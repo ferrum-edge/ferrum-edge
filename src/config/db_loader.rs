@@ -199,6 +199,11 @@ impl DatabaseStore {
                     .map(|v| v as u64),
                 auth_mode: parse_auth_mode(&auth_mode_str),
                 plugins,
+                // Connection pooling settings - None to use global defaults
+                pool_max_idle_per_host: None,
+                pool_idle_timeout_seconds: None,
+                pool_enable_http_keep_alive: None,
+                pool_enable_http2: None,
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
             });

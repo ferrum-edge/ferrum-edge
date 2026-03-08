@@ -122,6 +122,23 @@ The backend server uses these key dependencies:
 - **Gateway Overhead** - Performance difference between gateway and direct backend
 - **Error Rate** - Failed requests during the test
 
+### Connection Pooling Configuration
+
+This test suite uses the **hybrid configuration approach**:
+
+#### Global Defaults (Environment Variables)
+```bash
+FERRUM_POOL_MAX_IDLE_PER_HOST=15
+FERRUM_POOL_IDLE_TIMEOUT_SECONDS=120
+FERRUM_POOL_ENABLE_HTTP_KEEP_ALIVE=true
+FERRUM_POOL_ENABLE_HTTP2=false
+```
+
+#### Per-Proxy Overrides
+- **Health Check**: `pool_max_idle_per_host: 20` (high-frequency)
+- **Users API**: `pool_max_idle_per_host: 50` + `pool_idle_timeout_seconds: 180` (high-traffic)
+- **Data API**: `pool_max_idle_per_host: 30` (large payloads)
+
 ### Performance Analysis
 
 The report calculates:

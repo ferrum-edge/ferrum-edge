@@ -1,6 +1,6 @@
 ---
 # Performance testing configuration for Ferrum Gateway
-# Optimized for minimal latency and maximum throughput
+# Uses global defaults with selective per-proxy overrides
 
 proxies:
   - id: "proxy-health"
@@ -16,6 +16,9 @@ proxies:
     backend_write_timeout_ms: 5000
     backend_tls_verify_server_cert: true
     auth_mode: single
+    # Override for high-frequency health checks
+    pool_max_idle_per_host: 20
+    # Other settings use global defaults
     plugins: []
 
   - id: "proxy-users"
@@ -31,6 +34,10 @@ proxies:
     backend_write_timeout_ms: 5000
     backend_tls_verify_server_cert: true
     auth_mode: single
+    # Override for high-traffic API
+    pool_max_idle_per_host: 50
+    pool_idle_timeout_seconds: 180
+    # Other settings use global defaults
     plugins: []
 
   - id: "proxy-data"
@@ -46,6 +53,9 @@ proxies:
     backend_write_timeout_ms: 10000
     backend_tls_verify_server_cert: true
     auth_mode: single
+    # Override for large payload API
+    pool_max_idle_per_host: 30
+    # Other settings use global defaults
     plugins: []
 
 consumers: []

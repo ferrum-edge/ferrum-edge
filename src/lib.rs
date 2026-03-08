@@ -2,6 +2,7 @@
 
 pub mod admin;
 pub mod config;
+pub mod connection_pool;
 pub mod dns;
 pub mod grpc;
 pub mod modes;

@@ -1,5 +1,6 @@
 mod admin;
 mod config;
+mod connection_pool;
 mod dns;
 mod grpc;
 mod modes;

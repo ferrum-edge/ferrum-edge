@@ -19,6 +19,8 @@ use tokio::net::TcpListener;
 use tracing::{debug, error, info, warn};
 
 use crate::config::types::{AuthMode, BackendProtocol, GatewayConfig, Proxy};
+use crate::config::PoolConfig;
+use crate::connection_pool::ConnectionPool;
 use crate::dns::DnsCache;
 use crate::plugins::{
     create_plugin, Plugin, PluginResult, RequestContext, TransactionSummary,
@@ -43,15 +45,21 @@ fn is_websocket_upgrade(req: &Request<Incoming>) -> bool {
 pub struct ProxyState {
     pub config: Arc<ArcSwap<GatewayConfig>>,
     pub dns_cache: DnsCache,
+    pub connection_pool: Arc<ConnectionPool>,
     pub request_count: Arc<AtomicU64>,
     pub status_counts: Arc<dashmap::DashMap<u16, AtomicU64>>,
 }
 
 impl ProxyState {
     pub fn new(config: GatewayConfig, dns_cache: DnsCache) -> Self {
+        // Create connection pool with global configuration from environment
+        let global_pool_config = PoolConfig::from_env();
+        let connection_pool = Arc::new(ConnectionPool::new(global_pool_config));
+        
         Self {
             config: Arc::new(ArcSwap::new(Arc::new(config))),
             dns_cache,
+            connection_pool,
             request_count: Arc::new(AtomicU64::new(0)),
             status_counts: Arc::new(dashmap::DashMap::new()),
         }
@@ -710,28 +718,21 @@ async fn proxy_to_backend(
         )
         .await;
 
-    // Build the outgoing request using reqwest
-    let mut client_builder = reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_millis(proxy.backend_connect_timeout_ms))
-        .timeout(std::time::Duration::from_millis(proxy.backend_read_timeout_ms))
-        .danger_accept_invalid_certs(!proxy.backend_tls_verify_server_cert);
-
-    // If we have a resolved IP, configure the client to use it for this specific host
-    if let Ok(ip) = resolved_ip {
-        // Convert IpAddr to SocketAddr by adding the backend port
-        let socket_addr = std::net::SocketAddr::new(ip, proxy.backend_port);
-        
-        // For HTTPS, we need to preserve the hostname for TLS but use the IP for connection
-        if proxy.backend_protocol == BackendProtocol::Https {
-            // Use the original URL for HTTPS to preserve hostname for TLS
-            client_builder = client_builder.resolve(&proxy.backend_host, socket_addr);
-        } else {
-            // For HTTP, we can replace hostname with IP in URL
-            client_builder = client_builder.resolve(&proxy.backend_host, socket_addr);
+    // Get client from connection pool
+    let client = match state.connection_pool.get_client(proxy, resolved_ip.ok()).await {
+        Ok(client) => client,
+        Err(e) => {
+            error!("Failed to get client from pool: {}", e);
+            // Fallback to creating new client
+            let fallback_client = reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_millis(proxy.backend_connect_timeout_ms))
+                .timeout(std::time::Duration::from_millis(proxy.backend_read_timeout_ms))
+                .danger_accept_invalid_certs(!proxy.backend_tls_verify_server_cert)
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new());
+            fallback_client
         }
-    }
-
-    let client = client_builder.build().unwrap_or_else(|_| reqwest::Client::new());
+    };
 
     let req_method = match method {
         "GET" => reqwest::Method::GET,

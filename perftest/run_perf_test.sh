@@ -76,7 +76,14 @@ start_backend() {
 start_gateway() {
     echo -e "${YELLOW}🚪 Starting gateway on port $GATEWAY_PORT...${NC}"
     cd "$PROJECT_ROOT"
-    FERRUM_MODE=file FERRUM_FILE_CONFIG_PATH="$PERF_DIR/perf_config.yaml" ./target/release/ferrum-gateway > "$PERF_DIR/gateway.log" 2>&1 &
+    # Set global connection pool defaults optimized for performance testing
+    FERRUM_MODE=file \
+    FERRUM_FILE_CONFIG_PATH="$PERF_DIR/perf_config.yaml" \
+    FERRUM_POOL_MAX_IDLE_PER_HOST=15 \
+    FERRUM_POOL_IDLE_TIMEOUT_SECONDS=120 \
+    FERRUM_POOL_ENABLE_HTTP_KEEP_ALIVE=true \
+    FERRUM_POOL_ENABLE_HTTP2=false \
+    ./target/release/ferrum-gateway > "$PERF_DIR/gateway.log" 2>&1 &
     GATEWAY_PID=$!
     
     # Wait for gateway to start

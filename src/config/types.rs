@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// Backend protocol for a proxy resource.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum BackendProtocol {
     Http,
@@ -85,6 +85,15 @@ pub struct Proxy {
     pub auth_mode: AuthMode,
     #[serde(default)]
     pub plugins: Vec<PluginAssociation>,
+    // Connection pooling settings (optional - override global defaults)
+    #[serde(default)]
+    pub pool_max_idle_per_host: Option<usize>,
+    #[serde(default)]
+    pub pool_idle_timeout_seconds: Option<u64>,
+    #[serde(default)]
+    pub pool_enable_http_keep_alive: Option<bool>,
+    #[serde(default)]
+    pub pool_enable_http2: Option<bool>,
     #[serde(default = "Utc::now")]
     pub created_at: DateTime<Utc>,
     #[serde(default = "Utc::now")]
