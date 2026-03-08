@@ -15,7 +15,8 @@ tests/
 ├── plugin_integration_tests.rs    # Cross-plugin integration tests
 ├── config_file_loader_tests.rs    # Configuration file loading tests
 ├── config_types_tests.rs          # Configuration type validation tests
-└── proxy_tests.rs                 # Proxy routing and matching tests
+├── proxy_tests.rs                 # Proxy routing and matching tests
+└── admin_tests.rs                 # Admin API JWT authentication tests
 ```
 
 ## 🚀 Running Tests
@@ -40,6 +41,9 @@ cargo test --test config_types_tests
 
 # Proxy tests
 cargo test --test proxy_tests
+
+# Admin API tests
+cargo test --test admin_tests
 ```
 
 ### Run Tests by Pattern
@@ -50,9 +54,14 @@ cargo test plugin
 # Run all configuration tests
 cargo test config
 
+# Run all admin API tests
+cargo test admin
+
 # Run specific test functions
 cargo test test_stdout_logging_plugin_creation
 cargo test test_key_auth_plugin_successful_auth
+cargo test test_jwt_token_validation
+cargo test test_admin_api_integration
 ```
 
 ### Run Tests with Output
@@ -70,6 +79,14 @@ cargo test -- --ignored
 ## 📊 Test Results Summary
 
 ### ✅ Always Passing Tests
+
+#### admin_tests.rs (6/6 tests)
+- `test_jwt_token_validation` - ✅ JWT token generation and verification
+- `test_admin_api_integration` - ✅ Admin API state initialization
+- `test_jwt_configuration_validation` - ✅ Multiple JWT configurations
+- `test_jwt_security_scenarios` - ✅ Token tampering and cross-issuer attacks
+- `test_jwt_performance` - ✅ 100 token operations under 1 second
+- `test_jwt_concurrent_access` - ✅ 50 simultaneous token operations
 
 #### stdout_logging_tests.rs (4/4 tests)
 - `test_stdout_logging_plugin_creation` - ✅ Plugin instantiation
@@ -136,8 +153,27 @@ assert_continue(result)          // Assert PluginResult::Continue
 assert_reject(result, status)    // Assert PluginResult::Reject with status
 ```
 
+### Admin API Test Helpers (admin_tests.rs)
+
+```rust
+// JWT and admin state creation
+create_test_jwt_manager()        // JWT manager with test configuration
+create_test_admin_state()        // Admin state with JWT manager
+generate_test_token()           // Valid JWT token for testing
+generate_invalid_token()        // Invalid JWT token (wrong secret)
+
+// Test configuration
+TestConfig {                    // Configurable test parameters
+    jwt_secret: "test-secret",
+    jwt_issuer: "test-issuer", 
+    max_ttl: 3600,
+    admin_addr: "127.0.0.1:0"
+}
+```
+
 ### Usage Example
 
+#### Plugin Test Example
 ```rust
 use ferrum_gateway::plugins::{MyPlugin, Plugin, PluginResult};
 use serde_json::json;
@@ -154,6 +190,28 @@ async fn test_my_plugin() {
     let mut ctx = create_test_context();
     let result = plugin.on_request_received(&mut ctx).await;
     assert_continue(result);
+}
+```
+
+#### Admin API Test Example
+```rust
+use ferrum_gateway::admin::{AdminState, jwt_auth::{JwtManager, JwtConfig}};
+use serde_json::json;
+
+#[tokio::test]
+async fn test_jwt_authentication() {
+    let config = TestConfig::default();
+    let jwt_manager = create_test_jwt_manager(&config);
+    
+    // Test valid token
+    let valid_token = generate_test_token(&config, "test-user");
+    let result = jwt_manager.verify_token(&valid_token);
+    assert!(result.is_ok());
+    
+    // Test invalid token
+    let invalid_token = generate_invalid_token(&config, "test-user");
+    let result = jwt_manager.verify_token(&invalid_token);
+    assert!(result.is_err());
 }
 ```
 
@@ -174,6 +232,13 @@ async fn test_my_plugin() {
 - **Route Matching**: Path-based proxy selection
 - **URL Building**: Backend URL construction
 - **Priority Handling**: Route priority and conflict resolution
+
+### 4. Admin API Tests
+- **JWT Authentication**: Token generation, validation, and security
+- **Configuration Testing**: Multiple JWT configurations and scenarios
+- **Security Validation**: Token tampering, cross-issuer attacks, and edge cases
+- **Performance Testing**: Token operation benchmarks and concurrent access
+- **Integration Testing**: Admin API state management and initialization
 
 ## 🔧 Debugging Failed Tests
 
@@ -204,7 +269,9 @@ cargo test --test test_file_name -- --nocapture
 ### Current Coverage
 - **11 Plugins**: All plugins have basic creation and configuration tests
 - **5 Core Areas**: Logging, Authentication, Authorization, Rate Limiting, Integration
-- **25+ Test Cases**: Comprehensive coverage of plugin functionality
+- **25+ Plugin Test Cases**: Comprehensive coverage of plugin functionality
+- **6 Admin API Tests**: JWT authentication, security, and performance validation
+- **30+ Total Test Cases**: Full coverage of gateway functionality
 
 ### Adding New Tests
 
@@ -220,6 +287,14 @@ cargo test --test test_file_name -- --nocapture
 test_{plugin_name}_plugin_creation
 test_{plugin_name}_plugin_lifecycle
 test_{plugin_name}_plugin_with_config
+
+// Admin API tests
+test_jwt_token_validation
+test_jwt_configuration_validation
+test_jwt_security_scenarios
+test_jwt_performance
+test_jwt_concurrent_access
+test_admin_api_integration
 
 // Integration tests
 test_all_plugins_available
@@ -250,6 +325,14 @@ test_plugin_scope_configuration
 - Blocked IP/consumer → Reject (403)
 - No rules → Continue (default allow)
 
+### JWT Authentication Flow
+- Valid token with correct ISS → Continue
+- Invalid signature → Reject (401)
+- Expired token → Reject (401)
+- Wrong issuer → Reject (401)
+- Malformed token → Reject (401)
+- Missing token → Reject (401)
+
 ## 🚨 Troubleshooting
 
 ### Test Compilation Errors
@@ -261,6 +344,8 @@ test_plugin_scope_configuration
 - **Mock Data**: Ensure test data matches plugin expectations
 - **Async/Await**: All plugin tests must be `#[tokio::test]`
 - **Configuration**: Check JSON config matches plugin schema
+- **JWT Tokens**: Ensure test tokens use correct secret and issuer
+- **Admin State**: Verify admin state initialization in tests
 
 ### Performance Issues
 - **Test Isolation**: Each test should be independent

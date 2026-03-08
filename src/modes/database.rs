@@ -4,6 +4,7 @@ use std::time::Duration;
 use tracing::{error, info, warn};
 
 use crate::admin::{self, AdminState};
+use crate::admin::jwt_auth::create_jwt_manager_from_env;
 use crate::config::db_loader::DatabaseStore;
 use crate::config::EnvConfig;
 use crate::dns::DnsCache;
@@ -56,9 +57,11 @@ pub async fn run(env_config: EnvConfig, shutdown_tx: tokio::sync::watch::Sender<
 
     // Admin listener
     let admin_addr: SocketAddr = format!("0.0.0.0:{}", env_config.admin_http_port).parse()?;
+    let jwt_manager = create_jwt_manager_from_env()
+        .map_err(|e| anyhow::anyhow!("Failed to create JWT manager: {}", e))?;
     let admin_state = AdminState {
         db: Some(db.clone()),
-        jwt_secret: env_config.admin_jwt_secret.clone().unwrap_or_default(),
+        jwt_manager,
         proxy_state: Some(proxy_state.clone()),
         mode: "database".into(),
     };

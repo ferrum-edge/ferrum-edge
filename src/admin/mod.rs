@@ -1,3 +1,10 @@
+//! Admin API for Ferrum Gateway
+//! 
+//! Provides REST API for managing proxies, consumers, and plugins
+//! with JWT-based authentication and authorization.
+
+pub mod jwt_auth;
+
 use bytes::Bytes;
 use chrono::Utc;
 use http_body_util::{BodyExt, Full};
@@ -6,7 +13,6 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
-use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
 use serde_json::{json, Value};
 use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
@@ -15,6 +21,7 @@ use tokio::net::TcpListener;
 use tracing::{debug, error, info};
 use uuid::Uuid;
 
+use crate::admin::jwt_auth::{JwtManager, JwtError};
 use crate::config::db_loader::DatabaseStore;
 use crate::config::types::{Consumer, PluginConfig, Proxy};
 use crate::plugins;
@@ -24,7 +31,7 @@ use crate::proxy::ProxyState;
 #[derive(Clone)]
 pub struct AdminState {
     pub db: Option<Arc<DatabaseStore>>,
-    pub jwt_secret: String,
+    pub jwt_manager: JwtManager,
     pub proxy_state: Option<ProxyState>,
     pub mode: String,
 }
@@ -77,7 +84,8 @@ pub async fn start_admin_listener(
     Ok(())
 }
 
-async fn handle_admin_request(
+/// Handle an admin API request.
+pub async fn handle_admin_request(
     req: Request<Incoming>,
     state: AdminState,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
@@ -116,11 +124,52 @@ async fn handle_admin_request(
     }
 
     // Authenticate
-    if !verify_admin_jwt(&req, &state.jwt_secret) {
-        return Ok(json_response(
-            StatusCode::UNAUTHORIZED,
-            &json!({"error": "Unauthorized"}),
-        ));
+    match state.jwt_manager.verify_request(req.headers().get("authorization").and_then(|h| h.to_str().ok())) {
+        Ok(_) => {
+            // Token is valid, continue processing
+        }
+        Err(JwtError::MissingHeader) => {
+            return Ok(json_response(
+                StatusCode::UNAUTHORIZED,
+                &json!({"error": "Missing Authorization header"}),
+            ));
+        }
+        Err(JwtError::InvalidHeaderFormat) => {
+            return Ok(json_response(
+                StatusCode::UNAUTHORIZED,
+                &json!({"error": "Invalid Authorization header format"}),
+            ));
+        }
+        Err(JwtError::TokenExpired) => {
+            return Ok(json_response(
+                StatusCode::UNAUTHORIZED,
+                &json!({"error": "Token expired"}),
+            ));
+        }
+        Err(JwtError::TokenNotYetValid) => {
+            return Ok(json_response(
+                StatusCode::UNAUTHORIZED,
+                &json!({"error": "Token not yet valid"}),
+            ));
+        }
+        Err(JwtError::InvalidTokenIssuer) => {
+            return Ok(json_response(
+                StatusCode::UNAUTHORIZED,
+                &json!({"error": "Invalid token issuer"}),
+            ));
+        }
+        Err(JwtError::InvalidTokenSignature) => {
+            return Ok(json_response(
+                StatusCode::UNAUTHORIZED,
+                &json!({"error": "Invalid token signature"}),
+            ));
+        }
+        Err(JwtError::VerificationFailed(msg)) => {
+            return Ok(json_response(
+                StatusCode::UNAUTHORIZED,
+                &json!({"error": format!("Token verification failed: {}", msg)}),
+            ));
+        }
     }
 
     // Read body
@@ -181,28 +230,6 @@ async fn handle_admin_request(
             &json!({"error": "Not Found"}),
         )),
     }
-}
-
-fn verify_admin_jwt(req: &Request<Incoming>, secret: &str) -> bool {
-    let auth_header = match req.headers().get("authorization") {
-        Some(h) => match h.to_str() {
-            Ok(s) => s.to_string(),
-            Err(_) => return false,
-        },
-        None => return false,
-    };
-
-    if !auth_header.starts_with("Bearer ") {
-        return false;
-    }
-
-    let token = &auth_header[7..];
-    let key = DecodingKey::from_secret(secret.as_bytes());
-    let mut validation = Validation::new(Algorithm::HS256);
-    validation.validate_exp = false;
-    validation.required_spec_claims.clear();
-
-    decode::<Value>(token, &key, &validation).is_ok()
 }
 
 // ---- Proxy CRUD ----
