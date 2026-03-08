@@ -117,15 +117,15 @@
 - 🛠️ **Missing**: Full test suite for all modes and scenarios
 - 🎯 **Impact**: Reduced confidence in edge cases
 
+### **🔧 Backend mTLS**
+- ✅ **Status**: Implemented
+- 📋 **Requirement**: Client certificate authentication to backends
+- 🛠️ **Features**: Global environment variables, per-proxy overrides, connection pooling support
+- 🎯 **Impact**: Can authenticate to mTLS-protected backends
+
 ---
 
 ## **❌ NOT IMPLEMENTED (Missing Features)**
-
-### **🔧 Backend mTLS**
-- ❌ **Status**: Not implemented
-- 📋 **Requirement**: Client certificate authentication to backends
-- 🛠️ **Missing**: `backend_tls_client_cert_path`, `backend_tls_client_key_path` support
-- 🎯 **Impact**: Cannot authenticate to mTLS-protected backends
 
 ### **🔧 Custom CA Bundles**
 - ❌ **Status**: Not implemented
@@ -197,6 +197,7 @@ The Ferrum Gateway is **production-ready for most use cases** with:
 - ✅ Complete Admin API with JWT security
 - ✅ All operating modes (DB, File, CP, DP)
 - ✅ Robust configuration management
+- ✅ Backend mTLS authentication with global and per-proxy configuration
 - ✅ Comprehensive logging and basic metrics
 
 **This is a highly functional API gateway that meets the majority of enterprise requirements!** 🎉

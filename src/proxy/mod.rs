@@ -51,10 +51,10 @@ pub struct ProxyState {
 }
 
 impl ProxyState {
-    pub fn new(config: GatewayConfig, dns_cache: DnsCache) -> Self {
+    pub fn new(config: GatewayConfig, dns_cache: DnsCache, env_config: crate::config::EnvConfig) -> Self {
         // Create connection pool with global configuration from environment
         let global_pool_config = PoolConfig::from_env();
-        let connection_pool = Arc::new(ConnectionPool::new(global_pool_config));
+        let connection_pool = Arc::new(ConnectionPool::new(global_pool_config, env_config));
         
         Self {
             config: Arc::new(ArcSwap::new(Arc::new(config))),

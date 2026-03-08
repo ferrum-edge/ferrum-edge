@@ -24,15 +24,18 @@ pub struct ConnectionPool {
     /// Configuration for pool cleanup
     cleanup_interval: Duration,
     global_config: PoolConfig,
+    /// Global mTLS configuration
+    global_mtls_config: crate::config::EnvConfig,
 }
 
 impl ConnectionPool {
     /// Create a new connection pool manager with global configuration
-    pub fn new(global_config: PoolConfig) -> Self {
+    pub fn new(global_config: PoolConfig, mtls_config: crate::config::EnvConfig) -> Self {
         let pool = Self {
             pools: Arc::new(DashMap::new()),
             cleanup_interval: Duration::from_secs(30),
             global_config,
+            global_mtls_config: mtls_config,
         };
         
         // Start cleanup task
@@ -98,6 +101,27 @@ impl ConnectionPool {
         // Configure WebSocket support
         if matches!(proxy.backend_protocol, BackendProtocol::Ws | BackendProtocol::Wss) {
             client_builder = client_builder.http2_prior_knowledge(); // WebSockets work better with HTTP/1.1
+        }
+
+        // Add client certificate for mTLS (proxy-specific overrides take priority)
+        let cert_path = proxy.backend_tls_client_cert_path.as_ref()
+            .or_else(|| self.global_mtls_config.backend_tls_client_cert_path.as_ref());
+        let key_path = proxy.backend_tls_client_key_path.as_ref()
+            .or_else(|| self.global_mtls_config.backend_tls_client_key_path.as_ref());
+
+        if let (Some(cert_path), Some(key_path)) = (cert_path, key_path) {
+            // Load client certificate and key
+            let cert_pem = std::fs::read_to_string(cert_path)
+                .map_err(|e| anyhow::anyhow!("Failed to read client certificate from {}: {}", cert_path, e))?;
+            let key_pem = std::fs::read_to_string(key_path)
+                .map_err(|e| anyhow::anyhow!("Failed to read client key from {}: {}", key_path, e))?;
+            
+            // Parse certificate and key
+            let combined_pem = format!("{}\n{}", cert_pem, key_pem);
+            let identity = reqwest::Identity::from_pem(combined_pem.as_bytes())
+                .map_err(|e| anyhow::anyhow!("Failed to parse client certificate/key: {}", e))?;
+            
+            client_builder = client_builder.identity(identity);
         }
 
         // If we have a resolved IP, configure the client to use it
@@ -245,7 +269,36 @@ mod tests {
     #[tokio::test]
     async fn test_connection_pool_creation() {
         let global_config = PoolConfig::default();
-        let pool = ConnectionPool::new(global_config);
+        let env_config = crate::config::EnvConfig {
+            mode: crate::config::OperatingMode::File,
+            log_level: "info".to_string(),
+            proxy_http_port: 8000,
+            proxy_https_port: 8443,
+            proxy_tls_cert_path: None,
+            proxy_tls_key_path: None,
+            admin_http_port: 9000,
+            admin_https_port: 9443,
+            admin_tls_cert_path: None,
+            admin_tls_key_path: None,
+            admin_jwt_secret: None,
+            db_type: None,
+            db_url: None,
+            db_poll_interval: 30,
+            db_poll_check_interval: 5,
+            db_incremental_polling: true,
+            file_config_path: None,
+            cp_grpc_listen_addr: None,
+            cp_grpc_jwt_secret: None,
+            dp_cp_grpc_url: None,
+            dp_grpc_auth_token: None,
+            max_header_size_bytes: 16384,
+            max_body_size_bytes: 10485760,
+            dns_cache_ttl_seconds: 300,
+            dns_overrides: std::collections::HashMap::new(),
+            backend_tls_client_cert_path: None,
+            backend_tls_client_key_path: None,
+        };
+        let pool = ConnectionPool::new(global_config, env_config);
         let proxy = create_test_proxy();
         
         let client1 = pool.get_client(&proxy, None).await.unwrap();
@@ -259,7 +312,36 @@ mod tests {
     #[tokio::test]
     async fn test_pool_stats() {
         let global_config = PoolConfig::default();
-        let pool = ConnectionPool::new(global_config);
+        let env_config = crate::config::EnvConfig {
+            mode: crate::config::OperatingMode::File,
+            log_level: "info".to_string(),
+            proxy_http_port: 8000,
+            proxy_https_port: 8443,
+            proxy_tls_cert_path: None,
+            proxy_tls_key_path: None,
+            admin_http_port: 9000,
+            admin_https_port: 9443,
+            admin_tls_cert_path: None,
+            admin_tls_key_path: None,
+            admin_jwt_secret: None,
+            db_type: None,
+            db_url: None,
+            db_poll_interval: 30,
+            db_poll_check_interval: 5,
+            db_incremental_polling: true,
+            file_config_path: None,
+            cp_grpc_listen_addr: None,
+            cp_grpc_jwt_secret: None,
+            dp_cp_grpc_url: None,
+            dp_grpc_auth_token: None,
+            max_header_size_bytes: 16384,
+            max_body_size_bytes: 10485760,
+            dns_cache_ttl_seconds: 300,
+            dns_overrides: std::collections::HashMap::new(),
+            backend_tls_client_cert_path: None,
+            backend_tls_client_key_path: None,
+        };
+        let pool = ConnectionPool::new(global_config, env_config);
         let proxy = create_test_proxy();
         
         let _client = pool.get_client(&proxy, None).await.unwrap();

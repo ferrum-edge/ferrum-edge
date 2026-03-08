@@ -42,7 +42,7 @@ pub async fn run(env_config: EnvConfig, shutdown_tx: tokio::sync::watch::Sender<
         dns_warmup.warmup(hostnames).await;
     });
 
-    let proxy_state = ProxyState::new(config, dns_cache);
+    let proxy_state = ProxyState::new(config, dns_cache, env_config.clone());
     let db = Arc::new(db);
 
     // Proxy listener

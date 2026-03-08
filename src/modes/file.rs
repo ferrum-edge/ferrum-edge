@@ -54,7 +54,7 @@ pub async fn run(env_config: EnvConfig, shutdown_tx: tokio::sync::watch::Sender<
         dns_warmup.warmup(hostnames).await;
     });
 
-    let proxy_state = ProxyState::new(config, dns_cache);
+    let proxy_state = ProxyState::new(config, dns_cache, env_config.clone());
 
     // Validate TLS configuration if provided
     if let (Some(cert_path), Some(key_path)) = (&env_config.proxy_tls_cert_path, &env_config.proxy_tls_key_path) {

@@ -16,7 +16,7 @@ pub async fn run(env_config: EnvConfig, shutdown_tx: tokio::sync::watch::Sender<
     );
 
     // Start with empty config; CP will push the real one
-    let proxy_state = ProxyState::new(GatewayConfig::default(), dns_cache);
+    let proxy_state = ProxyState::new(GatewayConfig::default(), dns_cache, env_config.clone());
 
     // Start DP client to connect to CP
     let cp_url = env_config.dp_cp_grpc_url.clone().unwrap_or_default();

@@ -73,6 +73,10 @@ pub struct EnvConfig {
     // DNS
     pub dns_cache_ttl_seconds: u64,
     pub dns_overrides: HashMap<String, String>,
+
+    // Global Backend mTLS
+    pub backend_tls_client_cert_path: Option<String>,
+    pub backend_tls_client_key_path: Option<String>,
 }
 
 impl EnvConfig {
@@ -119,6 +123,10 @@ impl EnvConfig {
 
             dns_cache_ttl_seconds: parse_env_u64("FERRUM_DNS_CACHE_TTL_SECONDS", 300),
             dns_overrides,
+
+            // Global Backend mTLS
+            backend_tls_client_cert_path: env::var("FERRUM_BACKEND_TLS_CLIENT_CERT_PATH").ok(),
+            backend_tls_client_key_path: env::var("FERRUM_BACKEND_TLS_CLIENT_KEY_PATH").ok(),
         };
 
         config.validate()?;

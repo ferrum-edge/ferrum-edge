@@ -172,6 +172,8 @@ cargo run --release
 | `FERRUM_MAX_BODY_SIZE_BYTES` | No | `10485760` | Maximum request body size (0=unlimited) |
 | `FERRUM_DNS_CACHE_TTL_SECONDS` | No | `300` | Default DNS cache TTL |
 | `FERRUM_DNS_OVERRIDES` | No | `{}` | JSON map of hostname→IP static overrides |
+| `FERRUM_BACKEND_TLS_CLIENT_CERT_PATH` | No | — | Path to client certificate for backend mTLS |
+| `FERRUM_BACKEND_TLS_CLIENT_KEY_PATH` | No | — | Path to client private key for backend mTLS |
 
 ### Configuration File Format (File Mode)
 
