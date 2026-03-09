@@ -74,8 +74,11 @@ pub struct EnvConfig {
     pub dns_cache_ttl_seconds: u64,
     pub dns_overrides: HashMap<String, String>,
 
-    // Global Backend mTLS
+    /// Path to a PEM file containing trusted CA certificates for backend TLS verification
+    pub backend_tls_ca_bundle_path: Option<String>,
+    /// Path to a PEM file containing the client certificate for backend TLS verification
     pub backend_tls_client_cert_path: Option<String>,
+    /// Path to a PEM file containing the client key for backend TLS verification
     pub backend_tls_client_key_path: Option<String>,
 }
 
@@ -125,6 +128,7 @@ impl EnvConfig {
             dns_overrides,
 
             // Global Backend mTLS
+            backend_tls_ca_bundle_path: env::var("FERRUM_BACKEND_TLS_CA_BUNDLE_PATH").ok(),
             backend_tls_client_cert_path: env::var("FERRUM_BACKEND_TLS_CLIENT_CERT_PATH").ok(),
             backend_tls_client_key_path: env::var("FERRUM_BACKEND_TLS_CLIENT_KEY_PATH").ok(),
         };

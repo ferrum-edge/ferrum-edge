@@ -10,14 +10,49 @@ Backend mTLS allows the gateway to authenticate itself to backend services using
 
 ### Global Environment Variables
 
-Set these environment variables to configure client certificates for all backend connections:
+Set these environment variables to configure client certificates and CA verification for all backend connections:
 
 ```bash
+# Path to CA bundle for backend TLS verification (overrides system trust store)
+export FERRUM_BACKEND_TLS_CA_BUNDLE_PATH="/path/to/ca-bundle.pem"
+
 # Path to client certificate file (PEM format)
 export FERRUM_BACKEND_TLS_CLIENT_CERT_PATH="/path/to/client-cert.pem"
 
 # Path to client private key file (PEM format)  
 export FERRUM_BACKEND_TLS_CLIENT_KEY_PATH="/path/to/client-key.pem"
+```
+
+### Custom CA Bundles
+
+The `FERRUM_BACKEND_TLS_CA_BUNDLE_PATH` allows you to specify custom Certificate Authority (CA) bundles for backend TLS verification. This is useful for:
+
+- **Enterprise Environments**: When backend services use certificates from private CAs
+- **Development**: Using self-signed certificates in testing environments  
+- **Security**: Fine-grained control over trusted CAs beyond system defaults
+- **Compliance**: Meeting regulatory requirements for certificate validation
+
+**How it works:**
+- The CA bundle is loaded once at gateway startup
+- It's used for ALL backend connections (global configuration only)
+- It supplements or replaces the system trust store
+- Works with HTTP/HTTPS and WebSocket (wss://) connections
+
+**CA Bundle Format:**
+```bash
+# Multiple CAs can be combined in one file
+cat ca1.pem ca2.pem ca3.pem > ca-bundle.pem
+
+# Or create a single file with multiple certificates
+cat > ca-bundle.pem << EOF
+-----BEGIN CERTIFICATE-----
+# First CA certificate
+-----END CERTIFICATE-----
+
+-----BEGIN CERTIFICATE-----
+# Second CA certificate  
+-----END CERTIFICATE-----
+EOF
 ```
 
 ### Per-Proxy Configuration

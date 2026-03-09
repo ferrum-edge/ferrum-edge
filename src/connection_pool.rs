@@ -103,6 +103,15 @@ impl ConnectionPool {
             client_builder = client_builder.http2_prior_knowledge(); // WebSockets work better with HTTP/1.1
         }
 
+        // Add custom CA bundle for server certificate verification
+        if let Some(ca_bundle_path) = &self.global_mtls_config.backend_tls_ca_bundle_path {
+            let ca_pem = std::fs::read_to_string(ca_bundle_path)
+                .map_err(|e| anyhow::anyhow!("Failed to read CA bundle from {}: {}", ca_bundle_path, e))?;
+            let certificate = reqwest::Certificate::from_pem(ca_pem.as_bytes())
+                .map_err(|e| anyhow::anyhow!("Failed to parse CA bundle: {}", e))?;
+            client_builder = client_builder.add_root_certificate(certificate);
+        }
+
         // Add client certificate for mTLS (proxy-specific overrides take priority)
         let cert_path = proxy.backend_tls_client_cert_path.as_ref()
             .or_else(|| self.global_mtls_config.backend_tls_client_cert_path.as_ref());
@@ -295,6 +304,7 @@ mod tests {
             max_body_size_bytes: 10485760,
             dns_cache_ttl_seconds: 300,
             dns_overrides: std::collections::HashMap::new(),
+            backend_tls_ca_bundle_path: None,
             backend_tls_client_cert_path: None,
             backend_tls_client_key_path: None,
         };
@@ -338,6 +348,7 @@ mod tests {
             max_body_size_bytes: 10485760,
             dns_cache_ttl_seconds: 300,
             dns_overrides: std::collections::HashMap::new(),
+            backend_tls_ca_bundle_path: None,
             backend_tls_client_cert_path: None,
             backend_tls_client_key_path: None,
         };

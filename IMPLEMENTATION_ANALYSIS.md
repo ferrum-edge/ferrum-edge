@@ -127,11 +127,6 @@
 
 ## **❌ NOT IMPLEMENTED (Missing Features)**
 
-### **🔧 Custom CA Bundles**
-- ❌ **Status**: Not implemented
-- 📋 **Requirement**: Custom CA certificate validation
-- 🛠️ **Missing**: `backend_tls_server_ca_cert_path` support
-- 🎯 **Impact**: Limited to system trust store only
 
 ### **🔧 Certificate Pinning**
 - ❌ **Status**: Not implemented
@@ -198,6 +193,7 @@ The Ferrum Gateway is **production-ready for most use cases** with:
 - ✅ All operating modes (DB, File, CP, DP)
 - ✅ Robust configuration management
 - ✅ Backend mTLS authentication with global and per-proxy configuration
+- ✅ Custom CA bundle support for backend TLS verification
 - ✅ Comprehensive logging and basic metrics
 
 **This is a highly functional API gateway that meets the majority of enterprise requirements!** 🎉
