@@ -21,6 +21,7 @@ path = "examples/websocket_gateway_test.rs"
 name = "secure-echo-server-simple"
 path = "examples/secure_echo_server_simple.rs"
 
+
 [dependencies]
 # Async runtime
 tokio = { version = "1", features = ["full"] }
@@ -86,3 +87,8 @@ tonic-build = "0.12"
 [dev-dependencies]
 tempfile = "3"
 wiremock = "0.6"
+# Functional testing dependencies
+rand = "0.8"
+futures = "0.3"
+# Simple HTTP server dependencies
+tokio = { version = "1", features = ["net", "io-util", "time", "rt"] }

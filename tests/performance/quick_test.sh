@@ -5,7 +5,7 @@
 set -e
 
 PERF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(dirname "$PERF_DIR")"
+PROJECT_ROOT="$(dirname "$(dirname "$PERF_DIR")")"
 
 echo "🚀 Quick Performance Test Setup Verification"
 echo "============================================"

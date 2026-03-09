@@ -2,9 +2,16 @@
 
 This directory contains a comprehensive performance testing setup for measuring the throughput and latency of the Ferrum Gateway compared to direct backend access.
 
-## 🚀 Quick Start
+## � Location
+
+This performance testing suite is located at `tests/performance/` within the ferrum-gateway project, organized alongside the unit and integration tests.
+
+## �🚀 Quick Start
 
 ```bash
+# Navigate to the performance test directory
+cd tests/performance
+
 # Make the script executable
 chmod +x run_perf_test.sh
 
