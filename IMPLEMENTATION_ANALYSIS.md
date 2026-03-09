@@ -168,8 +168,6 @@
 
 ### **High Priority (Core Completion)**
 1. **gRPC Proxying** - Complete gRPC message forwarding
-2. **Backend mTLS** - Add client certificate support
-3. **Custom CA Support** - Enable custom trust stores
 
 ### **Medium Priority (Production Enhancement)**
 4. **HTTP/3 Support** - Add next-gen protocol support
