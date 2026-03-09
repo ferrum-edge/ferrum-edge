@@ -1,1 +1,0 @@
-hyper::server::conn::http1::Connection<tokio::net::TcpStream, service::util::ServiceFn<fn(hyper::Request<hyper::body::Incoming>) -> impl Future<Output = Result<Response<http_body_util::Full<hyper::body::Bytes>>, Infallible>> {handle_request}, hyper::body::Incoming>>
