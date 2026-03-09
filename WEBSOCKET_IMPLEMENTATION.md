@@ -101,10 +101,11 @@ The current implementation provides **enterprise-grade WebSocket support** with:
 ## 📝 **Implementation Files Created**
 
 1. **`src/proxy/mod.rs`** - Main WebSocket implementation
-2. **`examples/websocket_echo_server.rs`** - Test echo server
-3. **`examples/websocket_client_test.rs`** - Direct client test
-4. **`examples/websocket_proxy_server.rs`** - Standalone proxy demo
-5. **`examples/websocket_proxy_test.rs`** - Proxy test client
+2. **`tests/websocket_echo_server.rs`** - Test echo server
+3. **`tests/websocket_gateway_test.rs`** - Gateway integration test
+4. **`tests/secure_echo_server_simple.rs`** - Secure echo server for TLS testing
+5. **`tests/config.yaml`** - WebSocket proxy configuration
+6. **`tests/certs/`** - TLS certificates for testing
 
 ## 🎉 **Conclusion**
 

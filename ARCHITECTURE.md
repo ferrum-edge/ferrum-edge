@@ -79,14 +79,16 @@ tests/
 └── stdout_logging_tests.rs # Logging plugin tests
 ```
 
-### **Examples (`examples/`)**
+### **Test Infrastructure (`tests/`)**
 
 ```
-examples/
+tests/
 ├── config.yaml            # Example configuration file
 ├── websocket_echo_server.rs  # WebSocket echo server for testing
 ├── websocket_gateway_test.rs  # WebSocket gateway integration test
-└── secure_echo_server_simple.rs # Simple HTTPS echo server
+├── secure_echo_server_simple.rs # Simple HTTPS echo server
+├── certs/                 # TLS certificates for testing
+└── [other test files]     # Comprehensive test suite
 ```
 
 ### **Documentation (`docs/`)**
@@ -370,7 +372,7 @@ cargo test
 
 # Start with example config
 FERRUM_MODE=file \
-FERRUM_FILE_CONFIG_PATH=examples/config.yaml \
+FERRUM_FILE_CONFIG_PATH=tests/config.yaml \
 cargo run
 ```
 
@@ -478,8 +480,8 @@ cargo build
 # Release build
 cargo build --release
 
-# Run with examples
-cargo run --example websocket_echo_server
+# Run WebSocket test server
+cargo test --test websocket_echo_server -- --nocapture
 ```
 
 ## 📚 Additional Resources

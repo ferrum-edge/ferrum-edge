@@ -90,7 +90,7 @@ CREATE TABLE IF NOT EXISTS proxy_plugins (
 
 ### **📋 YAML Configuration Maps Directly to Database**
 
-Your `examples/config.yaml` file structure maps **1:1** to the database schema:
+Your `tests/config.yaml` file structure maps **1:1** to the database schema:
 
 #### **Example YAML → Database Mapping**
 
@@ -321,4 +321,4 @@ The Ferrum Gateway's database schema is **elegantly designed** to:
 5. **Integrate seamlessly** with Admin API
 6. **Maintain data consistency** with proper constraints
 
-**The same configuration that works in `examples/config.yaml` will work identically when stored in any supported database!** 🎉
+**The same configuration that works in `tests/config.yaml` will work identically when stored in any supported database!** 🎉

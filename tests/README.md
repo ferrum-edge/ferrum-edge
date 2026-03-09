@@ -16,7 +16,25 @@ tests/
 ├── config_file_loader_tests.rs    # Configuration file loading tests
 ├── config_types_tests.rs          # Configuration type validation tests
 ├── proxy_tests.rs                 # Proxy routing and matching tests
-└── admin_tests.rs                 # Admin API JWT authentication tests
+├── admin_tests.rs                 # Admin API JWT authentication tests
+├── admin_enhanced_tls_tests.rs   # Admin API TLS/mTLS tests
+├── admin_listeners_tests.rs       # Admin API separate listeners tests
+├── admin_read_only_tests.rs       # Admin API read-only mode tests
+├── backend_mtls_tests.rs         # Backend mTLS functionality tests
+├── frontend_tls_tests.rs          # Frontend TLS tests
+├── separate_listeners_tests.rs    # Separate HTTP/HTTPS listeners tests
+├── websocket_auth_tests.rs        # WebSocket authentication tests
+├── websocket_echo_server.rs       # WebSocket echo server for testing
+├── secure_echo_server_simple.rs   # Secure echo server for TLS testing
+├── websocket_gateway_test.rs       # Gateway WebSocket integration test
+├── config.yaml                   # Test configuration with WebSocket settings
+├── certs/                        # TLS certificates for testing
+│   ├── server.crt
+│   ├── server.key
+│   └── client.crt
+└── performance/                  # Performance testing directory
+    ├── README.md
+    └── [performance test files]
 ```
 
 ## 🚀 Running Tests
@@ -44,6 +62,20 @@ cargo test --test proxy_tests
 
 # Admin API tests
 cargo test --test admin_tests
+cargo test --test admin_enhanced_tls_tests
+cargo test --test admin_listeners_tests
+cargo test --test admin_read_only_tests
+
+# TLS tests
+cargo test --test backend_mtls_tests
+cargo test --test frontend_tls_tests
+cargo test --test separate_listeners_tests
+
+# WebSocket tests
+cargo test --test websocket_auth_tests
+
+# Integration tests
+cargo test --test websocket_gateway_test
 ```
 
 ### Run Tests by Pattern
@@ -75,6 +107,50 @@ cargo test -- --ignored
 # Run only ignored tests (if any)
 cargo test -- --ignored
 ```
+
+## 🧪 WebSocket Test Infrastructure
+
+The test suite includes WebSocket test servers for comprehensive WebSocket functionality testing:
+
+### Test Servers
+```bash
+# Run WebSocket echo server (port 8080)
+cargo test --test websocket_echo_server -- --nocapture
+
+# Run secure echo server (port 8443)  
+cargo test --test secure_echo_server_simple -- --nocapture
+
+# Run WebSocket gateway integration test
+cargo test --test websocket_gateway_test -- --nocapture
+```
+
+### Manual Testing Setup
+For manual WebSocket testing with the gateway:
+
+1. **Start echo server:**
+   ```bash
+   cargo test --test websocket_echo_server -- --nocapture
+   ```
+
+2. **Start gateway with WebSocket config:**
+   ```bash
+   FERRUM_MODE=file FERRUM_FILE_CONFIG_PATH=tests/config.yaml cargo run --bin ferrum-gateway
+   ```
+
+3. **Test WebSocket connections:**
+   - Regular WebSocket: `ws://localhost:8000/ws`
+   - Secure WebSocket: `wss://localhost:8443/ws` (if TLS configured)
+
+### Test Configuration
+The `tests/config.yaml` file contains WebSocket proxy configurations:
+- `/ws` → `ws://localhost:8080` (regular WebSocket)
+- `/wss` → `wss://localhost:8443` (secure WebSocket)
+
+### TLS Certificates
+The `tests/certs/` directory contains self-signed certificates for testing:
+- `server.crt` - Server certificate
+- `server.key` - Server private key  
+- `client.crt` - Client certificate (for mTLS testing)
 
 ## 📊 Test Results Summary
 

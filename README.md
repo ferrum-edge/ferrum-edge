@@ -124,7 +124,7 @@ cargo build --release
 ```bash
 # Run with the example configuration
 FERRUM_MODE=file \
-FERRUM_FILE_CONFIG_PATH=examples/config.yaml \
+FERRUM_FILE_CONFIG_PATH=tests/config.yaml \
 FERRUM_LOG_LEVEL=info \
 cargo run --release
 ```
@@ -217,7 +217,7 @@ cargo run --release
 
 ### Configuration File Format (File Mode)
 
-Configuration files can be YAML or JSON. See `examples/config.yaml` for a complete example.
+Configuration files can be YAML or JSON. See `tests/config.yaml` for a complete example.
 
 ```yaml
 proxies:

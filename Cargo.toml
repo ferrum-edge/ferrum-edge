@@ -9,18 +9,6 @@ license = "MIT"
 name = "ferrum-gateway"
 path = "src/main.rs"
 
-[[bin]]
-name = "websocket-echo-server"
-path = "examples/websocket_echo_server.rs"
-
-[[bin]]
-name = "websocket-gateway-test"
-path = "examples/websocket_gateway_test.rs"
-
-[[bin]]
-name = "secure-echo-server-simple"
-path = "examples/secure_echo_server_simple.rs"
-
 
 [dependencies]
 # Async runtime
