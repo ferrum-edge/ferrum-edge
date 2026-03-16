@@ -137,7 +137,6 @@ impl Plugin for RateLimiting {
         PluginResult::Continue
     }
 
-    async fn authorize(&self, ctx: &mut RequestContext) -> PluginResult {
-        self.on_request_received(ctx).await
-    }
+    // Rate limiting is applied only in on_request_received to avoid double-counting.
+    // The authorize phase is intentionally left as the default (Continue).
 }

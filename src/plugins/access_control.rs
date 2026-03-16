@@ -128,31 +128,59 @@ impl Plugin for AccessControl {
     }
 }
 
-// Helper method to check if IP matches (supports both individual IPs and CIDR notation)
+/// Check if an IP address matches a rule (supports exact IPs and CIDR notation).
 fn ip_matches(client_ip: &str, rule: &str) -> bool {
     // Simple exact match for individual IPs
     if client_ip == rule {
         return true;
     }
-    
-    // For CIDR notation, this is a simplified check
-    // In a real implementation, you'd use a proper CIDR library
+
+    // CIDR notation matching
     if rule.contains('/') {
-        // This is a CIDR range - simplified check for testing
-        if let Some((network_part, _)) = rule.split_once('/') {
-            // For /8 networks like 192.168.0.0/16, check if IP starts with network part
-            if network_part == "192.168.0.0" {
-                // For 192.168.0.0/16, any IP starting with 192.168.0.x should match
-                return client_ip.starts_with("192.168.0.");
-            } else if network_part == "10.0.0.0" {
-                // For 10.0.0.0/8, any IP starting with 10.0.0.x should match
-                return client_ip.starts_with("10.0.0.");
-            } else {
-                // For other CIDR ranges, use simple prefix check
-                return client_ip.starts_with(network_part);
+        if let Some((network_str, prefix_str)) = rule.split_once('/') {
+            let prefix_len: u8 = match prefix_str.parse() {
+                Ok(p) => p,
+                Err(_) => return false,
+            };
+
+            // Parse both IPs as IPv4
+            let client_octets = match parse_ipv4(client_ip) {
+                Some(o) => o,
+                None => return false,
+            };
+            let network_octets = match parse_ipv4(network_str) {
+                Some(o) => o,
+                None => return false,
+            };
+
+            if prefix_len > 32 {
+                return false;
             }
+
+            let client_bits = u32::from_be_bytes(client_octets);
+            let network_bits = u32::from_be_bytes(network_octets);
+            let mask = if prefix_len == 0 {
+                0u32
+            } else {
+                !0u32 << (32 - prefix_len)
+            };
+
+            return (client_bits & mask) == (network_bits & mask);
         }
     }
-    
+
     false
+}
+
+/// Parse a dotted-quad IPv4 address into 4 octets.
+fn parse_ipv4(ip: &str) -> Option<[u8; 4]> {
+    let parts: Vec<&str> = ip.split('.').collect();
+    if parts.len() != 4 {
+        return None;
+    }
+    let a: u8 = parts[0].parse().ok()?;
+    let b: u8 = parts[1].parse().ok()?;
+    let c: u8 = parts[2].parse().ok()?;
+    let d: u8 = parts[3].parse().ok()?;
+    Some([a, b, c, d])
 }
