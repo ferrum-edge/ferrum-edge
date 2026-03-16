@@ -205,13 +205,19 @@ impl ConnectionPool {
         }
     }
 
-    /// Get TLS configuration for HTTP/3 backend connections
+    /// Get TLS configuration for HTTP/3 backend connections.
+    ///
+    /// Configures ALPN with `h3` protocol and ensures TLS 1.3 is available
+    /// (required for QUIC/HTTP/3).
     pub fn get_tls_config_for_backend(&self, _proxy: &Proxy) -> Arc<rustls::ClientConfig> {
-        let client_config = rustls::ClientConfig::builder()
+        let mut client_config = rustls::ClientConfig::builder()
             .with_root_certificates(rustls::RootCertStore::from_iter(
                 webpki_roots::TLS_SERVER_ROOTS.iter().cloned()
             ))
             .with_no_client_auth();
+
+        // HTTP/3 requires ALPN protocol "h3"
+        client_config.alpn_protocols = vec![b"h3".to_vec()];
 
         Arc::new(client_config)
     }
