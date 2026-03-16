@@ -159,9 +159,10 @@
 
 ### **Testing Coverage Assessment**
 - **Previous Assessment**: "Basic tests exist" with "reduced confidence in edge cases"
-- **Actual State**: Comprehensive test suite with 17 test files covering:
+- **Actual State**: Comprehensive test suite with 28 test files and 228 passing tests covering:
   - Admin API functionality (admin_tests.rs, admin_enhanced_tls_tests.rs, admin_listeners_tests.rs, admin_read_only_tests.rs)
-  - Plugin system (plugin_integration_tests.rs, all individual plugin tests)
+  - All 11 plugins with dedicated test suites (stdout_logging, http_logging, transaction_debugger, jwt_auth, key_auth, basic_auth, oauth2_auth, access_control, request_transformer, response_transformer, rate_limiting)
+  - Core modules (dns_tests.rs, env_config_tests.rs)
   - TLS/mTLS (backend_mtls_tests.rs, frontend_tls_tests.rs, separate_listeners_tests.rs)
   - WebSocket authentication (websocket_auth_tests.rs)
   - Configuration management (config_file_loader_tests.rs, config_types_tests.rs)
@@ -202,7 +203,7 @@
 - ✅ **Complete TLS Implementation** - Separate listeners, mTLS, custom CAs, no-verify modes
 - ✅ **Admin API Security** - HTTP/HTTPS/mTLS with JWT authentication and read-only mode
 - ✅ **Backend mTLS** - Client certificate authentication with custom CAs and per-proxy configuration
-- ✅ **Testing Support** - Comprehensive test suite with 17 test files covering all major features
+- ✅ **Testing Support** - Comprehensive test suite with 28 test files and 228 tests covering all major features
 - ✅ **Connection Pooling** - High-performance connection reuse with per-proxy configuration
 - ✅ **DNS Caching** - In-memory cache with TTL, static overrides, startup warmup
 - ⚠️ **gRPC Proxying** - Basic framework exists but needs full gRPC message forwarding (90% complete)

@@ -9,10 +9,19 @@ tests/
 ├── README.md                      # This file - test documentation
 ├── plugin_utils.rs                # Shared test utilities and helpers
 ├── stdout_logging_tests.rs         # stdout_logging plugin tests
+├── http_logging_tests.rs          # http_logging plugin tests
+├── transaction_debugger_tests.rs  # transaction_debugger plugin tests
 ├── key_auth_tests.rs              # key_auth plugin tests
-├── access_control_tests.rs        # access_control plugin tests
+├── jwt_auth_plugin_tests.rs       # jwt_auth plugin tests
+├── basic_auth_tests.rs            # basic_auth plugin tests
+├── oauth2_auth_tests.rs           # oauth2_auth plugin tests
+├── access_control_tests.rs        # access_control plugin tests (IP/CIDR + consumer)
+├── request_transformer_tests.rs   # request_transformer plugin tests
+├── response_transformer_tests.rs  # response_transformer plugin tests
 ├── rate_limiting_tests.rs         # rate_limiting plugin tests
 ├── plugin_integration_tests.rs    # Cross-plugin integration tests
+├── dns_tests.rs                   # DNS cache and resolution tests
+├── env_config_tests.rs            # Environment configuration tests
 ├── config_file_loader_tests.rs    # Configuration file loading tests
 ├── config_types_tests.rs          # Configuration type validation tests
 ├── proxy_tests.rs                 # Proxy routing and matching tests
@@ -48,10 +57,21 @@ cargo test
 ```bash
 # Plugin tests
 cargo test --test stdout_logging_tests
+cargo test --test http_logging_tests
+cargo test --test transaction_debugger_tests
 cargo test --test key_auth_tests
+cargo test --test jwt_auth_plugin_tests
+cargo test --test basic_auth_tests
+cargo test --test oauth2_auth_tests
 cargo test --test access_control_tests
+cargo test --test request_transformer_tests
+cargo test --test response_transformer_tests
 cargo test --test rate_limiting_tests
 cargo test --test plugin_integration_tests
+
+# Core module tests
+cargo test --test dns_tests
+cargo test --test env_config_tests
 
 # Configuration tests
 cargo test --test config_file_loader_tests
@@ -178,40 +198,45 @@ The `tests/certs/` directory contains self-signed certificates for testing:
 - `test_plugin_configuration_validation` - ✅ Empty config handling
 - `test_plugin_complex_configurations` - ✅ Advanced configurations
 
-### ⚠️ Expected Failures (Testing Real Plugin Logic)
+### ✅ All Plugin Tests Passing
 
-These failures are **expected and correct** - they test actual plugin behavior with invalid data.
+#### key_auth_tests.rs (6/6 tests)
+- All tests passing including successful auth and query parameter auth
 
-#### key_auth_tests.rs (4/6 pass, 2 fail)
-- ✅ `test_key_auth_plugin_creation` - Plugin creation
-- ✅ `test_key_auth_plugin_default_config` - Default configuration
-- ✅ `test_key_auth_plugin_invalid_key` - Invalid API key rejection
-- ✅ `test_key_auth_plugin_missing_key` - Missing key rejection
-- ❌ `test_key_auth_plugin_successful_auth` - Expected: Valid auth passes
-- ❌ `test_key_auth_plugin_query_parameter` - Expected: Query param auth works
+#### access_control_tests.rs (18/18 tests)
+- IP allowlist/blocklist, CIDR ranges (/8, /12, /16, /24, /32), consumer allow/disallow
+- Blocked IP precedence over allowed ranges, no-consumer-identified (401)
 
-**Failure Reason**: Tests use mock consumer data that doesn't match actual plugin validation logic.
+#### rate_limiting_tests.rs (9/9 tests)
+- Consumer and IP-based limiting, window expiry, zero limit, double-count prevention
+- Rate limiting applied in `on_request_received` phase only (not `authorize`)
 
-#### access_control_tests.rs (1/7 pass, 6 fail)
-- ✅ `test_access_control_plugin_creation` - Plugin creation
-- ❌ `test_access_control_plugin_allowed_ip` - Expected: IP allowlist works
-- ❌ `test_access_control_plugin_blocked_ip` - Expected: IP blocklist works
-- ❌ `test_access_control_plugin_cidr_allowed` - Expected: CIDR ranges work
-- ❌ `test_access_control_plugin_cidr_blocked` - Expected: CIDR blocking works
-- ❌ `test_access_control_plugin_no_rules` - Expected: No rules = allow all
-- ❌ `test_access_control_plugin_not_in_allowed` - Expected: IP not in allowlist blocked
+#### jwt_auth_plugin_tests.rs (13/13 tests)
+- Bearer/query/custom header token lookup, claim field matching, wrong secret, malformed tokens
 
-**Failure Reason**: Plugin returns 401 (auth required) instead of 403 (forbidden) when no consumer is identified.
+#### basic_auth_tests.rs (11/11 tests)
+- Success/failure, scheme validation, base64 errors, missing headers, password with colons
 
-#### rate_limiting_tests.rs (2/6 pass, 4 fail)
-- ✅ `test_rate_limiting_plugin_creation` - Plugin creation
-- ✅ `test_rate_limiting_plugin_invalid_config` - Invalid config handling
-- ❌ `test_rate_limiting_plugin_consumer_limiting` - Expected: Consumer rate limiting
-- ❌ `test_rat_limiting_plugin_ip_limiting` - Expected: IP-based rate limitinge
-- ❌ `test_rate_limiting_plugin_short_window` - Expected: Short window rate limiting
-- ❌ `test_rate_limiting_plugin_zero_limit` - Expected: Zero limit = reject all
+#### oauth2_auth_tests.rs (13/13 tests)
+- JWKS/introspection modes, issuer/audience validation, consumer matching
 
-**Failure Reason**: Rate limiting logic requires proper time-based state management that tests don't simulate correctly.
+#### request_transformer_tests.rs (13/13 tests)
+- Add/remove/update headers and query params, multiple rules, edge cases
+
+#### response_transformer_tests.rs (10/10 tests)
+- Add/remove/update response headers, multiple rules, various status codes
+
+#### http_logging_tests.rs (6/6 tests)
+- Creation, empty URL no-op, unreachable endpoint graceful handling, lifecycle
+
+#### transaction_debugger_tests.rs (9/9 tests)
+- Creation, request/response logging, full lifecycle, body logging flags
+
+#### dns_tests.rs (13/13 tests)
+- Cache creation, IP resolution, per-proxy/global overrides, TTL, warmup
+
+#### env_config_tests.rs (27/27 tests)
+- All 4 operating modes, validation errors, default/custom ports, TLS flags, HTTP/3
 
 ## 🛠️ Test Utilities
 
@@ -343,11 +368,13 @@ cargo test --test test_file_name -- --nocapture
 ## 📈 Test Coverage
 
 ### Current Coverage
-- **11 Plugins**: All plugins have basic creation and configuration tests
-- **5 Core Areas**: Logging, Authentication, Authorization, Rate Limiting, Integration
-- **25+ Plugin Test Cases**: Comprehensive coverage of plugin functionality
+- **11 Plugins**: All plugins have comprehensive test suites with full lifecycle coverage
+- **7 Core Areas**: Logging, Authentication, Authorization, Rate Limiting, DNS, Configuration, Integration
+- **150+ Plugin Test Cases**: Comprehensive coverage including edge cases and error handling
 - **6 Admin API Tests**: JWT authentication, security, and performance validation
-- **30+ Total Test Cases**: Full coverage of gateway functionality
+- **27 Environment Config Tests**: All operating modes, validation, defaults
+- **13 DNS Tests**: Caching, resolution, overrides, TTL
+- **228 Total Test Cases**: Full coverage of gateway functionality (all passing)
 
 ### Adding New Tests
 

@@ -637,11 +637,13 @@ Authenticates using OAuth2 Bearer tokens via introspection or local JWKS-style v
 
 #### `access_control`
 
-Authorizes requests based on the identified consumer's username.
+Authorizes requests based on IP address, CIDR range, and/or the identified consumer's username. Blocked IPs take precedence over allowed IPs. If `allowed_ips` is specified, only IPs in that list are permitted; all others are rejected.
 
 **Config**:
 | Parameter | Type | Description |
 |---|---|---|
+| `allowed_ips` | String[] | IP addresses or CIDR ranges allowed (e.g., `["10.0.0.0/8", "192.168.1.1"]`) |
+| `blocked_ips` | String[] | IP addresses or CIDR ranges explicitly denied |
 | `allowed_consumers` | String[] | Usernames allowed access (empty = allow all) |
 | `disallowed_consumers` | String[] | Usernames explicitly denied |
 
