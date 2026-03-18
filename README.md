@@ -69,6 +69,9 @@ Handles proxy traffic only, receiving its configuration from a Control Plane nod
 - Receives initial config and subsequent updates
 - Continues serving with cached config if CP connection is lost
 - Automatically reconnects to CP
+- Exposes a read-only Admin API for monitoring
+
+See [docs/cp_dp_mode.md](docs/cp_dp_mode.md) for detailed architecture, protocol, and deployment documentation.
 
 ## Admin Read-Only Mode
 
