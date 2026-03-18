@@ -1,6 +1,7 @@
 //! Tests for oauth2_auth plugin
 
 use ferrum_gateway::plugins::{oauth2_auth::OAuth2Auth, Plugin, RequestContext};
+use ferrum_gateway::ConsumerIndex;
 use serde_json::json;
 use std::collections::HashMap;
 
@@ -69,7 +70,7 @@ async fn test_oauth2_auth_jwks_uri_config() {
 async fn test_oauth2_auth_jwks_mode_valid_token() {
     let plugin = OAuth2Auth::new(&json!({"validation_mode": "jwks"}));
     let consumer = create_oauth2_consumer("oauth-user", "my-oauth-secret");
-    let consumers = vec![consumer];
+    let consumer_index = ConsumerIndex::new(&[consumer]);
 
     let token = create_jwt_token(&json!({"sub": "oauth-user"}), "my-oauth-secret");
 
@@ -77,7 +78,7 @@ async fn test_oauth2_auth_jwks_mode_valid_token() {
     ctx.headers.insert("authorization".to_string(), format!("Bearer {}", token));
     ctx.identified_consumer = None;
 
-    let result = plugin.authenticate(&mut ctx, &consumers).await;
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
     assert_continue(result);
     assert!(ctx.identified_consumer.is_some());
     assert_eq!(ctx.identified_consumer.unwrap().username, "oauth-user");
@@ -87,38 +88,38 @@ async fn test_oauth2_auth_jwks_mode_valid_token() {
 async fn test_oauth2_auth_jwks_mode_invalid_token() {
     let plugin = OAuth2Auth::new(&json!({"validation_mode": "jwks"}));
     let consumer = create_oauth2_consumer("oauth-user", "my-oauth-secret");
-    let consumers = vec![consumer];
+    let consumer_index = ConsumerIndex::new(&[consumer]);
 
     let token = create_jwt_token(&json!({"sub": "oauth-user"}), "wrong-secret");
 
     let mut ctx = make_ctx();
     ctx.headers.insert("authorization".to_string(), format!("Bearer {}", token));
 
-    let result = plugin.authenticate(&mut ctx, &consumers).await;
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
     assert_reject(result, Some(401));
 }
 
 #[tokio::test]
 async fn test_oauth2_auth_missing_bearer_token() {
     let plugin = OAuth2Auth::new(&json!({}));
-    let consumers = vec![create_oauth2_consumer("oauth-user", "secret")];
+    let consumer_index = ConsumerIndex::new(&[create_oauth2_consumer("oauth-user", "secret")]);
 
     let mut ctx = make_ctx();
     // No authorization header
 
-    let result = plugin.authenticate(&mut ctx, &consumers).await;
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
     assert_reject(result, Some(401));
 }
 
 #[tokio::test]
 async fn test_oauth2_auth_non_bearer_scheme() {
     let plugin = OAuth2Auth::new(&json!({}));
-    let consumers = vec![create_oauth2_consumer("oauth-user", "secret")];
+    let consumer_index = ConsumerIndex::new(&[create_oauth2_consumer("oauth-user", "secret")]);
 
     let mut ctx = make_ctx();
     ctx.headers.insert("authorization".to_string(), "Basic dXNlcjpwYXNz".to_string());
 
-    let result = plugin.authenticate(&mut ctx, &consumers).await;
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
     assert_reject(result, Some(401));
 }
 
@@ -126,28 +127,28 @@ async fn test_oauth2_auth_non_bearer_scheme() {
 async fn test_oauth2_auth_introspection_mode_no_url() {
     // Introspection mode without a URL should reject
     let plugin = OAuth2Auth::new(&json!({"validation_mode": "introspection"}));
-    let consumers = vec![create_oauth2_consumer("oauth-user", "secret")];
+    let consumer_index = ConsumerIndex::new(&[create_oauth2_consumer("oauth-user", "secret")]);
 
     let token = create_jwt_token(&json!({"sub": "oauth-user"}), "secret");
 
     let mut ctx = make_ctx();
     ctx.headers.insert("authorization".to_string(), format!("Bearer {}", token));
 
-    let result = plugin.authenticate(&mut ctx, &consumers).await;
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
     assert_reject(result, Some(401));
 }
 
 #[tokio::test]
 async fn test_oauth2_auth_empty_consumers() {
     let plugin = OAuth2Auth::new(&json!({"validation_mode": "jwks"}));
-    let consumers: Vec<ferrum_gateway::config::types::Consumer> = vec![];
+    let consumer_index = ConsumerIndex::new(&[]);
 
     let token = create_jwt_token(&json!({"sub": "nobody"}), "any-secret");
 
     let mut ctx = make_ctx();
     ctx.headers.insert("authorization".to_string(), format!("Bearer {}", token));
 
-    let result = plugin.authenticate(&mut ctx, &consumers).await;
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
     assert_reject(result, Some(401));
 }
 
@@ -158,7 +159,7 @@ async fn test_oauth2_auth_jwks_with_issuer_validation() {
         "expected_issuer": "https://auth.example.com"
     }));
     let consumer = create_oauth2_consumer("oauth-user", "my-oauth-secret");
-    let consumers = vec![consumer];
+    let consumer_index = ConsumerIndex::new(&[consumer]);
 
     // Token with matching issuer
     let token = create_jwt_token(
@@ -170,7 +171,7 @@ async fn test_oauth2_auth_jwks_with_issuer_validation() {
     ctx.headers.insert("authorization".to_string(), format!("Bearer {}", token));
     ctx.identified_consumer = None;
 
-    let result = plugin.authenticate(&mut ctx, &consumers).await;
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
     assert_continue(result);
 }
 
@@ -181,7 +182,7 @@ async fn test_oauth2_auth_jwks_wrong_issuer_rejected() {
         "expected_issuer": "https://auth.example.com"
     }));
     let consumer = create_oauth2_consumer("oauth-user", "my-oauth-secret");
-    let consumers = vec![consumer];
+    let consumer_index = ConsumerIndex::new(&[consumer]);
 
     // Token with wrong issuer
     let token = create_jwt_token(
@@ -192,7 +193,7 @@ async fn test_oauth2_auth_jwks_wrong_issuer_rejected() {
     let mut ctx = make_ctx();
     ctx.headers.insert("authorization".to_string(), format!("Bearer {}", token));
 
-    let result = plugin.authenticate(&mut ctx, &consumers).await;
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
     assert_reject(result, Some(401));
 }
 
@@ -203,7 +204,7 @@ async fn test_oauth2_auth_jwks_with_audience_validation() {
         "expected_audience": "my-api"
     }));
     let consumer = create_oauth2_consumer("oauth-user", "my-oauth-secret");
-    let consumers = vec![consumer];
+    let consumer_index = ConsumerIndex::new(&[consumer]);
 
     let token = create_jwt_token(
         &json!({"sub": "oauth-user", "aud": "my-api"}),
@@ -214,7 +215,7 @@ async fn test_oauth2_auth_jwks_with_audience_validation() {
     ctx.headers.insert("authorization".to_string(), format!("Bearer {}", token));
     ctx.identified_consumer = None;
 
-    let result = plugin.authenticate(&mut ctx, &consumers).await;
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
     assert_continue(result);
 }
 
@@ -223,7 +224,7 @@ async fn test_oauth2_auth_default_mode_is_jwks() {
     // Default validation_mode should be "jwks"
     let plugin = OAuth2Auth::new(&json!({}));
     let consumer = create_oauth2_consumer("oauth-user", "my-oauth-secret");
-    let consumers = vec![consumer];
+    let consumer_index = ConsumerIndex::new(&[consumer]);
 
     let token = create_jwt_token(&json!({"sub": "oauth-user"}), "my-oauth-secret");
 
@@ -231,7 +232,7 @@ async fn test_oauth2_auth_default_mode_is_jwks() {
     ctx.headers.insert("authorization".to_string(), format!("Bearer {}", token));
     ctx.identified_consumer = None;
 
-    let result = plugin.authenticate(&mut ctx, &consumers).await;
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
     assert_continue(result);
     assert!(ctx.identified_consumer.is_some());
 }

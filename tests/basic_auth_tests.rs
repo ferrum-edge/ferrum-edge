@@ -1,6 +1,7 @@
 //! Tests for basic_auth plugin
 
 use ferrum_gateway::plugins::{basic_auth::BasicAuth, Plugin, RequestContext};
+use ferrum_gateway::ConsumerIndex;
 use serde_json::json;
 
 mod plugin_utils;
@@ -49,14 +50,14 @@ async fn test_basic_auth_plugin_creation() {
 async fn test_basic_auth_successful() {
     let plugin = BasicAuth::new(&json!({}));
     let consumer = create_basic_auth_consumer();
-    let consumers = vec![consumer];
+    let consumer_index = ConsumerIndex::new(&[consumer]);
 
     let mut ctx = make_ctx();
     // The test consumer has bcrypt hash for password "password"
     ctx.headers.insert("authorization".to_string(), basic_header("testuser", "password"));
     ctx.identified_consumer = None;
 
-    let result = plugin.authenticate(&mut ctx, &consumers).await;
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
     assert_continue(result);
     assert!(ctx.identified_consumer.is_some());
     assert_eq!(ctx.identified_consumer.unwrap().username, "testuser");
@@ -66,13 +67,13 @@ async fn test_basic_auth_successful() {
 async fn test_basic_auth_wrong_password() {
     let plugin = BasicAuth::new(&json!({}));
     let consumer = create_basic_auth_consumer();
-    let consumers = vec![consumer];
+    let consumer_index = ConsumerIndex::new(&[consumer]);
 
     let mut ctx = make_ctx();
     ctx.headers.insert("authorization".to_string(), basic_header("testuser", "wrongpassword"));
     ctx.identified_consumer = None;
 
-    let result = plugin.authenticate(&mut ctx, &consumers).await;
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
     assert_reject(result, Some(401));
 }
 
@@ -80,62 +81,62 @@ async fn test_basic_auth_wrong_password() {
 async fn test_basic_auth_wrong_username() {
     let plugin = BasicAuth::new(&json!({}));
     let consumer = create_basic_auth_consumer();
-    let consumers = vec![consumer];
+    let consumer_index = ConsumerIndex::new(&[consumer]);
 
     let mut ctx = make_ctx();
     ctx.headers.insert("authorization".to_string(), basic_header("unknownuser", "password"));
     ctx.identified_consumer = None;
 
-    let result = plugin.authenticate(&mut ctx, &consumers).await;
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
     assert_reject(result, Some(401));
 }
 
 #[tokio::test]
 async fn test_basic_auth_missing_header() {
     let plugin = BasicAuth::new(&json!({}));
-    let consumers = vec![create_basic_auth_consumer()];
+    let consumer_index = ConsumerIndex::new(&[create_basic_auth_consumer()]);
 
     let mut ctx = make_ctx();
     // No authorization header
-    let result = plugin.authenticate(&mut ctx, &consumers).await;
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
     assert_reject(result, Some(401));
 }
 
 #[tokio::test]
 async fn test_basic_auth_invalid_scheme() {
     let plugin = BasicAuth::new(&json!({}));
-    let consumers = vec![create_basic_auth_consumer()];
+    let consumer_index = ConsumerIndex::new(&[create_basic_auth_consumer()]);
 
     let mut ctx = make_ctx();
     ctx.headers.insert("authorization".to_string(), "Bearer some-token".to_string());
 
-    let result = plugin.authenticate(&mut ctx, &consumers).await;
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
     assert_reject(result, Some(401));
 }
 
 #[tokio::test]
 async fn test_basic_auth_invalid_base64() {
     let plugin = BasicAuth::new(&json!({}));
-    let consumers = vec![create_basic_auth_consumer()];
+    let consumer_index = ConsumerIndex::new(&[create_basic_auth_consumer()]);
 
     let mut ctx = make_ctx();
     ctx.headers.insert("authorization".to_string(), "Basic !!!not-valid-base64!!!".to_string());
 
-    let result = plugin.authenticate(&mut ctx, &consumers).await;
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
     assert_reject(result, Some(401));
 }
 
 #[tokio::test]
 async fn test_basic_auth_missing_colon_separator() {
     let plugin = BasicAuth::new(&json!({}));
-    let consumers = vec![create_basic_auth_consumer()];
+    let consumer_index = ConsumerIndex::new(&[create_basic_auth_consumer()]);
 
     let mut ctx = make_ctx();
     use base64::Engine;
     let encoded = base64::engine::general_purpose::STANDARD.encode("nocolonhere");
     ctx.headers.insert("authorization".to_string(), format!("Basic {}", encoded));
 
-    let result = plugin.authenticate(&mut ctx, &consumers).await;
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
     assert_reject(result, Some(401));
 }
 
@@ -143,7 +144,7 @@ async fn test_basic_auth_missing_colon_separator() {
 async fn test_basic_auth_case_insensitive_scheme() {
     let plugin = BasicAuth::new(&json!({}));
     let consumer = create_basic_auth_consumer();
-    let consumers = vec![consumer];
+    let consumer_index = ConsumerIndex::new(&[consumer]);
 
     let mut ctx = make_ctx();
     // Use lowercase "basic" instead of "Basic"
@@ -152,7 +153,7 @@ async fn test_basic_auth_case_insensitive_scheme() {
     ctx.headers.insert("authorization".to_string(), format!("basic {}", encoded));
     ctx.identified_consumer = None;
 
-    let result = plugin.authenticate(&mut ctx, &consumers).await;
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
     assert_continue(result);
     assert!(ctx.identified_consumer.is_some());
 }
@@ -160,12 +161,12 @@ async fn test_basic_auth_case_insensitive_scheme() {
 #[tokio::test]
 async fn test_basic_auth_empty_consumers() {
     let plugin = BasicAuth::new(&json!({}));
-    let consumers: Vec<ferrum_gateway::config::types::Consumer> = vec![];
+    let consumer_index = ConsumerIndex::new(&[]);
 
     let mut ctx = make_ctx();
     ctx.headers.insert("authorization".to_string(), basic_header("testuser", "password"));
 
-    let result = plugin.authenticate(&mut ctx, &consumers).await;
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
     assert_reject(result, Some(401));
 }
 
@@ -174,7 +175,7 @@ async fn test_basic_auth_password_with_colon() {
     let plugin = BasicAuth::new(&json!({}));
     // Password containing colons should work because splitn(2, ':') is used
     let consumer = create_basic_auth_consumer();
-    let consumers = vec![consumer];
+    let consumer_index = ConsumerIndex::new(&[consumer]);
 
     let mut ctx = make_ctx();
     // "testuser:pass:word:with:colons" should split as user="testuser", pass="pass:word:with:colons"
@@ -184,6 +185,6 @@ async fn test_basic_auth_password_with_colon() {
     ctx.identified_consumer = None;
 
     // This will fail because the password hash won't match, but the parsing should succeed
-    let result = plugin.authenticate(&mut ctx, &consumers).await;
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
     assert_reject(result, Some(401));
 }

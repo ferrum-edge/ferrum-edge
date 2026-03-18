@@ -8,7 +8,7 @@ use ferrum_gateway::config::types::{GatewayConfig, Proxy, BackendProtocol};
 use ferrum_gateway::connection_pool::ConnectionPool;
 use ferrum_gateway::dns::DnsCache;
 use ferrum_gateway::proxy::ProxyState;
-use ferrum_gateway::RouterCache;
+use ferrum_gateway::{ConsumerIndex, PluginCache, RouterCache};
 use tracing::info;
 
 // Initialize rustls crypto provider for tests
@@ -249,12 +249,17 @@ async fn test_http3_proxy_state_creation() {
     let dns_cache = DnsCache::new(300, std::collections::HashMap::new());
     let connection_pool = Arc::new(ConnectionPool::new(pool_config, env_config));
     
-    let router_cache = Arc::new(RouterCache::new(&create_http3_test_gateway_config(), 10_000));
+    let gc = create_http3_test_gateway_config();
+    let router_cache = Arc::new(RouterCache::new(&gc, 10_000));
+    let plugin_cache = Arc::new(PluginCache::new(&gc));
+    let consumer_index = Arc::new(ConsumerIndex::new(&gc.consumers));
     let proxy_state = ProxyState {
         config: gateway_config,
         dns_cache,
         connection_pool,
         router_cache,
+        plugin_cache,
+        consumer_index,
         request_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         status_counts: Arc::new(dashmap::DashMap::new()),
         enable_http3: true,
@@ -362,12 +367,17 @@ async fn test_http3_full_integration() {
     let connection_pool = Arc::new(ConnectionPool::new(pool_config, env_config));
     
     // Create proxy state with HTTP/3 support
-    let router_cache = Arc::new(RouterCache::new(&create_http3_test_gateway_config(), 10_000));
+    let gc = create_http3_test_gateway_config();
+    let router_cache = Arc::new(RouterCache::new(&gc, 10_000));
+    let plugin_cache = Arc::new(PluginCache::new(&gc));
+    let consumer_index = Arc::new(ConsumerIndex::new(&gc.consumers));
     let proxy_state = ProxyState {
         config: gateway_config,
         dns_cache,
         connection_pool,
         router_cache,
+        plugin_cache,
+        consumer_index,
         request_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         status_counts: Arc::new(dashmap::DashMap::new()),
         enable_http3: true,

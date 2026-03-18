@@ -10,9 +10,9 @@ use quinn::crypto::rustls::QuicServerConfig;
 use tracing::{debug, error, info, warn};
 
 use super::config::Http3ServerConfig;
-use crate::config::types::{AuthMode, GatewayConfig, Proxy};
+use crate::config::types::{AuthMode, Proxy};
 use crate::plugins::{
-    create_plugin, Plugin, PluginResult, RequestContext, TransactionSummary,
+    Plugin, PluginResult, RequestContext, TransactionSummary,
 };
 use crate::proxy::ProxyState;
 
@@ -129,7 +129,6 @@ async fn handle_h3_request(
     remote_addr: SocketAddr,
 ) -> Result<(), anyhow::Error> {
     let start_time = std::time::Instant::now();
-    let config = state.current_config();
 
     let method = req.method().to_string();
     let path = req.uri().path().to_string();
@@ -171,8 +170,8 @@ async fn handle_h3_request(
 
     ctx.matched_proxy = Some(proxy.clone());
 
-    // Resolve plugins for this proxy
-    let plugins = resolve_plugins(&config, &proxy);
+    // Get pre-resolved plugins from cache (O(1) lookup)
+    let plugins = state.plugin_cache.get_plugins(&proxy.id);
 
     // Execute on_request_received hooks
     for plugin in &plugins {
@@ -201,17 +200,15 @@ async fn handle_h3_request(
         })
         .collect();
 
-    let consumers = &config.consumers;
-
     match proxy.auth_mode {
         AuthMode::Multi => {
             for auth_plugin in &auth_plugins {
-                let _ = auth_plugin.authenticate(&mut ctx, consumers).await;
+                let _ = auth_plugin.authenticate(&mut ctx, &state.consumer_index).await;
             }
         }
         AuthMode::Single => {
             for auth_plugin in &auth_plugins {
-                match auth_plugin.authenticate(&mut ctx, consumers).await {
+                match auth_plugin.authenticate(&mut ctx, &state.consumer_index).await {
                     PluginResult::Reject { status_code, body } => {
                         record_request(&state, status_code);
                         send_h3_response(
@@ -459,45 +456,6 @@ async fn send_h3_response(
         .await?;
     stream.finish().await?;
     Ok(())
-}
-
-/// Resolve which plugins apply to this proxy request.
-fn resolve_plugins(config: &GatewayConfig, proxy: &Proxy) -> Vec<Arc<dyn Plugin>> {
-    let mut plugins: Vec<Arc<dyn Plugin>> = Vec::new();
-
-    for pc in &config.plugin_configs {
-        if !pc.enabled {
-            continue;
-        }
-        if pc.scope == crate::config::types::PluginScope::Global {
-            if let Some(plugin) = create_plugin(&pc.plugin_name, &pc.config) {
-                plugins.push(plugin);
-            }
-        }
-    }
-
-    let proxy_plugin_ids: Vec<&str> = proxy
-        .plugins
-        .iter()
-        .map(|a| a.plugin_config_id.as_str())
-        .collect();
-
-    for pc in &config.plugin_configs {
-        if !pc.enabled {
-            continue;
-        }
-        if pc.scope == crate::config::types::PluginScope::Proxy
-            && pc.proxy_id.as_deref() == Some(&proxy.id)
-            && proxy_plugin_ids.contains(&pc.id.as_str())
-        {
-            if let Some(plugin) = create_plugin(&pc.plugin_name, &pc.config) {
-                plugins.retain(|p| p.name() != plugin.name());
-                plugins.push(plugin);
-            }
-        }
-    }
-
-    plugins
 }
 
 fn strip_query_params(url: &str) -> String {

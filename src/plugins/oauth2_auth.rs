@@ -3,7 +3,7 @@ use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
 use serde_json::Value;
 use tracing::{debug, warn};
 
-use crate::config::types::Consumer;
+use crate::consumer_index::ConsumerIndex;
 
 use super::{Plugin, PluginResult, RequestContext};
 
@@ -51,7 +51,7 @@ impl Plugin for OAuth2Auth {
     async fn authenticate(
         &self,
         ctx: &mut RequestContext,
-        consumers: &[Consumer],
+        consumer_index: &ConsumerIndex,
     ) -> PluginResult {
         let token = match Self::extract_bearer_token(ctx) {
             Some(t) => t,
@@ -78,16 +78,14 @@ impl Plugin for OAuth2Auth {
                             if let Ok(body) = resp.json::<Value>().await {
                                 let active = body["active"].as_bool().unwrap_or(false);
                                 if active {
-                                    // Try to find consumer by subject
+                                    // O(1) lookup by subject via ConsumerIndex
                                     if let Some(sub) = body["sub"].as_str() {
-                                        for consumer in consumers {
-                                            if consumer.username == sub || consumer.id == sub {
-                                                if ctx.identified_consumer.is_none() {
-                                                    ctx.identified_consumer =
-                                                        Some(consumer.clone());
-                                                }
-                                                return PluginResult::Continue;
+                                        if let Some(consumer) = consumer_index.find_by_identity(sub) {
+                                            if ctx.identified_consumer.is_none() {
+                                                ctx.identified_consumer =
+                                                    Some((*consumer).clone());
                                             }
+                                            return PluginResult::Continue;
                                         }
                                     }
                                     return PluginResult::Continue;
@@ -107,7 +105,8 @@ impl Plugin for OAuth2Auth {
             "jwks" | _ => {
                 // For JWKS-based validation, try consumer OAuth2 credentials with local secrets
                 debug!("OAuth2 JWKS validation mode, jwks_uri: {:?}", self.jwks_uri());
-                for consumer in consumers {
+                let consumers = consumer_index.consumers();
+                for consumer in consumers.iter() {
                     if let Some(oauth_creds) = consumer.credentials.get("oauth2") {
                         if let Some(secret) = oauth_creds.get("secret").and_then(|s| s.as_str()) {
                             let key = DecodingKey::from_secret(secret.as_bytes());
@@ -130,7 +129,7 @@ impl Plugin for OAuth2Auth {
                                         "oauth2_auth: identified consumer '{}'",
                                         consumer.username
                                     );
-                                    ctx.identified_consumer = Some(consumer.clone());
+                                    ctx.identified_consumer = Some((**consumer).clone());
                                 }
                                 return PluginResult::Continue;
                             }

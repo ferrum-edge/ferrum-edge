@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 use tracing::debug;
 
-use crate::config::types::Consumer;
+use crate::consumer_index::ConsumerIndex;
 
 use super::{Plugin, PluginResult, RequestContext};
 
@@ -44,7 +44,7 @@ impl Plugin for KeyAuth {
     async fn authenticate(
         &self,
         ctx: &mut RequestContext,
-        consumers: &[Consumer],
+        consumer_index: &ConsumerIndex,
     ) -> PluginResult {
         let api_key = match self.extract_key(ctx) {
             Some(k) => k,
@@ -56,18 +56,13 @@ impl Plugin for KeyAuth {
             }
         };
 
-        for consumer in consumers {
-            if let Some(key_creds) = consumer.credentials.get("keyauth") {
-                if let Some(key) = key_creds.get("key").and_then(|s| s.as_str()) {
-                    if key == api_key {
-                        if ctx.identified_consumer.is_none() {
-                            debug!("key_auth: identified consumer '{}'", consumer.username);
-                            ctx.identified_consumer = Some(consumer.clone());
-                        }
-                        return PluginResult::Continue;
-                    }
-                }
+        // O(1) lookup by API key via ConsumerIndex
+        if let Some(consumer) = consumer_index.find_by_api_key(&api_key) {
+            if ctx.identified_consumer.is_none() {
+                debug!("key_auth: identified consumer '{}'", consumer.username);
+                ctx.identified_consumer = Some((*consumer).clone());
             }
+            return PluginResult::Continue;
         }
 
         PluginResult::Reject {

@@ -23,7 +23,8 @@ async fn test_stdout_logging_plugin_lifecycle() {
     let result = plugin.on_request_received(&mut ctx).await;
     assert!(matches!(result, PluginResult::Continue));
     
-    let result = plugin.authenticate(&mut ctx, &[]).await;
+    let consumer_index = ferrum_gateway::ConsumerIndex::new(&[]);
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
     assert!(matches!(result, PluginResult::Continue));
     
     let result = plugin.authorize(&mut ctx).await;

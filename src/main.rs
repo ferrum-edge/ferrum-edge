@@ -1,10 +1,12 @@
 mod admin;
 mod config;
 mod connection_pool;
+mod consumer_index;
 mod dns;
 mod grpc;
 mod http3;
 mod modes;
+mod plugin_cache;
 mod plugins;
 mod proxy;
 mod router_cache;

@@ -17,6 +17,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::config::types::{Consumer, Proxy};
+use crate::consumer_index::ConsumerIndex;
 
 /// Context passed through the plugin pipeline for a single request.
 #[derive(Debug, Clone)]
@@ -92,11 +93,11 @@ pub trait Plugin: Send + Sync {
         PluginResult::Continue
     }
 
-    /// Authentication phase.
+    /// Authentication phase. Uses ConsumerIndex for O(1) credential lookups.
     async fn authenticate(
         &self,
         _ctx: &mut RequestContext,
-        _consumers: &[Consumer],
+        _consumer_index: &ConsumerIndex,
     ) -> PluginResult {
         PluginResult::Continue
     }

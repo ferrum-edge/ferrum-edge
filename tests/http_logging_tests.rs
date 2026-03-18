@@ -66,12 +66,12 @@ async fn test_http_logging_default_lifecycle_phases() {
         "GET".to_string(),
         "/test".to_string(),
     );
-    let consumers = vec![];
+    let consumer_index = ferrum_gateway::ConsumerIndex::new(&[]);
 
     let result = plugin.on_request_received(&mut ctx).await;
     assert!(matches!(result, ferrum_gateway::plugins::PluginResult::Continue));
 
-    let result = plugin.authenticate(&mut ctx, &consumers).await;
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
     assert!(matches!(result, ferrum_gateway::plugins::PluginResult::Continue));
 
     let result = plugin.authorize(&mut ctx).await;

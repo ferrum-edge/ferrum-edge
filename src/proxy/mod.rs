@@ -20,9 +20,11 @@ use tracing::{debug, error, info, warn};
 use crate::config::types::{AuthMode, BackendProtocol, GatewayConfig, Proxy};
 use crate::config::PoolConfig;
 use crate::connection_pool::ConnectionPool;
+use crate::consumer_index::ConsumerIndex;
 use crate::dns::DnsCache;
+use crate::plugin_cache::PluginCache;
 use crate::plugins::{
-    create_plugin, Plugin, PluginResult, RequestContext, TransactionSummary,
+    Plugin, PluginResult, RequestContext, TransactionSummary,
 };
 use crate::http3::client::Http3Client;
 use crate::router_cache::RouterCache;
@@ -48,6 +50,8 @@ pub struct ProxyState {
     pub dns_cache: DnsCache,
     pub connection_pool: Arc<ConnectionPool>,
     pub router_cache: Arc<RouterCache>,
+    pub plugin_cache: Arc<PluginCache>,
+    pub consumer_index: Arc<ConsumerIndex>,
     pub request_count: Arc<AtomicU64>,
     pub status_counts: Arc<dashmap::DashMap<u16, AtomicU64>>,
     /// Whether HTTP/3 is enabled (used for Alt-Svc header advertisement)
@@ -65,12 +69,18 @@ impl ProxyState {
         let connection_pool = Arc::new(ConnectionPool::new(global_pool_config, env_config));
         // Build router cache with pre-sorted route table for fast prefix matching
         let router_cache = Arc::new(RouterCache::new(&config, 10_000));
+        // Pre-resolve plugins per proxy (fixes rate_limiting state persistence bug)
+        let plugin_cache = Arc::new(PluginCache::new(&config));
+        // Build credential-indexed consumer lookup for O(1) auth
+        let consumer_index = Arc::new(ConsumerIndex::new(&config.consumers));
 
         Self {
             config: Arc::new(ArcSwap::new(Arc::new(config))),
             dns_cache,
             connection_pool,
             router_cache,
+            plugin_cache,
+            consumer_index,
             request_count: Arc::new(AtomicU64::new(0)),
             status_counts: Arc::new(dashmap::DashMap::new()),
             enable_http3,
@@ -80,8 +90,10 @@ impl ProxyState {
 
     pub fn update_config(&self, new_config: GatewayConfig) {
         self.router_cache.rebuild(&new_config);
+        self.plugin_cache.rebuild(&new_config);
+        self.consumer_index.rebuild(&new_config.consumers);
         self.config.store(Arc::new(new_config));
-        info!("Proxy configuration updated atomically");
+        info!("Proxy configuration updated atomically (router + plugins + consumers rebuilt)");
     }
 
     pub fn current_config(&self) -> Arc<GatewayConfig> {
@@ -595,7 +607,6 @@ async fn handle_proxy_request(
     remote_addr: SocketAddr,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     let start_time = Instant::now();
-    let config = state.current_config();
 
     let method = req.method().to_string();
     let path = req.uri().path().to_string();
@@ -636,8 +647,8 @@ async fn handle_proxy_request(
 
     ctx.matched_proxy = Some(proxy.clone());
 
-    // Resolve plugins for this proxy
-    let plugins = resolve_plugins(&config, &proxy);
+    // Get pre-resolved plugins from cache (O(1) lookup, no per-request allocation)
+    let plugins = state.plugin_cache.get_plugins(&proxy.id);
 
     // Execute on_request_received hooks
     for plugin in &plugins {
@@ -664,13 +675,11 @@ async fn handle_proxy_request(
         })
         .collect();
 
-    let consumers = &config.consumers;
-
     match proxy.auth_mode {
         AuthMode::Multi => {
             // Execute ALL auth plugins; first success sets consumer
             for auth_plugin in &auth_plugins {
-                let _ = auth_plugin.authenticate(&mut ctx, consumers).await;
+                let _ = auth_plugin.authenticate(&mut ctx, &state.consumer_index).await;
                 // In multi mode, we don't reject on individual failure
             }
             // After all auth plugins, check if any consumer was identified
@@ -679,7 +688,7 @@ async fn handle_proxy_request(
         AuthMode::Single => {
             // Execute auth plugins sequentially; first failure rejects
             for auth_plugin in &auth_plugins {
-                match auth_plugin.authenticate(&mut ctx, consumers).await {
+                match auth_plugin.authenticate(&mut ctx, &state.consumer_index).await {
                     PluginResult::Reject { status_code, body } => {
                         record_request(&state, status_code);
                         return Ok(build_response(
@@ -822,49 +831,6 @@ pub fn find_matching_proxy(config: &GatewayConfig, path: &str) -> Option<Proxy> 
     }
 
     best_match.cloned()
-}
-
-/// Resolve which plugins apply to this proxy request.
-fn resolve_plugins(config: &GatewayConfig, proxy: &Proxy) -> Vec<Arc<dyn Plugin>> {
-    let mut plugins: Vec<Arc<dyn Plugin>> = Vec::new();
-
-    // Global plugins
-    for pc in &config.plugin_configs {
-        if !pc.enabled {
-            continue;
-        }
-        if pc.scope == crate::config::types::PluginScope::Global {
-            if let Some(plugin) = create_plugin(&pc.plugin_name, &pc.config) {
-                plugins.push(plugin);
-            }
-        }
-    }
-
-    // Proxy-scoped plugins (override globals of same name)
-    let proxy_plugin_ids: Vec<&str> = proxy
-        .plugins
-        .iter()
-        .map(|a| a.plugin_config_id.as_str())
-        .collect();
-
-    // Only process plugin configs that are assigned to this proxy
-    for pc in &config.plugin_configs {
-        if !pc.enabled {
-            continue;
-        }
-        if pc.scope == crate::config::types::PluginScope::Proxy
-            && pc.proxy_id.as_deref() == Some(&proxy.id)
-            && proxy_plugin_ids.contains(&pc.id.as_str())
-        {
-            if let Some(plugin) = create_plugin(&pc.plugin_name, &pc.config) {
-                // Remove any global plugin of the same name
-                plugins.retain(|p| p.name() != plugin.name());
-                plugins.push(plugin);
-            }
-        }
-    }
-
-    plugins
 }
 
 /// Build the backend URL based on proxy config and path forwarding logic.

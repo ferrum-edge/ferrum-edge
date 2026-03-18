@@ -3,7 +3,7 @@ use base64::Engine;
 use serde_json::Value;
 use tracing::debug;
 
-use crate::config::types::Consumer;
+use crate::consumer_index::ConsumerIndex;
 
 use super::{Plugin, PluginResult, RequestContext};
 
@@ -24,7 +24,7 @@ impl Plugin for BasicAuth {
     async fn authenticate(
         &self,
         ctx: &mut RequestContext,
-        consumers: &[Consumer],
+        consumer_index: &ConsumerIndex,
     ) -> PluginResult {
         let auth_header = match ctx.headers.get("authorization") {
             Some(h) => h.clone(),
@@ -75,18 +75,15 @@ impl Plugin for BasicAuth {
         let username = parts[0];
         let password = parts[1];
 
-        for consumer in consumers {
-            if consumer.username != username {
-                continue;
-            }
-
+        // O(1) lookup by username via ConsumerIndex
+        if let Some(consumer) = consumer_index.find_by_username(username) {
             if let Some(basic_creds) = consumer.credentials.get("basicauth") {
                 if let Some(hashed) = basic_creds.get("password_hash").and_then(|s| s.as_str()) {
                     // Verify bcrypt hash
                     if bcrypt::verify(password, hashed).unwrap_or(false) {
                         if ctx.identified_consumer.is_none() {
                             debug!("basic_auth: identified consumer '{}'", consumer.username);
-                            ctx.identified_consumer = Some(consumer.clone());
+                            ctx.identified_consumer = Some((*consumer).clone());
                         }
                         return PluginResult::Continue;
                     }

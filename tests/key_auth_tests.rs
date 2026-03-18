@@ -1,6 +1,7 @@
 //! Tests for key_auth plugin
 
 use ferrum_gateway::plugins::{key_auth::KeyAuth, Plugin};
+use ferrum_gateway::ConsumerIndex;
 use serde_json::json;
 
 mod plugin_utils;
@@ -30,13 +31,13 @@ async fn test_key_auth_plugin_successful_auth() {
     let plugin = KeyAuth::new(&config);
     
     let consumer = create_test_consumer();
-    let consumers = vec![consumer.clone()];
-    
+    let consumer_index = ConsumerIndex::new(&[consumer]);
+
     // Test successful authentication
     let mut valid_ctx = create_test_context();
     valid_ctx.headers.insert("X-API-Key".to_string(), "test-api-key".to_string());
-    
-    let result = plugin.authenticate(&mut valid_ctx, &consumers).await;
+
+    let result = plugin.authenticate(&mut valid_ctx, &consumer_index).await;
     assert_continue(result);
     assert!(valid_ctx.identified_consumer.is_some());
 }
@@ -49,13 +50,13 @@ async fn test_key_auth_plugin_missing_key() {
     let plugin = KeyAuth::new(&config);
     
     let consumer = create_test_consumer();
-    let consumers = vec![consumer];
-    
+    let consumer_index = ConsumerIndex::new(&[consumer]);
+
     // Test failed authentication with missing key
     let mut invalid_ctx = create_test_context();
     invalid_ctx.headers.remove("X-API-Key");
-    
-    let result = plugin.authenticate(&mut invalid_ctx, &consumers).await;
+
+    let result = plugin.authenticate(&mut invalid_ctx, &consumer_index).await;
     assert_reject(result, Some(401));
 }
 
@@ -67,13 +68,13 @@ async fn test_key_auth_plugin_invalid_key() {
     let plugin = KeyAuth::new(&config);
     
     let consumer = create_test_consumer();
-    let consumers = vec![consumer];
-    
+    let consumer_index = ConsumerIndex::new(&[consumer]);
+
     // Test failed authentication with invalid key
     let mut invalid_ctx = create_test_context();
     invalid_ctx.headers.insert("X-API-Key".to_string(), "invalid-key".to_string());
-    
-    let result = plugin.authenticate(&mut invalid_ctx, &consumers).await;
+
+    let result = plugin.authenticate(&mut invalid_ctx, &consumer_index).await;
     assert_reject(result, Some(401));
 }
 
@@ -85,13 +86,13 @@ async fn test_key_auth_plugin_query_parameter() {
     let plugin = KeyAuth::new(&config);
     
     let consumer = create_test_consumer();
-    let consumers = vec![consumer];
-    
+    let consumer_index = ConsumerIndex::new(&[consumer]);
+
     // Test successful authentication via query parameter
     let mut valid_ctx = create_test_context();
     valid_ctx.query_params.insert("api_key".to_string(), "test-api-key".to_string());
-    
-    let result = plugin.authenticate(&mut valid_ctx, &consumers).await;
+
+    let result = plugin.authenticate(&mut valid_ctx, &consumer_index).await;
     assert_continue(result);
     assert!(valid_ctx.identified_consumer.is_some());
 }

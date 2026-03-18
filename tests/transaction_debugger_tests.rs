@@ -85,7 +85,7 @@ async fn test_transaction_debugger_full_lifecycle() {
     }));
 
     let mut ctx = make_ctx();
-    let consumers = vec![];
+    let consumer_index = ferrum_gateway::ConsumerIndex::new(&[]);
     let mut headers: HashMap<String, String> = HashMap::new();
 
     // on_request_received
@@ -93,7 +93,7 @@ async fn test_transaction_debugger_full_lifecycle() {
     assert!(matches!(result, ferrum_gateway::plugins::PluginResult::Continue));
 
     // authenticate (default - Continue)
-    let result = plugin.authenticate(&mut ctx, &consumers).await;
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
     assert!(matches!(result, ferrum_gateway::plugins::PluginResult::Continue));
 
     // authorize (default - Continue)

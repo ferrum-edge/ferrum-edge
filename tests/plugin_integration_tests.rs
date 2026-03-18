@@ -112,12 +112,12 @@ async fn test_plugin_configuration_validation() {
         
         // Test basic operations don't panic
         let mut ctx = create_test_context();
-        let consumers = vec![create_test_consumer()];
-        
+        let consumer_index = ferrum_gateway::ConsumerIndex::new(&[create_test_consumer()]);
+
         // These should not panic even with empty config
         let _ = plugin.on_request_received(&mut ctx).await;
         let _ = plugin.authorize(&mut ctx).await;
-        let _ = plugin.authenticate(&mut ctx, &consumers).await;
+        let _ = plugin.authenticate(&mut ctx, &consumer_index).await;
         
         let mut headers = std::collections::HashMap::new();
         let _ = plugin.before_proxy(&mut ctx, &mut headers).await;

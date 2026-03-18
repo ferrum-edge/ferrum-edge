@@ -3,7 +3,7 @@ use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
 use serde_json::Value;
 use tracing::debug;
 
-use crate::config::types::Consumer;
+use crate::consumer_index::ConsumerIndex;
 
 use super::{Plugin, PluginResult, RequestContext};
 
@@ -64,7 +64,7 @@ impl Plugin for JwtAuth {
     async fn authenticate(
         &self,
         ctx: &mut RequestContext,
-        consumers: &[Consumer],
+        consumer_index: &ConsumerIndex,
     ) -> PluginResult {
         let token = match self.extract_token(ctx) {
             Some(t) => t,
@@ -77,8 +77,9 @@ impl Plugin for JwtAuth {
             }
         };
 
-        // Try each consumer's JWT secret to verify
-        for consumer in consumers {
+        // Must try each consumer's JWT secret to verify (inherently O(n) for decoding)
+        let consumers = consumer_index.consumers();
+        for consumer in consumers.iter() {
             if let Some(jwt_creds) = consumer.credentials.get("jwt") {
                 if let Some(secret) = jwt_creds.get("secret").and_then(|s| s.as_str()) {
                     let key = DecodingKey::from_secret(secret.as_bytes());
@@ -97,7 +98,7 @@ impl Plugin for JwtAuth {
                             {
                                 if ctx.identified_consumer.is_none() {
                                     debug!("jwt_auth: identified consumer '{}'", consumer.username);
-                                    ctx.identified_consumer = Some(consumer.clone());
+                                    ctx.identified_consumer = Some((**consumer).clone());
                                 }
                                 return PluginResult::Continue;
                             }
