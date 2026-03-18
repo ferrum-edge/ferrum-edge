@@ -73,6 +73,20 @@ pub struct EnvConfig {
     // DNS
     pub dns_cache_ttl_seconds: u64,
     pub dns_overrides: HashMap<String, String>,
+    /// Comma-separated nameserver addresses (ip[:port], IPv4 or IPv6).
+    /// Default: parsed from /etc/resolv.conf
+    pub dns_resolver_address: Option<String>,
+    /// Path to hosts file. Default: /etc/hosts (system default)
+    pub dns_resolver_hosts_file: Option<String>,
+    /// Order of record types to query (comma-separated, case-insensitive).
+    /// Valid values: CACHE, SRV, A, AAAA, CNAME. Default: "CACHE,SRV,A,CNAME"
+    pub dns_order: Option<String>,
+    /// Override TTL (seconds) for positive DNS records. Default: use response TTL
+    pub dns_valid_ttl: Option<u64>,
+    /// Stale data usage time (seconds) during refresh. Default: 3600
+    pub dns_stale_ttl: u64,
+    /// TTL (seconds) for errors/empty responses. Default: 1
+    pub dns_error_ttl: u64,
 
     /// Path to a PEM file containing trusted CA certificates for backend TLS verification
     pub backend_tls_ca_bundle_path: Option<String>,
@@ -144,6 +158,14 @@ impl EnvConfig {
 
             dns_cache_ttl_seconds: parse_env_u64("FERRUM_DNS_CACHE_TTL_SECONDS", 300),
             dns_overrides,
+            dns_resolver_address: env::var("FERRUM_DNS_RESOLVER_ADDRESS").ok(),
+            dns_resolver_hosts_file: env::var("FERRUM_DNS_RESOLVER_HOSTS_FILE").ok(),
+            dns_order: env::var("FERRUM_DNS_ORDER").ok(),
+            dns_valid_ttl: env::var("FERRUM_DNS_VALID_TTL")
+                .ok()
+                .and_then(|v| v.parse().ok()),
+            dns_stale_ttl: parse_env_u64("FERRUM_DNS_STALE_TTL", 3600),
+            dns_error_ttl: parse_env_u64("FERRUM_DNS_ERROR_TTL", 1),
 
             // Global Backend mTLS
             backend_tls_ca_bundle_path: env::var("FERRUM_BACKEND_TLS_CA_BUNDLE_PATH").ok(),

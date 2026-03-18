@@ -3,7 +3,7 @@ use tracing::{error, info};
 
 use crate::config::file_loader;
 use crate::config::EnvConfig;
-use crate::dns::DnsCache;
+use crate::dns::{DnsCache, DnsConfig};
 use crate::proxy::{self, ProxyState};
 use crate::tls;
 
@@ -38,10 +38,16 @@ pub async fn run(env_config: EnvConfig, shutdown_tx: tokio::sync::watch::Sender<
         config.consumers.len()
     );
 
-    let dns_cache = DnsCache::new(
-        env_config.dns_cache_ttl_seconds,
-        env_config.dns_overrides.clone(),
-    );
+    let dns_cache = DnsCache::new(DnsConfig {
+        default_ttl_seconds: env_config.dns_cache_ttl_seconds,
+        global_overrides: env_config.dns_overrides.clone(),
+        resolver_addresses: env_config.dns_resolver_address.clone(),
+        hosts_file_path: env_config.dns_resolver_hosts_file.clone(),
+        dns_order: env_config.dns_order.clone(),
+        valid_ttl_override: env_config.dns_valid_ttl,
+        stale_ttl_seconds: env_config.dns_stale_ttl,
+        error_ttl_seconds: env_config.dns_error_ttl,
+    });
 
     // DNS warmup — await before accepting requests to avoid cold-cache
     // DNS lookups in the hot request path

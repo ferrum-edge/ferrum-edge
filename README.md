@@ -204,6 +204,12 @@ cargo run --release
 | `FERRUM_MAX_BODY_SIZE_BYTES` | No | `10485760` | Maximum request body size (0=unlimited) |
 | `FERRUM_DNS_CACHE_TTL_SECONDS` | No | `300` | Default DNS cache TTL |
 | `FERRUM_DNS_OVERRIDES` | No | `{}` | JSON map of hostname→IP static overrides |
+| `FERRUM_DNS_RESOLVER_ADDRESS` | No | resolv.conf | Comma-separated nameservers (ip[:port]) |
+| `FERRUM_DNS_RESOLVER_HOSTS_FILE` | No | `/etc/hosts` | Path to custom hosts file |
+| `FERRUM_DNS_ORDER` | No | `CACHE,SRV,A,CNAME` | Record type query order (comma-separated) |
+| `FERRUM_DNS_VALID_TTL` | No | response TTL | Override TTL (seconds) for positive records |
+| `FERRUM_DNS_STALE_TTL` | No | `3600` | Stale data usage time (seconds) during refresh |
+| `FERRUM_DNS_ERROR_TTL` | No | `1` | TTL (seconds) for errors/empty responses |
 | `FERRUM_BACKEND_TLS_CA_BUNDLE_PATH` | No | — | Path to CA bundle for backend TLS verification |
 | `FERRUM_BACKEND_TLS_CLIENT_CERT_PATH` | No | — | Path to client certificate for backend mTLS |
 | `FERRUM_BACKEND_TLS_CLIENT_KEY_PATH` | No | — | Path to client private key for backend mTLS |
@@ -730,12 +736,18 @@ All modes maintain an in-memory cache of the last valid configuration. If the co
 - Periodic reconnection attempts (every 5 seconds)
 - Full config resynchronization on reconnect
 
-### DNS Caching
+### DNS Resolver
 
-- In-memory cache with configurable TTL (`FERRUM_DNS_CACHE_TTL_SECONDS`)
+- Built on [hickory-resolver](https://github.com/hickory-dns/hickory-dns) with full configurability
+- Configurable nameservers, custom hosts file, and DNS record type query ordering
+- In-memory DashMap cache with stale-while-revalidate (serve stale data during background refresh)
+- Error caching prevents hammering DNS for non-existent domains
+- Proactive background refresh at 75% TTL keeps entries warm
 - Per-proxy TTL override via `dns_cache_ttl_seconds`
 - Static overrides: global (`FERRUM_DNS_OVERRIDES`) and per-proxy (`dns_override`)
+- Respects system `RES_OPTIONS` and `LOCALDOMAIN` environment variables
 - Non-blocking startup warmup resolves all backend hostnames
+- See [docs/dns_resolver.md](docs/dns_resolver.md) for full configuration reference
 
 ## Security
 

@@ -442,3 +442,157 @@ fn test_env_config_cp_mode_valid() {
         },
     );
 }
+
+// ============================================================================
+// DNS Enhanced Configuration Tests
+// ============================================================================
+
+#[test]
+fn test_env_config_dns_resolver_address() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_DNS_RESOLVER_ADDRESS", "1.1.1.1,8.8.8.8"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.dns_resolver_address, Some("1.1.1.1,8.8.8.8".to_string()));
+        },
+    );
+}
+
+#[test]
+fn test_env_config_dns_resolver_address_not_set() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+        ],
+        || {
+            remove_var("FERRUM_DNS_RESOLVER_ADDRESS");
+            let config = EnvConfig::from_env().unwrap();
+            assert!(config.dns_resolver_address.is_none());
+        },
+    );
+}
+
+#[test]
+fn test_env_config_dns_resolver_hosts_file() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_DNS_RESOLVER_HOSTS_FILE", "/custom/hosts"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.dns_resolver_hosts_file, Some("/custom/hosts".to_string()));
+        },
+    );
+}
+
+#[test]
+fn test_env_config_dns_order() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_DNS_ORDER", "A,AAAA,SRV"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.dns_order, Some("A,AAAA,SRV".to_string()));
+        },
+    );
+}
+
+#[test]
+fn test_env_config_dns_valid_ttl() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_DNS_VALID_TTL", "120"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.dns_valid_ttl, Some(120));
+        },
+    );
+}
+
+#[test]
+fn test_env_config_dns_valid_ttl_not_set() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+        ],
+        || {
+            remove_var("FERRUM_DNS_VALID_TTL");
+            let config = EnvConfig::from_env().unwrap();
+            assert!(config.dns_valid_ttl.is_none(), "dns_valid_ttl should be None when not set");
+        },
+    );
+}
+
+#[test]
+fn test_env_config_dns_stale_ttl_default() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+        ],
+        || {
+            remove_var("FERRUM_DNS_STALE_TTL");
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.dns_stale_ttl, 3600, "dns_stale_ttl should default to 3600");
+        },
+    );
+}
+
+#[test]
+fn test_env_config_dns_stale_ttl_custom() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_DNS_STALE_TTL", "7200"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.dns_stale_ttl, 7200);
+        },
+    );
+}
+
+#[test]
+fn test_env_config_dns_error_ttl_default() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+        ],
+        || {
+            remove_var("FERRUM_DNS_ERROR_TTL");
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.dns_error_ttl, 1, "dns_error_ttl should default to 1");
+        },
+    );
+}
+
+#[test]
+fn test_env_config_dns_error_ttl_custom() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_DNS_ERROR_TTL", "5"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.dns_error_ttl, 5);
+        },
+    );
+}

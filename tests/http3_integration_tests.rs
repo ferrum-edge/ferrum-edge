@@ -115,6 +115,12 @@ fn create_http3_test_env_config() -> EnvConfig {
         max_body_size_bytes: 10_485_760,
         dns_cache_ttl_seconds: 300,
         dns_overrides: std::collections::HashMap::new(),
+        dns_resolver_address: None,
+        dns_resolver_hosts_file: None,
+        dns_order: None,
+        dns_valid_ttl: None,
+        dns_stale_ttl: 3600,
+        dns_error_ttl: 1,
         backend_tls_ca_bundle_path: None,
         backend_tls_client_cert_path: None,
         backend_tls_client_key_path: None,
@@ -144,7 +150,7 @@ async fn test_http3_backend_connection() {
     let env_config = create_http3_test_env_config();
     
     let connection_pool = Arc::new(ConnectionPool::new(pool_config, env_config));
-    let dns_cache = DnsCache::new(300, std::collections::HashMap::new());
+    let dns_cache = DnsCache::new(ferrum_gateway::dns::DnsConfig::default());
     
     // Test DNS resolution first
     let resolved_ip = dns_cache.resolve(&proxy.backend_host, proxy.dns_override.clone().as_deref(), proxy.dns_cache_ttl_seconds).await;
@@ -246,7 +252,7 @@ async fn test_http3_proxy_state_creation() {
     let pool_config = PoolConfig::default();
     let env_config = create_http3_test_env_config();
     
-    let dns_cache = DnsCache::new(300, std::collections::HashMap::new());
+    let dns_cache = DnsCache::new(ferrum_gateway::dns::DnsConfig::default());
     let connection_pool = Arc::new(ConnectionPool::new(pool_config, env_config));
     
     let gc = create_http3_test_gateway_config();
@@ -363,7 +369,7 @@ async fn test_http3_full_integration() {
     let pool_config = PoolConfig::default();
     let env_config = create_http3_test_env_config();
     
-    let dns_cache = DnsCache::new(300, std::collections::HashMap::new());
+    let dns_cache = DnsCache::new(ferrum_gateway::dns::DnsConfig::default());
     let connection_pool = Arc::new(ConnectionPool::new(pool_config, env_config));
     
     // Create proxy state with HTTP/3 support

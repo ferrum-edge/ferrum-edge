@@ -1,101 +1,382 @@
 use dashmap::DashMap;
+use hickory_resolver::config::{
+    NameServerConfig, NameServerConfigGroup, ResolverConfig, ResolverOpts, ResolveHosts,
+};
+use hickory_resolver::name_server::TokioConnectionProvider;
+use hickory_resolver::proto::xfer::Protocol;
+use hickory_resolver::Resolver;
 use std::collections::HashMap;
-use std::net::IpAddr;
+use std::fs::File;
+use std::io::BufReader;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
-/// A cached DNS entry with TTL.
+/// Record type ordering for DNS queries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DnsRecordOrder {
+    /// Use the record type that succeeded on the last lookup for this hostname.
+    Cache,
+    /// Query A records (IPv4).
+    A,
+    /// Query AAAA records (IPv6).
+    Aaaa,
+    /// Query SRV records (service discovery).
+    Srv,
+    /// Query CNAME records (canonical name).
+    Cname,
+}
+
+/// Cached record type from a previous successful lookup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CachedRecordType {
+    A,
+    Aaaa,
+    Srv,
+    Cname,
+}
+
+/// Configuration for the DNS resolver and cache.
+#[derive(Debug, Clone)]
+pub struct DnsConfig {
+    pub default_ttl_seconds: u64,
+    pub global_overrides: HashMap<String, String>,
+    /// Comma-separated nameserver addresses (ip[:port], IPv4 or IPv6).
+    pub resolver_addresses: Option<String>,
+    /// Path to a custom hosts file.
+    pub hosts_file_path: Option<String>,
+    /// Comma-separated DNS record type query order (e.g., "CACHE,SRV,A,CNAME").
+    pub dns_order: Option<String>,
+    /// Override TTL (seconds) for positive DNS records. None = use response TTL.
+    pub valid_ttl_override: Option<u64>,
+    /// How long stale data can be served while a background refresh is in progress.
+    pub stale_ttl_seconds: u64,
+    /// TTL (seconds) for caching DNS errors and empty responses.
+    pub error_ttl_seconds: u64,
+}
+
+impl Default for DnsConfig {
+    fn default() -> Self {
+        Self {
+            default_ttl_seconds: 300,
+            global_overrides: HashMap::new(),
+            resolver_addresses: None,
+            hosts_file_path: None,
+            dns_order: None,
+            valid_ttl_override: None,
+            stale_ttl_seconds: 3600,
+            error_ttl_seconds: 1,
+        }
+    }
+}
+
+/// A cached DNS entry with TTL and stale-while-revalidate support.
 #[derive(Debug, Clone)]
 struct DnsCacheEntry {
     addresses: Vec<IpAddr>,
     expires_at: Instant,
+    /// Deadline after which stale data is no longer served.
+    stale_deadline: Instant,
+    /// The record type that produced this result (for CACHE ordering).
+    record_type_used: Option<CachedRecordType>,
+    /// Whether this is a cached error/empty response.
+    is_error: bool,
 }
 
-/// Asynchronous DNS resolver with in-memory caching.
+/// Asynchronous DNS resolver with in-memory caching, stale-while-revalidate,
+/// error caching, configurable record type ordering, and hickory-resolver backend.
 #[derive(Clone)]
 pub struct DnsCache {
     cache: Arc<DashMap<String, DnsCacheEntry>>,
     global_overrides: HashMap<String, String>,
     default_ttl: Duration,
+    resolver: Arc<Resolver<TokioConnectionProvider>>,
+    dns_order: Vec<DnsRecordOrder>,
+    valid_ttl_override: Option<Duration>,
+    stale_ttl: Duration,
+    error_ttl: Duration,
 }
 
 impl DnsCache {
-    pub fn new(default_ttl_seconds: u64, global_overrides: HashMap<String, String>) -> Self {
+    pub fn new(config: DnsConfig) -> Self {
+        let resolver = build_resolver(&config);
+
+        let dns_order = parse_dns_order(config.dns_order.as_deref());
+
         Self {
             cache: Arc::new(DashMap::new()),
-            global_overrides,
-            default_ttl: Duration::from_secs(default_ttl_seconds),
+            global_overrides: config.global_overrides,
+            default_ttl: Duration::from_secs(config.default_ttl_seconds),
+            resolver: Arc::new(resolver),
+            dns_order,
+            valid_ttl_override: config.valid_ttl_override.map(Duration::from_secs),
+            stale_ttl: Duration::from_secs(config.stale_ttl_seconds),
+            error_ttl: Duration::from_secs(config.error_ttl_seconds),
         }
     }
 
     /// Resolve a hostname to an IP address, using cache, overrides, or actual DNS.
+    ///
+    /// Resolution priority:
+    /// 1. Per-proxy static override (highest priority)
+    /// 2. Global static overrides
+    /// 3. Cache (fresh → return immediately; stale → return + background refresh)
+    /// 4. Actual DNS resolution via hickory-resolver
     pub async fn resolve(
         &self,
         hostname: &str,
         per_proxy_override: Option<&str>,
         per_proxy_ttl: Option<u64>,
     ) -> Result<IpAddr, anyhow::Error> {
-        // Check per-proxy static override first
+        // 1. Check per-proxy static override first
         if let Some(ip_str) = per_proxy_override {
             let addr: IpAddr = ip_str.parse()?;
             return Ok(addr);
         }
 
-        // Check global overrides
+        // 2. Check global overrides
         if let Some(ip_str) = self.global_overrides.get(hostname) {
             let addr: IpAddr = ip_str.parse()?;
             return Ok(addr);
         }
 
-        // Check cache
+        // 3. Check cache with stale-while-revalidate
         if let Some(entry) = self.cache.get(hostname) {
-            if entry.expires_at > Instant::now() && !entry.addresses.is_empty() {
+            let now = Instant::now();
+
+            // Fresh entry — return immediately
+            if entry.expires_at > now && !entry.addresses.is_empty() && !entry.is_error {
                 return Ok(entry.addresses[0]);
+            }
+
+            // Stale but within stale window — return stale data, trigger background refresh
+            if entry.stale_deadline > now && !entry.addresses.is_empty() && !entry.is_error {
+                let cache = self.clone();
+                let host = hostname.to_string();
+                let ttl = per_proxy_ttl;
+                tokio::spawn(async move {
+                    if let Err(e) = cache.refresh_entry(&host, ttl).await {
+                        warn!("DNS stale refresh failed for {}: {}", host, e);
+                    }
+                });
+                debug!("DNS serving stale entry for {} (background refresh triggered)", hostname);
+                return Ok(entry.addresses[0]);
+            }
+
+            // Cached error that hasn't expired — return error immediately
+            if entry.is_error && entry.expires_at > now {
+                anyhow::bail!("DNS resolution failed for {} (cached error)", hostname);
             }
         }
 
-        // Perform actual DNS resolution
-        let addrs = self.do_resolve(hostname).await?;
+        // 4. Perform actual DNS resolution
+        match self.do_resolve(hostname).await {
+            Ok((addrs, record_type)) if !addrs.is_empty() => {
+                let ttl = per_proxy_ttl
+                    .map(Duration::from_secs)
+                    .or(self.valid_ttl_override)
+                    .unwrap_or(self.default_ttl);
+
+                self.cache.insert(
+                    hostname.to_string(),
+                    DnsCacheEntry {
+                        addresses: addrs.clone(),
+                        expires_at: Instant::now() + ttl,
+                        stale_deadline: Instant::now() + ttl + self.stale_ttl,
+                        record_type_used: record_type,
+                        is_error: false,
+                    },
+                );
+
+                debug!("DNS resolved {} -> {:?} (ttl={:?})", hostname, addrs[0], ttl);
+                Ok(addrs[0])
+            }
+            Ok(_) => {
+                self.cache_error(hostname);
+                anyhow::bail!("DNS resolution returned no addresses for {}", hostname);
+            }
+            Err(e) => {
+                self.cache_error(hostname);
+                Err(e)
+            }
+        }
+    }
+
+    /// Refresh a single cache entry in the background.
+    async fn refresh_entry(&self, hostname: &str, per_proxy_ttl: Option<u64>) -> Result<(), anyhow::Error> {
+        let (addrs, record_type) = self.do_resolve(hostname).await?;
         if addrs.is_empty() {
-            anyhow::bail!("DNS resolution returned no addresses for {}", hostname);
+            anyhow::bail!("DNS refresh returned no addresses for {}", hostname);
         }
 
         let ttl = per_proxy_ttl
             .map(Duration::from_secs)
+            .or(self.valid_ttl_override)
             .unwrap_or(self.default_ttl);
 
         self.cache.insert(
             hostname.to_string(),
             DnsCacheEntry {
-                addresses: addrs.clone(),
+                addresses: addrs,
                 expires_at: Instant::now() + ttl,
+                stale_deadline: Instant::now() + ttl + self.stale_ttl,
+                record_type_used: record_type,
+                is_error: false,
             },
         );
 
-        debug!("DNS resolved {} -> {:?} (ttl={:?})", hostname, addrs[0], ttl);
-        Ok(addrs[0])
+        debug!("DNS background refresh: {} refreshed", hostname);
+        Ok(())
     }
 
-    async fn do_resolve(&self, hostname: &str) -> Result<Vec<IpAddr>, anyhow::Error> {
-        // Try parsing as IP first
+    /// Cache a DNS error to prevent hammering DNS for known-bad hostnames.
+    fn cache_error(&self, hostname: &str) {
+        self.cache.insert(
+            hostname.to_string(),
+            DnsCacheEntry {
+                addresses: vec![],
+                expires_at: Instant::now() + self.error_ttl,
+                stale_deadline: Instant::now() + self.error_ttl, // no stale serving for errors
+                record_type_used: None,
+                is_error: true,
+            },
+        );
+        debug!("DNS cached error for {} (ttl={:?})", hostname, self.error_ttl);
+    }
+
+    /// Perform DNS resolution using hickory-resolver with configurable record type ordering.
+    async fn do_resolve(&self, hostname: &str) -> Result<(Vec<IpAddr>, Option<CachedRecordType>), anyhow::Error> {
+        // Try parsing as IP first — bypass DNS entirely
         if let Ok(addr) = hostname.parse::<IpAddr>() {
-            return Ok(vec![addr]);
+            return Ok((vec![addr], None));
         }
 
-        // Use tokio's built-in DNS resolution
-        let addrs: Vec<IpAddr> = tokio::net::lookup_host(format!("{}:0", hostname))
-            .await?
-            .map(|sa| sa.ip())
-            .collect();
+        // Determine the cached record type (for CACHE ordering)
+        let cached_record_type = if self.dns_order.contains(&DnsRecordOrder::Cache) {
+            self.cache.get(hostname).and_then(|e| e.record_type_used)
+        } else {
+            None
+        };
 
-        Ok(addrs)
+        // Build the query order based on dns_order config
+        let mut query_types: Vec<CachedRecordType> = Vec::new();
+        for order in &self.dns_order {
+            match order {
+                DnsRecordOrder::Cache => {
+                    if let Some(rt) = cached_record_type {
+                        if !query_types.contains(&rt) {
+                            query_types.push(rt);
+                        }
+                    }
+                }
+                DnsRecordOrder::A => {
+                    if !query_types.contains(&CachedRecordType::A) {
+                        query_types.push(CachedRecordType::A);
+                    }
+                }
+                DnsRecordOrder::Aaaa => {
+                    if !query_types.contains(&CachedRecordType::Aaaa) {
+                        query_types.push(CachedRecordType::Aaaa);
+                    }
+                }
+                DnsRecordOrder::Srv => {
+                    if !query_types.contains(&CachedRecordType::Srv) {
+                        query_types.push(CachedRecordType::Srv);
+                    }
+                }
+                DnsRecordOrder::Cname => {
+                    if !query_types.contains(&CachedRecordType::Cname) {
+                        query_types.push(CachedRecordType::Cname);
+                    }
+                }
+            }
+        }
+
+        // If no query types were produced (e.g., only CACHE with no cached type), use defaults
+        if query_types.is_empty() {
+            query_types = vec![CachedRecordType::A, CachedRecordType::Aaaa];
+        }
+
+        // Try each record type in order
+        for record_type in &query_types {
+            match record_type {
+                CachedRecordType::A => {
+                    match self.resolver.ipv4_lookup(hostname).await {
+                        Ok(lookup) => {
+                            let addrs: Vec<IpAddr> = lookup.iter()
+                                .map(|a| IpAddr::V4(a.0))
+                                .collect();
+                            if !addrs.is_empty() {
+                                return Ok((addrs, Some(CachedRecordType::A)));
+                            }
+                        }
+                        Err(_) => continue,
+                    }
+                }
+                CachedRecordType::Aaaa => {
+                    match self.resolver.ipv6_lookup(hostname).await {
+                        Ok(lookup) => {
+                            let addrs: Vec<IpAddr> = lookup.iter()
+                                .map(|a| IpAddr::V6(a.0))
+                                .collect();
+                            if !addrs.is_empty() {
+                                return Ok((addrs, Some(CachedRecordType::Aaaa)));
+                            }
+                        }
+                        Err(_) => continue,
+                    }
+                }
+                CachedRecordType::Srv => {
+                    match self.resolver.srv_lookup(hostname).await {
+                        Ok(srv_lookup) => {
+                            // SRV records point to target hostnames — resolve them to IPs
+                            for srv in srv_lookup.iter() {
+                                let target = srv.target().to_string();
+                                // Remove trailing dot if present
+                                let target = target.trim_end_matches('.');
+                                if let Ok(ip_lookup) = self.resolver.lookup_ip(target).await {
+                                    let addrs: Vec<IpAddr> = ip_lookup.iter().collect();
+                                    if !addrs.is_empty() {
+                                        return Ok((addrs, Some(CachedRecordType::Srv)));
+                                    }
+                                }
+                            }
+                        }
+                        Err(_) => continue,
+                    }
+                }
+                CachedRecordType::Cname => {
+                    // For CNAME, use lookup_ip which follows CNAME chains automatically
+                    match self.resolver.lookup_ip(hostname).await {
+                        Ok(lookup) => {
+                            let addrs: Vec<IpAddr> = lookup.iter().collect();
+                            if !addrs.is_empty() {
+                                return Ok((addrs, Some(CachedRecordType::Cname)));
+                            }
+                        }
+                        Err(_) => continue,
+                    }
+                }
+            }
+        }
+
+        anyhow::bail!("DNS resolution returned no addresses for {}", hostname);
     }
 
     /// Returns the number of entries currently in the cache.
     #[allow(dead_code)]
     pub fn cache_len(&self) -> usize {
         self.cache.len()
+    }
+
+    /// Check if a cached entry exists and is a cached error.
+    #[allow(dead_code)]
+    pub fn is_cached_error(&self, hostname: &str) -> bool {
+        self.cache
+            .get(hostname)
+            .map(|e| e.is_error && e.expires_at > Instant::now())
+            .unwrap_or(false)
     }
 
     /// Start a background task that proactively refreshes cache entries before
@@ -116,8 +397,13 @@ impl DnsCache {
                 let mut to_refresh: Vec<(String, Option<u64>)> = Vec::new();
 
                 for entry in cache.cache.iter() {
+                    // Skip error entries
+                    if entry.is_error {
+                        continue;
+                    }
+
                     let remaining = entry.expires_at.saturating_duration_since(now);
-                    let total_ttl = cache.default_ttl;
+                    let total_ttl = cache.valid_ttl_override.unwrap_or(cache.default_ttl);
                     // Refresh if less than 25% of TTL remaining
                     if remaining < total_ttl / 4 && remaining > Duration::ZERO {
                         to_refresh.push((entry.key().clone(), None));
@@ -125,17 +411,19 @@ impl DnsCache {
                 }
 
                 // Refresh entries in the background
-                for (hostname, ttl) in to_refresh {
+                for (hostname, _ttl) in to_refresh {
                     match cache.do_resolve(&hostname).await {
-                        Ok(addrs) if !addrs.is_empty() => {
-                            let refresh_ttl = ttl
-                                .map(Duration::from_secs)
+                        Ok((addrs, record_type)) if !addrs.is_empty() => {
+                            let refresh_ttl = cache.valid_ttl_override
                                 .unwrap_or(cache.default_ttl);
                             cache.cache.insert(
                                 hostname.clone(),
                                 DnsCacheEntry {
                                     addresses: addrs,
                                     expires_at: Instant::now() + refresh_ttl,
+                                    stale_deadline: Instant::now() + refresh_ttl + cache.stale_ttl,
+                                    record_type_used: record_type,
+                                    is_error: false,
                                 },
                             );
                             debug!("DNS background refresh: {} refreshed", hostname);
@@ -173,4 +461,155 @@ impl DnsCache {
 
         info!("DNS warmup complete");
     }
+}
+
+/// Build a hickory-resolver `Resolver` from a `DnsConfig`.
+fn build_resolver(config: &DnsConfig) -> Resolver<TokioConnectionProvider> {
+    // Start with system configuration as the base
+    let (mut resolver_config, mut resolver_opts) = match hickory_resolver::system_conf::read_system_conf() {
+        Ok((rc, ro)) => {
+            debug!("DNS: loaded system resolv.conf ({} nameservers)", rc.name_servers().len());
+            (rc, ro)
+        }
+        Err(e) => {
+            warn!("DNS: failed to read system resolv.conf: {}. Using default (Google DNS)", e);
+            (ResolverConfig::default(), ResolverOpts::default())
+        }
+    };
+
+    // Override nameservers if FERRUM_DNS_RESOLVER_ADDRESS is set
+    if let Some(ref addr_str) = config.resolver_addresses {
+        let nameservers = parse_nameserver_addresses(addr_str);
+        if !nameservers.is_empty() {
+            let ns_group = NameServerConfigGroup::from(nameservers);
+            // Preserve system search/domain settings but replace nameservers
+            resolver_config = ResolverConfig::from_parts(
+                resolver_config.domain().cloned(),
+                resolver_config.search().to_vec(),
+                ns_group,
+            );
+            info!("DNS: using custom nameservers from FERRUM_DNS_RESOLVER_ADDRESS");
+        } else {
+            warn!("DNS: FERRUM_DNS_RESOLVER_ADDRESS set but no valid addresses parsed, using system default");
+        }
+    }
+
+    // Apply TTL overrides
+    if let Some(valid_ttl) = config.valid_ttl_override {
+        let d = Duration::from_secs(valid_ttl);
+        resolver_opts.positive_min_ttl = Some(d);
+        resolver_opts.positive_max_ttl = Some(d);
+    }
+
+    // Apply error/negative TTL
+    let neg_ttl = Duration::from_secs(config.error_ttl_seconds);
+    resolver_opts.negative_min_ttl = Some(neg_ttl);
+    resolver_opts.negative_max_ttl = Some(neg_ttl);
+
+    // Always check hosts file
+    resolver_opts.use_hosts_file = ResolveHosts::Always;
+
+    // Build the resolver
+    let mut builder = Resolver::builder_with_config(
+        resolver_config,
+        TokioConnectionProvider::default(),
+    );
+    *builder.options_mut() = resolver_opts;
+    let mut resolver = builder.build();
+
+    // Load custom hosts file if specified
+    if let Some(ref hosts_path) = config.hosts_file_path {
+        match File::open(hosts_path) {
+            Ok(file) => {
+                let mut hosts = hickory_resolver::Hosts::default();
+                let _ = hosts.read_hosts_conf(BufReader::new(file));
+                resolver.set_hosts(Arc::new(hosts));
+                info!("DNS: loaded custom hosts file from {}", hosts_path);
+            }
+            Err(e) => {
+                warn!("DNS: failed to open custom hosts file '{}': {}", hosts_path, e);
+            }
+        }
+    }
+
+    resolver
+}
+
+/// Parse comma-separated nameserver addresses into NameServerConfig entries.
+/// Each address can be ip[:port], with port defaulting to 53.
+/// Supports both IPv4 and IPv6 (IPv6 brackets optional: [::1]:53 or ::1).
+fn parse_nameserver_addresses(addr_str: &str) -> Vec<NameServerConfig> {
+    let mut configs = Vec::new();
+
+    for entry in addr_str.split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+
+        let socket_addr = parse_addr_with_port(entry, 53);
+        match socket_addr {
+            Some(addr) => {
+                // Add both UDP and TCP for each nameserver
+                configs.push(NameServerConfig::new(addr, Protocol::Udp));
+                configs.push(NameServerConfig::new(addr, Protocol::Tcp));
+                debug!("DNS: added nameserver {}", addr);
+            }
+            None => {
+                warn!("DNS: failed to parse nameserver address '{}'", entry);
+            }
+        }
+    }
+
+    configs
+}
+
+/// Parse an address string with optional port into a SocketAddr.
+/// Supports: "1.2.3.4", "1.2.3.4:5353", "[::1]", "[::1]:5353", "::1"
+fn parse_addr_with_port(s: &str, default_port: u16) -> Option<SocketAddr> {
+    // Try direct SocketAddr parse first (handles "1.2.3.4:53" and "[::1]:53")
+    if let Ok(addr) = s.parse::<SocketAddr>() {
+        return Some(addr);
+    }
+
+    // Try as bare IP address (add default port)
+    // Handle bracketed IPv6 without port: "[::1]"
+    let ip_str = s.trim_start_matches('[').trim_end_matches(']');
+    if let Ok(ip) = ip_str.parse::<IpAddr>() {
+        return Some(SocketAddr::new(ip, default_port));
+    }
+
+    None
+}
+
+/// Parse a DNS order string into a Vec of DnsRecordOrder.
+/// Input is comma-separated, case-insensitive. Default: "CACHE,SRV,A,CNAME".
+fn parse_dns_order(order_str: Option<&str>) -> Vec<DnsRecordOrder> {
+    let s = order_str.unwrap_or("CACHE,SRV,A,CNAME");
+
+    let mut result = Vec::new();
+    for part in s.split(',') {
+        match part.trim().to_uppercase().as_str() {
+            "CACHE" => result.push(DnsRecordOrder::Cache),
+            "A" => result.push(DnsRecordOrder::A),
+            "AAAA" => result.push(DnsRecordOrder::Aaaa),
+            "SRV" => result.push(DnsRecordOrder::Srv),
+            "CNAME" => result.push(DnsRecordOrder::Cname),
+            other => {
+                warn!("DNS: ignoring unknown record type '{}' in dns_order", other);
+            }
+        }
+    }
+
+    if result.is_empty() {
+        warn!("DNS: dns_order produced empty list, using default");
+        result = vec![
+            DnsRecordOrder::Cache,
+            DnsRecordOrder::Srv,
+            DnsRecordOrder::A,
+            DnsRecordOrder::Cname,
+        ];
+    }
+
+    result
 }
