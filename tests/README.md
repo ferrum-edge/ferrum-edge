@@ -24,7 +24,11 @@ tests/
 ├── env_config_tests.rs            # Environment configuration tests
 ├── config_file_loader_tests.rs    # Configuration file loading tests
 ├── config_types_tests.rs          # Configuration type validation tests
-├── proxy_tests.rs                 # Proxy routing and matching tests
+├── proxy_tests.rs                 # Proxy routing and URL building tests
+├── router_cache_tests.rs          # Router cache matching, caching, and e2e URL tests (29 tests)
+├── connection_pool_tests.rs       # Connection pool reuse, cleanup, and pool keys (9 tests)
+├── pool_config_tests.rs           # Pool config defaults and per-proxy overrides (3 tests)
+├── admin_jwt_auth_tests.rs        # JWT verification, invalid issuer, expired tokens (3 tests)
 ├── admin_tests.rs                 # Admin API JWT authentication tests
 ├── admin_enhanced_tls_tests.rs   # Admin API TLS/mTLS tests
 ├── admin_listeners_tests.rs       # Admin API separate listeners tests
@@ -32,6 +36,7 @@ tests/
 ├── backend_mtls_tests.rs         # Backend mTLS functionality tests
 ├── frontend_tls_tests.rs          # Frontend TLS tests
 ├── separate_listeners_tests.rs    # Separate HTTP/HTTPS listeners tests
+├── http3_integration_tests.rs     # HTTP/3 integration and proxy state tests
 ├── websocket_auth_tests.rs        # WebSocket authentication tests
 ├── websocket_echo_server.rs       # WebSocket echo server for testing
 ├── secure_echo_server_simple.rs   # Secure echo server for TLS testing
@@ -72,13 +77,17 @@ cargo test --test plugin_integration_tests
 # Core module tests
 cargo test --test dns_tests
 cargo test --test env_config_tests
+cargo test --test connection_pool_tests
+cargo test --test pool_config_tests
+cargo test --test admin_jwt_auth_tests
 
 # Configuration tests
 cargo test --test config_file_loader_tests
 cargo test --test config_types_tests
 
-# Proxy tests
+# Proxy and routing tests
 cargo test --test proxy_tests
+cargo test --test router_cache_tests
 
 # Admin API tests
 cargo test --test admin_tests
@@ -369,12 +378,15 @@ cargo test --test test_file_name -- --nocapture
 
 ### Current Coverage
 - **11 Plugins**: All plugins have comprehensive test suites with full lifecycle coverage
-- **7 Core Areas**: Logging, Authentication, Authorization, Rate Limiting, DNS, Configuration, Integration
+- **9 Core Areas**: Logging, Authentication, Authorization, Rate Limiting, DNS, Configuration, Connection Pooling, Router Cache, Integration
 - **150+ Plugin Test Cases**: Comprehensive coverage including edge cases and error handling
+- **29 Router Cache Tests**: Route matching, end-to-end URL mapping, cache behavior, concurrency, edge cases
+- **9 Connection Pool Tests**: Pool reuse, cleanup, pool keys, per-proxy overrides
 - **6 Admin API Tests**: JWT authentication, security, and performance validation
 - **27 Environment Config Tests**: All operating modes, validation, defaults
-- **13 DNS Tests**: Caching, resolution, overrides, TTL
-- **228 Total Test Cases**: Full coverage of gateway functionality (all passing)
+- **13 DNS Tests**: Caching, resolution, overrides, TTL, warmup, background refresh
+- **280+ Total Test Cases**: Full coverage of gateway functionality (all passing)
+- **All tests in `tests/` directory** — no inline `#[cfg(test)]` modules in source files
 
 ### Adding New Tests
 

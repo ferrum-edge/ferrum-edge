@@ -122,12 +122,59 @@ FERRUM_BACKEND_TLS_NO_VERIFY="true"  # Backend no-verify mode
 - ✅ **Port Configuration Details**
 - ✅ **TLS Mode Explanations**
 
+---
+
+## ✅ Networking, Router Cache, and Test Organization Updates
+
+### **🔀 Router Cache (`src/router_cache.rs` — NEW)**
+
+Added high-performance router cache that keeps route matching off the hot request path:
+
+- **Pre-sorted route table** (longest listen_path first) rebuilt atomically via ArcSwap on config changes
+- **Bounded DashMap path cache** (default 10K entries) for O(1) repeated path lookups
+- **Integrated into ProxyState** — `update_config()` triggers rebuild automatically
+- All 3 call sites (HTTP, WebSocket, HTTP/3) now use `router_cache.find_proxy()` instead of `find_matching_proxy()`
+- 29 new tests in `tests/router_cache_tests.rs` covering route matching, end-to-end URL mapping, cache behavior, concurrency, and edge cases
+
+### **🔧 Connection Pool Fixes (`src/connection_pool.rs`)**
+
+- **Removed `http2_prior_knowledge()`** — was forcing h2c (cleartext HTTP/2) on all backends, breaking HTTP/1.1 backends
+- **Lock-free cleanup** — replaced `RwLock<Instant>` with `AtomicU64` epoch millis to eliminate deadlock during DashMap iteration
+- **TCP keepalive conditional** — only set when `enable_http_keep_alive` is true
+- Tests moved to `tests/connection_pool_tests.rs` (9 tests)
+
+### **🌍 DNS Cache Improvements (`src/dns/mod.rs`)**
+
+- **Background refresh** at 75% TTL — proactively re-resolves entries before expiration
+- **Startup warmup awaited** — no cold-cache lookups in hot request path
+- 7 new tests in `tests/dns_tests.rs`
+
+### **🔐 HTTP/2 Inbound and TCP Keepalive (`src/proxy/mod.rs`, `src/tls/mod.rs`)**
+
+- **ALPN protocol advertisement** (`h2` + `http/1.1`) in TLS config
+- **auto::Builder** for HTTP/1.1+HTTP/2 auto-negotiation on TLS connections
+- **TCP keepalive** (60s) on inbound connections via socket2 crate
+- Added `socket2 = "0.6.3"` to Cargo.toml
+
+### **🧪 Test Organization**
+
+- **Moved all inline tests from `src/` to `tests/`** — no `#[cfg(test)]` modules remain in source files
+- New test files: `connection_pool_tests.rs`, `pool_config_tests.rs`, `admin_jwt_auth_tests.rs`, `router_cache_tests.rs`
+- Total: 35+ test files, 280+ tests, all passing
+
+### **📄 Documentation Updated**
+
+- **ARCHITECTURE.md** — Added router_cache.rs to project structure, updated proxy engine section with cache details, updated DNS section with background refresh, updated request flow diagram, noted ALPN in TLS section, updated testing strategy
+- **IMPLEMENTATION_ANALYSIS.md** — Updated core proxying features, DNS caching, testing coverage assessment, completeness to ~95%, and "What's Working" summary
+- **tests/README.md** — Added new test files to structure and test counts
+
 ### **🚀 Ready for Production**
 
 The Ferrum Gateway documentation now provides:
 - **Complete TLS Reference** - All ports, certificates, and modes
+- **Complete Networking Reference** - Router cache, connection pooling, DNS caching
 - **Security Guidelines** - Clear production vs. testing recommendations
 - **Configuration Examples** - Real-world setup scenarios
 - **Troubleshooting Information** - Common issues and solutions
 
-**All .md documentation files have been properly updated with the latest listener ports and TLS enhancements!** 🎉
+**All .md documentation files have been updated with the latest networking, caching, and test organization improvements!** 🎉

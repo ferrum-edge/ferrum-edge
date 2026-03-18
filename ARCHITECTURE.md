@@ -34,6 +34,7 @@ src/
 ├── proxy/                 # Proxy request handling
 │   ├── mod.rs             # ProxyState and main proxy logic
 │   └── handler.rs         # HTTP request/response processing
+├── router_cache.rs        # Pre-sorted route table with bounded path cache
 ├── connection_pool.rs     # HTTP client connection pooling with mTLS support
 ├── dns/                   # DNS resolution and caching
 │   ├── mod.rs             # DNS module exports
@@ -75,7 +76,12 @@ tests/
 ├── plugin_utils.rs        # Shared test utilities for plugins
 ├── config_file_loader_tests.rs # Configuration file loading tests
 ├── config_types_tests.rs  # Configuration type validation tests
-├── proxy_tests.rs         # Proxy functionality tests
+├── proxy_tests.rs         # Proxy routing and URL building tests
+├── router_cache_tests.rs  # Router cache matching, caching, and e2e URL tests
+├── connection_pool_tests.rs # Connection pool reuse and cleanup tests
+├── pool_config_tests.rs   # Pool config defaults and overrides tests
+├── admin_jwt_auth_tests.rs # JWT verification tests
+├── dns_tests.rs           # DNS cache, warmup, TTL, and background refresh tests
 └── stdout_logging_tests.rs # Logging plugin tests
 ```
 
@@ -123,18 +129,22 @@ The configuration system provides flexible configuration management through mult
 - Per-proxy configuration overrides
 - Configuration validation and defaults
 
-### **2. Proxy Engine (`src/proxy/`)**
+### **2. Proxy Engine (`src/proxy/` + `src/router_cache.rs`)**
 
 The proxy engine handles all request routing and processing with **consistent security for HTTP and WebSocket**:
 
 **Key Features**:
-- Longest prefix match routing
+- **Router cache** with pre-sorted route table and bounded path lookup cache (`src/router_cache.rs`)
+- Longest prefix match routing with O(1) cache hits for repeated paths
+- Route table rebuilt atomically via ArcSwap on config changes — never on the hot request path
 - Protocol translation (HTTP ↔ WebSocket)
+- HTTP/1.1 and HTTP/2 inbound support (auto-negotiated via ALPN on TLS connections)
 - Request/response transformation
 - **Unified plugin pipeline** for HTTP and WebSocket requests
 - **Full authentication and authorization** for WebSocket connections
 - **Rate limiting** applies to WebSocket connections
 - **Complete logging** of WebSocket connections
+- **TCP keepalive** on inbound connections (60s interval) for stale client detection
 
 **Security Model**:
 - **WebSocket requests** go through the same plugin pipeline as HTTP requests
@@ -149,6 +159,7 @@ TLS configuration for client connections with optional mutual authentication:
 
 **Key Features**:
 - HTTP/HTTPS dual-mode operation
+- **ALPN protocol advertisement** (`h2` and `http/1.1`) enabling HTTP/2 on TLS connections
 - Server certificate presentation for HTTPS
 - Optional client certificate verification for mTLS
 - Global environment variable configuration
@@ -197,11 +208,14 @@ Separate HTTP and HTTPS listeners for the Admin API with enhanced TLS support:
 High-performance HTTP client connection pooling with backend mTLS support:
 
 **Key Features**:
-- Connection reuse and keep-alive
+- Connection reuse and keep-alive with per-proxy pool keys
+- Lock-free cleanup using `AtomicU64` epoch timestamps (avoids deadlock with DashMap)
+- HTTP/2 negotiated via ALPN on HTTPS (no forced h2c cleartext mode)
+- TCP keepalive only when `enable_http_keep_alive` is true
 - Backend mTLS authentication with client certificates
 - Custom CA bundle support for server certificate verification
 - No-Verify mode for testing environments (`FERRUM_BACKEND_TLS_NO_VERIFY`)
-- Per-proxy connection configuration
+- Per-proxy connection configuration overrides
 - DNS resolution integration
 - Connection statistics and monitoring
 
@@ -261,36 +275,40 @@ Four distinct operating modes for different deployment scenarios:
 
 ### **7. DNS System (`src/dns/`)**
 
-Async DNS resolution with caching capabilities:
+Async DNS resolution with caching designed to keep lookups off the hot request path:
 
 **Key Features**:
-- In-memory caching with TTL
-- Static DNS overrides
-- Per-proxy DNS configuration
-- Startup cache warmup
+- In-memory `DashMap` caching with configurable TTL
+- **Startup warmup** — awaited before accepting requests (no cold-cache lookups in hot path)
+- **Background refresh** — proactively re-resolves entries at 75% TTL before expiration
+- Static DNS overrides (global and per-proxy)
+- Per-proxy DNS configuration and TTL overrides
+- Graceful degradation on resolution failures
 
 ## 🔄 Request Flow
 
 ### **HTTP Request Processing**
 
 ```
-1. Client Request
+1. Client Request (TCP keepalive set on accept)
    ↓
-2. TLS Termination (if HTTPS)
+2. TLS Termination + ALPN negotiation (HTTP/1.1 or HTTP/2)
    ↓
-3. Route Matching (longest prefix)
+3. Router Cache Lookup (O(1) cache hit or pre-sorted prefix scan)
    ↓
 4. Plugin Pipeline (auth → authz → rate limit)
    ↓
-5. Connection Pool (get/create client)
+5. DNS Cache Lookup (warm cache, background-refreshed)
    ↓
-6. Backend Request (with mTLS if configured)
+6. Connection Pool (get/create client per proxy key)
    ↓
-7. Response Processing
+7. Backend Request (with mTLS if configured)
    ↓
-8. Plugin Response Pipeline
+8. Response Processing
    ↓
-9. Client Response
+9. Plugin Response Pipeline
+   ↓
+10. Client Response
 ```
 
 ### **WebSocket Request Processing**
@@ -338,14 +356,14 @@ export FERRUM_BACKEND_TLS_CLIENT_KEY_PATH="/path/to/global-key.pem"
 The project uses comprehensive testing at multiple levels:
 
 ### **Unit Tests**
-- Located in `src/` files alongside implementation
+- All tests located in `tests/` directory (no inline tests in `src/`)
 - Test individual functions and modules
 - Fast execution with minimal dependencies
 
 ### **Integration Tests**
-- Located in `tests/` directory
+- Located in `tests/` directory alongside unit tests
 - Test component interactions
-- Include end-to-end scenarios
+- Include end-to-end scenarios (e.g., router cache → URL mapping → backend URL)
 
 ### **Plugin Testing**
 - `plugin_utils.rs` provides shared test utilities

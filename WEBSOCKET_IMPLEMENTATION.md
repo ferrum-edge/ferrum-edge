@@ -12,7 +12,7 @@
 ### **2. Production-Ready Features**
 - ✅ Custom headers for WebSocket proxy identification
 - ✅ Backend URL configuration and validation
-- ✅ Integration with existing proxy routing system
+- ✅ Integration with router cache for O(1) route lookups
 - ✅ Plugin system compatibility
 - ✅ WebSocket connection metrics tracking
 - ✅ Comprehensive error handling

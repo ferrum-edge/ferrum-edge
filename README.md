@@ -9,14 +9,15 @@ Ferrum Gateway is a lightweight, extensible API gateway designed for modern micr
 ## Features
 
 - **Multiple Operating Modes**: Database, File, Control Plane (CP), and Data Plane (DP) modes
-- **Protocol Support**: HTTP/1.1, HTTP/2, WebSocket (`ws`/`wss`), and gRPC proxying
-- **Connection Pooling**: High-performance HTTP/HTTPS/WebSocket connection reuse with keep-alive support
-- **Longest Prefix Match Routing**: Efficient route matching with unique `listen_path` enforcement
+- **Protocol Support**: HTTP/1.1, HTTP/2 (ALPN-negotiated on TLS), HTTP/3, WebSocket (`ws`/`wss`), and gRPC proxying
+- **Connection Pooling**: Lock-free connection reuse with per-proxy pool keys, AtomicU64 cleanup, HTTP/2 via ALPN (no forced h2c)
+- **Router Cache**: Pre-sorted route table with bounded O(1) path cache; rebuilt atomically on config changes, never on hot path
+- **Longest Prefix Match Routing**: Efficient route matching with wildcard path-suffix forwarding and unique `listen_path` enforcement
 - **Dynamic Configuration**: Zero-downtime configuration reloads via DB polling, SIGHUP signals, or CP push
 - **Plugin System**: Extensible pipeline with lifecycle hooks for authentication, authorization, transformation, rate limiting, and logging
 - **Multi-Authentication**: Chain multiple auth plugins with first-match consumer identification
 - **TLS/mTLS Support**: Frontend TLS termination and backend mTLS with configurable certificate verification
-- **DNS Caching**: In-memory async DNS cache with startup warmup, per-proxy TTL overrides, and static overrides
+- **DNS Caching**: In-memory async DNS cache with startup warmup, background refresh at 75% TTL, per-proxy TTL overrides, and static overrides
 - **Admin REST API**: Full CRUD for Proxies, Consumers, and Plugin Configs with JWT-protected endpoints
 - **Admin Read-Only Mode**: Configurable read-only mode for Admin API with automatic DP mode protection
 - **Rate Limiting**: In-memory per-consumer or per-IP rate limiting with configurable windows
