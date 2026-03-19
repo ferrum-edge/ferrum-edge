@@ -119,7 +119,7 @@ async fn test_pool_stats() {
     let stats = pool.get_stats();
 
     assert!(stats.total_pools > 0);
-    assert_eq!(stats.max_idle_per_host, 10);
+    assert_eq!(stats.max_idle_per_host, 64);
     assert_eq!(stats.idle_timeout_seconds, 90);
 }
 
