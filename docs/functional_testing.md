@@ -6,7 +6,7 @@ This document describes the functional testing strategy for the Ferrum Gateway, 
 
 ### cp_dp_grpc_tests.rs
 
-Located in `tests/cp_dp_grpc_tests.rs`, this file contains library-level unit tests for gRPC communication between CP and DP.
+Located in `tests/integration/cp_dp_grpc_tests.rs`, this file contains integration tests for gRPC communication between CP and DP.
 
 **Tests:**
 - `test_dp_receives_initial_config_from_cp` - Verifies DP receives initial config snapshot from CP
@@ -22,7 +22,7 @@ cargo test --test cp_dp_grpc_tests
 
 ### functional_cp_dp_test.rs
 
-Located in `tests/functional_cp_dp_test.rs`, this file contains higher-level functional tests for CP/DP integration and database TLS support.
+Located in `tests/functional/functional_cp_dp_test.rs`, this file contains higher-level functional tests for CP/DP integration and database TLS support.
 
 **Test Coverage:**
 1. **test_cp_dp_grpc_config_sync** - Tests complete gRPC config sync flow

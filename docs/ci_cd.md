@@ -18,7 +18,7 @@ Two main workflows handle different aspects of the development lifecycle:
 
 | Workflow | Trigger | Purpose |
 |----------|---------|---------|
-| **CI** (`ci.yml`) | Push to `main`, Pull Requests | Test, lint, build binaries, build Docker image |
+| **CI** (`ci.yml`) | Push to `main`, Pull Requests | Test and lint |
 | **Release** (`release.yml`) | Push tag matching `v*` | Build platform-specific binaries, create GitHub release |
 
 ### CI Pipeline Flow
@@ -27,10 +27,10 @@ Two main workflows handle different aspects of the development lifecycle:
 Push to main / Pull Request
         │
         ├─► Test (cargo test)
-        ├─► Lint (clippy, fmt)
-        ├─► Build Release (ubuntu, macOS x86_64, macOS ARM64)
-        └─► Build Docker (push to registry on main branch only)
+        └─► Lint (clippy, fmt)
 ```
+
+> **Note**: Build Release and Docker Build jobs are currently disabled (commented out in ci.yml) while the project is in early development. They will be enabled when the project is mature. See the release pipeline for producing binaries on version tags.
 
 ### Release Pipeline Flow
 
@@ -96,57 +96,17 @@ cargo fmt --all -- --check
 - Indicate code quality issues
 - Must be fixed before merging
 
-#### 3. Build Release Job
+#### 3. Build Release Job (Currently Disabled)
 
-**Runs**: `ubuntu-latest`, `macos-latest` (matrix)
+> **Status**: Commented out in ci.yml while the project is in early development. Will be re-enabled when the project is mature.
 
-Builds optimized release binaries for multiple platforms:
+When enabled, builds optimized release binaries for multiple platforms (Linux x86_64, macOS x86_64, macOS aarch64). Gated on test and lint jobs passing, and only runs on push to `main` (not on PRs).
 
-```bash
-cargo build --release --target ${{ matrix.target }}
-```
+#### 4. Docker Build Job (Currently Disabled)
 
-**Builds For**:
-- Linux x86_64
-- macOS x86_64
-- macOS aarch64 (Apple Silicon)
+> **Status**: Commented out in ci.yml while the project is in early development. Will be re-enabled when the project is mature.
 
-**Artifacts**:
-- Binaries uploaded as GitHub Actions artifacts
-- Available for download during PR review
-- Deleted after 90 days (default GitHub retention)
-
-**Uses**:
-- Pre-compilation validation before releases
-- Performance testing of release binaries
-- Cross-platform compatibility verification
-
-#### 4. Docker Build Job
-
-**Runs**: `ubuntu-latest`
-
-**Condition**: Only runs on `main` branch (push, not PR)
-
-Builds and optionally pushes Docker image:
-
-```bash
-docker buildx build \
-  --cache-from type=gha \
-  --cache-to type=gha,mode=max \
-  --push (if DOCKER_USERNAME is set)
-```
-
-**Tags**:
-- `${{ secrets.DOCKER_USERNAME }}/ferrum-gateway:latest`
-- `${{ secrets.DOCKER_USERNAME }}/ferrum-gateway:${{ github.sha }}`
-
-**Requirements**:
-- GitHub Secrets: `DOCKER_USERNAME`, `DOCKER_PASSWORD`
-- Skipped if secrets not configured
-
-**Caching**:
-- Uses GitHub Actions cache layer for faster builds
-- Significantly speeds up Docker builds
+When enabled, builds and optionally pushes a Docker image. Gated on test and lint jobs passing, and only runs on push to `main`. Requires `DOCKER_USERNAME` and `DOCKER_PASSWORD` GitHub Secrets for pushing to a registry.
 
 ## Release Pipeline (release.yml)
 
@@ -558,7 +518,7 @@ git show v0.2.0
 **Common Issues**:
 - `protoc` not installed: Fixed in CI (installs protoc)
 - Missing dependencies: Check `Cargo.toml`
-- Rust version: Workflows lock to Rust 1.85
+- Rust version: Workflows use `stable` Rust toolchain
 
 ### Docker Push Failing
 

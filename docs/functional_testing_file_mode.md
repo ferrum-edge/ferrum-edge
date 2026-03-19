@@ -222,8 +222,8 @@ FERRUM_MODE=file
 # Optional: Logging level (default: info)
 RUST_LOG=ferrum_gateway=debug
 
-# Optional: Proxy ports (defaults: 8080 for HTTP, 8443 for HTTPS)
-FERRUM_PROXY_HTTP_PORT=8080
+# Optional: Proxy ports (defaults: 8000 for HTTP, 8443 for HTTPS)
+FERRUM_PROXY_HTTP_PORT=8000
 FERRUM_PROXY_HTTPS_PORT=8443
 
 # Optional: Admin API ports (defaults: 9000 for HTTP, 9443 for HTTPS)
