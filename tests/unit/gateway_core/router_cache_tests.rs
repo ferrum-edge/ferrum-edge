@@ -1,7 +1,7 @@
 use chrono::Utc;
+use ferrum_gateway::RouterCache;
 use ferrum_gateway::config::types::{AuthMode, BackendProtocol, GatewayConfig, Proxy};
 use ferrum_gateway::proxy::build_backend_url;
-use ferrum_gateway::RouterCache;
 
 /// Helper to create a test proxy with sensible defaults.
 fn test_proxy(id: &str, listen_path: &str) -> Proxy {
@@ -88,10 +88,7 @@ fn test_longest_prefix_match_three_routes() {
 
 #[test]
 fn test_root_path_catch_all() {
-    let config = test_config(vec![
-        test_proxy("root", "/"),
-        test_proxy("api", "/api"),
-    ]);
+    let config = test_config(vec![test_proxy("root", "/"), test_proxy("api", "/api")]);
     let cache = RouterCache::new(&config, 100);
 
     // /api path should match the specific /api proxy
@@ -381,10 +378,7 @@ fn test_rebuild_clears_cache_and_uses_new_routes() {
 
 #[test]
 fn test_rebuild_updates_route_count() {
-    let config1 = test_config(vec![
-        test_proxy("a", "/a"),
-        test_proxy("b", "/b"),
-    ]);
+    let config1 = test_config(vec![test_proxy("a", "/a"), test_proxy("b", "/b")]);
     let cache = RouterCache::new(&config1, 100);
     assert_eq!(cache.route_count(), 2);
 
@@ -413,10 +407,7 @@ fn test_bounded_capacity_clears_on_overflow() {
 
 #[tokio::test]
 async fn test_concurrent_find_proxy() {
-    let config = test_config(vec![
-        test_proxy("api", "/api"),
-        test_proxy("web", "/web"),
-    ]);
+    let config = test_config(vec![test_proxy("api", "/api"), test_proxy("web", "/web")]);
     let cache = std::sync::Arc::new(RouterCache::new(&config, 1000));
 
     let mut handles = vec![];

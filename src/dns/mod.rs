@@ -1,10 +1,10 @@
 use dashmap::DashMap;
+use hickory_resolver::Resolver;
 use hickory_resolver::config::{
-    NameServerConfig, NameServerConfigGroup, ResolverConfig, ResolverOpts, ResolveHosts,
+    NameServerConfig, NameServerConfigGroup, ResolveHosts, ResolverConfig, ResolverOpts,
 };
 use hickory_resolver::name_server::TokioConnectionProvider;
 use hickory_resolver::proto::xfer::Protocol;
-use hickory_resolver::Resolver;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::BufReader;
@@ -160,7 +160,10 @@ impl DnsCache {
                         warn!("DNS stale refresh failed for {}: {}", host, e);
                     }
                 });
-                debug!("DNS serving stale entry for {} (background refresh triggered)", hostname);
+                debug!(
+                    "DNS serving stale entry for {} (background refresh triggered)",
+                    hostname
+                );
                 return Ok(entry.addresses[0]);
             }
 
@@ -189,7 +192,10 @@ impl DnsCache {
                     },
                 );
 
-                debug!("DNS resolved {} -> {:?} (ttl={:?})", hostname, addrs[0], ttl);
+                debug!(
+                    "DNS resolved {} -> {:?} (ttl={:?})",
+                    hostname, addrs[0], ttl
+                );
                 Ok(addrs[0])
             }
             Ok(_) => {
@@ -204,7 +210,11 @@ impl DnsCache {
     }
 
     /// Refresh a single cache entry in the background.
-    async fn refresh_entry(&self, hostname: &str, per_proxy_ttl: Option<u64>) -> Result<(), anyhow::Error> {
+    async fn refresh_entry(
+        &self,
+        hostname: &str,
+        per_proxy_ttl: Option<u64>,
+    ) -> Result<(), anyhow::Error> {
         let (addrs, record_type) = self.do_resolve(hostname).await?;
         if addrs.is_empty() {
             anyhow::bail!("DNS refresh returned no addresses for {}", hostname);
@@ -242,11 +252,17 @@ impl DnsCache {
                 is_error: true,
             },
         );
-        debug!("DNS cached error for {} (ttl={:?})", hostname, self.error_ttl);
+        debug!(
+            "DNS cached error for {} (ttl={:?})",
+            hostname, self.error_ttl
+        );
     }
 
     /// Perform DNS resolution using hickory-resolver with configurable record type ordering.
-    async fn do_resolve(&self, hostname: &str) -> Result<(Vec<IpAddr>, Option<CachedRecordType>), anyhow::Error> {
+    async fn do_resolve(
+        &self,
+        hostname: &str,
+    ) -> Result<(Vec<IpAddr>, Option<CachedRecordType>), anyhow::Error> {
         // Try parsing as IP first — bypass DNS entirely
         if let Ok(addr) = hostname.parse::<IpAddr>() {
             return Ok((vec![addr], None));
@@ -301,32 +317,24 @@ impl DnsCache {
         // Try each record type in order
         for record_type in &query_types {
             match record_type {
-                CachedRecordType::A => {
-                    match self.resolver.ipv4_lookup(hostname).await {
-                        Ok(lookup) => {
-                            let addrs: Vec<IpAddr> = lookup.iter()
-                                .map(|a| IpAddr::V4(a.0))
-                                .collect();
-                            if !addrs.is_empty() {
-                                return Ok((addrs, Some(CachedRecordType::A)));
-                            }
+                CachedRecordType::A => match self.resolver.ipv4_lookup(hostname).await {
+                    Ok(lookup) => {
+                        let addrs: Vec<IpAddr> = lookup.iter().map(|a| IpAddr::V4(a.0)).collect();
+                        if !addrs.is_empty() {
+                            return Ok((addrs, Some(CachedRecordType::A)));
                         }
-                        Err(_) => continue,
                     }
-                }
-                CachedRecordType::Aaaa => {
-                    match self.resolver.ipv6_lookup(hostname).await {
-                        Ok(lookup) => {
-                            let addrs: Vec<IpAddr> = lookup.iter()
-                                .map(|a| IpAddr::V6(a.0))
-                                .collect();
-                            if !addrs.is_empty() {
-                                return Ok((addrs, Some(CachedRecordType::Aaaa)));
-                            }
+                    Err(_) => continue,
+                },
+                CachedRecordType::Aaaa => match self.resolver.ipv6_lookup(hostname).await {
+                    Ok(lookup) => {
+                        let addrs: Vec<IpAddr> = lookup.iter().map(|a| IpAddr::V6(a.0)).collect();
+                        if !addrs.is_empty() {
+                            return Ok((addrs, Some(CachedRecordType::Aaaa)));
                         }
-                        Err(_) => continue,
                     }
-                }
+                    Err(_) => continue,
+                },
                 CachedRecordType::Srv => {
                     match self.resolver.srv_lookup(hostname).await {
                         Ok(srv_lookup) => {
@@ -414,8 +422,7 @@ impl DnsCache {
                 for (hostname, _ttl) in to_refresh {
                     match cache.do_resolve(&hostname).await {
                         Ok((addrs, record_type)) if !addrs.is_empty() => {
-                            let refresh_ttl = cache.valid_ttl_override
-                                .unwrap_or(cache.default_ttl);
+                            let refresh_ttl = cache.valid_ttl_override.unwrap_or(cache.default_ttl);
                             cache.cache.insert(
                                 hostname.clone(),
                                 DnsCacheEntry {
@@ -466,16 +473,23 @@ impl DnsCache {
 /// Build a hickory-resolver `Resolver` from a `DnsConfig`.
 fn build_resolver(config: &DnsConfig) -> Resolver<TokioConnectionProvider> {
     // Start with system configuration as the base
-    let (mut resolver_config, mut resolver_opts) = match hickory_resolver::system_conf::read_system_conf() {
-        Ok((rc, ro)) => {
-            debug!("DNS: loaded system resolv.conf ({} nameservers)", rc.name_servers().len());
-            (rc, ro)
-        }
-        Err(e) => {
-            warn!("DNS: failed to read system resolv.conf: {}. Using default (Google DNS)", e);
-            (ResolverConfig::default(), ResolverOpts::default())
-        }
-    };
+    let (mut resolver_config, mut resolver_opts) =
+        match hickory_resolver::system_conf::read_system_conf() {
+            Ok((rc, ro)) => {
+                debug!(
+                    "DNS: loaded system resolv.conf ({} nameservers)",
+                    rc.name_servers().len()
+                );
+                (rc, ro)
+            }
+            Err(e) => {
+                warn!(
+                    "DNS: failed to read system resolv.conf: {}. Using default (Google DNS)",
+                    e
+                );
+                (ResolverConfig::default(), ResolverOpts::default())
+            }
+        };
 
     // Override nameservers if FERRUM_DNS_RESOLVER_ADDRESS is set
     if let Some(ref addr_str) = config.resolver_addresses {
@@ -490,7 +504,9 @@ fn build_resolver(config: &DnsConfig) -> Resolver<TokioConnectionProvider> {
             );
             info!("DNS: using custom nameservers from FERRUM_DNS_RESOLVER_ADDRESS");
         } else {
-            warn!("DNS: FERRUM_DNS_RESOLVER_ADDRESS set but no valid addresses parsed, using system default");
+            warn!(
+                "DNS: FERRUM_DNS_RESOLVER_ADDRESS set but no valid addresses parsed, using system default"
+            );
         }
     }
 
@@ -510,10 +526,8 @@ fn build_resolver(config: &DnsConfig) -> Resolver<TokioConnectionProvider> {
     resolver_opts.use_hosts_file = ResolveHosts::Always;
 
     // Build the resolver
-    let mut builder = Resolver::builder_with_config(
-        resolver_config,
-        TokioConnectionProvider::default(),
-    );
+    let mut builder =
+        Resolver::builder_with_config(resolver_config, TokioConnectionProvider::default());
     *builder.options_mut() = resolver_opts;
     let mut resolver = builder.build();
 
@@ -527,7 +541,10 @@ fn build_resolver(config: &DnsConfig) -> Resolver<TokioConnectionProvider> {
                 info!("DNS: loaded custom hosts file from {}", hosts_path);
             }
             Err(e) => {
-                warn!("DNS: failed to open custom hosts file '{}': {}", hosts_path, e);
+                warn!(
+                    "DNS: failed to open custom hosts file '{}': {}",
+                    hosts_path, e
+                );
             }
         }
     }

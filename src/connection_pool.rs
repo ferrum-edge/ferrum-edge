@@ -1,14 +1,14 @@
 //! Connection pool manager for HTTP/HTTPS/WebSocket clients
 //! Provides efficient connection reuse and keep-alive support
 
-use crate::config::types::Proxy;
 use crate::config::PoolConfig;
+use crate::config::types::Proxy;
+use anyhow::Result;
 use dashmap::DashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
-use anyhow::Result;
 use tracing::warn;
 
 /// Connection pool entry with client and last used timestamp.
@@ -47,34 +47,46 @@ impl ConnectionPool {
             global_config,
             global_mtls_config: mtls_config,
         };
-        
+
         // Start cleanup task
         pool.start_cleanup_task();
         pool
     }
 
     /// Get or create a client for the given proxy using global defaults + proxy overrides
-    pub async fn get_client(&self, proxy: &Proxy, resolved_ip: Option<std::net::IpAddr>) -> Result<reqwest::Client> {
+    pub async fn get_client(
+        &self,
+        proxy: &Proxy,
+        resolved_ip: Option<std::net::IpAddr>,
+    ) -> Result<reqwest::Client> {
         // Get effective configuration (global defaults + proxy overrides)
         let config = self.global_config.for_proxy(proxy);
-        
+
         let pool_key = self.create_pool_key(proxy, resolved_ip, &config);
-        
+
         // Try to get existing client from pool
         if let Some(entry) = self.pools.get(&pool_key) {
             // Update last used time (atomic, no lock needed)
-            entry.last_used_epoch_ms.store(now_epoch_ms(), Ordering::Relaxed);
+            entry
+                .last_used_epoch_ms
+                .store(now_epoch_ms(), Ordering::Relaxed);
             return Ok(entry.client.clone());
         }
 
         // Create new client with effective configuration
         let client = self.create_client(proxy, resolved_ip, &config).await?;
-        
+
         // Add to pool if we haven't reached the limit
-        let host_entries: Vec<_> = self.pools.iter()
-            .filter(|entry| entry.key().starts_with(&format!("{}:{}:", proxy.backend_host, proxy.backend_port)))
+        let host_entries: Vec<_> = self
+            .pools
+            .iter()
+            .filter(|entry| {
+                entry
+                    .key()
+                    .starts_with(&format!("{}:{}:", proxy.backend_host, proxy.backend_port))
+            })
             .collect();
-            
+
         if host_entries.len() < config.max_idle_per_host {
             let entry = PoolEntry {
                 client: client.clone(),
@@ -87,7 +99,12 @@ impl ConnectionPool {
     }
 
     /// Create a new reqwest client with the given configuration
-    async fn create_client(&self, proxy: &Proxy, resolved_ip: Option<std::net::IpAddr>, config: &PoolConfig) -> Result<reqwest::Client> {
+    async fn create_client(
+        &self,
+        proxy: &Proxy,
+        resolved_ip: Option<std::net::IpAddr>,
+        config: &PoolConfig,
+    ) -> Result<reqwest::Client> {
         let mut client_builder = reqwest::Client::builder()
             .connect_timeout(Duration::from_millis(proxy.backend_connect_timeout_ms))
             .timeout(Duration::from_millis(proxy.backend_read_timeout_ms))
@@ -97,7 +114,8 @@ impl ConnectionPool {
 
         // Enable TCP keep-alive if configured (detects dead backend connections)
         if config.enable_http_keep_alive {
-            client_builder = client_builder.tcp_keepalive(Duration::from_secs(config.tcp_keepalive_seconds));
+            client_builder =
+                client_builder.tcp_keepalive(Duration::from_secs(config.tcp_keepalive_seconds));
         }
 
         // Configure HTTP/2 keep-alive settings. These are applied when reqwest
@@ -106,15 +124,20 @@ impl ConnectionPool {
         // which breaks backends that only speak HTTP/1.1.
         if config.enable_http2 {
             client_builder = client_builder
-                .http2_keep_alive_interval(Duration::from_secs(config.http2_keep_alive_interval_seconds))
-                .http2_keep_alive_timeout(Duration::from_secs(config.http2_keep_alive_timeout_seconds));
+                .http2_keep_alive_interval(Duration::from_secs(
+                    config.http2_keep_alive_interval_seconds,
+                ))
+                .http2_keep_alive_timeout(Duration::from_secs(
+                    config.http2_keep_alive_timeout_seconds,
+                ));
         }
 
         // Add custom CA bundle for server certificate verification (unless no_verify is set)
         if !self.global_mtls_config.backend_tls_no_verify {
             if let Some(ca_bundle_path) = &self.global_mtls_config.backend_tls_ca_bundle_path {
-                let ca_pem = std::fs::read_to_string(ca_bundle_path)
-                    .map_err(|e| anyhow::anyhow!("Failed to read CA bundle from {}: {}", ca_bundle_path, e))?;
+                let ca_pem = std::fs::read_to_string(ca_bundle_path).map_err(|e| {
+                    anyhow::anyhow!("Failed to read CA bundle from {}: {}", ca_bundle_path, e)
+                })?;
                 let certificate = reqwest::Certificate::from_pem(ca_pem.as_bytes())
                     .map_err(|e| anyhow::anyhow!("Failed to parse CA bundle: {}", e))?;
                 client_builder = client_builder.add_root_certificate(certificate);
@@ -126,23 +149,33 @@ impl ConnectionPool {
         }
 
         // Add client certificate for mTLS (proxy-specific overrides take priority)
-        let cert_path = proxy.backend_tls_client_cert_path.as_ref()
-            .or(self.global_mtls_config.backend_tls_client_cert_path.as_ref());
-        let key_path = proxy.backend_tls_client_key_path.as_ref()
+        let cert_path = proxy.backend_tls_client_cert_path.as_ref().or(self
+            .global_mtls_config
+            .backend_tls_client_cert_path
+            .as_ref());
+        let key_path = proxy
+            .backend_tls_client_key_path
+            .as_ref()
             .or(self.global_mtls_config.backend_tls_client_key_path.as_ref());
 
         if let (Some(cert_path), Some(key_path)) = (cert_path, key_path) {
             // Load client certificate and key
-            let cert_pem = std::fs::read_to_string(cert_path)
-                .map_err(|e| anyhow::anyhow!("Failed to read client certificate from {}: {}", cert_path, e))?;
-            let key_pem = std::fs::read_to_string(key_path)
-                .map_err(|e| anyhow::anyhow!("Failed to read client key from {}: {}", key_path, e))?;
-            
+            let cert_pem = std::fs::read_to_string(cert_path).map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to read client certificate from {}: {}",
+                    cert_path,
+                    e
+                )
+            })?;
+            let key_pem = std::fs::read_to_string(key_path).map_err(|e| {
+                anyhow::anyhow!("Failed to read client key from {}: {}", key_path, e)
+            })?;
+
             // Parse certificate and key
             let combined_pem = format!("{}\n{}", cert_pem, key_pem);
             let identity = reqwest::Identity::from_pem(combined_pem.as_bytes())
                 .map_err(|e| anyhow::anyhow!("Failed to parse client certificate/key: {}", e))?;
-            
+
             client_builder = client_builder.identity(identity);
         }
 
@@ -157,11 +190,17 @@ impl ConnectionPool {
     }
 
     /// Create pool key for caching clients
-    fn create_pool_key(&self, proxy: &Proxy, resolved_ip: Option<std::net::IpAddr>, config: &PoolConfig) -> String {
+    fn create_pool_key(
+        &self,
+        proxy: &Proxy,
+        resolved_ip: Option<std::net::IpAddr>,
+        config: &PoolConfig,
+    ) -> String {
         let ip_str = resolved_ip.map(|ip| ip.to_string()).unwrap_or_default();
-        format!("{}:{}:{}:{}:{}:{}", 
-            proxy.backend_host, 
-            proxy.backend_port, 
+        format!(
+            "{}:{}:{}:{}:{}:{}",
+            proxy.backend_host,
+            proxy.backend_port,
             proxy.backend_protocol as u8,
             config.max_idle_per_host,
             config.idle_timeout_seconds,
@@ -219,7 +258,7 @@ impl ConnectionPool {
     pub fn get_tls_config_for_backend(&self, _proxy: &Proxy) -> Arc<rustls::ClientConfig> {
         let mut client_config = rustls::ClientConfig::builder()
             .with_root_certificates(rustls::RootCertStore::from_iter(
-                webpki_roots::TLS_SERVER_ROOTS.iter().cloned()
+                webpki_roots::TLS_SERVER_ROOTS.iter().cloned(),
             ))
             .with_no_client_auth();
 

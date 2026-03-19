@@ -1,11 +1,15 @@
 //! Tests for response_transformer plugin
 
-use ferrum_gateway::plugins::{response_transformer::ResponseTransformer, Plugin, RequestContext};
+use ferrum_gateway::plugins::{Plugin, RequestContext, response_transformer::ResponseTransformer};
 use serde_json::json;
 use std::collections::HashMap;
 
 fn make_ctx() -> RequestContext {
-    RequestContext::new("127.0.0.1".to_string(), "GET".to_string(), "/test".to_string())
+    RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/test".to_string(),
+    )
 }
 
 #[tokio::test]
@@ -26,7 +30,10 @@ async fn test_response_transformer_add_header() {
     let mut headers: HashMap<String, String> = HashMap::new();
 
     let result = plugin.after_proxy(&mut ctx, 200, &mut headers).await;
-    assert!(matches!(result, ferrum_gateway::plugins::PluginResult::Continue));
+    assert!(matches!(
+        result,
+        ferrum_gateway::plugins::PluginResult::Continue
+    ));
     assert_eq!(headers.get("x-response-id").unwrap(), "abc-123");
 }
 
@@ -44,7 +51,10 @@ async fn test_response_transformer_remove_header() {
     headers.insert("content-type".to_string(), "application/json".to_string());
 
     let result = plugin.after_proxy(&mut ctx, 200, &mut headers).await;
-    assert!(matches!(result, ferrum_gateway::plugins::PluginResult::Continue));
+    assert!(matches!(
+        result,
+        ferrum_gateway::plugins::PluginResult::Continue
+    ));
     assert!(!headers.contains_key("x-internal"));
     assert!(headers.contains_key("content-type"));
 }
@@ -62,7 +72,10 @@ async fn test_response_transformer_update_header() {
     headers.insert("server".to_string(), "nginx".to_string());
 
     let result = plugin.after_proxy(&mut ctx, 200, &mut headers).await;
-    assert!(matches!(result, ferrum_gateway::plugins::PluginResult::Continue));
+    assert!(matches!(
+        result,
+        ferrum_gateway::plugins::PluginResult::Continue
+    ));
     assert_eq!(headers.get("server").unwrap(), "Ferrum Gateway");
 }
 
@@ -82,7 +95,10 @@ async fn test_response_transformer_multiple_rules() {
     headers.insert("server".to_string(), "nginx".to_string());
 
     let result = plugin.after_proxy(&mut ctx, 200, &mut headers).await;
-    assert!(matches!(result, ferrum_gateway::plugins::PluginResult::Continue));
+    assert!(matches!(
+        result,
+        ferrum_gateway::plugins::PluginResult::Continue
+    ));
     assert_eq!(headers.get("x-gateway").unwrap(), "ferrum");
     assert!(!headers.contains_key("x-powered-by"));
     assert_eq!(headers.get("server").unwrap(), "Ferrum");
@@ -97,7 +113,10 @@ async fn test_response_transformer_empty_rules() {
     headers.insert("x-existing".to_string(), "unchanged".to_string());
 
     let result = plugin.after_proxy(&mut ctx, 200, &mut headers).await;
-    assert!(matches!(result, ferrum_gateway::plugins::PluginResult::Continue));
+    assert!(matches!(
+        result,
+        ferrum_gateway::plugins::PluginResult::Continue
+    ));
     assert_eq!(headers.get("x-existing").unwrap(), "unchanged");
 }
 
@@ -109,7 +128,10 @@ async fn test_response_transformer_no_config() {
     let mut headers: HashMap<String, String> = HashMap::new();
 
     let result = plugin.after_proxy(&mut ctx, 500, &mut headers).await;
-    assert!(matches!(result, ferrum_gateway::plugins::PluginResult::Continue));
+    assert!(matches!(
+        result,
+        ferrum_gateway::plugins::PluginResult::Continue
+    ));
 }
 
 #[tokio::test]
@@ -124,7 +146,10 @@ async fn test_response_transformer_add_without_value_ignored() {
     let mut headers: HashMap<String, String> = HashMap::new();
 
     let result = plugin.after_proxy(&mut ctx, 200, &mut headers).await;
-    assert!(matches!(result, ferrum_gateway::plugins::PluginResult::Continue));
+    assert!(matches!(
+        result,
+        ferrum_gateway::plugins::PluginResult::Continue
+    ));
     assert!(!headers.contains_key("x-novalue"));
 }
 
@@ -140,7 +165,10 @@ async fn test_response_transformer_unknown_operation_ignored() {
     let mut headers: HashMap<String, String> = HashMap::new();
 
     let result = plugin.after_proxy(&mut ctx, 200, &mut headers).await;
-    assert!(matches!(result, ferrum_gateway::plugins::PluginResult::Continue));
+    assert!(matches!(
+        result,
+        ferrum_gateway::plugins::PluginResult::Continue
+    ));
 }
 
 #[tokio::test]
@@ -156,7 +184,10 @@ async fn test_response_transformer_handles_various_status_codes() {
         let mut headers: HashMap<String, String> = HashMap::new();
 
         let result = plugin.after_proxy(&mut ctx, status, &mut headers).await;
-        assert!(matches!(result, ferrum_gateway::plugins::PluginResult::Continue));
+        assert!(matches!(
+            result,
+            ferrum_gateway::plugins::PluginResult::Continue
+        ));
         assert_eq!(headers.get("x-processed").unwrap(), "true");
     }
 }

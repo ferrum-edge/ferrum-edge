@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
+use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
 use serde_json::Value;
 use tracing::debug;
 
@@ -29,28 +29,24 @@ impl JwtAuth {
     fn extract_token(&self, ctx: &RequestContext) -> Option<String> {
         if self.token_lookup.starts_with("header:") {
             let header_name = &self.token_lookup["header:".len()..];
-            ctx.headers
-                .get(&header_name.to_lowercase())
-                .map(|v| {
-                    if v.starts_with("Bearer ") || v.starts_with("bearer ") {
-                        v[7..].to_string()
-                    } else {
-                        v.clone()
-                    }
-                })
+            ctx.headers.get(&header_name.to_lowercase()).map(|v| {
+                if v.starts_with("Bearer ") || v.starts_with("bearer ") {
+                    v[7..].to_string()
+                } else {
+                    v.clone()
+                }
+            })
         } else if self.token_lookup.starts_with("query:") {
             let param_name = &self.token_lookup["query:".len()..];
             ctx.query_params.get(param_name).cloned()
         } else {
-            ctx.headers
-                .get("authorization")
-                .and_then(|v| {
-                    if v.starts_with("Bearer ") || v.starts_with("bearer ") {
-                        Some(v[7..].to_string())
-                    } else {
-                        None
-                    }
-                })
+            ctx.headers.get("authorization").and_then(|v| {
+                if v.starts_with("Bearer ") || v.starts_with("bearer ") {
+                    Some(v[7..].to_string())
+                } else {
+                    None
+                }
+            })
         }
     }
 }
@@ -88,15 +84,11 @@ impl Plugin for JwtAuth {
                 validation.validate_exp = false;
                 validation.required_spec_claims.clear();
 
-                if let Ok(token_data) =
-                    decode::<serde_json::Value>(&token, &key, &validation)
-                {
+                if let Ok(token_data) = decode::<serde_json::Value>(&token, &key, &validation) {
                     // Check if the claim field matches consumer
                     if let Some(claim_val) = token_data.claims.get(&self.consumer_claim_field) {
                         let claim_str = claim_val.as_str().unwrap_or("");
-                        if claim_str == consumer.username
-                            || claim_str == consumer.id
-                        {
+                        if claim_str == consumer.username || claim_str == consumer.id {
                             if ctx.identified_consumer.is_none() {
                                 debug!("jwt_auth: identified consumer '{}'", consumer.username);
                                 ctx.identified_consumer = Some((**consumer).clone());

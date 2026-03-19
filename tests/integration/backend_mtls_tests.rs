@@ -1,15 +1,15 @@
 //! Backend mTLS Tests
-//! 
+//!
 //! Tests for backend mutual TLS authentication using client certificates
 
-use ferrum_gateway::config::types::{Proxy, BackendProtocol, AuthMode};
-use ferrum_gateway::config::env_config::{EnvConfig, OperatingMode};
-use ferrum_gateway::config::PoolConfig;
-use ferrum_gateway::connection_pool::ConnectionPool;
 use chrono::Utc;
+use ferrum_gateway::config::PoolConfig;
+use ferrum_gateway::config::env_config::{EnvConfig, OperatingMode};
+use ferrum_gateway::config::types::{AuthMode, BackendProtocol, Proxy};
+use ferrum_gateway::connection_pool::ConnectionPool;
 use std::collections::HashMap;
-use tempfile::NamedTempFile;
 use std::io::Write;
+use tempfile::NamedTempFile;
 
 /// Create a test proxy with mTLS configuration
 fn create_test_mtls_proxy() -> Proxy {
@@ -56,7 +56,10 @@ fn create_test_proxy_specific_mtls() -> Proxy {
 }
 
 /// Create test environment configuration with mTLS settings
-fn create_test_env_config_with_mtls(cert_path: Option<String>, key_path: Option<String>) -> EnvConfig {
+fn create_test_env_config_with_mtls(
+    cert_path: Option<String>,
+    key_path: Option<String>,
+) -> EnvConfig {
     EnvConfig {
         mode: OperatingMode::File,
         log_level: "info".to_string(),
@@ -120,12 +123,12 @@ fn create_test_cert_files() -> Result<(NamedTempFile, NamedTempFile), Box<dyn st
     let mut cert_file = NamedTempFile::new()?;
     let test_cert = "-----BEGIN CERTIFICATE-----\nMIICljCCAX4CCQCKLy9qJQXF9jANBgkqhkiG9w0BAQsFADCBjDELMAkGA1UEBhMC\nVVMxCzAJBgNVBAgMAkNBMRYwFAYDVQQHDA1TYW4gRnJhbmNpc2NvMRMwEQYDVQQK\nDApFeGFtcGxlIE9yZzEUMBIGA1UECwwLRXhhbXBsZSBVbml0MRcwFQYDVQQDDA5l\neGFtcGxlLmNvbSBUZXN0MRQwEgYJKoZIhvcNAQkBFgV0ZXN0QGV4YW1wbGUuY29tMB4X\nDTI0MDEwMTAwMDAwMFoXDTI1MDEwMTAwMDAwMFowgYwxCzAJBgNVBAYTAlVTMQswCQYD\nVQQIDAJDQTEWMBQGA1UEBwwNU2FuIEZyYW5jaXNjbzETMBEGA1UECgwKRXhhbXBsZSBP\ncmcxFDASBgNVBAsMC0V4YW1wbGUgVW5pdDEXMBUGA1UEAwwOZXhhbXBsZS5jb20g\nVGVzdDEUMBIGCSqGSIb3DQEJARYFdGVzdEBleGFtcGxlLmNvbTCBnzANBgkqhkiG9w0B\nAQEFAAOBjQAwgYkCgYEAuJ8J8QJ9nJ2zK2QK6qnJzE7J1VJjJQ+vXJ8vQJ9nJ2zK2QK\n6qnJzE7J1VJjJQ+vXJ8vQJ9nJ2zK2QK6qnJzE7J1VJjJQ+vXJ8vQJ9nJ2zK2QK6qnJ\nzE7J1VJjJQ+vXJ8vQJ9nJ2zK2QK6qnJzE7J1VJjJQ+vXJ8vQJ9nJ2zK2QK6qnJzE7J\n1VJjJQ+vXJ8vQIDAQABMA0GCSqGSIb3DQEBCwUAA4GBAOMJ8QJ9nJ2zK2QK6qnJzE7J\n1VJjJQ+vXJ8vQJ9nJ2zK2QK6qnJzE7J1VJjJQ+vXJ8vQJ9nJ2zK2QK6qnJzE7J1VJj\nJQ+vXJ8vQJ9nJ2zK2QK6qnJzE7J1VJjJQ+vXJ8vQJ9nJ2zK2QK6qnJzE7J1VJjJQ+v\nXJ8vQJ9nJ2zK2QK6qnJzE7J1VJjJQ+vXJ8vQJ9nJ2zK2QK6qnJzE7J1VJjJQ+vXJ8\n-----END CERTIFICATE-----\n";
     cert_file.write_all(test_cert.as_bytes())?;
-    
+
     // Create test private key
     let mut key_file = NamedTempFile::new()?;
     let test_key = "-----BEGIN PRIVATE KEY-----\nMIICdwIBADANBgkqhkiG9w0BAQEFAASCAmEwggJdAgEAAoGBALifCfECfZydsytk\nCupqycxOydVSYyUPr1yfL0CfZydsytkCupqycxOydVSYyUPr1yfL0CfZydsytkCupq\nycxOydVSYyUPr1yfL0CfZydsytkCupqycxOydVSYyUPr1yfL0CfZydsytkCupqycxO\nydVSYyUPr1yfL0CfZydsytkCupqycxOydVSYyUPr1yfL0CfZydsytkCupqycxOydVS\nYyUPr1yfL0CfZydsytkCupqycxOydVSYyUPr1yfL0CfZydsytkCupqycxOydVSYyUPr\n1yfL0CfZydsytkCupqycxOydVSYyUPr1yfL0CfZydsytkCupqycxOydVSYyUPr1yfL\nAgMBAAECgYEAvJ8J8QJ9nJ2zK2QK6qnJzE7J1VJjJQ+vXJ8vQJ9nJ2zK2QK6qnJzE7J\n1VJjJQ+vXJ8vQJ9nJ2zK2QK6qnJzE7J1VJjJQ+vXJ8vQJ9nJ2zK2QK6qnJzE7J1VJj\nJQ+vXJ8vQJ9nJ2zK2QK6qnJzE7J1VJjJQ+vXJ8vQJ9nJ2zK2QK6qnJzE7J1VJjJQ+v\nXJ8vQJ9nJ2zK2QK6qnJzE7J1VJjJQ+vXJ8vQJ9nJ2zK2QK6qnJzE7J1VJjJQ+vXJ8\nvQJ9nJ2zK2QK6qnJzE7J1VJjJQ+vXJ8vQJ9nJ2zK2QK6qnJzE7J1VJjJQ+vXJ8vQJ9\nnJ2zK2QK6qnJzE7J1VJjJQ+vXJ8vQJ9nJ2zK2QK6qnJzE7J1VJjJQ+vXJ8vQJ9nJ2z\nK2QK6qnJzE7J1VJjJQ+vXJ8vQJ9nJ2zK2QK6qnJzE7J1VJjJQ+vXJ8vQJ9nJ2zK2QK\n6qnJzE7J1VJjJQ+vXJ8vQJ9nJ2zK2QK6qnJzE7J1VJjJQ+vXJ8vQJ9nJ2zK2QK6qnJ\nzE7J1VJjJQ+vXJ8vQJ9nJ2zK2QK6qnJzE7J1VJjJQ+vXJ8vQJ9nJ2zK2QK6qnJzE7J\n1VJjJQ+vXJ8vQJ9nJ2zK2QK6qnJzE7J1VJjJQ+vXJ8vQJ9nJ2zK2QK6qnJzE7J1VJj\nJQ+vXJ8vQJ9nJ2zK2QK6qnJzE7J1VJjJQ+vXJ8vQJ9nJ2zK2QK6qnJzE7J1VJjJQ+v\nXJ8vQJ9nJ2zK2QK6qnJzE7J1VJjJQ+vXJ8vQJ9nJ2zK2QK6qnJzE7J1VJjJQ+vXJ8\n-----END PRIVATE KEY-----\n";
     key_file.write_all(test_key.as_bytes())?;
-    
+
     Ok((cert_file, key_file))
 }
 
@@ -133,23 +136,23 @@ fn create_test_cert_files() -> Result<(NamedTempFile, NamedTempFile), Box<dyn st
 async fn test_backend_mtls_global_config() {
     // Create test certificate files
     let (cert_file, key_file) = create_test_cert_files().expect("Failed to create test cert files");
-    
+
     // Create environment config with global mTLS settings
     let env_config = create_test_env_config_with_mtls(
         Some(cert_file.path().to_string_lossy().to_string()),
         Some(key_file.path().to_string_lossy().to_string()),
     );
-    
+
     // Create connection pool
     let global_config = PoolConfig::default();
     let pool = ConnectionPool::new(global_config, env_config);
-    
+
     // Create proxy without specific mTLS config (should use global)
     let proxy = create_test_mtls_proxy();
-    
+
     // Test that we can create a client (this will try to load the certificates)
     let result = pool.get_client(&proxy, None).await;
-    
+
     // Note: This test verifies that the mTLS configuration is properly integrated
     // In a real scenario, the actual TLS handshake would fail with our test cert,
     // but we're testing the configuration loading and client creation logic
@@ -161,10 +164,17 @@ async fn test_backend_mtls_global_config() {
         Err(e) => {
             // Check if the error is related to certificate parsing or TLS setup (expected with test cert)
             let error_msg = e.to_string().to_lowercase();
-            if error_msg.contains("certificate") || error_msg.contains("tls") || 
-               error_msg.contains("identity") || error_msg.contains("builder") ||
-               error_msg.contains("invalid") || error_msg.contains("parse") {
-                println!("✅ mTLS configuration loaded (certificate parsing error expected with test cert): {}", e);
+            if error_msg.contains("certificate")
+                || error_msg.contains("tls")
+                || error_msg.contains("identity")
+                || error_msg.contains("builder")
+                || error_msg.contains("invalid")
+                || error_msg.contains("parse")
+            {
+                println!(
+                    "✅ mTLS configuration loaded (certificate parsing error expected with test cert): {}",
+                    e
+                );
             } else {
                 panic!("Unexpected error creating client with mTLS: {}", e);
             }
@@ -175,39 +185,51 @@ async fn test_backend_mtls_global_config() {
 #[tokio::test]
 async fn test_backend_mtls_proxy_specific_override() {
     // Create test certificate files
-    let (global_cert_file, global_key_file) = create_test_cert_files().expect("Failed to create global test cert files");
-    let (proxy_cert_file, proxy_key_file) = create_test_cert_files().expect("Failed to create proxy test cert files");
-    
+    let (global_cert_file, global_key_file) =
+        create_test_cert_files().expect("Failed to create global test cert files");
+    let (proxy_cert_file, proxy_key_file) =
+        create_test_cert_files().expect("Failed to create proxy test cert files");
+
     // Create environment config with global mTLS settings
     let env_config = create_test_env_config_with_mtls(
         Some(global_cert_file.path().to_string_lossy().to_string()),
         Some(global_key_file.path().to_string_lossy().to_string()),
     );
-    
+
     // Create connection pool
     let global_config = PoolConfig::default();
     let pool = ConnectionPool::new(global_config, env_config);
-    
+
     // Create proxy with specific mTLS config (should override global)
     let mut proxy = create_test_mtls_proxy();
     proxy.backend_tls_client_cert_path = Some(proxy_cert_file.path().to_string_lossy().to_string());
     proxy.backend_tls_client_key_path = Some(proxy_key_file.path().to_string_lossy().to_string());
-    
+
     // Test that we can create a client (this will try to load the proxy-specific certificates)
     let result = pool.get_client(&proxy, None).await;
-    
+
     match result {
         Ok(_client) => {
             println!("✅ Client created with proxy-specific mTLS override");
         }
         Err(e) => {
             let error_msg = e.to_string().to_lowercase();
-            if error_msg.contains("certificate") || error_msg.contains("tls") || 
-               error_msg.contains("identity") || error_msg.contains("builder") ||
-               error_msg.contains("invalid") || error_msg.contains("parse") {
-                println!("✅ Proxy-specific mTLS configuration loaded (certificate parsing error expected): {}", e);
+            if error_msg.contains("certificate")
+                || error_msg.contains("tls")
+                || error_msg.contains("identity")
+                || error_msg.contains("builder")
+                || error_msg.contains("invalid")
+                || error_msg.contains("parse")
+            {
+                println!(
+                    "✅ Proxy-specific mTLS configuration loaded (certificate parsing error expected): {}",
+                    e
+                );
             } else {
-                panic!("Unexpected error creating client with proxy-specific mTLS: {}", e);
+                panic!(
+                    "Unexpected error creating client with proxy-specific mTLS: {}",
+                    e
+                );
             }
         }
     }
@@ -217,17 +239,17 @@ async fn test_backend_mtls_proxy_specific_override() {
 async fn test_backend_mtls_no_certificates() {
     // Create environment config without mTLS settings
     let env_config = create_test_env_config_with_mtls(None, None);
-    
+
     // Create connection pool
     let global_config = PoolConfig::default();
     let pool = ConnectionPool::new(global_config, env_config);
-    
+
     // Create proxy without mTLS config
     let proxy = create_test_mtls_proxy();
-    
+
     // Test that we can create a client without mTLS
     let result = pool.get_client(&proxy, None).await;
-    
+
     match result {
         Ok(_client) => {
             println!("✅ Client created without mTLS configuration");
@@ -242,29 +264,32 @@ async fn test_backend_mtls_no_certificates() {
 async fn test_backend_mtls_partial_config() {
     // Create test certificate file
     let (cert_file, _) = create_test_cert_files().expect("Failed to create test cert files");
-    
+
     // Create environment config with only cert (missing key) - should not apply mTLS
     let env_config = create_test_env_config_with_mtls(
         Some(cert_file.path().to_string_lossy().to_string()),
         None,
     );
-    
+
     // Create connection pool
     let global_config = PoolConfig::default();
     let pool = ConnectionPool::new(global_config, env_config);
-    
+
     // Create proxy without mTLS config
     let proxy = create_test_mtls_proxy();
-    
+
     // Test that we can create a client (should not apply mTLS due to missing key)
     let result = pool.get_client(&proxy, None).await;
-    
+
     match result {
         Ok(_client) => {
             println!("✅ Client created without mTLS (partial config ignored)");
         }
         Err(e) => {
-            panic!("Unexpected error creating client with partial mTLS config: {}", e);
+            panic!(
+                "Unexpected error creating client with partial mTLS config: {}",
+                e
+            );
         }
     }
 }
@@ -273,7 +298,7 @@ async fn test_backend_mtls_partial_config() {
 async fn test_backend_ca_bundle_global_config() {
     // Create test CA bundle file
     let (ca_file, _) = create_test_cert_files().expect("Failed to create test CA files");
-    
+
     // Create environment config with CA bundle
     let env_config = EnvConfig {
         backend_tls_ca_bundle_path: Some(ca_file.path().to_string_lossy().to_string()),
@@ -281,17 +306,17 @@ async fn test_backend_ca_bundle_global_config() {
         backend_tls_client_key_path: None,
         ..create_test_env_config_with_mtls(None, None)
     };
-    
+
     // Create connection pool
     let global_config = PoolConfig::default();
     let pool = ConnectionPool::new(global_config, env_config);
-    
+
     // Create proxy without specific mTLS config (should use global CA bundle)
     let proxy = create_test_mtls_proxy();
-    
+
     // Test that we can create a client (this will try to load the CA bundle)
     let result = pool.get_client(&proxy, None).await;
-    
+
     // Note: This test verifies that the CA bundle configuration is properly integrated
     // The actual TLS verification will depend on the CA bundle validity
     match result {
@@ -301,11 +326,19 @@ async fn test_backend_ca_bundle_global_config() {
         Err(e) => {
             // Check if the error is related to certificate parsing or TLS setup (expected with test CA)
             let error_msg = e.to_string().to_lowercase();
-            if error_msg.contains("certificate") || error_msg.contains("tls") || 
-               error_msg.contains("identity") || error_msg.contains("builder") ||
-               error_msg.contains("invalid") || error_msg.contains("parse") ||
-               error_msg.contains("ca") || error_msg.contains("bundle") {
-                println!("✅ CA bundle configuration loaded (certificate parsing error expected with test CA): {}", e);
+            if error_msg.contains("certificate")
+                || error_msg.contains("tls")
+                || error_msg.contains("identity")
+                || error_msg.contains("builder")
+                || error_msg.contains("invalid")
+                || error_msg.contains("parse")
+                || error_msg.contains("ca")
+                || error_msg.contains("bundle")
+            {
+                println!(
+                    "✅ CA bundle configuration loaded (certificate parsing error expected with test CA): {}",
+                    e
+                );
             } else {
                 panic!("Unexpected error creating client with CA bundle: {}", e);
             }

@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use chrono::Utc;
-use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use serde_json::json;
 use tokio::time::timeout;
 use tonic::transport::Server;
@@ -163,7 +163,11 @@ fn create_test_proxy_state() -> ProxyState {
 /// Start a CP gRPC server on a random port and return the address and broadcast sender.
 async fn start_test_cp_server(
     config: GatewayConfig,
-) -> (SocketAddr, tokio::sync::broadcast::Sender<ferrum_gateway::grpc::proto::ConfigUpdate>, tokio::task::JoinHandle<()>) {
+) -> (
+    SocketAddr,
+    tokio::sync::broadcast::Sender<ferrum_gateway::grpc::proto::ConfigUpdate>,
+    tokio::task::JoinHandle<()>,
+) {
     let config_arc = Arc::new(ArcSwap::new(Arc::new(config)));
     let (server, update_tx) = CpGrpcServer::new(config_arc, TEST_JWT_SECRET.to_string());
 
@@ -216,7 +220,11 @@ async fn test_dp_receives_initial_config_from_cp() {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let current_config = proxy_state.config.load();
-    assert_eq!(current_config.proxies.len(), 2, "DP should have received 2 proxies from CP");
+    assert_eq!(
+        current_config.proxies.len(),
+        2,
+        "DP should have received 2 proxies from CP"
+    );
     assert_eq!(current_config.proxies[0].id, "proxy-0");
     assert_eq!(current_config.proxies[1].id, "proxy-1");
 
@@ -255,7 +263,10 @@ async fn test_dp_receives_config_updates() {
         }
     })
     .await;
-    assert!(received_initial.is_ok(), "DP should have received initial config with 1 proxy");
+    assert!(
+        received_initial.is_ok(),
+        "DP should have received initial config with 1 proxy"
+    );
 
     // Now broadcast an updated config with 3 proxies
     let updated_config = create_test_config(3);
@@ -271,7 +282,10 @@ async fn test_dp_receives_config_updates() {
         }
     })
     .await;
-    assert!(received_update.is_ok(), "DP should have received updated config with 3 proxies");
+    assert!(
+        received_update.is_ok(),
+        "DP should have received updated config with 3 proxies"
+    );
 
     let current_config = proxy_state.config.load();
     assert_eq!(current_config.proxies.len(), 3);
@@ -309,7 +323,9 @@ async fn test_dp_rejects_invalid_token() {
             // Should get an authentication error
             let err_msg = format!("{}", e);
             assert!(
-                err_msg.contains("Unauthenticated") || err_msg.contains("unauthenticated") || err_msg.contains("token"),
+                err_msg.contains("Unauthenticated")
+                    || err_msg.contains("unauthenticated")
+                    || err_msg.contains("token"),
                 "Expected authentication error, got: {}",
                 err_msg
             );
@@ -319,7 +335,11 @@ async fn test_dp_rejects_invalid_token() {
     }
 
     // Verify proxy state was NOT updated
-    assert_eq!(proxy_state.config.load().proxies.len(), 0, "Config should remain empty after auth failure");
+    assert_eq!(
+        proxy_state.config.load().proxies.len(),
+        0,
+        "Config should remain empty after auth failure"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -383,7 +403,10 @@ async fn test_dp_handles_malformed_config() {
         }
     })
     .await;
-    assert!(recovered.is_ok(), "Client should recover and process valid updates after malformed one");
+    assert!(
+        recovered.is_ok(),
+        "Client should recover and process valid updates after malformed one"
+    );
 
     client_handle.abort();
 }
@@ -419,7 +442,10 @@ async fn test_dp_preserves_config_after_cp_shutdown() {
         }
     })
     .await;
-    assert!(received.is_ok(), "Should receive initial config with 2 proxies");
+    assert!(
+        received.is_ok(),
+        "Should receive initial config with 2 proxies"
+    );
 
     // Shut down CP server
     server_handle.abort();
@@ -435,7 +461,10 @@ async fn test_dp_preserves_config_after_cp_shutdown() {
     assert_eq!(proxy_state.config.load().proxies[1].id, "proxy-1");
 
     // Verify the client task is still alive (not crashed) — it should be retrying
-    assert!(!client_handle.is_finished(), "DP client should still be running (retrying connection)");
+    assert!(
+        !client_handle.is_finished(),
+        "DP client should still be running (retrying connection)"
+    );
 
     client_handle.abort();
 }

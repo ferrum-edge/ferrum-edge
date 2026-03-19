@@ -1,5 +1,5 @@
-use ferrum_gateway::config::types::{AuthMode, BackendProtocol, GatewayConfig, Proxy};
 use chrono::Utc;
+use ferrum_gateway::config::types::{AuthMode, BackendProtocol, GatewayConfig, Proxy};
 
 #[test]
 fn test_unique_listen_paths_valid() {
@@ -251,10 +251,10 @@ fn test_route_table_sorted_by_length() {
         plugin_configs: vec![],
         loaded_at: Utc::now(),
     };
-    
+
     let route_table = config.build_route_table();
     assert_eq!(route_table.len(), 3);
-    
+
     // Routes should be sorted by length (longest first)
     assert_eq!(route_table[0].0, "/api/v1/users");
     assert_eq!(route_table[0].1, "long");

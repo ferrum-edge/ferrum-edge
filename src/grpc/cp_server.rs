@@ -1,11 +1,11 @@
 use arc_swap::ArcSwap;
-use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
+use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
 use serde_json::Value;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::broadcast;
-use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
+use tokio_stream::wrappers::BroadcastStream;
 use tonic::{Request, Response, Status};
 use tracing::info;
 
@@ -43,9 +43,7 @@ impl CpGrpcServer {
             .metadata()
             .get("authorization")
             .and_then(|v| v.to_str().ok())
-            .map(|s| {
-                s.strip_prefix("Bearer ").unwrap_or(s)
-            })
+            .map(|s| s.strip_prefix("Bearer ").unwrap_or(s))
             .ok_or_else(|| Status::unauthenticated("Missing authorization token"))?;
 
         let key = DecodingKey::from_secret(self.jwt_secret.as_bytes());
@@ -89,7 +87,9 @@ impl ConfigSync for CpGrpcServer {
         let mut meta_req = Request::new(());
         // Copy authorization metadata from original request
         if let Some(auth_header) = request.metadata().get("authorization") {
-            meta_req.metadata_mut().insert("authorization", auth_header.clone());
+            meta_req
+                .metadata_mut()
+                .insert("authorization", auth_header.clone());
         }
         self.verify_jwt(&meta_req)?;
 
@@ -127,9 +127,7 @@ impl ConfigSync for CpGrpcServer {
             .metadata()
             .get("authorization")
             .and_then(|v| v.to_str().ok())
-            .map(|s| {
-                s.strip_prefix("Bearer ").unwrap_or(s)
-            })
+            .map(|s| s.strip_prefix("Bearer ").unwrap_or(s))
             .ok_or_else(|| Status::unauthenticated("Missing authorization token"))?;
 
         let key = DecodingKey::from_secret(self.jwt_secret.as_bytes());

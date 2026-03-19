@@ -2,8 +2,7 @@
 //! Supports ISS claim validation, TTL enforcement, and token generation
 
 use jsonwebtoken::{
-    decode, DecodingKey, Validation,
-    Algorithm, TokenData, errors::Error as JwtEncodeError
+    Algorithm, DecodingKey, TokenData, Validation, decode, errors::Error as JwtEncodeError,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -64,12 +63,12 @@ impl JwtManager {
     /// Verify and decode a JWT token
     pub fn verify_token(&self, token: &str) -> Result<TokenData<AdminClaims>, JwtEncodeError> {
         let key = DecodingKey::from_secret(self.config.secret.as_bytes());
-        
+
         // Configure validation with required claims
         let mut validation = Validation::new(self.config.algorithm);
         validation.validate_exp = true; // Enable expiration check
         validation.validate_nbf = true; // Enable not-before check
-        
+
         // Set required claims
         validation.required_spec_claims = {
             let mut claims = HashSet::new();
@@ -81,10 +80,10 @@ impl JwtManager {
             claims.insert("jti".to_string());
             claims
         };
-        
+
         // Validate issuer
         validation.set_issuer(&[&self.config.issuer]);
-        
+
         // Decode and validate
         decode::<AdminClaims>(token, &key, &validation)
     }
@@ -98,11 +97,14 @@ impl JwtManager {
     }
 
     /// Verify JWT from request
-    pub fn verify_request(&self, auth_header: Option<&str>) -> Result<TokenData<AdminClaims>, JwtError> {
+    pub fn verify_request(
+        &self,
+        auth_header: Option<&str>,
+    ) -> Result<TokenData<AdminClaims>, JwtError> {
         let auth_header = auth_header.ok_or(JwtError::MissingHeader)?;
-        let token = Self::extract_token_from_header(auth_header)
-            .ok_or(JwtError::InvalidHeaderFormat)?;
-        
+        let token =
+            Self::extract_token_from_header(auth_header).ok_or(JwtError::InvalidHeaderFormat)?;
+
         self.verify_token(&token)
             .map_err(|e: JwtEncodeError| JwtError::VerificationFailed(e.to_string()))
     }
@@ -164,10 +166,10 @@ impl std::error::Error for JwtError {}
 pub fn create_jwt_manager_from_env() -> Result<JwtManager, JwtError> {
     let secret = std::env::var("FERRUM_ADMIN_JWT_SECRET")
         .map_err(|_| JwtError::VerificationFailed("FERRUM_ADMIN_JWT_SECRET not set".to_string()))?;
-    
-    let issuer = std::env::var("FERRUM_ADMIN_JWT_ISSUER")
-        .unwrap_or_else(|_| "ferrum-gateway".to_string());
-    
+
+    let issuer =
+        std::env::var("FERRUM_ADMIN_JWT_ISSUER").unwrap_or_else(|_| "ferrum-gateway".to_string());
+
     let max_ttl = std::env::var("FERRUM_ADMIN_JWT_MAX_TTL")
         .ok()
         .and_then(|s| s.parse().ok())

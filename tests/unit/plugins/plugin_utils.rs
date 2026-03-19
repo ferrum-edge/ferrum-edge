@@ -1,8 +1,8 @@
 //! Common test utilities for plugin tests
 
-use ferrum_gateway::config::types::{AuthMode, BackendProtocol, Consumer, Proxy};
-use ferrum_gateway::plugins::{RequestContext, PluginResult};
 use chrono::Utc;
+use ferrum_gateway::config::types::{AuthMode, BackendProtocol, Consumer, Proxy};
+use ferrum_gateway::plugins::{PluginResult, RequestContext};
 use serde_json::{Map, Value};
 use std::collections::HashMap;
 
@@ -14,11 +14,17 @@ pub fn create_test_consumer() -> Consumer {
     credentials.insert("keyauth".to_string(), Value::Object(keyauth_creds));
 
     let mut basicauth_creds = Map::new();
-    basicauth_creds.insert("password_hash".to_string(), Value::String("$2b$12$LQv3c1yqBWVHxkd0LHAkCOYz6TtxMQJqhN8/LewdBdXwtGtrmuPq6".to_string()));
+    basicauth_creds.insert(
+        "password_hash".to_string(),
+        Value::String("$2b$12$LQv3c1yqBWVHxkd0LHAkCOYz6TtxMQJqhN8/LewdBdXwtGtrmuPq6".to_string()),
+    );
     credentials.insert("basicauth".to_string(), Value::Object(basicauth_creds));
 
     let mut jwt_creds = Map::new();
-    jwt_creds.insert("secret".to_string(), Value::String("test-jwt-secret".to_string()));
+    jwt_creds.insert(
+        "secret".to_string(),
+        Value::String("test-jwt-secret".to_string()),
+    );
     credentials.insert("jwt".to_string(), Value::Object(jwt_creds));
 
     Consumer {
@@ -33,11 +39,18 @@ pub fn create_test_consumer() -> Consumer {
 
 /// Create a test request context with common headers
 pub fn create_test_context() -> RequestContext {
-    let mut ctx = RequestContext::new("127.0.0.1".to_string(), "GET".to_string(), "/test".to_string());
-    ctx.headers.insert("Authorization".to_string(), "Bearer test-token".to_string());
-    ctx.headers.insert("X-API-Key".to_string(), "test-api-key".to_string());
-    ctx.headers.insert("User-Agent".to_string(), "test-agent".to_string());
-    
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/test".to_string(),
+    );
+    ctx.headers
+        .insert("Authorization".to_string(), "Bearer test-token".to_string());
+    ctx.headers
+        .insert("X-API-Key".to_string(), "test-api-key".to_string());
+    ctx.headers
+        .insert("User-Agent".to_string(), "test-agent".to_string());
+
     // Set a test consumer so access control plugin doesn't reject
     ctx.identified_consumer = Some(create_test_consumer());
     ctx
@@ -105,7 +118,7 @@ pub fn create_test_transaction_summary() -> ferrum_gateway::plugins::Transaction
 #[allow(dead_code)]
 pub fn assert_continue(result: PluginResult) {
     match result {
-        PluginResult::Continue => {},
+        PluginResult::Continue => {}
         _ => panic!("Expected Continue, got {:?}", result),
     }
 }
@@ -116,9 +129,13 @@ pub fn assert_reject(result: PluginResult, expected_status: Option<u16>) {
     match result {
         PluginResult::Reject { status_code, .. } => {
             if let Some(expected) = expected_status {
-                assert_eq!(status_code, expected, "Expected status {}, got {}", expected, status_code);
+                assert_eq!(
+                    status_code, expected,
+                    "Expected status {}, got {}",
+                    expected, status_code
+                );
             }
-        },
+        }
         _ => panic!("Expected Reject, got {:?}", result),
     }
 }

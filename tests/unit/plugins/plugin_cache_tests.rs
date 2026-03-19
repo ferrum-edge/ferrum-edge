@@ -1,10 +1,10 @@
 //! Tests for PluginCache — pre-resolved plugin instances per proxy
 
 use chrono::Utc;
+use ferrum_gateway::PluginCache;
 use ferrum_gateway::config::types::{
     AuthMode, BackendProtocol, GatewayConfig, PluginAssociation, PluginConfig, PluginScope, Proxy,
 };
-use ferrum_gateway::PluginCache;
 use serde_json::json;
 
 fn make_proxy(id: &str, listen_path: &str, plugin_ids: Vec<&str>) -> Proxy {
@@ -224,7 +224,13 @@ fn test_multiple_global_and_proxy_plugins() {
         vec![make_proxy("p1", "/api", vec!["ps1"])],
         vec![
             make_plugin_config("g1", "stdout_logging", PluginScope::Global, None, true),
-            make_plugin_config("g2", "transaction_debugger", PluginScope::Global, None, true),
+            make_plugin_config(
+                "g2",
+                "transaction_debugger",
+                PluginScope::Global,
+                None,
+                true,
+            ),
             make_plugin_config("ps1", "key_auth", PluginScope::Proxy, Some("p1"), true),
         ],
     );

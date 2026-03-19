@@ -12,9 +12,9 @@
 //! Run with: cargo test --test functional_database_test -- --ignored --nocapture
 
 use chrono::Utc;
-use jsonwebtoken::{encode, EncodingKey, Header};
+use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::json;
-use std::process::{Command, Child};
+use std::process::{Child, Command};
 use std::time::{Duration, SystemTime};
 use tempfile::TempDir;
 use uuid::Uuid;
@@ -82,9 +82,7 @@ impl DatabaseModeTestHarness {
         let db_url = format!("sqlite:{}?mode=rwc", self.db_path());
 
         // Build the gateway binary if not already built
-        let build_status = Command::new("cargo")
-            .args(["build"])
-            .status()?;
+        let build_status = Command::new("cargo").args(["build"]).status()?;
 
         if !build_status.success() {
             return Err("Failed to build ferrum-gateway".into());
@@ -176,7 +174,9 @@ impl Drop for DatabaseModeTestHarness {
 }
 
 /// Create a simple echo HTTP server for backend testing
-async fn start_echo_backend(port: u16) -> Result<tokio::task::JoinHandle<()>, Box<dyn std::error::Error>> {
+async fn start_echo_backend(
+    port: u16,
+) -> Result<tokio::task::JoinHandle<()>, Box<dyn std::error::Error>> {
     let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port)).await?;
 
     let handle = tokio::spawn(async move {
@@ -239,7 +239,10 @@ async fn test_database_mode_comprehensive() {
     let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("Failed to bind backend listener");
-    let backend_port = backend_listener.local_addr().expect("Failed to get address").port();
+    let backend_port = backend_listener
+        .local_addr()
+        .expect("Failed to get address")
+        .port();
     drop(backend_listener);
 
     let _backend_handle = start_echo_backend(backend_port)
@@ -255,7 +258,9 @@ async fn test_database_mode_comprehensive() {
         .expect("Failed to start gateway");
 
     let client = harness.get_client().expect("Failed to create HTTP client");
-    let token = harness.generate_token().expect("Failed to generate JWT token");
+    let token = harness
+        .generate_token()
+        .expect("Failed to generate JWT token");
     let auth_header = format!("Bearer {}", token);
 
     // Test 1: Create a proxy via Admin API
@@ -388,7 +393,10 @@ async fn test_database_mode_comprehensive() {
     // Test 6: Get consumer
     println!("\n--- Test 6: Get Consumer ---");
     let response = client
-        .get(format!("{}/consumers/test-consumer-1", harness.admin_base_url))
+        .get(format!(
+            "{}/consumers/test-consumer-1",
+            harness.admin_base_url
+        ))
         .header("Authorization", &auth_header)
         .send()
         .await
@@ -431,13 +439,19 @@ async fn test_database_mode_comprehensive() {
     // Test 8: Get plugin config
     println!("\n--- Test 8: Get Plugin Config ---");
     let response = client
-        .get(format!("{}/plugins/config/test-plugin-1", harness.admin_base_url))
+        .get(format!(
+            "{}/plugins/config/test-plugin-1",
+            harness.admin_base_url
+        ))
         .header("Authorization", &auth_header)
         .send()
         .await
         .expect("Failed to get plugin config");
 
-    assert!(response.status().is_success(), "Failed to get plugin config");
+    assert!(
+        response.status().is_success(),
+        "Failed to get plugin config"
+    );
     let config_json: serde_json::Value = response.json().await.expect("Failed to parse response");
     assert_eq!(config_json["id"], "test-plugin-1");
     println!("✓ Plugin config retrieved successfully");
@@ -556,10 +570,7 @@ async fn test_database_mode_comprehensive() {
 
     assert!(response.status().is_success(), "Failed to list proxies");
     let proxies: serde_json::Value = response.json().await.expect("Failed to parse proxies");
-    assert!(
-        proxies.is_array(),
-        "Proxies response should be an array"
-    );
+    assert!(proxies.is_array(), "Proxies response should be an array");
     println!("✓ Proxy listing works");
 
     println!("\n=== All Tests Passed ===\n");

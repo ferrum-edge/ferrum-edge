@@ -56,10 +56,7 @@ pub enum PluginResult {
     /// Continue to the next plugin/phase.
     Continue,
     /// Short-circuit: immediately return this response to the client.
-    Reject {
-        status_code: u16,
-        body: String,
-    },
+    Reject { status_code: u16, body: String },
 }
 
 /// Transaction summary for logging plugins.
@@ -135,20 +132,20 @@ pub fn create_plugin(name: &str, config: &Value) -> Option<Arc<dyn Plugin>> {
     match name {
         "stdout_logging" => Some(Arc::new(stdout_logging::StdoutLogging::new(config))),
         "http_logging" => Some(Arc::new(http_logging::HttpLogging::new(config))),
-        "transaction_debugger" => Some(Arc::new(
-            transaction_debugger::TransactionDebugger::new(config),
-        )),
+        "transaction_debugger" => Some(Arc::new(transaction_debugger::TransactionDebugger::new(
+            config,
+        ))),
         "oauth2_auth" => Some(Arc::new(oauth2_auth::OAuth2Auth::new(config))),
         "jwt_auth" => Some(Arc::new(jwt_auth::JwtAuth::new(config))),
         "key_auth" => Some(Arc::new(key_auth::KeyAuth::new(config))),
         "basic_auth" => Some(Arc::new(basic_auth::BasicAuth::new(config))),
         "access_control" => Some(Arc::new(access_control::AccessControl::new(config))),
-        "request_transformer" => Some(Arc::new(
-            request_transformer::RequestTransformer::new(config),
-        )),
-        "response_transformer" => Some(Arc::new(
-            response_transformer::ResponseTransformer::new(config),
-        )),
+        "request_transformer" => Some(Arc::new(request_transformer::RequestTransformer::new(
+            config,
+        ))),
+        "response_transformer" => Some(Arc::new(response_transformer::ResponseTransformer::new(
+            config,
+        ))),
         "rate_limiting" => Some(Arc::new(rate_limiting::RateLimiting::new(config))),
         _ => {
             tracing::warn!("Unknown plugin: {}", name);

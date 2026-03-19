@@ -27,9 +27,13 @@ pub fn load_config_from_file(path: &str) -> Result<GatewayConfig, anyhow::Error>
         }
         _ => {
             // Try YAML first, then JSON
-            info!("Attempting to parse config file {} (unknown extension)", path.display());
-            serde_yaml::from_str(&content)
-                .or_else(|_| serde_json::from_str(&content).map_err(|e| serde_yaml::Error::custom(e.to_string())))?
+            info!(
+                "Attempting to parse config file {} (unknown extension)",
+                path.display()
+            );
+            serde_yaml::from_str(&content).or_else(|_| {
+                serde_json::from_str(&content).map_err(|e| serde_yaml::Error::custom(e.to_string()))
+            })?
         }
     };
 

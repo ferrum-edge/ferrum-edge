@@ -1,5 +1,5 @@
 //! Admin API for Ferrum Gateway
-//! 
+//!
 //! Provides REST API for managing proxies, consumers, and plugins
 //! with JWT-based authentication and authorization.
 
@@ -13,15 +13,15 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::net::SocketAddr;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use tokio::net::TcpListener;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-use crate::admin::jwt_auth::{JwtManager, JwtError};
+use crate::admin::jwt_auth::{JwtError, JwtManager};
 use crate::config::db_loader::DatabaseStore;
 use crate::config::types::{Consumer, PluginConfig, Proxy};
 use crate::plugins;
@@ -65,7 +65,7 @@ pub async fn start_admin_listener_with_tls(
                     Ok((stream, remote_addr)) => {
                         let state = state.clone();
                         let tls_config = tls_config.clone();
-                        
+
                         tokio::spawn(async move {
                             let result = if let Some(tls_config) = tls_config {
                                 // Handle TLS connection
@@ -74,7 +74,7 @@ pub async fn start_admin_listener_with_tls(
                                 // Handle plain HTTP connection
                                 handle_admin_connection(stream, remote_addr, state).await
                             };
-                            
+
                             if let Err(e) = result {
                                 debug!("Admin connection handling error: {}", e);
                             }
@@ -101,7 +101,7 @@ async fn handle_admin_tls_connection(
     tls_config: Arc<rustls::ServerConfig>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use tokio_rustls::TlsAcceptor;
-    
+
     let acceptor = TlsAcceptor::from(tls_config);
     let tls_stream = match acceptor.accept(stream).await {
         Ok(stream) => {
@@ -109,30 +109,31 @@ async fn handle_admin_tls_connection(
             stream
         }
         Err(e) => {
-            warn!("Admin TLS handshake failed from {}: {}", remote_addr.ip(), e);
+            warn!(
+                "Admin TLS handshake failed from {}: {}",
+                remote_addr.ip(),
+                e
+            );
             return Err(e.into());
         }
     };
-    
+
     // Convert TLS stream to TokioIo for hyper
     let io = hyper_util::rt::TokioIo::new(tls_stream);
-    
+
     // Use the same HTTP service function
     let svc = service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
         let state = state.clone();
-        async move {
-            handle_admin_request(req, state).await
-        }
+        async move { handle_admin_request(req, state).await }
     });
 
     // Serve the HTTP service over TLS
-    let conn = hyper::server::conn::http1::Builder::new()
-        .serve_connection(io, svc);
-    
+    let conn = hyper::server::conn::http1::Builder::new().serve_connection(io, svc);
+
     if let Err(e) = conn.await {
         error!("Admin HTTP connection error over TLS: {}", e);
     }
-    
+
     Ok(())
 }
 
@@ -145,18 +146,13 @@ async fn handle_admin_connection(
     let io = TokioIo::new(stream);
     let svc = service_fn(move |req: Request<Incoming>| {
         let state = state.clone();
-        async move {
-            handle_admin_request(req, state).await
-        }
+        async move { handle_admin_request(req, state).await }
     });
-    
-    if let Err(e) = http1::Builder::new()
-        .serve_connection(io, svc)
-        .await
-    {
+
+    if let Err(e) = http1::Builder::new().serve_connection(io, svc).await {
         error!("Admin HTTP connection error: {}", e);
     }
-    
+
     Ok(())
 }
 
@@ -200,7 +196,11 @@ pub async fn handle_admin_request(
     }
 
     // Authenticate
-    match state.jwt_manager.verify_request(req.headers().get("authorization").and_then(|h| h.to_str().ok())) {
+    match state.jwt_manager.verify_request(
+        req.headers()
+            .get("authorization")
+            .and_then(|h| h.to_str().ok()),
+    ) {
         Ok(_) => {
             // Token is valid, continue processing
         }
@@ -269,9 +269,7 @@ pub async fn handle_admin_request(
         (Method::GET, ["consumers"]) => handle_list_consumers(&state).await,
         (Method::POST, ["consumers"]) => handle_create_consumer(&state, &body_bytes).await,
         (Method::GET, ["consumers", id]) => handle_get_consumer(&state, id).await,
-        (Method::PUT, ["consumers", id]) => {
-            handle_update_consumer(&state, id, &body_bytes).await
-        }
+        (Method::PUT, ["consumers", id]) => handle_update_consumer(&state, id, &body_bytes).await,
         (Method::DELETE, ["consumers", id]) => handle_delete_consumer(&state, id).await,
 
         // Consumer credentials
@@ -288,9 +286,7 @@ pub async fn handle_admin_request(
         (Method::POST, ["plugins", "config"]) => {
             handle_create_plugin_config(&state, &body_bytes).await
         }
-        (Method::GET, ["plugins", "config", id]) => {
-            handle_get_plugin_config(&state, id).await
-        }
+        (Method::GET, ["plugins", "config", id]) => handle_get_plugin_config(&state, id).await,
         (Method::PUT, ["plugins", "config", id]) => {
             handle_update_plugin_config(&state, id, &body_bytes).await
         }
@@ -310,9 +306,7 @@ pub async fn handle_admin_request(
 
 // ---- Proxy CRUD ----
 
-async fn handle_list_proxies(
-    state: &AdminState,
-) -> Result<Response<Full<Bytes>>, hyper::Error> {
+async fn handle_list_proxies(state: &AdminState) -> Result<Response<Full<Bytes>>, hyper::Error> {
     if let Some(ref db) = state.db {
         match db.load_full_config().await {
             Ok(config) => Ok(json_response(StatusCode::OK, &json!(config.proxies))),
@@ -337,7 +331,7 @@ async fn handle_create_proxy(
     if state.read_only {
         return Ok(json_response(
             StatusCode::FORBIDDEN,
-            &json!({"error": "Admin API is in read-only mode"})
+            &json!({"error": "Admin API is in read-only mode"}),
         ));
     }
 
@@ -347,7 +341,7 @@ async fn handle_create_proxy(
             return Ok(json_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 &json!({"error": "No database"}),
-            ))
+            ));
         }
     };
 
@@ -357,7 +351,7 @@ async fn handle_create_proxy(
             return Ok(json_response(
                 StatusCode::BAD_REQUEST,
                 &json!({"error": format!("Invalid body: {}", e)}),
-            ))
+            ));
         }
     };
 
@@ -374,13 +368,13 @@ async fn handle_create_proxy(
             return Ok(json_response(
                 StatusCode::CONFLICT,
                 &json!({"error": "listen_path already exists"}),
-            ))
+            ));
         }
         Err(e) => {
             return Ok(json_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 &json!({"error": format!("Database error: {}", e)}),
-            ))
+            ));
         }
     }
 
@@ -403,7 +397,7 @@ async fn handle_get_proxy(
             return Ok(json_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 &json!({"error": "No database"}),
-            ))
+            ));
         }
     };
 
@@ -429,7 +423,7 @@ async fn handle_update_proxy(
     if state.read_only {
         return Ok(json_response(
             StatusCode::FORBIDDEN,
-            &json!({"error": "Admin API is in read-only mode"})
+            &json!({"error": "Admin API is in read-only mode"}),
         ));
     }
 
@@ -439,7 +433,7 @@ async fn handle_update_proxy(
             return Ok(json_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 &json!({"error": "No database"}),
-            ))
+            ));
         }
     };
 
@@ -449,7 +443,7 @@ async fn handle_update_proxy(
             return Ok(json_response(
                 StatusCode::BAD_REQUEST,
                 &json!({"error": format!("Invalid body: {}", e)}),
-            ))
+            ));
         }
     };
 
@@ -466,13 +460,13 @@ async fn handle_update_proxy(
             return Ok(json_response(
                 StatusCode::CONFLICT,
                 &json!({"error": "listen_path already exists"}),
-            ))
+            ));
         }
         Err(e) => {
             return Ok(json_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 &json!({"error": format!("{}", e)}),
-            ))
+            ));
         }
     }
 
@@ -493,7 +487,7 @@ async fn handle_delete_proxy(
     if state.read_only {
         return Ok(json_response(
             StatusCode::FORBIDDEN,
-            &json!({"error": "Admin API is in read-only mode"})
+            &json!({"error": "Admin API is in read-only mode"}),
         ));
     }
 
@@ -503,7 +497,7 @@ async fn handle_delete_proxy(
             return Ok(json_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 &json!({"error": "No database"}),
-            ))
+            ));
         }
     };
 
@@ -522,16 +516,14 @@ async fn handle_delete_proxy(
 
 // ---- Consumer CRUD ----
 
-async fn handle_list_consumers(
-    state: &AdminState,
-) -> Result<Response<Full<Bytes>>, hyper::Error> {
+async fn handle_list_consumers(state: &AdminState) -> Result<Response<Full<Bytes>>, hyper::Error> {
     let db = match &state.db {
         Some(db) => db,
         None => {
             return Ok(json_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 &json!({"error": "No database"}),
-            ))
+            ));
         }
     };
 
@@ -552,7 +544,7 @@ async fn handle_create_consumer(
     if state.read_only {
         return Ok(json_response(
             StatusCode::FORBIDDEN,
-            &json!({"error": "Admin API is in read-only mode"})
+            &json!({"error": "Admin API is in read-only mode"}),
         ));
     }
 
@@ -562,7 +554,7 @@ async fn handle_create_consumer(
             return Ok(json_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 &json!({"error": "No database"}),
-            ))
+            ));
         }
     };
 
@@ -572,7 +564,7 @@ async fn handle_create_consumer(
             return Ok(json_response(
                 StatusCode::BAD_REQUEST,
                 &json!({"error": format!("Invalid body: {}", e)}),
-            ))
+            ));
         }
     };
 
@@ -604,7 +596,7 @@ async fn handle_get_consumer(
             return Ok(json_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 &json!({"error": "No database"}),
-            ))
+            ));
         }
     };
 
@@ -630,7 +622,7 @@ async fn handle_update_consumer(
     if state.read_only {
         return Ok(json_response(
             StatusCode::FORBIDDEN,
-            &json!({"error": "Admin API is in read-only mode"})
+            &json!({"error": "Admin API is in read-only mode"}),
         ));
     }
 
@@ -640,7 +632,7 @@ async fn handle_update_consumer(
             return Ok(json_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 &json!({"error": "No database"}),
-            ))
+            ));
         }
     };
 
@@ -650,7 +642,7 @@ async fn handle_update_consumer(
             return Ok(json_response(
                 StatusCode::BAD_REQUEST,
                 &json!({"error": format!("Invalid body: {}", e)}),
-            ))
+            ));
         }
     };
 
@@ -675,7 +667,7 @@ async fn handle_delete_consumer(
     if state.read_only {
         return Ok(json_response(
             StatusCode::FORBIDDEN,
-            &json!({"error": "Admin API is in read-only mode"})
+            &json!({"error": "Admin API is in read-only mode"}),
         ));
     }
 
@@ -685,7 +677,7 @@ async fn handle_delete_consumer(
             return Ok(json_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 &json!({"error": "No database"}),
-            ))
+            ));
         }
     };
 
@@ -714,7 +706,7 @@ async fn handle_update_credentials(
             return Ok(json_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 &json!({"error": "No database"}),
-            ))
+            ));
         }
     };
 
@@ -724,7 +716,7 @@ async fn handle_update_credentials(
             return Ok(json_response(
                 StatusCode::BAD_REQUEST,
                 &json!({"error": format!("Invalid body: {}", e)}),
-            ))
+            ));
         }
     };
 
@@ -742,7 +734,9 @@ async fn handle_update_credentials(
                     obj.remove("password");
                 }
             }
-            consumer.credentials.insert(cred_type.to_string(), hashed_cred);
+            consumer
+                .credentials
+                .insert(cred_type.to_string(), hashed_cred);
             consumer.updated_at = Utc::now();
             match db.update_consumer(&consumer).await {
                 Ok(_) => Ok(json_response(StatusCode::OK, &json!(consumer))),
@@ -774,7 +768,7 @@ async fn handle_delete_credentials(
             return Ok(json_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 &json!({"error": "No database"}),
-            ))
+            ));
         }
     };
 
@@ -819,7 +813,7 @@ async fn handle_list_plugin_configs(
             return Ok(json_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 &json!({"error": "No database"}),
-            ))
+            ));
         }
     };
 
@@ -840,7 +834,7 @@ async fn handle_create_plugin_config(
     if state.read_only {
         return Ok(json_response(
             StatusCode::FORBIDDEN,
-            &json!({"error": "Admin API is in read-only mode"})
+            &json!({"error": "Admin API is in read-only mode"}),
         ));
     }
 
@@ -850,7 +844,7 @@ async fn handle_create_plugin_config(
             return Ok(json_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 &json!({"error": "No database"}),
-            ))
+            ));
         }
     };
 
@@ -860,7 +854,7 @@ async fn handle_create_plugin_config(
             return Ok(json_response(
                 StatusCode::BAD_REQUEST,
                 &json!({"error": format!("Invalid body: {}", e)}),
-            ))
+            ));
         }
     };
 
@@ -889,7 +883,7 @@ async fn handle_get_plugin_config(
             return Ok(json_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 &json!({"error": "No database"}),
-            ))
+            ));
         }
     };
 
@@ -915,7 +909,7 @@ async fn handle_update_plugin_config(
     if state.read_only {
         return Ok(json_response(
             StatusCode::FORBIDDEN,
-            &json!({"error": "Admin API is in read-only mode"})
+            &json!({"error": "Admin API is in read-only mode"}),
         ));
     }
 
@@ -925,7 +919,7 @@ async fn handle_update_plugin_config(
             return Ok(json_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 &json!({"error": "No database"}),
-            ))
+            ));
         }
     };
 
@@ -935,7 +929,7 @@ async fn handle_update_plugin_config(
             return Ok(json_response(
                 StatusCode::BAD_REQUEST,
                 &json!({"error": format!("Invalid body: {}", e)}),
-            ))
+            ));
         }
     };
 
@@ -959,7 +953,7 @@ async fn handle_delete_plugin_config(
     if state.read_only {
         return Ok(json_response(
             StatusCode::FORBIDDEN,
-            &json!({"error": "Admin API is in read-only mode"})
+            &json!({"error": "Admin API is in read-only mode"}),
         ));
     }
 
@@ -969,7 +963,7 @@ async fn handle_delete_plugin_config(
             return Ok(json_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 &json!({"error": "No database"}),
-            ))
+            ));
         }
     };
 
@@ -988,9 +982,7 @@ async fn handle_delete_plugin_config(
 
 // ---- Metrics ----
 
-async fn handle_metrics(
-    state: &AdminState,
-) -> Result<Response<Full<Bytes>>, hyper::Error> {
+async fn handle_metrics(state: &AdminState) -> Result<Response<Full<Bytes>>, hyper::Error> {
     let mut status_codes = serde_json::Map::new();
 
     if let Some(ref ps) = state.proxy_state {

@@ -59,10 +59,7 @@ fn start_gateway_in_file_mode(
 
     if !build_output.status.success() {
         eprintln!("Failed to build gateway binary");
-        eprintln!(
-            "stderr: {}",
-            String::from_utf8_lossy(&build_output.stderr)
-        );
+        eprintln!("stderr: {}", String::from_utf8_lossy(&build_output.stderr));
         return Err("Build failed".into());
     }
 

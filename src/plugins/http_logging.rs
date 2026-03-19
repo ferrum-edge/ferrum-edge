@@ -12,10 +12,7 @@ pub struct HttpLogging {
 impl HttpLogging {
     pub fn new(config: &Value) -> Self {
         Self {
-            endpoint_url: config["endpoint_url"]
-                .as_str()
-                .unwrap_or("")
-                .to_string(),
+            endpoint_url: config["endpoint_url"].as_str().unwrap_or("").to_string(),
             authorization_header: config["authorization_header"]
                 .as_str()
                 .map(|s| s.to_string()),
@@ -39,7 +36,10 @@ impl Plugin for HttpLogging {
             req = req.header("Authorization", auth);
         }
         if let Err(e) = req.send().await {
-            warn!("HTTP logging plugin failed to send to {}: {}", self.endpoint_url, e);
+            warn!(
+                "HTTP logging plugin failed to send to {}: {}",
+                self.endpoint_url, e
+            );
         }
     }
 }

@@ -86,7 +86,10 @@ impl RouterCache {
             // This is rare in practice and cheaper than LRU bookkeeping.
             if self.path_cache.len() >= self.max_cache_entries {
                 self.path_cache.clear();
-                debug!("Router path cache cleared (exceeded {} entries)", self.max_cache_entries);
+                debug!(
+                    "Router path cache cleared (exceeded {} entries)",
+                    self.max_cache_entries
+                );
             }
             self.path_cache.insert(path.to_string(), Arc::clone(proxy));
         }

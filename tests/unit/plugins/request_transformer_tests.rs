@@ -1,11 +1,15 @@
 //! Tests for request_transformer plugin
 
-use ferrum_gateway::plugins::{request_transformer::RequestTransformer, Plugin, RequestContext};
+use ferrum_gateway::plugins::{Plugin, RequestContext, request_transformer::RequestTransformer};
 use serde_json::json;
 use std::collections::HashMap;
 
 fn make_ctx() -> RequestContext {
-    RequestContext::new("127.0.0.1".to_string(), "GET".to_string(), "/test".to_string())
+    RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/test".to_string(),
+    )
 }
 
 #[tokio::test]
@@ -26,7 +30,10 @@ async fn test_request_transformer_add_header() {
     let mut headers: HashMap<String, String> = HashMap::new();
 
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
-    assert!(matches!(result, ferrum_gateway::plugins::PluginResult::Continue));
+    assert!(matches!(
+        result,
+        ferrum_gateway::plugins::PluginResult::Continue
+    ));
     assert_eq!(headers.get("x-custom").unwrap(), "custom-value");
 }
 
@@ -44,7 +51,10 @@ async fn test_request_transformer_remove_header() {
     headers.insert("x-keep-me".to_string(), "should-remain".to_string());
 
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
-    assert!(matches!(result, ferrum_gateway::plugins::PluginResult::Continue));
+    assert!(matches!(
+        result,
+        ferrum_gateway::plugins::PluginResult::Continue
+    ));
     assert!(!headers.contains_key("x-remove-me"));
     assert!(headers.contains_key("x-keep-me"));
 }
@@ -62,7 +72,10 @@ async fn test_request_transformer_update_header() {
     headers.insert("x-existing".to_string(), "old-value".to_string());
 
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
-    assert!(matches!(result, ferrum_gateway::plugins::PluginResult::Continue));
+    assert!(matches!(
+        result,
+        ferrum_gateway::plugins::PluginResult::Continue
+    ));
     assert_eq!(headers.get("x-existing").unwrap(), "new-value");
 }
 
@@ -78,7 +91,10 @@ async fn test_request_transformer_add_query_param() {
     let mut headers: HashMap<String, String> = HashMap::new();
 
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
-    assert!(matches!(result, ferrum_gateway::plugins::PluginResult::Continue));
+    assert!(matches!(
+        result,
+        ferrum_gateway::plugins::PluginResult::Continue
+    ));
     assert_eq!(ctx.query_params.get("version").unwrap(), "v2");
 }
 
@@ -91,12 +107,17 @@ async fn test_request_transformer_remove_query_param() {
     }));
 
     let mut ctx = make_ctx();
-    ctx.query_params.insert("secret".to_string(), "should-be-removed".to_string());
-    ctx.query_params.insert("keep".to_string(), "should-remain".to_string());
+    ctx.query_params
+        .insert("secret".to_string(), "should-be-removed".to_string());
+    ctx.query_params
+        .insert("keep".to_string(), "should-remain".to_string());
     let mut headers: HashMap<String, String> = HashMap::new();
 
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
-    assert!(matches!(result, ferrum_gateway::plugins::PluginResult::Continue));
+    assert!(matches!(
+        result,
+        ferrum_gateway::plugins::PluginResult::Continue
+    ));
     assert!(!ctx.query_params.contains_key("secret"));
     assert!(ctx.query_params.contains_key("keep"));
 }
@@ -114,7 +135,10 @@ async fn test_request_transformer_update_query_param() {
     let mut headers: HashMap<String, String> = HashMap::new();
 
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
-    assert!(matches!(result, ferrum_gateway::plugins::PluginResult::Continue));
+    assert!(matches!(
+        result,
+        ferrum_gateway::plugins::PluginResult::Continue
+    ));
     assert_eq!(ctx.query_params.get("page").unwrap(), "2");
 }
 
@@ -130,12 +154,16 @@ async fn test_request_transformer_multiple_rules() {
     }));
 
     let mut ctx = make_ctx();
-    ctx.query_params.insert("removed_param".to_string(), "gone".to_string());
+    ctx.query_params
+        .insert("removed_param".to_string(), "gone".to_string());
     let mut headers: HashMap<String, String> = HashMap::new();
     headers.insert("x-removed".to_string(), "gone".to_string());
 
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
-    assert!(matches!(result, ferrum_gateway::plugins::PluginResult::Continue));
+    assert!(matches!(
+        result,
+        ferrum_gateway::plugins::PluginResult::Continue
+    ));
     assert_eq!(headers.get("x-added").unwrap(), "yes");
     assert!(!headers.contains_key("x-removed"));
     assert_eq!(ctx.query_params.get("added_param").unwrap(), "true");
@@ -151,7 +179,10 @@ async fn test_request_transformer_empty_rules() {
     headers.insert("x-existing".to_string(), "untouched".to_string());
 
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
-    assert!(matches!(result, ferrum_gateway::plugins::PluginResult::Continue));
+    assert!(matches!(
+        result,
+        ferrum_gateway::plugins::PluginResult::Continue
+    ));
     assert_eq!(headers.get("x-existing").unwrap(), "untouched");
 }
 
@@ -163,7 +194,10 @@ async fn test_request_transformer_no_config() {
     let mut headers: HashMap<String, String> = HashMap::new();
 
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
-    assert!(matches!(result, ferrum_gateway::plugins::PluginResult::Continue));
+    assert!(matches!(
+        result,
+        ferrum_gateway::plugins::PluginResult::Continue
+    ));
 }
 
 #[tokio::test]
@@ -178,7 +212,10 @@ async fn test_request_transformer_add_without_value_ignored() {
     let mut headers: HashMap<String, String> = HashMap::new();
 
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
-    assert!(matches!(result, ferrum_gateway::plugins::PluginResult::Continue));
+    assert!(matches!(
+        result,
+        ferrum_gateway::plugins::PluginResult::Continue
+    ));
     // Should not add header without a value
     assert!(!headers.contains_key("x-novalue"));
 }
@@ -195,7 +232,10 @@ async fn test_request_transformer_unknown_operation_ignored() {
     let mut headers: HashMap<String, String> = HashMap::new();
 
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
-    assert!(matches!(result, ferrum_gateway::plugins::PluginResult::Continue));
+    assert!(matches!(
+        result,
+        ferrum_gateway::plugins::PluginResult::Continue
+    ));
 }
 
 #[tokio::test]
@@ -210,5 +250,8 @@ async fn test_request_transformer_unknown_target_ignored() {
     let mut headers: HashMap<String, String> = HashMap::new();
 
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
-    assert!(matches!(result, ferrum_gateway::plugins::PluginResult::Continue));
+    assert!(matches!(
+        result,
+        ferrum_gateway::plugins::PluginResult::Continue
+    ));
 }

@@ -41,7 +41,10 @@ impl Plugin for TransactionDebugger {
         response_headers: &mut HashMap<String, String>,
     ) -> PluginResult {
         println!("[DEBUG] === Backend Response ===");
-        println!("[DEBUG] Status: {} for {} {}", response_status, ctx.method, ctx.path);
+        println!(
+            "[DEBUG] Status: {} for {} {}",
+            response_status, ctx.method, ctx.path
+        );
         println!("[DEBUG] Response Headers: {:?}", response_headers);
         if self.log_response_body {
             println!("[DEBUG] (Response body logging enabled)");

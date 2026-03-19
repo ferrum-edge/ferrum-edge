@@ -1,6 +1,6 @@
+use chrono::Utc;
 use ferrum_gateway::config::types::{AuthMode, BackendProtocol, GatewayConfig, Proxy};
 use ferrum_gateway::proxy::{build_backend_url, find_matching_proxy};
-use chrono::Utc;
 
 fn test_proxy() -> Proxy {
     Proxy {

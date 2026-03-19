@@ -67,29 +67,34 @@ impl Plugin for AccessControl {
     async fn authorize(&self, ctx: &mut RequestContext) -> PluginResult {
         // Check IP-based access control first
         let client_ip = &ctx.client_ip;
-        
+
         // Check if IP is explicitly blocked
-        if self.blocked_ips.iter().any(|blocked_ip| {
-            ip_matches(client_ip, blocked_ip)
-        }) {
+        if self
+            .blocked_ips
+            .iter()
+            .any(|blocked_ip| ip_matches(client_ip, blocked_ip))
+        {
             debug!("access_control: IP '{}' is blocked", client_ip);
             return PluginResult::Reject {
                 status_code: 403,
                 body: r#"{"error":"IP address is blocked"}"#.into(),
             };
         }
-        
+
         // Check if allowed IPs are configured and IP is not in allowed list
-        if !self.allowed_ips.is_empty() && !self.allowed_ips.iter().any(|allowed_ip| {
-            ip_matches(client_ip, allowed_ip)
-        }) {
+        if !self.allowed_ips.is_empty()
+            && !self
+                .allowed_ips
+                .iter()
+                .any(|allowed_ip| ip_matches(client_ip, allowed_ip))
+        {
             debug!("access_control: IP '{}' not in allowed list", client_ip);
             return PluginResult::Reject {
                 status_code: 403,
                 body: r#"{"error":"IP address not allowed"}"#.into(),
             };
         }
-        
+
         let consumer = match &ctx.identified_consumer {
             Some(c) => c,
             None => {

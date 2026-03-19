@@ -1,10 +1,12 @@
 //! Tests for key_auth plugin
 
-use ferrum_gateway::plugins::{key_auth::KeyAuth, Plugin};
 use ferrum_gateway::ConsumerIndex;
+use ferrum_gateway::plugins::{Plugin, key_auth::KeyAuth};
 use serde_json::json;
 
-use super::plugin_utils::{create_test_consumer, create_test_context, assert_continue, assert_reject};
+use super::plugin_utils::{
+    assert_continue, assert_reject, create_test_consumer, create_test_context,
+};
 
 #[tokio::test]
 async fn test_key_auth_plugin_creation() {
@@ -28,13 +30,15 @@ async fn test_key_auth_plugin_successful_auth() {
         "key_lookup": "header:X-API-Key"
     });
     let plugin = KeyAuth::new(&config);
-    
+
     let consumer = create_test_consumer();
     let consumer_index = ConsumerIndex::new(&[consumer]);
 
     // Test successful authentication
     let mut valid_ctx = create_test_context();
-    valid_ctx.headers.insert("X-API-Key".to_string(), "test-api-key".to_string());
+    valid_ctx
+        .headers
+        .insert("X-API-Key".to_string(), "test-api-key".to_string());
 
     let result = plugin.authenticate(&mut valid_ctx, &consumer_index).await;
     assert_continue(result);
@@ -47,7 +51,7 @@ async fn test_key_auth_plugin_missing_key() {
         "key_lookup": "header:X-API-Key"
     });
     let plugin = KeyAuth::new(&config);
-    
+
     let consumer = create_test_consumer();
     let consumer_index = ConsumerIndex::new(&[consumer]);
 
@@ -65,13 +69,15 @@ async fn test_key_auth_plugin_invalid_key() {
         "key_lookup": "header:X-API-Key"
     });
     let plugin = KeyAuth::new(&config);
-    
+
     let consumer = create_test_consumer();
     let consumer_index = ConsumerIndex::new(&[consumer]);
 
     // Test failed authentication with invalid key
     let mut invalid_ctx = create_test_context();
-    invalid_ctx.headers.insert("X-API-Key".to_string(), "invalid-key".to_string());
+    invalid_ctx
+        .headers
+        .insert("X-API-Key".to_string(), "invalid-key".to_string());
 
     let result = plugin.authenticate(&mut invalid_ctx, &consumer_index).await;
     assert_reject(result, Some(401));
@@ -83,13 +89,15 @@ async fn test_key_auth_plugin_query_parameter() {
         "key_lookup": "query:api_key"
     });
     let plugin = KeyAuth::new(&config);
-    
+
     let consumer = create_test_consumer();
     let consumer_index = ConsumerIndex::new(&[consumer]);
 
     // Test successful authentication via query parameter
     let mut valid_ctx = create_test_context();
-    valid_ctx.query_params.insert("api_key".to_string(), "test-api-key".to_string());
+    valid_ctx
+        .query_params
+        .insert("api_key".to_string(), "test-api-key".to_string());
 
     let result = plugin.authenticate(&mut valid_ctx, &consumer_index).await;
     assert_continue(result);

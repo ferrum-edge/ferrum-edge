@@ -1,8 +1,8 @@
 //! Tests for connection pool configuration
 
-use ferrum_gateway::config::PoolConfig;
-use ferrum_gateway::config::types::{Proxy, BackendProtocol, AuthMode};
 use chrono::Utc;
+use ferrum_gateway::config::PoolConfig;
+use ferrum_gateway::config::types::{AuthMode, BackendProtocol, Proxy};
 
 fn create_test_proxy() -> Proxy {
     Proxy {
@@ -81,8 +81,14 @@ fn test_no_overrides() {
     assert_eq!(config.max_idle_per_host, global.max_idle_per_host);
     assert_eq!(config.idle_timeout_seconds, global.idle_timeout_seconds);
     assert_eq!(config.tcp_keepalive_seconds, global.tcp_keepalive_seconds);
-    assert_eq!(config.http2_keep_alive_interval_seconds, global.http2_keep_alive_interval_seconds);
-    assert_eq!(config.http2_keep_alive_timeout_seconds, global.http2_keep_alive_timeout_seconds);
+    assert_eq!(
+        config.http2_keep_alive_interval_seconds,
+        global.http2_keep_alive_interval_seconds
+    );
+    assert_eq!(
+        config.http2_keep_alive_timeout_seconds,
+        global.http2_keep_alive_timeout_seconds
+    );
     assert_eq!(config.enable_http_keep_alive, global.enable_http_keep_alive);
     assert_eq!(config.enable_http2, global.enable_http2);
 }

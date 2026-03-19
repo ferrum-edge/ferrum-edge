@@ -14,19 +14,25 @@ fn with_env_vars<F: FnOnce()>(vars: &[(&str, &str)], f: F) {
     let _guard = ENV_LOCK.lock().unwrap();
     for (k, v) in vars {
         // SAFETY: We hold a mutex preventing concurrent access.
-        unsafe { std::env::set_var(k, v); }
+        unsafe {
+            std::env::set_var(k, v);
+        }
     }
     f();
     for (k, _) in vars {
         // SAFETY: We hold a mutex preventing concurrent access.
-        unsafe { std::env::remove_var(k); }
+        unsafe {
+            std::env::remove_var(k);
+        }
     }
 }
 
 /// Helper to remove an env var (must be called inside with_env_vars or while holding ENV_LOCK).
 fn remove_var(key: &str) {
     // SAFETY: Called within with_env_vars which holds ENV_LOCK.
-    unsafe { std::env::remove_var(key); }
+    unsafe {
+        std::env::remove_var(key);
+    }
 }
 
 #[test]
@@ -88,7 +94,10 @@ fn test_env_config_file_mode_valid() {
         || {
             let config = EnvConfig::from_env().unwrap();
             assert_eq!(config.mode, OperatingMode::File);
-            assert_eq!(config.file_config_path, Some("/path/to/config.yaml".to_string()));
+            assert_eq!(
+                config.file_config_path,
+                Some("/path/to/config.yaml".to_string())
+            );
         },
     );
 }
@@ -304,12 +313,18 @@ fn test_env_config_dns_overrides_parsing() {
         &[
             ("FERRUM_MODE", "file"),
             ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
-            ("FERRUM_DNS_OVERRIDES", r#"{"myhost.local":"10.0.0.1","other.local":"10.0.0.2"}"#),
+            (
+                "FERRUM_DNS_OVERRIDES",
+                r#"{"myhost.local":"10.0.0.1","other.local":"10.0.0.2"}"#,
+            ),
         ],
         || {
             let config = EnvConfig::from_env().unwrap();
             assert_eq!(config.dns_overrides.len(), 2);
-            assert_eq!(config.dns_overrides.get("myhost.local").unwrap(), "10.0.0.1");
+            assert_eq!(
+                config.dns_overrides.get("myhost.local").unwrap(),
+                "10.0.0.1"
+            );
             assert_eq!(config.dns_overrides.get("other.local").unwrap(), "10.0.0.2");
         },
     );
@@ -419,7 +434,10 @@ fn test_env_config_dp_mode_valid() {
         || {
             let config = EnvConfig::from_env().unwrap();
             assert_eq!(config.mode, OperatingMode::DataPlane);
-            assert_eq!(config.dp_cp_grpc_url, Some("http://control-plane:50051".to_string()));
+            assert_eq!(
+                config.dp_cp_grpc_url,
+                Some("http://control-plane:50051".to_string())
+            );
             assert_eq!(config.dp_grpc_auth_token, Some("my-token".to_string()));
         },
     );
@@ -439,7 +457,10 @@ fn test_env_config_cp_mode_valid() {
         || {
             let config = EnvConfig::from_env().unwrap();
             assert_eq!(config.mode, OperatingMode::ControlPlane);
-            assert_eq!(config.cp_grpc_listen_addr, Some("0.0.0.0:50051".to_string()));
+            assert_eq!(
+                config.cp_grpc_listen_addr,
+                Some("0.0.0.0:50051".to_string())
+            );
             assert_eq!(config.cp_grpc_jwt_secret, Some("grpc-secret".to_string()));
         },
     );
@@ -459,7 +480,10 @@ fn test_env_config_dns_resolver_address() {
         ],
         || {
             let config = EnvConfig::from_env().unwrap();
-            assert_eq!(config.dns_resolver_address, Some("1.1.1.1,8.8.8.8".to_string()));
+            assert_eq!(
+                config.dns_resolver_address,
+                Some("1.1.1.1,8.8.8.8".to_string())
+            );
         },
     );
 }
@@ -489,7 +513,10 @@ fn test_env_config_dns_resolver_hosts_file() {
         ],
         || {
             let config = EnvConfig::from_env().unwrap();
-            assert_eq!(config.dns_resolver_hosts_file, Some("/custom/hosts".to_string()));
+            assert_eq!(
+                config.dns_resolver_hosts_file,
+                Some("/custom/hosts".to_string())
+            );
         },
     );
 }
@@ -534,7 +561,10 @@ fn test_env_config_dns_valid_ttl_not_set() {
         || {
             remove_var("FERRUM_DNS_VALID_TTL");
             let config = EnvConfig::from_env().unwrap();
-            assert!(config.dns_valid_ttl.is_none(), "dns_valid_ttl should be None when not set");
+            assert!(
+                config.dns_valid_ttl.is_none(),
+                "dns_valid_ttl should be None when not set"
+            );
         },
     );
 }
@@ -549,7 +579,10 @@ fn test_env_config_dns_stale_ttl_default() {
         || {
             remove_var("FERRUM_DNS_STALE_TTL");
             let config = EnvConfig::from_env().unwrap();
-            assert_eq!(config.dns_stale_ttl, 3600, "dns_stale_ttl should default to 3600");
+            assert_eq!(
+                config.dns_stale_ttl, 3600,
+                "dns_stale_ttl should default to 3600"
+            );
         },
     );
 }
@@ -611,7 +644,10 @@ fn test_env_config_max_single_header_size_default() {
         || {
             remove_var("FERRUM_MAX_SINGLE_HEADER_SIZE_BYTES");
             let config = EnvConfig::from_env().unwrap();
-            assert_eq!(config.max_single_header_size_bytes, 16384, "max_single_header_size_bytes should default to 16384");
+            assert_eq!(
+                config.max_single_header_size_bytes, 16384,
+                "max_single_header_size_bytes should default to 16384"
+            );
         },
     );
 }
@@ -641,7 +677,10 @@ fn test_env_config_max_response_body_size_default() {
         || {
             remove_var("FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES");
             let config = EnvConfig::from_env().unwrap();
-            assert_eq!(config.max_response_body_size_bytes, 10_485_760, "max_response_body_size_bytes should default to 10MB");
+            assert_eq!(
+                config.max_response_body_size_bytes, 10_485_760,
+                "max_response_body_size_bytes should default to 10MB"
+            );
         },
     );
 }
@@ -671,7 +710,10 @@ fn test_env_config_max_header_size_updated_default() {
         || {
             remove_var("FERRUM_MAX_HEADER_SIZE_BYTES");
             let config = EnvConfig::from_env().unwrap();
-            assert_eq!(config.max_header_size_bytes, 32768, "max_header_size_bytes should default to 32KB");
+            assert_eq!(
+                config.max_header_size_bytes, 32768,
+                "max_header_size_bytes should default to 32KB"
+            );
         },
     );
 }
@@ -770,7 +812,10 @@ fn test_effective_db_url_postgres_all_ssl_params() {
             ("FERRUM_MODE", "database"),
             ("FERRUM_ADMIN_JWT_SECRET", "secret"),
             ("FERRUM_DB_TYPE", "postgres"),
-            ("FERRUM_DB_URL", "postgres://user:pass@db.example.com/ferrum"),
+            (
+                "FERRUM_DB_URL",
+                "postgres://user:pass@db.example.com/ferrum",
+            ),
             ("FERRUM_DB_SSL_MODE", "verify-full"),
             ("FERRUM_DB_SSL_ROOT_CERT", "/certs/ca.pem"),
             ("FERRUM_DB_SSL_CLIENT_CERT", "/certs/client.pem"),
@@ -793,7 +838,10 @@ fn test_effective_db_url_postgres_existing_query_params() {
             ("FERRUM_MODE", "database"),
             ("FERRUM_ADMIN_JWT_SECRET", "secret"),
             ("FERRUM_DB_TYPE", "postgres"),
-            ("FERRUM_DB_URL", "postgres://localhost/ferrum?connect_timeout=10"),
+            (
+                "FERRUM_DB_URL",
+                "postgres://localhost/ferrum?connect_timeout=10",
+            ),
             ("FERRUM_DB_SSL_MODE", "require"),
         ],
         || {

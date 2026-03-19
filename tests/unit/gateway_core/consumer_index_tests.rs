@@ -1,12 +1,17 @@
 //! Tests for ConsumerIndex — credential-indexed consumer lookup
 
 use chrono::Utc;
-use ferrum_gateway::config::types::Consumer;
 use ferrum_gateway::ConsumerIndex;
+use ferrum_gateway::config::types::Consumer;
 use serde_json::{Map, Value};
 use std::collections::HashMap;
 
-fn make_consumer(id: &str, username: &str, api_key: Option<&str>, custom_id: Option<&str>) -> Consumer {
+fn make_consumer(
+    id: &str,
+    username: &str,
+    api_key: Option<&str>,
+    custom_id: Option<&str>,
+) -> Consumer {
     let mut credentials = HashMap::new();
 
     if let Some(key) = api_key {
@@ -111,7 +116,10 @@ fn test_multiple_consumers_different_credentials() {
     assert_eq!(index.find_by_api_key("key-b").unwrap().username, "bob");
     assert!(index.find_by_api_key("key-c").is_none());
     assert_eq!(index.find_by_username("carol").unwrap().id, "c3");
-    assert_eq!(index.find_by_identity("custom-c").unwrap().username, "carol");
+    assert_eq!(
+        index.find_by_identity("custom-c").unwrap().username,
+        "carol"
+    );
     assert_eq!(index.consumer_count(), 3);
 }
 

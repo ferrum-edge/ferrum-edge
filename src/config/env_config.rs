@@ -113,7 +113,7 @@ pub struct EnvConfig {
     pub backend_tls_client_key_path: Option<String>,
     /// Path to a PEM file containing trusted CA certificates for client certificate verification
     pub frontend_tls_client_ca_bundle_path: Option<String>,
-    
+
     /// Admin API TLS client CA bundle for mTLS verification
     pub admin_tls_client_ca_bundle_path: Option<String>,
     /// Disable backend TLS certificate verification (for testing only)
@@ -182,9 +182,15 @@ impl EnvConfig {
             dp_grpc_auth_token: env::var("FERRUM_DP_GRPC_AUTH_TOKEN").ok(),
 
             max_header_size_bytes: parse_env_usize("FERRUM_MAX_HEADER_SIZE_BYTES", 32_768),
-            max_single_header_size_bytes: parse_env_usize("FERRUM_MAX_SINGLE_HEADER_SIZE_BYTES", 16_384),
+            max_single_header_size_bytes: parse_env_usize(
+                "FERRUM_MAX_SINGLE_HEADER_SIZE_BYTES",
+                16_384,
+            ),
             max_body_size_bytes: parse_env_usize("FERRUM_MAX_BODY_SIZE_BYTES", 10_485_760),
-            max_response_body_size_bytes: parse_env_usize("FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES", 10_485_760),
+            max_response_body_size_bytes: parse_env_usize(
+                "FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES",
+                10_485_760,
+            ),
 
             dns_cache_ttl_seconds: parse_env_u64("FERRUM_DNS_CACHE_TTL_SECONDS", 300),
             dns_overrides,
@@ -201,14 +207,20 @@ impl EnvConfig {
             backend_tls_ca_bundle_path: env::var("FERRUM_BACKEND_TLS_CA_BUNDLE_PATH").ok(),
             backend_tls_client_cert_path: env::var("FERRUM_BACKEND_TLS_CLIENT_CERT_PATH").ok(),
             backend_tls_client_key_path: env::var("FERRUM_BACKEND_TLS_CLIENT_KEY_PATH").ok(),
-            
+
             // Global Frontend mTLS (client certificate verification)
-            frontend_tls_client_ca_bundle_path: env::var("FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH").ok(),
-            
+            frontend_tls_client_ca_bundle_path: env::var(
+                "FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH",
+            )
+            .ok(),
+
             // Admin API TLS enhancements
-            admin_tls_client_ca_bundle_path: env::var("FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH").ok(),
-            backend_tls_no_verify: env::var("FERRUM_BACKEND_TLS_NO_VERIFY").unwrap_or_default() == "true",
-            admin_tls_no_verify: env::var("FERRUM_ADMIN_TLS_NO_VERIFY").unwrap_or_default() == "true",
+            admin_tls_client_ca_bundle_path: env::var("FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH")
+                .ok(),
+            backend_tls_no_verify: env::var("FERRUM_BACKEND_TLS_NO_VERIFY").unwrap_or_default()
+                == "true",
+            admin_tls_no_verify: env::var("FERRUM_ADMIN_TLS_NO_VERIFY").unwrap_or_default()
+                == "true",
             admin_read_only: env::var("FERRUM_ADMIN_READ_ONLY").unwrap_or_default() == "true",
 
             // HTTP/3 / QUIC

@@ -181,7 +181,10 @@ plugin_configs:
     assert_eq!(config.plugin_configs[0].scope, PluginScope::Global);
     assert!(config.plugin_configs[0].enabled);
     assert_eq!(config.plugin_configs[1].scope, PluginScope::Proxy);
-    assert_eq!(config.plugin_configs[1].proxy_id, Some("proxy-protected".to_string()));
+    assert_eq!(
+        config.plugin_configs[1].proxy_id,
+        Some("proxy-protected".to_string())
+    );
 }
 
 // ============================================================================
@@ -354,7 +357,10 @@ plugin_configs: []
     assert_eq!(config.consumers.len(), 1);
     assert!(config.consumers[0].credentials.contains_key("basicauth"));
     let basicauth = &config.consumers[0].credentials["basicauth"];
-    assert_eq!(basicauth["password_hash"].as_str(), Some("$2b$12$hashed_password_here"));
+    assert_eq!(
+        basicauth["password_hash"].as_str(),
+        Some("$2b$12$hashed_password_here")
+    );
 }
 
 #[test]
@@ -430,7 +436,10 @@ plugin_configs:
 
     assert_eq!(config.plugin_configs.len(), 1);
     assert_eq!(config.plugin_configs[0].scope, PluginScope::Proxy);
-    assert_eq!(config.plugin_configs[0].proxy_id, Some("proxy-protected".to_string()));
+    assert_eq!(
+        config.plugin_configs[0].proxy_id,
+        Some("proxy-protected".to_string())
+    );
 }
 
 #[test]
@@ -503,10 +512,19 @@ plugin_configs: []
 
     let proxy = &config.proxies[0];
     assert_eq!(proxy.backend_path, Some("/v1/gateway".to_string()));
-    assert_eq!(proxy.backend_tls_client_cert_path, Some("/etc/certs/client.pem".to_string()));
-    assert_eq!(proxy.backend_tls_client_key_path, Some("/etc/certs/client-key.pem".to_string()));
+    assert_eq!(
+        proxy.backend_tls_client_cert_path,
+        Some("/etc/certs/client.pem".to_string())
+    );
+    assert_eq!(
+        proxy.backend_tls_client_key_path,
+        Some("/etc/certs/client-key.pem".to_string())
+    );
     assert!(!proxy.backend_tls_verify_server_cert);
-    assert_eq!(proxy.backend_tls_server_ca_cert_path, Some("/etc/certs/ca.pem".to_string()));
+    assert_eq!(
+        proxy.backend_tls_server_ca_cert_path,
+        Some("/etc/certs/ca.pem".to_string())
+    );
     assert_eq!(proxy.dns_override, Some("192.168.1.1".to_string()));
     assert_eq!(proxy.dns_cache_ttl_seconds, Some(300));
     assert_eq!(proxy.pool_max_idle_per_host, Some(50));
@@ -718,8 +736,14 @@ plugin_configs: []
 
     assert_eq!(config.proxies[0].plugins.len(), 3);
     assert_eq!(config.proxies[0].plugins[0].plugin_config_id, "plugin-auth");
-    assert_eq!(config.proxies[0].plugins[1].plugin_config_id, "plugin-ratelimit");
-    assert_eq!(config.proxies[0].plugins[2].plugin_config_id, "plugin-logging");
+    assert_eq!(
+        config.proxies[0].plugins[1].plugin_config_id,
+        "plugin-ratelimit"
+    );
+    assert_eq!(
+        config.proxies[0].plugins[2].plugin_config_id,
+        "plugin-logging"
+    );
 }
 
 #[test]

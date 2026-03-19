@@ -1,9 +1,11 @@
 //! Tests for rate_limiting plugin
 
-use ferrum_gateway::plugins::{rate_limiting::RateLimiting, Plugin, PluginResult};
+use ferrum_gateway::plugins::{Plugin, PluginResult, rate_limiting::RateLimiting};
 use serde_json::json;
 
-use super::plugin_utils::{create_test_consumer, create_test_context, assert_continue, assert_reject};
+use super::plugin_utils::{
+    assert_continue, assert_reject, create_test_consumer, create_test_context,
+};
 
 #[tokio::test]
 async fn test_rate_limiting_plugin_creation() {
@@ -45,7 +47,10 @@ async fn test_rate_limiting_plugin_consumer_limiting() {
     }
 
     // Should have some rejections after hitting the limit
-    assert!(rejected_count > 0, "Expected some requests to be rate limited");
+    assert!(
+        rejected_count > 0,
+        "Expected some requests to be rate limited"
+    );
 }
 
 #[tokio::test]
@@ -73,7 +78,10 @@ async fn test_rate_limiting_plugin_ip_limiting() {
     }
 
     // Should have some rejections after hitting the limit
-    assert!(rejected_count > 0, "Expected some requests to be rate limited");
+    assert!(
+        rejected_count > 0,
+        "Expected some requests to be rate limited"
+    );
 }
 
 #[tokio::test]
@@ -130,7 +138,9 @@ async fn test_rate_limiting_plugin_invalid_config() {
     let mut ctx = create_test_context();
     let result = plugin.on_request_received(&mut ctx).await;
     // Should handle gracefully
-    assert!(matches!(result, PluginResult::Continue) || matches!(result, PluginResult::Reject { .. }));
+    assert!(
+        matches!(result, PluginResult::Continue) || matches!(result, PluginResult::Reject { .. })
+    );
 }
 
 #[tokio::test]

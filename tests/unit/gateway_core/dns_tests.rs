@@ -120,9 +120,11 @@ async fn test_dns_warmup_does_not_panic() {
 async fn test_dns_warmup_with_overrides() {
     let cache = DnsCache::new(default_dns_config(300, HashMap::new()));
 
-    let hostnames = vec![
-        ("myhost.local".to_string(), Some("10.0.0.1".to_string()), Some(600)),
-    ];
+    let hostnames = vec![(
+        "myhost.local".to_string(),
+        Some("10.0.0.1".to_string()),
+        Some(600),
+    )];
 
     cache.warmup(hostnames).await;
 
@@ -144,7 +146,9 @@ async fn test_dns_custom_ttl_per_proxy() {
 async fn test_dns_resolve_nonexistent_domain() {
     let cache = DnsCache::new(default_dns_config(300, HashMap::new()));
 
-    let result = cache.resolve("this-domain-absolutely-does-not-exist.invalid", None, None).await;
+    let result = cache
+        .resolve("this-domain-absolutely-does-not-exist.invalid", None, None)
+        .await;
     assert!(result.is_err());
 }
 
@@ -166,7 +170,10 @@ async fn test_dns_warmup_populates_cache() {
     cache.warmup(hostnames).await;
 
     // After warmup, cache should contain entries for resolved hostnames
-    assert!(cache.cache_len() >= 1, "Warmup should populate at least one cache entry");
+    assert!(
+        cache.cache_len() >= 1,
+        "Warmup should populate at least one cache entry"
+    );
 }
 
 #[tokio::test]
@@ -187,7 +194,10 @@ async fn test_dns_ttl_expiration_causes_re_resolution() {
 
     // Second resolution should still succeed (re-resolves from DNS)
     let result2 = cache.resolve("localhost", None, Some(1)).await.unwrap();
-    assert_eq!(result1, result2, "Re-resolution should return same IP for localhost");
+    assert_eq!(
+        result1, result2,
+        "Re-resolution should return same IP for localhost"
+    );
 }
 
 #[tokio::test]
@@ -206,14 +216,20 @@ async fn test_dns_concurrent_resolution_safety() {
     let mut results = Vec::new();
     for handle in handles {
         let result = handle.await.unwrap();
-        assert!(result.is_ok(), "Concurrent resolution should not panic or error");
+        assert!(
+            result.is_ok(),
+            "Concurrent resolution should not panic or error"
+        );
         results.push(result.unwrap());
     }
 
     // All should resolve to the same IP
     let first = results[0];
     for ip in &results {
-        assert_eq!(*ip, first, "All concurrent resolutions should return the same IP");
+        assert_eq!(
+            *ip, first,
+            "All concurrent resolutions should return the same IP"
+        );
     }
 }
 
@@ -222,11 +238,18 @@ async fn test_dns_per_proxy_override_bypasses_cache() {
     let cache = DnsCache::new(default_dns_config(300, HashMap::new()));
 
     // Resolve with override — should NOT populate cache
-    let result = cache.resolve("some-host.example.com", Some("10.0.0.1"), None).await.unwrap();
+    let result = cache
+        .resolve("some-host.example.com", Some("10.0.0.1"), None)
+        .await
+        .unwrap();
     assert_eq!(result.to_string(), "10.0.0.1");
 
     // Cache should be empty since overrides bypass caching
-    assert_eq!(cache.cache_len(), 0, "Per-proxy override should bypass cache");
+    assert_eq!(
+        cache.cache_len(),
+        0,
+        "Per-proxy override should bypass cache"
+    );
 }
 
 #[tokio::test]
@@ -240,7 +263,11 @@ async fn test_dns_cache_serves_from_cache_within_ttl() {
     // Second call should use cache (no way to directly verify but we can
     // confirm it returns immediately and gives same result)
     let result2 = cache.resolve("localhost", None, None).await.unwrap();
-    assert_eq!(cache.cache_len(), 1, "Cache should still have exactly 1 entry");
+    assert_eq!(
+        cache.cache_len(),
+        1,
+        "Cache should still have exactly 1 entry"
+    );
     assert!(result2.to_string() == "127.0.0.1" || result2.to_string() == "::1");
 }
 
@@ -257,16 +284,25 @@ async fn test_dns_error_caching() {
     });
 
     // First resolution of non-existent domain should fail
-    let result1 = cache.resolve("this-domain-absolutely-does-not-exist.invalid", None, None).await;
+    let result1 = cache
+        .resolve("this-domain-absolutely-does-not-exist.invalid", None, None)
+        .await;
     assert!(result1.is_err(), "First resolution should fail");
 
     // Error should be cached
-    assert!(cache.is_cached_error("this-domain-absolutely-does-not-exist.invalid"),
-            "Error should be cached");
+    assert!(
+        cache.is_cached_error("this-domain-absolutely-does-not-exist.invalid"),
+        "Error should be cached"
+    );
 
     // Second resolution should return cached error immediately
-    let result2 = cache.resolve("this-domain-absolutely-does-not-exist.invalid", None, None).await;
-    assert!(result2.is_err(), "Second resolution should also fail (cached error)");
+    let result2 = cache
+        .resolve("this-domain-absolutely-does-not-exist.invalid", None, None)
+        .await;
+    assert!(
+        result2.is_err(),
+        "Second resolution should also fail (cached error)"
+    );
 }
 
 #[tokio::test]
@@ -278,15 +314,19 @@ async fn test_dns_error_ttl_expiration() {
     });
 
     // Resolve a non-existent domain
-    let _ = cache.resolve("this-domain-absolutely-does-not-exist.invalid", None, None).await;
+    let _ = cache
+        .resolve("this-domain-absolutely-does-not-exist.invalid", None, None)
+        .await;
     assert!(cache.is_cached_error("this-domain-absolutely-does-not-exist.invalid"));
 
     // Wait for error TTL to expire
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
     // Cached error should have expired
-    assert!(!cache.is_cached_error("this-domain-absolutely-does-not-exist.invalid"),
-            "Cached error should expire after error_ttl");
+    assert!(
+        !cache.is_cached_error("this-domain-absolutely-does-not-exist.invalid"),
+        "Cached error should expire after error_ttl"
+    );
 }
 
 #[tokio::test]
@@ -307,13 +347,20 @@ async fn test_dns_stale_while_revalidate() {
 
     // Should return stale data (and trigger background refresh)
     let result2 = cache.resolve("localhost", None, None).await.unwrap();
-    assert_eq!(result1, result2, "Stale data should be returned during stale window");
+    assert_eq!(
+        result1, result2,
+        "Stale data should be returned during stale window"
+    );
 
     // Give background refresh time to complete
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
     // Cache should have been refreshed
-    assert_eq!(cache.cache_len(), 1, "Cache should still have the entry after refresh");
+    assert_eq!(
+        cache.cache_len(),
+        1,
+        "Cache should still have the entry after refresh"
+    );
 }
 
 #[tokio::test]
@@ -406,7 +453,11 @@ async fn test_dns_custom_hosts_file() {
 
     // The custom hosts file entry should be resolvable
     let result = cache.resolve("my-custom-host.test", None, None).await;
-    assert!(result.is_ok(), "Custom hosts file entry should resolve: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "Custom hosts file entry should resolve: {:?}",
+        result
+    );
     assert_eq!(result.unwrap().to_string(), "10.99.99.1");
 
     let result2 = cache.resolve("another-host.test", None, None).await;
@@ -445,5 +496,8 @@ async fn test_dns_stale_deadline_enforcement() {
 
     // Should re-resolve (not serve stale data since we're past stale_deadline)
     let result2 = cache.resolve("localhost", None, None).await.unwrap();
-    assert_eq!(result1, result2, "Re-resolution should return same IP for localhost");
+    assert_eq!(
+        result1, result2,
+        "Re-resolution should return same IP for localhost"
+    );
 }

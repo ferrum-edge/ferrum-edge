@@ -1,9 +1,9 @@
 //! Tests for connection pool manager
 
-use ferrum_gateway::connection_pool::ConnectionPool;
-use ferrum_gateway::config::PoolConfig;
-use ferrum_gateway::config::types::{Proxy, BackendProtocol, AuthMode};
 use chrono::Utc;
+use ferrum_gateway::config::PoolConfig;
+use ferrum_gateway::config::types::{AuthMode, BackendProtocol, Proxy};
+use ferrum_gateway::connection_pool::ConnectionPool;
 
 fn create_test_proxy() -> Proxy {
     Proxy {
@@ -137,7 +137,10 @@ async fn test_different_proxy_configs_produce_different_pool_keys() {
     let _client2 = pool.get_client(&proxy2, None).await.unwrap();
 
     let stats = pool.get_stats();
-    assert_eq!(stats.total_pools, 2, "Different ports should create separate pool entries");
+    assert_eq!(
+        stats.total_pools, 2,
+        "Different ports should create separate pool entries"
+    );
 }
 
 #[tokio::test]
@@ -154,7 +157,10 @@ async fn test_different_protocols_produce_different_pool_keys() {
     let _client2 = pool.get_client(&proxy_https, None).await.unwrap();
 
     let stats = pool.get_stats();
-    assert_eq!(stats.total_pools, 2, "Different protocols should create separate pool entries");
+    assert_eq!(
+        stats.total_pools, 2,
+        "Different protocols should create separate pool entries"
+    );
 }
 
 #[tokio::test]
@@ -167,7 +173,10 @@ async fn test_same_proxy_reuses_cached_client() {
     let _client3 = pool.get_client(&proxy, None).await.unwrap();
 
     let stats = pool.get_stats();
-    assert_eq!(stats.total_pools, 1, "Same proxy config should reuse cached client");
+    assert_eq!(
+        stats.total_pools, 1,
+        "Same proxy config should reuse cached client"
+    );
 }
 
 #[tokio::test]
@@ -182,7 +191,10 @@ async fn test_resolved_ip_affects_pool_key() {
     let _client2 = pool.get_client(&proxy, Some(ip2)).await.unwrap();
 
     let stats = pool.get_stats();
-    assert_eq!(stats.total_pools, 2, "Different resolved IPs should create separate pool entries");
+    assert_eq!(
+        stats.total_pools, 2,
+        "Different resolved IPs should create separate pool entries"
+    );
 }
 
 #[tokio::test]
@@ -208,7 +220,10 @@ async fn test_pool_with_proxy_config_overrides() {
 
     // Should create a client successfully with proxy overrides
     let client = pool.get_client(&proxy, None).await;
-    assert!(client.is_ok(), "Pool should create client with proxy config overrides");
+    assert!(
+        client.is_ok(),
+        "Pool should create client with proxy config overrides"
+    );
 }
 
 #[tokio::test]
@@ -219,5 +234,8 @@ async fn test_pool_websocket_protocol_creates_client() {
     proxy.backend_protocol = BackendProtocol::Ws;
 
     let client = pool.get_client(&proxy, None).await;
-    assert!(client.is_ok(), "Pool should create client for WebSocket protocol");
+    assert!(
+        client.is_ok(),
+        "Pool should create client for WebSocket protocol"
+    );
 }

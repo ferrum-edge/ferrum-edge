@@ -3,14 +3,14 @@
 fn test_frontend_tls_configuration() {
     // This test verifies that the frontend TLS configuration can be loaded
     // with optional client certificate verification
-    
+
     // Test without client CA bundle (regular HTTPS)
     let _config_without_client_ca = r#"
     # Server certificate and key
     FERRUM_PROXY_TLS_CERT_PATH="/path/to/server.crt"
     FERRUM_PROXY_TLS_KEY_PATH="/path/to/server.key"
     "#;
-    
+
     println!("✅ Frontend TLS configuration test:");
     println!("   - Server certificates: FERRUM_PROXY_TLS_CERT_PATH, FERRUM_PROXY_TLS_KEY_PATH");
     println!("   - Optional client CA: FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH");
@@ -23,15 +23,24 @@ fn test_frontend_tls_configuration() {
 fn test_frontend_tls_env_vars() {
     // Verify the expected environment variables are documented
     let expected_env_vars = vec![
-        ("FERRUM_PROXY_TLS_CERT_PATH", "Path to server TLS certificate"),
-        ("FERRUM_PROXY_TLS_KEY_PATH", "Path to server TLS private key"),
-        ("FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH", "Path to client CA bundle for mTLS"),
+        (
+            "FERRUM_PROXY_TLS_CERT_PATH",
+            "Path to server TLS certificate",
+        ),
+        (
+            "FERRUM_PROXY_TLS_KEY_PATH",
+            "Path to server TLS private key",
+        ),
+        (
+            "FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH",
+            "Path to client CA bundle for mTLS",
+        ),
     ];
-    
+
     for (env_var, description) in expected_env_vars {
         println!("✅ Environment variable: {} - {}", env_var, description);
     }
-    
+
     println!("✅ Frontend TLS environment variables documented correctly");
 }
 

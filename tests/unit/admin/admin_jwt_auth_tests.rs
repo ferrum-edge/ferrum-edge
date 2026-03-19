@@ -1,8 +1,8 @@
 //! Tests for admin JWT authentication
 
-use ferrum_gateway::admin::jwt_auth::{JwtConfig, JwtManager, AdminClaims};
 use chrono::{Duration, Utc};
-use jsonwebtoken::{encode, EncodingKey, Header, Algorithm};
+use ferrum_gateway::admin::jwt_auth::{AdminClaims, JwtConfig, JwtManager};
+use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use serde_json::json;
 
 #[test]

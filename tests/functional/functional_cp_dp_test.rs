@@ -26,7 +26,7 @@ use ferrum_gateway::dns::{DnsCache, DnsConfig};
 use ferrum_gateway::grpc::cp_server::CpGrpcServer;
 use ferrum_gateway::grpc::dp_client;
 use ferrum_gateway::proxy::ProxyState;
-use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use serde_json::json;
 use tokio::time::sleep;
 use tonic::transport::Server;
@@ -201,7 +201,11 @@ async fn test_cp_dp_grpc_config_sync() {
 
     // Create DP proxy state (starts empty)
     let dp_proxy_state = create_proxy_state();
-    assert_eq!(dp_proxy_state.config.load().proxies.len(), 0, "DP should start with empty config");
+    assert_eq!(
+        dp_proxy_state.config.load().proxies.len(),
+        0,
+        "DP should start with empty config"
+    );
 
     // Connect DP to CP
     println!("DP connecting to CP at {}...", addr);
@@ -212,7 +216,8 @@ async fn test_cp_dp_grpc_config_sync() {
     let token_clone = token.clone();
 
     let client_handle = tokio::spawn(async move {
-        let _ = dp_client::connect_and_subscribe(&url_clone, &token_clone, "test-dp-node", &ps).await;
+        let _ =
+            dp_client::connect_and_subscribe(&url_clone, &token_clone, "test-dp-node", &ps).await;
     });
 
     // Wait for initial config to be received by DP
@@ -226,7 +231,11 @@ async fn test_cp_dp_grpc_config_sync() {
         "DP should have received 1 proxy from CP"
     );
     assert_eq!(dp_config.proxies[0].id, "proxy-func-1");
-    assert_eq!(dp_config.consumers.len(), 1, "DP should have received 1 consumer");
+    assert_eq!(
+        dp_config.consumers.len(),
+        1,
+        "DP should have received 1 consumer"
+    );
     println!("DP successfully received initial config with 1 proxy and 1 consumer");
 
     // Update config on CP and broadcast to DP
@@ -275,24 +284,21 @@ async fn test_database_connection_with_tls_config() {
 
     // Test 1: Connect without TLS (plaintext)
     println!("Test 1: Connecting to SQLite without TLS...");
-    let db = DatabaseStore::connect_with_tls_config(
-        "sqlite",
-        &db_url,
-        false,
-        None,
-        None,
-        None,
-        false,
-    )
-    .await
-    .expect("Failed to connect to plaintext SQLite database");
+    let db =
+        DatabaseStore::connect_with_tls_config("sqlite", &db_url, false, None, None, None, false)
+            .await
+            .expect("Failed to connect to plaintext SQLite database");
 
     // Verify we can load config from the database
     let config = db
         .load_full_config()
         .await
         .expect("Failed to load config from database");
-    assert_eq!(config.proxies.len(), 0, "Initial database should have no proxies");
+    assert_eq!(
+        config.proxies.len(),
+        0,
+        "Initial database should have no proxies"
+    );
     println!("Plaintext database connection: PASSED");
 
     // Test 2: Create a proxy in the database
@@ -331,22 +337,19 @@ async fn test_database_connection_with_tls_config() {
         .load_full_config()
         .await
         .expect("Failed to load config with TLS params");
-    assert_eq!(config.proxies.len(), 1, "Should still have the created proxy");
+    assert_eq!(
+        config.proxies.len(),
+        1,
+        "Should still have the created proxy"
+    );
     println!("TLS parameters acceptance: PASSED");
 
     // Test 5: Test TLS insecure mode
     println!("Test 5: Database connection with TLS insecure mode...");
-    let db_insecure = DatabaseStore::connect_with_tls_config(
-        "sqlite",
-        &db_url,
-        true,
-        None,
-        None,
-        None,
-        true,
-    )
-    .await
-    .expect("Failed to connect with TLS insecure");
+    let db_insecure =
+        DatabaseStore::connect_with_tls_config("sqlite", &db_url, true, None, None, None, true)
+            .await
+            .expect("Failed to connect with TLS insecure");
 
     let config = db_insecure
         .load_full_config()
@@ -369,11 +372,26 @@ async fn test_env_config_tls_fields() {
     let config = create_test_env_config();
 
     // Verify all TLS fields are present
-    assert!(!config.db_tls_enabled, "db_tls_enabled should default to false");
-    assert!(config.db_tls_ca_cert_path.is_none(), "db_tls_ca_cert_path should be None");
-    assert!(config.db_tls_client_cert_path.is_none(), "db_tls_client_cert_path should be None");
-    assert!(config.db_tls_client_key_path.is_none(), "db_tls_client_key_path should be None");
-    assert!(!config.db_tls_insecure, "db_tls_insecure should default to false");
+    assert!(
+        !config.db_tls_enabled,
+        "db_tls_enabled should default to false"
+    );
+    assert!(
+        config.db_tls_ca_cert_path.is_none(),
+        "db_tls_ca_cert_path should be None"
+    );
+    assert!(
+        config.db_tls_client_cert_path.is_none(),
+        "db_tls_client_cert_path should be None"
+    );
+    assert!(
+        config.db_tls_client_key_path.is_none(),
+        "db_tls_client_key_path should be None"
+    );
+    assert!(
+        !config.db_tls_insecure,
+        "db_tls_insecure should default to false"
+    );
 
     println!("All TLS fields present in EnvConfig");
     println!("EnvConfig TLS fields test PASSED");
@@ -404,7 +422,10 @@ async fn test_grpc_url_construction() {
 
     match pg_with_ca {
         Ok(_) => println!("Postgres TLS URL construction simulation: PASSED"),
-        Err(e) => println!("Postgres TLS URL construction (expected to fail in test): {}", e),
+        Err(e) => println!(
+            "Postgres TLS URL construction (expected to fail in test): {}",
+            e
+        ),
     }
 
     // Test MySQL TLS URL construction
@@ -421,7 +442,10 @@ async fn test_grpc_url_construction() {
 
     match mysql_with_ca {
         Ok(_) => println!("MySQL TLS URL construction simulation: PASSED"),
-        Err(e) => println!("MySQL TLS URL construction (expected to fail in test): {}", e),
+        Err(e) => println!(
+            "MySQL TLS URL construction (expected to fail in test): {}",
+            e
+        ),
     }
 
     println!("gRPC URL construction test PASSED");

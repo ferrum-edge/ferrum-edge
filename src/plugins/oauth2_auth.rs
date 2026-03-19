@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
+use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
 use serde_json::Value;
 use tracing::{debug, warn};
 
@@ -30,15 +30,13 @@ impl OAuth2Auth {
     }
 
     fn extract_bearer_token(ctx: &RequestContext) -> Option<String> {
-        ctx.headers
-            .get("authorization")
-            .and_then(|v| {
-                if v.starts_with("Bearer ") || v.starts_with("bearer ") {
-                    Some(v[7..].to_string())
-                } else {
-                    None
-                }
-            })
+        ctx.headers.get("authorization").and_then(|v| {
+            if v.starts_with("Bearer ") || v.starts_with("bearer ") {
+                Some(v[7..].to_string())
+            } else {
+                None
+            }
+        })
     }
 }
 
@@ -68,12 +66,7 @@ impl Plugin for OAuth2Auth {
                 // Token introspection via HTTP POST
                 if let Some(ref url) = self.introspection_url {
                     let client = reqwest::Client::new();
-                    match client
-                        .post(url)
-                        .form(&[("token", &token)])
-                        .send()
-                        .await
-                    {
+                    match client.post(url).form(&[("token", &token)]).send().await {
                         Ok(resp) => {
                             if let Ok(body) = resp.json::<Value>().await {
                                 let active = body["active"].as_bool().unwrap_or(false);
@@ -83,8 +76,7 @@ impl Plugin for OAuth2Auth {
                                         && let Some(consumer) = consumer_index.find_by_identity(sub)
                                     {
                                         if ctx.identified_consumer.is_none() {
-                                            ctx.identified_consumer =
-                                                Some((*consumer).clone());
+                                            ctx.identified_consumer = Some((*consumer).clone());
                                         }
                                         return PluginResult::Continue;
                                     }
@@ -104,7 +96,10 @@ impl Plugin for OAuth2Auth {
             }
             _ => {
                 // For JWKS-based validation, try consumer OAuth2 credentials with local secrets
-                debug!("OAuth2 JWKS validation mode, jwks_uri: {:?}", self.jwks_uri());
+                debug!(
+                    "OAuth2 JWKS validation mode, jwks_uri: {:?}",
+                    self.jwks_uri()
+                );
                 let consumers = consumer_index.consumers();
                 for consumer in consumers.iter() {
                     if let Some(oauth_creds) = consumer.credentials.get("oauth2")
@@ -122,14 +117,9 @@ impl Plugin for OAuth2Auth {
                             validation.set_audience(&[aud]);
                         }
 
-                        if let Ok(_token_data) =
-                            decode::<Value>(&token, &key, &validation)
-                        {
+                        if let Ok(_token_data) = decode::<Value>(&token, &key, &validation) {
                             if ctx.identified_consumer.is_none() {
-                                debug!(
-                                    "oauth2_auth: identified consumer '{}'",
-                                    consumer.username
-                                );
+                                debug!("oauth2_auth: identified consumer '{}'", consumer.username);
                                 ctx.identified_consumer = Some((**consumer).clone());
                             }
                             return PluginResult::Continue;

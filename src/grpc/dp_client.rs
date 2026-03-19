@@ -3,17 +3,13 @@ use tonic::metadata::MetadataValue;
 use tonic::transport::Channel;
 use tracing::{error, info, warn};
 
-use super::proto::config_sync_client::ConfigSyncClient;
 use super::proto::SubscribeRequest;
+use super::proto::config_sync_client::ConfigSyncClient;
 use crate::config::types::GatewayConfig;
 use crate::proxy::ProxyState;
 
 /// Connect to the Control Plane and receive config updates.
-pub async fn start_dp_client(
-    cp_url: String,
-    auth_token: String,
-    proxy_state: ProxyState,
-) {
+pub async fn start_dp_client(cp_url: String, auth_token: String, proxy_state: ProxyState) {
     let node_id = uuid::Uuid::new_v4().to_string();
     info!("DP client starting, connecting to CP at {}", cp_url);
 
@@ -46,11 +42,11 @@ pub async fn connect_and_subscribe(
     let token: MetadataValue<_> = format!("Bearer {}", auth_token).parse()?;
 
     #[allow(clippy::result_large_err)]
-    let mut client = ConfigSyncClient::with_interceptor(channel, move |mut req: tonic::Request<()>| {
-        req.metadata_mut()
-            .insert("authorization", token.clone());
-        Ok(req)
-    });
+    let mut client =
+        ConfigSyncClient::with_interceptor(channel, move |mut req: tonic::Request<()>| {
+            req.metadata_mut().insert("authorization", token.clone());
+            Ok(req)
+        });
 
     info!("Connected to CP, subscribing for config updates");
 

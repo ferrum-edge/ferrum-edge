@@ -3,15 +3,18 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::{error, info, warn};
 
-use crate::admin::{self, AdminState};
 use crate::admin::jwt_auth::create_jwt_manager_from_env;
-use crate::config::db_loader::DatabaseStore;
+use crate::admin::{self, AdminState};
 use crate::config::EnvConfig;
+use crate::config::db_loader::DatabaseStore;
 use crate::dns::{DnsCache, DnsConfig};
 use crate::proxy::{self, ProxyState};
 use crate::tls;
 
-pub async fn run(env_config: EnvConfig, shutdown_tx: tokio::sync::watch::Sender<bool>) -> Result<(), anyhow::Error> {
+pub async fn run(
+    env_config: EnvConfig,
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+) -> Result<(), anyhow::Error> {
     let effective_url = env_config
         .effective_db_url()
         .unwrap_or_else(|| "sqlite://ferrum.db".to_string());
@@ -51,7 +54,13 @@ pub async fn run(env_config: EnvConfig, shutdown_tx: tokio::sync::watch::Sender<
     let hostnames: Vec<_> = config
         .proxies
         .iter()
-        .map(|p| (p.backend_host.clone(), p.dns_override.clone(), p.dns_cache_ttl_seconds))
+        .map(|p| {
+            (
+                p.backend_host.clone(),
+                p.dns_override.clone(),
+                p.dns_cache_ttl_seconds,
+            )
+        })
         .collect();
     dns_cache.warmup(hostnames).await;
 
@@ -62,15 +71,27 @@ pub async fn run(env_config: EnvConfig, shutdown_tx: tokio::sync::watch::Sender<
     let db = Arc::new(db);
 
     // Load TLS configuration if provided
-    let tls_config = if let (Some(cert_path), Some(key_path)) = (&env_config.proxy_tls_cert_path, &env_config.proxy_tls_key_path) {
+    let tls_config = if let (Some(cert_path), Some(key_path)) = (
+        &env_config.proxy_tls_cert_path,
+        &env_config.proxy_tls_key_path,
+    ) {
         info!("Loading TLS configuration with client certificate verification...");
         let client_ca_bundle_path = env_config.frontend_tls_client_ca_bundle_path.as_deref();
-        match tls::load_tls_config_with_client_auth(cert_path, key_path, client_ca_bundle_path, env_config.backend_tls_no_verify) {
+        match tls::load_tls_config_with_client_auth(
+            cert_path,
+            key_path,
+            client_ca_bundle_path,
+            env_config.backend_tls_no_verify,
+        ) {
             Ok(config) => {
                 if client_ca_bundle_path.is_some() {
-                    info!("TLS configuration loaded with client certificate verification (HTTPS with mTLS available)");
+                    info!(
+                        "TLS configuration loaded with client certificate verification (HTTPS with mTLS available)"
+                    );
                 } else {
-                    info!("TLS configuration loaded without client certificate verification (HTTPS available)");
+                    info!(
+                        "TLS configuration loaded without client certificate verification (HTTPS available)"
+                    );
                 }
                 Some(config)
             }
@@ -106,7 +127,14 @@ pub async fn run(env_config: EnvConfig, shutdown_tx: tokio::sync::watch::Sender<
         let https_shutdown = shutdown_tx.subscribe();
         let https_handle = tokio::spawn(async move {
             info!("Starting HTTPS proxy listener on {}", https_addr);
-            if let Err(e) = proxy::start_proxy_listener_with_tls(https_addr, https_state, https_shutdown, Some(tls_config)).await {
+            if let Err(e) = proxy::start_proxy_listener_with_tls(
+                https_addr,
+                https_state,
+                https_shutdown,
+                Some(tls_config),
+            )
+            .await
+            {
                 error!("HTTPS proxy listener error: {}", e);
             }
         });
@@ -125,8 +153,14 @@ pub async fn run(env_config: EnvConfig, shutdown_tx: tokio::sync::watch::Sender<
             let h3_handle = tokio::spawn(async move {
                 info!("Starting HTTP/3 (QUIC) proxy listener on {}", h3_addr);
                 if let Err(e) = crate::http3::server::start_http3_listener(
-                    h3_addr, h3_state, h3_shutdown, tls_config, h3_config,
-                ).await {
+                    h3_addr,
+                    h3_state,
+                    h3_shutdown,
+                    tls_config,
+                    h3_config,
+                )
+                .await
+                {
                     error!("HTTP/3 proxy listener error: {}", e);
                 }
             });
@@ -152,15 +186,21 @@ pub async fn run(env_config: EnvConfig, shutdown_tx: tokio::sync::watch::Sender<
     // Admin HTTP listener (always enabled)
     let admin_http_handle = tokio::spawn(async move {
         info!("Starting Admin HTTP listener on {}", admin_http_addr);
-        if let Err(e) = admin::start_admin_listener(admin_http_addr, admin_state, admin_shutdown).await {
+        if let Err(e) =
+            admin::start_admin_listener(admin_http_addr, admin_state, admin_shutdown).await
+        {
             error!("Admin HTTP listener error: {}", e);
         }
     });
     handles.push(admin_http_handle);
 
     // Admin HTTPS listener (only if TLS is configured)
-    if let (Some(admin_cert_path), Some(admin_key_path)) = (&env_config.admin_tls_cert_path, &env_config.admin_tls_key_path) {
-        let admin_https_addr: SocketAddr = format!("0.0.0.0:{}", env_config.admin_https_port).parse()?;
+    if let (Some(admin_cert_path), Some(admin_key_path)) = (
+        &env_config.admin_tls_cert_path,
+        &env_config.admin_tls_key_path,
+    ) {
+        let admin_https_addr: SocketAddr =
+            format!("0.0.0.0:{}", env_config.admin_https_port).parse()?;
         let admin_state_for_https = AdminState {
             db: Some(db.clone()),
             jwt_manager: create_jwt_manager_from_env()
@@ -170,22 +210,28 @@ pub async fn run(env_config: EnvConfig, shutdown_tx: tokio::sync::watch::Sender<
             read_only: env_config.admin_read_only,
         };
         let admin_https_shutdown = shutdown_tx.subscribe();
-        
+
         // Load admin TLS configuration
         let admin_client_ca_bundle = env_config.admin_tls_client_ca_bundle_path.as_deref();
         let admin_tls_config = match tls::load_tls_config_with_client_auth(
-            admin_cert_path, 
-            admin_key_path, 
+            admin_cert_path,
+            admin_key_path,
             admin_client_ca_bundle,
-            env_config.admin_tls_no_verify
+            env_config.admin_tls_no_verify,
         ) {
             Ok(config) => {
                 if admin_client_ca_bundle.is_some() {
-                    info!("Admin TLS configuration loaded with client certificate verification (HTTPS with mTLS available)");
+                    info!(
+                        "Admin TLS configuration loaded with client certificate verification (HTTPS with mTLS available)"
+                    );
                 } else if env_config.admin_tls_no_verify {
-                    warn!("Admin TLS configuration loaded with certificate verification DISABLED (testing mode)");
+                    warn!(
+                        "Admin TLS configuration loaded with certificate verification DISABLED (testing mode)"
+                    );
                 } else {
-                    info!("Admin TLS configuration loaded without client certificate verification (HTTPS available)");
+                    info!(
+                        "Admin TLS configuration loaded without client certificate verification (HTTPS available)"
+                    );
                 }
                 Some(config)
             }
@@ -197,7 +243,14 @@ pub async fn run(env_config: EnvConfig, shutdown_tx: tokio::sync::watch::Sender<
 
         let admin_https_handle = tokio::spawn(async move {
             info!("Starting Admin HTTPS listener on {}", admin_https_addr);
-            if let Err(e) = admin::start_admin_listener_with_tls(admin_https_addr, admin_state_for_https, admin_https_shutdown, admin_tls_config).await {
+            if let Err(e) = admin::start_admin_listener_with_tls(
+                admin_https_addr,
+                admin_state_for_https,
+                admin_https_shutdown,
+                admin_tls_config,
+            )
+            .await
+            {
                 error!("Admin HTTPS listener error: {}", e);
             }
         });

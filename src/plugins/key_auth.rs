@@ -23,14 +23,18 @@ impl KeyAuth {
     fn extract_key(&self, ctx: &RequestContext) -> Option<String> {
         if self.key_location.starts_with("header:") {
             let header_name = &self.key_location["header:".len()..];
-            ctx.headers.get(&header_name.to_lowercase())
+            ctx.headers
+                .get(&header_name.to_lowercase())
                 .or_else(|| ctx.headers.get(header_name))
                 .cloned()
         } else if self.key_location.starts_with("query:") {
             let param_name = &self.key_location["query:".len()..];
             ctx.query_params.get(param_name).cloned()
         } else {
-            ctx.headers.get("x-api-key").or_else(|| ctx.headers.get("X-API-Key")).cloned()
+            ctx.headers
+                .get("x-api-key")
+                .or_else(|| ctx.headers.get("X-API-Key"))
+                .cloned()
         }
     }
 }

@@ -102,10 +102,7 @@ impl ConsumerIndex {
                 Arc::clone(&arc_consumer),
             );
             if let Some(ref custom_id) = consumer.custom_id {
-                index.insert(
-                    format!("identity:{}", custom_id),
-                    Arc::clone(&arc_consumer),
-                );
+                index.insert(format!("identity:{}", custom_id), Arc::clone(&arc_consumer));
             }
         }
 

@@ -48,14 +48,13 @@ impl Http3Client {
         body: bytes::Bytes,
     ) -> Result<(u16, Vec<u8>, std::collections::HashMap<String, String>), anyhow::Error> {
         // Parse URL to get host and port
-        let uri: http::Uri = backend_url.parse()
+        let uri: http::Uri = backend_url
+            .parse()
             .map_err(|e| anyhow::anyhow!("Invalid backend URL: {}", e))?;
 
         let host = uri.host().unwrap_or(&proxy.backend_host);
         let port = uri.port_u16().unwrap_or(proxy.backend_port);
-        let path_and_query = uri.path_and_query()
-            .map(|pq| pq.as_str())
-            .unwrap_or("/");
+        let path_and_query = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
 
         // Resolve the backend address
         let addr = resolve_backend_addr(host, port).await?;
@@ -86,9 +85,7 @@ impl Http3Client {
         // Build the request with the correct URI (path only, not full URL)
         let req_method: http::Method = method.parse().unwrap_or(http::Method::GET);
 
-        let mut req_builder = Request::builder()
-            .method(req_method)
-            .uri(path_and_query);
+        let mut req_builder = Request::builder().method(req_method).uri(path_and_query);
 
         // Add headers, skipping connection-level headers not valid in HTTP/3
         for (name, value) in &headers {
@@ -146,7 +143,9 @@ async fn resolve_backend_addr(host: &str, port: u16) -> Result<SocketAddr, anyho
         .await
         .map_err(|e| anyhow::anyhow!("DNS resolution failed for {}:{}: {}", host, port, e))?
         .next()
-        .ok_or_else(|| anyhow::anyhow!("DNS resolution returned no addresses for {}:{}", host, port))?;
+        .ok_or_else(|| {
+            anyhow::anyhow!("DNS resolution returned no addresses for {}:{}", host, port)
+        })?;
 
     Ok(addr)
 }

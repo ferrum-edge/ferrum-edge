@@ -1,9 +1,9 @@
 //! Tests for access_control plugin
 
-use ferrum_gateway::plugins::{access_control::AccessControl, Plugin};
+use ferrum_gateway::plugins::{Plugin, access_control::AccessControl};
 use serde_json::json;
 
-use super::plugin_utils::{create_test_context, assert_continue, assert_reject};
+use super::plugin_utils::{assert_continue, assert_reject, create_test_context};
 
 #[tokio::test]
 async fn test_access_control_plugin_creation() {
@@ -22,11 +22,11 @@ async fn test_access_control_plugin_allowed_ip() {
         "blocked_ips": ["192.168.1.100"]
     });
     let plugin = AccessControl::new(&config);
-    
+
     // Test allowed IP
     let mut allowed_ctx = create_test_context();
     allowed_ctx.client_ip = "127.0.0.1".to_string();
-    
+
     let result = plugin.authorize(&mut allowed_ctx).await;
     assert_continue(result);
 }
@@ -38,11 +38,11 @@ async fn test_access_control_plugin_blocked_ip() {
         "blocked_ips": ["192.168.1.100"]
     });
     let plugin = AccessControl::new(&config);
-    
+
     // Test blocked IP
     let mut blocked_ctx = create_test_context();
     blocked_ctx.client_ip = "192.168.1.100".to_string();
-    
+
     let result = plugin.authorize(&mut blocked_ctx).await;
     assert_reject(result, Some(403));
 }
@@ -54,11 +54,11 @@ async fn test_access_control_plugin_cidr_allowed() {
         "blocked_ips": []
     });
     let plugin = AccessControl::new(&config);
-    
+
     // Test IP within allowed CIDR range
     let mut allowed_ctx = create_test_context();
     allowed_ctx.client_ip = "10.0.0.50".to_string();
-    
+
     let result = plugin.authorize(&mut allowed_ctx).await;
     assert_continue(result);
 }
@@ -70,11 +70,11 @@ async fn test_access_control_plugin_cidr_blocked() {
         "blocked_ips": ["192.168.0.0/16"]
     });
     let plugin = AccessControl::new(&config);
-    
+
     // Test IP within blocked CIDR range
     let mut blocked_ctx = create_test_context();
     blocked_ctx.client_ip = "192.168.0.50".to_string();
-    
+
     let result = plugin.authorize(&mut blocked_ctx).await;
     assert_reject(result, Some(403));
 }
@@ -83,11 +83,11 @@ async fn test_access_control_plugin_cidr_blocked() {
 async fn test_access_control_plugin_no_rules() {
     let config = json!({});
     let plugin = AccessControl::new(&config);
-    
+
     // With no rules, should allow all
     let mut ctx = create_test_context();
     ctx.client_ip = "any.ip.address".to_string();
-    
+
     let result = plugin.authorize(&mut ctx).await;
     assert_continue(result);
 }

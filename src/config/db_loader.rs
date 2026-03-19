@@ -3,8 +3,8 @@ use crate::config::types::{
     PluginScope, Proxy,
 };
 use chrono::Utc;
-use sqlx::{AnyPool, any::AnyPoolOptions, any::AnyRow};
 use sqlx::Row;
+use sqlx::{AnyPool, any::AnyPoolOptions, any::AnyRow};
 use tracing::{error, info};
 
 /// Database configuration store.
@@ -18,16 +18,7 @@ impl DatabaseStore {
     /// Connect to the database and run migrations.
     #[allow(dead_code)]
     pub async fn connect(db_type: &str, db_url: &str) -> Result<Self, anyhow::Error> {
-        Self::connect_with_tls_config(
-            db_type,
-            db_url,
-            false,
-            None,
-            None,
-            None,
-            false,
-        )
-        .await
+        Self::connect_with_tls_config(db_type, db_url, false, None, None, None, false).await
     }
 
     /// Connect to the database with optional TLS configuration and run migrations.
@@ -69,7 +60,10 @@ impl DatabaseStore {
 
         store.run_migrations().await?;
 
-        info!("Database connected and migrations applied (type={}, tls_enabled={})", db_type, tls_enabled);
+        info!(
+            "Database connected and migrations applied (type={}, tls_enabled={})",
+            db_type, tls_enabled
+        );
         Ok(store)
     }
 
@@ -122,7 +116,10 @@ impl DatabaseStore {
             }
             _ => {
                 // SQLite and others don't use network TLS
-                info!("TLS configuration not supported for database type: {}", db_type);
+                info!(
+                    "TLS configuration not supported for database type: {}",
+                    db_type
+                );
             }
         }
 
@@ -263,9 +260,7 @@ impl DatabaseStore {
                     .unwrap_or(80),
                 backend_path: row.try_get("backend_path").ok(),
                 strip_listen_path: row.try_get::<i32, _>("strip_listen_path").unwrap_or(1) != 0,
-                preserve_host_header: row
-                    .try_get::<i32, _>("preserve_host_header")
-                    .unwrap_or(0)
+                preserve_host_header: row.try_get::<i32, _>("preserve_host_header").unwrap_or(0)
                     != 0,
                 backend_connect_timeout_ms: row
                     .try_get::<i64, _>("backend_connect_timeout_ms")
@@ -445,7 +440,7 @@ impl DatabaseStore {
     pub async fn update_consumer(&self, consumer: &Consumer) -> Result<(), anyhow::Error> {
         let creds_json = serde_json::to_string(&consumer.credentials)?;
         sqlx::query(
-            "UPDATE consumers SET username=?, custom_id=?, credentials=?, updated_at=? WHERE id=?"
+            "UPDATE consumers SET username=?, custom_id=?, credentials=?, updated_at=? WHERE id=?",
         )
         .bind(&consumer.username)
         .bind(&consumer.custom_id)

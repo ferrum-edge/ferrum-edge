@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::config::types::{GatewayConfig, PluginScope};
-use crate::plugins::{create_plugin, Plugin};
+use crate::plugins::{Plugin, create_plugin};
 
 /// Pre-resolved plugin cache that avoids per-request plugin creation.
 ///

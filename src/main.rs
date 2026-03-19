@@ -21,13 +21,12 @@ async fn main() {
     // Initialize rustls crypto provider
     rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider())
         .expect("Failed to install crypto provider");
-    
+
     // Initialize tracing/logging
     let log_level = std::env::var("FERRUM_LOG_LEVEL").unwrap_or_else(|_| "info".into());
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new(&log_level)),
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&log_level)),
         )
         .json()
         .init();
@@ -55,7 +54,7 @@ async fn main() {
 
         #[cfg(unix)]
         {
-            use tokio::signal::unix::{signal, SignalKind};
+            use tokio::signal::unix::{SignalKind, signal};
             let mut sigterm = signal(SignalKind::terminate()).expect("Failed to register SIGTERM");
             tokio::select! {
                 _ = ctrl_c => {

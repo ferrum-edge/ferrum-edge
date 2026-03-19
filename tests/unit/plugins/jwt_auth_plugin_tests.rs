@@ -1,17 +1,21 @@
 //! Tests for jwt_auth plugin (proxy-side JWT authentication, not admin JWT)
 
-use ferrum_gateway::plugins::{jwt_auth::JwtAuth, Plugin, RequestContext};
 use ferrum_gateway::ConsumerIndex;
+use ferrum_gateway::plugins::{Plugin, RequestContext, jwt_auth::JwtAuth};
 use serde_json::json;
 
-use super::plugin_utils::{create_test_consumer, assert_continue, assert_reject};
+use super::plugin_utils::{assert_continue, assert_reject, create_test_consumer};
 
 fn make_ctx() -> RequestContext {
-    RequestContext::new("127.0.0.1".to_string(), "GET".to_string(), "/test".to_string())
+    RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/test".to_string(),
+    )
 }
 
 fn create_jwt_token(claims: &serde_json::Value, secret: &str) -> String {
-    use jsonwebtoken::{encode, EncodingKey, Header};
+    use jsonwebtoken::{EncodingKey, Header, encode};
     encode(
         &Header::default(),
         claims,
@@ -44,7 +48,8 @@ async fn test_jwt_auth_successful_with_bearer_header() {
     let token = create_jwt_token(&json!({"sub": "testuser"}), "test-jwt-secret");
 
     let mut ctx = make_ctx();
-    ctx.headers.insert("authorization".to_string(), format!("Bearer {}", token));
+    ctx.headers
+        .insert("authorization".to_string(), format!("Bearer {}", token));
     ctx.identified_consumer = None;
 
     let result = plugin.authenticate(&mut ctx, &consumer_index).await;
@@ -63,7 +68,8 @@ async fn test_jwt_auth_successful_with_consumer_id() {
     let token = create_jwt_token(&json!({"sub": "test-consumer"}), "test-jwt-secret");
 
     let mut ctx = make_ctx();
-    ctx.headers.insert("authorization".to_string(), format!("Bearer {}", token));
+    ctx.headers
+        .insert("authorization".to_string(), format!("Bearer {}", token));
     ctx.identified_consumer = None;
 
     let result = plugin.authenticate(&mut ctx, &consumer_index).await;
@@ -80,7 +86,8 @@ async fn test_jwt_auth_wrong_secret() {
     let token = create_jwt_token(&json!({"sub": "testuser"}), "wrong-secret");
 
     let mut ctx = make_ctx();
-    ctx.headers.insert("authorization".to_string(), format!("Bearer {}", token));
+    ctx.headers
+        .insert("authorization".to_string(), format!("Bearer {}", token));
     ctx.identified_consumer = None;
 
     let result = plugin.authenticate(&mut ctx, &consumer_index).await;
@@ -109,7 +116,8 @@ async fn test_jwt_auth_wrong_claim_value() {
     let token = create_jwt_token(&json!({"sub": "unknown-user"}), "test-jwt-secret");
 
     let mut ctx = make_ctx();
-    ctx.headers.insert("authorization".to_string(), format!("Bearer {}", token));
+    ctx.headers
+        .insert("authorization".to_string(), format!("Bearer {}", token));
     ctx.identified_consumer = None;
 
     let result = plugin.authenticate(&mut ctx, &consumer_index).await;
@@ -125,7 +133,8 @@ async fn test_jwt_auth_custom_claim_field() {
     let token = create_jwt_token(&json!({"user_id": "testuser"}), "test-jwt-secret");
 
     let mut ctx = make_ctx();
-    ctx.headers.insert("authorization".to_string(), format!("Bearer {}", token));
+    ctx.headers
+        .insert("authorization".to_string(), format!("Bearer {}", token));
     ctx.identified_consumer = None;
 
     let result = plugin.authenticate(&mut ctx, &consumer_index).await;
@@ -176,7 +185,8 @@ async fn test_jwt_auth_bearer_lowercase() {
     let token = create_jwt_token(&json!({"sub": "testuser"}), "test-jwt-secret");
 
     let mut ctx = make_ctx();
-    ctx.headers.insert("authorization".to_string(), format!("bearer {}", token));
+    ctx.headers
+        .insert("authorization".to_string(), format!("bearer {}", token));
     ctx.identified_consumer = None;
 
     let result = plugin.authenticate(&mut ctx, &consumer_index).await;
@@ -191,7 +201,8 @@ async fn test_jwt_auth_empty_consumers() {
     let token = create_jwt_token(&json!({"sub": "testuser"}), "test-jwt-secret");
 
     let mut ctx = make_ctx();
-    ctx.headers.insert("authorization".to_string(), format!("Bearer {}", token));
+    ctx.headers
+        .insert("authorization".to_string(), format!("Bearer {}", token));
 
     let result = plugin.authenticate(&mut ctx, &consumer_index).await;
     assert_reject(result, Some(401));
@@ -203,7 +214,8 @@ async fn test_jwt_auth_malformed_token() {
     let consumer_index = ConsumerIndex::new(&[create_test_consumer()]);
 
     let mut ctx = make_ctx();
-    ctx.headers.insert("authorization".to_string(), "Bearer not.a.jwt".to_string());
+    ctx.headers
+        .insert("authorization".to_string(), "Bearer not.a.jwt".to_string());
 
     let result = plugin.authenticate(&mut ctx, &consumer_index).await;
     assert_reject(result, Some(401));

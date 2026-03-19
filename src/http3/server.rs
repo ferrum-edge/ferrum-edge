@@ -11,9 +11,7 @@ use tracing::{debug, error, info, warn};
 
 use super::config::Http3ServerConfig;
 use crate::config::types::{AuthMode, Proxy};
-use crate::plugins::{
-    Plugin, PluginResult, RequestContext, TransactionSummary,
-};
+use crate::plugins::{Plugin, PluginResult, RequestContext, TransactionSummary};
 use crate::proxy::ProxyState;
 
 /// Start the HTTP/3 (QUIC) proxy listener.
@@ -87,8 +85,7 @@ async fn handle_h3_connection(
     let remote_addr = connection.remote_address();
     debug!("HTTP/3 connection established from {}", remote_addr);
 
-    let mut h3_conn = h3::server::Connection::new(h3_quinn::Connection::new(connection))
-        .await?;
+    let mut h3_conn = h3::server::Connection::new(h3_quinn::Connection::new(connection)).await?;
 
     loop {
         match h3_conn.accept().await {
@@ -97,7 +94,8 @@ async fn handle_h3_connection(
                 tokio::spawn(async move {
                     match resolver.resolve_request().await {
                         Ok((req, stream)) => {
-                            if let Err(e) = handle_h3_request(req, stream, state, remote_addr).await {
+                            if let Err(e) = handle_h3_request(req, stream, state, remote_addr).await
+                            {
                                 error!("HTTP/3 request error: {}", e);
                             }
                         }
@@ -135,11 +133,7 @@ async fn handle_h3_request(
     let query_string = req.uri().query().unwrap_or("").to_string();
 
     // Build request context
-    let mut ctx = RequestContext::new(
-        remote_addr.ip().to_string(),
-        method.clone(),
-        path.clone(),
-    );
+    let mut ctx = RequestContext::new(remote_addr.ip().to_string(), method.clone(), path.clone());
 
     // Validate and extract headers with size limits
     let mut total_header_size: usize = 0;
@@ -155,7 +149,8 @@ async fn handle_h3_request(
                     name.as_str(),
                     state.max_single_header_size_bytes
                 ),
-            ).await?;
+            )
+            .await?;
             return Ok(());
         }
         total_header_size += header_size;
@@ -170,7 +165,8 @@ async fn handle_h3_request(
             &mut stream,
             StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
             r#"{"error":"Total request headers exceed maximum size"}"#,
-        ).await?;
+        )
+        .await?;
         return Ok(());
     }
 
@@ -188,7 +184,12 @@ async fn handle_h3_request(
         Some(p) => (*p).clone(),
         None => {
             record_request(&state, 404);
-            send_h3_response(&mut stream, StatusCode::NOT_FOUND, r#"{"error":"Not Found"}"#).await?;
+            send_h3_response(
+                &mut stream,
+                StatusCode::NOT_FOUND,
+                r#"{"error":"Not Found"}"#,
+            )
+            .await?;
             return Ok(());
         }
     };
@@ -207,7 +208,8 @@ async fn handle_h3_request(
                     &mut stream,
                     StatusCode::from_u16(status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
                     &body,
-                ).await?;
+                )
+                .await?;
                 return Ok(());
             }
             PluginResult::Continue => {}
@@ -228,20 +230,25 @@ async fn handle_h3_request(
     match proxy.auth_mode {
         AuthMode::Multi => {
             for auth_plugin in &auth_plugins {
-                let _ = auth_plugin.authenticate(&mut ctx, &state.consumer_index).await;
+                let _ = auth_plugin
+                    .authenticate(&mut ctx, &state.consumer_index)
+                    .await;
             }
         }
         AuthMode::Single => {
             for auth_plugin in &auth_plugins {
-                match auth_plugin.authenticate(&mut ctx, &state.consumer_index).await {
+                match auth_plugin
+                    .authenticate(&mut ctx, &state.consumer_index)
+                    .await
+                {
                     PluginResult::Reject { status_code, body } => {
                         record_request(&state, status_code);
                         send_h3_response(
                             &mut stream,
-                            StatusCode::from_u16(status_code)
-                                .unwrap_or(StatusCode::UNAUTHORIZED),
+                            StatusCode::from_u16(status_code).unwrap_or(StatusCode::UNAUTHORIZED),
                             &body,
-                        ).await?;
+                        )
+                        .await?;
                         return Ok(());
                     }
                     PluginResult::Continue => {}
@@ -258,10 +265,10 @@ async fn handle_h3_request(
                     record_request(&state, status_code);
                     send_h3_response(
                         &mut stream,
-                        StatusCode::from_u16(status_code)
-                            .unwrap_or(StatusCode::FORBIDDEN),
+                        StatusCode::from_u16(status_code).unwrap_or(StatusCode::FORBIDDEN),
                         &body,
-                    ).await?;
+                    )
+                    .await?;
                     return Ok(());
                 }
                 PluginResult::Continue => {}
@@ -277,10 +284,10 @@ async fn handle_h3_request(
                 record_request(&state, status_code);
                 send_h3_response(
                     &mut stream,
-                    StatusCode::from_u16(status_code)
-                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                    StatusCode::from_u16(status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
                     &body,
-                ).await?;
+                )
+                .await?;
                 return Ok(());
             }
             PluginResult::Continue => {}
@@ -298,7 +305,8 @@ async fn handle_h3_request(
             &mut stream,
             StatusCode::PAYLOAD_TOO_LARGE,
             r#"{"error":"Request body exceeds maximum size"}"#,
-        ).await?;
+        )
+        .await?;
         return Ok(());
     }
 
@@ -306,13 +314,16 @@ async fn handle_h3_request(
     let mut body_data = Vec::new();
     while let Some(chunk) = stream.recv_data().await? {
         let bytes = chunk.chunk();
-        if state.max_body_size_bytes > 0 && body_data.len() + bytes.len() > state.max_body_size_bytes {
+        if state.max_body_size_bytes > 0
+            && body_data.len() + bytes.len() > state.max_body_size_bytes
+        {
             record_request(&state, 413);
             send_h3_response(
                 &mut stream,
                 StatusCode::PAYLOAD_TOO_LARGE,
                 r#"{"error":"Request body exceeds maximum size"}"#,
-            ).await?;
+            )
+            .await?;
             return Ok(());
         }
         body_data.extend_from_slice(bytes);
@@ -322,9 +333,15 @@ async fn handle_h3_request(
     let backend_url = crate::proxy::build_backend_url(&proxy, &path, &query_string);
     let backend_start = std::time::Instant::now();
 
-    let (response_status, response_body, mut response_headers) =
-        proxy_to_backend_h3(&state, &proxy, &backend_url, &method, &proxy_headers, body_data)
-            .await;
+    let (response_status, response_body, mut response_headers) = proxy_to_backend_h3(
+        &state,
+        &proxy,
+        &backend_url,
+        &method,
+        &proxy_headers,
+        body_data,
+    )
+    .await;
 
     let backend_ttfb_ms = backend_start.elapsed().as_secs_f64() * 1000.0;
     let backend_total_ms = backend_start.elapsed().as_secs_f64() * 1000.0;
@@ -377,9 +394,7 @@ async fn handle_h3_request(
 
     let resp = resp_builder.body(()).unwrap();
     stream.send_response(resp).await?;
-    stream
-        .send_data(Bytes::from(response_body))
-        .await?;
+    stream.send_data(Bytes::from(response_body)).await?;
     stream.finish().await?;
 
     Ok(())
@@ -405,7 +420,11 @@ async fn proxy_to_backend_h3(
         .await;
 
     // Get client from connection pool
-    let client = match state.connection_pool.get_client(proxy, resolved_ip.ok()).await {
+    let client = match state
+        .connection_pool
+        .get_client(proxy, resolved_ip.ok())
+        .await
+    {
         Ok(client) => client,
         Err(e) => {
             error!("Failed to get client from pool: {}", e);
@@ -455,8 +474,7 @@ async fn proxy_to_backend_h3(
 
     // Add proxy headers
     if let Some(xff) = headers.get("x-forwarded-for") {
-        req_builder =
-            req_builder.header("X-Forwarded-For", format!("{}, {}", xff, "client_ip"));
+        req_builder = req_builder.header("X-Forwarded-For", format!("{}, {}", xff, "client_ip"));
     }
     req_builder = req_builder.header("X-Forwarded-Proto", "h3");
     if let Some(host) = headers.get("host").or_else(|| headers.get(":authority")) {
@@ -480,7 +498,8 @@ async fn proxy_to_backend_h3(
             // Enforce response body size limit
             if state.max_response_body_size_bytes > 0 {
                 // Fast path: check Content-Length header from backend
-                let content_length = response.headers()
+                let content_length = response
+                    .headers()
                     .get("content-length")
                     .and_then(|v| v.to_str().ok())
                     .and_then(|v| v.parse::<usize>().ok());
@@ -488,11 +507,15 @@ async fn proxy_to_backend_h3(
                 if let Some(len) = content_length
                     && len > state.max_response_body_size_bytes
                 {
-                    warn!("Backend response body ({} bytes) exceeds limit ({} bytes)",
-                          len, state.max_response_body_size_bytes);
+                    warn!(
+                        "Backend response body ({} bytes) exceeds limit ({} bytes)",
+                        len, state.max_response_body_size_bytes
+                    );
                     return (
                         502,
-                        r#"{"error":"Backend response body exceeds maximum size"}"#.as_bytes().to_vec(),
+                        r#"{"error":"Backend response body exceeds maximum size"}"#
+                            .as_bytes()
+                            .to_vec(),
                         std::collections::HashMap::new(),
                     );
                 }
@@ -528,9 +551,7 @@ async fn send_h3_response(
         .body(())
         .unwrap();
     stream.send_response(resp).await?;
-    stream
-        .send_data(Bytes::from(body.to_string()))
-        .await?;
+    stream.send_data(Bytes::from(body.to_string())).await?;
     stream.finish().await?;
     Ok(())
 }
@@ -561,8 +582,13 @@ async fn collect_response_with_limit_h3(
         match chunk_result {
             Ok(chunk) => {
                 if body.len() + chunk.len() > max_size {
-                    warn!("Backend response truncated: exceeded {} byte limit", max_size);
-                    return Err(r#"{"error":"Backend response body exceeds maximum size"}"#.as_bytes().to_vec());
+                    warn!(
+                        "Backend response truncated: exceeded {} byte limit",
+                        max_size
+                    );
+                    return Err(r#"{"error":"Backend response body exceeds maximum size"}"#
+                        .as_bytes()
+                        .to_vec());
                 }
                 body.extend_from_slice(&chunk);
             }
