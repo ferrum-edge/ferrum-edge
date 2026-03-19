@@ -1,3 +1,4 @@
 mod functional_cp_dp_test;
 mod functional_database_test;
 mod functional_file_mode_test;
+mod functional_websocket_test;
