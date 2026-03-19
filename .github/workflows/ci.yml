@@ -46,8 +46,8 @@ jobs:
 
       - name: Install protoc
         run: |
-          apt-get update
-          apt-get install -y protobuf-compiler
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
 
       - name: Run tests
         run: cargo test --verbose --all-features
@@ -68,8 +68,8 @@ jobs:
 
       - name: Install protoc
         run: |
-          apt-get update
-          apt-get install -y protobuf-compiler
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
 
       - name: Cache cargo registry
         uses: actions/cache@v3
@@ -122,8 +122,8 @@ jobs:
       - name: Install protoc (Ubuntu)
         if: runner.os == 'Linux'
         run: |
-          apt-get update
-          apt-get install -y protobuf-compiler
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
 
       - name: Install protoc (macOS)
         if: runner.os == 'macOS'
@@ -176,7 +176,7 @@ jobs:
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
-        if: secrets.DOCKER_USERNAME != ''
+        if: ${{ secrets.DOCKER_USERNAME != '' }}
 
       - name: Build Docker image
         uses: docker/build-push-action@v4
