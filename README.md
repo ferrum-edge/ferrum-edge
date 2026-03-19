@@ -316,6 +316,11 @@ See [CI/CD Documentation](docs/ci_cd.md) for complete pipeline overview, secrets
 | `FERRUM_DB_POLL_INTERVAL` | No | `30` | Seconds between DB config polls |
 | `FERRUM_DB_POLL_CHECK_INTERVAL` | No | `5` | Seconds between DB connectivity checks |
 | `FERRUM_DB_INCREMENTAL_POLLING` | No | `true` | Enable incremental (delta) DB polling |
+| `FERRUM_DB_TLS_ENABLED` | No | `false` | Enable TLS for database connections |
+| `FERRUM_DB_TLS_CA_CERT_PATH` | No | — | Path to CA certificate for database TLS verification |
+| `FERRUM_DB_TLS_CLIENT_CERT_PATH` | No | — | Path to client certificate for database mTLS |
+| `FERRUM_DB_TLS_CLIENT_KEY_PATH` | No | — | Path to client private key for database mTLS |
+| `FERRUM_DB_TLS_INSECURE` | No | `false` | Skip certificate verification for database TLS (testing only) |
 | `FERRUM_DB_SSL_MODE` | No | — | Database SSL mode: `disable`, `prefer`, `require`, `verify-ca`, `verify-full` |
 | `FERRUM_DB_SSL_ROOT_CERT` | No | — | Path to CA certificate for database server verification |
 | `FERRUM_DB_SSL_CLIENT_CERT` | No | — | Path to client certificate for database mTLS |
@@ -348,6 +353,9 @@ See [CI/CD Documentation](docs/ci_cd.md) for complete pipeline overview, secrets
 | `FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH` | No | — | Path to admin client CA bundle for mTLS verification |
 | `FERRUM_ADMIN_TLS_NO_VERIFY` | No | `false` | Disable admin TLS certificate verification (testing only) |
 | `FERRUM_BACKEND_TLS_NO_VERIFY` | No | `false` | Disable backend TLS certificate verification (testing only) |
+| `FERRUM_ENABLE_HTTP3` | No | `false` | Enable HTTP/3 (QUIC) listener on the HTTPS port |
+| `FERRUM_HTTP3_IDLE_TIMEOUT` | No | `30` | HTTP/3 connection idle timeout in seconds |
+| `FERRUM_HTTP3_MAX_STREAMS` | No | `100` | Maximum concurrent HTTP/3 streams per connection |
 
 ### Configuration File Format (File Mode)
 
@@ -645,8 +653,12 @@ Returns:
 
 ```bash
 curl http://localhost:9000/health
-# Returns: {"status": "ok"}
+# or equivalently:
+curl http://localhost:9000/status
+# Returns: {"status": "ok", "timestamp": "...", "mode": "database"}
 ```
+
+Both `/health` and `/status` return the same response and do not require JWT authentication, making them suitable for load balancer health probes and monitoring systems.
 
 ## Plugin System
 
@@ -876,6 +888,20 @@ All modes maintain an in-memory cache of the last valid configuration. If the co
 - Non-blocking startup warmup resolves all backend hostnames
 - See [docs/dns_resolver.md](docs/dns_resolver.md) for full configuration reference
 
+### HTTP/3 (QUIC) Support
+
+Ferrum supports HTTP/3 over QUIC on the same port as HTTPS. HTTP/3 requires TLS to be configured.
+
+```bash
+FERRUM_PROXY_TLS_CERT_PATH=/path/to/cert.pem \
+FERRUM_PROXY_TLS_KEY_PATH=/path/to/key.pem \
+FERRUM_ENABLE_HTTP3=true \
+FERRUM_HTTP3_IDLE_TIMEOUT=30 \
+FERRUM_HTTP3_MAX_STREAMS=100
+```
+
+When enabled, the gateway listens for QUIC connections on `FERRUM_PROXY_HTTPS_PORT` alongside the standard HTTPS listener. Clients that support HTTP/3 (e.g., `curl --http3`) can connect via QUIC for lower-latency connections with built-in multiplexing and improved head-of-line blocking behavior.
+
 ## Security
 
 ### TLS Configuration
@@ -891,7 +917,11 @@ FERRUM_ADMIN_TLS_KEY_PATH=/path/to/admin-key.pem
 
 ### Database TLS/SSL
 
-Ferrum supports TLS encryption for PostgreSQL and MySQL database connections via dedicated environment variables. These are translated into connection string parameters automatically, so you don't need to embed them in `FERRUM_DB_URL`.
+Ferrum supports TLS encryption for PostgreSQL and MySQL database connections. There are two configuration approaches — use whichever fits your workflow.
+
+#### Option 1: `FERRUM_DB_SSL_*` variables (recommended)
+
+These variables give you granular control over SSL mode and are translated into connection string parameters automatically, so you don't need to embed them in `FERRUM_DB_URL`.
 
 **PostgreSQL with server certificate verification:**
 ```bash
@@ -930,6 +960,43 @@ FERRUM_DB_SSL_ROOT_CERT=/certs/ca.pem
 | `verify-full` | Require SSL, verify CA and hostname |
 
 > **Note:** SQLite connections ignore SSL settings (file-based, no network TLS). MySQL mode values are automatically mapped to the MySQL-native format (e.g., `require` → `REQUIRED`, `verify-ca` → `VERIFY_CA`).
+
+#### Option 2: `FERRUM_DB_TLS_*` variables
+
+A simpler toggle-based approach. Set `FERRUM_DB_TLS_ENABLED=true` to enable TLS with `sslmode=require` (PostgreSQL) or `ssl-mode=REQUIRED` (MySQL), then optionally provide certificate paths.
+
+```bash
+FERRUM_DB_TYPE=postgres \
+FERRUM_DB_URL="postgres://user:pass@db.example.com/ferrum" \
+FERRUM_DB_TLS_ENABLED=true \
+FERRUM_DB_TLS_CA_CERT_PATH=/certs/ca.pem \
+FERRUM_DB_TLS_CLIENT_CERT_PATH=/certs/client.pem \
+FERRUM_DB_TLS_CLIENT_KEY_PATH=/certs/client-key.pem
+```
+
+Set `FERRUM_DB_TLS_INSECURE=true` to skip certificate verification (testing only).
+
+> **Note:** If both `FERRUM_DB_SSL_*` and `FERRUM_DB_TLS_*` variables are set, the SSL parameters are appended to the connection URL first, then the TLS layer applies on top. Use one approach or the other to avoid confusion.
+
+### Frontend mTLS (Client Certificate Verification)
+
+Ferrum can require clients to present a valid TLS certificate when connecting to the proxy HTTPS listener. This is configured by providing a CA bundle containing the trusted certificate authorities used to verify client certificates.
+
+```bash
+# Enable frontend mTLS on the proxy listener
+FERRUM_PROXY_TLS_CERT_PATH=/certs/server.pem \
+FERRUM_PROXY_TLS_KEY_PATH=/certs/server-key.pem \
+FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH=/certs/client-ca-bundle.pem
+```
+
+Clients must then present a valid certificate signed by one of the CAs in the bundle:
+
+```bash
+curl --cert /certs/client.pem --key /certs/client-key.pem \
+  https://gateway.example.com:8443/api/v1/resource
+```
+
+The admin API supports the same pattern with `FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH` for mTLS on the admin HTTPS listener.
 
 ### Backend mTLS
 
