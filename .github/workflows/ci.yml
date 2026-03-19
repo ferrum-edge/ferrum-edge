@@ -165,6 +165,8 @@ jobs:
     name: Build and Push Docker Image
     runs-on: ubuntu-latest
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    env:
+      HAS_DOCKER_CREDS: ${{ secrets.DOCKER_USERNAME != '' && secrets.DOCKER_PASSWORD != '' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -172,19 +174,30 @@ jobs:
         uses: docker/setup-buildx-action@v2
 
       - name: Log in to Docker Hub
+        if: env.HAS_DOCKER_CREDS == 'true'
         uses: docker/login-action@v2
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
-        if: ${{ secrets.DOCKER_USERNAME != '' }}
 
-      - name: Build Docker image
+      - name: Build and push Docker image
+        if: env.HAS_DOCKER_CREDS == 'true'
         uses: docker/build-push-action@v4
         with:
           context: .
-          push: ${{ secrets.DOCKER_USERNAME != '' }}
+          push: true
           tags: |
             ${{ secrets.DOCKER_USERNAME }}/ferrum-gateway:latest
             ${{ secrets.DOCKER_USERNAME }}/ferrum-gateway:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build Docker image (no push)
+        if: env.HAS_DOCKER_CREDS != 'true'
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          push: false
+          tags: ferrum-gateway:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
