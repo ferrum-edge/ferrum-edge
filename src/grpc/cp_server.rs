@@ -37,17 +37,14 @@ impl CpGrpcServer {
         )
     }
 
+    #[allow(clippy::result_large_err)]
     fn verify_jwt(&self, req: &Request<()>) -> Result<(), Status> {
         let token = req
             .metadata()
             .get("authorization")
             .and_then(|v| v.to_str().ok())
-            .and_then(|s| {
-                if s.starts_with("Bearer ") {
-                    Some(&s[7..])
-                } else {
-                    Some(s)
-                }
+            .map(|s| {
+                s.strip_prefix("Bearer ").unwrap_or(s)
             })
             .ok_or_else(|| Status::unauthenticated("Missing authorization token"))?;
 
@@ -130,12 +127,8 @@ impl ConfigSync for CpGrpcServer {
             .metadata()
             .get("authorization")
             .and_then(|v| v.to_str().ok())
-            .and_then(|s| {
-                if s.starts_with("Bearer ") {
-                    Some(&s[7..])
-                } else {
-                    Some(s)
-                }
+            .map(|s| {
+                s.strip_prefix("Bearer ").unwrap_or(s)
             })
             .ok_or_else(|| Status::unauthenticated("Missing authorization token"))?;
 

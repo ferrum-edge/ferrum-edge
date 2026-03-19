@@ -37,10 +37,10 @@ fn is_websocket_upgrade(req: &Request<Incoming>) -> bool {
     let sec_key = headers.get("sec-websocket-key").and_then(|v| v.to_str().ok());
     let sec_version = headers.get("sec-websocket-version").and_then(|v| v.to_str().ok());
 
-    connection.map_or(false, |conn| conn.to_lowercase().contains("upgrade"))
-        && upgrade.map_or(false, |up| up.to_lowercase() == "websocket")
+    connection.is_some_and(|conn| conn.to_lowercase().contains("upgrade"))
+        && upgrade.is_some_and(|up| up.to_lowercase() == "websocket")
         && sec_key.is_some()
-        && sec_version.map_or(false, |v| v == "13")
+        && (sec_version == Some("13"))
 }
 
 /// Shared state for the proxy engine.
@@ -856,6 +856,7 @@ async fn handle_proxy_request(
 
 /// Find the matching proxy using longest prefix match.
 /// Iterates proxies directly to avoid per-request allocation.
+#[allow(dead_code)]
 pub fn find_matching_proxy(config: &GatewayConfig, path: &str) -> Option<Proxy> {
     let mut best_match: Option<&Proxy> = None;
     let mut best_len = 0;
@@ -939,13 +940,12 @@ async fn proxy_to_backend(
         Err(e) => {
             error!("Failed to get client from pool: {}", e);
             // Fallback to creating new client
-            let fallback_client = reqwest::Client::builder()
+            reqwest::Client::builder()
                 .connect_timeout(std::time::Duration::from_millis(proxy.backend_connect_timeout_ms))
                 .timeout(std::time::Duration::from_millis(proxy.backend_read_timeout_ms))
                 .danger_accept_invalid_certs(!proxy.backend_tls_verify_server_cert)
                 .build()
-                .unwrap_or_else(|_| reqwest::Client::new());
-            fallback_client
+                .unwrap_or_else(|_| reqwest::Client::new())
         }
     };
 
@@ -990,18 +990,16 @@ async fn proxy_to_backend(
     }
 
     // Enforce request body size limit via Content-Length fast path
-    if state.max_body_size_bytes > 0 {
-        if let Some(content_length) = headers.get("content-length") {
-            if let Ok(len) = content_length.parse::<usize>() {
-                if len > state.max_body_size_bytes {
-                    return (
-                        413,
-                        r#"{"error":"Request body exceeds maximum size"}"#.as_bytes().to_vec(),
-                        HashMap::new(),
-                    );
-                }
-            }
-        }
+    if state.max_body_size_bytes > 0
+        && let Some(content_length) = headers.get("content-length")
+        && let Ok(len) = content_length.parse::<usize>()
+        && len > state.max_body_size_bytes
+    {
+        return (
+            413,
+            r#"{"error":"Request body exceeds maximum size"}"#.as_bytes().to_vec(),
+            HashMap::new(),
+        );
     }
 
     // Collect and forward body with size limit
@@ -1050,16 +1048,16 @@ async fn proxy_to_backend(
                     .and_then(|v| v.to_str().ok())
                     .and_then(|v| v.parse::<usize>().ok());
 
-                if let Some(len) = content_length {
-                    if len > state.max_response_body_size_bytes {
-                        warn!("Backend response body ({} bytes) exceeds limit ({} bytes)",
-                              len, state.max_response_body_size_bytes);
-                        return (
-                            502,
-                            r#"{"error":"Backend response body exceeds maximum size"}"#.as_bytes().to_vec(),
-                            HashMap::new(),
-                        );
-                    }
+                if let Some(len) = content_length
+                    && len > state.max_response_body_size_bytes
+                {
+                    warn!("Backend response body ({} bytes) exceeds limit ({} bytes)",
+                          len, state.max_response_body_size_bytes);
+                    return (
+                        502,
+                        r#"{"error":"Backend response body exceeds maximum size"}"#.as_bytes().to_vec(),
+                        HashMap::new(),
+                    );
                 }
 
                 // Stream-collect with size limit using chunk_with_limit
@@ -1159,16 +1157,15 @@ async fn proxy_to_backend_http3(
     let (_parts, body) = original_req.into_parts();
     let request_body = if state.max_body_size_bytes > 0 {
         // Check Content-Length fast path
-        if let Some(content_length) = headers.get("content-length") {
-            if let Ok(len) = content_length.parse::<usize>() {
-                if len > state.max_body_size_bytes {
-                    return (
-                        413,
-                        r#"{"error":"Request body exceeds maximum size"}"#.as_bytes().to_vec(),
-                        HashMap::new(),
-                    );
-                }
-            }
+        if let Some(content_length) = headers.get("content-length")
+            && let Ok(len) = content_length.parse::<usize>()
+            && len > state.max_body_size_bytes
+        {
+            return (
+                413,
+                r#"{"error":"Request body exceeds maximum size"}"#.as_bytes().to_vec(),
+                HashMap::new(),
+            );
         }
         let limited = http_body_util::Limited::new(body, state.max_body_size_bytes);
         match limited.collect().await {

@@ -127,9 +127,9 @@ impl ConnectionPool {
 
         // Add client certificate for mTLS (proxy-specific overrides take priority)
         let cert_path = proxy.backend_tls_client_cert_path.as_ref()
-            .or_else(|| self.global_mtls_config.backend_tls_client_cert_path.as_ref());
+            .or(self.global_mtls_config.backend_tls_client_cert_path.as_ref());
         let key_path = proxy.backend_tls_client_key_path.as_ref()
-            .or_else(|| self.global_mtls_config.backend_tls_client_key_path.as_ref());
+            .or(self.global_mtls_config.backend_tls_client_key_path.as_ref());
 
         if let (Some(cert_path), Some(key_path)) = (cert_path, key_path) {
             // Load client certificate and key

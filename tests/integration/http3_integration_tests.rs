@@ -25,6 +25,7 @@ fn init_crypto_provider() {
 }
 
 /// Test HTTP/3 server configuration
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 struct Http3TestConfig {
     pub http3_idle_timeout: u64,
@@ -242,7 +243,7 @@ async fn test_http3_configuration_loading() {
     
     // Verify HTTP/3 configuration is loaded correctly
     // HTTP/3 shares proxy_https_port (no separate http3_port)
-    assert_eq!(env_config.enable_http3, true);
+    assert!(env_config.enable_http3);
     assert_eq!(env_config.proxy_https_port, 8443);
     assert_eq!(env_config.http3_idle_timeout, 30);
     assert_eq!(env_config.http3_max_streams, 100);
@@ -320,7 +321,7 @@ async fn test_http3_environment_variables() {
         .unwrap_or(100);
 
     // Verify environment variables are parsed correctly
-    assert_eq!(enable_http3, true);
+    assert!(enable_http3);
     assert_eq!(http3_idle_timeout, 30);
     assert_eq!(http3_max_streams, 100);
 
@@ -360,7 +361,6 @@ async fn test_http3_configuration_validation() {
 
     // HTTP/3 shares proxy_https_port (no separate http3_port)
     assert!(config.proxy_https_port > 0);
-    assert!(config.proxy_https_port <= 65535);
     assert!(config.http3_idle_timeout > 0);
     assert!(config.http3_max_streams > 0);
     assert!(config.enable_http3);

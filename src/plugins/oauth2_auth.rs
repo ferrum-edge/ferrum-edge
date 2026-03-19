@@ -79,14 +79,14 @@ impl Plugin for OAuth2Auth {
                                 let active = body["active"].as_bool().unwrap_or(false);
                                 if active {
                                     // O(1) lookup by subject via ConsumerIndex
-                                    if let Some(sub) = body["sub"].as_str() {
-                                        if let Some(consumer) = consumer_index.find_by_identity(sub) {
-                                            if ctx.identified_consumer.is_none() {
-                                                ctx.identified_consumer =
-                                                    Some((*consumer).clone());
-                                            }
-                                            return PluginResult::Continue;
+                                    if let Some(sub) = body["sub"].as_str()
+                                        && let Some(consumer) = consumer_index.find_by_identity(sub)
+                                    {
+                                        if ctx.identified_consumer.is_none() {
+                                            ctx.identified_consumer =
+                                                Some((*consumer).clone());
                                         }
+                                        return PluginResult::Continue;
                                     }
                                     return PluginResult::Continue;
                                 }
@@ -102,37 +102,37 @@ impl Plugin for OAuth2Auth {
                     body: r#"{"error":"Token introspection failed"}"#.into(),
                 }
             }
-            "jwks" | _ => {
+            _ => {
                 // For JWKS-based validation, try consumer OAuth2 credentials with local secrets
                 debug!("OAuth2 JWKS validation mode, jwks_uri: {:?}", self.jwks_uri());
                 let consumers = consumer_index.consumers();
                 for consumer in consumers.iter() {
-                    if let Some(oauth_creds) = consumer.credentials.get("oauth2") {
-                        if let Some(secret) = oauth_creds.get("secret").and_then(|s| s.as_str()) {
-                            let key = DecodingKey::from_secret(secret.as_bytes());
-                            let mut validation = Validation::new(Algorithm::HS256);
-                            validation.validate_exp = false;
-                            validation.required_spec_claims.clear();
+                    if let Some(oauth_creds) = consumer.credentials.get("oauth2")
+                        && let Some(secret) = oauth_creds.get("secret").and_then(|s| s.as_str())
+                    {
+                        let key = DecodingKey::from_secret(secret.as_bytes());
+                        let mut validation = Validation::new(Algorithm::HS256);
+                        validation.validate_exp = false;
+                        validation.required_spec_claims.clear();
 
-                            if let Some(ref iss) = self.expected_issuer {
-                                validation.set_issuer(&[iss]);
-                            }
-                            if let Some(ref aud) = self.expected_audience {
-                                validation.set_audience(&[aud]);
-                            }
+                        if let Some(ref iss) = self.expected_issuer {
+                            validation.set_issuer(&[iss]);
+                        }
+                        if let Some(ref aud) = self.expected_audience {
+                            validation.set_audience(&[aud]);
+                        }
 
-                            if let Ok(_token_data) =
-                                decode::<Value>(&token, &key, &validation)
-                            {
-                                if ctx.identified_consumer.is_none() {
-                                    debug!(
-                                        "oauth2_auth: identified consumer '{}'",
-                                        consumer.username
-                                    );
-                                    ctx.identified_consumer = Some((**consumer).clone());
-                                }
-                                return PluginResult::Continue;
+                        if let Ok(_token_data) =
+                            decode::<Value>(&token, &key, &validation)
+                        {
+                            if ctx.identified_consumer.is_none() {
+                                debug!(
+                                    "oauth2_auth: identified consumer '{}'",
+                                    consumer.username
+                                );
+                                ctx.identified_consumer = Some((**consumer).clone());
                             }
+                            return PluginResult::Continue;
                         }
                     }
                 }

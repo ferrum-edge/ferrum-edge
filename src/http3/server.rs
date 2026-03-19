@@ -288,20 +288,18 @@ async fn handle_h3_request(
     }
 
     // Enforce request body size limit via Content-Length fast path
-    if state.max_body_size_bytes > 0 {
-        if let Some(content_length) = ctx.headers.get("content-length") {
-            if let Ok(len) = content_length.parse::<usize>() {
-                if len > state.max_body_size_bytes {
-                    record_request(&state, 413);
-                    send_h3_response(
-                        &mut stream,
-                        StatusCode::PAYLOAD_TOO_LARGE,
-                        r#"{"error":"Request body exceeds maximum size"}"#,
-                    ).await?;
-                    return Ok(());
-                }
-            }
-        }
+    if state.max_body_size_bytes > 0
+        && let Some(content_length) = ctx.headers.get("content-length")
+        && let Ok(len) = content_length.parse::<usize>()
+        && len > state.max_body_size_bytes
+    {
+        record_request(&state, 413);
+        send_h3_response(
+            &mut stream,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            r#"{"error":"Request body exceeds maximum size"}"#,
+        ).await?;
+        return Ok(());
     }
 
     // Collect request body from the H3 stream with size limit
@@ -411,7 +409,7 @@ async fn proxy_to_backend_h3(
         Ok(client) => client,
         Err(e) => {
             error!("Failed to get client from pool: {}", e);
-            let fallback_client = reqwest::Client::builder()
+            reqwest::Client::builder()
                 .connect_timeout(std::time::Duration::from_millis(
                     proxy.backend_connect_timeout_ms,
                 ))
@@ -420,8 +418,7 @@ async fn proxy_to_backend_h3(
                 ))
                 .danger_accept_invalid_certs(!proxy.backend_tls_verify_server_cert)
                 .build()
-                .unwrap_or_else(|_| reqwest::Client::new());
-            fallback_client
+                .unwrap_or_else(|_| reqwest::Client::new())
         }
     };
 
@@ -488,16 +485,16 @@ async fn proxy_to_backend_h3(
                     .and_then(|v| v.to_str().ok())
                     .and_then(|v| v.parse::<usize>().ok());
 
-                if let Some(len) = content_length {
-                    if len > state.max_response_body_size_bytes {
-                        warn!("Backend response body ({} bytes) exceeds limit ({} bytes)",
-                              len, state.max_response_body_size_bytes);
-                        return (
-                            502,
-                            r#"{"error":"Backend response body exceeds maximum size"}"#.as_bytes().to_vec(),
-                            std::collections::HashMap::new(),
-                        );
-                    }
+                if let Some(len) = content_length
+                    && len > state.max_response_body_size_bytes
+                {
+                    warn!("Backend response body ({} bytes) exceeds limit ({} bytes)",
+                          len, state.max_response_body_size_bytes);
+                    return (
+                        502,
+                        r#"{"error":"Backend response body exceeds maximum size"}"#.as_bytes().to_vec(),
+                        std::collections::HashMap::new(),
+                    );
                 }
 
                 // Stream-collect with size limit

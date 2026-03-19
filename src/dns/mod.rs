@@ -264,10 +264,10 @@ impl DnsCache {
         for order in &self.dns_order {
             match order {
                 DnsRecordOrder::Cache => {
-                    if let Some(rt) = cached_record_type {
-                        if !query_types.contains(&rt) {
-                            query_types.push(rt);
-                        }
+                    if let Some(rt) = cached_record_type
+                        && !query_types.contains(&rt)
+                    {
+                        query_types.push(rt);
                     }
                 }
                 DnsRecordOrder::A => {

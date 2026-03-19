@@ -16,6 +16,7 @@ pub struct DatabaseStore {
 
 impl DatabaseStore {
     /// Connect to the database and run migrations.
+    #[allow(dead_code)]
     pub async fn connect(db_type: &str, db_url: &str) -> Result<Self, anyhow::Error> {
         Self::connect_with_tls_config(
             db_type,

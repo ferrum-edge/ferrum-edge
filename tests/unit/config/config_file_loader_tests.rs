@@ -152,8 +152,8 @@ plugin_configs:
     assert_eq!(config.proxies[0].name, Some("HTTPBin Proxy".to_string()));
     assert_eq!(config.proxies[0].backend_protocol, BackendProtocol::Https);
     assert_eq!(config.proxies[0].backend_port, 443);
-    assert_eq!(config.proxies[0].strip_listen_path, true);
-    assert_eq!(config.proxies[0].preserve_host_header, false);
+    assert!(config.proxies[0].strip_listen_path);
+    assert!(!config.proxies[0].preserve_host_header);
     assert_eq!(config.proxies[0].backend_connect_timeout_ms, 5000);
     assert_eq!(config.proxies[0].auth_mode, AuthMode::Single);
     assert_eq!(config.proxies[0].pool_max_idle_per_host, Some(25));
@@ -179,7 +179,7 @@ plugin_configs:
     assert_eq!(config.plugin_configs[0].id, "plugin-stdout");
     assert_eq!(config.plugin_configs[0].plugin_name, "stdout_logging");
     assert_eq!(config.plugin_configs[0].scope, PluginScope::Global);
-    assert_eq!(config.plugin_configs[0].enabled, true);
+    assert!(config.plugin_configs[0].enabled);
     assert_eq!(config.plugin_configs[1].scope, PluginScope::Proxy);
     assert_eq!(config.plugin_configs[1].proxy_id, Some("proxy-protected".to_string()));
 }
@@ -505,7 +505,7 @@ plugin_configs: []
     assert_eq!(proxy.backend_path, Some("/v1/gateway".to_string()));
     assert_eq!(proxy.backend_tls_client_cert_path, Some("/etc/certs/client.pem".to_string()));
     assert_eq!(proxy.backend_tls_client_key_path, Some("/etc/certs/client-key.pem".to_string()));
-    assert_eq!(proxy.backend_tls_verify_server_cert, false);
+    assert!(!proxy.backend_tls_verify_server_cert);
     assert_eq!(proxy.backend_tls_server_ca_cert_path, Some("/etc/certs/ca.pem".to_string()));
     assert_eq!(proxy.dns_override, Some("192.168.1.1".to_string()));
     assert_eq!(proxy.dns_cache_ttl_seconds, Some(300));

@@ -127,7 +127,7 @@ impl Http3Client {
         // Collect response body
         let mut response_body = Vec::new();
         while let Some(chunk) = stream.recv_data().await? {
-            response_body.extend_from_slice(&chunk.chunk());
+            response_body.extend_from_slice(chunk.chunk());
         }
 
         Ok((status, response_body, response_headers))

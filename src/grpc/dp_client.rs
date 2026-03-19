@@ -45,6 +45,7 @@ pub async fn connect_and_subscribe(
 
     let token: MetadataValue<_> = format!("Bearer {}", auth_token).parse()?;
 
+    #[allow(clippy::result_large_err)]
     let mut client = ConfigSyncClient::with_interceptor(channel, move |mut req: tonic::Request<()>| {
         req.metadata_mut()
             .insert("authorization", token.clone());

@@ -136,37 +136,37 @@ fn ip_matches(client_ip: &str, rule: &str) -> bool {
     }
 
     // CIDR notation matching
-    if rule.contains('/') {
-        if let Some((network_str, prefix_str)) = rule.split_once('/') {
-            let prefix_len: u8 = match prefix_str.parse() {
-                Ok(p) => p,
-                Err(_) => return false,
-            };
+    if rule.contains('/')
+        && let Some((network_str, prefix_str)) = rule.split_once('/')
+    {
+        let prefix_len: u8 = match prefix_str.parse() {
+            Ok(p) => p,
+            Err(_) => return false,
+        };
 
-            // Parse both IPs as IPv4
-            let client_octets = match parse_ipv4(client_ip) {
-                Some(o) => o,
-                None => return false,
-            };
-            let network_octets = match parse_ipv4(network_str) {
-                Some(o) => o,
-                None => return false,
-            };
+        // Parse both IPs as IPv4
+        let client_octets = match parse_ipv4(client_ip) {
+            Some(o) => o,
+            None => return false,
+        };
+        let network_octets = match parse_ipv4(network_str) {
+            Some(o) => o,
+            None => return false,
+        };
 
-            if prefix_len > 32 {
-                return false;
-            }
-
-            let client_bits = u32::from_be_bytes(client_octets);
-            let network_bits = u32::from_be_bytes(network_octets);
-            let mask = if prefix_len == 0 {
-                0u32
-            } else {
-                !0u32 << (32 - prefix_len)
-            };
-
-            return (client_bits & mask) == (network_bits & mask);
+        if prefix_len > 32 {
+            return false;
         }
+
+        let client_bits = u32::from_be_bytes(client_octets);
+        let network_bits = u32::from_be_bytes(network_octets);
+        let mask = if prefix_len == 0 {
+            0u32
+        } else {
+            !0u32 << (32 - prefix_len)
+        };
+
+        return (client_bits & mask) == (network_bits & mask);
     }
 
     false

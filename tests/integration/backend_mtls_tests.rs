@@ -157,7 +157,6 @@ async fn test_backend_mtls_global_config() {
         Ok(_client) => {
             // Client was created successfully with mTLS configuration
             println!("✅ Client created with global mTLS configuration");
-            assert!(true);
         }
         Err(e) => {
             // Check if the error is related to certificate parsing or TLS setup (expected with test cert)
@@ -166,7 +165,6 @@ async fn test_backend_mtls_global_config() {
                error_msg.contains("identity") || error_msg.contains("builder") ||
                error_msg.contains("invalid") || error_msg.contains("parse") {
                 println!("✅ mTLS configuration loaded (certificate parsing error expected with test cert): {}", e);
-                assert!(true); // This is expected with our test certificate
             } else {
                 panic!("Unexpected error creating client with mTLS: {}", e);
             }
@@ -201,7 +199,6 @@ async fn test_backend_mtls_proxy_specific_override() {
     match result {
         Ok(_client) => {
             println!("✅ Client created with proxy-specific mTLS override");
-            assert!(true);
         }
         Err(e) => {
             let error_msg = e.to_string().to_lowercase();
@@ -209,7 +206,6 @@ async fn test_backend_mtls_proxy_specific_override() {
                error_msg.contains("identity") || error_msg.contains("builder") ||
                error_msg.contains("invalid") || error_msg.contains("parse") {
                 println!("✅ Proxy-specific mTLS configuration loaded (certificate parsing error expected): {}", e);
-                assert!(true);
             } else {
                 panic!("Unexpected error creating client with proxy-specific mTLS: {}", e);
             }
@@ -235,7 +231,6 @@ async fn test_backend_mtls_no_certificates() {
     match result {
         Ok(_client) => {
             println!("✅ Client created without mTLS configuration");
-            assert!(true);
         }
         Err(e) => {
             panic!("Unexpected error creating client without mTLS: {}", e);
@@ -267,7 +262,6 @@ async fn test_backend_mtls_partial_config() {
     match result {
         Ok(_client) => {
             println!("✅ Client created without mTLS (partial config ignored)");
-            assert!(true);
         }
         Err(e) => {
             panic!("Unexpected error creating client with partial mTLS config: {}", e);
@@ -303,7 +297,6 @@ async fn test_backend_ca_bundle_global_config() {
     match result {
         Ok(_client) => {
             println!("✅ Client created with global CA bundle configuration");
-            assert!(true);
         }
         Err(e) => {
             // Check if the error is related to certificate parsing or TLS setup (expected with test CA)
@@ -313,7 +306,6 @@ async fn test_backend_ca_bundle_global_config() {
                error_msg.contains("invalid") || error_msg.contains("parse") ||
                error_msg.contains("ca") || error_msg.contains("bundle") {
                 println!("✅ CA bundle configuration loaded (certificate parsing error expected with test CA): {}", e);
-                assert!(true); // This is expected with our test CA
             } else {
                 panic!("Unexpected error creating client with CA bundle: {}", e);
             }

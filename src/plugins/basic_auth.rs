@@ -76,18 +76,17 @@ impl Plugin for BasicAuth {
         let password = parts[1];
 
         // O(1) lookup by username via ConsumerIndex
-        if let Some(consumer) = consumer_index.find_by_username(username) {
-            if let Some(basic_creds) = consumer.credentials.get("basicauth") {
-                if let Some(hashed) = basic_creds.get("password_hash").and_then(|s| s.as_str()) {
-                    // Verify bcrypt hash
-                    if bcrypt::verify(password, hashed).unwrap_or(false) {
-                        if ctx.identified_consumer.is_none() {
-                            debug!("basic_auth: identified consumer '{}'", consumer.username);
-                            ctx.identified_consumer = Some((*consumer).clone());
-                        }
-                        return PluginResult::Continue;
-                    }
+        if let Some(consumer) = consumer_index.find_by_username(username)
+            && let Some(basic_creds) = consumer.credentials.get("basicauth")
+            && let Some(hashed) = basic_creds.get("password_hash").and_then(|s| s.as_str())
+        {
+            // Verify bcrypt hash
+            if bcrypt::verify(password, hashed).unwrap_or(false) {
+                if ctx.identified_consumer.is_none() {
+                    debug!("basic_auth: identified consumer '{}'", consumer.username);
+                    ctx.identified_consumer = Some((*consumer).clone());
                 }
+                return PluginResult::Continue;
             }
         }
 

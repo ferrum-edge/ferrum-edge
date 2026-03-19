@@ -60,6 +60,7 @@ impl PluginCache {
         self.proxy_plugins.load().len()
     }
 
+    #[allow(clippy::type_complexity)]
     fn build_cache(
         config: &GatewayConfig,
     ) -> (HashMap<String, Vec<Arc<dyn Plugin>>>, Vec<Arc<dyn Plugin>>) {
@@ -69,10 +70,10 @@ impl PluginCache {
             if !pc.enabled {
                 continue;
             }
-            if pc.scope == PluginScope::Global {
-                if let Some(plugin) = create_plugin(&pc.plugin_name, &pc.config) {
-                    global_plugins.push(plugin);
-                }
+            if pc.scope == PluginScope::Global
+                && let Some(plugin) = create_plugin(&pc.plugin_name, &pc.config)
+            {
+                global_plugins.push(plugin);
             }
         }
 
@@ -98,12 +99,11 @@ impl PluginCache {
                 if pc.scope == PluginScope::Proxy
                     && pc.proxy_id.as_deref() == Some(&proxy.id)
                     && proxy_plugin_ids.contains(&pc.id.as_str())
+                    && let Some(plugin) = create_plugin(&pc.plugin_name, &pc.config)
                 {
-                    if let Some(plugin) = create_plugin(&pc.plugin_name, &pc.config) {
-                        // Remove any global plugin of the same name
-                        merged.retain(|p| p.name() != plugin.name());
-                        merged.push(plugin);
-                    }
+                    // Remove any global plugin of the same name
+                    merged.retain(|p| p.name() != plugin.name());
+                    merged.push(plugin);
                 }
             }
 

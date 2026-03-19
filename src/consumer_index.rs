@@ -80,10 +80,10 @@ impl ConsumerIndex {
             all.push(Arc::clone(&arc_consumer));
 
             // Index by API key (keyauth credential)
-            if let Some(key_creds) = consumer.credentials.get("keyauth") {
-                if let Some(key) = key_creds.get("key").and_then(|s| s.as_str()) {
-                    index.insert(format!("keyauth:{}", key), Arc::clone(&arc_consumer));
-                }
+            if let Some(key_creds) = consumer.credentials.get("keyauth")
+                && let Some(key) = key_creds.get("key").and_then(|s| s.as_str())
+            {
+                index.insert(format!("keyauth:{}", key), Arc::clone(&arc_consumer));
             }
 
             // Index by username (for basic_auth)

@@ -31,11 +31,11 @@ impl JwtAuth {
             let header_name = &self.token_lookup["header:".len()..];
             ctx.headers
                 .get(&header_name.to_lowercase())
-                .and_then(|v| {
+                .map(|v| {
                     if v.starts_with("Bearer ") || v.starts_with("bearer ") {
-                        Some(v[7..].to_string())
+                        v[7..].to_string()
                     } else {
-                        Some(v.clone())
+                        v.clone()
                     }
                 })
         } else if self.token_lookup.starts_with("query:") {
@@ -80,28 +80,28 @@ impl Plugin for JwtAuth {
         // Must try each consumer's JWT secret to verify (inherently O(n) for decoding)
         let consumers = consumer_index.consumers();
         for consumer in consumers.iter() {
-            if let Some(jwt_creds) = consumer.credentials.get("jwt") {
-                if let Some(secret) = jwt_creds.get("secret").and_then(|s| s.as_str()) {
-                    let key = DecodingKey::from_secret(secret.as_bytes());
-                    let mut validation = Validation::new(Algorithm::HS256);
-                    validation.validate_exp = false;
-                    validation.required_spec_claims.clear();
+            if let Some(jwt_creds) = consumer.credentials.get("jwt")
+                && let Some(secret) = jwt_creds.get("secret").and_then(|s| s.as_str())
+            {
+                let key = DecodingKey::from_secret(secret.as_bytes());
+                let mut validation = Validation::new(Algorithm::HS256);
+                validation.validate_exp = false;
+                validation.required_spec_claims.clear();
 
-                    if let Ok(token_data) =
-                        decode::<serde_json::Value>(&token, &key, &validation)
-                    {
-                        // Check if the claim field matches consumer
-                        if let Some(claim_val) = token_data.claims.get(&self.consumer_claim_field) {
-                            let claim_str = claim_val.as_str().unwrap_or("");
-                            if claim_str == consumer.username
-                                || claim_str == consumer.id
-                            {
-                                if ctx.identified_consumer.is_none() {
-                                    debug!("jwt_auth: identified consumer '{}'", consumer.username);
-                                    ctx.identified_consumer = Some((**consumer).clone());
-                                }
-                                return PluginResult::Continue;
+                if let Ok(token_data) =
+                    decode::<serde_json::Value>(&token, &key, &validation)
+                {
+                    // Check if the claim field matches consumer
+                    if let Some(claim_val) = token_data.claims.get(&self.consumer_claim_field) {
+                        let claim_str = claim_val.as_str().unwrap_or("");
+                        if claim_str == consumer.username
+                            || claim_str == consumer.id
+                        {
+                            if ctx.identified_consumer.is_none() {
+                                debug!("jwt_auth: identified consumer '{}'", consumer.username);
+                                ctx.identified_consumer = Some((**consumer).clone());
                             }
+                            return PluginResult::Continue;
                         }
                     }
                 }

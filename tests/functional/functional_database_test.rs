@@ -180,45 +180,40 @@ async fn start_echo_backend(port: u16) -> Result<tokio::task::JoinHandle<()>, Bo
     let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port)).await?;
 
     let handle = tokio::spawn(async move {
-        loop {
-            match listener.accept().await {
-                Ok((socket, _)) => {
-                    tokio::spawn(async move {
-                        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
-                        let (reader, mut writer) = socket.into_split();
-                        let mut buf_reader = tokio::io::BufReader::new(reader);
-                        let mut line = String::new();
+        while let Ok((socket, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+                let (reader, mut writer) = socket.into_split();
+                let mut buf_reader = tokio::io::BufReader::new(reader);
+                let mut line = String::new();
 
-                        // Read request line
-                        if buf_reader.read_line(&mut line).await.is_err() {
-                            return;
-                        }
-
-                        // Read headers until blank line
-                        let mut headers = String::new();
-                        loop {
-                            line.clear();
-                            if buf_reader.read_line(&mut line).await.is_err() {
-                                return;
-                            }
-                            if line == "\r\n" || line == "\n" {
-                                break;
-                            }
-                            headers.push_str(&line);
-                        }
-
-                        // Send simple 200 OK response
-                        let body = r#"{"status":"ok","echo":true}"#;
-                        let response = format!(
-                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                            body.len(),
-                            body
-                        );
-                        let _ = writer.write_all(response.as_bytes()).await;
-                    });
+                // Read request line
+                if buf_reader.read_line(&mut line).await.is_err() {
+                    return;
                 }
-                Err(_) => break,
-            }
+
+                // Read headers until blank line
+                let mut headers = String::new();
+                loop {
+                    line.clear();
+                    if buf_reader.read_line(&mut line).await.is_err() {
+                        return;
+                    }
+                    if line == "\r\n" || line == "\n" {
+                        break;
+                    }
+                    headers.push_str(&line);
+                }
+
+                // Send simple 200 OK response
+                let body = r#"{"status":"ok","echo":true}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = writer.write_all(response.as_bytes()).await;
+            });
         }
     });
 

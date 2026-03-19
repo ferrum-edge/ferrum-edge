@@ -39,16 +39,16 @@ impl PoolConfig {
         let mut config = Self::default();
         
         // Read from environment variables
-        if let Ok(val) = env::var("FERRUM_POOL_MAX_IDLE_PER_HOST") {
-            if let Ok(parsed) = val.parse::<usize>() {
-                config.max_idle_per_host = parsed;
-            }
+        if let Ok(val) = env::var("FERRUM_POOL_MAX_IDLE_PER_HOST")
+            && let Ok(parsed) = val.parse::<usize>()
+        {
+            config.max_idle_per_host = parsed;
         }
         
-        if let Ok(val) = env::var("FERRUM_POOL_IDLE_TIMEOUT_SECONDS") {
-            if let Ok(parsed) = val.parse::<u64>() {
-                config.idle_timeout_seconds = parsed;
-            }
+        if let Ok(val) = env::var("FERRUM_POOL_IDLE_TIMEOUT_SECONDS")
+            && let Ok(parsed) = val.parse::<u64>()
+        {
+            config.idle_timeout_seconds = parsed;
         }
         
         if let Ok(val) = env::var("FERRUM_POOL_ENABLE_HTTP_KEEP_ALIVE") {
@@ -59,22 +59,22 @@ impl PoolConfig {
             config.enable_http2 = val.parse::<bool>().unwrap_or(true);
         }
         
-        if let Ok(val) = env::var("FERRUM_POOL_TCP_KEEPALIVE_SECONDS") {
-            if let Ok(parsed) = val.parse::<u64>() {
-                config.tcp_keepalive_seconds = parsed;
-            }
+        if let Ok(val) = env::var("FERRUM_POOL_TCP_KEEPALIVE_SECONDS")
+            && let Ok(parsed) = val.parse::<u64>()
+        {
+            config.tcp_keepalive_seconds = parsed;
         }
         
-        if let Ok(val) = env::var("FERRUM_POOL_HTTP2_KEEP_ALIVE_INTERVAL_SECONDS") {
-            if let Ok(parsed) = val.parse::<u64>() {
-                config.http2_keep_alive_interval_seconds = parsed;
-            }
+        if let Ok(val) = env::var("FERRUM_POOL_HTTP2_KEEP_ALIVE_INTERVAL_SECONDS")
+            && let Ok(parsed) = val.parse::<u64>()
+        {
+            config.http2_keep_alive_interval_seconds = parsed;
         }
         
-        if let Ok(val) = env::var("FERRUM_POOL_HTTP2_KEEP_ALIVE_TIMEOUT_SECONDS") {
-            if let Ok(parsed) = val.parse::<u64>() {
-                config.http2_keep_alive_timeout_seconds = parsed;
-            }
+        if let Ok(val) = env::var("FERRUM_POOL_HTTP2_KEEP_ALIVE_TIMEOUT_SECONDS")
+            && let Ok(parsed) = val.parse::<u64>()
+        {
+            config.http2_keep_alive_timeout_seconds = parsed;
         }
         
         // Validate HTTP/2 timeout is reasonable compared to HTTP read timeout

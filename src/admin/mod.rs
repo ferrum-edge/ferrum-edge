@@ -732,14 +732,14 @@ async fn handle_update_credentials(
         Ok(Some(mut consumer)) => {
             let mut hashed_cred = cred_value.clone();
             // Hash password if basicauth
-            if cred_type == "basicauth" {
-                if let Some(pass) = hashed_cred.get("password").and_then(|p| p.as_str()) {
-                    let hash = bcrypt::hash(pass, bcrypt::DEFAULT_COST).unwrap_or_default();
-                    hashed_cred["password_hash"] = json!(hash);
-                    // Remove plaintext
-                    if let Some(obj) = hashed_cred.as_object_mut() {
-                        obj.remove("password");
-                    }
+            if cred_type == "basicauth"
+                && let Some(pass) = hashed_cred.get("password").and_then(|p| p.as_str())
+            {
+                let hash = bcrypt::hash(pass, bcrypt::DEFAULT_COST).unwrap_or_default();
+                hashed_cred["password_hash"] = json!(hash);
+                // Remove plaintext
+                if let Some(obj) = hashed_cred.as_object_mut() {
+                    obj.remove("password");
                 }
             }
             consumer.credentials.insert(cred_type.to_string(), hashed_cred);
@@ -1048,13 +1048,13 @@ fn json_response(status: StatusCode, body: &Value) -> Response<Full<Bytes>> {
 
 fn hash_consumer_secrets(consumer: &mut Consumer) {
     // Hash basicauth passwords
-    if let Some(basic) = consumer.credentials.get_mut("basicauth") {
-        if let Some(pass) = basic.get("password").and_then(|p| p.as_str()) {
-            let hash = bcrypt::hash(pass, bcrypt::DEFAULT_COST).unwrap_or_default();
-            basic["password_hash"] = json!(hash);
-            if let Some(obj) = basic.as_object_mut() {
-                obj.remove("password");
-            }
+    if let Some(basic) = consumer.credentials.get_mut("basicauth")
+        && let Some(pass) = basic.get("password").and_then(|p| p.as_str())
+    {
+        let hash = bcrypt::hash(pass, bcrypt::DEFAULT_COST).unwrap_or_default();
+        basic["password_hash"] = json!(hash);
+        if let Some(obj) = basic.as_object_mut() {
+            obj.remove("password");
         }
     }
 }
