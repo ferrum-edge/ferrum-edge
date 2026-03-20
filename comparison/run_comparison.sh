@@ -37,6 +37,7 @@ NC='\033[0m'
 
 # Configuration
 BACKEND_PORT=3001
+BACKEND_HTTPS_PORT=3443
 GATEWAY_HTTP_PORT=8000
 GATEWAY_HTTPS_PORT=8443
 WRK_DURATION=${WRK_DURATION:-30s}
@@ -156,10 +157,13 @@ cleanup() {
     # Clean up Docker network and temporary config files
     docker network rm "$TYK_NETWORK" 2>/dev/null || true
     rm -f "$COMP_DIR/configs/.kong_runtime.yaml" 2>/dev/null || true
+    rm -f "$COMP_DIR/configs/.kong_runtime_e2e_tls.yaml" 2>/dev/null || true
     rm -rf "$COMP_DIR/configs/.tyk_runtime_apps" 2>/dev/null || true
+    rm -rf "$COMP_DIR/configs/.tyk_runtime_apps_e2e_tls" 2>/dev/null || true
     rm -rf "$COMP_DIR/configs/.tyk_runtime" 2>/dev/null || true
 
     kill_port "$BACKEND_PORT"
+    kill_port "$BACKEND_HTTPS_PORT"
     kill_port "$GATEWAY_HTTP_PORT"
     kill_port "$GATEWAY_HTTPS_PORT"
 }
@@ -270,11 +274,15 @@ build_project() {
 # ===========================================================================
 
 start_backend() {
-    log_info "Starting backend server on port $BACKEND_PORT..."
+    log_info "Starting backend server on ports $BACKEND_PORT (HTTP) and $BACKEND_HTTPS_PORT (HTTPS)..."
     kill_port "$BACKEND_PORT"
+    kill_port "$BACKEND_HTTPS_PORT"
+    BACKEND_TLS_CERT="$CERTS_DIR/server.crt" \
+    BACKEND_TLS_KEY="$CERTS_DIR/server.key" \
     "$PERF_DIR/target/release/backend_server" > "$RESULTS_DIR/backend.log" 2>&1 &
     BACKEND_PID=$!
-    wait_for_http "http://127.0.0.1:$BACKEND_PORT/health" "Backend server"
+    wait_for_http "http://127.0.0.1:$BACKEND_PORT/health" "Backend server (HTTP)"
+    wait_for_http "https://127.0.0.1:$BACKEND_HTTPS_PORT/health" "Backend server (HTTPS)" 10
 }
 
 # ===========================================================================
@@ -293,7 +301,7 @@ run_wrk() {
     local result_file="${RESULTS_DIR}/${gateway}_${protocol}_${safe_endpoint}_results.txt"
 
     local url
-    if [[ "$protocol" == "https" ]]; then
+    if [[ "$protocol" == "https" || "$protocol" == "e2e_tls" ]]; then
         url="https://127.0.0.1:${port}${endpoint}"
     else
         url="http://127.0.0.1:${port}${endpoint}"
@@ -369,6 +377,27 @@ stop_ferrum() {
     sleep 1
 }
 
+start_ferrum_e2e_tls() {
+    log_info "Starting Ferrum Gateway (E2E TLS) on port $GATEWAY_HTTPS_PORT..."
+    kill_port "$GATEWAY_HTTP_PORT"
+    kill_port "$GATEWAY_HTTPS_PORT"
+    cd "$PROJECT_ROOT"
+    FERRUM_MODE=file \
+    FERRUM_FILE_CONFIG_PATH="$COMP_DIR/configs/ferrum_comparison_e2e_tls.yaml" \
+    FERRUM_PROXY_HTTP_PORT="$GATEWAY_HTTP_PORT" \
+    FERRUM_PROXY_HTTPS_PORT="$GATEWAY_HTTPS_PORT" \
+    FERRUM_PROXY_TLS_CERT_PATH="$CERTS_DIR/server.crt" \
+    FERRUM_PROXY_TLS_KEY_PATH="$CERTS_DIR/server.key" \
+    FERRUM_POOL_MAX_IDLE_PER_HOST=200 \
+    FERRUM_POOL_IDLE_TIMEOUT_SECONDS=120 \
+    FERRUM_POOL_ENABLE_HTTP_KEEP_ALIVE=true \
+    FERRUM_POOL_ENABLE_HTTP2=false \
+    FERRUM_LOG_LEVEL=warn \
+    ./target/release/ferrum-gateway > "$RESULTS_DIR/ferrum_e2e_tls.log" 2>&1 &
+    FERRUM_PID=$!
+    wait_for_http "https://127.0.0.1:$GATEWAY_HTTPS_PORT/health" "Ferrum (E2E TLS)" 15
+}
+
 test_ferrum() {
     log_header "Testing Ferrum Gateway"
 
@@ -378,10 +407,16 @@ test_ferrum() {
     run_wrk "ferrum" "http" "/api/users" "$GATEWAY_HTTP_PORT"
     stop_ferrum
 
-    # HTTPS tests
+    # HTTPS tests (TLS termination — plaintext backend)
     start_ferrum_https
     run_wrk "ferrum" "https" "/health" "$GATEWAY_HTTPS_PORT"
     run_wrk "ferrum" "https" "/api/users" "$GATEWAY_HTTPS_PORT"
+    stop_ferrum
+
+    # E2E TLS tests (TLS on both sides)
+    start_ferrum_e2e_tls
+    run_wrk "ferrum" "e2e_tls" "/health" "$GATEWAY_HTTPS_PORT"
+    run_wrk "ferrum" "e2e_tls" "/api/users" "$GATEWAY_HTTPS_PORT"
     stop_ferrum
 }
 
@@ -392,13 +427,16 @@ test_ferrum() {
 prepare_kong_config() {
     # For Docker: replace BACKEND_HOST placeholder
     # For native: always use 127.0.0.1 (backend is on localhost)
+    local host
     if [[ "$KONG_NATIVE" == "true" ]]; then
-        sed "s/BACKEND_HOST/127.0.0.1/g" \
-            "$COMP_DIR/configs/kong.yaml" > "$COMP_DIR/configs/.kong_runtime.yaml"
+        host="127.0.0.1"
     else
-        sed "s/BACKEND_HOST/$BACKEND_HOST/g" \
-            "$COMP_DIR/configs/kong.yaml" > "$COMP_DIR/configs/.kong_runtime.yaml"
+        host="$BACKEND_HOST"
     fi
+    sed "s/BACKEND_HOST/$host/g" \
+        "$COMP_DIR/configs/kong.yaml" > "$COMP_DIR/configs/.kong_runtime.yaml"
+    sed "s/BACKEND_HOST/$host/g" \
+        "$COMP_DIR/configs/kong_e2e_tls.yaml" > "$COMP_DIR/configs/.kong_runtime_e2e_tls.yaml"
 }
 
 # --- Kong Native ---
@@ -440,6 +478,27 @@ start_kong_native_https() {
 
     KONG_PID="native"
     wait_for_http "https://127.0.0.1:$GATEWAY_HTTPS_PORT/health" "Kong native (HTTPS)" 20
+}
+
+start_kong_native_e2e_tls() {
+    log_info "Starting Kong Gateway native (E2E TLS) on port $GATEWAY_HTTPS_PORT..."
+    kill_port "$GATEWAY_HTTP_PORT"
+    kill_port "$GATEWAY_HTTPS_PORT"
+
+    KONG_DATABASE=off \
+    KONG_DECLARATIVE_CONFIG="$COMP_DIR/configs/.kong_runtime_e2e_tls.yaml" \
+    KONG_PROXY_LISTEN="0.0.0.0:$GATEWAY_HTTP_PORT, 0.0.0.0:$GATEWAY_HTTPS_PORT ssl" \
+    KONG_SSL_CERT="$CERTS_DIR/server.crt" \
+    KONG_SSL_CERT_KEY="$CERTS_DIR/server.key" \
+    KONG_ADMIN_LISTEN="off" \
+    KONG_PROXY_ACCESS_LOG=/dev/null \
+    KONG_PROXY_ERROR_LOG=/dev/stderr \
+    KONG_LOG_LEVEL=warn \
+    KONG_PREFIX="/tmp/kong-bench" \
+    kong start > "$RESULTS_DIR/kong_e2e_tls.log" 2>&1
+
+    KONG_PID="native"
+    wait_for_http "https://127.0.0.1:$GATEWAY_HTTPS_PORT/health" "Kong native (E2E TLS)" 20
 }
 
 stop_kong_native() {
@@ -511,6 +570,38 @@ start_kong_docker_https() {
     wait_for_http "https://127.0.0.1:$GATEWAY_HTTPS_PORT/health" "Kong Docker (HTTPS)" 20
 }
 
+start_kong_docker_e2e_tls() {
+    log_info "Starting Kong Gateway Docker (E2E TLS) on port $GATEWAY_HTTPS_PORT..."
+    docker rm -f "$KONG_CONTAINER" 2>/dev/null || true
+    kill_port "$GATEWAY_HTTP_PORT"
+    kill_port "$GATEWAY_HTTPS_PORT"
+
+    local network_args=()
+    if [[ "$DOCKER_USE_HOST_NETWORK" == "true" ]]; then
+        network_args+=(--network host)
+    else
+        network_args+=(-p "$GATEWAY_HTTP_PORT:$GATEWAY_HTTP_PORT" -p "$GATEWAY_HTTPS_PORT:$GATEWAY_HTTPS_PORT")
+    fi
+
+    docker run -d --name "$KONG_CONTAINER" \
+        "${network_args[@]}" \
+        -v "$COMP_DIR/configs/.kong_runtime_e2e_tls.yaml:/etc/kong/kong.yml:ro" \
+        -v "$CERTS_DIR/server.crt:/etc/kong/ssl/server.crt:ro" \
+        -v "$CERTS_DIR/server.key:/etc/kong/ssl/server.key:ro" \
+        -e KONG_DATABASE=off \
+        -e KONG_DECLARATIVE_CONFIG=/etc/kong/kong.yml \
+        -e KONG_PROXY_LISTEN="0.0.0.0:$GATEWAY_HTTP_PORT, 0.0.0.0:$GATEWAY_HTTPS_PORT ssl" \
+        -e KONG_SSL_CERT=/etc/kong/ssl/server.crt \
+        -e KONG_SSL_CERT_KEY=/etc/kong/ssl/server.key \
+        -e KONG_ADMIN_LISTEN="off" \
+        -e KONG_PROXY_ACCESS_LOG=/dev/null \
+        -e KONG_PROXY_ERROR_LOG=/dev/stderr \
+        -e KONG_LOG_LEVEL=warn \
+        "kong/kong-gateway:${KONG_VERSION}" > /dev/null
+
+    wait_for_http "https://127.0.0.1:$GATEWAY_HTTPS_PORT/health" "Kong Docker (E2E TLS)" 20
+}
+
 stop_kong_docker() {
     docker rm -f "$KONG_CONTAINER" 2>/dev/null || true
     kill_port "$GATEWAY_HTTP_PORT"
@@ -544,10 +635,16 @@ test_kong() {
         run_wrk "kong" "http" "/api/users" "$GATEWAY_HTTP_PORT"
         stop_kong_native
 
-        # HTTPS tests
+        # HTTPS tests (TLS termination — plaintext backend)
         start_kong_native_https
         run_wrk "kong" "https" "/health" "$GATEWAY_HTTPS_PORT"
         run_wrk "kong" "https" "/api/users" "$GATEWAY_HTTPS_PORT"
+        stop_kong_native
+
+        # E2E TLS tests (TLS on both sides)
+        start_kong_native_e2e_tls
+        run_wrk "kong" "e2e_tls" "/health" "$GATEWAY_HTTPS_PORT"
+        run_wrk "kong" "e2e_tls" "/api/users" "$GATEWAY_HTTPS_PORT"
         stop_kong_native
     else
         # HTTP tests
@@ -556,10 +653,16 @@ test_kong() {
         run_wrk "kong" "http" "/api/users" "$GATEWAY_HTTP_PORT"
         stop_kong_docker
 
-        # HTTPS tests
+        # HTTPS tests (TLS termination — plaintext backend)
         start_kong_docker_https
         run_wrk "kong" "https" "/health" "$GATEWAY_HTTPS_PORT"
         run_wrk "kong" "https" "/api/users" "$GATEWAY_HTTPS_PORT"
+        stop_kong_docker
+
+        # E2E TLS tests (TLS on both sides)
+        start_kong_docker_e2e_tls
+        run_wrk "kong" "e2e_tls" "/health" "$GATEWAY_HTTPS_PORT"
+        run_wrk "kong" "e2e_tls" "/api/users" "$GATEWAY_HTTPS_PORT"
         stop_kong_docker
     fi
 }
@@ -569,10 +672,16 @@ test_kong() {
 # ===========================================================================
 
 prepare_tyk_config() {
-    # Replace BACKEND_HOST placeholder in Tyk API definitions
+    # Replace BACKEND_HOST placeholder in Tyk API definitions (HTTP/HTTPS termination)
     mkdir -p "$COMP_DIR/configs/.tyk_runtime_apps"
     for f in "$COMP_DIR/configs/tyk/apps"/*.json; do
         sed "s/BACKEND_HOST/$BACKEND_HOST/g" "$f" > "$COMP_DIR/configs/.tyk_runtime_apps/$(basename "$f")"
+    done
+
+    # E2E TLS app definitions (HTTPS backend on port 3443)
+    mkdir -p "$COMP_DIR/configs/.tyk_runtime_apps_e2e_tls"
+    for f in "$COMP_DIR/configs/tyk/apps_e2e_tls"/*.json; do
+        sed "s/BACKEND_HOST/$BACKEND_HOST/g" "$f" > "$COMP_DIR/configs/.tyk_runtime_apps_e2e_tls/$(basename "$f")"
     done
 
     # On macOS (no --network host), Tyk and Redis share a Docker network.
@@ -659,6 +768,30 @@ start_tyk_https() {
     wait_for_http "https://127.0.0.1:$GATEWAY_HTTPS_PORT/hello" "Tyk (HTTPS)" 20
 }
 
+start_tyk_e2e_tls() {
+    log_info "Starting Tyk Gateway (E2E TLS) on port $GATEWAY_HTTPS_PORT..."
+    docker rm -f "$TYK_CONTAINER" 2>/dev/null || true
+    kill_port "$GATEWAY_HTTP_PORT"
+    kill_port "$GATEWAY_HTTPS_PORT"
+
+    local network_args=()
+    if [[ "$DOCKER_USE_HOST_NETWORK" == "true" ]]; then
+        network_args+=(--network host)
+    else
+        network_args+=(--network "$TYK_NETWORK" -p "$GATEWAY_HTTPS_PORT:$GATEWAY_HTTPS_PORT")
+    fi
+
+    docker run -d --name "$TYK_CONTAINER" \
+        "${network_args[@]}" \
+        -v "$TYK_CONF_DIR/tyk_tls.conf:/opt/tyk-gateway/tyk.conf:ro" \
+        -v "$COMP_DIR/configs/.tyk_runtime_apps_e2e_tls:/etc/tyk/apps:ro" \
+        -v "$CERTS_DIR/server.crt:/etc/tyk/certs/server.crt:ro" \
+        -v "$CERTS_DIR/server.key:/etc/tyk/certs/server.key:ro" \
+        "tykio/tyk-gateway:${TYK_VERSION}" > /dev/null
+
+    wait_for_http "https://127.0.0.1:$GATEWAY_HTTPS_PORT/hello" "Tyk (E2E TLS)" 20
+}
+
 stop_tyk() {
     docker rm -f "$TYK_CONTAINER" 2>/dev/null || true
     kill_port "$GATEWAY_HTTP_PORT"
@@ -678,10 +811,16 @@ test_tyk() {
     run_wrk "tyk" "http" "/api/users" "$GATEWAY_HTTP_PORT"
     stop_tyk
 
-    # HTTPS tests
+    # HTTPS tests (TLS termination — plaintext backend)
     start_tyk_https
     run_wrk "tyk" "https" "/health" "$GATEWAY_HTTPS_PORT"
     run_wrk "tyk" "https" "/api/users" "$GATEWAY_HTTPS_PORT"
+    stop_tyk
+
+    # E2E TLS tests (TLS on both sides)
+    start_tyk_e2e_tls
+    run_wrk "tyk" "e2e_tls" "/health" "$GATEWAY_HTTPS_PORT"
+    run_wrk "tyk" "e2e_tls" "/api/users" "$GATEWAY_HTTPS_PORT"
     stop_tyk
     stop_redis
 }
@@ -694,6 +833,9 @@ test_baseline() {
     log_header "Testing Direct Backend (Baseline)"
     run_wrk "baseline" "http" "/health" "$BACKEND_PORT"
     run_wrk "baseline" "http" "/api/users" "$BACKEND_PORT"
+    # HTTPS baseline (direct to backend HTTPS port, no gateway)
+    run_wrk "baseline" "https" "/health" "$BACKEND_HTTPS_PORT"
+    run_wrk "baseline" "https" "/api/users" "$BACKEND_HTTPS_PORT"
 }
 
 # ===========================================================================

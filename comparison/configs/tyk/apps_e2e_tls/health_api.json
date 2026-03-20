@@ -1,0 +1,25 @@
+{
+  "name": "Health API (E2E TLS)",
+  "slug": "health-api-e2e",
+  "api_id": "health-api-e2e",
+  "org_id": "default",
+  "use_keyless": true,
+  "active": true,
+  "proxy": {
+    "listen_path": "/health",
+    "target_url": "https://BACKEND_HOST:3443/health",
+    "strip_listen_path": false,
+    "transport": {
+      "ssl_insecure_skip_verify": true
+    }
+  },
+  "version_data": {
+    "not_versioned": true,
+    "default_version": "Default",
+    "versions": {
+      "Default": {
+        "name": "Default"
+      }
+    }
+  }
+}

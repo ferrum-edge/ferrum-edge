@@ -1,0 +1,37 @@
+_format_version: "3.0"
+
+# Kong DB-less declarative configuration — end-to-end TLS
+# Frontend: HTTPS (TLS termination) → Backend: HTTPS (re-encryption)
+#
+# NOTE: BACKEND_HOST is replaced at runtime by run_comparison.sh
+
+services:
+  - name: health-service-e2e
+    host: BACKEND_HOST
+    port: 3443
+    protocol: https
+    connect_timeout: 1000
+    read_timeout: 5000
+    write_timeout: 5000
+    tls_verify: false
+    routes:
+      - name: health-route-e2e
+        paths:
+          - /health
+        strip_path: false
+        preserve_host: false
+
+  - name: users-service-e2e
+    host: BACKEND_HOST
+    port: 3443
+    protocol: https
+    connect_timeout: 1000
+    read_timeout: 5000
+    write_timeout: 5000
+    tls_verify: false
+    routes:
+      - name: users-route-e2e
+        paths:
+          - /api/users
+        strip_path: false
+        preserve_host: false

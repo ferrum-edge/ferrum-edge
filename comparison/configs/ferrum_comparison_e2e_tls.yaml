@@ -1,0 +1,41 @@
+---
+# Ferrum Gateway comparison benchmark configuration — end-to-end TLS
+# Frontend: HTTPS (TLS termination) → Backend: HTTPS (re-encryption)
+
+proxies:
+  - id: "proxy-health"
+    name: "Health Check Proxy (E2E TLS)"
+    listen_path: "/health"
+    backend_protocol: https
+    backend_host: "127.0.0.1"
+    backend_port: 3443
+    strip_listen_path: false
+    preserve_host_header: false
+    backend_connect_timeout_ms: 1000
+    backend_read_timeout_ms: 5000
+    backend_write_timeout_ms: 5000
+    backend_tls_verify_server_cert: false
+    auth_mode: single
+    pool_max_idle_per_host: 200
+    plugins: []
+
+  - id: "proxy-users"
+    name: "Users API Proxy (E2E TLS)"
+    listen_path: "/api/users"
+    backend_protocol: https
+    backend_host: "127.0.0.1"
+    backend_port: 3443
+    strip_listen_path: false
+    preserve_host_header: false
+    backend_connect_timeout_ms: 1000
+    backend_read_timeout_ms: 5000
+    backend_write_timeout_ms: 5000
+    backend_tls_verify_server_cert: false
+    auth_mode: single
+    pool_max_idle_per_host: 200
+    pool_idle_timeout_seconds: 180
+    plugins: []
+
+consumers: []
+
+plugin_configs: []

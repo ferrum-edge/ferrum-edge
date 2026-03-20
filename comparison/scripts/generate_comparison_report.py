@@ -104,7 +104,7 @@ def _latency_to_ms(s):
 # ---------------------------------------------------------------------------
 
 GATEWAYS = ["baseline", "ferrum", "kong", "tyk"]
-PROTOCOLS = ["http", "https"]
+PROTOCOLS = ["http", "https", "e2e_tls"]
 ENDPOINTS = ["health", "users"]
 
 
@@ -231,22 +231,33 @@ def _build_table(data, protocol, endpoint, baseline_metrics):
 
 
 def _build_tls_overhead_table(data):
-    """Compare each gateway's HTTP vs HTTPS performance."""
+    """Compare each gateway's HTTP vs HTTPS vs E2E TLS performance."""
     gws = [g for g in GATEWAYS if g != "baseline" and g in data]
     if not gws:
         return "<p>No TLS comparison data available.</p>"
 
-    html = """<table>
+    has_e2e = any(
+        "e2e_tls" in data.get(gw, {}) for gw in gws
+    )
+
+    # Build header
+    header_cols = "<th>Gateway</th><th>Endpoint</th>"
+    header_cols += "<th>HTTP RPS</th><th>HTTPS RPS</th><th>RPS Drop</th>"
+    header_cols += "<th>HTTP Latency</th><th>HTTPS Latency</th><th>Latency Increase</th>"
+    if has_e2e:
+        header_cols += "<th>E2E TLS RPS</th><th>E2E vs HTTP</th>"
+        header_cols += "<th>E2E TLS Latency</th><th>E2E Lat. Increase</th>"
+
+    html = f"""<table>
 <thead><tr>
-  <th>Gateway</th><th>Endpoint</th>
-  <th>HTTP RPS</th><th>HTTPS RPS</th><th>RPS Drop</th>
-  <th>HTTP Latency</th><th>HTTPS Latency</th><th>Latency Increase</th>
+  {header_cols}
 </tr></thead><tbody>\n"""
 
     for gw in gws:
         for ep in ENDPOINTS:
             http_m = data.get(gw, {}).get("http", {}).get(ep, {})
             https_m = data.get(gw, {}).get("https", {}).get(ep, {})
+            e2e_m = data.get(gw, {}).get("e2e_tls", {}).get(ep, {})
             if not http_m or not https_m:
                 continue
 
@@ -272,7 +283,28 @@ def _build_tls_overhead_table(data):
             html += f"<td>{rps_drop}</td>"
             html += f"<td>{_fmt(http_lat, ' ms')}</td>"
             html += f"<td>{_fmt(https_lat, ' ms')}</td>"
-            html += f"<td>{lat_inc}</td></tr>\n"
+            html += f"<td>{lat_inc}</td>"
+
+            if has_e2e:
+                e2e_rps = e2e_m.get("rps")
+                e2e_lat = e2e_m.get("latency_avg_ms")
+
+                e2e_drop = ""
+                if http_rps and e2e_rps:
+                    pct = ((http_rps - e2e_rps) / http_rps) * 100
+                    e2e_drop = f"{pct:.1f}%"
+
+                e2e_lat_inc = ""
+                if http_lat and e2e_lat:
+                    diff = e2e_lat - http_lat
+                    e2e_lat_inc = f"+{diff:.2f} ms"
+
+                html += f"<td>{_fmt(e2e_rps, '', 0)}</td>"
+                html += f"<td>{e2e_drop}</td>"
+                html += f"<td>{_fmt(e2e_lat, ' ms')}</td>"
+                html += f"<td>{e2e_lat_inc}</td>"
+
+            html += "</tr>\n"
 
     html += "</tbody></table>"
     return html
@@ -286,9 +318,11 @@ def generate_report(results_dir, output_path, meta=None):
         print(f"No result files found in {results_dir}", file=sys.stderr)
         sys.exit(1)
 
-    # Baseline metrics for /health and /users (HTTP only)
+    # Baseline metrics for /health and /users
     bl_health = data.get("baseline", {}).get("http", {}).get("health", {})
     bl_users = data.get("baseline", {}).get("http", {}).get("users", {})
+    bl_https_health = data.get("baseline", {}).get("https", {}).get("health", {})
+    bl_https_users = data.get("baseline", {}).get("https", {}).get("users", {})
 
     meta = meta or {}
     GATEWAY_LABELS = _gateway_labels(meta)
@@ -365,12 +399,18 @@ def generate_report(results_dir, output_path, meta=None):
 <div class="section">
   <h2>Direct Backend Baseline</h2>
   <div class="baseline-box">
-    <strong>/health:</strong> {_fmt(bl_health.get('rps'), ' req/s', 0)} &mdash;
+    <strong>HTTP /health:</strong> {_fmt(bl_health.get('rps'), ' req/s', 0)} &mdash;
     {_fmt(bl_health.get('latency_avg_ms'), ' ms avg')} &mdash;
     {_fmt(bl_health.get('error_count', 0), ' errors', 0)}<br>
-    <strong>/api/users:</strong> {_fmt(bl_users.get('rps'), ' req/s', 0)} &mdash;
+    <strong>HTTP /api/users:</strong> {_fmt(bl_users.get('rps'), ' req/s', 0)} &mdash;
     {_fmt(bl_users.get('latency_avg_ms'), ' ms avg')} &mdash;
-    {_fmt(bl_users.get('error_count', 0), ' errors', 0)}
+    {_fmt(bl_users.get('error_count', 0), ' errors', 0)}<br>
+    <strong>HTTPS /health:</strong> {_fmt(bl_https_health.get('rps'), ' req/s', 0)} &mdash;
+    {_fmt(bl_https_health.get('latency_avg_ms'), ' ms avg')} &mdash;
+    {_fmt(bl_https_health.get('error_count', 0), ' errors', 0)}<br>
+    <strong>HTTPS /api/users:</strong> {_fmt(bl_https_users.get('rps'), ' req/s', 0)} &mdash;
+    {_fmt(bl_https_users.get('latency_avg_ms'), ' ms avg')} &mdash;
+    {_fmt(bl_https_users.get('error_count', 0), ' errors', 0)}
   </div>
 </div>
 
@@ -391,7 +431,16 @@ def generate_report(results_dir, output_path, meta=None):
 </div>
 
 <div class="section">
-  <h2>TLS Overhead (HTTP vs HTTPS per Gateway)</h2>
+  <h2>End-to-End TLS Performance (Full Encryption)</h2>
+  <p>Client &rarr; HTTPS &rarr; Gateway &rarr; HTTPS &rarr; Backend. Both hops are encrypted. This is the most secure deployment pattern.</p>
+  <h3>/health endpoint</h3>
+  {_build_table(data, 'e2e_tls', 'health', bl_https_health)}
+  <h3>/api/users endpoint</h3>
+  {_build_table(data, 'e2e_tls', 'users', bl_https_users)}
+</div>
+
+<div class="section">
+  <h2>TLS Overhead Comparison (HTTP vs HTTPS vs E2E TLS per Gateway)</h2>
   {_build_tls_overhead_table(data)}
 </div>
 
@@ -401,7 +450,7 @@ def generate_report(results_dir, output_path, meta=None):
     <li><strong>Ferrum Gateway</strong> runs as a native binary on the host — zero container overhead.</li>
     <li><strong>Kong</strong> runs {"natively on the host (installed via package manager) — no container overhead." if meta.get("kong_native") else "inside a Docker container. On <strong>macOS</strong>, Docker Desktop runs containers in a Linux VM with userspace networking, which adds <strong>~0.1–0.5 ms per round-trip</strong> (port-mapped) plus higher CPU scheduling variance (~9.5x). On <strong>Linux</strong> with <code>--network host</code>, Docker overhead is negligible (&lt;5 &micro;s). To eliminate this overhead on Linux, install Kong natively via the official apt/yum packages."}</li>
     <li><strong>Tyk</strong> runs inside a Docker container (no official macOS binary; Linux-only native packages available via <a href="https://tyk.io/docs/apim/open-source/installation">packagecloud</a>). The same Docker overhead caveats as Kong apply. Additionally, Tyk requires Redis which also runs in a container.</li>
-    <li><strong>TLS tests</strong> measure TLS termination at the gateway (client &rarr; HTTPS &rarr; gateway &rarr; HTTP &rarr; backend). This is the standard API gateway deployment pattern.</li>
+    <li><strong>HTTPS tests</strong> measure TLS termination at the gateway (client &rarr; HTTPS &rarr; gateway &rarr; HTTP &rarr; backend). <strong>E2E TLS tests</strong> measure full encryption (client &rarr; HTTPS &rarr; gateway &rarr; HTTPS &rarr; backend), the most secure pattern.</li>
     <li>All gateways run sequentially (one at a time) to avoid resource contention on the host.</li>
     <li>Each test includes a {meta.get("duration", "30s")} measured run preceded by a warm-up phase (results discarded).</li>
     <li>To get the fairest comparison on macOS, install Kong natively and run the benchmark again. Tyk results on macOS should be interpreted with Docker overhead in mind (~0.1–0.5 ms added latency, ~5-15% throughput reduction).</li>
