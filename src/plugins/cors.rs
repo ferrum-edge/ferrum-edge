@@ -196,11 +196,17 @@ impl Plugin for CorsPlugin {
             ctx.method == "OPTIONS" && ctx.headers.contains_key("access-control-request-method");
 
         if !is_preflight {
-            // Simple/actual CORS request — stash origin for after_proxy if allowed
-            if self.is_origin_allowed(&origin) {
-                ctx.metadata
-                    .insert("cors_origin".to_string(), origin.clone());
+            // Simple/actual CORS request — reject if origin is not allowed
+            if !self.is_origin_allowed(&origin) {
+                debug!("cors: request rejected for disallowed origin '{}'", origin);
+                return PluginResult::Reject {
+                    status_code: 403,
+                    body: "CORS origin not allowed".to_string(),
+                    headers: HashMap::new(),
+                };
             }
+            ctx.metadata
+                .insert("cors_origin".to_string(), origin.clone());
             return PluginResult::Continue;
         }
 
@@ -222,8 +228,8 @@ impl Plugin for CorsPlugin {
                 origin
             );
             return PluginResult::Reject {
-                status_code: 204,
-                body: String::new(),
+                status_code: 403,
+                body: "CORS origin not allowed".to_string(),
                 headers: HashMap::new(),
             };
         }
@@ -240,8 +246,8 @@ impl Plugin for CorsPlugin {
                     requested_method, origin
                 );
                 return PluginResult::Reject {
-                    status_code: 204,
-                    body: String::new(),
+                    status_code: 403,
+                    body: format!("CORS method not allowed: {}", requested_method),
                     headers: HashMap::new(),
                 };
             }
