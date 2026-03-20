@@ -539,7 +539,7 @@ async fn test_grpc_backend_unavailable() {
         "Backend unavailable should return grpc-status 14 (UNAVAILABLE)"
     );
     assert!(
-        headers.get("grpc-message").is_some(),
+        headers.contains_key("grpc-message"),
         "Should include a grpc-message explaining the error"
     );
 
@@ -702,7 +702,7 @@ async fn test_grpc_key_auth_rejects_missing_key() {
     );
     // Auth rejection happens before gRPC proxy path, so no grpc-status header
     assert!(
-        headers.get("grpc-status").is_none(),
+        !headers.contains_key("grpc-status"),
         "Auth rejection should not include grpc-status (it's a pre-proxy rejection)"
     );
 
