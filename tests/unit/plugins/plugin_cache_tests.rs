@@ -270,20 +270,8 @@ fn test_plugins_sorted_by_priority() {
         vec![make_proxy("p1", "/api", vec!["ps1", "ps2"])],
         vec![
             make_plugin_config("g1", "stdout_logging", PluginScope::Global, None, true),
-            make_plugin_config(
-                "ps1",
-                "key_auth",
-                PluginScope::Proxy,
-                Some("p1"),
-                true,
-            ),
-            make_plugin_config(
-                "ps2",
-                "cors",
-                PluginScope::Proxy,
-                Some("p1"),
-                true,
-            ),
+            make_plugin_config("ps1", "key_auth", PluginScope::Proxy, Some("p1"), true),
+            make_plugin_config("ps2", "cors", PluginScope::Proxy, Some("p1"), true),
         ],
     );
     let cache = PluginCache::new(&config);
@@ -300,17 +288,39 @@ fn test_plugins_sorted_by_priority() {
 fn test_full_plugin_priority_chain() {
     // All major plugin types — verify the complete ordering
     let config = make_config(
-        vec![make_proxy("p1", "/api", vec!["ps1", "ps2", "ps3", "ps4", "ps5", "ps6"])],
+        vec![make_proxy(
+            "p1",
+            "/api",
+            vec!["ps1", "ps2", "ps3", "ps4", "ps5", "ps6"],
+        )],
         vec![
             // Global: logging
             make_plugin_config("g1", "stdout_logging", PluginScope::Global, None, true),
             // Proxy-scoped: add in scrambled order
-            make_plugin_config("ps1", "access_control", PluginScope::Proxy, Some("p1"), true),
-            make_plugin_config("ps2", "request_transformer", PluginScope::Proxy, Some("p1"), true),
+            make_plugin_config(
+                "ps1",
+                "access_control",
+                PluginScope::Proxy,
+                Some("p1"),
+                true,
+            ),
+            make_plugin_config(
+                "ps2",
+                "request_transformer",
+                PluginScope::Proxy,
+                Some("p1"),
+                true,
+            ),
             make_plugin_config("ps3", "cors", PluginScope::Proxy, Some("p1"), true),
             make_plugin_config("ps4", "rate_limiting", PluginScope::Proxy, Some("p1"), true),
             make_plugin_config("ps5", "key_auth", PluginScope::Proxy, Some("p1"), true),
-            make_plugin_config("ps6", "response_transformer", PluginScope::Proxy, Some("p1"), true),
+            make_plugin_config(
+                "ps6",
+                "response_transformer",
+                PluginScope::Proxy,
+                Some("p1"),
+                true,
+            ),
         ],
     );
     let cache = PluginCache::new(&config);
@@ -345,7 +355,7 @@ fn test_global_plugins_also_sorted() {
     // Even for unknown proxy (global fallback), should be sorted
     let plugins = cache.get_plugins("unknown");
     assert_eq!(plugins.len(), 2);
-    assert_eq!(plugins[0].name(), "cors");          // 100
+    assert_eq!(plugins[0].name(), "cors"); // 100
     assert_eq!(plugins[1].name(), "stdout_logging"); // 9000
 }
 
