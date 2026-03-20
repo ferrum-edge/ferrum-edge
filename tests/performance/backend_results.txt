@@ -1,18 +1,18 @@
 Running 30s test @ http://127.0.0.1:3001/api/users
   8 threads and 100 connections
   Thread Stats   Avg      Stdev     Max   +/- Stdev
-    Latency     1.66ms  787.93us  46.98ms   88.99%
-    Req/Sec     6.96k   458.63     8.05k    80.79%
+    Latency     1.68ms  578.29us  18.71ms   88.77%
+    Req/Sec     6.85k   518.37     7.73k    79.58%
   Latency Distribution
-     50%    1.71ms
-     75%    1.86ms
-     90%    2.00ms
-     99%    2.52ms
-  1663006 requests in 30.05s, 318.62MB read
-Requests/sec:  55344.83
-Transfer/sec:     10.60MB
+     50%    1.72ms
+     75%    1.88ms
+     90%    2.02ms
+     99%    2.70ms
+  1639808 requests in 30.07s, 314.19MB read
+Requests/sec:  54541.30
+Transfer/sec:     10.45MB
 
 --- Backend Baseline Statistics ---
-Total requests: 1663006
+Total requests: 1639808
 Non-2xx responses: 0
 Socket errors: connect 0, read 0, write 0, timeout 0

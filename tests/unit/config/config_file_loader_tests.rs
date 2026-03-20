@@ -199,6 +199,7 @@ fn test_all_backend_protocols() {
         ("ws", BackendProtocol::Ws),
         ("wss", BackendProtocol::Wss),
         ("grpc", BackendProtocol::Grpc),
+        ("grpcs", BackendProtocol::Grpcs),
         ("h3", BackendProtocol::H3),
     ];
 

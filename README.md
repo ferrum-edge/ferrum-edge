@@ -936,7 +936,42 @@ Set `backend_protocol: ws` or `wss`. Ferrum handles the HTTP Upgrade and proxies
 
 ### gRPC Proxying
 
-Set `backend_protocol: grpc`. Ferrum proxies gRPC requests over HTTP/2.
+Set `backend_protocol: grpc` (cleartext h2c) or `grpcs` (TLS with ALPN h2). Ferrum uses hyper's HTTP/2 client directly to proxy gRPC requests with full trailer support (`grpc-status`, `grpc-message`).
+
+**How it works**: gRPC runs on HTTP/2, so the gateway transparently forwards HTTP/2 frames — it does not need to understand protobuf. gRPC metadata maps directly to HTTP/2 headers, so all existing auth plugins (JWT, API key, Basic, OAuth2) work unchanged with gRPC. Clients send `authorization: Bearer <token>` as gRPC metadata, which plugins already inspect.
+
+**Configuration example** (YAML):
+```yaml
+proxies:
+  - id: grpc-users
+    listen_path: /grpc
+    backend_protocol: grpc        # h2c (cleartext HTTP/2)
+    backend_host: grpc-backend
+    backend_port: 50051
+    strip_listen_path: true
+    plugins:
+      - name: jwt_auth             # Works with gRPC metadata
+        config:
+          secret: "my-jwt-secret"
+```
+
+**Configuration example** (gRPC over TLS):
+```yaml
+proxies:
+  - id: grpc-secure
+    listen_path: /grpc
+    backend_protocol: grpcs       # HTTP/2 over TLS with ALPN
+    backend_host: grpc-backend
+    backend_port: 443
+```
+
+**Protocol details**:
+- `grpc` — h2c (cleartext HTTP/2 via prior knowledge handshake). Use for internal backends without TLS.
+- `grpcs` — HTTP/2 over TLS with ALPN `h2` negotiation. Use for external or secured backends.
+- gRPC error responses follow the spec: HTTP 200 with `grpc-status` and `grpc-message` headers.
+- When the backend is unavailable, the gateway returns `grpc-status: 14` (UNAVAILABLE).
+- When the backend times out, the gateway returns `grpc-status: 4` (DEADLINE_EXCEEDED).
+- The frontend listener accepts both HTTP/1.1 and h2c connections, so gRPC clients can connect to the standard HTTP port without TLS.
 
 ## Resilience & Caching
 

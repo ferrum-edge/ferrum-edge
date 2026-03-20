@@ -11,6 +11,7 @@ pub enum BackendProtocol {
     Ws,
     Wss,
     Grpc,
+    Grpcs,
     H3,
 }
 
@@ -22,6 +23,7 @@ impl std::fmt::Display for BackendProtocol {
             Self::Ws => write!(f, "ws"),
             Self::Wss => write!(f, "wss"),
             Self::Grpc => write!(f, "grpc"),
+            Self::Grpcs => write!(f, "grpcs"),
             Self::H3 => write!(f, "h3"),
         }
     }

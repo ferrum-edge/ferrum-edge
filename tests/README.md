@@ -58,6 +58,7 @@ tests/
 │   ├── backend_mtls_tests.rs           # Backend mutual TLS
 │   ├── connection_pool_tests.rs        # Connection pool with real connections
 │   ├── cp_dp_grpc_tests.rs            # CP/DP gRPC communication
+│   ├── grpc_proxy_tests.rs            # gRPC reverse proxy (in-process)
 │   └── http3_integration_tests.rs      # HTTP/3 flow tests
 │
 ├── functional_tests.rs                 # Entry point: functional test crate
@@ -65,7 +66,9 @@ tests/
 │   ├── mod.rs
 │   ├── functional_cp_dp_test.rs        # CP/DP mode: gRPC + DB TLS
 │   ├── functional_database_test.rs     # Database mode: SQLite + Admin API + proxy
-│   └── functional_file_mode_test.rs    # File mode: YAML config + SIGHUP reload
+│   ├── functional_file_mode_test.rs    # File mode: YAML config + SIGHUP reload
+│   ├── functional_grpc_test.rs         # gRPC proxying: h2c echo, errors, metadata
+│   └── functional_websocket_test.rs    # WebSocket proxying: ws/wss echo
 │
 ├── helpers/
 │   └── bin/                            # Standalone test server binaries
@@ -123,6 +126,12 @@ cargo test --test functional_tests functional_file_mode -- --ignored --nocapture
 
 # CP/DP mode: gRPC sync + database TLS config
 cargo test --test functional_tests functional_cp_dp -- --ignored --nocapture
+
+# gRPC proxying: client → gateway → gRPC backend echo
+cargo test --test functional_tests functional_grpc -- --ignored --nocapture
+
+# WebSocket proxying: client → gateway → WebSocket backend echo
+cargo test --test functional_tests functional_websocket -- --ignored --nocapture
 ```
 
 ### Performance Tests

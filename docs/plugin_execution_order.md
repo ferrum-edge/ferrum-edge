@@ -139,3 +139,14 @@ pub mod priority {
 ```
 
 The default priority is `5000` (the Custom band), which runs after all transforms but before logging. This is a safe default for plugins that don't have strong ordering requirements.
+
+## gRPC Compatibility
+
+All plugins in the execution pipeline work transparently with gRPC requests. gRPC metadata maps directly to HTTP/2 headers, so:
+
+- **Authentication plugins** (JWT, OAuth2, API key, Basic) inspect the `authorization` header, which gRPC clients send as metadata.
+- **Rate limiting** works identically for gRPC — keyed by IP or consumer identity.
+- **Request/Response transformers** can add, modify, or remove gRPC metadata (HTTP/2 headers).
+- **Logging plugins** receive the same `TransactionSummary` with the gRPC path (e.g., `/my.Service/MyMethod`) and HTTP status.
+
+gRPC requests are detected by their `content-type: application/grpc` header and routed to the dedicated gRPC proxy path, which uses hyper's HTTP/2 client for trailer forwarding. The plugin pipeline runs before and after the gRPC backend call, just like HTTP requests.

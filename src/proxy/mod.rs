@@ -1,3 +1,5 @@
+pub mod grpc_proxy;
+
 use arc_swap::ArcSwap;
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
@@ -26,6 +28,8 @@ use crate::http3::client::Http3Client;
 use crate::plugin_cache::PluginCache;
 use crate::plugins::{Plugin, PluginResult, RequestContext, TransactionSummary};
 use crate::router_cache::RouterCache;
+
+use self::grpc_proxy::{GrpcConnectionPool, GrpcProxyError};
 
 /// Check if the request is a WebSocket upgrade request
 fn is_websocket_upgrade(req: &Request<Incoming>) -> bool {
@@ -56,6 +60,8 @@ pub struct ProxyState {
     pub consumer_index: Arc<ConsumerIndex>,
     pub request_count: Arc<AtomicU64>,
     pub status_counts: Arc<dashmap::DashMap<u16, AtomicU64>>,
+    /// gRPC-specific HTTP/2 connection pool (h2c + h2 with trailer support)
+    pub grpc_pool: Arc<GrpcConnectionPool>,
     /// Whether HTTP/3 is enabled (used for Alt-Svc header advertisement)
     pub enable_http3: bool,
     /// The HTTPS port (shared by HTTP/3 QUIC listener)
@@ -79,8 +85,12 @@ impl ProxyState {
         let max_single_header_size_bytes = env_config.max_single_header_size_bytes;
         let max_body_size_bytes = env_config.max_body_size_bytes;
         let max_response_body_size_bytes = env_config.max_response_body_size_bytes;
-        // Create connection pool with global configuration from environment
+        // Create connection pools with global configuration from environment
         let global_pool_config = PoolConfig::from_env();
+        let grpc_pool = Arc::new(GrpcConnectionPool::new(
+            global_pool_config.clone(),
+            env_config.clone(),
+        ));
         let connection_pool = Arc::new(ConnectionPool::new(global_pool_config, env_config));
         // Build router cache with pre-sorted route table for fast prefix matching
         let router_cache = Arc::new(RouterCache::new(&config, 10_000));
@@ -98,6 +108,7 @@ impl ProxyState {
             consumer_index,
             request_count: Arc::new(AtomicU64::new(0)),
             status_counts: Arc::new(dashmap::DashMap::new()),
+            grpc_pool,
             enable_http3,
             proxy_https_port,
             max_header_size_bytes,
@@ -120,7 +131,11 @@ impl ProxyState {
     }
 }
 
-/// Handle a plain HTTP TCP connection (HTTP/1.1 only for cleartext).
+/// Handle a plain HTTP TCP connection (HTTP/1.1 and HTTP/2 cleartext via h2c).
+///
+/// Uses hyper-util's auto builder which accepts both HTTP/1.1 and HTTP/2
+/// connections. h2c (cleartext HTTP/2) is required for gRPC clients that
+/// connect without TLS.
 async fn handle_connection(
     stream: tokio::net::TcpStream,
     remote_addr: SocketAddr,
@@ -132,12 +147,16 @@ async fn handle_connection(
     // Use TokioIo to adapt the TCP stream for hyper
     let io = TokioIo::new(stream);
 
-    // Plain HTTP uses HTTP/1.1 only (HTTP/2 cleartext requires prior knowledge
-    // or upgrade which is rarely used; HTTP/2 is negotiated via ALPN on TLS)
-    let mut http1_builder = hyper::server::conn::http1::Builder::new();
-    http1_builder.max_buf_size(state.max_header_size_bytes);
+    // Use auto builder to support both HTTP/1.1 and HTTP/2 cleartext (h2c).
+    // This is needed for gRPC clients that use h2c prior knowledge.
+    let mut builder =
+        hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
+    builder.http1().max_buf_size(state.max_header_size_bytes);
+    builder
+        .http2()
+        .max_header_list_size(state.max_header_size_bytes as u32);
 
-    // Create a service function that can handle both HTTP and WebSocket
+    // Create a service function that can handle HTTP, WebSocket, and gRPC
     let svc = service_fn(move |req: Request<Incoming>| {
         let state = state.clone();
         let addr = remote_addr;
@@ -150,11 +169,7 @@ async fn handle_connection(
             }
         }
     });
-    if let Err(e) = http1_builder
-        .serve_connection(io, svc)
-        .with_upgrades()
-        .await
-    {
+    if let Err(e) = builder.serve_connection_with_upgrades(io, svc).await {
         debug!("Connection error: {}", e);
     }
 
@@ -669,7 +684,7 @@ async fn handle_tls_connection(
 }
 
 /// Handle a single proxy request.
-async fn handle_proxy_request(
+pub async fn handle_proxy_request(
     req: Request<Incoming>,
     state: ProxyState,
     remote_addr: SocketAddr,
@@ -874,6 +889,110 @@ async fn handle_proxy_request(
         .await;
     }
 
+    // Check if this is a gRPC request and the proxy supports gRPC
+    if grpc_proxy::is_grpc_request(&req)
+        && matches!(
+            proxy.backend_protocol,
+            BackendProtocol::Grpc | BackendProtocol::Grpcs
+        )
+    {
+        let backend_url = build_backend_url(&proxy, &path, &query_string);
+        let backend_start = Instant::now();
+
+        let grpc_result = grpc_proxy::proxy_grpc_request(
+            req,
+            &proxy,
+            &backend_url,
+            &state.grpc_pool,
+            &state.dns_cache,
+            proxy_headers,
+        )
+        .await;
+
+        let backend_total_ms = backend_start.elapsed().as_secs_f64() * 1000.0;
+
+        match grpc_result {
+            Ok(grpc_resp) => {
+                let mut response_headers: HashMap<String, String> = grpc_resp.headers;
+
+                // Forward trailers as response headers (gRPC Trailers-Only encoding)
+                for (k, v) in &grpc_resp.trailers {
+                    response_headers.insert(k.clone(), v.clone());
+                }
+
+                // after_proxy hooks
+                for plugin in &plugins {
+                    let _ = plugin
+                        .after_proxy(&mut ctx, grpc_resp.status, &mut response_headers)
+                        .await;
+                }
+
+                let total_ms = start_time.elapsed().as_secs_f64() * 1000.0;
+                let gateway_processing_ms = total_ms - backend_total_ms;
+
+                // Log phase
+                if !plugins.is_empty() {
+                    let summary = TransactionSummary {
+                        timestamp_received: ctx.timestamp_received.to_rfc3339(),
+                        client_ip: ctx.client_ip.clone(),
+                        consumer_username: ctx
+                            .identified_consumer
+                            .as_ref()
+                            .map(|c| c.username.clone()),
+                        http_method: method,
+                        request_path: path,
+                        matched_proxy_id: Some(proxy.id.clone()),
+                        matched_proxy_name: proxy.name.clone(),
+                        backend_target_url: Some(strip_query_params(&backend_url)),
+                        response_status_code: grpc_resp.status,
+                        latency_total_ms: total_ms,
+                        latency_gateway_processing_ms: gateway_processing_ms,
+                        latency_backend_ttfb_ms: backend_total_ms,
+                        latency_backend_total_ms: backend_total_ms,
+                        request_user_agent: ctx.headers.get("user-agent").cloned(),
+                        metadata: ctx.metadata.clone(),
+                    };
+                    for plugin in &plugins {
+                        plugin.log(&summary).await;
+                    }
+                }
+
+                record_request(&state, grpc_resp.status);
+
+                // Build gRPC response with headers and trailers
+                let mut resp_builder = Response::builder()
+                    .status(StatusCode::from_u16(grpc_resp.status).unwrap_or(StatusCode::OK));
+                for (k, v) in &response_headers {
+                    resp_builder = resp_builder.header(k.as_str(), v.as_str());
+                }
+
+                return Ok(resp_builder
+                    .body(Full::new(Bytes::from(grpc_resp.body)))
+                    .unwrap_or_else(|_| {
+                        grpc_proxy::build_grpc_error_response(
+                            grpc_proxy::grpc_status::UNAVAILABLE,
+                            "Internal gateway error",
+                        )
+                    }));
+            }
+            Err(e) => {
+                let (grpc_code, msg) = match &e {
+                    GrpcProxyError::BackendUnavailable(m) => {
+                        (grpc_proxy::grpc_status::UNAVAILABLE, m.as_str())
+                    }
+                    GrpcProxyError::BackendTimeout(m) => {
+                        (grpc_proxy::grpc_status::DEADLINE_EXCEEDED, m.as_str())
+                    }
+                    GrpcProxyError::Internal(m) => {
+                        (grpc_proxy::grpc_status::UNAVAILABLE, m.as_str())
+                    }
+                };
+                record_request(&state, 200); // gRPC errors use HTTP 200
+                return Ok(grpc_proxy::build_grpc_error_response(grpc_code, msg));
+            }
+        }
+    }
+
     // Build backend URL
     let backend_url = build_backend_url(&proxy, &path, &query_string);
     let backend_start = Instant::now();
@@ -969,9 +1088,11 @@ pub fn find_matching_proxy(config: &GatewayConfig, path: &str) -> Option<Proxy> 
 /// Build the backend URL based on proxy config and path forwarding logic.
 pub fn build_backend_url(proxy: &Proxy, incoming_path: &str, query_string: &str) -> String {
     let scheme = match proxy.backend_protocol {
-        BackendProtocol::Http | BackendProtocol::Ws => "http",
-        BackendProtocol::Https | BackendProtocol::Wss | BackendProtocol::H3 => "https",
-        BackendProtocol::Grpc => "http", // gRPC over HTTP/2
+        BackendProtocol::Http | BackendProtocol::Ws | BackendProtocol::Grpc => "http",
+        BackendProtocol::Https
+        | BackendProtocol::Wss
+        | BackendProtocol::H3
+        | BackendProtocol::Grpcs => "https",
     };
 
     let remaining_path = if proxy.strip_listen_path {

@@ -132,6 +132,66 @@ pub struct EnvConfig {
     pub http3_max_streams: u32,
 }
 
+impl Default for EnvConfig {
+    fn default() -> Self {
+        Self {
+            mode: OperatingMode::File,
+            log_level: "info".into(),
+            proxy_http_port: 8000,
+            proxy_https_port: 8443,
+            proxy_tls_cert_path: None,
+            proxy_tls_key_path: None,
+            admin_http_port: 9000,
+            admin_https_port: 9443,
+            admin_tls_cert_path: None,
+            admin_tls_key_path: None,
+            admin_jwt_secret: None,
+            db_type: None,
+            db_url: None,
+            db_poll_interval: 30,
+            db_poll_check_interval: 5,
+            db_incremental_polling: true,
+            db_tls_enabled: false,
+            db_tls_ca_cert_path: None,
+            db_tls_client_cert_path: None,
+            db_tls_client_key_path: None,
+            db_tls_insecure: false,
+            db_ssl_mode: None,
+            db_ssl_root_cert: None,
+            db_ssl_client_cert: None,
+            db_ssl_client_key: None,
+            file_config_path: None,
+            cp_grpc_listen_addr: None,
+            cp_grpc_jwt_secret: None,
+            dp_cp_grpc_url: None,
+            dp_grpc_auth_token: None,
+            max_header_size_bytes: 32_768,
+            max_single_header_size_bytes: 16_384,
+            max_body_size_bytes: 10_485_760,
+            max_response_body_size_bytes: 10_485_760,
+            dns_cache_ttl_seconds: 300,
+            dns_overrides: HashMap::new(),
+            dns_resolver_address: None,
+            dns_resolver_hosts_file: None,
+            dns_order: None,
+            dns_valid_ttl: None,
+            dns_stale_ttl: 3600,
+            dns_error_ttl: 1,
+            backend_tls_ca_bundle_path: None,
+            backend_tls_client_cert_path: None,
+            backend_tls_client_key_path: None,
+            frontend_tls_client_ca_bundle_path: None,
+            admin_tls_client_ca_bundle_path: None,
+            backend_tls_no_verify: false,
+            admin_read_only: false,
+            admin_tls_no_verify: false,
+            enable_http3: false,
+            http3_idle_timeout: 30,
+            http3_max_streams: 100,
+        }
+    }
+}
+
 impl EnvConfig {
     pub fn from_env() -> Result<Self, String> {
         let mode = OperatingMode::from_env()?;

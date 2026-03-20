@@ -559,6 +559,7 @@ fn parse_protocol(s: &str) -> BackendProtocol {
         "ws" => BackendProtocol::Ws,
         "wss" => BackendProtocol::Wss,
         "grpc" => BackendProtocol::Grpc,
+        "grpcs" => BackendProtocol::Grpcs,
         _ => BackendProtocol::Http,
     }
 }
