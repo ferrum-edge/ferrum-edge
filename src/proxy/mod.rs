@@ -1104,15 +1104,18 @@ pub async fn handle_proxy_request(
     }
 
     // Resolve upstream target if load balancing is configured
-    let upstream_target: Option<UpstreamTarget> = if let Some(upstream_id) = &proxy.upstream_id {
+    let (upstream_target, upstream_is_fallback) = if let Some(upstream_id) = &proxy.upstream_id {
         let hash_key = ctx.client_ip.clone(); // Default hash key for consistent hashing
-        state.load_balancer_cache.select_target(
+        match state.load_balancer_cache.select_target(
             upstream_id,
             &hash_key,
             Some(&state.health_checker.unhealthy_targets),
-        )
+        ) {
+            Some(selection) => (Some(selection.target), selection.is_fallback),
+            None => (None, false),
+        }
     } else {
-        None
+        (None, false)
     };
 
     // Circuit breaker check
@@ -1272,6 +1275,22 @@ pub async fn handle_proxy_request(
 
     for (k, v) in &response_headers {
         resp_builder = resp_builder.header(k.as_str(), v.as_str());
+    }
+
+    // Add gateway error categorization headers so clients and ops teams
+    // can distinguish different failure modes:
+    //   X-Gateway-Error: connection_failure | backend_timeout | backend_error
+    //   X-Gateway-Upstream-Status: degraded (when routing via all-unhealthy fallback)
+    if backend_resp.connection_error {
+        resp_builder = resp_builder.header("X-Gateway-Error", "connection_failure");
+    } else if response_status == 504 {
+        resp_builder = resp_builder.header("X-Gateway-Error", "backend_timeout");
+    } else if response_status >= 500 {
+        resp_builder = resp_builder.header("X-Gateway-Error", "backend_error");
+    }
+
+    if upstream_is_fallback {
+        resp_builder = resp_builder.header("X-Gateway-Upstream-Status", "degraded");
     }
 
     // Advertise HTTP/3 availability via Alt-Svc header
