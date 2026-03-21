@@ -127,10 +127,10 @@ impl BodyValidator {
             data.as_object(),
         ) {
             for req in required {
-                if let Some(field_name) = req.as_str() {
-                    if !data_obj.contains_key(field_name) {
-                        return Err(format!("Missing required property: {}", field_name));
-                    }
+                if let Some(field_name) = req.as_str()
+                    && !data_obj.contains_key(field_name)
+                {
+                    return Err(format!("Missing required property: {}", field_name));
                 }
             }
         }

@@ -78,10 +78,10 @@ impl Plugin for CorrelationId {
         _response_status: u16,
         response_headers: &mut HashMap<String, String>,
     ) -> PluginResult {
-        if self.echo_downstream {
-            if let Some(request_id) = ctx.metadata.get("request_id") {
-                response_headers.insert(self.header_name.clone(), request_id.clone());
-            }
+        if self.echo_downstream
+            && let Some(request_id) = ctx.metadata.get("request_id")
+        {
+            response_headers.insert(self.header_name.clone(), request_id.clone());
         }
         PluginResult::Continue
     }

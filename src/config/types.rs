@@ -3,20 +3,15 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// Load balancing algorithm for distributing requests across upstream targets.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum LoadBalancerAlgorithm {
+    #[default]
     RoundRobin,
     WeightedRoundRobin,
     LeastConnections,
     ConsistentHashing,
     Random,
-}
-
-impl Default for LoadBalancerAlgorithm {
-    fn default() -> Self {
-        Self::RoundRobin
-    }
 }
 
 /// A single backend target within an upstream group.

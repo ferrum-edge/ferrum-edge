@@ -1166,22 +1166,21 @@ pub async fn handle_proxy_request(
             // Try a different target on retry if load balancing is configured
             if let (Some(upstream_id), Some(prev_target)) =
                 (&proxy.upstream_id, &current_target)
-            {
-                if let Some(next) = state.load_balancer_cache.select_next_target(
+                && let Some(next) = state.load_balancer_cache.select_next_target(
                     upstream_id,
                     &ctx.client_ip,
                     prev_target,
                     Some(&state.health_checker.unhealthy_targets),
-                ) {
-                    current_url = build_backend_url_with_target(
-                        &proxy,
-                        &path,
-                        &query_string,
-                        &next.host,
-                        next.port,
-                    );
-                    current_target = Some(next);
-                }
+                )
+            {
+                current_url = build_backend_url_with_target(
+                    &proxy,
+                    &path,
+                    &query_string,
+                    &next.host,
+                    next.port,
+                );
+                current_target = Some(next);
             }
 
             debug!(
@@ -1213,12 +1212,12 @@ pub async fn handle_proxy_request(
     // Passive health check reporting
     if let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, &upstream_target) {
         let config = state.config.load();
-        if let Some(upstream) = config.upstreams.iter().find(|u| u.id == *upstream_id) {
-            if let Some(hc) = &upstream.health_checks {
-                state
-                    .health_checker
-                    .report_response(target, response_status, hc.passive.as_ref());
-            }
+        if let Some(upstream) = config.upstreams.iter().find(|u| u.id == *upstream_id)
+            && let Some(hc) = &upstream.health_checks
+        {
+            state
+                .health_checker
+                .report_response(target, response_status, hc.passive.as_ref());
         }
     }
 

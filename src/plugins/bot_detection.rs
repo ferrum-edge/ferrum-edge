@@ -24,7 +24,7 @@ impl BotDetection {
                     .filter_map(|v| v.as_str().map(|s| s.to_lowercase()))
                     .collect()
             })
-            .unwrap_or_else(|| default_blocked_patterns());
+            .unwrap_or_else(default_blocked_patterns);
 
         let allow_list = config["allow_list"]
             .as_array()

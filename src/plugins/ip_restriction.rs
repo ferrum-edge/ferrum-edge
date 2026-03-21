@@ -128,46 +128,46 @@ pub fn ip_matches(client_ip: &str, rule: &str) -> bool {
     }
 
     // CIDR notation matching for IPv4
-    if rule.contains('/') {
-        if let Some((network_str, prefix_str)) = rule.split_once('/') {
-            let prefix_len: u8 = match prefix_str.parse() {
-                Ok(p) => p,
-                Err(_) => return false,
+    if rule.contains('/')
+        && let Some((network_str, prefix_str)) = rule.split_once('/')
+    {
+        let prefix_len: u8 = match prefix_str.parse() {
+            Ok(p) => p,
+            Err(_) => return false,
+        };
+
+        // Try IPv4
+        if let (Some(client_octets), Some(network_octets)) =
+            (parse_ipv4(client_ip), parse_ipv4(network_str))
+        {
+            if prefix_len > 32 {
+                return false;
+            }
+            let client_bits = u32::from_be_bytes(client_octets);
+            let network_bits = u32::from_be_bytes(network_octets);
+            let mask = if prefix_len == 0 {
+                0u32
+            } else {
+                !0u32 << (32 - prefix_len)
             };
+            return (client_bits & mask) == (network_bits & mask);
+        }
 
-            // Try IPv4
-            if let (Some(client_octets), Some(network_octets)) =
-                (parse_ipv4(client_ip), parse_ipv4(network_str))
-            {
-                if prefix_len > 32 {
-                    return false;
-                }
-                let client_bits = u32::from_be_bytes(client_octets);
-                let network_bits = u32::from_be_bytes(network_octets);
-                let mask = if prefix_len == 0 {
-                    0u32
-                } else {
-                    !0u32 << (32 - prefix_len)
-                };
-                return (client_bits & mask) == (network_bits & mask);
+        // Try IPv6
+        if let (Some(client_parts), Some(network_parts)) =
+            (parse_ipv6(client_ip), parse_ipv6(network_str))
+        {
+            if prefix_len > 128 {
+                return false;
             }
-
-            // Try IPv6
-            if let (Some(client_parts), Some(network_parts)) =
-                (parse_ipv6(client_ip), parse_ipv6(network_str))
-            {
-                if prefix_len > 128 {
-                    return false;
-                }
-                let client_bits = ipv6_to_u128(&client_parts);
-                let network_bits = ipv6_to_u128(&network_parts);
-                let mask = if prefix_len == 0 {
-                    0u128
-                } else {
-                    !0u128 << (128 - prefix_len)
-                };
-                return (client_bits & mask) == (network_bits & mask);
-            }
+            let client_bits = ipv6_to_u128(&client_parts);
+            let network_bits = ipv6_to_u128(&network_parts);
+            let mask = if prefix_len == 0 {
+                0u128
+            } else {
+                !0u128 << (128 - prefix_len)
+            };
+            return (client_bits & mask) == (network_bits & mask);
         }
     }
 

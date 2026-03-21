@@ -159,6 +159,12 @@ pub struct CircuitBreakerCache {
     breakers: DashMap<String, Arc<CircuitBreaker>>,
 }
 
+impl Default for CircuitBreakerCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CircuitBreakerCache {
     pub fn new() -> Self {
         Self {

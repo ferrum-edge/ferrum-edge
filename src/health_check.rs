@@ -45,6 +45,12 @@ pub struct HealthChecker {
     active_check_handles: Vec<tokio::task::JoinHandle<()>>,
 }
 
+impl Default for HealthChecker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl HealthChecker {
     pub fn new() -> Self {
         Self {
@@ -109,14 +115,14 @@ impl HealthChecker {
                 .retain(|_, &mut ts| ts >= window_start);
 
             let failures_in_window = state.recent_failures.len() as u32;
-            if failures_in_window >= config.unhealthy_threshold {
-                if !self.unhealthy_targets.contains_key(&key) {
-                    warn!(
-                        "Passive health check: marking target {} as unhealthy ({} failures in {}s window)",
-                        key, failures_in_window, config.unhealthy_window_seconds
-                    );
-                    self.unhealthy_targets.insert(key, ());
-                }
+            if failures_in_window >= config.unhealthy_threshold
+                && !self.unhealthy_targets.contains_key(&key)
+            {
+                warn!(
+                    "Passive health check: marking target {} as unhealthy ({} failures in {}s window)",
+                    key, failures_in_window, config.unhealthy_window_seconds
+                );
+                self.unhealthy_targets.insert(key, ());
             }
         } else {
             let failures = state.consecutive_failures.load(Ordering::Relaxed);
