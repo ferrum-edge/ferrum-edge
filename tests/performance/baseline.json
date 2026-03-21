@@ -1,73 +1,73 @@
 {
-  "_comment": "Performance baseline for CI regression detection. Auto-updated on main branch merges. To regenerate locally: cd tests/performance && ./ci_perf_test.sh --save-baseline",
-  "timestamp": "2026-03-20T00:00:00+00:00",
+  "_comment": "Performance baseline from CI run 2026-03-21. Auto-updated on main branch merges. To regenerate locally: cd tests/performance && ./ci_perf_test.sh --save-baseline",
+  "timestamp": "2026-03-21T00:00:00+00:00",
   "tests": {
     "health": {
-      "rps": 15000,
-      "latency_avg_us": 3000,
-      "latency_stdev_us": 1500,
-      "latency_max_us": 50000,
-      "latency_avg_display": "3.00ms",
-      "latency_max_display": "50.00ms",
+      "rps": 26328,
+      "latency_avg_us": 1810,
+      "latency_stdev_us": 900,
+      "latency_max_us": 12090,
+      "latency_avg_display": "1.81ms",
+      "latency_max_display": "12.09ms",
       "percentiles": {
-        "p50_us": 2000,
-        "p50_display": "2.00ms",
-        "p75_us": 3500,
-        "p75_display": "3.50ms",
-        "p90_us": 5000,
-        "p90_display": "5.00ms",
-        "p99_us": 15000,
-        "p99_display": "15.00ms"
+        "p50_us": 1710,
+        "p50_display": "1.71ms",
+        "p75_us": 2140,
+        "p75_display": "2.14ms",
+        "p90_us": 2650,
+        "p90_display": "2.65ms",
+        "p99_us": 4100,
+        "p99_display": "4.10ms"
       },
-      "total_requests": 150000,
+      "total_requests": 263280,
       "errors": {"connect": 0, "read": 0, "write": 0, "timeout": 0},
       "non_2xx_responses": 0
     },
     "users": {
-      "rps": 12000,
-      "latency_avg_us": 4000,
-      "latency_stdev_us": 2000,
-      "latency_max_us": 60000,
-      "latency_avg_display": "4.00ms",
-      "latency_max_display": "60.00ms",
+      "rps": 24283,
+      "latency_avg_us": 2690,
+      "latency_stdev_us": 1500,
+      "latency_max_us": 131330,
+      "latency_avg_display": "2.69ms",
+      "latency_max_display": "131.33ms",
       "percentiles": {
-        "p50_us": 3000,
-        "p50_display": "3.00ms",
-        "p75_us": 5000,
-        "p75_display": "5.00ms",
-        "p90_us": 7000,
-        "p90_display": "7.00ms",
-        "p99_us": 20000,
-        "p99_display": "20.00ms"
+        "p50_us": 1950,
+        "p50_display": "1.95ms",
+        "p75_us": 2370,
+        "p75_display": "2.37ms",
+        "p90_us": 2800,
+        "p90_display": "2.80ms",
+        "p99_us": 24210,
+        "p99_display": "24.21ms"
       },
-      "total_requests": 120000,
+      "total_requests": 242830,
       "errors": {"connect": 0, "read": 0, "write": 0, "timeout": 0},
       "non_2xx_responses": 0
     },
     "backend_baseline": {
-      "rps": 18000,
-      "latency_avg_us": 2500,
-      "latency_stdev_us": 1000,
-      "latency_max_us": 30000,
-      "latency_avg_display": "2.50ms",
-      "latency_max_display": "30.00ms",
+      "rps": 30997,
+      "latency_avg_us": 1480,
+      "latency_stdev_us": 500,
+      "latency_max_us": 2550,
+      "latency_avg_display": "1.48ms",
+      "latency_max_display": "2.55ms",
       "percentiles": {
-        "p50_us": 1800,
-        "p50_display": "1.80ms",
-        "p75_us": 3000,
-        "p75_display": "3.00ms",
-        "p90_us": 4500,
-        "p90_display": "4.50ms",
-        "p99_us": 12000,
-        "p99_display": "12.00ms"
+        "p50_us": 1540,
+        "p50_display": "1.54ms",
+        "p75_us": 1670,
+        "p75_display": "1.67ms",
+        "p90_us": 1780,
+        "p90_display": "1.78ms",
+        "p99_us": 1950,
+        "p99_display": "1.95ms"
       },
-      "total_requests": 180000,
+      "total_requests": 309970,
       "errors": {"connect": 0, "read": 0, "write": 0, "timeout": 0},
       "non_2xx_responses": 0
     }
   },
   "overhead": {
-    "rps_reduction_pct": 8.5,
-    "latency_added_us": 1500
+    "rps_reduction_pct": 21.66,
+    "latency_added_us": 1210
   }
 }
