@@ -1,29 +1,36 @@
 //! Tests for http_logging plugin
 
-use ferrum_gateway::plugins::{Plugin, http_logging::HttpLogging};
+use ferrum_gateway::plugins::{Plugin, PluginHttpClient, http_logging::HttpLogging};
 use serde_json::json;
 
 use super::plugin_utils::create_test_transaction_summary;
 
+fn default_client() -> PluginHttpClient {
+    PluginHttpClient::default()
+}
+
 #[tokio::test]
 async fn test_http_logging_plugin_creation() {
-    let plugin = HttpLogging::new(&json!({
-        "endpoint_url": "http://localhost:9200/logs",
-        "authorization_header": "Bearer log-token"
-    }));
+    let plugin = HttpLogging::new(
+        &json!({
+            "endpoint_url": "http://localhost:9200/logs",
+            "authorization_header": "Bearer log-token"
+        }),
+        default_client(),
+    );
     assert_eq!(plugin.name(), "http_logging");
 }
 
 #[tokio::test]
 async fn test_http_logging_plugin_creation_empty_config() {
-    let plugin = HttpLogging::new(&json!({}));
+    let plugin = HttpLogging::new(&json!({}), default_client());
     assert_eq!(plugin.name(), "http_logging");
 }
 
 #[tokio::test]
 async fn test_http_logging_empty_url_does_not_send() {
     // When endpoint_url is empty, log() should return without sending
-    let plugin = HttpLogging::new(&json!({}));
+    let plugin = HttpLogging::new(&json!({}), default_client());
     let summary = create_test_transaction_summary();
 
     // This should not panic or error - just silently return
@@ -33,9 +40,12 @@ async fn test_http_logging_empty_url_does_not_send() {
 #[tokio::test]
 async fn test_http_logging_invalid_url_does_not_panic() {
     // When endpoint_url is unreachable, log() should handle the error gracefully
-    let plugin = HttpLogging::new(&json!({
-        "endpoint_url": "http://127.0.0.1:1/unreachable"
-    }));
+    let plugin = HttpLogging::new(
+        &json!({
+            "endpoint_url": "http://127.0.0.1:1/unreachable"
+        }),
+        default_client(),
+    );
     let summary = create_test_transaction_summary();
 
     // Should not panic - just log a warning
@@ -44,10 +54,13 @@ async fn test_http_logging_invalid_url_does_not_panic() {
 
 #[tokio::test]
 async fn test_http_logging_with_authorization_header() {
-    let plugin = HttpLogging::new(&json!({
-        "endpoint_url": "http://127.0.0.1:1/unreachable",
-        "authorization_header": "Bearer my-secret-token"
-    }));
+    let plugin = HttpLogging::new(
+        &json!({
+            "endpoint_url": "http://127.0.0.1:1/unreachable",
+            "authorization_header": "Bearer my-secret-token"
+        }),
+        default_client(),
+    );
     assert_eq!(plugin.name(), "http_logging");
 
     // Should not panic even with auth header set and unreachable endpoint
@@ -58,7 +71,7 @@ async fn test_http_logging_with_authorization_header() {
 #[tokio::test]
 async fn test_http_logging_default_lifecycle_phases() {
     // http_logging only implements log(), all other phases should return Continue
-    let plugin = HttpLogging::new(&json!({}));
+    let plugin = HttpLogging::new(&json!({}), default_client());
 
     let mut ctx = ferrum_gateway::plugins::RequestContext::new(
         "127.0.0.1".to_string(),

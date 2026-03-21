@@ -2,20 +2,23 @@ use async_trait::async_trait;
 use serde_json::Value;
 use tracing::warn;
 
+use super::plugin_http_client::PluginHttpClient;
 use super::{Plugin, TransactionSummary};
 
 pub struct HttpLogging {
     endpoint_url: String,
     authorization_header: Option<String>,
+    http_client: PluginHttpClient,
 }
 
 impl HttpLogging {
-    pub fn new(config: &Value) -> Self {
+    pub fn new(config: &Value, http_client: PluginHttpClient) -> Self {
         Self {
             endpoint_url: config["endpoint_url"].as_str().unwrap_or("").to_string(),
             authorization_header: config["authorization_header"]
                 .as_str()
                 .map(|s| s.to_string()),
+            http_client,
         }
     }
 }
@@ -34,8 +37,11 @@ impl Plugin for HttpLogging {
         if self.endpoint_url.is_empty() {
             return;
         }
-        let client = reqwest::Client::new();
-        let mut req = client.post(&self.endpoint_url).json(summary);
+        let mut req = self
+            .http_client
+            .get()
+            .post(&self.endpoint_url)
+            .json(summary);
         if let Some(ref auth) = self.authorization_header {
             req = req.header("Authorization", auth);
         }

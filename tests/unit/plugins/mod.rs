@@ -11,6 +11,7 @@ mod oauth2_auth_tests;
 mod plugin_cache_tests;
 mod plugin_integration_tests;
 mod rate_limiting_tests;
+mod rejection_logging_tests;
 mod request_transformer_tests;
 mod response_transformer_tests;
 mod stdout_logging_tests;

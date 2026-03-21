@@ -26,7 +26,9 @@ use crate::consumer_index::ConsumerIndex;
 use crate::dns::DnsCache;
 use crate::http3::client::Http3Client;
 use crate::plugin_cache::PluginCache;
-use crate::plugins::{Plugin, PluginResult, RequestContext, TransactionSummary};
+use crate::plugins::{
+    Plugin, PluginResult, RequestContext, TransactionSummary, priority as plugin_priority,
+};
 use crate::router_cache::RouterCache;
 
 use self::grpc_proxy::{GrpcConnectionPool, GrpcProxyError};
@@ -91,11 +93,15 @@ impl ProxyState {
             global_pool_config.clone(),
             env_config.clone(),
         ));
-        let connection_pool = Arc::new(ConnectionPool::new(global_pool_config, env_config));
+        let connection_pool = Arc::new(ConnectionPool::new(global_pool_config.clone(), env_config));
         // Build router cache with pre-sorted route table for fast prefix matching
         let router_cache = Arc::new(RouterCache::new(&config, 10_000));
-        // Pre-resolve plugins per proxy (fixes rate_limiting state persistence bug)
-        let plugin_cache = Arc::new(PluginCache::new(&config));
+        // Pre-resolve plugins per proxy (fixes rate_limiting state persistence bug).
+        // All plugins that make outbound HTTP calls share a pooled client configured
+        // with the gateway's connection pool settings (keepalive, idle timeout, etc.).
+        let plugin_http_client =
+            crate::plugins::PluginHttpClient::from_pool_config(&global_pool_config);
+        let plugin_cache = Arc::new(PluginCache::with_http_client(&config, plugin_http_client));
         // Build credential-indexed consumer lookup for O(1) auth
         let consumer_index = Arc::new(ConsumerIndex::new(&config.consumers));
 
@@ -683,6 +689,60 @@ async fn handle_tls_connection(
     Ok(())
 }
 
+/// Run logging plugins for a rejected request.
+///
+/// When a plugin (auth, access control, rate limiting, etc.) rejects a request,
+/// logging plugins (stdout_logging, http_logging, transaction_debugger) must still
+/// execute so that rejected traffic is visible in log sinks like Splunk, stdout, etc.
+/// Only plugins in the Logging priority band (9000+) are invoked here.
+pub async fn log_rejected_request(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &RequestContext,
+    status_code: u16,
+    start_time: Instant,
+    rejection_phase: &str,
+) {
+    let logging_plugins: Vec<&Arc<dyn Plugin>> = plugins
+        .iter()
+        .filter(|p| p.priority() >= plugin_priority::STDOUT_LOGGING)
+        .collect();
+
+    if logging_plugins.is_empty() {
+        return;
+    }
+
+    let total_ms = start_time.elapsed().as_secs_f64() * 1000.0;
+    let proxy = ctx.matched_proxy.as_ref();
+
+    let mut metadata = ctx.metadata.clone();
+    metadata.insert("rejection_phase".to_string(), rejection_phase.to_string());
+
+    let summary = TransactionSummary {
+        timestamp_received: ctx.timestamp_received.to_rfc3339(),
+        client_ip: ctx.client_ip.clone(),
+        consumer_username: ctx.identified_consumer.as_ref().map(|c| c.username.clone()),
+        http_method: ctx.method.clone(),
+        request_path: ctx.path.clone(),
+        matched_proxy_id: proxy.map(|p| p.id.clone()),
+        matched_proxy_name: proxy.and_then(|p| p.name.clone()),
+        backend_target_url: proxy.map(|p| {
+            let url = build_backend_url(p, &ctx.path, "");
+            strip_query_params(&url)
+        }),
+        response_status_code: status_code,
+        latency_total_ms: total_ms,
+        latency_gateway_processing_ms: total_ms,
+        latency_backend_ttfb_ms: -1.0,
+        latency_backend_total_ms: -1.0,
+        request_user_agent: ctx.headers.get("user-agent").cloned(),
+        metadata,
+    };
+
+    for plugin in &logging_plugins {
+        plugin.log(&summary).await;
+    }
+}
+
 /// Handle a single proxy request.
 pub async fn handle_proxy_request(
     req: Request<Incoming>,
@@ -762,6 +822,14 @@ pub async fn handle_proxy_request(
                 body,
                 headers,
             } => {
+                log_rejected_request(
+                    &plugins,
+                    &ctx,
+                    status_code,
+                    start_time,
+                    "on_request_received",
+                )
+                .await;
                 record_request(&state, status_code);
                 return Ok(build_reject_response(
                     StatusCode::from_u16(status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
@@ -808,6 +876,14 @@ pub async fn handle_proxy_request(
                         body,
                         headers,
                     } => {
+                        log_rejected_request(
+                            &plugins,
+                            &ctx,
+                            status_code,
+                            start_time,
+                            "authenticate",
+                        )
+                        .await;
                         record_request(&state, status_code);
                         return Ok(build_reject_response(
                             StatusCode::from_u16(status_code).unwrap_or(StatusCode::UNAUTHORIZED),
@@ -829,6 +905,7 @@ pub async fn handle_proxy_request(
                 body,
                 headers,
             } => {
+                log_rejected_request(&plugins, &ctx, status_code, start_time, "authorize").await;
                 record_request(&state, status_code);
                 return Ok(build_reject_response(
                     StatusCode::from_u16(status_code).unwrap_or(StatusCode::FORBIDDEN),
@@ -856,6 +933,8 @@ pub async fn handle_proxy_request(
                     body,
                     headers,
                 } => {
+                    log_rejected_request(&plugins, &ctx, status_code, start_time, "before_proxy")
+                        .await;
                     record_request(&state, status_code);
                     return Ok(build_reject_response(
                         StatusCode::from_u16(status_code)
@@ -987,6 +1066,7 @@ pub async fn handle_proxy_request(
                         (grpc_proxy::grpc_status::UNAVAILABLE, m.as_str())
                     }
                 };
+                log_rejected_request(&plugins, &ctx, 200, start_time, "grpc_backend_error").await;
                 record_request(&state, 200); // gRPC errors use HTTP 200
                 return Ok(grpc_proxy::build_grpc_error_response(grpc_code, msg));
             }
