@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::config::types::{GatewayConfig, PluginScope};
-use crate::plugins::{Plugin, create_plugin};
+use crate::plugins::{Plugin, PluginHttpClient, create_plugin_with_http_client};
 
 /// Pre-resolved plugin cache that avoids per-request plugin creation.
 ///
@@ -18,15 +18,33 @@ pub struct PluginCache {
     proxy_plugins: ArcSwap<HashMap<String, Vec<Arc<dyn Plugin>>>>,
     /// Fallback: global plugins only (for proxies with no scoped overrides)
     global_plugins: ArcSwap<Vec<Arc<dyn Plugin>>>,
+    /// Shared HTTP client for plugins that make outbound network calls.
+    http_client: PluginHttpClient,
 }
 
 impl PluginCache {
     /// Build a new plugin cache from the given config.
+    #[allow(dead_code)]
     pub fn new(config: &GatewayConfig) -> Self {
-        let (proxy_map, globals) = Self::build_cache(config);
+        let http_client = PluginHttpClient::default();
+        let (proxy_map, globals) = Self::build_cache(config, &http_client);
         Self {
             proxy_plugins: ArcSwap::new(Arc::new(proxy_map)),
             global_plugins: ArcSwap::new(Arc::new(globals)),
+            http_client,
+        }
+    }
+
+    /// Build a new plugin cache with a shared HTTP client configured from
+    /// the gateway's pool settings. All plugins that make outbound HTTP calls
+    /// (http_logging, future OTel exporters, etc.) share this client for
+    /// connection reuse and keepalive.
+    pub fn with_http_client(config: &GatewayConfig, http_client: PluginHttpClient) -> Self {
+        let (proxy_map, globals) = Self::build_cache(config, &http_client);
+        Self {
+            proxy_plugins: ArcSwap::new(Arc::new(proxy_map)),
+            global_plugins: ArcSwap::new(Arc::new(globals)),
+            http_client,
         }
     }
 
@@ -34,7 +52,7 @@ impl PluginCache {
     /// Old plugin instances (including rate limiter state) are dropped
     /// only after all in-flight requests using them complete.
     pub fn rebuild(&self, config: &GatewayConfig) {
-        let (proxy_map, globals) = Self::build_cache(config);
+        let (proxy_map, globals) = Self::build_cache(config, &self.http_client);
         self.proxy_plugins.store(Arc::new(proxy_map));
         self.global_plugins.store(Arc::new(globals));
     }
@@ -63,6 +81,7 @@ impl PluginCache {
     #[allow(clippy::type_complexity)]
     fn build_cache(
         config: &GatewayConfig,
+        http_client: &PluginHttpClient,
     ) -> (HashMap<String, Vec<Arc<dyn Plugin>>>, Vec<Arc<dyn Plugin>>) {
         // Step 1: Create all enabled global plugins (shared across proxies)
         let mut global_plugins: Vec<Arc<dyn Plugin>> = Vec::new();
@@ -71,7 +90,8 @@ impl PluginCache {
                 continue;
             }
             if pc.scope == PluginScope::Global
-                && let Some(plugin) = create_plugin(&pc.plugin_name, &pc.config)
+                && let Some(plugin) =
+                    create_plugin_with_http_client(&pc.plugin_name, &pc.config, http_client.clone())
             {
                 global_plugins.push(plugin);
             }
@@ -99,7 +119,11 @@ impl PluginCache {
                 if pc.scope == PluginScope::Proxy
                     && pc.proxy_id.as_deref() == Some(&proxy.id)
                     && proxy_plugin_ids.contains(&pc.id.as_str())
-                    && let Some(plugin) = create_plugin(&pc.plugin_name, &pc.config)
+                    && let Some(plugin) = create_plugin_with_http_client(
+                        &pc.plugin_name,
+                        &pc.config,
+                        http_client.clone(),
+                    )
                 {
                     // Remove any global plugin of the same name
                     merged.retain(|p| p.name() != plugin.name());

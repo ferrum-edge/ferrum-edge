@@ -5,11 +5,14 @@ pub mod http_logging;
 pub mod jwt_auth;
 pub mod key_auth;
 pub mod oauth2_auth;
+pub mod plugin_http_client;
 pub mod rate_limiting;
 pub mod request_transformer;
 pub mod response_transformer;
 pub mod stdout_logging;
 pub mod transaction_debugger;
+
+pub use plugin_http_client::PluginHttpClient;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -172,10 +175,34 @@ pub trait Plugin: Send + Sync {
 }
 
 /// Create a plugin instance from its name and configuration.
+///
+/// Uses a default `PluginHttpClient` for plugins that make outbound HTTP calls.
+/// Prefer [`create_plugin_with_http_client`] in production to share the gateway's
+/// pooled client across all plugins for connection reuse and keepalive.
+#[allow(dead_code)]
 pub fn create_plugin(name: &str, config: &Value) -> Option<Arc<dyn Plugin>> {
+    create_plugin_with_http_client(name, config, PluginHttpClient::default())
+}
+
+/// Create a plugin instance with a shared HTTP client for outbound calls.
+///
+/// Plugins that make network calls (http_logging, future OTel exporters, webhooks,
+/// etc.) will use this shared client, which is configured with the gateway's
+/// connection pool settings (keepalive, idle timeout, HTTP/2 multiplexing).
+///
+/// This ensures all plugin outbound traffic gets proper connection reuse instead
+/// of opening a new TCP+TLS connection per call.
+pub fn create_plugin_with_http_client(
+    name: &str,
+    config: &Value,
+    http_client: PluginHttpClient,
+) -> Option<Arc<dyn Plugin>> {
     match name {
         "stdout_logging" => Some(Arc::new(stdout_logging::StdoutLogging::new(config))),
-        "http_logging" => Some(Arc::new(http_logging::HttpLogging::new(config))),
+        "http_logging" => Some(Arc::new(http_logging::HttpLogging::new(
+            config,
+            http_client,
+        ))),
         "transaction_debugger" => Some(Arc::new(transaction_debugger::TransactionDebugger::new(
             config,
         ))),

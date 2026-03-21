@@ -93,11 +93,15 @@ impl ProxyState {
             global_pool_config.clone(),
             env_config.clone(),
         ));
-        let connection_pool = Arc::new(ConnectionPool::new(global_pool_config, env_config));
+        let connection_pool = Arc::new(ConnectionPool::new(global_pool_config.clone(), env_config));
         // Build router cache with pre-sorted route table for fast prefix matching
         let router_cache = Arc::new(RouterCache::new(&config, 10_000));
-        // Pre-resolve plugins per proxy (fixes rate_limiting state persistence bug)
-        let plugin_cache = Arc::new(PluginCache::new(&config));
+        // Pre-resolve plugins per proxy (fixes rate_limiting state persistence bug).
+        // All plugins that make outbound HTTP calls share a pooled client configured
+        // with the gateway's connection pool settings (keepalive, idle timeout, etc.).
+        let plugin_http_client =
+            crate::plugins::PluginHttpClient::from_pool_config(&global_pool_config);
+        let plugin_cache = Arc::new(PluginCache::with_http_client(&config, plugin_http_client));
         // Build credential-indexed consumer lookup for O(1) auth
         let consumer_index = Arc::new(ConsumerIndex::new(&config.consumers));
 
