@@ -1,0 +1,73 @@
+{
+  "_comment": "Performance baseline for CI regression detection. Auto-updated on main branch merges. To regenerate locally: cd tests/performance && ./ci_perf_test.sh --save-baseline",
+  "timestamp": "2026-03-20T00:00:00+00:00",
+  "tests": {
+    "health": {
+      "rps": 15000,
+      "latency_avg_us": 3000,
+      "latency_stdev_us": 1500,
+      "latency_max_us": 50000,
+      "latency_avg_display": "3.00ms",
+      "latency_max_display": "50.00ms",
+      "percentiles": {
+        "p50_us": 2000,
+        "p50_display": "2.00ms",
+        "p75_us": 3500,
+        "p75_display": "3.50ms",
+        "p90_us": 5000,
+        "p90_display": "5.00ms",
+        "p99_us": 15000,
+        "p99_display": "15.00ms"
+      },
+      "total_requests": 150000,
+      "errors": {"connect": 0, "read": 0, "write": 0, "timeout": 0},
+      "non_2xx_responses": 0
+    },
+    "users": {
+      "rps": 12000,
+      "latency_avg_us": 4000,
+      "latency_stdev_us": 2000,
+      "latency_max_us": 60000,
+      "latency_avg_display": "4.00ms",
+      "latency_max_display": "60.00ms",
+      "percentiles": {
+        "p50_us": 3000,
+        "p50_display": "3.00ms",
+        "p75_us": 5000,
+        "p75_display": "5.00ms",
+        "p90_us": 7000,
+        "p90_display": "7.00ms",
+        "p99_us": 20000,
+        "p99_display": "20.00ms"
+      },
+      "total_requests": 120000,
+      "errors": {"connect": 0, "read": 0, "write": 0, "timeout": 0},
+      "non_2xx_responses": 0
+    },
+    "backend_baseline": {
+      "rps": 18000,
+      "latency_avg_us": 2500,
+      "latency_stdev_us": 1000,
+      "latency_max_us": 30000,
+      "latency_avg_display": "2.50ms",
+      "latency_max_display": "30.00ms",
+      "percentiles": {
+        "p50_us": 1800,
+        "p50_display": "1.80ms",
+        "p75_us": 3000,
+        "p75_display": "3.00ms",
+        "p90_us": 4500,
+        "p90_display": "4.50ms",
+        "p99_us": 12000,
+        "p99_display": "12.00ms"
+      },
+      "total_requests": 180000,
+      "errors": {"connect": 0, "read": 0, "write": 0, "timeout": 0},
+      "non_2xx_responses": 0
+    }
+  },
+  "overhead": {
+    "rps_reduction_pct": 8.5,
+    "latency_added_us": 1500
+  }
+}

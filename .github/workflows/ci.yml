@@ -9,8 +9,8 @@ on:
       - main
 
 jobs:
-  test:
-    name: Test
+  unit-test:
+    name: Unit Tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -49,10 +49,63 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler
 
-      - name: Run tests
-        run: cargo test --verbose --all-features
+      - name: Run unit tests
+        run: cargo test --lib --verbose --all-features
         env:
           RUST_BACKTRACE: 1
+
+  functional-test:
+    name: Functional Tests
+    runs-on: ubuntu-latest
+    needs: [unit-test]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-
+
+      - name: Cache cargo index
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-git-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-git-
+
+      - name: Cache cargo build
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-build-target-
+
+      - name: Install protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - name: Run functional/integration tests
+        run: cargo test --tests --verbose --all-features
+        env:
+          RUST_BACKTRACE: 1
+
+      - name: Summarize test results
+        if: always()
+        run: |
+          echo "## Functional Test Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "All integration and functional tests from \`tests/\` directory executed." >> $GITHUB_STEP_SUMMARY
 
   lint:
     name: Lint
@@ -88,6 +141,190 @@ jobs:
 
       - name: Check formatting
         run: cargo fmt --all -- --check
+
+  performance-regression:
+    name: Performance Regression Check
+    runs-on: ubuntu-latest
+    needs: [functional-test]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-
+
+      - name: Cache cargo build
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-build-target-
+
+      - name: Install protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - name: Install wrk
+        run: sudo apt-get install -y wrk
+
+      - name: Restore performance baseline cache
+        id: perf-cache
+        uses: actions/cache@v4
+        with:
+          path: tests/performance/cached_baseline.json
+          key: perf-baseline-${{ github.base_ref || 'main' }}-${{ hashFiles('src/**/*.rs', 'Cargo.lock') }}
+          restore-keys: |
+            perf-baseline-${{ github.base_ref || 'main' }}-
+            perf-baseline-main-
+
+      - name: Build release binaries
+        run: |
+          cargo build --release --bin ferrum-gateway
+          cd tests/performance && cargo build --release --bin backend_server
+
+      - name: Start backend server
+        run: |
+          tests/performance/target/release/backend_server > /tmp/backend.log 2>&1 &
+          echo "BACKEND_PID=$!" >> $GITHUB_ENV
+          for i in $(seq 1 15); do
+            if curl -sf http://127.0.0.1:3001/health > /dev/null 2>&1; then
+              echo "Backend ready"
+              break
+            fi
+            if [ "$i" -eq 15 ]; then
+              echo "Backend failed to start"
+              cat /tmp/backend.log
+              exit 1
+            fi
+            sleep 1
+          done
+
+      - name: Start gateway
+        run: |
+          FERRUM_MODE=file \
+          FERRUM_FILE_CONFIG_PATH="$(pwd)/tests/performance/perf_config.yaml" \
+          FERRUM_POOL_MAX_IDLE_PER_HOST=200 \
+          FERRUM_POOL_IDLE_TIMEOUT_SECONDS=120 \
+          FERRUM_POOL_ENABLE_HTTP_KEEP_ALIVE=true \
+          FERRUM_POOL_ENABLE_HTTP2=false \
+          ./target/release/ferrum-gateway > /tmp/gateway.log 2>&1 &
+          echo "GATEWAY_PID=$!" >> $GITHUB_ENV
+          for i in $(seq 1 15); do
+            if curl -sf http://127.0.0.1:8000/health > /dev/null 2>&1; then
+              echo "Gateway ready"
+              break
+            fi
+            if [ "$i" -eq 15 ]; then
+              echo "Gateway failed to start"
+              cat /tmp/gateway.log
+              exit 1
+            fi
+            sleep 1
+          done
+
+      - name: Run performance tests
+        run: |
+          RESULTS_DIR="tests/performance/ci_results"
+          mkdir -p "$RESULTS_DIR"
+
+          echo "Running health check test..."
+          wrk -t4 -c50 -d10s --latency \
+            -s tests/performance/health_test.lua \
+            http://127.0.0.1:8000/health \
+            > "$RESULTS_DIR/health_raw.txt" 2>&1
+
+          echo "Running users API test..."
+          wrk -t4 -c50 -d10s --latency \
+            -s tests/performance/users_test.lua \
+            http://127.0.0.1:8000/api/users \
+            > "$RESULTS_DIR/users_raw.txt" 2>&1
+
+          echo "Running direct backend baseline..."
+          wrk -t4 -c50 -d10s --latency \
+            -s tests/performance/backend_test.lua \
+            http://127.0.0.1:3001/api/users \
+            > "$RESULTS_DIR/backend_raw.txt" 2>&1
+
+          echo "Parsing results..."
+          python3 tests/performance/parse_wrk_results.py \
+            --health "$RESULTS_DIR/health_raw.txt" \
+            --users "$RESULTS_DIR/users_raw.txt" \
+            --backend "$RESULTS_DIR/backend_raw.txt" \
+            --output "$RESULTS_DIR/results.json"
+
+      - name: Stop services
+        if: always()
+        run: |
+          kill $BACKEND_PID 2>/dev/null || true
+          kill $GATEWAY_PID 2>/dev/null || true
+
+      - name: Select baseline for comparison
+        id: select-baseline
+        run: |
+          # Prefer cached baseline from previous main branch run,
+          # fall back to the committed baseline.json
+          if [ -f tests/performance/cached_baseline.json ]; then
+            echo "Using cached baseline from previous main branch run"
+            echo "baseline_path=tests/performance/cached_baseline.json" >> $GITHUB_OUTPUT
+          else
+            echo "Using committed baseline.json"
+            echo "baseline_path=tests/performance/baseline.json" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Compare against baseline
+        run: |
+          python3 tests/performance/compare_baselines.py \
+            --baseline "${{ steps.select-baseline.outputs.baseline_path }}" \
+            --current tests/performance/ci_results/results.json
+
+      - name: Update cached baseline (main branch only)
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        run: |
+          cp tests/performance/ci_results/results.json tests/performance/cached_baseline.json
+
+      - name: Save performance baseline cache
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        uses: actions/cache/save@v4
+        with:
+          path: tests/performance/cached_baseline.json
+          key: perf-baseline-main-${{ hashFiles('src/**/*.rs', 'Cargo.lock') }}
+
+      - name: Upload performance results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: performance-results
+          path: |
+            tests/performance/ci_results/results.json
+            tests/performance/ci_results/*_raw.txt
+          retention-days: 30
+
+      - name: Post performance summary
+        if: always()
+        run: |
+          echo "## Performance Regression Check" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ -f tests/performance/ci_results/results.json ]; then
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            python3 tests/performance/compare_baselines.py \
+              --baseline "${{ steps.select-baseline.outputs.baseline_path }}" \
+              --current tests/performance/ci_results/results.json \
+              >> $GITHUB_STEP_SUMMARY 2>&1 || true
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          else
+            echo "Performance tests did not produce results." >> $GITHUB_STEP_SUMMARY
+          fi
 
   # TODO: Enable build-release and docker-build jobs when the project is mature
   # build-release:
