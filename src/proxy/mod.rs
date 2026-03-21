@@ -1222,7 +1222,7 @@ pub async fn handle_proxy_request(
         {
             state
                 .health_checker
-                .report_response(target, response_status, hc.passive.as_ref());
+                .report_response(target, response_status, backend_resp.connection_error, hc.passive.as_ref());
         }
     }
 

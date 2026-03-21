@@ -296,12 +296,16 @@ upstreams:
 **How it works:**
 
 1. After each proxied request, the response status code is reported to the health checker.
-2. If the status code is in `unhealthy_status_codes`, a failure is recorded with a timestamp.
+2. A failure is recorded (with a timestamp) when **either** condition is true:
+   - The status code is in `unhealthy_status_codes` (e.g., backend returned 500)
+   - The request was a **connection error** — TCP connection refused, read timeout, DNS resolution failure, or TLS handshake error. These always count as failures regardless of `unhealthy_status_codes`.
 3. Old failures outside the `unhealthy_window_seconds` window are cleaned up.
 4. If the number of failures within the window reaches `unhealthy_threshold`, the target is marked **unhealthy**.
 5. Recovery happens via two mechanisms:
    - **Automatic recovery timer**: After `healthy_after_seconds`, the target is automatically restored to the rotation with a clean slate — similar to a circuit breaker's half-open state. If it immediately fails again, passive checks will re-mark it unhealthy.
    - **On-success recovery**: If a request to the target succeeds (e.g., via the all-unhealthy fallback path), it is immediately restored.
+
+> **Connection errors vs. status codes:** Connection-level failures (TCP refused, timeout, DNS failure) are **always** counted as passive health check failures, even if you customize `unhealthy_status_codes`. You don't need to add 502 to your list to catch connection failures — they are handled separately.
 
 > **Why `healthy_after_seconds` matters:** Without it (or with active health checks disabled), passively-marked unhealthy targets can only recover via the all-unhealthy fallback path — and if even one target remains healthy, the unhealthy targets never receive traffic and can never recover. The automatic recovery timer prevents this "stuck unhealthy" scenario.
 
