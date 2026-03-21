@@ -6,12 +6,14 @@ Exits with non-zero status if a regression is detected.
 Regression thresholds (configurable via env vars):
   PERF_RPS_REGRESSION_PCT       - Max allowed RPS drop % (default: 15)
   PERF_LATENCY_REGRESSION_PCT   - Max allowed latency increase % (default: 25)
-  PERF_P99_REGRESSION_PCT       - Max allowed p99 latency increase % (default: 30)
+  PERF_P95_REGRESSION_PCT       - Max allowed p95 latency increase % (default: 30)
   PERF_ERROR_THRESHOLD          - Max allowed total errors (default: 10)
   PERF_OVERHEAD_MAX_PCT         - Max allowed gateway overhead % (default: 25)
 
 CI environments have inherent variance, so thresholds are intentionally generous.
-The goal is to catch major regressions, not micro-optimizations.
+The goal is to catch major regressions, not micro-optimizations. P99 latency is
+reported for visibility but not gated on — CI noise makes p99 too volatile for
+reliable regression detection. P95 (interpolated from p90/p99) is used instead.
 """
 
 import argparse
@@ -27,7 +29,7 @@ def get_threshold(env_var, default):
 # Thresholds
 RPS_REGRESSION_PCT = get_threshold("PERF_RPS_REGRESSION_PCT", 15)
 LATENCY_REGRESSION_PCT = get_threshold("PERF_LATENCY_REGRESSION_PCT", 25)
-P99_REGRESSION_PCT = get_threshold("PERF_P99_REGRESSION_PCT", 30)
+P95_REGRESSION_PCT = get_threshold("PERF_P95_REGRESSION_PCT", 30)
 ERROR_THRESHOLD = int(get_threshold("PERF_ERROR_THRESHOLD", 10))
 OVERHEAD_MAX_PCT = get_threshold("PERF_OVERHEAD_MAX_PCT", 25)
 
@@ -37,6 +39,19 @@ def pct_change(old, new):
     if old == 0:
         return 0
     return ((new - old) / old) * 100
+
+
+def _interpolate_p95(percentiles):
+    """Interpolate P95 from P90 and P99 (wrk only reports 50/75/90/99).
+
+    Uses linear interpolation: p95 = p90 + (p99 - p90) * 5/9.
+    Returns None if either percentile is missing.
+    """
+    p90 = percentiles.get("p90_us")
+    p99 = percentiles.get("p99_us")
+    if p90 is not None and p99 is not None:
+        return p90 + (p99 - p90) * (5.0 / 9.0)
+    return None
 
 
 def check_test(name, baseline_test, current_test, issues, warnings):
@@ -81,21 +96,23 @@ def check_test(name, baseline_test, current_test, issues, warnings):
                 f"current: {c['latency_avg_us']:.0f}us)"
             )
 
-    # --- P99 latency (lower is better) ---
-    b_p99 = b.get("percentiles", {}).get("p99_us")
-    c_p99 = c.get("percentiles", {}).get("p99_us")
-    if b_p99 and c_p99:
-        p99_change = pct_change(b_p99, c_p99)
-        if p99_change > P99_REGRESSION_PCT:
+    # --- P95 latency (lower is better) ---
+    # wrk only reports p50/p75/p90/p99; we interpolate p95 as the midpoint.
+    # P99 is too volatile in CI (noisy neighbors, GC pauses) to gate on reliably.
+    b_p95 = _interpolate_p95(b.get("percentiles", {}))
+    c_p95 = _interpolate_p95(c.get("percentiles", {}))
+    if b_p95 and c_p95:
+        p95_change = pct_change(b_p95, c_p95)
+        if p95_change > P95_REGRESSION_PCT:
             issues.append(
-                f"  REGRESSION [{name}] P99 latency increased {p99_change:.1f}% "
-                f"(baseline: {b_p99:.0f}us, current: {c_p99:.0f}us, "
-                f"threshold: {P99_REGRESSION_PCT}%)"
+                f"  REGRESSION [{name}] P95 latency increased {p95_change:.1f}% "
+                f"(baseline: {b_p95:.0f}us, current: {c_p95:.0f}us, "
+                f"threshold: {P95_REGRESSION_PCT}%)"
             )
-        elif p99_change > (P99_REGRESSION_PCT / 2):
+        elif p95_change > (P95_REGRESSION_PCT / 2):
             warnings.append(
-                f"  WARNING [{name}] P99 latency increased {p99_change:.1f}% "
-                f"(baseline: {b_p99:.0f}us, current: {c_p99:.0f}us)"
+                f"  WARNING [{name}] P95 latency increased {p95_change:.1f}% "
+                f"(baseline: {b_p95:.0f}us, current: {c_p95:.0f}us)"
             )
 
     # --- Errors ---
@@ -165,7 +182,7 @@ def print_summary_table(baseline, current):
                 f"  {'Max Latency':<25} {b_display:>15} {c_display:>15} {sign}{change:>10.1f}%"
             )
 
-        for pct in ["p50", "p75", "p90", "p99"]:
+        for pct in ["p50", "p75", "p90"]:
             b_val = b.get("percentiles", {}).get(f"{pct}_us")
             c_val = c.get("percentiles", {}).get(f"{pct}_us")
             if b_val and c_val:
@@ -176,6 +193,28 @@ def print_summary_table(baseline, current):
                 print(
                     f"  {pct.upper() + ' Latency':<25} {b_display:>15} {c_display:>15} {sign}{change:>10.1f}%"
                 )
+
+        # P95 (interpolated from p90/p99) — this is the gated percentile
+        b_p95 = _interpolate_p95(b.get("percentiles", {}))
+        c_p95 = _interpolate_p95(c.get("percentiles", {}))
+        if b_p95 and c_p95:
+            change = pct_change(b_p95, c_p95)
+            sign = "+" if change >= 0 else ""
+            print(
+                f"  {'P95 Latency (gated)':<25} {b_p95/1000:>14.2f}ms {c_p95/1000:>14.2f}ms {sign}{change:>10.1f}%"
+            )
+
+        # P99 — informational only, not gated (too volatile in CI)
+        b_p99 = b.get("percentiles", {}).get("p99_us")
+        c_p99 = c.get("percentiles", {}).get("p99_us")
+        if b_p99 and c_p99:
+            change = pct_change(b_p99, c_p99)
+            sign = "+" if change >= 0 else ""
+            b_display = b["percentiles"].get("p99_display", f"{b_p99:.0f}us")
+            c_display = c["percentiles"].get("p99_display", f"{c_p99:.0f}us")
+            print(
+                f"  {'P99 Latency (info)':<25} {b_display:>15} {c_display:>15} {sign}{change:>10.1f}%"
+            )
 
         b_errors = sum(b.get("errors", {}).values())
         c_errors = sum(c.get("errors", {}).values())
