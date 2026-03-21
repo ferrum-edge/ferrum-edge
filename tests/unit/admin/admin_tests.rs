@@ -48,6 +48,7 @@ fn create_test_admin_state(config: &TestConfig) -> AdminState {
     AdminState {
         db: None,
         jwt_manager: create_test_jwt_manager(config),
+        cached_config: None,
         proxy_state: None,
         mode: "test".to_string(),
         read_only: false, // Default to read-write for existing tests

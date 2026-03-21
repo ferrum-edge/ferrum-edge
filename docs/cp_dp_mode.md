@@ -65,9 +65,14 @@ All gRPC calls are authenticated with JWT HS256 tokens:
 
 ### Resilience
 
+The CP/DP architecture is designed so that data source outages are invisible to API consumers:
+
 - **Auto-reconnect**: If the CP connection drops, the DP retries every 5 seconds
-- **Cached config**: DPs continue serving traffic with their last known config during CP outages
+- **Cached config**: DPs continue serving traffic with their last known config indefinitely during CP outages
 - **Connect timeout**: DP uses a 10-second connect timeout per attempt
+- **CP database outage**: If the CP's database goes offline, the CP continues serving its cached config to DPs via gRPC. It does not broadcast stale updates — DPs simply retain their last known config. When the database recovers, the next poll picks up any changes and broadcasts them.
+- **Admin API fallback**: Both CP and DP admin API read endpoints fall back to the in-memory cached config when the database is unavailable. Responses served from cache include an `X-Data-Source: cached` header. Write operations require a live database and return `503` if unavailable.
+- **Health visibility**: The `/health` endpoint reports `cached_config` status (available, loaded_at, proxy/consumer counts) so operators can see whether the node is running on cached data.
 
 ## Environment Variables
 
@@ -136,5 +141,7 @@ FERRUM_PROXY_HTTPS_PORT=8443 \
 
 The Data Plane exposes a read-only Admin API for monitoring:
 - All write operations (create/update/delete proxies, consumers, plugins) return `403 Forbidden`
-- Read operations (list proxies, view config, health checks) work normally
-- The admin API reflects the DP's currently cached config from the CP
+- Read operations (list proxies, consumers, plugin configs, health checks) are served from the DP's in-memory cached config
+- Responses include `X-Data-Source: cached` header to indicate the data comes from the cache rather than a live database
+- The `/health` endpoint includes `cached_config` details (availability, loaded_at, proxy/consumer counts)
+- The admin API always reflects the DP's currently cached config received from the CP

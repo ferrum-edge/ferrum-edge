@@ -55,6 +55,7 @@ pub async fn run(
     let admin_state = AdminState {
         db: Some(db.clone()),
         jwt_manager,
+        cached_config: Some(config_arc.clone()),
         proxy_state: None,
         mode: "cp".into(),
         read_only: env_config.admin_read_only,
@@ -82,6 +83,7 @@ pub async fn run(
             db: Some(db.clone()),
             jwt_manager: create_jwt_manager_from_env()
                 .map_err(|e| anyhow::anyhow!("Failed to create JWT manager: {}", e))?,
+            cached_config: Some(config_arc.clone()),
             proxy_state: None,
             mode: "cp".into(),
             read_only: env_config.admin_read_only,

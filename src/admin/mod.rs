@@ -23,9 +23,10 @@ use uuid::Uuid;
 
 use crate::admin::jwt_auth::{JwtError, JwtManager};
 use crate::config::db_loader::DatabaseStore;
-use crate::config::types::{Consumer, PluginConfig, Proxy};
+use crate::config::types::{Consumer, GatewayConfig, PluginConfig, Proxy};
 use crate::plugins;
 use crate::proxy::ProxyState;
+use arc_swap::ArcSwap;
 
 /// Admin API state.
 #[derive(Clone)]
@@ -33,8 +34,18 @@ pub struct AdminState {
     pub db: Option<Arc<DatabaseStore>>,
     pub jwt_manager: JwtManager,
     pub proxy_state: Option<ProxyState>,
+    /// In-memory cached config for resilient reads when DB is unavailable.
+    /// Falls back to this when database queries fail or no DB is configured.
+    pub cached_config: Option<Arc<ArcSwap<GatewayConfig>>>,
     pub mode: String,
     pub read_only: bool,
+}
+
+impl AdminState {
+    /// Get the current cached config if available.
+    fn cached_gateway_config(&self) -> Option<Arc<GatewayConfig>> {
+        self.cached_config.as_ref().map(|c| c.load_full())
+    }
 }
 
 /// Start the Admin API listener with dual-path handling.
@@ -192,6 +203,20 @@ pub async fn handle_admin_request(
             }
         }
 
+        // Report cached config availability for resilience visibility
+        if let Some(config) = state.cached_gateway_config() {
+            health_status["cached_config"] = json!({
+                "available": true,
+                "loaded_at": config.loaded_at.to_rfc3339(),
+                "proxy_count": config.proxies.len(),
+                "consumer_count": config.consumers.len(),
+            });
+        } else {
+            health_status["cached_config"] = json!({
+                "available": false
+            });
+        }
+
         return Ok(json_response(StatusCode::OK, &health_status));
     }
 
@@ -307,18 +332,29 @@ pub async fn handle_admin_request(
 // ---- Proxy CRUD ----
 
 async fn handle_list_proxies(state: &AdminState) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    // Try database first, fall back to cached config for resilience
     if let Some(ref db) = state.db {
         match db.load_full_config().await {
-            Ok(config) => Ok(json_response(StatusCode::OK, &json!(config.proxies))),
-            Err(e) => Ok(json_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                &json!({"error": format!("Database error: {}", e)}),
-            )),
+            Ok(config) => return Ok(json_response(StatusCode::OK, &json!(config.proxies))),
+            Err(e) => {
+                warn!(
+                    "Database unavailable for list proxies, falling back to cached config: {}",
+                    e
+                );
+            }
         }
+    }
+
+    // Fallback: serve from in-memory cached config
+    if let Some(config) = state.cached_gateway_config() {
+        Ok(json_response_with_stale(
+            StatusCode::OK,
+            &json!(config.proxies),
+        ))
     } else {
         Ok(json_response(
             StatusCode::SERVICE_UNAVAILABLE,
-            &json!({"error": "No database configured"}),
+            &json!({"error": "No database and no cached config available"}),
         ))
     }
 }
@@ -391,26 +427,39 @@ async fn handle_get_proxy(
     state: &AdminState,
     id: &str,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
-    let db = match &state.db {
-        Some(db) => db,
-        None => {
-            return Ok(json_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                &json!({"error": "No database"}),
-            ));
+    // Try database first
+    if let Some(ref db) = state.db {
+        match db.get_proxy(id).await {
+            Ok(Some(proxy)) => return Ok(json_response(StatusCode::OK, &json!(proxy))),
+            Ok(None) => {
+                return Ok(json_response(
+                    StatusCode::NOT_FOUND,
+                    &json!({"error": "Proxy not found"}),
+                ));
+            }
+            Err(e) => {
+                warn!(
+                    "Database unavailable for get proxy, falling back to cached config: {}",
+                    e
+                );
+            }
         }
-    };
+    }
 
-    match db.get_proxy(id).await {
-        Ok(Some(proxy)) => Ok(json_response(StatusCode::OK, &json!(proxy))),
-        Ok(None) => Ok(json_response(
-            StatusCode::NOT_FOUND,
-            &json!({"error": "Proxy not found"}),
-        )),
-        Err(e) => Ok(json_response(
+    // Fallback: search in cached config
+    if let Some(config) = state.cached_gateway_config() {
+        match config.proxies.iter().find(|p| p.id == id) {
+            Some(proxy) => Ok(json_response_with_stale(StatusCode::OK, &json!(proxy))),
+            None => Ok(json_response(
+                StatusCode::NOT_FOUND,
+                &json!({"error": "Proxy not found"}),
+            )),
+        }
+    } else {
+        Ok(json_response(
             StatusCode::SERVICE_UNAVAILABLE,
-            &json!({"error": format!("{}", e)}),
-        )),
+            &json!({"error": "No database and no cached config available"}),
+        ))
     }
 }
 
@@ -517,22 +566,30 @@ async fn handle_delete_proxy(
 // ---- Consumer CRUD ----
 
 async fn handle_list_consumers(state: &AdminState) -> Result<Response<Full<Bytes>>, hyper::Error> {
-    let db = match &state.db {
-        Some(db) => db,
-        None => {
-            return Ok(json_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                &json!({"error": "No database"}),
-            ));
+    // Try database first, fall back to cached config for resilience
+    if let Some(ref db) = state.db {
+        match db.load_full_config().await {
+            Ok(config) => return Ok(json_response(StatusCode::OK, &json!(config.consumers))),
+            Err(e) => {
+                warn!(
+                    "Database unavailable for list consumers, falling back to cached config: {}",
+                    e
+                );
+            }
         }
-    };
+    }
 
-    match db.load_full_config().await {
-        Ok(config) => Ok(json_response(StatusCode::OK, &json!(config.consumers))),
-        Err(e) => Ok(json_response(
+    // Fallback: serve from in-memory cached config
+    if let Some(config) = state.cached_gateway_config() {
+        Ok(json_response_with_stale(
+            StatusCode::OK,
+            &json!(config.consumers),
+        ))
+    } else {
+        Ok(json_response(
             StatusCode::SERVICE_UNAVAILABLE,
-            &json!({"error": format!("{}", e)}),
-        )),
+            &json!({"error": "No database and no cached config available"}),
+        ))
     }
 }
 
@@ -590,26 +647,39 @@ async fn handle_get_consumer(
     state: &AdminState,
     id: &str,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
-    let db = match &state.db {
-        Some(db) => db,
-        None => {
-            return Ok(json_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                &json!({"error": "No database"}),
-            ));
+    // Try database first
+    if let Some(ref db) = state.db {
+        match db.get_consumer(id).await {
+            Ok(Some(c)) => return Ok(json_response(StatusCode::OK, &json!(c))),
+            Ok(None) => {
+                return Ok(json_response(
+                    StatusCode::NOT_FOUND,
+                    &json!({"error": "Consumer not found"}),
+                ));
+            }
+            Err(e) => {
+                warn!(
+                    "Database unavailable for get consumer, falling back to cached config: {}",
+                    e
+                );
+            }
         }
-    };
+    }
 
-    match db.get_consumer(id).await {
-        Ok(Some(c)) => Ok(json_response(StatusCode::OK, &json!(c))),
-        Ok(None) => Ok(json_response(
-            StatusCode::NOT_FOUND,
-            &json!({"error": "Consumer not found"}),
-        )),
-        Err(e) => Ok(json_response(
+    // Fallback: search in cached config
+    if let Some(config) = state.cached_gateway_config() {
+        match config.consumers.iter().find(|c| c.id == id) {
+            Some(consumer) => Ok(json_response_with_stale(StatusCode::OK, &json!(consumer))),
+            None => Ok(json_response(
+                StatusCode::NOT_FOUND,
+                &json!({"error": "Consumer not found"}),
+            )),
+        }
+    } else {
+        Ok(json_response(
             StatusCode::SERVICE_UNAVAILABLE,
-            &json!({"error": format!("{}", e)}),
-        )),
+            &json!({"error": "No database and no cached config available"}),
+        ))
     }
 }
 
@@ -807,22 +877,30 @@ async fn handle_list_plugin_types() -> Result<Response<Full<Bytes>>, hyper::Erro
 async fn handle_list_plugin_configs(
     state: &AdminState,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
-    let db = match &state.db {
-        Some(db) => db,
-        None => {
-            return Ok(json_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                &json!({"error": "No database"}),
-            ));
+    // Try database first, fall back to cached config for resilience
+    if let Some(ref db) = state.db {
+        match db.load_full_config().await {
+            Ok(config) => return Ok(json_response(StatusCode::OK, &json!(config.plugin_configs))),
+            Err(e) => {
+                warn!(
+                    "Database unavailable for list plugin configs, falling back to cached config: {}",
+                    e
+                );
+            }
         }
-    };
+    }
 
-    match db.load_full_config().await {
-        Ok(config) => Ok(json_response(StatusCode::OK, &json!(config.plugin_configs))),
-        Err(e) => Ok(json_response(
+    // Fallback: serve from in-memory cached config
+    if let Some(config) = state.cached_gateway_config() {
+        Ok(json_response_with_stale(
+            StatusCode::OK,
+            &json!(config.plugin_configs),
+        ))
+    } else {
+        Ok(json_response(
             StatusCode::SERVICE_UNAVAILABLE,
-            &json!({"error": format!("{}", e)}),
-        )),
+            &json!({"error": "No database and no cached config available"}),
+        ))
     }
 }
 
@@ -877,26 +955,39 @@ async fn handle_get_plugin_config(
     state: &AdminState,
     id: &str,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
-    let db = match &state.db {
-        Some(db) => db,
-        None => {
-            return Ok(json_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                &json!({"error": "No database"}),
-            ));
+    // Try database first
+    if let Some(ref db) = state.db {
+        match db.get_plugin_config(id).await {
+            Ok(Some(pc)) => return Ok(json_response(StatusCode::OK, &json!(pc))),
+            Ok(None) => {
+                return Ok(json_response(
+                    StatusCode::NOT_FOUND,
+                    &json!({"error": "Plugin config not found"}),
+                ));
+            }
+            Err(e) => {
+                warn!(
+                    "Database unavailable for get plugin config, falling back to cached config: {}",
+                    e
+                );
+            }
         }
-    };
+    }
 
-    match db.get_plugin_config(id).await {
-        Ok(Some(pc)) => Ok(json_response(StatusCode::OK, &json!(pc))),
-        Ok(None) => Ok(json_response(
-            StatusCode::NOT_FOUND,
-            &json!({"error": "Plugin config not found"}),
-        )),
-        Err(e) => Ok(json_response(
+    // Fallback: search in cached config
+    if let Some(config) = state.cached_gateway_config() {
+        match config.plugin_configs.iter().find(|pc| pc.id == id) {
+            Some(pc) => Ok(json_response_with_stale(StatusCode::OK, &json!(pc))),
+            None => Ok(json_response(
+                StatusCode::NOT_FOUND,
+                &json!({"error": "Plugin config not found"}),
+            )),
+        }
+    } else {
+        Ok(json_response(
             StatusCode::SERVICE_UNAVAILABLE,
-            &json!({"error": format!("{}", e)}),
-        )),
+            &json!({"error": "No database and no cached config available"}),
+        ))
     }
 }
 
@@ -1034,6 +1125,17 @@ fn json_response(status: StatusCode, body: &Value) -> Response<Full<Bytes>> {
     Response::builder()
         .status(status)
         .header("Content-Type", "application/json")
+        .body(Full::new(Bytes::from(body_str)))
+        .unwrap()
+}
+
+/// JSON response with X-Data-Source: cached header to indicate stale/cached data.
+fn json_response_with_stale(status: StatusCode, body: &Value) -> Response<Full<Bytes>> {
+    let body_str = serde_json::to_string(body).unwrap_or_else(|_| "{}".into());
+    Response::builder()
+        .status(status)
+        .header("Content-Type", "application/json")
+        .header("X-Data-Source", "cached")
         .body(Full::new(Bytes::from(body_str)))
         .unwrap()
 }

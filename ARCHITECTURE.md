@@ -198,10 +198,10 @@ Separate HTTP and HTTPS listeners for the Admin API with enhanced TLS support:
 - **Admin No-Verify**: `FERRUM_ADMIN_TLS_NO_VERIFY` for testing
 
 **Operating Mode Support**:
-- **Database Mode**: Full admin API with HTTP/HTTPS/mTLS
-- **Control Plane Mode**: Full admin API with HTTP/HTTPS/mTLS
+- **Database Mode**: Full admin API with HTTP/HTTPS/mTLS (reads fall back to cached config if DB is offline)
+- **Control Plane Mode**: Full admin API with HTTP/HTTPS/mTLS (reads fall back to cached config if DB is offline)
 - **File Mode**: No admin API (proxy only)
-- **Data Plane Mode**: No admin API (proxy only)
+- **Data Plane Mode**: Read-only admin API served from cached config (writes return 403)
 
 ### **4. Connection Pool (`src/connection_pool.rs`)**
 
@@ -270,8 +270,35 @@ Four distinct operating modes for different deployment scenarios:
 #### **Data Plane Mode (`data_plane.rs`)**
 - Proxy traffic only
 - gRPC configuration from Control Plane
-- No database or Admin API
+- Read-only Admin API served from cached config
 - **Use Case**: Scalable traffic processing
+
+### **6.1 Data Source Resiliency**
+
+The gateway is designed to continue operating indefinitely when its data source becomes unavailable. Configuration is loaded into memory once and all request-path operations use the in-memory cache — no per-request database or file access.
+
+#### **How It Works**
+
+All modes store the active configuration in an `ArcSwap<GatewayConfig>` — a lock-free, atomically-swappable smart pointer. Every proxy request reads from this in-memory cache, never from the data source directly. Background tasks periodically attempt to refresh the config from the source, but failures only produce a log warning and never affect request handling.
+
+#### **Failure Behavior by Mode**
+
+| Mode | Data Source | On Source Failure |
+|------|------------|-------------------|
+| **File** | YAML/JSON file | Config loaded once at startup. File can be deleted/corrupted afterward with zero impact. SIGHUP reload gracefully falls back to previous config on parse errors. |
+| **Database** | SQL database | Polling loop logs a warning and continues with cached config. Gateway serves traffic indefinitely with stale config until DB recovers. |
+| **Control Plane** | SQL database | Polling loop logs a warning. Does not broadcast stale updates to Data Planes. DPs retain their last known config. Admin API reads fall back to the in-memory cached config. |
+| **Data Plane** | Control Plane (gRPC) | Auto-reconnects to CP every 5 seconds. Continues serving traffic with cached config. Admin API reads served from cached config with `X-Data-Source: cached` header. |
+
+#### **Admin API Resilience**
+
+Admin API read endpoints (GET proxies, consumers, plugin configs) use a two-tier strategy:
+1. **Primary**: Query the database for fresh data
+2. **Fallback**: If the database is unavailable (or not configured, as in DP mode), serve from the in-memory cached config
+
+Fallback responses include an `X-Data-Source: cached` header so callers can detect stale data. Write operations (POST/PUT/DELETE) require a live database and will return `503 Service Unavailable` if the database is offline — there is no way to safely write without a data store.
+
+The `/health` endpoint reports `cached_config` status including availability, `loaded_at` timestamp, and proxy/consumer counts, providing operational visibility during outages.
 
 ### **7. DNS System (`src/dns/`)**
 
