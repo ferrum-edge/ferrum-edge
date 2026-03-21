@@ -283,6 +283,7 @@ upstreams:
         unhealthy_status_codes: [500, 502, 503, 504]
         unhealthy_threshold: 3
         unhealthy_window_seconds: 30
+        healthy_after_seconds: 30
 ```
 
 | Field | Type | Default | Description |
@@ -290,6 +291,7 @@ upstreams:
 | `unhealthy_status_codes` | array | `[500, 502, 503, 504]` | Status codes that count as failures |
 | `unhealthy_threshold` | integer | `3` | Failures within window to mark unhealthy |
 | `unhealthy_window_seconds` | integer | `30` | Time window for failure counting |
+| `healthy_after_seconds` | integer | `30` | Seconds before an unhealthy target is automatically restored (0 to disable) |
 
 **How it works:**
 
@@ -297,7 +299,11 @@ upstreams:
 2. If the status code is in `unhealthy_status_codes`, a failure is recorded with a timestamp.
 3. Old failures outside the `unhealthy_window_seconds` window are cleaned up.
 4. If the number of failures within the window reaches `unhealthy_threshold`, the target is marked **unhealthy**.
-5. Recovery requires just 1 successful response (status code not in `unhealthy_status_codes`).
+5. Recovery happens via two mechanisms:
+   - **Automatic recovery timer**: After `healthy_after_seconds`, the target is automatically restored to the rotation with a clean slate — similar to a circuit breaker's half-open state. If it immediately fails again, passive checks will re-mark it unhealthy.
+   - **On-success recovery**: If a request to the target succeeds (e.g., via the all-unhealthy fallback path), it is immediately restored.
+
+> **Why `healthy_after_seconds` matters:** Without it (or with active health checks disabled), passively-marked unhealthy targets can only recover via the all-unhealthy fallback path — and if even one target remains healthy, the unhealthy targets never receive traffic and can never recover. The automatic recovery timer prevents this "stuck unhealthy" scenario.
 
 **Trade-offs vs. active checks:**
 
@@ -329,10 +335,13 @@ Both checks write to the same shared `unhealthy_targets` set. Either check can m
 
 - Active checks can restore a passively-marked-unhealthy target when their probes succeed.
 - A successful proxied response can restore an actively-marked-unhealthy target.
+- The passive recovery timer (`healthy_after_seconds`) can restore a target regardless of which check marked it.
+
+> **Best practice:** When using passive-only health checks, always keep `healthy_after_seconds` enabled (the default is 30s). When using combined active + passive checks, active probes provide the primary recovery mechanism and the timer acts as an additional safety net.
 
 ### Fallback When All Unhealthy
 
-If all targets in an upstream are marked unhealthy, the load balancer **falls back to routing to all targets** rather than returning errors. This ensures the gateway continues to serve traffic even in degraded conditions — some targets may still be partially functional.
+If all targets in an upstream are marked unhealthy, the load balancer **falls back to routing to all targets** rather than returning errors. This ensures the gateway continues to serve traffic even in degraded conditions — some targets may still be partially functional. If the fallback request succeeds, the target is immediately restored to the healthy rotation via passive health check recovery.
 
 ## Retry Logic
 

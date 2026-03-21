@@ -43,8 +43,8 @@ impl TargetHealth {
 
 /// Manages health state for all upstream targets.
 pub struct HealthChecker {
-    /// Set of unhealthy target keys ("host:port").
-    pub unhealthy_targets: Arc<DashMap<String, ()>>,
+    /// Set of unhealthy target keys ("host:port") → epoch_ms when marked unhealthy.
+    pub unhealthy_targets: Arc<DashMap<String, u64>>,
     /// Per-target health state.
     target_states: Arc<DashMap<String, Arc<TargetHealth>>>,
     /// Shared HTTP client for active health check probes, configured with
@@ -103,6 +103,21 @@ impl HealthChecker {
                         self.active_check_handles.push(handle);
                     }
                 }
+
+                // Start passive recovery timer if passive health checks are
+                // configured with a non-zero healthy_after_seconds. This
+                // automatically restores unhealthy targets after a cooldown
+                // period, preventing the "all targets unhealthy forever"
+                // death spiral when only passive checks are configured.
+                if let Some(passive) = &hc_config.passive {
+                    if passive.healthy_after_seconds > 0 {
+                        let handle = self.start_passive_recovery_timer(
+                            &upstream.targets,
+                            passive.healthy_after_seconds,
+                        );
+                        self.active_check_handles.push(handle);
+                    }
+                }
             }
         }
     }
@@ -149,7 +164,7 @@ impl HealthChecker {
                     "Passive health check: marking target {} as unhealthy ({} failures in {}s window)",
                     key, failures_in_window, config.unhealthy_window_seconds
                 );
-                self.unhealthy_targets.insert(key, ());
+                self.unhealthy_targets.insert(key, now_epoch_ms());
             }
         } else {
             let failures = state.consecutive_failures.load(Ordering::Relaxed);
@@ -172,6 +187,57 @@ impl HealthChecker {
                 }
             }
         }
+    }
+
+    /// Start a background timer that automatically restores passively-marked
+    /// unhealthy targets after `healthy_after_seconds`.
+    ///
+    /// This prevents the "all targets unhealthy forever" death spiral when
+    /// only passive health checks are configured. Once the cooldown period
+    /// elapses, the target is restored to the rotation (like a circuit
+    /// breaker half-open state). If it immediately fails again, passive
+    /// health checks will re-mark it unhealthy.
+    fn start_passive_recovery_timer(
+        &self,
+        targets: &[UpstreamTarget],
+        healthy_after_seconds: u64,
+    ) -> tokio::task::JoinHandle<()> {
+        let unhealthy_targets = self.unhealthy_targets.clone();
+        let target_states = self.target_states.clone();
+        let target_keys: Vec<String> = targets.iter().map(target_key).collect();
+        let check_interval = Duration::from_secs(std::cmp::max(healthy_after_seconds / 4, 1));
+        let recovery_ms = healthy_after_seconds * 1000;
+
+        tokio::spawn(async move {
+            let mut timer = tokio::time::interval(check_interval);
+
+            loop {
+                timer.tick().await;
+
+                let now = now_epoch_ms();
+
+                for key in &target_keys {
+                    if let Some(entry) = unhealthy_targets.get(key) {
+                        let marked_at = *entry.value();
+                        if now.saturating_sub(marked_at) >= recovery_ms {
+                            info!(
+                                "Passive recovery timer: restoring target {} after {}s cooldown",
+                                key, healthy_after_seconds
+                            );
+                            drop(entry); // Release DashMap ref before removing
+                            unhealthy_targets.remove(key);
+
+                            // Reset failure counters so the target gets a clean slate
+                            if let Some(state) = target_states.get(key) {
+                                state.consecutive_failures.store(0, Ordering::Relaxed);
+                                state.consecutive_successes.store(0, Ordering::Relaxed);
+                                state.recent_failures.clear();
+                            }
+                        }
+                    }
+                }
+            }
+        })
     }
 
     /// Start an active health check background task for a target.
@@ -241,7 +307,7 @@ impl HealthChecker {
                                     "Active health check: target {} is unhealthy (status {})",
                                     key, status
                                 );
-                                unhealthy_targets.insert(key.clone(), ());
+                                unhealthy_targets.insert(key.clone(), now_epoch_ms());
                             }
                         }
                     }
@@ -258,7 +324,7 @@ impl HealthChecker {
                                 "Active health check: target {} is unhealthy (connection error)",
                                 key
                             );
-                            unhealthy_targets.insert(key.clone(), ());
+                            unhealthy_targets.insert(key.clone(), now_epoch_ms());
                         }
                     }
                 }

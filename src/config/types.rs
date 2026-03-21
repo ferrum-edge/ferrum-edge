@@ -79,6 +79,18 @@ fn default_healthy_status_codes() -> Vec<u16> {
 }
 
 /// Passive health check configuration.
+///
+/// When a target accumulates `unhealthy_threshold` failures (matching
+/// `unhealthy_status_codes`) within `unhealthy_window_seconds`, it is
+/// marked unhealthy and removed from the load balancer rotation.
+///
+/// Recovery happens via two mechanisms:
+/// 1. **Automatic timer**: After `healthy_after_seconds` (default 30s),
+///    the target is automatically restored to the rotation, giving it
+///    a fresh chance — similar to a circuit breaker's half-open state.
+/// 2. **On-success recovery**: If a request to the target succeeds
+///    (e.g., via the all-unhealthy fallback path), it is immediately
+///    marked healthy.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PassiveHealthCheck {
     #[serde(default = "default_passive_unhealthy_codes")]
@@ -87,6 +99,12 @@ pub struct PassiveHealthCheck {
     pub unhealthy_threshold: u32,
     #[serde(default = "default_passive_window")]
     pub unhealthy_window_seconds: u64,
+    /// Seconds after which an unhealthy target is automatically restored
+    /// to the rotation. Acts as a recovery timer / half-open circuit breaker.
+    /// Default: 30 seconds. Set to 0 to disable automatic recovery (rely
+    /// on active health checks or all-unhealthy fallback only).
+    #[serde(default = "default_passive_healthy_after")]
+    pub healthy_after_seconds: u64,
 }
 
 impl Default for PassiveHealthCheck {
@@ -95,8 +113,13 @@ impl Default for PassiveHealthCheck {
             unhealthy_status_codes: default_passive_unhealthy_codes(),
             unhealthy_threshold: default_unhealthy_threshold(),
             unhealthy_window_seconds: default_passive_window(),
+            healthy_after_seconds: default_passive_healthy_after(),
         }
     }
+}
+
+fn default_passive_healthy_after() -> u64 {
+    30
 }
 
 fn default_passive_unhealthy_codes() -> Vec<u16> {

@@ -59,7 +59,7 @@ impl LoadBalancerCache {
         &self,
         upstream_id: &str,
         ctx_key: &str,
-        unhealthy: Option<&DashMap<String, ()>>,
+        unhealthy: Option<&DashMap<String, u64>>,
     ) -> Option<UpstreamTarget> {
         let balancers = self.balancers.load();
         let balancer = balancers.get(upstream_id)?;
@@ -72,7 +72,7 @@ impl LoadBalancerCache {
         upstream_id: &str,
         ctx_key: &str,
         exclude: &UpstreamTarget,
-        unhealthy: Option<&DashMap<String, ()>>,
+        unhealthy: Option<&DashMap<String, u64>>,
     ) -> Option<UpstreamTarget> {
         let balancers = self.balancers.load();
         let balancer = balancers.get(upstream_id)?;
@@ -160,7 +160,7 @@ impl LoadBalancer {
 
     fn healthy_targets(
         &self,
-        unhealthy: Option<&DashMap<String, ()>>,
+        unhealthy: Option<&DashMap<String, u64>>,
     ) -> Vec<(usize, &UpstreamTarget)> {
         self.targets
             .iter()
@@ -178,7 +178,7 @@ impl LoadBalancer {
     fn select(
         &self,
         ctx_key: &str,
-        unhealthy: Option<&DashMap<String, ()>>,
+        unhealthy: Option<&DashMap<String, u64>>,
     ) -> Option<UpstreamTarget> {
         let healthy = self.healthy_targets(unhealthy);
         if healthy.is_empty() {
@@ -228,7 +228,7 @@ impl LoadBalancer {
         &self,
         ctx_key: &str,
         exclude: &UpstreamTarget,
-        unhealthy: Option<&DashMap<String, ()>>,
+        unhealthy: Option<&DashMap<String, u64>>,
     ) -> Option<UpstreamTarget> {
         let exclude_key = target_key(exclude);
         let healthy: Vec<(usize, &UpstreamTarget)> = self
@@ -471,8 +471,8 @@ mod tests {
         let targets = make_targets(3);
         let lb = LoadBalancer::new(LoadBalancerAlgorithm::RoundRobin, &targets, None);
 
-        let unhealthy: DashMap<String, ()> = DashMap::new();
-        unhealthy.insert("host0:8080".to_string(), ());
+        let unhealthy: DashMap<String, u64> = DashMap::new();
+        unhealthy.insert("host0:8080".to_string(), 0);
 
         let mut seen = std::collections::HashSet::new();
         for _ in 0..100 {
@@ -490,9 +490,9 @@ mod tests {
         let targets = make_targets(2);
         let lb = LoadBalancer::new(LoadBalancerAlgorithm::RoundRobin, &targets, None);
 
-        let unhealthy: DashMap<String, ()> = DashMap::new();
-        unhealthy.insert("host0:8080".to_string(), ());
-        unhealthy.insert("host1:8080".to_string(), ());
+        let unhealthy: DashMap<String, u64> = DashMap::new();
+        unhealthy.insert("host0:8080".to_string(), 0);
+        unhealthy.insert("host1:8080".to_string(), 0);
 
         // Should still return a target (fallback)
         let t = lb.select("", Some(&unhealthy));
