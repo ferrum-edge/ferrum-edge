@@ -19,6 +19,7 @@ Ferrum Gateway provides built-in load balancing to distribute traffic across mul
   - [Passive Health Checks](#passive-health-checks)
   - [Combined Health Checks](#combined-health-checks)
   - [Fallback When All Unhealthy](#fallback-when-all-unhealthy)
+- [Client Observability Headers](#client-observability-headers)
 - [Retry Logic](#retry-logic)
 - [Circuit Breaker](#circuit-breaker)
 - [Configuration Reference](#configuration-reference)
@@ -35,6 +36,14 @@ The load balancing architecture consists of:
 5. **Circuit Breaker** — Prevents cascading failures by temporarily stopping requests to failing backends.
 
 Load balancers are rebuilt atomically on configuration changes (file reload via SIGHUP, database polling, or control plane push) — no requests are dropped during reconfiguration.
+
+### DNS Integration
+
+Upstream target hostnames are automatically resolved through the gateway's [central DNS cache](dns_resolver.md). This means:
+
+- **Startup warmup**: All upstream target hostnames are pre-resolved alongside proxy backend hostnames before the gateway accepts traffic — no cold-cache DNS lookups on the first request.
+- **Hot-path efficiency**: DNS resolution never happens in the request hot path. All HTTP clients use a custom `DnsCacheResolver` that transparently routes lookups through the in-memory cache.
+- **Background refresh**: DNS entries for upstream targets are proactively refreshed at 75% TTL, just like proxy backend hostnames.
 
 ## Quick Start
 
@@ -346,6 +355,53 @@ Both checks write to the same shared `unhealthy_targets` set. Either check can m
 ### Fallback When All Unhealthy
 
 If all targets in an upstream are marked unhealthy, the load balancer **falls back to routing to all targets** rather than returning errors. This ensures the gateway continues to serve traffic even in degraded conditions — some targets may still be partially functional. If the fallback request succeeds, the target is immediately restored to the healthy rotation via passive health check recovery.
+
+When operating in fallback mode, the gateway sets the `X-Gateway-Upstream-Status: degraded` response header so clients and monitoring systems can detect degraded routing. See [Client Observability Headers](#client-observability-headers) for details.
+
+## Client Observability Headers
+
+When proxying to upstream targets, the gateway adds response headers that help clients and ops teams distinguish between different failure modes. These headers are **only** set on error responses (5xx) or degraded routing — successful 2xx/3xx/4xx responses do not include them.
+
+### `X-Gateway-Error`
+
+Set on 5xx responses to categorize the failure:
+
+| Value | Meaning |
+|-------|---------|
+| `connection_failure` | TCP connection refused, DNS resolution failure, TLS handshake error, or connect timeout — the gateway could not reach the backend at all |
+| `backend_timeout` | The backend accepted the connection but did not respond in time (504 Gateway Timeout) |
+| `backend_error` | The backend returned a 5xx error response (500, 502, 503, etc.) |
+
+### `X-Gateway-Upstream-Status`
+
+| Value | Meaning |
+|-------|---------|
+| `degraded` | All targets in the upstream were marked unhealthy. The request was routed via the all-unhealthy fallback path — the selected target may still be failing |
+
+**Example: connection failure**
+```
+HTTP/1.1 502 Bad Gateway
+X-Gateway-Error: connection_failure
+```
+
+**Example: backend timeout during degraded routing**
+```
+HTTP/1.1 504 Gateway Timeout
+X-Gateway-Error: backend_timeout
+X-Gateway-Upstream-Status: degraded
+```
+
+**Example: successful response (no error headers)**
+```
+HTTP/1.1 200 OK
+```
+
+### Use Cases
+
+- **Alerting**: Alert on `X-Gateway-Error: connection_failure` to detect backends that are completely down vs. backends that are slow (`backend_timeout`).
+- **Client-side retry**: Clients can decide whether to retry based on the error type — connection failures may resolve quickly, while backend errors suggest the service itself is unhealthy.
+- **Dashboards**: Track `X-Gateway-Upstream-Status: degraded` to monitor when upstreams are operating in fallback mode.
+- **Distinguishing gateway vs. backend issues**: A `backend_error` means the backend returned a 5xx — the issue is with the backend. A `connection_failure` means the gateway couldn't reach the backend — the issue may be network, DNS, or the backend process is down.
 
 ## Retry Logic
 

@@ -36,8 +36,10 @@ src/
 │   └── handler.rs         # HTTP request/response processing
 ├── router_cache.rs        # Pre-sorted route table with bounded path cache
 ├── connection_pool.rs     # HTTP client connection pooling with mTLS support
+├── load_balancer.rs       # Load balancing algorithms and upstream target selection
+├── health_check.rs        # Active and passive health checking for upstream targets
 ├── dns/                   # DNS resolution and caching
-│   ├── mod.rs             # DNS module exports
+│   ├── mod.rs             # DNS module exports, DnsCacheResolver for HTTP clients
 │   └── resolver.rs        # Async DNS resolver with caching
 ├── admin/                 # Admin API for configuration management
 │   ├── mod.rs             # Admin API routes and handlers
@@ -101,7 +103,13 @@ tests/
 
 ```
 docs/
-└── backend_mtls.md        # Backend mTLS configuration guide
+├── backend_mtls.md        # Backend mTLS configuration guide
+├── dns_resolver.md        # DNS resolver and caching configuration
+├── load_balancing.md      # Load balancing, health checks, retry, circuit breaker
+├── cors_plugin.md         # CORS plugin configuration
+├── frontend_tls.md        # Frontend TLS/mTLS configuration
+├── cp_dp_mode.md          # Control Plane / Data Plane architecture
+└── ...                    # Additional documentation
 ```
 
 ### **Performance Testing (`perftest/`)**
@@ -203,7 +211,22 @@ Separate HTTP and HTTPS listeners for the Admin API with enhanced TLS support:
 - **File Mode**: No admin API (proxy only)
 - **Data Plane Mode**: Read-only admin API served from cached config (writes return 403)
 
-### **4. Connection Pool (`src/connection_pool.rs`)**
+### **4. Load Balancer & Health Checks (`src/load_balancer.rs`, `src/health_check.rs`)**
+
+Distributes traffic across multiple backend targets within an upstream group:
+
+**Key Features**:
+- Five algorithms: round robin, weighted round robin (smooth WRR), least connections, consistent hashing (150 vnodes), random
+- Atomic rebuild on config changes — no requests dropped during reconfiguration
+- Active health checks (periodic HTTP probes) and passive health checks (response monitoring)
+- Passive recovery timer (`healthy_after_seconds`) for automatic target restoration
+- Connection errors always count as passive health check failures
+- All-unhealthy fallback: routes to all targets rather than returning errors
+- `TargetSelection` carries `is_fallback` flag for downstream observability
+- Client-facing headers: `X-Gateway-Error` (connection_failure | backend_timeout | backend_error) and `X-Gateway-Upstream-Status: degraded`
+- See [docs/load_balancing.md](docs/load_balancing.md) for full configuration reference
+
+### **4.1 Connection Pool (`src/connection_pool.rs`)**
 
 High-performance HTTP client connection pooling with backend mTLS support:
 
@@ -216,7 +239,7 @@ High-performance HTTP client connection pooling with backend mTLS support:
 - Custom CA bundle support for server certificate verification
 - No-Verify mode for testing environments (`FERRUM_BACKEND_TLS_NO_VERIFY`)
 - Per-proxy connection configuration overrides
-- DNS resolution integration
+- Transparent DNS cache integration via `DnsCacheResolver` — no DNS in the hot path
 - Connection statistics and monitoring
 
 ### **4. Plugin System (`src/plugins/`)**
@@ -306,8 +329,9 @@ Async DNS resolution with caching designed to keep lookups off the hot request p
 
 **Key Features**:
 - In-memory `DashMap` caching with configurable TTL
-- **Startup warmup** — awaited before accepting requests (no cold-cache lookups in hot path)
+- **Startup warmup** — resolves all proxy backend and upstream target hostnames before accepting requests
 - **Background refresh** — proactively re-resolves entries at 75% TTL before expiration
+- **`DnsCacheResolver`** — custom `reqwest::dns::Resolve` implementation that routes all HTTP client DNS lookups through the cache, keeping DNS off the hot request path
 - Static DNS overrides (global and per-proxy)
 - Per-proxy DNS configuration and TTL overrides
 - Graceful degradation on resolution failures
@@ -325,17 +349,19 @@ Async DNS resolution with caching designed to keep lookups off the hot request p
    ↓
 4. Plugin Pipeline (auth → authz → rate limit)
    ↓
-5. DNS Cache Lookup (warm cache, background-refreshed)
+5. Load Balancer Target Selection (if upstream configured)
    ↓
-6. Connection Pool (get/create client per proxy key)
+6. Connection Pool (get/create client per proxy key, DNS via cache)
    ↓
-7. Backend Request (with mTLS if configured)
+7. Backend Request (with mTLS if configured, retry on failure)
    ↓
-8. Response Processing
+8. Health Check Reporting (passive: record success/failure)
    ↓
-9. Plugin Response Pipeline
+9. Response Processing (add X-Gateway-Error headers on failure)
    ↓
-10. Client Response
+10. Plugin Response Pipeline
+   ↓
+11. Client Response
 ```
 
 ### **WebSocket Request Processing**
@@ -533,6 +559,8 @@ cargo test --test websocket_echo_server -- --nocapture
 
 - **`IMPLEMENTATION_ANALYSIS.md`** - Detailed implementation status
 - **`docs/backend_mtls.md`** - Backend mTLS configuration guide
+- **`docs/load_balancing.md`** - Load balancing, health checks, retry, circuit breaker guide
+- **`docs/dns_resolver.md`** - DNS resolver and caching configuration
 - **`tests/README.md`** - Test suite documentation
 - **`perftest/README.md`** - Performance testing guide
 

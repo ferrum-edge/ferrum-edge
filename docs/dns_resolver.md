@@ -84,7 +84,20 @@ A background task proactively refreshes cache entries when they reach 75% of the
 
 ## DNS Warmup
 
-On startup, Ferrum Gateway resolves all configured backend hostnames asynchronously before accepting traffic. This ensures no cold-cache DNS lookups on the first request.
+On startup, Ferrum Gateway resolves all configured hostnames asynchronously before accepting traffic. This includes:
+
+- **Proxy backend hostnames** (`backend_host` on each proxy)
+- **Upstream target hostnames** (`host` on each upstream target, when [load balancing](load_balancing.md) is configured)
+
+This ensures no cold-cache DNS lookups on the first request, whether the proxy uses a single backend or a load-balanced upstream pool.
+
+## Transparent DNS Cache for HTTP Clients
+
+All outbound HTTP clients (proxy traffic, health check probes) use a custom `DnsCacheResolver` that transparently routes DNS lookups through the gateway's central DNS cache. This is set via `reqwest::ClientBuilder::dns_resolver()` on every client, ensuring that:
+
+- **No DNS in the hot path**: Hostname resolution is always served from the in-memory cache, never from the network.
+- **Per-proxy `dns_override`**: When a proxy has a static `dns_override` IP, it is applied as a `resolve()` hint on the HTTP client, taking priority over the DNS cache for that specific hostname.
+- **Unified caching**: Proxy backends, upstream targets, and health check probes all share the same DNS cache, benefiting from warmup and background refresh.
 
 ## Resolution Priority
 
