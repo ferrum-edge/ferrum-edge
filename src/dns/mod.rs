@@ -655,12 +655,11 @@ impl reqwest::dns::Resolve for DnsCacheResolver {
         let hostname = name.as_str().to_string();
 
         Box::pin(async move {
-            let ip = cache
-                .resolve(&hostname, None, None)
-                .await
-                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+            let ip = cache.resolve(&hostname, None, None).await.map_err(
+                |e| -> Box<dyn std::error::Error + Send + Sync> {
                     Box::new(std::io::Error::other(e.to_string()))
-                })?;
+                },
+            )?;
 
             // reqwest expects an iterator of SocketAddr. The port is ignored
             // (reqwest uses the port from the URL), but SocketAddr requires one.

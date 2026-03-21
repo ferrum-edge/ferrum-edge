@@ -153,7 +153,11 @@ async fn test_backend_mtls_global_config() {
 
     // Create connection pool
     let global_config = PoolConfig::default();
-    let pool = ConnectionPool::new(global_config, env_config, ferrum_gateway::dns::DnsCache::new(ferrum_gateway::dns::DnsConfig::default()));
+    let pool = ConnectionPool::new(
+        global_config,
+        env_config,
+        ferrum_gateway::dns::DnsCache::new(ferrum_gateway::dns::DnsConfig::default()),
+    );
 
     // Create proxy without specific mTLS config (should use global)
     let proxy = create_test_mtls_proxy();
@@ -206,7 +210,11 @@ async fn test_backend_mtls_proxy_specific_override() {
 
     // Create connection pool
     let global_config = PoolConfig::default();
-    let pool = ConnectionPool::new(global_config, env_config, ferrum_gateway::dns::DnsCache::new(ferrum_gateway::dns::DnsConfig::default()));
+    let pool = ConnectionPool::new(
+        global_config,
+        env_config,
+        ferrum_gateway::dns::DnsCache::new(ferrum_gateway::dns::DnsConfig::default()),
+    );
 
     // Create proxy with specific mTLS config (should override global)
     let mut proxy = create_test_mtls_proxy();
@@ -250,7 +258,11 @@ async fn test_backend_mtls_no_certificates() {
 
     // Create connection pool
     let global_config = PoolConfig::default();
-    let pool = ConnectionPool::new(global_config, env_config, ferrum_gateway::dns::DnsCache::new(ferrum_gateway::dns::DnsConfig::default()));
+    let pool = ConnectionPool::new(
+        global_config,
+        env_config,
+        ferrum_gateway::dns::DnsCache::new(ferrum_gateway::dns::DnsConfig::default()),
+    );
 
     // Create proxy without mTLS config
     let proxy = create_test_mtls_proxy();
@@ -281,7 +293,11 @@ async fn test_backend_mtls_partial_config() {
 
     // Create connection pool
     let global_config = PoolConfig::default();
-    let pool = ConnectionPool::new(global_config, env_config, ferrum_gateway::dns::DnsCache::new(ferrum_gateway::dns::DnsConfig::default()));
+    let pool = ConnectionPool::new(
+        global_config,
+        env_config,
+        ferrum_gateway::dns::DnsCache::new(ferrum_gateway::dns::DnsConfig::default()),
+    );
 
     // Create proxy without mTLS config
     let proxy = create_test_mtls_proxy();
@@ -317,7 +333,11 @@ async fn test_backend_ca_bundle_global_config() {
 
     // Create connection pool
     let global_config = PoolConfig::default();
-    let pool = ConnectionPool::new(global_config, env_config, ferrum_gateway::dns::DnsCache::new(ferrum_gateway::dns::DnsConfig::default()));
+    let pool = ConnectionPool::new(
+        global_config,
+        env_config,
+        ferrum_gateway::dns::DnsCache::new(ferrum_gateway::dns::DnsConfig::default()),
+    );
 
     // Create proxy without specific mTLS config (should use global CA bundle)
     let proxy = create_test_mtls_proxy();

@@ -487,11 +487,7 @@ async fn proxy_to_backend_h3(
     body_bytes: Vec<u8>,
 ) -> (u16, Vec<u8>, std::collections::HashMap<String, String>) {
     // Get client from connection pool (uses DnsCacheResolver for DNS lookups)
-    let client = match state
-        .connection_pool
-        .get_client(proxy)
-        .await
-    {
+    let client = match state.connection_pool.get_client(proxy).await {
         Ok(client) => client,
         Err(e) => {
             error!("Failed to get client from pool: {}", e);

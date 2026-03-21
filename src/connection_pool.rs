@@ -85,10 +85,7 @@ impl ConnectionPool {
     /// lookups are served from the warmed cache — never hitting DNS on the
     /// hot request path. For proxies with `dns_override`, a static resolve
     /// hint is additionally set on the client.
-    pub async fn get_client(
-        &self,
-        proxy: &Proxy,
-    ) -> Result<reqwest::Client> {
+    pub async fn get_client(&self, proxy: &Proxy) -> Result<reqwest::Client> {
         // Get effective configuration (global defaults + proxy overrides)
         let config = self.global_config.for_proxy(proxy);
 
@@ -123,11 +120,7 @@ impl ConnectionPool {
     /// hostname lookups go through the gateway's DNS cache. For proxies
     /// with a `dns_override`, a static `resolve()` hint is additionally
     /// set to pin the backend host to the override IP.
-    async fn create_client(
-        &self,
-        proxy: &Proxy,
-        config: &PoolConfig,
-    ) -> Result<reqwest::Client> {
+    async fn create_client(&self, proxy: &Proxy, config: &PoolConfig) -> Result<reqwest::Client> {
         // Create the custom DNS resolver wrapping our DnsCache
         let dns_resolver = Arc::new(DnsCacheResolver::new(self.dns_cache.clone()));
 
@@ -228,11 +221,7 @@ impl ConnectionPool {
     /// entry because `reqwest::Client` handles per-host connection pooling
     /// internally — different target hostnames in the URL get separate TCP
     /// connections and TLS sessions (with correct SNI) automatically.
-    fn create_pool_key(
-        &self,
-        proxy: &Proxy,
-        config: &PoolConfig,
-    ) -> String {
+    fn create_pool_key(&self, proxy: &Proxy, config: &PoolConfig) -> String {
         let override_str = proxy.dns_override.as_deref().unwrap_or_default();
         format!(
             "{}:{}:{}:{}:{}:{}",

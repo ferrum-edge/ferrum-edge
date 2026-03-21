@@ -25,7 +25,12 @@ use tokio::time::sleep;
 async fn start_identifying_server(port: u16, name: &'static str) {
     let listener = TcpListener::bind(format!("127.0.0.1:{}", port))
         .await
-        .unwrap_or_else(|_| panic!("Failed to bind identifying server {} on port {}", name, port));
+        .unwrap_or_else(|_| {
+            panic!(
+                "Failed to bind identifying server {} on port {}",
+                name, port
+            )
+        });
 
     loop {
         if let Ok((mut stream, _)) = listener.accept().await {
@@ -80,7 +85,10 @@ async fn start_status_server(port: u16, name: &'static str, status_code: u16) {
                 let mut buf = vec![0u8; 4096];
                 let _n = stream.read(&mut buf).await.unwrap_or(0);
 
-                let body = format!(r#"{{"server":"{}","status_code":{}}}"#, server_name, status_code);
+                let body = format!(
+                    r#"{{"server":"{}","status_code":{}}}"#,
+                    server_name, status_code
+                );
                 let response = format!(
                     "HTTP/1.1 {} Error\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{}",
                     status_code,
@@ -96,11 +104,7 @@ async fn start_status_server(port: u16, name: &'static str, status_code: u16) {
 
 /// Start a server that initially returns errors then switches to healthy.
 /// Uses a shared atomic counter to track call count.
-async fn start_flapping_server(
-    port: u16,
-    name: &'static str,
-    fail_count: u32,
-) {
+async fn start_flapping_server(port: u16, name: &'static str, fail_count: u32) {
     let listener = TcpListener::bind(format!("127.0.0.1:{}", port))
         .await
         .unwrap_or_else(|_| panic!("Failed to bind flapping server {} on port {}", name, port));
@@ -251,7 +255,12 @@ plugin_configs: []
 
         match resp {
             Ok(r) => {
-                assert!(r.status().is_success(), "Request {} failed with {}", i, r.status());
+                assert!(
+                    r.status().is_success(),
+                    "Request {} failed with {}",
+                    i,
+                    r.status()
+                );
                 let body = r.text().await.unwrap_or_default();
                 let server = parse_server_name(&body);
                 if !server.is_empty() {
@@ -350,7 +359,12 @@ plugin_configs: []
 
         match resp {
             Ok(r) => {
-                assert!(r.status().is_success(), "Request {} failed with {}", i, r.status());
+                assert!(
+                    r.status().is_success(),
+                    "Request {} failed with {}",
+                    i,
+                    r.status()
+                );
                 let body = r.text().await.unwrap_or_default();
                 let server = parse_server_name(&body);
                 if !server.is_empty() {
@@ -862,9 +876,18 @@ plugin_configs: []
     }
 
     println!("Initial distribution: {:?}", initial_counts);
-    assert!(initial_counts.contains_key("target-a"), "target-a should get traffic initially");
-    assert!(initial_counts.contains_key("target-b"), "target-b should get traffic initially");
-    assert!(!initial_counts.contains_key("target-c"), "target-c should NOT get traffic initially");
+    assert!(
+        initial_counts.contains_key("target-a"),
+        "target-a should get traffic initially"
+    );
+    assert!(
+        initial_counts.contains_key("target-b"),
+        "target-b should get traffic initially"
+    );
+    assert!(
+        !initial_counts.contains_key("target-c"),
+        "target-c should NOT get traffic initially"
+    );
 
     // Update config: add target-c, remove target-b
     let updated_config = r#"
@@ -926,9 +949,18 @@ plugin_configs: []
     }
 
     println!("Updated distribution: {:?}", updated_counts);
-    assert!(updated_counts.contains_key("target-a"), "target-a should get traffic after reload");
-    assert!(updated_counts.contains_key("target-c"), "target-c should get traffic after reload");
-    assert!(!updated_counts.contains_key("target-b"), "target-b should NOT get traffic after reload");
+    assert!(
+        updated_counts.contains_key("target-a"),
+        "target-a should get traffic after reload"
+    );
+    assert!(
+        updated_counts.contains_key("target-c"),
+        "target-c should get traffic after reload"
+    );
+    assert!(
+        !updated_counts.contains_key("target-b"),
+        "target-b should NOT get traffic after reload"
+    );
 
     if let Ok(mut proc) = gateway {
         let _ = proc.kill();
@@ -1015,7 +1047,10 @@ plugin_configs: []
         }
     }
 
-    println!("Retry test: {} successful responses out of 10", success_count);
+    println!(
+        "Retry test: {} successful responses out of 10",
+        success_count
+    );
 
     // At least some requests should succeed via retry to fallback-server
     assert!(
@@ -1107,7 +1142,10 @@ plugin_configs: []
         }
     }
 
-    println!("Fallback test: {} responses received out of 10", response_count);
+    println!(
+        "Fallback test: {} responses received out of 10",
+        response_count
+    );
 
     // Should get responses even though all targets are unhealthy (fallback behavior)
     assert!(
@@ -1230,14 +1268,32 @@ plugin_configs: []
     println!("Static servers: {:?}", static_servers);
 
     // API traffic should only go to api-1 and api-2
-    assert!(api_servers.contains_key("api-1"), "api-1 should get /api traffic");
-    assert!(api_servers.contains_key("api-2"), "api-2 should get /api traffic");
-    assert!(!api_servers.contains_key("static-1"), "static-1 should NOT get /api traffic");
+    assert!(
+        api_servers.contains_key("api-1"),
+        "api-1 should get /api traffic"
+    );
+    assert!(
+        api_servers.contains_key("api-2"),
+        "api-2 should get /api traffic"
+    );
+    assert!(
+        !api_servers.contains_key("static-1"),
+        "static-1 should NOT get /api traffic"
+    );
 
     // Static traffic should only go to static-1 and static-2
-    assert!(static_servers.contains_key("static-1"), "static-1 should get /static traffic");
-    assert!(static_servers.contains_key("static-2"), "static-2 should get /static traffic");
-    assert!(!static_servers.contains_key("api-1"), "api-1 should NOT get /static traffic");
+    assert!(
+        static_servers.contains_key("static-1"),
+        "static-1 should get /static traffic"
+    );
+    assert!(
+        static_servers.contains_key("static-2"),
+        "static-2 should get /static traffic"
+    );
+    assert!(
+        !static_servers.contains_key("api-1"),
+        "api-1 should NOT get /static traffic"
+    );
 
     if let Ok(mut proc) = gateway {
         let _ = proc.kill();
@@ -1330,8 +1386,18 @@ plugin_configs: []
 
     assert_eq!(w3 + w2 + w1, 60, "Total should be 60");
     // weight-3 should get the most, weight-1 the least
-    assert!(w3 > w2, "weight-3 ({}) should get more than weight-2 ({})", w3, w2);
-    assert!(w2 > w1, "weight-2 ({}) should get more than weight-1 ({})", w2, w1);
+    assert!(
+        w3 > w2,
+        "weight-3 ({}) should get more than weight-2 ({})",
+        w3,
+        w2
+    );
+    assert!(
+        w2 > w1,
+        "weight-2 ({}) should get more than weight-1 ({})",
+        w2,
+        w1
+    );
     // Expected exact: 30, 20, 10
     assert_eq!(w3, 30, "weight-3 should get 30 requests");
     assert_eq!(w2, 20, "weight-2 should get 20 requests");
@@ -1533,7 +1599,10 @@ plugin_configs: []
         }
     }
 
-    println!("Unreachable target test: {} successes out of 10", success_count);
+    println!(
+        "Unreachable target test: {} successes out of 10",
+        success_count
+    );
 
     // With retry logic and connection failure retry enabled,
     // requests should eventually reach the reachable server
@@ -1619,7 +1688,12 @@ plugin_configs: []
 
         match resp {
             Ok(r) => {
-                assert!(r.status().is_success(), "Direct request {} failed: {}", i, r.status());
+                assert!(
+                    r.status().is_success(),
+                    "Direct request {} failed: {}",
+                    i,
+                    r.status()
+                );
                 let body = r.text().await.unwrap_or_default();
                 let server = parse_server_name(&body);
                 if !server.is_empty() {
@@ -1655,7 +1729,12 @@ plugin_configs: []
 
         match resp {
             Ok(r) => {
-                assert!(r.status().is_success(), "LB request {} failed: {}", i, r.status());
+                assert!(
+                    r.status().is_success(),
+                    "LB request {} failed: {}",
+                    i,
+                    r.status()
+                );
                 let body = r.text().await.unwrap_or_default();
                 let server = parse_server_name(&body);
                 if !server.is_empty() {

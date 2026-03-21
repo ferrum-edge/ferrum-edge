@@ -175,7 +175,11 @@ async fn test_http3_backend_connection() {
     let env_config = create_http3_test_env_config();
 
     let dns_cache = DnsCache::new(ferrum_gateway::dns::DnsConfig::default());
-    let connection_pool = Arc::new(ConnectionPool::new(pool_config, env_config, dns_cache.clone()));
+    let connection_pool = Arc::new(ConnectionPool::new(
+        pool_config,
+        env_config,
+        dns_cache.clone(),
+    ));
 
     // Test DNS resolution first
     let resolved_ip = dns_cache
@@ -302,7 +306,11 @@ async fn test_http3_proxy_state_creation() {
     let env_config = create_http3_test_env_config();
 
     let dns_cache = DnsCache::new(ferrum_gateway::dns::DnsConfig::default());
-    let connection_pool = Arc::new(ConnectionPool::new(pool_config, env_config, dns_cache.clone()));
+    let connection_pool = Arc::new(ConnectionPool::new(
+        pool_config,
+        env_config,
+        dns_cache.clone(),
+    ));
 
     let gc = create_http3_test_gateway_config();
     let router_cache = Arc::new(RouterCache::new(&gc, 10_000));
@@ -431,7 +439,11 @@ async fn test_http3_full_integration() {
     let env_config = create_http3_test_env_config();
 
     let dns_cache = DnsCache::new(ferrum_gateway::dns::DnsConfig::default());
-    let connection_pool = Arc::new(ConnectionPool::new(pool_config, env_config, dns_cache.clone()));
+    let connection_pool = Arc::new(ConnectionPool::new(
+        pool_config,
+        env_config,
+        dns_cache.clone(),
+    ));
 
     // Create proxy state with HTTP/3 support
     let gc = create_http3_test_gateway_config();
@@ -504,7 +516,11 @@ async fn test_http3_connection_performance() {
     let pool_config = PoolConfig::default();
     let env_config = create_http3_test_env_config();
 
-    let connection_pool = Arc::new(ConnectionPool::new(pool_config, env_config, DnsCache::new(ferrum_gateway::dns::DnsConfig::default())));
+    let connection_pool = Arc::new(ConnectionPool::new(
+        pool_config,
+        env_config,
+        DnsCache::new(ferrum_gateway::dns::DnsConfig::default()),
+    ));
 
     // Test HTTP/3 client creation performance
     let tls_config = connection_pool.get_tls_config_for_backend(&proxy);

@@ -112,7 +112,11 @@ fn create_test_dns_cache() -> DnsCache {
 
 #[tokio::test]
 async fn test_connection_pool_creation() {
-    let pool = ConnectionPool::new(PoolConfig::default(), create_test_env_config(), create_test_dns_cache());
+    let pool = ConnectionPool::new(
+        PoolConfig::default(),
+        create_test_env_config(),
+        create_test_dns_cache(),
+    );
     let proxy = create_test_proxy();
 
     let _client1 = pool.get_client(&proxy).await.unwrap();
@@ -125,7 +129,11 @@ async fn test_connection_pool_creation() {
 
 #[tokio::test]
 async fn test_pool_stats() {
-    let pool = ConnectionPool::new(PoolConfig::default(), create_test_env_config(), create_test_dns_cache());
+    let pool = ConnectionPool::new(
+        PoolConfig::default(),
+        create_test_env_config(),
+        create_test_dns_cache(),
+    );
     let proxy = create_test_proxy();
 
     let _client = pool.get_client(&proxy).await.unwrap();
@@ -138,7 +146,11 @@ async fn test_pool_stats() {
 
 #[tokio::test]
 async fn test_different_proxy_configs_produce_different_pool_keys() {
-    let pool = ConnectionPool::new(PoolConfig::default(), create_test_env_config(), create_test_dns_cache());
+    let pool = ConnectionPool::new(
+        PoolConfig::default(),
+        create_test_env_config(),
+        create_test_dns_cache(),
+    );
 
     let mut proxy1 = create_test_proxy();
     proxy1.backend_port = 3000;
@@ -158,7 +170,11 @@ async fn test_different_proxy_configs_produce_different_pool_keys() {
 
 #[tokio::test]
 async fn test_different_protocols_produce_different_pool_keys() {
-    let pool = ConnectionPool::new(PoolConfig::default(), create_test_env_config(), create_test_dns_cache());
+    let pool = ConnectionPool::new(
+        PoolConfig::default(),
+        create_test_env_config(),
+        create_test_dns_cache(),
+    );
 
     let mut proxy_http = create_test_proxy();
     proxy_http.backend_protocol = BackendProtocol::Http;
@@ -178,7 +194,11 @@ async fn test_different_protocols_produce_different_pool_keys() {
 
 #[tokio::test]
 async fn test_same_proxy_reuses_cached_client() {
-    let pool = ConnectionPool::new(PoolConfig::default(), create_test_env_config(), create_test_dns_cache());
+    let pool = ConnectionPool::new(
+        PoolConfig::default(),
+        create_test_env_config(),
+        create_test_dns_cache(),
+    );
     let proxy = create_test_proxy();
 
     let _client1 = pool.get_client(&proxy).await.unwrap();
@@ -194,7 +214,11 @@ async fn test_same_proxy_reuses_cached_client() {
 
 #[tokio::test]
 async fn test_dns_override_affects_pool_key() {
-    let pool = ConnectionPool::new(PoolConfig::default(), create_test_env_config(), create_test_dns_cache());
+    let pool = ConnectionPool::new(
+        PoolConfig::default(),
+        create_test_env_config(),
+        create_test_dns_cache(),
+    );
 
     let mut proxy1 = create_test_proxy();
     proxy1.dns_override = Some("127.0.0.1".to_string());
@@ -214,7 +238,11 @@ async fn test_dns_override_affects_pool_key() {
 
 #[tokio::test]
 async fn test_pool_clear() {
-    let pool = ConnectionPool::new(PoolConfig::default(), create_test_env_config(), create_test_dns_cache());
+    let pool = ConnectionPool::new(
+        PoolConfig::default(),
+        create_test_env_config(),
+        create_test_dns_cache(),
+    );
     let proxy = create_test_proxy();
 
     let _client = pool.get_client(&proxy).await.unwrap();
@@ -226,7 +254,11 @@ async fn test_pool_clear() {
 
 #[tokio::test]
 async fn test_pool_with_proxy_config_overrides() {
-    let pool = ConnectionPool::new(PoolConfig::default(), create_test_env_config(), create_test_dns_cache());
+    let pool = ConnectionPool::new(
+        PoolConfig::default(),
+        create_test_env_config(),
+        create_test_dns_cache(),
+    );
 
     let mut proxy = create_test_proxy();
     proxy.pool_max_idle_per_host = Some(25);
@@ -243,7 +275,11 @@ async fn test_pool_with_proxy_config_overrides() {
 
 #[tokio::test]
 async fn test_pool_websocket_protocol_creates_client() {
-    let pool = ConnectionPool::new(PoolConfig::default(), create_test_env_config(), create_test_dns_cache());
+    let pool = ConnectionPool::new(
+        PoolConfig::default(),
+        create_test_env_config(),
+        create_test_dns_cache(),
+    );
 
     let mut proxy = create_test_proxy();
     proxy.backend_protocol = BackendProtocol::Ws;

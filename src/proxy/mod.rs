@@ -1161,8 +1161,16 @@ pub async fn handle_proxy_request(
         let mut attempt = 0u32;
         let mut current_target = upstream_target.clone();
         let mut current_url = backend_url.clone();
-        let mut result =
-            proxy_to_backend(&state, &proxy, &current_url, &method, proxy_headers, req, upstream_target.as_ref()).await;
+        let mut result = proxy_to_backend(
+            &state,
+            &proxy,
+            &current_url,
+            &method,
+            proxy_headers,
+            req,
+            upstream_target.as_ref(),
+        )
+        .await;
 
         while retry::should_retry(retry_config, &method, &result, attempt) {
             let delay = retry::retry_delay(retry_config, attempt);
@@ -1194,12 +1202,28 @@ pub async fn handle_proxy_request(
             );
 
             // Build a minimal request for retry (body was consumed on first attempt)
-            result =
-                proxy_to_backend_retry(&state, &proxy, &current_url, &method, proxy_headers, current_target.as_ref()).await;
+            result = proxy_to_backend_retry(
+                &state,
+                &proxy,
+                &current_url,
+                &method,
+                proxy_headers,
+                current_target.as_ref(),
+            )
+            .await;
         }
         result
     } else {
-        proxy_to_backend(&state, &proxy, &backend_url, &method, proxy_headers, req, upstream_target.as_ref()).await
+        proxy_to_backend(
+            &state,
+            &proxy,
+            &backend_url,
+            &method,
+            proxy_headers,
+            req,
+            upstream_target.as_ref(),
+        )
+        .await
     };
     let response_status = backend_resp.status_code;
     let response_body = backend_resp.body;
@@ -1223,9 +1247,12 @@ pub async fn handle_proxy_request(
         if let Some(upstream) = config.upstreams.iter().find(|u| u.id == *upstream_id)
             && let Some(hc) = &upstream.health_checks
         {
-            state
-                .health_checker
-                .report_response(target, response_status, backend_resp.connection_error, hc.passive.as_ref());
+            state.health_checker.report_response(
+                target,
+                response_status,
+                backend_resp.connection_error,
+                hc.passive.as_ref(),
+            );
         }
     }
 
@@ -1426,11 +1453,7 @@ async fn proxy_to_backend_retry(
         .map(|t| t.host.as_str())
         .unwrap_or(&proxy.backend_host);
 
-    let client = match state
-        .connection_pool
-        .get_client(proxy)
-        .await
-    {
+    let client = match state.connection_pool.get_client(proxy).await {
         Ok(client) => client,
         Err(e) => {
             error!("Failed to get client from pool for retry: {}", e);
@@ -1538,11 +1561,7 @@ async fn proxy_to_backend(
     // The client uses our DnsCacheResolver for transparent DNS cache lookups.
     // All upstream targets share one reqwest::Client since it handles
     // per-host pooling and SNI internally.
-    let client = match state
-        .connection_pool
-        .get_client(proxy)
-        .await
-    {
+    let client = match state.connection_pool.get_client(proxy).await {
         Ok(client) => client,
         Err(e) => {
             error!("Failed to get client from pool: {}", e);

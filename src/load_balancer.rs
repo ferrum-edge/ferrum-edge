@@ -501,7 +501,10 @@ mod tests {
         let mut seen = std::collections::HashSet::new();
         for _ in 0..100 {
             let sel = lb.select("", Some(&unhealthy)).unwrap();
-            assert!(!sel.is_fallback, "Should not be fallback when healthy targets exist");
+            assert!(
+                !sel.is_fallback,
+                "Should not be fallback when healthy targets exist"
+            );
             seen.insert(sel.target.host.clone());
         }
 
@@ -522,7 +525,10 @@ mod tests {
         // Should still return a target (fallback) and mark it as degraded
         let sel = lb.select("", Some(&unhealthy));
         assert!(sel.is_some());
-        assert!(sel.unwrap().is_fallback, "All-unhealthy selection should be marked as fallback");
+        assert!(
+            sel.unwrap().is_fallback,
+            "All-unhealthy selection should be marked as fallback"
+        );
     }
 
     #[test]
