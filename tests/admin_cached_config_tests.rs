@@ -5,12 +5,16 @@
 
 use arc_swap::ArcSwap;
 use chrono::Utc;
-use ferrum_gateway::admin::{start_admin_listener, AdminState, jwt_auth::{JwtManager, JwtConfig}};
+use ferrum_gateway::admin::{
+    AdminState,
+    jwt_auth::{JwtConfig, JwtManager},
+    start_admin_listener,
+};
 use ferrum_gateway::config::types::{
     AuthMode, BackendProtocol, Consumer, GatewayConfig, PluginConfig, PluginScope, Proxy,
 };
-use jsonwebtoken::{encode, EncodingKey, Header};
-use serde_json::{json, Value};
+use jsonwebtoken::{EncodingKey, Header, encode};
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -173,7 +177,9 @@ async fn test_list_proxies_falls_back_to_cached_config() {
     let state = AdminState {
         db: None,
         jwt_manager: create_test_jwt_manager(&tc),
-        cached_config: Some(Arc::new(ArcSwap::new(Arc::new(create_test_gateway_config())))),
+        cached_config: Some(Arc::new(ArcSwap::new(Arc::new(
+            create_test_gateway_config(),
+        )))),
         proxy_state: None,
         mode: "test".to_string(),
         read_only: true,
@@ -201,7 +207,9 @@ async fn test_list_consumers_falls_back_to_cached_config() {
     let state = AdminState {
         db: None,
         jwt_manager: create_test_jwt_manager(&tc),
-        cached_config: Some(Arc::new(ArcSwap::new(Arc::new(create_test_gateway_config())))),
+        cached_config: Some(Arc::new(ArcSwap::new(Arc::new(
+            create_test_gateway_config(),
+        )))),
         proxy_state: None,
         mode: "test".to_string(),
         read_only: true,
@@ -224,7 +232,9 @@ async fn test_list_plugin_configs_falls_back_to_cached_config() {
     let state = AdminState {
         db: None,
         jwt_manager: create_test_jwt_manager(&tc),
-        cached_config: Some(Arc::new(ArcSwap::new(Arc::new(create_test_gateway_config())))),
+        cached_config: Some(Arc::new(ArcSwap::new(Arc::new(
+            create_test_gateway_config(),
+        )))),
         proxy_state: None,
         mode: "test".to_string(),
         read_only: true,
@@ -235,7 +245,9 @@ async fn test_list_plugin_configs_falls_back_to_cached_config() {
     let (status, body, data_source) = admin_get(&base_url, "/plugins/config", &token).await;
 
     assert_eq!(status, 200);
-    let plugins = body.as_array().expect("Should return array of plugin configs");
+    let plugins = body
+        .as_array()
+        .expect("Should return array of plugin configs");
     assert_eq!(plugins.len(), 1);
     assert_eq!(plugins[0]["plugin_name"], "rate_limiting");
     assert_eq!(data_source.as_deref(), Some("cached"));
@@ -249,7 +261,9 @@ async fn test_get_proxy_by_id_falls_back_to_cached_config() {
     let state = AdminState {
         db: None,
         jwt_manager: create_test_jwt_manager(&tc),
-        cached_config: Some(Arc::new(ArcSwap::new(Arc::new(create_test_gateway_config())))),
+        cached_config: Some(Arc::new(ArcSwap::new(Arc::new(
+            create_test_gateway_config(),
+        )))),
         proxy_state: None,
         mode: "test".to_string(),
         read_only: true,
@@ -271,7 +285,9 @@ async fn test_get_proxy_not_found_in_cache() {
     let state = AdminState {
         db: None,
         jwt_manager: create_test_jwt_manager(&tc),
-        cached_config: Some(Arc::new(ArcSwap::new(Arc::new(create_test_gateway_config())))),
+        cached_config: Some(Arc::new(ArcSwap::new(Arc::new(
+            create_test_gateway_config(),
+        )))),
         proxy_state: None,
         mode: "test".to_string(),
         read_only: true,
@@ -291,7 +307,9 @@ async fn test_get_consumer_by_id_falls_back_to_cached_config() {
     let state = AdminState {
         db: None,
         jwt_manager: create_test_jwt_manager(&tc),
-        cached_config: Some(Arc::new(ArcSwap::new(Arc::new(create_test_gateway_config())))),
+        cached_config: Some(Arc::new(ArcSwap::new(Arc::new(
+            create_test_gateway_config(),
+        )))),
         proxy_state: None,
         mode: "test".to_string(),
         read_only: true,
@@ -313,7 +331,9 @@ async fn test_get_consumer_not_found_in_cache() {
     let state = AdminState {
         db: None,
         jwt_manager: create_test_jwt_manager(&tc),
-        cached_config: Some(Arc::new(ArcSwap::new(Arc::new(create_test_gateway_config())))),
+        cached_config: Some(Arc::new(ArcSwap::new(Arc::new(
+            create_test_gateway_config(),
+        )))),
         proxy_state: None,
         mode: "test".to_string(),
         read_only: true,
@@ -333,7 +353,9 @@ async fn test_get_plugin_config_by_id_falls_back_to_cached_config() {
     let state = AdminState {
         db: None,
         jwt_manager: create_test_jwt_manager(&tc),
-        cached_config: Some(Arc::new(ArcSwap::new(Arc::new(create_test_gateway_config())))),
+        cached_config: Some(Arc::new(ArcSwap::new(Arc::new(
+            create_test_gateway_config(),
+        )))),
         proxy_state: None,
         mode: "test".to_string(),
         read_only: true,
@@ -356,7 +378,9 @@ async fn test_get_plugin_config_not_found_in_cache() {
     let state = AdminState {
         db: None,
         jwt_manager: create_test_jwt_manager(&tc),
-        cached_config: Some(Arc::new(ArcSwap::new(Arc::new(create_test_gateway_config())))),
+        cached_config: Some(Arc::new(ArcSwap::new(Arc::new(
+            create_test_gateway_config(),
+        )))),
         proxy_state: None,
         mode: "test".to_string(),
         read_only: true,
@@ -389,10 +413,12 @@ async fn test_list_proxies_no_db_no_cache_returns_503() {
     let (status, body, _) = admin_get(&base_url, "/proxies", &token).await;
 
     assert_eq!(status, 503);
-    assert!(body["error"]
-        .as_str()
-        .unwrap()
-        .contains("No database and no cached config"));
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("No database and no cached config")
+    );
 }
 
 #[tokio::test]
@@ -412,10 +438,12 @@ async fn test_list_consumers_no_db_no_cache_returns_503() {
     let (status, body, _) = admin_get(&base_url, "/consumers", &token).await;
 
     assert_eq!(status, 503);
-    assert!(body["error"]
-        .as_str()
-        .unwrap()
-        .contains("No database and no cached config"));
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("No database and no cached config")
+    );
 }
 
 #[tokio::test]
@@ -435,10 +463,12 @@ async fn test_get_proxy_no_db_no_cache_returns_503() {
     let (status, body, _) = admin_get(&base_url, "/proxies/any-id", &token).await;
 
     assert_eq!(status, 503);
-    assert!(body["error"]
-        .as_str()
-        .unwrap()
-        .contains("No database and no cached config"));
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("No database and no cached config")
+    );
 }
 
 // ---- Health endpoint shows cached config status ----
@@ -449,7 +479,9 @@ async fn test_health_endpoint_shows_cached_config_info() {
     let state = AdminState {
         db: None,
         jwt_manager: create_test_jwt_manager(&tc),
-        cached_config: Some(Arc::new(ArcSwap::new(Arc::new(create_test_gateway_config())))),
+        cached_config: Some(Arc::new(ArcSwap::new(Arc::new(
+            create_test_gateway_config(),
+        )))),
         proxy_state: None,
         mode: "test".to_string(),
         read_only: true,

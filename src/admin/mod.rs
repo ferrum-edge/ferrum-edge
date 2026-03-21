@@ -21,12 +21,12 @@ use tokio::net::TcpListener;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-use arc_swap::ArcSwap;
 use crate::admin::jwt_auth::{JwtError, JwtManager};
 use crate::config::db_loader::DatabaseStore;
 use crate::config::types::{Consumer, GatewayConfig, PluginConfig, Proxy};
 use crate::plugins;
 use crate::proxy::ProxyState;
+use arc_swap::ArcSwap;
 
 /// Admin API state.
 #[derive(Clone)]
@@ -337,14 +337,20 @@ async fn handle_list_proxies(state: &AdminState) -> Result<Response<Full<Bytes>>
         match db.load_full_config().await {
             Ok(config) => return Ok(json_response(StatusCode::OK, &json!(config.proxies))),
             Err(e) => {
-                warn!("Database unavailable for list proxies, falling back to cached config: {}", e);
+                warn!(
+                    "Database unavailable for list proxies, falling back to cached config: {}",
+                    e
+                );
             }
         }
     }
 
     // Fallback: serve from in-memory cached config
     if let Some(config) = state.cached_gateway_config() {
-        Ok(json_response_with_stale(StatusCode::OK, &json!(config.proxies)))
+        Ok(json_response_with_stale(
+            StatusCode::OK,
+            &json!(config.proxies),
+        ))
     } else {
         Ok(json_response(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -425,12 +431,17 @@ async fn handle_get_proxy(
     if let Some(ref db) = state.db {
         match db.get_proxy(id).await {
             Ok(Some(proxy)) => return Ok(json_response(StatusCode::OK, &json!(proxy))),
-            Ok(None) => return Ok(json_response(
-                StatusCode::NOT_FOUND,
-                &json!({"error": "Proxy not found"}),
-            )),
+            Ok(None) => {
+                return Ok(json_response(
+                    StatusCode::NOT_FOUND,
+                    &json!({"error": "Proxy not found"}),
+                ));
+            }
             Err(e) => {
-                warn!("Database unavailable for get proxy, falling back to cached config: {}", e);
+                warn!(
+                    "Database unavailable for get proxy, falling back to cached config: {}",
+                    e
+                );
             }
         }
     }
@@ -560,14 +571,20 @@ async fn handle_list_consumers(state: &AdminState) -> Result<Response<Full<Bytes
         match db.load_full_config().await {
             Ok(config) => return Ok(json_response(StatusCode::OK, &json!(config.consumers))),
             Err(e) => {
-                warn!("Database unavailable for list consumers, falling back to cached config: {}", e);
+                warn!(
+                    "Database unavailable for list consumers, falling back to cached config: {}",
+                    e
+                );
             }
         }
     }
 
     // Fallback: serve from in-memory cached config
     if let Some(config) = state.cached_gateway_config() {
-        Ok(json_response_with_stale(StatusCode::OK, &json!(config.consumers)))
+        Ok(json_response_with_stale(
+            StatusCode::OK,
+            &json!(config.consumers),
+        ))
     } else {
         Ok(json_response(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -634,12 +651,17 @@ async fn handle_get_consumer(
     if let Some(ref db) = state.db {
         match db.get_consumer(id).await {
             Ok(Some(c)) => return Ok(json_response(StatusCode::OK, &json!(c))),
-            Ok(None) => return Ok(json_response(
-                StatusCode::NOT_FOUND,
-                &json!({"error": "Consumer not found"}),
-            )),
+            Ok(None) => {
+                return Ok(json_response(
+                    StatusCode::NOT_FOUND,
+                    &json!({"error": "Consumer not found"}),
+                ));
+            }
             Err(e) => {
-                warn!("Database unavailable for get consumer, falling back to cached config: {}", e);
+                warn!(
+                    "Database unavailable for get consumer, falling back to cached config: {}",
+                    e
+                );
             }
         }
     }
@@ -860,14 +882,20 @@ async fn handle_list_plugin_configs(
         match db.load_full_config().await {
             Ok(config) => return Ok(json_response(StatusCode::OK, &json!(config.plugin_configs))),
             Err(e) => {
-                warn!("Database unavailable for list plugin configs, falling back to cached config: {}", e);
+                warn!(
+                    "Database unavailable for list plugin configs, falling back to cached config: {}",
+                    e
+                );
             }
         }
     }
 
     // Fallback: serve from in-memory cached config
     if let Some(config) = state.cached_gateway_config() {
-        Ok(json_response_with_stale(StatusCode::OK, &json!(config.plugin_configs)))
+        Ok(json_response_with_stale(
+            StatusCode::OK,
+            &json!(config.plugin_configs),
+        ))
     } else {
         Ok(json_response(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -931,12 +959,17 @@ async fn handle_get_plugin_config(
     if let Some(ref db) = state.db {
         match db.get_plugin_config(id).await {
             Ok(Some(pc)) => return Ok(json_response(StatusCode::OK, &json!(pc))),
-            Ok(None) => return Ok(json_response(
-                StatusCode::NOT_FOUND,
-                &json!({"error": "Plugin config not found"}),
-            )),
+            Ok(None) => {
+                return Ok(json_response(
+                    StatusCode::NOT_FOUND,
+                    &json!({"error": "Plugin config not found"}),
+                ));
+            }
             Err(e) => {
-                warn!("Database unavailable for get plugin config, falling back to cached config: {}", e);
+                warn!(
+                    "Database unavailable for get plugin config, falling back to cached config: {}",
+                    e
+                );
             }
         }
     }
