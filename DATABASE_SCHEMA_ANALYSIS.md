@@ -44,6 +44,7 @@ CREATE TABLE IF NOT EXISTS proxies (
     dns_override TEXT,                             -- Static IP override
     dns_cache_ttl_seconds INTEGER,                 -- Custom DNS TTL
     auth_mode TEXT NOT NULL DEFAULT 'single',     -- "single" or "multi"
+    upstream_id TEXT,                              -- FK to upstreams.id for load balancing
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 )
