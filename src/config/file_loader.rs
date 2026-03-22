@@ -22,28 +22,28 @@ pub fn load_config_from_file(path: &str) -> Result<GatewayConfig, anyhow::Error>
         .unwrap_or("")
         .to_lowercase();
 
-    // Parse to a generic Value first so we can check/migrate the version
-    let mut value: serde_json::Value = match ext.as_str() {
-        "yaml" | "yml" => {
-            info!("Loading YAML configuration from {}", file_path.display());
-            let yaml_val: serde_yaml::Value = serde_yaml::from_str(&content)?;
-            serde_json::to_value(yaml_val)?
-        }
-        "json" => {
-            info!("Loading JSON configuration from {}", file_path.display());
-            serde_json::from_str(&content)?
-        }
+    // Determine if this is YAML or JSON
+    let is_yaml = match ext.as_str() {
+        "yaml" | "yml" => true,
+        "json" => false,
         _ => {
-            info!(
-                "Attempting to parse config file {} (unknown extension)",
-                file_path.display()
-            );
-            // Try YAML first, then JSON
-            match serde_yaml::from_str::<serde_yaml::Value>(&content) {
-                Ok(yaml_val) => serde_json::to_value(yaml_val)?,
-                Err(_) => serde_json::from_str(&content)?,
-            }
+            // Heuristic: try YAML parse to detect format
+            serde_yaml::from_str::<serde_yaml::Value>(&content).is_ok()
         }
+    };
+
+    if is_yaml {
+        info!("Loading YAML configuration from {}", file_path.display());
+    } else {
+        info!("Loading JSON configuration from {}", file_path.display());
+    }
+
+    // For version detection and migration, parse to serde_json::Value
+    let mut value: serde_json::Value = if is_yaml {
+        let yaml_val: serde_yaml::Value = serde_yaml::from_str(&content)?;
+        serde_json::to_value(yaml_val)?
+    } else {
+        serde_json::from_str(&content)?
     };
 
     // Detect config version and migrate in memory if needed
@@ -61,8 +61,14 @@ pub fn load_config_from_file(path: &str) -> Result<GatewayConfig, anyhow::Error>
         ConfigMigrator::migrate_in_memory(&mut value)?;
     }
 
-    // Deserialize the (possibly migrated) value into GatewayConfig
-    let config: GatewayConfig = serde_json::from_value(value)?;
+    // Deserialize from the original format to preserve YAML-specific features
+    // (like tags for enum variants). Only fall back to JSON deserialization if
+    // a migration was applied (since migrations operate on serde_json::Value).
+    let config: GatewayConfig = if is_yaml && file_version == CURRENT_CONFIG_VERSION {
+        serde_yaml::from_str(&content)?
+    } else {
+        serde_json::from_value(value)?
+    };
 
     // Validate listen_path uniqueness
     if let Err(dupes) = config.validate_unique_listen_paths() {
