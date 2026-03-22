@@ -333,6 +333,7 @@ mod tests {
     #[test]
     fn test_empty_delta_when_configs_identical() {
         let config = GatewayConfig {
+            version: "1".to_string(),
             proxies: vec![make_proxy("p1", "/api", Utc::now())],
             consumers: vec![],
             plugin_configs: vec![],
