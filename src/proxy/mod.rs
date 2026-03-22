@@ -162,14 +162,115 @@ impl ProxyState {
         }
     }
 
+    /// Apply a new configuration, using incremental (surgical) updates when
+    /// possible to avoid disrupting the hot request path.
+    ///
+    /// The delta between the old and new config is computed first. If nothing
+    /// changed, this is a no-op. For typical admin API edits (1-2 resources),
+    /// only the affected cache entries are updated while the rest of the
+    /// caches — including stateful plugin instances, warm path caches, and
+    /// load balancer counters — remain completely untouched.
+    ///
+    /// Falls back to a full rebuild only on the very first config load (when
+    /// there is no previous config to diff against).
     pub fn update_config(&self, new_config: GatewayConfig) {
-        self.router_cache.rebuild(&new_config);
-        self.plugin_cache.rebuild(&new_config);
-        self.consumer_index.rebuild(&new_config.consumers);
-        self.load_balancer_cache.rebuild(&new_config);
+        use crate::config_delta::ConfigDelta;
+
+        let old_config = self.config.load_full();
+
+        // If this is the initial load (empty config), do a full rebuild
+        if old_config.proxies.is_empty()
+            && old_config.consumers.is_empty()
+            && old_config.plugin_configs.is_empty()
+            && old_config.upstreams.is_empty()
+        {
+            self.router_cache.rebuild(&new_config);
+            self.plugin_cache.rebuild(&new_config);
+            self.consumer_index.rebuild(&new_config.consumers);
+            self.load_balancer_cache.rebuild(&new_config);
+            self.config.store(Arc::new(new_config));
+            info!(
+                "Proxy configuration loaded (full build: router + plugins + consumers + load balancers)"
+            );
+            return;
+        }
+
+        let delta = ConfigDelta::compute(&old_config, &new_config);
+
+        if delta.is_empty() {
+            debug!("Config poll: no changes detected, skipping update");
+            // Still update loaded_at timestamp
+            self.config.store(Arc::new(new_config));
+            return;
+        }
+
+        // --- RouterCache: rebuild route table, surgically invalidate path cache ---
+        let affected_paths = delta.affected_listen_paths(&old_config);
+        self.router_cache.apply_delta(&new_config, &affected_paths);
+
+        // --- PluginCache: only rebuild plugins for affected proxies ---
+        let proxy_ids_to_rebuild = delta.proxy_ids_needing_plugin_rebuild(&new_config);
+        let rebuild_globals = delta
+            .added_plugin_configs
+            .iter()
+            .chain(delta.modified_plugin_configs.iter())
+            .any(|pc| pc.scope == crate::config::types::PluginScope::Global)
+            || !delta.removed_plugin_config_ids.is_empty();
+        self.plugin_cache.apply_delta(
+            &new_config,
+            &proxy_ids_to_rebuild,
+            &delta.removed_proxy_ids,
+            rebuild_globals,
+        );
+
+        // --- ConsumerIndex: surgical add/remove/update ---
+        self.consumer_index.apply_delta(
+            &delta.added_consumers,
+            &delta.removed_consumer_ids,
+            &delta.modified_consumers,
+        );
+
+        // --- LoadBalancerCache: only rebuild changed upstreams ---
+        self.load_balancer_cache.apply_delta(
+            &new_config,
+            &delta.added_upstreams,
+            &delta.removed_upstream_ids,
+            &delta.modified_upstreams,
+        );
+
+        // Swap the canonical config last (readers may still be using old caches
+        // via ArcSwap snapshots until they finish their current request)
         self.config.store(Arc::new(new_config));
+
+        // Log a concise summary of what changed
+        let total_changes = delta.added_proxies.len()
+            + delta.removed_proxy_ids.len()
+            + delta.modified_proxies.len()
+            + delta.added_consumers.len()
+            + delta.removed_consumer_ids.len()
+            + delta.modified_consumers.len()
+            + delta.added_plugin_configs.len()
+            + delta.removed_plugin_config_ids.len()
+            + delta.modified_plugin_configs.len()
+            + delta.added_upstreams.len()
+            + delta.removed_upstream_ids.len()
+            + delta.modified_upstreams.len();
         info!(
-            "Proxy configuration updated atomically (router + plugins + consumers + load balancers rebuilt)"
+            "Config updated incrementally: {} changes (proxies: +{} -{} ~{}, consumers: +{} -{} ~{}, plugins: +{} -{} ~{}, upstreams: +{} -{} ~{}, {} proxy plugin lists rebuilt)",
+            total_changes,
+            delta.added_proxies.len(),
+            delta.removed_proxy_ids.len(),
+            delta.modified_proxies.len(),
+            delta.added_consumers.len(),
+            delta.removed_consumer_ids.len(),
+            delta.modified_consumers.len(),
+            delta.added_plugin_configs.len(),
+            delta.removed_plugin_config_ids.len(),
+            delta.modified_plugin_configs.len(),
+            delta.added_upstreams.len(),
+            delta.removed_upstream_ids.len(),
+            delta.modified_upstreams.len(),
+            proxy_ids_to_rebuild.len(),
         );
     }
 
@@ -1527,17 +1628,16 @@ pub async fn handle_proxy_request(
     }
 
     // Passive health check reporting (O(1) upstream lookup via index)
-    if let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, &upstream_target) {
-        if let Some(upstream) = state.load_balancer_cache.get_upstream(upstream_id)
-            && let Some(hc) = &upstream.health_checks
-        {
-            state.health_checker.report_response(
-                target,
-                response_status,
-                backend_resp.connection_error,
-                hc.passive.as_ref(),
-            );
-        }
+    if let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, &upstream_target)
+        && let Some(upstream) = state.load_balancer_cache.get_upstream(upstream_id)
+        && let Some(hc) = &upstream.health_checks
+    {
+        state.health_checker.report_response(
+            target,
+            response_status,
+            backend_resp.connection_error,
+            hc.passive.as_ref(),
+        );
     }
 
     let backend_ttfb_ms = backend_start.elapsed().as_secs_f64() * 1000.0;

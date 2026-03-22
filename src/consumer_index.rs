@@ -70,6 +70,70 @@ impl ConsumerIndex {
         self.all_consumers.load_full()
     }
 
+    /// Incrementally update the consumer index by applying only the changes.
+    ///
+    /// Clones the current maps, removes deleted consumers' index entries,
+    /// and inserts/overwrites added or modified consumers. Untouched
+    /// consumers keep their existing Arc references — no reallocation.
+    pub fn apply_delta(&self, added: &[Consumer], removed_ids: &[String], modified: &[Consumer]) {
+        if added.is_empty() && removed_ids.is_empty() && modified.is_empty() {
+            return;
+        }
+
+        // Clone current state for patching
+        let mut keyauth = self.keyauth_index.load().as_ref().clone();
+        let mut basic = self.basic_index.load().as_ref().clone();
+        let mut identity = self.identity_index.load().as_ref().clone();
+        let mut all: Vec<Arc<Consumer>> = self.all_consumers.load().as_ref().clone();
+
+        // Remove deleted consumers from all indexes
+        if !removed_ids.is_empty() {
+            let removed_set: std::collections::HashSet<&str> =
+                removed_ids.iter().map(|s| s.as_str()).collect();
+
+            // Remove from all-consumers list
+            all.retain(|c| !removed_set.contains(c.id.as_str()));
+
+            // Remove from credential indexes (need to find their keys)
+            keyauth.retain(|_, c| !removed_set.contains(c.id.as_str()));
+            basic.retain(|_, c| !removed_set.contains(c.id.as_str()));
+            identity.retain(|_, c| !removed_set.contains(c.id.as_str()));
+        }
+
+        // Upsert added and modified consumers
+        for consumer in added.iter().chain(modified.iter()) {
+            let arc_consumer = Arc::new(consumer.clone());
+
+            // For modified: remove old entries first (username/custom_id may have changed)
+            all.retain(|c| c.id != consumer.id);
+            keyauth.retain(|_, c| c.id != consumer.id);
+            basic.retain(|_, c| c.id != consumer.id);
+            identity.retain(|_, c| c.id != consumer.id);
+
+            // Insert new entries
+            all.push(Arc::clone(&arc_consumer));
+
+            if let Some(key_creds) = consumer.credentials.get("keyauth")
+                && let Some(key) = key_creds.get("key").and_then(|s| s.as_str())
+            {
+                keyauth.insert(key.to_string(), Arc::clone(&arc_consumer));
+            }
+
+            basic.insert(consumer.username.clone(), Arc::clone(&arc_consumer));
+            identity.insert(consumer.username.clone(), Arc::clone(&arc_consumer));
+            identity.insert(consumer.id.clone(), Arc::clone(&arc_consumer));
+            if let Some(ref custom_id) = consumer.custom_id {
+                identity.insert(custom_id.clone(), Arc::clone(&arc_consumer));
+            }
+        }
+
+        // Atomic swap all indexes
+        self.keyauth_index.store(Arc::new(keyauth));
+        self.basic_index.store(Arc::new(basic));
+        self.identity_index.store(Arc::new(identity));
+        self.all_consumers.store(Arc::new(all));
+    }
+
     /// Number of indexed entries (for testing).
     #[allow(dead_code)]
     pub fn index_len(&self) -> usize {

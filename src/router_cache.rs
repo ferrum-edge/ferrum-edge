@@ -144,6 +144,46 @@ impl RouterCache {
         );
     }
 
+    /// Incrementally update the route table and surgically invalidate only
+    /// the path cache entries affected by changed routes.
+    ///
+    /// The route table itself is rebuilt (cheap O(n log n) sort) because
+    /// insertion order matters for longest-prefix matching. But the path
+    /// cache — which is the expensive thing to lose — is preserved for all
+    /// unaffected routes. Only paths that `starts_with` a changed
+    /// listen_path are evicted, so the hot 99% of cache entries survive.
+    pub fn apply_delta(&self, config: &GatewayConfig, affected_listen_paths: &[String]) {
+        // Rebuild the sorted route table (cheap, O(n log n))
+        let table = Self::build_route_table(config);
+        self.route_table.store(Arc::new(table));
+
+        if affected_listen_paths.is_empty() {
+            return;
+        }
+
+        // Surgically invalidate only path cache entries that could be
+        // affected by the changed routes. A cached path "/api/v2/users"
+        // is invalidated if any affected listen_path (e.g. "/api/v2") is
+        // a prefix of it, OR if the cached path is a prefix of an affected
+        // listen_path (handles the case where a new longer route takes
+        // priority over a shorter cached match).
+        let before = self.path_cache.len();
+        self.path_cache.retain(|cached_path, _| {
+            !affected_listen_paths.iter().any(|lp| {
+                cached_path.starts_with(lp.as_str()) || lp.starts_with(cached_path.as_str())
+            })
+        });
+        let evicted = before - self.path_cache.len();
+        if evicted > 0 {
+            debug!(
+                "Router cache: route table rebuilt ({} routes), surgically evicted {} of {} path cache entries",
+                config.proxies.len(),
+                evicted,
+                before
+            );
+        }
+    }
+
     /// Build a pre-sorted route table from config.
     /// Sorted by listen_path length descending so the first starts_with match
     /// is the longest prefix match.

@@ -1,9 +1,14 @@
 use arc_swap::ArcSwap;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::config::types::{GatewayConfig, PluginScope};
 use crate::plugins::{Plugin, PluginHttpClient, create_plugin_with_http_client};
+
+/// A list of plugins shared across requests via Arc.
+type PluginList = Arc<Vec<Arc<dyn Plugin>>>;
+/// Map from proxy_id to its pre-resolved plugin list.
+type ProxyPluginMap = HashMap<String, PluginList>;
 
 /// Pre-resolved plugin cache that avoids per-request plugin creation.
 ///
@@ -17,9 +22,9 @@ pub struct PluginCache {
     /// proxy_id → pre-resolved plugin list (global + proxy-scoped, merged).
     /// Wrapped in Arc<Vec<...>> so `get_plugins` returns a cheap Arc clone
     /// instead of cloning the entire Vec on every request.
-    proxy_plugins: ArcSwap<HashMap<String, Arc<Vec<Arc<dyn Plugin>>>>>,
+    proxy_plugins: ArcSwap<ProxyPluginMap>,
     /// Fallback: global plugins only (for proxies with no scoped overrides)
-    global_plugins: ArcSwap<Arc<Vec<Arc<dyn Plugin>>>>,
+    global_plugins: ArcSwap<PluginList>,
     /// Shared HTTP client for plugins that make outbound network calls.
     http_client: PluginHttpClient,
 }
@@ -57,6 +62,112 @@ impl PluginCache {
         let (proxy_map, globals) = Self::build_cache(config, &self.http_client);
         self.proxy_plugins.store(Arc::new(proxy_map));
         self.global_plugins.store(Arc::new(globals));
+    }
+
+    /// Incrementally update the plugin cache, only rebuilding plugins for
+    /// proxies identified in `proxy_ids_to_rebuild`. All other proxy plugin
+    /// lists — including their stateful plugin instances (rate limiters, etc.)
+    /// — are preserved unchanged.
+    ///
+    /// Also rebuilds global plugins if `rebuild_globals` is true (i.e., a
+    /// global-scoped plugin config was added/modified/removed).
+    pub fn apply_delta(
+        &self,
+        config: &GatewayConfig,
+        proxy_ids_to_rebuild: &HashSet<String>,
+        removed_proxy_ids: &[String],
+        rebuild_globals: bool,
+    ) {
+        // Load the current state — we'll clone-and-patch it
+        let current_map = self.proxy_plugins.load();
+        let current_globals = self.global_plugins.load();
+
+        // Rebuild globals if any global plugin config changed
+        let new_globals = if rebuild_globals {
+            let mut global_plugins: Vec<Arc<dyn Plugin>> = Vec::new();
+            for pc in &config.plugin_configs {
+                if !pc.enabled {
+                    continue;
+                }
+                if pc.scope == PluginScope::Global
+                    && let Some(plugin) = create_plugin_with_http_client(
+                        &pc.plugin_name,
+                        &pc.config,
+                        self.http_client.clone(),
+                    )
+                {
+                    global_plugins.push(plugin);
+                }
+            }
+            global_plugins.sort_by_key(|p| p.priority());
+            Arc::new(global_plugins)
+        } else {
+            Arc::clone(current_globals.as_ref())
+        };
+
+        // Build index of proxy-scoped plugin configs for efficient lookup
+        let mut proxy_scoped_configs: HashMap<&str, Vec<&crate::config::types::PluginConfig>> =
+            HashMap::new();
+        for pc in &config.plugin_configs {
+            if !pc.enabled {
+                continue;
+            }
+            if pc.scope == PluginScope::Proxy
+                && let Some(ref proxy_id) = pc.proxy_id
+            {
+                proxy_scoped_configs
+                    .entry(proxy_id.as_str())
+                    .or_default()
+                    .push(pc);
+            }
+        }
+
+        // Clone the current map and patch it
+        let mut new_map: HashMap<String, Arc<Vec<Arc<dyn Plugin>>>> = current_map.as_ref().clone();
+
+        // Remove deleted proxies
+        for id in removed_proxy_ids {
+            new_map.remove(id);
+        }
+
+        // Rebuild only the affected proxies' plugin lists
+        for proxy in &config.proxies {
+            if !proxy_ids_to_rebuild.contains(&proxy.id) {
+                continue;
+            }
+
+            let mut merged: Vec<Arc<dyn Plugin>> = new_globals.as_ref().clone();
+
+            if let Some(scoped_configs) = proxy_scoped_configs.get(proxy.id.as_str()) {
+                let proxy_plugin_ids: HashSet<&str> = proxy
+                    .plugins
+                    .iter()
+                    .map(|a| a.plugin_config_id.as_str())
+                    .collect();
+
+                for pc in scoped_configs {
+                    if proxy_plugin_ids.contains(pc.id.as_str())
+                        && let Some(plugin) = create_plugin_with_http_client(
+                            &pc.plugin_name,
+                            &pc.config,
+                            self.http_client.clone(),
+                        )
+                    {
+                        merged.retain(|p| p.name() != plugin.name());
+                        merged.push(plugin);
+                    }
+                }
+            }
+
+            merged.sort_by_key(|p| p.priority());
+            new_map.insert(proxy.id.clone(), Arc::new(merged));
+        }
+
+        // Atomic swap — readers see old or new, never a partial state
+        self.proxy_plugins.store(Arc::new(new_map));
+        if rebuild_globals {
+            self.global_plugins.store(Arc::new(new_globals));
+        }
     }
 
     /// Get the pre-resolved plugins for a proxy. Lock-free O(1) lookup.
@@ -117,10 +228,7 @@ impl PluginCache {
     fn build_cache(
         config: &GatewayConfig,
         http_client: &PluginHttpClient,
-    ) -> (
-        HashMap<String, Arc<Vec<Arc<dyn Plugin>>>>,
-        Arc<Vec<Arc<dyn Plugin>>>,
-    ) {
+    ) -> (ProxyPluginMap, PluginList) {
         // Step 1: Create all enabled global plugins (shared across proxies)
         let mut global_plugins: Vec<Arc<dyn Plugin>> = Vec::new();
 
@@ -139,13 +247,13 @@ impl PluginCache {
                 {
                     global_plugins.push(plugin);
                 }
-            } else if pc.scope == PluginScope::Proxy {
-                if let Some(ref proxy_id) = pc.proxy_id {
-                    proxy_scoped_configs
-                        .entry(proxy_id.as_str())
-                        .or_default()
-                        .push(pc);
-                }
+            } else if pc.scope == PluginScope::Proxy
+                && let Some(ref proxy_id) = pc.proxy_id
+            {
+                proxy_scoped_configs
+                    .entry(proxy_id.as_str())
+                    .or_default()
+                    .push(pc);
             }
         }
 
@@ -167,16 +275,16 @@ impl PluginCache {
                     .collect();
 
                 for pc in scoped_configs {
-                    if proxy_plugin_ids.contains(pc.id.as_str()) {
-                        if let Some(plugin) = create_plugin_with_http_client(
+                    if proxy_plugin_ids.contains(pc.id.as_str())
+                        && let Some(plugin) = create_plugin_with_http_client(
                             &pc.plugin_name,
                             &pc.config,
                             http_client.clone(),
-                        ) {
-                            // Remove any global plugin of the same name
-                            merged.retain(|p| p.name() != plugin.name());
-                            merged.push(plugin);
-                        }
+                        )
+                    {
+                        // Remove any global plugin of the same name
+                        merged.retain(|p| p.name() != plugin.name());
+                        merged.push(plugin);
                     }
                 }
             }

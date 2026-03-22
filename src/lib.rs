@@ -3,6 +3,7 @@
 pub mod admin;
 pub mod circuit_breaker;
 pub mod config;
+pub mod config_delta;
 pub mod connection_pool;
 pub mod consumer_index;
 #[path = "../custom_plugins/mod.rs"]
