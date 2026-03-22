@@ -22,6 +22,11 @@ proxies:
     pool_http2_keep_alive_interval_seconds: 20  # More frequent pings for high-traffic API
     pool_http2_keep_alive_timeout_seconds: 30   # Reasonable timeout for high-traffic API
     # pool_enable_http_keep_alive and pool_enable_http2 use global defaults
+    # Response body mode: "stream" (default) or "buffer".
+    # Stream forwards chunks as they arrive — lower latency, lower memory.
+    # Buffer collects the full body first — required when a plugin needs
+    # to inspect or transform the response body.
+    # response_body_mode: stream  # (default — omitted is the same as "stream")
     auth_mode: single
     plugins:
       - plugin_config_id: "plugin-stdout"
@@ -88,6 +93,9 @@ proxies:
     pool_max_idle_per_host: 20
     pool_enable_http2: false  # Better compatibility with auth plugins
     # Other settings use global defaults
+    # Buffer mode: collect entire response before forwarding to client.
+    # Useful when plugins need to inspect/transform the full response body.
+    response_body_mode: buffer
     auth_mode: single
     plugins:
       - plugin_config_id: "plugin-keyauth"

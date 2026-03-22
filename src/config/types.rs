@@ -301,6 +301,25 @@ pub enum AuthMode {
     Multi,
 }
 
+/// Controls whether proxy responses are streamed or buffered before
+/// being forwarded to the client.
+///
+/// - **Stream** (default): Response chunks are forwarded to the client as
+///   they arrive from the backend. Lower memory usage and lower latency
+///   for large responses. Incompatible with plugins that need to inspect
+///   or modify the full response body — those will automatically force
+///   buffering regardless of this setting.
+/// - **Buffer**: The entire response body is collected in memory before
+///   forwarding. Required when a plugin needs access to the complete
+///   response body (e.g., response body transformation).
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ResponseBodyMode {
+    #[default]
+    Stream,
+    Buffer,
+}
+
 /// Plugin scope (global or per-proxy).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -372,6 +391,13 @@ pub struct Proxy {
     /// Retry configuration.
     #[serde(default)]
     pub retry: Option<RetryConfig>,
+    /// Response body mode: `stream` (default) or `buffer`.
+    /// Streaming forwards response chunks as they arrive from the backend.
+    /// Buffering collects the entire response before forwarding. Plugins
+    /// that require the full response body will force buffering regardless
+    /// of this setting.
+    #[serde(default)]
+    pub response_body_mode: ResponseBodyMode,
     #[serde(default = "Utc::now")]
     pub created_at: DateTime<Utc>,
     #[serde(default = "Utc::now")]

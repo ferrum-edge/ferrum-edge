@@ -80,6 +80,7 @@ fn create_http3_test_proxy() -> Proxy {
         upstream_id: None,
         circuit_breaker: None,
         retry: None,
+        response_body_mode: Default::default(),
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     }

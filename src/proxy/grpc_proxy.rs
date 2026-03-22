@@ -18,7 +18,6 @@
 //!
 //! gRPC metadata maps to HTTP/2 headers, so existing auth plugins work unchanged.
 
-use bytes::Bytes;
 use dashmap::DashMap;
 use http_body_util::BodyExt;
 use hyper::Request;
@@ -525,16 +524,13 @@ pub mod grpc_status {
 ///
 /// gRPC errors use HTTP 200 with `grpc-status` and `grpc-message` as headers
 /// (Trailers-Only responses pack trailers into the header block).
-pub fn build_grpc_error_response(
-    status: u32,
-    message: &str,
-) -> hyper::Response<http_body_util::Full<Bytes>> {
+pub fn build_grpc_error_response(status: u32, message: &str) -> hyper::Response<super::ProxyBody> {
     hyper::Response::builder()
         .status(200)
         .header("content-type", "application/grpc")
         .header("grpc-status", status.to_string())
         .header("grpc-message", message)
-        .body(http_body_util::Full::new(Bytes::new()))
+        .body(super::ProxyBody::empty())
         .unwrap()
 }
 

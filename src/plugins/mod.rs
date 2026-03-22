@@ -187,6 +187,17 @@ pub trait Plugin: Send + Sync {
         PluginResult::Continue
     }
 
+    /// Returns `true` if this plugin needs the entire response body buffered
+    /// in memory before forwarding to the client. When any active plugin
+    /// returns `true`, the gateway forces buffered mode for that proxy
+    /// regardless of the `response_body_mode` configuration.
+    ///
+    /// Default is `false` (compatible with streaming). Override this in
+    /// plugins that inspect or transform the response body.
+    fn requires_response_body_buffering(&self) -> bool {
+        false
+    }
+
     /// Called for transaction logging.
     async fn log(&self, _summary: &TransactionSummary) {}
 }

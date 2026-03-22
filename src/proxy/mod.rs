@@ -1,9 +1,10 @@
+pub mod body;
 pub mod grpc_proxy;
 
 use arc_swap::ArcSwap;
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
-use http_body_util::{BodyExt, Full};
+use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode, upgrade::OnUpgrade, upgrade::Upgraded};
@@ -23,7 +24,9 @@ use tracing::{debug, error, info, warn};
 
 use crate::circuit_breaker::CircuitBreakerCache;
 use crate::config::PoolConfig;
-use crate::config::types::{AuthMode, BackendProtocol, GatewayConfig, Proxy, UpstreamTarget};
+use crate::config::types::{
+    AuthMode, BackendProtocol, GatewayConfig, Proxy, ResponseBodyMode, UpstreamTarget,
+};
 use crate::connection_pool::ConnectionPool;
 use crate::consumer_index::ConsumerIndex;
 use crate::dns::DnsCache;
@@ -35,8 +38,10 @@ use crate::plugins::{
     Plugin, PluginResult, RequestContext, TransactionSummary, priority as plugin_priority,
 };
 use crate::retry;
+use crate::retry::ResponseBody;
 use crate::router_cache::RouterCache;
 
+pub use self::body::ProxyBody;
 use self::grpc_proxy::{GrpcConnectionPool, GrpcProxyError};
 
 /// Check if the request is a WebSocket upgrade request
@@ -236,7 +241,7 @@ async fn handle_websocket_request(
     req: Request<Incoming>,
     state: ProxyState,
     remote_addr: SocketAddr,
-) -> Result<Response<Full<Bytes>>, hyper::Error> {
+) -> Result<Response<ProxyBody>, hyper::Error> {
     info!(
         "WebSocket upgrade request for proxy routing from {}",
         remote_addr.ip()
@@ -354,7 +359,7 @@ async fn handle_websocket_request(
         .header("sec-websocket-accept", accept_key)
         .header("x-websocket-proxy", "ferrum-gateway")
         .header("x-websocket-backend", backend_url.clone())
-        .body(Full::new(Bytes::from("")))
+        .body(ProxyBody::empty())
         .unwrap();
 
     info!(
@@ -373,7 +378,7 @@ async fn handle_websocket_request_authenticated(
     proxy: Arc<Proxy>,
     ctx: RequestContext,
     plugins: Vec<Arc<dyn Plugin>>,
-) -> Result<Response<Full<Bytes>>, hyper::Error> {
+) -> Result<Response<ProxyBody>, hyper::Error> {
     info!(
         "WebSocket upgrade request authenticated for proxy: {} from: {}",
         proxy.id,
@@ -447,7 +452,7 @@ async fn handle_websocket_request_authenticated(
                     .as_bytes(),
             ),
         )
-        .body(Full::new(Bytes::from("")))
+        .body(ProxyBody::empty())
         .unwrap();
 
     // Collect client headers to forward to backend
@@ -1052,7 +1057,7 @@ pub async fn handle_proxy_request(
     req: Request<Incoming>,
     state: ProxyState,
     remote_addr: SocketAddr,
-) -> Result<Response<Full<Bytes>>, hyper::Error> {
+) -> Result<Response<ProxyBody>, hyper::Error> {
     let start_time = Instant::now();
 
     let method = req.method().to_string();
@@ -1350,7 +1355,7 @@ pub async fn handle_proxy_request(
                 }
 
                 return Ok(resp_builder
-                    .body(Full::new(Bytes::from(grpc_resp.body)))
+                    .body(ProxyBody::full(Bytes::from(grpc_resp.body)))
                     .unwrap_or_else(|_| {
                         grpc_proxy::build_grpc_error_response(
                             grpc_proxy::grpc_status::UNAVAILABLE,
@@ -1430,6 +1435,14 @@ pub async fn handle_proxy_request(
             .record_connection_start(upstream_id, target);
     }
 
+    // Determine response body mode: stream by default, buffer when required.
+    // A plugin that needs the full body (e.g., response body transformation)
+    // forces buffering regardless of the proxy configuration.
+    let should_stream = match proxy.response_body_mode {
+        ResponseBodyMode::Buffer => false,
+        ResponseBodyMode::Stream => !plugins.iter().any(|p| p.requires_response_body_buffering()),
+    };
+
     // Perform the backend request with retry logic
     let backend_resp = if let Some(retry_config) = &proxy.retry {
         let mut attempt = 0u32;
@@ -1443,6 +1456,7 @@ pub async fn handle_proxy_request(
             proxy_headers,
             req,
             upstream_target.as_ref(),
+            should_stream,
         )
         .await;
 
@@ -1475,7 +1489,9 @@ pub async fn handle_proxy_request(
                 current_url, attempt, retry_config.max_retries, result.connection_error
             );
 
-            // Build a minimal request for retry (body was consumed on first attempt)
+            // Build a minimal request for retry (body was consumed on first attempt).
+            // The final retry attempt uses streaming if configured.
+            let is_last_attempt = attempt >= retry_config.max_retries;
             result = proxy_to_backend_retry(
                 &state,
                 &proxy,
@@ -1483,6 +1499,7 @@ pub async fn handle_proxy_request(
                 &method,
                 proxy_headers,
                 current_target.as_ref(),
+                should_stream && is_last_attempt,
             )
             .await;
         }
@@ -1496,6 +1513,7 @@ pub async fn handle_proxy_request(
             proxy_headers,
             req,
             upstream_target.as_ref(),
+            should_stream,
         )
         .await
     };
@@ -1533,7 +1551,8 @@ pub async fn handle_proxy_request(
     let backend_ttfb_ms = backend_start.elapsed().as_secs_f64() * 1000.0;
     let backend_total_ms = backend_start.elapsed().as_secs_f64() * 1000.0;
 
-    // after_proxy hooks
+    // after_proxy hooks (these only modify headers, not the body,
+    // so they are compatible with both streaming and buffered modes)
     for plugin in &plugins {
         let _ = plugin
             .after_proxy(&mut ctx, response_status, &mut response_headers)
@@ -1602,14 +1621,18 @@ pub async fn handle_proxy_request(
         );
     }
 
-    Ok(resp_builder
-        .body(Full::new(Bytes::from(response_body)))
-        .unwrap_or_else(|_| {
-            Response::builder()
-                .status(StatusCode::INTERNAL_SERVER_ERROR)
-                .body(Full::new(Bytes::from("Internal Server Error")))
-                .unwrap()
-        }))
+    // Build response body: either stream from backend or return buffered data
+    let body = match response_body {
+        ResponseBody::Streaming(resp) => ProxyBody::streaming(resp),
+        ResponseBody::Buffered(data) => ProxyBody::full(Bytes::from(data)),
+    };
+
+    Ok(resp_builder.body(body).unwrap_or_else(|_| {
+        Response::builder()
+            .status(StatusCode::INTERNAL_SERVER_ERROR)
+            .body(ProxyBody::from_string("Internal Server Error"))
+            .unwrap()
+    }))
 }
 
 /// Find the matching proxy using longest prefix match.
@@ -1718,6 +1741,7 @@ async fn proxy_to_backend_retry(
     method: &str,
     headers: &HashMap<String, String>,
     upstream_target: Option<&UpstreamTarget>,
+    stream_response: bool,
 ) -> retry::BackendResponse {
     // All reqwest clients use our DnsCacheResolver, so DNS resolution is
     // always served from the warmed cache — never hitting DNS on the hot path.
@@ -1733,7 +1757,9 @@ async fn proxy_to_backend_retry(
             error!("Failed to get client from pool for retry: {}", e);
             return retry::BackendResponse {
                 status_code: 502,
-                body: format!(r#"{{"error":"Backend unavailable: {}"}}"#, e).into_bytes(),
+                body: ResponseBody::Buffered(
+                    format!(r#"{{"error":"Backend unavailable: {}"}}"#, e).into_bytes(),
+                ),
                 headers: HashMap::new(),
                 connection_error: true,
             };
@@ -1780,12 +1806,21 @@ async fn proxy_to_backend_retry(
                     resp_headers.insert(k.as_str().to_string(), vs.to_string());
                 }
             }
-            let body = response.bytes().await.unwrap_or_default().to_vec();
-            retry::BackendResponse {
-                status_code: status,
-                body,
-                headers: resp_headers,
-                connection_error: false,
+            if stream_response {
+                retry::BackendResponse {
+                    status_code: status,
+                    body: ResponseBody::Streaming(response),
+                    headers: resp_headers,
+                    connection_error: false,
+                }
+            } else {
+                let body = response.bytes().await.unwrap_or_default().to_vec();
+                retry::BackendResponse {
+                    status_code: status,
+                    body: ResponseBody::Buffered(body),
+                    headers: resp_headers,
+                    connection_error: false,
+                }
             }
         }
         Err(e) => {
@@ -1793,7 +1828,9 @@ async fn proxy_to_backend_retry(
             let is_connect = e.is_connect() || e.is_timeout();
             retry::BackendResponse {
                 status_code: 502,
-                body: format!(r#"{{"error":"Backend unavailable: {}"}}"#, e).into_bytes(),
+                body: ResponseBody::Buffered(
+                    format!(r#"{{"error":"Backend unavailable: {}"}}"#, e).into_bytes(),
+                ),
                 headers: HashMap::new(),
                 connection_error: is_connect,
             }
@@ -1802,6 +1839,7 @@ async fn proxy_to_backend_retry(
 }
 
 /// Proxy the request to the backend.
+#[allow(clippy::too_many_arguments)]
 async fn proxy_to_backend(
     state: &ProxyState,
     proxy: &Proxy,
@@ -1810,6 +1848,7 @@ async fn proxy_to_backend(
     headers: &HashMap<String, String>,
     original_req: Request<Incoming>,
     upstream_target: Option<&UpstreamTarget>,
+    stream_response: bool,
 ) -> retry::BackendResponse {
     // All reqwest clients use our DnsCacheResolver, so DNS resolution is
     // always served from the warmed cache — never hitting DNS on the hot path.
@@ -1819,13 +1858,14 @@ async fn proxy_to_backend(
         .map(|t| t.host.as_str())
         .unwrap_or(&proxy.backend_host);
 
-    // Handle HTTP/3 backend requests differently
+    // Handle HTTP/3 backend requests differently (always buffered — h3 crate
+    // doesn't expose a streaming body API compatible with reqwest::Response)
     if matches!(proxy.backend_protocol, BackendProtocol::H3) {
         let (status, body, hdrs) =
             proxy_to_backend_http3(state, proxy, backend_url, method, headers, original_req).await;
         return retry::BackendResponse {
             status_code: status,
-            body,
+            body: ResponseBody::Buffered(body),
             headers: hdrs,
             connection_error: false,
         };
@@ -1906,7 +1946,9 @@ async fn proxy_to_backend(
         {
             return retry::BackendResponse {
                 status_code: 413,
-                body: r#"{"error":"Request body exceeds maximum size"}"#.as_bytes().to_vec(),
+                body: ResponseBody::Buffered(
+                    r#"{"error":"Request body exceeds maximum size"}"#.as_bytes().to_vec(),
+                ),
                 headers: HashMap::new(),
                 connection_error: false,
             };
@@ -1930,8 +1972,9 @@ async fn proxy_to_backend(
                 Err(_) => {
                     return retry::BackendResponse {
                         status_code: 413,
-                        body:
+                        body: ResponseBody::Buffered(
                             r#"{"error":"Request body exceeds maximum size"}"#.as_bytes().to_vec(),
+                        ),
                         headers: HashMap::new(),
                         connection_error: false,
                     };
@@ -1981,35 +2024,57 @@ async fn proxy_to_backend(
                     );
                     return retry::BackendResponse {
                         status_code: 502,
-                        body: r#"{"error":"Backend response body exceeds maximum size"}"#
-                            .as_bytes()
-                            .to_vec(),
+                        body: ResponseBody::Buffered(
+                            r#"{"error":"Backend response body exceeds maximum size"}"#
+                                .as_bytes()
+                                .to_vec(),
+                        ),
                         headers: HashMap::new(),
                         connection_error: false,
                     };
                 }
 
-                // Stream-collect with size limit using chunk_with_limit
+                // When streaming is requested and Content-Length is present and within
+                // limits, we can safely stream. If there's no Content-Length we must
+                // buffer to enforce the size limit.
+                if stream_response && content_length.is_some() {
+                    return retry::BackendResponse {
+                        status_code: status,
+                        body: ResponseBody::Streaming(response),
+                        headers: resp_headers,
+                        connection_error: false,
+                    };
+                }
+
+                // Buffer: stream-collect with size limit
                 let max_size = state.max_response_body_size_bytes;
                 match collect_response_with_limit(response, max_size).await {
                     Ok((resp_body, _)) => retry::BackendResponse {
                         status_code: status,
-                        body: resp_body,
+                        body: ResponseBody::Buffered(resp_body),
                         headers: resp_headers,
                         connection_error: false,
                     },
                     Err(err_body) => retry::BackendResponse {
                         status_code: 502,
-                        body: err_body,
+                        body: ResponseBody::Buffered(err_body),
                         headers: HashMap::new(),
                         connection_error: false,
                     },
+                }
+            } else if stream_response {
+                // No size limit and streaming requested — pass through directly
+                retry::BackendResponse {
+                    status_code: status,
+                    body: ResponseBody::Streaming(response),
+                    headers: resp_headers,
+                    connection_error: false,
                 }
             } else {
                 let body = response.bytes().await.unwrap_or_default().to_vec();
                 retry::BackendResponse {
                     status_code: status,
-                    body,
+                    body: ResponseBody::Buffered(body),
                     headers: resp_headers,
                     connection_error: false,
                 }
@@ -2020,7 +2085,9 @@ async fn proxy_to_backend(
             let is_connect = e.is_connect() || e.is_timeout();
             retry::BackendResponse {
                 status_code: 502,
-                body: format!(r#"{{"error":"Backend unavailable: {}"}}"#, e).into_bytes(),
+                body: ResponseBody::Buffered(
+                    format!(r#"{{"error":"Backend unavailable: {}"}}"#, e).into_bytes(),
+                ),
                 headers: HashMap::new(),
                 connection_error: is_connect,
             }
@@ -2077,11 +2144,11 @@ fn record_request(state: &ProxyState, status: u16) {
     record_status(state, status);
 }
 
-fn build_response(status: StatusCode, body: &str) -> Response<Full<Bytes>> {
+fn build_response(status: StatusCode, body: &str) -> Response<ProxyBody> {
     Response::builder()
         .status(status)
         .header("Content-Type", "application/json")
-        .body(Full::new(Bytes::from(body.to_string())))
+        .body(ProxyBody::from_string(body))
         .unwrap()
 }
 
@@ -2089,7 +2156,7 @@ fn build_reject_response(
     status: StatusCode,
     body: &str,
     headers: &HashMap<String, String>,
-) -> Response<Full<Bytes>> {
+) -> Response<ProxyBody> {
     let mut resp = build_response(status, body);
     for (k, v) in headers {
         if let (Ok(name), Ok(val)) = (
