@@ -26,11 +26,11 @@ pub struct HttpLogging {
 impl HttpLogging {
     pub fn new(config: &Value, http_client: PluginHttpClient) -> Self {
         let batch_size = config["batch_size"].as_u64().unwrap_or(50).max(1) as usize;
-        let flush_interval_ms = config["flush_interval_ms"].as_u64().unwrap_or(1000).max(100);
-        let buffer_capacity = config["buffer_capacity"]
+        let flush_interval_ms = config["flush_interval_ms"]
             .as_u64()
-            .unwrap_or(10000)
-            .max(1) as usize;
+            .unwrap_or(1000)
+            .max(100);
+        let buffer_capacity = config["buffer_capacity"].as_u64().unwrap_or(10000).max(1) as usize;
 
         let batch_config = BatchConfig {
             endpoint_url: config["endpoint_url"].as_str().unwrap_or("").to_string(),
@@ -41,9 +41,7 @@ impl HttpLogging {
             batch_size,
             flush_interval: Duration::from_millis(flush_interval_ms),
             max_retries: config["max_retries"].as_u64().unwrap_or(3) as u32,
-            retry_delay: Duration::from_millis(
-                config["retry_delay_ms"].as_u64().unwrap_or(1000),
-            ),
+            retry_delay: Duration::from_millis(config["retry_delay_ms"].as_u64().unwrap_or(1000)),
         };
 
         let endpoint_url = batch_config.endpoint_url.clone();
