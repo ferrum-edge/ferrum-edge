@@ -18,6 +18,7 @@ Ferrum Gateway is a lightweight, extensible API gateway designed for modern micr
 - **Multi-Authentication**: Chain multiple auth plugins with first-match consumer identification
 - **TLS/mTLS Support**: Frontend TLS termination and backend mTLS with configurable certificate verification
 - **Load Balancing**: Five algorithms (round robin, weighted round robin, least connections, consistent hashing, random) with active/passive health checks, automatic failover, retry, and circuit breaker — see [docs/load_balancing.md](docs/load_balancing.md)
+- **Response Body Streaming**: Configurable per-proxy response body mode (`stream` default / `buffer`) — streaming forwards chunks as they arrive for lower latency and memory; plugins can force buffering via `requires_response_body_buffering()` — see [docs/response_body_streaming.md](docs/response_body_streaming.md)
 - **Client Observability Headers**: `X-Gateway-Error` (connection_failure | backend_timeout | backend_error) and `X-Gateway-Upstream-Status: degraded` for failure categorization
 - **DNS Caching**: In-memory async DNS cache with startup warmup (proxy backends + upstream targets), background refresh at 75% TTL, transparent `DnsCacheResolver` for all HTTP clients, per-proxy TTL overrides, and static overrides
 - **Admin REST API**: Full CRUD for Proxies, Consumers, and Plugin Configs with JWT-protected endpoints
@@ -376,6 +377,8 @@ proxies:
     backend_connect_timeout_ms: 5000
     backend_read_timeout_ms: 30000
     backend_write_timeout_ms: 30000
+    # Response body mode: "stream" (default) or "buffer"
+    # response_body_mode: stream
     # Connection pooling settings (optional - override global defaults)
     pool_max_idle_per_host: 25          # Override global default (10)
     pool_idle_timeout_seconds: 120      # Override global default (90)

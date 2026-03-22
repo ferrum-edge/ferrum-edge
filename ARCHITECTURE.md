@@ -33,6 +33,7 @@ src/
 │   └── types.rs           # Core data structures (Proxy, Consumer, Plugin)
 ├── proxy/                 # Proxy request handling
 │   ├── mod.rs             # ProxyState and main proxy logic
+│   ├── body.rs            # ProxyBody sum type (Full/Stream) for response streaming
 │   └── handler.rs         # HTTP request/response processing
 ├── router_cache.rs        # Pre-sorted route table with bounded path cache
 ├── connection_pool.rs     # HTTP client connection pooling with mTLS support
@@ -109,6 +110,7 @@ docs/
 ├── cors_plugin.md         # CORS plugin configuration
 ├── frontend_tls.md        # Frontend TLS/mTLS configuration
 ├── cp_dp_mode.md          # Control Plane / Data Plane architecture
+├── response_body_streaming.md # Response body streaming vs buffering
 └── ...                    # Additional documentation
 ```
 
@@ -153,6 +155,7 @@ The proxy engine handles all request routing and processing with **consistent se
 - **Rate limiting** applies to WebSocket connections
 - **Complete logging** of WebSocket connections
 - **TCP keepalive** on inbound connections (60s interval) for stale client detection
+- **Configurable response body mode** — per-proxy `response_body_mode` (stream/buffer); plugins can force buffering via `requires_response_body_buffering()`
 
 **Security Model**:
 - **WebSocket requests** go through the same plugin pipeline as HTTP requests
@@ -357,7 +360,7 @@ Async DNS resolution with caching designed to keep lookups off the hot request p
    ↓
 8. Health Check Reporting (passive: record success/failure)
    ↓
-9. Response Processing (add X-Gateway-Error headers on failure)
+9. Response Processing (stream or buffer based on response_body_mode)
    ↓
 10. Plugin Response Pipeline
    ↓
@@ -561,6 +564,7 @@ cargo test --test websocket_echo_server -- --nocapture
 - **`docs/backend_mtls.md`** - Backend mTLS configuration guide
 - **`docs/load_balancing.md`** - Load balancing, health checks, retry, circuit breaker guide
 - **`docs/dns_resolver.md`** - DNS resolver and caching configuration
+- **`docs/response_body_streaming.md`** - Response body streaming vs buffering configuration
 - **`tests/README.md`** - Test suite documentation
 - **`perftest/README.md`** - Performance testing guide
 
