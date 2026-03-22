@@ -1,6 +1,6 @@
 use crate::config::types::{
-    AuthMode, BackendProtocol, Consumer, GatewayConfig, PluginAssociation, PluginConfig,
-    PluginScope, Proxy,
+    AuthMode, BackendProtocol, Consumer, GatewayConfig, HealthCheckConfig, LoadBalancerAlgorithm,
+    PluginAssociation, PluginConfig, PluginScope, Proxy, Upstream, UpstreamTarget,
 };
 use chrono::Utc;
 use sqlx::Row;
@@ -156,13 +156,14 @@ impl DatabaseStore {
         let proxies = self.load_proxies().await?;
         let consumers = self.load_consumers().await?;
         let plugin_configs = self.load_plugin_configs().await?;
+        let upstreams = self.load_upstreams().await?;
 
         let config = GatewayConfig {
             version: crate::config::types::CURRENT_CONFIG_VERSION.to_string(),
             proxies,
             consumers,
             plugin_configs,
-            upstreams: Vec::new(),
+            upstreams,
             loaded_at: Utc::now(),
         };
 
@@ -482,6 +483,110 @@ impl DatabaseStore {
     pub async fn get_plugin_config(&self, id: &str) -> Result<Option<PluginConfig>, anyhow::Error> {
         let configs = self.load_plugin_configs().await?;
         Ok(configs.into_iter().find(|c| c.id == id))
+    }
+
+    // ---- Upstream CRUD ----
+
+    async fn load_upstreams(&self) -> Result<Vec<Upstream>, anyhow::Error> {
+        let rows: Vec<AnyRow> = sqlx::query("SELECT * FROM upstreams")
+            .fetch_all(&self.pool)
+            .await?;
+
+        let mut upstreams = Vec::new();
+        for row in rows {
+            let targets_str: String = row.try_get("targets").unwrap_or("[]".into());
+            let targets: Vec<UpstreamTarget> =
+                serde_json::from_str(&targets_str).unwrap_or_default();
+
+            let algo_str: String = row.try_get("algorithm").unwrap_or("round_robin".into());
+            let algorithm: LoadBalancerAlgorithm =
+                serde_json::from_value(serde_json::Value::String(algo_str)).unwrap_or_default();
+
+            let health_checks: Option<HealthCheckConfig> = row
+                .try_get::<String, _>("health_checks")
+                .ok()
+                .and_then(|s| serde_json::from_str(&s).ok());
+
+            upstreams.push(Upstream {
+                id: row.try_get("id")?,
+                name: row.try_get("name").ok(),
+                targets,
+                algorithm,
+                hash_on: row.try_get("hash_on").ok(),
+                health_checks,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            });
+        }
+
+        Ok(upstreams)
+    }
+
+    pub async fn create_upstream(&self, upstream: &Upstream) -> Result<(), anyhow::Error> {
+        let targets_json = serde_json::to_string(&upstream.targets)?;
+        let algo_json = serde_json::to_string(&upstream.algorithm)?;
+        // algo_json is quoted like "\"round_robin\"", strip the quotes
+        let algo_str = algo_json.trim_matches('"');
+        let health_checks_json = upstream
+            .health_checks
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
+
+        sqlx::query(
+            "INSERT INTO upstreams (id, name, targets, algorithm, hash_on, health_checks, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+        )
+        .bind(&upstream.id)
+        .bind(&upstream.name)
+        .bind(&targets_json)
+        .bind(algo_str)
+        .bind(&upstream.hash_on)
+        .bind(&health_checks_json)
+        .bind(upstream.created_at.to_rfc3339())
+        .bind(upstream.updated_at.to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    pub async fn update_upstream(&self, upstream: &Upstream) -> Result<(), anyhow::Error> {
+        let targets_json = serde_json::to_string(&upstream.targets)?;
+        let algo_json = serde_json::to_string(&upstream.algorithm)?;
+        let algo_str = algo_json.trim_matches('"');
+        let health_checks_json = upstream
+            .health_checks
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
+
+        sqlx::query(
+            "UPDATE upstreams SET name=?, targets=?, algorithm=?, hash_on=?, health_checks=?, updated_at=? WHERE id=?"
+        )
+        .bind(&upstream.name)
+        .bind(&targets_json)
+        .bind(algo_str)
+        .bind(&upstream.hash_on)
+        .bind(&health_checks_json)
+        .bind(Utc::now().to_rfc3339())
+        .bind(&upstream.id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    pub async fn delete_upstream(&self, id: &str) -> Result<bool, anyhow::Error> {
+        let result = sqlx::query("DELETE FROM upstreams WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn get_upstream(&self, id: &str) -> Result<Option<Upstream>, anyhow::Error> {
+        let upstreams = self.load_upstreams().await?;
+        Ok(upstreams.into_iter().find(|u| u.id == id))
     }
 
     pub async fn check_listen_path_unique(

@@ -80,10 +80,24 @@ impl V001InitialSchema {
             )
         "#;
 
+        let create_upstreams = r#"
+            CREATE TABLE IF NOT EXISTS upstreams (
+                id TEXT PRIMARY KEY,
+                name TEXT,
+                targets TEXT NOT NULL DEFAULT '[]',
+                algorithm TEXT NOT NULL DEFAULT 'round_robin',
+                hash_on TEXT,
+                health_checks TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+        "#;
+
         sqlx::query(create_proxies).execute(pool).await?;
         sqlx::query(create_consumers).execute(pool).await?;
         sqlx::query(create_plugin_configs).execute(pool).await?;
         sqlx::query(create_proxy_plugins).execute(pool).await?;
+        sqlx::query(create_upstreams).execute(pool).await?;
 
         Ok(())
     }

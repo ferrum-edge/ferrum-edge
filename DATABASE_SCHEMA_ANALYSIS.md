@@ -20,7 +20,7 @@ This single call installs drivers for:
 
 ### **📊 Schema Tables Created**
 
-The system automatically creates **4 core tables** on first startup:
+The system automatically creates **5 core tables** on first startup:
 
 #### **1. `proxies` Table - Main Route Definitions**
 ```sql
@@ -83,6 +83,22 @@ CREATE TABLE IF NOT EXISTS proxy_plugins (
     PRIMARY KEY (proxy_id, plugin_config_id)       -- Composite key
 )
 ```
+
+#### **5. `upstreams` Table - Load-Balanced Backend Groups**
+```sql
+CREATE TABLE IF NOT EXISTS upstreams (
+    id TEXT PRIMARY KEY,                            -- "upstream-backend-pool"
+    name TEXT,                                      -- "My Backend Pool"
+    targets TEXT NOT NULL DEFAULT '[]',             -- JSON array of {host, port, weight, tags}
+    algorithm TEXT NOT NULL DEFAULT 'round_robin',  -- Load balancing algorithm
+    hash_on TEXT,                                   -- Field for consistent hashing (e.g. "header:x-user-id")
+    health_checks TEXT,                             -- JSON health check config (active/passive)
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+)
+```
+
+Upstreams store their `targets` and `health_checks` as JSON text columns, supporting variable-length arrays of backend targets and nested health check configuration without additional join tables.
 
 ---
 

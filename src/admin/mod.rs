@@ -23,7 +23,7 @@ use uuid::Uuid;
 
 use crate::admin::jwt_auth::{JwtError, JwtManager};
 use crate::config::db_loader::DatabaseStore;
-use crate::config::types::{Consumer, GatewayConfig, PluginConfig, Proxy};
+use crate::config::types::{Consumer, GatewayConfig, PluginConfig, Proxy, Upstream};
 use crate::plugins;
 use crate::proxy::ProxyState;
 use arc_swap::ArcSwap;
@@ -330,6 +330,13 @@ pub async fn handle_admin_request(
         (Method::DELETE, ["plugins", "config", id]) => {
             handle_delete_plugin_config(&state, id).await
         }
+
+        // Upstreams CRUD
+        (Method::GET, ["upstreams"]) => handle_list_upstreams(&state).await,
+        (Method::POST, ["upstreams"]) => handle_create_upstream(&state, &body_bytes).await,
+        (Method::GET, ["upstreams", id]) => handle_get_upstream(&state, id).await,
+        (Method::PUT, ["upstreams", id]) => handle_update_upstream(&state, id, &body_bytes).await,
+        (Method::DELETE, ["upstreams", id]) => handle_delete_upstream(&state, id).await,
 
         // Metrics
         (Method::GET, ["admin", "metrics"]) => handle_metrics(&state).await,
@@ -1075,6 +1082,214 @@ async fn handle_delete_plugin_config(
         Ok(false) => Ok(json_response(
             StatusCode::NOT_FOUND,
             &json!({"error": "Plugin config not found"}),
+        )),
+        Err(e) => Ok(json_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &json!({"error": format!("{}", e)}),
+        )),
+    }
+}
+
+// ---- Upstream CRUD ----
+
+async fn handle_list_upstreams(state: &AdminState) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    // Try database first, fall back to cached config for resilience
+    if let Some(ref db) = state.db {
+        match db.load_full_config().await {
+            Ok(config) => return Ok(json_response(StatusCode::OK, &json!(config.upstreams))),
+            Err(e) => {
+                warn!(
+                    "Database unavailable for list upstreams, falling back to cached config: {}",
+                    e
+                );
+            }
+        }
+    }
+
+    // Fallback: serve from in-memory cached config
+    if let Some(config) = state.cached_gateway_config() {
+        Ok(json_response_with_stale(
+            StatusCode::OK,
+            &json!(config.upstreams),
+        ))
+    } else {
+        Ok(json_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &json!({"error": "No database and no cached config available"}),
+        ))
+    }
+}
+
+async fn handle_create_upstream(
+    state: &AdminState,
+    body: &[u8],
+) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    if state.read_only {
+        return Ok(json_response(
+            StatusCode::FORBIDDEN,
+            &json!({"error": "Admin API is in read-only mode"}),
+        ));
+    }
+
+    let db = match &state.db {
+        Some(db) => db,
+        None => {
+            return Ok(json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &json!({"error": "No database"}),
+            ));
+        }
+    };
+
+    let mut upstream: Upstream = match serde_json::from_slice(body) {
+        Ok(u) => u,
+        Err(e) => {
+            return Ok(json_response(
+                StatusCode::BAD_REQUEST,
+                &json!({"error": format!("Invalid body: {}", e)}),
+            ));
+        }
+    };
+
+    if upstream.id.is_empty() {
+        upstream.id = Uuid::new_v4().to_string();
+    }
+    upstream.created_at = Utc::now();
+    upstream.updated_at = Utc::now();
+
+    if upstream.targets.is_empty() {
+        return Ok(json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"error": "At least one target is required"}),
+        ));
+    }
+
+    match db.create_upstream(&upstream).await {
+        Ok(_) => Ok(json_response(StatusCode::CREATED, &json!(upstream))),
+        Err(e) => Ok(json_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &json!({"error": format!("{}", e)}),
+        )),
+    }
+}
+
+async fn handle_get_upstream(
+    state: &AdminState,
+    id: &str,
+) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    // Try database first
+    if let Some(ref db) = state.db {
+        match db.get_upstream(id).await {
+            Ok(Some(upstream)) => return Ok(json_response(StatusCode::OK, &json!(upstream))),
+            Ok(None) => {
+                return Ok(json_response(
+                    StatusCode::NOT_FOUND,
+                    &json!({"error": "Upstream not found"}),
+                ));
+            }
+            Err(e) => {
+                warn!(
+                    "Database unavailable for get upstream, falling back to cached config: {}",
+                    e
+                );
+            }
+        }
+    }
+
+    // Fallback: search in cached config
+    if let Some(config) = state.cached_gateway_config() {
+        match config.upstreams.iter().find(|u| u.id == id) {
+            Some(upstream) => Ok(json_response_with_stale(StatusCode::OK, &json!(upstream))),
+            None => Ok(json_response(
+                StatusCode::NOT_FOUND,
+                &json!({"error": "Upstream not found"}),
+            )),
+        }
+    } else {
+        Ok(json_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &json!({"error": "No database and no cached config available"}),
+        ))
+    }
+}
+
+async fn handle_update_upstream(
+    state: &AdminState,
+    id: &str,
+    body: &[u8],
+) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    if state.read_only {
+        return Ok(json_response(
+            StatusCode::FORBIDDEN,
+            &json!({"error": "Admin API is in read-only mode"}),
+        ));
+    }
+
+    let db = match &state.db {
+        Some(db) => db,
+        None => {
+            return Ok(json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &json!({"error": "No database"}),
+            ));
+        }
+    };
+
+    let mut upstream: Upstream = match serde_json::from_slice(body) {
+        Ok(u) => u,
+        Err(e) => {
+            return Ok(json_response(
+                StatusCode::BAD_REQUEST,
+                &json!({"error": format!("Invalid body: {}", e)}),
+            ));
+        }
+    };
+
+    upstream.id = id.to_string();
+    upstream.updated_at = Utc::now();
+
+    if upstream.targets.is_empty() {
+        return Ok(json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"error": "At least one target is required"}),
+        ));
+    }
+
+    match db.update_upstream(&upstream).await {
+        Ok(_) => Ok(json_response(StatusCode::OK, &json!(upstream))),
+        Err(e) => Ok(json_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &json!({"error": format!("{}", e)}),
+        )),
+    }
+}
+
+async fn handle_delete_upstream(
+    state: &AdminState,
+    id: &str,
+) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    if state.read_only {
+        return Ok(json_response(
+            StatusCode::FORBIDDEN,
+            &json!({"error": "Admin API is in read-only mode"}),
+        ));
+    }
+
+    let db = match &state.db {
+        Some(db) => db,
+        None => {
+            return Ok(json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &json!({"error": "No database"}),
+            ));
+        }
+    };
+
+    match db.delete_upstream(id).await {
+        Ok(true) => Ok(json_response(StatusCode::NO_CONTENT, &json!({}))),
+        Ok(false) => Ok(json_response(
+            StatusCode::NOT_FOUND,
+            &json!({"error": "Upstream not found"}),
         )),
         Err(e) => Ok(json_response(
             StatusCode::SERVICE_UNAVAILABLE,

@@ -45,6 +45,8 @@ tags:
     description: Manage API consumers and their credentials
   - name: Plugins
     description: Manage plugin configurations
+  - name: Upstreams
+    description: Manage upstream groups for load-balanced backends
 
 paths:
   # ── Health ──────────────────────────────────────────────────────────
@@ -592,6 +594,110 @@ paths:
           description: Plugin configuration deleted
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/ReadOnly"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  # ── Upstreams ────────────────────────────────────────────────────────
+  /upstreams:
+    get:
+      operationId: listUpstreams
+      summary: List all upstreams
+      tags: [Upstreams]
+      responses:
+        "200":
+          description: Array of upstream objects
+          headers:
+            X-Data-Source:
+              $ref: "#/components/headers/X-Data-Source"
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Upstream"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+    post:
+      operationId: createUpstream
+      summary: Create an upstream
+      tags: [Upstreams]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/Upstream"
+      responses:
+        "201":
+          description: Created upstream
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Upstream"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          $ref: "#/components/responses/ReadOnly"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /upstreams/{id}:
+    parameters:
+      - $ref: "#/components/parameters/ResourceId"
+    get:
+      operationId: getUpstream
+      summary: Get an upstream by ID
+      tags: [Upstreams]
+      responses:
+        "200":
+          description: Upstream object
+          headers:
+            X-Data-Source:
+              $ref: "#/components/headers/X-Data-Source"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Upstream"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+    put:
+      operationId: updateUpstream
+      summary: Update an upstream
+      tags: [Upstreams]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/Upstream"
+      responses:
+        "200":
+          description: Updated upstream
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Upstream"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          $ref: "#/components/responses/ReadOnly"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+    delete:
+      operationId: deleteUpstream
+      summary: Delete an upstream
+      tags: [Upstreams]
+      responses:
+        "204":
+          description: Upstream deleted
         "403":
           $ref: "#/components/responses/ReadOnly"
         "404":

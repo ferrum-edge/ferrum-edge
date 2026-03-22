@@ -578,6 +578,7 @@ When using Database or CP modes, Ferrum auto-creates the following tables on sta
 - **`consumers`**: API consumer/user definitions
 - **`plugin_configs`**: Plugin configurations (global or per-proxy scoped)
 - **`proxy_plugins`**: Many-to-many linking proxies to plugin configs
+- **`upstreams`**: Upstream groups for load-balanced backends (targets stored as JSON, with algorithm and health check configuration)
 
 ## Admin API
 
@@ -669,6 +670,57 @@ curl -X POST -H "Authorization: Bearer $TOKEN" \
   http://localhost:9000/plugins/config
 ```
 
+#### Upstreams
+
+```bash
+# List all upstreams
+curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/upstreams
+
+# Create an upstream (load-balanced backend group)
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "my-backend-pool",
+    "targets": [
+      {"host": "backend1.example.com", "port": 8080, "weight": 5},
+      {"host": "backend2.example.com", "port": 8080, "weight": 3}
+    ],
+    "algorithm": "weighted_round_robin",
+    "health_checks": {
+      "active": {
+        "http_path": "/health",
+        "interval_seconds": 10,
+        "healthy_threshold": 3,
+        "unhealthy_threshold": 3
+      }
+    }
+  }' \
+  http://localhost:9000/upstreams
+
+# Get an upstream
+curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/upstreams/{upstream_id}
+
+# Update an upstream
+curl -X PUT -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "my-backend-pool",
+    "targets": [
+      {"host": "backend1.example.com", "port": 8080, "weight": 5},
+      {"host": "backend3.example.com", "port": 8080, "weight": 2}
+    ],
+    "algorithm": "round_robin"
+  }' \
+  http://localhost:9000/upstreams/{upstream_id}
+
+# Delete an upstream
+curl -X DELETE -H "Authorization: Bearer $TOKEN" http://localhost:9000/upstreams/{upstream_id}
+```
+
+Supported load balancing algorithms: `round_robin`, `weighted_round_robin`, `least_connections`, `consistent_hashing`, `random`.
+
+To use an upstream with a proxy, set the proxy's `upstream_id` field to the upstream's ID. When set, the upstream's targets override the proxy's `backend_host`/`backend_port`.
+
 #### Metrics
 
 ```bash
@@ -752,19 +804,31 @@ config: {}
 
 #### `http_logging`
 
-Sends the transaction summary as JSON to an external HTTP endpoint.
+Sends transaction summaries as JSON to an external HTTP endpoint. Entries are buffered and sent in batches (as a JSON array) to reduce per-request HTTP overhead. A background task handles flushing, retries, and delivery — the proxy hot path only performs a non-blocking channel write.
 
 **Config**:
-| Parameter | Type | Description |
-|---|---|---|
-| `endpoint_url` | String | URL to POST transaction logs to |
-| `authorization_header` | String (optional) | Authorization header value for the logging endpoint |
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `endpoint_url` | String | `""` | URL to POST transaction logs to |
+| `authorization_header` | String | *(none)* | Authorization header value for the logging endpoint |
+| `batch_size` | Integer | `50` | Number of entries to buffer before sending a batch |
+| `flush_interval_ms` | Integer | `1000` | Max milliseconds before flushing a partial batch (min: 100) |
+| `max_retries` | Integer | `3` | Retry attempts on failed batch delivery |
+| `retry_delay_ms` | Integer | `1000` | Delay in milliseconds between retry attempts |
+| `buffer_capacity` | Integer | `10000` | Channel capacity — new entries are dropped when full |
+
+Batches are flushed when `batch_size` is reached **or** `flush_interval_ms` elapses, whichever comes first. After all retries are exhausted, the batch is discarded to keep memory usage bounded.
 
 ```yaml
 plugin_name: http_logging
 config:
   endpoint_url: "https://logging-service.example.com/ingest"
   authorization_header: "Bearer log-token-123"
+  batch_size: 50
+  flush_interval_ms: 1000
+  max_retries: 3
+  retry_delay_ms: 1000
+  buffer_capacity: 10000
 ```
 
 #### `transaction_debugger`
