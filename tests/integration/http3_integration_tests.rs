@@ -80,6 +80,7 @@ fn create_http3_test_proxy() -> Proxy {
         upstream_id: None,
         circuit_breaker: None,
         retry: None,
+        response_body_mode: Default::default(),
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     }
@@ -175,8 +176,12 @@ async fn test_http3_backend_connection() {
     let pool_config = PoolConfig::default();
     let env_config = create_http3_test_env_config();
 
-    let connection_pool = Arc::new(ConnectionPool::new(pool_config, env_config));
     let dns_cache = DnsCache::new(ferrum_gateway::dns::DnsConfig::default());
+    let connection_pool = Arc::new(ConnectionPool::new(
+        pool_config,
+        env_config,
+        dns_cache.clone(),
+    ));
 
     // Test DNS resolution first
     let resolved_ip = dns_cache
@@ -303,7 +308,11 @@ async fn test_http3_proxy_state_creation() {
     let env_config = create_http3_test_env_config();
 
     let dns_cache = DnsCache::new(ferrum_gateway::dns::DnsConfig::default());
-    let connection_pool = Arc::new(ConnectionPool::new(pool_config, env_config));
+    let connection_pool = Arc::new(ConnectionPool::new(
+        pool_config,
+        env_config,
+        dns_cache.clone(),
+    ));
 
     let gc = create_http3_test_gateway_config();
     let router_cache = Arc::new(RouterCache::new(&gc, 10_000));
@@ -328,6 +337,7 @@ async fn test_http3_proxy_state_creation() {
         max_single_header_size_bytes: 16384,
         max_body_size_bytes: 10_485_760,
         max_response_body_size_bytes: 10_485_760,
+        env_config: Arc::new(ferrum_gateway::config::EnvConfig::default()),
     };
 
     // Verify proxy state is created successfully
@@ -432,7 +442,11 @@ async fn test_http3_full_integration() {
     let env_config = create_http3_test_env_config();
 
     let dns_cache = DnsCache::new(ferrum_gateway::dns::DnsConfig::default());
-    let connection_pool = Arc::new(ConnectionPool::new(pool_config, env_config));
+    let connection_pool = Arc::new(ConnectionPool::new(
+        pool_config,
+        env_config,
+        dns_cache.clone(),
+    ));
 
     // Create proxy state with HTTP/3 support
     let gc = create_http3_test_gateway_config();
@@ -458,6 +472,7 @@ async fn test_http3_full_integration() {
         max_single_header_size_bytes: 16384,
         max_body_size_bytes: 10_485_760,
         max_response_body_size_bytes: 10_485_760,
+        env_config: Arc::new(ferrum_gateway::config::EnvConfig::default()),
     };
 
     // Verify proxy state is created successfully
@@ -505,7 +520,11 @@ async fn test_http3_connection_performance() {
     let pool_config = PoolConfig::default();
     let env_config = create_http3_test_env_config();
 
-    let connection_pool = Arc::new(ConnectionPool::new(pool_config, env_config));
+    let connection_pool = Arc::new(ConnectionPool::new(
+        pool_config,
+        env_config,
+        DnsCache::new(ferrum_gateway::dns::DnsConfig::default()),
+    ));
 
     // Test HTTP/3 client creation performance
     let tls_config = connection_pool.get_tls_config_for_backend(&proxy);

@@ -94,6 +94,7 @@ fn create_test_proxy(id: &str, listen_path: &str, host: &str, port: u16) -> Prox
         upstream_id: None,
         circuit_breaker: None,
         retry: None,
+        response_body_mode: Default::default(),
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }

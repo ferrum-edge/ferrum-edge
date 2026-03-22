@@ -126,8 +126,31 @@ impl Plugin for MyPlugin {
         // 9000-9999: logging
         500  // Example: runs after CORS (100), before auth (1000+)
     }
+
+    // If your plugin makes outbound HTTP calls to a configured endpoint,
+    // override warmup_hostnames() so the endpoint is pre-resolved at startup
+    // via the gateway's shared DNS cache:
+    fn warmup_hostnames(&self) -> Vec<String> {
+        vec!["my-endpoint.example.com".to_string()]
+    }
 }
 ```
+
+### Response Body Buffering
+
+If your plugin needs access to the full response body (e.g., for body-level transformation or inspection), override `requires_response_body_buffering()` to return `true`. This forces the gateway to buffer the entire backend response before forwarding it to the client, even when the proxy's `response_body_mode` is set to `stream`.
+
+```rust
+impl Plugin for MyBodyPlugin {
+    fn name(&self) -> &str { "my_body_plugin" }
+
+    fn requires_response_body_buffering(&self) -> bool {
+        true  // Forces response buffering for this proxy
+    }
+}
+```
+
+By default, this method returns `false`. Existing plugins like `response_transformer` only modify headers (not the body), so they work with both streaming and buffered modes without overriding this method. See [docs/response_body_streaming.md](response_body_streaming.md) for the full streaming architecture.
 
 Add the constant to `src/plugins/mod.rs` in the `priority` module for discoverability:
 

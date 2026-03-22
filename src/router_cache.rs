@@ -8,6 +8,7 @@
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::debug;
 
 use crate::config::types::{GatewayConfig, Proxy};
@@ -28,8 +29,10 @@ pub struct RouterCache {
     route_table: ArcSwap<Vec<RouteEntry>>,
     /// Bounded cache: request path → matched proxy for O(1) repeated lookups.
     path_cache: DashMap<String, Arc<Proxy>>,
-    /// Maximum entries in path_cache before clearing to bound memory.
+    /// Maximum entries in path_cache before eviction.
     max_cache_entries: usize,
+    /// Monotonic counter used for random-sample eviction (avoids clearing entire cache).
+    eviction_counter: AtomicU64,
 }
 
 impl RouterCache {
@@ -41,8 +44,9 @@ impl RouterCache {
         let table = Self::build_route_table(config);
         Self {
             route_table: ArcSwap::new(Arc::new(table)),
-            path_cache: DashMap::new(),
+            path_cache: DashMap::with_capacity(max_cache_entries),
             max_cache_entries,
+            eviction_counter: AtomicU64::new(0),
         }
     }
 
@@ -82,14 +86,11 @@ impl RouterCache {
         // Cache the result (including None → we skip caching misses to avoid
         // unbounded growth from random paths / scanners)
         if let Some(ref proxy) = result {
-            // Bound memory: if cache is too large, clear it.
-            // This is rare in practice and cheaper than LRU bookkeeping.
+            // Bound memory: if cache is too large, evict ~25% of entries using
+            // random sampling instead of clearing everything. This avoids a
+            // thundering herd of O(n) route scans after eviction.
             if self.path_cache.len() >= self.max_cache_entries {
-                self.path_cache.clear();
-                debug!(
-                    "Router path cache cleared (exceeded {} entries)",
-                    self.max_cache_entries
-                );
+                self.evict_sample();
             }
             self.path_cache.insert(path.to_string(), Arc::clone(proxy));
         }
@@ -107,6 +108,80 @@ impl RouterCache {
     #[allow(dead_code)]
     pub fn route_count(&self) -> usize {
         self.route_table.load().len()
+    }
+
+    /// Evict ~25% of cache entries using counter-based pseudo-random sampling.
+    /// Much better than clearing the entire cache because the remaining 75%
+    /// of hot entries continue to serve O(1) hits, avoiding a thundering herd
+    /// of O(routes) scans.
+    fn evict_sample(&self) {
+        let target_removals = self.max_cache_entries / 4;
+        let seed = self.eviction_counter.fetch_add(1, Ordering::Relaxed);
+        let mut removed = 0;
+
+        // DashMap shards provide pseudo-random iteration order; we just
+        // remove the first `target_removals` entries we encounter.
+        // Use retain for efficient bulk removal.
+        let mut keep_count = 0u64;
+        self.path_cache.retain(|_, _| {
+            if removed >= target_removals {
+                return true;
+            }
+            // Use a simple hash of the counter to decide which entries to evict.
+            // This provides a roughly uniform eviction pattern.
+            keep_count += 1;
+            if (keep_count.wrapping_mul(seed.wrapping_add(7))).is_multiple_of(4) {
+                removed += 1;
+                false
+            } else {
+                true
+            }
+        });
+
+        debug!(
+            "Router path cache evicted {} entries (was at capacity {})",
+            removed, self.max_cache_entries
+        );
+    }
+
+    /// Incrementally update the route table and surgically invalidate only
+    /// the path cache entries affected by changed routes.
+    ///
+    /// The route table itself is rebuilt (cheap O(n log n) sort) because
+    /// insertion order matters for longest-prefix matching. But the path
+    /// cache — which is the expensive thing to lose — is preserved for all
+    /// unaffected routes. Only paths that `starts_with` a changed
+    /// listen_path are evicted, so the hot 99% of cache entries survive.
+    pub fn apply_delta(&self, config: &GatewayConfig, affected_listen_paths: &[String]) {
+        // Rebuild the sorted route table (cheap, O(n log n))
+        let table = Self::build_route_table(config);
+        self.route_table.store(Arc::new(table));
+
+        if affected_listen_paths.is_empty() {
+            return;
+        }
+
+        // Surgically invalidate only path cache entries that could be
+        // affected by the changed routes. A cached path "/api/v2/users"
+        // is invalidated if any affected listen_path (e.g. "/api/v2") is
+        // a prefix of it, OR if the cached path is a prefix of an affected
+        // listen_path (handles the case where a new longer route takes
+        // priority over a shorter cached match).
+        let before = self.path_cache.len();
+        self.path_cache.retain(|cached_path, _| {
+            !affected_listen_paths.iter().any(|lp| {
+                cached_path.starts_with(lp.as_str()) || lp.starts_with(cached_path.as_str())
+            })
+        });
+        let evicted = before - self.path_cache.len();
+        if evicted > 0 {
+            debug!(
+                "Router cache: route table rebuilt ({} routes), surgically evicted {} of {} path cache entries",
+                config.proxies.len(),
+                evicted,
+                before
+            );
+        }
     }
 
     /// Build a pre-sorted route table from config.

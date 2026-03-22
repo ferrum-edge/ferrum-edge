@@ -33,11 +33,14 @@ src/
 │   └── types.rs           # Core data structures (Proxy, Consumer, Plugin)
 ├── proxy/                 # Proxy request handling
 │   ├── mod.rs             # ProxyState and main proxy logic
+│   ├── body.rs            # ProxyBody sum type (Full/Stream) for response streaming
 │   └── handler.rs         # HTTP request/response processing
 ├── router_cache.rs        # Pre-sorted route table with bounded path cache
 ├── connection_pool.rs     # HTTP client connection pooling with mTLS support
+├── load_balancer.rs       # Load balancing algorithms and upstream target selection
+├── health_check.rs        # Active and passive health checking for upstream targets
 ├── dns/                   # DNS resolution and caching
-│   ├── mod.rs             # DNS module exports
+│   ├── mod.rs             # DNS module exports, DnsCacheResolver for HTTP clients
 │   └── resolver.rs        # Async DNS resolver with caching
 ├── admin/                 # Admin API for configuration management
 │   ├── mod.rs             # Admin API routes and handlers
@@ -101,7 +104,14 @@ tests/
 
 ```
 docs/
-└── backend_mtls.md        # Backend mTLS configuration guide
+├── backend_mtls.md        # Backend mTLS configuration guide
+├── dns_resolver.md        # DNS resolver and caching configuration
+├── load_balancing.md      # Load balancing, health checks, retry, circuit breaker
+├── cors_plugin.md         # CORS plugin configuration
+├── frontend_tls.md        # Frontend TLS/mTLS configuration
+├── cp_dp_mode.md          # Control Plane / Data Plane architecture
+├── response_body_streaming.md # Response body streaming vs buffering
+└── ...                    # Additional documentation
 ```
 
 ### **Performance Testing (`perftest/`)**
@@ -129,14 +139,17 @@ The configuration system provides flexible configuration management through mult
 - Per-proxy configuration overrides
 - Configuration validation and defaults
 
-### **2. Proxy Engine (`src/proxy/` + `src/router_cache.rs`)**
+### **2. Proxy Engine (`src/proxy/` + `src/router_cache.rs` + `src/plugin_cache.rs` + `src/consumer_index.rs`)**
 
 The proxy engine handles all request routing and processing with **consistent security for HTTP and WebSocket**:
 
 **Key Features**:
-- **Router cache** with pre-sorted route table and bounded path lookup cache (`src/router_cache.rs`)
+- **Router cache** with pre-sorted route table and bounded path lookup cache with random-sample eviction (`src/router_cache.rs`)
 - Longest prefix match routing with O(1) cache hits for repeated paths
 - Route table rebuilt atomically via ArcSwap on config changes — never on the hot request path
+- **Plugin cache** returns `Arc<Vec<...>>` for zero-allocation per-request plugin retrieval (`src/plugin_cache.rs`)
+- **Consumer index** with separate per-credential-type HashMaps for allocation-free O(1) auth lookups (`src/consumer_index.rs`)
+- **Load balancer cache** with pre-computed target keys and O(1) upstream index (`src/load_balancer.rs`)
 - Protocol translation (HTTP ↔ WebSocket)
 - HTTP/1.1 and HTTP/2 inbound support (auto-negotiated via ALPN on TLS connections)
 - Request/response transformation
@@ -145,6 +158,7 @@ The proxy engine handles all request routing and processing with **consistent se
 - **Rate limiting** applies to WebSocket connections
 - **Complete logging** of WebSocket connections
 - **TCP keepalive** on inbound connections (60s interval) for stale client detection
+- **Configurable response body mode** — per-proxy `response_body_mode` (stream/buffer); plugins can force buffering via `requires_response_body_buffering()`
 
 **Security Model**:
 - **WebSocket requests** go through the same plugin pipeline as HTTP requests
@@ -203,7 +217,22 @@ Separate HTTP and HTTPS listeners for the Admin API with enhanced TLS support:
 - **File Mode**: No admin API (proxy only)
 - **Data Plane Mode**: Read-only admin API served from cached config (writes return 403)
 
-### **4. Connection Pool (`src/connection_pool.rs`)**
+### **4. Load Balancer & Health Checks (`src/load_balancer.rs`, `src/health_check.rs`)**
+
+Distributes traffic across multiple backend targets within an upstream group:
+
+**Key Features**:
+- Five algorithms: round robin, weighted round robin (smooth WRR), least connections, consistent hashing (150 vnodes), random
+- Atomic rebuild on config changes — no requests dropped during reconfiguration
+- Active health checks (periodic HTTP probes) and passive health checks (response monitoring)
+- Passive recovery timer (`healthy_after_seconds`) for automatic target restoration
+- Connection errors always count as passive health check failures
+- All-unhealthy fallback: routes to all targets rather than returning errors
+- `TargetSelection` carries `is_fallback` flag for downstream observability
+- Client-facing headers: `X-Gateway-Error` (connection_failure | backend_timeout | backend_error) and `X-Gateway-Upstream-Status: degraded`
+- See [docs/load_balancing.md](docs/load_balancing.md) for full configuration reference
+
+### **4.1 Connection Pool (`src/connection_pool.rs`)**
 
 High-performance HTTP client connection pooling with backend mTLS support:
 
@@ -216,7 +245,7 @@ High-performance HTTP client connection pooling with backend mTLS support:
 - Custom CA bundle support for server certificate verification
 - No-Verify mode for testing environments (`FERRUM_BACKEND_TLS_NO_VERIFY`)
 - Per-proxy connection configuration overrides
-- DNS resolution integration
+- Transparent DNS cache integration via `DnsCacheResolver` — no DNS in the hot path
 - Connection statistics and monitoring
 
 ### **4. Plugin System (`src/plugins/`)**
@@ -306,11 +335,49 @@ Async DNS resolution with caching designed to keep lookups off the hot request p
 
 **Key Features**:
 - In-memory `DashMap` caching with configurable TTL
-- **Startup warmup** — awaited before accepting requests (no cold-cache lookups in hot path)
+- **Startup warmup** — resolves all proxy backend, upstream target, and plugin endpoint hostnames (deduplicated) before accepting requests
 - **Background refresh** — proactively re-resolves entries at 75% TTL before expiration
+- **`DnsCacheResolver` / `DnsCacheResolver`** — custom `reqwest::dns::Resolve` implementations that route all HTTP client DNS lookups (proxy backends, health checks, and plugin outbound calls) through the cache, keeping DNS off the hot request path
 - Static DNS overrides (global and per-proxy)
 - Per-proxy DNS configuration and TTL overrides
 - Graceful degradation on resolution failures
+
+## ⚡ Performance & Scalability
+
+The gateway is designed to scale to **10,000+ proxy/consumer resources** and **30,000+ plugin configurations** with minimal per-request overhead. All hot-path data structures use lock-free reads and pre-computed indexes.
+
+### **Per-Request Data Structure Complexity**
+
+| Component | Lookup | Lock Type | Notes |
+|-----------|--------|-----------|-------|
+| Route matching | O(1) cache hit / O(routes) fallback | Lock-free ArcSwap | DashMap path cache with random-sample eviction |
+| Plugin lookup | O(1) HashMap | Lock-free ArcSwap | Returns `Arc<Vec<...>>` — zero Vec allocation per request |
+| Consumer auth | O(1) per credential type | Lock-free ArcSwap | Separate indexes per type (no format!() allocation) |
+| Upstream lookup | O(1) HashMap | Lock-free ArcSwap | Pre-built index avoids linear scan |
+| Load balancer | O(1) round-robin / O(log n) consistent hash | Lock-free ArcSwap | Pre-computed target keys avoid format!() per request |
+| Circuit breaker | O(1) atomic loads | Lock-free DashMap | |
+| Health check state | O(1) DashMap | Lock-free DashMap | |
+
+### **Key Design Decisions for Scale**
+
+- **ArcSwap everywhere**: Config updates are atomic pointer swaps. Readers never block, even during config reload with 10k+ resources.
+- **Pre-computed indexes**: Plugin configs are indexed by `proxy_id` at build time (O(P+C) rebuild instead of O(P×C)). Consumer credentials are split into separate HashMaps per type. Load balancer target keys are pre-computed strings.
+- **Zero per-request allocation in plugin lookup**: `PluginCache::get_plugins()` returns `Arc<Vec<Arc<dyn Plugin>>>` — a single Arc clone, not N Arc clones + Vec allocation.
+- **Random-sample cache eviction**: RouterCache evicts ~25% of entries when full instead of clearing the entire cache, preventing thundering-herd O(routes) scans.
+- **No locks on the hot path**: All request-path reads use `ArcSwap::load()` (lock-free) or `DashMap` (per-bucket sharded locks). No `Mutex` or `RwLock` in the request pipeline.
+
+### **Config Rebuild Performance**
+
+When configuration changes (database poll, SIGHUP, or gRPC push), all caches are rebuilt atomically off the hot path:
+
+| Cache | Rebuild Complexity | Notes |
+|-------|-------------------|-------|
+| RouterCache | O(n log n) sort | Pre-sorted by listen_path length |
+| PluginCache | O(P + C) | Plugin configs pre-indexed by proxy_id |
+| ConsumerIndex | O(consumers × credentials) | ~3-5 index entries per consumer |
+| LoadBalancerCache | O(upstreams × targets) | Pre-computes target keys and hash rings |
+
+In-flight requests continue using the previous config snapshot via Arc reference counting — zero disruption during reload.
 
 ## 🔄 Request Flow
 
@@ -325,17 +392,19 @@ Async DNS resolution with caching designed to keep lookups off the hot request p
    ↓
 4. Plugin Pipeline (auth → authz → rate limit)
    ↓
-5. DNS Cache Lookup (warm cache, background-refreshed)
+5. Load Balancer Target Selection (if upstream configured)
    ↓
-6. Connection Pool (get/create client per proxy key)
+6. Connection Pool (get/create client per proxy key, DNS via cache)
    ↓
-7. Backend Request (with mTLS if configured)
+7. Backend Request (with mTLS if configured, retry on failure)
    ↓
-8. Response Processing
+8. Health Check Reporting (passive: record success/failure)
    ↓
-9. Plugin Response Pipeline
+9. Response Processing (stream or buffer based on response_body_mode)
    ↓
-10. Client Response
+10. Plugin Response Pipeline
+   ↓
+11. Client Response
 ```
 
 ### **WebSocket Request Processing**
@@ -533,6 +602,9 @@ cargo test --test websocket_echo_server -- --nocapture
 
 - **`IMPLEMENTATION_ANALYSIS.md`** - Detailed implementation status
 - **`docs/backend_mtls.md`** - Backend mTLS configuration guide
+- **`docs/load_balancing.md`** - Load balancing, health checks, retry, circuit breaker guide
+- **`docs/dns_resolver.md`** - DNS resolver and caching configuration
+- **`docs/response_body_streaming.md`** - Response body streaming vs buffering configuration
 - **`tests/README.md`** - Test suite documentation
 - **`perftest/README.md`** - Performance testing guide
 

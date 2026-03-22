@@ -187,8 +187,44 @@ pub trait Plugin: Send + Sync {
         PluginResult::Continue
     }
 
+    /// Returns `true` if this plugin needs the entire response body buffered
+    /// in memory before forwarding to the client. When any active plugin
+    /// returns `true`, the gateway forces buffered mode for that proxy
+    /// regardless of the `response_body_mode` configuration.
+    ///
+    /// Default is `false` (compatible with streaming). Override this in
+    /// plugins that inspect or transform the response body.
+    fn requires_response_body_buffering(&self) -> bool {
+        false
+    }
+
     /// Called for transaction logging.
     async fn log(&self, _summary: &TransactionSummary) {}
+
+    /// Returns `true` if this plugin participates in the authentication phase.
+    ///
+    /// The gateway uses this to filter plugins for the authentication lifecycle
+    /// phase, where auth mode (Single vs Multi) determines how failures are
+    /// handled. Custom auth plugins should override this to return `true`.
+    ///
+    /// Default is `false`. Built-in auth plugins (jwt_auth, key_auth,
+    /// basic_auth, oauth2_auth, hmac_auth) override this to return `true`.
+    fn is_auth_plugin(&self) -> bool {
+        false
+    }
+
+    /// Returns hostnames that this plugin will send traffic to.
+    ///
+    /// Used during DNS warmup to pre-resolve plugin endpoint hostnames
+    /// alongside proxy backend hostnames, avoiding cold-cache DNS lookups
+    /// on the first request through the plugin.
+    ///
+    /// Default implementation returns an empty list (most plugins make no
+    /// outbound network calls). Override this if your plugin has a configured
+    /// endpoint URL (e.g., http_logging, oauth2_auth introspection).
+    fn warmup_hostnames(&self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 /// Create a plugin instance from its name and configuration.
@@ -250,15 +286,19 @@ pub fn create_plugin_with_http_client(
         "prometheus_metrics" => Some(Arc::new(prometheus_metrics::PrometheusMetrics::new(config))),
         "otel_tracing" => Some(Arc::new(otel_tracing::OtelTracing::new(config))),
         _ => {
-            tracing::warn!("Unknown plugin: {}", name);
-            None
+            // Fall through to custom plugins registry
+            let result = crate::custom_plugins::create_custom_plugin(name, config, http_client);
+            if result.is_none() {
+                tracing::warn!("Unknown plugin: {}", name);
+            }
+            result
         }
     }
 }
 
-/// List of all available plugin names.
+/// List of all available plugin names (built-in + custom).
 pub fn available_plugins() -> Vec<&'static str> {
-    vec![
+    let mut plugins = vec![
         "stdout_logging",
         "http_logging",
         "transaction_debugger",
@@ -279,5 +319,7 @@ pub fn available_plugins() -> Vec<&'static str> {
         "request_termination",
         "prometheus_metrics",
         "otel_tracing",
-    ]
+    ];
+    plugins.extend(crate::custom_plugins::custom_plugin_names());
+    plugins
 }

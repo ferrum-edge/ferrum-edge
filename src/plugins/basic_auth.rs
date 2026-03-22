@@ -22,6 +22,10 @@ impl Plugin for BasicAuth {
         "basic_auth"
     }
 
+    fn is_auth_plugin(&self) -> bool {
+        true
+    }
+
     fn priority(&self) -> u16 {
         super::priority::BASIC_AUTH
     }

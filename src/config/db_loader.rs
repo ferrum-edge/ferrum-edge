@@ -246,6 +246,7 @@ impl DatabaseStore {
                 upstream_id: None,
                 circuit_breaker: None,
                 retry: None,
+                response_body_mode: crate::config::types::ResponseBodyMode::default(),
                 // Connection pooling settings - None to use global defaults
                 pool_max_idle_per_host: None,
                 pool_idle_timeout_seconds: None,

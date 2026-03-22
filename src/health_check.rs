@@ -43,8 +43,8 @@ impl TargetHealth {
 
 /// Manages health state for all upstream targets.
 pub struct HealthChecker {
-    /// Set of unhealthy target keys ("host:port").
-    pub unhealthy_targets: Arc<DashMap<String, ()>>,
+    /// Set of unhealthy target keys ("host:port") → epoch_ms when marked unhealthy.
+    pub unhealthy_targets: Arc<DashMap<String, u64>>,
     /// Per-target health state.
     target_states: Arc<DashMap<String, Arc<TargetHealth>>>,
     /// Shared HTTP client for active health check probes, configured with
@@ -103,15 +103,36 @@ impl HealthChecker {
                         self.active_check_handles.push(handle);
                     }
                 }
+
+                // Start passive recovery timer if passive health checks are
+                // configured with a non-zero healthy_after_seconds. This
+                // automatically restores unhealthy targets after a cooldown
+                // period, preventing the "all targets unhealthy forever"
+                // death spiral when only passive checks are configured.
+                if let Some(passive) = &hc_config.passive
+                    && passive.healthy_after_seconds > 0
+                {
+                    let handle = self.start_passive_recovery_timer(
+                        &upstream.targets,
+                        passive.healthy_after_seconds,
+                    );
+                    self.active_check_handles.push(handle);
+                }
             }
         }
     }
 
     /// Report a response from a proxied request (passive health checking).
+    ///
+    /// `connection_error` should be `true` when the failure was a TCP
+    /// connection error, read timeout, or similar transport-level failure
+    /// (as opposed to a valid HTTP response from the backend). Connection
+    /// errors always count as failures regardless of `unhealthy_status_codes`.
     pub fn report_response(
         &self,
         target: &UpstreamTarget,
         status_code: u16,
+        connection_error: bool,
         passive_config: Option<&PassiveHealthCheck>,
     ) {
         let config = match passive_config {
@@ -126,7 +147,10 @@ impl HealthChecker {
             .or_insert_with(|| Arc::new(TargetHealth::new()))
             .clone();
 
-        if config.unhealthy_status_codes.contains(&status_code) {
+        // Connection errors (TCP refused, timeout, DNS failure) always count
+        // as failures — they indicate the target is unreachable, regardless
+        // of what status codes are in the unhealthy list.
+        if connection_error || config.unhealthy_status_codes.contains(&status_code) {
             state.consecutive_successes.store(0, Ordering::Relaxed);
             state.consecutive_failures.fetch_add(1, Ordering::Relaxed);
 
@@ -149,7 +173,7 @@ impl HealthChecker {
                     "Passive health check: marking target {} as unhealthy ({} failures in {}s window)",
                     key, failures_in_window, config.unhealthy_window_seconds
                 );
-                self.unhealthy_targets.insert(key, ());
+                self.unhealthy_targets.insert(key, now_epoch_ms());
             }
         } else {
             let failures = state.consecutive_failures.load(Ordering::Relaxed);
@@ -172,6 +196,57 @@ impl HealthChecker {
                 }
             }
         }
+    }
+
+    /// Start a background timer that automatically restores passively-marked
+    /// unhealthy targets after `healthy_after_seconds`.
+    ///
+    /// This prevents the "all targets unhealthy forever" death spiral when
+    /// only passive health checks are configured. Once the cooldown period
+    /// elapses, the target is restored to the rotation (like a circuit
+    /// breaker half-open state). If it immediately fails again, passive
+    /// health checks will re-mark it unhealthy.
+    fn start_passive_recovery_timer(
+        &self,
+        targets: &[UpstreamTarget],
+        healthy_after_seconds: u64,
+    ) -> tokio::task::JoinHandle<()> {
+        let unhealthy_targets = self.unhealthy_targets.clone();
+        let target_states = self.target_states.clone();
+        let target_keys: Vec<String> = targets.iter().map(target_key).collect();
+        let check_interval = Duration::from_secs(std::cmp::max(healthy_after_seconds / 4, 1));
+        let recovery_ms = healthy_after_seconds * 1000;
+
+        tokio::spawn(async move {
+            let mut timer = tokio::time::interval(check_interval);
+
+            loop {
+                timer.tick().await;
+
+                let now = now_epoch_ms();
+
+                for key in &target_keys {
+                    if let Some(entry) = unhealthy_targets.get(key) {
+                        let marked_at = *entry.value();
+                        if now.saturating_sub(marked_at) >= recovery_ms {
+                            info!(
+                                "Passive recovery timer: restoring target {} after {}s cooldown",
+                                key, healthy_after_seconds
+                            );
+                            drop(entry); // Release DashMap ref before removing
+                            unhealthy_targets.remove(key);
+
+                            // Reset failure counters so the target gets a clean slate
+                            if let Some(state) = target_states.get(key) {
+                                state.consecutive_failures.store(0, Ordering::Relaxed);
+                                state.consecutive_successes.store(0, Ordering::Relaxed);
+                                state.recent_failures.clear();
+                            }
+                        }
+                    }
+                }
+            }
+        })
     }
 
     /// Start an active health check background task for a target.
@@ -241,7 +316,7 @@ impl HealthChecker {
                                     "Active health check: target {} is unhealthy (status {})",
                                     key, status
                                 );
-                                unhealthy_targets.insert(key.clone(), ());
+                                unhealthy_targets.insert(key.clone(), now_epoch_ms());
                             }
                         }
                     }
@@ -258,7 +333,7 @@ impl HealthChecker {
                                 "Active health check: target {} is unhealthy (connection error)",
                                 key
                             );
-                            unhealthy_targets.insert(key.clone(), ());
+                            unhealthy_targets.insert(key.clone(), now_epoch_ms());
                         }
                     }
                 }
@@ -341,11 +416,12 @@ mod tests {
             unhealthy_status_codes: vec![500, 502, 503],
             unhealthy_threshold: 3,
             unhealthy_window_seconds: 60,
+            healthy_after_seconds: 30,
         };
 
         // Report 3 failures
         for _ in 0..3 {
-            checker.report_response(&target, 500, Some(&config));
+            checker.report_response(&target, 500, false, Some(&config));
         }
 
         assert!(checker.unhealthy_targets.contains_key("backend1:8080"));
@@ -359,16 +435,17 @@ mod tests {
             unhealthy_status_codes: vec![500],
             unhealthy_threshold: 2,
             unhealthy_window_seconds: 60,
+            healthy_after_seconds: 30,
         };
 
         // Mark unhealthy
         for _ in 0..2 {
-            checker.report_response(&target, 500, Some(&config));
+            checker.report_response(&target, 500, false, Some(&config));
         }
         assert!(checker.unhealthy_targets.contains_key("backend1:8080"));
 
         // Recovery
-        checker.report_response(&target, 200, Some(&config));
+        checker.report_response(&target, 200, false, Some(&config));
         assert!(!checker.unhealthy_targets.contains_key("backend1:8080"));
     }
 
@@ -380,12 +457,60 @@ mod tests {
             unhealthy_status_codes: vec![500],
             unhealthy_threshold: 3,
             unhealthy_window_seconds: 60,
+            healthy_after_seconds: 30,
         };
 
         for _ in 0..100 {
-            checker.report_response(&target, 200, Some(&config));
+            checker.report_response(&target, 200, false, Some(&config));
         }
 
+        assert!(!checker.unhealthy_targets.contains_key("backend1:8080"));
+    }
+
+    #[test]
+    fn test_connection_error_counts_as_failure_regardless_of_status_codes() {
+        let checker = HealthChecker::new();
+        let target = make_target("backend1", 8080);
+        // Only 500 is in the unhealthy list — 502 is NOT
+        let config = PassiveHealthCheck {
+            unhealthy_status_codes: vec![500],
+            unhealthy_threshold: 2,
+            unhealthy_window_seconds: 60,
+            healthy_after_seconds: 30,
+        };
+
+        // Report connection errors with status 502 (synthetic from proxy).
+        // Even though 502 is NOT in unhealthy_status_codes, connection_error=true
+        // should still count as a failure.
+        for _ in 0..2 {
+            checker.report_response(&target, 502, true, Some(&config));
+        }
+
+        assert!(
+            checker.unhealthy_targets.contains_key("backend1:8080"),
+            "Connection errors should mark target unhealthy even if status code is not in unhealthy list"
+        );
+    }
+
+    #[test]
+    fn test_connection_error_recovery_on_success() {
+        let checker = HealthChecker::new();
+        let target = make_target("backend1", 8080);
+        let config = PassiveHealthCheck {
+            unhealthy_status_codes: vec![500],
+            unhealthy_threshold: 2,
+            unhealthy_window_seconds: 60,
+            healthy_after_seconds: 30,
+        };
+
+        // Mark unhealthy via connection errors
+        for _ in 0..2 {
+            checker.report_response(&target, 502, true, Some(&config));
+        }
+        assert!(checker.unhealthy_targets.contains_key("backend1:8080"));
+
+        // A successful response should recover it
+        checker.report_response(&target, 200, false, Some(&config));
         assert!(!checker.unhealthy_targets.contains_key("backend1:8080"));
     }
 }

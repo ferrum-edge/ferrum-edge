@@ -17,7 +17,10 @@ Ferrum Gateway is a lightweight, extensible API gateway designed for modern micr
 - **Plugin System**: Extensible pipeline with lifecycle hooks for authentication, authorization, transformation, rate limiting, and logging
 - **Multi-Authentication**: Chain multiple auth plugins with first-match consumer identification
 - **TLS/mTLS Support**: Frontend TLS termination and backend mTLS with configurable certificate verification
-- **DNS Caching**: In-memory async DNS cache with startup warmup, background refresh at 75% TTL, per-proxy TTL overrides, and static overrides
+- **Load Balancing**: Five algorithms (round robin, weighted round robin, least connections, consistent hashing, random) with active/passive health checks, automatic failover, retry, and circuit breaker — see [docs/load_balancing.md](docs/load_balancing.md)
+- **Response Body Streaming**: Configurable per-proxy response body mode (`stream` default / `buffer`) — streaming forwards chunks as they arrive for lower latency and memory; plugins can force buffering via `requires_response_body_buffering()` — see [docs/response_body_streaming.md](docs/response_body_streaming.md)
+- **Client Observability Headers**: `X-Gateway-Error` (connection_failure | backend_timeout | backend_error) and `X-Gateway-Upstream-Status: degraded` for failure categorization
+- **DNS Caching**: In-memory async DNS cache with startup warmup (proxy backends + upstream targets + plugin endpoints, deduplicated), background refresh at 75% TTL, transparent `DnsCacheResolver` for all HTTP clients including plugin outbound calls, per-proxy TTL overrides, and static overrides
 - **Admin REST API**: Full CRUD for Proxies, Consumers, and Plugin Configs with JWT-protected endpoints
 - **Admin Read-Only Mode**: Configurable read-only mode for Admin API with automatic DP mode protection
 - **Rate Limiting**: In-memory per-consumer or per-IP rate limiting with configurable windows
@@ -374,6 +377,8 @@ proxies:
     backend_connect_timeout_ms: 5000
     backend_read_timeout_ms: 30000
     backend_write_timeout_ms: 30000
+    # Response body mode: "stream" (default) or "buffer"
+    # response_body_mode: stream
     # Connection pooling settings (optional - override global defaults)
     pool_max_idle_per_host: 25          # Override global default (10)
     pool_idle_timeout_seconds: 120      # Override global default (90)
@@ -1002,7 +1007,8 @@ All modes maintain an in-memory cache of the last valid configuration. If the co
 - Per-proxy TTL override via `dns_cache_ttl_seconds`
 - Static overrides: global (`FERRUM_DNS_OVERRIDES`) and per-proxy (`dns_override`)
 - Respects system `RES_OPTIONS` and `LOCALDOMAIN` environment variables
-- Non-blocking startup warmup resolves all backend hostnames
+- Non-blocking startup warmup resolves all backend, upstream, and plugin endpoint hostnames (deduplicated)
+- Shared DNS cache for plugin outbound calls (http_logging, oauth2_auth, etc.) via custom reqwest resolver
 - See [docs/dns_resolver.md](docs/dns_resolver.md) for full configuration reference
 
 ### HTTP/3 (QUIC) Support
@@ -1144,7 +1150,9 @@ Consumer passwords (for `basic_auth`) are stored as bcrypt hashes. The Admin API
 | `Database connection failed` | Verify `FERRUM_DB_TYPE` and `FERRUM_DB_URL` are correct |
 | `401 Unauthorized on Admin API` | Check that your JWT is signed with `FERRUM_ADMIN_JWT_SECRET` |
 | `404 Not Found on proxy request` | Verify the request path matches a configured `listen_path` prefix |
-| `502 Bad Gateway` | Backend is unreachable; check `backend_host`, `backend_port`, DNS, and timeouts |
+| `502 Bad Gateway` | Backend is unreachable; check `X-Gateway-Error` header for details (`connection_failure` vs `backend_error`); verify `backend_host`, `backend_port`, DNS, and timeouts |
+| `504 Gateway Timeout` | Backend did not respond in time; `X-Gateway-Error: backend_timeout` is set; check `backend_read_timeout_ms` |
+| `X-Gateway-Upstream-Status: degraded` | All upstream targets are unhealthy; requests are routed via fallback — check health check configuration |
 | `429 Too Many Requests` | Rate limit exceeded; check `rate_limiting` plugin config |
 | DP not receiving config | Verify `FERRUM_DP_GRPC_AUTH_TOKEN` is a valid JWT signed with `FERRUM_CP_GRPC_JWT_SECRET` |
 

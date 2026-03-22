@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use serde_json::Value;
 use tracing::warn;
+use url::Url;
 
 use super::utils::PluginHttpClient;
 use super::{Plugin, TransactionSummary};
@@ -51,5 +52,15 @@ impl Plugin for HttpLogging {
                 self.endpoint_url, e
             );
         }
+    }
+
+    fn warmup_hostnames(&self) -> Vec<String> {
+        if self.endpoint_url.is_empty() {
+            return Vec::new();
+        }
+        Url::parse(&self.endpoint_url)
+            .ok()
+            .and_then(|u| u.host_str().map(|h| vec![h.to_string()]))
+            .unwrap_or_default()
     }
 }

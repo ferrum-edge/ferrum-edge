@@ -58,6 +58,10 @@ impl Plugin for JwtAuth {
         "jwt_auth"
     }
 
+    fn is_auth_plugin(&self) -> bool {
+        true
+    }
+
     fn priority(&self) -> u16 {
         super::priority::JWT_AUTH
     }

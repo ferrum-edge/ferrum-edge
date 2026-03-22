@@ -3,6 +3,7 @@ use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
 use serde_json::Value;
 use std::collections::HashMap;
 use tracing::{debug, warn};
+use url::Url;
 
 use crate::consumer_index::ConsumerIndex;
 
@@ -48,6 +49,10 @@ impl OAuth2Auth {
 impl Plugin for OAuth2Auth {
     fn name(&self) -> &str {
         "oauth2_auth"
+    }
+
+    fn is_auth_plugin(&self) -> bool {
+        true
     }
 
     fn priority(&self) -> u16 {
@@ -151,11 +156,33 @@ impl Plugin for OAuth2Auth {
             }
         }
     }
+
+    fn warmup_hostnames(&self) -> Vec<String> {
+        let mut hosts = Vec::new();
+        if let Some(ref url) = self.introspection_url
+            && let Some(host) = Self::hostname_from_url(url)
+        {
+            hosts.push(host);
+        }
+        if let Some(ref url) = self.jwks_uri
+            && let Some(host) = Self::hostname_from_url(url)
+        {
+            hosts.push(host);
+        }
+        hosts
+    }
 }
 
 impl OAuth2Auth {
     /// Get the JWKS URI for this OAuth2 configuration (if configured)
     pub fn jwks_uri(&self) -> Option<&str> {
         self.jwks_uri.as_deref()
+    }
+
+    /// Extract the hostname from a URL string, if parseable.
+    fn hostname_from_url(url: &str) -> Option<String> {
+        Url::parse(url)
+            .ok()
+            .and_then(|u| u.host_str().map(|h| h.to_string()))
     }
 }

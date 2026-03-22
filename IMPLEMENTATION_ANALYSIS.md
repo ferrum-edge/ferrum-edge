@@ -217,7 +217,7 @@
 - ✅ **Backend mTLS** - Client certificate authentication with custom CAs and per-proxy configuration
 - ✅ **Testing Support** - 35+ test files with 280+ tests, all in `tests/` directory (no inline tests in `src/`)
 - ✅ **Connection Pooling** - Lock-free AtomicU64 cleanup, per-proxy pool keys, no forced h2c
-- ✅ **DNS Caching** - In-memory DashMap with TTL, background refresh at 75%, startup warmup, static overrides
+- ✅ **DNS Caching** - In-memory DashMap with TTL, background refresh at 75%, startup warmup (backends + upstreams + plugin endpoints, deduplicated), static overrides, shared cache for plugin outbound calls via `DnsCacheResolver`
 - ✅ **Router Cache** - Pre-sorted route table with bounded DashMap path cache, atomic ArcSwap rebuild
 - ⚠️ **gRPC Proxying** - Basic framework exists but needs full gRPC message forwarding (90% complete)
 

@@ -67,6 +67,7 @@ tests/
 │   ├── functional_cp_dp_test.rs        # CP/DP mode: gRPC + DB TLS
 │   ├── functional_database_test.rs     # Database mode: SQLite + Admin API + proxy
 │   ├── functional_file_mode_test.rs    # File mode: YAML config + SIGHUP reload
+│   ├── functional_load_balancer_test.rs # Load balancing: algorithms, health checks, failover
 │   ├── functional_grpc_test.rs         # gRPC proxying: h2c echo, errors, metadata
 │   └── functional_websocket_test.rs    # WebSocket proxying: ws/wss echo
 │
@@ -132,6 +133,9 @@ cargo test --test functional_tests functional_grpc -- --ignored --nocapture
 
 # WebSocket proxying: client → gateway → WebSocket backend echo
 cargo test --test functional_tests functional_websocket -- --ignored --nocapture
+
+# Load balancing: algorithms, health checks, target failover, observability headers
+cargo test --test functional_tests functional_load_balancer -- --ignored --nocapture
 ```
 
 ### Performance Tests

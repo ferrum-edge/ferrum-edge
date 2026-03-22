@@ -1,8 +1,11 @@
 mod admin;
 mod circuit_breaker;
 mod config;
+mod config_delta;
 mod connection_pool;
 mod consumer_index;
+#[path = "../custom_plugins/mod.rs"]
+mod custom_plugins;
 mod dns;
 mod grpc;
 mod health_check;

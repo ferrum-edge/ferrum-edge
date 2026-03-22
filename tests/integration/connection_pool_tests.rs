@@ -4,6 +4,7 @@ use chrono::Utc;
 use ferrum_gateway::config::PoolConfig;
 use ferrum_gateway::config::types::{AuthMode, BackendProtocol, Proxy};
 use ferrum_gateway::connection_pool::ConnectionPool;
+use ferrum_gateway::dns::{DnsCache, DnsConfig};
 
 fn create_test_proxy() -> Proxy {
     Proxy {
@@ -37,6 +38,7 @@ fn create_test_proxy() -> Proxy {
         upstream_id: None,
         circuit_breaker: None,
         retry: None,
+        response_body_mode: Default::default(),
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }
@@ -105,13 +107,21 @@ fn create_test_env_config() -> ferrum_gateway::config::EnvConfig {
     }
 }
 
+fn create_test_dns_cache() -> DnsCache {
+    DnsCache::new(DnsConfig::default())
+}
+
 #[tokio::test]
 async fn test_connection_pool_creation() {
-    let pool = ConnectionPool::new(PoolConfig::default(), create_test_env_config());
+    let pool = ConnectionPool::new(
+        PoolConfig::default(),
+        create_test_env_config(),
+        create_test_dns_cache(),
+    );
     let proxy = create_test_proxy();
 
-    let _client1 = pool.get_client(&proxy, None).await.unwrap();
-    let _client2 = pool.get_client(&proxy, None).await.unwrap();
+    let _client1 = pool.get_client(&proxy).await.unwrap();
+    let _client2 = pool.get_client(&proxy).await.unwrap();
 
     // Should reuse the same client
     let stats = pool.get_stats();
@@ -120,10 +130,14 @@ async fn test_connection_pool_creation() {
 
 #[tokio::test]
 async fn test_pool_stats() {
-    let pool = ConnectionPool::new(PoolConfig::default(), create_test_env_config());
+    let pool = ConnectionPool::new(
+        PoolConfig::default(),
+        create_test_env_config(),
+        create_test_dns_cache(),
+    );
     let proxy = create_test_proxy();
 
-    let _client = pool.get_client(&proxy, None).await.unwrap();
+    let _client = pool.get_client(&proxy).await.unwrap();
     let stats = pool.get_stats();
 
     assert!(stats.total_pools > 0);
@@ -133,7 +147,11 @@ async fn test_pool_stats() {
 
 #[tokio::test]
 async fn test_different_proxy_configs_produce_different_pool_keys() {
-    let pool = ConnectionPool::new(PoolConfig::default(), create_test_env_config());
+    let pool = ConnectionPool::new(
+        PoolConfig::default(),
+        create_test_env_config(),
+        create_test_dns_cache(),
+    );
 
     let mut proxy1 = create_test_proxy();
     proxy1.backend_port = 3000;
@@ -141,8 +159,8 @@ async fn test_different_proxy_configs_produce_different_pool_keys() {
     let mut proxy2 = create_test_proxy();
     proxy2.backend_port = 4000;
 
-    let _client1 = pool.get_client(&proxy1, None).await.unwrap();
-    let _client2 = pool.get_client(&proxy2, None).await.unwrap();
+    let _client1 = pool.get_client(&proxy1).await.unwrap();
+    let _client2 = pool.get_client(&proxy2).await.unwrap();
 
     let stats = pool.get_stats();
     assert_eq!(
@@ -153,7 +171,11 @@ async fn test_different_proxy_configs_produce_different_pool_keys() {
 
 #[tokio::test]
 async fn test_different_protocols_produce_different_pool_keys() {
-    let pool = ConnectionPool::new(PoolConfig::default(), create_test_env_config());
+    let pool = ConnectionPool::new(
+        PoolConfig::default(),
+        create_test_env_config(),
+        create_test_dns_cache(),
+    );
 
     let mut proxy_http = create_test_proxy();
     proxy_http.backend_protocol = BackendProtocol::Http;
@@ -161,8 +183,8 @@ async fn test_different_protocols_produce_different_pool_keys() {
     let mut proxy_https = create_test_proxy();
     proxy_https.backend_protocol = BackendProtocol::Https;
 
-    let _client1 = pool.get_client(&proxy_http, None).await.unwrap();
-    let _client2 = pool.get_client(&proxy_https, None).await.unwrap();
+    let _client1 = pool.get_client(&proxy_http).await.unwrap();
+    let _client2 = pool.get_client(&proxy_https).await.unwrap();
 
     let stats = pool.get_stats();
     assert_eq!(
@@ -173,12 +195,16 @@ async fn test_different_protocols_produce_different_pool_keys() {
 
 #[tokio::test]
 async fn test_same_proxy_reuses_cached_client() {
-    let pool = ConnectionPool::new(PoolConfig::default(), create_test_env_config());
+    let pool = ConnectionPool::new(
+        PoolConfig::default(),
+        create_test_env_config(),
+        create_test_dns_cache(),
+    );
     let proxy = create_test_proxy();
 
-    let _client1 = pool.get_client(&proxy, None).await.unwrap();
-    let _client2 = pool.get_client(&proxy, None).await.unwrap();
-    let _client3 = pool.get_client(&proxy, None).await.unwrap();
+    let _client1 = pool.get_client(&proxy).await.unwrap();
+    let _client2 = pool.get_client(&proxy).await.unwrap();
+    let _client3 = pool.get_client(&proxy).await.unwrap();
 
     let stats = pool.get_stats();
     assert_eq!(
@@ -188,29 +214,39 @@ async fn test_same_proxy_reuses_cached_client() {
 }
 
 #[tokio::test]
-async fn test_resolved_ip_affects_pool_key() {
-    let pool = ConnectionPool::new(PoolConfig::default(), create_test_env_config());
-    let proxy = create_test_proxy();
+async fn test_dns_override_affects_pool_key() {
+    let pool = ConnectionPool::new(
+        PoolConfig::default(),
+        create_test_env_config(),
+        create_test_dns_cache(),
+    );
 
-    let ip1: std::net::IpAddr = "127.0.0.1".parse().unwrap();
-    let ip2: std::net::IpAddr = "192.168.1.1".parse().unwrap();
+    let mut proxy1 = create_test_proxy();
+    proxy1.dns_override = Some("127.0.0.1".to_string());
 
-    let _client1 = pool.get_client(&proxy, Some(ip1)).await.unwrap();
-    let _client2 = pool.get_client(&proxy, Some(ip2)).await.unwrap();
+    let mut proxy2 = create_test_proxy();
+    proxy2.dns_override = Some("192.168.1.1".to_string());
+
+    let _client1 = pool.get_client(&proxy1).await.unwrap();
+    let _client2 = pool.get_client(&proxy2).await.unwrap();
 
     let stats = pool.get_stats();
     assert_eq!(
         stats.total_pools, 2,
-        "Different resolved IPs should create separate pool entries"
+        "Different DNS overrides should create separate pool entries"
     );
 }
 
 #[tokio::test]
 async fn test_pool_clear() {
-    let pool = ConnectionPool::new(PoolConfig::default(), create_test_env_config());
+    let pool = ConnectionPool::new(
+        PoolConfig::default(),
+        create_test_env_config(),
+        create_test_dns_cache(),
+    );
     let proxy = create_test_proxy();
 
-    let _client = pool.get_client(&proxy, None).await.unwrap();
+    let _client = pool.get_client(&proxy).await.unwrap();
     assert_eq!(pool.get_stats().total_pools, 1);
 
     pool.clear();
@@ -219,7 +255,11 @@ async fn test_pool_clear() {
 
 #[tokio::test]
 async fn test_pool_with_proxy_config_overrides() {
-    let pool = ConnectionPool::new(PoolConfig::default(), create_test_env_config());
+    let pool = ConnectionPool::new(
+        PoolConfig::default(),
+        create_test_env_config(),
+        create_test_dns_cache(),
+    );
 
     let mut proxy = create_test_proxy();
     proxy.pool_max_idle_per_host = Some(25);
@@ -227,7 +267,7 @@ async fn test_pool_with_proxy_config_overrides() {
     proxy.pool_tcp_keepalive_seconds = Some(30);
 
     // Should create a client successfully with proxy overrides
-    let client = pool.get_client(&proxy, None).await;
+    let client = pool.get_client(&proxy).await;
     assert!(
         client.is_ok(),
         "Pool should create client with proxy config overrides"
@@ -236,12 +276,16 @@ async fn test_pool_with_proxy_config_overrides() {
 
 #[tokio::test]
 async fn test_pool_websocket_protocol_creates_client() {
-    let pool = ConnectionPool::new(PoolConfig::default(), create_test_env_config());
+    let pool = ConnectionPool::new(
+        PoolConfig::default(),
+        create_test_env_config(),
+        create_test_dns_cache(),
+    );
 
     let mut proxy = create_test_proxy();
     proxy.backend_protocol = BackendProtocol::Ws;
 
-    let client = pool.get_client(&proxy, None).await;
+    let client = pool.get_client(&proxy).await;
     assert!(
         client.is_ok(),
         "Pool should create client for WebSocket protocol"

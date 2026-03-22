@@ -39,6 +39,16 @@ Response body limits protect against backends sending unexpectedly large payload
 1. **Content-Length fast path**: If the backend's `Content-Length` header exceeds `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES`, a 502 is returned immediately.
 2. **Streaming enforcement**: Response bytes are collected in chunks with a running size counter. If the accumulated size exceeds the limit, collection stops and a 502 is returned.
 
+### Interaction with Response Body Streaming
+
+When `response_body_mode: stream` is configured (the default), the gateway can forward response chunks to the client as they arrive without buffering the full body. However, response size limits still apply:
+
+- **With `Content-Length` header**: If the backend sends a `Content-Length` that exceeds `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES`, the request is rejected immediately with 502 before any streaming begins. If the Content-Length is within the limit, the response is streamed directly.
+- **Without `Content-Length` header**: The gateway **falls back to buffering** because it cannot verify the response size upfront. This ensures size limits are always enforced, even when streaming is configured.
+- **When `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES=0`** (unlimited): Responses are streamed without any size checks, regardless of whether `Content-Length` is present.
+
+See [docs/response_body_streaming.md](response_body_streaming.md) for full details on streaming vs buffering behavior.
+
 ## HTTP/3 (QUIC) Enforcement
 
 The same size limits apply to HTTP/3 connections:

@@ -10,9 +10,9 @@ use super::plugin_utils::{create_test_consumer, create_test_context};
 #[tokio::test]
 async fn test_all_plugins_available() {
     let plugins = available_plugins();
-    assert_eq!(plugins.len(), 20);
 
-    let expected_plugins = vec![
+    // 20 built-in + custom plugins from custom_plugins/mod.rs
+    let expected_builtins = vec![
         "stdout_logging",
         "http_logging",
         "transaction_debugger",
@@ -34,6 +34,16 @@ async fn test_all_plugins_available() {
         "prometheus_metrics",
         "otel_tracing",
     ];
+
+    // Verify all built-in plugins are present
+    assert!(
+        plugins.len() >= expected_builtins.len(),
+        "Expected at least {} plugins, got {}",
+        expected_builtins.len(),
+        plugins.len()
+    );
+
+    let expected_plugins = expected_builtins;
 
     for expected in expected_plugins {
         assert!(plugins.contains(&expected), "Missing plugin: {}", expected);

@@ -164,6 +164,10 @@ impl Plugin for HmacAuth {
         "hmac_auth"
     }
 
+    fn is_auth_plugin(&self) -> bool {
+        true
+    }
+
     fn priority(&self) -> u16 {
         HMAC_AUTH_PRIORITY
     }

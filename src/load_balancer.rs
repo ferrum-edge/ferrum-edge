@@ -11,56 +11,134 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
+/// Result of a target selection, indicating whether the selection was from
+/// healthy targets or a degraded-mode fallback (all targets were unhealthy).
+#[derive(Debug, Clone)]
+pub struct TargetSelection {
+    pub target: UpstreamTarget,
+    /// True when all targets were marked unhealthy and this selection is a
+    /// best-effort fallback. Callers should propagate this as an
+    /// `X-Gateway-Upstream-Status: degraded` response header so clients
+    /// and ops teams can distinguish degraded-mode routing from normal routing.
+    pub is_fallback: bool,
+}
+
 /// Load balancer cache, rebuilt atomically on config change.
+///
+/// Individual `LoadBalancer` instances are wrapped in `Arc` so that
+/// incremental updates can clone the HashMap cheaply (just Arc pointer
+/// copies) and only allocate new `LoadBalancer` instances for changed
+/// upstreams. Unchanged upstreams keep their exact same instance —
+/// round-robin counters, WRR weights, active connection counts, and
+/// consistent hash rings are all preserved.
 pub struct LoadBalancerCache {
-    balancers: ArcSwap<HashMap<String, LoadBalancer>>,
+    balancers: ArcSwap<HashMap<String, Arc<LoadBalancer>>>,
+    /// O(1) upstream lookup by ID (avoids linear scan of config.upstreams).
+    upstreams: ArcSwap<HashMap<String, Arc<Upstream>>>,
 }
 
 impl LoadBalancerCache {
     pub fn new(config: &GatewayConfig) -> Self {
         let balancers = Self::build_balancers(config);
+        let upstreams = Self::build_upstream_index(config);
         Self {
             balancers: ArcSwap::new(Arc::new(balancers)),
+            upstreams: ArcSwap::new(Arc::new(upstreams)),
         }
     }
 
     pub fn rebuild(&self, config: &GatewayConfig) {
         let balancers = Self::build_balancers(config);
+        let upstreams = Self::build_upstream_index(config);
         self.balancers.store(Arc::new(balancers));
+        self.upstreams.store(Arc::new(upstreams));
     }
 
-    fn build_balancers(config: &GatewayConfig) -> HashMap<String, LoadBalancer> {
-        let mut map = HashMap::new();
+    fn build_balancers(config: &GatewayConfig) -> HashMap<String, Arc<LoadBalancer>> {
+        let mut map = HashMap::with_capacity(config.upstreams.len());
         for upstream in &config.upstreams {
             map.insert(
                 upstream.id.clone(),
-                LoadBalancer::new(
+                Arc::new(LoadBalancer::new(
                     upstream.algorithm,
                     &upstream.targets,
                     upstream.hash_on.clone(),
-                ),
+                )),
             );
         }
         map
     }
 
-    /// Look up an upstream by ID.
-    #[allow(dead_code)]
-    pub fn get_upstream<'a>(
+    fn build_upstream_index(config: &GatewayConfig) -> HashMap<String, Arc<Upstream>> {
+        let mut map = HashMap::with_capacity(config.upstreams.len());
+        for upstream in &config.upstreams {
+            map.insert(upstream.id.clone(), Arc::new(upstream.clone()));
+        }
+        map
+    }
+
+    /// Incrementally update only the changed upstreams.
+    ///
+    /// Clones the current `HashMap<String, Arc<LoadBalancer>>` (cheap — just
+    /// Arc pointer copies for all 10k entries), then:
+    /// - Removes deleted upstreams
+    /// - Creates fresh `LoadBalancer` instances only for added/modified upstreams
+    /// - Unchanged upstreams keep their exact same `Arc<LoadBalancer>`, preserving
+    ///   round-robin counters, WRR weights, active connection counts, and hash rings
+    pub fn apply_delta(
         &self,
-        config: &'a GatewayConfig,
-        upstream_id: &str,
-    ) -> Option<&'a Upstream> {
-        config.upstreams.iter().find(|u| u.id == upstream_id)
+        full_new_config: &GatewayConfig,
+        added: &[Upstream],
+        removed_ids: &[String],
+        modified: &[Upstream],
+    ) {
+        if added.is_empty() && removed_ids.is_empty() && modified.is_empty() {
+            return;
+        }
+
+        // Clone the current map — O(n) Arc pointer copies, no LoadBalancer cloning
+        let mut new_balancers = self.balancers.load().as_ref().clone();
+
+        // Remove deleted upstreams
+        for id in removed_ids {
+            new_balancers.remove(id);
+        }
+
+        // Create fresh LoadBalancer instances only for added/modified upstreams
+        for upstream in added.iter().chain(modified.iter()) {
+            new_balancers.insert(
+                upstream.id.clone(),
+                Arc::new(LoadBalancer::new(
+                    upstream.algorithm,
+                    &upstream.targets,
+                    upstream.hash_on.clone(),
+                )),
+            );
+        }
+
+        // Upstream index is cheap to rebuild (just Arc<Upstream> clones)
+        let new_upstream_idx = Self::build_upstream_index(full_new_config);
+
+        self.balancers.store(Arc::new(new_balancers));
+        self.upstreams.store(Arc::new(new_upstream_idx));
+    }
+
+    /// O(1) lookup of an upstream by ID from the pre-built index.
+    pub fn get_upstream(&self, upstream_id: &str) -> Option<Arc<Upstream>> {
+        let idx = self.upstreams.load();
+        idx.get(upstream_id).cloned()
     }
 
     /// Select a target from the upstream, filtering out unhealthy targets.
+    ///
+    /// Returns a [`TargetSelection`] indicating whether the target came from
+    /// the healthy pool or is a degraded-mode fallback (all targets unhealthy).
     pub fn select_target(
         &self,
         upstream_id: &str,
         ctx_key: &str,
-        unhealthy: Option<&DashMap<String, ()>>,
-    ) -> Option<UpstreamTarget> {
+        unhealthy: Option<&DashMap<String, u64>>,
+    ) -> Option<TargetSelection> {
         let balancers = self.balancers.load();
         let balancer = balancers.get(upstream_id)?;
         balancer.select(ctx_key, unhealthy)
@@ -72,7 +150,7 @@ impl LoadBalancerCache {
         upstream_id: &str,
         ctx_key: &str,
         exclude: &UpstreamTarget,
-        unhealthy: Option<&DashMap<String, ()>>,
+        unhealthy: Option<&DashMap<String, u64>>,
     ) -> Option<UpstreamTarget> {
         let balancers = self.balancers.load();
         let balancer = balancers.get(upstream_id)?;
@@ -111,6 +189,8 @@ fn target_key(target: &UpstreamTarget) -> String {
 /// Per-upstream load balancer with algorithm-specific state.
 struct LoadBalancer {
     targets: Vec<UpstreamTarget>,
+    /// Pre-computed "host:port" keys for each target, avoiding format!() per request.
+    target_keys: Vec<String>,
     algorithm: LoadBalancerAlgorithm,
     /// Round-robin counter.
     rr_counter: AtomicU64,
@@ -131,16 +211,18 @@ impl LoadBalancer {
         hash_on: Option<String>,
     ) -> Self {
         let wrr_weights: Vec<AtomicI64> = targets.iter().map(|_| AtomicI64::new(0)).collect();
+        // Pre-compute target keys once at build time, not per-request
+        let target_keys: Vec<String> = targets.iter().map(target_key).collect();
 
         // Build consistent hash ring with virtual nodes
         let mut hash_ring = Vec::new();
         if algorithm == LoadBalancerAlgorithm::ConsistentHashing {
-            for (idx, target) in targets.iter().enumerate() {
+            for (idx, key) in target_keys.iter().enumerate() {
                 // 150 virtual nodes per target for better distribution
                 for vnode in 0..150 {
-                    let key = format!("{}:{}:{}", target.host, target.port, vnode);
+                    let vnode_key = format!("{}:{}", key, vnode);
                     let mut hasher = DefaultHasher::new();
-                    key.hash(&mut hasher);
+                    vnode_key.hash(&mut hasher);
                     hash_ring.push((hasher.finish(), idx));
                 }
             }
@@ -149,6 +231,7 @@ impl LoadBalancer {
 
         Self {
             targets: targets.to_vec(),
+            target_keys,
             algorithm,
             rr_counter: AtomicU64::new(0),
             wrr_weights,
@@ -160,14 +243,14 @@ impl LoadBalancer {
 
     fn healthy_targets(
         &self,
-        unhealthy: Option<&DashMap<String, ()>>,
+        unhealthy: Option<&DashMap<String, u64>>,
     ) -> Vec<(usize, &UpstreamTarget)> {
         self.targets
             .iter()
             .enumerate()
-            .filter(|(_, t)| {
+            .filter(|(i, _)| {
                 if let Some(unhealthy_set) = unhealthy {
-                    !unhealthy_set.contains_key(&target_key(t))
+                    !unhealthy_set.contains_key(&self.target_keys[*i])
                 } else {
                     true
                 }
@@ -178,18 +261,21 @@ impl LoadBalancer {
     fn select(
         &self,
         ctx_key: &str,
-        unhealthy: Option<&DashMap<String, ()>>,
-    ) -> Option<UpstreamTarget> {
+        unhealthy: Option<&DashMap<String, u64>>,
+    ) -> Option<TargetSelection> {
         let healthy = self.healthy_targets(unhealthy);
         if healthy.is_empty() {
             // Fallback: try all targets if everything is unhealthy
             if self.targets.is_empty() {
                 return None;
             }
-            return self.select_from_all(ctx_key);
+            return self.select_from_all(ctx_key).map(|target| TargetSelection {
+                target,
+                is_fallback: true,
+            });
         }
 
-        match self.algorithm {
+        let target = match self.algorithm {
             LoadBalancerAlgorithm::RoundRobin => {
                 let idx = self.rr_counter.fetch_add(1, Ordering::Relaxed) as usize;
                 let target_idx = idx % healthy.len();
@@ -208,7 +294,12 @@ impl LoadBalancer {
                 let hash = hasher.finish() as usize;
                 Some(healthy[hash % healthy.len()].1.clone())
             }
-        }
+        };
+
+        target.map(|t| TargetSelection {
+            target: t,
+            is_fallback: false,
+        })
     }
 
     fn select_from_all(&self, ctx_key: &str) -> Option<UpstreamTarget> {
@@ -228,13 +319,13 @@ impl LoadBalancer {
         &self,
         ctx_key: &str,
         exclude: &UpstreamTarget,
-        unhealthy: Option<&DashMap<String, ()>>,
+        unhealthy: Option<&DashMap<String, u64>>,
     ) -> Option<UpstreamTarget> {
         let exclude_key = target_key(exclude);
         let healthy: Vec<(usize, &UpstreamTarget)> = self
             .healthy_targets(unhealthy)
             .into_iter()
-            .filter(|(_, t)| target_key(t) != exclude_key)
+            .filter(|(i, _)| self.target_keys[*i] != exclude_key)
             .collect();
 
         if healthy.is_empty() {
@@ -243,7 +334,7 @@ impl LoadBalancer {
                 .targets
                 .iter()
                 .enumerate()
-                .filter(|(_, t)| target_key(t) != exclude_key)
+                .filter(|(i, _)| self.target_keys[*i] != exclude_key)
                 .collect();
             if fallback.is_empty() {
                 return None;
@@ -312,10 +403,10 @@ impl LoadBalancer {
         let mut best = &candidates[0];
 
         for candidate in candidates {
-            let key = target_key(candidate.1);
+            let key = &self.target_keys[candidate.0];
             let conns = self
                 .active_connections
-                .get(&key)
+                .get(key)
                 .map(|v| v.load(Ordering::Relaxed))
                 .unwrap_or(0);
             if conns < min_conns {
@@ -409,8 +500,9 @@ mod tests {
 
         let mut counts = HashMap::new();
         for _ in 0..300 {
-            let t = lb.select("", None).unwrap();
-            *counts.entry(t.host.clone()).or_insert(0) += 1;
+            let sel = lb.select("", None).unwrap();
+            assert!(!sel.is_fallback);
+            *counts.entry(sel.target.host.clone()).or_insert(0) += 1;
         }
 
         assert_eq!(counts.len(), 3);
@@ -426,8 +518,8 @@ mod tests {
 
         let mut counts = HashMap::new();
         for _ in 0..600 {
-            let t = lb.select("", None).unwrap();
-            *counts.entry(t.host.clone()).or_insert(0) += 1;
+            let sel = lb.select("", None).unwrap();
+            *counts.entry(sel.target.host.clone()).or_insert(0) += 1;
         }
 
         let heavy = counts.get("heavy").copied().unwrap_or(0);
@@ -443,8 +535,8 @@ mod tests {
 
         let first = lb.select("user-123", None).unwrap();
         for _ in 0..100 {
-            let t = lb.select("user-123", None).unwrap();
-            assert_eq!(t.host, first.host);
+            let sel = lb.select("user-123", None).unwrap();
+            assert_eq!(sel.target.host, first.target.host);
         }
     }
 
@@ -462,8 +554,8 @@ mod tests {
         }
 
         // Next selection should prefer host1
-        let t = lb.select("", None).unwrap();
-        assert_eq!(t.host, "host1");
+        let sel = lb.select("", None).unwrap();
+        assert_eq!(sel.target.host, "host1");
     }
 
     #[test]
@@ -471,13 +563,17 @@ mod tests {
         let targets = make_targets(3);
         let lb = LoadBalancer::new(LoadBalancerAlgorithm::RoundRobin, &targets, None);
 
-        let unhealthy: DashMap<String, ()> = DashMap::new();
-        unhealthy.insert("host0:8080".to_string(), ());
+        let unhealthy: DashMap<String, u64> = DashMap::new();
+        unhealthy.insert("host0:8080".to_string(), 0);
 
         let mut seen = std::collections::HashSet::new();
         for _ in 0..100 {
-            let t = lb.select("", Some(&unhealthy)).unwrap();
-            seen.insert(t.host.clone());
+            let sel = lb.select("", Some(&unhealthy)).unwrap();
+            assert!(
+                !sel.is_fallback,
+                "Should not be fallback when healthy targets exist"
+            );
+            seen.insert(sel.target.host.clone());
         }
 
         assert!(!seen.contains("host0"));
@@ -490,13 +586,17 @@ mod tests {
         let targets = make_targets(2);
         let lb = LoadBalancer::new(LoadBalancerAlgorithm::RoundRobin, &targets, None);
 
-        let unhealthy: DashMap<String, ()> = DashMap::new();
-        unhealthy.insert("host0:8080".to_string(), ());
-        unhealthy.insert("host1:8080".to_string(), ());
+        let unhealthy: DashMap<String, u64> = DashMap::new();
+        unhealthy.insert("host0:8080".to_string(), 0);
+        unhealthy.insert("host1:8080".to_string(), 0);
 
-        // Should still return a target (fallback)
-        let t = lb.select("", Some(&unhealthy));
-        assert!(t.is_some());
+        // Should still return a target (fallback) and mark it as degraded
+        let sel = lb.select("", Some(&unhealthy));
+        assert!(sel.is_some());
+        assert!(
+            sel.unwrap().is_fallback,
+            "All-unhealthy selection should be marked as fallback"
+        );
     }
 
     #[test]

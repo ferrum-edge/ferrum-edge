@@ -3,6 +3,7 @@
 
 use crate::config::PoolConfig;
 use crate::config::types::Proxy;
+use crate::dns::{DnsCache, DnsCacheResolver};
 use anyhow::Result;
 use dashmap::DashMap;
 use std::net::SocketAddr;
@@ -27,7 +28,14 @@ fn now_epoch_ms() -> u64 {
         .as_millis() as u64
 }
 
-/// Connection pool manager for reusing HTTP clients
+/// Connection pool manager for reusing HTTP clients.
+///
+/// All `reqwest::Client` instances created by this pool use a custom DNS
+/// resolver ([`DnsCacheResolver`]) that transparently routes all hostname
+/// lookups through the gateway's [`DnsCache`]. This ensures DNS resolution
+/// is off the hot request path for both single-backend and load-balanced
+/// proxies — the cache is pre-warmed at startup and continuously refreshed
+/// in the background.
 pub struct ConnectionPool {
     /// Map of (host, port, protocol) -> pooled client
     pools: Arc<DashMap<String, PoolEntry>>,
@@ -36,16 +44,27 @@ pub struct ConnectionPool {
     global_config: PoolConfig,
     /// Global mTLS configuration
     global_mtls_config: crate::config::EnvConfig,
+    /// DNS cache used as the custom resolver for all reqwest clients
+    dns_cache: DnsCache,
 }
 
 impl ConnectionPool {
-    /// Create a new connection pool manager with global configuration
-    pub fn new(global_config: PoolConfig, mtls_config: crate::config::EnvConfig) -> Self {
+    /// Create a new connection pool manager with global configuration.
+    ///
+    /// The `dns_cache` is used as the DNS resolver for every `reqwest::Client`
+    /// created by this pool, ensuring all DNS lookups go through the warmed
+    /// and background-refreshed cache rather than hitting DNS on the hot path.
+    pub fn new(
+        global_config: PoolConfig,
+        mtls_config: crate::config::EnvConfig,
+        dns_cache: DnsCache,
+    ) -> Self {
         let pool = Self {
             pools: Arc::new(DashMap::new()),
             cleanup_interval: Duration::from_secs(30),
             global_config,
             global_mtls_config: mtls_config,
+            dns_cache,
         };
 
         // Start cleanup task
@@ -53,16 +72,24 @@ impl ConnectionPool {
         pool
     }
 
-    /// Get or create a client for the given proxy using global defaults + proxy overrides
-    pub async fn get_client(
-        &self,
-        proxy: &Proxy,
-        resolved_ip: Option<std::net::IpAddr>,
-    ) -> Result<reqwest::Client> {
+    /// Get or create a client for the given proxy using global defaults + proxy overrides.
+    ///
+    /// The pool key is based on proxy-level configuration (host, port, protocol,
+    /// timeouts, TLS, pool settings) — NOT per upstream target. This is correct
+    /// because `reqwest::Client` has its own internal connection pool that keys
+    /// by URL host:port, so different upstream targets automatically get separate
+    /// TCP connections and TLS sessions (with correct SNI) even when sharing
+    /// one `reqwest::Client`.
+    ///
+    /// All clients use the gateway's DNS cache as their resolver, so DNS
+    /// lookups are served from the warmed cache — never hitting DNS on the
+    /// hot request path. For proxies with `dns_override`, a static resolve
+    /// hint is additionally set on the client.
+    pub async fn get_client(&self, proxy: &Proxy) -> Result<reqwest::Client> {
         // Get effective configuration (global defaults + proxy overrides)
         let config = self.global_config.for_proxy(proxy);
 
-        let pool_key = self.create_pool_key(proxy, resolved_ip, &config);
+        let pool_key = self.create_pool_key(proxy, &config);
 
         // Try to get existing client from pool
         if let Some(entry) = self.pools.get(&pool_key) {
@@ -76,7 +103,7 @@ impl ConnectionPool {
         // Create new client with effective configuration.
         // reqwest::Client has its own internal connection pool, so we only need
         // one Client per unique pool key. Always cache it for reuse.
-        let client = self.create_client(proxy, resolved_ip, &config).await?;
+        let client = self.create_client(proxy, &config).await?;
 
         let entry = PoolEntry {
             client: client.clone(),
@@ -87,14 +114,18 @@ impl ConnectionPool {
         Ok(client)
     }
 
-    /// Create a new reqwest client with the given configuration
-    async fn create_client(
-        &self,
-        proxy: &Proxy,
-        resolved_ip: Option<std::net::IpAddr>,
-        config: &PoolConfig,
-    ) -> Result<reqwest::Client> {
+    /// Create a new reqwest client with the given configuration.
+    ///
+    /// Every client uses [`DnsCacheResolver`] as its DNS resolver, so all
+    /// hostname lookups go through the gateway's DNS cache. For proxies
+    /// with a `dns_override`, a static `resolve()` hint is additionally
+    /// set to pin the backend host to the override IP.
+    async fn create_client(&self, proxy: &Proxy, config: &PoolConfig) -> Result<reqwest::Client> {
+        // Create the custom DNS resolver wrapping our DnsCache
+        let dns_resolver = Arc::new(DnsCacheResolver::new(self.dns_cache.clone()));
+
         let mut client_builder = reqwest::Client::builder()
+            .dns_resolver(dns_resolver)
             .connect_timeout(Duration::from_millis(proxy.backend_connect_timeout_ms))
             .timeout(Duration::from_millis(proxy.backend_read_timeout_ms))
             .danger_accept_invalid_certs(!proxy.backend_tls_verify_server_cert)
@@ -168,8 +199,13 @@ impl ConnectionPool {
             client_builder = client_builder.identity(identity);
         }
 
-        // If we have a resolved IP, configure the client to use it
-        if let Some(ip) = resolved_ip {
+        // If the proxy has a static DNS override, set a resolve hint so the
+        // override IP takes priority over the DnsCacheResolver for this
+        // specific hostname. This preserves backward compatibility with
+        // per-proxy dns_override configuration.
+        if let Some(ref dns_override) = proxy.dns_override
+            && let Ok(ip) = dns_override.parse::<std::net::IpAddr>()
+        {
             let socket_addr = SocketAddr::new(ip, proxy.backend_port);
             client_builder = client_builder.resolve(&proxy.backend_host, socket_addr);
         }
@@ -178,14 +214,15 @@ impl ConnectionPool {
         Ok(client)
     }
 
-    /// Create pool key for caching clients
-    fn create_pool_key(
-        &self,
-        proxy: &Proxy,
-        resolved_ip: Option<std::net::IpAddr>,
-        config: &PoolConfig,
-    ) -> String {
-        let ip_str = resolved_ip.map(|ip| ip.to_string()).unwrap_or_default();
+    /// Create pool key for caching clients.
+    ///
+    /// Keyed by proxy-level configuration (host, port, protocol, pool settings,
+    /// dns_override). All upstream targets in the same proxy share one pool
+    /// entry because `reqwest::Client` handles per-host connection pooling
+    /// internally — different target hostnames in the URL get separate TCP
+    /// connections and TLS sessions (with correct SNI) automatically.
+    fn create_pool_key(&self, proxy: &Proxy, config: &PoolConfig) -> String {
+        let override_str = proxy.dns_override.as_deref().unwrap_or_default();
         format!(
             "{}:{}:{}:{}:{}:{}",
             proxy.backend_host,
@@ -193,7 +230,7 @@ impl ConnectionPool {
             proxy.backend_protocol as u8,
             config.max_idle_per_host,
             config.idle_timeout_seconds,
-            ip_str
+            override_str
         )
     }
 

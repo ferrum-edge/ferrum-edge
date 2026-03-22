@@ -9,16 +9,48 @@ use crate::config::types::{BackoffStrategy, RetryConfig};
 use std::collections::HashMap;
 use std::time::Duration;
 
+/// The response body, either fully buffered or still streaming from the backend.
+pub enum ResponseBody {
+    /// Body has been fully collected into memory.
+    Buffered(Vec<u8>),
+    /// Body is still attached to the backend response and will be streamed
+    /// to the client. The status code and headers have already been extracted.
+    Streaming(reqwest::Response),
+}
+
 /// Result of a backend request, carrying enough context for the retry
 /// logic to distinguish connection-level failures from HTTP-level ones.
 pub struct BackendResponse {
     pub status_code: u16,
-    pub body: Vec<u8>,
+    pub body: ResponseBody,
     pub headers: HashMap<String, String>,
     /// True when the backend was never reached — TCP connect refused,
     /// DNS resolution failure, TLS handshake error, connect timeout, etc.
     /// False when we got an actual HTTP response (even if it's a 502).
     pub connection_error: bool,
+}
+
+impl BackendResponse {
+    /// Returns the buffered body bytes, or an empty slice for streaming responses.
+    #[allow(dead_code)]
+    pub fn body_bytes(&self) -> &[u8] {
+        match &self.body {
+            ResponseBody::Buffered(b) => b,
+            ResponseBody::Streaming(_) => &[],
+        }
+    }
+
+    /// Consume the response and return the buffered body bytes.
+    /// Panics if the body is streaming (caller must check first).
+    #[allow(dead_code)]
+    pub fn into_buffered_body(self) -> Vec<u8> {
+        match self.body {
+            ResponseBody::Buffered(b) => b,
+            ResponseBody::Streaming(_) => {
+                panic!("attempted to extract buffered body from a streaming response")
+            }
+        }
+    }
 }
 
 /// Determine if a request should be retried.
@@ -83,7 +115,7 @@ mod tests {
     fn http_response(status_code: u16) -> BackendResponse {
         BackendResponse {
             status_code,
-            body: Vec::new(),
+            body: ResponseBody::Buffered(Vec::new()),
             headers: HashMap::new(),
             connection_error: false,
         }
@@ -92,7 +124,7 @@ mod tests {
     fn connection_failure() -> BackendResponse {
         BackendResponse {
             status_code: 502,
-            body: Vec::new(),
+            body: ResponseBody::Buffered(Vec::new()),
             headers: HashMap::new(),
             connection_error: true,
         }

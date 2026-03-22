@@ -1,0 +1,1270 @@
+openapi: 3.1.0
+info:
+  title: Ferrum Gateway Admin API
+  description: |
+    RESTful API for managing the Ferrum API Gateway configuration at runtime.
+
+    All endpoints except `/health`, `/status`, and `/metrics` require JWT bearer
+    token authentication via the `Authorization: Bearer <token>` header.
+
+    When the primary database is unavailable, read endpoints transparently fall
+    back to the most recent cached configuration and include an
+    `X-Data-Source: cached` response header. Write operations require a live
+    database and return `503 Service Unavailable` when one is not present.
+
+    The Admin API can be placed in **read-only mode**, in which case all POST,
+    PUT, and DELETE operations return `403 Forbidden`.
+  version: 0.1.0
+  license:
+    name: MIT
+    url: https://opensource.org/licenses/MIT
+
+servers:
+  - url: "{protocol}://{host}:{port}"
+    description: Admin API listener
+    variables:
+      protocol:
+        default: http
+        enum: [http, https]
+      host:
+        default: 127.0.0.1
+      port:
+        default: "8001"
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: Health
+    description: Unauthenticated health and readiness probes
+  - name: Metrics
+    description: Observability and monitoring endpoints
+  - name: Proxies
+    description: Manage proxy route definitions
+  - name: Consumers
+    description: Manage API consumers and their credentials
+  - name: Plugins
+    description: Manage plugin configurations
+
+paths:
+  # ── Health ──────────────────────────────────────────────────────────
+  /health:
+    get:
+      operationId: getHealth
+      summary: Gateway health check
+      description: |
+        Returns gateway health status including database connectivity and
+        cached configuration availability. Also accessible at `/status`.
+      tags: [Health]
+      security: []
+      responses:
+        "200":
+          description: Health status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+
+  /status:
+    get:
+      operationId: getStatus
+      summary: Gateway status (alias for /health)
+      tags: [Health]
+      security: []
+      responses:
+        "200":
+          description: Health status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+
+  # ── Metrics ─────────────────────────────────────────────────────────
+  /metrics:
+    get:
+      operationId: getPrometheusMetrics
+      summary: Prometheus metrics
+      description: |
+        Returns gateway metrics in Prometheus exposition format.
+        Unauthenticated so it can be scraped by Prometheus without credentials.
+      tags: [Metrics]
+      security: []
+      responses:
+        "200":
+          description: Prometheus text exposition
+          content:
+            text/plain:
+              schema:
+                type: [string, "null"]
+              example: |
+                # HELP ferrum_requests_total Total number of requests processed
+                # TYPE ferrum_requests_total counter
+                ferrum_requests_total{proxy_id="my-api",method="GET",status_code="200"} 42
+
+  /admin/metrics:
+    get:
+      operationId: getAdminMetrics
+      summary: Gateway operational metrics (JSON)
+      tags: [Metrics]
+      responses:
+        "200":
+          description: Operational metrics
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminMetrics"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  # ── Proxies ─────────────────────────────────────────────────────────
+  /proxies:
+    get:
+      operationId: listProxies
+      summary: List all proxies
+      description: Falls back to cached config when the database is unavailable.
+      tags: [Proxies]
+      responses:
+        "200":
+          description: Array of proxy objects
+          headers:
+            X-Data-Source:
+              $ref: "#/components/headers/X-Data-Source"
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Proxy"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+    post:
+      operationId: createProxy
+      summary: Create a proxy
+      description: |
+        Creates a new proxy route. A UUID is generated when `id` is omitted or
+        empty. `created_at` and `updated_at` are set automatically.
+      tags: [Proxies]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ProxyCreate"
+      responses:
+        "201":
+          description: Proxy created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Proxy"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/ReadOnly"
+        "409":
+          description: Conflict — `listen_path` already exists
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /proxies/{id}:
+    parameters:
+      - $ref: "#/components/parameters/ResourceId"
+
+    get:
+      operationId: getProxy
+      summary: Get a proxy
+      tags: [Proxies]
+      responses:
+        "200":
+          description: Proxy object
+          headers:
+            X-Data-Source:
+              $ref: "#/components/headers/X-Data-Source"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Proxy"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+    put:
+      operationId: updateProxy
+      summary: Update a proxy
+      description: |
+        Replaces the proxy with the given body. The `id` field in the body is
+        ignored — the path parameter is authoritative. `updated_at` is set
+        automatically.
+      tags: [Proxies]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ProxyCreate"
+      responses:
+        "200":
+          description: Proxy updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Proxy"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/ReadOnly"
+        "409":
+          description: Conflict — `listen_path` already exists on another proxy
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+    delete:
+      operationId: deleteProxy
+      summary: Delete a proxy
+      tags: [Proxies]
+      responses:
+        "204":
+          description: Proxy deleted
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/ReadOnly"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  # ── Consumers ───────────────────────────────────────────────────────
+  /consumers:
+    get:
+      operationId: listConsumers
+      summary: List all consumers
+      tags: [Consumers]
+      responses:
+        "200":
+          description: Array of consumer objects
+          headers:
+            X-Data-Source:
+              $ref: "#/components/headers/X-Data-Source"
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Consumer"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+    post:
+      operationId: createConsumer
+      summary: Create a consumer
+      description: |
+        Creates a new API consumer. A UUID is generated when `id` is omitted
+        or empty. Plaintext `password` fields inside `basicauth` credentials
+        are automatically bcrypt-hashed and stored as `password_hash`.
+      tags: [Consumers]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ConsumerCreate"
+      responses:
+        "201":
+          description: Consumer created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Consumer"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/ReadOnly"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /consumers/{id}:
+    parameters:
+      - $ref: "#/components/parameters/ResourceId"
+
+    get:
+      operationId: getConsumer
+      summary: Get a consumer
+      tags: [Consumers]
+      responses:
+        "200":
+          description: Consumer object
+          headers:
+            X-Data-Source:
+              $ref: "#/components/headers/X-Data-Source"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Consumer"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+    put:
+      operationId: updateConsumer
+      summary: Update a consumer
+      tags: [Consumers]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ConsumerCreate"
+      responses:
+        "200":
+          description: Consumer updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Consumer"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/ReadOnly"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+    delete:
+      operationId: deleteConsumer
+      summary: Delete a consumer
+      tags: [Consumers]
+      responses:
+        "204":
+          description: Consumer deleted
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/ReadOnly"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /consumers/{consumer_id}/credentials/{cred_type}:
+    parameters:
+      - name: consumer_id
+        in: path
+        required: true
+        schema:
+          type: [string, "null"]
+        description: Consumer ID
+      - name: cred_type
+        in: path
+        required: true
+        schema:
+          type: [string, "null"]
+          examples:
+            - basicauth
+            - key-auth
+            - jwt
+            - oauth2
+            - hmac_auth
+        description: |
+          Credential type to set or remove (e.g. `basicauth`, `key-auth`,
+          `jwt`, `oauth2`, `hmac_auth`).
+
+    put:
+      operationId: updateConsumerCredentials
+      summary: Set or update a credential
+      description: |
+        Sets a credential on the consumer. For `basicauth`, a plaintext
+        `password` field is automatically bcrypt-hashed and stored as
+        `password_hash`.
+      tags: [Consumers]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              description: Credential payload (schema varies by credential type)
+              examples:
+                - username: alice
+                  password: s3cret
+                - key: my-api-key-value
+      responses:
+        "200":
+          description: Credentials updated — returns full consumer object
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Consumer"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+    delete:
+      operationId: deleteConsumerCredentials
+      summary: Remove a credential
+      tags: [Consumers]
+      responses:
+        "204":
+          description: Credential removed
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  # ── Plugins ─────────────────────────────────────────────────────────
+  /plugins:
+    get:
+      operationId: listAvailablePlugins
+      summary: List available plugin types
+      description: Returns the names of all built-in plugins that can be configured.
+      tags: [Plugins]
+      responses:
+        "200":
+          description: Array of plugin type names
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: [string, "null"]
+              example:
+                - stdout_logging
+                - http_logging
+                - transaction_debugger
+                - oauth2_auth
+                - jwt_auth
+                - key_auth
+                - basic_auth
+                - hmac_auth
+                - cors
+                - access_control
+                - ip_restriction
+                - bot_detection
+                - correlation_id
+                - request_transformer
+                - response_transformer
+                - rate_limiting
+                - body_validator
+                - request_termination
+                - prometheus_metrics
+                - otel_tracing
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /plugins/config:
+    get:
+      operationId: listPluginConfigs
+      summary: List all plugin configurations
+      tags: [Plugins]
+      responses:
+        "200":
+          description: Array of plugin configurations
+          headers:
+            X-Data-Source:
+              $ref: "#/components/headers/X-Data-Source"
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/PluginConfig"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+    post:
+      operationId: createPluginConfig
+      summary: Create a plugin configuration
+      tags: [Plugins]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PluginConfigCreate"
+      responses:
+        "201":
+          description: Plugin configuration created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PluginConfig"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/ReadOnly"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /plugins/config/{id}:
+    parameters:
+      - $ref: "#/components/parameters/ResourceId"
+
+    get:
+      operationId: getPluginConfig
+      summary: Get a plugin configuration
+      tags: [Plugins]
+      responses:
+        "200":
+          description: Plugin configuration object
+          headers:
+            X-Data-Source:
+              $ref: "#/components/headers/X-Data-Source"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PluginConfig"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+    put:
+      operationId: updatePluginConfig
+      summary: Update a plugin configuration
+      tags: [Plugins]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PluginConfigCreate"
+      responses:
+        "200":
+          description: Plugin configuration updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PluginConfig"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/ReadOnly"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+    delete:
+      operationId: deletePluginConfig
+      summary: Delete a plugin configuration
+      tags: [Plugins]
+      responses:
+        "204":
+          description: Plugin configuration deleted
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/ReadOnly"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+# ════════════════════════════════════════════════════════════════════════
+components:
+  # ── Security ────────────────────────────────────────────────────────
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        HS256-signed JWT. Configure the secret, issuer, and max TTL via
+        environment variables:
+
+        | Variable | Default | Description |
+        |----------|---------|-------------|
+        | `FERRUM_ADMIN_JWT_SECRET` | *(required)* | Signing key |
+        | `FERRUM_ADMIN_JWT_ISSUER` | `ferrum-gateway` | Expected `iss` claim |
+        | `FERRUM_ADMIN_JWT_MAX_TTL` | `3600` | Max token lifetime (seconds) |
+
+  # ── Reusable parameters ────────────────────────────────────────────
+  parameters:
+    ResourceId:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: string
+      description: Resource UUID
+
+  # ── Reusable headers ───────────────────────────────────────────────
+  headers:
+    X-Data-Source:
+      description: |
+        Present with value `cached` when the response was served from the
+        in-memory config cache instead of the primary database.
+      required: false
+      schema:
+        type: string
+        enum: [cached]
+
+  # ── Reusable responses ─────────────────────────────────────────────
+  responses:
+    BadRequest:
+      description: Invalid request body
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Unauthorized:
+      description: Missing or invalid JWT
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    ReadOnly:
+      description: Admin API is in read-only mode
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error: Admin API is in read-only mode
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    ServiceUnavailable:
+      description: Database unavailable and no cached config
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+
+  # ── Schemas ─────────────────────────────────────────────────────────
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: [string, "null"]
+          description: Human-readable error message
+
+    # ── Proxy ───────────────────────────────────────────────────────
+    Proxy:
+      type: object
+      required:
+        - id
+        - listen_path
+        - backend_protocol
+        - backend_host
+        - backend_port
+        - created_at
+        - updated_at
+      properties:
+        id:
+          type: [string, "null"]
+          format: uuid
+          description: Unique identifier (auto-generated if omitted on create)
+        name:
+          type: [string, "null"]
+
+          description: Optional friendly name
+        listen_path:
+          type: [string, "null"]
+          description: URL path prefix to match incoming requests (must be unique)
+          examples:
+            - /api/v1
+            - /users
+        backend_protocol:
+          $ref: "#/components/schemas/BackendProtocol"
+        backend_host:
+          type: [string, "null"]
+          description: Backend server hostname or IP
+        backend_port:
+          type: integer
+          format: uint16
+          description: Backend server port
+        backend_path:
+          type: [string, "null"]
+
+          description: Optional path prefix prepended to forwarded requests
+        strip_listen_path:
+          type: boolean
+          default: true
+          description: Strip listen_path prefix before forwarding to backend
+        preserve_host_header:
+          type: boolean
+          default: false
+          description: Forward the original Host header to the backend
+        backend_connect_timeout_ms:
+          type: integer
+          format: uint64
+          default: 5000
+          description: TCP connect timeout in milliseconds
+        backend_read_timeout_ms:
+          type: integer
+          format: uint64
+          default: 30000
+          description: Backend response timeout in milliseconds
+        backend_write_timeout_ms:
+          type: integer
+          format: uint64
+          default: 30000
+          description: Backend write timeout in milliseconds
+        backend_tls_client_cert_path:
+          type: [string, "null"]
+
+          description: Path to mTLS client certificate (PEM)
+        backend_tls_client_key_path:
+          type: [string, "null"]
+
+          description: Path to mTLS client private key (PEM)
+        backend_tls_verify_server_cert:
+          type: boolean
+          default: true
+          description: Verify the backend's TLS certificate
+        backend_tls_server_ca_cert_path:
+          type: [string, "null"]
+
+          description: Path to custom CA bundle for backend TLS verification
+        dns_override:
+          type: [string, "null"]
+
+          description: Override DNS resolution with a specific IP address
+        dns_cache_ttl_seconds:
+          type: [integer, "null"]
+          format: uint64
+          description: DNS cache TTL override in seconds
+        auth_mode:
+          $ref: "#/components/schemas/AuthMode"
+        plugins:
+          type: array
+          default: []
+          items:
+            $ref: "#/components/schemas/PluginAssociation"
+          description: Plugin configurations applied to this proxy
+        pool_max_idle_per_host:
+          type: [integer, "null"]
+          description: Max idle connections per host (overrides global, clamped 4–1024)
+        pool_idle_timeout_seconds:
+          type: [integer, "null"]
+          format: uint64
+          description: Idle connection timeout in seconds (overrides global)
+        pool_enable_http_keep_alive:
+          type: [boolean, "null"]
+          description: Enable HTTP keep-alive (overrides global)
+        pool_enable_http2:
+          type: [boolean, "null"]
+          description: Enable HTTP/2 keep-alive PINGs (overrides global)
+        pool_tcp_keepalive_seconds:
+          type: [integer, "null"]
+          format: uint64
+          description: TCP keep-alive probe interval (overrides global)
+        pool_http2_keep_alive_interval_seconds:
+          type: [integer, "null"]
+          format: uint64
+          description: HTTP/2 PING interval in seconds (overrides global)
+        pool_http2_keep_alive_timeout_seconds:
+          type: [integer, "null"]
+          format: uint64
+          description: HTTP/2 PING timeout in seconds (overrides global)
+        upstream_id:
+          type: [string, "null"]
+
+          description: |
+            Reference to an Upstream for load-balanced backends. When set,
+            `backend_host` and `backend_port` are overridden by the selected
+            upstream target.
+        circuit_breaker:
+          oneOf:
+            - $ref: "#/components/schemas/CircuitBreakerConfig"
+            - type: "null"
+          description: Optional circuit breaker configuration
+        retry:
+          oneOf:
+            - $ref: "#/components/schemas/RetryConfig"
+            - type: "null"
+          description: Optional retry configuration
+        created_at:
+          type: [string, "null"]
+          format: date-time
+          description: Creation timestamp (set by server)
+        updated_at:
+          type: [string, "null"]
+          format: date-time
+          description: Last modification timestamp (set by server)
+
+    ProxyCreate:
+      description: |
+        Request body for creating or updating a proxy. Same schema as Proxy
+        but `id`, `created_at`, and `updated_at` are optional (server-managed).
+      allOf:
+        - $ref: "#/components/schemas/Proxy"
+      required:
+        - listen_path
+        - backend_protocol
+        - backend_host
+        - backend_port
+
+    BackendProtocol:
+      type: string
+      enum: [http, https, ws, wss, grpc, grpcs, h3]
+      description: Protocol used to communicate with the backend
+
+    AuthMode:
+      type: string
+      enum: [single, multi]
+      default: single
+      description: |
+        `single` — first successful auth plugin wins.
+        `multi` — all auth plugins run; no single rejection blocks the request.
+
+    PluginAssociation:
+      type: object
+      required: [plugin_config_id]
+      properties:
+        plugin_config_id:
+          type: [string, "null"]
+          description: ID of the PluginConfig to apply to this proxy
+
+    # ── Consumer ────────────────────────────────────────────────────
+    Consumer:
+      type: object
+      required: [id, username, created_at, updated_at]
+      properties:
+        id:
+          type: [string, "null"]
+          format: uuid
+        username:
+          type: [string, "null"]
+          description: Unique consumer username
+        custom_id:
+          type: [string, "null"]
+
+          description: Optional external identifier
+        credentials:
+          type: object
+          default: {}
+          additionalProperties:
+            type: object
+          description: |
+            Map of credential type to credential payload.
+
+            | Type | Fields |
+            |------|--------|
+            | `basicauth` | `username`, `password_hash` (bcrypt) |
+            | `key-auth` | `key` |
+            | `jwt` | `key`, `secret`, `algorithm` |
+            | `oauth2` | `client_id`, `client_secret` |
+            | `hmac_auth` | `secret` |
+        created_at:
+          type: [string, "null"]
+          format: date-time
+        updated_at:
+          type: [string, "null"]
+          format: date-time
+
+    ConsumerCreate:
+      description: Request body for creating or updating a consumer.
+      allOf:
+        - $ref: "#/components/schemas/Consumer"
+      required:
+        - username
+
+    # ── Plugin Config ───────────────────────────────────────────────
+    PluginConfig:
+      type: object
+      required: [id, plugin_name, scope, enabled, created_at, updated_at]
+      properties:
+        id:
+          type: [string, "null"]
+          format: uuid
+        plugin_name:
+          type: [string, "null"]
+          description: Plugin type name (must be one of the available plugins)
+        config:
+          type: object
+          default: {}
+          description: Plugin-specific JSON configuration
+        scope:
+          $ref: "#/components/schemas/PluginScope"
+        proxy_id:
+          type: [string, "null"]
+
+          description: Required when scope is `proxy`
+        enabled:
+          type: boolean
+          default: true
+        created_at:
+          type: [string, "null"]
+          format: date-time
+        updated_at:
+          type: [string, "null"]
+          format: date-time
+
+    PluginConfigCreate:
+      description: Request body for creating or updating a plugin configuration.
+      allOf:
+        - $ref: "#/components/schemas/PluginConfig"
+      required:
+        - plugin_name
+        - scope
+
+    PluginScope:
+      type: string
+      enum: [global, proxy]
+      description: |
+        `global` — plugin applies to all proxies.
+        `proxy` — plugin applies only to the proxy referenced by `proxy_id`.
+
+    # ── Circuit Breaker ─────────────────────────────────────────────
+    CircuitBreakerConfig:
+      type: object
+      properties:
+        failure_threshold:
+          type: integer
+          format: uint32
+          default: 5
+          description: Consecutive failures to trip the circuit open
+        success_threshold:
+          type: integer
+          format: uint32
+          default: 3
+          description: Consecutive successes in half-open to close the circuit
+        timeout_seconds:
+          type: integer
+          format: uint64
+          default: 30
+          description: Seconds to wait in open state before transitioning to half-open
+        failure_status_codes:
+          type: array
+          items:
+            type: integer
+            format: uint16
+          default: [500, 502, 503, 504]
+          description: HTTP status codes that count as failures
+        half_open_max_requests:
+          type: integer
+          format: uint32
+          default: 1
+          description: Maximum concurrent probe requests allowed in half-open state
+
+    # ── Retry ───────────────────────────────────────────────────────
+    RetryConfig:
+      type: object
+      properties:
+        max_retries:
+          type: integer
+          format: uint32
+          default: 3
+          description: Maximum retry attempts
+        retryable_status_codes:
+          type: array
+          items:
+            type: integer
+            format: uint16
+          default: [502, 503, 504]
+          description: HTTP status codes eligible for retry
+        retryable_methods:
+          type: array
+          items:
+            type: [string, "null"]
+          default: [GET, HEAD, OPTIONS, PUT, DELETE]
+          description: HTTP methods eligible for retry
+        backoff:
+          $ref: "#/components/schemas/BackoffStrategy"
+        retry_on_connect_failure:
+          type: boolean
+          default: true
+          description: |
+            Retry on TCP-level failures (connect refused, DNS failure, TLS
+            error, timeout) independently of `retryable_status_codes`.
+
+    BackoffStrategy:
+      description: Retry delay strategy
+      oneOf:
+        - type: object
+          title: Fixed delay
+          required: [fixed]
+          properties:
+            fixed:
+              type: object
+              required: [delay_ms]
+              properties:
+                delay_ms:
+                  type: integer
+                  format: uint64
+                  default: 100
+                  description: Fixed delay between retries in milliseconds
+        - type: object
+          title: Exponential backoff
+          required: [exponential]
+          properties:
+            exponential:
+              type: object
+              required: [base_ms, max_ms]
+              properties:
+                base_ms:
+                  type: integer
+                  format: uint64
+                  description: Base delay in milliseconds (doubled each attempt)
+                max_ms:
+                  type: integer
+                  format: uint64
+                  description: Maximum delay cap in milliseconds
+      default:
+        fixed:
+          delay_ms: 100
+
+    # ── Upstream / Load Balancing ────────────────────────────────────
+    Upstream:
+      type: object
+      required: [id, targets, created_at, updated_at]
+      properties:
+        id:
+          type: [string, "null"]
+          format: uuid
+        name:
+          type: [string, "null"]
+
+        targets:
+          type: array
+          items:
+            $ref: "#/components/schemas/UpstreamTarget"
+          minItems: 1
+        algorithm:
+          $ref: "#/components/schemas/LoadBalancerAlgorithm"
+        hash_on:
+          type: [string, "null"]
+
+          description: |
+            Field to hash for consistent-hashing algorithm
+            (e.g. `header:x-user-id`). Ignored by other algorithms.
+        health_checks:
+          oneOf:
+            - $ref: "#/components/schemas/HealthCheckConfig"
+            - type: "null"
+        created_at:
+          type: [string, "null"]
+          format: date-time
+        updated_at:
+          type: [string, "null"]
+          format: date-time
+
+    UpstreamTarget:
+      type: object
+      required: [host, port]
+      properties:
+        host:
+          type: [string, "null"]
+          description: Backend hostname or IP
+        port:
+          type: integer
+          format: uint16
+        weight:
+          type: integer
+          format: uint32
+          default: 1
+          description: Relative weight for weighted round-robin
+        tags:
+          type: object
+          default: {}
+          additionalProperties:
+            type: [string, "null"]
+          description: Arbitrary key-value tags
+
+    LoadBalancerAlgorithm:
+      type: string
+      enum:
+        - round_robin
+        - weighted_round_robin
+        - least_connections
+        - consistent_hashing
+        - random
+      default: round_robin
+
+    # ── Health Checks ───────────────────────────────────────────────
+    HealthCheckConfig:
+      type: object
+      properties:
+        active:
+          oneOf:
+            - $ref: "#/components/schemas/ActiveHealthCheck"
+            - type: "null"
+        passive:
+          oneOf:
+            - $ref: "#/components/schemas/PassiveHealthCheck"
+            - type: "null"
+
+    ActiveHealthCheck:
+      type: object
+      properties:
+        http_path:
+          type: [string, "null"]
+          default: /health
+          description: HTTP path to probe
+        interval_seconds:
+          type: integer
+          format: uint64
+          default: 10
+          description: Seconds between probes
+        timeout_ms:
+          type: integer
+          format: uint64
+          default: 5000
+          description: Probe timeout in milliseconds
+        healthy_threshold:
+          type: integer
+          format: uint32
+          default: 3
+          description: Consecutive healthy probes to mark target healthy
+        unhealthy_threshold:
+          type: integer
+          format: uint32
+          default: 3
+          description: Consecutive unhealthy probes to mark target unhealthy
+        healthy_status_codes:
+          type: array
+          items:
+            type: integer
+            format: uint16
+          default: [200, 302]
+          description: Status codes considered healthy
+
+    PassiveHealthCheck:
+      type: object
+      properties:
+        unhealthy_status_codes:
+          type: array
+          items:
+            type: integer
+            format: uint16
+          default: [500, 502, 503, 504]
+          description: Status codes that count toward the unhealthy threshold
+        unhealthy_threshold:
+          type: integer
+          format: uint32
+          default: 3
+          description: Failures within the window to mark target unhealthy
+        unhealthy_window_seconds:
+          type: integer
+          format: uint64
+          default: 30
+          description: Sliding window for counting failures
+
+    # ── Health response ─────────────────────────────────────────────
+    HealthResponse:
+      type: object
+      required: [status, timestamp, mode, database, cached_config]
+      properties:
+        status:
+          type: [string, "null"]
+          enum: [ok, degraded]
+        timestamp:
+          type: [string, "null"]
+          format: date-time
+        mode:
+          type: [string, "null"]
+          description: Gateway operating mode
+          examples:
+            - control_plane
+            - data_plane
+            - file
+        database:
+          type: object
+          required: [status, type]
+          properties:
+            status:
+              type: [string, "null"]
+              enum: [connected, disconnected]
+            type:
+              type: [string, "null"]
+              description: Database engine type
+              examples:
+                - postgres
+                - mysql
+                - sqlite
+            error:
+              type: [string, "null"]
+              description: Error message when disconnected
+        cached_config:
+          type: object
+          required: [available]
+          properties:
+            available:
+              type: boolean
+            loaded_at:
+              type: [string, "null"]
+              format: date-time
+              description: Present only when `available` is true
+            proxy_count:
+              type: integer
+              description: Present only when `available` is true
+            consumer_count:
+              type: integer
+              description: Present only when `available` is true
+
+    # ── Admin metrics ───────────────────────────────────────────────
+    AdminMetrics:
+      type: object
+      required:
+        - mode
+        - proxy_count
+        - consumer_count
+        - requests_per_second_current
+        - status_codes_last_second
+      properties:
+        mode:
+          type: string
+        config_last_updated_at:
+          type: string
+          format: date-time
+        config_source_status:
+          type: string
+          enum: [online, "n/a"]
+        proxy_count:
+          type: integer
+        consumer_count:
+          type: integer
+        requests_per_second_current:
+          type: number
+          format: double
+        status_codes_last_second:
+          type: object
+          additionalProperties:
+            type: integer
+          description: Map of HTTP status code to count in the last second

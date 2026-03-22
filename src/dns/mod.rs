@@ -448,11 +448,28 @@ impl DnsCache {
     }
 
     /// Warmup: resolve all hostnames from the config at startup.
+    ///
+    /// Hostnames are deduplicated before resolution — if multiple proxies or
+    /// plugins share the same hostname, only one DNS lookup is performed.
+    /// Each unique hostname is resolved concurrently.
     pub async fn warmup(&self, hostnames: Vec<(String, Option<String>, Option<u64>)>) {
-        info!("DNS warmup: resolving {} hostnames", hostnames.len());
+        // Deduplicate by hostname, keeping the first override/TTL seen for each.
+        // Hostnames with a static override still go through resolve() to populate
+        // the cache, but they won't trigger actual DNS queries.
+        let mut seen = std::collections::HashSet::new();
+        let unique: Vec<_> = hostnames
+            .into_iter()
+            .filter(|(host, _, _)| seen.insert(host.clone()))
+            .collect();
+
+        info!(
+            "DNS warmup: resolving {} unique hostnames ({} after dedup)",
+            seen.len(),
+            unique.len()
+        );
         let mut handles = Vec::new();
 
-        for (host, override_ip, ttl) in hostnames {
+        for (host, override_ip, ttl) in unique {
             let cache = self.clone();
             handles.push(tokio::spawn(async move {
                 match cache.resolve(&host, override_ip.as_deref(), ttl).await {
@@ -629,4 +646,43 @@ fn parse_dns_order(order_str: Option<&str>) -> Vec<DnsRecordOrder> {
     }
 
     result
+}
+
+/// A custom DNS resolver for `reqwest` that delegates all hostname lookups
+/// to our [`DnsCache`]. This ensures that **all** `reqwest::Client` instances
+/// — for both single-backend and load-balanced proxies — transparently use
+/// the DNS cache with warmup, background refresh, and stale-while-revalidate.
+///
+/// By setting this as the `dns_resolver` on every `reqwest::Client`, DNS
+/// resolution is kept completely off the hot request path: the cache is
+/// pre-warmed at startup and continuously refreshed in the background.
+pub struct DnsCacheResolver {
+    cache: DnsCache,
+}
+
+impl DnsCacheResolver {
+    pub fn new(cache: DnsCache) -> Self {
+        Self { cache }
+    }
+}
+
+impl reqwest::dns::Resolve for DnsCacheResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let cache = self.cache.clone();
+        let hostname = name.as_str().to_string();
+
+        Box::pin(async move {
+            let ip = cache.resolve(&hostname, None, None).await.map_err(
+                |e| -> Box<dyn std::error::Error + Send + Sync> {
+                    Box::new(std::io::Error::other(e.to_string()))
+                },
+            )?;
+
+            // reqwest expects an iterator of SocketAddr. The port is ignored
+            // (reqwest uses the port from the URL), but SocketAddr requires one.
+            let addr: SocketAddr = SocketAddr::new(ip, 0);
+            let addrs: reqwest::dns::Addrs = Box::new(std::iter::once(addr));
+            Ok(addrs)
+        })
+    }
 }
