@@ -752,19 +752,31 @@ config: {}
 
 #### `http_logging`
 
-Sends the transaction summary as JSON to an external HTTP endpoint.
+Sends transaction summaries as JSON to an external HTTP endpoint. Entries are buffered and sent in batches (as a JSON array) to reduce per-request HTTP overhead. A background task handles flushing, retries, and delivery — the proxy hot path only performs a non-blocking channel write.
 
 **Config**:
-| Parameter | Type | Description |
-|---|---|---|
-| `endpoint_url` | String | URL to POST transaction logs to |
-| `authorization_header` | String (optional) | Authorization header value for the logging endpoint |
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `endpoint_url` | String | `""` | URL to POST transaction logs to |
+| `authorization_header` | String | *(none)* | Authorization header value for the logging endpoint |
+| `batch_size` | Integer | `50` | Number of entries to buffer before sending a batch |
+| `flush_interval_ms` | Integer | `1000` | Max milliseconds before flushing a partial batch (min: 100) |
+| `max_retries` | Integer | `3` | Retry attempts on failed batch delivery |
+| `retry_delay_ms` | Integer | `1000` | Delay in milliseconds between retry attempts |
+| `buffer_capacity` | Integer | `10000` | Channel capacity — new entries are dropped when full |
+
+Batches are flushed when `batch_size` is reached **or** `flush_interval_ms` elapses, whichever comes first. After all retries are exhausted, the batch is discarded to keep memory usage bounded.
 
 ```yaml
 plugin_name: http_logging
 config:
   endpoint_url: "https://logging-service.example.com/ingest"
   authorization_header: "Bearer log-token-123"
+  batch_size: 50
+  flush_interval_ms: 1000
+  max_retries: 3
+  retry_delay_ms: 1000
+  buffer_capacity: 10000
 ```
 
 #### `transaction_debugger`

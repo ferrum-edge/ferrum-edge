@@ -29,11 +29,11 @@ async fn test_http_logging_plugin_creation_empty_config() {
 
 #[tokio::test]
 async fn test_http_logging_empty_url_does_not_send() {
-    // When endpoint_url is empty, log() should return without sending
+    // When endpoint_url is empty, log() should accept entries without errors
     let plugin = HttpLogging::new(&json!({}), default_client());
     let summary = create_test_transaction_summary();
 
-    // This should not panic or error - just silently return
+    // This should not panic or error — entry goes into channel and is drained
     plugin.log(&summary).await;
 }
 
@@ -42,14 +42,20 @@ async fn test_http_logging_invalid_url_does_not_panic() {
     // When endpoint_url is unreachable, log() should handle the error gracefully
     let plugin = HttpLogging::new(
         &json!({
-            "endpoint_url": "http://127.0.0.1:1/unreachable"
+            "endpoint_url": "http://127.0.0.1:1/unreachable",
+            "batch_size": 1,
+            "flush_interval_ms": 100,
+            "max_retries": 0
         }),
         default_client(),
     );
     let summary = create_test_transaction_summary();
 
-    // Should not panic - just log a warning
+    // Should not panic — entry is queued and background task handles the failure
     plugin.log(&summary).await;
+
+    // Give the background flush task time to attempt delivery
+    tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
 }
 
 #[tokio::test]
@@ -57,7 +63,10 @@ async fn test_http_logging_with_authorization_header() {
     let plugin = HttpLogging::new(
         &json!({
             "endpoint_url": "http://127.0.0.1:1/unreachable",
-            "authorization_header": "Bearer my-secret-token"
+            "authorization_header": "Bearer my-secret-token",
+            "batch_size": 1,
+            "flush_interval_ms": 100,
+            "max_retries": 0
         }),
         default_client(),
     );
@@ -66,6 +75,8 @@ async fn test_http_logging_with_authorization_header() {
     // Should not panic even with auth header set and unreachable endpoint
     let summary = create_test_transaction_summary();
     plugin.log(&summary).await;
+
+    tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
 }
 
 #[tokio::test]
@@ -110,4 +121,76 @@ async fn test_http_logging_default_lifecycle_phases() {
         result,
         ferrum_gateway::plugins::PluginResult::Continue
     ));
+}
+
+#[tokio::test]
+async fn test_http_logging_batch_config_defaults() {
+    // Plugin should accept minimal config and apply defaults
+    let plugin = HttpLogging::new(
+        &json!({
+            "endpoint_url": "http://localhost:9200/logs"
+        }),
+        default_client(),
+    );
+    assert_eq!(plugin.name(), "http_logging");
+}
+
+#[tokio::test]
+async fn test_http_logging_custom_batch_config() {
+    // Plugin should accept all batch/retry config options
+    let plugin = HttpLogging::new(
+        &json!({
+            "endpoint_url": "http://localhost:9200/logs",
+            "batch_size": 100,
+            "flush_interval_ms": 5000,
+            "max_retries": 5,
+            "retry_delay_ms": 2000,
+            "buffer_capacity": 50000
+        }),
+        default_client(),
+    );
+    assert_eq!(plugin.name(), "http_logging");
+}
+
+#[tokio::test]
+async fn test_http_logging_buffer_accepts_multiple_entries() {
+    // log() should accept many entries without blocking
+    let plugin = HttpLogging::new(
+        &json!({
+            "endpoint_url": "http://127.0.0.1:1/unreachable",
+            "batch_size": 50,
+            "flush_interval_ms": 10000,
+            "max_retries": 0,
+            "buffer_capacity": 1000
+        }),
+        default_client(),
+    );
+
+    let summary = create_test_transaction_summary();
+    for _ in 0..100 {
+        plugin.log(&summary).await;
+    }
+    // Should not panic or block — entries are queued in the channel
+}
+
+#[tokio::test]
+async fn test_http_logging_buffer_full_drops_gracefully() {
+    // When buffer_capacity is exceeded, entries should be dropped without panic
+    let plugin = HttpLogging::new(
+        &json!({
+            "endpoint_url": "http://127.0.0.1:1/unreachable",
+            "batch_size": 1000,
+            "flush_interval_ms": 60000,
+            "max_retries": 0,
+            "buffer_capacity": 5
+        }),
+        default_client(),
+    );
+
+    let summary = create_test_transaction_summary();
+    // Send more entries than buffer_capacity — excess should be dropped
+    for _ in 0..20 {
+        plugin.log(&summary).await;
+    }
+    // Should not panic — overflow entries are dropped with a warning
 }
