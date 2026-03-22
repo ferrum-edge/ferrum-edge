@@ -1,3 +1,4 @@
+pub mod client_ip;
 pub mod grpc_proxy;
 
 use arc_swap::ArcSwap;
@@ -73,6 +74,10 @@ pub struct ProxyState {
     pub max_single_header_size_bytes: usize,
     pub max_body_size_bytes: usize,
     pub max_response_body_size_bytes: usize,
+    /// Trusted proxy CIDRs for X-Forwarded-For client IP resolution
+    pub trusted_proxies: Arc<client_ip::TrustedProxies>,
+    /// Optional authoritative real-IP header (e.g., "CF-Connecting-IP", "X-Real-IP")
+    pub real_ip_header: Option<String>,
 }
 
 impl ProxyState {
@@ -87,6 +92,8 @@ impl ProxyState {
         let max_single_header_size_bytes = env_config.max_single_header_size_bytes;
         let max_body_size_bytes = env_config.max_body_size_bytes;
         let max_response_body_size_bytes = env_config.max_response_body_size_bytes;
+        let trusted_proxies = Arc::new(client_ip::TrustedProxies::parse(&env_config.trusted_proxies));
+        let real_ip_header = env_config.real_ip_header.clone();
         // Create connection pools with global configuration from environment
         let global_pool_config = PoolConfig::from_env();
         let grpc_pool = Arc::new(GrpcConnectionPool::new(
@@ -121,6 +128,8 @@ impl ProxyState {
             max_single_header_size_bytes,
             max_body_size_bytes,
             max_response_body_size_bytes,
+            trusted_proxies,
+            real_ip_header,
         }
     }
 
@@ -755,8 +764,10 @@ pub async fn handle_proxy_request(
     let path = req.uri().path().to_string();
     let query_string = req.uri().query().unwrap_or("").to_string();
 
-    // Build request context
-    let mut ctx = RequestContext::new(remote_addr.ip().to_string(), method.clone(), path.clone());
+    let socket_ip = remote_addr.ip().to_string();
+
+    // Build request context (client_ip resolved below after headers are parsed)
+    let mut ctx = RequestContext::new(socket_ip.clone(), method.clone(), path.clone());
 
     // Validate and extract headers with size limits
     let mut total_header_size: usize = 0;
@@ -785,6 +796,42 @@ pub async fn handle_proxy_request(
             StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
             r#"{"error":"Total request headers exceed maximum size"}"#,
         ));
+    }
+
+    // Resolve real client IP using trusted proxy configuration.
+    // Check authoritative real-IP header first (e.g., CF-Connecting-IP),
+    // then fall back to X-Forwarded-For right-to-left walk.
+    if !state.trusted_proxies.is_empty() {
+        let resolved = if let Some(ref real_ip_header) = state.real_ip_header {
+            let header_val = ctx.headers.get(&real_ip_header.to_lowercase());
+            if let Some(val) = header_val {
+                // Validate the direct connection is from a trusted proxy before
+                // trusting this header
+                let socket_addr: Option<std::net::IpAddr> = socket_ip.parse().ok();
+                if socket_addr.map_or(false, |ip| state.trusted_proxies.contains(&ip)) {
+                    val.trim().to_string()
+                } else {
+                    client_ip::resolve_client_ip(
+                        &socket_ip,
+                        ctx.headers.get("x-forwarded-for").map(|s| s.as_str()),
+                        &state.trusted_proxies,
+                    )
+                }
+            } else {
+                client_ip::resolve_client_ip(
+                    &socket_ip,
+                    ctx.headers.get("x-forwarded-for").map(|s| s.as_str()),
+                    &state.trusted_proxies,
+                )
+            }
+        } else {
+            client_ip::resolve_client_ip(
+                &socket_ip,
+                ctx.headers.get("x-forwarded-for").map(|s| s.as_str()),
+                &state.trusted_proxies,
+            )
+        };
+        ctx.client_ip = resolved;
     }
 
     // Parse query params
@@ -1079,7 +1126,7 @@ pub async fn handle_proxy_request(
 
     // Perform the backend request
     let (response_status, response_body, mut response_headers) =
-        proxy_to_backend(&state, &proxy, &backend_url, &method, proxy_headers, req).await;
+        proxy_to_backend(&state, &proxy, &backend_url, &method, proxy_headers, req, &ctx.client_ip).await;
 
     let backend_ttfb_ms = backend_start.elapsed().as_secs_f64() * 1000.0;
     let backend_total_ms = backend_start.elapsed().as_secs_f64() * 1000.0;
@@ -1211,6 +1258,7 @@ async fn proxy_to_backend(
     method: &str,
     headers: &HashMap<String, String>,
     original_req: Request<Incoming>,
+    client_ip: &str,
 ) -> (u16, Vec<u8>, HashMap<String, String>) {
     // Resolve backend hostname
     let resolved_ip = state
@@ -1224,7 +1272,7 @@ async fn proxy_to_backend(
 
     // Handle HTTP/3 backend requests differently
     if matches!(proxy.backend_protocol, BackendProtocol::H3) {
-        return proxy_to_backend_http3(state, proxy, backend_url, method, headers, original_req)
+        return proxy_to_backend_http3(state, proxy, backend_url, method, headers, original_req, client_ip)
             .await;
     }
 
@@ -1283,7 +1331,9 @@ async fn proxy_to_backend(
 
     // Add proxy headers
     if let Some(xff) = headers.get("x-forwarded-for") {
-        req_builder = req_builder.header("X-Forwarded-For", format!("{}, {}", xff, "client_ip"));
+        req_builder = req_builder.header("X-Forwarded-For", format!("{}, {}", xff, client_ip));
+    } else {
+        req_builder = req_builder.header("X-Forwarded-For", client_ip);
     }
     req_builder = req_builder.header("X-Forwarded-Proto", "http");
     if let Some(host) = headers.get("host") {
@@ -1482,6 +1532,7 @@ async fn proxy_to_backend_http3(
     method: &str,
     headers: &HashMap<String, String>,
     original_req: Request<Incoming>,
+    _client_ip: &str,
 ) -> (u16, Vec<u8>, HashMap<String, String>) {
     info!("Proxying request to HTTP/3 backend: {}", backend_url);
 

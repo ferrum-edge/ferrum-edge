@@ -146,6 +146,19 @@ pub struct EnvConfig {
     pub tls_prefer_server_cipher_order: bool,
     /// Comma-separated ECDH curves/groups: X25519, secp256r1, secp384r1 (default: "X25519,secp256r1")
     pub tls_curves: Option<String>,
+
+    // Client IP resolution
+    /// Comma-separated trusted proxy CIDRs/IPs for X-Forwarded-For resolution.
+    /// When set, the gateway walks the XFF chain right-to-left, skipping trusted
+    /// proxy IPs, to determine the real client IP. When unset, the TCP socket
+    /// address is always used (secure default for edge deployments).
+    /// Example: "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,::1"
+    pub trusted_proxies: String,
+    /// Header to use as the authoritative source of client IP. When set, this
+    /// header is checked first (e.g., "CF-Connecting-IP" for Cloudflare, or
+    /// "X-Real-IP" for nginx). If the header is absent or the direct connection
+    /// is not from a trusted proxy, falls back to the X-Forwarded-For walk.
+    pub real_ip_header: Option<String>,
 }
 
 impl Default for EnvConfig {
@@ -209,6 +222,8 @@ impl Default for EnvConfig {
             tls_cipher_suites: None,
             tls_prefer_server_cipher_order: true,
             tls_curves: None,
+            trusted_proxies: String::new(),
+            real_ip_header: None,
         }
     }
 }
@@ -320,6 +335,10 @@ impl EnvConfig {
                 .map(|v| v != "false")
                 .unwrap_or(true),
             tls_curves: env::var("FERRUM_TLS_CURVES").ok(),
+
+            // Client IP resolution
+            trusted_proxies: env::var("FERRUM_TRUSTED_PROXIES").unwrap_or_default(),
+            real_ip_header: env::var("FERRUM_REAL_IP_HEADER").ok(),
         };
 
         config.validate()?;

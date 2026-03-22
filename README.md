@@ -20,6 +20,7 @@ Ferrum Gateway is a lightweight, extensible API gateway designed for modern micr
 - **DNS Caching**: In-memory async DNS cache with startup warmup, background refresh at 75% TTL, per-proxy TTL overrides, and static overrides
 - **Admin REST API**: Full CRUD for Proxies, Consumers, and Plugin Configs with JWT-protected endpoints
 - **Admin Read-Only Mode**: Configurable read-only mode for Admin API with automatic DP mode protection
+- **Client IP Resolution**: Secure originating IP detection via trusted proxy configuration with `X-Forwarded-For` right-to-left walk and optional authoritative header support (e.g., `CF-Connecting-IP`)
 - **Rate Limiting**: In-memory per-consumer or per-IP rate limiting with configurable windows
 - **Graceful Shutdown**: SIGTERM/SIGINT handling with active request draining
 - **Observability**: Structured JSON logging via `tracing` ecosystem and runtime metrics endpoint
@@ -356,6 +357,10 @@ See [CI/CD Documentation](docs/ci_cd.md) for complete pipeline overview, secrets
 | `FERRUM_ENABLE_HTTP3` | No | `false` | Enable HTTP/3 (QUIC) listener on the HTTPS port |
 | `FERRUM_HTTP3_IDLE_TIMEOUT` | No | `30` | HTTP/3 connection idle timeout in seconds |
 | `FERRUM_HTTP3_MAX_STREAMS` | No | `100` | Maximum concurrent HTTP/3 streams per connection |
+| `FERRUM_TRUSTED_PROXIES` | No | — | Comma-separated trusted proxy CIDRs/IPs for client IP resolution via `X-Forwarded-For` |
+| `FERRUM_REAL_IP_HEADER` | No | — | Authoritative real-IP header name (e.g., `CF-Connecting-IP`, `X-Real-IP`) |
+
+See [docs/client_ip_resolution.md](docs/client_ip_resolution.md) for the security model, deployment examples, and troubleshooting guide.
 
 ### Configuration File Format (File Mode)
 

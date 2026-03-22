@@ -115,6 +115,9 @@ All operational parameters MUST be configurable via environment variables.
 *   **Request Handling Limits:**
     *   `FERRUM_MAX_HEADER_SIZE_BYTES`: (Integer bytes) - Default: `16384`.
     *   `FERRUM_MAX_BODY_SIZE_BYTES`: (Integer bytes, `0` for unlimited) - Default: `10485760` (10 MiB).
+*   **Client IP Resolution:**
+    *   `FERRUM_TRUSTED_PROXIES`: (Comma-separated CIDRs/IPs, e.g., `10.0.0.0/8,172.16.0.0/12`) - Default: empty (XFF headers ignored; socket IP used).
+    *   `FERRUM_REAL_IP_HEADER`: (Header name, e.g., `CF-Connecting-IP` or `X-Real-IP`) - Default: none.
 *   **DNS Caching:**
     *   `FERRUM_DNS_CACHE_TTL_SECONDS`: (Integer seconds) - Default: `300`.
     *   `FERRUM_DNS_OVERRIDES`: (JSON string map `{"hostname": "ip_address", ...}`) - Default: `{}`.

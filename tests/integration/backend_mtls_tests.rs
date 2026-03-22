@@ -119,6 +119,8 @@ fn create_test_env_config_with_mtls(
         tls_cipher_suites: None,
         tls_prefer_server_cipher_order: true,
         tls_curves: None,
+        trusted_proxies: String::new(),
+        real_ip_header: None,
     }
 }
 

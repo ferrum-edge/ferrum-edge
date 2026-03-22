@@ -189,8 +189,10 @@ async fn handle_h3_request(
     let path = req.uri().path().to_string();
     let query_string = req.uri().query().unwrap_or("").to_string();
 
-    // Build request context
-    let mut ctx = RequestContext::new(remote_addr.ip().to_string(), method.clone(), path.clone());
+    let socket_ip = remote_addr.ip().to_string();
+
+    // Build request context (client_ip resolved below after headers are parsed)
+    let mut ctx = RequestContext::new(socket_ip.clone(), method.clone(), path.clone());
 
     // Validate and extract headers with size limits
     let mut total_header_size: usize = 0;
@@ -225,6 +227,38 @@ async fn handle_h3_request(
         )
         .await?;
         return Ok(());
+    }
+
+    // Resolve real client IP using trusted proxy configuration
+    if !state.trusted_proxies.is_empty() {
+        let resolved = if let Some(ref real_ip_header) = state.real_ip_header {
+            let header_val = ctx.headers.get(&real_ip_header.to_lowercase());
+            if let Some(val) = header_val {
+                let socket_addr: Option<std::net::IpAddr> = socket_ip.parse().ok();
+                if socket_addr.map_or(false, |ip| state.trusted_proxies.contains(&ip)) {
+                    val.trim().to_string()
+                } else {
+                    crate::proxy::client_ip::resolve_client_ip(
+                        &socket_ip,
+                        ctx.headers.get("x-forwarded-for").map(|s| s.as_str()),
+                        &state.trusted_proxies,
+                    )
+                }
+            } else {
+                crate::proxy::client_ip::resolve_client_ip(
+                    &socket_ip,
+                    ctx.headers.get("x-forwarded-for").map(|s| s.as_str()),
+                    &state.trusted_proxies,
+                )
+            }
+        } else {
+            crate::proxy::client_ip::resolve_client_ip(
+                &socket_ip,
+                ctx.headers.get("x-forwarded-for").map(|s| s.as_str()),
+                &state.trusted_proxies,
+            )
+        };
+        ctx.client_ip = resolved;
     }
 
     // Parse query params
@@ -417,6 +451,7 @@ async fn handle_h3_request(
         &method,
         &proxy_headers,
         body_data,
+        &ctx.client_ip,
     )
     .await;
 
@@ -485,6 +520,7 @@ async fn proxy_to_backend_h3(
     method: &str,
     headers: &std::collections::HashMap<String, String>,
     body_bytes: Vec<u8>,
+    client_ip: &str,
 ) -> (u16, Vec<u8>, std::collections::HashMap<String, String>) {
     // Resolve backend hostname
     let resolved_ip = state
@@ -551,7 +587,9 @@ async fn proxy_to_backend_h3(
 
     // Add proxy headers
     if let Some(xff) = headers.get("x-forwarded-for") {
-        req_builder = req_builder.header("X-Forwarded-For", format!("{}, {}", xff, "client_ip"));
+        req_builder = req_builder.header("X-Forwarded-For", format!("{}, {}", xff, client_ip));
+    } else {
+        req_builder = req_builder.header("X-Forwarded-For", client_ip);
     }
     req_builder = req_builder.header("X-Forwarded-Proto", "h3");
     if let Some(host) = headers.get("host").or_else(|| headers.get(":authority")) {

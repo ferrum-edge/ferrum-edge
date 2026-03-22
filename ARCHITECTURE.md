@@ -33,6 +33,7 @@ src/
 │   └── types.rs           # Core data structures (Proxy, Consumer, Plugin)
 ├── proxy/                 # Proxy request handling
 │   ├── mod.rs             # ProxyState and main proxy logic
+│   ├── client_ip.rs       # Trusted proxy / X-Forwarded-For client IP resolution
 │   └── handler.rs         # HTTP request/response processing
 ├── router_cache.rs        # Pre-sorted route table with bounded path cache
 ├── connection_pool.rs     # HTTP client connection pooling with mTLS support
