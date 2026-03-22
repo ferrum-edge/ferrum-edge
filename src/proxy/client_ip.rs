@@ -130,7 +130,9 @@ impl CidrEntry {
                 }
                 let net_bits = u32::from(*net);
                 let addr_bits = u32::from(*addr);
-                let mask = u32::MAX.checked_shl(32 - self.prefix_len as u32).unwrap_or(0);
+                let mask = u32::MAX
+                    .checked_shl(32 - self.prefix_len as u32)
+                    .unwrap_or(0);
                 (net_bits & mask) == (addr_bits & mask)
             }
             (IpAddr::V6(net), IpAddr::V6(addr)) => {
@@ -382,11 +384,7 @@ mod tests {
         // XFF: "198.51.100.23, 173.245.49.1"
         // Socket: 10.0.0.1
         assert_eq!(
-            resolve_client_ip(
-                "10.0.0.1",
-                Some("198.51.100.23, 173.245.49.1"),
-                &tp
-            ),
+            resolve_client_ip("10.0.0.1", Some("198.51.100.23, 173.245.49.1"), &tp),
             "198.51.100.23"
         );
     }

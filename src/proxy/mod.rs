@@ -110,7 +110,9 @@ impl ProxyState {
         let max_single_header_size_bytes = env_config.max_single_header_size_bytes;
         let max_body_size_bytes = env_config.max_body_size_bytes;
         let max_response_body_size_bytes = env_config.max_response_body_size_bytes;
-        let trusted_proxies = Arc::new(client_ip::TrustedProxies::parse(&env_config.trusted_proxies));
+        let trusted_proxies = Arc::new(client_ip::TrustedProxies::parse(
+            &env_config.trusted_proxies,
+        ));
         // Create connection pools with global configuration from environment
         let global_pool_config = PoolConfig::from_env();
         let grpc_pool = Arc::new(GrpcConnectionPool::new(
@@ -2014,8 +2016,16 @@ async fn proxy_to_backend(
     // Handle HTTP/3 backend requests differently (always buffered — h3 crate
     // doesn't expose a streaming body API compatible with reqwest::Response)
     if matches!(proxy.backend_protocol, BackendProtocol::H3) {
-        let (status, body, hdrs) =
-            proxy_to_backend_http3(state, proxy, backend_url, method, headers, original_req, client_ip).await;
+        let (status, body, hdrs) = proxy_to_backend_http3(
+            state,
+            proxy,
+            backend_url,
+            method,
+            headers,
+            original_req,
+            client_ip,
+        )
+        .await;
         return retry::BackendResponse {
             status_code: status,
             body: ResponseBody::Buffered(body),
