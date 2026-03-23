@@ -1,0 +1,15 @@
+[package]
+name = "pingora-bench-proxy"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "pingora-bench-proxy"
+path = "src/main.rs"
+
+[dependencies]
+pingora-core = { path = "/Users/jeremyjustus/workspace/pingora/pingora-core", features = ["rustls"] }
+pingora-proxy = { path = "/Users/jeremyjustus/workspace/pingora/pingora-proxy", features = ["rustls"] }
+async-trait = "0.1"
+env_logger = "0.11"
+log = "0.4"

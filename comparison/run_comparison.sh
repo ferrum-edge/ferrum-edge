@@ -2,7 +2,7 @@
 
 # ===========================================================================
 # API Gateway Comparison Benchmark
-# Ferrum Gateway vs Kong vs Tyk
+# Ferrum Gateway vs Pingora vs Kong vs Tyk
 #
 # Runs each gateway sequentially (one at a time) against the same backend
 # echo server, testing both HTTP and HTTPS (TLS termination), then generates
@@ -17,7 +17,7 @@
 #   WRK_CONNECTIONS=100     wrk concurrent connections
 #   KONG_VERSION=3.9        Kong Docker image tag
 #   TYK_VERSION=v5.7        Tyk Docker image tag
-#   SKIP_GATEWAYS=tyk       Comma-separated gateways to skip (ferrum,kong,tyk)
+#   SKIP_GATEWAYS=tyk       Comma-separated gateways to skip (ferrum,pingora,kong,tyk)
 #   WARMUP_DURATION=5s      Warm-up duration before measured test
 # ===========================================================================
 
@@ -61,7 +61,12 @@ REDIS_CONTAINER="ferrum-bench-redis"
 # PIDs to track
 BACKEND_PID=""
 FERRUM_PID=""
+PINGORA_PID=""
 KONG_PID=""
+
+# Pingora bench proxy binary path
+PINGORA_PROXY_DIR="$COMP_DIR/configs/pingora"
+PINGORA_BINARY="$PINGORA_PROXY_DIR/target/release/pingora-bench-proxy"
 
 # Detect platform for Docker networking
 # macOS Docker Desktop does not support --network host; use port mapping instead
@@ -145,6 +150,10 @@ cleanup() {
     if [[ -n "$FERRUM_PID" ]]; then
         kill "$FERRUM_PID" 2>/dev/null || true
         log_ok "Ferrum gateway stopped"
+    fi
+    if [[ -n "$PINGORA_PID" ]]; then
+        kill "$PINGORA_PID" 2>/dev/null || true
+        log_ok "Pingora proxy stopped"
     fi
     if [[ "$KONG_PID" == "native" ]]; then
         KONG_PREFIX="/tmp/kong-bench" kong stop 2>/dev/null || true
@@ -266,6 +275,17 @@ build_project() {
     cd "$PERF_DIR"
     cargo build --release --bin backend_server 2>&1 | tail -1
 
+    if ! should_skip "pingora"; then
+        log_info "Building Pingora bench proxy (release)..."
+        cd "$PINGORA_PROXY_DIR"
+        cargo build --release 2>&1 | tail -1
+        if [[ -f "$PINGORA_BINARY" ]]; then
+            log_ok "Pingora bench proxy built"
+        else
+            log_warn "Pingora bench proxy build failed — will skip Pingora tests"
+        fi
+    fi
+
     log_ok "Build completed"
 }
 
@@ -313,15 +333,22 @@ run_wrk() {
     wrk -t2 -c20 -d"$WARMUP_DURATION" -s "$LUA_SCRIPT" "$url" > /dev/null 2>&1 || true
 
     # Measured run
-    wrk -t"$WRK_THREADS" -c"$WRK_CONNECTIONS" -d"$WRK_DURATION" \
-        --latency -s "$LUA_SCRIPT" "$url" > "$result_file" 2>&1
+    if ! wrk -t"$WRK_THREADS" -c"$WRK_CONNECTIONS" -d"$WRK_DURATION" \
+        --latency -s "$LUA_SCRIPT" "$url" > "$result_file" 2>&1; then
+        log_warn "wrk failed for ${label} — see ${result_file}"
+        return 0
+    fi
 
     # Print summary line
     local rps
-    rps=$(grep "Requests/sec:" "$result_file" | awk '{print $2}')
+    rps=$(grep "Requests/sec:" "$result_file" | awk '{print $2}' || echo "N/A")
     local latency
-    latency=$(grep "Latency " "$result_file" | awk '{print $2}')
-    echo -e "    ${GREEN}→ ${rps} req/s, ${latency} avg latency${NC}"
+    latency=$(grep "Latency " "$result_file" | awk '{print $2}' || echo "N/A")
+    if [[ -z "$rps" ]]; then
+        log_warn "No results for ${label} (connection error?)"
+    else
+        echo -e "    ${GREEN}→ ${rps} req/s, ${latency} avg latency${NC}"
+    fi
 }
 
 # ===========================================================================
@@ -418,6 +445,96 @@ test_ferrum() {
     run_wrk "ferrum" "e2e_tls" "/health" "$GATEWAY_HTTPS_PORT"
     run_wrk "ferrum" "e2e_tls" "/api/users" "$GATEWAY_HTTPS_PORT"
     stop_ferrum
+}
+
+# ===========================================================================
+# Pingora (Cloudflare) — native Rust proxy framework
+# ===========================================================================
+
+start_pingora_http() {
+    log_info "Starting Pingora bench proxy (HTTP) on port $GATEWAY_HTTP_PORT..."
+    kill_port "$GATEWAY_HTTP_PORT"
+    PINGORA_HTTP_PORT="$GATEWAY_HTTP_PORT" \
+    PINGORA_BACKEND_HOST=127.0.0.1 \
+    PINGORA_BACKEND_PORT="$BACKEND_PORT" \
+    "$PINGORA_BINARY" > "$RESULTS_DIR/pingora_http.log" 2>&1 &
+    PINGORA_PID=$!
+    wait_for_http "http://127.0.0.1:$GATEWAY_HTTP_PORT/health" "Pingora (HTTP)"
+}
+
+start_pingora_https() {
+    log_info "Starting Pingora bench proxy (HTTPS) on ports $GATEWAY_HTTP_PORT + $GATEWAY_HTTPS_PORT..."
+    kill_port "$GATEWAY_HTTP_PORT"
+    kill_port "$GATEWAY_HTTPS_PORT"
+    PINGORA_HTTP_PORT="$GATEWAY_HTTP_PORT" \
+    PINGORA_HTTPS_PORT="$GATEWAY_HTTPS_PORT" \
+    PINGORA_BACKEND_HOST=127.0.0.1 \
+    PINGORA_BACKEND_PORT="$BACKEND_PORT" \
+    PINGORA_TLS_CERT="$CERTS_DIR/server.crt" \
+    PINGORA_TLS_KEY="$CERTS_DIR/server.key" \
+    "$PINGORA_BINARY" > "$RESULTS_DIR/pingora_https.log" 2>&1 &
+    PINGORA_PID=$!
+    wait_for_http "https://127.0.0.1:$GATEWAY_HTTPS_PORT/health" "Pingora (HTTPS)" 15
+}
+
+start_pingora_e2e_tls() {
+    log_info "Starting Pingora bench proxy (E2E TLS) on port $GATEWAY_HTTPS_PORT..."
+    kill_port "$GATEWAY_HTTP_PORT"
+    kill_port "$GATEWAY_HTTPS_PORT"
+    PINGORA_HTTP_PORT="$GATEWAY_HTTP_PORT" \
+    PINGORA_HTTPS_PORT="$GATEWAY_HTTPS_PORT" \
+    PINGORA_BACKEND_HOST=127.0.0.1 \
+    PINGORA_BACKEND_PORT="$BACKEND_HTTPS_PORT" \
+    PINGORA_BACKEND_TLS=true \
+    PINGORA_TLS_CERT="$CERTS_DIR/server.crt" \
+    PINGORA_TLS_KEY="$CERTS_DIR/server.key" \
+    "$PINGORA_BINARY" > "$RESULTS_DIR/pingora_e2e_tls.log" 2>&1 &
+    PINGORA_PID=$!
+    wait_for_http "https://127.0.0.1:$GATEWAY_HTTPS_PORT/health" "Pingora (E2E TLS)" 15
+}
+
+stop_pingora() {
+    if [[ -n "$PINGORA_PID" ]]; then
+        kill "$PINGORA_PID" 2>/dev/null || true
+        wait "$PINGORA_PID" 2>/dev/null || true
+        PINGORA_PID=""
+    fi
+    kill_port "$GATEWAY_HTTP_PORT"
+    kill_port "$GATEWAY_HTTPS_PORT"
+    sleep 1
+}
+
+test_pingora() {
+    if [[ ! -f "$PINGORA_BINARY" ]]; then
+        log_warn "Pingora bench proxy not built — skipping Pingora tests"
+        return
+    fi
+
+    log_header "Testing Pingora (Cloudflare)"
+
+    # HTTP tests
+    start_pingora_http
+    run_wrk "pingora" "http" "/health" "$GATEWAY_HTTP_PORT"
+    run_wrk "pingora" "http" "/api/users" "$GATEWAY_HTTP_PORT"
+    stop_pingora
+
+    # HTTPS tests (TLS termination — plaintext backend)
+    start_pingora_https
+    run_wrk "pingora" "https" "/health" "$GATEWAY_HTTPS_PORT"
+    run_wrk "pingora" "https" "/api/users" "$GATEWAY_HTTPS_PORT"
+    stop_pingora
+
+    # E2E TLS tests (TLS on both sides)
+    # Pingora's TLS library requires a valid domain (not IP) for upstream SNI,
+    # so E2E TLS to 127.0.0.1 may fail. Skip gracefully if it does.
+    if start_pingora_e2e_tls; then
+        run_wrk "pingora" "e2e_tls" "/health" "$GATEWAY_HTTPS_PORT"
+        run_wrk "pingora" "e2e_tls" "/api/users" "$GATEWAY_HTTPS_PORT"
+        stop_pingora
+    else
+        log_warn "Pingora E2E TLS failed to start — skipping (known IP-based SNI limitation)"
+        stop_pingora
+    fi
 }
 
 # ===========================================================================
@@ -850,11 +967,17 @@ write_metadata() {
         kong_info="Docker ${KONG_VERSION}"
     fi
 
+    local pingora_info="native (source build)"
+    if [[ ! -f "$PINGORA_BINARY" ]]; then
+        pingora_info="skipped (not built)"
+    fi
+
     cat > "$RESULTS_DIR/meta.json" <<METAEOF
 {
     "duration": "$WRK_DURATION",
     "threads": "$WRK_THREADS",
     "connections": "$WRK_CONNECTIONS",
+    "pingora_version": "$pingora_info",
     "kong_version": "$kong_info",
     "tyk_version": "Docker ${TYK_VERSION}",
     "kong_native": $KONG_NATIVE,
@@ -879,7 +1002,7 @@ main() {
     echo -e "${BOLD}"
     echo "  ╔═══════════════════════════════════════════════════════╗"
     echo "  ║       API Gateway Comparison Benchmark Suite          ║"
-    echo "  ║       Ferrum  vs  Kong  vs  Tyk                      ║"
+    echo "  ║       Ferrum  vs  Pingora  vs  Kong  vs  Tyk         ║"
     echo "  ╚═══════════════════════════════════════════════════════╝"
     echo -e "${NC}"
     echo "  Duration: ${WRK_DURATION}  Threads: ${WRK_THREADS}  Connections: ${WRK_CONNECTIONS}"
@@ -903,6 +1026,10 @@ main() {
 
     if ! should_skip "ferrum"; then
         test_ferrum
+    fi
+
+    if ! should_skip "pingora"; then
+        test_pingora
     fi
 
     if ! should_skip "kong"; then

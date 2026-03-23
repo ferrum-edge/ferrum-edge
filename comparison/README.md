@@ -1,6 +1,6 @@
 # API Gateway Comparison Benchmarks
 
-Performance comparison suite that benchmarks **Ferrum Gateway** against **Kong** and **Tyk** API Gateways under identical conditions.
+Performance comparison suite that benchmarks **Ferrum Gateway** against **Pingora** (Cloudflare), **Kong**, and **Tyk** under identical conditions.
 
 ## What It Measures
 
@@ -33,8 +33,10 @@ A direct backend baseline (no gateway) is run first for both HTTP and HTTPS comp
 | **wrk** | Yes | `brew install wrk` (macOS) or `apt install wrk` (Ubuntu) |
 | **Python 3** | Yes | Usually pre-installed; needed for report generation |
 | **Rust/Cargo** | Yes | [rustup.rs](https://rustup.rs/) — builds Ferrum and the backend server |
+| **cmake** | For Pingora | `brew install cmake` (macOS) or `apt install cmake` (Ubuntu) |
 | **curl** | Yes | Usually pre-installed; used for health checks |
 | **Docker** | For Tyk (always), Kong (if not native) | [docs.docker.com/get-docker](https://docs.docker.com/get-docker/) |
+| **Pingora source** | For Pingora tests | Clone [cloudflare/pingora](https://github.com/cloudflare/pingora) to `~/workspace/pingora` |
 | **Kong** (native) | Recommended | See below |
 
 ### Native Kong Installation (Recommended for Fair Benchmarks)
@@ -97,8 +99,11 @@ WRK_DURATION=60s WRK_THREADS=12 WRK_CONNECTIONS=200 ./comparison/run_comparison.
 # Skip a gateway (e.g., if you don't have Docker)
 SKIP_GATEWAYS=tyk,kong ./comparison/run_comparison.sh
 
+# Only test Ferrum vs Pingora (no Docker required)
+SKIP_GATEWAYS=kong,tyk ./comparison/run_comparison.sh
+
 # Only test Ferrum vs Kong
-SKIP_GATEWAYS=tyk ./comparison/run_comparison.sh
+SKIP_GATEWAYS=pingora,tyk ./comparison/run_comparison.sh
 ```
 
 | Variable | Default | Description |
@@ -109,7 +114,7 @@ SKIP_GATEWAYS=tyk ./comparison/run_comparison.sh
 | `WARMUP_DURATION` | `5s` | Warm-up duration before each test (results discarded) |
 | `KONG_VERSION` | `3.9` | Kong Docker image tag |
 | `TYK_VERSION` | `v5.7` | Tyk Docker image tag |
-| `SKIP_GATEWAYS` | _(empty)_ | Comma-separated gateways to skip: `ferrum`, `kong`, `tyk` |
+| `SKIP_GATEWAYS` | _(empty)_ | Comma-separated gateways to skip: `ferrum`, `pingora`, `kong`, `tyk` |
 
 ## Swapping Gateway Versions
 
@@ -259,6 +264,8 @@ The HTML report's "Methodology & Caveats" section notes which gateways ran nativ
 
 - **No plugins enabled:** Tests measure pure proxy overhead only. Real-world performance with authentication, rate limiting, or transformation plugins will differ. Each gateway has different plugin performance characteristics.
 
+- **Pingora is a framework, not a gateway:** The Pingora benchmark uses a minimal ~80-line proxy binary built on Pingora's framework. It has no plugins, admin API, config management, or any gateway features. This is the fairest raw proxy comparison but understates the real-world overhead a production Pingora deployment would have once application logic is added.
+
 - **Single-node only:** All tests run on localhost. Distributed deployment characteristics (network latency, cluster synchronization) are not captured.
 
 - **In-memory state:** Tyk requires Redis even in standalone mode. The Redis instance runs locally and is fast, but it's a dependency that Kong and Ferrum don't need, which could slightly affect Tyk's resource usage.
@@ -274,6 +281,9 @@ comparison/
 ├── configs/
 │   ├── ferrum_comparison.yaml         # Ferrum config (HTTP backend)
 │   ├── ferrum_comparison_e2e_tls.yaml # Ferrum config (HTTPS backend)
+│   ├── pingora/                       # Pingora minimal bench proxy (built from source)
+│   │   ├── Cargo.toml
+│   │   └── src/main.rs
 │   ├── kong.yaml                      # Kong config (HTTP backend)
 │   ├── kong_e2e_tls.yaml             # Kong config (HTTPS backend)
 │   └── tyk/

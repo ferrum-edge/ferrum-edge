@@ -103,7 +103,7 @@ def _latency_to_ms(s):
 # Result file discovery
 # ---------------------------------------------------------------------------
 
-GATEWAYS = ["baseline", "ferrum", "kong", "tyk"]
+GATEWAYS = ["baseline", "ferrum", "pingora", "kong", "tyk"]
 PROTOCOLS = ["http", "https", "e2e_tls"]
 ENDPOINTS = ["health", "users"]
 
