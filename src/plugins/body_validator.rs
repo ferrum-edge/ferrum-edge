@@ -169,48 +169,92 @@ impl BodyValidator {
             }
         }
 
-        // Basic tag balance check
+        // Tag balance check with proper handling of CDATA, comments,
+        // processing instructions, and DOCTYPE declarations.
+        let bytes = trimmed.as_bytes();
+        let len = bytes.len();
         let mut depth: i32 = 0;
-        let mut in_tag = false;
-        let mut is_closing = false;
-        let mut is_self_closing = false;
-        let mut tag_just_opened = false;
+        let mut i = 0;
 
-        for ch in trimmed.chars() {
-            match ch {
-                '<' => {
-                    in_tag = true;
-                    is_closing = false;
-                    is_self_closing = false;
-                    tag_just_opened = true;
+        while i < len {
+            if bytes[i] != b'<' {
+                i += 1;
+                continue;
+            }
+
+            // We're at a '<' — determine what kind of construct follows
+            let remaining = &bytes[i..];
+
+            // CDATA section: <![CDATA[ ... ]]>
+            if remaining.starts_with(b"<![CDATA[") {
+                match find_subsequence(&bytes[i + 9..], b"]]>") {
+                    Some(end) => {
+                        i = i + 9 + end + 3;
+                        continue;
+                    }
+                    None => return Err("Unterminated CDATA section".to_string()),
                 }
-                '/' if in_tag => {
-                    if tag_just_opened {
-                        // `</` — this is a closing tag
-                        is_closing = true;
+            }
+
+            // Comment: <!-- ... -->
+            if remaining.starts_with(b"<!--") {
+                match find_subsequence(&bytes[i + 4..], b"-->") {
+                    Some(end) => {
+                        i = i + 4 + end + 3;
+                        continue;
+                    }
+                    None => return Err("Unterminated XML comment".to_string()),
+                }
+            }
+
+            // Processing instruction: <? ... ?>
+            if remaining.len() >= 2 && remaining[1] == b'?' {
+                match find_subsequence(&bytes[i + 2..], b"?>") {
+                    Some(end) => {
+                        i = i + 2 + end + 2;
+                        continue;
+                    }
+                    None => return Err("Unterminated processing instruction".to_string()),
+                }
+            }
+
+            // DOCTYPE declaration: <!DOCTYPE ... >
+            if remaining.starts_with(b"<!") {
+                // Skip any <! declaration (DOCTYPE, etc.) — find matching >
+                match find_byte(&bytes[i + 2..], b'>') {
+                    Some(end) => {
+                        i = i + 2 + end + 1;
+                        continue;
+                    }
+                    None => return Err("Unterminated declaration".to_string()),
+                }
+            }
+
+            // Closing tag: </...>
+            if remaining.len() >= 2 && remaining[1] == b'/' {
+                match find_byte(&bytes[i + 2..], b'>') {
+                    Some(end) => {
+                        depth -= 1;
+                        i = i + 2 + end + 1;
+                        continue;
+                    }
+                    None => return Err("Unterminated closing tag".to_string()),
+                }
+            }
+
+            // Regular tag: <name ... /> or <name ... >
+            match find_byte(&bytes[i + 1..], b'>') {
+                Some(end) => {
+                    // Check if self-closing (ends with />)
+                    let tag_end = i + 1 + end;
+                    if tag_end > 0 && bytes[tag_end - 1] == b'/' {
+                        // Self-closing tag — no depth change
                     } else {
-                        // `/` later in the tag — self-closing like `<br/>`
-                        is_self_closing = true;
+                        depth += 1;
                     }
-                    tag_just_opened = false;
+                    i = tag_end + 1;
                 }
-                '>' => {
-                    if in_tag {
-                        if is_self_closing {
-                            // Self-closing tag, no depth change
-                        } else if is_closing {
-                            depth -= 1;
-                        } else {
-                            // Skip processing instructions and declarations
-                            depth += 1;
-                        }
-                        in_tag = false;
-                    }
-                    tag_just_opened = false;
-                }
-                _ => {
-                    tag_just_opened = false;
-                }
+                None => return Err("Unterminated tag".to_string()),
             }
         }
 
@@ -220,6 +264,16 @@ impl BodyValidator {
 
         Ok(())
     }
+}
+
+/// Find the position of a byte subsequence within a slice.
+fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+/// Find the position of a single byte within a slice.
+fn find_byte(haystack: &[u8], needle: u8) -> Option<usize> {
+    haystack.iter().position(|&b| b == needle)
 }
 
 fn json_type_name(v: &Value) -> &'static str {

@@ -7,6 +7,7 @@ pub mod cors;
 pub mod hmac_auth;
 pub mod http_logging;
 pub mod ip_restriction;
+pub mod jwks_store;
 pub mod jwt_auth;
 pub mod key_auth;
 pub mod oauth2_auth;
@@ -304,7 +305,10 @@ pub fn create_plugin_with_http_client(
             config,
         ))),
         "prometheus_metrics" => Some(Arc::new(prometheus_metrics::PrometheusMetrics::new(config))),
-        "otel_tracing" => Some(Arc::new(otel_tracing::OtelTracing::new(config))),
+        "otel_tracing" => Some(Arc::new(otel_tracing::OtelTracing::new_with_http_client(
+            config,
+            http_client,
+        ))),
         _ => {
             // Fall through to custom plugins registry
             let result = crate::custom_plugins::create_custom_plugin(name, config, http_client);

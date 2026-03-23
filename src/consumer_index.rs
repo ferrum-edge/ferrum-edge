@@ -1,7 +1,7 @@
 use arc_swap::ArcSwap;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::warn;
+use tracing::{error, warn};
 
 use crate::config::types::Consumer;
 
@@ -242,9 +242,13 @@ impl ConsumerIndex {
             identity.insert(consumer.id.clone(), Arc::clone(&arc_consumer));
             if let Some(ref custom_id) = consumer.custom_id {
                 let prev = identity.insert(custom_id.clone(), Arc::clone(&arc_consumer));
-                if let Some(existing) = prev {
-                    warn!(
-                        "Credential collision: identity (custom_id) '{}' for consumer '{}' overwrites consumer '{}'",
+                if let Some(existing) = prev
+                    && existing.id != consumer.id
+                {
+                    error!(
+                        "IDENTITY COLLISION: custom_id '{}' for consumer '{}' overwrites consumer '{}'. \
+                         This will cause incorrect OAuth2/JWT authentication. \
+                         Ensure custom_id values are unique across all consumers.",
                         custom_id, consumer.id, existing.id
                     );
                 }

@@ -697,6 +697,13 @@ async fn handle_create_consumer(
         ));
     }
 
+    // Normalize custom_id: treat empty string as None
+    if let Some(ref cid) = consumer.custom_id
+        && cid.trim().is_empty()
+    {
+        consumer.custom_id = None;
+    }
+
     consumer.created_at = Utc::now();
     consumer.updated_at = Utc::now();
 
@@ -710,10 +717,15 @@ async fn handle_create_consumer(
 
     match db.create_consumer(&consumer).await {
         Ok(_) => Ok(json_response(StatusCode::CREATED, &json!(consumer))),
-        Err(e) => Ok(json_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &json!({"error": format!("{}", e)}),
-        )),
+        Err(e) => {
+            let msg = format!("{}", e);
+            let status = if is_unique_constraint_violation(&msg) {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            Ok(json_response(status, &json!({"error": msg})))
+        }
     }
 }
 
@@ -792,6 +804,14 @@ async fn handle_update_consumer(
 
     consumer.id = id.to_string();
     consumer.updated_at = Utc::now();
+
+    // Normalize custom_id: treat empty string as None
+    if let Some(ref cid) = consumer.custom_id
+        && cid.trim().is_empty()
+    {
+        consumer.custom_id = None;
+    }
+
     if let Err(e) = hash_consumer_secrets(&mut consumer) {
         return Ok(json_response(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -801,10 +821,15 @@ async fn handle_update_consumer(
 
     match db.update_consumer(&consumer).await {
         Ok(_) => Ok(json_response(StatusCode::OK, &json!(consumer))),
-        Err(e) => Ok(json_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &json!({"error": format!("{}", e)}),
-        )),
+        Err(e) => {
+            let msg = format!("{}", e);
+            let status = if is_unique_constraint_violation(&msg) {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            Ok(json_response(status, &json!({"error": msg})))
+        }
     }
 }
 
@@ -1467,6 +1492,17 @@ fn json_response_with_stale(status: StatusCode, body: &Value) -> Response<Full<B
                 "{\"error\":\"Internal Server Error\"}",
             )))
         })
+}
+
+/// Check if a database error message indicates a unique constraint violation.
+///
+/// Covers SQLite ("UNIQUE constraint failed"), PostgreSQL ("duplicate key value
+/// violates unique constraint"), and MySQL ("Duplicate entry").
+fn is_unique_constraint_violation(error_msg: &str) -> bool {
+    let lower = error_msg.to_lowercase();
+    lower.contains("unique constraint")
+        || lower.contains("duplicate key")
+        || lower.contains("duplicate entry")
 }
 
 fn hash_consumer_secrets(consumer: &mut Consumer) -> Result<(), String> {

@@ -40,8 +40,15 @@ pub async fn run(
         .clone()
         .ok_or_else(|| anyhow::anyhow!("FERRUM_DP_GRPC_AUTH_TOKEN is required in dp mode"))?;
     let dp_proxy_state = proxy_state.clone();
+    let dp_shutdown = shutdown_tx.subscribe();
     tokio::spawn(async move {
-        crate::grpc::dp_client::start_dp_client(cp_url, auth_token, dp_proxy_state).await;
+        crate::grpc::dp_client::start_dp_client_with_shutdown(
+            cp_url,
+            auth_token,
+            dp_proxy_state,
+            Some(dp_shutdown),
+        )
+        .await;
     });
 
     // Build TLS hardening policy from environment

@@ -16,6 +16,15 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
+/// Wait for a shutdown signal on a watch channel.
+async fn wait_for_shutdown(mut rx: tokio::sync::watch::Receiver<bool>) {
+    while !*rx.borrow() {
+        if rx.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
 fn target_key(target: &UpstreamTarget) -> String {
     format!("{}:{}", target.host, target.port)
 }
@@ -95,6 +104,15 @@ impl HealthChecker {
 
     /// Start health checks for all upstreams in the config.
     pub fn start(&mut self, config: &GatewayConfig) {
+        self.start_with_shutdown(config, None);
+    }
+
+    /// Start health checks with an optional shutdown signal.
+    pub fn start_with_shutdown(
+        &mut self,
+        config: &GatewayConfig,
+        shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
+    ) {
         // Cancel any existing active check tasks
         for handle in self.active_check_handles.drain(..) {
             handle.abort();
@@ -105,7 +123,7 @@ impl HealthChecker {
                 // Start active health checks
                 if let Some(active) = &hc_config.active {
                     for target in &upstream.targets {
-                        let handle = self.start_active_check(target, active);
+                        let handle = self.start_active_check(target, active, shutdown_rx.clone());
                         self.active_check_handles.push(handle);
                     }
                 }
@@ -121,6 +139,7 @@ impl HealthChecker {
                     let handle = self.start_passive_recovery_timer(
                         &upstream.targets,
                         passive.healthy_after_seconds,
+                        shutdown_rx.clone(),
                     );
                     self.active_check_handles.push(handle);
                 }
@@ -231,6 +250,7 @@ impl HealthChecker {
         &self,
         targets: &[UpstreamTarget],
         healthy_after_seconds: u64,
+        shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
     ) -> tokio::task::JoinHandle<()> {
         let unhealthy_targets = self.unhealthy_targets.clone();
         let target_states = self.target_states.clone();
@@ -242,7 +262,17 @@ impl HealthChecker {
             let mut timer = tokio::time::interval(check_interval);
 
             loop {
-                timer.tick().await;
+                if let Some(ref rx) = shutdown_rx {
+                    tokio::select! {
+                        _ = timer.tick() => {}
+                        _ = wait_for_shutdown(rx.clone()) => {
+                            info!("Passive recovery timer shutting down");
+                            return;
+                        }
+                    }
+                } else {
+                    timer.tick().await;
+                }
 
                 let now = now_epoch_ms();
 
@@ -281,6 +311,7 @@ impl HealthChecker {
         &self,
         target: &UpstreamTarget,
         config: &ActiveHealthCheck,
+        shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
     ) -> tokio::task::JoinHandle<()> {
         let key = target_key(target);
         let scheme = if config.use_tls { "https" } else { "http" };
@@ -301,7 +332,17 @@ impl HealthChecker {
             let mut timer = tokio::time::interval(interval);
 
             loop {
-                timer.tick().await;
+                if let Some(ref rx) = shutdown_rx {
+                    tokio::select! {
+                        _ = timer.tick() => {}
+                        _ = wait_for_shutdown(rx.clone()) => {
+                            info!("Active health check for {} shutting down", key);
+                            return;
+                        }
+                    }
+                } else {
+                    timer.tick().await;
+                }
 
                 let state = target_states
                     .entry(key.clone())

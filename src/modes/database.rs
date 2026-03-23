@@ -85,8 +85,8 @@ pub async fn run(
 
     dns_cache.warmup(hostnames).await;
 
-    // Start background TTL refresh to keep cache warm
-    dns_cache.start_background_refresh();
+    // Start background TTL refresh to keep cache warm (with shutdown)
+    dns_cache.start_background_refresh_with_shutdown(Some(shutdown_tx.subscribe()));
     let db = Arc::new(db);
 
     // Build TLS hardening policy from environment
@@ -287,24 +287,34 @@ pub async fn run(
         info!("Admin TLS not configured - HTTPS listener disabled");
     }
 
-    // Database polling loop
+    // Database polling loop (with shutdown)
     let poll_interval = Duration::from_secs(env_config.db_poll_interval);
     let db_poll = db.clone();
     let proxy_state_poll = proxy_state.clone();
+    let mut poll_shutdown = shutdown_tx.subscribe();
     tokio::spawn(async move {
+        let mut interval = tokio::time::interval(poll_interval);
+        interval.tick().await; // skip first immediate tick
         loop {
-            tokio::time::sleep(poll_interval).await;
-            match db_poll.load_full_config().await {
-                Ok(new_config) => {
-                    if proxy_state_poll.update_config(new_config) {
-                        info!("Configuration reloaded from database");
+            tokio::select! {
+                _ = interval.tick() => {
+                    match db_poll.load_full_config().await {
+                        Ok(new_config) => {
+                            if proxy_state_poll.update_config(new_config) {
+                                info!("Configuration reloaded from database");
+                            }
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Failed to reload config from database (using cached): {}",
+                                e
+                            );
+                        }
                     }
                 }
-                Err(e) => {
-                    warn!(
-                        "Failed to reload config from database (using cached): {}",
-                        e
-                    );
+                _ = poll_shutdown.changed() => {
+                    info!("Database polling shutting down");
+                    return;
                 }
             }
         }

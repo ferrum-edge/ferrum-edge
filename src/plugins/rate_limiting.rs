@@ -10,6 +10,10 @@ use super::{Plugin, PluginResult, RequestContext};
 
 /// Sliding window rate limiter. Tracks individual request timestamps within the
 /// window to provide exact counting with zero boundary-burst vulnerability.
+///
+/// Best for longer windows (minutes, hours) where the per-key timestamp count
+/// stays bounded. For sub-second / per-second TPS limiting, use [`TokenBucket`]
+/// instead to avoid O(n) memory per key.
 #[derive(Debug)]
 struct SlidingWindow {
     timestamps: VecDeque<Instant>,
@@ -48,52 +52,163 @@ impl SlidingWindow {
     }
 }
 
+/// Token bucket rate limiter. O(1) memory and O(1) per check regardless of TPS.
+///
+/// Tokens refill at a constant rate. Each request consumes one token.
+/// When the bucket is empty, requests are rejected until tokens refill.
+///
+/// For a limit of N requests per T seconds:
+/// - `capacity` = N (maximum burst size)
+/// - `refill_rate` = N / T tokens per second
+///
+/// This provides smooth rate limiting suitable for high-TPS scenarios
+/// (e.g., 10,000 req/s) without storing individual request timestamps.
+#[derive(Debug)]
+struct TokenBucket {
+    /// Current available tokens (fractional for smooth refill).
+    tokens: f64,
+    /// Maximum tokens (= request limit).
+    capacity: f64,
+    /// Tokens added per second.
+    refill_rate: f64,
+    /// Last time tokens were refilled.
+    last_refill: Instant,
+}
+
+impl TokenBucket {
+    fn new(limit: u64, window: Duration) -> Self {
+        let capacity = limit as f64;
+        let window_secs = window.as_secs_f64().max(0.001); // avoid division by zero
+        Self {
+            tokens: capacity,
+            capacity,
+            refill_rate: capacity / window_secs,
+            last_refill: Instant::now(),
+        }
+    }
+
+    fn check_and_consume(&mut self) -> bool {
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.last_refill).as_secs_f64();
+        self.last_refill = now;
+
+        // Refill tokens based on elapsed time
+        self.tokens = (self.tokens + elapsed * self.refill_rate).min(self.capacity);
+
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// A rate window that automatically picks the best algorithm.
+///
+/// - Short windows (≤5s): token bucket — O(1) memory, ideal for TPS limiting
+/// - Longer windows (>5s): sliding window — exact counting, no boundary burst
+#[derive(Debug)]
+enum RateWindow {
+    Sliding(SlidingWindow),
+    Bucket(TokenBucket),
+}
+
+impl RateWindow {
+    fn new(limit: u64, duration: Duration) -> Self {
+        if duration.as_secs() <= 5 {
+            RateWindow::Bucket(TokenBucket::new(limit, duration))
+        } else {
+            RateWindow::Sliding(SlidingWindow::new(limit, duration))
+        }
+    }
+
+    fn check_and_increment(&mut self) -> bool {
+        match self {
+            RateWindow::Sliding(sw) => sw.check_and_increment(),
+            RateWindow::Bucket(tb) => tb.check_and_consume(),
+        }
+    }
+
+    /// Returns the window duration (for stale entry eviction).
+    fn window_duration(&self) -> Duration {
+        match self {
+            RateWindow::Sliding(sw) => sw.window_duration,
+            RateWindow::Bucket(tb) => {
+                // For staleness: if tokens are full, no recent activity
+                Duration::from_secs_f64(tb.capacity / tb.refill_rate)
+            }
+        }
+    }
+
+    /// Returns true if this window has had recent activity.
+    fn has_recent_activity(&self, now: Instant) -> bool {
+        match self {
+            RateWindow::Sliding(sw) => sw
+                .timestamps
+                .back()
+                .is_some_and(|last| now.duration_since(*last) < sw.window_duration),
+            RateWindow::Bucket(tb) => now.duration_since(tb.last_refill) < self.window_duration(),
+        }
+    }
+}
+
 /// Maximum entries before triggering eviction of stale rate-limit state.
 const MAX_STATE_ENTRIES: usize = 100_000;
 
+/// A rate window specification: requests allowed within a duration.
+#[derive(Debug, Clone)]
+struct WindowSpec {
+    limit: u64,
+    duration: Duration,
+}
+
 pub struct RateLimiting {
     limit_by: String,
-    per_second: Option<u64>,
-    per_minute: Option<u64>,
-    per_hour: Option<u64>,
-    // key -> windows (second, minute, hour)
-    state: Arc<DashMap<String, Vec<SlidingWindow>>>,
+    /// Window specifications used to create RateWindows per key.
+    window_specs: Vec<WindowSpec>,
+    // key -> windows
+    state: Arc<DashMap<String, Vec<RateWindow>>>,
 }
 
 impl RateLimiting {
     pub fn new(config: &Value) -> Self {
         let limit_by = config["limit_by"].as_str().unwrap_or("ip").to_string();
 
-        // Handle different configuration formats
-        let (per_second, per_minute, per_hour) =
-            if let Some(window_seconds) = config["window_seconds"].as_u64() {
-                let max_requests = config["max_requests"].as_u64().unwrap_or(10);
-
-                // Convert window_seconds to appropriate rate limits
-                match window_seconds {
-                    1 => (Some(max_requests), None, None),
-                    60 => (None, Some(max_requests), None),
-                    3600 => (None, None, Some(max_requests)),
-                    _ => {
-                        // For other window sizes, convert to per-minute rate
-                        let per_minute_rate = (max_requests * 60) / window_seconds.max(1);
-                        (None, Some(per_minute_rate), None)
-                    }
-                }
-            } else {
-                // Use the explicit rate limits if provided
-                (
-                    config["requests_per_second"].as_u64(),
-                    config["requests_per_minute"].as_u64(),
-                    config["requests_per_hour"].as_u64(),
-                )
-            };
+        let window_specs = if let Some(window_seconds) = config["window_seconds"].as_u64() {
+            let max_requests = config["max_requests"].as_u64().unwrap_or(10);
+            // Use the exact window duration — no conversion or precision loss
+            vec![WindowSpec {
+                limit: max_requests,
+                duration: Duration::from_secs(window_seconds.max(1)),
+            }]
+        } else {
+            // Use the explicit rate limits if provided
+            let mut specs = Vec::new();
+            if let Some(limit) = config["requests_per_second"].as_u64() {
+                specs.push(WindowSpec {
+                    limit,
+                    duration: Duration::from_secs(1),
+                });
+            }
+            if let Some(limit) = config["requests_per_minute"].as_u64() {
+                specs.push(WindowSpec {
+                    limit,
+                    duration: Duration::from_secs(60),
+                });
+            }
+            if let Some(limit) = config["requests_per_hour"].as_u64() {
+                specs.push(WindowSpec {
+                    limit,
+                    duration: Duration::from_secs(3600),
+                });
+            }
+            specs
+        };
 
         Self {
             limit_by,
-            per_second,
-            per_minute,
-            per_hour,
+            window_specs,
             state: Arc::new(DashMap::new()),
         }
     }
@@ -109,7 +224,7 @@ impl RateLimiting {
         }
     }
 
-    /// Evict entries whose sliding windows are all empty (no recent requests).
+    /// Evict entries whose rate windows have had no recent activity.
     /// Called periodically to prevent unbounded memory growth.
     fn evict_stale_entries(&self) {
         if self.state.len() <= MAX_STATE_ENTRIES {
@@ -117,32 +232,20 @@ impl RateLimiting {
         }
 
         let now = Instant::now();
-        self.state.retain(|_, windows| {
-            // Keep the entry if any window still has timestamps within its duration
-            windows.iter().any(|w| {
-                w.timestamps
-                    .back()
-                    .is_some_and(|last| now.duration_since(*last) < w.window_duration)
-            })
-        });
+        self.state
+            .retain(|_, windows| windows.iter().any(|w| w.has_recent_activity(now)));
     }
 
     fn check_rate(&self, key: &str) -> PluginResult {
         // Periodically evict stale entries to bound memory usage
         self.evict_stale_entries();
 
+        let specs = &self.window_specs;
         let mut entry = self.state.entry(key.to_string()).or_insert_with(|| {
-            let mut windows = Vec::new();
-            if let Some(limit) = self.per_second {
-                windows.push(SlidingWindow::new(limit, Duration::from_secs(1)));
-            }
-            if let Some(limit) = self.per_minute {
-                windows.push(SlidingWindow::new(limit, Duration::from_secs(60)));
-            }
-            if let Some(limit) = self.per_hour {
-                windows.push(SlidingWindow::new(limit, Duration::from_secs(3600)));
-            }
-            windows
+            specs
+                .iter()
+                .map(|spec| RateWindow::new(spec.limit, spec.duration))
+                .collect()
         });
 
         for window in entry.value_mut().iter_mut() {
@@ -167,10 +270,6 @@ impl Plugin for RateLimiting {
     }
 
     fn priority(&self) -> u16 {
-        // Runs at 299 so it executes after access_control (200) in the authorize
-        // phase, where identified_consumer is available for consumer-based limiting.
-        // IP-based limiting also runs in on_request_received (phase 1) for early
-        // rejection before auth.
         super::priority::RATE_LIMITING
     }
 

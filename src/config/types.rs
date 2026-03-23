@@ -490,6 +490,41 @@ impl GatewayConfig {
         }
     }
 
+    /// Validate that consumer usernames and custom_ids are unique.
+    ///
+    /// In database mode the DB enforces this via UNIQUE constraints. In file
+    /// mode there's no DB, so this catches duplicates at config load time
+    /// and prevents the gateway from starting with ambiguous identity mappings
+    /// that would cause incorrect OAuth2/JWT authentication.
+    pub fn validate_unique_consumer_identities(&self) -> Result<(), Vec<String>> {
+        let mut seen_usernames: HashMap<&str, &str> = HashMap::new();
+        let mut seen_custom_ids: HashMap<&str, &str> = HashMap::new();
+        let mut duplicates = Vec::new();
+
+        for consumer in &self.consumers {
+            if let Some(existing_id) = seen_usernames.insert(&consumer.username, &consumer.id) {
+                duplicates.push(format!(
+                    "Duplicate consumer username '{}' in consumer '{}' (conflicts with '{}')",
+                    consumer.username, consumer.id, existing_id
+                ));
+            }
+            if let Some(ref custom_id) = consumer.custom_id
+                && let Some(existing_id) = seen_custom_ids.insert(custom_id, &consumer.id)
+            {
+                duplicates.push(format!(
+                    "Duplicate consumer custom_id '{}' in consumer '{}' (conflicts with '{}')",
+                    custom_id, consumer.id, existing_id
+                ));
+            }
+        }
+
+        if duplicates.is_empty() {
+            Ok(())
+        } else {
+            Err(duplicates)
+        }
+    }
+
     /// Build a sorted list of listen_paths for longest prefix matching.
     #[allow(dead_code)]
     pub fn build_route_table(&self) -> Vec<(String, String)> {

@@ -13,6 +13,15 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
+/// Wait for a shutdown signal on a watch channel.
+async fn wait_for_shutdown(mut rx: tokio::sync::watch::Receiver<bool>) {
+    while !*rx.borrow() {
+        if rx.changed().await.is_err() {
+            return; // Sender dropped
+        }
+    }
+}
+
 /// Record type ordering for DNS queries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DnsRecordOrder {
@@ -428,7 +437,19 @@ impl DnsCache {
     /// Start a background task that proactively refreshes cache entries before
     /// they expire. Entries are refreshed when they reach 75% of their TTL,
     /// keeping DNS resolution out of the hot request path.
+    #[allow(dead_code)]
     pub fn start_background_refresh(&self) {
+        self.start_background_refresh_with_shutdown(None);
+    }
+
+    /// Start background refresh with an optional shutdown signal.
+    ///
+    /// When `shutdown_rx` is provided, the task will exit cleanly when the
+    /// shutdown signal is received. Without it, the task runs until aborted.
+    pub fn start_background_refresh_with_shutdown(
+        &self,
+        shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
+    ) {
         let cache = self.clone();
         let check_interval = std::cmp::max(cache.default_ttl.as_secs() / 4, 5);
 
@@ -436,7 +457,17 @@ impl DnsCache {
             let mut interval = tokio::time::interval(Duration::from_secs(check_interval));
 
             loop {
-                interval.tick().await;
+                if let Some(ref rx) = shutdown_rx {
+                    tokio::select! {
+                        _ = interval.tick() => {}
+                        _ = wait_for_shutdown(rx.clone()) => {
+                            info!("DNS background refresh shutting down");
+                            return;
+                        }
+                    }
+                } else {
+                    interval.tick().await;
+                }
 
                 // Evict expired entries and enforce max cache size
                 cache.evict_expired();

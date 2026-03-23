@@ -3,6 +3,7 @@ mod plugin_utils;
 
 mod access_control_tests;
 mod basic_auth_tests;
+mod body_validator_tests;
 mod bot_detection_tests;
 mod correlation_id_tests;
 mod cors_tests;
@@ -12,6 +13,7 @@ mod ip_restriction_tests;
 mod jwt_auth_plugin_tests;
 mod key_auth_tests;
 mod oauth2_auth_tests;
+mod otel_tracing_tests;
 mod plugin_cache_tests;
 mod plugin_integration_tests;
 mod rate_limiting_tests;

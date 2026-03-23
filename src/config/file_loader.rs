@@ -81,6 +81,18 @@ pub fn load_config_from_file(path: &str) -> Result<GatewayConfig, anyhow::Error>
         );
     }
 
+    // Validate consumer username/custom_id uniqueness
+    if let Err(dupes) = config.validate_unique_consumer_identities() {
+        for msg in &dupes {
+            error!("{}", msg);
+        }
+        anyhow::bail!(
+            "Configuration validation failed: {} duplicate consumer identity(ies) found. \
+             Each consumer must have a unique username and unique custom_id.",
+            dupes.len()
+        );
+    }
+
     info!(
         "Configuration loaded (version {}): {} proxies, {} consumers, {} plugin configs",
         config.version,

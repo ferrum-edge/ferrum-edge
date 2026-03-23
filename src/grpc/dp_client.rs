@@ -9,11 +9,29 @@ use crate::config::types::GatewayConfig;
 use crate::proxy::ProxyState;
 
 /// Connect to the Control Plane and receive config updates.
+#[allow(dead_code)]
 pub async fn start_dp_client(cp_url: String, auth_token: String, proxy_state: ProxyState) {
+    start_dp_client_with_shutdown(cp_url, auth_token, proxy_state, None).await;
+}
+
+/// Connect to the Control Plane with an optional shutdown signal.
+pub async fn start_dp_client_with_shutdown(
+    cp_url: String,
+    auth_token: String,
+    proxy_state: ProxyState,
+    shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
+) {
     let node_id = uuid::Uuid::new_v4().to_string();
     info!("DP client starting, connecting to CP at {}", cp_url);
 
     loop {
+        if let Some(ref rx) = shutdown_rx
+            && *rx.borrow()
+        {
+            info!("DP client shutting down");
+            return;
+        }
+
         match connect_and_subscribe(&cp_url, &auth_token, &node_id, &proxy_state).await {
             Ok(_) => {
                 warn!("CP connection stream ended, will reconnect...");
@@ -24,7 +42,22 @@ pub async fn start_dp_client(cp_url: String, auth_token: String, proxy_state: Pr
         }
 
         // Continue serving with cached config; retry connection
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        if let Some(ref rx) = shutdown_rx {
+            let mut rx_clone = rx.clone();
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+                _ = async {
+                    while !*rx_clone.borrow() {
+                        if rx_clone.changed().await.is_err() { return; }
+                    }
+                } => {
+                    info!("DP client shutting down");
+                    return;
+                }
+            }
+        } else {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
     }
 }
 

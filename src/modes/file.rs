@@ -90,8 +90,8 @@ pub async fn run(
 
     dns_cache.warmup(hostnames).await;
 
-    // Start background TTL refresh to keep cache warm
-    dns_cache.start_background_refresh();
+    // Start background TTL refresh to keep cache warm (with shutdown)
+    dns_cache.start_background_refresh_with_shutdown(Some(shutdown_tx.subscribe()));
 
     // Build TLS hardening policy from environment
     let tls_policy = TlsPolicy::from_env_config(&env_config)?;
@@ -146,9 +146,10 @@ pub async fn run(
         );
     }
 
-    // Listen for SIGHUP to reload config
+    // Listen for SIGHUP to reload config (with shutdown)
     let proxy_state_reload = proxy_state.clone();
     let config_path_owned = config_path.to_string();
+    let mut sighup_shutdown = shutdown_tx.subscribe();
     tokio::spawn(async move {
         #[cfg(unix)]
         {
@@ -161,18 +162,25 @@ pub async fn run(
                 }
             };
             loop {
-                sighup.recv().await;
-                info!("SIGHUP received, reloading configuration...");
-                match file_loader::reload_config_from_file(&config_path_owned) {
-                    Ok(new_config) => {
-                        proxy_state_reload.update_config(new_config);
-                        info!("Configuration reloaded successfully");
+                tokio::select! {
+                    _ = sighup.recv() => {
+                        info!("SIGHUP received, reloading configuration...");
+                        match file_loader::reload_config_from_file(&config_path_owned) {
+                            Ok(new_config) => {
+                                proxy_state_reload.update_config(new_config);
+                                info!("Configuration reloaded successfully");
+                            }
+                            Err(e) => {
+                                error!(
+                                    "Configuration reload failed, keeping previous config: {}",
+                                    e
+                                );
+                            }
+                        }
                     }
-                    Err(e) => {
-                        error!(
-                            "Configuration reload failed, keeping previous config: {}",
-                            e
-                        );
+                    _ = sighup_shutdown.changed() => {
+                        info!("SIGHUP listener shutting down");
+                        return;
                     }
                 }
             }

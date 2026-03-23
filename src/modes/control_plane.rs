@@ -165,27 +165,37 @@ pub async fn run(
         }
     });
 
-    // Database polling loop -> push updates to DPs
+    // Database polling loop -> push updates to DPs (with shutdown)
     let poll_interval = Duration::from_secs(env_config.db_poll_interval);
     let db_poll = db.clone();
     let config_poll = config_arc.clone();
+    let mut cp_poll_shutdown = shutdown_tx.subscribe();
     tokio::spawn(async move {
+        let mut interval = tokio::time::interval(poll_interval);
+        interval.tick().await; // skip first immediate tick
         loop {
-            tokio::time::sleep(poll_interval).await;
-            match db_poll.load_full_config().await {
-                Ok(new_config) => {
-                    // Store config before broadcasting so that a DP calling
-                    // GetFullConfig immediately after receiving the broadcast
-                    // reads the new version (not the stale one).
-                    config_poll.store(Arc::new(new_config.clone()));
-                    CpGrpcServer::broadcast_update(&update_tx, &new_config);
-                    info!("Configuration reloaded from database and pushed to DPs");
+            tokio::select! {
+                _ = interval.tick() => {
+                    match db_poll.load_full_config().await {
+                        Ok(new_config) => {
+                            // Store config before broadcasting so that a DP calling
+                            // GetFullConfig immediately after receiving the broadcast
+                            // reads the new version (not the stale one).
+                            config_poll.store(Arc::new(new_config.clone()));
+                            CpGrpcServer::broadcast_update(&update_tx, &new_config);
+                            info!("Configuration reloaded from database and pushed to DPs");
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Failed to reload config from database (serving cached): {}",
+                                e
+                            );
+                        }
+                    }
                 }
-                Err(e) => {
-                    warn!(
-                        "Failed to reload config from database (serving cached): {}",
-                        e
-                    );
+                _ = cp_poll_shutdown.changed() => {
+                    info!("CP database polling shutting down");
+                    return;
                 }
             }
         }

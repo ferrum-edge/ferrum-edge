@@ -47,7 +47,7 @@ impl V001InitialSchema {
             CREATE TABLE IF NOT EXISTS consumers (
                 id TEXT PRIMARY KEY,
                 username TEXT NOT NULL UNIQUE,
-                custom_id TEXT,
+                custom_id TEXT UNIQUE,
                 credentials TEXT NOT NULL DEFAULT '{}',
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
