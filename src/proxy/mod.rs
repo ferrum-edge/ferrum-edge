@@ -1208,45 +1208,49 @@ pub async fn handle_proxy_request(
     }
 
     // Resolve real client IP using trusted proxy configuration.
-    // Check authoritative real-IP header first (e.g., CF-Connecting-IP),
-    // then fall back to X-Forwarded-For right-to-left walk.
+    // Parse the socket IP once and reuse the parsed value to avoid redundant
+    // parsing across the real-IP-header check and the XFF walk.
     if !state.trusted_proxies.is_empty() {
+        let socket_addr: Option<std::net::IpAddr> = socket_ip.parse().ok();
         let resolved = if let Some(ref real_ip_header) = state.env_config.real_ip_header {
             let header_val = ctx.headers.get(&real_ip_header.to_lowercase());
             if let Some(val) = header_val {
                 // Validate the direct connection is from a trusted proxy before
                 // trusting this header
-                let socket_addr: Option<std::net::IpAddr> = socket_ip.parse().ok();
                 if socket_addr.is_some_and(|ip| state.trusted_proxies.contains(&ip)) {
                     val.trim().to_string()
                 } else {
-                    client_ip::resolve_client_ip(
-                        &socket_ip,
-                        ctx.headers.get("x-forwarded-for").map(|s| s.as_str()),
-                        &state.trusted_proxies,
-                    )
+                    socket_ip.to_string()
                 }
-            } else {
-                client_ip::resolve_client_ip(
+            } else if let Some(ref addr) = socket_addr {
+                client_ip::resolve_client_ip_parsed(
                     &socket_ip,
+                    addr,
                     ctx.headers.get("x-forwarded-for").map(|s| s.as_str()),
                     &state.trusted_proxies,
                 )
+            } else {
+                socket_ip.to_string()
             }
-        } else {
-            client_ip::resolve_client_ip(
+        } else if let Some(ref addr) = socket_addr {
+            client_ip::resolve_client_ip_parsed(
                 &socket_ip,
+                addr,
                 ctx.headers.get("x-forwarded-for").map(|s| s.as_str()),
                 &state.trusted_proxies,
             )
+        } else {
+            socket_ip.to_string()
         };
         ctx.client_ip = resolved;
     }
 
-    // Parse query params
-    for pair in query_string.split('&') {
-        if let Some((k, v)) = pair.split_once('=') {
-            ctx.query_params.insert(k.to_string(), v.to_string());
+    // Parse query params (skip when empty — most requests have no query string)
+    if !query_string.is_empty() {
+        for pair in query_string.split('&') {
+            if let Some((k, v)) = pair.split_once('=') {
+                ctx.query_params.insert(k.to_string(), v.to_string());
+            }
         }
     }
 
@@ -1366,11 +1370,10 @@ pub async fn handle_proxy_request(
         }
     }
 
-    // before_proxy hooks — only clone headers if plugins need to modify them
+    // before_proxy hooks — only clone headers if at least one plugin modifies them
+    let needs_header_clone = plugins.iter().any(|p| p.modifies_request_headers());
     let mut owned_proxy_headers;
-    let proxy_headers: &HashMap<String, String> = if plugins.is_empty() {
-        &ctx.headers
-    } else {
+    let proxy_headers: &HashMap<String, String> = if needs_header_clone {
         owned_proxy_headers = ctx.headers.clone();
         for plugin in plugins.iter() {
             match plugin
@@ -1396,6 +1399,36 @@ pub async fn handle_proxy_request(
             }
         }
         &owned_proxy_headers
+    } else if !plugins.is_empty() {
+        // Run before_proxy hooks that don't modify headers (e.g., body_validator)
+        // but skip the header clone.
+        owned_proxy_headers = HashMap::new(); // unused, satisfies borrow checker
+        for plugin in plugins.iter() {
+            match plugin
+                .before_proxy(&mut ctx, &mut owned_proxy_headers)
+                .await
+            {
+                PluginResult::Reject {
+                    status_code,
+                    body,
+                    headers,
+                } => {
+                    log_rejected_request(&plugins, &ctx, status_code, start_time, "before_proxy")
+                        .await;
+                    record_request(&state, status_code);
+                    return Ok(build_reject_response(
+                        StatusCode::from_u16(status_code)
+                            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                        &body,
+                        &headers,
+                    ));
+                }
+                PluginResult::Continue => {}
+            }
+        }
+        &ctx.headers
+    } else {
+        &ctx.headers
     };
 
     // Check if this is a WebSocket upgrade request and the proxy supports WebSocket
@@ -1796,43 +1829,19 @@ pub fn find_matching_proxy(config: &GatewayConfig, path: &str) -> Option<Proxy> 
 
 /// Build the backend URL based on proxy config and path forwarding logic.
 pub fn build_backend_url(proxy: &Proxy, incoming_path: &str, query_string: &str) -> String {
-    let scheme = match proxy.backend_protocol {
-        BackendProtocol::Http | BackendProtocol::Ws | BackendProtocol::Grpc => "http",
-        BackendProtocol::Https
-        | BackendProtocol::Wss
-        | BackendProtocol::H3
-        | BackendProtocol::Grpcs => "https",
-    };
-
-    let remaining_path = if proxy.strip_listen_path {
-        incoming_path.strip_prefix(&proxy.listen_path).unwrap_or("")
-    } else {
-        incoming_path
-    };
-
-    let backend_path = proxy.backend_path.as_deref().unwrap_or("");
-    let full_path = format!("{}{}", backend_path, remaining_path);
-    let full_path = if full_path.is_empty() {
-        "/".to_string()
-    } else if !full_path.starts_with('/') {
-        format!("/{}", full_path)
-    } else {
-        full_path
-    };
-
-    let base = format!(
-        "{}://{}:{}{}",
-        scheme, proxy.backend_host, proxy.backend_port, full_path
-    );
-
-    if query_string.is_empty() {
-        base
-    } else {
-        format!("{}?{}", base, query_string)
-    }
+    build_backend_url_with_target(
+        proxy,
+        incoming_path,
+        query_string,
+        &proxy.backend_host,
+        proxy.backend_port,
+    )
 }
 
 /// Build backend URL using a specific host and port (for load-balanced targets).
+///
+/// Uses a single `String` buffer to avoid intermediate allocations from
+/// multiple `format!` calls.
 pub fn build_backend_url_with_target(
     proxy: &Proxy,
     incoming_path: &str,
@@ -1840,6 +1849,8 @@ pub fn build_backend_url_with_target(
     host: &str,
     port: u16,
 ) -> String {
+    use std::fmt::Write;
+
     let scheme = match proxy.backend_protocol {
         BackendProtocol::Http | BackendProtocol::Ws | BackendProtocol::Grpc => "http",
         BackendProtocol::Https
@@ -1855,22 +1866,39 @@ pub fn build_backend_url_with_target(
     };
 
     let backend_path = proxy.backend_path.as_deref().unwrap_or("");
-    let full_path = format!("{}{}", backend_path, remaining_path);
-    let full_path = if full_path.is_empty() {
+
+    // Combine backend_path and remaining_path, ensuring a leading '/'
+    let full_path = if backend_path.is_empty() && remaining_path.is_empty() {
         "/".to_string()
-    } else if !full_path.starts_with('/') {
-        format!("/{}", full_path)
     } else {
-        full_path
+        let combined = format!("{}{}", backend_path, remaining_path);
+        if combined.starts_with('/') {
+            combined
+        } else {
+            format!("/{}", combined)
+        }
     };
 
-    let base = format!("{}://{}:{}{}", scheme, host, port, full_path);
+    // Build URL in a single buffer with pre-allocated capacity
+    let capacity = scheme.len()
+        + 3
+        + host.len()
+        + 6
+        + full_path.len()
+        + if query_string.is_empty() {
+            0
+        } else {
+            1 + query_string.len()
+        };
+    let mut url = String::with_capacity(capacity);
+    let _ = write!(url, "{}://{}:{}{}", scheme, host, port, full_path);
 
-    if query_string.is_empty() {
-        base
-    } else {
-        format!("{}?{}", base, query_string)
+    if !query_string.is_empty() {
+        url.push('?');
+        url.push_str(query_string);
     }
+
+    url
 }
 
 /// Retry a backend request without a body (body was consumed on the first attempt).

@@ -158,6 +158,9 @@ impl CidrEntry {
 /// trusted proxy IPs, and returns the first untrusted IP.
 ///
 /// When no trusted proxies are configured, returns the socket IP unchanged.
+///
+/// The `socket_addr` variant accepts a pre-parsed `IpAddr` to avoid redundant
+/// parsing on the hot path when the caller already has a parsed IP.
 pub fn resolve_client_ip(
     socket_ip: &str,
     xff_header: Option<&str>,
@@ -168,21 +171,32 @@ pub fn resolve_client_ip(
         return socket_ip.to_string();
     }
 
+    // Parse the socket IP once; if unparseable, return it as-is
+    let socket_addr: IpAddr = match socket_ip.parse() {
+        Ok(ip) => ip,
+        Err(_) => return socket_ip.to_string(),
+    };
+
+    resolve_client_ip_parsed(socket_ip, &socket_addr, xff_header, trusted_proxies)
+}
+
+/// Like `resolve_client_ip` but accepts a pre-parsed `IpAddr` so callers on
+/// the hot path avoid parsing the socket IP string twice.
+pub fn resolve_client_ip_parsed(
+    socket_ip: &str,
+    socket_addr: &IpAddr,
+    xff_header: Option<&str>,
+    trusted_proxies: &TrustedProxies,
+) -> String {
     // No XFF header — use socket IP
     let xff = match xff_header {
         Some(h) if !h.trim().is_empty() => h,
         _ => return socket_ip.to_string(),
     };
 
-    // Parse the socket IP; if unparseable, return it as-is
-    let socket_addr: IpAddr = match socket_ip.parse() {
-        Ok(ip) => ip,
-        Err(_) => return socket_ip.to_string(),
-    };
-
     // If the direct connection is NOT from a trusted proxy, the XFF header
     // could be entirely attacker-controlled — ignore it.
-    if !trusted_proxies.contains(&socket_addr) {
+    if !trusted_proxies.contains(socket_addr) {
         debug!(
             socket_ip = socket_ip,
             "Direct connection not from trusted proxy; ignoring X-Forwarded-For"
@@ -190,11 +204,10 @@ pub fn resolve_client_ip(
         return socket_ip.to_string();
     }
 
-    // Parse XFF entries (comma-separated, left-to-right order)
-    let entries: Vec<&str> = xff.split(',').map(|s| s.trim()).collect();
-
-    // Walk right-to-left, skip trusted proxies
-    for entry in entries.iter().rev() {
+    // Walk XFF entries right-to-left without collecting into a Vec.
+    // rsplit(',') yields entries from right to left directly.
+    for entry in xff.rsplit(',') {
+        let entry = entry.trim();
         if entry.is_empty() {
             continue;
         }

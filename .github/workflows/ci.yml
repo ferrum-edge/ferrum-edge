@@ -202,9 +202,9 @@ jobs:
             perf-baseline-${{ github.base_ref || 'main' }}-
             perf-baseline-main-
 
-      - name: Build release binaries (ci-release profile)
+      - name: Build release binaries
         run: |
-          cargo build --profile ci-release --bin ferrum-gateway
+          cargo build --release --bin ferrum-gateway
           cd tests/performance && cargo build --release --bin backend_server
 
       - name: Start backend server
@@ -232,7 +232,7 @@ jobs:
           FERRUM_POOL_IDLE_TIMEOUT_SECONDS=120 \
           FERRUM_POOL_ENABLE_HTTP_KEEP_ALIVE=true \
           FERRUM_POOL_ENABLE_HTTP2=false \
-          ./target/ci-release/ferrum-gateway > /tmp/gateway.log 2>&1 &
+          ./target/release/ferrum-gateway > /tmp/gateway.log 2>&1 &
           echo "GATEWAY_PID=$!" >> $GITHUB_ENV
           for i in $(seq 1 15); do
             if curl -sf http://127.0.0.1:8000/health > /dev/null 2>&1; then

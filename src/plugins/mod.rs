@@ -168,6 +168,16 @@ pub trait Plugin: Send + Sync {
         PluginResult::Continue
     }
 
+    /// Returns `true` if this plugin may modify outgoing request headers
+    /// during the `before_proxy` phase. The gateway uses this hint to skip
+    /// cloning the header map when no plugin needs to modify it.
+    ///
+    /// Default is `false`. Override in plugins that insert, remove, or
+    /// modify headers in `before_proxy`.
+    fn modifies_request_headers(&self) -> bool {
+        false
+    }
+
     /// Called just before the request is proxied to the backend.
     async fn before_proxy(
         &self,

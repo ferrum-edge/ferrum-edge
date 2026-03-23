@@ -52,6 +52,13 @@ impl Plugin for ExamplePlugin {
         super::super::plugins::priority::DEFAULT
     }
 
+    /// Return `true` if your plugin modifies outgoing request headers in
+    /// `before_proxy`. This allows the gateway to skip cloning the header
+    /// map when no plugin needs to modify it.
+    fn modifies_request_headers(&self) -> bool {
+        true
+    }
+
     /// Called when a request is first received (before routing).
     /// Return `PluginResult::Reject` to short-circuit with an error response.
     async fn on_request_received(&self, _ctx: &mut RequestContext) -> PluginResult {

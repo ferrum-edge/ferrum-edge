@@ -49,6 +49,10 @@ impl Plugin for RequestTransformer {
         super::priority::REQUEST_TRANSFORMER
     }
 
+    fn modifies_request_headers(&self) -> bool {
+        true
+    }
+
     async fn before_proxy(
         &self,
         ctx: &mut RequestContext,

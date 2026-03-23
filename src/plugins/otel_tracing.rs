@@ -71,6 +71,10 @@ impl Plugin for OtelTracing {
         OTEL_TRACING_PRIORITY
     }
 
+    fn modifies_request_headers(&self) -> bool {
+        true
+    }
+
     async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult {
         // Extract or generate trace context
         let traceparent = if let Some(existing) = ctx.headers.get("traceparent") {

@@ -44,6 +44,10 @@ impl Plugin for CorrelationId {
         CORRELATION_ID_PRIORITY
     }
 
+    fn modifies_request_headers(&self) -> bool {
+        true
+    }
+
     async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult {
         let request_id = if let Some(existing) = ctx.headers.get(&self.header_name) {
             existing.clone()
