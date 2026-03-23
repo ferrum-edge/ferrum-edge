@@ -159,7 +159,7 @@ fn test_grpc_error_response_deadline_exceeded() {
 #[test]
 fn test_grpc_error_response_unauthenticated() {
     let resp = grpc_proxy::build_grpc_error_response(
-        grpc_proxy::grpc_status::UNAUTHENTICATED,
+        16, // UNAUTHENTICATED
         "Missing token",
     );
     assert_eq!(resp.status(), 200);
@@ -169,7 +169,7 @@ fn test_grpc_error_response_unauthenticated() {
 #[test]
 fn test_grpc_error_response_resource_exhausted() {
     let resp = grpc_proxy::build_grpc_error_response(
-        grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
+        8, // RESOURCE_EXHAUSTED
         "Rate limited",
     );
     assert_eq!(resp.status(), 200);

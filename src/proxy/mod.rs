@@ -181,26 +181,63 @@ impl ProxyState {
     ///
     /// Falls back to a full rebuild only on the very first config load (when
     /// there is no previous config to diff against).
-    pub fn update_config(&self, new_config: GatewayConfig) {
+    /// Update the proxy configuration. Returns `true` if changes were applied.
+    pub fn update_config(&self, new_config: GatewayConfig) -> bool {
         use crate::config_delta::ConfigDelta;
 
         let old_config = self.config.load_full();
 
-        // If this is the initial load (empty config), do a full rebuild
-        if old_config.proxies.is_empty()
+        // If this is the initial load (old config empty, new config has data),
+        // do a full rebuild of all caches instead of computing a delta.
+        let old_is_empty = old_config.proxies.is_empty()
             && old_config.consumers.is_empty()
             && old_config.plugin_configs.is_empty()
-            && old_config.upstreams.is_empty()
-        {
+            && old_config.upstreams.is_empty();
+        let new_is_empty = new_config.proxies.is_empty()
+            && new_config.consumers.is_empty()
+            && new_config.plugin_configs.is_empty()
+            && new_config.upstreams.is_empty();
+
+        if old_is_empty && !new_is_empty {
             self.router_cache.rebuild(&new_config);
             self.plugin_cache.rebuild(&new_config);
             self.consumer_index.rebuild(&new_config.consumers);
             self.load_balancer_cache.rebuild(&new_config);
+
+            // DNS warmup for all hostnames in the new config
+            let mut hostnames: Vec<(String, Option<String>, Option<u64>)> = new_config
+                .proxies
+                .iter()
+                .map(|p| {
+                    (
+                        p.backend_host.clone(),
+                        p.dns_override.clone(),
+                        p.dns_cache_ttl_seconds,
+                    )
+                })
+                .collect();
+            for upstream in &new_config.upstreams {
+                for target in &upstream.targets {
+                    hostnames.push((target.host.clone(), None, None));
+                }
+            }
+            if !hostnames.is_empty() {
+                let dns = self.dns_cache.clone();
+                tokio::spawn(async move {
+                    dns.warmup(hostnames).await;
+                });
+            }
+
             self.config.store(Arc::new(new_config));
             info!(
                 "Proxy configuration loaded (full build: router + plugins + consumers + load balancers)"
             );
-            return;
+            return true;
+        }
+
+        // Both empty — nothing to do
+        if old_is_empty && new_is_empty {
+            return false;
         }
 
         let delta = ConfigDelta::compute(&old_config, &new_config);
@@ -209,7 +246,7 @@ impl ProxyState {
             debug!("Config poll: no changes detected, skipping update");
             // Still update loaded_at timestamp
             self.config.store(Arc::new(new_config));
-            return;
+            return false;
         }
 
         // --- RouterCache: rebuild route table, surgically invalidate path cache ---
@@ -251,6 +288,37 @@ impl ProxyState {
             self.circuit_breaker_cache.prune(&delta.removed_proxy_ids);
         }
 
+        // --- DNS warmup for new/modified hostnames ---
+        // Collect backend hostnames from added/modified proxies and upstreams
+        // so the DNS cache is warm before the first request hits them.
+        let mut new_hostnames: Vec<(String, Option<String>, Option<u64>)> = Vec::new();
+        for proxy in delta
+            .added_proxies
+            .iter()
+            .chain(delta.modified_proxies.iter())
+        {
+            new_hostnames.push((
+                proxy.backend_host.clone(),
+                proxy.dns_override.clone(),
+                proxy.dns_cache_ttl_seconds,
+            ));
+        }
+        for upstream in delta
+            .added_upstreams
+            .iter()
+            .chain(delta.modified_upstreams.iter())
+        {
+            for target in &upstream.targets {
+                new_hostnames.push((target.host.clone(), None, None));
+            }
+        }
+        if !new_hostnames.is_empty() {
+            let dns = self.dns_cache.clone();
+            tokio::spawn(async move {
+                dns.warmup(new_hostnames).await;
+            });
+        }
+
         // Swap the canonical config last (readers may still be using old caches
         // via ArcSwap snapshots until they finish their current request)
         self.config.store(Arc::new(new_config));
@@ -285,6 +353,7 @@ impl ProxyState {
             delta.modified_upstreams.len(),
             proxy_ids_to_rebuild.len(),
         );
+        true
     }
 
     pub fn current_config(&self) -> Arc<GatewayConfig> {

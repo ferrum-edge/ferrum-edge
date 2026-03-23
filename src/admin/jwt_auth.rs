@@ -32,7 +32,6 @@ pub struct AdminClaims {
 pub struct JwtConfig {
     pub secret: String,
     pub issuer: String,
-    #[allow(dead_code)]
     pub max_ttl_seconds: u64,
     pub algorithm: Algorithm,
 }
@@ -40,7 +39,7 @@ pub struct JwtConfig {
 impl Default for JwtConfig {
     fn default() -> Self {
         Self {
-            secret: "change-me-in-production".to_string(),
+            secret: String::new(),
             issuer: "ferrum-gateway".to_string(),
             max_ttl_seconds: 3600,
             algorithm: Algorithm::HS256,
@@ -85,7 +84,19 @@ impl JwtManager {
         validation.set_issuer(&[&self.config.issuer]);
 
         // Decode and validate
-        decode::<AdminClaims>(token, &key, &validation)
+        let token_data = decode::<AdminClaims>(token, &key, &validation)?;
+
+        // Enforce max TTL: reject tokens with excessive lifetimes
+        if self.config.max_ttl_seconds > 0 {
+            let ttl = token_data.claims.exp - token_data.claims.iat;
+            if ttl > self.config.max_ttl_seconds as i64 {
+                return Err(jsonwebtoken::errors::Error::from(
+                    jsonwebtoken::errors::ErrorKind::InvalidToken,
+                ));
+            }
+        }
+
+        Ok(token_data)
     }
 
     /// Extract token from Authorization header

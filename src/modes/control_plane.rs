@@ -40,10 +40,15 @@ pub async fn run(
     let config_arc = Arc::new(ArcSwap::new(Arc::new(config)));
     let db = Arc::new(db);
 
-    let grpc_secret = env_config.cp_grpc_jwt_secret.clone().unwrap_or_else(|| {
-        warn!("FERRUM_CP_GRPC_JWT_SECRET not set; gRPC authentication disabled");
-        String::new()
-    });
+    let grpc_secret = match env_config.cp_grpc_jwt_secret.clone() {
+        Some(secret) if !secret.is_empty() => secret,
+        _ => {
+            return Err(anyhow::anyhow!(
+                "FERRUM_CP_GRPC_JWT_SECRET must be set and non-empty in control plane mode. \
+                 Without it, any client can forge valid gRPC authentication tokens."
+            ));
+        }
+    };
 
     // Create gRPC server
     let (grpc_server, update_tx) = CpGrpcServer::new(config_arc.clone(), grpc_secret);

@@ -411,13 +411,13 @@ async fn test_database_mode_comprehensive() {
     println!("\n--- Test 7: Create Plugin Config ---");
     let plugin_config_data = json!({
         "id": "test-plugin-1",
-        "plugin_name": "rate-limiting",
+        "plugin_name": "rate_limiting",
         "scope": "proxy",
         "proxy_id": "test-proxy-1",
         "enabled": true,
         "config": {
-            "requests": 10,
-            "window": 60
+            "requests_per_minute": 100,
+            "limit_by": "ip"
         }
     });
 

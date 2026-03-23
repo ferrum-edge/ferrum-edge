@@ -688,6 +688,15 @@ async fn handle_create_consumer(
     if consumer.id.is_empty() {
         consumer.id = Uuid::new_v4().to_string();
     }
+
+    // Validate username is non-empty
+    if consumer.username.trim().is_empty() {
+        return Ok(json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"error": "Consumer username must not be empty"}),
+        ));
+    }
+
     consumer.created_at = Utc::now();
     consumer.updated_at = Utc::now();
 
@@ -1029,6 +1038,16 @@ async fn handle_create_plugin_config(
     if pc.id.is_empty() {
         pc.id = Uuid::new_v4().to_string();
     }
+
+    // Validate plugin name is a known plugin
+    let known_plugins = crate::plugins::available_plugins();
+    if !known_plugins.contains(&pc.plugin_name.as_str()) {
+        return Ok(json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"error": format!("Unknown plugin name '{}'. Available plugins: {:?}", pc.plugin_name, known_plugins)}),
+        ));
+    }
+
     pc.created_at = Utc::now();
     pc.updated_at = Utc::now();
 
