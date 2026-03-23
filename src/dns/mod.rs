@@ -503,10 +503,15 @@ impl DnsCache {
             .filter(|(host, _, _)| seen.insert(host.clone()))
             .collect();
 
+        if unique.is_empty() {
+            debug!("DNS warmup: no hostnames to resolve");
+            return;
+        }
+
         info!(
-            "DNS warmup: resolving {} unique hostnames ({} after dedup)",
-            seen.len(),
-            unique.len()
+            "DNS warmup: resolving {} unique hostnames ({} before dedup)",
+            unique.len(),
+            seen.len()
         );
         let mut handles = Vec::new();
 
