@@ -90,8 +90,18 @@ pub struct TransactionSummary {
     pub latency_total_ms: f64,
     pub latency_gateway_processing_ms: f64,
     pub latency_backend_ttfb_ms: f64,
+    /// For buffered responses: actual total backend time (body fully received).
+    /// For streaming responses: -1.0 (body still transferring at log time;
+    /// use `latency_backend_ttfb_ms` for alerting).
     pub latency_backend_total_ms: f64,
     pub request_user_agent: Option<String>,
+    /// True when the response body was streamed (not buffered).
+    /// When true, `latency_backend_total_ms` is -1.0 (unknown at log time).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub response_streamed: bool,
+    /// True when the client disconnected before receiving the full response.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub client_disconnected: bool,
     pub metadata: HashMap<String, String>,
 }
 

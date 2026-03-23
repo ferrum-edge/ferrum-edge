@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashMap;
-use tracing::debug;
+use tracing::warn;
 
 use super::{Plugin, PluginResult, RequestContext};
 
@@ -79,7 +79,7 @@ impl Plugin for AccessControl {
             .iter()
             .any(|blocked_ip| ip_matches(client_ip, blocked_ip))
         {
-            debug!("access_control: IP '{}' is blocked", client_ip);
+            warn!(client_ip = %client_ip, plugin = "access_control", reason = "ip_blocked", "IP address blocked by access control");
             return PluginResult::Reject {
                 status_code: 403,
                 body: r#"{"error":"IP address is blocked"}"#.into(),
@@ -94,7 +94,7 @@ impl Plugin for AccessControl {
                 .iter()
                 .any(|allowed_ip| ip_matches(client_ip, allowed_ip))
         {
-            debug!("access_control: IP '{}' not in allowed list", client_ip);
+            warn!(client_ip = %client_ip, plugin = "access_control", reason = "ip_not_allowed", "IP address not in allow list");
             return PluginResult::Reject {
                 status_code: 403,
                 body: r#"{"error":"IP address not allowed"}"#.into(),
@@ -105,7 +105,7 @@ impl Plugin for AccessControl {
         let consumer = match &ctx.identified_consumer {
             Some(c) => c,
             None => {
-                debug!("access_control: no consumer identified, rejecting");
+                warn!(client_ip = %ctx.client_ip, plugin = "access_control", reason = "no_consumer", "No consumer identified for access control");
                 return PluginResult::Reject {
                     status_code: 401,
                     body: r#"{"error":"No consumer identified"}"#.into(),
@@ -118,7 +118,7 @@ impl Plugin for AccessControl {
 
         // Check disallowed first
         if self.disallowed_consumers.contains(username) {
-            debug!("access_control: consumer '{}' is disallowed", username);
+            warn!(consumer = %username, client_ip = %ctx.client_ip, plugin = "access_control", reason = "consumer_disallowed", "Consumer rejected by access control");
             return PluginResult::Reject {
                 status_code: 403,
                 body: r#"{"error":"Consumer is not allowed"}"#.into(),
@@ -128,10 +128,7 @@ impl Plugin for AccessControl {
 
         // If allowed list is configured, consumer must be in it
         if !self.allowed_consumers.is_empty() && !self.allowed_consumers.contains(username) {
-            debug!(
-                "access_control: consumer '{}' not in allowed list",
-                username
-            );
+            warn!(consumer = %username, client_ip = %ctx.client_ip, plugin = "access_control", reason = "consumer_not_allowed", "Consumer not in allow list");
             return PluginResult::Reject {
                 status_code: 403,
                 body: r#"{"error":"Consumer is not allowed"}"#.into(),

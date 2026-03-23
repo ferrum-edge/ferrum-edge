@@ -43,7 +43,7 @@ src/
 │   └── types.rs           # Core data structures (Proxy, Consumer, Plugin)
 ├── proxy/                 # Proxy request handling
 │   ├── mod.rs             # ProxyState and main proxy logic
-│   ├── body.rs            # ProxyBody sum type (Full/Stream) for response streaming
+│   ├── body.rs            # ProxyBody sum type (Full/Tracked) for response streaming
 │   ├── client_ip.rs       # Trusted proxy / X-Forwarded-For client IP resolution
 │   ├── handler.rs         # HTTP request/response processing
 │   └── grpc_proxy.rs      # gRPC reverse proxy with HTTP/2 and trailer support

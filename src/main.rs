@@ -34,7 +34,7 @@ async fn main() {
     }
 
     // Initialize tracing/logging
-    let log_level = std::env::var("FERRUM_LOG_LEVEL").unwrap_or_else(|_| "info".into());
+    let log_level = std::env::var("FERRUM_LOG_LEVEL").unwrap_or_else(|_| "error".into());
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&log_level)),

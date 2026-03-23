@@ -48,7 +48,7 @@ COPY --from=builder --chown=ferrum:ferrum /build/target/release/ferrum-gateway /
 
 # Set environment variables
 ENV FERRUM_MODE=database \
-    FERRUM_LOG_LEVEL=info \
+    FERRUM_LOG_LEVEL=error \
     FERRUM_PROXY_HTTP_PORT=8000 \
     FERRUM_PROXY_HTTPS_PORT=8443 \
     FERRUM_ADMIN_HTTP_PORT=9000 \

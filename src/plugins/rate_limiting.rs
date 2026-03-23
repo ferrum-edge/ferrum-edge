@@ -4,7 +4,7 @@ use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tracing::debug;
+use tracing::warn;
 
 use super::{Plugin, PluginResult, RequestContext};
 
@@ -147,7 +147,7 @@ impl RateLimiting {
 
         for window in entry.value_mut().iter_mut() {
             if !window.check_and_increment() {
-                debug!("rate_limiting: limit exceeded for key '{}'", key);
+                warn!(rate_limit_key = %key, plugin = "rate_limiting", "Rate limit exceeded");
                 return PluginResult::Reject {
                     status_code: 429,
                     body: r#"{"error":"Rate limit exceeded"}"#.into(),

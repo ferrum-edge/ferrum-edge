@@ -153,7 +153,7 @@ See [docs/size_limits.md](size_limits.md) for the full size limit enforcement ar
 
 ### HTTP/1.1 and HTTP/2
 
-Both protocols support streaming. The gateway uses `ProxyBody::Stream` which wraps the backend response's byte stream.
+Both protocols support streaming. The gateway uses `ProxyBody::Tracked` which wraps the backend response's byte stream with lightweight completion tracking via `StreamingMetrics`.
 
 ### HTTP/3 (QUIC)
 
@@ -173,18 +173,18 @@ The streaming architecture is built on the `ProxyBody` enum in `src/proxy/body.r
 
 ```rust
 pub enum ProxyBody {
-    Full(Full<Bytes>),          // Buffered: complete body in memory
-    Stream(Pin<Box<dyn Body>>), // Streaming: chunks forwarded as they arrive
+    Full(Full<Bytes>),     // Buffered: complete body in memory
+    Tracked(TrackedBody),  // Streaming: chunks forwarded with completion tracking
 }
 ```
 
-`ProxyBody` implements `http_body::Body`, so it is transparent to hyper's response machinery. The `Full` variant is zero-cost (no allocation beyond the data). The `Stream` variant allocates one `Box` to erase the concrete stream type.
+`ProxyBody` implements `http_body::Body`, so it is transparent to hyper's response machinery. The `Full` variant is zero-cost (no allocation beyond the data). The `Tracked` variant wraps a streaming body with a shared `Arc<StreamingMetrics>` that records the last-frame timestamp via a single atomic store per frame — enabling accurate backend total latency measurement without closures or string cloning on the hot path.
 
 Helper constructors:
 - `ProxyBody::full(data)` — Create a buffered body from bytes
 - `ProxyBody::from_string(s)` — Create a buffered body from a string
 - `ProxyBody::empty()` — Create an empty body
-- `ProxyBody::streaming(response)` — Create a streaming body from a `reqwest::Response`
+- `ProxyBody::streaming_tracked(response, baseline)` — Create a streaming body with completion tracking, returning `(ProxyBody, Arc<StreamingMetrics>)`
 
 ## When to Use Buffer Mode
 

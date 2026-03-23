@@ -508,6 +508,8 @@ async fn handle_h3_request(
         latency_backend_ttfb_ms: backend_ttfb_ms,
         latency_backend_total_ms: backend_total_ms,
         request_user_agent: ctx.headers.get("user-agent").cloned(),
+        response_streamed: false,
+        client_disconnected: false,
         metadata: ctx.metadata.clone(),
     };
 

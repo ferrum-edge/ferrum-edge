@@ -309,7 +309,7 @@ See [CI/CD Documentation](docs/ci_cd.md) for complete pipeline overview, secrets
 | Variable | Required | Default | Description |
 |---|---|---|---|
 | `FERRUM_MODE` | **Yes** | — | Operating mode: `database`, `file`, `cp`, `dp` |
-| `FERRUM_LOG_LEVEL` | No | `info` | Log verbosity: `error`, `warn`, `info`, `debug`, `trace` |
+| `FERRUM_LOG_LEVEL` | No | `error` | Log verbosity: `error`, `warn`, `info`, `debug`, `trace` |
 | `FERRUM_PROXY_HTTP_PORT` | No | `8000` | HTTP proxy listener port |
 | `FERRUM_PROXY_HTTPS_PORT` | No | `8443` | HTTPS proxy listener port |
 | `FERRUM_PROXY_TLS_CERT_PATH` | If HTTPS | — | Path to proxy TLS certificate |

@@ -93,7 +93,7 @@ All operational parameters MUST be configurable via environment variables.
 
 *   **Mode & Core:**
     *   `FERRUM_MODE`: (`database`, `file`, `cp`, `dp`) - **Required**.
-    *   `FERRUM_LOG_LEVEL`: (`error`, `warn`, `info`, `debug`, `trace`) - Default: `info`.
+    *   `FERRUM_LOG_LEVEL`: (`error`, `warn`, `info`, `debug`, `trace`) - Default: `error`.
 *   **Network Ports & TLS:**
     *   `FERRUM_PROXY_HTTP_PORT`, `FERRUM_PROXY_HTTPS_PORT`, `FERRUM_PROXY_TLS_CERT_PATH`, `FERRUM_PROXY_TLS_KEY_PATH`
     *   `FERRUM_ADMIN_HTTP_PORT`, `FERRUM_ADMIN_HTTPS_PORT`, `FERRUM_ADMIN_TLS_CERT_PATH`, `FERRUM_ADMIN_TLS_KEY_PATH`
@@ -259,7 +259,7 @@ Define Rust structs (using `serde` for serialization/deserialization) for the co
 *   **Required Plugin Implementations:**
     *   **`stdout_logging`:** Logs a summary of each transaction to standard output (JSON format preferred).
     *   **`http_logging`:** Buffers transaction summaries and sends them as a JSON array via HTTP POST to a configured URL using a background task. Config: `endpoint_url` (String), `authorization_header` (Optional String), `batch_size` (Integer, default 50), `flush_interval_ms` (Integer, default 1000), `max_retries` (Integer, default 3), `retry_delay_ms` (Integer, default 1000), `buffer_capacity` (Integer, default 10000). Batches are discarded after retries are exhausted to bound memory usage.
-        *   **Transaction Summary Fields (for both logging plugins):** Timestamp Received, Client IP Address, Identified Consumer Username/ID (or null), HTTP Method, Request Path, Matched Proxy ID/Name, Backend Target URL (protocol://host:port/path - *excluding query parameters*), Final HTTP Response Status Code, Latency-Total (ms), Latency-GatewayProcessing (ms), Latency-BackendTTFB (ms), Latency-BackendTotal (ms), Request User-Agent Header.
+        *   **Transaction Summary Fields (for both logging plugins):** Timestamp Received, Client IP Address, Identified Consumer Username/ID (or null), HTTP Method, Request Path, Matched Proxy ID/Name, Backend Target URL (protocol://host:port/path - *excluding query parameters*), Final HTTP Response Status Code, Latency-Total (ms), Latency-GatewayProcessing (ms), Latency-BackendTTFB (ms), Latency-BackendTotal (ms, -1.0 for streaming responses where total is unknown at log time), Request User-Agent Header, Response Streamed (bool), Client Disconnected (bool).
     *   **`transaction_debugger`:** Logs verbose request/response details (headers, optional bodies) to standard output for debugging specific Proxies. Config: `log_request_body` (bool), `log_response_body` (bool). Enable per-proxy only.
     *   **`oauth2_auth`:** Performs OAuth2 authentication using Bearer tokens. Config: `validation_mode` (`introspection` or `jwks`), plus necessary parameters for each mode (e.g., `introspection_url`, `jwks_uri`, expected issuer/audience). Identifies `Consumer`. Integrates with `multi` auth mode.
     *   **`jwt_auth`:** Performs JWT Bearer token authentication (HS256 initially) based on `Consumer` credentials. Config: `token_lookup` (how to find token), `consumer_claim_field` (claim identifying consumer). Identifies `Consumer`. Integrates with `multi` auth mode.

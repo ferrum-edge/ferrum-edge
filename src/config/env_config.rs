@@ -173,7 +173,7 @@ impl Default for EnvConfig {
     fn default() -> Self {
         Self {
             mode: OperatingMode::File,
-            log_level: "info".into(),
+            log_level: "error".into(),
             proxy_http_port: 8000,
             proxy_https_port: 8443,
             proxy_tls_cert_path: None,
@@ -248,7 +248,7 @@ impl EnvConfig {
 
         let config = Self {
             mode: mode.clone(),
-            log_level: env::var("FERRUM_LOG_LEVEL").unwrap_or_else(|_| "info".into()),
+            log_level: env::var("FERRUM_LOG_LEVEL").unwrap_or_else(|_| "error".into()),
 
             proxy_http_port: parse_env_u16("FERRUM_PROXY_HTTP_PORT", 8000),
             proxy_https_port: parse_env_u16("FERRUM_PROXY_HTTPS_PORT", 8443),
