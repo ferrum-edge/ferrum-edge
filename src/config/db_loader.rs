@@ -91,9 +91,11 @@ impl DatabaseStore {
         match db_type {
             "postgres" => {
                 if insecure {
+                    // sslmode=require: encrypts but does NOT verify the server certificate
                     url.push_str(&format!("{}sslmode=require", separator));
                 } else {
-                    url.push_str(&format!("{}sslmode=require", separator));
+                    // sslmode=verify-full: encrypts AND verifies the server certificate
+                    url.push_str(&format!("{}sslmode=verify-full", separator));
                     if let Some(ca_path) = ca_cert_path {
                         url.push_str(&format!("&sslrootcert={}", ca_path));
                     }
@@ -107,17 +109,19 @@ impl DatabaseStore {
             }
             "mysql" => {
                 if insecure {
+                    // REQUIRED: encrypts but does NOT verify the server certificate
                     url.push_str(&format!("{}ssl-mode=REQUIRED", separator));
                 } else {
-                    url.push_str(&format!("{}ssl-mode=REQUIRED", separator));
+                    // VERIFY_IDENTITY: encrypts AND verifies the server certificate
+                    url.push_str(&format!("{}ssl-mode=VERIFY_IDENTITY", separator));
                     if let Some(ca_path) = ca_cert_path {
                         url.push_str(&format!("&ssl-ca={}", ca_path));
                     }
                     if let Some(cert_path) = client_cert_path {
-                        url.push_str(&format!("&ssl-client-cert={}", cert_path));
+                        url.push_str(&format!("&ssl-cert={}", cert_path));
                     }
                     if let Some(key_path) = client_key_path {
-                        url.push_str(&format!("&ssl-client-key={}", key_path));
+                        url.push_str(&format!("&ssl-key={}", key_path));
                     }
                 }
             }
@@ -307,6 +311,20 @@ impl DatabaseStore {
         .bind(&proxy.id)
         .execute(&self.pool)
         .await?;
+
+        // Update plugin associations: remove old, insert new
+        sqlx::query("DELETE FROM proxy_plugins WHERE proxy_id = ?")
+            .bind(&proxy.id)
+            .execute(&self.pool)
+            .await?;
+
+        for assoc in &proxy.plugins {
+            sqlx::query("INSERT INTO proxy_plugins (proxy_id, plugin_config_id) VALUES (?, ?)")
+                .bind(&proxy.id)
+                .bind(&assoc.plugin_config_id)
+                .execute(&self.pool)
+                .await?;
+        }
 
         Ok(())
     }

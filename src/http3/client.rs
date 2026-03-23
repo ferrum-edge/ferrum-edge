@@ -83,7 +83,9 @@ impl Http3Client {
         });
 
         // Build the request with the correct URI (path only, not full URL)
-        let req_method: http::Method = method.parse().unwrap_or(http::Method::GET);
+        let req_method: http::Method = method
+            .parse()
+            .map_err(|_| anyhow::anyhow!("Invalid HTTP method: {}", method))?;
 
         let mut req_builder = Request::builder().method(req_method).uri(path_and_query);
 

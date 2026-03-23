@@ -1,5 +1,4 @@
 use rustls::ServerConfig;
-use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::CryptoProvider;
 use rustls_pemfile::{certs, private_key};
 use std::fs::File;
@@ -8,57 +7,6 @@ use std::sync::Arc;
 use tracing::{info, warn};
 
 use crate::config::EnvConfig;
-
-/// A TLS certificate verifier that accepts all certificates.
-/// Used only when `FERRUM_BACKEND_TLS_NO_VERIFY=true` (testing mode).
-#[derive(Debug)]
-struct NoVerifier;
-
-impl ServerCertVerifier for NoVerifier {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &rustls::pki_types::CertificateDer<'_>,
-        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
-        _server_name: &rustls::pki_types::ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: rustls::pki_types::UnixTime,
-    ) -> Result<ServerCertVerified, rustls::Error> {
-        Ok(ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        Ok(HandshakeSignatureValid::assertion())
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        Ok(HandshakeSignatureValid::assertion())
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        vec![
-            rustls::SignatureScheme::RSA_PKCS1_SHA256,
-            rustls::SignatureScheme::RSA_PKCS1_SHA384,
-            rustls::SignatureScheme::RSA_PKCS1_SHA512,
-            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
-            rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
-            rustls::SignatureScheme::ECDSA_NISTP521_SHA512,
-            rustls::SignatureScheme::RSA_PSS_SHA256,
-            rustls::SignatureScheme::RSA_PSS_SHA384,
-            rustls::SignatureScheme::RSA_PSS_SHA512,
-            rustls::SignatureScheme::ED25519,
-        ]
-    }
-}
 
 /// TLS hardening policy parsed from environment variables.
 #[derive(Debug, Clone)]
@@ -368,59 +316,6 @@ pub fn load_tls_config_with_client_auth(
 
     // Advertise HTTP/2 and HTTP/1.1 via ALPN so clients can negotiate HTTP/2 over TLS
     config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-
-    Ok(Arc::new(config))
-}
-
-/// Build a rustls ClientConfig suitable for HTTP/3 backend connections,
-/// with TLS hardening policy applied.
-#[allow(dead_code)]
-pub fn build_h3_client_tls_config(
-    no_verify: bool,
-    ca_bundle_path: Option<&str>,
-    tls_policy: &TlsPolicy,
-) -> Result<Arc<rustls::ClientConfig>, anyhow::Error> {
-    let mut root_store = rustls::RootCertStore::empty();
-
-    if let Some(ca_path) = ca_bundle_path {
-        let ca_file = File::open(ca_path)?;
-        let ca_certs: Vec<_> = certs(&mut BufReader::new(ca_file))
-            .filter_map(|r| r.ok())
-            .collect();
-        let (added, _) = root_store.add_parsable_certificates(ca_certs);
-        if added == 0 {
-            return Err(anyhow::anyhow!(
-                "No valid CA certificates found in {}",
-                ca_path
-            ));
-        }
-    } else {
-        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    }
-
-    let mut config = if no_verify {
-        warn!("HTTP/3 client TLS verification DISABLED (testing mode)");
-
-        // Build config that skips server certificate verification
-        rustls::ClientConfig::builder_with_provider(tls_policy.crypto_provider.clone())
-            .with_protocol_versions(&tls_policy.protocol_versions)
-            .map_err(|e| {
-                anyhow::anyhow!("Failed to set TLS protocol versions for H3 client: {}", e)
-            })?
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(NoVerifier))
-            .with_no_client_auth()
-    } else {
-        rustls::ClientConfig::builder_with_provider(tls_policy.crypto_provider.clone())
-            .with_protocol_versions(&tls_policy.protocol_versions)
-            .map_err(|e| {
-                anyhow::anyhow!("Failed to set TLS protocol versions for H3 client: {}", e)
-            })?
-            .with_root_certificates(root_store)
-            .with_no_client_auth()
-    };
-
-    config.alpn_protocols = vec![b"h3".to_vec()];
 
     Ok(Arc::new(config))
 }

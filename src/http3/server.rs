@@ -340,7 +340,13 @@ async fn handle_h3_request(
                 let status = StatusCode::UNAUTHORIZED;
                 let mut resp_builder = Response::builder().status(status);
                 resp_builder = resp_builder.header("content-type", "application/json");
-                let resp = resp_builder.body(()).unwrap();
+                let resp = match resp_builder.body(()) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        error!("Failed to build HTTP/3 response: {}", e);
+                        return Ok(());
+                    }
+                };
                 stream.send_response(resp).await?;
                 stream
                     .send_data(Bytes::from(r#"{"error":"Unauthorized"}"#.as_bytes()))
@@ -525,7 +531,9 @@ async fn handle_h3_request(
         resp_builder = resp_builder.header("content-type", "application/json");
     }
 
-    let resp = resp_builder.body(()).unwrap();
+    let resp = resp_builder
+        .body(())
+        .map_err(|e| anyhow::anyhow!("Failed to build HTTP/3 proxy response: {}", e))?;
     stream.send_response(resp).await?;
     stream.send_data(Bytes::from(response_body)).await?;
     stream.finish().await?;
@@ -664,8 +672,11 @@ async fn proxy_to_backend_h3(
             }
         }
         Err(e) => {
-            error!("Backend request failed (HTTP/3 frontend): {}", e);
-            let error_msg = serde_json::json!({"error": format!("Backend unavailable: {}", e)});
+            error!(
+                "Backend request failed (HTTP/3 frontend): connection error details: {}",
+                e
+            );
+            let error_msg = serde_json::json!({"error": "Backend unavailable"});
             (
                 502,
                 error_msg.to_string().into_bytes(),
@@ -685,7 +696,7 @@ async fn send_h3_response(
         .status(status)
         .header("content-type", "application/json")
         .body(())
-        .unwrap();
+        .map_err(|e| anyhow::anyhow!("Failed to build HTTP/3 response: {}", e))?;
     stream.send_response(resp).await?;
     stream.send_data(Bytes::from(body.to_string())).await?;
     stream.finish().await?;
@@ -705,7 +716,9 @@ async fn send_h3_reject_response(
     for (k, v) in headers {
         builder = builder.header(k.as_str(), v.as_str());
     }
-    let resp = builder.body(()).unwrap();
+    let resp = builder
+        .body(())
+        .map_err(|e| anyhow::anyhow!("Failed to build HTTP/3 reject response: {}", e))?;
     stream.send_response(resp).await?;
     stream.send_data(Bytes::from(body.to_string())).await?;
     stream.finish().await?;

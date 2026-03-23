@@ -382,7 +382,10 @@ impl GrpcConnectionPool {
     /// Start background cleanup task that evicts idle connections.
     fn start_cleanup_task(&self) {
         let entries = self.entries.clone();
-        let idle_timeout_ms = self.global_pool_config.idle_timeout_seconds * 1000;
+        let idle_timeout_ms = self
+            .global_pool_config
+            .idle_timeout_seconds
+            .saturating_mul(1000);
 
         tokio::spawn(async move {
             let mut cleanup_timer = tokio::time::interval(Duration::from_secs(30));
@@ -467,14 +470,9 @@ pub enum GrpcProxyError {
 }
 
 /// gRPC status codes for gateway-generated errors.
-#[allow(dead_code)]
 pub mod grpc_status {
-    pub const OK: u32 = 0;
     pub const DEADLINE_EXCEEDED: u32 = 4;
-    pub const RESOURCE_EXHAUSTED: u32 = 8;
-    pub const UNIMPLEMENTED: u32 = 12;
     pub const UNAVAILABLE: u32 = 14;
-    pub const UNAUTHENTICATED: u32 = 16;
 }
 
 /// Build a gRPC error response with proper Trailers-Only encoding.
