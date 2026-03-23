@@ -44,6 +44,9 @@ pub struct ActiveHealthCheck {
     pub unhealthy_threshold: u32,
     #[serde(default = "default_healthy_status_codes")]
     pub healthy_status_codes: Vec<u16>,
+    /// Use HTTPS for health check probes instead of HTTP.
+    #[serde(default)]
+    pub use_tls: bool,
 }
 
 impl Default for ActiveHealthCheck {
@@ -55,6 +58,7 @@ impl Default for ActiveHealthCheck {
             healthy_threshold: default_healthy_threshold(),
             unhealthy_threshold: default_unhealthy_threshold(),
             healthy_status_codes: default_healthy_status_codes(),
+            use_tls: false,
         }
     }
 }

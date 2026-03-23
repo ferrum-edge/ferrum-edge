@@ -488,7 +488,7 @@ pub fn build_grpc_error_response(status: u32, message: &str) -> hyper::Response<
         .header("grpc-status", status.to_string())
         .header("grpc-message", message)
         .body(super::ProxyBody::empty())
-        .unwrap()
+        .unwrap_or_else(|_| hyper::Response::new(super::ProxyBody::empty()))
 }
 
 /// Collected gRPC response with body and trailers.

@@ -8,6 +8,7 @@
 use crate::config::types::{BackoffStrategy, RetryConfig};
 use std::collections::HashMap;
 use std::time::Duration;
+use tracing::warn;
 
 /// The response body, either fully buffered or still streaming from the backend.
 pub enum ResponseBody {
@@ -41,13 +42,14 @@ impl BackendResponse {
     }
 
     /// Consume the response and return the buffered body bytes.
-    /// Panics if the body is streaming (caller must check first).
+    /// Returns an empty Vec if the body is streaming.
     #[allow(dead_code)]
     pub fn into_buffered_body(self) -> Vec<u8> {
         match self.body {
             ResponseBody::Buffered(b) => b,
             ResponseBody::Streaming(_) => {
-                panic!("attempted to extract buffered body from a streaming response")
+                warn!("attempted to extract buffered body from a streaming response");
+                Vec::new()
             }
         }
     }

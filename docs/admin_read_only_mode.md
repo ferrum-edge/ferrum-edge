@@ -122,6 +122,20 @@ FERRUM_ADMIN_JWT_SECRET="admin-secret" \
 cargo run --release
 ```
 
+## Input Validation
+
+The Admin API validates proxy configurations on create (`POST /proxies`) and update (`PUT /proxies/{id}`) requests. Invalid input returns `400 Bad Request` with a descriptive error message.
+
+**Validation rules:**
+
+| Field | Rule | Example Error |
+|-------|------|---------------|
+| `listen_path` | Must be non-empty and start with `/` | `"listen_path must start with '/'"` |
+| `backend_host` | Must be non-empty | `"backend_host must not be empty"` |
+| `backend_port` | Must be greater than 0 | `"backend_port must be greater than 0"` |
+
+These validations apply in all operating modes (database, file, CP) and are enforced regardless of read-only mode.
+
 ## Implementation Details
 
 ### Code Changes

@@ -82,7 +82,9 @@ pub async fn start_http3_listener(
         .with_cert_resolver(tls_config.cert_resolver.clone());
 
     server_tls_config.alpn_protocols = vec![b"h3".to_vec()];
-    server_tls_config.max_early_data_size = u32::MAX; // Enable 0-RTT
+    // 0-RTT is disabled for security: early data is replayable, which is dangerous
+    // for non-idempotent operations proxied through an API gateway.
+    server_tls_config.max_early_data_size = 0;
 
     let quic_server_config = QuicServerConfig::try_from(server_tls_config)
         .map_err(|e| anyhow::anyhow!("Failed to create QUIC server config: {}", e))?;
@@ -313,15 +315,8 @@ async fn handle_h3_request(
     }
 
     // Authentication phase
-    let auth_plugins: Vec<&Arc<dyn Plugin>> = plugins
-        .iter()
-        .filter(|p| {
-            matches!(
-                p.name(),
-                "jwt_auth" | "key_auth" | "basic_auth" | "oauth2_auth"
-            )
-        })
-        .collect();
+    let auth_plugins: Vec<&Arc<dyn Plugin>> =
+        plugins.iter().filter(|p| p.is_auth_plugin()).collect();
 
     match proxy.auth_mode {
         AuthMode::Multi => {
@@ -574,7 +569,17 @@ async fn proxy_to_backend_h3(
         "PATCH" => reqwest::Method::PATCH,
         "HEAD" => reqwest::Method::HEAD,
         "OPTIONS" => reqwest::Method::OPTIONS,
-        _ => reqwest::Method::GET,
+        other => match reqwest::Method::from_bytes(other.as_bytes()) {
+            Ok(m) => m,
+            Err(_) => {
+                warn!("HTTP/3: Unsupported HTTP method: {}", other);
+                return (
+                    405,
+                    r#"{"error":"Method not allowed"}"#.as_bytes().to_vec(),
+                    HashMap::new(),
+                );
+            }
+        },
     };
 
     let mut req_builder = client.request(req_method, backend_url);

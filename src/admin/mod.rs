@@ -7,7 +7,7 @@ pub mod jwt_auth;
 
 use bytes::Bytes;
 use chrono::Utc;
-use http_body_util::{BodyExt, Full};
+use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -261,10 +261,20 @@ pub async fn handle_admin_request(
         }
     }
 
-    // Read body
-    let body_bytes = match req.into_body().collect().await {
+    // Read body with 1 MiB size limit
+    const MAX_BODY_SIZE: usize = 1024 * 1024; // 1 MiB
+    let body_bytes = match Limited::new(req.into_body(), MAX_BODY_SIZE).collect().await {
         Ok(collected) => collected.to_bytes().to_vec(),
-        Err(_) => Vec::new(),
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("length limit exceeded") {
+                return Ok(json_response(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    &json!({"error": "Request body too large (max 1 MiB)"}),
+                ));
+            }
+            Vec::new()
+        }
     };
 
     // Route
@@ -386,6 +396,26 @@ async fn handle_create_proxy(
         }
     };
 
+    // Validate proxy fields
+    if proxy.listen_path.is_empty() || !proxy.listen_path.starts_with('/') {
+        return Ok(json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"error": "listen_path must be non-empty and start with '/'"}),
+        ));
+    }
+    if proxy.backend_host.is_empty() {
+        return Ok(json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"error": "backend_host must be non-empty"}),
+        ));
+    }
+    if proxy.backend_port == 0 {
+        return Ok(json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"error": "backend_port must be greater than 0"}),
+        ));
+    }
+
     if proxy.id.is_empty() {
         proxy.id = Uuid::new_v4().to_string();
     }
@@ -490,6 +520,26 @@ async fn handle_update_proxy(
             ));
         }
     };
+
+    // Validate proxy fields
+    if proxy.listen_path.is_empty() || !proxy.listen_path.starts_with('/') {
+        return Ok(json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"error": "listen_path must be non-empty and start with '/'"}),
+        ));
+    }
+    if proxy.backend_host.is_empty() {
+        return Ok(json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"error": "backend_host must be non-empty"}),
+        ));
+    }
+    if proxy.backend_port == 0 {
+        return Ok(json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"error": "backend_port must be greater than 0"}),
+        ));
+    }
 
     proxy.id = id.to_string();
     proxy.updated_at = Utc::now();
@@ -642,7 +692,12 @@ async fn handle_create_consumer(
     consumer.updated_at = Utc::now();
 
     // Hash any secrets in credentials
-    hash_consumer_secrets(&mut consumer);
+    if let Err(e) = hash_consumer_secrets(&mut consumer) {
+        return Ok(json_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &json!({"error": e}),
+        ));
+    }
 
     match db.create_consumer(&consumer).await {
         Ok(_) => Ok(json_response(StatusCode::CREATED, &json!(consumer))),
@@ -728,7 +783,12 @@ async fn handle_update_consumer(
 
     consumer.id = id.to_string();
     consumer.updated_at = Utc::now();
-    hash_consumer_secrets(&mut consumer);
+    if let Err(e) = hash_consumer_secrets(&mut consumer) {
+        return Ok(json_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &json!({"error": e}),
+        ));
+    }
 
     match db.update_consumer(&consumer).await {
         Ok(_) => Ok(json_response(StatusCode::OK, &json!(consumer))),
@@ -1368,7 +1428,11 @@ fn json_response(status: StatusCode, body: &Value) -> Response<Full<Bytes>> {
         .status(status)
         .header("Content-Type", "application/json")
         .body(Full::new(Bytes::from(body_str)))
-        .unwrap()
+        .unwrap_or_else(|_| {
+            Response::new(Full::new(Bytes::from(
+                "{\"error\":\"Internal Server Error\"}",
+            )))
+        })
 }
 
 /// JSON response with X-Data-Source: cached header to indicate stale/cached data.
@@ -1379,28 +1443,28 @@ fn json_response_with_stale(status: StatusCode, body: &Value) -> Response<Full<B
         .header("Content-Type", "application/json")
         .header("X-Data-Source", "cached")
         .body(Full::new(Bytes::from(body_str)))
-        .unwrap()
+        .unwrap_or_else(|_| {
+            Response::new(Full::new(Bytes::from(
+                "{\"error\":\"Internal Server Error\"}",
+            )))
+        })
 }
 
-fn hash_consumer_secrets(consumer: &mut Consumer) {
+fn hash_consumer_secrets(consumer: &mut Consumer) -> Result<(), String> {
     // Hash basicauth passwords
     if let Some(basic) = consumer.credentials.get_mut("basicauth")
         && let Some(pass) = basic.get("password").and_then(|p| p.as_str())
     {
-        let hash = match bcrypt::hash(pass, bcrypt::DEFAULT_COST) {
-            Ok(h) => h,
-            Err(e) => {
-                tracing::error!(
-                    "Failed to hash password for consumer {}: {}",
-                    consumer.id,
-                    e
-                );
-                return;
-            }
-        };
+        let hash = bcrypt::hash(pass, bcrypt::DEFAULT_COST).map_err(|e| {
+            format!(
+                "Failed to hash password for consumer {}: {}",
+                consumer.id, e
+            )
+        })?;
         basic["password_hash"] = json!(hash);
         if let Some(obj) = basic.as_object_mut() {
             obj.remove("password");
         }
     }
+    Ok(())
 }

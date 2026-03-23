@@ -1,6 +1,7 @@
 use arc_swap::ArcSwap;
 use std::collections::HashMap;
 use std::sync::Arc;
+use tracing::warn;
 
 use crate::config::types::Consumer;
 
@@ -166,19 +167,43 @@ impl ConsumerIndex {
             if let Some(key_creds) = consumer.credentials.get("keyauth")
                 && let Some(key) = key_creds.get("key").and_then(|s| s.as_str())
             {
-                keyauth.insert(key.to_string(), Arc::clone(&arc_consumer));
+                let prev = keyauth.insert(key.to_string(), Arc::clone(&arc_consumer));
+                if let Some(existing) = prev {
+                    warn!(
+                        "Credential collision: keyauth key '{}' for consumer '{}' overwrites consumer '{}'",
+                        key, consumer.id, existing.id
+                    );
+                }
             }
 
             // Index by username only if consumer has basic_auth credentials
             if consumer.credentials.contains_key("basicauth") {
-                basic.insert(consumer.username.clone(), Arc::clone(&arc_consumer));
+                let prev = basic.insert(consumer.username.clone(), Arc::clone(&arc_consumer));
+                if let Some(existing) = prev {
+                    warn!(
+                        "Credential collision: basicauth username '{}' for consumer '{}' overwrites consumer '{}'",
+                        consumer.username, consumer.id, existing.id
+                    );
+                }
             }
 
             // Index by username and id (for jwt/oauth2 claim matching)
-            identity.insert(consumer.username.clone(), Arc::clone(&arc_consumer));
+            let prev = identity.insert(consumer.username.clone(), Arc::clone(&arc_consumer));
+            if let Some(existing) = prev {
+                warn!(
+                    "Credential collision: identity '{}' for consumer '{}' overwrites consumer '{}'",
+                    consumer.username, consumer.id, existing.id
+                );
+            }
             identity.insert(consumer.id.clone(), Arc::clone(&arc_consumer));
             if let Some(ref custom_id) = consumer.custom_id {
-                identity.insert(custom_id.clone(), Arc::clone(&arc_consumer));
+                let prev = identity.insert(custom_id.clone(), Arc::clone(&arc_consumer));
+                if let Some(existing) = prev {
+                    warn!(
+                        "Credential collision: identity (custom_id) '{}' for consumer '{}' overwrites consumer '{}'",
+                        custom_id, consumer.id, existing.id
+                    );
+                }
             }
         }
 

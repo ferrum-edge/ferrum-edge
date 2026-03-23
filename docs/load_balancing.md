@@ -251,6 +251,7 @@ upstreams:
         healthy_threshold: 3
         unhealthy_threshold: 3
         healthy_status_codes: [200, 302]
+        use_tls: false
 ```
 
 | Field | Type | Default | Description |
@@ -261,11 +262,12 @@ upstreams:
 | `healthy_threshold` | integer | `3` | Consecutive successes before marking healthy |
 | `unhealthy_threshold` | integer | `3` | Consecutive failures before marking unhealthy |
 | `healthy_status_codes` | array | `[200, 302]` | HTTP status codes considered healthy |
+| `use_tls` | boolean | `false` | Use HTTPS for health probe requests instead of HTTP |
 
 **How it works:**
 
 1. A background task is spawned for each target in the upstream.
-2. Every `interval_seconds`, the task sends an HTTP GET to `http://<host>:<port><http_path>`.
+2. Every `interval_seconds`, the task sends an HTTP GET to `http://<host>:<port><http_path>` (or `https://` when `use_tls: true`).
 3. If the response status code is in `healthy_status_codes`, it counts as a success.
 4. After `unhealthy_threshold` consecutive failures (bad status code, timeout, or connection error), the target is marked **unhealthy** and excluded from load balancing.
 5. After `healthy_threshold` consecutive successes, the target is marked **healthy** again and re-included.

@@ -248,6 +248,16 @@ Separate HTTP and HTTPS listeners for the Admin API with enhanced TLS support:
 - **File Mode**: No admin API (proxy only)
 - **Data Plane Mode**: Read-only admin API served from cached config (writes return 403)
 
+### **3.2 HTTP/3 (QUIC) (`src/http3/`)**
+
+Optional HTTP/3 listener using QUIC transport, enabled via `FERRUM_ENABLE_HTTP3=true`:
+
+**Key Features**:
+- QUIC-based transport with TLS 1.3 (mandatory per spec)
+- Shares the HTTPS port with HTTP/1.1 and HTTP/2 listeners
+- Configurable idle timeout and max concurrent streams
+- **0-RTT early data is disabled** for security — 0-RTT is vulnerable to replay attacks on non-idempotent operations proxied through the gateway
+
 ### **4. Load Balancer & Health Checks (`src/load_balancer.rs`, `src/health_check.rs`)**
 
 Distributes traffic across multiple backend targets within an upstream group:
@@ -391,7 +401,7 @@ Integrates with health checking to skip unhealthy targets.
 
 Active and passive backend health checking:
 
-- **Active checks**: Periodic HTTP probes with configurable path, method, expected status, timeout, and interval
+- **Active checks**: Periodic HTTP/HTTPS probes with configurable path, method, expected status, timeout, and interval
 - **Passive checks**: Monitors HTTP status codes from proxied requests with windowed failure counting
 - **Unhealthy target tracking**: DashMap-based, integrates with load balancer to skip failing backends
 
@@ -474,12 +484,14 @@ In-flight requests continue using the previous config snapshot via Arc reference
 
 ### **WebSocket Request Processing**
 
+All WebSocket connections go through the full plugin authentication pipeline — there is no unauthenticated bypass path. The upgrade is performed only after all plugins (auth, authz, rate limiting, logging) have executed successfully.
+
 ```
 1. WebSocket Upgrade Request
    ↓
 2. Route Matching
    ↓
-3. Plugin Pipeline
+3. Full Plugin Pipeline (auth → authz → rate limit → logging)
    ↓
 4. Connection Pool (with mTLS)
    ↓

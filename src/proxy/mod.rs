@@ -312,18 +312,12 @@ async fn handle_connection(
         .http2()
         .max_header_list_size(state.max_header_size_bytes as u32);
 
-    // Create a service function that can handle HTTP, WebSocket, and gRPC
+    // WebSocket requests flow through handle_proxy_request so that authentication
+    // and authorization plugins execute before the upgrade handshake.
     let svc = service_fn(move |req: Request<Incoming>| {
         let state = state.clone();
         let addr = remote_addr;
-        async move {
-            if is_websocket_upgrade(&req) {
-                debug!("Detected WebSocket upgrade request, routing to WebSocket handler");
-                handle_websocket_request(req, state, addr).await
-            } else {
-                handle_proxy_request(req, state, addr, false).await
-            }
-        }
+        async move { handle_proxy_request(req, state, addr, false).await }
     });
     if let Err(e) = builder.serve_connection_with_upgrades(io, svc).await {
         debug!("Connection error: {}", e);
@@ -343,149 +337,6 @@ fn set_tcp_keepalive(stream: &tokio::net::TcpStream) {
     if let Err(e) = socket.set_tcp_keepalive(&keepalive) {
         debug!("Failed to set TCP keepalive: {}", e);
     }
-}
-
-/// Handle WebSocket requests with proper connection takeover
-async fn handle_websocket_request(
-    req: Request<Incoming>,
-    state: ProxyState,
-    remote_addr: SocketAddr,
-) -> Result<Response<ProxyBody>, hyper::Error> {
-    info!(
-        "WebSocket upgrade request for proxy routing from {}",
-        remote_addr.ip()
-    );
-
-    // Find matching proxy for WebSocket request via router cache
-    let path = req.uri().path().to_string();
-    let matched_proxy = state.router_cache.find_proxy(&path);
-
-    let proxy = match matched_proxy {
-        Some(p) => p,
-        None => {
-            state.request_count.fetch_add(1, Ordering::Relaxed);
-            record_status(&state, 404);
-            return Ok(build_response(
-                StatusCode::NOT_FOUND,
-                r#"{"error":"Not Found"}"#,
-            ));
-        }
-    };
-
-    // Verify this proxy supports WebSocket
-    if !matches!(
-        proxy.backend_protocol,
-        BackendProtocol::Ws | BackendProtocol::Wss
-    ) {
-        error!("Proxy {} does not support WebSocket protocol", proxy.id);
-        return Ok(build_response(
-            StatusCode::BAD_GATEWAY,
-            r#"{"error":"This proxy does not support WebSocket connections"}"#,
-        ));
-    }
-
-    // Build backend URL using the standard URL builder (respects strip_listen_path, backend_path, query)
-    let query_string = req.uri().query().unwrap_or("");
-    let backend_url = build_websocket_backend_url(&proxy, &path, query_string);
-
-    // Get the upgrade parts from the request
-    let (mut parts, _body) = req.into_parts();
-
-    // Extract the OnUpgrade future
-    let on_upgrade = match parts.extensions.remove::<OnUpgrade>() {
-        Some(on_upgrade) => on_upgrade,
-        None => {
-            error!("No upgrade extension found in request");
-            return Ok(build_response(
-                StatusCode::BAD_REQUEST,
-                r#"{"error":"No upgrade extension found"}"#,
-            ));
-        }
-    };
-
-    // Log connection details
-    let ws_key = parts
-        .headers
-        .get("sec-websocket-key")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("missing");
-
-    let ws_version = parts
-        .headers
-        .get("sec-websocket-version")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("unknown");
-
-    debug!(
-        "WebSocket handshake details - Key: {}, Version: {}, Backend: {}",
-        ws_key, ws_version, backend_url
-    );
-
-    // Generate accept key
-    let accept_key = derive_accept_key(ws_key.as_bytes());
-
-    // Collect client headers to forward to backend
-    let client_headers = collect_forwardable_headers(&parts.headers);
-
-    // Connect to backend BEFORE sending 101 to client.
-    // If the backend is unreachable, we return 502 instead of a premature 101.
-    let env_config = state.env_config.clone();
-    let backend_ws_stream =
-        match connect_websocket_backend(&backend_url, &proxy, &env_config, &client_headers).await {
-            Ok(stream) => stream,
-            Err(e) => {
-                error!(
-                    "WebSocket backend connection failed for {}: {}",
-                    proxy.id, e
-                );
-                state.request_count.fetch_add(1, Ordering::Relaxed);
-                record_status(&state, 502);
-                return Ok(build_response(
-                    StatusCode::BAD_GATEWAY,
-                    r#"{"error":"Backend WebSocket connection failed"}"#,
-                ));
-            }
-        };
-
-    // Backend verified — now record 101 and send upgrade response to client
-    state.request_count.fetch_add(1, Ordering::Relaxed);
-    record_status(&state, 101);
-
-    // Spawn bidirectional forwarding task (awaits client upgrade, then proxies)
-    let proxy_id = proxy.id.clone();
-    tokio::spawn(async move {
-        match on_upgrade.await {
-            Ok(upgraded) => {
-                info!(
-                    "WebSocket connection upgraded successfully for: {}",
-                    proxy_id
-                );
-                if let Err(e) = run_websocket_proxy(upgraded, backend_ws_stream, &proxy_id).await {
-                    error!("WebSocket proxying error: {}", e);
-                }
-            }
-            Err(e) => {
-                error!("WebSocket upgrade failed: {}", e);
-            }
-        }
-    });
-
-    // Build upgrade response
-    let upgrade_response = Response::builder()
-        .status(StatusCode::SWITCHING_PROTOCOLS)
-        .header("upgrade", "websocket")
-        .header("connection", "upgrade")
-        .header("sec-websocket-accept", accept_key)
-        .header("x-websocket-proxy", "ferrum-gateway")
-        .body(ProxyBody::empty())
-        .unwrap_or_else(|_| Response::new(ProxyBody::empty()));
-
-    info!(
-        "WebSocket upgrade response sent for: {} -> {}",
-        proxy.id, backend_url
-    );
-
-    Ok(upgrade_response)
 }
 
 /// Handle WebSocket requests AFTER authentication and authorization plugins have run
@@ -1113,18 +964,12 @@ async fn handle_tls_connection(
         .http2()
         .max_header_list_size(state.max_header_size_bytes as u32);
 
-    // Use the same HTTP service function
+    // WebSocket requests flow through handle_proxy_request so that authentication
+    // and authorization plugins execute before the upgrade handshake.
     let svc = service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
         let state = state.clone();
         let addr = remote_addr;
-        async move {
-            if is_websocket_upgrade(&req) {
-                debug!("Detected WebSocket upgrade request over TLS, routing to WebSocket handler");
-                handle_websocket_request(req, state, addr).await
-            } else {
-                handle_proxy_request(req, state, addr, true).await
-            }
-        }
+        async move { handle_proxy_request(req, state, addr, true).await }
     });
     if let Err(e) = builder.serve_connection_with_upgrades(io, svc).await {
         error!("HTTP connection error over TLS: {}", e);
@@ -1334,15 +1179,40 @@ pub async fn handle_proxy_request(
 
     match proxy.auth_mode {
         AuthMode::Multi => {
-            // Execute ALL auth plugins; first success sets consumer
+            // Execute auth plugins; first success (consumer identified) stops iteration.
+            // If all fail and auth plugins were configured, reject with 401.
+            let mut last_reject: Option<(u16, String, HashMap<String, String>)> = None;
             for auth_plugin in &auth_plugins {
-                let _ = auth_plugin
+                match auth_plugin
                     .authenticate(&mut ctx, &state.consumer_index)
-                    .await;
-                // In multi mode, we don't reject on individual failure
+                    .await
+                {
+                    PluginResult::Reject {
+                        status_code,
+                        body,
+                        headers,
+                    } => {
+                        last_reject = Some((status_code, body, headers));
+                    }
+                    PluginResult::Continue => {
+                        if ctx.identified_consumer.is_some() {
+                            last_reject = None;
+                            break;
+                        }
+                    }
+                }
             }
-            // After all auth plugins, check if any consumer was identified
-            // This is handled by the access_control plugin below
+            if let Some((status_code, body, headers)) = last_reject
+                .filter(|_| !auth_plugins.is_empty() && ctx.identified_consumer.is_none())
+            {
+                log_rejected_request(&plugins, &ctx, status_code, start_time, "authenticate").await;
+                record_request(&state, status_code);
+                return Ok(build_reject_response(
+                    StatusCode::from_u16(status_code).unwrap_or(StatusCode::UNAUTHORIZED),
+                    &body,
+                    &headers,
+                ));
+            }
         }
         AuthMode::Single => {
             // Execute auth plugins sequentially; first failure rejects
@@ -1801,7 +1671,15 @@ pub async fn handle_proxy_request(
         .status(StatusCode::from_u16(response_status).unwrap_or(StatusCode::BAD_GATEWAY));
 
     for (k, v) in &response_headers {
-        resp_builder = resp_builder.header(k.as_str(), v.as_str());
+        if k == "set-cookie" {
+            // Set-Cookie values were stored newline-separated to avoid RFC-violating
+            // comma folding. Emit each value as a separate header line.
+            for cookie_val in v.split('\n') {
+                resp_builder = resp_builder.header("set-cookie", cookie_val);
+            }
+        } else {
+            resp_builder = resp_builder.header(k.as_str(), v.as_str());
+        }
     }
 
     // Add gateway error categorization headers so clients and ops teams
@@ -1834,12 +1712,9 @@ pub async fn handle_proxy_request(
         ResponseBody::Buffered(data) => ProxyBody::full(Bytes::from(data)),
     };
 
-    Ok(resp_builder.body(body).unwrap_or_else(|_| {
-        Response::builder()
-            .status(StatusCode::INTERNAL_SERVER_ERROR)
-            .body(ProxyBody::from_string("Internal Server Error"))
-            .unwrap()
-    }))
+    Ok(resp_builder
+        .body(body)
+        .unwrap_or_else(|_| Response::new(ProxyBody::from_string("Internal Server Error"))))
 }
 
 /// Build the backend URL based on proxy config and path forwarding logic.
@@ -2005,19 +1880,7 @@ async fn proxy_to_backend_retry(
         Ok(response) => {
             let status = response.status().as_u16();
             let mut resp_headers = HashMap::new();
-            for (k, v) in response.headers() {
-                if let Ok(vs) = v.to_str() {
-                    // Use entry API to preserve multi-value headers (e.g. Set-Cookie)
-                    // by appending with comma separation per RFC 7230 Section 3.2.2
-                    resp_headers
-                        .entry(k.as_str().to_string())
-                        .and_modify(|existing: &mut String| {
-                            existing.push_str(", ");
-                            existing.push_str(vs);
-                        })
-                        .or_insert_with(|| vs.to_string());
-                }
-            }
+            collect_response_headers(response.headers(), &mut resp_headers);
             if stream_response {
                 retry::BackendResponse {
                     status_code: status,
@@ -2230,19 +2093,7 @@ async fn proxy_to_backend(
         Ok(response) => {
             let status = response.status().as_u16();
             let mut resp_headers = HashMap::new();
-            for (k, v) in response.headers() {
-                if let Ok(vs) = v.to_str() {
-                    // Use entry API to preserve multi-value headers (e.g. Set-Cookie)
-                    // by appending with comma separation per RFC 7230 Section 3.2.2
-                    resp_headers
-                        .entry(k.as_str().to_string())
-                        .and_modify(|existing: &mut String| {
-                            existing.push_str(", ");
-                            existing.push_str(vs);
-                        })
-                        .or_insert_with(|| vs.to_string());
-                }
-            }
+            collect_response_headers(response.headers(), &mut resp_headers);
 
             // Enforce response body size limit
             if state.max_response_body_size_bytes > 0 {
@@ -2357,7 +2208,7 @@ async fn collect_response_with_limit(
             }
             Err(e) => {
                 error!("Error reading backend response: {}", e);
-                return Err(format!(r#"{{"error":"Backend error: {}"}}"#, e).into_bytes());
+                return Err(r#"{"error":"Backend response read error"}"#.as_bytes().to_vec());
             }
         }
     }
@@ -2380,6 +2231,40 @@ fn record_status(state: &ProxyState, status: u16) {
 fn record_request(state: &ProxyState, status: u16) {
     state.request_count.fetch_add(1, Ordering::Relaxed);
     record_status(state, status);
+}
+
+/// Collect backend response headers into a HashMap.
+///
+/// RFC 7230 Section 3.2.2 allows folding multi-valued headers with commas,
+/// **except** `Set-Cookie` (RFC 6265) which must be emitted as separate header
+/// lines. We store multiple Set-Cookie values separated by `\n` so they can be
+/// split back into individual headers when building the downstream response.
+fn collect_response_headers(
+    source: &reqwest::header::HeaderMap,
+    target: &mut HashMap<String, String>,
+) {
+    for (k, v) in source {
+        if let Ok(vs) = v.to_str() {
+            let key = k.as_str().to_string();
+            if k == "set-cookie" {
+                target
+                    .entry(key)
+                    .and_modify(|existing: &mut String| {
+                        existing.push('\n');
+                        existing.push_str(vs);
+                    })
+                    .or_insert_with(|| vs.to_string());
+            } else {
+                target
+                    .entry(key)
+                    .and_modify(|existing: &mut String| {
+                        existing.push_str(", ");
+                        existing.push_str(vs);
+                    })
+                    .or_insert_with(|| vs.to_string());
+            }
+        }
+    }
 }
 
 fn build_response(status: StatusCode, body: &str) -> Response<ProxyBody> {
@@ -2420,7 +2305,7 @@ async fn proxy_to_backend_http3(
     method: &str,
     headers: &HashMap<String, String>,
     original_req: Request<Incoming>,
-    _client_ip: &str,
+    client_ip: &str,
 ) -> (u16, Vec<u8>, HashMap<String, String>) {
     info!("Proxying request to HTTP/3 backend: {}", backend_url);
 
@@ -2471,13 +2356,40 @@ async fn proxy_to_backend_http3(
     };
 
     // Convert headers to HTTP/3 format
-    let mut http3_headers = Vec::new();
+    let mut http3_headers: Vec<(hyper::header::HeaderName, hyper::header::HeaderValue)> =
+        Vec::new();
     for (name, value) in headers {
+        if name == "connection" || name == "transfer-encoding" {
+            continue;
+        }
         if let (Ok(header_name), Ok(header_value)) = (name.parse(), value.parse()) {
             http3_headers.push((header_name, header_value));
         } else {
             debug!("Skipping invalid HTTP/3 header: {}={}", name, value);
         }
+    }
+
+    // Add X-Forwarded-* headers (matching HTTP/1.1 and HTTP/2 paths)
+    if let Some(xff) = headers.get("x-forwarded-for") {
+        if let Ok(v) = format!("{}, {}", xff, client_ip).parse() {
+            http3_headers.push((hyper::header::HeaderName::from_static("x-forwarded-for"), v));
+        }
+    } else if let Ok(v) = client_ip.parse() {
+        http3_headers.push((hyper::header::HeaderName::from_static("x-forwarded-for"), v));
+    }
+    if let Ok(v) = "https".parse() {
+        http3_headers.push((
+            hyper::header::HeaderName::from_static("x-forwarded-proto"),
+            v,
+        ));
+    }
+    if let Some(host) = headers.get("host")
+        && let Ok(v) = host.parse()
+    {
+        http3_headers.push((
+            hyper::header::HeaderName::from_static("x-forwarded-host"),
+            v,
+        ));
     }
 
     // Make HTTP/3 request
@@ -2491,8 +2403,11 @@ async fn proxy_to_backend_http3(
         }
         Err(e) => {
             error!("HTTP/3 backend request failed: {}", e);
-            let body = format!(r#"{{"error":"HTTP/3 backend request failed: {}"}}"#, e);
-            (502, body.into_bytes(), HashMap::new())
+            (
+                502,
+                r#"{"error":"HTTP/3 backend request failed"}"#.as_bytes().to_vec(),
+                HashMap::new(),
+            )
         }
     }
 }

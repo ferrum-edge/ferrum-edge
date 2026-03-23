@@ -262,7 +262,11 @@ impl HealthChecker {
         config: &ActiveHealthCheck,
     ) -> tokio::task::JoinHandle<()> {
         let key = target_key(target);
-        let url = format!("http://{}:{}{}", target.host, target.port, config.http_path);
+        let scheme = if config.use_tls { "https" } else { "http" };
+        let url = format!(
+            "{}://{}:{}{}",
+            scheme, target.host, target.port, config.http_path
+        );
         let interval = Duration::from_secs(config.interval_seconds);
         let timeout = Duration::from_millis(config.timeout_ms);
         let healthy_threshold = config.healthy_threshold;

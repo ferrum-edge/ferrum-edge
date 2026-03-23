@@ -56,6 +56,10 @@ The same size limits apply to HTTP/3 connections:
 - Body collection tracks accumulated size during `recv_data()` calls
 - Response body limits are enforced identically to HTTP/1.1 and HTTP/2
 
+## Admin API Body Limit
+
+The Admin API enforces a **1 MiB** (1,048,576 bytes) request body size limit on all endpoints. This is a fixed limit independent of the proxy size limits above. Requests exceeding this limit receive a `413 Payload Too Large` response.
+
 ## Error Responses
 
 All error responses are JSON with `Content-Type: application/json`.
@@ -66,6 +70,7 @@ All error responses are JSON with `Content-Type: application/json`.
 | Total headers too large | `431 Request Header Fields Too Large` | `{"error":"Total request headers exceed maximum size"}` |
 | Request body too large (Content-Length) | `413 Content Too Large` | `{"error":"Request body exceeds maximum size"}` |
 | Request body too large (streaming) | `413 Content Too Large` | `{"error":"Request body exceeds maximum size"}` |
+| Admin API body too large | `413 Payload Too Large` | Request rejected by body size middleware |
 | Response body too large | `502 Bad Gateway` | `{"error":"Backend response body exceeds maximum size"}` |
 
 **Why 502 for response body?** The backend sent a response that violates the gateway's configured limits. The client is not at fault — the backend is misbehaving. This matches HTTP semantics: 502 indicates the gateway received an invalid response from the upstream server.

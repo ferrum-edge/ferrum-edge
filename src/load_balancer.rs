@@ -181,12 +181,16 @@ impl LoadBalancerCache {
             // Try to find with pre-computed key first
             if !key_ref.is_empty() {
                 if let Some(count) = balancer.active_connections.get(key_ref) {
-                    count.fetch_sub(1, Ordering::Relaxed);
+                    let _ = count.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                        if v > 0 { Some(v - 1) } else { None }
+                    });
                 }
             } else {
                 let fallback = target_key(target);
                 if let Some(count) = balancer.active_connections.get(&fallback) {
-                    count.fetch_sub(1, Ordering::Relaxed);
+                    let _ = count.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                        if v > 0 { Some(v - 1) } else { None }
+                    });
                 }
             }
         }

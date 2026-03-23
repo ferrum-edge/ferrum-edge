@@ -169,8 +169,11 @@ pub async fn run(
             tokio::time::sleep(poll_interval).await;
             match db_poll.load_full_config().await {
                 Ok(new_config) => {
+                    // Store config before broadcasting so that a DP calling
+                    // GetFullConfig immediately after receiving the broadcast
+                    // reads the new version (not the stale one).
+                    config_poll.store(Arc::new(new_config.clone()));
                     CpGrpcServer::broadcast_update(&update_tx, &new_config);
-                    config_poll.store(Arc::new(new_config));
                     info!("Configuration reloaded from database and pushed to DPs");
                 }
                 Err(e) => {

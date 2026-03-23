@@ -174,6 +174,7 @@ impl BodyValidator {
         let mut in_tag = false;
         let mut is_closing = false;
         let mut is_self_closing = false;
+        let mut tag_just_opened = false;
 
         for ch in trimmed.chars() {
             match ch {
@@ -181,13 +182,17 @@ impl BodyValidator {
                     in_tag = true;
                     is_closing = false;
                     is_self_closing = false;
+                    tag_just_opened = true;
                 }
                 '/' if in_tag => {
-                    if depth == 0 && !is_closing {
+                    if tag_just_opened {
+                        // `</` — this is a closing tag
                         is_closing = true;
                     } else {
+                        // `/` later in the tag — self-closing like `<br/>`
                         is_self_closing = true;
                     }
+                    tag_just_opened = false;
                 }
                 '>' => {
                     if in_tag {
@@ -201,9 +206,16 @@ impl BodyValidator {
                         }
                         in_tag = false;
                     }
+                    tag_just_opened = false;
                 }
-                _ => {}
+                _ => {
+                    tag_just_opened = false;
+                }
             }
+        }
+
+        if depth != 0 {
+            return Err(format!("Unbalanced XML tags (depth {})", depth));
         }
 
         Ok(())

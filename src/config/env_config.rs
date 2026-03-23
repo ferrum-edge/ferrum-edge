@@ -265,7 +265,7 @@ impl EnvConfig {
             db_poll_interval: parse_env_u64("FERRUM_DB_POLL_INTERVAL", 30),
             db_poll_check_interval: parse_env_u64("FERRUM_DB_POLL_CHECK_INTERVAL", 5),
             db_incremental_polling: env::var("FERRUM_DB_INCREMENTAL_POLLING")
-                .map(|v| v != "false")
+                .map(|v| v == "true")
                 .unwrap_or(true),
             db_tls_enabled: env::var("FERRUM_DB_TLS_ENABLED").unwrap_or_default() == "true",
             db_tls_ca_cert_path: env::var("FERRUM_DB_TLS_CA_CERT_PATH").ok(),
@@ -345,7 +345,7 @@ impl EnvConfig {
             tls_max_version: env::var("FERRUM_TLS_MAX_VERSION").unwrap_or_else(|_| "1.3".into()),
             tls_cipher_suites: env::var("FERRUM_TLS_CIPHER_SUITES").ok(),
             tls_prefer_server_cipher_order: env::var("FERRUM_TLS_PREFER_SERVER_CIPHER_ORDER")
-                .map(|v| v != "false")
+                .map(|v| v == "true")
                 .unwrap_or(true),
             tls_curves: env::var("FERRUM_TLS_CURVES").ok(),
 

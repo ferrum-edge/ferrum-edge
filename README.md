@@ -324,7 +324,7 @@ See [CI/CD Documentation](docs/ci_cd.md) for complete pipeline overview, secrets
 | `FERRUM_DB_URL` | DB/CP modes | — | Database connection string |
 | `FERRUM_DB_POLL_INTERVAL` | No | `30` | Seconds between DB config polls |
 | `FERRUM_DB_POLL_CHECK_INTERVAL` | No | `5` | Seconds between DB connectivity checks |
-| `FERRUM_DB_INCREMENTAL_POLLING` | No | `true` | Enable incremental (delta) DB polling |
+| `FERRUM_DB_INCREMENTAL_POLLING` | No | `true` | Enable incremental (delta) DB polling. Set to `"true"` to enable or `"false"` to disable. |
 | `FERRUM_DB_TLS_ENABLED` | No | `false` | Enable TLS for database connections |
 | `FERRUM_DB_TLS_CA_CERT_PATH` | No | — | Path to CA certificate for database TLS verification |
 | `FERRUM_DB_TLS_CLIENT_CERT_PATH` | No | — | Path to client certificate for database mTLS |

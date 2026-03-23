@@ -5,7 +5,7 @@ use crate::config::types::{
 use chrono::Utc;
 use sqlx::Row;
 use sqlx::{AnyPool, any::AnyPoolOptions, any::AnyRow};
-use tracing::{error, info};
+use tracing::{debug, error, info, warn};
 
 /// Database configuration store.
 #[derive(Clone)]
@@ -700,20 +700,23 @@ fn row_to_proxy(
         backend_host: row.try_get("backend_host")?,
         backend_port: row
             .try_get::<i32, _>("backend_port")
-            .map(|v| v as u16)
+            .map(|v| v.clamp(0, 65535) as u16)
             .unwrap_or(80),
         backend_path: row.try_get("backend_path").ok(),
         strip_listen_path: row.try_get::<i32, _>("strip_listen_path").unwrap_or(1) != 0,
         preserve_host_header: row.try_get::<i32, _>("preserve_host_header").unwrap_or(0) != 0,
         backend_connect_timeout_ms: row
             .try_get::<i64, _>("backend_connect_timeout_ms")
-            .unwrap_or(5000) as u64,
+            .map(|v| v.max(0) as u64)
+            .unwrap_or(5000),
         backend_read_timeout_ms: row
             .try_get::<i64, _>("backend_read_timeout_ms")
-            .unwrap_or(30000) as u64,
+            .map(|v| v.max(0) as u64)
+            .unwrap_or(30000),
         backend_write_timeout_ms: row
             .try_get::<i64, _>("backend_write_timeout_ms")
-            .unwrap_or(30000) as u64,
+            .map(|v| v.max(0) as u64)
+            .unwrap_or(30000),
         backend_tls_client_cert_path: row.try_get("backend_tls_client_cert_path").ok(),
         backend_tls_client_key_path: row.try_get("backend_tls_client_key_path").ok(),
         backend_tls_verify_server_cert: row
@@ -747,7 +750,10 @@ fn row_to_proxy(
 /// Parse a consumer row into a Consumer struct.
 fn row_to_consumer(row: &AnyRow) -> Result<Consumer, anyhow::Error> {
     let creds_str: String = row.try_get("credentials").unwrap_or("{}".into());
-    let credentials = serde_json::from_str(&creds_str).unwrap_or_default();
+    let credentials = serde_json::from_str(&creds_str).unwrap_or_else(|e| {
+        warn!("Failed to parse credentials JSON for consumer: {}", e);
+        std::collections::HashMap::new()
+    });
 
     Ok(Consumer {
         id: row.try_get("id")?,
@@ -762,7 +768,10 @@ fn row_to_consumer(row: &AnyRow) -> Result<Consumer, anyhow::Error> {
 /// Parse a plugin_config row into a PluginConfig struct.
 fn row_to_plugin_config(row: &AnyRow) -> Result<PluginConfig, anyhow::Error> {
     let config_str: String = row.try_get("config").unwrap_or("{}".into());
-    let config_val = serde_json::from_str(&config_str).unwrap_or(serde_json::Value::Null);
+    let config_val = serde_json::from_str(&config_str).unwrap_or_else(|e| {
+        warn!("Failed to parse plugin config JSON: {}", e);
+        serde_json::Value::Null
+    });
     let scope_str: String = row.try_get("scope").unwrap_or("global".into());
 
     Ok(PluginConfig {
@@ -824,5 +833,11 @@ fn parse_datetime_column(row: &AnyRow, column: &str) -> chrono::DateTime<Utc> {
                         .ok()
                 })
         })
-        .unwrap_or_else(Utc::now)
+        .unwrap_or_else(|| {
+            debug!(
+                "Could not parse '{}' column, falling back to Utc::now()",
+                column
+            );
+            Utc::now()
+        })
 }

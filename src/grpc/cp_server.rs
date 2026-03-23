@@ -7,7 +7,7 @@ use tokio::sync::broadcast;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
 use tonic::{Request, Response, Status};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use super::proto::config_sync_server::{ConfigSync, ConfigSyncServer};
 use super::proto::{ConfigUpdate, FullConfigRequest, FullConfigResponse, SubscribeRequest};
@@ -38,9 +38,8 @@ impl CpGrpcServer {
     }
 
     #[allow(clippy::result_large_err)]
-    fn verify_jwt(&self, req: &Request<()>) -> Result<(), Status> {
-        let token = req
-            .metadata()
+    fn verify_jwt_metadata(&self, metadata: &tonic::metadata::MetadataMap) -> Result<(), Status> {
+        let token = metadata
             .get("authorization")
             .and_then(|v| v.to_str().ok())
             .map(|s| s.strip_prefix("Bearer ").unwrap_or(s))
@@ -89,15 +88,7 @@ impl ConfigSync for CpGrpcServer {
         &self,
         request: Request<SubscribeRequest>,
     ) -> Result<Response<Self::SubscribeStream>, Status> {
-        // Verify JWT from metadata
-        let mut meta_req = Request::new(());
-        // Copy authorization metadata from original request
-        if let Some(auth_header) = request.metadata().get("authorization") {
-            meta_req
-                .metadata_mut()
-                .insert("authorization", auth_header.clone());
-        }
-        self.verify_jwt(&meta_req)?;
+        self.verify_jwt_metadata(request.metadata())?;
 
         let node_id = request.into_inner().node_id;
         info!("DP node '{}' subscribed for config updates", node_id);
@@ -118,7 +109,13 @@ impl ConfigSync for CpGrpcServer {
         let rx = self.update_tx.subscribe();
         let stream = BroadcastStream::new(rx).filter_map(|result| match result {
             Ok(update) => Some(Ok(update)),
-            Err(_) => None,
+            Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
+                warn!(
+                    "DP config stream lagged behind by {} updates — DP may have stale config",
+                    n
+                );
+                None
+            }
         });
 
         // Prepend initial config
@@ -132,20 +129,7 @@ impl ConfigSync for CpGrpcServer {
         &self,
         request: Request<FullConfigRequest>,
     ) -> Result<Response<FullConfigResponse>, Status> {
-        let token = request
-            .metadata()
-            .get("authorization")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.strip_prefix("Bearer ").unwrap_or(s))
-            .ok_or_else(|| Status::unauthenticated("Missing authorization token"))?;
-
-        let key = DecodingKey::from_secret(self.jwt_secret.as_bytes());
-        let mut validation = Validation::new(Algorithm::HS256);
-        validation.validate_exp = true;
-        validation.required_spec_claims.clear();
-
-        decode::<Value>(token, &key, &validation)
-            .map_err(|e| Status::unauthenticated(format!("Invalid token: {}", e)))?;
+        self.verify_jwt_metadata(request.metadata())?;
 
         let config = self.config.load_full();
         let config_json = serde_json::to_string(config.as_ref()).map_err(|e| {

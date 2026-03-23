@@ -8,7 +8,7 @@ WebSocket requests are detected via the `Upgrade: websocket` header and routed s
 
 1. **Upgrade detection** - `is_websocket_upgrade()` checks for WebSocket upgrade headers
 2. **Route matching** - Uses the same router cache as HTTP for O(1) lookups
-3. **Authentication** - Proxies with plugins go through `handle_websocket_request_authenticated()`; those without go through `handle_websocket_request()`
+3. **Authentication & Authorization** - All WebSocket connections go through the full plugin authentication and authorization pipeline, the same pipeline used for HTTP requests
 4. **Handshake** - Gateway returns HTTP 101 Switching Protocols with the `sec-websocket-accept` key
 5. **Connection takeover** - `OnUpgrade` is extracted from the request; a spawned task awaits the upgrade and begins proxying
 6. **Bidirectional forwarding** - `handle_websocket_proxying()` splits both client and backend streams, forwarding messages in both directions via `tokio::select!`

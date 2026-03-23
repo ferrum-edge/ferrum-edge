@@ -108,7 +108,9 @@ impl CircuitBreaker {
         }
     }
 
-    /// Record a successful response.
+    /// Record a successful response, transitioning from half-open to closed
+    /// after enough successes reach the configured threshold.
+    #[allow(dead_code)] // Public API — called by retry/proxy logic when circuit is half-open
     pub fn record_success(&self) {
         let state = self.state.load(Ordering::Acquire);
         match state {
@@ -135,7 +137,7 @@ impl CircuitBreaker {
     /// Record a failed response.
     pub fn record_failure(&self, status_code: u16) {
         if !self.config.failure_status_codes.contains(&status_code) {
-            self.record_success();
+            // Non-failure status codes are neutral — don't treat as success or failure
             return;
         }
 
