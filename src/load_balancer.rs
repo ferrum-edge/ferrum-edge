@@ -211,15 +211,13 @@ struct LoadBalancer {
     active_connections: DashMap<String, AtomicI64>,
     /// Consistent hash ring (sorted hash values -> target index).
     hash_ring: Vec<(u64, usize)>,
-    /// Hash on field (e.g., "ip", "header:X-User-Id", "consumer").
-    hash_on: Option<String>,
 }
 
 impl LoadBalancer {
     fn new(
         algorithm: LoadBalancerAlgorithm,
         targets: &[UpstreamTarget],
-        hash_on: Option<String>,
+        _hash_on: Option<String>,
     ) -> Self {
         let wrr_weights: Vec<AtomicI64> = targets.iter().map(|_| AtomicI64::new(0)).collect();
         // Pre-compute target keys once at build time, not per-request
@@ -248,7 +246,6 @@ impl LoadBalancer {
             wrr_weights,
             active_connections: DashMap::new(),
             hash_ring,
-            hash_on,
         }
     }
 

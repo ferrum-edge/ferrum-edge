@@ -31,6 +31,7 @@ pub struct PluginCache {
 
 impl PluginCache {
     /// Build a new plugin cache from the given config with a default HTTP client.
+    #[allow(dead_code)]
     pub fn new(config: &GatewayConfig) -> Self {
         let http_client = PluginHttpClient::default();
         Self::with_http_client(config, http_client)
