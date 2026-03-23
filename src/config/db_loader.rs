@@ -151,12 +151,7 @@ impl DatabaseStore {
         if applied.is_empty() {
             info!("Database schema is up to date");
         } else {
-            for m in &applied {
-                info!(
-                    "Applied migration V{}: {} ({}ms)",
-                    m.version, m.name, m.execution_time_ms
-                );
-            }
+            info!("Applied {} migration(s)", applied.len());
         }
 
         Ok(())

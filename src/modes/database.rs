@@ -296,8 +296,9 @@ pub async fn run(
             tokio::time::sleep(poll_interval).await;
             match db_poll.load_full_config().await {
                 Ok(new_config) => {
-                    proxy_state_poll.update_config(new_config);
-                    info!("Configuration reloaded from database");
+                    if proxy_state_poll.update_config(new_config) {
+                        info!("Configuration reloaded from database");
+                    }
                 }
                 Err(e) => {
                     warn!(

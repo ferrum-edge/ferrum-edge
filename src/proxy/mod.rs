@@ -181,17 +181,24 @@ impl ProxyState {
     ///
     /// Falls back to a full rebuild only on the very first config load (when
     /// there is no previous config to diff against).
-    pub fn update_config(&self, new_config: GatewayConfig) {
+    /// Update the proxy configuration. Returns `true` if changes were applied.
+    pub fn update_config(&self, new_config: GatewayConfig) -> bool {
         use crate::config_delta::ConfigDelta;
 
         let old_config = self.config.load_full();
 
-        // If this is the initial load (empty config), do a full rebuild
-        if old_config.proxies.is_empty()
+        // If this is the initial load (old config empty, new config has data),
+        // do a full rebuild of all caches instead of computing a delta.
+        let old_is_empty = old_config.proxies.is_empty()
             && old_config.consumers.is_empty()
             && old_config.plugin_configs.is_empty()
-            && old_config.upstreams.is_empty()
-        {
+            && old_config.upstreams.is_empty();
+        let new_is_empty = new_config.proxies.is_empty()
+            && new_config.consumers.is_empty()
+            && new_config.plugin_configs.is_empty()
+            && new_config.upstreams.is_empty();
+
+        if old_is_empty && !new_is_empty {
             self.router_cache.rebuild(&new_config);
             self.plugin_cache.rebuild(&new_config);
             self.consumer_index.rebuild(&new_config.consumers);
@@ -225,7 +232,12 @@ impl ProxyState {
             info!(
                 "Proxy configuration loaded (full build: router + plugins + consumers + load balancers)"
             );
-            return;
+            return true;
+        }
+
+        // Both empty — nothing to do
+        if old_is_empty && new_is_empty {
+            return false;
         }
 
         let delta = ConfigDelta::compute(&old_config, &new_config);
@@ -234,7 +246,7 @@ impl ProxyState {
             debug!("Config poll: no changes detected, skipping update");
             // Still update loaded_at timestamp
             self.config.store(Arc::new(new_config));
-            return;
+            return false;
         }
 
         // --- RouterCache: rebuild route table, surgically invalidate path cache ---
@@ -341,6 +353,7 @@ impl ProxyState {
             delta.modified_upstreams.len(),
             proxy_ids_to_rebuild.len(),
         );
+        true
     }
 
     pub fn current_config(&self) -> Arc<GatewayConfig> {
