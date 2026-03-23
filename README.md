@@ -362,6 +362,11 @@ See [CI/CD Documentation](docs/ci_cd.md) for complete pipeline overview, secrets
 | `FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH` | No | — | Path to admin client CA bundle for mTLS verification |
 | `FERRUM_ADMIN_TLS_NO_VERIFY` | No | `false` | Disable admin TLS certificate verification (testing only) |
 | `FERRUM_BACKEND_TLS_NO_VERIFY` | No | `false` | Disable backend TLS certificate verification (testing only) |
+| `FERRUM_TLS_MIN_VERSION` | No | `1.2` | Minimum TLS protocol version (`1.2` or `1.3`) |
+| `FERRUM_TLS_MAX_VERSION` | No | `1.3` | Maximum TLS protocol version (`1.2` or `1.3`) |
+| `FERRUM_TLS_CIPHER_SUITES` | No | *(secure defaults)* | Comma-separated cipher suites (see [TLS Policy Hardening](docs/frontend_tls.md#tls-policy-hardening)) |
+| `FERRUM_TLS_CURVES` | No | `X25519,secp256r1` | Comma-separated key exchange groups: `X25519`, `secp256r1`/`P-256`, `secp384r1`/`P-384` |
+| `FERRUM_TLS_PREFER_SERVER_CIPHER_ORDER` | No | `true` | Prefer server cipher order during TLS 1.2 negotiation |
 | `FERRUM_ENABLE_HTTP3` | No | `false` | Enable HTTP/3 (QUIC) listener on the HTTPS port |
 | `FERRUM_HTTP3_IDLE_TIMEOUT` | No | `30` | HTTP/3 connection idle timeout in seconds |
 | `FERRUM_HTTP3_MAX_STREAMS` | No | `100` | Maximum concurrent HTTP/3 streams per connection |

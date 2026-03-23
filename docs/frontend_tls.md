@@ -392,6 +392,118 @@ Look for messages like:
 - "TLS connection established with client certificate verification"
 - "TLS handshake failed"
 
+## TLS Policy Hardening
+
+The gateway supports fine-grained control over TLS protocol versions, cipher suites, key exchange groups, and cipher order negotiation. These settings apply globally to all inbound TLS listeners (proxy and admin).
+
+### Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `FERRUM_TLS_MIN_VERSION` | `1.2` | Minimum TLS version. Allowed: `1.2`, `1.3` |
+| `FERRUM_TLS_MAX_VERSION` | `1.3` | Maximum TLS version. Allowed: `1.2`, `1.3` |
+| `FERRUM_TLS_CIPHER_SUITES` | *(see defaults below)* | Comma-separated list of cipher suites (OpenSSL naming) |
+| `FERRUM_TLS_CURVES` | *(see defaults below)* | Comma-separated list of key exchange groups |
+| `FERRUM_TLS_PREFER_SERVER_CIPHER_ORDER` | `true` | When `true`, server cipher preference is used during TLS 1.2 negotiation |
+
+### Protocol Version Examples
+
+```bash
+# TLS 1.2 and 1.3 (default)
+export FERRUM_TLS_MIN_VERSION="1.2"
+export FERRUM_TLS_MAX_VERSION="1.3"
+
+# TLS 1.3 only (strictest)
+export FERRUM_TLS_MIN_VERSION="1.3"
+export FERRUM_TLS_MAX_VERSION="1.3"
+
+# TLS 1.2 only (legacy compatibility)
+export FERRUM_TLS_MIN_VERSION="1.2"
+export FERRUM_TLS_MAX_VERSION="1.2"
+```
+
+**Note:** Setting `FERRUM_TLS_MIN_VERSION` higher than `FERRUM_TLS_MAX_VERSION` is an error and the gateway will refuse to start.
+
+### Supported Cipher Suites
+
+When `FERRUM_TLS_CIPHER_SUITES` is not set, the gateway uses secure AEAD-only defaults:
+
+**TLS 1.3 (always AEAD):**
+| Name | Description |
+|------|-------------|
+| `TLS_AES_256_GCM_SHA384` | AES-256-GCM (strongest) |
+| `TLS_AES_128_GCM_SHA256` | AES-128-GCM |
+| `TLS_CHACHA20_POLY1305_SHA256` | ChaCha20-Poly1305 (fast on non-AES-NI hardware) |
+
+**TLS 1.2 (ECDHE + AEAD only):**
+| Name | Description |
+|------|-------------|
+| `ECDHE-ECDSA-AES256-GCM-SHA384` | ECDSA key exchange, AES-256-GCM |
+| `ECDHE-RSA-AES256-GCM-SHA384` | RSA key exchange, AES-256-GCM |
+| `ECDHE-ECDSA-AES128-GCM-SHA256` | ECDSA key exchange, AES-128-GCM |
+| `ECDHE-RSA-AES128-GCM-SHA256` | RSA key exchange, AES-128-GCM |
+| `ECDHE-ECDSA-CHACHA20-POLY1305` | ECDSA key exchange, ChaCha20-Poly1305 |
+| `ECDHE-RSA-CHACHA20-POLY1305` | RSA key exchange, ChaCha20-Poly1305 |
+
+No CBC or non-AEAD cipher suites are supported.
+
+**Example — restrict to AES-256 only:**
+```bash
+export FERRUM_TLS_CIPHER_SUITES="TLS_AES_256_GCM_SHA384,ECDHE-ECDSA-AES256-GCM-SHA384,ECDHE-RSA-AES256-GCM-SHA384"
+```
+
+### Supported Key Exchange Groups (Curves)
+
+When `FERRUM_TLS_CURVES` is not set, the gateway uses `X25519` and `secp256r1`.
+
+| Name | Aliases | Description |
+|------|---------|-------------|
+| `X25519` | — | Curve25519 (modern, fast, recommended) |
+| `secp256r1` | `P-256`, `P256` | NIST P-256 (widely compatible) |
+| `secp384r1` | `P-384`, `P384` | NIST P-384 (stronger, slower) |
+
+Curve names are case-insensitive.
+
+**Example — X25519 only:**
+```bash
+export FERRUM_TLS_CURVES="X25519"
+```
+
+**Example — all supported curves:**
+```bash
+export FERRUM_TLS_CURVES="X25519,secp256r1,secp384r1"
+```
+
+### Server Cipher Order
+
+When `FERRUM_TLS_PREFER_SERVER_CIPHER_ORDER` is `true` (the default), the server's cipher suite preference takes priority over the client's during TLS 1.2 negotiation. This ensures the strongest cipher is selected regardless of client ordering. TLS 1.3 does not use this setting (server always selects).
+
+```bash
+# Let server choose (recommended, default)
+export FERRUM_TLS_PREFER_SERVER_CIPHER_ORDER="true"
+
+# Let client choose
+export FERRUM_TLS_PREFER_SERVER_CIPHER_ORDER="false"
+```
+
+### Verifying TLS Policy
+
+The gateway logs the active TLS policy at startup:
+
+```
+TLS policy: versions=["TLS 1.2", "TLS 1.3"], cipher_suites=["TLS13_AES_256_GCM_SHA384", ...], curves=["X25519", "SECP256R1"], prefer_server_order=true
+```
+
+You can also verify externally:
+
+```bash
+# Check negotiated protocol and cipher
+openssl s_client -connect localhost:8443 -tls1_3
+
+# List supported ciphers
+openssl s_client -connect localhost:8443 -cipher 'ALL' -tls1_2
+```
+
 ## Integration with Load Balancers
 
 When using load balancers:
