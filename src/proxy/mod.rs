@@ -1891,9 +1891,7 @@ pub async fn handle_proxy_request(
     // supplementary log with accurate backend_total_ms.
     // Default (false): streaming responses pass through with zero tracking overhead.
     let body = match response_body {
-        ResponseBody::Streaming(resp)
-            if state.env_config.enable_streaming_latency_tracking =>
-        {
+        ResponseBody::Streaming(resp) if state.env_config.enable_streaming_latency_tracking => {
             let (tracked_body, metrics) = ProxyBody::streaming_tracked(resp, backend_start);
 
             // Spawn a lightweight deferred task to log the final streaming latency.

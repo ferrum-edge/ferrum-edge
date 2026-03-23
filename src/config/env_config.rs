@@ -255,11 +255,9 @@ impl EnvConfig {
         let config = Self {
             mode: mode.clone(),
             log_level: env::var("FERRUM_LOG_LEVEL").unwrap_or_else(|_| "error".into()),
-            enable_streaming_latency_tracking: env::var(
-                "FERRUM_ENABLE_STREAMING_LATENCY_TRACKING",
-            )
-            .map(|v| v == "true" || v == "1")
-            .unwrap_or(false),
+            enable_streaming_latency_tracking: env::var("FERRUM_ENABLE_STREAMING_LATENCY_TRACKING")
+                .map(|v| v == "true" || v == "1")
+                .unwrap_or(false),
 
             proxy_http_port: parse_env_u16("FERRUM_PROXY_HTTP_PORT", 8000),
             proxy_https_port: parse_env_u16("FERRUM_PROXY_HTTPS_PORT", 8443),
