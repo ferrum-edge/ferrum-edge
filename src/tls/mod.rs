@@ -289,10 +289,15 @@ pub fn load_tls_config_with_client_auth(
             cert_path, key_path, ca_bundle_path, added, ignored
         );
 
-        // For now, use a simple approach that requires client certs but doesn't enforce strict verification
-        // This is a limitation of the current rustls version
+        let client_cert_verifier =
+            rustls::server::WebPkiClientVerifier::builder(Arc::new(client_auth_roots))
+                .build()
+                .map_err(|e| {
+                    anyhow::anyhow!("Failed to build client certificate verifier: {}", e)
+                })?;
+
         builder
-            .with_no_client_auth() // TODO: Update when proper client cert verification is available
+            .with_client_cert_verifier(client_cert_verifier)
             .with_single_cert(cert_chain, key)?
     } else {
         // No client certificate verification

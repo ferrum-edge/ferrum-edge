@@ -384,10 +384,6 @@ async fn handle_websocket_request(
         ));
     }
 
-    // Record WebSocket connection attempt
-    state.request_count.fetch_add(1, Ordering::Relaxed);
-    record_status(&state, 101); // Switching Protocols
-
     // Build backend URL using the standard URL builder (respects strip_listen_path, backend_path, query)
     let query_string = req.uri().query().unwrap_or("");
     let backend_url = build_websocket_backend_url(&proxy, &path, query_string);
@@ -431,26 +427,40 @@ async fn handle_websocket_request(
     // Collect client headers to forward to backend
     let client_headers = collect_forwardable_headers(&parts.headers);
 
-    // Spawn a task to handle the WebSocket connection after upgrade
-    let proxy_clone = proxy.clone();
+    // Connect to backend BEFORE sending 101 to client.
+    // If the backend is unreachable, we return 502 instead of a premature 101.
     let env_config = state.env_config.clone();
-    let backend_url_clone = backend_url.clone();
+    let backend_ws_stream =
+        match connect_websocket_backend(&backend_url, &proxy, &env_config, &client_headers).await {
+            Ok(stream) => stream,
+            Err(e) => {
+                error!(
+                    "WebSocket backend connection failed for {}: {}",
+                    proxy.id, e
+                );
+                state.request_count.fetch_add(1, Ordering::Relaxed);
+                record_status(&state, 502);
+                return Ok(build_response(
+                    StatusCode::BAD_GATEWAY,
+                    r#"{"error":"Backend WebSocket connection failed"}"#,
+                ));
+            }
+        };
+
+    // Backend verified — now record 101 and send upgrade response to client
+    state.request_count.fetch_add(1, Ordering::Relaxed);
+    record_status(&state, 101);
+
+    // Spawn bidirectional forwarding task (awaits client upgrade, then proxies)
+    let proxy_id = proxy.id.clone();
     tokio::spawn(async move {
         match on_upgrade.await {
             Ok(upgraded) => {
                 info!(
                     "WebSocket connection upgraded successfully for: {}",
-                    proxy_clone.id
+                    proxy_id
                 );
-                if let Err(e) = handle_websocket_proxying(
-                    upgraded,
-                    &backend_url_clone,
-                    &proxy_clone,
-                    &env_config,
-                    &client_headers,
-                )
-                .await
-                {
+                if let Err(e) = run_websocket_proxy(upgraded, backend_ws_stream, &proxy_id).await {
                     error!("WebSocket proxying error: {}", e);
                 }
             }
@@ -493,41 +503,9 @@ async fn handle_websocket_request_authenticated(
         remote_addr.ip()
     );
 
-    // Record successful WebSocket connection attempt
-    state.request_count.fetch_add(1, Ordering::Relaxed);
-    record_status(&state, 101); // Switching Protocols
-
     // Build backend URL using the standard URL builder (respects strip_listen_path, backend_path, query)
     let query_string = req.uri().query().unwrap_or("");
     let backend_url = build_websocket_backend_url(&proxy, &ctx.path, query_string);
-
-    // Log the WebSocket connection attempt
-    let start_time = std::time::Instant::now();
-    let total_ms = start_time.elapsed().as_secs_f64() * 1000.0;
-
-    // Build transaction summary for logging
-    let summary = TransactionSummary {
-        timestamp_received: ctx.timestamp_received.to_rfc3339(),
-        client_ip: ctx.client_ip.clone(),
-        consumer_username: ctx.identified_consumer.as_ref().map(|c| c.username.clone()),
-        http_method: "GET".to_string(), // WebSocket upgrades are always GET
-        request_path: ctx.path.clone(),
-        matched_proxy_id: Some(proxy.id.clone()),
-        matched_proxy_name: proxy.name.clone(),
-        backend_target_url: Some(strip_query_params(&backend_url)),
-        response_status_code: 101, // Switching Protocols
-        latency_total_ms: total_ms,
-        latency_gateway_processing_ms: total_ms,
-        latency_backend_ttfb_ms: 0.0, // Not applicable for WebSocket upgrade
-        latency_backend_total_ms: 0.0, // Not applicable for WebSocket upgrade
-        request_user_agent: ctx.headers.get("user-agent").cloned(),
-        metadata: ctx.metadata.clone(),
-    };
-
-    // Log the successful WebSocket connection (after auth)
-    for plugin in plugins.iter() {
-        plugin.log(&summary).await;
-    }
 
     // Get the upgrade parts from the request
     let (mut parts, _body) = req.into_parts();
@@ -543,6 +521,58 @@ async fn handle_websocket_request_authenticated(
             ));
         }
     };
+
+    // Collect client headers to forward to backend
+    let client_headers = collect_forwardable_headers(&parts.headers);
+
+    // Connect to backend BEFORE sending 101 to client.
+    // If the backend is unreachable, we return 502 instead of a premature 101.
+    let env_config = state.env_config.clone();
+    let backend_ws_stream =
+        match connect_websocket_backend(&backend_url, &proxy, &env_config, &client_headers).await {
+            Ok(stream) => stream,
+            Err(e) => {
+                error!(
+                    "WebSocket backend connection failed for authenticated {}: {}",
+                    proxy.id, e
+                );
+                state.request_count.fetch_add(1, Ordering::Relaxed);
+                record_status(&state, 502);
+                return Ok(build_response(
+                    StatusCode::BAD_GATEWAY,
+                    r#"{"error":"Backend WebSocket connection failed"}"#,
+                ));
+            }
+        };
+
+    // Backend verified — now record 101 and log
+    state.request_count.fetch_add(1, Ordering::Relaxed);
+    record_status(&state, 101);
+
+    let start_time = std::time::Instant::now();
+    let total_ms = start_time.elapsed().as_secs_f64() * 1000.0;
+
+    let summary = TransactionSummary {
+        timestamp_received: ctx.timestamp_received.to_rfc3339(),
+        client_ip: ctx.client_ip.clone(),
+        consumer_username: ctx.identified_consumer.as_ref().map(|c| c.username.clone()),
+        http_method: "GET".to_string(),
+        request_path: ctx.path.clone(),
+        matched_proxy_id: Some(proxy.id.clone()),
+        matched_proxy_name: proxy.name.clone(),
+        backend_target_url: Some(strip_query_params(&backend_url)),
+        response_status_code: 101,
+        latency_total_ms: total_ms,
+        latency_gateway_processing_ms: total_ms,
+        latency_backend_ttfb_ms: 0.0,
+        latency_backend_total_ms: 0.0,
+        request_user_agent: ctx.headers.get("user-agent").cloned(),
+        metadata: ctx.metadata.clone(),
+    };
+
+    for plugin in plugins.iter() {
+        plugin.log(&summary).await;
+    }
 
     // Create the upgrade response with proper headers
     let upgrade_response = Response::builder()
@@ -563,32 +593,19 @@ async fn handle_websocket_request_authenticated(
         .body(ProxyBody::empty())
         .unwrap();
 
-    // Collect client headers to forward to backend
-    let client_headers = collect_forwardable_headers(&parts.headers);
-
-    // Spawn the WebSocket proxying task
-    let proxy_clone = proxy.clone();
-    let env_config = state.env_config.clone();
-    let backend_url_for_spawn = backend_url.clone();
+    // Spawn bidirectional forwarding task (awaits client upgrade, then proxies)
+    let proxy_id = proxy.id.clone();
     tokio::spawn(async move {
         match on_upgrade.await {
             Ok(upgraded) => {
-                if let Err(e) = handle_websocket_proxying(
-                    upgraded,
-                    &backend_url_for_spawn,
-                    &proxy_clone,
-                    &env_config,
-                    &client_headers,
-                )
-                .await
-                {
-                    error!("WebSocket proxying error for {}: {}", proxy_clone.id, e);
+                if let Err(e) = run_websocket_proxy(upgraded, backend_ws_stream, &proxy_id).await {
+                    error!("WebSocket proxying error for {}: {}", proxy_id, e);
                 }
             }
             Err(e) => {
                 error!(
                     "Failed to upgrade WebSocket connection for {}: {}",
-                    proxy_clone.id, e
+                    proxy_id, e
                 );
             }
         }
@@ -818,35 +835,23 @@ impl rustls::client::danger::ServerCertVerifier for NoVerifier {
     }
 }
 
-/// Handle actual WebSocket proxying after connection upgrade
-async fn handle_websocket_proxying(
-    upgraded: Upgraded,
+/// Connect to backend WebSocket server before sending 101 to client.
+/// Returns the connected backend stream, or an error if the backend is unreachable.
+async fn connect_websocket_backend(
     backend_url: &str,
     proxy: &Proxy,
     env_config: &crate::config::EnvConfig,
     client_headers: &[(String, String)],
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    info!(
-        "Starting WebSocket proxying for {} to backend: {}",
-        proxy.id, backend_url
-    );
-
-    // WebSocket configuration with frame/message size limits
+) -> Result<
+    WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    Box<dyn std::error::Error + Send + Sync>,
+> {
     let ws_config = WebSocketConfig {
-        max_frame_size: Some(16 << 20),   // 16 MiB max frame size
-        max_message_size: Some(64 << 20), // 64 MiB max message size
+        max_frame_size: Some(16 << 20),
+        max_message_size: Some(64 << 20),
         ..Default::default()
     };
 
-    // Convert the upgraded connection to a WebSocket stream
-    let ws_stream = WebSocketStream::from_raw_socket(
-        TokioIo::new(upgraded),
-        tokio_tungstenite::tungstenite::protocol::Role::Server,
-        Some(ws_config),
-    )
-    .await;
-
-    // Build a tungstenite HTTP request with forwarded client headers
     let mut ws_request = backend_url.into_client_request()?;
     for (name, value) in client_headers {
         if let (Ok(header_name), Ok(header_value)) = (
@@ -857,10 +862,7 @@ async fn handle_websocket_proxying(
         }
     }
 
-    // Build TLS connector that respects proxy-level settings
     let connector = build_websocket_tls_connector(proxy, env_config);
-
-    // Connect to backend with timeout
     let connect_timeout = std::time::Duration::from_millis(proxy.backend_connect_timeout_ms);
     let connect_future =
         connect_async_tls_with_config(ws_request, Some(ws_config), false, connector);
@@ -879,6 +881,28 @@ async fn handle_websocket_proxying(
 
     info!("Connected to backend WebSocket server: {}", backend_url);
     debug!("Backend response status: {}", backend_response.status());
+
+    Ok(backend_ws_stream)
+}
+
+/// Run bidirectional WebSocket proxying between upgraded client and connected backend.
+async fn run_websocket_proxy(
+    upgraded: Upgraded,
+    backend_ws_stream: WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    proxy_id: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let ws_config = WebSocketConfig {
+        max_frame_size: Some(16 << 20),
+        max_message_size: Some(64 << 20),
+        ..Default::default()
+    };
+
+    let ws_stream = WebSocketStream::from_raw_socket(
+        TokioIo::new(upgraded),
+        tokio_tungstenite::tungstenite::protocol::Role::Server,
+        Some(ws_config),
+    )
+    .await;
 
     // Split streams for bidirectional communication
     let (mut ws_sink, mut ws_stream) = ws_stream.split();
@@ -990,7 +1014,7 @@ async fn handle_websocket_proxying(
         }
     }
 
-    info!("WebSocket proxy connection closed for {}", proxy.id);
+    info!("WebSocket proxy connection closed for {}", proxy_id);
     Ok(())
 }
 

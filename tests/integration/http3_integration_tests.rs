@@ -161,6 +161,7 @@ fn create_http3_test_env_config() -> EnvConfig {
         tls_prefer_server_cipher_order: true,
         tls_curves: None,
         trusted_proxies: String::new(),
+        dns_cache_max_size: 10_000,
         real_ip_header: None,
     }
 }

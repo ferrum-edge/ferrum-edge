@@ -54,6 +54,8 @@ pub struct DnsConfig {
     pub stale_ttl_seconds: u64,
     /// TTL (seconds) for caching DNS errors and empty responses.
     pub error_ttl_seconds: u64,
+    /// Maximum number of entries in the DNS cache. Entries are evicted when this limit is reached.
+    pub max_cache_size: usize,
 }
 
 impl Default for DnsConfig {
@@ -67,6 +69,7 @@ impl Default for DnsConfig {
             valid_ttl_override: None,
             stale_ttl_seconds: 3600,
             error_ttl_seconds: 1,
+            max_cache_size: 10_000,
         }
     }
 }
@@ -96,6 +99,7 @@ pub struct DnsCache {
     valid_ttl_override: Option<Duration>,
     stale_ttl: Duration,
     error_ttl: Duration,
+    max_cache_size: usize,
 }
 
 impl DnsCache {
@@ -113,6 +117,7 @@ impl DnsCache {
             valid_ttl_override: config.valid_ttl_override.map(Duration::from_secs),
             stale_ttl: Duration::from_secs(config.stale_ttl_seconds),
             error_ttl: Duration::from_secs(config.error_ttl_seconds),
+            max_cache_size: config.max_cache_size,
         }
     }
 
@@ -387,6 +392,39 @@ impl DnsCache {
             .unwrap_or(false)
     }
 
+    /// Evict expired entries and enforce max cache size.
+    /// Removes entries past their stale deadline first, then evicts oldest
+    /// entries (by expiration time) if still over capacity.
+    pub fn evict_expired(&self) {
+        let now = Instant::now();
+
+        // Phase 1: Remove all entries past their stale deadline (fully expired)
+        self.cache.retain(|_, entry| entry.stale_deadline > now);
+
+        // Phase 2: If still over capacity, evict oldest entries by expires_at
+        if self.cache.len() > self.max_cache_size {
+            let target_size = self.max_cache_size * 3 / 4; // Evict to 75% capacity
+            let mut entries: Vec<(String, Instant)> = self
+                .cache
+                .iter()
+                .map(|e| (e.key().clone(), e.expires_at))
+                .collect();
+            // Sort by expires_at ascending (oldest first)
+            entries.sort_by_key(|(_, expires)| *expires);
+
+            let to_remove = self.cache.len().saturating_sub(target_size);
+            for (hostname, _) in entries.into_iter().take(to_remove) {
+                self.cache.remove(&hostname);
+            }
+
+            debug!(
+                "DNS cache eviction: trimmed to {} entries (max: {})",
+                self.cache.len(),
+                self.max_cache_size
+            );
+        }
+    }
+
     /// Start a background task that proactively refreshes cache entries before
     /// they expire. Entries are refreshed when they reach 75% of their TTL,
     /// keeping DNS resolution out of the hot request path.
@@ -399,6 +437,9 @@ impl DnsCache {
 
             loop {
                 interval.tick().await;
+
+                // Evict expired entries and enforce max cache size
+                cache.evict_expired();
 
                 // Collect entries that are nearing expiration (past 75% of TTL)
                 let now = Instant::now();

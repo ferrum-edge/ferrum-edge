@@ -96,6 +96,7 @@ fn create_test_env_config() -> EnvConfig {
         tls_prefer_server_cipher_order: true,
         tls_curves: None,
         trusted_proxies: String::new(),
+        dns_cache_max_size: 10_000,
         real_ip_header: None,
     }
 }
@@ -164,6 +165,7 @@ fn create_proxy_state() -> ProxyState {
         valid_ttl_override: None,
         stale_ttl_seconds: 3600,
         error_ttl_seconds: 1,
+        max_cache_size: 10_000,
     });
     let env_config = create_test_env_config();
     ProxyState::new(GatewayConfig::default(), dns_cache, env_config)

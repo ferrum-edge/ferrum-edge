@@ -53,6 +53,13 @@ impl DatabaseStore {
             .connect(&final_url)
             .await?;
 
+        // Enable foreign key enforcement for SQLite (off by default)
+        if db_type == "sqlite" {
+            sqlx::query("PRAGMA foreign_keys = ON")
+                .execute(&pool)
+                .await?;
+        }
+
         let store = Self {
             pool,
             db_type: db_type.to_string(),
@@ -182,83 +189,29 @@ impl DatabaseStore {
             .fetch_all(&self.pool)
             .await?;
 
+        // Batch-load all proxy_plugins in one query (eliminates N+1)
+        let assoc_rows: Vec<AnyRow> =
+            sqlx::query("SELECT proxy_id, plugin_config_id FROM proxy_plugins")
+                .fetch_all(&self.pool)
+                .await
+                .unwrap_or_default();
+
+        let mut plugins_by_proxy: std::collections::HashMap<String, Vec<PluginAssociation>> =
+            std::collections::HashMap::new();
+        for r in &assoc_rows {
+            let proxy_id: String = r.try_get("proxy_id").unwrap_or_default();
+            let plugin_config_id: String = r.try_get("plugin_config_id").unwrap_or_default();
+            plugins_by_proxy
+                .entry(proxy_id)
+                .or_default()
+                .push(PluginAssociation { plugin_config_id });
+        }
+
         let mut proxies = Vec::new();
         for row in rows {
             let id: String = row.try_get("id")?;
-
-            // Load proxy plugin associations
-            let assoc_rows: Vec<AnyRow> =
-                sqlx::query("SELECT plugin_config_id FROM proxy_plugins WHERE proxy_id = ?")
-                    .bind(&id)
-                    .fetch_all(&self.pool)
-                    .await
-                    .unwrap_or_default();
-
-            let plugins: Vec<PluginAssociation> = assoc_rows
-                .iter()
-                .map(|r| PluginAssociation {
-                    plugin_config_id: r.try_get("plugin_config_id").unwrap_or_default(),
-                })
-                .collect();
-
-            let proto_str: String = row.try_get("backend_protocol").unwrap_or("http".into());
-            let auth_mode_str: String = row.try_get("auth_mode").unwrap_or("single".into());
-
-            proxies.push(Proxy {
-                id,
-                name: row.try_get("name").ok(),
-                listen_path: row.try_get("listen_path")?,
-                backend_protocol: parse_protocol(&proto_str),
-                backend_host: row.try_get("backend_host")?,
-                backend_port: row
-                    .try_get::<i32, _>("backend_port")
-                    .map(|v| v as u16)
-                    .unwrap_or(80),
-                backend_path: row.try_get("backend_path").ok(),
-                strip_listen_path: row.try_get::<i32, _>("strip_listen_path").unwrap_or(1) != 0,
-                preserve_host_header: row.try_get::<i32, _>("preserve_host_header").unwrap_or(0)
-                    != 0,
-                backend_connect_timeout_ms: row
-                    .try_get::<i64, _>("backend_connect_timeout_ms")
-                    .unwrap_or(5000) as u64,
-                backend_read_timeout_ms: row
-                    .try_get::<i64, _>("backend_read_timeout_ms")
-                    .unwrap_or(30000) as u64,
-                backend_write_timeout_ms: row
-                    .try_get::<i64, _>("backend_write_timeout_ms")
-                    .unwrap_or(30000) as u64,
-                backend_tls_client_cert_path: row.try_get("backend_tls_client_cert_path").ok(),
-                backend_tls_client_key_path: row.try_get("backend_tls_client_key_path").ok(),
-                backend_tls_verify_server_cert: row
-                    .try_get::<i32, _>("backend_tls_verify_server_cert")
-                    .unwrap_or(1)
-                    != 0,
-                backend_tls_server_ca_cert_path: row
-                    .try_get("backend_tls_server_ca_cert_path")
-                    .ok(),
-                dns_override: row.try_get("dns_override").ok(),
-                dns_cache_ttl_seconds: row
-                    .try_get::<i64, _>("dns_cache_ttl_seconds")
-                    .ok()
-                    .map(|v| v as u64),
-                auth_mode: parse_auth_mode(&auth_mode_str),
-                plugins,
-                // Load balancing
-                upstream_id: row.try_get::<String, _>("upstream_id").ok(),
-                circuit_breaker: None,
-                retry: None,
-                response_body_mode: crate::config::types::ResponseBodyMode::default(),
-                // Connection pooling settings - None to use global defaults
-                pool_max_idle_per_host: None,
-                pool_idle_timeout_seconds: None,
-                pool_enable_http_keep_alive: None,
-                pool_enable_http2: None,
-                pool_tcp_keepalive_seconds: None,
-                pool_http2_keep_alive_interval_seconds: None,
-                pool_http2_keep_alive_timeout_seconds: None,
-                created_at: Utc::now(),
-                updated_at: Utc::now(),
-            });
+            let plugins = plugins_by_proxy.remove(&id).unwrap_or_default();
+            proxies.push(row_to_proxy(&row, id, plugins)?);
         }
 
         Ok(proxies)
@@ -271,17 +224,7 @@ impl DatabaseStore {
 
         let mut consumers = Vec::new();
         for row in rows {
-            let creds_str: String = row.try_get("credentials").unwrap_or("{}".into());
-            let credentials = serde_json::from_str(&creds_str).unwrap_or_default();
-
-            consumers.push(Consumer {
-                id: row.try_get("id")?,
-                username: row.try_get("username")?,
-                custom_id: row.try_get("custom_id").ok(),
-                credentials,
-                created_at: Utc::now(),
-                updated_at: Utc::now(),
-            });
+            consumers.push(row_to_consumer(&row)?);
         }
 
         Ok(consumers)
@@ -294,24 +237,7 @@ impl DatabaseStore {
 
         let mut configs = Vec::new();
         for row in rows {
-            let config_str: String = row.try_get("config").unwrap_or("{}".into());
-            let config_val = serde_json::from_str(&config_str).unwrap_or(serde_json::Value::Null);
-            let scope_str: String = row.try_get("scope").unwrap_or("global".into());
-
-            configs.push(PluginConfig {
-                id: row.try_get("id")?,
-                plugin_name: row.try_get("plugin_name")?,
-                config: config_val,
-                scope: if scope_str == "proxy" {
-                    PluginScope::Proxy
-                } else {
-                    PluginScope::Global
-                },
-                proxy_id: row.try_get("proxy_id").ok(),
-                enabled: row.try_get::<i32, _>("enabled").unwrap_or(1) != 0,
-                created_at: Utc::now(),
-                updated_at: Utc::now(),
-            });
+            configs.push(row_to_plugin_config(&row)?);
         }
 
         Ok(configs)
@@ -371,16 +297,70 @@ impl DatabaseStore {
     }
 
     pub async fn delete_proxy(&self, id: &str) -> Result<bool, anyhow::Error> {
+        // Look up the proxy's upstream_id before deleting so we can cascade-delete
+        // the upstream if it becomes orphaned.
+        let upstream_id: Option<String> =
+            sqlx::query("SELECT upstream_id FROM proxies WHERE id = ?")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?
+                .and_then(|row| row.try_get::<String, _>("upstream_id").ok());
+
+        // Clean up junction table (defense in depth alongside ON DELETE CASCADE)
+        sqlx::query("DELETE FROM proxy_plugins WHERE proxy_id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+
         let result = sqlx::query("DELETE FROM proxies WHERE id = ?")
             .bind(id)
             .execute(&self.pool)
             .await?;
-        Ok(result.rows_affected() > 0)
+
+        if result.rows_affected() == 0 {
+            return Ok(false);
+        }
+
+        // If the proxy had an upstream, check if it's now orphaned and delete it
+        if let Some(ref uid) = upstream_id
+            && !self.is_upstream_referenced(uid).await?
+        {
+            info!("Cascade-deleting orphaned upstream {}", uid);
+            sqlx::query("DELETE FROM upstreams WHERE id = ?")
+                .bind(uid)
+                .execute(&self.pool)
+                .await?;
+        }
+
+        Ok(true)
     }
 
     pub async fn get_proxy(&self, id: &str) -> Result<Option<Proxy>, anyhow::Error> {
-        let proxies = self.load_proxies().await?;
-        Ok(proxies.into_iter().find(|p| p.id == id))
+        let row: Option<AnyRow> = sqlx::query("SELECT * FROM proxies WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+
+        let row = match row {
+            Some(r) => r,
+            None => return Ok(None),
+        };
+
+        let assoc_rows: Vec<AnyRow> =
+            sqlx::query("SELECT plugin_config_id FROM proxy_plugins WHERE proxy_id = ?")
+                .bind(id)
+                .fetch_all(&self.pool)
+                .await
+                .unwrap_or_default();
+
+        let plugins: Vec<PluginAssociation> = assoc_rows
+            .iter()
+            .map(|r| PluginAssociation {
+                plugin_config_id: r.try_get("plugin_config_id").unwrap_or_default(),
+            })
+            .collect();
+
+        Ok(Some(row_to_proxy(&row, id.to_string(), plugins)?))
     }
 
     pub async fn create_consumer(&self, consumer: &Consumer) -> Result<(), anyhow::Error> {
@@ -425,8 +405,15 @@ impl DatabaseStore {
     }
 
     pub async fn get_consumer(&self, id: &str) -> Result<Option<Consumer>, anyhow::Error> {
-        let consumers = self.load_consumers().await?;
-        Ok(consumers.into_iter().find(|c| c.id == id))
+        let row: Option<AnyRow> = sqlx::query("SELECT * FROM consumers WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+
+        match row {
+            Some(r) => Ok(Some(row_to_consumer(&r)?)),
+            None => Ok(None),
+        }
     }
 
     pub async fn create_plugin_config(&self, pc: &PluginConfig) -> Result<(), anyhow::Error> {
@@ -475,6 +462,11 @@ impl DatabaseStore {
     }
 
     pub async fn delete_plugin_config(&self, id: &str) -> Result<bool, anyhow::Error> {
+        // Clean up junction table (defense in depth alongside ON DELETE CASCADE)
+        sqlx::query("DELETE FROM proxy_plugins WHERE plugin_config_id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
         let result = sqlx::query("DELETE FROM plugin_configs WHERE id = ?")
             .bind(id)
             .execute(&self.pool)
@@ -483,8 +475,15 @@ impl DatabaseStore {
     }
 
     pub async fn get_plugin_config(&self, id: &str) -> Result<Option<PluginConfig>, anyhow::Error> {
-        let configs = self.load_plugin_configs().await?;
-        Ok(configs.into_iter().find(|c| c.id == id))
+        let row: Option<AnyRow> = sqlx::query("SELECT * FROM plugin_configs WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+
+        match row {
+            Some(r) => Ok(Some(row_to_plugin_config(&r)?)),
+            None => Ok(None),
+        }
     }
 
     // ---- Upstream CRUD ----
@@ -496,29 +495,7 @@ impl DatabaseStore {
 
         let mut upstreams = Vec::new();
         for row in rows {
-            let targets_str: String = row.try_get("targets").unwrap_or("[]".into());
-            let targets: Vec<UpstreamTarget> =
-                serde_json::from_str(&targets_str).unwrap_or_default();
-
-            let algo_str: String = row.try_get("algorithm").unwrap_or("round_robin".into());
-            let algorithm: LoadBalancerAlgorithm =
-                serde_json::from_value(serde_json::Value::String(algo_str)).unwrap_or_default();
-
-            let health_checks: Option<HealthCheckConfig> = row
-                .try_get::<String, _>("health_checks")
-                .ok()
-                .and_then(|s| serde_json::from_str(&s).ok());
-
-            upstreams.push(Upstream {
-                id: row.try_get("id")?,
-                name: row.try_get("name").ok(),
-                targets,
-                algorithm,
-                hash_on: row.try_get("hash_on").ok(),
-                health_checks,
-                created_at: Utc::now(),
-                updated_at: Utc::now(),
-            });
+            upstreams.push(row_to_upstream(&row)?);
         }
 
         Ok(upstreams)
@@ -578,7 +555,16 @@ impl DatabaseStore {
         Ok(())
     }
 
+    /// Delete an upstream only if it is not referenced by any proxy.
+    /// Returns `Err` if the upstream is still in use.
     pub async fn delete_upstream(&self, id: &str) -> Result<bool, anyhow::Error> {
+        if self.is_upstream_referenced(id).await? {
+            anyhow::bail!(
+                "Upstream {} is referenced by one or more proxies and cannot be deleted",
+                id
+            );
+        }
+
         let result = sqlx::query("DELETE FROM upstreams WHERE id = ?")
             .bind(id)
             .execute(&self.pool)
@@ -586,9 +572,44 @@ impl DatabaseStore {
         Ok(result.rows_affected() > 0)
     }
 
+    /// Check if any proxy references this upstream via upstream_id.
+    pub async fn is_upstream_referenced(&self, upstream_id: &str) -> Result<bool, anyhow::Error> {
+        let rows: Vec<AnyRow> = sqlx::query("SELECT id FROM proxies WHERE upstream_id = ? LIMIT 1")
+            .bind(upstream_id)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(!rows.is_empty())
+    }
+
+    /// When a proxy changes its upstream_id, clean up the old upstream if it
+    /// became orphaned (no other proxies reference it).
+    pub async fn cleanup_orphaned_upstream(
+        &self,
+        old_upstream_id: &str,
+    ) -> Result<(), anyhow::Error> {
+        if !self.is_upstream_referenced(old_upstream_id).await? {
+            info!(
+                "Cleaning up orphaned upstream {} after proxy reassignment",
+                old_upstream_id
+            );
+            sqlx::query("DELETE FROM upstreams WHERE id = ?")
+                .bind(old_upstream_id)
+                .execute(&self.pool)
+                .await?;
+        }
+        Ok(())
+    }
+
     pub async fn get_upstream(&self, id: &str) -> Result<Option<Upstream>, anyhow::Error> {
-        let upstreams = self.load_upstreams().await?;
-        Ok(upstreams.into_iter().find(|u| u.id == id))
+        let row: Option<AnyRow> = sqlx::query("SELECT * FROM upstreams WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+
+        match row {
+            Some(r) => Ok(Some(row_to_upstream(&r)?)),
+            None => Ok(None),
+        }
     }
 
     pub async fn check_listen_path_unique(
@@ -636,4 +657,128 @@ fn parse_auth_mode(s: &str) -> AuthMode {
         "multi" => AuthMode::Multi,
         _ => AuthMode::Single,
     }
+}
+
+/// Parse a proxy row into a Proxy struct (shared by load_proxies and get_proxy).
+fn row_to_proxy(
+    row: &AnyRow,
+    id: String,
+    plugins: Vec<PluginAssociation>,
+) -> Result<Proxy, anyhow::Error> {
+    let proto_str: String = row.try_get("backend_protocol").unwrap_or("http".into());
+    let auth_mode_str: String = row.try_get("auth_mode").unwrap_or("single".into());
+
+    Ok(Proxy {
+        id,
+        name: row.try_get("name").ok(),
+        listen_path: row.try_get("listen_path")?,
+        backend_protocol: parse_protocol(&proto_str),
+        backend_host: row.try_get("backend_host")?,
+        backend_port: row
+            .try_get::<i32, _>("backend_port")
+            .map(|v| v as u16)
+            .unwrap_or(80),
+        backend_path: row.try_get("backend_path").ok(),
+        strip_listen_path: row.try_get::<i32, _>("strip_listen_path").unwrap_or(1) != 0,
+        preserve_host_header: row.try_get::<i32, _>("preserve_host_header").unwrap_or(0) != 0,
+        backend_connect_timeout_ms: row
+            .try_get::<i64, _>("backend_connect_timeout_ms")
+            .unwrap_or(5000) as u64,
+        backend_read_timeout_ms: row
+            .try_get::<i64, _>("backend_read_timeout_ms")
+            .unwrap_or(30000) as u64,
+        backend_write_timeout_ms: row
+            .try_get::<i64, _>("backend_write_timeout_ms")
+            .unwrap_or(30000) as u64,
+        backend_tls_client_cert_path: row.try_get("backend_tls_client_cert_path").ok(),
+        backend_tls_client_key_path: row.try_get("backend_tls_client_key_path").ok(),
+        backend_tls_verify_server_cert: row
+            .try_get::<i32, _>("backend_tls_verify_server_cert")
+            .unwrap_or(1)
+            != 0,
+        backend_tls_server_ca_cert_path: row.try_get("backend_tls_server_ca_cert_path").ok(),
+        dns_override: row.try_get("dns_override").ok(),
+        dns_cache_ttl_seconds: row
+            .try_get::<i64, _>("dns_cache_ttl_seconds")
+            .ok()
+            .map(|v| v as u64),
+        auth_mode: parse_auth_mode(&auth_mode_str),
+        plugins,
+        upstream_id: row.try_get::<String, _>("upstream_id").ok(),
+        circuit_breaker: None,
+        retry: None,
+        response_body_mode: crate::config::types::ResponseBodyMode::default(),
+        pool_max_idle_per_host: None,
+        pool_idle_timeout_seconds: None,
+        pool_enable_http_keep_alive: None,
+        pool_enable_http2: None,
+        pool_tcp_keepalive_seconds: None,
+        pool_http2_keep_alive_interval_seconds: None,
+        pool_http2_keep_alive_timeout_seconds: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    })
+}
+
+/// Parse a consumer row into a Consumer struct.
+fn row_to_consumer(row: &AnyRow) -> Result<Consumer, anyhow::Error> {
+    let creds_str: String = row.try_get("credentials").unwrap_or("{}".into());
+    let credentials = serde_json::from_str(&creds_str).unwrap_or_default();
+
+    Ok(Consumer {
+        id: row.try_get("id")?,
+        username: row.try_get("username")?,
+        custom_id: row.try_get("custom_id").ok(),
+        credentials,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    })
+}
+
+/// Parse a plugin_config row into a PluginConfig struct.
+fn row_to_plugin_config(row: &AnyRow) -> Result<PluginConfig, anyhow::Error> {
+    let config_str: String = row.try_get("config").unwrap_or("{}".into());
+    let config_val = serde_json::from_str(&config_str).unwrap_or(serde_json::Value::Null);
+    let scope_str: String = row.try_get("scope").unwrap_or("global".into());
+
+    Ok(PluginConfig {
+        id: row.try_get("id")?,
+        plugin_name: row.try_get("plugin_name")?,
+        config: config_val,
+        scope: if scope_str == "proxy" {
+            PluginScope::Proxy
+        } else {
+            PluginScope::Global
+        },
+        proxy_id: row.try_get("proxy_id").ok(),
+        enabled: row.try_get::<i32, _>("enabled").unwrap_or(1) != 0,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    })
+}
+
+/// Parse an upstream row into an Upstream struct.
+fn row_to_upstream(row: &AnyRow) -> Result<Upstream, anyhow::Error> {
+    let targets_str: String = row.try_get("targets").unwrap_or("[]".into());
+    let targets: Vec<UpstreamTarget> = serde_json::from_str(&targets_str).unwrap_or_default();
+
+    let algo_str: String = row.try_get("algorithm").unwrap_or("round_robin".into());
+    let algorithm: LoadBalancerAlgorithm =
+        serde_json::from_value(serde_json::Value::String(algo_str)).unwrap_or_default();
+
+    let health_checks: Option<HealthCheckConfig> = row
+        .try_get::<String, _>("health_checks")
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok());
+
+    Ok(Upstream {
+        id: row.try_get("id")?,
+        name: row.try_get("name").ok(),
+        targets,
+        algorithm,
+        hash_on: row.try_get("hash_on").ok(),
+        health_checks,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    })
 }

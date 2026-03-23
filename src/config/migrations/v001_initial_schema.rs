@@ -16,12 +16,45 @@ impl Migration for V001InitialSchema {
     }
 
     fn checksum(&self) -> &str {
-        "v001_initial_schema_a1b2c3d4"
+        "v001_initial_schema_fk_constraints"
     }
 }
 
 impl V001InitialSchema {
-    pub async fn up(&self, pool: &AnyPool, _db_type: &str) -> Result<(), anyhow::Error> {
+    pub async fn up(&self, pool: &AnyPool, db_type: &str) -> Result<(), anyhow::Error> {
+        // Enable foreign key enforcement for SQLite (off by default)
+        if db_type == "sqlite" {
+            sqlx::query("PRAGMA foreign_keys = ON")
+                .execute(pool)
+                .await?;
+        }
+
+        // Upstreams must be created first (referenced by proxies)
+        let create_upstreams = r#"
+            CREATE TABLE IF NOT EXISTS upstreams (
+                id TEXT PRIMARY KEY,
+                name TEXT,
+                targets TEXT NOT NULL DEFAULT '[]',
+                algorithm TEXT NOT NULL DEFAULT 'round_robin',
+                hash_on TEXT,
+                health_checks TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+        "#;
+
+        let create_consumers = r#"
+            CREATE TABLE IF NOT EXISTS consumers (
+                id TEXT PRIMARY KEY,
+                username TEXT NOT NULL UNIQUE,
+                custom_id TEXT,
+                credentials TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+        "#;
+
+        // Proxies reference upstreams via FK
         let create_proxies = r#"
             CREATE TABLE IF NOT EXISTS proxies (
                 id TEXT PRIMARY KEY,
@@ -43,62 +76,40 @@ impl V001InitialSchema {
                 dns_override TEXT,
                 dns_cache_ttl_seconds INTEGER,
                 auth_mode TEXT NOT NULL DEFAULT 'single',
-                upstream_id TEXT,
+                upstream_id TEXT REFERENCES upstreams(id) ON DELETE RESTRICT,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             )
         "#;
 
-        let create_consumers = r#"
-            CREATE TABLE IF NOT EXISTS consumers (
-                id TEXT PRIMARY KEY,
-                username TEXT NOT NULL UNIQUE,
-                custom_id TEXT,
-                credentials TEXT NOT NULL DEFAULT '{}',
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-            )
-        "#;
-
+        // Plugin configs reference proxies via FK (proxy-scoped plugins cascade on proxy delete)
         let create_plugin_configs = r#"
             CREATE TABLE IF NOT EXISTS plugin_configs (
                 id TEXT PRIMARY KEY,
                 plugin_name TEXT NOT NULL,
                 config TEXT NOT NULL DEFAULT '{}',
                 scope TEXT NOT NULL DEFAULT 'global',
-                proxy_id TEXT,
+                proxy_id TEXT REFERENCES proxies(id) ON DELETE CASCADE,
                 enabled INTEGER NOT NULL DEFAULT 1,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             )
         "#;
 
+        // Junction table with FKs to both proxies and plugin_configs
         let create_proxy_plugins = r#"
             CREATE TABLE IF NOT EXISTS proxy_plugins (
-                proxy_id TEXT NOT NULL,
-                plugin_config_id TEXT NOT NULL,
+                proxy_id TEXT NOT NULL REFERENCES proxies(id) ON DELETE CASCADE,
+                plugin_config_id TEXT NOT NULL REFERENCES plugin_configs(id) ON DELETE CASCADE,
                 PRIMARY KEY (proxy_id, plugin_config_id)
             )
         "#;
 
-        let create_upstreams = r#"
-            CREATE TABLE IF NOT EXISTS upstreams (
-                id TEXT PRIMARY KEY,
-                name TEXT,
-                targets TEXT NOT NULL DEFAULT '[]',
-                algorithm TEXT NOT NULL DEFAULT 'round_robin',
-                hash_on TEXT,
-                health_checks TEXT,
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-            )
-        "#;
-
-        sqlx::query(create_proxies).execute(pool).await?;
+        sqlx::query(create_upstreams).execute(pool).await?;
         sqlx::query(create_consumers).execute(pool).await?;
+        sqlx::query(create_proxies).execute(pool).await?;
         sqlx::query(create_plugin_configs).execute(pool).await?;
         sqlx::query(create_proxy_plugins).execute(pool).await?;
-        sqlx::query(create_upstreams).execute(pool).await?;
 
         Ok(())
     }

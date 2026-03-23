@@ -106,6 +106,8 @@ pub struct EnvConfig {
     pub dns_stale_ttl: u64,
     /// TTL (seconds) for errors/empty responses. Default: 1
     pub dns_error_ttl: u64,
+    /// Maximum number of entries in the DNS cache. Default: 10000
+    pub dns_cache_max_size: usize,
 
     /// Path to a PEM file containing trusted CA certificates for backend TLS verification
     pub backend_tls_ca_bundle_path: Option<String>,
@@ -208,6 +210,7 @@ impl Default for EnvConfig {
             dns_valid_ttl: None,
             dns_stale_ttl: 3600,
             dns_error_ttl: 1,
+            dns_cache_max_size: 10_000,
             backend_tls_ca_bundle_path: None,
             backend_tls_client_cert_path: None,
             backend_tls_client_key_path: None,
@@ -300,6 +303,10 @@ impl EnvConfig {
                 .and_then(|v| v.parse().ok()),
             dns_stale_ttl: parse_env_u64("FERRUM_DNS_STALE_TTL", 3600),
             dns_error_ttl: parse_env_u64("FERRUM_DNS_ERROR_TTL", 1),
+            dns_cache_max_size: env::var("FERRUM_DNS_CACHE_MAX_SIZE")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(10_000),
 
             // Global Backend mTLS
             backend_tls_ca_bundle_path: env::var("FERRUM_BACKEND_TLS_CA_BUNDLE_PATH").ok(),

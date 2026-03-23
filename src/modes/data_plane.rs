@@ -24,6 +24,7 @@ pub async fn run(
         valid_ttl_override: env_config.dns_valid_ttl,
         stale_ttl_seconds: env_config.dns_stale_ttl,
         error_ttl_seconds: env_config.dns_error_ttl,
+        max_cache_size: env_config.dns_cache_max_size,
     });
 
     // Start with empty config; CP will push the real one via gRPC

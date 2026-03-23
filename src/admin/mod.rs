@@ -538,8 +538,23 @@ async fn handle_update_proxy(
         }
     }
 
+    // Capture the old upstream_id before update so we can clean up if it changes
+    let old_upstream_id: Option<String> = match db.get_proxy(id).await {
+        Ok(Some(old_proxy)) => old_proxy.upstream_id,
+        _ => None,
+    };
+
     match db.update_proxy(&proxy).await {
-        Ok(_) => Ok(json_response(StatusCode::OK, &json!(proxy))),
+        Ok(_) => {
+            // If upstream_id changed, clean up the old upstream if it became orphaned
+            if let Some(ref old_uid) = old_upstream_id
+                && proxy.upstream_id.as_deref() != Some(old_uid.as_str())
+                && let Err(e) = db.cleanup_orphaned_upstream(old_uid).await
+            {
+                warn!("Failed to clean up orphaned upstream {}: {}", old_uid, e);
+            }
+            Ok(json_response(StatusCode::OK, &json!(proxy)))
+        }
         Err(e) => Ok(json_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             &json!({"error": format!("{}", e)}),
@@ -1310,6 +1325,10 @@ async fn handle_delete_upstream(
         Ok(false) => Ok(json_response(
             StatusCode::NOT_FOUND,
             &json!({"error": "Upstream not found"}),
+        )),
+        Err(e) if e.to_string().contains("referenced by one or more proxies") => Ok(json_response(
+            StatusCode::CONFLICT,
+            &json!({"error": format!("{}", e)}),
         )),
         Err(e) => Ok(json_response(
             StatusCode::SERVICE_UNAVAILABLE,

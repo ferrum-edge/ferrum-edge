@@ -26,6 +26,7 @@ Ferrum Gateway includes a full-featured DNS resolver built on [hickory-resolver]
 | `FERRUM_DNS_VALID_TTL` | `u64` | Response TTL | Override TTL (seconds) for positive DNS records. When set, all successful lookups use this fixed TTL regardless of the DNS response TTL. |
 | `FERRUM_DNS_STALE_TTL` | `u64` | `3600` | How long (seconds) stale cached data can be served while a background refresh is in progress. See [Stale-While-Revalidate](#stale-while-revalidate). |
 | `FERRUM_DNS_ERROR_TTL` | `u64` | `1` | TTL (seconds) for caching DNS errors and empty responses. Prevents hammering DNS for known-bad hostnames. |
+| `FERRUM_DNS_CACHE_MAX_SIZE` | `usize` | `10000` | Maximum number of entries in the DNS cache. Expired entries are evicted automatically; if the cache still exceeds this limit, oldest entries are removed. |
 
 ### System-Level DNS Settings
 

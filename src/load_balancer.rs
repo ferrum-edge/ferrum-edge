@@ -206,7 +206,9 @@ struct LoadBalancer {
     /// Round-robin counter.
     rr_counter: AtomicU64,
     /// Weighted round-robin state (smooth weighted round-robin).
-    wrr_weights: Vec<AtomicI64>,
+    /// Protected by a mutex to prevent weight drift under concurrency.
+    /// The critical section is sub-microsecond (weight arithmetic only).
+    wrr_state: std::sync::Mutex<Vec<i64>>,
     /// Active connections per target (for least-connections).
     active_connections: DashMap<String, AtomicI64>,
     /// Consistent hash ring (sorted hash values -> target index).
@@ -219,7 +221,7 @@ impl LoadBalancer {
         targets: &[UpstreamTarget],
         _hash_on: Option<String>,
     ) -> Self {
-        let wrr_weights: Vec<AtomicI64> = targets.iter().map(|_| AtomicI64::new(0)).collect();
+        let wrr_weights: Vec<i64> = vec![0; targets.len()];
         // Pre-compute target keys once at build time, not per-request
         let target_keys: Vec<String> = targets.iter().map(target_key).collect();
 
@@ -243,7 +245,7 @@ impl LoadBalancer {
             target_keys,
             algorithm,
             rr_counter: AtomicU64::new(0),
-            wrr_weights,
+            wrr_state: std::sync::Mutex::new(wrr_weights),
             active_connections: DashMap::new(),
             hash_ring,
         }
@@ -375,6 +377,9 @@ impl LoadBalancer {
     }
 
     /// Smooth weighted round-robin (NGINX algorithm).
+    ///
+    /// Uses a mutex to prevent weight drift under concurrent access.
+    /// The critical section is sub-microsecond (only integer arithmetic).
     fn select_wrr(&self, candidates: &[(usize, &UpstreamTarget)]) -> Option<UpstreamTarget> {
         if candidates.is_empty() {
             return None;
@@ -387,14 +392,15 @@ impl LoadBalancer {
             return Some(candidates[idx % candidates.len()].1.clone());
         }
 
+        let mut weights = self.wrr_state.lock().unwrap_or_else(|e| e.into_inner());
+
         // Add effective weight to current weight for each candidate
         let mut best_idx = 0;
         let mut best_current = i64::MIN;
 
         for (i, (orig_idx, target)) in candidates.iter().enumerate() {
-            let current = self.wrr_weights[*orig_idx]
-                .fetch_add(target.weight as i64, Ordering::Relaxed)
-                + target.weight as i64;
+            weights[*orig_idx] += target.weight as i64;
+            let current = weights[*orig_idx];
             if current > best_current {
                 best_current = current;
                 best_idx = i;
@@ -403,7 +409,7 @@ impl LoadBalancer {
 
         // Subtract total weight from the selected candidate
         let (orig_idx, _) = candidates[best_idx];
-        self.wrr_weights[orig_idx].fetch_sub(total_weight, Ordering::Relaxed);
+        weights[orig_idx] -= total_weight;
 
         Some(candidates[best_idx].1.clone())
     }

@@ -74,17 +74,16 @@ impl ConnectionPool {
 
     /// Get or create a client for the given proxy using global defaults + proxy overrides.
     ///
-    /// The pool key is based on proxy-level configuration (host, port, protocol,
-    /// timeouts, TLS, pool settings) — NOT per upstream target. This is correct
-    /// because `reqwest::Client` has its own internal connection pool that keys
-    /// by URL host:port, so different upstream targets automatically get separate
-    /// TCP connections and TLS sessions (with correct SNI) even when sharing
-    /// one `reqwest::Client`.
+    /// For single-backend proxies, the pool key uses `backend_host:backend_port`.
+    /// For upstream-backed proxies, the pool key uses `upstream_id` instead —
+    /// the proxy's `backend_host:port` is ignored since routing is determined
+    /// by the upstream's targets. `reqwest::Client` internally pools TCP
+    /// connections by URL host:port, so different targets within an upstream
+    /// automatically get separate connections and TLS sessions.
     ///
     /// All clients use the gateway's DNS cache as their resolver, so DNS
     /// lookups are served from the warmed cache — never hitting DNS on the
-    /// hot request path. For proxies with `dns_override`, a static resolve
-    /// hint is additionally set on the client.
+    /// hot request path.
     pub async fn get_client(&self, proxy: &Proxy) -> Result<reqwest::Client> {
         // Get effective configuration (global defaults + proxy overrides)
         let config = self.global_config.for_proxy(proxy);
@@ -234,13 +233,19 @@ impl ConnectionPool {
     /// would create 50 separate clients instead of 1.
     fn create_pool_key(&self, proxy: &Proxy, config: &PoolConfig) -> String {
         let override_str = proxy.dns_override.as_deref().unwrap_or_default();
+        // When the proxy uses an upstream for load balancing, key by upstream_id
+        // instead of backend_host:port. The upstream defines the actual targets;
+        // backend_host:port is ignored for routing. reqwest internally pools
+        // TCP connections per URL host:port, so different targets within the
+        // same upstream get separate connections automatically.
+        let destination = if let Some(ref upstream_id) = proxy.upstream_id {
+            format!("upstream:{}", upstream_id)
+        } else {
+            format!("{}:{}", proxy.backend_host, proxy.backend_port)
+        };
         format!(
-            "{}:{}:{}:{}:{}",
-            proxy.backend_host,
-            proxy.backend_port,
-            proxy.backend_protocol as u8,
-            config.max_idle_per_host,
-            override_str
+            "{}:{}:{}:{}",
+            destination, proxy.backend_protocol as u8, config.max_idle_per_host, override_str
         )
     }
 

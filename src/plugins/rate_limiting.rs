@@ -1,26 +1,26 @@
 use async_trait::async_trait;
 use dashmap::DashMap;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::debug;
 
 use super::{Plugin, PluginResult, RequestContext};
 
+/// Sliding window rate limiter. Tracks individual request timestamps within the
+/// window to provide exact counting with zero boundary-burst vulnerability.
 #[derive(Debug)]
-struct RateWindow {
-    count: u64,
-    window_start: Instant,
+struct SlidingWindow {
+    timestamps: VecDeque<Instant>,
     window_duration: Duration,
     limit: u64,
 }
 
-impl RateWindow {
+impl SlidingWindow {
     fn new(limit: u64, duration: Duration) -> Self {
         Self {
-            count: 0,
-            window_start: Instant::now(),
+            timestamps: VecDeque::new(),
             window_duration: duration,
             limit,
         }
@@ -28,12 +28,19 @@ impl RateWindow {
 
     fn check_and_increment(&mut self) -> bool {
         let now = Instant::now();
-        if now.duration_since(self.window_start) >= self.window_duration {
-            self.window_start = now;
-            self.count = 1;
-            true
-        } else if self.count < self.limit {
-            self.count += 1;
+        let window_start = now - self.window_duration;
+
+        // Evict timestamps outside the sliding window
+        while let Some(front) = self.timestamps.front() {
+            if *front < window_start {
+                self.timestamps.pop_front();
+            } else {
+                break;
+            }
+        }
+
+        if (self.timestamps.len() as u64) < self.limit {
+            self.timestamps.push_back(now);
             true
         } else {
             false
@@ -47,7 +54,7 @@ pub struct RateLimiting {
     per_minute: Option<u64>,
     per_hour: Option<u64>,
     // key -> windows (second, minute, hour)
-    state: Arc<DashMap<String, Vec<RateWindow>>>,
+    state: Arc<DashMap<String, Vec<SlidingWindow>>>,
 }
 
 impl RateLimiting {
@@ -103,13 +110,13 @@ impl RateLimiting {
         let mut entry = self.state.entry(key.to_string()).or_insert_with(|| {
             let mut windows = Vec::new();
             if let Some(limit) = self.per_second {
-                windows.push(RateWindow::new(limit, Duration::from_secs(1)));
+                windows.push(SlidingWindow::new(limit, Duration::from_secs(1)));
             }
             if let Some(limit) = self.per_minute {
-                windows.push(RateWindow::new(limit, Duration::from_secs(60)));
+                windows.push(SlidingWindow::new(limit, Duration::from_secs(60)));
             }
             if let Some(limit) = self.per_hour {
-                windows.push(RateWindow::new(limit, Duration::from_secs(3600)));
+                windows.push(SlidingWindow::new(limit, Duration::from_secs(3600)));
             }
             windows
         });
