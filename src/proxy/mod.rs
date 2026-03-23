@@ -1815,8 +1815,6 @@ pub async fn handle_proxy_request(
     }))
 }
 
-
-
 /// Build the backend URL based on proxy config and path forwarding logic.
 pub fn build_backend_url(proxy: &Proxy, incoming_path: &str, query_string: &str) -> String {
     build_backend_url_with_target(

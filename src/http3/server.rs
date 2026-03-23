@@ -344,14 +344,11 @@ async fn handle_h3_request(
                 record_request(&state, 401);
                 let status = StatusCode::UNAUTHORIZED;
                 let mut resp_builder = Response::builder().status(status);
-                resp_builder =
-                    resp_builder.header("content-type", "application/json");
+                resp_builder = resp_builder.header("content-type", "application/json");
                 let resp = resp_builder.body(()).unwrap();
                 stream.send_response(resp).await?;
                 stream
-                    .send_data(Bytes::from(
-                        r#"{"error":"Unauthorized"}"#.as_bytes(),
-                    ))
+                    .send_data(Bytes::from(r#"{"error":"Unauthorized"}"#.as_bytes()))
                     .await?;
                 stream.finish().await?;
                 return Ok(());

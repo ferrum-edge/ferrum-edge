@@ -57,10 +57,12 @@ impl Plugin for ResponseTransformer {
             match rule.operation.as_str() {
                 "add" => {
                     if let Some(ref val) = rule.value {
-                        response_headers.entry(rule.key.to_lowercase()).or_insert_with(|| {
-                            debug!("response_transformer: added header {}={}", rule.key, val);
-                            val.clone()
-                        });
+                        response_headers
+                            .entry(rule.key.to_lowercase())
+                            .or_insert_with(|| {
+                                debug!("response_transformer: added header {}={}", rule.key, val);
+                                val.clone()
+                            });
                     }
                 }
                 "update" => {

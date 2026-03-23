@@ -84,7 +84,9 @@ impl Plugin for RequestTransformer {
                 "query" => match rule.operation.as_str() {
                     "add" => {
                         if let Some(ref val) = rule.value {
-                            ctx.query_params.entry(rule.key.clone()).or_insert_with(|| val.clone());
+                            ctx.query_params
+                                .entry(rule.key.clone())
+                                .or_insert_with(|| val.clone());
                         }
                     }
                     "update" => {

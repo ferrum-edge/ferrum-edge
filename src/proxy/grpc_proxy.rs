@@ -412,7 +412,6 @@ impl GrpcConnectionPool {
             }
         });
     }
-
 }
 
 /// Dangerous: skip TLS certificate verification (for testing or self-signed certs).

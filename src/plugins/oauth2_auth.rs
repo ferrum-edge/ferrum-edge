@@ -101,7 +101,9 @@ impl Plugin for OAuth2Auth {
                                         return PluginResult::Continue;
                                     }
                                     // Token is active but subject not found — reject
-                                    warn!("OAuth2: token active but subject not found in consumers");
+                                    warn!(
+                                        "OAuth2: token active but subject not found in consumers"
+                                    );
                                     return PluginResult::Reject {
                                         status_code: 401,
                                         body: r#"{"error":"Unknown token subject"}"#.into(),
