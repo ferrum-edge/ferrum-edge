@@ -440,7 +440,10 @@ async fn handle_create_proxy(
     }
 
     match db.create_proxy(&proxy).await {
-        Ok(_) => Ok(json_response(StatusCode::CREATED, &json!(proxy))),
+        Ok(_) => {
+            info!(action = "create", resource = "proxy", id = %proxy.id, "Admin API: proxy created");
+            Ok(json_response(StatusCode::CREATED, &json!(proxy)))
+        }
         Err(e) => Ok(json_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             &json!({"error": format!("{}", e)}),
@@ -579,6 +582,7 @@ async fn handle_update_proxy(
             {
                 warn!("Failed to clean up orphaned upstream {}: {}", old_uid, e);
             }
+            info!(action = "update", resource = "proxy", id = %proxy.id, "Admin API: proxy updated");
             Ok(json_response(StatusCode::OK, &json!(proxy)))
         }
         Err(e) => Ok(json_response(
@@ -611,7 +615,10 @@ async fn handle_delete_proxy(
     };
 
     match db.delete_proxy(id).await {
-        Ok(true) => Ok(json_response(StatusCode::NO_CONTENT, &json!({}))),
+        Ok(true) => {
+            info!(action = "delete", resource = "proxy", id = %id, "Admin API: proxy deleted");
+            Ok(json_response(StatusCode::NO_CONTENT, &json!({})))
+        }
         Ok(false) => Ok(json_response(
             StatusCode::NOT_FOUND,
             &json!({"error": "Proxy not found"}),
@@ -709,7 +716,10 @@ async fn handle_create_consumer(
     }
 
     match db.create_consumer(&consumer).await {
-        Ok(_) => Ok(json_response(StatusCode::CREATED, &json!(consumer))),
+        Ok(_) => {
+            info!(action = "create", resource = "consumer", id = %consumer.id, "Admin API: consumer created");
+            Ok(json_response(StatusCode::CREATED, &json!(consumer)))
+        }
         Err(e) => Ok(json_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             &json!({"error": format!("{}", e)}),
@@ -800,7 +810,10 @@ async fn handle_update_consumer(
     }
 
     match db.update_consumer(&consumer).await {
-        Ok(_) => Ok(json_response(StatusCode::OK, &json!(consumer))),
+        Ok(_) => {
+            info!(action = "update", resource = "consumer", id = %consumer.id, "Admin API: consumer updated");
+            Ok(json_response(StatusCode::OK, &json!(consumer)))
+        }
         Err(e) => Ok(json_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             &json!({"error": format!("{}", e)}),
@@ -831,7 +844,10 @@ async fn handle_delete_consumer(
     };
 
     match db.delete_consumer(id).await {
-        Ok(true) => Ok(json_response(StatusCode::NO_CONTENT, &json!({}))),
+        Ok(true) => {
+            info!(action = "delete", resource = "consumer", id = %id, "Admin API: consumer deleted");
+            Ok(json_response(StatusCode::NO_CONTENT, &json!({})))
+        }
         Ok(false) => Ok(json_response(
             StatusCode::NOT_FOUND,
             &json!({"error": "Consumer not found"}),
@@ -1052,7 +1068,10 @@ async fn handle_create_plugin_config(
     pc.updated_at = Utc::now();
 
     match db.create_plugin_config(&pc).await {
-        Ok(_) => Ok(json_response(StatusCode::CREATED, &json!(pc))),
+        Ok(_) => {
+            info!(action = "create", resource = "plugin_config", id = %pc.id, plugin = %pc.plugin_name, "Admin API: plugin config created");
+            Ok(json_response(StatusCode::CREATED, &json!(pc)))
+        }
         Err(e) => Ok(json_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             &json!({"error": format!("{}", e)}),
@@ -1168,7 +1187,10 @@ async fn handle_delete_plugin_config(
     };
 
     match db.delete_plugin_config(id).await {
-        Ok(true) => Ok(json_response(StatusCode::NO_CONTENT, &json!({}))),
+        Ok(true) => {
+            info!(action = "delete", resource = "plugin_config", id = %id, "Admin API: plugin config deleted");
+            Ok(json_response(StatusCode::NO_CONTENT, &json!({})))
+        }
         Ok(false) => Ok(json_response(
             StatusCode::NOT_FOUND,
             &json!({"error": "Plugin config not found"}),
@@ -1255,7 +1277,10 @@ async fn handle_create_upstream(
     }
 
     match db.create_upstream(&upstream).await {
-        Ok(_) => Ok(json_response(StatusCode::CREATED, &json!(upstream))),
+        Ok(_) => {
+            info!(action = "create", resource = "upstream", id = %upstream.id, "Admin API: upstream created");
+            Ok(json_response(StatusCode::CREATED, &json!(upstream)))
+        }
         Err(e) => Ok(json_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             &json!({"error": format!("{}", e)}),
@@ -1346,7 +1371,10 @@ async fn handle_update_upstream(
     }
 
     match db.update_upstream(&upstream).await {
-        Ok(_) => Ok(json_response(StatusCode::OK, &json!(upstream))),
+        Ok(_) => {
+            info!(action = "update", resource = "upstream", id = %upstream.id, "Admin API: upstream updated");
+            Ok(json_response(StatusCode::OK, &json!(upstream)))
+        }
         Err(e) => Ok(json_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             &json!({"error": format!("{}", e)}),
@@ -1376,7 +1404,10 @@ async fn handle_delete_upstream(
     };
 
     match db.delete_upstream(id).await {
-        Ok(true) => Ok(json_response(StatusCode::NO_CONTENT, &json!({}))),
+        Ok(true) => {
+            info!(action = "delete", resource = "upstream", id = %id, "Admin API: upstream deleted");
+            Ok(json_response(StatusCode::NO_CONTENT, &json!({})))
+        }
         Ok(false) => Ok(json_response(
             StatusCode::NOT_FOUND,
             &json!({"error": "Upstream not found"}),

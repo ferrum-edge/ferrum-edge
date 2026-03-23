@@ -114,6 +114,7 @@ pub fn create_test_transaction_summary() -> ferrum_gateway::plugins::Transaction
         latency_backend_ttfb_ms: 80.0,
         latency_backend_total_ms: 90.0,
         request_user_agent: Some("test-agent".to_string()),
+        client_disconnected: false,
         metadata: HashMap::new(),
     }
 }

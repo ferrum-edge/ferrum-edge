@@ -159,6 +159,7 @@ impl DatabaseStore {
 
     /// Load the full gateway configuration from the database.
     pub async fn load_full_config(&self) -> Result<GatewayConfig, anyhow::Error> {
+        let load_start = std::time::Instant::now();
         let proxies = self.load_proxies().await?;
         let consumers = self.load_consumers().await?;
         let plugin_configs = self.load_plugin_configs().await?;
@@ -172,6 +173,14 @@ impl DatabaseStore {
             upstreams,
             loaded_at: Utc::now(),
         };
+        info!(
+            elapsed_ms = load_start.elapsed().as_millis() as u64,
+            proxies = config.proxies.len(),
+            consumers = config.consumers.len(),
+            plugins = config.plugin_configs.len(),
+            upstreams = config.upstreams.len(),
+            "Config loaded from database"
+        );
 
         if let Err(dupes) = config.validate_unique_listen_paths() {
             for msg in &dupes {

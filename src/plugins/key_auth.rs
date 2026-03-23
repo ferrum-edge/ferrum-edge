@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashMap;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::consumer_index::ConsumerIndex;
 
@@ -79,6 +79,7 @@ impl Plugin for KeyAuth {
             return PluginResult::Continue;
         }
 
+        warn!(client_ip = %ctx.client_ip, "Authentication failed: invalid API key");
         PluginResult::Reject {
             status_code: 401,
             body: r#"{"error":"Invalid API key"}"#.into(),

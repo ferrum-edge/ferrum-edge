@@ -9,7 +9,7 @@ use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tracing::debug;
+use tracing::{debug, trace};
 
 use crate::config::types::{GatewayConfig, Proxy};
 
@@ -102,6 +102,12 @@ impl RouterCache {
         // Cache both hits AND misses. Negative cache entries (None) prevent
         // O(n) rescans for repeated scanner/bot traffic hitting non-existent
         // paths. Bounded by max_cache_entries with eviction.
+        trace!(
+            path = %path,
+            matched = result.is_some(),
+            cache_hit = false,
+            "Router cache lookup (table scan)"
+        );
         if self.path_cache.len() >= self.max_cache_entries {
             self.evict_sample();
         }

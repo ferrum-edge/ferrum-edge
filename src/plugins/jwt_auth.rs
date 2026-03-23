@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
 use serde_json::Value;
 use std::collections::HashMap;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::consumer_index::ConsumerIndex;
 
@@ -112,7 +112,7 @@ impl Plugin for JwtAuth {
             }
         }
 
-        debug!("jwt_auth: no matching consumer found");
+        warn!(client_ip = %ctx.client_ip, "Authentication failed: invalid JWT token");
         PluginResult::Reject {
             status_code: 401,
             body: r#"{"error":"Invalid JWT token"}"#.into(),

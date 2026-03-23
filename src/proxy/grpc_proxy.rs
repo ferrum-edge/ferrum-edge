@@ -158,9 +158,12 @@ impl GrpcConnectionPool {
         let tcp = tokio::time::timeout(connect_timeout, TcpStream::connect(&addr))
             .await
             .map_err(|_| {
-                warn!(
-                    "gRPC: connect timeout ({}ms) to backend {}",
-                    proxy.backend_connect_timeout_ms, addr
+                error!(
+                    proxy_id = %proxy.id,
+                    backend_addr = %addr,
+                    timeout_ms = proxy.backend_connect_timeout_ms,
+                    error_kind = "connect_timeout",
+                    "gRPC backend connect timeout"
                 );
                 GrpcProxyError::BackendTimeout(format!(
                     "Connect timeout after {}ms to {}",
@@ -168,7 +171,13 @@ impl GrpcConnectionPool {
                 ))
             })?
             .map_err(|e| {
-                warn!("gRPC: failed to connect to backend {}: {}", addr, e);
+                error!(
+                    proxy_id = %proxy.id,
+                    backend_addr = %addr,
+                    error_kind = "connect_failure",
+                    error = %e,
+                    "gRPC backend connection failed"
+                );
                 GrpcProxyError::BackendUnavailable(format!("Connection refused: {}", e))
             })?;
 
@@ -553,9 +562,11 @@ pub async fn proxy_grpc_request(
     let response = tokio::time::timeout(read_timeout, sender.send_request(backend_req))
         .await
         .map_err(|_| {
-            warn!(
-                "gRPC: read timeout ({}ms) waiting for backend response",
-                proxy.backend_read_timeout_ms
+            error!(
+                proxy_id = %proxy.id,
+                timeout_ms = proxy.backend_read_timeout_ms,
+                error_kind = "read_timeout",
+                "gRPC backend read timeout"
             );
             GrpcProxyError::BackendTimeout(format!(
                 "Read timeout after {}ms",
@@ -563,7 +574,12 @@ pub async fn proxy_grpc_request(
             ))
         })?
         .map_err(|e| {
-            error!("gRPC: backend request failed: {}", e);
+            error!(
+                proxy_id = %proxy.id,
+                error_kind = if e.is_timeout() { "read_timeout" } else { "request_error" },
+                error = %e,
+                "gRPC backend request failed"
+            );
             if e.is_timeout() {
                 GrpcProxyError::BackendTimeout(format!("Backend timeout: {}", e))
             } else {
@@ -610,9 +626,11 @@ pub async fn proxy_grpc_request(
     tokio::time::timeout(read_timeout, body_collection)
         .await
         .map_err(|_| {
-            warn!(
-                "gRPC: read timeout ({}ms) while collecting response body",
-                proxy.backend_read_timeout_ms
+            error!(
+                proxy_id = %proxy.id,
+                timeout_ms = proxy.backend_read_timeout_ms,
+                error_kind = "body_read_timeout",
+                "gRPC backend body read timeout"
             );
             GrpcProxyError::BackendTimeout(format!(
                 "Body read timeout after {}ms",

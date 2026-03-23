@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashMap;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use super::{Plugin, PluginResult, RequestContext};
 
@@ -79,7 +79,7 @@ impl Plugin for AccessControl {
             .iter()
             .any(|blocked_ip| ip_matches(client_ip, blocked_ip))
         {
-            debug!("access_control: IP '{}' is blocked", client_ip);
+            warn!(client_ip = %client_ip, "Access denied: IP address is blocked");
             return PluginResult::Reject {
                 status_code: 403,
                 body: r#"{"error":"IP address is blocked"}"#.into(),
@@ -94,7 +94,7 @@ impl Plugin for AccessControl {
                 .iter()
                 .any(|allowed_ip| ip_matches(client_ip, allowed_ip))
         {
-            debug!("access_control: IP '{}' not in allowed list", client_ip);
+            warn!(client_ip = %client_ip, "Access denied: IP not in allowed list");
             return PluginResult::Reject {
                 status_code: 403,
                 body: r#"{"error":"IP address not allowed"}"#.into(),
@@ -118,7 +118,7 @@ impl Plugin for AccessControl {
 
         // Check disallowed first
         if self.disallowed_consumers.contains(username) {
-            debug!("access_control: consumer '{}' is disallowed", username);
+            warn!(client_ip = %ctx.client_ip, consumer = %username, "Access denied: consumer is disallowed");
             return PluginResult::Reject {
                 status_code: 403,
                 body: r#"{"error":"Consumer is not allowed"}"#.into(),
@@ -128,10 +128,7 @@ impl Plugin for AccessControl {
 
         // If allowed list is configured, consumer must be in it
         if !self.allowed_consumers.is_empty() && !self.allowed_consumers.contains(username) {
-            debug!(
-                "access_control: consumer '{}' not in allowed list",
-                username
-            );
+            warn!(client_ip = %ctx.client_ip, consumer = %username, "Access denied: consumer not in allowed list");
             return PluginResult::Reject {
                 status_code: 403,
                 body: r#"{"error":"Consumer is not allowed"}"#.into(),

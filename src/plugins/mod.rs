@@ -92,6 +92,10 @@ pub struct TransactionSummary {
     pub latency_backend_ttfb_ms: f64,
     pub latency_backend_total_ms: f64,
     pub request_user_agent: Option<String>,
+    /// True when the client disconnected before receiving the full response
+    /// (e.g., request body read failure indicating the client closed early).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub client_disconnected: bool,
     pub metadata: HashMap<String, String>,
 }
 

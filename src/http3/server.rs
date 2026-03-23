@@ -155,7 +155,24 @@ async fn handle_h3_connection(
                         Ok((req, stream)) => {
                             if let Err(e) = handle_h3_request(req, stream, state, remote_addr).await
                             {
-                                error!("HTTP/3 request error: {}", e);
+                                let err_string = e.to_string();
+                                if err_string.contains("reset")
+                                    || err_string.contains("closed")
+                                    || err_string.contains("aborted")
+                                {
+                                    error!(
+                                        remote_addr = %remote_addr,
+                                        error_kind = "client_disconnect",
+                                        error = %e,
+                                        "HTTP/3 client disconnected during request"
+                                    );
+                                } else {
+                                    error!(
+                                        remote_addr = %remote_addr,
+                                        error = %e,
+                                        "HTTP/3 request error"
+                                    );
+                                }
                             }
                         }
                         Err(e) => {
@@ -169,7 +186,25 @@ async fn handle_h3_connection(
                 break;
             }
             Err(e) => {
-                warn!("HTTP/3 connection error from {}: {}", remote_addr, e);
+                let err_string = e.to_string();
+                if err_string.contains("reset")
+                    || err_string.contains("closed")
+                    || err_string.contains("aborted")
+                    || err_string.contains("timed out")
+                {
+                    error!(
+                        remote_addr = %remote_addr,
+                        error_kind = "client_disconnect",
+                        error = %e,
+                        "HTTP/3 client disconnected"
+                    );
+                } else {
+                    warn!(
+                        remote_addr = %remote_addr,
+                        error = %e,
+                        "HTTP/3 connection error"
+                    );
+                }
                 break;
             }
         }
@@ -489,36 +524,8 @@ async fn handle_h3_request(
             .await;
     }
 
-    let total_ms = start_time.elapsed().as_secs_f64() * 1000.0;
-    let gateway_processing_ms = total_ms - backend_total_ms;
-
-    // Build transaction summary for logging
-    let summary = TransactionSummary {
-        timestamp_received: ctx.timestamp_received.to_rfc3339(),
-        client_ip: ctx.client_ip.clone(),
-        consumer_username: ctx.identified_consumer.as_ref().map(|c| c.username.clone()),
-        http_method: method,
-        request_path: path,
-        matched_proxy_id: Some(proxy.id.clone()),
-        matched_proxy_name: proxy.name.clone(),
-        backend_target_url: Some(strip_query_params(&backend_url)),
-        response_status_code: response_status,
-        latency_total_ms: total_ms,
-        latency_gateway_processing_ms: gateway_processing_ms,
-        latency_backend_ttfb_ms: backend_ttfb_ms,
-        latency_backend_total_ms: backend_total_ms,
-        request_user_agent: ctx.headers.get("user-agent").cloned(),
-        metadata: ctx.metadata.clone(),
-    };
-
-    // Log phase
-    for plugin in plugins.iter() {
-        plugin.log(&summary).await;
-    }
-
-    record_request(&state, response_status);
-
-    // Build and send response
+    // Build and send response BEFORE logging, so we can measure
+    // accurate total latency and detect client disconnects.
     let status = StatusCode::from_u16(response_status).unwrap_or(StatusCode::BAD_GATEWAY);
     let mut resp_builder = Response::builder().status(status);
 
@@ -534,9 +541,48 @@ async fn handle_h3_request(
     let resp = resp_builder
         .body(())
         .map_err(|e| anyhow::anyhow!("Failed to build HTTP/3 proxy response: {}", e))?;
-    stream.send_response(resp).await?;
-    stream.send_data(Bytes::from(response_body)).await?;
-    stream.finish().await?;
+
+    // Send response to client — detect disconnect if send fails
+    let send_result = async {
+        stream.send_response(resp).await?;
+        stream.send_data(Bytes::from(response_body)).await?;
+        stream.finish().await
+    }
+    .await;
+
+    let client_disconnected = send_result.is_err();
+
+    // Log phase — fires AFTER response is fully sent (or client disconnected)
+    let total_ms = start_time.elapsed().as_secs_f64() * 1000.0;
+    let gateway_processing_ms = total_ms - backend_total_ms;
+
+    let summary = TransactionSummary {
+        timestamp_received: ctx.timestamp_received.to_rfc3339(),
+        client_ip: ctx.client_ip.clone(),
+        consumer_username: ctx.identified_consumer.as_ref().map(|c| c.username.clone()),
+        http_method: method,
+        request_path: path,
+        matched_proxy_id: Some(proxy.id.clone()),
+        matched_proxy_name: proxy.name.clone(),
+        backend_target_url: Some(strip_query_params(&backend_url)),
+        response_status_code: response_status,
+        latency_total_ms: total_ms,
+        latency_gateway_processing_ms: gateway_processing_ms,
+        latency_backend_ttfb_ms: backend_ttfb_ms,
+        latency_backend_total_ms: backend_total_ms,
+        request_user_agent: ctx.headers.get("user-agent").cloned(),
+        client_disconnected,
+        metadata: ctx.metadata.clone(),
+    };
+
+    for plugin in plugins.iter() {
+        plugin.log(&summary).await;
+    }
+
+    record_request(&state, response_status);
+
+    // Propagate any send error
+    send_result?;
 
     Ok(())
 }
@@ -555,7 +601,7 @@ async fn proxy_to_backend_h3(
     let client = match state.connection_pool.get_client(proxy).await {
         Ok(client) => client,
         Err(e) => {
-            error!("Failed to get client from pool: {}", e);
+            error!(proxy_id = %proxy.id, error = %e, "Failed to get client from pool for HTTP/3 backend");
             reqwest::Client::builder()
                 .connect_timeout(std::time::Duration::from_millis(
                     proxy.backend_connect_timeout_ms,
@@ -672,9 +718,19 @@ async fn proxy_to_backend_h3(
             }
         }
         Err(e) => {
+            let error_kind = if e.is_connect() {
+                "connect_failure"
+            } else if e.is_timeout() {
+                "read_timeout"
+            } else {
+                "request_error"
+            };
             error!(
-                "Backend request failed (HTTP/3 frontend): connection error details: {}",
-                e
+                proxy_id = %proxy.id,
+                backend_url = %backend_url,
+                error_kind = error_kind,
+                error = %e,
+                "Backend request failed (HTTP/3 frontend)"
             );
             let error_msg = serde_json::json!({"error": "Backend unavailable"});
             (

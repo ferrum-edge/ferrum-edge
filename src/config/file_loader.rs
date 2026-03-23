@@ -10,6 +10,7 @@ use tracing::{error, info, warn};
 /// disk is not modified — use `FERRUM_MODE=migrate FERRUM_MIGRATE_ACTION=config`
 /// to persist config file migrations.
 pub fn load_config_from_file(path: &str) -> Result<GatewayConfig, anyhow::Error> {
+    let load_start = std::time::Instant::now();
     let file_path = Path::new(path);
     if !file_path.exists() {
         anyhow::bail!("Configuration file not found: {}", file_path.display());
@@ -82,11 +83,13 @@ pub fn load_config_from_file(path: &str) -> Result<GatewayConfig, anyhow::Error>
     }
 
     info!(
-        "Configuration loaded (version {}): {} proxies, {} consumers, {} plugin configs",
-        config.version,
-        config.proxies.len(),
-        config.consumers.len(),
-        config.plugin_configs.len()
+        elapsed_ms = load_start.elapsed().as_millis() as u64,
+        version = %config.version,
+        proxies = config.proxies.len(),
+        consumers = config.consumers.len(),
+        plugins = config.plugin_configs.len(),
+        upstreams = config.upstreams.len(),
+        "Config loaded from file"
     );
 
     Ok(config)

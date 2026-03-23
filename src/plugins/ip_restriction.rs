@@ -7,7 +7,7 @@
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashMap;
-use tracing::debug;
+use tracing::warn;
 
 use super::{Plugin, PluginResult, RequestContext};
 
@@ -75,7 +75,7 @@ impl Plugin for IpRestriction {
                     if self.allow.iter().any(|rule| ip_matches(client_ip, rule)) {
                         return PluginResult::Continue;
                     }
-                    debug!("ip_restriction: IP '{}' not in allow list", client_ip);
+                    warn!(client_ip = %client_ip, "Request blocked: IP not in allow list");
                     return PluginResult::Reject {
                         status_code: 403,
                         body: r#"{"error":"IP address not allowed"}"#.to_string(),
@@ -84,7 +84,7 @@ impl Plugin for IpRestriction {
                 }
                 // Then check deny list
                 if self.deny.iter().any(|rule| ip_matches(client_ip, rule)) {
-                    debug!("ip_restriction: IP '{}' is denied", client_ip);
+                    warn!(client_ip = %client_ip, "Request blocked: IP is denied");
                     return PluginResult::Reject {
                         status_code: 403,
                         body: r#"{"error":"IP address denied"}"#.to_string(),
@@ -95,7 +95,7 @@ impl Plugin for IpRestriction {
             Mode::DenyFirst => {
                 // Check deny list first
                 if self.deny.iter().any(|rule| ip_matches(client_ip, rule)) {
-                    debug!("ip_restriction: IP '{}' is denied", client_ip);
+                    warn!(client_ip = %client_ip, "Request blocked: IP is denied");
                     return PluginResult::Reject {
                         status_code: 403,
                         body: r#"{"error":"IP address denied"}"#.to_string(),
@@ -106,7 +106,7 @@ impl Plugin for IpRestriction {
                 if !self.allow.is_empty()
                     && !self.allow.iter().any(|rule| ip_matches(client_ip, rule))
                 {
-                    debug!("ip_restriction: IP '{}' not in allow list", client_ip);
+                    warn!(client_ip = %client_ip, "Request blocked: IP not in allow list");
                     return PluginResult::Reject {
                         status_code: 403,
                         body: r#"{"error":"IP address not allowed"}"#.to_string(),

@@ -17,7 +17,7 @@ use hmac::{Hmac, Mac};
 use serde_json::Value;
 use sha2::{Sha256, Sha512};
 use std::collections::HashMap;
-use tracing::{debug, warn};
+use tracing::warn;
 
 use super::{Plugin, PluginResult, RequestContext};
 use crate::consumer_index::ConsumerIndex;
@@ -187,7 +187,7 @@ impl Plugin for HmacAuth {
         let consumer = match consumer_index.find_by_identity(&username) {
             Some(c) => c,
             None => {
-                debug!("hmac_auth: consumer '{}' not found", username);
+                warn!(client_ip = %ctx.client_ip, username = %username, "Authentication failed: HMAC consumer not found");
                 return PluginResult::Reject {
                     status_code: 401,
                     body: r#"{"error":"Invalid credentials"}"#.to_string(),
@@ -237,7 +237,7 @@ impl Plugin for HmacAuth {
 
         // Constant-time comparison to prevent timing attacks
         if !Self::constant_time_eq(signature.as_bytes(), expected_sig.as_bytes()) {
-            debug!("hmac_auth: signature mismatch for user '{}'", username);
+            warn!(client_ip = %ctx.client_ip, username = %username, "Authentication failed: HMAC signature mismatch");
             return PluginResult::Reject {
                 status_code: 401,
                 body: r#"{"error":"Invalid signature"}"#.to_string(),

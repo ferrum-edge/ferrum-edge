@@ -10,7 +10,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
-use tracing::warn;
+use tracing::{debug, warn};
 
 /// Connection pool entry with client and last used timestamp.
 /// Uses atomic u64 (epoch millis) instead of RwLock<Instant> to avoid
@@ -102,6 +102,7 @@ impl ConnectionPool {
         // Create new client with effective configuration.
         // reqwest::Client has its own internal connection pool, so we only need
         // one Client per unique pool key. Always cache it for reuse.
+        debug!(proxy_id = %proxy.id, "Connection pool: creating new HTTP client");
         let client = self.create_client(proxy, &config).await?;
 
         let entry = PoolEntry {

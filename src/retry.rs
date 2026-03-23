@@ -8,7 +8,7 @@
 use crate::config::types::{BackoffStrategy, RetryConfig};
 use std::collections::HashMap;
 use std::time::Duration;
-use tracing::warn;
+use tracing::{debug, warn};
 
 /// The response body, either fully buffered or still streaming from the backend.
 pub enum ResponseBody {
@@ -87,12 +87,30 @@ pub fn should_retry(
     }
 
     if response.connection_error {
-        return config.retry_on_connect_failure;
+        let will_retry = config.retry_on_connect_failure;
+        if will_retry {
+            debug!(
+                method = method,
+                attempt = attempt,
+                connection_error = true,
+                "Retry decision: connection failure, will retry"
+            );
+        }
+        return will_retry;
     }
 
-    config
+    let will_retry = config
         .retryable_status_codes
-        .contains(&response.status_code)
+        .contains(&response.status_code);
+    if will_retry {
+        debug!(
+            method = method,
+            status = response.status_code,
+            attempt = attempt,
+            "Retry decision: retryable status code, will retry"
+        );
+    }
+    will_retry
 }
 
 /// Calculate the delay before the next retry attempt.

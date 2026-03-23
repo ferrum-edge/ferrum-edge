@@ -262,7 +262,7 @@ Reduce per-request allocations in plugin lookup
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `FERRUM_MODE` | (required) | `database`, `file`, `cp`, `dp`, `migrate` |
-| `FERRUM_LOG_LEVEL` | `info` | `error`, `warn`, `info`, `debug`, `trace` |
+| `FERRUM_LOG_LEVEL` | `error` | `error`, `warn`, `info`, `debug`, `trace` |
 | `FERRUM_PROXY_HTTP_PORT` | `8000` | Proxy HTTP listen port |
 | `FERRUM_PROXY_HTTPS_PORT` | `8443` | Proxy HTTPS listen port |
 | `FERRUM_ADMIN_HTTP_PORT` | `9000` | Admin API HTTP port |

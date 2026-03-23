@@ -23,6 +23,8 @@ pub struct CircuitBreaker {
     last_failure_epoch_ms: AtomicU64,
     half_open_in_flight: AtomicU32,
     config: CircuitBreakerConfig,
+    /// Label for log messages (typically the proxy ID).
+    label: String,
 }
 
 /// Error returned when the circuit is open.
@@ -36,7 +38,12 @@ impl std::fmt::Display for CircuitOpenError {
 }
 
 impl CircuitBreaker {
+    #[allow(dead_code)] // Used in tests
     pub fn new(config: CircuitBreakerConfig) -> Self {
+        Self::with_label(config, String::new())
+    }
+
+    pub fn with_label(config: CircuitBreakerConfig, label: String) -> Self {
         Self {
             state: AtomicU8::new(STATE_CLOSED),
             failure_count: AtomicU32::new(0),
@@ -44,6 +51,7 @@ impl CircuitBreaker {
             last_failure_epoch_ms: AtomicU64::new(0),
             half_open_in_flight: AtomicU32::new(0),
             config,
+            label,
         }
     }
 
@@ -70,7 +78,7 @@ impl CircuitBreaker {
                             // CAS winner: initialize half-open state
                             self.half_open_in_flight.store(1, Ordering::Relaxed);
                             self.success_count.store(0, Ordering::Relaxed);
-                            info!("Circuit breaker transitioning from Open to Half-Open");
+                            info!(proxy_id = %self.label, "Circuit breaker transitioning from Open to Half-Open");
                             Ok(())
                         }
                         Err(current) => {
@@ -117,7 +125,7 @@ impl CircuitBreaker {
             STATE_HALF_OPEN => {
                 let successes = self.success_count.fetch_add(1, Ordering::Relaxed) + 1;
                 if successes >= self.config.success_threshold {
-                    info!("Circuit breaker closing (recovered)");
+                    info!(proxy_id = %self.label, "Circuit breaker closing (recovered)");
                     self.state.store(STATE_CLOSED, Ordering::Release);
                     self.failure_count.store(0, Ordering::Relaxed);
                     self.success_count.store(0, Ordering::Relaxed);
@@ -149,12 +157,12 @@ impl CircuitBreaker {
             STATE_CLOSED => {
                 let failures = self.failure_count.fetch_add(1, Ordering::Relaxed) + 1;
                 if failures >= self.config.failure_threshold {
-                    warn!("Circuit breaker opening after {} failures", failures);
+                    warn!(proxy_id = %self.label, failures = failures, "Circuit breaker opening");
                     self.state.store(STATE_OPEN, Ordering::Release);
                 }
             }
             STATE_HALF_OPEN => {
-                warn!("Circuit breaker reopening (probe failed)");
+                warn!(proxy_id = %self.label, "Circuit breaker reopening (probe failed)");
                 self.state.store(STATE_OPEN, Ordering::Release);
                 self.success_count.store(0, Ordering::Relaxed);
                 self.half_open_in_flight.store(0, Ordering::Relaxed);
@@ -201,7 +209,12 @@ impl CircuitBreakerCache {
     ) -> Arc<CircuitBreaker> {
         self.breakers
             .entry(proxy_id.to_string())
-            .or_insert_with(|| Arc::new(CircuitBreaker::new(config.clone())))
+            .or_insert_with(|| {
+                Arc::new(CircuitBreaker::with_label(
+                    config.clone(),
+                    proxy_id.to_string(),
+                ))
+            })
             .clone()
     }
 

@@ -315,6 +315,7 @@ impl HealthChecker {
                 match result {
                     Ok(resp) => {
                         let status = resp.status().as_u16();
+                        debug!(target = %key, status = status, healthy = healthy_status_codes.contains(&status), "Active health check probe completed");
                         if healthy_status_codes.contains(&status) {
                             state.consecutive_failures.store(0, Ordering::Relaxed);
                             let successes =

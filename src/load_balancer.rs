@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use tracing::{debug, trace, warn};
 
 /// Result of a target selection, indicating whether the selection was from
 /// healthy targets or a degraded-mode fallback (all targets were unhealthy).
@@ -50,6 +51,10 @@ impl LoadBalancerCache {
     pub fn rebuild(&self, config: &GatewayConfig) {
         let balancers = Self::build_balancers(config);
         let upstreams = Self::build_upstream_index(config);
+        debug!(
+            upstream_count = config.upstreams.len(),
+            "Load balancer cache rebuilt"
+        );
         self.balancers.store(Arc::new(balancers));
         self.upstreams.store(Arc::new(upstreams));
     }
@@ -95,6 +100,12 @@ impl LoadBalancerCache {
         if added.is_empty() && removed_ids.is_empty() && modified.is_empty() {
             return;
         }
+        debug!(
+            added = added.len(),
+            removed = removed_ids.len(),
+            modified = modified.len(),
+            "Load balancer cache updated incrementally"
+        );
 
         // Clone the current map — O(n) Arc pointer copies, no LoadBalancer cloning
         let mut new_balancers = self.balancers.load().as_ref().clone();
@@ -293,6 +304,11 @@ impl LoadBalancer {
             if self.targets.is_empty() {
                 return None;
             }
+            warn!(
+                algorithm = ?self.algorithm,
+                total_targets = self.targets.len(),
+                "All upstream targets unhealthy, falling back to full rotation"
+            );
             return self.select_from_all(ctx_key).map(|target| TargetSelection {
                 target,
                 is_fallback: true,
@@ -320,9 +336,12 @@ impl LoadBalancer {
             }
         };
 
-        target.map(|t| TargetSelection {
-            target: t,
-            is_fallback: false,
+        target.map(|t| {
+            trace!(algorithm = ?self.algorithm, target = %format!("{}:{}", t.host, t.port), "Target selected");
+            TargetSelection {
+                target: t,
+                is_fallback: false,
+            }
         })
     }
 

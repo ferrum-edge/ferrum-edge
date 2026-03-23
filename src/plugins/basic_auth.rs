@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use base64::Engine;
 use serde_json::Value;
 use std::collections::HashMap;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::consumer_index::ConsumerIndex;
 
@@ -104,6 +104,7 @@ impl Plugin for BasicAuth {
             }
         }
 
+        warn!(client_ip = %ctx.client_ip, "Authentication failed: invalid basic auth credentials");
         PluginResult::Reject {
             status_code: 401,
             body: r#"{"error":"Invalid credentials"}"#.into(),
