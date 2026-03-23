@@ -55,7 +55,15 @@ impl Plugin for ResponseTransformer {
     ) -> PluginResult {
         for rule in &self.rules {
             match rule.operation.as_str() {
-                "add" | "update" => {
+                "add" => {
+                    if let Some(ref val) = rule.value {
+                        response_headers.entry(rule.key.to_lowercase()).or_insert_with(|| {
+                            debug!("response_transformer: added header {}={}", rule.key, val);
+                            val.clone()
+                        });
+                    }
+                }
+                "update" => {
                     if let Some(ref val) = rule.value {
                         response_headers.insert(rule.key.to_lowercase(), val.clone());
                         debug!("response_transformer: set header {}={}", rule.key, val);

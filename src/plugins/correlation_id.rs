@@ -50,7 +50,13 @@ impl Plugin for CorrelationId {
 
     async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult {
         let request_id = if let Some(existing) = ctx.headers.get(&self.header_name) {
-            existing.clone()
+            if existing.len() <= 256 {
+                existing.clone()
+            } else {
+                let id = Uuid::new_v4().to_string();
+                ctx.headers.insert(self.header_name.clone(), id.clone());
+                id
+            }
         } else {
             let id = Uuid::new_v4().to_string();
             ctx.headers.insert(self.header_name.clone(), id.clone());

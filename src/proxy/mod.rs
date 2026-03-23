@@ -321,7 +321,7 @@ async fn handle_connection(
                 debug!("Detected WebSocket upgrade request, routing to WebSocket handler");
                 handle_websocket_request(req, state, addr).await
             } else {
-                handle_proxy_request(req, state, addr).await
+                handle_proxy_request(req, state, addr, false).await
             }
         }
     });
@@ -467,7 +467,6 @@ async fn handle_websocket_request(
         .header("connection", "upgrade")
         .header("sec-websocket-accept", accept_key)
         .header("x-websocket-proxy", "ferrum-gateway")
-        .header("x-websocket-backend", backend_url.clone())
         .body(ProxyBody::empty())
         .unwrap();
 
@@ -1096,7 +1095,7 @@ async fn handle_tls_connection(
                 debug!("Detected WebSocket upgrade request over TLS, routing to WebSocket handler");
                 handle_websocket_request(req, state, addr).await
             } else {
-                handle_proxy_request(req, state, addr).await
+                handle_proxy_request(req, state, addr, true).await
             }
         }
     });
@@ -1166,10 +1165,11 @@ pub async fn handle_proxy_request(
     req: Request<Incoming>,
     state: ProxyState,
     remote_addr: SocketAddr,
+    is_tls: bool,
 ) -> Result<Response<ProxyBody>, hyper::Error> {
     let start_time = Instant::now();
 
-    let method = req.method().to_string();
+    let method = req.method().as_str().to_owned();
     let path = req.uri().path().to_string();
     let query_string = req.uri().query().unwrap_or("").to_string();
 
@@ -1400,9 +1400,9 @@ pub async fn handle_proxy_request(
         }
         &owned_proxy_headers
     } else if !plugins.is_empty() {
-        // Run before_proxy hooks that don't modify headers (e.g., body_validator)
-        // but skip the header clone.
-        owned_proxy_headers = HashMap::new(); // unused, satisfies borrow checker
+        // Run before_proxy hooks that don't modify headers (e.g., body_validator).
+        // Pass ctx.headers so plugins can read (but not modify) the real headers.
+        owned_proxy_headers = ctx.headers.clone();
         for plugin in plugins.iter() {
             match plugin
                 .before_proxy(&mut ctx, &mut owned_proxy_headers)
@@ -1631,6 +1631,7 @@ pub async fn handle_proxy_request(
             upstream_target.as_ref(),
             should_stream,
             &ctx.client_ip,
+            is_tls,
         )
         .await;
 
@@ -1675,6 +1676,7 @@ pub async fn handle_proxy_request(
                 current_target.as_ref(),
                 should_stream && is_last_attempt,
                 &ctx.client_ip,
+                is_tls,
             )
             .await;
         }
@@ -1690,6 +1692,7 @@ pub async fn handle_proxy_request(
             upstream_target.as_ref(),
             should_stream,
             &ctx.client_ip,
+            is_tls,
         )
         .await
     };
@@ -1722,8 +1725,11 @@ pub async fn handle_proxy_request(
         );
     }
 
-    let backend_ttfb_ms = backend_start.elapsed().as_secs_f64() * 1000.0;
-    let backend_total_ms = backend_start.elapsed().as_secs_f64() * 1000.0;
+    let backend_elapsed = backend_start.elapsed().as_secs_f64() * 1000.0;
+    // For streaming responses, TTFB is approximately when proxy_to_backend returned
+    // (first byte received); total time includes plugin processing that follows.
+    let backend_ttfb_ms = backend_elapsed;
+    let backend_total_ms = backend_elapsed;
 
     // after_proxy hooks (these only modify headers, not the body,
     // so they are compatible with both streaming and buffered modes)
@@ -1809,23 +1815,7 @@ pub async fn handle_proxy_request(
     }))
 }
 
-/// Find the matching proxy using longest prefix match.
-/// Iterates proxies directly to avoid per-request allocation.
-#[allow(dead_code)]
-pub fn find_matching_proxy(config: &GatewayConfig, path: &str) -> Option<Proxy> {
-    let mut best_match: Option<&Proxy> = None;
-    let mut best_len = 0;
 
-    for proxy in &config.proxies {
-        let lp = &proxy.listen_path;
-        if lp.len() > best_len && path.starts_with(lp.as_str()) {
-            best_match = Some(proxy);
-            best_len = lp.len();
-        }
-    }
-
-    best_match.cloned()
-}
 
 /// Build the backend URL based on proxy config and path forwarding logic.
 pub fn build_backend_url(proxy: &Proxy, incoming_path: &str, query_string: &str) -> String {
@@ -1913,6 +1903,7 @@ async fn proxy_to_backend_retry(
     upstream_target: Option<&UpstreamTarget>,
     stream_response: bool,
     client_ip: &str,
+    is_tls: bool,
 ) -> retry::BackendResponse {
     // All reqwest clients use our DnsCacheResolver, so DNS resolution is
     // always served from the warmed cache — never hitting DNS on the hot path.
@@ -1945,7 +1936,7 @@ async fn proxy_to_backend_retry(
         "PATCH" => reqwest::Method::PATCH,
         "HEAD" => reqwest::Method::HEAD,
         "OPTIONS" => reqwest::Method::OPTIONS,
-        _ => reqwest::Method::GET,
+        other => reqwest::Method::from_bytes(other.as_bytes()).unwrap_or(reqwest::Method::GET),
     };
 
     let mut req_builder = client.request(req_method, backend_url);
@@ -1974,7 +1965,7 @@ async fn proxy_to_backend_retry(
     } else {
         req_builder = req_builder.header("X-Forwarded-For", client_ip);
     }
-    req_builder = req_builder.header("X-Forwarded-Proto", "http");
+    req_builder = req_builder.header("X-Forwarded-Proto", if is_tls { "https" } else { "http" });
     if let Some(host) = headers.get("host") {
         req_builder = req_builder.header("X-Forwarded-Host", host.as_str());
     }
@@ -1985,7 +1976,15 @@ async fn proxy_to_backend_retry(
             let mut resp_headers = HashMap::new();
             for (k, v) in response.headers() {
                 if let Ok(vs) = v.to_str() {
-                    resp_headers.insert(k.as_str().to_string(), vs.to_string());
+                    // Use entry API to preserve multi-value headers (e.g. Set-Cookie)
+                    // by appending with comma separation per RFC 7230 Section 3.2.2
+                    resp_headers
+                        .entry(k.as_str().to_string())
+                        .and_modify(|existing: &mut String| {
+                            existing.push_str(", ");
+                            existing.push_str(vs);
+                        })
+                        .or_insert_with(|| vs.to_string());
                 }
             }
             if stream_response {
@@ -2011,7 +2010,7 @@ async fn proxy_to_backend_retry(
             retry::BackendResponse {
                 status_code: 502,
                 body: ResponseBody::Buffered(
-                    format!(r#"{{"error":"Backend unavailable: {}"}}"#, e).into_bytes(),
+                    r#"{"error":"Backend unavailable"}"#.as_bytes().to_vec(),
                 ),
                 headers: HashMap::new(),
                 connection_error: is_connect,
@@ -2032,6 +2031,7 @@ async fn proxy_to_backend(
     upstream_target: Option<&UpstreamTarget>,
     stream_response: bool,
     client_ip: &str,
+    is_tls: bool,
 ) -> retry::BackendResponse {
     // All reqwest clients use our DnsCacheResolver, so DNS resolution is
     // always served from the warmed cache — never hitting DNS on the hot path.
@@ -2092,7 +2092,7 @@ async fn proxy_to_backend(
         "PATCH" => reqwest::Method::PATCH,
         "HEAD" => reqwest::Method::HEAD,
         "OPTIONS" => reqwest::Method::OPTIONS,
-        _ => reqwest::Method::GET,
+        other => reqwest::Method::from_bytes(other.as_bytes()).unwrap_or(reqwest::Method::GET),
     };
 
     let mut req_builder = client.request(req_method, backend_url);
@@ -2122,7 +2122,7 @@ async fn proxy_to_backend(
     } else {
         req_builder = req_builder.header("X-Forwarded-For", client_ip);
     }
-    req_builder = req_builder.header("X-Forwarded-Proto", "http");
+    req_builder = req_builder.header("X-Forwarded-Proto", if is_tls { "https" } else { "http" });
     if let Some(host) = headers.get("host") {
         req_builder = req_builder.header("X-Forwarded-Host", host.as_str());
     }
@@ -2195,7 +2195,15 @@ async fn proxy_to_backend(
             let mut resp_headers = HashMap::new();
             for (k, v) in response.headers() {
                 if let Ok(vs) = v.to_str() {
-                    resp_headers.insert(k.as_str().to_string(), vs.to_string());
+                    // Use entry API to preserve multi-value headers (e.g. Set-Cookie)
+                    // by appending with comma separation per RFC 7230 Section 3.2.2
+                    resp_headers
+                        .entry(k.as_str().to_string())
+                        .and_modify(|existing: &mut String| {
+                            existing.push_str(", ");
+                            existing.push_str(vs);
+                        })
+                        .or_insert_with(|| vs.to_string());
                 }
             }
 
@@ -2279,7 +2287,7 @@ async fn proxy_to_backend(
             retry::BackendResponse {
                 status_code: 502,
                 body: ResponseBody::Buffered(
-                    format!(r#"{{"error":"Backend unavailable: {}"}}"#, e).into_bytes(),
+                    r#"{"error":"Backend unavailable"}"#.as_bytes().to_vec(),
                 ),
                 headers: HashMap::new(),
                 connection_error: is_connect,

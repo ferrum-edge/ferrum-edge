@@ -119,7 +119,10 @@ impl ConsumerIndex {
                 keyauth.insert(key.to_string(), Arc::clone(&arc_consumer));
             }
 
-            basic.insert(consumer.username.clone(), Arc::clone(&arc_consumer));
+            // Index by username only if consumer has basic_auth credentials
+            if consumer.credentials.contains_key("basicauth") {
+                basic.insert(consumer.username.clone(), Arc::clone(&arc_consumer));
+            }
             identity.insert(consumer.username.clone(), Arc::clone(&arc_consumer));
             identity.insert(consumer.id.clone(), Arc::clone(&arc_consumer));
             if let Some(ref custom_id) = consumer.custom_id {
@@ -166,8 +169,10 @@ impl ConsumerIndex {
                 keyauth.insert(key.to_string(), Arc::clone(&arc_consumer));
             }
 
-            // Index by username (for basic_auth)
-            basic.insert(consumer.username.clone(), Arc::clone(&arc_consumer));
+            // Index by username only if consumer has basic_auth credentials
+            if consumer.credentials.contains_key("basicauth") {
+                basic.insert(consumer.username.clone(), Arc::clone(&arc_consumer));
+            }
 
             // Index by username and id (for jwt/oauth2 claim matching)
             identity.insert(consumer.username.clone(), Arc::clone(&arc_consumer));

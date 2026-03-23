@@ -413,51 +413,6 @@ impl GrpcConnectionPool {
         });
     }
 
-    /// Get pool statistics for monitoring.
-    #[allow(dead_code)]
-    pub fn get_stats(&self) -> GrpcPoolStats {
-        let mut active = 0;
-        let mut closed = 0;
-
-        for entry in self.entries.iter() {
-            if entry.sender.is_closed() {
-                closed += 1;
-            } else {
-                active += 1;
-            }
-        }
-
-        GrpcPoolStats {
-            total_entries: self.entries.len(),
-            active_connections: active,
-            closed_connections: closed,
-            idle_timeout_seconds: self.global_pool_config.idle_timeout_seconds,
-            http2_keepalive_interval_seconds: self
-                .global_pool_config
-                .http2_keep_alive_interval_seconds,
-            http2_keepalive_timeout_seconds: self
-                .global_pool_config
-                .http2_keep_alive_timeout_seconds,
-        }
-    }
-
-    /// Clear all pooled connections.
-    #[allow(dead_code)]
-    pub fn clear(&self) {
-        self.entries.clear();
-    }
-}
-
-/// gRPC connection pool statistics.
-#[allow(dead_code)]
-#[derive(Debug, Clone)]
-pub struct GrpcPoolStats {
-    pub total_entries: usize,
-    pub active_connections: usize,
-    pub closed_connections: usize,
-    pub idle_timeout_seconds: u64,
-    pub http2_keepalive_interval_seconds: u64,
-    pub http2_keepalive_timeout_seconds: u64,
 }
 
 /// Dangerous: skip TLS certificate verification (for testing or self-signed certs).

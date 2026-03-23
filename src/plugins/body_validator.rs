@@ -107,7 +107,8 @@ impl BodyValidator {
                 "object" => data.is_object(),
                 "array" => data.is_array(),
                 "string" => data.is_string(),
-                "number" | "integer" => data.is_number(),
+                "number" => data.is_number(),
+                "integer" => data.is_i64() || data.is_u64(),
                 "boolean" => data.is_boolean(),
                 "null" => data.is_null(),
                 _ => true,
@@ -288,11 +289,12 @@ impl Plugin for BodyValidator {
             Ok(()) => PluginResult::Continue,
             Err(msg) => {
                 debug!("body_validator: validation failed: {}", msg);
+                let escaped_msg = msg.replace('\\', "\\\\").replace('"', "\\\"");
                 PluginResult::Reject {
                     status_code: 400,
                     body: format!(
                         r#"{{"error":"Request body validation failed","details":"{}"}}"#,
-                        msg
+                        escaped_msg
                     ),
                     headers: HashMap::new(),
                 }

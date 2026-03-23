@@ -30,16 +30,10 @@ pub struct PluginCache {
 }
 
 impl PluginCache {
-    /// Build a new plugin cache from the given config.
-    #[allow(dead_code)]
+    /// Build a new plugin cache from the given config with a default HTTP client.
     pub fn new(config: &GatewayConfig) -> Self {
         let http_client = PluginHttpClient::default();
-        let (proxy_map, globals) = Self::build_cache(config, &http_client);
-        Self {
-            proxy_plugins: ArcSwap::new(Arc::new(proxy_map)),
-            global_plugins: ArcSwap::new(Arc::new(globals)),
-            http_client,
-        }
+        Self::with_http_client(config, http_client)
     }
 
     /// Build a new plugin cache with a shared HTTP client configured from

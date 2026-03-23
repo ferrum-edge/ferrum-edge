@@ -7,7 +7,7 @@ use tokio::sync::broadcast;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
 use tonic::{Request, Response, Status};
-use tracing::info;
+use tracing::{error, info};
 
 use super::proto::config_sync_server::{ConfigSync, ConfigSyncServer};
 use super::proto::{ConfigUpdate, FullConfigRequest, FullConfigResponse, SubscribeRequest};
@@ -48,7 +48,7 @@ impl CpGrpcServer {
 
         let key = DecodingKey::from_secret(self.jwt_secret.as_bytes());
         let mut validation = Validation::new(Algorithm::HS256);
-        validation.validate_exp = false;
+        validation.validate_exp = true;
         validation.required_spec_claims.clear();
 
         decode::<Value>(token, &key, &validation)
@@ -63,7 +63,13 @@ impl CpGrpcServer {
 
     /// Broadcast a config update to all connected DPs.
     pub fn broadcast_update(tx: &broadcast::Sender<ConfigUpdate>, config: &GatewayConfig) {
-        let config_json = serde_json::to_string(config).unwrap_or_default();
+        let config_json = match serde_json::to_string(config) {
+            Ok(json) => json,
+            Err(e) => {
+                error!("Failed to serialize config for broadcast: {}", e);
+                return;
+            }
+        };
         let update = ConfigUpdate {
             update_type: 0, // FULL_SNAPSHOT
             config_json,
@@ -98,7 +104,10 @@ impl ConfigSync for CpGrpcServer {
 
         // Send initial full config
         let config = self.config.load_full();
-        let config_json = serde_json::to_string(config.as_ref()).unwrap_or_default();
+        let config_json = serde_json::to_string(config.as_ref()).map_err(|e| {
+            error!("Failed to serialize config in subscribe: {}", e);
+            Status::internal("Failed to serialize configuration")
+        })?;
         let initial = ConfigUpdate {
             update_type: 0, // FULL_SNAPSHOT
             config_json,
@@ -132,14 +141,17 @@ impl ConfigSync for CpGrpcServer {
 
         let key = DecodingKey::from_secret(self.jwt_secret.as_bytes());
         let mut validation = Validation::new(Algorithm::HS256);
-        validation.validate_exp = false;
+        validation.validate_exp = true;
         validation.required_spec_claims.clear();
 
         decode::<Value>(token, &key, &validation)
             .map_err(|e| Status::unauthenticated(format!("Invalid token: {}", e)))?;
 
         let config = self.config.load_full();
-        let config_json = serde_json::to_string(config.as_ref()).unwrap_or_default();
+        let config_json = serde_json::to_string(config.as_ref()).map_err(|e| {
+            error!("Failed to serialize config in get_full_config: {}", e);
+            Status::internal("Failed to serialize configuration")
+        })?;
 
         Ok(Response::new(FullConfigResponse {
             config_json,

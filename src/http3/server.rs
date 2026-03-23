@@ -325,10 +325,36 @@ async fn handle_h3_request(
 
     match proxy.auth_mode {
         AuthMode::Multi => {
+            // Multi auth mode: try each auth plugin, first success wins
+            let mut any_success = false;
             for auth_plugin in &auth_plugins {
-                let _ = auth_plugin
+                match auth_plugin
                     .authenticate(&mut ctx, &state.consumer_index)
-                    .await;
+                    .await
+                {
+                    PluginResult::Continue => {
+                        any_success = true;
+                        break;
+                    }
+                    PluginResult::Reject { .. } => continue,
+                }
+            }
+            if !any_success && !auth_plugins.is_empty() {
+                // All auth plugins rejected — deny access
+                record_request(&state, 401);
+                let status = StatusCode::UNAUTHORIZED;
+                let mut resp_builder = Response::builder().status(status);
+                resp_builder =
+                    resp_builder.header("content-type", "application/json");
+                let resp = resp_builder.body(()).unwrap();
+                stream.send_response(resp).await?;
+                stream
+                    .send_data(Bytes::from(
+                        r#"{"error":"Unauthorized"}"#.as_bytes(),
+                    ))
+                    .await?;
+                stream.finish().await?;
+                return Ok(());
             }
         }
         AuthMode::Single => {
@@ -502,7 +528,10 @@ async fn handle_h3_request(
         resp_builder = resp_builder.header(k.as_str(), v.as_str());
     }
 
-    resp_builder = resp_builder.header("content-type", "application/json");
+    // Only add content-type if backend didn't provide one
+    if !response_headers.contains_key("content-type") {
+        resp_builder = resp_builder.header("content-type", "application/json");
+    }
 
     let resp = resp_builder.body(()).unwrap();
     stream.send_response(resp).await?;

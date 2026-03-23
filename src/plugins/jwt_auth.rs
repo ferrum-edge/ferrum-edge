@@ -91,7 +91,9 @@ impl Plugin for JwtAuth {
             {
                 let key = DecodingKey::from_secret(secret.as_bytes());
                 let mut validation = Validation::new(Algorithm::HS256);
-                validation.validate_exp = false;
+                // Validate expiration when present, but don't require it as a claim
+                // so that tokens without `exp` still work (operator choice).
+                validation.validate_exp = true;
                 validation.required_spec_claims.clear();
 
                 if let Ok(token_data) = decode::<serde_json::Value>(&token, &key, &validation) {

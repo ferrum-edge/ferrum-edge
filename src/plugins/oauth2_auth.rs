@@ -100,7 +100,13 @@ impl Plugin for OAuth2Auth {
                                         }
                                         return PluginResult::Continue;
                                     }
-                                    return PluginResult::Continue;
+                                    // Token is active but subject not found — reject
+                                    warn!("OAuth2: token active but subject not found in consumers");
+                                    return PluginResult::Reject {
+                                        status_code: 401,
+                                        body: r#"{"error":"Unknown token subject"}"#.into(),
+                                        headers: HashMap::new(),
+                                    };
                                 }
                             }
                         }
@@ -128,7 +134,7 @@ impl Plugin for OAuth2Auth {
                     {
                         let key = DecodingKey::from_secret(secret.as_bytes());
                         let mut validation = Validation::new(Algorithm::HS256);
-                        validation.validate_exp = false;
+                        validation.validate_exp = true;
                         validation.required_spec_claims.clear();
 
                         if let Some(ref iss) = self.expected_issuer {

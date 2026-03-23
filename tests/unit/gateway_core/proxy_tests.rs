@@ -1,6 +1,7 @@
 use chrono::Utc;
 use ferrum_gateway::config::types::{AuthMode, BackendProtocol, GatewayConfig, Proxy};
-use ferrum_gateway::proxy::{build_backend_url, find_matching_proxy};
+use ferrum_gateway::proxy::build_backend_url;
+use ferrum_gateway::router_cache::RouterCache;
 
 fn test_proxy() -> Proxy {
     Proxy {
@@ -91,7 +92,8 @@ fn test_longest_prefix_match() {
         upstreams: vec![],
         loaded_at: Utc::now(),
     };
-    let matched = find_matching_proxy(&config, "/api/v1/users");
+    let router = RouterCache::new(&config, 10000);
+    let matched = router.find_proxy("/api/v1/users");
     assert!(matched.is_some());
     assert_eq!(matched.unwrap().id, "long");
 }
@@ -109,6 +111,7 @@ fn test_no_match() {
         upstreams: vec![],
         loaded_at: Utc::now(),
     };
-    let matched = find_matching_proxy(&config, "/other/path");
+    let router = RouterCache::new(&config, 10000);
+    let matched = router.find_proxy("/other/path");
     assert!(matched.is_none());
 }

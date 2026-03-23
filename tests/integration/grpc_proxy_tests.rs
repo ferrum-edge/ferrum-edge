@@ -257,7 +257,7 @@ async fn start_test_gateway(state: ProxyState) -> (SocketAddr, tokio::task::Join
                 let svc = service_fn(move |req: Request<Incoming>| {
                     let state = state.clone();
                     let addr = remote_addr;
-                    async move { ferrum_gateway::proxy::handle_proxy_request(req, state, addr).await }
+                    async move { ferrum_gateway::proxy::handle_proxy_request(req, state, addr, false).await }
                 });
                 let _ = builder.serve_connection_with_upgrades(io, svc).await;
             });

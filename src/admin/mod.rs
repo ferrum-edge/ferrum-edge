@@ -789,6 +789,12 @@ async fn handle_update_credentials(
     cred_type: &str,
     body: &[u8],
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    if state.read_only {
+        return Ok(json_response(
+            StatusCode::FORBIDDEN,
+            &json!({"error": "Admin API is in read-only mode"}),
+        ));
+    }
     let db = match &state.db {
         Some(db) => db,
         None => {
@@ -816,7 +822,15 @@ async fn handle_update_credentials(
             if cred_type == "basicauth"
                 && let Some(pass) = hashed_cred.get("password").and_then(|p| p.as_str())
             {
-                let hash = bcrypt::hash(pass, bcrypt::DEFAULT_COST).unwrap_or_default();
+                let hash = match bcrypt::hash(pass, bcrypt::DEFAULT_COST) {
+                    Ok(h) => h,
+                    Err(e) => {
+                        return Ok(json_response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            &json!({"error": format!("Failed to hash password: {}", e)}),
+                        ));
+                    }
+                };
                 hashed_cred["password_hash"] = json!(hash);
                 // Remove plaintext
                 if let Some(obj) = hashed_cred.as_object_mut() {
@@ -851,6 +865,12 @@ async fn handle_delete_credentials(
     consumer_id: &str,
     cred_type: &str,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    if state.read_only {
+        return Ok(json_response(
+            StatusCode::FORBIDDEN,
+            &json!({"error": "Admin API is in read-only mode"}),
+        ));
+    }
     let db = match &state.db {
         Some(db) => db,
         None => {

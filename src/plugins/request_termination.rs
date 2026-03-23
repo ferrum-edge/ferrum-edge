@@ -28,7 +28,11 @@ pub struct RequestTermination {
 
 impl RequestTermination {
     pub fn new(config: &Value) -> Self {
-        let status_code = config["status_code"].as_u64().unwrap_or(503) as u16;
+        let status_code = config["status_code"]
+            .as_u64()
+            .map(|c| c as u16)
+            .filter(|&c| (100..=599).contains(&c))
+            .unwrap_or(503);
         let content_type = config["content_type"]
             .as_str()
             .unwrap_or("application/json")
@@ -69,14 +73,20 @@ impl RequestTermination {
         let msg = self.message.as_deref().unwrap_or("Service unavailable");
 
         if self.content_type.contains("json") {
+            let escaped = msg.replace('\\', "\\\\").replace('"', "\\\"");
             format!(
                 r#"{{"message":"{}","status_code":{}}}"#,
-                msg, self.status_code
+                escaped, self.status_code
             )
         } else if self.content_type.contains("xml") {
+            let escaped = msg
+                .replace('&', "&amp;")
+                .replace('<', "&lt;")
+                .replace('>', "&gt;")
+                .replace('"', "&quot;");
             format!(
                 r#"<?xml version="1.0"?><response><message>{}</message><status_code>{}</status_code></response>"#,
-                msg, self.status_code
+                escaped, self.status_code
             )
         } else {
             msg.to_string()

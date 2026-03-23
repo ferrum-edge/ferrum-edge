@@ -77,8 +77,12 @@ impl Plugin for BotDetection {
         let user_agent = match ctx.headers.get("user-agent") {
             Some(ua) => ua.to_lowercase(),
             None => {
-                // No user-agent header — could be suspicious, but allow by default
-                return PluginResult::Continue;
+                // No user-agent header — reject as suspicious
+                return PluginResult::Reject {
+                    status_code: self.custom_response_code,
+                    body: r#"{"error":"Forbidden"}"#.to_string(),
+                    headers: HashMap::new(),
+                };
             }
         };
 

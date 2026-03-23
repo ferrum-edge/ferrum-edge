@@ -61,7 +61,15 @@ impl Plugin for RequestTransformer {
         for rule in &self.rules {
             match rule.target.as_str() {
                 "header" => match rule.operation.as_str() {
-                    "add" | "update" => {
+                    "add" => {
+                        if let Some(ref val) = rule.value {
+                            headers.entry(rule.key.to_lowercase()).or_insert_with(|| {
+                                debug!("request_transformer: added header {}={}", rule.key, val);
+                                val.clone()
+                            });
+                        }
+                    }
+                    "update" => {
                         if let Some(ref val) = rule.value {
                             headers.insert(rule.key.to_lowercase(), val.clone());
                             debug!("request_transformer: set header {}={}", rule.key, val);
@@ -74,7 +82,12 @@ impl Plugin for RequestTransformer {
                     _ => {}
                 },
                 "query" => match rule.operation.as_str() {
-                    "add" | "update" => {
+                    "add" => {
+                        if let Some(ref val) = rule.value {
+                            ctx.query_params.entry(rule.key.clone()).or_insert_with(|| val.clone());
+                        }
+                    }
+                    "update" => {
                         if let Some(ref val) = rule.value {
                             ctx.query_params.insert(rule.key.clone(), val.clone());
                         }

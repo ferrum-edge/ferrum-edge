@@ -56,24 +56,41 @@ impl CircuitBreaker {
                 // Check if timeout has elapsed
                 let now = now_epoch_ms();
                 let last_failure = self.last_failure_epoch_ms.load(Ordering::Relaxed);
-                let timeout_ms = self.config.timeout_seconds * 1000;
+                let timeout_ms = self.config.timeout_seconds.saturating_mul(1000);
 
                 if now.saturating_sub(last_failure) >= timeout_ms {
-                    // Transition to half-open
-                    self.state
-                        .compare_exchange(
-                            STATE_OPEN,
-                            STATE_HALF_OPEN,
-                            Ordering::AcqRel,
-                            Ordering::Relaxed,
-                        )
-                        .ok();
-                    self.half_open_in_flight.store(0, Ordering::Relaxed);
-                    self.success_count.store(0, Ordering::Relaxed);
-                    info!("Circuit breaker transitioning from Open to Half-Open");
-                    // Allow this request as first probe
-                    self.half_open_in_flight.fetch_add(1, Ordering::Relaxed);
-                    Ok(())
+                    // Attempt transition to half-open (only one thread wins the CAS)
+                    match self.state.compare_exchange(
+                        STATE_OPEN,
+                        STATE_HALF_OPEN,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    ) {
+                        Ok(_) => {
+                            // CAS winner: initialize half-open state
+                            self.half_open_in_flight.store(1, Ordering::Relaxed);
+                            self.success_count.store(0, Ordering::Relaxed);
+                            info!("Circuit breaker transitioning from Open to Half-Open");
+                            Ok(())
+                        }
+                        Err(current) => {
+                            // CAS loser: another thread already transitioned.
+                            // Fall through to handle the current state.
+                            if current == STATE_HALF_OPEN {
+                                let in_flight =
+                                    self.half_open_in_flight.fetch_add(1, Ordering::Relaxed);
+                                if in_flight < self.config.half_open_max_requests {
+                                    Ok(())
+                                } else {
+                                    self.half_open_in_flight.fetch_sub(1, Ordering::Relaxed);
+                                    Err(CircuitOpenError)
+                                }
+                            } else {
+                                // State changed to something else (e.g. Closed)
+                                Ok(())
+                            }
+                        }
+                    }
                 } else {
                     Err(CircuitOpenError)
                 }
