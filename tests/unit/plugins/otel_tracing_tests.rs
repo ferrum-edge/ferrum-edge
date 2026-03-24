@@ -2,9 +2,14 @@
 
 use ferrum_gateway::plugins::{
     Plugin, PluginResult, RequestContext, TransactionSummary, otel_tracing::OtelTracing,
+    utils::PluginHttpClient,
 };
 use serde_json::json;
 use std::collections::HashMap;
+
+fn new_otel(config: &serde_json::Value) -> OtelTracing {
+    OtelTracing::new_with_http_client(config, PluginHttpClient::default())
+}
 
 fn make_ctx() -> RequestContext {
     RequestContext::new(
@@ -38,14 +43,14 @@ fn make_summary(metadata: HashMap<String, String>) -> TransactionSummary {
 
 #[tokio::test]
 async fn test_otel_tracing_plugin_creation() {
-    let plugin = OtelTracing::new(&json!({}));
+    let plugin = new_otel(&json!({}));
     assert_eq!(plugin.name(), "otel_tracing");
     assert_eq!(plugin.priority(), 25);
 }
 
 #[tokio::test]
 async fn test_otel_tracing_generates_traceparent() {
-    let plugin = OtelTracing::new(&json!({}));
+    let plugin = new_otel(&json!({}));
     let mut ctx = make_ctx();
 
     let result = plugin.on_request_received(&mut ctx).await;
@@ -68,7 +73,7 @@ async fn test_otel_tracing_generates_traceparent() {
 
 #[tokio::test]
 async fn test_otel_tracing_propagates_existing_traceparent() {
-    let plugin = OtelTracing::new(&json!({}));
+    let plugin = new_otel(&json!({}));
     let mut ctx = make_ctx();
     ctx.headers.insert(
         "traceparent".to_string(),
@@ -100,7 +105,7 @@ async fn test_otel_tracing_propagates_existing_traceparent() {
 
 #[tokio::test]
 async fn test_otel_tracing_preserves_tracestate() {
-    let plugin = OtelTracing::new(&json!({}));
+    let plugin = new_otel(&json!({}));
     let mut ctx = make_ctx();
     ctx.headers.insert(
         "traceparent".to_string(),
@@ -120,7 +125,7 @@ async fn test_otel_tracing_preserves_tracestate() {
 
 #[tokio::test]
 async fn test_otel_tracing_injects_headers_before_proxy() {
-    let plugin = OtelTracing::new(&json!({}));
+    let plugin = new_otel(&json!({}));
     let mut ctx = make_ctx();
 
     // Simulate on_request_received
@@ -134,7 +139,7 @@ async fn test_otel_tracing_injects_headers_before_proxy() {
 
 #[tokio::test]
 async fn test_otel_tracing_echoes_traceparent_in_response() {
-    let plugin = OtelTracing::new(&json!({}));
+    let plugin = new_otel(&json!({}));
     let mut ctx = make_ctx();
 
     plugin.on_request_received(&mut ctx).await;
@@ -149,7 +154,7 @@ async fn test_otel_tracing_echoes_traceparent_in_response() {
 
 #[tokio::test]
 async fn test_otel_tracing_no_traceparent_when_generate_disabled() {
-    let plugin = OtelTracing::new(&json!({"generate_trace_id": false}));
+    let plugin = new_otel(&json!({"generate_trace_id": false}));
     let mut ctx = make_ctx();
 
     plugin.on_request_received(&mut ctx).await;
@@ -160,7 +165,7 @@ async fn test_otel_tracing_no_traceparent_when_generate_disabled() {
 
 #[tokio::test]
 async fn test_otel_tracing_log_emits_without_otlp() {
-    let plugin = OtelTracing::new(&json!({}));
+    let plugin = new_otel(&json!({}));
 
     // Just ensure log() doesn't panic when no OTLP endpoint
     let mut metadata = HashMap::new();
@@ -188,7 +193,7 @@ async fn test_otel_tracing_with_otlp_endpoint() {
 
     let endpoint = format!("{}/v1/traces", mock_server.uri());
 
-    let plugin = OtelTracing::new(&json!({
+    let plugin = new_otel(&json!({
         "endpoint": endpoint,
         "batch_size": 1,
         "flush_interval_ms": 100
@@ -227,7 +232,7 @@ async fn test_otel_tracing_otlp_with_authorization() {
 
     let endpoint = format!("{}/v1/traces", mock_server.uri());
 
-    let plugin = OtelTracing::new(&json!({
+    let plugin = new_otel(&json!({
         "endpoint": endpoint,
         "authorization": "Bearer test-token",
         "batch_size": 1,
@@ -249,7 +254,7 @@ async fn test_otel_tracing_otlp_with_authorization() {
 
 #[tokio::test]
 async fn test_otel_tracing_warmup_hostnames() {
-    let plugin = OtelTracing::new(&json!({
+    let plugin = new_otel(&json!({
         "endpoint": "https://otel-collector.example.com:4318/v1/traces"
     }));
 
@@ -259,6 +264,6 @@ async fn test_otel_tracing_warmup_hostnames() {
 
 #[tokio::test]
 async fn test_otel_tracing_no_warmup_hostnames_without_endpoint() {
-    let plugin = OtelTracing::new(&json!({}));
+    let plugin = new_otel(&json!({}));
     assert!(plugin.warmup_hostnames().is_empty());
 }

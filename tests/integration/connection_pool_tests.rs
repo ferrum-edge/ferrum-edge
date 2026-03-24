@@ -293,3 +293,134 @@ async fn test_pool_websocket_protocol_creates_client() {
         "Pool should create client for WebSocket protocol"
     );
 }
+
+#[tokio::test]
+async fn test_upstream_id_pools_separately_from_backend_host() {
+    let pool = ConnectionPool::new(
+        PoolConfig::default(),
+        create_test_env_config(),
+        create_test_dns_cache(),
+    );
+
+    // Proxy with direct backend
+    let proxy_direct = create_test_proxy();
+
+    // Proxy with same host/port but through an upstream
+    let mut proxy_upstream = create_test_proxy();
+    proxy_upstream.upstream_id = Some("upstream-1".to_string());
+
+    let _client1 = pool.get_client(&proxy_direct).await.unwrap();
+    let _client2 = pool.get_client(&proxy_upstream).await.unwrap();
+
+    let stats = pool.get_stats();
+    assert_eq!(
+        stats.total_pools, 2,
+        "Upstream-backed proxy should have a different pool key than direct backend"
+    );
+}
+
+#[tokio::test]
+async fn test_different_upstream_ids_pool_separately() {
+    let pool = ConnectionPool::new(
+        PoolConfig::default(),
+        create_test_env_config(),
+        create_test_dns_cache(),
+    );
+
+    let mut proxy1 = create_test_proxy();
+    proxy1.upstream_id = Some("upstream-a".to_string());
+
+    let mut proxy2 = create_test_proxy();
+    proxy2.upstream_id = Some("upstream-b".to_string());
+
+    let _client1 = pool.get_client(&proxy1).await.unwrap();
+    let _client2 = pool.get_client(&proxy2).await.unwrap();
+
+    let stats = pool.get_stats();
+    assert_eq!(
+        stats.total_pools, 2,
+        "Different upstream IDs should create separate pool entries"
+    );
+}
+
+#[tokio::test]
+async fn test_concurrent_pool_access() {
+    use std::sync::Arc;
+
+    let pool = Arc::new(ConnectionPool::new(
+        PoolConfig::default(),
+        create_test_env_config(),
+        create_test_dns_cache(),
+    ));
+
+    let mut handles = Vec::new();
+    for i in 0..10 {
+        let pool_clone = pool.clone();
+        handles.push(tokio::spawn(async move {
+            let mut proxy = create_test_proxy();
+            proxy.backend_port = 3000 + (i % 3); // 3 distinct keys
+            pool_clone.get_client(&proxy).await.unwrap();
+        }));
+    }
+
+    for h in handles {
+        h.await.unwrap();
+    }
+
+    let stats = pool.get_stats();
+    assert_eq!(
+        stats.total_pools, 3,
+        "Concurrent access should produce exactly 3 pool entries for 3 distinct ports"
+    );
+}
+
+#[tokio::test]
+async fn test_idle_timeout_does_not_fragment_pool() {
+    let pool = ConnectionPool::new(
+        PoolConfig::default(),
+        create_test_env_config(),
+        create_test_dns_cache(),
+    );
+
+    // Two proxies with same host/port/protocol but different idle timeouts
+    // should share the same pool entry (idle_timeout is excluded from pool key)
+    let mut proxy1 = create_test_proxy();
+    proxy1.pool_idle_timeout_seconds = Some(30);
+
+    let mut proxy2 = create_test_proxy();
+    proxy2.pool_idle_timeout_seconds = Some(120);
+
+    let _client1 = pool.get_client(&proxy1).await.unwrap();
+    let _client2 = pool.get_client(&proxy2).await.unwrap();
+
+    let stats = pool.get_stats();
+    assert_eq!(
+        stats.total_pools, 1,
+        "Different idle_timeout_seconds should NOT fragment the pool"
+    );
+}
+
+#[tokio::test]
+async fn test_max_idle_per_host_does_fragment_pool() {
+    let pool = ConnectionPool::new(
+        PoolConfig::default(),
+        create_test_env_config(),
+        create_test_dns_cache(),
+    );
+
+    // Different max_idle_per_host IS in the pool key (affects connection behavior)
+    let mut proxy1 = create_test_proxy();
+    proxy1.pool_max_idle_per_host = Some(10);
+
+    let mut proxy2 = create_test_proxy();
+    proxy2.pool_max_idle_per_host = Some(50);
+
+    let _client1 = pool.get_client(&proxy1).await.unwrap();
+    let _client2 = pool.get_client(&proxy2).await.unwrap();
+
+    let stats = pool.get_stats();
+    assert_eq!(
+        stats.total_pools, 2,
+        "Different max_idle_per_host should create separate pool entries"
+    );
+}

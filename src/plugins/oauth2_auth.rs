@@ -3,7 +3,7 @@ use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::time::Duration;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, warn};
 use url::Url;
 
 use crate::consumer_index::ConsumerIndex;
@@ -71,17 +71,10 @@ impl OAuth2Auth {
             .as_u64()
             .unwrap_or(JWKS_REFRESH_INTERVAL_SECS);
 
-        // If discovery_url is set, we'll resolve jwks_uri from it at warmup time.
-        // For now, create the store with whatever jwks_uri we have (may be None
-        // if only discovery_url is set — the store will be created during warmup).
         let (jwks_store, refresh_handle) = if let Some(ref uri) = jwks_uri {
             let store = JwksKeyStore::new(uri.clone(), http_client.clone());
             let handle = store.start_background_refresh(Duration::from_secs(refresh_interval_secs));
             (Some(store), Some(handle))
-        } else if discovery_url.is_some() {
-            // Store will be created lazily after OIDC discovery resolves the jwks_uri.
-            // We create a placeholder that will be replaced.
-            (None, None)
         } else {
             (None, None)
         };
@@ -104,6 +97,27 @@ impl OAuth2Auth {
             http_client,
             jwks_store,
             _refresh_handle: refresh_handle,
+        }
+    }
+
+    /// Eagerly fetch JWKS keys if a store is configured.
+    /// Called by tests to pre-populate the key store before assertions.
+    #[allow(dead_code)] // Used by tests
+    pub async fn warmup_jwks(&self) {
+        if let Some(ref store) = self.jwks_store {
+            match store.fetch_keys().await {
+                Ok(count) => {
+                    tracing::info!(
+                        "OAuth2 JWKS warmup: fetched {} keys from {:?}",
+                        count,
+                        self.jwks_uri
+                    );
+                }
+                Err(e) => warn!(
+                    "OAuth2 JWKS warmup failed: {} — will retry in background",
+                    e
+                ),
+            }
         }
     }
 
@@ -178,97 +192,6 @@ impl OAuth2Auth {
         decode::<Value>(token, key, &validation)
             .ok()
             .map(|td| td.claims)
-    }
-
-    /// Eagerly fetch JWKS keys if a store is configured.
-    ///
-    /// If `discovery_url` is set, performs OIDC discovery first to resolve
-    /// the `jwks_uri`, then fetches the keys. This should be called during
-    /// plugin warmup to ensure keys are available before the first request.
-    #[allow(dead_code)]
-    pub async fn warmup_jwks(&self) {
-        if let Some(ref store) = self.jwks_store {
-            match store.fetch_keys().await {
-                Ok(count) => info!(
-                    "OAuth2 JWKS warmup: fetched {} keys from {:?}",
-                    count, self.jwks_uri
-                ),
-                Err(e) => warn!(
-                    "OAuth2 JWKS warmup failed: {} — will retry in background",
-                    e
-                ),
-            }
-        }
-    }
-
-    /// Perform OIDC discovery to resolve the JWKS URI from a discovery document.
-    ///
-    /// Fetches `{discovery_url}` and extracts the `jwks_uri` field from the
-    /// JSON response. Returns `None` if discovery fails.
-    async fn discover_jwks_uri(
-        http_client: &PluginHttpClient,
-        discovery_url: &str,
-    ) -> Option<String> {
-        debug!("OAuth2: performing OIDC discovery from {}", discovery_url);
-
-        let resp = match http_client.get().get(discovery_url).send().await {
-            Ok(r) => r,
-            Err(e) => {
-                error!("OAuth2 OIDC discovery failed: {}", e);
-                return None;
-            }
-        };
-
-        if !resp.status().is_success() {
-            error!("OAuth2 OIDC discovery returned HTTP {}", resp.status());
-            return None;
-        }
-
-        let doc: Value = match resp.json().await {
-            Ok(v) => v,
-            Err(e) => {
-                error!("OAuth2 OIDC discovery: failed to parse JSON: {}", e);
-                return None;
-            }
-        };
-
-        doc.get("jwks_uri")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-    }
-
-    /// Create the plugin with OIDC discovery — resolves `discovery_url` to find `jwks_uri`
-    /// at startup. This is an async constructor variant.
-    #[allow(dead_code)]
-    pub async fn new_with_discovery(config: &Value, http_client: PluginHttpClient) -> Self {
-        let mut plugin = Self::new(config, http_client.clone());
-
-        // If discovery_url is set and we don't have a jwks_store yet, resolve it
-        if plugin.jwks_store.is_none()
-            && let Some(ref discovery_url) = plugin.discovery_url
-        {
-            if let Some(jwks_uri) = Self::discover_jwks_uri(&http_client, discovery_url).await {
-                info!("OAuth2 OIDC discovery: resolved jwks_uri={}", jwks_uri);
-                let refresh_interval = config["jwks_refresh_interval_secs"]
-                    .as_u64()
-                    .unwrap_or(JWKS_REFRESH_INTERVAL_SECS);
-                let store = JwksKeyStore::new(jwks_uri.clone(), http_client);
-                let handle = store.start_background_refresh(Duration::from_secs(refresh_interval));
-                plugin.jwks_uri = Some(jwks_uri);
-                plugin.jwks_store = Some(store);
-                plugin._refresh_handle = Some(handle);
-            } else {
-                error!(
-                    "OAuth2 OIDC discovery failed for {} — JWKS validation will not work",
-                    discovery_url
-                );
-            }
-        }
-
-        // Eagerly fetch keys
-        plugin.warmup_jwks().await;
-
-        plugin
     }
 }
 

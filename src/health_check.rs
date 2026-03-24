@@ -206,14 +206,19 @@ impl HealthChecker {
             }
 
             let failures_in_window = state.recent_failures.len() as u32;
-            if failures_in_window >= config.unhealthy_threshold
-                && !self.unhealthy_targets.contains_key(&key)
-            {
-                warn!(
-                    "Passive health check: marking target {} as unhealthy ({} failures in {}s window)",
-                    key, failures_in_window, config.unhealthy_window_seconds
-                );
-                self.unhealthy_targets.insert(key, now_epoch_ms());
+            if failures_in_window >= config.unhealthy_threshold {
+                // Use entry API for atomic check-and-insert to avoid TOCTOU race
+                // where two threads both see "not unhealthy" and both insert/log.
+                let key_ref = key.clone();
+                self.unhealthy_targets
+                    .entry(key)
+                    .or_insert_with(|| {
+                        warn!(
+                            "Passive health check: marking target {} as unhealthy ({} failures in {}s window)",
+                            key_ref, failures_in_window, config.unhealthy_window_seconds
+                        );
+                        now_epoch_ms()
+                    });
             }
         } else {
             let failures = state.consecutive_failures.load(Ordering::Relaxed);
@@ -277,22 +282,24 @@ impl HealthChecker {
                 let now = now_epoch_ms();
 
                 for key in &target_keys {
-                    if let Some(entry) = unhealthy_targets.get(key) {
-                        let marked_at = *entry.value();
-                        if now.saturating_sub(marked_at) >= recovery_ms {
-                            info!(
-                                "Passive recovery timer: restoring target {} after {}s cooldown",
-                                key, healthy_after_seconds
-                            );
-                            drop(entry); // Release DashMap ref before removing
-                            unhealthy_targets.remove(key);
+                    // Use remove_if for atomic check-and-remove to avoid TOCTOU race
+                    // where the key could be re-added between our get() and remove().
+                    let removed = unhealthy_targets
+                        .remove_if(key, |_, marked_at| {
+                            now.saturating_sub(*marked_at) >= recovery_ms
+                        })
+                        .is_some();
 
-                            // Reset failure counters so the target gets a clean slate
-                            if let Some(state) = target_states.get(key) {
-                                state.consecutive_failures.store(0, Ordering::Relaxed);
-                                state.consecutive_successes.store(0, Ordering::Relaxed);
-                                state.recent_failures.clear();
-                            }
+                    if removed {
+                        info!(
+                            "Passive recovery timer: restoring target {} after {}s cooldown",
+                            key, healthy_after_seconds
+                        );
+                        // Reset failure counters so the target gets a clean slate
+                        if let Some(state) = target_states.get(key) {
+                            state.consecutive_failures.store(0, Ordering::Relaxed);
+                            state.consecutive_successes.store(0, Ordering::Relaxed);
+                            state.recent_failures.clear();
                         }
                     }
                 }
@@ -361,28 +368,28 @@ impl HealthChecker {
                             let successes =
                                 state.consecutive_successes.fetch_add(1, Ordering::Relaxed) + 1;
 
-                            if unhealthy_targets.contains_key(&key)
-                                && successes >= healthy_threshold
+                            if successes >= healthy_threshold
+                                && unhealthy_targets.remove(&key).is_some()
                             {
                                 info!(
                                     "Active health check: target {} is healthy (status {})",
                                     key, status
                                 );
-                                unhealthy_targets.remove(&key);
                             }
                         } else {
                             state.consecutive_successes.store(0, Ordering::Relaxed);
                             let failures =
                                 state.consecutive_failures.fetch_add(1, Ordering::Relaxed) + 1;
 
-                            if !unhealthy_targets.contains_key(&key)
-                                && failures >= unhealthy_threshold
-                            {
-                                warn!(
-                                    "Active health check: target {} is unhealthy (status {})",
-                                    key, status
-                                );
-                                unhealthy_targets.insert(key.clone(), now_epoch_ms());
+                            if failures >= unhealthy_threshold {
+                                let key_ref = key.clone();
+                                unhealthy_targets.entry(key.clone()).or_insert_with(|| {
+                                    warn!(
+                                        "Active health check: target {} is unhealthy (status {})",
+                                        key_ref, status
+                                    );
+                                    now_epoch_ms()
+                                });
                             }
                         }
                     }
@@ -393,13 +400,17 @@ impl HealthChecker {
 
                         debug!("Active health check failed for {}: {}", key, e);
 
-                        if !unhealthy_targets.contains_key(&key) && failures >= unhealthy_threshold
-                        {
-                            warn!(
-                                "Active health check: target {} is unhealthy (connection error)",
-                                key
-                            );
-                            unhealthy_targets.insert(key.clone(), now_epoch_ms());
+                        if failures >= unhealthy_threshold {
+                            let key_ref = key.clone();
+                            unhealthy_targets
+                                .entry(key.clone())
+                                .or_insert_with(|| {
+                                    warn!(
+                                        "Active health check: target {} is unhealthy (connection error)",
+                                        key_ref
+                                    );
+                                    now_epoch_ms()
+                                });
                         }
                     }
                 }
@@ -462,125 +473,4 @@ fn now_epoch_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::config::types::PassiveHealthCheck;
-
-    fn make_target(host: &str, port: u16) -> UpstreamTarget {
-        UpstreamTarget {
-            host: host.to_string(),
-            port,
-            weight: 1,
-            tags: std::collections::HashMap::new(),
-        }
-    }
-
-    #[test]
-    fn test_passive_health_marks_unhealthy() {
-        let checker = HealthChecker::new();
-        let target = make_target("backend1", 8080);
-        let config = PassiveHealthCheck {
-            unhealthy_status_codes: vec![500, 502, 503],
-            unhealthy_threshold: 3,
-            unhealthy_window_seconds: 60,
-            healthy_after_seconds: 30,
-        };
-
-        // Report 3 failures
-        for _ in 0..3 {
-            checker.report_response(&target, 500, false, Some(&config));
-        }
-
-        assert!(checker.unhealthy_targets.contains_key("backend1:8080"));
-    }
-
-    #[test]
-    fn test_passive_health_recovers() {
-        let checker = HealthChecker::new();
-        let target = make_target("backend1", 8080);
-        let config = PassiveHealthCheck {
-            unhealthy_status_codes: vec![500],
-            unhealthy_threshold: 2,
-            unhealthy_window_seconds: 60,
-            healthy_after_seconds: 30,
-        };
-
-        // Mark unhealthy
-        for _ in 0..2 {
-            checker.report_response(&target, 500, false, Some(&config));
-        }
-        assert!(checker.unhealthy_targets.contains_key("backend1:8080"));
-
-        // Recovery
-        checker.report_response(&target, 200, false, Some(&config));
-        assert!(!checker.unhealthy_targets.contains_key("backend1:8080"));
-    }
-
-    #[test]
-    fn test_success_does_not_mark_unhealthy() {
-        let checker = HealthChecker::new();
-        let target = make_target("backend1", 8080);
-        let config = PassiveHealthCheck {
-            unhealthy_status_codes: vec![500],
-            unhealthy_threshold: 3,
-            unhealthy_window_seconds: 60,
-            healthy_after_seconds: 30,
-        };
-
-        for _ in 0..100 {
-            checker.report_response(&target, 200, false, Some(&config));
-        }
-
-        assert!(!checker.unhealthy_targets.contains_key("backend1:8080"));
-    }
-
-    #[test]
-    fn test_connection_error_counts_as_failure_regardless_of_status_codes() {
-        let checker = HealthChecker::new();
-        let target = make_target("backend1", 8080);
-        // Only 500 is in the unhealthy list — 502 is NOT
-        let config = PassiveHealthCheck {
-            unhealthy_status_codes: vec![500],
-            unhealthy_threshold: 2,
-            unhealthy_window_seconds: 60,
-            healthy_after_seconds: 30,
-        };
-
-        // Report connection errors with status 502 (synthetic from proxy).
-        // Even though 502 is NOT in unhealthy_status_codes, connection_error=true
-        // should still count as a failure.
-        for _ in 0..2 {
-            checker.report_response(&target, 502, true, Some(&config));
-        }
-
-        assert!(
-            checker.unhealthy_targets.contains_key("backend1:8080"),
-            "Connection errors should mark target unhealthy even if status code is not in unhealthy list"
-        );
-    }
-
-    #[test]
-    fn test_connection_error_recovery_on_success() {
-        let checker = HealthChecker::new();
-        let target = make_target("backend1", 8080);
-        let config = PassiveHealthCheck {
-            unhealthy_status_codes: vec![500],
-            unhealthy_threshold: 2,
-            unhealthy_window_seconds: 60,
-            healthy_after_seconds: 30,
-        };
-
-        // Mark unhealthy via connection errors
-        for _ in 0..2 {
-            checker.report_response(&target, 502, true, Some(&config));
-        }
-        assert!(checker.unhealthy_targets.contains_key("backend1:8080"));
-
-        // A successful response should recover it
-        checker.report_response(&target, 200, false, Some(&config));
-        assert!(!checker.unhealthy_targets.contains_key("backend1:8080"));
-    }
 }

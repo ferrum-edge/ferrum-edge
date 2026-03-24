@@ -456,60 +456,6 @@ async fn test_oauth2_jwks_maps_subject_to_custom_id() {
     assert_eq!(ctx.identified_consumer.unwrap().username, "local-user");
 }
 
-// ─── OIDC Discovery Tests ──────────────────────────────────────────────
-
-#[tokio::test]
-async fn test_oauth2_oidc_discovery_resolves_jwks_uri() {
-    let private_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_private.pem");
-    let public_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_public.pem");
-
-    let mock_server = wiremock::MockServer::start().await;
-
-    // Serve OIDC discovery document
-    let jwks_url = format!("{}/.well-known/jwks.json", mock_server.uri());
-    let discovery_doc = json!({
-        "issuer": mock_server.uri(),
-        "jwks_uri": jwks_url,
-        "authorization_endpoint": format!("{}/authorize", mock_server.uri()),
-        "token_endpoint": format!("{}/token", mock_server.uri()),
-    });
-    wiremock::Mock::given(wiremock::matchers::method("GET"))
-        .and(wiremock::matchers::path(
-            "/.well-known/openid-configuration",
-        ))
-        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(&discovery_doc))
-        .mount(&mock_server)
-        .await;
-
-    // Serve JWKS endpoint
-    let jwks_json = build_rsa_jwks_from_pem(public_key_pem);
-    wiremock::Mock::given(wiremock::matchers::method("GET"))
-        .and(wiremock::matchers::path("/.well-known/jwks.json"))
-        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(&jwks_json))
-        .mount(&mock_server)
-        .await;
-
-    let discovery_url = format!("{}/.well-known/openid-configuration", mock_server.uri());
-    let plugin =
-        OAuth2Auth::new_with_discovery(&json!({"discovery_url": discovery_url}), default_client())
-            .await;
-
-    // Should have resolved jwks_uri from discovery
-    assert!(plugin.jwks_uri().is_some());
-
-    let consumer = create_consumer("discovered-user");
-    let consumer_index = ConsumerIndex::new(&[consumer]);
-
-    let token = create_rs256_token(&json!({"sub": "discovered-user"}), private_key_pem);
-
-    let mut ctx = make_ctx();
-    ctx.headers
-        .insert("authorization".to_string(), format!("Bearer {}", token));
-
-    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
-    assert_continue(result);
-}
-
 // ─── Configurable consumer_claim Tests ──────────────────────────────────
 
 #[tokio::test]

@@ -48,11 +48,6 @@ struct SpanData {
 }
 
 impl OtelTracing {
-    #[allow(dead_code)]
-    pub fn new(config: &Value) -> Self {
-        Self::new_with_http_client(config, PluginHttpClient::default())
-    }
-
     pub fn new_with_http_client(config: &Value, http_client: PluginHttpClient) -> Self {
         let service_name = config["service_name"]
             .as_str()

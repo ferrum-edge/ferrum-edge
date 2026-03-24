@@ -228,7 +228,9 @@ pub async fn handle_admin_request(
             .status(StatusCode::OK)
             .header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
             .body(Full::new(Bytes::from(metrics_output)))
-            .unwrap();
+            .unwrap_or_else(|_| {
+                Response::new(Full::new(Bytes::from("# error rendering metrics\n")))
+            });
         return Ok(resp);
     }
 

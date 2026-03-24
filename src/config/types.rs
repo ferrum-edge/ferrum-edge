@@ -667,19 +667,6 @@ impl GatewayConfig {
             Err(errors)
         }
     }
-
-    /// Build a sorted list of listen_paths for longest prefix matching.
-    #[allow(dead_code)]
-    pub fn build_route_table(&self) -> Vec<(String, String)> {
-        let mut routes: Vec<(String, String)> = self
-            .proxies
-            .iter()
-            .map(|p| (p.listen_path.clone(), p.id.clone()))
-            .collect();
-        // Sort by path length descending for longest prefix match
-        routes.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
-        routes
-    }
 }
 
 fn default_true() -> bool {

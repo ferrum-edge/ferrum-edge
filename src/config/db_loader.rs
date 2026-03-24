@@ -204,8 +204,23 @@ impl DatabaseStore {
         let mut plugins_by_proxy: std::collections::HashMap<String, Vec<PluginAssociation>> =
             std::collections::HashMap::new();
         for r in &assoc_rows {
-            let proxy_id: String = r.try_get("proxy_id").unwrap_or_default();
-            let plugin_config_id: String = r.try_get("plugin_config_id").unwrap_or_default();
+            let proxy_id: String = match r.try_get("proxy_id") {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!("Failed to read proxy_id from proxy_plugins row: {}", e);
+                    continue;
+                }
+            };
+            let plugin_config_id: String = match r.try_get("plugin_config_id") {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!(
+                        "Failed to read plugin_config_id from proxy_plugins row (proxy_id={}): {}",
+                        proxy_id, e
+                    );
+                    continue;
+                }
+            };
             plugins_by_proxy
                 .entry(proxy_id)
                 .or_default()
@@ -469,10 +484,12 @@ impl DatabaseStore {
 
         let plugins: Vec<PluginAssociation> = assoc_rows
             .iter()
-            .filter_map(|r| {
-                r.try_get::<String, _>("plugin_config_id")
-                    .ok()
-                    .map(|plugin_config_id| PluginAssociation { plugin_config_id })
+            .filter_map(|r| match r.try_get::<String, _>("plugin_config_id") {
+                Ok(plugin_config_id) => Some(PluginAssociation { plugin_config_id }),
+                Err(e) => {
+                    warn!("Failed to read plugin_config_id for proxy {}: {}", id, e);
+                    None
+                }
             })
             .collect();
 
@@ -835,7 +852,13 @@ impl DatabaseStore {
             {
                 continue;
             }
-            let creds_str: String = row.try_get("credentials").unwrap_or_default();
+            let creds_str: String = row.try_get("credentials").unwrap_or_else(|e| {
+                warn!(
+                    "Failed to read credentials column for consumer {}: {}",
+                    id, e
+                );
+                String::new()
+            });
             if let Ok(creds) = serde_json::from_str::<serde_json::Value>(&creds_str)
                 && let Some(key) = creds
                     .get("keyauth")
@@ -894,8 +917,22 @@ fn row_to_proxy(
     id: String,
     plugins: Vec<PluginAssociation>,
 ) -> Result<Proxy, anyhow::Error> {
-    let proto_str: String = row.try_get("backend_protocol").unwrap_or("http".into());
-    let auth_mode_str: String = row.try_get("auth_mode").unwrap_or("single".into());
+    // Clone id for use in warning messages (the original is moved into the Proxy struct).
+    let pid = id.clone();
+    let proto_str: String = row.try_get("backend_protocol").unwrap_or_else(|e| {
+        warn!(
+            "Proxy {}: failed to read backend_protocol, defaulting to http: {}",
+            pid, e
+        );
+        "http".into()
+    });
+    let auth_mode_str: String = row.try_get("auth_mode").unwrap_or_else(|e| {
+        warn!(
+            "Proxy {}: failed to read auth_mode, defaulting to single: {}",
+            pid, e
+        );
+        "single".into()
+    });
 
     Ok(Proxy {
         id,
@@ -940,11 +977,22 @@ fn row_to_proxy(
         circuit_breaker: row
             .try_get::<String, _>("circuit_breaker")
             .ok()
-            .and_then(|s| serde_json::from_str::<CircuitBreakerConfig>(&s).ok()),
-        retry: row
-            .try_get::<String, _>("retry")
-            .ok()
-            .and_then(|s| serde_json::from_str::<RetryConfig>(&s).ok()),
+            .and_then(|s| {
+                serde_json::from_str::<CircuitBreakerConfig>(&s)
+                    .map_err(|e| {
+                        warn!("Proxy {}: failed to parse circuit_breaker JSON: {}", pid, e);
+                        e
+                    })
+                    .ok()
+            }),
+        retry: row.try_get::<String, _>("retry").ok().and_then(|s| {
+            serde_json::from_str::<RetryConfig>(&s)
+                .map_err(|e| {
+                    warn!("Proxy {}: failed to parse retry JSON: {}", pid, e);
+                    e
+                })
+                .ok()
+        }),
         response_body_mode: row
             .try_get::<String, _>("response_body_mode")
             .ok()
@@ -988,7 +1036,10 @@ fn row_to_proxy(
 
 /// Parse a consumer row into a Consumer struct.
 fn row_to_consumer(row: &AnyRow) -> Result<Consumer, anyhow::Error> {
-    let creds_str: String = row.try_get("credentials").unwrap_or("{}".into());
+    let creds_str: String = row.try_get("credentials").unwrap_or_else(|e| {
+        warn!("Failed to read credentials column for consumer: {}", e);
+        "{}".into()
+    });
     let credentials = serde_json::from_str(&creds_str).unwrap_or_else(|e| {
         warn!("Failed to parse credentials JSON for consumer: {}", e);
         std::collections::HashMap::new()
@@ -1006,12 +1057,21 @@ fn row_to_consumer(row: &AnyRow) -> Result<Consumer, anyhow::Error> {
 
 /// Parse a plugin_config row into a PluginConfig struct.
 fn row_to_plugin_config(row: &AnyRow) -> Result<PluginConfig, anyhow::Error> {
-    let config_str: String = row.try_get("config").unwrap_or("{}".into());
+    let config_str: String = row.try_get("config").unwrap_or_else(|e| {
+        warn!("Failed to read plugin config column: {}", e);
+        "{}".into()
+    });
     let config_val = serde_json::from_str(&config_str).unwrap_or_else(|e| {
         warn!("Failed to parse plugin config JSON: {}", e);
         serde_json::Value::Null
     });
-    let scope_str: String = row.try_get("scope").unwrap_or("global".into());
+    let scope_str: String = row.try_get("scope").unwrap_or_else(|e| {
+        warn!(
+            "Failed to read plugin scope column, defaulting to global: {}",
+            e
+        );
+        "global".into()
+    });
 
     Ok(PluginConfig {
         id: row.try_get("id")?,
@@ -1031,17 +1091,36 @@ fn row_to_plugin_config(row: &AnyRow) -> Result<PluginConfig, anyhow::Error> {
 
 /// Parse an upstream row into an Upstream struct.
 fn row_to_upstream(row: &AnyRow) -> Result<Upstream, anyhow::Error> {
-    let targets_str: String = row.try_get("targets").unwrap_or("[]".into());
-    let targets: Vec<UpstreamTarget> = serde_json::from_str(&targets_str).unwrap_or_default();
+    let targets_str: String = row.try_get("targets").unwrap_or_else(|e| {
+        warn!("Failed to read upstream targets column: {}", e);
+        "[]".into()
+    });
+    let targets: Vec<UpstreamTarget> = serde_json::from_str(&targets_str).unwrap_or_else(|e| {
+        warn!("Failed to parse upstream targets JSON: {}", e);
+        Vec::new()
+    });
 
-    let algo_str: String = row.try_get("algorithm").unwrap_or("round_robin".into());
+    let algo_str: String = row.try_get("algorithm").unwrap_or_else(|e| {
+        warn!(
+            "Failed to read upstream algorithm column, defaulting to round_robin: {}",
+            e
+        );
+        "round_robin".into()
+    });
     let algorithm: LoadBalancerAlgorithm =
         serde_json::from_value(serde_json::Value::String(algo_str)).unwrap_or_default();
 
     let health_checks: Option<HealthCheckConfig> = row
         .try_get::<String, _>("health_checks")
         .ok()
-        .and_then(|s| serde_json::from_str(&s).ok());
+        .and_then(|s| {
+            serde_json::from_str(&s)
+                .map_err(|e| {
+                    warn!("Failed to parse upstream health_checks JSON: {}", e);
+                    e
+                })
+                .ok()
+        });
 
     Ok(Upstream {
         id: row.try_get("id")?,

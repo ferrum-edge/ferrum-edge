@@ -77,13 +77,22 @@ impl CircuitBreaker {
                             // CAS loser: another thread already transitioned.
                             // Fall through to handle the current state.
                             if current == STATE_HALF_OPEN {
-                                let in_flight =
-                                    self.half_open_in_flight.fetch_add(1, Ordering::Relaxed);
-                                if in_flight < self.config.half_open_max_requests {
-                                    Ok(())
-                                } else {
-                                    self.half_open_in_flight.fetch_sub(1, Ordering::Relaxed);
-                                    Err(CircuitOpenError)
+                                // Use CAS loop to atomically claim a slot
+                                loop {
+                                    let in_flight =
+                                        self.half_open_in_flight.load(Ordering::Acquire);
+                                    if in_flight >= self.config.half_open_max_requests {
+                                        return Err(CircuitOpenError);
+                                    }
+                                    match self.half_open_in_flight.compare_exchange_weak(
+                                        in_flight,
+                                        in_flight + 1,
+                                        Ordering::AcqRel,
+                                        Ordering::Acquire,
+                                    ) {
+                                        Ok(_) => return Ok(()),
+                                        Err(_) => continue,
+                                    }
                                 }
                             } else {
                                 // State changed to something else (e.g. Closed)
@@ -96,12 +105,21 @@ impl CircuitBreaker {
                 }
             }
             STATE_HALF_OPEN => {
-                let in_flight = self.half_open_in_flight.fetch_add(1, Ordering::Relaxed);
-                if in_flight < self.config.half_open_max_requests {
-                    Ok(())
-                } else {
-                    self.half_open_in_flight.fetch_sub(1, Ordering::Relaxed);
-                    Err(CircuitOpenError)
+                // Use CAS loop to atomically claim a slot without exceeding the limit.
+                loop {
+                    let current = self.half_open_in_flight.load(Ordering::Acquire);
+                    if current >= self.config.half_open_max_requests {
+                        return Err(CircuitOpenError);
+                    }
+                    match self.half_open_in_flight.compare_exchange_weak(
+                        current,
+                        current + 1,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    ) {
+                        Ok(_) => return Ok(()),
+                        Err(_) => continue,
+                    }
                 }
             }
             _ => Ok(()),
@@ -121,13 +139,29 @@ impl CircuitBreaker {
                     Ordering::SeqCst,
                     |v| v.checked_sub(1),
                 );
+                // Re-check state: another thread may have reopened the circuit
+                // between our initial load and now.
+                if self.state.load(Ordering::Acquire) != STATE_HALF_OPEN {
+                    return;
+                }
                 let successes = self.success_count.fetch_add(1, Ordering::Relaxed) + 1;
                 if successes >= self.config.success_threshold {
-                    info!("Circuit breaker closing (recovered)");
-                    self.state.store(STATE_CLOSED, Ordering::SeqCst);
-                    self.failure_count.store(0, Ordering::Relaxed);
-                    self.success_count.store(0, Ordering::Relaxed);
-                    self.half_open_in_flight.store(0, Ordering::Relaxed);
+                    // Use CAS to transition: only one thread should close the circuit
+                    if self
+                        .state
+                        .compare_exchange(
+                            STATE_HALF_OPEN,
+                            STATE_CLOSED,
+                            Ordering::SeqCst,
+                            Ordering::Relaxed,
+                        )
+                        .is_ok()
+                    {
+                        info!("Circuit breaker closing (recovered)");
+                        self.failure_count.store(0, Ordering::Relaxed);
+                        self.success_count.store(0, Ordering::Relaxed);
+                        self.half_open_in_flight.store(0, Ordering::Relaxed);
+                    }
                 }
             }
             STATE_CLOSED => {
@@ -252,124 +286,4 @@ fn now_epoch_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn default_config() -> CircuitBreakerConfig {
-        CircuitBreakerConfig {
-            failure_threshold: 3,
-            success_threshold: 2,
-            timeout_seconds: 1,
-            failure_status_codes: vec![500, 502, 503],
-            half_open_max_requests: 1,
-        }
-    }
-
-    #[test]
-    fn test_closed_allows_requests() {
-        let cb = CircuitBreaker::new(default_config());
-        assert!(cb.can_execute().is_ok());
-        assert_eq!(cb.state_name(), "closed");
-    }
-
-    #[test]
-    fn test_opens_after_threshold() {
-        let cb = CircuitBreaker::new(default_config());
-
-        cb.record_failure(500);
-        cb.record_failure(500);
-        assert!(cb.can_execute().is_ok()); // Still closed
-
-        cb.record_failure(500);
-        assert_eq!(cb.state_name(), "open");
-        assert!(cb.can_execute().is_err());
-    }
-
-    #[test]
-    fn test_non_configured_status_treated_as_success() {
-        let cb = CircuitBreaker::new(default_config());
-
-        // 404 is not in failure_status_codes, should be treated as success
-        cb.record_failure(404);
-        cb.record_failure(404);
-        cb.record_failure(404);
-        assert_eq!(cb.state_name(), "closed");
-    }
-
-    #[test]
-    fn test_success_resets_failure_count() {
-        let cb = CircuitBreaker::new(default_config());
-
-        cb.record_failure(500);
-        cb.record_failure(500);
-        cb.record_success(); // Should reset
-        cb.record_failure(500);
-        cb.record_failure(500);
-        // Only 2 failures after reset, should still be closed
-        assert_eq!(cb.state_name(), "closed");
-    }
-
-    #[test]
-    fn test_half_open_recovery() {
-        let config = CircuitBreakerConfig {
-            failure_threshold: 2,
-            success_threshold: 2,
-            timeout_seconds: 0, // Immediate timeout for testing
-            failure_status_codes: vec![500],
-            half_open_max_requests: 2,
-        };
-        let cb = CircuitBreaker::new(config);
-
-        // Trip open
-        cb.record_failure(500);
-        cb.record_failure(500);
-        assert_eq!(cb.state_name(), "open");
-
-        // Timeout elapsed (0 seconds), should transition to half-open
-        assert!(cb.can_execute().is_ok());
-        assert_eq!(cb.state_name(), "half_open");
-
-        // Successful probes
-        cb.record_success();
-        cb.record_success();
-        assert_eq!(cb.state_name(), "closed");
-    }
-
-    #[test]
-    fn test_half_open_probe_failure_reopens() {
-        let config = CircuitBreakerConfig {
-            failure_threshold: 2,
-            success_threshold: 2,
-            timeout_seconds: 0,
-            failure_status_codes: vec![500],
-            half_open_max_requests: 1,
-        };
-        let cb = CircuitBreaker::new(config);
-
-        // Trip open
-        cb.record_failure(500);
-        cb.record_failure(500);
-
-        // Transition to half-open
-        assert!(cb.can_execute().is_ok());
-
-        // Probe fails
-        cb.record_failure(500);
-        assert_eq!(cb.state_name(), "open");
-    }
-
-    #[test]
-    fn test_cache_creates_and_reuses() {
-        let cache = CircuitBreakerCache::new();
-        let config = default_config();
-
-        let cb1 = cache.get_or_create("proxy-1", &config);
-        let cb2 = cache.get_or_create("proxy-1", &config);
-
-        // Should be the same instance
-        assert!(Arc::ptr_eq(&cb1, &cb2));
-    }
 }

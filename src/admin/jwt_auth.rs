@@ -119,12 +119,6 @@ impl JwtManager {
         self.verify_token(&token)
             .map_err(|e: JwtEncodeError| JwtError::VerificationFailed(e.to_string()))
     }
-
-    /// Get configuration
-    #[allow(dead_code)]
-    pub fn config(&self) -> &JwtConfig {
-        &self.config
-    }
 }
 
 /// JWT Error types

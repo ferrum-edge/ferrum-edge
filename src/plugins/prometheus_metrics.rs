@@ -36,13 +36,13 @@ pub struct MetricsRegistry {
 /// Histogram with predefined buckets.
 pub struct HistogramBuckets {
     /// Bucket boundaries in milliseconds
-    boundaries: Vec<f64>,
+    pub boundaries: Vec<f64>,
     /// Count of observations <= each boundary
-    counts: Vec<AtomicU64>,
+    pub counts: Vec<AtomicU64>,
     /// Sum of all observations
-    sum: std::sync::atomic::AtomicU64, // stored as bits of f64
+    pub sum: std::sync::atomic::AtomicU64, // stored as bits of f64
     /// Total count
-    count: AtomicU64,
+    pub count: AtomicU64,
 }
 
 impl HistogramBuckets {
@@ -85,8 +85,14 @@ impl HistogramBuckets {
     }
 }
 
+impl Default for MetricsRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MetricsRegistry {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             request_counter: DashMap::new(),
             request_duration_buckets: DashMap::new(),
@@ -95,7 +101,7 @@ impl MetricsRegistry {
         }
     }
 
-    fn record(&self, summary: &TransactionSummary) {
+    pub fn record(&self, summary: &TransactionSummary) {
         // Increment request counter
         let counter_key = format!(
             "{}:{}:{}",
