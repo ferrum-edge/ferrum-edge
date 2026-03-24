@@ -1171,7 +1171,9 @@ pub async fn handle_proxy_request(
 
     let socket_ip = remote_addr.ip().to_string();
 
-    // Build request context (client_ip resolved below after headers are parsed)
+    // Build request context — pass cloned socket_ip to ctx (client_ip may be
+    // overwritten by trusted-proxy resolution below). method and path keep
+    // separate ownership for use in backend URL building and logging.
     let mut ctx = RequestContext::new(socket_ip.clone(), method.clone(), path.clone());
 
     // Validate and extract headers with size limits
@@ -1400,17 +1402,16 @@ pub async fn handle_proxy_request(
         }
     }
 
-    // before_proxy hooks — only clone headers if at least one plugin modifies them
+    // before_proxy hooks — only clone headers if at least one plugin modifies them.
+    // When no plugin modifies headers, pass &mut ctx.headers directly to avoid
+    // an expensive per-request HashMap clone on the hot path.
     let needs_header_clone =
         !plugins.is_empty() && plugins.iter().any(|p| p.modifies_request_headers());
-    let mut owned_proxy_headers;
-    let proxy_headers: &HashMap<String, String> = if needs_header_clone {
-        owned_proxy_headers = ctx.headers.clone();
+    let mut owned_proxy_headers: Option<HashMap<String, String>> = None;
+    if needs_header_clone {
+        let mut cloned = ctx.headers.clone();
         for plugin in plugins.iter() {
-            match plugin
-                .before_proxy(&mut ctx, &mut owned_proxy_headers)
-                .await
-            {
+            match plugin.before_proxy(&mut ctx, &mut cloned).await {
                 PluginResult::Reject {
                     status_code,
                     body,
@@ -1429,21 +1430,20 @@ pub async fn handle_proxy_request(
                 PluginResult::Continue => {}
             }
         }
-        &owned_proxy_headers
+        owned_proxy_headers = Some(cloned);
     } else if !plugins.is_empty() {
         // Run before_proxy hooks that don't modify headers (e.g., body_validator).
-        // Pass ctx.headers so plugins can read (but not modify) the real headers.
-        owned_proxy_headers = ctx.headers.clone();
+        // No plugin modifies headers, so swap headers out of ctx temporarily to
+        // satisfy the borrow checker without cloning — zero allocation hot path.
+        let mut tmp_headers = std::mem::take(&mut ctx.headers);
         for plugin in plugins.iter() {
-            match plugin
-                .before_proxy(&mut ctx, &mut owned_proxy_headers)
-                .await
-            {
+            match plugin.before_proxy(&mut ctx, &mut tmp_headers).await {
                 PluginResult::Reject {
                     status_code,
                     body,
                     headers,
                 } => {
+                    ctx.headers = tmp_headers;
                     log_rejected_request(&plugins, &ctx, status_code, start_time, "before_proxy")
                         .await;
                     record_request(&state, status_code);
@@ -1457,10 +1457,10 @@ pub async fn handle_proxy_request(
                 PluginResult::Continue => {}
             }
         }
-        &ctx.headers
-    } else {
-        &ctx.headers
-    };
+        ctx.headers = tmp_headers;
+    }
+    let proxy_headers: &HashMap<String, String> =
+        owned_proxy_headers.as_ref().unwrap_or(&ctx.headers);
 
     // Check if this is a WebSocket upgrade request and the proxy supports WebSocket
     // This check happens AFTER authentication and authorization plugins have run
