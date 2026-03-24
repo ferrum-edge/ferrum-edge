@@ -10,6 +10,7 @@ mod cors_tests;
 mod hmac_auth_tests;
 mod http_logging_tests;
 mod ip_restriction_tests;
+mod jwks_store_tests;
 mod jwt_auth_plugin_tests;
 mod key_auth_tests;
 mod oauth2_auth_tests;

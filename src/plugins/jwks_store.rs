@@ -230,18 +230,3 @@ impl JwksKeyStore {
         })
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_empty_store_has_no_keys() {
-        let store = JwksKeyStore::new(
-            "https://example.com/.well-known/jwks.json".to_string(),
-            PluginHttpClient::default(),
-        );
-        assert!(!store.has_keys());
-        assert!(store.get_key("nonexistent").is_none());
-    }
-}

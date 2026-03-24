@@ -1,7 +1,13 @@
+mod circuit_breaker_tests;
+mod client_ip_tests;
+mod config_delta_tests;
 mod consumer_index_tests;
 mod dns_tests;
 mod grpc_proxy_tests;
+mod health_check_tests;
+mod load_balancer_tests;
 mod proxy_tests;
 mod response_body_mode_tests;
+mod retry_tests;
 mod router_cache_tests;
 mod websocket_auth_tests;
