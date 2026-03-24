@@ -205,8 +205,6 @@ struct LoadBalancer {
     targets: Vec<UpstreamTarget>,
     /// Pre-computed "host:port" keys for each target, avoiding format!() per request.
     target_keys: Vec<String>,
-    /// O(1) reverse lookup from (host, port) to target index, avoiding linear scan.
-    target_index: HashMap<(String, u16), usize>,
     algorithm: LoadBalancerAlgorithm,
     /// Round-robin counter.
     rr_counter: AtomicU64,
@@ -230,12 +228,6 @@ impl LoadBalancer {
         // Pre-compute target keys once at build time, not per-request
         let target_keys: Vec<String> = targets.iter().map(target_key).collect();
 
-        // Build O(1) reverse index from (host, port) -> target index
-        let mut target_index = HashMap::with_capacity(targets.len());
-        for (i, t) in targets.iter().enumerate() {
-            target_index.insert((t.host.clone(), t.port), i);
-        }
-
         // Build consistent hash ring with virtual nodes
         let mut hash_ring = Vec::new();
         if algorithm == LoadBalancerAlgorithm::ConsistentHashing {
@@ -254,7 +246,6 @@ impl LoadBalancer {
         Self {
             targets: targets.to_vec(),
             target_keys,
-            target_index,
             algorithm,
             rr_counter: AtomicU64::new(0),
             wrr_state: std::sync::Mutex::new(wrr_weights),
@@ -418,8 +409,11 @@ impl LoadBalancer {
         exclude: &UpstreamTarget,
         unhealthy: Option<&DashMap<String, u64>>,
     ) -> Option<UpstreamTarget> {
-        // Find the exclude target's index via O(1) lookup
-        let exclude_idx = self.target_index.get(&(exclude.host.clone(), exclude.port));
+        // Find the exclude target's index via linear scan (avoids host.clone() allocation)
+        let exclude_idx = self
+            .targets
+            .iter()
+            .position(|t| t.host == exclude.host && t.port == exclude.port);
 
         // Build healthy targets excluding the specified target
         let healthy: Vec<(usize, &UpstreamTarget)> = self
@@ -428,7 +422,7 @@ impl LoadBalancer {
             .enumerate()
             .filter(|(i, _)| {
                 // Exclude the specified target
-                if exclude_idx.is_some_and(|&ei| ei == *i) {
+                if exclude_idx.is_some_and(|ei| ei == *i) {
                     return false;
                 }
                 if let Some(unhealthy_set) = unhealthy {
@@ -445,7 +439,7 @@ impl LoadBalancer {
                 .targets
                 .iter()
                 .enumerate()
-                .filter(|(i, _)| exclude_idx.is_none_or(|&ei| ei != *i))
+                .filter(|(i, _)| exclude_idx.is_none_or(|ei| ei != *i))
                 .collect();
             if fallback.is_empty() {
                 return None;
