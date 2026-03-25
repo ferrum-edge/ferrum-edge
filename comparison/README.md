@@ -189,6 +189,9 @@ The following results were collected on macOS (Apple Silicon) with 8 threads, 10
 | **Tyk v5.7** (Docker) | HTTP | 23,036 | 22,380 | 4.22 ms | 4.32 ms |
 | **Tyk v5.7** (Docker) | HTTPS | 22,185 | 21,561 | 4.43 ms | 4.50 ms |
 | **Tyk v5.7** (Docker) | E2E TLS | 21,114 | 19,154 | 4.93 ms | 5.41 ms |
+| **KrakenD 2.13** (Docker) | HTTP | 20,417 | 19,936 | — | — |
+| **KrakenD 2.13** (Docker) | HTTPS | 19,636 | — | — | — |
+| **KrakenD 2.13** (Docker) | E2E TLS | 20,826 | — | — | — |
 
 > **Note:** Pingora E2E TLS is not supported in this benchmark — Pingora's TLS library requires a valid DNS hostname for upstream SNI and cannot connect to IP-based backends (127.0.0.1) over TLS. This is a framework limitation, not a configuration issue.
 
@@ -223,6 +226,22 @@ Pingora is a pure proxy framework (no plugins, admin API, or config management),
 - **Pingora cannot do E2E TLS with IP-based backends** — its TLS library requires a valid DNS hostname for SNI. Ferrum handles this without issue, making it more flexible for local/container deployments where backends are addressed by IP.
 - **Ferrum's HTTPS overhead is essentially zero** — HTTP and HTTPS /health both hit ~90K req/s. Ferrum's rustls-based TLS termination adds negligible cost, compared to Pingora where HTTPS adds 8% overhead on /health.
 
+### Ferrum vs KrakenD
+
+KrakenD is a high-performance, stateless Go-based API gateway. It runs in Docker with `no-op` encoding (raw response pass-through) to minimize processing overhead. Key-auth benchmarks are excluded because KrakenD's API key authentication requires Enterprise Edition.
+
+| Test | Ferrum | KrakenD | Advantage |
+|------|--------|---------|-----------|
+| HTTP /health | **96,520** req/s | 20,417 req/s | **Ferrum 4.7x faster** |
+| HTTP /api/users | **45,924** req/s | 19,936 req/s | **Ferrum 2.3x faster** |
+| HTTPS /health | **93,766** req/s | 19,636 req/s | **Ferrum 4.8x faster** |
+| E2E TLS /health | **86,792** req/s | 20,826 req/s | **Ferrum 4.2x faster** |
+
+**Key findings:**
+- **Ferrum is 4.2–4.8x faster than KrakenD** on lightweight /health requests across all TLS scenarios.
+- **KrakenD throughput is flat across protocols** (~20K req/s for HTTP, HTTPS, and E2E TLS), suggesting Docker networking overhead dominates its performance profile on macOS.
+- **KrakenD performs similarly to Kong and Tyk** — all three Docker-based gateways land in the 19–26K req/s range, while native Ferrum delivers 4–5x more throughput.
+
 ### Adjusting for Docker Overhead
 
 Kong and Tyk ran in Docker on macOS, which adds ~0.1–0.5 ms latency per request and reduces throughput by ~5–15% (see [Docker Overhead](#docker-overhead)). Even after generously accounting for this:
@@ -233,6 +252,7 @@ Kong and Tyk ran in Docker on macOS, which adds ~0.1–0.5 ms latency per reques
 | **Pingora** (native) | 59,429 | **1.5x faster** |
 | **Kong** (Docker, +15% adjusted) | ~30,300 | **3.0x faster** |
 | **Tyk** (Docker, +15% adjusted) | ~26,500 | **3.4x faster** |
+| **KrakenD** (Docker, +15% adjusted) | ~23,500 | **3.8x faster** |
 
 ### End-to-End TLS Performance
 
@@ -243,8 +263,10 @@ The E2E TLS scenario (client → HTTPS → gateway → HTTPS → backend) is the
 | **Ferrum** (native) | **81,148** | **39,120** | 1.30 ms | 3.13 ms |
 | **Kong 3.9** (Docker) | 23,333 | 22,556 | 4.46 ms | 4.89 ms |
 | **Tyk v5.7** (Docker) | 21,114 | 19,154 | 4.93 ms | 5.41 ms |
+| **KrakenD 2.13** (Docker) | 20,826 | — | — | — |
 
 - **Ferrum is 3.5x faster than Kong** on E2E TLS /health
+- **Ferrum is 4.2x faster than KrakenD** on E2E TLS /health
 - **Ferrum is 1.7x faster than Kong** on E2E TLS /api/users
 - **Ferrum is 2x faster than Tyk** on E2E TLS /api/users
 
@@ -264,12 +286,12 @@ Ferrum's TLS termination has essentially **zero throughput cost** — HTTP and H
 ### Key Takeaways
 
 - **Ferrum is 41–52% faster than Pingora** on lightweight requests (the fairest native-to-native comparison), and leads on all endpoints including heavier payloads.
-- **Ferrum is 3–4x faster than Kong and Tyk** on pure proxy throughput, even after giving Docker gateways a generous 15% adjustment.
+- **Ferrum is 3–5x faster than Kong, Tyk, and KrakenD** on pure proxy throughput, even after giving Docker gateways a generous 15% adjustment.
 - **Ferrum's TLS implementation is the most efficient** — effectively zero overhead for TLS termination (HTTP and HTTPS deliver the same throughput), compared to Kong's 22% drop.
 - **Ferrum's key-auth has zero measurable overhead** — authenticated requests run at the same speed as unauthenticated ones, thanks to O(1) credential lookup via pre-computed ConsumerIndex. Kong takes a 10% hit, Tyk takes a 30% hit for authentication.
 - **Ferrum uniquely supports E2E TLS with IP-based backends** — Pingora cannot test E2E TLS due to its SNI limitation.
 - **Docker overhead accounts for at most ~0.5 ms of the latency gap.** Ferrum's latency advantage over Kong is ~2.6 ms (HTTP) to ~3.6 ms (E2E TLS) — the vast majority is real gateway overhead, not Docker artifact.
-- **Kong and Tyk perform comparably** when both run in Docker with proper connection pooling — Kong edges ahead slightly on /health, Tyk is more consistent across endpoints.
+- **Kong, Tyk, and KrakenD perform comparably** when all run in Docker — all three land in the 19–26K req/s range, suggesting Docker networking overhead on macOS is a significant equalizer. Kong edges ahead slightly on /health, while KrakenD and Tyk are more consistent across protocols.
 
 For the most apples-to-apples comparison, run on Linux where all gateways can be installed natively.
 
