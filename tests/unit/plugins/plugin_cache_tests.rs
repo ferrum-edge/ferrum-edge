@@ -57,10 +57,16 @@ fn make_plugin_config(
     proxy_id: Option<&str>,
     enabled: bool,
 ) -> PluginConfig {
+    // Some plugins now require non-empty config to be created successfully.
+    let config = match plugin_name {
+        "access_control" => json!({"allowed_ips": ["0.0.0.0/0"]}),
+        "ip_restriction" => json!({"allow": ["0.0.0.0/0"]}),
+        _ => json!({}),
+    };
     PluginConfig {
         id: id.to_string(),
         plugin_name: plugin_name.to_string(),
-        config: json!({}),
+        config,
         scope,
         proxy_id: proxy_id.map(|s| s.to_string()),
         enabled,
@@ -97,7 +103,7 @@ fn test_global_plugins_returned_for_all_proxies() {
             true,
         )],
     );
-    let cache = PluginCache::new(&config);
+    let cache = PluginCache::new(&config).unwrap();
 
     let p1_plugins = cache.get_plugins("p1");
     let p2_plugins = cache.get_plugins("p2");
@@ -123,7 +129,7 @@ fn test_proxy_scoped_plugins_override_globals_of_same_name() {
             ),
         ],
     );
-    let cache = PluginCache::new(&config);
+    let cache = PluginCache::new(&config).unwrap();
 
     let plugins = cache.get_plugins("p1");
     // Should have 1 plugin (proxy-scoped replaces global of same name)
@@ -143,7 +149,7 @@ fn test_disabled_plugins_excluded() {
             false, // disabled
         )],
     );
-    let cache = PluginCache::new(&config);
+    let cache = PluginCache::new(&config).unwrap();
 
     let plugins = cache.get_plugins("p1");
     assert_eq!(plugins.len(), 0);
@@ -161,7 +167,7 @@ fn test_rebuild_produces_updated_plugin_set() {
             true,
         )],
     );
-    let cache = PluginCache::new(&config1);
+    let cache = PluginCache::new(&config1).unwrap();
 
     assert_eq!(cache.get_plugins("p1").len(), 1);
     assert_eq!(cache.get_plugins("p1")[0].name(), "stdout_logging");
@@ -177,7 +183,7 @@ fn test_rebuild_produces_updated_plugin_set() {
             true,
         )],
     );
-    cache.rebuild(&config2);
+    cache.rebuild(&config2).unwrap();
 
     assert_eq!(cache.get_plugins("p1").len(), 1);
     assert_eq!(cache.get_plugins("p1")[0].name(), "transaction_debugger");
@@ -195,7 +201,7 @@ fn test_plugins_persist_across_get_calls() {
             true,
         )],
     );
-    let cache = PluginCache::new(&config);
+    let cache = PluginCache::new(&config).unwrap();
 
     let call1 = cache.get_plugins("p1");
     let call2 = cache.get_plugins("p1");
@@ -216,7 +222,7 @@ fn test_unknown_proxy_falls_back_to_globals() {
             true,
         )],
     );
-    let cache = PluginCache::new(&config);
+    let cache = PluginCache::new(&config).unwrap();
 
     // "unknown" proxy not in config — should get global plugins
     let plugins = cache.get_plugins("unknown");
@@ -240,7 +246,7 @@ fn test_multiple_global_and_proxy_plugins() {
             make_plugin_config("ps1", "key_auth", PluginScope::Proxy, Some("p1"), true),
         ],
     );
-    let cache = PluginCache::new(&config);
+    let cache = PluginCache::new(&config).unwrap();
 
     let plugins = cache.get_plugins("p1");
     // 2 global + 1 proxy-scoped = 3
@@ -262,7 +268,7 @@ fn test_proxy_count() {
         ],
         vec![],
     );
-    let cache = PluginCache::new(&config);
+    let cache = PluginCache::new(&config).unwrap();
 
     assert_eq!(cache.proxy_count(), 3);
 }
@@ -280,7 +286,7 @@ fn test_plugins_sorted_by_priority() {
             make_plugin_config("ps2", "cors", PluginScope::Proxy, Some("p1"), true),
         ],
     );
-    let cache = PluginCache::new(&config);
+    let cache = PluginCache::new(&config).unwrap();
     let plugins = cache.get_plugins("p1");
 
     assert_eq!(plugins.len(), 3);
@@ -329,7 +335,7 @@ fn test_full_plugin_priority_chain() {
             ),
         ],
     );
-    let cache = PluginCache::new(&config);
+    let cache = PluginCache::new(&config).unwrap();
     let plugins = cache.get_plugins("p1");
 
     let names: Vec<&str> = plugins.iter().map(|p| p.name()).collect();
@@ -356,7 +362,7 @@ fn test_global_plugins_also_sorted() {
             make_plugin_config("g2", "cors", PluginScope::Global, None, true),
         ],
     );
-    let cache = PluginCache::new(&config);
+    let cache = PluginCache::new(&config).unwrap();
 
     // Even for unknown proxy (global fallback), should be sorted
     let plugins = cache.get_plugins("unknown");
@@ -386,7 +392,7 @@ async fn test_rate_limiter_state_persists_across_calls() {
             updated_at: Utc::now(),
         }],
     );
-    let cache = PluginCache::new(&config);
+    let cache = PluginCache::new(&config).unwrap();
 
     let plugins = cache.get_plugins("p1");
     let rate_limiter = &plugins[0];
@@ -439,7 +445,7 @@ async fn test_concurrent_get_plugins() {
             true,
         )],
     );
-    let cache = std::sync::Arc::new(PluginCache::new(&config));
+    let cache = std::sync::Arc::new(PluginCache::new(&config).unwrap());
 
     let mut handles = vec![];
     for _ in 0..10 {
@@ -468,7 +474,7 @@ async fn test_rebuild_during_reads() {
             true,
         )],
     );
-    let cache = std::sync::Arc::new(PluginCache::new(&config1));
+    let cache = std::sync::Arc::new(PluginCache::new(&config1).unwrap());
 
     // Snapshot before rebuild
     let pre_rebuild = cache.get_plugins("p1");
@@ -485,7 +491,7 @@ async fn test_rebuild_during_reads() {
             true,
         )],
     );
-    cache.rebuild(&config2);
+    cache.rebuild(&config2).unwrap();
 
     // Post-rebuild should see new plugin
     let post_rebuild = cache.get_plugins("p1");

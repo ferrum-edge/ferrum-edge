@@ -254,7 +254,7 @@ pub trait Plugin: Send + Sync {
 /// Prefer [`create_plugin_with_http_client`] in production to share the gateway's
 /// pooled client across all plugins for connection reuse and keepalive.
 #[allow(dead_code)]
-pub fn create_plugin(name: &str, config: &Value) -> Option<Arc<dyn Plugin>> {
+pub fn create_plugin(name: &str, config: &Value) -> Result<Option<Arc<dyn Plugin>>, String> {
     create_plugin_with_http_client(name, config, PluginHttpClient::default())
 }
 
@@ -266,48 +266,54 @@ pub fn create_plugin(name: &str, config: &Value) -> Option<Arc<dyn Plugin>> {
 ///
 /// This ensures all plugin outbound traffic gets proper connection reuse instead
 /// of opening a new TCP+TLS connection per call.
+///
+/// Returns:
+/// - `Ok(Some(plugin))` — plugin created successfully
+/// - `Ok(None)` — unknown plugin name
+/// - `Err(msg)` — plugin config validation failed
 pub fn create_plugin_with_http_client(
     name: &str,
     config: &Value,
     http_client: PluginHttpClient,
-) -> Option<Arc<dyn Plugin>> {
+) -> Result<Option<Arc<dyn Plugin>>, String> {
     match name {
-        "stdout_logging" => Some(Arc::new(stdout_logging::StdoutLogging::new(config))),
-        "http_logging" => Some(Arc::new(http_logging::HttpLogging::new(
+        "stdout_logging" => Ok(Some(Arc::new(stdout_logging::StdoutLogging::new(config)))),
+        "http_logging" => Ok(Some(Arc::new(http_logging::HttpLogging::new(
             config,
             http_client,
+        )?))),
+        "transaction_debugger" => Ok(Some(Arc::new(
+            transaction_debugger::TransactionDebugger::new(config),
         ))),
-        "transaction_debugger" => Some(Arc::new(transaction_debugger::TransactionDebugger::new(
-            config,
-        ))),
-        "oauth2_auth" => Some(Arc::new(oauth2_auth::OAuth2Auth::new(
+        "oauth2_auth" => Ok(Some(Arc::new(oauth2_auth::OAuth2Auth::new(
             config,
             http_client.clone(),
+        )?))),
+        "jwt_auth" => Ok(Some(Arc::new(jwt_auth::JwtAuth::new(config)))),
+        "key_auth" => Ok(Some(Arc::new(key_auth::KeyAuth::new(config)))),
+        "basic_auth" => Ok(Some(Arc::new(basic_auth::BasicAuth::new(config)))),
+        "hmac_auth" => Ok(Some(Arc::new(hmac_auth::HmacAuth::new(config)))),
+        "cors" => Ok(Some(Arc::new(cors::CorsPlugin::new(config)))),
+        "access_control" => Ok(Some(Arc::new(access_control::AccessControl::new(config)?))),
+        "ip_restriction" => Ok(Some(Arc::new(ip_restriction::IpRestriction::new(config)?))),
+        "bot_detection" => Ok(Some(Arc::new(bot_detection::BotDetection::new(config)))),
+        "correlation_id" => Ok(Some(Arc::new(correlation_id::CorrelationId::new(config)))),
+        "request_transformer" => Ok(Some(Arc::new(
+            request_transformer::RequestTransformer::new(config),
         ))),
-        "jwt_auth" => Some(Arc::new(jwt_auth::JwtAuth::new(config))),
-        "key_auth" => Some(Arc::new(key_auth::KeyAuth::new(config))),
-        "basic_auth" => Some(Arc::new(basic_auth::BasicAuth::new(config))),
-        "hmac_auth" => Some(Arc::new(hmac_auth::HmacAuth::new(config))),
-        "cors" => Some(Arc::new(cors::CorsPlugin::new(config))),
-        "access_control" => Some(Arc::new(access_control::AccessControl::new(config))),
-        "ip_restriction" => Some(Arc::new(ip_restriction::IpRestriction::new(config))),
-        "bot_detection" => Some(Arc::new(bot_detection::BotDetection::new(config))),
-        "correlation_id" => Some(Arc::new(correlation_id::CorrelationId::new(config))),
-        "request_transformer" => Some(Arc::new(request_transformer::RequestTransformer::new(
-            config,
+        "response_transformer" => Ok(Some(Arc::new(
+            response_transformer::ResponseTransformer::new(config),
         ))),
-        "response_transformer" => Some(Arc::new(response_transformer::ResponseTransformer::new(
-            config,
+        "rate_limiting" => Ok(Some(Arc::new(rate_limiting::RateLimiting::new(config)))),
+        "body_validator" => Ok(Some(Arc::new(body_validator::BodyValidator::new(config)))),
+        "request_termination" => Ok(Some(Arc::new(
+            request_termination::RequestTermination::new(config),
         ))),
-        "rate_limiting" => Some(Arc::new(rate_limiting::RateLimiting::new(config))),
-        "body_validator" => Some(Arc::new(body_validator::BodyValidator::new(config))),
-        "request_termination" => Some(Arc::new(request_termination::RequestTermination::new(
+        "prometheus_metrics" => Ok(Some(Arc::new(prometheus_metrics::PrometheusMetrics::new(
             config,
-        ))),
-        "prometheus_metrics" => Some(Arc::new(prometheus_metrics::PrometheusMetrics::new(config))),
-        "otel_tracing" => Some(Arc::new(otel_tracing::OtelTracing::new_with_http_client(
-            config,
-            http_client,
+        )))),
+        "otel_tracing" => Ok(Some(Arc::new(
+            otel_tracing::OtelTracing::new_with_http_client(config, http_client)?,
         ))),
         _ => {
             // Fall through to custom plugins registry
@@ -315,12 +321,29 @@ pub fn create_plugin_with_http_client(
             if result.is_none() {
                 tracing::warn!("Unknown plugin: {}", name);
             }
-            result
+            Ok(result)
         }
     }
 }
 
 /// List of all available plugin names (built-in + custom).
+/// Returns true if the named plugin is security-critical (auth or access control).
+///
+/// Validation failures for these plugins are fatal at startup — the gateway
+/// refuses to start rather than serving traffic without the intended security.
+pub fn is_security_plugin(name: &str) -> bool {
+    matches!(
+        name,
+        "key_auth"
+            | "basic_auth"
+            | "jwt_auth"
+            | "hmac_auth"
+            | "oauth2_auth"
+            | "access_control"
+            | "ip_restriction"
+    )
+}
+
 pub fn available_plugins() -> Vec<&'static str> {
     let mut plugins = vec![
         "stdout_logging",

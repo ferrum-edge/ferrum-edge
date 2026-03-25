@@ -22,7 +22,7 @@ The CORS plugin is configured via the `plugin_configs` section in your YAML conf
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `allowed_origins` | `string[]` | `["*"]` | Origins permitted to make cross-origin requests. Use `["*"]` to allow any origin, or list specific origins for stricter control. |
+| `allowed_origins` | `string[]` | `["*"]` | Origins permitted to make cross-origin requests. Use `["*"]` to allow any origin, list specific origins for exact matching, or use wildcard subdomain patterns like `"*.company.com"` to allow all subdomains. These can be mixed (see examples below). If `"*"` appears anywhere in the list, all origins are allowed. |
 | `allowed_methods` | `string[]` | `["GET","HEAD","POST","PUT","PATCH","DELETE","OPTIONS"]` | HTTP methods returned in the `Access-Control-Allow-Methods` preflight header. Preflight requests for unlisted methods are rejected with 403. |
 | `allowed_headers` | `string[]` | `["Accept","Authorization","Content-Type","Origin","X-Requested-With"]` | Request headers returned in the `Access-Control-Allow-Headers` preflight header. |
 | `exposed_headers` | `string[]` | `[]` | Response headers the browser is allowed to access via JavaScript, returned in `Access-Control-Expose-Headers`. |
@@ -121,7 +121,35 @@ plugin_configs:
     enabled: true
 ```
 
-### Example 4: Backend Handles OPTIONS
+### Example 4: Wildcard Subdomain Origins
+
+Allow all subdomains of a domain, optionally mixed with exact origins.
+
+```yaml
+plugin_configs:
+  - id: "cors-subdomain"
+    plugin_name: "cors"
+    config:
+      allowed_origins:
+        - "*.company.com"
+        - "https://partner-app.example.com"
+      allow_credentials: true
+      max_age: 3600
+    scope: global
+    enabled: true
+```
+
+This allows:
+- `https://app.company.com` ✅ (matches `*.company.com`)
+- `https://staging.company.com` ✅ (matches `*.company.com`)
+- `https://deep.sub.company.com` ✅ (matches `*.company.com`)
+- `https://partner-app.example.com` ✅ (exact match)
+- `https://company.com` ❌ (bare domain does not match `*.company.com`)
+- `https://evil.com` ❌ (no match)
+
+> **Note:** Wildcard subdomain patterns match the host portion of the origin only. `*.company.com` matches any origin whose host ends with `.company.com`, regardless of scheme or port. The bare domain (`company.com` without a subdomain) does **not** match — add it as a separate exact entry if needed.
+
+### Example 5: Backend Handles OPTIONS
 
 If your backend service implements its own preflight handling and you only want the gateway to add response headers, set `preflight_continue: true`.
 
@@ -282,7 +310,7 @@ curl -v http://localhost:8000/api/users
 
 1. **403 "CORS origin not allowed"**
 
-   The `Origin` header value does not match any entry in `allowed_origins`. Origins are case-sensitive and must include the scheme (e.g., `https://example.com`, not `example.com`).
+   The `Origin` header value does not match any entry in `allowed_origins`. Exact origins must include the scheme (e.g., `https://example.com`, not `example.com`). Origin matching is case-insensitive. If using wildcard subdomain patterns (e.g., `*.company.com`), note that the bare domain (`https://company.com`) does not match — add it as a separate exact entry if needed.
 
 2. **403 "CORS method not allowed: ..."**
 

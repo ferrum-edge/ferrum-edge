@@ -318,7 +318,7 @@ async fn test_http3_proxy_state_creation() {
 
     let gc = create_http3_test_gateway_config();
     let router_cache = Arc::new(RouterCache::new(&gc, 10_000));
-    let plugin_cache = Arc::new(PluginCache::new(&gc));
+    let plugin_cache = Arc::new(PluginCache::new(&gc).unwrap());
     let consumer_index = Arc::new(ConsumerIndex::new(&gc.consumers));
     let proxy_state = ProxyState {
         config: gateway_config,
@@ -453,7 +453,7 @@ async fn test_http3_full_integration() {
     // Create proxy state with HTTP/3 support
     let gc = create_http3_test_gateway_config();
     let router_cache = Arc::new(RouterCache::new(&gc, 10_000));
-    let plugin_cache = Arc::new(PluginCache::new(&gc));
+    let plugin_cache = Arc::new(PluginCache::new(&gc).unwrap());
     let consumer_index = Arc::new(ConsumerIndex::new(&gc.consumers));
     let proxy_state = ProxyState {
         config: gateway_config,

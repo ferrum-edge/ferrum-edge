@@ -1,7 +1,7 @@
 //! Tests for prometheus_metrics plugin
 
 use ferrum_gateway::plugins::prometheus_metrics::{
-    MetricsRegistry, PrometheusMetrics, global_registry,
+    CounterKey, MetricsRegistry, PrometheusMetrics, global_registry,
 };
 use ferrum_gateway::plugins::{Plugin, TransactionSummary};
 use serde_json::json;
@@ -51,9 +51,13 @@ async fn test_registry_records_request_counter() {
 
     registry.record(&summary);
 
-    let key = "proxy-1:GET:200";
-    assert!(registry.request_counter.contains_key(key));
-    let count = registry.request_counter.get(key).unwrap();
+    let key = CounterKey {
+        proxy_id: "proxy-1".into(),
+        method: "GET".into(),
+        status_code: 200,
+    };
+    assert!(registry.request_counter.contains_key(&key));
+    let count = registry.request_counter.get(&key).unwrap();
     assert_eq!(count.load(Ordering::Relaxed), 1);
 }
 
@@ -66,8 +70,12 @@ async fn test_registry_increments_counter_on_repeated_requests() {
         registry.record(&summary);
     }
 
-    let key = "proxy-1:POST:201";
-    let count = registry.request_counter.get(key).unwrap();
+    let key = CounterKey {
+        proxy_id: "proxy-1".into(),
+        method: "POST".into(),
+        status_code: 201,
+    };
+    let count = registry.request_counter.get(&key).unwrap();
     assert_eq!(count.load(Ordering::Relaxed), 5);
 }
 
@@ -83,7 +91,11 @@ async fn test_registry_separate_counters_per_proxy_method_status() {
     assert_eq!(
         registry
             .request_counter
-            .get("proxy-a:GET:200")
+            .get(&CounterKey {
+                proxy_id: "proxy-a".into(),
+                method: "GET".into(),
+                status_code: 200
+            })
             .unwrap()
             .load(Ordering::Relaxed),
         1
@@ -91,7 +103,11 @@ async fn test_registry_separate_counters_per_proxy_method_status() {
     assert_eq!(
         registry
             .request_counter
-            .get("proxy-a:POST:200")
+            .get(&CounterKey {
+                proxy_id: "proxy-a".into(),
+                method: "POST".into(),
+                status_code: 200
+            })
             .unwrap()
             .load(Ordering::Relaxed),
         1
@@ -99,7 +115,11 @@ async fn test_registry_separate_counters_per_proxy_method_status() {
     assert_eq!(
         registry
             .request_counter
-            .get("proxy-b:GET:200")
+            .get(&CounterKey {
+                proxy_id: "proxy-b".into(),
+                method: "GET".into(),
+                status_code: 200
+            })
             .unwrap()
             .load(Ordering::Relaxed),
         1
@@ -107,7 +127,11 @@ async fn test_registry_separate_counters_per_proxy_method_status() {
     assert_eq!(
         registry
             .request_counter
-            .get("proxy-a:GET:500")
+            .get(&CounterKey {
+                proxy_id: "proxy-a".into(),
+                method: "GET".into(),
+                status_code: 500
+            })
             .unwrap()
             .load(Ordering::Relaxed),
         1
@@ -181,7 +205,11 @@ async fn test_registry_unknown_proxy_uses_default_key() {
     summary.matched_proxy_id = None;
     registry.record(&summary);
 
-    assert!(registry.request_counter.contains_key("unknown:GET:200"));
+    assert!(registry.request_counter.contains_key(&CounterKey {
+        proxy_id: "unknown".into(),
+        method: "GET".into(),
+        status_code: 200
+    }));
 }
 
 #[tokio::test]
@@ -262,11 +290,11 @@ async fn test_plugin_log_hook_records_metrics() {
     // The global registry should have the metric
     let registry = global_registry();
     // Note: global registry is shared across tests, so we check our specific key exists
-    assert!(
-        registry
-            .request_counter
-            .contains_key("log-hook-test:DELETE:204")
-    );
+    assert!(registry.request_counter.contains_key(&CounterKey {
+        proxy_id: "log-hook-test".into(),
+        method: "DELETE".into(),
+        status_code: 204
+    }));
 }
 
 #[tokio::test]

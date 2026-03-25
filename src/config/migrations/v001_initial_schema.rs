@@ -16,7 +16,7 @@ impl Migration for V001InitialSchema {
     }
 
     fn checksum(&self) -> &str {
-        "v001_initial_schema_fk_constraints_indexes_full_proxy_fields"
+        "v001_initial_schema_fk_constraints_indexes_full_proxy_fields_updated_at_indexes"
     }
 }
 
@@ -132,6 +132,27 @@ impl V001InitialSchema {
         .await?;
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_proxy_plugins_plugin_config_id ON proxy_plugins (plugin_config_id)",
+        )
+        .execute(pool)
+        .await?;
+
+        // Indexes on updated_at columns for incremental polling queries
+        // (SELECT * FROM X WHERE updated_at > ? uses index scan instead of full table scan)
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_proxies_updated_at ON proxies (updated_at)")
+            .execute(pool)
+            .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_consumers_updated_at ON consumers (updated_at)",
+        )
+        .execute(pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_plugin_configs_updated_at ON plugin_configs (updated_at)",
+        )
+        .execute(pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_upstreams_updated_at ON upstreams (updated_at)",
         )
         .execute(pool)
         .await?;

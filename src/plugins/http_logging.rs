@@ -24,7 +24,16 @@ pub struct HttpLogging {
 }
 
 impl HttpLogging {
-    pub fn new(config: &Value, http_client: PluginHttpClient) -> Self {
+    pub fn new(config: &Value, http_client: PluginHttpClient) -> Result<Self, String> {
+        let endpoint_url = config["endpoint_url"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                "http_logging: 'endpoint_url' is required — logs will have nowhere to send"
+                    .to_string()
+            })?
+            .to_string();
+
         let batch_size = config["batch_size"].as_u64().unwrap_or(50).max(1) as usize;
         let flush_interval_ms = config["flush_interval_ms"]
             .as_u64()
@@ -33,7 +42,7 @@ impl HttpLogging {
         let buffer_capacity = config["buffer_capacity"].as_u64().unwrap_or(10000).max(1) as usize;
 
         let batch_config = BatchConfig {
-            endpoint_url: config["endpoint_url"].as_str().unwrap_or("").to_string(),
+            endpoint_url,
             authorization_header: config["authorization_header"]
                 .as_str()
                 .map(|s| s.to_string()),
@@ -44,22 +53,17 @@ impl HttpLogging {
             retry_delay: Duration::from_millis(config["retry_delay_ms"].as_u64().unwrap_or(1000)),
         };
 
-        let endpoint_url = batch_config.endpoint_url.clone();
-        let endpoint_hostname = if endpoint_url.is_empty() {
-            None
-        } else {
-            Url::parse(&endpoint_url)
-                .ok()
-                .and_then(|u| u.host_str().map(|h| h.to_string()))
-        };
+        let endpoint_hostname = Url::parse(&batch_config.endpoint_url)
+            .ok()
+            .and_then(|u| u.host_str().map(|h| h.to_string()));
 
         let (sender, receiver) = mpsc::channel(buffer_capacity);
         tokio::spawn(flush_loop(receiver, batch_config));
 
-        Self {
+        Ok(Self {
             sender,
             endpoint_hostname,
-        }
+        })
     }
 }
 

@@ -171,7 +171,7 @@ fn create_test_proxy_state() -> ProxyState {
         max_cache_size: 10_000,
     });
     let env_config = create_test_env_config();
-    ProxyState::new(GatewayConfig::default(), dns_cache, env_config)
+    ProxyState::new(GatewayConfig::default(), dns_cache, env_config).unwrap()
 }
 
 /// Start a CP gRPC server on a random port and return the address and broadcast sender.

@@ -8,7 +8,14 @@ use serde_json::json;
 use std::collections::HashMap;
 
 fn new_otel(config: &serde_json::Value) -> OtelTracing {
-    OtelTracing::new_with_http_client(config, PluginHttpClient::default())
+    // Merge a default endpoint into the config so tests that don't care about the
+    // endpoint still pass now that it's required.
+    let mut merged = config.clone();
+    if merged.get("endpoint").is_none() {
+        merged["endpoint"] =
+            serde_json::Value::String("http://localhost:4318/v1/traces".to_string());
+    }
+    OtelTracing::new_with_http_client(&merged, PluginHttpClient::default()).unwrap()
 }
 
 fn make_ctx() -> RequestContext {
@@ -263,7 +270,14 @@ async fn test_otel_tracing_warmup_hostnames() {
 }
 
 #[tokio::test]
-async fn test_otel_tracing_no_warmup_hostnames_without_endpoint() {
-    let plugin = new_otel(&json!({}));
-    assert!(plugin.warmup_hostnames().is_empty());
+async fn test_otel_tracing_creation_fails_without_endpoint() {
+    let result = OtelTracing::new_with_http_client(&json!({}), PluginHttpClient::default());
+    match result {
+        Err(e) => assert!(
+            e.contains("endpoint"),
+            "Expected error about endpoint, got: {}",
+            e
+        ),
+        Ok(_) => panic!("Expected Err when creating otel_tracing without endpoint"),
+    }
 }

@@ -42,7 +42,7 @@ A single gateway instance reads configuration from a database, handles proxy tra
 **Use case**: Single-node or small-scale deployments where simplicity is preferred.
 
 - Connects to PostgreSQL, MySQL, or SQLite
-- Polls the database periodically for configuration changes
+- Uses incremental polling to detect config changes efficiently — only fetches rows modified since the last poll via indexed `updated_at` queries, with lightweight ID queries for deletion detection. Falls back to full reload on error.
 - Maintains an in-memory cache for resilience during DB outages
 - Serves both proxy traffic and Admin API
 
@@ -322,9 +322,8 @@ See [CI/CD Documentation](docs/ci_cd.md) for complete pipeline overview, secrets
 | `FERRUM_ADMIN_READ_ONLY` | All modes | `false` | Set Admin API to read-only mode (DP mode defaults to true) |
 | `FERRUM_DB_TYPE` | DB/CP modes | — | Database type: `postgres`, `mysql`, `sqlite` |
 | `FERRUM_DB_URL` | DB/CP modes | — | Database connection string |
-| `FERRUM_DB_POLL_INTERVAL` | No | `30` | Seconds between DB config polls |
+| `FERRUM_DB_POLL_INTERVAL` | No | `30` | Seconds between DB config polls. Incremental polling is always enabled with automatic fallback to full reload on error. |
 | `FERRUM_DB_POLL_CHECK_INTERVAL` | No | `5` | Seconds between DB connectivity checks |
-| `FERRUM_DB_INCREMENTAL_POLLING` | No | `true` | Enable incremental (delta) DB polling. Set to `"true"` to enable or `"false"` to disable. |
 | `FERRUM_DB_TLS_ENABLED` | No | `false` | Enable TLS for database connections |
 | `FERRUM_DB_TLS_CA_CERT_PATH` | No | — | Path to CA certificate for database TLS verification |
 | `FERRUM_DB_TLS_CLIENT_CERT_PATH` | No | — | Path to client certificate for database mTLS |
@@ -371,6 +370,7 @@ See [CI/CD Documentation](docs/ci_cd.md) for complete pipeline overview, secrets
 | `FERRUM_ENABLE_HTTP3` | No | `false` | Enable HTTP/3 (QUIC) listener on the HTTPS port |
 | `FERRUM_HTTP3_IDLE_TIMEOUT` | No | `30` | HTTP/3 connection idle timeout in seconds |
 | `FERRUM_HTTP3_MAX_STREAMS` | No | `100` | Maximum concurrent HTTP/3 streams per connection |
+| `FERRUM_BASIC_AUTH_HMAC_SECRET` | No | — | Server secret for HMAC-SHA256 password verification (~1μs). When set, the Admin API stores `hmac_sha256:<hex>` hashes instead of bcrypt. Existing bcrypt hashes remain valid. |
 | `FERRUM_TRUSTED_PROXIES` | No | — | Comma-separated trusted proxy CIDRs/IPs for client IP resolution via `X-Forwarded-For` |
 | `FERRUM_REAL_IP_HEADER` | No | — | Authoritative real-IP header name (e.g., `CF-Connecting-IP`, `X-Real-IP`) |
 

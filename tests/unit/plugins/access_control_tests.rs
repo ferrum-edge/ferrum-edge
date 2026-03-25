@@ -11,7 +11,7 @@ async fn test_access_control_plugin_creation() {
         "allowed_ips": ["127.0.0.1", "10.0.0.0/8"],
         "blocked_ips": ["192.168.1.100"]
     });
-    let plugin = AccessControl::new(&config);
+    let plugin = AccessControl::new(&config).unwrap();
     assert_eq!(plugin.name(), "access_control");
 }
 
@@ -21,7 +21,7 @@ async fn test_access_control_plugin_allowed_ip() {
         "allowed_ips": ["127.0.0.1", "10.0.0.0/8"],
         "blocked_ips": ["192.168.1.100"]
     });
-    let plugin = AccessControl::new(&config);
+    let plugin = AccessControl::new(&config).unwrap();
 
     // Test allowed IP
     let mut allowed_ctx = create_test_context();
@@ -37,7 +37,7 @@ async fn test_access_control_plugin_blocked_ip() {
         "allowed_ips": ["127.0.0.1", "10.0.0.0/8"],
         "blocked_ips": ["192.168.1.100"]
     });
-    let plugin = AccessControl::new(&config);
+    let plugin = AccessControl::new(&config).unwrap();
 
     // Test blocked IP
     let mut blocked_ctx = create_test_context();
@@ -53,7 +53,7 @@ async fn test_access_control_plugin_cidr_allowed() {
         "allowed_ips": ["10.0.0.0/8"],
         "blocked_ips": []
     });
-    let plugin = AccessControl::new(&config);
+    let plugin = AccessControl::new(&config).unwrap();
 
     // Test IP within allowed CIDR range
     let mut allowed_ctx = create_test_context();
@@ -69,7 +69,7 @@ async fn test_access_control_plugin_cidr_blocked() {
         "allowed_ips": [],
         "blocked_ips": ["192.168.0.0/16"]
     });
-    let plugin = AccessControl::new(&config);
+    let plugin = AccessControl::new(&config).unwrap();
 
     // Test IP within blocked CIDR range
     let mut blocked_ctx = create_test_context();
@@ -81,15 +81,11 @@ async fn test_access_control_plugin_cidr_blocked() {
 
 #[tokio::test]
 async fn test_access_control_plugin_no_rules() {
+    // Empty config has no rules at all — should return Err.
     let config = json!({});
-    let plugin = AccessControl::new(&config);
-
-    // With no rules, should allow all
-    let mut ctx = create_test_context();
-    ctx.client_ip = "any.ip.address".to_string();
-
-    let result = plugin.authorize(&mut ctx).await;
-    assert_continue(result);
+    let result = AccessControl::new(&config);
+    assert!(result.is_err());
+    assert!(result.err().unwrap().contains("at least one"));
 }
 
 #[tokio::test]
@@ -98,7 +94,7 @@ async fn test_access_control_plugin_not_in_allowed() {
         "allowed_ips": ["127.0.0.1"],
         "blocked_ips": []
     });
-    let plugin = AccessControl::new(&config);
+    let plugin = AccessControl::new(&config).unwrap();
 
     // Test IP not in allowed list
     let mut blocked_ctx = create_test_context();
@@ -115,7 +111,7 @@ async fn test_access_control_cidr_24_allowed() {
     let config = json!({
         "allowed_ips": ["172.16.0.0/24"]
     });
-    let plugin = AccessControl::new(&config);
+    let plugin = AccessControl::new(&config).unwrap();
 
     let mut ctx = create_test_context();
     ctx.client_ip = "172.16.0.123".to_string();
@@ -128,7 +124,7 @@ async fn test_access_control_cidr_24_outside_range() {
     let config = json!({
         "allowed_ips": ["172.16.0.0/24"]
     });
-    let plugin = AccessControl::new(&config);
+    let plugin = AccessControl::new(&config).unwrap();
 
     // 172.16.1.1 should NOT match 172.16.0.0/24
     let mut ctx = create_test_context();
@@ -142,7 +138,7 @@ async fn test_access_control_cidr_16_range() {
     let config = json!({
         "allowed_ips": ["192.168.0.0/16"]
     });
-    let plugin = AccessControl::new(&config);
+    let plugin = AccessControl::new(&config).unwrap();
 
     // Both should match /16
     let mut ctx = create_test_context();
@@ -161,7 +157,7 @@ async fn test_access_control_cidr_8_range() {
     let config = json!({
         "allowed_ips": ["10.0.0.0/8"]
     });
-    let plugin = AccessControl::new(&config);
+    let plugin = AccessControl::new(&config).unwrap();
 
     let mut ctx = create_test_context();
     ctx.client_ip = "10.255.255.255".to_string();
@@ -179,7 +175,7 @@ async fn test_access_control_cidr_32_exact() {
     let config = json!({
         "allowed_ips": ["10.0.0.1/32"]
     });
-    let plugin = AccessControl::new(&config);
+    let plugin = AccessControl::new(&config).unwrap();
 
     let mut ctx = create_test_context();
     ctx.client_ip = "10.0.0.1".to_string();
@@ -197,7 +193,7 @@ async fn test_access_control_blocked_cidr_range() {
     let config = json!({
         "blocked_ips": ["172.16.0.0/12"]
     });
-    let plugin = AccessControl::new(&config);
+    let plugin = AccessControl::new(&config).unwrap();
 
     let mut ctx = create_test_context();
     ctx.client_ip = "172.20.5.10".to_string();
@@ -212,7 +208,7 @@ async fn test_access_control_allowed_consumer() {
     let config = json!({
         "allowed_consumers": ["testuser"]
     });
-    let plugin = AccessControl::new(&config);
+    let plugin = AccessControl::new(&config).unwrap();
 
     let mut ctx = create_test_context();
     let result = plugin.authorize(&mut ctx).await;
@@ -224,7 +220,7 @@ async fn test_access_control_disallowed_consumer() {
     let config = json!({
         "disallowed_consumers": ["testuser"]
     });
-    let plugin = AccessControl::new(&config);
+    let plugin = AccessControl::new(&config).unwrap();
 
     let mut ctx = create_test_context();
     let result = plugin.authorize(&mut ctx).await;
@@ -236,7 +232,7 @@ async fn test_access_control_consumer_not_in_allowed_list() {
     let config = json!({
         "allowed_consumers": ["admin", "superuser"]
     });
-    let plugin = AccessControl::new(&config);
+    let plugin = AccessControl::new(&config).unwrap();
 
     let mut ctx = create_test_context();
     // ctx has consumer "testuser" which is NOT in allowed list
@@ -249,7 +245,7 @@ async fn test_access_control_no_consumer_identified() {
     let config = json!({
         "allowed_consumers": ["admin"]
     });
-    let plugin = AccessControl::new(&config);
+    let plugin = AccessControl::new(&config).unwrap();
 
     let mut ctx = create_test_context();
     ctx.identified_consumer = None;
@@ -263,7 +259,7 @@ async fn test_access_control_blocked_ip_takes_precedence_over_allowed() {
         "allowed_ips": ["10.0.0.0/8"],
         "blocked_ips": ["10.0.0.5"]
     });
-    let plugin = AccessControl::new(&config);
+    let plugin = AccessControl::new(&config).unwrap();
 
     // IP is in allowed range but explicitly blocked
     let mut ctx = create_test_context();
@@ -279,7 +275,7 @@ async fn test_access_control_ipv6_exact_match_allowed() {
     let config = json!({
         "allowed_ips": ["2001:0db8:85a3:0000:0000:8a2e:0370:7334"]
     });
-    let plugin = AccessControl::new(&config);
+    let plugin = AccessControl::new(&config).unwrap();
 
     let mut ctx = create_test_context();
     ctx.client_ip = "2001:0db8:85a3:0000:0000:8a2e:0370:7334".to_string();
@@ -292,7 +288,7 @@ async fn test_access_control_ipv6_exact_match_rejected() {
     let config = json!({
         "allowed_ips": ["2001:0db8:85a3:0000:0000:8a2e:0370:7334"]
     });
-    let plugin = AccessControl::new(&config);
+    let plugin = AccessControl::new(&config).unwrap();
 
     let mut ctx = create_test_context();
     ctx.client_ip = "2001:0db8:85a3:0000:0000:8a2e:0370:9999".to_string();
@@ -305,7 +301,7 @@ async fn test_access_control_ipv6_cidr_32_allowed() {
     let config = json!({
         "allowed_ips": ["2001:db8::/32"]
     });
-    let plugin = AccessControl::new(&config);
+    let plugin = AccessControl::new(&config).unwrap();
 
     let mut ctx = create_test_context();
     ctx.client_ip = "2001:0db8:aaaa:bbbb:cccc:dddd:eeee:ffff".to_string();
@@ -318,7 +314,7 @@ async fn test_access_control_ipv6_cidr_32_outside_range() {
     let config = json!({
         "allowed_ips": ["2001:db8::/32"]
     });
-    let plugin = AccessControl::new(&config);
+    let plugin = AccessControl::new(&config).unwrap();
 
     let mut ctx = create_test_context();
     ctx.client_ip = "2001:0db9:0000:0000:0000:0000:0000:0001".to_string();
@@ -331,7 +327,7 @@ async fn test_access_control_ipv6_blocked_cidr() {
     let config = json!({
         "blocked_ips": ["fe80::/10"]
     });
-    let plugin = AccessControl::new(&config);
+    let plugin = AccessControl::new(&config).unwrap();
 
     // Link-local address should be blocked
     let mut ctx = create_test_context();
@@ -345,7 +341,7 @@ async fn test_access_control_ipv6_loopback_shorthand() {
     let config = json!({
         "allowed_ips": ["::1/128"]
     });
-    let plugin = AccessControl::new(&config);
+    let plugin = AccessControl::new(&config).unwrap();
 
     let mut ctx = create_test_context();
     ctx.client_ip = "::1".to_string();
@@ -358,7 +354,7 @@ async fn test_access_control_ipv6_cidr_64() {
     let config = json!({
         "allowed_ips": ["2001:db8:1::/64"]
     });
-    let plugin = AccessControl::new(&config);
+    let plugin = AccessControl::new(&config).unwrap();
 
     // Same /64 prefix — should match
     let mut ctx = create_test_context();
@@ -378,7 +374,7 @@ async fn test_access_control_mixed_ipv4_and_ipv6_rules() {
     let config = json!({
         "allowed_ips": ["10.0.0.0/8", "2001:db8::/32"]
     });
-    let plugin = AccessControl::new(&config);
+    let plugin = AccessControl::new(&config).unwrap();
 
     // IPv4 in range
     let mut ctx = create_test_context();

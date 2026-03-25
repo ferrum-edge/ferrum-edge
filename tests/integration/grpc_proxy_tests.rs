@@ -151,7 +151,7 @@ fn create_test_proxy_state(proxies: Vec<Proxy>) -> ProxyState {
         upstreams: vec![],
         loaded_at: Utc::now(),
     };
-    ProxyState::new(config, dns_cache, create_test_env_config())
+    ProxyState::new(config, dns_cache, create_test_env_config()).unwrap()
 }
 
 /// Start a mock gRPC backend (h2c HTTP/2 server) that echoes requests.

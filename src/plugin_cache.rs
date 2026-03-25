@@ -3,7 +3,49 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::config::types::{GatewayConfig, PluginScope};
+use tracing::{error, warn};
+
+use crate::config::types::PluginConfig;
 use crate::plugins::{Plugin, PluginHttpClient, create_plugin_with_http_client};
+
+/// Try to create a plugin, logging validation errors.
+///
+/// For security-critical plugins (auth, access_control, ip_restriction),
+/// validation errors are propagated as `Err` so the gateway can refuse to start.
+/// For non-security plugins, validation errors are logged and the plugin is skipped.
+fn try_create_plugin(
+    pc: &PluginConfig,
+    http_client: &PluginHttpClient,
+) -> Result<Option<Arc<dyn Plugin>>, String> {
+    match create_plugin_with_http_client(&pc.plugin_name, &pc.config, http_client.clone()) {
+        Ok(Some(plugin)) => Ok(Some(plugin)),
+        Ok(None) => {
+            warn!(
+                "Unknown plugin '{}' (plugin_config_id={}), skipping",
+                pc.plugin_name, pc.id
+            );
+            Ok(None)
+        }
+        Err(e) => {
+            if crate::plugins::is_security_plugin(&pc.plugin_name) {
+                error!(
+                    "FATAL: Security plugin '{}' (plugin_config_id={}) config validation failed: {}",
+                    pc.plugin_name, pc.id, e
+                );
+                Err(format!(
+                    "Security plugin '{}' (plugin_config_id={}) config validation failed: {}",
+                    pc.plugin_name, pc.id, e
+                ))
+            } else {
+                error!(
+                    "Plugin '{}' (plugin_config_id={}) config validation failed: {} — skipping",
+                    pc.plugin_name, pc.id, e
+                );
+                Ok(None)
+            }
+        }
+    }
+}
 
 /// A list of plugins shared across requests via Arc.
 type PluginList = Arc<Vec<Arc<dyn Plugin>>>;
@@ -39,7 +81,7 @@ pub struct PluginCache {
 impl PluginCache {
     /// Build a new plugin cache from the given config with a default HTTP client.
     #[allow(dead_code)]
-    pub fn new(config: &GatewayConfig) -> Self {
+    pub fn new(config: &GatewayConfig) -> Result<Self, String> {
         let http_client = PluginHttpClient::default();
         Self::with_http_client(config, http_client)
     }
@@ -48,29 +90,35 @@ impl PluginCache {
     /// the gateway's pool settings. All plugins that make outbound HTTP calls
     /// (http_logging, future OTel exporters, etc.) share this client for
     /// connection reuse and keepalive.
-    pub fn with_http_client(config: &GatewayConfig, http_client: PluginHttpClient) -> Self {
+    pub fn with_http_client(
+        config: &GatewayConfig,
+        http_client: PluginHttpClient,
+    ) -> Result<Self, String> {
         let (proxy_map, globals, buffering_map, global_needs_buffering) =
-            Self::build_cache(config, &http_client);
-        Self {
+            Self::build_cache(config, &http_client)?;
+        Ok(Self {
             proxy_plugins: ArcSwap::new(Arc::new(proxy_map)),
             global_plugins: ArcSwap::new(Arc::new(globals)),
             requires_buffering: ArcSwap::new(Arc::new(buffering_map)),
             global_requires_buffering: ArcSwap::new(Arc::new(global_needs_buffering)),
             http_client,
-        }
+        })
     }
 
     /// Atomically rebuild the cache when config changes.
     /// Old plugin instances (including rate limiter state) are dropped
     /// only after all in-flight requests using them complete.
-    pub fn rebuild(&self, config: &GatewayConfig) {
+    ///
+    /// Returns `Err` if a security-critical plugin fails validation.
+    pub fn rebuild(&self, config: &GatewayConfig) -> Result<(), String> {
         let (proxy_map, globals, buffering_map, global_needs_buffering) =
-            Self::build_cache(config, &self.http_client);
+            Self::build_cache(config, &self.http_client)?;
         self.proxy_plugins.store(Arc::new(proxy_map));
         self.global_plugins.store(Arc::new(globals));
         self.requires_buffering.store(Arc::new(buffering_map));
         self.global_requires_buffering
             .store(Arc::new(global_needs_buffering));
+        Ok(())
     }
 
     /// Incrementally update the plugin cache, only rebuilding plugins for
@@ -98,14 +146,14 @@ impl PluginCache {
                 if !pc.enabled {
                     continue;
                 }
-                if pc.scope == PluginScope::Global
-                    && let Some(plugin) = create_plugin_with_http_client(
-                        &pc.plugin_name,
-                        &pc.config,
-                        self.http_client.clone(),
-                    )
-                {
-                    global_plugins.push(plugin);
+                if pc.scope == PluginScope::Global {
+                    match try_create_plugin(pc, &self.http_client) {
+                        Ok(Some(plugin)) => global_plugins.push(plugin),
+                        Ok(None) => {}
+                        Err(e) => {
+                            error!("Config reload: {}", e);
+                        }
+                    }
                 }
             }
             global_plugins.sort_by_key(|p| p.priority());
@@ -155,15 +203,17 @@ impl PluginCache {
                     .collect();
 
                 for pc in scoped_configs {
-                    if proxy_plugin_ids.contains(pc.id.as_str())
-                        && let Some(plugin) = create_plugin_with_http_client(
-                            &pc.plugin_name,
-                            &pc.config,
-                            self.http_client.clone(),
-                        )
-                    {
-                        merged.retain(|p| p.name() != plugin.name());
-                        merged.push(plugin);
+                    if proxy_plugin_ids.contains(pc.id.as_str()) {
+                        match try_create_plugin(pc, &self.http_client) {
+                            Ok(Some(plugin)) => {
+                                merged.retain(|p| p.name() != plugin.name());
+                                merged.push(plugin);
+                            }
+                            Ok(None) => {}
+                            Err(e) => {
+                                error!("Config reload: {}", e);
+                            }
+                        }
                     }
                 }
             }
@@ -271,7 +321,7 @@ impl PluginCache {
     fn build_cache(
         config: &GatewayConfig,
         http_client: &PluginHttpClient,
-    ) -> (ProxyPluginMap, PluginList, BufferingMap, bool) {
+    ) -> Result<(ProxyPluginMap, PluginList, BufferingMap, bool), String> {
         // Step 1: Create all enabled global plugins (shared across proxies)
         let mut global_plugins: Vec<Arc<dyn Plugin>> = Vec::new();
 
@@ -280,15 +330,18 @@ impl PluginCache {
         let mut proxy_scoped_configs: HashMap<&str, Vec<&crate::config::types::PluginConfig>> =
             HashMap::new();
 
+        // Collect all security plugin errors to report before bailing
+        let mut security_errors: Vec<String> = Vec::new();
+
         for pc in &config.plugin_configs {
             if !pc.enabled {
                 continue;
             }
             if pc.scope == PluginScope::Global {
-                if let Some(plugin) =
-                    create_plugin_with_http_client(&pc.plugin_name, &pc.config, http_client.clone())
-                {
-                    global_plugins.push(plugin);
+                match try_create_plugin(pc, http_client) {
+                    Ok(Some(plugin)) => global_plugins.push(plugin),
+                    Ok(None) => {}
+                    Err(e) => security_errors.push(e),
                 }
             } else if pc.scope == PluginScope::Proxy
                 && let Some(ref proxy_id) = pc.proxy_id
@@ -319,16 +372,16 @@ impl PluginCache {
                     .collect();
 
                 for pc in scoped_configs {
-                    if proxy_plugin_ids.contains(pc.id.as_str())
-                        && let Some(plugin) = create_plugin_with_http_client(
-                            &pc.plugin_name,
-                            &pc.config,
-                            http_client.clone(),
-                        )
-                    {
-                        // Remove any global plugin of the same name
-                        merged.retain(|p| p.name() != plugin.name());
-                        merged.push(plugin);
+                    if proxy_plugin_ids.contains(pc.id.as_str()) {
+                        match try_create_plugin(pc, http_client) {
+                            Ok(Some(plugin)) => {
+                                // Remove any global plugin of the same name
+                                merged.retain(|p| p.name() != plugin.name());
+                                merged.push(plugin);
+                            }
+                            Ok(None) => {}
+                            Err(e) => security_errors.push(e),
+                        }
                     }
                 }
             }
@@ -343,17 +396,28 @@ impl PluginCache {
             proxy_map.insert(proxy.id.clone(), Arc::new(merged));
         }
 
+        // If any security plugins failed validation, refuse to build the cache
+        if !security_errors.is_empty() {
+            for err in &security_errors {
+                error!("{}", err);
+            }
+            return Err(format!(
+                "Gateway startup aborted: {} security plugin(s) failed config validation",
+                security_errors.len()
+            ));
+        }
+
         // Sort global fallback list too
         global_plugins.sort_by_key(|p| p.priority());
         let global_needs_buffering = global_plugins
             .iter()
             .any(|p| p.requires_response_body_buffering());
 
-        (
+        Ok((
             proxy_map,
             Arc::new(global_plugins),
             buffering_map,
             global_needs_buffering,
-        )
+        ))
     }
 }

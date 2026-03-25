@@ -48,58 +48,59 @@ struct SpanData {
 }
 
 impl OtelTracing {
-    pub fn new_with_http_client(config: &Value, http_client: PluginHttpClient) -> Self {
+    pub fn new_with_http_client(
+        config: &Value,
+        http_client: PluginHttpClient,
+    ) -> Result<Self, String> {
         let service_name = config["service_name"]
             .as_str()
             .unwrap_or("ferrum-gateway")
             .to_string();
         let generate_trace_id = config["generate_trace_id"].as_bool().unwrap_or(true);
 
-        let endpoint = config["endpoint"].as_str().unwrap_or("").to_string();
+        let endpoint = config["endpoint"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                "otel_tracing: 'endpoint' is required — traces will have nowhere to export"
+                    .to_string()
+            })?
+            .to_string();
 
-        let (otlp_sender, otlp_hostname) = if endpoint.is_empty() {
-            (None, None)
-        } else {
-            let batch_size = config["batch_size"].as_u64().unwrap_or(50).max(1) as usize;
-            let flush_interval_ms = config["flush_interval_ms"]
-                .as_u64()
-                .unwrap_or(5000)
-                .max(100);
-            let buffer_capacity =
-                config["buffer_capacity"].as_u64().unwrap_or(10000).max(1) as usize;
+        let batch_size = config["batch_size"].as_u64().unwrap_or(50).max(1) as usize;
+        let flush_interval_ms = config["flush_interval_ms"]
+            .as_u64()
+            .unwrap_or(5000)
+            .max(100);
+        let buffer_capacity = config["buffer_capacity"].as_u64().unwrap_or(10000).max(1) as usize;
 
-            let hostname = Url::parse(&endpoint)
-                .ok()
-                .and_then(|u| u.host_str().map(|h| h.to_string()));
+        let otlp_hostname = Url::parse(&endpoint)
+            .ok()
+            .and_then(|u| u.host_str().map(|h| h.to_string()));
 
-            let authorization = config["authorization"].as_str().map(|s| s.to_string());
+        let authorization = config["authorization"].as_str().map(|s| s.to_string());
 
-            let (sender, receiver) = mpsc::channel(buffer_capacity);
+        let (sender, receiver) = mpsc::channel(buffer_capacity);
 
-            let otlp_config = OtlpConfig {
-                endpoint,
-                authorization,
-                http_client,
-                batch_size,
-                flush_interval: Duration::from_millis(flush_interval_ms),
-                max_retries: config["max_retries"].as_u64().unwrap_or(2) as u32,
-                retry_delay: Duration::from_millis(
-                    config["retry_delay_ms"].as_u64().unwrap_or(1000),
-                ),
-                service_name: service_name.clone(),
-            };
-
-            tokio::spawn(otlp_flush_loop(receiver, otlp_config));
-
-            (Some(sender), hostname)
+        let otlp_config = OtlpConfig {
+            endpoint,
+            authorization,
+            http_client,
+            batch_size,
+            flush_interval: Duration::from_millis(flush_interval_ms),
+            max_retries: config["max_retries"].as_u64().unwrap_or(2) as u32,
+            retry_delay: Duration::from_millis(config["retry_delay_ms"].as_u64().unwrap_or(1000)),
+            service_name: service_name.clone(),
         };
 
-        Self {
+        tokio::spawn(otlp_flush_loop(receiver, otlp_config));
+
+        Ok(Self {
             service_name,
             generate_trace_id,
-            otlp_sender,
+            otlp_sender: Some(sender),
             otlp_hostname,
-        }
+        })
     }
 
     /// Generate a W3C traceparent header value.

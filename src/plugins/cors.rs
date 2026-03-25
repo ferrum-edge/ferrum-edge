@@ -5,13 +5,27 @@ use tracing::{debug, warn};
 
 use super::{Plugin, PluginResult, RequestContext};
 
+/// A single origin pattern entry.
+#[derive(Debug, Clone)]
+enum OriginPattern {
+    /// Exact origin match (case-insensitive), e.g. `"https://app.company.com"`.
+    Exact(String),
+    /// Wildcard subdomain match, e.g. `"*.company.com"`.
+    ///
+    /// Stores the suffix to match against (e.g. `".company.com"`).
+    /// Matches any origin whose host part ends with the suffix, so
+    /// `*.company.com` matches `https://app.company.com` and
+    /// `https://deep.sub.company.com` but NOT `https://company.com`.
+    WildcardSubdomain(String),
+}
+
 /// How allowed origins are configured.
 #[derive(Debug)]
 enum AllowedOrigins {
-    /// Any origin is allowed (`["*"]`).
+    /// Any origin is allowed (`["*"]` or any list containing `"*"`).
     Wildcard,
-    /// Only the listed origins are allowed (exact match, case-sensitive).
-    List(Vec<String>),
+    /// Only the listed patterns are allowed (exact or wildcard subdomain).
+    List(Vec<OriginPattern>),
 }
 
 /// CORS (Cross-Origin Resource Sharing) plugin.
@@ -78,18 +92,39 @@ impl CorsPlugin {
     }
 
     /// Parse the `allowed_origins` config field.
+    ///
+    /// Supports three forms:
+    /// - `["*"]` or any list containing `"*"` → `AllowedOrigins::Wildcard`
+    /// - `["https://example.com"]` → exact match
+    /// - `["*.company.com"]` → wildcard subdomain (matches any `*.company.com`)
+    ///
+    /// These can be mixed: `["https://exact.com", "*.company.com"]`.
     fn parse_origins(config: &Value) -> AllowedOrigins {
         match config["allowed_origins"].as_array() {
             Some(arr) => {
-                let origins: Vec<String> = arr
+                let raw: Vec<String> = arr
                     .iter()
                     .filter_map(|v| v.as_str().map(String::from))
                     .collect();
-                if origins.is_empty() || (origins.len() == 1 && origins[0] == "*") {
-                    AllowedOrigins::Wildcard
-                } else {
-                    AllowedOrigins::List(origins)
+
+                // Empty list or any entry being "*" → allow all origins
+                if raw.is_empty() || raw.iter().any(|o| o == "*") {
+                    return AllowedOrigins::Wildcard;
                 }
+
+                let patterns = raw
+                    .into_iter()
+                    .map(|o| {
+                        if let Some(suffix) = o.strip_prefix('*') {
+                            // "*.company.com" → suffix is ".company.com"
+                            OriginPattern::WildcardSubdomain(suffix.to_ascii_lowercase())
+                        } else {
+                            OriginPattern::Exact(o)
+                        }
+                    })
+                    .collect();
+
+                AllowedOrigins::List(patterns)
             }
             None => AllowedOrigins::Wildcard,
         }
@@ -108,13 +143,36 @@ impl CorsPlugin {
     }
 
     /// Check whether a request origin is allowed.
+    ///
+    /// For `Exact` patterns: case-insensitive full-string match.
+    /// For `WildcardSubdomain` patterns: the origin's host portion must end
+    /// with the stored suffix (e.g. `.company.com`). This means
+    /// `*.company.com` matches `https://app.company.com` but NOT
+    /// `https://company.com` (bare domain has no subdomain prefix).
     fn is_origin_allowed(&self, origin: &str) -> bool {
         if origin.is_empty() {
             return false;
         }
         match &self.allowed_origins {
             AllowedOrigins::Wildcard => true,
-            AllowedOrigins::List(origins) => origins.iter().any(|o| o.eq_ignore_ascii_case(origin)),
+            AllowedOrigins::List(patterns) => patterns.iter().any(|p| match p {
+                OriginPattern::Exact(expected) => expected.eq_ignore_ascii_case(origin),
+                OriginPattern::WildcardSubdomain(suffix) => {
+                    // Extract the host from the origin.
+                    // Origins look like "https://sub.company.com" or
+                    // "http://sub.company.com:8080".
+                    // We strip the scheme prefix, then match the host against the suffix.
+                    let host_part = origin
+                        .split("://")
+                        .nth(1)
+                        .unwrap_or(origin)
+                        // Strip port if present
+                        .split(':')
+                        .next()
+                        .unwrap_or("");
+                    host_part.to_ascii_lowercase().ends_with(suffix.as_str())
+                }
+            }),
         }
     }
 

@@ -102,7 +102,7 @@ impl ProxyState {
         config: GatewayConfig,
         dns_cache: DnsCache,
         env_config: crate::config::EnvConfig,
-    ) -> Self {
+    ) -> Result<Self, anyhow::Error> {
         let alt_svc_header = if env_config.enable_http3 {
             Some(format!("h3=\":{}\"; ma=86400", env_config.proxy_https_port))
         } else {
@@ -134,7 +134,10 @@ impl ProxyState {
         // with the gateway's connection pool settings (keepalive, idle timeout, etc.).
         let plugin_http_client =
             crate::plugins::PluginHttpClient::new(&global_pool_config, dns_cache.clone());
-        let plugin_cache = Arc::new(PluginCache::with_http_client(&config, plugin_http_client));
+        let plugin_cache = Arc::new(
+            PluginCache::with_http_client(&config, plugin_http_client)
+                .map_err(|e| anyhow::anyhow!("{}", e))?,
+        );
         // Build credential-indexed consumer lookup for O(1) auth
         let consumer_index = Arc::new(ConsumerIndex::new(&config.consumers));
         // Build load balancer cache for upstream target selection
@@ -148,7 +151,7 @@ impl ProxyState {
         // Circuit breaker cache
         let circuit_breaker_cache = Arc::new(CircuitBreakerCache::new());
 
-        Self {
+        Ok(Self {
             config: Arc::new(ArcSwap::new(Arc::new(config))),
             dns_cache,
             connection_pool,
@@ -168,7 +171,7 @@ impl ProxyState {
             max_body_size_bytes,
             max_response_body_size_bytes,
             trusted_proxies,
-        }
+        })
     }
 
     /// Apply a new configuration, using incremental (surgical) updates when
@@ -201,7 +204,13 @@ impl ProxyState {
 
         if old_is_empty && !new_is_empty {
             self.router_cache.rebuild(&new_config);
-            self.plugin_cache.rebuild(&new_config);
+            if let Err(e) = self.plugin_cache.rebuild(&new_config) {
+                error!(
+                    "Config reload rejected — security plugin validation failed: {}",
+                    e
+                );
+                return false;
+            }
             self.consumer_index.rebuild(&new_config.consumers);
             self.load_balancer_cache.rebuild(&new_config);
 
@@ -354,6 +363,202 @@ impl ProxyState {
             delta.removed_upstream_ids.len(),
             delta.modified_upstreams.len(),
             proxy_ids_to_rebuild.len(),
+        );
+        true
+    }
+
+    /// Apply an incremental config update from the database polling loop.
+    ///
+    /// Unlike `update_config()` which takes a full `GatewayConfig` and diffs it
+    /// against the current config, this method receives pre-computed changes
+    /// directly from the DB layer's `load_incremental_config()`. This avoids
+    /// loading and diffing the full config on every poll cycle.
+    ///
+    /// Returns `true` if changes were applied.
+    pub fn apply_incremental(&self, result: crate::config::db_loader::IncrementalResult) -> bool {
+        if result.is_empty() {
+            return false;
+        }
+
+        // Patch the stored GatewayConfig: clone current, apply mutations, store
+        let mut new_config = (*self.config.load_full()).clone();
+
+        // Remove deleted resources
+        if !result.removed_proxy_ids.is_empty() {
+            let removed: std::collections::HashSet<&str> = result
+                .removed_proxy_ids
+                .iter()
+                .map(|s| s.as_str())
+                .collect();
+            new_config
+                .proxies
+                .retain(|p| !removed.contains(p.id.as_str()));
+        }
+        if !result.removed_consumer_ids.is_empty() {
+            let removed: std::collections::HashSet<&str> = result
+                .removed_consumer_ids
+                .iter()
+                .map(|s| s.as_str())
+                .collect();
+            new_config
+                .consumers
+                .retain(|c| !removed.contains(c.id.as_str()));
+        }
+        if !result.removed_plugin_config_ids.is_empty() {
+            let removed: std::collections::HashSet<&str> = result
+                .removed_plugin_config_ids
+                .iter()
+                .map(|s| s.as_str())
+                .collect();
+            new_config
+                .plugin_configs
+                .retain(|pc| !removed.contains(pc.id.as_str()));
+        }
+        if !result.removed_upstream_ids.is_empty() {
+            let removed: std::collections::HashSet<&str> = result
+                .removed_upstream_ids
+                .iter()
+                .map(|s| s.as_str())
+                .collect();
+            new_config
+                .upstreams
+                .retain(|u| !removed.contains(u.id.as_str()));
+        }
+
+        // Upsert added/modified resources (replace existing by ID, or append new)
+        for proxy in &result.added_or_modified_proxies {
+            if let Some(existing) = new_config.proxies.iter_mut().find(|p| p.id == proxy.id) {
+                *existing = proxy.clone();
+            } else {
+                new_config.proxies.push(proxy.clone());
+            }
+        }
+        for consumer in &result.added_or_modified_consumers {
+            if let Some(existing) = new_config
+                .consumers
+                .iter_mut()
+                .find(|c| c.id == consumer.id)
+            {
+                *existing = consumer.clone();
+            } else {
+                new_config.consumers.push(consumer.clone());
+            }
+        }
+        for pc in &result.added_or_modified_plugin_configs {
+            if let Some(existing) = new_config.plugin_configs.iter_mut().find(|p| p.id == pc.id) {
+                *existing = pc.clone();
+            } else {
+                new_config.plugin_configs.push(pc.clone());
+            }
+        }
+        for upstream in &result.added_or_modified_upstreams {
+            if let Some(existing) = new_config
+                .upstreams
+                .iter_mut()
+                .find(|u| u.id == upstream.id)
+            {
+                *existing = upstream.clone();
+            } else {
+                new_config.upstreams.push(upstream.clone());
+            }
+        }
+
+        new_config.loaded_at = result.poll_timestamp;
+
+        // Build a ConfigDelta to feed into existing cache apply_delta() methods.
+        // For incremental results, we treat all changed resources as "modified"
+        // since the DB layer doesn't distinguish adds from modifications.
+        // The cache apply_delta methods handle both cases correctly.
+        let old_config = self.config.load_full();
+
+        // Use ConfigDelta::compute against old + new to get proper add/modify/remove classification
+        let delta = crate::config_delta::ConfigDelta::compute(&old_config, &new_config);
+
+        // --- RouterCache ---
+        let affected_paths = delta.affected_listen_paths(&old_config);
+        self.router_cache.apply_delta(&new_config, &affected_paths);
+
+        // --- PluginCache ---
+        let proxy_ids_to_rebuild = delta.proxy_ids_needing_plugin_rebuild(&new_config);
+        let rebuild_globals = delta
+            .added_plugin_configs
+            .iter()
+            .chain(delta.modified_plugin_configs.iter())
+            .any(|pc| pc.scope == crate::config::types::PluginScope::Global)
+            || !delta.removed_plugin_config_ids.is_empty();
+        self.plugin_cache.apply_delta(
+            &new_config,
+            &proxy_ids_to_rebuild,
+            &delta.removed_proxy_ids,
+            rebuild_globals,
+        );
+
+        // --- ConsumerIndex ---
+        self.consumer_index.apply_delta(
+            &delta.added_consumers,
+            &delta.removed_consumer_ids,
+            &delta.modified_consumers,
+        );
+
+        // --- LoadBalancerCache ---
+        self.load_balancer_cache.apply_delta(
+            &new_config,
+            &delta.added_upstreams,
+            &delta.removed_upstream_ids,
+            &delta.modified_upstreams,
+        );
+
+        // --- CircuitBreakerCache ---
+        if !delta.removed_proxy_ids.is_empty() {
+            self.circuit_breaker_cache.prune(&delta.removed_proxy_ids);
+        }
+
+        // --- DNS warmup for new/modified hostnames ---
+        let mut new_hostnames: Vec<(String, Option<String>, Option<u64>)> = Vec::new();
+        for proxy in delta
+            .added_proxies
+            .iter()
+            .chain(delta.modified_proxies.iter())
+        {
+            new_hostnames.push((
+                proxy.backend_host.clone(),
+                proxy.dns_override.clone(),
+                proxy.dns_cache_ttl_seconds,
+            ));
+        }
+        for upstream in delta
+            .added_upstreams
+            .iter()
+            .chain(delta.modified_upstreams.iter())
+        {
+            for target in &upstream.targets {
+                new_hostnames.push((target.host.clone(), None, None));
+            }
+        }
+        if !new_hostnames.is_empty() {
+            let dns = self.dns_cache.clone();
+            tokio::spawn(async move {
+                dns.warmup(new_hostnames).await;
+            });
+        }
+
+        // Store updated config
+        self.config.store(Arc::new(new_config));
+
+        info!(
+            "Incremental config applied: proxies: +{} -{} ~{}, consumers: +{} -{} ~{}, plugins: +{} -{} ~{}, upstreams: +{} -{} ~{}",
+            delta.added_proxies.len(),
+            delta.removed_proxy_ids.len(),
+            delta.modified_proxies.len(),
+            delta.added_consumers.len(),
+            delta.removed_consumer_ids.len(),
+            delta.modified_consumers.len(),
+            delta.added_plugin_configs.len(),
+            delta.removed_plugin_config_ids.len(),
+            delta.modified_plugin_configs.len(),
+            delta.added_upstreams.len(),
+            delta.removed_upstream_ids.len(),
+            delta.modified_upstreams.len(),
         );
         true
     }

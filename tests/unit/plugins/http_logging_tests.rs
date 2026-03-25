@@ -17,20 +17,35 @@ async fn test_http_logging_plugin_creation() {
             "authorization_header": "Bearer log-token"
         }),
         default_client(),
-    );
+    )
+    .unwrap();
     assert_eq!(plugin.name(), "http_logging");
 }
 
 #[tokio::test]
 async fn test_http_logging_plugin_creation_empty_config() {
-    let plugin = HttpLogging::new(&json!({}), default_client());
-    assert_eq!(plugin.name(), "http_logging");
+    let result = HttpLogging::new(&json!({}), default_client());
+    match result {
+        Err(e) => assert!(
+            e.contains("endpoint_url"),
+            "Expected error about endpoint_url, got: {}",
+            e
+        ),
+        Ok(_) => panic!("Expected Err when creating http_logging without endpoint_url"),
+    }
 }
 
 #[tokio::test]
 async fn test_http_logging_empty_url_does_not_send() {
-    // When endpoint_url is empty, log() should accept entries without errors
-    let plugin = HttpLogging::new(&json!({}), default_client());
+    // When endpoint_url is empty, creation should fail with an error
+    assert!(HttpLogging::new(&json!({}), default_client()).is_err());
+
+    // With a valid endpoint_url, log() should accept entries without errors
+    let plugin = HttpLogging::new(
+        &json!({"endpoint_url": "http://127.0.0.1:1/unreachable"}),
+        default_client(),
+    )
+    .unwrap();
     let summary = create_test_transaction_summary();
 
     // This should not panic or error — entry goes into channel and is drained
@@ -48,7 +63,8 @@ async fn test_http_logging_invalid_url_does_not_panic() {
             "max_retries": 0
         }),
         default_client(),
-    );
+    )
+    .unwrap();
     let summary = create_test_transaction_summary();
 
     // Should not panic — entry is queued and background task handles the failure
@@ -69,7 +85,8 @@ async fn test_http_logging_with_authorization_header() {
             "max_retries": 0
         }),
         default_client(),
-    );
+    )
+    .unwrap();
     assert_eq!(plugin.name(), "http_logging");
 
     // Should not panic even with auth header set and unreachable endpoint
@@ -82,7 +99,11 @@ async fn test_http_logging_with_authorization_header() {
 #[tokio::test]
 async fn test_http_logging_default_lifecycle_phases() {
     // http_logging only implements log(), all other phases should return Continue
-    let plugin = HttpLogging::new(&json!({}), default_client());
+    let plugin = HttpLogging::new(
+        &json!({"endpoint_url": "http://127.0.0.1:1/unreachable"}),
+        default_client(),
+    )
+    .unwrap();
 
     let mut ctx = ferrum_gateway::plugins::RequestContext::new(
         "127.0.0.1".to_string(),
@@ -131,7 +152,8 @@ async fn test_http_logging_batch_config_defaults() {
             "endpoint_url": "http://localhost:9200/logs"
         }),
         default_client(),
-    );
+    )
+    .unwrap();
     assert_eq!(plugin.name(), "http_logging");
 }
 
@@ -148,7 +170,8 @@ async fn test_http_logging_custom_batch_config() {
             "buffer_capacity": 50000
         }),
         default_client(),
-    );
+    )
+    .unwrap();
     assert_eq!(plugin.name(), "http_logging");
 }
 
@@ -164,7 +187,8 @@ async fn test_http_logging_buffer_accepts_multiple_entries() {
             "buffer_capacity": 1000
         }),
         default_client(),
-    );
+    )
+    .unwrap();
 
     let summary = create_test_transaction_summary();
     for _ in 0..100 {
@@ -185,7 +209,8 @@ async fn test_http_logging_buffer_full_drops_gracefully() {
             "buffer_capacity": 5
         }),
         default_client(),
-    );
+    )
+    .unwrap();
 
     let summary = create_test_transaction_summary();
     // Send more entries than buffer_capacity — excess should be dropped

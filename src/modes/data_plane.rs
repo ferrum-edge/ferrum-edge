@@ -31,7 +31,7 @@ pub async fn run(
     dns_cache.start_background_refresh_with_shutdown(Some(shutdown_tx.subscribe()));
 
     // Start with empty config; CP will push the real one via gRPC
-    let proxy_state = ProxyState::new(GatewayConfig::default(), dns_cache, env_config.clone());
+    let proxy_state = ProxyState::new(GatewayConfig::default(), dns_cache, env_config.clone())?;
 
     // Spawn the DP gRPC client to connect to CP and receive config updates
     let cp_url = env_config

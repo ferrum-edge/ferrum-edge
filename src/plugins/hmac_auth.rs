@@ -246,7 +246,10 @@ impl Plugin for HmacAuth {
         }
 
         // Authentication successful
-        ctx.identified_consumer = Some((*consumer).clone());
+        if ctx.identified_consumer.is_none() {
+            debug!("hmac_auth: identified consumer '{}'", consumer.username);
+            ctx.identified_consumer = Some((*consumer).clone());
+        }
         PluginResult::Continue
     }
 }

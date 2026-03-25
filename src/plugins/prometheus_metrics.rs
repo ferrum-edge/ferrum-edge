@@ -21,10 +21,19 @@ pub fn global_registry() -> Arc<MetricsRegistry> {
         .clone()
 }
 
+/// Composite key for request counter: (proxy_id, method, status_code).
+/// Avoids `format!()` string allocation on every request.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct CounterKey {
+    pub proxy_id: String,
+    pub method: String,
+    pub status_code: u16,
+}
+
 /// Metrics registry holding all Prometheus-compatible counters and histograms.
 pub struct MetricsRegistry {
-    /// Total requests by proxy_id, method, status_code
-    pub request_counter: DashMap<String, AtomicU64>,
+    /// Total requests by (proxy_id, method, status_code)
+    pub request_counter: DashMap<CounterKey, AtomicU64>,
     /// Request duration histogram buckets by proxy_id
     pub request_duration_buckets: DashMap<String, HistogramBuckets>,
     /// Backend duration histogram buckets by proxy_id
@@ -102,24 +111,22 @@ impl MetricsRegistry {
     }
 
     pub fn record(&self, summary: &TransactionSummary) {
-        // Increment request counter
-        let counter_key = format!(
-            "{}:{}:{}",
-            summary.matched_proxy_id.as_deref().unwrap_or("unknown"),
-            summary.http_method,
-            summary.response_status_code
-        );
-        self.request_counter
-            .entry(counter_key)
-            .or_insert_with(|| AtomicU64::new(0))
-            .fetch_add(1, Ordering::Relaxed);
-
-        // Record duration histograms
         let proxy_id = summary
             .matched_proxy_id
             .as_deref()
             .unwrap_or("unknown")
             .to_string();
+
+        // Increment request counter (composite key — no format!() allocation)
+        let counter_key = CounterKey {
+            proxy_id: proxy_id.clone(),
+            method: summary.http_method.clone(),
+            status_code: summary.response_status_code,
+        };
+        self.request_counter
+            .entry(counter_key)
+            .or_insert_with(|| AtomicU64::new(0))
+            .fetch_add(1, Ordering::Relaxed);
 
         self.request_duration_buckets
             .entry(proxy_id.clone())
@@ -144,14 +151,12 @@ impl MetricsRegistry {
         output.push_str("# HELP ferrum_requests_total Total number of requests processed.\n");
         output.push_str("# TYPE ferrum_requests_total counter\n");
         for entry in self.request_counter.iter() {
-            let parts: Vec<&str> = entry.key().splitn(3, ':').collect();
-            if parts.len() == 3 {
-                let count = entry.value().load(Ordering::Relaxed);
-                output.push_str(&format!(
-                    "ferrum_requests_total{{proxy_id=\"{}\",method=\"{}\",status_code=\"{}\"}} {}\n",
-                    parts[0], parts[1], parts[2], count
-                ));
-            }
+            let key = entry.key();
+            let count = entry.value().load(Ordering::Relaxed);
+            output.push_str(&format!(
+                "ferrum_requests_total{{proxy_id=\"{}\",method=\"{}\",status_code=\"{}\"}} {}\n",
+                key.proxy_id, key.method, key.status_code, count
+            ));
         }
 
         // Request duration histogram

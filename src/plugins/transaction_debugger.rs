@@ -46,11 +46,12 @@ impl TransactionDebugger {
         }
     }
 
-    /// Returns true if the given header name (lowercased) should be redacted.
+    /// Returns true if the given header name should be redacted.
+    /// Header names are already lowercased by hyper, and SENSITIVE_HEADERS
+    /// and extra_redacted_headers are stored lowercase — no conversion needed.
     fn is_sensitive(&self, header_name: &str) -> bool {
-        let lower = header_name.to_lowercase();
-        SENSITIVE_HEADERS.iter().any(|&h| h == lower)
-            || self.extra_redacted_headers.iter().any(|h| h == &lower)
+        SENSITIVE_HEADERS.contains(&header_name)
+            || self.extra_redacted_headers.iter().any(|h| h == header_name)
     }
 
     /// Create a redacted copy of headers for safe logging.

@@ -53,8 +53,18 @@ async fn test_all_plugins_available() {
 #[tokio::test]
 async fn test_plugin_creation_all_plugins() {
     for plugin_name in available_plugins() {
-        let config = json!({});
+        // Some plugins now require specific config fields
+        let config = match plugin_name {
+            "http_logging" => json!({"endpoint_url": "http://localhost:9200/logs"}),
+            "otel_tracing" => json!({"endpoint": "http://localhost:4318/v1/traces"}),
+            "oauth2_auth" => json!({"jwks_uri": "https://example.com/.well-known/jwks.json"}),
+            "ip_restriction" => json!({"allow": ["0.0.0.0/0"]}),
+            "access_control" => json!({"allowed_ips": ["0.0.0.0/0"]}),
+            _ => json!({}),
+        };
         let plugin = create_plugin(plugin_name, &config);
+        let plugin = plugin
+            .unwrap_or_else(|e| panic!("create_plugin returned Err for {}: {}", plugin_name, e));
         assert!(plugin.is_some(), "Failed to create plugin: {}", plugin_name);
         assert_eq!(plugin.unwrap().name(), plugin_name);
     }
@@ -98,11 +108,11 @@ async fn test_plugin_error_handling() {
     // Test creating plugin with invalid name
     let config = json!({});
     let plugin = create_plugin("nonexistent_plugin", &config);
-    assert!(plugin.is_none());
+    assert!(matches!(plugin, Ok(None)));
 
     // Test creating plugin with invalid config
     let plugin = create_plugin("jwt_auth", &json!({"invalid": "config"}));
-    assert!(plugin.is_some()); // Should still create, but may fail during execution
+    assert!(plugin.unwrap().is_some()); // Should still create, but may fail during execution
 }
 
 #[tokio::test]
@@ -110,12 +120,13 @@ async fn test_plugin_configuration_validation() {
     // Test that plugins handle missing config gracefully
     let empty_config = json!({});
 
+    // Note: access_control and ip_restriction are excluded because they now
+    // require at least one rule in config and intentionally reject empty config.
     let plugin_names = vec![
         "stdout_logging",
         "transaction_debugger",
         "key_auth",
         "basic_auth",
-        "access_control",
         "rate_limiting",
         "request_transformer",
         "response_transformer",
@@ -123,6 +134,8 @@ async fn test_plugin_configuration_validation() {
 
     for plugin_name in plugin_names {
         let plugin = create_plugin(plugin_name, &empty_config);
+        let plugin = plugin
+            .unwrap_or_else(|e| panic!("create_plugin returned Err for {}: {}", plugin_name, e));
         assert!(plugin.is_some(), "Failed to create plugin: {}", plugin_name);
 
         let plugin = plugin.unwrap();
@@ -183,6 +196,8 @@ async fn test_plugin_complex_configurations() {
 
     for (plugin_name, config) in complex_configs {
         let plugin = create_plugin(plugin_name, &config);
+        let plugin = plugin
+            .unwrap_or_else(|e| panic!("create_plugin returned Err for {}: {}", plugin_name, e));
         assert!(
             plugin.is_some(),
             "Failed to create plugin: {} with complex config",

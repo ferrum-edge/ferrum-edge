@@ -20,14 +20,19 @@ use super::plugin_utils::{create_test_context, create_test_proxy};
 #[tokio::test]
 async fn test_log_rejected_request_only_calls_logging_plugins() {
     // Build a realistic plugin list: auth + logging
-    let key_auth = create_plugin("key_auth", &json!({})).unwrap();
-    let stdout_log = create_plugin("stdout_logging", &json!({})).unwrap();
+    let key_auth = create_plugin("key_auth", &json!({})).unwrap().unwrap();
+    let stdout_log = create_plugin("stdout_logging", &json!({}))
+        .unwrap()
+        .unwrap();
     let http_log = create_plugin(
         "http_logging",
-        &json!({"endpoint": "http://127.0.0.1:9999/logs"}),
+        &json!({"endpoint_url": "http://127.0.0.1:9999/logs"}),
     )
+    .unwrap()
     .unwrap();
-    let debugger = create_plugin("transaction_debugger", &json!({})).unwrap();
+    let debugger = create_plugin("transaction_debugger", &json!({}))
+        .unwrap()
+        .unwrap();
 
     // Verify priorities are in expected bands
     assert!(key_auth.priority() < plugin_priority::STDOUT_LOGGING);
@@ -50,7 +55,9 @@ async fn test_log_rejected_request_only_calls_logging_plugins() {
 #[tokio::test]
 async fn test_rejected_request_summary_has_rejection_phase() {
     // Use stdout_logging since it just prints to stdout (observable but won't fail)
-    let stdout_log = create_plugin("stdout_logging", &json!({})).unwrap();
+    let stdout_log = create_plugin("stdout_logging", &json!({}))
+        .unwrap()
+        .unwrap();
     let plugins: Vec<Arc<dyn Plugin>> = vec![stdout_log];
 
     let mut ctx = create_test_context();
@@ -71,9 +78,10 @@ async fn test_rejected_request_summary_has_rejection_phase() {
 #[tokio::test]
 async fn test_log_rejected_request_noop_without_logging_plugins() {
     // Only auth plugins, no logging plugins
-    let key_auth = create_plugin("key_auth", &json!({})).unwrap();
-    let access_ctrl =
-        create_plugin("access_control", &json!({"allowed_ips": ["0.0.0.0/0"]})).unwrap();
+    let key_auth = create_plugin("key_auth", &json!({})).unwrap().unwrap();
+    let access_ctrl = create_plugin("access_control", &json!({"allowed_ips": ["0.0.0.0/0"]}))
+        .unwrap()
+        .unwrap();
 
     let plugins: Vec<Arc<dyn Plugin>> = vec![key_auth, access_ctrl];
 
@@ -99,7 +107,9 @@ async fn test_log_rejected_request_empty_plugins() {
 /// Verify that log_rejected_request handles all rejection phases.
 #[tokio::test]
 async fn test_log_rejected_request_all_phases() {
-    let stdout_log = create_plugin("stdout_logging", &json!({})).unwrap();
+    let stdout_log = create_plugin("stdout_logging", &json!({}))
+        .unwrap()
+        .unwrap();
     let plugins: Vec<Arc<dyn Plugin>> = vec![stdout_log];
 
     let mut ctx = create_test_context();

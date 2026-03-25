@@ -255,3 +255,128 @@ async fn test_request_transformer_unknown_target_ignored() {
         ferrum_gateway::plugins::PluginResult::Continue
     ));
 }
+
+#[tokio::test]
+async fn test_request_transformer_rename_header() {
+    let plugin = RequestTransformer::new(&json!({
+        "rules": [
+            {"operation": "rename", "target": "header", "key": "X-Old-Name", "new_key": "X-New-Name"}
+        ]
+    }));
+
+    let mut ctx = make_ctx();
+    let mut headers: HashMap<String, String> = HashMap::new();
+    headers.insert("x-old-name".to_string(), "the-value".to_string());
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(
+        result,
+        ferrum_gateway::plugins::PluginResult::Continue
+    ));
+    assert!(!headers.contains_key("x-old-name"));
+    assert_eq!(headers.get("x-new-name").unwrap(), "the-value");
+}
+
+#[tokio::test]
+async fn test_request_transformer_rename_header_nonexistent() {
+    let plugin = RequestTransformer::new(&json!({
+        "rules": [
+            {"operation": "rename", "target": "header", "key": "X-Does-Not-Exist", "new_key": "X-New-Name"}
+        ]
+    }));
+
+    let mut ctx = make_ctx();
+    let mut headers: HashMap<String, String> = HashMap::new();
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(
+        result,
+        ferrum_gateway::plugins::PluginResult::Continue
+    ));
+    assert!(!headers.contains_key("x-new-name"));
+    assert!(!headers.contains_key("x-does-not-exist"));
+}
+
+#[tokio::test]
+async fn test_request_transformer_rename_query_param() {
+    let plugin = RequestTransformer::new(&json!({
+        "rules": [
+            {"operation": "rename", "target": "query", "key": "old_key", "new_key": "new_key"}
+        ]
+    }));
+
+    let mut ctx = make_ctx();
+    ctx.query_params
+        .insert("old_key".to_string(), "the-value".to_string());
+    let mut headers: HashMap<String, String> = HashMap::new();
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(
+        result,
+        ferrum_gateway::plugins::PluginResult::Continue
+    ));
+    assert!(!ctx.query_params.contains_key("old_key"));
+    assert_eq!(ctx.query_params.get("new_key").unwrap(), "the-value");
+}
+
+#[tokio::test]
+async fn test_request_transformer_rename_query_param_nonexistent() {
+    let plugin = RequestTransformer::new(&json!({
+        "rules": [
+            {"operation": "rename", "target": "query", "key": "missing_key", "new_key": "new_key"}
+        ]
+    }));
+
+    let mut ctx = make_ctx();
+    let mut headers: HashMap<String, String> = HashMap::new();
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(
+        result,
+        ferrum_gateway::plugins::PluginResult::Continue
+    ));
+    assert!(!ctx.query_params.contains_key("missing_key"));
+    assert!(!ctx.query_params.contains_key("new_key"));
+}
+
+#[tokio::test]
+async fn test_request_transformer_rename_without_new_key_ignored() {
+    let plugin = RequestTransformer::new(&json!({
+        "rules": [
+            {"operation": "rename", "target": "header", "key": "X-Old-Name"}
+        ]
+    }));
+
+    let mut ctx = make_ctx();
+    let mut headers: HashMap<String, String> = HashMap::new();
+    headers.insert("x-old-name".to_string(), "the-value".to_string());
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(
+        result,
+        ferrum_gateway::plugins::PluginResult::Continue
+    ));
+    // Without new_key, the rename is a no-op — old key should remain
+    assert_eq!(headers.get("x-old-name").unwrap(), "the-value");
+}
+
+#[tokio::test]
+async fn test_request_transformer_header_key_pre_lowercased() {
+    let plugin = RequestTransformer::new(&json!({
+        "rules": [
+            {"operation": "add", "target": "header", "key": "X-UPPER-CASE", "value": "lowered"}
+        ]
+    }));
+
+    let mut ctx = make_ctx();
+    let mut headers: HashMap<String, String> = HashMap::new();
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(
+        result,
+        ferrum_gateway::plugins::PluginResult::Continue
+    ));
+    // Key should be stored as lowercase due to pre-lowercasing at config time
+    assert_eq!(headers.get("x-upper-case").unwrap(), "lowered");
+    assert!(!headers.contains_key("X-UPPER-CASE"));
+}

@@ -7,10 +7,13 @@ use super::{Plugin, PluginResult, RequestContext};
 
 #[derive(Debug, Clone)]
 struct TransformRule {
-    operation: String, // add, remove, update
+    operation: String, // add, remove, update, rename
     target: String,    // header, query
+    /// Pre-lowercased for header rules (avoids per-request `.to_lowercase()`).
     key: String,
     value: Option<String>,
+    /// New key for rename operations (pre-lowercased for header rules).
+    new_key: Option<String>,
 }
 
 pub struct RequestTransformer {
@@ -19,21 +22,46 @@ pub struct RequestTransformer {
 
 impl RequestTransformer {
     pub fn new(config: &Value) -> Self {
-        let rules = config["rules"]
+        let rules: Vec<TransformRule> = config["rules"]
             .as_array()
             .map(|arr| {
                 arr.iter()
                     .filter_map(|r| {
+                        let operation = r["operation"].as_str()?.to_string();
+                        let target = r["target"].as_str()?.to_string();
+                        let raw_key = r["key"].as_str()?.to_string();
+                        let value = r["value"].as_str().map(String::from);
+                        let raw_new_key = r["new_key"].as_str().map(String::from);
+
+                        // Pre-lowercase header keys at config time
+                        let key = if target == "header" {
+                            raw_key.to_lowercase()
+                        } else {
+                            raw_key
+                        };
+                        let new_key = if target == "header" {
+                            raw_new_key.map(|k| k.to_lowercase())
+                        } else {
+                            raw_new_key
+                        };
+
                         Some(TransformRule {
-                            operation: r["operation"].as_str()?.to_string(),
-                            target: r["target"].as_str()?.to_string(),
-                            key: r["key"].as_str()?.to_string(),
-                            value: r["value"].as_str().map(String::from),
+                            operation,
+                            target,
+                            key,
+                            value,
+                            new_key,
                         })
                     })
                     .collect()
             })
             .unwrap_or_default();
+
+        if rules.is_empty() {
+            tracing::warn!(
+                "request_transformer: no 'rules' configured — plugin will have no effect"
+            );
+        }
 
         Self { rules }
     }
@@ -63,7 +91,7 @@ impl Plugin for RequestTransformer {
                 "header" => match rule.operation.as_str() {
                     "add" => {
                         if let Some(ref val) = rule.value {
-                            headers.entry(rule.key.to_lowercase()).or_insert_with(|| {
+                            headers.entry(rule.key.clone()).or_insert_with(|| {
                                 debug!("request_transformer: added header {}={}", rule.key, val);
                                 val.clone()
                             });
@@ -71,13 +99,24 @@ impl Plugin for RequestTransformer {
                     }
                     "update" => {
                         if let Some(ref val) = rule.value {
-                            headers.insert(rule.key.to_lowercase(), val.clone());
+                            headers.insert(rule.key.clone(), val.clone());
                             debug!("request_transformer: set header {}={}", rule.key, val);
                         }
                     }
                     "remove" => {
-                        headers.remove(&rule.key.to_lowercase());
+                        headers.remove(&rule.key);
                         debug!("request_transformer: removed header {}", rule.key);
+                    }
+                    "rename" => {
+                        if let Some(ref new_key) = rule.new_key
+                            && let Some(val) = headers.remove(&rule.key)
+                        {
+                            debug!(
+                                "request_transformer: renamed header {} -> {}",
+                                rule.key, new_key
+                            );
+                            headers.insert(new_key.clone(), val);
+                        }
                     }
                     _ => {}
                 },
@@ -96,6 +135,13 @@ impl Plugin for RequestTransformer {
                     }
                     "remove" => {
                         ctx.query_params.remove(&rule.key);
+                    }
+                    "rename" => {
+                        if let Some(ref new_key) = rule.new_key
+                            && let Some(val) = ctx.query_params.remove(&rule.key)
+                        {
+                            ctx.query_params.insert(new_key.clone(), val);
+                        }
                     }
                     _ => {}
                 },

@@ -3,11 +3,44 @@ use crate::config::types::{
     LoadBalancerAlgorithm, PluginAssociation, PluginConfig, PluginScope, Proxy, ResponseBodyMode,
     RetryConfig, Upstream, UpstreamTarget,
 };
-use chrono::Utc;
+use chrono::{DateTime, Duration, Utc};
 use sqlx::Executor;
 use sqlx::Row;
 use sqlx::{AnyPool, any::AnyPoolOptions, any::AnyRow};
+use std::collections::HashSet;
 use tracing::{debug, error, info, warn};
+
+/// Result of an incremental config poll.
+///
+/// Contains only the resources that changed since the last poll, plus IDs of
+/// resources that were deleted. The polling loop uses this to apply surgical
+/// updates without loading the entire database.
+pub struct IncrementalResult {
+    pub added_or_modified_proxies: Vec<Proxy>,
+    pub removed_proxy_ids: Vec<String>,
+    pub added_or_modified_consumers: Vec<Consumer>,
+    pub removed_consumer_ids: Vec<String>,
+    pub added_or_modified_plugin_configs: Vec<PluginConfig>,
+    pub removed_plugin_config_ids: Vec<String>,
+    pub added_or_modified_upstreams: Vec<Upstream>,
+    pub removed_upstream_ids: Vec<String>,
+    /// Timestamp to use as `since` for the next incremental poll.
+    pub poll_timestamp: DateTime<Utc>,
+}
+
+impl IncrementalResult {
+    /// True when nothing changed — skip all cache work.
+    pub fn is_empty(&self) -> bool {
+        self.added_or_modified_proxies.is_empty()
+            && self.removed_proxy_ids.is_empty()
+            && self.added_or_modified_consumers.is_empty()
+            && self.removed_consumer_ids.is_empty()
+            && self.added_or_modified_plugin_configs.is_empty()
+            && self.removed_plugin_config_ids.is_empty()
+            && self.added_or_modified_upstreams.is_empty()
+            && self.removed_upstream_ids.is_empty()
+    }
+}
 
 /// Database configuration store.
 #[derive(Clone)]
@@ -883,6 +916,205 @@ impl DatabaseStore {
         Ok(row.is_some())
     }
 
+    // ---- Incremental Polling ----
+
+    /// Load only resources that changed since `since`, and detect deletions by
+    /// comparing current DB IDs against the caller's known ID sets.
+    ///
+    /// This replaces `load_full_config()` for subsequent polls after the initial
+    /// full load, reducing DB I/O from 4 full table scans to 4 indexed
+    /// `WHERE updated_at > ?` queries plus 4 lightweight `SELECT id` queries.
+    pub async fn load_incremental_config(
+        &self,
+        since: DateTime<Utc>,
+        known_proxy_ids: &HashSet<String>,
+        known_consumer_ids: &HashSet<String>,
+        known_plugin_config_ids: &HashSet<String>,
+        known_upstream_ids: &HashSet<String>,
+    ) -> Result<IncrementalResult, anyhow::Error> {
+        let poll_timestamp = Utc::now();
+
+        // Subtract 1 second safety margin to handle boundary writes
+        let since_safe = since - Duration::seconds(1);
+        let since_str = since_safe.to_rfc3339();
+
+        // Fetch changed rows (indexed scan via updated_at index)
+        let changed_proxies = self.load_proxies_since(&since_str).await?;
+        let changed_consumers = self.load_consumers_since(&since_str).await?;
+        let changed_plugin_configs = self.load_plugin_configs_since(&since_str).await?;
+        let changed_upstreams = self.load_upstreams_since(&since_str).await?;
+
+        // Fetch current IDs (lightweight — one TEXT column per table)
+        let current_proxy_ids = self.load_table_ids("proxies").await?;
+        let current_consumer_ids = self.load_table_ids("consumers").await?;
+        let current_plugin_config_ids = self.load_table_ids("plugin_configs").await?;
+        let current_upstream_ids = self.load_table_ids("upstreams").await?;
+
+        // Detect deletions: IDs we knew about that no longer exist
+        let removed_proxy_ids = diff_removed(known_proxy_ids, &current_proxy_ids);
+        let removed_consumer_ids = diff_removed(known_consumer_ids, &current_consumer_ids);
+        let removed_plugin_config_ids =
+            diff_removed(known_plugin_config_ids, &current_plugin_config_ids);
+        let removed_upstream_ids = diff_removed(known_upstream_ids, &current_upstream_ids);
+
+        let result = IncrementalResult {
+            added_or_modified_proxies: changed_proxies,
+            removed_proxy_ids,
+            added_or_modified_consumers: changed_consumers,
+            removed_consumer_ids,
+            added_or_modified_plugin_configs: changed_plugin_configs,
+            removed_plugin_config_ids,
+            added_or_modified_upstreams: changed_upstreams,
+            removed_upstream_ids,
+            poll_timestamp,
+        };
+
+        if result.is_empty() {
+            debug!("Incremental poll: no changes detected");
+        } else {
+            info!(
+                "Incremental poll: {} proxies, {} consumers, {} plugins, {} upstreams changed; {} proxies, {} consumers, {} plugins, {} upstreams removed",
+                result.added_or_modified_proxies.len(),
+                result.added_or_modified_consumers.len(),
+                result.added_or_modified_plugin_configs.len(),
+                result.added_or_modified_upstreams.len(),
+                result.removed_proxy_ids.len(),
+                result.removed_consumer_ids.len(),
+                result.removed_plugin_config_ids.len(),
+                result.removed_upstream_ids.len(),
+            );
+        }
+
+        Ok(result)
+    }
+
+    /// Load proxies modified since `since_str` (RFC 3339 timestamp).
+    async fn load_proxies_since(&self, since_str: &str) -> Result<Vec<Proxy>, anyhow::Error> {
+        let rows: Vec<AnyRow> = sqlx::query("SELECT * FROM proxies WHERE updated_at > ?")
+            .bind(since_str)
+            .fetch_all(&self.pool)
+            .await?;
+
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Batch-load proxy_plugins only for the changed proxy IDs
+        let changed_ids: HashSet<String> = rows
+            .iter()
+            .filter_map(|r| r.try_get::<String, _>("id").ok())
+            .collect();
+
+        let assoc_rows: Vec<AnyRow> =
+            sqlx::query("SELECT proxy_id, plugin_config_id FROM proxy_plugins")
+                .fetch_all(&self.pool)
+                .await
+                .unwrap_or_default();
+
+        let mut plugins_by_proxy: std::collections::HashMap<String, Vec<PluginAssociation>> =
+            std::collections::HashMap::new();
+        for r in &assoc_rows {
+            if let Ok(proxy_id) = r.try_get::<String, _>("proxy_id")
+                && changed_ids.contains(&proxy_id)
+                && let Ok(plugin_config_id) = r.try_get::<String, _>("plugin_config_id")
+            {
+                plugins_by_proxy
+                    .entry(proxy_id)
+                    .or_default()
+                    .push(PluginAssociation { plugin_config_id });
+            }
+        }
+
+        let mut proxies = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let id: String = row.try_get("id")?;
+            let plugins = plugins_by_proxy.remove(&id).unwrap_or_default();
+            proxies.push(row_to_proxy(row, id, plugins)?);
+        }
+
+        Ok(proxies)
+    }
+
+    /// Load consumers modified since `since_str`.
+    async fn load_consumers_since(&self, since_str: &str) -> Result<Vec<Consumer>, anyhow::Error> {
+        let rows: Vec<AnyRow> = sqlx::query("SELECT * FROM consumers WHERE updated_at > ?")
+            .bind(since_str)
+            .fetch_all(&self.pool)
+            .await?;
+
+        let mut consumers = Vec::with_capacity(rows.len());
+        for row in rows {
+            consumers.push(row_to_consumer(&row)?);
+        }
+        Ok(consumers)
+    }
+
+    /// Load plugin configs modified since `since_str`.
+    async fn load_plugin_configs_since(
+        &self,
+        since_str: &str,
+    ) -> Result<Vec<PluginConfig>, anyhow::Error> {
+        let rows: Vec<AnyRow> = sqlx::query("SELECT * FROM plugin_configs WHERE updated_at > ?")
+            .bind(since_str)
+            .fetch_all(&self.pool)
+            .await?;
+
+        let mut configs = Vec::with_capacity(rows.len());
+        for row in rows {
+            configs.push(row_to_plugin_config(&row)?);
+        }
+        Ok(configs)
+    }
+
+    /// Load upstreams modified since `since_str`.
+    async fn load_upstreams_since(&self, since_str: &str) -> Result<Vec<Upstream>, anyhow::Error> {
+        let rows: Vec<AnyRow> = sqlx::query("SELECT * FROM upstreams WHERE updated_at > ?")
+            .bind(since_str)
+            .fetch_all(&self.pool)
+            .await?;
+
+        let mut upstreams = Vec::with_capacity(rows.len());
+        for row in rows {
+            upstreams.push(row_to_upstream(&row)?);
+        }
+        Ok(upstreams)
+    }
+
+    /// Load all IDs from a table (lightweight — one TEXT column, no deserialization).
+    async fn load_table_ids(&self, table: &str) -> Result<HashSet<String>, anyhow::Error> {
+        // Table name is a compile-time constant from the caller, not user input.
+        let sql = format!("SELECT id FROM {}", table);
+        let rows: Vec<AnyRow> = sqlx::query(&sql).fetch_all(&self.pool).await?;
+
+        let mut ids = HashSet::with_capacity(rows.len());
+        for row in rows {
+            if let Ok(id) = row.try_get::<String, _>("id") {
+                ids.insert(id);
+            }
+        }
+        Ok(ids)
+    }
+
+    /// Extract known IDs from a full config (used to seed the incremental poller).
+    pub fn extract_known_ids(
+        config: &GatewayConfig,
+    ) -> (
+        HashSet<String>,
+        HashSet<String>,
+        HashSet<String>,
+        HashSet<String>,
+    ) {
+        let proxy_ids: HashSet<String> = config.proxies.iter().map(|p| p.id.clone()).collect();
+        let consumer_ids: HashSet<String> = config.consumers.iter().map(|c| c.id.clone()).collect();
+        let plugin_config_ids: HashSet<String> = config
+            .plugin_configs
+            .iter()
+            .map(|pc| pc.id.clone())
+            .collect();
+        let upstream_ids: HashSet<String> = config.upstreams.iter().map(|u| u.id.clone()).collect();
+        (proxy_ids, consumer_ids, plugin_config_ids, upstream_ids)
+    }
+
     pub fn pool(&self) -> &AnyPool {
         &self.pool
     }
@@ -890,6 +1122,11 @@ impl DatabaseStore {
     pub fn db_type(&self) -> &str {
         &self.db_type
     }
+}
+
+/// IDs in `known` that are not in `current` (i.e., deleted resources).
+fn diff_removed(known: &HashSet<String>, current: &HashSet<String>) -> Vec<String> {
+    known.difference(current).cloned().collect()
 }
 
 fn parse_protocol(s: &str) -> BackendProtocol {

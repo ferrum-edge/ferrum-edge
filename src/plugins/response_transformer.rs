@@ -7,9 +7,12 @@ use super::{Plugin, PluginResult, RequestContext};
 
 #[derive(Debug, Clone)]
 struct TransformRule {
-    operation: String,
+    operation: String, // add, remove, update, rename
+    /// Pre-lowercased header key (avoids per-request `.to_lowercase()`).
     key: String,
     value: Option<String>,
+    /// New key for rename operations (pre-lowercased).
+    new_key: Option<String>,
 }
 
 pub struct ResponseTransformer {
@@ -18,20 +21,32 @@ pub struct ResponseTransformer {
 
 impl ResponseTransformer {
     pub fn new(config: &Value) -> Self {
-        let rules = config["rules"]
+        let rules: Vec<TransformRule> = config["rules"]
             .as_array()
             .map(|arr| {
                 arr.iter()
                     .filter_map(|r| {
+                        let operation = r["operation"].as_str()?.to_string();
+                        let raw_key = r["key"].as_str()?.to_string();
+                        let value = r["value"].as_str().map(String::from);
+                        let raw_new_key = r["new_key"].as_str().map(String::from);
+
                         Some(TransformRule {
-                            operation: r["operation"].as_str()?.to_string(),
-                            key: r["key"].as_str()?.to_string(),
-                            value: r["value"].as_str().map(String::from),
+                            operation,
+                            key: raw_key.to_lowercase(),
+                            value,
+                            new_key: raw_new_key.map(|k| k.to_lowercase()),
                         })
                     })
                     .collect()
             })
             .unwrap_or_default();
+
+        if rules.is_empty() {
+            tracing::warn!(
+                "response_transformer: no 'rules' configured — plugin will have no effect"
+            );
+        }
 
         Self { rules }
     }
@@ -57,23 +72,32 @@ impl Plugin for ResponseTransformer {
             match rule.operation.as_str() {
                 "add" => {
                     if let Some(ref val) = rule.value {
-                        response_headers
-                            .entry(rule.key.to_lowercase())
-                            .or_insert_with(|| {
-                                debug!("response_transformer: added header {}={}", rule.key, val);
-                                val.clone()
-                            });
+                        response_headers.entry(rule.key.clone()).or_insert_with(|| {
+                            debug!("response_transformer: added header {}={}", rule.key, val);
+                            val.clone()
+                        });
                     }
                 }
                 "update" => {
                     if let Some(ref val) = rule.value {
-                        response_headers.insert(rule.key.to_lowercase(), val.clone());
+                        response_headers.insert(rule.key.clone(), val.clone());
                         debug!("response_transformer: set header {}={}", rule.key, val);
                     }
                 }
                 "remove" => {
-                    response_headers.remove(&rule.key.to_lowercase());
+                    response_headers.remove(&rule.key);
                     debug!("response_transformer: removed header {}", rule.key);
+                }
+                "rename" => {
+                    if let Some(ref new_key) = rule.new_key
+                        && let Some(val) = response_headers.remove(&rule.key)
+                    {
+                        debug!(
+                            "response_transformer: renamed header {} -> {}",
+                            rule.key, new_key
+                        );
+                        response_headers.insert(new_key.clone(), val);
+                    }
                 }
                 _ => {}
             }

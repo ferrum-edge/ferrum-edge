@@ -1050,12 +1050,12 @@ async fn handle_update_credentials(
             if cred_type == "basicauth"
                 && let Some(pass) = hashed_cred.get("password").and_then(|p| p.as_str())
             {
-                let hash = match bcrypt::hash(pass, bcrypt::DEFAULT_COST) {
+                let hash = match hash_basic_auth_password(pass) {
                     Ok(h) => h,
                     Err(e) => {
                         return Ok(json_response(
                             StatusCode::INTERNAL_SERVER_ERROR,
-                            &json!({"error": format!("Failed to hash password: {}", e)}),
+                            &json!({"error": e}),
                         ));
                     }
                 };
@@ -1728,7 +1728,7 @@ fn hash_consumer_secrets(consumer: &mut Consumer) -> Result<(), String> {
     if let Some(basic) = consumer.credentials.get_mut("basicauth")
         && let Some(pass) = basic.get("password").and_then(|p| p.as_str())
     {
-        let hash = bcrypt::hash(pass, bcrypt::DEFAULT_COST).map_err(|e| {
+        let hash = hash_basic_auth_password(pass).map_err(|e| {
             format!(
                 "Failed to hash password for consumer {}: {}",
                 consumer.id, e
@@ -1740,4 +1740,28 @@ fn hash_consumer_secrets(consumer: &mut Consumer) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Hash a plaintext password for basic_auth storage.
+///
+/// When `FERRUM_BASIC_AUTH_HMAC_SECRET` is set, produces an `hmac_sha256:<hex>` hash
+/// (~1μs verification). Otherwise falls back to bcrypt ($2b$, ~100ms verification).
+fn hash_basic_auth_password(password: &str) -> Result<String, String> {
+    if let Ok(secret) = std::env::var("FERRUM_BASIC_AUTH_HMAC_SECRET")
+        && !secret.is_empty()
+    {
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+        type HmacSha256 = Hmac<Sha256>;
+
+        let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
+            .map_err(|e| format!("Failed to create HMAC instance: {}", e))?;
+        mac.update(password.as_bytes());
+        let hash = hex::encode(mac.finalize().into_bytes());
+        return Ok(format!("hmac_sha256:{}", hash));
+    }
+
+    // Fallback to bcrypt
+    bcrypt::hash(password, bcrypt::DEFAULT_COST)
+        .map_err(|e| format!("Failed to hash password: {}", e))
 }

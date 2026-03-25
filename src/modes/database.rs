@@ -1,7 +1,10 @@
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
+
+use chrono::{DateTime, Utc};
 
 use crate::admin::jwt_auth::create_jwt_manager_from_env;
 use crate::admin::{self, AdminState};
@@ -75,7 +78,7 @@ pub async fn run(
 
     // Build ProxyState first so the plugin cache exists with the shared DNS
     // cache, then collect plugin hostnames to include in warmup.
-    let proxy_state = ProxyState::new(config, dns_cache.clone(), env_config.clone());
+    let proxy_state = ProxyState::new(config, dns_cache.clone(), env_config.clone())?;
 
     // Collect plugin endpoint hostnames (http_logging, oauth2_auth, etc.)
     let plugin_hosts = proxy_state.plugin_cache.collect_warmup_hostnames();
@@ -289,7 +292,13 @@ pub async fn run(
         info!("Admin TLS not configured - HTTPS listener disabled");
     }
 
-    // Database polling loop (with shutdown)
+    // Database polling loop (with shutdown) — uses incremental polling
+    // to avoid full table scans on every cycle.
+    //
+    // First poll after startup seeds the known ID sets from the initial config.
+    // Subsequent polls use `load_incremental_config()` which fetches only
+    // rows with `updated_at > last_poll_at` and detects deletions via
+    // lightweight `SELECT id` queries.
     let poll_interval = Duration::from_secs(env_config.db_poll_interval);
     let db_poll = db.clone();
     let proxy_state_poll = proxy_state.clone();
@@ -297,20 +306,105 @@ pub async fn run(
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(poll_interval);
         interval.tick().await; // skip first immediate tick
+
+        // Seed incremental state from the initial config load
+        let initial_config = proxy_state_poll.current_config();
+        let (
+            mut known_proxy_ids,
+            mut known_consumer_ids,
+            mut known_plugin_config_ids,
+            mut known_upstream_ids,
+        ) = DatabaseStore::extract_known_ids(&initial_config);
+        let mut last_poll_at: Option<DateTime<Utc>> = Some(initial_config.loaded_at);
+
         loop {
             tokio::select! {
                 _ = interval.tick() => {
-                    match db_poll.load_full_config().await {
-                        Ok(new_config) => {
-                            if proxy_state_poll.update_config(new_config) {
-                                info!("Configuration reloaded from database");
+                    if let Some(since) = last_poll_at {
+                        // Incremental poll — only fetch changes since last poll
+                        match db_poll.load_incremental_config(
+                            since,
+                            &known_proxy_ids,
+                            &known_consumer_ids,
+                            &known_plugin_config_ids,
+                            &known_upstream_ids,
+                        ).await {
+                            Ok(result) => {
+                                let poll_ts = result.poll_timestamp;
+                                // Update known IDs before applying (add new, remove deleted)
+                                update_known_ids(
+                                    &mut known_proxy_ids,
+                                    &result.added_or_modified_proxies.iter().map(|p| p.id.clone()).collect(),
+                                    &result.removed_proxy_ids,
+                                );
+                                update_known_ids(
+                                    &mut known_consumer_ids,
+                                    &result.added_or_modified_consumers.iter().map(|c| c.id.clone()).collect(),
+                                    &result.removed_consumer_ids,
+                                );
+                                update_known_ids(
+                                    &mut known_plugin_config_ids,
+                                    &result.added_or_modified_plugin_configs.iter().map(|pc| pc.id.clone()).collect(),
+                                    &result.removed_plugin_config_ids,
+                                );
+                                update_known_ids(
+                                    &mut known_upstream_ids,
+                                    &result.added_or_modified_upstreams.iter().map(|u| u.id.clone()).collect(),
+                                    &result.removed_upstream_ids,
+                                );
+
+                                if proxy_state_poll.apply_incremental(result) {
+                                    debug!("Incremental config reload complete");
+                                }
+                                last_poll_at = Some(poll_ts);
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "Incremental poll failed, falling back to full reload: {}",
+                                    e
+                                );
+                                // Fallback to full config load
+                                match db_poll.load_full_config().await {
+                                    Ok(new_config) => {
+                                        let (p, c, pc, u) = DatabaseStore::extract_known_ids(&new_config);
+                                        known_proxy_ids = p;
+                                        known_consumer_ids = c;
+                                        known_plugin_config_ids = pc;
+                                        known_upstream_ids = u;
+                                        last_poll_at = Some(new_config.loaded_at);
+                                        if proxy_state_poll.update_config(new_config) {
+                                            info!("Configuration reloaded from database (full fallback)");
+                                        }
+                                    }
+                                    Err(e2) => {
+                                        warn!(
+                                            "Full config reload also failed (using cached): {}",
+                                            e2
+                                        );
+                                    }
+                                }
                             }
                         }
-                        Err(e) => {
-                            warn!(
-                                "Failed to reload config from database (using cached): {}",
-                                e
-                            );
+                    } else {
+                        // First poll — full load to seed state
+                        match db_poll.load_full_config().await {
+                            Ok(new_config) => {
+                                let (p, c, pc, u) = DatabaseStore::extract_known_ids(&new_config);
+                                known_proxy_ids = p;
+                                known_consumer_ids = c;
+                                known_plugin_config_ids = pc;
+                                known_upstream_ids = u;
+                                last_poll_at = Some(new_config.loaded_at);
+                                if proxy_state_poll.update_config(new_config) {
+                                    info!("Configuration reloaded from database");
+                                }
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "Failed to reload config from database (using cached): {}",
+                                    e
+                                );
+                            }
                         }
                     }
                 }
@@ -328,4 +422,14 @@ pub async fn run(
     }
 
     Ok(())
+}
+
+/// Update a known ID set by adding new IDs and removing deleted ones.
+fn update_known_ids(known: &mut HashSet<String>, added: &Vec<String>, removed: &[String]) {
+    for id in removed {
+        known.remove(id);
+    }
+    for id in added {
+        known.insert(id.clone());
+    }
 }

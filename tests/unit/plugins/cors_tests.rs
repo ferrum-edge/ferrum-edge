@@ -515,3 +515,201 @@ async fn test_multiple_origins_in_config() {
         _ => panic!("Expected 403 Reject for disallowed origin"),
     }
 }
+
+// ── Wildcard subdomain origin tests ─────────────────────────────────
+
+#[tokio::test]
+async fn test_wildcard_subdomain_origin_matches() {
+    let plugin = CorsPlugin::new(&json!({
+        "allowed_origins": ["*.company.com"]
+    }));
+
+    let mut ctx = make_cors_ctx("GET", "https://app.company.com");
+    let result = plugin.on_request_received(&mut ctx).await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "*.company.com should match https://app.company.com"
+    );
+    assert_eq!(
+        ctx.metadata.get("cors_origin").unwrap(),
+        "https://app.company.com"
+    );
+}
+
+#[tokio::test]
+async fn test_wildcard_subdomain_deep_subdomain_matches() {
+    let plugin = CorsPlugin::new(&json!({
+        "allowed_origins": ["*.company.com"]
+    }));
+
+    let mut ctx = make_cors_ctx("GET", "https://deep.sub.company.com");
+    let result = plugin.on_request_received(&mut ctx).await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "*.company.com should match https://deep.sub.company.com"
+    );
+}
+
+#[tokio::test]
+async fn test_wildcard_subdomain_rejects_non_match() {
+    let plugin = CorsPlugin::new(&json!({
+        "allowed_origins": ["*.company.com"]
+    }));
+
+    let mut ctx = make_cors_ctx("GET", "https://evil.com");
+    let result = plugin.on_request_received(&mut ctx).await;
+    match result {
+        PluginResult::Reject {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 403);
+            assert_eq!(body, "CORS origin not allowed");
+        }
+        _ => panic!("Expected 403 Reject for non-matching origin"),
+    }
+}
+
+#[tokio::test]
+async fn test_wildcard_subdomain_does_not_match_bare_domain() {
+    let plugin = CorsPlugin::new(&json!({
+        "allowed_origins": ["*.company.com"]
+    }));
+
+    // "company.com" has no subdomain prefix, so it should NOT match "*.company.com"
+    let mut ctx = make_cors_ctx("GET", "https://company.com");
+    let result = plugin.on_request_received(&mut ctx).await;
+    match result {
+        PluginResult::Reject {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 403);
+            assert_eq!(body, "CORS origin not allowed");
+        }
+        _ => panic!("Expected 403 Reject — bare domain should not match wildcard subdomain"),
+    }
+}
+
+#[tokio::test]
+async fn test_wildcard_subdomain_case_insensitive() {
+    let plugin = CorsPlugin::new(&json!({
+        "allowed_origins": ["*.Company.Com"]
+    }));
+
+    let mut ctx = make_cors_ctx("GET", "https://APP.COMPANY.COM");
+    let result = plugin.on_request_received(&mut ctx).await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "Wildcard subdomain matching should be case-insensitive"
+    );
+}
+
+#[tokio::test]
+async fn test_mixed_exact_and_wildcard_origins() {
+    let plugin = CorsPlugin::new(&json!({
+        "allowed_origins": ["https://exact.com", "*.company.com"]
+    }));
+
+    // Exact match
+    let mut ctx1 = make_cors_ctx("GET", "https://exact.com");
+    let result1 = plugin.on_request_received(&mut ctx1).await;
+    assert!(
+        matches!(result1, PluginResult::Continue),
+        "Exact origin should match"
+    );
+
+    // Wildcard subdomain match
+    let mut ctx2 = make_cors_ctx("GET", "https://app.company.com");
+    let result2 = plugin.on_request_received(&mut ctx2).await;
+    assert!(
+        matches!(result2, PluginResult::Continue),
+        "Wildcard subdomain should match"
+    );
+
+    // Neither
+    let mut ctx3 = make_cors_ctx("GET", "https://evil.com");
+    let result3 = plugin.on_request_received(&mut ctx3).await;
+    assert!(
+        matches!(
+            result3,
+            PluginResult::Reject {
+                status_code: 403,
+                ..
+            }
+        ),
+        "Unmatched origin should be rejected"
+    );
+}
+
+#[tokio::test]
+async fn test_star_in_list_with_other_origins_becomes_wildcard() {
+    // If "*" appears anywhere in the list, treat the whole config as Wildcard
+    let plugin = CorsPlugin::new(&json!({
+        "allowed_origins": ["*", "https://specific.com"]
+    }));
+
+    let mut ctx = make_cors_ctx("GET", "https://anything.example.com");
+    let result = plugin.on_request_received(&mut ctx).await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "\"*\" in list should make all origins allowed"
+    );
+}
+
+#[tokio::test]
+async fn test_wildcard_subdomain_preflight() {
+    let plugin = CorsPlugin::new(&json!({
+        "allowed_origins": ["*.company.com"]
+    }));
+
+    let mut ctx = make_preflight_ctx("https://app.company.com", "POST");
+    let result = plugin.on_request_received(&mut ctx).await;
+    match result {
+        PluginResult::Reject {
+            status_code,
+            headers,
+            ..
+        } => {
+            assert_eq!(status_code, 204);
+            assert_eq!(
+                headers.get("access-control-allow-origin").unwrap(),
+                "https://app.company.com",
+                "Preflight should reflect the actual origin, not the pattern"
+            );
+        }
+        _ => panic!("Expected 204 Reject for approved preflight"),
+    }
+}
+
+#[tokio::test]
+async fn test_wildcard_subdomain_reflects_origin_in_response() {
+    let plugin = CorsPlugin::new(&json!({
+        "allowed_origins": ["*.company.com"]
+    }));
+
+    let mut ctx = make_cors_ctx("GET", "https://app.company.com");
+    let _ = plugin.on_request_received(&mut ctx).await;
+
+    let mut response_headers: HashMap<String, String> = HashMap::new();
+    let _ = plugin
+        .after_proxy(&mut ctx, 200, &mut response_headers)
+        .await;
+    assert_eq!(
+        response_headers.get("access-control-allow-origin").unwrap(),
+        "https://app.company.com",
+        "Response should reflect the actual matched origin, not the wildcard pattern"
+    );
+}
+
+#[tokio::test]
+async fn test_wildcard_subdomain_with_port() {
+    let plugin = CorsPlugin::new(&json!({
+        "allowed_origins": ["*.company.com"]
+    }));
+
+    let mut ctx = make_cors_ctx("GET", "https://app.company.com:8443");
+    let result = plugin.on_request_received(&mut ctx).await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "*.company.com should match https://app.company.com:8443"
+    );
+}

@@ -211,3 +211,54 @@ async fn test_basic_auth_password_with_colon() {
     let result = plugin.authenticate(&mut ctx, &consumer_index).await;
     assert_reject(result, Some(401));
 }
+
+#[tokio::test]
+async fn test_basic_auth_bcrypt_fallback() {
+    // Verify bcrypt hash verification works (the default path when HMAC is not configured)
+    let plugin = BasicAuth::new(&json!({}));
+
+    // Create a consumer with a known bcrypt hash for "mypassword"
+    let hash = bcrypt::hash("mypassword", 4).unwrap(); // cost=4 for fast tests
+
+    use chrono::Utc;
+    use serde_json::{Map, Value};
+
+    let mut credentials = std::collections::HashMap::new();
+    let mut basicauth_creds = Map::new();
+    basicauth_creds.insert("password_hash".to_string(), Value::String(hash));
+    credentials.insert("basicauth".to_string(), Value::Object(basicauth_creds));
+
+    let consumer = ferrum_gateway::config::types::Consumer {
+        id: "bcrypt-consumer".to_string(),
+        username: "bcryptuser".to_string(),
+        custom_id: None,
+        credentials,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+    let consumer_index = ConsumerIndex::new(&[consumer]);
+
+    // Correct password should succeed
+    let mut ctx = make_ctx();
+    ctx.headers.insert(
+        "authorization".to_string(),
+        basic_header("bcryptuser", "mypassword"),
+    );
+    ctx.identified_consumer = None;
+
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
+    assert_continue(result);
+    assert!(ctx.identified_consumer.is_some());
+    assert_eq!(ctx.identified_consumer.unwrap().username, "bcryptuser");
+
+    // Wrong password should fail
+    let mut ctx2 = make_ctx();
+    ctx2.headers.insert(
+        "authorization".to_string(),
+        basic_header("bcryptuser", "wrongpassword"),
+    );
+    ctx2.identified_consumer = None;
+
+    let result2 = plugin.authenticate(&mut ctx2, &consumer_index).await;
+    assert_reject(result2, Some(401));
+}

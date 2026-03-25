@@ -795,3 +795,27 @@ async fn test_json_schema_complex_api_payload() {
     let mut headers = HashMap::new();
     assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
 }
+
+// ─── Pre-compiled regex pattern reuse ─────────────────────────────────
+
+#[tokio::test]
+async fn test_json_schema_pattern_pre_compiled_reuse() {
+    // Create a plugin with a pattern constraint — the regex is pre-compiled at config time
+    let plugin = json_schema_plugin(serde_json::json!({
+        "type": "string",
+        "pattern": "^[A-Z]{3}-[0-9]{4}$"
+    }));
+
+    // First request: matching pattern
+    let mut ctx1 = make_json_ctx(r#""ABC-1234""#);
+    let mut headers1 = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx1, &mut headers1).await);
+
+    // Second request: non-matching pattern (implicitly exercises the same pre-compiled regex)
+    let mut ctx2 = make_json_ctx(r#""invalid""#);
+    let mut headers2 = HashMap::new();
+    assert_reject(
+        plugin.before_proxy(&mut ctx2, &mut headers2).await,
+        Some(400),
+    );
+}

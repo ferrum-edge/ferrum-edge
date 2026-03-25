@@ -26,13 +26,16 @@ pub struct BodyValidator {
     required_xml_elements: Vec<String>,
     /// Content types to validate (empty = validate all).
     content_types: Vec<String>,
+    /// Pre-compiled regexes for JSON Schema `pattern` constraints.
+    /// Keyed by the pattern string so lookup is O(1) at request time.
+    compiled_patterns: HashMap<String, regex::Regex>,
 }
 
 impl BodyValidator {
     pub fn new(config: &Value) -> Self {
         let json_schema = config.get("json_schema").cloned();
 
-        let required_fields = config["required_fields"]
+        let required_fields: Vec<String> = config["required_fields"]
             .as_array()
             .map(|arr| {
                 arr.iter()
@@ -43,7 +46,7 @@ impl BodyValidator {
 
         let validate_xml = config["validate_xml"].as_bool().unwrap_or(false);
 
-        let required_xml_elements = config["required_xml_elements"]
+        let required_xml_elements: Vec<String> = config["required_xml_elements"]
             .as_array()
             .map(|arr| {
                 arr.iter()
@@ -67,12 +70,29 @@ impl BodyValidator {
                 ]
             });
 
+        if json_schema.is_none()
+            && required_fields.is_empty()
+            && !validate_xml
+            && required_xml_elements.is_empty()
+        {
+            tracing::warn!(
+                "body_validator: no validation rules configured — set 'json_schema', 'required_fields', 'validate_xml', or 'required_xml_elements'"
+            );
+        }
+
+        // Pre-compile all regex patterns found in the JSON schema at config load time.
+        let mut compiled_patterns = HashMap::new();
+        if let Some(ref schema) = json_schema {
+            collect_patterns(schema, &mut compiled_patterns);
+        }
+
         Self {
             json_schema,
             required_fields,
             validate_xml,
             required_xml_elements,
             content_types,
+            compiled_patterns,
         }
     }
 
@@ -160,17 +180,27 @@ impl BodyValidator {
                 ));
             }
             if let Some(pattern) = schema.get("pattern").and_then(|v| v.as_str()) {
-                match regex::Regex::new(pattern) {
-                    Ok(re) => {
-                        if !re.is_match(s) {
-                            return Err(format!(
-                                "String '{}' does not match pattern '{}'",
-                                s, pattern
-                            ));
-                        }
+                if let Some(re) = self.compiled_patterns.get(pattern) {
+                    if !re.is_match(s) {
+                        return Err(format!(
+                            "String '{}' does not match pattern '{}'",
+                            s, pattern
+                        ));
                     }
-                    Err(e) => {
-                        return Err(format!("Invalid regex pattern '{}': {}", pattern, e));
+                } else {
+                    // Fallback: pattern wasn't found during schema walk (shouldn't happen)
+                    match regex::Regex::new(pattern) {
+                        Ok(re) => {
+                            if !re.is_match(s) {
+                                return Err(format!(
+                                    "String '{}' does not match pattern '{}'",
+                                    s, pattern
+                                ));
+                            }
+                        }
+                        Err(e) => {
+                            return Err(format!("Invalid regex pattern '{}': {}", pattern, e));
+                        }
                     }
                 }
             }
@@ -473,6 +503,51 @@ impl BodyValidator {
         }
 
         Ok(())
+    }
+}
+
+/// Recursively walk a JSON Schema and pre-compile all `pattern` regex strings.
+fn collect_patterns(schema: &Value, patterns: &mut HashMap<String, regex::Regex>) {
+    if let Some(pattern) = schema.get("pattern").and_then(|v| v.as_str())
+        && !patterns.contains_key(pattern)
+    {
+        match regex::Regex::new(pattern) {
+            Ok(re) => {
+                patterns.insert(pattern.to_string(), re);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "body_validator: invalid regex pattern '{}' in schema: {}",
+                    pattern,
+                    e
+                );
+            }
+        }
+    }
+
+    // Recurse into sub-schemas
+    if let Some(props) = schema.get("properties").and_then(|p| p.as_object()) {
+        for prop_schema in props.values() {
+            collect_patterns(prop_schema, patterns);
+        }
+    }
+    if let Some(items) = schema.get("items") {
+        collect_patterns(items, patterns);
+    }
+    if let Some(additional) = schema.get("additionalProperties")
+        && additional.is_object()
+    {
+        collect_patterns(additional, patterns);
+    }
+    for keyword in &["allOf", "anyOf", "oneOf"] {
+        if let Some(arr) = schema.get(*keyword).and_then(|v| v.as_array()) {
+            for sub in arr {
+                collect_patterns(sub, patterns);
+            }
+        }
+    }
+    if let Some(not_schema) = schema.get("not") {
+        collect_patterns(not_schema, patterns);
     }
 }
 

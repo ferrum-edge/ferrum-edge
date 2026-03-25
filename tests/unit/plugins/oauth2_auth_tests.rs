@@ -79,7 +79,11 @@ fn create_rs256_token_no_kid(claims: &serde_json::Value, private_key_pem: &[u8])
 
 #[tokio::test]
 async fn test_oauth2_auth_plugin_creation() {
-    let plugin = OAuth2Auth::new(&json!({}), default_client());
+    let plugin = OAuth2Auth::new(
+        &json!({"jwks_uri": "https://example.com/.well-known/jwks.json"}),
+        default_client(),
+    )
+    .unwrap();
     assert_eq!(plugin.name(), "oauth2_auth");
 }
 
@@ -88,13 +92,18 @@ async fn test_oauth2_auth_creation_with_config() {
     let plugin = OAuth2Auth::new(
         &json!({
             "validation_mode": "jwks",
+            "jwks_uri": "https://auth.example.com/.well-known/jwks.json",
             "expected_issuer": "https://auth.example.com",
             "expected_audience": "my-api"
         }),
         default_client(),
-    );
+    )
+    .unwrap();
     assert_eq!(plugin.name(), "oauth2_auth");
-    assert_eq!(plugin.jwks_uri(), None);
+    assert_eq!(
+        plugin.jwks_uri(),
+        Some("https://auth.example.com/.well-known/jwks.json")
+    );
 }
 
 #[tokio::test]
@@ -104,7 +113,8 @@ async fn test_oauth2_auth_jwks_uri_config() {
             "jwks_uri": "https://auth.example.com/.well-known/jwks.json"
         }),
         default_client(),
-    );
+    )
+    .unwrap();
     assert_eq!(
         plugin.jwks_uri(),
         Some("https://auth.example.com/.well-known/jwks.json")
@@ -116,7 +126,8 @@ async fn test_oauth2_auth_missing_bearer_token() {
     let plugin = OAuth2Auth::new(
         &json!({"jwks_uri": "https://example.com/jwks"}),
         default_client(),
-    );
+    )
+    .unwrap();
     let consumer_index = ConsumerIndex::new(&[create_consumer("user")]);
 
     let mut ctx = make_ctx();
@@ -130,7 +141,8 @@ async fn test_oauth2_auth_non_bearer_scheme() {
     let plugin = OAuth2Auth::new(
         &json!({"jwks_uri": "https://example.com/jwks"}),
         default_client(),
-    );
+    )
+    .unwrap();
     let consumer_index = ConsumerIndex::new(&[create_consumer("user")]);
 
     let mut ctx = make_ctx();
@@ -144,32 +156,19 @@ async fn test_oauth2_auth_non_bearer_scheme() {
 
 #[tokio::test]
 async fn test_oauth2_auth_introspection_mode_no_url() {
-    let plugin = OAuth2Auth::new(
+    // Introspection mode without introspection_url should fail at construction time
+    let result = OAuth2Auth::new(
         &json!({"validation_mode": "introspection"}),
         default_client(),
     );
-    let consumer_index = ConsumerIndex::new(&[create_consumer("user")]);
-
-    let mut ctx = make_ctx();
-    ctx.headers.insert(
-        "authorization".to_string(),
-        "Bearer some-opaque-token".to_string(),
-    );
-    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
-    assert_reject(result, Some(401));
+    assert!(result.is_err());
 }
 
 #[tokio::test]
 async fn test_oauth2_jwks_mode_rejects_without_jwks_uri() {
-    // JWKS mode without any jwks_uri or discovery_url should return 500 (misconfigured)
-    let plugin = OAuth2Auth::new(&json!({"validation_mode": "jwks"}), default_client());
-    let consumer_index = ConsumerIndex::new(&[create_consumer("user")]);
-
-    let mut ctx = make_ctx();
-    ctx.headers
-        .insert("authorization".to_string(), "Bearer some-token".to_string());
-    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
-    assert_reject(result, Some(500));
+    // JWKS mode without any jwks_uri or discovery_url should fail at construction time
+    let result = OAuth2Auth::new(&json!({"validation_mode": "jwks"}), default_client());
+    assert!(result.is_err());
 }
 
 // ─── JWKS RS256 Validation (IdP Public Keys) ──────────────────────────
@@ -191,7 +190,8 @@ async fn test_oauth2_jwks_validates_rs256_token_from_idp() {
     let plugin = OAuth2Auth::new(
         &json!({"validation_mode": "jwks", "jwks_uri": jwks_uri}),
         default_client(),
-    );
+    )
+    .unwrap();
     plugin.warmup_jwks().await;
 
     let consumer = create_consumer("idp-user");
@@ -226,7 +226,8 @@ async fn test_oauth2_jwks_rejects_token_signed_with_wrong_key() {
     let plugin = OAuth2Auth::new(
         &json!({"validation_mode": "jwks", "jwks_uri": jwks_uri}),
         default_client(),
-    );
+    )
+    .unwrap();
     plugin.warmup_jwks().await;
 
     let consumer = create_consumer("idp-user");
@@ -260,7 +261,8 @@ async fn test_oauth2_jwks_rejects_unknown_subject() {
     let plugin = OAuth2Auth::new(
         &json!({"validation_mode": "jwks", "jwks_uri": jwks_uri}),
         default_client(),
-    );
+    )
+    .unwrap();
     plugin.warmup_jwks().await;
 
     // Consumer index doesn't contain "unknown-user"
@@ -297,7 +299,8 @@ async fn test_oauth2_jwks_validates_with_issuer() {
             "expected_issuer": "https://auth.example.com"
         }),
         default_client(),
-    );
+    )
+    .unwrap();
     plugin.warmup_jwks().await;
 
     let consumer = create_consumer("user");
@@ -337,7 +340,8 @@ async fn test_oauth2_jwks_rejects_wrong_issuer() {
             "expected_issuer": "https://auth.example.com"
         }),
         default_client(),
-    );
+    )
+    .unwrap();
     plugin.warmup_jwks().await;
 
     let consumer = create_consumer("user");
@@ -377,7 +381,8 @@ async fn test_oauth2_jwks_validates_with_audience() {
             "expected_audience": "my-api"
         }),
         default_client(),
-    );
+    )
+    .unwrap();
     plugin.warmup_jwks().await;
 
     let consumer = create_consumer("user");
@@ -407,7 +412,7 @@ async fn test_oauth2_jwks_token_without_kid_tries_all_keys() {
         .await;
 
     let jwks_uri = format!("{}/.well-known/jwks.json", mock_server.uri());
-    let plugin = OAuth2Auth::new(&json!({"jwks_uri": jwks_uri}), default_client());
+    let plugin = OAuth2Auth::new(&json!({"jwks_uri": jwks_uri}), default_client()).unwrap();
     plugin.warmup_jwks().await;
 
     let consumer = create_consumer("user");
@@ -438,7 +443,7 @@ async fn test_oauth2_jwks_maps_subject_to_custom_id() {
         .await;
 
     let jwks_uri = format!("{}/.well-known/jwks.json", mock_server.uri());
-    let plugin = OAuth2Auth::new(&json!({"jwks_uri": jwks_uri}), default_client());
+    let plugin = OAuth2Auth::new(&json!({"jwks_uri": jwks_uri}), default_client()).unwrap();
     plugin.warmup_jwks().await;
 
     // Consumer has custom_id matching the IdP's sub claim
@@ -473,7 +478,7 @@ async fn test_oauth2_jwks_consumer_claim_defaults_to_sub() {
         .await;
 
     let jwks_uri = format!("{}/jwks", mock_server.uri());
-    let plugin = OAuth2Auth::new(&json!({"jwks_uri": jwks_uri}), default_client());
+    let plugin = OAuth2Auth::new(&json!({"jwks_uri": jwks_uri}), default_client()).unwrap();
     plugin.warmup_jwks().await;
 
     let consumer = create_consumer("sub-user");
@@ -514,7 +519,8 @@ async fn test_oauth2_jwks_consumer_claim_email() {
             "consumer_claim": "email"
         }),
         default_client(),
-    );
+    )
+    .unwrap();
     plugin.warmup_jwks().await;
 
     // Consumer's custom_id matches the email claim
@@ -559,7 +565,8 @@ async fn test_oauth2_jwks_consumer_claim_preferred_username() {
             "consumer_claim": "preferred_username"
         }),
         default_client(),
-    );
+    )
+    .unwrap();
     plugin.warmup_jwks().await;
 
     // Consumer's username matches the preferred_username claim
@@ -605,7 +612,8 @@ async fn test_oauth2_jwks_consumer_claim_custom_field() {
             "consumer_claim": "user_id"
         }),
         default_client(),
-    );
+    )
+    .unwrap();
     plugin.warmup_jwks().await;
 
     let consumer = create_consumer_with_custom_id("internal-user", "uid-98765");
@@ -649,7 +657,8 @@ async fn test_oauth2_jwks_consumer_claim_missing_rejects() {
             "consumer_claim": "email"
         }),
         default_client(),
-    );
+    )
+    .unwrap();
     plugin.warmup_jwks().await;
 
     let consumer = create_consumer("user");
@@ -678,7 +687,8 @@ async fn test_oauth2_warmup_hostnames_includes_all_endpoints() {
             "discovery_url": "https://idp.example.com/.well-known/openid-configuration"
         }),
         default_client(),
-    );
+    )
+    .unwrap();
 
     let hosts = plugin.warmup_hostnames();
     assert!(hosts.contains(&"introspect.example.com".to_string()));

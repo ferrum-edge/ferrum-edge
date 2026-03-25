@@ -1,9 +1,11 @@
+use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 use url::Url;
 
 use crate::consumer_index::ConsumerIndex;
@@ -54,8 +56,10 @@ pub struct OAuth2Auth {
     /// or custom_id via `ConsumerIndex::find_by_identity()`.
     consumer_claim: String,
     http_client: PluginHttpClient,
-    /// Remote JWKS key store — populated when `jwks_uri` or `discovery_url` is configured.
-    jwks_store: Option<JwksKeyStore>,
+    /// Remote JWKS key store — populated immediately when `jwks_uri` is configured,
+    /// or asynchronously after OIDC discovery when `discovery_url` is configured.
+    /// Uses ArcSwap so the discovery background task can populate it after construction.
+    jwks_store: Arc<ArcSwap<Option<JwksKeyStore>>>,
     /// Handle for the background JWKS refresh task.
     _refresh_handle: Option<tokio::task::JoinHandle<()>>,
 }
@@ -64,27 +68,75 @@ pub struct OAuth2Auth {
 const JWKS_REFRESH_INTERVAL_SECS: u64 = 300;
 
 impl OAuth2Auth {
-    pub fn new(config: &Value, http_client: PluginHttpClient) -> Self {
+    pub fn new(config: &Value, http_client: PluginHttpClient) -> Result<Self, String> {
         let jwks_uri = config["jwks_uri"].as_str().map(|s| s.to_string());
         let discovery_url = config["discovery_url"].as_str().map(|s| s.to_string());
+        let introspection_url = config["introspection_url"].as_str().map(|s| s.to_string());
+        let validation_mode = config["validation_mode"]
+            .as_str()
+            .unwrap_or("jwks")
+            .to_string();
+
+        // Validate: at least one endpoint must be configured
+        if validation_mode == "introspection" && introspection_url.is_none() {
+            return Err(
+                "oauth2_auth: validation_mode is 'introspection' but 'introspection_url' is not set"
+                    .to_string(),
+            );
+        }
+        if validation_mode != "introspection" && jwks_uri.is_none() && discovery_url.is_none() {
+            return Err(
+                "oauth2_auth: JWKS mode requires either 'jwks_uri' or 'discovery_url' to be set"
+                    .to_string(),
+            );
+        }
         let refresh_interval_secs = config["jwks_refresh_interval_secs"]
             .as_u64()
             .unwrap_or(JWKS_REFRESH_INTERVAL_SECS);
 
-        let (jwks_store, refresh_handle) = if let Some(ref uri) = jwks_uri {
+        let jwks_store_slot: Arc<ArcSwap<Option<JwksKeyStore>>> =
+            Arc::new(ArcSwap::from_pointee(None));
+
+        let refresh_handle = if let Some(ref uri) = jwks_uri {
+            // Explicit jwks_uri — create store immediately
             let store = JwksKeyStore::new(uri.clone(), http_client.clone());
             let handle = store.start_background_refresh(Duration::from_secs(refresh_interval_secs));
-            (Some(store), Some(handle))
+            jwks_store_slot.store(Arc::new(Some(store)));
+            Some(handle)
+        } else if let Some(ref disc_url) = discovery_url {
+            // OIDC discovery — fetch jwks_uri asynchronously, then create store
+            let slot = jwks_store_slot.clone();
+            let client = http_client.clone();
+            let url = disc_url.clone();
+            let interval = refresh_interval_secs;
+            tokio::spawn(async move {
+                match discover_jwks_uri(&client, &url).await {
+                    Ok(uri) => {
+                        info!("OAuth2 OIDC discovery: resolved jwks_uri={}", uri);
+                        let store = JwksKeyStore::new(uri, client);
+                        // Eagerly fetch keys before making the store visible
+                        if let Err(e) = store.fetch_keys().await {
+                            warn!("OAuth2 OIDC: initial JWKS fetch failed: {}", e);
+                        }
+                        store.start_background_refresh(Duration::from_secs(interval));
+                        slot.store(Arc::new(Some(store)));
+                    }
+                    Err(e) => {
+                        warn!(
+                            "OAuth2 OIDC discovery failed: {} — JWKS validation will be unavailable",
+                            e
+                        );
+                    }
+                }
+            });
+            None
         } else {
-            (None, None)
+            None
         };
 
-        Self {
-            validation_mode: config["validation_mode"]
-                .as_str()
-                .unwrap_or("jwks")
-                .to_string(),
-            introspection_url: config["introspection_url"].as_str().map(|s| s.to_string()),
+        Ok(Self {
+            validation_mode,
+            introspection_url,
             introspection_auth: config["introspection_auth"].as_str().map(|s| s.to_string()),
             jwks_uri,
             discovery_url,
@@ -95,22 +147,22 @@ impl OAuth2Auth {
                 .unwrap_or("sub")
                 .to_string(),
             http_client,
-            jwks_store,
+            jwks_store: jwks_store_slot,
             _refresh_handle: refresh_handle,
-        }
+        })
     }
 
     /// Eagerly fetch JWKS keys if a store is configured.
     /// Called by tests to pre-populate the key store before assertions.
     #[allow(dead_code)] // Used by tests
     pub async fn warmup_jwks(&self) {
-        if let Some(ref store) = self.jwks_store {
+        let guard = self.jwks_store.load();
+        if let Some(ref store) = **guard {
             match store.fetch_keys().await {
                 Ok(count) => {
-                    tracing::info!(
+                    info!(
                         "OAuth2 JWKS warmup: fetched {} keys from {:?}",
-                        count,
-                        self.jwks_uri
+                        count, self.jwks_uri
                     );
                 }
                 Err(e) => warn!(
@@ -136,7 +188,8 @@ impl OAuth2Auth {
     /// Returns `Some(claims)` if validation succeeds, `None` if it fails
     /// or no JWKS keys are available.
     fn validate_with_jwks(&self, token: &str) -> Option<Value> {
-        let store = self.jwks_store.as_ref()?;
+        let guard = self.jwks_store.load();
+        let store = guard.as_ref().as_ref()?;
 
         if !store.has_keys() {
             warn!("OAuth2 JWKS: no keys available — IdP keys may not have been fetched yet");
@@ -287,11 +340,17 @@ impl Plugin for OAuth2Auth {
                     self.jwks_uri()
                 );
 
-                if self.jwks_store.is_none() {
-                    warn!("OAuth2 JWKS: no jwks_uri or discovery_url configured");
+                if self.jwks_store.load().is_none() {
+                    // Store not yet populated — either no jwks_uri/discovery_url configured,
+                    // or OIDC discovery is still in progress
+                    if self.discovery_url.is_some() {
+                        warn!("OAuth2 JWKS: OIDC discovery still in progress, rejecting request");
+                    } else {
+                        warn!("OAuth2 JWKS: no jwks_uri or discovery_url configured");
+                    }
                     return PluginResult::Reject {
                         status_code: 500,
-                        body: r#"{"error":"OAuth2 plugin misconfigured: no jwks_uri or discovery_url"}"#.into(),
+                        body: r#"{"error":"OAuth2 plugin misconfigured or not yet ready"}"#.into(),
                         headers: HashMap::new(),
                     };
                 }
@@ -372,4 +431,38 @@ impl OAuth2Auth {
             .ok()
             .and_then(|u| u.host_str().map(|h| h.to_string()))
     }
+}
+
+/// Fetch the OIDC discovery document and extract the `jwks_uri` field.
+///
+/// Standard OIDC discovery endpoints return a JSON document with a `jwks_uri`
+/// field pointing to the Identity Provider's JWKS endpoint.
+/// See: https://openid.net/specs/openid-connect-discovery-1_0.html
+async fn discover_jwks_uri(
+    http_client: &PluginHttpClient,
+    discovery_url: &str,
+) -> Result<String, String> {
+    let response = http_client
+        .get()
+        .get(discovery_url)
+        .send()
+        .await
+        .map_err(|e| format!("OIDC discovery request failed: {}", e))?;
+
+    if !response.status().is_success() {
+        return Err(format!(
+            "OIDC discovery endpoint returned HTTP {}",
+            response.status()
+        ));
+    }
+
+    let body: Value = response
+        .json()
+        .await
+        .map_err(|e| format!("OIDC discovery response parse failed: {}", e))?;
+
+    body["jwks_uri"]
+        .as_str()
+        .map(|s| s.to_string())
+        .ok_or_else(|| "OIDC discovery document missing 'jwks_uri' field".to_string())
 }

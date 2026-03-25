@@ -23,7 +23,7 @@ impl Plugin for StdoutLogging {
 
     async fn log(&self, summary: &TransactionSummary) {
         if let Ok(json) = serde_json::to_string(summary) {
-            println!("{}", json);
+            tracing::info!(target: "access_log", "{}", json);
         }
     }
 }

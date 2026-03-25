@@ -78,6 +78,7 @@ url = "2"
 socket2 = { version = "0.6.3", features = ["all"] }
 sha2 = "0.10.9"
 hmac = "0.12.1"
+hex = "0.4"
 
 # ── Build profiles ─────────────────────────────────────────────────────────
 # Dev: optimise for fast compile-edit-run cycles

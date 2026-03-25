@@ -206,6 +206,12 @@ impl RateLimiting {
             specs
         };
 
+        if window_specs.is_empty() {
+            tracing::warn!(
+                "rate_limiting: no rate limit windows configured — set 'window_seconds'+'max_requests', or 'requests_per_second'/'requests_per_minute'/'requests_per_hour'"
+            );
+        }
+
         Self {
             limit_by,
             window_specs,
