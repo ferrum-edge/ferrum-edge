@@ -77,6 +77,10 @@ struct BenchArgs {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Install rustls crypto provider (needed for TLS operations)
+    let _ =
+        rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
+
     let cli = Cli::parse();
     match cli.command {
         Protocol::Http2(args) => run_http2(&args).await,
@@ -105,13 +109,12 @@ fn print_results(metrics: &BenchMetrics, protocol: &str, args: &BenchArgs) {
     }
 }
 
-fn collect_results(
+async fn collect_results(
     handles: Vec<tokio::task::JoinHandle<anyhow::Result<BenchMetrics>>>,
 ) -> BenchMetrics {
-    let rt = tokio::runtime::Handle::current();
     let mut combined = BenchMetrics::new();
     for handle in handles {
-        match rt.block_on(handle) {
+        match handle.await {
             Ok(Ok(m)) => combined.merge(&m),
             Ok(Err(e)) => eprintln!("  task error: {e}"),
             Err(e) => eprintln!("  join error: {e}"),
@@ -201,7 +204,7 @@ async fn run_http2(args: &BenchArgs) -> anyhow::Result<()> {
         }));
     }
 
-    let combined = collect_results(handles);
+    let combined = collect_results(handles).await;
     print_results(&combined, "HTTP/2", args);
     Ok(())
 }
@@ -229,15 +232,26 @@ async fn run_http3(args: &BenchArgs) -> anyhow::Result<()> {
             let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap())?;
             endpoint.set_default_client_config(client_cfg);
 
-            let conn = endpoint.connect(addr, &host_str)?.await?;
-            let (driver, mut send_req) =
-                h3::client::new(h3_quinn::Connection::new(conn)).await?;
-            // h3 driver needs to run but isn't a bare Future; drop it to let the
-            // connection proceed (requests drive it).
-            drop(driver);
+            let conn = endpoint.connect(addr, &host_str)
+                .map_err(|e| { eprintln!("  quinn connect start error: {e}"); anyhow::anyhow!("{e}") })?
+                .await
+                .map_err(|e| { eprintln!("  quinn connect error: {e}"); anyhow::anyhow!("{e}") })?;
+            let (mut driver, mut send_req) =
+                h3::client::new(h3_quinn::Connection::new(conn))
+                    .await
+                    .map_err(|e| { eprintln!("  h3 handshake error: {e}"); anyhow::anyhow!("{e}") })?;
+            // h3 driver must be polled concurrently to process connection frames
+            tokio::spawn(async move {
+                let _ = futures_util::future::poll_fn(|cx| driver.poll_close(cx)).await;
+            });
 
+            let full_uri = format!("https://{host_str}:{port}{path}");
             while Instant::now() < deadline {
-                let req = http::Request::get(&path).body(()).unwrap();
+                let req = http::Request::builder()
+                    .method("GET")
+                    .uri(&full_uri)
+                    .body(())
+                    .unwrap();
                 let start = Instant::now();
                 match send_req.send_request(req).await {
                     Ok(mut stream) => {
@@ -247,15 +261,18 @@ async fn run_http3(args: &BenchArgs) -> anyhow::Result<()> {
                                 let mut body_bytes = 0usize;
                                 while let Ok(Some(chunk)) = stream.recv_data().await {
                                     body_bytes += chunk.remaining();
-                                    // consume
                                 }
                                 let latency = start.elapsed().as_micros() as u64;
                                 metrics.record(latency, body_bytes);
                             }
-                            Err(_) => metrics.record_error(),
+                            Err(e) => {
+                                eprintln!("  h3 recv_response error: {e}");
+                                metrics.record_error();
+                            }
                         }
                     }
-                    Err(_) => {
+                    Err(e) => {
+                        eprintln!("  h3 send_request error: {e}");
                         metrics.record_error();
                         break;
                     }
@@ -265,7 +282,7 @@ async fn run_http3(args: &BenchArgs) -> anyhow::Result<()> {
         }));
     }
 
-    let combined = collect_results(handles);
+    let combined = collect_results(handles).await;
     print_results(&combined, "HTTP/3", args);
     Ok(())
 }
@@ -317,7 +334,7 @@ async fn run_ws(args: &BenchArgs) -> anyhow::Result<()> {
         }));
     }
 
-    let combined = collect_results(handles);
+    let combined = collect_results(handles).await;
     print_results(&combined, "WebSocket", args);
     Ok(())
 }
@@ -378,7 +395,7 @@ async fn run_grpc(args: &BenchArgs) -> anyhow::Result<()> {
         }));
     }
 
-    let combined = collect_results(handles);
+    let combined = collect_results(handles).await;
     print_results(&combined, "gRPC", args);
     Ok(())
 }
@@ -436,7 +453,7 @@ async fn run_tcp(args: &BenchArgs) -> anyhow::Result<()> {
         }));
     }
 
-    let combined = collect_results(handles);
+    let combined = collect_results(handles).await;
     let proto_name = if args.tls { "TCP+TLS" } else { "TCP" };
     print_results(&combined, proto_name, args);
     Ok(())
@@ -475,13 +492,17 @@ async fn run_udp(args: &BenchArgs) -> anyhow::Result<()> {
                     .await
                     .map_err(|e| anyhow::anyhow!("udp connect: {e}"))?;
 
-                let dtls_conn = DTLSConn::new(
-                    Arc::clone(&sock) as Arc<dyn webrtc_util::Conn + Send + Sync>,
-                    cfg,
-                    true,  // is_client
-                    None,  // no existing state
+                let dtls_conn = tokio::time::timeout(
+                    Duration::from_secs(10),
+                    DTLSConn::new(
+                        Arc::clone(&sock) as Arc<dyn webrtc_util::Conn + Send + Sync>,
+                        cfg,
+                        true,  // is_client
+                        None,  // no existing state
+                    ),
                 )
                 .await
+                .map_err(|_| anyhow::anyhow!("dtls handshake timed out after 10s"))?
                 .map_err(|e| anyhow::anyhow!("dtls connect: {e}"))?;
 
                 let mut buf = vec![0u8; 65535];
@@ -491,12 +512,20 @@ async fn run_udp(args: &BenchArgs) -> anyhow::Result<()> {
                         .send(&payload)
                         .await
                         .map_err(|e| anyhow::anyhow!("dtls send: {e}"))?;
-                    let n = dtls_conn
-                        .recv(&mut buf)
-                        .await
-                        .map_err(|e| anyhow::anyhow!("dtls recv: {e}"))?;
-                    let latency = start.elapsed().as_micros() as u64;
-                    metrics.record(latency, n);
+                    match tokio::time::timeout(Duration::from_secs(5), dtls_conn.recv(&mut buf)).await {
+                        Ok(Ok(n)) => {
+                            let latency = start.elapsed().as_micros() as u64;
+                            metrics.record(latency, n);
+                        }
+                        Ok(Err(e)) => {
+                            eprintln!("  dtls recv error: {e}");
+                            break;
+                        }
+                        Err(_) => {
+                            eprintln!("  dtls recv timeout");
+                            break;
+                        }
+                    }
                 }
             } else {
                 let sock = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
@@ -514,7 +543,7 @@ async fn run_udp(args: &BenchArgs) -> anyhow::Result<()> {
         }));
     }
 
-    let combined = collect_results(handles);
+    let combined = collect_results(handles).await;
     let proto_name = if args.tls { "UDP+DTLS" } else { "UDP" };
     print_results(&combined, proto_name, args);
     Ok(())

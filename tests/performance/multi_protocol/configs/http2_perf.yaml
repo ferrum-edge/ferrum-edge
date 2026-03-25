@@ -24,9 +24,9 @@ proxies:
   - id: "h2-health"
     name: "HTTP/2 Health Check"
     listen_path: "/health"
-    backend_protocol: https
+    backend_protocol: http
     backend_host: "127.0.0.1"
-    backend_port: 3443
+    backend_port: 3010
     strip_listen_path: false
     preserve_host_header: false
     backend_connect_timeout_ms: 5000

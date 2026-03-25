@@ -125,6 +125,22 @@ async fn handle_http(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, In
 
 // ── Servers ──────────────────────────────────────────────────────────────────
 
+/// Simple HTTP/1.1 health endpoint so all protocol tests have a reliable health check target.
+async fn run_http1_health_server(addr: SocketAddr) -> anyhow::Result<()> {
+    let listener = TcpListener::bind(addr)
+        .await
+        .context("binding http1 health listener")?;
+    loop {
+        let (stream, _) = listener.accept().await?;
+        tokio::spawn(async move {
+            let io = TokioIo::new(stream);
+            let _ = hyper::server::conn::http1::Builder::new()
+                .serve_connection(io, hyper::service::service_fn(handle_http))
+                .await;
+        });
+    }
+}
+
 async fn run_h2c_server(addr: SocketAddr) -> anyhow::Result<()> {
     let listener = TcpListener::bind(addr)
         .await
@@ -302,10 +318,10 @@ async fn run_dtls_echo(addr: SocketAddr, cert_path: &str, key_path: &str) -> any
     use webrtc_dtls::listener;
     use webrtc_util::conn::Listener;
 
-    // from_pem takes a combined PEM string (cert + key concatenated)
+    // from_pem expects key PEM before cert PEM
     let cert_pem = std::fs::read_to_string(cert_path).context("reading DTLS cert")?;
     let key_pem = std::fs::read_to_string(key_path).context("reading DTLS key")?;
-    let combined_pem = format!("{cert_pem}\n{key_pem}");
+    let combined_pem = format!("{key_pem}\n{cert_pem}");
     let cert = DtlsCert::from_pem(&combined_pem)
         .map_err(|e| anyhow::anyhow!("loading DTLS certificate: {e}"))?;
 
@@ -357,6 +373,7 @@ async fn main() -> anyhow::Result<()> {
 
     println!("Multi-Protocol Backend Server");
     println!("=============================");
+    println!("HTTP/1.1 Health:  127.0.0.1:3010");
     println!("HTTP/2 (h2c):    127.0.0.1:3002");
     println!("HTTPS/H2 (TLS):  127.0.0.1:3443");
     println!("WebSocket:        127.0.0.1:3003");
@@ -371,37 +388,26 @@ async fn main() -> anyhow::Result<()> {
     let cert_str = cert_path.to_string_lossy().to_string();
     let key_str = key_path.to_string_lossy().to_string();
 
-    tokio::select! {
-        r = run_h2c_server("127.0.0.1:3002".parse()?) => {
-            eprintln!("h2c server exited: {r:?}");
-        }
-        r = run_h2_tls_server("127.0.0.1:3443".parse()?, tls_cfg.clone()) => {
-            eprintln!("h2-tls server exited: {r:?}");
-        }
-        r = run_ws_server("127.0.0.1:3003".parse()?) => {
-            eprintln!("ws server exited: {r:?}");
-        }
-        r = run_grpc_server("127.0.0.1:50052".parse()?) => {
-            eprintln!("grpc server exited: {r:?}");
-        }
-        r = run_tcp_echo("127.0.0.1:3004".parse()?) => {
-            eprintln!("tcp echo exited: {r:?}");
-        }
-        r = run_tcp_tls_echo("127.0.0.1:3444".parse()?, tls_cfg.clone()) => {
-            eprintln!("tcp-tls echo exited: {r:?}");
-        }
-        r = run_udp_echo("127.0.0.1:3005".parse()?) => {
-            eprintln!("udp echo exited: {r:?}");
-        }
-        r = run_h3_server("127.0.0.1:3445".parse()?, h3_cfg) => {
-            eprintln!("h3 server exited: {r:?}");
-        }
-        r = run_dtls_echo("127.0.0.1:3006".parse()?, &cert_str, &key_str) => {
-            eprintln!("dtls echo exited: {r:?}");
-        }
-        _ = tokio::signal::ctrl_c() => {
-            println!("\nShutting down...");
-        }
+    // Spawn all servers independently so one failure doesn't kill the rest
+    tokio::spawn(async { if let Err(e) = run_http1_health_server("127.0.0.1:3010".parse().unwrap()).await { eprintln!("http1 health error: {e}"); } });
+    tokio::spawn(async { if let Err(e) = run_h2c_server("127.0.0.1:3002".parse().unwrap()).await { eprintln!("h2c server error: {e}"); } });
+    tokio::spawn(async move { if let Err(e) = run_h2_tls_server("127.0.0.1:3443".parse().unwrap(), tls_cfg.clone()).await { eprintln!("h2-tls server error: {e}"); } });
+    tokio::spawn(async { if let Err(e) = run_ws_server("127.0.0.1:3003".parse().unwrap()).await { eprintln!("ws server error: {e}"); } });
+    tokio::spawn(async { if let Err(e) = run_grpc_server("127.0.0.1:50052".parse().unwrap()).await { eprintln!("grpc server error: {e}"); } });
+    tokio::spawn(async { if let Err(e) = run_tcp_echo("127.0.0.1:3004".parse().unwrap()).await { eprintln!("tcp echo error: {e}"); } });
+    {
+        let tls_cfg2 = Arc::new(
+            tls_utils::make_server_tls_config(&cert_path, &key_path)
+                .context("building tcp-tls server config")?,
+        );
+        tokio::spawn(async move { if let Err(e) = run_tcp_tls_echo("127.0.0.1:3444".parse().unwrap(), tls_cfg2).await { eprintln!("tcp-tls echo error: {e}"); } });
     }
+    tokio::spawn(async { if let Err(e) = run_udp_echo("127.0.0.1:3005".parse().unwrap()).await { eprintln!("udp echo error: {e}"); } });
+    tokio::spawn(async move { if let Err(e) = run_h3_server("127.0.0.1:3445".parse().unwrap(), h3_cfg).await { eprintln!("h3 server error: {e}"); } });
+    tokio::spawn(async move { if let Err(e) = run_dtls_echo("127.0.0.1:3006".parse().unwrap(), &cert_str, &key_str).await { eprintln!("dtls echo error: {e}"); } });
+
+    // Wait for ctrl-c
+    tokio::signal::ctrl_c().await?;
+    println!("\nShutting down...");
     Ok(())
 }

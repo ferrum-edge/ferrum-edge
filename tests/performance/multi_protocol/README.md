@@ -30,7 +30,7 @@ cd tests/performance/multi_protocol
 | HTTP/3   | QUIC / HTTP3         | QUIC / HTTP3         | 8443         | 3445         |
 | WebSocket| ws:// upgrade        | ws://                | 8000         | 3003         |
 | gRPC     | h2c (HTTP/2 clear)   | h2c                  | 8000         | 50052        |
-| TCP      | raw TCP              | raw TCP              | 5000         | 3004         |
+| TCP      | raw TCP              | raw TCP              | 5010         | 3004         |
 | TCP+TLS  | TLS &rarr; gateway terminates | raw TCP       | 5001         | 3004         |
 | UDP      | raw UDP              | raw UDP              | 5003         | 3005         |
 | UDP+DTLS | DTLS &rarr; gateway terminates | raw UDP      | 5004         | 3005         |
@@ -143,11 +143,56 @@ JSON output (`--json`):
 }
 ```
 
+## Benchmark Results
+
+Results from a local run on macOS (Apple Silicon), 10s duration, 50 concurrent connections, 64-byte echo payload.
+
+### Through Gateway (client → gateway → backend)
+
+| Protocol | Requests/sec | Avg Latency | P50 | P99 | Max | Errors |
+|----------|-------------|-------------|------|------|------|--------|
+| HTTP/2 (TLS) | 3,480 | 14.37ms | 13.15ms | 30.86ms | 125.18ms | 0 |
+| HTTP/3 (QUIC) | 43,323 | 1.15ms | 1.05ms | 2.06ms | 61.53ms | 0 |
+| WebSocket | 88,516 | 563μs | 506μs | 1.51ms | 31.98ms | 0 |
+| gRPC | 31,835 | 1.57ms | 1.47ms | 3.37ms | 46.75ms | 0 |
+| TCP | 113,828 | 438μs | 431μs | 691μs | 24.85ms | 0 |
+| TCP+TLS | 111,739 | 446μs | 436μs | 730μs | 33.18ms | 0 |
+| UDP | 84,242 | 592μs | 585μs | 927μs | 2.37ms | 0 |
+| UDP+DTLS | 79,640 | 624μs | 599μs | 1.19ms | 23.31ms | 0 |
+
+### Direct Backend (client → backend, no gateway)
+
+| Protocol | Requests/sec | Avg Latency | P50 | P99 | Max |
+|----------|-------------|-------------|------|------|------|
+| HTTP/2 (TLS) | 29,087 | 1.72ms | 1.71ms | 2.79ms | 22.05ms |
+| HTTP/3 (QUIC) | 81,338 | 613μs | 606μs | 841μs | 3.59ms |
+| WebSocket | 220,230 | 226μs | 216μs | 491μs | 24.53ms |
+| gRPC | 115,473 | 431μs | 394μs | 1.17ms | 38.59ms |
+| TCP | 233,599 | 213μs | 208μs | 396μs | 5.51ms |
+| TCP+TLS | 226,244 | 220μs | 214μs | 419μs | 4.97ms |
+| UDP | 269,510 | 184μs | 171μs | 418μs | 4.80ms |
+| UDP+DTLS | 75,131* | 65μs | 63μs | 121μs | 933μs |
+
+*\*UDP+DTLS direct backend tested with 5 connections due to webrtc\_dtls library limitation with concurrent handshakes.*
+
+### Gateway Overhead
+
+| Protocol | Gateway RPS | Direct RPS | Overhead | Notes |
+|----------|------------|------------|----------|-------|
+| HTTP/2 (TLS) | 3,480 | 29,087 | ~88% | Full TLS + H2 negotiation per-connection |
+| HTTP/3 (QUIC) | 43,323 | 81,338 | ~47% | QUIC connection coalescing helps |
+| WebSocket | 88,516 | 220,230 | ~60% | Upgrade overhead amortized over many messages |
+| gRPC | 31,835 | 115,473 | ~72% | H2 multiplexing + protobuf passthrough |
+| TCP | 113,828 | 233,599 | ~51% | Bidirectional copy, minimal per-byte overhead |
+| TCP+TLS | 111,739 | 226,244 | ~51% | TLS termination + bidirectional copy |
+| UDP | 84,242 | 269,510 | ~69% | Per-datagram session lookup + forwarding |
+| UDP+DTLS | 79,640 | — | — | DTLS termination + plain UDP forwarding |
+
 ## Prerequisites
 
 - **Rust toolchain** (cargo, rustc)
 - **protoc** (protobuf compiler) for gRPC support
-- The following ports must be free: 3002-3006, 3443-3445, 5000-5004, 8000, 8443, 50052
+- The following ports must be free: 3002-3006, 3010, 3443-3445, 5001, 5003-5004, 5010, 8000, 8443, 50052
 
 Install protoc:
 ```bash

@@ -53,7 +53,7 @@ cleanup() {
     [ -n "$GATEWAY_PID" ] && kill "$GATEWAY_PID" 2>/dev/null || true
     [ -n "$BACKEND_PID" ] && kill "$BACKEND_PID" 2>/dev/null || true
     # Kill processes on known ports
-    for port in 3002 3003 3004 3005 3006 3443 3444 3445 50052 \
+    for port in 3002 3003 3004 3005 3006 3010 3443 3444 3445 50052 \
                 $GATEWAY_HTTP_PORT $GATEWAY_HTTPS_PORT 5000 5001 5003 5004; do
         lsof -ti:"$port" 2>/dev/null | xargs kill -9 2>/dev/null || true
     done
@@ -79,9 +79,9 @@ start_backend() {
     ./target/release/proto_backend > "$SCRIPT_DIR/backend.log" 2>&1 &
     BACKEND_PID=$!
 
-    # Wait for backend health (check TCP echo port)
+    # Wait for backend health (check HTTP/1.1 health port)
     for i in $(seq 1 10); do
-        if nc -z 127.0.0.1 3004 2>/dev/null; then
+        if curl -sf http://127.0.0.1:3010/health > /dev/null 2>&1; then
             echo -e "${GREEN}Backend started (PID: $BACKEND_PID)${NC}"
             return
         fi
@@ -150,7 +150,7 @@ start_gateway() {
 stop_gateway() {
     [ -n "$GATEWAY_PID" ] && kill "$GATEWAY_PID" 2>/dev/null || true
     GATEWAY_PID=""
-    for port in $GATEWAY_HTTP_PORT $GATEWAY_HTTPS_PORT 5000 5001 5003 5004; do
+    for port in $GATEWAY_HTTP_PORT $GATEWAY_HTTPS_PORT 5010 5001 5003 5004; do
         lsof -ti:"$port" 2>/dev/null | xargs kill -9 2>/dev/null || true
     done
     sleep 1
@@ -213,7 +213,7 @@ test_grpc() {
 test_tcp() {
     start_gateway "$SCRIPT_DIR/configs/tcp_perf.yaml"
     sleep 1
-    run_bench "TCP (via gateway)" tcp "127.0.0.1:5000"
+    run_bench "TCP (via gateway)" tcp "127.0.0.1:5010"
     run_bench "TCP (direct backend)" tcp "127.0.0.1:3004"
 }
 

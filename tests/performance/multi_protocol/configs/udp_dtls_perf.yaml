@@ -19,7 +19,7 @@ proxies:
     listen_path: "/health"
     backend_protocol: http
     backend_host: "127.0.0.1"
-    backend_port: 3002
+    backend_port: 3010
     strip_listen_path: false
     preserve_host_header: false
     backend_connect_timeout_ms: 1000
