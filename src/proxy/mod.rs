@@ -1,6 +1,9 @@
 pub mod body;
 pub mod client_ip;
 pub mod grpc_proxy;
+pub mod stream_listener;
+pub mod tcp_proxy;
+pub mod udp_proxy;
 
 use arc_swap::ArcSwap;
 use bytes::Bytes;
@@ -95,6 +98,8 @@ pub struct ProxyState {
     /// Parsed trusted proxy CIDRs for X-Forwarded-For client IP resolution.
     /// Pre-parsed from `env_config.trusted_proxies` to avoid re-parsing on every request.
     pub trusted_proxies: Arc<client_ip::TrustedProxies>,
+    /// Manages TCP/UDP stream proxy listeners (dedicated port per proxy).
+    pub stream_listener_manager: Arc<stream_listener::StreamListenerManager>,
 }
 
 impl ProxyState {
@@ -151,8 +156,32 @@ impl ProxyState {
         // Circuit breaker cache
         let circuit_breaker_cache = Arc::new(CircuitBreakerCache::new());
 
+        let config_arc = Arc::new(ArcSwap::new(Arc::new(config)));
+
+        // Parse stream proxy bind address
+        let stream_bind_addr: std::net::IpAddr = env_config_arc
+            .stream_proxy_bind_address
+            .parse()
+            .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+
+        let stream_listener_manager = Arc::new(stream_listener::StreamListenerManager::new(
+            stream_bind_addr,
+            config_arc.clone(),
+            dns_cache.clone(),
+            load_balancer_cache.clone(),
+            None, // Frontend TLS for stream proxies is configured per-listener in reconcile()
+        ));
+
+        // Reconcile stream proxy listeners (TCP/UDP) at startup so that any
+        // stream proxies in the initial config begin accepting connections
+        // immediately, without waiting for a config reload event.
+        let slm_startup = stream_listener_manager.clone();
+        tokio::spawn(async move {
+            slm_startup.reconcile().await;
+        });
+
         Ok(Self {
-            config: Arc::new(ArcSwap::new(Arc::new(config))),
+            config: config_arc,
             dns_cache,
             connection_pool,
             router_cache,
@@ -171,6 +200,7 @@ impl ProxyState {
             max_body_size_bytes,
             max_response_body_size_bytes,
             trusted_proxies,
+            stream_listener_manager,
         })
     }
 
@@ -239,6 +269,13 @@ impl ProxyState {
             }
 
             self.config.store(Arc::new(new_config));
+
+            // Reconcile stream proxy listeners (TCP/UDP)
+            let slm = self.stream_listener_manager.clone();
+            tokio::spawn(async move {
+                slm.reconcile().await;
+            });
+
             info!(
                 "Proxy configuration loaded (full build: router + plugins + consumers + load balancers)"
             );
@@ -333,6 +370,20 @@ impl ProxyState {
         // Swap the canonical config last (readers may still be using old caches
         // via ArcSwap snapshots until they finish their current request)
         self.config.store(Arc::new(new_config));
+
+        // Reconcile stream proxy listeners if any proxies changed
+        let stream_proxies_changed = delta
+            .added_proxies
+            .iter()
+            .chain(delta.modified_proxies.iter())
+            .any(|p| p.backend_protocol.is_stream_proxy())
+            || !delta.removed_proxy_ids.is_empty();
+        if stream_proxies_changed {
+            let slm = self.stream_listener_manager.clone();
+            tokio::spawn(async move {
+                slm.reconcile().await;
+            });
+        }
 
         // Log a concise summary of what changed
         let total_changes = delta.added_proxies.len()
@@ -544,6 +595,20 @@ impl ProxyState {
 
         // Store updated config
         self.config.store(Arc::new(new_config));
+
+        // Reconcile stream proxy listeners if any proxies changed
+        let stream_proxies_changed = delta
+            .added_proxies
+            .iter()
+            .chain(delta.modified_proxies.iter())
+            .any(|p| p.backend_protocol.is_stream_proxy())
+            || !delta.removed_proxy_ids.is_empty();
+        if stream_proxies_changed {
+            let slm = self.stream_listener_manager.clone();
+            tokio::spawn(async move {
+                slm.reconcile().await;
+            });
+        }
 
         info!(
             "Incremental config applied: proxies: +{} -{} ~{}, consumers: +{} -{} ~{}, plugins: +{} -{} ~{}, upstreams: +{} -{} ~{}",
@@ -2219,6 +2284,9 @@ pub fn build_backend_url_with_target(
         | BackendProtocol::Wss
         | BackendProtocol::H3
         | BackendProtocol::Grpcs => "https",
+        // Stream proxies (TCP/UDP) don't use HTTP URL building, but provide a sensible default
+        BackendProtocol::Tcp | BackendProtocol::Udp => "http",
+        BackendProtocol::TcpTls | BackendProtocol::Dtls => "https",
     };
 
     let remaining_path = if proxy.strip_listen_path {

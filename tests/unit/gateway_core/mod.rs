@@ -10,4 +10,5 @@ mod proxy_tests;
 mod response_body_mode_tests;
 mod retry_tests;
 mod router_cache_tests;
+mod stream_health_check_tests;
 mod websocket_auth_tests;

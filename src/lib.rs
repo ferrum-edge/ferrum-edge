@@ -9,6 +9,7 @@ pub mod consumer_index;
 #[path = "../custom_plugins/mod.rs"]
 pub mod custom_plugins;
 pub mod dns;
+pub mod dtls;
 pub mod grpc;
 pub mod health_check;
 pub mod http3;

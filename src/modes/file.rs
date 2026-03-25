@@ -134,6 +134,19 @@ pub async fn run(
         None
     };
 
+    // Set TLS config on stream listener manager for TCP proxies with frontend_tls.
+    // The TLS config is loaded after ProxyState::new(), so we update it here and
+    // re-reconcile to start any deferred frontend_tls listeners.
+    if let Some(ref tls_cfg) = tls_config {
+        proxy_state
+            .stream_listener_manager
+            .set_frontend_tls_config(Some(tls_cfg.clone()));
+        let slm = proxy_state.stream_listener_manager.clone();
+        tokio::spawn(async move {
+            slm.reconcile().await;
+        });
+    }
+
     // Log size limits if non-default
     if env_config.max_header_size_bytes != 32_768 {
         info!(

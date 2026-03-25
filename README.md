@@ -9,7 +9,8 @@ Ferrum Gateway is a lightweight, extensible API gateway designed for modern micr
 ## Features
 
 - **Multiple Operating Modes**: Database, File, Control Plane (CP), and Data Plane (DP) modes
-- **Protocol Support**: HTTP/1.1, HTTP/2 (ALPN-negotiated on TLS), HTTP/3, WebSocket (`ws`/`wss`), and gRPC proxying
+- **Protocol Support**: HTTP/1.1, HTTP/2 (ALPN-negotiated on TLS), HTTP/3, WebSocket (`ws`/`wss`), gRPC proxying, and raw TCP/UDP/DTLS stream proxying
+- **TCP/UDP Proxy**: Dedicated-port TCP and UDP stream proxying with TLS termination/origination, DTLS 1.2 backend encryption, session tracking, load balancing, health checks (TCP SYN, UDP probe), and plugin support (IP restriction, rate limiting, logging) — see [docs/tcp_udp_proxy.md](docs/tcp_udp_proxy.md)
 - **Connection Pooling**: Lock-free connection reuse with per-proxy pool keys, AtomicU64 cleanup, HTTP/2 via ALPN (no forced h2c)
 - **Router Cache**: Pre-sorted route table with bounded O(1) path cache; rebuilt atomically on config changes, never on hot path
 - **Longest Prefix Match Routing**: Efficient route matching with wildcard path-suffix forwarding and unique `listen_path` enforcement
@@ -28,7 +29,7 @@ Ferrum Gateway is a lightweight, extensible API gateway designed for modern micr
 - **Graceful Shutdown**: SIGTERM/SIGINT handling with active request draining
 - **Observability**: Structured JSON logging via `tracing` ecosystem and runtime metrics endpoint
 - **Load Balancing**: Five algorithms (RoundRobin, Weighted, LeastConnections, ConsistentHash, Random) with unhealthy target filtering
-- **Health Checking**: Active HTTP probes and passive status monitoring with configurable thresholds
+- **Health Checking**: Active probes (HTTP, TCP SYN, UDP) and passive status monitoring with configurable thresholds
 - **Circuit Breaker**: Three-state pattern (Closed/Open/Half-Open) preventing cascading failures
 - **Retry Logic**: Connection and HTTP-level retries with fixed/exponential backoff strategies
 - **Advanced TLS Hardening**: Configurable cipher suites, key exchange groups, and protocol versions
@@ -373,6 +374,7 @@ See [CI/CD Documentation](docs/ci_cd.md) for complete pipeline overview, secrets
 | `FERRUM_BASIC_AUTH_HMAC_SECRET` | No | — | Server secret for HMAC-SHA256 password verification (~1μs). When set, the Admin API stores `hmac_sha256:<hex>` hashes instead of bcrypt. Existing bcrypt hashes remain valid. |
 | `FERRUM_TRUSTED_PROXIES` | No | — | Comma-separated trusted proxy CIDRs/IPs for client IP resolution via `X-Forwarded-For` |
 | `FERRUM_REAL_IP_HEADER` | No | — | Authoritative real-IP header name (e.g., `CF-Connecting-IP`, `X-Real-IP`) |
+| `FERRUM_STREAM_PROXY_BIND_ADDRESS` | No | `0.0.0.0` | Bind address for TCP/UDP/DTLS stream proxy listeners |
 
 See [docs/client_ip_resolution.md](docs/client_ip_resolution.md) for the security model, deployment examples, and troubleshooting guide.
 
@@ -417,6 +419,33 @@ plugin_configs:
     scope: global
     enabled: true
 ```
+
+#### Stream Proxy (TCP/UDP/DTLS)
+
+Stream proxies use `listen_port` instead of `listen_path` and bind to dedicated ports:
+
+```yaml
+proxies:
+  # TCP proxy with TLS origination to backend
+  - id: "postgres-proxy"
+    listen_path: ""
+    listen_port: 5432
+    backend_protocol: tcp_tls
+    backend_host: "db.internal"
+    backend_port: 5432
+
+  # UDP proxy with DTLS encryption to backend
+  - id: "iot-proxy"
+    listen_path: ""
+    listen_port: 5684
+    backend_protocol: dtls
+    backend_host: "iot-backend.internal"
+    backend_port: 5684
+    backend_tls_verify_server_cert: false
+    udp_idle_timeout_seconds: 120
+```
+
+See [docs/tcp_udp_proxy.md](docs/tcp_udp_proxy.md) for full documentation.
 
 ## Connection Pooling
 

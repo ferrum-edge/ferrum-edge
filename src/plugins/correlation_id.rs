@@ -44,6 +44,10 @@ impl Plugin for CorrelationId {
         CORRELATION_ID_PRIORITY
     }
 
+    fn supports_stream_proxy(&self) -> bool {
+        true
+    }
+
     fn modifies_request_headers(&self) -> bool {
         true
     }

@@ -29,6 +29,19 @@ fn default_weight() -> u32 {
     1
 }
 
+/// Health check probe type.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum HealthProbeType {
+    /// HTTP GET probe (default). Sends a request to `http_path` and checks status code.
+    #[default]
+    Http,
+    /// TCP probe. Attempts a TCP connection — success means healthy.
+    Tcp,
+    /// UDP probe. Sends `udp_probe_payload` and expects any response within timeout.
+    Udp,
+}
+
 /// Active health check configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActiveHealthCheck {
@@ -47,6 +60,13 @@ pub struct ActiveHealthCheck {
     /// Use HTTPS for health check probes instead of HTTP.
     #[serde(default)]
     pub use_tls: bool,
+    /// Probe type: `http` (default), `tcp`, or `udp`.
+    #[serde(default)]
+    pub probe_type: HealthProbeType,
+    /// Hex-encoded probe payload for UDP health checks.
+    /// Sent to the target; any response within timeout means healthy.
+    #[serde(default)]
+    pub udp_probe_payload: Option<String>,
 }
 
 impl Default for ActiveHealthCheck {
@@ -59,6 +79,8 @@ impl Default for ActiveHealthCheck {
             unhealthy_threshold: default_unhealthy_threshold(),
             healthy_status_codes: default_healthy_status_codes(),
             use_tls: false,
+            probe_type: HealthProbeType::default(),
+            udp_probe_payload: None,
         }
     }
 }
@@ -280,6 +302,29 @@ pub enum BackendProtocol {
     Grpc,
     Grpcs,
     H3,
+    Tcp,
+    #[serde(rename = "tcp_tls")]
+    TcpTls,
+    Udp,
+    Dtls,
+}
+
+impl BackendProtocol {
+    /// Returns true if this protocol is a raw stream proxy (TCP/UDP) rather than HTTP-based.
+    pub fn is_stream_proxy(&self) -> bool {
+        matches!(self, Self::Tcp | Self::TcpTls | Self::Udp | Self::Dtls)
+    }
+
+    /// Returns true if this protocol uses UDP transport.
+    pub fn is_udp(&self) -> bool {
+        matches!(self, Self::Udp | Self::Dtls)
+    }
+
+    /// Returns true if the backend connection uses TLS/DTLS.
+    #[allow(dead_code)] // Used in Phase 2 (TCP/UDP proxy TLS origination)
+    pub fn is_tls_backend(&self) -> bool {
+        matches!(self, Self::TcpTls | Self::Dtls)
+    }
 }
 
 impl std::fmt::Display for BackendProtocol {
@@ -292,6 +337,10 @@ impl std::fmt::Display for BackendProtocol {
             Self::Grpc => write!(f, "grpc"),
             Self::Grpcs => write!(f, "grpcs"),
             Self::H3 => write!(f, "h3"),
+            Self::Tcp => write!(f, "tcp"),
+            Self::TcpTls => write!(f, "tcp_tls"),
+            Self::Udp => write!(f, "udp"),
+            Self::Dtls => write!(f, "dtls"),
         }
     }
 }
@@ -402,6 +451,19 @@ pub struct Proxy {
     /// of this setting.
     #[serde(default)]
     pub response_body_mode: ResponseBodyMode,
+    /// Port the gateway listens on for this TCP/UDP proxy.
+    /// Required when backend_protocol is Tcp/TcpTls/Udp/Dtls.
+    /// Not used for HTTP-based protocols.
+    #[serde(default)]
+    pub listen_port: Option<u16>,
+    /// Whether to terminate TLS on the gateway side for incoming TCP connections.
+    /// Uses the gateway's TLS certificate. Only applicable for Tcp/TcpTls protocols.
+    #[serde(default)]
+    pub frontend_tls: bool,
+    /// UDP session idle timeout in seconds. After this duration of inactivity,
+    /// the UDP session mapping is removed. Default: 60 seconds.
+    #[serde(default = "default_udp_idle_timeout")]
+    pub udp_idle_timeout_seconds: u64,
     #[serde(default = "Utc::now")]
     pub created_at: DateTime<Utc>,
     #[serde(default = "Utc::now")]
@@ -667,6 +729,74 @@ impl GatewayConfig {
             Err(errors)
         }
     }
+
+    /// Validate stream proxy (TCP/UDP) configuration.
+    ///
+    /// - Stream proxies must have a `listen_port` in range 1024-65535.
+    /// - `listen_port` must be unique across all stream proxies.
+    /// - HTTP proxies must not set `listen_port`.
+    pub fn validate_stream_proxies(&self) -> Result<(), Vec<String>> {
+        let mut errors = Vec::new();
+        let mut seen_ports: HashMap<u16, &str> = HashMap::new();
+
+        for proxy in &self.proxies {
+            if proxy.backend_protocol.is_stream_proxy() {
+                match proxy.listen_port {
+                    None => {
+                        errors.push(format!(
+                            "Stream proxy '{}' (protocol {}) must have a listen_port",
+                            proxy.id, proxy.backend_protocol
+                        ));
+                    }
+                    Some(port) if port < 1 => {
+                        errors.push(format!(
+                            "Stream proxy '{}' has invalid listen_port {} (must be >= 1)",
+                            proxy.id, port
+                        ));
+                    }
+                    Some(port) => {
+                        if let Some(existing_id) = seen_ports.insert(port, &proxy.id) {
+                            errors.push(format!(
+                                "Duplicate listen_port {} in proxy '{}' (conflicts with '{}')",
+                                port, proxy.id, existing_id
+                            ));
+                        }
+                    }
+                }
+            } else if proxy.listen_port.is_some() {
+                errors.push(format!(
+                    "HTTP proxy '{}' (protocol {}) must not set listen_port",
+                    proxy.id, proxy.backend_protocol
+                ));
+            }
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+
+    /// Normalize stream proxy listen_paths to synthetic values.
+    ///
+    /// TCP/UDP proxies don't use URL path routing. This sets their `listen_path`
+    /// to a synthetic value like `__tcp:5432` or `__udp:5353` so the existing
+    /// UNIQUE constraint and config delta logic works unchanged.
+    pub fn normalize_stream_proxy_paths(&mut self) {
+        for proxy in &mut self.proxies {
+            if proxy.backend_protocol.is_stream_proxy()
+                && let Some(port) = proxy.listen_port
+            {
+                let prefix = if proxy.backend_protocol.is_udp() {
+                    "__udp"
+                } else {
+                    "__tcp"
+                };
+                proxy.listen_path = format!("{}:{}", prefix, port);
+            }
+        }
+    }
 }
 
 fn default_true() -> bool {
@@ -683,4 +813,8 @@ fn default_read_timeout() -> u64 {
 
 fn default_write_timeout() -> u64 {
     30000
+}
+
+fn default_udp_idle_timeout() -> u64 {
+    60
 }

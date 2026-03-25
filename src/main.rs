@@ -7,6 +7,7 @@ mod consumer_index;
 #[path = "../custom_plugins/mod.rs"]
 mod custom_plugins;
 mod dns;
+mod dtls;
 mod grpc;
 mod health_check;
 mod http3;

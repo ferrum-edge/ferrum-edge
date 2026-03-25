@@ -268,6 +268,10 @@ impl Plugin for RateLimiting {
         super::priority::RATE_LIMITING
     }
 
+    fn supports_stream_proxy(&self) -> bool {
+        true
+    }
+
     async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult {
         // Phase 1: always enforce IP-based limits early (before auth).
         // This protects auth endpoints from brute-force regardless of limit_by mode.

@@ -59,6 +59,9 @@ fn create_grpc_proxy(id: &str, listen_path: &str, backend_port: u16) -> Proxy {
         circuit_breaker: None,
         retry: None,
         response_body_mode: Default::default(),
+        listen_port: None,
+        frontend_tls: false,
+        udp_idle_timeout_seconds: 60,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }
@@ -124,6 +127,7 @@ fn create_test_env_config() -> ferrum_gateway::config::EnvConfig {
         tls_cipher_suites: None,
         tls_prefer_server_cipher_order: true,
         tls_curves: None,
+        stream_proxy_bind_address: "0.0.0.0".into(),
         trusted_proxies: String::new(),
         dns_cache_max_size: 10_000,
         real_ip_header: None,

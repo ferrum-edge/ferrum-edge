@@ -81,6 +81,9 @@ fn create_http3_test_proxy() -> Proxy {
         circuit_breaker: None,
         retry: None,
         response_body_mode: Default::default(),
+        listen_port: None,
+        frontend_tls: false,
+        udp_idle_timeout_seconds: 60,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     }
@@ -159,6 +162,7 @@ fn create_http3_test_env_config() -> EnvConfig {
         tls_cipher_suites: None,
         tls_prefer_server_cipher_order: true,
         tls_curves: None,
+        stream_proxy_bind_address: "0.0.0.0".into(),
         trusted_proxies: String::new(),
         dns_cache_max_size: 10_000,
         real_ip_header: None,
@@ -320,6 +324,16 @@ async fn test_http3_proxy_state_creation() {
     let router_cache = Arc::new(RouterCache::new(&gc, 10_000));
     let plugin_cache = Arc::new(PluginCache::new(&gc).unwrap());
     let consumer_index = Arc::new(ConsumerIndex::new(&gc.consumers));
+    let lb_cache = Arc::new(ferrum_gateway::LoadBalancerCache::new(&gc));
+    let slm = Arc::new(
+        ferrum_gateway::proxy::stream_listener::StreamListenerManager::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+            gateway_config.clone(),
+            dns_cache.clone(),
+            lb_cache.clone(),
+            None,
+        ),
+    );
     let proxy_state = ProxyState {
         config: gateway_config,
         dns_cache,
@@ -330,7 +344,7 @@ async fn test_http3_proxy_state_creation() {
         request_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         status_counts: Arc::new(dashmap::DashMap::new()),
         grpc_pool: Arc::new(ferrum_gateway::proxy::grpc_proxy::GrpcConnectionPool::default()),
-        load_balancer_cache: Arc::new(ferrum_gateway::LoadBalancerCache::new(&gc)),
+        load_balancer_cache: lb_cache,
         health_checker: Arc::new(ferrum_gateway::health_check::HealthChecker::new()),
         circuit_breaker_cache: Arc::new(ferrum_gateway::circuit_breaker::CircuitBreakerCache::new()),
         alt_svc_header: Some("h3=\":8443\"; ma=86400".to_string()),
@@ -340,6 +354,7 @@ async fn test_http3_proxy_state_creation() {
         max_response_body_size_bytes: 10_485_760,
         env_config: Arc::new(ferrum_gateway::config::EnvConfig::default()),
         trusted_proxies: Arc::new(ferrum_gateway::proxy::client_ip::TrustedProxies::parse("")),
+        stream_listener_manager: slm,
     };
 
     // Verify proxy state is created successfully
@@ -455,6 +470,16 @@ async fn test_http3_full_integration() {
     let router_cache = Arc::new(RouterCache::new(&gc, 10_000));
     let plugin_cache = Arc::new(PluginCache::new(&gc).unwrap());
     let consumer_index = Arc::new(ConsumerIndex::new(&gc.consumers));
+    let lb_cache = Arc::new(ferrum_gateway::LoadBalancerCache::new(&gc));
+    let slm = Arc::new(
+        ferrum_gateway::proxy::stream_listener::StreamListenerManager::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+            gateway_config.clone(),
+            dns_cache.clone(),
+            lb_cache.clone(),
+            None,
+        ),
+    );
     let proxy_state = ProxyState {
         config: gateway_config,
         dns_cache,
@@ -465,7 +490,7 @@ async fn test_http3_full_integration() {
         request_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         status_counts: Arc::new(dashmap::DashMap::new()),
         grpc_pool: Arc::new(ferrum_gateway::proxy::grpc_proxy::GrpcConnectionPool::default()),
-        load_balancer_cache: Arc::new(ferrum_gateway::LoadBalancerCache::new(&gc)),
+        load_balancer_cache: lb_cache,
         health_checker: Arc::new(ferrum_gateway::health_check::HealthChecker::new()),
         circuit_breaker_cache: Arc::new(ferrum_gateway::circuit_breaker::CircuitBreakerCache::new()),
         alt_svc_header: Some("h3=\":8443\"; ma=86400".to_string()),
@@ -475,6 +500,7 @@ async fn test_http3_full_integration() {
         max_response_body_size_bytes: 10_485_760,
         env_config: Arc::new(ferrum_gateway::config::EnvConfig::default()),
         trusted_proxies: Arc::new(ferrum_gateway::proxy::client_ip::TrustedProxies::parse("")),
+        stream_listener_manager: slm,
     };
 
     // Verify proxy state is created successfully

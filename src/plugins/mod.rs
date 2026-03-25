@@ -29,7 +29,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::config::types::{Consumer, Proxy};
+use crate::config::types::{BackendProtocol, Consumer, Proxy};
 use crate::consumer_index::ConsumerIndex;
 
 /// Context passed through the plugin pipeline for a single request.
@@ -107,6 +107,38 @@ pub struct TransactionSummary {
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub client_disconnected: bool,
     pub metadata: HashMap<String, String>,
+}
+
+/// Context for stream proxy (TCP/UDP) plugin hooks.
+#[allow(dead_code)] // Used in Phase 2+ when TCP/UDP proxy handlers invoke plugins
+#[derive(Debug, Clone)]
+pub struct StreamConnectionContext {
+    pub client_ip: String,
+    pub proxy_id: String,
+    pub proxy_name: Option<String>,
+    pub listen_port: u16,
+    pub backend_protocol: BackendProtocol,
+    pub metadata: HashMap<String, String>,
+}
+
+/// Transaction summary for stream proxy (TCP/UDP) logging plugins.
+#[allow(dead_code)] // Used when TCP/UDP proxy handlers invoke logging plugins
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct StreamTransactionSummary {
+    pub proxy_id: String,
+    pub proxy_name: Option<String>,
+    pub client_ip: String,
+    pub backend_target: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backend_resolved_ip: Option<String>,
+    pub protocol: String,
+    pub listen_port: u16,
+    pub duration_ms: f64,
+    pub bytes_sent: u64,
+    pub bytes_received: u64,
+    pub connection_error: Option<String>,
+    pub timestamp_connected: String,
+    pub timestamp_disconnected: String,
 }
 
 /// Plugin execution priority bands.
@@ -249,6 +281,29 @@ pub trait Plugin: Send + Sync {
     fn warmup_hostnames(&self) -> Vec<String> {
         Vec::new()
     }
+
+    /// Returns `true` if this plugin supports stream proxy (TCP/UDP) connections.
+    ///
+    /// Only stream-compatible plugins are invoked for TCP/UDP proxy connections.
+    /// Most HTTP-specific plugins (auth, CORS, body transformer, etc.) return
+    /// `false` (the default). Plugins like ip_restriction, rate_limiting,
+    /// stdout_logging, and prometheus_metrics opt in.
+    #[allow(dead_code)] // Called by stream proxy handlers when plugins are wired in
+    fn supports_stream_proxy(&self) -> bool {
+        false
+    }
+
+    /// Called when a new stream connection (TCP/UDP session) is established.
+    ///
+    /// Returning `PluginResult::Reject` closes the connection immediately.
+    #[allow(dead_code)]
+    async fn on_stream_connect(&self, _ctx: &StreamConnectionContext) -> PluginResult {
+        PluginResult::Continue
+    }
+
+    /// Called when a stream connection (TCP/UDP session) is completed.
+    #[allow(dead_code)]
+    async fn on_stream_disconnect(&self, _summary: &StreamTransactionSummary) {}
 }
 
 /// Create a plugin instance from its name and configuration.

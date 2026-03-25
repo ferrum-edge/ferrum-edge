@@ -197,7 +197,7 @@ impl DatabaseStore {
         let plugin_configs = self.load_plugin_configs().await?;
         let upstreams = self.load_upstreams().await?;
 
-        let config = GatewayConfig {
+        let mut config = GatewayConfig {
             version: crate::config::types::CURRENT_CONFIG_VERSION.to_string(),
             proxies,
             consumers,
@@ -212,6 +212,20 @@ impl DatabaseStore {
             }
             anyhow::bail!("Database has duplicate listen_path values");
         }
+
+        // Validate stream proxy (TCP/UDP) configuration
+        if let Err(errors) = config.validate_stream_proxies() {
+            for msg in &errors {
+                error!("{}", msg);
+            }
+            anyhow::bail!(
+                "Database configuration validation failed: {} stream proxy error(s) found",
+                errors.len()
+            );
+        }
+
+        // Normalize stream proxy listen_paths to synthetic values (__tcp:PORT, __udp:PORT)
+        config.normalize_stream_proxy_paths();
 
         Ok(config)
     }
@@ -317,7 +331,7 @@ impl DatabaseStore {
         let mut tx = self.pool.begin().await?;
 
         sqlx::query(
-            "INSERT INTO proxies (id, name, listen_path, backend_protocol, backend_host, backend_port, backend_path, strip_listen_path, preserve_host_header, backend_connect_timeout_ms, backend_read_timeout_ms, backend_write_timeout_ms, backend_tls_client_cert_path, backend_tls_client_key_path, backend_tls_verify_server_cert, backend_tls_server_ca_cert_path, dns_override, dns_cache_ttl_seconds, auth_mode, upstream_id, circuit_breaker, retry, response_body_mode, pool_max_idle_per_host, pool_idle_timeout_seconds, pool_enable_http_keep_alive, pool_enable_http2, pool_tcp_keepalive_seconds, pool_http2_keep_alive_interval_seconds, pool_http2_keep_alive_timeout_seconds, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            "INSERT INTO proxies (id, name, listen_path, backend_protocol, backend_host, backend_port, backend_path, strip_listen_path, preserve_host_header, backend_connect_timeout_ms, backend_read_timeout_ms, backend_write_timeout_ms, backend_tls_client_cert_path, backend_tls_client_key_path, backend_tls_verify_server_cert, backend_tls_server_ca_cert_path, dns_override, dns_cache_ttl_seconds, auth_mode, upstream_id, circuit_breaker, retry, response_body_mode, pool_max_idle_per_host, pool_idle_timeout_seconds, pool_enable_http_keep_alive, pool_enable_http2, pool_tcp_keepalive_seconds, pool_http2_keep_alive_interval_seconds, pool_http2_keep_alive_timeout_seconds, listen_port, frontend_tls, udp_idle_timeout_seconds, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         )
         .bind(&proxy.id)
         .bind(&proxy.name)
@@ -349,6 +363,9 @@ impl DatabaseStore {
         .bind(proxy.pool_tcp_keepalive_seconds.map(|v| v as i64))
         .bind(proxy.pool_http2_keep_alive_interval_seconds.map(|v| v as i64))
         .bind(proxy.pool_http2_keep_alive_timeout_seconds.map(|v| v as i64))
+        .bind(proxy.listen_port.map(|v| v as i32))
+        .bind(if proxy.frontend_tls { 1i32 } else { 0 })
+        .bind(proxy.udp_idle_timeout_seconds as i64)
         .bind(proxy.created_at.to_rfc3339())
         .bind(proxy.updated_at.to_rfc3339())
         .execute(&mut *tx)
@@ -387,7 +404,7 @@ impl DatabaseStore {
         let mut tx = self.pool.begin().await?;
 
         sqlx::query(
-            "UPDATE proxies SET name=?, listen_path=?, backend_protocol=?, backend_host=?, backend_port=?, backend_path=?, strip_listen_path=?, preserve_host_header=?, backend_connect_timeout_ms=?, backend_read_timeout_ms=?, backend_write_timeout_ms=?, backend_tls_client_cert_path=?, backend_tls_client_key_path=?, backend_tls_verify_server_cert=?, backend_tls_server_ca_cert_path=?, dns_override=?, dns_cache_ttl_seconds=?, auth_mode=?, upstream_id=?, circuit_breaker=?, retry=?, response_body_mode=?, pool_max_idle_per_host=?, pool_idle_timeout_seconds=?, pool_enable_http_keep_alive=?, pool_enable_http2=?, pool_tcp_keepalive_seconds=?, pool_http2_keep_alive_interval_seconds=?, pool_http2_keep_alive_timeout_seconds=?, updated_at=? WHERE id=?"
+            "UPDATE proxies SET name=?, listen_path=?, backend_protocol=?, backend_host=?, backend_port=?, backend_path=?, strip_listen_path=?, preserve_host_header=?, backend_connect_timeout_ms=?, backend_read_timeout_ms=?, backend_write_timeout_ms=?, backend_tls_client_cert_path=?, backend_tls_client_key_path=?, backend_tls_verify_server_cert=?, backend_tls_server_ca_cert_path=?, dns_override=?, dns_cache_ttl_seconds=?, auth_mode=?, upstream_id=?, circuit_breaker=?, retry=?, response_body_mode=?, pool_max_idle_per_host=?, pool_idle_timeout_seconds=?, pool_enable_http_keep_alive=?, pool_enable_http2=?, pool_tcp_keepalive_seconds=?, pool_http2_keep_alive_interval_seconds=?, pool_http2_keep_alive_timeout_seconds=?, listen_port=?, frontend_tls=?, udp_idle_timeout_seconds=?, updated_at=? WHERE id=?"
         )
         .bind(&proxy.name)
         .bind(&proxy.listen_path)
@@ -418,6 +435,9 @@ impl DatabaseStore {
         .bind(proxy.pool_tcp_keepalive_seconds.map(|v| v as i64))
         .bind(proxy.pool_http2_keep_alive_interval_seconds.map(|v| v as i64))
         .bind(proxy.pool_http2_keep_alive_timeout_seconds.map(|v| v as i64))
+        .bind(proxy.listen_port.map(|v| v as i32))
+        .bind(if proxy.frontend_tls { 1i32 } else { 0 })
+        .bind(proxy.udp_idle_timeout_seconds as i64)
         .bind(Utc::now().to_rfc3339())
         .bind(&proxy.id)
         .execute(&mut *tx)
@@ -1137,6 +1157,10 @@ fn parse_protocol(s: &str) -> BackendProtocol {
         "grpc" => BackendProtocol::Grpc,
         "grpcs" => BackendProtocol::Grpcs,
         "h3" => BackendProtocol::H3,
+        "tcp" => BackendProtocol::Tcp,
+        "tcp_tls" => BackendProtocol::TcpTls,
+        "udp" => BackendProtocol::Udp,
+        "dtls" => BackendProtocol::Dtls,
         _ => BackendProtocol::Http,
     }
 }
@@ -1266,6 +1290,15 @@ fn row_to_proxy(
             .try_get::<i64, _>("pool_http2_keep_alive_timeout_seconds")
             .ok()
             .map(|v| v as u64),
+        listen_port: row
+            .try_get::<i32, _>("listen_port")
+            .ok()
+            .map(|v| v.clamp(0, 65535) as u16),
+        frontend_tls: row.try_get::<i32, _>("frontend_tls").unwrap_or(0) != 0,
+        udp_idle_timeout_seconds: row
+            .try_get::<i64, _>("udp_idle_timeout_seconds")
+            .map(|v| v.max(0) as u64)
+            .unwrap_or(60),
         created_at: parse_datetime_column(row, "created_at"),
         updated_at: parse_datetime_column(row, "updated_at"),
     })

@@ -4,4 +4,6 @@ mod functional_db_upstream_test;
 mod functional_file_mode_test;
 mod functional_grpc_test;
 mod functional_load_balancer_test;
+mod functional_tcp_proxy_test;
+mod functional_udp_proxy_test;
 mod functional_websocket_test;

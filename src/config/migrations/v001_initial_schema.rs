@@ -87,6 +87,9 @@ impl V001InitialSchema {
                 pool_tcp_keepalive_seconds INTEGER,
                 pool_http2_keep_alive_interval_seconds INTEGER,
                 pool_http2_keep_alive_timeout_seconds INTEGER,
+                listen_port INTEGER,
+                frontend_tls INTEGER NOT NULL DEFAULT 0,
+                udp_idle_timeout_seconds INTEGER NOT NULL DEFAULT 60,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             )

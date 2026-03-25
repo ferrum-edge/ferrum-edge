@@ -131,6 +131,17 @@ pub async fn run(
         None
     };
 
+    // Set TLS config on stream listener manager for TCP proxies with frontend_tls
+    if let Some(ref tls_cfg) = tls_config {
+        proxy_state
+            .stream_listener_manager
+            .set_frontend_tls_config(Some(tls_cfg.clone()));
+        let slm = proxy_state.stream_listener_manager.clone();
+        tokio::spawn(async move {
+            slm.reconcile().await;
+        });
+    }
+
     // Start separate listeners for HTTP and HTTPS
     let mut handles = Vec::new();
 

@@ -70,6 +70,52 @@ impl IpRestriction {
         Ok(Self { allow, deny, mode })
     }
 
+    /// Check whether a client IP is allowed by the restriction rules.
+    #[allow(dead_code)] // Called via on_stream_connect
+    fn check_ip(&self, client_ip_str: &str) -> PluginResult {
+        let client_ip = parse_client_ip(client_ip_str);
+
+        match self.mode {
+            Mode::AllowFirst => {
+                if !self.allow.is_empty()
+                    && !self.allow.iter().any(|rule| rule_matches(&client_ip, rule))
+                {
+                    return PluginResult::Reject {
+                        status_code: 403,
+                        body: r#"{"error":"IP address not allowed"}"#.to_string(),
+                        headers: HashMap::new(),
+                    };
+                }
+                if self.deny.iter().any(|rule| rule_matches(&client_ip, rule)) {
+                    return PluginResult::Reject {
+                        status_code: 403,
+                        body: r#"{"error":"IP address denied"}"#.to_string(),
+                        headers: HashMap::new(),
+                    };
+                }
+            }
+            Mode::DenyFirst => {
+                if self.deny.iter().any(|rule| rule_matches(&client_ip, rule)) {
+                    return PluginResult::Reject {
+                        status_code: 403,
+                        body: r#"{"error":"IP address denied"}"#.to_string(),
+                        headers: HashMap::new(),
+                    };
+                }
+                if !self.allow.is_empty()
+                    && !self.allow.iter().any(|rule| rule_matches(&client_ip, rule))
+                {
+                    return PluginResult::Reject {
+                        status_code: 403,
+                        body: r#"{"error":"IP address not allowed"}"#.to_string(),
+                        headers: HashMap::new(),
+                    };
+                }
+            }
+        }
+        PluginResult::Continue
+    }
+
     /// Parse a JSON array of IP/CIDR strings into pre-computed rules at config load time.
     fn parse_rule_list(config: &Value, key: &str) -> Vec<ParsedRule> {
         config[key]
@@ -95,6 +141,14 @@ impl Plugin for IpRestriction {
 
     fn priority(&self) -> u16 {
         IP_RESTRICTION_PRIORITY
+    }
+
+    fn supports_stream_proxy(&self) -> bool {
+        true
+    }
+
+    async fn on_stream_connect(&self, ctx: &super::StreamConnectionContext) -> super::PluginResult {
+        self.check_ip(&ctx.client_ip)
     }
 
     async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult {

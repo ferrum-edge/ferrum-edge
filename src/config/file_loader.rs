@@ -64,7 +64,7 @@ pub fn load_config_from_file(path: &str) -> Result<GatewayConfig, anyhow::Error>
     // Deserialize from the original format to preserve YAML-specific features
     // (like tags for enum variants). Only fall back to JSON deserialization if
     // a migration was applied (since migrations operate on serde_json::Value).
-    let config: GatewayConfig = if is_yaml && file_version == CURRENT_CONFIG_VERSION {
+    let mut config: GatewayConfig = if is_yaml && file_version == CURRENT_CONFIG_VERSION {
         serde_yaml::from_str(&content)?
     } else {
         serde_json::from_value(value)?
@@ -148,6 +148,20 @@ pub fn load_config_from_file(path: &str) -> Result<GatewayConfig, anyhow::Error>
             errors.len()
         );
     }
+
+    // Validate stream proxy (TCP/UDP) configuration
+    if let Err(errors) = config.validate_stream_proxies() {
+        for msg in &errors {
+            error!("{}", msg);
+        }
+        anyhow::bail!(
+            "Configuration validation failed: {} stream proxy error(s) found",
+            errors.len()
+        );
+    }
+
+    // Normalize stream proxy listen_paths to synthetic values (__tcp:PORT, __udp:PORT)
+    config.normalize_stream_proxy_paths();
 
     info!(
         "Configuration loaded (version {}): {} proxies, {} consumers, {} plugin configs",

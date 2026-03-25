@@ -154,6 +154,11 @@ pub struct EnvConfig {
     /// Comma-separated ECDH curves/groups: X25519, secp256r1, secp384r1 (default: "X25519,secp256r1")
     pub tls_curves: Option<String>,
 
+    // Stream proxy (TCP/UDP)
+    /// Bind address for TCP/UDP stream proxy listeners (default: 0.0.0.0).
+    #[allow(dead_code)] // Used in Phase 2 (stream listener startup)
+    pub stream_proxy_bind_address: String,
+
     // Client IP resolution
     /// Comma-separated trusted proxy CIDRs/IPs for X-Forwarded-For resolution.
     /// When set, the gateway walks the XFF chain right-to-left, skipping trusted
@@ -221,6 +226,7 @@ impl Default for EnvConfig {
             backend_tls_no_verify: false,
             admin_read_only: false,
             admin_tls_no_verify: false,
+            stream_proxy_bind_address: "0.0.0.0".into(),
             enable_http3: false,
             http3_idle_timeout: 30,
             http3_max_streams: 100,
@@ -328,6 +334,8 @@ impl EnvConfig {
             admin_tls_no_verify: env::var("FERRUM_ADMIN_TLS_NO_VERIFY").unwrap_or_default()
                 == "true",
             admin_read_only: env::var("FERRUM_ADMIN_READ_ONLY").unwrap_or_default() == "true",
+            stream_proxy_bind_address: env::var("FERRUM_STREAM_PROXY_BIND_ADDRESS")
+                .unwrap_or_else(|_| "0.0.0.0".into()),
 
             // HTTP/3 / QUIC
             enable_http3: env::var("FERRUM_ENABLE_HTTP3").unwrap_or_default() == "true",

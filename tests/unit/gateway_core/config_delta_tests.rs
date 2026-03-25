@@ -38,6 +38,9 @@ fn make_proxy(id: &str, listen_path: &str, updated_at: DateTime<Utc>) -> Proxy {
         circuit_breaker: None,
         retry: None,
         response_body_mode: ResponseBodyMode::default(),
+        listen_port: None,
+        frontend_tls: false,
+        udp_idle_timeout_seconds: 60,
         created_at: updated_at,
         updated_at,
     }

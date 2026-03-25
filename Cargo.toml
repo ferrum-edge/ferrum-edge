@@ -80,6 +80,10 @@ sha2 = "0.10.9"
 hmac = "0.12.1"
 hex = "0.4"
 
+# DTLS (secure UDP)
+webrtc-dtls = { package = "dtls", version = "0.17.1", features = ["pem"] }
+webrtc-util = { version = "0.17.1", default-features = false, features = ["conn"] }
+
 # ── Build profiles ─────────────────────────────────────────────────────────
 # Dev: optimise for fast compile-edit-run cycles
 [profile.dev]

@@ -915,6 +915,25 @@ components:
             Reference to an Upstream for load-balanced backends. When set,
             `backend_host` and `backend_port` are overridden by the selected
             upstream target.
+        listen_port:
+          type: [integer, "null"]
+          format: uint16
+          description: |
+            Port for this TCP/UDP proxy to listen on. Required when backend_protocol
+            is tcp, tcp_tls, udp, or dtls. Each stream proxy binds its own dedicated port.
+        frontend_tls:
+          type: boolean
+          default: false
+          description: |
+            Terminate TLS on the gateway side for incoming TCP connections.
+            Uses the gateway's TLS certificate. Only applicable for tcp/tcp_tls protocols.
+        udp_idle_timeout_seconds:
+          type: integer
+          format: uint64
+          default: 60
+          description: |
+            UDP session idle timeout in seconds. After this duration of inactivity,
+            the UDP session mapping is removed. Only applicable for udp/dtls protocols.
         circuit_breaker:
           oneOf:
             - $ref: "#/components/schemas/CircuitBreakerConfig"
@@ -948,8 +967,12 @@ components:
 
     BackendProtocol:
       type: string
-      enum: [http, https, ws, wss, grpc, grpcs, h3]
-      description: Protocol used to communicate with the backend
+      enum: [http, https, ws, wss, grpc, grpcs, h3, tcp, tcp_tls, udp, dtls]
+      description: |
+        Protocol used to communicate with the backend.
+        TCP/UDP protocols (tcp, tcp_tls, udp, dtls) are raw stream proxies
+        that require a `listen_port` instead of `listen_path`.
+        `dtls` encrypts UDP datagrams to the backend using DTLS 1.2 (ECDSA/Ed25519 keys only).
 
     AuthMode:
       type: string
@@ -1269,7 +1292,25 @@ components:
             type: integer
             format: uint16
           default: [200, 302]
-          description: Status codes considered healthy
+          description: Status codes considered healthy (HTTP probe only)
+        probe_type:
+          type: string
+          enum: [http, tcp, udp]
+          default: http
+          description: |
+            Type of health probe.
+            `http` — HTTP GET request (default).
+            `tcp` — TCP SYN connection probe.
+            `udp` — UDP probe with optional payload.
+        udp_probe_payload:
+          type: [string, "null"]
+          description: |
+            Hex-encoded payload to send for UDP probes (e.g., "0000").
+            If omitted, a single zero byte is sent.
+        use_tls:
+          type: boolean
+          default: false
+          description: Use HTTPS for HTTP probes
 
     PassiveHealthCheck:
       type: object

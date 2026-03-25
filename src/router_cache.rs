@@ -209,6 +209,7 @@ impl RouterCache {
         let mut entries: Vec<RouteEntry> = config
             .proxies
             .iter()
+            .filter(|p| !p.backend_protocol.is_stream_proxy())
             .map(|p| RouteEntry {
                 listen_path: p.listen_path.clone(),
                 proxy: Arc::new(p.clone()),

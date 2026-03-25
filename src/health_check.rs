@@ -9,7 +9,9 @@
 //! benefit from connection reuse across targets.
 
 use crate::config::pool_config::PoolConfig;
-use crate::config::types::{ActiveHealthCheck, GatewayConfig, PassiveHealthCheck, UpstreamTarget};
+use crate::config::types::{
+    ActiveHealthCheck, GatewayConfig, HealthProbeType, PassiveHealthCheck, UpstreamTarget,
+};
 use dashmap::DashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -321,19 +323,26 @@ impl HealthChecker {
         shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
     ) -> tokio::task::JoinHandle<()> {
         let key = target_key(target);
-        let scheme = if config.use_tls { "https" } else { "http" };
-        let url = format!(
-            "{}://{}:{}{}",
-            scheme, target.host, target.port, config.http_path
-        );
         let interval = Duration::from_secs(config.interval_seconds);
         let timeout = Duration::from_millis(config.timeout_ms);
         let healthy_threshold = config.healthy_threshold;
         let unhealthy_threshold = config.unhealthy_threshold;
-        let healthy_status_codes = config.healthy_status_codes.clone();
         let unhealthy_targets = self.unhealthy_targets.clone();
         let target_states = self.target_states.clone();
+
+        // Build probe-specific state
+        let probe_type = config.probe_type;
+        let host = target.host.clone();
+        let port = target.port;
+        let healthy_status_codes = config.healthy_status_codes.clone();
         let client = self.http_client.clone();
+        let scheme = if config.use_tls { "https" } else { "http" };
+        let url = format!("{}://{}:{}{}", scheme, host, port, config.http_path);
+        let udp_payload = config
+            .udp_probe_payload
+            .as_deref()
+            .and_then(|hex| hex::decode(hex).ok())
+            .unwrap_or_default();
 
         tokio::spawn(async move {
             let mut timer = tokio::time::interval(interval);
@@ -356,62 +365,37 @@ impl HealthChecker {
                     .or_insert_with(|| Arc::new(TargetHealth::new()))
                     .clone();
 
-                // Apply per-probe timeout at request level; the shared client
-                // handles pooling, keep-alive, and connection reuse.
-                let result = client.get(&url).timeout(timeout).send().await;
-
-                match result {
-                    Ok(resp) => {
-                        let status = resp.status().as_u16();
-                        if healthy_status_codes.contains(&status) {
-                            state.consecutive_failures.store(0, Ordering::Relaxed);
-                            let successes =
-                                state.consecutive_successes.fetch_add(1, Ordering::Relaxed) + 1;
-
-                            if successes >= healthy_threshold
-                                && unhealthy_targets.remove(&key).is_some()
-                            {
-                                info!(
-                                    "Active health check: target {} is healthy (status {})",
-                                    key, status
-                                );
-                            }
-                        } else {
-                            state.consecutive_successes.store(0, Ordering::Relaxed);
-                            let failures =
-                                state.consecutive_failures.fetch_add(1, Ordering::Relaxed) + 1;
-
-                            if failures >= unhealthy_threshold {
-                                let key_ref = key.clone();
-                                unhealthy_targets.entry(key.clone()).or_insert_with(|| {
-                                    warn!(
-                                        "Active health check: target {} is unhealthy (status {})",
-                                        key_ref, status
-                                    );
-                                    now_epoch_ms()
-                                });
-                            }
-                        }
+                let probe_success = match probe_type {
+                    HealthProbeType::Http => {
+                        http_probe(&client, &url, timeout, &healthy_status_codes).await
                     }
-                    Err(e) => {
-                        state.consecutive_successes.store(0, Ordering::Relaxed);
-                        let failures =
-                            state.consecutive_failures.fetch_add(1, Ordering::Relaxed) + 1;
+                    HealthProbeType::Tcp => tcp_probe(&host, port, timeout).await,
+                    HealthProbeType::Udp => udp_probe(&host, port, timeout, &udp_payload).await,
+                };
 
-                        debug!("Active health check failed for {}: {}", key, e);
+                if probe_success {
+                    state.consecutive_failures.store(0, Ordering::Relaxed);
+                    let successes = state.consecutive_successes.fetch_add(1, Ordering::Relaxed) + 1;
 
-                        if failures >= unhealthy_threshold {
-                            let key_ref = key.clone();
-                            unhealthy_targets
-                                .entry(key.clone())
-                                .or_insert_with(|| {
-                                    warn!(
-                                        "Active health check: target {} is unhealthy (connection error)",
-                                        key_ref
-                                    );
-                                    now_epoch_ms()
-                                });
-                        }
+                    if successes >= healthy_threshold && unhealthy_targets.remove(&key).is_some() {
+                        info!(
+                            "Active health check: target {} is healthy ({:?} probe)",
+                            key, probe_type
+                        );
+                    }
+                } else {
+                    state.consecutive_successes.store(0, Ordering::Relaxed);
+                    let failures = state.consecutive_failures.fetch_add(1, Ordering::Relaxed) + 1;
+
+                    if failures >= unhealthy_threshold {
+                        let key_ref = key.clone();
+                        unhealthy_targets.entry(key.clone()).or_insert_with(|| {
+                            warn!(
+                                "Active health check: target {} is unhealthy ({:?} probe)",
+                                key_ref, probe_type
+                            );
+                            now_epoch_ms()
+                        });
                     }
                 }
             }
@@ -423,6 +407,86 @@ impl Drop for HealthChecker {
     fn drop(&mut self) {
         for handle in &self.active_check_handles {
             handle.abort();
+        }
+    }
+}
+
+/// HTTP health probe — sends a GET request and checks the status code.
+async fn http_probe(
+    client: &reqwest::Client,
+    url: &str,
+    timeout: Duration,
+    healthy_status_codes: &[u16],
+) -> bool {
+    match client.get(url).timeout(timeout).send().await {
+        Ok(resp) => {
+            let status = resp.status().as_u16();
+            if healthy_status_codes.is_empty() {
+                // Default: any 2xx is healthy
+                (200..300).contains(&status)
+            } else {
+                healthy_status_codes.contains(&status)
+            }
+        }
+        Err(e) => {
+            debug!("HTTP health probe failed for {}: {}", url, e);
+            false
+        }
+    }
+}
+
+/// TCP health probe — attempts a TCP connection within the timeout.
+/// Success means the target accepted the connection (SYN-ACK).
+async fn tcp_probe(host: &str, port: u16, timeout: Duration) -> bool {
+    let addr = format!("{}:{}", host, port);
+    match tokio::time::timeout(timeout, tokio::net::TcpStream::connect(&addr)).await {
+        Ok(Ok(_stream)) => true,
+        Ok(Err(e)) => {
+            debug!("TCP health probe connection failed for {}: {}", addr, e);
+            false
+        }
+        Err(_) => {
+            debug!("TCP health probe timed out for {}", addr);
+            false
+        }
+    }
+}
+
+/// UDP health probe — sends a payload and waits for any response within the timeout.
+/// A response (any data) means the target is alive. Timeout means unhealthy.
+async fn udp_probe(host: &str, port: u16, timeout: Duration, payload: &[u8]) -> bool {
+    let addr = format!("{}:{}", host, port);
+    let socket = match tokio::net::UdpSocket::bind("0.0.0.0:0").await {
+        Ok(s) => s,
+        Err(e) => {
+            debug!("UDP health probe: failed to bind socket: {}", e);
+            return false;
+        }
+    };
+
+    if let Err(e) = socket.connect(&addr).await {
+        debug!("UDP health probe: failed to connect to {}: {}", addr, e);
+        return false;
+    }
+
+    // Send probe payload (or a single zero byte if no payload configured)
+    let data = if payload.is_empty() { &[0u8] } else { payload };
+    if let Err(e) = socket.send(data).await {
+        debug!("UDP health probe: failed to send to {}: {}", addr, e);
+        return false;
+    }
+
+    // Wait for any response
+    let mut buf = [0u8; 1];
+    match tokio::time::timeout(timeout, socket.recv(&mut buf)).await {
+        Ok(Ok(_)) => true,
+        Ok(Err(e)) => {
+            debug!("UDP health probe: recv error from {}: {}", addr, e);
+            false
+        }
+        Err(_) => {
+            debug!("UDP health probe timed out for {}", addr);
+            false
         }
     }
 }

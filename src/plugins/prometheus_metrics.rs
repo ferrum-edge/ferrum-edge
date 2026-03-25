@@ -254,6 +254,10 @@ impl Plugin for PrometheusMetrics {
         PROMETHEUS_METRICS_PRIORITY
     }
 
+    fn supports_stream_proxy(&self) -> bool {
+        true
+    }
+
     async fn log(&self, summary: &TransactionSummary) {
         self.registry.record(summary);
     }

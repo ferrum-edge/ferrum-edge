@@ -91,6 +91,9 @@ pub fn create_test_proxy() -> Proxy {
         circuit_breaker: None,
         retry: None,
         response_body_mode: Default::default(),
+        listen_port: None,
+        frontend_tls: false,
+        udp_idle_timeout_seconds: 60,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }
