@@ -1,0 +1,35 @@
+---
+# gRPC performance test config
+# Gateway proxies gRPC (h2c) to backend gRPC server
+proxies:
+  - id: "grpc-bench"
+    name: "gRPC Bench Service"
+    listen_path: "/bench.BenchService"
+    backend_protocol: grpc
+    backend_host: "127.0.0.1"
+    backend_port: 50052
+    strip_listen_path: false
+    preserve_host_header: false
+    backend_connect_timeout_ms: 5000
+    backend_read_timeout_ms: 10000
+    backend_write_timeout_ms: 10000
+    auth_mode: single
+    plugins: []
+
+  - id: "grpc-health"
+    name: "Health Check"
+    listen_path: "/health"
+    backend_protocol: http
+    backend_host: "127.0.0.1"
+    backend_port: 3002
+    strip_listen_path: false
+    preserve_host_header: false
+    backend_connect_timeout_ms: 1000
+    backend_read_timeout_ms: 5000
+    backend_write_timeout_ms: 5000
+    auth_mode: single
+    pool_max_idle_per_host: 200
+    plugins: []
+
+consumers: []
+plugin_configs: []

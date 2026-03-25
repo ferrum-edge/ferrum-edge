@@ -1,0 +1,33 @@
+---
+# UDP+DTLS (frontend DTLS termination) performance test config
+# Client connects via DTLS to gateway, gateway forwards plain UDP to backend
+proxies:
+  - id: "udp-dtls-echo"
+    name: "UDP+DTLS Echo Proxy"
+    listen_path: ""
+    listen_port: 5004
+    backend_protocol: udp
+    backend_host: "127.0.0.1"
+    backend_port: 3005
+    frontend_tls: true
+    udp_idle_timeout_seconds: 30
+    auth_mode: single
+    plugins: []
+
+  - id: "udp-dtls-health"
+    name: "Health Check"
+    listen_path: "/health"
+    backend_protocol: http
+    backend_host: "127.0.0.1"
+    backend_port: 3002
+    strip_listen_path: false
+    preserve_host_header: false
+    backend_connect_timeout_ms: 1000
+    backend_read_timeout_ms: 5000
+    backend_write_timeout_ms: 5000
+    auth_mode: single
+    pool_max_idle_per_host: 200
+    plugins: []
+
+consumers: []
+plugin_configs: []

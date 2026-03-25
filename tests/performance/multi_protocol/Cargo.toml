@@ -1,0 +1,65 @@
+[package]
+name = "multi-protocol-perf"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "proto_backend"
+path = "proto_backend.rs"
+
+[[bin]]
+name = "proto_bench"
+path = "proto_bench.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# HTTP
+hyper = { version = "1", features = ["full"] }
+hyper-util = { version = "0.1", features = ["full"] }
+http-body-util = "0.1"
+http = "1"
+
+# TLS
+rustls = { version = "0.23", features = ["ring", "std"] }
+tokio-rustls = "0.26"
+rustls-pemfile = "2"
+rcgen = "0.13"
+
+# WebSocket
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+futures-util = { version = "0.3", features = ["sink"] }
+
+# gRPC
+tonic = { version = "0.12", features = ["tls"] }
+prost = "0.13"
+
+# HTTP/3 / QUIC
+quinn = "0.11.9"
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
+
+# DTLS
+webrtc-dtls = { package = "dtls", version = "0.17.1", features = ["pem"] }
+webrtc-util = { version = "0.17.1", default-features = false, features = ["conn"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Metrics
+hdrhistogram = "7"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Streaming
+tokio-stream = "0.1"
+
+# Other
+bytes = "1"
+anyhow = "1"
+
+[build-dependencies]
+tonic-build = "0.12"

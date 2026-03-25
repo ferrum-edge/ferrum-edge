@@ -1,0 +1,36 @@
+---
+# HTTP/3 (QUIC) performance test config
+# Gateway listens with HTTP/3 enabled, proxies to HTTP/3 backend
+proxies:
+  - id: "h3-users"
+    name: "HTTP/3 Users API"
+    listen_path: "/api/users"
+    backend_protocol: h3
+    backend_host: "127.0.0.1"
+    backend_port: 3445
+    strip_listen_path: false
+    preserve_host_header: false
+    backend_connect_timeout_ms: 5000
+    backend_read_timeout_ms: 10000
+    backend_write_timeout_ms: 10000
+    backend_tls_verify_server_cert: false
+    auth_mode: single
+    plugins: []
+
+  - id: "h3-health"
+    name: "HTTP/3 Health Check"
+    listen_path: "/health"
+    backend_protocol: h3
+    backend_host: "127.0.0.1"
+    backend_port: 3445
+    strip_listen_path: false
+    preserve_host_header: false
+    backend_connect_timeout_ms: 5000
+    backend_read_timeout_ms: 5000
+    backend_write_timeout_ms: 5000
+    backend_tls_verify_server_cert: false
+    auth_mode: single
+    plugins: []
+
+consumers: []
+plugin_configs: []
