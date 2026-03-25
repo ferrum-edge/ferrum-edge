@@ -539,8 +539,6 @@ plugin_configs: []
 #[ignore]
 #[tokio::test]
 async fn test_udp_proxy_frontend_dtls_termination() {
-    use webrtc_dtls::config::Config as DtlsConfig;
-
     let backend_port = 19822u16;
     let proxy_port = 19823u16;
     let gateway_http_port = 18216u16;
@@ -584,21 +582,8 @@ plugin_configs: []
     .expect("Failed to start");
     sleep(Duration::from_secs(3)).await;
 
-    // Connect as a DTLS client to the gateway
-    let client_config = DtlsConfig {
-        insecure_skip_verify: true,
-        ..Default::default()
-    };
-
-    let client_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    client_socket
-        .connect(format!("127.0.0.1:{}", proxy_port))
-        .await
-        .unwrap();
-    let conn: Arc<dyn webrtc_util::Conn + Send + Sync> = Arc::new(client_socket);
-    let dtls_client = webrtc_dtls::conn::DTLSConn::new(conn, client_config, true, None)
-        .await
-        .expect("DTLS client handshake failed");
+    // Connect as a DTLS client to the gateway (with retries for CI timing)
+    let dtls_client = connect_dtls_client_with_retry(proxy_port, 5).await;
 
     // Send data through DTLS (use write/read — DTLSConn's public methods)
     let msg1 = b"Hello through frontend DTLS!";
@@ -639,8 +624,6 @@ plugin_configs: []
 #[ignore]
 #[tokio::test]
 async fn test_udp_proxy_full_dtls_e2e() {
-    use webrtc_dtls::config::Config as DtlsConfig;
-
     let backend_port = 19824u16;
     let proxy_port = 19825u16;
     let gateway_http_port = 18217u16;
@@ -685,21 +668,8 @@ plugin_configs: []
     .expect("Failed to start");
     sleep(Duration::from_secs(3)).await;
 
-    // Connect as DTLS client
-    let client_config = DtlsConfig {
-        insecure_skip_verify: true,
-        ..Default::default()
-    };
-
-    let client_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    client_socket
-        .connect(format!("127.0.0.1:{}", proxy_port))
-        .await
-        .unwrap();
-    let conn: Arc<dyn webrtc_util::Conn + Send + Sync> = Arc::new(client_socket);
-    let dtls_client = webrtc_dtls::conn::DTLSConn::new(conn, client_config, true, None)
-        .await
-        .expect("DTLS client handshake failed");
+    // Connect as DTLS client (with retries for CI timing)
+    let dtls_client = connect_dtls_client_with_retry(proxy_port, 5).await;
 
     // Send data through full DTLS pipeline (use write/read — DTLSConn's public methods)
     let msg = b"Full DTLS end-to-end!";
@@ -718,6 +688,59 @@ plugin_configs: []
     let _ = gateway.kill();
     let _ = gateway.wait();
     dtls_echo.abort();
+}
+
+// ============================================================================
+// DTLS Client Helper
+// ============================================================================
+
+/// Connect a DTLS client with retries — the DTLS listener may take longer to
+/// start than plain UDP, especially on CI runners.
+async fn connect_dtls_client_with_retry(
+    proxy_port: u16,
+    max_attempts: u32,
+) -> webrtc_dtls::conn::DTLSConn {
+    use webrtc_dtls::config::Config as DtlsConfig;
+
+    let mut last_err = String::new();
+    for attempt in 1..=max_attempts {
+        let client_config = DtlsConfig {
+            insecure_skip_verify: true,
+            ..Default::default()
+        };
+
+        let client_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client_socket
+            .connect(format!("127.0.0.1:{}", proxy_port))
+            .await
+            .unwrap();
+        let conn: Arc<dyn webrtc_util::Conn + Send + Sync> = Arc::new(client_socket);
+
+        match tokio::time::timeout(
+            Duration::from_secs(5),
+            webrtc_dtls::conn::DTLSConn::new(conn, client_config, true, None),
+        )
+        .await
+        {
+            Ok(Ok(dtls_conn)) => return dtls_conn,
+            Ok(Err(e)) => {
+                last_err = format!("{}", e);
+                if attempt < max_attempts {
+                    sleep(Duration::from_secs(2)).await;
+                }
+            }
+            Err(_) => {
+                last_err = "handshake timed out".to_string();
+                if attempt < max_attempts {
+                    sleep(Duration::from_secs(2)).await;
+                }
+            }
+        }
+    }
+    panic!(
+        "DTLS client handshake failed after {} attempts: {}",
+        max_attempts, last_err
+    );
 }
 
 // ============================================================================

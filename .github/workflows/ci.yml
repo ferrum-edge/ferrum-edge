@@ -109,7 +109,7 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "All integration, functional, and end-to-end tests executed." >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "Includes \`--ignored\` tests: gRPC proxying, WebSocket proxying, file mode reload, database mode, and CP/DP sync." >> $GITHUB_STEP_SUMMARY
+          echo "Includes \`--ignored\` tests: gRPC proxying, WebSocket proxying, TCP/UDP/DTLS stream proxying, file mode reload, database mode, and CP/DP sync." >> $GITHUB_STEP_SUMMARY
 
   lint:
     name: Lint
