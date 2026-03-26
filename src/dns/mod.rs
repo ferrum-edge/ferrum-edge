@@ -118,10 +118,17 @@ pub struct DnsCache {
     refreshing: Arc<DashMap<String, ()>>,
     /// Threshold above which DNS resolutions are logged as slow. None = disabled.
     slow_threshold: Option<Duration>,
+    /// Pre-computed label describing which nameservers are in use (for slow resolution logs).
+    resolver_label: Arc<str>,
 }
 
 impl DnsCache {
     pub fn new(config: DnsConfig) -> Self {
+        let resolver_label: Arc<str> = match &config.resolver_addresses {
+            Some(addrs) => Arc::from(addrs.as_str()),
+            None => Arc::from("system"),
+        };
+
         let resolver = build_resolver(&config);
 
         let dns_order = parse_dns_order(config.dns_order.as_deref());
@@ -138,6 +145,7 @@ impl DnsCache {
             max_cache_size: config.max_cache_size,
             refreshing: Arc::new(DashMap::new()),
             slow_threshold: config.slow_threshold_ms.map(Duration::from_millis),
+            resolver_label,
         }
     }
 
@@ -309,10 +317,11 @@ impl DnsCache {
         let elapsed = start.elapsed();
         if elapsed > threshold {
             warn!(
-                "DNS slow resolution for {} took {:.1}ms (threshold: {}ms)",
+                "DNS slow resolution for {} took {:.1}ms (threshold: {}ms, resolver: {})",
                 hostname,
                 elapsed.as_secs_f64() * 1000.0,
                 threshold.as_millis(),
+                self.resolver_label,
             );
         }
         result
