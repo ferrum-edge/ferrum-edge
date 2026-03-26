@@ -104,6 +104,50 @@ pub fn classify_grpc_proxy_error(e: &crate::proxy::grpc_proxy::GrpcProxyError) -
     }
 }
 
+/// Classify a generic boxed error (e.g. from WebSocket connections) into an
+/// `ErrorClass` by inspecting its Display and Debug representations. Called
+/// on the error path only.
+pub fn classify_boxed_error(e: &(dyn std::error::Error + Send + Sync)) -> ErrorClass {
+    let error_str = format!("{}", e);
+    let debug_str = format!("{:?}", e);
+
+    if error_str.contains("connect timeout") || error_str.contains("timed out") {
+        return ErrorClass::ConnectionTimeout;
+    }
+    if error_str.contains("refused") || debug_str.contains("ConnectionRefused") {
+        return ErrorClass::ConnectionRefused;
+    }
+    if debug_str.contains("dns error")
+        || debug_str.contains("resolve")
+        || debug_str.contains("Name or service not known")
+        || debug_str.contains("No such host")
+        || debug_str.contains("no record found")
+        || debug_str.contains("failed to lookup address")
+    {
+        return ErrorClass::DnsLookupError;
+    }
+    if debug_str.contains("certificate")
+        || debug_str.contains("SSL")
+        || debug_str.contains("tls")
+        || debug_str.contains("TLS")
+        || debug_str.contains("AlertReceived")
+        || debug_str.contains("HandshakeFailure")
+        || debug_str.contains("InvalidCertificate")
+    {
+        return ErrorClass::TlsError;
+    }
+    if debug_str.contains("reset") || debug_str.contains("ConnectionReset") {
+        return ErrorClass::ConnectionReset;
+    }
+    if debug_str.contains("broken pipe")
+        || debug_str.contains("BrokenPipe")
+        || debug_str.contains("connection closed")
+    {
+        return ErrorClass::ConnectionClosed;
+    }
+    ErrorClass::RequestError
+}
+
 /// Classify a `reqwest::Error` into an `ErrorClass` by inspecting its
 /// error chain and message. This is called on the error path only (not hot path).
 pub fn classify_reqwest_error(e: &reqwest::Error) -> ErrorClass {

@@ -102,6 +102,7 @@ Error classification is wired into all proxy protocols:
 | HTTP/2 | `TransactionSummary` | Full (13 error classes) | `classify_reqwest_error()` |
 | HTTP/3 (QUIC) | `TransactionSummary` | Full (13 error classes) | `classify_reqwest_error()` |
 | gRPC / gRPCs | `TransactionSummary` | Full (via gRPC error mapping) | `classify_grpc_proxy_error()` |
+| WebSocket / WSS | `TransactionSummary` | Full (connection-phase errors) | `classify_boxed_error()` |
 | TCP / TCP+TLS | `StreamTransactionSummary` | Field available (`error_class`) | Classified from `anyhow::Error` context |
 | UDP / DTLS | `StreamTransactionSummary` | Field available (`error_class`) | Classified from `anyhow::Error` context |
 
@@ -109,24 +110,25 @@ Error classification is wired into all proxy protocols:
 
 Not all error classes apply to all protocols equally:
 
-| Error Class | HTTP | gRPC | HTTP/3 | TCP/UDP |
-|---|:---:|:---:|:---:|:---:|
-| `ConnectionTimeout` | Yes | Yes | Yes | Yes |
-| `ConnectionRefused` | Yes | Yes | Yes | Yes |
-| `ConnectionReset` | Yes | — | Yes | Yes |
-| `ConnectionClosed` | Yes | — | Yes | Yes |
-| `DnsLookupError` | Yes | Yes | Yes | Yes |
-| `TlsError` | Yes | Yes | Yes | Yes |
-| `ReadWriteTimeout` | Yes | Yes | Yes | — |
-| `ClientDisconnect` | Yes | — | — | — |
-| `ProtocolError` | Yes | Yes | Yes | — |
-| `ResponseBodyTooLarge` | Yes | — | Yes | — |
-| `RequestBodyTooLarge` | Yes | — | — | — |
-| `ConnectionPoolError` | Yes | — | — | — |
-| `RequestError` | Yes | Yes | Yes | — |
+| Error Class | HTTP | gRPC | HTTP/3 | WebSocket | TCP/UDP |
+|---|:---:|:---:|:---:|:---:|:---:|
+| `ConnectionTimeout` | Yes | Yes | Yes | Yes | Yes |
+| `ConnectionRefused` | Yes | Yes | Yes | Yes | Yes |
+| `ConnectionReset` | Yes | — | Yes | Yes | Yes |
+| `ConnectionClosed` | Yes | — | Yes | Yes | Yes |
+| `DnsLookupError` | Yes | Yes | Yes | Yes | Yes |
+| `TlsError` | Yes | Yes | Yes | Yes | Yes |
+| `ReadWriteTimeout` | Yes | Yes | Yes | — | — |
+| `ClientDisconnect` | Yes | — | — | — | — |
+| `ProtocolError` | Yes | Yes | Yes | — | — |
+| `ResponseBodyTooLarge` | Yes | — | Yes | — | — |
+| `RequestBodyTooLarge` | Yes | — | — | — | — |
+| `ConnectionPoolError` | Yes | — | — | — | — |
+| `RequestError` | Yes | Yes | Yes | Yes | — |
 
 **Notes:**
 - gRPC uses hyper's HTTP/2 client (not reqwest), so its error classification maps from `GrpcProxyError` variants which carry enough context to distinguish timeout, TLS, refused, and protocol errors.
+- WebSocket errors are classified during the backend connection phase (before the 101 upgrade). Once the connection is upgraded, errors occur at the frame level and are not classified (the connection is already established). `ReadWriteTimeout` does not apply because WebSocket connections are long-lived and use connect-phase timeouts only.
 - TCP/UDP streams don't have request/response semantics, so body size limits and client disconnect don't apply. Their primary error classes are connection-level: timeout, refused, reset, DNS, and TLS.
 
 ## Implementation Details
@@ -136,4 +138,5 @@ Error classification is implemented in `src/retry.rs`:
 - `ErrorClass` enum — 13 variants covering the full spectrum of gateway-level failures.
 - `classify_reqwest_error()` — inspects the `reqwest::Error` chain (connect errors, timeout, TLS, DNS, reset, etc.) and returns the appropriate `ErrorClass`. Used by HTTP/1.1, HTTP/2, and HTTP/3 paths.
 - `classify_grpc_proxy_error()` — maps `GrpcProxyError` variants (timeout, unavailable, internal) into `ErrorClass`. Inspects the error message to further distinguish TLS, connection refused, protocol, and DNS errors.
+- `classify_boxed_error()` — inspects generic `Box<dyn Error>` by its Display/Debug representation. Used by the WebSocket path where errors come from `tokio-tungstenite` rather than reqwest.
 - All classification functions are only called when the backend request fails, keeping the hot path allocation-free.

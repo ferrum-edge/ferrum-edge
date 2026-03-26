@@ -759,15 +759,64 @@ async fn handle_websocket_request_authenticated(
         match connect_websocket_backend(&backend_url, &proxy, &env_config, &client_headers).await {
             Ok(stream) => stream,
             Err(e) => {
+                let ws_error_class = retry::classify_boxed_error(e.as_ref());
                 error!(
                     proxy_id = %proxy.id,
                     backend_url = %backend_url,
                     error_kind = "connect_failure",
+                    error_class = %ws_error_class,
                     error = %e,
                     "WebSocket backend connection failed"
                 );
                 state.request_count.fetch_add(1, Ordering::Relaxed);
                 record_status(&state, 502);
+
+                // Log with error_class for WebSocket backend failures
+                if !plugins.is_empty() {
+                    let logging_plugins: Vec<&Arc<dyn Plugin>> = plugins
+                        .iter()
+                        .filter(|p| p.priority() >= plugin_priority::STDOUT_LOGGING)
+                        .collect();
+
+                    if !logging_plugins.is_empty() {
+                        let ws_total_ms = (chrono::Utc::now() - ctx.timestamp_received)
+                            .num_milliseconds()
+                            .max(0) as f64;
+                        let mut metadata = ctx.metadata.clone();
+                        metadata.insert(
+                            "rejection_phase".to_string(),
+                            "websocket_backend_error".to_string(),
+                        );
+                        let summary = TransactionSummary {
+                            timestamp_received: ctx.timestamp_received.to_rfc3339(),
+                            client_ip: ctx.client_ip.clone(),
+                            consumer_username: ctx
+                                .identified_consumer
+                                .as_ref()
+                                .map(|c| c.username.clone()),
+                            http_method: "GET".to_string(),
+                            request_path: ctx.path.clone(),
+                            matched_proxy_id: Some(proxy.id.clone()),
+                            matched_proxy_name: proxy.name.clone(),
+                            backend_target_url: Some(strip_query_params(&backend_url).to_string()),
+                            backend_resolved_ip: None,
+                            response_status_code: 502,
+                            latency_total_ms: ws_total_ms,
+                            latency_gateway_processing_ms: ws_total_ms,
+                            latency_backend_ttfb_ms: -1.0,
+                            latency_backend_total_ms: -1.0,
+                            request_user_agent: ctx.headers.get("user-agent").cloned(),
+                            response_streamed: false,
+                            client_disconnected: false,
+                            error_class: Some(ws_error_class),
+                            metadata,
+                        };
+                        for plugin in &logging_plugins {
+                            plugin.log(&summary).await;
+                        }
+                    }
+                }
+
                 return Ok(build_response(
                     StatusCode::BAD_GATEWAY,
                     r#"{"error":"Backend WebSocket connection failed"}"#,

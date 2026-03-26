@@ -3,7 +3,8 @@
 use ferrum_gateway::config::types::{BackoffStrategy, RetryConfig};
 use ferrum_gateway::proxy::grpc_proxy::GrpcProxyError;
 use ferrum_gateway::retry::{
-    BackendResponse, ErrorClass, ResponseBody, classify_grpc_proxy_error, retry_delay, should_retry,
+    BackendResponse, ErrorClass, ResponseBody, classify_boxed_error, classify_grpc_proxy_error,
+    retry_delay, should_retry,
 };
 use std::collections::HashMap;
 use std::time::Duration;
@@ -256,4 +257,75 @@ fn test_grpc_generic_unavailable_classified() {
 fn test_grpc_internal_error_classified() {
     let err = GrpcProxyError::Internal("Failed to read client cert from /path: not found".into());
     assert_eq!(classify_grpc_proxy_error(&err), ErrorClass::RequestError);
+}
+
+// --- classify_boxed_error tests (WebSocket / generic errors) ---
+
+#[test]
+fn test_boxed_error_connect_timeout() {
+    let err: Box<dyn std::error::Error + Send + Sync> =
+        "WebSocket backend connect timeout (5000ms) for proxy ws-1".into();
+    assert_eq!(
+        classify_boxed_error(err.as_ref()),
+        ErrorClass::ConnectionTimeout
+    );
+}
+
+#[test]
+fn test_boxed_error_timed_out() {
+    let err: Box<dyn std::error::Error + Send + Sync> = "operation timed out".into();
+    assert_eq!(
+        classify_boxed_error(err.as_ref()),
+        ErrorClass::ConnectionTimeout
+    );
+}
+
+#[test]
+fn test_boxed_error_connection_refused() {
+    let err: Box<dyn std::error::Error + Send + Sync> = "Connection refused (os error 111)".into();
+    assert_eq!(
+        classify_boxed_error(err.as_ref()),
+        ErrorClass::ConnectionRefused
+    );
+}
+
+#[test]
+fn test_boxed_error_tls() {
+    let err: Box<dyn std::error::Error + Send + Sync> =
+        "TLS handshake failed: certificate verify failed".into();
+    assert_eq!(classify_boxed_error(err.as_ref()), ErrorClass::TlsError);
+}
+
+#[test]
+fn test_boxed_error_dns() {
+    let err: Box<dyn std::error::Error + Send + Sync> =
+        "failed to lookup address information: Name or service not known".into();
+    assert_eq!(
+        classify_boxed_error(err.as_ref()),
+        ErrorClass::DnsLookupError
+    );
+}
+
+#[test]
+fn test_boxed_error_connection_reset() {
+    let err: Box<dyn std::error::Error + Send + Sync> = "connection reset by peer".into();
+    assert_eq!(
+        classify_boxed_error(err.as_ref()),
+        ErrorClass::ConnectionReset
+    );
+}
+
+#[test]
+fn test_boxed_error_broken_pipe() {
+    let err: Box<dyn std::error::Error + Send + Sync> = "broken pipe".into();
+    assert_eq!(
+        classify_boxed_error(err.as_ref()),
+        ErrorClass::ConnectionClosed
+    );
+}
+
+#[test]
+fn test_boxed_error_unknown_fallback() {
+    let err: Box<dyn std::error::Error + Send + Sync> = "some unknown error".into();
+    assert_eq!(classify_boxed_error(err.as_ref()), ErrorClass::RequestError);
 }
