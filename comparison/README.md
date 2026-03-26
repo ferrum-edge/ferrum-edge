@@ -1,6 +1,6 @@
 # API Gateway Comparison Benchmarks
 
-Performance comparison suite that benchmarks **Ferrum Gateway** against **Pingora** (Cloudflare), **Kong**, **Tyk**, and **KrakenD** under identical conditions.
+Performance comparison suite that benchmarks **Ferrum Gateway** against **Pingora** (Cloudflare), **Kong**, **Tyk**, **KrakenD**, and **Envoy** under identical conditions.
 
 ## What It Measures
 
@@ -11,7 +11,7 @@ Each gateway is tested as a reverse proxy with four scenarios:
 | **HTTP (plaintext)** | Client → Gateway (port 8000) → Backend. Measures raw proxy overhead. |
 | **HTTPS (TLS termination)** | Client → Gateway (port 8443, TLS) → Backend (plaintext). Measures TLS handshake and encryption overhead at the gateway. |
 | **E2E TLS (full encryption)** | Client → Gateway (port 8443, TLS) → Backend (TLS, port 3443). Measures full end-to-end encryption where the gateway re-encrypts traffic to the backend. |
-| **Key-Auth (HTTP + authentication)** | Client → Gateway (port 8000, HTTP) → Backend. Each request includes an API key header (`apikey: test-api-key`) validated by the gateway's key-auth plugin. Measures authentication overhead. Ferrum, Kong, and Tyk only (Pingora has no auth plugin framework; KrakenD key-auth requires Enterprise Edition). |
+| **Key-Auth (HTTP + authentication)** | Client → Gateway (port 8000, HTTP) → Backend. Each request includes an API key header (`apikey: test-api-key`) validated by the gateway's key-auth plugin. Measures authentication overhead. Ferrum, Kong, Tyk, and Envoy (Pingora has no auth plugin framework; KrakenD key-auth requires Enterprise Edition). Envoy uses an inline Lua filter for API key validation. |
 
 Two endpoints are tested per proxy scenario:
 - `/health` — instant backend response, measures pure gateway latency
@@ -24,7 +24,7 @@ A direct backend baseline (no gateway) is run first for both HTTP and HTTPS comp
 - Gateways are tested **sequentially** (one at a time) to avoid resource contention
 - Each test gets a **5-second warm-up** (results discarded) before the measured 30-second run
 - The same backend echo server, wrk parameters, and endpoints are used across all gateways
-- Ferrum runs as a native binary; Kong runs natively if installed (preferred) or in Docker; Tyk and KrakenD run in Docker
+- Ferrum runs as a native binary; Kong and Envoy run natively if installed (preferred) or in Docker; Tyk and KrakenD run in Docker
 - The script auto-detects native Kong and prefers it over Docker for fairer benchmarking
 
 ## Prerequisites
@@ -36,7 +36,7 @@ A direct backend baseline (no gateway) is run first for both HTTP and HTTPS comp
 | **Rust/Cargo** | Yes | [rustup.rs](https://rustup.rs/) — builds Ferrum and the backend server |
 | **cmake** | For Pingora | `brew install cmake` (macOS) or `apt install cmake` (Ubuntu) |
 | **curl** | Yes | Usually pre-installed; used for health checks |
-| **Docker** | For Tyk, KrakenD (always), Kong (if not native) | [docs.docker.com/get-docker](https://docs.docker.com/get-docker/) |
+| **Docker** | For Tyk, KrakenD (always), Kong/Envoy (if not native) | [docs.docker.com/get-docker](https://docs.docker.com/get-docker/) |
 | **Pingora source** | For Pingora tests | Clone [cloudflare/pingora](https://github.com/cloudflare/pingora) to `~/workspace/pingora` |
 | **Kong** (native) | Recommended | See below |
 
@@ -56,6 +56,24 @@ sudo apt install kong
 ```bash
 curl -1sLf 'https://packages.konghq.com/public/gateway-39/setup.rpm.sh' | sudo bash
 sudo yum install kong
+```
+
+### Native Envoy Installation (Recommended for Fair Benchmarks)
+
+Installing Envoy natively eliminates Docker overhead and provides a fair comparison against Ferrum and Pingora. The script auto-detects a native `envoy` binary and uses it automatically.
+
+**macOS:**
+```bash
+brew install envoy
+```
+
+**Ubuntu/Debian:**
+```bash
+# See https://www.envoyproxy.io/docs/envoy/latest/start/install for latest instructions
+sudo apt update && sudo apt install -y apt-transport-https ca-certificates curl gnupg
+curl -sL 'https://deb.dl.getenvoy.io/public/gpg.8115BA8E629CC074.key' | sudo gpg --dearmor -o /usr/share/keyrings/getenvoy-keyring.gpg
+echo "deb [signed-by=/usr/share/keyrings/getenvoy-keyring.gpg] https://deb.dl.getenvoy.io/public/deb/ubuntu $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/getenvoy.list
+sudo apt update && sudo apt install -y getenvoy-envoy
 ```
 
 ### Native Tyk Installation (Linux Only)
@@ -82,9 +100,9 @@ On macOS, Tyk runs in Docker — see the "Docker Overhead" section below for wha
 ```
 
 The script will:
-1. Pull Kong, Tyk, and KrakenD Docker images
+1. Pull Kong, Tyk, KrakenD, and Envoy Docker images
 2. Build Ferrum Gateway and the backend server (release mode)
-3. Run baseline → Ferrum → Pingora → Kong → Tyk → KrakenD tests sequentially
+3. Run baseline → Ferrum → Pingora → Kong → Tyk → KrakenD → Envoy tests sequentially
 4. Generate an HTML comparison report in `comparison/results/`
 
 Open `comparison/results/comparison_report.html` in a browser to view the results.
@@ -101,10 +119,13 @@ WRK_DURATION=60s WRK_THREADS=12 WRK_CONNECTIONS=200 ./comparison/run_comparison.
 SKIP_GATEWAYS=tyk,kong ./comparison/run_comparison.sh
 
 # Only test Ferrum vs Pingora (no Docker required)
-SKIP_GATEWAYS=kong,tyk ./comparison/run_comparison.sh
+SKIP_GATEWAYS=kong,tyk,krakend,envoy ./comparison/run_comparison.sh
 
 # Only test Ferrum vs Kong
-SKIP_GATEWAYS=pingora,tyk ./comparison/run_comparison.sh
+SKIP_GATEWAYS=pingora,tyk,krakend,envoy ./comparison/run_comparison.sh
+
+# Only test Ferrum vs Envoy
+SKIP_GATEWAYS=pingora,kong,tyk,krakend ./comparison/run_comparison.sh
 ```
 
 | Variable | Default | Description |
@@ -116,15 +137,16 @@ SKIP_GATEWAYS=pingora,tyk ./comparison/run_comparison.sh
 | `KONG_VERSION` | `3.9` | Kong Docker image tag |
 | `TYK_VERSION` | `v5.7` | Tyk Docker image tag |
 | `KRAKEND_VERSION` | `2.13` | KrakenD Docker image tag |
-| `SKIP_GATEWAYS` | _(empty)_ | Comma-separated gateways to skip: `ferrum`, `pingora`, `kong`, `tyk`, `krakend` |
+| `ENVOY_VERSION` | `1.32-latest` | Envoy Docker image tag |
+| `SKIP_GATEWAYS` | _(empty)_ | Comma-separated gateways to skip: `ferrum`, `pingora`, `kong`, `tyk`, `krakend`, `envoy` |
 
 ## Swapping Gateway Versions
 
 To re-run benchmarks with newer Kong, Tyk, or KrakenD releases:
 
 ```bash
-# Test against Kong 3.10, Tyk v5.8, and KrakenD 2.14
-KONG_VERSION=3.10 TYK_VERSION=v5.8 KRAKEND_VERSION=2.14 ./comparison/run_comparison.sh
+# Test against Kong 3.10, Tyk v5.8, KrakenD 2.14, and Envoy 1.33
+KONG_VERSION=3.10 TYK_VERSION=v5.8 KRAKEND_VERSION=2.14 ENVOY_VERSION=1.33-latest ./comparison/run_comparison.sh
 ```
 
 The script pulls the specified Docker image tags automatically. Results are overwritten in `comparison/results/` — copy or rename the directory if you want to preserve previous runs.
@@ -134,6 +156,7 @@ The script pulls the specified Docker image tags automatically. Results are over
 - **Kong** uses DB-less declarative mode. The config format (`_format_version: "3.0"`) is stable across 3.x releases. If Kong 4.x changes the format, update `comparison/configs/kong.yaml`.
 - **Tyk** uses standalone mode with file-based API definitions. The API definition schema has been stable across v5.x. If Tyk v6 changes it, update the files in `comparison/configs/tyk/apps/`.
 - **KrakenD** uses stateless JSON configuration with `version: 3` format. The config schema has been stable across 2.x releases. If KrakenD 3.x changes it, update the files in `comparison/configs/krakend/`.
+- **Envoy** uses static YAML configuration with `STRICT_DNS` cluster discovery. The config is stable across 1.x releases. If the config format changes, update the files in `comparison/configs/envoy/`.
 - **Ferrum** is built from source in the current checkout, so it always tests the latest local code.
 
 ## Interpreting Results
@@ -169,17 +192,20 @@ Per-gateway comparison of HTTP vs HTTPS vs E2E TLS performance. Shows the RPS dr
 
 ## Initial Findings
 
-The following results were collected on macOS (Apple Silicon) with 8 threads, 100 connections, and 30-second measured runs. Kong and Tyk ran in Docker; Ferrum ran natively.
+The following results were collected on macOS (Apple Silicon) with 8 threads, 100 connections, and 30-second measured runs. Ferrum, Pingora, and Envoy ran natively; Kong, Tyk, and KrakenD ran in Docker.
 
 ### Raw Results
 
 | Gateway | Protocol | /health req/s | /api/users req/s | /health latency | /api/users latency |
 |---------|----------|--------------|-----------------|-----------------|-------------------|
-| **Baseline** (no gateway) | HTTP | 212,899 | 54,777 | 0.38 ms | 1.68 ms |
-| **Baseline** (no gateway) | HTTPS | 198,937 | 53,883 | 0.48 ms | 1.67 ms |
-| **Ferrum** (native) | HTTP | 90,110 | 39,733 | 1.08 ms | 2.43 ms |
-| **Ferrum** (native) | HTTPS | 90,107 | 40,009 | 1.08 ms | 2.41 ms |
-| **Ferrum** (native) | E2E TLS | 81,148 | 39,120 | 1.30 ms | 3.13 ms |
+| **Baseline** (no gateway) | HTTP | 205,221 | 60,164 | 0.42 ms | 1.51 ms |
+| **Baseline** (no gateway) | HTTPS | 196,495 | 55,351 | 0.44 ms | 1.65 ms |
+| **Ferrum** (native) | HTTP | 89,582 | 45,459 | 1.10 ms | 2.09 ms |
+| **Ferrum** (native) | HTTPS | 81,873 | 43,917 | 1.23 ms | 2.16 ms |
+| **Ferrum** (native) | E2E TLS | 75,615 | 43,095 | 1.36 ms | 2.22 ms |
+| **Envoy 1.37** (native) | HTTP | 87,000 | 46,135 | 2.16 ms | 2.07 ms |
+| **Envoy 1.37** (native) | HTTPS | 70,168 | 46,998 | 2.61 ms | 2.09 ms |
+| **Envoy 1.37** (native) | E2E TLS | 66,262 | 36,828 | 2.96 ms | 2.96 ms |
 | **Pingora** (native) | HTTP | 59,429 | 39,016 | 1.65 ms | 2.48 ms |
 | **Pingora** (native) | HTTPS | 63,925 | 39,303 | 1.94 ms | 3.03 ms |
 | **Pingora** (native) | E2E TLS | — | — | — | — |
@@ -197,15 +223,20 @@ The following results were collected on macOS (Apple Silicon) with 8 threads, 10
 
 ### Key-Auth Results (HTTP, /api/users-auth)
 
-Each gateway proxies `/api/users-auth` → backend `/api/users` with API key authentication enabled. A valid API key is sent in the `apikey` header on every request. Pingora is excluded (no auth plugin framework). KrakenD is excluded (key-auth requires Enterprise Edition).
+Each gateway proxies `/api/users-auth` → backend `/api/users` with API key authentication enabled. A valid API key is sent in the `apikey` header on every request. Pingora is excluded (no auth plugin framework). KrakenD is excluded (key-auth requires Enterprise Edition). Envoy uses an inline Lua filter for API key validation.
 
 | Gateway | Key-Auth req/s | No-Auth req/s | Auth Overhead | Latency |
 |---------|---------------|---------------|---------------|---------|
-| **Ferrum** (native) | **40,930** | 39,733 | **~0% (within noise)** | 2.35 ms |
+| **Ferrum** (native) | **44,478** | 46,020 | **~0% (within noise)** | 2.14 ms |
+| **Envoy 1.37** (native, Lua) | 43,912 | 48,273 | -9.0% | 2.19 ms |
 | **Kong 3.9** (Docker) | 19,966 | 22,273 | -10.4% | 4.99 ms |
 | **Tyk v5.7** (Docker) | 15,625 | 22,380 | -30.2% | 6.36 ms |
 
-**Key finding:** Ferrum's key-auth plugin has effectively zero overhead — the O(1) `ConsumerIndex` credential lookup and lock-free hot path mean authentication adds no measurable cost. Kong takes a 10% throughput hit, and Tyk takes a 30% hit for authentication processing.
+**Key findings:**
+- **Ferrum and Envoy key-auth throughput are nearly identical** — 44.5K vs 43.9K req/s (1.3% difference, within noise). Both are high-performance native proxies.
+- **Ferrum's key-auth has effectively zero overhead** — the O(1) `ConsumerIndex` credential lookup and lock-free hot path mean authentication adds no measurable cost vs unauthenticated requests.
+- **Envoy's Lua filter adds ~9% overhead** — dropping from 48K to 44K req/s. The Lua VM execution cost is modest but measurable compared to Ferrum's compiled Rust plugin.
+- Kong takes a 10% throughput hit and Tyk takes a 30% hit for authentication processing (both in Docker, so actual native overhead may differ).
 
 ### Ferrum vs Pingora (Native-to-Native Comparison)
 
@@ -245,17 +276,42 @@ KrakenD is a high-performance, stateless Go-based API gateway. It runs in Docker
 - **KrakenD throughput is flat across protocols** (~17K req/s for HTTP, HTTPS, and E2E TLS), suggesting Docker networking overhead dominates its performance profile on macOS.
 - **KrakenD performs similarly to Kong and Tyk** — all three Docker-based gateways land in the 16–26K req/s range, while native Ferrum delivers 2–5x more throughput.
 
+### Ferrum vs Envoy (Native-to-Native Comparison)
+
+Envoy is a high-performance C++ proxy widely used in service mesh architectures (Istio, Envoy Gateway). Both run as native binaries with minimal configuration (no plugins, no access logging) for a fair baseline proxy comparison.
+
+| Test | Ferrum | Envoy | Advantage |
+|------|--------|-------|-----------|
+| HTTP /health | **89,582** req/s (1.10 ms) | 87,000 req/s (2.16 ms) | Ferrum 3% faster |
+| HTTP /api/users | 45,459 req/s (2.09 ms) | **46,135** req/s (2.07 ms) | Envoy 1% faster (within noise) |
+| HTTPS /health | **81,873** req/s (1.23 ms) | 70,168 req/s (2.61 ms) | **Ferrum 17% faster** |
+| HTTPS /api/users | 43,917 req/s (2.16 ms) | **46,998** req/s (2.09 ms) | Envoy 7% faster |
+| E2E TLS /health | **75,615** req/s (1.36 ms) | 66,262 req/s (2.96 ms) | **Ferrum 14% faster** |
+| E2E TLS /api/users | **43,095** req/s (2.22 ms) | 36,828 req/s (2.96 ms) | **Ferrum 17% faster** |
+
+**Key findings:**
+- **Ferrum and Envoy are closely matched on HTTP throughput** — within 3% on /health and essentially tied on /api/users. Both are high-performance native proxies.
+- **Ferrum has a clear advantage on TLS workloads** — 14–17% faster on HTTPS and E2E TLS /health requests. Ferrum's rustls-based TLS adds less overhead than Envoy's BoringSSL.
+- **Ferrum has consistently lower latency** — 1.1–2.2 ms across all scenarios vs Envoy's 2.1–3.0 ms. Ferrum's lock-free hot path delivers more predictable performance.
+- **Envoy's E2E TLS degrades more** — Envoy drops 20% throughput from HTTP to E2E TLS on /api/users (46K → 37K), while Ferrum drops only 5% (45K → 43K).
+- **Docker was dramatically distorting Envoy's results.** When Envoy ran in Docker, it showed 17–22K req/s — running natively it achieves 37–87K req/s, a **2.5–5x improvement**. This reveals that Docker Desktop on macOS imposes far greater overhead than previously estimated (see [Docker Overhead](#docker-overhead)).
+
 ### Adjusting for Docker Overhead
 
-Kong and Tyk ran in Docker on macOS, which adds ~0.1–0.5 ms latency per request and reduces throughput by ~5–15% (see [Docker Overhead](#docker-overhead)). Even after generously accounting for this:
+> **Important caveat:** Our native Envoy vs Docker Envoy comparison revealed that Docker Desktop on macOS reduces throughput by **60–80%** (not 5–15% as previously estimated). Envoy achieved 87K req/s natively but only 17K req/s in Docker — a 5x difference. This means the Docker-based results for Kong, Tyk, and KrakenD likely understate their true native performance by a similar margin. Take all Docker-based comparisons with a large grain of salt — the only fair comparisons are native-to-native.
 
-| Gateway | /health req/s (adjusted) | Ferrum Advantage |
-|---------|-------------------------|-----------------|
-| **Ferrum** (native) | 90,110 | — |
-| **Pingora** (native) | 59,429 | **1.5x faster** |
-| **Kong** (Docker, +15% adjusted) | ~30,300 | **3.0x faster** |
-| **Tyk** (Docker, +15% adjusted) | ~26,500 | **3.4x faster** |
-| **KrakenD** (Docker, +15% adjusted) | ~20,000 | **4.5x faster** |
+Given the Envoy native-vs-Docker data point, Docker Desktop on macOS appears to impose ~60–80% throughput reduction (not the ~5–15% previously assumed). A conservative 3x adjustment for Docker gateways:
+
+| Gateway | /health req/s (actual) | Estimated native | Ferrum Advantage |
+|---------|----------------------|-----------------|-----------------|
+| **Ferrum** (native) | 89,582 | 89,582 | — |
+| **Envoy** (native) | 87,000 | 87,000 | **3% faster** |
+| **Pingora** (native) | 59,429 | 59,429 | **1.5x faster** |
+| **Kong** (Docker) | 26,380 | ~66,000–79,000 (est.) | Unknown — needs native test |
+| **Tyk** (Docker) | 23,036 | ~58,000–69,000 (est.) | Unknown — needs native test |
+| **KrakenD** (Docker) | 17,418 | ~44,000–52,000 (est.) | Unknown — needs native test |
+
+The Docker-gated gateways (Kong, Tyk, KrakenD) need native benchmarks on Linux to draw meaningful performance conclusions. The previous 15% Docker overhead estimate was based on Docker documentation and theoretical analysis; the Envoy native-vs-Docker comparison shows the real impact on macOS is 5x or more.
 
 ### End-to-End TLS Performance
 
@@ -263,15 +319,15 @@ The E2E TLS scenario (client → HTTPS → gateway → HTTPS → backend) is the
 
 | Gateway | E2E /health req/s | E2E /api/users req/s | E2E /health latency | E2E /api/users latency |
 |---------|------------------|---------------------|--------------------|-----------------------|
-| **Ferrum** (native) | **81,148** | **39,120** | 1.30 ms | 3.13 ms |
+| **Ferrum** (native) | **75,615** | **43,095** | 1.36 ms | 2.22 ms |
+| **Envoy 1.37** (native) | 66,262 | 36,828 | 2.96 ms | 2.96 ms |
 | **Kong 3.9** (Docker) | 23,333 | 22,556 | 4.46 ms | 4.89 ms |
 | **Tyk v5.7** (Docker) | 21,114 | 19,154 | 4.93 ms | 5.41 ms |
 | **KrakenD 2.13** (Docker) | 17,458 | 17,035 | 5.92 ms | 5.80 ms |
 
-- **Ferrum is 3.5x faster than Kong** on E2E TLS /health
-- **Ferrum is 4.6x faster than KrakenD** on E2E TLS /health
-- **Ferrum is 1.7x faster than Kong** on E2E TLS /api/users
-- **Ferrum is 2x faster than Tyk** on E2E TLS /api/users
+- **Ferrum is 14% faster than Envoy** on E2E TLS /health (native-to-native)
+- **Ferrum is 17% faster than Envoy** on E2E TLS /api/users (native-to-native)
+- Docker-based results (Kong, Tyk, KrakenD) are not directly comparable — see [Docker Overhead](#docker-overhead) caveat
 
 ### TLS Overhead by Gateway
 
@@ -283,24 +339,25 @@ How much does each layer of encryption cost each gateway?
 | **Pingora** | +8% RPS (noise/scheduling) | N/A (SNI limitation) |
 | **Kong** | -22% RPS on /health | **-12% RPS, +0.78 ms** |
 | **Tyk** | -4% RPS | **-8% RPS, +0.71 ms** |
+| **Envoy** (native) | -19% RPS on /health | **-20% RPS on /api/users, +0.89 ms** |
 
 Ferrum's TLS termination has essentially **zero throughput cost** — HTTP and HTTPS both deliver ~90K req/s on /health. E2E TLS adds only 10% overhead. All gateways handle TLS more efficiently with proper connection pooling configured.
 
 ### Key Takeaways
 
 - **Ferrum is 41–52% faster than Pingora** on lightweight requests (the fairest native-to-native comparison), and leads on all endpoints including heavier payloads.
-- **Ferrum is 3–5x faster than Kong, Tyk, and KrakenD** on pure proxy throughput, even after giving Docker gateways a generous 15% adjustment.
-- **Ferrum's TLS implementation is the most efficient** — effectively zero overhead for TLS termination (HTTP and HTTPS deliver the same throughput), compared to Kong's 22% drop.
+- **Envoy is the closest competitor to Ferrum** — running native-to-native, Envoy nearly matches Ferrum on HTTP throughput (87K vs 90K req/s) and even edges ahead on some /api/users tests. However, Ferrum pulls ahead by 14–17% on TLS-heavy workloads.
+- **Ferrum's TLS implementation is more efficient** — Ferrum drops only 5% throughput from HTTP to E2E TLS, while Envoy drops 20%. Ferrum's rustls-based TLS adds less overhead than Envoy's BoringSSL.
+- **Docker Desktop on macOS imposes massive overhead (60–80% throughput loss).** The Envoy native-vs-Docker comparison (87K native vs 17K Docker = 5x difference) proves that the previously assumed 5–15% Docker overhead was vastly understated. Kong, Tyk, and KrakenD results are likely similarly distorted — their true native performance could be 3–5x higher than measured.
+- **Docker-based comparisons are unreliable for performance conclusions.** Kong, Tyk, and KrakenD all cluster around 17–26K req/s in Docker, but this likely reflects Docker's throughput ceiling more than the gateways' actual capabilities. Run on Linux with native installs for meaningful comparisons.
 - **Ferrum's key-auth has zero measurable overhead** — authenticated requests run at the same speed as unauthenticated ones, thanks to O(1) credential lookup via pre-computed ConsumerIndex. Kong takes a 10% hit, Tyk takes a 30% hit for authentication.
 - **Ferrum uniquely supports E2E TLS with IP-based backends** — Pingora cannot test E2E TLS due to its SNI limitation.
-- **Docker overhead accounts for at most ~0.5 ms of the latency gap.** Ferrum's latency advantage over Kong is ~2.6 ms (HTTP) to ~3.6 ms (E2E TLS) — the vast majority is real gateway overhead, not Docker artifact.
-- **Kong, Tyk, and KrakenD perform comparably** when all run in Docker — all three land in the 19–26K req/s range, suggesting Docker networking overhead on macOS is a significant equalizer. Kong edges ahead slightly on /health, while KrakenD and Tyk are more consistent across protocols.
 
 For the most apples-to-apples comparison, run on Linux where all gateways can be installed natively.
 
 ## Adding a New Gateway
 
-To add a new gateway (e.g., Envoy, NGINX, Traefik):
+To add a new gateway (e.g., NGINX, Traefik, HAProxy):
 
 1. **Create config files** in `comparison/configs/` for the gateway
 2. **Add functions** to `run_comparison.sh`:
@@ -315,20 +372,31 @@ Each test function should follow the pattern: start → run_wrk (per endpoint) �
 
 ## Docker Overhead
 
+> **Measured impact: 60–80% throughput reduction on macOS.** Running Envoy natively vs in Docker on the same machine showed 87K req/s native vs 17K req/s Docker — a **5x throughput difference**. This is far worse than the 5–15% often cited in Docker documentation.
+
 When a gateway runs in Docker instead of natively, there is measurable overhead that affects benchmark results. The amount varies by platform:
 
-| Platform | Networking Mode | Added Latency | Throughput Impact | Notes |
-|----------|----------------|---------------|-------------------|-------|
-| **Linux** | `--network host` | < 5 μs | < 1% | Negligible; containers share the host network stack |
-| **Linux** | port mapping (`-p`) | ~10–50 μs | ~2–5% | Userspace proxy adds a small hop |
-| **macOS** | port mapping (`-p`) | ~0.1–0.5 ms | ~5–15% | Docker Desktop runs in a Linux VM; each packet crosses the VM boundary + userspace networking |
+| Platform | Networking Mode | Estimated Throughput Impact | Measured Impact (Envoy) | Notes |
+|----------|----------------|---------------------------|------------------------|-------|
+| **Linux** | `--network host` | < 1% | Not yet measured | Negligible; containers share the host network stack |
+| **Linux** | port mapping (`-p`) | ~2–5% | Not yet measured | Userspace proxy adds a small hop |
+| **macOS** | port mapping (`-p`) | **60–80%** | **5x throughput loss** | Docker Desktop runs in a Linux VM; VM boundary + userspace networking + CPU scheduling variance |
 
-**On macOS**, Docker overhead is the most significant. Docker Desktop 4.19+ improved this with the gVisor TCP/IP stack (5x faster than the older vpnkit), but the VM boundary remains. CPU scheduling variance is also ~9.5x higher in the VM compared to native.
+**On macOS**, Docker overhead is dramatically worse than commonly believed. Our Envoy native-vs-Docker comparison provides hard evidence:
 
-**To minimize Docker overhead:**
-1. On Linux, install Kong and Tyk natively via package managers (see Prerequisites above)
-2. On Linux with Docker, `--network host` is used automatically (negligible overhead)
-3. On macOS, no native Kong, Tyk, or KrakenD binaries exist — Docker overhead is unavoidable. Interpret results with the overhead estimates above in mind
+| Envoy Test | Native (req/s) | Docker (req/s) | Docker Penalty |
+|------------|----------------|----------------|----------------|
+| HTTP /health | 87,000 | 17,258 | **-80%** |
+| HTTP /api/users | 46,135 | 18,799 | **-59%** |
+| HTTPS /health | 70,168 | 21,666 | **-69%** |
+| E2E TLS /api/users | 36,828 | 15,841 | **-57%** |
+
+This means **all Docker-based benchmark results (Kong, Tyk, KrakenD) likely understate true performance by 3–5x.** The previous ~5–15% Docker overhead estimate was incorrect for high-throughput workloads on macOS.
+
+**To get meaningful comparisons:**
+1. **Best**: Run on Linux where all gateways can be installed natively or use `--network host`
+2. On macOS, install gateways natively when possible (`brew install envoy`, native Kong via package manager)
+3. On macOS with Docker, treat results as a rough lower bound — do not draw performance conclusions from Docker-gated results
 
 The HTML report's "Methodology & Caveats" section notes which gateways ran natively vs in Docker.
 
@@ -345,6 +413,8 @@ The HTML report's "Methodology & Caveats" section notes which gateways ran nativ
 - **Tyk on macOS:** No native macOS binary exists, so Tyk always runs in Docker on macOS. On Linux, Tyk can be installed natively via packagecloud (adding native Tyk support to this script is a welcome contribution).
 
 - **KrakenD key-auth is Enterprise-only:** The `auth/api-keys` plugin requires KrakenD Enterprise Edition. KrakenD CE supports JWT validation, but we exclude KrakenD from key-auth benchmarks for consistency (all other gateways use header-based API key auth). KrakenD always runs in Docker.
+
+- **Envoy runs with no plugins:** Envoy is tested as a bare reverse proxy with no filters beyond the HTTP router. It runs natively if `envoy` is on `$PATH` (e.g., `brew install envoy` on macOS), otherwise falls back to Docker. When running in Docker on macOS, the `dns_lookup_family: V4_ONLY` setting is required in cluster config because Docker Desktop's `host.docker.internal` resolves to an IPv6 address that the host backend doesn't bind to.
 
 ## File Structure
 
@@ -375,10 +445,15 @@ comparison/
 │   │       ├── health_api.json
 │   │       ├── users_api.json
 │   │       └── users_auth_api.json
-│   └── krakend/
-│       ├── krakend_http.json          # KrakenD config (HTTP backend, no-op encoding)
-│       ├── krakend_https.json         # KrakenD config (HTTPS listener, HTTP backend)
-│       └── krakend_e2e_tls.json       # KrakenD config (HTTPS listener, HTTPS backend)
+│   ├── krakend/
+│   │   ├── krakend_http.json          # KrakenD config (HTTP backend, no-op encoding)
+│   │   ├── krakend_https.json         # KrakenD config (HTTPS listener, HTTP backend)
+│   │   └── krakend_e2e_tls.json       # KrakenD config (HTTPS listener, HTTPS backend)
+│   └── envoy/
+│       ├── envoy_http.yaml            # Envoy config (HTTP proxy, plaintext backend)
+│       ├── envoy_https.yaml           # Envoy config (HTTPS listener, plaintext backend)
+│       ├── envoy_e2e_tls.yaml         # Envoy config (HTTPS listener, HTTPS backend)
+│       └── envoy_key_auth.yaml        # Envoy config (HTTP proxy, Lua key-auth filter)
 ├── lua/
 │   ├── comparison_test.lua            # Unified wrk Lua script
 │   └── comparison_test_key_auth.lua   # wrk script with API key header

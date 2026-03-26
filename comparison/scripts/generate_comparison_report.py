@@ -103,7 +103,7 @@ def _latency_to_ms(s):
 # Result file discovery
 # ---------------------------------------------------------------------------
 
-GATEWAYS = ["baseline", "ferrum", "pingora", "kong", "tyk", "krakend"]
+GATEWAYS = ["baseline", "ferrum", "pingora", "kong", "tyk", "krakend", "envoy"]
 PROTOCOLS = ["http", "https", "e2e_tls"]
 ENDPOINTS = ["health", "users"]
 
@@ -114,12 +114,14 @@ def _gateway_labels(meta):
     kong_ver = meta.get("kong_version", "")
     tyk_ver = meta.get("tyk_version", "")
     krakend_ver = meta.get("krakend_version", "")
+    envoy_ver = meta.get("envoy_version", "")
     return {
         "baseline": "Direct Backend",
         "ferrum": "Ferrum Gateway (native)",
         "kong": f"Kong Gateway ({'native' if kong_native else 'Docker'})" if not kong_ver else f"Kong ({kong_ver})",
         "tyk": f"Tyk ({tyk_ver})" if tyk_ver else "Tyk Gateway (Docker)",
         "krakend": f"KrakenD ({krakend_ver})" if krakend_ver else "KrakenD (Docker)",
+        "envoy": f"Envoy ({envoy_ver})" if envoy_ver else "Envoy Proxy (Docker)",
     }
 
 
@@ -461,7 +463,7 @@ def generate_report(results_dir, output_path, meta=None):
 <div class="container">
 <div class="header">
   <h1>API Gateway Comparison Report</h1>
-  <p>Ferrum Gateway vs Kong vs Tyk vs KrakenD &mdash; Performance Benchmark</p>
+  <p>Ferrum Gateway vs Kong vs Tyk vs KrakenD vs Envoy &mdash; Performance Benchmark</p>
   <p style="font-size:0.85em; opacity:0.7;">{now}</p>
 </div>
 
@@ -473,6 +475,7 @@ def generate_report(results_dir, output_path, meta=None):
   Kong: {meta.get('kong_version', 'N/A')} &bull;
   Tyk: {meta.get('tyk_version', 'N/A')} &bull;
   KrakenD: {meta.get('krakend_version', 'N/A')} &bull;
+  Envoy: {meta.get('envoy_version', 'N/A')} &bull;
   OS: {meta.get('os', 'N/A')}
 </div>
 
@@ -537,6 +540,7 @@ def generate_report(results_dir, output_path, meta=None):
     <li><strong>Kong</strong> runs {"natively on the host (installed via package manager) — no container overhead." if meta.get("kong_native") else "inside a Docker container. On <strong>macOS</strong>, Docker Desktop runs containers in a Linux VM with userspace networking, which adds <strong>~0.1–0.5 ms per round-trip</strong> (port-mapped) plus higher CPU scheduling variance (~9.5x). On <strong>Linux</strong> with <code>--network host</code>, Docker overhead is negligible (&lt;5 &micro;s). To eliminate this overhead on Linux, install Kong natively via the official apt/yum packages."}</li>
     <li><strong>Tyk</strong> runs inside a Docker container (no official macOS binary; Linux-only native packages available via <a href="https://tyk.io/docs/apim/open-source/installation">packagecloud</a>). The same Docker overhead caveats as Kong apply. Additionally, Tyk requires Redis which also runs in a container.</li>
     <li><strong>KrakenD</strong> runs inside a Docker container (Go-based, stateless gateway). The same Docker overhead caveats apply. KrakenD is configured with <code>no-op</code> encoding for raw response pass-through, matching the minimal-overhead proxy behavior of other gateways. Key-auth benchmarks are excluded because API key authentication requires KrakenD Enterprise Edition.</li>
+    <li><strong>Envoy Proxy</strong> runs inside a Docker container (C++-based, high-performance proxy). The same Docker overhead caveats apply. Envoy is configured as a minimal HTTP reverse proxy with static route configuration, no access logging, and connection pooling defaults. Key-auth benchmarks are excluded as Envoy&rsquo;s ext_authz filter requires an external authorization service.</li>
     <li><strong>HTTPS tests</strong> measure TLS termination at the gateway (client &rarr; HTTPS &rarr; gateway &rarr; HTTP &rarr; backend). <strong>E2E TLS tests</strong> measure full encryption (client &rarr; HTTPS &rarr; gateway &rarr; HTTPS &rarr; backend), the most secure pattern.</li>
     <li>All gateways run sequentially (one at a time) to avoid resource contention on the host.</li>
     <li>Each test includes a {meta.get("duration", "30s")} measured run preceded by a warm-up phase (results discarded).</li>
