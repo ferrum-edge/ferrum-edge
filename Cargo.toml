@@ -79,6 +79,7 @@ socket2 = { version = "0.6.3", features = ["all"] }
 sha2 = "0.10.9"
 hmac = "0.12.1"
 hex = "0.4"
+x509-parser = "0.16"
 
 # DTLS (secure UDP)
 webrtc-dtls = { package = "dtls", version = "0.17.1", features = ["pem"] }

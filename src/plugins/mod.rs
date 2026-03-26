@@ -10,6 +10,7 @@ pub mod ip_restriction;
 pub mod jwks_store;
 pub mod jwt_auth;
 pub mod key_auth;
+pub mod mtls_auth;
 pub mod oauth2_auth;
 pub mod otel_tracing;
 pub mod prometheus_metrics;
@@ -85,6 +86,10 @@ pub struct RequestContext {
     pub timestamp_received: DateTime<Utc>,
     /// Extra metadata plugins can attach
     pub metadata: HashMap<String, String>,
+    /// DER-encoded client certificate from mTLS handshake (first cert in chain).
+    /// Populated when the connection used TLS with client certificate verification.
+    /// Shared via Arc to avoid cloning cert bytes for each request on HTTP/2 connections.
+    pub tls_client_cert_der: Option<Arc<Vec<u8>>>,
 }
 
 impl RequestContext {
@@ -99,6 +104,7 @@ impl RequestContext {
             identified_consumer: None,
             timestamp_received: Utc::now(),
             metadata: HashMap::new(),
+            tls_client_cert_der: None,
         }
     }
 }
@@ -190,7 +196,7 @@ pub struct StreamTransactionSummary {
 /// | Band    | Range       | Purpose                                      | Plugins                          |
 /// |---------|-------------|----------------------------------------------|----------------------------------|
 /// | Early   | 0–999       | Pre-processing: CORS preflight               | cors (100)                       |
-/// | AuthN   | 1000–1999   | Authentication: identity verification         | oauth2 (1000), jwt (1100), key (1200), basic (1300) |
+/// | AuthN   | 950–1999    | Authentication: identity verification         | mtls (950), oauth2 (1000), jwt (1100), key (1200), basic (1300) |
 /// | AuthZ   | 2000–2999   | Authorization & post-auth enforcement         | access_control (2000), rate_limiting (2900) |
 /// | Transform | 3000–3999 | Request transformation before backend         | request_transformer (3000)       |
 /// | Response | 4000–4999  | Response transformation after backend         | response_transformer (4000)      |
@@ -203,6 +209,7 @@ pub mod priority {
     pub const CORS: u16 = 100;
     pub const IP_RESTRICTION: u16 = 150;
     pub const BOT_DETECTION: u16 = 200;
+    pub const MTLS_AUTH: u16 = 950;
     pub const OAUTH2_AUTH: u16 = 1000;
     pub const JWT_AUTH: u16 = 1100;
     pub const KEY_AUTH: u16 = 1200;
@@ -393,6 +400,7 @@ pub fn create_plugin_with_http_client(
         "key_auth" => Ok(Some(Arc::new(key_auth::KeyAuth::new(config)))),
         "basic_auth" => Ok(Some(Arc::new(basic_auth::BasicAuth::new(config)))),
         "hmac_auth" => Ok(Some(Arc::new(hmac_auth::HmacAuth::new(config)))),
+        "mtls_auth" => Ok(Some(Arc::new(mtls_auth::MtlsAuth::new(config)))),
         "cors" => Ok(Some(Arc::new(cors::CorsPlugin::new(config)))),
         "access_control" => Ok(Some(Arc::new(access_control::AccessControl::new(config)?))),
         "ip_restriction" => Ok(Some(Arc::new(ip_restriction::IpRestriction::new(config)?))),
@@ -439,6 +447,7 @@ pub fn is_security_plugin(name: &str) -> bool {
             | "jwt_auth"
             | "hmac_auth"
             | "oauth2_auth"
+            | "mtls_auth"
             | "access_control"
             | "ip_restriction"
     )
@@ -454,6 +463,7 @@ pub fn available_plugins() -> Vec<&'static str> {
         "key_auth",
         "basic_auth",
         "hmac_auth",
+        "mtls_auth",
         "cors",
         "access_control",
         "ip_restriction",

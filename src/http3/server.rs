@@ -162,16 +162,30 @@ async fn handle_h3_connection(
     let remote_addr = connection.remote_address();
     debug!("HTTP/3 connection established from {}", remote_addr);
 
+    // Extract peer certificate from the QUIC connection (mTLS).
+    // Quinn returns peer_identity() as Box<dyn Any> containing Vec<rustls::pki_types::CertificateDer>.
+    // Arc-shared so multiplexed streams avoid per-request cert cloning.
+    let client_cert_der: Option<Arc<Vec<u8>>> = connection
+        .peer_identity()
+        .and_then(|identity| {
+            identity
+                .downcast::<Vec<rustls::pki_types::CertificateDer<'static>>>()
+                .ok()
+        })
+        .and_then(|certs| certs.first().map(|cert| Arc::new(cert.to_vec())));
+
     let mut h3_conn = h3::server::Connection::new(h3_quinn::Connection::new(connection)).await?;
 
     loop {
         match h3_conn.accept().await {
             Ok(Some(resolver)) => {
                 let state = state.clone();
+                let cert = client_cert_der.clone();
                 tokio::spawn(async move {
                     match resolver.resolve_request().await {
                         Ok((req, stream)) => {
-                            if let Err(e) = handle_h3_request(req, stream, state, remote_addr).await
+                            if let Err(e) =
+                                handle_h3_request(req, stream, state, remote_addr, cert).await
                             {
                                 error!("HTTP/3 request error: {}", e);
                             }
@@ -202,6 +216,7 @@ async fn handle_h3_request(
     mut stream: RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
     state: ProxyState,
     remote_addr: SocketAddr,
+    tls_client_cert_der: Option<Arc<Vec<u8>>>,
 ) -> Result<(), anyhow::Error> {
     let start_time = std::time::Instant::now();
 
@@ -213,6 +228,7 @@ async fn handle_h3_request(
 
     // Build request context (client_ip resolved below after headers are parsed)
     let mut ctx = RequestContext::new(socket_ip.clone(), method.clone(), path.clone());
+    ctx.tls_client_cert_der = tls_client_cert_der;
 
     // Validate and extract headers with size limits
     let mut total_header_size: usize = 0;

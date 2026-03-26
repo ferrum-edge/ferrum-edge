@@ -987,6 +987,7 @@ dependencies = [
  "webpki-roots 0.26.11",
  "webrtc-util",
  "wiremock",
+ "x509-parser",
 ]
 
 [[package]]

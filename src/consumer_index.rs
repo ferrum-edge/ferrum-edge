@@ -15,6 +15,8 @@ pub struct ConsumerIndex {
     keyauth_index: ArcSwap<HashMap<String, Arc<Consumer>>>,
     basic_index: ArcSwap<HashMap<String, Arc<Consumer>>>,
     identity_index: ArcSwap<HashMap<String, Arc<Consumer>>>,
+    /// mTLS identity index: maps `mtls_auth.identity` → Consumer for O(1) cert-based auth.
+    mtls_index: ArcSwap<HashMap<String, Arc<Consumer>>>,
     /// Full consumer list for plugins that need iteration (jwt_auth, oauth2_auth)
     all_consumers: ArcSwap<Vec<Arc<Consumer>>>,
 }
@@ -23,6 +25,7 @@ struct IndexMaps {
     keyauth: HashMap<String, Arc<Consumer>>,
     basic: HashMap<String, Arc<Consumer>>,
     identity: HashMap<String, Arc<Consumer>>,
+    mtls: HashMap<String, Arc<Consumer>>,
     all: Vec<Arc<Consumer>>,
 }
 
@@ -34,6 +37,7 @@ impl ConsumerIndex {
             keyauth_index: ArcSwap::new(Arc::new(maps.keyauth)),
             basic_index: ArcSwap::new(Arc::new(maps.basic)),
             identity_index: ArcSwap::new(Arc::new(maps.identity)),
+            mtls_index: ArcSwap::new(Arc::new(maps.mtls)),
             all_consumers: ArcSwap::new(Arc::new(maps.all)),
         }
     }
@@ -44,6 +48,7 @@ impl ConsumerIndex {
         self.keyauth_index.store(Arc::new(maps.keyauth));
         self.basic_index.store(Arc::new(maps.basic));
         self.identity_index.store(Arc::new(maps.identity));
+        self.mtls_index.store(Arc::new(maps.mtls));
         self.all_consumers.store(Arc::new(maps.all));
     }
 
@@ -62,6 +67,12 @@ impl ConsumerIndex {
     /// O(1) lookup by username or ID (for jwt_auth/oauth2_auth claim matching). No allocation.
     pub fn find_by_identity(&self, identity: &str) -> Option<Arc<Consumer>> {
         let idx = self.identity_index.load();
+        idx.get(identity).cloned()
+    }
+
+    /// O(1) lookup by mTLS identity (for mtls_auth plugin). No allocation.
+    pub fn find_by_mtls_identity(&self, identity: &str) -> Option<Arc<Consumer>> {
+        let idx = self.mtls_index.load();
         idx.get(identity).cloned()
     }
 
@@ -85,6 +96,7 @@ impl ConsumerIndex {
         let mut keyauth = self.keyauth_index.load().as_ref().clone();
         let mut basic = self.basic_index.load().as_ref().clone();
         let mut identity = self.identity_index.load().as_ref().clone();
+        let mut mtls = self.mtls_index.load().as_ref().clone();
         let mut all: Vec<Arc<Consumer>> = self.all_consumers.load().as_ref().clone();
 
         // Collect all IDs that need removal (deleted + modified consumers being re-inserted)
@@ -101,6 +113,7 @@ impl ConsumerIndex {
             let mut old_keyauth_keys: Vec<String> = Vec::new();
             let mut old_basic_keys: Vec<String> = Vec::new();
             let mut old_identity_keys: Vec<String> = Vec::new();
+            let mut old_mtls_keys: Vec<String> = Vec::new();
 
             for consumer in all.iter() {
                 if !ids_to_remove.contains(consumer.id.as_str()) {
@@ -115,6 +128,12 @@ impl ConsumerIndex {
                 // Collect old basicauth username
                 if consumer.credentials.contains_key("basicauth") {
                     old_basic_keys.push(consumer.username.clone());
+                }
+                // Collect old mtls_auth identity
+                if let Some(mtls_creds) = consumer.credentials.get("mtls_auth")
+                    && let Some(id) = mtls_creds.get("identity").and_then(|s| s.as_str())
+                {
+                    old_mtls_keys.push(id.to_string());
                 }
                 // Collect old identity keys (username, id, custom_id)
                 old_identity_keys.push(consumer.username.clone());
@@ -147,6 +166,13 @@ impl ConsumerIndex {
                     identity.remove(key);
                 }
             }
+            for key in &old_mtls_keys {
+                if let Some(existing) = mtls.get(key)
+                    && ids_to_remove.contains(existing.id.as_str())
+                {
+                    mtls.remove(key);
+                }
+            }
 
             // Remove from all-consumers list (single pass with HashSet lookup)
             all.retain(|c| !ids_to_remove.contains(c.id.as_str()));
@@ -168,6 +194,12 @@ impl ConsumerIndex {
             if consumer.credentials.contains_key("basicauth") {
                 basic.insert(consumer.username.clone(), Arc::clone(&arc_consumer));
             }
+            // Index by mTLS identity if consumer has mtls_auth credentials
+            if let Some(mtls_creds) = consumer.credentials.get("mtls_auth")
+                && let Some(id) = mtls_creds.get("identity").and_then(|s| s.as_str())
+            {
+                mtls.insert(id.to_string(), Arc::clone(&arc_consumer));
+            }
             identity.insert(consumer.username.clone(), Arc::clone(&arc_consumer));
             identity.insert(consumer.id.clone(), Arc::clone(&arc_consumer));
             if let Some(ref custom_id) = consumer.custom_id {
@@ -179,6 +211,7 @@ impl ConsumerIndex {
         self.keyauth_index.store(Arc::new(keyauth));
         self.basic_index.store(Arc::new(basic));
         self.identity_index.store(Arc::new(identity));
+        self.mtls_index.store(Arc::new(mtls));
         self.all_consumers.store(Arc::new(all));
     }
 
@@ -199,6 +232,7 @@ impl ConsumerIndex {
     fn build_index(consumers: &[Consumer]) -> IndexMaps {
         let mut keyauth = HashMap::with_capacity(consumers.len());
         let mut basic = HashMap::with_capacity(consumers.len());
+        let mut mtls = HashMap::with_capacity(consumers.len());
         // identity has up to 3 entries per consumer (username, id, custom_id)
         let mut identity = HashMap::with_capacity(consumers.len() * 3);
         let mut all = Vec::with_capacity(consumers.len());
@@ -231,6 +265,19 @@ impl ConsumerIndex {
                 }
             }
 
+            // Index by mTLS identity (mtls_auth credential)
+            if let Some(mtls_creds) = consumer.credentials.get("mtls_auth")
+                && let Some(id) = mtls_creds.get("identity").and_then(|s| s.as_str())
+            {
+                let prev = mtls.insert(id.to_string(), Arc::clone(&arc_consumer));
+                if let Some(existing) = prev {
+                    warn!(
+                        "Credential collision: mtls_auth identity '{}' for consumer '{}' overwrites consumer '{}'",
+                        id, consumer.id, existing.id
+                    );
+                }
+            }
+
             // Index by username and id (for jwt/oauth2 claim matching)
             let prev = identity.insert(consumer.username.clone(), Arc::clone(&arc_consumer));
             if let Some(existing) = prev {
@@ -259,6 +306,7 @@ impl ConsumerIndex {
             keyauth,
             basic,
             identity,
+            mtls,
             all,
         }
     }
