@@ -182,6 +182,48 @@ fn start_gateway_in_file_mode(
     Ok(child)
 }
 
+/// Start an HTTP server that identifies itself but delays its response.
+/// This keeps connections alive long enough for least-connections to see non-zero counts.
+async fn start_slow_identifying_server(port: u16, name: &'static str, delay_ms: u64) {
+    let listener = TcpListener::bind(format!("127.0.0.1:{}", port))
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "Failed to bind slow identifying server {} on port {}",
+                name, port
+            )
+        });
+
+    loop {
+        if let Ok((mut stream, _)) = listener.accept().await {
+            let server_name = name;
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 4096];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..n]).to_string();
+
+                let path = request
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap_or("/");
+
+                // Delay before responding so connections stay open
+                sleep(Duration::from_millis(delay_ms)).await;
+
+                let body = format!(r#"{{"server":"{}","path":"{}"}}"#, server_name, path);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            });
+        }
+    }
+}
+
 /// Parse the "server" field from a JSON response body.
 fn parse_server_name(body: &str) -> String {
     serde_json::from_str::<serde_json::Value>(body)
@@ -1775,4 +1817,582 @@ plugin_configs: []
     s1.abort();
     s2.abort();
     s3.abort();
+}
+
+// ============================================================================
+// Test: Least Connections Load Balancing
+// ============================================================================
+
+#[ignore]
+#[tokio::test]
+async fn test_least_connections_load_balancing() {
+    let temp_dir = TempDir::new().expect("Failed to create temp directory");
+    let config_path = temp_dir.path().join("config.yaml");
+
+    let config = r#"
+proxies:
+  - id: "lb-lc-proxy"
+    listen_path: "/lc"
+    backend_protocol: http
+    backend_host: "127.0.0.1"
+    backend_port: 30201
+    strip_listen_path: true
+    upstream_id: "upstream-lc"
+
+upstreams:
+  - id: "upstream-lc"
+    name: "Least Connections Upstream"
+    algorithm: least_connections
+    targets:
+      - host: "127.0.0.1"
+        port: 30201
+        weight: 1
+      - host: "127.0.0.1"
+        port: 30202
+        weight: 1
+      - host: "127.0.0.1"
+        port: 30203
+        weight: 1
+
+consumers: []
+plugin_configs: []
+"#;
+
+    std::fs::File::create(&config_path)
+        .unwrap()
+        .write_all(config.as_bytes())
+        .unwrap();
+
+    // Use slow servers (200ms delay) so concurrent connections stay open
+    // long enough for LC to see non-zero active connection counts.
+    let s1 = tokio::spawn(start_slow_identifying_server(30201, "lc-server1", 200));
+    let s2 = tokio::spawn(start_slow_identifying_server(30202, "lc-server2", 200));
+    let s3 = tokio::spawn(start_slow_identifying_server(30203, "lc-server3", 200));
+    sleep(Duration::from_millis(500)).await;
+
+    let gateway = start_gateway_in_file_mode(config_path.to_str().unwrap(), 28200);
+    sleep(Duration::from_secs(3)).await;
+
+    let client = reqwest::Client::new();
+
+    // Send 30 requests in concurrent batches of 6.
+    // The 200ms server delay ensures connections overlap, giving LC real
+    // connection counts to differentiate targets.
+    let mut all_bodies: Vec<String> = Vec::new();
+    for batch in 0..5 {
+        let mut handles = Vec::new();
+        for i in 0..6 {
+            let c = client.clone();
+            let idx = batch * 6 + i;
+            handles.push(tokio::spawn(async move {
+                let resp = c
+                    .get(format!("http://127.0.0.1:28200/lc/test-{}", idx))
+                    .send()
+                    .await;
+                match resp {
+                    Ok(r) => {
+                        assert!(
+                            r.status().is_success(),
+                            "Request {} failed with {}",
+                            idx,
+                            r.status()
+                        );
+                        r.text().await.unwrap_or_default()
+                    }
+                    Err(e) => panic!("Request {} failed: {}", idx, e),
+                }
+            }));
+        }
+        for h in handles {
+            all_bodies.push(h.await.unwrap());
+        }
+    }
+
+    let mut counts: HashMap<String, u32> = HashMap::new();
+    for body in &all_bodies {
+        let server = parse_server_name(body);
+        if !server.is_empty() {
+            *counts.entry(server).or_insert(0) += 1;
+        }
+    }
+
+    println!("Least connections distribution: {:?}", counts);
+
+    // All 3 servers should receive traffic
+    assert!(
+        counts.len() == 3,
+        "Expected traffic to 3 servers, got {:?}",
+        counts
+    );
+
+    // Each server should get some traffic (LC distributes to least-loaded)
+    for (server, count) in &counts {
+        assert!(
+            *count >= 3 && *count <= 20,
+            "Server {} got {} requests — expected LC to spread across all targets (3-20 of 30)",
+            server,
+            count
+        );
+    }
+
+    if let Ok(mut proc) = gateway {
+        let _ = proc.kill();
+    }
+    s1.abort();
+    s2.abort();
+    s3.abort();
+}
+
+// ============================================================================
+// Test: Random Load Balancing
+// ============================================================================
+
+#[ignore]
+#[tokio::test]
+async fn test_random_load_balancing() {
+    let temp_dir = TempDir::new().expect("Failed to create temp directory");
+    let config_path = temp_dir.path().join("config.yaml");
+
+    let config = r#"
+proxies:
+  - id: "lb-rand-proxy"
+    listen_path: "/rand"
+    backend_protocol: http
+    backend_host: "127.0.0.1"
+    backend_port: 30211
+    strip_listen_path: true
+    upstream_id: "upstream-rand"
+
+upstreams:
+  - id: "upstream-rand"
+    name: "Random Upstream"
+    algorithm: random
+    targets:
+      - host: "127.0.0.1"
+        port: 30211
+        weight: 1
+      - host: "127.0.0.1"
+        port: 30212
+        weight: 1
+      - host: "127.0.0.1"
+        port: 30213
+        weight: 1
+
+consumers: []
+plugin_configs: []
+"#;
+
+    std::fs::File::create(&config_path)
+        .unwrap()
+        .write_all(config.as_bytes())
+        .unwrap();
+
+    let s1 = tokio::spawn(start_identifying_server(30211, "rand-server1"));
+    let s2 = tokio::spawn(start_identifying_server(30212, "rand-server2"));
+    let s3 = tokio::spawn(start_identifying_server(30213, "rand-server3"));
+    sleep(Duration::from_millis(500)).await;
+
+    let gateway = start_gateway_in_file_mode(config_path.to_str().unwrap(), 28201);
+    sleep(Duration::from_secs(3)).await;
+
+    let client = reqwest::Client::new();
+    let mut counts: HashMap<String, u32> = HashMap::new();
+
+    // Send 90 requests to get a meaningful distribution sample
+    for i in 0..90 {
+        let resp = client
+            .get(format!("http://127.0.0.1:28201/rand/test-{}", i))
+            .send()
+            .await;
+
+        match resp {
+            Ok(r) => {
+                assert!(
+                    r.status().is_success(),
+                    "Request {} failed with {}",
+                    i,
+                    r.status()
+                );
+                let body = r.text().await.unwrap_or_default();
+                let server = parse_server_name(&body);
+                if !server.is_empty() {
+                    *counts.entry(server).or_insert(0) += 1;
+                }
+            }
+            Err(e) => panic!("Request {} failed: {}", i, e),
+        }
+    }
+
+    println!("Random distribution: {:?}", counts);
+
+    // All 3 servers should receive some traffic
+    assert!(
+        counts.len() == 3,
+        "Expected traffic to all 3 servers with random distribution, got {:?}",
+        counts
+    );
+
+    // With 90 requests across 3 targets, each should get at least some requests.
+    // Statistical guarantee: P(any server gets 0 of 90) is vanishingly small.
+    for (server, count) in &counts {
+        assert!(
+            *count >= 5,
+            "Server {} got only {} requests — random distribution should spread across all targets",
+            server,
+            count
+        );
+    }
+
+    if let Ok(mut proc) = gateway {
+        let _ = proc.kill();
+    }
+    s1.abort();
+    s2.abort();
+    s3.abort();
+}
+
+// ============================================================================
+// Test: Active Health Check with TCP Probes
+// ============================================================================
+
+#[ignore]
+#[tokio::test]
+async fn test_active_health_check_tcp_probe() {
+    let temp_dir = TempDir::new().expect("Failed to create temp directory");
+    let config_path = temp_dir.path().join("config.yaml");
+
+    // Server on 30221 is healthy (TCP-accepting), server on 30222 has nothing listening.
+    // TCP probe should detect 30222 as unhealthy (connection refused).
+    let config = r#"
+proxies:
+  - id: "lb-tcp-probe-proxy"
+    listen_path: "/tcp-probe"
+    backend_protocol: http
+    backend_host: "127.0.0.1"
+    backend_port: 30221
+    strip_listen_path: true
+    upstream_id: "upstream-tcp-probe"
+
+upstreams:
+  - id: "upstream-tcp-probe"
+    name: "TCP Probe Upstream"
+    algorithm: round_robin
+    targets:
+      - host: "127.0.0.1"
+        port: 30221
+        weight: 1
+      - host: "127.0.0.1"
+        port: 30222
+        weight: 1
+    health_checks:
+      active:
+        probe_type: tcp
+        interval_seconds: 1
+        timeout_ms: 1000
+        healthy_threshold: 1
+        unhealthy_threshold: 2
+
+consumers: []
+plugin_configs: []
+"#;
+
+    std::fs::File::create(&config_path)
+        .unwrap()
+        .write_all(config.as_bytes())
+        .unwrap();
+
+    // Only start server on 30221; port 30222 has nothing listening (TCP probe fails)
+    let s1 = tokio::spawn(start_identifying_server(30221, "tcp-healthy"));
+    sleep(Duration::from_millis(500)).await;
+
+    let gateway = start_gateway_in_file_mode(config_path.to_str().unwrap(), 28202);
+    // Wait for TCP health checks to detect unreachable target
+    sleep(Duration::from_secs(5)).await;
+
+    let client = reqwest::Client::new();
+    let mut counts: HashMap<String, u32> = HashMap::new();
+
+    // All traffic should go to tcp-healthy since tcp probe marks 30222 unhealthy
+    for i in 0..20 {
+        let resp = client
+            .get(format!("http://127.0.0.1:28202/tcp-probe/test-{}", i))
+            .send()
+            .await;
+
+        match resp {
+            Ok(r) => {
+                let body = r.text().await.unwrap_or_default();
+                let server = parse_server_name(&body);
+                if !server.is_empty() {
+                    *counts.entry(server).or_insert(0) += 1;
+                }
+            }
+            Err(e) => panic!("Request {} failed: {}", i, e),
+        }
+    }
+
+    println!("TCP probe health check distribution: {:?}", counts);
+
+    assert_eq!(
+        counts.get("tcp-healthy").copied().unwrap_or(0),
+        20,
+        "All 20 requests should go to tcp-healthy, got {:?}",
+        counts
+    );
+
+    if let Ok(mut proc) = gateway {
+        let _ = proc.kill();
+    }
+    s1.abort();
+}
+
+// ============================================================================
+// Test: Passive Health Check Recovery Timer (healthy_after_seconds)
+// ============================================================================
+
+#[ignore]
+#[tokio::test]
+async fn test_passive_health_check_recovery_timer() {
+    let temp_dir = TempDir::new().expect("Failed to create temp directory");
+    let config_path = temp_dir.path().join("config.yaml");
+
+    // Configure passive health check with a short recovery timer.
+    // One server returns 500s initially then recovers, the other is always healthy.
+    // After the recovery timer fires, the flapping server should be restored.
+    let config = r#"
+proxies:
+  - id: "lb-recovery-timer-proxy"
+    listen_path: "/recovery-timer"
+    backend_protocol: http
+    backend_host: "127.0.0.1"
+    backend_port: 30231
+    strip_listen_path: true
+    upstream_id: "upstream-recovery-timer"
+
+upstreams:
+  - id: "upstream-recovery-timer"
+    name: "Recovery Timer Upstream"
+    algorithm: round_robin
+    targets:
+      - host: "127.0.0.1"
+        port: 30231
+        weight: 1
+      - host: "127.0.0.1"
+        port: 30232
+        weight: 1
+    health_checks:
+      passive:
+        unhealthy_status_codes: [500, 502, 503]
+        unhealthy_threshold: 3
+        unhealthy_window_seconds: 60
+        healthy_after_seconds: 4
+
+consumers: []
+plugin_configs: []
+"#;
+
+    std::fs::File::create(&config_path)
+        .unwrap()
+        .write_all(config.as_bytes())
+        .unwrap();
+
+    // Server 1 is always healthy. Server 2 fails first 10 requests then recovers.
+    let s1 = tokio::spawn(start_identifying_server(30231, "stable-server"));
+    let s2 = tokio::spawn(start_flapping_server(30232, "flapping-server", 10));
+    sleep(Duration::from_millis(500)).await;
+
+    let gateway = start_gateway_in_file_mode(config_path.to_str().unwrap(), 28203);
+    sleep(Duration::from_secs(3)).await;
+
+    let client = reqwest::Client::new();
+
+    // Phase 1: Send requests to trigger passive health check marking server2 unhealthy
+    for i in 0..10 {
+        let _ = client
+            .get(format!(
+                "http://127.0.0.1:28203/recovery-timer/warmup-{}",
+                i
+            ))
+            .send()
+            .await;
+    }
+    sleep(Duration::from_millis(500)).await;
+
+    // Phase 2: Verify bad server is excluded (most traffic to stable-server)
+    let mut phase2_counts: HashMap<String, u32> = HashMap::new();
+    for i in 0..10 {
+        let resp = client
+            .get(format!(
+                "http://127.0.0.1:28203/recovery-timer/phase2-{}",
+                i
+            ))
+            .send()
+            .await;
+
+        if let Ok(r) = resp {
+            let body = r.text().await.unwrap_or_default();
+            let server = parse_server_name(&body);
+            if !server.is_empty() {
+                *phase2_counts.entry(server).or_insert(0) += 1;
+            }
+        }
+    }
+
+    println!("Phase 2 (after marking unhealthy): {:?}", phase2_counts);
+    let stable_phase2 = phase2_counts.get("stable-server").copied().unwrap_or(0);
+    assert!(
+        stable_phase2 >= 8,
+        "At least 8/10 requests should go to stable-server while flapping is marked unhealthy, got {}",
+        stable_phase2
+    );
+
+    // Phase 3: Wait for the recovery timer (healthy_after_seconds=4, check interval=1s)
+    sleep(Duration::from_secs(6)).await;
+
+    // Phase 4: After recovery timer fires, flapping-server (now returning 200s)
+    // should be back in rotation and receive traffic
+    let mut phase4_counts: HashMap<String, u32> = HashMap::new();
+    for i in 0..20 {
+        let resp = client
+            .get(format!(
+                "http://127.0.0.1:28203/recovery-timer/phase4-{}",
+                i
+            ))
+            .send()
+            .await;
+
+        if let Ok(r) = resp {
+            let body = r.text().await.unwrap_or_default();
+            let server = parse_server_name(&body);
+            if !server.is_empty() {
+                *phase4_counts.entry(server).or_insert(0) += 1;
+            }
+        }
+    }
+
+    println!("Phase 4 (after recovery timer): {:?}", phase4_counts);
+
+    // Both servers should receive traffic after recovery
+    assert!(
+        phase4_counts.len() == 2,
+        "Both servers should get traffic after recovery timer, got {:?}",
+        phase4_counts
+    );
+    assert!(
+        phase4_counts.get("flapping-server").copied().unwrap_or(0) > 0,
+        "flapping-server should get traffic after recovery timer restores it"
+    );
+
+    if let Ok(mut proc) = gateway {
+        let _ = proc.kill();
+    }
+    s1.abort();
+    s2.abort();
+}
+
+// ============================================================================
+// Test: Active Health Check with Custom Status Codes
+// ============================================================================
+
+#[ignore]
+#[tokio::test]
+async fn test_active_health_check_custom_status_codes() {
+    let temp_dir = TempDir::new().expect("Failed to create temp directory");
+    let config_path = temp_dir.path().join("config.yaml");
+
+    // Configure active health checks that accept 200 AND 503 as "healthy".
+    // Server on 30241 returns 200 (healthy), server on 30242 returns 503.
+    // Because 503 is in healthy_status_codes, BOTH servers should stay healthy.
+    let config = r#"
+proxies:
+  - id: "lb-custom-codes-proxy"
+    listen_path: "/custom-codes"
+    backend_protocol: http
+    backend_host: "127.0.0.1"
+    backend_port: 30241
+    strip_listen_path: true
+    upstream_id: "upstream-custom-codes"
+
+upstreams:
+  - id: "upstream-custom-codes"
+    name: "Custom Status Codes Upstream"
+    algorithm: round_robin
+    targets:
+      - host: "127.0.0.1"
+        port: 30241
+        weight: 1
+      - host: "127.0.0.1"
+        port: 30242
+        weight: 1
+    health_checks:
+      active:
+        http_path: "/health"
+        interval_seconds: 1
+        timeout_ms: 2000
+        healthy_threshold: 1
+        unhealthy_threshold: 2
+        healthy_status_codes: [200, 503]
+
+consumers: []
+plugin_configs: []
+"#;
+
+    std::fs::File::create(&config_path)
+        .unwrap()
+        .write_all(config.as_bytes())
+        .unwrap();
+
+    // Server 1 returns 200, server 2 returns 503 — but 503 is in healthy_status_codes
+    let s1 = tokio::spawn(start_identifying_server(30241, "ok-server"));
+    let s2 = tokio::spawn(start_status_server(30242, "maint-server", 503));
+    sleep(Duration::from_millis(500)).await;
+
+    let gateway = start_gateway_in_file_mode(config_path.to_str().unwrap(), 28204);
+    // Wait for health checks to run — both should pass
+    sleep(Duration::from_secs(5)).await;
+
+    let client = reqwest::Client::new();
+    let mut counts: HashMap<String, u32> = HashMap::new();
+
+    // Both servers should be considered healthy since 503 is in the allowed list
+    for i in 0..20 {
+        let resp = client
+            .get(format!("http://127.0.0.1:28204/custom-codes/test-{}", i))
+            .send()
+            .await;
+
+        match resp {
+            Ok(r) => {
+                let body = r.text().await.unwrap_or_default();
+                let server = parse_server_name(&body);
+                if !server.is_empty() {
+                    *counts.entry(server).or_insert(0) += 1;
+                }
+            }
+            Err(e) => panic!("Request {} failed: {}", i, e),
+        }
+    }
+
+    println!("Custom status codes distribution: {:?}", counts);
+
+    // Both servers should receive traffic since 503 is acceptable
+    assert!(
+        counts.len() == 2,
+        "Both servers should get traffic (503 is in healthy_status_codes), got {:?}",
+        counts
+    );
+    assert!(
+        counts.get("ok-server").copied().unwrap_or(0) > 0,
+        "ok-server should get traffic"
+    );
+    assert!(
+        counts.get("maint-server").copied().unwrap_or(0) > 0,
+        "maint-server should get traffic (503 is in healthy codes)"
+    );
+
+    if let Ok(mut proc) = gateway {
+        let _ = proc.kill();
+    }
+    s1.abort();
+    s2.abort();
 }
