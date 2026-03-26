@@ -80,6 +80,13 @@ pub struct EnvConfig {
     // File mode
     pub file_config_path: Option<String>,
 
+    /// Path to an externally provided backup config file (JSON). When set in
+    /// database mode and the database is unreachable at startup, the gateway
+    /// loads config from this file so pods can restart with stale config while
+    /// the database recovers. The file is expected to be provisioned externally
+    /// (e.g. via ConfigMap, PersistentVolume, or sidecar export).
+    pub db_config_backup_path: Option<String>,
+
     // CP/DP
     pub cp_grpc_listen_addr: Option<String>,
     pub cp_grpc_jwt_secret: Option<String>,
@@ -221,6 +228,7 @@ impl Default for EnvConfig {
             db_ssl_client_cert: None,
             db_ssl_client_key: None,
             file_config_path: None,
+            db_config_backup_path: None,
             cp_grpc_listen_addr: None,
             cp_grpc_jwt_secret: None,
             dp_cp_grpc_url: None,
@@ -308,6 +316,7 @@ impl EnvConfig {
             db_ssl_client_key: env::var("FERRUM_DB_SSL_CLIENT_KEY").ok(),
 
             file_config_path: env::var("FERRUM_FILE_CONFIG_PATH").ok(),
+            db_config_backup_path: env::var("FERRUM_DB_CONFIG_BACKUP_PATH").ok(),
 
             cp_grpc_listen_addr: env::var("FERRUM_CP_GRPC_LISTEN_ADDR").ok(),
             cp_grpc_jwt_secret: env::var("FERRUM_CP_GRPC_JWT_SECRET").ok(),

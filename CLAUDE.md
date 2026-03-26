@@ -283,6 +283,7 @@ Reduce per-request allocations in plugin lookup
 | `FERRUM_FILE_CONFIG_PATH` | (required for file mode) | Path to YAML/JSON config file |
 | `FERRUM_DB_TYPE` | (required for db mode) | `postgres`, `mysql`, `sqlite` |
 | `FERRUM_DB_URL` | (required for db mode) | Database connection URL |
+| `FERRUM_DB_CONFIG_BACKUP_PATH` | (none) | Path to externally provided JSON config backup for startup failover when DB is unreachable |
 | `FERRUM_CP_GRPC_LISTEN_ADDR` | `0.0.0.0:50051` | CP gRPC server listen address |
 | `FERRUM_DP_CP_GRPC_URL` | (required for dp mode) | CP gRPC URL for DP to connect to |
 | `FERRUM_BACKEND_TLS_NO_VERIFY` | `false` | Skip backend TLS verification (testing only) |

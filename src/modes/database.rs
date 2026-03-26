@@ -9,6 +9,7 @@ use chrono::{DateTime, Utc};
 use crate::admin::jwt_auth::create_jwt_manager_from_env;
 use crate::admin::{self, AdminState};
 use crate::config::EnvConfig;
+use crate::config::config_backup::load_config_backup;
 use crate::config::db_loader::DatabaseStore;
 use crate::dns::{DnsCache, DnsConfig};
 use crate::proxy::{self, ProxyState};
@@ -32,13 +33,47 @@ pub async fn run(
     )
     .await?;
 
-    // Load initial config
-    let config = db.load_full_config().await?;
-    info!(
-        "Database mode: loaded {} proxies, {} consumers",
-        config.proxies.len(),
-        config.consumers.len()
-    );
+    // Load initial config from database, falling back to backup file if configured
+    let backup_path = env_config.db_config_backup_path.clone();
+    let config = match db.load_full_config().await {
+        Ok(cfg) => {
+            info!(
+                "Database mode: loaded {} proxies, {} consumers",
+                cfg.proxies.len(),
+                cfg.consumers.len()
+            );
+            cfg
+        }
+        Err(e) => {
+            // Database unreachable — try backup file for pod restart resilience
+            if let Some(ref path) = backup_path {
+                warn!(
+                    "Database load failed ({}), attempting backup file: {}",
+                    e, path
+                );
+                match load_config_backup(path) {
+                    Some(cfg) => {
+                        warn!(
+                            "Starting with backup config ({} proxies, {} consumers). \
+                             Database polling will retry and update when DB recovers.",
+                            cfg.proxies.len(),
+                            cfg.consumers.len()
+                        );
+                        cfg
+                    }
+                    None => {
+                        return Err(anyhow::anyhow!(
+                            "Database load failed and no usable backup at {}: {}",
+                            path,
+                            e
+                        ));
+                    }
+                }
+            } else {
+                return Err(e);
+            }
+        }
+    };
 
     // DNS cache
     let dns_cache = DnsCache::new(DnsConfig {

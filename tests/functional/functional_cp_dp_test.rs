@@ -62,6 +62,7 @@ fn create_test_env_config() -> EnvConfig {
         db_ssl_client_cert: None,
         db_ssl_client_key: None,
         file_config_path: Some("/tmp/test-config.json".into()),
+        db_config_backup_path: None,
         cp_grpc_listen_addr: Some("127.0.0.1:50054".into()),
         cp_grpc_jwt_secret: Some(GRPC_JWT_SECRET.into()),
         dp_cp_grpc_url: None,

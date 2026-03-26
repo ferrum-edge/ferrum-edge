@@ -70,6 +70,7 @@ fn create_test_env_config() -> ferrum_gateway::config::EnvConfig {
         db_ssl_client_cert: None,
         db_ssl_client_key: None,
         file_config_path: None,
+        db_config_backup_path: None,
         cp_grpc_listen_addr: None,
         cp_grpc_jwt_secret: None,
         dp_cp_grpc_url: None,
