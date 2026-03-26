@@ -47,6 +47,8 @@ tags:
     description: Manage plugin configurations
   - name: Upstreams
     description: Manage upstream groups for load-balanced backends
+  - name: Batch
+    description: Bulk resource creation for high-throughput provisioning
 
 paths:
   # ── Health ──────────────────────────────────────────────────────────
@@ -118,13 +120,75 @@ paths:
         "401":
           $ref: "#/components/responses/Unauthorized"
 
+  # ── Batch ────────────────────────────────────────────────────────────
+  /batch:
+    post:
+      operationId: batchCreate
+      summary: Batch create resources
+      description: |
+        Creates multiple resources in a single request. Each resource type is
+        persisted in a single database transaction, dramatically improving
+        throughput compared to individual create calls.
+
+        Resources are created in dependency order: consumers and upstreams
+        first, then proxies, then plugin configs. This ensures referential
+        integrity when plugins reference proxy IDs or consumer usernames.
+
+        All fields within each resource follow the same schema as the
+        individual create endpoints. IDs are auto-generated if omitted.
+      tags: [Batch]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BatchCreateRequest"
+      responses:
+        "201":
+          description: All resources created successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BatchCreateResponse"
+        "207":
+          description: Partial success — some resource types failed
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/BatchCreateResponse"
+                  - type: object
+                    properties:
+                      errors:
+                        type: array
+                        items:
+                          type: string
+                        description: Error messages for failed resource types
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/ReadOnly"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
   # ── Proxies ─────────────────────────────────────────────────────────
   /proxies:
     get:
       operationId: listProxies
       summary: List all proxies
-      description: Falls back to cached config when the database is unavailable.
+      description: |
+        Falls back to cached config when the database is unavailable.
+
+        When `limit` or `offset` query parameters are provided, the response
+        is wrapped in a paginated envelope with `data` and `pagination` fields.
+        Without pagination parameters, a plain JSON array is returned for
+        backward compatibility.
       tags: [Proxies]
+      parameters:
+        - $ref: "#/components/parameters/PaginationOffset"
+        - $ref: "#/components/parameters/PaginationLimit"
       responses:
         "200":
           description: Array of proxy objects
@@ -259,7 +323,14 @@ paths:
     get:
       operationId: listConsumers
       summary: List all consumers
+      description: |
+        When `limit` or `offset` query parameters are provided, the response
+        is wrapped in a paginated envelope. Without them, a plain JSON array
+        is returned for backward compatibility.
       tags: [Consumers]
+      parameters:
+        - $ref: "#/components/parameters/PaginationOffset"
+        - $ref: "#/components/parameters/PaginationLimit"
       responses:
         "200":
           description: Array of consumer objects
@@ -490,7 +561,14 @@ paths:
     get:
       operationId: listPluginConfigs
       summary: List all plugin configurations
+      description: |
+        When `limit` or `offset` query parameters are provided, the response
+        is wrapped in a paginated envelope. Without them, a plain JSON array
+        is returned for backward compatibility.
       tags: [Plugins]
+      parameters:
+        - $ref: "#/components/parameters/PaginationOffset"
+        - $ref: "#/components/parameters/PaginationLimit"
       responses:
         "200":
           description: Array of plugin configurations
@@ -606,7 +684,14 @@ paths:
     get:
       operationId: listUpstreams
       summary: List all upstreams
+      description: |
+        When `limit` or `offset` query parameters are provided, the response
+        is wrapped in a paginated envelope. Without them, a plain JSON array
+        is returned for backward compatibility.
       tags: [Upstreams]
+      parameters:
+        - $ref: "#/components/parameters/PaginationOffset"
+        - $ref: "#/components/parameters/PaginationLimit"
       responses:
         "200":
           description: Array of upstream objects
@@ -732,6 +817,33 @@ components:
       schema:
         type: string
       description: Resource UUID
+
+    PaginationOffset:
+      name: offset
+      in: query
+      required: false
+      schema:
+        type: integer
+        minimum: 0
+        default: 0
+      description: |
+        Number of items to skip. When provided (along with or without `limit`),
+        the response switches from a plain JSON array to a paginated envelope
+        containing `data` and `pagination` fields.
+
+    PaginationLimit:
+      name: limit
+      in: query
+      required: false
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 1000
+        default: 100
+      description: |
+        Maximum number of items to return (max 1000). When provided (along with
+        or without `offset`), the response switches from a plain JSON array to
+        a paginated envelope containing `data` and `pagination` fields.
 
   # ── Reusable headers ───────────────────────────────────────────────
   headers:
@@ -1436,3 +1548,76 @@ components:
           additionalProperties:
             type: integer
           description: Map of HTTP status code to count in the last second
+
+    # ── Pagination envelope ────────────────────────────────────────────
+    Pagination:
+      type: object
+      description: |
+        Pagination metadata returned when `limit` or `offset` query parameters
+        are provided on a list endpoint. Without these parameters, list endpoints
+        return a plain JSON array for backward compatibility.
+      required: [offset, limit, total]
+      properties:
+        offset:
+          type: integer
+          description: Number of items skipped
+        limit:
+          type: integer
+          description: Maximum items per page
+        total:
+          type: integer
+          description: Total number of items in the collection (before pagination)
+
+    # ── Batch ──────────────────────────────────────────────────────────
+    BatchCreateRequest:
+      type: object
+      description: |
+        Batch create request. All fields are optional — include only the
+        resource types you want to create.
+      properties:
+        proxies:
+          type: array
+          items:
+            $ref: "#/components/schemas/ProxyCreate"
+          description: Proxies to create
+        consumers:
+          type: array
+          items:
+            $ref: "#/components/schemas/ConsumerCreate"
+          description: Consumers to create
+        plugin_configs:
+          type: array
+          items:
+            $ref: "#/components/schemas/PluginConfigCreate"
+          description: Plugin configurations to create
+        upstreams:
+          type: array
+          items:
+            $ref: "#/components/schemas/Upstream"
+          description: Upstreams to create
+
+    BatchCreateResponse:
+      type: object
+      required: [created]
+      properties:
+        created:
+          type: object
+          required: [proxies, consumers, plugin_configs, upstreams]
+          properties:
+            proxies:
+              type: integer
+              description: Number of proxies created
+            consumers:
+              type: integer
+              description: Number of consumers created
+            plugin_configs:
+              type: integer
+              description: Number of plugin configs created
+            upstreams:
+              type: integer
+              description: Number of upstreams created
+        errors:
+          type: array
+          items:
+            type: string
+          description: Present only on 207 Multi-Status; lists per-type error messages

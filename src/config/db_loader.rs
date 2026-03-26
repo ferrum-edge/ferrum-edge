@@ -1058,23 +1058,54 @@ impl DatabaseStore {
             .filter_map(|r| r.try_get::<String, _>("id").ok())
             .collect();
 
-        let assoc_rows: Vec<AnyRow> =
-            sqlx::query("SELECT proxy_id, plugin_config_id FROM proxy_plugins")
-                .fetch_all(&self.pool)
-                .await
-                .unwrap_or_default();
-
         let mut plugins_by_proxy: std::collections::HashMap<String, Vec<PluginAssociation>> =
             std::collections::HashMap::new();
-        for r in &assoc_rows {
-            if let Ok(proxy_id) = r.try_get::<String, _>("proxy_id")
-                && changed_ids.contains(&proxy_id)
-                && let Ok(plugin_config_id) = r.try_get::<String, _>("plugin_config_id")
-            {
-                plugins_by_proxy
-                    .entry(proxy_id)
-                    .or_default()
-                    .push(PluginAssociation { plugin_config_id });
+
+        if !changed_ids.is_empty() {
+            let changed_id_list: Vec<&str> = changed_ids.iter().map(|s| s.as_str()).collect();
+
+            let assoc_rows: Vec<AnyRow> = if changed_id_list.len() > 100 {
+                // Too many IDs for an IN clause — fetch all and filter in memory
+                let all_rows: Vec<AnyRow> =
+                    sqlx::query("SELECT proxy_id, plugin_config_id FROM proxy_plugins")
+                        .fetch_all(&self.pool)
+                        .await
+                        .unwrap_or_default();
+                all_rows
+                    .into_iter()
+                    .filter(|r| {
+                        r.try_get::<String, _>("proxy_id")
+                            .map(|id| changed_ids.contains(&id))
+                            .unwrap_or(false)
+                    })
+                    .collect()
+            } else {
+                // Build parameterized IN clause for targeted fetch
+                let placeholders: String = changed_id_list
+                    .iter()
+                    .map(|_| "?")
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let sql = self.q(&format!(
+                    "SELECT proxy_id, plugin_config_id FROM proxy_plugins WHERE proxy_id IN ({})",
+                    placeholders
+                ));
+                let mut query = sqlx::query(&sql);
+                for id in &changed_id_list {
+                    query = query.bind(*id);
+                }
+                query.fetch_all(&self.pool).await.unwrap_or_default()
+            };
+
+            for r in &assoc_rows {
+                if let Ok(proxy_id) = r.try_get::<String, _>("proxy_id")
+                    && let Ok(plugin_config_id) = r.try_get::<String, _>("plugin_config_id")
+                {
+                    plugins_by_proxy
+                        .entry(proxy_id)
+                        .or_default()
+                        .push(PluginAssociation { plugin_config_id });
+                }
             }
         }
 
@@ -1169,6 +1200,206 @@ impl DatabaseStore {
             .collect();
         let upstream_ids: HashSet<String> = config.upstreams.iter().map(|u| u.id.clone()).collect();
         (proxy_ids, consumer_ids, plugin_config_ids, upstream_ids)
+    }
+
+    /// Batch-create multiple proxies in a single transaction.
+    pub async fn batch_create_proxies(&self, proxies: &[Proxy]) -> Result<usize, anyhow::Error> {
+        if proxies.is_empty() {
+            return Ok(0);
+        }
+        let mut tx = self.pool.begin().await?;
+        let insert_sql = self.q("INSERT INTO proxies (id, name, listen_path, backend_protocol, backend_host, backend_port, backend_path, strip_listen_path, preserve_host_header, backend_connect_timeout_ms, backend_read_timeout_ms, backend_write_timeout_ms, backend_tls_client_cert_path, backend_tls_client_key_path, backend_tls_verify_server_cert, backend_tls_server_ca_cert_path, dns_override, dns_cache_ttl_seconds, auth_mode, upstream_id, circuit_breaker, retry, response_body_mode, pool_max_idle_per_host, pool_idle_timeout_seconds, pool_enable_http_keep_alive, pool_enable_http2, pool_tcp_keepalive_seconds, pool_http2_keep_alive_interval_seconds, pool_http2_keep_alive_timeout_seconds, listen_port, frontend_tls, udp_idle_timeout_seconds, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+        let assoc_sql =
+            self.q("INSERT INTO proxy_plugins (proxy_id, plugin_config_id) VALUES (?, ?)");
+
+        for proxy in proxies {
+            let circuit_breaker_json = proxy
+                .circuit_breaker
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()?;
+            let retry_json = proxy
+                .retry
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()?;
+            let response_body_mode_str = match proxy.response_body_mode {
+                ResponseBodyMode::Buffer => "buffer",
+                ResponseBodyMode::Stream => "stream",
+            };
+
+            sqlx::query(&insert_sql)
+                .bind(&proxy.id)
+                .bind(&proxy.name)
+                .bind(&proxy.listen_path)
+                .bind(proxy.backend_protocol.to_string())
+                .bind(&proxy.backend_host)
+                .bind(proxy.backend_port as i32)
+                .bind(&proxy.backend_path)
+                .bind(if proxy.strip_listen_path { 1i32 } else { 0 })
+                .bind(if proxy.preserve_host_header { 1i32 } else { 0 })
+                .bind(proxy.backend_connect_timeout_ms as i64)
+                .bind(proxy.backend_read_timeout_ms as i64)
+                .bind(proxy.backend_write_timeout_ms as i64)
+                .bind(&proxy.backend_tls_client_cert_path)
+                .bind(&proxy.backend_tls_client_key_path)
+                .bind(if proxy.backend_tls_verify_server_cert {
+                    1i32
+                } else {
+                    0
+                })
+                .bind(&proxy.backend_tls_server_ca_cert_path)
+                .bind(&proxy.dns_override)
+                .bind(proxy.dns_cache_ttl_seconds.map(|v| v as i64))
+                .bind(match proxy.auth_mode {
+                    AuthMode::Multi => "multi",
+                    _ => "single",
+                })
+                .bind(&proxy.upstream_id)
+                .bind(&circuit_breaker_json)
+                .bind(&retry_json)
+                .bind(response_body_mode_str)
+                .bind(proxy.pool_max_idle_per_host.map(|v| v as i64))
+                .bind(proxy.pool_idle_timeout_seconds.map(|v| v as i64))
+                .bind(
+                    proxy
+                        .pool_enable_http_keep_alive
+                        .map(|v| if v { 1i32 } else { 0 }),
+                )
+                .bind(proxy.pool_enable_http2.map(|v| if v { 1i32 } else { 0 }))
+                .bind(proxy.pool_tcp_keepalive_seconds.map(|v| v as i64))
+                .bind(
+                    proxy
+                        .pool_http2_keep_alive_interval_seconds
+                        .map(|v| v as i64),
+                )
+                .bind(
+                    proxy
+                        .pool_http2_keep_alive_timeout_seconds
+                        .map(|v| v as i64),
+                )
+                .bind(proxy.listen_port.map(|v| v as i32))
+                .bind(if proxy.frontend_tls { 1i32 } else { 0 })
+                .bind(proxy.udp_idle_timeout_seconds as i64)
+                .bind(proxy.created_at.to_rfc3339())
+                .bind(proxy.updated_at.to_rfc3339())
+                .execute(&mut *tx)
+                .await?;
+
+            for assoc in &proxy.plugins {
+                sqlx::query(&assoc_sql)
+                    .bind(&proxy.id)
+                    .bind(&assoc.plugin_config_id)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+        }
+
+        let count = proxies.len();
+        tx.commit().await?;
+        Ok(count)
+    }
+
+    /// Batch-create multiple consumers in a single transaction.
+    pub async fn batch_create_consumers(
+        &self,
+        consumers: &[Consumer],
+    ) -> Result<usize, anyhow::Error> {
+        if consumers.is_empty() {
+            return Ok(0);
+        }
+        let mut tx = self.pool.begin().await?;
+        let sql = self.q("INSERT INTO consumers (id, username, custom_id, credentials, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)");
+
+        for consumer in consumers {
+            let creds_json = serde_json::to_string(&consumer.credentials)?;
+            sqlx::query(&sql)
+                .bind(&consumer.id)
+                .bind(&consumer.username)
+                .bind(&consumer.custom_id)
+                .bind(&creds_json)
+                .bind(consumer.created_at.to_rfc3339())
+                .bind(consumer.updated_at.to_rfc3339())
+                .execute(&mut *tx)
+                .await?;
+        }
+
+        let count = consumers.len();
+        tx.commit().await?;
+        Ok(count)
+    }
+
+    /// Batch-create multiple plugin configs in a single transaction.
+    pub async fn batch_create_plugin_configs(
+        &self,
+        configs: &[PluginConfig],
+    ) -> Result<usize, anyhow::Error> {
+        if configs.is_empty() {
+            return Ok(0);
+        }
+        let mut tx = self.pool.begin().await?;
+        let sql = self.q("INSERT INTO plugin_configs (id, plugin_name, config, scope, proxy_id, enabled, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
+
+        for pc in configs {
+            let config_json = serde_json::to_string(&pc.config)?;
+            let scope_str = match pc.scope {
+                PluginScope::Proxy => "proxy",
+                PluginScope::Global => "global",
+            };
+            sqlx::query(&sql)
+                .bind(&pc.id)
+                .bind(&pc.plugin_name)
+                .bind(&config_json)
+                .bind(scope_str)
+                .bind(&pc.proxy_id)
+                .bind(if pc.enabled { 1i32 } else { 0 })
+                .bind(pc.created_at.to_rfc3339())
+                .bind(pc.updated_at.to_rfc3339())
+                .execute(&mut *tx)
+                .await?;
+        }
+
+        let count = configs.len();
+        tx.commit().await?;
+        Ok(count)
+    }
+
+    /// Batch-create multiple upstreams in a single transaction.
+    pub async fn batch_create_upstreams(
+        &self,
+        upstreams: &[Upstream],
+    ) -> Result<usize, anyhow::Error> {
+        if upstreams.is_empty() {
+            return Ok(0);
+        }
+        let mut tx = self.pool.begin().await?;
+        let sql = self.q("INSERT INTO upstreams (id, name, targets, algorithm, hash_on, health_checks, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
+
+        for upstream in upstreams {
+            let targets_json = serde_json::to_string(&upstream.targets)?;
+            let algo_json = serde_json::to_string(&upstream.algorithm)?;
+            let algo_str = algo_json.trim_matches('"');
+            let health_checks_json = upstream
+                .health_checks
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()?;
+            sqlx::query(&sql)
+                .bind(&upstream.id)
+                .bind(&upstream.name)
+                .bind(&targets_json)
+                .bind(algo_str)
+                .bind(&upstream.hash_on)
+                .bind(&health_checks_json)
+                .bind(upstream.created_at.to_rfc3339())
+                .bind(upstream.updated_at.to_rfc3339())
+                .execute(&mut *tx)
+                .await?;
+        }
+
+        let count = upstreams.len();
+        tx.commit().await?;
+        Ok(count)
     }
 
     pub fn pool(&self) -> &AnyPool {

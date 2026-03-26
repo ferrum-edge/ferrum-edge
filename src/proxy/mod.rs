@@ -488,41 +488,74 @@ impl ProxyState {
                 .retain(|u| !removed.contains(u.id.as_str()));
         }
 
-        // Upsert added/modified resources (replace existing by ID, or append new)
-        for proxy in &result.added_or_modified_proxies {
-            if let Some(existing) = new_config.proxies.iter_mut().find(|p| p.id == proxy.id) {
-                *existing = proxy.clone();
-            } else {
-                new_config.proxies.push(proxy.clone());
+        // Upsert added/modified resources using HashMap index for O(1) lookups
+        // instead of O(n) linear scan per resource. Move values to avoid cloning.
+
+        if !result.added_or_modified_proxies.is_empty() {
+            let mut idx: std::collections::HashMap<String, usize> = new_config
+                .proxies
+                .iter()
+                .enumerate()
+                .map(|(i, p)| (p.id.clone(), i))
+                .collect();
+            for proxy in result.added_or_modified_proxies {
+                if let Some(&pos) = idx.get(&proxy.id) {
+                    new_config.proxies[pos] = proxy;
+                } else {
+                    idx.insert(proxy.id.clone(), new_config.proxies.len());
+                    new_config.proxies.push(proxy);
+                }
             }
         }
-        for consumer in &result.added_or_modified_consumers {
-            if let Some(existing) = new_config
+
+        if !result.added_or_modified_consumers.is_empty() {
+            let mut idx: std::collections::HashMap<String, usize> = new_config
                 .consumers
-                .iter_mut()
-                .find(|c| c.id == consumer.id)
-            {
-                *existing = consumer.clone();
-            } else {
-                new_config.consumers.push(consumer.clone());
+                .iter()
+                .enumerate()
+                .map(|(i, c)| (c.id.clone(), i))
+                .collect();
+            for consumer in result.added_or_modified_consumers {
+                if let Some(&pos) = idx.get(&consumer.id) {
+                    new_config.consumers[pos] = consumer;
+                } else {
+                    idx.insert(consumer.id.clone(), new_config.consumers.len());
+                    new_config.consumers.push(consumer);
+                }
             }
         }
-        for pc in &result.added_or_modified_plugin_configs {
-            if let Some(existing) = new_config.plugin_configs.iter_mut().find(|p| p.id == pc.id) {
-                *existing = pc.clone();
-            } else {
-                new_config.plugin_configs.push(pc.clone());
+
+        if !result.added_or_modified_plugin_configs.is_empty() {
+            let mut idx: std::collections::HashMap<String, usize> = new_config
+                .plugin_configs
+                .iter()
+                .enumerate()
+                .map(|(i, pc)| (pc.id.clone(), i))
+                .collect();
+            for pc in result.added_or_modified_plugin_configs {
+                if let Some(&pos) = idx.get(&pc.id) {
+                    new_config.plugin_configs[pos] = pc;
+                } else {
+                    idx.insert(pc.id.clone(), new_config.plugin_configs.len());
+                    new_config.plugin_configs.push(pc);
+                }
             }
         }
-        for upstream in &result.added_or_modified_upstreams {
-            if let Some(existing) = new_config
+
+        if !result.added_or_modified_upstreams.is_empty() {
+            let mut idx: std::collections::HashMap<String, usize> = new_config
                 .upstreams
-                .iter_mut()
-                .find(|u| u.id == upstream.id)
-            {
-                *existing = upstream.clone();
-            } else {
-                new_config.upstreams.push(upstream.clone());
+                .iter()
+                .enumerate()
+                .map(|(i, u)| (u.id.clone(), i))
+                .collect();
+            for upstream in result.added_or_modified_upstreams {
+                if let Some(&pos) = idx.get(&upstream.id) {
+                    new_config.upstreams[pos] = upstream;
+                } else {
+                    idx.insert(upstream.id.clone(), new_config.upstreams.len());
+                    new_config.upstreams.push(upstream);
+                }
             }
         }
 

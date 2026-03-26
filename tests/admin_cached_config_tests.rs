@@ -580,3 +580,315 @@ async fn test_cached_config_reflects_live_updates() {
         "Updated cached config should be reflected immediately"
     );
 }
+
+// ---- Pagination tests ----
+
+/// Create a GatewayConfig with many proxies for pagination testing.
+fn create_pagination_test_config() -> GatewayConfig {
+    let mut proxies = Vec::new();
+    let mut consumers = Vec::new();
+    let mut plugin_configs = Vec::new();
+    for i in 0..5 {
+        proxies.push(create_test_proxy(
+            &format!("proxy-{}", i),
+            &format!("/api/v{}", i),
+            "backend.example.com",
+            8080,
+        ));
+        consumers.push(Consumer {
+            id: format!("consumer-{}", i),
+            username: format!("user-{}", i),
+            custom_id: None,
+            credentials: HashMap::new(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        });
+        plugin_configs.push(PluginConfig {
+            id: format!("plugin-cfg-{}", i),
+            plugin_name: "rate_limiting".to_string(),
+            config: json!({"rate": 100}),
+            scope: PluginScope::Global,
+            enabled: true,
+            proxy_id: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        });
+    }
+    GatewayConfig {
+        version: "1".to_string(),
+        proxies,
+        consumers,
+        plugin_configs,
+        upstreams: vec![],
+        loaded_at: Utc::now(),
+    }
+}
+
+fn create_pagination_admin_state(tc: &TestConfig) -> AdminState {
+    AdminState {
+        db: None,
+        jwt_manager: create_test_jwt_manager(tc),
+        cached_config: Some(Arc::new(ArcSwap::new(Arc::new(
+            create_pagination_test_config(),
+        )))),
+        proxy_state: None,
+        mode: "test".to_string(),
+        read_only: true,
+    }
+}
+
+#[tokio::test]
+async fn test_list_proxies_without_pagination_returns_plain_array() {
+    let tc = TestConfig::default();
+    let state = create_pagination_admin_state(&tc);
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let (status, body, _) = admin_get(&base_url, "/proxies", &token).await;
+    assert_eq!(status, 200);
+    // Without pagination params, should be a plain array
+    assert!(
+        body.is_array(),
+        "Should return plain array without pagination params"
+    );
+    assert_eq!(body.as_array().unwrap().len(), 5);
+}
+
+#[tokio::test]
+async fn test_list_proxies_with_limit_returns_paginated_envelope() {
+    let tc = TestConfig::default();
+    let state = create_pagination_admin_state(&tc);
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let (status, body, _) = admin_get(&base_url, "/proxies?limit=2", &token).await;
+    assert_eq!(status, 200);
+    // With pagination params, should return envelope
+    assert!(body["data"].is_array(), "Should have data field");
+    assert_eq!(body["data"].as_array().unwrap().len(), 2);
+    assert_eq!(body["pagination"]["offset"], 0);
+    assert_eq!(body["pagination"]["limit"], 2);
+    assert_eq!(body["pagination"]["total"], 5);
+}
+
+#[tokio::test]
+async fn test_list_proxies_with_offset_and_limit() {
+    let tc = TestConfig::default();
+    let state = create_pagination_admin_state(&tc);
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let (status, body, _) = admin_get(&base_url, "/proxies?offset=2&limit=2", &token).await;
+    assert_eq!(status, 200);
+    let data = body["data"].as_array().unwrap();
+    assert_eq!(data.len(), 2);
+    assert_eq!(data[0]["id"], "proxy-2");
+    assert_eq!(data[1]["id"], "proxy-3");
+    assert_eq!(body["pagination"]["total"], 5);
+}
+
+#[tokio::test]
+async fn test_list_proxies_offset_beyond_total_returns_empty() {
+    let tc = TestConfig::default();
+    let state = create_pagination_admin_state(&tc);
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let (status, body, _) = admin_get(&base_url, "/proxies?offset=100&limit=10", &token).await;
+    assert_eq!(status, 200);
+    assert_eq!(body["data"].as_array().unwrap().len(), 0);
+    assert_eq!(body["pagination"]["total"], 5);
+}
+
+#[tokio::test]
+async fn test_list_consumers_with_pagination() {
+    let tc = TestConfig::default();
+    let state = create_pagination_admin_state(&tc);
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let (status, body, _) = admin_get(&base_url, "/consumers?limit=3", &token).await;
+    assert_eq!(status, 200);
+    assert_eq!(body["data"].as_array().unwrap().len(), 3);
+    assert_eq!(body["pagination"]["total"], 5);
+}
+
+#[tokio::test]
+async fn test_list_plugin_configs_with_pagination() {
+    let tc = TestConfig::default();
+    let state = create_pagination_admin_state(&tc);
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let (status, body, _) = admin_get(&base_url, "/plugins/config?limit=1&offset=4", &token).await;
+    assert_eq!(status, 200);
+    let data = body["data"].as_array().unwrap();
+    assert_eq!(data.len(), 1);
+    assert_eq!(data[0]["id"], "plugin-cfg-4");
+    assert_eq!(body["pagination"]["total"], 5);
+}
+
+#[tokio::test]
+async fn test_list_upstreams_with_pagination() {
+    let tc = TestConfig::default();
+    let state = create_pagination_admin_state(&tc);
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    // Upstreams is empty, pagination should still work
+    let (status, body, _) = admin_get(&base_url, "/upstreams?limit=10", &token).await;
+    assert_eq!(status, 200);
+    assert_eq!(body["data"].as_array().unwrap().len(), 0);
+    assert_eq!(body["pagination"]["total"], 0);
+}
+
+#[tokio::test]
+async fn test_pagination_limit_clamped_to_max() {
+    let tc = TestConfig::default();
+    let state = create_pagination_admin_state(&tc);
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    // limit=5000 exceeds MAX_PAGE_SIZE (1000), should be clamped
+    let (status, body, _) = admin_get(&base_url, "/proxies?limit=5000", &token).await;
+    assert_eq!(status, 200);
+    // Should still return all 5 (since 5 < 1000)
+    assert_eq!(body["data"].as_array().unwrap().len(), 5);
+    assert_eq!(body["pagination"]["limit"], 1000);
+}
+
+// ---- Batch endpoint tests ----
+
+use ferrum_gateway::config::db_loader::DatabaseStore;
+
+async fn create_db_admin_state(tc: &TestConfig) -> (AdminState, tempfile::TempDir) {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("test_batch.db");
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
+    let db =
+        DatabaseStore::connect_with_tls_config("sqlite", &db_url, false, None, None, None, false)
+            .await
+            .expect("Failed to connect to test database");
+    let state = AdminState {
+        db: Some(Arc::new(db)),
+        jwt_manager: create_test_jwt_manager(tc),
+        cached_config: None,
+        proxy_state: None,
+        mode: "database".to_string(),
+        read_only: false,
+    };
+    (state, temp_dir)
+}
+
+async fn admin_post(base_url: &str, path: &str, token: &str, body: &Value) -> (u16, Value) {
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{}{}", base_url, path))
+        .header("Authorization", format!("Bearer {}", token))
+        .json(body)
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status().as_u16();
+    let body: Value = resp.json().await.unwrap();
+    (status, body)
+}
+
+#[tokio::test]
+async fn test_batch_create_consumers_and_proxies() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let batch = json!({
+        "consumers": [
+            {"id": "c1", "username": "user1", "credentials": {}},
+            {"id": "c2", "username": "user2", "credentials": {}},
+            {"id": "c3", "username": "user3", "credentials": {}}
+        ],
+        "proxies": [
+            {"id": "p1", "listen_path": "/a", "backend_protocol": "http", "backend_host": "localhost", "backend_port": 8080, "strip_listen_path": true},
+            {"id": "p2", "listen_path": "/b", "backend_protocol": "http", "backend_host": "localhost", "backend_port": 8080, "strip_listen_path": true}
+        ]
+    });
+
+    let (status, body) = admin_post(&base_url, "/batch", &token, &batch).await;
+    assert_eq!(status, 201, "Batch create failed: {:?}", body);
+    assert_eq!(body["created"]["consumers"], 3);
+    assert_eq!(body["created"]["proxies"], 2);
+    assert_eq!(body["created"]["plugin_configs"], 0);
+    assert_eq!(body["created"]["upstreams"], 0);
+
+    // Verify resources exist via individual GET
+    let (status, _body, _) = admin_get(&base_url, "/consumers/c1", &token).await;
+    assert_eq!(status, 200);
+
+    let (status, _body, _) = admin_get(&base_url, "/proxies/p1", &token).await;
+    assert_eq!(status, 200);
+}
+
+#[tokio::test]
+async fn test_batch_create_plugin_configs() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    // First create a proxy for the plugin to reference
+    let proxy_batch = json!({
+        "proxies": [
+            {"id": "bp1", "listen_path": "/bp1", "backend_protocol": "http", "backend_host": "localhost", "backend_port": 8080, "strip_listen_path": true}
+        ]
+    });
+    let (status, _) = admin_post(&base_url, "/batch", &token, &proxy_batch).await;
+    assert_eq!(status, 201);
+
+    // Now batch create plugin configs
+    let plugin_batch = json!({
+        "plugin_configs": [
+            {"id": "pc1", "plugin_name": "key_auth", "scope": "proxy", "proxy_id": "bp1", "enabled": true, "config": {"key_location": "header:X-API-Key"}},
+            {"id": "pc2", "plugin_name": "rate_limiting", "scope": "global", "enabled": true, "config": {"rate": 100, "per": "second"}}
+        ]
+    });
+
+    let (status, body) = admin_post(&base_url, "/batch", &token, &plugin_batch).await;
+    assert_eq!(status, 201, "Batch plugin create failed: {:?}", body);
+    assert_eq!(body["created"]["plugin_configs"], 2);
+}
+
+#[tokio::test]
+async fn test_batch_create_read_only_rejected() {
+    let tc = TestConfig::default();
+    let state = AdminState {
+        db: None,
+        jwt_manager: create_test_jwt_manager(&tc),
+        cached_config: None,
+        proxy_state: None,
+        mode: "test".to_string(),
+        read_only: true,
+    };
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let batch = json!({"consumers": [{"id": "c1", "username": "u1"}]});
+    let (status, body) = admin_post(&base_url, "/batch", &token, &batch).await;
+    assert_eq!(status, 403);
+    assert!(body["error"].as_str().unwrap().contains("read-only"));
+}
+
+#[tokio::test]
+async fn test_batch_create_empty_request() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    // Empty batch — all zero counts
+    let (status, body) = admin_post(&base_url, "/batch", &token, &json!({})).await;
+    assert_eq!(status, 201);
+    assert_eq!(body["created"]["proxies"], 0);
+    assert_eq!(body["created"]["consumers"], 0);
+    assert_eq!(body["created"]["plugin_configs"], 0);
+    assert_eq!(body["created"]["upstreams"], 0);
+}

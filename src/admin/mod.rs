@@ -169,6 +169,76 @@ async fn handle_admin_connection(
     Ok(())
 }
 
+/// Pagination parameters parsed from query string.
+struct PaginationParams {
+    offset: usize,
+    limit: usize,
+    /// True when caller explicitly provided `limit` or `offset` query params.
+    is_paginated: bool,
+}
+
+const DEFAULT_PAGE_SIZE: usize = 100;
+const MAX_PAGE_SIZE: usize = 1000;
+
+fn parse_pagination(uri: &hyper::Uri) -> PaginationParams {
+    let mut offset = 0usize;
+    let mut limit = DEFAULT_PAGE_SIZE;
+    let mut is_paginated = false;
+    if let Some(query) = uri.query() {
+        for pair in query.split('&') {
+            let mut parts = pair.splitn(2, '=');
+            if let (Some(key), Some(val)) = (parts.next(), parts.next()) {
+                match key {
+                    "offset" => {
+                        offset = val.parse().unwrap_or(0);
+                        is_paginated = true;
+                    }
+                    "limit" => {
+                        limit = val.parse().unwrap_or(DEFAULT_PAGE_SIZE).min(MAX_PAGE_SIZE);
+                        if limit == 0 {
+                            limit = DEFAULT_PAGE_SIZE;
+                        }
+                        is_paginated = true;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    PaginationParams {
+        offset,
+        limit,
+        is_paginated,
+    }
+}
+
+/// Apply pagination to a serializable collection.
+/// When pagination params are present, wraps the response in an envelope with metadata.
+/// Otherwise returns the plain array for backward compatibility.
+fn paginate_response(items: &Value, pagination: &PaginationParams) -> Value {
+    if !pagination.is_paginated {
+        return items.clone();
+    }
+    let arr = match items.as_array() {
+        Some(a) => a,
+        None => return items.clone(),
+    };
+    let total = arr.len();
+    let paginated: Vec<_> = arr
+        .iter()
+        .skip(pagination.offset)
+        .take(pagination.limit)
+        .collect();
+    json!({
+        "data": paginated,
+        "pagination": {
+            "offset": pagination.offset,
+            "limit": pagination.limit,
+            "total": total
+        }
+    })
+}
+
 /// Handle an admin API request.
 pub async fn handle_admin_request(
     req: Request<Incoming>,
@@ -176,6 +246,7 @@ pub async fn handle_admin_request(
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     let method = req.method().clone();
     let path = req.uri().path().to_string();
+    let pagination = parse_pagination(req.uri());
 
     // Health check (unauthenticated)
     if path == "/health" || path == "/status" {
@@ -286,14 +357,14 @@ pub async fn handle_admin_request(
 
     match (method, segments.as_slice()) {
         // Proxies CRUD
-        (Method::GET, ["proxies"]) => handle_list_proxies(&state).await,
+        (Method::GET, ["proxies"]) => handle_list_proxies(&state, &pagination).await,
         (Method::POST, ["proxies"]) => handle_create_proxy(&state, &body_bytes).await,
         (Method::GET, ["proxies", id]) => handle_get_proxy(&state, id).await,
         (Method::PUT, ["proxies", id]) => handle_update_proxy(&state, id, &body_bytes).await,
         (Method::DELETE, ["proxies", id]) => handle_delete_proxy(&state, id).await,
 
         // Consumers CRUD
-        (Method::GET, ["consumers"]) => handle_list_consumers(&state).await,
+        (Method::GET, ["consumers"]) => handle_list_consumers(&state, &pagination).await,
         (Method::POST, ["consumers"]) => handle_create_consumer(&state, &body_bytes).await,
         (Method::GET, ["consumers", id]) => handle_get_consumer(&state, id).await,
         (Method::PUT, ["consumers", id]) => handle_update_consumer(&state, id, &body_bytes).await,
@@ -309,7 +380,9 @@ pub async fn handle_admin_request(
 
         // Plugins
         (Method::GET, ["plugins"]) => handle_list_plugin_types().await,
-        (Method::GET, ["plugins", "config"]) => handle_list_plugin_configs(&state).await,
+        (Method::GET, ["plugins", "config"]) => {
+            handle_list_plugin_configs(&state, &pagination).await
+        }
         (Method::POST, ["plugins", "config"]) => {
             handle_create_plugin_config(&state, &body_bytes).await
         }
@@ -322,11 +395,14 @@ pub async fn handle_admin_request(
         }
 
         // Upstreams CRUD
-        (Method::GET, ["upstreams"]) => handle_list_upstreams(&state).await,
+        (Method::GET, ["upstreams"]) => handle_list_upstreams(&state, &pagination).await,
         (Method::POST, ["upstreams"]) => handle_create_upstream(&state, &body_bytes).await,
         (Method::GET, ["upstreams", id]) => handle_get_upstream(&state, id).await,
         (Method::PUT, ["upstreams", id]) => handle_update_upstream(&state, id, &body_bytes).await,
         (Method::DELETE, ["upstreams", id]) => handle_delete_upstream(&state, id).await,
+
+        // Batch create
+        (Method::POST, ["batch"]) => handle_batch_create(&state, &body_bytes).await,
 
         // Metrics
         (Method::GET, ["admin", "metrics"]) => handle_metrics(&state).await,
@@ -340,11 +416,17 @@ pub async fn handle_admin_request(
 
 // ---- Proxy CRUD ----
 
-async fn handle_list_proxies(state: &AdminState) -> Result<Response<Full<Bytes>>, hyper::Error> {
+async fn handle_list_proxies(
+    state: &AdminState,
+    pagination: &PaginationParams,
+) -> Result<Response<Full<Bytes>>, hyper::Error> {
     // Try database first, fall back to cached config for resilience
     if let Some(ref db) = state.db {
         match db.load_full_config().await {
-            Ok(config) => return Ok(json_response(StatusCode::OK, &json!(config.proxies))),
+            Ok(config) => {
+                let body = paginate_response(&json!(config.proxies), pagination);
+                return Ok(json_response(StatusCode::OK, &body));
+            }
             Err(e) => {
                 warn!(
                     "Database unavailable for list proxies, falling back to cached config: {}",
@@ -356,10 +438,8 @@ async fn handle_list_proxies(state: &AdminState) -> Result<Response<Full<Bytes>>
 
     // Fallback: serve from in-memory cached config
     if let Some(config) = state.cached_gateway_config() {
-        Ok(json_response_with_stale(
-            StatusCode::OK,
-            &json!(config.proxies),
-        ))
+        let body = paginate_response(&json!(config.proxies), pagination);
+        Ok(json_response_with_stale(StatusCode::OK, &body))
     } else {
         Ok(json_response(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -727,7 +807,10 @@ async fn handle_delete_proxy(
 
 // ---- Consumer CRUD ----
 
-async fn handle_list_consumers(state: &AdminState) -> Result<Response<Full<Bytes>>, hyper::Error> {
+async fn handle_list_consumers(
+    state: &AdminState,
+    pagination: &PaginationParams,
+) -> Result<Response<Full<Bytes>>, hyper::Error> {
     // Try database first, fall back to cached config for resilience
     if let Some(ref db) = state.db {
         match db.load_full_config().await {
@@ -737,7 +820,8 @@ async fn handle_list_consumers(state: &AdminState) -> Result<Response<Full<Bytes
                     .iter()
                     .map(redact_consumer_credentials)
                     .collect();
-                return Ok(json_response(StatusCode::OK, &json!(redacted)));
+                let body = paginate_response(&json!(redacted), pagination);
+                return Ok(json_response(StatusCode::OK, &body));
             }
             Err(e) => {
                 warn!(
@@ -755,7 +839,8 @@ async fn handle_list_consumers(state: &AdminState) -> Result<Response<Full<Bytes
             .iter()
             .map(redact_consumer_credentials)
             .collect();
-        Ok(json_response_with_stale(StatusCode::OK, &json!(redacted)))
+        let body = paginate_response(&json!(redacted), pagination);
+        Ok(json_response_with_stale(StatusCode::OK, &body))
     } else {
         Ok(json_response(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1213,11 +1298,15 @@ async fn handle_list_plugin_types() -> Result<Response<Full<Bytes>>, hyper::Erro
 
 async fn handle_list_plugin_configs(
     state: &AdminState,
+    pagination: &PaginationParams,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     // Try database first, fall back to cached config for resilience
     if let Some(ref db) = state.db {
         match db.load_full_config().await {
-            Ok(config) => return Ok(json_response(StatusCode::OK, &json!(config.plugin_configs))),
+            Ok(config) => {
+                let body = paginate_response(&json!(config.plugin_configs), pagination);
+                return Ok(json_response(StatusCode::OK, &body));
+            }
             Err(e) => {
                 warn!(
                     "Database unavailable for list plugin configs, falling back to cached config: {}",
@@ -1229,10 +1318,8 @@ async fn handle_list_plugin_configs(
 
     // Fallback: serve from in-memory cached config
     if let Some(config) = state.cached_gateway_config() {
-        Ok(json_response_with_stale(
-            StatusCode::OK,
-            &json!(config.plugin_configs),
-        ))
+        let body = paginate_response(&json!(config.plugin_configs), pagination);
+        Ok(json_response_with_stale(StatusCode::OK, &body))
     } else {
         Ok(json_response(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1442,11 +1529,17 @@ async fn handle_delete_plugin_config(
 
 // ---- Upstream CRUD ----
 
-async fn handle_list_upstreams(state: &AdminState) -> Result<Response<Full<Bytes>>, hyper::Error> {
+async fn handle_list_upstreams(
+    state: &AdminState,
+    pagination: &PaginationParams,
+) -> Result<Response<Full<Bytes>>, hyper::Error> {
     // Try database first, fall back to cached config for resilience
     if let Some(ref db) = state.db {
         match db.load_full_config().await {
-            Ok(config) => return Ok(json_response(StatusCode::OK, &json!(config.upstreams))),
+            Ok(config) => {
+                let body = paginate_response(&json!(config.upstreams), pagination);
+                return Ok(json_response(StatusCode::OK, &body));
+            }
             Err(e) => {
                 warn!(
                     "Database unavailable for list upstreams, falling back to cached config: {}",
@@ -1458,10 +1551,8 @@ async fn handle_list_upstreams(state: &AdminState) -> Result<Response<Full<Bytes
 
     // Fallback: serve from in-memory cached config
     if let Some(config) = state.cached_gateway_config() {
-        Ok(json_response_with_stale(
-            StatusCode::OK,
-            &json!(config.upstreams),
-        ))
+        let body = paginate_response(&json!(config.upstreams), pagination);
+        Ok(json_response_with_stale(StatusCode::OK, &body))
     } else {
         Ok(json_response(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1757,6 +1848,162 @@ async fn handle_metrics(state: &AdminState) -> Result<Response<Full<Bytes>>, hyp
 
         Ok(json_response(StatusCode::OK, &metrics))
     }
+}
+
+// ---- Batch Create ----
+
+/// Batch create endpoint — accepts multiple resources in a single request,
+/// persists them in a single database transaction per resource type.
+///
+/// Request body format:
+/// ```json
+/// {
+///   "proxies": [...],
+///   "consumers": [...],
+///   "plugin_configs": [...],
+///   "upstreams": [...]
+/// }
+/// ```
+/// All fields are optional. Returns counts of created resources.
+async fn handle_batch_create(
+    state: &AdminState,
+    body: &[u8],
+) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    if state.read_only {
+        return Ok(json_response(
+            StatusCode::FORBIDDEN,
+            &json!({"error": "Admin API is in read-only mode"}),
+        ));
+    }
+
+    let db = match &state.db {
+        Some(db) => db,
+        None => {
+            return Ok(json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &json!({"error": "No database"}),
+            ));
+        }
+    };
+
+    let batch: Value = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(e) => {
+            return Ok(json_response(
+                StatusCode::BAD_REQUEST,
+                &json!({"error": format!("Invalid JSON body: {}", e)}),
+            ));
+        }
+    };
+
+    let mut created_proxies = 0usize;
+    let mut created_consumers = 0usize;
+    let mut created_plugin_configs = 0usize;
+    let mut created_upstreams = 0usize;
+    let mut errors: Vec<String> = Vec::new();
+
+    // Batch create consumers (before proxies, since proxies may reference consumer ACLs)
+    if let Some(consumers_val) = batch.get("consumers") {
+        match serde_json::from_value::<Vec<Consumer>>(consumers_val.clone()) {
+            Ok(mut consumers) => {
+                let now = Utc::now();
+                for c in &mut consumers {
+                    if c.id.is_empty() {
+                        c.id = Uuid::new_v4().to_string();
+                    }
+                    c.created_at = now;
+                    c.updated_at = now;
+                    if let Err(e) = hash_consumer_secrets(c) {
+                        errors.push(format!("Consumer '{}': {}", c.id, e));
+                    }
+                }
+                match db.batch_create_consumers(&consumers).await {
+                    Ok(n) => created_consumers = n,
+                    Err(e) => errors.push(format!("consumers: {}", e)),
+                }
+            }
+            Err(e) => errors.push(format!("consumers parse error: {}", e)),
+        }
+    }
+
+    // Batch create upstreams (before proxies, since proxies may reference upstream_id)
+    if let Some(upstreams_val) = batch.get("upstreams") {
+        match serde_json::from_value::<Vec<Upstream>>(upstreams_val.clone()) {
+            Ok(mut upstreams) => {
+                let now = Utc::now();
+                for u in &mut upstreams {
+                    if u.id.is_empty() {
+                        u.id = Uuid::new_v4().to_string();
+                    }
+                    u.created_at = now;
+                    u.updated_at = now;
+                }
+                match db.batch_create_upstreams(&upstreams).await {
+                    Ok(n) => created_upstreams = n,
+                    Err(e) => errors.push(format!("upstreams: {}", e)),
+                }
+            }
+            Err(e) => errors.push(format!("upstreams parse error: {}", e)),
+        }
+    }
+
+    // Batch create proxies
+    if let Some(proxies_val) = batch.get("proxies") {
+        match serde_json::from_value::<Vec<Proxy>>(proxies_val.clone()) {
+            Ok(mut proxies) => {
+                let now = Utc::now();
+                for p in &mut proxies {
+                    if p.id.is_empty() {
+                        p.id = Uuid::new_v4().to_string();
+                    }
+                    p.created_at = now;
+                    p.updated_at = now;
+                }
+                match db.batch_create_proxies(&proxies).await {
+                    Ok(n) => created_proxies = n,
+                    Err(e) => errors.push(format!("proxies: {}", e)),
+                }
+            }
+            Err(e) => errors.push(format!("proxies parse error: {}", e)),
+        }
+    }
+
+    // Batch create plugin configs (after proxies, since they reference proxy_id)
+    if let Some(pcs_val) = batch.get("plugin_configs") {
+        match serde_json::from_value::<Vec<PluginConfig>>(pcs_val.clone()) {
+            Ok(mut pcs) => {
+                let now = Utc::now();
+                for pc in &mut pcs {
+                    if pc.id.is_empty() {
+                        pc.id = Uuid::new_v4().to_string();
+                    }
+                    pc.created_at = now;
+                    pc.updated_at = now;
+                }
+                match db.batch_create_plugin_configs(&pcs).await {
+                    Ok(n) => created_plugin_configs = n,
+                    Err(e) => errors.push(format!("plugin_configs: {}", e)),
+                }
+            }
+            Err(e) => errors.push(format!("plugin_configs parse error: {}", e)),
+        }
+    }
+
+    let mut response = json!({
+        "created": {
+            "proxies": created_proxies,
+            "consumers": created_consumers,
+            "plugin_configs": created_plugin_configs,
+            "upstreams": created_upstreams,
+        }
+    });
+
+    if !errors.is_empty() {
+        response["errors"] = json!(errors);
+        return Ok(json_response(StatusCode::MULTI_STATUS, &response));
+    }
+
+    Ok(json_response(StatusCode::CREATED, &response))
 }
 
 // ---- Helpers ----
