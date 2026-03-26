@@ -155,6 +155,15 @@ impl ProxyBody {
         Self::Stream(Box::pin(StreamBody::new(stream)))
     }
 
+    /// Create a streaming body from a hyper HTTP/2 response (Incoming body).
+    pub fn streaming_h2(response: hyper::Response<hyper::body::Incoming>) -> Self {
+        use http_body_util::BodyExt;
+
+        let body = response.into_body();
+        let mapped = body.map_err(|e| Box::new(e) as ProxyBodyError);
+        Self::Stream(Box::pin(mapped))
+    }
+
     /// Create a streaming body with lightweight completion tracking.
     ///
     /// Returns the body and a shared `Arc<StreamingMetrics>` that a deferred

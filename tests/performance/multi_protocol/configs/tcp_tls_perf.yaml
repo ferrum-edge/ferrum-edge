@@ -1,0 +1,35 @@
+---
+# TCP+TLS (frontend TLS termination) performance test config
+# Client connects via TLS to gateway, gateway forwards plain TCP to backend
+proxies:
+  - id: "tcp-tls-echo"
+    name: "TCP+TLS Echo Proxy"
+    listen_path: ""
+    listen_port: 5001
+    backend_protocol: tcp
+    backend_host: "127.0.0.1"
+    backend_port: 3004
+    frontend_tls: true
+    backend_connect_timeout_ms: 5000
+    backend_read_timeout_ms: 30000
+    backend_write_timeout_ms: 30000
+    auth_mode: single
+    plugins: []
+
+  - id: "tcp-tls-health"
+    name: "Health Check"
+    listen_path: "/health"
+    backend_protocol: http
+    backend_host: "127.0.0.1"
+    backend_port: 3010
+    strip_listen_path: false
+    preserve_host_header: false
+    backend_connect_timeout_ms: 1000
+    backend_read_timeout_ms: 5000
+    backend_write_timeout_ms: 5000
+    auth_mode: single
+    pool_max_idle_per_host: 200
+    plugins: []
+
+consumers: []
+plugin_configs: []

@@ -1,0 +1,35 @@
+---
+# WebSocket performance test config
+# Gateway proxies WebSocket connections to backend WS echo server
+proxies:
+  - id: "ws-echo"
+    name: "WebSocket Echo"
+    listen_path: "/ws"
+    backend_protocol: ws
+    backend_host: "127.0.0.1"
+    backend_port: 3003
+    strip_listen_path: true
+    preserve_host_header: false
+    backend_connect_timeout_ms: 5000
+    backend_read_timeout_ms: 30000
+    backend_write_timeout_ms: 30000
+    auth_mode: single
+    plugins: []
+
+  - id: "ws-health"
+    name: "Health Check"
+    listen_path: "/health"
+    backend_protocol: http
+    backend_host: "127.0.0.1"
+    backend_port: 3010
+    strip_listen_path: false
+    preserve_host_header: false
+    backend_connect_timeout_ms: 1000
+    backend_read_timeout_ms: 5000
+    backend_write_timeout_ms: 5000
+    auth_mode: single
+    pool_max_idle_per_host: 200
+    plugins: []
+
+consumers: []
+plugin_configs: []

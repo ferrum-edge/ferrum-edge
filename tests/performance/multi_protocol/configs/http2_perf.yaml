@@ -1,0 +1,42 @@
+---
+# HTTP/2 performance test config
+# Gateway listens on HTTP (8000) and HTTPS (8443), proxies to HTTPS backend with HTTP/2 over TLS
+proxies:
+  - id: "h2-users"
+    name: "HTTP/2 Users API"
+    listen_path: "/api/users"
+    backend_protocol: https
+    backend_host: "127.0.0.1"
+    backend_port: 3443
+    strip_listen_path: false
+    preserve_host_header: false
+    backend_connect_timeout_ms: 5000
+    backend_read_timeout_ms: 10000
+    backend_write_timeout_ms: 10000
+    backend_tls_verify_server_cert: false
+    auth_mode: single
+    pool_max_idle_per_host: 200
+    pool_enable_http2: true
+    pool_http2_keep_alive_interval_seconds: 30
+    pool_http2_keep_alive_timeout_seconds: 45
+    plugins: []
+
+  - id: "h2-health"
+    name: "HTTP/2 Health Check"
+    listen_path: "/health"
+    backend_protocol: http
+    backend_host: "127.0.0.1"
+    backend_port: 3010
+    strip_listen_path: false
+    preserve_host_header: false
+    backend_connect_timeout_ms: 5000
+    backend_read_timeout_ms: 5000
+    backend_write_timeout_ms: 5000
+    backend_tls_verify_server_cert: false
+    auth_mode: single
+    pool_max_idle_per_host: 200
+    pool_enable_http2: true
+    plugins: []
+
+consumers: []
+plugin_configs: []

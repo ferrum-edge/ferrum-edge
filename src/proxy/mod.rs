@@ -1,6 +1,7 @@
 pub mod body;
 pub mod client_ip;
 pub mod grpc_proxy;
+pub mod http2_pool;
 pub mod stream_listener;
 pub mod tcp_proxy;
 pub mod udp_proxy;
@@ -17,7 +18,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::{Message, WebSocketConfig};
@@ -47,6 +48,7 @@ use crate::router_cache::RouterCache;
 
 pub use self::body::ProxyBody;
 use self::grpc_proxy::{GrpcConnectionPool, GrpcProxyError};
+use self::http2_pool::Http2ConnectionPool;
 
 /// Check if the request is a WebSocket upgrade request
 fn is_websocket_upgrade(req: &Request<Incoming>) -> bool {
@@ -79,6 +81,8 @@ pub struct ProxyState {
     pub status_counts: Arc<dashmap::DashMap<u16, AtomicU64>>,
     /// gRPC-specific HTTP/2 connection pool (h2c + h2 with trailer support)
     pub grpc_pool: Arc<GrpcConnectionPool>,
+    /// HTTP/2 connection pool for HTTPS backends (proper stream multiplexing)
+    pub http2_pool: Arc<Http2ConnectionPool>,
     /// Load balancer cache for upstream target selection.
     pub load_balancer_cache: Arc<LoadBalancerCache>,
     /// Health checker for upstream targets.
@@ -123,6 +127,10 @@ impl ProxyState {
         // Create connection pools with global configuration from environment
         let global_pool_config = PoolConfig::from_env();
         let grpc_pool = Arc::new(GrpcConnectionPool::new(
+            global_pool_config.clone(),
+            env_config.clone(),
+        ));
+        let http2_pool = Arc::new(Http2ConnectionPool::new(
             global_pool_config.clone(),
             env_config.clone(),
         ));
@@ -193,6 +201,7 @@ impl ProxyState {
             request_count: Arc::new(AtomicU64::new(0)),
             status_counts: Arc::new(dashmap::DashMap::new()),
             grpc_pool,
+            http2_pool,
             alt_svc_header,
             env_config: env_config_arc,
             max_header_size_bytes,
@@ -2113,7 +2122,10 @@ pub async fn handle_proxy_request(
     // For buffered responses, backend_elapsed includes full body download (accurate total).
     // For streaming responses, the body is still being sent to the client at log time,
     // so we mark total as unknown (-1.0) to avoid silently reporting TTFB as total.
-    let is_streaming_response = matches!(&response_body, ResponseBody::Streaming(_));
+    let is_streaming_response = matches!(
+        &response_body,
+        ResponseBody::Streaming(_) | ResponseBody::StreamingH2(_)
+    );
     let backend_total_ms = if is_streaming_response {
         -1.0
     } else {
@@ -2246,6 +2258,7 @@ pub async fn handle_proxy_request(
             tracked_body
         }
         ResponseBody::Streaming(resp) => ProxyBody::streaming(resp),
+        ResponseBody::StreamingH2(resp) => ProxyBody::streaming_h2(resp),
         ResponseBody::Buffered(data) => ProxyBody::full(Bytes::from(data)),
     };
 
@@ -2556,6 +2569,28 @@ async fn proxy_to_backend(
             connection_error: false,
             backend_resolved_ip: resolved_ip.clone(),
         };
+    }
+
+    // Use HTTP/2 multiplexing pool for HTTPS backends with H2 enabled.
+    // This avoids reqwest's connection-per-burst behavior by multiplexing
+    // concurrent requests over a single persistent TLS+H2 connection.
+    if matches!(proxy.backend_protocol, BackendProtocol::Https) {
+        let pool_config = state.connection_pool.global_pool_config().for_proxy(proxy);
+        if pool_config.enable_http2 {
+            return proxy_to_backend_http2(
+                state,
+                proxy,
+                backend_url,
+                method,
+                headers,
+                original_req,
+                stream_response,
+                client_ip,
+                is_tls,
+                resolved_ip,
+            )
+            .await;
+        }
     }
 
     // Get client from connection pool for HTTP/1.1 and HTTP/2.
@@ -2958,6 +2993,249 @@ fn build_reject_response(
         }
     }
     resp
+}
+
+/// Proxy the request to an HTTPS backend using the HTTP/2 multiplexing pool.
+///
+/// Uses hyper's HTTP/2 client directly to multiplex concurrent requests over
+/// a single persistent TLS connection, avoiding reqwest's connection-per-burst behavior.
+#[allow(clippy::too_many_arguments)]
+async fn proxy_to_backend_http2(
+    state: &ProxyState,
+    proxy: &Proxy,
+    backend_url: &str,
+    method: &str,
+    headers: &HashMap<String, String>,
+    original_req: Request<Incoming>,
+    stream_response: bool,
+    client_ip: &str,
+    is_tls: bool,
+    resolved_ip: Option<String>,
+) -> retry::BackendResponse {
+    debug!(proxy_id = %proxy.id, backend_url = %backend_url, "Proxying request via HTTP/2 pool");
+
+    // Get or create HTTP/2 connection to backend
+    let mut sender = match state.http2_pool.get_sender(proxy, &state.dns_cache).await {
+        Ok(s) => s,
+        Err(e) => {
+            let msg = match &e {
+                http2_pool::Http2PoolError::BackendTimeout(m) => m.clone(),
+                http2_pool::Http2PoolError::BackendUnavailable(m) => m.clone(),
+                http2_pool::Http2PoolError::Internal(m) => m.clone(),
+            };
+            error!(proxy_id = %proxy.id, error = %msg, "HTTP/2 pool connection failed");
+            return retry::BackendResponse {
+                status_code: 502,
+                body: ResponseBody::Buffered(
+                    format!(r#"{{"error":"Backend unavailable: {}"}}"#, msg).into_bytes(),
+                ),
+                headers: HashMap::new(),
+                connection_error: true,
+                backend_resolved_ip: resolved_ip,
+            };
+        }
+    };
+
+    // If the cached sender is closed, reconnect
+    if sender.is_closed() {
+        sender = match state.http2_pool.get_sender(proxy, &state.dns_cache).await {
+            Ok(s) => s,
+            Err(e) => {
+                let msg = match &e {
+                    http2_pool::Http2PoolError::BackendTimeout(m) => m.clone(),
+                    http2_pool::Http2PoolError::BackendUnavailable(m) => m.clone(),
+                    http2_pool::Http2PoolError::Internal(m) => m.clone(),
+                };
+                error!(proxy_id = %proxy.id, error = %msg, "HTTP/2 pool reconnection failed");
+                return retry::BackendResponse {
+                    status_code: 502,
+                    body: ResponseBody::Buffered(
+                        format!(r#"{{"error":"Backend unavailable: {}"}}"#, msg).into_bytes(),
+                    ),
+                    headers: HashMap::new(),
+                    connection_error: true,
+                    backend_resolved_ip: resolved_ip,
+                };
+            }
+        };
+    }
+
+    // Parse the backend URL
+    let uri: hyper::Uri = match backend_url.parse() {
+        Ok(u) => u,
+        Err(e) => {
+            error!(proxy_id = %proxy.id, error = %e, "Invalid backend URL");
+            return retry::BackendResponse {
+                status_code: 502,
+                body: ResponseBody::Buffered(
+                    r#"{"error":"Invalid backend URL"}"#.as_bytes().to_vec(),
+                ),
+                headers: HashMap::new(),
+                connection_error: false,
+                backend_resolved_ip: resolved_ip,
+            };
+        }
+    };
+
+    // Build hyper request
+    let (mut parts, body) = original_req.into_parts();
+
+    // Set the URI
+    parts.uri = uri;
+
+    // Set the method
+    parts.method = match method {
+        "GET" => hyper::Method::GET,
+        "POST" => hyper::Method::POST,
+        "PUT" => hyper::Method::PUT,
+        "DELETE" => hyper::Method::DELETE,
+        "PATCH" => hyper::Method::PATCH,
+        "HEAD" => hyper::Method::HEAD,
+        "OPTIONS" => hyper::Method::OPTIONS,
+        other => match hyper::Method::from_bytes(other.as_bytes()) {
+            Ok(m) => m,
+            Err(_) => {
+                return retry::BackendResponse {
+                    status_code: 405,
+                    body: ResponseBody::Buffered(
+                        r#"{"error":"Method Not Allowed"}"#.as_bytes().to_vec(),
+                    ),
+                    headers: HashMap::new(),
+                    connection_error: false,
+                    backend_resolved_ip: resolved_ip,
+                };
+            }
+        },
+    };
+
+    // Clear and rebuild headers from the plugin-processed headers map
+    parts.headers.clear();
+    let effective_host = &proxy.backend_host;
+    for (k, v) in headers {
+        match k.as_str() {
+            "host" => {
+                if proxy.preserve_host_header {
+                    if let Ok(val) = hyper::header::HeaderValue::from_str(v) {
+                        parts.headers.insert(hyper::header::HOST, val);
+                    }
+                } else if let Ok(val) = hyper::header::HeaderValue::from_str(effective_host) {
+                    parts.headers.insert(hyper::header::HOST, val);
+                }
+            }
+            // Hop-by-hop headers per RFC 7230 Section 6.1
+            "connection"
+            | "transfer-encoding"
+            | "keep-alive"
+            | "te"
+            | "trailer"
+            | "proxy-authorization"
+            | "proxy-connection"
+            | "upgrade" => continue,
+            _ => {
+                if let (Ok(name), Ok(val)) = (
+                    hyper::header::HeaderName::from_bytes(k.as_bytes()),
+                    hyper::header::HeaderValue::from_str(v),
+                ) {
+                    parts.headers.insert(name, val);
+                }
+            }
+        }
+    }
+
+    // Add proxy headers
+    if let Some(xff) = headers.get("x-forwarded-for") {
+        if let Ok(val) = hyper::header::HeaderValue::from_str(&format!("{}, {}", xff, client_ip)) {
+            parts.headers.insert("x-forwarded-for", val);
+        }
+    } else if let Ok(val) = hyper::header::HeaderValue::from_str(client_ip) {
+        parts.headers.insert("x-forwarded-for", val);
+    }
+    if let Ok(val) = hyper::header::HeaderValue::from_str(if is_tls { "https" } else { "http" }) {
+        parts.headers.insert("x-forwarded-proto", val);
+    }
+    if let Some(host) = headers.get("host")
+        && let Ok(val) = hyper::header::HeaderValue::from_str(host)
+    {
+        parts.headers.insert("x-forwarded-host", val);
+    }
+
+    let backend_req = Request::from_parts(parts, body);
+
+    // Send to backend with read timeout
+    let read_timeout = Duration::from_millis(proxy.backend_read_timeout_ms);
+    let response = match tokio::time::timeout(read_timeout, sender.send_request(backend_req)).await
+    {
+        Ok(Ok(resp)) => resp,
+        Ok(Err(e)) => {
+            error!(proxy_id = %proxy.id, error = %e, "HTTP/2 backend request failed");
+            return retry::BackendResponse {
+                status_code: 502,
+                body: ResponseBody::Buffered(
+                    r#"{"error":"Backend unavailable"}"#.as_bytes().to_vec(),
+                ),
+                headers: HashMap::new(),
+                connection_error: true,
+                backend_resolved_ip: resolved_ip,
+            };
+        }
+        Err(_) => {
+            warn!(
+                proxy_id = %proxy.id,
+                "HTTP/2: read timeout ({}ms) waiting for backend response",
+                proxy.backend_read_timeout_ms
+            );
+            return retry::BackendResponse {
+                status_code: 504,
+                body: ResponseBody::Buffered(r#"{"error":"Backend timeout"}"#.as_bytes().to_vec()),
+                headers: HashMap::new(),
+                connection_error: true,
+                backend_resolved_ip: resolved_ip,
+            };
+        }
+    };
+
+    // Extract response status and headers
+    let status = response.status().as_u16();
+    let mut resp_headers = HashMap::new();
+    for (k, v) in response.headers() {
+        if let Ok(vs) = v.to_str() {
+            resp_headers.insert(k.as_str().to_string(), vs.to_string());
+        }
+    }
+
+    if stream_response {
+        retry::BackendResponse {
+            status_code: status,
+            body: ResponseBody::StreamingH2(response),
+            headers: resp_headers,
+            connection_error: false,
+            backend_resolved_ip: resolved_ip,
+        }
+    } else {
+        // Buffer the full response body
+        let body_bytes = match response.into_body().collect().await {
+            Ok(collected) => collected.to_bytes().to_vec(),
+            Err(e) => {
+                error!(proxy_id = %proxy.id, error = %e, "Failed to read HTTP/2 response body");
+                return retry::BackendResponse {
+                    status_code: 502,
+                    body: ResponseBody::Buffered(
+                        r#"{"error":"Failed to read backend response"}"#.as_bytes().to_vec(),
+                    ),
+                    headers: HashMap::new(),
+                    connection_error: false,
+                    backend_resolved_ip: resolved_ip,
+                };
+            }
+        };
+        retry::BackendResponse {
+            status_code: status,
+            body: ResponseBody::Buffered(body_bytes),
+            headers: resp_headers,
+            connection_error: false,
+            backend_resolved_ip: resolved_ip,
+        }
+    }
 }
 
 /// Proxy the request to an HTTP/3 backend.
