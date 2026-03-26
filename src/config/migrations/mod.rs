@@ -60,8 +60,22 @@ impl MigrationRunner {
     }
 
     /// Ensure the `_ferrum_migrations` tracking table exists.
+    ///
+    /// MySQL's `TEXT` type is reported as `BLOB` by the `Any` driver, which
+    /// prevents `try_get::<String>()`. Use `VARCHAR` for MySQL compatibility.
     async fn ensure_tracking_table(&self) -> Result<(), anyhow::Error> {
-        let sql = r#"
+        let sql = if self.db_type == "mysql" {
+            r#"
+            CREATE TABLE IF NOT EXISTS _ferrum_migrations (
+                version INTEGER PRIMARY KEY,
+                name VARCHAR(255) NOT NULL,
+                applied_at VARCHAR(50) NOT NULL,
+                checksum VARCHAR(255) NOT NULL,
+                execution_time_ms INTEGER NOT NULL
+            )
+            "#
+        } else {
+            r#"
             CREATE TABLE IF NOT EXISTS _ferrum_migrations (
                 version INTEGER PRIMARY KEY,
                 name TEXT NOT NULL,
@@ -69,7 +83,8 @@ impl MigrationRunner {
                 checksum TEXT NOT NULL,
                 execution_time_ms INTEGER NOT NULL
             )
-        "#;
+            "#
+        };
         sqlx::query(sql).execute(&self.pool).await?;
         Ok(())
     }
@@ -99,26 +114,28 @@ impl MigrationRunner {
         info!("Detected pre-migration database. Bootstrapping migration tracking for V1.");
         let now = Utc::now().to_rfc3339();
         let v1 = v001_initial_schema::V001InitialSchema;
-        sqlx::query(
-            "INSERT INTO _ferrum_migrations (version, name, applied_at, checksum, execution_time_ms) VALUES (?, ?, ?, ?, ?)"
-        )
-        .bind(v1.version())
-        .bind(v1.name())
-        .bind(&now)
-        .bind(v1.checksum())
-        .bind(0i64)
-        .execute(&self.pool)
-        .await?;
+        let insert_sql = Self::migration_insert_sql(&self.db_type);
+        sqlx::query(&insert_sql)
+            .bind(v1.version())
+            .bind(v1.name())
+            .bind(&now)
+            .bind(v1.checksum())
+            .bind(0i64)
+            .execute(&self.pool)
+            .await?;
 
         info!("Bootstrapped: V1 ({}) marked as applied", v1.name());
         Ok(())
     }
 
     /// Check if a table exists in the database, dispatching per db_type.
+    ///
+    /// PostgreSQL uses `$1` for bind parameters (the `?` placeholder is
+    /// ambiguous because PostgreSQL reserves `?` as a JSON operator).
     async fn table_exists(&self, table_name: &str) -> Result<bool, anyhow::Error> {
         let sql = match self.db_type.as_str() {
             "postgres" => {
-                "SELECT tablename FROM pg_tables WHERE schemaname='public' AND tablename = ?"
+                "SELECT tablename FROM pg_tables WHERE schemaname='public' AND tablename = $1"
             }
             "mysql" => {
                 "SELECT table_name FROM information_schema.tables WHERE table_name = ? AND table_schema = DATABASE()"
@@ -135,6 +152,16 @@ impl MigrationRunner {
             .await?;
 
         Ok(!rows.is_empty())
+    }
+
+    /// Return the migration INSERT statement with the correct bind parameter
+    /// syntax for the target database. PostgreSQL uses `$N`, MySQL/SQLite use `?`.
+    fn migration_insert_sql(db_type: &str) -> String {
+        if db_type == "postgres" {
+            "INSERT INTO _ferrum_migrations (version, name, applied_at, checksum, execution_time_ms) VALUES ($1, $2, $3, $4, $5)".to_string()
+        } else {
+            "INSERT INTO _ferrum_migrations (version, name, applied_at, checksum, execution_time_ms) VALUES (?, ?, ?, ?, ?)".to_string()
+        }
     }
 
     /// Get all applied migration versions from the tracking table.
@@ -202,16 +229,15 @@ impl MigrationRunner {
             let elapsed_ms = start.elapsed().as_millis() as i64;
 
             let now = Utc::now().to_rfc3339();
-            sqlx::query(
-                "INSERT INTO _ferrum_migrations (version, name, applied_at, checksum, execution_time_ms) VALUES (?, ?, ?, ?, ?)"
-            )
-            .bind(migration.version() as i32)
-            .bind(migration.name())
-            .bind(&now)
-            .bind(migration.checksum())
-            .bind(elapsed_ms as i32)
-            .execute(&self.pool)
-            .await?;
+            let insert_sql = Self::migration_insert_sql(&self.db_type);
+            sqlx::query(&insert_sql)
+                .bind(migration.version() as i32)
+                .bind(migration.name())
+                .bind(&now)
+                .bind(migration.checksum())
+                .bind(elapsed_ms as i32)
+                .execute(&self.pool)
+                .await?;
 
             let record = MigrationRecord {
                 version: migration.version(),
