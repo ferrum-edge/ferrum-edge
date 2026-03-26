@@ -1,0 +1,59 @@
+version: "3.8"
+
+services:
+  postgres-tls:
+    image: postgres:16-alpine
+    container_name: ferrum-test-pg-tls
+    ports:
+      - "15432:5432"
+    environment:
+      POSTGRES_DB: ferrum
+      POSTGRES_USER: ferrum
+      POSTGRES_PASSWORD: test-password
+    volumes:
+      - ${CERTS_DIR:-/tmp/ferrum-db-tls-certs}:/certs:ro
+    command:
+      - -c
+      - ssl=on
+      - -c
+      - ssl_cert_file=/certs/pg-server.crt
+      - -c
+      - ssl_key_file=/certs/pg-server.key
+      - -c
+      - ssl_ca_file=/certs/ca.crt
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ferrum -d ferrum"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - ferrum-tls-test-network
+
+  mysql-tls:
+    image: mysql:8.0
+    container_name: ferrum-test-mysql-tls
+    ports:
+      - "13306:3306"
+    environment:
+      MYSQL_DATABASE: ferrum
+      MYSQL_USER: ferrum
+      MYSQL_PASSWORD: test-password
+      MYSQL_ROOT_PASSWORD: root-test-password
+    volumes:
+      - ${CERTS_DIR:-/tmp/ferrum-db-tls-certs}:/certs:ro
+    command:
+      - --require-secure-transport=ON
+      - --ssl-cert=/certs/mysql-server.crt
+      - --ssl-key=/certs/mysql-server.key
+      - --ssl-ca=/certs/ca.crt
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-proot-test-password"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - ferrum-tls-test-network
+
+networks:
+  ferrum-tls-test-network:
+    driver: bridge

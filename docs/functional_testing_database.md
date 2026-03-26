@@ -365,8 +365,8 @@ println!("✓ Test description");
 
 ## Future Enhancements
 
-- [ ] Add PostgreSQL/MySQL backend testing
-- [ ] Add TLS configuration testing
+- [x] Add PostgreSQL/MySQL backend testing — see [Database TLS Testing](database_tls.md#functional-testing)
+- [x] Add TLS configuration testing — see [Database TLS Testing](database_tls.md#functional-testing)
 - [ ] Add metrics verification (check actual metric values)
 - [ ] Add concurrent request testing
 - [ ] Add large payload testing
@@ -382,3 +382,4 @@ println!("✓ Test description");
 - [Admin API Reference](../README.md#admin-api)
 - [JWT Authentication](../README.md#jwt-authentication)
 - [Proxy Configuration](../README.md#proxy-configuration)
+- [Database TLS Configuration](database_tls.md)

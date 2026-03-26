@@ -1,0 +1,369 @@
+# Database TLS Configuration
+
+Ferrum Gateway supports TLS-encrypted connections to PostgreSQL and MySQL databases. SQLite is an embedded database with no network layer, so TLS does not apply.
+
+## Quick Reference
+
+| Database   | TLS Support | SSL Mode Values                                         | mTLS (Client Certs) |
+|------------|-------------|---------------------------------------------------------|----------------------|
+| PostgreSQL | Yes         | `disable`, `prefer`, `require`, `verify-ca`, `verify-full` | Yes                  |
+| MySQL      | Yes         | `disable`, `prefer`, `require`, `verify-ca`, `verify-full` | Yes                  |
+| SQLite     | N/A         | All SSL settings silently ignored                       | N/A                  |
+
+## Configuration Approaches
+
+Ferrum Gateway provides two approaches for configuring database TLS. **The native SQL parameter approach is recommended.**
+
+### Approach 1: Native SQL Parameters (Recommended)
+
+Uses `FERRUM_DB_SSL_*` environment variables that map directly to database driver parameters.
+
+| Environment Variable       | Description                                                      | Example                     |
+|---------------------------|------------------------------------------------------------------|-----------------------------|
+| `FERRUM_DB_SSL_MODE`       | SSL connection mode                                              | `verify-full`               |
+| `FERRUM_DB_SSL_ROOT_CERT`  | Path to CA certificate for server verification                   | `/etc/ferrum/certs/ca.crt`  |
+| `FERRUM_DB_SSL_CLIENT_CERT`| Path to client certificate for mutual TLS                        | `/etc/ferrum/certs/client.crt` |
+| `FERRUM_DB_SSL_CLIENT_KEY` | Path to client private key for mutual TLS                        | `/etc/ferrum/certs/client.key` |
+
+These variables are appended to the `FERRUM_DB_URL` connection string as query parameters. The gateway automatically translates them into the correct format for each database:
+
+**PostgreSQL** — appended as `sslmode=X&sslrootcert=Y&sslcert=Z&sslkey=W`
+
+**MySQL** — values are mapped to MySQL conventions:
+- `disable` → `DISABLED`
+- `prefer` → `PREFERRED`
+- `require` → `REQUIRED`
+- `verify-ca` → `VERIFY_CA`
+- `verify-full` → `VERIFY_IDENTITY`
+
+### Approach 2: Legacy TLS Configuration
+
+Uses `FERRUM_DB_TLS_*` environment variables that configure TLS at the connection builder level.
+
+| Environment Variable          | Description                                         | Default |
+|-------------------------------|-----------------------------------------------------|---------|
+| `FERRUM_DB_TLS_ENABLED`       | Enable TLS for the database connection              | `false` |
+| `FERRUM_DB_TLS_CA_CERT_PATH`  | Path to CA certificate for server verification      | (none)  |
+| `FERRUM_DB_TLS_CLIENT_CERT_PATH` | Path to client certificate for mTLS              | (none)  |
+| `FERRUM_DB_TLS_CLIENT_KEY_PATH`  | Path to client private key for mTLS              | (none)  |
+| `FERRUM_DB_TLS_INSECURE`      | Skip server certificate verification (testing only) | `false` |
+
+When `FERRUM_DB_TLS_ENABLED=true`:
+- **`FERRUM_DB_TLS_INSECURE=false`** (default): Uses `sslmode=verify-full` (PostgreSQL) or `ssl-mode=VERIFY_IDENTITY` (MySQL) — encrypted and verified.
+- **`FERRUM_DB_TLS_INSECURE=true`**: Uses `sslmode=require` (PostgreSQL) or `ssl-mode=REQUIRED` (MySQL) — encrypted but **no certificate verification**.
+
+## PostgreSQL TLS Setup
+
+### Server-Side Setup
+
+Enable SSL in PostgreSQL by configuring `postgresql.conf`:
+
+```conf
+ssl = on
+ssl_cert_file = '/path/to/server.crt'
+ssl_key_file = '/path/to/server.key'
+ssl_ca_file = '/path/to/ca.crt'
+```
+
+The server key must have restrictive permissions (`chmod 600`) and be owned by the postgres user.
+
+### Gateway Configuration
+
+#### Encrypted + Full Verification (Production)
+
+```bash
+export FERRUM_MODE=database
+export FERRUM_DB_TYPE=postgres
+export FERRUM_DB_URL="postgres://ferrum:password@db-host:5432/ferrum"
+export FERRUM_DB_SSL_MODE=verify-full
+export FERRUM_DB_SSL_ROOT_CERT=/etc/ferrum/certs/ca.crt
+```
+
+This verifies:
+1. The connection is encrypted (TLS)
+2. The server certificate is signed by a trusted CA
+3. The server hostname matches the certificate's CN or SAN
+
+#### Encrypted + CA Verification (No Hostname Check)
+
+```bash
+export FERRUM_DB_SSL_MODE=verify-ca
+export FERRUM_DB_SSL_ROOT_CERT=/etc/ferrum/certs/ca.crt
+```
+
+#### Encrypted Only (No Verification)
+
+```bash
+export FERRUM_DB_SSL_MODE=require
+```
+
+Encrypts the connection but does not verify the server certificate. Suitable for development or when using private networks.
+
+#### Mutual TLS (Client Certificate Authentication)
+
+```bash
+export FERRUM_DB_SSL_MODE=verify-full
+export FERRUM_DB_SSL_ROOT_CERT=/etc/ferrum/certs/ca.crt
+export FERRUM_DB_SSL_CLIENT_CERT=/etc/ferrum/certs/client.crt
+export FERRUM_DB_SSL_CLIENT_KEY=/etc/ferrum/certs/client.key
+```
+
+Requires PostgreSQL to be configured with `ssl_ca_file` pointing to a CA that signed the client certificate, and `pg_hba.conf` entries using `hostssl ... cert` authentication.
+
+### Docker Example
+
+```bash
+# Generate test certificates
+openssl genrsa -out ca.key 4096
+openssl req -new -x509 -days 365 -key ca.key -out ca.crt -subj "/CN=Test CA"
+openssl genrsa -out server.key 2048
+openssl req -new -key server.key -out server.csr -subj "/CN=postgres"
+openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial \
+  -days 365 -out server.crt
+
+# Start PostgreSQL with TLS
+docker run -d \
+  --name pg-tls \
+  -p 5432:5432 \
+  -e POSTGRES_DB=ferrum \
+  -e POSTGRES_USER=ferrum \
+  -e POSTGRES_PASSWORD=secret \
+  -v $(pwd)/certs:/certs-src:ro \
+  --entrypoint sh \
+  postgres:16 \
+  -c 'cp /certs-src/server.crt /var/lib/postgresql/ &&
+      cp /certs-src/server.key /var/lib/postgresql/ &&
+      cp /certs-src/ca.crt /var/lib/postgresql/ &&
+      chown postgres:postgres /var/lib/postgresql/server.* /var/lib/postgresql/ca.crt &&
+      chmod 600 /var/lib/postgresql/server.key &&
+      exec docker-entrypoint.sh postgres \
+        -c ssl=on \
+        -c ssl_cert_file=/var/lib/postgresql/server.crt \
+        -c ssl_key_file=/var/lib/postgresql/server.key \
+        -c ssl_ca_file=/var/lib/postgresql/ca.crt'
+
+# Start gateway with TLS verification
+docker run -d \
+  -e FERRUM_MODE=database \
+  -e FERRUM_DB_TYPE=postgres \
+  -e FERRUM_DB_URL="postgres://ferrum:secret@host.docker.internal:5432/ferrum" \
+  -e FERRUM_DB_SSL_MODE=verify-full \
+  -e FERRUM_DB_SSL_ROOT_CERT=/certs/ca.crt \
+  -e FERRUM_ADMIN_JWT_SECRET=your-secret \
+  -v $(pwd)/certs:/certs:ro \
+  ferrum-gateway
+```
+
+## MySQL TLS Setup
+
+### Server-Side Setup
+
+Enable SSL in MySQL by setting system variables:
+
+```sql
+-- my.cnf or command-line flags
+[mysqld]
+require_secure_transport = ON
+ssl-cert = /path/to/server-cert.pem
+ssl-key = /path/to/server-key.pem
+ssl-ca = /path/to/ca.pem
+```
+
+### Gateway Configuration
+
+#### Encrypted + Identity Verification (Production)
+
+```bash
+export FERRUM_MODE=database
+export FERRUM_DB_TYPE=mysql
+export FERRUM_DB_URL="mysql://ferrum:password@db-host:3306/ferrum"
+export FERRUM_DB_SSL_MODE=verify-full
+export FERRUM_DB_SSL_ROOT_CERT=/etc/ferrum/certs/ca.crt
+```
+
+`verify-full` is automatically translated to MySQL's `VERIFY_IDENTITY`, which verifies the server certificate and checks that the hostname matches.
+
+#### Encrypted + CA Verification Only
+
+```bash
+export FERRUM_DB_SSL_MODE=verify-ca
+export FERRUM_DB_SSL_ROOT_CERT=/etc/ferrum/certs/ca.crt
+```
+
+Translated to MySQL's `VERIFY_CA`.
+
+#### Encrypted Only
+
+```bash
+export FERRUM_DB_SSL_MODE=require
+```
+
+Translated to MySQL's `REQUIRED`.
+
+#### Mutual TLS
+
+```bash
+export FERRUM_DB_SSL_MODE=verify-full
+export FERRUM_DB_SSL_ROOT_CERT=/etc/ferrum/certs/ca.crt
+export FERRUM_DB_SSL_CLIENT_CERT=/etc/ferrum/certs/client.crt
+export FERRUM_DB_SSL_CLIENT_KEY=/etc/ferrum/certs/client.key
+```
+
+### Docker Example
+
+```bash
+# Start MySQL with TLS
+docker run -d \
+  --name mysql-tls \
+  -p 3306:3306 \
+  -e MYSQL_DATABASE=ferrum \
+  -e MYSQL_USER=ferrum \
+  -e MYSQL_PASSWORD=secret \
+  -e MYSQL_ROOT_PASSWORD=root-secret \
+  -v $(pwd)/certs/server-cert.pem:/etc/mysql/ssl/server-cert.pem:ro \
+  -v $(pwd)/certs/server-key.pem:/etc/mysql/ssl/server-key.pem:ro \
+  -v $(pwd)/certs/ca.pem:/etc/mysql/ssl/ca.pem:ro \
+  mysql:8 \
+  --require-secure-transport=ON \
+  --ssl-cert=/etc/mysql/ssl/server-cert.pem \
+  --ssl-key=/etc/mysql/ssl/server-key.pem \
+  --ssl-ca=/etc/mysql/ssl/ca.pem
+
+# Start gateway
+docker run -d \
+  -e FERRUM_MODE=database \
+  -e FERRUM_DB_TYPE=mysql \
+  -e FERRUM_DB_URL="mysql://ferrum:secret@host.docker.internal:3306/ferrum" \
+  -e FERRUM_DB_SSL_MODE=verify-full \
+  -e FERRUM_DB_SSL_ROOT_CERT=/certs/ca.crt \
+  -e FERRUM_ADMIN_JWT_SECRET=your-secret \
+  -v $(pwd)/certs:/certs:ro \
+  ferrum-gateway
+```
+
+## SQLite
+
+SQLite is an embedded, file-based database. It does not use network connections, so TLS is not applicable. Any `FERRUM_DB_SSL_*` or `FERRUM_DB_TLS_*` environment variables are silently ignored when `FERRUM_DB_TYPE=sqlite`.
+
+```bash
+export FERRUM_MODE=database
+export FERRUM_DB_TYPE=sqlite
+export FERRUM_DB_URL="sqlite:///data/ferrum.db?mode=rwc"
+# FERRUM_DB_SSL_* variables are ignored — no warning, no error
+```
+
+## SSL Mode Reference
+
+| Mode          | Encrypted | Server Cert Verified | Hostname Verified | Use Case                         |
+|---------------|-----------|----------------------|-------------------|----------------------------------|
+| `disable`     | No        | No                   | No                | Development only                 |
+| `prefer`      | Maybe     | No                   | No                | Development (uses TLS if server supports it) |
+| `require`     | Yes       | No                   | No                | Private networks, testing        |
+| `verify-ca`   | Yes       | Yes                  | No                | Trusted CA, dynamic hostnames    |
+| `verify-full` | Yes       | Yes                  | Yes               | **Production (recommended)**     |
+
+## Managed Database Services
+
+Most managed database services (AWS RDS, Azure Database, Google Cloud SQL) provide TLS by default. Use the CA certificate bundle provided by the cloud provider.
+
+### AWS RDS PostgreSQL
+
+```bash
+export FERRUM_DB_TYPE=postgres
+export FERRUM_DB_URL="postgres://ferrum:password@mydb.xxxx.us-east-1.rds.amazonaws.com:5432/ferrum"
+export FERRUM_DB_SSL_MODE=verify-full
+export FERRUM_DB_SSL_ROOT_CERT=/etc/ferrum/rds-combined-ca-bundle.pem
+```
+
+### AWS RDS MySQL
+
+```bash
+export FERRUM_DB_TYPE=mysql
+export FERRUM_DB_URL="mysql://ferrum:password@mydb.xxxx.us-east-1.rds.amazonaws.com:3306/ferrum"
+export FERRUM_DB_SSL_MODE=verify-full
+export FERRUM_DB_SSL_ROOT_CERT=/etc/ferrum/rds-combined-ca-bundle.pem
+```
+
+### Azure Database for PostgreSQL
+
+```bash
+export FERRUM_DB_TYPE=postgres
+export FERRUM_DB_URL="postgres://ferrum:password@mydb.postgres.database.azure.com:5432/ferrum"
+export FERRUM_DB_SSL_MODE=verify-full
+export FERRUM_DB_SSL_ROOT_CERT=/etc/ferrum/DigiCertGlobalRootCA.crt.pem
+```
+
+## Functional Testing
+
+The project includes functional tests that verify TLS database connectivity end-to-end.
+
+### Setup
+
+```bash
+# Generate certificates and start TLS-enabled database containers
+./tests/scripts/setup_db_tls.sh
+
+# Build the gateway
+cargo build
+```
+
+### Run Tests
+
+```bash
+# Run all database TLS tests
+cargo test --test functional_tests functional_db_tls -- --ignored --nocapture
+
+# Run individual tests
+cargo test --test functional_tests test_postgresql_tls_verify_full -- --ignored --nocapture
+cargo test --test functional_tests test_mysql_tls_verify_identity -- --ignored --nocapture
+cargo test --test functional_tests test_sqlite_ignores_tls_settings -- --ignored --nocapture
+```
+
+### Test Coverage
+
+| Test                                   | Database   | TLS Mode        | What It Verifies                                |
+|----------------------------------------|------------|-----------------|------------------------------------------------|
+| `test_postgresql_tls_verify_full`      | PostgreSQL | verify-full     | Full cert verification + CRUD + proxy routing   |
+| `test_postgresql_tls_require`          | PostgreSQL | require         | Encrypted connection + CRUD + proxy routing     |
+| `test_postgresql_tls_legacy_insecure`  | PostgreSQL | legacy insecure | Legacy `FERRUM_DB_TLS_*` env vars work          |
+| `test_mysql_tls_verify_identity`       | MySQL      | verify-full     | Full cert verification + CRUD + proxy routing   |
+| `test_mysql_tls_required`              | MySQL      | require         | Encrypted connection + CRUD + proxy routing     |
+| `test_mysql_tls_legacy_insecure`       | MySQL      | legacy insecure | Legacy `FERRUM_DB_TLS_*` env vars work          |
+| `test_sqlite_ignores_tls_settings`     | SQLite     | N/A             | SSL env vars are silently ignored               |
+| `test_health_endpoint_shows_db_status` | PostgreSQL | require         | Health endpoint works with TLS database         |
+
+Each test performs a complete CRUD cycle:
+1. Creates an upstream, proxy, consumer, and plugin config via the Admin API
+2. Reads each resource back and verifies correctness
+3. Waits for database polling to load the proxy into the routing table
+4. Sends an HTTP request through the proxy to verify end-to-end routing
+5. Updates and verifies a proxy modification
+6. Lists all resources
+7. Deletes all resources
+
+### Cleanup
+
+```bash
+# Stop and remove the test database containers
+./tests/scripts/setup_db_tls.sh --cleanup
+```
+
+## Troubleshooting
+
+### "certificate verify failed" / "ssl_ca_file not found"
+
+- Verify the CA cert path exists and is readable by the gateway process
+- Ensure the CA cert was used to sign the server's certificate
+- For `verify-full`: ensure the server hostname matches the certificate's CN or SAN
+
+### "SSL required" from MySQL
+
+MySQL's `require_secure_transport=ON` rejects non-TLS connections. Set at least `FERRUM_DB_SSL_MODE=require`.
+
+### PostgreSQL key permission errors
+
+PostgreSQL requires the server key file to have `chmod 600` and be owned by the postgres user. The setup script handles this via a copy-and-chown step.
+
+### Connection works without TLS env vars
+
+If the database URL already contains SSL parameters (e.g., `?sslmode=require`), those take precedence. The `FERRUM_DB_SSL_*` variables are appended and may conflict. Use one approach or the other.
