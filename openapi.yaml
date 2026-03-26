@@ -49,6 +49,8 @@ tags:
     description: Manage upstream groups for load-balanced backends
   - name: Batch
     description: Bulk resource creation for high-throughput provisioning
+  - name: Backup & Restore
+    description: Full configuration backup and restore for disaster recovery and migration
 
 paths:
   # ── Health ──────────────────────────────────────────────────────────
@@ -170,6 +172,145 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/ReadOnly"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  # ── Backup & Restore ────────────────────────────────────────────────
+  /backup:
+    get:
+      operationId: backupConfig
+      summary: Export full gateway configuration
+      description: |
+        Returns the complete gateway configuration as a single JSON document
+        suitable for archival or later restoration via `POST /restore`.
+
+        The output format is compatible with `POST /batch` (additive import)
+        and `POST /restore` (full replacement). Consumer credentials are
+        included **unredacted** since this is a backup endpoint.
+
+        Falls back to the in-memory cached configuration when the database is
+        unavailable, indicated by the `X-Data-Source: cached` response header.
+
+        ### Size guidance
+
+        The response is a single JSON document containing all requested
+        resources. Typical sizes:
+
+        | Deployment | Resources | Approx size |
+        |------------|-----------|-------------|
+        | Small | ~100 proxies, ~50 consumers | 100–200 KB |
+        | Medium | ~1,000 proxies, ~500 consumers | 1–2 MB |
+        | Large | ~5,000 proxies, ~3,000 consumers | 5–10 MB |
+        | Very large | 10,000+ proxies, 5,000+ consumers | 15+ MB |
+
+        For very large deployments, use the `resources` query parameter to
+        back up individual resource types separately.
+      tags: [Backup & Restore]
+      parameters:
+        - name: resources
+          in: query
+          required: false
+          description: |
+            Comma-separated list of resource types to include.
+            Valid values: `proxies`, `consumers`, `plugin_configs`, `upstreams`.
+            When omitted, all resource types are included.
+          schema:
+            type: string
+            example: "proxies,upstreams"
+      responses:
+        "200":
+          description: Full configuration backup
+          headers:
+            Content-Disposition:
+              schema:
+                type: string
+                example: 'attachment; filename="ferrum-backup.json"'
+            X-Data-Source:
+              schema:
+                type: string
+                enum: [database, cached]
+                description: Where the config was read from
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BackupResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /restore:
+    post:
+      operationId: restoreConfig
+      summary: Replace all configuration from a backup
+      description: |
+        **Destructive operation** — deletes ALL existing resources and imports
+        the provided configuration. Requires `?confirm=true` query parameter
+        to prevent accidental invocation.
+
+        Accepts the same JSON format produced by `GET /backup`. Resources are
+        imported in dependency order (consumers & upstreams first, then proxies,
+        then plugin configs).
+
+        To perform an additive (non-destructive) import, use `POST /batch`
+        instead.
+
+        ### Body size limit
+
+        Default: **100 MiB** (supports ~30K proxies + 90K plugins).
+        Configurable via the `FERRUM_ADMIN_RESTORE_MAX_BODY_SIZE_MIB`
+        environment variable. Returns `413 Payload Too Large` when exceeded.
+
+        Database inserts are chunked into 1,000-record transactions to keep
+        WAL/redo size bounded. A 90K-plugin restore runs as 90 commits, not
+        one massive transaction.
+
+        For configurations exceeding the body limit, restore resource types
+        separately using `POST /batch` with partial backup files
+        (generated via `GET /backup?resources=proxies`, etc.).
+      tags: [Backup & Restore]
+      parameters:
+        - name: confirm
+          in: query
+          required: true
+          description: Must be `true` to confirm the destructive operation
+          schema:
+            type: boolean
+            enum: [true]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RestoreRequest"
+      responses:
+        "200":
+          description: Configuration restored successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RestoreResponse"
+        "207":
+          description: Partial success — some resource types failed during import
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/RestoreResponse"
+                  - type: object
+                    properties:
+                      errors:
+                        type: array
+                        items:
+                          type: string
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/ReadOnly"
+        "413":
+          description: Request body too large (default max 100 MiB, configurable via FERRUM_ADMIN_RESTORE_MAX_BODY_SIZE_MIB)
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
 
@@ -1616,6 +1757,100 @@ components:
             upstreams:
               type: integer
               description: Number of upstreams created
+        errors:
+          type: array
+          items:
+            type: string
+          description: Present only on 207 Multi-Status; lists per-type error messages
+
+    BackupResponse:
+      type: object
+      required: [version, exported_at, source, counts, proxies, consumers, plugin_configs, upstreams]
+      properties:
+        version:
+          type: string
+          description: Configuration schema version
+          example: "1"
+        exported_at:
+          type: string
+          format: date-time
+          description: ISO 8601 timestamp of when the backup was created
+        source:
+          type: string
+          enum: [database, cached]
+          description: Where the config was read from
+        counts:
+          type: object
+          required: [proxies, consumers, plugin_configs, upstreams]
+          properties:
+            proxies:
+              type: integer
+            consumers:
+              type: integer
+            plugin_configs:
+              type: integer
+            upstreams:
+              type: integer
+        proxies:
+          type: array
+          items:
+            $ref: "#/components/schemas/Proxy"
+        consumers:
+          type: array
+          items:
+            $ref: "#/components/schemas/Consumer"
+        plugin_configs:
+          type: array
+          items:
+            $ref: "#/components/schemas/PluginConfig"
+        upstreams:
+          type: array
+          items:
+            $ref: "#/components/schemas/Upstream"
+
+    RestoreRequest:
+      type: object
+      description: |
+        Same format as the backup output or the batch create request.
+        All fields are optional — omitted resource types are treated as empty.
+      properties:
+        proxies:
+          type: array
+          items:
+            $ref: "#/components/schemas/Proxy"
+        consumers:
+          type: array
+          items:
+            $ref: "#/components/schemas/Consumer"
+        plugin_configs:
+          type: array
+          items:
+            $ref: "#/components/schemas/PluginConfig"
+        upstreams:
+          type: array
+          items:
+            $ref: "#/components/schemas/Upstream"
+
+    RestoreResponse:
+      type: object
+      required: [restored]
+      properties:
+        restored:
+          type: object
+          required: [proxies, consumers, plugin_configs, upstreams]
+          properties:
+            proxies:
+              type: integer
+              description: Number of proxies restored
+            consumers:
+              type: integer
+              description: Number of consumers restored
+            plugin_configs:
+              type: integer
+              description: Number of plugin configs restored
+            upstreams:
+              type: integer
+              description: Number of upstreams restored
         errors:
           type: array
           items:

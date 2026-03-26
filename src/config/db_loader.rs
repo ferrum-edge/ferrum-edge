@@ -1202,11 +1202,25 @@ impl DatabaseStore {
         (proxy_ids, consumer_ids, plugin_config_ids, upstream_ids)
     }
 
-    /// Batch-create multiple proxies in a single transaction.
+    /// Maximum records per database transaction for batch operations.
+    /// Keeps transaction WAL/redo log size manageable and reduces lock hold time.
+    const BATCH_CHUNK_SIZE: usize = 1000;
+
+    /// Batch-create multiple proxies, chunked into transactions of
+    /// [`BATCH_CHUNK_SIZE`] for large-scale imports.
     pub async fn batch_create_proxies(&self, proxies: &[Proxy]) -> Result<usize, anyhow::Error> {
         if proxies.is_empty() {
             return Ok(0);
         }
+        let mut total = 0usize;
+        for chunk in proxies.chunks(Self::BATCH_CHUNK_SIZE) {
+            total += self.batch_create_proxies_chunk(chunk).await?;
+        }
+        Ok(total)
+    }
+
+    /// Insert a single chunk of proxies in one transaction.
+    async fn batch_create_proxies_chunk(&self, proxies: &[Proxy]) -> Result<usize, anyhow::Error> {
         let mut tx = self.pool.begin().await?;
         let insert_sql = self.q("INSERT INTO proxies (id, name, listen_path, backend_protocol, backend_host, backend_port, backend_path, strip_listen_path, preserve_host_header, backend_connect_timeout_ms, backend_read_timeout_ms, backend_write_timeout_ms, backend_tls_client_cert_path, backend_tls_client_key_path, backend_tls_verify_server_cert, backend_tls_server_ca_cert_path, dns_override, dns_cache_ttl_seconds, auth_mode, upstream_id, circuit_breaker, retry, response_body_mode, pool_max_idle_per_host, pool_idle_timeout_seconds, pool_enable_http_keep_alive, pool_enable_http2, pool_tcp_keepalive_seconds, pool_http2_keep_alive_interval_seconds, pool_http2_keep_alive_timeout_seconds, listen_port, frontend_tls, udp_idle_timeout_seconds, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
         let assoc_sql =
@@ -1300,7 +1314,8 @@ impl DatabaseStore {
         Ok(count)
     }
 
-    /// Batch-create multiple consumers in a single transaction.
+    /// Batch-create multiple consumers, chunked into transactions of
+    /// [`BATCH_CHUNK_SIZE`] for large-scale imports.
     pub async fn batch_create_consumers(
         &self,
         consumers: &[Consumer],
@@ -1308,6 +1323,18 @@ impl DatabaseStore {
         if consumers.is_empty() {
             return Ok(0);
         }
+        let mut total = 0usize;
+        for chunk in consumers.chunks(Self::BATCH_CHUNK_SIZE) {
+            total += self.batch_create_consumers_chunk(chunk).await?;
+        }
+        Ok(total)
+    }
+
+    /// Insert a single chunk of consumers in one transaction.
+    async fn batch_create_consumers_chunk(
+        &self,
+        consumers: &[Consumer],
+    ) -> Result<usize, anyhow::Error> {
         let mut tx = self.pool.begin().await?;
         let sql = self.q("INSERT INTO consumers (id, username, custom_id, credentials, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)");
 
@@ -1329,7 +1356,8 @@ impl DatabaseStore {
         Ok(count)
     }
 
-    /// Batch-create multiple plugin configs in a single transaction.
+    /// Batch-create multiple plugin configs, chunked into transactions of
+    /// [`BATCH_CHUNK_SIZE`] for large-scale imports.
     pub async fn batch_create_plugin_configs(
         &self,
         configs: &[PluginConfig],
@@ -1337,6 +1365,18 @@ impl DatabaseStore {
         if configs.is_empty() {
             return Ok(0);
         }
+        let mut total = 0usize;
+        for chunk in configs.chunks(Self::BATCH_CHUNK_SIZE) {
+            total += self.batch_create_plugin_configs_chunk(chunk).await?;
+        }
+        Ok(total)
+    }
+
+    /// Insert a single chunk of plugin configs in one transaction.
+    async fn batch_create_plugin_configs_chunk(
+        &self,
+        configs: &[PluginConfig],
+    ) -> Result<usize, anyhow::Error> {
         let mut tx = self.pool.begin().await?;
         let sql = self.q("INSERT INTO plugin_configs (id, plugin_name, config, scope, proxy_id, enabled, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
 
@@ -1364,7 +1404,8 @@ impl DatabaseStore {
         Ok(count)
     }
 
-    /// Batch-create multiple upstreams in a single transaction.
+    /// Batch-create multiple upstreams, chunked into transactions of
+    /// [`BATCH_CHUNK_SIZE`] for large-scale imports.
     pub async fn batch_create_upstreams(
         &self,
         upstreams: &[Upstream],
@@ -1372,6 +1413,18 @@ impl DatabaseStore {
         if upstreams.is_empty() {
             return Ok(0);
         }
+        let mut total = 0usize;
+        for chunk in upstreams.chunks(Self::BATCH_CHUNK_SIZE) {
+            total += self.batch_create_upstreams_chunk(chunk).await?;
+        }
+        Ok(total)
+    }
+
+    /// Insert a single chunk of upstreams in one transaction.
+    async fn batch_create_upstreams_chunk(
+        &self,
+        upstreams: &[Upstream],
+    ) -> Result<usize, anyhow::Error> {
         let mut tx = self.pool.begin().await?;
         let sql = self.q("INSERT INTO upstreams (id, name, targets, algorithm, hash_on, health_checks, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
 
@@ -1400,6 +1453,35 @@ impl DatabaseStore {
         let count = upstreams.len();
         tx.commit().await?;
         Ok(count)
+    }
+
+    /// Delete all resources from all tables in a single transaction.
+    ///
+    /// Deletion order respects foreign key constraints:
+    /// 1. proxy_plugins (junction table)
+    /// 2. plugin_configs (may reference proxies)
+    /// 3. proxies (may reference upstreams)
+    /// 4. consumers
+    /// 5. upstreams
+    pub async fn delete_all_resources(&self) -> Result<(), anyhow::Error> {
+        let mut tx = self.pool.begin().await?;
+
+        sqlx::query("DELETE FROM proxy_plugins")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM plugin_configs")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM proxies").execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM consumers")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM upstreams")
+            .execute(&mut *tx)
+            .await?;
+
+        tx.commit().await?;
+        Ok(())
     }
 
     pub fn pool(&self) -> &AnyPool {

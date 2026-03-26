@@ -29,6 +29,7 @@ use crate::config::types::{
 use crate::plugins;
 use crate::proxy::ProxyState;
 use arc_swap::ArcSwap;
+use serde::{Deserialize, Serialize};
 
 /// Admin API state.
 #[derive(Clone)]
@@ -246,6 +247,7 @@ pub async fn handle_admin_request(
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     let method = req.method().clone();
     let path = req.uri().path().to_string();
+    let query = req.uri().query().map(|q| q.to_string());
     let pagination = parse_pagination(req.uri());
 
     // Health check (unauthenticated)
@@ -336,16 +338,27 @@ pub async fn handle_admin_request(
         }
     }
 
-    // Read body with 1 MiB size limit
-    const MAX_BODY_SIZE: usize = 1024 * 1024; // 1 MiB
-    let body_bytes = match Limited::new(req.into_body(), MAX_BODY_SIZE).collect().await {
+    // Read body with size limit.
+    // /restore gets a configurable limit (default 100 MiB) for large-scale
+    // backups (30K+ proxies / 90K+ plugins can reach ~80 MB);
+    // all other endpoints use the standard 1 MiB limit.
+    let restore_max_mib: usize = if path == "/restore" {
+        std::env::var("FERRUM_ADMIN_RESTORE_MAX_BODY_SIZE_MIB")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(100)
+    } else {
+        1
+    };
+    let max_body_size = restore_max_mib * 1024 * 1024;
+    let body_bytes = match Limited::new(req.into_body(), max_body_size).collect().await {
         Ok(collected) => collected.to_bytes().to_vec(),
         Err(e) => {
             let msg = e.to_string();
             if msg.contains("length limit exceeded") {
                 return Ok(json_response(
                     StatusCode::PAYLOAD_TOO_LARGE,
-                    &json!({"error": "Request body too large (max 1 MiB)"}),
+                    &json!({"error": format!("Request body too large (max {} MiB)", restore_max_mib)}),
                 ));
             }
             Vec::new()
@@ -403,6 +416,10 @@ pub async fn handle_admin_request(
 
         // Batch create
         (Method::POST, ["batch"]) => handle_batch_create(&state, &body_bytes).await,
+
+        // Backup & Restore
+        (Method::GET, ["backup"]) => handle_backup(&state, query.as_deref()).await,
+        (Method::POST, ["restore"]) => handle_restore(&state, &body_bytes, query.as_deref()).await,
 
         // Metrics
         (Method::GET, ["admin", "metrics"]) => handle_metrics(&state).await,
@@ -2004,6 +2021,359 @@ async fn handle_batch_create(
     }
 
     Ok(json_response(StatusCode::CREATED, &response))
+}
+
+// ---- Backup & Restore ----
+
+/// Parse the `resources` query parameter into a set of included resource types.
+/// Returns `None` when no filter is specified (include all).
+fn parse_backup_resources(query: Option<&str>) -> Option<std::collections::HashSet<&str>> {
+    let query = query?;
+    for pair in query.split('&') {
+        let mut parts = pair.splitn(2, '=');
+        if let (Some(key), Some(val)) = (parts.next(), parts.next())
+            && key == "resources"
+        {
+            return Some(val.split(',').collect());
+        }
+    }
+    None
+}
+
+/// Typed backup payload — serializes directly from config structs without an
+/// intermediate `serde_json::Value` tree. At 30K proxies / 90K plugins this
+/// saves ~80 MB of peak heap vs the `json!()` macro approach.
+#[derive(Serialize)]
+struct BackupPayload<'a> {
+    version: &'a str,
+    exported_at: String,
+    source: &'a str,
+    counts: BackupCounts,
+    proxies: &'a [Proxy],
+    consumers: &'a [Consumer],
+    plugin_configs: &'a [PluginConfig],
+    upstreams: &'a [Upstream],
+}
+
+#[derive(Serialize)]
+struct BackupCounts {
+    proxies: usize,
+    consumers: usize,
+    plugin_configs: usize,
+    upstreams: usize,
+}
+
+/// Export the full gateway configuration as a JSON backup.
+///
+/// Returns the complete config (proxies, consumers, plugin_configs, upstreams)
+/// in the same format accepted by `POST /batch` and `POST /restore`, so the
+/// output can be directly used to restore the gateway.
+///
+/// Consumer credentials are included **unredacted** (this is a backup endpoint).
+///
+/// Supports `?resources=proxies,consumers` to export only specific resource types.
+///
+/// Reads from the database first; falls back to the in-memory cached config
+/// when the database is unavailable.
+///
+/// Memory: serializes directly from the config structs (no intermediate
+/// `serde_json::Value` copy), so peak memory is config + output buffer.
+async fn handle_backup(
+    state: &AdminState,
+    query: Option<&str>,
+) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    let resource_filter = parse_backup_resources(query);
+
+    // Try database first, then cached config
+    let (config, source) = if let Some(ref db) = state.db {
+        match db.load_full_config().await {
+            Ok(config) => (config, "database"),
+            Err(e) => {
+                warn!("Backup: database load failed, trying cached config: {}", e);
+                match state.cached_gateway_config() {
+                    Some(c) => ((*c).clone(), "cached"),
+                    None => {
+                        return Ok(json_response(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            &json!({"error": "Database unavailable and no cached config"}),
+                        ));
+                    }
+                }
+            }
+        }
+    } else {
+        match state.cached_gateway_config() {
+            Some(c) => ((*c).clone(), "cached"),
+            None => {
+                return Ok(json_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    &json!({"error": "No database configured and no cached config available"}),
+                ));
+            }
+        }
+    };
+
+    // Determine which resource types to include
+    let include_proxies = resource_filter
+        .as_ref()
+        .is_none_or(|f| f.contains("proxies"));
+    let include_consumers = resource_filter
+        .as_ref()
+        .is_none_or(|f| f.contains("consumers"));
+    let include_plugin_configs = resource_filter
+        .as_ref()
+        .is_none_or(|f| f.contains("plugin_configs"));
+    let include_upstreams = resource_filter
+        .as_ref()
+        .is_none_or(|f| f.contains("upstreams"));
+
+    let empty_proxies: Vec<Proxy> = Vec::new();
+    let empty_consumers: Vec<Consumer> = Vec::new();
+    let empty_plugin_configs: Vec<PluginConfig> = Vec::new();
+    let empty_upstreams: Vec<Upstream> = Vec::new();
+
+    let proxies = if include_proxies {
+        config.proxies.as_slice()
+    } else {
+        empty_proxies.as_slice()
+    };
+    let consumers = if include_consumers {
+        config.consumers.as_slice()
+    } else {
+        empty_consumers.as_slice()
+    };
+    let plugin_configs = if include_plugin_configs {
+        config.plugin_configs.as_slice()
+    } else {
+        empty_plugin_configs.as_slice()
+    };
+    let upstreams = if include_upstreams {
+        config.upstreams.as_slice()
+    } else {
+        empty_upstreams.as_slice()
+    };
+
+    let backup = BackupPayload {
+        version: &config.version,
+        exported_at: Utc::now().to_rfc3339(),
+        source,
+        counts: BackupCounts {
+            proxies: proxies.len(),
+            consumers: consumers.len(),
+            plugin_configs: plugin_configs.len(),
+            upstreams: upstreams.len(),
+        },
+        proxies,
+        consumers,
+        plugin_configs,
+        upstreams,
+    };
+
+    // Serialize directly to bytes — no intermediate Value allocation.
+    let body_bytes = serde_json::to_vec(&backup).unwrap_or_else(|_| b"{}".to_vec());
+    info!(
+        "Backup: {} proxies, {} consumers, {} plugin_configs, {} upstreams ({} bytes)",
+        proxies.len(),
+        consumers.len(),
+        plugin_configs.len(),
+        upstreams.len(),
+        body_bytes.len()
+    );
+
+    let resp = Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "application/json")
+        .header(
+            "Content-Disposition",
+            "attachment; filename=\"ferrum-backup.json\"",
+        )
+        .header("X-Data-Source", source)
+        .body(Full::new(Bytes::from(body_bytes)))
+        .unwrap_or_else(|_| {
+            Response::new(Full::new(Bytes::from(
+                "{\"error\":\"Internal Server Error\"}",
+            )))
+        });
+    Ok(resp)
+}
+
+/// Check whether `confirm=true` is present in the query string.
+fn parse_restore_confirm(query: Option<&str>) -> bool {
+    let query = match query {
+        Some(q) => q,
+        None => return false,
+    };
+    for pair in query.split('&') {
+        let mut parts = pair.splitn(2, '=');
+        if let (Some(key), Some(val)) = (parts.next(), parts.next())
+            && key == "confirm"
+            && val == "true"
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Typed restore payload — deserializes directly into typed structs without an
+/// intermediate `serde_json::Value` tree. This halves peak memory usage vs the
+/// two-pass `Value → from_value` approach.
+///
+/// Extra fields from `GET /backup` (version, exported_at, source, counts) are
+/// silently ignored via `#[serde(default)]`.
+#[derive(Deserialize)]
+struct RestorePayload {
+    #[serde(default)]
+    proxies: Vec<Proxy>,
+    #[serde(default)]
+    consumers: Vec<Consumer>,
+    #[serde(default)]
+    plugin_configs: Vec<PluginConfig>,
+    #[serde(default)]
+    upstreams: Vec<Upstream>,
+}
+
+/// Restore the gateway configuration from a backup payload.
+///
+/// This is a **destructive** operation that replaces all existing configuration:
+/// 1. Parses and validates the entire payload (fail-fast before any deletion)
+/// 2. Deletes ALL existing resources (proxies, consumers, plugin_configs, upstreams)
+/// 3. Imports the provided resources in dependency order using chunked transactions
+///
+/// Requires `?confirm=true` query parameter to prevent accidental invocation.
+///
+/// Memory: deserializes directly into typed structs (no intermediate
+/// `serde_json::Value` copy), so peak memory is body bytes + parsed structs.
+/// Database inserts are chunked into 1,000-record transactions to keep WAL
+/// size bounded and avoid prolonged lock holds.
+async fn handle_restore(
+    state: &AdminState,
+    body: &[u8],
+    query: Option<&str>,
+) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    if state.read_only {
+        return Ok(json_response(
+            StatusCode::FORBIDDEN,
+            &json!({"error": "Admin API is in read-only mode"}),
+        ));
+    }
+
+    let db = match &state.db {
+        Some(db) => db,
+        None => {
+            return Ok(json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &json!({"error": "No database"}),
+            ));
+        }
+    };
+
+    if !parse_restore_confirm(query) {
+        return Ok(json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({
+                "error": "Restore is a destructive operation that replaces all existing configuration. Pass ?confirm=true to proceed."
+            }),
+        ));
+    }
+
+    // Phase 1: Parse all resources directly into typed structs before deleting
+    // anything. This avoids an intermediate serde_json::Value copy (~50% less
+    // peak memory at scale).
+    let payload: RestorePayload = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(e) => {
+            return Ok(json_response(
+                StatusCode::BAD_REQUEST,
+                &json!({"error": format!("Invalid JSON body: {}", e)}),
+            ));
+        }
+    };
+
+    info!(
+        "Restore: parsed payload — {} proxies, {} consumers, {} plugin_configs, {} upstreams ({} bytes)",
+        payload.proxies.len(),
+        payload.consumers.len(),
+        payload.plugin_configs.len(),
+        payload.upstreams.len(),
+        body.len()
+    );
+
+    // Phase 2: Delete all existing resources
+    if let Err(e) = db.delete_all_resources().await {
+        error!("Restore: failed to delete existing resources: {}", e);
+        return Ok(json_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &json!({"error": format!("Failed to clear existing config: {}", e)}),
+        ));
+    }
+
+    info!("Restore: cleared existing config, beginning import");
+
+    // Phase 3: Import resources in dependency order.
+    // Each batch_create_* method internally chunks into 1,000-record
+    // transactions to keep WAL/redo size bounded.
+    let mut errors: Vec<String> = Vec::new();
+    let mut created_consumers = 0usize;
+    let mut created_upstreams = 0usize;
+    let mut created_proxies = 0usize;
+    let mut created_plugin_configs = 0usize;
+
+    // Consumers first (no dependencies)
+    if !payload.consumers.is_empty() {
+        match db.batch_create_consumers(&payload.consumers).await {
+            Ok(n) => created_consumers = n,
+            Err(e) => errors.push(format!("consumers: {}", e)),
+        }
+    }
+
+    // Upstreams (no dependencies)
+    if !payload.upstreams.is_empty() {
+        match db.batch_create_upstreams(&payload.upstreams).await {
+            Ok(n) => created_upstreams = n,
+            Err(e) => errors.push(format!("upstreams: {}", e)),
+        }
+    }
+
+    // Proxies (may reference upstreams)
+    if !payload.proxies.is_empty() {
+        match db.batch_create_proxies(&payload.proxies).await {
+            Ok(n) => created_proxies = n,
+            Err(e) => errors.push(format!("proxies: {}", e)),
+        }
+    }
+
+    // Plugin configs (may reference proxies)
+    if !payload.plugin_configs.is_empty() {
+        match db
+            .batch_create_plugin_configs(&payload.plugin_configs)
+            .await
+        {
+            Ok(n) => created_plugin_configs = n,
+            Err(e) => errors.push(format!("plugin_configs: {}", e)),
+        }
+    }
+
+    info!(
+        "Restore: imported {} proxies, {} consumers, {} plugin_configs, {} upstreams",
+        created_proxies, created_consumers, created_plugin_configs, created_upstreams
+    );
+
+    let mut response = json!({
+        "restored": {
+            "proxies": created_proxies,
+            "consumers": created_consumers,
+            "plugin_configs": created_plugin_configs,
+            "upstreams": created_upstreams,
+        }
+    });
+
+    if !errors.is_empty() {
+        response["errors"] = json!(errors);
+        return Ok(json_response(StatusCode::MULTI_STATUS, &response));
+    }
+
+    Ok(json_response(StatusCode::OK, &response))
 }
 
 // ---- Helpers ----

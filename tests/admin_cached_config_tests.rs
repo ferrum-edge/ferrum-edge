@@ -892,3 +892,245 @@ async fn test_batch_create_empty_request() {
     assert_eq!(body["created"]["plugin_configs"], 0);
     assert_eq!(body["created"]["upstreams"], 0);
 }
+
+// ---- Backup & Restore Tests ----
+
+#[tokio::test]
+async fn test_backup_returns_full_config() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    // Seed some data via batch
+    let seed = json!({
+        "consumers": [
+            {"id": "bc1", "username": "backup_user1", "credentials": {}},
+            {"id": "bc2", "username": "backup_user2", "credentials": {}}
+        ],
+        "upstreams": [
+            {"id": "bu1", "name": "backup_upstream", "targets": [{"host": "10.0.0.1", "port": 8080, "weight": 100}]}
+        ],
+        "proxies": [
+            {"id": "bp1", "listen_path": "/backup1", "backend_protocol": "http", "backend_host": "localhost", "backend_port": 8080, "strip_listen_path": true, "upstream_id": "bu1"}
+        ],
+        "plugin_configs": [
+            {"id": "bpc1", "plugin_name": "rate_limiting", "scope": "global", "enabled": true, "config": {"rate": 100, "per": "second"}}
+        ]
+    });
+    let (status, _) = admin_post(&base_url, "/batch", &token, &seed).await;
+    assert_eq!(status, 201);
+
+    // Backup
+    let (status, body, data_source) = admin_get(&base_url, "/backup", &token).await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(data_source.as_deref(), Some("database"));
+
+    // Verify counts
+    assert_eq!(body["counts"]["consumers"], 2);
+    assert_eq!(body["counts"]["upstreams"], 1);
+    assert_eq!(body["counts"]["proxies"], 1);
+    assert_eq!(body["counts"]["plugin_configs"], 1);
+
+    // Verify actual data
+    assert_eq!(body["proxies"].as_array().unwrap().len(), 1);
+    assert_eq!(body["consumers"].as_array().unwrap().len(), 2);
+    assert_eq!(body["upstreams"].as_array().unwrap().len(), 1);
+    assert_eq!(body["plugin_configs"].as_array().unwrap().len(), 1);
+
+    // Verify metadata
+    assert!(body["exported_at"].is_string());
+    assert_eq!(body["version"], "1");
+}
+
+#[tokio::test]
+async fn test_backup_empty_config() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let (status, body, _) = admin_get(&base_url, "/backup", &token).await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(body["counts"]["proxies"], 0);
+    assert_eq!(body["counts"]["consumers"], 0);
+    assert_eq!(body["counts"]["plugin_configs"], 0);
+    assert_eq!(body["counts"]["upstreams"], 0);
+}
+
+#[tokio::test]
+async fn test_backup_resource_filter() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    // Seed data with all resource types
+    let seed = json!({
+        "consumers": [
+            {"id": "fc1", "username": "filter_user", "credentials": {}}
+        ],
+        "upstreams": [
+            {"id": "fu1", "name": "filter_upstream", "targets": [{"host": "10.0.0.1", "port": 8080, "weight": 100}]}
+        ],
+        "proxies": [
+            {"id": "fp1", "listen_path": "/filter", "backend_protocol": "http", "backend_host": "localhost", "backend_port": 8080, "strip_listen_path": true}
+        ],
+        "plugin_configs": [
+            {"id": "fpc1", "plugin_name": "rate_limiting", "scope": "global", "enabled": true, "config": {"rate": 100, "per": "second"}}
+        ]
+    });
+    let (status, _) = admin_post(&base_url, "/batch", &token, &seed).await;
+    assert_eq!(status, 201);
+
+    // Backup only proxies and upstreams
+    let (status, body, _) =
+        admin_get(&base_url, "/backup?resources=proxies,upstreams", &token).await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(body["counts"]["proxies"], 1);
+    assert_eq!(body["counts"]["upstreams"], 1);
+    assert_eq!(body["counts"]["consumers"], 0);
+    assert_eq!(body["counts"]["plugin_configs"], 0);
+    assert!(body["proxies"].as_array().unwrap().len() == 1);
+    assert!(body["consumers"].as_array().unwrap().is_empty());
+
+    // Backup only consumers
+    let (status, body, _) = admin_get(&base_url, "/backup?resources=consumers", &token).await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(body["counts"]["consumers"], 1);
+    assert_eq!(body["counts"]["proxies"], 0);
+}
+
+#[tokio::test]
+async fn test_restore_requires_confirm() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    // Without ?confirm=true
+    let (status, body) = admin_post(&base_url, "/restore", &token, &json!({})).await;
+    assert_eq!(status, 400);
+    assert!(body["error"].as_str().unwrap().contains("confirm=true"));
+}
+
+#[tokio::test]
+async fn test_restore_replaces_all_config() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    // Seed initial data
+    let seed = json!({
+        "consumers": [
+            {"id": "old_c1", "username": "old_user", "credentials": {}},
+        ],
+        "proxies": [
+            {"id": "old_p1", "listen_path": "/old", "backend_protocol": "http", "backend_host": "localhost", "backend_port": 8080, "strip_listen_path": true}
+        ]
+    });
+    let (status, _) = admin_post(&base_url, "/batch", &token, &seed).await;
+    assert_eq!(status, 201);
+
+    // Restore with new data
+    let restore_payload = json!({
+        "consumers": [
+            {"id": "new_c1", "username": "new_user1", "credentials": {}},
+            {"id": "new_c2", "username": "new_user2", "credentials": {}}
+        ],
+        "proxies": [
+            {"id": "new_p1", "listen_path": "/new1", "backend_protocol": "http", "backend_host": "localhost", "backend_port": 8080, "strip_listen_path": true},
+            {"id": "new_p2", "listen_path": "/new2", "backend_protocol": "http", "backend_host": "localhost", "backend_port": 8080, "strip_listen_path": true}
+        ]
+    });
+    let (status, body) =
+        admin_post(&base_url, "/restore?confirm=true", &token, &restore_payload).await;
+    assert_eq!(status, 200, "Restore failed: {:?}", body);
+    assert_eq!(body["restored"]["consumers"], 2);
+    assert_eq!(body["restored"]["proxies"], 2);
+
+    // Verify old data is gone
+    let (status, _, _) = admin_get(&base_url, "/consumers/old_c1", &token).await;
+    assert_eq!(status, reqwest::StatusCode::NOT_FOUND);
+    let (status, _, _) = admin_get(&base_url, "/proxies/old_p1", &token).await;
+    assert_eq!(status, reqwest::StatusCode::NOT_FOUND);
+
+    // Verify new data exists
+    let (status, _, _) = admin_get(&base_url, "/consumers/new_c1", &token).await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    let (status, _, _) = admin_get(&base_url, "/proxies/new_p1", &token).await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_backup_then_restore_roundtrip() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    // Seed data
+    let seed = json!({
+        "consumers": [
+            {"id": "rt_c1", "username": "roundtrip_user", "credentials": {}},
+        ],
+        "upstreams": [
+            {"id": "rt_u1", "name": "roundtrip_upstream", "targets": [{"host": "10.0.0.1", "port": 8080, "weight": 100}]}
+        ],
+        "proxies": [
+            {"id": "rt_p1", "listen_path": "/roundtrip", "backend_protocol": "http", "backend_host": "localhost", "backend_port": 8080, "strip_listen_path": true}
+        ],
+        "plugin_configs": [
+            {"id": "rt_pc1", "plugin_name": "rate_limiting", "scope": "global", "enabled": true, "config": {"rate": 50, "per": "second"}}
+        ]
+    });
+    let (status, _) = admin_post(&base_url, "/batch", &token, &seed).await;
+    assert_eq!(status, 201);
+
+    // Backup
+    let (status, backup, _) = admin_get(&base_url, "/backup", &token).await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+
+    // Wipe by restoring empty config
+    let (status, _) = admin_post(&base_url, "/restore?confirm=true", &token, &json!({})).await;
+    assert_eq!(status, 200);
+
+    // Verify wiped
+    let (status, check, _) = admin_get(&base_url, "/backup", &token).await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(check["counts"]["proxies"], 0);
+
+    // Restore from backup
+    let (status, body) = admin_post(&base_url, "/restore?confirm=true", &token, &backup).await;
+    assert_eq!(status, 200, "Roundtrip restore failed: {:?}", body);
+    assert_eq!(body["restored"]["consumers"], 1);
+    assert_eq!(body["restored"]["upstreams"], 1);
+    assert_eq!(body["restored"]["proxies"], 1);
+    assert_eq!(body["restored"]["plugin_configs"], 1);
+
+    // Verify data is back
+    let (status, _, _) = admin_get(&base_url, "/consumers/rt_c1", &token).await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    let (status, _, _) = admin_get(&base_url, "/proxies/rt_p1", &token).await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_restore_read_only_rejected() {
+    let tc = TestConfig::default();
+    let state = AdminState {
+        db: None,
+        jwt_manager: create_test_jwt_manager(&tc),
+        cached_config: None,
+        proxy_state: None,
+        mode: "test".to_string(),
+        read_only: true,
+    };
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let (status, body) = admin_post(&base_url, "/restore?confirm=true", &token, &json!({})).await;
+    assert_eq!(status, 403);
+    assert!(body["error"].as_str().unwrap().contains("read-only"));
+}

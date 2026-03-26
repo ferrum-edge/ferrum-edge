@@ -294,6 +294,7 @@ Reduce per-request allocations in plugin lookup
 | `FERRUM_DTLS_KEY_PATH` | (none) | PEM key for frontend DTLS termination |
 | `FERRUM_DTLS_CLIENT_CA_CERT_PATH` | (none) | PEM CA cert for verifying DTLS client certs (frontend mTLS) |
 | `FERRUM_PLUGIN_HTTP_SLOW_THRESHOLD_MS` | `1000` | Threshold (ms) for warning-level logs on slow plugin HTTP calls |
+| `FERRUM_ADMIN_RESTORE_MAX_BODY_SIZE_MIB` | `100` | Max request body size (MiB) for `POST /restore` |
 
 See `src/config/env_config.rs` for the full list of 90+ environment variables.
 

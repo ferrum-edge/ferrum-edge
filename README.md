@@ -23,7 +23,7 @@ Ferrum Gateway is a lightweight, extensible API gateway designed for modern micr
 - **Client Observability Headers**: `X-Gateway-Error` (connection_failure | backend_timeout | backend_error) and `X-Gateway-Upstream-Status: degraded` for failure categorization
 - **Consumer Identity Forwarding**: Automatically injects `X-Consumer-Username` and `X-Consumer-Custom-Id` headers on requests forwarded to backends after successful authentication
 - **DNS Caching**: In-memory async DNS cache with startup warmup (proxy backends + upstream targets + plugin endpoints, deduplicated), background refresh at 75% TTL, transparent `DnsCacheResolver` for all HTTP clients including plugin outbound calls, per-proxy TTL overrides, and static overrides
-- **Admin REST API**: Full CRUD for Proxies, Consumers, and Plugin Configs with JWT-protected endpoints
+- **Admin REST API**: Full CRUD for Proxies, Consumers, and Plugin Configs with JWT-protected endpoints, batch operations, and full config backup/restore
 - **Admin Read-Only Mode**: Configurable read-only mode for Admin API with automatic DP mode protection
 - **Client IP Resolution**: Secure originating IP detection via trusted proxy configuration with `X-Forwarded-For` right-to-left walk and optional authoritative header support (e.g., `CF-Connecting-IP`)
 - **Rate Limiting**: In-memory per-consumer or per-IP rate limiting with configurable windows and optional `x-ratelimit-*` header exposure
@@ -322,6 +322,7 @@ See [CI/CD Documentation](docs/ci_cd.md) for complete pipeline overview, secrets
 | `FERRUM_ADMIN_TLS_KEY_PATH` | If HTTPS | — | Path to admin TLS private key |
 | `FERRUM_ADMIN_JWT_SECRET` | DB/CP modes | — | HS256 secret for Admin API JWT auth |
 | `FERRUM_ADMIN_READ_ONLY` | All modes | `false` | Set Admin API to read-only mode (DP mode defaults to true) |
+| `FERRUM_ADMIN_RESTORE_MAX_BODY_SIZE_MIB` | No | `100` | Max request body size in MiB for `POST /restore` (supports ~30K proxies + 90K plugins at default) |
 | `FERRUM_DB_TYPE` | DB/CP modes | — | Database type: `postgres`, `mysql`, `sqlite` |
 | `FERRUM_DB_URL` | DB/CP modes | — | Database connection string |
 | `FERRUM_DB_POLL_INTERVAL` | No | `30` | Seconds between DB config polls. Incremental polling is always enabled with automatic fallback to full reload on error. |
@@ -811,6 +812,26 @@ curl -X DELETE -H "Authorization: Bearer $TOKEN" http://localhost:9000/upstreams
 Supported load balancing algorithms: `round_robin`, `weighted_round_robin`, `least_connections`, `consistent_hashing`, `random`.
 
 To use an upstream with a proxy, set the proxy's `upstream_id` field to the upstream's ID. When set, the upstream's targets override the proxy's `backend_host`/`backend_port`.
+
+#### Backup & Restore
+
+```bash
+# Full backup — exports all proxies, consumers, plugins, upstreams (unredacted)
+curl -H "Authorization: Bearer $TOKEN" \
+  http://localhost:9000/backup > ferrum-backup.json
+
+# Partial backup — only proxies and upstreams
+curl -H "Authorization: Bearer $TOKEN" \
+  "http://localhost:9000/backup?resources=proxies,upstreams" > partial-backup.json
+
+# Restore from backup (destructive — replaces all existing config)
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d @ferrum-backup.json \
+  "http://localhost:9000/restore?confirm=true"
+```
+
+The backup output is directly compatible with `POST /batch` (additive) and `POST /restore` (full replacement). Database inserts are chunked into 1,000-record transactions for large-scale imports. See [docs/admin_backup_restore.md](docs/admin_backup_restore.md) for details.
 
 #### Metrics
 
