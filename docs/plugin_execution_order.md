@@ -116,6 +116,8 @@ Request transformers run after authentication and authorization, so they only mo
 
 Logging plugins run in phase 6 (`log`) which is fire-and-forget after the response is sent to the client. They are outside the hot path and do not affect request latency. Their relative ordering within the logging band (9000–9200) does not impact behavior.
 
+All logging plugins receive the `TransactionSummary` struct which includes an `error_class` field for failed transactions. This field classifies gateway-level errors (e.g., `ConnectionTimeout`, `TlsError`, `DnsLookupError`) to help operators quickly identify root causes. See [docs/error_classification.md](error_classification.md) for the full list of error classes and debugging guidance.
+
 ## Adding a New Plugin
 
 When implementing a new plugin, choose a priority that places it in the correct band:
