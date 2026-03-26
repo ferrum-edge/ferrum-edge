@@ -101,11 +101,10 @@ impl JwksKeyStore {
     pub async fn fetch_keys(&self) -> Result<usize, String> {
         debug!("Fetching JWKS keys from {}", self.jwks_uri);
 
+        let req = self.http_client.get().get(&self.jwks_uri);
         let response = self
             .http_client
-            .get()
-            .get(&self.jwks_uri)
-            .send()
+            .execute(req, "jwks_fetch")
             .await
             .map_err(|e| format!("JWKS fetch failed: {}", e))?;
 

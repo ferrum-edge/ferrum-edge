@@ -183,6 +183,12 @@ pub struct EnvConfig {
     /// "X-Real-IP" for nginx). If the header is absent or the direct connection
     /// is not from a trusted proxy, falls back to the X-Forwarded-For walk.
     pub real_ip_header: Option<String>,
+
+    /// Threshold in milliseconds for logging slow plugin outbound HTTP calls.
+    /// When a plugin HTTP request (e.g. http_logging, oauth2 introspection,
+    /// JWKS fetch, OTLP export) exceeds this duration, a warning is logged.
+    /// Default: 1000 (1 second).
+    pub plugin_http_slow_threshold_ms: u64,
 }
 
 impl Default for EnvConfig {
@@ -252,6 +258,7 @@ impl Default for EnvConfig {
             tls_curves: None,
             trusted_proxies: String::new(),
             real_ip_header: None,
+            plugin_http_slow_threshold_ms: 1000,
         }
     }
 }
@@ -380,6 +387,11 @@ impl EnvConfig {
             real_ip_header: env::var("FERRUM_REAL_IP_HEADER")
                 .ok()
                 .map(|h| h.to_lowercase()),
+
+            plugin_http_slow_threshold_ms: parse_env_u64(
+                "FERRUM_PLUGIN_HTTP_SLOW_THRESHOLD_MS",
+                1000,
+            ),
         };
 
         config.validate()?;

@@ -353,7 +353,7 @@ async fn send_otlp_batch(cfg: &OtlpConfig, batch: Vec<SpanData>) {
             req = req.header("Authorization", auth);
         }
 
-        match req.send().await {
+        match cfg.http_client.execute(req, "otel_export").await {
             Ok(response) if response.status().is_success() => return,
             Ok(response) => {
                 warn!(

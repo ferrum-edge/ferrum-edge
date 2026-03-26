@@ -151,7 +151,7 @@ async fn send_batch(cfg: &BatchConfig, batch: Vec<TransactionSummary>) {
         if let Some(auth) = &cfg.authorization_header {
             req = req.header("Authorization", auth);
         }
-        match req.send().await {
+        match cfg.http_client.execute(req, "http_logging").await {
             Ok(response) if response.status().is_success() => return,
             Ok(response) => {
                 warn!(

@@ -145,8 +145,11 @@ impl ProxyState {
         // Pre-resolve plugins per proxy (fixes rate_limiting state persistence bug).
         // All plugins that make outbound HTTP calls share a pooled client configured
         // with the gateway's connection pool settings (keepalive, idle timeout, etc.).
-        let plugin_http_client =
-            crate::plugins::PluginHttpClient::new(&global_pool_config, dns_cache.clone());
+        let plugin_http_client = crate::plugins::PluginHttpClient::new(
+            &global_pool_config,
+            dns_cache.clone(),
+            env_config_arc.plugin_http_slow_threshold_ms,
+        );
         let plugin_cache = Arc::new(
             PluginCache::with_http_client(&config, plugin_http_client)
                 .map_err(|e| anyhow::anyhow!("{}", e))?,

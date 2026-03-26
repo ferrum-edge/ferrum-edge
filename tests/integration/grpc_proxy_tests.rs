@@ -134,6 +134,7 @@ fn create_test_env_config() -> ferrum_gateway::config::EnvConfig {
         dtls_cert_path: None,
         dtls_key_path: None,
         dtls_client_ca_cert_path: None,
+        plugin_http_slow_threshold_ms: 1000,
     }
 }
 

@@ -32,12 +32,13 @@
 //! #[async_trait]
 //! impl Plugin for MyPlugin {
 //!     async fn log(&self, summary: &TransactionSummary) {
-//!         // Uses pooled connections + gateway DNS cache — no per-call overhead
-//!         let _ = self.http_client.get()
+//!         // Uses pooled connections + gateway DNS cache — no per-call overhead.
+//!         // execute() automatically logs a warning when the call exceeds the
+//!         // configured FERRUM_PLUGIN_HTTP_SLOW_THRESHOLD_MS threshold.
+//!         let req = self.http_client.get()
 //!             .post(&self.endpoint)
-//!             .json(summary)
-//!             .send()
-//!             .await;
+//!             .json(summary);
+//!         let _ = self.http_client.execute(req, "my_plugin").await;
 //!     }
 //! }
 //! ```
@@ -51,9 +52,16 @@ use std::time::Duration;
 ///
 /// Wraps a `reqwest::Client` configured with the gateway's connection pool
 /// settings and DNS cache. Clone-cheap (Arc internally) — pass freely to all plugins.
+///
+/// Includes optional slow-request logging: when `slow_threshold` is set,
+/// calls via [`execute`] that exceed the threshold emit a warning log with
+/// the elapsed time and a caller-provided label.
 #[derive(Clone, Debug)]
 pub struct PluginHttpClient {
     client: Arc<reqwest::Client>,
+    /// Threshold above which outbound plugin HTTP calls are logged as slow.
+    /// Configured via `FERRUM_PLUGIN_HTTP_SLOW_THRESHOLD_MS` (default: 1000ms).
+    slow_threshold: Duration,
 }
 
 impl PluginHttpClient {
@@ -67,7 +75,7 @@ impl PluginHttpClient {
     /// - HTTP/2 keep-alive from PoolConfig (multiplexed stream health)
     /// - Gateway DNS cache (shared TTL, stale-while-revalidate, background refresh)
     /// - 30s connect timeout, 60s request timeout (generous for log sinks)
-    pub fn new(pool_config: &PoolConfig, dns_cache: DnsCache) -> Self {
+    pub fn new(pool_config: &PoolConfig, dns_cache: DnsCache, slow_threshold_ms: u64) -> Self {
         let resolver = DnsCacheResolver::new(dns_cache);
 
         let mut builder = reqwest::Client::builder()
@@ -98,6 +106,7 @@ impl PluginHttpClient {
 
         Self {
             client: Arc::new(client),
+            slow_threshold: Duration::from_millis(slow_threshold_ms),
         }
     }
 
@@ -133,14 +142,54 @@ impl PluginHttpClient {
 
         Self {
             client: Arc::new(client),
+            slow_threshold: Duration::from_millis(1000),
         }
     }
 
-    /// Get the underlying `reqwest::Client` for making requests.
+    /// Build a plugin HTTP client from pool config with a custom slow threshold
+    /// and no DNS cache.
+    ///
+    /// Useful for tests that need to verify slow-call logging behavior with
+    /// a specific threshold.
+    #[allow(dead_code)] // Used by integration tests in tests/unit/plugins/
+    pub fn from_pool_config_with_threshold(config: &PoolConfig, slow_threshold_ms: u64) -> Self {
+        let mut client = Self::from_pool_config(config);
+        client.slow_threshold = Duration::from_millis(slow_threshold_ms);
+        client
+    }
+
+    /// Get the underlying `reqwest::Client` for building requests.
     ///
     /// The returned client uses pooled connections — no per-call overhead.
+    /// Prefer [`execute`] over calling `.send()` directly so that slow
+    /// outbound calls are automatically logged.
     pub fn get(&self) -> &reqwest::Client {
         &self.client
+    }
+
+    /// Send a pre-built request with automatic slow-call logging.
+    ///
+    /// Times the network round-trip and emits a `warn!` if the elapsed time
+    /// exceeds the configured `FERRUM_PLUGIN_HTTP_SLOW_THRESHOLD_MS`. The
+    /// `label` identifies the caller in log output (e.g. "http_logging",
+    /// "oauth2_introspection", "jwks_fetch", "otel_export").
+    pub async fn execute(
+        &self,
+        request: reqwest::RequestBuilder,
+        label: &str,
+    ) -> Result<reqwest::Response, reqwest::Error> {
+        let start = std::time::Instant::now();
+        let result = request.send().await;
+        let elapsed = start.elapsed();
+        if elapsed > self.slow_threshold {
+            tracing::warn!(
+                plugin = label,
+                elapsed_ms = elapsed.as_millis() as u64,
+                threshold_ms = self.slow_threshold.as_millis() as u64,
+                "Slow plugin HTTP call"
+            );
+        }
+        result
     }
 }
 

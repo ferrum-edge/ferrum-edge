@@ -961,6 +961,66 @@ fn test_effective_db_url_root_cert_only() {
 }
 
 #[test]
+fn test_plugin_http_slow_threshold_default() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+        ],
+        || {
+            remove_var("FERRUM_PLUGIN_HTTP_SLOW_THRESHOLD_MS");
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.plugin_http_slow_threshold_ms, 1000);
+        },
+    );
+}
+
+#[test]
+fn test_plugin_http_slow_threshold_custom() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_PLUGIN_HTTP_SLOW_THRESHOLD_MS", "5000"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.plugin_http_slow_threshold_ms, 5000);
+        },
+    );
+}
+
+#[test]
+fn test_plugin_http_slow_threshold_zero() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_PLUGIN_HTTP_SLOW_THRESHOLD_MS", "0"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.plugin_http_slow_threshold_ms, 0);
+        },
+    );
+}
+
+#[test]
+fn test_plugin_http_slow_threshold_invalid_falls_back_to_default() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_PLUGIN_HTTP_SLOW_THRESHOLD_MS", "not_a_number"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.plugin_http_slow_threshold_ms, 1000);
+        },
+    );
+}
+
+#[test]
 fn test_effective_db_url_none_when_no_db_url() {
     with_env_vars(
         &[
