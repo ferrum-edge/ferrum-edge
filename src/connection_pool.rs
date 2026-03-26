@@ -286,6 +286,11 @@ impl ConnectionPool {
         });
     }
 
+    /// Get the global pool configuration.
+    pub fn global_pool_config(&self) -> &PoolConfig {
+        &self.global_config
+    }
+
     /// Get pool statistics for monitoring
     #[allow(dead_code)]
     pub fn get_stats(&self) -> PoolStats {

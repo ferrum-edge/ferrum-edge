@@ -9,6 +9,12 @@ pub struct BenchMetrics {
     pub total_bytes: u64,
 }
 
+impl Default for BenchMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl BenchMetrics {
     pub fn new() -> Self {
         Self {
@@ -42,7 +48,13 @@ impl BenchMetrics {
     }
 
     /// Generate a wrk-like text report.
-    pub fn report(&self, protocol: &str, target: &str, concurrency: u64, duration_secs: u64) -> String {
+    pub fn report(
+        &self,
+        protocol: &str,
+        target: &str,
+        concurrency: u64,
+        duration_secs: u64,
+    ) -> String {
         let rps = if duration_secs > 0 {
             self.total_requests as f64 / duration_secs as f64
         } else {
@@ -64,10 +76,12 @@ impl BenchMetrics {
         let p99 = self.histogram.value_at_quantile(0.99);
 
         // Calculate +/- Stdev percentage
-        let within_stdev = if self.histogram.len() > 0 {
+        let within_stdev = if !self.histogram.is_empty() {
             let lo = avg.saturating_sub(stdev);
             let hi = avg.saturating_add(stdev);
-            let count_within: u64 = self.histogram.iter_recorded()
+            let count_within: u64 = self
+                .histogram
+                .iter_recorded()
                 .filter(|v| v.value_iterated_to() >= lo && v.value_iterated_to() <= hi)
                 .map(|v| v.count_at_value())
                 .sum();

@@ -32,6 +32,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Protocol {
+    /// HTTP/1.1 load test
+    Http1(BenchArgs),
     /// HTTP/2 load test
     Http2(BenchArgs),
     /// HTTP/3 (QUIC) load test
@@ -83,6 +85,7 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     match cli.command {
+        Protocol::Http1(args) => run_http1(&args).await,
         Protocol::Http2(args) => run_http2(&args).await,
         Protocol::Http3(args) => run_http3(&args).await,
         Protocol::Ws(args) => run_ws(&args).await,
@@ -96,7 +99,8 @@ async fn main() -> anyhow::Result<()> {
 
 fn print_results(metrics: &BenchMetrics, protocol: &str, args: &BenchArgs) {
     if args.json {
-        let report = metrics.to_json_report(protocol, &args.target, args.concurrency, args.duration);
+        let report =
+            metrics.to_json_report(protocol, &args.target, args.concurrency, args.duration);
         println!(
             "{}",
             serde_json::to_string_pretty(&report).unwrap_or_default()
@@ -123,6 +127,111 @@ async fn collect_results(
     combined
 }
 
+// ── HTTP/1.1 ─────────────────────────────────────────────────────────────────
+
+async fn run_http1(args: &BenchArgs) -> anyhow::Result<()> {
+    let is_tls = args.target.starts_with("https://");
+    let url: http::Uri = args.target.parse().context("invalid target URL")?;
+    let host = url.host().context("no host in URL")?;
+    let port = url.port_u16().unwrap_or(if is_tls { 443 } else { 80 });
+    let addr: SocketAddr = format!("{host}:{port}")
+        .parse()
+        .context("invalid address")?;
+    let path = url.path().to_string();
+    let authority = format!("{host}:{port}");
+
+    let tls_connector = if is_tls {
+        let mut tls_cfg = tls_utils::make_client_tls_config_insecure();
+        // Force HTTP/1.1 via ALPN so TLS doesn't negotiate h2
+        tls_cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+        Some((
+            tokio_rustls::TlsConnector::from(Arc::new(tls_cfg)),
+            rustls::pki_types::ServerName::try_from(host.to_string())
+                .map_err(|e| anyhow::anyhow!("invalid server name: {e}"))?,
+        ))
+    } else {
+        None
+    };
+
+    let deadline = Instant::now() + Duration::from_secs(args.duration);
+    let protocol_label = if is_tls { "HTTP/1.1+TLS" } else { "HTTP/1.1" };
+
+    let mut handles = Vec::new();
+    for _ in 0..args.concurrency {
+        let path = path.clone();
+        let authority = authority.clone();
+        let tls_connector = tls_connector.clone();
+        handles.push(tokio::spawn(async move {
+            let mut metrics = BenchMetrics::new();
+
+            // Helper to create a connection (plain or TLS)
+            async fn connect_h1(
+                addr: SocketAddr,
+                tls: &Option<(
+                    tokio_rustls::TlsConnector,
+                    rustls::pki_types::ServerName<'static>,
+                )>,
+            ) -> anyhow::Result<hyper::client::conn::http1::SendRequest<http_body_util::Full<Bytes>>>
+            {
+                let tcp = tokio::net::TcpStream::connect(addr).await?;
+                let _ = tcp.set_nodelay(true);
+                if let Some((connector, server_name)) = tls {
+                    let tls_stream = connector.connect(server_name.clone(), tcp).await?;
+                    let io = hyper_util::rt::TokioIo::new(tls_stream);
+                    let (sr, conn) = hyper::client::conn::http1::handshake(io).await?;
+                    tokio::spawn(async move {
+                        let _ = conn.await;
+                    });
+                    Ok(sr)
+                } else {
+                    let io = hyper_util::rt::TokioIo::new(tcp);
+                    let (sr, conn) = hyper::client::conn::http1::handshake(io).await?;
+                    tokio::spawn(async move {
+                        let _ = conn.await;
+                    });
+                    Ok(sr)
+                }
+            }
+
+            let mut send_req = connect_h1(addr, &tls_connector).await?;
+
+            while Instant::now() < deadline {
+                // Reconnect if the connection was closed
+                if send_req.is_closed() {
+                    send_req = connect_h1(addr, &tls_connector).await?;
+                }
+
+                let req = hyper::Request::get(&path)
+                    .header("host", &authority)
+                    .body(http_body_util::Full::new(Bytes::new()))
+                    .unwrap();
+                let start = Instant::now();
+                match send_req.send_request(req).await {
+                    Ok(resp) => {
+                        use http_body_util::BodyExt;
+                        match resp.into_body().collect().await {
+                            Ok(body) => {
+                                let bytes = body.to_bytes();
+                                let latency = start.elapsed().as_micros() as u64;
+                                metrics.record(latency, bytes.len());
+                            }
+                            Err(_) => metrics.record_error(),
+                        }
+                    }
+                    Err(_) => {
+                        metrics.record_error();
+                    }
+                }
+            }
+            Ok(metrics)
+        }));
+    }
+
+    let combined = collect_results(handles).await;
+    print_results(&combined, protocol_label, args);
+    Ok(())
+}
+
 // ── HTTP/2 ───────────────────────────────────────────────────────────────────
 
 async fn run_http2(args: &BenchArgs) -> anyhow::Result<()> {
@@ -134,7 +243,9 @@ async fn run_http2(args: &BenchArgs) -> anyhow::Result<()> {
     let url: http::Uri = args.target.parse().context("invalid target URL")?;
     let host = url.host().context("no host in URL")?;
     let port = url.port_u16().unwrap_or(if is_tls { 443 } else { 80 });
-    let addr: SocketAddr = format!("{host}:{port}").parse().context("invalid address")?;
+    let addr: SocketAddr = format!("{host}:{port}")
+        .parse()
+        .context("invalid address")?;
     let path = url.path().to_string();
 
     let deadline = Instant::now() + Duration::from_secs(args.duration);
@@ -148,7 +259,13 @@ async fn run_http2(args: &BenchArgs) -> anyhow::Result<()> {
     // HTTP/2 multiplexes many streams over fewer connections. Use a
     // connection pool sized to balance multiplexing benefit vs contention.
     // ~10 streams per connection is a good balance for throughput.
-    let num_conns = std::cmp::max(1, std::cmp::min(args.concurrency as usize, args.concurrency as usize / 10 + 1));
+    let num_conns = std::cmp::max(
+        1,
+        std::cmp::min(
+            args.concurrency as usize,
+            args.concurrency as usize / 10 + 1,
+        ),
+    );
     let mut senders = Vec::with_capacity(num_conns);
 
     for _ in 0..num_conns {
@@ -161,16 +278,14 @@ async fn run_http2(args: &BenchArgs) -> anyhow::Result<()> {
                 .map_err(|e| anyhow::anyhow!("invalid server name: {e}"))?;
             let tls_stream = connector.connect(server_name, tcp).await?;
             let io = hyper_util::rt::TokioIo::new(tls_stream);
-            let (sr, conn) =
-                http2::handshake(TokioExecutor::new(), io).await?;
+            let (sr, conn) = http2::handshake(TokioExecutor::new(), io).await?;
             tokio::spawn(async move {
                 let _ = conn.await;
             });
             sr
         } else {
             let io = hyper_util::rt::TokioIo::new(tcp);
-            let (sr, conn) =
-                http2::handshake(TokioExecutor::new(), io).await?;
+            let (sr, conn) = http2::handshake(TokioExecutor::new(), io).await?;
             tokio::spawn(async move {
                 let _ = conn.await;
             });
@@ -193,16 +308,14 @@ async fn run_http2(args: &BenchArgs) -> anyhow::Result<()> {
                     .unwrap();
                 let start = Instant::now();
                 match send_req.send_request(req).await {
-                    Ok(resp) => {
-                        match resp.into_body().collect().await {
-                            Ok(body) => {
-                                let bytes = body.to_bytes();
-                                let latency = start.elapsed().as_micros() as u64;
-                                metrics.record(latency, bytes.len());
-                            }
-                            Err(_) => metrics.record_error(),
+                    Ok(resp) => match resp.into_body().collect().await {
+                        Ok(body) => {
+                            let bytes = body.to_bytes();
+                            let latency = start.elapsed().as_micros() as u64;
+                            metrics.record(latency, bytes.len());
                         }
-                    }
+                        Err(_) => metrics.record_error(),
+                    },
                     Err(_) => {
                         metrics.record_error();
                         break;
@@ -224,7 +337,9 @@ async fn run_http3(args: &BenchArgs) -> anyhow::Result<()> {
     let url: http::Uri = args.target.parse().context("invalid target URL")?;
     let host = url.host().context("no host in URL")?;
     let port = url.port_u16().unwrap_or(443);
-    let addr: SocketAddr = format!("{host}:{port}").parse().context("invalid address")?;
+    let addr: SocketAddr = format!("{host}:{port}")
+        .parse()
+        .context("invalid address")?;
     let path = url.path().to_string();
 
     let deadline = Instant::now() + Duration::from_secs(args.duration);
@@ -241,14 +356,23 @@ async fn run_http3(args: &BenchArgs) -> anyhow::Result<()> {
             let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap())?;
             endpoint.set_default_client_config(client_cfg);
 
-            let conn = endpoint.connect(addr, &host_str)
-                .map_err(|e| { eprintln!("  quinn connect start error: {e}"); anyhow::anyhow!("{e}") })?
+            let conn = endpoint
+                .connect(addr, &host_str)
+                .map_err(|e| {
+                    eprintln!("  quinn connect start error: {e}");
+                    anyhow::anyhow!("{e}")
+                })?
                 .await
-                .map_err(|e| { eprintln!("  quinn connect error: {e}"); anyhow::anyhow!("{e}") })?;
-            let (mut driver, mut send_req) =
-                h3::client::new(h3_quinn::Connection::new(conn))
-                    .await
-                    .map_err(|e| { eprintln!("  h3 handshake error: {e}"); anyhow::anyhow!("{e}") })?;
+                .map_err(|e| {
+                    eprintln!("  quinn connect error: {e}");
+                    anyhow::anyhow!("{e}")
+                })?;
+            let (mut driver, mut send_req) = h3::client::new(h3_quinn::Connection::new(conn))
+                .await
+                .map_err(|e| {
+                    eprintln!("  h3 handshake error: {e}");
+                    anyhow::anyhow!("{e}")
+                })?;
             // h3 driver must be polled concurrently to process connection frames
             tokio::spawn(async move {
                 let _ = futures_util::future::poll_fn(|cx| driver.poll_close(cx)).await;
@@ -319,11 +443,7 @@ async fn run_ws(args: &BenchArgs) -> anyhow::Result<()> {
 
             while Instant::now() < deadline {
                 let start = Instant::now();
-                if write
-                    .send(Message::Binary(payload.clone().into()))
-                    .await
-                    .is_err()
-                {
+                if write.send(Message::Binary(payload.clone())).await.is_err() {
                     metrics.record_error();
                     break;
                 }
@@ -351,8 +471,8 @@ async fn run_ws(args: &BenchArgs) -> anyhow::Result<()> {
 // ── gRPC ─────────────────────────────────────────────────────────────────────
 
 async fn run_grpc(args: &BenchArgs) -> anyhow::Result<()> {
-    use bench_proto::bench_service_client::BenchServiceClient;
     use bench_proto::EchoRequest;
+    use bench_proto::bench_service_client::BenchServiceClient;
 
     let deadline = Instant::now() + Duration::from_secs(args.duration);
     let mut handles = Vec::new();
@@ -386,10 +506,8 @@ async fn run_grpc(args: &BenchArgs) -> anyhow::Result<()> {
                         metrics.record_error();
                         // Try reconnecting
                         tokio::time::sleep(Duration::from_millis(10)).await;
-                        let Ok(ch) =
-                            tonic::transport::Channel::from_shared(target.clone())
-                                .map_err(|e| anyhow::anyhow!("{e}"))
-                                .and_then(|c| Ok(c))
+                        let Ok(ch) = tonic::transport::Channel::from_shared(target.clone())
+                            .map_err(|e| anyhow::anyhow!("{e}"))
                         else {
                             break;
                         };
@@ -435,9 +553,8 @@ async fn run_tcp(args: &BenchArgs) -> anyhow::Result<()> {
 
             if let Some(tls_cfg) = tls_cfg {
                 let connector = tokio_rustls::TlsConnector::from(tls_cfg);
-                let server_name =
-                    rustls::pki_types::ServerName::try_from("localhost".to_string())
-                        .map_err(|e| anyhow::anyhow!("server name: {e}"))?;
+                let server_name = rustls::pki_types::ServerName::try_from("localhost".to_string())
+                    .map_err(|e| anyhow::anyhow!("server name: {e}"))?;
                 let mut stream = connector.connect(server_name, tcp).await?;
                 let mut buf = vec![0u8; payload.len()];
                 while Instant::now() < deadline {
@@ -506,8 +623,8 @@ async fn run_udp(args: &BenchArgs) -> anyhow::Result<()> {
                     DTLSConn::new(
                         Arc::clone(&sock) as Arc<dyn webrtc_util::Conn + Send + Sync>,
                         cfg,
-                        true,  // is_client
-                        None,  // no existing state
+                        true, // is_client
+                        None, // no existing state
                     ),
                 )
                 .await
@@ -521,7 +638,9 @@ async fn run_udp(args: &BenchArgs) -> anyhow::Result<()> {
                         .send(&payload)
                         .await
                         .map_err(|e| anyhow::anyhow!("dtls send: {e}"))?;
-                    match tokio::time::timeout(Duration::from_secs(5), dtls_conn.recv(&mut buf)).await {
+                    match tokio::time::timeout(Duration::from_secs(5), dtls_conn.recv(&mut buf))
+                        .await
+                    {
                         Ok(Ok(n)) => {
                             let latency = start.elapsed().as_micros() as u64;
                             metrics.record(latency, n);

@@ -1,7 +1,7 @@
 #!/bin/bash
 # Multi-protocol performance test runner for Ferrum Gateway
 # Usage: ./run_protocol_test.sh <protocol> [options]
-#   Protocols: http2, http3, ws, grpc, tcp, tcp-tls, udp, udp-dtls, all
+#   Protocols: http1, http1-tls, http2, http3, ws, grpc, tcp, tcp-tls, udp, udp-dtls, all
 #   Options:
 #     --duration <secs>    Test duration (default: 30)
 #     --concurrency <n>    Concurrent connections (default: 100)
@@ -53,7 +53,7 @@ cleanup() {
     [ -n "$GATEWAY_PID" ] && kill "$GATEWAY_PID" 2>/dev/null || true
     [ -n "$BACKEND_PID" ] && kill "$BACKEND_PID" 2>/dev/null || true
     # Kill processes on known ports
-    for port in 3002 3003 3004 3005 3006 3010 3443 3444 3445 50052 \
+    for port in 3001 3002 3003 3004 3005 3006 3010 3443 3444 3445 50052 \
                 $GATEWAY_HTTP_PORT $GATEWAY_HTTPS_PORT 5000 5001 5003 5004; do
         lsof -ti:"$port" 2>/dev/null | xargs kill -9 2>/dev/null || true
     done
@@ -182,6 +182,20 @@ run_bench() {
 
 # ── Protocol test functions ───────────────────────────────────────────────────
 
+test_http1() {
+    start_gateway "$SCRIPT_DIR/configs/http1_perf.yaml"
+    sleep 1
+    run_bench "HTTP/1.1 (via gateway)" http1 "http://127.0.0.1:$GATEWAY_HTTP_PORT/api/users"
+    run_bench "HTTP/1.1 (direct backend)" http1 "http://127.0.0.1:3001/api/users"
+}
+
+test_http1_tls() {
+    start_gateway "$SCRIPT_DIR/configs/http1_tls_perf.yaml"
+    sleep 1
+    run_bench "HTTP/1.1+TLS (via gateway)" http1 "https://127.0.0.1:$GATEWAY_HTTPS_PORT/api/users"
+    run_bench "HTTP/1.1+TLS (direct backend - no TLS)" http1 "http://127.0.0.1:3001/api/users"
+}
+
 test_http2() {
     start_gateway "$SCRIPT_DIR/configs/http2_perf.yaml" "FERRUM_POOL_ENABLE_HTTP2=true"
     sleep 1
@@ -249,6 +263,8 @@ build
 start_backend
 
 case "$PROTOCOL" in
+    http1)     test_http1 ;;
+    http1-tls) test_http1_tls ;;
     http2)     test_http2 ;;
     http3)     test_http3 ;;
     ws)        test_ws ;;
@@ -258,6 +274,8 @@ case "$PROTOCOL" in
     udp)       test_udp ;;
     udp-dtls)  test_udp_dtls ;;
     all)
+        test_http1;   stop_gateway
+        test_http1_tls; stop_gateway
         test_http2;   stop_gateway
         test_http3;   stop_gateway
         test_ws;      stop_gateway
@@ -269,7 +287,7 @@ case "$PROTOCOL" in
         ;;
     *)
         echo -e "${RED}Unknown protocol: $PROTOCOL${NC}"
-        echo "Usage: $0 <http2|http3|ws|grpc|tcp|tcp-tls|udp|udp-dtls|all> [options]"
+        echo "Usage: $0 <http1|http1-tls|http2|http3|ws|grpc|tcp|tcp-tls|udp|udp-dtls|all> [options]"
         exit 1
         ;;
 esac

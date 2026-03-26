@@ -628,6 +628,35 @@ The testing suite provides:
 
 See `tests/performance/README.md` for detailed usage instructions.
 
+#### Multi-Protocol Performance Tests
+
+A dedicated multi-protocol benchmark suite tests all 10 supported protocols through the gateway:
+
+```bash
+cd tests/performance/multi_protocol
+
+# Run all protocol tests
+./run_protocol_test.sh all --duration 10 --concurrency 200
+
+# Run a single protocol
+./run_protocol_test.sh http1-tls --duration 10 --concurrency 200
+```
+
+| Protocol | Gateway RPS | Direct RPS | Overhead |
+|----------|------------|------------|----------|
+| HTTP/1.1 | 88,773 | 100,112 | ~11% |
+| HTTP/1.1+TLS | 85,210 | 98,935 | ~14% |
+| HTTP/2 (TLS) | 49,223 | 109,162 | ~55% |
+| HTTP/3 (QUIC) | 39,581 | 67,866 | ~42% |
+| WebSocket | 104,465 | 219,620 | ~52% |
+| gRPC | 34,470 | 118,650 | ~71% |
+| TCP | 108,332 | 215,646 | ~50% |
+| TCP+TLS | 112,152 | 221,520 | ~49% |
+| UDP | 79,029 | 228,705 | ~65% |
+| UDP+DTLS | 74,098 | — | — |
+
+*Tested on macOS Apple Silicon, 200 concurrent connections, 10s duration. See `tests/performance/multi_protocol/README.md` for full details.*
+
 ### Database Schema
 
 When using Database or CP modes, Ferrum auto-creates the following tables on startup:

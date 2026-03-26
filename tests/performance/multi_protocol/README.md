@@ -1,6 +1,6 @@
 # Multi-Protocol Performance Tests
 
-Performance test suite that benchmarks Ferrum Gateway across all supported protocols: HTTP/2, HTTP/3 (QUIC), WebSocket, gRPC, TCP, TCP+TLS, UDP, and UDP+DTLS.
+Performance test suite that benchmarks Ferrum Gateway across all supported protocols: HTTP/1.1, HTTP/1.1+TLS, HTTP/2, HTTP/3 (QUIC), WebSocket, gRPC, TCP, TCP+TLS, UDP, and UDP+DTLS.
 
 Each test runs a **three-tier setup**: `proto_bench` (load generator) &rarr; `ferrum-gateway` (proxy) &rarr; `proto_backend` (echo backend), then a direct baseline without the gateway for comparison.
 
@@ -26,6 +26,8 @@ cd tests/performance/multi_protocol
 
 | Protocol | Client &rarr; Gateway | Gateway &rarr; Backend | Gateway Port | Backend Port |
 |----------|----------------------|----------------------|--------------|--------------|
+| HTTP/1.1 | HTTP                 | HTTP                 | 8000         | 3001         |
+| HTTP/1.1+TLS | HTTPS (ALPN http/1.1) | HTTP              | 8443         | 3001         |
 | HTTP/2   | HTTPS + ALPN h2      | HTTPS + H2           | 8443         | 3443         |
 | HTTP/3   | QUIC / HTTP3         | QUIC / HTTP3         | 8443         | 3445         |
 | WebSocket| ws:// upgrade        | ws://                | 8000         | 3003         |
@@ -52,6 +54,7 @@ Multi-protocol echo backend that starts all servers on fixed ports:
 
 | Server       | Port  | Description                         |
 |-------------|-------|--------------------------------------|
+| HTTP/1.1    | 3001  | HTTP/1.1 with keep-alive            |
 | HTTP/2 h2c  | 3002  | Cleartext HTTP/2 with prior knowledge|
 | HTTPS/H2    | 3443  | HTTP/2 over TLS (ALPN negotiated)    |
 | WebSocket   | 3003  | WS echo (text + binary)             |
@@ -69,7 +72,7 @@ Self-signed TLS certificates are generated at startup into `./certs/` (gitignore
 Load testing binary with subcommands for each protocol:
 
 ```
-proto_bench <http2|http3|ws|grpc|tcp|udp> [OPTIONS]
+proto_bench <http1|http2|http3|ws|grpc|tcp|udp> [OPTIONS]
 
 Options:
   --target <URL|ADDR>     Target URL or address
@@ -145,60 +148,61 @@ JSON output (`--json`):
 
 ## Benchmark Results
 
-Results from a local run on macOS (Apple Silicon), 10s duration, 50 concurrent connections, 64-byte echo payload.
+Results from a local run on macOS (Apple Silicon), 10s duration, 200 concurrent connections, 64-byte echo payload.
 
 ### Through Gateway (client → gateway → backend)
 
 | Protocol | Requests/sec | Avg Latency | P50 | P99 | Max | Errors |
 |----------|-------------|-------------|------|------|------|--------|
-| HTTP/2 (TLS) | 3,469 | 14.40ms | 11.94ms | 36.32ms | 66.30ms | 0 |
-| HTTP/3 (QUIC) | 43,323 | 1.15ms | 1.05ms | 2.06ms | 61.53ms | 0 |
-| WebSocket | 88,516 | 563μs | 506μs | 1.51ms | 31.98ms | 0 |
-| gRPC | 31,835 | 1.57ms | 1.47ms | 3.37ms | 46.75ms | 0 |
-| TCP | 113,828 | 438μs | 431μs | 691μs | 24.85ms | 0 |
-| TCP+TLS | 111,739 | 446μs | 436μs | 730μs | 33.18ms | 0 |
-| UDP | 84,242 | 592μs | 585μs | 927μs | 2.37ms | 0 |
-| UDP+DTLS | 79,640 | 624μs | 599μs | 1.19ms | 23.31ms | 0 |
+| HTTP/1.1 | 88,773 | 2.25ms | 2.18ms | 3.93ms | 54.37ms | 0 |
+| HTTP/1.1+TLS | 85,210 | 2.34ms | 2.25ms | 4.24ms | 69.89ms | 0 |
+| HTTP/2 (TLS) | 49,223 | 4.06ms | 3.87ms | 8.16ms | 34.30ms | 0 |
+| HTTP/3 (QUIC) | 39,581 | 5.04ms | 4.60ms | 12.17ms | 105.28ms | 0 |
+| WebSocket | 104,465 | 1.91ms | 1.82ms | 3.75ms | 73.41ms | 0 |
+| gRPC | 34,470 | 5.80ms | 5.68ms | 9.81ms | 77.38ms | 0 |
+| TCP | 108,332 | 1.84ms | 1.76ms | 3.60ms | 40.83ms | 0 |
+| TCP+TLS | 112,152 | 1.78ms | 1.75ms | 2.92ms | 10.23ms | 0 |
+| UDP | 79,029 | 2.53ms | 2.52ms | 3.38ms | 27.87ms | 0 |
+| UDP+DTLS | 74,098 | 2.57ms | 2.53ms | 4.28ms | 99.33ms | 0 |
 
 ### Direct Backend (client → backend, no gateway)
 
 | Protocol | Requests/sec | Avg Latency | P50 | P99 | Max |
 |----------|-------------|-------------|------|------|------|
-| HTTP/2 (TLS) | 34,183 | 1.46ms | 1.48ms | 1.89ms | 7.32ms |
-| HTTP/3 (QUIC) | 81,338 | 613μs | 606μs | 841μs | 3.59ms |
-| WebSocket | 220,230 | 226μs | 216μs | 491μs | 24.53ms |
-| gRPC | 115,473 | 431μs | 394μs | 1.17ms | 38.59ms |
-| TCP | 233,599 | 213μs | 208μs | 396μs | 5.51ms |
-| TCP+TLS | 226,244 | 220μs | 214μs | 419μs | 4.97ms |
-| UDP | 269,510 | 184μs | 171μs | 418μs | 4.80ms |
-| UDP+DTLS | 75,131* | 65μs | 63μs | 121μs | 933μs |
+| HTTP/1.1 | 100,112 | 2.00ms | 2.07ms | 2.88ms | 11.29ms |
+| HTTP/1.1+TLS | 98,935* | 2.02ms | 2.08ms | 3.17ms | 25.17ms |
+| HTTP/2 (TLS) | 109,162 | 1.83ms | 1.91ms | 2.78ms | 8.06ms |
+| HTTP/3 (QUIC) | 67,866 | 2.94ms | 2.80ms | 4.74ms | 79.17ms |
+| WebSocket | 219,620 | 909μs | 881μs | 1.80ms | 7.34ms |
+| gRPC | 118,650 | 1.68ms | 1.43ms | 5.62ms | 44.90ms |
+| TCP | 215,646 | 926μs | 883μs | 1.97ms | 24.57ms |
+| TCP+TLS | 221,520 | 901μs | 876μs | 1.75ms | 8.24ms |
+| UDP | 228,705 | 873μs | 759μs | 2.05ms | 15.46ms |
+| UDP+DTLS | —** | — | — | — | — |
 
-*\*UDP+DTLS direct backend tested with 5 connections due to webrtc\_dtls library limitation with concurrent handshakes.*
+*\*HTTP/1.1+TLS direct baseline uses plain HTTP since the backend has no TLS; the TLS overhead is entirely at the gateway.*
+*\*\*UDP+DTLS direct backend cannot be tested at 200 connections due to webrtc\_dtls library limitation with concurrent DTLS handshakes. Gateway-proxied DTLS works fine (74K ops/sec) because the gateway terminates DTLS and forwards plain UDP.*
 
 ### Gateway Overhead
 
 | Protocol | Gateway RPS | Direct RPS | Overhead | Notes |
 |----------|------------|------------|----------|-------|
-| HTTP/2 (TLS) | 3,469 | 34,183 | ~90% | reqwest creates new TLS connections per burst (see note) |
-| HTTP/3 (QUIC) | 43,323 | 81,338 | ~47% | QUIC connection coalescing helps |
-| WebSocket | 88,516 | 220,230 | ~60% | Upgrade overhead amortized over many messages |
-| gRPC | 31,835 | 115,473 | ~72% | H2 multiplexing + protobuf passthrough |
-| TCP | 113,828 | 233,599 | ~51% | Bidirectional copy, minimal per-byte overhead |
-| TCP+TLS | 111,739 | 226,244 | ~51% | TLS termination + bidirectional copy |
-| UDP | 84,242 | 269,510 | ~69% | Per-datagram session lookup + forwarding |
-| UDP+DTLS | 79,640 | — | — | DTLS termination + plain UDP forwarding |
-
-### Note: HTTP/2 Gateway Overhead
-
-HTTP/2 through the gateway shows higher overhead than other protocols. At low concurrency (1 connection), latency is only **727μs** (healthy). Under concurrent load, the gateway's `reqwest` client creates multiple short-lived TLS connections to the backend rather than multiplexing HTTP/2 streams over a single persistent connection. This causes each connection to pay a full TLS handshake cost (~10ms), resulting in the elevated average latency. The throughput plateaus at ~3.5K rps regardless of concurrency level.
-
-This is a `reqwest` connection pool behavior — when concurrent requests arrive before the first HTTP/2 connection completes ALPN negotiation, reqwest opens additional connections instead of queuing requests for multiplexing on the first one. Potential mitigations include switching to a lower-level `hyper` HTTP/2 client with explicit connection management, or pre-warming the reqwest connection pool before load arrives.
+| HTTP/1.1 | 88,773 | 100,112 | ~11% | reqwest connection pool with keep-alive |
+| HTTP/1.1+TLS | 85,210 | 98,935 | ~14% | TLS termination at gateway, plain HTTP to backend |
+| HTTP/2 (TLS) | 49,223 | 109,162 | ~55% | reqwest H2; hyper-native pool planned |
+| HTTP/3 (QUIC) | 39,581 | 67,866 | ~42% | QUIC proxy via quinn |
+| WebSocket | 104,465 | 219,620 | ~52% | Upgrade overhead amortized over many messages |
+| gRPC | 34,470 | 118,650 | ~71% | H2 multiplexing + protobuf passthrough |
+| TCP | 108,332 | 215,646 | ~50% | Bidirectional copy, minimal per-byte overhead |
+| TCP+TLS | 112,152 | 221,520 | ~49% | TLS termination + bidirectional copy |
+| UDP | 79,029 | 228,705 | ~65% | Per-datagram session lookup + forwarding |
+| UDP+DTLS | 74,098 | — | — | DTLS termination + plain UDP forwarding |
 
 ## Prerequisites
 
 - **Rust toolchain** (cargo, rustc)
 - **protoc** (protobuf compiler) for gRPC support
-- The following ports must be free: 3002-3006, 3010, 3443-3445, 5001, 5003-5004, 5010, 8000, 8443, 50052
+- The following ports must be free: 3001-3006, 3010, 3443-3445, 5001, 5003-5004, 5010, 8000, 8443, 50052
 
 Install protoc:
 ```bash

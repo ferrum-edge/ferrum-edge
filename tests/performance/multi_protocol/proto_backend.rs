@@ -88,9 +88,7 @@ async fn handle_http(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, In
         (_, "/health") => Response::builder()
             .status(StatusCode::OK)
             .header("content-type", "application/json")
-            .body(Full::new(Bytes::from_static(
-                b"{\"status\":\"healthy\"}",
-            )))
+            .body(Full::new(Bytes::from_static(b"{\"status\":\"healthy\"}")))
             .unwrap_or_else(|_| Response::new(Full::new(Bytes::new()))),
         (ref m, "/api/users") if m == hyper::Method::GET => {
             tokio::time::sleep(Duration::from_micros(100)).await;
@@ -124,6 +122,23 @@ async fn handle_http(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, In
 }
 
 // ── Servers ──────────────────────────────────────────────────────────────────
+
+/// HTTP/1.1 API server for performance testing.
+async fn run_http1_server(addr: SocketAddr) -> anyhow::Result<()> {
+    let listener = TcpListener::bind(addr)
+        .await
+        .context("binding http1 listener")?;
+    loop {
+        let (stream, _) = listener.accept().await?;
+        tokio::spawn(async move {
+            let io = TokioIo::new(stream);
+            let _ = hyper::server::conn::http1::Builder::new()
+                .keep_alive(true)
+                .serve_connection(io, hyper::service::service_fn(handle_http))
+                .await;
+        });
+    }
+}
 
 /// Simple HTTP/1.1 health endpoint so all protocol tests have a reliable health check target.
 async fn run_http1_health_server(addr: SocketAddr) -> anyhow::Result<()> {
@@ -192,10 +207,8 @@ async fn run_ws_server(addr: SocketAddr) -> anyhow::Result<()> {
             };
             let (mut write, mut read) = ws.split();
             while let Some(Ok(msg)) = read.next().await {
-                if msg.is_text() || msg.is_binary() {
-                    if write.send(msg).await.is_err() {
-                        break;
-                    }
+                if (msg.is_text() || msg.is_binary()) && write.send(msg).await.is_err() {
+                    break;
                 }
             }
         });
@@ -255,10 +268,7 @@ async fn run_udp_echo(addr: SocketAddr) -> anyhow::Result<()> {
     }
 }
 
-async fn run_h3_server(
-    addr: SocketAddr,
-    server_config: quinn::ServerConfig,
-) -> anyhow::Result<()> {
+async fn run_h3_server(addr: SocketAddr, server_config: quinn::ServerConfig) -> anyhow::Result<()> {
     let endpoint = quinn::Endpoint::server(server_config, addr).context("creating h3 endpoint")?;
 
     loop {
@@ -274,38 +284,29 @@ async fn run_h3_server(
                 return;
             };
 
-            loop {
-                match conn.accept().await {
-                    Ok(Some(resolver)) => {
-                        let Ok((req, mut stream)) = resolver.resolve_request().await else {
-                            continue;
-                        };
-                        let (status, body) = match req.uri().path() {
-                            "/health" => {
-                                (StatusCode::OK, b"{\"status\":\"healthy\"}" as &[u8])
-                            }
-                            "/api/users" => (
-                                StatusCode::OK,
-                                b"{\"users\":[{\"id\":1,\"name\":\"Alice\"},{\"id\":2,\"name\":\"Bob\"}]}"
-                                    as &[u8],
-                            ),
-                            _ => (StatusCode::NOT_FOUND, b"not found" as &[u8]),
-                        };
+            while let Ok(Some(resolver)) = conn.accept().await {
+                let Ok((req, mut stream)) = resolver.resolve_request().await else {
+                    continue;
+                };
+                let (status, body) = match req.uri().path() {
+                    "/health" => (StatusCode::OK, b"{\"status\":\"healthy\"}" as &[u8]),
+                    "/api/users" => (
+                        StatusCode::OK,
+                        b"{\"users\":[{\"id\":1,\"name\":\"Alice\"},{\"id\":2,\"name\":\"Bob\"}]}"
+                            as &[u8],
+                    ),
+                    _ => (StatusCode::NOT_FOUND, b"not found" as &[u8]),
+                };
 
-                        let resp = http::Response::builder()
-                            .status(status)
-                            .header("content-type", "application/json")
-                            .body(())
-                            .unwrap();
+                let resp = http::Response::builder()
+                    .status(status)
+                    .header("content-type", "application/json")
+                    .body(())
+                    .unwrap();
 
-                        let _ = stream.send_response(resp).await;
-                        let _ = stream
-                            .send_data(bytes::Bytes::copy_from_slice(body))
-                            .await;
-                        let _ = stream.finish().await;
-                    }
-                    _ => break,
-                }
+                let _ = stream.send_response(resp).await;
+                let _ = stream.send_data(bytes::Bytes::copy_from_slice(body)).await;
+                let _ = stream.finish().await;
             }
         });
     }
@@ -330,10 +331,9 @@ async fn run_dtls_echo(addr: SocketAddr, cert_path: &str, key_path: &str) -> any
         ..Default::default()
     };
 
-    let listener =
-        listener::listen(addr.to_string(), cfg)
-            .await
-            .map_err(|e| anyhow::anyhow!("DTLS listener bind error: {e}"))?;
+    let listener = listener::listen(addr.to_string(), cfg)
+        .await
+        .map_err(|e| anyhow::anyhow!("DTLS listener bind error: {e}"))?;
 
     loop {
         let (conn, _peer): (Arc<dyn webrtc_util::Conn + Send + Sync>, SocketAddr) = listener
@@ -373,6 +373,7 @@ async fn main() -> anyhow::Result<()> {
 
     println!("Multi-Protocol Backend Server");
     println!("=============================");
+    println!("HTTP/1.1 API:     127.0.0.1:3001");
     println!("HTTP/1.1 Health:  127.0.0.1:3010");
     println!("HTTP/2 (h2c):    127.0.0.1:3002");
     println!("HTTPS/H2 (TLS):  127.0.0.1:3443");
@@ -389,22 +390,69 @@ async fn main() -> anyhow::Result<()> {
     let key_str = key_path.to_string_lossy().to_string();
 
     // Spawn all servers independently so one failure doesn't kill the rest
-    tokio::spawn(async { if let Err(e) = run_http1_health_server("127.0.0.1:3010".parse().unwrap()).await { eprintln!("http1 health error: {e}"); } });
-    tokio::spawn(async { if let Err(e) = run_h2c_server("127.0.0.1:3002".parse().unwrap()).await { eprintln!("h2c server error: {e}"); } });
-    tokio::spawn(async move { if let Err(e) = run_h2_tls_server("127.0.0.1:3443".parse().unwrap(), tls_cfg.clone()).await { eprintln!("h2-tls server error: {e}"); } });
-    tokio::spawn(async { if let Err(e) = run_ws_server("127.0.0.1:3003".parse().unwrap()).await { eprintln!("ws server error: {e}"); } });
-    tokio::spawn(async { if let Err(e) = run_grpc_server("127.0.0.1:50052".parse().unwrap()).await { eprintln!("grpc server error: {e}"); } });
-    tokio::spawn(async { if let Err(e) = run_tcp_echo("127.0.0.1:3004".parse().unwrap()).await { eprintln!("tcp echo error: {e}"); } });
+    tokio::spawn(async {
+        if let Err(e) = run_http1_server("127.0.0.1:3001".parse().unwrap()).await {
+            eprintln!("http1 server error: {e}");
+        }
+    });
+    tokio::spawn(async {
+        if let Err(e) = run_http1_health_server("127.0.0.1:3010".parse().unwrap()).await {
+            eprintln!("http1 health error: {e}");
+        }
+    });
+    tokio::spawn(async {
+        if let Err(e) = run_h2c_server("127.0.0.1:3002".parse().unwrap()).await {
+            eprintln!("h2c server error: {e}");
+        }
+    });
+    tokio::spawn(async move {
+        if let Err(e) = run_h2_tls_server("127.0.0.1:3443".parse().unwrap(), tls_cfg.clone()).await
+        {
+            eprintln!("h2-tls server error: {e}");
+        }
+    });
+    tokio::spawn(async {
+        if let Err(e) = run_ws_server("127.0.0.1:3003".parse().unwrap()).await {
+            eprintln!("ws server error: {e}");
+        }
+    });
+    tokio::spawn(async {
+        if let Err(e) = run_grpc_server("127.0.0.1:50052".parse().unwrap()).await {
+            eprintln!("grpc server error: {e}");
+        }
+    });
+    tokio::spawn(async {
+        if let Err(e) = run_tcp_echo("127.0.0.1:3004".parse().unwrap()).await {
+            eprintln!("tcp echo error: {e}");
+        }
+    });
     {
         let tls_cfg2 = Arc::new(
             tls_utils::make_server_tls_config(&cert_path, &key_path)
                 .context("building tcp-tls server config")?,
         );
-        tokio::spawn(async move { if let Err(e) = run_tcp_tls_echo("127.0.0.1:3444".parse().unwrap(), tls_cfg2).await { eprintln!("tcp-tls echo error: {e}"); } });
+        tokio::spawn(async move {
+            if let Err(e) = run_tcp_tls_echo("127.0.0.1:3444".parse().unwrap(), tls_cfg2).await {
+                eprintln!("tcp-tls echo error: {e}");
+            }
+        });
     }
-    tokio::spawn(async { if let Err(e) = run_udp_echo("127.0.0.1:3005".parse().unwrap()).await { eprintln!("udp echo error: {e}"); } });
-    tokio::spawn(async move { if let Err(e) = run_h3_server("127.0.0.1:3445".parse().unwrap(), h3_cfg).await { eprintln!("h3 server error: {e}"); } });
-    tokio::spawn(async move { if let Err(e) = run_dtls_echo("127.0.0.1:3006".parse().unwrap(), &cert_str, &key_str).await { eprintln!("dtls echo error: {e}"); } });
+    tokio::spawn(async {
+        if let Err(e) = run_udp_echo("127.0.0.1:3005".parse().unwrap()).await {
+            eprintln!("udp echo error: {e}");
+        }
+    });
+    tokio::spawn(async move {
+        if let Err(e) = run_h3_server("127.0.0.1:3445".parse().unwrap(), h3_cfg).await {
+            eprintln!("h3 server error: {e}");
+        }
+    });
+    tokio::spawn(async move {
+        if let Err(e) = run_dtls_echo("127.0.0.1:3006".parse().unwrap(), &cert_str, &key_str).await
+        {
+            eprintln!("dtls echo error: {e}");
+        }
+    });
 
     // Wait for ctrl-c
     tokio::signal::ctrl_c().await?;
