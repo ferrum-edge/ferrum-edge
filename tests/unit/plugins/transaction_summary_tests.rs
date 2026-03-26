@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 
-use ferrum_gateway::plugins::TransactionSummary;
+use ferrum_gateway::plugins::{StreamTransactionSummary, TransactionSummary};
 
 /// Build a fully-populated TransactionSummary for testing.
 fn make_full_summary() -> TransactionSummary {
@@ -313,4 +313,105 @@ fn test_backend_response_carries_error_class() {
 
     let json = serde_json::to_string(&summary).unwrap();
     assert!(json.contains("connection_timeout"));
+}
+
+// ── StreamTransactionSummary error_class ─────────────────────────────────
+
+fn make_stream_summary() -> StreamTransactionSummary {
+    StreamTransactionSummary {
+        proxy_id: "tcp-proxy-1".to_string(),
+        proxy_name: Some("TCP Backend".to_string()),
+        client_ip: "10.0.0.1".to_string(),
+        backend_target: "10.0.0.50:5432".to_string(),
+        backend_resolved_ip: Some("10.0.0.50".to_string()),
+        protocol: "tcp".to_string(),
+        listen_port: 5432,
+        duration_ms: 1500.0,
+        bytes_sent: 2048,
+        bytes_received: 4096,
+        connection_error: None,
+        error_class: None,
+        timestamp_connected: "2026-03-26T12:00:00Z".to_string(),
+        timestamp_disconnected: "2026-03-26T12:00:01.5Z".to_string(),
+    }
+}
+
+#[test]
+fn test_stream_summary_omits_error_class_when_none() {
+    let summary = make_stream_summary();
+    let json = serde_json::to_string(&summary).unwrap();
+
+    assert!(
+        !json.contains("error_class"),
+        "Stream JSON should omit error_class when None, got: {}",
+        json
+    );
+}
+
+#[test]
+fn test_stream_summary_contains_error_class_when_present() {
+    use ferrum_gateway::retry::ErrorClass;
+
+    let mut summary = make_stream_summary();
+    summary.error_class = Some(ErrorClass::ConnectionTimeout);
+    summary.connection_error = Some("Backend connect timeout to 10.0.0.50:5432".to_string());
+
+    let json = serde_json::to_string(&summary).unwrap();
+
+    assert!(
+        json.contains(r#""error_class":"connection_timeout""#),
+        "Stream JSON should contain error_class, got: {}",
+        json
+    );
+    assert!(
+        json.contains("Backend connect timeout"),
+        "Stream JSON should contain connection_error, got: {}",
+        json
+    );
+}
+
+#[test]
+fn test_stream_summary_tls_error_class() {
+    use ferrum_gateway::retry::ErrorClass;
+
+    let mut summary = make_stream_summary();
+    summary.error_class = Some(ErrorClass::TlsError);
+    summary.connection_error = Some("Backend TLS handshake failed".to_string());
+    summary.protocol = "tcp_tls".to_string();
+
+    let json = serde_json::to_string(&summary).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+    assert_eq!(parsed["error_class"], "tls_error");
+    assert_eq!(parsed["protocol"], "tcp_tls");
+}
+
+#[test]
+fn test_stream_summary_dns_error_class() {
+    use ferrum_gateway::retry::ErrorClass;
+
+    let mut summary = make_stream_summary();
+    summary.error_class = Some(ErrorClass::DnsLookupError);
+    summary.connection_error = Some("DNS resolution failed for backend.local".to_string());
+
+    let json = serde_json::to_string(&summary).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+    assert_eq!(parsed["error_class"], "dns_lookup_error");
+}
+
+#[test]
+fn test_stream_summary_serialization_roundtrip() {
+    use ferrum_gateway::retry::ErrorClass;
+
+    let mut summary = make_stream_summary();
+    summary.error_class = Some(ErrorClass::ConnectionRefused);
+
+    let json = serde_json::to_string(&summary).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+    assert_eq!(parsed["proxy_id"], "tcp-proxy-1");
+    assert_eq!(parsed["error_class"], "connection_refused");
+    assert_eq!(parsed["bytes_sent"], 2048);
+    assert_eq!(parsed["bytes_received"], 4096);
 }
