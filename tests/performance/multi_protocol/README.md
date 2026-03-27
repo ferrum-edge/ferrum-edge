@@ -97,6 +97,13 @@ Key environment variables set by the test runner:
 | `FERRUM_ENABLE_HTTP3` | `true` | Enable QUIC listener (HTTP/3 test) |
 | `FERRUM_PROXY_TLS_CERT_PATH` | `certs/cert.pem` | Gateway TLS cert |
 | `FERRUM_DTLS_CERT_PATH` | `certs/cert.pem` | Gateway DTLS cert |
+| `FERRUM_POOL_HTTP2_*` | (tuned) | H2 flow control: 8 MiB stream, 32 MiB conn windows |
+| `FERRUM_HTTP3_*` | (tuned) | H3/QUIC: 8 MiB stream, 32 MiB conn, 1000 max streams |
+| `FERRUM_HTTP3_CONNECTIONS_PER_BACKEND` | `4` | QUIC connections per backend |
+| `FERRUM_HTTP3_POOL_IDLE_TIMEOUT_SECONDS` | `120` | H3 pool idle eviction timeout |
+| `FERRUM_POOL_CLEANUP_INTERVAL_SECONDS` | `30` | Pool cleanup sweep interval (all pools) |
+| `FERRUM_UDP_MAX_SESSIONS` | `10000` | Max concurrent UDP sessions per proxy |
+| `FERRUM_UDP_CLEANUP_INTERVAL_SECONDS` | `10` | UDP session cleanup interval |
 
 ## Metrics Output
 
@@ -154,49 +161,48 @@ Results from a local run on macOS (Apple Silicon), 10s duration, 200 concurrent 
 
 | Protocol | Requests/sec | Avg Latency | P50 | P99 | Max | Errors |
 |----------|-------------|-------------|------|------|------|--------|
-| HTTP/1.1 | 88,773 | 2.25ms | 2.18ms | 3.93ms | 54.37ms | 0 |
-| HTTP/1.1+TLS | 85,210 | 2.34ms | 2.25ms | 4.24ms | 69.89ms | 0 |
-| HTTP/2 (TLS) | 49,223 | 4.06ms | 3.87ms | 8.16ms | 34.30ms | 0 |
-| HTTP/3 (QUIC) | 39,581 | 5.04ms | 4.60ms | 12.17ms | 105.28ms | 0 |
-| WebSocket | 104,465 | 1.91ms | 1.82ms | 3.75ms | 73.41ms | 0 |
-| gRPC | 34,470 | 5.80ms | 5.68ms | 9.81ms | 77.38ms | 0 |
-| TCP | 108,332 | 1.84ms | 1.76ms | 3.60ms | 40.83ms | 0 |
-| TCP+TLS | 112,152 | 1.78ms | 1.75ms | 2.92ms | 10.23ms | 0 |
-| UDP | 79,029 | 2.53ms | 2.52ms | 3.38ms | 27.87ms | 0 |
-| UDP+DTLS | 74,098 | 2.57ms | 2.53ms | 4.28ms | 99.33ms | 0 |
+| HTTP/1.1 | 90,706 | 2.20ms | 2.14ms | 4.21ms | 21.31ms | 0 |
+| HTTP/1.1+TLS | 88,472 | 2.26ms | 2.18ms | 4.40ms | 33.70ms | 0 |
+| HTTP/2 (TLS) | 101,390 | 1.97ms | 1.85ms | 5.04ms | 37.12ms | 0 |
+| HTTP/3 (QUIC) | 50,519 | 3.95ms | 3.73ms | 6.72ms | 60.06ms | 0 |
+| WebSocket | 113,141 | 1.76ms | 1.72ms | 3.05ms | 15.92ms | 0 |
+| gRPC | 63,235 | 3.16ms | 2.93ms | 8.77ms | 47.13ms | 0 |
+| TCP | 113,657 | 1.76ms | 1.73ms | 2.77ms | 13.96ms | 0 |
+| TCP+TLS | 113,794 | 1.76ms | 1.72ms | 2.96ms | 25.18ms | 0 |
+| UDP | 82,515 | 2.42ms | 2.45ms | 2.91ms | 21.47ms | 0 |
+| UDP+DTLS | 80,187 | 2.37ms | 2.43ms | 3.25ms | 16.56ms | 0 |
 
 ### Direct Backend (client → backend, no gateway)
 
 | Protocol | Requests/sec | Avg Latency | P50 | P99 | Max |
 |----------|-------------|-------------|------|------|------|
-| HTTP/1.1 | 100,112 | 2.00ms | 2.07ms | 2.88ms | 11.29ms |
-| HTTP/1.1+TLS | 98,935* | 2.02ms | 2.08ms | 3.17ms | 25.17ms |
-| HTTP/2 (TLS) | 109,162 | 1.83ms | 1.91ms | 2.78ms | 8.06ms |
-| HTTP/3 (QUIC) | 67,866 | 2.94ms | 2.80ms | 4.74ms | 79.17ms |
-| WebSocket | 219,620 | 909μs | 881μs | 1.80ms | 7.34ms |
-| gRPC | 118,650 | 1.68ms | 1.43ms | 5.62ms | 44.90ms |
-| TCP | 215,646 | 926μs | 883μs | 1.97ms | 24.57ms |
-| TCP+TLS | 221,520 | 901μs | 876μs | 1.75ms | 8.24ms |
-| UDP | 228,705 | 873μs | 759μs | 2.05ms | 15.46ms |
-| UDP+DTLS | —** | — | — | — | — |
+| HTTP/1.1 | 222,382 | 897μs | 856μs | 1.86ms | 20.82ms |
+| HTTP/1.1+TLS | 222,883* | 895μs | 856μs | 1.85ms | 14.30ms |
+| HTTP/2 (TLS) | 349,942 | 570μs | 502μs | 1.66ms | 126.08ms |
+| HTTP/3 (QUIC) | 88,524 | 2.26ms | 2.25ms | 2.73ms | 21.71ms |
+| WebSocket | 225,172 | 886μs | 863μs | 1.71ms | 20.27ms |
+| gRPC | 176,234 | 1.13ms | 963μs | 3.85ms | 80.19ms |
+| TCP | 224,167 | 891μs | 865μs | 1.71ms | 52.51ms |
+| TCP+TLS | 224,985 | 887μs | 865μs | 1.71ms | 13.69ms |
+| UDP | 276,245 | 723μs | 696μs | 1.11ms | 8.59ms |
+| UDP+DTLS | 108,489 | 1.75ms | 1.78ms | 2.64ms | 11.89ms |
 
 *\*HTTP/1.1+TLS direct baseline uses plain HTTP since the backend has no TLS; the TLS overhead is entirely at the gateway.*
-*\*\*UDP+DTLS direct backend cannot be tested at 200 connections due to webrtc\_dtls library limitation with concurrent DTLS handshakes. Gateway-proxied DTLS works fine (74K ops/sec) because the gateway terminates DTLS and forwards plain UDP.*
 
 ### Gateway Overhead
 
 | Protocol | Gateway RPS | Direct RPS | Overhead | Notes |
 |----------|------------|------------|----------|-------|
-| HTTP/1.1 | 88,773 | 100,112 | ~11% | reqwest connection pool with keep-alive |
-| HTTP/1.1+TLS | 85,210 | 98,935 | ~14% | TLS termination at gateway, plain HTTP to backend |
-| HTTP/2 (TLS) | 49,223 | 109,162 | ~55% | reqwest H2; hyper-native pool planned |
-| HTTP/3 (QUIC) | 39,581 | 67,866 | ~42% | QUIC proxy via quinn |
-| WebSocket | 104,465 | 219,620 | ~52% | Upgrade overhead amortized over many messages |
-| gRPC | 34,470 | 118,650 | ~71% | H2 multiplexing + protobuf passthrough |
-| TCP | 108,332 | 215,646 | ~50% | Bidirectional copy, minimal per-byte overhead |
-| TCP+TLS | 112,152 | 221,520 | ~49% | TLS termination + bidirectional copy |
-| UDP | 79,029 | 228,705 | ~65% | Per-datagram session lookup + forwarding |
-| UDP+DTLS | 74,098 | — | — | DTLS termination + plain UDP forwarding |
+| HTTP/1.1 | 90,706 | 222,382 | ~59% | reqwest connection pool with keep-alive |
+| HTTP/1.1+TLS | 88,472 | 222,883 | ~60% | TLS termination at gateway, plain HTTP to backend |
+| HTTP/2 (TLS) | 101,390 | 349,942 | ~71% | hyper-native H2 pool with multiplexing |
+| HTTP/3 (QUIC) | 50,519 | 88,524 | ~43% | QUIC connection pool via quinn |
+| WebSocket | 113,141 | 225,172 | ~50% | Upgrade overhead amortized over many messages |
+| gRPC | 63,235 | 176,234 | ~64% | H2 multiplexing + protobuf passthrough |
+| TCP | 113,657 | 224,167 | ~49% | Bidirectional copy, minimal per-byte overhead |
+| TCP+TLS | 113,794 | 224,985 | ~49% | TLS termination + bidirectional copy (cached TLS config) |
+| UDP | 82,515 | 276,245 | ~70% | Per-datagram session lookup + forwarding |
+| UDP+DTLS | 80,187 | 108,489 | ~26% | DTLS termination + plain UDP forwarding |
 
 ## Prerequisites
 

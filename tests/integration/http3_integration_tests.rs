@@ -83,6 +83,7 @@ fn create_http3_test_proxy() -> Proxy {
         pool_http2_adaptive_window: None,
         pool_http2_max_frame_size: None,
         pool_http2_max_concurrent_streams: None,
+        pool_http3_connections_per_backend: None,
         upstream_id: None,
         circuit_breaker: None,
         retry: None,
@@ -162,6 +163,11 @@ fn create_http3_test_env_config() -> EnvConfig {
         http3_stream_receive_window: 8_388_608,
         http3_receive_window: 33_554_432,
         http3_send_window: 8_388_608,
+        http3_connections_per_backend: 4,
+        http3_pool_idle_timeout_seconds: 120,
+        pool_cleanup_interval_seconds: 30,
+        udp_max_sessions: 10_000,
+        udp_cleanup_interval_seconds: 10,
         db_tls_enabled: false,
         db_tls_ca_cert_path: None,
         db_tls_client_cert_path: None,
@@ -351,6 +357,8 @@ async fn test_http3_proxy_state_creation() {
             lb_cache.clone(),
             None,
             false,
+            10_000,
+            10,
         ),
     );
     let dns_cache_for_sd = dns_cache.clone();
@@ -514,6 +522,8 @@ async fn test_http3_full_integration() {
             lb_cache.clone(),
             None,
             false,
+            10_000,
+            10,
         ),
     );
     let dns_cache_for_sd = dns_cache.clone();

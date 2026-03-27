@@ -96,13 +96,27 @@ impl GrpcConnectionPool {
     /// ⚠️  CRITICAL — DO NOT add fields to this key without careful analysis.
     /// Adding fields causes pool fragmentation and P95 latency regressions.
     /// See `ConnectionPool::create_pool_key` for detailed rationale.
+    ///
+    /// Returns the base key (without shard suffix). For shard keys, the caller
+    /// appends `#N` using `write!` to avoid extra allocations.
     fn pool_key(proxy: &Proxy) -> String {
         let tls = matches!(proxy.backend_protocol, BackendProtocol::Grpcs);
         format!("{}:{}:{}", proxy.backend_host, proxy.backend_port, tls)
     }
 
-    fn shard_key(base_key: &str, shard: usize) -> String {
-        format!("{base_key}#{shard}")
+    /// Build a shard key by appending the shard index to a pre-allocated buffer.
+    /// Reuses the same buffer across calls to minimize allocations.
+    fn write_shard_key(buf: &mut String, base_key: &str, shard: usize) {
+        buf.clear();
+        buf.push_str(base_key);
+        buf.push('#');
+        // Inline integer formatting for small numbers (0-9 are single digit)
+        if shard < 10 {
+            buf.push((b'0' + shard as u8) as char);
+        } else {
+            use std::fmt::Write;
+            let _ = write!(buf, "{shard}");
+        }
     }
 
     /// Get or create an HTTP/2 connection to the gRPC backend.
@@ -120,9 +134,12 @@ impl GrpcConnectionPool {
             .or_insert_with(|| Arc::new(AtomicUsize::new(0)))
             .clone();
         let start = rr.fetch_add(1, Ordering::Relaxed) % shard_count;
-        let selected_key = Self::shard_key(&base_key, start);
 
-        if let Some(entry) = self.entries.get(&selected_key) {
+        // Reusable buffer for shard key construction (avoids per-request String allocation)
+        let mut key_buf = String::with_capacity(base_key.len() + 4);
+        Self::write_shard_key(&mut key_buf, &base_key, start);
+
+        if let Some(entry) = self.entries.get(&key_buf) {
             if !entry.sender.is_closed() {
                 entry
                     .last_used_epoch_ms
@@ -130,7 +147,7 @@ impl GrpcConnectionPool {
                 return Ok(entry.sender.clone());
             }
             drop(entry);
-            self.entries.remove(&selected_key);
+            self.entries.remove(&key_buf);
         }
 
         // Fill the selected shard eagerly so round-robin distribution actually
@@ -140,8 +157,8 @@ impl GrpcConnectionPool {
             Err(err) => {
                 for offset in 1..shard_count {
                     let shard = (start + offset) % shard_count;
-                    let key = Self::shard_key(&base_key, shard);
-                    if let Some(entry) = self.entries.get(&key) {
+                    Self::write_shard_key(&mut key_buf, &base_key, shard);
+                    if let Some(entry) = self.entries.get(&key_buf) {
                         if !entry.sender.is_closed() {
                             entry
                                 .last_used_epoch_ms
@@ -149,13 +166,15 @@ impl GrpcConnectionPool {
                             return Ok(entry.sender.clone());
                         }
                         drop(entry);
-                        self.entries.remove(&key);
+                        self.entries.remove(&key_buf);
                     }
                 }
                 return Err(err);
             }
         };
-        let sender = match self.entries.entry(selected_key) {
+        // Reset key_buf to the originally selected shard for insertion
+        Self::write_shard_key(&mut key_buf, &base_key, start);
+        let sender = match self.entries.entry(key_buf) {
             dashmap::mapref::entry::Entry::Occupied(mut occupied) => {
                 if occupied.get().sender.is_closed() {
                     occupied.insert(GrpcPoolEntry {
@@ -447,9 +466,10 @@ impl GrpcConnectionPool {
             .global_pool_config
             .idle_timeout_seconds
             .saturating_mul(1000);
+        let cleanup_secs = self.global_env_config.pool_cleanup_interval_seconds.max(1);
 
         tokio::spawn(async move {
-            let mut cleanup_timer = tokio::time::interval(Duration::from_secs(30));
+            let mut cleanup_timer = tokio::time::interval(Duration::from_secs(cleanup_secs));
 
             loop {
                 cleanup_timer.tick().await;

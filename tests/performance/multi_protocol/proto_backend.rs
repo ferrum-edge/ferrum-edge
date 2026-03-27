@@ -10,7 +10,7 @@
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
 use bytes::Bytes;
@@ -91,7 +91,6 @@ async fn handle_http(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, In
             .body(Full::new(Bytes::from_static(b"{\"status\":\"healthy\"}")))
             .unwrap_or_else(|_| Response::new(Full::new(Bytes::new()))),
         (ref m, "/api/users") if m == hyper::Method::GET => {
-            tokio::time::sleep(Duration::from_micros(100)).await;
             Response::builder()
                 .status(StatusCode::OK)
                 .header("content-type", "application/json")

@@ -198,6 +198,8 @@ impl ProxyState {
             load_balancer_cache.clone(),
             None, // Frontend TLS for stream proxies is configured per-listener in reconcile()
             env_config_arc.tls_no_verify,
+            env_config_arc.udp_max_sessions,
+            env_config_arc.udp_cleanup_interval_seconds,
         ));
 
         // Reconcile stream proxy listeners (TCP/UDP) at startup so that any

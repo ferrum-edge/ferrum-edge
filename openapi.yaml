@@ -1206,6 +1206,12 @@ components:
           description: |
             Maximum concurrent HTTP/2 streams per backend connection (overrides global).
             Default: 1000.
+        pool_http3_connections_per_backend:
+          type: [integer, "null"]
+          description: |
+            Number of QUIC connections per HTTP/3 backend (overrides global
+            FERRUM_HTTP3_CONNECTIONS_PER_BACKEND). Multiple connections distribute
+            QUIC frame processing across driver tasks. Default: 4.
         upstream_id:
           type: [string, "null"]
 

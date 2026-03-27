@@ -181,6 +181,23 @@ pub struct EnvConfig {
     /// Controls how much data can be in flight (sent but unacknowledged)
     /// across all streams on a single QUIC connection.
     pub http3_send_window: u64,
+    /// Number of QUIC connections to maintain per HTTP/3 backend (default: 4).
+    /// Multiple connections distribute QUIC frame processing across driver tasks.
+    pub http3_connections_per_backend: usize,
+    /// HTTP/3 pool idle timeout in seconds (default: 120).
+    /// Connections idle longer than this are evicted from the pool.
+    pub http3_pool_idle_timeout_seconds: u64,
+
+    // Connection pool cleanup
+    /// Interval in seconds between connection pool cleanup sweeps (default: 30).
+    /// Applies to HTTP, gRPC, HTTP/2, and HTTP/3 connection pools.
+    pub pool_cleanup_interval_seconds: u64,
+
+    // UDP proxy
+    /// Maximum concurrent UDP sessions per proxy (default: 10000).
+    pub udp_max_sessions: usize,
+    /// UDP session cleanup interval in seconds (default: 10).
+    pub udp_cleanup_interval_seconds: u64,
 
     // TLS Hardening
     /// Minimum TLS version: "1.2" or "1.3" (default: "1.2")
@@ -312,6 +329,11 @@ impl Default for EnvConfig {
             http3_stream_receive_window: 8_388_608, // 8 MiB
             http3_receive_window: 33_554_432,       // 32 MiB
             http3_send_window: 8_388_608,           // 8 MiB
+            http3_connections_per_backend: 4,
+            http3_pool_idle_timeout_seconds: 120,
+            pool_cleanup_interval_seconds: 30,
+            udp_max_sessions: 10_000,
+            udp_cleanup_interval_seconds: 10,
             tls_min_version: "1.2".into(),
             tls_max_version: "1.3".into(),
             tls_cipher_suites: None,
@@ -457,6 +479,36 @@ impl EnvConfig {
             ),
             http3_receive_window: resolve_u64(conf, "FERRUM_HTTP3_RECEIVE_WINDOW", 33_554_432),
             http3_send_window: resolve_u64(conf, "FERRUM_HTTP3_SEND_WINDOW", 8_388_608),
+            http3_connections_per_backend: resolve_var(
+                conf,
+                "FERRUM_HTTP3_CONNECTIONS_PER_BACKEND",
+            )
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4)
+            .max(1),
+            http3_pool_idle_timeout_seconds: resolve_u64(
+                conf,
+                "FERRUM_HTTP3_POOL_IDLE_TIMEOUT_SECONDS",
+                120,
+            ),
+
+            // Connection pool cleanup
+            pool_cleanup_interval_seconds: resolve_u64(
+                conf,
+                "FERRUM_POOL_CLEANUP_INTERVAL_SECONDS",
+                30,
+            ),
+
+            // UDP proxy
+            udp_max_sessions: resolve_var(conf, "FERRUM_UDP_MAX_SESSIONS")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(10_000)
+                .max(1),
+            udp_cleanup_interval_seconds: resolve_u64(
+                conf,
+                "FERRUM_UDP_CLEANUP_INTERVAL_SECONDS",
+                10,
+            ),
 
             // TLS Hardening
             tls_min_version: resolve_var_or(conf, "FERRUM_TLS_MIN_VERSION", "1.2"),

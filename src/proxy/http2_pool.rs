@@ -404,9 +404,10 @@ impl Http2ConnectionPool {
             .global_pool_config
             .idle_timeout_seconds
             .saturating_mul(1000);
+        let cleanup_secs = self.global_env_config.pool_cleanup_interval_seconds.max(1);
 
         tokio::spawn(async move {
-            let mut cleanup_timer = tokio::time::interval(Duration::from_secs(30));
+            let mut cleanup_timer = tokio::time::interval(Duration::from_secs(cleanup_secs));
 
             loop {
                 cleanup_timer.tick().await;

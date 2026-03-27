@@ -19,6 +19,67 @@ use crate::config::types::{BackendProtocol, GatewayConfig, Proxy};
 use crate::dns::DnsCache;
 use crate::load_balancer::LoadBalancerCache;
 
+/// Cached backend TLS configuration to avoid reading certificate files from
+/// disk on every connection. Built once per listener lifecycle and reused.
+struct CachedBackendTlsConfig {
+    config: Arc<rustls::ClientConfig>,
+}
+
+impl CachedBackendTlsConfig {
+    /// Build a TLS client config from proxy settings, reading cert files once.
+    fn build(proxy: &Proxy, tls_no_verify: bool) -> Result<Self, anyhow::Error> {
+        // Build root certificate store
+        let mut root_store = rustls::RootCertStore::empty();
+        if let Some(ca_path) = &proxy.backend_tls_server_ca_cert_path {
+            let ca_data = std::fs::read(ca_path)
+                .map_err(|e| anyhow::anyhow!("Failed to read CA cert {}: {}", ca_path, e))?;
+            let certs = rustls_pemfile::certs(&mut &ca_data[..])
+                .filter_map(|r| r.ok())
+                .collect::<Vec<_>>();
+            for cert in certs {
+                root_store
+                    .add(cert)
+                    .map_err(|e| anyhow::anyhow!("Failed to add CA cert: {}", e))?;
+            }
+        } else {
+            root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        }
+
+        // Build TLS client config with optional client auth
+        let mut tls_config = if let (Some(cert_path), Some(key_path)) = (
+            &proxy.backend_tls_client_cert_path,
+            &proxy.backend_tls_client_key_path,
+        ) {
+            let cert_data = std::fs::read(cert_path)?;
+            let key_data = std::fs::read(key_path)?;
+            let certs: Vec<_> = rustls_pemfile::certs(&mut &cert_data[..])
+                .filter_map(|r| r.ok())
+                .collect();
+            let key = rustls_pemfile::private_key(&mut &key_data[..])
+                .map_err(|e| anyhow::anyhow!("Failed to parse private key: {}", e))?
+                .ok_or_else(|| anyhow::anyhow!("No private key found in {}", key_path))?;
+            rustls::ClientConfig::builder()
+                .with_root_certificates(root_store)
+                .with_client_auth_cert(certs, key)
+                .map_err(|e| anyhow::anyhow!("Failed to set client auth cert: {}", e))?
+        } else {
+            rustls::ClientConfig::builder()
+                .with_root_certificates(root_store)
+                .with_no_client_auth()
+        };
+
+        if !proxy.backend_tls_verify_server_cert || tls_no_verify {
+            tls_config
+                .dangerous()
+                .set_certificate_verifier(Arc::new(NoVerifier));
+        }
+
+        Ok(Self {
+            config: Arc::new(tls_config),
+        })
+    }
+}
+
 /// Metrics for a single TCP proxy listener.
 #[derive(Default)]
 pub struct TcpProxyMetrics {
@@ -70,6 +131,32 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
         addr
     );
 
+    // Pre-build backend TLS config if this proxy uses TcpTls backend protocol.
+    // This avoids reading certificate files from disk on every connection.
+    let backend_tls_cache: Option<Arc<CachedBackendTlsConfig>> = {
+        let current_config = config.load();
+        current_config
+            .proxies
+            .iter()
+            .find(|p| p.id == proxy_id)
+            .filter(|p| p.backend_protocol == BackendProtocol::TcpTls)
+            .map(|proxy| {
+                CachedBackendTlsConfig::build(proxy, tls_no_verify)
+                    .map(Arc::new)
+                    .unwrap_or_else(|e| {
+                        warn!(proxy_id = %proxy_id, "Failed to pre-build backend TLS config: {}, will retry per-connection", e);
+                        // Return a dummy config that will be rebuilt per-connection
+                        Arc::new(CachedBackendTlsConfig {
+                            config: Arc::new(
+                                rustls::ClientConfig::builder()
+                                    .with_root_certificates(rustls::RootCertStore::empty())
+                                    .with_no_client_auth()
+                            ),
+                        })
+                    })
+            })
+    };
+
     let mut shutdown_rx = shutdown;
 
     loop {
@@ -92,6 +179,7 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
                 let lb_cache = load_balancer_cache.clone();
                 let frontend_tls = frontend_tls_config.clone();
                 let metrics = metrics.clone();
+                let backend_tls = backend_tls_cache.clone();
 
                 tokio::spawn(async move {
                     let result = handle_tcp_connection(
@@ -103,6 +191,7 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
                         &lb_cache,
                         frontend_tls.as_ref(),
                         tls_no_verify,
+                        backend_tls.as_deref(),
                     )
                     .await;
 
@@ -151,6 +240,7 @@ async fn handle_tcp_connection(
     lb_cache: &LoadBalancerCache,
     frontend_tls_config: Option<&Arc<rustls::ServerConfig>>,
     tls_no_verify: bool,
+    cached_backend_tls: Option<&CachedBackendTlsConfig>,
 ) -> Result<(u64, u64, Duration), anyhow::Error> {
     let start = Instant::now();
     let _ = client_stream.set_nodelay(true);
@@ -187,8 +277,14 @@ async fn handle_tcp_connection(
 
         // Connect to backend (with or without TLS origination)
         if proxy.backend_protocol == BackendProtocol::TcpTls {
-            let backend_stream =
-                connect_backend_tls(backend_addr, &backend_host, &proxy, tls_no_verify).await?;
+            let backend_stream = connect_backend_tls_cached(
+                backend_addr,
+                &backend_host,
+                &proxy,
+                tls_no_verify,
+                cached_backend_tls,
+            )
+            .await?;
             bidirectional_copy(tls_stream, backend_stream).await
         } else {
             let backend_stream = connect_backend_plain(backend_addr, &proxy).await?;
@@ -197,8 +293,14 @@ async fn handle_tcp_connection(
     } else {
         // No frontend TLS — raw TCP
         if proxy.backend_protocol == BackendProtocol::TcpTls {
-            let backend_stream =
-                connect_backend_tls(backend_addr, &backend_host, &proxy, tls_no_verify).await?;
+            let backend_stream = connect_backend_tls_cached(
+                backend_addr,
+                &backend_host,
+                &proxy,
+                tls_no_verify,
+                cached_backend_tls,
+            )
+            .await?;
             bidirectional_copy(client_stream, backend_stream).await
         } else {
             let backend_stream = connect_backend_plain(backend_addr, &proxy).await?;
@@ -237,63 +339,27 @@ async fn connect_backend_plain(
     Ok(stream)
 }
 
-/// Connect to a TLS-enabled backend (TcpTls protocol).
-async fn connect_backend_tls(
+/// Connect to a TLS-enabled backend using the cached TLS config when available.
+/// Falls back to building the config from disk if no cache is provided.
+async fn connect_backend_tls_cached(
     addr: SocketAddr,
     hostname: &str,
     proxy: &Proxy,
     tls_no_verify: bool,
+    cached_tls: Option<&CachedBackendTlsConfig>,
 ) -> Result<tokio_rustls::client::TlsStream<TcpStream>, anyhow::Error> {
     let tcp_stream = connect_backend_plain(addr, proxy).await?;
 
-    // Build root certificate store
-    let mut root_store = rustls::RootCertStore::empty();
-    if let Some(ca_path) = &proxy.backend_tls_server_ca_cert_path {
-        let ca_data = tokio::fs::read(ca_path)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to read CA cert {}: {}", ca_path, e))?;
-        let certs = rustls_pemfile::certs(&mut &ca_data[..])
-            .filter_map(|r| r.ok())
-            .collect::<Vec<_>>();
-        for cert in certs {
-            root_store
-                .add(cert)
-                .map_err(|e| anyhow::anyhow!("Failed to add CA cert: {}", e))?;
-        }
+    let tls_config = if let Some(cached) = cached_tls {
+        // Fast path: use pre-built TLS config (no disk I/O)
+        cached.config.clone()
     } else {
-        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    }
-
-    // Build TLS client config with optional client auth
-    let mut tls_config = if let (Some(cert_path), Some(key_path)) = (
-        &proxy.backend_tls_client_cert_path,
-        &proxy.backend_tls_client_key_path,
-    ) {
-        let cert_data = tokio::fs::read(cert_path).await?;
-        let key_data = tokio::fs::read(key_path).await?;
-        let certs: Vec<_> = rustls_pemfile::certs(&mut &cert_data[..])
-            .filter_map(|r| r.ok())
-            .collect();
-        let key = rustls_pemfile::private_key(&mut &key_data[..])
-            .map_err(|e| anyhow::anyhow!("Failed to parse private key: {}", e))?
-            .ok_or_else(|| anyhow::anyhow!("No private key found in {}", key_path))?;
-        rustls::ClientConfig::builder()
-            .with_root_certificates(root_store)
-            .with_client_auth_cert(certs, key)
-            .map_err(|e| anyhow::anyhow!("Failed to set client auth cert: {}", e))?
-    } else {
-        rustls::ClientConfig::builder()
-            .with_root_certificates(root_store)
-            .with_no_client_auth()
+        // Slow path: build TLS config from disk (fallback)
+        let built = CachedBackendTlsConfig::build(proxy, tls_no_verify)?;
+        built.config
     };
 
-    if !proxy.backend_tls_verify_server_cert || tls_no_verify {
-        tls_config
-            .dangerous()
-            .set_certificate_verifier(Arc::new(NoVerifier));
-    }
-
-    let connector = tokio_rustls::TlsConnector::from(Arc::new(tls_config));
+    let connector = tokio_rustls::TlsConnector::from(tls_config);
     let server_name = rustls::pki_types::ServerName::try_from(hostname.to_string())
         .map_err(|e| anyhow::anyhow!("Invalid server name '{}': {}", hostname, e))?;
 

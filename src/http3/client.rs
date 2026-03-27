@@ -51,11 +51,12 @@ pub struct Http3ConnectionPool {
 
 impl Http3ConnectionPool {
     pub fn new(env_config: Arc<crate::config::EnvConfig>) -> Self {
+        let connections_per_backend = env_config.http3_connections_per_backend;
         let pool = Self {
             entries: Arc::new(DashMap::new()),
             env_config,
             conn_counter: AtomicU64::new(0),
-            connections_per_backend: 4,
+            connections_per_backend,
         };
         pool.start_cleanup_task();
         pool
@@ -83,8 +84,12 @@ impl Http3ConnectionPool {
         body: bytes::Bytes,
         tls_config_fn: impl FnOnce() -> Arc<rustls::ClientConfig>,
     ) -> Result<(u16, Vec<u8>, HashMap<String, String>), anyhow::Error> {
-        let index = self.conn_counter.fetch_add(1, Ordering::Relaxed) as usize
-            % self.connections_per_backend;
+        // Per-proxy override takes priority over global default
+        let conns_per_backend = proxy
+            .pool_http3_connections_per_backend
+            .unwrap_or(self.connections_per_backend)
+            .max(1);
+        let index = self.conn_counter.fetch_add(1, Ordering::Relaxed) as usize % conns_per_backend;
         let key = Self::pool_key(proxy, index);
 
         // Try cached connection first
@@ -248,8 +253,13 @@ impl Http3ConnectionPool {
     /// Background cleanup task that evicts idle connections.
     fn start_cleanup_task(&self) {
         let entries = self.entries.clone();
+        let cleanup_secs = self.env_config.pool_cleanup_interval_seconds.max(1);
+        let idle_timeout_ms = self
+            .env_config
+            .http3_pool_idle_timeout_seconds
+            .saturating_mul(1000);
         tokio::spawn(async move {
-            let mut cleanup_timer = tokio::time::interval(Duration::from_secs(30));
+            let mut cleanup_timer = tokio::time::interval(Duration::from_secs(cleanup_secs));
             loop {
                 cleanup_timer.tick().await;
                 let now = now_epoch_ms();
@@ -257,8 +267,7 @@ impl Http3ConnectionPool {
                 for entry in entries.iter() {
                     let last_used = entry.last_used_epoch_ms.load(Ordering::Relaxed);
                     let idle_ms = now.saturating_sub(last_used);
-                    if idle_ms > 120_000 {
-                        // 2 minutes idle
+                    if idle_ms > idle_timeout_ms {
                         keys_to_remove.push(entry.key().clone());
                     }
                 }

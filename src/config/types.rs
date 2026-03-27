@@ -601,6 +601,10 @@ pub struct Proxy {
     pub pool_http2_max_frame_size: Option<u32>,
     #[serde(default)]
     pub pool_http2_max_concurrent_streams: Option<u32>,
+    /// Per-proxy override for HTTP/3 connections per backend.
+    /// When set, overrides the global `FERRUM_HTTP3_CONNECTIONS_PER_BACKEND` default.
+    #[serde(default)]
+    pub pool_http3_connections_per_backend: Option<usize>,
     /// Optional upstream ID for load-balanced backends.
     /// When set, overrides backend_host/backend_port with upstream target selection.
     #[serde(default)]

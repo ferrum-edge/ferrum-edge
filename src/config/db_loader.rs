@@ -372,7 +372,7 @@ impl DatabaseStore {
         let hosts_json = serde_json::to_string(&proxy.hosts)?;
 
         sqlx::query(
-            &self.q("INSERT INTO proxies (id, name, hosts, listen_path, backend_protocol, backend_host, backend_port, backend_path, strip_listen_path, preserve_host_header, backend_connect_timeout_ms, backend_read_timeout_ms, backend_write_timeout_ms, backend_tls_client_cert_path, backend_tls_client_key_path, backend_tls_verify_server_cert, backend_tls_server_ca_cert_path, dns_override, dns_cache_ttl_seconds, auth_mode, upstream_id, circuit_breaker, retry, response_body_mode, pool_max_idle_per_host, pool_idle_timeout_seconds, pool_enable_http_keep_alive, pool_enable_http2, pool_tcp_keepalive_seconds, pool_http2_keep_alive_interval_seconds, pool_http2_keep_alive_timeout_seconds, pool_http2_initial_stream_window_size, pool_http2_initial_connection_window_size, pool_http2_adaptive_window, pool_http2_max_frame_size, pool_http2_max_concurrent_streams, listen_port, frontend_tls, udp_idle_timeout_seconds, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+            &self.q("INSERT INTO proxies (id, name, hosts, listen_path, backend_protocol, backend_host, backend_port, backend_path, strip_listen_path, preserve_host_header, backend_connect_timeout_ms, backend_read_timeout_ms, backend_write_timeout_ms, backend_tls_client_cert_path, backend_tls_client_key_path, backend_tls_verify_server_cert, backend_tls_server_ca_cert_path, dns_override, dns_cache_ttl_seconds, auth_mode, upstream_id, circuit_breaker, retry, response_body_mode, pool_max_idle_per_host, pool_idle_timeout_seconds, pool_enable_http_keep_alive, pool_enable_http2, pool_tcp_keepalive_seconds, pool_http2_keep_alive_interval_seconds, pool_http2_keep_alive_timeout_seconds, pool_http2_initial_stream_window_size, pool_http2_initial_connection_window_size, pool_http2_adaptive_window, pool_http2_max_frame_size, pool_http2_max_concurrent_streams, pool_http3_connections_per_backend, listen_port, frontend_tls, udp_idle_timeout_seconds, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
         )
         .bind(&proxy.id)
         .bind(&proxy.name)
@@ -410,6 +410,7 @@ impl DatabaseStore {
         .bind(proxy.pool_http2_adaptive_window.map(|v| if v { 1i32 } else { 0 }))
         .bind(proxy.pool_http2_max_frame_size.map(|v| v as i64))
         .bind(proxy.pool_http2_max_concurrent_streams.map(|v| v as i64))
+        .bind(proxy.pool_http3_connections_per_backend.map(|v| v as i64))
         .bind(proxy.listen_port.map(|v| v as i32))
         .bind(if proxy.frontend_tls { 1i32 } else { 0 })
         .bind(proxy.udp_idle_timeout_seconds as i64)
@@ -455,7 +456,7 @@ impl DatabaseStore {
         let hosts_json = serde_json::to_string(&proxy.hosts)?;
 
         sqlx::query(
-            &self.q("UPDATE proxies SET name=?, hosts=?, listen_path=?, backend_protocol=?, backend_host=?, backend_port=?, backend_path=?, strip_listen_path=?, preserve_host_header=?, backend_connect_timeout_ms=?, backend_read_timeout_ms=?, backend_write_timeout_ms=?, backend_tls_client_cert_path=?, backend_tls_client_key_path=?, backend_tls_verify_server_cert=?, backend_tls_server_ca_cert_path=?, dns_override=?, dns_cache_ttl_seconds=?, auth_mode=?, upstream_id=?, circuit_breaker=?, retry=?, response_body_mode=?, pool_max_idle_per_host=?, pool_idle_timeout_seconds=?, pool_enable_http_keep_alive=?, pool_enable_http2=?, pool_tcp_keepalive_seconds=?, pool_http2_keep_alive_interval_seconds=?, pool_http2_keep_alive_timeout_seconds=?, pool_http2_initial_stream_window_size=?, pool_http2_initial_connection_window_size=?, pool_http2_adaptive_window=?, pool_http2_max_frame_size=?, pool_http2_max_concurrent_streams=?, listen_port=?, frontend_tls=?, udp_idle_timeout_seconds=?, updated_at=? WHERE id=?")
+            &self.q("UPDATE proxies SET name=?, hosts=?, listen_path=?, backend_protocol=?, backend_host=?, backend_port=?, backend_path=?, strip_listen_path=?, preserve_host_header=?, backend_connect_timeout_ms=?, backend_read_timeout_ms=?, backend_write_timeout_ms=?, backend_tls_client_cert_path=?, backend_tls_client_key_path=?, backend_tls_verify_server_cert=?, backend_tls_server_ca_cert_path=?, dns_override=?, dns_cache_ttl_seconds=?, auth_mode=?, upstream_id=?, circuit_breaker=?, retry=?, response_body_mode=?, pool_max_idle_per_host=?, pool_idle_timeout_seconds=?, pool_enable_http_keep_alive=?, pool_enable_http2=?, pool_tcp_keepalive_seconds=?, pool_http2_keep_alive_interval_seconds=?, pool_http2_keep_alive_timeout_seconds=?, pool_http2_initial_stream_window_size=?, pool_http2_initial_connection_window_size=?, pool_http2_adaptive_window=?, pool_http2_max_frame_size=?, pool_http2_max_concurrent_streams=?, pool_http3_connections_per_backend=?, listen_port=?, frontend_tls=?, udp_idle_timeout_seconds=?, updated_at=? WHERE id=?")
         )
         .bind(&proxy.name)
         .bind(&hosts_json)
@@ -492,6 +493,7 @@ impl DatabaseStore {
         .bind(proxy.pool_http2_adaptive_window.map(|v| if v { 1i32 } else { 0 }))
         .bind(proxy.pool_http2_max_frame_size.map(|v| v as i64))
         .bind(proxy.pool_http2_max_concurrent_streams.map(|v| v as i64))
+        .bind(proxy.pool_http3_connections_per_backend.map(|v| v as i64))
         .bind(proxy.listen_port.map(|v| v as i32))
         .bind(if proxy.frontend_tls { 1i32 } else { 0 })
         .bind(proxy.udp_idle_timeout_seconds as i64)
@@ -1285,7 +1287,7 @@ impl DatabaseStore {
     /// Insert a single chunk of proxies in one transaction.
     async fn batch_create_proxies_chunk(&self, proxies: &[Proxy]) -> Result<usize, anyhow::Error> {
         let mut tx = self.pool.begin().await?;
-        let insert_sql = self.q("INSERT INTO proxies (id, name, hosts, listen_path, backend_protocol, backend_host, backend_port, backend_path, strip_listen_path, preserve_host_header, backend_connect_timeout_ms, backend_read_timeout_ms, backend_write_timeout_ms, backend_tls_client_cert_path, backend_tls_client_key_path, backend_tls_verify_server_cert, backend_tls_server_ca_cert_path, dns_override, dns_cache_ttl_seconds, auth_mode, upstream_id, circuit_breaker, retry, response_body_mode, pool_max_idle_per_host, pool_idle_timeout_seconds, pool_enable_http_keep_alive, pool_enable_http2, pool_tcp_keepalive_seconds, pool_http2_keep_alive_interval_seconds, pool_http2_keep_alive_timeout_seconds, pool_http2_initial_stream_window_size, pool_http2_initial_connection_window_size, pool_http2_adaptive_window, pool_http2_max_frame_size, pool_http2_max_concurrent_streams, listen_port, frontend_tls, udp_idle_timeout_seconds, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+        let insert_sql = self.q("INSERT INTO proxies (id, name, hosts, listen_path, backend_protocol, backend_host, backend_port, backend_path, strip_listen_path, preserve_host_header, backend_connect_timeout_ms, backend_read_timeout_ms, backend_write_timeout_ms, backend_tls_client_cert_path, backend_tls_client_key_path, backend_tls_verify_server_cert, backend_tls_server_ca_cert_path, dns_override, dns_cache_ttl_seconds, auth_mode, upstream_id, circuit_breaker, retry, response_body_mode, pool_max_idle_per_host, pool_idle_timeout_seconds, pool_enable_http_keep_alive, pool_enable_http2, pool_tcp_keepalive_seconds, pool_http2_keep_alive_interval_seconds, pool_http2_keep_alive_timeout_seconds, pool_http2_initial_stream_window_size, pool_http2_initial_connection_window_size, pool_http2_adaptive_window, pool_http2_max_frame_size, pool_http2_max_concurrent_streams, pool_http3_connections_per_backend, listen_port, frontend_tls, udp_idle_timeout_seconds, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
         let assoc_sql =
             self.q("INSERT INTO proxy_plugins (proxy_id, plugin_config_id) VALUES (?, ?)");
 
@@ -1374,6 +1376,7 @@ impl DatabaseStore {
                 )
                 .bind(proxy.pool_http2_max_frame_size.map(|v| v as i64))
                 .bind(proxy.pool_http2_max_concurrent_streams.map(|v| v as i64))
+                .bind(proxy.pool_http3_connections_per_backend.map(|v| v as i64))
                 .bind(proxy.listen_port.map(|v| v as i32))
                 .bind(if proxy.frontend_tls { 1i32 } else { 0 })
                 .bind(proxy.udp_idle_timeout_seconds as i64)
@@ -1754,6 +1757,10 @@ fn row_to_proxy(
             .try_get::<i64, _>("pool_http2_max_concurrent_streams")
             .ok()
             .map(|v| v as u32),
+        pool_http3_connections_per_backend: row
+            .try_get::<i64, _>("pool_http3_connections_per_backend")
+            .ok()
+            .map(|v| v.max(1) as usize),
         listen_port: row
             .try_get::<i32, _>("listen_port")
             .ok()

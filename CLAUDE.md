@@ -298,6 +298,11 @@ Reduce per-request allocations in plugin lookup
 | `FERRUM_DTLS_CLIENT_CA_CERT_PATH` | (none) | PEM CA cert for verifying DTLS client certs (frontend mTLS) |
 | `FERRUM_PLUGIN_HTTP_SLOW_THRESHOLD_MS` | `1000` | Threshold (ms) for warning-level logs on slow plugin HTTP calls |
 | `FERRUM_ADMIN_RESTORE_MAX_BODY_SIZE_MIB` | `100` | Max request body size (MiB) for `POST /restore` |
+| `FERRUM_HTTP3_CONNECTIONS_PER_BACKEND` | `4` | QUIC connections per HTTP/3 backend (distributes frame processing) |
+| `FERRUM_HTTP3_POOL_IDLE_TIMEOUT_SECONDS` | `120` | HTTP/3 connection pool idle eviction timeout |
+| `FERRUM_POOL_CLEANUP_INTERVAL_SECONDS` | `30` | Cleanup sweep interval for HTTP, gRPC, HTTP/2, HTTP/3 pools |
+| `FERRUM_UDP_MAX_SESSIONS` | `10000` | Maximum concurrent UDP sessions per proxy |
+| `FERRUM_UDP_CLEANUP_INTERVAL_SECONDS` | `10` | UDP session cleanup sweep interval |
 
 See `src/config/env_config.rs` for the full list of 90+ environment variables.
 

@@ -253,8 +253,8 @@ The default probe type. Sends an HTTP GET request and checks the response status
 UDP is connectionless, so the gateway tracks sessions by client source address (`SocketAddr`). Each unique client gets a dedicated backend socket for reply routing.
 
 - **Session creation**: First datagram from a new client creates a session
-- **Session cleanup**: Background task runs every 10 seconds, removing sessions idle longer than `udp_idle_timeout_seconds`
-- **Max sessions**: Hard limit of 10,000 concurrent sessions per proxy to prevent resource exhaustion
+- **Session cleanup**: Background task runs every `FERRUM_UDP_CLEANUP_INTERVAL_SECONDS` (default 10s), removing sessions idle longer than `udp_idle_timeout_seconds`
+- **Max sessions**: Limit of `FERRUM_UDP_MAX_SESSIONS` (default 10,000) concurrent sessions per proxy to prevent resource exhaustion
 - **Reply routing**: Each session spawns a receiver task that forwards backend replies back to the correct client
 
 ## Compatible Plugins
@@ -282,6 +282,8 @@ See [docs/plugin_execution_order.md](plugin_execution_order.md) for the full per
 | `FERRUM_DTLS_CERT_PATH` | (none) | PEM certificate for frontend DTLS termination (ECDSA P-256 or Ed25519) |
 | `FERRUM_DTLS_KEY_PATH` | (none) | PEM private key for frontend DTLS termination |
 | `FERRUM_DTLS_CLIENT_CA_CERT_PATH` | (none) | PEM CA certificate for verifying DTLS client certs (frontend mTLS). Separate from `FERRUM_TLS_CLIENT_CA_CERT_PATH` used for TCP. |
+| `FERRUM_UDP_MAX_SESSIONS` | `10000` | Maximum concurrent UDP sessions per proxy |
+| `FERRUM_UDP_CLEANUP_INTERVAL_SECONDS` | `10` | Interval between UDP session cleanup sweeps |
 
 ## Validation Rules
 

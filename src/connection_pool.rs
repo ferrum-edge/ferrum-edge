@@ -59,9 +59,10 @@ impl ConnectionPool {
         mtls_config: crate::config::EnvConfig,
         dns_cache: DnsCache,
     ) -> Self {
+        let cleanup_secs = mtls_config.pool_cleanup_interval_seconds;
         let pool = Self {
             pools: Arc::new(DashMap::new()),
-            cleanup_interval: Duration::from_secs(30),
+            cleanup_interval: Duration::from_secs(cleanup_secs.max(1)),
             global_config,
             global_mtls_config: mtls_config,
             dns_cache,

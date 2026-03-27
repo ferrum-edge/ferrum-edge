@@ -50,9 +50,14 @@ pub struct StreamListenerManager {
     frontend_dtls_client_ca_path: arc_swap::ArcSwap<Option<String>>,
     /// Global override to disable backend TLS certificate verification.
     tls_no_verify: bool,
+    /// Maximum concurrent UDP sessions per proxy.
+    udp_max_sessions: usize,
+    /// UDP session cleanup interval in seconds.
+    udp_cleanup_interval_seconds: u64,
 }
 
 impl StreamListenerManager {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         bind_addr: IpAddr,
         config: Arc<arc_swap::ArcSwap<GatewayConfig>>,
@@ -60,6 +65,8 @@ impl StreamListenerManager {
         load_balancer_cache: Arc<LoadBalancerCache>,
         frontend_tls_config: Option<Arc<rustls::ServerConfig>>,
         tls_no_verify: bool,
+        udp_max_sessions: usize,
+        udp_cleanup_interval_seconds: u64,
     ) -> Self {
         Self {
             listeners: tokio::sync::Mutex::new(std::collections::HashMap::new()),
@@ -71,6 +78,8 @@ impl StreamListenerManager {
             frontend_dtls_cert_key: arc_swap::ArcSwap::new(Arc::new(None)),
             frontend_dtls_client_ca_path: arc_swap::ArcSwap::new(Arc::new(None)),
             tls_no_verify,
+            udp_max_sessions,
+            udp_cleanup_interval_seconds,
         }
     }
 
@@ -219,6 +228,8 @@ impl StreamListenerManager {
                     None
                 };
                 let metrics = Arc::new(UdpProxyMetrics::default());
+                let udp_max_sessions = self.udp_max_sessions;
+                let udp_cleanup_interval = self.udp_cleanup_interval_seconds;
                 tokio::spawn(async move {
                     if let Err(e) = super::udp_proxy::start_udp_listener(UdpListenerConfig {
                         port: port_val,
@@ -231,6 +242,8 @@ impl StreamListenerManager {
                         metrics,
                         frontend_dtls_config,
                         tls_no_verify,
+                        max_sessions: udp_max_sessions,
+                        cleanup_interval_seconds: udp_cleanup_interval,
                     })
                     .await
                     {

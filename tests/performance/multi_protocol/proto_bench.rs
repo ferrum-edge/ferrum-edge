@@ -358,42 +358,43 @@ async fn run_http3(args: &BenchArgs) -> anyhow::Result<()> {
     let path = url.path().to_string();
 
     let deadline = Instant::now() + Duration::from_secs(args.duration);
-    let mut handles = Vec::new();
     let client_cfg = tls_utils::make_h3_client_config_insecure();
 
-    for _ in 0..args.concurrency {
-        let path = path.clone();
-        let client_cfg = client_cfg.clone();
-        let host_str = host.to_string();
+    // HTTP/3 multiplexes streams over QUIC connections. Use a connection pool
+    // similar to HTTP/2: ~10 streams per connection for good throughput balance.
+    let num_conns = std::cmp::max(1, std::cmp::min(args.concurrency as usize, args.concurrency as usize / 10 + 1));
+    let host_str = host.to_string();
+    let full_uri = format!("https://{host_str}:{port}{path}");
+
+    // Create a pool of QUIC connections with shared endpoints
+    let mut senders: Vec<h3::client::SendRequest<h3_quinn::OpenStreams, bytes::Bytes>> = Vec::with_capacity(num_conns);
+
+    for _ in 0..num_conns {
+        let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap())?;
+        endpoint.set_default_client_config(client_cfg.clone());
+
+        let conn = endpoint
+            .connect(addr, &host_str)
+            .map_err(|e| anyhow::anyhow!("quinn connect: {e}"))?
+            .await
+            .map_err(|e| anyhow::anyhow!("quinn connect: {e}"))?;
+        let (mut driver, send_req) = h3::client::new(h3_quinn::Connection::new(conn))
+            .await
+            .map_err(|e| anyhow::anyhow!("h3 handshake: {e}"))?;
+        // h3 driver must be polled concurrently to process connection frames
+        tokio::spawn(async move {
+            let _ = futures_util::future::poll_fn(|cx| driver.poll_close(cx)).await;
+        });
+        senders.push(send_req);
+    }
+
+    // Distribute concurrent tasks across the connection pool
+    let mut handles = Vec::new();
+    for i in 0..args.concurrency {
+        let mut send_req = senders[i as usize % num_conns].clone();
+        let full_uri = full_uri.clone();
         handles.push(tokio::spawn(async move {
             let mut metrics = BenchMetrics::new();
-
-            let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap())?;
-            endpoint.set_default_client_config(client_cfg);
-
-            let conn = endpoint
-                .connect(addr, &host_str)
-                .map_err(|e| {
-                    eprintln!("  quinn connect start error: {e}");
-                    anyhow::anyhow!("{e}")
-                })?
-                .await
-                .map_err(|e| {
-                    eprintln!("  quinn connect error: {e}");
-                    anyhow::anyhow!("{e}")
-                })?;
-            let (mut driver, mut send_req) = h3::client::new(h3_quinn::Connection::new(conn))
-                .await
-                .map_err(|e| {
-                    eprintln!("  h3 handshake error: {e}");
-                    anyhow::anyhow!("{e}")
-                })?;
-            // h3 driver must be polled concurrently to process connection frames
-            tokio::spawn(async move {
-                let _ = futures_util::future::poll_fn(|cx| driver.poll_close(cx)).await;
-            });
-
-            let full_uri = format!("https://{host_str}:{port}{path}");
             while Instant::now() < deadline {
                 let req = http::Request::builder()
                     .method("GET")
@@ -490,22 +491,30 @@ async fn run_grpc(args: &BenchArgs) -> anyhow::Result<()> {
     use bench_proto::bench_service_client::BenchServiceClient;
 
     let deadline = Instant::now() + Duration::from_secs(args.duration);
-    let mut handles = Vec::new();
     let payload = vec![0xABu8; args.payload_size];
 
-    for _ in 0..args.concurrency {
-        let target = args.target.clone();
+    // gRPC uses HTTP/2 multiplexing. Share a pool of channels across tasks
+    // (~10 streams per channel) instead of one channel per task.
+    let num_conns = std::cmp::max(1, std::cmp::min(args.concurrency as usize, args.concurrency as usize / 10 + 1));
+    let mut channels = Vec::with_capacity(num_conns);
+
+    for _ in 0..num_conns {
+        let channel = tonic::transport::Channel::from_shared(args.target.clone())
+            .map_err(|e| anyhow::anyhow!("invalid gRPC target: {e}"))?
+            .initial_stream_window_size(8_388_608)         // 8 MiB (vs 64 KB default)
+            .initial_connection_window_size(33_554_432)     // 32 MiB
+            .connect()
+            .await
+            .map_err(|e| anyhow::anyhow!("gRPC connect to {}: {e}", args.target))?;
+        channels.push(channel);
+    }
+
+    let mut handles = Vec::new();
+    for i in 0..args.concurrency {
+        let channel = channels[i as usize % num_conns].clone();
         let payload = payload.clone();
         handles.push(tokio::spawn(async move {
             let mut metrics = BenchMetrics::new();
-
-            let channel = tonic::transport::Channel::from_shared(target.clone())
-                .map_err(|e| anyhow::anyhow!("invalid gRPC target: {e}"))?
-                .initial_stream_window_size(8_388_608)         // 8 MiB (vs 64 KB default)
-                .initial_connection_window_size(33_554_432)     // 32 MiB
-                .connect()
-                .await
-                .map_err(|e| anyhow::anyhow!("gRPC connect to {target}: {e}"))?;
             let mut client = BenchServiceClient::new(channel);
 
             while Instant::now() < deadline {
@@ -521,18 +530,7 @@ async fn run_grpc(args: &BenchArgs) -> anyhow::Result<()> {
                     }
                     Err(_) => {
                         metrics.record_error();
-                        // Try reconnecting
-                        tokio::time::sleep(Duration::from_millis(10)).await;
-                        let Ok(ch) = tonic::transport::Channel::from_shared(target.clone())
-                            .map_err(|e| anyhow::anyhow!("{e}"))
-                            .map(|c| c.initial_stream_window_size(8_388_608).initial_connection_window_size(33_554_432))
-                        else {
-                            break;
-                        };
-                        match ch.connect().await {
-                            Ok(new_ch) => client = BenchServiceClient::new(new_ch),
-                            Err(_) => break,
-                        }
+                        break;
                     }
                 }
             }

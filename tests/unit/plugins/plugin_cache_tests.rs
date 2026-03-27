@@ -47,6 +47,7 @@ fn make_proxy(id: &str, listen_path: &str, plugin_ids: Vec<&str>) -> Proxy {
         pool_http2_adaptive_window: None,
         pool_http2_max_frame_size: None,
         pool_http2_max_concurrent_streams: None,
+        pool_http3_connections_per_backend: None,
         upstream_id: None,
         circuit_breaker: None,
         retry: None,

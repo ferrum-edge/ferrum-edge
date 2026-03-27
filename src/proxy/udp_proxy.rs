@@ -29,9 +29,6 @@ use crate::load_balancer::LoadBalancerCache;
 /// Maximum datagram size for UDP forwarding.
 const MAX_UDP_DATAGRAM_SIZE: usize = 65535;
 
-/// Default maximum number of concurrent sessions per proxy.
-const DEFAULT_MAX_SESSIONS: usize = 10_000;
-
 /// Metrics for a single UDP proxy listener.
 #[derive(Default)]
 pub struct UdpProxyMetrics {
@@ -69,6 +66,10 @@ pub struct UdpListenerConfig {
     /// accepts DTLS connections from clients instead of plain UDP.
     pub frontend_dtls_config: Option<webrtc_dtls::config::Config>,
     pub tls_no_verify: bool,
+    /// Maximum concurrent sessions per proxy (from `FERRUM_UDP_MAX_SESSIONS`, default 10000).
+    pub max_sessions: usize,
+    /// Session cleanup interval in seconds (from `FERRUM_UDP_CLEANUP_INTERVAL_SECONDS`, default 10).
+    pub cleanup_interval_seconds: u64,
 }
 
 /// Start a UDP proxy listener on the given port.
@@ -91,6 +92,8 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
         metrics,
         frontend_dtls_config,
         tls_no_verify,
+        max_sessions,
+        cleanup_interval_seconds,
     } = cfg;
 
     if let Some(dtls_config) = frontend_dtls_config {
@@ -105,12 +108,14 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
             metrics,
             dtls_config,
             tls_no_verify,
+            max_sessions,
         )
         .await;
     }
 
     let addr = SocketAddr::new(bind_addr, port);
     let frontend_socket = Arc::new(UdpSocket::bind(addr).await?);
+    ensure_coarse_timer_started();
     info!(proxy_id = %proxy_id, "UDP proxy listener started on {}", addr);
 
     let sessions: SessionMap = Arc::new(DashMap::new());
@@ -133,6 +138,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
         proxy_id.clone(),
         idle_timeout,
         shutdown.clone(),
+        cleanup_interval_seconds,
     );
 
     let mut buf = vec![0u8; MAX_UDP_DATAGRAM_SIZE];
@@ -159,12 +165,12 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                     existing.value().clone()
                 } else {
                     // Check session limit
-                    if sessions.len() >= DEFAULT_MAX_SESSIONS {
+                    if sessions.len() >= max_sessions {
                         warn!(
                             proxy_id = %proxy_id,
                             client = %client_addr,
                             "UDP session limit reached ({}), dropping datagram",
-                            DEFAULT_MAX_SESSIONS
+                            max_sessions
                         );
                         continue;
                     }
@@ -195,7 +201,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                 };
 
                 // Forward datagram to backend (via DTLS if configured)
-                session.last_activity.store(epoch_millis(), Ordering::Relaxed);
+                session.last_activity.store(coarse_epoch_millis(), Ordering::Relaxed);
                 let send_result = if let Some(ref dtls) = session.dtls_conn {
                     dtls.write(data, None).await.map_err(|e| std::io::Error::other(e.to_string()))
                 } else {
@@ -230,15 +236,17 @@ fn spawn_session_cleanup(
     proxy_id: String,
     idle_timeout_seconds: u64,
     mut shutdown: watch::Receiver<bool>,
+    cleanup_interval_seconds: u64,
 ) {
     let idle_timeout_ms = idle_timeout_seconds * 1000;
 
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(10));
+        let mut interval =
+            tokio::time::interval(Duration::from_secs(cleanup_interval_seconds.max(1)));
         loop {
             tokio::select! {
                 _ = interval.tick() => {
-                    let now = epoch_millis();
+                    let now = coarse_epoch_millis();
                     let mut expired = Vec::new();
 
                     for entry in sessions.iter() {
@@ -291,11 +299,13 @@ async fn start_dtls_frontend_listener(
     metrics: Arc<UdpProxyMetrics>,
     dtls_config: webrtc_dtls::config::Config,
     tls_no_verify: bool,
+    max_sessions: usize,
 ) -> Result<(), anyhow::Error> {
     use webrtc_util::conn::Listener;
 
     let addr = SocketAddr::new(bind_addr, port);
     let listener = crate::dtls::start_dtls_listener(addr, dtls_config).await?;
+    ensure_coarse_timer_started();
     info!(proxy_id = %proxy_id, "DTLS frontend listener started on {}", addr);
 
     let mut shutdown_rx = shutdown;
@@ -313,12 +323,12 @@ async fn start_dtls_frontend_listener(
 
                 // Check session limit
                 let active = metrics.active_sessions.load(Ordering::Relaxed);
-                if active >= DEFAULT_MAX_SESSIONS as u64 {
+                if active >= max_sessions as u64 {
                     warn!(
                         proxy_id = %proxy_id,
                         client = %client_addr,
                         "DTLS session limit reached ({}), rejecting connection",
-                        DEFAULT_MAX_SESSIONS
+                        max_sessions
                     );
                     let _ = client_conn.close().await;
                     continue;
@@ -614,7 +624,7 @@ async fn create_session(
     let session = Arc::new(UdpSession {
         backend_socket: backend_socket.clone(),
         dtls_conn: dtls_conn.clone(),
-        last_activity: AtomicU64::new(epoch_millis()),
+        last_activity: AtomicU64::new(coarse_epoch_millis()),
         bytes_sent: AtomicU64::new(0),
         bytes_received: AtomicU64::new(0),
     });
@@ -653,7 +663,7 @@ async fn create_session(
                 Ok(len) => {
                     reply_session
                         .last_activity
-                        .store(epoch_millis(), Ordering::Relaxed);
+                        .store(coarse_epoch_millis(), Ordering::Relaxed);
                     reply_session
                         .bytes_received
                         .fetch_add(len as u64, Ordering::Relaxed);
@@ -713,7 +723,37 @@ fn resolve_backend_target(
     }
 }
 
-fn epoch_millis() -> u64 {
+/// Coarse-grained epoch millisecond timestamp updated periodically.
+/// Avoids calling `SystemTime::now()` on every datagram in the hot path.
+/// Resolution is ~1ms which is sufficient for session idle timeout tracking.
+static COARSE_EPOCH_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Start the background timer that updates `COARSE_EPOCH_MS` every millisecond.
+/// Safe to call multiple times; only the first call spawns the task.
+fn ensure_coarse_timer_started() {
+    use std::sync::Once;
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        // Seed with current time
+        COARSE_EPOCH_MS.store(epoch_millis_precise(), Ordering::Relaxed);
+        tokio::spawn(async {
+            let mut interval = tokio::time::interval(Duration::from_millis(1));
+            loop {
+                interval.tick().await;
+                COARSE_EPOCH_MS.store(epoch_millis_precise(), Ordering::Relaxed);
+            }
+        });
+    });
+}
+
+/// Get the coarse-grained cached timestamp (updated every ~1ms).
+#[inline(always)]
+fn coarse_epoch_millis() -> u64 {
+    COARSE_EPOCH_MS.load(Ordering::Relaxed)
+}
+
+/// Precise epoch millis - used for timer updates and initial seeding.
+fn epoch_millis_precise() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()

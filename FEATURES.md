@@ -6,7 +6,7 @@ A comprehensive feature list for Ferrum Gateway.
 
 - **HTTP/1.1** with keep-alive connection pooling
 - **HTTP/2** via ALPN negotiation on TLS connections
-- **HTTP/3** (QUIC) on the same port as HTTPS with configurable idle timeout and max streams
+- **HTTP/3** (QUIC) on the same port as HTTPS with configurable idle timeout, max streams, QUIC flow-control windows, and per-backend connection pooling
 - **WebSocket** (`ws`/`wss`) with transparent upgrade handling
 - **gRPC** (`grpc`/`grpcs`) with HTTP/2 trailer support and full plugin compatibility
 - **TCP** stream proxying with TLS termination and origination
