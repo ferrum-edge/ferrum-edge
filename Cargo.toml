@@ -9,6 +9,12 @@ license = "PolyForm-Noncommercial-1.0.0"
 name = "ferrum-gateway"
 path = "src/main.rs"
 
+[features]
+default = []
+secrets-vault = ["dep:vaultrs"]
+secrets-aws = ["dep:aws-config", "dep:aws-sdk-secretsmanager"]
+secrets-gcp = ["dep:google-cloud-secretmanager-v1"]
+secrets-azure = ["dep:azure_security_keyvault_secrets", "dep:azure_identity", "dep:azure_core"]
 
 [dependencies]
 # Async runtime
@@ -80,6 +86,15 @@ sha2 = "0.10.9"
 hmac = "0.12.1"
 hex = "0.4"
 x509-parser = "0.16"
+
+# Secrets management (optional)
+vaultrs = { version = "0.7", optional = true }
+aws-config = { version = "1.1", features = ["behavior-version-latest"], optional = true }
+aws-sdk-secretsmanager = { version = "1", optional = true }
+google-cloud-secretmanager-v1 = { version = "1.7", optional = true }
+azure_security_keyvault_secrets = { version = "0.12", optional = true }
+azure_identity = { version = "0.33", optional = true }
+azure_core = { version = "0.33", optional = true }
 
 # DTLS (secure UDP)
 webrtc-dtls = { package = "dtls", version = "0.17.1", features = ["pem"] }

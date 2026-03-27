@@ -18,6 +18,7 @@ mod plugins;
 mod proxy;
 mod retry;
 mod router_cache;
+mod secrets;
 mod service_discovery;
 mod tls;
 
@@ -46,7 +47,19 @@ async fn main() {
 
     info!("Ferrum Gateway starting...");
 
-    // Load environment config
+    // Resolve any env vars with _FILE, _VAULT, _AWS, _GCP, _AZURE suffixes
+    // into their base env vars BEFORE loading config. This way every config
+    // key automatically supports external secret sources.
+    match secrets::resolve_all_env_secrets().await {
+        Ok(0) => {}
+        Ok(n) => info!("Resolved {} env var(s) from external secret sources", n),
+        Err(e) => {
+            error!("Secret resolution error: {}", e);
+            std::process::exit(1);
+        }
+    }
+
+    // Load environment config (now includes any resolved secrets)
     let env_config = match EnvConfig::from_env() {
         Ok(c) => c,
         Err(e) => {

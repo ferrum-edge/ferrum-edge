@@ -20,6 +20,7 @@ pub mod plugins;
 pub mod proxy;
 pub mod retry;
 pub mod router_cache;
+pub mod secrets;
 pub mod service_discovery;
 pub mod tls;
 
