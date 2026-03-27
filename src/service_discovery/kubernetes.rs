@@ -14,8 +14,11 @@ use tracing::debug;
 /// Kubernetes service discoverer.
 ///
 /// Polls EndpointSlice resources for the configured service and converts
-/// ready endpoints into `UpstreamTarget` entries.
+/// ready endpoints into `UpstreamTarget` entries. The HTTP client is built
+/// once at construction and reused across polls to avoid repeated TLS
+/// handshakes and connection setup.
 pub struct KubernetesDiscoverer {
+    client: reqwest::Client,
     namespace: String,
     service_name: String,
     port_name: Option<String>,
@@ -32,7 +35,9 @@ impl KubernetesDiscoverer {
         label_selector: Option<String>,
         default_weight: u32,
     ) -> Self {
+        let client = Self::build_client();
         Self {
+            client,
             namespace,
             service_name,
             port_name,
@@ -47,6 +52,20 @@ impl KubernetesDiscoverer {
     pub fn with_api_url(mut self, url: String) -> Self {
         self.api_url_override = Some(url);
         self
+    }
+
+    /// Build the HTTP client once with in-cluster CA cert if available.
+    fn build_client() -> reqwest::Client {
+        let mut builder = reqwest::Client::builder();
+
+        if let Some(ca_path) = Self::ca_cert_path()
+            && let Ok(ca_cert) = std::fs::read(&ca_path)
+            && let Ok(cert) = reqwest::Certificate::from_pem(&ca_cert)
+        {
+            builder = builder.add_root_certificate(cert);
+        }
+
+        builder.build().unwrap_or_else(|_| reqwest::Client::new())
     }
 
     /// Build the Kubernetes API URL for listing EndpointSlices.
@@ -133,19 +152,7 @@ impl super::ServiceDiscoverer for KubernetesDiscoverer {
     async fn discover(&self) -> Result<Vec<UpstreamTarget>, anyhow::Error> {
         let url = self.api_url();
 
-        // Build HTTP client with appropriate auth
-        let mut client_builder = reqwest::Client::builder();
-
-        // Add CA cert for in-cluster TLS
-        if let Some(ca_path) = Self::ca_cert_path() {
-            let ca_cert = std::fs::read(&ca_path)?;
-            let cert = reqwest::Certificate::from_pem(&ca_cert)?;
-            client_builder = client_builder.add_root_certificate(cert);
-        }
-
-        let client = client_builder.build()?;
-
-        let mut request = client.get(&url);
+        let mut request = self.client.get(&url);
 
         // Add bearer token auth
         if let Some(token) = Self::read_sa_token() {
