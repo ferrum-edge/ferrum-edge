@@ -326,19 +326,24 @@ pub trait Plugin: Send + Sync {
     /// Called after the full response body has been received from the backend.
     ///
     /// Only invoked when `requires_response_body_buffering()` returns `true` for
-    /// at least one active plugin on the proxy. Plugins that need to inspect or
-    /// cache the response body should override this method.
+    /// at least one active plugin on the proxy. Plugins that need to inspect,
+    /// validate, or cache the response body should override this method.
     ///
     /// The body bytes are the raw backend response body (before any response
     /// transformation). The response_status and response_headers are the values
     /// after the `after_proxy` phase.
+    ///
+    /// Returning `PluginResult::Reject` replaces the buffered response with the
+    /// rejection body/status before it reaches the client (useful for enforcing
+    /// API response contracts).
     async fn on_response_body(
         &self,
         _ctx: &RequestContext,
         _response_status: u16,
         _response_headers: &HashMap<String, String>,
         _body: &[u8],
-    ) {
+    ) -> PluginResult {
+        PluginResult::Continue
     }
 
     /// Transform the request body before it is sent to the backend.

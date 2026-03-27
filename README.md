@@ -1181,16 +1181,25 @@ Detects and blocks bot traffic based on User-Agent patterns. By default, missing
 
 #### `body_validator`
 
-Validates JSON and XML request bodies against schemas. Supports comprehensive JSON Schema validation including type checking, string/numeric constraints, array/object validation, composition operators, and format validation.
+Validates JSON and XML request and response bodies against schemas. Supports comprehensive JSON Schema validation including type checking, string/numeric constraints, array/object validation, composition operators, and format validation. Request validation rejects with 400; response validation rejects with 502 and automatically enables response body buffering.
 
-**Config**:
+**Request validation config**:
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `json_schema` | Object | — | JSON Schema for validation (supports `type`, `required`, `properties`, `additionalProperties`, `minLength`/`maxLength`, `pattern`, `minimum`/`maximum`, `exclusiveMinimum`/`exclusiveMaximum`, `enum`, `const`, `items`, `minItems`/`maxItems`, `uniqueItems`, `allOf`/`anyOf`/`oneOf`/`not`, `format`) |
+| `json_schema` | Object | — | JSON Schema for request body validation (supports `type`, `required`, `properties`, `additionalProperties`, `minLength`/`maxLength`, `pattern`, `minimum`/`maximum`, `exclusiveMinimum`/`exclusiveMaximum`, `enum`, `const`, `items`, `minItems`/`maxItems`, `uniqueItems`, `allOf`/`anyOf`/`oneOf`/`not`, `format`) |
 | `required_fields` | String[] | `[]` | Simple required field names (alternative to JSON Schema `required`) |
 | `validate_xml` | bool | `false` | Enable XML well-formedness validation |
 | `required_xml_elements` | String[] | `[]` | Required XML element names |
 | `content_types` | String[] | `["application/json","application/xml","text/xml"]` | MIME types to validate |
+
+**Response validation config**:
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `response_json_schema` | Object | — | JSON Schema for response body validation (same schema support as request) |
+| `response_required_fields` | String[] | `[]` | Required field names in response JSON body |
+| `response_validate_xml` | bool | `false` | Enable XML well-formedness validation for responses |
+| `response_required_xml_elements` | String[] | `[]` | Required XML element names in responses |
+| `response_content_types` | String[] | `["application/json","application/xml","text/xml"]` | Response MIME types to validate |
 
 **Supported `format` values**: `email`, `ipv4`, `ipv6`, `uri`, `date-time`, `date`, `uuid`
 

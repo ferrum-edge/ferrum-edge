@@ -819,3 +819,293 @@ async fn test_json_schema_pattern_pre_compiled_reuse() {
         Some(400),
     );
 }
+
+// ═══════════════════════════════════════════════════════════════════════
+//  Response Body Validation Tests
+// ═══════════════════════════════════════════════════════════════════════
+
+fn make_response_ctx() -> RequestContext {
+    RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/api/data".to_string(),
+    )
+}
+
+fn response_json_headers() -> HashMap<String, String> {
+    let mut h = HashMap::new();
+    h.insert("content-type".to_string(), "application/json".to_string());
+    h
+}
+
+fn response_xml_headers() -> HashMap<String, String> {
+    let mut h = HashMap::new();
+    h.insert("content-type".to_string(), "application/xml".to_string());
+    h
+}
+
+fn response_schema_plugin(schema: serde_json::Value) -> BodyValidator {
+    BodyValidator::new(&serde_json::json!({
+        "response_json_schema": schema
+    }))
+}
+
+// ─── requires_response_body_buffering ─────────────────────────────────
+
+#[test]
+fn test_response_buffering_required_when_response_schema_configured() {
+    let plugin = response_schema_plugin(serde_json::json!({"type": "object"}));
+    assert!(plugin.requires_response_body_buffering());
+}
+
+#[test]
+fn test_response_buffering_required_when_response_required_fields() {
+    let plugin = BodyValidator::new(&serde_json::json!({
+        "response_required_fields": ["id"]
+    }));
+    assert!(plugin.requires_response_body_buffering());
+}
+
+#[test]
+fn test_response_buffering_not_required_when_only_request_validation() {
+    let plugin = BodyValidator::new(&serde_json::json!({
+        "json_schema": {"type": "object"}
+    }));
+    assert!(!plugin.requires_response_body_buffering());
+}
+
+// ─── Response JSON Schema Validation ──────────────────────────────────
+
+#[tokio::test]
+async fn test_response_json_schema_valid() {
+    let plugin = response_schema_plugin(serde_json::json!({
+        "type": "object",
+        "required": ["id", "name"],
+        "properties": {
+            "id": {"type": "integer"},
+            "name": {"type": "string"}
+        }
+    }));
+    let ctx = make_response_ctx();
+    let headers = response_json_headers();
+    let body = br#"{"id": 1, "name": "Alice"}"#;
+    assert_continue(plugin.on_response_body(&ctx, 200, &headers, body).await);
+}
+
+#[tokio::test]
+async fn test_response_json_schema_missing_required_field() {
+    let plugin = response_schema_plugin(serde_json::json!({
+        "type": "object",
+        "required": ["id", "name"]
+    }));
+    let ctx = make_response_ctx();
+    let headers = response_json_headers();
+    let body = br#"{"id": 1}"#;
+    assert_reject(
+        plugin.on_response_body(&ctx, 200, &headers, body).await,
+        Some(502),
+    );
+}
+
+#[tokio::test]
+async fn test_response_json_schema_wrong_type() {
+    let plugin = response_schema_plugin(serde_json::json!({"type": "object"}));
+    let ctx = make_response_ctx();
+    let headers = response_json_headers();
+    let body = br#"[1, 2, 3]"#;
+    assert_reject(
+        plugin.on_response_body(&ctx, 200, &headers, body).await,
+        Some(502),
+    );
+}
+
+#[tokio::test]
+async fn test_response_json_invalid_json() {
+    let plugin = response_schema_plugin(serde_json::json!({"type": "object"}));
+    let ctx = make_response_ctx();
+    let headers = response_json_headers();
+    let body = b"not json at all";
+    assert_reject(
+        plugin.on_response_body(&ctx, 200, &headers, body).await,
+        Some(502),
+    );
+}
+
+#[tokio::test]
+async fn test_response_json_empty_body_skipped() {
+    let plugin = response_schema_plugin(serde_json::json!({"type": "object"}));
+    let ctx = make_response_ctx();
+    let headers = response_json_headers();
+    assert_continue(plugin.on_response_body(&ctx, 200, &headers, b"").await);
+}
+
+#[tokio::test]
+async fn test_response_json_non_matching_content_type_skipped() {
+    let plugin = response_schema_plugin(serde_json::json!({"type": "object"}));
+    let ctx = make_response_ctx();
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "text/plain".to_string());
+    let body = b"not json";
+    assert_continue(plugin.on_response_body(&ctx, 200, &headers, body).await);
+}
+
+// ─── Response Required Fields ─────────────────────────────────────────
+
+#[tokio::test]
+async fn test_response_required_fields_valid() {
+    let plugin = BodyValidator::new(&serde_json::json!({
+        "response_required_fields": ["status", "data"]
+    }));
+    let ctx = make_response_ctx();
+    let headers = response_json_headers();
+    let body = br#"{"status": "ok", "data": []}"#;
+    assert_continue(plugin.on_response_body(&ctx, 200, &headers, body).await);
+}
+
+#[tokio::test]
+async fn test_response_required_fields_missing() {
+    let plugin = BodyValidator::new(&serde_json::json!({
+        "response_required_fields": ["status", "data"]
+    }));
+    let ctx = make_response_ctx();
+    let headers = response_json_headers();
+    let body = br#"{"status": "ok"}"#;
+    assert_reject(
+        plugin.on_response_body(&ctx, 200, &headers, body).await,
+        Some(502),
+    );
+}
+
+// ─── Response XML Validation ──────────────────────────────────────────
+
+#[tokio::test]
+async fn test_response_xml_valid() {
+    let plugin = BodyValidator::new(&serde_json::json!({
+        "response_validate_xml": true
+    }));
+    let ctx = make_response_ctx();
+    let headers = response_xml_headers();
+    let body = b"<root><item>text</item></root>";
+    assert_continue(plugin.on_response_body(&ctx, 200, &headers, body).await);
+}
+
+#[tokio::test]
+async fn test_response_xml_invalid() {
+    let plugin = BodyValidator::new(&serde_json::json!({
+        "response_validate_xml": true
+    }));
+    let ctx = make_response_ctx();
+    let headers = response_xml_headers();
+    let body = b"<root><item></root>";
+    assert_reject(
+        plugin.on_response_body(&ctx, 200, &headers, body).await,
+        Some(502),
+    );
+}
+
+#[tokio::test]
+async fn test_response_xml_required_elements() {
+    let plugin = BodyValidator::new(&serde_json::json!({
+        "response_validate_xml": true,
+        "response_required_xml_elements": ["result"]
+    }));
+    let ctx = make_response_ctx();
+    let headers = response_xml_headers();
+    let body = b"<root><data>text</data></root>";
+    assert_reject(
+        plugin.on_response_body(&ctx, 200, &headers, body).await,
+        Some(502),
+    );
+}
+
+// ─── Combined Request + Response Validation ───────────────────────────
+
+#[tokio::test]
+async fn test_both_request_and_response_validation() {
+    let plugin = BodyValidator::new(&serde_json::json!({
+        "json_schema": {"type": "object", "required": ["action"]},
+        "response_json_schema": {"type": "object", "required": ["result"]}
+    }));
+
+    // Request validation still works
+    let mut req_ctx = make_json_ctx(r#"{"action": "create"}"#);
+    let mut req_headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut req_ctx, &mut req_headers).await);
+
+    // Request with missing field is rejected (400)
+    let mut bad_req_ctx = make_json_ctx(r#"{"other": "value"}"#);
+    let mut bad_req_headers = HashMap::new();
+    assert_reject(
+        plugin
+            .before_proxy(&mut bad_req_ctx, &mut bad_req_headers)
+            .await,
+        Some(400),
+    );
+
+    // Response validation works
+    let resp_ctx = make_response_ctx();
+    let resp_headers = response_json_headers();
+    assert_continue(
+        plugin
+            .on_response_body(&resp_ctx, 200, &resp_headers, br#"{"result": "ok"}"#)
+            .await,
+    );
+
+    // Response with missing field is rejected (502)
+    assert_reject(
+        plugin
+            .on_response_body(&resp_ctx, 200, &resp_headers, br#"{"other": "value"}"#)
+            .await,
+        Some(502),
+    );
+
+    // Buffering is required because response validation is configured
+    assert!(plugin.requires_response_body_buffering());
+}
+
+// ─── Response schema with pattern (pre-compiled regex) ────────────────
+
+#[tokio::test]
+async fn test_response_json_schema_pattern_valid() {
+    let plugin = response_schema_plugin(serde_json::json!({
+        "type": "object",
+        "properties": {
+            "code": {"type": "string", "pattern": "^[A-Z]{3}-[0-9]+$"}
+        }
+    }));
+    let ctx = make_response_ctx();
+    let headers = response_json_headers();
+    let body = br#"{"code": "ABC-123"}"#;
+    assert_continue(plugin.on_response_body(&ctx, 200, &headers, body).await);
+}
+
+#[tokio::test]
+async fn test_response_json_schema_pattern_invalid() {
+    let plugin = response_schema_plugin(serde_json::json!({
+        "type": "object",
+        "properties": {
+            "code": {"type": "string", "pattern": "^[A-Z]{3}-[0-9]+$"}
+        }
+    }));
+    let ctx = make_response_ctx();
+    let headers = response_json_headers();
+    let body = br#"{"code": "invalid"}"#;
+    assert_reject(
+        plugin.on_response_body(&ctx, 200, &headers, body).await,
+        Some(502),
+    );
+}
+
+// ─── Response with no validation configured skips ─────────────────────
+
+#[tokio::test]
+async fn test_response_no_validation_skips() {
+    // Only request validation configured — response body should pass through
+    let plugin = BodyValidator::new(&serde_json::json!({
+        "json_schema": {"type": "object"}
+    }));
+    let ctx = make_response_ctx();
+    let headers = response_json_headers();
+    let body = b"totally invalid json!!!";
+    assert_continue(plugin.on_response_body(&ctx, 200, &headers, body).await);
+}

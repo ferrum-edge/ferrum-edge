@@ -2259,7 +2259,7 @@ pub async fn handle_proxy_request(
         )
         .await
     };
-    let response_status = backend_resp.status_code;
+    let mut response_status = backend_resp.status_code;
     let mut response_body = backend_resp.body;
     let mut response_headers = backend_resp.headers;
     let backend_resolved_ip = backend_resp.backend_resolved_ip;
@@ -2336,15 +2336,38 @@ pub async fn handle_proxy_request(
     }
 
     // on_response_body hooks — only for buffered responses, only when plugins exist.
-    // This allows plugins (e.g., response_caching) to inspect and store the
-    // full response body after after_proxy headers are finalized.
+    // This allows plugins (e.g., response_caching, body_validator) to inspect,
+    // validate, or store the full response body after after_proxy headers are
+    // finalized. A Reject result replaces the response before it reaches the client.
     if !plugins.is_empty()
         && let ResponseBody::Buffered(ref data) = response_body
     {
         for plugin in plugins.iter() {
-            plugin
+            let result = plugin
                 .on_response_body(&ctx, response_status, &response_headers, data)
                 .await;
+            match result {
+                PluginResult::Continue => {}
+                PluginResult::Reject {
+                    status_code,
+                    body: reject_body,
+                    headers: reject_headers,
+                } => {
+                    debug!(
+                        plugin = plugin.name(),
+                        status_code, "Plugin rejected response body"
+                    );
+                    response_status = status_code;
+                    response_headers.clear();
+                    response_headers
+                        .insert("content-type".to_string(), "application/json".to_string());
+                    for (k, v) in reject_headers {
+                        response_headers.insert(k, v);
+                    }
+                    response_body = ResponseBody::Buffered(reject_body.into_bytes());
+                    break;
+                }
+            }
         }
     }
 

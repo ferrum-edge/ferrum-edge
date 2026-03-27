@@ -1,12 +1,12 @@
 //! Body Validation Plugin
 //!
-//! Validates JSON and XML request bodies against schemas before proxying.
+//! Validates JSON and XML request and response bodies against schemas.
 //! For JSON, validates against a JSON Schema. For XML, validates that the
 //! body is well-formed XML and optionally checks for required elements.
 //!
-//! The plugin reads the request body from the Content-Type header to
-//! determine the validation strategy, then validates the body content
-//! from the request.
+//! Request validation runs in `before_proxy` (rejects with 400).
+//! Response validation runs in `on_response_body` (rejects with 502)
+//! and requires response body buffering when configured.
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -16,19 +16,35 @@ use tracing::debug;
 use super::{Plugin, PluginResult, RequestContext};
 
 pub struct BodyValidator {
-    /// JSON schema for validation (if configured).
+    // ── Request validation config ──
+    /// JSON schema for request body validation (if configured).
     json_schema: Option<Value>,
     /// Required JSON fields (simple validation without full JSON Schema).
     required_fields: Vec<String>,
-    /// Whether to validate XML is well-formed.
+    /// Whether to validate XML request bodies are well-formed.
     validate_xml: bool,
-    /// Required XML elements.
+    /// Required XML elements in request bodies.
     required_xml_elements: Vec<String>,
-    /// Content types to validate (empty = validate all).
+    /// Content types to validate for requests (empty = validate all).
     content_types: Vec<String>,
-    /// Pre-compiled regexes for JSON Schema `pattern` constraints.
-    /// Keyed by the pattern string so lookup is O(1) at request time.
+    /// Pre-compiled regexes for JSON Schema `pattern` constraints (request).
     compiled_patterns: HashMap<String, regex::Regex>,
+
+    // ── Response validation config ──
+    /// JSON schema for response body validation (if configured).
+    response_json_schema: Option<Value>,
+    /// Required JSON fields in response bodies.
+    response_required_fields: Vec<String>,
+    /// Whether to validate XML response bodies are well-formed.
+    response_validate_xml: bool,
+    /// Required XML elements in response bodies.
+    response_required_xml_elements: Vec<String>,
+    /// Content types to validate for responses.
+    response_content_types: Vec<String>,
+    /// Pre-compiled regexes for response JSON Schema `pattern` constraints.
+    response_compiled_patterns: HashMap<String, regex::Regex>,
+    /// Whether any response validation is configured (cached for O(1) check).
+    has_response_validation: bool,
 }
 
 impl BodyValidator {
@@ -70,20 +86,68 @@ impl BodyValidator {
                 ]
             });
 
-        if json_schema.is_none()
-            && required_fields.is_empty()
-            && !validate_xml
-            && required_xml_elements.is_empty()
-        {
+        // ── Response validation config ──
+        let response_json_schema = config.get("response_json_schema").cloned();
+
+        let response_required_fields: Vec<String> = config["response_required_fields"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let response_validate_xml = config["response_validate_xml"].as_bool().unwrap_or(false);
+
+        let response_required_xml_elements: Vec<String> = config["response_required_xml_elements"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let response_content_types = config["response_content_types"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_lowercase()))
+                    .collect()
+            })
+            .unwrap_or_else(|| {
+                vec![
+                    "application/json".to_string(),
+                    "application/xml".to_string(),
+                    "text/xml".to_string(),
+                ]
+            });
+
+        let has_response_validation = response_json_schema.is_some()
+            || !response_required_fields.is_empty()
+            || response_validate_xml
+            || !response_required_xml_elements.is_empty();
+
+        let has_request_validation = json_schema.is_some()
+            || !required_fields.is_empty()
+            || validate_xml
+            || !required_xml_elements.is_empty();
+
+        if !has_request_validation && !has_response_validation {
             tracing::warn!(
-                "body_validator: no validation rules configured — set 'json_schema', 'required_fields', 'validate_xml', or 'required_xml_elements'"
+                "body_validator: no validation rules configured — set 'json_schema', 'required_fields', 'validate_xml', 'required_xml_elements' (request) or their 'response_*' equivalents"
             );
         }
 
-        // Pre-compile all regex patterns found in the JSON schema at config load time.
+        // Pre-compile all regex patterns found in schemas at config load time.
         let mut compiled_patterns = HashMap::new();
         if let Some(ref schema) = json_schema {
             collect_patterns(schema, &mut compiled_patterns);
+        }
+        let mut response_compiled_patterns = HashMap::new();
+        if let Some(ref schema) = response_json_schema {
+            collect_patterns(schema, &mut response_compiled_patterns);
         }
 
         Self {
@@ -93,34 +157,51 @@ impl BodyValidator {
             required_xml_elements,
             content_types,
             compiled_patterns,
+            response_json_schema,
+            response_required_fields,
+            response_validate_xml,
+            response_required_xml_elements,
+            response_content_types,
+            response_compiled_patterns,
+            has_response_validation,
         }
     }
 
-    fn validate_json_body(&self, body: &str) -> Result<(), String> {
+    fn validate_json_body(
+        &self,
+        body: &str,
+        required_fields: &[String],
+        json_schema: Option<&Value>,
+        compiled_patterns: &HashMap<String, regex::Regex>,
+    ) -> Result<(), String> {
         // Parse as JSON
         let parsed: Value =
             serde_json::from_str(body).map_err(|e| format!("Invalid JSON: {}", e))?;
 
         // Check required fields
         if let Value::Object(map) = &parsed {
-            for field in &self.required_fields {
+            for field in required_fields {
                 if !map.contains_key(field) {
                     return Err(format!("Missing required field: {}", field));
                 }
             }
-        } else if !self.required_fields.is_empty() {
-            return Err("Request body must be a JSON object".to_string());
+        } else if !required_fields.is_empty() {
+            return Err("Body must be a JSON object".to_string());
         }
 
         // Validate against JSON Schema if provided
-        if let Some(schema) = &self.json_schema {
-            self.validate_against_schema(&parsed, schema)?;
+        if let Some(schema) = json_schema {
+            Self::validate_against_schema_with(compiled_patterns, &parsed, schema)?;
         }
 
         Ok(())
     }
 
-    fn validate_against_schema(&self, data: &Value, schema: &Value) -> Result<(), String> {
+    fn validate_against_schema_with(
+        compiled_patterns: &HashMap<String, regex::Regex>,
+        data: &Value,
+        schema: &Value,
+    ) -> Result<(), String> {
         // --- enum constraint (applies to any type) ---
         if let Some(enum_values) = schema.get("enum").and_then(|e| e.as_array())
             && !enum_values.contains(data)
@@ -180,7 +261,7 @@ impl BodyValidator {
                 ));
             }
             if let Some(pattern) = schema.get("pattern").and_then(|v| v.as_str()) {
-                if let Some(re) = self.compiled_patterns.get(pattern) {
+                if let Some(re) = compiled_patterns.get(pattern) {
                     if !re.is_match(s) {
                         return Err(format!(
                             "String '{}' does not match pattern '{}'",
@@ -266,7 +347,7 @@ impl BodyValidator {
         ) {
             for (key, prop_schema) in props {
                 if let Some(value) = data_obj.get(key) {
-                    self.validate_against_schema(value, prop_schema)?;
+                    Self::validate_against_schema_with(compiled_patterns, value, prop_schema)?;
                 }
             }
         }
@@ -292,7 +373,11 @@ impl BodyValidator {
                         .unwrap_or_default();
                     for (key, value) in data_obj {
                         if !defined_keys.contains(key) {
-                            self.validate_against_schema(value, additional)?;
+                            Self::validate_against_schema_with(
+                                compiled_patterns,
+                                value,
+                                additional,
+                            )?;
                         }
                     }
                 }
@@ -323,7 +408,7 @@ impl BodyValidator {
         if let Some(arr) = data.as_array() {
             if let Some(items_schema) = schema.get("items") {
                 for (i, item) in arr.iter().enumerate() {
-                    self.validate_against_schema(item, items_schema)
+                    Self::validate_against_schema_with(compiled_patterns, item, items_schema)
                         .map_err(|e| format!("Array item [{}]: {}", i, e))?;
                 }
             }
@@ -355,15 +440,15 @@ impl BodyValidator {
         // --- composition: allOf, anyOf, oneOf, not ---
         if let Some(all_of) = schema.get("allOf").and_then(|v| v.as_array()) {
             for (i, sub_schema) in all_of.iter().enumerate() {
-                self.validate_against_schema(data, sub_schema)
+                Self::validate_against_schema_with(compiled_patterns, data, sub_schema)
                     .map_err(|e| format!("allOf[{}]: {}", i, e))?;
             }
         }
 
         if let Some(any_of) = schema.get("anyOf").and_then(|v| v.as_array()) {
-            let matched = any_of
-                .iter()
-                .any(|sub| self.validate_against_schema(data, sub).is_ok());
+            let matched = any_of.iter().any(|sub| {
+                Self::validate_against_schema_with(compiled_patterns, data, sub).is_ok()
+            });
             if !matched {
                 return Err("Value does not match any of the anyOf schemas".to_string());
             }
@@ -372,7 +457,9 @@ impl BodyValidator {
         if let Some(one_of) = schema.get("oneOf").and_then(|v| v.as_array()) {
             let match_count = one_of
                 .iter()
-                .filter(|sub| self.validate_against_schema(data, sub).is_ok())
+                .filter(|sub| {
+                    Self::validate_against_schema_with(compiled_patterns, data, sub).is_ok()
+                })
                 .count();
             if match_count != 1 {
                 return Err(format!(
@@ -383,7 +470,7 @@ impl BodyValidator {
         }
 
         if let Some(not_schema) = schema.get("not")
-            && self.validate_against_schema(data, not_schema).is_ok()
+            && Self::validate_against_schema_with(compiled_patterns, data, not_schema).is_ok()
         {
             return Err("Value must not match the 'not' schema".to_string());
         }
@@ -391,7 +478,7 @@ impl BodyValidator {
         Ok(())
     }
 
-    fn validate_xml_body(&self, body: &str) -> Result<(), String> {
+    fn validate_xml_body(body: &str, required_xml_elements: &[String]) -> Result<(), String> {
         // Basic well-formedness check: must start with < and have matching tags
         let trimmed = body.trim();
         if trimmed.is_empty() {
@@ -402,7 +489,7 @@ impl BodyValidator {
         }
 
         // Check for required elements
-        for element in &self.required_xml_elements {
+        for element in required_xml_elements {
             let open_tag = format!("<{}", element);
             if !trimmed.contains(&open_tag) {
                 return Err(format!("Missing required XML element: {}", element));
@@ -683,9 +770,14 @@ impl Plugin for BodyValidator {
 
         // Determine validation type
         let result = if content_type.contains("json") {
-            self.validate_json_body(&body)
+            self.validate_json_body(
+                &body,
+                &self.required_fields,
+                self.json_schema.as_ref(),
+                &self.compiled_patterns,
+            )
         } else if content_type.contains("xml") && self.validate_xml {
-            self.validate_xml_body(&body)
+            Self::validate_xml_body(&body, &self.required_xml_elements)
         } else {
             Ok(())
         };
@@ -693,12 +785,88 @@ impl Plugin for BodyValidator {
         match result {
             Ok(()) => PluginResult::Continue,
             Err(msg) => {
-                debug!("body_validator: validation failed: {}", msg);
+                debug!("body_validator: request validation failed: {}", msg);
                 let escaped_msg = msg.replace('\\', "\\\\").replace('"', "\\\"");
                 PluginResult::Reject {
                     status_code: 400,
                     body: format!(
                         r#"{{"error":"Request body validation failed","details":"{}"}}"#,
+                        escaped_msg
+                    ),
+                    headers: HashMap::new(),
+                }
+            }
+        }
+    }
+
+    fn requires_response_body_buffering(&self) -> bool {
+        self.has_response_validation
+    }
+
+    async fn on_response_body(
+        &self,
+        _ctx: &RequestContext,
+        _response_status: u16,
+        response_headers: &HashMap<String, String>,
+        body: &[u8],
+    ) -> PluginResult {
+        if !self.has_response_validation {
+            return PluginResult::Continue;
+        }
+
+        // Determine content type from response headers
+        let content_type = response_headers
+            .get("content-type")
+            .cloned()
+            .unwrap_or_default()
+            .to_lowercase();
+
+        let should_validate = self.response_content_types.is_empty()
+            || self
+                .response_content_types
+                .iter()
+                .any(|ct| content_type.contains(ct.as_str()));
+
+        if !should_validate {
+            return PluginResult::Continue;
+        }
+
+        if body.is_empty() {
+            return PluginResult::Continue;
+        }
+
+        // Convert body bytes to string for validation
+        let body_str = match std::str::from_utf8(body) {
+            Ok(s) => s,
+            Err(_) => {
+                debug!("body_validator: response body is not valid UTF-8, skipping validation");
+                return PluginResult::Continue;
+            }
+        };
+
+        // Determine validation type
+        let result = if content_type.contains("json") {
+            self.validate_json_body(
+                body_str,
+                &self.response_required_fields,
+                self.response_json_schema.as_ref(),
+                &self.response_compiled_patterns,
+            )
+        } else if content_type.contains("xml") && self.response_validate_xml {
+            Self::validate_xml_body(body_str, &self.response_required_xml_elements)
+        } else {
+            Ok(())
+        };
+
+        match result {
+            Ok(()) => PluginResult::Continue,
+            Err(msg) => {
+                debug!("body_validator: response validation failed: {}", msg);
+                let escaped_msg = msg.replace('\\', "\\\\").replace('"', "\\\"");
+                PluginResult::Reject {
+                    status_code: 502,
+                    body: format!(
+                        r#"{{"error":"Response body validation failed","details":"{}"}}"#,
                         escaped_msg
                     ),
                     headers: HashMap::new(),

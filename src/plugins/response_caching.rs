@@ -491,11 +491,11 @@ impl Plugin for ResponseCaching {
         _response_status: u16,
         _response_headers: &HashMap<String, String>,
         body: &[u8],
-    ) {
+    ) -> PluginResult {
         // Check if we should cache this response
         let cache_key = match ctx.metadata.get("cache_key") {
             Some(key) => key.clone(),
-            None => return,
+            None => return PluginResult::Continue,
         };
 
         // Check body size limit
@@ -506,7 +506,7 @@ impl Plugin for ResponseCaching {
                 max_size = self.config.max_entry_size_bytes,
                 "response_caching: response body exceeds max_entry_size_bytes, skipping cache"
             );
-            return;
+            return PluginResult::Continue;
         }
 
         // Reconstruct cached headers from metadata
@@ -548,7 +548,7 @@ impl Plugin for ResponseCaching {
                 max_total = self.config.max_total_size_bytes,
                 "response_caching: total cache size would exceed limit, skipping cache"
             );
-            return;
+            return PluginResult::Continue;
         }
 
         // Insert into cache
@@ -568,5 +568,7 @@ impl Plugin for ResponseCaching {
 
         // Evict if needed
         self.evict_if_needed();
+
+        PluginResult::Continue
     }
 }

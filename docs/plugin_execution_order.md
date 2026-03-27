@@ -80,7 +80,7 @@ Given all built-in plugins enabled, the execution order is:
 | 9 | `access_control` | 2000 | authorize |
 | 10 | `rate_limiting` | 2900 | on_request_received (IP mode), authorize (consumer mode) |
 | 11 | `request_transformer` | 3000 | before_proxy |
-| 12 | `body_validator` | 3100 | before_proxy |
+| 12 | `body_validator` | 3100 | before_proxy, on_response_body |
 | 13 | `request_termination` | 3200 | before_proxy |
 | 14 | `response_transformer` | 4000 | after_proxy |
 | 15 | `stdout_logging` | 9000 | log |
@@ -216,7 +216,7 @@ TLS/DTLS are transport-layer concerns, not separate protocols. A plugin that sup
 | `access_control` | ✓ | ✓ | ✓ | | | Needs consumer identity (auth not available on TCP/UDP) |
 | `rate_limiting` | ✓ | ✓ | ✓ | ✓ | ✓ | Connection/session rate applies everywhere |
 | `request_transformer` | ✓ | ✓ | | | | Modifies HTTP headers/query/body |
-| `body_validator` | ✓ | ✓ | | | | Validates request body |
+| `body_validator` | ✓ | ✓ | | | | Validates request and response bodies |
 | `request_termination` | ✓ | ✓ | ✓ | | | Returns HTTP error response |
 | `response_transformer` | ✓ | ✓ | | | | Modifies HTTP response headers/body |
 | `stdout_logging` | ✓ | ✓ | ✓ | ✓ | ✓ | Observability applies everywhere |
