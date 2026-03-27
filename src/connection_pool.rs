@@ -139,10 +139,10 @@ impl ConnectionPool {
                 client_builder.tcp_keepalive(Duration::from_secs(config.tcp_keepalive_seconds));
         }
 
-        // Configure HTTP/2 keep-alive settings. These are applied when reqwest
-        // auto-negotiates HTTP/2 via ALPN on HTTPS connections. We intentionally
-        // do NOT call http2_prior_knowledge() — that forces h2c (cleartext HTTP/2)
-        // which breaks backends that only speak HTTP/1.1.
+        // Configure HTTP/2 keep-alive and flow-control settings. These are applied
+        // when reqwest auto-negotiates HTTP/2 via ALPN on HTTPS connections. We
+        // intentionally do NOT call http2_prior_knowledge() — that forces h2c
+        // (cleartext HTTP/2) which breaks backends that only speak HTTP/1.1.
         if config.enable_http2 {
             client_builder = client_builder
                 .http2_keep_alive_interval(Duration::from_secs(
@@ -150,7 +150,11 @@ impl ConnectionPool {
                 ))
                 .http2_keep_alive_timeout(Duration::from_secs(
                     config.http2_keep_alive_timeout_seconds,
-                ));
+                ))
+                .http2_initial_stream_window_size(config.http2_initial_stream_window_size)
+                .http2_initial_connection_window_size(config.http2_initial_connection_window_size)
+                .http2_adaptive_window(config.http2_adaptive_window)
+                .http2_max_frame_size(config.http2_max_frame_size);
         }
 
         // Add custom CA bundle for server certificate verification (unless no_verify is set)

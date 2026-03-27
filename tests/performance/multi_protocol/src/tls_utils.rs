@@ -106,14 +106,30 @@ pub fn make_h3_server_config(
 
     tls_cfg.alpn_protocols = vec![b"h3".to_vec()];
 
-    let server_cfg = quinn::ServerConfig::with_crypto(Arc::new(
+    // Apply optimized QUIC transport settings for the backend server
+    let mut transport_config = quinn::TransportConfig::default();
+    transport_config.stream_receive_window(
+        quinn::VarInt::from_u64(8_388_608).unwrap_or(quinn::VarInt::from_u32(8_388_608)),
+    ); // 8 MiB
+    transport_config.receive_window(
+        quinn::VarInt::from_u64(33_554_432).unwrap_or(quinn::VarInt::from_u32(33_554_432)),
+    ); // 32 MiB
+    transport_config.send_window(8_388_608); // 8 MiB
+    transport_config.max_concurrent_bidi_streams(quinn::VarInt::from_u32(1000));
+
+    let mut server_cfg = quinn::ServerConfig::with_crypto(Arc::new(
         quinn::crypto::rustls::QuicServerConfig::try_from(tls_cfg)
             .context("quinn crypto config")?,
     ));
+    server_cfg.transport_config(Arc::new(transport_config));
     Ok(server_cfg)
 }
 
 /// Create a `quinn::ClientConfig` that skips server certificate verification.
+///
+/// Applies optimized QUIC transport settings (8 MiB stream window, 32 MiB
+/// connection window, 8 MiB send window) to match the gateway's tuned defaults
+/// and ensure the bench client is not the bottleneck.
 pub fn make_h3_client_config_insecure() -> quinn::ClientConfig {
     let mut tls_cfg = rustls::ClientConfig::builder()
         .dangerous()
@@ -124,7 +140,20 @@ pub fn make_h3_client_config_insecure() -> quinn::ClientConfig {
 
     let quic_cfg =
         quinn::crypto::rustls::QuicClientConfig::try_from(tls_cfg).expect("quic client config");
-    quinn::ClientConfig::new(Arc::new(quic_cfg))
+
+    // Optimized QUIC transport settings — match the gateway's tuned defaults
+    let mut transport_config = quinn::TransportConfig::default();
+    transport_config.stream_receive_window(
+        quinn::VarInt::from_u64(8_388_608).unwrap_or(quinn::VarInt::from_u32(8_388_608)),
+    ); // 8 MiB
+    transport_config.receive_window(
+        quinn::VarInt::from_u64(33_554_432).unwrap_or(quinn::VarInt::from_u32(33_554_432)),
+    ); // 32 MiB
+    transport_config.send_window(8_388_608); // 8 MiB
+
+    let mut client_config = quinn::ClientConfig::new(Arc::new(quic_cfg));
+    client_config.transport_config(Arc::new(transport_config));
+    client_config
 }
 
 // ── NoCertVerifier ───────────────────────────────────────────────────────────

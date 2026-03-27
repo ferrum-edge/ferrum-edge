@@ -590,6 +590,17 @@ pub struct Proxy {
     pub pool_http2_keep_alive_interval_seconds: Option<u64>,
     #[serde(default)]
     pub pool_http2_keep_alive_timeout_seconds: Option<u64>,
+    // HTTP/2 flow control & performance tuning overrides
+    #[serde(default)]
+    pub pool_http2_initial_stream_window_size: Option<u32>,
+    #[serde(default)]
+    pub pool_http2_initial_connection_window_size: Option<u32>,
+    #[serde(default)]
+    pub pool_http2_adaptive_window: Option<bool>,
+    #[serde(default)]
+    pub pool_http2_max_frame_size: Option<u32>,
+    #[serde(default)]
+    pub pool_http2_max_concurrent_streams: Option<u32>,
     /// Optional upstream ID for load-balanced backends.
     /// When set, overrides backend_host/backend_port with upstream target selection.
     #[serde(default)]

@@ -14,6 +14,16 @@ proxies:
     backend_read_timeout_ms: 10000
     backend_write_timeout_ms: 10000
     auth_mode: single
+    pool_max_idle_per_host: 200
+    pool_enable_http2: true
+    pool_http2_keep_alive_interval_seconds: 30
+    pool_http2_keep_alive_timeout_seconds: 45
+    # HTTP/2 flow control tuning — critical for gRPC throughput
+    pool_http2_initial_stream_window_size: 8388608       # 8 MiB (vs 64 KB default)
+    pool_http2_initial_connection_window_size: 33554432   # 32 MiB
+    pool_http2_adaptive_window: false                    # Fixed windows for predictable performance
+    pool_http2_max_frame_size: 65535                     # Max allowed frame size
+    pool_http2_max_concurrent_streams: 1000              # High concurrency limit
     plugins: []
 
   - id: "grpc-health"

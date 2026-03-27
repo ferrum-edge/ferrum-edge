@@ -60,12 +60,18 @@ fn now_epoch_ms() -> u64 {
 /// - Global mTLS and CA bundle settings from `EnvConfig`
 /// - Background idle connection cleanup
 pub struct GrpcConnectionPool {
-    /// Cached sender handles keyed by `host:port:tls`
+    /// Cached sender handles keyed by `host:port:tls:index`
     entries: Arc<DashMap<String, GrpcPoolEntry>>,
     /// Global pool configuration (idle timeout, keepalive, etc.)
     global_pool_config: PoolConfig,
     /// Global TLS/mTLS configuration
     global_env_config: crate::config::EnvConfig,
+    /// Round-robin counter for distributing streams across backend connections.
+    conn_counter: AtomicU64,
+    /// Number of connections to maintain per backend. Multiple connections
+    /// distribute HTTP/2 frame processing across tokio tasks, reducing
+    /// contention at high concurrency.
+    connections_per_backend: usize,
 }
 
 impl Default for GrpcConnectionPool {
@@ -83,6 +89,8 @@ impl GrpcConnectionPool {
             entries: Arc::new(DashMap::new()),
             global_pool_config,
             global_env_config,
+            conn_counter: AtomicU64::new(0),
+            connections_per_backend: 4,
         };
 
         pool.start_cleanup_task();
@@ -92,18 +100,26 @@ impl GrpcConnectionPool {
     /// ⚠️  CRITICAL — DO NOT add fields to this key without careful analysis.
     /// Adding fields causes pool fragmentation and P95 latency regressions.
     /// See `ConnectionPool::create_pool_key` for detailed rationale.
-    fn pool_key(proxy: &Proxy) -> String {
+    fn pool_key(proxy: &Proxy, index: usize) -> String {
         let tls = matches!(proxy.backend_protocol, BackendProtocol::Grpcs);
-        format!("{}:{}:{}", proxy.backend_host, proxy.backend_port, tls)
+        format!(
+            "{}:{}:{}:{}",
+            proxy.backend_host, proxy.backend_port, tls, index
+        )
     }
 
     /// Get or create an HTTP/2 connection to the gRPC backend.
+    ///
+    /// Uses round-robin across `connections_per_backend` connections to
+    /// distribute HTTP/2 frame processing across multiple tokio tasks.
     pub async fn get_sender(
         &self,
         proxy: &Proxy,
         dns_cache: &DnsCache,
     ) -> Result<http2::SendRequest<Incoming>, GrpcProxyError> {
-        let key = Self::pool_key(proxy);
+        let index = self.conn_counter.fetch_add(1, Ordering::Relaxed) as usize
+            % self.connections_per_backend;
+        let key = Self::pool_key(proxy, index);
 
         // Try to reuse existing connection
         if let Some(entry) = self.entries.get(&key) {
@@ -191,7 +207,7 @@ impl GrpcConnectionPool {
         }
     }
 
-    /// Build an HTTP/2 client builder with keepalive settings from pool config.
+    /// Build an HTTP/2 client builder with keepalive and flow-control settings.
     fn build_h2_builder(pool_config: &PoolConfig) -> http2::Builder<TokioExecutor> {
         let mut builder = http2::Builder::new(TokioExecutor::new());
 
@@ -206,6 +222,18 @@ impl GrpcConnectionPool {
                 .keep_alive_timeout(Duration::from_secs(
                     pool_config.http2_keep_alive_timeout_seconds,
                 ));
+        }
+
+        // Flow-control tuning — larger windows dramatically improve throughput
+        // by allowing more data in flight before waiting for WINDOW_UPDATEs.
+        builder
+            .initial_stream_window_size(pool_config.http2_initial_stream_window_size)
+            .initial_connection_window_size(pool_config.http2_initial_connection_window_size)
+            .adaptive_window(pool_config.http2_adaptive_window)
+            .max_frame_size(pool_config.http2_max_frame_size);
+
+        if let Some(max_streams) = pool_config.http2_max_concurrent_streams {
+            builder.max_concurrent_streams(max_streams);
         }
 
         builder
@@ -511,15 +539,8 @@ pub async fn proxy_grpc_request(
     dns_cache: &DnsCache,
     proxy_headers: &HashMap<String, String>,
 ) -> Result<GrpcResponse, GrpcProxyError> {
-    // Get or create HTTP/2 connection to backend
+    // Get or create HTTP/2 connection to backend (round-robins across pool)
     let mut sender = grpc_pool.get_sender(proxy, dns_cache).await?;
-
-    // If the cached sender is closed, remove and reconnect
-    if sender.is_closed() {
-        let key = GrpcConnectionPool::pool_key(proxy);
-        grpc_pool.entries.remove(&key);
-        sender = grpc_pool.get_sender(proxy, dns_cache).await?;
-    }
 
     // Parse the backend URL to extract path and authority
     let uri: hyper::Uri = backend_url

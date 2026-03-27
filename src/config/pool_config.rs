@@ -32,6 +32,43 @@ pub struct PoolConfig {
     pub tcp_keepalive_seconds: u64,
     pub http2_keep_alive_interval_seconds: u64,
     pub http2_keep_alive_timeout_seconds: u64,
+
+    // ── HTTP/2 flow control & performance tuning ─────────────────────────
+    //
+    // The h2 spec defaults (64KB stream window, 16KB frame) were designed for
+    // dial-up-era congestion safety.  On modern networks they throttle
+    // throughput to ~8 Mbps at 100 ms RTT.  These settings let operators
+    // (and per-proxy overrides) raise the limits to match their bandwidth.
+    /// Initial per-stream flow-control window size in bytes.
+    /// Larger values allow more data in flight per stream before the sender
+    /// must wait for a WINDOW_UPDATE, directly improving single-stream throughput.
+    /// Default: 8 MiB (8_388_608).  h2 spec minimum: 65_535, maximum: 2^31-1.
+    pub http2_initial_stream_window_size: u32,
+
+    /// Initial connection-level flow-control window size in bytes.
+    /// This is the aggregate budget shared across all concurrent streams on
+    /// one HTTP/2 connection.  Should be ≥ stream_window × expected_concurrency.
+    /// Default: 32 MiB (33_554_432).
+    pub http2_initial_connection_window_size: u32,
+
+    /// Enable hyper's adaptive flow-control algorithm (BDP probing).
+    /// When true, hyper dynamically adjusts the connection window based on
+    /// measured bandwidth-delay product, scaling up automatically on fast
+    /// links and staying conservative on slow ones.
+    /// Default: false (use fixed windows for predictable performance).
+    pub http2_adaptive_window: bool,
+
+    /// Maximum HTTP/2 frame payload size in bytes.
+    /// Larger frames reduce per-frame overhead but increase head-of-line
+    /// blocking risk.  Must be between 16_384 (spec minimum) and 16_777_215.
+    /// Default: 65_535.
+    pub http2_max_frame_size: u32,
+
+    /// Maximum number of concurrent HTTP/2 streams the gateway will open
+    /// to a single backend connection.  `None` means unlimited (server decides).
+    /// Useful for protecting backends that choke on high stream counts.
+    /// Default: 1000.
+    pub http2_max_concurrent_streams: Option<u32>,
 }
 
 impl Default for PoolConfig {
@@ -44,6 +81,11 @@ impl Default for PoolConfig {
             tcp_keepalive_seconds: 60,
             http2_keep_alive_interval_seconds: 30,
             http2_keep_alive_timeout_seconds: 45, // More reasonable timeout comparable to HTTP read timeout
+            http2_initial_stream_window_size: 8_388_608, // 8 MiB
+            http2_initial_connection_window_size: 33_554_432, // 32 MiB
+            http2_adaptive_window: false,
+            http2_max_frame_size: 65_535,
+            http2_max_concurrent_streams: Some(1000),
         }
     }
 }
@@ -92,6 +134,34 @@ impl PoolConfig {
             config.http2_keep_alive_timeout_seconds = parsed;
         }
 
+        if let Ok(val) = env::var("FERRUM_POOL_HTTP2_INITIAL_STREAM_WINDOW_SIZE")
+            && let Ok(parsed) = val.parse::<u32>()
+        {
+            config.http2_initial_stream_window_size = parsed.max(65_535);
+        }
+
+        if let Ok(val) = env::var("FERRUM_POOL_HTTP2_INITIAL_CONNECTION_WINDOW_SIZE")
+            && let Ok(parsed) = val.parse::<u32>()
+        {
+            config.http2_initial_connection_window_size = parsed.max(65_535);
+        }
+
+        if let Ok(val) = env::var("FERRUM_POOL_HTTP2_ADAPTIVE_WINDOW") {
+            config.http2_adaptive_window = val.parse::<bool>().unwrap_or(true);
+        }
+
+        if let Ok(val) = env::var("FERRUM_POOL_HTTP2_MAX_FRAME_SIZE")
+            && let Ok(parsed) = val.parse::<u32>()
+        {
+            config.http2_max_frame_size = parsed.clamp(16_384, 16_777_215);
+        }
+
+        if let Ok(val) = env::var("FERRUM_POOL_HTTP2_MAX_CONCURRENT_STREAMS")
+            && let Ok(parsed) = val.parse::<u32>()
+        {
+            config.http2_max_concurrent_streams = Some(parsed);
+        }
+
         // Validate HTTP/2 timeout is reasonable compared to HTTP read timeout
         if config.http2_keep_alive_timeout_seconds < 10 {
             tracing::warn!(
@@ -138,6 +208,26 @@ impl PoolConfig {
 
         if let Some(val) = proxy.pool_http2_keep_alive_timeout_seconds {
             config.http2_keep_alive_timeout_seconds = val;
+        }
+
+        if let Some(val) = proxy.pool_http2_initial_stream_window_size {
+            config.http2_initial_stream_window_size = val.max(65_535);
+        }
+
+        if let Some(val) = proxy.pool_http2_initial_connection_window_size {
+            config.http2_initial_connection_window_size = val.max(65_535);
+        }
+
+        if let Some(val) = proxy.pool_http2_adaptive_window {
+            config.http2_adaptive_window = val;
+        }
+
+        if let Some(val) = proxy.pool_http2_max_frame_size {
+            config.http2_max_frame_size = val.clamp(16_384, 16_777_215);
+        }
+
+        if let Some(val) = proxy.pool_http2_max_concurrent_streams {
+            config.http2_max_concurrent_streams = Some(val);
         }
 
         // Validate the final max_idle_per_host after overrides

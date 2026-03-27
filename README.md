@@ -377,7 +377,10 @@ See [CI/CD Documentation](docs/ci_cd.md) for complete pipeline overview, secrets
 | `FERRUM_ENABLE_STREAMING_LATENCY_TRACKING` | No | `false` | Track streaming response total latency via deferred task (adds one `Arc` + `tokio::spawn` per streaming request) |
 | `FERRUM_ENABLE_HTTP3` | No | `false` | Enable HTTP/3 (QUIC) listener on the HTTPS port |
 | `FERRUM_HTTP3_IDLE_TIMEOUT` | No | `30` | HTTP/3 connection idle timeout in seconds |
-| `FERRUM_HTTP3_MAX_STREAMS` | No | `100` | Maximum concurrent HTTP/3 streams per connection |
+| `FERRUM_HTTP3_MAX_STREAMS` | No | `1000` | Maximum concurrent HTTP/3 streams per connection |
+| `FERRUM_HTTP3_STREAM_RECEIVE_WINDOW` | No | `8388608` | HTTP/3 per-stream receive window in bytes (default: 8 MiB) |
+| `FERRUM_HTTP3_RECEIVE_WINDOW` | No | `33554432` | HTTP/3 connection-level receive window in bytes (default: 32 MiB) |
+| `FERRUM_HTTP3_SEND_WINDOW` | No | `8388608` | HTTP/3 per-connection send window in bytes (default: 8 MiB) |
 | `FERRUM_BASIC_AUTH_HMAC_SECRET` | No | — | Server secret for HMAC-SHA256 password verification (~1μs). When set, the Admin API stores `hmac_sha256:<hex>` hashes instead of bcrypt. Existing bcrypt hashes remain valid. |
 | `FERRUM_TRUSTED_PROXIES` | No | — | Comma-separated trusted proxy CIDRs/IPs for client IP resolution via `X-Forwarded-For` |
 | `FERRUM_REAL_IP_HEADER` | No | — | Authoritative real-IP header name (e.g., `CF-Connecting-IP`, `X-Real-IP`) |
@@ -576,6 +579,12 @@ FERRUM_POOL_ENABLE_HTTP2=true
 FERRUM_POOL_TCP_KEEPALIVE_SECONDS=60
 FERRUM_POOL_HTTP2_KEEP_ALIVE_INTERVAL_SECONDS=30
 FERRUM_POOL_HTTP2_KEEP_ALIVE_TIMEOUT_SECONDS=45
+# HTTP/2 flow control tuning (dramatically improves HTTP/2 and gRPC throughput)
+FERRUM_POOL_HTTP2_INITIAL_STREAM_WINDOW_SIZE=8388608       # 8 MiB (vs 64 KB h2 spec default)
+FERRUM_POOL_HTTP2_INITIAL_CONNECTION_WINDOW_SIZE=33554432   # 32 MiB
+FERRUM_POOL_HTTP2_ADAPTIVE_WINDOW=false                    # Fixed windows for predictable performance
+FERRUM_POOL_HTTP2_MAX_FRAME_SIZE=65535                     # Max frame payload
+FERRUM_POOL_HTTP2_MAX_CONCURRENT_STREAMS=1000              # Concurrent streams per connection
 ```
 
 #### Per-Proxy Overrides (Optional)
@@ -588,6 +597,10 @@ proxies:
     pool_tcp_keepalive_seconds: 30
     pool_http2_keep_alive_interval_seconds: 15
     pool_http2_keep_alive_timeout_seconds: 5
+    # HTTP/2 flow control overrides
+    pool_http2_initial_stream_window_size: 16777216   # 16 MiB for large response bodies
+    pool_http2_initial_connection_window_size: 67108864  # 64 MiB
+    pool_http2_adaptive_window: true                  # Enable BDP probing for this proxy
     # Other settings use global defaults
 ```
 
@@ -610,6 +623,11 @@ proxies:
 | `FERRUM_POOL_TCP_KEEPALIVE_SECONDS` | `60` | TCP keep-alive interval in seconds |
 | `FERRUM_POOL_HTTP2_KEEP_ALIVE_INTERVAL_SECONDS` | `30` | HTTP/2 keep-alive ping interval in seconds |
 | `FERRUM_POOL_HTTP2_KEEP_ALIVE_TIMEOUT_SECONDS` | `45` | HTTP/2 keep-alive timeout in seconds |
+| `FERRUM_POOL_HTTP2_INITIAL_STREAM_WINDOW_SIZE` | `8388608` | HTTP/2 per-stream flow-control window (bytes). Larger = higher single-stream throughput. Default: 8 MiB |
+| `FERRUM_POOL_HTTP2_INITIAL_CONNECTION_WINDOW_SIZE` | `33554432` | HTTP/2 connection-level flow-control window (bytes). Aggregate budget across streams. Default: 32 MiB |
+| `FERRUM_POOL_HTTP2_ADAPTIVE_WINDOW` | `false` | Enable adaptive flow-control (BDP probing). Disabled by default for predictable fixed-window performance |
+| `FERRUM_POOL_HTTP2_MAX_FRAME_SIZE` | `65535` | Maximum HTTP/2 frame payload (bytes). Range: 16384–16777215 |
+| `FERRUM_POOL_HTTP2_MAX_CONCURRENT_STREAMS` | `1000` | Max concurrent HTTP/2 streams per backend connection |
 
 ### Sizing `pool_max_idle_per_host`
 
@@ -1498,7 +1516,7 @@ FERRUM_PROXY_TLS_CERT_PATH=/path/to/cert.pem \
 FERRUM_PROXY_TLS_KEY_PATH=/path/to/key.pem \
 FERRUM_ENABLE_HTTP3=true \
 FERRUM_HTTP3_IDLE_TIMEOUT=30 \
-FERRUM_HTTP3_MAX_STREAMS=100
+FERRUM_HTTP3_MAX_STREAMS=1000
 ```
 
 When enabled, the gateway listens for QUIC connections on `FERRUM_PROXY_HTTPS_PORT` alongside the standard HTTPS listener. Clients that support HTTP/3 (e.g., `curl --http3`) can connect via QUIC for lower-latency connections with built-in multiplexing and improved head-of-line blocking behavior.

@@ -168,8 +168,19 @@ pub struct EnvConfig {
     pub enable_http3: bool,
     /// HTTP/3 idle timeout in seconds (default: 30)
     pub http3_idle_timeout: u64,
-    /// HTTP/3 max concurrent streams (default: 100)
+    /// HTTP/3 max concurrent streams (default: 1000)
     pub http3_max_streams: u32,
+    /// HTTP/3 per-stream receive window in bytes (default: 8 MiB).
+    /// Controls how much data a peer can send on a single QUIC stream
+    /// before the receiver must send a flow-control credit update.
+    pub http3_stream_receive_window: u64,
+    /// HTTP/3 connection-level receive window in bytes (default: 32 MiB).
+    /// Aggregate budget shared across all concurrent streams on one QUIC connection.
+    pub http3_receive_window: u64,
+    /// HTTP/3 per-connection send window in bytes (default: 8 MiB).
+    /// Controls how much data can be in flight (sent but unacknowledged)
+    /// across all streams on a single QUIC connection.
+    pub http3_send_window: u64,
 
     // TLS Hardening
     /// Minimum TLS version: "1.2" or "1.3" (default: "1.2")
@@ -297,7 +308,10 @@ impl Default for EnvConfig {
             dtls_client_ca_cert_path: None,
             enable_http3: false,
             http3_idle_timeout: 30,
-            http3_max_streams: 100,
+            http3_max_streams: 1000,
+            http3_stream_receive_window: 8_388_608, // 8 MiB
+            http3_receive_window: 33_554_432,       // 32 MiB
+            http3_send_window: 8_388_608,           // 8 MiB
             tls_min_version: "1.2".into(),
             tls_max_version: "1.3".into(),
             tls_cipher_suites: None,
@@ -435,7 +449,14 @@ impl EnvConfig {
             http3_idle_timeout: resolve_u64(conf, "FERRUM_HTTP3_IDLE_TIMEOUT", 30),
             http3_max_streams: resolve_var(conf, "FERRUM_HTTP3_MAX_STREAMS")
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(100),
+                .unwrap_or(1000),
+            http3_stream_receive_window: resolve_u64(
+                conf,
+                "FERRUM_HTTP3_STREAM_RECEIVE_WINDOW",
+                8_388_608,
+            ),
+            http3_receive_window: resolve_u64(conf, "FERRUM_HTTP3_RECEIVE_WINDOW", 33_554_432),
+            http3_send_window: resolve_u64(conf, "FERRUM_HTTP3_SEND_WINDOW", 8_388_608),
 
             // TLS Hardening
             tls_min_version: resolve_var_or(conf, "FERRUM_TLS_MIN_VERSION", "1.2"),

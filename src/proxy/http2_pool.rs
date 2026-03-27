@@ -46,12 +46,16 @@ struct Http2PoolEntry {
 /// - Global mTLS and CA bundle settings from `EnvConfig`
 /// - Background idle connection cleanup
 pub struct Http2ConnectionPool {
-    /// Cached sender handles keyed by `host:port`
+    /// Cached sender handles keyed by `host:port:index`
     entries: Arc<DashMap<String, Http2PoolEntry>>,
     /// Global pool configuration (idle timeout, keepalive, etc.)
     global_pool_config: PoolConfig,
     /// Global TLS/mTLS configuration
     global_env_config: crate::config::EnvConfig,
+    /// Round-robin counter for distributing streams across backend connections.
+    conn_counter: AtomicU64,
+    /// Number of connections to maintain per backend.
+    connections_per_backend: usize,
 }
 
 impl Default for Http2ConnectionPool {
@@ -69,6 +73,8 @@ impl Http2ConnectionPool {
             entries: Arc::new(DashMap::new()),
             global_pool_config,
             global_env_config,
+            conn_counter: AtomicU64::new(0),
+            connections_per_backend: 4,
         };
 
         pool.start_cleanup_task();
@@ -76,17 +82,22 @@ impl Http2ConnectionPool {
     }
 
     /// Pool key — kept minimal to avoid fragmentation.
-    fn pool_key(proxy: &Proxy) -> String {
-        format!("{}:{}", proxy.backend_host, proxy.backend_port)
+    fn pool_key(proxy: &Proxy, index: usize) -> String {
+        format!("{}:{}:{}", proxy.backend_host, proxy.backend_port, index)
     }
 
     /// Get or create an HTTP/2 connection to the HTTPS backend.
+    ///
+    /// Uses round-robin across `connections_per_backend` connections to
+    /// distribute HTTP/2 frame processing across multiple tokio tasks.
     pub async fn get_sender(
         &self,
         proxy: &Proxy,
         dns_cache: &DnsCache,
     ) -> Result<http2::SendRequest<Incoming>, Http2PoolError> {
-        let key = Self::pool_key(proxy);
+        let index = self.conn_counter.fetch_add(1, Ordering::Relaxed) as usize
+            % self.connections_per_backend;
+        let key = Self::pool_key(proxy, index);
 
         // Try to reuse existing connection
         if let Some(entry) = self.entries.get(&key) {
@@ -168,7 +179,7 @@ impl Http2ConnectionPool {
             .await
     }
 
-    /// Build an HTTP/2 client builder with keepalive settings from pool config.
+    /// Build an HTTP/2 client builder with keepalive and flow-control settings.
     fn build_h2_builder(pool_config: &PoolConfig) -> http2::Builder<TokioExecutor> {
         let mut builder = http2::Builder::new(TokioExecutor::new());
 
@@ -183,6 +194,18 @@ impl Http2ConnectionPool {
                 .keep_alive_timeout(Duration::from_secs(
                     pool_config.http2_keep_alive_timeout_seconds,
                 ));
+        }
+
+        // Flow-control tuning — larger windows dramatically improve throughput
+        // by allowing more data in flight before waiting for WINDOW_UPDATEs.
+        builder
+            .initial_stream_window_size(pool_config.http2_initial_stream_window_size)
+            .initial_connection_window_size(pool_config.http2_initial_connection_window_size)
+            .adaptive_window(pool_config.http2_adaptive_window)
+            .max_frame_size(pool_config.http2_max_frame_size);
+
+        if let Some(max_streams) = pool_config.http2_max_concurrent_streams {
+            builder.max_concurrent_streams(max_streams);
         }
 
         builder

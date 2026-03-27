@@ -41,7 +41,7 @@ impl Default for Http3TestConfig {
     fn default() -> Self {
         Self {
             http3_idle_timeout: 30,
-            http3_max_streams: 100,
+            http3_max_streams: 1000,
             enable_http3: true,
         }
     }
@@ -78,6 +78,11 @@ fn create_http3_test_proxy() -> Proxy {
         pool_tcp_keepalive_seconds: Some(60),
         pool_http2_keep_alive_interval_seconds: Some(30),
         pool_http2_keep_alive_timeout_seconds: Some(45),
+        pool_http2_initial_stream_window_size: None,
+        pool_http2_initial_connection_window_size: None,
+        pool_http2_adaptive_window: None,
+        pool_http2_max_frame_size: None,
+        pool_http2_max_concurrent_streams: None,
         upstream_id: None,
         circuit_breaker: None,
         retry: None,
@@ -153,7 +158,10 @@ fn create_http3_test_env_config() -> EnvConfig {
         // HTTP/3 specific configuration (shares proxy_https_port for QUIC listener)
         enable_http3: true,
         http3_idle_timeout: 30,
-        http3_max_streams: 100,
+        http3_max_streams: 1000,
+        http3_stream_receive_window: 8_388_608,
+        http3_receive_window: 33_554_432,
+        http3_send_window: 8_388_608,
         db_tls_enabled: false,
         db_tls_ca_cert_path: None,
         db_tls_client_cert_path: None,
@@ -217,7 +225,7 @@ async fn test_http3_backend_connection() {
 
     // Test HTTP/3 client creation and basic functionality
     let tls_config = connection_pool.get_tls_config_for_backend(&proxy);
-    let http3_client_result = ferrum_gateway::http3::client::Http3Client::new(tls_config);
+    let http3_client_result = ferrum_gateway::http3::client::Http3Client::new(tls_config, None);
 
     match http3_client_result {
         Ok(_client) => {
@@ -303,7 +311,7 @@ async fn test_http3_configuration_loading() {
     assert!(env_config.enable_http3);
     assert_eq!(env_config.proxy_https_port, 8443);
     assert_eq!(env_config.http3_idle_timeout, 30);
-    assert_eq!(env_config.http3_max_streams, 100);
+    assert_eq!(env_config.http3_max_streams, 1000);
 
     let gateway_config = create_http3_test_gateway_config();
 
@@ -357,6 +365,9 @@ async fn test_http3_proxy_state_creation() {
         status_counts: Arc::new(dashmap::DashMap::new()),
         grpc_pool: Arc::new(ferrum_gateway::proxy::grpc_proxy::GrpcConnectionPool::default()),
         http2_pool: Arc::new(ferrum_gateway::proxy::http2_pool::Http2ConnectionPool::default()),
+        h3_pool: Arc::new(ferrum_gateway::http3::client::Http3ConnectionPool::new(
+            Arc::new(ferrum_gateway::config::EnvConfig::default()),
+        )),
         load_balancer_cache: lb_cache.clone(),
         health_checker: Arc::new(ferrum_gateway::health_check::HealthChecker::new()),
         circuit_breaker_cache: Arc::new(ferrum_gateway::circuit_breaker::CircuitBreakerCache::new()),
@@ -517,6 +528,9 @@ async fn test_http3_full_integration() {
         status_counts: Arc::new(dashmap::DashMap::new()),
         grpc_pool: Arc::new(ferrum_gateway::proxy::grpc_proxy::GrpcConnectionPool::default()),
         http2_pool: Arc::new(ferrum_gateway::proxy::http2_pool::Http2ConnectionPool::default()),
+        h3_pool: Arc::new(ferrum_gateway::http3::client::Http3ConnectionPool::new(
+            Arc::new(ferrum_gateway::config::EnvConfig::default()),
+        )),
         load_balancer_cache: lb_cache.clone(),
         health_checker: Arc::new(ferrum_gateway::health_check::HealthChecker::new()),
         circuit_breaker_cache: Arc::new(ferrum_gateway::circuit_breaker::CircuitBreakerCache::new()),
@@ -556,7 +570,7 @@ async fn test_http3_full_integration() {
     assert!(Arc::strong_count(&tls_config) > 0);
 
     // Test HTTP/3 client creation (may fail in test environment, but should not panic)
-    let http3_client_result = ferrum_gateway::http3::client::Http3Client::new(tls_config);
+    let http3_client_result = ferrum_gateway::http3::client::Http3Client::new(tls_config, None);
     match http3_client_result {
         Ok(_client) => {
             info!("HTTP/3 client created successfully");
@@ -596,7 +610,7 @@ async fn test_http3_connection_performance() {
     let tls_config = connection_pool.get_tls_config_for_backend(&proxy);
 
     let start_time = std::time::Instant::now();
-    let http3_client = ferrum_gateway::http3::client::Http3Client::new(tls_config)
+    let http3_client = ferrum_gateway::http3::client::Http3Client::new(tls_config, None)
         .expect("HTTP/3 client creation should succeed");
     let client_creation_time = start_time.elapsed();
 

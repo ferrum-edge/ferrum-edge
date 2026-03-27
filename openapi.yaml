@@ -1177,6 +1177,35 @@ components:
           type: [integer, "null"]
           format: uint64
           description: HTTP/2 PING timeout in seconds (overrides global)
+        pool_http2_initial_stream_window_size:
+          type: [integer, "null"]
+          format: uint32
+          description: |
+            HTTP/2 initial per-stream flow-control window size in bytes (overrides global).
+            Larger values improve single-stream throughput. Default: 8388608 (8 MiB).
+        pool_http2_initial_connection_window_size:
+          type: [integer, "null"]
+          format: uint32
+          description: |
+            HTTP/2 initial connection-level flow-control window size in bytes (overrides global).
+            Aggregate budget shared across all concurrent streams. Default: 33554432 (32 MiB).
+        pool_http2_adaptive_window:
+          type: [boolean, "null"]
+          description: |
+            Enable adaptive flow-control (BDP probing) for HTTP/2 connections (overrides global).
+            Disabled by default for predictable fixed-window performance. Default: false.
+        pool_http2_max_frame_size:
+          type: [integer, "null"]
+          format: uint32
+          description: |
+            Maximum HTTP/2 frame payload size in bytes (overrides global).
+            Range: 16384–16777215. Default: 65535.
+        pool_http2_max_concurrent_streams:
+          type: [integer, "null"]
+          format: uint32
+          description: |
+            Maximum concurrent HTTP/2 streams per backend connection (overrides global).
+            Default: 1000.
         upstream_id:
           type: [string, "null"]
 

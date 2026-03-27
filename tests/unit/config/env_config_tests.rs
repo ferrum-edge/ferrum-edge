@@ -302,7 +302,7 @@ fn test_env_config_http3_defaults() {
             let config = EnvConfig::from_env().unwrap();
             assert!(!config.enable_http3);
             assert_eq!(config.http3_idle_timeout, 30);
-            assert_eq!(config.http3_max_streams, 100);
+            assert_eq!(config.http3_max_streams, 1000);
         },
     );
 }

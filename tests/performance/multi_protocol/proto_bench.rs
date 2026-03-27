@@ -237,7 +237,7 @@ async fn run_http1(args: &BenchArgs) -> anyhow::Result<()> {
 async fn run_http2(args: &BenchArgs) -> anyhow::Result<()> {
     use http_body_util::BodyExt;
     use hyper::client::conn::http2;
-    use hyper_util::rt::TokioExecutor;
+    use hyper_util::rt::{TokioExecutor, TokioTimer};
 
     let is_tls = args.target.starts_with("https://");
     let url: http::Uri = args.target.parse().context("invalid target URL")?;
@@ -256,6 +256,20 @@ async fn run_http2(args: &BenchArgs) -> anyhow::Result<()> {
         None
     };
 
+    // Build an HTTP/2 client builder with optimized flow-control settings.
+    // The default 64 KB stream window throttles throughput on modern networks;
+    // 8 MiB stream + 32 MiB connection windows match the gateway's tuned defaults.
+    let make_h2_builder = || {
+        let mut builder = http2::Builder::new(TokioExecutor::new());
+        builder
+            .timer(TokioTimer::new())
+            .initial_stream_window_size(8_388_608)         // 8 MiB
+            .initial_connection_window_size(33_554_432)     // 32 MiB
+            .adaptive_window(false)                         // Fixed windows
+            .max_frame_size(65_535);                        // Max frame size
+        builder
+    };
+
     // HTTP/2 multiplexes many streams over fewer connections. Use a
     // connection pool sized to balance multiplexing benefit vs contention.
     // ~10 streams per connection is a good balance for throughput.
@@ -270,6 +284,7 @@ async fn run_http2(args: &BenchArgs) -> anyhow::Result<()> {
 
     for _ in 0..num_conns {
         let tcp = tokio::net::TcpStream::connect(addr).await?;
+        tcp.set_nodelay(true)?;
         let host_str = host.to_string();
 
         let send_req = if let Some(ref tls_cfg) = tls_cfg {
@@ -278,14 +293,14 @@ async fn run_http2(args: &BenchArgs) -> anyhow::Result<()> {
                 .map_err(|e| anyhow::anyhow!("invalid server name: {e}"))?;
             let tls_stream = connector.connect(server_name, tcp).await?;
             let io = hyper_util::rt::TokioIo::new(tls_stream);
-            let (sr, conn) = http2::handshake(TokioExecutor::new(), io).await?;
+            let (sr, conn) = make_h2_builder().handshake(io).await?;
             tokio::spawn(async move {
                 let _ = conn.await;
             });
             sr
         } else {
             let io = hyper_util::rt::TokioIo::new(tcp);
-            let (sr, conn) = http2::handshake(TokioExecutor::new(), io).await?;
+            let (sr, conn) = make_h2_builder().handshake(io).await?;
             tokio::spawn(async move {
                 let _ = conn.await;
             });
@@ -486,6 +501,8 @@ async fn run_grpc(args: &BenchArgs) -> anyhow::Result<()> {
 
             let channel = tonic::transport::Channel::from_shared(target.clone())
                 .map_err(|e| anyhow::anyhow!("invalid gRPC target: {e}"))?
+                .initial_stream_window_size(8_388_608)         // 8 MiB (vs 64 KB default)
+                .initial_connection_window_size(33_554_432)     // 32 MiB
                 .connect()
                 .await
                 .map_err(|e| anyhow::anyhow!("gRPC connect to {target}: {e}"))?;
@@ -508,6 +525,7 @@ async fn run_grpc(args: &BenchArgs) -> anyhow::Result<()> {
                         tokio::time::sleep(Duration::from_millis(10)).await;
                         let Ok(ch) = tonic::transport::Channel::from_shared(target.clone())
                             .map_err(|e| anyhow::anyhow!("{e}"))
+                            .map(|c| c.initial_stream_window_size(8_388_608).initial_connection_window_size(33_554_432))
                         else {
                             break;
                         };

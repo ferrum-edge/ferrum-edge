@@ -36,7 +36,7 @@ use crate::connection_pool::ConnectionPool;
 use crate::consumer_index::ConsumerIndex;
 use crate::dns::DnsCache;
 use crate::health_check::HealthChecker;
-use crate::http3::client::Http3Client;
+use crate::http3::client::Http3ConnectionPool;
 use crate::load_balancer::LoadBalancerCache;
 use crate::plugin_cache::PluginCache;
 use crate::plugins::{
@@ -84,6 +84,8 @@ pub struct ProxyState {
     pub grpc_pool: Arc<GrpcConnectionPool>,
     /// HTTP/2 connection pool for HTTPS backends (proper stream multiplexing)
     pub http2_pool: Arc<Http2ConnectionPool>,
+    /// HTTP/3 connection pool for QUIC backends (reuses QUIC connections)
+    pub h3_pool: Arc<Http3ConnectionPool>,
     /// Load balancer cache for upstream target selection.
     pub load_balancer_cache: Arc<LoadBalancerCache>,
     /// Health checker for upstream targets.
@@ -138,6 +140,7 @@ impl ProxyState {
             env_config.clone(),
         ));
         let env_config_arc = Arc::new(env_config.clone());
+        let h3_pool = Arc::new(Http3ConnectionPool::new(env_config_arc.clone()));
         let connection_pool = Arc::new(ConnectionPool::new(
             global_pool_config.clone(),
             env_config,
@@ -219,6 +222,7 @@ impl ProxyState {
             status_counts: Arc::new(dashmap::DashMap::new()),
             grpc_pool,
             http2_pool,
+            h3_pool,
             alt_svc_header,
             env_config: env_config_arc,
             max_header_size_bytes,
@@ -746,9 +750,14 @@ async fn handle_connection(
     let mut builder =
         hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
     builder.http1().max_buf_size(state.max_header_size_bytes);
+    let pool_cfg = state.connection_pool.global_pool_config();
     builder
         .http2()
-        .max_header_list_size(state.max_header_size_bytes as u32);
+        .max_header_list_size(state.max_header_size_bytes as u32)
+        .initial_stream_window_size(pool_cfg.http2_initial_stream_window_size)
+        .initial_connection_window_size(pool_cfg.http2_initial_connection_window_size)
+        .adaptive_window(pool_cfg.http2_adaptive_window)
+        .max_frame_size(pool_cfg.http2_max_frame_size);
 
     // WebSocket requests flow through handle_proxy_request so that authentication
     // and authorization plugins execute before the upgrade handshake.
@@ -1513,9 +1522,14 @@ async fn handle_tls_connection(
     let mut builder =
         hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
     builder.http1().max_buf_size(state.max_header_size_bytes);
+    let pool_cfg = state.connection_pool.global_pool_config();
     builder
         .http2()
-        .max_header_list_size(state.max_header_size_bytes as u32);
+        .max_header_list_size(state.max_header_size_bytes as u32)
+        .initial_stream_window_size(pool_cfg.http2_initial_stream_window_size)
+        .initial_connection_window_size(pool_cfg.http2_initial_connection_window_size)
+        .adaptive_window(pool_cfg.http2_adaptive_window)
+        .max_frame_size(pool_cfg.http2_max_frame_size);
 
     // WebSocket requests flow through handle_proxy_request so that authentication
     // and authorization plugins execute before the upgrade handshake.
@@ -1625,6 +1639,7 @@ pub async fn handle_proxy_request(
     // separate ownership for use in backend URL building and logging.
     let mut ctx = RequestContext::new(socket_ip.clone(), method.clone(), path.clone());
     ctx.tls_client_cert_der = tls_client_cert_der;
+    ctx.headers.reserve(req.headers().keys_len());
 
     // Validate and extract headers with size limits
     let mut total_header_size: usize = 0;
@@ -3613,22 +3628,8 @@ async fn proxy_to_backend_http3(
 ) -> (u16, Vec<u8>, HashMap<String, String>) {
     debug!(proxy_id = %proxy.id, backend_url = %backend_url, "Proxying request to HTTP/3 backend");
 
-    // Create HTTP/3 client with TLS configuration
-    let tls_config = state.connection_pool.get_tls_config_for_backend(proxy);
-    let http3_client = match Http3Client::new(tls_config) {
-        Ok(client) => client,
-        Err(e) => {
-            error!(
-                proxy_id = %proxy.id,
-                backend_url = %backend_url,
-                error_kind = "client_creation",
-                error = %e,
-                "Failed to create HTTP/3 client"
-            );
-            let body = r#"{"error":"HTTP/3 client creation failed"}"#;
-            return (502, body.as_bytes().to_vec(), HashMap::new());
-        }
-    };
+    // TLS config creation is deferred to the H3 pool's cache-miss path to avoid
+    // cloning the root certificate store (~120 certs) on every request.
 
     // Read request body with size limit
     let (_parts, body) = original_req.into_parts();
@@ -3708,9 +3709,19 @@ async fn proxy_to_backend_http3(
         ));
     }
 
-    // Make HTTP/3 request
-    match http3_client
-        .request(proxy, method, backend_url, http3_headers, request_body)
+    // Make HTTP/3 request via connection pool (reuses QUIC connections)
+    let connection_pool = state.connection_pool.clone();
+    let proxy_clone = proxy.clone();
+    match state
+        .h3_pool
+        .request(
+            proxy,
+            method,
+            backend_url,
+            &http3_headers,
+            request_body,
+            move || connection_pool.get_tls_config_for_backend(&proxy_clone),
+        )
         .await
     {
         Ok(response) => {
