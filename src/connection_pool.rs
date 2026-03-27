@@ -127,6 +127,7 @@ impl ConnectionPool {
             .dns_resolver(dns_resolver)
             .connect_timeout(Duration::from_millis(proxy.backend_connect_timeout_ms))
             .timeout(Duration::from_millis(proxy.backend_read_timeout_ms))
+            .tcp_nodelay(true)
             .danger_accept_invalid_certs(
                 !proxy.backend_tls_verify_server_cert || self.global_mtls_config.tls_no_verify,
             )
@@ -150,7 +151,9 @@ impl ConnectionPool {
                 ))
                 .http2_keep_alive_timeout(Duration::from_secs(
                     config.http2_keep_alive_timeout_seconds,
-                ));
+                ))
+                .http2_initial_stream_window_size(1_048_576)
+                .http2_initial_connection_window_size(16_777_216);
         }
 
         // Add custom CA bundle for server certificate verification (unless no_verify is set)

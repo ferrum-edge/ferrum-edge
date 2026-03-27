@@ -11,7 +11,7 @@ use hyper::body::Incoming;
 use hyper::client::conn::http2;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tracing::{debug, warn};
@@ -46,8 +46,10 @@ struct Http2PoolEntry {
 /// - Global mTLS and CA bundle settings from `EnvConfig`
 /// - Background idle connection cleanup
 pub struct Http2ConnectionPool {
-    /// Cached sender handles keyed by `host:port`
+    /// Cached sender handles keyed by `host:port#shard`
     entries: Arc<DashMap<String, Http2PoolEntry>>,
+    /// Round-robin counters keyed by base backend host:port.
+    rr_counters: Arc<DashMap<String, Arc<AtomicUsize>>>,
     /// Global pool configuration (idle timeout, keepalive, etc.)
     global_pool_config: PoolConfig,
     /// Global TLS/mTLS configuration
@@ -67,6 +69,7 @@ impl Http2ConnectionPool {
     ) -> Self {
         let pool = Self {
             entries: Arc::new(DashMap::new()),
+            rr_counters: Arc::new(DashMap::new()),
             global_pool_config,
             global_env_config,
         };
@@ -80,36 +83,64 @@ impl Http2ConnectionPool {
         format!("{}:{}", proxy.backend_host, proxy.backend_port)
     }
 
+    fn shard_key(base_key: &str, shard: usize) -> String {
+        format!("{base_key}#{shard}")
+    }
+
     /// Get or create an HTTP/2 connection to the HTTPS backend.
     pub async fn get_sender(
         &self,
         proxy: &Proxy,
         dns_cache: &DnsCache,
     ) -> Result<http2::SendRequest<Incoming>, Http2PoolError> {
-        let key = Self::pool_key(proxy);
+        let base_key = Self::pool_key(proxy);
+        let pool_config = self.global_pool_config.for_proxy(proxy);
+        let shard_count = pool_config.http2_connections_per_host.max(1);
+        let rr = self
+            .rr_counters
+            .entry(base_key.clone())
+            .or_insert_with(|| Arc::new(AtomicUsize::new(0)))
+            .clone();
+        let start = rr.fetch_add(1, Ordering::Relaxed) % shard_count;
 
-        // Try to reuse existing connection
-        if let Some(entry) = self.entries.get(&key) {
-            if !entry.sender.is_closed() {
-                entry
-                    .last_used_epoch_ms
-                    .store(now_epoch_ms(), Ordering::Relaxed);
-                return Ok(entry.sender.clone());
+        for offset in 0..shard_count {
+            let shard = (start + offset) % shard_count;
+            let key = Self::shard_key(&base_key, shard);
+            if let Some(entry) = self.entries.get(&key) {
+                if !entry.sender.is_closed() {
+                    entry
+                        .last_used_epoch_ms
+                        .store(now_epoch_ms(), Ordering::Relaxed);
+                    return Ok(entry.sender.clone());
+                }
+                drop(entry);
+                self.entries.remove(&key);
             }
-            // Connection is closed, remove it
-            drop(entry);
-            self.entries.remove(&key);
         }
 
-        // Create a new connection
+        // Lazily create the selected shard when none are ready.
+        let key = Self::shard_key(&base_key, start);
         let sender = self.create_connection(proxy, dns_cache).await?;
-        self.entries.insert(
-            key,
-            Http2PoolEntry {
-                sender: sender.clone(),
-                last_used_epoch_ms: Arc::new(AtomicU64::new(now_epoch_ms())),
-            },
-        );
+        let sender = match self.entries.entry(key) {
+            dashmap::mapref::entry::Entry::Occupied(mut occupied) => {
+                if occupied.get().sender.is_closed() {
+                    occupied.insert(Http2PoolEntry {
+                        sender: sender.clone(),
+                        last_used_epoch_ms: Arc::new(AtomicU64::new(now_epoch_ms())),
+                    });
+                    sender
+                } else {
+                    occupied.get().sender.clone()
+                }
+            }
+            dashmap::mapref::entry::Entry::Vacant(vacant) => {
+                vacant.insert(Http2PoolEntry {
+                    sender: sender.clone(),
+                    last_used_epoch_ms: Arc::new(AtomicU64::new(now_epoch_ms())),
+                });
+                sender
+            }
+        };
         Ok(sender)
     }
 
@@ -182,7 +213,12 @@ impl Http2ConnectionPool {
                 ))
                 .keep_alive_timeout(Duration::from_secs(
                     pool_config.http2_keep_alive_timeout_seconds,
-                ));
+                ))
+                // Large windows avoid throttling highly concurrent small requests on a
+                // single backend connection shard.
+                .initial_stream_window_size(Some(1_048_576))
+                .initial_connection_window_size(Some(16_777_216))
+                .max_concurrent_reset_streams(4096);
         }
 
         builder

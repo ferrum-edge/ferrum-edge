@@ -151,6 +151,7 @@ async fn handle_tcp_connection(
     tls_no_verify: bool,
 ) -> Result<(u64, u64, Duration), anyhow::Error> {
     let start = Instant::now();
+    let _ = client_stream.set_nodelay(true);
 
     // Look up the proxy config
     let current_config = config.load();
@@ -230,6 +231,7 @@ async fn connect_backend_plain(
         .await
         .map_err(|_| anyhow::anyhow!("Backend connect timeout to {}", addr))?
         .map_err(|e| anyhow::anyhow!("Backend connect failed to {}: {}", addr, e))?;
+    let _ = stream.set_nodelay(true);
     Ok(stream)
 }
 

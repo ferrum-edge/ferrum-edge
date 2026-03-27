@@ -550,6 +550,7 @@ async fn run_tcp(args: &BenchArgs) -> anyhow::Result<()> {
         handles.push(tokio::spawn(async move {
             let mut metrics = BenchMetrics::new();
             let tcp = tokio::net::TcpStream::connect(addr).await?;
+            let _ = tcp.set_nodelay(true);
 
             if let Some(tls_cfg) = tls_cfg {
                 let connector = tokio_rustls::TlsConnector::from(tls_cfg);

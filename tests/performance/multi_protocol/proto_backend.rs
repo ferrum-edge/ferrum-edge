@@ -229,6 +229,7 @@ async fn run_tcp_echo(addr: SocketAddr) -> anyhow::Result<()> {
         .context("binding tcp echo listener")?;
     loop {
         let (mut stream, _) = listener.accept().await?;
+        let _ = stream.set_nodelay(true);
         tokio::spawn(async move {
             let (mut rd, mut wr) = stream.split();
             let _ = tokio::io::copy(&mut rd, &mut wr).await;
@@ -322,6 +323,9 @@ async fn run_dtls_echo(addr: SocketAddr, cert_path: &str, key_path: &str) -> any
     // from_pem expects key PEM before cert PEM
     let cert_pem = std::fs::read_to_string(cert_path).context("reading DTLS cert")?;
     let key_pem = std::fs::read_to_string(key_path).context("reading DTLS key")?;
+    let key_pem = key_pem
+        .replace("BEGIN PRIVATE KEY", "BEGIN PRIVATE_KEY")
+        .replace("END PRIVATE KEY", "END PRIVATE_KEY");
     let combined_pem = format!("{key_pem}\n{cert_pem}");
     let cert = DtlsCert::from_pem(&combined_pem)
         .map_err(|e| anyhow::anyhow!("loading DTLS certificate: {e}"))?;

@@ -29,6 +29,10 @@ pub struct PoolConfig {
     /// HTTP/2 itself is auto-negotiated via ALPN on HTTPS connections — this does NOT
     /// force h2c (cleartext HTTP/2) via http2_prior_knowledge().
     pub enable_http2: bool,
+    /// Number of parallel backend HTTP/2 connections to keep per host.
+    /// A small shard set reduces lock contention on a single multiplexed h2 sender
+    /// under high concurrency while still preserving connection reuse.
+    pub http2_connections_per_host: usize,
     pub tcp_keepalive_seconds: u64,
     pub http2_keep_alive_interval_seconds: u64,
     pub http2_keep_alive_timeout_seconds: u64,
@@ -41,6 +45,9 @@ impl Default for PoolConfig {
             idle_timeout_seconds: 90,
             enable_http_keep_alive: true,
             enable_http2: true,
+            http2_connections_per_host: std::thread::available_parallelism()
+                .map(|n| n.get().clamp(2, 8))
+                .unwrap_or(4),
             tcp_keepalive_seconds: 60,
             http2_keep_alive_interval_seconds: 30,
             http2_keep_alive_timeout_seconds: 45, // More reasonable timeout comparable to HTTP read timeout
@@ -72,6 +79,12 @@ impl PoolConfig {
 
         if let Ok(val) = env::var("FERRUM_POOL_ENABLE_HTTP2") {
             config.enable_http2 = val.parse::<bool>().unwrap_or(true);
+        }
+
+        if let Ok(val) = env::var("FERRUM_POOL_HTTP2_CONNECTIONS_PER_HOST")
+            && let Ok(parsed) = val.parse::<usize>()
+        {
+            config.http2_connections_per_host = parsed.max(1);
         }
 
         if let Ok(val) = env::var("FERRUM_POOL_TCP_KEEPALIVE_SECONDS")
