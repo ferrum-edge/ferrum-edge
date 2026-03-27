@@ -2347,9 +2347,15 @@ async fn handle_restore(
     let mut created_proxies = 0usize;
     let mut created_plugin_configs = 0usize;
 
-    // Consumers first (no dependencies)
+    // Consumers first (no dependencies) — hash secrets before persisting
     if !payload.consumers.is_empty() {
-        match db.batch_create_consumers(&payload.consumers).await {
+        let mut consumers = payload.consumers.clone();
+        for consumer in &mut consumers {
+            if let Err(e) = hash_consumer_secrets(consumer) {
+                errors.push(format!("consumer {} secret hashing: {}", consumer.id, e));
+            }
+        }
+        match db.batch_create_consumers(&consumers).await {
             Ok(n) => created_consumers = n,
             Err(e) => errors.push(format!("consumers: {}", e)),
         }

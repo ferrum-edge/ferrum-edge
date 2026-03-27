@@ -1159,3 +1159,115 @@ async fn test_restore_read_only_rejected() {
     assert_eq!(status, 403);
     assert!(body["error"].as_str().unwrap().contains("read-only"));
 }
+
+#[tokio::test]
+async fn test_batch_create_proxies_persists_hosts() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let batch = json!({
+        "proxies": [
+            {
+                "id": "hosts_p1",
+                "listen_path": "/hosts-test",
+                "hosts": ["api.example.com", "*.staging.example.com"],
+                "backend_protocol": "http",
+                "backend_host": "localhost",
+                "backend_port": 8080,
+                "strip_listen_path": true
+            }
+        ]
+    });
+
+    let (status, body) = admin_post(&base_url, "/batch", &token, &batch).await;
+    assert_eq!(status, 201, "Batch create failed: {:?}", body);
+    assert_eq!(body["created"]["proxies"], 1);
+
+    // Verify hosts field was persisted by reading the proxy back
+    let (status, proxy_body, _) = admin_get(&base_url, "/proxies/hosts_p1", &token).await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    let hosts = proxy_body["hosts"].as_array().unwrap();
+    assert_eq!(hosts.len(), 2);
+    assert_eq!(hosts[0], "api.example.com");
+    assert_eq!(hosts[1], "*.staging.example.com");
+}
+
+#[tokio::test]
+async fn test_batch_create_upstreams_persists_service_discovery() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let batch = json!({
+        "upstreams": [
+            {
+                "id": "sd_u1",
+                "name": "sd-upstream",
+                "targets": [{"host": "10.0.0.1", "port": 8080, "weight": 100}],
+                "service_discovery": {
+                    "provider": "dns_sd",
+                    "dns_sd": {"service_name": "_http._tcp.local", "poll_interval_seconds": 60},
+                    "default_weight": 5
+                }
+            }
+        ]
+    });
+
+    let (status, body) = admin_post(&base_url, "/batch", &token, &batch).await;
+    assert_eq!(status, 201, "Batch create failed: {:?}", body);
+    assert_eq!(body["created"]["upstreams"], 1);
+
+    // Verify service_discovery was persisted
+    let (status, upstream_body, _) = admin_get(&base_url, "/upstreams/sd_u1", &token).await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    let sd = &upstream_body["service_discovery"];
+    assert!(!sd.is_null(), "service_discovery should be persisted");
+    assert_eq!(sd["provider"], "dns_sd");
+    assert_eq!(sd["dns_sd"]["service_name"], "_http._tcp.local");
+    assert_eq!(sd["dns_sd"]["poll_interval_seconds"], 60);
+    assert_eq!(sd["default_weight"], 5);
+}
+
+#[tokio::test]
+async fn test_restore_hashes_consumer_secrets() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    // Restore with a consumer that has a plaintext basicauth password
+    let restore_payload = json!({
+        "consumers": [
+            {
+                "id": "hash_c1",
+                "username": "hash_user",
+                "credentials": {
+                    "basicauth": {
+                        "username": "hash_user",
+                        "password": "my_secret_password"
+                    }
+                }
+            }
+        ]
+    });
+
+    let (status, body) =
+        admin_post(&base_url, "/restore?confirm=true", &token, &restore_payload).await;
+    assert_eq!(status, 200, "Restore failed: {:?}", body);
+    assert_eq!(body["restored"]["consumers"], 1);
+
+    // Read the consumer back and verify the password was hashed
+    // (the plaintext "password" key should be removed, replaced by "password_hash")
+    let (status, consumer_body, _) = admin_get(&base_url, "/consumers/hash_c1", &token).await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    let creds = &consumer_body["credentials"]["basicauth"];
+    // The API redacts password_hash, but the plaintext "password" key should NOT be present
+    assert!(
+        creds.get("password").is_none() || creds["password"].is_null(),
+        "Plaintext password should be removed after hashing, got: {:?}",
+        creds
+    );
+}

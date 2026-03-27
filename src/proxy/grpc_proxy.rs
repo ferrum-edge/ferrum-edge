@@ -34,6 +34,7 @@ use tracing::{debug, error, warn};
 use crate::config::PoolConfig;
 use crate::config::types::{BackendProtocol, Proxy};
 use crate::dns::DnsCache;
+use crate::tls::NoVerifier;
 
 /// Pool entry tracking a sender handle and its last-used timestamp.
 struct GrpcPoolEntry {
@@ -378,7 +379,7 @@ impl GrpcConnectionPool {
         if !proxy.backend_tls_verify_server_cert || self.global_env_config.tls_no_verify {
             tls_config
                 .dangerous()
-                .set_certificate_verifier(Arc::new(NoCertificateVerification));
+                .set_certificate_verifier(Arc::new(NoVerifier));
         }
 
         let connector = TlsConnector::from(Arc::new(tls_config));
@@ -445,47 +446,6 @@ impl GrpcConnectionPool {
                 }
             }
         });
-    }
-}
-
-/// Dangerous: skip TLS certificate verification (for testing or self-signed certs).
-#[derive(Debug)]
-struct NoCertificateVerification;
-
-impl rustls::client::danger::ServerCertVerifier for NoCertificateVerification {
-    fn verify_server_cert(
-        &self,
-        _: &rustls::pki_types::CertificateDer<'_>,
-        _: &[rustls::pki_types::CertificateDer<'_>],
-        _: &rustls::pki_types::ServerName<'_>,
-        _: &[u8],
-        _: rustls::pki_types::UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        _: &[u8],
-        _: &rustls::pki_types::CertificateDer<'_>,
-        _: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        _: &[u8],
-        _: &rustls::pki_types::CertificateDer<'_>,
-        _: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        rustls::crypto::ring::default_provider()
-            .signature_verification_algorithms
-            .supported_schemes()
     }
 }
 

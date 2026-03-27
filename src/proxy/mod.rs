@@ -46,6 +46,7 @@ use crate::retry;
 use crate::retry::ResponseBody;
 use crate::router_cache::RouterCache;
 use crate::service_discovery::ServiceDiscoveryManager;
+use crate::tls::NoVerifier;
 
 pub use self::body::ProxyBody;
 use self::grpc_proxy::{GrpcConnectionPool, GrpcProxyError};
@@ -1192,47 +1193,6 @@ fn build_websocket_tls_connector(
     )))
 }
 
-/// A certificate verifier that accepts all server certificates (for testing/dev).
-#[derive(Debug)]
-struct NoVerifier;
-
-impl rustls::client::danger::ServerCertVerifier for NoVerifier {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &rustls::pki_types::CertificateDer<'_>,
-        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
-        _server_name: &rustls::pki_types::ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: rustls::pki_types::UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        rustls::crypto::ring::default_provider()
-            .signature_verification_algorithms
-            .supported_schemes()
-    }
-}
-
 /// Connect to backend WebSocket server before sending 101 to client.
 /// Returns the connected backend stream, or an error if the backend is unreachable.
 async fn connect_websocket_backend(
@@ -1647,13 +1607,18 @@ pub async fn handle_proxy_request(
         let header_size = name.as_str().len() + value.len();
         if header_size > state.max_single_header_size_bytes {
             record_request(&state, 431);
-            // Escape header name to prevent JSON injection from client-controlled data
-            let escaped_name = name.as_str().replace('\\', "\\\\").replace('"', "\\\"");
+            // Escape header name to prevent JSON injection from client-controlled data.
+            // Use serde_json to produce a correctly escaped JSON string value,
+            // which handles backslash, quotes, and all control characters.
+            let escaped_name = serde_json::to_string(name.as_str())
+                .unwrap_or_else(|_| "\"<invalid>\"".to_string());
+            // escaped_name is a quoted JSON string like "\"foo\"", strip outer quotes for embedding
+            let inner = &escaped_name[1..escaped_name.len() - 1];
             return Ok(build_response(
                 StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
                 &format!(
                     r#"{{"error":"Request header '{}' exceeds maximum size of {} bytes"}}"#,
-                    escaped_name, state.max_single_header_size_bytes
+                    inner, state.max_single_header_size_bytes
                 ),
             ));
         }
