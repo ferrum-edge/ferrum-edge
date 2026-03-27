@@ -3,6 +3,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use tracing::debug;
 
+use super::body_transform::{self, BodyRule};
 use super::{Plugin, PluginResult, RequestContext};
 
 #[derive(Debug, Clone)]
@@ -17,6 +18,8 @@ struct TransformRule {
 
 pub struct ResponseTransformer {
     rules: Vec<TransformRule>,
+    /// Pre-parsed body transformation rules (target: "body").
+    body_rules: Vec<BodyRule>,
 }
 
 impl ResponseTransformer {
@@ -27,6 +30,13 @@ impl ResponseTransformer {
                 arr.iter()
                     .filter_map(|r| {
                         let operation = r["operation"].as_str()?.to_string();
+                        // Skip body rules — handled separately.
+                        // Response transformer rules default to "header" target
+                        // for backwards compatibility (no target field required).
+                        let target = r["target"].as_str().unwrap_or("header");
+                        if target == "body" {
+                            return None;
+                        }
                         let raw_key = r["key"].as_str()?.to_string();
                         let value = r["value"].as_str().map(String::from);
                         let raw_new_key = r["new_key"].as_str().map(String::from);
@@ -42,13 +52,15 @@ impl ResponseTransformer {
             })
             .unwrap_or_default();
 
-        if rules.is_empty() {
+        let body_rules = body_transform::parse_body_rules(config);
+
+        if rules.is_empty() && body_rules.is_empty() {
             tracing::warn!(
                 "response_transformer: no 'rules' configured — plugin will have no effect"
             );
         }
 
-        Self { rules }
+        Self { rules, body_rules }
     }
 }
 
@@ -64,6 +76,10 @@ impl Plugin for ResponseTransformer {
 
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
         super::HTTP_GRPC_PROTOCOLS
+    }
+
+    fn requires_response_body_buffering(&self) -> bool {
+        !self.body_rules.is_empty()
     }
 
     async fn after_proxy(
@@ -107,5 +123,20 @@ impl Plugin for ResponseTransformer {
             }
         }
         PluginResult::Continue
+    }
+
+    async fn transform_response_body(
+        &self,
+        body: &[u8],
+        content_type: Option<&str>,
+    ) -> Option<Vec<u8>> {
+        // Only transform JSON bodies
+        if let Some(ct) = content_type
+            && !body_transform::is_json_content_type(ct)
+        {
+            return None;
+        }
+
+        body_transform::apply_body_rules(body, &self.body_rules)
     }
 }

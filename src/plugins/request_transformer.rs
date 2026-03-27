@@ -3,6 +3,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use tracing::debug;
 
+use super::body_transform::{self, BodyRule};
 use super::{Plugin, PluginResult, RequestContext};
 
 #[derive(Debug, Clone)]
@@ -18,6 +19,8 @@ struct TransformRule {
 
 pub struct RequestTransformer {
     rules: Vec<TransformRule>,
+    /// Pre-parsed body transformation rules (target: "body").
+    body_rules: Vec<BodyRule>,
 }
 
 impl RequestTransformer {
@@ -29,6 +32,10 @@ impl RequestTransformer {
                     .filter_map(|r| {
                         let operation = r["operation"].as_str()?.to_string();
                         let target = r["target"].as_str()?.to_string();
+                        // Skip body rules — handled separately
+                        if target == "body" {
+                            return None;
+                        }
                         let raw_key = r["key"].as_str()?.to_string();
                         let value = r["value"].as_str().map(String::from);
                         let raw_new_key = r["new_key"].as_str().map(String::from);
@@ -57,13 +64,15 @@ impl RequestTransformer {
             })
             .unwrap_or_default();
 
-        if rules.is_empty() {
+        let body_rules = body_transform::parse_body_rules(config);
+
+        if rules.is_empty() && body_rules.is_empty() {
             tracing::warn!(
                 "request_transformer: no 'rules' configured — plugin will have no effect"
             );
         }
 
-        Self { rules }
+        Self { rules, body_rules }
     }
 }
 
@@ -83,6 +92,10 @@ impl Plugin for RequestTransformer {
 
     fn modifies_request_headers(&self) -> bool {
         true
+    }
+
+    fn modifies_request_body(&self) -> bool {
+        !self.body_rules.is_empty()
     }
 
     async fn before_proxy(
@@ -153,5 +166,21 @@ impl Plugin for RequestTransformer {
             }
         }
         PluginResult::Continue
+    }
+
+    async fn transform_request_body(
+        &self,
+        body: &[u8],
+        content_type: Option<&str>,
+    ) -> Option<Vec<u8>> {
+        // Only transform JSON bodies
+        if let Some(ct) = content_type
+            && !body_transform::is_json_content_type(ct)
+        {
+            return None;
+        }
+        // No content-type header — try to parse as JSON anyway
+
+        body_transform::apply_body_rules(body, &self.body_rules)
     }
 }

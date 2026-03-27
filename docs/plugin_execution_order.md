@@ -174,7 +174,7 @@ impl Plugin for MyBodyPlugin {
 }
 ```
 
-By default, this method returns `false`. Existing plugins like `response_transformer` only modify headers (not the body), so they work with both streaming and buffered modes without overriding this method. See [docs/response_body_streaming.md](response_body_streaming.md) for the full streaming architecture.
+By default, this method returns `false`. When `response_transformer` has body transformation rules configured (`target: "body"`), it automatically returns `true` from this method, forcing buffering so the JSON body can be parsed and rewritten. When only header rules are configured, it returns `false` and works with streaming mode. See [docs/response_body_streaming.md](response_body_streaming.md) for the full streaming architecture.
 
 Add the constant to `src/plugins/mod.rs` in the `priority` module for discoverability:
 
@@ -215,10 +215,10 @@ TLS/DTLS are transport-layer concerns, not separate protocols. A plugin that sup
 | `hmac_auth` | ✓ | ✓ | ✓ | | | Requires HTTP headers |
 | `access_control` | ✓ | ✓ | ✓ | | | Needs consumer identity (auth not available on TCP/UDP) |
 | `rate_limiting` | ✓ | ✓ | ✓ | ✓ | ✓ | Connection/session rate applies everywhere |
-| `request_transformer` | ✓ | ✓ | | | | Modifies HTTP headers/body |
+| `request_transformer` | ✓ | ✓ | | | | Modifies HTTP headers/query/body |
 | `body_validator` | ✓ | ✓ | | | | Validates request and response bodies |
 | `request_termination` | ✓ | ✓ | ✓ | | | Returns HTTP error response |
-| `response_transformer` | ✓ | ✓ | | | | Modifies HTTP response headers |
+| `response_transformer` | ✓ | ✓ | | | | Modifies HTTP response headers/body |
 | `stdout_logging` | ✓ | ✓ | ✓ | ✓ | ✓ | Observability applies everywhere |
 | `correlation_id` | ✓ | ✓ | ✓ | ✓ | ✓ | ID assignment is protocol-agnostic |
 | `http_logging` | ✓ | ✓ | ✓ | ✓ | ✓ | Observability applies everywhere |
@@ -227,6 +227,63 @@ TLS/DTLS are transport-layer concerns, not separate protocols. A plugin that sup
 | `otel_tracing` | ✓ | ✓ | ✓ | ✓ | ✓ | Tracing for all protocols |
 
 Protocol-filtered plugin lists are pre-computed in `PluginCache` at config reload time, so there is zero filtering cost on the hot path.
+
+## Body Transformation
+
+Both `request_transformer` and `response_transformer` support JSON body field manipulation using dot-notation paths. Use `"target": "body"` in the rules array alongside existing header and query rules.
+
+### Configuration
+
+```json
+{
+  "rules": [
+    {"operation": "rename", "target": "body", "key": "user.old_field", "new_key": "user.new_field"},
+    {"operation": "remove", "target": "body", "key": "internal.debug_info"},
+    {"operation": "add", "target": "body", "key": "metadata.version", "value": "v2"},
+    {"operation": "update", "target": "body", "key": "user.role", "value": "admin"}
+  ]
+}
+```
+
+### Dot-Notation Paths
+
+Fields are referenced using dot-delimited paths that navigate nested JSON objects:
+
+| Path | Targets |
+|------|---------|
+| `name` | `{"name": "..."}` |
+| `user.email` | `{"user": {"email": "..."}}` |
+| `a.b.c.d` | `{"a": {"b": {"c": {"d": "..."}}}}` |
+
+### Operations
+
+| Operation | Behavior |
+|-----------|----------|
+| `add` | Insert field only if it doesn't already exist. Creates intermediate objects as needed. |
+| `update` | Always set the field value (overwrites if exists, creates if not). |
+| `remove` | Delete the field at the given path. |
+| `rename` | Move the value from `key` path to `new_key` path (both use dot notation). |
+
+### Value Parsing
+
+String values in the `"value"` field are parsed as JSON when possible:
+- `"42"` → number `42`
+- `"true"` → boolean `true`
+- `"{\"a\":1}"` → object `{"a": 1}`
+- `"hello"` → string `"hello"` (not valid JSON, kept as string)
+
+Non-string JSON values (numbers, booleans, objects, arrays) in the config are used directly.
+
+### Content-Type Awareness
+
+Body transformation only applies to JSON bodies (detected by `Content-Type` containing `application/json` or `+json`). Non-JSON bodies are passed through unchanged.
+
+### Performance Notes
+
+- Body rules are parsed once at config load time, not per-request.
+- When `response_transformer` has body rules, it automatically enables response body buffering for the proxy. Without body rules, responses stream through with zero overhead.
+- `request_transformer` body transformation runs after the request body is collected and before it is sent to the backend (HTTP/1.1 and HTTPS paths).
+- Header, query, and body rules can be mixed in a single plugin configuration.
 
 ## gRPC Compatibility
 

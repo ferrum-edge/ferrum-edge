@@ -1073,21 +1073,30 @@ See [docs/cors_plugin.md](docs/cors_plugin.md) for detailed configuration, reque
 
 #### `request_transformer`
 
-Modifies request headers and query parameters before proxying.
+Modifies request headers, query parameters, and JSON body fields before proxying.
 
 **Config**:
 ```yaml
 config:
   rules:
-    - operation: add     # add, remove, update
-      target: header     # header, query
+    - operation: add       # add, remove, update, rename
+      target: header       # header, query, body
       key: "X-Custom"
       value: "my-value"
+    - operation: rename
+      target: body
+      key: "user.old_field"       # dot-notation for nested JSON
+      new_key: "user.new_field"
+    - operation: remove
+      target: body
+      key: "internal.debug_info"
 ```
+
+Body rules use dot-notation paths (e.g., `user.address.city`) to navigate nested JSON objects. The `add` operation creates intermediate objects as needed. Values are auto-parsed as JSON when possible (`"42"` → number, `"true"` → boolean). Body transformation only applies to `application/json` (or `+json`) content types.
 
 #### `response_transformer`
 
-Modifies response headers before sending to the client.
+Modifies response headers and JSON body fields before sending to the client. When body rules are configured, response body buffering is automatically enabled.
 
 **Config**:
 ```yaml
@@ -1096,7 +1105,16 @@ config:
     - operation: add
       key: "X-Powered-By"
       value: "Ferrum-Gateway"
+    - operation: rename
+      target: body
+      key: "resp_data"
+      new_key: "data"
+    - operation: remove
+      target: body
+      key: "internal_trace_id"
 ```
+
+Header rules default to `target: header` for backwards compatibility (no `target` field required). Body rules require explicit `target: body` and support the same dot-notation paths as `request_transformer`.
 
 #### `rate_limiting`
 

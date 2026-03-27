@@ -2187,6 +2187,7 @@ pub async fn handle_proxy_request(
             proxy_headers,
             req,
             upstream_target.as_ref(),
+            &plugins,
             should_stream,
             &ctx.client_ip,
             is_tls,
@@ -2251,6 +2252,7 @@ pub async fn handle_proxy_request(
             proxy_headers,
             req,
             upstream_target.as_ref(),
+            &plugins,
             should_stream,
             &ctx.client_ip,
             is_tls,
@@ -2365,6 +2367,25 @@ pub async fn handle_proxy_request(
                     response_body = ResponseBody::Buffered(reject_body.into_bytes());
                     break;
                 }
+            }
+        }
+    }
+
+    // transform_response_body hooks — only for buffered responses.
+    // Allows plugins (e.g., response_transformer with body rules) to rewrite
+    // JSON fields in the response body before it is sent to the client.
+    if !plugins.is_empty()
+        && let ResponseBody::Buffered(ref mut data) = response_body
+    {
+        // Clone content-type to avoid borrowing response_headers across the loop.
+        let content_type = response_headers.get("content-type").cloned();
+        let ct_ref = content_type.as_deref();
+        for plugin in plugins.iter() {
+            if let Some(transformed) = plugin.transform_response_body(data, ct_ref).await {
+                // Update Content-Length to reflect the new body size
+                response_headers
+                    .insert("content-length".to_string(), transformed.len().to_string());
+                *data = transformed;
             }
         }
     }
@@ -2749,6 +2770,7 @@ async fn proxy_to_backend(
     headers: &HashMap<String, String>,
     original_req: Request<Incoming>,
     upstream_target: Option<&UpstreamTarget>,
+    #[allow(unused_variables)] plugins: &[Arc<dyn crate::plugins::Plugin>],
     stream_response: bool,
     client_ip: &str,
     is_tls: bool,
@@ -2984,6 +3006,24 @@ async fn proxy_to_backend(
                 }
             }
         };
+
+        // Transform request body via plugins (JSON field rename, add, remove, etc.)
+        let body_bytes =
+            if !body_bytes.is_empty() && plugins.iter().any(|p| p.modifies_request_body()) {
+                let content_type = headers.get("content-type").map(|s| s.as_str());
+                let mut current = body_bytes;
+                for plugin in plugins {
+                    if plugin.modifies_request_body()
+                        && let Some(transformed) =
+                            plugin.transform_request_body(&current, content_type).await
+                    {
+                        current = transformed;
+                    }
+                }
+                current
+            } else {
+                body_bytes
+            };
 
         if !body_bytes.is_empty() {
             req_builder = req_builder.body(body_bytes);

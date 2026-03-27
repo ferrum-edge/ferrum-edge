@@ -1,5 +1,6 @@
 pub mod access_control;
 pub mod basic_auth;
+pub mod body_transform;
 pub mod body_validator;
 pub mod bot_detection;
 pub mod correlation_id;
@@ -282,6 +283,16 @@ pub trait Plugin: Send + Sync {
         false
     }
 
+    /// Returns `true` if this plugin may transform the request body before
+    /// it is sent to the backend. The gateway uses this hint to call
+    /// `transform_request_body` only when needed.
+    ///
+    /// Default is `false`. Override in plugins that rewrite JSON fields,
+    /// rename body keys, etc.
+    fn modifies_request_body(&self) -> bool {
+        false
+    }
+
     /// Called just before the request is proxied to the backend.
     async fn before_proxy(
         &self,
@@ -333,6 +344,40 @@ pub trait Plugin: Send + Sync {
         _body: &[u8],
     ) -> PluginResult {
         PluginResult::Continue
+    }
+
+    /// Transform the request body before it is sent to the backend.
+    ///
+    /// Called after `before_proxy` hooks, only when `modifies_request_body()`
+    /// returns `true` for at least one active plugin. The body bytes are the
+    /// raw request body collected from the client.
+    ///
+    /// Return `Some(new_body)` to replace the body, or `None` to leave it
+    /// unchanged. The `content_type` parameter is extracted from the request
+    /// headers so plugins can decide whether to parse the body.
+    async fn transform_request_body(
+        &self,
+        _body: &[u8],
+        _content_type: Option<&str>,
+    ) -> Option<Vec<u8>> {
+        None
+    }
+
+    /// Transform the response body before it is sent to the client.
+    ///
+    /// Called after `on_response_body` hooks, only for buffered responses
+    /// when `requires_response_body_buffering()` returns `true`. The body
+    /// bytes are the raw backend response body.
+    ///
+    /// Return `Some(new_body)` to replace the body, or `None` to leave it
+    /// unchanged. The `content_type` parameter is extracted from the response
+    /// headers so plugins can decide whether to parse the body.
+    async fn transform_response_body(
+        &self,
+        _body: &[u8],
+        _content_type: Option<&str>,
+    ) -> Option<Vec<u8>> {
+        None
     }
 
     /// Called for transaction logging.
