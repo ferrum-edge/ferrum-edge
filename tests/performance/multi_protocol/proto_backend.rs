@@ -286,28 +286,30 @@ async fn run_h3_server(addr: SocketAddr, server_config: quinn::ServerConfig) -> 
             };
 
             while let Ok(Some(resolver)) = conn.accept().await {
-                let Ok((req, mut stream)) = resolver.resolve_request().await else {
-                    continue;
-                };
-                let (status, body) = match req.uri().path() {
-                    "/health" => (StatusCode::OK, b"{\"status\":\"healthy\"}" as &[u8]),
-                    "/api/users" => (
-                        StatusCode::OK,
-                        b"{\"users\":[{\"id\":1,\"name\":\"Alice\"},{\"id\":2,\"name\":\"Bob\"}]}"
-                            as &[u8],
-                    ),
-                    _ => (StatusCode::NOT_FOUND, b"not found" as &[u8]),
-                };
+                tokio::spawn(async move {
+                    let Ok((req, mut stream)) = resolver.resolve_request().await else {
+                        return;
+                    };
+                    let (status, body) = match req.uri().path() {
+                        "/health" => (StatusCode::OK, b"{\"status\":\"healthy\"}" as &[u8]),
+                        "/api/users" => (
+                            StatusCode::OK,
+                            b"{\"users\":[{\"id\":1,\"name\":\"Alice\"},{\"id\":2,\"name\":\"Bob\"}]}"
+                                as &[u8],
+                        ),
+                        _ => (StatusCode::NOT_FOUND, b"not found" as &[u8]),
+                    };
 
-                let resp = http::Response::builder()
-                    .status(status)
-                    .header("content-type", "application/json")
-                    .body(())
-                    .unwrap();
+                    let resp = http::Response::builder()
+                        .status(status)
+                        .header("content-type", "application/json")
+                        .body(())
+                        .unwrap();
 
-                let _ = stream.send_response(resp).await;
-                let _ = stream.send_data(bytes::Bytes::copy_from_slice(body)).await;
-                let _ = stream.finish().await;
+                    let _ = stream.send_response(resp).await;
+                    let _ = stream.send_data(bytes::Bytes::copy_from_slice(body)).await;
+                    let _ = stream.finish().await;
+                });
             }
         });
     }

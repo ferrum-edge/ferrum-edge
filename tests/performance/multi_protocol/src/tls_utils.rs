@@ -106,10 +106,16 @@ pub fn make_h3_server_config(
 
     tls_cfg.alpn_protocols = vec![b"h3".to_vec()];
 
-    let server_cfg = quinn::ServerConfig::with_crypto(Arc::new(
+    let mut server_cfg = quinn::ServerConfig::with_crypto(Arc::new(
         quinn::crypto::rustls::QuicServerConfig::try_from(tls_cfg)
             .context("quinn crypto config")?,
     ));
+    let mut transport = quinn::TransportConfig::default();
+    transport.max_concurrent_bidi_streams(1024u32.into());
+    transport.stream_receive_window((2 * 1024 * 1024u32).into());
+    transport.receive_window((16 * 1024 * 1024u32).into());
+    transport.send_window(16 * 1024 * 1024);
+    server_cfg.transport_config(Arc::new(transport));
     Ok(server_cfg)
 }
 
@@ -124,7 +130,14 @@ pub fn make_h3_client_config_insecure() -> quinn::ClientConfig {
 
     let quic_cfg =
         quinn::crypto::rustls::QuicClientConfig::try_from(tls_cfg).expect("quic client config");
-    quinn::ClientConfig::new(Arc::new(quic_cfg))
+    let mut client_cfg = quinn::ClientConfig::new(Arc::new(quic_cfg));
+    let mut transport = quinn::TransportConfig::default();
+    transport.max_concurrent_bidi_streams(1024u32.into());
+    transport.stream_receive_window((2 * 1024 * 1024u32).into());
+    transport.receive_window((16 * 1024 * 1024u32).into());
+    transport.send_window(16 * 1024 * 1024);
+    client_cfg.transport_config(Arc::new(transport));
+    client_cfg
 }
 
 // ── NoCertVerifier ───────────────────────────────────────────────────────────

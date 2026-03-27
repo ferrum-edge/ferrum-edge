@@ -119,26 +119,42 @@ impl GrpcConnectionPool {
             .or_insert_with(|| Arc::new(AtomicUsize::new(0)))
             .clone();
         let start = rr.fetch_add(1, Ordering::Relaxed) % shard_count;
+        let selected_key = Self::shard_key(&base_key, start);
 
-        for offset in 0..shard_count {
-            let shard = (start + offset) % shard_count;
-            let key = Self::shard_key(&base_key, shard);
-            if let Some(entry) = self.entries.get(&key) {
-                if !entry.sender.is_closed() {
-                    entry
-                        .last_used_epoch_ms
-                        .store(now_epoch_ms(), Ordering::Relaxed);
-                    return Ok(entry.sender.clone());
-                }
-                drop(entry);
-                self.entries.remove(&key);
+        if let Some(entry) = self.entries.get(&selected_key) {
+            if !entry.sender.is_closed() {
+                entry
+                    .last_used_epoch_ms
+                    .store(now_epoch_ms(), Ordering::Relaxed);
+                return Ok(entry.sender.clone());
             }
+            drop(entry);
+            self.entries.remove(&selected_key);
         }
 
-        // Lazily create the selected shard when none are ready.
-        let key = Self::shard_key(&base_key, start);
-        let sender = self.create_connection(proxy, dns_cache).await?;
-        let sender = match self.entries.entry(key) {
+        // Fill the selected shard eagerly so round-robin distribution actually
+        // materializes multiple backend connections under load.
+        let sender = match self.create_connection(proxy, dns_cache).await {
+            Ok(sender) => sender,
+            Err(err) => {
+                for offset in 1..shard_count {
+                    let shard = (start + offset) % shard_count;
+                    let key = Self::shard_key(&base_key, shard);
+                    if let Some(entry) = self.entries.get(&key) {
+                        if !entry.sender.is_closed() {
+                            entry
+                                .last_used_epoch_ms
+                                .store(now_epoch_ms(), Ordering::Relaxed);
+                            return Ok(entry.sender.clone());
+                        }
+                        drop(entry);
+                        self.entries.remove(&key);
+                    }
+                }
+                return Err(err);
+            }
+        };
+        let sender = match self.entries.entry(selected_key) {
             dashmap::mapref::entry::Entry::Occupied(mut occupied) => {
                 if occupied.get().sender.is_closed() {
                     occupied.insert(GrpcPoolEntry {
