@@ -48,7 +48,7 @@ fn test_proxy() -> Proxy {
 #[test]
 fn test_build_backend_url_strip() {
     let proxy = test_proxy();
-    let url = build_backend_url(&proxy, "/api/v1/users/123", "");
+    let url = build_backend_url(&proxy, "/api/v1/users/123", "", proxy.listen_path.len());
     assert_eq!(url, "http://backend.example.com:3000/users/123");
 }
 
@@ -56,7 +56,7 @@ fn test_build_backend_url_strip() {
 fn test_build_backend_url_no_strip() {
     let mut proxy = test_proxy();
     proxy.strip_listen_path = false;
-    let url = build_backend_url(&proxy, "/api/v1/users/123", "");
+    let url = build_backend_url(&proxy, "/api/v1/users/123", "", proxy.listen_path.len());
     assert_eq!(url, "http://backend.example.com:3000/api/v1/users/123");
 }
 
@@ -64,14 +64,19 @@ fn test_build_backend_url_no_strip() {
 fn test_build_backend_url_with_backend_path() {
     let mut proxy = test_proxy();
     proxy.backend_path = Some("/internal".into());
-    let url = build_backend_url(&proxy, "/api/v1/users", "");
+    let url = build_backend_url(&proxy, "/api/v1/users", "", proxy.listen_path.len());
     assert_eq!(url, "http://backend.example.com:3000/internal/users");
 }
 
 #[test]
 fn test_build_backend_url_with_query() {
     let proxy = test_proxy();
-    let url = build_backend_url(&proxy, "/api/v1/search", "q=hello&page=1");
+    let url = build_backend_url(
+        &proxy,
+        "/api/v1/search",
+        "q=hello&page=1",
+        proxy.listen_path.len(),
+    );
     assert_eq!(url, "http://backend.example.com:3000/search?q=hello&page=1");
 }
 
@@ -99,7 +104,7 @@ fn test_longest_prefix_match() {
     let router = RouterCache::new(&config, 10000);
     let matched = router.find_proxy(None, "/api/v1/users");
     assert!(matched.is_some());
-    assert_eq!(matched.unwrap().id, "long");
+    assert_eq!(matched.unwrap().proxy.id, "long");
 }
 
 #[test]

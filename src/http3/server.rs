@@ -318,12 +318,21 @@ async fn handle_h3_request(
         });
 
     // Route: host + longest prefix match via router cache
-    let matched_proxy = state
+    let route_match = state
         .router_cache
         .find_proxy(request_host.as_deref(), &path);
 
-    let proxy = match matched_proxy {
-        Some(p) => p,
+    let proxy = match route_match {
+        Some(rm) => {
+            // Inject regex path parameters into context metadata and headers
+            for (name, value) in &rm.path_params {
+                ctx.metadata
+                    .insert(format!("path_param.{}", name), value.clone());
+                ctx.headers
+                    .insert(format!("x-path-param-{}", name), value.clone());
+            }
+            rm.proxy
+        }
         None => {
             record_request(&state, 404);
             send_h3_response(
@@ -514,7 +523,8 @@ async fn handle_h3_request(
     }
 
     // Build backend URL and proxy
-    let backend_url = crate::proxy::build_backend_url(&proxy, &path, &query_string);
+    let backend_url =
+        crate::proxy::build_backend_url(&proxy, &path, &query_string, proxy.listen_path.len());
     let backend_start = std::time::Instant::now();
 
     let (response_status, response_body, mut response_headers, h3_error_class) =

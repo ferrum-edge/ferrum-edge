@@ -646,6 +646,44 @@ impl GatewayConfig {
         }
     }
 
+    /// Validate that regex listen_paths compile correctly.
+    ///
+    /// Listen paths starting with `~` are treated as regex patterns. The `~`
+    /// prefix is stripped and the remainder is compiled as a regex (auto-anchored
+    /// with `^` if not already). Compilation errors are reported here at config
+    /// load time rather than silently skipping routes at runtime.
+    pub fn validate_regex_listen_paths(&self) -> Result<(), Vec<String>> {
+        let mut errors = Vec::new();
+        for proxy in &self.proxies {
+            if proxy.listen_path.starts_with('~') {
+                let pattern = &proxy.listen_path[1..];
+                if pattern.is_empty() {
+                    errors.push(format!(
+                        "Proxy '{}': regex listen_path '~' has empty pattern",
+                        proxy.id
+                    ));
+                    continue;
+                }
+                let anchored = if pattern.starts_with('^') {
+                    pattern.to_string()
+                } else {
+                    format!("^{}", pattern)
+                };
+                if let Err(e) = Regex::new(&anchored) {
+                    errors.push(format!(
+                        "Proxy '{}': invalid regex listen_path '{}': {}",
+                        proxy.id, proxy.listen_path, e
+                    ));
+                }
+            }
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+
     /// Normalize all proxy host entries to lowercase.
     pub fn normalize_hosts(&mut self) {
         for proxy in &mut self.proxies {

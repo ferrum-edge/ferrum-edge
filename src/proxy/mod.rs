@@ -1537,7 +1537,7 @@ pub async fn log_rejected_request(
         matched_proxy_id: proxy.map(|p| p.id.clone()),
         matched_proxy_name: proxy.and_then(|p| p.name.clone()),
         backend_target_url: proxy.map(|p| {
-            let url = build_backend_url(p, &ctx.path, "");
+            let url = build_backend_url(p, &ctx.path, "", p.listen_path.len());
             strip_query_params(&url).to_string()
         }),
         backend_resolved_ip: None,
@@ -1674,12 +1674,21 @@ pub async fn handle_proxy_request(
         });
 
     // Route: host + longest prefix match via router cache (O(1) cache hit, pre-sorted fallback)
-    let matched_proxy = state
+    let route_match = state
         .router_cache
         .find_proxy(request_host.as_deref(), &path);
 
-    let proxy = match matched_proxy {
-        Some(p) => p,
+    let (proxy, strip_len) = match route_match {
+        Some(rm) => {
+            // Inject regex path parameters into context metadata and headers
+            for (name, value) in &rm.path_params {
+                ctx.metadata
+                    .insert(format!("path_param.{}", name), value.clone());
+                ctx.headers
+                    .insert(format!("x-path-param-{}", name), value.clone());
+            }
+            (rm.proxy, rm.matched_prefix_len)
+        }
         None => {
             debug!(path = %path, client_ip = %ctx.client_ip, "No route matched for request path");
             state.request_count.fetch_add(1, Ordering::Relaxed);
@@ -1918,7 +1927,7 @@ pub async fn handle_proxy_request(
             BackendProtocol::Grpc | BackendProtocol::Grpcs
         )
     {
-        let backend_url = build_backend_url(&proxy, &path, &query_string);
+        let backend_url = build_backend_url(&proxy, &path, &query_string, strip_len);
         let backend_start = Instant::now();
 
         let grpc_result = grpc_proxy::proxy_grpc_request(
@@ -2061,7 +2070,7 @@ pub async fn handle_proxy_request(
                             matched_proxy_id: proxy_ref.map(|p| p.id.clone()),
                             matched_proxy_name: proxy_ref.and_then(|p| p.name.clone()),
                             backend_target_url: proxy_ref.map(|p| {
-                                let url = build_backend_url(p, &ctx.path, "");
+                                let url = build_backend_url(p, &ctx.path, "", p.listen_path.len());
                                 strip_query_params(&url).to_string()
                             }),
                             backend_resolved_ip: None,
@@ -2153,8 +2162,14 @@ pub async fn handle_proxy_request(
         (proxy.backend_host.as_str(), proxy.backend_port)
     };
 
-    let backend_url =
-        build_backend_url_with_target(&proxy, &path, &query_string, effective_host, effective_port);
+    let backend_url = build_backend_url_with_target(
+        &proxy,
+        &path,
+        &query_string,
+        effective_host,
+        effective_port,
+        strip_len,
+    );
     let backend_start = Instant::now();
 
     // Track connection for least-connections load balancing
@@ -2214,6 +2229,7 @@ pub async fn handle_proxy_request(
                     &query_string,
                     &next.host,
                     next.port,
+                    strip_len,
                 );
                 current_target = Some(next);
             }
@@ -2510,17 +2526,28 @@ pub async fn handle_proxy_request(
 }
 
 /// Build the backend URL based on proxy config and path forwarding logic.
-pub fn build_backend_url(proxy: &Proxy, incoming_path: &str, query_string: &str) -> String {
+pub fn build_backend_url(
+    proxy: &Proxy,
+    incoming_path: &str,
+    query_string: &str,
+    strip_len: usize,
+) -> String {
     build_backend_url_with_target(
         proxy,
         incoming_path,
         query_string,
         &proxy.backend_host,
         proxy.backend_port,
+        strip_len,
     )
 }
 
 /// Build backend URL using a specific host and port (for load-balanced targets).
+///
+/// `strip_len` is the number of bytes to strip from the start of `incoming_path`
+/// when `proxy.strip_listen_path` is true. For prefix routes this equals
+/// `proxy.listen_path.len()`; for regex routes it is the regex match length
+/// (from `RouteMatch::matched_prefix_len`).
 ///
 /// Uses a single `String` buffer to avoid intermediate allocations from
 /// multiple `format!` calls.
@@ -2530,6 +2557,7 @@ pub fn build_backend_url_with_target(
     query_string: &str,
     host: &str,
     port: u16,
+    strip_len: usize,
 ) -> String {
     use std::fmt::Write;
 
@@ -2545,7 +2573,7 @@ pub fn build_backend_url_with_target(
     };
 
     let remaining_path = if proxy.strip_listen_path {
-        incoming_path.strip_prefix(&proxy.listen_path).unwrap_or("")
+        &incoming_path[strip_len.min(incoming_path.len())..]
     } else {
         incoming_path
     };

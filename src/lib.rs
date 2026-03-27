@@ -27,4 +27,4 @@ pub use consumer_index::ConsumerIndex;
 pub use load_balancer::LoadBalancerCache;
 pub use plugin_cache::PluginCache;
 pub use proxy::build_backend_url;
-pub use router_cache::RouterCache;
+pub use router_cache::{RouteMatch, RouterCache};

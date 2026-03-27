@@ -237,6 +237,14 @@ impl DatabaseStore {
         // Normalize host entries to lowercase
         config.normalize_hosts();
 
+        // Validate regex listen_paths compile correctly
+        if let Err(errors) = config.validate_regex_listen_paths() {
+            for msg in &errors {
+                error!("{}", msg);
+            }
+            anyhow::bail!("Database has invalid regex listen_path(s)");
+        }
+
         if let Err(dupes) = config.validate_unique_listen_paths() {
             for msg in &dupes {
                 error!("{}", msg);

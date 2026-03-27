@@ -71,7 +71,7 @@ fn test_longest_prefix_match_two_routes() {
 
     let matched = cache.find_proxy(None, "/api/v1/users");
     assert!(matched.is_some());
-    assert_eq!(matched.unwrap().id, "long");
+    assert_eq!(matched.unwrap().proxy.id, "long");
 }
 
 #[test]
@@ -85,15 +85,15 @@ fn test_longest_prefix_match_three_routes() {
 
     // Should match /api/v1/users (longest)
     let matched = cache.find_proxy(None, "/api/v1/users/123");
-    assert_eq!(matched.unwrap().id, "long");
+    assert_eq!(matched.unwrap().proxy.id, "long");
 
     // Should match /api/v1 (not /api or /api/v1/users)
     let matched = cache.find_proxy(None, "/api/v1/products");
-    assert_eq!(matched.unwrap().id, "medium");
+    assert_eq!(matched.unwrap().proxy.id, "medium");
 
     // Should match /api
     let matched = cache.find_proxy(None, "/api/v2/other");
-    assert_eq!(matched.unwrap().id, "short");
+    assert_eq!(matched.unwrap().proxy.id, "short");
 }
 
 #[test]
@@ -103,15 +103,15 @@ fn test_root_path_catch_all() {
 
     // /api path should match the specific /api proxy
     let matched = cache.find_proxy(None, "/api/anything");
-    assert_eq!(matched.unwrap().id, "api");
+    assert_eq!(matched.unwrap().proxy.id, "api");
 
     // /other should fall through to root catch-all
     let matched = cache.find_proxy(None, "/other/path");
-    assert_eq!(matched.unwrap().id, "root");
+    assert_eq!(matched.unwrap().proxy.id, "root");
 
     // Bare / should match root
     let matched = cache.find_proxy(None, "/");
-    assert_eq!(matched.unwrap().id, "root");
+    assert_eq!(matched.unwrap().proxy.id, "root");
 }
 
 #[test]
@@ -121,7 +121,7 @@ fn test_exact_match_path_equals_listen_path() {
 
     let matched = cache.find_proxy(None, "/api/v1");
     assert!(matched.is_some());
-    assert_eq!(matched.unwrap().id, "exact");
+    assert_eq!(matched.unwrap().proxy.id, "exact");
 }
 
 #[test]
@@ -149,7 +149,7 @@ fn test_single_proxy() {
     let cache = RouterCache::new(&config, 100);
 
     let matched = cache.find_proxy(None, "/service/endpoint");
-    assert_eq!(matched.unwrap().id, "only");
+    assert_eq!(matched.unwrap().proxy.id, "only");
 }
 
 #[test]
@@ -169,8 +169,8 @@ fn test_proxy_order_independence() {
 
     let m1 = cache1.find_proxy(None, "/api/v1/users");
     let m2 = cache2.find_proxy(None, "/api/v1/users");
-    assert_eq!(m1.unwrap().id, "long");
-    assert_eq!(m2.unwrap().id, "long");
+    assert_eq!(m1.unwrap().proxy.id, "long");
+    assert_eq!(m2.unwrap().proxy.id, "long");
 }
 
 // ============================================================
@@ -185,8 +185,8 @@ fn test_e2e_strip_listen_path_basic() {
     let config = test_config(vec![test_proxy("api", "/api/v1")]);
     let cache = RouterCache::new(&config, 100);
 
-    let proxy = cache.find_proxy(None, "/api/v1/users/123").unwrap();
-    let url = build_backend_url(&proxy, "/api/v1/users/123", "");
+    let rm = cache.find_proxy(None, "/api/v1/users/123").unwrap();
+    let url = build_backend_url(&rm.proxy, "/api/v1/users/123", "", rm.matched_prefix_len);
     assert_eq!(url, "http://backend.example.com:3000/users/123");
 }
 
@@ -197,8 +197,8 @@ fn test_e2e_no_strip_listen_path() {
     let config = test_config(vec![proxy]);
     let cache = RouterCache::new(&config, 100);
 
-    let proxy = cache.find_proxy(None, "/api/v1/users/123").unwrap();
-    let url = build_backend_url(&proxy, "/api/v1/users/123", "");
+    let rm = cache.find_proxy(None, "/api/v1/users/123").unwrap();
+    let url = build_backend_url(&rm.proxy, "/api/v1/users/123", "", rm.matched_prefix_len);
     assert_eq!(url, "http://backend.example.com:3000/api/v1/users/123");
 }
 
@@ -212,8 +212,8 @@ fn test_e2e_with_backend_path() {
     let config = test_config(vec![proxy]);
     let cache = RouterCache::new(&config, 100);
 
-    let proxy = cache.find_proxy(None, "/api/v1/users/123").unwrap();
-    let url = build_backend_url(&proxy, "/api/v1/users/123", "");
+    let rm = cache.find_proxy(None, "/api/v1/users/123").unwrap();
+    let url = build_backend_url(&rm.proxy, "/api/v1/users/123", "", rm.matched_prefix_len);
     assert_eq!(url, "http://backend.example.com:3000/internal/users/123");
 }
 
@@ -227,8 +227,8 @@ fn test_e2e_backend_path_with_nested_listen_path() {
     let config = test_config(vec![proxy]);
     let cache = RouterCache::new(&config, 100);
 
-    let proxy = cache.find_proxy(None, "/api/v1/users/123").unwrap();
-    let url = build_backend_url(&proxy, "/api/v1/users/123", "");
+    let rm = cache.find_proxy(None, "/api/v1/users/123").unwrap();
+    let url = build_backend_url(&rm.proxy, "/api/v1/users/123", "", rm.matched_prefix_len);
     assert_eq!(url, "http://backend.example.com:3000/v2/v1/users/123");
 }
 
@@ -237,8 +237,13 @@ fn test_e2e_query_string_preserved() {
     let config = test_config(vec![test_proxy("api", "/api")]);
     let cache = RouterCache::new(&config, 100);
 
-    let proxy = cache.find_proxy(None, "/api/search").unwrap();
-    let url = build_backend_url(&proxy, "/api/search", "q=hello&page=1");
+    let rm = cache.find_proxy(None, "/api/search").unwrap();
+    let url = build_backend_url(
+        &rm.proxy,
+        "/api/search",
+        "q=hello&page=1",
+        rm.matched_prefix_len,
+    );
     assert_eq!(url, "http://backend.example.com:3000/search?q=hello&page=1");
 }
 
@@ -248,8 +253,8 @@ fn test_e2e_trailing_slash_on_listen_path() {
     let config = test_config(vec![test_proxy("api", "/api/v1")]);
     let cache = RouterCache::new(&config, 100);
 
-    let proxy = cache.find_proxy(None, "/api/v1/").unwrap();
-    let url = build_backend_url(&proxy, "/api/v1/", "");
+    let rm = cache.find_proxy(None, "/api/v1/").unwrap();
+    let url = build_backend_url(&rm.proxy, "/api/v1/", "", rm.matched_prefix_len);
     assert_eq!(url, "http://backend.example.com:3000/");
 }
 
@@ -268,13 +273,13 @@ fn test_e2e_multiple_proxies_different_backends() {
     let cache = RouterCache::new(&config, 100);
 
     // Users API
-    let proxy = cache.find_proxy(None, "/api/users/123").unwrap();
-    let url = build_backend_url(&proxy, "/api/users/123", "");
+    let rm = cache.find_proxy(None, "/api/users/123").unwrap();
+    let url = build_backend_url(&rm.proxy, "/api/users/123", "", rm.matched_prefix_len);
     assert_eq!(url, "http://users-service.internal:8001/123");
 
     // Products API with backend_path
-    let proxy = cache.find_proxy(None, "/api/products/456").unwrap();
-    let url = build_backend_url(&proxy, "/api/products/456", "");
+    let rm = cache.find_proxy(None, "/api/products/456").unwrap();
+    let url = build_backend_url(&rm.proxy, "/api/products/456", "", rm.matched_prefix_len);
     assert_eq!(url, "http://products-service.internal:8002/v2/456");
 }
 
@@ -285,8 +290,8 @@ fn test_e2e_https_backend_protocol() {
     let config = test_config(vec![proxy]);
     let cache = RouterCache::new(&config, 100);
 
-    let proxy = cache.find_proxy(None, "/api/data").unwrap();
-    let url = build_backend_url(&proxy, "/api/data", "");
+    let rm = cache.find_proxy(None, "/api/data").unwrap();
+    let url = build_backend_url(&rm.proxy, "/api/data", "", rm.matched_prefix_len);
     assert_eq!(url, "https://backend.example.com:3000/data");
 }
 
@@ -297,8 +302,8 @@ fn test_e2e_websocket_protocol() {
     let config = test_config(vec![proxy]);
     let cache = RouterCache::new(&config, 100);
 
-    let proxy = cache.find_proxy(None, "/ws/chat").unwrap();
-    let url = build_backend_url(&proxy, "/ws/chat", "");
+    let rm = cache.find_proxy(None, "/ws/chat").unwrap();
+    let url = build_backend_url(&rm.proxy, "/ws/chat", "", rm.matched_prefix_len);
     assert_eq!(url, "http://backend.example.com:3000/chat");
 }
 
@@ -309,8 +314,8 @@ fn test_e2e_grpc_protocol() {
     let config = test_config(vec![proxy]);
     let cache = RouterCache::new(&config, 100);
 
-    let proxy = cache.find_proxy(None, "/grpc/service.Method").unwrap();
-    let url = build_backend_url(&proxy, "/grpc/service.Method", "");
+    let rm = cache.find_proxy(None, "/grpc/service.Method").unwrap();
+    let url = build_backend_url(&rm.proxy, "/grpc/service.Method", "", rm.matched_prefix_len);
     assert_eq!(url, "http://backend.example.com:3000/service.Method");
 }
 
@@ -334,7 +339,7 @@ fn test_cache_hit_returns_same_result_as_scan() {
     let second = cache.find_proxy(None, "/api/v1/users");
     assert_eq!(cache.cache_len(), 1);
 
-    assert_eq!(first.unwrap().id, second.unwrap().id);
+    assert_eq!(first.unwrap().proxy.id, second.unwrap().proxy.id);
 }
 
 #[test]
@@ -374,7 +379,7 @@ fn test_rebuild_clears_cache_and_uses_new_routes() {
 
     // Populate cache
     let matched = cache.find_proxy(None, "/api/v1/users");
-    assert_eq!(matched.unwrap().id, "v1");
+    assert_eq!(matched.unwrap().proxy.id, "v1");
     assert_eq!(cache.cache_len(), 1);
 
     // Rebuild with different config
@@ -390,7 +395,7 @@ fn test_rebuild_clears_cache_and_uses_new_routes() {
 
     // New route should match
     let matched = cache.find_proxy(None, "/api/v2/users");
-    assert_eq!(matched.unwrap().id, "v2");
+    assert_eq!(matched.unwrap().proxy.id, "v2");
 }
 
 #[test]
@@ -439,9 +444,9 @@ async fn test_concurrent_find_proxy() {
             let result = cache.find_proxy(None, path);
             assert!(result.is_some());
             if i % 2 == 0 {
-                assert_eq!(result.unwrap().id, "api");
+                assert_eq!(result.unwrap().proxy.id, "api");
             } else {
-                assert_eq!(result.unwrap().id, "web");
+                assert_eq!(result.unwrap().proxy.id, "web");
             }
         }));
     }
@@ -463,7 +468,7 @@ fn test_double_slashes_in_path() {
 
     let matched = cache.find_proxy(None, "/api//v1//users");
     assert!(matched.is_some());
-    assert_eq!(matched.unwrap().id, "api");
+    assert_eq!(matched.unwrap().proxy.id, "api");
 }
 
 #[test]
@@ -475,7 +480,7 @@ fn test_very_long_path() {
     let path = format!("/api/{}", long_suffix);
     let matched = cache.find_proxy(None, &path);
     assert!(matched.is_some());
-    assert_eq!(matched.unwrap().id, "api");
+    assert_eq!(matched.unwrap().proxy.id, "api");
 }
 
 #[test]
@@ -495,8 +500,8 @@ fn test_e2e_exact_listen_path_no_remaining() {
     let config = test_config(vec![test_proxy("api", "/api/v1")]);
     let cache = RouterCache::new(&config, 100);
 
-    let proxy = cache.find_proxy(None, "/api/v1").unwrap();
-    let url = build_backend_url(&proxy, "/api/v1", "");
+    let rm = cache.find_proxy(None, "/api/v1").unwrap();
+    let url = build_backend_url(&rm.proxy, "/api/v1", "", rm.matched_prefix_len);
     assert_eq!(url, "http://backend.example.com:3000/");
 }
 
@@ -520,10 +525,10 @@ fn test_host_exact_match_with_path() {
     let cache = RouterCache::new(&config, 100);
 
     let matched = cache.find_proxy(Some("api.example.com"), "/users");
-    assert_eq!(matched.unwrap().id, "api");
+    assert_eq!(matched.unwrap().proxy.id, "api");
 
     let matched = cache.find_proxy(Some("admin.example.com"), "/users");
-    assert_eq!(matched.unwrap().id, "admin");
+    assert_eq!(matched.unwrap().proxy.id, "admin");
 }
 
 #[test]
@@ -536,10 +541,10 @@ fn test_host_wildcard_match() {
     let cache = RouterCache::new(&config, 100);
 
     let matched = cache.find_proxy(Some("api.example.com"), "/");
-    assert_eq!(matched.unwrap().id, "wildcard");
+    assert_eq!(matched.unwrap().proxy.id, "wildcard");
 
     let matched = cache.find_proxy(Some("admin.example.com"), "/path");
-    assert_eq!(matched.unwrap().id, "wildcard");
+    assert_eq!(matched.unwrap().proxy.id, "wildcard");
 }
 
 #[test]
@@ -583,11 +588,11 @@ fn test_host_priority_exact_over_wildcard() {
 
     // Exact host should take priority over wildcard
     let matched = cache.find_proxy(Some("api.example.com"), "/");
-    assert_eq!(matched.unwrap().id, "exact");
+    assert_eq!(matched.unwrap().proxy.id, "exact");
 
     // Non-exact should fall through to wildcard
     let matched = cache.find_proxy(Some("other.example.com"), "/");
-    assert_eq!(matched.unwrap().id, "wildcard");
+    assert_eq!(matched.unwrap().proxy.id, "wildcard");
 }
 
 #[test]
@@ -603,11 +608,11 @@ fn test_host_priority_wildcard_over_catchall() {
 
     // Wildcard should take priority over catch-all
     let matched = cache.find_proxy(Some("api.example.com"), "/");
-    assert_eq!(matched.unwrap().id, "wildcard");
+    assert_eq!(matched.unwrap().proxy.id, "wildcard");
 
     // Unmatched host should fall through to catch-all
     let matched = cache.find_proxy(Some("other.org"), "/");
-    assert_eq!(matched.unwrap().id, "catchall");
+    assert_eq!(matched.unwrap().proxy.id, "catchall");
 }
 
 #[test]
@@ -617,13 +622,13 @@ fn test_no_host_proxy_matches_all_hosts() {
     let cache = RouterCache::new(&config, 100);
 
     let matched = cache.find_proxy(Some("api.example.com"), "/api/users");
-    assert_eq!(matched.unwrap().id, "catchall");
+    assert_eq!(matched.unwrap().proxy.id, "catchall");
 
     let matched = cache.find_proxy(Some("anything.org"), "/api/users");
-    assert_eq!(matched.unwrap().id, "catchall");
+    assert_eq!(matched.unwrap().proxy.id, "catchall");
 
     let matched = cache.find_proxy(None, "/api/users");
-    assert_eq!(matched.unwrap().id, "catchall");
+    assert_eq!(matched.unwrap().proxy.id, "catchall");
 }
 
 #[test]
@@ -638,7 +643,7 @@ fn test_host_with_port_stripped() {
     let cache = RouterCache::new(&config, 100);
 
     let matched = cache.find_proxy(Some("api.example.com"), "/");
-    assert_eq!(matched.unwrap().id, "api");
+    assert_eq!(matched.unwrap().proxy.id, "api");
 }
 
 #[test]
@@ -653,7 +658,7 @@ fn test_host_case_insensitive() {
     let cache = RouterCache::new(&config, 100);
 
     let matched = cache.find_proxy(Some("api.example.com"), "/");
-    assert_eq!(matched.unwrap().id, "api");
+    assert_eq!(matched.unwrap().proxy.id, "api");
 }
 
 #[test]
@@ -669,10 +674,10 @@ fn test_same_path_different_hosts() {
     let cache = RouterCache::new(&config, 100);
 
     let matched = cache.find_proxy(Some("api.example.com"), "/users");
-    assert_eq!(matched.unwrap().id, "api");
+    assert_eq!(matched.unwrap().proxy.id, "api");
 
     let matched = cache.find_proxy(Some("admin.example.com"), "/users");
-    assert_eq!(matched.unwrap().id, "admin");
+    assert_eq!(matched.unwrap().proxy.id, "admin");
 }
 
 #[test]
@@ -717,7 +722,7 @@ fn test_rebuild_clears_host_path_cache() {
 
     // New host should match
     let matched = cache.find_proxy(Some("new.example.com"), "/users");
-    assert_eq!(matched.unwrap().id, "new-api");
+    assert_eq!(matched.unwrap().proxy.id, "new-api");
 }
 
 #[test]
@@ -732,15 +737,15 @@ fn test_host_with_path_matching_combined() {
 
     // api.example.com + /api/v1 → api-v1
     let matched = cache.find_proxy(Some("api.example.com"), "/api/v1/users");
-    assert_eq!(matched.unwrap().id, "api-v1");
+    assert_eq!(matched.unwrap().proxy.id, "api-v1");
 
     // api.example.com + /api/v2 → api-v2
     let matched = cache.find_proxy(Some("api.example.com"), "/api/v2/users");
-    assert_eq!(matched.unwrap().id, "api-v2");
+    assert_eq!(matched.unwrap().proxy.id, "api-v2");
 
     // admin.example.com + any path → admin-root
     let matched = cache.find_proxy(Some("admin.example.com"), "/dashboard");
-    assert_eq!(matched.unwrap().id, "admin-root");
+    assert_eq!(matched.unwrap().proxy.id, "admin-root");
 
     // api.example.com + unmatched path → no match (no catch-all for this host)
     let matched = cache.find_proxy(Some("api.example.com"), "/other");
@@ -758,10 +763,10 @@ fn test_multiple_hosts_on_single_proxy() {
     let cache = RouterCache::new(&config, 100);
 
     let matched = cache.find_proxy(Some("api.example.com"), "/");
-    assert_eq!(matched.unwrap().id, "multi");
+    assert_eq!(matched.unwrap().proxy.id, "multi");
 
     let matched = cache.find_proxy(Some("api.example.org"), "/");
-    assert_eq!(matched.unwrap().id, "multi");
+    assert_eq!(matched.unwrap().proxy.id, "multi");
 
     let matched = cache.find_proxy(Some("other.com"), "/");
     assert!(matched.is_none());
@@ -777,7 +782,7 @@ fn test_no_host_header_falls_to_catchall() {
 
     // No Host header → skip exact/wildcard tiers, match catch-all
     let matched = cache.find_proxy(None, "/users");
-    assert_eq!(matched.unwrap().id, "catchall");
+    assert_eq!(matched.unwrap().proxy.id, "catchall");
 }
 
 #[test]
@@ -792,17 +797,498 @@ fn test_full_priority_chain() {
 
     // Exact match wins
     let matched = cache.find_proxy(Some("api.example.com"), "/api/users");
-    assert_eq!(matched.unwrap().id, "exact");
+    assert_eq!(matched.unwrap().proxy.id, "exact");
 
     // Wildcard match (not exact)
     let matched = cache.find_proxy(Some("other.example.com"), "/api/users");
-    assert_eq!(matched.unwrap().id, "wildcard");
+    assert_eq!(matched.unwrap().proxy.id, "wildcard");
 
     // No match in exact or wildcard → catch-all
     let matched = cache.find_proxy(Some("other.org"), "/api/users");
-    assert_eq!(matched.unwrap().id, "catchall");
+    assert_eq!(matched.unwrap().proxy.id, "catchall");
 
     // No host → catch-all
     let matched = cache.find_proxy(None, "/api/users");
-    assert_eq!(matched.unwrap().id, "catchall");
+    assert_eq!(matched.unwrap().proxy.id, "catchall");
+}
+
+// ============================================================
+// Regex path routing
+// ============================================================
+
+/// Helper to create a test proxy with a regex listen_path.
+fn test_regex_proxy(id: &str, regex_path: &str) -> Proxy {
+    let mut p = test_proxy(id, &format!("~{}", regex_path));
+    p.backend_host = "regex-backend".into();
+    p
+}
+
+#[test]
+fn test_regex_basic_match() {
+    let config = test_config(vec![test_regex_proxy(
+        "user-orders",
+        r"/users/[^/]+/orders",
+    )]);
+    let cache = RouterCache::new(&config, 100);
+
+    let matched = cache.find_proxy(None, "/users/42/orders");
+    assert!(matched.is_some());
+    assert_eq!(matched.unwrap().proxy.id, "user-orders");
+}
+
+#[test]
+fn test_regex_no_match() {
+    let config = test_config(vec![test_regex_proxy(
+        "user-orders",
+        r"/users/[^/]+/orders",
+    )]);
+    let cache = RouterCache::new(&config, 100);
+
+    // Path doesn't match the regex
+    let matched = cache.find_proxy(None, "/products/42/orders");
+    assert!(matched.is_none());
+}
+
+#[test]
+fn test_regex_named_captures() {
+    let config = test_config(vec![test_regex_proxy(
+        "user-orders",
+        r"/users/(?P<user_id>[^/]+)/orders/(?P<order_id>[^/]+)",
+    )]);
+    let cache = RouterCache::new(&config, 100);
+
+    let matched = cache.find_proxy(None, "/users/42/orders/99/details");
+    assert!(matched.is_some());
+    let rm = matched.unwrap();
+    assert_eq!(rm.proxy.id, "user-orders");
+    assert_eq!(rm.path_params.len(), 2);
+    assert!(
+        rm.path_params
+            .contains(&("user_id".to_string(), "42".to_string()))
+    );
+    assert!(
+        rm.path_params
+            .contains(&("order_id".to_string(), "99".to_string()))
+    );
+}
+
+#[test]
+fn test_regex_matched_prefix_len() {
+    let config = test_config(vec![test_regex_proxy(
+        "user-orders",
+        r"/users/[^/]+/orders",
+    )]);
+    let cache = RouterCache::new(&config, 100);
+
+    let matched = cache.find_proxy(None, "/users/42/orders/pending");
+    let rm = matched.unwrap();
+    // The regex matches "/users/42/orders" (19 chars)
+    assert_eq!(rm.matched_prefix_len, "/users/42/orders".len());
+}
+
+#[test]
+fn test_prefix_beats_regex() {
+    // Prefix routes always take priority over regex routes
+    let config = test_config(vec![
+        test_proxy("prefix", "/users"),
+        test_regex_proxy("regex", r"/users/[^/]+/orders"),
+    ]);
+    let cache = RouterCache::new(&config, 100);
+
+    // This matches both the prefix /users and the regex pattern
+    let matched = cache.find_proxy(None, "/users/42/orders");
+    assert_eq!(matched.unwrap().proxy.id, "prefix");
+}
+
+#[test]
+fn test_regex_fallback_when_no_prefix() {
+    // Regex routes are checked when no prefix route matches
+    let config = test_config(vec![
+        test_proxy("api", "/api"),
+        test_regex_proxy("user-orders", r"/users/[^/]+/orders"),
+    ]);
+    let cache = RouterCache::new(&config, 100);
+
+    // /api matches the prefix route
+    let matched = cache.find_proxy(None, "/api/test");
+    assert_eq!(matched.unwrap().proxy.id, "api");
+
+    // /users/42/orders doesn't match /api, falls through to regex
+    let matched = cache.find_proxy(None, "/users/42/orders");
+    assert_eq!(matched.unwrap().proxy.id, "user-orders");
+}
+
+#[test]
+fn test_regex_with_remaining_path() {
+    // Regex match with additional path segments after the matched portion
+    let config = test_config(vec![test_regex_proxy(
+        "user-orders",
+        r"/users/[^/]+/orders",
+    )]);
+    let cache = RouterCache::new(&config, 100);
+
+    let matched = cache.find_proxy(None, "/users/42/orders/99/items");
+    assert!(matched.is_some());
+    assert_eq!(matched.unwrap().proxy.id, "user-orders");
+}
+
+#[test]
+fn test_regex_cache_separation() {
+    // Regex matches use the regex cache, prefix matches use the prefix cache
+    let config = test_config(vec![
+        test_proxy("api", "/api"),
+        test_regex_proxy("user-orders", r"/users/[^/]+/orders"),
+    ]);
+    let cache = RouterCache::new(&config, 100);
+
+    // Prefix match → prefix cache
+    cache.find_proxy(None, "/api/test");
+    assert_eq!(cache.cache_len(), 1);
+    assert_eq!(cache.regex_cache_len(), 0);
+
+    // Regex match → regex cache
+    cache.find_proxy(None, "/users/42/orders");
+    assert_eq!(cache.cache_len(), 1); // prefix cache unchanged
+    assert_eq!(cache.regex_cache_len(), 1);
+
+    // Different regex path → another regex cache entry
+    cache.find_proxy(None, "/users/99/orders");
+    assert_eq!(cache.cache_len(), 1);
+    assert_eq!(cache.regex_cache_len(), 2);
+}
+
+#[test]
+fn test_regex_cache_hit() {
+    let config = test_config(vec![test_regex_proxy(
+        "user-orders",
+        r"/users/(?P<user_id>[^/]+)/orders",
+    )]);
+    let cache = RouterCache::new(&config, 100);
+
+    // First call: cache miss → regex scan
+    let first = cache.find_proxy(None, "/users/42/orders");
+    assert_eq!(cache.regex_cache_len(), 1);
+
+    // Second call: cache hit (same path)
+    let second = cache.find_proxy(None, "/users/42/orders");
+    assert_eq!(cache.regex_cache_len(), 1); // no new entry
+
+    assert_eq!(first.unwrap().proxy.id, second.unwrap().proxy.id);
+}
+
+#[test]
+fn test_regex_negative_cache() {
+    // When neither prefix nor regex matches, a negative entry goes in the prefix cache
+    let config = test_config(vec![
+        test_proxy("api", "/api"),
+        test_regex_proxy("user-orders", r"/users/[^/]+/orders"),
+    ]);
+    let cache = RouterCache::new(&config, 100);
+
+    let matched = cache.find_proxy(None, "/unknown/path");
+    assert!(matched.is_none());
+    // Negative entry is in the prefix cache
+    assert_eq!(cache.cache_len(), 1);
+    assert_eq!(cache.regex_cache_len(), 0);
+}
+
+#[test]
+fn test_regex_auto_anchor() {
+    // Regex should only match from the start of the path (auto-anchored with ^)
+    let config = test_config(vec![test_regex_proxy("users", r"/users/[^/]+")]);
+    let cache = RouterCache::new(&config, 100);
+
+    // Should match — starts with /users/
+    let matched = cache.find_proxy(None, "/users/42");
+    assert!(matched.is_some());
+
+    // Should NOT match — /users is not at the start
+    let matched = cache.find_proxy(None, "/api/users/42");
+    assert!(matched.is_none());
+}
+
+#[test]
+fn test_regex_with_host_routing() {
+    // Regex routes work with host-based routing tiers
+    let mut regex_proxy = test_regex_proxy("user-api", r"/users/[^/]+");
+    regex_proxy.hosts = vec!["api.example.com".to_string()];
+
+    let config = test_config(vec![regex_proxy]);
+    let cache = RouterCache::new(&config, 100);
+
+    // Matches exact host + regex path
+    let matched = cache.find_proxy(Some("api.example.com"), "/users/42");
+    assert_eq!(matched.unwrap().proxy.id, "user-api");
+
+    // Wrong host → no match
+    let matched = cache.find_proxy(Some("other.com"), "/users/42");
+    assert!(matched.is_none());
+}
+
+#[test]
+fn test_regex_with_wildcard_host() {
+    let mut regex_proxy = test_regex_proxy("user-api", r"/users/[^/]+");
+    regex_proxy.hosts = vec!["*.example.com".to_string()];
+
+    let config = test_config(vec![regex_proxy]);
+    let cache = RouterCache::new(&config, 100);
+
+    let matched = cache.find_proxy(Some("api.example.com"), "/users/42");
+    assert_eq!(matched.unwrap().proxy.id, "user-api");
+
+    let matched = cache.find_proxy(Some("admin.example.com"), "/users/42");
+    assert_eq!(matched.unwrap().proxy.id, "user-api");
+}
+
+#[test]
+fn test_regex_host_priority_prefix_over_regex() {
+    // Within exact host tier: prefix route beats regex route
+    let mut prefix_proxy = test_proxy_with_hosts("prefix", "/users", vec!["api.example.com"]);
+    prefix_proxy.backend_host = "prefix-backend".into();
+
+    let mut regex_proxy = test_regex_proxy("regex", r"/users/[^/]+/orders");
+    regex_proxy.hosts = vec!["api.example.com".to_string()];
+
+    let config = test_config(vec![prefix_proxy, regex_proxy]);
+    let cache = RouterCache::new(&config, 100);
+
+    // Prefix wins for the same host
+    let matched = cache.find_proxy(Some("api.example.com"), "/users/42/orders");
+    assert_eq!(matched.unwrap().proxy.id, "prefix");
+}
+
+#[test]
+fn test_regex_multiple_patterns() {
+    let config = test_config(vec![
+        test_regex_proxy("user-orders", r"/users/[^/]+/orders"),
+        test_regex_proxy("product-reviews", r"/products/[^/]+/reviews"),
+    ]);
+    let cache = RouterCache::new(&config, 100);
+
+    let matched = cache.find_proxy(None, "/users/42/orders/1");
+    assert_eq!(matched.unwrap().proxy.id, "user-orders");
+
+    let matched = cache.find_proxy(None, "/products/widget/reviews/5");
+    assert_eq!(matched.unwrap().proxy.id, "product-reviews");
+}
+
+#[test]
+fn test_regex_route_count() {
+    let config = test_config(vec![
+        test_proxy("api", "/api"),
+        test_regex_proxy("user-orders", r"/users/[^/]+/orders"),
+        test_regex_proxy("product-reviews", r"/products/[^/]+/reviews"),
+    ]);
+    let cache = RouterCache::new(&config, 100);
+
+    // 1 prefix + 2 regex = 3 total routes
+    assert_eq!(cache.route_count(), 3);
+}
+
+#[test]
+fn test_regex_rebuild_clears_caches() {
+    let config1 = test_config(vec![test_regex_proxy("v1", r"/users/[^/]+")]);
+    let cache = RouterCache::new(&config1, 100);
+
+    cache.find_proxy(None, "/users/42");
+    assert_eq!(cache.regex_cache_len(), 1);
+
+    // Rebuild with different config
+    let config2 = test_config(vec![test_regex_proxy("v2", r"/products/[^/]+")]);
+    cache.rebuild(&config2);
+
+    assert_eq!(cache.regex_cache_len(), 0);
+    assert_eq!(cache.cache_len(), 0);
+
+    // Old regex should no longer match
+    let matched = cache.find_proxy(None, "/users/42");
+    assert!(matched.is_none());
+
+    // New regex should match
+    let matched = cache.find_proxy(None, "/products/widget");
+    assert_eq!(matched.unwrap().proxy.id, "v2");
+}
+
+#[test]
+fn test_regex_e2e_strip_listen_path() {
+    // Regex route with strip_listen_path: strip the matched portion
+    let mut proxy = test_regex_proxy("user-orders", r"/users/[^/]+/orders");
+    proxy.strip_listen_path = true;
+    proxy.backend_host = "orders-service".into();
+    proxy.backend_port = 8080;
+
+    let config = test_config(vec![proxy]);
+    let cache = RouterCache::new(&config, 100);
+
+    let rm = cache.find_proxy(None, "/users/42/orders/pending").unwrap();
+    let url = build_backend_url(
+        &rm.proxy,
+        "/users/42/orders/pending",
+        "",
+        rm.matched_prefix_len,
+    );
+    // Matched portion is "/users/42/orders" (16 chars), remaining is "/pending"
+    assert_eq!(url, "http://orders-service:8080/pending");
+}
+
+#[test]
+fn test_regex_e2e_no_strip() {
+    let mut proxy = test_regex_proxy("user-orders", r"/users/[^/]+/orders");
+    proxy.strip_listen_path = false;
+    proxy.backend_host = "orders-service".into();
+    proxy.backend_port = 8080;
+
+    let config = test_config(vec![proxy]);
+    let cache = RouterCache::new(&config, 100);
+
+    let rm = cache.find_proxy(None, "/users/42/orders/pending").unwrap();
+    let url = build_backend_url(
+        &rm.proxy,
+        "/users/42/orders/pending",
+        "",
+        rm.matched_prefix_len,
+    );
+    // No stripping — full path is forwarded
+    assert_eq!(url, "http://orders-service:8080/users/42/orders/pending");
+}
+
+#[test]
+fn test_regex_e2e_with_query_string() {
+    let mut proxy = test_regex_proxy("search", r"/search/[^/]+");
+    proxy.backend_host = "search-service".into();
+    proxy.backend_port = 8080;
+
+    let config = test_config(vec![proxy]);
+    let cache = RouterCache::new(&config, 100);
+
+    let rm = cache.find_proxy(None, "/search/products").unwrap();
+    let url = build_backend_url(
+        &rm.proxy,
+        "/search/products",
+        "q=hello&page=1",
+        rm.matched_prefix_len,
+    );
+    assert_eq!(url, "http://search-service:8080/?q=hello&page=1");
+}
+
+#[test]
+fn test_regex_e2e_with_backend_path() {
+    let mut proxy = test_regex_proxy("user-orders", r"/users/[^/]+/orders");
+    proxy.strip_listen_path = true;
+    proxy.backend_path = Some("/internal".into());
+    proxy.backend_host = "orders-service".into();
+    proxy.backend_port = 8080;
+
+    let config = test_config(vec![proxy]);
+    let cache = RouterCache::new(&config, 100);
+
+    let rm = cache.find_proxy(None, "/users/42/orders/pending").unwrap();
+    let url = build_backend_url(
+        &rm.proxy,
+        "/users/42/orders/pending",
+        "",
+        rm.matched_prefix_len,
+    );
+    assert_eq!(url, "http://orders-service:8080/internal/pending");
+}
+
+#[test]
+fn test_regex_path_params_cached_correctly() {
+    let config = test_config(vec![test_regex_proxy(
+        "users",
+        r"/users/(?P<id>[^/]+)/profile",
+    )]);
+    let cache = RouterCache::new(&config, 100);
+
+    // First request: cache miss
+    let rm1 = cache.find_proxy(None, "/users/42/profile").unwrap();
+    assert_eq!(rm1.path_params, vec![("id".to_string(), "42".to_string())]);
+
+    // Same path: cache hit — same params
+    let rm2 = cache.find_proxy(None, "/users/42/profile").unwrap();
+    assert_eq!(rm2.path_params, vec![("id".to_string(), "42".to_string())]);
+
+    // Different path: different params
+    let rm3 = cache.find_proxy(None, "/users/99/profile").unwrap();
+    assert_eq!(rm3.path_params, vec![("id".to_string(), "99".to_string())]);
+}
+
+#[test]
+fn test_regex_prefix_no_path_params() {
+    // Prefix routes should always have empty path_params
+    let config = test_config(vec![test_proxy("api", "/api")]);
+    let cache = RouterCache::new(&config, 100);
+
+    let rm = cache.find_proxy(None, "/api/test").unwrap();
+    assert!(rm.path_params.is_empty());
+    assert_eq!(rm.matched_prefix_len, "/api".len());
+}
+
+#[test]
+fn test_regex_invalid_pattern_skipped() {
+    // Invalid regex should be skipped (logged as warning), not crash
+    let config = test_config(vec![
+        test_proxy("fallback", "/"),
+        test_regex_proxy("bad", r"/users/[invalid"),
+    ]);
+    let cache = RouterCache::new(&config, 100);
+
+    // The invalid regex route is skipped, fallback catches everything
+    let matched = cache.find_proxy(None, "/users/42");
+    assert_eq!(matched.unwrap().proxy.id, "fallback");
+    // Only the prefix route should be counted (invalid regex skipped)
+    assert_eq!(cache.route_count(), 1);
+}
+
+#[tokio::test]
+async fn test_regex_concurrent_find_proxy() {
+    let config = test_config(vec![
+        test_proxy("api", "/api"),
+        test_regex_proxy("users", r"/users/(?P<id>[^/]+)"),
+    ]);
+    let cache = std::sync::Arc::new(RouterCache::new(&config, 1000));
+
+    let mut handles = vec![];
+    for i in 0..50 {
+        let cache = cache.clone();
+        handles.push(tokio::spawn(async move {
+            if i % 2 == 0 {
+                let result = cache.find_proxy(None, "/api/resource");
+                assert_eq!(result.unwrap().proxy.id, "api");
+            } else {
+                let result = cache.find_proxy(None, &format!("/users/{}", i));
+                let rm = result.unwrap();
+                assert_eq!(rm.proxy.id, "users");
+                assert_eq!(rm.path_params[0].0, "id");
+                assert_eq!(rm.path_params[0].1, i.to_string());
+            }
+        }));
+    }
+
+    for handle in handles {
+        handle.await.unwrap();
+    }
+}
+
+#[test]
+fn test_regex_explicit_anchor() {
+    // Users can provide their own ^ anchor — should work fine
+    let config = test_config(vec![test_regex_proxy("anchored", r"^/users/[^/]+")]);
+    let cache = RouterCache::new(&config, 100);
+
+    let matched = cache.find_proxy(None, "/users/42");
+    assert_eq!(matched.unwrap().proxy.id, "anchored");
+}
+
+#[test]
+fn test_regex_exact_path_no_remaining() {
+    // When the regex matches the entire path exactly
+    let config = test_config(vec![test_regex_proxy("exact", r"/status")]);
+    let cache = RouterCache::new(&config, 100);
+
+    let rm = cache.find_proxy(None, "/status").unwrap();
+    assert_eq!(rm.matched_prefix_len, "/status".len());
+
+    let url = build_backend_url(&rm.proxy, "/status", "", rm.matched_prefix_len);
+    assert_eq!(url, "http://regex-backend:3000/");
 }

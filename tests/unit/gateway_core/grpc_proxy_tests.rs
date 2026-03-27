@@ -94,7 +94,12 @@ fn test_is_grpc_request_text_plain_is_not_grpc() {
 #[test]
 fn test_build_backend_url_grpc_uses_http_scheme() {
     let proxy = test_proxy();
-    let url = build_backend_url(&proxy, "/grpc/my.Service/MyMethod", "");
+    let url = build_backend_url(
+        &proxy,
+        "/grpc/my.Service/MyMethod",
+        "",
+        proxy.listen_path.len(),
+    );
     assert_eq!(
         url,
         "http://grpc-backend.example.com:50051/my.Service/MyMethod"
@@ -105,7 +110,12 @@ fn test_build_backend_url_grpc_uses_http_scheme() {
 fn test_build_backend_url_grpcs_uses_https_scheme() {
     let mut proxy = test_proxy();
     proxy.backend_protocol = BackendProtocol::Grpcs;
-    let url = build_backend_url(&proxy, "/grpc/my.Service/MyMethod", "");
+    let url = build_backend_url(
+        &proxy,
+        "/grpc/my.Service/MyMethod",
+        "",
+        proxy.listen_path.len(),
+    );
     assert_eq!(
         url,
         "https://grpc-backend.example.com:50051/my.Service/MyMethod"
@@ -116,7 +126,12 @@ fn test_build_backend_url_grpcs_uses_https_scheme() {
 fn test_build_backend_url_grpc_with_backend_path() {
     let mut proxy = test_proxy();
     proxy.backend_path = Some("/prefix".into());
-    let url = build_backend_url(&proxy, "/grpc/my.Service/MyMethod", "");
+    let url = build_backend_url(
+        &proxy,
+        "/grpc/my.Service/MyMethod",
+        "",
+        proxy.listen_path.len(),
+    );
     assert_eq!(
         url,
         "http://grpc-backend.example.com:50051/prefix/my.Service/MyMethod"
@@ -127,7 +142,12 @@ fn test_build_backend_url_grpc_with_backend_path() {
 fn test_build_backend_url_grpc_no_strip() {
     let mut proxy = test_proxy();
     proxy.strip_listen_path = false;
-    let url = build_backend_url(&proxy, "/grpc/my.Service/MyMethod", "");
+    let url = build_backend_url(
+        &proxy,
+        "/grpc/my.Service/MyMethod",
+        "",
+        proxy.listen_path.len(),
+    );
     assert_eq!(
         url,
         "http://grpc-backend.example.com:50051/grpc/my.Service/MyMethod"

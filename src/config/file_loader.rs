@@ -104,6 +104,17 @@ pub fn load_config_from_file(path: &str) -> Result<GatewayConfig, anyhow::Error>
         );
     }
 
+    // Validate regex listen_paths compile correctly
+    if let Err(errors) = config.validate_regex_listen_paths() {
+        for msg in &errors {
+            error!("{}", msg);
+        }
+        anyhow::bail!(
+            "Configuration validation failed: {} invalid regex listen_path(s) found",
+            errors.len()
+        );
+    }
+
     // Validate host+listen_path uniqueness
     if let Err(dupes) = config.validate_unique_listen_paths() {
         for msg in &dupes {
