@@ -1036,7 +1036,9 @@ async fn test_both_request_and_response_validation() {
     let mut bad_req_ctx = make_json_ctx(r#"{"other": "value"}"#);
     let mut bad_req_headers = HashMap::new();
     assert_reject(
-        plugin.before_proxy(&mut bad_req_ctx, &mut bad_req_headers).await,
+        plugin
+            .before_proxy(&mut bad_req_ctx, &mut bad_req_headers)
+            .await,
         Some(400),
     );
 
