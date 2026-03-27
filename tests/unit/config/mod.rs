@@ -1,5 +1,6 @@
 mod admin_enhanced_tls_tests;
 mod admin_listeners_tests;
+mod conf_file_tests;
 mod config_backup_tests;
 mod config_file_loader_tests;
 mod config_migration_tests;

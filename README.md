@@ -311,6 +311,7 @@ See [CI/CD Documentation](docs/ci_cd.md) for complete pipeline overview, secrets
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
+| `FERRUM_CONF_PATH` | No | `./ferrum.conf` | Path to optional conf file (values override env vars). See [Configuration File](#configuration-file-ferrumconf). |
 | `FERRUM_MODE` | **Yes** | — | Operating mode: `database`, `file`, `cp`, `dp`, `migrate` |
 | `FERRUM_LOG_LEVEL` | No | `error` | Log verbosity: `error`, `warn`, `info`, `debug`, `trace` |
 | `FERRUM_PROXY_HTTP_PORT` | No | `8000` | HTTP proxy listener port |
@@ -386,6 +387,43 @@ See [CI/CD Documentation](docs/ci_cd.md) for complete pipeline overview, secrets
 | `FERRUM_PLUGIN_HTTP_SLOW_THRESHOLD_MS` | No | `1000` | Threshold (ms) for logging slow plugin outbound HTTP calls (http_logging, oauth2, JWKS, OTLP) |
 
 See [docs/client_ip_resolution.md](docs/client_ip_resolution.md) for the security model, deployment examples, and troubleshooting guide.
+
+### Configuration File (`ferrum.conf`)
+
+As an alternative to environment variables, the gateway supports a `ferrum.conf` configuration file. Values set in the conf file **take precedence** over environment variables, providing a single-file approach for operators who prefer file-based configuration over environment variables.
+
+**File location:**
+- Default: `./ferrum.conf` (current working directory)
+- Override with the `FERRUM_CONF_PATH` environment variable (the only setting that must remain an env var)
+- If the file does not exist at the default path, it is silently skipped
+
+**Format:** Simple key-value pairs using the same `FERRUM_*` names as environment variables:
+
+```conf
+# Operating mode
+FERRUM_MODE = file
+FERRUM_FILE_CONFIG_PATH = /etc/ferrum/config.yaml
+FERRUM_LOG_LEVEL = info
+
+# Proxy ports
+FERRUM_PROXY_HTTP_PORT = 8080
+FERRUM_PROXY_HTTPS_PORT = 8443
+
+# TLS hardening
+FERRUM_TLS_MIN_VERSION = 1.3
+
+# Quoted values for paths with spaces
+FERRUM_PROXY_TLS_CERT_PATH = "/path/with spaces/cert.pem"
+```
+
+- Lines starting with `#` are comments
+- Inline comments are supported: `KEY = value # comment`
+- Values can be quoted with double or single quotes (quotes are stripped)
+- Empty lines are ignored
+
+A reference `ferrum.conf` with all available fields and descriptions is included in the repository root.
+
+**Precedence order:** `ferrum.conf` > environment variables > built-in defaults
 
 ### Configuration File Format (File Mode)
 

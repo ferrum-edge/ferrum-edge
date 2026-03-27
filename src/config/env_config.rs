@@ -1,3 +1,4 @@
+use super::conf_file::ConfFile;
 use std::collections::HashMap;
 use std::env;
 
@@ -12,12 +13,14 @@ pub enum OperatingMode {
 }
 
 impl OperatingMode {
+    #[allow(dead_code)] // Used by integration/unit tests via the lib crate
     pub fn from_env() -> Result<Self, String> {
-        match env::var("FERRUM_MODE")
-            .unwrap_or_default()
-            .to_lowercase()
-            .as_str()
-        {
+        Self::resolve(&ConfFile::default())
+    }
+
+    fn resolve(conf: &ConfFile) -> Result<Self, String> {
+        let raw = resolve_var(conf, "FERRUM_MODE").unwrap_or_default();
+        match raw.to_lowercase().as_str() {
             "database" => Ok(Self::Database),
             "file" => Ok(Self::File),
             "cp" => Ok(Self::ControlPlane),
@@ -29,6 +32,25 @@ impl OperatingMode {
             )),
         }
     }
+}
+
+/// Resolve a configuration value: conf file takes precedence over env var.
+fn resolve_var(conf: &ConfFile, key: &str) -> Option<String> {
+    conf.get(key)
+        .map(|s| s.to_string())
+        .or_else(|| env::var(key).ok())
+}
+
+/// Resolve a configuration value with a default fallback.
+fn resolve_var_or(conf: &ConfFile, key: &str, default: &str) -> String {
+    resolve_var(conf, key).unwrap_or_else(|| default.to_string())
+}
+
+/// Resolve a bool configuration value ("true" or "1").
+fn resolve_bool(conf: &ConfFile, key: &str, default: bool) -> bool {
+    resolve_var(conf, key)
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(default)
 }
 
 /// All environment-driven configuration.
@@ -276,134 +298,144 @@ impl Default for EnvConfig {
 
 impl EnvConfig {
     pub fn from_env() -> Result<Self, String> {
-        let mode = OperatingMode::from_env()?;
+        let conf = ConfFile::load()?;
+        Self::from_env_with_conf(&conf)
+    }
 
-        let dns_overrides: HashMap<String, String> = env::var("FERRUM_DNS_OVERRIDES")
-            .ok()
+    /// Build config using values from the given conf file (takes precedence)
+    /// with fallback to environment variables.
+    pub fn from_env_with_conf(conf: &ConfFile) -> Result<Self, String> {
+        let mode = OperatingMode::resolve(conf)?;
+
+        let dns_overrides: HashMap<String, String> = resolve_var(conf, "FERRUM_DNS_OVERRIDES")
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default();
 
         let config = Self {
             mode: mode.clone(),
-            log_level: env::var("FERRUM_LOG_LEVEL").unwrap_or_else(|_| "error".into()),
-            enable_streaming_latency_tracking: env::var("FERRUM_ENABLE_STREAMING_LATENCY_TRACKING")
-                .map(|v| v == "true" || v == "1")
-                .unwrap_or(false),
+            log_level: resolve_var_or(conf, "FERRUM_LOG_LEVEL", "error"),
+            enable_streaming_latency_tracking: resolve_bool(
+                conf,
+                "FERRUM_ENABLE_STREAMING_LATENCY_TRACKING",
+                false,
+            ),
 
-            proxy_http_port: parse_env_u16("FERRUM_PROXY_HTTP_PORT", 8000),
-            proxy_https_port: parse_env_u16("FERRUM_PROXY_HTTPS_PORT", 8443),
-            proxy_tls_cert_path: env::var("FERRUM_PROXY_TLS_CERT_PATH").ok(),
-            proxy_tls_key_path: env::var("FERRUM_PROXY_TLS_KEY_PATH").ok(),
+            proxy_http_port: resolve_u16(conf, "FERRUM_PROXY_HTTP_PORT", 8000),
+            proxy_https_port: resolve_u16(conf, "FERRUM_PROXY_HTTPS_PORT", 8443),
+            proxy_tls_cert_path: resolve_var(conf, "FERRUM_PROXY_TLS_CERT_PATH"),
+            proxy_tls_key_path: resolve_var(conf, "FERRUM_PROXY_TLS_KEY_PATH"),
 
-            admin_http_port: parse_env_u16("FERRUM_ADMIN_HTTP_PORT", 9000),
-            admin_https_port: parse_env_u16("FERRUM_ADMIN_HTTPS_PORT", 9443),
-            admin_tls_cert_path: env::var("FERRUM_ADMIN_TLS_CERT_PATH").ok(),
-            admin_tls_key_path: env::var("FERRUM_ADMIN_TLS_KEY_PATH").ok(),
-            admin_jwt_secret: env::var("FERRUM_ADMIN_JWT_SECRET").ok(),
-            db_type: env::var("FERRUM_DB_TYPE").ok(),
-            db_url: env::var("FERRUM_DB_URL").ok(),
-            db_poll_interval: parse_env_u64("FERRUM_DB_POLL_INTERVAL", 30),
-            db_tls_enabled: env::var("FERRUM_DB_TLS_ENABLED").unwrap_or_default() == "true",
-            db_tls_ca_cert_path: env::var("FERRUM_DB_TLS_CA_CERT_PATH").ok(),
-            db_tls_client_cert_path: env::var("FERRUM_DB_TLS_CLIENT_CERT_PATH").ok(),
-            db_tls_client_key_path: env::var("FERRUM_DB_TLS_CLIENT_KEY_PATH").ok(),
-            db_tls_insecure: env::var("FERRUM_DB_TLS_INSECURE").unwrap_or_default() == "true",
+            admin_http_port: resolve_u16(conf, "FERRUM_ADMIN_HTTP_PORT", 9000),
+            admin_https_port: resolve_u16(conf, "FERRUM_ADMIN_HTTPS_PORT", 9443),
+            admin_tls_cert_path: resolve_var(conf, "FERRUM_ADMIN_TLS_CERT_PATH"),
+            admin_tls_key_path: resolve_var(conf, "FERRUM_ADMIN_TLS_KEY_PATH"),
+            admin_jwt_secret: resolve_var(conf, "FERRUM_ADMIN_JWT_SECRET"),
+            db_type: resolve_var(conf, "FERRUM_DB_TYPE"),
+            db_url: resolve_var(conf, "FERRUM_DB_URL"),
+            db_poll_interval: resolve_u64(conf, "FERRUM_DB_POLL_INTERVAL", 30),
+            db_tls_enabled: resolve_bool(conf, "FERRUM_DB_TLS_ENABLED", false),
+            db_tls_ca_cert_path: resolve_var(conf, "FERRUM_DB_TLS_CA_CERT_PATH"),
+            db_tls_client_cert_path: resolve_var(conf, "FERRUM_DB_TLS_CLIENT_CERT_PATH"),
+            db_tls_client_key_path: resolve_var(conf, "FERRUM_DB_TLS_CLIENT_KEY_PATH"),
+            db_tls_insecure: resolve_bool(conf, "FERRUM_DB_TLS_INSECURE", false),
 
             // Database TLS/SSL
-            db_ssl_mode: env::var("FERRUM_DB_SSL_MODE").ok(),
-            db_ssl_root_cert: env::var("FERRUM_DB_SSL_ROOT_CERT").ok(),
-            db_ssl_client_cert: env::var("FERRUM_DB_SSL_CLIENT_CERT").ok(),
-            db_ssl_client_key: env::var("FERRUM_DB_SSL_CLIENT_KEY").ok(),
+            db_ssl_mode: resolve_var(conf, "FERRUM_DB_SSL_MODE"),
+            db_ssl_root_cert: resolve_var(conf, "FERRUM_DB_SSL_ROOT_CERT"),
+            db_ssl_client_cert: resolve_var(conf, "FERRUM_DB_SSL_CLIENT_CERT"),
+            db_ssl_client_key: resolve_var(conf, "FERRUM_DB_SSL_CLIENT_KEY"),
 
-            file_config_path: env::var("FERRUM_FILE_CONFIG_PATH").ok(),
-            db_config_backup_path: env::var("FERRUM_DB_CONFIG_BACKUP_PATH").ok(),
+            file_config_path: resolve_var(conf, "FERRUM_FILE_CONFIG_PATH"),
+            db_config_backup_path: resolve_var(conf, "FERRUM_DB_CONFIG_BACKUP_PATH"),
 
-            cp_grpc_listen_addr: env::var("FERRUM_CP_GRPC_LISTEN_ADDR").ok(),
-            cp_grpc_jwt_secret: env::var("FERRUM_CP_GRPC_JWT_SECRET").ok(),
-            dp_cp_grpc_url: env::var("FERRUM_DP_CP_GRPC_URL").ok(),
-            dp_grpc_auth_token: env::var("FERRUM_DP_GRPC_AUTH_TOKEN").ok(),
+            cp_grpc_listen_addr: resolve_var(conf, "FERRUM_CP_GRPC_LISTEN_ADDR"),
+            cp_grpc_jwt_secret: resolve_var(conf, "FERRUM_CP_GRPC_JWT_SECRET"),
+            dp_cp_grpc_url: resolve_var(conf, "FERRUM_DP_CP_GRPC_URL"),
+            dp_grpc_auth_token: resolve_var(conf, "FERRUM_DP_GRPC_AUTH_TOKEN"),
 
-            max_header_size_bytes: parse_env_usize("FERRUM_MAX_HEADER_SIZE_BYTES", 32_768),
-            max_single_header_size_bytes: parse_env_usize(
+            max_header_size_bytes: resolve_usize(conf, "FERRUM_MAX_HEADER_SIZE_BYTES", 32_768),
+            max_single_header_size_bytes: resolve_usize(
+                conf,
                 "FERRUM_MAX_SINGLE_HEADER_SIZE_BYTES",
                 16_384,
             ),
-            max_body_size_bytes: parse_env_usize("FERRUM_MAX_BODY_SIZE_BYTES", 10_485_760),
-            max_response_body_size_bytes: parse_env_usize(
+            max_body_size_bytes: resolve_usize(conf, "FERRUM_MAX_BODY_SIZE_BYTES", 10_485_760),
+            max_response_body_size_bytes: resolve_usize(
+                conf,
                 "FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES",
                 10_485_760,
             ),
 
-            dns_cache_ttl_seconds: parse_env_u64("FERRUM_DNS_CACHE_TTL_SECONDS", 300),
+            dns_cache_ttl_seconds: resolve_u64(conf, "FERRUM_DNS_CACHE_TTL_SECONDS", 300),
             dns_overrides,
-            dns_resolver_address: env::var("FERRUM_DNS_RESOLVER_ADDRESS").ok(),
-            dns_resolver_hosts_file: env::var("FERRUM_DNS_RESOLVER_HOSTS_FILE").ok(),
-            dns_order: env::var("FERRUM_DNS_ORDER").ok(),
-            dns_valid_ttl: env::var("FERRUM_DNS_VALID_TTL")
-                .ok()
-                .and_then(|v| v.parse().ok()),
-            dns_stale_ttl: parse_env_u64("FERRUM_DNS_STALE_TTL", 3600),
-            dns_error_ttl: parse_env_u64("FERRUM_DNS_ERROR_TTL", 1),
-            dns_cache_max_size: env::var("FERRUM_DNS_CACHE_MAX_SIZE")
-                .ok()
+            dns_resolver_address: resolve_var(conf, "FERRUM_DNS_RESOLVER_ADDRESS"),
+            dns_resolver_hosts_file: resolve_var(conf, "FERRUM_DNS_RESOLVER_HOSTS_FILE"),
+            dns_order: resolve_var(conf, "FERRUM_DNS_ORDER"),
+            dns_valid_ttl: resolve_var(conf, "FERRUM_DNS_VALID_TTL").and_then(|v| v.parse().ok()),
+            dns_stale_ttl: resolve_u64(conf, "FERRUM_DNS_STALE_TTL", 3600),
+            dns_error_ttl: resolve_u64(conf, "FERRUM_DNS_ERROR_TTL", 1),
+            dns_cache_max_size: resolve_var(conf, "FERRUM_DNS_CACHE_MAX_SIZE")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(10_000),
-            dns_slow_threshold_ms: env::var("FERRUM_DNS_SLOW_THRESHOLD_MS")
-                .ok()
+            dns_slow_threshold_ms: resolve_var(conf, "FERRUM_DNS_SLOW_THRESHOLD_MS")
                 .and_then(|v| v.parse().ok()),
 
             // Global Backend mTLS
-            backend_tls_ca_bundle_path: env::var("FERRUM_BACKEND_TLS_CA_BUNDLE_PATH").ok(),
-            backend_tls_client_cert_path: env::var("FERRUM_BACKEND_TLS_CLIENT_CERT_PATH").ok(),
-            backend_tls_client_key_path: env::var("FERRUM_BACKEND_TLS_CLIENT_KEY_PATH").ok(),
+            backend_tls_ca_bundle_path: resolve_var(conf, "FERRUM_BACKEND_TLS_CA_BUNDLE_PATH"),
+            backend_tls_client_cert_path: resolve_var(conf, "FERRUM_BACKEND_TLS_CLIENT_CERT_PATH"),
+            backend_tls_client_key_path: resolve_var(conf, "FERRUM_BACKEND_TLS_CLIENT_KEY_PATH"),
 
             // Global Frontend mTLS (client certificate verification)
-            frontend_tls_client_ca_bundle_path: env::var(
+            frontend_tls_client_ca_bundle_path: resolve_var(
+                conf,
                 "FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH",
-            )
-            .ok(),
+            ),
 
             // Admin API TLS enhancements
-            admin_tls_client_ca_bundle_path: env::var("FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH")
-                .ok(),
-            backend_tls_no_verify: env::var("FERRUM_BACKEND_TLS_NO_VERIFY").unwrap_or_default()
-                == "true",
-            admin_tls_no_verify: env::var("FERRUM_ADMIN_TLS_NO_VERIFY").unwrap_or_default()
-                == "true",
-            admin_read_only: env::var("FERRUM_ADMIN_READ_ONLY").unwrap_or_default() == "true",
-            stream_proxy_bind_address: env::var("FERRUM_STREAM_PROXY_BIND_ADDRESS")
-                .unwrap_or_else(|_| "0.0.0.0".into()),
-            dtls_cert_path: env::var("FERRUM_DTLS_CERT_PATH").ok(),
-            dtls_key_path: env::var("FERRUM_DTLS_KEY_PATH").ok(),
-            dtls_client_ca_cert_path: env::var("FERRUM_DTLS_CLIENT_CA_CERT_PATH").ok(),
+            admin_tls_client_ca_bundle_path: resolve_var(
+                conf,
+                "FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH",
+            ),
+            backend_tls_no_verify: resolve_bool(conf, "FERRUM_BACKEND_TLS_NO_VERIFY", false),
+            admin_tls_no_verify: resolve_bool(conf, "FERRUM_ADMIN_TLS_NO_VERIFY", false),
+            admin_read_only: resolve_bool(conf, "FERRUM_ADMIN_READ_ONLY", false),
+            stream_proxy_bind_address: resolve_var_or(
+                conf,
+                "FERRUM_STREAM_PROXY_BIND_ADDRESS",
+                "0.0.0.0",
+            ),
+            dtls_cert_path: resolve_var(conf, "FERRUM_DTLS_CERT_PATH"),
+            dtls_key_path: resolve_var(conf, "FERRUM_DTLS_KEY_PATH"),
+            dtls_client_ca_cert_path: resolve_var(conf, "FERRUM_DTLS_CLIENT_CA_CERT_PATH"),
 
             // HTTP/3 / QUIC
-            enable_http3: env::var("FERRUM_ENABLE_HTTP3").unwrap_or_default() == "true",
-            http3_idle_timeout: parse_env_u64("FERRUM_HTTP3_IDLE_TIMEOUT", 30),
-            http3_max_streams: env::var("FERRUM_HTTP3_MAX_STREAMS")
-                .ok()
+            enable_http3: resolve_bool(conf, "FERRUM_ENABLE_HTTP3", false),
+            http3_idle_timeout: resolve_u64(conf, "FERRUM_HTTP3_IDLE_TIMEOUT", 30),
+            http3_max_streams: resolve_var(conf, "FERRUM_HTTP3_MAX_STREAMS")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(100),
 
             // TLS Hardening
-            tls_min_version: env::var("FERRUM_TLS_MIN_VERSION").unwrap_or_else(|_| "1.2".into()),
-            tls_max_version: env::var("FERRUM_TLS_MAX_VERSION").unwrap_or_else(|_| "1.3".into()),
-            tls_cipher_suites: env::var("FERRUM_TLS_CIPHER_SUITES").ok(),
-            tls_prefer_server_cipher_order: env::var("FERRUM_TLS_PREFER_SERVER_CIPHER_ORDER")
-                .map(|v| v == "true")
-                .unwrap_or(true),
-            tls_curves: env::var("FERRUM_TLS_CURVES").ok(),
+            tls_min_version: resolve_var_or(conf, "FERRUM_TLS_MIN_VERSION", "1.2"),
+            tls_max_version: resolve_var_or(conf, "FERRUM_TLS_MAX_VERSION", "1.3"),
+            tls_cipher_suites: resolve_var(conf, "FERRUM_TLS_CIPHER_SUITES"),
+            tls_prefer_server_cipher_order: resolve_var(
+                conf,
+                "FERRUM_TLS_PREFER_SERVER_CIPHER_ORDER",
+            )
+            .map(|v| v == "true")
+            .unwrap_or(true),
+            tls_curves: resolve_var(conf, "FERRUM_TLS_CURVES"),
 
             // Client IP resolution
-            trusted_proxies: env::var("FERRUM_TRUSTED_PROXIES").unwrap_or_default(),
+            trusted_proxies: resolve_var_or(conf, "FERRUM_TRUSTED_PROXIES", ""),
             // Pre-lowercase at load time so the hot path avoids per-request
             // to_lowercase() allocation when looking up this header in ctx.headers
             // (which stores hyper's already-lowercased header names).
-            real_ip_header: env::var("FERRUM_REAL_IP_HEADER")
-                .ok()
-                .map(|h| h.to_lowercase()),
+            real_ip_header: resolve_var(conf, "FERRUM_REAL_IP_HEADER").map(|h| h.to_lowercase()),
 
-            plugin_http_slow_threshold_ms: parse_env_u64(
+            plugin_http_slow_threshold_ms: resolve_u64(
+                conf,
                 "FERRUM_PLUGIN_HTTP_SLOW_THRESHOLD_MS",
                 1000,
             ),
@@ -518,7 +550,7 @@ impl EnvConfig {
                 // Migrate mode: validation depends on FERRUM_MIGRATE_ACTION.
                 // For "config", FERRUM_FILE_CONFIG_PATH is required.
                 // For "up" and "status", FERRUM_DB_TYPE and FERRUM_DB_URL are required.
-                let action = std::env::var("FERRUM_MIGRATE_ACTION")
+                let action = env::var("FERRUM_MIGRATE_ACTION")
                     .unwrap_or_else(|_| "up".into())
                     .to_lowercase();
                 match action.as_str() {
@@ -591,23 +623,20 @@ impl EnvConfig {
     }
 }
 
-fn parse_env_u16(key: &str, default: u16) -> u16 {
-    env::var(key)
-        .ok()
+fn resolve_u16(conf: &ConfFile, key: &str, default: u16) -> u16 {
+    resolve_var(conf, key)
         .and_then(|v| v.parse().ok())
         .unwrap_or(default)
 }
 
-fn parse_env_u64(key: &str, default: u64) -> u64 {
-    env::var(key)
-        .ok()
+fn resolve_u64(conf: &ConfFile, key: &str, default: u64) -> u64 {
+    resolve_var(conf, key)
         .and_then(|v| v.parse().ok())
         .unwrap_or(default)
 }
 
-fn parse_env_usize(key: &str, default: usize) -> usize {
-    env::var(key)
-        .ok()
+fn resolve_usize(conf: &ConfFile, key: &str, default: usize) -> usize {
+    resolve_var(conf, key)
         .and_then(|v| v.parse().ok())
         .unwrap_or(default)
 }

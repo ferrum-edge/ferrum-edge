@@ -1,3 +1,4 @@
+pub mod conf_file;
 pub mod config_backup;
 pub mod config_migration;
 pub mod db_loader;
