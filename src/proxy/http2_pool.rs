@@ -1,8 +1,9 @@
 //! HTTP/2 connection pool using hyper's HTTP/2 client directly.
 //!
-//! Provides proper HTTP/2 stream multiplexing over a single persistent TLS
-//! connection, avoiding the connection-per-request churn that reqwest exhibits
-//! under concurrent load. Modeled on the `GrpcConnectionPool` pattern.
+//! Provides proper HTTP/2 stream multiplexing over multiple persistent TLS
+//! connections, distributing load via round-robin to avoid serialization on
+//! a single connection's state machine. The number of connections per backend
+//! is governed by `max_idle_per_host` from the global or per-proxy pool config.
 //!
 //! Used when a proxy has `backend_protocol: https` and `pool_enable_http2: true`.
 
@@ -11,7 +12,7 @@ use hyper::body::Incoming;
 use hyper::client::conn::http2;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tracing::{debug, warn};
@@ -33,12 +34,23 @@ struct Http2PoolEntry {
     last_used_epoch_ms: Arc<AtomicU64>,
 }
 
+/// A slot holding multiple HTTP/2 connections to the same backend.
+/// Round-robin selection distributes load across connections to avoid
+/// serialization on a single HTTP/2 state machine.
+struct Http2PoolSlot {
+    entries: Vec<Http2PoolEntry>,
+    counter: AtomicUsize,
+}
+
 /// HTTP/2 connection pool for HTTPS backends.
 ///
 /// Manages reusable HTTP/2 connections with proper stream multiplexing.
 /// Unlike the reqwest-based `ConnectionPool`, this uses hyper's HTTP/2 client
-/// directly to multiplex concurrent requests over a single TLS connection,
-/// eliminating the TLS handshake overhead that reqwest incurs under load.
+/// directly to multiplex concurrent requests over persistent TLS connections.
+///
+/// Multiple connections per backend (up to `max_idle_per_host`) are maintained
+/// and selected via round-robin to distribute stream-level contention across
+/// connections, avoiding the bottleneck of a single HTTP/2 state machine.
 ///
 /// Honors the same configuration as the HTTP pool:
 /// - Global `PoolConfig` from environment variables
@@ -46,8 +58,8 @@ struct Http2PoolEntry {
 /// - Global mTLS and CA bundle settings from `EnvConfig`
 /// - Background idle connection cleanup
 pub struct Http2ConnectionPool {
-    /// Cached sender handles keyed by `host:port`
-    entries: Arc<DashMap<String, Http2PoolEntry>>,
+    /// Cached sender handles keyed by `host:port`, with multiple connections per slot
+    entries: Arc<DashMap<String, Http2PoolSlot>>,
     /// Global pool configuration (idle timeout, keepalive, etc.)
     global_pool_config: PoolConfig,
     /// Global TLS/mTLS configuration
@@ -81,6 +93,10 @@ impl Http2ConnectionPool {
     }
 
     /// Get or create an HTTP/2 connection to the HTTPS backend.
+    ///
+    /// Connections are selected via round-robin across the pool slot. If all
+    /// connections in the slot are closed, or the slot doesn't exist yet, a
+    /// new connection is created. The pool grows lazily up to `max_idle_per_host`.
     pub async fn get_sender(
         &self,
         proxy: &Proxy,
@@ -88,28 +104,45 @@ impl Http2ConnectionPool {
     ) -> Result<http2::SendRequest<Incoming>, Http2PoolError> {
         let key = Self::pool_key(proxy);
 
-        // Try to reuse existing connection
-        if let Some(entry) = self.entries.get(&key) {
-            if !entry.sender.is_closed() {
-                entry
-                    .last_used_epoch_ms
-                    .store(now_epoch_ms(), Ordering::Relaxed);
-                return Ok(entry.sender.clone());
+        // Fast path: read-only round-robin selection from existing slot
+        if let Some(slot) = self.entries.get(&key) {
+            let len = slot.entries.len();
+            if len > 0 {
+                // Try each sender in round-robin order to find a live one
+                for _ in 0..len {
+                    let idx = slot.counter.fetch_add(1, Ordering::Relaxed) % len;
+                    let entry = &slot.entries[idx];
+                    if !entry.sender.is_closed() {
+                        entry
+                            .last_used_epoch_ms
+                            .store(now_epoch_ms(), Ordering::Relaxed);
+                        return Ok(entry.sender.clone());
+                    }
+                }
             }
-            // Connection is closed, remove it
-            drop(entry);
-            self.entries.remove(&key);
+            drop(slot); // release read lock before write path
         }
 
-        // Create a new connection
+        // Slow path: create a new connection and add it to the pool
         let sender = self.create_connection(proxy, dns_cache).await?;
-        self.entries.insert(
-            key,
-            Http2PoolEntry {
+        let pool_config = self.global_pool_config.for_proxy(proxy);
+
+        let mut slot = self.entries.entry(key).or_insert_with(|| Http2PoolSlot {
+            entries: Vec::with_capacity(pool_config.max_idle_per_host.min(32)),
+            counter: AtomicUsize::new(0),
+        });
+
+        // Clean out closed connections while we hold the write lock
+        slot.entries.retain(|e| !e.sender.is_closed());
+
+        // Add the new connection if we haven't hit the cap
+        if slot.entries.len() < pool_config.max_idle_per_host {
+            slot.entries.push(Http2PoolEntry {
                 sender: sender.clone(),
                 last_used_epoch_ms: Arc::new(AtomicU64::new(now_epoch_ms())),
-            },
-        );
+            });
+        }
+
         Ok(sender)
     }
 
@@ -168,12 +201,23 @@ impl Http2ConnectionPool {
             .await
     }
 
-    /// Build an HTTP/2 client builder with keepalive settings from pool config.
+    /// Build an HTTP/2 client builder with keepalive and flow control settings.
+    ///
+    /// Configures larger initial window sizes for higher throughput under
+    /// concurrent load, matching common production HTTP/2 tuning.
     fn build_h2_builder(pool_config: &PoolConfig) -> http2::Builder<TokioExecutor> {
         let mut builder = http2::Builder::new(TokioExecutor::new());
 
         // Timer is required for keep_alive_interval and keep_alive_timeout to work
         builder.timer(TokioTimer::new());
+
+        // Increase flow control windows and frame size for higher throughput.
+        // Defaults (65535 bytes / 16KB frames) throttle concurrent streams on a
+        // single connection — these values are standard production tuning.
+        builder
+            .initial_connection_window_size(2 * 1024 * 1024) // 2 MB (default 65535)
+            .initial_stream_window_size(1024 * 1024) // 1 MB (default 65535)
+            .max_frame_size(32 * 1024); // 32 KB (default 16384)
 
         if pool_config.enable_http2 {
             builder
@@ -336,7 +380,7 @@ impl Http2ConnectionPool {
         Ok(sender)
     }
 
-    /// Start background cleanup task that evicts idle connections.
+    /// Start background cleanup task that evicts idle and closed connections.
     fn start_cleanup_task(&self) {
         let entries = self.entries.clone();
         let idle_timeout_ms = self
@@ -351,26 +395,31 @@ impl Http2ConnectionPool {
                 cleanup_timer.tick().await;
 
                 let now = now_epoch_ms();
-                let mut keys_to_remove = Vec::new();
+                let mut empty_keys = Vec::new();
 
-                for entry in entries.iter() {
-                    let last_used = entry.last_used_epoch_ms.load(Ordering::Relaxed);
-                    let idle_ms = now.saturating_sub(last_used);
+                for mut slot in entries.iter_mut() {
+                    // Remove closed or idle connections from the slot
+                    slot.entries.retain(|entry| {
+                        let last_used = entry.last_used_epoch_ms.load(Ordering::Relaxed);
+                        let idle_ms = now.saturating_sub(last_used);
+                        !entry.sender.is_closed() && idle_ms <= idle_timeout_ms
+                    });
 
-                    // Evict if idle too long or if the connection is already closed
-                    if idle_ms > idle_timeout_ms || entry.sender.is_closed() {
-                        keys_to_remove.push(entry.key().clone());
+                    if slot.entries.is_empty() {
+                        empty_keys.push(slot.key().clone());
                     }
                 }
 
-                if !keys_to_remove.is_empty() {
+                // Remove completely empty slots
+                for key in &empty_keys {
+                    entries.remove(key);
+                }
+
+                if !empty_keys.is_empty() {
                     debug!(
-                        "http2_pool cleanup: evicting {} idle/closed connections",
-                        keys_to_remove.len()
+                        "http2_pool cleanup: removed {} empty slots",
+                        empty_keys.len()
                     );
-                    for key in keys_to_remove {
-                        entries.remove(&key);
-                    }
                 }
             }
         });

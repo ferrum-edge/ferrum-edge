@@ -313,6 +313,10 @@ impl ConnectionPool {
     /// Configures ALPN with `h3` protocol and ensures TLS 1.3 is available
     /// (required for QUIC/HTTP/3). Respects proxy-specific TLS settings
     /// for custom CA bundles and mTLS client certificates.
+    ///
+    /// Note: Production HTTP/3 proxying now uses `Http3ConnectionPool` which
+    /// builds its own TLS config. This method is retained for integration tests.
+    #[allow(dead_code)]
     pub fn get_tls_config_for_backend(&self, proxy: &Proxy) -> Arc<rustls::ClientConfig> {
         use rustls_pemfile::certs;
         use std::io::BufReader;

@@ -190,7 +190,7 @@ async fn test_http3_backend_connection() {
     let env_config = create_http3_test_env_config();
 
     let dns_cache = DnsCache::new(ferrum_gateway::dns::DnsConfig::default());
-    let connection_pool = Arc::new(ConnectionPool::new(
+    let _connection_pool = Arc::new(ConnectionPool::new(
         pool_config,
         env_config,
         dns_cache.clone(),
@@ -212,33 +212,29 @@ async fn test_http3_backend_connection() {
 
     info!("Resolved {} to {:?}", proxy.backend_host, resolved_ip);
 
-    // Test HTTP/3 client creation and basic functionality
-    let tls_config = connection_pool.get_tls_config_for_backend(&proxy);
-    let http3_client_result = ferrum_gateway::http3::client::Http3Client::new(tls_config);
+    // Test HTTP/3 connection pool creation and basic functionality
+    let pool_config_for_h3 = PoolConfig::default();
+    let env_config_for_h3 = create_http3_test_env_config();
+    let http3_pool_result = ferrum_gateway::http3::client::Http3ConnectionPool::new(
+        pool_config_for_h3,
+        env_config_for_h3,
+    );
 
-    match http3_client_result {
-        Ok(_client) => {
-            info!("HTTP/3 client created successfully");
+    match http3_pool_result {
+        Ok(http3_pool) => {
+            info!("HTTP/3 connection pool created successfully");
 
-            // Test a simple HTTP/3 request to verify client works
-            // Use a real HTTP/3-enabled endpoint (facebook.com supports HTTP/3)
+            // Test a simple HTTP/3 request to verify pool works
             let backend_url = "https://www.facebook.com:443/";
-            let headers = std::collections::HashMap::from([
-                ("user-agent".to_string(), "ferrum-gateway-test".to_string()),
-                ("accept".to_string(), "text/html".to_string()),
-            ]);
 
             // Convert headers to HTTP/3 format
-            let mut http3_headers = Vec::new();
-            for (name, value) in headers {
-                http3_headers.push((
-                    name.parse()
-                        .unwrap_or_else(|_| http::header::HeaderName::from_static("x-custom")),
-                    value
-                        .parse()
-                        .unwrap_or_else(|_| http::header::HeaderValue::from_static("")),
-                ));
-            }
+            let http3_headers = vec![
+                (
+                    "user-agent".parse().unwrap(),
+                    "ferrum-gateway-test".parse().unwrap(),
+                ),
+                ("accept".parse().unwrap(), "text/html".parse().unwrap()),
+            ];
 
             // Verify header conversion works
             assert_eq!(http3_headers.len(), 2);
@@ -246,8 +242,15 @@ async fn test_http3_backend_connection() {
             // Try to make a request (Facebook supports HTTP/3, so should work better)
             let request_body = bytes::Bytes::from("test");
             let start_time = std::time::Instant::now();
-            let result = _client
-                .request(&proxy, "GET", backend_url, http3_headers, request_body)
+            let result = http3_pool
+                .request(
+                    &proxy,
+                    "GET",
+                    backend_url,
+                    http3_headers,
+                    request_body,
+                    &dns_cache,
+                )
                 .await;
             let request_time = start_time.elapsed();
 
@@ -271,14 +274,11 @@ async fn test_http3_backend_connection() {
                 }
                 Err(e) => {
                     tracing::warn!("HTTP/3 request failed: {:?}", e);
-                    // This is still possible due to network issues, but should be less common
                 }
             }
         }
         Err(e) => {
-            tracing::warn!("Failed to create HTTP/3 client: {:?}", e);
-            // This is expected in test environments without proper HTTP/3 support
-            // We'll still verify the configuration is correct
+            tracing::warn!("Failed to create HTTP/3 connection pool: {:?}", e);
         }
     }
 
@@ -354,6 +354,7 @@ async fn test_http3_proxy_state_creation() {
         status_counts: Arc::new(dashmap::DashMap::new()),
         grpc_pool: Arc::new(ferrum_gateway::proxy::grpc_proxy::GrpcConnectionPool::default()),
         http2_pool: Arc::new(ferrum_gateway::proxy::http2_pool::Http2ConnectionPool::default()),
+        http3_pool: None,
         load_balancer_cache: lb_cache.clone(),
         health_checker: Arc::new(ferrum_gateway::health_check::HealthChecker::new()),
         circuit_breaker_cache: Arc::new(ferrum_gateway::circuit_breaker::CircuitBreakerCache::new()),
@@ -472,7 +473,7 @@ async fn test_http3_full_integration() {
     // 3. Verify HTTP/3 routing logic works
     // 4. Test HTTP/3 client integration
 
-    let proxy = create_http3_test_proxy();
+    let _proxy = create_http3_test_proxy();
     let gateway_config = Arc::new(arc_swap::ArcSwap::from_pointee(
         create_http3_test_gateway_config(),
     ));
@@ -514,6 +515,7 @@ async fn test_http3_full_integration() {
         status_counts: Arc::new(dashmap::DashMap::new()),
         grpc_pool: Arc::new(ferrum_gateway::proxy::grpc_proxy::GrpcConnectionPool::default()),
         http2_pool: Arc::new(ferrum_gateway::proxy::http2_pool::Http2ConnectionPool::default()),
+        http3_pool: None,
         load_balancer_cache: lb_cache.clone(),
         health_checker: Arc::new(ferrum_gateway::health_check::HealthChecker::new()),
         circuit_breaker_cache: Arc::new(ferrum_gateway::circuit_breaker::CircuitBreakerCache::new()),
@@ -546,21 +548,19 @@ async fn test_http3_full_integration() {
         BackendProtocol::H3
     );
 
-    // Test HTTP/3 backend connection creation
-    let tls_config = proxy_state
-        .connection_pool
-        .get_tls_config_for_backend(&proxy);
-    assert!(Arc::strong_count(&tls_config) > 0);
-
-    // Test HTTP/3 client creation (may fail in test environment, but should not panic)
-    let http3_client_result = ferrum_gateway::http3::client::Http3Client::new(tls_config);
-    match http3_client_result {
-        Ok(_client) => {
-            info!("HTTP/3 client created successfully");
+    // Test HTTP/3 connection pool creation (may fail in test environment, but should not panic)
+    let pool_config_for_h3 = PoolConfig::default();
+    let env_config_for_h3 = create_http3_test_env_config();
+    let http3_pool_result = ferrum_gateway::http3::client::Http3ConnectionPool::new(
+        pool_config_for_h3,
+        env_config_for_h3,
+    );
+    match http3_pool_result {
+        Ok(_pool) => {
+            info!("HTTP/3 connection pool created successfully");
         }
         Err(e) => {
-            tracing::warn!("Failed to create HTTP/3 client: {}", e);
-            // This is expected in test environments without proper HTTP/3 support
+            tracing::warn!("Failed to create HTTP/3 connection pool: {}", e);
         }
     }
 
@@ -583,48 +583,48 @@ async fn test_http3_connection_performance() {
     let pool_config = PoolConfig::default();
     let env_config = create_http3_test_env_config();
 
-    let connection_pool = Arc::new(ConnectionPool::new(
+    let _connection_pool = Arc::new(ConnectionPool::new(
         pool_config,
         env_config,
         DnsCache::new(ferrum_gateway::dns::DnsConfig::default()),
     ));
 
-    // Test HTTP/3 client creation performance
-    let tls_config = connection_pool.get_tls_config_for_backend(&proxy);
+    // Test HTTP/3 connection pool creation performance
+    let pool_config_for_h3 = PoolConfig::default();
+    let env_config_for_h3 = create_http3_test_env_config();
+    let dns_cache_perf = DnsCache::new(ferrum_gateway::dns::DnsConfig::default());
 
     let start_time = std::time::Instant::now();
-    let http3_client = ferrum_gateway::http3::client::Http3Client::new(tls_config)
-        .expect("HTTP/3 client creation should succeed");
+    let http3_pool = Arc::new(
+        ferrum_gateway::http3::client::Http3ConnectionPool::new(
+            pool_config_for_h3,
+            env_config_for_h3,
+        )
+        .expect("HTTP/3 connection pool creation should succeed"),
+    );
     let client_creation_time = start_time.elapsed();
 
-    info!("HTTP/3 client creation took: {:?}", client_creation_time);
+    info!(
+        "HTTP/3 connection pool creation took: {:?}",
+        client_creation_time
+    );
     assert!(
         client_creation_time.as_millis() < 100,
-        "Client creation should be fast"
+        "Pool creation should be fast"
     );
 
     // Test multiple concurrent requests
-    // Use a real HTTP/3-enabled endpoint (facebook.com supports HTTP/3)
     let backend_url = "https://www.facebook.com:443/";
-    let headers = std::collections::HashMap::from([
+    let http3_headers: Vec<(http::header::HeaderName, http::header::HeaderValue)> = vec![
         (
-            "user-agent".to_string(),
-            "ferrum-gateway-perf-test".to_string(),
+            "user-agent".parse().unwrap(),
+            "ferrum-gateway-perf-test".parse().unwrap(),
         ),
-        ("accept".to_string(), "application/json".to_string()),
-    ]);
-
-    // Convert headers to HTTP/3 format
-    let mut http3_headers = Vec::new();
-    for (name, value) in headers {
-        http3_headers.push((
-            name.parse()
-                .unwrap_or_else(|_| http::header::HeaderName::from_static("x-custom")),
-            value
-                .parse()
-                .unwrap_or_else(|_| http::header::HeaderValue::from_static("")),
-        ));
-    }
+        (
+            "accept".parse().unwrap(),
+            "application/json".parse().unwrap(),
+        ),
+    ];
 
     // Test sequential requests
     let sequential_start = std::time::Instant::now();
@@ -633,13 +633,14 @@ async fn test_http3_connection_performance() {
 
     for i in 0..total_requests {
         let request_body = bytes::Bytes::from(format!("request_{}", i));
-        match http3_client
+        match http3_pool
             .request(
                 &proxy,
                 "GET",
                 backend_url,
                 http3_headers.clone(),
                 request_body,
+                &dns_cache_perf,
             )
             .await
         {
@@ -670,15 +671,23 @@ async fn test_http3_connection_performance() {
     let mut concurrent_tasks = Vec::new();
 
     for i in 0..total_requests {
-        let client = http3_client.clone();
+        let pool_clone = http3_pool.clone();
         let proxy_clone = proxy.clone();
         let url = backend_url.to_string();
         let headers_clone = http3_headers.clone();
+        let dns_clone = dns_cache_perf.clone();
 
         let task = tokio::spawn(async move {
             let request_body = bytes::Bytes::from(format!("concurrent_request_{}", i));
-            match client
-                .request(&proxy_clone, "GET", &url, headers_clone, request_body)
+            match pool_clone
+                .request(
+                    &proxy_clone,
+                    "GET",
+                    &url,
+                    headers_clone,
+                    request_body,
+                    &dns_clone,
+                )
                 .await
             {
                 Ok((status, body, response_headers)) => {

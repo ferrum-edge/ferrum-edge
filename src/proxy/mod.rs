@@ -36,7 +36,7 @@ use crate::connection_pool::ConnectionPool;
 use crate::consumer_index::ConsumerIndex;
 use crate::dns::DnsCache;
 use crate::health_check::HealthChecker;
-use crate::http3::client::Http3Client;
+use crate::http3::client::Http3ConnectionPool;
 use crate::load_balancer::LoadBalancerCache;
 use crate::plugin_cache::PluginCache;
 use crate::plugins::{
@@ -84,6 +84,8 @@ pub struct ProxyState {
     pub grpc_pool: Arc<GrpcConnectionPool>,
     /// HTTP/2 connection pool for HTTPS backends (proper stream multiplexing)
     pub http2_pool: Arc<Http2ConnectionPool>,
+    /// HTTP/3 (QUIC) connection pool for h3 backends
+    pub http3_pool: Option<Arc<Http3ConnectionPool>>,
     /// Load balancer cache for upstream target selection.
     pub load_balancer_cache: Arc<LoadBalancerCache>,
     /// Health checker for upstream targets.
@@ -137,6 +139,20 @@ impl ProxyState {
             global_pool_config.clone(),
             env_config.clone(),
         ));
+        let http3_pool = if env_config.enable_http3 {
+            match Http3ConnectionPool::new(global_pool_config.clone(), env_config.clone()) {
+                Ok(pool) => Some(Arc::new(pool)),
+                Err(e) => {
+                    warn!(
+                        "Failed to create HTTP/3 connection pool: {}, HTTP/3 proxying will create per-request endpoints",
+                        e
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let env_config_arc = Arc::new(env_config.clone());
         let connection_pool = Arc::new(ConnectionPool::new(
             global_pool_config.clone(),
@@ -219,6 +235,7 @@ impl ProxyState {
             status_counts: Arc::new(dashmap::DashMap::new()),
             grpc_pool,
             http2_pool,
+            http3_pool,
             alt_svc_header,
             env_config: env_config_arc,
             max_header_size_bytes,
@@ -3622,17 +3639,15 @@ async fn proxy_to_backend_http3(
 ) -> (u16, Vec<u8>, HashMap<String, String>) {
     debug!(proxy_id = %proxy.id, backend_url = %backend_url, "Proxying request to HTTP/3 backend");
 
-    // Create HTTP/3 client with TLS configuration
-    let tls_config = state.connection_pool.get_tls_config_for_backend(proxy);
-    let http3_client = match Http3Client::new(tls_config) {
-        Ok(client) => client,
-        Err(e) => {
+    // Get the HTTP/3 connection pool
+    let http3_pool = match &state.http3_pool {
+        Some(pool) => pool,
+        None => {
             error!(
                 proxy_id = %proxy.id,
                 backend_url = %backend_url,
-                error_kind = "client_creation",
-                error = %e,
-                "Failed to create HTTP/3 client"
+                error_kind = "pool_unavailable",
+                "HTTP/3 connection pool not available"
             );
             let body = r#"{"error":"HTTP/3 client creation failed"}"#;
             return (502, body.as_bytes().to_vec(), HashMap::new());
@@ -3717,9 +3732,16 @@ async fn proxy_to_backend_http3(
         ));
     }
 
-    // Make HTTP/3 request
-    match http3_client
-        .request(proxy, method, backend_url, http3_headers, request_body)
+    // Make HTTP/3 request using pooled QUIC connection
+    match http3_pool
+        .request(
+            proxy,
+            method,
+            backend_url,
+            http3_headers,
+            request_body,
+            &state.dns_cache,
+        )
         .await
     {
         Ok(response) => {
