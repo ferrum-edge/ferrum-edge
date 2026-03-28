@@ -265,31 +265,55 @@ async fn process_datagram(
             cached_session.clone()
         } else {
             lookup_or_create_session(
-                client_addr, proxy_id, config, dns_cache, lb_cache,
-                frontend_socket, sessions, metrics, tls_no_verify, max_sessions,
-            ).await?
+                client_addr,
+                proxy_id,
+                config,
+                dns_cache,
+                lb_cache,
+                frontend_socket,
+                sessions,
+                metrics,
+                tls_no_verify,
+                max_sessions,
+            )
+            .await?
         }
     } else {
         lookup_or_create_session(
-            client_addr, proxy_id, config, dns_cache, lb_cache,
-            frontend_socket, sessions, metrics, tls_no_verify, max_sessions,
-        ).await?
+            client_addr,
+            proxy_id,
+            config,
+            dns_cache,
+            lb_cache,
+            frontend_socket,
+            sessions,
+            metrics,
+            tls_no_verify,
+            max_sessions,
+        )
+        .await?
     };
 
     // Update cache for next datagram.
     *last_client = Some((client_addr, session.clone()));
 
     // Forward to backend.
-    session.last_activity.store(coarse_epoch_millis(), Ordering::Relaxed);
+    session
+        .last_activity
+        .store(coarse_epoch_millis(), Ordering::Relaxed);
     let send_result = if let Some(ref dtls) = session.dtls_conn {
-        dtls.write(data, None).await.map_err(|e| std::io::Error::other(e.to_string()))
+        dtls.write(data, None)
+            .await
+            .map_err(|e| std::io::Error::other(e.to_string()))
     } else {
         session.backend_socket.send(data).await
     };
 
     match send_result {
         Ok(_) => {
-            session.bytes_sent.fetch_add(data.len() as u64, Ordering::Relaxed);
+            session
+                .bytes_sent
+                .fetch_add(data.len() as u64, Ordering::Relaxed);
             *batch_dgrams_out += 1;
             *batch_bytes_out += data.len() as u64;
             Ok(())
@@ -324,9 +348,17 @@ async fn lookup_or_create_session(
     }
 
     create_session(
-        proxy_id, config, dns_cache, lb_cache, frontend_socket,
-        client_addr, sessions, metrics, tls_no_verify,
-    ).await
+        proxy_id,
+        config,
+        dns_cache,
+        lb_cache,
+        frontend_socket,
+        client_addr,
+        sessions,
+        metrics,
+        tls_no_verify,
+    )
+    .await
 }
 
 /// Spawn a background task that periodically removes idle UDP sessions.
@@ -808,15 +840,23 @@ async fn create_session(
                                 );
                                 // Flush what we have and exit.
                                 reply_session.last_activity.store(now, Ordering::Relaxed);
-                                reply_session.bytes_received.fetch_add(batch_bytes_received, Ordering::Relaxed);
-                                reply_metrics.datagrams_out.fetch_add(batch_dgrams, Ordering::Relaxed);
-                                reply_metrics.bytes_out.fetch_add(batch_bytes, Ordering::Relaxed);
+                                reply_session
+                                    .bytes_received
+                                    .fetch_add(batch_bytes_received, Ordering::Relaxed);
+                                reply_metrics
+                                    .datagrams_out
+                                    .fetch_add(batch_dgrams, Ordering::Relaxed);
+                                reply_metrics
+                                    .bytes_out
+                                    .fetch_add(batch_bytes, Ordering::Relaxed);
                                 // Exit outer loop via return.
                                 if let Some(ref dtls) = reply_dtls {
                                     let _ = dtls.close().await;
                                 }
                                 reply_sessions.remove(&client_addr);
-                                reply_metrics.active_sessions.fetch_sub(1, Ordering::Relaxed);
+                                reply_metrics
+                                    .active_sessions
+                                    .fetch_sub(1, Ordering::Relaxed);
                                 return;
                             }
                         }
@@ -827,9 +867,15 @@ async fn create_session(
 
             // Flush batched metrics.
             reply_session.last_activity.store(now, Ordering::Relaxed);
-            reply_session.bytes_received.fetch_add(batch_bytes_received, Ordering::Relaxed);
-            reply_metrics.datagrams_out.fetch_add(batch_dgrams, Ordering::Relaxed);
-            reply_metrics.bytes_out.fetch_add(batch_bytes, Ordering::Relaxed);
+            reply_session
+                .bytes_received
+                .fetch_add(batch_bytes_received, Ordering::Relaxed);
+            reply_metrics
+                .datagrams_out
+                .fetch_add(batch_dgrams, Ordering::Relaxed);
+            reply_metrics
+                .bytes_out
+                .fetch_add(batch_bytes, Ordering::Relaxed);
         }
         // Session's backend receiver exited — remove session
         // Close DTLS connection if active
