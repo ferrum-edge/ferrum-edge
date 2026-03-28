@@ -17,7 +17,7 @@ Returns the entire gateway configuration as a single JSON document. The output f
 
 ### Key Behaviors
 
-- **Unredacted credentials**: Unlike `GET /consumers` (which redacts `basicauth.password_hash`, `hmac_auth.secret`, `oauth2.client_secret`, and `jwt_auth.secret`), the backup endpoint returns raw credential values. This is necessary for faithful restoration.
+- **Unredacted credentials**: Unlike `GET /consumers` (which redacts `basicauth.password_hash`, `hmac_auth.secret`, `oauth2.client_secret`, and `jwt.secret`), the backup endpoint returns raw credential values. This is necessary for faithful restoration.
 - **Database-first with cached fallback**: Reads from the database when available. If the database is unreachable, falls back to the in-memory cached config and sets the `X-Data-Source: cached` response header.
 - **Content-Disposition header**: Includes `attachment; filename="ferrum-backup.json"` for browser-friendly downloads.
 - **Resource filtering**: Use `?resources=proxies,consumers` to export only specific resource types. Valid values: `proxies`, `consumers`, `plugin_configs`, `upstreams`. Omit the parameter to export everything.

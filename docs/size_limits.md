@@ -113,7 +113,7 @@ Beyond request/response size limits, the Admin API enforces limits on individual
 |-------|-------|-------------|
 | Proxy `listen_path` (regex) | 1024 chars | Maximum pattern length for regex routes (e.g., `~^/api/v\d+`) |
 | Consumer `username` | 255 chars | Maximum length for consumer usernames |
-| Credential type | Whitelist | Only `basicauth`, `keyauth`, `jwt_auth`, `hmac_auth`, `oauth2`, `mtls_auth` |
+| Credential type | Whitelist | Only `basicauth`, `keyauth`, `jwt`, `hmac_auth`, `oauth2`, `mtls_auth` |
 
 These limits are enforced during:
 - Admin API `POST`/`PUT` operations on proxies and consumers

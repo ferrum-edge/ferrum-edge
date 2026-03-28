@@ -12,7 +12,7 @@ fn test_allowed_credential_types_contains_expected() {
     let expected = &[
         "basicauth",
         "keyauth",
-        "jwt_auth",
+        "jwt",
         "hmac_auth",
         "oauth2",
         "mtls_auth",
@@ -116,16 +116,16 @@ fn test_redact_oauth2_client_secret() {
 }
 
 #[test]
-fn test_redact_jwt_auth_secret() {
+fn test_redact_jwt_secret() {
     let mut credentials = std::collections::HashMap::new();
     credentials.insert(
-        "jwt_auth".to_string(),
+        "jwt".to_string(),
         json!({"secret": "my-jwt-secret", "algorithm": "HS256"}),
     );
     let consumer = make_consumer(credentials);
 
     let redacted = ferrum_gateway::admin::redact_consumer_credentials(&consumer);
-    let jwt = redacted.credentials.get("jwt_auth").unwrap();
+    let jwt = redacted.credentials.get("jwt").unwrap();
     assert_eq!(jwt["secret"], "[REDACTED]");
     assert_eq!(jwt["algorithm"], "HS256");
 }

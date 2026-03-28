@@ -1384,7 +1384,7 @@ async fn handle_delete_consumer(
 pub const ALLOWED_CREDENTIAL_TYPES: &[&str] = &[
     "basicauth",
     "keyauth",
-    "jwt_auth",
+    "jwt",
     "hmac_auth",
     "oauth2",
     "mtls_auth",
@@ -2995,7 +2995,7 @@ pub fn redact_consumer_credentials(consumer: &Consumer) -> Consumer {
         obj.insert("client_secret".to_string(), json!("[REDACTED]"));
     }
     // Redact JWT auth secret
-    if let Some(jwt) = redacted.credentials.get_mut("jwt_auth")
+    if let Some(jwt) = redacted.credentials.get_mut("jwt")
         && let Some(obj) = jwt.as_object_mut()
         && obj.contains_key("secret")
     {
