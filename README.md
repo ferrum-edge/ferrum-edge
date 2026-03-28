@@ -929,7 +929,7 @@ curl -X DELETE -H "Authorization: Bearer $TOKEN" http://localhost:9000/upstreams
 
 Supported load balancing algorithms: `round_robin`, `weighted_round_robin`, `least_connections`, `consistent_hashing`, `random`.
 
-To use an upstream with a proxy, set the proxy's `upstream_id` field to the upstream's ID. When set, the upstream's targets override the proxy's `backend_host`/`backend_port`.
+To use an upstream with a proxy, set the proxy's `upstream_id` field to the upstream's ID. When set, the upstream's targets override the proxy's `backend_host`/`backend_port`. Each target may also specify an optional `path` field (e.g., `{"host": "backend1.example.com", "port": 8080, "path": "/v2"}`) which overrides the proxy's `backend_path` when that target is selected.
 
 #### Backup & Restore
 

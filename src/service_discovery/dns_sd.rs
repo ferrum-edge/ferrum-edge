@@ -44,6 +44,7 @@ impl super::ServiceDiscoverer for DnsSdDiscoverer {
                     self.default_weight
                 },
                 tags: HashMap::new(),
+                path: None,
             })
             .collect();
 

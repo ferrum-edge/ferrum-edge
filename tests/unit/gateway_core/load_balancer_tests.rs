@@ -15,6 +15,7 @@ fn make_targets(n: usize) -> Vec<UpstreamTarget> {
             port: 8080,
             weight: 1,
             tags: HashMap::new(),
+            path: None,
         })
         .collect()
 }
@@ -26,12 +27,14 @@ fn make_weighted_targets() -> Vec<UpstreamTarget> {
             port: 8080,
             weight: 5,
             tags: HashMap::new(),
+            path: None,
         },
         UpstreamTarget {
             host: "light".into(),
             port: 8080,
             weight: 1,
             tags: HashMap::new(),
+            path: None,
         },
     ]
 }

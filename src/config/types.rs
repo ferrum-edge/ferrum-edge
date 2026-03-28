@@ -71,6 +71,10 @@ pub struct UpstreamTarget {
     pub weight: u32,
     #[serde(default)]
     pub tags: HashMap<String, String>,
+    /// Optional path prefix that overrides the proxy's `backend_path` when this
+    /// target is selected by the load balancer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
 }
 
 fn default_weight() -> u32 {

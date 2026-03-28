@@ -1614,6 +1614,12 @@ components:
           additionalProperties:
             type: [string, "null"]
           description: Arbitrary key-value tags
+        path:
+          type: [string, "null"]
+          description: >-
+            Optional path prefix that overrides the proxy's backend_path when
+            this target is selected by the load balancer. If omitted or null,
+            the proxy's backend_path is used.
 
     LoadBalancerAlgorithm:
       type: string

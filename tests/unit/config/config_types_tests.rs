@@ -77,6 +77,7 @@ fn make_upstream(id: &str) -> Upstream {
             port: 3000,
             weight: 100,
             tags: HashMap::new(),
+            path: None,
         }],
         algorithm: Default::default(),
         hash_on: None,
@@ -1173,4 +1174,24 @@ fn test_restore_payload_accepts_valid_upstream_reference() {
     config.proxies = vec![p];
     config.upstreams = vec![make_upstream("u1")];
     assert!(config.validate_upstream_references().is_ok());
+}
+
+#[test]
+fn test_upstream_target_path_serde_with_path() {
+    let target: UpstreamTarget =
+        serde_json::from_str(r#"{"host":"a","port":80,"path":"/v2"}"#).unwrap();
+    assert_eq!(target.path, Some("/v2".into()));
+
+    let json = serde_json::to_string(&target).unwrap();
+    assert!(json.contains(r#""path":"/v2""#));
+}
+
+#[test]
+fn test_upstream_target_path_serde_without_path() {
+    let target: UpstreamTarget = serde_json::from_str(r#"{"host":"a","port":80}"#).unwrap();
+    assert_eq!(target.path, None);
+
+    // path should be omitted from serialized output when None
+    let json = serde_json::to_string(&target).unwrap();
+    assert!(!json.contains("path"));
 }

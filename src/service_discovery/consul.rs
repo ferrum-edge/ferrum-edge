@@ -227,6 +227,7 @@ impl super::ServiceDiscoverer for ConsulDiscoverer {
                 port,
                 weight,
                 tags,
+                path: None,
             });
         }
 

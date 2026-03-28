@@ -142,7 +142,7 @@ src/
 | `GatewayConfig` | Top-level config container | proxies, consumers, upstreams, plugins |
 | `Proxy` | A route + backend target | listen_path, hosts, backend_host/port/protocol, plugins, TLS/DNS/timeout overrides, pool_*, circuit_breaker, retry, response_body_mode |
 | `Consumer` | An authenticated client identity | username, custom_id, credentials (HashMap), tags |
-| `Upstream` | A load-balanced target group | targets (host/port/weight), algorithm, health_checks |
+| `Upstream` | A load-balanced target group | targets (host/port/weight/path), algorithm, health_checks |
 | `PluginConfig` | Plugin instance configuration | name, enabled, config (serde_json::Value) |
 | `ServiceDiscoveryConfig` | Dynamic upstream target discovery | provider (dns_sd/kubernetes/consul), poll_interval_seconds, provider-specific settings |
 
