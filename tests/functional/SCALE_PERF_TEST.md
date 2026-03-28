@@ -114,29 +114,29 @@ The test uses the `POST /batch` endpoint introduced to improve admin write throu
 
 ## Baseline Results (SQLite, debug build, Apple Silicon)
 
-Results from a real run on a MacBook, showing proxy hot-path performance as config scales from 3k to 30k:
+Results from a real run on a MacBook (2026-03-28), showing proxy hot-path performance as config scales from 3k to 30k:
 
-| Proxies | RPS | Avg(ms) | P50(ms) | P95(ms) | P99(ms) | % Baseline |
-|---------|-----|---------|---------|---------|---------|------------|
-| 3,000 | 6,611 | 7.6 | 6.6 | 12.3 | 27.4 | 100% |
-| 6,000 | 6,740 | 7.4 | 6.8 | 10.0 | 17.6 | 102% |
-| 9,000 | 7,121 | 7.0 | 6.5 | 8.7 | 13.8 | 108% |
-| 12,000 | 7,056 | 7.1 | 6.6 | 8.8 | 13.1 | 107% |
-| 15,000 | 6,883 | 7.3 | 6.8 | 9.2 | 13.5 | 104% |
-| 18,000 | 6,755 | 7.4 | 7.0 | 9.4 | 13.0 | 102% |
-| 21,000 | 6,535 | 7.6 | 7.1 | 9.8 | 16.0 | 99% |
-| 24,000 | 6,444 | 7.8 | 7.3 | 10.0 | 14.5 | 97% |
-| 27,000 | 6,320 | 7.9 | 7.4 | 10.4 | 16.7 | 96% |
-| 30,000 | 5,931 | 8.4 | 7.8 | 11.6 | 24.2 | 90% |
+| Proxies | RPS | Avg(ms) | P50(ms) | P95(ms) | P99(ms) | Max(ms) | % Baseline |
+|---------|-----|---------|---------|---------|---------|---------|------------|
+| 3,000 | 7,168 | 7.0 | 6.5 | 8.8 | 14.3 | 101.0 | 100% |
+| 6,000 | 7,238 | 6.9 | 6.4 | 8.6 | 14.3 | 117.1 | 101% |
+| 9,000 | 6,680 | 7.5 | 6.8 | 10.5 | 21.6 | 107.9 | 93% |
+| 12,000 | 6,964 | 7.2 | 6.6 | 9.5 | 14.1 | 106.8 | 97% |
+| 15,000 | 6,842 | 7.3 | 6.7 | 9.9 | 14.8 | 65.4 | 95% |
+| 18,000 | 6,445 | 7.8 | 7.1 | 10.9 | 16.1 | 95.6 | 90% |
+| 21,000 | 5,975 | 8.4 | 7.5 | 13.0 | 24.4 | 96.2 | 83% |
+| 24,000 | 5,962 | 8.4 | 7.7 | 12.0 | 24.9 | 80.2 | 83% |
+| 27,000 | 6,253 | 8.0 | 7.4 | 10.9 | 17.7 | 103.5 | 87% |
+| 30,000 | 6,264 | 8.0 | 7.4 | 10.7 | 17.6 | 93.5 | 87% |
 
-**10.3% throughput degradation** from 3k to 30k proxies, 100% success rate, zero failures.
+**12.6% throughput degradation** from 3k to 30k proxies, 100% success rate, zero failures. Consistent RPS across all batches with no cold-start anomalies.
 
-Batch API creation speed: ~3,400-5,500 resources/s (vs ~5-116/s with individual API calls).
+Batch API creation speed: ~5,300-5,500 resources/s (vs ~5-116/s with individual API calls).
 
 ## Interpreting Results
 
 - **RPS % of baseline**: How current throughput compares to the first batch (3k proxies). Ideally stays above 70%.
 - **Latency growth**: Small increases in avg/p50 are expected. Large jumps in p99/max may indicate lock contention or cache rebuild overhead.
 - **Failed requests**: A small number of failures during config reloads is acceptable. The test asserts success rate stays above 50% (a very conservative floor).
-- **Creation speed (resources/s)**: With the batch API, expect 3,000-5,000+ resources/s on SQLite, potentially higher on PostgreSQL. Compare against the baseline of ~5-100/s with individual API calls.
+- **Creation speed (resources/s)**: With the batch API, expect 3,000-5,500+ resources/s on SQLite, potentially higher on PostgreSQL. Compare against the baseline of ~5-100/s with individual API calls.
 - **Throughput degradation > 70%**: The test prints a warning. This would indicate a scaling issue in the router, plugin cache, or consumer index.
