@@ -195,9 +195,9 @@ impl PoolConfig {
         let mut config = self.clone();
 
         // Apply proxy-level overrides if present
-        if let Some(val) = proxy.pool_max_idle_per_host {
-            config.max_idle_per_host = val;
-        }
+        // Note: max_idle_per_host is intentionally global-only — per-proxy overrides
+        // were removed because they fragment the connection pool (different values create
+        // separate reqwest::Client instances for the same backend).
 
         if let Some(val) = proxy.pool_idle_timeout_seconds {
             config.idle_timeout_seconds = val;
@@ -242,10 +242,6 @@ impl PoolConfig {
         if let Some(val) = proxy.pool_http2_max_concurrent_streams {
             config.http2_max_concurrent_streams = Some(val);
         }
-
-        // Validate the final max_idle_per_host after overrides
-        config.max_idle_per_host =
-            Self::validate_max_idle_per_host(config.max_idle_per_host, &proxy.id);
 
         config
     }

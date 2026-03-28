@@ -30,7 +30,7 @@ fn make_proxy(id: &str, listen_path: &str) -> Proxy {
         dns_cache_ttl_seconds: None,
         auth_mode: AuthMode::Single,
         plugins: vec![],
-        pool_max_idle_per_host: None,
+
         pool_idle_timeout_seconds: None,
         pool_enable_http_keep_alive: None,
         pool_enable_http2: None,
@@ -126,7 +126,7 @@ fn test_unique_listen_paths_valid() {
                 dns_cache_ttl_seconds: None,
                 auth_mode: AuthMode::Single,
                 plugins: vec![],
-                pool_max_idle_per_host: Some(10),
+
                 pool_idle_timeout_seconds: Some(30),
                 pool_enable_http_keep_alive: Some(true),
                 pool_enable_http2: Some(true),
@@ -171,7 +171,7 @@ fn test_unique_listen_paths_valid() {
                 dns_cache_ttl_seconds: None,
                 auth_mode: AuthMode::Single,
                 plugins: vec![],
-                pool_max_idle_per_host: Some(10),
+
                 pool_idle_timeout_seconds: Some(30),
                 pool_enable_http_keep_alive: Some(true),
                 pool_enable_http2: Some(true),
@@ -230,7 +230,7 @@ fn test_unique_listen_paths_duplicate() {
                 dns_cache_ttl_seconds: None,
                 auth_mode: AuthMode::Single,
                 plugins: vec![],
-                pool_max_idle_per_host: Some(10),
+
                 pool_idle_timeout_seconds: Some(30),
                 pool_enable_http_keep_alive: Some(true),
                 pool_enable_http2: Some(true),
@@ -275,7 +275,7 @@ fn test_unique_listen_paths_duplicate() {
                 dns_cache_ttl_seconds: None,
                 auth_mode: AuthMode::Single,
                 plugins: vec![],
-                pool_max_idle_per_host: Some(10),
+
                 pool_idle_timeout_seconds: Some(30),
                 pool_enable_http_keep_alive: Some(true),
                 pool_enable_http2: Some(true),

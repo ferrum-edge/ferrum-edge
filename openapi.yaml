@@ -1167,9 +1167,6 @@ components:
           items:
             $ref: "#/components/schemas/PluginAssociation"
           description: Plugin configurations applied to this proxy
-        pool_max_idle_per_host:
-          type: [integer, "null"]
-          description: Max idle connections per host (overrides global, clamped 4–1024)
         pool_idle_timeout_seconds:
           type: [integer, "null"]
           format: uint64

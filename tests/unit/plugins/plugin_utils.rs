@@ -81,7 +81,7 @@ pub fn create_test_proxy() -> Proxy {
         dns_cache_ttl_seconds: None,
         auth_mode: AuthMode::Single,
         plugins: vec![],
-        pool_max_idle_per_host: None,
+
         pool_idle_timeout_seconds: None,
         pool_enable_http_keep_alive: None,
         pool_enable_http2: None,

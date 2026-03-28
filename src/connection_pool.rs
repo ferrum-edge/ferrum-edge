@@ -89,7 +89,7 @@ impl ConnectionPool {
         // Get effective configuration (global defaults + proxy overrides)
         let config = self.global_config.for_proxy(proxy);
 
-        let pool_key = self.create_pool_key(proxy, &config);
+        let pool_key = self.create_pool_key(proxy);
 
         // Try to get existing client from pool
         if let Some(entry) = self.pools.get(&pool_key) {
@@ -223,28 +223,24 @@ impl ConnectionPool {
 
     /// Create pool key for caching clients.
     ///
-    /// Keyed by proxy-level configuration (host, port, protocol, pool settings,
-    /// dns_override). All upstream targets in the same proxy share one pool
-    /// entry because `reqwest::Client` handles per-host connection pooling
-    /// internally — different target hostnames in the URL get separate TCP
-    /// connections and TLS sessions (with correct SNI) automatically.
-    /// Create pool key for caching clients.
-    ///
     /// ⚠️  CRITICAL — DO NOT add fields to this key without careful analysis.
     /// Adding fields causes pool fragmentation: N proxies with different values
     /// create N separate reqwest::Client instances instead of sharing one,
     /// which destroys connection reuse and causes P95 latency regressions.
     ///
-    /// Only includes fields that affect connection *behavior* — host, port,
-    /// protocol, pool size, and DNS override.  `idle_timeout_seconds` is
-    /// intentionally excluded: it controls when idle connections are reaped
-    /// but does not change how connections are created or used, so proxies
-    /// with different idle timeouts can safely share a `reqwest::Client`
-    /// (which has its own internal connection pool keyed by URL).  Including
-    /// idle_timeout would cause unnecessary pool fragmentation — e.g., 50
-    /// proxies with slightly different timeouts hitting the same backend
-    /// would create 50 separate clients instead of 1.
-    fn create_pool_key(&self, proxy: &Proxy, config: &PoolConfig) -> String {
+    /// Only includes fields that affect connection *routing* — destination,
+    /// protocol, and DNS override.  Configuration-only fields like
+    /// `idle_timeout_seconds` and `max_idle_per_host` are intentionally
+    /// excluded: they control cleanup/sizing policy but don't change how
+    /// connections are created or routed.  `max_idle_per_host` is global-only
+    /// (set via `FERRUM_POOL_MAX_IDLE_PER_HOST`) so all clients sharing a
+    /// destination use the same pool ceiling, maximizing connection reuse.
+    ///
+    /// All upstream targets in the same proxy share one pool entry because
+    /// `reqwest::Client` handles per-host connection pooling internally —
+    /// different target hostnames in the URL get separate TCP connections
+    /// and TLS sessions (with correct SNI) automatically.
+    fn create_pool_key(&self, proxy: &Proxy) -> String {
         let override_str = proxy.dns_override.as_deref().unwrap_or_default();
         // When the proxy uses an upstream for load balancing, key by upstream_id
         // instead of backend_host:port. The upstream defines the actual targets;
@@ -257,8 +253,8 @@ impl ConnectionPool {
             format!("{}:{}", proxy.backend_host, proxy.backend_port)
         };
         format!(
-            "{}:{}:{}:{}",
-            destination, proxy.backend_protocol as u8, config.max_idle_per_host, override_str
+            "{}:{}:{}",
+            destination, proxy.backend_protocol as u8, override_str
         )
     }
 

@@ -123,7 +123,7 @@ impl V001InitialSchema {
                 circuit_breaker TEXT,
                 retry TEXT,
                 response_body_mode VARCHAR(50) NOT NULL DEFAULT 'stream',
-                pool_max_idle_per_host INTEGER,
+
                 pool_idle_timeout_seconds INTEGER,
                 pool_enable_http_keep_alive INTEGER,
                 pool_enable_http2 INTEGER,
@@ -171,7 +171,7 @@ impl V001InitialSchema {
                 circuit_breaker TEXT,
                 retry TEXT,
                 response_body_mode TEXT NOT NULL DEFAULT 'stream',
-                pool_max_idle_per_host INTEGER,
+
                 pool_idle_timeout_seconds INTEGER,
                 pool_enable_http_keep_alive INTEGER,
                 pool_enable_http2 INTEGER,

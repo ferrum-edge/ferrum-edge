@@ -451,7 +451,6 @@ proxies:
     # Response body mode: "stream" (default) or "buffer"
     # response_body_mode: stream
     # Connection pooling settings (optional - override global defaults)
-    pool_max_idle_per_host: 25          # Override global default (10)
     pool_idle_timeout_seconds: 120      # Override global default (90)
     # pool_enable_http_keep_alive and pool_enable_http2 use global defaults
     auth_mode: single
@@ -594,7 +593,6 @@ FERRUM_POOL_HTTP2_MAX_CONCURRENT_STREAMS=1000              # Concurrent streams 
 proxies:
   - id: "high-traffic-api"
     # Override specific settings for this proxy
-    pool_max_idle_per_host: 128
     pool_enable_http2: false
     pool_tcp_keepalive_seconds: 30
     pool_http2_keep_alive_interval_seconds: 15
@@ -631,13 +629,14 @@ proxies:
 | `FERRUM_POOL_HTTP2_MAX_FRAME_SIZE` | `65535` | Maximum HTTP/2 frame payload (bytes). Range: 16384–16777215 |
 | `FERRUM_POOL_HTTP2_MAX_CONCURRENT_STREAMS` | `1000` | Max concurrent HTTP/2 streams per backend connection |
 
-### Sizing `pool_max_idle_per_host`
+### Sizing `FERRUM_POOL_MAX_IDLE_PER_HOST`
 
 This is the single most important pool setting for performance and reliability.
 It controls how many idle backend connections are kept alive and ready for reuse
 per backend host. Values that are too low cause connection churn under load (new
 TCP handshakes per request), while values that are too high waste file
-descriptors and memory.
+descriptors and memory. This is configured globally via the
+`FERRUM_POOL_MAX_IDLE_PER_HOST` environment variable.
 
 **Safety bounds:** The gateway enforces a minimum of **4** and a maximum of
 **1024**. Values outside this range are automatically clamped with a warning in
@@ -704,7 +703,6 @@ FERRUM_POOL_ENABLE_HTTP2=true
 #### WebSocket Services
 ```yaml
 # Per-proxy override for WS/WSS
-pool_max_idle_per_host: 32
 pool_idle_timeout_seconds: 300
 pool_enable_http2: false  # HTTP/1.1 recommended for WebSockets
 ```
@@ -712,14 +710,13 @@ pool_enable_http2: false  # HTTP/1.1 recommended for WebSockets
 #### Auth-Protected APIs
 ```yaml
 # Per-proxy override for auth-heavy services
-pool_max_idle_per_host: 64
 pool_enable_http2: false  # Better compatibility with auth plugins
 ```
 
 ### Performance Impact
 
 In performance tests (8 threads, 100 connections, 30 seconds), connection
-pooling with properly tuned `pool_max_idle_per_host` provides:
+pooling with properly tuned `FERRUM_POOL_MAX_IDLE_PER_HOST` provides:
 - **~88,500 RPS** for lightweight health checks through the gateway
 - **~77,000 RPS** for API proxy vs ~60,000 RPS direct backend access
 - **1.10ms avg latency** for health checks, ~1.24ms for API proxy

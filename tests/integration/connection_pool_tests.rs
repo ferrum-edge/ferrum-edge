@@ -29,7 +29,7 @@ fn create_test_proxy() -> Proxy {
         dns_cache_ttl_seconds: None,
         auth_mode: AuthMode::Single,
         plugins: vec![],
-        pool_max_idle_per_host: None,
+
         pool_idle_timeout_seconds: None,
         pool_enable_http_keep_alive: None,
         pool_enable_http2: None,
@@ -299,7 +299,6 @@ async fn test_pool_with_proxy_config_overrides() {
     );
 
     let mut proxy = create_test_proxy();
-    proxy.pool_max_idle_per_host = Some(25);
     proxy.pool_idle_timeout_seconds = Some(120);
     proxy.pool_tcp_keepalive_seconds = Some(30);
 
@@ -432,30 +431,5 @@ async fn test_idle_timeout_does_not_fragment_pool() {
     assert_eq!(
         stats.total_pools, 1,
         "Different idle_timeout_seconds should NOT fragment the pool"
-    );
-}
-
-#[tokio::test]
-async fn test_max_idle_per_host_does_fragment_pool() {
-    let pool = ConnectionPool::new(
-        PoolConfig::default(),
-        create_test_env_config(),
-        create_test_dns_cache(),
-    );
-
-    // Different max_idle_per_host IS in the pool key (affects connection behavior)
-    let mut proxy1 = create_test_proxy();
-    proxy1.pool_max_idle_per_host = Some(10);
-
-    let mut proxy2 = create_test_proxy();
-    proxy2.pool_max_idle_per_host = Some(50);
-
-    let _client1 = pool.get_client(&proxy1).await.unwrap();
-    let _client2 = pool.get_client(&proxy2).await.unwrap();
-
-    let stats = pool.get_stats();
-    assert_eq!(
-        stats.total_pools, 2,
-        "Different max_idle_per_host should create separate pool entries"
     );
 }

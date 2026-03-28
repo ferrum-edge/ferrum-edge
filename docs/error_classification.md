@@ -38,7 +38,7 @@ These error classes typically indicate problems with the gateway node itself or 
 - **`ConnectionTimeout`** — Check network connectivity to the backend. Verify firewall rules allow outbound connections. Consider increasing the proxy's `connect_timeout` if the backend is on a high-latency network.
 - **`ConnectionRefused`** — Verify the backend is running and listening on the expected host:port. Check `backend_host` and `backend_port` in the proxy config.
 - **`DnsLookupError`** — Check DNS resolver configuration. Verify the `backend_host` hostname is correct and resolvable. Check `/etc/resolv.conf` or the gateway's DNS settings.
-- **`ConnectionPoolError`** — The gateway may be under heavy load with all pooled connections in use. Consider increasing `pool_max_idle_per_host` or `pool_idle_timeout` on the proxy.
+- **`ConnectionPoolError`** — The gateway may be under heavy load with all pooled connections in use. Consider increasing the global `FERRUM_POOL_MAX_IDLE_PER_HOST` env var or the per-proxy `pool_idle_timeout` setting.
 
 ### TLS Issues
 

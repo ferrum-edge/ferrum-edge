@@ -16,7 +16,6 @@ proxies:
     backend_write_timeout_ms: 30000
     backend_tls_verify_server_cert: true
     # Override global defaults for this high-traffic external API
-    pool_max_idle_per_host: 25
     pool_idle_timeout_seconds: 120
     pool_tcp_keepalive_seconds: 45
     pool_http2_keep_alive_interval_seconds: 20  # More frequent pings for high-traffic API
@@ -53,7 +52,6 @@ proxies:
     backend_port: 8080
     strip_listen_path: true
     # Override global defaults for WebSocket connections
-    pool_max_idle_per_host: 10
     pool_idle_timeout_seconds: 300
     pool_tcp_keepalive_seconds: 90  # Longer keep-alive for persistent WebSocket connections
     pool_http2_keep_alive_interval_seconds: 60  # Less frequent pings for persistent connections
@@ -72,7 +70,6 @@ proxies:
     backend_port: 8443
     strip_listen_path: true
     # Override global defaults for secure WebSocket connections
-    pool_max_idle_per_host: 10
     pool_idle_timeout_seconds: 300
     pool_tcp_keepalive_seconds: 90  # Longer keep-alive for persistent WebSocket connections
     pool_http2_keep_alive_interval_seconds: 60  # Less frequent pings for persistent connections
@@ -90,7 +87,6 @@ proxies:
     backend_port: 3001
     strip_listen_path: true
     # Conservative settings for auth-protected APIs
-    pool_max_idle_per_host: 20
     pool_enable_http2: false  # Better compatibility with auth plugins
     # Other settings use global defaults
     # Buffer mode: collect entire response before forwarding to client.
@@ -111,7 +107,6 @@ proxies:
     backend_port: 3002
     strip_listen_path: true
     # Conservative settings for multi-auth APIs
-    pool_max_idle_per_host: 15
     pool_enable_http2: false  # Better compatibility with auth plugins
     # Other settings use global defaults
     auth_mode: multi

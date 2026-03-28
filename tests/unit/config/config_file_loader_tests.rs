@@ -90,7 +90,6 @@ proxies:
     backend_read_timeout_ms: 30000
     backend_write_timeout_ms: 30000
     backend_tls_verify_server_cert: true
-    pool_max_idle_per_host: 25
     pool_idle_timeout_seconds: 120
     pool_tcp_keepalive_seconds: 45
     pool_http2_keep_alive_interval_seconds: 20
@@ -156,7 +155,6 @@ plugin_configs:
     assert!(!config.proxies[0].preserve_host_header);
     assert_eq!(config.proxies[0].backend_connect_timeout_ms, 5000);
     assert_eq!(config.proxies[0].auth_mode, AuthMode::Single);
-    assert_eq!(config.proxies[0].pool_max_idle_per_host, Some(25));
     assert_eq!(config.proxies[0].pool_idle_timeout_seconds, Some(120));
     assert_eq!(config.proxies[0].pool_tcp_keepalive_seconds, Some(45));
     assert_eq!(config.proxies[1].auth_mode, AuthMode::Multi);
@@ -496,7 +494,6 @@ proxies:
     backend_tls_server_ca_cert_path: "/etc/certs/ca.pem"
     dns_override: "192.168.1.1"
     dns_cache_ttl_seconds: 300
-    pool_max_idle_per_host: 50
     pool_idle_timeout_seconds: 180
     pool_enable_http_keep_alive: true
     pool_enable_http2: true
@@ -528,7 +525,7 @@ plugin_configs: []
     );
     assert_eq!(proxy.dns_override, Some("192.168.1.1".to_string()));
     assert_eq!(proxy.dns_cache_ttl_seconds, Some(300));
-    assert_eq!(proxy.pool_max_idle_per_host, Some(50));
+
     assert_eq!(proxy.pool_idle_timeout_seconds, Some(180));
     assert_eq!(proxy.pool_enable_http_keep_alive, Some(true));
     assert_eq!(proxy.pool_enable_http2, Some(true));
@@ -558,7 +555,7 @@ plugin_configs: []
     assert_eq!(proxy.backend_path, None);
     assert_eq!(proxy.dns_override, None);
     assert_eq!(proxy.dns_cache_ttl_seconds, None);
-    assert_eq!(proxy.pool_max_idle_per_host, None);
+
     assert_eq!(proxy.pool_idle_timeout_seconds, None);
 }
 

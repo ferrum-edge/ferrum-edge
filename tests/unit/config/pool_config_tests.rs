@@ -28,7 +28,7 @@ fn create_test_proxy() -> Proxy {
         dns_cache_ttl_seconds: None,
         auth_mode: AuthMode::Single,
         plugins: vec![],
-        pool_max_idle_per_host: None,
+
         pool_idle_timeout_seconds: None,
         pool_enable_http_keep_alive: None,
         pool_enable_http2: None,
@@ -71,14 +71,13 @@ fn test_proxy_overrides() {
     let mut proxy = create_test_proxy();
 
     // Apply overrides
-    proxy.pool_max_idle_per_host = Some(25);
     proxy.pool_enable_http2 = Some(false);
     proxy.pool_tcp_keepalive_seconds = Some(30);
     proxy.pool_http2_keep_alive_interval_seconds = Some(15);
     proxy.pool_http2_keep_alive_timeout_seconds = Some(45);
 
     let config = global.for_proxy(&proxy);
-    assert_eq!(config.max_idle_per_host, 25);
+    assert_eq!(config.max_idle_per_host, 64); // unchanged (global-only)
     assert_eq!(config.idle_timeout_seconds, 90); // unchanged
     assert_eq!(config.tcp_keepalive_seconds, 30); // overridden
     assert_eq!(config.http2_keep_alive_interval_seconds, 15); // overridden

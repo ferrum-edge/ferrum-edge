@@ -15,7 +15,6 @@ proxies:
     backend_write_timeout_ms: 10000
     backend_tls_verify_server_cert: false
     auth_mode: single
-    pool_max_idle_per_host: 200
     pool_enable_http2: true
     pool_http2_keep_alive_interval_seconds: 30
     pool_http2_keep_alive_timeout_seconds: 45
@@ -40,7 +39,6 @@ proxies:
     backend_write_timeout_ms: 5000
     backend_tls_verify_server_cert: false
     auth_mode: single
-    pool_max_idle_per_host: 200
     pool_enable_http2: true
     plugins: []
 

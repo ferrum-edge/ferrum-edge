@@ -71,7 +71,7 @@ fn create_http3_test_proxy() -> Proxy {
         dns_cache_ttl_seconds: None,
         auth_mode: ferrum_gateway::config::types::AuthMode::Single,
         plugins: vec![],
-        pool_max_idle_per_host: Some(10),
+
         pool_idle_timeout_seconds: Some(90),
         pool_enable_http_keep_alive: Some(true),
         pool_enable_http2: Some(true),

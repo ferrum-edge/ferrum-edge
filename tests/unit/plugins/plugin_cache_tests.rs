@@ -35,7 +35,7 @@ fn make_proxy(id: &str, listen_path: &str, plugin_ids: Vec<&str>) -> Proxy {
                 plugin_config_id: id.to_string(),
             })
             .collect(),
-        pool_max_idle_per_host: None,
+
         pool_idle_timeout_seconds: None,
         pool_enable_http_keep_alive: None,
         pool_enable_http2: None,

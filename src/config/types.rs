@@ -576,8 +576,10 @@ pub struct Proxy {
     #[serde(default)]
     pub plugins: Vec<PluginAssociation>,
     // Connection pooling settings (optional - override global defaults)
-    #[serde(default)]
-    pub pool_max_idle_per_host: Option<usize>,
+    // Note: pool_max_idle_per_host is intentionally global-only (FERRUM_POOL_MAX_IDLE_PER_HOST).
+    // Per-proxy overrides were removed because they fragment the connection pool — different
+    // values create separate reqwest::Client instances for the same backend, destroying
+    // connection reuse and increasing P95 latency.
     #[serde(default)]
     pub pool_idle_timeout_seconds: Option<u64>,
     #[serde(default)]

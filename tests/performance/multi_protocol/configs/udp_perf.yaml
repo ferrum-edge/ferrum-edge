@@ -24,7 +24,6 @@ proxies:
     backend_read_timeout_ms: 5000
     backend_write_timeout_ms: 5000
     auth_mode: single
-    pool_max_idle_per_host: 200
     plugins: []
 
 consumers: []

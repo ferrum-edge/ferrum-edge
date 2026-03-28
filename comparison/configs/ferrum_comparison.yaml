@@ -16,7 +16,6 @@ proxies:
     backend_write_timeout_ms: 5000
     backend_tls_verify_server_cert: true
     auth_mode: single
-    pool_max_idle_per_host: 200
     plugins: []
 
   - id: "proxy-users"
@@ -32,7 +31,6 @@ proxies:
     backend_write_timeout_ms: 5000
     backend_tls_verify_server_cert: true
     auth_mode: single
-    pool_max_idle_per_host: 200
     pool_idle_timeout_seconds: 180
     plugins: []
 
