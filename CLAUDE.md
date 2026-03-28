@@ -68,7 +68,7 @@ All four jobs must pass for a PR to merge.
 | Mode | Description | Admin API | Proxy | Config Source |
 |------|-------------|-----------|-------|---------------|
 | `database` | Single-instance, DB-backed | Read/Write | Yes | PostgreSQL/MySQL/SQLite via polling |
-| `file` | Single-instance, file-backed | Read-only | Yes | YAML/JSON file, SIGHUP reload |
+| `file` | Single-instance, file-backed | Read-only | Yes | YAML/JSON file, SIGHUP reload (Unix only) |
 | `cp` | Control Plane | Read/Write | **No** | Database + gRPC distribution |
 | `dp` | Data Plane | Read-only | Yes | gRPC stream from CP |
 | `migrate` | Schema migration utility | No | No | Runs DB migrations then exits |

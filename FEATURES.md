@@ -15,7 +15,7 @@ A comprehensive feature list for Ferrum Gateway.
 ## Operating Modes
 
 - **Database** — single-instance with PostgreSQL, MySQL, or SQLite backend
-- **File** — single-instance with YAML/JSON config, SIGHUP reload
+- **File** — single-instance with YAML/JSON config, SIGHUP reload (Unix only; restart required on other platforms)
 - **Control Plane (CP)** — centralized config authority, gRPC distribution to DPs
 - **Data Plane (DP)** — horizontally scalable traffic processing nodes
 

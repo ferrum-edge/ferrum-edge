@@ -223,6 +223,13 @@ pub async fn run(
                 }
             }
         }
+        #[cfg(not(unix))]
+        {
+            warn!(
+                "SIGHUP config reload is not available on this platform. Restart the process to apply config changes."
+            );
+            let _ = sighup_shutdown.changed().await;
+        }
     });
 
     // Start Admin API (read-only in file mode)
@@ -233,9 +240,11 @@ pub async fn run(
                 "Admin JWT not configured ({}), admin endpoints will reject requests",
                 e
             );
-            // Create a dummy JWT manager that will reject all requests
+            // Create a JWT manager with a random secret so externally-crafted
+            // tokens are rejected — no one can predict the secret.
+            let random_secret = format!("{}{}", uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
             crate::admin::jwt_auth::JwtManager::new(crate::admin::jwt_auth::JwtConfig {
-                secret: "file-mode-no-jwt-configured".to_string(),
+                secret: random_secret,
                 ..Default::default()
             })
         }

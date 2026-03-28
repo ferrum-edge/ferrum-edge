@@ -15,6 +15,22 @@ pub fn load_config_from_file(path: &str) -> Result<GatewayConfig, anyhow::Error>
         anyhow::bail!("Configuration file not found: {}", file_path.display());
     }
 
+    // Warn if the config file is world-readable (may contain credentials)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(metadata) = std::fs::metadata(file_path) {
+            let mode = metadata.permissions().mode();
+            if mode & 0o004 != 0 {
+                warn!(
+                    "Config file {} is world-readable (mode {:o}). Consider restricting permissions as it may contain credentials.",
+                    file_path.display(),
+                    mode & 0o777
+                );
+            }
+        }
+    }
+
     let content = std::fs::read_to_string(file_path)?;
     let ext = file_path
         .extension()

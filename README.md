@@ -15,7 +15,7 @@ Ferrum Gateway is a lightweight, extensible API gateway designed for modern micr
 - **Router Cache**: Pre-sorted route table with bounded O(1) path cache; rebuilt atomically on config changes, never on hot path
 - **Longest Prefix Match Routing**: Efficient route matching with wildcard path-suffix forwarding and unique `listen_path` enforcement
 - **Host-Based Routing**: Optional per-proxy hostname matching with exact and wildcard prefix support (e.g., `*.example.com`)
-- **Dynamic Configuration**: Zero-downtime configuration reloads via DB polling, SIGHUP signals, or CP push
+- **Dynamic Configuration**: Zero-downtime configuration reloads via DB polling, SIGHUP signals (Unix only), or CP push
 - **Plugin System**: Extensible pipeline with lifecycle hooks for authentication, authorization, transformation, rate limiting, and logging
 - **Multi-Authentication**: Chain multiple auth plugins with first-match consumer identification
 - **TLS/mTLS Support**: Frontend TLS termination and backend mTLS with configurable certificate verification

@@ -363,13 +363,23 @@ Using `--test-threads=1` prevents port conflicts when multiple functional tests 
 
 ## Known Limitations
 
-1. **Functional Tests on Windows**: File mode tests use Unix signal handling (SIGHUP). Windows versions need process management alternatives.
+1. **SIGHUP Reload is Unix-only**: File mode config reload via SIGHUP is only available on Unix platforms. On non-Unix platforms (e.g., Windows), a warning is logged at startup and a process restart is required to apply config changes.
 
-2. **Port Conflicts**: Tests use fixed ports (8080, 8443, 9999, etc.). Ensure these are available during testing.
+2. **Functional Tests on Windows**: File mode tests use Unix signal handling (SIGHUP). Windows versions need process management alternatives.
 
-3. **Binary Caching**: Tests rebuild the binary each run. Use `--release` mode for faster builds in CI.
+3. **Port Conflicts**: Tests use fixed ports (8080, 8443, 9999, etc.). Ensure these are available during testing.
 
-4. **Timeout Sensitivity**: SIGHUP reload tests rely on timing. On slow systems, may need to increase wait times.
+4. **Binary Caching**: Tests rebuild the binary each run. Use `--release` mode for faster builds in CI.
+
+5. **Timeout Sensitivity**: SIGHUP reload tests rely on timing. On slow systems, may need to increase wait times.
+
+## Security Notes
+
+- **Config file permissions**: The gateway warns at startup if the config file is world-readable (Unix only). Since config files may contain consumer credentials (API keys, passwords, JWT secrets), restrict file permissions (e.g., `chmod 600`).
+
+- **Admin API JWT in file mode**: When `FERRUM_ADMIN_JWT_SECRET` is not configured, the admin API uses a randomly generated secret per process start. This means the admin API is effectively inaccessible (no one can forge valid tokens), but it is still recommended to either set an explicit JWT secret or restrict network access to the admin port.
+
+- **ferrum.conf precedence**: Values in `ferrum.conf` take precedence over environment variables. If both are set for the same key with different values, a warning is logged. Be aware that a stale `ferrum.conf` in the working directory can silently override explicit env vars.
 
 ## Future Improvements
 
