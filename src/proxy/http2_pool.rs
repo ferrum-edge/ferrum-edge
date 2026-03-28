@@ -89,6 +89,16 @@ impl Http2ConnectionPool {
     }
 
     /// Get or create an HTTP/2 connection to the HTTPS backend.
+    ///
+    /// Returns a sender that has been `ready()`-checked, meaning the H2
+    /// connection has capacity for at least one more stream. This is critical
+    /// for scaling under high concurrency: without the readiness check, all
+    /// concurrent requests pile onto one sender and exceed
+    /// `MAX_CONCURRENT_STREAMS`, causing stream resets and errors.
+    ///
+    /// When the selected shard's sender is not ready (back-pressure), we
+    /// try other shards round-robin before blocking, spreading load across
+    /// all pooled connections.
     pub async fn get_sender(
         &self,
         proxy: &Proxy,
@@ -103,24 +113,76 @@ impl Http2ConnectionPool {
             .or_insert_with(|| Arc::new(AtomicUsize::new(0)))
             .clone();
         let start = rr.fetch_add(1, Ordering::Relaxed) % shard_count;
-        let selected_key = Self::shard_key(&base_key, start);
 
-        if let Some(entry) = self.entries.get(&selected_key) {
-            if !entry.sender.is_closed() {
+        // Two-phase readiness check:
+        //
+        // Phase 1 (zero-cost): poll each shard's sender once without blocking.
+        //   At low concurrency, the sender is almost always immediately ready,
+        //   so this returns in nanoseconds with no timeout overhead.
+        //
+        // Phase 2 (back-pressure): if no shard was instantly ready, re-scan
+        //   with a short timeout per shard, giving each H2 connection a chance
+        //   to free a stream slot before we fall through to creating a new connection.
+        let mut first_live_key: Option<String> = None;
+        for offset in 0..shard_count {
+            let shard = (start + offset) % shard_count;
+            let key = Self::shard_key(&base_key, shard);
+
+            if let Some(entry) = self.entries.get(&key) {
+                if entry.sender.is_closed() {
+                    drop(entry);
+                    self.entries.remove(&key);
+                    continue;
+                }
+                let mut sender = entry.sender.clone();
                 entry
                     .last_used_epoch_ms
                     .store(now_epoch_ms(), Ordering::Relaxed);
-                return Ok(entry.sender.clone());
+                drop(entry);
+
+                // Instant poll — no timer, no allocation, just check if ready now
+                match futures_util::FutureExt::now_or_never(sender.ready()) {
+                    Some(Ok(())) => return Ok(sender),
+                    Some(Err(_)) => {
+                        // Connection error — evict and try next shard
+                        self.entries.remove(&key);
+                        continue;
+                    }
+                    None => {
+                        // Not ready yet — remember this shard for phase 2
+                        if first_live_key.is_none() {
+                            first_live_key = Some(key);
+                        }
+                    }
+                }
             }
-            drop(entry);
-            self.entries.remove(&selected_key);
         }
 
-        // Fill the selected shard eagerly so round-robin distribution actually
-        // materializes multiple backend connections under load.
+        // Phase 2: no shard was instantly ready (high concurrency / back-pressure).
+        // Wait briefly on the first live shard for a stream slot to free up.
+        if let Some(key) = first_live_key
+            && let Some(entry) = self.entries.get(&key)
+        {
+            let mut sender = entry.sender.clone();
+            drop(entry);
+            match tokio::time::timeout(Duration::from_millis(5), sender.ready()).await {
+                Ok(Ok(())) => return Ok(sender),
+                Ok(Err(_)) => {
+                    self.entries.remove(&key);
+                }
+                Err(_) => {
+                    // Still not ready after 5ms — fall through to create new connection
+                }
+            }
+        }
+
+        // No existing shard was ready — create a new connection on the
+        // originally selected shard.
+        let selected_key = Self::shard_key(&base_key, start);
         let sender = match self.create_connection(proxy, dns_cache).await {
             Ok(sender) => sender,
             Err(err) => {
+                // Connection failed — try to find any live shard as fallback
                 for offset in 1..shard_count {
                     let shard = (start + offset) % shard_count;
                     let key = Self::shard_key(&base_key, shard);

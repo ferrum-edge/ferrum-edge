@@ -120,6 +120,10 @@ impl GrpcConnectionPool {
     }
 
     /// Get or create an HTTP/2 connection to the gRPC backend.
+    ///
+    /// Returns a sender that has been `ready()`-checked, meaning the H2
+    /// connection has capacity for at least one more stream. Uses the same
+    /// two-phase readiness strategy as `Http2ConnectionPool::get_sender`.
     pub async fn get_sender(
         &self,
         proxy: &Proxy,
@@ -137,21 +141,61 @@ impl GrpcConnectionPool {
 
         // Reusable buffer for shard key construction (avoids per-request String allocation)
         let mut key_buf = String::with_capacity(base_key.len() + 4);
-        Self::write_shard_key(&mut key_buf, &base_key, start);
 
-        if let Some(entry) = self.entries.get(&key_buf) {
-            if !entry.sender.is_closed() {
+        // Two-phase readiness check (see Http2ConnectionPool::get_sender for rationale):
+        // Phase 1: instant poll each shard without blocking.
+        // Phase 2: if none ready, wait briefly on first live shard.
+        let mut first_live_key: Option<String> = None;
+        for offset in 0..shard_count {
+            let shard = (start + offset) % shard_count;
+            Self::write_shard_key(&mut key_buf, &base_key, shard);
+
+            if let Some(entry) = self.entries.get(&key_buf) {
+                if entry.sender.is_closed() {
+                    drop(entry);
+                    self.entries.remove(&key_buf);
+                    continue;
+                }
+                let mut sender = entry.sender.clone();
                 entry
                     .last_used_epoch_ms
                     .store(now_epoch_ms(), Ordering::Relaxed);
-                return Ok(entry.sender.clone());
+                drop(entry);
+
+                match futures_util::FutureExt::now_or_never(sender.ready()) {
+                    Some(Ok(())) => return Ok(sender),
+                    Some(Err(_)) => {
+                        self.entries.remove(&key_buf);
+                        continue;
+                    }
+                    None => {
+                        if first_live_key.is_none() {
+                            first_live_key = Some(key_buf.clone());
+                        }
+                    }
+                }
             }
-            drop(entry);
-            self.entries.remove(&key_buf);
         }
 
-        // Fill the selected shard eagerly so round-robin distribution actually
-        // materializes multiple backend connections under load.
+        // Phase 2: wait briefly on first live shard for a stream slot to free up.
+        if let Some(key) = first_live_key
+            && let Some(entry) = self.entries.get(&key)
+        {
+            let mut sender = entry.sender.clone();
+            drop(entry);
+            match tokio::time::timeout(Duration::from_millis(5), sender.ready()).await {
+                Ok(Ok(())) => return Ok(sender),
+                Ok(Err(_)) => {
+                    self.entries.remove(&key);
+                }
+                Err(_) => {
+                    // Still not ready after 5ms — fall through to create new connection
+                }
+            }
+        }
+
+        // No existing shard was ready — create a new connection.
+        Self::write_shard_key(&mut key_buf, &base_key, start);
         let sender = match self.create_connection(proxy, dns_cache).await {
             Ok(sender) => sender,
             Err(err) => {
@@ -172,7 +216,6 @@ impl GrpcConnectionPool {
                 return Err(err);
             }
         };
-        // Reset key_buf to the originally selected shard for insertion
         Self::write_shard_key(&mut key_buf, &base_key, start);
         let sender = match self.entries.entry(key_buf) {
             dashmap::mapref::entry::Entry::Occupied(mut occupied) => {
