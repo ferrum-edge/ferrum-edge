@@ -1,5 +1,6 @@
 use ferrum_gateway::plugins::body_transform::{
-    get_nested_value, remove_nested_value, rename_nested_field, set_nested_value,
+    get_nested_value, is_json_content_type, remove_nested_value, rename_nested_field,
+    set_nested_value,
 };
 use serde_json::json;
 
@@ -87,4 +88,29 @@ fn test_rename_nested_field_missing_source() {
         "user.missing",
         "user.new_key"
     ));
+}
+
+#[test]
+fn test_get_nested_value_deep() {
+    let root = json!({"user": {"address": {"city": "NYC"}}});
+    assert_eq!(
+        get_nested_value(&root, "user.address.city"),
+        Some(&json!("NYC"))
+    );
+}
+
+#[test]
+fn test_rename_across_levels() {
+    let mut root = json!({"old": {"nested": {"key": "val"}}});
+    assert!(rename_nested_field(&mut root, "old.nested.key", "flat_key"));
+    assert_eq!(root, json!({"old": {"nested": {}}, "flat_key": "val"}));
+}
+
+#[test]
+fn test_is_json_content_type() {
+    assert!(is_json_content_type("application/json"));
+    assert!(is_json_content_type("application/json; charset=utf-8"));
+    assert!(is_json_content_type("application/vnd.api+json"));
+    assert!(!is_json_content_type("text/html"));
+    assert!(!is_json_content_type("application/xml"));
 }
