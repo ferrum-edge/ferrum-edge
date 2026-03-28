@@ -345,12 +345,18 @@ impl ProxyState {
             .chain(delta.modified_plugin_configs.iter())
             .any(|pc| pc.scope == crate::config::types::PluginScope::Global)
             || !delta.removed_plugin_config_ids.is_empty();
-        self.plugin_cache.apply_delta(
+        if let Err(e) = self.plugin_cache.apply_delta(
             &new_config,
             &proxy_ids_to_rebuild,
             &delta.removed_proxy_ids,
             rebuild_globals,
-        );
+        ) {
+            error!(
+                "Config reload rejected — security plugin validation failed: {}",
+                e
+            );
+            return false;
+        }
 
         // --- ConsumerIndex: surgical add/remove/update ---
         self.consumer_index.apply_delta(
@@ -626,12 +632,18 @@ impl ProxyState {
             .chain(delta.modified_plugin_configs.iter())
             .any(|pc| pc.scope == crate::config::types::PluginScope::Global)
             || !delta.removed_plugin_config_ids.is_empty();
-        self.plugin_cache.apply_delta(
+        if let Err(e) = self.plugin_cache.apply_delta(
             &new_config,
             &proxy_ids_to_rebuild,
             &delta.removed_proxy_ids,
             rebuild_globals,
-        );
+        ) {
+            error!(
+                "Config reload rejected — security plugin validation failed: {}",
+                e
+            );
+            return false;
+        }
 
         // --- ConsumerIndex ---
         self.consumer_index.apply_delta(
@@ -2774,7 +2786,13 @@ async fn proxy_to_backend_retry(
                     error_class: None,
                 }
             } else {
-                let body = response.bytes().await.unwrap_or_default().to_vec();
+                let body = match response.bytes().await {
+                    Ok(b) => b.to_vec(),
+                    Err(e) => {
+                        warn!("Failed to read backend response body: {}", e);
+                        Vec::new()
+                    }
+                };
                 retry::BackendResponse {
                     status_code: status,
                     body: ResponseBody::Buffered(body),
@@ -3168,7 +3186,13 @@ async fn proxy_to_backend(
                     error_class: None,
                 }
             } else {
-                let body = response.bytes().await.unwrap_or_default().to_vec();
+                let body = match response.bytes().await {
+                    Ok(b) => b.to_vec(),
+                    Err(e) => {
+                        warn!("Failed to read backend response body: {}", e);
+                        Vec::new()
+                    }
+                };
                 retry::BackendResponse {
                     status_code: status,
                     body: ResponseBody::Buffered(body),

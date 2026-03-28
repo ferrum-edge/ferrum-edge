@@ -105,7 +105,10 @@ impl super::ServiceDiscoverer for ConsulDiscoverer {
 
         if !response.status().is_success() {
             let status = response.status();
-            let body = response.text().await.unwrap_or_default();
+            let body = match response.text().await {
+                Ok(t) => t,
+                Err(e) => format!("<failed to read response body: {}>", e),
+            };
             anyhow::bail!(
                 "Consul API returned {}: {}",
                 status,

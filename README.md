@@ -1406,6 +1406,14 @@ Integrates with OpenTelemetry for distributed tracing.
 | `endpoint` | String | OTLP collector endpoint |
 | `service_name` | String | Service name for traces |
 
+### Custom Plugins
+
+Ferrum supports drop-in custom plugins. Create a `.rs` file in the `custom_plugins/` directory, export a `create_plugin()` factory function, and rebuild — the build script auto-discovers and registers it. No core files need editing.
+
+Optionally set `FERRUM_CUSTOM_PLUGINS=plugin_a,plugin_b` at **build time** to include only specific custom plugins.
+
+See [CUSTOM_PLUGINS.md](CUSTOM_PLUGINS.md) for the full developer guide, trait reference, and working examples.
+
 ## Proxying Behavior
 
 ### Routing

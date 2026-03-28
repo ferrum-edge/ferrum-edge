@@ -3,6 +3,7 @@ mod plugin_utils;
 
 mod access_control_tests;
 mod basic_auth_tests;
+mod body_transform_tests;
 mod body_validator_tests;
 mod bot_detection_tests;
 mod correlation_id_tests;

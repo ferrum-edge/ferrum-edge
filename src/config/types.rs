@@ -839,6 +839,22 @@ impl GatewayConfig {
             }
         }
 
+        // Cross-namespace collision: a custom_id that matches another consumer's
+        // username or ID would silently overwrite in the identity index, causing
+        // incorrect JWT/OAuth2 authentication.
+        for consumer in &self.consumers {
+            if let Some(ref custom_id) = consumer.custom_id
+                && let Some(&owner_id) = seen_usernames.get(custom_id.as_str())
+                && owner_id != consumer.id
+            {
+                duplicates.push(format!(
+                    "Consumer '{}' custom_id '{}' collides with username of consumer '{}' \
+                     — this will cause incorrect JWT/OAuth2 authentication",
+                    consumer.id, custom_id, owner_id
+                ));
+            }
+        }
+
         if duplicates.is_empty() {
             Ok(())
         } else {
@@ -846,12 +862,15 @@ impl GatewayConfig {
         }
     }
 
-    /// Validate that consumer keyauth API keys are unique across all consumers.
+    /// Validate that consumer credentials are unique across all consumers.
     ///
-    /// If two consumers share the same API key, the ConsumerIndex silently
+    /// Checks keyauth API keys, basicauth usernames, and mTLS identities.
+    /// If two consumers share the same credential, the ConsumerIndex silently
     /// overwrites one, causing the wrong consumer to be authenticated.
     pub fn validate_unique_consumer_credentials(&self) -> Result<(), Vec<String>> {
         let mut seen_keyauth: HashMap<&str, &str> = HashMap::new();
+        let mut seen_basicauth: HashMap<&str, &str> = HashMap::new();
+        let mut seen_mtls: HashMap<&str, &str> = HashMap::new();
         let mut duplicates = Vec::new();
 
         for consumer in &self.consumers {
@@ -863,6 +882,27 @@ impl GatewayConfig {
                 duplicates.push(format!(
                     "Duplicate keyauth API key in consumer '{}' (conflicts with consumer '{}')",
                     consumer.id, existing_id
+                ));
+            }
+
+            // basicauth consumers are indexed by username — duplicates cause silent overwrite
+            if consumer.credentials.contains_key("basicauth")
+                && let Some(existing_id) = seen_basicauth.insert(&consumer.username, &consumer.id)
+            {
+                duplicates.push(format!(
+                    "Duplicate basicauth username '{}' in consumer '{}' (conflicts with consumer '{}')",
+                    consumer.username, consumer.id, existing_id
+                ));
+            }
+
+            // mTLS consumers are indexed by identity — duplicates cause silent overwrite
+            if let Some(mtls_creds) = consumer.credentials.get("mtls_auth")
+                && let Some(identity) = mtls_creds.get("identity").and_then(|s| s.as_str())
+                && let Some(existing_id) = seen_mtls.insert(identity, &consumer.id)
+            {
+                duplicates.push(format!(
+                    "Duplicate mtls_auth identity '{}' in consumer '{}' (conflicts with consumer '{}')",
+                    identity, consumer.id, existing_id
                 ));
             }
         }

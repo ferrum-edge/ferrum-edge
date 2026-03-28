@@ -510,3 +510,91 @@ async fn test_rebuild_during_reads() {
     // Pre-rebuild snapshot still valid (Arc keeps it alive)
     assert_eq!(pre_rebuild[0].name(), "stdout_logging");
 }
+
+// ---- apply_delta security error propagation ----
+
+#[test]
+fn test_apply_delta_rejects_invalid_security_plugin() {
+    // Start with a valid config
+    let config1 = make_config(
+        vec![make_proxy("p1", "/api", vec!["pc1"])],
+        vec![make_plugin_config(
+            "pc1",
+            "stdout_logging",
+            PluginScope::Proxy,
+            Some("p1"),
+            true,
+        )],
+    );
+    let cache = PluginCache::new(&config1).unwrap();
+
+    // Delta with an invalid security plugin (ip_restriction with empty config
+    // fails validation because it requires at least one allow/deny rule)
+    let config2 = make_config(
+        vec![make_proxy("p1", "/api", vec!["pc1", "pc2"])],
+        vec![
+            make_plugin_config(
+                "pc1",
+                "stdout_logging",
+                PluginScope::Proxy,
+                Some("p1"),
+                true,
+            ),
+            PluginConfig {
+                id: "pc2".to_string(),
+                plugin_name: "ip_restriction".to_string(),
+                config: json!({}), // empty — ip_restriction requires allow/deny
+                scope: PluginScope::Proxy,
+                proxy_id: Some("p1".to_string()),
+                enabled: true,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            },
+        ],
+    );
+
+    let mut proxy_ids = std::collections::HashSet::new();
+    proxy_ids.insert("p1".to_string());
+
+    let result = cache.apply_delta(&config2, &proxy_ids, &[], false);
+    assert!(
+        result.is_err(),
+        "apply_delta should reject invalid security plugin config"
+    );
+}
+
+#[test]
+fn test_apply_delta_accepts_valid_config() {
+    let config1 = make_config(
+        vec![make_proxy("p1", "/api", vec!["pc1"])],
+        vec![make_plugin_config(
+            "pc1",
+            "stdout_logging",
+            PluginScope::Proxy,
+            Some("p1"),
+            true,
+        )],
+    );
+    let cache = PluginCache::new(&config1).unwrap();
+
+    // Delta adding a non-security plugin
+    let config2 = make_config(
+        vec![make_proxy("p1", "/api", vec!["pc1", "pc2"])],
+        vec![
+            make_plugin_config(
+                "pc1",
+                "stdout_logging",
+                PluginScope::Proxy,
+                Some("p1"),
+                true,
+            ),
+            make_plugin_config("pc2", "cors", PluginScope::Proxy, Some("p1"), true),
+        ],
+    );
+
+    let mut proxy_ids = std::collections::HashSet::new();
+    proxy_ids.insert("p1".to_string());
+
+    let result = cache.apply_delta(&config2, &proxy_ids, &[], false);
+    assert!(result.is_ok(), "apply_delta should accept valid config");
+}

@@ -237,6 +237,13 @@ impl DatabaseStore {
         // Normalize host entries to lowercase
         config.normalize_hosts();
 
+        // Validate host entry format
+        if let Err(errors) = config.validate_hosts() {
+            for msg in &errors {
+                warn!("{}", msg);
+            }
+        }
+
         // Validate regex listen_paths compile correctly
         if let Err(errors) = config.validate_regex_listen_paths() {
             for msg in &errors {
@@ -261,6 +268,21 @@ impl DatabaseStore {
                 "Database configuration validation failed: {} stream proxy error(s) found",
                 errors.len()
             );
+        }
+
+        // Defense-in-depth: validate consumer identity and credential uniqueness.
+        // The database schema has UNIQUE constraints, but if data was imported or
+        // the schema was modified, duplicates could exist. Log warnings instead of
+        // failing startup so the gateway can still serve with the DB's data.
+        if let Err(errors) = config.validate_unique_consumer_identities() {
+            for msg in &errors {
+                warn!("{}", msg);
+            }
+        }
+        if let Err(errors) = config.validate_unique_consumer_credentials() {
+            for msg in &errors {
+                warn!("{}", msg);
+            }
         }
 
         // Normalize stream proxy listen_paths to synthetic values (__tcp:PORT, __udp:PORT)
@@ -927,7 +949,13 @@ impl DatabaseStore {
             let existing_hosts: Vec<String> = row
                 .try_get::<String, _>("hosts")
                 .ok()
-                .and_then(|s| serde_json::from_str(&s).ok())
+                .and_then(|s| match serde_json::from_str(&s) {
+                    Ok(v) => Some(v),
+                    Err(e) => {
+                        warn!("Failed to parse hosts JSON during uniqueness check: {}", e);
+                        None
+                    }
+                })
                 .unwrap_or_default();
 
             if crate::config::types::hosts_overlap(hosts, &existing_hosts) {
@@ -1016,6 +1044,50 @@ impl DatabaseStore {
                     .and_then(|k| k.get("key"))
                     .and_then(|k| k.as_str())
                 && key == api_key
+            {
+                return Ok(false);
+            }
+        }
+
+        Ok(true)
+    }
+
+    /// Check that an mTLS identity is not already used by another consumer.
+    ///
+    /// mTLS identities are stored inside the credentials JSON blob, so there is
+    /// no database-level UNIQUE constraint — this application-level check is
+    /// the only enforcement.
+    ///
+    /// Returns `true` if the identity is unique (safe to insert/update).
+    pub async fn check_mtls_identity_unique(
+        &self,
+        mtls_identity: &str,
+        exclude_consumer_id: Option<&str>,
+    ) -> Result<bool, anyhow::Error> {
+        let rows: Vec<AnyRow> = sqlx::query("SELECT id, credentials FROM consumers")
+            .fetch_all(&self.pool)
+            .await?;
+
+        for row in &rows {
+            let id: String = row.try_get("id")?;
+            if let Some(eid) = exclude_consumer_id
+                && id == eid
+            {
+                continue;
+            }
+            let creds_str: String = row.try_get("credentials").unwrap_or_else(|e| {
+                warn!(
+                    "Failed to read credentials column for consumer {}: {}",
+                    id, e
+                );
+                String::new()
+            });
+            if let Ok(creds) = serde_json::from_str::<serde_json::Value>(&creds_str)
+                && let Some(identity) = creds
+                    .get("mtls_auth")
+                    .and_then(|m| m.get("identity"))
+                    .and_then(|i| i.as_str())
+                && identity == mtls_identity
             {
                 return Ok(false);
             }
@@ -1131,19 +1203,27 @@ impl DatabaseStore {
 
             let assoc_rows: Vec<AnyRow> = if changed_id_list.len() > 100 {
                 // Too many IDs for an IN clause — fetch all and filter in memory
-                let all_rows: Vec<AnyRow> =
-                    sqlx::query("SELECT proxy_id, plugin_config_id FROM proxy_plugins")
-                        .fetch_all(&self.pool)
-                        .await
-                        .unwrap_or_default();
-                all_rows
-                    .into_iter()
-                    .filter(|r| {
-                        r.try_get::<String, _>("proxy_id")
-                            .map(|id| changed_ids.contains(&id))
-                            .unwrap_or(false)
-                    })
-                    .collect()
+                match sqlx::query("SELECT proxy_id, plugin_config_id FROM proxy_plugins")
+                    .fetch_all(&self.pool)
+                    .await
+                {
+                    Ok(all_rows) => all_rows
+                        .into_iter()
+                        .filter(|r| {
+                            r.try_get::<String, _>("proxy_id")
+                                .map(|id| changed_ids.contains(&id))
+                                .unwrap_or(false)
+                        })
+                        .collect(),
+                    Err(e) => {
+                        warn!(
+                            "Failed to fetch proxy_plugins for incremental update: {}. \
+                             Plugin associations may be stale until next full reload.",
+                            e
+                        );
+                        Vec::new()
+                    }
+                }
             } else {
                 // Build parameterized IN clause for targeted fetch
                 let placeholders: String = changed_id_list
@@ -1159,7 +1239,17 @@ impl DatabaseStore {
                 for id in &changed_id_list {
                     query = query.bind(*id);
                 }
-                query.fetch_all(&self.pool).await.unwrap_or_default()
+                match query.fetch_all(&self.pool).await {
+                    Ok(rows) => rows,
+                    Err(e) => {
+                        warn!(
+                            "Failed to fetch proxy_plugins for incremental update: {}. \
+                             Plugin associations may be stale until next full reload.",
+                            e
+                        );
+                        Vec::new()
+                    }
+                }
             };
 
             for r in &assoc_rows {
@@ -1638,7 +1728,13 @@ fn row_to_proxy(
     let hosts: Vec<String> = row
         .try_get::<String, _>("hosts")
         .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
+        .and_then(|s| match serde_json::from_str(&s) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                warn!("Proxy {}: failed to parse hosts JSON '{}': {}", pid, s, e);
+                None
+            }
+        })
         .unwrap_or_default();
 
     Ok(Proxy {
@@ -1849,7 +1945,13 @@ fn row_to_upstream(row: &AnyRow) -> Result<Upstream, anyhow::Error> {
         "round_robin".into()
     });
     let algorithm: LoadBalancerAlgorithm =
-        serde_json::from_value(serde_json::Value::String(algo_str)).unwrap_or_default();
+        serde_json::from_value(serde_json::Value::String(algo_str.clone())).unwrap_or_else(|e| {
+            warn!(
+                "Failed to parse upstream algorithm '{}', defaulting to round_robin: {}",
+                algo_str, e
+            );
+            LoadBalancerAlgorithm::default()
+        });
 
     let health_checks: Option<HealthCheckConfig> = row
         .try_get::<String, _>("health_checks")

@@ -90,7 +90,24 @@ pub async fn connect_and_subscribe(
         );
 
         match serde_json::from_str::<GatewayConfig>(&update.config_json) {
-            Ok(config) => {
+            Ok(mut config) => {
+                // Validate config received from CP before applying
+                config.normalize_hosts();
+                if let Err(errors) = config.validate_regex_listen_paths() {
+                    for msg in &errors {
+                        error!("CP config rejected — {}", msg);
+                    }
+                    error!("Ignoring config update with invalid regex listen_paths");
+                    continue;
+                }
+                if let Err(errors) = config.validate_stream_proxies() {
+                    for msg in &errors {
+                        error!("CP config rejected — {}", msg);
+                    }
+                    error!("Ignoring config update with invalid stream proxy config");
+                    continue;
+                }
+                config.normalize_stream_proxy_paths();
                 proxy_state.update_config(config);
                 info!("Configuration updated from CP");
             }

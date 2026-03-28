@@ -5,12 +5,16 @@
 //!
 //! This plugin adds a custom `X-Custom-Gateway` header to every request
 //! before it is proxied to the backend, and echoes it back in the response.
+//!
+//! The `create_plugin` function at the bottom is the only required entry
+//! point — the build script discovers this file automatically.
 
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::sync::Arc;
 
-use crate::plugins::{Plugin, PluginResult, RequestContext, TransactionSummary};
+use crate::plugins::{Plugin, PluginHttpClient, PluginResult, RequestContext, TransactionSummary};
 
 pub struct ExamplePlugin {
     header_value: String,
@@ -32,8 +36,7 @@ impl ExamplePlugin {
 
 #[async_trait]
 impl Plugin for ExamplePlugin {
-    /// Unique name for this plugin. Must match the name used in gateway config
-    /// and in the `create_custom_plugin()` match arm.
+    /// Unique name for this plugin. Must match the file name (without .rs).
     fn name(&self) -> &str {
         "example_plugin"
     }
@@ -113,4 +116,14 @@ impl Plugin for ExamplePlugin {
     //     // pre-resolve DNS at startup.
     //     vec![]
     // }
+}
+
+/// Factory function — called automatically by the build-script-generated registry.
+/// The function name `create_plugin` and signature are the convention that every
+/// custom plugin file must follow.
+pub fn create_plugin(
+    config: &Value,
+    _http_client: PluginHttpClient,
+) -> Option<Arc<dyn Plugin>> {
+    Some(Arc::new(ExamplePlugin::new(config)))
 }

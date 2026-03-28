@@ -53,10 +53,9 @@ pub fn set_nested_value(root: &mut Value, path: &str, value: Value) -> bool {
     let mut current = root;
     // Navigate to parent, creating intermediate objects
     for &segment in &segments[..segments.len() - 1] {
-        if !current.is_object() {
+        let Some(obj) = current.as_object_mut() else {
             return false;
-        }
-        let obj = current.as_object_mut().unwrap();
+        };
         current = obj
             .entry(segment.to_string())
             .or_insert_with(|| Value::Object(serde_json::Map::new()));

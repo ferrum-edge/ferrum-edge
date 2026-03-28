@@ -187,13 +187,17 @@ impl PluginCache {
     ///
     /// Also rebuilds global plugins if `rebuild_globals` is true (i.e., a
     /// global-scoped plugin config was added/modified/removed).
+    /// Returns `Err` if a security-critical plugin fails validation during
+    /// incremental update, matching the behavior of `rebuild()`.
     pub fn apply_delta(
         &self,
         config: &GatewayConfig,
         proxy_ids_to_rebuild: &HashSet<String>,
         removed_proxy_ids: &[String],
         rebuild_globals: bool,
-    ) {
+    ) -> Result<(), String> {
+        let mut security_errors: Vec<String> = Vec::new();
+
         // Load the current state — we'll clone-and-patch it
         let current_map = self.proxy_plugins.load();
         let current_globals = self.global_plugins.load();
@@ -211,6 +215,7 @@ impl PluginCache {
                         Ok(None) => {}
                         Err(e) => {
                             error!("Config reload: {}", e);
+                            security_errors.push(e);
                         }
                     }
                 }
@@ -271,6 +276,7 @@ impl PluginCache {
                             Ok(None) => {}
                             Err(e) => {
                                 error!("Config reload: {}", e);
+                                security_errors.push(e);
                             }
                         }
                     }
@@ -324,6 +330,14 @@ impl PluginCache {
             }
         }
 
+        // Reject the delta if any security plugin failed validation
+        if !security_errors.is_empty() {
+            return Err(format!(
+                "Config reload rejected: {} security plugin(s) failed validation",
+                security_errors.len()
+            ));
+        }
+
         // Atomic swap — readers see old or new, never a partial state
         self.proxy_plugins.store(Arc::new(new_map));
         self.requires_buffering.store(Arc::new(new_buffering));
@@ -343,6 +357,8 @@ impl PluginCache {
             self.global_protocol_plugins
                 .store(Arc::new(new_global_proto));
         }
+
+        Ok(())
     }
 
     /// Get the pre-resolved plugins for a proxy. Lock-free O(1) lookup.

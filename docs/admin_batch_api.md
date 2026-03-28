@@ -414,6 +414,18 @@ Some resource types failed while others succeeded:
 }
 ```
 
+### Validation
+
+Each resource in the batch is validated before any database writes. If validation fails, the entire batch for that resource type is skipped and errors are returned. Validation includes:
+
+- **All resources**: ID format (alphanumeric + `.`, `_`, `-`, max 254 chars), no duplicate IDs within the batch
+- **Consumers**: Non-empty username, no duplicate usernames or custom_ids within the batch, custom_id normalization (empty string → null)
+- **Proxies**: listen_path format (`/` prefix or `~` regex with compilation check), host entry format validation and lowercase normalization, no duplicate proxy IDs within the batch
+- **Upstreams**: At least one target or service_discovery config, no duplicate names within the batch
+- **Plugin configs**: Known plugin name, scope/proxy_id consistency (proxy scope requires proxy_id, global scope rejects proxy_id), no duplicate plugin config IDs within the batch
+
+**Note**: Within-batch uniqueness is checked, but cross-batch uniqueness (against existing DB records) is enforced by database constraints. Database constraint violations are returned as errors in the response.
+
 ### Error Responses
 
 | Status | Condition |

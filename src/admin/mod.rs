@@ -14,6 +14,7 @@ use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use serde_json::{Value, json};
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -24,7 +25,7 @@ use uuid::Uuid;
 use crate::admin::jwt_auth::{JwtError, JwtManager};
 use crate::config::db_loader::DatabaseStore;
 use crate::config::types::{
-    Consumer, GatewayConfig, PluginConfig, Proxy, Upstream, validate_resource_id,
+    Consumer, GatewayConfig, PluginConfig, PluginScope, Proxy, Upstream, validate_resource_id,
 };
 use crate::plugins;
 use crate::proxy::ProxyState;
@@ -497,23 +498,53 @@ async fn handle_create_proxy(
     };
 
     // Validate proxy fields
-    if proxy.listen_path.is_empty() || !proxy.listen_path.starts_with('/') {
+    if proxy.listen_path.is_empty() {
         return Ok(json_response(
             StatusCode::BAD_REQUEST,
-            &json!({"error": "listen_path must be non-empty and start with '/'"}),
+            &json!({"error": "listen_path must be non-empty"}),
         ));
     }
-    if proxy.backend_host.is_empty() {
+    if proxy.listen_path.starts_with('~') {
+        // Regex listen_path — validate pattern compiles
+        let pattern = &proxy.listen_path[1..];
+        if pattern.is_empty() {
+            return Ok(json_response(
+                StatusCode::BAD_REQUEST,
+                &json!({"error": "regex listen_path '~' has empty pattern"}),
+            ));
+        }
+        let anchored = if pattern.starts_with('^') {
+            pattern.to_string()
+        } else {
+            format!("^{}", pattern)
+        };
+        if let Err(e) = regex::Regex::new(&anchored) {
+            return Ok(json_response(
+                StatusCode::BAD_REQUEST,
+                &json!({"error": format!("invalid regex listen_path: {}", e)}),
+            ));
+        }
+    } else if !proxy.listen_path.starts_with('/') {
         return Ok(json_response(
             StatusCode::BAD_REQUEST,
-            &json!({"error": "backend_host must be non-empty"}),
+            &json!({"error": "listen_path must start with '/' or '~' (regex)"}),
         ));
     }
-    if proxy.backend_port == 0 {
-        return Ok(json_response(
-            StatusCode::BAD_REQUEST,
-            &json!({"error": "backend_port must be greater than 0"}),
-        ));
+    // backend_host and backend_port are required unless upstream_id is set
+    // (upstream targets override these fields at request time)
+    if proxy.upstream_id.is_none() {
+        if proxy.backend_host.is_empty() {
+            return Ok(json_response(
+                StatusCode::BAD_REQUEST,
+                &json!({"error": "backend_host must be non-empty (or set upstream_id)"}),
+            ));
+        }
+        if proxy.backend_port == 0 {
+            return Ok(json_response(
+                StatusCode::BAD_REQUEST,
+                &json!({"error": "backend_port must be greater than 0 (or set upstream_id)"}),
+            ));
+        }
     }
 
     if proxy.id.is_empty() {
@@ -615,6 +646,36 @@ async fn handle_create_proxy(
         }
     }
 
+    // Validate stream proxy configuration
+    if proxy.backend_protocol.is_stream_proxy() {
+        match proxy.listen_port {
+            None => {
+                return Ok(json_response(
+                    StatusCode::BAD_REQUEST,
+                    &json!({"error": format!(
+                        "Stream proxy (protocol {}) must have a listen_port",
+                        proxy.backend_protocol
+                    )}),
+                ));
+            }
+            Some(port) if port < 1 => {
+                return Ok(json_response(
+                    StatusCode::BAD_REQUEST,
+                    &json!({"error": format!("listen_port {} must be >= 1", port)}),
+                ));
+            }
+            _ => {}
+        }
+    } else if proxy.listen_port.is_some() {
+        return Ok(json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"error": format!(
+                "HTTP proxy (protocol {}) must not set listen_port",
+                proxy.backend_protocol
+            )}),
+        ));
+    }
+
     match db.create_proxy(&proxy).await {
         Ok(_) => Ok(json_response(StatusCode::CREATED, &json!(proxy))),
         Err(e) => Ok(json_response(
@@ -698,23 +759,53 @@ async fn handle_update_proxy(
     };
 
     // Validate proxy fields
-    if proxy.listen_path.is_empty() || !proxy.listen_path.starts_with('/') {
+    if proxy.listen_path.is_empty() {
         return Ok(json_response(
             StatusCode::BAD_REQUEST,
-            &json!({"error": "listen_path must be non-empty and start with '/'"}),
+            &json!({"error": "listen_path must be non-empty"}),
         ));
     }
-    if proxy.backend_host.is_empty() {
+    if proxy.listen_path.starts_with('~') {
+        // Regex listen_path — validate pattern compiles
+        let pattern = &proxy.listen_path[1..];
+        if pattern.is_empty() {
+            return Ok(json_response(
+                StatusCode::BAD_REQUEST,
+                &json!({"error": "regex listen_path '~' has empty pattern"}),
+            ));
+        }
+        let anchored = if pattern.starts_with('^') {
+            pattern.to_string()
+        } else {
+            format!("^{}", pattern)
+        };
+        if let Err(e) = regex::Regex::new(&anchored) {
+            return Ok(json_response(
+                StatusCode::BAD_REQUEST,
+                &json!({"error": format!("invalid regex listen_path: {}", e)}),
+            ));
+        }
+    } else if !proxy.listen_path.starts_with('/') {
         return Ok(json_response(
             StatusCode::BAD_REQUEST,
-            &json!({"error": "backend_host must be non-empty"}),
+            &json!({"error": "listen_path must start with '/' or '~' (regex)"}),
         ));
     }
-    if proxy.backend_port == 0 {
-        return Ok(json_response(
-            StatusCode::BAD_REQUEST,
-            &json!({"error": "backend_port must be greater than 0"}),
-        ));
+    // backend_host and backend_port are required unless upstream_id is set
+    // (upstream targets override these fields at request time)
+    if proxy.upstream_id.is_none() {
+        if proxy.backend_host.is_empty() {
+            return Ok(json_response(
+                StatusCode::BAD_REQUEST,
+                &json!({"error": "backend_host must be non-empty (or set upstream_id)"}),
+            ));
+        }
+        if proxy.backend_port == 0 {
+            return Ok(json_response(
+                StatusCode::BAD_REQUEST,
+                &json!({"error": "backend_port must be greater than 0 (or set upstream_id)"}),
+            ));
+        }
     }
 
     proxy.id = id.to_string();
@@ -789,6 +880,36 @@ async fn handle_update_proxy(
                 ));
             }
         }
+    }
+
+    // Validate stream proxy configuration
+    if proxy.backend_protocol.is_stream_proxy() {
+        match proxy.listen_port {
+            None => {
+                return Ok(json_response(
+                    StatusCode::BAD_REQUEST,
+                    &json!({"error": format!(
+                        "Stream proxy (protocol {}) must have a listen_port",
+                        proxy.backend_protocol
+                    )}),
+                ));
+            }
+            Some(port) if port < 1 => {
+                return Ok(json_response(
+                    StatusCode::BAD_REQUEST,
+                    &json!({"error": format!("listen_port {} must be >= 1", port)}),
+                ));
+            }
+            _ => {}
+        }
+    } else if proxy.listen_port.is_some() {
+        return Ok(json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"error": format!(
+                "HTTP proxy (protocol {}) must not set listen_port",
+                proxy.backend_protocol
+            )}),
+        ));
     }
 
     // Capture the old upstream_id before update so we can clean up if it changes
@@ -999,6 +1120,27 @@ async fn handle_create_consumer(
         }
     }
 
+    // Check mTLS identity uniqueness (stored in JSON, no DB constraint)
+    if let Some(mtls_creds) = consumer.credentials.get("mtls_auth")
+        && let Some(identity) = mtls_creds.get("identity").and_then(|s| s.as_str())
+    {
+        match db.check_mtls_identity_unique(identity, None).await {
+            Ok(true) => {}
+            Ok(false) => {
+                return Ok(json_response(
+                    StatusCode::CONFLICT,
+                    &json!({"error": "A consumer with this mTLS identity already exists"}),
+                ));
+            }
+            Err(e) => {
+                return Ok(json_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    &json!({"error": format!("Database error: {}", e)}),
+                ));
+            }
+        }
+    }
+
     match db.create_consumer(&consumer).await {
         Ok(_) => Ok(json_response(
             StatusCode::CREATED,
@@ -1135,6 +1277,27 @@ async fn handle_update_consumer(
         }
     }
 
+    // Check mTLS identity uniqueness excluding self (stored in JSON, no DB constraint)
+    if let Some(mtls_creds) = consumer.credentials.get("mtls_auth")
+        && let Some(identity) = mtls_creds.get("identity").and_then(|s| s.as_str())
+    {
+        match db.check_mtls_identity_unique(identity, Some(id)).await {
+            Ok(true) => {}
+            Ok(false) => {
+                return Ok(json_response(
+                    StatusCode::CONFLICT,
+                    &json!({"error": "A consumer with this mTLS identity already exists"}),
+                ));
+            }
+            Err(e) => {
+                return Ok(json_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    &json!({"error": format!("Database error: {}", e)}),
+                ));
+            }
+        }
+    }
+
     match db.update_consumer(&consumer).await {
         Ok(_) => Ok(json_response(
             StatusCode::OK,
@@ -1251,6 +1414,29 @@ async fn handle_update_credentials(
                         return Ok(json_response(
                             StatusCode::CONFLICT,
                             &json!({"error": "A consumer with this API key already exists"}),
+                        ));
+                    }
+                    Err(e) => {
+                        return Ok(json_response(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            &json!({"error": format!("Database error: {}", e)}),
+                        ));
+                    }
+                }
+            }
+            // Check mTLS identity uniqueness before updating (no DB constraint)
+            if cred_type == "mtls_auth"
+                && let Some(identity) = hashed_cred.get("identity").and_then(|i| i.as_str())
+            {
+                match db
+                    .check_mtls_identity_unique(identity, Some(consumer_id))
+                    .await
+                {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        return Ok(json_response(
+                            StatusCode::CONFLICT,
+                            &json!({"error": "A consumer with this mTLS identity already exists"}),
                         ));
                     }
                     Err(e) => {
@@ -1440,6 +1626,20 @@ async fn handle_create_plugin_config(
         ));
     }
 
+    // Validate scope and proxy_id consistency
+    if pc.scope == PluginScope::Proxy && pc.proxy_id.is_none() {
+        return Ok(json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"error": "Plugin with scope 'proxy' must have a proxy_id"}),
+        ));
+    }
+    if pc.scope == PluginScope::Global && pc.proxy_id.is_some() {
+        return Ok(json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"error": "Plugin with scope 'global' must not have a proxy_id"}),
+        ));
+    }
+
     pc.created_at = Utc::now();
     pc.updated_at = Utc::now();
 
@@ -1527,6 +1727,29 @@ async fn handle_update_plugin_config(
 
     pc.id = id.to_string();
     pc.updated_at = Utc::now();
+
+    // Validate plugin name is known
+    let known_plugins = crate::plugins::available_plugins();
+    if !known_plugins.contains(&pc.plugin_name.as_str()) {
+        return Ok(json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"error": format!("Unknown plugin name '{}'. Available plugins: {:?}", pc.plugin_name, known_plugins)}),
+        ));
+    }
+
+    // Validate scope and proxy_id consistency
+    if pc.scope == PluginScope::Proxy && pc.proxy_id.is_none() {
+        return Ok(json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"error": "Plugin with scope 'proxy' must have a proxy_id"}),
+        ));
+    }
+    if pc.scope == PluginScope::Global && pc.proxy_id.is_some() {
+        return Ok(json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"error": "Plugin with scope 'global' must not have a proxy_id"}),
+        ));
+    }
 
     match db.update_plugin_config(&pc).await {
         Ok(_) => Ok(json_response(StatusCode::OK, &json!(pc))),
@@ -1952,9 +2175,36 @@ async fn handle_batch_create(
         match serde_json::from_value::<Vec<Consumer>>(consumers_val.clone()) {
             Ok(mut consumers) => {
                 let now = Utc::now();
+                let mut seen_ids: HashSet<String> = HashSet::new();
+                let mut seen_usernames: HashSet<String> = HashSet::new();
+                let mut seen_custom_ids: HashSet<String> = HashSet::new();
                 for c in &mut consumers {
                     if c.id.is_empty() {
                         c.id = Uuid::new_v4().to_string();
+                    } else if let Err(msg) = validate_resource_id(&c.id) {
+                        errors.push(format!("Consumer '{}': {}", c.id, msg));
+                    }
+                    if !seen_ids.insert(c.id.clone()) {
+                        errors.push(format!("Duplicate consumer ID '{}' in batch", c.id));
+                    }
+                    if c.username.trim().is_empty() {
+                        errors.push(format!("Consumer '{}': username must not be empty", c.id));
+                    } else if !seen_usernames.insert(c.username.clone()) {
+                        errors.push(format!(
+                            "Duplicate consumer username '{}' in batch",
+                            c.username
+                        ));
+                    }
+                    // Normalize custom_id: treat empty string as None
+                    if let Some(ref cid) = c.custom_id
+                        && cid.trim().is_empty()
+                    {
+                        c.custom_id = None;
+                    }
+                    if let Some(ref cid) = c.custom_id
+                        && !seen_custom_ids.insert(cid.clone())
+                    {
+                        errors.push(format!("Duplicate consumer custom_id '{}' in batch", cid));
                     }
                     c.created_at = now;
                     c.updated_at = now;
@@ -1962,9 +2212,11 @@ async fn handle_batch_create(
                         errors.push(format!("Consumer '{}': {}", c.id, e));
                     }
                 }
-                match db.batch_create_consumers(&consumers).await {
-                    Ok(n) => created_consumers = n,
-                    Err(e) => errors.push(format!("consumers: {}", e)),
+                if errors.is_empty() {
+                    match db.batch_create_consumers(&consumers).await {
+                        Ok(n) => created_consumers = n,
+                        Err(e) => errors.push(format!("consumers: {}", e)),
+                    }
                 }
             }
             Err(e) => errors.push(format!("consumers parse error: {}", e)),
@@ -1976,16 +2228,36 @@ async fn handle_batch_create(
         match serde_json::from_value::<Vec<Upstream>>(upstreams_val.clone()) {
             Ok(mut upstreams) => {
                 let now = Utc::now();
+                let mut seen_ids: HashSet<String> = HashSet::new();
+                let mut seen_names: HashSet<String> = HashSet::new();
                 for u in &mut upstreams {
                     if u.id.is_empty() {
                         u.id = Uuid::new_v4().to_string();
+                    } else if let Err(msg) = validate_resource_id(&u.id) {
+                        errors.push(format!("Upstream '{}': {}", u.id, msg));
+                    }
+                    if !seen_ids.insert(u.id.clone()) {
+                        errors.push(format!("Duplicate upstream ID '{}' in batch", u.id));
+                    }
+                    if let Some(ref name) = u.name
+                        && !seen_names.insert(name.clone())
+                    {
+                        errors.push(format!("Duplicate upstream name '{}' in batch", name));
+                    }
+                    if u.targets.is_empty() && u.service_discovery.is_none() {
+                        errors.push(format!(
+                            "Upstream '{}': must have at least one target or service_discovery",
+                            u.id
+                        ));
                     }
                     u.created_at = now;
                     u.updated_at = now;
                 }
-                match db.batch_create_upstreams(&upstreams).await {
-                    Ok(n) => created_upstreams = n,
-                    Err(e) => errors.push(format!("upstreams: {}", e)),
+                if errors.is_empty() {
+                    match db.batch_create_upstreams(&upstreams).await {
+                        Ok(n) => created_upstreams = n,
+                        Err(e) => errors.push(format!("upstreams: {}", e)),
+                    }
                 }
             }
             Err(e) => errors.push(format!("upstreams parse error: {}", e)),
@@ -1997,16 +2269,62 @@ async fn handle_batch_create(
         match serde_json::from_value::<Vec<Proxy>>(proxies_val.clone()) {
             Ok(mut proxies) => {
                 let now = Utc::now();
+                let mut seen_ids: HashSet<String> = HashSet::new();
                 for p in &mut proxies {
                     if p.id.is_empty() {
                         p.id = Uuid::new_v4().to_string();
+                    } else if let Err(msg) = validate_resource_id(&p.id) {
+                        errors.push(format!("Proxy '{}': {}", p.id, msg));
+                    }
+                    if !seen_ids.insert(p.id.clone()) {
+                        errors.push(format!("Duplicate proxy ID '{}' in batch", p.id));
+                    }
+                    if p.listen_path.is_empty() {
+                        errors.push(format!("Proxy '{}': listen_path must be non-empty", p.id));
+                    } else if p.listen_path.starts_with('~') {
+                        // Validate regex compilation
+                        let pattern = &p.listen_path[1..];
+                        if pattern.is_empty() {
+                            errors.push(format!(
+                                "Proxy '{}': regex listen_path '~' has empty pattern",
+                                p.id
+                            ));
+                        } else {
+                            let anchored = if pattern.starts_with('^') {
+                                pattern.to_string()
+                            } else {
+                                format!("^{}", pattern)
+                            };
+                            if let Err(e) = regex::Regex::new(&anchored) {
+                                errors.push(format!(
+                                    "Proxy '{}': invalid regex listen_path: {}",
+                                    p.id, e
+                                ));
+                            }
+                        }
+                    } else if !p.listen_path.starts_with('/') {
+                        errors.push(format!(
+                            "Proxy '{}': listen_path must start with '/' or '~' (regex)",
+                            p.id
+                        ));
+                    }
+                    // Normalize and validate hosts
+                    for host in &mut p.hosts {
+                        *host = host.to_lowercase();
+                    }
+                    for host in &p.hosts {
+                        if let Err(msg) = crate::config::types::validate_host_entry(host) {
+                            errors.push(format!("Proxy '{}': {}", p.id, msg));
+                        }
                     }
                     p.created_at = now;
                     p.updated_at = now;
                 }
-                match db.batch_create_proxies(&proxies).await {
-                    Ok(n) => created_proxies = n,
-                    Err(e) => errors.push(format!("proxies: {}", e)),
+                if errors.is_empty() {
+                    match db.batch_create_proxies(&proxies).await {
+                        Ok(n) => created_proxies = n,
+                        Err(e) => errors.push(format!("proxies: {}", e)),
+                    }
                 }
             }
             Err(e) => errors.push(format!("proxies parse error: {}", e)),
@@ -2017,17 +2335,44 @@ async fn handle_batch_create(
     if let Some(pcs_val) = batch.get("plugin_configs") {
         match serde_json::from_value::<Vec<PluginConfig>>(pcs_val.clone()) {
             Ok(mut pcs) => {
+                let known_plugins = crate::plugins::available_plugins();
                 let now = Utc::now();
+                let mut seen_ids: HashSet<String> = HashSet::new();
                 for pc in &mut pcs {
                     if pc.id.is_empty() {
                         pc.id = Uuid::new_v4().to_string();
+                    } else if let Err(msg) = validate_resource_id(&pc.id) {
+                        errors.push(format!("PluginConfig '{}': {}", pc.id, msg));
+                    }
+                    if !seen_ids.insert(pc.id.clone()) {
+                        errors.push(format!("Duplicate plugin config ID '{}' in batch", pc.id));
+                    }
+                    if !known_plugins.contains(&pc.plugin_name.as_str()) {
+                        errors.push(format!(
+                            "PluginConfig '{}': unknown plugin name '{}'",
+                            pc.id, pc.plugin_name
+                        ));
+                    }
+                    if pc.scope == PluginScope::Proxy && pc.proxy_id.is_none() {
+                        errors.push(format!(
+                            "PluginConfig '{}': scope 'proxy' requires proxy_id",
+                            pc.id
+                        ));
+                    }
+                    if pc.scope == PluginScope::Global && pc.proxy_id.is_some() {
+                        errors.push(format!(
+                            "PluginConfig '{}': scope 'global' must not have proxy_id",
+                            pc.id
+                        ));
                     }
                     pc.created_at = now;
                     pc.updated_at = now;
                 }
-                match db.batch_create_plugin_configs(&pcs).await {
-                    Ok(n) => created_plugin_configs = n,
-                    Err(e) => errors.push(format!("plugin_configs: {}", e)),
+                if errors.is_empty() {
+                    match db.batch_create_plugin_configs(&pcs).await {
+                        Ok(n) => created_plugin_configs = n,
+                        Err(e) => errors.push(format!("plugin_configs: {}", e)),
+                    }
                 }
             }
             Err(e) => errors.push(format!("plugin_configs parse error: {}", e)),
@@ -2327,7 +2672,53 @@ async fn handle_restore(
         body.len()
     );
 
-    // Phase 2: Delete all existing resources
+    // Phase 2: Validate payload BEFORE deleting anything.
+    // Assemble a temporary GatewayConfig and run the same validations as file mode.
+    {
+        let temp_config = GatewayConfig {
+            version: crate::config::types::CURRENT_CONFIG_VERSION.to_string(),
+            proxies: payload.proxies.clone(),
+            consumers: payload.consumers.clone(),
+            plugin_configs: payload.plugin_configs.clone(),
+            upstreams: payload.upstreams.clone(),
+            loaded_at: Utc::now(),
+        };
+        let mut validation_errors: Vec<String> = Vec::new();
+
+        if let Err(errs) = temp_config.validate_unique_resource_ids() {
+            validation_errors.extend(errs);
+        }
+        if let Err(errs) = temp_config.validate_unique_consumer_identities() {
+            validation_errors.extend(errs);
+        }
+        if let Err(errs) = temp_config.validate_unique_consumer_credentials() {
+            validation_errors.extend(errs);
+        }
+        if let Err(errs) = temp_config.validate_regex_listen_paths() {
+            validation_errors.extend(errs);
+        }
+        if let Err(errs) = temp_config.validate_unique_listen_paths() {
+            validation_errors.extend(errs);
+        }
+        if let Err(errs) = temp_config.validate_stream_proxies() {
+            validation_errors.extend(errs);
+        }
+        if let Err(errs) = temp_config.validate_upstream_references() {
+            validation_errors.extend(errs);
+        }
+
+        if !validation_errors.is_empty() {
+            return Ok(json_response(
+                StatusCode::BAD_REQUEST,
+                &json!({
+                    "error": "Restore payload validation failed — existing config was NOT deleted",
+                    "validation_errors": validation_errors
+                }),
+            ));
+        }
+    }
+
+    // Phase 3: Delete all existing resources (safe: payload is validated)
     if let Err(e) = db.delete_all_resources().await {
         error!("Restore: failed to delete existing resources: {}", e);
         return Ok(json_response(

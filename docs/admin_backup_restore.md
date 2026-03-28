@@ -65,10 +65,11 @@ cat ferrum-backup.json | jq '.counts'
 
 ## Restore — `POST /restore?confirm=true`
 
-Replaces the entire gateway configuration with the provided backup payload. This is a **destructive operation**:
+Replaces the entire gateway configuration with the provided backup payload. This is a **destructive operation**, but the payload is validated before any data is deleted:
 
-1. **Deletes** all existing proxies, consumers, plugin configs, upstreams, and junction table entries
-2. **Imports** the provided resources in dependency order
+1. **Validates** the payload for internal consistency (resource ID uniqueness, consumer identity/credential uniqueness, regex listen_path compilation, listen_path+hosts uniqueness, stream proxy configuration, upstream references). If validation fails, the request returns `400` with detailed errors and **existing config is NOT deleted**.
+2. **Deletes** all existing proxies, consumers, plugin configs, upstreams, and junction table entries
+3. **Imports** the provided resources in dependency order
 
 ### Safety Guard
 
@@ -169,7 +170,7 @@ If some resource types fail during import while others succeed, the endpoint ret
 }
 ```
 
-**Important**: The delete phase happens before import. If import partially fails, you may end up with fewer resources than before. Use `GET /backup` first to create a safety snapshot.
+**Important**: The payload is validated before the delete phase. If validation fails, existing config is preserved and a `400` response is returned with details. However, if validation passes but the import phase partially fails (e.g., database error during insert), you may end up with fewer resources than before. Use `GET /backup` first to create a safety snapshot.
 
 ## Restore vs. Batch
 
@@ -178,7 +179,7 @@ If some resource types fail during import while others succeed, the endpoint ret
 | Deletes existing data | Yes (full wipe) | No (additive) |
 | Safety guard | Requires `?confirm=true` | None |
 | Use case | Disaster recovery, environment migration | Incremental provisioning |
-| Body size limit | 10 MiB | 1 MiB |
+| Body size limit | 100 MiB (configurable) | 1 MiB |
 | Response key | `restored` | `created` |
 
 ## Backup in File Mode and Data Plane Mode

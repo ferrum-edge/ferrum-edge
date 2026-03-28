@@ -768,7 +768,13 @@ async fn proxy_to_backend_h3(
                     ),
                 }
             } else {
-                let body = response.bytes().await.unwrap_or_default().to_vec();
+                let body = match response.bytes().await {
+                    Ok(b) => b.to_vec(),
+                    Err(e) => {
+                        warn!("Failed to read backend response body (HTTP/3): {}", e);
+                        Vec::new()
+                    }
+                };
                 (status, body, resp_headers, None)
             }
         }

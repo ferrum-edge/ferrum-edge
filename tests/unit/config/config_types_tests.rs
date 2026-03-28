@@ -349,6 +349,138 @@ fn test_unique_consumer_credentials_no_keyauth_ok() {
     assert!(config.validate_unique_consumer_credentials().is_ok());
 }
 
+#[test]
+fn test_unique_consumer_credentials_duplicate_basicauth() {
+    // Two consumers with basicauth and the same username should conflict
+    let mut c1 = make_consumer("c1", "alice");
+    c1.credentials.insert(
+        "basicauth".into(),
+        serde_json::json!({"password_hash": "$2b$12$abc"}),
+    );
+    let mut c2 = make_consumer("c2", "alice");
+    c2.credentials.insert(
+        "basicauth".into(),
+        serde_json::json!({"password_hash": "$2b$12$def"}),
+    );
+    let mut config = empty_config();
+    config.consumers = vec![c1, c2];
+    let err = config.validate_unique_consumer_credentials().unwrap_err();
+    assert_eq!(err.len(), 1);
+    assert!(err[0].contains("Duplicate basicauth username"));
+}
+
+#[test]
+fn test_unique_consumer_credentials_basicauth_different_usernames_ok() {
+    let mut c1 = make_consumer("c1", "alice");
+    c1.credentials.insert(
+        "basicauth".into(),
+        serde_json::json!({"password_hash": "$2b$12$abc"}),
+    );
+    let mut c2 = make_consumer("c2", "bob");
+    c2.credentials.insert(
+        "basicauth".into(),
+        serde_json::json!({"password_hash": "$2b$12$def"}),
+    );
+    let mut config = empty_config();
+    config.consumers = vec![c1, c2];
+    assert!(config.validate_unique_consumer_credentials().is_ok());
+}
+
+#[test]
+fn test_unique_consumer_credentials_duplicate_mtls_identity() {
+    let mut c1 = make_consumer("c1", "alice");
+    c1.credentials.insert(
+        "mtls_auth".into(),
+        serde_json::json!({"identity": "CN=client1"}),
+    );
+    let mut c2 = make_consumer("c2", "bob");
+    c2.credentials.insert(
+        "mtls_auth".into(),
+        serde_json::json!({"identity": "CN=client1"}),
+    );
+    let mut config = empty_config();
+    config.consumers = vec![c1, c2];
+    let err = config.validate_unique_consumer_credentials().unwrap_err();
+    assert_eq!(err.len(), 1);
+    assert!(err[0].contains("Duplicate mtls_auth identity"));
+}
+
+#[test]
+fn test_unique_consumer_credentials_mtls_different_identities_ok() {
+    let mut c1 = make_consumer("c1", "alice");
+    c1.credentials.insert(
+        "mtls_auth".into(),
+        serde_json::json!({"identity": "CN=client1"}),
+    );
+    let mut c2 = make_consumer("c2", "bob");
+    c2.credentials.insert(
+        "mtls_auth".into(),
+        serde_json::json!({"identity": "CN=client2"}),
+    );
+    let mut config = empty_config();
+    config.consumers = vec![c1, c2];
+    assert!(config.validate_unique_consumer_credentials().is_ok());
+}
+
+// ---- Consumer identity uniqueness tests ----
+
+#[test]
+fn test_unique_consumer_identities_valid() {
+    let c1 = make_consumer("c1", "alice");
+    let c2 = make_consumer("c2", "bob");
+    let mut config = empty_config();
+    config.consumers = vec![c1, c2];
+    assert!(config.validate_unique_consumer_identities().is_ok());
+}
+
+#[test]
+fn test_unique_consumer_identities_duplicate_username() {
+    let c1 = make_consumer("c1", "alice");
+    let c2 = make_consumer("c2", "alice");
+    let mut config = empty_config();
+    config.consumers = vec![c1, c2];
+    let err = config.validate_unique_consumer_identities().unwrap_err();
+    assert_eq!(err.len(), 1);
+    assert!(err[0].contains("Duplicate consumer username"));
+}
+
+#[test]
+fn test_unique_consumer_identities_duplicate_custom_id() {
+    let mut c1 = make_consumer("c1", "alice");
+    c1.custom_id = Some("shared-id".into());
+    let mut c2 = make_consumer("c2", "bob");
+    c2.custom_id = Some("shared-id".into());
+    let mut config = empty_config();
+    config.consumers = vec![c1, c2];
+    let err = config.validate_unique_consumer_identities().unwrap_err();
+    assert_eq!(err.len(), 1);
+    assert!(err[0].contains("Duplicate consumer custom_id"));
+}
+
+#[test]
+fn test_unique_consumer_identities_cross_namespace_collision() {
+    // Consumer c2's custom_id collides with consumer c1's username
+    let c1 = make_consumer("c1", "alice");
+    let mut c2 = make_consumer("c2", "bob");
+    c2.custom_id = Some("alice".into());
+    let mut config = empty_config();
+    config.consumers = vec![c1, c2];
+    let err = config.validate_unique_consumer_identities().unwrap_err();
+    assert_eq!(err.len(), 1);
+    assert!(err[0].contains("collides with username"));
+    assert!(err[0].contains("incorrect JWT/OAuth2"));
+}
+
+#[test]
+fn test_unique_consumer_identities_own_custom_id_matches_own_username() {
+    // A consumer whose custom_id matches its own username should NOT be flagged
+    let mut c1 = make_consumer("c1", "alice");
+    c1.custom_id = Some("alice".into());
+    let mut config = empty_config();
+    config.consumers = vec![c1];
+    assert!(config.validate_unique_consumer_identities().is_ok());
+}
+
 // ---- Upstream name uniqueness tests ----
 
 #[test]
@@ -896,4 +1028,149 @@ fn test_hosts_deserialization_with_values() {
     }"#;
     let proxy: Proxy = serde_json::from_str(json).unwrap();
     assert_eq!(proxy.hosts, vec!["api.example.com", "*.example.org"]);
+}
+
+// ---- Regex listen_path validation tests ----
+
+#[test]
+fn test_regex_listen_path_valid() {
+    let mut config = empty_config();
+    config.proxies = vec![make_proxy("p1", "~/api/v[0-9]+/.*")];
+    assert!(config.validate_regex_listen_paths().is_ok());
+}
+
+#[test]
+fn test_regex_listen_path_invalid_pattern() {
+    let mut config = empty_config();
+    config.proxies = vec![make_proxy("p1", "~(invalid[regex")];
+    let err = config.validate_regex_listen_paths().unwrap_err();
+    assert_eq!(err.len(), 1);
+    assert!(err[0].contains("invalid regex listen_path"));
+}
+
+#[test]
+fn test_regex_listen_path_empty_pattern() {
+    let mut config = empty_config();
+    config.proxies = vec![make_proxy("p1", "~")];
+    let err = config.validate_regex_listen_paths().unwrap_err();
+    assert_eq!(err.len(), 1);
+    assert!(err[0].contains("empty pattern"));
+}
+
+#[test]
+fn test_regex_listen_path_non_regex_not_checked() {
+    // Normal listen_paths should not be validated as regex
+    let mut config = empty_config();
+    config.proxies = vec![make_proxy("p1", "/api")];
+    assert!(config.validate_regex_listen_paths().is_ok());
+}
+
+// ---- Stream proxy validation tests ----
+
+#[test]
+fn test_stream_proxy_tcp_requires_listen_port() {
+    let mut proxy = make_proxy("p1", "/tcp");
+    proxy.backend_protocol = BackendProtocol::Tcp;
+    proxy.listen_port = None;
+    let mut config = empty_config();
+    config.proxies = vec![proxy];
+    let err = config.validate_stream_proxies().unwrap_err();
+    assert!(err[0].contains("must have a listen_port"));
+}
+
+#[test]
+fn test_stream_proxy_tcp_with_listen_port_ok() {
+    let mut proxy = make_proxy("p1", "/tcp");
+    proxy.backend_protocol = BackendProtocol::Tcp;
+    proxy.listen_port = Some(5432);
+    let mut config = empty_config();
+    config.proxies = vec![proxy];
+    assert!(config.validate_stream_proxies().is_ok());
+}
+
+#[test]
+fn test_stream_proxy_duplicate_ports() {
+    let mut p1 = make_proxy("p1", "/tcp1");
+    p1.backend_protocol = BackendProtocol::Tcp;
+    p1.listen_port = Some(5432);
+    let mut p2 = make_proxy("p2", "/tcp2");
+    p2.backend_protocol = BackendProtocol::Tcp;
+    p2.listen_port = Some(5432);
+    let mut config = empty_config();
+    config.proxies = vec![p1, p2];
+    let err = config.validate_stream_proxies().unwrap_err();
+    assert!(err[0].contains("Duplicate listen_port"));
+}
+
+#[test]
+fn test_http_proxy_must_not_set_listen_port() {
+    let mut proxy = make_proxy("p1", "/api");
+    proxy.listen_port = Some(8080);
+    let mut config = empty_config();
+    config.proxies = vec![proxy];
+    let err = config.validate_stream_proxies().unwrap_err();
+    assert!(err[0].contains("must not set listen_port"));
+}
+
+// ---- Restore pre-deletion validation tests ----
+// These test the GatewayConfig validation methods used by handle_restore
+// to validate the entire payload before deleting existing data.
+
+#[test]
+fn test_restore_payload_valid() {
+    let mut config = empty_config();
+    config.proxies = vec![make_proxy("p1", "/api")];
+    config.consumers = vec![make_consumer("c1", "alice")];
+    config.upstreams = vec![make_upstream("u1")];
+    assert!(config.validate_unique_resource_ids().is_ok());
+    assert!(config.validate_unique_consumer_identities().is_ok());
+    assert!(config.validate_unique_consumer_credentials().is_ok());
+    assert!(config.validate_regex_listen_paths().is_ok());
+    assert!(config.validate_unique_listen_paths().is_ok());
+    assert!(config.validate_stream_proxies().is_ok());
+}
+
+#[test]
+fn test_restore_payload_rejects_duplicate_resource_ids() {
+    let mut config = empty_config();
+    config.proxies = vec![make_proxy("same-id", "/a"), make_proxy("same-id", "/b")];
+    let err = config.validate_unique_resource_ids().unwrap_err();
+    assert!(!err.is_empty());
+    assert!(err[0].contains("same-id"));
+}
+
+#[test]
+fn test_restore_payload_rejects_invalid_regex() {
+    let mut config = empty_config();
+    config.proxies = vec![make_proxy("p1", "~(broken[regex")];
+    let err = config.validate_regex_listen_paths().unwrap_err();
+    assert!(err[0].contains("invalid regex"));
+}
+
+#[test]
+fn test_restore_payload_rejects_duplicate_listen_paths() {
+    let mut config = empty_config();
+    config.proxies = vec![make_proxy("p1", "/api"), make_proxy("p2", "/api")];
+    let err = config.validate_unique_listen_paths().unwrap_err();
+    assert!(!err.is_empty());
+}
+
+#[test]
+fn test_restore_payload_rejects_missing_upstream_reference() {
+    let mut p = make_proxy("p1", "/api");
+    p.upstream_id = Some("nonexistent".into());
+    let mut config = empty_config();
+    config.proxies = vec![p];
+    let err = config.validate_upstream_references().unwrap_err();
+    assert!(err[0].contains("nonexistent"));
+}
+
+#[test]
+fn test_restore_payload_accepts_valid_upstream_reference() {
+    let mut p = make_proxy("p1", "/api");
+    p.upstream_id = Some("u1".into());
+    let mut config = empty_config();
+    config.proxies = vec![p];
+    config.upstreams = vec![make_upstream("u1")];
+    assert!(config.validate_upstream_references().is_ok());
 }

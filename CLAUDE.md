@@ -132,7 +132,7 @@ src/
 ├── service_discovery/         # Dynamic upstream discovery (DNS-SD, Kubernetes, Consul)
 ├── tls/                       # TLS/mTLS listener configuration
 ├── http3/                     # HTTP/3 (QUIC) support
-└── custom_plugins/            # Custom/external plugin loading
+└── custom_plugins/            # Drop-in custom plugins (auto-discovered by build.rs)
 ```
 
 ### Domain Model (src/config/types.rs)

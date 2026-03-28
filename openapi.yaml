@@ -1065,14 +1065,20 @@ components:
           maxLength: 254
         name:
           type: [string, "null"]
-
-          description: Optional friendly name
+          description: >-
+            Optional friendly name. Must be unique across all proxies when set.
         listen_path:
           type: [string, "null"]
-          description: URL path prefix to match incoming requests (must be unique)
+          description: >-
+            URL path prefix to match incoming requests. Must start with `/` for
+            literal path matching, or `~` for regex matching (e.g., `~^/api/v[0-9]+/`).
+            Regex patterns are compiled at creation time and auto-anchored with `^`
+            if not already present. The combination of `(hosts, listen_path)` must
+            be unique across all proxies.
           examples:
             - /api/v1
             - /users
+            - "~^/api/v[0-9]+/"
         hosts:
           type: array
           items:
@@ -1080,19 +1086,28 @@ components:
           default: []
           description: >-
             Optional list of hostnames this proxy matches. Empty means match all
-            hosts. Supports exact hostnames and wildcard prefixes (e.g.,
-            '*.example.com').
+            hosts. Supports exact hostnames (`api.example.com`) and wildcard
+            prefixes (`*.example.com`). Entries are normalized to lowercase on
+            create/update. Must match the format `[a-z0-9]([a-z0-9.-]*[a-z0-9])?`
+            for exact hosts or `*.[a-z0-9]([a-z0-9.-]*[a-z0-9])?` for wildcards.
           examples:
             - ["api.example.com", "*.internal.example.com"]
         backend_protocol:
           $ref: "#/components/schemas/BackendProtocol"
         backend_host:
           type: [string, "null"]
-          description: Backend server hostname or IP
+          description: >-
+            Backend server hostname or IP. Required when `upstream_id` is not set.
+            When `upstream_id` is set, this field is ignored (upstream targets
+            provide the backend address).
         backend_port:
           type: integer
           format: uint16
-          description: Backend server port
+          default: 0
+          description: >-
+            Backend server port. Required (>= 1) when `upstream_id` is not set.
+            When `upstream_id` is set, this field is ignored (upstream targets
+            provide the backend port).
         backend_path:
           type: [string, "null"]
 
@@ -1214,17 +1229,20 @@ components:
             QUIC frame processing across driver tasks. Default: 4.
         upstream_id:
           type: [string, "null"]
-
           description: |
-            Reference to an Upstream for load-balanced backends. When set,
+            Reference to an existing Upstream for load-balanced backends. When set,
             `backend_host` and `backend_port` are overridden by the selected
-            upstream target.
+            upstream target. The referenced upstream must exist at creation time.
+            Deleting an upstream that is referenced by a proxy is blocked.
         listen_port:
           type: [integer, "null"]
           format: uint16
+          minimum: 1
           description: |
-            Port for this TCP/UDP proxy to listen on. Required when backend_protocol
-            is tcp, tcp_tls, udp, or dtls. Each stream proxy binds its own dedicated port.
+            Port for this TCP/UDP proxy to listen on (must be >= 1). Required when
+            backend_protocol is tcp, tcp_tls, udp, or dtls. Must NOT be set for HTTP
+            proxies. Each stream proxy binds its own dedicated port; duplicate ports
+            across stream proxies are rejected.
         frontend_tls:
           type: boolean
           default: false
@@ -1250,6 +1268,20 @@ components:
             - $ref: "#/components/schemas/RetryConfig"
             - type: "null"
           description: Optional retry configuration
+        response_body_mode:
+          type: string
+          enum: [stream, buffer]
+          default: stream
+          description: |
+            Response body handling mode.
+
+            - `stream` (default): Passes response bytes through as they arrive for
+              lower latency and memory usage. If any plugin attached to this proxy
+              requires response body buffering (e.g., response_transformer), the
+              gateway automatically buffers regardless of this setting.
+            - `buffer`: Always buffers the full response body before running
+              after-proxy plugins, even if no plugin requires it. Use this when you
+              need to guarantee the complete body is available for inspection.
         created_at:
           type: [string, "null"]
           format: date-time
@@ -1311,26 +1343,33 @@ components:
           maxLength: 254
         username:
           type: [string, "null"]
-          description: Unique consumer username
+          minLength: 1
+          description: >-
+            Unique consumer username (must be non-empty). Used as the lookup key
+            for basic_auth authentication. Must be unique across all consumers.
         custom_id:
           type: [string, "null"]
-
-          description: Optional external identifier
+          description: >-
+            Optional external identifier. Must be unique across all consumers when
+            set. Empty strings are normalized to null. Must not collide with another
+            consumer's username (this would cause incorrect JWT/OAuth2 authentication).
         credentials:
           type: object
           default: {}
           additionalProperties:
             type: object
           description: |
-            Map of credential type to credential payload.
+            Map of credential type to credential payload. Credential values that
+            serve as lookup keys must be unique across all consumers.
 
-            | Type | Fields |
-            |------|--------|
-            | `basicauth` | `username`, `password_hash` (bcrypt) |
-            | `key-auth` | `key` |
-            | `jwt` | `key`, `secret`, `algorithm` |
-            | `oauth2` | `client_id`, `client_secret` |
-            | `hmac_auth` | `secret` |
+            | Type | Fields | Uniqueness |
+            |------|--------|------------|
+            | `keyauth` | `key` | `key` must be globally unique |
+            | `basicauth` | `password` or `password_hash` (bcrypt/HMAC) | Indexed by consumer `username` (unique) |
+            | `mtls_auth` | `identity` | `identity` must be globally unique |
+            | `jwt_auth` | (identity from JWT claim) | Looked up by `username`, `id`, or `custom_id` |
+            | `oauth2` | (identity from token claim) | Looked up by `username`, `id`, or `custom_id` |
+            | `hmac_auth` | `secret` | Looked up by username in Authorization header |
         created_at:
           type: [string, "null"]
           format: date-time
@@ -1360,17 +1399,28 @@ components:
           maxLength: 254
         plugin_name:
           type: [string, "null"]
-          description: Plugin type name (must be one of the available plugins)
+          description: >-
+            Plugin type name. Must be one of the available built-in plugins
+            (e.g., key_auth, rate_limiting, cors, stdout_logging). Use
+            `GET /plugins` to discover available plugin names.
         config:
           type: object
           default: {}
-          description: Plugin-specific JSON configuration
+          description: >-
+            Plugin-specific JSON configuration. Validated when the plugin is
+            instantiated at config reload time. Security plugins (key_auth,
+            basic_auth, jwt_auth, hmac_auth, oauth2_auth, mtls_auth,
+            access_control, ip_restriction) block gateway startup if their
+            config is invalid.
         scope:
           $ref: "#/components/schemas/PluginScope"
         proxy_id:
           type: [string, "null"]
-
-          description: Required when scope is `proxy`
+          description: >-
+            Required when scope is `proxy` — must reference an existing proxy ID.
+            Must be null (or omitted) when scope is `global`. The referenced proxy
+            must exist. When a proxy is deleted, its associated plugin configs are
+            automatically deleted (cascade).
         enabled:
           type: boolean
           default: true
@@ -1393,8 +1443,9 @@ components:
       type: string
       enum: [global, proxy]
       description: |
-        `global` — plugin applies to all proxies.
-        `proxy` — plugin applies only to the proxy referenced by `proxy_id`.
+        `global` — plugin applies to all proxies; `proxy_id` must be null.
+        `proxy` — plugin applies only to the proxy referenced by `proxy_id`;
+        `proxy_id` is required.
 
     # ── Circuit Breaker ─────────────────────────────────────────────
     CircuitBreakerConfig:
@@ -1510,17 +1561,19 @@ components:
           maxLength: 254
         name:
           type: [string, "null"]
-
+          description: >-
+            Optional friendly name. Must be unique across all upstreams when set.
         targets:
           type: array
           items:
             $ref: "#/components/schemas/UpstreamTarget"
-          minItems: 1
+          description: >-
+            Static list of backend targets. At least one target is required unless
+            `service_discovery` is configured as an alternative target source.
         algorithm:
           $ref: "#/components/schemas/LoadBalancerAlgorithm"
         hash_on:
           type: [string, "null"]
-
           description: |
             Field to hash for consistent-hashing algorithm
             (e.g. `header:x-user-id`). Ignored by other algorithms.
@@ -1528,6 +1581,14 @@ components:
           oneOf:
             - $ref: "#/components/schemas/HealthCheckConfig"
             - type: "null"
+        service_discovery:
+          oneOf:
+            - $ref: "#/components/schemas/ServiceDiscoveryConfig"
+            - type: "null"
+          description: >-
+            Dynamic target discovery configuration. When set, discovered targets
+            are merged with any static `targets`. Can be used as the sole target
+            source (allowing `targets` to be empty).
         created_at:
           type: [string, "null"]
           format: date-time
@@ -1653,6 +1714,78 @@ components:
           format: uint64
           default: 30
           description: Sliding window for counting failures
+
+    # ── Service Discovery ──────────────────────────────────────────
+    ServiceDiscoveryConfig:
+      type: object
+      required: [provider]
+      properties:
+        provider:
+          type: string
+          enum: [dns_sd, kubernetes, consul]
+          description: Service discovery provider type
+        dns_sd:
+          type: object
+          description: DNS-SD (SRV record) configuration. Required when provider is `dns_sd`.
+          properties:
+            service_name:
+              type: string
+              description: DNS name to query for SRV records (e.g., `_http._tcp.my-service.example.com`)
+            poll_interval_seconds:
+              type: integer
+              format: uint64
+              default: 30
+              description: Re-query interval in seconds
+        kubernetes:
+          type: object
+          description: Kubernetes EndpointSlice configuration. Required when provider is `kubernetes`.
+          properties:
+            service_name:
+              type: string
+              description: Kubernetes service name
+            namespace:
+              type: string
+              default: default
+              description: Kubernetes namespace
+            port_name:
+              type: [string, "null"]
+              description: Named port to select from EndpointSlice
+            poll_interval_seconds:
+              type: integer
+              format: uint64
+              default: 30
+        consul:
+          type: object
+          description: HashiCorp Consul configuration. Required when provider is `consul`.
+          properties:
+            address:
+              type: string
+              description: Consul HTTP API address (e.g., `http://consul:8500`)
+            service_name:
+              type: string
+              description: Service name registered in Consul
+            datacenter:
+              type: [string, "null"]
+              description: Datacenter filter (uses local datacenter if not set)
+            tag:
+              type: [string, "null"]
+              description: Service tag filter
+            healthy_only:
+              type: boolean
+              default: true
+              description: Only return healthy services
+            token:
+              type: [string, "null"]
+              description: Consul ACL token for authentication
+            poll_interval_seconds:
+              type: integer
+              format: uint64
+              default: 30
+        default_weight:
+          type: integer
+          format: uint32
+          default: 1
+          description: Default weight assigned to discovered targets
 
     # ── Health response ─────────────────────────────────────────────
     HealthResponse:

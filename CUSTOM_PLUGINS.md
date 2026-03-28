@@ -41,7 +41,9 @@ Response sent to client
 
 ### 1. Create your plugin file
 
-Create a new `.rs` file in the `custom_plugins/` directory at the project root:
+Create a new `.rs` file in the `custom_plugins/` directory at the project root. The file name becomes the plugin name (e.g., `my_header_injector.rs` → plugin name `my_header_injector`).
+
+Each plugin file must export a `create_plugin` factory function:
 
 ```rust
 // custom_plugins/my_header_injector.rs
@@ -49,8 +51,9 @@ Create a new `.rs` file in the `custom_plugins/` directory at the project root:
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::sync::Arc;
 
-use crate::plugins::{Plugin, PluginResult, RequestContext};
+use crate::plugins::{Plugin, PluginHttpClient, PluginResult, RequestContext};
 
 pub struct MyHeaderInjector {
     header_name: String,
@@ -75,7 +78,7 @@ impl MyHeaderInjector {
 #[async_trait]
 impl Plugin for MyHeaderInjector {
     fn name(&self) -> &str {
-        "my_header_injector"
+        "my_header_injector"  // Must match the file name
     }
 
     async fn before_proxy(
@@ -87,32 +90,33 @@ impl Plugin for MyHeaderInjector {
         PluginResult::Continue
     }
 }
+
+/// Required factory function ��� the build script calls this automatically.
+pub fn create_plugin(
+    config: &Value,
+    _http_client: PluginHttpClient,
+) -> Option<Arc<dyn Plugin>> {
+    Some(Arc::new(MyHeaderInjector::new(config)))
+}
 ```
 
-### 2. Register it in `custom_plugins/mod.rs`
-
-Open `custom_plugins/mod.rs` and make three additions:
-
-```rust
-// Step 1: Declare the module
-pub mod my_header_injector;
-
-// Step 2: Add to the factory match (inside create_custom_plugin)
-"my_header_injector" => Some(Arc::new(
-    my_header_injector::MyHeaderInjector::new(config)
-)),
-
-// Step 3: Add to the names list (inside custom_plugin_names)
-"my_header_injector",
-```
-
-### 3. Build
+### 2. Build
 
 ```bash
 cargo build --release
 ```
 
-That's it. No core files edited. Your plugin is now available to use in gateway configuration.
+That's it. The build script automatically discovers your file, declares the module, and registers it in the plugin factory. No registry file to edit, no core files modified.
+
+### Filtering plugins (optional)
+
+To include only specific custom plugins, set `FERRUM_CUSTOM_PLUGINS` at **build time**:
+
+```bash
+FERRUM_CUSTOM_PLUGINS=my_header_injector,my_auth cargo build --release
+```
+
+If unset, all `.rs` files in `custom_plugins/` are included.
 
 ### 4. Configure
 
@@ -297,13 +301,15 @@ impl MyWebhookPlugin {
 }
 ```
 
-Then in the factory registration:
+Then in the factory function at the bottom of your plugin file:
 
 ```rust
-// In custom_plugins/mod.rs, inside create_custom_plugin():
-"my_webhook" => Some(Arc::new(
-    my_webhook::MyWebhookPlugin::new(config, _http_client)
-)),
+pub fn create_plugin(
+    config: &Value,
+    http_client: PluginHttpClient,
+) -> Option<Arc<dyn Plugin>> {
+    Some(Arc::new(MyWebhookPlugin::new(config, http_client)))
+}
 ```
 
 The shared HTTP client provides connection pooling, keepalive, and DNS caching from the gateway's core infrastructure.
@@ -399,8 +405,9 @@ ferrum-gateway/
 │   │   └── ...
 │   ├── main.rs
 │   └── lib.rs
-├── custom_plugins/            # YOUR PLUGINS GO HERE
-│   ├── mod.rs                 # Registry: declare modules, register in factory
+├── build.rs                   # Auto-discovers custom plugins at compile time
+├── custom_plugins/            # YOUR PLUGINS GO HERE — just drop .rs files
+│   ├── mod.rs                 # Thin shim (includes build-script-generated code)
 │   ├── example_plugin.rs      # Working example (can be removed)
 │   ├── my_header_injector.rs  # Your plugin
 │   └── my_custom_auth.rs      # Your plugin
@@ -485,10 +492,9 @@ Use the gateway's test infrastructure in `tests/` to create end-to-end tests wit
 
 ## Checklist
 
-- [ ] Plugin file created in `custom_plugins/`
-- [ ] Module declared in `custom_plugins/mod.rs`
-- [ ] Plugin registered in `create_custom_plugin()` match arm
-- [ ] Plugin name added to `custom_plugin_names()`
+- [ ] Plugin `.rs` file created in `custom_plugins/`
+- [ ] `create_plugin()` factory function exported
+- [ ] `fn name()` returns the file name (without `.rs`)
 - [ ] Priority set appropriately for the execution phase
 - [ ] `is_auth_plugin()` returns `true` if it's an auth plugin
 - [ ] `requires_response_body_buffering()` returns `true` if needed
