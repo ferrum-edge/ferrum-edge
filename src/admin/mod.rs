@@ -1665,10 +1665,10 @@ async fn handle_create_upstream(
         }
     }
 
-    if upstream.targets.is_empty() {
+    if upstream.targets.is_empty() && upstream.service_discovery.is_none() {
         return Ok(json_response(
             StatusCode::BAD_REQUEST,
-            &json!({"error": "At least one target is required"}),
+            &json!({"error": "At least one target is required (or configure service_discovery)"}),
         ));
     }
 
@@ -1775,10 +1775,10 @@ async fn handle_update_upstream(
     upstream.id = id.to_string();
     upstream.updated_at = Utc::now();
 
-    if upstream.targets.is_empty() {
+    if upstream.targets.is_empty() && upstream.service_discovery.is_none() {
         return Ok(json_response(
             StatusCode::BAD_REQUEST,
-            &json!({"error": "At least one target is required"}),
+            &json!({"error": "At least one target is required (or configure service_discovery)"}),
         ));
     }
 
