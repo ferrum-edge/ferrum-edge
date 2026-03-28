@@ -237,6 +237,13 @@ impl DatabaseStore {
         // Normalize host entries to lowercase
         config.normalize_hosts();
 
+        // Validate host entry format
+        if let Err(errors) = config.validate_hosts() {
+            for msg in &errors {
+                warn!("{}", msg);
+            }
+        }
+
         // Validate regex listen_paths compile correctly
         if let Err(errors) = config.validate_regex_listen_paths() {
             for msg in &errors {

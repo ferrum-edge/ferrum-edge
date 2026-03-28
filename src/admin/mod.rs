@@ -24,7 +24,7 @@ use uuid::Uuid;
 use crate::admin::jwt_auth::{JwtError, JwtManager};
 use crate::config::db_loader::DatabaseStore;
 use crate::config::types::{
-    Consumer, GatewayConfig, PluginConfig, Proxy, Upstream, validate_resource_id,
+    Consumer, GatewayConfig, PluginConfig, PluginScope, Proxy, Upstream, validate_resource_id,
 };
 use crate::plugins;
 use crate::proxy::ProxyState;
@@ -497,10 +497,36 @@ async fn handle_create_proxy(
     };
 
     // Validate proxy fields
-    if proxy.listen_path.is_empty() || !proxy.listen_path.starts_with('/') {
+    if proxy.listen_path.is_empty() {
         return Ok(json_response(
             StatusCode::BAD_REQUEST,
-            &json!({"error": "listen_path must be non-empty and start with '/'"}),
+            &json!({"error": "listen_path must be non-empty"}),
+        ));
+    }
+    if proxy.listen_path.starts_with('~') {
+        // Regex listen_path — validate pattern compiles
+        let pattern = &proxy.listen_path[1..];
+        if pattern.is_empty() {
+            return Ok(json_response(
+                StatusCode::BAD_REQUEST,
+                &json!({"error": "regex listen_path '~' has empty pattern"}),
+            ));
+        }
+        let anchored = if pattern.starts_with('^') {
+            pattern.to_string()
+        } else {
+            format!("^{}", pattern)
+        };
+        if let Err(e) = regex::Regex::new(&anchored) {
+            return Ok(json_response(
+                StatusCode::BAD_REQUEST,
+                &json!({"error": format!("invalid regex listen_path: {}", e)}),
+            ));
+        }
+    } else if !proxy.listen_path.starts_with('/') {
+        return Ok(json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"error": "listen_path must start with '/' or '~' (regex)"}),
         ));
     }
     if proxy.backend_host.is_empty() {
@@ -615,6 +641,36 @@ async fn handle_create_proxy(
         }
     }
 
+    // Validate stream proxy configuration
+    if proxy.backend_protocol.is_stream_proxy() {
+        match proxy.listen_port {
+            None => {
+                return Ok(json_response(
+                    StatusCode::BAD_REQUEST,
+                    &json!({"error": format!(
+                        "Stream proxy (protocol {}) must have a listen_port",
+                        proxy.backend_protocol
+                    )}),
+                ));
+            }
+            Some(port) if port < 1 => {
+                return Ok(json_response(
+                    StatusCode::BAD_REQUEST,
+                    &json!({"error": format!("listen_port {} must be >= 1", port)}),
+                ));
+            }
+            _ => {}
+        }
+    } else if proxy.listen_port.is_some() {
+        return Ok(json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"error": format!(
+                "HTTP proxy (protocol {}) must not set listen_port",
+                proxy.backend_protocol
+            )}),
+        ));
+    }
+
     match db.create_proxy(&proxy).await {
         Ok(_) => Ok(json_response(StatusCode::CREATED, &json!(proxy))),
         Err(e) => Ok(json_response(
@@ -698,10 +754,36 @@ async fn handle_update_proxy(
     };
 
     // Validate proxy fields
-    if proxy.listen_path.is_empty() || !proxy.listen_path.starts_with('/') {
+    if proxy.listen_path.is_empty() {
         return Ok(json_response(
             StatusCode::BAD_REQUEST,
-            &json!({"error": "listen_path must be non-empty and start with '/'"}),
+            &json!({"error": "listen_path must be non-empty"}),
+        ));
+    }
+    if proxy.listen_path.starts_with('~') {
+        // Regex listen_path — validate pattern compiles
+        let pattern = &proxy.listen_path[1..];
+        if pattern.is_empty() {
+            return Ok(json_response(
+                StatusCode::BAD_REQUEST,
+                &json!({"error": "regex listen_path '~' has empty pattern"}),
+            ));
+        }
+        let anchored = if pattern.starts_with('^') {
+            pattern.to_string()
+        } else {
+            format!("^{}", pattern)
+        };
+        if let Err(e) = regex::Regex::new(&anchored) {
+            return Ok(json_response(
+                StatusCode::BAD_REQUEST,
+                &json!({"error": format!("invalid regex listen_path: {}", e)}),
+            ));
+        }
+    } else if !proxy.listen_path.starts_with('/') {
+        return Ok(json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"error": "listen_path must start with '/' or '~' (regex)"}),
         ));
     }
     if proxy.backend_host.is_empty() {
@@ -789,6 +871,36 @@ async fn handle_update_proxy(
                 ));
             }
         }
+    }
+
+    // Validate stream proxy configuration
+    if proxy.backend_protocol.is_stream_proxy() {
+        match proxy.listen_port {
+            None => {
+                return Ok(json_response(
+                    StatusCode::BAD_REQUEST,
+                    &json!({"error": format!(
+                        "Stream proxy (protocol {}) must have a listen_port",
+                        proxy.backend_protocol
+                    )}),
+                ));
+            }
+            Some(port) if port < 1 => {
+                return Ok(json_response(
+                    StatusCode::BAD_REQUEST,
+                    &json!({"error": format!("listen_port {} must be >= 1", port)}),
+                ));
+            }
+            _ => {}
+        }
+    } else if proxy.listen_port.is_some() {
+        return Ok(json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"error": format!(
+                "HTTP proxy (protocol {}) must not set listen_port",
+                proxy.backend_protocol
+            )}),
+        ));
     }
 
     // Capture the old upstream_id before update so we can clean up if it changes
@@ -1505,6 +1617,20 @@ async fn handle_create_plugin_config(
         ));
     }
 
+    // Validate scope and proxy_id consistency
+    if pc.scope == PluginScope::Proxy && pc.proxy_id.is_none() {
+        return Ok(json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"error": "Plugin with scope 'proxy' must have a proxy_id"}),
+        ));
+    }
+    if pc.scope == PluginScope::Global && pc.proxy_id.is_some() {
+        return Ok(json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"error": "Plugin with scope 'global' must not have a proxy_id"}),
+        ));
+    }
+
     pc.created_at = Utc::now();
     pc.updated_at = Utc::now();
 
@@ -1592,6 +1718,29 @@ async fn handle_update_plugin_config(
 
     pc.id = id.to_string();
     pc.updated_at = Utc::now();
+
+    // Validate plugin name is known
+    let known_plugins = crate::plugins::available_plugins();
+    if !known_plugins.contains(&pc.plugin_name.as_str()) {
+        return Ok(json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"error": format!("Unknown plugin name '{}'. Available plugins: {:?}", pc.plugin_name, known_plugins)}),
+        ));
+    }
+
+    // Validate scope and proxy_id consistency
+    if pc.scope == PluginScope::Proxy && pc.proxy_id.is_none() {
+        return Ok(json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"error": "Plugin with scope 'proxy' must have a proxy_id"}),
+        ));
+    }
+    if pc.scope == PluginScope::Global && pc.proxy_id.is_some() {
+        return Ok(json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"error": "Plugin with scope 'global' must not have a proxy_id"}),
+        ));
+    }
 
     match db.update_plugin_config(&pc).await {
         Ok(_) => Ok(json_response(StatusCode::OK, &json!(pc))),

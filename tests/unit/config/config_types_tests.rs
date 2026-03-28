@@ -1029,3 +1029,85 @@ fn test_hosts_deserialization_with_values() {
     let proxy: Proxy = serde_json::from_str(json).unwrap();
     assert_eq!(proxy.hosts, vec!["api.example.com", "*.example.org"]);
 }
+
+// ---- Regex listen_path validation tests ----
+
+#[test]
+fn test_regex_listen_path_valid() {
+    let mut config = empty_config();
+    config.proxies = vec![make_proxy("p1", "~/api/v[0-9]+/.*")];
+    assert!(config.validate_regex_listen_paths().is_ok());
+}
+
+#[test]
+fn test_regex_listen_path_invalid_pattern() {
+    let mut config = empty_config();
+    config.proxies = vec![make_proxy("p1", "~(invalid[regex")];
+    let err = config.validate_regex_listen_paths().unwrap_err();
+    assert_eq!(err.len(), 1);
+    assert!(err[0].contains("invalid regex listen_path"));
+}
+
+#[test]
+fn test_regex_listen_path_empty_pattern() {
+    let mut config = empty_config();
+    config.proxies = vec![make_proxy("p1", "~")];
+    let err = config.validate_regex_listen_paths().unwrap_err();
+    assert_eq!(err.len(), 1);
+    assert!(err[0].contains("empty pattern"));
+}
+
+#[test]
+fn test_regex_listen_path_non_regex_not_checked() {
+    // Normal listen_paths should not be validated as regex
+    let mut config = empty_config();
+    config.proxies = vec![make_proxy("p1", "/api")];
+    assert!(config.validate_regex_listen_paths().is_ok());
+}
+
+// ---- Stream proxy validation tests ----
+
+#[test]
+fn test_stream_proxy_tcp_requires_listen_port() {
+    let mut proxy = make_proxy("p1", "/tcp");
+    proxy.backend_protocol = BackendProtocol::Tcp;
+    proxy.listen_port = None;
+    let mut config = empty_config();
+    config.proxies = vec![proxy];
+    let err = config.validate_stream_proxies().unwrap_err();
+    assert!(err[0].contains("must have a listen_port"));
+}
+
+#[test]
+fn test_stream_proxy_tcp_with_listen_port_ok() {
+    let mut proxy = make_proxy("p1", "/tcp");
+    proxy.backend_protocol = BackendProtocol::Tcp;
+    proxy.listen_port = Some(5432);
+    let mut config = empty_config();
+    config.proxies = vec![proxy];
+    assert!(config.validate_stream_proxies().is_ok());
+}
+
+#[test]
+fn test_stream_proxy_duplicate_ports() {
+    let mut p1 = make_proxy("p1", "/tcp1");
+    p1.backend_protocol = BackendProtocol::Tcp;
+    p1.listen_port = Some(5432);
+    let mut p2 = make_proxy("p2", "/tcp2");
+    p2.backend_protocol = BackendProtocol::Tcp;
+    p2.listen_port = Some(5432);
+    let mut config = empty_config();
+    config.proxies = vec![p1, p2];
+    let err = config.validate_stream_proxies().unwrap_err();
+    assert!(err[0].contains("Duplicate listen_port"));
+}
+
+#[test]
+fn test_http_proxy_must_not_set_listen_port() {
+    let mut proxy = make_proxy("p1", "/api");
+    proxy.listen_port = Some(8080);
+    let mut config = empty_config();
+    config.proxies = vec![proxy];
+    let err = config.validate_stream_proxies().unwrap_err();
+    assert!(err[0].contains("must not set listen_port"));
+}
