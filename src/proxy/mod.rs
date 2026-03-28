@@ -820,7 +820,7 @@ async fn handle_connection(
     let svc = service_fn(move |req: Request<Incoming>| {
         let state = state.clone();
         let addr = remote_addr;
-        async move { handle_proxy_request(req, state, addr, false, None).await }
+        async move { handle_proxy_request(req, state, addr, false, None, None).await }
     });
     if let Err(e) = builder.serve_connection_with_upgrades(io, svc).await {
         let err_string = e.to_string();
@@ -1518,16 +1518,18 @@ async fn handle_tls_connection(
         }
     };
 
-    // Extract peer certificate (first in chain) before wrapping the stream.
+    // Extract peer certificate and chain before wrapping the stream.
     // This is the only point where the ServerConnection is accessible — once
     // wrapped in TokioIo, the TLS metadata is encapsulated and inaccessible.
     // Arc-shared so HTTP/2 multiplexed requests avoid per-request cert cloning.
-    let client_cert_der: Option<Arc<Vec<u8>>> = tls_stream
-        .get_ref()
-        .1
-        .peer_certificates()
+    let peer_certs = tls_stream.get_ref().1.peer_certificates();
+    let client_cert_der: Option<Arc<Vec<u8>>> = peer_certs
         .and_then(|certs| certs.first())
         .map(|cert| Arc::new(cert.to_vec()));
+    // Capture intermediate/CA certs (index 1+) for per-proxy CA filtering in mtls_auth.
+    let client_cert_chain_der: Option<Arc<Vec<Vec<u8>>>> = peer_certs
+        .filter(|certs| certs.len() > 1)
+        .map(|certs| Arc::new(certs[1..].iter().map(|c| c.to_vec()).collect()));
 
     // Convert TLS stream to TokioIo for hyper
     let io = hyper_util::rt::TokioIo::new(tls_stream);
@@ -1552,7 +1554,8 @@ async fn handle_tls_connection(
         let state = state.clone();
         let addr = remote_addr;
         let cert = client_cert_der.clone();
-        async move { handle_proxy_request(req, state, addr, true, cert).await }
+        let chain = client_cert_chain_der.clone();
+        async move { handle_proxy_request(req, state, addr, true, cert, chain).await }
     });
     if let Err(e) = builder.serve_connection_with_upgrades(io, svc).await {
         let err_string = e.to_string();
@@ -1640,6 +1643,7 @@ pub async fn handle_proxy_request(
     remote_addr: SocketAddr,
     is_tls: bool,
     tls_client_cert_der: Option<Arc<Vec<u8>>>,
+    tls_client_cert_chain_der: Option<Arc<Vec<Vec<u8>>>>,
 ) -> Result<Response<ProxyBody>, hyper::Error> {
     let start_time = Instant::now();
 
@@ -1654,6 +1658,7 @@ pub async fn handle_proxy_request(
     // separate ownership for use in backend URL building and logging.
     let mut ctx = RequestContext::new(socket_ip.clone(), method.clone(), path.clone());
     ctx.tls_client_cert_der = tls_client_cert_der;
+    ctx.tls_client_cert_chain_der = tls_client_cert_chain_der;
     ctx.headers.reserve(req.headers().keys_len());
 
     // Validate and extract headers with size limits

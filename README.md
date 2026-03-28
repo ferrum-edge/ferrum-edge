@@ -988,7 +988,7 @@ Both `/health` and `/status` return the same response and do not require JWT aut
 Plugins execute in a defined pipeline for each request:
 
 1. **`on_request_received`** — Called immediately when a request arrives (CORS preflight, rate limiting)
-2. **`authenticate`** — Identifies the consumer (JWT, API Key, Basic Auth, OAuth2)
+2. **`authenticate`** — Identifies the consumer (mTLS, JWT, API Key, Basic Auth, OAuth2)
 3. **`authorize`** — Checks consumer permissions (Access Control)
 4. **`before_proxy`** — Modifies the request before forwarding (Request Transformer)
 5. **`after_proxy`** — Modifies the response from the backend (Response Transformer, CORS headers)
@@ -1001,7 +1001,7 @@ Within each phase, plugins run in **priority order** (lowest number first). This
 | Priority | Band | Plugins |
 |----------|------|---------|
 | 100 | Early | `cors`, `ip_restriction`, `bot_detection` |
-| 1000-1400 | Authentication | `oauth2_auth`, `jwt_auth`, `key_auth`, `basic_auth`, `hmac_auth` |
+| 950-1400 | Authentication | `mtls_auth`, `oauth2_auth`, `jwt_auth`, `key_auth`, `basic_auth`, `hmac_auth` |
 | 2000 | Authorization | `access_control` |
 | 2850 | Authorization | `graphql` (depth, complexity, per-operation rate limiting) |
 | 2900 | Authorization | `rate_limiting` (consumer-based limits run after auth) |
@@ -1089,6 +1089,91 @@ Logs verbose request/response details to stdout. Sensitive headers (Authorizatio
 | `redacted_headers` | String[] | `[]` | Additional header names to redact beyond the built-in sensitive list |
 
 **Built-in redacted headers**: `authorization`, `proxy-authorization`, `cookie`, `set-cookie`, `x-api-key`, `x-auth-token`, `x-csrf-token`, `x-xsrf-token`, `www-authenticate`, `x-forwarded-authorization`
+
+#### `mtls_auth`
+
+Authenticates requests using the client's TLS certificate, matching a configurable certificate field against consumer credentials. Operates on top of the gateway's global CA verification — the TLS handshake validates the certificate chain, and this plugin provides per-proxy consumer identity matching with optional CA filtering.
+
+**Config**:
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `cert_field` | String | `subject_cn` | Certificate field to use as identity (see below) |
+| `allowed_issuers` | Object[] | *(none)* | Per-proxy issuer DN filters (see [Issuer Filtering](#issuer-filtering)) |
+| `allowed_ca_fingerprints_sha256` | String[] | *(none)* | SHA-256 fingerprints of allowed CA/intermediate certs (see [CA Fingerprint Filtering](#ca-fingerprint-filtering)) |
+
+**Supported `cert_field` values:**
+
+| Value | Description |
+|-------|-------------|
+| `subject_cn` | Subject Common Name (default) |
+| `subject_ou` | Subject Organizational Unit |
+| `subject_o` | Subject Organization |
+| `san_dns` | First DNS Subject Alternative Name |
+| `san_email` | First email Subject Alternative Name |
+| `fingerprint_sha256` | SHA-256 fingerprint of the DER-encoded certificate (lowercase hex) |
+| `serial` | Certificate serial number (lowercase hex) |
+
+**Consumer credential** (`mtls_auth`):
+```yaml
+credentials:
+  mtls_auth:
+    identity: "client.example.com"
+```
+
+The `identity` value must exactly match the extracted certificate field (case-sensitive).
+
+##### Issuer Filtering
+
+When `allowed_issuers` is configured, the plugin verifies the client certificate's issuer DN matches at least one filter entry. This enables per-proxy CA restrictions on top of the global truststore.
+
+Each filter object can specify `cn`, `o`, and/or `ou` fields. Within a single filter, all specified fields must match (**AND** logic). Across filter entries, any match is sufficient (**OR** logic).
+
+```yaml
+plugin_name: mtls_auth
+config:
+  cert_field: subject_cn
+  allowed_issuers:
+    - cn: "Internal Services CA"
+    - cn: "Partner Portal CA"
+      o: "Partner Corp"
+```
+
+In this example, clients are accepted if their certificate was issued by "Internal Services CA" (any org) **or** by "Partner Portal CA" with organization "Partner Corp".
+
+##### CA Fingerprint Filtering
+
+When `allowed_ca_fingerprints_sha256` is configured, the plugin verifies that at least one certificate in the client's TLS chain (intermediate/CA certs sent during the handshake) matches a configured SHA-256 fingerprint. Fingerprints are case-insensitive.
+
+```yaml
+plugin_name: mtls_auth
+config:
+  cert_field: subject_cn
+  allowed_ca_fingerprints_sha256:
+    - "a1b2c3d4e5f6..."
+```
+
+> **Note:** Root CA certificates are typically not included in the client's certificate chain — they are in the server's trust store. Use `allowed_issuers` for root CA filtering, and `allowed_ca_fingerprints_sha256` for intermediate CA filtering.
+
+When both `allowed_issuers` and `allowed_ca_fingerprints_sha256` are configured, **both** constraints must pass (AND logic).
+
+##### Multi-Auth Compatibility
+
+`mtls_auth` works with `auth_mode: multi`. When combined with other auth plugins (e.g., `jwt_auth`, `key_auth`), if the mTLS check fails (no cert, wrong issuer, unknown identity), the gateway continues to the next auth plugin. The request is only rejected if **all** configured auth plugins fail.
+
+```yaml
+auth_mode: multi
+plugins:
+  - plugin_config_id: "mtls-plugin"    # Try mTLS first (priority 950)
+  - plugin_config_id: "jwt-plugin"     # Fall back to JWT (priority 1100)
+```
+
+##### How It Works
+
+1. **TLS handshake** (global) — the gateway validates the client certificate against the global CA truststore (`FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH`). This is all-or-nothing per listener.
+2. **Issuer check** (per-proxy, optional) — if `allowed_issuers` is configured, the plugin verifies the peer cert's issuer DN. Rejects with `403` on mismatch.
+3. **CA fingerprint check** (per-proxy, optional) — if `allowed_ca_fingerprints_sha256` is configured, the plugin checks the chain certs. Rejects with `403` on mismatch.
+4. **Identity extraction** — the configured `cert_field` is extracted from the peer certificate.
+5. **Consumer lookup** — O(1) lookup via `ConsumerIndex` using the extracted identity.
 
 #### `jwt_auth`
 

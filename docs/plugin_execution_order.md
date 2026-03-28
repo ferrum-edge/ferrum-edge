@@ -16,7 +16,7 @@ Request In
              │
              ▼
 ┌─────────────────────────┐
-│ 2. authenticate         │  Identity verification: JWT, OAuth2, API key, Basic
+│ 2. authenticate         │  Identity verification: mTLS, JWT, OAuth2, API key, Basic
 └────────────┬────────────┘
              │
              ▼
@@ -56,7 +56,7 @@ Priority bands are spaced with gaps so future plugins can slot in without renumb
 | Band | Priority Range | Purpose | Plugins |
 |------|---------------|---------|---------|
 | **Early** | 0–999 | Pre-processing that must run before auth | `cors` (100), `ip_restriction` (150), `bot_detection` (200) |
-| **AuthN** | 1000–1999 | Authentication / identity verification | `oauth2_auth` (1000), `jwt_auth` (1100), `key_auth` (1200), `basic_auth` (1300), `hmac_auth` (1400) |
+| **AuthN** | 950–1999 | Authentication / identity verification | `mtls_auth` (950), `oauth2_auth` (1000), `jwt_auth` (1100), `key_auth` (1200), `basic_auth` (1300), `hmac_auth` (1400) |
 | **AuthZ** | 2000–2999 | Authorization & post-auth enforcement | `access_control` (2000), `graphql` (2850), `rate_limiting` (2900) |
 | **Transform** | 3000–3999 | Request modification before backend call | `request_transformer` (3000), `body_validator` (3100), `request_termination` (3200) |
 | **Response** | 4000–4999 | Response modification after backend call | `response_transformer` (4000) |
@@ -72,24 +72,25 @@ Given all built-in plugins enabled, the execution order is:
 | 1 | `cors` | 100 | on_request_received, after_proxy |
 | 2 | `ip_restriction` | 150 | on_request_received |
 | 3 | `bot_detection` | 200 | on_request_received |
-| 4 | `oauth2_auth` | 1000 | authenticate |
-| 5 | `jwt_auth` | 1100 | authenticate |
-| 6 | `key_auth` | 1200 | authenticate |
-| 7 | `basic_auth` | 1300 | authenticate |
-| 8 | `hmac_auth` | 1400 | authenticate |
-| 9 | `access_control` | 2000 | authorize |
-| 10 | `graphql` | 2850 | before_proxy |
-| 11 | `rate_limiting` | 2900 | on_request_received (IP mode), authorize (consumer mode) |
-| 12 | `request_transformer` | 3000 | before_proxy |
-| 13 | `body_validator` | 3100 | before_proxy, on_response_body |
-| 14 | `request_termination` | 3200 | before_proxy |
-| 15 | `response_transformer` | 4000 | after_proxy |
-| 16 | `stdout_logging` | 9000 | log |
-| 17 | `correlation_id` | 9050 | on_request_received, log |
-| 18 | `http_logging` | 9100 | log |
-| 19 | `transaction_debugger` | 9200 | on_request_received, after_proxy, log |
-| 20 | `prometheus_metrics` | 9300 | after_proxy, log |
-| 21 | `otel_tracing` | 9400 | on_request_received, after_proxy |
+| 4 | `mtls_auth` | 950 | authenticate |
+| 5 | `oauth2_auth` | 1000 | authenticate |
+| 6 | `jwt_auth` | 1100 | authenticate |
+| 7 | `key_auth` | 1200 | authenticate |
+| 8 | `basic_auth` | 1300 | authenticate |
+| 9 | `hmac_auth` | 1400 | authenticate |
+| 10 | `access_control` | 2000 | authorize |
+| 11 | `graphql` | 2850 | before_proxy |
+| 12 | `rate_limiting` | 2900 | on_request_received (IP mode), authorize (consumer mode) |
+| 13 | `request_transformer` | 3000 | before_proxy |
+| 14 | `body_validator` | 3100 | before_proxy, on_response_body |
+| 15 | `request_termination` | 3200 | before_proxy |
+| 16 | `response_transformer` | 4000 | after_proxy |
+| 17 | `stdout_logging` | 9000 | log |
+| 18 | `correlation_id` | 9050 | on_request_received, log |
+| 19 | `http_logging` | 9100 | log |
+| 20 | `transaction_debugger` | 9200 | on_request_received, after_proxy, log |
+| 21 | `prometheus_metrics` | 9300 | after_proxy, log |
+| 22 | `otel_tracing` | 9400 | on_request_received, after_proxy |
 
 ## Why This Order Matters
 
@@ -209,6 +210,7 @@ TLS/DTLS are transport-layer concerns, not separate protocols. A plugin that sup
 | `cors` | ✓ | | | | | HTTP-only concept (Origin/ACAO headers) |
 | `ip_restriction` | ✓ | ✓ | ✓ | ✓ | ✓ | IP filtering is protocol-agnostic |
 | `bot_detection` | ✓ | ✓ | ✓ | | | Needs User-Agent header |
+| `mtls_auth` | ✓ | ✓ | ✓ | | | Requires TLS client certificate |
 | `oauth2_auth` | ✓ | ✓ | ✓ | | | Requires HTTP headers |
 | `jwt_auth` | ✓ | ✓ | ✓ | | | Requires HTTP headers |
 | `key_auth` | ✓ | ✓ | ✓ | | | Requires HTTP headers |

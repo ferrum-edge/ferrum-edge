@@ -93,6 +93,10 @@ pub struct RequestContext {
     /// Populated when the connection used TLS with client certificate verification.
     /// Shared via Arc to avoid cloning cert bytes for each request on HTTP/2 connections.
     pub tls_client_cert_der: Option<Arc<Vec<u8>>>,
+    /// DER-encoded CA/intermediate certificates from the client's TLS certificate chain.
+    /// Contains all certificates after the peer cert (index 1+) sent during the handshake.
+    /// Used by the mtls_auth plugin for per-proxy CA fingerprint verification.
+    pub tls_client_cert_chain_der: Option<Arc<Vec<Vec<u8>>>>,
 }
 
 impl RequestContext {
@@ -108,6 +112,7 @@ impl RequestContext {
             timestamp_received: Utc::now(),
             metadata: HashMap::new(),
             tls_client_cert_der: None,
+            tls_client_cert_chain_der: None,
         }
     }
 }

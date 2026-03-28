@@ -348,6 +348,50 @@ curl https://localhost:8443/api/v1
 4. **Document certificate issuance procedures**
 5. **Plan for certificate compromise scenarios**
 
+### Per-Proxy CA Filtering with `mtls_auth`
+
+The global `FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH` applies to all connections on the HTTPS listener — the TLS handshake happens before routing, so the gateway cannot know which proxy a request targets until after the handshake completes.
+
+For per-proxy CA restrictions, use the `mtls_auth` plugin's `allowed_issuers` and `allowed_ca_fingerprints_sha256` options. This gives you a two-layer approach:
+
+1. **TLS layer (global)** — accepts any client cert signed by any CA in the truststore
+2. **Plugin layer (per-proxy)** — verifies the cert's issuer DN and/or chain CA fingerprints match the proxy's policy
+
+```yaml
+# Proxy A: only accepts certs from Internal Services CA
+- id: "proxy-a"
+  listen_path: "/internal/"
+  auth_mode: single
+  plugins:
+    - plugin_config_id: "mtls-internal-only"
+
+# Plugin config: mtls-internal-only
+- id: "mtls-internal-only"
+  name: "mtls_auth"
+  config:
+    cert_field: "subject_cn"
+    allowed_issuers:
+      - cn: "Internal Services CA"
+
+# Proxy B: accepts certs from either Internal or Partner CAs
+- id: "proxy-b"
+  listen_path: "/partner/"
+  auth_mode: single
+  plugins:
+    - plugin_config_id: "mtls-internal-and-partner"
+
+# Plugin config: mtls-internal-and-partner
+- id: "mtls-internal-and-partner"
+  name: "mtls_auth"
+  config:
+    cert_field: "subject_cn"
+    allowed_issuers:
+      - cn: "Internal Services CA"
+      - cn: "Partner Portal CA"
+```
+
+This approach works with `auth_mode: multi` — if the mTLS check fails, the gateway tries the next auth plugin (e.g., JWT, API key).
+
 ## Troubleshooting
 
 ### Common Issues
