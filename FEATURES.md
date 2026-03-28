@@ -131,7 +131,7 @@ Ferrum supports dynamic upstream target discovery through three providers, confi
 
 ## Secrets Management
 
-**Any** environment variable can be loaded from an external secret source by setting a suffixed variant. Each variable supports exactly one source — if both the base variable and a suffixed variant are set, startup fails with a conflict error.
+Any `FERRUM_*` environment variable can be loaded from an external secret source by setting a suffixed variant. Only variables with the `FERRUM_` prefix are scanned — non-Ferrum env vars are never modified. Each variable supports exactly one source — if both the base variable and a suffixed variant are set, startup fails with a conflict error. After resolution, the suffixed source variables (e.g. `FERRUM_X_FILE`) are removed from the environment to avoid leaking reference paths to child processes.
 
 **Always available (no extra dependencies):**
 - **Environment variable** — `FERRUM_X=value` (direct value)
@@ -158,7 +158,7 @@ Each cloud backend uses its SDK's standard credential chain. The required enviro
 | `VAULT_ADDR` | Yes | Vault server URL (e.g. `https://vault.example.com:8200`) |
 | `VAULT_TOKEN` | Yes | Authentication token with read access to the referenced secret paths |
 
-Uses KV v2 engine. The `_VAULT` reference format is `<mount>/data/<path>#<json_key>` (e.g. `secret/data/ferrum#admin_jwt`).
+Uses KV v2 engine. The `_VAULT` reference format is `<mount>/data/<path>#<json_key>` (e.g. `secret/data/ferrum#admin_jwt`). The `#<json_key>` suffix is required if the Vault secret contains multiple keys; if omitted, the secret must contain exactly one key or startup fails with an error.
 
 **AWS Secrets Manager** (`secrets-aws`):
 
@@ -289,6 +289,10 @@ cargo build --release --features secrets-vault,secrets-aws
 **Cloud backends (AWS, GCP, Azure)** use **rustls** (pure-Rust TLS) with the compile-time Mozilla CA bundle (`webpki-roots`) and the OS certificate store (`rustls-native-certs`). No OpenSSL or system-specific TLS libraries are required. These SDKs connect to public cloud API endpoints whose certificates are already trusted by the Mozilla CA bundle — no additional TLS configuration is needed.
 
 **HashiCorp Vault** also uses rustls, but since Vault is often deployed on-premises with a private CA, the gateway respects `FERRUM_TLS_CA_BUNDLE_PATH`. If this variable points to a PEM-encoded CA bundle, the Vault client will trust certificates signed by those CAs in addition to the default trust store. This is the same CA bundle variable used by the gateway's backend proxy connections.
+
+### Timeouts and Resilience
+
+Each individual cloud backend fetch (Vault, AWS, GCP, Azure) has a **30-second timeout**. If a secret provider is unreachable or slow, the gateway fails startup with a clear timeout error rather than hanging indefinitely. File-based secrets have no timeout since they are local filesystem reads.
 
 ## Deployment
 

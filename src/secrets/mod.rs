@@ -1,7 +1,7 @@
 //! Secret resolution with pluggable backends.
 //!
-//! Any environment variable can be loaded from an external source by setting
-//! a suffixed variant instead of the variable itself:
+//! Any `FERRUM_*` environment variable can be loaded from an external source
+//! by setting a suffixed variant instead of the variable itself:
 //!
 //! - `FERRUM_X_FILE=/path` — read from file (always available)
 //! - `FERRUM_X_VAULT=secret/data/app#key` — HashiCorp Vault (requires `secrets-vault`)
@@ -10,9 +10,11 @@
 //! - `FERRUM_X_AZURE=https://...` — Azure Key Vault (requires `secrets-azure`)
 //!
 //! At startup, `resolve_all_env_secrets()` scans the environment for any
-//! suffixed variables, resolves them, and injects the result into the base
-//! env var. After this runs, the rest of the config loading reads plain
-//! env vars as usual — no code changes needed per config key.
+//! `FERRUM_*` suffixed variables, resolves them, and returns the results.
+//! The caller injects them into the process environment before config loading.
+//!
+//! Only variables with the `FERRUM_` prefix are scanned, preventing accidental
+//! resolution of unrelated application env vars.
 //!
 //! If both the base variable and a suffixed variant are set, startup fails
 //! with a conflict error.
@@ -32,18 +34,73 @@ mod vault;
 use std::collections::HashMap;
 use tracing::info;
 
-/// Known suffixes for external secret sources.
-const SUFFIXES: &[&str] = &[
-    "_FILE",
+/// Only scan environment variables with this prefix.
+const FERRUM_PREFIX: &str = "FERRUM_";
+
+/// Timeout for individual secret fetch operations from cloud backends.
+#[cfg(any(
+    feature = "secrets-vault",
+    feature = "secrets-aws",
+    feature = "secrets-gcp",
+    feature = "secrets-azure"
+))]
+const SECRET_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Secret backend identified during env var scanning.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SecretBackend {
+    File,
     #[cfg(feature = "secrets-vault")]
-    "_VAULT",
+    Vault,
     #[cfg(feature = "secrets-aws")]
-    "_AWS",
+    Aws,
     #[cfg(feature = "secrets-gcp")]
-    "_GCP",
+    Gcp,
     #[cfg(feature = "secrets-azure")]
-    "_AZURE",
-];
+    Azure,
+}
+
+/// A pending secret to resolve.
+struct PendingSecret {
+    base_key: String,
+    reference: String,
+    suffixed_key: String,
+    backend: SecretBackend,
+}
+
+/// Match a raw env var key against known secret suffixes.
+/// Returns `(base_key, backend)` if the key ends with a recognized suffix.
+fn match_suffix(raw_key: &str) -> Option<(&str, SecretBackend)> {
+    // Check longer suffixes first to avoid false prefix matches.
+    #[cfg(feature = "secrets-azure")]
+    if let Some(base) = raw_key.strip_suffix("_AZURE") {
+        return Some((base, SecretBackend::Azure));
+    }
+    #[cfg(feature = "secrets-vault")]
+    if let Some(base) = raw_key.strip_suffix("_VAULT") {
+        return Some((base, SecretBackend::Vault));
+    }
+    if let Some(base) = raw_key.strip_suffix("_FILE") {
+        return Some((base, SecretBackend::File));
+    }
+    #[cfg(feature = "secrets-aws")]
+    if let Some(base) = raw_key.strip_suffix("_AWS") {
+        return Some((base, SecretBackend::Aws));
+    }
+    #[cfg(feature = "secrets-gcp")]
+    if let Some(base) = raw_key.strip_suffix("_GCP") {
+        return Some((base, SecretBackend::Gcp));
+    }
+    None
+}
+
+/// The result of resolving all env-based secrets at startup.
+pub struct ResolvedEnvSecrets {
+    /// Resolved `(base_key, value)` pairs to inject into the environment.
+    pub vars: Vec<(String, String)>,
+    /// Suffixed source keys (e.g., `FERRUM_X_FILE`) to remove from the environment.
+    pub source_keys_to_remove: Vec<String>,
+}
 
 /// A successfully resolved secret value with its source for logging.
 #[derive(Debug, Clone)]
@@ -55,36 +112,39 @@ pub struct ResolvedSecret {
     pub source: String,
 }
 
-/// Scan the environment for all `*_FILE`, `*_VAULT`, `*_AWS`, `*_GCP`, `*_AZURE`
-/// variables, resolve each one, and inject the result into the corresponding
-/// base env var.
+/// Scan the environment for all `FERRUM_*_{FILE,VAULT,AWS,GCP,AZURE}` variables,
+/// resolve each one, and return the results for the caller to inject into the
+/// process environment.
 ///
-/// This must be called **before** `EnvConfig::from_env_unvalidated()` so that
-/// the config loader sees the resolved values as plain env vars.
+/// This must be called **before** `EnvConfig::from_env()` so that the config
+/// loader sees the resolved values as plain env vars.
 ///
-/// Returns the number of secrets resolved from external sources.
-pub async fn resolve_all_env_secrets() -> Result<usize, String> {
-    // Collect all suffixed env vars first (avoid mutating env while iterating)
-    let mut to_resolve: HashMap<String, Vec<(String, String)>> = HashMap::new();
+/// Only variables with the `FERRUM_` prefix are scanned, preventing accidental
+/// resolution of unrelated application env vars.
+pub async fn resolve_all_env_secrets() -> Result<ResolvedEnvSecrets, String> {
+    // Collect all suffixed env vars (avoid mutating env while iterating)
+    let mut to_resolve: HashMap<String, Vec<(SecretBackend, String, String)>> = HashMap::new();
 
     for (raw_key, value) in std::env::vars() {
-        for suffix in SUFFIXES {
-            if let Some(base_key) = raw_key.strip_suffix(suffix)
-                && !base_key.is_empty()
-                && !value.is_empty()
-            {
-                to_resolve
-                    .entry(base_key.to_string())
-                    .or_default()
-                    .push((format!("{suffix} ({raw_key})"), value.clone()));
+        if !raw_key.starts_with(FERRUM_PREFIX) {
+            continue;
+        }
+        if let Some((base_key, backend)) = match_suffix(&raw_key) {
+            if base_key.is_empty() || value.is_empty() {
+                continue;
             }
+            to_resolve.entry(base_key.to_string()).or_default().push((
+                backend,
+                raw_key.clone(),
+                value,
+            ));
         }
     }
 
-    let mut resolved_count = 0;
+    // Check for conflicts and build the pending list
+    let mut pending: Vec<PendingSecret> = Vec::new();
 
     for (base_key, sources) in &to_resolve {
-        // Check if the base env var is also set (conflict)
         let direct_set = std::env::var(base_key)
             .ok()
             .filter(|s| !s.is_empty())
@@ -93,12 +153,12 @@ pub async fn resolve_all_env_secrets() -> Result<usize, String> {
         let total_sources = sources.len() + if direct_set { 1 } else { 0 };
 
         if total_sources > 1 {
-            let mut names: Vec<&str> = Vec::new();
+            let mut names: Vec<String> = Vec::new();
             if direct_set {
-                names.push("direct env var");
+                names.push("direct env var".to_string());
             }
-            for (suffix_desc, _) in sources {
-                names.push(suffix_desc);
+            for (_, suffixed_key, _) in sources {
+                names.push(suffixed_key.clone());
             }
             return Err(format!(
                 "Multiple secret sources configured for {}: {}. Only one source is allowed.",
@@ -107,74 +167,146 @@ pub async fn resolve_all_env_secrets() -> Result<usize, String> {
             ));
         }
 
-        // Resolve the single external source
-        let (suffix_desc, reference) = &sources[0];
-        let value = resolve_from_suffix(suffix_desc, reference, base_key).await?;
-
-        // SAFETY: Called during single-threaded startup before any concurrent
-        // env var reads. The tokio runtime is up but no worker tasks are
-        // reading env vars yet.
-        unsafe {
-            std::env::set_var(base_key, &value);
-        }
-        resolved_count += 1;
+        let (backend, suffixed_key, reference) = &sources[0];
+        pending.push(PendingSecret {
+            base_key: base_key.clone(),
+            reference: reference.clone(),
+            suffixed_key: suffixed_key.clone(),
+            backend: backend.clone(),
+        });
     }
 
-    Ok(resolved_count)
-}
+    // Resolve secrets, grouped by backend for client reuse
+    let mut results = ResolvedEnvSecrets {
+        vars: Vec::new(),
+        source_keys_to_remove: Vec::new(),
+    };
 
-/// Resolve a single secret from a specific suffix source.
-async fn resolve_from_suffix(
-    suffix_desc: &str,
-    reference: &str,
-    base_key: &str,
-) -> Result<String, String> {
-    if suffix_desc.contains("_FILE") {
-        let value = file::read_secret(reference, base_key)?;
-        info!("Loaded {} from file", base_key);
-        Ok(value)
-    } else if cfg!(feature = "secrets-vault") && suffix_desc.contains("_VAULT") {
-        #[cfg(feature = "secrets-vault")]
-        {
-            let value = vault::fetch_secret(reference, base_key).await?;
-            info!("Loaded {} from Vault", base_key);
-            Ok(value)
-        }
-        #[cfg(not(feature = "secrets-vault"))]
-        unreachable!()
-    } else if cfg!(feature = "secrets-aws") && suffix_desc.contains("_AWS") {
-        #[cfg(feature = "secrets-aws")]
-        {
-            let value = aws::fetch_secret(reference, base_key).await?;
-            info!("Loaded {} from AWS Secrets Manager", base_key);
-            Ok(value)
-        }
-        #[cfg(not(feature = "secrets-aws"))]
-        unreachable!()
-    } else if cfg!(feature = "secrets-gcp") && suffix_desc.contains("_GCP") {
-        #[cfg(feature = "secrets-gcp")]
-        {
-            let value = gcp::fetch_secret(reference, base_key).await?;
-            info!("Loaded {} from GCP Secret Manager", base_key);
-            Ok(value)
-        }
-        #[cfg(not(feature = "secrets-gcp"))]
-        unreachable!()
-    } else if cfg!(feature = "secrets-azure") && suffix_desc.contains("_AZURE") {
-        #[cfg(feature = "secrets-azure")]
-        {
-            let value = azure::fetch_secret(reference, base_key).await?;
-            info!("Loaded {} from Azure Key Vault", base_key);
-            Ok(value)
-        }
-        #[cfg(not(feature = "secrets-azure"))]
-        unreachable!()
-    } else {
-        Err(format!(
-            "Unknown secret source suffix '{}' for {}",
-            suffix_desc, base_key
-        ))
+    // File secrets (no client needed, no timeout needed)
+    for s in pending.iter().filter(|s| s.backend == SecretBackend::File) {
+        let value = file::read_secret(&s.reference, &s.base_key)?;
+        info!("Loaded {} from file", s.base_key);
+        results.vars.push((s.base_key.clone(), value));
+        results.source_keys_to_remove.push(s.suffixed_key.clone());
     }
+
+    // Vault secrets (single client, shared across all Vault refs)
+    #[cfg(feature = "secrets-vault")]
+    {
+        let vault_secrets: Vec<&PendingSecret> = pending
+            .iter()
+            .filter(|s| s.backend == SecretBackend::Vault)
+            .collect();
+        if !vault_secrets.is_empty() {
+            let client = vault::VaultClientWrapper::new()?;
+            for s in vault_secrets {
+                let value = tokio::time::timeout(
+                    SECRET_FETCH_TIMEOUT,
+                    client.fetch_secret(&s.reference, &s.base_key),
+                )
+                .await
+                .map_err(|_| {
+                    format!(
+                        "Timeout resolving {} from Vault after {}s",
+                        s.base_key,
+                        SECRET_FETCH_TIMEOUT.as_secs()
+                    )
+                })??;
+                info!("Loaded {} from Vault", s.base_key);
+                results.vars.push((s.base_key.clone(), value));
+                results.source_keys_to_remove.push(s.suffixed_key.clone());
+            }
+        }
+    }
+
+    // AWS secrets (single client, shared across all AWS refs)
+    #[cfg(feature = "secrets-aws")]
+    {
+        let aws_secrets: Vec<&PendingSecret> = pending
+            .iter()
+            .filter(|s| s.backend == SecretBackend::Aws)
+            .collect();
+        if !aws_secrets.is_empty() {
+            let client = aws::AwsClientWrapper::new().await;
+            for s in aws_secrets {
+                let value = tokio::time::timeout(
+                    SECRET_FETCH_TIMEOUT,
+                    client.fetch_secret(&s.reference, &s.base_key),
+                )
+                .await
+                .map_err(|_| {
+                    format!(
+                        "Timeout resolving {} from AWS Secrets Manager after {}s",
+                        s.base_key,
+                        SECRET_FETCH_TIMEOUT.as_secs()
+                    )
+                })??;
+                info!("Loaded {} from AWS Secrets Manager", s.base_key);
+                results.vars.push((s.base_key.clone(), value));
+                results.source_keys_to_remove.push(s.suffixed_key.clone());
+            }
+        }
+    }
+
+    // GCP secrets (single client, shared across all GCP refs)
+    #[cfg(feature = "secrets-gcp")]
+    {
+        let gcp_secrets: Vec<&PendingSecret> = pending
+            .iter()
+            .filter(|s| s.backend == SecretBackend::Gcp)
+            .collect();
+        if !gcp_secrets.is_empty() {
+            let client = gcp::GcpClientWrapper::new().await?;
+            for s in gcp_secrets {
+                let value = tokio::time::timeout(
+                    SECRET_FETCH_TIMEOUT,
+                    client.fetch_secret(&s.reference, &s.base_key),
+                )
+                .await
+                .map_err(|_| {
+                    format!(
+                        "Timeout resolving {} from GCP Secret Manager after {}s",
+                        s.base_key,
+                        SECRET_FETCH_TIMEOUT.as_secs()
+                    )
+                })??;
+                info!("Loaded {} from GCP Secret Manager", s.base_key);
+                results.vars.push((s.base_key.clone(), value));
+                results.source_keys_to_remove.push(s.suffixed_key.clone());
+            }
+        }
+    }
+
+    // Azure secrets (single credential, shared across all Azure refs)
+    #[cfg(feature = "secrets-azure")]
+    {
+        let azure_secrets: Vec<&PendingSecret> = pending
+            .iter()
+            .filter(|s| s.backend == SecretBackend::Azure)
+            .collect();
+        if !azure_secrets.is_empty() {
+            let creds = azure::AzureCredentials::new()?;
+            for s in azure_secrets {
+                let value = tokio::time::timeout(
+                    SECRET_FETCH_TIMEOUT,
+                    creds.fetch_secret(&s.reference, &s.base_key),
+                )
+                .await
+                .map_err(|_| {
+                    format!(
+                        "Timeout resolving {} from Azure Key Vault after {}s",
+                        s.base_key,
+                        SECRET_FETCH_TIMEOUT.as_secs()
+                    )
+                })??;
+                info!("Loaded {} from Azure Key Vault", s.base_key);
+                results.vars.push((s.base_key.clone(), value));
+                results.source_keys_to_remove.push(s.suffixed_key.clone());
+            }
+        }
+    }
+
+    Ok(results)
 }
 
 /// Resolve a single secret by key name, checking all enabled backends.
@@ -239,7 +371,16 @@ pub async fn resolve_secret(key: &str) -> Result<Option<ResolvedSecret>, String>
         }
         #[cfg(feature = "secrets-vault")]
         "vault" => {
-            let value = vault::fetch_secret(&reference, key).await?;
+            let value =
+                tokio::time::timeout(SECRET_FETCH_TIMEOUT, vault::fetch_secret(&reference, key))
+                    .await
+                    .map_err(|_| {
+                        format!(
+                            "Timeout resolving {} from Vault after {}s",
+                            key,
+                            SECRET_FETCH_TIMEOUT.as_secs()
+                        )
+                    })??;
             info!("Loaded {} from Vault", key);
             Ok(Some(ResolvedSecret {
                 value,
@@ -248,7 +389,16 @@ pub async fn resolve_secret(key: &str) -> Result<Option<ResolvedSecret>, String>
         }
         #[cfg(feature = "secrets-aws")]
         "aws" => {
-            let value = aws::fetch_secret(&reference, key).await?;
+            let value =
+                tokio::time::timeout(SECRET_FETCH_TIMEOUT, aws::fetch_secret(&reference, key))
+                    .await
+                    .map_err(|_| {
+                        format!(
+                            "Timeout resolving {} from AWS Secrets Manager after {}s",
+                            key,
+                            SECRET_FETCH_TIMEOUT.as_secs()
+                        )
+                    })??;
             info!("Loaded {} from AWS Secrets Manager", key);
             Ok(Some(ResolvedSecret {
                 value,
@@ -257,7 +407,16 @@ pub async fn resolve_secret(key: &str) -> Result<Option<ResolvedSecret>, String>
         }
         #[cfg(feature = "secrets-gcp")]
         "gcp" => {
-            let value = gcp::fetch_secret(&reference, key).await?;
+            let value =
+                tokio::time::timeout(SECRET_FETCH_TIMEOUT, gcp::fetch_secret(&reference, key))
+                    .await
+                    .map_err(|_| {
+                        format!(
+                            "Timeout resolving {} from GCP Secret Manager after {}s",
+                            key,
+                            SECRET_FETCH_TIMEOUT.as_secs()
+                        )
+                    })??;
             info!("Loaded {} from GCP Secret Manager", key);
             Ok(Some(ResolvedSecret {
                 value,
@@ -266,7 +425,16 @@ pub async fn resolve_secret(key: &str) -> Result<Option<ResolvedSecret>, String>
         }
         #[cfg(feature = "secrets-azure")]
         "azure" => {
-            let value = azure::fetch_secret(&reference, key).await?;
+            let value =
+                tokio::time::timeout(SECRET_FETCH_TIMEOUT, azure::fetch_secret(&reference, key))
+                    .await
+                    .map_err(|_| {
+                        format!(
+                            "Timeout resolving {} from Azure Key Vault after {}s",
+                            key,
+                            SECRET_FETCH_TIMEOUT.as_secs()
+                        )
+                    })??;
             info!("Loaded {} from Azure Key Vault", key);
             Ok(Some(ResolvedSecret {
                 value,

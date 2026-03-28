@@ -26,8 +26,7 @@ use config::{EnvConfig, OperatingMode};
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
-#[tokio::main]
-async fn main() {
+fn main() {
     // Initialize rustls crypto provider
     if rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider())
         .is_err()
@@ -47,15 +46,39 @@ async fn main() {
 
     info!("Ferrum Gateway starting...");
 
-    // Resolve any env vars with _FILE, _VAULT, _AWS, _GCP, _AZURE suffixes
-    // into their base env vars BEFORE loading config. This way every config
-    // key automatically supports external secret sources.
-    match secrets::resolve_all_env_secrets().await {
-        Ok(0) => {}
-        Ok(n) => info!("Resolved {} env var(s) from external secret sources", n),
-        Err(e) => {
-            error!("Secret resolution error: {}", e);
-            std::process::exit(1);
+    // Resolve secrets using a single-threaded runtime so that subsequent
+    // env var mutations are safe — no concurrent threads exist yet.
+    {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("Failed to create secret resolution runtime");
+
+        match rt.block_on(secrets::resolve_all_env_secrets()) {
+            Ok(resolved) => {
+                // SAFETY: The single-threaded tokio runtime above is the only
+                // runtime. No worker threads or concurrent env var readers exist.
+                // We set the resolved values and remove the suffixed source keys
+                // before any multi-threaded runtime starts.
+                unsafe {
+                    for (base_key, value) in &resolved.vars {
+                        std::env::set_var(base_key, value);
+                    }
+                    for suffixed_key in &resolved.source_keys_to_remove {
+                        std::env::remove_var(suffixed_key);
+                    }
+                }
+                if !resolved.vars.is_empty() {
+                    info!(
+                        "Resolved {} env var(s) from external secret sources",
+                        resolved.vars.len()
+                    );
+                }
+            }
+            Err(e) => {
+                error!("Secret resolution error: {}", e);
+                std::process::exit(1);
+            }
         }
     }
 
@@ -70,56 +93,64 @@ async fn main() {
 
     info!("Operating mode: {:?}", env_config.mode);
 
-    // Shutdown signal
-    let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
-    let shutdown_tx_signal = shutdown_tx.clone();
+    // Start the main multi-threaded runtime for the gateway
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("Failed to create tokio runtime");
 
-    // Graceful shutdown handler
-    tokio::spawn(async move {
-        let ctrl_c = tokio::signal::ctrl_c();
+    rt.block_on(async {
+        // Shutdown signal
+        let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
+        let shutdown_tx_signal = shutdown_tx.clone();
 
-        #[cfg(unix)]
-        {
-            use tokio::signal::unix::{SignalKind, signal};
-            let mut sigterm = match signal(SignalKind::terminate()) {
-                Ok(s) => s,
-                Err(e) => {
-                    error!("Failed to register SIGTERM handler: {}", e);
-                    return;
-                }
-            };
-            tokio::select! {
-                _ = ctrl_c => {
-                    info!("SIGINT received, initiating graceful shutdown...");
-                }
-                _ = sigterm.recv() => {
-                    info!("SIGTERM received, initiating graceful shutdown...");
+        // Graceful shutdown handler
+        tokio::spawn(async move {
+            let ctrl_c = tokio::signal::ctrl_c();
+
+            #[cfg(unix)]
+            {
+                use tokio::signal::unix::{SignalKind, signal};
+                let mut sigterm = match signal(SignalKind::terminate()) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        error!("Failed to register SIGTERM handler: {}", e);
+                        return;
+                    }
+                };
+                tokio::select! {
+                    _ = ctrl_c => {
+                        info!("SIGINT received, initiating graceful shutdown...");
+                    }
+                    _ = sigterm.recv() => {
+                        info!("SIGTERM received, initiating graceful shutdown...");
+                    }
                 }
             }
+
+            #[cfg(not(unix))]
+            {
+                ctrl_c.await.ok();
+                info!("Ctrl+C received, initiating graceful shutdown...");
+            }
+
+            let _ = shutdown_tx_signal.send(true);
+        });
+
+        // Run the appropriate mode
+        let result = match env_config.mode {
+            OperatingMode::Database => modes::database::run(env_config, shutdown_tx).await,
+            OperatingMode::File => modes::file::run(env_config, shutdown_tx).await,
+            OperatingMode::ControlPlane => modes::control_plane::run(env_config, shutdown_tx).await,
+            OperatingMode::DataPlane => modes::data_plane::run(env_config, shutdown_tx).await,
+            OperatingMode::Migrate => modes::migrate::run(env_config, shutdown_tx).await,
+        };
+
+        if let Err(e) = result {
+            error!("Fatal error: {}", e);
+            std::process::exit(1);
         }
 
-        #[cfg(not(unix))]
-        {
-            ctrl_c.await.ok();
-            info!("Ctrl+C received, initiating graceful shutdown...");
-        }
-
-        let _ = shutdown_tx_signal.send(true);
+        info!("Ferrum Gateway shut down cleanly");
     });
-
-    // Run the appropriate mode
-    let result = match env_config.mode {
-        OperatingMode::Database => modes::database::run(env_config, shutdown_tx).await,
-        OperatingMode::File => modes::file::run(env_config, shutdown_tx).await,
-        OperatingMode::ControlPlane => modes::control_plane::run(env_config, shutdown_tx).await,
-        OperatingMode::DataPlane => modes::data_plane::run(env_config, shutdown_tx).await,
-        OperatingMode::Migrate => modes::migrate::run(env_config, shutdown_tx).await,
-    };
-
-    if let Err(e) = result {
-        error!("Fatal error: {}", e);
-        std::process::exit(1);
-    }
-
-    info!("Ferrum Gateway shut down cleanly");
 }
