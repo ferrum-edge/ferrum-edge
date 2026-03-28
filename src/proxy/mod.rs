@@ -52,7 +52,10 @@ pub use self::body::ProxyBody;
 use self::grpc_proxy::{GrpcConnectionPool, GrpcProxyError};
 use self::http2_pool::Http2ConnectionPool;
 
-/// Check if the request is a WebSocket upgrade request
+/// Check if the request is a WebSocket upgrade request.
+///
+/// Uses ASCII case-insensitive comparisons to avoid per-request `to_lowercase()`
+/// String allocations on the hot path.
 fn is_websocket_upgrade(req: &Request<Incoming>) -> bool {
     let headers = req.headers();
     let connection = headers.get("connection").and_then(|v| v.to_str().ok());
@@ -64,10 +67,62 @@ fn is_websocket_upgrade(req: &Request<Incoming>) -> bool {
         .get("sec-websocket-version")
         .and_then(|v| v.to_str().ok());
 
-    connection.is_some_and(|conn| conn.to_lowercase().contains("upgrade"))
-        && upgrade.is_some_and(|up| up.to_lowercase() == "websocket")
+    connection.is_some_and(|conn| {
+        // The Connection header can contain comma-separated values (e.g., "keep-alive, Upgrade").
+        // Split on commas and check each token case-insensitively without allocating.
+        conn.split(',')
+            .any(|token| token.trim().eq_ignore_ascii_case("upgrade"))
+    }) && upgrade.is_some_and(|up| up.eq_ignore_ascii_case("websocket"))
         && sec_key.is_some()
         && (sec_version == Some("13"))
+}
+
+/// Parse an HTTP method string into a `reqwest::Method`.
+///
+/// Common methods are matched as constants (zero-cost), with a fallback to
+/// `from_bytes()` for non-standard methods. Extracted as a helper to avoid
+/// duplicating this match block across `proxy_to_backend` and `proxy_to_backend_retry`
+/// (code deduplication improves instruction cache utilization).
+fn parse_reqwest_method(method: &str) -> Result<reqwest::Method, ()> {
+    match method {
+        "GET" => Ok(reqwest::Method::GET),
+        "POST" => Ok(reqwest::Method::POST),
+        "PUT" => Ok(reqwest::Method::PUT),
+        "DELETE" => Ok(reqwest::Method::DELETE),
+        "PATCH" => Ok(reqwest::Method::PATCH),
+        "HEAD" => Ok(reqwest::Method::HEAD),
+        "OPTIONS" => Ok(reqwest::Method::OPTIONS),
+        other => reqwest::Method::from_bytes(other.as_bytes()).map_err(|_| ()),
+    }
+}
+
+/// Parse an HTTP method string into a `hyper::Method`.
+fn parse_hyper_method(method: &str) -> Result<hyper::Method, ()> {
+    match method {
+        "GET" => Ok(hyper::Method::GET),
+        "POST" => Ok(hyper::Method::POST),
+        "PUT" => Ok(hyper::Method::PUT),
+        "DELETE" => Ok(hyper::Method::DELETE),
+        "PATCH" => Ok(hyper::Method::PATCH),
+        "HEAD" => Ok(hyper::Method::HEAD),
+        "OPTIONS" => Ok(hyper::Method::OPTIONS),
+        other => hyper::Method::from_bytes(other.as_bytes()).map_err(|_| ()),
+    }
+}
+
+/// Build X-Forwarded-For header value by appending the client IP to the existing value.
+/// Uses pre-allocated buffer instead of `format!()` to avoid format machinery overhead.
+fn build_xff_value(existing_xff: Option<&str>, client_ip: &str) -> String {
+    match existing_xff {
+        Some(xff) => {
+            let mut val = String::with_capacity(xff.len() + 2 + client_ip.len());
+            val.push_str(xff);
+            val.push_str(", ");
+            val.push_str(client_ip);
+            val
+        }
+        None => client_ip.to_string(),
+    }
 }
 
 /// Shared state for the proxy engine.
@@ -2661,31 +2716,42 @@ pub fn build_backend_url_with_target(
 
     let backend_path = proxy.backend_path.as_deref().unwrap_or("");
 
-    // Combine backend_path and remaining_path, ensuring a leading '/'
-    let full_path = if backend_path.is_empty() && remaining_path.is_empty() {
-        "/".to_string()
-    } else {
-        let combined = format!("{}{}", backend_path, remaining_path);
-        if combined.starts_with('/') {
-            combined
-        } else {
-            format!("/{}", combined)
-        }
-    };
+    // Both empty means path is just "/"
+    let path_is_root = backend_path.is_empty() && remaining_path.is_empty();
 
-    // Build URL in a single buffer with pre-allocated capacity
+    // Determine if we need to prepend a '/' (when neither segment starts with one)
+    let needs_leading_slash =
+        !path_is_root && !backend_path.starts_with('/') && !remaining_path.starts_with('/');
+
+    // Build URL in a single buffer, writing the path segments directly to avoid
+    // an intermediate `full_path` String allocation from format!().
+    let path_len = if path_is_root {
+        1
+    } else {
+        (if needs_leading_slash { 1 } else { 0 }) + backend_path.len() + remaining_path.len()
+    };
     let capacity = scheme.len()
         + 3
         + host.len()
         + 6
-        + full_path.len()
+        + path_len
         + if query_string.is_empty() {
             0
         } else {
             1 + query_string.len()
         };
     let mut url = String::with_capacity(capacity);
-    let _ = write!(url, "{}://{}:{}{}", scheme, host, port, full_path);
+    let _ = write!(url, "{}://{}:{}", scheme, host, port);
+
+    if path_is_root {
+        url.push('/');
+    } else {
+        if needs_leading_slash {
+            url.push('/');
+        }
+        url.push_str(backend_path);
+        url.push_str(remaining_path);
+    }
 
     if !query_string.is_empty() {
         url.push('?');
@@ -2746,30 +2812,21 @@ async fn proxy_to_backend_retry(
         }
     };
 
-    let req_method = match method {
-        "GET" => reqwest::Method::GET,
-        "POST" => reqwest::Method::POST,
-        "PUT" => reqwest::Method::PUT,
-        "DELETE" => reqwest::Method::DELETE,
-        "PATCH" => reqwest::Method::PATCH,
-        "HEAD" => reqwest::Method::HEAD,
-        "OPTIONS" => reqwest::Method::OPTIONS,
-        other => match reqwest::Method::from_bytes(other.as_bytes()) {
-            Ok(m) => m,
-            Err(_) => {
-                warn!("Invalid HTTP method on retry: {}", other);
-                return retry::BackendResponse {
-                    status_code: 405,
-                    body: ResponseBody::Buffered(
-                        r#"{"error":"Method Not Allowed"}"#.as_bytes().to_vec(),
-                    ),
-                    headers: HashMap::new(),
-                    connection_error: false,
-                    backend_resolved_ip: resolved_ip.clone(),
-                    error_class: None,
-                };
-            }
-        },
+    let req_method = match parse_reqwest_method(method) {
+        Ok(m) => m,
+        Err(()) => {
+            warn!("Invalid HTTP method on retry: {}", method);
+            return retry::BackendResponse {
+                status_code: 405,
+                body: ResponseBody::Buffered(
+                    r#"{"error":"Method Not Allowed"}"#.as_bytes().to_vec(),
+                ),
+                headers: HashMap::new(),
+                connection_error: false,
+                backend_resolved_ip: resolved_ip.clone(),
+                error_class: None,
+            };
+        }
     };
 
     let mut req_builder = client.request(req_method, backend_url);
@@ -2802,11 +2859,11 @@ async fn proxy_to_backend_retry(
     }
 
     // Add proxy headers with real client IP
-    if let Some(xff) = headers.get("x-forwarded-for") {
-        req_builder = req_builder.header("X-Forwarded-For", format!("{}, {}", xff, client_ip));
-    } else {
-        req_builder = req_builder.header("X-Forwarded-For", client_ip);
-    }
+    let xff_val = build_xff_value(
+        headers.get("x-forwarded-for").map(|s| s.as_str()),
+        client_ip,
+    );
+    req_builder = req_builder.header("X-Forwarded-For", xff_val);
     req_builder = req_builder.header("X-Forwarded-Proto", if is_tls { "https" } else { "http" });
     if let Some(host) = headers.get("host") {
         req_builder = req_builder.header("X-Forwarded-Host", host.as_str());
@@ -2981,30 +3038,21 @@ async fn proxy_to_backend(
         }
     };
 
-    let req_method = match method {
-        "GET" => reqwest::Method::GET,
-        "POST" => reqwest::Method::POST,
-        "PUT" => reqwest::Method::PUT,
-        "DELETE" => reqwest::Method::DELETE,
-        "PATCH" => reqwest::Method::PATCH,
-        "HEAD" => reqwest::Method::HEAD,
-        "OPTIONS" => reqwest::Method::OPTIONS,
-        other => match reqwest::Method::from_bytes(other.as_bytes()) {
-            Ok(m) => m,
-            Err(_) => {
-                warn!("Invalid HTTP method: {}", other);
-                return retry::BackendResponse {
-                    status_code: 405,
-                    body: ResponseBody::Buffered(
-                        r#"{"error":"Method Not Allowed"}"#.as_bytes().to_vec(),
-                    ),
-                    headers: HashMap::new(),
-                    connection_error: false,
-                    backend_resolved_ip: resolved_ip.clone(),
-                    error_class: None,
-                };
-            }
-        },
+    let req_method = match parse_reqwest_method(method) {
+        Ok(m) => m,
+        Err(()) => {
+            warn!("Invalid HTTP method: {}", method);
+            return retry::BackendResponse {
+                status_code: 405,
+                body: ResponseBody::Buffered(
+                    r#"{"error":"Method Not Allowed"}"#.as_bytes().to_vec(),
+                ),
+                headers: HashMap::new(),
+                connection_error: false,
+                backend_resolved_ip: resolved_ip.clone(),
+                error_class: None,
+            };
+        }
     };
 
     let mut req_builder = client.request(req_method, backend_url);
@@ -3037,11 +3085,11 @@ async fn proxy_to_backend(
     }
 
     // Add proxy headers
-    if let Some(xff) = headers.get("x-forwarded-for") {
-        req_builder = req_builder.header("X-Forwarded-For", format!("{}, {}", xff, client_ip));
-    } else {
-        req_builder = req_builder.header("X-Forwarded-For", client_ip);
-    }
+    let xff_val = build_xff_value(
+        headers.get("x-forwarded-for").map(|s| s.as_str()),
+        client_ip,
+    );
+    req_builder = req_builder.header("X-Forwarded-For", xff_val);
     req_builder = req_builder.header("X-Forwarded-Proto", if is_tls { "https" } else { "http" });
     if let Some(host) = headers.get("host") {
         req_builder = req_builder.header("X-Forwarded-Host", host.as_str());
@@ -3366,6 +3414,37 @@ fn collect_response_headers(
     }
 }
 
+/// Collect hyper response headers into a HashMap.
+///
+/// Same semantics as `collect_response_headers` (Set-Cookie newline separation,
+/// comma folding for other headers) but for `hyper::HeaderMap` instead of
+/// `reqwest::header::HeaderMap`. Used by the HTTP/2 multiplexing pool path.
+fn collect_hyper_response_headers(source: &hyper::HeaderMap, target: &mut HashMap<String, String>) {
+    target.reserve(source.keys_len());
+    for (k, v) in source {
+        if let Ok(vs) = v.to_str() {
+            let key = k.as_str().to_string();
+            if k == "set-cookie" {
+                target
+                    .entry(key)
+                    .and_modify(|existing: &mut String| {
+                        existing.push('\n');
+                        existing.push_str(vs);
+                    })
+                    .or_insert_with(|| vs.to_string());
+            } else {
+                target
+                    .entry(key)
+                    .and_modify(|existing: &mut String| {
+                        existing.push_str(", ");
+                        existing.push_str(vs);
+                    })
+                    .or_insert_with(|| vs.to_string());
+            }
+        }
+    }
+}
+
 fn build_response(status: StatusCode, body: &str) -> Response<ProxyBody> {
     // Response::builder with a valid status and static header name cannot fail
     Response::builder()
@@ -3415,7 +3494,9 @@ async fn proxy_to_backend_http2(
 ) -> retry::BackendResponse {
     debug!(proxy_id = %proxy.id, backend_url = %backend_url, "Proxying request via HTTP/2 pool");
 
-    // Get or create HTTP/2 connection to backend
+    // Get or create HTTP/2 connection to backend.
+    // The pool returns a ready() sender with stream capacity, evicting closed
+    // connections and spreading load across shards automatically.
     let mut sender = match state.http2_pool.get_sender(proxy, &state.dns_cache).await {
         Ok(s) => s,
         Err(e) => {
@@ -3437,31 +3518,6 @@ async fn proxy_to_backend_http2(
             };
         }
     };
-
-    // If the cached sender is closed, reconnect
-    if sender.is_closed() {
-        sender = match state.http2_pool.get_sender(proxy, &state.dns_cache).await {
-            Ok(s) => s,
-            Err(e) => {
-                let msg = match &e {
-                    http2_pool::Http2PoolError::BackendTimeout(m) => m.clone(),
-                    http2_pool::Http2PoolError::BackendUnavailable(m) => m.clone(),
-                    http2_pool::Http2PoolError::Internal(m) => m.clone(),
-                };
-                error!(proxy_id = %proxy.id, error = %msg, "HTTP/2 pool reconnection failed");
-                return retry::BackendResponse {
-                    status_code: 502,
-                    body: ResponseBody::Buffered(
-                        format!(r#"{{"error":"Backend unavailable: {}"}}"#, msg).into_bytes(),
-                    ),
-                    headers: HashMap::new(),
-                    connection_error: true,
-                    backend_resolved_ip: resolved_ip,
-                    error_class: Some(retry::ErrorClass::ConnectionPoolError),
-                };
-            }
-        };
-    }
 
     // Parse the backend URL
     let uri: hyper::Uri = match backend_url.parse() {
@@ -3488,29 +3544,20 @@ async fn proxy_to_backend_http2(
     parts.uri = uri;
 
     // Set the method
-    parts.method = match method {
-        "GET" => hyper::Method::GET,
-        "POST" => hyper::Method::POST,
-        "PUT" => hyper::Method::PUT,
-        "DELETE" => hyper::Method::DELETE,
-        "PATCH" => hyper::Method::PATCH,
-        "HEAD" => hyper::Method::HEAD,
-        "OPTIONS" => hyper::Method::OPTIONS,
-        other => match hyper::Method::from_bytes(other.as_bytes()) {
-            Ok(m) => m,
-            Err(_) => {
-                return retry::BackendResponse {
-                    status_code: 405,
-                    body: ResponseBody::Buffered(
-                        r#"{"error":"Method Not Allowed"}"#.as_bytes().to_vec(),
-                    ),
-                    headers: HashMap::new(),
-                    connection_error: false,
-                    backend_resolved_ip: resolved_ip,
-                    error_class: None,
-                };
-            }
-        },
+    parts.method = match parse_hyper_method(method) {
+        Ok(m) => m,
+        Err(()) => {
+            return retry::BackendResponse {
+                status_code: 405,
+                body: ResponseBody::Buffered(
+                    r#"{"error":"Method Not Allowed"}"#.as_bytes().to_vec(),
+                ),
+                headers: HashMap::new(),
+                connection_error: false,
+                backend_resolved_ip: resolved_ip,
+                error_class: None,
+            };
+        }
     };
 
     // Clear and rebuild headers from the plugin-processed headers map
@@ -3548,11 +3595,11 @@ async fn proxy_to_backend_http2(
     }
 
     // Add proxy headers
-    if let Some(xff) = headers.get("x-forwarded-for") {
-        if let Ok(val) = hyper::header::HeaderValue::from_str(&format!("{}, {}", xff, client_ip)) {
-            parts.headers.insert("x-forwarded-for", val);
-        }
-    } else if let Ok(val) = hyper::header::HeaderValue::from_str(client_ip) {
+    let xff_val = build_xff_value(
+        headers.get("x-forwarded-for").map(|s| s.as_str()),
+        client_ip,
+    );
+    if let Ok(val) = hyper::header::HeaderValue::from_str(&xff_val) {
         parts.headers.insert("x-forwarded-for", val);
     }
     if let Ok(val) = hyper::header::HeaderValue::from_str(if is_tls { "https" } else { "http" }) {
@@ -3604,11 +3651,7 @@ async fn proxy_to_backend_http2(
     // Extract response status and headers
     let status = response.status().as_u16();
     let mut resp_headers = HashMap::new();
-    for (k, v) in response.headers() {
-        if let Ok(vs) = v.to_str() {
-            resp_headers.insert(k.as_str().to_string(), vs.to_string());
-        }
-    }
+    collect_hyper_response_headers(response.headers(), &mut resp_headers);
 
     if stream_response {
         retry::BackendResponse {

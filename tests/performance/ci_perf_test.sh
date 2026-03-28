@@ -46,12 +46,46 @@ if ! command -v wrk &> /dev/null; then
     exit 1
 fi
 
-# Build
-echo "Building project..."
-cd "$PROJECT_ROOT"
-cargo build --release --bin ferrum-gateway 2>&1
-cd "$PERF_DIR"
-cargo build --release --bin backend_server 2>&1
+# Check if a binary is up-to-date (newer than all Rust source files in its crate)
+binary_is_fresh() {
+    local binary="$1"
+    local src_dir="$2"
+    [ -f "$binary" ] || return 1
+    local newer
+    newer=$(find "$src_dir" \( -name '*.rs' -o -name 'Cargo.toml' -o -name 'Cargo.lock' \) -newer "$binary" -print -quit 2>/dev/null)
+    [ -z "$newer" ]
+}
+
+# Build (skips if binaries are newer than source)
+GATEWAY_BIN="$PROJECT_ROOT/target/release/ferrum-gateway"
+BACKEND_BIN="$PERF_DIR/target/release/backend_server"
+NEED_GATEWAY=true
+NEED_BACKEND=true
+
+if binary_is_fresh "$GATEWAY_BIN" "$PROJECT_ROOT/src"; then
+    NEED_GATEWAY=false
+fi
+if binary_is_fresh "$BACKEND_BIN" "$PERF_DIR/src"; then
+    NEED_BACKEND=false
+fi
+
+if ! $NEED_GATEWAY && ! $NEED_BACKEND; then
+    echo "Binaries up-to-date, skipping build"
+else
+    echo "Building project..."
+    if $NEED_GATEWAY; then
+        cd "$PROJECT_ROOT"
+        cargo build --release --bin ferrum-gateway 2>&1
+    else
+        echo "  ferrum-gateway binary is fresh"
+    fi
+    if $NEED_BACKEND; then
+        cd "$PERF_DIR"
+        cargo build --release --bin backend_server 2>&1
+    else
+        echo "  backend_server binary is fresh"
+    fi
+fi
 
 # Start backend
 echo "Starting backend server..."

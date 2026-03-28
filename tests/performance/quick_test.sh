@@ -19,10 +19,31 @@ if ! command -v wrk &> /dev/null; then
 fi
 echo "✅ wrk is installed"
 
-# Build backend server
-echo "🔨 Building backend server..."
-cd "$PERF_DIR"
-cargo build --release --bin backend_server
+# Kill stale processes from prior runs
+if lsof -ti:3001 > /dev/null 2>&1; then
+    echo "Killing stale process on port 3001..."
+    lsof -ti:3001 2>/dev/null | xargs kill -9 2>/dev/null || true
+    sleep 1
+fi
+
+# Check if a binary is up-to-date (newer than all Rust source files in its crate)
+binary_is_fresh() {
+    local binary="$1"
+    local src_dir="$2"
+    [ -f "$binary" ] || return 1
+    local newer
+    newer=$(find "$src_dir" \( -name '*.rs' -o -name 'Cargo.toml' -o -name 'Cargo.lock' \) -newer "$binary" -print -quit 2>/dev/null)
+    [ -z "$newer" ]
+}
+
+# Build backend server (skip if binary is fresh)
+if binary_is_fresh "$PERF_DIR/target/release/backend_server" "$PERF_DIR/src"; then
+    echo "✅ backend_server binary is up-to-date, skipping build"
+else
+    echo "🔨 Building backend server..."
+    cd "$PERF_DIR"
+    cargo build --release --bin backend_server
+fi
 
 # Start backend server in background
 echo "🌐 Starting backend server..."
