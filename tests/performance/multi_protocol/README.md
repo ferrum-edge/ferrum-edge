@@ -161,31 +161,31 @@ Results from a local run on macOS (Apple Silicon), 10s duration, 200 concurrent 
 
 | Protocol | Requests/sec | Avg Latency | P50 | P99 | Max | Errors |
 |----------|-------------|-------------|------|------|------|--------|
-| HTTP/1.1 | 90,706 | 2.20ms | 2.14ms | 4.21ms | 21.31ms | 0 |
-| HTTP/1.1+TLS | 88,472 | 2.26ms | 2.18ms | 4.40ms | 33.70ms | 0 |
-| HTTP/2 (TLS) | 101,390 | 1.97ms | 1.85ms | 5.04ms | 37.12ms | 0 |
-| HTTP/3 (QUIC) | 50,519 | 3.95ms | 3.73ms | 6.72ms | 60.06ms | 0 |
-| WebSocket | 113,141 | 1.76ms | 1.72ms | 3.05ms | 15.92ms | 0 |
-| gRPC | 63,235 | 3.16ms | 2.93ms | 8.77ms | 47.13ms | 0 |
-| TCP | 113,657 | 1.76ms | 1.73ms | 2.77ms | 13.96ms | 0 |
-| TCP+TLS | 113,794 | 1.76ms | 1.72ms | 2.96ms | 25.18ms | 0 |
-| UDP | 82,515 | 2.42ms | 2.45ms | 2.91ms | 21.47ms | 0 |
-| UDP+DTLS | 80,187 | 2.37ms | 2.43ms | 3.25ms | 16.56ms | 0 |
+| HTTP/1.1 | 90,063 | 2.22ms | 2.12ms | 4.70ms | 30.51ms | 0 |
+| HTTP/1.1+TLS | 89,046 | 2.24ms | 2.14ms | 4.84ms | 42.17ms | 0 |
+| HTTP/2 (TLS) | 100,530 | 1.99ms | 1.82ms | 6.13ms | 127.04ms | 0 |
+| HTTP/3 (QUIC) | 49,188 | 4.06ms | 3.77ms | 7.54ms | 123.07ms | 0 |
+| WebSocket | 111,852 | 1.78ms | 1.74ms | 3.15ms | 23.66ms | 0 |
+| gRPC | 60,689 | 3.29ms | 2.96ms | 11.11ms | 47.65ms | 0 |
+| TCP | 112,037 | 1.78ms | 1.74ms | 3.08ms | 24.72ms | 0 |
+| TCP+TLS | 112,017 | 1.78ms | 1.74ms | 3.19ms | 19.65ms | 0 |
+| UDP | 81,924 | 2.44ms | 2.45ms | 3.00ms | 10.96ms | 0 |
+| UDP+DTLS | 75,150 | 2.53ms | 2.54ms | 4.41ms | 33.18ms | 0 |
 
 ### Direct Backend (client → backend, no gateway)
 
 | Protocol | Requests/sec | Avg Latency | P50 | P99 | Max |
 |----------|-------------|-------------|------|------|------|
-| HTTP/1.1 | 222,382 | 897μs | 856μs | 1.86ms | 20.82ms |
-| HTTP/1.1+TLS | 222,883* | 895μs | 856μs | 1.85ms | 14.30ms |
-| HTTP/2 (TLS) | 349,942 | 570μs | 502μs | 1.66ms | 126.08ms |
-| HTTP/3 (QUIC) | 88,524 | 2.26ms | 2.25ms | 2.73ms | 21.71ms |
-| WebSocket | 225,172 | 886μs | 863μs | 1.71ms | 20.27ms |
-| gRPC | 176,234 | 1.13ms | 963μs | 3.85ms | 80.19ms |
-| TCP | 224,167 | 891μs | 865μs | 1.71ms | 52.51ms |
-| TCP+TLS | 224,985 | 887μs | 865μs | 1.71ms | 13.69ms |
-| UDP | 276,245 | 723μs | 696μs | 1.11ms | 8.59ms |
-| UDP+DTLS | 108,489 | 1.75ms | 1.78ms | 2.64ms | 11.89ms |
+| HTTP/1.1 | 221,572 | 901μs | 866μs | 1.82ms | 9.38ms |
+| HTTP/1.1+TLS | 219,383* | 909μs | 865μs | 1.89ms | 76.48ms |
+| HTTP/2 (TLS) | 354,711 | 562μs | 489μs | 1.74ms | 73.86ms |
+| HTTP/3 (QUIC) | 90,448 | 2.21ms | 2.19ms | 3.26ms | 25.66ms |
+| WebSocket | 222,932 | 895μs | 870μs | 1.74ms | 7.20ms |
+| gRPC | 162,602 | 1.23ms | 974μs | 4.42ms | 366.08ms |
+| TCP | 223,859 | 892μs | 865μs | 1.75ms | 16.43ms |
+| TCP+TLS | 222,303 | 898μs | 869μs | 1.78ms | 6.67ms |
+| UDP | 247,271 | 808μs | 738μs | 1.71ms | 6.81ms |
+| UDP+DTLS | 101,452 | 1.87ms | 1.87ms | 2.95ms | 23.20ms |
 
 *\*HTTP/1.1+TLS direct baseline uses plain HTTP since the backend has no TLS; the TLS overhead is entirely at the gateway.*
 
@@ -193,16 +193,16 @@ Results from a local run on macOS (Apple Silicon), 10s duration, 200 concurrent 
 
 | Protocol | Gateway RPS | Direct RPS | Overhead | Notes |
 |----------|------------|------------|----------|-------|
-| HTTP/1.1 | 90,706 | 222,382 | ~59% | reqwest connection pool with keep-alive |
-| HTTP/1.1+TLS | 88,472 | 222,883 | ~60% | TLS termination at gateway, plain HTTP to backend |
-| HTTP/2 (TLS) | 101,390 | 349,942 | ~71% | hyper-native H2 pool with multiplexing |
-| HTTP/3 (QUIC) | 50,519 | 88,524 | ~43% | QUIC connection pool via quinn |
-| WebSocket | 113,141 | 225,172 | ~50% | Upgrade overhead amortized over many messages |
-| gRPC | 63,235 | 176,234 | ~64% | H2 multiplexing + protobuf passthrough |
-| TCP | 113,657 | 224,167 | ~49% | Bidirectional copy, minimal per-byte overhead |
-| TCP+TLS | 113,794 | 224,985 | ~49% | TLS termination + bidirectional copy (cached TLS config) |
-| UDP | 82,515 | 276,245 | ~70% | Per-datagram session lookup + forwarding |
-| UDP+DTLS | 80,187 | 108,489 | ~26% | DTLS termination + plain UDP forwarding |
+| HTTP/1.1 | 90,063 | 221,572 | ~59% | reqwest connection pool with keep-alive |
+| HTTP/1.1+TLS | 89,046 | 219,383 | ~59% | TLS termination at gateway, plain HTTP to backend |
+| HTTP/2 (TLS) | 100,530 | 354,711 | ~72% | hyper-native H2 pool with two-phase ready() multiplexing |
+| HTTP/3 (QUIC) | 49,188 | 90,448 | ~46% | QUIC connection pool via quinn |
+| WebSocket | 111,852 | 222,932 | ~50% | Upgrade overhead amortized over many messages |
+| gRPC | 60,689 | 162,602 | ~63% | H2 multiplexing + protobuf passthrough |
+| TCP | 112,037 | 223,859 | ~50% | Bidirectional copy, minimal per-byte overhead |
+| TCP+TLS | 112,017 | 222,303 | ~50% | TLS termination + bidirectional copy (cached TLS config) |
+| UDP | 81,924 | 247,271 | ~67% | Per-datagram session lookup + forwarding |
+| UDP+DTLS | 75,150 | 101,452 | ~26% | DTLS termination + plain UDP forwarding |
 
 ## Prerequisites
 

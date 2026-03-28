@@ -7,6 +7,7 @@
 #     --concurrency <n>    Concurrent connections (default: 100)
 #     --payload-size <n>   Payload bytes for echo tests (default: 64)
 #     --json               Output JSON results
+#     --skip-build         Skip build entirely (use existing binaries)
 
 set -e
 
@@ -28,6 +29,7 @@ DURATION=30
 CONCURRENCY=100
 PAYLOAD_SIZE=64
 JSON_FLAG=""
+SKIP_BUILD=false
 
 # Parse options
 while [[ $# -gt 0 ]]; do
@@ -36,6 +38,7 @@ while [[ $# -gt 0 ]]; do
         --concurrency) CONCURRENCY="$2"; shift 2 ;;
         --payload-size) PAYLOAD_SIZE="$2"; shift 2 ;;
         --json) JSON_FLAG="--json"; shift ;;
+        --skip-build) SKIP_BUILD=true; shift ;;
         *) shift ;;
     esac
 done
@@ -62,13 +65,55 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# Check if a binary is up-to-date (newer than all Rust source files in its crate)
+binary_is_fresh() {
+    local binary="$1"
+    local src_dir="$2"
+    [ -f "$binary" ] || return 1
+    # If any .rs or .toml file is newer than the binary, it's stale
+    local newer
+    newer=$(find "$src_dir" \( -name '*.rs' -o -name 'Cargo.toml' -o -name 'Cargo.lock' \) -newer "$binary" -print -quit 2>/dev/null)
+    [ -z "$newer" ]
+}
+
 # Build
 build() {
+    if $SKIP_BUILD; then
+        echo -e "${YELLOW}Skipping build (--skip-build)${NC}"
+        return
+    fi
+
+    local gateway_bin="$PROJECT_ROOT/target/release/ferrum-gateway"
+    local bench_bin="$SCRIPT_DIR/target/release/proto_bench"
+
+    local need_gateway=true
+    local need_bench=true
+
+    if binary_is_fresh "$gateway_bin" "$PROJECT_ROOT/src"; then
+        need_gateway=false
+    fi
+    if binary_is_fresh "$bench_bin" "$SCRIPT_DIR/src"; then
+        need_bench=false
+    fi
+
+    if ! $need_gateway && ! $need_bench; then
+        echo -e "${GREEN}Binaries up-to-date, skipping build${NC}"
+        return
+    fi
+
     echo -e "${BLUE}Building multi-protocol test suite...${NC}"
-    cd "$PROJECT_ROOT"
-    cargo build --release --bin ferrum-gateway 2>&1 | tail -1
-    cd "$SCRIPT_DIR"
-    cargo build --release 2>&1 | tail -1
+    if $need_gateway; then
+        cd "$PROJECT_ROOT"
+        cargo build --release --bin ferrum-gateway 2>&1 | tail -1
+    else
+        echo -e "  ${GREEN}ferrum-gateway binary is fresh${NC}"
+    fi
+    if $need_bench; then
+        cd "$SCRIPT_DIR"
+        cargo build --release 2>&1 | tail -1
+    else
+        echo -e "  ${GREEN}proto_bench/proto_backend binaries are fresh${NC}"
+    fi
     echo -e "${GREEN}Build complete${NC}"
 }
 
@@ -263,6 +308,29 @@ test_udp_dtls() {
     run_bench "UDP+DTLS (direct backend)" udp "127.0.0.1:3006" --tls
 }
 
+# Kill stale processes from prior crashed runs before starting.
+# Without this, leftover listeners on test ports cause "Connection refused"
+# or "Address already in use" failures when the backend/gateway try to bind.
+kill_stale_processes() {
+    local stale=false
+    for port in 3001 3002 3003 3004 3005 3006 3010 3443 3444 3445 50052 \
+                $GATEWAY_HTTP_PORT $GATEWAY_HTTPS_PORT 5000 5001 5003 5004 5010; do
+        if lsof -ti:"$port" > /dev/null 2>&1; then
+            stale=true
+            break
+        fi
+    done
+    if $stale; then
+        echo -e "${YELLOW}Killing stale processes from prior run...${NC}"
+        for port in 3001 3002 3003 3004 3005 3006 3010 3443 3444 3445 50052 \
+                    $GATEWAY_HTTP_PORT $GATEWAY_HTTPS_PORT 5000 5001 5003 5004 5010; do
+            lsof -ti:"$port" 2>/dev/null | xargs kill -9 2>/dev/null || true
+        done
+        sleep 1
+        echo -e "${GREEN}Stale processes cleaned${NC}"
+    fi
+}
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 echo -e "${BLUE}╔══════════════════════════════════════════╗${NC}"
@@ -270,6 +338,7 @@ echo -e "${BLUE}║  Ferrum Gateway Multi-Protocol Perf Test ║${NC}"
 echo -e "${BLUE}╚══════════════════════════════════════════╝${NC}"
 echo ""
 
+kill_stale_processes
 build
 start_backend
 

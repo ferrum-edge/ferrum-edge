@@ -1,6 +1,7 @@
 use arc_swap::ArcSwap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tonic::transport::Server;
 use tonic::transport::server::ServerTlsConfig;
@@ -62,6 +63,12 @@ pub async fn run(
     let admin_http_addr: SocketAddr = format!("0.0.0.0:{}", env_config.admin_http_port).parse()?;
     let jwt_manager = create_jwt_manager_from_env()
         .map_err(|e| anyhow::anyhow!("Failed to create JWT manager: {}", e))?;
+
+    // Shared flag: DB polling loop sets this to false when the database is
+    // unreachable, causing the admin API to reject writes early and preserve
+    // the cached config until the DB recovers.
+    let db_available = Arc::new(AtomicBool::new(true));
+
     let admin_state = AdminState {
         db: Some(db.clone()),
         jwt_manager,
@@ -69,6 +76,7 @@ pub async fn run(
         proxy_state: None,
         mode: "cp".into(),
         read_only: env_config.admin_read_only,
+        db_available: Some(db_available.clone()),
         admin_restore_max_body_size_mib: env_config.admin_restore_max_body_size_mib,
     };
     let admin_shutdown = shutdown_tx.subscribe();
@@ -98,6 +106,7 @@ pub async fn run(
             proxy_state: None,
             mode: "cp".into(),
             read_only: env_config.admin_read_only,
+            db_available: Some(db_available.clone()),
             admin_restore_max_body_size_mib: env_config.admin_restore_max_body_size_mib,
         };
         let admin_https_shutdown = shutdown_tx.subscribe();
@@ -225,6 +234,7 @@ pub async fn run(
     let poll_interval = Duration::from_secs(env_config.db_poll_interval);
     let db_poll = db.clone();
     let config_poll = config_arc.clone();
+    let db_available_poll = db_available.clone();
     let mut cp_poll_shutdown = shutdown_tx.subscribe();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(poll_interval);
@@ -254,6 +264,7 @@ pub async fn run(
                             &known_upstream_ids,
                         ).await {
                             Ok(result) => {
+                                db_available_poll.store(true, Ordering::Relaxed);
                                 if result.is_empty() {
                                     last_poll_at = Some(result.poll_timestamp);
                                     continue;
@@ -307,6 +318,7 @@ pub async fn run(
                                 // Fallback to full config load + full snapshot broadcast
                                 match db_poll.load_full_config().await {
                                     Ok(new_config) => {
+                                        db_available_poll.store(true, Ordering::Relaxed);
                                         let (p, c, pc, u) = DatabaseStore::extract_known_ids(&new_config);
                                         known_proxy_ids = p;
                                         known_consumer_ids = c;
@@ -318,6 +330,7 @@ pub async fn run(
                                         info!("Configuration reloaded from database (full fallback) and pushed to DPs");
                                     }
                                     Err(e2) => {
+                                        db_available_poll.store(false, Ordering::Relaxed);
                                         warn!(
                                             "Full config reload also failed (serving cached): {}",
                                             e2

@@ -266,6 +266,7 @@ pub async fn run(
         proxy_state: Some(proxy_state.clone()),
         mode: "dp".into(),
         read_only: true, // DP admin API is always read-only
+        db_available: None,
         admin_restore_max_body_size_mib: env_config.admin_restore_max_body_size_mib,
     };
     let admin_shutdown = shutdown_tx.subscribe();
@@ -296,6 +297,7 @@ pub async fn run(
             proxy_state: Some(proxy_state.clone()),
             mode: "dp".into(),
             read_only: true,
+            db_available: None,
             admin_restore_max_body_size_mib: env_config.admin_restore_max_body_size_mib,
         };
         let admin_https_shutdown = shutdown_tx.subscribe();

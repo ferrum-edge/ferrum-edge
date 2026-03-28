@@ -717,23 +717,35 @@ impl GatewayConfig {
     pub fn validate_unique_listen_paths(&self) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
 
-        for (i, proxy_a) in self.proxies.iter().enumerate() {
-            for proxy_b in self.proxies.iter().skip(i + 1) {
-                if proxy_a.listen_path != proxy_b.listen_path {
-                    continue;
-                }
-                // Same listen_path — check if hosts overlap
-                if hosts_overlap(&proxy_a.hosts, &proxy_b.hosts) {
-                    if proxy_a.hosts.is_empty() && proxy_b.hosts.is_empty() {
-                        errors.push(format!(
-                            "Duplicate listen_path '{}' found in proxy '{}' (conflicts with '{}')",
-                            proxy_a.listen_path, proxy_b.id, proxy_a.id
-                        ));
-                    } else {
-                        errors.push(format!(
-                            "Overlapping host+listen_path for '{}' in proxy '{}' (conflicts with '{}')",
-                            proxy_a.listen_path, proxy_b.id, proxy_a.id
-                        ));
+        // Group proxies by listen_path — only proxies sharing the same path can conflict.
+        // This reduces O(n^2) all-pairs comparison to O(n) grouping + O(k^2) within each
+        // group, where k is the number of proxies sharing a single listen_path (typically 1).
+        let mut by_path: HashMap<&str, Vec<&Proxy>> = HashMap::new();
+        for proxy in &self.proxies {
+            by_path
+                .entry(proxy.listen_path.as_str())
+                .or_default()
+                .push(proxy);
+        }
+
+        for group in by_path.values() {
+            if group.len() < 2 {
+                continue;
+            }
+            for (i, proxy_a) in group.iter().enumerate() {
+                for proxy_b in group.iter().skip(i + 1) {
+                    if hosts_overlap(&proxy_a.hosts, &proxy_b.hosts) {
+                        if proxy_a.hosts.is_empty() && proxy_b.hosts.is_empty() {
+                            errors.push(format!(
+                                "Duplicate listen_path '{}' found in proxy '{}' (conflicts with '{}')",
+                                proxy_a.listen_path, proxy_b.id, proxy_a.id
+                            ));
+                        } else {
+                            errors.push(format!(
+                                "Overlapping host+listen_path for '{}' in proxy '{}' (conflicts with '{}')",
+                                proxy_a.listen_path, proxy_b.id, proxy_a.id
+                            ));
+                        }
                     }
                 }
             }

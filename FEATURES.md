@@ -52,13 +52,14 @@ Ferrum supports dynamic upstream target discovery through three providers, confi
 
 ## Plugin System
 
-- 21 built-in plugins with lifecycle hooks (request received, authenticate, authorize, before proxy, after proxy, log)
+- 22 built-in plugins with lifecycle hooks (request received, authenticate, authorize, before proxy, after proxy, log)
 - Priority-ordered execution with protocol-aware filtering (HTTP, gRPC, WebSocket, TCP, UDP)
 - Global and per-proxy scoping with same-type override semantics
 - Multi-authentication mode with first-match consumer identification
 
 ### Authentication Plugins
 
+- **mTLS** — client certificate identity matching with per-proxy CA filtering
 - **JWT** (HS256) — bearer token with configurable claim field
 - **API Key** — header or query parameter lookup
 - **Basic Auth** — bcrypt or HMAC-SHA256 password verification

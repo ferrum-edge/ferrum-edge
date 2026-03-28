@@ -199,6 +199,7 @@ async fn test_list_proxies_falls_back_to_cached_config() {
         proxy_state: None,
         mode: "test".to_string(),
         read_only: true,
+        db_available: None,
         admin_restore_max_body_size_mib: 100,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
@@ -230,6 +231,7 @@ async fn test_list_consumers_falls_back_to_cached_config() {
         proxy_state: None,
         mode: "test".to_string(),
         read_only: true,
+        db_available: None,
         admin_restore_max_body_size_mib: 100,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
@@ -256,6 +258,7 @@ async fn test_list_plugin_configs_falls_back_to_cached_config() {
         proxy_state: None,
         mode: "test".to_string(),
         read_only: true,
+        db_available: None,
         admin_restore_max_body_size_mib: 100,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
@@ -286,6 +289,7 @@ async fn test_get_proxy_by_id_falls_back_to_cached_config() {
         proxy_state: None,
         mode: "test".to_string(),
         read_only: true,
+        db_available: None,
         admin_restore_max_body_size_mib: 100,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
@@ -311,6 +315,7 @@ async fn test_get_proxy_not_found_in_cache() {
         proxy_state: None,
         mode: "test".to_string(),
         read_only: true,
+        db_available: None,
         admin_restore_max_body_size_mib: 100,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
@@ -334,6 +339,7 @@ async fn test_get_consumer_by_id_falls_back_to_cached_config() {
         proxy_state: None,
         mode: "test".to_string(),
         read_only: true,
+        db_available: None,
         admin_restore_max_body_size_mib: 100,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
@@ -359,6 +365,7 @@ async fn test_get_consumer_not_found_in_cache() {
         proxy_state: None,
         mode: "test".to_string(),
         read_only: true,
+        db_available: None,
         admin_restore_max_body_size_mib: 100,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
@@ -382,6 +389,7 @@ async fn test_get_plugin_config_by_id_falls_back_to_cached_config() {
         proxy_state: None,
         mode: "test".to_string(),
         read_only: true,
+        db_available: None,
         admin_restore_max_body_size_mib: 100,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
@@ -408,6 +416,7 @@ async fn test_get_plugin_config_not_found_in_cache() {
         proxy_state: None,
         mode: "test".to_string(),
         read_only: true,
+        db_available: None,
         admin_restore_max_body_size_mib: 100,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
@@ -431,6 +440,7 @@ async fn test_list_proxies_no_db_no_cache_returns_503() {
         proxy_state: None,
         mode: "test".to_string(),
         read_only: true,
+        db_available: None,
         admin_restore_max_body_size_mib: 100,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
@@ -457,6 +467,7 @@ async fn test_list_consumers_no_db_no_cache_returns_503() {
         proxy_state: None,
         mode: "test".to_string(),
         read_only: true,
+        db_available: None,
         admin_restore_max_body_size_mib: 100,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
@@ -483,6 +494,7 @@ async fn test_get_proxy_no_db_no_cache_returns_503() {
         proxy_state: None,
         mode: "test".to_string(),
         read_only: true,
+        db_available: None,
         admin_restore_max_body_size_mib: 100,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
@@ -513,6 +525,7 @@ async fn test_health_endpoint_shows_cached_config_info() {
         proxy_state: None,
         mode: "test".to_string(),
         read_only: true,
+        db_available: None,
         admin_restore_max_body_size_mib: 100,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
@@ -544,6 +557,7 @@ async fn test_health_endpoint_shows_no_cached_config() {
         proxy_state: None,
         mode: "test".to_string(),
         read_only: true,
+        db_available: None,
         admin_restore_max_body_size_mib: 100,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
@@ -573,6 +587,7 @@ async fn test_cached_config_reflects_live_updates() {
         proxy_state: None,
         mode: "test".to_string(),
         read_only: true,
+        db_available: None,
         admin_restore_max_body_size_mib: 100,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
@@ -656,6 +671,7 @@ fn create_pagination_admin_state(tc: &TestConfig) -> AdminState {
         proxy_state: None,
         mode: "test".to_string(),
         read_only: true,
+        db_available: None,
         admin_restore_max_body_size_mib: 100,
     }
 }
@@ -799,6 +815,7 @@ async fn create_db_admin_state(tc: &TestConfig) -> (AdminState, tempfile::TempDi
         proxy_state: None,
         mode: "database".to_string(),
         read_only: false,
+        db_available: None,
         admin_restore_max_body_size_mib: 100,
     };
     (state, temp_dir)
@@ -891,6 +908,7 @@ async fn test_batch_create_read_only_rejected() {
         proxy_state: None,
         mode: "test".to_string(),
         read_only: true,
+        db_available: None,
         admin_restore_max_body_size_mib: 100,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
@@ -1151,6 +1169,7 @@ async fn test_restore_read_only_rejected() {
         proxy_state: None,
         mode: "test".to_string(),
         read_only: true,
+        db_available: None,
         admin_restore_max_body_size_mib: 100,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;

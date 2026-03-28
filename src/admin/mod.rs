@@ -17,7 +17,7 @@ use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::net::TcpListener;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
@@ -43,6 +43,9 @@ pub struct AdminState {
     pub cached_config: Option<Arc<ArcSwap<GatewayConfig>>>,
     pub mode: String,
     pub read_only: bool,
+    /// Dynamic flag set by the DB polling loop. When `false`, write operations
+    /// are rejected early to preserve the cached config until the DB recovers.
+    pub db_available: Option<Arc<AtomicBool>>,
     /// Max request body size in MiB for POST /restore.
     pub admin_restore_max_body_size_mib: usize,
 }
@@ -51,6 +54,26 @@ impl AdminState {
     /// Get the current cached config if available.
     fn cached_gateway_config(&self) -> Option<Arc<GatewayConfig>> {
         self.cached_config.as_ref().map(|c| c.load_full())
+    }
+
+    /// Check whether write operations are allowed. Returns an error response
+    /// if the admin API is read-only or the database is currently unavailable.
+    pub fn check_write_allowed(&self) -> Option<Response<Full<Bytes>>> {
+        if self.read_only {
+            return Some(json_response(
+                StatusCode::FORBIDDEN,
+                &json!({"error": "Admin API is in read-only mode"}),
+            ));
+        }
+        if let Some(ref flag) = self.db_available
+            && !flag.load(Ordering::Relaxed)
+        {
+            return Some(json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &json!({"error": "Database is currently unavailable — admin API is temporarily read-only"}),
+            ));
+        }
+        None
     }
 }
 
@@ -281,6 +304,14 @@ pub async fn handle_admin_request(
             }
         }
 
+        // Report whether admin writes are enabled (read_only flag + db_available)
+        let writes_blocked = state.check_write_allowed().is_some();
+        health_status["admin_writes_enabled"] = json!(!writes_blocked);
+        if writes_blocked && !state.read_only {
+            // DB-driven read-only — mark as degraded if not already
+            health_status["status"] = json!("degraded");
+        }
+
         // Report cached config availability for resilience visibility
         if let Some(config) = state.cached_gateway_config() {
             health_status["cached_config"] = json!({
@@ -470,11 +501,8 @@ async fn handle_create_proxy(
     body: &[u8],
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     // Check if admin API is in read-only mode
-    if state.read_only {
-        return Ok(json_response(
-            StatusCode::FORBIDDEN,
-            &json!({"error": "Admin API is in read-only mode"}),
-        ));
+    if let Some(resp) = state.check_write_allowed() {
+        return Ok(resp);
     }
 
     let db = match &state.db {
@@ -743,11 +771,8 @@ async fn handle_update_proxy(
     body: &[u8],
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     // Check if admin API is in read-only mode
-    if state.read_only {
-        return Ok(json_response(
-            StatusCode::FORBIDDEN,
-            &json!({"error": "Admin API is in read-only mode"}),
-        ));
+    if let Some(resp) = state.check_write_allowed() {
+        return Ok(resp);
     }
 
     let db = match &state.db {
@@ -965,11 +990,8 @@ async fn handle_delete_proxy(
     id: &str,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     // Check if admin API is in read-only mode
-    if state.read_only {
-        return Ok(json_response(
-            StatusCode::FORBIDDEN,
-            &json!({"error": "Admin API is in read-only mode"}),
-        ));
+    if let Some(resp) = state.check_write_allowed() {
+        return Ok(resp);
     }
 
     let db = match &state.db {
@@ -1044,11 +1066,8 @@ async fn handle_create_consumer(
     body: &[u8],
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     // Check if admin API is in read-only mode
-    if state.read_only {
-        return Ok(json_response(
-            StatusCode::FORBIDDEN,
-            &json!({"error": "Admin API is in read-only mode"}),
-        ));
+    if let Some(resp) = state.check_write_allowed() {
+        return Ok(resp);
     }
 
     let db = match &state.db {
@@ -1242,11 +1261,8 @@ async fn handle_update_consumer(
     body: &[u8],
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     // Check if admin API is in read-only mode
-    if state.read_only {
-        return Ok(json_response(
-            StatusCode::FORBIDDEN,
-            &json!({"error": "Admin API is in read-only mode"}),
-        ));
+    if let Some(resp) = state.check_write_allowed() {
+        return Ok(resp);
     }
 
     let db = match &state.db {
@@ -1350,11 +1366,8 @@ async fn handle_delete_consumer(
     id: &str,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     // Check if admin API is in read-only mode
-    if state.read_only {
-        return Ok(json_response(
-            StatusCode::FORBIDDEN,
-            &json!({"error": "Admin API is in read-only mode"}),
-        ));
+    if let Some(resp) = state.check_write_allowed() {
+        return Ok(resp);
     }
 
     let db = match &state.db {
@@ -1396,11 +1409,8 @@ async fn handle_update_credentials(
     cred_type: &str,
     body: &[u8],
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
-    if state.read_only {
-        return Ok(json_response(
-            StatusCode::FORBIDDEN,
-            &json!({"error": "Admin API is in read-only mode"}),
-        ));
+    if let Some(resp) = state.check_write_allowed() {
+        return Ok(resp);
     }
 
     // Validate credential type against whitelist
@@ -1531,11 +1541,8 @@ async fn handle_delete_credentials(
     consumer_id: &str,
     cred_type: &str,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
-    if state.read_only {
-        return Ok(json_response(
-            StatusCode::FORBIDDEN,
-            &json!({"error": "Admin API is in read-only mode"}),
-        ));
+    if let Some(resp) = state.check_write_allowed() {
+        return Ok(resp);
     }
 
     // Validate credential type against whitelist
@@ -1628,11 +1635,8 @@ async fn handle_create_plugin_config(
     body: &[u8],
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     // Check if admin API is in read-only mode
-    if state.read_only {
-        return Ok(json_response(
-            StatusCode::FORBIDDEN,
-            &json!({"error": "Admin API is in read-only mode"}),
-        ));
+    if let Some(resp) = state.check_write_allowed() {
+        return Ok(resp);
     }
 
     let db = match &state.db {
@@ -1781,11 +1785,8 @@ async fn handle_update_plugin_config(
     body: &[u8],
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     // Check if admin API is in read-only mode
-    if state.read_only {
-        return Ok(json_response(
-            StatusCode::FORBIDDEN,
-            &json!({"error": "Admin API is in read-only mode"}),
-        ));
+    if let Some(resp) = state.check_write_allowed() {
+        return Ok(resp);
     }
 
     let db = match &state.db {
@@ -1867,11 +1868,8 @@ async fn handle_delete_plugin_config(
     id: &str,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     // Check if admin API is in read-only mode
-    if state.read_only {
-        return Ok(json_response(
-            StatusCode::FORBIDDEN,
-            &json!({"error": "Admin API is in read-only mode"}),
-        ));
+    if let Some(resp) = state.check_write_allowed() {
+        return Ok(resp);
     }
 
     let db = match &state.db {
@@ -1935,11 +1933,8 @@ async fn handle_create_upstream(
     state: &AdminState,
     body: &[u8],
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
-    if state.read_only {
-        return Ok(json_response(
-            StatusCode::FORBIDDEN,
-            &json!({"error": "Admin API is in read-only mode"}),
-        ));
+    if let Some(resp) = state.check_write_allowed() {
+        return Ok(resp);
     }
 
     let db = match &state.db {
@@ -2070,11 +2065,8 @@ async fn handle_update_upstream(
     id: &str,
     body: &[u8],
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
-    if state.read_only {
-        return Ok(json_response(
-            StatusCode::FORBIDDEN,
-            &json!({"error": "Admin API is in read-only mode"}),
-        ));
+    if let Some(resp) = state.check_write_allowed() {
+        return Ok(resp);
     }
 
     let db = match &state.db {
@@ -2139,11 +2131,8 @@ async fn handle_delete_upstream(
     state: &AdminState,
     id: &str,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
-    if state.read_only {
-        return Ok(json_response(
-            StatusCode::FORBIDDEN,
-            &json!({"error": "Admin API is in read-only mode"}),
-        ));
+    if let Some(resp) = state.check_write_allowed() {
+        return Ok(resp);
     }
 
     let db = match &state.db {
@@ -2239,11 +2228,8 @@ async fn handle_batch_create(
     state: &AdminState,
     body: &[u8],
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
-    if state.read_only {
-        return Ok(json_response(
-            StatusCode::FORBIDDEN,
-            &json!({"error": "Admin API is in read-only mode"}),
-        ));
+    if let Some(resp) = state.check_write_allowed() {
+        return Ok(resp);
     }
 
     let db = match &state.db {
@@ -2728,11 +2714,8 @@ async fn handle_restore(
     body: &[u8],
     query: Option<&str>,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
-    if state.read_only {
-        return Ok(json_response(
-            StatusCode::FORBIDDEN,
-            &json!({"error": "Admin API is in read-only mode"}),
-        ));
+    if let Some(resp) = state.check_write_allowed() {
+        return Ok(resp);
     }
 
     let db = match &state.db {

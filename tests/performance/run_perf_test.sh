@@ -48,19 +48,49 @@ check_dependencies() {
     echo -e "${GREEN}✅ Dependencies check passed${NC}"
 }
 
-# Build the project
+# Check if a binary is up-to-date (newer than all Rust source files in its crate)
+binary_is_fresh() {
+    local binary="$1"
+    local src_dir="$2"
+    [ -f "$binary" ] || return 1
+    local newer
+    newer=$(find "$src_dir" \( -name '*.rs' -o -name 'Cargo.toml' -o -name 'Cargo.lock' \) -newer "$binary" -print -quit 2>/dev/null)
+    [ -z "$newer" ]
+}
+
+# Build the project (skips if binaries are newer than source)
 build_project() {
-    echo -e "${YELLOW}🔨 Building project...${NC}"
-    
-    # Build gateway
-    cd "$PROJECT_ROOT"
-    cargo build --release --bin ferrum-gateway
-    
-    # Build backend server
-    cd "$PERF_DIR"
-    cargo build --release --bin backend_server
-    
-    echo -e "${GREEN}✅ Build completed${NC}"
+    local gateway_bin="$PROJECT_ROOT/target/release/ferrum-gateway"
+    local backend_bin="$PERF_DIR/target/release/backend_server"
+    local need_gateway=true
+    local need_backend=true
+
+    if binary_is_fresh "$gateway_bin" "$PROJECT_ROOT/src"; then
+        need_gateway=false
+    fi
+    if binary_is_fresh "$backend_bin" "$PERF_DIR/src"; then
+        need_backend=false
+    fi
+
+    if ! $need_gateway && ! $need_backend; then
+        echo -e "${GREEN}Binaries up-to-date, skipping build${NC}"
+        return
+    fi
+
+    echo -e "${YELLOW}Building project...${NC}"
+    if $need_gateway; then
+        cd "$PROJECT_ROOT"
+        cargo build --release --bin ferrum-gateway
+    else
+        echo -e "  ${GREEN}ferrum-gateway binary is fresh${NC}"
+    fi
+    if $need_backend; then
+        cd "$PERF_DIR"
+        cargo build --release --bin backend_server
+    else
+        echo -e "  ${GREEN}backend_server binary is fresh${NC}"
+    fi
+    echo -e "${GREEN}Build completed${NC}"
 }
 
 # Start backend server

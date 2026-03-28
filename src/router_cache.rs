@@ -156,7 +156,7 @@ impl RouterCache {
         let cache_key = make_cache_key(host, path);
 
         // Fast path 1: check prefix cache (includes negative entries for total misses)
-        if let Some(entry) = self.prefix_cache.get(&cache_key) {
+        if let Some(entry) = self.prefix_cache.get(cache_key.as_str()) {
             return entry.value().as_ref().map(|proxy| RouteMatch {
                 proxy: Arc::clone(proxy),
                 path_params: Vec::new(),
@@ -165,7 +165,7 @@ impl RouterCache {
         }
 
         // Fast path 2: check regex cache (only contains positive matches)
-        if let Some(entry) = self.regex_cache.get(&cache_key) {
+        if let Some(entry) = self.regex_cache.get(cache_key.as_str()) {
             let cached = entry.value();
             return Some(RouteMatch {
                 proxy: Arc::clone(&cached.proxy),
@@ -601,11 +601,25 @@ fn evict_dashmap_sample<V>(
     );
 }
 
-/// Build a cache key from host and path.
+/// Build a cache key from host and path with exact-capacity pre-allocation.
+///
 /// Uses NUL separator which cannot appear in hostnames or URL paths.
+/// Uses `String::with_capacity` + `push_str` instead of `format!()` to
+/// avoid format-machinery overhead and produce an exact-size allocation.
 fn make_cache_key(host: Option<&str>, path: &str) -> String {
     match host {
-        Some(h) => format!("{}\0{}", h, path),
-        None => format!("\0{}", path),
+        Some(h) => {
+            let mut key = String::with_capacity(h.len() + 1 + path.len());
+            key.push_str(h);
+            key.push('\0');
+            key.push_str(path);
+            key
+        }
+        None => {
+            let mut key = String::with_capacity(1 + path.len());
+            key.push('\0');
+            key.push_str(path);
+            key
+        }
     }
 }

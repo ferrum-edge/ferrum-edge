@@ -2,6 +2,9 @@
 //!
 //! Tests for the Admin API read-only mode functionality
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use ferrum_gateway::admin::{
     AdminState,
     jwt_auth::{JwtConfig, JwtManager},
@@ -47,6 +50,7 @@ fn create_test_admin_state(config: &TestConfig, read_only: bool) -> AdminState {
         proxy_state: None,
         mode: "test".to_string(),
         read_only,
+        db_available: None,
         admin_restore_max_body_size_mib: 100,
     }
 }
@@ -162,6 +166,7 @@ async fn test_admin_state_mode_field() {
         proxy_state: None,
         mode: "production".to_string(),
         read_only: false,
+        db_available: None,
         admin_restore_max_body_size_mib: 100,
     };
     assert_eq!(admin_state_prod.mode, "production");
@@ -176,4 +181,122 @@ async fn test_admin_state_jwt_manager() {
     let token = generate_test_token(&config, "test-user");
     let result = admin_state.jwt_manager.verify_token(&token);
     assert!(result.is_ok(), "JWT manager should work correctly");
+}
+
+#[tokio::test]
+async fn test_check_write_allowed_permits_when_db_available() {
+    let config = TestConfig::default();
+    let db_flag = Arc::new(AtomicBool::new(true));
+    let state = AdminState {
+        db: None,
+        jwt_manager: create_test_jwt_manager(&config),
+        cached_config: None,
+        proxy_state: None,
+        mode: "database".to_string(),
+        read_only: false,
+        db_available: Some(db_flag),
+        admin_restore_max_body_size_mib: 100,
+    };
+    assert!(
+        state.check_write_allowed().is_none(),
+        "Writes should be allowed when db_available=true and read_only=false"
+    );
+}
+
+#[tokio::test]
+async fn test_check_write_allowed_blocks_when_db_unavailable() {
+    let config = TestConfig::default();
+    let db_flag = Arc::new(AtomicBool::new(false));
+    let state = AdminState {
+        db: None,
+        jwt_manager: create_test_jwt_manager(&config),
+        cached_config: None,
+        proxy_state: None,
+        mode: "database".to_string(),
+        read_only: false,
+        db_available: Some(db_flag),
+        admin_restore_max_body_size_mib: 100,
+    };
+    let resp = state.check_write_allowed();
+    assert!(
+        resp.is_some(),
+        "Writes should be blocked when db_available=false"
+    );
+    assert_eq!(
+        resp.unwrap().status(),
+        hyper::StatusCode::SERVICE_UNAVAILABLE,
+        "Should return 503 when DB is unavailable"
+    );
+}
+
+#[tokio::test]
+async fn test_check_write_allowed_blocks_when_read_only() {
+    let config = TestConfig::default();
+    let db_flag = Arc::new(AtomicBool::new(true));
+    let state = AdminState {
+        db: None,
+        jwt_manager: create_test_jwt_manager(&config),
+        cached_config: None,
+        proxy_state: None,
+        mode: "database".to_string(),
+        read_only: true,
+        db_available: Some(db_flag),
+        admin_restore_max_body_size_mib: 100,
+    };
+    let resp = state.check_write_allowed();
+    assert!(
+        resp.is_some(),
+        "Writes should be blocked when read_only=true"
+    );
+    assert_eq!(
+        resp.unwrap().status(),
+        hyper::StatusCode::FORBIDDEN,
+        "Should return 403 when read_only"
+    );
+}
+
+#[tokio::test]
+async fn test_check_write_allowed_permits_when_no_db_flag() {
+    let config = TestConfig::default();
+    let state = AdminState {
+        db: None,
+        jwt_manager: create_test_jwt_manager(&config),
+        cached_config: None,
+        proxy_state: None,
+        mode: "file".to_string(),
+        read_only: false,
+        db_available: None,
+        admin_restore_max_body_size_mib: 100,
+    };
+    assert!(
+        state.check_write_allowed().is_none(),
+        "Writes should be allowed when db_available is None and read_only=false"
+    );
+}
+
+#[tokio::test]
+async fn test_db_available_flag_transitions() {
+    let config = TestConfig::default();
+    let db_flag = Arc::new(AtomicBool::new(true));
+    let state = AdminState {
+        db: None,
+        jwt_manager: create_test_jwt_manager(&config),
+        cached_config: None,
+        proxy_state: None,
+        mode: "database".to_string(),
+        read_only: false,
+        db_available: Some(db_flag.clone()),
+        admin_restore_max_body_size_mib: 100,
+    };
+
+    // Initially available
+    assert!(state.check_write_allowed().is_none());
+
+    // Simulate DB going down
+    db_flag.store(false, Ordering::Relaxed);
+    assert!(state.check_write_allowed().is_some());
+
+    // Simulate DB recovery
+    db_flag.store(true, Ordering::Relaxed);
+    assert!(state.check_write_allowed().is_none());
 }

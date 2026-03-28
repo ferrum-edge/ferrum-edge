@@ -2,7 +2,7 @@
 
 This document provides a comprehensive overview of the Ferrum Gateway codebase architecture to help new developers understand the project structure and contribute effectively.
 
-## 🏗️ High-Level Architecture
+## High-Level Architecture
 
 Ferrum Gateway is a high-performance API Gateway built in Rust that follows a modular, plugin-based architecture. It supports multiple operating modes and provides dynamic routing, authentication, authorization, and protocol translation capabilities.
 
@@ -18,87 +18,114 @@ Ferrum Gateway is a high-performance API Gateway built in Rust that follows a mo
               └─────────────────┘
 ```
 
-## 📁 Project Structure
+## Project Structure
 
 ### **Core Application (`src/`)**
 
 ```
 src/
-├── main.rs                 # Application entry point and CLI argument parsing
-├── lib.rs                  # Library root with public API exports
-├── circuit_breaker.rs      # Three-state circuit breaker (Closed/Open/Half-Open)
-├── connection_pool.rs      # HTTP client connection pooling with mTLS support
-├── consumer_index.rs       # Consumer lookup index for auth plugins
-├── health_check.rs         # Active and passive backend health checking
-├── load_balancer.rs        # Load balancing (RoundRobin, Weighted, LeastConn, ConsistentHash, Random)
-├── plugin_cache.rs         # Plugin configuration cache with atomic updates
-├── retry.rs                # Retry logic with backoff strategies
-├── router_cache.rs         # Pre-sorted route table with bounded path cache
-├── config/                 # Configuration management
-│   ├── mod.rs             # Configuration module exports
-│   ├── db_loader.rs       # Database configuration loading and migrations
-│   ├── env_config.rs      # Environment variable configuration
-│   ├── file_loader.rs     # YAML/JSON file configuration loading
-│   ├── pool_config.rs     # Connection pool configuration
-│   └── types.rs           # Core data structures (Proxy, Consumer, Plugin)
-├── proxy/                 # Proxy request handling
-│   ├── mod.rs             # ProxyState and main proxy logic
-│   ├── body.rs            # ProxyBody sum type (Full/Tracked) for response streaming
-│   ├── client_ip.rs       # Trusted proxy / X-Forwarded-For client IP resolution
-│   ├── handler.rs         # HTTP request/response processing
-│   └── grpc_proxy.rs      # gRPC reverse proxy with HTTP/2 and trailer support
-├── router_cache.rs        # Pre-sorted route table with bounded path cache
-├── connection_pool.rs     # HTTP client connection pooling with mTLS support
-├── load_balancer.rs       # Load balancing algorithms and upstream target selection
-├── health_check.rs        # Active and passive health checking for upstream targets
-├── tls/
-│   └── mod.rs             # TLS configuration with advanced hardening
-├── dns/                   # DNS resolution and caching
-│   ├── mod.rs             # DNS module exports, DnsCacheResolver for HTTP clients
-│   └── resolver.rs        # Async DNS resolver with caching
-├── http3/                 # HTTP/3 (QUIC) support
+├── main.rs                    # Application entry point and CLI argument parsing
+├── lib.rs                     # Library root with public API exports
+├── circuit_breaker.rs         # Three-state circuit breaker (Closed/Open/Half-Open)
+├── config_delta.rs            # Incremental config updates for CP/DP
+├── connection_pool.rs         # HTTP client connection pooling with mTLS support
+├── consumer_index.rs          # Consumer lookup index for auth plugins
+├── health_check.rs            # Active and passive backend health checking
+├── load_balancer.rs           # Load balancing (RoundRobin, Weighted, LeastConn, ConsistentHash, Random)
+├── plugin_cache.rs            # Plugin configuration cache with atomic updates
+├── retry.rs                   # Retry logic with backoff strategies
+├── router_cache.rs            # Pre-sorted route table with bounded path cache
+├── admin/                     # Admin API for configuration management
+│   ├── mod.rs                 # Admin API routes and handlers
+│   └── jwt_auth.rs            # JWT authentication for Admin API
+├── config/                    # Configuration management
+│   ├── mod.rs                 # Configuration module exports
+│   ├── conf_file.rs           # File configuration helpers
+│   ├── config_backup.rs       # Config backup support for startup failover
+│   ├── config_migration.rs    # Config version migrations
+│   ├── db_loader.rs           # Database configuration loading and polling
+│   ├── env_config.rs          # Environment variable configuration
+│   ├── file_loader.rs         # YAML/JSON file configuration loading
+│   ├── pool_config.rs         # Connection pool configuration
+│   ├── types.rs               # Core data structures (Proxy, Consumer, Plugin)
+│   └── migrations/            # SQL schema migrations
+│       ├── mod.rs             # Migration registry
+│       └── v001_initial_schema.rs  # Initial database schema
+├── dns/                       # DNS resolution and caching
+│   ├── mod.rs                 # DNS module exports, DnsCacheResolver for HTTP clients
+│   └── resolver.rs            # Async DNS resolver with caching
+├── dtls/                      # DTLS support (frontend termination, backend origination)
+│   └── mod.rs                 # DTLS certificate helpers
+├── grpc/                      # gRPC CP/DP communication
 │   ├── mod.rs
-│   ├── client.rs
-│   ├── server.rs
-│   └── config.rs
-├── admin/                 # Admin API for configuration management
-│   ├── mod.rs             # Admin API routes and handlers
-│   └── jwt_auth.rs        # JWT authentication for Admin API
-├── plugins/               # Plugin system for extensibility
-│   ├── mod.rs             # Plugin framework, registry, and priority constants
-│   ├── access_control.rs  # Consumer-based authorization
-│   ├── basic_auth.rs      # HTTP Basic auth with bcrypt
-│   ├── body_validator.rs  # JSON/XML request body validation
-│   ├── bot_detection.rs   # Bot detection and mitigation
-│   ├── correlation_id.rs  # Correlation ID generation and propagation
-│   ├── cors.rs            # Cross-Origin Resource Sharing
-│   ├── hmac_auth.rs       # HMAC authentication
-│   ├── http_logging.rs    # HTTP endpoint logging
-│   ├── ip_restriction.rs  # IP-based access control
-│   ├── jwt_auth.rs        # HS256 JWT authentication
-│   ├── key_auth.rs        # API key authentication
-│   ├── oauth2_auth.rs     # OAuth2 introspection/JWKS validation
-│   ├── otel_tracing.rs    # OpenTelemetry distributed tracing
-│   ├── prometheus_metrics.rs # Prometheus metrics export
-│   ├── rate_limiting.rs   # In-memory rate limiting
+│   ├── cp_server.rs           # Control Plane gRPC server
+│   └── dp_client.rs           # Data Plane gRPC client
+├── http3/                     # HTTP/3 (QUIC) support
+│   ├── mod.rs
+│   ├── client.rs              # HTTP/3 client connections
+│   ├── config.rs              # HTTP/3 configuration
+│   └── server.rs              # HTTP/3 server listener
+├── modes/                     # Operating modes
+│   ├── mod.rs
+│   ├── control_plane.rs       # Control Plane mode
+│   ├── data_plane.rs          # Data Plane mode
+│   ├── database.rs            # Database mode
+│   ├── file.rs                # File mode
+│   └── migrate.rs             # Database migration mode
+├── plugins/                   # Plugin system (23 built-in plugins)
+│   ├── mod.rs                 # Plugin framework, registry, and priority constants
+│   ├── access_control.rs      # Consumer-based authorization
+│   ├── basic_auth.rs          # HTTP Basic auth with bcrypt
+│   ├── body_transform.rs      # Request/response body transformation
+│   ├── body_validator.rs      # JSON/XML request body validation
+│   ├── bot_detection.rs       # Bot detection and mitigation
+│   ├── correlation_id.rs      # Correlation ID generation and propagation
+│   ├── cors.rs                # Cross-Origin Resource Sharing
+│   ├── graphql.rs             # GraphQL query validation and rate limiting
+│   ├── hmac_auth.rs           # HMAC authentication
+│   ├── http_logging.rs        # HTTP endpoint logging
+│   ├── ip_restriction.rs      # IP-based access control
+│   ├── jwks_store.rs          # JWKS key store for JWT/OAuth2
+│   ├── jwt_auth.rs            # HS256 JWT authentication
+│   ├── key_auth.rs            # API key authentication
+│   ├── mtls_auth.rs           # Mutual TLS client certificate authentication
+│   ├── oauth2_auth.rs         # OAuth2 introspection/JWKS validation
+│   ├── otel_tracing.rs        # OpenTelemetry distributed tracing
+│   ├── prometheus_metrics.rs  # Prometheus metrics export
+│   ├── rate_limiting.rs       # In-memory rate limiting
 │   ├── request_termination.rs # Early response / request termination
 │   ├── request_transformer.rs # Header/query modification
+│   ├── response_caching.rs    # Response caching
 │   ├── response_transformer.rs # Response header modification
-│   ├── stdout_logging.rs  # JSON transaction logging
+│   ├── stdout_logging.rs      # JSON transaction logging
 │   ├── transaction_debugger.rs # Verbose request/response debugging
-│   └── utils/             # Plugin utilities
+│   └── utils/                 # Plugin utilities
 │       ├── mod.rs
-│       └── http_client.rs
-├── grpc/                  # gRPC CP/DP communication
-│   ├── mod.rs
-│   ├── cp_server.rs       # Control Plane gRPC server
-│   └── dp_client.rs       # Data Plane gRPC client
-└── modes/                 # Operating modes
-    ├── mod.rs
-    ├── control_plane.rs   # Control Plane mode
-    ├── data_plane.rs      # Data Plane mode
-    ├── database.rs        # Database mode
-    └── file.rs            # File mode
+│       └── http_client.rs     # Shared HTTP client for plugin outbound calls
+├── proxy/                     # Proxy request handling
+│   ├── mod.rs                 # ProxyState, handle_proxy_request, URL building
+│   ├── body.rs                # ProxyBody sum type (Full/Tracked) for response streaming
+│   ├── client_ip.rs           # Trusted proxy / X-Forwarded-For client IP resolution
+│   ├── grpc_proxy.rs          # gRPC reverse proxy with HTTP/2 and trailer support
+│   ├── http2_pool.rs          # HTTP/2 connection pooling
+│   ├── stream_listener.rs     # Stream listener lifecycle manager (reconcile on config reload)
+│   ├── tcp_proxy.rs           # Raw TCP stream proxy with TLS termination/origination
+│   └── udp_proxy.rs           # UDP datagram proxy with per-client session tracking, DTLS
+├── secrets/                   # Secret management providers
+│   ├── mod.rs                 # Secret resolution orchestration
+│   ├── aws.rs                 # AWS Secrets Manager provider
+│   ├── azure.rs               # Azure Key Vault provider
+│   ├── env.rs                 # Environment variable secret provider
+│   ├── file.rs                # File-based secret provider
+│   ├── gcp.rs                 # GCP Secret Manager provider
+│   └── vault.rs               # HashiCorp Vault provider
+├── service_discovery/         # Dynamic upstream discovery
+│   ├── mod.rs                 # Service discovery orchestrator
+│   ├── consul.rs              # Consul provider
+│   ├── dns_sd.rs              # DNS-SD provider
+│   └── kubernetes.rs          # Kubernetes provider
+└── tls/
+    └── mod.rs                 # TLS configuration with advanced hardening
 ```
 
 ### **Tests (`tests/`)**
@@ -108,15 +135,19 @@ tests/
 ├── README.md                           # Test suite documentation
 ├── config.yaml                         # Test configuration fixture
 ├── certs/                              # TLS certificates for testing
+├── fixtures/                           # RSA key fixtures for auth plugin tests
+├── scripts/                            # Test setup scripts (e.g., DB TLS)
 │
 ├── unit_tests.rs                       # Entry point: unit test crate
 ├── unit/                               # Unit tests by component
-│   ├── plugins/                        # All 20 plugin tests
+│   ├── plugins/                        # All 23 plugin tests
 │   ├── config/                         # Configuration parsing tests
 │   ├── admin/                          # Admin API tests
-│   └── gateway_core/                   # Core data structure tests
+│   ├── gateway_core/                   # Core data structure tests
+│   └── secrets/                        # Secret provider tests
 │
 ├── integration_tests.rs                # Entry point: integration test crate
+├── admin_cached_config_tests.rs        # Admin API cached config tests
 ├── integration/                        # Integration tests
 │
 ├── functional_tests.rs                 # Entry point: functional test crate
@@ -125,36 +156,42 @@ tests/
 ├── helpers/bin/                        # Standalone test server binaries
 │
 └── performance/                        # Performance/load testing (separate crate)
+    └── multi_protocol/                 # Multi-protocol benchmark suite
 ```
 
 ### **Documentation (`docs/`)**
 
 ```
 docs/
-├── admin_read_only_mode.md  # Admin API read-only mode
-├── backend_mtls.md          # Backend mTLS configuration
-├── ci_cd.md                 # CI/CD pipeline documentation
-├── cors_plugin.md           # CORS plugin configuration
-├── cp_dp_mode.md            # Control Plane / Data Plane architecture
-├── dns_resolver.md          # DNS resolver configuration
-├── docker.md                # Docker deployment guide
-├── frontend_tls.md          # Frontend TLS/mTLS configuration
-├── functional_testing.md    # CP/DP functional testing guide
+├── admin_backup_restore.md     # Admin backup and restore API
+├── admin_batch_api.md          # Admin batch operations API
+├── admin_read_only_mode.md     # Admin API read-only mode
+├── backend_mtls.md             # Backend mTLS configuration
+├── ci_cd.md                    # CI/CD pipeline documentation
+├── client_ip_resolution.md     # Client IP resolution and trusted proxies
+├── cors_plugin.md              # CORS plugin configuration
+├── cp_dp_mode.md               # Control Plane / Data Plane architecture
+├── database_tls.md             # Database TLS configuration
+├── dns_resolver.md             # DNS resolver configuration
+├── docker.md                   # Docker deployment guide
+├── error_classification.md     # Error classification and gateway headers
+├── frontend_tls.md             # Frontend TLS/mTLS configuration
+├── functional_testing.md       # CP/DP functional testing guide
+├── functional_testing_auth_acl.md  # Auth/ACL functional testing
 ├── functional_testing_database.md  # Database mode testing
 ├── functional_testing_file_mode.md # File mode testing
-├── load_balancing.md        # Load balancing, health checks, retry, circuit breaker
-├── plugin_execution_order.md # Plugin priority and execution order
-├── response_body_streaming.md # Response body streaming vs buffering
-└── size_limits.md           # Request/response size limits
+├── infrastructure_sizing.md    # Infrastructure sizing guide
+├── load_balancing.md           # Load balancing, health checks, retry, circuit breaker
+├── migrations.md               # Database migration documentation
+├── pingora_comparison.md       # Pingora comparison analysis
+├── plugin_execution_order.md   # Plugin priority and execution order
+├── response_body_streaming.md  # Response body streaming vs buffering
+├── routing.md                  # Routing and path matching
+├── size_limits.md              # Request/response size limits
+└── tcp_udp_proxy.md            # TCP/UDP stream proxy documentation
 ```
 
-### **Performance Testing (`tests/performance/`)**
-
-```
-tests/performance/
-```
-
-## 🧩 Core Components
+## Core Components
 
 ### **1. Configuration System (`src/config/`)**
 
@@ -163,12 +200,17 @@ The configuration system provides flexible configuration management through mult
 - **`env_config.rs`**: Environment variable parsing and validation
 - **`pool_config.rs`**: Connection pool settings with global defaults and proxy overrides
 - **`types.rs`**: Core data structures including `Proxy`, `Consumer`, and `Plugin` definitions
+- **`conf_file.rs`**: File configuration helpers
+- **`config_backup.rs`**: Config backup support for startup failover when the data source is unreachable
+- **`config_migration.rs`**: Config version migrations for schema evolution
+- **`db_loader.rs`**: Database configuration loading with incremental polling
 
 **Key Features**:
 - Environment variable configuration for all settings
 - YAML/JSON file configuration support
 - Per-proxy configuration overrides
 - Configuration validation and defaults
+- Config backup for startup failover (`FERRUM_DB_CONFIG_BACKUP_PATH`)
 
 ### **2. Proxy Engine (`src/proxy/` + `src/router_cache.rs` + `src/plugin_cache.rs` + `src/consumer_index.rs`)**
 
@@ -190,10 +232,13 @@ The proxy engine handles all request routing and processing with **consistent se
 - **Complete logging** of WebSocket connections
 - **TCP keepalive** on inbound connections (60s interval) for stale client detection
 - **Configurable response body mode** — per-proxy `response_body_mode` (stream/buffer); plugins can force buffering via `requires_response_body_buffering()`
+- **TCP/UDP stream proxying** with TLS termination/origination and DTLS support (`src/proxy/tcp_proxy.rs`, `src/proxy/udp_proxy.rs`)
+- **Stream listener lifecycle management** — reconciles TCP/UDP listeners on config reload (`src/proxy/stream_listener.rs`)
+- **HTTP/2 connection pooling** for dedicated HTTP/2 backend connections (`src/proxy/http2_pool.rs`)
 
 **Security Model**:
 - **WebSocket requests** go through the same plugin pipeline as HTTP requests
-- **Authentication plugins** (key_auth, jwt_auth, etc.) protect WebSocket endpoints
+- **Authentication plugins** (key_auth, jwt_auth, mtls_auth, etc.) protect WebSocket endpoints
 - **Authorization plugins** (access_control) enforce IP restrictions on WebSocket connections
 - **Rate limiting plugins** prevent WebSocket connection abuse
 - **Logging plugins** provide complete audit trail for WebSocket connections
@@ -245,7 +290,7 @@ Separate HTTP and HTTPS listeners for the Admin API with enhanced TLS support:
 **Operating Mode Support**:
 - **Database Mode**: Full admin API with HTTP/HTTPS/mTLS (reads fall back to cached config if DB is offline)
 - **Control Plane Mode**: Full admin API with HTTP/HTTPS/mTLS (reads fall back to cached config if DB is offline)
-- **File Mode**: No admin API (proxy only)
+- **File Mode**: Read-only admin API served from cached config
 - **Data Plane Mode**: Read-only admin API served from cached config (writes return 403)
 
 ### **3.2 HTTP/3 (QUIC) (`src/http3/`)**
@@ -289,16 +334,17 @@ High-performance HTTP client connection pooling with backend mTLS support:
 - Transparent DNS cache integration via `DnsCacheResolver` — no DNS in the hot path
 - Connection statistics and monitoring
 
-### **4. Plugin System (`src/plugins/`)**
+### **5. Plugin System (`src/plugins/`)**
 
 Extensible plugin architecture for authentication, authorization, and transformations:
 
-**20 Plugins Implemented**:
-- **Authentication**: `jwt_auth`, `key_auth`, `basic_auth`, `oauth2_auth`, `hmac_auth`
+**23 Plugins Registered**:
+- **Authentication**: `jwt_auth`, `key_auth`, `basic_auth`, `oauth2_auth`, `hmac_auth`, `mtls_auth`
 - **Authorization**: `access_control`, `ip_restriction`
 - **Security**: `cors`, `bot_detection`
 - **Rate Limiting**: `rate_limiting`
-- **Transformation**: `request_transformer`, `response_transformer`, `request_termination`, `body_validator`
+- **Transformation**: `request_transformer`, `response_transformer`, `request_termination`, `body_validator`, `graphql`
+- **Caching**: `response_caching`
 - **Observability**: `stdout_logging`, `http_logging`, `transaction_debugger`, `correlation_id`, `prometheus_metrics`, `otel_tracing`
 
 **Plugin Lifecycle**:
@@ -306,7 +352,7 @@ Extensible plugin architecture for authentication, authorization, and transforma
 2. **Response Phase**: Logging → Metrics
 3. **Error Phase**: Error handling and logging
 
-### **5. Admin API (`src/admin/`)**
+### **6. Admin API (`src/admin/`)**
 
 RESTful API for dynamic configuration management:
 
@@ -314,38 +360,45 @@ RESTful API for dynamic configuration management:
 - `/proxies` - Proxy CRUD operations
 - `/consumers` - Consumer management
 - `/plugins` - Plugin configuration
+- `/upstreams` - Upstream CRUD operations
+- `/health` - Health check endpoint
+- `/backup` and `/restore` - Configuration backup/restore
 - JWT-based authentication and authorization
 
-### **6. Operating Modes (`src/modes/`)**
+### **7. Operating Modes (`src/modes/`)**
 
-Four distinct operating modes for different deployment scenarios:
+Five operating modes for different deployment scenarios:
 
 #### **Database Mode (`database.rs`)**
 - Single gateway instance with database storage
-- Periodic configuration polling
-- Admin API included
+- Periodic configuration polling with incremental updates
+- Full admin API included
 - **Use Case**: Small to medium deployments
 
 #### **File Mode (`file.rs`)**
-- Configuration from local files
-- SIGHUP-based reloading
-- No Admin API
+- Configuration from local YAML/JSON files
+- SIGHUP-based reloading (Unix only)
+- Read-only admin API
 - **Use Case**: Development, immutable infrastructure
 
 #### **Control Plane Mode (`control_plane.rs`)**
 - Centralized configuration management
-- Database integration
-- gRPC configuration distribution
+- Database integration with incremental polling
+- gRPC configuration distribution to Data Planes
 - No proxy traffic handling
 - **Use Case**: Distributed deployments
 
 #### **Data Plane Mode (`data_plane.rs`)**
 - Proxy traffic only
 - gRPC configuration from Control Plane
-- Read-only Admin API served from cached config
+- Read-only admin API served from cached config
 - **Use Case**: Scalable traffic processing
 
-### **6.1 Data Source Resiliency**
+#### **Migrate Mode (`migrate.rs`)**
+- Runs database schema migrations then exits
+- **Use Case**: CI/CD deployment pipelines
+
+### **7.1 Data Source Resiliency**
 
 The gateway is designed to continue operating indefinitely when its data source becomes unavailable. Configuration is loaded into memory once and all request-path operations use the in-memory cache — no per-request database or file access.
 
@@ -372,7 +425,7 @@ Fallback responses include an `X-Data-Source: cached` header so callers can dete
 
 The `/health` endpoint reports `cached_config` status including availability, `loaded_at` timestamp, and proxy/consumer counts, providing operational visibility during outages.
 
-### **7. DNS System (`src/dns/`)**
+### **8. DNS System (`src/dns/`)**
 
 Async DNS resolution with caching designed to keep lookups off the hot request path:
 
@@ -380,36 +433,37 @@ Async DNS resolution with caching designed to keep lookups off the hot request p
 - In-memory `DashMap` caching with configurable TTL
 - **Startup warmup** — resolves all proxy backend, upstream target, and plugin endpoint hostnames (deduplicated) before accepting requests
 - **Background refresh** — proactively re-resolves entries at 75% TTL before expiration
-- **`DnsCacheResolver` / `DnsCacheResolver`** — custom `reqwest::dns::Resolve` implementations that route all HTTP client DNS lookups (proxy backends, health checks, and plugin outbound calls) through the cache, keeping DNS off the hot request path
+- **`DnsCacheResolver`** — custom `reqwest::dns::Resolve` implementation that routes all HTTP client DNS lookups (proxy backends, health checks, and plugin outbound calls) through the cache, keeping DNS off the hot request path
 - Static DNS overrides (global and per-proxy)
 - Per-proxy DNS configuration and TTL overrides
 - Graceful degradation on resolution failures
 
-### **8. Load Balancer (`src/load_balancer.rs`)**
+### **9. Service Discovery (`src/service_discovery/`)**
 
-Five load balancing algorithms for distributing traffic across backend targets:
+Dynamic upstream target discovery from external registries:
 
-- **RoundRobin** (default) - Sequential distribution
-- **WeightedRoundRobin** - Weight-based distribution
-- **LeastConnections** - Routes to the target with fewest active connections
-- **ConsistentHashing** - Hash-based routing with configurable hash_on field
-- **Random** - Random target selection
+- **DNS-SD** (`dns_sd.rs`) — SRV record-based discovery
+- **Kubernetes** (`kubernetes.rs`) — Kubernetes API-based endpoint discovery
+- **Consul** (`consul.rs`) — Consul service catalog discovery
 
-Integrates with health checking to skip unhealthy targets.
+Discovered targets are merged with static upstream targets and fed into the load balancer.
 
-### **9. Health Checker (`src/health_check.rs`)**
+### **10. Secrets Management (`src/secrets/`)**
 
-Active and passive backend health checking:
+Pluggable secret resolution for configuration values:
 
-- **Active checks**: Periodic HTTP/HTTPS probes with configurable path, method, expected status, timeout, and interval
-- **Passive checks**: Monitors HTTP status codes from proxied requests with windowed failure counting
-- **Unhealthy target tracking**: DashMap-based, integrates with load balancer to skip failing backends
+- **Environment variables** (`env.rs`) — resolve secrets from environment
+- **File** (`file.rs`) — resolve secrets from files on disk
+- **AWS Secrets Manager** (`aws.rs`) — resolve secrets from AWS
+- **Azure Key Vault** (`azure.rs`) — resolve secrets from Azure
+- **GCP Secret Manager** (`gcp.rs`) — resolve secrets from GCP
+- **HashiCorp Vault** (`vault.rs`) — resolve secrets from Vault
 
-### **10. Circuit Breaker (`src/circuit_breaker.rs`)**
+### **11. Circuit Breaker (`src/circuit_breaker.rs`)**
 
 Three-state circuit breaker pattern (Closed/Open/Half-Open) to prevent cascading failures. Configurable failure and success thresholds, timeout for Open-to-Half-Open transitions, and max probe requests in Half-Open state.
 
-### **11. Retry Logic (`src/retry.rs`)**
+### **12. Retry Logic (`src/retry.rs`)**
 
 Configurable retry logic with backoff strategies:
 
@@ -454,7 +508,7 @@ When configuration changes (database poll, SIGHUP, or gRPC push), all caches are
 
 In-flight requests continue using the previous config snapshot via Arc reference counting — zero disruption during reload.
 
-## 🔄 Request Flow
+## Request Flow
 
 ### **HTTP Request Processing**
 
@@ -500,7 +554,7 @@ All WebSocket connections go through the full plugin authentication pipeline —
 6. Bidirectional Proxying
 ```
 
-## 🔧 Configuration Hierarchy
+## Configuration Hierarchy
 
 Configuration follows a clear priority order:
 
@@ -524,7 +578,7 @@ export FERRUM_BACKEND_TLS_CLIENT_CERT_PATH="/path/to/global-cert.pem"
 export FERRUM_BACKEND_TLS_CLIENT_KEY_PATH="/path/to/global-key.pem"
 ```
 
-## 🧪 Testing Strategy
+## Testing Strategy
 
 The project uses comprehensive testing at multiple levels:
 
@@ -544,22 +598,23 @@ The project uses comprehensive testing at multiple levels:
 - Test plugin lifecycle and configuration
 
 ### **Performance Testing**
-- `tests/performance/` directory contains performance benchmarks
-- Automated performance regression testing
-- Load testing scenarios
+- `tests/performance/` directory contains wrk-based performance benchmarks
+- `tests/performance/multi_protocol/` contains multi-protocol benchmark suite (HTTP/1.1, HTTP/2, HTTP/3, gRPC, TCP, UDP, WebSocket)
+- Automated performance regression testing in CI
+- Baseline comparison with `compare_baselines.py`
 
-## 🚀 Getting Started for New Developers
+## Getting Started for New Developers
 
 ### **1. Development Setup**
 
 ```bash
 # Clone and build
-git clone https://github.com/your-org/ferrum-gateway.git
+git clone https://github.com/QuickLaunchWeb/ferrum-gateway.git
 cd ferrum-gateway
 cargo build
 
 # Run tests
-cargo test
+cargo test --all-features
 
 # Start with example config
 FERRUM_MODE=file \
@@ -580,19 +635,22 @@ cargo run
 #### **New Plugin**
 1. Create plugin file in `src/plugins/`
 2. Implement `Plugin` trait
-3. Add to plugin registry in `src/plugins/mod.rs`
-4. Add configuration to `src/config/types.rs`
-5. Write tests in `tests/`
+3. Add a priority constant in `src/plugins/mod.rs`
+4. Override `supported_protocols()` to declare protocol support
+5. Register in the plugin registry (`create_plugin()` match arm in `mod.rs`)
+6. Add unit tests in `tests/unit/plugins/`
+7. Update `FEATURES.md`, `README.md`, and `docs/plugin_execution_order.md`
 
 #### **New Configuration Option**
-1. Add field to appropriate struct in `src/config/types.rs`
+1. Add field to appropriate struct in `src/config/types.rs` with `#[serde(default)]`
 2. Add environment variable parsing in `src/config/env_config.rs`
-3. Update documentation
-4. Add tests
+3. If database-stored: update migration in `src/config/migrations/` and `db_loader.rs`
+4. Update `openapi.yaml` if the Admin API exposes it
+5. Add tests
 
 #### **New Admin API Endpoint**
-1. Add handler in `src/admin/handlers/`
-2. Register route in `src/admin/mod.rs`
+1. Add handler in `src/admin/mod.rs`
+2. Register route in admin router
 3. Add authentication/authorization as needed
 4. Write integration tests
 
@@ -604,6 +662,7 @@ cargo run
 - Update documentation for API changes
 - Use `anyhow` for error handling
 - Prefer async/await for I/O operations
+- No `.unwrap()` or `.expect()` in production code
 
 ### **5. Common Patterns**
 
@@ -639,7 +698,7 @@ pub struct MyConfig {
 }
 ```
 
-## 🔄 Development Workflow
+## Development Workflow
 
 ### **1. Feature Development**
 1. Create feature branch from `main`
@@ -650,17 +709,18 @@ pub struct MyConfig {
 
 ### **2. Testing**
 ```bash
-# Run all tests
-cargo test
+# Unit tests
+cargo test --test unit_tests --all-features
 
-# Run specific test
-cargo test test_name
+# Integration tests
+cargo test --test integration_tests --test admin_cached_config_tests --all-features
 
-# Run with output
-cargo test -- --nocapture
+# Functional / E2E tests (requires binary build)
+cargo build --bin ferrum-gateway
+cargo test --test functional_tests --all-features -- --ignored
 
-# Run integration tests
-cargo test --test '*'
+# All tests
+cargo test --all-features
 ```
 
 ### **3. Building**
@@ -670,28 +730,11 @@ cargo build
 
 # Release build
 cargo build --release
-
-# Run WebSocket test server
-cargo test --test websocket_echo_server -- --nocapture
 ```
 
-## 📚 Additional Resources
+## Additional Resources
 
-- **`IMPLEMENTATION_ANALYSIS.md`** - Detailed implementation status
 - **`docs/`** - Feature-specific documentation (TLS, DNS, CORS, Docker, CI/CD, etc.)
 - **`tests/README.md`** - Test suite documentation
 - **`tests/performance/README.md`** - Performance testing guide
 - **`comparison/README.md`** - API gateway comparison benchmarks
-
-## 🤝 Contributing
-
-We welcome contributions! Please:
-
-1. Read this architecture guide first
-2. Check existing issues and pull requests
-3. Follow the code style guidelines
-4. Write comprehensive tests
-5. Update documentation
-6. Ensure all tests pass before submitting
-
-For questions or guidance, reach out through GitHub issues or discussions.
