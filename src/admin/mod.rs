@@ -2169,6 +2169,17 @@ async fn handle_batch_create(
                 for c in &mut consumers {
                     if c.id.is_empty() {
                         c.id = Uuid::new_v4().to_string();
+                    } else if let Err(msg) = validate_resource_id(&c.id) {
+                        errors.push(format!("Consumer '{}': {}", c.id, msg));
+                    }
+                    if c.username.trim().is_empty() {
+                        errors.push(format!("Consumer '{}': username must not be empty", c.id));
+                    }
+                    // Normalize custom_id: treat empty string as None
+                    if let Some(ref cid) = c.custom_id
+                        && cid.trim().is_empty()
+                    {
+                        c.custom_id = None;
                     }
                     c.created_at = now;
                     c.updated_at = now;
@@ -2176,9 +2187,11 @@ async fn handle_batch_create(
                         errors.push(format!("Consumer '{}': {}", c.id, e));
                     }
                 }
-                match db.batch_create_consumers(&consumers).await {
-                    Ok(n) => created_consumers = n,
-                    Err(e) => errors.push(format!("consumers: {}", e)),
+                if errors.is_empty() {
+                    match db.batch_create_consumers(&consumers).await {
+                        Ok(n) => created_consumers = n,
+                        Err(e) => errors.push(format!("consumers: {}", e)),
+                    }
                 }
             }
             Err(e) => errors.push(format!("consumers parse error: {}", e)),
@@ -2193,13 +2206,23 @@ async fn handle_batch_create(
                 for u in &mut upstreams {
                     if u.id.is_empty() {
                         u.id = Uuid::new_v4().to_string();
+                    } else if let Err(msg) = validate_resource_id(&u.id) {
+                        errors.push(format!("Upstream '{}': {}", u.id, msg));
+                    }
+                    if u.targets.is_empty() && u.service_discovery.is_none() {
+                        errors.push(format!(
+                            "Upstream '{}': must have at least one target or service_discovery",
+                            u.id
+                        ));
                     }
                     u.created_at = now;
                     u.updated_at = now;
                 }
-                match db.batch_create_upstreams(&upstreams).await {
-                    Ok(n) => created_upstreams = n,
-                    Err(e) => errors.push(format!("upstreams: {}", e)),
+                if errors.is_empty() {
+                    match db.batch_create_upstreams(&upstreams).await {
+                        Ok(n) => created_upstreams = n,
+                        Err(e) => errors.push(format!("upstreams: {}", e)),
+                    }
                 }
             }
             Err(e) => errors.push(format!("upstreams parse error: {}", e)),
@@ -2214,13 +2237,55 @@ async fn handle_batch_create(
                 for p in &mut proxies {
                     if p.id.is_empty() {
                         p.id = Uuid::new_v4().to_string();
+                    } else if let Err(msg) = validate_resource_id(&p.id) {
+                        errors.push(format!("Proxy '{}': {}", p.id, msg));
+                    }
+                    if p.listen_path.is_empty() {
+                        errors.push(format!("Proxy '{}': listen_path must be non-empty", p.id));
+                    } else if p.listen_path.starts_with('~') {
+                        // Validate regex compilation
+                        let pattern = &p.listen_path[1..];
+                        if pattern.is_empty() {
+                            errors.push(format!(
+                                "Proxy '{}': regex listen_path '~' has empty pattern",
+                                p.id
+                            ));
+                        } else {
+                            let anchored = if pattern.starts_with('^') {
+                                pattern.to_string()
+                            } else {
+                                format!("^{}", pattern)
+                            };
+                            if let Err(e) = regex::Regex::new(&anchored) {
+                                errors.push(format!(
+                                    "Proxy '{}': invalid regex listen_path: {}",
+                                    p.id, e
+                                ));
+                            }
+                        }
+                    } else if !p.listen_path.starts_with('/') {
+                        errors.push(format!(
+                            "Proxy '{}': listen_path must start with '/' or '~' (regex)",
+                            p.id
+                        ));
+                    }
+                    // Normalize and validate hosts
+                    for host in &mut p.hosts {
+                        *host = host.to_lowercase();
+                    }
+                    for host in &p.hosts {
+                        if let Err(msg) = crate::config::types::validate_host_entry(host) {
+                            errors.push(format!("Proxy '{}': {}", p.id, msg));
+                        }
                     }
                     p.created_at = now;
                     p.updated_at = now;
                 }
-                match db.batch_create_proxies(&proxies).await {
-                    Ok(n) => created_proxies = n,
-                    Err(e) => errors.push(format!("proxies: {}", e)),
+                if errors.is_empty() {
+                    match db.batch_create_proxies(&proxies).await {
+                        Ok(n) => created_proxies = n,
+                        Err(e) => errors.push(format!("proxies: {}", e)),
+                    }
                 }
             }
             Err(e) => errors.push(format!("proxies parse error: {}", e)),
@@ -2231,17 +2296,40 @@ async fn handle_batch_create(
     if let Some(pcs_val) = batch.get("plugin_configs") {
         match serde_json::from_value::<Vec<PluginConfig>>(pcs_val.clone()) {
             Ok(mut pcs) => {
+                let known_plugins = crate::plugins::available_plugins();
                 let now = Utc::now();
                 for pc in &mut pcs {
                     if pc.id.is_empty() {
                         pc.id = Uuid::new_v4().to_string();
+                    } else if let Err(msg) = validate_resource_id(&pc.id) {
+                        errors.push(format!("PluginConfig '{}': {}", pc.id, msg));
+                    }
+                    if !known_plugins.contains(&pc.plugin_name.as_str()) {
+                        errors.push(format!(
+                            "PluginConfig '{}': unknown plugin name '{}'",
+                            pc.id, pc.plugin_name
+                        ));
+                    }
+                    if pc.scope == PluginScope::Proxy && pc.proxy_id.is_none() {
+                        errors.push(format!(
+                            "PluginConfig '{}': scope 'proxy' requires proxy_id",
+                            pc.id
+                        ));
+                    }
+                    if pc.scope == PluginScope::Global && pc.proxy_id.is_some() {
+                        errors.push(format!(
+                            "PluginConfig '{}': scope 'global' must not have proxy_id",
+                            pc.id
+                        ));
                     }
                     pc.created_at = now;
                     pc.updated_at = now;
                 }
-                match db.batch_create_plugin_configs(&pcs).await {
-                    Ok(n) => created_plugin_configs = n,
-                    Err(e) => errors.push(format!("plugin_configs: {}", e)),
+                if errors.is_empty() {
+                    match db.batch_create_plugin_configs(&pcs).await {
+                        Ok(n) => created_plugin_configs = n,
+                        Err(e) => errors.push(format!("plugin_configs: {}", e)),
+                    }
                 }
             }
             Err(e) => errors.push(format!("plugin_configs parse error: {}", e)),
