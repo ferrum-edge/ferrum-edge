@@ -402,29 +402,25 @@ pub async fn run(
                         ).await {
                             Ok(result) => {
                                 let poll_ts = result.poll_timestamp;
-                                // Update known IDs before applying (add new, remove deleted)
-                                update_known_ids(
-                                    &mut known_proxy_ids,
-                                    &result.added_or_modified_proxies.iter().map(|p| p.id.clone()).collect(),
-                                    &result.removed_proxy_ids,
-                                );
-                                update_known_ids(
-                                    &mut known_consumer_ids,
-                                    &result.added_or_modified_consumers.iter().map(|c| c.id.clone()).collect(),
-                                    &result.removed_consumer_ids,
-                                );
-                                update_known_ids(
-                                    &mut known_plugin_config_ids,
-                                    &result.added_or_modified_plugin_configs.iter().map(|pc| pc.id.clone()).collect(),
-                                    &result.removed_plugin_config_ids,
-                                );
-                                update_known_ids(
-                                    &mut known_upstream_ids,
-                                    &result.added_or_modified_upstreams.iter().map(|u| u.id.clone()).collect(),
-                                    &result.removed_upstream_ids,
-                                );
+                                // Collect ID changes before moving result into apply_incremental
+                                let added_proxy_ids: Vec<String> = result.added_or_modified_proxies.iter().map(|p| p.id.clone()).collect();
+                                let removed_proxy_ids = result.removed_proxy_ids.clone();
+                                let added_consumer_ids: Vec<String> = result.added_or_modified_consumers.iter().map(|c| c.id.clone()).collect();
+                                let removed_consumer_ids = result.removed_consumer_ids.clone();
+                                let added_plugin_config_ids: Vec<String> = result.added_or_modified_plugin_configs.iter().map(|pc| pc.id.clone()).collect();
+                                let removed_plugin_config_ids = result.removed_plugin_config_ids.clone();
+                                let added_upstream_ids: Vec<String> = result.added_or_modified_upstreams.iter().map(|u| u.id.clone()).collect();
+                                let removed_upstream_ids = result.removed_upstream_ids.clone();
 
                                 if proxy_state_poll.apply_incremental(result) {
+                                    // Update known IDs only after successful apply to keep them
+                                    // in sync with actual proxy state. If apply is rejected
+                                    // (e.g. security plugin validation), known_ids stay unchanged
+                                    // so the next poll re-fetches the same changes.
+                                    update_known_ids(&mut known_proxy_ids, &added_proxy_ids, &removed_proxy_ids);
+                                    update_known_ids(&mut known_consumer_ids, &added_consumer_ids, &removed_consumer_ids);
+                                    update_known_ids(&mut known_plugin_config_ids, &added_plugin_config_ids, &removed_plugin_config_ids);
+                                    update_known_ids(&mut known_upstream_ids, &added_upstream_ids, &removed_upstream_ids);
                                     debug!("Incremental config reload complete");
                                 }
                                 last_poll_at = Some(poll_ts);

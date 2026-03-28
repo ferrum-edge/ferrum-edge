@@ -513,6 +513,12 @@ async fn handle_create_proxy(
                 &json!({"error": "regex listen_path '~' has empty pattern"}),
             ));
         }
+        if pattern.len() > 1024 {
+            return Ok(json_response(
+                StatusCode::BAD_REQUEST,
+                &json!({"error": "regex listen_path pattern must not exceed 1024 characters"}),
+            ));
+        }
         let anchored = if pattern.starts_with('^') {
             pattern.to_string()
         } else {
@@ -570,7 +576,7 @@ async fn handle_create_proxy(
         Err(e) => {
             return Ok(json_response(
                 StatusCode::SERVICE_UNAVAILABLE,
-                &json!({"error": format!("Database error: {}", e)}),
+                &db_error_response(&e),
             ));
         }
     }
@@ -603,7 +609,7 @@ async fn handle_create_proxy(
         Err(e) => {
             return Ok(json_response(
                 StatusCode::SERVICE_UNAVAILABLE,
-                &json!({"error": format!("Database error: {}", e)}),
+                &db_error_response(&e),
             ));
         }
     }
@@ -621,7 +627,7 @@ async fn handle_create_proxy(
             Err(e) => {
                 return Ok(json_response(
                     StatusCode::SERVICE_UNAVAILABLE,
-                    &json!({"error": format!("Database error: {}", e)}),
+                    &db_error_response(&e),
                 ));
             }
         }
@@ -640,7 +646,7 @@ async fn handle_create_proxy(
             Err(e) => {
                 return Ok(json_response(
                     StatusCode::SERVICE_UNAVAILABLE,
-                    &json!({"error": format!("Database error: {}", e)}),
+                    &db_error_response(&e),
                 ));
             }
         }
@@ -665,6 +671,12 @@ async fn handle_create_proxy(
                 ));
             }
             _ => {}
+        }
+        if proxy.response_body_mode != crate::config::types::ResponseBodyMode::Stream {
+            return Ok(json_response(
+                StatusCode::BAD_REQUEST,
+                &json!({"error": "Stream proxies (TCP/UDP) must use response_body_mode 'stream'"}),
+            ));
         }
     } else if proxy.listen_port.is_some() {
         return Ok(json_response(
@@ -774,6 +786,12 @@ async fn handle_update_proxy(
                 &json!({"error": "regex listen_path '~' has empty pattern"}),
             ));
         }
+        if pattern.len() > 1024 {
+            return Ok(json_response(
+                StatusCode::BAD_REQUEST,
+                &json!({"error": "regex listen_path pattern must not exceed 1024 characters"}),
+            ));
+        }
         let anchored = if pattern.starts_with('^') {
             pattern.to_string()
         } else {
@@ -857,7 +875,7 @@ async fn handle_update_proxy(
             Err(e) => {
                 return Ok(json_response(
                     StatusCode::SERVICE_UNAVAILABLE,
-                    &json!({"error": format!("Database error: {}", e)}),
+                    &db_error_response(&e),
                 ));
             }
         }
@@ -876,7 +894,7 @@ async fn handle_update_proxy(
             Err(e) => {
                 return Ok(json_response(
                     StatusCode::SERVICE_UNAVAILABLE,
-                    &json!({"error": format!("Database error: {}", e)}),
+                    &db_error_response(&e),
                 ));
             }
         }
@@ -901,6 +919,12 @@ async fn handle_update_proxy(
                 ));
             }
             _ => {}
+        }
+        if proxy.response_body_mode != crate::config::types::ResponseBodyMode::Stream {
+            return Ok(json_response(
+                StatusCode::BAD_REQUEST,
+                &json!({"error": "Stream proxies (TCP/UDP) must use response_body_mode 'stream'"}),
+            ));
         }
     } else if proxy.listen_port.is_some() {
         return Ok(json_response(
@@ -1056,11 +1080,17 @@ async fn handle_create_consumer(
         ));
     }
 
-    // Validate username is non-empty
+    // Validate username is non-empty and within length limits
     if consumer.username.trim().is_empty() {
         return Ok(json_response(
             StatusCode::BAD_REQUEST,
             &json!({"error": "Consumer username must not be empty"}),
+        ));
+    }
+    if consumer.username.len() > 255 {
+        return Ok(json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"error": "Consumer username must not exceed 255 characters"}),
         ));
     }
 
@@ -1086,7 +1116,7 @@ async fn handle_create_consumer(
         Err(e) => {
             return Ok(json_response(
                 StatusCode::SERVICE_UNAVAILABLE,
-                &json!({"error": format!("Database error: {}", e)}),
+                &db_error_response(&e),
             ));
         }
     }
@@ -1114,7 +1144,7 @@ async fn handle_create_consumer(
             Err(e) => {
                 return Ok(json_response(
                     StatusCode::SERVICE_UNAVAILABLE,
-                    &json!({"error": format!("Database error: {}", e)}),
+                    &db_error_response(&e),
                 ));
             }
         }
@@ -1135,7 +1165,7 @@ async fn handle_create_consumer(
             Err(e) => {
                 return Ok(json_response(
                     StatusCode::SERVICE_UNAVAILABLE,
-                    &json!({"error": format!("Database error: {}", e)}),
+                    &db_error_response(&e),
                 ));
             }
         }
@@ -1271,7 +1301,7 @@ async fn handle_update_consumer(
             Err(e) => {
                 return Ok(json_response(
                     StatusCode::SERVICE_UNAVAILABLE,
-                    &json!({"error": format!("Database error: {}", e)}),
+                    &db_error_response(&e),
                 ));
             }
         }
@@ -1292,7 +1322,7 @@ async fn handle_update_consumer(
             Err(e) => {
                 return Ok(json_response(
                     StatusCode::SERVICE_UNAVAILABLE,
-                    &json!({"error": format!("Database error: {}", e)}),
+                    &db_error_response(&e),
                 ));
             }
         }
@@ -1350,6 +1380,16 @@ async fn handle_delete_consumer(
     }
 }
 
+/// Allowed credential types for consumer authentication plugins.
+pub const ALLOWED_CREDENTIAL_TYPES: &[&str] = &[
+    "basicauth",
+    "keyauth",
+    "jwt_auth",
+    "hmac_auth",
+    "oauth2",
+    "mtls_auth",
+];
+
 async fn handle_update_credentials(
     state: &AdminState,
     consumer_id: &str,
@@ -1362,6 +1402,18 @@ async fn handle_update_credentials(
             &json!({"error": "Admin API is in read-only mode"}),
         ));
     }
+
+    // Validate credential type against whitelist
+    if !ALLOWED_CREDENTIAL_TYPES.contains(&cred_type) {
+        return Ok(json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"error": format!(
+                "Unknown credential type '{}'. Allowed types: {:?}",
+                cred_type, ALLOWED_CREDENTIAL_TYPES
+            )}),
+        ));
+    }
+
     let db = match &state.db {
         Some(db) => db,
         None => {
@@ -1419,7 +1471,7 @@ async fn handle_update_credentials(
                     Err(e) => {
                         return Ok(json_response(
                             StatusCode::SERVICE_UNAVAILABLE,
-                            &json!({"error": format!("Database error: {}", e)}),
+                            &db_error_response(&e),
                         ));
                     }
                 }
@@ -1442,7 +1494,7 @@ async fn handle_update_credentials(
                     Err(e) => {
                         return Ok(json_response(
                             StatusCode::SERVICE_UNAVAILABLE,
-                            &json!({"error": format!("Database error: {}", e)}),
+                            &db_error_response(&e),
                         ));
                     }
                 }
@@ -1485,6 +1537,18 @@ async fn handle_delete_credentials(
             &json!({"error": "Admin API is in read-only mode"}),
         ));
     }
+
+    // Validate credential type against whitelist
+    if !ALLOWED_CREDENTIAL_TYPES.contains(&cred_type) {
+        return Ok(json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"error": format!(
+                "Unknown credential type '{}'. Allowed types: {:?}",
+                cred_type, ALLOWED_CREDENTIAL_TYPES
+            )}),
+        ));
+    }
+
     let db = match &state.db {
         Some(db) => db,
         None => {
@@ -1612,7 +1676,7 @@ async fn handle_create_plugin_config(
         Err(e) => {
             return Ok(json_response(
                 StatusCode::SERVICE_UNAVAILABLE,
-                &json!({"error": format!("Database error: {}", e)}),
+                &db_error_response(&e),
             ));
         }
     }
@@ -1638,6 +1702,25 @@ async fn handle_create_plugin_config(
             StatusCode::BAD_REQUEST,
             &json!({"error": "Plugin with scope 'global' must not have a proxy_id"}),
         ));
+    }
+    // Validate proxy_id references an existing proxy
+    if let Some(ref proxy_id) = pc.proxy_id {
+        match db.get_proxy(proxy_id).await {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                return Ok(json_response(
+                    StatusCode::BAD_REQUEST,
+                    &json!({"error": format!("proxy_id '{}' does not exist", proxy_id)}),
+                ));
+            }
+            Err(e) => {
+                error!("Database error checking proxy_id reference: {}", e);
+                return Ok(json_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    &json!({"error": "Database error checking proxy reference"}),
+                ));
+            }
+        }
     }
 
     pc.created_at = Utc::now();
@@ -1749,6 +1832,25 @@ async fn handle_update_plugin_config(
             StatusCode::BAD_REQUEST,
             &json!({"error": "Plugin with scope 'global' must not have a proxy_id"}),
         ));
+    }
+    // Validate proxy_id references an existing proxy
+    if let Some(ref proxy_id) = pc.proxy_id {
+        match db.get_proxy(proxy_id).await {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                return Ok(json_response(
+                    StatusCode::BAD_REQUEST,
+                    &json!({"error": format!("proxy_id '{}' does not exist", proxy_id)}),
+                ));
+            }
+            Err(e) => {
+                error!("Database error checking proxy_id reference: {}", e);
+                return Ok(json_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    &json!({"error": "Database error checking proxy reference"}),
+                ));
+            }
+        }
     }
 
     match db.update_plugin_config(&pc).await {
@@ -1883,7 +1985,7 @@ async fn handle_create_upstream(
         Err(e) => {
             return Ok(json_response(
                 StatusCode::SERVICE_UNAVAILABLE,
-                &json!({"error": format!("Database error: {}", e)}),
+                &db_error_response(&e),
             ));
         }
     }
@@ -1908,7 +2010,7 @@ async fn handle_create_upstream(
             Err(e) => {
                 return Ok(json_response(
                     StatusCode::SERVICE_UNAVAILABLE,
-                    &json!({"error": format!("Database error: {}", e)}),
+                    &db_error_response(&e),
                 ));
             }
         }
@@ -2018,7 +2120,7 @@ async fn handle_update_upstream(
             Err(e) => {
                 return Ok(json_response(
                     StatusCode::SERVICE_UNAVAILABLE,
-                    &json!({"error": format!("Database error: {}", e)}),
+                    &db_error_response(&e),
                 ));
             }
         }
@@ -2597,6 +2699,8 @@ fn parse_restore_confirm(query: Option<&str>) -> bool {
 #[derive(Deserialize)]
 struct RestorePayload {
     #[serde(default)]
+    version: String,
+    #[serde(default)]
     proxies: Vec<Proxy>,
     #[serde(default)]
     consumers: Vec<Consumer>,
@@ -2662,6 +2766,22 @@ async fn handle_restore(
             ));
         }
     };
+
+    // Validate config version compatibility when present
+    if !payload.version.is_empty()
+        && payload.version != crate::config::types::CURRENT_CONFIG_VERSION
+    {
+        return Ok(json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({
+                "error": format!(
+                    "Incompatible config version '{}'. This gateway expects version '{}'",
+                    payload.version,
+                    crate::config::types::CURRENT_CONFIG_VERSION
+                )
+            }),
+        ));
+    }
 
     info!(
         "Restore: parsed payload — {} proxies, {} consumers, {} plugin_configs, {} upstreams ({} bytes)",
@@ -2831,6 +2951,13 @@ fn json_response_with_stale(status: StatusCode, body: &Value) -> Response<Full<B
         })
 }
 
+/// Log a database error internally and return a generic error body for the client.
+/// Avoids leaking database schema details in API responses.
+fn db_error_response(e: &dyn std::fmt::Display) -> Value {
+    warn!("Database error in admin API: {}", e);
+    json!({"error": "Database operation failed"})
+}
+
 /// Check if a database error message indicates a unique constraint violation.
 ///
 /// Covers SQLite ("UNIQUE constraint failed"), PostgreSQL ("duplicate key value
@@ -2844,13 +2971,35 @@ fn is_unique_constraint_violation(error_msg: &str) -> bool {
 
 /// Create a copy of the consumer with sensitive credential values redacted
 /// for safe inclusion in API responses.
-fn redact_consumer_credentials(consumer: &Consumer) -> Consumer {
+pub fn redact_consumer_credentials(consumer: &Consumer) -> Consumer {
     let mut redacted = consumer.clone();
+    // Redact basicauth password hash
     if let Some(basic) = redacted.credentials.get_mut("basicauth")
         && let Some(obj) = basic.as_object_mut()
         && obj.contains_key("password_hash")
     {
         obj.insert("password_hash".to_string(), json!("[REDACTED]"));
+    }
+    // Redact HMAC auth secret
+    if let Some(hmac) = redacted.credentials.get_mut("hmac_auth")
+        && let Some(obj) = hmac.as_object_mut()
+        && obj.contains_key("secret")
+    {
+        obj.insert("secret".to_string(), json!("[REDACTED]"));
+    }
+    // Redact OAuth2 client secret
+    if let Some(oauth2) = redacted.credentials.get_mut("oauth2")
+        && let Some(obj) = oauth2.as_object_mut()
+        && obj.contains_key("client_secret")
+    {
+        obj.insert("client_secret".to_string(), json!("[REDACTED]"));
+    }
+    // Redact JWT auth secret
+    if let Some(jwt) = redacted.credentials.get_mut("jwt_auth")
+        && let Some(obj) = jwt.as_object_mut()
+        && obj.contains_key("secret")
+    {
+        obj.insert("secret".to_string(), json!("[REDACTED]"));
     }
     redacted
 }

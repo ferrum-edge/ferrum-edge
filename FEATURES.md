@@ -117,10 +117,13 @@ Ferrum supports dynamic upstream target discovery through three providers, confi
 
 - Admin REST API with JWT authentication and read-only mode
 - Full CRUD for proxies, consumers, plugin configs, and upstreams
+- Credential type whitelist enforcement on consumer credential endpoints
+- Config version validation on restore endpoint
+- Database error masking in API responses (internal details logged, not exposed)
 - Batch operations and full config backup/restore
 - Zero-downtime config reload via DB polling, SIGHUP, or CP push
 - Atomic config swap via ArcSwap (no partial config visible to requests)
-- Incremental database polling with indexed `updated_at` queries
+- Incremental database polling with indexed `updated_at` queries and full config validation
 
 ## Resilience
 

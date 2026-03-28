@@ -611,6 +611,38 @@ impl ProxyState {
 
         new_config.loaded_at = result.poll_timestamp;
 
+        // Validate the patched config before applying (same validations as load_full_config)
+        new_config.normalize_hosts();
+        if let Err(errors) = new_config.validate_hosts() {
+            for msg in &errors {
+                warn!("Incremental config validation: {}", msg);
+            }
+        }
+        if let Err(errors) = new_config.validate_regex_listen_paths() {
+            for msg in &errors {
+                error!("Incremental config rejected: {}", msg);
+            }
+            return false;
+        }
+        if let Err(errors) = new_config.validate_unique_listen_paths() {
+            for msg in &errors {
+                error!("Incremental config rejected: {}", msg);
+            }
+            return false;
+        }
+        if let Err(errors) = new_config.validate_stream_proxies() {
+            for msg in &errors {
+                error!("Incremental config rejected: {}", msg);
+            }
+            return false;
+        }
+        if let Err(errors) = new_config.validate_upstream_references() {
+            for msg in &errors {
+                warn!("Incremental config: {}", msg);
+            }
+        }
+        new_config.normalize_stream_proxy_paths();
+
         // Build a ConfigDelta to feed into existing cache apply_delta() methods.
         // For incremental results, we treat all changed resources as "modified"
         // since the DB layer doesn't distinguish adds from modifications.
@@ -697,13 +729,22 @@ impl ProxyState {
         // Store updated config
         self.config.store(Arc::new(new_config));
 
-        // Reconcile stream proxy listeners if any proxies changed
+        // Reconcile stream proxy listeners if any stream proxies changed
+        let removed_had_stream = if !delta.removed_proxy_ids.is_empty() {
+            let removed_set: std::collections::HashSet<&str> =
+                delta.removed_proxy_ids.iter().map(|s| s.as_str()).collect();
+            old_config.proxies.iter().any(|p| {
+                removed_set.contains(p.id.as_str()) && p.backend_protocol.is_stream_proxy()
+            })
+        } else {
+            false
+        };
         let stream_proxies_changed = delta
             .added_proxies
             .iter()
             .chain(delta.modified_proxies.iter())
             .any(|p| p.backend_protocol.is_stream_proxy())
-            || !delta.removed_proxy_ids.is_empty();
+            || removed_had_stream;
         if stream_proxies_changed {
             let slm = self.stream_listener_manager.clone();
             tokio::spawn(async move {

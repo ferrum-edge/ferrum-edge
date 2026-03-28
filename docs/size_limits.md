@@ -104,3 +104,19 @@ FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES=104857600  # 100MB
 FERRUM_MAX_BODY_SIZE_BYTES=0
 FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES=0
 ```
+
+## Configuration Field Limits
+
+Beyond request/response size limits, the Admin API enforces limits on individual configuration fields:
+
+| Field | Limit | Description |
+|-------|-------|-------------|
+| Proxy `listen_path` (regex) | 1024 chars | Maximum pattern length for regex routes (e.g., `~^/api/v\d+`) |
+| Consumer `username` | 255 chars | Maximum length for consumer usernames |
+| Credential type | Whitelist | Only `basicauth`, `keyauth`, `jwt_auth`, `hmac_auth`, `oauth2`, `mtls_auth` |
+
+These limits are enforced during:
+- Admin API `POST`/`PUT` operations on proxies and consumers
+- `PUT`/`DELETE` on `/consumers/{id}/credentials/{type}`
+- `POST /restore` — validation fails before any data is deleted
+- Database incremental polling — invalid configs are rejected before applying

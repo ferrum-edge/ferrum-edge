@@ -17,7 +17,7 @@ Returns the entire gateway configuration as a single JSON document. The output f
 
 ### Key Behaviors
 
-- **Unredacted credentials**: Unlike `GET /consumers`, the backup endpoint returns raw credential hashes (e.g., bcrypt `$2b$` or `hmac_sha256:` values). This is necessary for faithful restoration.
+- **Unredacted credentials**: Unlike `GET /consumers` (which redacts `basicauth.password_hash`, `hmac_auth.secret`, `oauth2.client_secret`, and `jwt_auth.secret`), the backup endpoint returns raw credential values. This is necessary for faithful restoration.
 - **Database-first with cached fallback**: Reads from the database when available. If the database is unreachable, falls back to the in-memory cached config and sets the `X-Data-Source: cached` response header.
 - **Content-Disposition header**: Includes `attachment; filename="ferrum-backup.json"` for browser-friendly downloads.
 - **Resource filtering**: Use `?resources=proxies,consumers` to export only specific resource types. Valid values: `proxies`, `consumers`, `plugin_configs`, `upstreams`. Omit the parameter to export everything.
@@ -67,7 +67,7 @@ cat ferrum-backup.json | jq '.counts'
 
 Replaces the entire gateway configuration with the provided backup payload. This is a **destructive operation**, but the payload is validated before any data is deleted:
 
-1. **Validates** the payload for internal consistency (resource ID uniqueness, consumer identity/credential uniqueness, regex listen_path compilation, listen_path+hosts uniqueness, stream proxy configuration, upstream references). If validation fails, the request returns `400` with detailed errors and **existing config is NOT deleted**.
+1. **Validates** the payload for internal consistency (config version compatibility, resource ID uniqueness, consumer identity/credential uniqueness, regex listen_path compilation and length limits, listen_path+hosts uniqueness, stream proxy configuration including response_body_mode, upstream references). If validation fails, the request returns `400` with detailed errors and **existing config is NOT deleted**.
 2. **Deletes** all existing proxies, consumers, plugin configs, upstreams, and junction table entries
 3. **Imports** the provided resources in dependency order
 
@@ -88,7 +88,7 @@ Accepts the same JSON format produced by `GET /backup`. All resource arrays are 
 }
 ```
 
-The `version`, `exported_at`, `source`, and `counts` metadata fields from a backup are silently ignored if present, so you can pass a backup response directly as the restore payload.
+The `exported_at`, `source`, and `counts` metadata fields from a backup are silently ignored if present, so you can pass a backup response directly as the restore payload. The `version` field, if present, is validated against the current config version — a mismatch returns `400 Bad Request`.
 
 ### Body Size Limit
 

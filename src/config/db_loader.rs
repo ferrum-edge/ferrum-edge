@@ -220,6 +220,9 @@ impl DatabaseStore {
 
     /// Load the full gateway configuration from the database.
     pub async fn load_full_config(&self) -> Result<GatewayConfig, anyhow::Error> {
+        // Capture timestamp before queries so the incremental polling safety
+        // margin covers the full load duration.
+        let loaded_at = Utc::now();
         let proxies = self.load_proxies().await?;
         let consumers = self.load_consumers().await?;
         let plugin_configs = self.load_plugin_configs().await?;
@@ -231,7 +234,7 @@ impl DatabaseStore {
             consumers,
             plugin_configs,
             upstreams,
-            loaded_at: Utc::now(),
+            loaded_at,
         };
 
         // Normalize host entries to lowercase
@@ -1201,7 +1204,7 @@ impl DatabaseStore {
         if !changed_ids.is_empty() {
             let changed_id_list: Vec<&str> = changed_ids.iter().map(|s| s.as_str()).collect();
 
-            let assoc_rows: Vec<AnyRow> = if changed_id_list.len() > 100 {
+            let assoc_rows: Vec<AnyRow> = if changed_id_list.len() > 500 {
                 // Too many IDs for an IN clause — fetch all and filter in memory
                 match sqlx::query("SELECT proxy_id, plugin_config_id FROM proxy_plugins")
                     .fetch_all(&self.pool)
