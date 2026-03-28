@@ -125,6 +125,8 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
     } = cfg;
     let addr = SocketAddr::new(bind_addr, port);
     let listener = tokio::net::TcpListener::bind(addr).await?;
+    // Convert to Arc<str> so per-connection clones are a cheap pointer bump.
+    let proxy_id: Arc<str> = Arc::from(proxy_id);
     info!(
         proxy_id = %proxy_id,
         "TCP proxy listener started on {}",
@@ -138,7 +140,7 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
         current_config
             .proxies
             .iter()
-            .find(|p| p.id == proxy_id)
+            .find(|p| *p.id == *proxy_id)
             .filter(|p| p.backend_protocol == BackendProtocol::TcpTls)
             .map(|proxy| {
                 CachedBackendTlsConfig::build(proxy, tls_no_verify)
@@ -190,7 +192,6 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
                         &dns_cache,
                         &lb_cache,
                         frontend_tls.as_ref(),
-                        tls_no_verify,
                         backend_tls.as_deref(),
                     )
                     .await;
@@ -229,6 +230,17 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
     }
 }
 
+/// Lightweight snapshot of the proxy fields needed per TCP connection.
+/// Avoids cloning the entire `Proxy` struct on every accepted connection.
+struct TcpConnParams {
+    backend_host: String,
+    backend_port: u16,
+    backend_protocol: BackendProtocol,
+    dns_override: Option<String>,
+    dns_cache_ttl_seconds: Option<u64>,
+    backend_connect_timeout_ms: u64,
+}
+
 /// Handle a single TCP connection: TLS termination → backend resolution → bidirectional copy.
 #[allow(clippy::too_many_arguments)]
 async fn handle_tcp_connection(
@@ -239,34 +251,45 @@ async fn handle_tcp_connection(
     dns_cache: &DnsCache,
     lb_cache: &LoadBalancerCache,
     frontend_tls_config: Option<&Arc<rustls::ServerConfig>>,
-    tls_no_verify: bool,
     cached_backend_tls: Option<&CachedBackendTlsConfig>,
 ) -> Result<(u64, u64, Duration), anyhow::Error> {
     let start = Instant::now();
     let _ = client_stream.set_nodelay(true);
 
-    // Look up the proxy config
-    let current_config = config.load();
-    let proxy = current_config
-        .proxies
-        .iter()
-        .find(|p| p.id == proxy_id)
-        .ok_or_else(|| anyhow::anyhow!("Proxy {} not found in config", proxy_id))?
-        .clone();
+    // Look up the proxy config and extract only the fields we need.
+    // The ArcSwap guard (and full Proxy) is dropped before any async work.
+    let params = {
+        let current_config = config.load();
+        let proxy = current_config
+            .proxies
+            .iter()
+            .find(|p| p.id == proxy_id)
+            .ok_or_else(|| anyhow::anyhow!("Proxy {} not found in config", proxy_id))?;
 
-    // Resolve backend target
-    let (backend_host, backend_port) = resolve_backend_target(&proxy, lb_cache)?;
+        let (backend_host, backend_port) = resolve_backend_target(proxy, lb_cache)?;
+
+        TcpConnParams {
+            backend_host,
+            backend_port,
+            backend_protocol: proxy.backend_protocol,
+            dns_override: proxy.dns_override.clone(),
+            dns_cache_ttl_seconds: proxy.dns_cache_ttl_seconds,
+            backend_connect_timeout_ms: proxy.backend_connect_timeout_ms,
+        }
+    };
 
     // Resolve backend IP via DNS
     let resolved_ip = dns_cache
         .resolve(
-            &backend_host,
-            proxy.dns_override.as_deref(),
-            proxy.dns_cache_ttl_seconds,
+            &params.backend_host,
+            params.dns_override.as_deref(),
+            params.dns_cache_ttl_seconds,
         )
         .await
-        .map_err(|e| anyhow::anyhow!("DNS resolution failed for {}: {}", backend_host, e))?;
-    let backend_addr = SocketAddr::new(resolved_ip, backend_port);
+        .map_err(|e| anyhow::anyhow!("DNS resolution failed for {}: {}", params.backend_host, e))?;
+    let backend_addr = SocketAddr::new(resolved_ip, params.backend_port);
+    let connect_timeout = Duration::from_millis(params.backend_connect_timeout_ms);
+    let is_backend_tls = params.backend_protocol == BackendProtocol::TcpTls;
 
     // Apply frontend TLS termination if configured
     if let Some(tls_config) = frontend_tls_config {
@@ -275,35 +298,32 @@ async fn handle_tcp_connection(
             anyhow::anyhow!("Frontend TLS handshake failed from {}: {}", remote_addr, e)
         })?;
 
-        // Connect to backend (with or without TLS origination)
-        if proxy.backend_protocol == BackendProtocol::TcpTls {
+        if is_backend_tls {
             let backend_stream = connect_backend_tls_cached(
                 backend_addr,
-                &backend_host,
-                &proxy,
-                tls_no_verify,
+                &params.backend_host,
+                connect_timeout,
                 cached_backend_tls,
             )
             .await?;
             bidirectional_copy(tls_stream, backend_stream).await
         } else {
-            let backend_stream = connect_backend_plain(backend_addr, &proxy).await?;
+            let backend_stream = connect_backend_plain(backend_addr, connect_timeout).await?;
             bidirectional_copy(tls_stream, backend_stream).await
         }
     } else {
         // No frontend TLS — raw TCP
-        if proxy.backend_protocol == BackendProtocol::TcpTls {
+        if is_backend_tls {
             let backend_stream = connect_backend_tls_cached(
                 backend_addr,
-                &backend_host,
-                &proxy,
-                tls_no_verify,
+                &params.backend_host,
+                connect_timeout,
                 cached_backend_tls,
             )
             .await?;
             bidirectional_copy(client_stream, backend_stream).await
         } else {
-            let backend_stream = connect_backend_plain(backend_addr, &proxy).await?;
+            let backend_stream = connect_backend_plain(backend_addr, connect_timeout).await?;
             bidirectional_copy(client_stream, backend_stream).await
         }
     }
@@ -325,13 +345,12 @@ fn resolve_backend_target(
     }
 }
 
-/// Connect to a plain TCP backend with the proxy's configured timeout.
+/// Connect to a plain TCP backend with the given connect timeout.
 async fn connect_backend_plain(
     addr: SocketAddr,
-    proxy: &Proxy,
+    connect_timeout: Duration,
 ) -> Result<TcpStream, anyhow::Error> {
-    let timeout = Duration::from_millis(proxy.backend_connect_timeout_ms);
-    let stream = tokio::time::timeout(timeout, TcpStream::connect(addr))
+    let stream = tokio::time::timeout(connect_timeout, TcpStream::connect(addr))
         .await
         .map_err(|_| anyhow::anyhow!("Backend connect timeout to {}", addr))?
         .map_err(|e| anyhow::anyhow!("Backend connect failed to {}: {}", addr, e))?;
@@ -344,20 +363,14 @@ async fn connect_backend_plain(
 async fn connect_backend_tls_cached(
     addr: SocketAddr,
     hostname: &str,
-    proxy: &Proxy,
-    tls_no_verify: bool,
+    connect_timeout: Duration,
     cached_tls: Option<&CachedBackendTlsConfig>,
 ) -> Result<tokio_rustls::client::TlsStream<TcpStream>, anyhow::Error> {
-    let tcp_stream = connect_backend_plain(addr, proxy).await?;
+    let tcp_stream = connect_backend_plain(addr, connect_timeout).await?;
 
-    let tls_config = if let Some(cached) = cached_tls {
-        // Fast path: use pre-built TLS config (no disk I/O)
-        cached.config.clone()
-    } else {
-        // Slow path: build TLS config from disk (fallback)
-        let built = CachedBackendTlsConfig::build(proxy, tls_no_verify)?;
-        built.config
-    };
+    let tls_config = cached_tls
+        .map(|c| c.config.clone())
+        .ok_or_else(|| anyhow::anyhow!("Backend TLS config not available for {}", addr))?;
 
     let connector = tokio_rustls::TlsConnector::from(tls_config);
     let server_name = rustls::pki_types::ServerName::try_from(hostname.to_string())
@@ -371,6 +384,11 @@ async fn connect_backend_tls_cached(
     Ok(tls_stream)
 }
 
+/// Buffer size for bidirectional TCP copy. 64 KiB reduces syscall overhead
+/// compared to the tokio default of 8 KiB, yielding significantly higher
+/// throughput for bulk TCP traffic.
+const TCP_COPY_BUF_SIZE: usize = 64 * 1024;
+
 /// Bidirectional stream copy between client and backend.
 /// Returns (bytes_client_to_backend, bytes_backend_to_client).
 async fn bidirectional_copy<C, B>(
@@ -381,9 +399,13 @@ where
     C: AsyncRead + AsyncWrite + Unpin,
     B: AsyncRead + AsyncWrite + Unpin,
 {
-    let (bytes_to_backend, bytes_to_client) =
-        tokio::io::copy_bidirectional(&mut client, &mut backend)
-            .await
-            .map_err(|e| anyhow::anyhow!("Bidirectional copy error: {}", e))?;
+    let (bytes_to_backend, bytes_to_client) = tokio::io::copy_bidirectional_with_sizes(
+        &mut client,
+        &mut backend,
+        TCP_COPY_BUF_SIZE,
+        TCP_COPY_BUF_SIZE,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("Bidirectional copy error: {}", e))?;
     Ok((bytes_to_backend, bytes_to_client))
 }
