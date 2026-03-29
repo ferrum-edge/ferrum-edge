@@ -296,7 +296,6 @@ impl ConnectionPool {
     }
 
     /// Get pool statistics for monitoring
-    #[allow(dead_code)]
     pub fn get_stats(&self) -> PoolStats {
         let mut entries_per_host = std::collections::HashMap::new();
         for entry in self.pools.iter() {
@@ -404,7 +403,6 @@ impl ConnectionPool {
 }
 
 /// Connection pool statistics
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct PoolStats {
     pub total_pools: usize,

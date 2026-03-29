@@ -270,6 +270,17 @@ impl RouterCache {
         None
     }
 
+    /// Cache statistics for metrics: (prefix_entries, regex_entries, prefix_evictions, regex_evictions, max_entries).
+    pub fn cache_stats(&self) -> (usize, usize, u64, u64, usize) {
+        (
+            self.prefix_cache.len(),
+            self.regex_cache.len(),
+            self.prefix_eviction_counter.load(Ordering::Relaxed),
+            self.regex_eviction_counter.load(Ordering::Relaxed),
+            self.max_cache_entries,
+        )
+    }
+
     /// Number of entries currently in the prefix cache (for testing).
     #[allow(dead_code)]
     pub fn cache_len(&self) -> usize {

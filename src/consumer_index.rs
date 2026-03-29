@@ -229,6 +229,16 @@ impl ConsumerIndex {
         self.all_consumers.load().len()
     }
 
+    /// Per-auth-type consumer counts for metrics.
+    pub fn auth_type_counts(&self) -> (usize, usize, usize, usize) {
+        (
+            self.keyauth_index.load().len(),
+            self.basic_index.load().len(),
+            self.mtls_index.load().len(),
+            self.all_consumers.load().len(),
+        )
+    }
+
     fn build_index(consumers: &[Consumer]) -> IndexMaps {
         let mut keyauth = HashMap::with_capacity(consumers.len());
         let mut basic = HashMap::with_capacity(consumers.len());

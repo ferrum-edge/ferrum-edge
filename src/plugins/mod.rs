@@ -428,6 +428,14 @@ pub trait Plugin: Send + Sync {
         HTTP_ONLY_PROTOCOLS
     }
 
+    /// Returns the number of tracked rate-limit keys, if applicable.
+    ///
+    /// Only meaningful for stateful plugins that track per-key counters
+    /// (e.g., rate_limiting). Returns `None` by default.
+    fn tracked_keys_count(&self) -> Option<usize> {
+        None
+    }
+
     /// Called when a new stream connection (TCP/UDP session) is established.
     ///
     /// Returning `PluginResult::Reject` closes the connection immediately.

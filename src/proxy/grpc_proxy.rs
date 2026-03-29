@@ -93,6 +93,11 @@ impl GrpcConnectionPool {
         pool
     }
 
+    /// Number of connections in the pool (for metrics).
+    pub fn pool_size(&self) -> usize {
+        self.entries.len()
+    }
+
     /// ⚠️  CRITICAL — DO NOT add fields to this key without careful analysis.
     /// Adding fields causes pool fragmentation and P95 latency regressions.
     /// See `ConnectionPool::create_pool_key` for detailed rationale.

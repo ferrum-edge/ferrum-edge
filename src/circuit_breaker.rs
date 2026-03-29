@@ -214,8 +214,17 @@ impl CircuitBreaker {
         &self.config
     }
 
+    /// Current failure count (for metrics).
+    pub fn failure_count(&self) -> u32 {
+        self.failure_count.load(Ordering::Relaxed)
+    }
+
+    /// Current success count (for metrics).
+    pub fn success_count(&self) -> u32 {
+        self.success_count.load(Ordering::Relaxed)
+    }
+
     /// Current state name (for metrics/logging).
-    #[allow(dead_code)]
     pub fn state_name(&self) -> &'static str {
         match self.state.load(Ordering::Relaxed) {
             STATE_CLOSED => "closed",
@@ -270,6 +279,22 @@ impl CircuitBreakerCache {
         let cb = self.get_or_create(proxy_id, config);
         cb.can_execute()?;
         Ok(cb)
+    }
+
+    /// Snapshot of all circuit breaker states for metrics.
+    pub fn snapshot(&self) -> Vec<(String, &'static str, u32, u32)> {
+        self.breakers
+            .iter()
+            .map(|entry| {
+                let cb = entry.value();
+                (
+                    entry.key().clone(),
+                    cb.state_name(),
+                    cb.failure_count(),
+                    cb.success_count(),
+                )
+            })
+            .collect()
     }
 
     /// Remove circuit breakers for proxies that no longer exist in config.

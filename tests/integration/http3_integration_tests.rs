@@ -405,6 +405,7 @@ async fn test_http3_proxy_state_creation() {
         env_config: Arc::new(ferrum_gateway::config::EnvConfig::default()),
         trusted_proxies: Arc::new(ferrum_gateway::proxy::client_ip::TrustedProxies::parse("")),
         stream_listener_manager: slm,
+        started_at: std::time::Instant::now(),
     };
 
     // Verify proxy state is created successfully
@@ -570,6 +571,7 @@ async fn test_http3_full_integration() {
         env_config: Arc::new(ferrum_gateway::config::EnvConfig::default()),
         trusted_proxies: Arc::new(ferrum_gateway::proxy::client_ip::TrustedProxies::parse("")),
         stream_listener_manager: slm,
+        started_at: std::time::Instant::now(),
     };
 
     // Verify proxy state is created successfully
