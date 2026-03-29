@@ -487,7 +487,7 @@ impl Plugin for ResponseCaching {
 
     async fn on_response_body(
         &self,
-        ctx: &RequestContext,
+        ctx: &mut RequestContext,
         _response_status: u16,
         _response_headers: &HashMap<String, String>,
         body: &[u8],

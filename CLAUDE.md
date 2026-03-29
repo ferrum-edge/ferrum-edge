@@ -4,7 +4,7 @@ This file provides context for Claude Code when working on the Ferrum Gateway co
 
 ## Project Overview
 
-Ferrum Gateway is a high-performance API Gateway and reverse proxy built in Rust. It supports HTTP/1.1, HTTP/2, HTTP/3 (QUIC), WebSocket, gRPC, and raw TCP/UDP stream proxying with a plugin architecture (21 built-in plugins), four operating modes, and load balancing with health checks.
+Ferrum Gateway is a high-performance API Gateway and reverse proxy built in Rust. It supports HTTP/1.1, HTTP/2, HTTP/3 (QUIC), WebSocket, gRPC, and raw TCP/UDP stream proxying with a plugin architecture (26 built-in plugins including 4 AI/LLM-specific plugins), four operating modes, and load balancing with health checks.
 
 - **Language**: Rust (edition 2024)
 - **Async runtime**: tokio + hyper 1.0
@@ -112,7 +112,7 @@ src/
 │   ├── tcp_proxy.rs           # Raw TCP stream proxy with TLS termination/origination
 │   ├── udp_proxy.rs           # UDP datagram proxy with per-client session tracking, DTLS frontend/backend
 │   └── stream_listener.rs     # Stream listener lifecycle manager (reconcile on config reload)
-├── plugins/                   # Plugin system (20 plugins)
+├── plugins/                   # Plugin system (26 plugins, including 4 AI/LLM plugins)
 │   ├── mod.rs                 # Plugin trait, registry, priority constants, lifecycle
 │   └── [plugin_name].rs       # Individual plugin implementations
 ├── grpc/                      # CP/DP gRPC communication
@@ -153,11 +153,12 @@ Plugins execute in priority order (lower number = runs first). The lifecycle pha
 1. `on_request_received` — Correlation ID, request transformer, bot detection
 2. `authenticate` — Key auth, basic auth, JWT, HMAC, JWKS
 3. `authorize` — Access control (ACL), IP restriction
-4. `before_proxy` — Rate limiting, body validation, request termination
+4. `before_proxy` — Rate limiting, AI prompt shield, body validation, AI request guard, request termination
 5. `after_proxy` — Response transformer, CORS headers
-6. `log` — Stdout logging, HTTP logging, Prometheus, OpenTelemetry
+6. `on_response_body` — AI token metrics, AI rate limiter (token counting)
+7. `log` — Stdout logging, HTTP logging, Prometheus, OpenTelemetry
 
-Plugin priority constants are defined in `src/plugins/mod.rs` (e.g., `priority::CORS = 100`, `priority::RATE_LIMITING = 1100`).
+Plugin priority constants are defined in `src/plugins/mod.rs` (e.g., `priority::CORS = 100`, `priority::RATE_LIMITING = 2900`, `priority::AI_TOKEN_METRICS = 4100`).
 
 ### Test Structure
 

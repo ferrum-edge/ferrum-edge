@@ -1,4 +1,8 @@
 pub mod access_control;
+pub mod ai_prompt_shield;
+pub mod ai_rate_limiter;
+pub mod ai_request_guard;
+pub mod ai_token_metrics;
 pub mod basic_auth;
 pub mod body_transform;
 pub mod body_validator;
@@ -247,10 +251,14 @@ pub mod priority {
     pub const ACCESS_CONTROL: u16 = 2000;
     pub const GRAPHQL: u16 = 2850;
     pub const RATE_LIMITING: u16 = 2900;
+    pub const AI_PROMPT_SHIELD: u16 = 2925;
     pub const BODY_VALIDATOR: u16 = 2950;
+    pub const AI_REQUEST_GUARD: u16 = 2975;
     pub const REQUEST_TRANSFORMER: u16 = 3000;
     pub const RESPONSE_CACHING: u16 = 3500;
     pub const RESPONSE_TRANSFORMER: u16 = 4000;
+    pub const AI_TOKEN_METRICS: u16 = 4100;
+    pub const AI_RATE_LIMITER: u16 = 4200;
     pub const STDOUT_LOGGING: u16 = 9000;
     pub const HTTP_LOGGING: u16 = 9100;
     pub const TRANSACTION_DEBUGGER: u16 = 9200;
@@ -357,7 +365,7 @@ pub trait Plugin: Send + Sync {
     /// API response contracts).
     async fn on_response_body(
         &self,
-        _ctx: &RequestContext,
+        _ctx: &mut RequestContext,
         _response_status: u16,
         _response_headers: &HashMap<String, String>,
         _body: &[u8],
@@ -537,6 +545,16 @@ pub fn create_plugin_with_http_client(
         "otel_tracing" => Ok(Some(Arc::new(
             otel_tracing::OtelTracing::new_with_http_client(config, http_client)?,
         ))),
+        "ai_token_metrics" => Ok(Some(Arc::new(ai_token_metrics::AiTokenMetrics::new(
+            config,
+        )))),
+        "ai_request_guard" => Ok(Some(Arc::new(ai_request_guard::AiRequestGuard::new(
+            config,
+        )))),
+        "ai_rate_limiter" => Ok(Some(Arc::new(ai_rate_limiter::AiRateLimiter::new(config)))),
+        "ai_prompt_shield" => Ok(Some(Arc::new(ai_prompt_shield::AiPromptShield::new(
+            config,
+        )))),
         _ => {
             // Fall through to custom plugins registry
             let result = crate::custom_plugins::create_custom_plugin(name, config, http_client);
@@ -594,6 +612,10 @@ pub fn available_plugins() -> Vec<&'static str> {
         "response_caching",
         "prometheus_metrics",
         "otel_tracing",
+        "ai_token_metrics",
+        "ai_request_guard",
+        "ai_rate_limiter",
+        "ai_prompt_shield",
     ];
     plugins.extend(crate::custom_plugins::custom_plugin_names());
     plugins

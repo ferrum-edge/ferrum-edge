@@ -805,7 +805,7 @@ impl Plugin for BodyValidator {
 
     async fn on_response_body(
         &self,
-        _ctx: &RequestContext,
+        _ctx: &mut RequestContext,
         _response_status: u16,
         response_headers: &HashMap<String, String>,
         body: &[u8],

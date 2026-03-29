@@ -886,10 +886,10 @@ async fn test_response_json_schema_valid() {
             "name": {"type": "string"}
         }
     }));
-    let ctx = make_response_ctx();
+    let mut ctx = make_response_ctx();
     let headers = response_json_headers();
     let body = br#"{"id": 1, "name": "Alice"}"#;
-    assert_continue(plugin.on_response_body(&ctx, 200, &headers, body).await);
+    assert_continue(plugin.on_response_body(&mut ctx, 200, &headers, body).await);
 }
 
 #[tokio::test]
@@ -898,11 +898,11 @@ async fn test_response_json_schema_missing_required_field() {
         "type": "object",
         "required": ["id", "name"]
     }));
-    let ctx = make_response_ctx();
+    let mut ctx = make_response_ctx();
     let headers = response_json_headers();
     let body = br#"{"id": 1}"#;
     assert_reject(
-        plugin.on_response_body(&ctx, 200, &headers, body).await,
+        plugin.on_response_body(&mut ctx, 200, &headers, body).await,
         Some(502),
     );
 }
@@ -910,11 +910,11 @@ async fn test_response_json_schema_missing_required_field() {
 #[tokio::test]
 async fn test_response_json_schema_wrong_type() {
     let plugin = response_schema_plugin(serde_json::json!({"type": "object"}));
-    let ctx = make_response_ctx();
+    let mut ctx = make_response_ctx();
     let headers = response_json_headers();
     let body = br#"[1, 2, 3]"#;
     assert_reject(
-        plugin.on_response_body(&ctx, 200, &headers, body).await,
+        plugin.on_response_body(&mut ctx, 200, &headers, body).await,
         Some(502),
     );
 }
@@ -922,11 +922,11 @@ async fn test_response_json_schema_wrong_type() {
 #[tokio::test]
 async fn test_response_json_invalid_json() {
     let plugin = response_schema_plugin(serde_json::json!({"type": "object"}));
-    let ctx = make_response_ctx();
+    let mut ctx = make_response_ctx();
     let headers = response_json_headers();
     let body = b"not json at all";
     assert_reject(
-        plugin.on_response_body(&ctx, 200, &headers, body).await,
+        plugin.on_response_body(&mut ctx, 200, &headers, body).await,
         Some(502),
     );
 }
@@ -934,19 +934,19 @@ async fn test_response_json_invalid_json() {
 #[tokio::test]
 async fn test_response_json_empty_body_skipped() {
     let plugin = response_schema_plugin(serde_json::json!({"type": "object"}));
-    let ctx = make_response_ctx();
+    let mut ctx = make_response_ctx();
     let headers = response_json_headers();
-    assert_continue(plugin.on_response_body(&ctx, 200, &headers, b"").await);
+    assert_continue(plugin.on_response_body(&mut ctx, 200, &headers, b"").await);
 }
 
 #[tokio::test]
 async fn test_response_json_non_matching_content_type_skipped() {
     let plugin = response_schema_plugin(serde_json::json!({"type": "object"}));
-    let ctx = make_response_ctx();
+    let mut ctx = make_response_ctx();
     let mut headers = HashMap::new();
     headers.insert("content-type".to_string(), "text/plain".to_string());
     let body = b"not json";
-    assert_continue(plugin.on_response_body(&ctx, 200, &headers, body).await);
+    assert_continue(plugin.on_response_body(&mut ctx, 200, &headers, body).await);
 }
 
 // ─── Response Required Fields ─────────────────────────────────────────
@@ -956,10 +956,10 @@ async fn test_response_required_fields_valid() {
     let plugin = BodyValidator::new(&serde_json::json!({
         "response_required_fields": ["status", "data"]
     }));
-    let ctx = make_response_ctx();
+    let mut ctx = make_response_ctx();
     let headers = response_json_headers();
     let body = br#"{"status": "ok", "data": []}"#;
-    assert_continue(plugin.on_response_body(&ctx, 200, &headers, body).await);
+    assert_continue(plugin.on_response_body(&mut ctx, 200, &headers, body).await);
 }
 
 #[tokio::test]
@@ -967,11 +967,11 @@ async fn test_response_required_fields_missing() {
     let plugin = BodyValidator::new(&serde_json::json!({
         "response_required_fields": ["status", "data"]
     }));
-    let ctx = make_response_ctx();
+    let mut ctx = make_response_ctx();
     let headers = response_json_headers();
     let body = br#"{"status": "ok"}"#;
     assert_reject(
-        plugin.on_response_body(&ctx, 200, &headers, body).await,
+        plugin.on_response_body(&mut ctx, 200, &headers, body).await,
         Some(502),
     );
 }
@@ -983,10 +983,10 @@ async fn test_response_xml_valid() {
     let plugin = BodyValidator::new(&serde_json::json!({
         "response_validate_xml": true
     }));
-    let ctx = make_response_ctx();
+    let mut ctx = make_response_ctx();
     let headers = response_xml_headers();
     let body = b"<root><item>text</item></root>";
-    assert_continue(plugin.on_response_body(&ctx, 200, &headers, body).await);
+    assert_continue(plugin.on_response_body(&mut ctx, 200, &headers, body).await);
 }
 
 #[tokio::test]
@@ -994,11 +994,11 @@ async fn test_response_xml_invalid() {
     let plugin = BodyValidator::new(&serde_json::json!({
         "response_validate_xml": true
     }));
-    let ctx = make_response_ctx();
+    let mut ctx = make_response_ctx();
     let headers = response_xml_headers();
     let body = b"<root><item></root>";
     assert_reject(
-        plugin.on_response_body(&ctx, 200, &headers, body).await,
+        plugin.on_response_body(&mut ctx, 200, &headers, body).await,
         Some(502),
     );
 }
@@ -1009,11 +1009,11 @@ async fn test_response_xml_required_elements() {
         "response_validate_xml": true,
         "response_required_xml_elements": ["result"]
     }));
-    let ctx = make_response_ctx();
+    let mut ctx = make_response_ctx();
     let headers = response_xml_headers();
     let body = b"<root><data>text</data></root>";
     assert_reject(
-        plugin.on_response_body(&ctx, 200, &headers, body).await,
+        plugin.on_response_body(&mut ctx, 200, &headers, body).await,
         Some(502),
     );
 }
@@ -1043,18 +1043,18 @@ async fn test_both_request_and_response_validation() {
     );
 
     // Response validation works
-    let resp_ctx = make_response_ctx();
+    let mut resp_ctx = make_response_ctx();
     let resp_headers = response_json_headers();
     assert_continue(
         plugin
-            .on_response_body(&resp_ctx, 200, &resp_headers, br#"{"result": "ok"}"#)
+            .on_response_body(&mut resp_ctx, 200, &resp_headers, br#"{"result": "ok"}"#)
             .await,
     );
 
     // Response with missing field is rejected (502)
     assert_reject(
         plugin
-            .on_response_body(&resp_ctx, 200, &resp_headers, br#"{"other": "value"}"#)
+            .on_response_body(&mut resp_ctx, 200, &resp_headers, br#"{"other": "value"}"#)
             .await,
         Some(502),
     );
@@ -1073,10 +1073,10 @@ async fn test_response_json_schema_pattern_valid() {
             "code": {"type": "string", "pattern": "^[A-Z]{3}-[0-9]+$"}
         }
     }));
-    let ctx = make_response_ctx();
+    let mut ctx = make_response_ctx();
     let headers = response_json_headers();
     let body = br#"{"code": "ABC-123"}"#;
-    assert_continue(plugin.on_response_body(&ctx, 200, &headers, body).await);
+    assert_continue(plugin.on_response_body(&mut ctx, 200, &headers, body).await);
 }
 
 #[tokio::test]
@@ -1087,11 +1087,11 @@ async fn test_response_json_schema_pattern_invalid() {
             "code": {"type": "string", "pattern": "^[A-Z]{3}-[0-9]+$"}
         }
     }));
-    let ctx = make_response_ctx();
+    let mut ctx = make_response_ctx();
     let headers = response_json_headers();
     let body = br#"{"code": "invalid"}"#;
     assert_reject(
-        plugin.on_response_body(&ctx, 200, &headers, body).await,
+        plugin.on_response_body(&mut ctx, 200, &headers, body).await,
         Some(502),
     );
 }
@@ -1104,8 +1104,8 @@ async fn test_response_no_validation_skips() {
     let plugin = BodyValidator::new(&serde_json::json!({
         "json_schema": {"type": "object"}
     }));
-    let ctx = make_response_ctx();
+    let mut ctx = make_response_ctx();
     let headers = response_json_headers();
     let body = b"totally invalid json!!!";
-    assert_continue(plugin.on_response_body(&ctx, 200, &headers, body).await);
+    assert_continue(plugin.on_response_body(&mut ctx, 200, &headers, body).await);
 }

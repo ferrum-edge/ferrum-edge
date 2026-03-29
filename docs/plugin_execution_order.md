@@ -57,9 +57,9 @@ Priority bands are spaced with gaps so future plugins can slot in without renumb
 |------|---------------|---------|---------|
 | **Early** | 0–949 | Pre-processing that must run before auth | `cors` (100), `ip_restriction` (150), `bot_detection` (200) |
 | **AuthN** | 950–1999 | Authentication / identity verification | `mtls_auth` (950), `jwks_auth` (1000), `jwt_auth` (1100), `key_auth` (1200), `basic_auth` (1300), `hmac_auth` (1400) |
-| **AuthZ** | 2000–2999 | Authorization & post-auth enforcement | `access_control` (2000), `graphql` (2850), `rate_limiting` (2900) |
-| **Transform** | 3000–3999 | Request modification before backend call | `request_transformer` (3000), `body_validator` (3100), `request_termination` (3200) |
-| **Response** | 4000–4999 | Response modification after backend call | `response_transformer` (4000) |
+| **AuthZ** | 2000–2999 | Authorization & post-auth enforcement | `access_control` (2000), `graphql` (2850), `rate_limiting` (2900), `ai_prompt_shield` (2925) |
+| **Transform** | 3000–3999 | Request modification before backend call | `body_validator` (2950), `ai_request_guard` (2975), `request_transformer` (3000), `request_termination` (3200) |
+| **Response** | 4000–4999 | Response modification after backend call | `response_transformer` (4000), `ai_token_metrics` (4100), `ai_rate_limiter` (4200) |
 | **Custom** | 5000 | Default for unrecognized/custom plugins | _(future plugins)_ |
 | **Logging** | 9000–9999 | Observability, runs outside the hot path | `stdout_logging` (9000), `correlation_id` (9050), `http_logging` (9100), `transaction_debugger` (9200), `prometheus_metrics` (9300), `otel_tracing` (9400) |
 
@@ -81,16 +81,20 @@ Given all built-in plugins enabled, the execution order is:
 | 10 | `access_control` | 2000 | authorize |
 | 11 | `graphql` | 2850 | before_proxy |
 | 12 | `rate_limiting` | 2900 | on_request_received (IP mode), authorize (consumer mode) |
-| 13 | `request_transformer` | 3000 | before_proxy |
-| 14 | `body_validator` | 3100 | before_proxy, on_response_body |
-| 15 | `request_termination` | 3200 | before_proxy |
-| 16 | `response_transformer` | 4000 | after_proxy |
-| 17 | `stdout_logging` | 9000 | log |
-| 18 | `correlation_id` | 9050 | on_request_received, log |
-| 19 | `http_logging` | 9100 | log |
-| 20 | `transaction_debugger` | 9200 | on_request_received, after_proxy, log |
-| 21 | `prometheus_metrics` | 9300 | after_proxy, log |
-| 22 | `otel_tracing` | 9400 | on_request_received, after_proxy |
+| 13 | `ai_prompt_shield` | 2925 | before_proxy, transform_request_body |
+| 14 | `body_validator` | 2950 | before_proxy, on_response_body |
+| 15 | `ai_request_guard` | 2975 | before_proxy, transform_request_body |
+| 16 | `request_transformer` | 3000 | before_proxy |
+| 17 | `request_termination` | 3200 | before_proxy |
+| 18 | `response_transformer` | 4000 | after_proxy |
+| 19 | `ai_token_metrics` | 4100 | on_response_body |
+| 20 | `ai_rate_limiter` | 4200 | before_proxy, on_response_body, after_proxy |
+| 21 | `stdout_logging` | 9000 | log |
+| 22 | `correlation_id` | 9050 | on_request_received, log |
+| 23 | `http_logging` | 9100 | log |
+| 24 | `transaction_debugger` | 9200 | on_request_received, after_proxy, log |
+| 25 | `prometheus_metrics` | 9300 | after_proxy, log |
+| 26 | `otel_tracing` | 9400 | on_request_received, after_proxy |
 
 ## Why This Order Matters
 
@@ -113,6 +117,15 @@ Rate limiting sits at the end of the AuthZ band (priority 2900) so it can enforc
 - `limit_by: "consumer"` — enforces consumer-based limits in `authorize` (phase 3, after auth). If no consumer is identified (unauthenticated request), falls back to IP-based keying.
 
 **Header exposure** (`expose_headers: true`): When enabled, the plugin injects `x-ratelimit-limit`, `x-ratelimit-remaining`, `x-ratelimit-window`, and `x-ratelimit-identity` headers on both upstream requests (`before_proxy`) and downstream responses (`after_proxy`). This lets backends and clients see current rate-limit state without additional lookups. Disabled by default so gateway admins control whether limit details are exposed.
+
+### AI Plugins: PII shield before guard, metrics before rate limiter (2925–4200)
+
+The four AI plugins are ordered to compose correctly:
+
+1. **`ai_prompt_shield` (2925)** runs first in the pre-proxy flow — PII must be detected/redacted before the request reaches any other validation or the backend. It sits right after `rate_limiting` so brute-force protection applies first.
+2. **`ai_request_guard` (2975)** runs after PII scanning — it validates model names, max_tokens, message counts, and temperature. If the prompt shield already rejected or redacted the request, the guard validates the cleaned version.
+3. **`ai_token_metrics` (4100)** runs after the response comes back from the backend — it parses the LLM response body to extract token usage (prompt, completion, total, model) and writes it to `ctx.metadata`. This metadata flows into `TransactionSummary` for all downstream logging plugins.
+4. **`ai_rate_limiter` (4200)** runs after `ai_token_metrics` — it reads the token count from the response body and accumulates it against the consumer's token budget. On the pre-proxy side, it checks whether the consumer has exceeded their token limit before allowing the request through. The pre-proxy check uses historical accumulation, while the post-proxy hook records new usage.
 
 ### Transforms after auth (3000+)
 
@@ -223,6 +236,10 @@ TLS/DTLS are transport-layer concerns, not separate protocols. A plugin that sup
 | `body_validator` | ✓ | ✓ | | | | Validates request and response bodies |
 | `request_termination` | ✓ | ✓ | ✓ | | | Returns HTTP error response |
 | `response_transformer` | ✓ | ✓ | | | | Modifies HTTP response headers/body |
+| `ai_prompt_shield` | ✓ | ✓ | | | | Scans JSON request bodies for PII |
+| `ai_request_guard` | ✓ | ✓ | | | | Validates JSON request bodies |
+| `ai_token_metrics` | ✓ | ✓ | | | | Parses JSON response bodies for token usage |
+| `ai_rate_limiter` | ✓ | ✓ | | | | Parses JSON response bodies for token counts |
 | `stdout_logging` | ✓ | ✓ | ✓ | ✓ | ✓ | Observability applies everywhere |
 | `correlation_id` | ✓ | ✓ | ✓ | ✓ | ✓ | ID assignment is protocol-agnostic |
 | `http_logging` | ✓ | ✓ | ✓ | ✓ | ✓ | Observability applies everywhere |

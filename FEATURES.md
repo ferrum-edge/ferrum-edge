@@ -54,7 +54,7 @@ Ferrum supports dynamic upstream target discovery through three providers, confi
 
 ## Plugin System
 
-- 22 built-in plugins with lifecycle hooks (request received, authenticate, authorize, before proxy, after proxy, log)
+- 26 built-in plugins with lifecycle hooks (request received, authenticate, authorize, before proxy, after proxy, on response body, log)
 - Priority-ordered execution with protocol-aware filtering (HTTP, gRPC, WebSocket, TCP, UDP)
 - Global and per-proxy scoping with same-type override semantics
 - Multi-authentication mode with first-match consumer identification
@@ -77,6 +77,13 @@ Ferrum supports dynamic upstream target discovery through three providers, confi
 - **CORS** — preflight handling with origin, method, and header validation
 - **Body Validator** — JSON Schema and XML validation
 - **GraphQL** — query depth/complexity limiting, alias limiting, introspection control, per-operation rate limiting
+
+### AI / LLM Plugins
+
+- **AI Token Metrics** — extract token usage (prompt, completion, total) from LLM responses (OpenAI, Anthropic, Google, Cohere, Mistral, Bedrock) into transaction metadata for downstream observability
+- **AI Request Guard** — validate and constrain AI requests: model allow/block lists, max_tokens enforcement (reject or clamp), message count limits, prompt length limits, temperature range, system prompt blocking
+- **AI Rate Limiter** — token-aware rate limiting per consumer or IP with sliding window, auto-detecting provider format from responses
+- **AI Prompt Shield** — PII detection and redaction in prompts with built-in patterns (SSN, credit card, email, phone, API keys, AWS keys, IBAN) and custom regex support
 
 ### Transform Plugins
 

@@ -1007,8 +1007,9 @@ Within each phase, plugins run in **priority order** (lowest number first). This
 | 2000 | Authorization | `access_control` |
 | 2850 | Authorization | `graphql` (depth, complexity, per-operation rate limiting) |
 | 2900 | Authorization | `rate_limiting` (consumer-based limits run after auth) |
+| 2925-2975 | AI Pre-proxy | `ai_prompt_shield` (PII scan), `ai_request_guard` (model/token policy) |
 | 3000 | Transform | `request_transformer`, `body_validator`, `request_termination` |
-| 4000 | Response | `response_transformer` |
+| 4000-4200 | Response | `response_transformer`, `ai_token_metrics` (extract usage), `ai_rate_limiter` (count tokens) |
 | 9000-9400 | Logging | `stdout_logging`, `http_logging`, `transaction_debugger`, `correlation_id`, `prometheus_metrics`, `otel_tracing` |
 
 Plugins at the same priority have no guaranteed relative order. Gaps between bands allow future plugins to slot in without renumbering. See [docs/plugin_execution_order.md](docs/plugin_execution_order.md) for the full design rationale.
@@ -1635,6 +1636,194 @@ FERRUM_HTTP3_MAX_STREAMS=1000
 ```
 
 When enabled, the gateway listens for QUIC connections on `FERRUM_PROXY_HTTPS_PORT` alongside the standard HTTPS listener. Clients that support HTTP/3 (e.g., `curl --http3`) can connect via QUIC for lower-latency connections with built-in multiplexing and improved head-of-line blocking behavior.
+
+### AI / LLM Plugins
+
+Ferrum provides four plugins purpose-built for AI/LLM API gateway use cases. They compose together to give you cost visibility, budget enforcement, request policy, and PII protection — all at the gateway layer with no changes to your application code.
+
+These plugins auto-detect the LLM provider from the response JSON structure, supporting **OpenAI** (and compatible: Azure OpenAI, Groq, Together, etc.), **Anthropic**, **Google Gemini**, **Cohere**, **Mistral**, and **AWS Bedrock**.
+
+#### `ai_token_metrics`
+
+Extracts token usage from LLM response bodies and writes it to request metadata, making token counts available to all downstream logging and observability plugins (stdout_logging, http_logging, prometheus_metrics, otel_tracing).
+
+**Config**:
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `provider` | String | `"auto"` | LLM provider format: `auto`, `openai`, `anthropic`, `google`, `cohere`, `mistral`, `bedrock` |
+| `include_model` | Boolean | `true` | Extract model name into metadata |
+| `include_token_details` | Boolean | `true` | Extract prompt/completion tokens separately (not just total) |
+| `metadata_prefix` | String | `"ai"` | Prefix for metadata keys (e.g., `ai_total_tokens`) |
+| `cost_per_prompt_token` | Float | *(none)* | If set, calculates estimated cost per request |
+| `cost_per_completion_token` | Float | *(none)* | If set, calculates estimated cost per request |
+
+**Metadata keys written**: `{prefix}_provider`, `{prefix}_total_tokens`, `{prefix}_prompt_tokens`, `{prefix}_completion_tokens`, `{prefix}_model`, `{prefix}_estimated_cost`
+
+**Note**: This plugin requires response body buffering. For AI proxies, set `response_body_mode: buffer` on the proxy or let the plugin force it automatically.
+
+```yaml
+plugin_name: ai_token_metrics
+config:
+  provider: auto
+  include_model: true
+  include_token_details: true
+  metadata_prefix: ai
+  cost_per_prompt_token: 0.000003    # $3/M input tokens (GPT-4o-mini)
+  cost_per_completion_token: 0.000012 # $12/M output tokens
+```
+
+#### `ai_request_guard`
+
+Validates and constrains AI/LLM API requests before they reach the backend. Prevents expensive mistakes (unbounded max_tokens, unauthorized models) and enforces organizational policy at the gateway layer.
+
+**Config**:
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `max_tokens_limit` | Integer | *(none)* | Maximum allowed `max_tokens` / `max_output_tokens` value |
+| `enforce_max_tokens` | String | `"reject"` | `reject` (400 error) or `clamp` (silently cap to limit) |
+| `default_max_tokens` | Integer | *(none)* | Inject `max_tokens` if not present in request |
+| `allowed_models` | String[] | `[]` | Whitelist of allowed model names (empty = allow all) |
+| `blocked_models` | String[] | `[]` | Blacklist of model names (takes precedence over allowed) |
+| `require_user_field` | Boolean | `false` | Require `user` field in request body (for audit trails) |
+| `max_messages` | Integer | *(none)* | Maximum number of messages in the messages array |
+| `max_prompt_characters` | Integer | *(none)* | Maximum total characters across all message content |
+| `temperature_range` | Float[2] | *(none)* | Allowed [min, max] range for temperature |
+| `block_system_prompts` | Boolean | `false` | Reject requests containing `role: "system"` messages |
+| `required_metadata_fields` | String[] | `[]` | Require these fields in the request body |
+
+Model matching is case-insensitive. Only POST requests with JSON content-type are validated.
+
+```yaml
+plugin_name: ai_request_guard
+config:
+  allowed_models:
+    - gpt-4o-mini
+    - gpt-4o
+    - claude-sonnet-4-20250514
+  blocked_models:
+    - o3           # Block expensive reasoning model
+  max_tokens_limit: 4096
+  enforce_max_tokens: clamp  # Silently cap instead of rejecting
+  default_max_tokens: 1024   # Inject if caller doesn't set it
+  temperature_range: [0.0, 1.0]
+  require_user_field: true
+  max_messages: 50
+  max_prompt_characters: 100000
+```
+
+#### `ai_rate_limiter`
+
+Rate-limits consumers by LLM token consumption instead of request count. A 10-token request and a 50,000-token request shouldn't count the same.
+
+Works in two phases: checks accumulated token usage before proxying (rejects with 429 if over budget), then records actual token consumption from the response after proxying.
+
+**Config**:
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `token_limit` | Integer | `100000` | Maximum tokens allowed per window |
+| `window_seconds` | Integer | `60` | Sliding window duration in seconds |
+| `count_mode` | String | `"total_tokens"` | What to count: `total_tokens`, `prompt_tokens`, or `completion_tokens` |
+| `limit_by` | String | `"consumer"` | Rate limit key: `consumer` or `ip` |
+| `expose_headers` | Boolean | `false` | Inject `x-ai-ratelimit-*` headers on responses |
+| `provider` | String | `"auto"` | LLM provider format for token extraction |
+
+**Response headers** (when `expose_headers: true`):
+- `x-ai-ratelimit-limit` — configured token limit
+- `x-ai-ratelimit-remaining` — tokens remaining in current window
+- `x-ai-ratelimit-window` — window duration in seconds
+- `x-ai-ratelimit-usage` — tokens consumed in current window
+
+```yaml
+plugin_name: ai_rate_limiter
+config:
+  token_limit: 500000        # 500K tokens per window
+  window_seconds: 3600       # Per hour
+  count_mode: total_tokens
+  limit_by: consumer
+  expose_headers: true
+```
+
+#### `ai_prompt_shield`
+
+Scans AI/LLM request bodies for PII (personally identifiable information) and either rejects the request, redacts the PII, or logs a warning. Built-in patterns cover common PII types; custom regex patterns can be added for organization-specific data.
+
+**Config**:
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `action` | String | `"reject"` | `reject` (400 error), `redact` (replace PII), or `warn` (log and pass) |
+| `patterns` | String[] | `["ssn", "credit_card", "api_key", "aws_key"]` | Built-in patterns to enable |
+| `custom_patterns` | Object[] | `[]` | Custom `{name, regex}` patterns |
+| `scan_fields` | String | `"content"` | `content` (scan message content only) or `all` (scan entire body) |
+| `exclude_roles` | String[] | `[]` | Message roles to skip scanning (e.g., `["system"]`) |
+| `redaction_placeholder` | String | `"[REDACTED:{type}]"` | Template for redacted text (`{type}` = pattern name) |
+| `max_scan_bytes` | Integer | `1048576` | Skip scanning if body exceeds this size (1MB default) |
+
+**Built-in patterns**: `ssn`, `credit_card`, `email`, `phone_us`, `api_key`, `aws_key`, `ip_address`, `iban`
+
+```yaml
+plugin_name: ai_prompt_shield
+config:
+  action: redact
+  patterns:
+    - ssn
+    - credit_card
+    - email
+    - api_key
+    - aws_key
+  custom_patterns:
+    - name: internal_account
+      regex: "ACCT-\\d{8}"
+  scan_fields: content
+  exclude_roles:
+    - system            # Don't scan system prompts
+  redaction_placeholder: "[REDACTED:{type}]"
+```
+
+**Example**: A request containing `"My SSN is 123-45-6789"` in a message content field would be:
+- **reject mode**: Blocked with `400 {"error":"PII detected in request","detected_types":["ssn"],...}`
+- **redact mode**: Rewritten to `"My SSN is [REDACTED:ssn]"` before forwarding to the backend
+- **warn mode**: Passed through unchanged, with `ai_shield_warnings: ssn` in transaction metadata
+
+#### AI Plugin Composition Example
+
+A typical AI gateway proxy combining all four plugins:
+
+```yaml
+# Proxy config for OpenAI API
+listen_path: /v1/chat/completions
+backend_protocol: https
+backend_host: api.openai.com
+backend_port: 443
+backend_path: /v1/chat/completions
+response_body_mode: buffer
+
+# Plugin configs (applied in priority order automatically)
+plugins:
+  - plugin_name: key_auth            # Authenticate callers
+    config: {}
+  - plugin_name: ai_prompt_shield    # Scan for PII before backend
+    config:
+      action: redact
+      patterns: [ssn, credit_card, email, api_key]
+  - plugin_name: ai_request_guard    # Enforce model/token policy
+    config:
+      allowed_models: [gpt-4o-mini, gpt-4o]
+      max_tokens_limit: 4096
+      enforce_max_tokens: clamp
+      default_max_tokens: 1024
+  - plugin_name: ai_token_metrics    # Extract usage for observability
+    config:
+      cost_per_prompt_token: 0.00000015
+      cost_per_completion_token: 0.0000006
+  - plugin_name: ai_rate_limiter     # Enforce token budgets
+    config:
+      token_limit: 1000000
+      window_seconds: 86400
+      limit_by: consumer
+      expose_headers: true
+  - plugin_name: stdout_logging      # Logs include ai_* metadata
+    config: {}
+```
 
 ## Security
 

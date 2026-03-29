@@ -68,7 +68,7 @@ async fn cache_response(
 
     // on_response_body
     plugin
-        .on_response_body(&ctx, status, &resp_headers, body)
+        .on_response_body(&mut ctx, status, &resp_headers, body)
         .await;
 }
 
@@ -453,7 +453,7 @@ async fn test_vary_by_headers() {
     resp_headers.insert("content-type".to_string(), "application/json".to_string());
     plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await;
     plugin
-        .on_response_body(&ctx, 200, &resp_headers, b"{\"json\":true}")
+        .on_response_body(&mut ctx, 200, &resp_headers, b"{\"json\":true}")
         .await;
 
     // Cache XML response (different Accept header = different cache key)
@@ -467,7 +467,7 @@ async fn test_vary_by_headers() {
     resp_headers2.insert("content-type".to_string(), "application/xml".to_string());
     plugin.after_proxy(&mut ctx2, 200, &mut resp_headers2).await;
     plugin
-        .on_response_body(&ctx2, 200, &resp_headers2, b"<xml/>")
+        .on_response_body(&mut ctx2, 200, &resp_headers2, b"<xml/>")
         .await;
 
     // JSON accept should get JSON response
@@ -544,7 +544,7 @@ async fn test_consumer_keyed_caching() {
     let mut rh = HashMap::new();
     plugin.after_proxy(&mut ctx_a, 200, &mut rh).await;
     plugin
-        .on_response_body(&ctx_a, 200, &rh, b"alice-data")
+        .on_response_body(&mut ctx_a, 200, &rh, b"alice-data")
         .await;
 
     // User B should get a MISS (different consumer = different cache key)
@@ -580,7 +580,7 @@ async fn test_different_query_params_different_cache() {
     let mut rh = HashMap::new();
     plugin.after_proxy(&mut ctx1, 200, &mut rh).await;
     plugin
-        .on_response_body(&ctx1, 200, &rh, b"page-1-data")
+        .on_response_body(&mut ctx1, 200, &rh, b"page-1-data")
         .await;
 
     // ?page=2 should be a MISS
@@ -617,7 +617,9 @@ async fn test_query_excluded_from_cache_key() {
     plugin.before_proxy(&mut ctx1, &mut h).await;
     let mut rh = HashMap::new();
     plugin.after_proxy(&mut ctx1, 200, &mut rh).await;
-    plugin.on_response_body(&ctx1, 200, &rh, b"same-data").await;
+    plugin
+        .on_response_body(&mut ctx1, 200, &rh, b"same-data")
+        .await;
 
     // ?page=2 should be a HIT (query excluded from key)
     let mut ctx2 = make_ctx_with_query("GET", "/api/items", &[("page", "2")]);
