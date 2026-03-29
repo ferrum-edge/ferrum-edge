@@ -187,6 +187,25 @@ impl LoadBalancerCache {
         balancer.select_excluding(ctx_key, exclude, unhealthy)
     }
 
+    /// Snapshot of active connection counts per upstream for metrics.
+    pub fn active_connections_snapshot(&self) -> Vec<(String, Vec<(String, i64)>)> {
+        let balancers = self.balancers.load();
+        let mut result = Vec::new();
+        for (upstream_id, balancer) in balancers.iter() {
+            let mut targets = Vec::new();
+            for entry in balancer.active_connections.iter() {
+                let count = entry.value().load(Ordering::Relaxed);
+                if count > 0 {
+                    targets.push((entry.key().clone(), count));
+                }
+            }
+            if !targets.is_empty() {
+                result.push((upstream_id.clone(), targets));
+            }
+        }
+        result
+    }
+
     /// Record that a connection was opened to a target (for least-connections).
     pub fn record_connection_start(&self, upstream_id: &str, target: &UpstreamTarget) {
         let balancers = self.balancers.load();

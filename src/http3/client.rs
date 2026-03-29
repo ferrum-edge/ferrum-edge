@@ -62,6 +62,11 @@ impl Http3ConnectionPool {
         pool
     }
 
+    /// Number of connections in the pool (for metrics).
+    pub fn pool_size(&self) -> usize {
+        self.entries.len()
+    }
+
     fn pool_key(proxy: &Proxy, index: usize) -> String {
         format!("{}:{}:{}", proxy.backend_host, proxy.backend_port, index)
     }

@@ -110,11 +110,28 @@ paths:
   /admin/metrics:
     get:
       operationId: getAdminMetrics
-      summary: Gateway operational metrics (JSON)
+      summary: Comprehensive gateway runtime metrics (JSON)
+      description: |
+        Returns a comprehensive snapshot of the gateway's runtime state including
+        request throughput, connection pool sizes, circuit breaker states, health
+        check results, load balancer active connections, cache statistics, consumer
+        index breakdowns, and rate limiter tracked keys.
+
+        The response is cached for 5 seconds to avoid performance impact from
+        frequent polling. The `X-Cache` response header indicates `hit` or `miss`.
+
+        Designed for dashboards and monitoring integrations that need richer data
+        than the Prometheus `/metrics` endpoint provides.
       tags: [Metrics]
       responses:
         "200":
-          description: Operational metrics
+          description: Runtime metrics snapshot
+          headers:
+            X-Cache:
+              schema:
+                type: string
+                enum: [hit, miss]
+              description: Whether this response was served from the 5-second cache
           content:
             application/json:
               schema:
@@ -1868,33 +1885,280 @@ components:
     # ── Admin metrics ───────────────────────────────────────────────
     AdminMetrics:
       type: object
+      description: |
+        Comprehensive gateway runtime metrics snapshot. Cached for 5 seconds
+        to avoid performance impact from frequent polling.
+      required:
+        - gateway
+        - connection_pools
+        - circuit_breakers
+        - health_check
+        - load_balancers
+        - caches
+        - consumer_index
+        - rate_limiting
+      properties:
+        gateway:
+          $ref: "#/components/schemas/AdminMetricsGateway"
+        connection_pools:
+          $ref: "#/components/schemas/AdminMetricsConnectionPools"
+        circuit_breakers:
+          type: array
+          items:
+            $ref: "#/components/schemas/AdminMetricsCircuitBreaker"
+          description: |
+            Per-proxy circuit breaker states. Only proxies with circuit breaker
+            config that have been accessed appear here.
+        health_check:
+          $ref: "#/components/schemas/AdminMetricsHealthCheck"
+        load_balancers:
+          $ref: "#/components/schemas/AdminMetricsLoadBalancers"
+        caches:
+          $ref: "#/components/schemas/AdminMetricsCaches"
+        consumer_index:
+          $ref: "#/components/schemas/AdminMetricsConsumerIndex"
+        rate_limiting:
+          $ref: "#/components/schemas/AdminMetricsRateLimiting"
+
+    AdminMetricsGateway:
+      type: object
+      description: Top-level gateway info and throughput counters.
       required:
         - mode
-        - proxy_count
-        - consumer_count
+        - uptime_seconds
         - requests_per_second_current
         - status_codes_last_second
+        - proxy_count
+        - consumer_count
+        - upstream_count
+        - plugin_config_count
       properties:
         mode:
           type: string
-        config_last_updated_at:
-          type: string
-          format: date-time
-        config_source_status:
-          type: string
-          enum: [online, "n/a"]
-        proxy_count:
+          enum: [database, file, cp, dp]
+          description: Operating mode (set by FERRUM_MODE)
+        uptime_seconds:
           type: integer
-        consumer_count:
-          type: integer
+          format: int64
+          description: Seconds since the gateway process started
         requests_per_second_current:
-          type: number
-          format: double
+          type: integer
+          format: int64
+          description: Requests processed in the most recent 1-second window
         status_codes_last_second:
           type: object
           additionalProperties:
             type: integer
-          description: Map of HTTP status code to count in the last second
+          description: |
+            Map of HTTP status code (as string key) to count in the last second.
+            Only status codes that were seen appear as keys.
+          example:
+            "200": 1105
+            "404": 38
+            "429": 31
+        config_last_updated_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: RFC 3339 timestamp of the last successful config load/reload
+        config_source_status:
+          type: string
+          enum: [online, "n/a"]
+          description: |
+            "online" when a database is configured and reachable,
+            "n/a" for file mode or CP mode without a database
+        proxy_count:
+          type: integer
+          description: Number of proxy routes in the active config
+        consumer_count:
+          type: integer
+          description: Number of consumers in the active config
+        upstream_count:
+          type: integer
+          description: Number of upstreams (load-balanced target groups) in the active config
+        plugin_config_count:
+          type: integer
+          description: Number of plugin configurations in the active config
+
+    AdminMetricsConnectionPools:
+      type: object
+      description: |
+        Connection pool sizes for all four protocol pools. Each pool reuses
+        connections to backend services to avoid TCP/TLS handshake overhead.
+      properties:
+        http:
+          type: object
+          description: HTTP/1.1 connection pool (reqwest-based, supports HTTP and HTTPS backends)
+          properties:
+            total_pools:
+              type: integer
+              description: Number of distinct backend host:port:protocol pool entries
+            max_idle_per_host:
+              type: integer
+              description: Maximum idle connections kept per host (from FERRUM_POOL_MAX_IDLE_PER_HOST)
+            idle_timeout_seconds:
+              type: integer
+              description: Seconds before an idle connection is evicted
+            entries_per_host:
+              type: object
+              additionalProperties:
+                type: integer
+              description: Map of pool key (host:port:tls) to connection count
+        grpc:
+          type: object
+          description: gRPC HTTP/2 connection pool (h2c + h2 with trailer support)
+          properties:
+            total_connections:
+              type: integer
+        http2:
+          type: object
+          description: HTTP/2 connection pool for HTTPS backends (stream multiplexing)
+          properties:
+            total_connections:
+              type: integer
+        http3:
+          type: object
+          description: HTTP/3 QUIC connection pool
+          properties:
+            total_connections:
+              type: integer
+
+    AdminMetricsCircuitBreaker:
+      type: object
+      description: |
+        Circuit breaker state for a single proxy. Three states:
+        - **closed**: Normal operation, requests pass through
+        - **open**: Failures exceeded threshold, requests rejected with 503
+        - **half_open**: Timeout elapsed, limited probe requests allowed to test recovery
+      required: [proxy_id, state, failure_count, success_count]
+      properties:
+        proxy_id:
+          type: string
+          description: ID of the proxy this circuit breaker protects
+        state:
+          type: string
+          enum: [closed, open, half_open]
+        failure_count:
+          type: integer
+          description: |
+            Consecutive failures in current state. In closed state, triggers
+            opening when it reaches the configured threshold.
+        success_count:
+          type: integer
+          description: |
+            Consecutive successes during half_open state. When this reaches the
+            configured success_threshold, the circuit closes (recovers).
+
+    AdminMetricsHealthCheck:
+      type: object
+      description: |
+        Health check state showing which upstream targets are currently
+        marked unhealthy and excluded from load balancing.
+      required: [unhealthy_target_count, unhealthy_targets]
+      properties:
+        unhealthy_target_count:
+          type: integer
+          description: Number of targets currently marked unhealthy
+        unhealthy_targets:
+          type: array
+          items:
+            type: object
+            required: [target, since_epoch_ms]
+            properties:
+              target:
+                type: string
+                description: "Target in host:port format"
+                example: "10.0.3.12:8080"
+              since_epoch_ms:
+                type: integer
+                format: int64
+                description: Unix epoch milliseconds when the target was marked unhealthy
+
+    AdminMetricsLoadBalancers:
+      type: object
+      description: |
+        Active connection counts per upstream target. Only upstreams with
+        at least one active connection appear. Useful for verifying even
+        distribution across targets and spotting hot targets.
+      properties:
+        active_connections:
+          type: object
+          additionalProperties:
+            type: object
+            additionalProperties:
+              type: integer
+          description: |
+            Nested map: upstream_id → { "host:port" → active_connection_count }.
+            Only targets with count > 0 are included.
+
+    AdminMetricsCaches:
+      type: object
+      description: Router lookup cache and DNS resolver cache statistics.
+      properties:
+        router:
+          type: object
+          description: |
+            Router cache stores (host, path) → proxy lookups for O(1) repeated hits.
+            Prefix and regex routes use separate cache partitions.
+          properties:
+            prefix_cache_entries:
+              type: integer
+              description: Current entries in the prefix route cache
+            regex_cache_entries:
+              type: integer
+              description: Current entries in the regex route cache
+            prefix_eviction_count:
+              type: integer
+              format: int64
+              description: Total number of prefix cache eviction sweeps since startup
+            regex_eviction_count:
+              type: integer
+              format: int64
+              description: Total number of regex cache eviction sweeps since startup
+            max_cache_entries:
+              type: integer
+              description: Maximum entries per cache partition before eviction triggers
+        dns:
+          type: object
+          description: DNS resolver cache with stale-while-revalidate support
+          properties:
+            cache_entries:
+              type: integer
+              description: Number of hostname entries currently cached
+
+    AdminMetricsConsumerIndex:
+      type: object
+      description: |
+        Consumer credential index counts by authentication type.
+        These are pre-built hash map indexes for O(1) credential lookup.
+      required: [total_consumers, key_auth_credentials, basic_auth_credentials, mtls_credentials]
+      properties:
+        total_consumers:
+          type: integer
+          description: Total number of consumers loaded in the index
+        key_auth_credentials:
+          type: integer
+          description: Number of API key credentials indexed (for key_auth plugin)
+        basic_auth_credentials:
+          type: integer
+          description: Number of username credentials indexed (for basic_auth plugin)
+        mtls_credentials:
+          type: integer
+          description: Number of mTLS identity credentials indexed (for mtls_auth plugin)
+
+    AdminMetricsRateLimiting:
+      type: object
+      description: |
+        Rate limiter state across all plugin instances. Each tracked key
+        represents a unique client (by IP or consumer) with an active
+        rate-limit window. Bounded to 100K entries per plugin instance.
+      required: [tracked_key_count]
+      properties:
+        tracked_key_count:
+          type: integer
+          description: |
+            Total number of rate-limit keys currently tracked across all
+            rate_limiting plugin instances (deduplicated by plugin identity)
 
     # ── Pagination envelope ────────────────────────────────────────────
     Pagination:

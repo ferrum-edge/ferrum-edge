@@ -525,7 +525,6 @@ impl DnsCache {
     }
 
     /// Returns the number of entries currently in the cache.
-    #[allow(dead_code)]
     pub fn cache_len(&self) -> usize {
         self.cache.len()
     }

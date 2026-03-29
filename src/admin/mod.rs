@@ -2274,10 +2274,58 @@ async fn handle_delete_upstream(
 
 // ---- Metrics ----
 
-async fn handle_metrics(state: &AdminState) -> Result<Response<Full<Bytes>>, hyper::Error> {
-    let mut status_codes = serde_json::Map::new();
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
+/// Process-global cache for the metrics JSON response.
+/// Uses a static to avoid adding a field to AdminState (which has 30+ construction sites).
+static METRICS_CACHE: OnceLock<arc_swap::ArcSwap<Option<(Instant, Bytes)>>> = OnceLock::new();
+
+fn metrics_cache() -> &'static arc_swap::ArcSwap<Option<(Instant, Bytes)>> {
+    METRICS_CACHE.get_or_init(|| arc_swap::ArcSwap::new(Arc::new(None)))
+}
+
+/// Cache TTL for the metrics response.
+const METRICS_CACHE_TTL: Duration = Duration::from_secs(5);
+
+async fn handle_metrics(state: &AdminState) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    let cache = metrics_cache();
+    let cached = cache.load();
+    if let Some((cached_at, ref bytes)) = **cached
+        && cached_at.elapsed() < METRICS_CACHE_TTL
+    {
+        let resp = Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "application/json")
+            .header("X-Cache", "hit")
+            .body(Full::new(bytes.clone()))
+            .unwrap_or_else(|_| Response::new(Full::new(Bytes::from("{}"))));
+        return Ok(resp);
+    }
+
+    let metrics = build_metrics(state);
+    let body_str = serde_json::to_string(&metrics).unwrap_or_else(|_| "{}".into());
+    let body_bytes = Bytes::from(body_str);
+
+    cache.store(Arc::new(Some((Instant::now(), body_bytes.clone()))));
+
+    let resp = Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "application/json")
+        .header("X-Cache", "miss")
+        .body(Full::new(body_bytes))
+        .unwrap_or_else(|_| Response::new(Full::new(Bytes::from("{}"))));
+    Ok(resp)
+}
+
+fn build_metrics(state: &AdminState) -> Value {
     if let Some(ref ps) = state.proxy_state {
+        let config = ps.current_config();
+        let rps = ps.request_count.load(Ordering::Relaxed);
+        let uptime_seconds = ps.started_at.elapsed().as_secs();
+
+        // Status codes
+        let mut status_codes = serde_json::Map::new();
         for entry in ps.status_counts.iter() {
             status_codes.insert(
                 entry.key().to_string(),
@@ -2285,37 +2333,150 @@ async fn handle_metrics(state: &AdminState) -> Result<Response<Full<Bytes>>, hyp
             );
         }
 
-        let config = ps.current_config();
-        let rps = ps.request_count.load(Ordering::Relaxed);
+        // Connection pools
+        let http_pool_stats = ps.connection_pool.get_stats();
+        let grpc_pool_size = ps.grpc_pool.pool_size();
+        let http2_pool_size = ps.http2_pool.pool_size();
+        let h3_pool_size = ps.h3_pool.pool_size();
 
-        let config_source_status = match &state.db {
-            Some(_) => "online",
-            None => "n/a",
-        };
+        // Circuit breakers
+        let cb_snapshot = ps.circuit_breaker_cache.snapshot();
+        let circuit_breakers: Vec<Value> = cb_snapshot
+            .iter()
+            .map(|(id, state, failures, successes)| {
+                json!({
+                    "proxy_id": id,
+                    "state": state,
+                    "failure_count": failures,
+                    "success_count": successes,
+                })
+            })
+            .collect();
 
-        let metrics = json!({
-            "mode": state.mode,
-            "config_last_updated_at": config.loaded_at.to_rfc3339(),
-            "config_source_status": config_source_status,
-            "proxy_count": config.proxies.len(),
-            "consumer_count": config.consumers.len(),
-            "requests_per_second_current": rps,
-            "status_codes_last_second": status_codes,
-        });
+        // Health check
+        let unhealthy_targets: Vec<Value> = ps
+            .health_checker
+            .unhealthy_targets
+            .iter()
+            .map(|entry| {
+                json!({
+                    "target": entry.key().clone(),
+                    "since_epoch_ms": *entry.value(),
+                })
+            })
+            .collect();
 
-        Ok(json_response(StatusCode::OK, &metrics))
+        // Load balancers
+        let lb_snapshot = ps.load_balancer_cache.active_connections_snapshot();
+        let mut lb_map = serde_json::Map::new();
+        for (upstream_id, targets) in &lb_snapshot {
+            let mut target_map = serde_json::Map::new();
+            for (target, count) in targets {
+                target_map.insert(target.clone(), json!(count));
+            }
+            lb_map.insert(upstream_id.clone(), Value::Object(target_map));
+        }
+
+        // Router cache
+        let (prefix_entries, regex_entries, prefix_evictions, regex_evictions, max_entries) =
+            ps.router_cache.cache_stats();
+
+        // DNS cache
+        let dns_cache_size = ps.dns_cache.cache_len();
+
+        // Consumer index
+        let (keyauth_count, basic_count, mtls_count, total_consumers) =
+            ps.consumer_index.auth_type_counts();
+
+        // Rate limiter keys
+        let rate_limiter_keys = ps.plugin_cache.total_rate_limiter_keys();
+
+        // Config source
+        let config_source_status = if state.db.is_some() { "online" } else { "n/a" };
+
+        json!({
+            "gateway": {
+                "mode": state.mode,
+                "uptime_seconds": uptime_seconds,
+                "requests_per_second_current": rps,
+                "status_codes_last_second": status_codes,
+                "config_last_updated_at": config.loaded_at.to_rfc3339(),
+                "config_source_status": config_source_status,
+                "proxy_count": config.proxies.len(),
+                "consumer_count": config.consumers.len(),
+                "upstream_count": config.upstreams.len(),
+                "plugin_config_count": config.plugin_configs.len(),
+            },
+            "connection_pools": {
+                "http": {
+                    "total_pools": http_pool_stats.total_pools,
+                    "max_idle_per_host": http_pool_stats.max_idle_per_host,
+                    "idle_timeout_seconds": http_pool_stats.idle_timeout_seconds,
+                    "entries_per_host": http_pool_stats.entries_per_host,
+                },
+                "grpc": {
+                    "total_connections": grpc_pool_size,
+                },
+                "http2": {
+                    "total_connections": http2_pool_size,
+                },
+                "http3": {
+                    "total_connections": h3_pool_size,
+                },
+            },
+            "circuit_breakers": circuit_breakers,
+            "health_check": {
+                "unhealthy_target_count": unhealthy_targets.len(),
+                "unhealthy_targets": unhealthy_targets,
+            },
+            "load_balancers": {
+                "active_connections": Value::Object(lb_map),
+            },
+            "caches": {
+                "router": {
+                    "prefix_cache_entries": prefix_entries,
+                    "regex_cache_entries": regex_entries,
+                    "prefix_eviction_count": prefix_evictions,
+                    "regex_eviction_count": regex_evictions,
+                    "max_cache_entries": max_entries,
+                },
+                "dns": {
+                    "cache_entries": dns_cache_size,
+                },
+            },
+            "consumer_index": {
+                "total_consumers": total_consumers,
+                "key_auth_credentials": keyauth_count,
+                "basic_auth_credentials": basic_count,
+                "mtls_credentials": mtls_count,
+            },
+            "rate_limiting": {
+                "tracked_key_count": rate_limiter_keys,
+            },
+        })
     } else {
-        let metrics = json!({
-            "mode": state.mode,
-            "config_last_updated_at": null,
-            "config_source_status": "n/a",
-            "proxy_count": 0,
-            "consumer_count": 0,
-            "requests_per_second_current": 0,
-            "status_codes_last_second": {},
-        });
-
-        Ok(json_response(StatusCode::OK, &metrics))
+        // CP mode or no proxy state
+        json!({
+            "gateway": {
+                "mode": state.mode,
+                "uptime_seconds": 0,
+                "requests_per_second_current": 0,
+                "status_codes_last_second": {},
+                "config_last_updated_at": null,
+                "config_source_status": "n/a",
+                "proxy_count": 0,
+                "consumer_count": 0,
+                "upstream_count": 0,
+                "plugin_config_count": 0,
+            },
+            "connection_pools": {},
+            "circuit_breakers": [],
+            "health_check": {"unhealthy_target_count": 0, "unhealthy_targets": []},
+            "load_balancers": {"active_connections": {}},
+            "caches": {},
+            "consumer_index": {"total_consumers": 0, "key_auth_credentials": 0, "basic_auth_credentials": 0, "mtls_credentials": 0},
+            "rate_limiting": {"tracked_key_count": 0},
+        })
     }
 }
 

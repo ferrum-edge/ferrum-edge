@@ -79,6 +79,11 @@ impl Http2ConnectionPool {
         pool
     }
 
+    /// Number of connections in the pool (for metrics).
+    pub fn pool_size(&self) -> usize {
+        self.entries.len()
+    }
+
     /// Pool key — kept minimal to avoid fragmentation.
     fn pool_key(proxy: &Proxy) -> String {
         format!("{}:{}", proxy.backend_host, proxy.backend_port)

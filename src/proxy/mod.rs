@@ -165,6 +165,8 @@ pub struct ProxyState {
     pub trusted_proxies: Arc<client_ip::TrustedProxies>,
     /// Manages TCP/UDP stream proxy listeners (dedicated port per proxy).
     pub stream_listener_manager: Arc<stream_listener::StreamListenerManager>,
+    /// Monotonic instant captured at ProxyState creation for uptime calculation.
+    pub started_at: Instant,
 }
 
 impl ProxyState {
@@ -289,6 +291,7 @@ impl ProxyState {
             max_response_body_size_bytes,
             trusted_proxies,
             stream_listener_manager,
+            started_at: Instant::now(),
         })
     }
 

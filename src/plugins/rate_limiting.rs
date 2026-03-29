@@ -344,6 +344,10 @@ impl Plugin for RateLimiting {
         super::ALL_PROTOCOLS
     }
 
+    fn tracked_keys_count(&self) -> Option<usize> {
+        Some(self.state.len())
+    }
+
     fn modifies_request_headers(&self) -> bool {
         self.expose_headers
     }

@@ -502,6 +502,38 @@ impl PluginCache {
         result
     }
 
+    /// Total number of tracked rate-limiter keys across all plugin instances.
+    pub fn total_rate_limiter_keys(&self) -> usize {
+        let mut total = 0usize;
+        let mut seen = std::collections::HashSet::new();
+
+        // Count from global plugins
+        let globals = self.global_plugins.load();
+        for plugin in globals.as_ref().iter() {
+            let ptr = Arc::as_ptr(plugin) as *const () as usize;
+            if seen.insert(ptr)
+                && let Some(count) = plugin.tracked_keys_count()
+            {
+                total += count;
+            }
+        }
+
+        // Count from per-proxy plugins (deduplicate by pointer identity)
+        let proxy_map = self.proxy_plugins.load();
+        for plugins in proxy_map.values() {
+            for plugin in plugins.iter() {
+                let ptr = Arc::as_ptr(plugin) as *const () as usize;
+                if seen.insert(ptr)
+                    && let Some(count) = plugin.tracked_keys_count()
+                {
+                    total += count;
+                }
+            }
+        }
+
+        total
+    }
+
     /// Number of proxy entries in the cache (for testing).
     #[allow(dead_code)]
     pub fn proxy_count(&self) -> usize {
