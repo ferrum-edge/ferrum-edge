@@ -100,8 +100,16 @@ curl -s -H "Authorization: Bearer $TOKEN" \
     },
     {
       "proxy_id": "proxy-legacy-billing",
+      "target": "10.0.2.1:8080",
       "state": "open",
       "failure_count": 5,
+      "success_count": 0
+    },
+    {
+      "proxy_id": "proxy-legacy-billing",
+      "target": "10.0.2.2:8080",
+      "state": "closed",
+      "failure_count": 0,
       "success_count": 0
     },
     {
@@ -202,11 +210,12 @@ The `http` pool has additional detail fields:
 
 ### `circuit_breakers`
 
-Array of per-proxy circuit breaker states. Only proxies that have a `circuit_breaker` config and have been accessed appear in this list.
+Array of circuit breaker states. For proxies with upstream targets, each target has its own independent breaker (per-target). For direct-backend proxies (no upstream), the breaker is per-proxy. Only proxies that have a `circuit_breaker` config and have been accessed appear in this list.
 
 | Field | Type | Description |
 |-------|------|-------------|
 | `proxy_id` | string | ID of the proxy this circuit breaker protects |
+| `target` | string | *(optional)* Upstream target `host:port` this breaker is scoped to. Absent for direct-backend proxies |
 | `state` | string | Current state: `closed` (normal), `open` (rejecting with 503), or `half_open` (probing for recovery) |
 | `failure_count` | integer | Consecutive failures in the current state. In `closed`, this increments toward the failure threshold. In `open`, it reflects the count that triggered the opening |
 | `success_count` | integer | Consecutive successes during `half_open`. When this reaches `success_threshold`, the circuit closes and the proxy recovers |
