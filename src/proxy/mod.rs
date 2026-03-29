@@ -2347,6 +2347,7 @@ pub async fn handle_proxy_request(
         effective_host,
         effective_port,
         strip_len,
+        upstream_target.as_ref().and_then(|t| t.path.as_deref()),
     );
     let backend_start = Instant::now();
 
@@ -2421,6 +2422,7 @@ pub async fn handle_proxy_request(
                     &next.host,
                     next.port,
                     strip_len,
+                    next.path.as_deref(),
                 );
                 current_target = Some(next);
             }
@@ -2739,6 +2741,7 @@ pub fn build_backend_url(
         &proxy.backend_host,
         proxy.backend_port,
         strip_len,
+        None,
     )
 }
 
@@ -2758,6 +2761,7 @@ pub fn build_backend_url_with_target(
     host: &str,
     port: u16,
     strip_len: usize,
+    target_path: Option<&str>,
 ) -> String {
     use std::fmt::Write;
 
@@ -2778,7 +2782,7 @@ pub fn build_backend_url_with_target(
         incoming_path
     };
 
-    let backend_path = proxy.backend_path.as_deref().unwrap_or("");
+    let backend_path = target_path.or(proxy.backend_path.as_deref()).unwrap_or("");
 
     // Both empty means path is just "/"
     let path_is_root = backend_path.is_empty() && remaining_path.is_empty();

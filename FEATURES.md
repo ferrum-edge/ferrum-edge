@@ -50,6 +50,7 @@ Ferrum supports dynamic upstream target discovery through three providers, confi
 - **Background polling** — each provider polls on a configurable interval (`poll_interval_seconds`), updating the upstream's target list without blocking request traffic.
 - **Static + dynamic target merging** — statically defined `targets` on an upstream are preserved and merged with dynamically discovered targets. This allows fallback entries that are always present.
 - **Resilience** — if a provider becomes unreachable (DNS timeout, Kubernetes API error, Consul agent down), the upstream retains its last-known target list and continues routing normally. A warning is logged on each failed poll. Normal updates resume automatically when the provider recovers.
+- **Per-target path override** — each upstream target may specify an optional `path` field that overrides the proxy's `backend_path` when that target is selected by the load balancer, enabling different backend path prefixes per target.
 
 ## Plugin System
 

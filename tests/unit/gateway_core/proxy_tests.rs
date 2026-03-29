@@ -1,6 +1,6 @@
 use chrono::Utc;
 use ferrum_gateway::config::types::{AuthMode, BackendProtocol, GatewayConfig, Proxy};
-use ferrum_gateway::proxy::build_backend_url;
+use ferrum_gateway::proxy::{build_backend_url, build_backend_url_with_target};
 use ferrum_gateway::router_cache::RouterCache;
 
 fn test_proxy() -> Proxy {
@@ -85,6 +85,68 @@ fn test_build_backend_url_with_query() {
         proxy.listen_path.len(),
     );
     assert_eq!(url, "http://backend.example.com:3000/search?q=hello&page=1");
+}
+
+#[test]
+fn test_build_backend_url_target_path_overrides_backend_path() {
+    let mut proxy = test_proxy();
+    proxy.backend_path = Some("/v1".into());
+    let url = build_backend_url_with_target(
+        &proxy,
+        "/api/v1/users",
+        "",
+        "target.example.com",
+        9090,
+        proxy.listen_path.len(),
+        Some("/v2"),
+    );
+    assert_eq!(url, "http://target.example.com:9090/v2/users");
+}
+
+#[test]
+fn test_build_backend_url_target_path_none_uses_backend_path() {
+    let mut proxy = test_proxy();
+    proxy.backend_path = Some("/v1".into());
+    let url = build_backend_url_with_target(
+        &proxy,
+        "/api/v1/users",
+        "",
+        "target.example.com",
+        9090,
+        proxy.listen_path.len(),
+        None,
+    );
+    assert_eq!(url, "http://target.example.com:9090/v1/users");
+}
+
+#[test]
+fn test_build_backend_url_target_path_with_no_backend_path() {
+    let proxy = test_proxy();
+    let url = build_backend_url_with_target(
+        &proxy,
+        "/api/v1/users",
+        "",
+        "target.example.com",
+        9090,
+        proxy.listen_path.len(),
+        Some("/service"),
+    );
+    assert_eq!(url, "http://target.example.com:9090/service/users");
+}
+
+#[test]
+fn test_build_backend_url_target_path_with_query() {
+    let proxy = test_proxy();
+    let url = build_backend_url_with_target(
+        &proxy,
+        "/api/v1/search",
+        "q=hello",
+        "target.example.com",
+        9090,
+        proxy.listen_path.len(),
+        Some("/svc"),
+    );
+    assert_eq!(url, "http://target.example.com:9090/svc/search?q=hello");
 }
 
 #[test]

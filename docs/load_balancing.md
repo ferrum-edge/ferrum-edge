@@ -30,7 +30,7 @@ Ferrum Gateway provides built-in load balancing to distribute traffic across mul
 The load balancing architecture consists of:
 
 1. **Upstreams** — Named groups of backend targets with a load balancing algorithm.
-2. **Targets** — Individual backend servers within an upstream, each with a host, port, and optional weight.
+2. **Targets** — Individual backend servers within an upstream, each with a host, port, optional weight, and optional path override.
 3. **Health Checks** — Active (periodic probes) and passive (response monitoring) checks that automatically exclude unhealthy targets.
 4. **Retry Logic** — Automatic retries to alternative targets when a request fails.
 5. **Circuit Breaker** — Prevents cascading failures by temporarily stopping requests to failing backends.
@@ -97,6 +97,7 @@ Each target represents a single backend server within an upstream.
 | `port` | integer | Yes | — | Backend server port |
 | `weight` | integer | No | `1` | Relative weight for weighted algorithms |
 | `tags` | object | No | `{}` | Key-value metadata tags |
+| `path` | string | No | — | Path prefix that overrides the proxy's `backend_path` when this target is selected |
 
 ### Weight
 
@@ -111,6 +112,27 @@ targets:
     port: 8080
     weight: 1    # receives 1/6 of traffic
 ```
+
+### Path
+
+The optional `path` field on a target overrides the proxy's `backend_path` when that target is selected by the load balancer. This allows different targets within the same upstream to serve different backend path prefixes.
+
+```yaml
+upstreams:
+  - id: "versioned-api"
+    algorithm: weighted_round_robin
+    targets:
+      - host: "10.0.1.1"
+        port: 8080
+        path: "/v2/api"    # requests to this target use /v2/api as the path prefix
+        weight: 9
+      - host: "10.0.1.2"
+        port: 8080
+        path: "/v1/api"    # requests to this target use /v1/api as the path prefix
+        weight: 1
+```
+
+When `path` is not set on a target, the proxy's `backend_path` is used as the path prefix (or no prefix if `backend_path` is also unset). When `path` is set, it fully replaces `backend_path` — the two are not concatenated.
 
 ## Load Balancing Algorithms
 

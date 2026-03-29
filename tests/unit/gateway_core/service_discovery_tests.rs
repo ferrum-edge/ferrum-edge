@@ -41,6 +41,7 @@ fn make_target(host: &str, port: u16) -> UpstreamTarget {
         port,
         weight: 1,
         tags: HashMap::new(),
+        path: None,
     }
 }
 
