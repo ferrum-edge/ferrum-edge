@@ -30,6 +30,9 @@ fn make_summary(
         latency_gateway_processing_ms: 5.0,
         latency_backend_ttfb_ms: total_ms - 5.0,
         latency_backend_total_ms: backend_ms,
+        latency_plugin_execution_ms: 2.0,
+        latency_plugin_external_io_ms: 0.0,
+        latency_gateway_overhead_ms: 3.0,
         request_user_agent: Some("test-agent".to_string()),
         response_streamed: false,
         client_disconnected: false,
@@ -297,6 +300,44 @@ async fn test_plugin_log_hook_records_metrics() {
         method: "DELETE".into(),
         status_code: 204
     }));
+}
+
+#[tokio::test]
+async fn test_registry_gateway_overhead_histogram() {
+    let registry = MetricsRegistry::new();
+
+    // Record a request with 3.0ms gateway overhead
+    registry.record(&make_summary("proxy-overhead", "GET", 200, 50.0, 40.0));
+
+    assert!(
+        registry
+            .gateway_overhead_buckets
+            .contains_key("proxy-overhead")
+    );
+    let hist = registry
+        .gateway_overhead_buckets
+        .get("proxy-overhead")
+        .unwrap();
+    assert_eq!(hist.count.load(Ordering::Relaxed), 1);
+    let sum = f64::from_bits(hist.sum.load(Ordering::Relaxed));
+    // make_summary sets gateway_overhead_ms = 3.0
+    assert!((sum - 3.0).abs() < 0.001);
+}
+
+#[tokio::test]
+async fn test_registry_render_contains_gateway_overhead() {
+    let registry = MetricsRegistry::new();
+    registry.record(&make_summary("overhead-render", "GET", 200, 42.0, 35.0));
+
+    let output = registry.render();
+
+    assert!(output.contains("# HELP ferrum_gateway_overhead_ms"));
+    assert!(output.contains("# TYPE ferrum_gateway_overhead_ms histogram"));
+    assert!(
+        output.contains(
+            r#"ferrum_gateway_overhead_ms_bucket{proxy_id="overhead-render",le="+Inf"} 1"#
+        )
+    );
 }
 
 #[tokio::test]

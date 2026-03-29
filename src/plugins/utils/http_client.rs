@@ -224,6 +224,40 @@ impl PluginHttpClient {
         }
         result
     }
+
+    /// Send a request and accumulate the elapsed time into a shared counter.
+    ///
+    /// Identical to [`execute`] but atomically adds the round-trip time
+    /// (in nanoseconds) to `accumulator`. Used by plugins that make
+    /// external HTTP calls during the request lifecycle so the gateway
+    /// can report `latency_plugin_external_io_ms` in transaction logs.
+    #[allow(dead_code)] // Available for plugins to opt into; not yet called by built-in plugins
+    pub async fn execute_tracked(
+        &self,
+        request: reqwest::RequestBuilder,
+        label: &str,
+        accumulator: &std::sync::atomic::AtomicU64,
+    ) -> Result<reqwest::Response, reqwest::Error> {
+        let request = request.build()?;
+        let url = request.url().to_string();
+        let start = std::time::Instant::now();
+        let result = self.client.execute(request).await;
+        let elapsed = start.elapsed();
+        accumulator.fetch_add(
+            elapsed.as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        if elapsed > self.slow_threshold {
+            tracing::warn!(
+                plugin = label,
+                url = %url,
+                elapsed_ms = elapsed.as_millis() as u64,
+                threshold_ms = self.slow_threshold.as_millis() as u64,
+                "Slow plugin HTTP call"
+            );
+        }
+        result
+    }
 }
 
 impl Default for PluginHttpClient {

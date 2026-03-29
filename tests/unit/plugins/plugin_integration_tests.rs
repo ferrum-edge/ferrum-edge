@@ -16,7 +16,6 @@ async fn test_all_plugins_available() {
         "stdout_logging",
         "http_logging",
         "transaction_debugger",
-        "oauth2_auth",
         "jwt_auth",
         "key_auth",
         "basic_auth",
@@ -60,7 +59,6 @@ async fn test_plugin_creation_all_plugins() {
             "jwks_auth" => {
                 json!({"providers": [{"jwks_uri": "https://example.com/.well-known/jwks.json"}]})
             }
-            "oauth2_auth" => json!({"jwks_uri": "https://example.com/.well-known/jwks.json"}),
             "ip_restriction" => json!({"allow": ["0.0.0.0/0"]}),
             "access_control" => json!({"allowed_ips": ["0.0.0.0/0"]}),
             _ => json!({}),

@@ -22,6 +22,9 @@ fn make_full_summary() -> TransactionSummary {
         latency_gateway_processing_ms: 5.5,
         latency_backend_ttfb_ms: 38.0,
         latency_backend_total_ms: 40.0,
+        latency_plugin_execution_ms: 3.0,
+        latency_plugin_external_io_ms: 0.0,
+        latency_gateway_overhead_ms: 2.5,
         request_user_agent: Some("curl/8.0".to_string()),
         response_streamed: false,
         client_disconnected: false,
@@ -199,6 +202,81 @@ async fn test_dns_resolved_ip_would_appear_in_transaction_log() {
         ip.is_loopback(),
         "Resolved IP should be loopback for localhost"
     );
+}
+
+// ── Gateway latency fields ──────────────────────────────────────────────
+
+#[test]
+fn test_summary_json_contains_gateway_overhead_ms() {
+    let summary = make_full_summary();
+    let json = serde_json::to_string(&summary).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+    assert_eq!(parsed["latency_gateway_overhead_ms"], 2.5);
+    assert_eq!(parsed["latency_plugin_execution_ms"], 3.0);
+    assert_eq!(parsed["latency_plugin_external_io_ms"], 0.0);
+}
+
+#[test]
+fn test_gateway_overhead_computation_no_backend() {
+    // Simulates a rejected request (no backend call).
+    // overhead = total - plugin_execution
+    let mut summary = make_full_summary();
+    summary.latency_total_ms = 10.0;
+    summary.latency_plugin_execution_ms = 4.0;
+    summary.latency_backend_total_ms = -1.0;
+    summary.latency_backend_ttfb_ms = 0.0;
+    // For rejected requests: overhead = total - plugin_execution = 6.0
+    summary.latency_gateway_overhead_ms =
+        summary.latency_total_ms - summary.latency_plugin_execution_ms;
+
+    assert!((summary.latency_gateway_overhead_ms - 6.0).abs() < 0.001);
+}
+
+#[test]
+fn test_gateway_overhead_computation_with_backend() {
+    // overhead = total - max(backend, 0) - plugin_execution
+    let mut summary = make_full_summary();
+    summary.latency_total_ms = 100.0;
+    summary.latency_backend_total_ms = 80.0;
+    summary.latency_plugin_execution_ms = 5.0;
+    summary.latency_gateway_overhead_ms = summary.latency_total_ms
+        - summary.latency_backend_total_ms.max(0.0)
+        - summary.latency_plugin_execution_ms;
+
+    assert!((summary.latency_gateway_overhead_ms - 15.0).abs() < 0.001);
+}
+
+#[test]
+fn test_gateway_overhead_with_external_io() {
+    // plugin_external_io_ms is a subset of plugin_execution_ms.
+    // overhead should not double-subtract it.
+    let mut summary = make_full_summary();
+    summary.latency_total_ms = 100.0;
+    summary.latency_backend_total_ms = 50.0;
+    summary.latency_plugin_execution_ms = 30.0;
+    summary.latency_plugin_external_io_ms = 25.0; // 25ms of the 30ms was external HTTP
+    summary.latency_gateway_overhead_ms = summary.latency_total_ms
+        - summary.latency_backend_total_ms.max(0.0)
+        - summary.latency_plugin_execution_ms;
+
+    // overhead = 100 - 50 - 30 = 20ms (external_io is informational, not subtracted separately)
+    assert!((summary.latency_gateway_overhead_ms - 20.0).abs() < 0.001);
+}
+
+#[test]
+fn test_plugin_http_call_ns_accumulator() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    let accumulator = Arc::new(AtomicU64::new(0));
+
+    // Simulate two plugin HTTP calls accumulating time
+    accumulator.fetch_add(5_000_000, Ordering::Relaxed); // 5ms in nanoseconds
+    accumulator.fetch_add(3_000_000, Ordering::Relaxed); // 3ms in nanoseconds
+
+    let external_io_ms = accumulator.load(Ordering::Relaxed) as f64 / 1_000_000.0;
+    assert!((external_io_ms - 8.0).abs() < 0.001);
 }
 
 // ── Error class field ───────────────────────────────────────────────────

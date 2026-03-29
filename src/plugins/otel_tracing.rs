@@ -43,6 +43,8 @@ struct SpanData {
     client_ip: String,
     duration_ms: f64,
     backend_ms: f64,
+    plugin_execution_ms: f64,
+    gateway_overhead_ms: f64,
     consumer: Option<String>,
     timestamp_received: String,
 }
@@ -267,6 +269,8 @@ impl Plugin for OtelTracing {
                 client_ip: summary.client_ip.clone(),
                 duration_ms: summary.latency_total_ms,
                 backend_ms: summary.latency_backend_total_ms,
+                plugin_execution_ms: summary.latency_plugin_execution_ms,
+                gateway_overhead_ms: summary.latency_gateway_overhead_ms,
                 consumer: summary.consumer_username.clone(),
                 timestamp_received: summary.timestamp_received.clone(),
             };
@@ -416,6 +420,14 @@ fn build_otlp_payload(service_name: &str, spans: &[SpanData]) -> Value {
             if s.backend_ms >= 0.0 {
                 attributes.push(otlp_attribute_double("backend.duration_ms", s.backend_ms));
             }
+            attributes.push(otlp_attribute_double(
+                "gateway.plugin_execution_ms",
+                s.plugin_execution_ms,
+            ));
+            attributes.push(otlp_attribute_double(
+                "gateway.overhead_ms",
+                s.gateway_overhead_ms,
+            ));
             if let Some(ref consumer) = s.consumer {
                 attributes.push(otlp_attribute("consumer.username", consumer));
             }

@@ -22,7 +22,6 @@ tests/
 │   │   ├── jwt_auth_plugin_tests.rs    # JWT auth plugin
 │   │   ├── key_auth_tests.rs           # Key auth plugin
 │   │   ├── jwks_auth_tests.rs           # JWKS auth plugin
-│   │   ├── oauth2_auth_tests.rs        # OAuth2 auth plugin (legacy)
 │   │   ├── plugin_cache_tests.rs       # Plugin cache logic
 │   │   ├── plugin_integration_tests.rs # Plugin creation and scope
 │   │   ├── rate_limiting_tests.rs      # Rate limiting plugin
