@@ -1,8 +1,10 @@
 //! OpenTelemetry Tracing Plugin
 //!
 //! Provides W3C Trace Context propagation (traceparent/tracestate headers)
-//! and emits structured trace data via the `log()` hook.
-//! Generates trace IDs for requests that don't already carry them.
+//! and exports spans to an OTLP-compatible collector via HTTP/JSON.
+//!
+//! When no endpoint is configured, the plugin runs in propagation-only mode:
+//! it generates/propagates trace context headers without exporting spans.
 //!
 //! Optionally exports spans to an OTLP-compatible collector via HTTP/JSON
 //! (OTLP/HTTP with JSON encoding, per the OpenTelemetry specification).
@@ -42,11 +44,22 @@ struct SpanData {
     http_status_code: u16,
     client_ip: String,
     duration_ms: f64,
+    gateway_processing_ms: f64,
+    backend_ttfb_ms: f64,
     backend_ms: f64,
     plugin_execution_ms: f64,
     gateway_overhead_ms: f64,
     consumer: Option<String>,
     timestamp_received: String,
+    // Rich attributes from TransactionSummary
+    user_agent: Option<String>,
+    matched_proxy_id: Option<String>,
+    matched_route: Option<String>,
+    backend_target_url: Option<String>,
+    backend_resolved_ip: Option<String>,
+    error_class: Option<String>,
+    response_streamed: bool,
+    client_disconnected: bool,
 }
 
 impl OtelTracing {
@@ -60,47 +73,63 @@ impl OtelTracing {
             .to_string();
         let generate_trace_id = config["generate_trace_id"].as_bool().unwrap_or(true);
 
+        let deployment_environment = config["deployment_environment"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+
+        // Endpoint is optional — when absent, plugin runs in propagation-only mode
         let endpoint = config["endpoint"]
             .as_str()
             .filter(|s| !s.is_empty())
-            .ok_or_else(|| {
-                "otel_tracing: 'endpoint' is required — traces will have nowhere to export"
-                    .to_string()
-            })?
-            .to_string();
+            .map(|s| s.to_string());
 
-        let batch_size = config["batch_size"].as_u64().unwrap_or(50).max(1) as usize;
-        let flush_interval_ms = config["flush_interval_ms"]
-            .as_u64()
-            .unwrap_or(5000)
-            .max(100);
-        let buffer_capacity = config["buffer_capacity"].as_u64().unwrap_or(10000).max(1) as usize;
+        let (otlp_sender, otlp_hostname) = if let Some(endpoint) = endpoint {
+            let batch_size = config["batch_size"].as_u64().unwrap_or(50).max(1) as usize;
+            let flush_interval_ms = config["flush_interval_ms"]
+                .as_u64()
+                .unwrap_or(5000)
+                .max(100);
+            let buffer_capacity =
+                config["buffer_capacity"].as_u64().unwrap_or(10000).max(1) as usize;
 
-        let otlp_hostname = Url::parse(&endpoint)
-            .ok()
-            .and_then(|u| u.host_str().map(|h| h.to_string()));
+            let otlp_hostname = Url::parse(&endpoint)
+                .ok()
+                .and_then(|u| u.host_str().map(|h| h.to_string()));
 
-        let authorization = config["authorization"].as_str().map(|s| s.to_string());
+            let authorization = config["authorization"].as_str().map(|s| s.to_string());
 
-        let (sender, receiver) = mpsc::channel(buffer_capacity);
+            // Parse custom headers from config
+            let custom_headers = parse_custom_headers(&config["headers"]);
 
-        let otlp_config = OtlpConfig {
-            endpoint,
-            authorization,
-            http_client,
-            batch_size,
-            flush_interval: Duration::from_millis(flush_interval_ms),
-            max_retries: config["max_retries"].as_u64().unwrap_or(2) as u32,
-            retry_delay: Duration::from_millis(config["retry_delay_ms"].as_u64().unwrap_or(1000)),
-            service_name: service_name.clone(),
+            let (sender, receiver) = mpsc::channel(buffer_capacity);
+
+            let otlp_config = OtlpConfig {
+                endpoint,
+                authorization,
+                custom_headers,
+                http_client,
+                batch_size,
+                flush_interval: Duration::from_millis(flush_interval_ms),
+                max_retries: config["max_retries"].as_u64().unwrap_or(2) as u32,
+                retry_delay: Duration::from_millis(
+                    config["retry_delay_ms"].as_u64().unwrap_or(1000),
+                ),
+                service_name: service_name.clone(),
+                deployment_environment: deployment_environment.clone(),
+            };
+
+            tokio::spawn(otlp_flush_loop(receiver, otlp_config));
+
+            (Some(sender), otlp_hostname)
+        } else {
+            (None, None)
         };
-
-        tokio::spawn(otlp_flush_loop(receiver, otlp_config));
 
         Ok(Self {
             service_name,
             generate_trace_id,
-            otlp_sender: Some(sender),
+            otlp_sender,
             otlp_hostname,
         })
     }
@@ -240,7 +269,7 @@ impl Plugin for OtelTracing {
             .map(|s| s.as_str())
             .unwrap_or("");
 
-        // Always emit structured log (existing behavior)
+        // Always emit structured log
         tracing::info!(
             target: "otel",
             service_name = %self.service_name,
@@ -268,11 +297,21 @@ impl Plugin for OtelTracing {
                 http_status_code: summary.response_status_code,
                 client_ip: summary.client_ip.clone(),
                 duration_ms: summary.latency_total_ms,
+                gateway_processing_ms: summary.latency_gateway_processing_ms,
+                backend_ttfb_ms: summary.latency_backend_ttfb_ms,
                 backend_ms: summary.latency_backend_total_ms,
                 plugin_execution_ms: summary.latency_plugin_execution_ms,
                 gateway_overhead_ms: summary.latency_gateway_overhead_ms,
                 consumer: summary.consumer_username.clone(),
                 timestamp_received: summary.timestamp_received.clone(),
+                user_agent: summary.request_user_agent.clone(),
+                matched_proxy_id: summary.matched_proxy_id.clone(),
+                matched_route: summary.matched_proxy_name.clone(),
+                backend_target_url: summary.backend_target_url.clone(),
+                backend_resolved_ip: summary.backend_resolved_ip.clone(),
+                error_class: summary.error_class.as_ref().map(|e| format!("{e:?}")),
+                response_streamed: summary.response_streamed,
+                client_disconnected: summary.client_disconnected,
             };
 
             if sender.try_send(span_data).is_err() {
@@ -294,12 +333,26 @@ impl Plugin for OtelTracing {
 struct OtlpConfig {
     endpoint: String,
     authorization: Option<String>,
+    custom_headers: Vec<(String, String)>,
     http_client: PluginHttpClient,
     batch_size: usize,
     flush_interval: Duration,
     max_retries: u32,
     retry_delay: Duration,
     service_name: String,
+    deployment_environment: Option<String>,
+}
+
+/// Parse custom headers from the `headers` config field.
+/// Accepts an object like `{"x-honeycomb-team": "abc", "X-Scope-OrgID": "123"}`.
+fn parse_custom_headers(value: &Value) -> Vec<(String, String)> {
+    match value.as_object() {
+        Some(map) => map
+            .iter()
+            .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+            .collect(),
+        None => Vec::new(),
+    }
 }
 
 async fn otlp_flush_loop(mut receiver: mpsc::Receiver<SpanData>, cfg: OtlpConfig) {
@@ -343,7 +396,11 @@ async fn otlp_flush_loop(mut receiver: mpsc::Receiver<SpanData>, cfg: OtlpConfig
 async fn send_otlp_batch(cfg: &OtlpConfig, batch: Vec<SpanData>) {
     let total_attempts = cfg.max_retries + 1;
     let entry_count = batch.len();
-    let payload = build_otlp_payload(&cfg.service_name, &batch);
+    let payload = build_otlp_payload(
+        &cfg.service_name,
+        cfg.deployment_environment.as_deref(),
+        &batch,
+    );
 
     for attempt in 1..=total_attempts {
         let mut req = cfg
@@ -355,6 +412,10 @@ async fn send_otlp_batch(cfg: &OtlpConfig, batch: Vec<SpanData>) {
 
         if let Some(auth) = &cfg.authorization {
             req = req.header("Authorization", auth);
+        }
+
+        for (key, value) in &cfg.custom_headers {
+            req = req.header(key.as_str(), value.as_str());
         }
 
         match cfg.http_client.execute(req, "otel_export").await {
@@ -390,7 +451,11 @@ async fn send_otlp_batch(cfg: &OtlpConfig, batch: Vec<SpanData>) {
 ///
 /// Format: ExportTraceServiceRequest with ResourceSpans → ScopeSpans → Spans.
 /// See: https://opentelemetry.io/docs/specs/otlp/#otlphttp-request
-fn build_otlp_payload(service_name: &str, spans: &[SpanData]) -> Value {
+fn build_otlp_payload(
+    service_name: &str,
+    deployment_environment: Option<&str>,
+    spans: &[SpanData],
+) -> Value {
     let otlp_spans: Vec<Value> = spans
         .iter()
         .map(|s| {
@@ -410,15 +475,21 @@ fn build_otlp_payload(service_name: &str, spans: &[SpanData]) -> Value {
             let end_ns = start_ns + (s.duration_ms * 1_000_000.0) as i64;
 
             let mut attributes = vec![
-                otlp_attribute("http.method", &s.http_method),
-                otlp_attribute("http.url", &s.http_url),
-                otlp_attribute_int("http.status_code", s.http_status_code as i64),
-                otlp_attribute("net.peer.ip", &s.client_ip),
+                otlp_attribute("http.request.method", &s.http_method),
+                otlp_attribute("url.path", &s.http_url),
+                otlp_attribute_int("http.response.status_code", s.http_status_code as i64),
+                otlp_attribute("client.address", &s.client_ip),
                 otlp_attribute("service.name", &s.service_name),
+                otlp_attribute_double("gateway.latency.total_ms", s.duration_ms),
+                otlp_attribute_double("gateway.latency.processing_ms", s.gateway_processing_ms),
+                otlp_attribute_double("gateway.latency.backend_ttfb_ms", s.backend_ttfb_ms),
             ];
 
             if s.backend_ms >= 0.0 {
-                attributes.push(otlp_attribute_double("backend.duration_ms", s.backend_ms));
+                attributes.push(otlp_attribute_double(
+                    "gateway.latency.backend_total_ms",
+                    s.backend_ms,
+                ));
             }
             attributes.push(otlp_attribute_double(
                 "gateway.plugin_execution_ms",
@@ -429,8 +500,55 @@ fn build_otlp_payload(service_name: &str, spans: &[SpanData]) -> Value {
                 s.gateway_overhead_ms,
             ));
             if let Some(ref consumer) = s.consumer {
-                attributes.push(otlp_attribute("consumer.username", consumer));
+                attributes.push(otlp_attribute("enduser.id", consumer));
             }
+            if let Some(ref ua) = s.user_agent {
+                attributes.push(otlp_attribute("user_agent.original", ua));
+            }
+            if let Some(ref proxy_id) = s.matched_proxy_id {
+                attributes.push(otlp_attribute("gateway.proxy.id", proxy_id));
+            }
+            if let Some(ref route) = s.matched_route {
+                attributes.push(otlp_attribute("http.route", route));
+            }
+            if let Some(ref target) = s.backend_target_url {
+                attributes.push(otlp_attribute("server.address", target));
+            }
+            if let Some(ref resolved) = s.backend_resolved_ip {
+                attributes.push(otlp_attribute("server.socket.address", resolved));
+            }
+            if s.response_streamed {
+                attributes.push(otlp_attribute_bool("gateway.response.streamed", true));
+            }
+            if s.client_disconnected {
+                attributes.push(otlp_attribute_bool("gateway.client.disconnected", true));
+            }
+
+            // Build span events for error conditions
+            let mut events = Vec::new();
+            if let Some(ref error_class) = s.error_class {
+                events.push(serde_json::json!({
+                    "name": "exception",
+                    "timeUnixNano": end_ns.to_string(),
+                    "attributes": [
+                        otlp_attribute("exception.type", "GatewayError"),
+                        otlp_attribute("exception.message", error_class),
+                    ]
+                }));
+            }
+            if s.client_disconnected {
+                events.push(serde_json::json!({
+                    "name": "client.disconnect",
+                    "timeUnixNano": end_ns.to_string(),
+                    "attributes": []
+                }));
+            }
+
+            let status_code = if s.http_status_code >= 500 {
+                2 // ERROR
+            } else {
+                1 // OK (includes 4xx — client errors are not server errors)
+            };
 
             let mut span = serde_json::json!({
                 "traceId": trace_id_bytes,
@@ -441,24 +559,37 @@ fn build_otlp_payload(service_name: &str, spans: &[SpanData]) -> Value {
                 "endTimeUnixNano": end_ns.to_string(),
                 "attributes": attributes,
                 "status": {
-                    "code": if s.http_status_code >= 400 { 2 } else { 1 } // ERROR or OK
+                    "code": status_code
                 }
             });
 
             if !parent_span_bytes.is_empty() {
                 span["parentSpanId"] = Value::String(parent_span_bytes);
             }
+            if !events.is_empty() {
+                span["events"] = Value::Array(events);
+            }
 
             span
         })
         .collect();
 
+    // Build resource attributes
+    let mut resource_attributes = vec![otlp_attribute("service.name", service_name)];
+    resource_attributes.push(otlp_attribute("service.version", env!("CARGO_PKG_VERSION")));
+    resource_attributes.push(otlp_attribute("telemetry.sdk.name", "ferrum-gateway"));
+    resource_attributes.push(otlp_attribute(
+        "telemetry.sdk.version",
+        env!("CARGO_PKG_VERSION"),
+    ));
+    if let Some(env) = deployment_environment {
+        resource_attributes.push(otlp_attribute("deployment.environment", env));
+    }
+
     serde_json::json!({
         "resourceSpans": [{
             "resource": {
-                "attributes": [
-                    otlp_attribute("service.name", service_name)
-                ]
+                "attributes": resource_attributes
             },
             "scopeSpans": [{
                 "scope": {
@@ -489,6 +620,13 @@ fn otlp_attribute_double(key: &str, value: f64) -> Value {
     serde_json::json!({
         "key": key,
         "value": { "doubleValue": value }
+    })
+}
+
+fn otlp_attribute_bool(key: &str, value: bool) -> Value {
+    serde_json::json!({
+        "key": key,
+        "value": { "boolValue": value }
     })
 }
 

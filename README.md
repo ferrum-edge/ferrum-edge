@@ -1010,7 +1010,8 @@ Within each phase, plugins run in **priority order** (lowest number first). This
 | 2925-2975 | AI Pre-proxy | `ai_prompt_shield` (PII scan), `ai_request_guard` (model/token policy) |
 | 3000 | Transform | `request_transformer`, `body_validator`, `request_termination` |
 | 4000-4200 | Response | `response_transformer`, `ai_token_metrics` (extract usage), `ai_rate_limiter` (count tokens) |
-| 9000-9400 | Logging | `stdout_logging`, `http_logging`, `transaction_debugger`, `correlation_id`, `prometheus_metrics`, `otel_tracing` |
+| 25 | Tracing | `otel_tracing` (W3C trace context + OTLP export, runs first for accurate timing) |
+| 9000-9300 | Logging | `stdout_logging`, `http_logging`, `transaction_debugger`, `correlation_id`, `prometheus_metrics` |
 
 Plugins at the same priority have no guaranteed relative order. Gaps between bands allow future plugins to slot in without renumbering. See [docs/plugin_execution_order.md](docs/plugin_execution_order.md) for the full design rationale.
 
@@ -1496,13 +1497,27 @@ Exports gateway metrics in Prometheus exposition format.
 
 #### `otel_tracing`
 
-Integrates with OpenTelemetry for distributed tracing.
+W3C Trace Context propagation and OTLP span export. Runs at priority 25 (earliest plugin) to capture accurate request timing. Supports two modes:
+
+- **Propagation + Export** (default): Generates/propagates `traceparent`/`tracestate` headers and exports spans to an OTLP collector via HTTP/JSON.
+- **Propagation-only**: When no `endpoint` is configured, generates/propagates trace context without exporting spans.
+
+Exported spans include OTel semantic convention attributes (`http.request.method`, `url.path`, `http.response.status_code`, `client.address`, `user_agent.original`, `http.route`, `server.address`, `server.socket.address`), gateway-specific attributes (`gateway.proxy.id`, `gateway.latency.*`, `gateway.response.streamed`, `gateway.client.disconnected`), error classification events, and resource attributes (`service.name`, `service.version`, `deployment.environment`).
 
 **Config**:
-| Parameter | Type | Description |
-|---|---|---|
-| `endpoint` | String | OTLP collector endpoint |
-| `service_name` | String | Service name for traces |
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `endpoint` | String | _(none)_ | OTLP/HTTP collector endpoint (e.g. `http://collector:4318/v1/traces`). Omit for propagation-only mode |
+| `service_name` | String | `ferrum-gateway` | Service name in spans and resource attributes |
+| `deployment_environment` | String | _(none)_ | `deployment.environment` resource attribute (e.g. `production`, `staging`) |
+| `generate_trace_id` | Boolean | `true` | Generate trace IDs for requests without incoming `traceparent` |
+| `headers` | Object | `{}` | Custom HTTP headers sent with OTLP exports (e.g. `{"x-honeycomb-team": "key"}`) |
+| `authorization` | String | _(none)_ | Authorization header value for OTLP exports |
+| `batch_size` | Integer | `50` | Spans per export batch |
+| `flush_interval_ms` | Integer | `5000` | Max delay before flushing a partial batch |
+| `buffer_capacity` | Integer | `10000` | Max pending spans; drops oldest when full |
+| `max_retries` | Integer | `2` | Retry attempts on export failure |
+| `retry_delay_ms` | Integer | `1000` | Delay between retries |
 
 ### Custom Plugins
 

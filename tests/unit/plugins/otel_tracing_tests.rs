@@ -9,7 +9,7 @@ use std::collections::HashMap;
 
 fn new_otel(config: &serde_json::Value) -> OtelTracing {
     // Merge a default endpoint into the config so tests that don't care about the
-    // endpoint still pass now that it's required.
+    // endpoint still pass now that it's required for OTLP export.
     let mut merged = config.clone();
     if merged.get("endpoint").is_none() {
         merged["endpoint"] =
@@ -47,6 +47,33 @@ fn make_summary(metadata: HashMap<String, String>) -> TransactionSummary {
         latency_gateway_overhead_ms: 1.5,
         request_user_agent: None,
         response_streamed: false,
+        client_disconnected: false,
+        error_class: None,
+        metadata,
+    }
+}
+
+fn make_rich_summary(metadata: HashMap<String, String>) -> TransactionSummary {
+    TransactionSummary {
+        timestamp_received: "2026-03-23T12:00:00Z".to_string(),
+        client_ip: "10.0.0.1".to_string(),
+        consumer_username: Some("alice".to_string()),
+        http_method: "POST".to_string(),
+        request_path: "/api/llm/chat".to_string(),
+        matched_proxy_id: Some("proxy-1".to_string()),
+        matched_proxy_name: Some("llm-service".to_string()),
+        backend_target_url: Some("http://backend:8080/chat".to_string()),
+        backend_resolved_ip: Some("10.1.2.3".to_string()),
+        response_status_code: 200,
+        latency_total_ms: 150.0,
+        latency_gateway_processing_ms: 5.0,
+        latency_backend_ttfb_ms: 120.0,
+        latency_backend_total_ms: 145.0,
+        latency_plugin_execution_ms: 2.0,
+        latency_plugin_external_io_ms: 0.5,
+        latency_gateway_overhead_ms: 3.0,
+        request_user_agent: Some("MyApp/1.0".to_string()),
+        response_streamed: true,
         client_disconnected: false,
         error_class: None,
         metadata,
@@ -177,7 +204,9 @@ async fn test_otel_tracing_no_traceparent_when_generate_disabled() {
 
 #[tokio::test]
 async fn test_otel_tracing_log_emits_without_otlp() {
-    let plugin = new_otel(&json!({}));
+    // Propagation-only mode: no endpoint configured
+    let plugin =
+        OtelTracing::new_with_http_client(&json!({}), PluginHttpClient::default()).unwrap();
 
     // Just ensure log() doesn't panic when no OTLP endpoint
     let mut metadata = HashMap::new();
@@ -275,14 +304,142 @@ async fn test_otel_tracing_warmup_hostnames() {
 }
 
 #[tokio::test]
-async fn test_otel_tracing_creation_fails_without_endpoint() {
-    let result = OtelTracing::new_with_http_client(&json!({}), PluginHttpClient::default());
-    match result {
-        Err(e) => assert!(
-            e.contains("endpoint"),
-            "Expected error about endpoint, got: {}",
-            e
-        ),
-        Ok(_) => panic!("Expected Err when creating otel_tracing without endpoint"),
-    }
+async fn test_otel_tracing_propagation_only_mode() {
+    // No endpoint — should create successfully in propagation-only mode
+    let plugin =
+        OtelTracing::new_with_http_client(&json!({}), PluginHttpClient::default()).unwrap();
+
+    // Should still generate trace context
+    let mut ctx = make_ctx();
+    let result = plugin.on_request_received(&mut ctx).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(ctx.metadata.contains_key("traceparent"));
+    assert!(ctx.metadata.contains_key("trace_id"));
+
+    // Should still inject headers
+    let mut headers = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(headers.contains_key("traceparent"));
+
+    // No warmup hostnames in propagation-only mode
+    assert!(plugin.warmup_hostnames().is_empty());
+}
+
+#[tokio::test]
+async fn test_otel_tracing_custom_headers() {
+    let mock_server = wiremock::MockServer::start().await;
+
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::header("x-honeycomb-team", "my-api-key"))
+        .and(wiremock::matchers::header("X-Scope-OrgID", "tenant-123"))
+        .respond_with(wiremock::ResponseTemplate::new(200))
+        .expect(1..)
+        .mount(&mock_server)
+        .await;
+
+    let endpoint = format!("{}/v1/traces", mock_server.uri());
+
+    let plugin = new_otel(&json!({
+        "endpoint": endpoint,
+        "headers": {
+            "x-honeycomb-team": "my-api-key",
+            "X-Scope-OrgID": "tenant-123"
+        },
+        "batch_size": 1,
+        "flush_interval_ms": 100
+    }));
+
+    let mut metadata = HashMap::new();
+    metadata.insert(
+        "trace_id".to_string(),
+        "abcdef1234567890abcdef1234567890".to_string(),
+    );
+    metadata.insert("span_id".to_string(), "1234567890abcdef".to_string());
+
+    let summary = make_summary(metadata);
+    plugin.log(&summary).await;
+
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+}
+
+#[tokio::test]
+async fn test_otel_tracing_rich_span_attributes() {
+    let mock_server = wiremock::MockServer::start().await;
+
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .respond_with(wiremock::ResponseTemplate::new(200))
+        .expect(1..)
+        .mount(&mock_server)
+        .await;
+
+    let endpoint = format!("{}/v1/traces", mock_server.uri());
+
+    let plugin = new_otel(&json!({
+        "endpoint": endpoint,
+        "deployment_environment": "staging",
+        "batch_size": 1,
+        "flush_interval_ms": 100
+    }));
+
+    let mut metadata = HashMap::new();
+    metadata.insert(
+        "trace_id".to_string(),
+        "abcdef1234567890abcdef1234567890".to_string(),
+    );
+    metadata.insert("span_id".to_string(), "1234567890abcdef".to_string());
+
+    let summary = make_rich_summary(metadata);
+    plugin.log(&summary).await;
+
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    // Verify the mock was called (wiremock expect handles this)
+    // The rich attributes (user_agent, route, backend_target, etc.) are included
+    // in the OTLP payload — we verify they don't break serialization or export.
+}
+
+#[tokio::test]
+async fn test_otel_tracing_error_span_events() {
+    let mock_server = wiremock::MockServer::start().await;
+
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .respond_with(wiremock::ResponseTemplate::new(200))
+        .expect(1..)
+        .mount(&mock_server)
+        .await;
+
+    let endpoint = format!("{}/v1/traces", mock_server.uri());
+
+    let plugin = new_otel(&json!({
+        "endpoint": endpoint,
+        "batch_size": 1,
+        "flush_interval_ms": 100
+    }));
+
+    let mut metadata = HashMap::new();
+    metadata.insert(
+        "trace_id".to_string(),
+        "abcdef1234567890abcdef1234567890".to_string(),
+    );
+    metadata.insert("span_id".to_string(), "1234567890abcdef".to_string());
+
+    // Simulate a gateway error with error_class and client disconnect
+    let mut summary = make_summary(metadata);
+    summary.response_status_code = 502;
+    summary.error_class = Some(ferrum_gateway::retry::ErrorClass::ConnectionTimeout);
+    summary.client_disconnected = true;
+
+    plugin.log(&summary).await;
+
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+}
+
+#[tokio::test]
+async fn test_otel_tracing_deployment_environment() {
+    let plugin = new_otel(&json!({
+        "deployment_environment": "production"
+    }));
+
+    // Plugin should be created with environment set
+    assert_eq!(plugin.name(), "otel_tracing");
 }

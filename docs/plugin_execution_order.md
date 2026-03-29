@@ -55,13 +55,13 @@ Priority bands are spaced with gaps so future plugins can slot in without renumb
 
 | Band | Priority Range | Purpose | Plugins |
 |------|---------------|---------|---------|
-| **Early** | 0–949 | Pre-processing that must run before auth | `cors` (100), `ip_restriction` (150), `bot_detection` (200) |
+| **Early** | 0–949 | Pre-processing that must run before auth | `otel_tracing` (25), `cors` (100), `ip_restriction` (150), `bot_detection` (200) |
 | **AuthN** | 950–1999 | Authentication / identity verification | `mtls_auth` (950), `jwks_auth` (1000), `jwt_auth` (1100), `key_auth` (1200), `basic_auth` (1300), `hmac_auth` (1400) |
 | **AuthZ** | 2000–2999 | Authorization & post-auth enforcement | `access_control` (2000), `graphql` (2850), `rate_limiting` (2900), `ai_prompt_shield` (2925) |
 | **Transform** | 3000–3999 | Request modification before backend call | `body_validator` (2950), `ai_request_guard` (2975), `request_transformer` (3000), `request_termination` (3200) |
 | **Response** | 4000–4999 | Response modification after backend call | `response_transformer` (4000), `ai_token_metrics` (4100), `ai_rate_limiter` (4200) |
 | **Custom** | 5000 | Default for unrecognized/custom plugins | _(future plugins)_ |
-| **Logging** | 9000–9999 | Observability, runs outside the hot path | `stdout_logging` (9000), `correlation_id` (9050), `http_logging` (9100), `transaction_debugger` (9200), `prometheus_metrics` (9300), `otel_tracing` (9400) |
+| **Logging** | 9000–9999 | Observability, runs outside the hot path | `stdout_logging` (9000), `correlation_id` (9050), `http_logging` (9100), `transaction_debugger` (9200), `prometheus_metrics` (9300) |
 
 ## Complete Execution Order
 
@@ -69,36 +69,40 @@ Given all built-in plugins enabled, the execution order is:
 
 | # | Plugin | Priority | Active Phases |
 |---|--------|----------|---------------|
-| 1 | `cors` | 100 | on_request_received, after_proxy |
-| 2 | `ip_restriction` | 150 | on_request_received |
-| 3 | `bot_detection` | 200 | on_request_received |
-| 4 | `mtls_auth` | 950 | authenticate |
-| 5 | `jwks_auth` | 1000 | authenticate |
-| 6 | `jwt_auth` | 1100 | authenticate |
-| 7 | `key_auth` | 1200 | authenticate |
-| 8 | `basic_auth` | 1300 | authenticate |
-| 9 | `hmac_auth` | 1400 | authenticate |
-| 10 | `access_control` | 2000 | authorize |
-| 11 | `graphql` | 2850 | before_proxy |
-| 12 | `rate_limiting` | 2900 | on_request_received (IP mode), authorize (consumer mode) |
-| 13 | `ai_prompt_shield` | 2925 | before_proxy, transform_request_body |
-| 14 | `body_validator` | 2950 | before_proxy, on_response_body |
-| 15 | `ai_request_guard` | 2975 | before_proxy, transform_request_body |
-| 16 | `request_transformer` | 3000 | before_proxy |
-| 17 | `request_termination` | 3200 | before_proxy |
-| 18 | `response_transformer` | 4000 | after_proxy |
-| 19 | `ai_token_metrics` | 4100 | on_response_body |
-| 20 | `ai_rate_limiter` | 4200 | before_proxy, on_response_body, after_proxy |
-| 21 | `stdout_logging` | 9000 | log |
-| 22 | `correlation_id` | 9050 | on_request_received, log |
-| 23 | `http_logging` | 9100 | log |
-| 24 | `transaction_debugger` | 9200 | on_request_received, after_proxy, log |
-| 25 | `prometheus_metrics` | 9300 | after_proxy, log |
-| 26 | `otel_tracing` | 9400 | on_request_received, after_proxy |
+| 1 | `otel_tracing` | 25 | on_request_received, before_proxy, after_proxy, log |
+| 2 | `cors` | 100 | on_request_received, after_proxy |
+| 3 | `ip_restriction` | 150 | on_request_received |
+| 4 | `bot_detection` | 200 | on_request_received |
+| 5 | `mtls_auth` | 950 | authenticate |
+| 6 | `jwks_auth` | 1000 | authenticate |
+| 7 | `jwt_auth` | 1100 | authenticate |
+| 8 | `key_auth` | 1200 | authenticate |
+| 9 | `basic_auth` | 1300 | authenticate |
+| 10 | `hmac_auth` | 1400 | authenticate |
+| 11 | `access_control` | 2000 | authorize |
+| 12 | `graphql` | 2850 | before_proxy |
+| 13 | `rate_limiting` | 2900 | on_request_received (IP mode), authorize (consumer mode) |
+| 14 | `ai_prompt_shield` | 2925 | before_proxy, transform_request_body |
+| 15 | `body_validator` | 2950 | before_proxy, on_response_body |
+| 16 | `ai_request_guard` | 2975 | before_proxy, transform_request_body |
+| 17 | `request_transformer` | 3000 | before_proxy |
+| 18 | `request_termination` | 3200 | before_proxy |
+| 19 | `response_transformer` | 4000 | after_proxy |
+| 20 | `ai_token_metrics` | 4100 | on_response_body |
+| 21 | `ai_rate_limiter` | 4200 | before_proxy, on_response_body, after_proxy |
+| 22 | `stdout_logging` | 9000 | log |
+| 23 | `correlation_id` | 9050 | on_request_received, log |
+| 24 | `http_logging` | 9100 | log |
+| 25 | `transaction_debugger` | 9200 | on_request_received, after_proxy, log |
+| 26 | `prometheus_metrics` | 9300 | after_proxy, log |
 
 ## Why This Order Matters
 
-### CORS runs first (priority 100)
+### OTel tracing runs first (priority 25)
+
+OpenTelemetry tracing runs at priority 25 — the earliest of any plugin — so it can capture trace context before any other plugin runs. This ensures accurate timing: the gateway span's start time reflects the true moment the request was received, not the time after CORS/auth/etc. have executed. The `before_proxy` phase injects traceparent into backend requests, `after_proxy` echoes it to clients, and `log` exports the completed span to the OTLP collector.
+
+### CORS runs next (priority 100)
 
 Browser preflight (`OPTIONS`) requests must be answered before authentication. If an auth plugin ran first, it would reject the preflight with `401` and the browser would never complete the CORS handshake. CORS at priority 100 ensures preflight responses are returned immediately.
 
