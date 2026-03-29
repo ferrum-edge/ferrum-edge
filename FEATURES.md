@@ -54,7 +54,7 @@ Ferrum supports dynamic upstream target discovery through three providers, confi
 
 ## Plugin System
 
-- 26 built-in plugins with lifecycle hooks (request received, authenticate, authorize, before proxy, after proxy, on response body, log)
+- 28 built-in plugins with lifecycle hooks (request received, authenticate, authorize, before proxy, after proxy, on response body, log)
 - Priority-ordered execution with protocol-aware filtering (HTTP, gRPC, WebSocket, TCP, UDP)
 - Global and per-proxy scoping with same-type override semantics
 - Multi-authentication mode with first-match consumer identification
@@ -73,6 +73,8 @@ Ferrum supports dynamic upstream target discovery through three providers, confi
 - **Access Control** — IP/CIDR and consumer-based allow/deny lists
 - **IP Restriction** — standalone IP/CIDR filtering
 - **Rate Limiting** — per-IP or per-consumer with configurable windows and optional header exposure
+- **Request Size Limiting** — per-proxy request body size limits (lower than global default), Content-Length fast path + buffered body check
+- **Response Size Limiting** — per-proxy response body size limits (lower than global default), Content-Length fast path + optional buffered body check
 - **Bot Detection** — User-Agent pattern blocking with allow-list support
 - **CORS** — preflight handling with origin, method, and header validation
 - **Body Validator** — JSON Schema and XML validation
