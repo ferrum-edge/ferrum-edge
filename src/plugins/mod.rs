@@ -201,8 +201,11 @@ pub struct TransactionSummary {
 }
 
 /// Context for stream proxy (TCP/UDP) plugin hooks.
-#[allow(dead_code)] // Used in Phase 2+ when TCP/UDP proxy handlers invoke plugins
+///
+/// Fields like `proxy_id`, `proxy_name`, `listen_port`, and `backend_protocol`
+/// are available for custom plugins to use in their `on_stream_connect` logic.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct StreamConnectionContext {
     pub client_ip: String,
     pub proxy_id: String,
@@ -213,7 +216,6 @@ pub struct StreamConnectionContext {
 }
 
 /// Transaction summary for stream proxy (TCP/UDP) logging plugins.
-#[allow(dead_code)] // Used when TCP/UDP proxy handlers invoke logging plugins
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct StreamTransactionSummary {
     pub proxy_id: String,
@@ -234,6 +236,10 @@ pub struct StreamTransactionSummary {
     pub error_class: Option<crate::retry::ErrorClass>,
     pub timestamp_connected: String,
     pub timestamp_disconnected: String,
+    /// Plugin-injected metadata (e.g., correlation ID, trace ID) carried
+    /// from `on_stream_connect` to `on_stream_disconnect`.
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    pub metadata: HashMap<String, String>,
 }
 
 /// Plugin execution priority bands.
@@ -475,13 +481,13 @@ pub trait Plugin: Send + Sync {
     /// Called when a new stream connection (TCP/UDP session) is established.
     ///
     /// Returning `PluginResult::Reject` closes the connection immediately.
-    #[allow(dead_code)]
-    async fn on_stream_connect(&self, _ctx: &StreamConnectionContext) -> PluginResult {
+    /// Plugins can insert metadata (e.g., correlation ID) into `ctx.metadata`
+    /// which is carried through to `on_stream_disconnect`.
+    async fn on_stream_connect(&self, _ctx: &mut StreamConnectionContext) -> PluginResult {
         PluginResult::Continue
     }
 
     /// Called when a stream connection (TCP/UDP session) is completed.
-    #[allow(dead_code)]
     async fn on_stream_disconnect(&self, _summary: &StreamTransactionSummary) {}
 }
 

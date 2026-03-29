@@ -6,7 +6,15 @@ use tracing::warn;
 use url::Url;
 
 use super::utils::PluginHttpClient;
-use super::{Plugin, TransactionSummary};
+use super::{Plugin, StreamTransactionSummary, TransactionSummary};
+
+/// Union type for log entries sent through the batched channel.
+#[derive(Clone, serde::Serialize)]
+#[serde(untagged)]
+enum LogEntry {
+    Http(TransactionSummary),
+    Stream(StreamTransactionSummary),
+}
 
 struct BatchConfig {
     endpoint_url: String,
@@ -19,7 +27,7 @@ struct BatchConfig {
 }
 
 pub struct HttpLogging {
-    sender: mpsc::Sender<TransactionSummary>,
+    sender: mpsc::Sender<LogEntry>,
     endpoint_hostname: Option<String>,
 }
 
@@ -81,8 +89,22 @@ impl Plugin for HttpLogging {
         super::ALL_PROTOCOLS
     }
 
+    async fn on_stream_disconnect(&self, summary: &StreamTransactionSummary) {
+        if self
+            .sender
+            .try_send(LogEntry::Stream(summary.clone()))
+            .is_err()
+        {
+            warn!("HTTP logging buffer full — dropping stream log entry");
+        }
+    }
+
     async fn log(&self, summary: &TransactionSummary) {
-        if self.sender.try_send(summary.clone()).is_err() {
+        if self
+            .sender
+            .try_send(LogEntry::Http(summary.clone()))
+            .is_err()
+        {
             warn!("HTTP logging buffer full — dropping log entry");
         }
     }
@@ -95,14 +117,14 @@ impl Plugin for HttpLogging {
     }
 }
 
-async fn flush_loop(mut receiver: mpsc::Receiver<TransactionSummary>, cfg: BatchConfig) {
+async fn flush_loop(mut receiver: mpsc::Receiver<LogEntry>, cfg: BatchConfig) {
     if cfg.endpoint_url.is_empty() {
         // Drain the channel without sending anything.
         while receiver.recv().await.is_some() {}
         return;
     }
 
-    let mut buffer: Vec<TransactionSummary> = Vec::with_capacity(cfg.batch_size);
+    let mut buffer: Vec<LogEntry> = Vec::with_capacity(cfg.batch_size);
     let mut timer = tokio::time::interval(cfg.flush_interval);
     // The first tick completes immediately — consume it so the first real
     // flush waits for one full interval.
@@ -142,7 +164,7 @@ async fn flush_loop(mut receiver: mpsc::Receiver<TransactionSummary>, cfg: Batch
     }
 }
 
-async fn send_batch(cfg: &BatchConfig, batch: Vec<TransactionSummary>) {
+async fn send_batch(cfg: &BatchConfig, batch: Vec<LogEntry>) {
     let total_attempts = cfg.max_retries + 1;
     let entry_count = batch.len();
 

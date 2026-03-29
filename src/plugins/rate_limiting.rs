@@ -260,6 +260,38 @@ impl RateLimiting {
             .retain(|_, windows| windows.iter().any(|w| w.has_recent_activity(now)));
     }
 
+    /// Rate check for stream connections (TCP/UDP). No metadata injection
+    /// since streams don't have response headers to inject ratelimit info into.
+    fn check_rate_stream(&self, key: &str) -> PluginResult {
+        self.evict_stale_entries();
+
+        let specs = &self.window_specs;
+        let mut entry = self.state.entry(key.to_string()).or_insert_with(|| {
+            specs
+                .iter()
+                .map(|spec| RateWindow::new(spec.limit, spec.duration))
+                .collect()
+        });
+
+        for (i, window) in entry.value_mut().iter_mut().enumerate() {
+            if !window.check_and_increment() {
+                warn!(rate_limit_key = %key, plugin = "rate_limiting", "Rate limit exceeded (stream)");
+                let mut headers = HashMap::new();
+                if self.expose_headers {
+                    headers.insert("x-ratelimit-limit".to_string(), specs[i].limit.to_string());
+                    headers.insert("x-ratelimit-remaining".to_string(), "0".to_string());
+                }
+                return PluginResult::Reject {
+                    status_code: 429,
+                    body: r#"{"error":"Rate limit exceeded"}"#.into(),
+                    headers,
+                };
+            }
+        }
+
+        PluginResult::Continue
+    }
+
     fn check_rate(&self, key: &str, ctx: &mut RequestContext) -> PluginResult {
         // Periodically evict stale entries to bound memory usage
         self.evict_stale_entries();
@@ -350,6 +382,14 @@ impl Plugin for RateLimiting {
 
     fn modifies_request_headers(&self) -> bool {
         self.expose_headers
+    }
+
+    async fn on_stream_connect(
+        &self,
+        ctx: &mut super::StreamConnectionContext,
+    ) -> super::PluginResult {
+        let ip_key = format!("ip:{}", ctx.client_ip);
+        self.check_rate_stream(&ip_key)
     }
 
     async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult {

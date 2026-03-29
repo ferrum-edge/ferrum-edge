@@ -18,6 +18,10 @@ use crate::tls::NoVerifier;
 use crate::config::types::{BackendProtocol, GatewayConfig, Proxy};
 use crate::dns::DnsCache;
 use crate::load_balancer::LoadBalancerCache;
+use crate::plugin_cache::PluginCache;
+use crate::plugins::{
+    PluginResult, ProxyProtocol, StreamConnectionContext, StreamTransactionSummary,
+};
 
 /// Cached backend TLS configuration to avoid reading certificate files from
 /// disk on every connection. Built once per listener lifecycle and reused.
@@ -101,6 +105,7 @@ pub struct TcpListenerConfig {
     pub shutdown: watch::Receiver<bool>,
     pub metrics: Arc<TcpProxyMetrics>,
     pub tls_no_verify: bool,
+    pub plugin_cache: Arc<PluginCache>,
 }
 
 /// Start a TCP proxy listener on the given port.
@@ -122,6 +127,7 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
         shutdown,
         metrics,
         tls_no_verify,
+        plugin_cache,
     } = cfg;
     let addr = SocketAddr::new(bind_addr, port);
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -132,6 +138,20 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
         "TCP proxy listener started on {}",
         addr
     );
+
+    // Pre-capture proxy metadata for plugin context (static for this listener's lifetime).
+    let (proxy_name, backend_protocol) = {
+        let current_config = config.load();
+        current_config
+            .proxies
+            .iter()
+            .find(|p| *p.id == *proxy_id)
+            .map(|p| (p.name.clone(), p.backend_protocol))
+            .unwrap_or((None, BackendProtocol::Tcp))
+    };
+
+    // Pre-resolve plugins for this proxy's protocol (TCP).
+    let plugins = plugin_cache.get_plugins_for_protocol(&proxy_id, ProxyProtocol::Tcp);
 
     // Pre-build backend TLS config if this proxy uses TcpTls backend protocol.
     // This avoids reading certificate files from disk on every connection.
@@ -182,8 +202,33 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
                 let frontend_tls = frontend_tls_config.clone();
                 let metrics = metrics.clone();
                 let backend_tls = backend_tls_cache.clone();
+                let plugins = plugins.clone();
+                let proxy_name = proxy_name.clone();
 
                 tokio::spawn(async move {
+                    let connected_at = chrono::Utc::now();
+
+                    // Run on_stream_connect plugins (ip_restriction, rate_limiting, etc.)
+                    let mut stream_ctx = StreamConnectionContext {
+                        client_ip: remote_addr.ip().to_string(),
+                        proxy_id: proxy_id.to_string(),
+                        proxy_name: proxy_name.clone(),
+                        listen_port: port,
+                        backend_protocol,
+                        metadata: std::collections::HashMap::new(),
+                    };
+                    for plugin in plugins.iter() {
+                        if let PluginResult::Reject { .. } = plugin.on_stream_connect(&mut stream_ctx).await {
+                            debug!(
+                                proxy_id = %proxy_id,
+                                client = %remote_addr.ip(),
+                                "TCP connection rejected by plugin"
+                            );
+                            metrics.active_connections.fetch_sub(1, Ordering::Relaxed);
+                            return;
+                        }
+                    }
+
                     let result = handle_tcp_connection(
                         stream,
                         remote_addr,
@@ -196,18 +241,21 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
                     )
                     .await;
 
-                    match &result {
-                        Ok((bytes_in, bytes_out, duration)) => {
-                            metrics.bytes_in.fetch_add(*bytes_in, Ordering::Relaxed);
-                            metrics.bytes_out.fetch_add(*bytes_out, Ordering::Relaxed);
+                    let disconnected_at = chrono::Utc::now();
+                    let duration_ms = (disconnected_at - connected_at).num_milliseconds().max(0) as f64;
+                    let (bytes_in, bytes_out, conn_error, error_class) = match &result {
+                        Ok((bi, bo, dur)) => {
+                            metrics.bytes_in.fetch_add(*bi, Ordering::Relaxed);
+                            metrics.bytes_out.fetch_add(*bo, Ordering::Relaxed);
                             debug!(
                                 proxy_id = %proxy_id,
                                 client = %remote_addr.ip(),
-                                bytes_in = bytes_in,
-                                bytes_out = bytes_out,
-                                duration_ms = duration.as_millis() as u64,
+                                bytes_in = bi,
+                                bytes_out = bo,
+                                duration_ms = dur.as_millis() as u64,
                                 "TCP connection completed"
                             );
+                            (*bi, *bo, None, None)
                         }
                         Err(e) => {
                             debug!(
@@ -216,6 +264,31 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
                                 error = %e,
                                 "TCP connection error"
                             );
+                            (0, 0, Some(e.to_string()), Some(crate::retry::ErrorClass::ConnectionTimeout))
+                        }
+                    };
+
+                    // Run on_stream_disconnect plugins (logging, metrics, etc.)
+                    if !plugins.is_empty() {
+                        let summary = StreamTransactionSummary {
+                            proxy_id: proxy_id.to_string(),
+                            proxy_name,
+                            client_ip: remote_addr.ip().to_string(),
+                            backend_target: String::new(), // set by handle_tcp_connection internally
+                            backend_resolved_ip: None,
+                            protocol: backend_protocol.to_string(),
+                            listen_port: port,
+                            duration_ms,
+                            bytes_sent: bytes_in,
+                            bytes_received: bytes_out,
+                            connection_error: conn_error,
+                            error_class,
+                            timestamp_connected: connected_at.to_rfc3339(),
+                            timestamp_disconnected: disconnected_at.to_rfc3339(),
+                            metadata: stream_ctx.metadata,
+                        };
+                        for plugin in plugins.iter() {
+                            plugin.on_stream_disconnect(&summary).await;
                         }
                     }
 

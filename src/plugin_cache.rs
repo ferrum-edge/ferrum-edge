@@ -56,8 +56,9 @@ type BufferingMap = HashMap<String, bool>;
 /// Map from proxy_id to whether any plugin requires request body buffering
 /// (i.e., modifies the request body before forwarding to the backend).
 type RequestBufferingMap = HashMap<String, bool>;
-/// Map from (proxy_id, protocol) to pre-filtered plugin list.
-type ProtocolPluginMap = HashMap<(String, ProxyProtocol), PluginList>;
+/// Two-level map: proxy_id → (protocol → plugin list).
+/// The outer lookup uses `&str` (zero allocation), inner lookup uses `ProxyProtocol` (Copy).
+type ProtocolPluginMap = HashMap<String, HashMap<ProxyProtocol, PluginList>>;
 
 /// Filter a plugin list to only those supporting a given protocol.
 fn filter_for_protocol(
@@ -86,14 +87,13 @@ fn build_protocol_maps(
         ProxyProtocol::Udp,
     ];
 
-    let mut proto_map = HashMap::with_capacity(proxy_map.len() * protocols.len());
+    let mut proto_map: ProtocolPluginMap = HashMap::with_capacity(proxy_map.len());
     for (proxy_id, plugins) in proxy_map {
+        let mut inner = HashMap::with_capacity(protocols.len());
         for &proto in &protocols {
-            proto_map.insert(
-                (proxy_id.clone(), proto),
-                filter_for_protocol(plugins, proto),
-            );
+            inner.insert(proto, filter_for_protocol(plugins, proto));
         }
+        proto_map.insert(proxy_id.clone(), inner);
     }
 
     let mut global_proto_map = HashMap::with_capacity(protocols.len());
@@ -347,20 +347,17 @@ impl PluginCache {
             ProxyProtocol::Udp,
         ];
         for id in removed_proxy_ids {
-            for &proto in &protocols {
-                new_proto_map.remove(&(id.clone(), proto));
-            }
+            new_proto_map.remove(id);
         }
         for proxy in &config.proxies {
             if proxy_ids_to_rebuild.contains(&proxy.id)
                 && let Some(plugins) = new_map.get(&proxy.id)
             {
+                let mut inner = HashMap::with_capacity(protocols.len());
                 for &proto in &protocols {
-                    new_proto_map.insert(
-                        (proxy.id.clone(), proto),
-                        filter_for_protocol(plugins, proto),
-                    );
+                    inner.insert(proto, filter_for_protocol(plugins, proto));
                 }
+                new_proto_map.insert(proxy.id.clone(), inner);
             }
         }
 
@@ -404,6 +401,7 @@ impl PluginCache {
     ///
     /// Returns an Arc to the cached plugin Vec — zero allocation per request.
     /// Callers iterate by reference; no Vec clone needed.
+    #[allow(dead_code)] // Used by tests for protocol-agnostic plugin inspection
     pub fn get_plugins(&self, proxy_id: &str) -> Arc<Vec<Arc<dyn Plugin>>> {
         let map = self.proxy_plugins.load();
         if let Some(plugins) = map.get(proxy_id) {
@@ -419,25 +417,21 @@ impl PluginCache {
     ///
     /// Returns only plugins that declare support for the given protocol.
     /// Pre-computed at config reload time — zero filtering cost per request.
-    #[allow(dead_code)] // Used by stream proxy handlers when protocol filtering is wired in
     pub fn get_plugins_for_protocol(
         &self,
         proxy_id: &str,
         protocol: ProxyProtocol,
     ) -> Arc<Vec<Arc<dyn Plugin>>> {
         let map = self.protocol_plugins.load();
-        // Use a temporary owned key for lookup — the hash map requires owned keys
-        if let Some(plugins) = map.get(&(proxy_id.to_string(), protocol)) {
+        if let Some(plugins) = map.get(proxy_id).and_then(|inner| inner.get(&protocol)) {
+            return Arc::clone(plugins);
+        }
+        // Fallback to global protocol-filtered plugins
+        let globals = self.global_protocol_plugins.load();
+        if let Some(plugins) = globals.get(&protocol) {
             Arc::clone(plugins)
         } else {
-            // Fallback to global protocol-filtered plugins
-            let globals = self.global_protocol_plugins.load();
-            if let Some(plugins) = globals.get(&protocol) {
-                Arc::clone(plugins)
-            } else {
-                // Should never happen, but return empty list
-                Arc::new(Vec::new())
-            }
+            Arc::new(Vec::new())
         }
     }
 

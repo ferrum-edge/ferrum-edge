@@ -47,6 +47,55 @@ Request In
 
 Any plugin can short-circuit the pipeline by returning a `Reject` result. For example, CORS returns a `204` preflight response in phase 1 without ever reaching authentication. Rate limiting returns `429` in the authorize phase (phase 3) after the consumer is identified.
 
+## Stream Proxy Lifecycle (TCP/UDP)
+
+TCP and UDP stream proxies use a separate two-phase lifecycle. Since there is no HTTP request/response structure, only protocol-agnostic plugins (those declaring `ALL_PROTOCOLS`) participate.
+
+```
+Connection/Session In
+    │
+    ▼
+┌─────────────────────────┐
+│ 1. on_stream_connect    │  Gating: IP restriction, rate limiting, ID assignment
+└────────────┬────────────┘
+             │
+             ▼
+       ┌───────────┐
+       │  Proxy     │  Bidirectional stream copy (TCP) or datagram forwarding (UDP)
+       └─────┬─────┘
+             │
+             ▼
+┌─────────────────────────┐
+│ 2. on_stream_disconnect │  Logging, metrics, tracing (fire-and-forget)
+└─────────────────────────┘
+```
+
+**Phase 1 — `on_stream_connect`**: Runs after the client connection is accepted (TCP) or the first datagram from a new client creates a session (UDP). Plugins can reject to close the connection immediately. Plugins can also insert metadata (e.g., correlation ID, trace ID) into `ctx.metadata`, which is carried through to `on_stream_disconnect`.
+
+**Phase 2 — `on_stream_disconnect`**: Runs after the stream completes (TCP connection closed, or UDP session expired/cleaned up). Receives a `StreamTransactionSummary` with bytes transferred, duration, error info, and metadata from the connect phase. Fire-and-forget — does not block cleanup.
+
+### Stream Hook Implementations by Plugin
+
+| Plugin | `on_stream_connect` | `on_stream_disconnect` | Behavior |
+|--------|:-------------------:|:----------------------:|----------|
+| `ip_restriction` | ✓ | | Rejects connections from denied IPs |
+| `rate_limiting` | ✓ | | IP-based rate limiting per connection/session |
+| `correlation_id` | ✓ | | Assigns a UUID request ID to metadata |
+| `otel_tracing` | ✓ | ✓ | Generates trace/span IDs; emits structured trace log |
+| `stdout_logging` | | ✓ | JSON access log for stream connections |
+| `http_logging` | | ✓ | Sends stream connection logs to webhook endpoint |
+| `prometheus_metrics` | | ✓ | Records `ferrum_stream_connections_total` counter and `ferrum_stream_duration_ms` histogram |
+| `transaction_debugger` | | ✓ | Prints debug info for stream connections |
+
+### When Hooks Fire
+
+| Protocol | `on_stream_connect` fires | `on_stream_disconnect` fires |
+|----------|--------------------------|------------------------------|
+| **TCP** | After `accept()`, before backend connection | After bidirectional copy completes |
+| **TCP+TLS** | After `accept()`, before TLS handshake | After bidirectional copy completes |
+| **UDP** | On first datagram from new client (session creation) | When session is cleaned up (idle timeout) |
+| **UDP+DTLS** | After DTLS `accept()`, before backend connection | When DTLS handler exits |
+
 ## Priority Bands
 
 Within each lifecycle phase, plugins are sorted by **priority** (lower number runs first). Priority is intrinsic to each plugin — it is not user-configurable. Plugins at the same priority have no guaranteed relative order.
@@ -70,7 +119,7 @@ Given all built-in plugins enabled, the execution order is:
 | # | Plugin | Priority | Active Phases |
 |---|--------|----------|---------------|
 | 1 | `cors` | 100 | on_request_received, after_proxy |
-| 2 | `ip_restriction` | 150 | on_request_received |
+| 2 | `ip_restriction` | 150 | on_request_received, on_stream_connect |
 | 3 | `bot_detection` | 200 | on_request_received |
 | 4 | `mtls_auth` | 950 | authenticate |
 | 5 | `jwks_auth` | 1000 | authenticate |
@@ -80,7 +129,7 @@ Given all built-in plugins enabled, the execution order is:
 | 9 | `hmac_auth` | 1400 | authenticate |
 | 10 | `access_control` | 2000 | authorize |
 | 11 | `graphql` | 2850 | before_proxy |
-| 12 | `rate_limiting` | 2900 | on_request_received (IP mode), authorize (consumer mode) |
+| 12 | `rate_limiting` | 2900 | on_request_received (IP mode), authorize (consumer mode), on_stream_connect |
 | 13 | `ai_prompt_shield` | 2925 | before_proxy, transform_request_body |
 | 14 | `body_validator` | 2950 | before_proxy, on_response_body |
 | 15 | `ai_request_guard` | 2975 | before_proxy, transform_request_body |
@@ -89,12 +138,12 @@ Given all built-in plugins enabled, the execution order is:
 | 18 | `response_transformer` | 4000 | after_proxy |
 | 19 | `ai_token_metrics` | 4100 | on_response_body |
 | 20 | `ai_rate_limiter` | 4200 | before_proxy, on_response_body, after_proxy |
-| 21 | `stdout_logging` | 9000 | log |
-| 22 | `correlation_id` | 9050 | on_request_received, log |
-| 23 | `http_logging` | 9100 | log |
-| 24 | `transaction_debugger` | 9200 | on_request_received, after_proxy, log |
-| 25 | `prometheus_metrics` | 9300 | after_proxy, log |
-| 26 | `otel_tracing` | 9400 | on_request_received, after_proxy |
+| 21 | `stdout_logging` | 9000 | log, on_stream_disconnect |
+| 22 | `correlation_id` | 9050 | on_request_received, on_stream_connect, log |
+| 23 | `http_logging` | 9100 | log, on_stream_disconnect |
+| 24 | `transaction_debugger` | 9200 | on_request_received, after_proxy, log, on_stream_disconnect |
+| 25 | `prometheus_metrics` | 9300 | after_proxy, log, on_stream_disconnect |
+| 26 | `otel_tracing` | 9400 | on_request_received, on_stream_connect, after_proxy, on_stream_disconnect |
 
 ## Why This Order Matters
 

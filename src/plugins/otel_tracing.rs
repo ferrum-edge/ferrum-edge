@@ -17,7 +17,7 @@ use url::Url;
 use uuid::Uuid;
 
 use super::utils::PluginHttpClient;
-use super::{Plugin, PluginResult, RequestContext, TransactionSummary};
+use super::{Plugin, PluginResult, RequestContext, StreamTransactionSummary, TransactionSummary};
 
 pub struct OtelTracing {
     /// Service name for spans.
@@ -150,6 +150,46 @@ impl Plugin for OtelTracing {
 
     fn modifies_request_headers(&self) -> bool {
         true
+    }
+
+    async fn on_stream_connect(
+        &self,
+        ctx: &mut super::StreamConnectionContext,
+    ) -> super::PluginResult {
+        if self.generate_trace_id {
+            let trace_id = Uuid::new_v4().as_simple().to_string();
+            let span_id = Self::generate_span_id();
+            ctx.metadata.insert("trace_id".to_string(), trace_id);
+            ctx.metadata.insert("span_id".to_string(), span_id);
+        }
+        super::PluginResult::Continue
+    }
+
+    async fn on_stream_disconnect(&self, summary: &StreamTransactionSummary) {
+        let trace_id = match summary.metadata.get("trace_id") {
+            Some(id) => id,
+            None => return,
+        };
+        let span_id = summary
+            .metadata
+            .get("span_id")
+            .map(|s| s.as_str())
+            .unwrap_or("");
+
+        tracing::info!(
+            target: "otel",
+            service_name = %self.service_name,
+            trace_id = %trace_id,
+            span_id = %span_id,
+            protocol = %summary.protocol,
+            proxy_id = %summary.proxy_id,
+            client_ip = %summary.client_ip,
+            backend_target = %summary.backend_target,
+            duration_ms = %summary.duration_ms,
+            bytes_sent = %summary.bytes_sent,
+            bytes_received = %summary.bytes_received,
+            "stream trace"
+        );
     }
 
     async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult {

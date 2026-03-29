@@ -13,6 +13,7 @@ use tracing::{error, info, warn};
 use crate::config::types::{BackendProtocol, GatewayConfig};
 use crate::dns::DnsCache;
 use crate::load_balancer::LoadBalancerCache;
+use crate::plugin_cache::PluginCache;
 
 use super::tcp_proxy::{TcpListenerConfig, TcpProxyMetrics};
 use super::udp_proxy::{UdpListenerConfig, UdpProxyMetrics};
@@ -36,6 +37,7 @@ pub struct StreamListenerManager {
     config: Arc<arc_swap::ArcSwap<GatewayConfig>>,
     dns_cache: DnsCache,
     load_balancer_cache: Arc<LoadBalancerCache>,
+    plugin_cache: Arc<PluginCache>,
     /// Frontend TLS config for TCP stream proxies with `frontend_tls: true`.
     /// Uses `ArcSwap` because the TLS config may be loaded after `ProxyState::new()`
     /// (e.g., in file mode where TLS certs are validated after the proxy state is built).
@@ -63,6 +65,7 @@ impl StreamListenerManager {
         config: Arc<arc_swap::ArcSwap<GatewayConfig>>,
         dns_cache: DnsCache,
         load_balancer_cache: Arc<LoadBalancerCache>,
+        plugin_cache: Arc<PluginCache>,
         frontend_tls_config: Option<Arc<rustls::ServerConfig>>,
         tls_no_verify: bool,
         udp_max_sessions: usize,
@@ -74,6 +77,7 @@ impl StreamListenerManager {
             config,
             dns_cache,
             load_balancer_cache,
+            plugin_cache,
             frontend_tls_config: arc_swap::ArcSwap::new(Arc::new(frontend_tls_config)),
             frontend_dtls_cert_key: arc_swap::ArcSwap::new(Arc::new(None)),
             frontend_dtls_client_ca_path: arc_swap::ArcSwap::new(Arc::new(None)),
@@ -230,6 +234,7 @@ impl StreamListenerManager {
                 let metrics = Arc::new(UdpProxyMetrics::default());
                 let udp_max_sessions = self.udp_max_sessions;
                 let udp_cleanup_interval = self.udp_cleanup_interval_seconds;
+                let plugin_cache = self.plugin_cache.clone();
                 tokio::spawn(async move {
                     if let Err(e) = super::udp_proxy::start_udp_listener(UdpListenerConfig {
                         port: port_val,
@@ -244,6 +249,7 @@ impl StreamListenerManager {
                         tls_no_verify,
                         max_sessions: udp_max_sessions,
                         cleanup_interval_seconds: udp_cleanup_interval,
+                        plugin_cache,
                     })
                     .await
                     {
@@ -263,6 +269,7 @@ impl StreamListenerManager {
                     None
                 };
                 let metrics = Arc::new(TcpProxyMetrics::default());
+                let plugin_cache = self.plugin_cache.clone();
                 tokio::spawn(async move {
                     if let Err(e) = super::tcp_proxy::start_tcp_listener(TcpListenerConfig {
                         port: port_val,
@@ -275,6 +282,7 @@ impl StreamListenerManager {
                         shutdown: shutdown_rx,
                         metrics,
                         tls_no_verify,
+                        plugin_cache,
                     })
                     .await
                     {

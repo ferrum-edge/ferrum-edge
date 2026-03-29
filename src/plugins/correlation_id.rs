@@ -52,6 +52,15 @@ impl Plugin for CorrelationId {
         true
     }
 
+    async fn on_stream_connect(
+        &self,
+        ctx: &mut super::StreamConnectionContext,
+    ) -> super::PluginResult {
+        let id = Uuid::new_v4().to_string();
+        ctx.metadata.insert("request_id".to_string(), id);
+        super::PluginResult::Continue
+    }
+
     async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult {
         let request_id = if let Some(existing) = ctx.headers.get(&self.header_name) {
             if existing.len() <= 256 {
