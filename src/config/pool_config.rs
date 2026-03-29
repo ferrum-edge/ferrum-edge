@@ -64,7 +64,7 @@ pub struct PoolConfig {
 
     /// Maximum HTTP/2 frame payload size in bytes.
     /// Larger frames reduce per-frame overhead but increase head-of-line
-    /// blocking risk.  Must be between 16_384 (spec minimum) and 16_777_215.
+    /// blocking risk.  Must be between 16_384 (spec minimum) and 1_048_576 (1 MiB).
     /// Default: 65_535.
     pub http2_max_frame_size: u32,
 
@@ -166,7 +166,7 @@ impl PoolConfig {
         if let Ok(val) = env::var("FERRUM_POOL_HTTP2_MAX_FRAME_SIZE")
             && let Ok(parsed) = val.parse::<u32>()
         {
-            config.http2_max_frame_size = parsed.clamp(16_384, 16_777_215);
+            config.http2_max_frame_size = parsed.clamp(16_384, 1_048_576);
         }
 
         if let Ok(val) = env::var("FERRUM_POOL_HTTP2_MAX_CONCURRENT_STREAMS")
@@ -236,7 +236,7 @@ impl PoolConfig {
         }
 
         if let Some(val) = proxy.pool_http2_max_frame_size {
-            config.http2_max_frame_size = val.clamp(16_384, 16_777_215);
+            config.http2_max_frame_size = val.clamp(16_384, 1_048_576);
         }
 
         if let Some(val) = proxy.pool_http2_max_concurrent_streams {

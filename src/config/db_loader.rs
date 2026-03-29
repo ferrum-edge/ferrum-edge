@@ -254,6 +254,14 @@ impl DatabaseStore {
         // Normalize host entries to lowercase
         config.normalize_hosts();
 
+        // Validate all field-level constraints (lengths, ranges, nested configs).
+        // Warn-only since data already exists in the database.
+        if let Err(errors) = config.validate_all_fields() {
+            for msg in &errors {
+                warn!("{}", msg);
+            }
+        }
+
         // Validate host entry format
         if let Err(errors) = config.validate_hosts() {
             for msg in &errors {

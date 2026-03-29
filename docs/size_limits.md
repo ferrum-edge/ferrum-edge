@@ -107,16 +107,145 @@ FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES=0
 
 ## Configuration Field Limits
 
-Beyond request/response size limits, the Admin API enforces limits on individual configuration fields:
+Beyond request/response size limits, the Admin API enforces validation on all configuration fields. These limits protect database storage, prevent misconfigurations, and reject malformed input (including control characters).
+
+### Resource IDs (all resource types)
+
+| Constraint | Limit | Description |
+|------------|-------|-------------|
+| Max length | 254 chars | All resource IDs (proxy, consumer, upstream, plugin_config) |
+| Format | `^[a-zA-Z0-9][a-zA-Z0-9._-]*$` | Must start with alphanumeric, then alphanumeric/dots/underscores/hyphens |
+
+### Proxy Fields
 
 | Field | Limit | Description |
 |-------|-------|-------------|
-| Proxy `listen_path` (regex) | 1024 chars | Maximum pattern length for regex routes (e.g., `~^/api/v\d+`) |
-| Consumer `username` | 255 chars | Maximum length for consumer usernames |
-| Credential type | Whitelist | Only `basicauth`, `keyauth`, `jwt`, `hmac_auth`, `mtls_auth` |
+| `name` | 255 chars | Optional proxy name |
+| `listen_path` (non-regex) | 500 chars | Path prefix for route matching |
+| `listen_path` (regex) | 1024 chars | Maximum regex pattern length (e.g., `~^/api/v\d+`) |
+| `backend_host` | 255 chars | Backend hostname (matches DNS spec max of 253) |
+| `backend_path` | 2048 chars | Backend path prefix |
+| `hosts` | 100 entries, 253 chars each | Hostname list with format validation |
+| `backend_connect_timeout_ms` | 1–86,400,000 | Connect timeout (max 24 hours) |
+| `backend_read_timeout_ms` | 1–86,400,000 | Read timeout (max 24 hours) |
+| `backend_write_timeout_ms` | 1–86,400,000 | Write timeout (max 24 hours) |
+| `dns_override` | 255 chars | DNS resolution override |
+| `dns_cache_ttl_seconds` | 1–86,400 | DNS cache TTL (max 24 hours) |
+| `pool_idle_timeout_seconds` | 1–3,600 | Connection pool idle timeout (max 1 hour) |
+| `pool_tcp_keepalive_seconds` | 1–86,400 | TCP keepalive interval |
+| `pool_http2_keep_alive_interval_seconds` | 1–86,400 | HTTP/2 PING interval |
+| `pool_http2_keep_alive_timeout_seconds` | 1–86,400 | HTTP/2 PING timeout |
+| `pool_http2_initial_stream_window_size` | 65,535–134,217,728 | HTTP/2 per-stream window (64 KiB – 128 MiB) |
+| `pool_http2_initial_connection_window_size` | 65,535–134,217,728 | HTTP/2 connection window (64 KiB – 128 MiB) |
+| `pool_http2_max_frame_size` | 16,384–1,048,576 | HTTP/2 frame size (16 KiB – 1 MiB) |
+| `pool_http2_max_concurrent_streams` | ≥ 1 | HTTP/2 max concurrent streams |
+| `pool_http3_connections_per_backend` | 1–256 | QUIC connections per backend |
+| `backend_tls_client_cert_path` | 4096 chars | mTLS client certificate path |
+| `backend_tls_client_key_path` | 4096 chars | mTLS client key path |
+| `backend_tls_server_ca_cert_path` | 4096 chars | Custom CA bundle path |
+| `allowed_methods` | Valid HTTP methods | Must be GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS, TRACE, or CONNECT |
+| `udp_idle_timeout_seconds` | 1–3,600 | UDP session idle timeout (max 1 hour) |
+
+### Consumer Fields
+
+| Field | Limit | Description |
+|-------|-------|-------------|
+| `username` | 255 chars | Consumer username |
+| `custom_id` | 255 chars | Optional custom identifier |
+| `credentials` (total JSON) | 64 KiB | Total serialized size of credentials object |
+| `credentials` (per value) | 4096 chars | Individual credential string values |
+| Credential type key | 64 chars | Credential type name (e.g., `keyauth`, `basicauth`) |
+
+### Upstream Fields
+
+| Field | Limit | Description |
+|-------|-------|-------------|
+| `name` | 255 chars | Optional upstream name |
+| `hash_on` | 255 chars | Consistent hashing key |
+| `targets` | 1000 entries | Maximum targets per upstream |
+| `targets[].host` | 255 chars | Target hostname |
+| `targets[].port` | ≥ 1 | Target port (non-zero) |
+| `targets[].weight` | 1–65,535 | Target weight |
+| `targets[].path` | 2048 chars | Optional per-target backend path override |
+| `targets[].tags` | 50 entries, 255 chars key/value | Target metadata tags |
+
+### Upstream Health Check Fields
+
+| Field | Limit | Description |
+|-------|-------|-------------|
+| `active.http_path` | 2048 chars | Health check probe path |
+| `active.interval_seconds` | 1–3,600 | Probe interval (max 1 hour) |
+| `active.timeout_ms` | 1–86,400,000 | Probe timeout |
+| `active.healthy_threshold` | 1–10,000 | Healthy transition threshold |
+| `active.unhealthy_threshold` | 1–10,000 | Unhealthy transition threshold |
+| `active.healthy_status_codes` | 50 entries, 100–599 | Valid HTTP status code range |
+| `active.udp_probe_payload` | 2048 chars | UDP probe hex payload |
+| `passive.unhealthy_status_codes` | 50 entries, 100–599 | Valid HTTP status code range |
+| `passive.unhealthy_threshold` | 1–10,000 | Failure threshold |
+| `passive.unhealthy_window_seconds` | 1–86,400 | Sliding window duration |
+| `passive.healthy_after_seconds` | 0–86,400 | Auto-recovery timer (0 = disabled) |
+
+### Upstream Service Discovery Fields
+
+| Field | Limit | Description |
+|-------|-------|-------------|
+| `default_weight` | 1–65,535 | Default weight for discovered targets |
+| `dns_sd.service_name` | 255 chars, non-empty | DNS SRV record name |
+| `dns_sd.poll_interval_seconds` | 1–3,600 | DNS poll interval |
+| `kubernetes.namespace` | 255 chars | K8s namespace |
+| `kubernetes.service_name` | 255 chars, non-empty | K8s service name |
+| `kubernetes.port_name` | 255 chars | Optional EndpointSlice port name |
+| `kubernetes.label_selector` | 1024 chars | Optional label selector |
+| `kubernetes.poll_interval_seconds` | 1–3,600 | K8s poll interval |
+| `consul.address` | 2048 chars, non-empty | Consul HTTP API address |
+| `consul.service_name` | 255 chars, non-empty | Consul service name |
+| `consul.datacenter` | 255 chars | Optional datacenter filter |
+| `consul.tag` | 255 chars | Optional service tag filter |
+| `consul.token` | 4096 chars | Optional ACL token |
+| `consul.poll_interval_seconds` | 1–3,600 | Consul poll interval |
+
+### Plugin Config Fields
+
+| Field | Limit | Description |
+|-------|-------|-------------|
+| `plugin_name` | 255 chars | Plugin name |
+| `config` (JSON size) | 1 MiB | Maximum serialized config size |
+| `config` (nesting depth) | 10 levels | Maximum JSON nesting |
+
+### Circuit Breaker Fields
+
+| Field | Limit | Description |
+|-------|-------|-------------|
+| `failure_threshold` | 1–10,000 | Failures before opening |
+| `success_threshold` | 1–10,000 | Successes to close |
+| `timeout_seconds` | 1–86,400 | Open-state duration |
+| `half_open_max_requests` | 1–10,000 | Probe requests in half-open |
+| `failure_status_codes` | 50 entries, 100–599 | Status codes that count as failure |
+
+### Retry Config Fields
+
+| Field | Limit | Description |
+|-------|-------|-------------|
+| `max_retries` | 0–100 | Maximum retry attempts |
+| `retryable_status_codes` | 50 entries, 100–599 | Status codes eligible for retry |
+| `retryable_methods` | 9 entries max | Must be valid HTTP methods (GET, POST, PUT, etc.) |
+| `backoff.delay_ms` (fixed) | 0–300,000 | Fixed backoff delay (max 5 minutes) |
+| `backoff.base_ms` (exponential) | 0–300,000 | Exponential base delay |
+| `backoff.max_ms` (exponential) | 0–300,000 | Exponential max delay (must be ≥ base_ms) |
+
+### Cross-Resource Validation
+
+All string fields reject ASCII control characters (null bytes, escape sequences, etc.) to prevent log injection. Additionally:
+
+- **Uniqueness**: Proxy IDs, consumer IDs, upstream IDs, plugin_config IDs, proxy names, upstream names, consumer usernames, consumer custom_ids, and consumer credentials are validated for uniqueness
+- **Referential integrity**: Proxy `upstream_id` must reference an existing upstream
+- **Plugin uniqueness**: Each proxy can have at most one plugin of each type
+- **Host/path uniqueness**: No two proxies can share overlapping host + listen_path combinations
+- **Stream proxy rules**: TCP/UDP proxies require `listen_port`; HTTP proxies must not set it
 
 These limits are enforced during:
-- Admin API `POST`/`PUT` operations on proxies and consumers
+- Admin API `POST`/`PUT` operations on all resource types
 - `PUT`/`DELETE` on `/consumers/{id}/credentials/{type}`
 - `POST /restore` — validation fails before any data is deleted
+- File config loading (YAML/JSON) and SIGHUP reload
 - Database incremental polling — invalid configs are rejected before applying

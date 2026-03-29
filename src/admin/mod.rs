@@ -25,7 +25,8 @@ use uuid::Uuid;
 use crate::admin::jwt_auth::{JwtError, JwtManager};
 use crate::config::db_loader::DatabaseStore;
 use crate::config::types::{
-    Consumer, GatewayConfig, PluginConfig, PluginScope, Proxy, Upstream, validate_resource_id,
+    Consumer, GatewayConfig, PluginConfig, PluginScope, Proxy, Upstream, VALID_HTTP_METHODS,
+    validate_resource_id,
 };
 use crate::plugins;
 use crate::proxy::ProxyState;
@@ -592,17 +593,22 @@ async fn handle_create_proxy(
         for m in methods.iter_mut() {
             *m = m.to_uppercase();
         }
-        let valid = [
-            "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "TRACE", "CONNECT",
-        ];
         for m in methods.iter() {
-            if !valid.contains(&m.as_str()) {
+            if !VALID_HTTP_METHODS.contains(&m.as_str()) {
                 return Ok(json_response(
                     StatusCode::BAD_REQUEST,
                     &json!({"error": format!("Invalid HTTP method: {}", m)}),
                 ));
             }
         }
+    }
+
+    // Validate field lengths, numeric ranges, and nested config objects
+    if let Err(field_errors) = proxy.validate_fields() {
+        return Ok(json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"error": format!("Invalid proxy fields: {}", field_errors.join("; "))}),
+        ));
     }
 
     if proxy.id.is_empty() {
@@ -886,17 +892,22 @@ async fn handle_update_proxy(
         for m in methods.iter_mut() {
             *m = m.to_uppercase();
         }
-        let valid = [
-            "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "TRACE", "CONNECT",
-        ];
         for m in methods.iter() {
-            if !valid.contains(&m.as_str()) {
+            if !VALID_HTTP_METHODS.contains(&m.as_str()) {
                 return Ok(json_response(
                     StatusCode::BAD_REQUEST,
                     &json!({"error": format!("Invalid HTTP method: {}", m)}),
                 ));
             }
         }
+    }
+
+    // Validate field lengths, numeric ranges, and nested config objects
+    if let Err(field_errors) = proxy.validate_fields() {
+        return Ok(json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"error": format!("Invalid proxy fields: {}", field_errors.join("; "))}),
+        ));
     }
 
     proxy.id = id.to_string();
@@ -1168,6 +1179,14 @@ async fn handle_create_consumer(
         consumer.custom_id = None;
     }
 
+    // Validate field lengths, credential sizes, and control characters
+    if let Err(field_errors) = consumer.validate_fields() {
+        return Ok(json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"error": format!("Invalid consumer fields: {}", field_errors.join("; "))}),
+        ));
+    }
+
     consumer.created_at = Utc::now();
     consumer.updated_at = Utc::now();
 
@@ -1341,6 +1360,14 @@ async fn handle_update_consumer(
         && cid.trim().is_empty()
     {
         consumer.custom_id = None;
+    }
+
+    // Validate field lengths, credential sizes, and control characters
+    if let Err(field_errors) = consumer.validate_fields() {
+        return Ok(json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"error": format!("Invalid consumer fields: {}", field_errors.join("; "))}),
+        ));
     }
 
     if let Err(e) = hash_consumer_secrets(&mut consumer) {
@@ -1555,6 +1582,15 @@ async fn handle_update_credentials(
             consumer
                 .credentials
                 .insert(cred_type.to_string(), hashed_cred);
+
+            // Validate credential field lengths and sizes after modification
+            if let Err(field_errors) = consumer.validate_fields() {
+                return Ok(json_response(
+                    StatusCode::BAD_REQUEST,
+                    &json!({"error": format!("Invalid credential fields: {}", field_errors.join("; "))}),
+                ));
+            }
+
             consumer.updated_at = Utc::now();
             match db.update_consumer(&consumer).await {
                 Ok(_) => Ok(json_response(
@@ -1736,6 +1772,14 @@ async fn handle_create_plugin_config(
         ));
     }
 
+    // Validate field lengths, config JSON size, and nesting depth
+    if let Err(field_errors) = pc.validate_fields() {
+        return Ok(json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"error": format!("Invalid plugin config fields: {}", field_errors.join("; "))}),
+        ));
+    }
+
     // Validate scope and proxy_id consistency
     if pc.scope == PluginScope::Proxy && pc.proxy_id.is_none() {
         return Ok(json_response(
@@ -1860,6 +1904,14 @@ async fn handle_update_plugin_config(
         return Ok(json_response(
             StatusCode::BAD_REQUEST,
             &json!({"error": format!("Unknown plugin name '{}'. Available plugins: {:?}", pc.plugin_name, known_plugins)}),
+        ));
+    }
+
+    // Validate field lengths, config JSON size, and nesting depth
+    if let Err(field_errors) = pc.validate_fields() {
+        return Ok(json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"error": format!("Invalid plugin config fields: {}", field_errors.join("; "))}),
         ));
     }
 
@@ -2034,6 +2086,14 @@ async fn handle_create_upstream(
         ));
     }
 
+    // Validate field lengths, target hosts/ports/weights, and nested configs
+    if let Err(field_errors) = upstream.validate_fields() {
+        return Ok(json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"error": format!("Invalid upstream fields: {}", field_errors.join("; "))}),
+        ));
+    }
+
     // Check upstream name uniqueness (when present)
     if let Some(ref name) = upstream.name {
         match db.check_upstream_name_unique(name, None).await {
@@ -2138,6 +2198,14 @@ async fn handle_update_upstream(
         return Ok(json_response(
             StatusCode::BAD_REQUEST,
             &json!({"error": "At least one target is required (or configure service_discovery)"}),
+        ));
+    }
+
+    // Validate field lengths, target hosts/ports/weights, and nested configs
+    if let Err(field_errors) = upstream.validate_fields() {
+        return Ok(json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"error": format!("Invalid upstream fields: {}", field_errors.join("; "))}),
         ));
     }
 
@@ -2336,6 +2404,12 @@ async fn handle_batch_create(
                     {
                         errors.push(format!("Duplicate consumer custom_id '{}' in batch", cid));
                     }
+                    // Validate field lengths and credential sizes
+                    if let Err(field_errs) = c.validate_fields() {
+                        for e in field_errs {
+                            errors.push(format!("Consumer '{}': {}", c.id, e));
+                        }
+                    }
                     c.created_at = now;
                     c.updated_at = now;
                     if let Err(e) = hash_consumer_secrets(c) {
@@ -2379,6 +2453,12 @@ async fn handle_batch_create(
                             "Upstream '{}': must have at least one target or service_discovery",
                             u.id
                         ));
+                    }
+                    // Validate field lengths, target hosts/ports/weights
+                    if let Err(field_errs) = u.validate_fields() {
+                        for e in field_errs {
+                            errors.push(format!("Upstream '{}': {}", u.id, e));
+                        }
                     }
                     u.created_at = now;
                     u.updated_at = now;
@@ -2447,6 +2527,12 @@ async fn handle_batch_create(
                             errors.push(format!("Proxy '{}': {}", p.id, msg));
                         }
                     }
+                    // Validate field lengths, numeric ranges, and nested configs
+                    if let Err(field_errs) = p.validate_fields() {
+                        for e in field_errs {
+                            errors.push(format!("Proxy '{}': {}", p.id, e));
+                        }
+                    }
                     p.created_at = now;
                     p.updated_at = now;
                 }
@@ -2494,6 +2580,12 @@ async fn handle_batch_create(
                             "PluginConfig '{}': scope 'global' must not have proxy_id",
                             pc.id
                         ));
+                    }
+                    // Validate field lengths, config JSON size, nesting depth
+                    if let Err(field_errs) = pc.validate_fields() {
+                        for e in field_errs {
+                            errors.push(format!("PluginConfig '{}': {}", pc.id, e));
+                        }
                     }
                     pc.created_at = now;
                     pc.updated_at = now;
@@ -2830,6 +2922,9 @@ async fn handle_restore(
         };
         let mut validation_errors: Vec<String> = Vec::new();
 
+        if let Err(errs) = temp_config.validate_all_fields() {
+            validation_errors.extend(errs);
+        }
         if let Err(errs) = temp_config.validate_unique_resource_ids() {
             validation_errors.extend(errs);
         }

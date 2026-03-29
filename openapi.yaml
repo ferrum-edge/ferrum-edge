@@ -1137,20 +1137,20 @@ components:
           description: Backend write timeout in milliseconds
         backend_tls_client_cert_path:
           type: [string, "null"]
-
-          description: Path to mTLS client certificate (PEM)
+          maxLength: 4096
+          description: Path to mTLS client certificate (PEM). Max 4096 characters.
         backend_tls_client_key_path:
           type: [string, "null"]
-
-          description: Path to mTLS client private key (PEM)
+          maxLength: 4096
+          description: Path to mTLS client private key (PEM). Max 4096 characters.
         backend_tls_verify_server_cert:
           type: boolean
           default: true
           description: Verify the backend's TLS certificate
         backend_tls_server_ca_cert_path:
           type: [string, "null"]
-
-          description: Path to custom CA bundle for backend TLS verification
+          maxLength: 4096
+          description: Path to custom CA bundle for backend TLS verification. Max 4096 characters.
         dns_override:
           type: [string, "null"]
 
@@ -1192,15 +1192,19 @@ components:
         pool_http2_initial_stream_window_size:
           type: [integer, "null"]
           format: uint32
+          minimum: 65535
+          maximum: 134217728
           description: |
             HTTP/2 initial per-stream flow-control window size in bytes (overrides global).
-            Larger values improve single-stream throughput. Default: 8388608 (8 MiB).
+            Larger values improve single-stream throughput. Range: 65535–134217728 (128 MiB). Default: 8388608 (8 MiB).
         pool_http2_initial_connection_window_size:
           type: [integer, "null"]
           format: uint32
+          minimum: 65535
+          maximum: 134217728
           description: |
             HTTP/2 initial connection-level flow-control window size in bytes (overrides global).
-            Aggregate budget shared across all concurrent streams. Default: 33554432 (32 MiB).
+            Aggregate budget shared across all concurrent streams. Range: 65535–134217728 (128 MiB). Default: 33554432 (32 MiB).
         pool_http2_adaptive_window:
           type: [boolean, "null"]
           description: |
@@ -1209,21 +1213,26 @@ components:
         pool_http2_max_frame_size:
           type: [integer, "null"]
           format: uint32
+          minimum: 16384
+          maximum: 1048576
           description: |
             Maximum HTTP/2 frame payload size in bytes (overrides global).
-            Range: 16384–16777215. Default: 65535.
+            Range: 16384–1048576 (1 MiB). Default: 65535.
         pool_http2_max_concurrent_streams:
           type: [integer, "null"]
           format: uint32
+          minimum: 1
           description: |
             Maximum concurrent HTTP/2 streams per backend connection (overrides global).
-            Default: 1000.
+            Must be at least 1. Default: 1000.
         pool_http3_connections_per_backend:
           type: [integer, "null"]
+          minimum: 1
+          maximum: 256
           description: |
             Number of QUIC connections per HTTP/3 backend (overrides global
             FERRUM_HTTP3_CONNECTIONS_PER_BACKEND). Multiple connections distribute
-            QUIC frame processing across driver tasks. Default: 4.
+            QUIC frame processing across driver tasks. Range: 1–256. Default: 4.
         upstream_id:
           type: [string, "null"]
           description: |
@@ -1507,9 +1516,11 @@ components:
         retryable_methods:
           type: array
           items:
-            type: [string, "null"]
+            type: string
+            enum: [GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS, TRACE, CONNECT]
+          maxItems: 9
           default: [GET, HEAD, OPTIONS, PUT, DELETE]
-          description: HTTP methods eligible for retry
+          description: HTTP methods eligible for retry. Must be valid HTTP methods.
         backoff:
           $ref: "#/components/schemas/BackoffStrategy"
         retry_on_connect_failure:

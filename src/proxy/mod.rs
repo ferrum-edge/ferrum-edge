@@ -668,6 +668,11 @@ impl ProxyState {
 
         // Validate the patched config before applying (same validations as load_full_config)
         new_config.normalize_hosts();
+        if let Err(errors) = new_config.validate_all_fields() {
+            for msg in &errors {
+                warn!("Incremental config field validation: {}", msg);
+            }
+        }
         if let Err(errors) = new_config.validate_hosts() {
             for msg in &errors {
                 warn!("Incremental config validation: {}", msg);

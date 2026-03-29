@@ -97,6 +97,17 @@ pub fn load_config_from_file(path: &str) -> Result<GatewayConfig, anyhow::Error>
         );
     }
 
+    // Validate all field-level constraints (lengths, ranges, nested configs)
+    if let Err(errors) = config.validate_all_fields() {
+        for msg in &errors {
+            error!("{}", msg);
+        }
+        anyhow::bail!(
+            "Configuration validation failed: {} invalid field(s) found",
+            errors.len()
+        );
+    }
+
     // Validate resource ID uniqueness
     if let Err(dupes) = config.validate_unique_resource_ids() {
         for msg in &dupes {

@@ -7,6 +7,87 @@ use std::sync::LazyLock;
 /// Maximum length for resource IDs.
 const MAX_ID_LENGTH: usize = 254;
 
+// ---- Field length limits (aligned with DB schema VARCHAR widths) ----
+
+/// Maximum length for name fields (proxy.name, upstream.name). Matches VARCHAR(255) in DB.
+pub const MAX_NAME_LENGTH: usize = 255;
+/// Maximum length for backend_host. Matches VARCHAR(255) in DB.
+pub const MAX_BACKEND_HOST_LENGTH: usize = 255;
+/// Maximum length for backend_path.
+pub const MAX_BACKEND_PATH_LENGTH: usize = 2048;
+/// Maximum length for listen_path (non-regex). Matches VARCHAR(500) in DB.
+pub const MAX_LISTEN_PATH_LENGTH: usize = 500;
+/// Maximum length for consumer username. Matches VARCHAR(255) in DB.
+pub const MAX_USERNAME_LENGTH: usize = 255;
+/// Maximum length for consumer custom_id. Matches VARCHAR(255) in DB.
+pub const MAX_CUSTOM_ID_LENGTH: usize = 255;
+/// Maximum length for individual hostname entries (DNS spec is 253).
+pub const MAX_HOST_LENGTH: usize = 253;
+/// Maximum number of host entries per proxy.
+pub const MAX_HOSTS_PER_PROXY: usize = 100;
+/// Maximum number of targets per upstream.
+pub const MAX_TARGETS_PER_UPSTREAM: usize = 1000;
+/// Maximum number of tags per upstream target.
+pub const MAX_TAGS_PER_TARGET: usize = 50;
+/// Maximum length for a tag key or value.
+pub const MAX_TAG_LENGTH: usize = 255;
+/// Maximum size of plugin config JSON in bytes.
+pub const MAX_PLUGIN_CONFIG_SIZE: usize = 1_048_576; // 1 MiB
+/// Maximum size of consumer credentials JSON in bytes.
+pub const MAX_CREDENTIALS_SIZE: usize = 65_536; // 64 KiB
+/// Maximum length for individual credential string values (API keys, secrets, identities).
+pub const MAX_CREDENTIAL_VALUE_LENGTH: usize = 4096;
+/// Maximum length for hash_on field in upstream.
+pub const MAX_HASH_ON_LENGTH: usize = 255;
+/// Maximum number of status codes in circuit breaker / retry / health check lists.
+pub const MAX_STATUS_CODES: usize = 50;
+/// Maximum number of retryable methods.
+pub const MAX_RETRYABLE_METHODS: usize = 9;
+/// Maximum length for file path fields (TLS cert/key paths).
+pub const MAX_FILE_PATH_LENGTH: usize = 4096;
+/// Maximum length for service discovery optional string fields.
+pub const MAX_SD_STRING_LENGTH: usize = 255;
+
+// ---- Numeric range limits ----
+
+/// Maximum timeout value in milliseconds (24 hours).
+pub const MAX_TIMEOUT_MS: u64 = 86_400_000;
+/// Maximum timeout value in seconds (24 hours).
+pub const MAX_TIMEOUT_SECONDS: u64 = 86_400;
+/// Maximum for threshold fields (circuit breaker, health checks).
+pub const MAX_THRESHOLD: u32 = 10_000;
+/// Maximum retry count.
+pub const MAX_RETRIES: u32 = 100;
+/// Maximum backoff delay in milliseconds (5 minutes).
+pub const MAX_BACKOFF_MS: u64 = 300_000;
+/// Maximum target weight.
+pub const MAX_TARGET_WEIGHT: u32 = 65_535;
+/// Maximum service discovery poll interval in seconds (1 hour).
+pub const MAX_SD_POLL_INTERVAL: u64 = 3600;
+/// Maximum health check interval in seconds (1 hour).
+pub const MAX_HEALTH_CHECK_INTERVAL: u64 = 3600;
+/// Maximum UDP idle timeout in seconds (1 hour).
+pub const MAX_UDP_IDLE_TIMEOUT: u64 = 3600;
+/// Maximum pool idle timeout in seconds (1 hour).
+pub const MAX_POOL_IDLE_TIMEOUT: u64 = 3600;
+/// Maximum DNS cache TTL in seconds (24 hours).
+pub const MAX_DNS_CACHE_TTL: u64 = 86_400;
+/// Minimum HTTP/2 initial window size (RFC 9113 §6.9.2: 64 KiB default).
+pub const MIN_HTTP2_WINDOW_SIZE: u32 = 65_535;
+/// Maximum HTTP/2 initial window size (128 MiB practical operational limit).
+pub const MAX_HTTP2_WINDOW_SIZE: u32 = 128 * 1024 * 1024;
+/// Minimum HTTP/2 max frame size (RFC 9113 §6.5.2: 16 KiB).
+pub const MIN_HTTP2_MAX_FRAME_SIZE: u32 = 16_384;
+/// Maximum HTTP/2 max frame size (1 MiB practical operational limit).
+pub const MAX_HTTP2_MAX_FRAME_SIZE: u32 = 1_048_576;
+/// Maximum HTTP/3 connections per backend (reasonable operational limit).
+pub const MAX_HTTP3_CONNECTIONS_PER_BACKEND: usize = 256;
+
+/// Valid HTTP methods for allowed_methods and retryable_methods validation.
+pub const VALID_HTTP_METHODS: &[&str] = &[
+    "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "TRACE", "CONNECT",
+];
+
 /// Regex pattern for valid resource IDs.
 /// Must start with alphanumeric, followed by alphanumeric, dots, underscores, or hyphens.
 static ID_REGEX: LazyLock<Regex> =
@@ -1295,6 +1376,952 @@ pub fn hosts_overlap(a: &[String], b: &[String]) -> bool {
     }
 
     false
+}
+
+// ---- Field-level validation ----
+
+/// Check if a string contains ASCII control characters (excluding common whitespace).
+/// Rejects null bytes, backspace, escape, etc. that could cause log injection.
+fn contains_control_chars(s: &str) -> bool {
+    s.bytes()
+        .any(|b| b < 0x20 && b != b'\t' && b != b'\n' && b != b'\r')
+}
+
+/// Validate a string field length and reject control characters.
+/// Returns `Err(message)` if the value exceeds `max_len` or contains control characters.
+fn validate_string_field(field_name: &str, value: &str, max_len: usize) -> Result<(), String> {
+    if value.len() > max_len {
+        return Err(format!(
+            "{} must not exceed {} characters (got {})",
+            field_name,
+            max_len,
+            value.len()
+        ));
+    }
+    if contains_control_chars(value) {
+        return Err(format!(
+            "{} must not contain control characters",
+            field_name
+        ));
+    }
+    Ok(())
+}
+
+/// Validate a u64 field is within a range.
+fn validate_u64_range(field_name: &str, value: u64, min: u64, max: u64) -> Result<(), String> {
+    if value < min || value > max {
+        return Err(format!(
+            "{} must be between {} and {} (got {})",
+            field_name, min, max, value
+        ));
+    }
+    Ok(())
+}
+
+/// Validate a u32 field is within a range.
+fn validate_u32_range(field_name: &str, value: u32, min: u32, max: u32) -> Result<(), String> {
+    if value < min || value > max {
+        return Err(format!(
+            "{} must be between {} and {} (got {})",
+            field_name, min, max, value
+        ));
+    }
+    Ok(())
+}
+
+/// Validate a list of HTTP status codes.
+fn validate_status_codes(field_name: &str, codes: &[u16]) -> Result<(), String> {
+    if codes.len() > MAX_STATUS_CODES {
+        return Err(format!(
+            "{} must not have more than {} entries (got {})",
+            field_name,
+            MAX_STATUS_CODES,
+            codes.len()
+        ));
+    }
+    for &code in codes {
+        if !(100..=599).contains(&code) {
+            return Err(format!(
+                "{} contains invalid HTTP status code {} (must be 100-599)",
+                field_name, code
+            ));
+        }
+    }
+    Ok(())
+}
+
+impl Proxy {
+    /// Validate all fields of a proxy for correctness and safe lengths.
+    ///
+    /// This validates field values only — uniqueness checks (listen_path conflicts,
+    /// name uniqueness, upstream_id existence) are done separately in the admin handlers.
+    pub fn validate_fields(&self) -> Result<(), Vec<String>> {
+        let mut errors = Vec::new();
+
+        // Name
+        if let Some(ref name) = self.name
+            && let Err(e) = validate_string_field("name", name, MAX_NAME_LENGTH)
+        {
+            errors.push(e);
+        }
+
+        // Hosts
+        if self.hosts.len() > MAX_HOSTS_PER_PROXY {
+            errors.push(format!(
+                "hosts must not have more than {} entries (got {})",
+                MAX_HOSTS_PER_PROXY,
+                self.hosts.len()
+            ));
+        }
+        for host in &self.hosts {
+            if host.len() > MAX_HOST_LENGTH {
+                errors.push(format!(
+                    "host entry '{}...' must not exceed {} characters",
+                    &host[..40.min(host.len())],
+                    MAX_HOST_LENGTH
+                ));
+            }
+        }
+
+        // listen_path length (regex pattern length is checked separately in admin handler)
+        if !self.listen_path.starts_with('~') && self.listen_path.len() > MAX_LISTEN_PATH_LENGTH {
+            errors.push(format!(
+                "listen_path must not exceed {} characters (got {})",
+                MAX_LISTEN_PATH_LENGTH,
+                self.listen_path.len()
+            ));
+        }
+        if contains_control_chars(&self.listen_path) {
+            errors.push("listen_path must not contain control characters".to_string());
+        }
+
+        // backend_host
+        if let Err(e) =
+            validate_string_field("backend_host", &self.backend_host, MAX_BACKEND_HOST_LENGTH)
+        {
+            errors.push(e);
+        }
+        if self.backend_host.contains("://") {
+            errors.push("backend_host must not contain a scheme (e.g., 'http://')".to_string());
+        }
+
+        // backend_path
+        if let Some(ref path) = self.backend_path
+            && let Err(e) = validate_string_field("backend_path", path, MAX_BACKEND_PATH_LENGTH)
+        {
+            errors.push(e);
+        }
+
+        // Timeout ranges
+        if let Err(e) = validate_u64_range(
+            "backend_connect_timeout_ms",
+            self.backend_connect_timeout_ms,
+            1,
+            MAX_TIMEOUT_MS,
+        ) {
+            errors.push(e);
+        }
+        if let Err(e) = validate_u64_range(
+            "backend_read_timeout_ms",
+            self.backend_read_timeout_ms,
+            1,
+            MAX_TIMEOUT_MS,
+        ) {
+            errors.push(e);
+        }
+        if let Err(e) = validate_u64_range(
+            "backend_write_timeout_ms",
+            self.backend_write_timeout_ms,
+            1,
+            MAX_TIMEOUT_MS,
+        ) {
+            errors.push(e);
+        }
+
+        // Pool timeout overrides
+        if let Some(v) = self.pool_idle_timeout_seconds
+            && let Err(e) =
+                validate_u64_range("pool_idle_timeout_seconds", v, 1, MAX_POOL_IDLE_TIMEOUT)
+        {
+            errors.push(e);
+        }
+        if let Some(v) = self.pool_tcp_keepalive_seconds
+            && let Err(e) =
+                validate_u64_range("pool_tcp_keepalive_seconds", v, 1, MAX_TIMEOUT_SECONDS)
+        {
+            errors.push(e);
+        }
+        if let Some(v) = self.pool_http2_keep_alive_interval_seconds
+            && let Err(e) = validate_u64_range(
+                "pool_http2_keep_alive_interval_seconds",
+                v,
+                1,
+                MAX_TIMEOUT_SECONDS,
+            )
+        {
+            errors.push(e);
+        }
+        if let Some(v) = self.pool_http2_keep_alive_timeout_seconds
+            && let Err(e) = validate_u64_range(
+                "pool_http2_keep_alive_timeout_seconds",
+                v,
+                1,
+                MAX_TIMEOUT_SECONDS,
+            )
+        {
+            errors.push(e);
+        }
+
+        // DNS cache TTL
+        if let Some(v) = self.dns_cache_ttl_seconds
+            && let Err(e) = validate_u64_range("dns_cache_ttl_seconds", v, 1, MAX_DNS_CACHE_TTL)
+        {
+            errors.push(e);
+        }
+
+        // UDP idle timeout
+        if let Err(e) = validate_u64_range(
+            "udp_idle_timeout_seconds",
+            self.udp_idle_timeout_seconds,
+            1,
+            MAX_UDP_IDLE_TIMEOUT,
+        ) {
+            errors.push(e);
+        }
+
+        // HTTP/2 flow control validation
+        if let Some(v) = self.pool_http2_initial_stream_window_size
+            && !(MIN_HTTP2_WINDOW_SIZE..=MAX_HTTP2_WINDOW_SIZE).contains(&v)
+        {
+            errors.push(format!(
+                "pool_http2_initial_stream_window_size must be between {} and {} (got {})",
+                MIN_HTTP2_WINDOW_SIZE, MAX_HTTP2_WINDOW_SIZE, v
+            ));
+        }
+        if let Some(v) = self.pool_http2_initial_connection_window_size
+            && !(MIN_HTTP2_WINDOW_SIZE..=MAX_HTTP2_WINDOW_SIZE).contains(&v)
+        {
+            errors.push(format!(
+                "pool_http2_initial_connection_window_size must be between {} and {} (got {})",
+                MIN_HTTP2_WINDOW_SIZE, MAX_HTTP2_WINDOW_SIZE, v
+            ));
+        }
+        if let Some(v) = self.pool_http2_max_frame_size
+            && !(MIN_HTTP2_MAX_FRAME_SIZE..=MAX_HTTP2_MAX_FRAME_SIZE).contains(&v)
+        {
+            errors.push(format!(
+                "pool_http2_max_frame_size must be between {} and {} (got {})",
+                MIN_HTTP2_MAX_FRAME_SIZE, MAX_HTTP2_MAX_FRAME_SIZE, v
+            ));
+        }
+        if let Some(0) = self.pool_http2_max_concurrent_streams {
+            errors.push("pool_http2_max_concurrent_streams must be at least 1 (got 0)".to_string());
+        }
+
+        // HTTP/3 connections per backend
+        if let Some(v) = self.pool_http3_connections_per_backend
+            && (v == 0 || v > MAX_HTTP3_CONNECTIONS_PER_BACKEND)
+        {
+            errors.push(format!(
+                "pool_http3_connections_per_backend must be between 1 and {} (got {})",
+                MAX_HTTP3_CONNECTIONS_PER_BACKEND, v
+            ));
+        }
+
+        // TLS file path lengths
+        if let Some(ref path) = self.backend_tls_client_cert_path
+            && let Err(e) =
+                validate_string_field("backend_tls_client_cert_path", path, MAX_FILE_PATH_LENGTH)
+        {
+            errors.push(e);
+        }
+        if let Some(ref path) = self.backend_tls_client_key_path
+            && let Err(e) =
+                validate_string_field("backend_tls_client_key_path", path, MAX_FILE_PATH_LENGTH)
+        {
+            errors.push(e);
+        }
+        if let Some(ref path) = self.backend_tls_server_ca_cert_path
+            && let Err(e) = validate_string_field(
+                "backend_tls_server_ca_cert_path",
+                path,
+                MAX_FILE_PATH_LENGTH,
+            )
+        {
+            errors.push(e);
+        }
+
+        // Allowed methods validation
+        if let Some(ref methods) = self.allowed_methods {
+            for method in methods {
+                let upper = method.to_uppercase();
+                if !VALID_HTTP_METHODS.contains(&upper.as_str()) {
+                    errors.push(format!(
+                        "allowed_methods contains invalid HTTP method: {}",
+                        method
+                    ));
+                }
+            }
+        }
+
+        // DNS override
+        if let Some(ref dns) = self.dns_override
+            && let Err(e) = validate_string_field("dns_override", dns, MAX_BACKEND_HOST_LENGTH)
+        {
+            errors.push(e);
+        }
+
+        // Circuit breaker config
+        if let Some(ref cb) = self.circuit_breaker
+            && let Err(cb_errors) = cb.validate_fields()
+        {
+            for e in cb_errors {
+                errors.push(format!("circuit_breaker.{}", e));
+            }
+        }
+
+        // Retry config
+        if let Some(ref retry) = self.retry
+            && let Err(retry_errors) = retry.validate_fields()
+        {
+            for e in retry_errors {
+                errors.push(format!("retry.{}", e));
+            }
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+}
+
+impl Consumer {
+    /// Validate all fields of a consumer for correctness and safe lengths.
+    pub fn validate_fields(&self) -> Result<(), Vec<String>> {
+        let mut errors = Vec::new();
+
+        // Username
+        if let Err(e) = validate_string_field("username", &self.username, MAX_USERNAME_LENGTH) {
+            errors.push(e);
+        }
+
+        // Custom ID
+        if let Some(ref cid) = self.custom_id
+            && let Err(e) = validate_string_field("custom_id", cid, MAX_CUSTOM_ID_LENGTH)
+        {
+            errors.push(e);
+        }
+
+        // Credentials total size
+        let cred_json = serde_json::to_string(&self.credentials).unwrap_or_default();
+        if cred_json.len() > MAX_CREDENTIALS_SIZE {
+            errors.push(format!(
+                "credentials JSON must not exceed {} bytes (got {})",
+                MAX_CREDENTIALS_SIZE,
+                cred_json.len()
+            ));
+        }
+
+        // Validate individual credential values
+        for (cred_type, cred_value) in &self.credentials {
+            if let Err(e) = validate_string_field("credential type", cred_type, 64) {
+                errors.push(e);
+            }
+            if let Some(obj) = cred_value.as_object() {
+                for (key, val) in obj {
+                    if let Some(s) = val.as_str() {
+                        if s.len() > MAX_CREDENTIAL_VALUE_LENGTH {
+                            errors.push(format!(
+                                "credentials.{}.{} must not exceed {} characters (got {})",
+                                cred_type,
+                                key,
+                                MAX_CREDENTIAL_VALUE_LENGTH,
+                                s.len()
+                            ));
+                        }
+                        if contains_control_chars(s) {
+                            errors.push(format!(
+                                "credentials.{}.{} must not contain control characters",
+                                cred_type, key
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+}
+
+impl Upstream {
+    /// Validate all fields of an upstream for correctness and safe lengths.
+    pub fn validate_fields(&self) -> Result<(), Vec<String>> {
+        let mut errors = Vec::new();
+
+        // Name
+        if let Some(ref name) = self.name
+            && let Err(e) = validate_string_field("name", name, MAX_NAME_LENGTH)
+        {
+            errors.push(e);
+        }
+
+        // hash_on
+        if let Some(ref hash_on) = self.hash_on
+            && let Err(e) = validate_string_field("hash_on", hash_on, MAX_HASH_ON_LENGTH)
+        {
+            errors.push(e);
+        }
+
+        // Target count limit
+        if self.targets.len() > MAX_TARGETS_PER_UPSTREAM {
+            errors.push(format!(
+                "targets must not have more than {} entries (got {})",
+                MAX_TARGETS_PER_UPSTREAM,
+                self.targets.len()
+            ));
+        }
+
+        // Validate individual targets
+        for (i, target) in self.targets.iter().enumerate() {
+            if let Err(e) = validate_string_field(
+                &format!("targets[{}].host", i),
+                &target.host,
+                MAX_BACKEND_HOST_LENGTH,
+            ) {
+                errors.push(e);
+            }
+            if target.host.is_empty() {
+                errors.push(format!("targets[{}].host must not be empty", i));
+            }
+            if target.port == 0 {
+                errors.push(format!("targets[{}].port must be greater than 0", i));
+            }
+            if target.weight == 0 || target.weight > MAX_TARGET_WEIGHT {
+                errors.push(format!(
+                    "targets[{}].weight must be between 1 and {} (got {})",
+                    i, MAX_TARGET_WEIGHT, target.weight
+                ));
+            }
+            // Tag limits
+            if target.tags.len() > MAX_TAGS_PER_TARGET {
+                errors.push(format!(
+                    "targets[{}].tags must not have more than {} entries (got {})",
+                    i,
+                    MAX_TAGS_PER_TARGET,
+                    target.tags.len()
+                ));
+            }
+            for (key, val) in &target.tags {
+                if key.len() > MAX_TAG_LENGTH {
+                    errors.push(format!(
+                        "targets[{}].tags key must not exceed {} characters",
+                        i, MAX_TAG_LENGTH
+                    ));
+                }
+                if val.len() > MAX_TAG_LENGTH {
+                    errors.push(format!(
+                        "targets[{}].tags value must not exceed {} characters",
+                        i, MAX_TAG_LENGTH
+                    ));
+                }
+            }
+            // Target path
+            if let Some(ref path) = target.path
+                && let Err(e) = validate_string_field(
+                    &format!("targets[{}].path", i),
+                    path,
+                    MAX_BACKEND_PATH_LENGTH,
+                )
+            {
+                errors.push(e);
+            }
+        }
+
+        // Health check config
+        if let Some(ref hc) = self.health_checks
+            && let Err(hc_errors) = hc.validate_fields()
+        {
+            for e in hc_errors {
+                errors.push(format!("health_checks.{}", e));
+            }
+        }
+
+        // Service discovery config
+        if let Some(ref sd) = self.service_discovery
+            && let Err(sd_errors) = sd.validate_fields()
+        {
+            for e in sd_errors {
+                errors.push(format!("service_discovery.{}", e));
+            }
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+}
+
+impl PluginConfig {
+    /// Validate all fields of a plugin config for correctness and safe lengths.
+    pub fn validate_fields(&self) -> Result<(), Vec<String>> {
+        let mut errors = Vec::new();
+
+        // Plugin name length (should already be validated against known plugins,
+        // but enforce a length limit as defense-in-depth)
+        if let Err(e) = validate_string_field("plugin_name", &self.plugin_name, MAX_NAME_LENGTH) {
+            errors.push(e);
+        }
+
+        // Config JSON size
+        let config_json = serde_json::to_string(&self.config).unwrap_or_default();
+        if config_json.len() > MAX_PLUGIN_CONFIG_SIZE {
+            errors.push(format!(
+                "config JSON must not exceed {} bytes (got {})",
+                MAX_PLUGIN_CONFIG_SIZE,
+                config_json.len()
+            ));
+        }
+
+        // Config JSON nesting depth
+        if json_depth(&self.config) > 10 {
+            errors.push("config JSON nesting depth must not exceed 10".to_string());
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+}
+
+impl CircuitBreakerConfig {
+    /// Validate circuit breaker configuration fields.
+    pub fn validate_fields(&self) -> Result<(), Vec<String>> {
+        let mut errors = Vec::new();
+
+        if let Err(e) = validate_u32_range(
+            "failure_threshold",
+            self.failure_threshold,
+            1,
+            MAX_THRESHOLD,
+        ) {
+            errors.push(e);
+        }
+        if let Err(e) = validate_u32_range(
+            "success_threshold",
+            self.success_threshold,
+            1,
+            MAX_THRESHOLD,
+        ) {
+            errors.push(e);
+        }
+        if let Err(e) = validate_u64_range(
+            "timeout_seconds",
+            self.timeout_seconds,
+            1,
+            MAX_TIMEOUT_SECONDS,
+        ) {
+            errors.push(e);
+        }
+        if let Err(e) = validate_u32_range(
+            "half_open_max_requests",
+            self.half_open_max_requests,
+            1,
+            MAX_THRESHOLD,
+        ) {
+            errors.push(e);
+        }
+        if let Err(e) = validate_status_codes("failure_status_codes", &self.failure_status_codes) {
+            errors.push(e);
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+}
+
+impl RetryConfig {
+    /// Validate retry configuration fields.
+    pub fn validate_fields(&self) -> Result<(), Vec<String>> {
+        let mut errors = Vec::new();
+
+        if let Err(e) = validate_u32_range("max_retries", self.max_retries, 0, MAX_RETRIES) {
+            errors.push(e);
+        }
+        if let Err(e) =
+            validate_status_codes("retryable_status_codes", &self.retryable_status_codes)
+        {
+            errors.push(e);
+        }
+        if self.retryable_methods.len() > MAX_RETRYABLE_METHODS {
+            errors.push(format!(
+                "retryable_methods must not have more than {} entries (got {})",
+                MAX_RETRYABLE_METHODS,
+                self.retryable_methods.len()
+            ));
+        }
+        for method in &self.retryable_methods {
+            let upper = method.to_uppercase();
+            if !VALID_HTTP_METHODS.contains(&upper.as_str()) {
+                errors.push(format!(
+                    "retryable_methods contains invalid HTTP method: {}",
+                    method
+                ));
+            }
+        }
+
+        // Validate backoff
+        match &self.backoff {
+            BackoffStrategy::Fixed { delay_ms } => {
+                if *delay_ms > MAX_BACKOFF_MS {
+                    errors.push(format!(
+                        "backoff.delay_ms must not exceed {} (got {})",
+                        MAX_BACKOFF_MS, delay_ms
+                    ));
+                }
+            }
+            BackoffStrategy::Exponential { base_ms, max_ms } => {
+                if *base_ms > MAX_BACKOFF_MS {
+                    errors.push(format!(
+                        "backoff.base_ms must not exceed {} (got {})",
+                        MAX_BACKOFF_MS, base_ms
+                    ));
+                }
+                if *max_ms > MAX_BACKOFF_MS {
+                    errors.push(format!(
+                        "backoff.max_ms must not exceed {} (got {})",
+                        MAX_BACKOFF_MS, max_ms
+                    ));
+                }
+                if *base_ms > *max_ms {
+                    errors.push(format!(
+                        "backoff.base_ms ({}) must not exceed backoff.max_ms ({})",
+                        base_ms, max_ms
+                    ));
+                }
+            }
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+}
+
+impl HealthCheckConfig {
+    /// Validate health check configuration fields.
+    pub fn validate_fields(&self) -> Result<(), Vec<String>> {
+        let mut errors = Vec::new();
+
+        if let Some(ref active) = self.active {
+            if let Err(e) = validate_string_field(
+                "active.http_path",
+                &active.http_path,
+                MAX_BACKEND_PATH_LENGTH,
+            ) {
+                errors.push(e);
+            }
+            if let Err(e) = validate_u64_range(
+                "active.interval_seconds",
+                active.interval_seconds,
+                1,
+                MAX_HEALTH_CHECK_INTERVAL,
+            ) {
+                errors.push(e);
+            }
+            if let Err(e) =
+                validate_u64_range("active.timeout_ms", active.timeout_ms, 1, MAX_TIMEOUT_MS)
+            {
+                errors.push(e);
+            }
+            if let Err(e) = validate_u32_range(
+                "active.healthy_threshold",
+                active.healthy_threshold,
+                1,
+                MAX_THRESHOLD,
+            ) {
+                errors.push(e);
+            }
+            if let Err(e) = validate_u32_range(
+                "active.unhealthy_threshold",
+                active.unhealthy_threshold,
+                1,
+                MAX_THRESHOLD,
+            ) {
+                errors.push(e);
+            }
+            if let Err(e) =
+                validate_status_codes("active.healthy_status_codes", &active.healthy_status_codes)
+            {
+                errors.push(e);
+            }
+            if let Some(ref payload) = active.udp_probe_payload
+                && let Err(e) = validate_string_field("active.udp_probe_payload", payload, 2048)
+            {
+                errors.push(e);
+            }
+        }
+
+        if let Some(ref passive) = self.passive {
+            if let Err(e) = validate_status_codes(
+                "passive.unhealthy_status_codes",
+                &passive.unhealthy_status_codes,
+            ) {
+                errors.push(e);
+            }
+            if let Err(e) = validate_u32_range(
+                "passive.unhealthy_threshold",
+                passive.unhealthy_threshold,
+                1,
+                MAX_THRESHOLD,
+            ) {
+                errors.push(e);
+            }
+            if let Err(e) = validate_u64_range(
+                "passive.unhealthy_window_seconds",
+                passive.unhealthy_window_seconds,
+                1,
+                MAX_TIMEOUT_SECONDS,
+            ) {
+                errors.push(e);
+            }
+            // healthy_after_seconds can be 0 (disabled), so min is 0
+            if let Err(e) = validate_u64_range(
+                "passive.healthy_after_seconds",
+                passive.healthy_after_seconds,
+                0,
+                MAX_TIMEOUT_SECONDS,
+            ) {
+                errors.push(e);
+            }
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+}
+
+impl ServiceDiscoveryConfig {
+    /// Validate service discovery configuration fields.
+    pub fn validate_fields(&self) -> Result<(), Vec<String>> {
+        let mut errors = Vec::new();
+
+        if self.default_weight == 0 || self.default_weight > MAX_TARGET_WEIGHT {
+            errors.push(format!(
+                "default_weight must be between 1 and {} (got {})",
+                MAX_TARGET_WEIGHT, self.default_weight
+            ));
+        }
+
+        match self.provider {
+            SdProvider::DnsSd => {
+                if let Some(ref dns_sd) = self.dns_sd {
+                    if let Err(e) = validate_string_field(
+                        "dns_sd.service_name",
+                        &dns_sd.service_name,
+                        MAX_NAME_LENGTH,
+                    ) {
+                        errors.push(e);
+                    }
+                    if dns_sd.service_name.is_empty() {
+                        errors.push("dns_sd.service_name must not be empty".to_string());
+                    }
+                    if let Err(e) = validate_u64_range(
+                        "dns_sd.poll_interval_seconds",
+                        dns_sd.poll_interval_seconds,
+                        1,
+                        MAX_SD_POLL_INTERVAL,
+                    ) {
+                        errors.push(e);
+                    }
+                } else {
+                    errors.push("dns_sd config is required when provider is dns_sd".to_string());
+                }
+            }
+            SdProvider::Kubernetes => {
+                if let Some(ref k8s) = self.kubernetes {
+                    if let Err(e) = validate_string_field(
+                        "kubernetes.namespace",
+                        &k8s.namespace,
+                        MAX_NAME_LENGTH,
+                    ) {
+                        errors.push(e);
+                    }
+                    if let Err(e) = validate_string_field(
+                        "kubernetes.service_name",
+                        &k8s.service_name,
+                        MAX_NAME_LENGTH,
+                    ) {
+                        errors.push(e);
+                    }
+                    if k8s.service_name.is_empty() {
+                        errors.push("kubernetes.service_name must not be empty".to_string());
+                    }
+                    if let Some(ref port_name) = k8s.port_name
+                        && let Err(e) = validate_string_field(
+                            "kubernetes.port_name",
+                            port_name,
+                            MAX_SD_STRING_LENGTH,
+                        )
+                    {
+                        errors.push(e);
+                    }
+                    if let Some(ref label_selector) = k8s.label_selector
+                        && let Err(e) =
+                            validate_string_field("kubernetes.label_selector", label_selector, 1024)
+                    {
+                        errors.push(e);
+                    }
+                    if let Err(e) = validate_u64_range(
+                        "kubernetes.poll_interval_seconds",
+                        k8s.poll_interval_seconds,
+                        1,
+                        MAX_SD_POLL_INTERVAL,
+                    ) {
+                        errors.push(e);
+                    }
+                } else {
+                    errors.push(
+                        "kubernetes config is required when provider is kubernetes".to_string(),
+                    );
+                }
+            }
+            SdProvider::Consul => {
+                if let Some(ref consul) = self.consul {
+                    if let Err(e) = validate_string_field(
+                        "consul.address",
+                        &consul.address,
+                        MAX_BACKEND_PATH_LENGTH,
+                    ) {
+                        errors.push(e);
+                    }
+                    if consul.address.is_empty() {
+                        errors.push("consul.address must not be empty".to_string());
+                    }
+                    if let Err(e) = validate_string_field(
+                        "consul.service_name",
+                        &consul.service_name,
+                        MAX_NAME_LENGTH,
+                    ) {
+                        errors.push(e);
+                    }
+                    if consul.service_name.is_empty() {
+                        errors.push("consul.service_name must not be empty".to_string());
+                    }
+                    if let Some(ref dc) = consul.datacenter
+                        && let Err(e) =
+                            validate_string_field("consul.datacenter", dc, MAX_SD_STRING_LENGTH)
+                    {
+                        errors.push(e);
+                    }
+                    if let Some(ref tag) = consul.tag
+                        && let Err(e) =
+                            validate_string_field("consul.tag", tag, MAX_SD_STRING_LENGTH)
+                    {
+                        errors.push(e);
+                    }
+                    if let Some(ref token) = consul.token
+                        && let Err(e) = validate_string_field(
+                            "consul.token",
+                            token,
+                            MAX_CREDENTIAL_VALUE_LENGTH,
+                        )
+                    {
+                        errors.push(e);
+                    }
+                    if let Err(e) = validate_u64_range(
+                        "consul.poll_interval_seconds",
+                        consul.poll_interval_seconds,
+                        1,
+                        MAX_SD_POLL_INTERVAL,
+                    ) {
+                        errors.push(e);
+                    }
+                } else {
+                    errors.push("consul config is required when provider is consul".to_string());
+                }
+            }
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+}
+
+impl GatewayConfig {
+    /// Validate all field-level constraints across every resource in the config.
+    ///
+    /// This validates individual field values (lengths, ranges, formats) — not
+    /// cross-resource constraints like uniqueness or FK references, which are
+    /// handled by the existing `validate_*` methods.
+    pub fn validate_all_fields(&self) -> Result<(), Vec<String>> {
+        let mut errors = Vec::new();
+
+        for proxy in &self.proxies {
+            if let Err(errs) = proxy.validate_fields() {
+                for e in errs {
+                    errors.push(format!("Proxy '{}': {}", proxy.id, e));
+                }
+            }
+        }
+        for consumer in &self.consumers {
+            if let Err(errs) = consumer.validate_fields() {
+                for e in errs {
+                    errors.push(format!("Consumer '{}': {}", consumer.id, e));
+                }
+            }
+        }
+        for upstream in &self.upstreams {
+            if let Err(errs) = upstream.validate_fields() {
+                for e in errs {
+                    errors.push(format!("Upstream '{}': {}", upstream.id, e));
+                }
+            }
+        }
+        for pc in &self.plugin_configs {
+            if let Err(errs) = pc.validate_fields() {
+                for e in errs {
+                    errors.push(format!("PluginConfig '{}': {}", pc.id, e));
+                }
+            }
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+}
+
+/// Compute the maximum nesting depth of a JSON value.
+fn json_depth(value: &serde_json::Value) -> usize {
+    match value {
+        serde_json::Value::Array(arr) => 1 + arr.iter().map(json_depth).max().unwrap_or(0),
+        serde_json::Value::Object(map) => 1 + map.values().map(json_depth).max().unwrap_or(0),
+        _ => 0,
+    }
 }
 
 /// Check if a wildcard pattern matches a hostname.
