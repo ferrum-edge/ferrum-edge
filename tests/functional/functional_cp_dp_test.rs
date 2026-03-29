@@ -179,9 +179,12 @@ fn create_test_proxy(id: &str, listen_path: &str, backend_port: u16) -> Proxy {
 
 /// Create a JWT token for gRPC authentication
 fn create_grpc_token() -> String {
+    let now = Utc::now().timestamp();
     let claims = json!({
         "sub": "dp-node",
         "role": "data_plane",
+        "iat": now,
+        "exp": now + 3600,
     });
     encode(
         &Header::new(Algorithm::HS256),
