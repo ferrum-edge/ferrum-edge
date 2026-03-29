@@ -5,6 +5,7 @@ use ferrum_gateway::PluginCache;
 use ferrum_gateway::config::types::{
     AuthMode, BackendProtocol, GatewayConfig, PluginAssociation, PluginConfig, PluginScope, Proxy,
 };
+use ferrum_gateway::plugins::ProxyProtocol;
 use serde_json::json;
 
 fn make_proxy(id: &str, listen_path: &str, plugin_ids: Vec<&str>) -> Proxy {
@@ -598,4 +599,240 @@ fn test_apply_delta_accepts_valid_config() {
 
     let result = cache.apply_delta(&config2, &proxy_ids, &[], false);
     assert!(result.is_ok(), "apply_delta should accept valid config");
+}
+
+// ---- Protocol-filtered plugin lookup tests ----
+
+fn make_plugin_config_with_json(
+    id: &str,
+    plugin_name: &str,
+    config: serde_json::Value,
+    scope: PluginScope,
+    proxy_id: Option<&str>,
+) -> PluginConfig {
+    PluginConfig {
+        id: id.to_string(),
+        plugin_name: plugin_name.to_string(),
+        config,
+        scope,
+        proxy_id: proxy_id.map(|s| s.to_string()),
+        enabled: true,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    }
+}
+
+#[test]
+fn test_get_plugins_for_protocol_filters_by_protocol() {
+    // ip_restriction = ALL_PROTOCOLS, cors = HTTP_ONLY
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["ps1", "ps2"])],
+        vec![
+            make_plugin_config(
+                "ps1",
+                "ip_restriction",
+                PluginScope::Proxy,
+                Some("p1"),
+                true,
+            ),
+            make_plugin_config_with_json(
+                "ps2",
+                "cors",
+                json!({"origins": ["*"]}),
+                PluginScope::Proxy,
+                Some("p1"),
+            ),
+        ],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+
+    // HTTP — both present
+    let http_plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Http);
+    let http_names: Vec<&str> = http_plugins.iter().map(|p| p.name()).collect();
+    assert!(http_names.contains(&"ip_restriction"));
+    assert!(http_names.contains(&"cors"));
+    assert_eq!(http_names.len(), 2);
+
+    // TCP — only ip_restriction (cors is HTTP_ONLY)
+    let tcp_plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Tcp);
+    let tcp_names: Vec<&str> = tcp_plugins.iter().map(|p| p.name()).collect();
+    assert!(tcp_names.contains(&"ip_restriction"));
+    assert!(!tcp_names.contains(&"cors"));
+    assert_eq!(tcp_names.len(), 1);
+
+    // UDP — only ip_restriction
+    let udp_plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Udp);
+    assert_eq!(udp_plugins.len(), 1);
+    assert_eq!(udp_plugins[0].name(), "ip_restriction");
+
+    // WebSocket — only ip_restriction (cors is HTTP_ONLY, not HTTP_FAMILY)
+    let ws_plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::WebSocket);
+    assert_eq!(ws_plugins.len(), 1);
+    assert_eq!(ws_plugins[0].name(), "ip_restriction");
+}
+
+#[test]
+fn test_get_plugins_for_protocol_tcp_excludes_http_family() {
+    // cors = HTTP_ONLY, key_auth = HTTP_FAMILY, rate_limiting = ALL, stdout_logging = ALL
+    let config = make_config(
+        vec![make_proxy(
+            "p1",
+            "/tcp-svc",
+            vec!["ps1", "ps2", "ps3", "ps4"],
+        )],
+        vec![
+            make_plugin_config_with_json(
+                "ps1",
+                "cors",
+                json!({"origins": ["*"]}),
+                PluginScope::Proxy,
+                Some("p1"),
+            ),
+            make_plugin_config("ps2", "key_auth", PluginScope::Proxy, Some("p1"), true),
+            make_plugin_config("ps3", "rate_limiting", PluginScope::Proxy, Some("p1"), true),
+            make_plugin_config(
+                "ps4",
+                "stdout_logging",
+                PluginScope::Proxy,
+                Some("p1"),
+                true,
+            ),
+        ],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+
+    let tcp_plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Tcp);
+    let tcp_names: Vec<&str> = tcp_plugins.iter().map(|p| p.name()).collect();
+    assert!(tcp_names.contains(&"rate_limiting"));
+    assert!(tcp_names.contains(&"stdout_logging"));
+    assert!(
+        !tcp_names.contains(&"cors"),
+        "cors should be excluded for TCP"
+    );
+    assert!(
+        !tcp_names.contains(&"key_auth"),
+        "key_auth should be excluded for TCP"
+    );
+    assert_eq!(tcp_names.len(), 2);
+}
+
+#[test]
+fn test_get_plugins_for_protocol_falls_back_to_globals() {
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec![])],
+        vec![make_plugin_config(
+            "g1",
+            "stdout_logging",
+            PluginScope::Global,
+            None,
+            true,
+        )],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+
+    // Proxy with no associations — should get global stdout_logging for TCP
+    let tcp_plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Tcp);
+    assert_eq!(tcp_plugins.len(), 1);
+    assert_eq!(tcp_plugins[0].name(), "stdout_logging");
+
+    // Nonexistent proxy — falls back to global plugins
+    let fallback = cache.get_plugins_for_protocol("nonexistent", ProxyProtocol::Http);
+    assert_eq!(fallback.len(), 1);
+    assert_eq!(fallback[0].name(), "stdout_logging");
+}
+
+#[test]
+fn test_get_plugins_for_protocol_rebuild_updates_maps() {
+    let config1 = make_config(
+        vec![make_proxy("p1", "/api", vec!["ps1"])],
+        vec![make_plugin_config(
+            "ps1",
+            "rate_limiting",
+            PluginScope::Proxy,
+            Some("p1"),
+            true,
+        )],
+    );
+    let cache = PluginCache::new(&config1).unwrap();
+
+    let tcp_before = cache.get_plugins_for_protocol("p1", ProxyProtocol::Tcp);
+    assert_eq!(tcp_before.len(), 1);
+
+    // Rebuild with an additional plugin
+    let config2 = make_config(
+        vec![make_proxy("p1", "/api", vec!["ps1", "ps2"])],
+        vec![
+            make_plugin_config("ps1", "rate_limiting", PluginScope::Proxy, Some("p1"), true),
+            make_plugin_config(
+                "ps2",
+                "ip_restriction",
+                PluginScope::Proxy,
+                Some("p1"),
+                true,
+            ),
+        ],
+    );
+    cache.rebuild(&config2).unwrap();
+
+    let tcp_after = cache.get_plugins_for_protocol("p1", ProxyProtocol::Tcp);
+    let names: Vec<&str> = tcp_after.iter().map(|p| p.name()).collect();
+    assert!(names.contains(&"rate_limiting"));
+    assert!(names.contains(&"ip_restriction"));
+    assert_eq!(names.len(), 2);
+}
+
+#[test]
+fn test_get_plugins_for_protocol_websocket_includes_auth_excludes_cors() {
+    let config = make_config(
+        vec![make_proxy("p1", "/ws", vec!["ps1", "ps2", "ps3"])],
+        vec![
+            make_plugin_config("ps1", "key_auth", PluginScope::Proxy, Some("p1"), true),
+            make_plugin_config("ps2", "rate_limiting", PluginScope::Proxy, Some("p1"), true),
+            make_plugin_config_with_json(
+                "ps3",
+                "cors",
+                json!({"origins": ["*"]}),
+                PluginScope::Proxy,
+                Some("p1"),
+            ),
+        ],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+
+    let ws_plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::WebSocket);
+    let names: Vec<&str> = ws_plugins.iter().map(|p| p.name()).collect();
+    assert!(names.contains(&"key_auth"), "WebSocket should include auth");
+    assert!(
+        names.contains(&"rate_limiting"),
+        "WebSocket should include rate_limiting"
+    );
+    assert!(!names.contains(&"cors"), "WebSocket should exclude CORS");
+    assert_eq!(names.len(), 2);
+}
+
+#[test]
+fn test_get_plugins_for_protocol_grpc_excludes_http_only() {
+    let config = make_config(
+        vec![make_proxy("p1", "/grpc", vec!["ps1", "ps2"])],
+        vec![
+            make_plugin_config_with_json(
+                "ps1",
+                "response_caching",
+                json!({"ttl_seconds": 60}),
+                PluginScope::Proxy,
+                Some("p1"),
+            ),
+            make_plugin_config("ps2", "rate_limiting", PluginScope::Proxy, Some("p1"), true),
+        ],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+
+    let grpc_plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Grpc);
+    let names: Vec<&str> = grpc_plugins.iter().map(|p| p.name()).collect();
+    assert!(names.contains(&"rate_limiting"));
+    assert!(
+        !names.contains(&"response_caching"),
+        "gRPC should exclude response_caching (HTTP_ONLY)"
+    );
+    assert_eq!(names.len(), 1);
 }

@@ -12,7 +12,7 @@ use tracing::{debug, error, info, warn};
 
 use super::config::Http3ServerConfig;
 use crate::config::types::{AuthMode, Proxy};
-use crate::plugins::{Plugin, PluginResult, RequestContext, TransactionSummary};
+use crate::plugins::{Plugin, PluginResult, ProxyProtocol, RequestContext, TransactionSummary};
 use crate::proxy::ProxyState;
 use crate::tls::TlsPolicy;
 
@@ -388,8 +388,10 @@ async fn handle_h3_request(
         return Ok(());
     }
 
-    // Get pre-resolved plugins from cache (O(1) lookup)
-    let plugins = state.plugin_cache.get_plugins(&proxy.id);
+    // Get pre-resolved plugins filtered for HTTP protocol (O(1) lookup)
+    let plugins = state
+        .plugin_cache
+        .get_plugins_for_protocol(&proxy.id, ProxyProtocol::Http);
 
     let mut plugin_execution_ns: u64 = 0;
 

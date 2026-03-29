@@ -411,6 +411,7 @@ fn make_stream_summary() -> StreamTransactionSummary {
         error_class: None,
         timestamp_connected: "2026-03-26T12:00:00Z".to_string(),
         timestamp_disconnected: "2026-03-26T12:00:01.5Z".to_string(),
+        metadata: std::collections::HashMap::new(),
     }
 }
 

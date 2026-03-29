@@ -71,7 +71,6 @@ impl IpRestriction {
     }
 
     /// Check whether a client IP is allowed by the restriction rules.
-    #[allow(dead_code)] // Called via on_stream_connect
     fn check_ip(&self, client_ip_str: &str) -> PluginResult {
         let client_ip = parse_client_ip(client_ip_str);
 
@@ -147,7 +146,10 @@ impl Plugin for IpRestriction {
         super::ALL_PROTOCOLS
     }
 
-    async fn on_stream_connect(&self, ctx: &super::StreamConnectionContext) -> super::PluginResult {
+    async fn on_stream_connect(
+        &self,
+        ctx: &mut super::StreamConnectionContext,
+    ) -> super::PluginResult {
         self.check_ip(&ctx.client_ip)
     }
 

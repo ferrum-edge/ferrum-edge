@@ -10,7 +10,7 @@ use serde_json::Value;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
-use super::{Plugin, TransactionSummary};
+use super::{Plugin, StreamTransactionSummary, TransactionSummary};
 
 /// Global metrics registry (singleton per process).
 static METRICS_REGISTRY: OnceLock<Arc<MetricsRegistry>> = OnceLock::new();
@@ -30,6 +30,13 @@ pub struct CounterKey {
     pub status_code: u16,
 }
 
+/// Composite key for stream connection counter: (proxy_id, protocol).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct StreamCounterKey {
+    pub proxy_id: String,
+    pub protocol: String,
+}
+
 /// Metrics registry holding all Prometheus-compatible counters and histograms.
 pub struct MetricsRegistry {
     /// Total requests by (proxy_id, method, status_code)
@@ -42,6 +49,10 @@ pub struct MetricsRegistry {
     pub gateway_overhead_buckets: DashMap<String, HistogramBuckets>,
     /// Rate limit exceeded counter
     pub rate_limit_exceeded: AtomicU64,
+    /// Stream connections by (proxy_id, protocol)
+    pub stream_connection_counter: DashMap<StreamCounterKey, AtomicU64>,
+    /// Stream connection duration histogram by proxy_id
+    pub stream_duration_buckets: DashMap<String, HistogramBuckets>,
 }
 
 /// Histogram with predefined buckets.
@@ -110,7 +121,27 @@ impl MetricsRegistry {
             backend_duration_buckets: DashMap::new(),
             gateway_overhead_buckets: DashMap::new(),
             rate_limit_exceeded: AtomicU64::new(0),
+            stream_connection_counter: DashMap::new(),
+            stream_duration_buckets: DashMap::new(),
         }
+    }
+
+    pub fn record_stream(&self, summary: &StreamTransactionSummary) {
+        let proxy_id = summary.proxy_id.clone();
+
+        let counter_key = StreamCounterKey {
+            proxy_id: proxy_id.clone(),
+            protocol: summary.protocol.clone(),
+        };
+        self.stream_connection_counter
+            .entry(counter_key)
+            .or_insert_with(|| AtomicU64::new(0))
+            .fetch_add(1, Ordering::Relaxed);
+
+        self.stream_duration_buckets
+            .entry(proxy_id)
+            .or_insert_with(HistogramBuckets::new)
+            .observe(summary.duration_ms);
     }
 
     pub fn record(&self, summary: &TransactionSummary) {
@@ -265,6 +296,55 @@ impl MetricsRegistry {
             self.rate_limit_exceeded.load(Ordering::Relaxed)
         ));
 
+        // Stream connection counter
+        if !self.stream_connection_counter.is_empty() {
+            output.push_str(
+                "# HELP ferrum_stream_connections_total Total stream connections (TCP/UDP).\n",
+            );
+            output.push_str("# TYPE ferrum_stream_connections_total counter\n");
+            for entry in self.stream_connection_counter.iter() {
+                let key = entry.key();
+                let count = entry.value().load(Ordering::Relaxed);
+                output.push_str(&format!(
+                    "ferrum_stream_connections_total{{proxy_id=\"{}\",protocol=\"{}\"}} {}\n",
+                    key.proxy_id, key.protocol, count
+                ));
+            }
+        }
+
+        // Stream duration histogram
+        if !self.stream_duration_buckets.is_empty() {
+            output.push_str(
+                "# HELP ferrum_stream_duration_ms Stream connection duration in milliseconds.\n",
+            );
+            output.push_str("# TYPE ferrum_stream_duration_ms histogram\n");
+            for entry in self.stream_duration_buckets.iter() {
+                let proxy_id = entry.key();
+                let histogram = entry.value();
+                for (i, boundary) in histogram.boundaries.iter().enumerate() {
+                    let count = histogram.counts[i].load(Ordering::Relaxed);
+                    output.push_str(&format!(
+                        "ferrum_stream_duration_ms_bucket{{proxy_id=\"{}\",le=\"{}\"}} {}\n",
+                        proxy_id, boundary, count
+                    ));
+                }
+                let total_count = histogram.count.load(Ordering::Relaxed);
+                let sum = f64::from_bits(histogram.sum.load(Ordering::Relaxed));
+                output.push_str(&format!(
+                    "ferrum_stream_duration_ms_bucket{{proxy_id=\"{}\",le=\"+Inf\"}} {}\n",
+                    proxy_id, total_count
+                ));
+                output.push_str(&format!(
+                    "ferrum_stream_duration_ms_sum{{proxy_id=\"{}\"}} {:.2}\n",
+                    proxy_id, sum
+                ));
+                output.push_str(&format!(
+                    "ferrum_stream_duration_ms_count{{proxy_id=\"{}\"}} {}\n",
+                    proxy_id, total_count
+                ));
+            }
+        }
+
         output
     }
 }
@@ -295,6 +375,10 @@ impl Plugin for PrometheusMetrics {
 
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
         super::ALL_PROTOCOLS
+    }
+
+    async fn on_stream_disconnect(&self, summary: &StreamTransactionSummary) {
+        self.registry.record_stream(summary);
     }
 
     async fn log(&self, summary: &TransactionSummary) {

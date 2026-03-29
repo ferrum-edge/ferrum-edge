@@ -40,7 +40,8 @@ use crate::http3::client::Http3ConnectionPool;
 use crate::load_balancer::LoadBalancerCache;
 use crate::plugin_cache::PluginCache;
 use crate::plugins::{
-    Plugin, PluginResult, RequestContext, TransactionSummary, priority as plugin_priority,
+    Plugin, PluginResult, ProxyProtocol, RequestContext, TransactionSummary,
+    priority as plugin_priority,
 };
 use crate::retry;
 use crate::retry::ResponseBody;
@@ -253,6 +254,7 @@ impl ProxyState {
             config_arc.clone(),
             dns_cache.clone(),
             load_balancer_cache.clone(),
+            plugin_cache.clone(),
             None, // Frontend TLS for stream proxies is configured per-listener in reconcile()
             env_config_arc.tls_no_verify,
             env_config_arc.udp_max_sessions,
@@ -1904,8 +1906,29 @@ pub async fn handle_proxy_request(
         return Ok(resp);
     }
 
-    // Get pre-resolved plugins from cache (O(1) lookup, no per-request allocation)
-    let plugins = state.plugin_cache.get_plugins(&proxy.id);
+    // Detect request protocol early so we fetch only plugins that support it.
+    // WebSocket and gRPC are detected from headers; everything else is plain HTTP.
+    let request_protocol = if is_websocket_upgrade(&req)
+        && matches!(
+            proxy.backend_protocol,
+            BackendProtocol::Ws | BackendProtocol::Wss
+        ) {
+        ProxyProtocol::WebSocket
+    } else if grpc_proxy::is_grpc_request(&req)
+        && matches!(
+            proxy.backend_protocol,
+            BackendProtocol::Grpc | BackendProtocol::Grpcs
+        )
+    {
+        ProxyProtocol::Grpc
+    } else {
+        ProxyProtocol::Http
+    };
+
+    // Get pre-resolved plugins filtered by protocol (O(1) lookup, no per-request filtering)
+    let plugins = state
+        .plugin_cache
+        .get_plugins_for_protocol(&proxy.id, request_protocol);
 
     // Accumulator for total wall-clock time spent inside plugin phase callbacks.
     // Stored as nanoseconds in u64 to avoid floating-point precision loss across

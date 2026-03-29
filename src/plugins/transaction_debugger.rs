@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashMap;
 
-use super::{Plugin, PluginResult, RequestContext, TransactionSummary};
+use super::{Plugin, PluginResult, RequestContext, StreamTransactionSummary, TransactionSummary};
 
 /// Headers that contain sensitive credentials and must be redacted in debug output.
 const SENSITIVE_HEADERS: &[&str] = &[
@@ -111,6 +111,33 @@ impl Plugin for TransactionDebugger {
             println!("[DEBUG] (Response body logging enabled)");
         }
         PluginResult::Continue
+    }
+
+    async fn on_stream_disconnect(&self, summary: &StreamTransactionSummary) {
+        if let Some(ref error) = summary.connection_error {
+            println!(
+                "[DEBUG] Stream: {} {}:{} -> {} [{}] ({:.0}ms, {} bytes in, {} bytes out)",
+                summary.protocol,
+                summary.proxy_id,
+                summary.listen_port,
+                summary.backend_target,
+                error,
+                summary.duration_ms,
+                summary.bytes_sent,
+                summary.bytes_received,
+            );
+        } else {
+            println!(
+                "[DEBUG] Stream: {} {}:{} -> {} ({:.0}ms, {} bytes in, {} bytes out)",
+                summary.protocol,
+                summary.proxy_id,
+                summary.listen_port,
+                summary.backend_target,
+                summary.duration_ms,
+                summary.bytes_sent,
+                summary.bytes_received,
+            );
+        }
     }
 
     async fn log(&self, summary: &TransactionSummary) {
