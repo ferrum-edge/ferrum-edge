@@ -610,3 +610,54 @@ async fn test_dns_stale_deadline_enforcement() {
         "Re-resolution should return same IP for localhost"
     );
 }
+
+#[tokio::test]
+async fn test_dns_resolve_all_returns_all_addresses() {
+    let cache = DnsCache::new(default_dns_config(300, HashMap::new()));
+
+    // resolve_all for localhost should return at least one IP
+    let result = cache.resolve_all("localhost", None, None).await;
+    assert!(result.is_ok(), "resolve_all should succeed for localhost");
+    let ips = result.unwrap();
+    assert!(!ips.is_empty(), "resolve_all should return at least one IP");
+}
+
+#[tokio::test]
+async fn test_dns_resolve_all_per_proxy_override() {
+    let cache = DnsCache::new(default_dns_config(300, HashMap::new()));
+
+    let result = cache
+        .resolve_all("example.com", Some("192.168.1.1"), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        result,
+        vec!["192.168.1.1".parse::<std::net::IpAddr>().unwrap()]
+    );
+}
+
+#[tokio::test]
+async fn test_dns_resolve_all_global_override() {
+    let mut overrides = HashMap::new();
+    overrides.insert("db.internal".to_string(), "10.0.0.5".to_string());
+    let cache = DnsCache::new(default_dns_config(300, overrides));
+
+    let result = cache.resolve_all("db.internal", None, None).await.unwrap();
+    assert_eq!(
+        result,
+        vec!["10.0.0.5".parse::<std::net::IpAddr>().unwrap()]
+    );
+}
+
+#[tokio::test]
+async fn test_dns_resolve_all_caches_entries() {
+    let cache = DnsCache::new(default_dns_config(300, HashMap::new()));
+
+    // First call should populate cache
+    let result1 = cache.resolve_all("localhost", None, None).await.unwrap();
+    assert_eq!(cache.cache_len(), 1);
+
+    // Second call should use cache and return the same set
+    let result2 = cache.resolve_all("localhost", None, None).await.unwrap();
+    assert_eq!(result1, result2);
+}
