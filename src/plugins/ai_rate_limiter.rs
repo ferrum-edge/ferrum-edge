@@ -426,19 +426,17 @@ impl Plugin for AiRateLimiter {
         // Try to read token count from ai_token_metrics metadata first (avoids
         // re-parsing the response JSON when both plugins are active). Falls back
         // to parsing the body directly if metadata isn't available.
-        let tokens = self
-            .read_tokens_from_metadata(&ctx.metadata)
-            .or_else(|| {
-                // Only parse JSON responses
-                let content_type = response_headers
-                    .get("content-type")
-                    .map(|s| s.as_str())
-                    .unwrap_or("");
-                if !content_type.contains("json") || body.is_empty() {
-                    return None;
-                }
-                self.extract_token_count(body)
-            });
+        let tokens = self.read_tokens_from_metadata(&ctx.metadata).or_else(|| {
+            // Only parse JSON responses
+            let content_type = response_headers
+                .get("content-type")
+                .map(|s| s.as_str())
+                .unwrap_or("");
+            if !content_type.contains("json") || body.is_empty() {
+                return None;
+            }
+            self.extract_token_count(body)
+        });
 
         let tokens = match tokens {
             Some(t) => t,
