@@ -563,7 +563,7 @@ By default, `POST` and `PATCH` are **not** retried because they are typically no
 
 ## Circuit Breaker
 
-The circuit breaker pattern prevents cascading failures by temporarily stopping requests to a proxy that is experiencing high failure rates.
+The circuit breaker pattern prevents cascading failures by temporarily stopping requests to a backend that is experiencing high failure rates. When a proxy uses an upstream with multiple targets, each target gets its own independent circuit breaker — a failing target's breaker opens without affecting healthy targets in the same upstream group. For direct-backend proxies (no upstream), the breaker is scoped to the proxy.
 
 ```yaml
 proxies:

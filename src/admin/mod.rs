@@ -2385,13 +2385,24 @@ fn build_metrics(state: &AdminState) -> Value {
         let cb_snapshot = ps.circuit_breaker_cache.snapshot();
         let circuit_breakers: Vec<Value> = cb_snapshot
             .iter()
-            .map(|(id, state, failures, successes)| {
-                json!({
-                    "proxy_id": id,
-                    "state": state,
-                    "failure_count": failures,
-                    "success_count": successes,
-                })
+            .map(|(key, state, failures, successes)| {
+                // Keys are "proxy_id" (direct backend) or "proxy_id::host:port" (upstream target)
+                if let Some((proxy_id, target)) = key.split_once("::") {
+                    json!({
+                        "proxy_id": proxy_id,
+                        "target": target,
+                        "state": state,
+                        "failure_count": failures,
+                        "success_count": successes,
+                    })
+                } else {
+                    json!({
+                        "proxy_id": key,
+                        "state": state,
+                        "failure_count": failures,
+                        "success_count": successes,
+                    })
+                }
             })
             .collect();
 

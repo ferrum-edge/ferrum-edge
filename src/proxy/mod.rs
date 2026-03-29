@@ -2445,34 +2445,32 @@ pub async fn handle_proxy_request(
         (None, false)
     };
 
-    // Circuit breaker check
-    let circuit_breaker = if let Some(cb_config) = &proxy.circuit_breaker {
-        match state
+    // Circuit breaker check — per-target when upstream is configured, per-proxy otherwise
+    let cb_target_key = upstream_target
+        .as_ref()
+        .map(|t| crate::circuit_breaker::target_key(&t.host, t.port));
+    if let Some(cb_config) = &proxy.circuit_breaker
+        && state
             .circuit_breaker_cache
-            .can_execute(&proxy.id, cb_config)
-        {
-            Ok(cb) => Some(cb),
-            Err(_) => {
-                warn!(proxy_id = %proxy.id, "Request rejected: circuit breaker open");
-                log_rejected_request(
-                    &plugins,
-                    &ctx,
-                    503,
-                    start_time,
-                    "circuit_breaker_open",
-                    plugin_execution_ns,
-                )
-                .await;
-                record_request(&state, 503);
-                return Ok(build_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    r#"{"error":"Service temporarily unavailable (circuit breaker open)"}"#,
-                ));
-            }
-        }
-    } else {
-        None
-    };
+            .can_execute(&proxy.id, cb_target_key.as_deref(), cb_config)
+            .is_err()
+    {
+        warn!(proxy_id = %proxy.id, "Request rejected: circuit breaker open");
+        log_rejected_request(
+            &plugins,
+            &ctx,
+            503,
+            start_time,
+            "circuit_breaker_open",
+            plugin_execution_ns,
+        )
+        .await;
+        record_request(&state, 503);
+        return Ok(build_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            r#"{"error":"Service temporarily unavailable (circuit breaker open)"}"#,
+        ));
+    }
 
     // Build backend URL (using upstream target if available)
     let (effective_host, effective_port) = if let Some(ref target) = upstream_target {
@@ -2520,10 +2518,13 @@ pub async fn handle_proxy_request(
             .plugin_cache
             .requires_request_body_buffering(&proxy.id);
 
-    // Perform the backend request with retry logic
-    let backend_resp = if let Some(retry_config) = &proxy.retry {
+    // Perform the backend request with retry logic.
+    // Returns the response and the final CB target key (may differ from the
+    // initial target when retries switch to a different upstream target).
+    let (backend_resp, final_cb_target_key) = if let Some(retry_config) = &proxy.retry {
         let mut attempt = 0u32;
         let mut current_target = upstream_target.clone();
+        let mut current_cb_target_key = cb_target_key.clone();
         let mut current_url = backend_url.clone();
         let (mut result, retained_body) = proxy_to_backend(
             &state,
@@ -2543,6 +2544,17 @@ pub async fn handle_proxy_request(
         .await;
 
         while retry::should_retry(retry_config, &method, &result, attempt) {
+            // Record the failed attempt against the current target's circuit breaker
+            // before potentially switching to a different target for the next retry.
+            if let Some(cb_config) = &proxy.circuit_breaker {
+                let cb = state.circuit_breaker_cache.get_or_create(
+                    &proxy.id,
+                    current_cb_target_key.as_deref(),
+                    cb_config,
+                );
+                cb.record_failure(result.status_code);
+            }
+
             let delay = retry::retry_delay(retry_config, attempt);
             tokio::time::sleep(delay).await;
             attempt += 1;
@@ -2565,6 +2577,8 @@ pub async fn handle_proxy_request(
                     strip_len,
                     next.path.as_deref(),
                 );
+                current_cb_target_key =
+                    Some(crate::circuit_breaker::target_key(&next.host, next.port));
                 current_target = Some(next);
             }
 
@@ -2594,9 +2608,9 @@ pub async fn handle_proxy_request(
             )
             .await;
         }
-        result
+        (result, current_cb_target_key)
     } else {
-        proxy_to_backend(
+        let resp = proxy_to_backend(
             &state,
             &proxy,
             &backend_url,
@@ -2612,7 +2626,8 @@ pub async fn handle_proxy_request(
             is_tls,
         )
         .await
-        .0
+        .0;
+        (resp, cb_target_key.clone())
     };
     let mut response_status = backend_resp.status_code;
     let mut response_body = backend_resp.body;
@@ -2647,10 +2662,15 @@ pub async fn handle_proxy_request(
             .record_latency(upstream_id, target, latency_us);
     }
 
-    // Record circuit breaker result: successes reset failure counters (Closed state)
-    // and count toward recovery threshold (Half-Open state). Failures increment
-    // the failure counter and may trip the breaker.
-    if let Some(cb) = &circuit_breaker {
+    // Record circuit breaker result against the final target's breaker.
+    // For retries, intermediate failures were already recorded per-target inside
+    // the retry loop, so this only records the final attempt's outcome.
+    if let Some(cb_config) = &proxy.circuit_breaker {
+        let cb = state.circuit_breaker_cache.get_or_create(
+            &proxy.id,
+            final_cb_target_key.as_deref(),
+            cb_config,
+        );
         if cb.config().failure_status_codes.contains(&response_status) {
             cb.record_failure(response_status);
         } else {

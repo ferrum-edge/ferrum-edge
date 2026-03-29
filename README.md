@@ -1421,6 +1421,38 @@ Validates JSON and XML request and response bodies against schemas. Supports com
 
 **Supported `format` values**: `email`, `ipv4`, `ipv6`, `uri`, `date-time`, `date`, `uuid`
 
+#### `request_size_limiting`
+
+Enforces per-proxy request body size limits that are lower than the global `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES`. Checks the `Content-Length` header for instant rejection without reading the body. Also verifies the actual buffered body size in `before_proxy` when other plugins (e.g., `body_validator`) cause body buffering. Rejects with HTTP 413.
+
+**Config**:
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `max_bytes` | u64 | `0` (disabled) | Maximum allowed request body size in bytes |
+
+```yaml
+plugin_name: request_size_limiting
+config:
+  max_bytes: 1048576  # 1 MiB — stricter than the 10 MiB global default
+```
+
+#### `response_size_limiting`
+
+Enforces per-proxy response body size limits that are lower than the global `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES`. Checks the `Content-Length` response header for instant rejection. Optionally forces response body buffering to catch chunked responses without `Content-Length`. Rejects with HTTP 502.
+
+**Config**:
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `max_bytes` | u64 | `0` (disabled) | Maximum allowed response body size in bytes |
+| `require_buffered_check` | bool | `false` | Force response body buffering to verify actual size (adds memory overhead) |
+
+```yaml
+plugin_name: response_size_limiting
+config:
+  max_bytes: 5242880         # 5 MiB
+  require_buffered_check: false  # only check Content-Length header (default)
+```
+
 #### `graphql`
 
 Adds GraphQL-aware proxying with query analysis, depth/complexity limiting, and per-operation rate limiting. Parses GraphQL queries from POST request bodies (`application/json` with a `query` field) and enforces configurable protections.

@@ -22,9 +22,11 @@ pub mod mtls_auth;
 pub mod otel_tracing;
 pub mod prometheus_metrics;
 pub mod rate_limiting;
+pub mod request_size_limiting;
 pub mod request_termination;
 pub mod request_transformer;
 pub mod response_caching;
+pub mod response_size_limiting;
 pub mod response_transformer;
 pub mod stdout_logging;
 pub mod transaction_debugger;
@@ -271,6 +273,7 @@ pub mod priority {
     pub const BASIC_AUTH: u16 = 1300;
     pub const HMAC_AUTH: u16 = 1400;
     pub const ACCESS_CONTROL: u16 = 2000;
+    pub const REQUEST_SIZE_LIMITING: u16 = 2800;
     pub const GRAPHQL: u16 = 2850;
     pub const RATE_LIMITING: u16 = 2900;
     pub const AI_PROMPT_SHIELD: u16 = 2925;
@@ -278,6 +281,7 @@ pub mod priority {
     pub const AI_REQUEST_GUARD: u16 = 2975;
     pub const REQUEST_TRANSFORMER: u16 = 3000;
     pub const RESPONSE_CACHING: u16 = 3500;
+    pub const RESPONSE_SIZE_LIMITING: u16 = 3950;
     pub const RESPONSE_TRANSFORMER: u16 = 4000;
     pub const AI_TOKEN_METRICS: u16 = 4100;
     pub const AI_RATE_LIMITER: u16 = 4200;
@@ -550,6 +554,12 @@ pub fn create_plugin_with_http_client(
         ))),
         "graphql" => Ok(Some(Arc::new(graphql::GraphqlPlugin::new(config)))),
         "rate_limiting" => Ok(Some(Arc::new(rate_limiting::RateLimiting::new(config)))),
+        "request_size_limiting" => Ok(Some(Arc::new(
+            request_size_limiting::RequestSizeLimiting::new(config),
+        ))),
+        "response_size_limiting" => Ok(Some(Arc::new(
+            response_size_limiting::ResponseSizeLimiting::new(config),
+        ))),
         "body_validator" => Ok(Some(Arc::new(body_validator::BodyValidator::new(config)))),
         "request_termination" => Ok(Some(Arc::new(
             request_termination::RequestTermination::new(config),
@@ -623,6 +633,8 @@ pub fn available_plugins() -> Vec<&'static str> {
         "response_transformer",
         "graphql",
         "rate_limiting",
+        "request_size_limiting",
+        "response_size_limiting",
         "body_validator",
         "request_termination",
         "response_caching",

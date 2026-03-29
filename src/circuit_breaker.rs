@@ -235,7 +235,25 @@ impl CircuitBreaker {
     }
 }
 
-/// Cache of circuit breakers keyed by proxy ID.
+/// Build the cache key for a circuit breaker.
+///
+/// When an upstream target is provided, the breaker is scoped to that specific
+/// target (`proxy_id::host:port`) so each target tracks failures independently.
+/// Without a target, the key is just the proxy ID (direct backend proxies).
+fn circuit_breaker_key(proxy_id: &str, target_key: Option<&str>) -> String {
+    match target_key {
+        Some(tk) => format!("{proxy_id}::{tk}"),
+        None => proxy_id.to_string(),
+    }
+}
+
+/// Build a target key string from host and port (e.g. `"10.0.0.1:8080"`).
+pub fn target_key(host: &str, port: u16) -> String {
+    format!("{host}:{port}")
+}
+
+/// Cache of circuit breakers, keyed per-proxy for direct backends or
+/// per-target (`proxy_id::host:port`) for upstream load-balanced targets.
 pub struct CircuitBreakerCache {
     breakers: DashMap<String, Arc<CircuitBreaker>>,
 }
@@ -253,30 +271,39 @@ impl CircuitBreakerCache {
         }
     }
 
-    /// Get or create a circuit breaker for a proxy.
+    /// Get or create a circuit breaker for a proxy (or proxy+target).
+    ///
+    /// `target_key` should be `Some("host:port")` when the proxy uses an upstream,
+    /// or `None` for direct backend proxies.
     /// If the config has changed, replaces the breaker with a fresh one.
     pub fn get_or_create(
         &self,
         proxy_id: &str,
+        target_key: Option<&str>,
         config: &CircuitBreakerConfig,
     ) -> Arc<CircuitBreaker> {
-        if let Some(existing) = self.breakers.get(proxy_id)
+        let key = circuit_breaker_key(proxy_id, target_key);
+        if let Some(existing) = self.breakers.get(&key)
             && existing.config() == config
         {
             return existing.clone();
         }
         let cb = Arc::new(CircuitBreaker::new(config.clone()));
-        self.breakers.insert(proxy_id.to_string(), cb.clone());
+        self.breakers.insert(key, cb.clone());
         cb
     }
 
-    /// Check if a request can proceed for a given proxy.
+    /// Check if a request can proceed for a given proxy (or proxy+target).
+    ///
+    /// `target_key` should be `Some("host:port")` when the proxy uses an upstream,
+    /// or `None` for direct backend proxies.
     pub fn can_execute(
         &self,
         proxy_id: &str,
+        target_key: Option<&str>,
         config: &CircuitBreakerConfig,
     ) -> Result<Arc<CircuitBreaker>, CircuitOpenError> {
-        let cb = self.get_or_create(proxy_id, config);
+        let cb = self.get_or_create(proxy_id, target_key, config);
         cb.can_execute()?;
         Ok(cb)
     }
@@ -298,11 +325,15 @@ impl CircuitBreakerCache {
     }
 
     /// Remove circuit breakers for proxies that no longer exist in config.
-    /// Prevents unbounded memory growth when proxies are frequently added/deleted.
+    /// Removes both direct-backend keys (`proxy_id`) and per-target keys
+    /// (`proxy_id::host:port`) for each removed proxy.
     pub fn prune(&self, removed_proxy_ids: &[String]) {
-        for id in removed_proxy_ids {
-            self.breakers.remove(id);
-        }
+        self.breakers.retain(|key, _| {
+            !removed_proxy_ids.iter().any(|id| {
+                // Match exact proxy_id key or proxy_id:: prefix for target-scoped keys
+                key == id || key.starts_with(&format!("{id}::"))
+            })
+        });
     }
 }
 

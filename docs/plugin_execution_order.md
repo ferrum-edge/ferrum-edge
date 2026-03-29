@@ -106,8 +106,8 @@ Priority bands are spaced with gaps so future plugins can slot in without renumb
 |------|---------------|---------|---------|
 | **Early** | 0–949 | Pre-processing that must run before auth | `otel_tracing` (25), `cors` (100), `ip_restriction` (150), `bot_detection` (200) |
 | **AuthN** | 950–1999 | Authentication / identity verification | `mtls_auth` (950), `jwks_auth` (1000), `jwt_auth` (1100), `key_auth` (1200), `basic_auth` (1300), `hmac_auth` (1400) |
-| **AuthZ** | 2000–2999 | Authorization & post-auth enforcement | `access_control` (2000), `graphql` (2850), `rate_limiting` (2900), `ai_prompt_shield` (2925) |
-| **Transform** | 3000–3999 | Request modification before backend call | `body_validator` (2950), `ai_request_guard` (2975), `request_transformer` (3000), `request_termination` (3200) |
+| **AuthZ** | 2000–2999 | Authorization & post-auth enforcement | `access_control` (2000), `request_size_limiting` (2800), `graphql` (2850), `rate_limiting` (2900), `ai_prompt_shield` (2925) |
+| **Transform** | 3000–3999 | Request modification before backend call | `body_validator` (2950), `ai_request_guard` (2975), `request_transformer` (3000), `request_termination` (3200), `response_size_limiting` (3950) |
 | **Response** | 4000–4999 | Response modification after backend call | `response_transformer` (4000), `ai_token_metrics` (4100), `ai_rate_limiter` (4200) |
 | **Custom** | 5000 | Default for unrecognized/custom plugins | _(future plugins)_ |
 | **Logging** | 9000–9999 | Observability, runs outside the hot path | `stdout_logging` (9000), `correlation_id` (9050), `http_logging` (9100), `transaction_debugger` (9200), `prometheus_metrics` (9300) |
@@ -129,21 +129,23 @@ Given all built-in plugins enabled, the execution order is:
 | 9 | `basic_auth` | 1300 | authenticate |
 | 10 | `hmac_auth` | 1400 | authenticate |
 | 11 | `access_control` | 2000 | authorize |
-| 12 | `graphql` | 2850 | before_proxy |
-| 13 | `rate_limiting` | 2900 | on_request_received (IP mode), authorize (consumer mode), on_stream_connect |
-| 14 | `ai_prompt_shield` | 2925 | before_proxy, transform_request_body |
-| 15 | `body_validator` | 2950 | before_proxy, on_response_body |
-| 16 | `ai_request_guard` | 2975 | before_proxy, transform_request_body |
-| 17 | `request_transformer` | 3000 | before_proxy |
-| 18 | `request_termination` | 3200 | before_proxy |
-| 19 | `response_transformer` | 4000 | after_proxy |
-| 20 | `ai_token_metrics` | 4100 | on_response_body |
-| 21 | `ai_rate_limiter` | 4200 | before_proxy, on_response_body, after_proxy |
-| 22 | `stdout_logging` | 9000 | log, on_stream_disconnect |
-| 23 | `correlation_id` | 9050 | on_request_received, on_stream_connect, log |
-| 24 | `http_logging` | 9100 | log, on_stream_disconnect |
-| 25 | `transaction_debugger` | 9200 | on_request_received, after_proxy, log, on_stream_disconnect |
-| 26 | `prometheus_metrics` | 9300 | after_proxy, log, on_stream_disconnect |
+| 12 | `request_size_limiting` | 2800 | on_request_received, before_proxy |
+| 13 | `graphql` | 2850 | before_proxy |
+| 14 | `rate_limiting` | 2900 | on_request_received (IP mode), authorize (consumer mode), on_stream_connect |
+| 15 | `ai_prompt_shield` | 2925 | before_proxy, transform_request_body |
+| 16 | `body_validator` | 2950 | before_proxy, on_response_body |
+| 17 | `ai_request_guard` | 2975 | before_proxy, transform_request_body |
+| 18 | `request_transformer` | 3000 | before_proxy |
+| 19 | `request_termination` | 3200 | before_proxy |
+| 20 | `response_size_limiting` | 3950 | after_proxy, on_response_body |
+| 21 | `response_transformer` | 4000 | after_proxy |
+| 22 | `ai_token_metrics` | 4100 | on_response_body |
+| 23 | `ai_rate_limiter` | 4200 | before_proxy, on_response_body, after_proxy |
+| 24 | `stdout_logging` | 9000 | log, on_stream_disconnect |
+| 25 | `correlation_id` | 9050 | on_request_received, on_stream_connect, log |
+| 26 | `http_logging` | 9100 | log, on_stream_disconnect |
+| 27 | `transaction_debugger` | 9200 | on_request_received, after_proxy, log, on_stream_disconnect |
+| 28 | `prometheus_metrics` | 9300 | after_proxy, log, on_stream_disconnect |
 
 ## Why This Order Matters
 
@@ -284,10 +286,12 @@ TLS/DTLS are transport-layer concerns, not separate protocols. A plugin that sup
 | `hmac_auth` | ✓ | ✓ | ✓ | | | Requires HTTP headers |
 | `access_control` | ✓ | ✓ | ✓ | | | Needs consumer identity (auth not available on TCP/UDP) |
 | `graphql` | ✓ | | | | | GraphQL is HTTP-only (JSON body parsing) |
+| `request_size_limiting` | ✓ | ✓ | | | | Enforces per-proxy request body size limits |
 | `rate_limiting` | ✓ | ✓ | ✓ | ✓ | ✓ | Connection/session rate applies everywhere |
 | `request_transformer` | ✓ | ✓ | | | | Modifies HTTP headers/query/body |
 | `body_validator` | ✓ | ✓ | | | | Validates request and response bodies |
 | `request_termination` | ✓ | ✓ | ✓ | | | Returns HTTP error response |
+| `response_size_limiting` | ✓ | ✓ | | | | Enforces per-proxy response body size limits |
 | `response_transformer` | ✓ | ✓ | | | | Modifies HTTP response headers/body |
 | `ai_prompt_shield` | ✓ | ✓ | | | | Scans JSON request bodies for PII |
 | `ai_request_guard` | ✓ | ✓ | | | | Validates JSON request bodies |
