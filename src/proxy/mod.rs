@@ -931,6 +931,7 @@ async fn handle_websocket_request_authenticated(
     proxy: Arc<Proxy>,
     ctx: RequestContext,
     plugins: Arc<Vec<Arc<dyn Plugin>>>,
+    plugin_execution_ns: u64,
 ) -> Result<Response<ProxyBody>, hyper::Error> {
     info!(
         "WebSocket upgrade request authenticated for proxy: {} from: {}",
@@ -998,6 +999,11 @@ async fn handle_websocket_request_authenticated(
                         let ws_total_ms = (chrono::Utc::now() - ctx.timestamp_received)
                             .num_milliseconds()
                             .max(0) as f64;
+                        let ws_plugin_execution_ms = plugin_execution_ns as f64 / 1_000_000.0;
+                        let ws_plugin_external_io_ms =
+                            ctx.plugin_http_call_ns.load(Ordering::Relaxed) as f64 / 1_000_000.0;
+                        let ws_gateway_overhead_ms =
+                            (ws_total_ms - ws_plugin_execution_ms).max(0.0);
                         let mut metadata = ctx.metadata.clone();
                         metadata.insert(
                             "rejection_phase".to_string(),
@@ -1021,6 +1027,9 @@ async fn handle_websocket_request_authenticated(
                             latency_gateway_processing_ms: ws_total_ms,
                             latency_backend_ttfb_ms: -1.0,
                             latency_backend_total_ms: -1.0,
+                            latency_plugin_execution_ms: ws_plugin_execution_ms,
+                            latency_plugin_external_io_ms: ws_plugin_external_io_ms,
+                            latency_gateway_overhead_ms: ws_gateway_overhead_ms,
                             request_user_agent: ctx.headers.get("user-agent").cloned(),
                             response_streamed: false,
                             client_disconnected: false,
@@ -1061,6 +1070,11 @@ async fn handle_websocket_request_authenticated(
         .ok()
         .map(|ip| ip.to_string());
 
+    let ws_plugin_execution_ms = plugin_execution_ns as f64 / 1_000_000.0;
+    let ws_plugin_external_io_ms =
+        ctx.plugin_http_call_ns.load(Ordering::Relaxed) as f64 / 1_000_000.0;
+    let ws_gateway_overhead_ms = (total_ms - ws_plugin_execution_ms).max(0.0);
+
     let summary = TransactionSummary {
         timestamp_received: ctx.timestamp_received.to_rfc3339(),
         client_ip: ctx.client_ip.clone(),
@@ -1080,6 +1094,9 @@ async fn handle_websocket_request_authenticated(
         latency_gateway_processing_ms: total_ms,
         latency_backend_ttfb_ms: 0.0,
         latency_backend_total_ms: 0.0,
+        latency_plugin_execution_ms: ws_plugin_execution_ms,
+        latency_plugin_external_io_ms: ws_plugin_external_io_ms,
+        latency_gateway_overhead_ms: ws_gateway_overhead_ms,
         request_user_agent: ctx.headers.get("user-agent").cloned(),
         response_streamed: false,
         client_disconnected: false,
@@ -1654,6 +1671,7 @@ pub async fn log_rejected_request(
     status_code: u16,
     start_time: Instant,
     rejection_phase: &str,
+    plugin_execution_ns: u64,
 ) {
     let logging_plugins: Vec<&Arc<dyn Plugin>> = plugins
         .iter()
@@ -1665,6 +1683,10 @@ pub async fn log_rejected_request(
     }
 
     let total_ms = start_time.elapsed().as_secs_f64() * 1000.0;
+    let plugin_execution_ms = plugin_execution_ns as f64 / 1_000_000.0;
+    let plugin_external_io_ms =
+        ctx.plugin_http_call_ns.load(Ordering::Relaxed) as f64 / 1_000_000.0;
+    let gateway_overhead_ms = (total_ms - plugin_execution_ms).max(0.0);
     let proxy = ctx.matched_proxy.as_ref();
 
     let mut metadata = ctx.metadata.clone();
@@ -1692,6 +1714,9 @@ pub async fn log_rejected_request(
         latency_gateway_processing_ms: total_ms,
         latency_backend_ttfb_ms: -1.0,
         latency_backend_total_ms: -1.0,
+        latency_plugin_execution_ms: plugin_execution_ms,
+        latency_plugin_external_io_ms: plugin_external_io_ms,
+        latency_gateway_overhead_ms: gateway_overhead_ms,
         request_user_agent: ctx.headers.get("user-agent").cloned(),
         response_streamed: false,
         client_disconnected: false,
@@ -1879,8 +1904,14 @@ pub async fn handle_proxy_request(
     // Get pre-resolved plugins from cache (O(1) lookup, no per-request allocation)
     let plugins = state.plugin_cache.get_plugins(&proxy.id);
 
+    // Accumulator for total wall-clock time spent inside plugin phase callbacks.
+    // Stored as nanoseconds in u64 to avoid floating-point precision loss across
+    // many additions; converted to f64 milliseconds once when building the summary.
+    let mut plugin_execution_ns: u64 = 0;
+
     // Execute on_request_received hooks (skip iteration when no plugins configured)
     if !plugins.is_empty() {
+        let phase_start = Instant::now();
         for plugin in plugins.iter() {
             match plugin.on_request_received(&mut ctx).await {
                 PluginResult::Reject {
@@ -1888,12 +1919,14 @@ pub async fn handle_proxy_request(
                     body,
                     headers,
                 } => {
+                    plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
                     log_rejected_request(
                         &plugins,
                         &ctx,
                         status_code,
                         start_time,
                         "on_request_received",
+                        plugin_execution_ns,
                     )
                     .await;
                     record_request(&state, status_code);
@@ -1907,84 +1940,102 @@ pub async fn handle_proxy_request(
                 PluginResult::Continue => {}
             }
         }
+        plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
     }
 
     // Authentication phase
     let auth_plugins: Vec<&Arc<dyn Plugin>> =
         plugins.iter().filter(|p| p.is_auth_plugin()).collect();
 
-    match proxy.auth_mode {
-        AuthMode::Multi => {
-            // Execute auth plugins; first success (consumer identified) stops iteration.
-            // If all fail and auth plugins were configured, reject with 401.
-            let mut last_reject: Option<(u16, String, HashMap<String, String>)> = None;
-            for auth_plugin in &auth_plugins {
-                match auth_plugin
-                    .authenticate(&mut ctx, &state.consumer_index)
-                    .await
-                {
-                    PluginResult::Reject {
-                        status_code,
-                        body,
-                        headers,
-                    } => {
-                        last_reject = Some((status_code, body, headers));
-                    }
-                    PluginResult::Continue => {
-                        if ctx.identified_consumer.is_some() {
-                            last_reject = None;
-                            break;
+    {
+        let auth_phase_start = Instant::now();
+        match proxy.auth_mode {
+            AuthMode::Multi => {
+                // Execute auth plugins; first success (consumer identified) stops iteration.
+                // If all fail and auth plugins were configured, reject with 401.
+                let mut last_reject: Option<(u16, String, HashMap<String, String>)> = None;
+                for auth_plugin in &auth_plugins {
+                    match auth_plugin
+                        .authenticate(&mut ctx, &state.consumer_index)
+                        .await
+                    {
+                        PluginResult::Reject {
+                            status_code,
+                            body,
+                            headers,
+                        } => {
+                            last_reject = Some((status_code, body, headers));
+                        }
+                        PluginResult::Continue => {
+                            if ctx.identified_consumer.is_some() {
+                                last_reject = None;
+                                break;
+                            }
                         }
                     }
                 }
-            }
-            if let Some((status_code, body, headers)) = last_reject
-                .filter(|_| !auth_plugins.is_empty() && ctx.identified_consumer.is_none())
-            {
-                log_rejected_request(&plugins, &ctx, status_code, start_time, "authenticate").await;
-                record_request(&state, status_code);
-                return Ok(build_reject_response(
-                    StatusCode::from_u16(status_code).unwrap_or(StatusCode::UNAUTHORIZED),
-                    &body,
-                    &headers,
-                ));
-            }
-        }
-        AuthMode::Single => {
-            // Execute auth plugins sequentially; first failure rejects
-            for auth_plugin in &auth_plugins {
-                match auth_plugin
-                    .authenticate(&mut ctx, &state.consumer_index)
-                    .await
+                if let Some((status_code, body, headers)) = last_reject
+                    .filter(|_| !auth_plugins.is_empty() && ctx.identified_consumer.is_none())
                 {
-                    PluginResult::Reject {
+                    plugin_execution_ns += auth_phase_start.elapsed().as_nanos() as u64;
+                    log_rejected_request(
+                        &plugins,
+                        &ctx,
                         status_code,
-                        body,
-                        headers,
-                    } => {
-                        log_rejected_request(
-                            &plugins,
-                            &ctx,
+                        start_time,
+                        "authenticate",
+                        plugin_execution_ns,
+                    )
+                    .await;
+                    record_request(&state, status_code);
+                    return Ok(build_reject_response(
+                        StatusCode::from_u16(status_code).unwrap_or(StatusCode::UNAUTHORIZED),
+                        &body,
+                        &headers,
+                    ));
+                }
+            }
+            AuthMode::Single => {
+                // Execute auth plugins sequentially; first failure rejects
+                for auth_plugin in &auth_plugins {
+                    match auth_plugin
+                        .authenticate(&mut ctx, &state.consumer_index)
+                        .await
+                    {
+                        PluginResult::Reject {
                             status_code,
-                            start_time,
-                            "authenticate",
-                        )
-                        .await;
-                        record_request(&state, status_code);
-                        return Ok(build_reject_response(
-                            StatusCode::from_u16(status_code).unwrap_or(StatusCode::UNAUTHORIZED),
-                            &body,
-                            &headers,
-                        ));
+                            body,
+                            headers,
+                        } => {
+                            plugin_execution_ns += auth_phase_start.elapsed().as_nanos() as u64;
+                            log_rejected_request(
+                                &plugins,
+                                &ctx,
+                                status_code,
+                                start_time,
+                                "authenticate",
+                                plugin_execution_ns,
+                            )
+                            .await;
+                            record_request(&state, status_code);
+                            return Ok(build_reject_response(
+                                StatusCode::from_u16(status_code)
+                                    .unwrap_or(StatusCode::UNAUTHORIZED),
+                                &body,
+                                &headers,
+                            ));
+                        }
+                        PluginResult::Continue => {}
                     }
-                    PluginResult::Continue => {}
                 }
             }
         }
+        plugin_execution_ns += auth_phase_start.elapsed().as_nanos() as u64;
     }
 
     // Authorization phase (access_control, rate_limiting by consumer, etc.)
     if !plugins.is_empty() {
+        let phase_start = Instant::now();
         for plugin in plugins.iter() {
             match plugin.authorize(&mut ctx).await {
                 PluginResult::Reject {
@@ -1992,8 +2043,16 @@ pub async fn handle_proxy_request(
                     body,
                     headers,
                 } => {
-                    log_rejected_request(&plugins, &ctx, status_code, start_time, "authorize")
-                        .await;
+                    plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
+                    log_rejected_request(
+                        &plugins,
+                        &ctx,
+                        status_code,
+                        start_time,
+                        "authorize",
+                        plugin_execution_ns,
+                    )
+                    .await;
                     record_request(&state, status_code);
                     return Ok(build_reject_response(
                         StatusCode::from_u16(status_code).unwrap_or(StatusCode::FORBIDDEN),
@@ -2004,6 +2063,7 @@ pub async fn handle_proxy_request(
                 PluginResult::Continue => {}
             }
         }
+        plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
     }
 
     // before_proxy hooks — only clone headers if at least one plugin modifies them.
@@ -2013,6 +2073,7 @@ pub async fn handle_proxy_request(
         !plugins.is_empty() && plugins.iter().any(|p| p.modifies_request_headers());
     let mut owned_proxy_headers: Option<HashMap<String, String>> = None;
     if needs_header_clone {
+        let phase_start = Instant::now();
         let mut cloned = ctx.headers.clone();
         for plugin in plugins.iter() {
             match plugin.before_proxy(&mut ctx, &mut cloned).await {
@@ -2021,8 +2082,16 @@ pub async fn handle_proxy_request(
                     body,
                     headers,
                 } => {
-                    log_rejected_request(&plugins, &ctx, status_code, start_time, "before_proxy")
-                        .await;
+                    plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
+                    log_rejected_request(
+                        &plugins,
+                        &ctx,
+                        status_code,
+                        start_time,
+                        "before_proxy",
+                        plugin_execution_ns,
+                    )
+                    .await;
                     record_request(&state, status_code);
                     return Ok(build_reject_response(
                         StatusCode::from_u16(status_code)
@@ -2034,11 +2103,13 @@ pub async fn handle_proxy_request(
                 PluginResult::Continue => {}
             }
         }
+        plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
         owned_proxy_headers = Some(cloned);
     } else if !plugins.is_empty() {
         // Run before_proxy hooks that don't modify headers (e.g., body_validator).
         // No plugin modifies headers, so swap headers out of ctx temporarily to
         // satisfy the borrow checker without cloning — zero allocation hot path.
+        let phase_start = Instant::now();
         let mut tmp_headers = std::mem::take(&mut ctx.headers);
         for plugin in plugins.iter() {
             match plugin.before_proxy(&mut ctx, &mut tmp_headers).await {
@@ -2047,9 +2118,17 @@ pub async fn handle_proxy_request(
                     body,
                     headers,
                 } => {
+                    plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
                     ctx.headers = tmp_headers;
-                    log_rejected_request(&plugins, &ctx, status_code, start_time, "before_proxy")
-                        .await;
+                    log_rejected_request(
+                        &plugins,
+                        &ctx,
+                        status_code,
+                        start_time,
+                        "before_proxy",
+                        plugin_execution_ns,
+                    )
+                    .await;
                     record_request(&state, status_code);
                     return Ok(build_reject_response(
                         StatusCode::from_u16(status_code)
@@ -2061,6 +2140,7 @@ pub async fn handle_proxy_request(
                 PluginResult::Continue => {}
             }
         }
+        plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
         ctx.headers = tmp_headers;
     }
     // Inject X-Consumer-Username header when a consumer has been authenticated
@@ -2099,6 +2179,7 @@ pub async fn handle_proxy_request(
             proxy,
             ctx,
             plugins,
+            plugin_execution_ns,
         )
         .await;
     }
@@ -2135,21 +2216,30 @@ pub async fn handle_proxy_request(
                 }
 
                 // after_proxy hooks
-                for plugin in plugins.iter() {
-                    if let PluginResult::Reject { status_code, .. } = plugin
-                        .after_proxy(&mut ctx, grpc_resp.status, &mut response_headers)
-                        .await
-                    {
-                        warn!(
-                            "after_proxy plugin '{}' returned Reject (status {}), but response is already committed",
-                            plugin.name(),
-                            status_code,
-                        );
+                {
+                    let phase_start = Instant::now();
+                    for plugin in plugins.iter() {
+                        if let PluginResult::Reject { status_code, .. } = plugin
+                            .after_proxy(&mut ctx, grpc_resp.status, &mut response_headers)
+                            .await
+                        {
+                            warn!(
+                                "after_proxy plugin '{}' returned Reject (status {}), but response is already committed",
+                                plugin.name(),
+                                status_code,
+                            );
+                        }
                     }
+                    plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
                 }
 
                 let total_ms = start_time.elapsed().as_secs_f64() * 1000.0;
+                let plugin_execution_ms = plugin_execution_ns as f64 / 1_000_000.0;
+                let plugin_external_io_ms =
+                    ctx.plugin_http_call_ns.load(Ordering::Relaxed) as f64 / 1_000_000.0;
                 let gateway_processing_ms = total_ms - backend_total_ms;
+                let gateway_overhead_ms =
+                    (total_ms - backend_total_ms - plugin_execution_ms).max(0.0);
 
                 // Log phase
                 if !plugins.is_empty() {
@@ -2183,6 +2273,9 @@ pub async fn handle_proxy_request(
                         latency_gateway_processing_ms: gateway_processing_ms,
                         latency_backend_ttfb_ms: backend_total_ms,
                         latency_backend_total_ms: backend_total_ms,
+                        latency_plugin_execution_ms: plugin_execution_ms,
+                        latency_plugin_external_io_ms: plugin_external_io_ms,
+                        latency_gateway_overhead_ms: gateway_overhead_ms,
                         request_user_agent: ctx.headers.get("user-agent").cloned(),
                         response_streamed: false,
                         client_disconnected: false,
@@ -2228,6 +2321,11 @@ pub async fn handle_proxy_request(
 
                 // Log with error_class for gRPC backend failures
                 let total_ms = start_time.elapsed().as_secs_f64() * 1000.0;
+                let grpc_plugin_execution_ms = plugin_execution_ns as f64 / 1_000_000.0;
+                let grpc_plugin_external_io_ms =
+                    ctx.plugin_http_call_ns.load(Ordering::Relaxed) as f64 / 1_000_000.0;
+                let grpc_gateway_overhead_ms =
+                    (total_ms - backend_total_ms - grpc_plugin_execution_ms).max(0.0);
                 if !plugins.is_empty() {
                     let logging_plugins: Vec<&Arc<dyn Plugin>> = plugins
                         .iter()
@@ -2262,6 +2360,9 @@ pub async fn handle_proxy_request(
                             latency_gateway_processing_ms: total_ms - backend_total_ms,
                             latency_backend_ttfb_ms: backend_total_ms,
                             latency_backend_total_ms: backend_total_ms,
+                            latency_plugin_execution_ms: grpc_plugin_execution_ms,
+                            latency_plugin_external_io_ms: grpc_plugin_external_io_ms,
+                            latency_gateway_overhead_ms: grpc_gateway_overhead_ms,
                             request_user_agent: ctx.headers.get("user-agent").cloned(),
                             response_streamed: false,
                             client_disconnected: false,
@@ -2326,7 +2427,15 @@ pub async fn handle_proxy_request(
             Ok(cb) => Some(cb),
             Err(_) => {
                 warn!(proxy_id = %proxy.id, "Request rejected: circuit breaker open");
-                log_rejected_request(&plugins, &ctx, 503, start_time, "circuit_breaker_open").await;
+                log_rejected_request(
+                    &plugins,
+                    &ctx,
+                    503,
+                    start_time,
+                    "circuit_breaker_open",
+                    plugin_execution_ns,
+                )
+                .await;
                 record_request(&state, 503);
                 return Ok(build_response(
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -2540,6 +2649,7 @@ pub async fn handle_proxy_request(
     // after_proxy hooks (these only modify headers, not the body,
     // so they are compatible with both streaming and buffered modes)
     if !plugins.is_empty() {
+        let phase_start = Instant::now();
         for plugin in plugins.iter() {
             if let PluginResult::Reject { status_code, .. } = plugin
                 .after_proxy(&mut ctx, response_status, &mut response_headers)
@@ -2552,6 +2662,7 @@ pub async fn handle_proxy_request(
                 );
             }
         }
+        plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
     }
 
     // on_response_body hooks — only for buffered responses, only when plugins exist.
@@ -2561,6 +2672,7 @@ pub async fn handle_proxy_request(
     if !plugins.is_empty()
         && let ResponseBody::Buffered(ref data) = response_body
     {
+        let phase_start = Instant::now();
         for plugin in plugins.iter() {
             let result = plugin
                 .on_response_body(&ctx, response_status, &response_headers, data)
@@ -2588,6 +2700,7 @@ pub async fn handle_proxy_request(
                 }
             }
         }
+        plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
     }
 
     // transform_response_body hooks — only for buffered responses.
@@ -2596,6 +2709,7 @@ pub async fn handle_proxy_request(
     if !plugins.is_empty()
         && let ResponseBody::Buffered(ref mut data) = response_body
     {
+        let phase_start = Instant::now();
         // Clone content-type to avoid borrowing response_headers across the loop.
         let content_type = response_headers.get("content-type").cloned();
         let ct_ref = content_type.as_deref();
@@ -2607,10 +2721,20 @@ pub async fn handle_proxy_request(
                 *data = transformed;
             }
         }
+        plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
     }
 
     let total_ms = start_time.elapsed().as_secs_f64() * 1000.0;
-    let gateway_processing_ms = total_ms - backend_total_ms;
+    let plugin_execution_ms = plugin_execution_ns as f64 / 1_000_000.0;
+    let plugin_external_io_ms =
+        ctx.plugin_http_call_ns.load(Ordering::Relaxed) as f64 / 1_000_000.0;
+    let effective_backend_ms = if backend_total_ms >= 0.0 {
+        backend_total_ms
+    } else {
+        backend_ttfb_ms
+    };
+    let gateway_processing_ms = total_ms - effective_backend_ms;
+    let gateway_overhead_ms = (total_ms - effective_backend_ms - plugin_execution_ms).max(0.0);
 
     // Log phase — skip TransactionSummary construction when no plugins need it
     if !plugins.is_empty() {
@@ -2633,6 +2757,9 @@ pub async fn handle_proxy_request(
             latency_gateway_processing_ms: gateway_processing_ms,
             latency_backend_ttfb_ms: backend_ttfb_ms,
             latency_backend_total_ms: backend_total_ms,
+            latency_plugin_execution_ms: plugin_execution_ms,
+            latency_plugin_external_io_ms: plugin_external_io_ms,
+            latency_gateway_overhead_ms: gateway_overhead_ms,
             request_user_agent: ctx.headers.get("user-agent").cloned(),
             response_streamed: is_streaming_response,
             client_disconnected: false,

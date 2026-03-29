@@ -48,7 +48,7 @@ async fn test_log_rejected_request_only_calls_logging_plugins() {
     let start = Instant::now();
 
     // This should not panic and should only call log() on logging plugins
-    log_rejected_request(&plugins, &ctx, 401, start, "authenticate").await;
+    log_rejected_request(&plugins, &ctx, 401, start, "authenticate", 0).await;
 }
 
 /// Verify the TransactionSummary produced for rejected requests has correct metadata.
@@ -67,7 +67,7 @@ async fn test_rejected_request_summary_has_rejection_phase() {
     let start = Instant::now();
 
     // Call with "authorize" phase
-    log_rejected_request(&plugins, &ctx, 403, start, "authorize").await;
+    log_rejected_request(&plugins, &ctx, 403, start, "authorize", 0).await;
 
     // The function completes without panic — if the summary were malformed,
     // the logging plugin would fail. The rejection_phase metadata is set
@@ -91,7 +91,7 @@ async fn test_log_rejected_request_noop_without_logging_plugins() {
     let start = Instant::now();
 
     // Should return immediately without calling any plugin
-    log_rejected_request(&plugins, &ctx, 401, start, "authenticate").await;
+    log_rejected_request(&plugins, &ctx, 401, start, "authenticate", 0).await;
 }
 
 /// Verify that log_rejected_request works with an empty plugin list.
@@ -101,7 +101,7 @@ async fn test_log_rejected_request_empty_plugins() {
     let ctx = create_test_context();
     let start = Instant::now();
 
-    log_rejected_request(&plugins, &ctx, 500, start, "on_request_received").await;
+    log_rejected_request(&plugins, &ctx, 500, start, "on_request_received", 0).await;
 }
 
 /// Verify that log_rejected_request handles all rejection phases.
@@ -125,7 +125,7 @@ async fn test_log_rejected_request_all_phases() {
 
     for (phase, status) in phases {
         let start = Instant::now();
-        log_rejected_request(&plugins, &ctx, status, start, phase).await;
+        log_rejected_request(&plugins, &ctx, status, start, phase, 0).await;
     }
 }
 
@@ -167,7 +167,7 @@ async fn test_rejected_request_summary_no_backend_fields() {
     ctx.identified_consumer = None;
 
     let start = Instant::now();
-    log_rejected_request(&plugins, &ctx, 401, start, "authenticate").await;
+    log_rejected_request(&plugins, &ctx, 401, start, "authenticate", 0).await;
 
     let summaries = logger.captured.lock().unwrap();
     assert_eq!(summaries.len(), 1);

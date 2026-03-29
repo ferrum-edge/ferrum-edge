@@ -17,7 +17,6 @@ mod jwks_store_tests;
 mod jwt_auth_plugin_tests;
 mod key_auth_tests;
 mod mtls_auth_tests;
-mod oauth2_auth_tests;
 mod otel_tracing_tests;
 mod plugin_cache_tests;
 mod plugin_http_client_tests;

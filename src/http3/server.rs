@@ -391,7 +391,10 @@ async fn handle_h3_request(
     // Get pre-resolved plugins from cache (O(1) lookup)
     let plugins = state.plugin_cache.get_plugins(&proxy.id);
 
+    let mut plugin_execution_ns: u64 = 0;
+
     // Execute on_request_received hooks
+    let phase_start = std::time::Instant::now();
     for plugin in plugins.iter() {
         match plugin.on_request_received(&mut ctx).await {
             PluginResult::Reject {
@@ -412,11 +415,13 @@ async fn handle_h3_request(
             PluginResult::Continue => {}
         }
     }
+    plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
 
     // Authentication phase
     let auth_plugins: Vec<&Arc<dyn Plugin>> =
         plugins.iter().filter(|p| p.is_auth_plugin()).collect();
 
+    let auth_phase_start = std::time::Instant::now();
     match proxy.auth_mode {
         AuthMode::Multi => {
             // Multi auth mode: try each auth plugin, first success wins
@@ -480,11 +485,42 @@ async fn handle_h3_request(
             }
         }
     }
+    plugin_execution_ns += auth_phase_start.elapsed().as_nanos() as u64;
 
     // Authorization phase
-    for plugin in plugins.iter() {
-        if plugin.name() == "access_control" {
-            match plugin.authorize(&mut ctx).await {
+    {
+        let phase_start = std::time::Instant::now();
+        for plugin in plugins.iter() {
+            if plugin.name() == "access_control" {
+                match plugin.authorize(&mut ctx).await {
+                    PluginResult::Reject {
+                        status_code,
+                        body,
+                        headers,
+                    } => {
+                        record_request(&state, status_code);
+                        send_h3_reject_response(
+                            &mut stream,
+                            StatusCode::from_u16(status_code).unwrap_or(StatusCode::FORBIDDEN),
+                            &body,
+                            &headers,
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                    PluginResult::Continue => {}
+                }
+            }
+        }
+        plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
+    }
+
+    // before_proxy hooks
+    let mut proxy_headers = ctx.headers.clone();
+    {
+        let phase_start = std::time::Instant::now();
+        for plugin in plugins.iter() {
+            match plugin.before_proxy(&mut ctx, &mut proxy_headers).await {
                 PluginResult::Reject {
                     status_code,
                     body,
@@ -493,7 +529,8 @@ async fn handle_h3_request(
                     record_request(&state, status_code);
                     send_h3_reject_response(
                         &mut stream,
-                        StatusCode::from_u16(status_code).unwrap_or(StatusCode::FORBIDDEN),
+                        StatusCode::from_u16(status_code)
+                            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
                         &body,
                         &headers,
                     )
@@ -503,29 +540,7 @@ async fn handle_h3_request(
                 PluginResult::Continue => {}
             }
         }
-    }
-
-    // before_proxy hooks
-    let mut proxy_headers = ctx.headers.clone();
-    for plugin in plugins.iter() {
-        match plugin.before_proxy(&mut ctx, &mut proxy_headers).await {
-            PluginResult::Reject {
-                status_code,
-                body,
-                headers,
-            } => {
-                record_request(&state, status_code);
-                send_h3_reject_response(
-                    &mut stream,
-                    StatusCode::from_u16(status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-                    &body,
-                    &headers,
-                )
-                .await?;
-                return Ok(());
-            }
-            PluginResult::Continue => {}
-        }
+        plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
     }
 
     // Enforce request body size limit via Content-Length fast path
@@ -584,14 +599,24 @@ async fn handle_h3_request(
     let backend_total_ms = backend_start.elapsed().as_secs_f64() * 1000.0;
 
     // after_proxy hooks
-    for plugin in plugins.iter() {
-        let _ = plugin
-            .after_proxy(&mut ctx, response_status, &mut response_headers)
-            .await;
+    {
+        let phase_start = std::time::Instant::now();
+        for plugin in plugins.iter() {
+            let _ = plugin
+                .after_proxy(&mut ctx, response_status, &mut response_headers)
+                .await;
+        }
+        plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
     }
 
     let total_ms = start_time.elapsed().as_secs_f64() * 1000.0;
+    let plugin_execution_ms = plugin_execution_ns as f64 / 1_000_000.0;
+    let plugin_external_io_ms = ctx
+        .plugin_http_call_ns
+        .load(std::sync::atomic::Ordering::Relaxed) as f64
+        / 1_000_000.0;
     let gateway_processing_ms = total_ms - backend_total_ms;
+    let gateway_overhead_ms = (total_ms - backend_total_ms - plugin_execution_ms).max(0.0);
 
     // Resolve backend IP from DNS cache for HTTP/3 tx log
     let h3_resolved_ip = state
@@ -625,6 +650,9 @@ async fn handle_h3_request(
         latency_gateway_processing_ms: gateway_processing_ms,
         latency_backend_ttfb_ms: backend_ttfb_ms,
         latency_backend_total_ms: backend_total_ms,
+        latency_plugin_execution_ms: plugin_execution_ms,
+        latency_plugin_external_io_ms: plugin_external_io_ms,
+        latency_gateway_overhead_ms: gateway_overhead_ms,
         request_user_agent: ctx.headers.get("user-agent").cloned(),
         response_streamed: false,
         client_disconnected: false,

@@ -38,6 +38,8 @@ pub struct MetricsRegistry {
     pub request_duration_buckets: DashMap<String, HistogramBuckets>,
     /// Backend duration histogram buckets by proxy_id
     pub backend_duration_buckets: DashMap<String, HistogramBuckets>,
+    /// Gateway overhead histogram buckets by proxy_id
+    pub gateway_overhead_buckets: DashMap<String, HistogramBuckets>,
     /// Rate limit exceeded counter
     pub rate_limit_exceeded: AtomicU64,
 }
@@ -106,6 +108,7 @@ impl MetricsRegistry {
             request_counter: DashMap::new(),
             request_duration_buckets: DashMap::new(),
             backend_duration_buckets: DashMap::new(),
+            gateway_overhead_buckets: DashMap::new(),
             rate_limit_exceeded: AtomicU64::new(0),
         }
     }
@@ -137,10 +140,15 @@ impl MetricsRegistry {
         // where total backend latency is unknown at log time.
         if summary.latency_backend_total_ms >= 0.0 {
             self.backend_duration_buckets
-                .entry(proxy_id)
+                .entry(proxy_id.clone())
                 .or_insert_with(HistogramBuckets::new)
                 .observe(summary.latency_backend_total_ms);
         }
+
+        self.gateway_overhead_buckets
+            .entry(proxy_id)
+            .or_insert_with(HistogramBuckets::new)
+            .observe(summary.latency_gateway_overhead_ms);
     }
 
     /// Render metrics in Prometheus exposition format.
@@ -214,6 +222,37 @@ impl MetricsRegistry {
             ));
             output.push_str(&format!(
                 "ferrum_backend_duration_ms_count{{proxy_id=\"{}\"}} {}\n",
+                proxy_id, total_count
+            ));
+        }
+
+        // Gateway overhead histogram
+        output.push_str(
+            "# HELP ferrum_gateway_overhead_ms Gateway overhead (excluding backend and plugins) in milliseconds.\n",
+        );
+        output.push_str("# TYPE ferrum_gateway_overhead_ms histogram\n");
+        for entry in self.gateway_overhead_buckets.iter() {
+            let proxy_id = entry.key();
+            let histogram = entry.value();
+            for (i, boundary) in histogram.boundaries.iter().enumerate() {
+                let count = histogram.counts[i].load(Ordering::Relaxed);
+                output.push_str(&format!(
+                    "ferrum_gateway_overhead_ms_bucket{{proxy_id=\"{}\",le=\"{}\"}} {}\n",
+                    proxy_id, boundary, count
+                ));
+            }
+            let total_count = histogram.count.load(Ordering::Relaxed);
+            let sum = f64::from_bits(histogram.sum.load(Ordering::Relaxed));
+            output.push_str(&format!(
+                "ferrum_gateway_overhead_ms_bucket{{proxy_id=\"{}\",le=\"+Inf\"}} {}\n",
+                proxy_id, total_count
+            ));
+            output.push_str(&format!(
+                "ferrum_gateway_overhead_ms_sum{{proxy_id=\"{}\"}} {:.2}\n",
+                proxy_id, sum
+            ));
+            output.push_str(&format!(
+                "ferrum_gateway_overhead_ms_count{{proxy_id=\"{}\"}} {}\n",
                 proxy_id, total_count
             ));
         }

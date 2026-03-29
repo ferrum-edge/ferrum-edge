@@ -15,7 +15,6 @@ pub mod jwks_store;
 pub mod jwt_auth;
 pub mod key_auth;
 pub mod mtls_auth;
-pub mod oauth2_auth;
 pub mod otel_tracing;
 pub mod prometheus_metrics;
 pub mod rate_limiting;
@@ -106,6 +105,10 @@ pub struct RequestContext {
     /// Contains all certificates after the peer cert (index 1+) sent during the handshake.
     /// Used by the mtls_auth plugin for per-proxy CA fingerprint verification.
     pub tls_client_cert_chain_der: Option<Arc<Vec<Vec<u8>>>>,
+    /// Cumulative nanoseconds spent by plugins making external HTTP calls
+    /// (via `PluginHttpClient::execute_tracked`). Shared across all plugin
+    /// invocations for this request — clone-safe via Arc.
+    pub plugin_http_call_ns: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl RequestContext {
@@ -124,6 +127,7 @@ impl RequestContext {
             metadata: HashMap::new(),
             tls_client_cert_der: None,
             tls_client_cert_chain_der: None,
+            plugin_http_call_ns: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 }
@@ -163,6 +167,19 @@ pub struct TransactionSummary {
     /// For streaming responses: -1.0 (body still transferring at log time;
     /// use `latency_backend_ttfb_ms` for alerting).
     pub latency_backend_total_ms: f64,
+    /// Wall-clock time spent executing all plugin hooks (on_request_received
+    /// through after_proxy/on_response_body/transform_response_body).
+    /// Includes any external I/O that plugins performed synchronously.
+    pub latency_plugin_execution_ms: f64,
+    /// Subset of plugin execution time spent on external HTTP calls
+    /// (via `PluginHttpClient::execute_tracked`). 0.0 when no plugin
+    /// makes tracked external calls during the request lifecycle.
+    pub latency_plugin_external_io_ms: f64,
+    /// Pure gateway overhead: routing, header parsing, URL building,
+    /// connection pool checkout, response framing, etc.
+    /// Computed as: total - max(backend, 0) - plugin_execution.
+    /// For rejected requests (no backend call): total - plugin_execution.
+    pub latency_gateway_overhead_ms: f64,
     pub request_user_agent: Option<String>,
     /// True when the response body was streamed (not buffered).
     /// When true, `latency_backend_total_ms` is -1.0 (unknown at log time).
@@ -239,7 +256,6 @@ pub mod priority {
     pub const BOT_DETECTION: u16 = 200;
     pub const MTLS_AUTH: u16 = 950;
     pub const JWKS_AUTH: u16 = 1000;
-    pub const OAUTH2_AUTH: u16 = 1000;
     pub const JWT_AUTH: u16 = 1100;
     pub const KEY_AUTH: u16 = 1200;
     pub const BASIC_AUTH: u16 = 1300;
@@ -494,10 +510,6 @@ pub fn create_plugin_with_http_client(
             config,
             http_client.clone(),
         )?))),
-        "oauth2_auth" => Ok(Some(Arc::new(oauth2_auth::OAuth2Auth::new(
-            config,
-            http_client.clone(),
-        )?))),
         "jwt_auth" => Ok(Some(Arc::new(jwt_auth::JwtAuth::new(config)))),
         "key_auth" => Ok(Some(Arc::new(key_auth::KeyAuth::new(config)))),
         "basic_auth" => Ok(Some(Arc::new(basic_auth::BasicAuth::new(config)))),
@@ -553,7 +565,6 @@ pub fn is_security_plugin(name: &str) -> bool {
             | "jwt_auth"
             | "hmac_auth"
             | "jwks_auth"
-            | "oauth2_auth"
             | "mtls_auth"
             | "access_control"
             | "ip_restriction"
@@ -566,7 +577,6 @@ pub fn available_plugins() -> Vec<&'static str> {
         "http_logging",
         "transaction_debugger",
         "jwks_auth",
-        "oauth2_auth",
         "jwt_auth",
         "key_auth",
         "basic_auth",

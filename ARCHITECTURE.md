@@ -72,7 +72,7 @@ src/
 │   ├── database.rs            # Database mode
 │   ├── file.rs                # File mode
 │   └── migrate.rs             # Database migration mode
-├── plugins/                   # Plugin system (23 built-in plugins)
+├── plugins/                   # Plugin system (22 built-in plugins)
 │   ├── mod.rs                 # Plugin framework, registry, and priority constants
 │   ├── access_control.rs      # Consumer-based authorization
 │   ├── basic_auth.rs          # HTTP Basic auth with bcrypt
@@ -91,7 +91,6 @@ src/
 │   ├── jwt_auth.rs            # HS256 JWT authentication
 │   ├── key_auth.rs            # API key authentication
 │   ├── mtls_auth.rs           # Mutual TLS client certificate authentication
-│   ├── oauth2_auth.rs         # OAuth2 introspection/JWKS validation (legacy)
 │   ├── otel_tracing.rs        # OpenTelemetry distributed tracing
 │   ├── prometheus_metrics.rs  # Prometheus metrics export
 │   ├── rate_limiting.rs       # In-memory rate limiting
@@ -142,7 +141,7 @@ tests/
 │
 ├── unit_tests.rs                       # Entry point: unit test crate
 ├── unit/                               # Unit tests by component
-│   ├── plugins/                        # All 23 plugin tests
+│   ├── plugins/                        # All 22 plugin tests
 │   ├── config/                         # Configuration parsing tests
 │   ├── admin/                          # Admin API tests
 │   ├── gateway_core/                   # Core data structure tests
@@ -340,7 +339,7 @@ High-performance HTTP client connection pooling with backend mTLS support:
 
 Extensible plugin architecture for authentication, authorization, and transformations:
 
-**23 Plugins Registered**:
+**22 Plugins Registered**:
 - **Authentication**: `jwks_auth`, `jwt_auth`, `key_auth`, `basic_auth`, `hmac_auth`, `mtls_auth`
 - **Authorization**: `access_control`, `ip_restriction`
 - **Security**: `cors`, `bot_detection`

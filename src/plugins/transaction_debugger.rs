@@ -116,20 +116,24 @@ impl Plugin for TransactionDebugger {
     async fn log(&self, summary: &TransactionSummary) {
         if let Some(ref error_class) = summary.error_class {
             println!(
-                "[DEBUG] Transaction: {} {} -> {} [{}] ({}ms)",
+                "[DEBUG] Transaction: {} {} -> {} [{}] ({}ms total, {:.2}ms plugins, {:.2}ms gw overhead)",
                 summary.http_method,
                 summary.request_path,
                 summary.response_status_code,
                 error_class,
-                summary.latency_total_ms
+                summary.latency_total_ms,
+                summary.latency_plugin_execution_ms,
+                summary.latency_gateway_overhead_ms,
             );
         } else {
             println!(
-                "[DEBUG] Transaction: {} {} -> {} ({}ms)",
+                "[DEBUG] Transaction: {} {} -> {} ({}ms total, {:.2}ms plugins, {:.2}ms gw overhead)",
                 summary.http_method,
                 summary.request_path,
                 summary.response_status_code,
-                summary.latency_total_ms
+                summary.latency_total_ms,
+                summary.latency_plugin_execution_ms,
+                summary.latency_gateway_overhead_ms,
             );
         }
     }
