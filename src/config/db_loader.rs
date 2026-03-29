@@ -3,11 +3,13 @@ use crate::config::types::{
     LoadBalancerAlgorithm, PluginAssociation, PluginConfig, PluginScope, Proxy, ResponseBodyMode,
     RetryConfig, ServiceDiscoveryConfig, Upstream, UpstreamTarget,
 };
+use arc_swap::ArcSwap;
 use chrono::{DateTime, Duration, Utc};
 use sqlx::Executor;
 use sqlx::Row;
 use sqlx::{AnyPool, any::AnyPoolOptions, any::AnyRow};
 use std::collections::HashSet;
+use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
 /// Result of an incremental config poll.
@@ -46,9 +48,15 @@ impl IncrementalResult {
 }
 
 /// Database configuration store.
+///
+/// The inner pool is wrapped in `ArcSwap` so it can be atomically replaced
+/// when DNS re-resolution detects that the database FQDN now points to a
+/// different IP. All readers (query methods, transactions) take a cheap
+/// `Arc` clone of the current pool, so in-flight queries finish on the old
+/// pool while new queries go to the freshly connected one.
 #[derive(Clone)]
 pub struct DatabaseStore {
-    pool: AnyPool,
+    pool: Arc<ArcSwap<AnyPool>>,
     db_type: String,
 }
 
@@ -111,6 +119,9 @@ impl DatabaseStore {
         let is_sqlite = db_type == "sqlite";
         let pool = AnyPoolOptions::new()
             .max_connections(10)
+            // Force connection cycling so new TCP connections re-resolve DNS.
+            // Defence-in-depth alongside the explicit DnsCache-based reconnect.
+            .max_lifetime(std::time::Duration::from_secs(300))
             .after_connect(move |conn, _meta| {
                 Box::pin(async move {
                     // Enable foreign key enforcement on every SQLite connection
@@ -125,7 +136,7 @@ impl DatabaseStore {
             .await?;
 
         let store = Self {
-            pool,
+            pool: Arc::new(ArcSwap::from_pointee(pool)),
             db_type: db_type.to_string(),
         };
 
@@ -209,7 +220,7 @@ impl DatabaseStore {
     async fn run_migrations(&self) -> Result<(), anyhow::Error> {
         use crate::config::migrations::MigrationRunner;
 
-        let runner = MigrationRunner::new(self.pool.clone(), self.db_type.clone());
+        let runner = MigrationRunner::new(self.pool(), self.db_type.clone());
         let applied = runner.run_pending().await?;
 
         if applied.is_empty() {
@@ -299,13 +310,13 @@ impl DatabaseStore {
 
     async fn load_proxies(&self) -> Result<Vec<Proxy>, anyhow::Error> {
         let rows: Vec<AnyRow> = sqlx::query("SELECT * FROM proxies")
-            .fetch_all(&self.pool)
+            .fetch_all(&self.pool())
             .await?;
 
         // Batch-load all proxy_plugins in one query (eliminates N+1)
         let assoc_rows: Vec<AnyRow> =
             match sqlx::query("SELECT proxy_id, plugin_config_id FROM proxy_plugins")
-                .fetch_all(&self.pool)
+                .fetch_all(&self.pool())
                 .await
             {
                 Ok(rows) => rows,
@@ -353,7 +364,7 @@ impl DatabaseStore {
 
     async fn load_consumers(&self) -> Result<Vec<Consumer>, anyhow::Error> {
         let rows: Vec<AnyRow> = sqlx::query("SELECT * FROM consumers")
-            .fetch_all(&self.pool)
+            .fetch_all(&self.pool())
             .await?;
 
         let mut consumers = Vec::new();
@@ -366,7 +377,7 @@ impl DatabaseStore {
 
     async fn load_plugin_configs(&self) -> Result<Vec<PluginConfig>, anyhow::Error> {
         let rows: Vec<AnyRow> = sqlx::query("SELECT * FROM plugin_configs")
-            .fetch_all(&self.pool)
+            .fetch_all(&self.pool())
             .await?;
 
         let mut configs = Vec::new();
@@ -395,7 +406,7 @@ impl DatabaseStore {
             ResponseBodyMode::Stream => "stream",
         };
 
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool().begin().await?;
 
         let hosts_json = serde_json::to_string(&proxy.hosts)?;
 
@@ -479,7 +490,7 @@ impl DatabaseStore {
             ResponseBodyMode::Stream => "stream",
         };
 
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool().begin().await?;
 
         let hosts_json = serde_json::to_string(&proxy.hosts)?;
 
@@ -552,7 +563,7 @@ impl DatabaseStore {
     }
 
     pub async fn delete_proxy(&self, id: &str) -> Result<bool, anyhow::Error> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool().begin().await?;
 
         // Look up the proxy's upstream_id before deleting so we can cascade-delete
         // the upstream if it becomes orphaned.
@@ -603,7 +614,7 @@ impl DatabaseStore {
     pub async fn get_proxy(&self, id: &str) -> Result<Option<Proxy>, anyhow::Error> {
         let row: Option<AnyRow> = sqlx::query(&self.q("SELECT * FROM proxies WHERE id = ?"))
             .bind(id)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&self.pool())
             .await?;
 
         let row = match row {
@@ -615,7 +626,7 @@ impl DatabaseStore {
             &self.q("SELECT plugin_config_id FROM proxy_plugins WHERE proxy_id = ?"),
         )
         .bind(id)
-        .fetch_all(&self.pool)
+        .fetch_all(&self.pool())
         .await
         {
             Ok(rows) => rows,
@@ -650,7 +661,7 @@ impl DatabaseStore {
         .bind(&creds_json)
         .bind(consumer.created_at.to_rfc3339())
         .bind(consumer.updated_at.to_rfc3339())
-        .execute(&self.pool)
+        .execute(&self.pool())
         .await?;
 
         Ok(())
@@ -666,7 +677,7 @@ impl DatabaseStore {
         .bind(&creds_json)
         .bind(Utc::now().to_rfc3339())
         .bind(&consumer.id)
-        .execute(&self.pool)
+        .execute(&self.pool())
         .await?;
 
         Ok(())
@@ -675,7 +686,7 @@ impl DatabaseStore {
     pub async fn delete_consumer(&self, id: &str) -> Result<bool, anyhow::Error> {
         let result = sqlx::query(&self.q("DELETE FROM consumers WHERE id = ?"))
             .bind(id)
-            .execute(&self.pool)
+            .execute(&self.pool())
             .await?;
         Ok(result.rows_affected() > 0)
     }
@@ -683,7 +694,7 @@ impl DatabaseStore {
     pub async fn get_consumer(&self, id: &str) -> Result<Option<Consumer>, anyhow::Error> {
         let row: Option<AnyRow> = sqlx::query(&self.q("SELECT * FROM consumers WHERE id = ?"))
             .bind(id)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&self.pool())
             .await?;
 
         match row {
@@ -709,7 +720,7 @@ impl DatabaseStore {
         .bind(if pc.enabled { 1i32 } else { 0 })
         .bind(pc.created_at.to_rfc3339())
         .bind(pc.updated_at.to_rfc3339())
-        .execute(&self.pool)
+        .execute(&self.pool())
         .await?;
 
         Ok(())
@@ -731,14 +742,14 @@ impl DatabaseStore {
         .bind(if pc.enabled { 1i32 } else { 0 })
         .bind(Utc::now().to_rfc3339())
         .bind(&pc.id)
-        .execute(&self.pool)
+        .execute(&self.pool())
         .await?;
 
         Ok(())
     }
 
     pub async fn delete_plugin_config(&self, id: &str) -> Result<bool, anyhow::Error> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool().begin().await?;
 
         // Clean up junction table (defense in depth alongside ON DELETE CASCADE)
         sqlx::query(&self.q("DELETE FROM proxy_plugins WHERE plugin_config_id = ?"))
@@ -758,7 +769,7 @@ impl DatabaseStore {
     pub async fn get_plugin_config(&self, id: &str) -> Result<Option<PluginConfig>, anyhow::Error> {
         let row: Option<AnyRow> = sqlx::query(&self.q("SELECT * FROM plugin_configs WHERE id = ?"))
             .bind(id)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&self.pool())
             .await?;
 
         match row {
@@ -771,7 +782,7 @@ impl DatabaseStore {
 
     async fn load_upstreams(&self) -> Result<Vec<Upstream>, anyhow::Error> {
         let rows: Vec<AnyRow> = sqlx::query("SELECT * FROM upstreams")
-            .fetch_all(&self.pool)
+            .fetch_all(&self.pool())
             .await?;
 
         let mut upstreams = Vec::new();
@@ -810,7 +821,7 @@ impl DatabaseStore {
         .bind(&service_discovery_json)
         .bind(upstream.created_at.to_rfc3339())
         .bind(upstream.updated_at.to_rfc3339())
-        .execute(&self.pool)
+        .execute(&self.pool())
         .await?;
 
         Ok(())
@@ -842,7 +853,7 @@ impl DatabaseStore {
         .bind(&service_discovery_json)
         .bind(Utc::now().to_rfc3339())
         .bind(&upstream.id)
-        .execute(&self.pool)
+        .execute(&self.pool())
         .await?;
 
         Ok(())
@@ -853,7 +864,7 @@ impl DatabaseStore {
     /// Uses a transaction to prevent race conditions between the reference
     /// check and the delete.
     pub async fn delete_upstream(&self, id: &str) -> Result<bool, anyhow::Error> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool().begin().await?;
 
         // Check reference within the transaction to prevent races
         let ref_rows: Vec<AnyRow> =
@@ -886,7 +897,7 @@ impl DatabaseStore {
         &self,
         old_upstream_id: &str,
     ) -> Result<(), anyhow::Error> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool().begin().await?;
 
         let ref_rows: Vec<AnyRow> =
             sqlx::query(&self.q("SELECT id FROM proxies WHERE upstream_id = ? LIMIT 1"))
@@ -913,7 +924,7 @@ impl DatabaseStore {
     pub async fn get_upstream(&self, id: &str) -> Result<Option<Upstream>, anyhow::Error> {
         let row: Option<AnyRow> = sqlx::query(&self.q("SELECT * FROM upstreams WHERE id = ?"))
             .bind(id)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&self.pool())
             .await?;
 
         match row {
@@ -936,12 +947,12 @@ impl DatabaseStore {
             sqlx::query(&self.q("SELECT id, hosts FROM proxies WHERE listen_path = ? AND id != ?"))
                 .bind(listen_path)
                 .bind(eid)
-                .fetch_all(&self.pool)
+                .fetch_all(&self.pool())
                 .await?
         } else {
             sqlx::query(&self.q("SELECT id, hosts FROM proxies WHERE listen_path = ?"))
                 .bind(listen_path)
-                .fetch_all(&self.pool)
+                .fetch_all(&self.pool())
                 .await?
         };
 
@@ -983,12 +994,12 @@ impl DatabaseStore {
             sqlx::query(&self.q("SELECT id FROM proxies WHERE name = ? AND id != ?"))
                 .bind(name)
                 .bind(eid)
-                .fetch_all(&self.pool)
+                .fetch_all(&self.pool())
                 .await?
         } else {
             sqlx::query(&self.q("SELECT id FROM proxies WHERE name = ?"))
                 .bind(name)
-                .fetch_all(&self.pool)
+                .fetch_all(&self.pool())
                 .await?
         };
         Ok(rows.is_empty())
@@ -1005,12 +1016,12 @@ impl DatabaseStore {
             sqlx::query(&self.q("SELECT id FROM upstreams WHERE name = ? AND id != ?"))
                 .bind(name)
                 .bind(eid)
-                .fetch_all(&self.pool)
+                .fetch_all(&self.pool())
                 .await?
         } else {
             sqlx::query(&self.q("SELECT id FROM upstreams WHERE name = ?"))
                 .bind(name)
-                .fetch_all(&self.pool)
+                .fetch_all(&self.pool())
                 .await?
         };
         Ok(rows.is_empty())
@@ -1027,7 +1038,7 @@ impl DatabaseStore {
         exclude_consumer_id: Option<&str>,
     ) -> Result<bool, anyhow::Error> {
         let rows: Vec<AnyRow> = sqlx::query("SELECT id, credentials FROM consumers")
-            .fetch_all(&self.pool)
+            .fetch_all(&self.pool())
             .await?;
 
         for row in &rows {
@@ -1071,7 +1082,7 @@ impl DatabaseStore {
         exclude_consumer_id: Option<&str>,
     ) -> Result<bool, anyhow::Error> {
         let rows: Vec<AnyRow> = sqlx::query("SELECT id, credentials FROM consumers")
-            .fetch_all(&self.pool)
+            .fetch_all(&self.pool())
             .await?;
 
         for row in &rows {
@@ -1107,7 +1118,7 @@ impl DatabaseStore {
     pub async fn check_upstream_exists(&self, upstream_id: &str) -> Result<bool, anyhow::Error> {
         let row: Option<AnyRow> = sqlx::query(&self.q("SELECT id FROM upstreams WHERE id = ?"))
             .bind(upstream_id)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&self.pool())
             .await?;
         Ok(row.is_some())
     }
@@ -1188,7 +1199,7 @@ impl DatabaseStore {
     async fn load_proxies_since(&self, since_str: &str) -> Result<Vec<Proxy>, anyhow::Error> {
         let rows: Vec<AnyRow> = sqlx::query(&self.q("SELECT * FROM proxies WHERE updated_at > ?"))
             .bind(since_str)
-            .fetch_all(&self.pool)
+            .fetch_all(&self.pool())
             .await?;
 
         if rows.is_empty() {
@@ -1210,7 +1221,7 @@ impl DatabaseStore {
             let assoc_rows: Vec<AnyRow> = if changed_id_list.len() > 500 {
                 // Too many IDs for an IN clause — fetch all and filter in memory
                 match sqlx::query("SELECT proxy_id, plugin_config_id FROM proxy_plugins")
-                    .fetch_all(&self.pool)
+                    .fetch_all(&self.pool())
                     .await
                 {
                     Ok(all_rows) => all_rows
@@ -1245,7 +1256,7 @@ impl DatabaseStore {
                 for id in &changed_id_list {
                     query = query.bind(*id);
                 }
-                match query.fetch_all(&self.pool).await {
+                match query.fetch_all(&self.pool()).await {
                     Ok(rows) => rows,
                     Err(e) => {
                         warn!(
@@ -1285,7 +1296,7 @@ impl DatabaseStore {
         let rows: Vec<AnyRow> =
             sqlx::query(&self.q("SELECT * FROM consumers WHERE updated_at > ?"))
                 .bind(since_str)
-                .fetch_all(&self.pool)
+                .fetch_all(&self.pool())
                 .await?;
 
         let mut consumers = Vec::with_capacity(rows.len());
@@ -1303,7 +1314,7 @@ impl DatabaseStore {
         let rows: Vec<AnyRow> =
             sqlx::query(&self.q("SELECT * FROM plugin_configs WHERE updated_at > ?"))
                 .bind(since_str)
-                .fetch_all(&self.pool)
+                .fetch_all(&self.pool())
                 .await?;
 
         let mut configs = Vec::with_capacity(rows.len());
@@ -1318,7 +1329,7 @@ impl DatabaseStore {
         let rows: Vec<AnyRow> =
             sqlx::query(&self.q("SELECT * FROM upstreams WHERE updated_at > ?"))
                 .bind(since_str)
-                .fetch_all(&self.pool)
+                .fetch_all(&self.pool())
                 .await?;
 
         let mut upstreams = Vec::with_capacity(rows.len());
@@ -1332,7 +1343,7 @@ impl DatabaseStore {
     async fn load_table_ids(&self, table: &str) -> Result<HashSet<String>, anyhow::Error> {
         // Table name is a compile-time constant from the caller, not user input.
         let sql = format!("SELECT id FROM {}", table);
-        let rows: Vec<AnyRow> = sqlx::query(&sql).fetch_all(&self.pool).await?;
+        let rows: Vec<AnyRow> = sqlx::query(&sql).fetch_all(&self.pool()).await?;
 
         let mut ids = HashSet::with_capacity(rows.len());
         for row in rows {
@@ -1382,7 +1393,7 @@ impl DatabaseStore {
 
     /// Insert a single chunk of proxies in one transaction.
     async fn batch_create_proxies_chunk(&self, proxies: &[Proxy]) -> Result<usize, anyhow::Error> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool().begin().await?;
         let insert_sql = self.q("INSERT INTO proxies (id, name, hosts, listen_path, backend_protocol, backend_host, backend_port, backend_path, strip_listen_path, preserve_host_header, backend_connect_timeout_ms, backend_read_timeout_ms, backend_write_timeout_ms, backend_tls_client_cert_path, backend_tls_client_key_path, backend_tls_verify_server_cert, backend_tls_server_ca_cert_path, dns_override, dns_cache_ttl_seconds, auth_mode, upstream_id, circuit_breaker, retry, response_body_mode, pool_idle_timeout_seconds, pool_enable_http_keep_alive, pool_enable_http2, pool_tcp_keepalive_seconds, pool_http2_keep_alive_interval_seconds, pool_http2_keep_alive_timeout_seconds, pool_http2_initial_stream_window_size, pool_http2_initial_connection_window_size, pool_http2_adaptive_window, pool_http2_max_frame_size, pool_http2_max_concurrent_streams, pool_http3_connections_per_backend, listen_port, frontend_tls, udp_idle_timeout_seconds, allowed_methods, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
         let assoc_sql =
             self.q("INSERT INTO proxy_plugins (proxy_id, plugin_config_id) VALUES (?, ?)");
@@ -1522,7 +1533,7 @@ impl DatabaseStore {
         &self,
         consumers: &[Consumer],
     ) -> Result<usize, anyhow::Error> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool().begin().await?;
         let sql = self.q("INSERT INTO consumers (id, username, custom_id, credentials, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)");
 
         for consumer in consumers {
@@ -1564,7 +1575,7 @@ impl DatabaseStore {
         &self,
         configs: &[PluginConfig],
     ) -> Result<usize, anyhow::Error> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool().begin().await?;
         let sql = self.q("INSERT INTO plugin_configs (id, plugin_name, config, scope, proxy_id, enabled, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
 
         for pc in configs {
@@ -1612,7 +1623,7 @@ impl DatabaseStore {
         &self,
         upstreams: &[Upstream],
     ) -> Result<usize, anyhow::Error> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool().begin().await?;
         let sql = self.q("INSERT INTO upstreams (id, name, targets, algorithm, hash_on, health_checks, service_discovery, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)");
 
         for upstream in upstreams {
@@ -1657,7 +1668,7 @@ impl DatabaseStore {
     /// 4. consumers
     /// 5. upstreams
     pub async fn delete_all_resources(&self) -> Result<(), anyhow::Error> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool().begin().await?;
 
         sqlx::query("DELETE FROM proxy_plugins")
             .execute(&mut *tx)
@@ -1677,12 +1688,102 @@ impl DatabaseStore {
         Ok(())
     }
 
-    pub fn pool(&self) -> &AnyPool {
-        &self.pool
+    /// Get a snapshot of the current connection pool.
+    ///
+    /// Returns an owned clone (cheap — `AnyPool` is `Arc`-based internally).
+    /// The returned handle remains valid even if `reconnect()` swaps the pool.
+    pub fn pool(&self) -> AnyPool {
+        (**self.pool.load()).clone()
     }
 
     pub fn db_type(&self) -> &str {
         &self.db_type
+    }
+
+    /// Atomically replace the connection pool with a freshly connected one.
+    ///
+    /// Called by the DB polling loop when DnsCache detects that the database
+    /// FQDN now resolves to a different set of IPs. The old pool is closed
+    /// gracefully in the background — in-flight queries complete normally.
+    pub async fn reconnect(
+        &self,
+        db_url: &str,
+        tls_enabled: bool,
+        tls_ca_cert_path: Option<&str>,
+        tls_client_cert_path: Option<&str>,
+        tls_client_key_path: Option<&str>,
+        tls_insecure: bool,
+    ) -> Result<(), anyhow::Error> {
+        sqlx::any::install_default_drivers();
+
+        let final_url = if tls_enabled && (self.db_type == "postgres" || self.db_type == "mysql") {
+            Self::build_tls_connection_url(
+                db_url,
+                &self.db_type,
+                tls_ca_cert_path,
+                tls_client_cert_path,
+                tls_client_key_path,
+                tls_insecure,
+            )?
+        } else {
+            db_url.to_string()
+        };
+
+        let is_sqlite = self.db_type == "sqlite";
+        let new_pool = AnyPoolOptions::new()
+            .max_connections(10)
+            .max_lifetime(std::time::Duration::from_secs(300))
+            .after_connect(move |conn, _meta| {
+                Box::pin(async move {
+                    if is_sqlite {
+                        conn.execute("PRAGMA foreign_keys = ON").await?;
+                    }
+                    Ok(())
+                })
+            })
+            .connect(&final_url)
+            .await?;
+
+        // Atomic swap — readers that already loaded the old pool keep using it.
+        let old_pool = self.pool.swap(Arc::new(new_pool));
+        info!(
+            "Database pool reconnected (db_type={}). Old pool closing in background.",
+            self.db_type
+        );
+
+        // Close old pool gracefully in the background so in-flight queries
+        // finish without blocking the polling loop.
+        tokio::spawn(async move {
+            old_pool.close().await;
+        });
+
+        Ok(())
+    }
+
+    /// Extract the hostname from a database URL, if it contains one.
+    ///
+    /// Returns `None` for SQLite URLs (file-based, no network host) or
+    /// if the host portion is already an IP address literal.
+    pub fn extract_db_hostname(db_url: &str) -> Option<String> {
+        let parsed = url::Url::parse(db_url).ok()?;
+
+        // Skip SQLite (no network host)
+        let scheme = parsed.scheme().to_lowercase();
+        if scheme.contains("sqlite") {
+            return None;
+        }
+
+        let host = parsed.host_str()?;
+
+        // For non-special URL schemes (postgres://, mysql://) the `url` crate
+        // treats IP literals as Domain. Strip brackets from IPv6 and check
+        // whether the host parses as an IP address.
+        let bare = host.trim_start_matches('[').trim_end_matches(']');
+        if bare.parse::<std::net::IpAddr>().is_ok() {
+            return None;
+        }
+
+        Some(host.to_string())
     }
 }
 

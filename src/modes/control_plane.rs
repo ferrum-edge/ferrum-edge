@@ -1,5 +1,5 @@
 use arc_swap::ArcSwap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -12,6 +12,7 @@ use crate::admin::jwt_auth::create_jwt_manager_from_env;
 use crate::admin::{self, AdminState};
 use crate::config::EnvConfig;
 use crate::config::db_loader::DatabaseStore;
+use crate::dns::{DnsCache, DnsConfig};
 use crate::grpc::cp_server::CpGrpcServer;
 use crate::tls::{self, TlsPolicy};
 
@@ -236,9 +237,35 @@ pub async fn run(
     let config_poll = config_arc.clone();
     let db_available_poll = db_available.clone();
     let mut cp_poll_shutdown = shutdown_tx.subscribe();
+
+    // DNS re-resolution for the database FQDN (same as database mode).
+    // CP mode doesn't run a proxy, but still needs to detect DB IP changes.
+    let db_hostname = DatabaseStore::extract_db_hostname(&effective_url);
+    let dns_cache_for_poll = DnsCache::new(DnsConfig {
+        default_ttl_seconds: env_config.dns_cache_ttl_seconds,
+        global_overrides: env_config.dns_overrides.clone(),
+        resolver_addresses: env_config.dns_resolver_address.clone(),
+        hosts_file_path: env_config.dns_resolver_hosts_file.clone(),
+        dns_order: env_config.dns_order.clone(),
+        valid_ttl_override: env_config.dns_valid_ttl,
+        stale_ttl_seconds: env_config.dns_stale_ttl,
+        error_ttl_seconds: env_config.dns_error_ttl,
+        max_cache_size: env_config.dns_cache_max_size,
+        slow_threshold_ms: env_config.dns_slow_threshold_ms,
+    });
+    let db_url_for_reconnect = effective_url.clone();
+    let db_tls_enabled = env_config.db_tls_enabled;
+    let db_tls_ca_cert = env_config.db_tls_ca_cert_path.clone();
+    let db_tls_client_cert = env_config.db_tls_client_cert_path.clone();
+    let db_tls_client_key = env_config.db_tls_client_key_path.clone();
+    let db_tls_insecure = env_config.db_tls_insecure;
+
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(poll_interval);
         interval.tick().await; // skip first immediate tick
+
+        // Track the last known set of resolved IPs for the DB hostname.
+        let mut last_db_ips: Option<Vec<IpAddr>> = None;
 
         // Seed incremental state from the initial config load
         let initial_config = config_poll.load_full();
@@ -254,6 +281,42 @@ pub async fn run(
         loop {
             tokio::select! {
                 _ = interval.tick() => {
+                    // Check if the database FQDN now resolves to different IPs
+                    if let Some(ref hostname) = db_hostname
+                        && let Ok(ips) = dns_cache_for_poll.resolve_all(hostname, None, None).await
+                    {
+                        let needs_reconnect = match &last_db_ips {
+                            Some(prev) => {
+                                let mut prev_sorted = prev.clone();
+                                prev_sorted.sort();
+                                let mut cur_sorted = ips.clone();
+                                cur_sorted.sort();
+                                prev_sorted != cur_sorted
+                            }
+                            None => false,
+                        };
+                        if needs_reconnect {
+                            info!(
+                                "Database DNS changed for '{}': {:?} -> {:?}, reconnecting pool",
+                                hostname, last_db_ips.as_deref().unwrap_or(&[]), ips
+                            );
+                            if let Err(e) = db_poll.reconnect(
+                                &db_url_for_reconnect,
+                                db_tls_enabled,
+                                db_tls_ca_cert.as_deref(),
+                                db_tls_client_cert.as_deref(),
+                                db_tls_client_key.as_deref(),
+                                db_tls_insecure,
+                            ).await {
+                                error!(
+                                    "Failed to reconnect database pool after DNS change for '{}': {}",
+                                    hostname, e
+                                );
+                            }
+                        }
+                        last_db_ips = Some(ips);
+                    }
+
                     if let Some(since) = last_poll_at {
                         // Incremental poll — only fetch changes since last poll
                         match db_poll.load_incremental_config(

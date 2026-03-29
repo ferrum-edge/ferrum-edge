@@ -286,7 +286,7 @@ pub async fn handle_admin_request(
 
         // Check database connectivity if available
         if let Some(db) = &state.db {
-            match sqlx::query("SELECT 1").fetch_one(db.pool()).await {
+            match sqlx::query("SELECT 1").fetch_one(&db.pool()).await {
                 Ok(_) => {
                     health_status["database"] = json!({
                         "status": "connected",

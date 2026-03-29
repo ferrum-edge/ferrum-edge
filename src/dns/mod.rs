@@ -251,6 +251,89 @@ impl DnsCache {
         }
     }
 
+    /// Resolve a hostname to all known IP addresses (not just the first).
+    ///
+    /// Uses the same cache, overrides, and TTL logic as [`resolve`]. This is
+    /// used by the database polling loop to detect when a FQDN's IP set has
+    /// changed and trigger a pool reconnect.
+    pub async fn resolve_all(
+        &self,
+        hostname: &str,
+        per_proxy_override: Option<&str>,
+        per_proxy_ttl: Option<u64>,
+    ) -> Result<Vec<IpAddr>, anyhow::Error> {
+        // 1. Per-proxy static override
+        if let Some(ip_str) = per_proxy_override {
+            let addr: IpAddr = ip_str.parse()?;
+            return Ok(vec![addr]);
+        }
+
+        // 2. Global overrides
+        if let Some(ip_str) = self.global_overrides.get(hostname) {
+            let addr: IpAddr = ip_str.parse()?;
+            return Ok(vec![addr]);
+        }
+
+        // 3. Cache with stale-while-revalidate
+        if let Some(entry) = self.cache.get(hostname) {
+            let now = Instant::now();
+
+            if entry.expires_at > now && !entry.addresses.is_empty() && !entry.is_error {
+                return Ok(entry.addresses.clone());
+            }
+
+            if entry.stale_deadline > now && !entry.addresses.is_empty() && !entry.is_error {
+                let host = hostname.to_string();
+                if self.refreshing.insert(host.clone(), ()).is_none() {
+                    let cache = self.clone();
+                    let ttl = per_proxy_ttl;
+                    tokio::spawn(async move {
+                        if let Err(e) = cache.refresh_entry(&host, ttl).await {
+                            warn!("DNS stale refresh failed for {}: {}", host, e);
+                        }
+                        cache.refreshing.remove(&host);
+                    });
+                }
+                return Ok(entry.addresses.clone());
+            }
+
+            if entry.is_error && entry.expires_at > now {
+                anyhow::bail!("DNS resolution failed for {} (cached error)", hostname);
+            }
+        }
+
+        // 4. Actual DNS resolution
+        match self.timed_resolve(hostname).await {
+            Ok((addrs, record_type)) if !addrs.is_empty() => {
+                let ttl = per_proxy_ttl
+                    .map(Duration::from_secs)
+                    .or(self.valid_ttl_override)
+                    .unwrap_or(self.default_ttl);
+
+                self.cache.insert(
+                    hostname.to_string(),
+                    DnsCacheEntry {
+                        addresses: addrs.clone(),
+                        expires_at: Instant::now() + ttl,
+                        stale_deadline: Instant::now() + ttl + self.stale_ttl,
+                        record_type_used: record_type,
+                        is_error: false,
+                    },
+                );
+
+                Ok(addrs)
+            }
+            Ok(_) => {
+                self.cache_error(hostname);
+                anyhow::bail!("DNS resolution returned no addresses for {}", hostname);
+            }
+            Err(e) => {
+                self.cache_error(hostname);
+                Err(e)
+            }
+        }
+    }
+
     /// Refresh a single cache entry in the background.
     async fn refresh_entry(
         &self,
