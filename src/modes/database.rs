@@ -150,7 +150,8 @@ pub async fn run(
     dns_cache.warmup(hostnames).await;
 
     // Start background TTL refresh to keep cache warm (with shutdown)
-    dns_cache.start_background_refresh_with_shutdown(Some(shutdown_tx.subscribe()));
+    let dns_handle =
+        dns_cache.start_background_refresh_with_shutdown(Some(shutdown_tx.subscribe()));
 
     // Start service discovery background tasks
     proxy_state.start_service_discovery(Some(shutdown_tx.subscribe()));
@@ -425,7 +426,7 @@ pub async fn run(
     let db_tls_client_key = env_config.db_tls_client_key_path.clone();
     let db_tls_insecure = env_config.db_tls_insecure;
 
-    tokio::spawn(async move {
+    let db_poll_handle = tokio::spawn(async move {
         let mut interval = tokio::time::interval(poll_interval);
         interval.tick().await; // skip first immediate tick
 
@@ -654,9 +655,22 @@ pub async fn run(
         }
     });
 
-    // Wait for all listeners to complete
+    // Wait for all listeners to complete (these exit when the shutdown signal fires)
     for handle in handles {
         handle.await?;
+    }
+
+    // Wait for background tasks to drain cleanly, with a timeout to prevent
+    // hanging if a task is stuck (e.g., blocked on a DB query or DNS lookup).
+    let bg_drain = async {
+        let _ = dns_handle.await;
+        let _ = db_poll_handle.await;
+    };
+    if tokio::time::timeout(Duration::from_secs(5), bg_drain)
+        .await
+        .is_err()
+    {
+        warn!("Background tasks did not drain within 5s, proceeding with shutdown");
     }
 
     Ok(())

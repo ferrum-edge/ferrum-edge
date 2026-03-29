@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::time::Duration;
 use tracing::{error, info, warn};
 
 use crate::admin::jwt_auth::create_jwt_manager_from_env;
@@ -94,7 +95,8 @@ pub async fn run(
     dns_cache.warmup(hostnames).await;
 
     // Start background TTL refresh to keep cache warm (with shutdown)
-    dns_cache.start_background_refresh_with_shutdown(Some(shutdown_tx.subscribe()));
+    let dns_handle =
+        dns_cache.start_background_refresh_with_shutdown(Some(shutdown_tx.subscribe()));
 
     // Start service discovery background tasks
     proxy_state.start_service_discovery(Some(shutdown_tx.subscribe()));
@@ -188,7 +190,7 @@ pub async fn run(
     let proxy_state_reload = proxy_state.clone();
     let config_path_owned = config_path.to_string();
     let mut sighup_shutdown = shutdown_tx.subscribe();
-    tokio::spawn(async move {
+    let sighup_handle = tokio::spawn(async move {
         #[cfg(unix)]
         {
             use tokio::signal::unix::{SignalKind, signal};
@@ -388,9 +390,22 @@ pub async fn run(
         }
     }
 
-    // Wait for all listeners to complete
+    // Wait for all listeners to complete (these exit when the shutdown signal fires)
     for handle in handles {
         handle.await?;
+    }
+
+    // Wait for background tasks to drain cleanly, with a timeout to prevent
+    // hanging if a task is stuck.
+    let bg_drain = async {
+        let _ = dns_handle.await;
+        let _ = sighup_handle.await;
+    };
+    if tokio::time::timeout(Duration::from_secs(5), bg_drain)
+        .await
+        .is_err()
+    {
+        warn!("Background tasks did not drain within 5s, proceeding with shutdown");
     }
 
     Ok(())

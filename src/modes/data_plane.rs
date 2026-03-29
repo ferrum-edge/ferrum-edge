@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::time::Duration;
 use tracing::{error, info, warn};
 
 use crate::admin::jwt_auth::create_jwt_manager_from_env;
@@ -29,7 +30,8 @@ pub async fn run(
     });
 
     // Start DNS background refresh
-    dns_cache.start_background_refresh_with_shutdown(Some(shutdown_tx.subscribe()));
+    let dns_handle =
+        dns_cache.start_background_refresh_with_shutdown(Some(shutdown_tx.subscribe()));
 
     // Start with empty config; CP will push the real one via gRPC
     let proxy_state = ProxyState::new(GatewayConfig::default(), dns_cache, env_config.clone())?;
@@ -106,7 +108,7 @@ pub async fn run(
 
     let dp_proxy_state = proxy_state.clone();
     let dp_shutdown = shutdown_tx.subscribe();
-    tokio::spawn(async move {
+    let dp_client_handle = tokio::spawn(async move {
         crate::grpc::dp_client::start_dp_client_with_shutdown(
             cp_url,
             auth_token,
@@ -351,9 +353,22 @@ pub async fn run(
         info!("Admin TLS not configured - HTTPS listener disabled");
     }
 
-    // Wait for all listeners to complete
+    // Wait for all listeners to complete (these exit when the shutdown signal fires)
     for handle in handles {
         handle.await?;
+    }
+
+    // Wait for background tasks to drain cleanly, with a timeout to prevent
+    // hanging if a task is stuck (e.g., blocked on a gRPC stream read).
+    let bg_drain = async {
+        let _ = dns_handle.await;
+        let _ = dp_client_handle.await;
+    };
+    if tokio::time::timeout(Duration::from_secs(5), bg_drain)
+        .await
+        .is_err()
+    {
+        warn!("Background tasks did not drain within 5s, proceeding with shutdown");
     }
 
     Ok(())

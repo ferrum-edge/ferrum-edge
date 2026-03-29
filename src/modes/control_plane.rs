@@ -230,6 +230,7 @@ pub async fn run(
     };
 
     info!("CP gRPC server listening on {}", grpc_addr);
+    let mut grpc_shutdown = shutdown_tx.subscribe();
     let grpc_handle = tokio::spawn(async move {
         let mut builder = Server::builder();
         if let Some(tls) = grpc_tls_config {
@@ -241,9 +242,17 @@ pub async fn run(
                 }
             };
         }
+        let shutdown_signal = async move {
+            while !*grpc_shutdown.borrow() {
+                if grpc_shutdown.changed().await.is_err() {
+                    return;
+                }
+            }
+            info!("CP gRPC server shutting down");
+        };
         if let Err(e) = builder
             .add_service(grpc_server.into_service())
-            .serve(grpc_addr)
+            .serve_with_shutdown(grpc_addr, shutdown_signal)
             .await
         {
             error!("gRPC server error: {}", e);
@@ -288,7 +297,7 @@ pub async fn run(
     let db_tls_client_key = env_config.db_tls_client_key_path.clone();
     let db_tls_insecure = env_config.db_tls_insecure;
 
-    tokio::spawn(async move {
+    let db_poll_handle = tokio::spawn(async move {
         let mut interval = tokio::time::interval(poll_interval);
         interval.tick().await; // skip first immediate tick
 
@@ -514,6 +523,7 @@ pub async fn run(
         }
     });
 
+    // Wait for all listener handles (these exit when the shutdown signal fires)
     tokio::select! {
         _ = admin_http_handle => {}
         _ = grpc_handle => {}
@@ -524,6 +534,15 @@ pub async fn run(
                 std::future::pending().await
             }
         } => {}
+    }
+
+    // Wait for background tasks to drain cleanly, with a timeout to prevent
+    // hanging if a task is stuck (e.g., blocked on a DB query).
+    if tokio::time::timeout(Duration::from_secs(5), db_poll_handle)
+        .await
+        .is_err()
+    {
+        warn!("Background tasks did not drain within 5s, proceeding with shutdown");
     }
 
     Ok(())

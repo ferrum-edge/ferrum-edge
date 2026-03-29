@@ -600,18 +600,20 @@ impl DnsCache {
     /// they expire. Entries are refreshed when they reach 75% of their TTL,
     /// keeping DNS resolution out of the hot request path.
     #[allow(dead_code)]
-    pub fn start_background_refresh(&self) {
-        self.start_background_refresh_with_shutdown(None);
+    pub fn start_background_refresh(&self) -> tokio::task::JoinHandle<()> {
+        self.start_background_refresh_with_shutdown(None)
     }
 
     /// Start background refresh with an optional shutdown signal.
     ///
     /// When `shutdown_rx` is provided, the task will exit cleanly when the
     /// shutdown signal is received. Without it, the task runs until aborted.
+    ///
+    /// Returns the task handle so callers can await graceful completion.
     pub fn start_background_refresh_with_shutdown(
         &self,
         shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
-    ) {
+    ) -> tokio::task::JoinHandle<()> {
         let cache = self.clone();
         let check_interval = std::cmp::max(cache.default_ttl.as_secs() / 4, 5);
 
@@ -678,7 +680,7 @@ impl DnsCache {
                     }
                 }
             }
-        });
+        })
     }
 
     /// Warmup: resolve all hostnames from the config at startup.
