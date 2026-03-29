@@ -8,7 +8,7 @@ Ferrum Gateway enforces configurable size limits on request headers, request bod
 |----------|------|---------|-------------|
 | `FERRUM_MAX_HEADER_SIZE_BYTES` | `usize` | `32768` (32KB) | Maximum total size of all request headers combined. Enforced at both the hyper protocol layer (HTTP/1.1 `max_buf_size`, HTTP/2 `max_header_list_size`) and the application layer. |
 | `FERRUM_MAX_SINGLE_HEADER_SIZE_BYTES` | `usize` | `16384` (16KB) | Maximum size of any single request header (name + value in bytes). Prevents individual oversized headers. |
-| `FERRUM_MAX_BODY_SIZE_BYTES` | `usize` | `10485760` (10MB) | Maximum request body size. Set to `0` for unlimited. Checked via `Content-Length` header (fast reject) and enforced during body collection via `http_body_util::Limited`. |
+| `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES` | `usize` | `10485760` (10MB) | Maximum request body size. Set to `0` for unlimited. Checked via `Content-Length` header (fast reject) and enforced during body collection via `http_body_util::Limited`. |
 | `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES` | `usize` | `10485760` (10MB) | Maximum response body size from backends. Set to `0` for unlimited. Protects against backends sending unexpectedly large responses. |
 
 ## Enforcement Layers
@@ -30,7 +30,7 @@ This provides a second line of defense and enables per-header size limits that h
 ### Layer 3: Request Body Enforcement
 
 Request body limits are enforced in two stages:
-1. **Content-Length fast path**: If the `Content-Length` header exceeds `FERRUM_MAX_BODY_SIZE_BYTES`, the request is rejected immediately (413) without reading any body data.
+1. **Content-Length fast path**: If the `Content-Length` header exceeds `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES`, the request is rejected immediately (413) without reading any body data.
 2. **Streaming enforcement**: Uses `http_body_util::Limited` to wrap the body stream. If the body exceeds the limit during collection, the stream is aborted and a 413 is returned.
 
 ### Layer 4: Response Body Enforcement
@@ -83,7 +83,7 @@ All error responses are JSON with `Content-Type: application/json`.
 # Small headers, moderate body limit
 FERRUM_MAX_HEADER_SIZE_BYTES=16384
 FERRUM_MAX_SINGLE_HEADER_SIZE_BYTES=8192
-FERRUM_MAX_BODY_SIZE_BYTES=1048576    # 1MB
+FERRUM_MAX_REQUEST_BODY_SIZE_BYTES=1048576    # 1MB
 FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES=5242880  # 5MB
 ```
 
@@ -93,7 +93,7 @@ FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES=5242880  # 5MB
 # Allow large request bodies for file uploads
 FERRUM_MAX_HEADER_SIZE_BYTES=32768
 FERRUM_MAX_SINGLE_HEADER_SIZE_BYTES=16384
-FERRUM_MAX_BODY_SIZE_BYTES=104857600  # 100MB
+FERRUM_MAX_REQUEST_BODY_SIZE_BYTES=104857600  # 100MB
 FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES=104857600  # 100MB
 ```
 
@@ -101,7 +101,7 @@ FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES=104857600  # 100MB
 
 ```bash
 # No body size limits (use with caution — vulnerable to OOM)
-FERRUM_MAX_BODY_SIZE_BYTES=0
+FERRUM_MAX_REQUEST_BODY_SIZE_BYTES=0
 FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES=0
 ```
 

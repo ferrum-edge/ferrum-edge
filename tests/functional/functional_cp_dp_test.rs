@@ -76,7 +76,7 @@ fn create_test_env_config() -> EnvConfig {
         dp_grpc_tls_no_verify: false,
         max_header_size_bytes: 32768,
         max_single_header_size_bytes: 16384,
-        max_body_size_bytes: 10_485_760,
+        max_request_body_size_bytes: 10_485_760,
         max_response_body_size_bytes: 10_485_760,
         dns_cache_ttl_seconds: 300,
         dns_overrides: HashMap::new(),

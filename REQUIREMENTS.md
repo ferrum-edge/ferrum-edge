@@ -114,7 +114,7 @@ All operational parameters MUST be configurable via environment variables.
     *   `FERRUM_DP_CP_GRPC_URL`: (e.g., `http://cp-hostname:50051`) - **Required** in DP mode.
 *   **Request Handling Limits:**
     *   `FERRUM_MAX_HEADER_SIZE_BYTES`: (Integer bytes) - Default: `16384`.
-    *   `FERRUM_MAX_BODY_SIZE_BYTES`: (Integer bytes, `0` for unlimited) - Default: `10485760` (10 MiB).
+    *   `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES`: (Integer bytes, `0` for unlimited) - Default: `10485760` (10 MiB).
 *   **Client IP Resolution:**
     *   `FERRUM_TRUSTED_PROXIES`: (Comma-separated CIDRs/IPs, e.g., `10.0.0.0/8,172.16.0.0/12`) - Default: empty (XFF headers ignored; socket IP used).
     *   `FERRUM_REAL_IP_HEADER`: (Header name, e.g., `CF-Connecting-IP` or `X-Real-IP`) - Default: none.
@@ -157,7 +157,7 @@ This defines how the gateway processes requests on the Proxy Traffic listeners.
     *   Cached entries MUST expire based on a TTL, configurable globally via `FERRUM_DNS_CACHE_TTL_SECONDS` and overridable per-proxy via `Proxy.dns_cache_ttl_seconds`. Upon cache miss or expiry, perform a fresh asynchronous DNS lookup.
     *   Support global static hostname-to-IP mappings provided via `FERRUM_DNS_OVERRIDES`.
     *   Support per-proxy static IP overrides via `Proxy.dns_override`. These overrides take precedence over global overrides and DNS lookups.
-*   **Request Size Limits:** Enforce the maximum allowed request header size (`FERRUM_MAX_HEADER_SIZE_BYTES`) and request body size (`FERRUM_MAX_BODY_SIZE_BYTES`). Requests exceeding these limits MUST be rejected immediately with appropriate HTTP status codes (e.g., 431 Request Header Fields Too Large, 413 Content Too Large).
+*   **Request Size Limits:** Enforce the maximum allowed request header size (`FERRUM_MAX_HEADER_SIZE_BYTES`) and request body size (`FERRUM_MAX_REQUEST_BODY_SIZE_BYTES`). Requests exceeding these limits MUST be rejected immediately with appropriate HTTP status codes (e.g., 431 Request Header Fields Too Large, 413 Content Too Large).
 *   **Zero-Downtime Configuration Updates:** All configuration changes loaded via database polling, file reload signal, or CP push MUST be applied atomically such that active request processing is not interrupted or negatively impacted. Target efficient handling of potentially thousands of `Proxy` resources.
 *   **Graceful Shutdown:** Upon receiving a SIGTERM or SIGINT signal, the gateway MUST:
     1.  Stop accepting new incoming connections on all listeners.

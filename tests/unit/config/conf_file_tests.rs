@@ -128,7 +128,7 @@ FERRUM_FILE_CONFIG_PATH = /path
 FERRUM_PROXY_HTTP_PORT = 3000
 FERRUM_PROXY_HTTPS_PORT = 3443
 FERRUM_ADMIN_HTTP_PORT = 4000
-FERRUM_MAX_BODY_SIZE_BYTES = 5242880
+FERRUM_MAX_REQUEST_BODY_SIZE_BYTES = 5242880
 FERRUM_DNS_CACHE_TTL_SECONDS = 600
 FERRUM_HTTP3_MAX_STREAMS = 200
 ";
@@ -141,7 +141,7 @@ FERRUM_HTTP3_MAX_STREAMS = 200
             assert_eq!(config.proxy_http_port, 3000);
             assert_eq!(config.proxy_https_port, 3443);
             assert_eq!(config.admin_http_port, 4000);
-            assert_eq!(config.max_body_size_bytes, 5_242_880);
+            assert_eq!(config.max_request_body_size_bytes, 5_242_880);
             assert_eq!(config.dns_cache_ttl_seconds, 600);
             assert_eq!(config.http3_max_streams, 200);
         },

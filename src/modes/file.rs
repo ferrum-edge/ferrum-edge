@@ -177,10 +177,10 @@ pub async fn run(
             env_config.max_header_size_bytes
         );
     }
-    if env_config.max_body_size_bytes != 10_485_760 {
+    if env_config.max_request_body_size_bytes != 10_485_760 {
         info!(
-            "Custom max body size: {} bytes",
-            env_config.max_body_size_bytes
+            "Custom max request body size: {} bytes",
+            env_config.max_request_body_size_bytes
         );
     }
 

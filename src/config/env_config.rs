@@ -143,7 +143,7 @@ pub struct EnvConfig {
     // Request/Response limits
     pub max_header_size_bytes: usize,
     pub max_single_header_size_bytes: usize,
-    pub max_body_size_bytes: usize,
+    pub max_request_body_size_bytes: usize,
     pub max_response_body_size_bytes: usize,
 
     // DNS
@@ -331,7 +331,7 @@ impl Default for EnvConfig {
             dp_grpc_tls_no_verify: false,
             max_header_size_bytes: 32_768,
             max_single_header_size_bytes: 16_384,
-            max_body_size_bytes: 10_485_760,
+            max_request_body_size_bytes: 10_485_760,
             max_response_body_size_bytes: 10_485_760,
             dns_cache_ttl_seconds: 300,
             dns_overrides: HashMap::new(),
@@ -460,7 +460,11 @@ impl EnvConfig {
                 "FERRUM_MAX_SINGLE_HEADER_SIZE_BYTES",
                 16_384,
             ),
-            max_body_size_bytes: resolve_usize(conf, "FERRUM_MAX_BODY_SIZE_BYTES", 10_485_760),
+            max_request_body_size_bytes: resolve_usize(
+                conf,
+                "FERRUM_MAX_REQUEST_BODY_SIZE_BYTES",
+                10_485_760,
+            ),
             max_response_body_size_bytes: resolve_usize(
                 conf,
                 "FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES",

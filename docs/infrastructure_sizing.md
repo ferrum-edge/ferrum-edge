@@ -130,7 +130,7 @@ See [Response Body Streaming](response_body_streaming.md) for full details on st
 
 **Recommendations:**
 - Use streaming mode (the default) unless plugins require full response body access.
-- Set `FERRUM_MAX_BODY_SIZE_BYTES` and `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES` to the smallest values your workload allows.
+- Set `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES` and `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES` to the smallest values your workload allows.
 - For file upload proxies, dedicate separate proxy routes with higher limits rather than raising the global default.
 - When body limits are set to 0 (unlimited), memory usage is bounded only by client behavior — always set explicit limits in production.
 
@@ -138,7 +138,7 @@ See [Response Body Streaming](response_body_streaming.md) for full details on st
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `FERRUM_MAX_BODY_SIZE_BYTES` | 10 MB | Maximum request body size |
+| `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES` | 10 MB | Maximum request body size |
 | `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES` | 10 MB | Maximum response body size |
 | `FERRUM_MAX_HEADER_SIZE_BYTES` | 32 KB | Maximum total header size |
 | `FERRUM_MAX_SINGLE_HEADER_SIZE_BYTES` | 16 KB | Maximum single header value size |

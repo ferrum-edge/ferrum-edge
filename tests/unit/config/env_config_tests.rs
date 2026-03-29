@@ -393,12 +393,12 @@ fn test_env_config_request_limits_defaults() {
         ],
         || {
             remove_var("FERRUM_MAX_HEADER_SIZE_BYTES");
-            remove_var("FERRUM_MAX_BODY_SIZE_BYTES");
+            remove_var("FERRUM_MAX_REQUEST_BODY_SIZE_BYTES");
 
             let config = EnvConfig::from_env().unwrap();
             assert_eq!(config.max_header_size_bytes, 32768);
             assert_eq!(config.max_single_header_size_bytes, 16384);
-            assert_eq!(config.max_body_size_bytes, 10_485_760);
+            assert_eq!(config.max_request_body_size_bytes, 10_485_760);
             assert_eq!(config.max_response_body_size_bytes, 10_485_760);
         },
     );

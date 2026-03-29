@@ -53,6 +53,9 @@ type PluginList = Arc<Vec<Arc<dyn Plugin>>>;
 type ProxyPluginMap = HashMap<String, PluginList>;
 /// Map from proxy_id to whether any plugin requires response body buffering.
 type BufferingMap = HashMap<String, bool>;
+/// Map from proxy_id to whether any plugin requires request body buffering
+/// (i.e., modifies the request body before forwarding to the backend).
+type RequestBufferingMap = HashMap<String, bool>;
 /// Map from (proxy_id, protocol) to pre-filtered plugin list.
 type ProtocolPluginMap = HashMap<(String, ProxyProtocol), PluginList>;
 
@@ -121,6 +124,12 @@ pub struct PluginCache {
     requires_buffering: ArcSwap<BufferingMap>,
     /// Whether global-only plugins require response body buffering (fallback).
     global_requires_buffering: ArcSwap<bool>,
+    /// Pre-computed: does any plugin for this proxy modify the request body?
+    /// When false, request bodies can be streamed directly to the backend
+    /// without collecting into memory first.
+    requires_request_buffering: ArcSwap<RequestBufferingMap>,
+    /// Whether global-only plugins require request body buffering (fallback).
+    global_requires_request_buffering: ArcSwap<bool>,
     /// Pre-computed per-protocol plugin lists: (proxy_id, protocol) → filtered plugins.
     /// Avoids per-request filtering on the hot path.
     protocol_plugins: ArcSwap<ProtocolPluginMap>,
@@ -146,14 +155,22 @@ impl PluginCache {
         config: &GatewayConfig,
         http_client: PluginHttpClient,
     ) -> Result<Self, String> {
-        let (proxy_map, globals, buffering_map, global_needs_buffering) =
-            Self::build_cache(config, &http_client)?;
+        let (
+            proxy_map,
+            globals,
+            buffering_map,
+            global_needs_buffering,
+            req_buffering_map,
+            global_needs_req_buffering,
+        ) = Self::build_cache(config, &http_client)?;
         let (proto_map, global_proto_map) = build_protocol_maps(&proxy_map, &globals);
         Ok(Self {
             proxy_plugins: ArcSwap::new(Arc::new(proxy_map)),
             global_plugins: ArcSwap::new(Arc::new(globals)),
             requires_buffering: ArcSwap::new(Arc::new(buffering_map)),
             global_requires_buffering: ArcSwap::new(Arc::new(global_needs_buffering)),
+            requires_request_buffering: ArcSwap::new(Arc::new(req_buffering_map)),
+            global_requires_request_buffering: ArcSwap::new(Arc::new(global_needs_req_buffering)),
             protocol_plugins: ArcSwap::new(Arc::new(proto_map)),
             global_protocol_plugins: ArcSwap::new(Arc::new(global_proto_map)),
             http_client,
@@ -166,14 +183,24 @@ impl PluginCache {
     ///
     /// Returns `Err` if a security-critical plugin fails validation.
     pub fn rebuild(&self, config: &GatewayConfig) -> Result<(), String> {
-        let (proxy_map, globals, buffering_map, global_needs_buffering) =
-            Self::build_cache(config, &self.http_client)?;
+        let (
+            proxy_map,
+            globals,
+            buffering_map,
+            global_needs_buffering,
+            req_buffering_map,
+            global_needs_req_buffering,
+        ) = Self::build_cache(config, &self.http_client)?;
         let (proto_map, global_proto_map) = build_protocol_maps(&proxy_map, &globals);
         self.proxy_plugins.store(Arc::new(proxy_map));
         self.global_plugins.store(Arc::new(globals));
         self.requires_buffering.store(Arc::new(buffering_map));
         self.global_requires_buffering
             .store(Arc::new(global_needs_buffering));
+        self.requires_request_buffering
+            .store(Arc::new(req_buffering_map));
+        self.global_requires_request_buffering
+            .store(Arc::new(global_needs_req_buffering));
         self.protocol_plugins.store(Arc::new(proto_map));
         self.global_protocol_plugins
             .store(Arc::new(global_proto_map));
@@ -287,10 +314,13 @@ impl PluginCache {
             new_map.insert(proxy.id.clone(), Arc::new(merged));
         }
 
-        // Update buffering map for changed proxies
+        // Update buffering maps for changed proxies
         let mut new_buffering: BufferingMap = self.requires_buffering.load().as_ref().clone();
+        let mut new_req_buffering: RequestBufferingMap =
+            self.requires_request_buffering.load().as_ref().clone();
         for id in removed_proxy_ids {
             new_buffering.remove(id);
+            new_req_buffering.remove(id);
         }
         for proxy in &config.proxies {
             if proxy_ids_to_rebuild.contains(&proxy.id)
@@ -299,6 +329,10 @@ impl PluginCache {
                 new_buffering.insert(
                     proxy.id.clone(),
                     plugins.iter().any(|p| p.requires_response_body_buffering()),
+                );
+                new_req_buffering.insert(
+                    proxy.id.clone(),
+                    plugins.iter().any(|p| p.modifies_request_body()),
                 );
             }
         }
@@ -341,6 +375,8 @@ impl PluginCache {
         // Atomic swap — readers see old or new, never a partial state
         self.proxy_plugins.store(Arc::new(new_map));
         self.requires_buffering.store(Arc::new(new_buffering));
+        self.requires_request_buffering
+            .store(Arc::new(new_req_buffering));
         self.protocol_plugins.store(Arc::new(new_proto_map));
         if rebuild_globals {
             self.global_plugins.store(Arc::new(new_globals.clone()));
@@ -348,6 +384,9 @@ impl PluginCache {
                 new_globals
                     .iter()
                     .any(|p| p.requires_response_body_buffering()),
+            ));
+            self.global_requires_request_buffering.store(Arc::new(
+                new_globals.iter().any(|p| p.modifies_request_body()),
             ));
             // Rebuild global protocol maps
             let mut new_global_proto = HashMap::with_capacity(protocols.len());
@@ -414,6 +453,21 @@ impl PluginCache {
         }
     }
 
+    /// Check whether any plugin for this proxy modifies the request body.
+    /// When true, the request body must be fully collected into memory before
+    /// forwarding so plugins can transform it. When false, the body can be
+    /// streamed directly to the backend without buffering.
+    /// Pre-computed at config load time — O(1) lookup instead of per-request iteration.
+    pub fn requires_request_body_buffering(&self, proxy_id: &str) -> bool {
+        let map = self.requires_request_buffering.load();
+        if let Some(&needs) = map.get(proxy_id) {
+            needs
+        } else {
+            // Fallback to global plugins' request buffering requirement
+            **self.global_requires_request_buffering.load()
+        }
+    }
+
     /// Collect all hostnames that plugins will send traffic to.
     ///
     /// Iterates all cached plugin instances (global + per-proxy) and calls
@@ -457,7 +511,17 @@ impl PluginCache {
     fn build_cache(
         config: &GatewayConfig,
         http_client: &PluginHttpClient,
-    ) -> Result<(ProxyPluginMap, PluginList, BufferingMap, bool), String> {
+    ) -> Result<
+        (
+            ProxyPluginMap,
+            PluginList,
+            BufferingMap,
+            bool,
+            RequestBufferingMap,
+            bool,
+        ),
+        String,
+    > {
         // Step 1: Create all enabled global plugins (shared across proxies)
         let mut global_plugins: Vec<Arc<dyn Plugin>> = Vec::new();
 
@@ -494,6 +558,8 @@ impl PluginCache {
         let mut proxy_map: HashMap<String, Arc<Vec<Arc<dyn Plugin>>>> =
             HashMap::with_capacity(config.proxies.len());
         let mut buffering_map: BufferingMap = HashMap::with_capacity(config.proxies.len());
+        let mut req_buffering_map: RequestBufferingMap =
+            HashMap::with_capacity(config.proxies.len());
 
         for proxy in &config.proxies {
             // Start with global plugins
@@ -529,6 +595,10 @@ impl PluginCache {
             let needs_buffering = merged.iter().any(|p| p.requires_response_body_buffering());
             buffering_map.insert(proxy.id.clone(), needs_buffering);
 
+            // Pre-compute whether any plugin modifies the request body
+            let needs_req_buffering = merged.iter().any(|p| p.modifies_request_body());
+            req_buffering_map.insert(proxy.id.clone(), needs_req_buffering);
+
             proxy_map.insert(proxy.id.clone(), Arc::new(merged));
         }
 
@@ -548,12 +618,15 @@ impl PluginCache {
         let global_needs_buffering = global_plugins
             .iter()
             .any(|p| p.requires_response_body_buffering());
+        let global_needs_req_buffering = global_plugins.iter().any(|p| p.modifies_request_body());
 
         Ok((
             proxy_map,
             Arc::new(global_plugins),
             buffering_map,
             global_needs_buffering,
+            req_buffering_map,
+            global_needs_req_buffering,
         ))
     }
 }

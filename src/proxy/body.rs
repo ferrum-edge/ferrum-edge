@@ -8,6 +8,7 @@
 use bytes::Bytes;
 use http_body::Frame;
 use http_body_util::{Full, StreamBody};
+use hyper::body::Incoming;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -220,5 +221,80 @@ impl http_body::Body for ProxyBody {
             ProxyBody::Stream(body) => body.size_hint(),
             ProxyBody::Tracked(body) => body.inner.size_hint(),
         }
+    }
+}
+
+/// A size-limited stream adapter over hyper's `Incoming` body.
+///
+/// Wraps `Incoming` and counts bytes as they flow through. If the
+/// accumulated size exceeds `max_bytes`, sets a shared `exceeded` flag
+/// and yields an error. This allows streaming request bodies to the
+/// backend while still enforcing `max_request_body_size_bytes`.
+///
+/// The `exceeded` flag is checked after `reqwest::send()` completes
+/// to distinguish a size-limit error from other request failures and
+/// return the correct HTTP 413 status.
+pub struct SizeLimitedIncoming {
+    inner: Incoming,
+    max_bytes: usize,
+    bytes_seen: usize,
+    exceeded: Arc<AtomicBool>,
+}
+
+impl SizeLimitedIncoming {
+    pub fn new(incoming: Incoming, max_bytes: usize, exceeded: Arc<AtomicBool>) -> Self {
+        Self {
+            inner: incoming,
+            max_bytes,
+            bytes_seen: 0,
+            exceeded,
+        }
+    }
+
+    /// Convert this size-limited body into a `reqwest::Body` for streaming
+    /// to the backend without collecting the full body into memory.
+    pub fn into_reqwest_body(self) -> reqwest::Body {
+        use futures_util::TryStreamExt;
+
+        // Convert the Body into a stream of data frames, filtering out
+        // non-data frames (trailers, etc.)
+        let stream = http_body_util::BodyStream::new(self)
+            .try_filter_map(|frame| async move { Ok(frame.into_data().ok()) });
+        reqwest::Body::wrap_stream(stream)
+    }
+}
+
+impl http_body::Body for SizeLimitedIncoming {
+    type Data = Bytes;
+    type Error = Box<dyn std::error::Error + Send + Sync>;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let this = self.get_mut();
+        match Pin::new(&mut this.inner).poll_frame(cx) {
+            Poll::Ready(Some(Ok(frame))) => {
+                if let Some(data) = frame.data_ref() {
+                    this.bytes_seen += data.len();
+                    if this.bytes_seen > this.max_bytes {
+                        this.exceeded.store(true, Ordering::Release);
+                        return Poll::Ready(Some(Err("request body exceeds maximum size".into())));
+                    }
+                }
+                Poll::Ready(Some(Ok(frame)))
+            }
+            Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(Box::new(e)))),
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
     }
 }

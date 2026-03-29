@@ -158,7 +158,7 @@ pub struct ProxyState {
     // Size limits
     pub max_header_size_bytes: usize,
     pub max_single_header_size_bytes: usize,
-    pub max_body_size_bytes: usize,
+    pub max_request_body_size_bytes: usize,
     pub max_response_body_size_bytes: usize,
     /// Parsed trusted proxy CIDRs for X-Forwarded-For client IP resolution.
     /// Pre-parsed from `env_config.trusted_proxies` to avoid re-parsing on every request.
@@ -180,7 +180,7 @@ impl ProxyState {
         };
         let max_header_size_bytes = env_config.max_header_size_bytes;
         let max_single_header_size_bytes = env_config.max_single_header_size_bytes;
-        let max_body_size_bytes = env_config.max_body_size_bytes;
+        let max_request_body_size_bytes = env_config.max_request_body_size_bytes;
         let max_response_body_size_bytes = env_config.max_response_body_size_bytes;
         let trusted_proxies = Arc::new(client_ip::TrustedProxies::parse(
             &env_config.trusted_proxies,
@@ -285,7 +285,7 @@ impl ProxyState {
             env_config: env_config_arc,
             max_header_size_bytes,
             max_single_header_size_bytes,
-            max_body_size_bytes,
+            max_request_body_size_bytes,
             max_response_body_size_bytes,
             trusted_proxies,
             stream_listener_manager,
@@ -2367,12 +2367,23 @@ pub async fn handle_proxy_request(
             .requires_response_body_buffering(&proxy.id),
     };
 
+    // Determine if we can stream the request body to the backend without
+    // collecting it into memory. This is safe when no plugin modifies the
+    // request body (e.g., request_transformer with body rules).
+    // When retries are configured, we force buffered mode so the collected
+    // body bytes can be replayed on connection failures.
+    let has_retry = proxy.retry.is_some();
+    let stream_request_body = !has_retry
+        && !state
+            .plugin_cache
+            .requires_request_body_buffering(&proxy.id);
+
     // Perform the backend request with retry logic
     let backend_resp = if let Some(retry_config) = &proxy.retry {
         let mut attempt = 0u32;
         let mut current_target = upstream_target.clone();
         let mut current_url = backend_url.clone();
-        let mut result = proxy_to_backend(
+        let (mut result, retained_body) = proxy_to_backend(
             &state,
             &proxy,
             &current_url,
@@ -2382,6 +2393,8 @@ pub async fn handle_proxy_request(
             upstream_target.as_ref(),
             &plugins,
             should_stream,
+            stream_request_body,
+            has_retry,
             &ctx.client_ip,
             is_tls,
         )
@@ -2420,7 +2433,8 @@ pub async fn handle_proxy_request(
                 "Retrying backend request"
             );
 
-            // Build a minimal request for retry (body was consumed on first attempt).
+            // Replay the original request body on retry. On connection failures
+            // the body was never sent, so replaying is correct and safe.
             // The final retry attempt uses streaming if configured.
             let is_last_attempt = attempt >= retry_config.max_retries;
             result = proxy_to_backend_retry(
@@ -2430,6 +2444,7 @@ pub async fn handle_proxy_request(
                 &method,
                 proxy_headers,
                 current_target.as_ref(),
+                retained_body.as_deref(),
                 should_stream && is_last_attempt,
                 &ctx.client_ip,
                 is_tls,
@@ -2448,10 +2463,13 @@ pub async fn handle_proxy_request(
             upstream_target.as_ref(),
             &plugins,
             should_stream,
+            stream_request_body,
+            false, // no retry — don't retain body
             &ctx.client_ip,
             is_tls,
         )
         .await
+        .0
     };
     let mut response_status = backend_resp.status_code;
     let mut response_body = backend_resp.body;
@@ -2807,8 +2825,9 @@ pub fn build_backend_url_with_target(
     url
 }
 
-/// Retry a backend request without a body (body was consumed on the first attempt).
-/// For idempotent methods (GET, HEAD, DELETE, OPTIONS) this is safe.
+/// Retry a backend request, replaying the original request body if available.
+/// The body bytes were collected and retained on the first attempt so they
+/// can be replayed on connection-failure retries without data loss.
 #[allow(clippy::too_many_arguments)]
 async fn proxy_to_backend_retry(
     state: &ProxyState,
@@ -2817,6 +2836,7 @@ async fn proxy_to_backend_retry(
     method: &str,
     headers: &HashMap<String, String>,
     upstream_target: Option<&UpstreamTarget>,
+    request_body: Option<&[u8]>,
     stream_response: bool,
     client_ip: &str,
     is_tls: bool,
@@ -2915,6 +2935,14 @@ async fn proxy_to_backend_retry(
         req_builder = req_builder.header("X-Forwarded-Host", host.as_str());
     }
 
+    // Replay the original request body on retry if available.
+    // On connection failures the body was never sent, so replaying is safe.
+    if let Some(body) = request_body
+        && !body.is_empty()
+    {
+        req_builder = req_builder.body(body.to_vec());
+    }
+
     match req_builder.send().await {
         Ok(response) => {
             let status = response.status().as_u16();
@@ -2990,9 +3018,16 @@ async fn proxy_to_backend(
     upstream_target: Option<&UpstreamTarget>,
     #[allow(unused_variables)] plugins: &[Arc<dyn crate::plugins::Plugin>],
     stream_response: bool,
+    stream_request_body: bool,
+    retain_request_body: bool,
     client_ip: &str,
     is_tls: bool,
-) -> retry::BackendResponse {
+) -> (retry::BackendResponse, Option<Vec<u8>>) {
+    // When retain_request_body is true (retries configured), the collected
+    // body bytes are cloned and returned alongside the response so the
+    // caller can replay them on connection-failure retries.
+    let mut retained_body: Option<Vec<u8>> = None;
+
     // All reqwest clients use our DnsCacheResolver, so DNS resolution is
     // always served from the warmed cache — never hitting DNS on the hot path.
     // For both single-backend and load-balanced proxies, the client transparently
@@ -3028,14 +3063,17 @@ async fn proxy_to_backend(
             client_ip,
         )
         .await;
-        return retry::BackendResponse {
-            status_code: status,
-            body: ResponseBody::Buffered(body),
-            headers: hdrs,
-            connection_error: false,
-            backend_resolved_ip: resolved_ip.clone(),
-            error_class: None,
-        };
+        return (
+            retry::BackendResponse {
+                status_code: status,
+                body: ResponseBody::Buffered(body),
+                headers: hdrs,
+                connection_error: false,
+                backend_resolved_ip: resolved_ip.clone(),
+                error_class: None,
+            },
+            None,
+        );
     }
 
     // Use HTTP/2 multiplexing pool for HTTPS backends with H2 enabled.
@@ -3044,19 +3082,22 @@ async fn proxy_to_backend(
     if matches!(proxy.backend_protocol, BackendProtocol::Https) {
         let pool_config = state.connection_pool.global_pool_config().for_proxy(proxy);
         if pool_config.enable_http2 {
-            return proxy_to_backend_http2(
-                state,
-                proxy,
-                backend_url,
-                method,
-                headers,
-                original_req,
-                stream_response,
-                client_ip,
-                is_tls,
-                resolved_ip,
-            )
-            .await;
+            return (
+                proxy_to_backend_http2(
+                    state,
+                    proxy,
+                    backend_url,
+                    method,
+                    headers,
+                    original_req,
+                    stream_response,
+                    client_ip,
+                    is_tls,
+                    resolved_ip,
+                )
+                .await,
+                None,
+            );
         }
     }
 
@@ -3088,16 +3129,19 @@ async fn proxy_to_backend(
         Ok(m) => m,
         Err(()) => {
             warn!("Invalid HTTP method: {}", method);
-            return retry::BackendResponse {
-                status_code: 405,
-                body: ResponseBody::Buffered(
-                    r#"{"error":"Method Not Allowed"}"#.as_bytes().to_vec(),
-                ),
-                headers: HashMap::new(),
-                connection_error: false,
-                backend_resolved_ip: resolved_ip.clone(),
-                error_class: None,
-            };
+            return (
+                retry::BackendResponse {
+                    status_code: 405,
+                    body: ResponseBody::Buffered(
+                        r#"{"error":"Method Not Allowed"}"#.as_bytes().to_vec(),
+                    ),
+                    headers: HashMap::new(),
+                    connection_error: false,
+                    backend_resolved_ip: resolved_ip.clone(),
+                    error_class: None,
+                },
+                None,
+            );
         }
     };
 
@@ -3144,103 +3188,143 @@ async fn proxy_to_backend(
     // Fast path: skip body collection for methods that typically have no body
     let has_body = !matches!(method, "GET" | "HEAD" | "DELETE" | "OPTIONS");
 
+    // Shared flag for detecting size-limit exceeded during streaming.
+    // Only allocated when we actually stream a request body.
+    let body_size_exceeded = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
     if has_body {
         // Enforce request body size limit via Content-Length fast path
-        if state.max_body_size_bytes > 0
+        if state.max_request_body_size_bytes > 0
             && let Some(content_length) = headers.get("content-length")
             && let Ok(len) = content_length.parse::<usize>()
-            && len > state.max_body_size_bytes
+            && len > state.max_request_body_size_bytes
         {
-            return retry::BackendResponse {
-                status_code: 413,
-                body: ResponseBody::Buffered(
-                    r#"{"error":"Request body exceeds maximum size"}"#.as_bytes().to_vec(),
-                ),
-                headers: HashMap::new(),
-                connection_error: false,
-                backend_resolved_ip: resolved_ip.clone(),
-                error_class: Some(retry::ErrorClass::RequestBodyTooLarge),
-            };
+            return (
+                retry::BackendResponse {
+                    status_code: 413,
+                    body: ResponseBody::Buffered(
+                        r#"{"error":"Request body exceeds maximum size"}"#.as_bytes().to_vec(),
+                    ),
+                    headers: HashMap::new(),
+                    connection_error: false,
+                    backend_resolved_ip: resolved_ip.clone(),
+                    error_class: Some(retry::ErrorClass::RequestBodyTooLarge),
+                },
+                None,
+            );
         }
 
-        // Collect and forward body with size limit.
-        // Skip body collection for methods that typically carry no body to avoid
-        // unnecessary Limited wrapper overhead on the hot path (GET health checks, etc.).
+        // Refine body presence check: skip for methods that typically carry no body
+        // unless Content-Length or Transfer-Encoding indicates otherwise.
         let has_body = !matches!(method, "GET" | "HEAD" | "OPTIONS")
             || headers.contains_key("content-length")
             || headers.get("transfer-encoding").is_some();
 
-        let body_bytes = if !has_body {
-            // Fast path: skip body collection entirely for bodyless requests
-            Vec::new()
-        } else if state.max_body_size_bytes > 0 {
-            let limited =
-                http_body_util::Limited::new(original_req.into_body(), state.max_body_size_bytes);
-            match limited.collect().await {
-                Ok(collected) => collected.to_bytes().to_vec(),
-                Err(_) => {
-                    return retry::BackendResponse {
-                        status_code: 413,
-                        body: ResponseBody::Buffered(
-                            r#"{"error":"Request body exceeds maximum size"}"#.as_bytes().to_vec(),
-                        ),
-                        headers: HashMap::new(),
-                        connection_error: false,
-                        backend_resolved_ip: resolved_ip.clone(),
-                        error_class: Some(retry::ErrorClass::RequestBodyTooLarge),
-                    };
-                }
+        if !has_body {
+            // No body to forward — skip entirely
+        } else if stream_request_body {
+            // Stream the request body directly to the backend without collecting
+            // into memory. Size limit is enforced during streaming via
+            // SizeLimitedIncoming which sets body_size_exceeded on overflow.
+            let incoming = original_req.into_body();
+            if state.max_request_body_size_bytes > 0 {
+                let limited = body::SizeLimitedIncoming::new(
+                    incoming,
+                    state.max_request_body_size_bytes,
+                    Arc::clone(&body_size_exceeded),
+                );
+                req_builder = req_builder.body(limited.into_reqwest_body());
+            } else {
+                // No size limit — stream body directly via wrap_stream
+                use futures_util::TryStreamExt;
+                let stream = http_body_util::BodyStream::new(incoming)
+                    .try_filter_map(|frame| async move { Ok(frame.into_data().ok()) });
+                req_builder = req_builder.body(reqwest::Body::wrap_stream(stream));
             }
         } else {
-            match original_req.into_body().collect().await {
-                Ok(collected) => collected.to_bytes().to_vec(),
-                Err(e) => {
-                    error!(
-                        proxy_id = %proxy.id,
-                        backend_url = %backend_url,
-                        error_kind = "client_disconnect",
-                        error = %e,
-                        "Client disconnected while sending request body"
-                    );
-                    return retry::BackendResponse {
-                        status_code: 499,
-                        body: ResponseBody::Buffered(
-                            r#"{"error":"Client disconnected"}"#.as_bytes().to_vec(),
-                        ),
-                        headers: HashMap::new(),
-                        connection_error: true,
-                        backend_resolved_ip: resolved_ip.clone(),
-                        error_class: Some(retry::ErrorClass::ClientDisconnect),
-                    };
-                }
-            }
-        };
-
-        // Transform request body via plugins (JSON field rename, add, remove, etc.)
-        let body_bytes =
-            if !body_bytes.is_empty() && plugins.iter().any(|p| p.modifies_request_body()) {
-                let content_type = headers.get("content-type").map(|s| s.as_str());
-                let mut current = body_bytes;
-                for plugin in plugins {
-                    if plugin.modifies_request_body()
-                        && let Some(transformed) =
-                            plugin.transform_request_body(&current, content_type).await
-                    {
-                        current = transformed;
+            // Buffered path: collect body into memory for plugin transformation.
+            let body_bytes = if state.max_request_body_size_bytes > 0 {
+                let limited = http_body_util::Limited::new(
+                    original_req.into_body(),
+                    state.max_request_body_size_bytes,
+                );
+                match limited.collect().await {
+                    Ok(collected) => collected.to_bytes().to_vec(),
+                    Err(_) => {
+                        return (
+                            retry::BackendResponse {
+                                status_code: 413,
+                                body: ResponseBody::Buffered(
+                                    r#"{"error":"Request body exceeds maximum size"}"#
+                                        .as_bytes()
+                                        .to_vec(),
+                                ),
+                                headers: HashMap::new(),
+                                connection_error: false,
+                                backend_resolved_ip: resolved_ip.clone(),
+                                error_class: Some(retry::ErrorClass::RequestBodyTooLarge),
+                            },
+                            None,
+                        );
                     }
                 }
-                current
             } else {
-                body_bytes
+                match original_req.into_body().collect().await {
+                    Ok(collected) => collected.to_bytes().to_vec(),
+                    Err(e) => {
+                        error!(
+                            proxy_id = %proxy.id,
+                            backend_url = %backend_url,
+                            error_kind = "client_disconnect",
+                            error = %e,
+                            "Client disconnected while sending request body"
+                        );
+                        return (
+                            retry::BackendResponse {
+                                status_code: 499,
+                                body: ResponseBody::Buffered(
+                                    r#"{"error":"Client disconnected"}"#.as_bytes().to_vec(),
+                                ),
+                                headers: HashMap::new(),
+                                connection_error: true,
+                                backend_resolved_ip: resolved_ip.clone(),
+                                error_class: Some(retry::ErrorClass::ClientDisconnect),
+                            },
+                            None,
+                        );
+                    }
+                }
             };
 
-        if !body_bytes.is_empty() {
-            req_builder = req_builder.body(body_bytes);
+            // Transform request body via plugins (JSON field rename, add, remove, etc.)
+            let body_bytes =
+                if !body_bytes.is_empty() && plugins.iter().any(|p| p.modifies_request_body()) {
+                    let content_type = headers.get("content-type").map(|s| s.as_str());
+                    let mut current = body_bytes;
+                    for plugin in plugins {
+                        if plugin.modifies_request_body()
+                            && let Some(transformed) =
+                                plugin.transform_request_body(&current, content_type).await
+                        {
+                            current = transformed;
+                        }
+                    }
+                    current
+                } else {
+                    body_bytes
+                };
+
+            if !body_bytes.is_empty() {
+                if retain_request_body {
+                    retained_body = Some(body_bytes.clone());
+                }
+                req_builder = req_builder.body(body_bytes);
+            }
         }
     }
 
     // Send
-    match req_builder.send().await {
+    let response = match req_builder.send().await {
         Ok(response) => {
             let status = response.status().as_u16();
             let mut resp_headers = HashMap::new();
@@ -3262,32 +3346,38 @@ async fn proxy_to_backend(
                         "Backend response body ({} bytes) exceeds limit ({} bytes)",
                         len, state.max_response_body_size_bytes
                     );
-                    return retry::BackendResponse {
-                        status_code: 502,
-                        body: ResponseBody::Buffered(
-                            r#"{"error":"Backend response body exceeds maximum size"}"#
-                                .as_bytes()
-                                .to_vec(),
-                        ),
-                        headers: HashMap::new(),
-                        connection_error: false,
-                        backend_resolved_ip: resolved_ip.clone(),
-                        error_class: Some(retry::ErrorClass::ResponseBodyTooLarge),
-                    };
+                    return (
+                        retry::BackendResponse {
+                            status_code: 502,
+                            body: ResponseBody::Buffered(
+                                r#"{"error":"Backend response body exceeds maximum size"}"#
+                                    .as_bytes()
+                                    .to_vec(),
+                            ),
+                            headers: HashMap::new(),
+                            connection_error: false,
+                            backend_resolved_ip: resolved_ip.clone(),
+                            error_class: Some(retry::ErrorClass::ResponseBodyTooLarge),
+                        },
+                        retained_body,
+                    );
                 }
 
                 // When streaming is requested and Content-Length is present and within
                 // limits, we can safely stream. If there's no Content-Length we must
                 // buffer to enforce the size limit.
                 if stream_response && content_length.is_some() {
-                    return retry::BackendResponse {
-                        status_code: status,
-                        body: ResponseBody::Streaming(response),
-                        headers: resp_headers,
-                        connection_error: false,
-                        backend_resolved_ip: resolved_ip.clone(),
-                        error_class: None,
-                    };
+                    return (
+                        retry::BackendResponse {
+                            status_code: status,
+                            body: ResponseBody::Streaming(response),
+                            headers: resp_headers,
+                            connection_error: false,
+                            backend_resolved_ip: resolved_ip.clone(),
+                            error_class: None,
+                        },
+                        retained_body,
+                    );
                 }
 
                 // Buffer: stream-collect with size limit
@@ -3339,6 +3429,30 @@ async fn proxy_to_backend(
             }
         }
         Err(e) => {
+            // Check if the error was caused by the streaming body exceeding
+            // the size limit. If so, return 413 instead of generic 502.
+            if body_size_exceeded.load(Ordering::Acquire) {
+                warn!(
+                    proxy_id = %proxy.id,
+                    backend_url = %backend_url,
+                    max_body_size = state.max_request_body_size_bytes,
+                    "Streaming request body exceeded maximum size"
+                );
+                return (
+                    retry::BackendResponse {
+                        status_code: 413,
+                        body: ResponseBody::Buffered(
+                            r#"{"error":"Request body exceeds maximum size"}"#.as_bytes().to_vec(),
+                        ),
+                        headers: HashMap::new(),
+                        connection_error: false,
+                        backend_resolved_ip: resolved_ip.clone(),
+                        error_class: Some(retry::ErrorClass::RequestBodyTooLarge),
+                    },
+                    retained_body,
+                );
+            }
+
             let is_connect = e.is_connect();
             let is_timeout = e.is_timeout();
             let error_kind = if is_connect {
@@ -3366,7 +3480,9 @@ async fn proxy_to_backend(
                 error_class: Some(retry::classify_reqwest_error(&e)),
             }
         }
-    }
+    };
+
+    (response, retained_body)
 }
 
 /// Collect a response body with a size limit, returning Err with error body if exceeded.
@@ -3754,11 +3870,11 @@ async fn proxy_to_backend_http3(
 
     // Read request body with size limit
     let (_parts, body) = original_req.into_parts();
-    let request_body = if state.max_body_size_bytes > 0 {
+    let request_body = if state.max_request_body_size_bytes > 0 {
         // Check Content-Length fast path
         if let Some(content_length) = headers.get("content-length")
             && let Ok(len) = content_length.parse::<usize>()
-            && len > state.max_body_size_bytes
+            && len > state.max_request_body_size_bytes
         {
             return (
                 413,
@@ -3766,7 +3882,7 @@ async fn proxy_to_backend_http3(
                 HashMap::new(),
             );
         }
-        let limited = http_body_util::Limited::new(body, state.max_body_size_bytes);
+        let limited = http_body_util::Limited::new(body, state.max_request_body_size_bytes);
         match limited.collect().await {
             Ok(collected) => collected.to_bytes(),
             Err(_) => {
