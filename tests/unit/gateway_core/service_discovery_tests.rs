@@ -28,6 +28,7 @@ fn make_upstream(
         targets,
         algorithm: LoadBalancerAlgorithm::RoundRobin,
         hash_on: None,
+        hash_on_cookie_config: None,
         health_checks: None,
         service_discovery: sd,
         created_at: chrono::Utc::now(),

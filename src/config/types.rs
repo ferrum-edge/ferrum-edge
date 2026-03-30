@@ -298,6 +298,59 @@ pub struct HealthCheckConfig {
     pub passive: Option<PassiveHealthCheck>,
 }
 
+/// Cookie configuration for `hash_on: "cookie:<name>"` sticky sessions.
+///
+/// When consistent hashing uses a cookie as the hash key and the cookie is not
+/// present in the request, the gateway sets a `Set-Cookie` response header so
+/// subsequent requests from the same client stick to the same backend target.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HashOnCookieConfig {
+    /// Cookie `Path` attribute. Default: `"/"`.
+    #[serde(default = "default_cookie_path")]
+    pub path: String,
+    /// Cookie `Max-Age` in seconds. Default: 3600 (1 hour).
+    #[serde(default = "default_cookie_ttl")]
+    pub ttl_seconds: u64,
+    /// Optional `Domain` attribute.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
+    /// Set `HttpOnly` flag. Default: true.
+    #[serde(default = "default_true")]
+    pub http_only: bool,
+    /// Set `Secure` flag. Default: false.
+    #[serde(default)]
+    pub secure: bool,
+    /// `SameSite` attribute (`"Strict"`, `"Lax"`, or `"None"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub same_site: Option<String>,
+}
+
+fn default_cookie_path() -> String {
+    "/".to_string()
+}
+
+fn default_cookie_ttl() -> u64 {
+    3600
+}
+
+impl Default for HashOnCookieConfig {
+    fn default() -> Self {
+        Self {
+            path: default_cookie_path(),
+            ttl_seconds: default_cookie_ttl(),
+            domain: None,
+            http_only: true,
+            secure: false,
+            same_site: None,
+        }
+    }
+}
+
+/// Maximum length for cookie config path field.
+pub const MAX_COOKIE_PATH_LENGTH: usize = 2048;
+/// Maximum length for cookie config domain field.
+pub const MAX_COOKIE_DOMAIN_LENGTH: usize = 253;
+
 /// An upstream defines a group of backend targets with load balancing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Upstream {
@@ -309,6 +362,10 @@ pub struct Upstream {
     pub algorithm: LoadBalancerAlgorithm,
     #[serde(default)]
     pub hash_on: Option<String>,
+    /// Cookie attributes for `hash_on: "cookie:<name>"` sticky sessions.
+    /// Ignored when `hash_on` is not cookie-based.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hash_on_cookie_config: Option<HashOnCookieConfig>,
     #[serde(default)]
     pub health_checks: Option<HealthCheckConfig>,
     #[serde(default)]
@@ -1778,6 +1835,66 @@ impl Upstream {
             && let Err(e) = validate_string_field("hash_on", hash_on, MAX_HASH_ON_LENGTH)
         {
             errors.push(e);
+        }
+
+        // Validate hash_on format: must be "ip", "header:<name>", or "cookie:<name>"
+        if let Some(ref hash_on) = self.hash_on {
+            let trimmed = hash_on.trim();
+            if !trimmed.is_empty()
+                && trimmed != "ip"
+                && !trimmed.starts_with("header:")
+                && !trimmed.starts_with("cookie:")
+            {
+                errors.push(format!(
+                    "hash_on must be 'ip', 'header:<name>', or 'cookie:<name>' (got '{}')",
+                    trimmed
+                ));
+            }
+            // Validate that header/cookie name is non-empty
+            if let Some(name) = trimmed.strip_prefix("header:")
+                && name.trim().is_empty()
+            {
+                errors.push("hash_on 'header:' requires a non-empty header name".to_string());
+            }
+            if let Some(name) = trimmed.strip_prefix("cookie:")
+                && name.trim().is_empty()
+            {
+                errors.push("hash_on 'cookie:' requires a non-empty cookie name".to_string());
+            }
+        }
+
+        // hash_on_cookie_config
+        if let Some(ref cc) = self.hash_on_cookie_config {
+            if let Err(e) = validate_string_field(
+                "hash_on_cookie_config.path",
+                &cc.path,
+                MAX_COOKIE_PATH_LENGTH,
+            ) {
+                errors.push(e);
+            }
+            if let Some(ref domain) = cc.domain
+                && let Err(e) = validate_string_field(
+                    "hash_on_cookie_config.domain",
+                    domain,
+                    MAX_COOKIE_DOMAIN_LENGTH,
+                )
+            {
+                errors.push(e);
+            }
+            if let Some(ref same_site) = cc.same_site
+                && !["Strict", "Lax", "None"].contains(&same_site.as_str())
+            {
+                errors.push(format!(
+                    "hash_on_cookie_config.same_site must be 'Strict', 'Lax', or 'None' (got '{}')",
+                    same_site
+                ));
+            }
+            if cc.ttl_seconds > MAX_TIMEOUT_SECONDS {
+                errors.push(format!(
+                    "hash_on_cookie_config.ttl_seconds must not exceed {} (got {})",
+                    MAX_TIMEOUT_SECONDS, cc.ttl_seconds
+                ));
+            }
         }
 
         // Target count limit

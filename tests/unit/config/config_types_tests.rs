@@ -82,6 +82,7 @@ fn make_upstream(id: &str) -> Upstream {
         }],
         algorithm: Default::default(),
         hash_on: None,
+        hash_on_cookie_config: None,
         health_checks: None,
         service_discovery: None,
         created_at: Utc::now(),

@@ -85,6 +85,7 @@ fn make_upstream(id: &str) -> Upstream {
         }],
         algorithm: LoadBalancerAlgorithm::RoundRobin,
         hash_on: None,
+        hash_on_cookie_config: None,
         health_checks: None,
         service_discovery: None,
         created_at: Utc::now(),
@@ -1028,6 +1029,83 @@ fn test_k8s_valid_optional_fields() {
         }),
         consul: None,
         default_weight: 1,
+    });
+    assert!(upstream.validate_fields().is_ok());
+}
+
+// ─── hash_on format validation tests ────────────────────────────────────────
+
+#[test]
+fn test_upstream_hash_on_valid_formats() {
+    for hash_on in &["ip", "header:x-user-id", "cookie:session"] {
+        let mut upstream = make_upstream("u1");
+        upstream.hash_on = Some(hash_on.to_string());
+        assert!(
+            upstream.validate_fields().is_ok(),
+            "hash_on '{}' should be valid",
+            hash_on
+        );
+    }
+}
+
+#[test]
+fn test_upstream_hash_on_invalid_format() {
+    let mut upstream = make_upstream("u1");
+    upstream.hash_on = Some("random_string".to_string());
+    let errs = upstream.validate_fields().unwrap_err();
+    assert!(errs.iter().any(|e| e.contains("hash_on must be")));
+}
+
+#[test]
+fn test_upstream_hash_on_empty_header_name() {
+    let mut upstream = make_upstream("u1");
+    upstream.hash_on = Some("header:".to_string());
+    let errs = upstream.validate_fields().unwrap_err();
+    assert!(errs.iter().any(|e| e.contains("non-empty header name")));
+}
+
+#[test]
+fn test_upstream_hash_on_empty_cookie_name() {
+    let mut upstream = make_upstream("u1");
+    upstream.hash_on = Some("cookie:".to_string());
+    let errs = upstream.validate_fields().unwrap_err();
+    assert!(errs.iter().any(|e| e.contains("non-empty cookie name")));
+}
+
+#[test]
+fn test_upstream_hash_on_cookie_config_validation() {
+    use ferrum_gateway::config::types::HashOnCookieConfig;
+
+    let mut upstream = make_upstream("u1");
+    upstream.hash_on = Some("cookie:session".to_string());
+    upstream.hash_on_cookie_config = Some(HashOnCookieConfig {
+        path: "/".to_string(),
+        ttl_seconds: 3600,
+        domain: None,
+        http_only: true,
+        secure: false,
+        same_site: Some("Invalid".to_string()),
+    });
+    let errs = upstream.validate_fields().unwrap_err();
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("same_site must be 'Strict', 'Lax', or 'None'"))
+    );
+}
+
+#[test]
+fn test_upstream_hash_on_cookie_config_valid() {
+    use ferrum_gateway::config::types::HashOnCookieConfig;
+
+    let mut upstream = make_upstream("u1");
+    upstream.hash_on = Some("cookie:session".to_string());
+    upstream.hash_on_cookie_config = Some(HashOnCookieConfig {
+        path: "/api".to_string(),
+        ttl_seconds: 7200,
+        domain: Some("example.com".to_string()),
+        http_only: true,
+        secure: true,
+        same_site: Some("Lax".to_string()),
     });
     assert!(upstream.validate_fields().is_ok());
 }

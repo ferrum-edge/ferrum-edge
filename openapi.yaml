@@ -1612,8 +1612,19 @@ components:
         hash_on:
           type: [string, "null"]
           description: |
-            Field to hash for consistent-hashing algorithm
-            (e.g. `header:x-user-id`). Ignored by other algorithms.
+            Hash key source for consistent-hashing algorithm. Accepted values:
+            - `ip` (default) — hash on client IP address
+            - `header:<name>` — hash on a request header value (e.g. `header:x-user-id`)
+            - `cookie:<name>` — hash on a cookie value; if the cookie is absent, the
+              gateway sets a `Set-Cookie` response header to establish a sticky session.
+            Ignored by other algorithms.
+        hash_on_cookie_config:
+          oneOf:
+            - $ref: "#/components/schemas/HashOnCookieConfig"
+            - type: "null"
+          description: >-
+            Cookie attributes for `hash_on: "cookie:<name>"` sticky sessions.
+            Ignored when `hash_on` is not cookie-based. Defaults are used if omitted.
         health_checks:
           oneOf:
             - $ref: "#/components/schemas/HealthCheckConfig"
@@ -1671,6 +1682,37 @@ components:
         - consistent_hashing
         - random
       default: round_robin
+
+    # ── Hash-On Cookie Config ────────────────────────────────────────
+    HashOnCookieConfig:
+      type: object
+      description: >-
+        Cookie attributes for `hash_on: "cookie:<name>"` sticky sessions.
+        Controls the Set-Cookie header injected when a new session is established.
+      properties:
+        path:
+          type: string
+          default: "/"
+          description: Cookie `Path` attribute.
+        ttl_seconds:
+          type: integer
+          default: 3600
+          description: Cookie `Max-Age` in seconds (default 1 hour).
+        domain:
+          type: [string, "null"]
+          description: Optional `Domain` attribute.
+        http_only:
+          type: boolean
+          default: true
+          description: Set `HttpOnly` flag.
+        secure:
+          type: boolean
+          default: false
+          description: Set `Secure` flag.
+        same_site:
+          type: [string, "null"]
+          enum: [Strict, Lax, None, null]
+          description: '`SameSite` attribute.'
 
     # ── Health Checks ───────────────────────────────────────────────
     HealthCheckConfig:

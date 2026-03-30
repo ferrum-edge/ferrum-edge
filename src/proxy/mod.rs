@@ -37,7 +37,7 @@ use crate::consumer_index::ConsumerIndex;
 use crate::dns::DnsCache;
 use crate::health_check::HealthChecker;
 use crate::http3::client::Http3ConnectionPool;
-use crate::load_balancer::LoadBalancerCache;
+use crate::load_balancer::{HashOnStrategy, LoadBalancerCache};
 use crate::plugin_cache::PluginCache;
 use crate::plugins::{
     Plugin, PluginResult, ProxyProtocol, RequestContext, TransactionSummary,
@@ -940,6 +940,8 @@ async fn handle_websocket_request_authenticated(
     plugins: Arc<Vec<Arc<dyn Plugin>>>,
     plugin_execution_ns: u64,
     upstream_target: Option<UpstreamTarget>,
+    lb_hash_key: String,
+    sticky_cookie_needed: bool,
 ) -> Result<Response<ProxyBody>, hyper::Error> {
     info!(
         "WebSocket upgrade request authenticated for proxy: {} from: {}",
@@ -1037,7 +1039,7 @@ async fn handle_websocket_request_authenticated(
                         (&proxy.upstream_id, &current_target)
                         && let Some(next) = state.load_balancer_cache.select_next_target(
                             upstream_id,
-                            &ctx.client_ip,
+                            &lb_hash_key,
                             prev_target,
                             Some(&state.health_checker.unhealthy_targets),
                         )
@@ -1199,7 +1201,7 @@ async fn handle_websocket_request_authenticated(
     }
 
     // Create the upgrade response with proper headers
-    let upgrade_response = Response::builder()
+    let mut ws_resp_builder = Response::builder()
         .status(StatusCode::SWITCHING_PROTOCOLS)
         .header("upgrade", "websocket")
         .header("connection", "upgrade")
@@ -1213,7 +1215,26 @@ async fn handle_websocket_request_authenticated(
                     .unwrap_or("")
                     .as_bytes(),
             ),
-        )
+        );
+
+    // Inject sticky session cookie on WebSocket upgrade responses
+    if sticky_cookie_needed
+        && let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, &current_target)
+    {
+        let strategy = state.load_balancer_cache.get_hash_on_strategy(upstream_id);
+        if let HashOnStrategy::Cookie(ref cookie_name) = strategy {
+            let upstream = state.load_balancer_cache.get_upstream(upstream_id);
+            let default_cc = crate::config::types::HashOnCookieConfig::default();
+            let cookie_config = upstream
+                .as_ref()
+                .and_then(|u| u.hash_on_cookie_config.as_ref())
+                .unwrap_or(&default_cc);
+            let cookie_val = build_sticky_cookie_header(cookie_name, target, cookie_config);
+            ws_resp_builder = ws_resp_builder.header("set-cookie", cookie_val);
+        }
+    }
+
+    let upgrade_response = ws_resp_builder
         .body(ProxyBody::empty())
         .unwrap_or_else(|_| Response::new(ProxyBody::empty()));
 
@@ -2280,13 +2301,24 @@ pub async fn handle_proxy_request(
     let proxy_headers: &HashMap<String, String> =
         owned_proxy_headers.as_ref().unwrap_or(&ctx.headers);
 
+    // Resolve the consistent-hashing key for upstream target selection and retries.
+    // Pre-computed here so all code paths (initial select, WS/gRPC/HTTP retries) share the same key.
+    let lb_hash_key = if let Some(upstream_id) = &proxy.upstream_id {
+        let strategy = state.load_balancer_cache.get_hash_on_strategy(upstream_id);
+        let (key, needs_set) = resolve_hash_key(&strategy, &ctx.client_ip, proxy_headers);
+        (key, needs_set)
+    } else {
+        (ctx.client_ip.clone(), false)
+    };
+
     // Resolve upstream target if load balancing is configured.
     // Done before protocol dispatch so all protocols (HTTP, gRPC, WebSocket) can use it.
-    let (upstream_target, upstream_is_fallback) = if let Some(upstream_id) = &proxy.upstream_id {
-        let hash_key = ctx.client_ip.clone(); // Default hash key for consistent hashing
+    let (upstream_target, upstream_is_fallback, sticky_cookie_needed) = if let Some(upstream_id) =
+        &proxy.upstream_id
+    {
         match state.load_balancer_cache.select_target(
             upstream_id,
-            &hash_key,
+            &lb_hash_key.0,
             Some(&state.health_checker.unhealthy_targets),
         ) {
             Some(selection) => {
@@ -2307,15 +2339,15 @@ pub async fn handle_proxy_request(
                         "Upstream target selected"
                     );
                 }
-                (Some(selection.target), selection.is_fallback)
+                (Some(selection.target), selection.is_fallback, lb_hash_key.1)
             }
             None => {
                 warn!(proxy_id = %proxy.id, upstream_id = %upstream_id, "No upstream target available");
-                (None, false)
+                (None, false, false)
             }
         }
     } else {
-        (None, false)
+        (None, false, false)
     };
 
     // Circuit breaker check — per-target when upstream is configured, per-proxy otherwise
@@ -2362,6 +2394,8 @@ pub async fn handle_proxy_request(
             plugins,
             plugin_execution_ns,
             upstream_target,
+            lb_hash_key.0,
+            sticky_cookie_needed,
         )
         .await;
     }
@@ -2456,7 +2490,7 @@ pub async fn handle_proxy_request(
                     (&proxy.upstream_id, &grpc_current_target)
                     && let Some(next) = state.load_balancer_cache.select_next_target(
                         upstream_id,
-                        &ctx.client_ip,
+                        &lb_hash_key.0,
                         prev_target,
                         Some(&state.health_checker.unhealthy_targets),
                     )
@@ -2576,6 +2610,31 @@ pub async fn handle_proxy_request(
                     };
                     for plugin in plugins.iter() {
                         plugin.log(&summary).await;
+                    }
+                }
+
+                // Inject sticky session cookie for gRPC responses
+                if sticky_cookie_needed
+                    && let (Some(upstream_id), Some(target)) =
+                        (&proxy.upstream_id, &upstream_target)
+                {
+                    let strategy = state.load_balancer_cache.get_hash_on_strategy(upstream_id);
+                    if let HashOnStrategy::Cookie(ref cookie_name) = strategy {
+                        let upstream = state.load_balancer_cache.get_upstream(upstream_id);
+                        let default_cc = crate::config::types::HashOnCookieConfig::default();
+                        let cookie_config = upstream
+                            .as_ref()
+                            .and_then(|u| u.hash_on_cookie_config.as_ref())
+                            .unwrap_or(&default_cc);
+                        let cookie_val =
+                            build_sticky_cookie_header(cookie_name, target, cookie_config);
+                        response_headers
+                            .entry("set-cookie".to_string())
+                            .and_modify(|v| {
+                                v.push('\n');
+                                v.push_str(&cookie_val);
+                            })
+                            .or_insert(cookie_val);
                     }
                 }
 
@@ -2764,7 +2823,7 @@ pub async fn handle_proxy_request(
             if let (Some(upstream_id), Some(prev_target)) = (&proxy.upstream_id, &current_target)
                 && let Some(next) = state.load_balancer_cache.select_next_target(
                     upstream_id,
-                    &ctx.client_ip,
+                    &lb_hash_key.0,
                     prev_target,
                     Some(&state.health_checker.unhealthy_targets),
                 )
@@ -3043,6 +3102,30 @@ pub async fn handle_proxy_request(
 
         for plugin in plugins.iter() {
             plugin.log(&summary).await;
+        }
+    }
+
+    // Inject sticky session cookie when cookie-based consistent hashing selected a new session
+    if sticky_cookie_needed
+        && let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, &upstream_target)
+    {
+        let strategy = state.load_balancer_cache.get_hash_on_strategy(upstream_id);
+        if let HashOnStrategy::Cookie(ref cookie_name) = strategy {
+            let upstream = state.load_balancer_cache.get_upstream(upstream_id);
+            let default_cc = crate::config::types::HashOnCookieConfig::default();
+            let cookie_config = upstream
+                .as_ref()
+                .and_then(|u| u.hash_on_cookie_config.as_ref())
+                .unwrap_or(&default_cc);
+            let cookie_val = build_sticky_cookie_header(cookie_name, target, cookie_config);
+            // Append to existing set-cookie or create new entry (newline-separated)
+            response_headers
+                .entry("set-cookie".to_string())
+                .and_modify(|v| {
+                    v.push('\n');
+                    v.push_str(&cookie_val);
+                })
+                .or_insert(cookie_val);
         }
     }
 
@@ -3925,6 +4008,77 @@ async fn collect_response_with_limit(
     }
     let len = body.len();
     Ok((body, len))
+}
+
+/// Resolve the consistent-hashing key based on the upstream's `hash_on` strategy.
+///
+/// Returns `(hash_key, needs_cookie_set)`:
+/// - `needs_cookie_set` is true when the strategy is cookie-based and the cookie
+///   was not present in the request (a new sticky session needs to be established).
+fn resolve_hash_key(
+    strategy: &HashOnStrategy,
+    client_ip: &str,
+    headers: &HashMap<String, String>,
+) -> (String, bool) {
+    match strategy {
+        HashOnStrategy::Ip => (client_ip.to_string(), false),
+        HashOnStrategy::Header(name) => {
+            // Header names in ctx.headers are stored as-is from hyper (lowercased)
+            let value = headers.get(name.as_str()).cloned().unwrap_or_default();
+            if value.is_empty() {
+                (client_ip.to_string(), false)
+            } else {
+                (value, false)
+            }
+        }
+        HashOnStrategy::Cookie(name) => {
+            // Parse the Cookie header to find the named cookie
+            if let Some(cookie_header) = headers.get("cookie") {
+                for part in cookie_header.split(';') {
+                    let part = part.trim();
+                    if let Some((k, v)) = part.split_once('=')
+                        && k.trim() == name.as_str()
+                    {
+                        let v = v.trim();
+                        if !v.is_empty() {
+                            return (v.to_string(), false);
+                        }
+                    }
+                }
+            }
+            // Cookie not found — use IP and signal that we need to set the cookie
+            (client_ip.to_string(), true)
+        }
+    }
+}
+
+/// Build a `Set-Cookie` header value for sticky session cookie injection.
+fn build_sticky_cookie_header(
+    cookie_name: &str,
+    target: &UpstreamTarget,
+    config: &crate::config::types::HashOnCookieConfig,
+) -> String {
+    use crate::load_balancer::target_key;
+    let value = target_key(target);
+    let mut cookie = format!(
+        "{}={}; Path={}; Max-Age={}",
+        cookie_name, value, config.path, config.ttl_seconds
+    );
+    if config.http_only {
+        cookie.push_str("; HttpOnly");
+    }
+    if config.secure {
+        cookie.push_str("; Secure");
+    }
+    if let Some(ref domain) = config.domain {
+        cookie.push_str("; Domain=");
+        cookie.push_str(domain);
+    }
+    if let Some(ref same_site) = config.same_site {
+        cookie.push_str("; SameSite=");
+        cookie.push_str(same_site);
+    }
+    cookie
 }
 
 fn strip_query_params(url: &str) -> &str {

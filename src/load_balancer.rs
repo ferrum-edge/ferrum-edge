@@ -11,6 +11,49 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
+/// Parsed strategy for resolving the hash key used by consistent hashing.
+/// Pre-computed at config-reload time so the request path does no string parsing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HashOnStrategy {
+    /// Hash on client IP address (default).
+    Ip,
+    /// Hash on the value of a request header (lowercased name).
+    Header(String),
+    /// Hash on the value of a request cookie.
+    Cookie(String),
+}
+
+impl HashOnStrategy {
+    /// Parse a `hash_on` config string into a strategy.
+    ///
+    /// Accepted formats:
+    /// - `None` or `"ip"` → `HashOnStrategy::Ip`
+    /// - `"header:<name>"` → `HashOnStrategy::Header(name)` (lowercased)
+    /// - `"cookie:<name>"` → `HashOnStrategy::Cookie(name)`
+    pub fn parse(hash_on: Option<&str>) -> Self {
+        match hash_on {
+            None | Some("ip") | Some("") => Self::Ip,
+            Some(s) if s.starts_with("header:") => {
+                let name = s["header:".len()..].trim();
+                if name.is_empty() {
+                    Self::Ip
+                } else {
+                    Self::Header(name.to_ascii_lowercase())
+                }
+            }
+            Some(s) if s.starts_with("cookie:") => {
+                let name = s["cookie:".len()..].trim();
+                if name.is_empty() {
+                    Self::Ip
+                } else {
+                    Self::Cookie(name.to_string())
+                }
+            }
+            Some(_) => Self::Ip, // Unknown format, fall back to IP
+        }
+    }
+}
+
 /// Default EWMA smoothing factor, stored as fixed-point with 1000 = 1.0.
 /// 300 = 0.3 — gives recent samples ~30% influence per update, balancing
 /// responsiveness to latency changes against noise from individual spikes.
@@ -177,6 +220,16 @@ impl LoadBalancerCache {
         self.upstreams.store(Arc::new(new_upstreams));
     }
 
+    /// Get the pre-parsed hash-on strategy for an upstream.
+    /// Returns `HashOnStrategy::Ip` if the upstream is not found.
+    pub fn get_hash_on_strategy(&self, upstream_id: &str) -> HashOnStrategy {
+        let balancers = self.balancers.load();
+        balancers
+            .get(upstream_id)
+            .map(|b| b.hash_on_strategy.clone())
+            .unwrap_or(HashOnStrategy::Ip)
+    }
+
     /// Select a target from the upstream, filtering out unhealthy targets.
     ///
     /// Returns a [`TargetSelection`] indicating whether the target came from
@@ -319,13 +372,15 @@ pub struct LoadBalancer {
     /// round-robin is used to ensure all targets get enough traffic to establish
     /// baseline latency measurements.
     pub latency_sample_count: DashMap<String, AtomicU64>,
+    /// Pre-parsed hash-on strategy for consistent hashing key resolution.
+    pub hash_on_strategy: HashOnStrategy,
 }
 
 impl LoadBalancer {
     pub fn new(
         algorithm: LoadBalancerAlgorithm,
         targets: &[UpstreamTarget],
-        _hash_on: Option<String>,
+        hash_on: Option<String>,
     ) -> Self {
         let wrr_weights: Vec<i64> = vec![0; targets.len()];
         // Pre-compute target keys once at build time, not per-request
@@ -356,6 +411,8 @@ impl LoadBalancer {
             }
         }
 
+        let hash_on_strategy = HashOnStrategy::parse(hash_on.as_deref());
+
         Self {
             targets: targets.to_vec(),
             target_keys,
@@ -366,6 +423,7 @@ impl LoadBalancer {
             hash_ring,
             latency_ewma,
             latency_sample_count,
+            hash_on_strategy,
         }
     }
 

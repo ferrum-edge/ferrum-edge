@@ -173,6 +173,7 @@ fn test_load_balancer_cache() {
             targets: make_targets(2),
             algorithm: LoadBalancerAlgorithm::RoundRobin,
             hash_on: None,
+            hash_on_cookie_config: None,
             health_checks: None,
             service_discovery: None,
             created_at: chrono::Utc::now(),
@@ -494,6 +495,7 @@ fn test_least_latency_cache_record_and_select() {
             targets: targets.clone(),
             algorithm: LoadBalancerAlgorithm::LeastLatency,
             hash_on: None,
+            hash_on_cookie_config: None,
             health_checks: None,
             service_discovery: None,
             created_at: chrono::Utc::now(),
@@ -692,4 +694,129 @@ fn test_least_latency_record_for_nonexistent_target() {
         .unwrap()
         .load(Ordering::Relaxed);
     assert_eq!(ewma, 1_000);
+}
+
+// ─── HashOnStrategy Tests ───────────────────────────────────────────────────
+
+use ferrum_gateway::load_balancer::HashOnStrategy;
+
+#[test]
+fn test_hash_on_strategy_parse_defaults_to_ip() {
+    assert_eq!(HashOnStrategy::parse(None), HashOnStrategy::Ip);
+    assert_eq!(HashOnStrategy::parse(Some("")), HashOnStrategy::Ip);
+    assert_eq!(HashOnStrategy::parse(Some("ip")), HashOnStrategy::Ip);
+    assert_eq!(HashOnStrategy::parse(Some("unknown")), HashOnStrategy::Ip);
+}
+
+#[test]
+fn test_hash_on_strategy_parse_header() {
+    assert_eq!(
+        HashOnStrategy::parse(Some("header:X-User-Id")),
+        HashOnStrategy::Header("x-user-id".to_string())
+    );
+    assert_eq!(
+        HashOnStrategy::parse(Some("header:x-session")),
+        HashOnStrategy::Header("x-session".to_string())
+    );
+    // Empty header name falls back to IP
+    assert_eq!(HashOnStrategy::parse(Some("header:")), HashOnStrategy::Ip);
+    assert_eq!(HashOnStrategy::parse(Some("header:  ")), HashOnStrategy::Ip);
+}
+
+#[test]
+fn test_hash_on_strategy_parse_cookie() {
+    assert_eq!(
+        HashOnStrategy::parse(Some("cookie:session")),
+        HashOnStrategy::Cookie("session".to_string())
+    );
+    assert_eq!(
+        HashOnStrategy::parse(Some("cookie:srv_id")),
+        HashOnStrategy::Cookie("srv_id".to_string())
+    );
+    // Empty cookie name falls back to IP
+    assert_eq!(HashOnStrategy::parse(Some("cookie:")), HashOnStrategy::Ip);
+}
+
+#[test]
+fn test_hash_on_strategy_stored_in_load_balancer() {
+    let targets = make_targets(2);
+    let lb = LoadBalancer::new(
+        LoadBalancerAlgorithm::ConsistentHashing,
+        &targets,
+        Some("header:x-tenant".to_string()),
+    );
+    assert_eq!(
+        lb.hash_on_strategy,
+        HashOnStrategy::Header("x-tenant".to_string())
+    );
+}
+
+#[test]
+fn test_consistent_hash_different_keys_different_targets() {
+    // With consistent hashing and enough targets, different hash keys should
+    // (with high probability) map to different targets.
+    let targets = make_targets(10);
+    let lb = LoadBalancer::new(
+        LoadBalancerAlgorithm::ConsistentHashing,
+        &targets,
+        Some("header:x-user".to_string()),
+    );
+
+    let mut selected = std::collections::HashSet::new();
+    for i in 0..50 {
+        let key = format!("user-{}", i);
+        let sel = lb.select(&key, None).unwrap();
+        selected.insert(sel.target.host.clone());
+    }
+    // With 10 targets and 50 diverse keys, we should hit multiple different targets
+    assert!(
+        selected.len() > 1,
+        "Expected multiple different targets, got {:?}",
+        selected
+    );
+}
+
+#[test]
+fn test_consistent_hash_sticky_same_key_same_target() {
+    let targets = make_targets(5);
+    let lb = LoadBalancer::new(LoadBalancerAlgorithm::ConsistentHashing, &targets, None);
+
+    // Same key should always map to the same target
+    let first = lb.select("sticky-user-123", None).unwrap();
+    for _ in 0..100 {
+        let sel = lb.select("sticky-user-123", None).unwrap();
+        assert_eq!(sel.target.host, first.target.host);
+        assert_eq!(sel.target.port, first.target.port);
+    }
+}
+
+#[test]
+fn test_load_balancer_cache_get_hash_on_strategy() {
+    let config = GatewayConfig {
+        version: "1".to_string(),
+        upstreams: vec![Upstream {
+            id: "us1".into(),
+            name: Some("test".into()),
+            targets: make_targets(2),
+            algorithm: LoadBalancerAlgorithm::ConsistentHashing,
+            hash_on: Some("cookie:srv".to_string()),
+            hash_on_cookie_config: None,
+            health_checks: None,
+            service_discovery: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }],
+        ..Default::default()
+    };
+
+    let cache = LoadBalancerCache::new(&config);
+    assert_eq!(
+        cache.get_hash_on_strategy("us1"),
+        HashOnStrategy::Cookie("srv".to_string())
+    );
+    // Non-existent upstream returns Ip default
+    assert_eq!(
+        cache.get_hash_on_strategy("nonexistent"),
+        HashOnStrategy::Ip
+    );
 }

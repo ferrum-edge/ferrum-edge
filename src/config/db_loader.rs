@@ -821,14 +821,21 @@ impl DatabaseStore {
             .map(serde_json::to_string)
             .transpose()?;
 
+        let hash_on_cookie_config_json = upstream
+            .hash_on_cookie_config
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
+
         sqlx::query(
-            &self.q("INSERT INTO upstreams (id, name, targets, algorithm, hash_on, health_checks, service_discovery, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
+            &self.q("INSERT INTO upstreams (id, name, targets, algorithm, hash_on, hash_on_cookie_config, health_checks, service_discovery, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
         )
         .bind(&upstream.id)
         .bind(&upstream.name)
         .bind(&targets_json)
         .bind(algo_str)
         .bind(&upstream.hash_on)
+        .bind(&hash_on_cookie_config_json)
         .bind(&health_checks_json)
         .bind(&service_discovery_json)
         .bind(upstream.created_at.to_rfc3339())
@@ -854,13 +861,20 @@ impl DatabaseStore {
             .map(serde_json::to_string)
             .transpose()?;
 
+        let hash_on_cookie_config_json = upstream
+            .hash_on_cookie_config
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
+
         sqlx::query(
-            &self.q("UPDATE upstreams SET name=?, targets=?, algorithm=?, hash_on=?, health_checks=?, service_discovery=?, updated_at=? WHERE id=?")
+            &self.q("UPDATE upstreams SET name=?, targets=?, algorithm=?, hash_on=?, hash_on_cookie_config=?, health_checks=?, service_discovery=?, updated_at=? WHERE id=?")
         )
         .bind(&upstream.name)
         .bind(&targets_json)
         .bind(algo_str)
         .bind(&upstream.hash_on)
+        .bind(&hash_on_cookie_config_json)
         .bind(&health_checks_json)
         .bind(&service_discovery_json)
         .bind(Utc::now().to_rfc3339())
@@ -1658,12 +1672,17 @@ impl DatabaseStore {
         upstreams: &[Upstream],
     ) -> Result<usize, anyhow::Error> {
         let mut tx = self.pool().begin().await?;
-        let sql = self.q("INSERT INTO upstreams (id, name, targets, algorithm, hash_on, health_checks, service_discovery, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)");
+        let sql = self.q("INSERT INTO upstreams (id, name, targets, algorithm, hash_on, hash_on_cookie_config, health_checks, service_discovery, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
 
         for upstream in upstreams {
             let targets_json = serde_json::to_string(&upstream.targets)?;
             let algo_json = serde_json::to_string(&upstream.algorithm)?;
             let algo_str = algo_json.trim_matches('"');
+            let hash_on_cookie_config_json = upstream
+                .hash_on_cookie_config
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()?;
             let health_checks_json = upstream
                 .health_checks
                 .as_ref()
@@ -1680,6 +1699,7 @@ impl DatabaseStore {
                 .bind(&targets_json)
                 .bind(algo_str)
                 .bind(&upstream.hash_on)
+                .bind(&hash_on_cookie_config_json)
                 .bind(&health_checks_json)
                 .bind(&service_discovery_json)
                 .bind(upstream.created_at.to_rfc3339())
@@ -2416,12 +2436,18 @@ fn row_to_upstream(row: &AnyRow) -> Result<Upstream, anyhow::Error> {
                 .ok()
         });
 
+    let hash_on_cookie_config: Option<crate::config::types::HashOnCookieConfig> = row
+        .try_get::<String, _>("hash_on_cookie_config")
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok());
+
     Ok(Upstream {
         id: row.try_get("id")?,
         name: row.try_get("name").ok(),
         targets,
         algorithm,
         hash_on: row.try_get("hash_on").ok(),
+        hash_on_cookie_config,
         health_checks,
         service_discovery,
         created_at: parse_datetime_column(row, "created_at"),

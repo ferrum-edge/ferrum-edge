@@ -22,10 +22,12 @@ async fn test_migration_runner_fresh_database() {
     let runner = MigrationRunner::new(pool.clone(), "sqlite".to_string());
     let applied = runner.run_pending().await.unwrap();
 
-    // V1 should be applied on a fresh database
-    assert_eq!(applied.len(), 1);
+    // V1 + V2 should be applied on a fresh database
+    assert_eq!(applied.len(), 2);
     assert_eq!(applied[0].version, 1);
     assert_eq!(applied[0].name, "initial_schema");
+    assert_eq!(applied[1].version, 2);
+    assert_eq!(applied[1].name, "hash_on_cookie_config");
 
     // Running again should apply nothing
     let applied_again = runner.run_pending().await.unwrap();
@@ -54,13 +56,16 @@ async fn test_migration_runner_bootstrap_existing_db() {
     let runner = MigrationRunner::new(pool.clone(), "sqlite".to_string());
     let applied = runner.run_pending().await.unwrap();
 
-    // V1 should NOT be applied (bootstrapped instead)
-    assert!(applied.is_empty());
+    // V1 should NOT be applied (bootstrapped instead), but V2 should be applied
+    assert_eq!(applied.len(), 1);
+    assert_eq!(applied[0].version, 2);
+    assert_eq!(applied[0].name, "hash_on_cookie_config");
 
-    // Check that V1 (bootstrapped) is recorded
+    // Check that V1 (bootstrapped) + V2 (applied) are recorded
     let status = runner.status().await.unwrap();
-    assert_eq!(status.applied.len(), 1);
+    assert_eq!(status.applied.len(), 2);
     assert_eq!(status.applied[0].version, 1);
+    assert_eq!(status.applied[1].version, 2);
     assert!(status.pending.is_empty());
 }
 
@@ -73,13 +78,13 @@ async fn test_migration_status() {
     // Before running: everything should be pending
     let status = runner.status().await.unwrap();
     assert!(status.applied.is_empty());
-    assert_eq!(status.pending.len(), 1);
+    assert_eq!(status.pending.len(), 2);
 
     // Run migrations
     runner.run_pending().await.unwrap();
 
     // After running: everything should be applied
     let status = runner.status().await.unwrap();
-    assert_eq!(status.applied.len(), 1);
+    assert_eq!(status.applied.len(), 2);
     assert!(status.pending.is_empty());
 }
