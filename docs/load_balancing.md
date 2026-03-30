@@ -85,7 +85,8 @@ An upstream defines a group of backend targets with load balancing configuration
 | `name` | string | No | — | Human-readable name |
 | `targets` | array | Yes | — | List of backend targets |
 | `algorithm` | string | No | `round_robin` | Load balancing algorithm |
-| `hash_on` | string | No | — | Key for consistent hashing (e.g., `ip`, `header:X-User-Id`) |
+| `hash_on` | string | No | `ip` | Hash key source for consistent hashing: `ip`, `header:<name>`, or `cookie:<name>` |
+| `hash_on_cookie_config` | object | No | — | Cookie attributes for `cookie:<name>` sticky sessions (see [Consistent Hashing](#consistent-hashing)) |
 | `health_checks` | object | No | — | Health check configuration |
 
 ## Targets
@@ -275,27 +276,95 @@ In this setup, a gateway deployed in `us-east` will naturally route most traffic
 
 **Algorithm:** `consistent_hashing`
 
-Routes requests to a target determined by a hash of a context key (by default, the client IP address). The same key always maps to the same target, providing session affinity without server-side session state.
+Routes requests to a target determined by a hash of a configurable key. The same key always maps to the same target, providing session affinity without server-side session state.
 
 Uses 150 virtual nodes per target on a hash ring for uniform distribution.
+
+#### Hash Key Sources
+
+The `hash_on` field controls what value is used as the hash key:
+
+| `hash_on` value | Description | Cookie injection |
+|---|---|---|
+| `ip` (default) | Hash on the client IP address | No |
+| `header:<name>` | Hash on the value of a request header (e.g., `header:x-user-id`) | No |
+| `cookie:<name>` | Hash on the value of a request cookie (e.g., `cookie:session`) | Yes — `Set-Cookie` is injected when the cookie is absent |
+
+When the specified header or cookie is not present in the request, the gateway falls back to the client IP.
+
+#### IP-based (default)
 
 ```yaml
 upstreams:
   - id: "my-upstream"
     algorithm: consistent_hashing
-    hash_on: "ip"                  # optional: hash key source
+    hash_on: "ip"
     targets:
       - host: "10.0.1.1"
         port: 8080
       - host: "10.0.1.2"
         port: 8080
-      - host: "10.0.1.3"
+```
+
+#### Header-based
+
+Route based on an arbitrary request header — useful for tenant-aware routing or gRPC metadata:
+
+```yaml
+upstreams:
+  - id: "tenant-pool"
+    algorithm: consistent_hashing
+    hash_on: "header:x-tenant-id"
+    targets:
+      - host: "10.0.1.1"
+        port: 8080
+      - host: "10.0.1.2"
         port: 8080
 ```
 
+#### Cookie-based (sticky sessions)
+
+When `hash_on` is `cookie:<name>`, the gateway establishes sticky sessions automatically:
+
+1. **First request** (no cookie): The gateway selects a target using the client IP as a fallback key, then injects a `Set-Cookie` response header with the selected target's identifier.
+2. **Subsequent requests** (cookie present): The cookie value is used as the hash key, routing the request to the same target.
+
+```yaml
+upstreams:
+  - id: "session-pool"
+    algorithm: consistent_hashing
+    hash_on: "cookie:srv"
+    hash_on_cookie_config:
+      path: "/"
+      ttl_seconds: 3600
+      http_only: true
+      secure: true
+      same_site: "Lax"
+    targets:
+      - host: "app-1.internal"
+        port: 8080
+      - host: "app-2.internal"
+        port: 8080
+```
+
+##### `hash_on_cookie_config` fields
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `path` | string | `"/"` | Cookie `Path` attribute |
+| `ttl_seconds` | integer | `3600` | Cookie `Max-Age` in seconds (1 hour default) |
+| `domain` | string | — | Optional `Domain` attribute |
+| `http_only` | boolean | `true` | Set the `HttpOnly` flag |
+| `secure` | boolean | `false` | Set the `Secure` flag |
+| `same_site` | string | — | `SameSite` attribute: `Strict`, `Lax`, or `None` |
+
+If `hash_on_cookie_config` is omitted, sensible defaults are used (path `/`, 1 hour TTL, `HttpOnly` enabled).
+
+The sticky session cookie is injected on HTTP, gRPC, and WebSocket (101 Upgrade) responses.
+
 When a target is removed or added, only a fraction of keys are remapped — this minimizes cache invalidation across backends.
 
-**Best for:** Session affinity, caching backends, stateful applications.
+**Best for:** Session affinity, caching backends, stateful applications, multi-tenant routing.
 
 ### Random
 
@@ -695,7 +764,9 @@ Gradually increase the green weight and decrease the blue weight as confidence g
 
 ### Session Affinity with Consistent Hashing
 
-Route the same client to the same backend for session-based applications:
+Route the same client to the same backend for session-based applications. Three approaches are available:
+
+**IP-based** — simplest, no cookies, works behind a single NAT/proxy:
 
 ```yaml
 upstreams:
@@ -708,6 +779,52 @@ upstreams:
       - host: "app-2.internal"
         port: 8080
       - host: "app-3.internal"
+        port: 8080
+    health_checks:
+      active:
+        http_path: "/health"
+        interval_seconds: 5
+        unhealthy_threshold: 3
+```
+
+**Cookie-based** — true sticky sessions that survive NAT/proxy changes:
+
+```yaml
+upstreams:
+  - id: "session-pool"
+    algorithm: consistent_hashing
+    hash_on: "cookie:srv"
+    hash_on_cookie_config:
+      path: "/"
+      ttl_seconds: 7200
+      http_only: true
+      secure: true
+      same_site: "Lax"
+    targets:
+      - host: "app-1.internal"
+        port: 8080
+      - host: "app-2.internal"
+        port: 8080
+      - host: "app-3.internal"
+        port: 8080
+    health_checks:
+      active:
+        http_path: "/health"
+        interval_seconds: 5
+        unhealthy_threshold: 3
+```
+
+**Header-based** — route by tenant, user ID, or any custom header:
+
+```yaml
+upstreams:
+  - id: "tenant-pool"
+    algorithm: consistent_hashing
+    hash_on: "header:x-tenant-id"
+    targets:
+      - host: "app-1.internal"
+        port: 8080
+      - host: "app-2.internal"
         port: 8080
     health_checks:
       active:

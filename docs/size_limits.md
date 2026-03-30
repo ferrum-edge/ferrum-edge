@@ -161,7 +161,11 @@ Beyond request/response size limits, the Admin API enforces validation on all co
 | Field | Limit | Description |
 |-------|-------|-------------|
 | `name` | 255 chars | Optional upstream name |
-| `hash_on` | 255 chars | Consistent hashing key |
+| `hash_on` | 255 chars | Consistent hashing key source (`ip`, `header:<name>`, `cookie:<name>`) |
+| `hash_on_cookie_config.path` | 2048 chars | Cookie `Path` attribute |
+| `hash_on_cookie_config.domain` | 253 chars | Cookie `Domain` attribute |
+| `hash_on_cookie_config.ttl_seconds` | ≤ 86,400 | Cookie `Max-Age` in seconds |
+| `hash_on_cookie_config.same_site` | `Strict` / `Lax` / `None` | Cookie `SameSite` attribute |
 | `targets` | 1000 entries | Maximum targets per upstream |
 | `targets[].host` | 255 chars | Target hostname |
 | `targets[].port` | ≥ 1 | Target port (non-zero) |

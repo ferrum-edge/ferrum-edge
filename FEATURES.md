@@ -29,7 +29,7 @@ A comprehensive feature list for Ferrum Gateway.
 
 ## Load Balancing
 
-- Six algorithms: round robin, weighted round robin, least connections, least latency, consistent hashing, random
+- Six algorithms: round robin, weighted round robin, least connections, least latency, consistent hashing (IP/header/cookie sticky sessions), random
 - Active health checks (HTTP, TCP SYN, UDP probes) with configurable thresholds
 - Passive health monitoring with automatic failover
 - Circuit breaker (Closed/Open/Half-Open) preventing cascading failures
