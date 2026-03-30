@@ -37,29 +37,50 @@ fn connection_failure() -> BackendResponse {
 
 #[test]
 fn test_should_retry_on_retryable_status() {
-    let config = default_config();
+    let config = RetryConfig {
+        retryable_status_codes: vec![502, 503, 504],
+        ..default_config()
+    };
     assert!(should_retry(&config, "GET", &http_response(502), 0));
     assert!(should_retry(&config, "GET", &http_response(503), 0));
     assert!(should_retry(&config, "GET", &http_response(504), 0));
 }
 
 #[test]
-fn test_should_not_retry_on_success() {
+fn test_default_config_no_status_code_retries() {
+    // Default config has empty retryable_status_codes — only connection failures retry.
     let config = default_config();
+    assert!(!should_retry(&config, "GET", &http_response(502), 0));
+    assert!(!should_retry(&config, "GET", &http_response(503), 0));
+    assert!(!should_retry(&config, "GET", &http_response(504), 0));
+}
+
+#[test]
+fn test_should_not_retry_on_success() {
+    let config = RetryConfig {
+        retryable_status_codes: vec![502, 503, 504],
+        ..default_config()
+    };
     assert!(!should_retry(&config, "GET", &http_response(200), 0));
     assert!(!should_retry(&config, "GET", &http_response(404), 0));
 }
 
 #[test]
 fn test_should_not_retry_post_by_default() {
-    let config = default_config();
+    let config = RetryConfig {
+        retryable_status_codes: vec![502],
+        ..default_config()
+    };
     assert!(!should_retry(&config, "POST", &http_response(502), 0));
     assert!(!should_retry(&config, "PATCH", &http_response(502), 0));
 }
 
 #[test]
 fn test_should_retry_put_and_delete() {
-    let config = default_config();
+    let config = RetryConfig {
+        retryable_status_codes: vec![503],
+        ..default_config()
+    };
     assert!(should_retry(&config, "PUT", &http_response(503), 0));
     assert!(should_retry(&config, "DELETE", &http_response(503), 0));
 }
@@ -68,6 +89,7 @@ fn test_should_retry_put_and_delete() {
 fn test_max_retries_exceeded() {
     let config = RetryConfig {
         max_retries: 2,
+        retryable_status_codes: vec![502],
         ..default_config()
     };
     assert!(should_retry(&config, "GET", &http_response(502), 0));
@@ -118,7 +140,10 @@ fn test_exponential_backoff() {
 
 #[test]
 fn test_case_insensitive_method_matching() {
-    let config = default_config();
+    let config = RetryConfig {
+        retryable_status_codes: vec![502],
+        ..default_config()
+    };
     assert!(should_retry(&config, "get", &http_response(502), 0));
     assert!(should_retry(&config, "Get", &http_response(502), 0));
 }
@@ -163,10 +188,23 @@ fn test_http_502_not_retried_when_removed_from_status_codes() {
 }
 
 #[test]
-fn test_connection_failure_still_respects_method_filter() {
+fn test_connection_failure_ignores_method_filter() {
+    // Connection failures retry regardless of HTTP method — the request
+    // never reached the backend so idempotency is not a concern.
     let config = default_config();
-    // POST is not in default retryable_methods
-    assert!(!should_retry(&config, "POST", &connection_failure(), 0));
+    assert!(should_retry(&config, "POST", &connection_failure(), 0));
+    assert!(should_retry(&config, "PATCH", &connection_failure(), 0));
+}
+
+#[test]
+fn test_status_code_retry_respects_method_filter() {
+    // HTTP status-code retries should still respect retryable_methods.
+    let config = RetryConfig {
+        retryable_status_codes: vec![502],
+        ..default_config()
+    };
+    assert!(!should_retry(&config, "POST", &http_response(502), 0));
+    assert!(should_retry(&config, "GET", &http_response(502), 0));
 }
 
 #[test]

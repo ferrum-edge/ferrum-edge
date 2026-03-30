@@ -512,7 +512,7 @@ fn default_max_retries() -> u32 {
     3
 }
 fn default_retryable_status_codes() -> Vec<u16> {
-    vec![502, 503, 504]
+    vec![]
 }
 fn default_retryable_methods() -> Vec<String> {
     vec![

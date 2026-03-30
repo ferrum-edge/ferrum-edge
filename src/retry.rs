@@ -295,16 +295,21 @@ pub fn should_retry(
         return false;
     }
 
+    // Connection-level failures (TCP refused, DNS, TLS, timeout) are retried
+    // regardless of HTTP method — the request never reached the backend so
+    // idempotency is not a concern.
+    if response.connection_error {
+        return config.retry_on_connect_failure;
+    }
+
+    // HTTP status-code retries only apply to configured methods (guards
+    // against non-idempotent replays like POST).
     if !config
         .retryable_methods
         .iter()
         .any(|m| m.eq_ignore_ascii_case(method))
     {
         return false;
-    }
-
-    if response.connection_error {
-        return config.retry_on_connect_failure;
     }
 
     config

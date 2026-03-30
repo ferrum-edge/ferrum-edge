@@ -33,7 +33,7 @@ Ferrum Gateway is a lightweight, extensible API gateway designed for modern micr
 - **Load Balancing**: Five algorithms (RoundRobin, Weighted, LeastConnections, ConsistentHash, Random) with unhealthy target filtering
 - **Health Checking**: Active probes (HTTP, TCP SYN, UDP) and passive status monitoring with configurable thresholds
 - **Circuit Breaker**: Three-state pattern (Closed/Open/Half-Open) preventing cascading failures
-- **Retry Logic**: Connection and HTTP-level retries with fixed/exponential backoff strategies
+- **Retry Logic**: Connection and HTTP-level retries with fixed/exponential backoff strategies for HTTP/1.1, HTTP/2, HTTP/3, gRPC, and WebSocket — see [docs/retry.md](docs/retry.md)
 - **Service Discovery**: Dynamic upstream target resolution via DNS-SD, Kubernetes, and Consul providers with background polling and static+dynamic target merging
 - **Advanced TLS Hardening**: Configurable cipher suites, key exchange groups, and protocol versions
 

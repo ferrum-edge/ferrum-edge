@@ -431,6 +431,8 @@ HTTP/1.1 200 OK
 
 When a request to a backend target fails, the retry system can automatically retry to a **different** target in the upstream. This provides automatic failover without client-side retry logic.
 
+> For comprehensive retry documentation including configuration reference, backoff strategies, protocol support, and examples, see [Retry Logic](retry.md).
+
 ```yaml
 proxies:
   - id: "my-api"
@@ -442,56 +444,27 @@ proxies:
     retry:
       max_retries: 3
       retryable_status_codes: [502, 503, 504]
-      retryable_methods: ["GET", "HEAD", "OPTIONS", "PUT", "DELETE"]
       retry_on_connect_failure: true
-      backoff: !fixed
-        delay_ms: 100
+      backoff: !exponential
+        base_ms: 100
+        max_ms: 5000
 ```
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `max_retries` | integer | `3` | Maximum number of retry attempts |
-| `retryable_status_codes` | array | `[502, 503, 504]` | HTTP status codes that trigger a retry |
-| `retryable_methods` | array | `["GET", "HEAD", "OPTIONS", "PUT", "DELETE"]` | HTTP methods eligible for retry |
-| `retry_on_connect_failure` | boolean | `true` | Retry on TCP/connection failures |
+| `retryable_status_codes` | array | `[]` (empty) | HTTP status codes that trigger a retry — empty by default (connection-failure-only) |
+| `retryable_methods` | array | `["GET", "HEAD", "OPTIONS", "PUT", "DELETE"]` | HTTP methods eligible for status-code retries (connection failure retries ignore this) |
+| `retry_on_connect_failure` | boolean | `true` | Retry on TCP/connection failures (refused, timeout, DNS, TLS) |
 | `backoff` | tagged enum | `!fixed { delay_ms: 100 }` | Backoff strategy between retries |
 
-### Backoff Strategies
+### Key Behaviors
 
-Backoff strategies use YAML tags to select the variant:
-
-**Fixed backoff:**
-```yaml
-backoff: !fixed
-  delay_ms: 100    # wait 100ms between each retry
-```
-
-**Exponential backoff:**
-```yaml
-backoff: !exponential
-  base_ms: 100     # first retry after 100ms
-  max_ms: 5000     # cap at 5 seconds
-```
-
-With exponential backoff, delays are: 100ms, 200ms, 400ms, 800ms, 1600ms, ..., capped at `max_ms`.
-
-### Connection Failures vs. HTTP Failures
-
-The retry system distinguishes between two types of failures:
-
-1. **Connection failures** — TCP connect refused, DNS resolution failure, TLS handshake error, connect timeout. These are retried when `retry_on_connect_failure: true`, regardless of `retryable_status_codes`.
-
-2. **HTTP status failures** — Actual HTTP responses with status codes like 502, 503. These are retried only when the status code is in `retryable_status_codes`.
-
-This distinction prevents situations where a proxy upstream returns a real HTTP 502 but you've removed 502 from `retryable_status_codes` — connection-level failures are still retried.
-
-### Retry with Load Balancing
-
-When retry is combined with an upstream, retries use `select_next_target()` which **excludes the previously tried target**. This ensures retries go to a different backend, maximizing the chance of success.
-
-### Non-retryable Methods
-
-By default, `POST` and `PATCH` are **not** retried because they are typically non-idempotent. You can override this by adding them to `retryable_methods` if your backend handles duplicate requests safely.
+- **Connection failures** (TCP refused, DNS, TLS, timeout) are retried for **all HTTP methods** — the request never reached the backend so idempotency is not a concern.
+- **HTTP status-code failures** (e.g., 502, 503) are only retried for methods in `retryable_methods` — `POST` and `PATCH` are excluded by default.
+- **Status-code retries are opt-in** — `retryable_status_codes` defaults to empty. Set it explicitly to enable (e.g., `[502, 503, 504]`).
+- When combined with an upstream, retries **exclude the previously tried target** so each attempt goes to a different backend.
+- Retries apply to HTTP/1.1, HTTP/2, HTTP/3, gRPC, and WebSocket protocols. TCP and UDP stream proxies do not use retry logic.
 
 ## Circuit Breaker
 
@@ -543,7 +516,6 @@ proxies:
     retry:
       max_retries: 3
       retryable_status_codes: [502, 503, 504]
-      retryable_methods: ["GET", "HEAD", "OPTIONS", "PUT", "DELETE"]
       retry_on_connect_failure: true
       backoff: !exponential
         base_ms: 100

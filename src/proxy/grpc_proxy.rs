@@ -18,8 +18,9 @@
 //!
 //! gRPC metadata maps to HTTP/2 headers, so existing auth plugins work unchanged.
 
+use bytes::Bytes;
 use dashmap::DashMap;
-use http_body_util::BodyExt;
+use http_body_util::{BodyExt, Full};
 use hyper::Request;
 use hyper::body::Incoming;
 use hyper::client::conn::http2;
@@ -38,7 +39,7 @@ use crate::tls::NoVerifier;
 
 /// Pool entry tracking a sender handle and its last-used timestamp.
 struct GrpcPoolEntry {
-    sender: http2::SendRequest<Incoming>,
+    sender: http2::SendRequest<Full<Bytes>>,
     last_used_epoch_ms: Arc<AtomicU64>,
 }
 
@@ -133,7 +134,7 @@ impl GrpcConnectionPool {
         &self,
         proxy: &Proxy,
         dns_cache: &DnsCache,
-    ) -> Result<http2::SendRequest<Incoming>, GrpcProxyError> {
+    ) -> Result<http2::SendRequest<Full<Bytes>>, GrpcProxyError> {
         let base_key = Self::pool_key(proxy);
         let pool_config = self.global_pool_config.for_proxy(proxy);
         let shard_count = pool_config.http2_connections_per_host.max(1);
@@ -249,7 +250,7 @@ impl GrpcConnectionPool {
         &self,
         proxy: &Proxy,
         dns_cache: &DnsCache,
-    ) -> Result<http2::SendRequest<Incoming>, GrpcProxyError> {
+    ) -> Result<http2::SendRequest<Full<Bytes>>, GrpcProxyError> {
         let host = &proxy.backend_host;
         let port = proxy.backend_port;
 
@@ -356,7 +357,7 @@ impl GrpcConnectionPool {
         &self,
         tcp: TcpStream,
         pool_config: &PoolConfig,
-    ) -> Result<http2::SendRequest<Incoming>, GrpcProxyError> {
+    ) -> Result<http2::SendRequest<Full<Bytes>>, GrpcProxyError> {
         let io = TokioIo::new(tcp);
         let builder = Self::build_h2_builder(pool_config);
 
@@ -381,7 +382,7 @@ impl GrpcConnectionPool {
         host: &str,
         proxy: &Proxy,
         pool_config: &PoolConfig,
-    ) -> Result<http2::SendRequest<Incoming>, GrpcProxyError> {
+    ) -> Result<http2::SendRequest<Full<Bytes>>, GrpcProxyError> {
         use rustls::pki_types::ServerName;
         use tokio_rustls::TlsConnector;
 
@@ -588,11 +589,80 @@ pub struct GrpcResponse {
 
 /// Proxy a gRPC request to the backend using hyper's HTTP/2 client.
 ///
-/// Collects the response body and trailers from the backend, returning them
-/// in a `GrpcResponse` that the caller can pack into the final HTTP/2 response
-/// with trailers forwarded as headers (Trailers-Only encoding).
+/// Collects the incoming request body, then delegates to the core send logic.
+/// Returns the collected request body bytes alongside the result so the caller
+/// can replay them on retry.
 pub async fn proxy_grpc_request(
     req: Request<Incoming>,
+    proxy: &Proxy,
+    backend_url: &str,
+    grpc_pool: &GrpcConnectionPool,
+    dns_cache: &DnsCache,
+    proxy_headers: &HashMap<String, String>,
+) -> (Result<GrpcResponse, GrpcProxyError>, Bytes) {
+    // Collect the incoming body for potential retry replay
+    let (parts, body) = req.into_parts();
+    let body_bytes = match BodyExt::collect(body).await {
+        Ok(collected) => collected.to_bytes(),
+        Err(e) => {
+            return (
+                Err(GrpcProxyError::Internal(format!(
+                    "Failed to read request body: {}",
+                    e
+                ))),
+                Bytes::new(),
+            );
+        }
+    };
+
+    let result = proxy_grpc_request_core(
+        parts.method.clone(),
+        parts.headers.clone(),
+        body_bytes.clone(),
+        proxy,
+        backend_url,
+        grpc_pool,
+        dns_cache,
+        proxy_headers,
+    )
+    .await;
+
+    (result, body_bytes)
+}
+
+/// Proxy a gRPC request using pre-collected body bytes.
+///
+/// Used for retry attempts where the request body has already been buffered.
+#[allow(clippy::too_many_arguments)]
+pub async fn proxy_grpc_request_from_bytes(
+    method: hyper::Method,
+    headers: hyper::HeaderMap,
+    body_bytes: Bytes,
+    proxy: &Proxy,
+    backend_url: &str,
+    grpc_pool: &GrpcConnectionPool,
+    dns_cache: &DnsCache,
+    proxy_headers: &HashMap<String, String>,
+) -> Result<GrpcResponse, GrpcProxyError> {
+    proxy_grpc_request_core(
+        method,
+        headers,
+        body_bytes,
+        proxy,
+        backend_url,
+        grpc_pool,
+        dns_cache,
+        proxy_headers,
+    )
+    .await
+}
+
+/// Core gRPC proxy logic shared by initial requests and retries.
+#[allow(clippy::too_many_arguments)]
+async fn proxy_grpc_request_core(
+    method: hyper::Method,
+    mut headers: hyper::HeaderMap,
+    body_bytes: Bytes,
     proxy: &Proxy,
     backend_url: &str,
     grpc_pool: &GrpcConnectionPool,
@@ -606,15 +676,9 @@ pub async fn proxy_grpc_request(
         .parse()
         .map_err(|e| GrpcProxyError::Internal(format!("Invalid backend URL: {}", e)))?;
 
-    // Build the backend request preserving method, path, and gRPC headers
-    let (mut parts, body) = req.into_parts();
-
-    // Set the full URI including scheme and authority for HTTP/2 pseudo-headers
-    parts.uri = uri;
-
     // Clear hop-by-hop headers
-    parts.headers.remove("connection");
-    parts.headers.remove("transfer-encoding");
+    headers.remove("connection");
+    headers.remove("transfer-encoding");
 
     // Apply proxy headers from the plugin pipeline (before_proxy transformations)
     for (k, v) in proxy_headers {
@@ -622,11 +686,14 @@ pub async fn proxy_grpc_request(
             hyper::header::HeaderName::from_bytes(k.as_bytes()),
             hyper::header::HeaderValue::from_str(v),
         ) {
-            parts.headers.insert(name, val);
+            headers.insert(name, val);
         }
     }
 
-    let backend_req = Request::from_parts(parts, body);
+    let mut backend_req = Request::new(Full::new(body_bytes));
+    *backend_req.method_mut() = method;
+    *backend_req.uri_mut() = uri;
+    *backend_req.headers_mut() = headers;
 
     // Send to backend with read timeout
     let read_timeout = Duration::from_millis(proxy.backend_read_timeout_ms);

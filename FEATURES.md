@@ -33,7 +33,7 @@ A comprehensive feature list for Ferrum Gateway.
 - Active health checks (HTTP, TCP SYN, UDP probes) with configurable thresholds
 - Passive health monitoring with automatic failover
 - Circuit breaker (Closed/Open/Half-Open) preventing cascading failures
-- Retry logic with fixed and exponential backoff strategies
+- Retry logic with fixed and exponential backoff strategies for HTTP/1.1, HTTP/2, HTTP/3, gRPC, and WebSocket — see [docs/retry.md](docs/retry.md)
 
 ## Service Discovery
 

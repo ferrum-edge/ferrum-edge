@@ -929,6 +929,7 @@ fn set_tcp_keepalive(stream: &tokio::net::TcpStream) {
 }
 
 /// Handle WebSocket requests AFTER authentication and authorization plugins have run
+#[allow(clippy::too_many_arguments)]
 async fn handle_websocket_request_authenticated(
     req: Request<Incoming>,
     state: ProxyState,
@@ -937,6 +938,7 @@ async fn handle_websocket_request_authenticated(
     ctx: RequestContext,
     plugins: Arc<Vec<Arc<dyn Plugin>>>,
     plugin_execution_ns: u64,
+    upstream_target: Option<UpstreamTarget>,
 ) -> Result<Response<ProxyBody>, hyper::Error> {
     info!(
         "WebSocket upgrade request authenticated for proxy: {} from: {}",
@@ -944,9 +946,21 @@ async fn handle_websocket_request_authenticated(
         remote_addr.ip()
     );
 
-    // Build backend URL using the standard URL builder (respects strip_listen_path, backend_path, query)
-    let query_string = req.uri().query().unwrap_or("");
-    let backend_url = build_websocket_backend_url(&proxy, &ctx.path, query_string);
+    // Build backend URL using upstream target if available
+    let query_string = req.uri().query().unwrap_or("").to_string();
+    let (effective_host, effective_port) = if let Some(ref target) = upstream_target {
+        (target.host.as_str(), target.port)
+    } else {
+        (proxy.backend_host.as_str(), proxy.backend_port)
+    };
+    let backend_url = build_websocket_backend_url_with_target(
+        &proxy,
+        &ctx.path,
+        &query_string,
+        effective_host,
+        effective_port,
+        upstream_target.as_ref().and_then(|t| t.path.as_deref()),
+    );
 
     // Get the upgrade parts from the request
     let (mut parts, _body) = req.into_parts();
@@ -976,15 +990,82 @@ async fn handle_websocket_request_authenticated(
 
     // Connect to backend BEFORE sending 101 to client.
     // If the backend is unreachable, we return 502 instead of a premature 101.
+    // Supports retry with upstream target rotation for connection failures.
     let env_config = state.env_config.clone();
-    let backend_ws_stream =
-        match connect_websocket_backend(&backend_url, &proxy, &env_config, &client_headers).await {
-            Ok(stream) => stream,
+    let mut current_backend_url = backend_url;
+    let mut current_target = upstream_target;
+    let mut ws_attempt = 0u32;
+
+    let backend_ws_stream = loop {
+        match connect_websocket_backend(&current_backend_url, &proxy, &env_config, &client_headers)
+            .await
+        {
+            Ok(stream) => break stream,
             Err(e) => {
                 let ws_error_class = retry::classify_boxed_error(e.as_ref());
+
+                // Check if we should retry this connection failure
+                let should_retry_ws = if let Some(retry_config) = &proxy.retry {
+                    ws_attempt < retry_config.max_retries && retry_config.retry_on_connect_failure
+                } else {
+                    false
+                };
+
+                if should_retry_ws {
+                    let retry_config = proxy.retry.as_ref().unwrap_or_else(|| unreachable!());
+
+                    // Record circuit breaker failure for current target
+                    if let Some(cb_config) = &proxy.circuit_breaker {
+                        let cb_key = current_target
+                            .as_ref()
+                            .map(|t| crate::circuit_breaker::target_key(&t.host, t.port));
+                        let cb = state.circuit_breaker_cache.get_or_create(
+                            &proxy.id,
+                            cb_key.as_deref(),
+                            cb_config,
+                        );
+                        cb.record_failure(502);
+                    }
+
+                    let delay = retry::retry_delay(retry_config, ws_attempt);
+                    tokio::time::sleep(delay).await;
+                    ws_attempt += 1;
+
+                    // Try a different target on retry if load balancing is configured
+                    if let (Some(upstream_id), Some(prev_target)) =
+                        (&proxy.upstream_id, &current_target)
+                        && let Some(next) = state.load_balancer_cache.select_next_target(
+                            upstream_id,
+                            &ctx.client_ip,
+                            prev_target,
+                            Some(&state.health_checker.unhealthy_targets),
+                        )
+                    {
+                        current_backend_url = build_websocket_backend_url_with_target(
+                            &proxy,
+                            &ctx.path,
+                            &query_string,
+                            &next.host,
+                            next.port,
+                            next.path.as_deref(),
+                        );
+                        current_target = Some(next);
+                    }
+
+                    warn!(
+                        proxy_id = %proxy.id,
+                        attempt = ws_attempt,
+                        max_retries = retry_config.max_retries,
+                        error_class = %ws_error_class,
+                        "Retrying WebSocket backend connection"
+                    );
+                    continue;
+                }
+
+                // No retry — return error
                 error!(
                     proxy_id = %proxy.id,
-                    backend_url = %backend_url,
+                    backend_url = %current_backend_url,
                     error_kind = "connect_failure",
                     error_class = %ws_error_class,
                     error = %e,
@@ -1025,7 +1106,9 @@ async fn handle_websocket_request_authenticated(
                             request_path: ctx.path.clone(),
                             matched_proxy_id: Some(proxy.id.clone()),
                             matched_proxy_name: proxy.name.clone(),
-                            backend_target_url: Some(strip_query_params(&backend_url).to_string()),
+                            backend_target_url: Some(
+                                strip_query_params(&current_backend_url).to_string(),
+                            ),
                             backend_resolved_ip: None,
                             response_status_code: 502,
                             latency_total_ms: ws_total_ms,
@@ -1052,7 +1135,8 @@ async fn handle_websocket_request_authenticated(
                     r#"{"error":"Backend WebSocket connection failed"}"#,
                 ));
             }
-        };
+        }
+    };
 
     // Backend verified — now record 101 and log
     state.request_count.fetch_add(1, Ordering::Relaxed);
@@ -1092,7 +1176,7 @@ async fn handle_websocket_request_authenticated(
         request_path: ctx.path.clone(),
         matched_proxy_id: Some(proxy.id.clone()),
         matched_proxy_name: proxy.name.clone(),
-        backend_target_url: Some(strip_query_params(&backend_url).to_string()),
+        backend_target_url: Some(strip_query_params(&current_backend_url).to_string()),
         backend_resolved_ip: ws_resolved_ip,
         response_status_code: 101,
         latency_total_ms: total_ms,
@@ -1152,7 +1236,7 @@ async fn handle_websocket_request_authenticated(
 
     info!(
         "WebSocket upgrade response sent for authenticated connection: {} -> {}",
-        proxy.id, backend_url
+        proxy.id, current_backend_url
     );
 
     Ok(upgrade_response)
@@ -1195,7 +1279,15 @@ fn collect_forwardable_headers(headers: &hyper::HeaderMap) -> Vec<(String, Strin
 
 /// Build a WebSocket backend URL with the proper ws:// or wss:// scheme,
 /// respecting strip_listen_path, backend_path, and query string.
-fn build_websocket_backend_url(proxy: &Proxy, incoming_path: &str, query_string: &str) -> String {
+/// Build a WebSocket backend URL using a specific target host/port.
+fn build_websocket_backend_url_with_target(
+    proxy: &Proxy,
+    incoming_path: &str,
+    query_string: &str,
+    host: &str,
+    port: u16,
+    target_path: Option<&str>,
+) -> String {
     let scheme = match proxy.backend_protocol {
         BackendProtocol::Ws => "ws",
         BackendProtocol::Wss => "wss",
@@ -1208,7 +1300,7 @@ fn build_websocket_backend_url(proxy: &Proxy, incoming_path: &str, query_string:
         incoming_path
     };
 
-    let backend_path = proxy.backend_path.as_deref().unwrap_or("");
+    let backend_path = target_path.or(proxy.backend_path.as_deref()).unwrap_or("");
     let full_path = format!("{}{}", backend_path, remaining_path);
     let full_path = if full_path.is_empty() {
         "/".to_string()
@@ -1218,10 +1310,7 @@ fn build_websocket_backend_url(proxy: &Proxy, incoming_path: &str, query_string:
         full_path
     };
 
-    let base = format!(
-        "{}://{}:{}{}",
-        scheme, proxy.backend_host, proxy.backend_port, full_path
-    );
+    let base = format!("{}://{}:{}{}", scheme, host, port, full_path);
 
     if query_string.is_empty() {
         base
@@ -2190,6 +2279,71 @@ pub async fn handle_proxy_request(
     let proxy_headers: &HashMap<String, String> =
         owned_proxy_headers.as_ref().unwrap_or(&ctx.headers);
 
+    // Resolve upstream target if load balancing is configured.
+    // Done before protocol dispatch so all protocols (HTTP, gRPC, WebSocket) can use it.
+    let (upstream_target, upstream_is_fallback) = if let Some(upstream_id) = &proxy.upstream_id {
+        let hash_key = ctx.client_ip.clone(); // Default hash key for consistent hashing
+        match state.load_balancer_cache.select_target(
+            upstream_id,
+            &hash_key,
+            Some(&state.health_checker.unhealthy_targets),
+        ) {
+            Some(selection) => {
+                if selection.is_fallback {
+                    warn!(
+                        proxy_id = %proxy.id,
+                        upstream_id = %upstream_id,
+                        target_host = %selection.target.host,
+                        target_port = selection.target.port,
+                        "All upstream targets unhealthy, using fallback target"
+                    );
+                } else {
+                    debug!(
+                        proxy_id = %proxy.id,
+                        upstream_id = %upstream_id,
+                        target_host = %selection.target.host,
+                        target_port = selection.target.port,
+                        "Upstream target selected"
+                    );
+                }
+                (Some(selection.target), selection.is_fallback)
+            }
+            None => {
+                warn!(proxy_id = %proxy.id, upstream_id = %upstream_id, "No upstream target available");
+                (None, false)
+            }
+        }
+    } else {
+        (None, false)
+    };
+
+    // Circuit breaker check — per-target when upstream is configured, per-proxy otherwise
+    let cb_target_key = upstream_target
+        .as_ref()
+        .map(|t| crate::circuit_breaker::target_key(&t.host, t.port));
+    if let Some(cb_config) = &proxy.circuit_breaker
+        && state
+            .circuit_breaker_cache
+            .can_execute(&proxy.id, cb_target_key.as_deref(), cb_config)
+            .is_err()
+    {
+        warn!(proxy_id = %proxy.id, "Request rejected: circuit breaker open");
+        log_rejected_request(
+            &plugins,
+            &ctx,
+            503,
+            start_time,
+            "circuit_breaker_open",
+            plugin_execution_ns,
+        )
+        .await;
+        record_request(&state, 503);
+        return Ok(build_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            r#"{"error":"Service temporarily unavailable (circuit breaker open)"}"#,
+        ));
+    }
+
     // Check if this is a WebSocket upgrade request and the proxy supports WebSocket
     // This check happens AFTER authentication and authorization plugins have run
     if is_websocket_upgrade(&req)
@@ -2206,6 +2360,7 @@ pub async fn handle_proxy_request(
             ctx,
             plugins,
             plugin_execution_ns,
+            upstream_target,
         )
         .await;
     }
@@ -2217,18 +2372,128 @@ pub async fn handle_proxy_request(
             BackendProtocol::Grpc | BackendProtocol::Grpcs
         )
     {
-        let backend_url = build_backend_url(&proxy, &path, &query_string, strip_len);
+        let (grpc_effective_host, grpc_effective_port) = if let Some(ref target) = upstream_target {
+            (target.host.as_str(), target.port)
+        } else {
+            (proxy.backend_host.as_str(), proxy.backend_port)
+        };
+        let mut grpc_backend_url = build_backend_url_with_target(
+            &proxy,
+            &path,
+            &query_string,
+            grpc_effective_host,
+            grpc_effective_port,
+            strip_len,
+            upstream_target.as_ref().and_then(|t| t.path.as_deref()),
+        );
         let backend_start = Instant::now();
 
-        let grpc_result = grpc_proxy::proxy_grpc_request(
+        // First attempt — also captures the buffered body for potential retries
+        let (mut grpc_result, grpc_body_bytes) = grpc_proxy::proxy_grpc_request(
             req,
             &proxy,
-            &backend_url,
+            &grpc_backend_url,
             &state.grpc_pool,
             &state.dns_cache,
             proxy_headers,
         )
         .await;
+
+        // Retain request parts for retry
+        let grpc_method = hyper::Method::POST; // gRPC always uses POST
+        let grpc_req_headers: hyper::HeaderMap = {
+            let mut hm = hyper::HeaderMap::new();
+            for (k, v) in proxy_headers {
+                if let (Ok(name), Ok(val)) = (
+                    hyper::header::HeaderName::from_bytes(k.as_bytes()),
+                    hyper::header::HeaderValue::from_str(v),
+                ) {
+                    hm.insert(name, val);
+                }
+            }
+            hm
+        };
+
+        // gRPC retry loop — retries on connection failures
+        if let Some(retry_config) = &proxy.retry {
+            let mut grpc_attempt = 0u32;
+            let mut grpc_current_target = upstream_target.clone();
+            let mut grpc_current_cb_key = cb_target_key.clone();
+
+            loop {
+                // Classify the error and determine if retryable
+                let is_connection_error = match &grpc_result {
+                    Err(GrpcProxyError::BackendUnavailable(_)) => true,
+                    Err(GrpcProxyError::BackendTimeout(msg)) if msg.contains("Connect timeout") => {
+                        true
+                    }
+                    _ => false,
+                };
+                if grpc_attempt >= retry_config.max_retries
+                    || !is_connection_error
+                    || !retry_config.retry_on_connect_failure
+                {
+                    break;
+                }
+
+                // Record circuit breaker failure for current target
+                if let Some(cb_config) = &proxy.circuit_breaker {
+                    let cb = state.circuit_breaker_cache.get_or_create(
+                        &proxy.id,
+                        grpc_current_cb_key.as_deref(),
+                        cb_config,
+                    );
+                    cb.record_failure(502);
+                }
+
+                let delay = retry::retry_delay(retry_config, grpc_attempt);
+                tokio::time::sleep(delay).await;
+                grpc_attempt += 1;
+
+                // Try a different target on retry if load balancing is configured
+                if let (Some(upstream_id), Some(prev_target)) =
+                    (&proxy.upstream_id, &grpc_current_target)
+                    && let Some(next) = state.load_balancer_cache.select_next_target(
+                        upstream_id,
+                        &ctx.client_ip,
+                        prev_target,
+                        Some(&state.health_checker.unhealthy_targets),
+                    )
+                {
+                    grpc_backend_url = build_backend_url_with_target(
+                        &proxy,
+                        &path,
+                        &query_string,
+                        &next.host,
+                        next.port,
+                        strip_len,
+                        next.path.as_deref(),
+                    );
+                    grpc_current_cb_key =
+                        Some(crate::circuit_breaker::target_key(&next.host, next.port));
+                    grpc_current_target = Some(next);
+                }
+
+                warn!(
+                    proxy_id = %proxy.id,
+                    attempt = grpc_attempt,
+                    max_retries = retry_config.max_retries,
+                    "Retrying gRPC backend request"
+                );
+
+                grpc_result = grpc_proxy::proxy_grpc_request_from_bytes(
+                    grpc_method.clone(),
+                    grpc_req_headers.clone(),
+                    grpc_body_bytes.clone(),
+                    &proxy,
+                    &grpc_backend_url,
+                    &state.grpc_pool,
+                    &state.dns_cache,
+                    proxy_headers,
+                )
+                .await;
+            }
+        }
 
         let backend_total_ms = backend_start.elapsed().as_secs_f64() * 1000.0;
 
@@ -2292,7 +2557,7 @@ pub async fn handle_proxy_request(
                         request_path: path,
                         matched_proxy_id: Some(proxy.id.clone()),
                         matched_proxy_name: proxy.name.clone(),
-                        backend_target_url: Some(strip_query_params(&backend_url).to_string()),
+                        backend_target_url: Some(strip_query_params(&grpc_backend_url).to_string()),
                         backend_resolved_ip: grpc_resolved_ip,
                         response_status_code: grpc_resp.status,
                         latency_total_ms: total_ms,
@@ -2405,70 +2670,6 @@ pub async fn handle_proxy_request(
                 return Ok(grpc_proxy::build_grpc_error_response(grpc_code, msg));
             }
         }
-    }
-
-    // Resolve upstream target if load balancing is configured
-    let (upstream_target, upstream_is_fallback) = if let Some(upstream_id) = &proxy.upstream_id {
-        let hash_key = ctx.client_ip.clone(); // Default hash key for consistent hashing
-        match state.load_balancer_cache.select_target(
-            upstream_id,
-            &hash_key,
-            Some(&state.health_checker.unhealthy_targets),
-        ) {
-            Some(selection) => {
-                if selection.is_fallback {
-                    warn!(
-                        proxy_id = %proxy.id,
-                        upstream_id = %upstream_id,
-                        target_host = %selection.target.host,
-                        target_port = selection.target.port,
-                        "All upstream targets unhealthy, using fallback target"
-                    );
-                } else {
-                    debug!(
-                        proxy_id = %proxy.id,
-                        upstream_id = %upstream_id,
-                        target_host = %selection.target.host,
-                        target_port = selection.target.port,
-                        "Upstream target selected"
-                    );
-                }
-                (Some(selection.target), selection.is_fallback)
-            }
-            None => {
-                warn!(proxy_id = %proxy.id, upstream_id = %upstream_id, "No upstream target available");
-                (None, false)
-            }
-        }
-    } else {
-        (None, false)
-    };
-
-    // Circuit breaker check — per-target when upstream is configured, per-proxy otherwise
-    let cb_target_key = upstream_target
-        .as_ref()
-        .map(|t| crate::circuit_breaker::target_key(&t.host, t.port));
-    if let Some(cb_config) = &proxy.circuit_breaker
-        && state
-            .circuit_breaker_cache
-            .can_execute(&proxy.id, cb_target_key.as_deref(), cb_config)
-            .is_err()
-    {
-        warn!(proxy_id = %proxy.id, "Request rejected: circuit breaker open");
-        log_rejected_request(
-            &plugins,
-            &ctx,
-            503,
-            start_time,
-            "circuit_breaker_open",
-            plugin_execution_ns,
-        )
-        .await;
-        record_request(&state, 503);
-        return Ok(build_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            r#"{"error":"Service temporarily unavailable (circuit breaker open)"}"#,
-        ));
     }
 
     // Build backend URL (using upstream target if available)
