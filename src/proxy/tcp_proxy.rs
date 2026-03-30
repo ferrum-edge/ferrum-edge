@@ -5,10 +5,12 @@
 //! `tokio::io::copy_bidirectional` for optimal zero-copy throughput.
 
 use std::net::{IpAddr, SocketAddr};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
@@ -106,6 +108,8 @@ pub struct TcpListenerConfig {
     pub metrics: Arc<TcpProxyMetrics>,
     pub tls_no_verify: bool,
     pub plugin_cache: Arc<PluginCache>,
+    /// Global default TCP idle timeout in seconds. Per-proxy `tcp_idle_timeout_seconds` overrides.
+    pub tcp_idle_timeout_seconds: u64,
 }
 
 /// Start a TCP proxy listener on the given port.
@@ -128,6 +132,7 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
         metrics,
         tls_no_verify,
         plugin_cache,
+        tcp_idle_timeout_seconds: global_tcp_idle_timeout,
     } = cfg;
     let addr = SocketAddr::new(bind_addr, port);
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -238,6 +243,7 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
                         &lb_cache,
                         frontend_tls.as_ref(),
                         backend_tls.as_deref(),
+                        global_tcp_idle_timeout,
                     )
                     .await;
 
@@ -312,6 +318,7 @@ struct TcpConnParams {
     dns_override: Option<String>,
     dns_cache_ttl_seconds: Option<u64>,
     backend_connect_timeout_ms: u64,
+    tcp_idle_timeout_seconds: u64,
 }
 
 /// Handle a single TCP connection: TLS termination → backend resolution → bidirectional copy.
@@ -325,6 +332,7 @@ async fn handle_tcp_connection(
     lb_cache: &LoadBalancerCache,
     frontend_tls_config: Option<&Arc<rustls::ServerConfig>>,
     cached_backend_tls: Option<&CachedBackendTlsConfig>,
+    global_tcp_idle_timeout: u64,
 ) -> Result<(u64, u64, Duration), anyhow::Error> {
     let start = Instant::now();
     let _ = client_stream.set_nodelay(true);
@@ -348,6 +356,9 @@ async fn handle_tcp_connection(
             dns_override: proxy.dns_override.clone(),
             dns_cache_ttl_seconds: proxy.dns_cache_ttl_seconds,
             backend_connect_timeout_ms: proxy.backend_connect_timeout_ms,
+            tcp_idle_timeout_seconds: proxy
+                .tcp_idle_timeout_seconds
+                .unwrap_or(global_tcp_idle_timeout),
         }
     };
 
@@ -364,6 +375,12 @@ async fn handle_tcp_connection(
     let connect_timeout = Duration::from_millis(params.backend_connect_timeout_ms);
     let is_backend_tls = params.backend_protocol == BackendProtocol::TcpTls;
 
+    let idle_timeout = if params.tcp_idle_timeout_seconds > 0 {
+        Some(Duration::from_secs(params.tcp_idle_timeout_seconds))
+    } else {
+        None
+    };
+
     // Apply frontend TLS termination if configured
     if let Some(tls_config) = frontend_tls_config {
         let acceptor = tokio_rustls::TlsAcceptor::from(tls_config.clone());
@@ -379,10 +396,10 @@ async fn handle_tcp_connection(
                 cached_backend_tls,
             )
             .await?;
-            bidirectional_copy(tls_stream, backend_stream).await
+            bidirectional_copy(tls_stream, backend_stream, idle_timeout).await
         } else {
             let backend_stream = connect_backend_plain(backend_addr, connect_timeout).await?;
-            bidirectional_copy(tls_stream, backend_stream).await
+            bidirectional_copy(tls_stream, backend_stream, idle_timeout).await
         }
     } else {
         // No frontend TLS — raw TCP
@@ -394,10 +411,10 @@ async fn handle_tcp_connection(
                 cached_backend_tls,
             )
             .await?;
-            bidirectional_copy(client_stream, backend_stream).await
+            bidirectional_copy(client_stream, backend_stream, idle_timeout).await
         } else {
             let backend_stream = connect_backend_plain(backend_addr, connect_timeout).await?;
-            bidirectional_copy(client_stream, backend_stream).await
+            bidirectional_copy(client_stream, backend_stream, idle_timeout).await
         }
     }
     .map(|(bytes_in, bytes_out)| (bytes_in, bytes_out, start.elapsed()))
@@ -464,21 +481,129 @@ const TCP_COPY_BUF_SIZE: usize = 64 * 1024;
 
 /// Bidirectional stream copy between client and backend.
 /// Returns (bytes_client_to_backend, bytes_backend_to_client).
+///
+/// When `idle_timeout` is `Some(d)` and non-zero, the connection is closed
+/// if no data is received on either side for the given duration.
+/// When `idle_timeout` is `None` or zero, uses the fast path with no overhead.
 async fn bidirectional_copy<C, B>(
     mut client: C,
     mut backend: B,
+    idle_timeout: Option<Duration>,
 ) -> Result<(u64, u64), anyhow::Error>
 where
     C: AsyncRead + AsyncWrite + Unpin,
     B: AsyncRead + AsyncWrite + Unpin,
 {
-    let (bytes_to_backend, bytes_to_client) = tokio::io::copy_bidirectional_with_sizes(
-        &mut client,
-        &mut backend,
-        TCP_COPY_BUF_SIZE,
-        TCP_COPY_BUF_SIZE,
-    )
-    .await
-    .map_err(|e| anyhow::anyhow!("Bidirectional copy error: {}", e))?;
-    Ok((bytes_to_backend, bytes_to_client))
+    match idle_timeout {
+        Some(timeout) if !timeout.is_zero() => {
+            let last_activity = Arc::new(AtomicU64::new(coarse_now_ms()));
+            let mut tracked_client = IdleTrackingStream::new(client, last_activity.clone());
+            let mut tracked_backend = IdleTrackingStream::new(backend, last_activity.clone());
+
+            let copy_fut = tokio::io::copy_bidirectional_with_sizes(
+                &mut tracked_client,
+                &mut tracked_backend,
+                TCP_COPY_BUF_SIZE,
+                TCP_COPY_BUF_SIZE,
+            );
+            tokio::pin!(copy_fut);
+
+            let idle_check = async {
+                let timeout_ms = timeout.as_millis() as u64;
+                loop {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    let last = last_activity.load(Ordering::Relaxed);
+                    if coarse_now_ms().saturating_sub(last) >= timeout_ms {
+                        return;
+                    }
+                }
+            };
+            tokio::pin!(idle_check);
+
+            tokio::select! {
+                result = &mut copy_fut => {
+                    result
+                        .map_err(|e| anyhow::anyhow!("Bidirectional copy error: {}", e))
+                }
+                _ = &mut idle_check => {
+                    Err(anyhow::anyhow!("TCP idle timeout after {}s", timeout.as_secs()))
+                }
+            }
+        }
+        _ => {
+            // No idle timeout — fast path with zero overhead.
+            tokio::io::copy_bidirectional_with_sizes(
+                &mut client,
+                &mut backend,
+                TCP_COPY_BUF_SIZE,
+                TCP_COPY_BUF_SIZE,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("Bidirectional copy error: {}", e))
+        }
+    }
+}
+
+/// Returns the current time as milliseconds since the Unix epoch.
+/// Used for coarse idle tracking — does not need sub-millisecond precision.
+fn coarse_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+/// Wraps an `AsyncRead + AsyncWrite` stream, updating a shared timestamp
+/// whenever bytes are successfully read. Used for idle connection detection.
+///
+/// Only reads are tracked: bidirectional data flow means a read on either
+/// side (client or backend) indicates the connection is actively in use.
+struct IdleTrackingStream<S> {
+    inner: S,
+    last_activity: Arc<AtomicU64>,
+}
+
+impl<S> IdleTrackingStream<S> {
+    fn new(inner: S, last_activity: Arc<AtomicU64>) -> Self {
+        Self {
+            inner,
+            last_activity,
+        }
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for IdleTrackingStream<S> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        let before = buf.filled().len();
+        let result = Pin::new(&mut this.inner).poll_read(cx, buf);
+        if let Poll::Ready(Ok(())) = &result
+            && buf.filled().len() > before
+        {
+            this.last_activity.store(coarse_now_ms(), Ordering::Relaxed);
+        }
+        result
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for IdleTrackingStream<S> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
 }

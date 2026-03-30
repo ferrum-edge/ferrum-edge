@@ -8,6 +8,10 @@
 //! TCP keep-alive) so that probe connections behave like real proxy traffic and
 //! benefit from connection reuse across targets.
 
+mod grpc_health_v1 {
+    tonic::include_proto!("grpc.health.v1");
+}
+
 use crate::config::pool_config::PoolConfig;
 use crate::config::types::{
     ActiveHealthCheck, GatewayConfig, HealthProbeType, PassiveHealthCheck, UpstreamTarget,
@@ -377,6 +381,8 @@ impl HealthChecker {
             .as_deref()
             .and_then(|hex| hex::decode(hex).ok())
             .unwrap_or_default();
+        let use_tls = config.use_tls;
+        let grpc_service_name = config.grpc_service_name.clone().unwrap_or_default();
 
         // Clone target and upstream_id for latency recording inside the spawned task
         let probe_target = target.clone();
@@ -412,6 +418,9 @@ impl HealthChecker {
                     }
                     HealthProbeType::Tcp => tcp_probe(&host, port, timeout).await,
                     HealthProbeType::Udp => udp_probe(&host, port, timeout, &udp_payload).await,
+                    HealthProbeType::Grpc => {
+                        grpc_probe(&host, port, timeout, use_tls, &grpc_service_name).await
+                    }
                 };
 
                 if probe_success {
@@ -552,6 +561,85 @@ async fn udp_probe(host: &str, port: u16, timeout: Duration, payload: &[u8]) -> 
     }
 }
 
+/// gRPC health probe — performs a unary grpc.health.v1.Health/Check RPC.
+/// Returns true only if the response status is SERVING.
+///
+/// Note: when `use_tls` is true the probe validates the server certificate
+/// using system root CAs. Self-signed backends will cause the probe to
+/// return false (target appears unhealthy).
+async fn grpc_probe(
+    host: &str,
+    port: u16,
+    timeout: Duration,
+    use_tls: bool,
+    service_name: &str,
+) -> bool {
+    let scheme = if use_tls { "https" } else { "http" };
+    let endpoint_url = format!("{}://{}:{}", scheme, host, port);
+
+    let endpoint = match tonic::transport::Endpoint::from_shared(endpoint_url) {
+        Ok(ep) => ep.timeout(timeout).connect_timeout(timeout),
+        Err(e) => {
+            debug!(
+                "gRPC health probe: invalid endpoint for {}:{}: {}",
+                host, port, e
+            );
+            return false;
+        }
+    };
+
+    let endpoint = if use_tls {
+        let tls_config = tonic::transport::ClientTlsConfig::new().with_enabled_roots();
+        match endpoint.tls_config(tls_config) {
+            Ok(ep) => ep,
+            Err(e) => {
+                debug!(
+                    "gRPC health probe: TLS config error for {}:{}: {}",
+                    host, port, e
+                );
+                return false;
+            }
+        }
+    } else {
+        endpoint
+    };
+
+    let channel = match tokio::time::timeout(timeout, endpoint.connect()).await {
+        Ok(Ok(ch)) => ch,
+        Ok(Err(e)) => {
+            debug!(
+                "gRPC health probe: connect failed for {}:{}: {}",
+                host, port, e
+            );
+            return false;
+        }
+        Err(_) => {
+            debug!("gRPC health probe: connect timed out for {}:{}", host, port);
+            return false;
+        }
+    };
+
+    let mut client = grpc_health_v1::health_client::HealthClient::new(channel);
+    let request = tonic::Request::new(grpc_health_v1::HealthCheckRequest {
+        service: service_name.to_string(),
+    });
+
+    match tokio::time::timeout(timeout, client.check(request)).await {
+        Ok(Ok(response)) => {
+            let status = response.into_inner().status;
+            status == grpc_health_v1::health_check_response::ServingStatus::Serving as i32
+        }
+        Ok(Err(e)) => {
+            debug!("gRPC health probe: RPC failed for {}:{}: {}", host, port, e);
+            false
+        }
+        Err(_) => {
+            debug!("gRPC health probe: RPC timed out for {}:{}", host, port);
+            false
+        }
+    }
+}
+
 /// Build a shared `reqwest::Client` for active health check probes using the
 /// gateway's global pool configuration.
 ///
@@ -602,4 +690,20 @@ fn now_epoch_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+/// Public wrapper around [`grpc_probe`] for use in unit/integration tests.
+///
+/// This is exposed solely for testing. Production callers should go through
+/// [`HealthChecker::start_active_check`] which drives the probe indirectly.
+#[doc(hidden)]
+#[allow(dead_code)]
+pub async fn grpc_probe_for_test(
+    host: &str,
+    port: u16,
+    timeout: Duration,
+    use_tls: bool,
+    service_name: &str,
+) -> bool {
+    grpc_probe(host, port, timeout, use_tls, service_name).await
 }

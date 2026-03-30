@@ -165,6 +165,18 @@ impl ProxyBody {
         Self::Stream(Box::pin(mapped))
     }
 
+    /// Create a streaming body directly from a hyper `Incoming` body.
+    ///
+    /// Used when the response headers and body have already been separated,
+    /// e.g. in the gRPC streaming path where status and headers are extracted
+    /// before the body is passed through.
+    pub fn streaming_incoming(body: hyper::body::Incoming) -> Self {
+        use http_body_util::BodyExt;
+
+        let mapped = body.map_err(|e| Box::new(e) as ProxyBodyError);
+        Self::Stream(Box::pin(mapped))
+    }
+
     /// Create a streaming body with lightweight completion tracking.
     ///
     /// Returns the body and a shared `Arc<StreamingMetrics>` that a deferred

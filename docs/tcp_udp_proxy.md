@@ -42,6 +42,7 @@ proxies:
     backend_host: "redis.internal"
     backend_port: 6379
     frontend_tls: true        # Terminate TLS on incoming connections
+    tcp_idle_timeout_seconds: 600  # 10 min (override global default for long-lived DB connections)
     enabled: true
 
   - id: "dns-proxy"
@@ -73,6 +74,7 @@ proxies:
 | `listen_port` | `u16` | (required) | Dedicated port for this stream proxy (1024-65535) |
 | `backend_protocol` | `string` | (required) | One of: `tcp`, `tcp_tls`, `udp`, `dtls` |
 | `frontend_tls` | `bool` | `false` | Terminate TLS (TCP) or DTLS (UDP) on incoming connections |
+| `tcp_idle_timeout_seconds` | `u64` | (global) | TCP idle timeout override. When omitted, uses `FERRUM_TCP_IDLE_TIMEOUT_SECONDS` (default 300s). 0 = disabled |
 | `udp_idle_timeout_seconds` | `u64` | `60` | UDP session idle timeout before cleanup |
 
 ### Synthetic `listen_path`
@@ -248,6 +250,43 @@ health_checks:
 
 The default probe type. Sends an HTTP GET request and checks the response status code. Works for backends that expose HTTP health endpoints alongside their primary protocol.
 
+## TCP Idle Timeout
+
+TCP connections are monitored for idle activity. When no data is transferred in either direction for the configured timeout, the connection is closed. This prevents zombie connections from consuming resources when backends or clients silently disappear.
+
+**Configuration hierarchy:**
+1. Per-proxy `tcp_idle_timeout_seconds` — highest priority, set per proxy
+2. Global `FERRUM_TCP_IDLE_TIMEOUT_SECONDS` — applies to all TCP proxies that don't specify a per-proxy override
+3. Default: 300 seconds (5 minutes)
+
+**Special values:**
+- `0` — disables idle timeout enforcement (relies on OS-level TCP keepalive only)
+- Maximum: 86,400 seconds (24 hours)
+
+**How it works:**
+- An `IdleTrackingStream` wrapper monitors reads on both the client and backend sides
+- A background checker polls every 1 second to compare the last activity timestamp against the timeout
+- When the timeout fires, the connection is closed gracefully and logged as a TCP idle timeout
+- Connections with active data flow in either direction are never affected
+- When disabled (0), the fast path uses `copy_bidirectional` with zero overhead
+
+```yaml
+proxies:
+  - id: "db-proxy"
+    listen_port: 5432
+    backend_protocol: tcp
+    backend_host: "db.internal"
+    backend_port: 5432
+    tcp_idle_timeout_seconds: 600   # 10 min for long-lived DB connections
+
+  - id: "cache-proxy"
+    listen_port: 6379
+    backend_protocol: tcp
+    backend_host: "redis.internal"
+    backend_port: 6379
+    tcp_idle_timeout_seconds: 30    # 30 sec for short-lived cache connections
+```
+
 ## UDP Session Management
 
 UDP is connectionless, so the gateway tracks sessions by client source address (`SocketAddr`). Each unique client gets a dedicated backend socket for reply routing.
@@ -282,6 +321,7 @@ See [docs/plugin_execution_order.md](plugin_execution_order.md) for the full per
 | `FERRUM_DTLS_CERT_PATH` | (none) | PEM certificate for frontend DTLS termination (ECDSA P-256 or Ed25519) |
 | `FERRUM_DTLS_KEY_PATH` | (none) | PEM private key for frontend DTLS termination |
 | `FERRUM_DTLS_CLIENT_CA_CERT_PATH` | (none) | PEM CA certificate for verifying DTLS client certs (frontend mTLS). Separate from `FERRUM_TLS_CLIENT_CA_CERT_PATH` used for TCP. |
+| `FERRUM_TCP_IDLE_TIMEOUT_SECONDS` | `300` | Default TCP idle timeout (5 min). Per-proxy `tcp_idle_timeout_seconds` overrides. 0 = disabled |
 | `FERRUM_UDP_MAX_SESSIONS` | `10000` | Maximum concurrent UDP sessions per proxy |
 | `FERRUM_UDP_CLEANUP_INTERVAL_SECONDS` | `10` | Interval between UDP session cleanup sweeps |
 
@@ -306,8 +346,10 @@ Stream proxy connections track:
 
 - **No protocol inspection**: Stream proxies forward raw bytes — no HTTP header manipulation, path routing, or content transformation
 - **No WebSocket upgrade**: WebSocket connections should use HTTP proxies with `ws`/`wss` protocol, not TCP proxies
+- **No circuit breaker**: TCP/UDP proxies do not participate in circuit breaker state tracking. Raw byte forwarding provides no semantic failure signal (like HTTP status codes) to trigger state transitions. Use health checks + load balancing for target failover instead.
+- **No retries**: TCP/UDP connections cannot be retried after partial data transfer. Once bytes have been forwarded, the stream cannot be replayed. Client-side retry or health-check-based target exclusion is the recommended approach.
 - **UDP max datagram**: Limited to 65,535 bytes per datagram (UDP protocol limit)
 - **Session isolation**: UDP sessions are keyed by source address — NAT'd clients sharing an IP:port will share a session
 - **DTLS key types**: DTLS only supports ECDSA P-256 and Ed25519 certificates — RSA keys are not supported by the underlying `webrtc-dtls` library
-- **DTLS protocol version**: Only DTLS 1.2 is supported (no DTLS 1.3)
+- **DTLS protocol version**: Only DTLS 1.2 is supported (no DTLS 1.3). The `webrtc-dtls` library does not implement DTLS 1.3.
 - **DTLS cert separation**: Frontend DTLS uses separate cert/key from TLS (`FERRUM_DTLS_CERT_PATH` / `FERRUM_DTLS_KEY_PATH` env vars, not the gateway's TLS cert)

@@ -96,7 +96,7 @@ Pingora does not support HTTP/3 or QUIC. There are no references to h3, quinn, o
 
 **Ferrum wins decisively.** HTTP/3 adoption is accelerating (used by Google, Meta, Cloudflare's own CDN), and having native support is a significant differentiator. Ferrum's implementation is security-conscious (0-RTT disabled, TLS 1.3 enforced) and feature-complete (full plugin pipeline for H3 requests).
 
-**Where Ferrum could improve**: The H3 client currently buffers the full response body (no streaming) due to h3 crate API limitations. As the h3 crate matures, adding streaming response support would improve performance for large response bodies over HTTP/3.
+HTTP/3 responses now support **backpressure-aware streaming** with adaptive coalescing (8–32 KiB) and time-based flushing (2ms), achieving full parity with the HTTP/1.1 and gRPC streaming paths. Buffered mode is used as a fallback only when plugins require response body access.
 
 ---
 
@@ -462,4 +462,4 @@ Based on this analysis, the highest-impact improvements Ferrum could adopt from 
 
 8. **Protocol-agnostic upgrade abstraction** — Extract WebSocket handling into a generic upgrade proxy trait that could support future protocols (e.g., WebTransport).
 
-9. **HTTP/3 streaming responses** — As the h3 crate matures, add streaming body support for the HTTP/3 client (currently buffers full response).
+9. ~~**HTTP/3 streaming responses**~~ — **Completed.** HTTP/3 now supports backpressure-aware streaming with adaptive coalescing (8–32 KiB) and time-based flushing (2ms). Falls back to buffered mode when plugins require body access.

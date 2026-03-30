@@ -6,10 +6,10 @@ A comprehensive feature list for Ferrum Edge.
 
 - **HTTP/1.1** with keep-alive connection pooling
 - **HTTP/2** via ALPN negotiation on TLS connections
-- **HTTP/3** (QUIC) on the same port as HTTPS with configurable idle timeout, max streams, QUIC flow-control windows, and per-backend connection pooling
+- **HTTP/3** (QUIC) on the same port as HTTPS with streaming responses (backpressure-aware adaptive coalescing), configurable idle timeout, max streams, QUIC flow-control windows, and per-backend connection pooling
 - **WebSocket** (`ws`/`wss`) with transparent upgrade handling
 - **gRPC** (`grpc`/`grpcs`) with HTTP/2 trailer support and full plugin compatibility
-- **TCP** stream proxying with TLS termination and origination
+- **TCP** stream proxying with TLS termination, origination, and configurable idle timeout
 - **UDP** datagram proxying with DTLS support (frontend termination + backend origination)
 
 ## Operating Modes
@@ -320,6 +320,18 @@ cargo build --release --features secrets-vault,secrets-aws
 ### Timeouts and Resilience
 
 Each individual cloud backend fetch (Vault, AWS, GCP, Azure) has a **30-second timeout**. If a secret provider is unreachable or slow, the gateway fails startup with a clear timeout error rather than hanging indefinitely. File-based secrets have no timeout since they are local filesystem reads.
+
+## Known Protocol Gaps
+
+The following are known limitations tracked for future improvement:
+
+| Gap | Protocol | Reason | Workaround |
+|-----|----------|--------|------------|
+| No circuit breaker | TCP, UDP | Raw byte forwarding provides no semantic failure signal to trigger circuit state transitions | Use health checks + load balancing for target failover |
+| No retries | TCP, UDP | Cannot replay data after partial byte transfer on a stream connection | Client-side retry or health-check-based target exclusion |
+| No HTTP/2 WebSocket (RFC 8441) | WebSocket | hyper does not implement the Extended CONNECT method for HTTP/2 WebSocket upgrades | Clients must use HTTP/1.1 or TLS-negotiated connections for WebSocket |
+| No per-frame plugin hooks | WebSocket | Plugins act on upgrade/close events only; individual frames are forwarded opaquely | Use HTTP proxies with request/response transformation for inspectable protocols |
+| No DTLS 1.3 | UDP | The `webrtc-dtls` library only supports DTLS 1.2 | Use TLS 1.3 over TCP for protocols that can use either transport |
 
 ## Deployment
 

@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use bytes::{Buf, Bytes};
+use bytes::{Buf, Bytes, BytesMut};
 use h3::server::RequestStream;
 use http::{Response, StatusCode};
 use quinn::crypto::rustls::QuicServerConfig;
@@ -561,7 +561,28 @@ async fn handle_h3_request(
         return Ok(());
     }
 
-    // Collect request body from the H3 stream with size limit
+    // Determine streaming vs buffered mode — same logic as HTTP/1.1 and gRPC paths.
+    // Stream by default; buffer only when plugins need to inspect/modify the body
+    // or when retries are configured (need to replay the request body).
+    let has_retry = proxy.retry.is_some();
+    let needs_request_buffering = has_retry
+        || state
+            .plugin_cache
+            .requires_request_body_buffering(&proxy.id);
+    let needs_response_buffering = has_retry
+        || state
+            .plugin_cache
+            .requires_response_body_buffering(&proxy.id);
+
+    // Build backend URL
+    let backend_url =
+        crate::proxy::build_backend_url(&proxy, &path, &query_string, proxy.listen_path.len());
+    let backend_start = std::time::Instant::now();
+
+    // --- Collect request body (always needed; stream to backend when possible) ---
+    // When request buffering is needed, we collect into Vec<u8> for plugin transforms
+    // and potential retry replay. Otherwise we still collect for reqwest but avoid
+    // plugin body transforms.
     let mut body_data = Vec::new();
     while let Some(chunk) = stream.recv_data().await? {
         let bytes = chunk.chunk();
@@ -580,119 +601,564 @@ async fn handle_h3_request(
         body_data.extend_from_slice(bytes);
     }
 
-    // Build backend URL and proxy
-    let backend_url =
-        crate::proxy::build_backend_url(&proxy, &path, &query_string, proxy.listen_path.len());
-    let backend_start = std::time::Instant::now();
+    // Transform request body via plugins when buffering is active
+    let body_data = if needs_request_buffering
+        && !body_data.is_empty()
+        && plugins.iter().any(|p| p.modifies_request_body())
+    {
+        let content_type = ctx.headers.get("content-type").map(|s| s.as_str());
+        let mut current = body_data;
+        for plugin in plugins.iter() {
+            if plugin.modifies_request_body()
+                && let Some(transformed) =
+                    plugin.transform_request_body(&current, content_type).await
+            {
+                current = transformed;
+            }
+        }
+        current
+    } else {
+        body_data
+    };
 
-    let (response_status, response_body, mut response_headers, h3_error_class) =
-        proxy_to_backend_h3(
+    if !needs_response_buffering {
+        // ===== STREAMING RESPONSE PATH =====
+        // Stream response body chunks from backend directly to the H3 client
+        // without collecting them in memory. This is the fast path.
+        let client_ip_owned = ctx.client_ip.clone();
+        let streaming_result = proxy_to_backend_h3_streaming(
             &state,
             &proxy,
             &backend_url,
             &method,
             &proxy_headers,
             body_data,
-            &ctx.client_ip,
+            &client_ip_owned,
+            &mut stream,
+            &plugins,
+            &mut ctx,
+            &mut plugin_execution_ns,
         )
         .await;
 
-    let backend_ttfb_ms = backend_start.elapsed().as_secs_f64() * 1000.0;
-    let backend_total_ms = backend_start.elapsed().as_secs_f64() * 1000.0;
+        let (response_status, _response_headers, h3_error_class) = match streaming_result {
+            Ok(result) => result,
+            Err(e) => {
+                // Stream may already have partial data sent — log and return
+                debug!("HTTP/3 streaming proxy error: {}", e);
+                return Err(e);
+            }
+        };
 
-    // after_proxy hooks
-    {
-        let phase_start = std::time::Instant::now();
+        let backend_total_ms = backend_start.elapsed().as_secs_f64() * 1000.0;
+        let backend_ttfb_ms = backend_total_ms; // Approximation for streaming
+
+        let total_ms = start_time.elapsed().as_secs_f64() * 1000.0;
+        let plugin_execution_ms = plugin_execution_ns as f64 / 1_000_000.0;
+        let plugin_external_io_ms = ctx
+            .plugin_http_call_ns
+            .load(std::sync::atomic::Ordering::Relaxed) as f64
+            / 1_000_000.0;
+        let gateway_processing_ms = total_ms - backend_total_ms;
+        let gateway_overhead_ms = (total_ms - backend_total_ms - plugin_execution_ms).max(0.0);
+
+        let h3_resolved_ip = state
+            .dns_cache
+            .resolve(
+                &proxy.backend_host,
+                proxy.dns_override.as_deref(),
+                proxy.dns_cache_ttl_seconds,
+            )
+            .await
+            .ok()
+            .map(|ip| ip.to_string());
+
+        let summary = TransactionSummary {
+            timestamp_received: ctx.timestamp_received.to_rfc3339(),
+            client_ip: ctx.client_ip.clone(),
+            consumer_username: ctx
+                .identified_consumer
+                .as_ref()
+                .map(|c| c.username.clone())
+                .or_else(|| ctx.authenticated_identity.clone()),
+            http_method: method,
+            request_path: path,
+            matched_proxy_id: Some(proxy.id.clone()),
+            matched_proxy_name: proxy.name.clone(),
+            backend_target_url: Some(strip_query_params(&backend_url).to_string()),
+            backend_resolved_ip: h3_resolved_ip,
+            response_status_code: response_status,
+            latency_total_ms: total_ms,
+            latency_gateway_processing_ms: gateway_processing_ms,
+            latency_backend_ttfb_ms: backend_ttfb_ms,
+            latency_backend_total_ms: backend_total_ms,
+            latency_plugin_execution_ms: plugin_execution_ms,
+            latency_plugin_external_io_ms: plugin_external_io_ms,
+            latency_gateway_overhead_ms: gateway_overhead_ms,
+            request_user_agent: ctx.headers.get("user-agent").cloned(),
+            response_streamed: true,
+            client_disconnected: false,
+            error_class: h3_error_class,
+            metadata: ctx.metadata.clone(),
+        };
+
         for plugin in plugins.iter() {
-            let _ = plugin
-                .after_proxy(&mut ctx, response_status, &mut response_headers)
-                .await;
+            plugin.log(&summary).await;
         }
-        plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
+
+        record_request(&state, response_status);
+    } else {
+        // ===== BUFFERED RESPONSE PATH =====
+        // Collect full response for plugin body inspection/transformation and retries.
+        let (mut response_status, response_body, mut response_headers, h3_error_class) =
+            proxy_to_backend_h3(
+                &state,
+                &proxy,
+                &backend_url,
+                &method,
+                &proxy_headers,
+                body_data,
+                &ctx.client_ip,
+            )
+            .await;
+
+        let backend_ttfb_ms = backend_start.elapsed().as_secs_f64() * 1000.0;
+        let backend_total_ms = backend_start.elapsed().as_secs_f64() * 1000.0;
+
+        // after_proxy hooks
+        {
+            let phase_start = std::time::Instant::now();
+            for plugin in plugins.iter() {
+                let _ = plugin
+                    .after_proxy(&mut ctx, response_status, &mut response_headers)
+                    .await;
+            }
+            plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
+        }
+
+        // on_response_body hooks — only for buffered responses when plugins exist.
+        // Mirrors the HTTP/1.1 path in proxy/mod.rs.
+        let mut response_body = response_body;
+        if !plugins.is_empty() {
+            let phase_start = std::time::Instant::now();
+            for plugin in plugins.iter() {
+                let result = plugin
+                    .on_response_body(&mut ctx, response_status, &response_headers, &response_body)
+                    .await;
+                match result {
+                    PluginResult::Continue => {}
+                    PluginResult::Reject {
+                        status_code,
+                        body: reject_body,
+                        headers: reject_headers,
+                    } => {
+                        debug!(
+                            plugin = plugin.name(),
+                            status_code, "Plugin rejected response body (HTTP/3)"
+                        );
+                        response_status = status_code;
+                        response_headers.clear();
+                        response_headers
+                            .insert("content-type".to_string(), "application/json".to_string());
+                        for (k, v) in reject_headers {
+                            response_headers.insert(k, v);
+                        }
+                        response_body = reject_body.into_bytes();
+                        break;
+                    }
+                }
+            }
+            plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
+        }
+
+        // transform_response_body hooks — only for buffered responses.
+        if !plugins.is_empty() {
+            let phase_start = std::time::Instant::now();
+            let content_type = response_headers.get("content-type").cloned();
+            let ct_ref = content_type.as_deref();
+            for plugin in plugins.iter() {
+                if let Some(transformed) =
+                    plugin.transform_response_body(&response_body, ct_ref).await
+                {
+                    response_headers
+                        .insert("content-length".to_string(), transformed.len().to_string());
+                    response_body = transformed;
+                }
+            }
+            plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
+        }
+
+        let total_ms = start_time.elapsed().as_secs_f64() * 1000.0;
+        let plugin_execution_ms = plugin_execution_ns as f64 / 1_000_000.0;
+        let plugin_external_io_ms = ctx
+            .plugin_http_call_ns
+            .load(std::sync::atomic::Ordering::Relaxed) as f64
+            / 1_000_000.0;
+        let gateway_processing_ms = total_ms - backend_total_ms;
+        let gateway_overhead_ms = (total_ms - backend_total_ms - plugin_execution_ms).max(0.0);
+
+        let h3_resolved_ip = state
+            .dns_cache
+            .resolve(
+                &proxy.backend_host,
+                proxy.dns_override.as_deref(),
+                proxy.dns_cache_ttl_seconds,
+            )
+            .await
+            .ok()
+            .map(|ip| ip.to_string());
+
+        let summary = TransactionSummary {
+            timestamp_received: ctx.timestamp_received.to_rfc3339(),
+            client_ip: ctx.client_ip.clone(),
+            consumer_username: ctx
+                .identified_consumer
+                .as_ref()
+                .map(|c| c.username.clone())
+                .or_else(|| ctx.authenticated_identity.clone()),
+            http_method: method,
+            request_path: path,
+            matched_proxy_id: Some(proxy.id.clone()),
+            matched_proxy_name: proxy.name.clone(),
+            backend_target_url: Some(strip_query_params(&backend_url).to_string()),
+            backend_resolved_ip: h3_resolved_ip,
+            response_status_code: response_status,
+            latency_total_ms: total_ms,
+            latency_gateway_processing_ms: gateway_processing_ms,
+            latency_backend_ttfb_ms: backend_ttfb_ms,
+            latency_backend_total_ms: backend_total_ms,
+            latency_plugin_execution_ms: plugin_execution_ms,
+            latency_plugin_external_io_ms: plugin_external_io_ms,
+            latency_gateway_overhead_ms: gateway_overhead_ms,
+            request_user_agent: ctx.headers.get("user-agent").cloned(),
+            response_streamed: false,
+            client_disconnected: false,
+            error_class: h3_error_class,
+            metadata: ctx.metadata.clone(),
+        };
+
+        for plugin in plugins.iter() {
+            plugin.log(&summary).await;
+        }
+
+        record_request(&state, response_status);
+
+        // Build and send buffered response
+        let status = StatusCode::from_u16(response_status).unwrap_or(StatusCode::BAD_GATEWAY);
+        let mut resp_builder = Response::builder().status(status);
+
+        for (k, v) in &response_headers {
+            resp_builder = resp_builder.header(k.as_str(), v.as_str());
+        }
+
+        if !response_headers.contains_key("content-type") {
+            resp_builder = resp_builder.header("content-type", "application/json");
+        }
+
+        let resp = resp_builder
+            .body(())
+            .map_err(|e| anyhow::anyhow!("Failed to build HTTP/3 proxy response: {}", e))?;
+        stream.send_response(resp).await?;
+        stream.send_data(Bytes::from(response_body)).await?;
+        stream.finish().await?;
     }
-
-    let total_ms = start_time.elapsed().as_secs_f64() * 1000.0;
-    let plugin_execution_ms = plugin_execution_ns as f64 / 1_000_000.0;
-    let plugin_external_io_ms = ctx
-        .plugin_http_call_ns
-        .load(std::sync::atomic::Ordering::Relaxed) as f64
-        / 1_000_000.0;
-    let gateway_processing_ms = total_ms - backend_total_ms;
-    let gateway_overhead_ms = (total_ms - backend_total_ms - plugin_execution_ms).max(0.0);
-
-    // Resolve backend IP from DNS cache for HTTP/3 tx log
-    let h3_resolved_ip = state
-        .dns_cache
-        .resolve(
-            &proxy.backend_host,
-            proxy.dns_override.as_deref(),
-            proxy.dns_cache_ttl_seconds,
-        )
-        .await
-        .ok()
-        .map(|ip| ip.to_string());
-
-    // Build transaction summary for logging
-    let summary = TransactionSummary {
-        timestamp_received: ctx.timestamp_received.to_rfc3339(),
-        client_ip: ctx.client_ip.clone(),
-        consumer_username: ctx
-            .identified_consumer
-            .as_ref()
-            .map(|c| c.username.clone())
-            .or_else(|| ctx.authenticated_identity.clone()),
-        http_method: method,
-        request_path: path,
-        matched_proxy_id: Some(proxy.id.clone()),
-        matched_proxy_name: proxy.name.clone(),
-        backend_target_url: Some(strip_query_params(&backend_url).to_string()),
-        backend_resolved_ip: h3_resolved_ip,
-        response_status_code: response_status,
-        latency_total_ms: total_ms,
-        latency_gateway_processing_ms: gateway_processing_ms,
-        latency_backend_ttfb_ms: backend_ttfb_ms,
-        latency_backend_total_ms: backend_total_ms,
-        latency_plugin_execution_ms: plugin_execution_ms,
-        latency_plugin_external_io_ms: plugin_external_io_ms,
-        latency_gateway_overhead_ms: gateway_overhead_ms,
-        request_user_agent: ctx.headers.get("user-agent").cloned(),
-        response_streamed: false,
-        client_disconnected: false,
-        error_class: h3_error_class,
-        metadata: ctx.metadata.clone(),
-    };
-
-    // Log phase
-    for plugin in plugins.iter() {
-        plugin.log(&summary).await;
-    }
-
-    record_request(&state, response_status);
-
-    // Build and send response
-    let status = StatusCode::from_u16(response_status).unwrap_or(StatusCode::BAD_GATEWAY);
-    let mut resp_builder = Response::builder().status(status);
-
-    for (k, v) in &response_headers {
-        resp_builder = resp_builder.header(k.as_str(), v.as_str());
-    }
-
-    // Only add content-type if backend didn't provide one
-    if !response_headers.contains_key("content-type") {
-        resp_builder = resp_builder.header("content-type", "application/json");
-    }
-
-    let resp = resp_builder
-        .body(())
-        .map_err(|e| anyhow::anyhow!("Failed to build HTTP/3 proxy response: {}", e))?;
-    stream.send_response(resp).await?;
-    stream.send_data(Bytes::from(response_body)).await?;
-    stream.finish().await?;
 
     Ok(())
 }
 
-/// Proxy a request to the backend (adapted for HTTP/3 — uses collected body bytes).
+/// Minimum coalescing threshold for QUIC DATA frames. Small frames add per-frame
+/// overhead (QUIC packet headers, HTTP/3 frame headers). Buffering until we have
+/// at least this many bytes amortises the overhead. 8 KiB is the lower bound of
+/// the optimal 8–32 KiB range for typical QUIC path MTUs (~1200 bytes).
+const H3_COALESCE_MIN_BYTES: usize = 8_192;
+
+/// Maximum coalescing buffer size. Even if data arrives fast, we flush at this
+/// threshold to bound per-stream memory and avoid introducing latency.
+const H3_COALESCE_MAX_BYTES: usize = 32_768;
+
+/// Time-based flush interval. If the coalescing buffer has data but hasn't
+/// reached the size threshold, flush after this duration to avoid stalling
+/// small or tail responses. 2ms balances latency vs frame efficiency.
+const H3_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(2);
+
+/// Streaming proxy path: sends backend response chunks directly to the H3 client
+/// as they arrive, without collecting the full body in memory. Returns the status,
+/// final response headers, and error class after the stream completes.
+///
+/// Response headers and `after_proxy` hooks are processed before streaming begins.
+/// The response body is forwarded chunk-by-chunk with coalescing for QUIC efficiency.
+#[allow(clippy::too_many_arguments)]
+async fn proxy_to_backend_h3_streaming(
+    state: &ProxyState,
+    proxy: &Proxy,
+    backend_url: &str,
+    method: &str,
+    headers: &HashMap<String, String>,
+    body_bytes: Vec<u8>,
+    client_ip: &str,
+    h3_stream: &mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    plugin_execution_ns: &mut u64,
+) -> Result<
+    (
+        u16,
+        HashMap<String, String>,
+        Option<crate::retry::ErrorClass>,
+    ),
+    anyhow::Error,
+> {
+    // Build the backend request (same client/header logic as buffered path)
+    let client = match state.connection_pool.get_client(proxy).await {
+        Ok(client) => client,
+        Err(e) => {
+            error!("Failed to get client from pool: {}", e);
+            reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_millis(
+                    proxy.backend_connect_timeout_ms,
+                ))
+                .timeout(std::time::Duration::from_millis(
+                    proxy.backend_read_timeout_ms,
+                ))
+                .danger_accept_invalid_certs(
+                    !proxy.backend_tls_verify_server_cert || state.env_config.tls_no_verify,
+                )
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new())
+        }
+    };
+
+    let req_method = match method {
+        "GET" => reqwest::Method::GET,
+        "POST" => reqwest::Method::POST,
+        "PUT" => reqwest::Method::PUT,
+        "DELETE" => reqwest::Method::DELETE,
+        "PATCH" => reqwest::Method::PATCH,
+        "HEAD" => reqwest::Method::HEAD,
+        "OPTIONS" => reqwest::Method::OPTIONS,
+        other => match reqwest::Method::from_bytes(other.as_bytes()) {
+            Ok(m) => m,
+            Err(_) => {
+                warn!("HTTP/3: Unsupported HTTP method: {}", other);
+                // Send 405 error directly on the h3 stream
+                send_h3_response(
+                    h3_stream,
+                    StatusCode::METHOD_NOT_ALLOWED,
+                    r#"{"error":"Method not allowed"}"#,
+                )
+                .await?;
+                return Ok((405, HashMap::new(), None));
+            }
+        },
+    };
+
+    let mut req_builder = client.request(req_method, backend_url);
+
+    for (k, v) in headers {
+        match k.as_str() {
+            "host" | ":authority" => {
+                if proxy.preserve_host_header {
+                    req_builder = req_builder.header("Host", v.as_str());
+                } else {
+                    req_builder = req_builder.header("Host", &proxy.backend_host);
+                }
+            }
+            "connection" | "transfer-encoding" => continue,
+            k if k.starts_with(':') => continue,
+            _ => {
+                req_builder = req_builder.header(k, v.as_str());
+            }
+        }
+    }
+
+    if let Some(xff) = headers.get("x-forwarded-for") {
+        req_builder = req_builder.header("X-Forwarded-For", format!("{}, {}", xff, client_ip));
+    } else {
+        req_builder = req_builder.header("X-Forwarded-For", client_ip);
+    }
+    req_builder = req_builder.header("X-Forwarded-Proto", "h3");
+    if let Some(host) = headers.get("host").or_else(|| headers.get(":authority")) {
+        req_builder = req_builder.header("X-Forwarded-Host", host.as_str());
+    }
+
+    if !body_bytes.is_empty() {
+        req_builder = req_builder.body(body_bytes);
+    }
+
+    let response = match req_builder.send().await {
+        Ok(r) => r,
+        Err(e) => {
+            error!("Backend request failed (HTTP/3 streaming): {}", e);
+            let h3_error_class = crate::retry::classify_reqwest_error(&e);
+            send_h3_response(
+                h3_stream,
+                StatusCode::BAD_GATEWAY,
+                r#"{"error":"Backend unavailable"}"#,
+            )
+            .await?;
+            return Ok((502, HashMap::new(), Some(h3_error_class)));
+        }
+    };
+
+    let response_status = response.status().as_u16();
+    let mut response_headers = HashMap::new();
+    for (k, v) in response.headers() {
+        if let Ok(vs) = v.to_str() {
+            response_headers.insert(k.as_str().to_string(), vs.to_string());
+        }
+    }
+
+    // Enforce response body size limit via Content-Length fast path
+    if state.max_response_body_size_bytes > 0
+        && let Some(len) = response
+            .headers()
+            .get("content-length")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<usize>().ok())
+        && len > state.max_response_body_size_bytes
+    {
+        warn!(
+            "Backend response body ({} bytes) exceeds limit ({} bytes)",
+            len, state.max_response_body_size_bytes
+        );
+        send_h3_response(
+            h3_stream,
+            StatusCode::BAD_GATEWAY,
+            r#"{"error":"Backend response body exceeds maximum size"}"#,
+        )
+        .await?;
+        return Ok((
+            502,
+            HashMap::new(),
+            Some(crate::retry::ErrorClass::ResponseBodyTooLarge),
+        ));
+    }
+
+    // after_proxy hooks (run before streaming begins so headers can be modified)
+    {
+        let phase_start = std::time::Instant::now();
+        for plugin in plugins.iter() {
+            let _ = plugin
+                .after_proxy(ctx, response_status, &mut response_headers)
+                .await;
+        }
+        *plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
+    }
+
+    // Send response headers on the H3 stream
+    let status = StatusCode::from_u16(response_status).unwrap_or(StatusCode::BAD_GATEWAY);
+    let mut resp_builder = Response::builder().status(status);
+    for (k, v) in &response_headers {
+        resp_builder = resp_builder.header(k.as_str(), v.as_str());
+    }
+    if !response_headers.contains_key("content-type") {
+        resp_builder = resp_builder.header("content-type", "application/json");
+    }
+    // Remove content-length for streaming — we don't know final size
+    // (backend may use chunked encoding or we may not have Content-Length)
+
+    let resp = resp_builder
+        .body(())
+        .map_err(|e| anyhow::anyhow!("Failed to build HTTP/3 streaming response: {}", e))?;
+    h3_stream.send_response(resp).await?;
+
+    // Stream response body chunks with adaptive coalescing and time-based flushing.
+    //
+    // Design (backpressure-aware):
+    //   Backend stream → adaptive coalescing buffer (BytesMut)
+    //     → flush policy: size threshold | time threshold | FIN
+    //       → send_data() (await respects QUIC flow control / backpressure)
+    //         → QUIC stream
+    //
+    // Key properties:
+    //   - send_data().await blocks when QUIC stream/connection window is exhausted,
+    //     which naturally stops us from reading more upstream data (backpressure).
+    //   - Time-based flush (H3_FLUSH_INTERVAL) prevents latency stalls on small
+    //     or tail chunks that don't reach the size threshold.
+    //   - Adaptive threshold: flush at H3_COALESCE_MIN_BYTES normally, but cap
+    //     at H3_COALESCE_MAX_BYTES to bound per-stream memory.
+    use futures_util::StreamExt as _;
+    let mut byte_stream = response.bytes_stream();
+    let mut coalesce_buf = BytesMut::with_capacity(H3_COALESCE_MAX_BYTES);
+    let mut total_streamed: usize = 0;
+    let mut flush_deadline = tokio::time::Instant::now() + H3_FLUSH_INTERVAL;
+    let mut stream_done = false;
+
+    loop {
+        // Backpressure-aware: we only read from upstream when we can send.
+        // send_data().await blocks on QUIC flow control, which naturally
+        // pauses our reads from the backend — no unbounded buffering.
+        tokio::select! {
+            chunk_opt = byte_stream.next(), if !stream_done => {
+                match chunk_opt {
+                    Some(Ok(chunk)) => {
+                        // Enforce size limit during streaming
+                        if state.max_response_body_size_bytes > 0 {
+                            total_streamed += chunk.len();
+                            if total_streamed > state.max_response_body_size_bytes {
+                                warn!(
+                                    "Backend response exceeded {} byte limit during streaming",
+                                    state.max_response_body_size_bytes
+                                );
+                                h3_stream.finish().await?;
+                                return Ok((
+                                    response_status,
+                                    response_headers,
+                                    Some(crate::retry::ErrorClass::ResponseBodyTooLarge),
+                                ));
+                            }
+                        }
+
+                        coalesce_buf.extend_from_slice(&chunk);
+
+                        // Flush when buffer reaches size threshold (adaptive: min to max range)
+                        if coalesce_buf.len() >= H3_COALESCE_MIN_BYTES {
+                            // split().freeze() is zero-copy: BytesMut → Bytes without realloc
+                            let data = coalesce_buf.split().freeze();
+                            h3_stream.send_data(data).await?;
+                            flush_deadline = tokio::time::Instant::now() + H3_FLUSH_INTERVAL;
+                        }
+                    }
+                    Some(Err(e)) => {
+                        error!("Error reading backend response during streaming: {}", e);
+                        if !coalesce_buf.is_empty() {
+                            let data = coalesce_buf.split().freeze();
+                            let _ = h3_stream.send_data(data).await;
+                        }
+                        h3_stream.finish().await?;
+                        return Ok((response_status, response_headers, None));
+                    }
+                    None => {
+                        // Backend stream ended (FIN) — flush remaining and finish
+                        stream_done = true;
+                    }
+                }
+            }
+
+            // Time-based flush: prevent latency stalls on small/tail chunks
+            // that haven't reached the size threshold yet.
+            _ = tokio::time::sleep_until(flush_deadline), if !coalesce_buf.is_empty() && !stream_done => {
+                let data = coalesce_buf.split().freeze();
+                h3_stream.send_data(data).await?;
+                flush_deadline = tokio::time::Instant::now() + H3_FLUSH_INTERVAL;
+            }
+        }
+
+        // After stream ends, flush any remaining bytes and send FIN
+        if stream_done {
+            if !coalesce_buf.is_empty() {
+                let data = coalesce_buf.split().freeze();
+                h3_stream.send_data(data).await?;
+            }
+            h3_stream.finish().await?;
+            break;
+        }
+    }
+
+    Ok((response_status, response_headers, None))
+}
+
+/// Proxy a request to the backend (buffered path — collects full response body).
 async fn proxy_to_backend_h3(
     state: &ProxyState,
     proxy: &Proxy,

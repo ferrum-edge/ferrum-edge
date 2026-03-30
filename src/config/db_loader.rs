@@ -2321,6 +2321,10 @@ fn row_to_proxy(
             .try_get::<i64, _>("udp_idle_timeout_seconds")
             .map(|v| v.max(0) as u64)
             .unwrap_or(60),
+        tcp_idle_timeout_seconds: row
+            .try_get::<i64, _>("tcp_idle_timeout_seconds")
+            .ok()
+            .map(|v| v.max(0) as u64),
         allowed_methods: row
             .try_get::<String, _>("allowed_methods")
             .ok()

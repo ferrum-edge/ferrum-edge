@@ -71,6 +71,10 @@ impl Http3ConnectionPool {
         format!("{}:{}:{}", proxy.backend_host, proxy.backend_port, index)
     }
 
+    fn pool_key_for_target(host: &str, port: u16, index: usize) -> String {
+        format!("{}:{}:{}", host, port, index)
+    }
+
     /// Send an HTTP/3 request, reusing a cached QUIC connection if available.
     ///
     /// Round-robins across `connections_per_backend` connections to distribute
@@ -141,6 +145,84 @@ impl Http3ConnectionPool {
         .await
     }
 
+    /// Send an HTTP/3 request to an explicit host/port target, independent of
+    /// `proxy.backend_host`/`proxy.backend_port`. Used by the retry path to
+    /// route to a different load-balanced upstream target.
+    ///
+    /// Pool entries are keyed by the explicit target host:port so connections
+    /// are cached and reused per target, not per proxy.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn request_with_target(
+        &self,
+        proxy: &Proxy,
+        target_host: &str,
+        target_port: u16,
+        method: &str,
+        backend_url: &str,
+        headers: &[(http::header::HeaderName, http::header::HeaderValue)],
+        body: bytes::Bytes,
+        tls_config_fn: impl FnOnce() -> Arc<rustls::ClientConfig>,
+    ) -> Result<(u16, Vec<u8>, HashMap<String, String>), anyhow::Error> {
+        let conns_per_backend = proxy
+            .pool_http3_connections_per_backend
+            .unwrap_or(self.connections_per_backend)
+            .max(1);
+        let index = self.conn_counter.fetch_add(1, Ordering::Relaxed) as usize % conns_per_backend;
+        let key = Self::pool_key_for_target(target_host, target_port, index);
+
+        // Try cached connection first
+        if let Some(entry) = self.entries.get(&key) {
+            entry
+                .last_used_epoch_ms
+                .store(now_epoch_ms(), Ordering::Relaxed);
+            let mut sr = entry.send_request.clone();
+            drop(entry);
+
+            match Self::do_request(&mut sr, proxy, method, backend_url, headers, body.clone()).await
+            {
+                Ok(result) => return Ok(result),
+                Err(e) => {
+                    debug!(
+                        "HTTP/3 cached connection to {}:{} failed, reconnecting: {}",
+                        target_host, target_port, e
+                    );
+                    self.entries.remove(&key);
+                }
+            }
+        }
+
+        // Create new connection to the explicit target
+        let tls_config = tls_config_fn();
+        let h3_config = super::config::Http3ServerConfig::from_env_config(&self.env_config);
+        let (endpoint, sr) = Self::create_connection_to_target(
+            target_host,
+            target_port,
+            &tls_config,
+            Some(&h3_config),
+        )
+        .await?;
+        let mut sr_for_request = sr.clone();
+
+        self.entries.insert(
+            key,
+            H3PoolEntry {
+                send_request: sr,
+                _endpoint: endpoint,
+                last_used_epoch_ms: Arc::new(AtomicU64::new(now_epoch_ms())),
+            },
+        );
+
+        Self::do_request(
+            &mut sr_for_request,
+            proxy,
+            method,
+            backend_url,
+            headers,
+            body,
+        )
+        .await
+    }
+
     /// Create a new QUIC endpoint + connection + h3 session.
     async fn create_connection(
         proxy: &Proxy,
@@ -176,6 +258,71 @@ impl Http3ConnectionPool {
         let addr = resolve_backend_addr(host, port).await?;
 
         // Bind to the matching address family (IPv4 or IPv6) based on the resolved backend
+        let bind_addr: SocketAddr = if addr.is_ipv6() {
+            "[::]:0".parse()?
+        } else {
+            "0.0.0.0:0".parse()?
+        };
+        let mut endpoint = quinn::Endpoint::client(bind_addr)?;
+        endpoint.set_default_client_config(client_config);
+
+        debug!(
+            "HTTP/3 pool: connecting to {}:{} (resolved: {})",
+            host, port, addr
+        );
+
+        let connection = endpoint
+            .connect(addr, host)?
+            .await
+            .map_err(|e| anyhow::anyhow!("QUIC connection failed: {}", e))?;
+
+        let (mut driver, send_request) =
+            h3::client::new(h3_quinn::Connection::new(connection)).await?;
+
+        tokio::spawn(async move {
+            let err = futures_util::future::poll_fn(|cx| driver.poll_close(cx)).await;
+            debug!("HTTP/3 pool connection driver closed: {}", err);
+        });
+
+        Ok((endpoint, send_request))
+    }
+
+    /// Create a new QUIC endpoint + connection + h3 session to an explicit host/port.
+    ///
+    /// Used by `request_with_target` for load-balanced retries where the target
+    /// differs from `proxy.backend_host`/`proxy.backend_port`.
+    async fn create_connection_to_target(
+        host: &str,
+        port: u16,
+        tls_config: &Arc<rustls::ClientConfig>,
+        h3_config: Option<&super::config::Http3ServerConfig>,
+    ) -> Result<(quinn::Endpoint, H3SendRequest), anyhow::Error> {
+        let quic_client_config = QuicClientConfig::try_from(tls_config.clone()).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to create QUIC client config (ensure TLS 1.3 cipher suites are available): {}",
+                e
+            )
+        })?;
+
+        let default_cfg = super::config::Http3ServerConfig::default();
+        let cfg = h3_config.unwrap_or(&default_cfg);
+
+        let mut transport_config = quinn::TransportConfig::default();
+        transport_config.stream_receive_window(
+            quinn::VarInt::from_u64(cfg.stream_receive_window)
+                .unwrap_or(quinn::VarInt::from_u32(1_048_576)),
+        );
+        transport_config.receive_window(
+            quinn::VarInt::from_u64(cfg.receive_window)
+                .unwrap_or(quinn::VarInt::from_u32(4_194_304)),
+        );
+        transport_config.send_window(cfg.send_window);
+
+        let mut client_config = quinn::ClientConfig::new(Arc::new(quic_client_config));
+        client_config.transport_config(Arc::new(transport_config));
+
+        let addr = resolve_backend_addr(host, port).await?;
+
         let bind_addr: SocketAddr = if addr.is_ipv6() {
             "[::]:0".parse()?
         } else {

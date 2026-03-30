@@ -50,7 +50,7 @@ use crate::service_discovery::ServiceDiscoveryManager;
 use crate::tls::NoVerifier;
 
 pub use self::body::ProxyBody;
-use self::grpc_proxy::{GrpcConnectionPool, GrpcProxyError};
+use self::grpc_proxy::{GrpcConnectionPool, GrpcProxyError, GrpcResponseKind};
 use self::http2_pool::Http2ConnectionPool;
 
 /// Check if the request is a WebSocket upgrade request.
@@ -264,6 +264,7 @@ impl ProxyState {
             plugin_cache.clone(),
             None, // Frontend TLS for stream proxies is configured per-listener in reconcile()
             env_config_arc.tls_no_verify,
+            env_config_arc.tcp_idle_timeout_seconds,
             env_config_arc.udp_max_sessions,
             env_config_arc.udp_cleanup_interval_seconds,
         ));
@@ -2496,6 +2497,14 @@ pub async fn handle_proxy_request(
         );
         let backend_start = Instant::now();
 
+        // Streaming is safe only when there are no retries and no plugins need
+        // the response body buffered (e.g., ai_token_metrics, ai_rate_limiter).
+        let grpc_has_retry = proxy.retry.is_some();
+        let grpc_should_stream = !grpc_has_retry
+            && !state
+                .plugin_cache
+                .requires_response_body_buffering(&proxy.id);
+
         // First attempt — also captures the buffered body for potential retries
         let (mut grpc_result, grpc_body_bytes) = grpc_proxy::proxy_grpc_request(
             req,
@@ -2504,6 +2513,7 @@ pub async fn handle_proxy_request(
             &state.grpc_pool,
             &state.dns_cache,
             proxy_headers,
+            grpc_should_stream,
         )
         .await;
 
@@ -2606,7 +2616,99 @@ pub async fn handle_proxy_request(
         let backend_total_ms = backend_start.elapsed().as_secs_f64() * 1000.0;
 
         match grpc_result {
-            Ok(grpc_resp) => {
+            Ok(GrpcResponseKind::Streaming(grpc_streaming)) => {
+                // Frame-by-frame streaming path: headers arrived, body not buffered.
+                // after_proxy plugins run on headers only (body is not yet in memory).
+                let mut response_headers: HashMap<String, String> = grpc_streaming.headers;
+                {
+                    let phase_start = Instant::now();
+                    for plugin in plugins.iter() {
+                        if let PluginResult::Reject { status_code, .. } = plugin
+                            .after_proxy(&mut ctx, grpc_streaming.status, &mut response_headers)
+                            .await
+                        {
+                            warn!(
+                                "after_proxy plugin '{}' returned Reject (status {}), but response is already committed",
+                                plugin.name(),
+                                status_code,
+                            );
+                        }
+                    }
+                    plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
+                }
+
+                let total_ms = start_time.elapsed().as_secs_f64() * 1000.0;
+                let plugin_execution_ms = plugin_execution_ns as f64 / 1_000_000.0;
+                let plugin_external_io_ms =
+                    ctx.plugin_http_call_ns.load(Ordering::Relaxed) as f64 / 1_000_000.0;
+                let gateway_processing_ms = total_ms - backend_total_ms;
+                let gateway_overhead_ms =
+                    (total_ms - backend_total_ms - plugin_execution_ms).max(0.0);
+
+                if !plugins.is_empty() {
+                    let grpc_resolved_ip = state
+                        .dns_cache
+                        .resolve(
+                            &proxy.backend_host,
+                            proxy.dns_override.as_deref(),
+                            proxy.dns_cache_ttl_seconds,
+                        )
+                        .await
+                        .ok()
+                        .map(|ip| ip.to_string());
+
+                    let summary = TransactionSummary {
+                        timestamp_received: ctx.timestamp_received.to_rfc3339(),
+                        client_ip: ctx.client_ip.clone(),
+                        consumer_username: ctx
+                            .identified_consumer
+                            .as_ref()
+                            .map(|c| c.username.clone()),
+                        http_method: method,
+                        request_path: path,
+                        matched_proxy_id: Some(proxy.id.clone()),
+                        matched_proxy_name: proxy.name.clone(),
+                        backend_target_url: Some(strip_query_params(&grpc_backend_url).to_string()),
+                        backend_resolved_ip: grpc_resolved_ip,
+                        response_status_code: grpc_streaming.status,
+                        latency_total_ms: total_ms,
+                        latency_gateway_processing_ms: gateway_processing_ms,
+                        latency_backend_ttfb_ms: backend_total_ms,
+                        latency_backend_total_ms: backend_total_ms,
+                        latency_plugin_execution_ms: plugin_execution_ms,
+                        latency_plugin_external_io_ms: plugin_external_io_ms,
+                        latency_gateway_overhead_ms: gateway_overhead_ms,
+                        request_user_agent: ctx.headers.get("user-agent").cloned(),
+                        response_streamed: true,
+                        client_disconnected: false,
+                        error_class: None,
+                        metadata: ctx.metadata.clone(),
+                    };
+                    for plugin in plugins.iter() {
+                        plugin.log(&summary).await;
+                    }
+                }
+
+                record_request(&state, grpc_streaming.status);
+
+                // Build the response with the live Incoming body — hyper will forward
+                // DATA frames and TRAILERS to the downstream client as they arrive.
+                let mut resp_builder = Response::builder()
+                    .status(StatusCode::from_u16(grpc_streaming.status).unwrap_or(StatusCode::OK));
+                for (k, v) in &response_headers {
+                    resp_builder = resp_builder.header(k.as_str(), v.as_str());
+                }
+
+                return Ok(resp_builder
+                    .body(ProxyBody::streaming_incoming(grpc_streaming.body))
+                    .unwrap_or_else(|_| {
+                        grpc_proxy::build_grpc_error_response(
+                            grpc_proxy::grpc_status::UNAVAILABLE,
+                            "Internal gateway error",
+                        )
+                    }));
+            }
+            Ok(GrpcResponseKind::Buffered(grpc_resp)) => {
                 let mut response_headers: HashMap<String, String> = grpc_resp.headers;
 
                 // Forward trailers as response headers (gRPC Trailers-Only encoding)
@@ -2927,19 +3029,34 @@ pub async fn handle_proxy_request(
             // the body was never sent, so replaying is correct and safe.
             // The final retry attempt uses streaming if configured.
             let is_last_attempt = attempt >= retry_config.max_retries;
-            result = proxy_to_backend_retry(
-                &state,
-                &proxy,
-                &current_url,
-                &method,
-                proxy_headers,
-                current_target.as_ref(),
-                retained_body.as_deref(),
-                should_stream && is_last_attempt,
-                &ctx.client_ip,
-                is_tls,
-            )
-            .await;
+            result = if matches!(proxy.backend_protocol, BackendProtocol::H3) {
+                proxy_to_backend_http3_retry(
+                    &state,
+                    &proxy,
+                    &current_url,
+                    &method,
+                    proxy_headers,
+                    current_target.as_ref(),
+                    retained_body.as_deref(),
+                    &ctx.client_ip,
+                    is_tls,
+                )
+                .await
+            } else {
+                proxy_to_backend_retry(
+                    &state,
+                    &proxy,
+                    &current_url,
+                    &method,
+                    proxy_headers,
+                    current_target.as_ref(),
+                    retained_body.as_deref(),
+                    should_stream && is_last_attempt,
+                    &ctx.client_ip,
+                    is_tls,
+                )
+                .await
+            };
         }
         (result, current_cb_target_key)
     } else {
@@ -3619,35 +3736,34 @@ async fn proxy_to_backend(
     // Handle HTTP/3 backend requests differently (always buffered — h3 crate
     // doesn't expose a streaming body API compatible with reqwest::Response)
     if matches!(proxy.backend_protocol, BackendProtocol::H3) {
-        let (status, body, hdrs) = proxy_to_backend_http3(
+        let (backend_resp, body_bytes) = proxy_to_backend_http3(
             state,
             proxy,
             backend_url,
             method,
             headers,
             original_req,
+            upstream_target,
             client_ip,
+            retain_request_body,
         )
         .await;
-        return (
-            retry::BackendResponse {
-                status_code: status,
-                body: ResponseBody::Buffered(body),
-                headers: hdrs,
-                connection_error: false,
-                backend_resolved_ip: resolved_ip.clone(),
-                error_class: None,
-            },
-            None,
-        );
+        // Merge resolved_ip into the response (h3 function resolves its own IP
+        // but the outer resolved_ip is already computed from DNS cache above)
+        let resp = retry::BackendResponse {
+            backend_resolved_ip: resolved_ip.clone().or(backend_resp.backend_resolved_ip),
+            ..backend_resp
+        };
+        return (resp, body_bytes);
     }
 
-    // Use HTTP/2 multiplexing pool for HTTPS backends with H2 enabled.
-    // This avoids reqwest's connection-per-burst behavior by multiplexing
-    // concurrent requests over a single persistent TLS+H2 connection.
+    // Use HTTP/2 multiplexing pool for HTTPS backends with H2 enabled,
+    // but only when body retention is NOT required (i.e., no retries configured).
+    // When retries are configured, we fall through to the reqwest path which
+    // auto-negotiates HTTP/2 via ALPN on TLS and supports body replay natively.
     if matches!(proxy.backend_protocol, BackendProtocol::Https) {
         let pool_config = state.connection_pool.global_pool_config().for_proxy(proxy);
-        if pool_config.enable_http2 {
+        if pool_config.enable_http2 && !retain_request_body {
             return (
                 proxy_to_backend_http2(
                     state,
@@ -3663,6 +3779,12 @@ async fn proxy_to_backend(
                 )
                 .await,
                 None,
+            );
+        }
+        if pool_config.enable_http2 && retain_request_body {
+            debug!(
+                proxy_id = %proxy.id,
+                "H2 pool bypassed for retry support — using reqwest (ALPN HTTP/2)"
             );
         }
     }
@@ -4491,6 +4613,7 @@ async fn proxy_to_backend_http2(
 }
 
 /// Proxy the request to an HTTP/3 backend.
+#[allow(clippy::too_many_arguments)]
 async fn proxy_to_backend_http3(
     state: &ProxyState,
     proxy: &Proxy,
@@ -4498,14 +4621,29 @@ async fn proxy_to_backend_http3(
     method: &str,
     headers: &HashMap<String, String>,
     original_req: Request<Incoming>,
+    upstream_target: Option<&UpstreamTarget>,
     client_ip: &str,
-) -> (u16, Vec<u8>, HashMap<String, String>) {
+    retain_request_body: bool,
+) -> (retry::BackendResponse, Option<Vec<u8>>) {
     debug!(proxy_id = %proxy.id, backend_url = %backend_url, "Proxying request to HTTP/3 backend");
 
-    // TLS config creation is deferred to the H3 pool's cache-miss path to avoid
-    // cloning the root certificate store (~120 certs) on every request.
+    // Resolve backend IP from DNS cache for the effective host
+    let effective_host = upstream_target
+        .map(|t| t.host.as_str())
+        .unwrap_or(&proxy.backend_host);
+    let resolved_ip = state
+        .dns_cache
+        .resolve(
+            effective_host,
+            proxy.dns_override.as_deref(),
+            proxy.dns_cache_ttl_seconds,
+        )
+        .await
+        .ok()
+        .map(|ip| ip.to_string());
 
-    // Read request body with size limit
+    // Read request body with size limit. HTTP/3 is always buffered — the h3
+    // crate requires the full body before sending the request.
     let (_parts, body) = original_req.into_parts();
     let request_body = if state.max_request_body_size_bytes > 0 {
         // Check Content-Length fast path
@@ -4514,9 +4652,17 @@ async fn proxy_to_backend_http3(
             && len > state.max_request_body_size_bytes
         {
             return (
-                413,
-                r#"{"error":"Request body exceeds maximum size"}"#.as_bytes().to_vec(),
-                HashMap::new(),
+                retry::BackendResponse {
+                    status_code: 413,
+                    body: ResponseBody::Buffered(
+                        r#"{"error":"Request body exceeds maximum size"}"#.as_bytes().to_vec(),
+                    ),
+                    headers: HashMap::new(),
+                    connection_error: false,
+                    backend_resolved_ip: resolved_ip,
+                    error_class: Some(retry::ErrorClass::RequestBodyTooLarge),
+                },
+                None,
             );
         }
         let limited = http_body_util::Limited::new(body, state.max_request_body_size_bytes);
@@ -4524,9 +4670,17 @@ async fn proxy_to_backend_http3(
             Ok(collected) => collected.to_bytes(),
             Err(_) => {
                 return (
-                    413,
-                    r#"{"error":"Request body exceeds maximum size"}"#.as_bytes().to_vec(),
-                    HashMap::new(),
+                    retry::BackendResponse {
+                        status_code: 413,
+                        body: ResponseBody::Buffered(
+                            r#"{"error":"Request body exceeds maximum size"}"#.as_bytes().to_vec(),
+                        ),
+                        headers: HashMap::new(),
+                        connection_error: false,
+                        backend_resolved_ip: resolved_ip,
+                        error_class: Some(retry::ErrorClass::RequestBodyTooLarge),
+                    },
+                    None,
                 );
             }
         }
@@ -4541,9 +4695,28 @@ async fn proxy_to_backend_http3(
                     error = %e,
                     "Client disconnected while sending request body (HTTP/3)"
                 );
-                Bytes::new()
+                return (
+                    retry::BackendResponse {
+                        status_code: 499,
+                        body: ResponseBody::Buffered(
+                            r#"{"error":"Client disconnected"}"#.as_bytes().to_vec(),
+                        ),
+                        headers: HashMap::new(),
+                        connection_error: true,
+                        backend_resolved_ip: resolved_ip,
+                        error_class: Some(retry::ErrorClass::ClientDisconnect),
+                    },
+                    None,
+                );
             }
         }
+    };
+
+    // Retain the body for retries (always safe for H3 since we always buffer)
+    let retained_body = if retain_request_body && !request_body.is_empty() {
+        Some(request_body.to_vec())
+    } else {
+        None
     };
 
     // Convert headers to HTTP/3 format
@@ -4583,34 +4756,58 @@ async fn proxy_to_backend_http3(
         ));
     }
 
-    // Make HTTP/3 request via connection pool (reuses QUIC connections)
+    // Make HTTP/3 request via connection pool (reuses QUIC connections).
+    // When an upstream target is specified, use it for target-aware pool keying.
     let connection_pool = state.connection_pool.clone();
     let proxy_clone = proxy.clone();
-    match state
-        .h3_pool
-        .request(
-            proxy,
-            method,
-            backend_url,
-            &http3_headers,
-            request_body,
-            move || connection_pool.get_tls_config_for_backend(&proxy_clone),
-        )
-        .await
-    {
+    let h3_result = if let Some(target) = upstream_target {
+        let target_host = target.host.clone();
+        let target_port = target.port;
+        state
+            .h3_pool
+            .request_with_target(
+                proxy,
+                &target_host,
+                target_port,
+                method,
+                backend_url,
+                &http3_headers,
+                request_body,
+                move || connection_pool.get_tls_config_for_backend(&proxy_clone),
+            )
+            .await
+    } else {
+        state
+            .h3_pool
+            .request(
+                proxy,
+                method,
+                backend_url,
+                &http3_headers,
+                request_body,
+                move || connection_pool.get_tls_config_for_backend(&proxy_clone),
+            )
+            .await
+    };
+
+    match h3_result {
         Ok(response) => {
             debug!(proxy_id = %proxy.id, status = response.0, "HTTP/3 backend request successful");
-            (response.0, response.1, response.2)
+            (
+                retry::BackendResponse {
+                    status_code: response.0,
+                    body: ResponseBody::Buffered(response.1),
+                    headers: response.2,
+                    connection_error: false,
+                    backend_resolved_ip: resolved_ip,
+                    error_class: None,
+                },
+                retained_body,
+            )
         }
         Err(e) => {
-            let error_kind =
-                if e.to_string().contains("timeout") || e.to_string().contains("timed out") {
-                    "read_timeout"
-                } else if e.to_string().contains("connect") || e.to_string().contains("refused") {
-                    "connect_failure"
-                } else {
-                    "request_error"
-                };
+            let error_str = e.to_string();
+            let (error_kind, is_conn_error, error_class) = classify_h3_error(&error_str);
             error!(
                 proxy_id = %proxy.id,
                 backend_url = %backend_url,
@@ -4619,10 +4816,233 @@ async fn proxy_to_backend_http3(
                 "HTTP/3 backend request failed"
             );
             (
-                502,
-                r#"{"error":"HTTP/3 backend request failed"}"#.as_bytes().to_vec(),
-                HashMap::new(),
+                retry::BackendResponse {
+                    status_code: 502,
+                    body: ResponseBody::Buffered(
+                        r#"{"error":"HTTP/3 backend request failed"}"#.as_bytes().to_vec(),
+                    ),
+                    headers: HashMap::new(),
+                    connection_error: is_conn_error,
+                    backend_resolved_ip: resolved_ip,
+                    error_class: Some(error_class),
+                },
+                retained_body,
             )
+        }
+    }
+}
+
+/// Classify an HTTP/3/QUIC error string into (error_kind, is_connection_error, ErrorClass).
+///
+/// Called only on the error path — not hot path.
+fn classify_h3_error(error_str: &str) -> (&'static str, bool, retry::ErrorClass) {
+    let lower = error_str.to_lowercase();
+    if lower.contains("dns") || lower.contains("resolve") || lower.contains("no record found") {
+        ("dns_failure", true, retry::ErrorClass::DnsLookupError)
+    } else if lower.contains("tls")
+        || lower.contains("certificate")
+        || lower.contains("ssl")
+        || lower.contains("handshake")
+        || lower.contains("invalid server name")
+    {
+        ("tls_error", true, retry::ErrorClass::TlsError)
+    } else if lower.contains("timeout") || lower.contains("timed out") {
+        if lower.contains("connect") {
+            (
+                "connect_timeout",
+                true,
+                retry::ErrorClass::ConnectionTimeout,
+            )
+        } else {
+            ("read_timeout", false, retry::ErrorClass::ReadWriteTimeout)
+        }
+    } else if lower.contains("refused") {
+        (
+            "connect_failure",
+            true,
+            retry::ErrorClass::ConnectionRefused,
+        )
+    } else if lower.contains("quic connection failed")
+        || lower.contains("connection reset")
+        || lower.contains("reset")
+    {
+        ("connect_failure", true, retry::ErrorClass::ConnectionReset)
+    } else if lower.contains("protocol")
+        || lower.contains("goaway")
+        || lower.contains("h3")
+        || lower.contains("stream")
+    {
+        ("protocol_error", false, retry::ErrorClass::ProtocolError)
+    } else {
+        ("request_error", false, retry::ErrorClass::RequestError)
+    }
+}
+
+/// Replay a saved HTTP/3 request to an explicit target (used during retries).
+///
+/// Accepts pre-collected body bytes, method, URI, and headers so the original
+/// `Request<Incoming>` body (already consumed) can be replayed. Mirrors the
+/// pattern used by `proxy_to_backend_retry` for HTTP/1.1.
+#[allow(clippy::too_many_arguments)]
+async fn proxy_to_backend_http3_retry(
+    state: &ProxyState,
+    proxy: &Proxy,
+    backend_url: &str,
+    method: &str,
+    headers: &HashMap<String, String>,
+    upstream_target: Option<&UpstreamTarget>,
+    request_body: Option<&[u8]>,
+    client_ip: &str,
+    is_tls: bool,
+) -> retry::BackendResponse {
+    let effective_host = upstream_target
+        .map(|t| t.host.as_str())
+        .unwrap_or(&proxy.backend_host);
+    let effective_port = upstream_target
+        .map(|t| t.port)
+        .unwrap_or(proxy.backend_port);
+
+    let resolved_ip = state
+        .dns_cache
+        .resolve(
+            effective_host,
+            proxy.dns_override.as_deref(),
+            proxy.dns_cache_ttl_seconds,
+        )
+        .await
+        .ok()
+        .map(|ip| ip.to_string());
+
+    // Build HTTP/3 headers from the saved headers map
+    let mut http3_headers: Vec<(hyper::header::HeaderName, hyper::header::HeaderValue)> =
+        Vec::new();
+    for (name, value) in headers {
+        match name.as_str() {
+            "connection"
+            | "transfer-encoding"
+            | "keep-alive"
+            | "te"
+            | "trailer"
+            | "proxy-authorization"
+            | "proxy-connection"
+            | "upgrade" => continue,
+            "host" => {
+                // Use effective upstream host unless preserve_host_header is set
+                let host_value = if proxy.preserve_host_header {
+                    value.as_str()
+                } else {
+                    effective_host
+                };
+                if let (Ok(hn), Ok(hv)) = (
+                    "host".parse::<hyper::header::HeaderName>(),
+                    host_value.parse::<hyper::header::HeaderValue>(),
+                ) {
+                    http3_headers.push((hn, hv));
+                }
+            }
+            _ => {
+                if let (Ok(hn), Ok(hv)) = (name.parse(), value.parse()) {
+                    http3_headers.push((hn, hv));
+                }
+            }
+        }
+    }
+
+    // X-Forwarded-* headers
+    let xff_val = build_xff_value(
+        headers.get("x-forwarded-for").map(|s| s.as_str()),
+        client_ip,
+    );
+    if let Ok(v) = xff_val.parse() {
+        http3_headers.push((hyper::header::HeaderName::from_static("x-forwarded-for"), v));
+    }
+    let proto = if is_tls { "https" } else { "http" };
+    if let Ok(v) = proto.parse() {
+        http3_headers.push((
+            hyper::header::HeaderName::from_static("x-forwarded-proto"),
+            v,
+        ));
+    }
+    if let Some(host) = headers.get("host")
+        && let Ok(v) = host.parse()
+    {
+        http3_headers.push((
+            hyper::header::HeaderName::from_static("x-forwarded-host"),
+            v,
+        ));
+    }
+
+    let body_bytes = bytes::Bytes::copy_from_slice(request_body.unwrap_or(&[]));
+
+    let connection_pool = state.connection_pool.clone();
+    let proxy_clone = proxy.clone();
+    let h3_result = if let Some(target) = upstream_target {
+        let target_host = target.host.clone();
+        let target_port = target.port;
+        state
+            .h3_pool
+            .request_with_target(
+                proxy,
+                &target_host,
+                target_port,
+                method,
+                backend_url,
+                &http3_headers,
+                body_bytes,
+                move || connection_pool.get_tls_config_for_backend(&proxy_clone),
+            )
+            .await
+    } else {
+        state
+            .h3_pool
+            .request(
+                proxy,
+                method,
+                backend_url,
+                &http3_headers,
+                body_bytes,
+                move || connection_pool.get_tls_config_for_backend(&proxy_clone),
+            )
+            .await
+    };
+
+    match h3_result {
+        Ok(response) => {
+            debug!(
+                proxy_id = %proxy.id,
+                status = response.0,
+                "HTTP/3 backend retry request successful"
+            );
+            retry::BackendResponse {
+                status_code: response.0,
+                body: ResponseBody::Buffered(response.1),
+                headers: response.2,
+                connection_error: false,
+                backend_resolved_ip: resolved_ip,
+                error_class: None,
+            }
+        }
+        Err(e) => {
+            let error_str = e.to_string();
+            let (error_kind, is_conn_error, error_class) = classify_h3_error(&error_str);
+            error!(
+                proxy_id = %proxy.id,
+                backend_url = %backend_url,
+                target = %format!("{}:{}", effective_host, effective_port),
+                error_kind = error_kind,
+                error = %e,
+                "HTTP/3 backend retry request failed"
+            );
+            retry::BackendResponse {
+                status_code: 502,
+                body: ResponseBody::Buffered(
+                    r#"{"error":"HTTP/3 backend request failed"}"#.as_bytes().to_vec(),
+                ),
+                headers: HashMap::new(),
+                connection_error: is_conn_error,
+                backend_resolved_ip: resolved_ip,
+                error_class: Some(error_class),
+            }
         }
     }
 }

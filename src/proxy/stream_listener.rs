@@ -52,6 +52,8 @@ pub struct StreamListenerManager {
     frontend_dtls_client_ca_path: arc_swap::ArcSwap<Option<String>>,
     /// Global override to disable backend TLS certificate verification.
     tls_no_verify: bool,
+    /// Global default TCP idle timeout in seconds (per-proxy `tcp_idle_timeout_seconds` overrides).
+    tcp_idle_timeout_seconds: u64,
     /// Maximum concurrent UDP sessions per proxy.
     udp_max_sessions: usize,
     /// UDP session cleanup interval in seconds.
@@ -68,6 +70,7 @@ impl StreamListenerManager {
         plugin_cache: Arc<PluginCache>,
         frontend_tls_config: Option<Arc<rustls::ServerConfig>>,
         tls_no_verify: bool,
+        tcp_idle_timeout_seconds: u64,
         udp_max_sessions: usize,
         udp_cleanup_interval_seconds: u64,
     ) -> Self {
@@ -82,6 +85,7 @@ impl StreamListenerManager {
             frontend_dtls_cert_key: arc_swap::ArcSwap::new(Arc::new(None)),
             frontend_dtls_client_ca_path: arc_swap::ArcSwap::new(Arc::new(None)),
             tls_no_verify,
+            tcp_idle_timeout_seconds,
             udp_max_sessions,
             udp_cleanup_interval_seconds,
         }
@@ -270,6 +274,7 @@ impl StreamListenerManager {
                 };
                 let metrics = Arc::new(TcpProxyMetrics::default());
                 let plugin_cache = self.plugin_cache.clone();
+                let tcp_idle_timeout = self.tcp_idle_timeout_seconds;
                 tokio::spawn(async move {
                     if let Err(e) = super::tcp_proxy::start_tcp_listener(TcpListenerConfig {
                         port: port_val,
@@ -283,6 +288,7 @@ impl StreamListenerManager {
                         metrics,
                         tls_no_verify,
                         plugin_cache,
+                        tcp_idle_timeout_seconds: tcp_idle_timeout,
                     })
                     .await
                     {

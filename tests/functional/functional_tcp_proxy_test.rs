@@ -521,7 +521,90 @@ plugin_configs: []
     echo_server.abort();
 }
 
-/// Test 5: TCP proxy handles connection to unreachable backend gracefully.
+/// Test 5: TCP idle timeout — gateway closes connection after inactivity.
+///
+/// Creates a TCP proxy with `tcp_idle_timeout_seconds: 2`, connects, exchanges
+/// data, then idles for 3 seconds. The gateway should close the connection
+/// before the test's read timeout fires.
+#[ignore]
+#[tokio::test]
+async fn test_tcp_proxy_idle_timeout() {
+    let backend_port = 19809u16;
+    let proxy_port = 19810u16;
+    let gateway_http_port = 18205u16;
+
+    let echo_server = start_tcp_echo_server(backend_port).await;
+
+    let temp_dir = TempDir::new().unwrap();
+    let config_path = temp_dir.path().join("config.yaml");
+    write_config(
+        &config_path,
+        &format!(
+            r#"
+proxies:
+  - id: "tcp-idle-timeout"
+    listen_path: ""
+    listen_port: {proxy_port}
+    backend_protocol: tcp
+    backend_host: "127.0.0.1"
+    backend_port: {backend_port}
+    tcp_idle_timeout_seconds: 2
+
+consumers: []
+plugin_configs: []
+"#
+        ),
+    );
+
+    let mut gateway = start_gateway(config_path.to_str().unwrap(), gateway_http_port, None, None)
+        .expect("Failed to start gateway");
+    sleep(Duration::from_secs(3)).await;
+
+    let mut stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", proxy_port))
+        .await
+        .expect("Failed to connect to TCP proxy");
+
+    // Send data and receive echo to confirm the connection is live.
+    let test_data = b"ping";
+    stream.write_all(test_data).await.expect("Failed to send");
+
+    let mut buf = vec![0u8; 64];
+    let n = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf))
+        .await
+        .expect("Echo read timed out")
+        .expect("Echo read error");
+    assert_eq!(&buf[..n], test_data, "Echo response should match sent data");
+
+    // Now go idle for longer than the configured timeout (2s).
+    sleep(Duration::from_secs(3)).await;
+
+    // The gateway should have closed the connection. A read should return
+    // either 0 bytes (clean close) or an error — not block indefinitely.
+    let read_result = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf)).await;
+
+    match read_result {
+        Ok(Ok(0)) => {}  // Connection closed cleanly — expected
+        Ok(Err(_)) => {} // Connection reset — also acceptable
+        Ok(Ok(_)) => {
+            // Some stale data arrived; attempt another read to detect closure.
+            let second = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf)).await;
+            match second {
+                Ok(Ok(0)) | Ok(Err(_)) => {} // Closed after draining — ok
+                Ok(Ok(_)) => {
+                    panic!("Connection should be closed by idle timeout, but keeps yielding data")
+                }
+                Err(_) => panic!("Timed out waiting for closure after stale data"),
+            }
+        }
+        Err(_) => panic!("Timed out waiting for idle-timeout closure; connection stayed open"),
+    }
+
+    let _ = gateway.kill();
+    let _ = gateway.wait();
+    echo_server.abort();
+}
+
+/// Test 6 (formerly 5): TCP proxy handles connection to unreachable backend gracefully.
 #[ignore]
 #[tokio::test]
 async fn test_tcp_proxy_backend_unreachable() {

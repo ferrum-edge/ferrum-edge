@@ -68,6 +68,8 @@ pub const MAX_SD_POLL_INTERVAL: u64 = 3600;
 pub const MAX_HEALTH_CHECK_INTERVAL: u64 = 3600;
 /// Maximum UDP idle timeout in seconds (1 hour).
 pub const MAX_UDP_IDLE_TIMEOUT: u64 = 3600;
+/// Maximum TCP idle timeout in seconds (24 hours).
+pub const MAX_TCP_IDLE_TIMEOUT: u64 = 86_400;
 /// Maximum pool idle timeout in seconds (1 hour).
 pub const MAX_POOL_IDLE_TIMEOUT: u64 = 3600;
 /// Maximum DNS cache TTL in seconds (24 hours).
@@ -174,6 +176,8 @@ pub enum HealthProbeType {
     Tcp,
     /// UDP probe. Sends `udp_probe_payload` and expects any response within timeout.
     Udp,
+    /// gRPC health check using the standard grpc.health.v1.Health/Check RPC.
+    Grpc,
 }
 
 /// Active health check configuration.
@@ -201,6 +205,10 @@ pub struct ActiveHealthCheck {
     /// Sent to the target; any response within timeout means healthy.
     #[serde(default)]
     pub udp_probe_payload: Option<String>,
+    /// Service name for gRPC health check requests (grpc.health.v1.Health/Check).
+    /// Empty string (default) checks overall server health.
+    #[serde(default)]
+    pub grpc_service_name: Option<String>,
 }
 
 impl Default for ActiveHealthCheck {
@@ -215,6 +223,7 @@ impl Default for ActiveHealthCheck {
             use_tls: false,
             probe_type: HealthProbeType::default(),
             udp_probe_payload: None,
+            grpc_service_name: None,
         }
     }
 }
@@ -781,6 +790,12 @@ pub struct Proxy {
     /// the UDP session mapping is removed. Default: 60 seconds.
     #[serde(default = "default_udp_idle_timeout")]
     pub udp_idle_timeout_seconds: u64,
+    /// TCP stream idle timeout in seconds. After this duration of no data
+    /// transfer in either direction, the connection is closed.
+    /// Per-proxy override; when `None`, uses the global `FERRUM_TCP_IDLE_TIMEOUT_SECONDS`
+    /// (default: 300s / 5 min). Set to 0 to disable (rely on OS TCP timeouts only).
+    #[serde(default)]
+    pub tcp_idle_timeout_seconds: Option<u64>,
     /// Optional list of allowed HTTP methods (e.g., ["GET", "POST"]).
     /// When `None` (default), all methods are allowed. When `Some`, requests
     /// with methods not in the list receive 405 Method Not Allowed.
@@ -1660,6 +1675,16 @@ impl Proxy {
             MAX_UDP_IDLE_TIMEOUT,
         ) {
             errors.push(e);
+        }
+
+        // TCP idle timeout (0 means disabled, so only reject values above the max)
+        if let Some(v) = self.tcp_idle_timeout_seconds
+            && v > MAX_TCP_IDLE_TIMEOUT
+        {
+            errors.push(format!(
+                "tcp_idle_timeout_seconds must be between 0 and {} (got {})",
+                MAX_TCP_IDLE_TIMEOUT, v
+            ));
         }
 
         // HTTP/2 flow control validation

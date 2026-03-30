@@ -56,6 +56,7 @@ fn make_proxy(id: &str, listen_path: &str, plugin_ids: Vec<&str>) -> Proxy {
         listen_port: None,
         frontend_tls: false,
         udp_idle_timeout_seconds: 60,
+        tcp_idle_timeout_seconds: Some(300),
         allowed_methods: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),

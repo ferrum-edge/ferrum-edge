@@ -8,6 +8,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build_client(true)
         .compile_protos(&["proto/ferrum.proto"], &["proto/"])?;
 
+    tonic_build::compile_protos("proto/health.proto")?;
+
     // ── Auto-discover custom plugins ────────────────────────────────────
     //
     // Scans custom_plugins/*.rs for files that export a `create_plugin`
