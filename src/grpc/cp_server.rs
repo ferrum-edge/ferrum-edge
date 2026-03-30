@@ -139,14 +139,28 @@ impl ConfigSync for CpGrpcServer {
         };
 
         let rx = self.update_tx.subscribe();
-        let stream = BroadcastStream::new(rx).filter_map(|result| match result {
+        let config_for_recovery = self.config.clone();
+        let stream = BroadcastStream::new(rx).filter_map(move |result| match result {
             Ok(update) => Some(Ok(update)),
             Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
                 warn!(
-                    "DP config stream lagged behind by {} updates — DP may have stale config",
+                    "DP config stream lagged behind by {} updates — sending full snapshot to recover",
                     n
                 );
-                None
+                // Send a full config snapshot so the DP recovers from missed deltas.
+                let current = config_for_recovery.load_full();
+                match serde_json::to_string(current.as_ref()) {
+                    Ok(config_json) => Some(Ok(ConfigUpdate {
+                        update_type: 0, // FULL_SNAPSHOT
+                        config_json,
+                        version: current.loaded_at.to_rfc3339(),
+                        timestamp: chrono::Utc::now().timestamp(),
+                    })),
+                    Err(e) => {
+                        error!("Failed to serialize recovery snapshot: {}", e);
+                        None
+                    }
+                }
             }
         });
 

@@ -1022,7 +1022,18 @@ async fn handle_websocket_request_authenticated(
                 };
 
                 if should_retry_ws {
-                    let retry_config = proxy.retry.as_ref().unwrap_or_else(|| unreachable!());
+                    // Safety: should_retry_ws is only true when proxy.retry.is_some()
+                    // (see condition above). Fall through to 502 if the invariant
+                    // ever breaks due to a refactor, rather than panicking.
+                    let retry_config = match proxy.retry.as_ref() {
+                        Some(rc) => rc,
+                        None => {
+                            return Ok(build_response(
+                                StatusCode::BAD_GATEWAY,
+                                r#"{"error":"Backend WebSocket connection failed"}"#,
+                            ));
+                        }
+                    };
 
                     // Record circuit breaker failure for current target
                     if let Some(cb_config) = &proxy.circuit_breaker {

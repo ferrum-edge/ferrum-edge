@@ -51,7 +51,8 @@ pub struct UdpProxyMetrics {
 
 /// A UDP session tracking a single client's connection to a backend.
 struct UdpSession {
-    backend_socket: Arc<UdpSocket>,
+    /// Plain UDP backend socket. `None` when using DTLS (traffic goes through `dtls_conn`).
+    backend_socket: Option<Arc<UdpSocket>>,
     /// DTLS connection wrapping the backend socket (set when `backend_protocol == Dtls`).
     dtls_conn: Option<Arc<webrtc_dtls::conn::DTLSConn>>,
     last_activity: AtomicU64, // epoch millis
@@ -351,8 +352,10 @@ async fn process_datagram(
         dtls.write(data, None)
             .await
             .map_err(|e| std::io::Error::other(e.to_string()))
+    } else if let Some(ref sock) = session.backend_socket {
+        sock.send(data).await
     } else {
-        session.backend_socket.send(data).await
+        return Err(anyhow::anyhow!("no backend socket available"));
     };
 
     match send_result {
@@ -390,14 +393,19 @@ async fn lookup_or_create_session(
         return Ok(existing.value().clone());
     }
 
-    if sessions.len() >= max_sessions {
+    // Atomically reserve a slot: increment active_sessions first, then check the limit.
+    // If we exceed the limit, undo the increment and reject. This prevents the TOCTOU
+    // race where multiple concurrent connections all pass a len() check before any insert.
+    let prev = metrics.active_sessions.fetch_add(1, Ordering::Relaxed);
+    if prev >= max_sessions as u64 {
+        metrics.active_sessions.fetch_sub(1, Ordering::Relaxed);
         return Err(anyhow::anyhow!(
             "UDP session limit reached ({}), dropping datagram",
             max_sessions
         ));
     }
 
-    create_session(
+    match create_session(
         proxy_id,
         config,
         dns_cache,
@@ -413,6 +421,14 @@ async fn lookup_or_create_session(
         listen_port,
     )
     .await
+    {
+        Ok(session) => Ok(session),
+        Err(e) => {
+            // Session creation failed — release the reserved slot.
+            metrics.active_sessions.fetch_sub(1, Ordering::Relaxed);
+            Err(e)
+        }
+    }
 }
 
 /// Spawn a background task that periodically removes idle UDP sessions.
@@ -554,9 +570,11 @@ async fn start_dtls_frontend_listener(
                     }
                 };
 
-                // Check session limit
-                let active = metrics.active_sessions.load(Ordering::Relaxed);
-                if active >= max_sessions as u64 {
+                // Atomically reserve a session slot before the DTLS handshake
+                // to prevent TOCTOU race where concurrent accepts all pass a load() check.
+                let prev = metrics.active_sessions.fetch_add(1, Ordering::Relaxed);
+                if prev >= max_sessions as u64 {
+                    metrics.active_sessions.fetch_sub(1, Ordering::Relaxed);
                     warn!(
                         proxy_id = %proxy_id,
                         client = %client_addr,
@@ -590,10 +608,11 @@ async fn start_dtls_frontend_listener(
                     }
                 }
                 if rejected {
+                    // Release the reserved slot since we're not proceeding.
+                    metrics.active_sessions.fetch_sub(1, Ordering::Relaxed);
                     continue;
                 }
 
-                metrics.active_sessions.fetch_add(1, Ordering::Relaxed);
                 metrics.total_sessions.fetch_add(1, Ordering::Relaxed);
 
                 debug!(
@@ -922,11 +941,9 @@ async fn create_session(
     };
     let (backend_socket, dtls_conn) = if proxy.backend_protocol == BackendProtocol::Dtls {
         // DTLS: create a connected socket and wrap it with DTLSConn.
-        // The DTLS layer takes ownership of the connected socket; we keep a
-        // placeholder backend_socket for the session struct (unused for I/O).
+        // The DTLS layer takes ownership of the socket; no placeholder needed.
         let socket = UdpSocket::bind(ephemeral_bind).await?;
         socket.connect(backend_addr).await?;
-        let placeholder = Arc::new(UdpSocket::bind(ephemeral_bind).await?);
 
         let dtls_config =
             crate::dtls::build_backend_dtls_config(&proxy, &backend_host, tls_no_verify)?;
@@ -937,12 +954,12 @@ async fn create_session(
             backend = %backend_addr,
             "DTLS handshake completed for backend connection"
         );
-        (placeholder, Some(dtls))
+        (None, Some(dtls))
     } else {
         // Plain UDP
         let socket = UdpSocket::bind(ephemeral_bind).await?;
         socket.connect(backend_addr).await?;
-        (Arc::new(socket), None)
+        (Some(Arc::new(socket)), None)
     };
 
     let now = coarse_epoch_millis();
@@ -957,7 +974,8 @@ async fn create_session(
     });
 
     sessions.insert(client_addr, session.clone());
-    metrics.active_sessions.fetch_add(1, Ordering::Relaxed);
+    // Note: active_sessions is incremented by the caller (lookup_or_create_session)
+    // before create_session is called, to avoid TOCTOU race conditions.
     metrics.total_sessions.fetch_add(1, Ordering::Relaxed);
 
     debug!(
@@ -983,8 +1001,10 @@ async fn create_session(
                 dtls.read(&mut buf, None)
                     .await
                     .map_err(|e| std::io::Error::other(e.to_string()))
+            } else if let Some(ref sock) = backend_socket {
+                sock.recv(&mut buf).await
             } else {
-                backend_socket.recv(&mut buf).await
+                break;
             };
 
             let len = match recv_result {
@@ -1019,8 +1039,11 @@ async fn create_session(
             // For plain UDP, drain additional pending replies without yielding.
             // DTLS reads cannot use try_recv, so skip batching for DTLS backends.
             if !is_dtls {
+                let Some(ref sock) = backend_socket else {
+                    break;
+                };
                 for _ in 0..RECV_BATCH_LIMIT {
-                    match backend_socket.try_recv(&mut buf) {
+                    match sock.try_recv(&mut buf) {
                         Ok(len2) => {
                             batch_dgrams += 1;
                             batch_bytes += len2 as u64;
@@ -1048,10 +1071,12 @@ async fn create_session(
                                 if let Some(ref dtls) = reply_dtls {
                                     let _ = dtls.close().await;
                                 }
-                                reply_sessions.remove(&client_addr);
-                                reply_metrics
-                                    .active_sessions
-                                    .fetch_sub(1, Ordering::Relaxed);
+                                // Only decrement if we actually removed (cleanup may have already).
+                                if reply_sessions.remove(&client_addr).is_some() {
+                                    reply_metrics
+                                        .active_sessions
+                                        .fetch_sub(1, Ordering::Relaxed);
+                                }
                                 return;
                             }
                         }
@@ -1077,10 +1102,13 @@ async fn create_session(
         if let Some(ref dtls) = reply_dtls {
             let _ = dtls.close().await;
         }
-        reply_sessions.remove(&client_addr);
-        reply_metrics
-            .active_sessions
-            .fetch_sub(1, Ordering::Relaxed);
+        // Only decrement active_sessions if we actually removed the session
+        // (the cleanup task may have already removed and decremented it).
+        if reply_sessions.remove(&client_addr).is_some() {
+            reply_metrics
+                .active_sessions
+                .fetch_sub(1, Ordering::Relaxed);
+        }
     });
 
     Ok(session)
