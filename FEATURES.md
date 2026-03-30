@@ -6,10 +6,10 @@ A comprehensive feature list for Ferrum Edge.
 
 - **HTTP/1.1** with keep-alive connection pooling
 - **HTTP/2** via ALPN negotiation on TLS connections
-- **HTTP/3** (QUIC) on the same port as HTTPS with configurable idle timeout, max streams, QUIC flow-control windows, and per-backend connection pooling
+- **HTTP/3** (QUIC) on the same port as HTTPS with streaming responses (backpressure-aware adaptive coalescing), configurable idle timeout, max streams, QUIC flow-control windows, and per-backend connection pooling
 - **WebSocket** (`ws`/`wss`) with transparent upgrade handling
 - **gRPC** (`grpc`/`grpcs`) with HTTP/2 trailer support and full plugin compatibility
-- **TCP** stream proxying with TLS termination and origination
+- **TCP** stream proxying with TLS termination, origination, and configurable idle timeout
 - **UDP** datagram proxying with DTLS support (frontend termination + backend origination)
 
 ## Operating Modes
@@ -320,6 +320,15 @@ cargo build --release --features secrets-vault,secrets-aws
 ### Timeouts and Resilience
 
 Each individual cloud backend fetch (Vault, AWS, GCP, Azure) has a **30-second timeout**. If a secret provider is unreachable or slow, the gateway fails startup with a clear timeout error rather than hanging indefinitely. File-based secrets have no timeout since they are local filesystem reads.
+
+## Known Protocol Gaps
+
+The following are known limitations tracked for future improvement:
+
+| Gap | Protocol | Reason | Workaround |
+|-----|----------|--------|------------|
+| No HTTP/2 WebSocket (RFC 8441) | WebSocket | hyper's server does not implement the Extended CONNECT method (RFC 8441) for HTTP/2 WebSocket upgrades. Client-side support exists in hyper 1.x but server-side requires low-level h2 crate work to handle `:protocol = "websocket"` pseudo-headers and `SETTINGS_ENABLE_CONNECT_PROTOCOL`. Axum added server-side support in 0.8.0 but Ferrum Edge uses hyper directly. | Clients must use HTTP/1.1 Upgrade or TLS-negotiated connections for WebSocket |
+| No DTLS 1.3 | UDP | DTLS 1.3 (RFC 9147, published April 2022) has no production-ready Rust implementation. The `webrtc-dtls` crate only supports DTLS 1.2 (RFC 6347). `rusty-dtls` exists but is early-stage (PSK-only handshakes). FFI to OpenSSL 3.2+ or WolfSSL would break the pure-Rust design. QUIC (already supported via quinn) provides TLS 1.3 over UDP but is not a transparent DTLS replacement. | Use TLS 1.3 over TCP, or use QUIC-based proxying for modern UDP security |
 
 ## Deployment
 

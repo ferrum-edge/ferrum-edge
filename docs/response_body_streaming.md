@@ -157,11 +157,22 @@ Both protocols support streaming. By default, streaming responses use `ProxyBody
 
 ### HTTP/3 (QUIC)
 
-HTTP/3 responses are always **buffered** regardless of `response_body_mode`. The h3 crate's API requires collecting the full body before constructing the response. This is a limitation of the current h3 integration, not a design choice.
+HTTP/3 responses support **streaming** by default, following the same decision logic as HTTP/1.1 and gRPC. When no plugins require response body buffering and retries are not configured, the gateway streams response body chunks from the backend directly to the QUIC client via multiple `send_data()` calls — no full-body buffering.
+
+The streaming pipeline uses **backpressure-aware adaptive coalescing**:
+
+1. **Adaptive size threshold** — Chunks are accumulated in a `BytesMut` buffer and flushed at 8–32 KiB boundaries to amortise QUIC per-frame overhead.
+2. **Time-based flushing** — If buffered data hasn't reached the size threshold within 2ms, it is flushed anyway to prevent latency stalls on small or tail responses.
+3. **QUIC backpressure** — `send_data().await` blocks when the QUIC stream or connection flow-control window is exhausted, which naturally pauses upstream reads and prevents unbounded memory growth.
+4. **Zero-copy buffer management** — `BytesMut::split().freeze()` converts the mutable buffer to immutable `Bytes` without reallocation.
+
+When plugins require response body access (e.g., `ai_token_metrics`, `response_transformer`) or retries are configured, HTTP/3 responses fall back to **buffered** mode with full `on_response_body` and `transform_response_body` plugin hook support.
 
 ### gRPC
 
-gRPC responses are always **buffered** because gRPC uses HTTP/2 trailers (`grpc-status`, `grpc-message`) which must be forwarded after the body. The gateway's gRPC proxy path collects the full body and trailers before constructing the response.
+gRPC responses support **frame-by-frame streaming** when no plugins require response body buffering and retries are not configured. The gateway forwards HTTP/2 DATA frames as they arrive from the backend, and HTTP/2 trailers (`grpc-status`, `grpc-message`) are forwarded automatically via hyper's `Incoming` body framing.
+
+When plugins require response body access (e.g., `ai_token_metrics`) or retries are configured, gRPC responses fall back to **buffered** mode — the full body and trailers are collected before constructing the response.
 
 ### WebSocket
 

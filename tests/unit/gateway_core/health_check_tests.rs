@@ -1,6 +1,8 @@
 //! Tests for health check module
 
-use ferrum_edge::config::types::{PassiveHealthCheck, UpstreamTarget};
+use ferrum_edge::config::types::{
+    ActiveHealthCheck, HealthProbeType, PassiveHealthCheck, UpstreamTarget,
+};
 use ferrum_edge::health_check::HealthChecker;
 use std::collections::HashMap;
 
@@ -213,4 +215,57 @@ fn test_remove_stale_targets_no_op_when_all_present() {
     // Both targets still active — nothing should be removed
     checker.remove_stale_targets(&[target1, target2]);
     assert_eq!(checker.unhealthy_targets.len(), 2);
+}
+
+// ── gRPC probe type tests ────────────────────────────────────────────────────
+
+#[test]
+fn test_grpc_probe_type_deserializes_from_grpc() {
+    let json = r#""grpc""#;
+    let probe_type: HealthProbeType = serde_json::from_str(json).unwrap();
+    assert_eq!(probe_type, HealthProbeType::Grpc);
+}
+
+#[test]
+fn test_grpc_probe_type_serializes_to_grpc() {
+    let probe_type = HealthProbeType::Grpc;
+    let serialized = serde_json::to_string(&probe_type).unwrap();
+    assert_eq!(serialized, r#""grpc""#);
+}
+
+#[test]
+fn test_active_health_check_grpc_service_name_defaults_to_none() {
+    let config = ActiveHealthCheck::default();
+    assert_eq!(config.grpc_service_name, None);
+}
+
+#[test]
+fn test_active_health_check_grpc_service_name_deserializes() {
+    let json = r#"{"grpc_service_name": "my.Service"}"#;
+    let config: ActiveHealthCheck = serde_json::from_str(json).unwrap();
+    assert_eq!(config.grpc_service_name, Some("my.Service".to_string()));
+}
+
+#[test]
+fn test_active_health_check_grpc_service_name_omitted_gives_none() {
+    let json = r#"{}"#;
+    let config: ActiveHealthCheck = serde_json::from_str(json).unwrap();
+    assert_eq!(config.grpc_service_name, None);
+}
+
+#[tokio::test]
+async fn test_grpc_probe_returns_false_for_nonexistent_host() {
+    // Use a short timeout to keep the test fast
+    use ferrum_edge::health_check::grpc_probe_for_test;
+    use std::time::Duration;
+
+    let result = grpc_probe_for_test(
+        "grpc-probe-test-nonexistent-host-12345.invalid",
+        50099,
+        Duration::from_millis(100),
+        false,
+        "",
+    )
+    .await;
+    assert!(!result, "probe should return false for a non-existent host");
 }

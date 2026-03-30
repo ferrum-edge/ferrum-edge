@@ -587,11 +587,36 @@ pub struct GrpcResponse {
     pub trailers: HashMap<String, String>,
 }
 
+/// Streaming gRPC response — headers received, body streams frame-by-frame with trailers.
+///
+/// The `body` field is an `Incoming` body from hyper. When passed through as
+/// a `ProxyBody::streaming_h2`, hyper's HTTP/2 server automatically forwards
+/// DATA frames and TRAILERS frames to the downstream client as they arrive,
+/// preserving gRPC streaming semantics without buffering the full response.
+pub struct GrpcStreamingResponse {
+    pub status: u16,
+    pub headers: HashMap<String, String>,
+    pub body: Incoming,
+}
+
+/// Either a fully-buffered or streaming gRPC response.
+pub enum GrpcResponseKind {
+    /// Response body was fully collected into memory (with trailers extracted).
+    Buffered(GrpcResponse),
+    /// Response headers received; body and trailers stream frame-by-frame.
+    Streaming(GrpcStreamingResponse),
+}
+
 /// Proxy a gRPC request to the backend using hyper's HTTP/2 client.
 ///
 /// Collects the incoming request body, then delegates to the core send logic.
 /// Returns the collected request body bytes alongside the result so the caller
 /// can replay them on retry.
+///
+/// When `stream_response` is true, the response body is NOT buffered — it is
+/// returned as a live `Incoming` stream so frames flow frame-by-frame to the
+/// downstream client. This is only safe when retries are NOT configured (the
+/// body has already been consumed by the time we know if a retry is needed).
 pub async fn proxy_grpc_request(
     req: Request<Incoming>,
     proxy: &Proxy,
@@ -599,7 +624,8 @@ pub async fn proxy_grpc_request(
     grpc_pool: &GrpcConnectionPool,
     dns_cache: &DnsCache,
     proxy_headers: &HashMap<String, String>,
-) -> (Result<GrpcResponse, GrpcProxyError>, Bytes) {
+    stream_response: bool,
+) -> (Result<GrpcResponseKind, GrpcProxyError>, Bytes) {
     // Collect the incoming body for potential retry replay
     let (parts, body) = req.into_parts();
     let body_bytes = match BodyExt::collect(body).await {
@@ -624,6 +650,7 @@ pub async fn proxy_grpc_request(
         grpc_pool,
         dns_cache,
         proxy_headers,
+        stream_response,
     )
     .await;
 
@@ -633,6 +660,7 @@ pub async fn proxy_grpc_request(
 /// Proxy a gRPC request using pre-collected body bytes.
 ///
 /// Used for retry attempts where the request body has already been buffered.
+/// Always uses buffered mode — retries must be able to inspect the response.
 #[allow(clippy::too_many_arguments)]
 pub async fn proxy_grpc_request_from_bytes(
     method: hyper::Method,
@@ -643,7 +671,8 @@ pub async fn proxy_grpc_request_from_bytes(
     grpc_pool: &GrpcConnectionPool,
     dns_cache: &DnsCache,
     proxy_headers: &HashMap<String, String>,
-) -> Result<GrpcResponse, GrpcProxyError> {
+) -> Result<GrpcResponseKind, GrpcProxyError> {
+    // Retries always use buffered mode so the response can be inspected
     proxy_grpc_request_core(
         method,
         headers,
@@ -653,11 +682,16 @@ pub async fn proxy_grpc_request_from_bytes(
         grpc_pool,
         dns_cache,
         proxy_headers,
+        false,
     )
     .await
 }
 
 /// Core gRPC proxy logic shared by initial requests and retries.
+///
+/// When `stream_response` is true, returns `GrpcResponseKind::Streaming` with
+/// the live `Incoming` body instead of buffering the full response. The caller
+/// is responsible for ensuring this is only used when retries are not needed.
 #[allow(clippy::too_many_arguments)]
 async fn proxy_grpc_request_core(
     method: hyper::Method,
@@ -668,7 +702,8 @@ async fn proxy_grpc_request_core(
     grpc_pool: &GrpcConnectionPool,
     dns_cache: &DnsCache,
     proxy_headers: &HashMap<String, String>,
-) -> Result<GrpcResponse, GrpcProxyError> {
+    stream_response: bool,
+) -> Result<GrpcResponseKind, GrpcProxyError> {
     // Get or create HTTP/2 connection to backend (round-robins across pool)
     let mut sender = grpc_pool.get_sender(proxy, dns_cache).await?;
     // Parse the backend URL to extract path and authority
@@ -720,14 +755,25 @@ async fn proxy_grpc_request_core(
 
     // Extract response status and headers
     let status = response.status().as_u16();
-    let mut headers = HashMap::new();
+    let mut resp_headers = HashMap::new();
     for (k, v) in response.headers() {
         if let Ok(vs) = v.to_str() {
-            headers.insert(k.as_str().to_string(), vs.to_string());
+            resp_headers.insert(k.as_str().to_string(), vs.to_string());
         }
     }
 
-    // Collect body and extract trailers (also under read timeout for streaming responses)
+    // Streaming mode: return the live Incoming body without buffering.
+    // The caller (mod.rs) wraps it in ProxyBody::streaming_h2 so hyper
+    // forwards DATA frames and TRAILERS to the downstream client as they arrive.
+    if stream_response {
+        return Ok(GrpcResponseKind::Streaming(GrpcStreamingResponse {
+            status,
+            headers: resp_headers,
+            body: response.into_body(),
+        }));
+    }
+
+    // Buffered mode: collect body and extract trailers (also under read timeout).
     let mut body_bytes = Vec::new();
     let mut trailers = HashMap::new();
 
@@ -767,12 +813,12 @@ async fn proxy_grpc_request_core(
             ))
         })?;
 
-    Ok(GrpcResponse {
+    Ok(GrpcResponseKind::Buffered(GrpcResponse {
         status,
-        headers,
+        headers: resp_headers,
         body: body_bytes,
         trailers,
-    })
+    }))
 }
 
 /// Check if a request is a gRPC request based on content-type.

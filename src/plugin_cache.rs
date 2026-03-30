@@ -56,6 +56,8 @@ type BufferingMap = HashMap<String, bool>;
 /// Map from proxy_id to whether any plugin requires request body buffering
 /// (i.e., modifies the request body before forwarding to the backend).
 type RequestBufferingMap = HashMap<String, bool>;
+/// Map from proxy_id to whether any plugin requires per-frame WebSocket hooks.
+type WsFrameMap = HashMap<String, bool>;
 /// Two-level map: proxy_id → (protocol → plugin list).
 /// The outer lookup uses `&str` (zero allocation), inner lookup uses `ProxyProtocol` (Copy).
 type ProtocolPluginMap = HashMap<String, HashMap<ProxyProtocol, PluginList>>;
@@ -135,6 +137,11 @@ pub struct PluginCache {
     protocol_plugins: ArcSwap<ProtocolPluginMap>,
     /// Per-protocol global plugin fallback lists.
     global_protocol_plugins: ArcSwap<HashMap<ProxyProtocol, PluginList>>,
+    /// Pre-computed: does any plugin for this proxy require per-frame WebSocket hooks?
+    /// When false, the WebSocket frame forwarding loop skips plugins entirely (zero overhead).
+    requires_ws_frame: ArcSwap<WsFrameMap>,
+    /// Whether global-only plugins require per-frame WebSocket hooks (fallback).
+    global_requires_ws_frame: ArcSwap<bool>,
     /// Shared HTTP client for plugins that make outbound network calls.
     http_client: PluginHttpClient,
 }
@@ -162,6 +169,8 @@ impl PluginCache {
             global_needs_buffering,
             req_buffering_map,
             global_needs_req_buffering,
+            ws_frame_map,
+            global_needs_ws_frame,
         ) = Self::build_cache(config, &http_client)?;
         let (proto_map, global_proto_map) = build_protocol_maps(&proxy_map, &globals);
         Ok(Self {
@@ -173,6 +182,8 @@ impl PluginCache {
             global_requires_request_buffering: ArcSwap::new(Arc::new(global_needs_req_buffering)),
             protocol_plugins: ArcSwap::new(Arc::new(proto_map)),
             global_protocol_plugins: ArcSwap::new(Arc::new(global_proto_map)),
+            requires_ws_frame: ArcSwap::new(Arc::new(ws_frame_map)),
+            global_requires_ws_frame: ArcSwap::new(Arc::new(global_needs_ws_frame)),
             http_client,
         })
     }
@@ -190,6 +201,8 @@ impl PluginCache {
             global_needs_buffering,
             req_buffering_map,
             global_needs_req_buffering,
+            ws_frame_map,
+            global_needs_ws_frame,
         ) = Self::build_cache(config, &self.http_client)?;
         let (proto_map, global_proto_map) = build_protocol_maps(&proxy_map, &globals);
         self.proxy_plugins.store(Arc::new(proxy_map));
@@ -204,6 +217,9 @@ impl PluginCache {
         self.protocol_plugins.store(Arc::new(proto_map));
         self.global_protocol_plugins
             .store(Arc::new(global_proto_map));
+        self.requires_ws_frame.store(Arc::new(ws_frame_map));
+        self.global_requires_ws_frame
+            .store(Arc::new(global_needs_ws_frame));
         Ok(())
     }
 
@@ -318,9 +334,11 @@ impl PluginCache {
         let mut new_buffering: BufferingMap = self.requires_buffering.load().as_ref().clone();
         let mut new_req_buffering: RequestBufferingMap =
             self.requires_request_buffering.load().as_ref().clone();
+        let mut new_ws_frame: WsFrameMap = self.requires_ws_frame.load().as_ref().clone();
         for id in removed_proxy_ids {
             new_buffering.remove(id);
             new_req_buffering.remove(id);
+            new_ws_frame.remove(id);
         }
         for proxy in &config.proxies {
             if proxy_ids_to_rebuild.contains(&proxy.id)
@@ -333,6 +351,10 @@ impl PluginCache {
                 new_req_buffering.insert(
                     proxy.id.clone(),
                     plugins.iter().any(|p| p.modifies_request_body()),
+                );
+                new_ws_frame.insert(
+                    proxy.id.clone(),
+                    plugins.iter().any(|p| p.requires_ws_frame_hooks()),
                 );
             }
         }
@@ -374,6 +396,7 @@ impl PluginCache {
         self.requires_buffering.store(Arc::new(new_buffering));
         self.requires_request_buffering
             .store(Arc::new(new_req_buffering));
+        self.requires_ws_frame.store(Arc::new(new_ws_frame));
         self.protocol_plugins.store(Arc::new(new_proto_map));
         if rebuild_globals {
             self.global_plugins.store(Arc::new(new_globals.clone()));
@@ -384,6 +407,9 @@ impl PluginCache {
             ));
             self.global_requires_request_buffering.store(Arc::new(
                 new_globals.iter().any(|p| p.modifies_request_body()),
+            ));
+            self.global_requires_ws_frame.store(Arc::new(
+                new_globals.iter().any(|p| p.requires_ws_frame_hooks()),
             ));
             // Rebuild global protocol maps
             let mut new_global_proto = HashMap::with_capacity(protocols.len());
@@ -462,6 +488,18 @@ impl PluginCache {
         }
     }
 
+    /// Check whether any plugin for this proxy requires per-frame WebSocket hooks.
+    /// When false, the WebSocket frame forwarding loop skips plugins entirely (zero overhead).
+    /// Pre-computed at config load time — O(1) lookup instead of per-request iteration.
+    pub fn requires_ws_frame_hooks(&self, proxy_id: &str) -> bool {
+        let map = self.requires_ws_frame.load();
+        if let Some(&needs) = map.get(proxy_id) {
+            needs
+        } else {
+            **self.global_requires_ws_frame.load()
+        }
+    }
+
     /// Collect all hostnames that plugins will send traffic to.
     ///
     /// Iterates all cached plugin instances (global + per-proxy) and calls
@@ -534,6 +572,7 @@ impl PluginCache {
         self.proxy_plugins.load().len()
     }
 
+    #[allow(clippy::type_complexity)]
     fn build_cache(
         config: &GatewayConfig,
         http_client: &PluginHttpClient,
@@ -544,6 +583,8 @@ impl PluginCache {
             BufferingMap,
             bool,
             RequestBufferingMap,
+            bool,
+            WsFrameMap,
             bool,
         ),
         String,
@@ -586,6 +627,7 @@ impl PluginCache {
         let mut buffering_map: BufferingMap = HashMap::with_capacity(config.proxies.len());
         let mut req_buffering_map: RequestBufferingMap =
             HashMap::with_capacity(config.proxies.len());
+        let mut ws_frame_map: WsFrameMap = HashMap::with_capacity(config.proxies.len());
 
         for proxy in &config.proxies {
             // Start with global plugins
@@ -625,6 +667,10 @@ impl PluginCache {
             let needs_req_buffering = merged.iter().any(|p| p.modifies_request_body());
             req_buffering_map.insert(proxy.id.clone(), needs_req_buffering);
 
+            // Pre-compute whether any plugin requires per-frame WebSocket hooks
+            let needs_ws_frame = merged.iter().any(|p| p.requires_ws_frame_hooks());
+            ws_frame_map.insert(proxy.id.clone(), needs_ws_frame);
+
             proxy_map.insert(proxy.id.clone(), Arc::new(merged));
         }
 
@@ -645,6 +691,7 @@ impl PluginCache {
             .iter()
             .any(|p| p.requires_response_body_buffering());
         let global_needs_req_buffering = global_plugins.iter().any(|p| p.modifies_request_body());
+        let global_needs_ws_frame = global_plugins.iter().any(|p| p.requires_ws_frame_hooks());
 
         Ok((
             proxy_map,
@@ -653,6 +700,8 @@ impl PluginCache {
             global_needs_buffering,
             req_buffering_map,
             global_needs_req_buffering,
+            ws_frame_map,
+            global_needs_ws_frame,
         ))
     }
 }

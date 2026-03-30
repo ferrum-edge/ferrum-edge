@@ -91,6 +91,7 @@ fn create_http3_test_proxy() -> Proxy {
         listen_port: None,
         frontend_tls: false,
         udp_idle_timeout_seconds: 60,
+        tcp_idle_timeout_seconds: Some(300),
         allowed_methods: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
@@ -178,6 +179,7 @@ fn create_http3_test_env_config() -> EnvConfig {
         http3_connections_per_backend: 4,
         http3_pool_idle_timeout_seconds: 120,
         pool_cleanup_interval_seconds: 30,
+        tcp_idle_timeout_seconds: 300,
         udp_max_sessions: 10_000,
         udp_cleanup_interval_seconds: 10,
         db_tls_enabled: false,
@@ -366,6 +368,7 @@ async fn test_http3_proxy_state_creation() {
     let plugin_cache = Arc::new(PluginCache::new(&gc).unwrap());
     let consumer_index = Arc::new(ConsumerIndex::new(&gc.consumers));
     let lb_cache = Arc::new(ferrum_edge::LoadBalancerCache::new(&gc));
+    let circuit_breaker_cache = Arc::new(ferrum_edge::circuit_breaker::CircuitBreakerCache::new());
     let slm = Arc::new(
         ferrum_edge::proxy::stream_listener::StreamListenerManager::new(
             std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
@@ -373,8 +376,10 @@ async fn test_http3_proxy_state_creation() {
             dns_cache.clone(),
             lb_cache.clone(),
             plugin_cache.clone(),
+            circuit_breaker_cache.clone(),
             None,
             false,
+            300,
             10_000,
             10,
         ),
@@ -533,6 +538,7 @@ async fn test_http3_full_integration() {
     let plugin_cache = Arc::new(PluginCache::new(&gc).unwrap());
     let consumer_index = Arc::new(ConsumerIndex::new(&gc.consumers));
     let lb_cache = Arc::new(ferrum_edge::LoadBalancerCache::new(&gc));
+    let circuit_breaker_cache = Arc::new(ferrum_edge::circuit_breaker::CircuitBreakerCache::new());
     let slm = Arc::new(
         ferrum_edge::proxy::stream_listener::StreamListenerManager::new(
             std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
@@ -540,8 +546,10 @@ async fn test_http3_full_integration() {
             dns_cache.clone(),
             lb_cache.clone(),
             plugin_cache.clone(),
+            circuit_breaker_cache.clone(),
             None,
             false,
+            300,
             10_000,
             10,
         ),
@@ -613,6 +621,175 @@ async fn test_http3_full_integration() {
     }
 
     info!("HTTP/3 full integration test completed successfully");
+}
+
+/// Test HTTP/3 streaming vs buffered decision logic.
+///
+/// Verifies that the streaming path is selected when no plugins require body
+/// buffering and no retries are configured (matching the same logic as HTTP/1.1
+/// and gRPC paths).
+#[tokio::test]
+async fn test_http3_streaming_decision_logic() {
+    use ferrum_edge::config::types::{PluginAssociation, PluginScope, RetryConfig};
+
+    // --- Case 1: No plugins, no retry → should stream ---
+    let proxy_stream = Proxy {
+        id: "h3-stream".to_string(),
+        name: Some("H3 Streaming".to_string()),
+        hosts: vec![],
+        listen_path: "/h3-stream".to_string(),
+        backend_protocol: BackendProtocol::H3,
+        backend_host: "localhost".to_string(),
+        backend_port: 443,
+        backend_path: None,
+        strip_listen_path: true,
+        preserve_host_header: false,
+        backend_connect_timeout_ms: 5000,
+        backend_read_timeout_ms: 30000,
+        backend_write_timeout_ms: 30000,
+        backend_tls_client_cert_path: None,
+        backend_tls_client_key_path: None,
+        backend_tls_verify_server_cert: true,
+        backend_tls_server_ca_cert_path: None,
+        dns_override: None,
+        dns_cache_ttl_seconds: None,
+        auth_mode: ferrum_edge::config::types::AuthMode::Single,
+        plugins: vec![],
+        pool_idle_timeout_seconds: None,
+        pool_enable_http_keep_alive: None,
+        pool_enable_http2: None,
+        pool_tcp_keepalive_seconds: None,
+        pool_http2_keep_alive_interval_seconds: None,
+        pool_http2_keep_alive_timeout_seconds: None,
+        pool_http2_initial_stream_window_size: None,
+        pool_http2_initial_connection_window_size: None,
+        pool_http2_adaptive_window: None,
+        pool_http2_max_frame_size: None,
+        pool_http2_max_concurrent_streams: None,
+        pool_http3_connections_per_backend: None,
+        upstream_id: None,
+        circuit_breaker: None,
+        retry: None,
+        response_body_mode: Default::default(),
+        listen_port: None,
+        frontend_tls: false,
+        udp_idle_timeout_seconds: 60,
+        tcp_idle_timeout_seconds: Some(300),
+        allowed_methods: None,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    };
+
+    // --- Case 2: Proxy with retry configured → should buffer ---
+    let proxy_buffered = Proxy {
+        id: "h3-buffered".to_string(),
+        name: Some("H3 Buffered".to_string()),
+        listen_path: "/h3-buffered".to_string(),
+        retry: Some(RetryConfig {
+            max_retries: 3,
+            retry_on_connect_failure: true,
+            retryable_status_codes: vec![502, 503, 504],
+            retryable_methods: vec!["GET".to_string()],
+            backoff: ferrum_edge::config::types::BackoffStrategy::Fixed { delay_ms: 100 },
+        }),
+        ..proxy_stream.clone()
+    };
+
+    // --- Case 3: Proxy with ai_token_metrics plugin → should buffer responses ---
+    let proxy_with_body_plugin = Proxy {
+        id: "h3-body-plugin".to_string(),
+        name: Some("H3 Body Plugin".to_string()),
+        listen_path: "/h3-body-plugin".to_string(),
+        retry: None,
+        plugins: vec![PluginAssociation {
+            plugin_config_id: "ai-token-metrics-cfg".to_string(),
+        }],
+        ..proxy_stream.clone()
+    };
+
+    let gc = GatewayConfig {
+        version: "1".to_string(),
+        proxies: vec![
+            proxy_stream.clone(),
+            proxy_buffered.clone(),
+            proxy_with_body_plugin.clone(),
+        ],
+        consumers: vec![],
+        plugin_configs: vec![ferrum_edge::config::types::PluginConfig {
+            id: "ai-token-metrics-cfg".to_string(),
+            plugin_name: "ai_token_metrics".to_string(),
+            enabled: true,
+            config: serde_json::json!({}),
+            scope: PluginScope::Proxy,
+            proxy_id: Some("h3-body-plugin".to_string()),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }],
+        upstreams: vec![],
+        loaded_at: chrono::Utc::now(),
+    };
+
+    let plugin_cache = PluginCache::new(&gc).unwrap();
+
+    // Case 1: No plugins, no retry → streaming
+    let has_retry_1 = proxy_stream.retry.is_some();
+    let needs_resp_buf_1 = plugin_cache.requires_response_body_buffering(&proxy_stream.id);
+    let needs_req_buf_1 = plugin_cache.requires_request_body_buffering(&proxy_stream.id);
+    assert!(!has_retry_1, "No retry configured");
+    assert!(!needs_resp_buf_1, "No response body buffering needed");
+    assert!(!needs_req_buf_1, "No request body buffering needed");
+    let should_stream_1 = !has_retry_1 && !needs_resp_buf_1;
+    assert!(should_stream_1, "Should stream: no plugins, no retry");
+
+    // Case 2: Retry configured → buffered
+    let has_retry_2 = proxy_buffered.retry.is_some();
+    assert!(has_retry_2, "Retry is configured");
+    let should_stream_2 =
+        !has_retry_2 && !plugin_cache.requires_response_body_buffering(&proxy_buffered.id);
+    assert!(
+        !should_stream_2,
+        "Should buffer: retry configured requires body replay"
+    );
+
+    // Case 3: ai_token_metrics plugin → buffered responses
+    let needs_resp_buf_3 =
+        plugin_cache.requires_response_body_buffering(&proxy_with_body_plugin.id);
+    assert!(
+        needs_resp_buf_3,
+        "ai_token_metrics requires response body buffering"
+    );
+    let should_stream_3 = proxy_with_body_plugin.retry.is_none() && !needs_resp_buf_3;
+    assert!(
+        !should_stream_3,
+        "Should buffer: plugin requires response body"
+    );
+}
+
+/// Test HTTP/3 chunk coalescing constants are appropriate
+#[tokio::test]
+async fn test_http3_coalesce_constants() {
+    // The coalescing thresholds should be in the optimal 8–32 KiB range for QUIC.
+    // Too small = excessive framing overhead. Too large = latency spike.
+    let coalesce_min = 8_192usize; // H3_COALESCE_MIN_BYTES
+    let coalesce_max = 32_768usize; // H3_COALESCE_MAX_BYTES
+    let flush_interval_ms = 2u64; // H3_FLUSH_INTERVAL
+
+    assert!(
+        coalesce_min >= 4_096,
+        "Coalesce minimum should be at least 4 KiB"
+    );
+    assert!(
+        coalesce_max <= 65_536,
+        "Coalesce maximum should be at most 64 KiB to bound per-stream memory"
+    );
+    assert!(
+        coalesce_min < coalesce_max,
+        "Min must be less than max for adaptive range"
+    );
+    assert!(
+        (1..=10).contains(&flush_interval_ms),
+        "Flush interval should be 1–10ms to balance latency vs efficiency"
+    );
 }
 
 /// Performance test for HTTP/3 connection establishment

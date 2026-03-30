@@ -362,3 +362,161 @@ fn test_target_key_format() {
         "backend.example.com:443"
     );
 }
+
+// --- TCP/UDP circuit breaker integration tests ---
+//
+// These tests verify circuit breaker cache behaviour as it is used in the
+// TCP and UDP stream proxies (direct backend and upstream-based paths).
+
+/// TCP/UDP direct backend: CB uses None target key (no upstream_id).
+#[test]
+fn test_tcp_direct_backend_circuit_breaker_opens() {
+    let cache = CircuitBreakerCache::new();
+    let config = CircuitBreakerConfig {
+        failure_threshold: 2,
+        success_threshold: 1,
+        timeout_seconds: 60,
+        failure_status_codes: vec![502],
+        half_open_max_requests: 1,
+    };
+
+    // Simulate two backend connect failures (no upstream → None target key).
+    let cb = cache.get_or_create("tcp-proxy-1", None, &config);
+    cb.record_failure(502);
+    assert!(cache.can_execute("tcp-proxy-1", None, &config).is_ok()); // Still closed after 1
+
+    cb.record_failure(502);
+    // After threshold, circuit should be open.
+    assert_eq!(cb.state_name(), "open");
+    assert!(
+        cache.can_execute("tcp-proxy-1", None, &config).is_err(),
+        "Circuit breaker should reject after threshold failures"
+    );
+}
+
+/// TCP/UDP with upstream: CB uses per-target key (host:port).
+#[test]
+fn test_tcp_upstream_backend_circuit_breaker_per_target() {
+    let cache = CircuitBreakerCache::new();
+    let config = CircuitBreakerConfig {
+        failure_threshold: 2,
+        success_threshold: 1,
+        timeout_seconds: 60,
+        failure_status_codes: vec![502],
+        half_open_max_requests: 1,
+    };
+
+    let tk = target_key("backend.internal", 4000);
+
+    // Simulate connection failures on the upstream target.
+    let cb = cache.get_or_create("tcp-proxy-2", Some(&tk), &config);
+    cb.record_failure(502);
+    cb.record_failure(502);
+    assert_eq!(cb.state_name(), "open");
+
+    // Proxy without this specific target should not be affected.
+    assert!(
+        cache.can_execute("tcp-proxy-2", None, &config).is_ok(),
+        "Direct backend breaker should be independent of upstream-scoped breaker"
+    );
+}
+
+/// Clean TCP connection (bidirectional copy completed) records success.
+#[test]
+fn test_tcp_successful_connection_records_success() {
+    let cache = CircuitBreakerCache::new();
+    let config = CircuitBreakerConfig {
+        failure_threshold: 3,
+        success_threshold: 1,
+        timeout_seconds: 0, // immediate half-open
+        failure_status_codes: vec![502],
+        half_open_max_requests: 1,
+    };
+
+    // Trip the breaker open.
+    let cb = cache.get_or_create("tcp-proxy-3", None, &config);
+    cb.record_failure(502);
+    cb.record_failure(502);
+    cb.record_failure(502);
+    assert_eq!(cb.state_name(), "open");
+
+    // Transition to half-open (timeout = 0).
+    assert!(cb.can_execute().is_ok());
+    assert_eq!(cb.state_name(), "half_open");
+
+    // Simulate a successful connection: record_success closes it.
+    cb.record_success();
+    assert_eq!(cb.state_name(), "closed");
+}
+
+/// UDP session creation failure (socket connect error) records failure.
+#[test]
+fn test_udp_session_failure_records_failure() {
+    let cache = CircuitBreakerCache::new();
+    let config = CircuitBreakerConfig {
+        failure_threshold: 2,
+        success_threshold: 1,
+        timeout_seconds: 60,
+        failure_status_codes: vec![502],
+        half_open_max_requests: 1,
+    };
+
+    // Simulate two UDP socket connect failures.
+    let cb = cache.get_or_create("udp-proxy-1", None, &config);
+    cb.record_failure(502);
+    cb.record_failure(502);
+
+    assert_eq!(cb.state_name(), "open");
+    assert!(
+        cache.can_execute("udp-proxy-1", None, &config).is_err(),
+        "UDP circuit breaker should be open after repeated session creation failures"
+    );
+}
+
+/// UDP successful session creation records success and stays closed.
+#[test]
+fn test_udp_successful_session_records_success() {
+    let cache = CircuitBreakerCache::new();
+    let config = CircuitBreakerConfig {
+        failure_threshold: 3,
+        success_threshold: 1,
+        timeout_seconds: 60,
+        failure_status_codes: vec![502],
+        half_open_max_requests: 1,
+    };
+
+    let cb = cache.get_or_create("udp-proxy-2", None, &config);
+    // One failure, then success — breaker should remain closed.
+    cb.record_failure(502);
+    cb.record_success();
+    cb.record_failure(502);
+
+    // Only 1 failure after the reset — should remain closed.
+    assert_eq!(cb.state_name(), "closed");
+}
+
+/// When circuit is open, `can_execute` returns error — proxy should reject
+/// the connection before attempting any network I/O.
+#[test]
+fn test_stream_proxy_rejects_when_circuit_open() {
+    let cache = CircuitBreakerCache::new();
+    let config = CircuitBreakerConfig {
+        failure_threshold: 1,
+        success_threshold: 2,
+        timeout_seconds: 60,
+        failure_status_codes: vec![502],
+        half_open_max_requests: 1,
+    };
+
+    // Trip the breaker with a single failure.
+    let cb = cache.get_or_create("stream-proxy-cb", None, &config);
+    cb.record_failure(502);
+    assert_eq!(cb.state_name(), "open");
+
+    // Both TCP and UDP stream proxies call can_execute before opening sockets.
+    let result = cache.can_execute("stream-proxy-cb", None, &config);
+    assert!(
+        result.is_err(),
+        "can_execute must return Err when circuit is open"
+    );
+}

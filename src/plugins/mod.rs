@@ -83,6 +83,13 @@ pub const HTTP_GRPC_PROTOCOLS: &[ProxyProtocol] = &[ProxyProtocol::Http, ProxyPr
 /// HTTP-only (single protocol).
 pub const HTTP_ONLY_PROTOCOLS: &[ProxyProtocol] = &[ProxyProtocol::Http];
 
+/// Direction of a WebSocket frame being proxied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WebSocketFrameDirection {
+    ClientToBackend,
+    BackendToClient,
+}
+
 /// Context passed through the plugin pipeline for a single request.
 #[derive(Debug, Clone)]
 pub struct RequestContext {
@@ -493,6 +500,23 @@ pub trait Plugin: Send + Sync {
 
     /// Called when a stream connection (TCP/UDP session) is completed.
     async fn on_stream_disconnect(&self, _summary: &StreamTransactionSummary) {}
+
+    /// Returns `true` if this plugin needs per-frame WebSocket inspection.
+    /// Zero overhead when `false` (default) — the frame forwarding loop skips plugins entirely.
+    fn requires_ws_frame_hooks(&self) -> bool {
+        false
+    }
+
+    /// Called for each WebSocket frame when at least one plugin on the proxy opts in.
+    /// Return `Some(message)` to replace the frame, `None` to pass through unchanged.
+    async fn on_ws_frame(
+        &self,
+        _proxy_id: &str,
+        _direction: WebSocketFrameDirection,
+        _message: &tokio_tungstenite::tungstenite::Message,
+    ) -> Option<tokio_tungstenite::tungstenite::Message> {
+        None
+    }
 }
 
 /// Create a plugin instance from its name and configuration.

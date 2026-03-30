@@ -240,6 +240,11 @@ pub struct EnvConfig {
     /// Applies to HTTP, gRPC, HTTP/2, and HTTP/3 connection pools.
     pub pool_cleanup_interval_seconds: u64,
 
+    // TCP proxy
+    /// Default TCP idle timeout in seconds (default: 300 / 5 min).
+    /// Per-proxy `tcp_idle_timeout_seconds` overrides this. Set to 0 to disable.
+    pub tcp_idle_timeout_seconds: u64,
+
     // UDP proxy
     /// Maximum concurrent UDP sessions per proxy (default: 10000).
     pub udp_max_sessions: usize,
@@ -407,6 +412,7 @@ impl Default for EnvConfig {
             http3_connections_per_backend: 4,
             http3_pool_idle_timeout_seconds: 120,
             pool_cleanup_interval_seconds: 30,
+            tcp_idle_timeout_seconds: 300,
             udp_max_sessions: 10_000,
             udp_cleanup_interval_seconds: 10,
             tls_min_version: "1.2".into(),
@@ -604,6 +610,9 @@ impl EnvConfig {
                 "FERRUM_POOL_CLEANUP_INTERVAL_SECONDS",
                 30,
             ),
+
+            // TCP proxy
+            tcp_idle_timeout_seconds: resolve_u64(conf, "FERRUM_TCP_IDLE_TIMEOUT_SECONDS", 300),
 
             // UDP proxy
             udp_max_sessions: resolve_var(conf, "FERRUM_UDP_MAX_SESSIONS")

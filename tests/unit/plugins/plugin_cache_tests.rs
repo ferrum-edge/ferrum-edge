@@ -56,6 +56,7 @@ fn make_proxy(id: &str, listen_path: &str, plugin_ids: Vec<&str>) -> Proxy {
         listen_port: None,
         frontend_tls: false,
         udp_idle_timeout_seconds: 60,
+        tcp_idle_timeout_seconds: Some(300),
         allowed_methods: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
@@ -835,4 +836,176 @@ fn test_get_plugins_for_protocol_grpc_excludes_http_only() {
         "gRPC should exclude response_caching (HTTP_ONLY)"
     );
     assert_eq!(names.len(), 1);
+}
+
+// ---- WebSocket per-frame plugin hook infrastructure ----
+
+#[tokio::test]
+async fn test_requires_ws_frame_hooks_defaults_false_for_all_plugins() {
+    use ferrum_edge::plugins::available_plugins;
+    use ferrum_edge::plugins::create_plugin;
+
+    // Every built-in plugin must return false for requires_ws_frame_hooks() by default.
+    // This is the zero-overhead guarantee — no existing plugin opts in.
+    for name in available_plugins() {
+        let config = match name {
+            "access_control" => serde_json::json!({"allowed_ips": ["0.0.0.0/0"]}),
+            "ip_restriction" => serde_json::json!({"allow": ["0.0.0.0/0"]}),
+            "cors" => serde_json::json!({"origins": ["*"]}),
+            "response_caching" => serde_json::json!({"ttl_seconds": 60}),
+            "http_logging" => serde_json::json!({"endpoint": "http://localhost:9999/log"}),
+            "jwks_auth" => {
+                serde_json::json!({"providers": [{"issuer": "https://example.com", "jwks_uri": "https://example.com/.well-known/jwks.json"}]})
+            }
+            "otel_tracing" => serde_json::json!({"endpoint": "http://localhost:4317"}),
+            _ => serde_json::json!({}),
+        };
+        if let Ok(Some(plugin)) = create_plugin(name, &config) {
+            assert!(
+                !plugin.requires_ws_frame_hooks(),
+                "Plugin '{}' should default requires_ws_frame_hooks() to false",
+                name
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_on_ws_frame_default_returns_none() {
+    use ferrum_edge::plugins::{WebSocketFrameDirection, create_plugin};
+    use tokio_tungstenite::tungstenite::Message;
+
+    // The default on_ws_frame() implementation must return None (passthrough).
+    let plugin = create_plugin("stdout_logging", &serde_json::json!({}))
+        .unwrap()
+        .unwrap();
+
+    let msg = Message::Text("hello".to_string());
+    let result = plugin
+        .on_ws_frame("proxy-1", WebSocketFrameDirection::ClientToBackend, &msg)
+        .await;
+    assert!(
+        result.is_none(),
+        "Default on_ws_frame() must return None (passthrough)"
+    );
+
+    let result = plugin
+        .on_ws_frame("proxy-1", WebSocketFrameDirection::BackendToClient, &msg)
+        .await;
+    assert!(
+        result.is_none(),
+        "Default on_ws_frame() must return None (passthrough) for BackendToClient"
+    );
+}
+
+#[test]
+fn test_plugin_cache_requires_ws_frame_hooks_false_when_no_plugins_opt_in() {
+    // When no plugins opt in, requires_ws_frame_hooks() must return false for any proxy.
+    let config = make_config(
+        vec![
+            make_proxy("p1", "/ws", vec!["ps1"]),
+            make_proxy("p2", "/api", vec![]),
+        ],
+        vec![
+            make_plugin_config("ps1", "rate_limiting", PluginScope::Proxy, Some("p1"), true),
+            make_plugin_config("g1", "stdout_logging", PluginScope::Global, None, true),
+        ],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+
+    // Known proxy — no plugin opts in
+    assert!(
+        !cache.requires_ws_frame_hooks("p1"),
+        "requires_ws_frame_hooks should be false when no plugin opts in"
+    );
+    // Another proxy — no plugin opts in
+    assert!(
+        !cache.requires_ws_frame_hooks("p2"),
+        "requires_ws_frame_hooks should be false for proxy with no plugins"
+    );
+    // Unknown proxy — falls back to global, still false
+    assert!(
+        !cache.requires_ws_frame_hooks("unknown"),
+        "requires_ws_frame_hooks should be false for unknown proxy (global fallback)"
+    );
+}
+
+#[test]
+fn test_plugin_cache_requires_ws_frame_hooks_rebuild_updates_flag() {
+    let config1 = make_config(
+        vec![make_proxy("p1", "/ws", vec!["ps1"])],
+        vec![make_plugin_config(
+            "ps1",
+            "rate_limiting",
+            PluginScope::Proxy,
+            Some("p1"),
+            true,
+        )],
+    );
+    let cache = PluginCache::new(&config1).unwrap();
+    assert!(!cache.requires_ws_frame_hooks("p1"));
+
+    // Rebuild with different config — flag should still be false (no plugin opts in)
+    let config2 = make_config(
+        vec![make_proxy("p1", "/ws", vec!["ps1"])],
+        vec![make_plugin_config(
+            "ps1",
+            "stdout_logging",
+            PluginScope::Proxy,
+            Some("p1"),
+            true,
+        )],
+    );
+    cache.rebuild(&config2).unwrap();
+    assert!(!cache.requires_ws_frame_hooks("p1"));
+}
+
+#[test]
+fn test_plugin_cache_requires_ws_frame_hooks_apply_delta_preserves_false() {
+    let config = make_config(
+        vec![make_proxy("p1", "/ws", vec!["ps1"])],
+        vec![make_plugin_config(
+            "ps1",
+            "rate_limiting",
+            PluginScope::Proxy,
+            Some("p1"),
+            true,
+        )],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+    assert!(!cache.requires_ws_frame_hooks("p1"));
+
+    // Delta adding a non-ws-frame plugin
+    let config2 = make_config(
+        vec![make_proxy("p1", "/ws", vec!["ps1", "ps2"])],
+        vec![
+            make_plugin_config("ps1", "rate_limiting", PluginScope::Proxy, Some("p1"), true),
+            make_plugin_config("ps2", "key_auth", PluginScope::Proxy, Some("p1"), true),
+        ],
+    );
+    let mut proxy_ids = std::collections::HashSet::new();
+    proxy_ids.insert("p1".to_string());
+    cache.apply_delta(&config2, &proxy_ids, &[], false).unwrap();
+
+    // Still false — neither rate_limiting nor key_auth opt into ws_frame hooks
+    assert!(
+        !cache.requires_ws_frame_hooks("p1"),
+        "requires_ws_frame_hooks should remain false after delta with non-frame plugins"
+    );
+}
+
+#[test]
+fn test_ws_frame_direction_debug_and_equality() {
+    use ferrum_edge::plugins::WebSocketFrameDirection;
+
+    let ctb = WebSocketFrameDirection::ClientToBackend;
+    let btc = WebSocketFrameDirection::BackendToClient;
+
+    assert_eq!(ctb, WebSocketFrameDirection::ClientToBackend);
+    assert_eq!(btc, WebSocketFrameDirection::BackendToClient);
+    assert_ne!(ctb, btc);
+
+    // Debug formatting should not panic
+    let _ = format!("{:?}", ctb);
+    let _ = format!("{:?}", btc);
 }

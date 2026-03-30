@@ -1275,6 +1275,15 @@ components:
             For TCP: uses the gateway's TLS certificate.
             For UDP: uses DTLS with ECDSA P-256 or Ed25519 certificates
             (configured via FERRUM_DTLS_CERT_PATH/FERRUM_DTLS_KEY_PATH env vars).
+        tcp_idle_timeout_seconds:
+          type: integer
+          format: uint64
+          nullable: true
+          description: |
+            TCP stream idle timeout in seconds. After this duration of no data transfer
+            in either direction, the connection is closed. When omitted, uses the global
+            FERRUM_TCP_IDLE_TIMEOUT_SECONDS (default: 300s / 5 min). Set to 0 to disable.
+            Only applicable for tcp/tcp_tls protocols.
         udp_idle_timeout_seconds:
           type: integer
           format: uint64

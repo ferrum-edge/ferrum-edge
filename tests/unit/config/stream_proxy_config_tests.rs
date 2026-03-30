@@ -2,7 +2,8 @@
 
 use chrono::Utc;
 use ferrum_edge::config::types::{
-    ActiveHealthCheck, AuthMode, BackendProtocol, GatewayConfig, HealthProbeType, Proxy,
+    ActiveHealthCheck, AuthMode, BackendProtocol, GatewayConfig, HealthProbeType,
+    MAX_TCP_IDLE_TIMEOUT, Proxy,
 };
 
 fn make_stream_proxy(id: &str, protocol: BackendProtocol, port: u16) -> Proxy {
@@ -48,6 +49,7 @@ fn make_stream_proxy(id: &str, protocol: BackendProtocol, port: u16) -> Proxy {
         listen_port: Some(port),
         frontend_tls: false,
         udp_idle_timeout_seconds: 60,
+        tcp_idle_timeout_seconds: Some(300),
         allowed_methods: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
@@ -97,6 +99,7 @@ fn make_http_proxy(id: &str, listen_path: &str) -> Proxy {
         listen_port: None,
         frontend_tls: false,
         udp_idle_timeout_seconds: 60,
+        tcp_idle_timeout_seconds: Some(300),
         allowed_methods: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
@@ -329,6 +332,103 @@ fn test_stream_proxy_defaults() {
     assert_eq!(proxy.listen_port, None);
     assert!(!proxy.frontend_tls);
     assert_eq!(proxy.udp_idle_timeout_seconds, 60);
+}
+
+// --- TCP idle timeout tests ---
+
+#[test]
+fn test_tcp_idle_timeout_default_is_none() {
+    let json = r#"{
+        "id": "tcp1",
+        "listen_path": "",
+        "backend_protocol": "tcp",
+        "backend_host": "localhost",
+        "backend_port": 5432
+    }"#;
+    let proxy: Proxy = serde_json::from_str(json).unwrap();
+    assert_eq!(proxy.tcp_idle_timeout_seconds, None);
+}
+
+#[test]
+fn test_tcp_idle_timeout_explicit_value() {
+    let json = r#"{
+        "id": "tcp2",
+        "listen_path": "",
+        "backend_protocol": "tcp",
+        "backend_host": "localhost",
+        "backend_port": 5432,
+        "tcp_idle_timeout_seconds": 600
+    }"#;
+    let proxy: Proxy = serde_json::from_str(json).unwrap();
+    assert_eq!(proxy.tcp_idle_timeout_seconds, Some(600));
+}
+
+#[test]
+fn test_tcp_idle_timeout_zero_is_disabled() {
+    let json = r#"{
+        "id": "tcp3",
+        "listen_path": "",
+        "backend_protocol": "tcp",
+        "backend_host": "localhost",
+        "backend_port": 5432,
+        "tcp_idle_timeout_seconds": 0
+    }"#;
+    let proxy: Proxy = serde_json::from_str(json).unwrap();
+    assert_eq!(proxy.tcp_idle_timeout_seconds, Some(0));
+    // Validation should accept 0 (disabled)
+    if let Err(errors) = proxy.validate_fields() {
+        assert!(
+            !errors.iter().any(|e| e.contains("tcp_idle_timeout")),
+            "tcp_idle_timeout_seconds: 0 should be valid (disabled), got errors: {:?}",
+            errors
+        );
+    }
+}
+
+#[test]
+fn test_tcp_idle_timeout_max_is_valid() {
+    let json = format!(
+        r#"{{
+        "id": "tcp4",
+        "listen_path": "",
+        "backend_protocol": "tcp",
+        "backend_host": "localhost",
+        "backend_port": 5432,
+        "tcp_idle_timeout_seconds": {}
+    }}"#,
+        MAX_TCP_IDLE_TIMEOUT
+    );
+    let proxy: Proxy = serde_json::from_str(&json).unwrap();
+    assert_eq!(proxy.tcp_idle_timeout_seconds, Some(MAX_TCP_IDLE_TIMEOUT));
+    if let Err(errors) = proxy.validate_fields() {
+        assert!(
+            !errors.iter().any(|e| e.contains("tcp_idle_timeout")),
+            "tcp_idle_timeout_seconds at max should be valid, got errors: {:?}",
+            errors
+        );
+    }
+}
+
+#[test]
+fn test_tcp_idle_timeout_over_max_is_rejected() {
+    let json = format!(
+        r#"{{
+        "id": "tcp5",
+        "listen_path": "",
+        "backend_protocol": "tcp",
+        "backend_host": "localhost",
+        "backend_port": 5432,
+        "tcp_idle_timeout_seconds": {}
+    }}"#,
+        MAX_TCP_IDLE_TIMEOUT + 1
+    );
+    let proxy: Proxy = serde_json::from_str(&json).unwrap();
+    let result = proxy.validate_fields();
+    assert!(
+        matches!(&result, Err(errors) if errors.iter().any(|e| e.contains("tcp_idle_timeout_seconds"))),
+        "tcp_idle_timeout_seconds above max should fail validation, got: {:?}",
+        result
+    );
 }
 
 // --- HealthProbeType tests ---

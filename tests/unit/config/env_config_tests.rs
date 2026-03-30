@@ -1220,3 +1220,48 @@ fn test_db_read_replica_url_sqlite_no_ssl() {
         },
     );
 }
+
+#[test]
+fn test_env_config_tcp_idle_timeout_default() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+        ],
+        || {
+            remove_var("FERRUM_TCP_IDLE_TIMEOUT_SECONDS");
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.tcp_idle_timeout_seconds, 300);
+        },
+    );
+}
+
+#[test]
+fn test_env_config_tcp_idle_timeout_custom() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_TCP_IDLE_TIMEOUT_SECONDS", "600"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.tcp_idle_timeout_seconds, 600);
+        },
+    );
+}
+
+#[test]
+fn test_env_config_tcp_idle_timeout_zero_disables() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_TCP_IDLE_TIMEOUT_SECONDS", "0"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.tcp_idle_timeout_seconds, 0);
+        },
+    );
+}
