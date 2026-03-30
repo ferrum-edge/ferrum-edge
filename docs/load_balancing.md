@@ -225,7 +225,7 @@ upstreams:
 
 **How it works:**
 
-1. **Warm-up phase**: When the upstream is first loaded (or after a config reload), the algorithm uses round-robin to distribute traffic evenly across all targets. Each target must receive at least 5 successful responses before latency-based selection begins. This ensures every target gets a fair baseline measurement.
+1. **Warm-up phase**: When the upstream is first loaded (or after a config reload), the algorithm uses round-robin to distribute traffic evenly across all healthy targets. Each healthy target must receive at least 5 successful responses before latency-based selection begins. This ensures every target gets a fair baseline measurement. If a target is unhealthy at startup, warm-up proceeds with the healthy targets only — the unhealthy target does not block the algorithm from advancing.
 
 2. **Steady-state**: After warm-up, each request is routed to the target with the lowest EWMA latency. The EWMA is updated after every successful backend response using the formula:
 
@@ -241,7 +241,7 @@ upstreams:
 
    Only successful responses are recorded — connection errors and timeouts are excluded to avoid polluting the EWMA with non-representative values.
 
-4. **Recovery**: When a target recovers from unhealthy status (via active or passive health checks), its EWMA is reset to the current minimum across all healthy targets. This gives the recovered target a fair chance at traffic instead of being penalized by a stale high latency value from before it went down.
+4. **Recovery / late joiners**: When a target recovers from unhealthy status (via active or passive health checks), its EWMA is reset to the current minimum across all healthy targets and its sample count is set to the warm-up threshold. This means the recovered target immediately participates in latency-based selection (with an optimistic starting point) rather than forcing the entire upstream back into round-robin warm-up mode. As real latency samples arrive, the EWMA converges to the target's true latency. Similarly, if a target was unhealthy at startup and later becomes healthy, it joins latency-based selection with an optimistic EWMA estimate equal to the current minimum, ensuring it gets a fair share of traffic without disrupting established routing for other targets.
 
 **Example: multi-region with automatic proximity routing**
 

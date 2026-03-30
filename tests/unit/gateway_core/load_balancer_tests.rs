@@ -468,13 +468,18 @@ fn test_least_latency_reset_recovered_target() {
         "Recovered target EWMA should match the current minimum"
     );
 
-    // Sample count should be reset to 0 (back in warm-up)
+    // Sample count should be set to the warm-up threshold (5) so the recovered
+    // target immediately participates in latency-based selection without forcing
+    // the entire upstream back into round-robin warm-up mode.
     let count = lb
         .latency_sample_count
         .get("host0:8080")
         .unwrap()
         .load(Ordering::Relaxed);
-    assert_eq!(count, 0, "Sample count should be reset to 0 after recovery");
+    assert_eq!(
+        count, 5,
+        "Sample count should be set to warm-up threshold after recovery"
+    );
 }
 
 #[test]
@@ -559,6 +564,107 @@ fn test_least_latency_single_target() {
         let sel = lb.select("", None).unwrap();
         assert_eq!(sel.target.host, "host0");
     }
+}
+
+#[test]
+fn test_least_latency_target_unhealthy_at_startup_then_recovers() {
+    // If a target is unhealthy at startup, the other targets should complete
+    // warm-up and enter latency-based selection without being blocked.
+    // When the unhealthy target later recovers and joins the healthy pool,
+    // it should NOT force the entire upstream back into round-robin warm-up.
+    let targets = make_targets(3);
+    let lb = LoadBalancer::new(LoadBalancerAlgorithm::LeastLatency, &targets, None);
+
+    // Mark host2 as unhealthy from the start
+    let unhealthy: DashMap<String, u64> = DashMap::new();
+    unhealthy.insert("host2:8080".to_string(), 0);
+
+    // Complete warm-up for host0 and host1 only (host2 is unhealthy, gets no traffic)
+    // host0: 10ms, host1: 2ms
+    for _ in 0..10 {
+        lb.record_latency(&targets[0], 10_000);
+        lb.record_latency(&targets[1], 2_000);
+    }
+
+    // With host2 unhealthy, latency-based selection should work for host0/host1
+    let sel = lb.select("", Some(&unhealthy)).unwrap();
+    assert_eq!(
+        sel.target.host, "host1",
+        "Should prefer host1 (lowest latency among healthy targets)"
+    );
+
+    // Now host2 recovers — remove from unhealthy set
+    unhealthy.remove("host2:8080");
+
+    // host2 has 0 samples, but host0/host1 are warmed up.
+    // The algorithm should NOT regress to round-robin for all traffic.
+    // Instead, host2 should be slightly favored (min EWMA - 1) to get
+    // traffic and establish a real baseline.
+    let sel = lb.select("", Some(&unhealthy)).unwrap();
+    assert_eq!(
+        sel.target.host, "host2",
+        "Recovered host2 should be slightly favored as a late joiner to establish baseline, got {}",
+        sel.target.host
+    );
+
+    // After host2 gets enough samples (simulate warm-up completing), the
+    // algorithm should use its real EWMA for selection.
+    // Give host2 a latency higher than host1 so host1 wins again.
+    for _ in 0..10 {
+        lb.record_latency(&targets[2], 8_000); // 8ms > host1's 2ms
+    }
+
+    let sel = lb.select("", Some(&unhealthy)).unwrap();
+    assert_eq!(
+        sel.target.host, "host1",
+        "After host2 warms up with higher latency, host1 should be preferred again"
+    );
+}
+
+#[test]
+fn test_least_latency_late_joiner_does_not_disrupt_routing() {
+    // When a new target joins (e.g., added via config reload or recovered from
+    // unhealthy), the existing latency-based routing should continue uninterrupted.
+    // The new target should get a fair share via optimistic EWMA estimation.
+    let targets = make_targets(2);
+    let lb = LoadBalancer::new(LoadBalancerAlgorithm::LeastLatency, &targets, None);
+
+    // Complete warm-up: host0: 20ms, host1: 5ms
+    for _ in 0..10 {
+        lb.record_latency(&targets[0], 20_000);
+        lb.record_latency(&targets[1], 5_000);
+    }
+
+    // Verify latency-based selection works (host1 preferred)
+    let sel = lb.select("", None).unwrap();
+    assert_eq!(sel.target.host, "host1");
+
+    // Now simulate host0's sample count being reset (as if it were a late joiner)
+    // by directly setting it below the threshold
+    lb.latency_sample_count
+        .get("host0:8080")
+        .unwrap()
+        .store(0, Ordering::Relaxed);
+
+    // The algorithm should NOT fall back to pure round-robin.
+    // host0 (unwarmed) gets min EWMA - 1, so it should be slightly favored
+    // to establish its real baseline.
+    let sel = lb.select("", None).unwrap();
+    assert_eq!(
+        sel.target.host, "host0",
+        "Late joiner (host0) should be slightly favored to establish baseline"
+    );
+
+    // After host0 re-warms with its real (higher) latency, host1 should win again.
+    for _ in 0..10 {
+        lb.record_latency(&targets[0], 20_000); // 20ms > host1's 5ms
+    }
+
+    let sel = lb.select("", None).unwrap();
+    assert_eq!(
+        sel.target.host, "host1",
+        "After late joiner warms up with higher latency, host1 should be preferred"
+    );
 }
 
 #[test]

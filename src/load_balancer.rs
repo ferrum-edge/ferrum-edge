@@ -430,6 +430,10 @@ impl LoadBalancer {
     ///
     /// Without this, a target that was slow before going unhealthy would retain
     /// its high EWMA and never receive traffic even after recovery.
+    ///
+    /// The sample count is set to `LATENCY_WARMUP_THRESHOLD` so the recovered
+    /// target immediately participates in latency-based selection rather than
+    /// forcing the entire upstream back into round-robin warm-up mode.
     pub fn reset_recovered_target_latency(&self, target: &UpstreamTarget) {
         let key = match self.find_target_key(target) {
             Some(k) => k,
@@ -448,9 +452,14 @@ impl LoadBalancer {
         if let Some(ewma_ref) = self.latency_ewma.get(key) {
             ewma_ref.value().store(min_ewma, Ordering::Relaxed);
         }
-        // Reset sample count so the target goes through warm-up again
+        // Set sample count to the warm-up threshold so this target immediately
+        // participates in latency-based selection. Setting to 0 would force the
+        // entire upstream back into round-robin warm-up, disrupting routing for
+        // other targets that already have good latency data.
         if let Some(count_ref) = self.latency_sample_count.get(key) {
-            count_ref.value().store(0, Ordering::Relaxed);
+            count_ref
+                .value()
+                .store(LATENCY_WARMUP_THRESHOLD, Ordering::Relaxed);
         }
     }
 
@@ -683,10 +692,17 @@ impl LoadBalancer {
 
     /// Select the target with the lowest latency EWMA.
     ///
-    /// **Warm-up phase**: Until every candidate has at least `LATENCY_WARMUP_THRESHOLD`
-    /// samples, round-robin is used to ensure all targets get enough traffic to
-    /// establish meaningful latency baselines. Without warm-up, the first target
-    /// to receive a response would monopolize all traffic.
+    /// **Warm-up phase**: At initial startup, round-robin is used until every
+    /// healthy candidate has at least `LATENCY_WARMUP_THRESHOLD` samples. This
+    /// ensures all targets get enough traffic to establish meaningful baselines
+    /// before the algorithm starts preferring the lowest-latency target.
+    ///
+    /// **Late joiners / recovery**: If some candidates already have latency data
+    /// but a newly healthy target does not, the algorithm does NOT regress to
+    /// round-robin. Instead, targets without data are treated as having the
+    /// current minimum EWMA (optimistic assumption) so they get a fair chance at
+    /// traffic while the rest of the upstream continues latency-based routing.
+    /// Once the new target accumulates enough samples, its real EWMA takes over.
     ///
     /// **Steady-state**: Selects the candidate with the lowest EWMA value.
     /// Ties are broken by candidate order (first lowest wins), providing
@@ -702,41 +718,89 @@ impl LoadBalancer {
             return None;
         }
 
-        // Check if all candidates have enough samples for latency-based selection.
-        // During warm-up, use round-robin so all targets get baseline measurements.
-        let all_warmed_up = candidates.iter().all(|(idx, _)| {
+        // Count how many candidates have warmed up and how many have any data at all.
+        let mut warmed_count = 0usize;
+        let mut any_has_data = false;
+        for (idx, _) in candidates {
             let key = &self.target_keys[*idx];
-            self.latency_sample_count
+            let samples = self
+                .latency_sample_count
                 .get(key)
-                .map(|v| v.load(Ordering::Relaxed) >= LATENCY_WARMUP_THRESHOLD)
-                .unwrap_or(false)
-        });
+                .map(|v| v.load(Ordering::Relaxed))
+                .unwrap_or(0);
+            if samples >= LATENCY_WARMUP_THRESHOLD {
+                warmed_count += 1;
+            }
+            if samples > 0 {
+                any_has_data = true;
+            }
+        }
 
-        if !all_warmed_up {
-            // Warm-up: round-robin to distribute traffic evenly for baseline measurement
+        // Initial warm-up: no candidate has any data yet, use round-robin so all
+        // targets get baseline measurements. Also used when every target is still
+        // below the warm-up threshold (fresh startup).
+        if warmed_count == 0 || (!any_has_data) {
             let idx = self.rr_counter.fetch_add(1, Ordering::Relaxed) as usize;
             return Some(candidates[idx % candidates.len()].1.clone());
         }
 
-        // Steady-state: select the candidate with the lowest EWMA
-        let mut min_latency = u64::MAX;
+        // If all candidates are warmed up, pure latency-based selection.
+        // If some are not (late joiner / recovery), use latency-based selection
+        // but treat unwarmed targets optimistically (see below).
+        let all_warmed_up = warmed_count == candidates.len();
+
+        // Find the minimum EWMA among warmed candidates (for optimistic fallback).
+        let min_known_ewma = if !all_warmed_up {
+            candidates
+                .iter()
+                .filter_map(|(idx, _)| {
+                    let key = &self.target_keys[*idx];
+                    self.latency_ewma
+                        .get(key)
+                        .map(|v| v.load(Ordering::Relaxed))
+                        .filter(|&v| v != LATENCY_UNSET)
+                })
+                .min()
+                .unwrap_or(LATENCY_UNSET)
+        } else {
+            0 // unused when all warmed up
+        };
+
+        // Steady-state: select the candidate with the lowest EWMA.
+        // Unwarmed targets use min_known_ewma so they get a fair share of traffic
+        // without disrupting latency-based routing for established targets.
+        let mut best_latency = u64::MAX;
         let mut best = &candidates[0];
 
         for candidate in candidates {
             let key = &self.target_keys[candidate.0];
-            let latency = self
-                .latency_ewma
+            let samples = self
+                .latency_sample_count
                 .get(key)
                 .map(|v| v.load(Ordering::Relaxed))
-                .unwrap_or(LATENCY_UNSET);
-            if latency < min_latency {
-                min_latency = latency;
+                .unwrap_or(0);
+            let latency = if samples >= LATENCY_WARMUP_THRESHOLD {
+                // Warmed target — use real EWMA
+                self.latency_ewma
+                    .get(key)
+                    .map(|v| v.load(Ordering::Relaxed))
+                    .unwrap_or(LATENCY_UNSET)
+            } else if !all_warmed_up && min_known_ewma != LATENCY_UNSET {
+                // Late joiner: use a value slightly below the current minimum so
+                // it wins ties and gets enough traffic to establish a real baseline.
+                // The saturating_sub ensures we don't underflow past 0.
+                min_known_ewma.saturating_sub(1)
+            } else {
+                LATENCY_UNSET
+            };
+            if latency < best_latency {
+                best_latency = latency;
                 best = candidate;
             }
         }
 
         // If all targets have no data, fall back to round-robin
-        if min_latency == LATENCY_UNSET {
+        if best_latency == LATENCY_UNSET {
             let idx = self.rr_counter.fetch_add(1, Ordering::Relaxed) as usize;
             return Some(candidates[idx % candidates.len()].1.clone());
         }
