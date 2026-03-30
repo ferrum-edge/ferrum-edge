@@ -2649,17 +2649,30 @@ pub async fn handle_proxy_request(
             .record_connection_end(upstream_id, target);
     }
 
-    // Record backend TTFB for least-latency load balancing.
-    // Only record successful responses (non-connection-error) to avoid
-    // polluting the EWMA with timeout/failure latencies that don't
-    // reflect the target's actual response time.
+    // Record backend TTFB for least-latency load balancing (passive path).
+    // Only record when:
+    //   1. No connection error (timeouts/refused don't reflect real latency)
+    //   2. Response is non-5xx (error responses may have artificially low latency
+    //      from fast-failing backends, which would skew the EWMA toward broken targets)
+    //   3. No active health checks configured for this upstream — when active probes
+    //      exist, they provide consistent, controlled RTT measurements and take
+    //      precedence over passive TTFB which includes variable application processing time
     if !backend_resp.connection_error
+        && response_status < 500
         && let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, &upstream_target)
     {
-        let latency_us = backend_start.elapsed().as_micros() as u64;
-        state
-            .load_balancer_cache
-            .record_latency(upstream_id, target, latency_us);
+        let upstream = state.load_balancer_cache.get_upstream(upstream_id);
+        let has_active_hc = upstream
+            .as_ref()
+            .and_then(|u| u.health_checks.as_ref())
+            .and_then(|hc| hc.active.as_ref())
+            .is_some();
+        if !has_active_hc {
+            let latency_us = backend_start.elapsed().as_micros() as u64;
+            state
+                .load_balancer_cache
+                .record_latency(upstream_id, target, latency_us);
+        }
     }
 
     // Record circuit breaker result against the final target's breaker.

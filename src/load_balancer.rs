@@ -268,9 +268,10 @@ impl LoadBalancerCache {
     /// the new sample. Latency is stored in microseconds for sub-millisecond
     /// precision without floating-point atomics.
     ///
-    /// Called from:
-    /// - **Passive path**: `proxy/mod.rs` after each backend response (TTFB)
-    /// - **Active path**: `health_check.rs` after each successful probe
+    /// Called from one of two sources (active takes precedence):
+    /// - **Active path**: `health_check.rs` after each successful probe RTT
+    /// - **Passive path**: `proxy/mod.rs` after each successful non-5xx backend
+    ///   response (TTFB) — only when no active health checks are configured
     pub fn record_latency(&self, upstream_id: &str, target: &UpstreamTarget, latency_us: u64) {
         let balancers = self.balancers.load();
         if let Some(balancer) = balancers.get(upstream_id) {

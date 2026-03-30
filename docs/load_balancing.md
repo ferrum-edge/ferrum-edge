@@ -235,11 +235,11 @@ upstreams:
 
    The smoothing factor (alpha = 0.3) means recent measurements account for ~30% of the average, providing a good balance between responsiveness to latency changes and stability against transient spikes.
 
-3. **Latency sources**: Latency is measured from two sources:
-   - **Passive (proxy traffic)**: Time-to-first-byte (TTFB) from each proxied request. This is always active and requires no configuration.
-   - **Active (health check probes)**: When active health checks are configured, the RTT of each successful probe is also recorded. This provides latency data even during low-traffic periods.
+3. **Latency sources**: Latency is measured from one of two sources, with active taking precedence:
+   - **Active (health check probes)**: When active health checks are configured, the RTT of each successful probe is used as the latency signal. Active probes provide consistent, controlled measurements that reflect pure network round-trip time without variable application processing overhead. **When active health checks are configured, passive latency recording is disabled.**
+   - **Passive (proxy traffic)**: When no active health checks are configured, time-to-first-byte (TTFB) from each proxied request is used instead. This requires no configuration but includes application processing time in the measurement.
 
-   Only successful responses are recorded — connection errors and timeouts are excluded to avoid polluting the EWMA with non-representative values.
+   Only successful, non-error responses are recorded — connection errors, timeouts, and 5xx responses are excluded. Connection errors and timeouts don't reflect real network latency, and 5xx responses may have artificially low latency from fast-failing backends which would skew the EWMA toward broken targets.
 
 4. **Recovery / late joiners**: When a target recovers from unhealthy status (via active or passive health checks), its EWMA is reset to the current minimum across all healthy targets and its sample count is set to the warm-up threshold. This means the recovered target immediately participates in latency-based selection (with an optimistic starting point) rather than forcing the entire upstream back into round-robin warm-up mode. As real latency samples arrive, the EWMA converges to the target's true latency. Similarly, if a target was unhealthy at startup and later becomes healthy, it joins latency-based selection with an optimistic EWMA estimate equal to the current minimum, ensuring it gets a fair share of traffic without disrupting established routing for other targets.
 
