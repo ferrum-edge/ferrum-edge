@@ -77,8 +77,8 @@ fn start_gateway_in_file_mode(
         .env("FERRUM_PROXY_HTTP_PORT", http_port.to_string())
         .env("RUST_LOG", "ferrum_gateway=debug")
         .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .spawn()?;
 
     Ok(child)

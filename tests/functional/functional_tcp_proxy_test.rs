@@ -139,8 +139,8 @@ fn start_gateway(
         .env("FERRUM_TLS_NO_VERIFY", "true")
         .env("RUST_LOG", "ferrum_gateway=debug")
         .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
 
     if let Some(cert) = tls_cert_path {
         cmd.env("FERRUM_PROXY_TLS_CERT_PATH", cert);

@@ -182,6 +182,7 @@ tests/
 - Unit tests: inline `#[cfg(test)]` modules for private functions, `tests/unit/` for public API
 - Integration tests: test component interactions with real network I/O
 - Functional tests: marked `#[ignore]` — start real gateway binary, test full request flow
+- **Functional test subprocess rule**: When spawning the gateway binary in functional tests, use `Stdio::null()` for stdout/stderr unless the test explicitly reads the output (e.g., `functional_logging_test.rs`). Using `Stdio::piped()` without reading causes a pipe buffer deadlock — the OS buffer fills up from debug logs and the gateway blocks on writes, hanging the test.
 - All test crates use `--all-features`
 
 ## Development Guidelines

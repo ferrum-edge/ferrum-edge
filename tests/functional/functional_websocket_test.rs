@@ -110,8 +110,8 @@ fn start_gateway(
         .env("FERRUM_PROXY_HTTP_PORT", http_port.to_string())
         .env("RUST_LOG", "ferrum_gateway=debug")
         .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
 
     if let Some(port) = https_port {
         cmd.env("FERRUM_PROXY_HTTPS_PORT", port.to_string());
