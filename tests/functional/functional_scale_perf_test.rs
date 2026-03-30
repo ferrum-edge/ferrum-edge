@@ -16,9 +16,15 @@
 //! Run with:
 //!   cargo test --test functional_tests functional_scale_perf -- --ignored --nocapture
 
+use bytes::Bytes;
 use chrono::Utc;
+use http_body_util::Full;
+use hyper::service::service_fn;
+use hyper::{Request, Response};
+use hyper_util::rt::TokioIo;
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::json;
+use std::convert::Infallible;
 use std::process::{Child, Command};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -178,37 +184,30 @@ impl Drop for ScalePerfHarness {
     }
 }
 
-/// Simple echo backend using raw TCP
+/// High-performance echo backend using hyper with HTTP/1.1 keep-alive
 async fn start_echo_backend(
     port: u16,
 ) -> Result<tokio::task::JoinHandle<()>, Box<dyn std::error::Error>> {
     let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port)).await?;
     let handle = tokio::spawn(async move {
-        while let Ok((socket, _)) = listener.accept().await {
+        while let Ok((stream, _)) = listener.accept().await {
             tokio::spawn(async move {
-                use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
-                let (reader, mut writer) = socket.into_split();
-                let mut buf_reader = tokio::io::BufReader::new(reader);
-                let mut line = String::new();
-                if buf_reader.read_line(&mut line).await.is_err() {
-                    return;
-                }
-                loop {
-                    line.clear();
-                    if buf_reader.read_line(&mut line).await.is_err() {
-                        return;
-                    }
-                    if line == "\r\n" || line == "\n" {
-                        break;
-                    }
-                }
-                let body = r#"{"status":"ok"}"#;
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
-                let _ = writer.write_all(response.as_bytes()).await;
+                let io = TokioIo::new(stream);
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .keep_alive(true)
+                    .serve_connection(
+                        io,
+                        service_fn(|_req: Request<hyper::body::Incoming>| async {
+                            Ok::<_, Infallible>(
+                                Response::builder()
+                                    .status(200)
+                                    .header("content-type", "application/json")
+                                    .body(Full::new(Bytes::from_static(b"{\"status\":\"ok\"}")))
+                                    .unwrap_or_else(|_| Response::new(Full::new(Bytes::new()))),
+                            )
+                        }),
+                    )
+                    .await;
             });
         }
     });
@@ -713,7 +712,7 @@ fn is_container_running(name: &str) -> bool {
 
 // ---- SQLite variant ----
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_scale_perf_30k_proxies() {
     println!("\n============================================================");
@@ -733,7 +732,7 @@ async fn test_scale_perf_30k_proxies() {
 
 // ---- PostgreSQL variant ----
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_scale_perf_30k_proxies_postgres() {
     println!("\n============================================================");
