@@ -54,10 +54,10 @@ cargo fmt                                                   # Auto-format
 
 The CI workflow (`.github/workflows/ci.yml`) runs on push to `main` and PRs targeting `main`:
 
-1. **Unit Tests** — `cargo test --test unit_tests --all-features`
-2. **Functional Tests** (depends on unit tests) — integration tests + E2E tests with `--ignored` flag
-3. **Lint** (parallel with unit tests) — clippy + fmt check
-4. **Performance Regression** (depends on functional tests) — wrk-based load testing against baseline
+1. **Format Check** — `cargo fmt --check` (instant, no compilation)
+2. **Tests** (parallel with format check) — unit tests, integration tests, and E2E tests (`--ignored`) in a single job
+3. **Lint** (depends on format check) — clippy with zero warnings
+4. **Performance Regression** (depends on tests) — wrk-based load testing against baseline (built with `ci-release` profile)
 
 All four jobs must pass for a PR to merge.
 
