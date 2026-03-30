@@ -90,48 +90,48 @@ The test uses the `POST /batch` endpoint introduced to improve admin write throu
 
 ```
 --- Batch 1/10: creating proxies 0 to 2999 ---
-  Created 3000 resources in 4.2s (714 resources/s)
+  Created 3000 resources in 0.6s (4972 resources/s)
   Verified proxy /svc/0 is routable
 
   Running 30-second perf test against 3000 proxies (concurrency=50)...
 ┌─────────────────────────────────────────────────────────┐
 │  Proxies:   3000  │  Duration:  30.0s                   │
 ├─────────────────────────────────────────────────────────┤
-│  Total requests:           256000                      │
-│  Successful:               256000                      │
+│  Total requests:          644838                       │
+│  Successful:              644838                       │
 │  Failed:                       0                       │
-│  RPS:                      8533.3                       │
+│  RPS:                    21489.9                       │
 ├─────────────────────────────────────────────────────────┤
-│  Avg latency:          5800 µs (   5.8 ms)            │
-│  P50 latency:          5450 µs (   5.5 ms)            │
-│  P95 latency:          6900 µs (   6.9 ms)            │
-│  P99 latency:         10600 µs (  10.6 ms)            │
-│  Max latency:        110000 µs ( 110.0 ms)            │
+│  Avg latency:           2293 µs (   2.3 ms)            │
+│  P50 latency:           2049 µs (   2.0 ms)            │
+│  P95 latency:           3949 µs (   3.9 ms)            │
+│  P99 latency:           6403 µs (   6.4 ms)            │
+│  Max latency:         143004 µs ( 143.0 ms)            │
 └─────────────────────────────────────────────────────────┘
 ```
 
-(Numbers above are illustrative -- actual results depend on hardware.)
+(Numbers above are from a real run -- actual results depend on hardware.)
 
 ## Baseline Results (SQLite, debug build, Apple Silicon)
 
-Results from a real run on a MacBook (2026-03-28), showing proxy hot-path performance as config scales from 3k to 30k:
+Results from a real run on a MacBook (2026-03-30), showing proxy hot-path performance as config scales from 3k to 30k. The echo backend uses hyper with HTTP/1.1 keep-alive, and the test runtime uses `multi_thread` flavor for realistic async throughput.
 
 | Proxies | RPS | Avg(ms) | P50(ms) | P95(ms) | P99(ms) | Max(ms) | % Baseline |
-|---------|-----|---------|---------|---------|---------|---------|------------|
-| 3,000 | 7,168 | 7.0 | 6.5 | 8.8 | 14.3 | 101.0 | 100% |
-| 6,000 | 7,238 | 6.9 | 6.4 | 8.6 | 14.3 | 117.1 | 101% |
-| 9,000 | 6,680 | 7.5 | 6.8 | 10.5 | 21.6 | 107.9 | 93% |
-| 12,000 | 6,964 | 7.2 | 6.6 | 9.5 | 14.1 | 106.8 | 97% |
-| 15,000 | 6,842 | 7.3 | 6.7 | 9.9 | 14.8 | 65.4 | 95% |
-| 18,000 | 6,445 | 7.8 | 7.1 | 10.9 | 16.1 | 95.6 | 90% |
-| 21,000 | 5,975 | 8.4 | 7.5 | 13.0 | 24.4 | 96.2 | 83% |
-| 24,000 | 5,962 | 8.4 | 7.7 | 12.0 | 24.9 | 80.2 | 83% |
-| 27,000 | 6,253 | 8.0 | 7.4 | 10.9 | 17.7 | 103.5 | 87% |
-| 30,000 | 6,264 | 8.0 | 7.4 | 10.7 | 17.6 | 93.5 | 87% |
+|---------|------|---------|---------|---------|---------|---------|------------|
+| 3,000 | 21,490 | 2.3 | 2.0 | 3.9 | 6.4 | 143.0 | 100% |
+| 6,000 | 22,458 | 2.2 | 2.0 | 3.6 | 5.1 | 94.1 | 105% |
+| 9,000 | 22,713 | 2.2 | 2.0 | 3.6 | 6.1 | 101.5 | 106% |
+| 12,000 | 20,966 | 2.4 | 2.2 | 3.7 | 5.5 | 81.9 | 98% |
+| 15,000 | 17,262 | 2.9 | 2.6 | 4.8 | 8.1 | 247.7 | 80% |
+| 18,000 | 17,690 | 2.8 | 2.6 | 4.6 | 6.8 | 99.3 | 82% |
+| 21,000 | 16,722 | 3.0 | 2.8 | 4.8 | 6.5 | 90.8 | 78% |
+| 24,000 | 15,396 | 3.2 | 3.0 | 5.3 | 7.2 | 97.5 | 72% |
+| 27,000 | 13,127 | 3.8 | 3.5 | 6.3 | 8.6 | 102.5 | 61% |
+| 30,000 | 13,715 | 3.6 | 3.4 | 6.1 | 8.0 | 98.3 | 64% |
 
-**12.6% throughput degradation** from 3k to 30k proxies, 100% success rate, zero failures. Consistent RPS across all batches with no cold-start anomalies.
+**36.2% throughput degradation** from 3k to 30k proxies, 100% success rate, zero failures. ~21k RPS baseline with 2ms P50 latency on a debug build.
 
-Batch API creation speed: ~5,300-5,500 resources/s (vs ~5-116/s with individual API calls).
+Batch API creation speed: ~3,000-5,300 resources/s (vs ~5-116/s with individual API calls).
 
 ## Interpreting Results
 
