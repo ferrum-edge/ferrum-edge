@@ -59,6 +59,16 @@ impl PluginTestHarness {
             temp_dir.path().join("test.db").to_string_lossy()
         );
 
+        // Build the gateway binary if not already built
+        let build_status = Command::new("cargo")
+            .args(["build", "--bin", "ferrum-gateway"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()?;
+        if !build_status.success() {
+            return Err("Failed to build ferrum-gateway".into());
+        }
+
         let binary_path = if std::path::Path::new("./target/debug/ferrum-gateway").exists() {
             "./target/debug/ferrum-gateway"
         } else {
