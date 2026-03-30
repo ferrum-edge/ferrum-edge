@@ -395,6 +395,13 @@ See [CI/CD Documentation](docs/ci_cd.md) for complete pipeline overview, secrets
 | `FERRUM_DTLS_KEY_PATH` | No | — | PEM private key for frontend DTLS termination |
 | `FERRUM_DTLS_CLIENT_CA_CERT_PATH` | No | — | PEM CA certificate for verifying DTLS client certs (frontend mTLS) |
 | `FERRUM_PLUGIN_HTTP_SLOW_THRESHOLD_MS` | No | `1000` | Threshold (ms) for logging slow plugin outbound HTTP calls (http_logging, JWKS fetch, OTLP) |
+| `FERRUM_WORKER_THREADS` | No | CPU cores | Tokio async worker threads (auto-detected like nginx `worker_processes auto`) |
+| `FERRUM_BLOCKING_THREADS` | No | `512` | Max tokio blocking threads for file/DNS I/O |
+| `FERRUM_MAX_CONNECTIONS` | No | `100000` | Max concurrent proxy connections; queues when full, `0` = unlimited |
+| `FERRUM_TCP_LISTEN_BACKLOG` | No | `2048` | TCP listen backlog size (min 128); raise `net.core.somaxconn` to match |
+| `FERRUM_SERVER_HTTP2_MAX_CONCURRENT_STREAMS` | No | `250` | Server-side HTTP/2 max concurrent streams per inbound connection |
+
+See [docs/infrastructure_sizing.md](docs/infrastructure_sizing.md) for detailed tuning guidance on runtime and listener settings.
 
 See [docs/client_ip_resolution.md](docs/client_ip_resolution.md) for the security model, deployment examples, and troubleshooting guide.
 

@@ -885,7 +885,8 @@ async fn handle_connection(
         .initial_stream_window_size(pool_cfg.http2_initial_stream_window_size)
         .initial_connection_window_size(pool_cfg.http2_initial_connection_window_size)
         .adaptive_window(pool_cfg.http2_adaptive_window)
-        .max_frame_size(pool_cfg.http2_max_frame_size);
+        .max_frame_size(pool_cfg.http2_max_frame_size)
+        .max_concurrent_streams(state.env_config.server_http2_max_concurrent_streams);
 
     // WebSocket requests flow through handle_proxy_request so that authentication
     // and authorization plugins execute before the upgrade handshake.
@@ -1657,8 +1658,51 @@ pub async fn start_proxy_listener_with_tls(
     shutdown: tokio::sync::watch::Receiver<bool>,
     tls_config: Option<Arc<rustls::ServerConfig>>,
 ) -> Result<(), anyhow::Error> {
-    let listener = TcpListener::bind(addr).await?;
-    info!("Proxy listener started on {}", addr);
+    // Use socket2 for fine-grained socket options before binding.
+    let socket = socket2::Socket::new(
+        if addr.is_ipv6() {
+            socket2::Domain::IPV6
+        } else {
+            socket2::Domain::IPV4
+        },
+        socket2::Type::STREAM,
+        Some(socket2::Protocol::TCP),
+    )?;
+
+    // SO_REUSEADDR: allow rapid restart without TIME_WAIT blocking the port.
+    socket.set_reuse_address(true)?;
+
+    // SO_REUSEPORT: let the kernel distribute incoming connections across
+    // multiple listener tasks (Linux 3.9+, macOS, BSDs). This eliminates
+    // the single-thread accept() bottleneck at 50k+ connections/sec.
+    #[cfg(unix)]
+    socket.set_reuse_port(true)?;
+
+    socket.set_nonblocking(true)?;
+    socket.bind(&addr.into())?;
+
+    // Increased backlog to absorb connection bursts (default 2048 vs OS default of 128).
+    let backlog = state.env_config.tcp_listen_backlog as i32;
+    socket.listen(backlog)?;
+
+    let listener = TcpListener::from_std(socket.into())?;
+    info!("Proxy listener started on {} (backlog={})", addr, backlog);
+
+    // Optional connection limit. When max_connections > 0, a semaphore bounds
+    // the number of concurrent connections to prevent resource exhaustion
+    // (file descriptors, memory) under extreme load.
+    let conn_semaphore: Option<Arc<tokio::sync::Semaphore>> =
+        if state.env_config.max_connections > 0 {
+            info!(
+                "Connection limit: {} max concurrent connections",
+                state.env_config.max_connections
+            );
+            Some(Arc::new(tokio::sync::Semaphore::new(
+                state.env_config.max_connections,
+            )))
+        } else {
+            None
+        };
 
     let mut shutdown_rx = shutdown;
 
@@ -1669,13 +1713,24 @@ pub async fn start_proxy_listener_with_tls(
                     Ok((stream, remote_addr)) => {
                         let state = state.clone();
                         let tls_config = tls_config.clone();
+                        let semaphore = conn_semaphore.clone();
 
                         tokio::spawn(async move {
+                            // Acquire connection permit if limit is configured.
+                            // The permit is held for the connection lifetime and
+                            // released automatically when _permit drops.
+                            let _permit = if let Some(ref sem) = semaphore {
+                                match sem.acquire().await {
+                                    Ok(permit) => Some(permit),
+                                    Err(_) => return, // semaphore closed — shutdown
+                                }
+                            } else {
+                                None
+                            };
+
                             let result = if let Some(tls_config) = tls_config {
-                                // Handle TLS connection with client certificate verification
                                 handle_tls_connection(stream, remote_addr, state, tls_config).await
                             } else {
-                                // Handle plain HTTP connection
                                 handle_connection(stream, remote_addr, state).await
                             };
 
@@ -1749,7 +1804,8 @@ async fn handle_tls_connection(
         .initial_stream_window_size(pool_cfg.http2_initial_stream_window_size)
         .initial_connection_window_size(pool_cfg.http2_initial_connection_window_size)
         .adaptive_window(pool_cfg.http2_adaptive_window)
-        .max_frame_size(pool_cfg.http2_max_frame_size);
+        .max_frame_size(pool_cfg.http2_max_frame_size)
+        .max_concurrent_streams(state.env_config.server_http2_max_concurrent_streams);
 
     // WebSocket requests flow through handle_proxy_request so that authentication
     // and authorization plugins execute before the upgrade handshake.

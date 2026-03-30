@@ -109,6 +109,15 @@ Ferrum supports dynamic upstream target discovery through three providers, confi
 - HTTP/2 multiplexing via ALPN negotiation
 - TCP and HTTP/2 keep-alive with configurable intervals
 
+## High-Concurrency & Runtime Tuning
+
+- **jemalloc** memory allocator (Linux/macOS) for reduced fragmentation at scale
+- **SO_REUSEPORT** for kernel-level connection distribution across CPU cores
+- Configurable TCP listen backlog (default 2048) for burst absorption
+- Connection limit semaphore (default 100k) with graceful queuing under overload
+- Server-side HTTP/2 `max_concurrent_streams` (default 250) to bound per-connection resource usage
+- Configurable tokio worker and blocking thread counts with auto-detection
+
 ## TLS & Security
 
 - Frontend TLS termination on proxy and admin listeners

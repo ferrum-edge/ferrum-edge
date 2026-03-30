@@ -1,3 +1,7 @@
+#[cfg(not(windows))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 mod admin;
 mod circuit_breaker;
 mod config;
@@ -109,10 +113,17 @@ fn main() {
     }
 
     // Start the main multi-threaded runtime for the gateway
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .expect("Failed to create tokio runtime");
+    let mut rt_builder = tokio::runtime::Builder::new_multi_thread();
+    rt_builder.enable_all();
+    if let Some(workers) = env_config.worker_threads {
+        info!("Tokio worker threads: {}", workers);
+        rt_builder.worker_threads(workers);
+    }
+    if let Some(blocking) = env_config.blocking_threads {
+        info!("Tokio max blocking threads: {}", blocking);
+        rt_builder.max_blocking_threads(blocking);
+    }
+    let rt = rt_builder.build().expect("Failed to create tokio runtime");
 
     rt.block_on(async {
         // Shutdown signal

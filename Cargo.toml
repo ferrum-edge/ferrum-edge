@@ -83,6 +83,11 @@ base64 = "0.22"
 url = "2"
 percent-encoding = "2"
 socket2 = { version = "0.6.3", features = ["all"] }
+
+# Memory allocator — jemalloc reduces fragmentation and improves throughput
+# under high concurrency (50k+ connections). Not available on Windows.
+[target.'cfg(not(windows))'.dependencies]
+tikv-jemallocator = "0.6"
 sha2 = "0.10.9"
 hmac = "0.12.1"
 hex = "0.4"

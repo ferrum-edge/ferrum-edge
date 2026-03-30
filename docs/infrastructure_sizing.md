@@ -220,7 +220,53 @@ Understanding where CPU cycles are spent helps you optimize for your specific wo
 **Recommendations:**
 - Use ECDSA certificates instead of RSA to reduce TLS CPU overhead by ~70%.
 - Enable HTTP/2 and connection keep-alive to amortize handshake costs across many requests.
-- For CPU-bound workloads, scale the Tokio runtime by setting `TOKIO_WORKER_THREADS` (defaults to number of CPU cores).
+- For CPU-bound workloads, scale the Tokio runtime by setting `FERRUM_WORKER_THREADS` (defaults to number of CPU cores).
+
+## Runtime & Listener Tuning
+
+These settings control the gateway's ability to handle high connection concurrency. The defaults are suitable for most workloads up to 100k concurrent connections.
+
+### Connection Limits
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `FERRUM_MAX_CONNECTIONS` | `100000` | Maximum concurrent proxy connections |
+| `FERRUM_TCP_LISTEN_BACKLOG` | `2048` | TCP listen backlog size (min 128) |
+| `FERRUM_SERVER_HTTP2_MAX_CONCURRENT_STREAMS` | `250` | Max HTTP/2 streams per inbound connection |
+
+**`FERRUM_MAX_CONNECTIONS`** — When the limit is reached, new connections queue (not drop) until an existing connection closes. This prevents file descriptor exhaustion and memory runaway under extreme load. Set to `0` to disable the limit entirely.
+
+**How to choose a value:**
+- Each connection uses ~10–30 KB of memory (tokio task + hyper buffers + socket state)
+- 100k connections ≈ 1–3 GB RAM — the default is safe for most production servers
+- The limit must stay below your OS file descriptor limit (`ulimit -n`) minus headroom for backend connections, database connections, and other fd usage
+- If you're running multiple gateway instances behind a load balancer, each instance needs enough headroom for its share of traffic plus failover spikes
+
+| Deployment | Suggested `FERRUM_MAX_CONNECTIONS` | Required `ulimit -n` |
+|------------|-----------------------------------|----------------------|
+| Small (dev/staging) | 10,000 | 16,384+ |
+| Medium (production) | 50,000 | 65,536+ |
+| Large (high-traffic) | 100,000 (default) | 262,144+ |
+| Extra-large | 200,000+ | 1,048,576+ |
+
+**`FERRUM_TCP_LISTEN_BACKLOG`** — The kernel queue size for connections waiting to be accepted. Under burst traffic, a small backlog causes the kernel to silently drop SYN packets. The default of 2048 handles most burst scenarios. On Linux, this is capped by `net.core.somaxconn` — ensure the sysctl value is at least as high as this setting.
+
+**`FERRUM_SERVER_HTTP2_MAX_CONCURRENT_STREAMS`** — Limits how many requests a single HTTP/2 client connection can multiplex simultaneously. Without this, a single greedy or misbehaving client could open unlimited streams, consuming disproportionate resources. The default of 250 is generous (nginx uses 128, envoy uses 100). Lower it if you need tighter per-connection isolation; raise it for trusted internal clients that benefit from heavy multiplexing.
+
+### Runtime Threading
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `FERRUM_WORKER_THREADS` | CPU cores (auto-detected) | Tokio async worker threads |
+| `FERRUM_BLOCKING_THREADS` | `512` (tokio default) | Max threads for blocking operations |
+
+**`FERRUM_WORKER_THREADS`** — The number of OS threads running the async event loop. Auto-detected from available CPU cores, matching nginx's `worker_processes auto` behavior. You rarely need to change this — but if the gateway shares a machine with other CPU-intensive services, you may want to pin it lower to avoid contention.
+
+**`FERRUM_BLOCKING_THREADS`** — The upper bound on threads for blocking I/O (file reads, DNS fallback, etc.). The proxy hot path is fully async, so these threads are rarely used. The tokio default of 512 is generous and safe to leave unchanged.
+
+### Memory Allocator
+
+Ferrum Gateway uses **jemalloc** as the global memory allocator on Linux and macOS. jemalloc reduces heap fragmentation and improves allocation throughput under high concurrency compared to the system allocator. This is the same allocator used by nginx, Redis, and most high-performance Rust services. No configuration is needed — it is enabled automatically at compile time.
 
 ## Scaling Strategies
 

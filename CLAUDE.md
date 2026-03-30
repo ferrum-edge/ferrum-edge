@@ -321,6 +321,11 @@ Reduce per-request allocations in plugin lookup
 | `FERRUM_POOL_CLEANUP_INTERVAL_SECONDS` | `30` | Cleanup sweep interval for HTTP, gRPC, HTTP/2, HTTP/3 pools |
 | `FERRUM_UDP_MAX_SESSIONS` | `10000` | Maximum concurrent UDP sessions per proxy |
 | `FERRUM_UDP_CLEANUP_INTERVAL_SECONDS` | `10` | UDP session cleanup sweep interval |
+| `FERRUM_WORKER_THREADS` | (CPU cores) | Tokio worker threads (maps to `runtime::Builder::worker_threads`) |
+| `FERRUM_BLOCKING_THREADS` | `512` | Tokio max blocking threads |
+| `FERRUM_MAX_CONNECTIONS` | `100000` | Max concurrent proxy connections (semaphore-bounded; 0 = unlimited) |
+| `FERRUM_TCP_LISTEN_BACKLOG` | `2048` | TCP listen backlog size (min 128) |
+| `FERRUM_SERVER_HTTP2_MAX_CONCURRENT_STREAMS` | `250` | Server-side HTTP/2 max concurrent streams per inbound connection |
 
 See `src/config/env_config.rs` for the full list of 90+ environment variables.
 

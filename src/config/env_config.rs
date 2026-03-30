@@ -309,6 +309,23 @@ pub struct EnvConfig {
     /// When true, migration commands preview changes without applying.
     /// Default: false.
     pub migrate_dry_run: bool,
+
+    // ── Runtime & listener tuning ────────────────────────────────────────
+    /// Number of tokio worker threads. Default: number of CPU cores.
+    pub worker_threads: Option<usize>,
+    /// Maximum number of tokio blocking threads. Default: 512 (tokio default).
+    pub blocking_threads: Option<usize>,
+    /// Maximum concurrent connections the proxy will accept.
+    /// Default: 100000. When the limit is reached, new connections queue
+    /// until a slot frees up. Set to 0 to disable the limit entirely.
+    pub max_connections: usize,
+    /// TCP listen backlog size for proxy listeners. Default: 2048.
+    /// Higher values absorb connection bursts without SYN drops.
+    pub tcp_listen_backlog: u32,
+    /// Server-side HTTP/2 max concurrent streams per inbound connection.
+    /// Limits how many requests a single HTTP/2 client can multiplex.
+    /// Default: 250 (nginx=128, envoy=100, unlimited by spec).
+    pub server_http2_max_concurrent_streams: u32,
 }
 
 impl Default for EnvConfig {
@@ -403,6 +420,11 @@ impl Default for EnvConfig {
             admin_restore_max_body_size_mib: 100,
             migrate_action: "up".into(),
             migrate_dry_run: false,
+            worker_threads: None,
+            blocking_threads: None,
+            max_connections: 100_000,
+            tcp_listen_backlog: 2048,
+            server_http2_max_concurrent_streams: 250,
         }
     }
 }
@@ -626,6 +648,26 @@ impl EnvConfig {
             ),
             migrate_action: resolve_var_or(conf, "FERRUM_MIGRATE_ACTION", "up").to_lowercase(),
             migrate_dry_run: resolve_bool(conf, "FERRUM_MIGRATE_DRY_RUN", false),
+            worker_threads: resolve_var(conf, "FERRUM_WORKER_THREADS")
+                .and_then(|v| v.parse().ok())
+                .map(|v: usize| v.max(1)),
+            blocking_threads: resolve_var(conf, "FERRUM_BLOCKING_THREADS")
+                .and_then(|v| v.parse().ok())
+                .map(|v: usize| v.max(1)),
+            max_connections: resolve_var(conf, "FERRUM_MAX_CONNECTIONS")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(100_000),
+            tcp_listen_backlog: resolve_var(conf, "FERRUM_TCP_LISTEN_BACKLOG")
+                .and_then(|v| v.parse().ok())
+                .map(|v: u32| v.max(128))
+                .unwrap_or(2048),
+            server_http2_max_concurrent_streams: resolve_var(
+                conf,
+                "FERRUM_SERVER_HTTP2_MAX_CONCURRENT_STREAMS",
+            )
+            .and_then(|v| v.parse().ok())
+            .map(|v: u32| v.max(1))
+            .unwrap_or(250),
         };
 
         config.validate()?;

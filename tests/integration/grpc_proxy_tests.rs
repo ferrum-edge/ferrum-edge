@@ -167,6 +167,11 @@ fn create_test_env_config() -> ferrum_gateway::config::EnvConfig {
         admin_restore_max_body_size_mib: 100,
         migrate_action: "up".into(),
         migrate_dry_run: false,
+        worker_threads: None,
+        blocking_threads: None,
+        max_connections: 0,
+        tcp_listen_backlog: 2048,
+        server_http2_max_concurrent_streams: 250,
     }
 }
 
