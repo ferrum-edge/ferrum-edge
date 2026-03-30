@@ -548,11 +548,7 @@ async fn handle_create_proxy(
                 &json!({"error": "regex listen_path pattern must not exceed 1024 characters"}),
             ));
         }
-        let anchored = if pattern.starts_with('^') {
-            pattern.to_string()
-        } else {
-            format!("^{}", pattern)
-        };
+        let anchored = crate::config::types::anchor_regex_pattern(pattern);
         if let Err(e) = regex::Regex::new(&anchored) {
             return Ok(json_response(
                 StatusCode::BAD_REQUEST,
@@ -868,11 +864,7 @@ async fn handle_update_proxy(
                 &json!({"error": "regex listen_path pattern must not exceed 1024 characters"}),
             ));
         }
-        let anchored = if pattern.starts_with('^') {
-            pattern.to_string()
-        } else {
-            format!("^{}", pattern)
-        };
+        let anchored = crate::config::types::anchor_regex_pattern(pattern);
         if let Err(e) = regex::Regex::new(&anchored) {
             return Ok(json_response(
                 StatusCode::BAD_REQUEST,
@@ -2714,11 +2706,7 @@ async fn handle_batch_create(
                                 p.id
                             ));
                         } else {
-                            let anchored = if pattern.starts_with('^') {
-                                pattern.to_string()
-                            } else {
-                                format!("^{}", pattern)
-                            };
+                            let anchored = crate::config::types::anchor_regex_pattern(pattern);
                             if let Err(e) = regex::Regex::new(&anchored) {
                                 errors.push(format!(
                                     "Proxy '{}': invalid regex listen_path: {}",

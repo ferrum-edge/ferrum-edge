@@ -417,12 +417,8 @@ impl RouterCache {
             if proxy.listen_path.starts_with('~') {
                 // Regex route: compile the pattern
                 let pattern_str = &proxy.listen_path[1..];
-                // Auto-anchor to start of path if not already anchored
-                let anchored = if pattern_str.starts_with('^') {
-                    pattern_str.to_string()
-                } else {
-                    format!("^{}", pattern_str)
-                };
+                // Auto-anchor for full-path matching (^pattern$)
+                let anchored = crate::config::types::anchor_regex_pattern(pattern_str);
                 let compiled = match Regex::new(&anchored) {
                     Ok(r) => r,
                     Err(e) => {

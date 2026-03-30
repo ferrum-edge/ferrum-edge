@@ -864,7 +864,8 @@ fn test_regex_named_captures() {
     )]);
     let cache = RouterCache::new(&config, 100);
 
-    let matched = cache.find_proxy(None, "/users/42/orders/99/details");
+    // Full-path anchoring: path must match the entire pattern
+    let matched = cache.find_proxy(None, "/users/42/orders/99");
     assert!(matched.is_some());
     let rm = matched.unwrap();
     assert_eq!(rm.proxy.id, "user-orders");
@@ -877,6 +878,10 @@ fn test_regex_named_captures() {
         rm.path_params
             .contains(&("order_id".to_string(), "99".to_string()))
     );
+
+    // Extra trailing segments do NOT match (full-path anchoring with $)
+    let no_match = cache.find_proxy(None, "/users/42/orders/99/details");
+    assert!(no_match.is_none());
 }
 
 #[test]
@@ -887,10 +892,14 @@ fn test_regex_matched_prefix_len() {
     )]);
     let cache = RouterCache::new(&config, 100);
 
-    let matched = cache.find_proxy(None, "/users/42/orders/pending");
+    // Full-path anchoring: exact path matches, matched_prefix_len = full path
+    let matched = cache.find_proxy(None, "/users/42/orders");
     let rm = matched.unwrap();
-    // The regex matches "/users/42/orders" (19 chars)
     assert_eq!(rm.matched_prefix_len, "/users/42/orders".len());
+
+    // Extra segments do NOT match with full-path anchoring
+    let no_match = cache.find_proxy(None, "/users/42/orders/pending");
+    assert!(no_match.is_none());
 }
 
 #[test]
@@ -926,14 +935,38 @@ fn test_regex_fallback_when_no_prefix() {
 }
 
 #[test]
-fn test_regex_with_remaining_path() {
-    // Regex match with additional path segments after the matched portion
+fn test_regex_full_path_anchoring_rejects_extra_segments() {
+    // Full-path anchoring (auto-appended $) means extra segments cause no match
     let config = test_config(vec![test_regex_proxy(
         "user-orders",
         r"/users/[^/]+/orders",
     )]);
     let cache = RouterCache::new(&config, 100);
 
+    // Exact match works
+    let matched = cache.find_proxy(None, "/users/42/orders");
+    assert!(matched.is_some());
+    assert_eq!(matched.unwrap().proxy.id, "user-orders");
+
+    // Extra trailing segments do NOT match
+    let no_match = cache.find_proxy(None, "/users/42/orders/99/items");
+    assert!(no_match.is_none());
+}
+
+#[test]
+fn test_regex_wildcard_suffix_opt_out() {
+    // Operators can append .* to opt out of end-anchoring for prefix-style matching
+    let config = test_config(vec![test_regex_proxy(
+        "user-orders",
+        r"/users/[^/]+/orders.*",
+    )]);
+    let cache = RouterCache::new(&config, 100);
+
+    // Exact match works
+    let matched = cache.find_proxy(None, "/users/42/orders");
+    assert!(matched.is_some());
+
+    // Sub-paths also match thanks to .*
     let matched = cache.find_proxy(None, "/users/42/orders/99/items");
     assert!(matched.is_some());
     assert_eq!(matched.unwrap().proxy.id, "user-orders");
@@ -1001,16 +1034,20 @@ fn test_regex_negative_cache() {
 
 #[test]
 fn test_regex_auto_anchor() {
-    // Regex should only match from the start of the path (auto-anchored with ^)
+    // Regex is auto-anchored with ^ and $ for full-path matching
     let config = test_config(vec![test_regex_proxy("users", r"/users/[^/]+")]);
     let cache = RouterCache::new(&config, 100);
 
-    // Should match — starts with /users/
+    // Should match — exact path
     let matched = cache.find_proxy(None, "/users/42");
     assert!(matched.is_some());
 
     // Should NOT match — /users is not at the start
     let matched = cache.find_proxy(None, "/api/users/42");
+    assert!(matched.is_none());
+
+    // Should NOT match — extra trailing segments ($ anchor)
+    let matched = cache.find_proxy(None, "/users/42/profile");
     assert!(matched.is_none());
 }
 
@@ -1072,11 +1109,15 @@ fn test_regex_multiple_patterns() {
     ]);
     let cache = RouterCache::new(&config, 100);
 
-    let matched = cache.find_proxy(None, "/users/42/orders/1");
+    let matched = cache.find_proxy(None, "/users/42/orders");
     assert_eq!(matched.unwrap().proxy.id, "user-orders");
 
-    let matched = cache.find_proxy(None, "/products/widget/reviews/5");
+    let matched = cache.find_proxy(None, "/products/widget/reviews");
     assert_eq!(matched.unwrap().proxy.id, "product-reviews");
+
+    // Extra segments don't match either pattern
+    let no_match = cache.find_proxy(None, "/users/42/orders/1");
+    assert!(no_match.is_none());
 }
 
 #[test]
@@ -1118,7 +1159,7 @@ fn test_regex_rebuild_clears_caches() {
 
 #[test]
 fn test_regex_e2e_strip_listen_path() {
-    // Regex route with strip_listen_path: strip the matched portion
+    // With full-path anchoring, strip_listen_path strips the entire matched path
     let mut proxy = test_regex_proxy("user-orders", r"/users/[^/]+/orders");
     proxy.strip_listen_path = true;
     proxy.backend_host = "orders-service".into();
@@ -1127,6 +1168,24 @@ fn test_regex_e2e_strip_listen_path() {
     let config = test_config(vec![proxy]);
     let cache = RouterCache::new(&config, 100);
 
+    let rm = cache.find_proxy(None, "/users/42/orders").unwrap();
+    let url = build_backend_url(&rm.proxy, "/users/42/orders", "", rm.matched_prefix_len);
+    // Full-path match: entire path stripped, backend gets "/"
+    assert_eq!(url, "http://orders-service:8080/");
+}
+
+#[test]
+fn test_regex_e2e_strip_with_wildcard_suffix() {
+    // Operators can use .* to allow sub-paths and strip the matched prefix
+    let mut proxy = test_regex_proxy("user-orders", r"/users/[^/]+/orders(/.*)?");
+    proxy.strip_listen_path = true;
+    proxy.backend_host = "orders-service".into();
+    proxy.backend_port = 8080;
+
+    let config = test_config(vec![proxy]);
+    let cache = RouterCache::new(&config, 100);
+
+    // Sub-path: full match includes trailing segments
     let rm = cache.find_proxy(None, "/users/42/orders/pending").unwrap();
     let url = build_backend_url(
         &rm.proxy,
@@ -1134,8 +1193,12 @@ fn test_regex_e2e_strip_listen_path() {
         "",
         rm.matched_prefix_len,
     );
-    // Matched portion is "/users/42/orders" (16 chars), remaining is "/pending"
-    assert_eq!(url, "http://orders-service:8080/pending");
+    assert_eq!(url, "http://orders-service:8080/");
+
+    // Exact path also matches
+    let rm = cache.find_proxy(None, "/users/42/orders").unwrap();
+    let url = build_backend_url(&rm.proxy, "/users/42/orders", "", rm.matched_prefix_len);
+    assert_eq!(url, "http://orders-service:8080/");
 }
 
 #[test]
@@ -1148,15 +1211,10 @@ fn test_regex_e2e_no_strip() {
     let config = test_config(vec![proxy]);
     let cache = RouterCache::new(&config, 100);
 
-    let rm = cache.find_proxy(None, "/users/42/orders/pending").unwrap();
-    let url = build_backend_url(
-        &rm.proxy,
-        "/users/42/orders/pending",
-        "",
-        rm.matched_prefix_len,
-    );
+    let rm = cache.find_proxy(None, "/users/42/orders").unwrap();
+    let url = build_backend_url(&rm.proxy, "/users/42/orders", "", rm.matched_prefix_len);
     // No stripping — full path is forwarded
-    assert_eq!(url, "http://orders-service:8080/users/42/orders/pending");
+    assert_eq!(url, "http://orders-service:8080/users/42/orders");
 }
 
 #[test]
@@ -1189,14 +1247,10 @@ fn test_regex_e2e_with_backend_path() {
     let config = test_config(vec![proxy]);
     let cache = RouterCache::new(&config, 100);
 
-    let rm = cache.find_proxy(None, "/users/42/orders/pending").unwrap();
-    let url = build_backend_url(
-        &rm.proxy,
-        "/users/42/orders/pending",
-        "",
-        rm.matched_prefix_len,
-    );
-    assert_eq!(url, "http://orders-service:8080/internal/pending");
+    let rm = cache.find_proxy(None, "/users/42/orders").unwrap();
+    let url = build_backend_url(&rm.proxy, "/users/42/orders", "", rm.matched_prefix_len);
+    // Full-path match stripped, backend_path prepended
+    assert_eq!(url, "http://orders-service:8080/internal");
 }
 
 #[test]
@@ -1278,13 +1332,40 @@ async fn test_regex_concurrent_find_proxy() {
 }
 
 #[test]
-fn test_regex_explicit_anchor() {
-    // Users can provide their own ^ anchor — should work fine
+fn test_regex_explicit_start_anchor() {
+    // Users can provide their own ^ anchor — $ is still auto-appended
     let config = test_config(vec![test_regex_proxy("anchored", r"^/users/[^/]+")]);
     let cache = RouterCache::new(&config, 100);
 
     let matched = cache.find_proxy(None, "/users/42");
     assert_eq!(matched.unwrap().proxy.id, "anchored");
+
+    // Extra segments don't match
+    let no_match = cache.find_proxy(None, "/users/42/profile");
+    assert!(no_match.is_none());
+}
+
+#[test]
+fn test_regex_explicit_end_anchor() {
+    // Users can provide their own $ anchor — no double $
+    let config = test_config(vec![test_regex_proxy("anchored", r"/users/[^/]+$")]);
+    let cache = RouterCache::new(&config, 100);
+
+    let matched = cache.find_proxy(None, "/users/42");
+    assert_eq!(matched.unwrap().proxy.id, "anchored");
+}
+
+#[test]
+fn test_regex_explicit_both_anchors() {
+    // Users can provide both ^ and $ — no modification needed
+    let config = test_config(vec![test_regex_proxy("anchored", r"^/users/[^/]+$")]);
+    let cache = RouterCache::new(&config, 100);
+
+    let matched = cache.find_proxy(None, "/users/42");
+    assert_eq!(matched.unwrap().proxy.id, "anchored");
+
+    let no_match = cache.find_proxy(None, "/users/42/profile");
+    assert!(no_match.is_none());
 }
 
 #[test]

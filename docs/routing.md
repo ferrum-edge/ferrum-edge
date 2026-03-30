@@ -87,8 +87,9 @@ proxies:
 | `api.example.com` | `/api/health` | `wildcard-api` | No exact-host prefix match for `/api/health`, wildcard `*.example.com` + prefix `/api` |
 | `other.example.com` | `/api/data` | `wildcard-api` | Wildcard host match + prefix `/api` |
 | `other.org` | `/anything` | `catchall` | No exact/wildcard match, catch-all `/` |
-| `other.org` | `/users/42/orders/pending` | `user-orders-regex` | No prefix match, catch-all regex matches |
-| `api.example.com` | `/users/42/orders` | `exact-api`? No. `wildcard-api`? No. `catchall` prefix `/`? Yes. | `catchall` | Catch-all prefix `/` beats catch-all regex |
+| `other.org` | `/users/42/orders` | `user-orders-regex` | No prefix match, catch-all regex matches exact path |
+| `other.org` | `/users/42/orders/pending` | `catchall` | Regex pattern has auto-appended `$`, so `/orders/pending` doesn't match — falls through to catch-all `/` |
+| `api.example.com` | `/users/42/orders` | `catchall` | Catch-all prefix `/` beats catch-all regex |
 
 Note the last row: the catch-all prefix route `/` matches `/users/42/orders` before the regex route is checked, because **prefix always beats regex within the same host tier**. To use the regex route for this path, either remove the catch-all or assign the regex route to a more specific host tier.
 
@@ -110,7 +111,8 @@ proxies:
 ### Pattern Rules
 
 - The `~` prefix signals regex mode (it is not part of the pattern)
-- Patterns are **auto-anchored** with `^` if not already anchored (matching always starts from the beginning of the path)
+- Patterns are **auto-anchored for full-path matching**: `^` is prepended and `$` is appended if not already present. This means the pattern must match the **entire** request path, not just a prefix — preventing ambiguous overlaps between regex routes
+- To allow sub-path matching (prefix-style regex), end your pattern with `.*` (e.g., `~/api/v[0-9]+/.*`)
 - Patterns are **pre-compiled** at config load time using the Rust `regex` crate — invalid patterns are caught during config validation, not at request time
 - Named capture groups use `(?P<name>pattern)` syntax
 
@@ -123,20 +125,32 @@ Named captures are extracted on match and forwarded to backends and plugins:
 
 ### Path Stripping with Regex Routes
 
-When `strip_listen_path: true`, the **matched portion** of the path is stripped (not the literal pattern text). The remaining path is forwarded to the backend:
+When `strip_listen_path: true`, the **matched portion** of the path is stripped (not the literal pattern text). With full-path anchoring, the entire path is the matched portion:
 
-| Request Path | Regex Pattern | Matched Portion | Remaining (to backend) |
+| Request Path | Regex Pattern | Match? | Remaining (to backend) |
 |---|---|---|---|
-| `/users/42/orders/pending` | `/users/[^/]+/orders` | `/users/42/orders` | `/pending` |
-| `/users/42/orders` | `/users/[^/]+/orders` | `/users/42/orders` | `/` |
+| `/users/42/orders` | `/users/[^/]+/orders` | Yes | `/` |
+| `/users/42/orders/pending` | `/users/[^/]+/orders` | **No** (blocked by `$`) | — |
+| `/users/42/orders/pending` | `/users/[^/]+/orders(/.*)?` | Yes | `/` |
 
-Combined with `backend_path`, this works the same as prefix routes:
+To match a prefix and forward sub-paths, use an optional trailing group:
+
+```yaml
+listen_path: "~/users/[^/]+/orders(/.*)?"
+strip_listen_path: true
+backend_path: "/internal"
+# /users/42/orders → backend receives /internal/
+# /users/42/orders/pending → backend receives /internal/
+```
+
+For exact-path proxying (the default with full-path anchoring):
 
 ```yaml
 listen_path: "~/users/[^/]+/orders"
 strip_listen_path: true
 backend_path: "/internal"
-# /users/42/orders/pending → backend receives /internal/pending
+# /users/42/orders → backend receives /internal/
+# /users/42/orders/pending → no match (404)
 ```
 
 ## Cache Architecture

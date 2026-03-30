@@ -1088,14 +1088,15 @@ components:
           type: [string, "null"]
           description: >-
             URL path prefix to match incoming requests. Must start with `/` for
-            literal path matching, or `~` for regex matching (e.g., `~^/api/v[0-9]+/`).
+            literal path matching, or `~` for regex matching (e.g., `~^/api/v[0-9]+$`).
             Regex patterns are compiled at creation time and auto-anchored with `^`
-            if not already present. The combination of `(hosts, listen_path)` must
-            be unique across all proxies.
+            and `$` for full-path matching if not already present. To allow sub-path
+            matching, end the pattern with `.*` (e.g., `~/api/v[0-9]+/.*`).
+            The combination of `(hosts, listen_path)` must be unique across all proxies.
           examples:
             - /api/v1
             - /users
-            - "~^/api/v[0-9]+/"
+            - "~/api/v[0-9]+/users/[^/]+"
         hosts:
           type: array
           items:

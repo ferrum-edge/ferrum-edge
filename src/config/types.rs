@@ -797,6 +797,24 @@ fn default_config_version() -> String {
     "1".to_string()
 }
 
+/// Auto-anchor a regex listen_path pattern for full-path matching.
+///
+/// Prepends `^` if not already present and appends `$` if not already present,
+/// ensuring the pattern must match the entire request path rather than just a
+/// prefix. Operators who need prefix-style matching can end their pattern with
+/// `.*` to opt out of the end anchor.
+pub fn anchor_regex_pattern(pattern: &str) -> String {
+    let mut anchored = if pattern.starts_with('^') {
+        pattern.to_string()
+    } else {
+        format!("^{}", pattern)
+    };
+    if !anchored.ends_with('$') {
+        anchored.push('$');
+    }
+    anchored
+}
+
 impl GatewayConfig {
     /// Validate that all proxy (host, listen_path) combinations are unique.
     ///
@@ -873,7 +891,8 @@ impl GatewayConfig {
     ///
     /// Listen paths starting with `~` are treated as regex patterns. The `~`
     /// prefix is stripped and the remainder is compiled as a regex (auto-anchored
-    /// with `^` if not already). Compilation errors are reported here at config
+    /// with `^` and `$` if not already present for full-path matching).
+    /// Compilation errors are reported here at config
     /// load time rather than silently skipping routes at runtime.
     pub fn validate_regex_listen_paths(&self) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
@@ -887,11 +906,7 @@ impl GatewayConfig {
                     ));
                     continue;
                 }
-                let anchored = if pattern.starts_with('^') {
-                    pattern.to_string()
-                } else {
-                    format!("^{}", pattern)
-                };
+                let anchored = anchor_regex_pattern(pattern);
                 if let Err(e) = Regex::new(&anchored) {
                     errors.push(format!(
                         "Proxy '{}': invalid regex listen_path '{}': {}",

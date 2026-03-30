@@ -1071,6 +1071,47 @@ fn test_regex_listen_path_non_regex_not_checked() {
     assert!(config.validate_regex_listen_paths().is_ok());
 }
 
+// ---- anchor_regex_pattern tests ----
+
+#[test]
+fn test_anchor_regex_pattern_adds_both_anchors() {
+    use ferrum_gateway::config::types::anchor_regex_pattern;
+
+    assert_eq!(anchor_regex_pattern("/users/[^/]+"), "^/users/[^/]+$");
+}
+
+#[test]
+fn test_anchor_regex_pattern_preserves_existing_start() {
+    use ferrum_gateway::config::types::anchor_regex_pattern;
+
+    assert_eq!(anchor_regex_pattern("^/users/[^/]+"), "^/users/[^/]+$");
+}
+
+#[test]
+fn test_anchor_regex_pattern_preserves_existing_end() {
+    use ferrum_gateway::config::types::anchor_regex_pattern;
+
+    assert_eq!(anchor_regex_pattern("/users/[^/]+$"), "^/users/[^/]+$");
+}
+
+#[test]
+fn test_anchor_regex_pattern_preserves_both_existing() {
+    use ferrum_gateway::config::types::anchor_regex_pattern;
+
+    assert_eq!(anchor_regex_pattern("^/users/[^/]+$"), "^/users/[^/]+$");
+}
+
+#[test]
+fn test_anchor_regex_pattern_wildcard_suffix_preserved() {
+    use ferrum_gateway::config::types::anchor_regex_pattern;
+
+    // Operators use .* to opt out of strict end-anchoring
+    assert_eq!(
+        anchor_regex_pattern("/users/[^/]+/orders.*"),
+        "^/users/[^/]+/orders.*$"
+    );
+}
+
 // ---- Stream proxy validation tests ----
 
 #[test]
