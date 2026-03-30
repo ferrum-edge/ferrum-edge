@@ -44,7 +44,7 @@ impl PluginTestHarness {
     async fn new() -> Result<Self, Box<dyn std::error::Error>> {
         let temp_dir = TempDir::new()?;
         let jwt_secret = "test-plugin-jwt-secret-12345".to_string();
-        let jwt_issuer = "ferrum-gateway-plugin-test".to_string();
+        let jwt_issuer = "ferrum-edge-plugin-test".to_string();
 
         let admin_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let admin_port = admin_listener.local_addr()?.port();
@@ -61,18 +61,18 @@ impl PluginTestHarness {
 
         // Build the gateway binary if not already built
         let build_status = Command::new("cargo")
-            .args(["build", "--bin", "ferrum-gateway"])
+            .args(["build", "--bin", "ferrum-edge"])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()?;
         if !build_status.success() {
-            return Err("Failed to build ferrum-gateway".into());
+            return Err("Failed to build ferrum-edge".into());
         }
 
-        let binary_path = if std::path::Path::new("./target/debug/ferrum-gateway").exists() {
-            "./target/debug/ferrum-gateway"
+        let binary_path = if std::path::Path::new("./target/debug/ferrum-edge").exists() {
+            "./target/debug/ferrum-edge"
         } else {
-            "./target/release/ferrum-gateway"
+            "./target/release/ferrum-edge"
         };
 
         let child = Command::new(binary_path)
@@ -1055,7 +1055,7 @@ async fn test_plugin_response_transformer() {
                     {
                         "operation": "add",
                         "key": "X-Powered-By",
-                        "value": "ferrum-gateway"
+                        "value": "ferrum-edge"
                     }
                 ]
             }
@@ -1085,7 +1085,7 @@ async fn test_plugin_response_transformer() {
         resp.headers()
             .get("x-powered-by")
             .map(|v| v.to_str().unwrap_or("")),
-        Some("ferrum-gateway"),
+        Some("ferrum-edge"),
         "Response should include X-Powered-By header"
     );
 }
