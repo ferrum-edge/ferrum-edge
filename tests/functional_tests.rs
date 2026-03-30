@@ -12,6 +12,7 @@
 //!   - functional_file_mode_test: File mode with YAML config, SIGHUP reload
 //!   - functional_grpc_test: gRPC reverse proxy
 //!   - functional_load_balancer_test: Load balancing algorithms
+//!   - functional_load_stress_test: Load & stress (10k proxies, 30k plugins, mixed auth/payloads, admin mutations)
 //!   - functional_scale_perf_test: Scale performance (0→30k proxies with auth+ACL, throughput degradation)
 //!   - functional_tcp_proxy_test: Raw TCP stream proxying
 //!   - functional_udp_proxy_test: UDP datagram proxying

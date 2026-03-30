@@ -97,7 +97,7 @@ jobs:
         run: cargo build --bin ferrum-gateway
 
       - name: Run end-to-end tests (gRPC, WebSocket, file mode, database, CP/DP)
-        run: cargo test --test functional_tests --verbose --all-features -- --ignored --skip test_scale_perf_30k_proxies
+        run: cargo test --test functional_tests --verbose --all-features -- --ignored --skip test_scale_perf_30k_proxies --skip test_load_stress
         env:
           RUST_BACKTRACE: 1
         timeout-minutes: 15
