@@ -48,7 +48,14 @@ impl CpGrpcServer {
         let key = DecodingKey::from_secret(self.jwt_secret.as_bytes());
         let mut validation = Validation::new(Algorithm::HS256);
         validation.validate_exp = true;
-        validation.required_spec_claims.clear();
+        // Require standard claims to prevent minimal/forged tokens from authenticating.
+        validation.required_spec_claims = {
+            let mut claims = std::collections::HashSet::new();
+            claims.insert("exp".to_string());
+            claims.insert("iat".to_string());
+            claims.insert("sub".to_string());
+            claims
+        };
 
         decode::<Value>(token, &key, &validation)
             .map_err(|e| Status::unauthenticated(format!("Invalid token: {}", e)))?;

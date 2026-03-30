@@ -199,3 +199,75 @@ fn test_index_len_counts_all_entries() {
     // Expected entries: keyauth:key-a, basic:alice, identity:alice, identity:c1, identity:custom-a
     assert_eq!(index.index_len(), 5);
 }
+
+// ---- apply_delta correctness ----
+
+#[test]
+fn test_apply_delta_add_consumer() {
+    let c1 = make_consumer("c1", "alice", Some("key-a"), None);
+    let index = ConsumerIndex::new(&[c1]);
+
+    let c2 = make_consumer("c2", "bob", Some("key-b"), None);
+    index.apply_delta(&[c2], &[], &[]);
+
+    assert_eq!(index.consumer_count(), 2);
+    assert!(index.find_by_api_key("key-a").is_some());
+    assert!(index.find_by_api_key("key-b").is_some());
+    assert!(index.find_by_username("bob").is_some());
+    assert!(index.find_by_identity("c2").is_some());
+}
+
+#[test]
+fn test_apply_delta_remove_consumer() {
+    let c1 = make_consumer("c1", "alice", Some("key-a"), None);
+    let c2 = make_consumer("c2", "bob", Some("key-b"), None);
+    let index = ConsumerIndex::new(&[c1, c2]);
+
+    index.apply_delta(&[], &["c1".to_string()], &[]);
+
+    assert_eq!(index.consumer_count(), 1);
+    assert!(index.find_by_api_key("key-a").is_none());
+    assert!(index.find_by_username("alice").is_none());
+    assert!(index.find_by_api_key("key-b").is_some());
+}
+
+#[test]
+fn test_apply_delta_modify_consumer_credentials() {
+    let c1 = make_consumer("c1", "alice", Some("key-old"), None);
+    let index = ConsumerIndex::new(&[c1]);
+
+    // Modify: change API key
+    let c1_modified = make_consumer("c1", "alice", Some("key-new"), None);
+    index.apply_delta(&[], &[], &[c1_modified]);
+
+    assert_eq!(index.consumer_count(), 1);
+    assert!(
+        index.find_by_api_key("key-old").is_none(),
+        "Old API key should be removed after modify"
+    );
+    assert!(
+        index.find_by_api_key("key-new").is_some(),
+        "New API key should be present after modify"
+    );
+    assert!(index.find_by_username("alice").is_some());
+}
+
+#[test]
+fn test_apply_delta_simultaneous_add_remove_modify() {
+    let c1 = make_consumer("c1", "alice", Some("key-a"), None);
+    let c2 = make_consumer("c2", "bob", Some("key-b"), None);
+    let c3 = make_consumer("c3", "carol", Some("key-c"), None);
+    let index = ConsumerIndex::new(&[c1, c2, c3]);
+
+    let c4 = make_consumer("c4", "dave", Some("key-d"), None);
+    let c2_modified = make_consumer("c2", "bob", Some("key-b-new"), None);
+
+    index.apply_delta(&[c4], &["c1".to_string()], &[c2_modified]);
+
+    assert_eq!(index.consumer_count(), 3); // c2, c3, c4
+    assert!(index.find_by_api_key("key-a").is_none()); // removed
+    assert!(index.find_by_api_key("key-b").is_none()); // old key replaced
+    assert!(index.find_by_api_key("key-b-new").is_some()); // modified
+    assert!(index.find_by_api_key("key-c").is_some()); // unchanged
+    assert!(index.find_by_api_key("key-d").is_some()); // added
+}

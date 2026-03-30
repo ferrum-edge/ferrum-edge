@@ -874,7 +874,7 @@ async fn handle_connection(
     let pool_cfg = state.connection_pool.global_pool_config();
     builder
         .http2()
-        .max_header_list_size(state.max_header_size_bytes as u32)
+        .max_header_list_size(state.max_header_size_bytes.min(u32::MAX as usize) as u32)
         .initial_stream_window_size(pool_cfg.http2_initial_stream_window_size)
         .initial_connection_window_size(pool_cfg.http2_initial_connection_window_size)
         .adaptive_window(pool_cfg.http2_adaptive_window)
@@ -1628,7 +1628,7 @@ async fn handle_tls_connection(
     let pool_cfg = state.connection_pool.global_pool_config();
     builder
         .http2()
-        .max_header_list_size(state.max_header_size_bytes as u32)
+        .max_header_list_size(state.max_header_size_bytes.min(u32::MAX as usize) as u32)
         .initial_stream_window_size(pool_cfg.http2_initial_stream_window_size)
         .initial_connection_window_size(pool_cfg.http2_initial_connection_window_size)
         .adaptive_window(pool_cfg.http2_adaptive_window)

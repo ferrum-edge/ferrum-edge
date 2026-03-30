@@ -111,3 +111,139 @@ fn test_jwt_expired_token() {
     let result = manager.verify_token(&token);
     assert!(result.is_err(), "Expired token should fail verification");
 }
+
+#[test]
+fn test_jwt_negative_ttl_rejected() {
+    let config = JwtConfig {
+        secret: "test-secret".to_string(),
+        issuer: "test-issuer".to_string(),
+        max_ttl_seconds: 3600,
+        algorithm: Algorithm::HS256,
+    };
+
+    let manager = JwtManager::new(config);
+
+    // Create a token where iat > exp (negative TTL)
+    // Token is still not expired (exp is in the future), but iat is even further in the future.
+    let now = Utc::now();
+    let claims = AdminClaims {
+        iss: "test-issuer".to_string(),
+        sub: "admin-user".to_string(),
+        iat: (now + Duration::hours(2)).timestamp(), // issued "in the future"
+        nbf: now.timestamp(),
+        exp: (now + Duration::hours(1)).timestamp(), // expires before iat
+        jti: uuid::Uuid::new_v4().to_string(),
+        additional: json!({}),
+    };
+
+    let header = Header::new(Algorithm::HS256);
+    let key = EncodingKey::from_secret("test-secret".as_bytes());
+    let token = encode(&header, &claims, &key).unwrap();
+
+    let result = manager.verify_token(&token);
+    assert!(
+        result.is_err(),
+        "Token with negative TTL (iat > exp) should be rejected"
+    );
+}
+
+#[test]
+fn test_jwt_zero_ttl_rejected() {
+    let config = JwtConfig {
+        secret: "test-secret".to_string(),
+        issuer: "test-issuer".to_string(),
+        max_ttl_seconds: 3600,
+        algorithm: Algorithm::HS256,
+    };
+
+    let manager = JwtManager::new(config);
+
+    // Create a token where iat == exp (zero TTL)
+    let now = Utc::now();
+    let exp_time = (now + Duration::hours(1)).timestamp();
+    let claims = AdminClaims {
+        iss: "test-issuer".to_string(),
+        sub: "admin-user".to_string(),
+        iat: exp_time, // same as exp
+        nbf: now.timestamp(),
+        exp: exp_time,
+        jti: uuid::Uuid::new_v4().to_string(),
+        additional: json!({}),
+    };
+
+    let header = Header::new(Algorithm::HS256);
+    let key = EncodingKey::from_secret("test-secret".as_bytes());
+    let token = encode(&header, &claims, &key).unwrap();
+
+    let result = manager.verify_token(&token);
+    assert!(
+        result.is_err(),
+        "Token with zero TTL (iat == exp) should be rejected"
+    );
+}
+
+#[test]
+fn test_jwt_valid_ttl_within_max() {
+    let config = JwtConfig {
+        secret: "test-secret".to_string(),
+        issuer: "test-issuer".to_string(),
+        max_ttl_seconds: 7200,
+        algorithm: Algorithm::HS256,
+    };
+
+    let manager = JwtManager::new(config);
+
+    let now = Utc::now();
+    let claims = AdminClaims {
+        iss: "test-issuer".to_string(),
+        sub: "admin-user".to_string(),
+        iat: now.timestamp(),
+        nbf: now.timestamp(),
+        exp: (now + Duration::seconds(3600)).timestamp(),
+        jti: uuid::Uuid::new_v4().to_string(),
+        additional: json!({}),
+    };
+
+    let header = Header::new(Algorithm::HS256);
+    let key = EncodingKey::from_secret("test-secret".as_bytes());
+    let token = encode(&header, &claims, &key).unwrap();
+
+    let result = manager.verify_token(&token);
+    assert!(
+        result.is_ok(),
+        "Token with positive TTL within max should be accepted"
+    );
+}
+
+#[test]
+fn test_jwt_ttl_exceeds_max_rejected() {
+    let config = JwtConfig {
+        secret: "test-secret".to_string(),
+        issuer: "test-issuer".to_string(),
+        max_ttl_seconds: 1800, // 30 min max
+        algorithm: Algorithm::HS256,
+    };
+
+    let manager = JwtManager::new(config);
+
+    let now = Utc::now();
+    let claims = AdminClaims {
+        iss: "test-issuer".to_string(),
+        sub: "admin-user".to_string(),
+        iat: now.timestamp(),
+        nbf: now.timestamp(),
+        exp: (now + Duration::seconds(3600)).timestamp(), // 1 hour > 30 min max
+        jti: uuid::Uuid::new_v4().to_string(),
+        additional: json!({}),
+    };
+
+    let header = Header::new(Algorithm::HS256);
+    let key = EncodingKey::from_secret("test-secret".as_bytes());
+    let token = encode(&header, &claims, &key).unwrap();
+
+    let result = manager.verify_token(&token);
+    assert!(
+        result.is_err(),
+        "Token with TTL exceeding max_ttl_seconds should be rejected"
+    );
+}

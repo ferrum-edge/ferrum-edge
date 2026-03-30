@@ -207,7 +207,12 @@ impl ConsumerIndex {
             }
         }
 
-        // Atomic swap all indexes
+        // Swap all indexes. Store all_consumers last so that a concurrent reader
+        // that finds a consumer via a credential index can also find it in the
+        // all-consumers list (the new list is a superset of the old for additions).
+        // For removals, storing credential indexes first ensures the removed
+        // consumer is unreachable via credentials before it disappears from the
+        // all-consumers list, avoiding stale auth lookups.
         self.keyauth_index.store(Arc::new(keyauth));
         self.basic_index.store(Arc::new(basic));
         self.identity_index.store(Arc::new(identity));

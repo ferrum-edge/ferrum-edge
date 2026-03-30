@@ -86,10 +86,10 @@ impl JwtManager {
         // Decode and validate
         let token_data = decode::<AdminClaims>(token, &key, &validation)?;
 
-        // Enforce max TTL: reject tokens with excessive lifetimes
+        // Enforce max TTL: reject tokens with excessive or non-positive lifetimes
         if self.config.max_ttl_seconds > 0 {
             let ttl = token_data.claims.exp - token_data.claims.iat;
-            if ttl > self.config.max_ttl_seconds as i64 {
+            if ttl <= 0 || ttl > self.config.max_ttl_seconds as i64 {
                 return Err(jsonwebtoken::errors::Error::from(
                     jsonwebtoken::errors::ErrorKind::InvalidToken,
                 ));

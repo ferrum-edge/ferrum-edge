@@ -27,8 +27,11 @@ const TEST_JWT_SECRET: &str = "test-grpc-secret-key";
 
 /// Create a JWT token signed with the test secret.
 fn create_test_token() -> String {
+    let now = chrono::Utc::now().timestamp();
     let claims = json!({
         "sub": "dp-node",
+        "iat": now,
+        "exp": now + 3600,
         "role": "data_plane",
     });
     encode(
@@ -356,7 +359,8 @@ async fn test_dp_rejects_invalid_token() {
     let (addr, _update_tx, _server_handle) = start_test_cp_server(cp_config).await;
 
     // Create a token signed with the WRONG secret
-    let wrong_claims = json!({"sub": "attacker"});
+    let now = chrono::Utc::now().timestamp();
+    let wrong_claims = json!({"sub": "attacker", "iat": now, "exp": now + 3600});
     let wrong_token = encode(
         &Header::new(Algorithm::HS256),
         &wrong_claims,
@@ -390,6 +394,60 @@ async fn test_dp_rejects_invalid_token() {
     }
 
     // Verify proxy state was NOT updated
+    assert_eq!(
+        proxy_state.config.load().proxies.len(),
+        0,
+        "Config should remain empty after auth failure"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_dp_rejects_token_missing_required_claims() {
+    // Start CP server
+    let cp_config = create_test_config(1);
+    let (addr, _update_tx, _server_handle) = start_test_cp_server(cp_config).await;
+
+    // Create a token with correct secret but missing required claims (no sub, no iat)
+    let now = chrono::Utc::now().timestamp();
+    let minimal_claims = json!({"exp": now + 3600, "role": "data_plane"});
+    let token_no_sub = encode(
+        &Header::new(Algorithm::HS256),
+        &minimal_claims,
+        &EncodingKey::from_secret(TEST_JWT_SECRET.as_bytes()),
+    )
+    .unwrap();
+
+    let proxy_state = create_test_proxy_state();
+    let cp_url = format!("http://127.0.0.1:{}", addr.port());
+
+    let result = timeout(
+        Duration::from_secs(5),
+        dp_client::connect_and_subscribe(
+            &cp_url,
+            &token_no_sub,
+            "missing-claims-node",
+            &proxy_state,
+            None,
+        ),
+    )
+    .await;
+
+    match result {
+        Ok(Err(e)) => {
+            let err_msg = format!("{}", e);
+            assert!(
+                err_msg.contains("Unauthenticated")
+                    || err_msg.contains("unauthenticated")
+                    || err_msg.contains("token")
+                    || err_msg.contains("claim"),
+                "Expected authentication error for missing claims, got: {}",
+                err_msg
+            );
+        }
+        Ok(Ok(())) => panic!("Should have rejected token missing required claims"),
+        Err(_) => panic!("Should have responded before timeout"),
+    }
+
     assert_eq!(
         proxy_state.config.load().proxies.len(),
         0,

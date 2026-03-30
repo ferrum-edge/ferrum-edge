@@ -539,13 +539,17 @@ fn build_health_check_client(pool_config: &PoolConfig) -> reqwest::Client {
             ));
     }
 
-    builder.build().unwrap_or_else(|e| {
-        tracing::error!(
-            "Failed to build health check HTTP client: {}, using default",
-            e
-        );
-        reqwest::Client::new()
-    })
+    match builder.build() {
+        Ok(client) => client,
+        Err(e) => {
+            tracing::error!(
+                "Failed to build health check HTTP client: {}. \
+                 Falling back to default client (pool/TLS/keepalive settings will not apply).",
+                e
+            );
+            reqwest::Client::new()
+        }
+    }
 }
 
 fn now_epoch_ms() -> u64 {

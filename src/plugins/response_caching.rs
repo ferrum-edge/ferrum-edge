@@ -540,7 +540,7 @@ impl Plugin for ResponseCaching {
 
         // Check total size limit
         let current_total = self.total_size.load(Ordering::Relaxed);
-        if current_total + entry_size > self.config.max_total_size_bytes {
+        if current_total.saturating_add(entry_size) > self.config.max_total_size_bytes {
             debug!(
                 cache_key = %cache_key,
                 current_total = current_total,

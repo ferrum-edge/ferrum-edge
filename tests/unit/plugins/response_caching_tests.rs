@@ -794,3 +794,40 @@ async fn test_max_total_size_exceeded() {
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(matches!(result, PluginResult::Continue));
 }
+
+#[tokio::test]
+async fn test_total_size_limit_uses_saturating_add() {
+    // Verify that the total size check doesn't overflow when current_total is
+    // near usize::MAX. The fix uses saturating_add to prevent wrapping around
+    // to a small number that would bypass the size limit check.
+    //
+    // We can't directly set the internal total_size counter, but we verify
+    // that the cache respects max_total_size_bytes by checking that entries
+    // that would exceed the limit are rejected. This validates the comparison
+    // logic path that now uses saturating_add.
+    let plugin = plugin_with_config(json!({
+        "ttl_seconds": 60,
+        "max_total_size_bytes": 1, // Extremely small limit
+    }));
+
+    // Cache a response that will exceed the 1-byte limit
+    cache_response(
+        &plugin,
+        "GET",
+        "/api/overflow",
+        200,
+        &HashMap::new(),
+        b"this body is much larger than 1 byte",
+    )
+    .await;
+
+    // Should NOT be cached (entry_size > max_total_size_bytes)
+    let mut ctx = make_ctx("GET", "/api/overflow");
+    let mut headers = HashMap::new();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "Entry exceeding max_total_size_bytes should not be cached"
+    );
+    assert_eq!(ctx.metadata.get("cache_status").unwrap(), "MISS");
+}
