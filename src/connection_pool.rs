@@ -125,6 +125,7 @@ impl ConnectionPool {
         let dns_resolver = Arc::new(DnsCacheResolver::new(self.dns_cache.clone()));
 
         let mut client_builder = reqwest::Client::builder()
+            .use_rustls_tls()
             .dns_resolver(dns_resolver)
             .connect_timeout(Duration::from_millis(proxy.backend_connect_timeout_ms))
             .timeout(Duration::from_millis(proxy.backend_read_timeout_ms))
@@ -159,9 +160,15 @@ impl ConnectionPool {
                 .http2_max_frame_size(config.http2_max_frame_size);
         }
 
-        // Add custom CA bundle for server certificate verification (unless no_verify is set)
+        // Add custom CA bundle for server certificate verification (unless no_verify is set).
+        // Per-proxy backend_tls_server_ca_cert_path takes priority over the global
+        // FERRUM_TLS_CA_BUNDLE_PATH env var.
         if !self.global_mtls_config.tls_no_verify {
-            if let Some(ca_bundle_path) = &self.global_mtls_config.tls_ca_bundle_path {
+            let ca_path = proxy
+                .backend_tls_server_ca_cert_path
+                .as_ref()
+                .or(self.global_mtls_config.tls_ca_bundle_path.as_ref());
+            if let Some(ca_bundle_path) = ca_path {
                 let ca_pem = std::fs::read_to_string(ca_bundle_path).map_err(|e| {
                     anyhow::anyhow!("Failed to read CA bundle from {}: {}", ca_bundle_path, e)
                 })?;
@@ -252,9 +259,15 @@ impl ConnectionPool {
         } else {
             format!("{}:{}", proxy.backend_host, proxy.backend_port)
         };
+        // Include per-proxy CA cert path — proxies with different CAs need
+        // separate clients since add_root_certificate is set at build time.
+        let ca_str = proxy
+            .backend_tls_server_ca_cert_path
+            .as_deref()
+            .unwrap_or_default();
         format!(
-            "{}:{}:{}",
-            destination, proxy.backend_protocol as u8, override_str
+            "{}:{}:{}:{}",
+            destination, proxy.backend_protocol as u8, override_str, ca_str
         )
     }
 

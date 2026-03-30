@@ -168,8 +168,12 @@ async fn handle_admin_tls_connection(
         async move { handle_admin_request(req, state).await }
     });
 
-    // Serve the HTTP service over TLS
-    let conn = hyper::server::conn::http1::Builder::new().serve_connection(io, svc);
+    // Use auto builder to support both HTTP/1.1 and HTTP/2 via ALPN negotiation.
+    // The TLS config advertises both h2 and http/1.1, so clients can negotiate
+    // either protocol.
+    let builder =
+        hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
+    let conn = builder.serve_connection(io, svc);
 
     if let Err(e) = conn.await {
         error!("Admin HTTP connection error over TLS: {}", e);

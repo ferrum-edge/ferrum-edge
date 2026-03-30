@@ -240,6 +240,28 @@ impl DnsCache {
                 );
                 Ok(addrs[0])
             }
+            Ok(_) | Err(_) if hostname == "localhost" => {
+                // Fallback for localhost — hickory-resolver may not read
+                // /etc/hosts, so DNS lookup can fail.  Respect dns_order:
+                // if AAAA appears before A, prefer IPv6 loopback.
+                let addr = self.localhost_addr();
+                let ttl = per_proxy_ttl
+                    .map(Duration::from_secs)
+                    .or(self.valid_ttl_override)
+                    .unwrap_or(self.default_ttl);
+                self.cache.insert(
+                    hostname.to_string(),
+                    DnsCacheEntry {
+                        addresses: vec![addr],
+                        expires_at: Instant::now() + ttl,
+                        stale_deadline: Instant::now() + ttl + self.stale_ttl,
+                        record_type_used: None,
+                        is_error: false,
+                    },
+                );
+                debug!("DNS resolved localhost -> {} (built-in fallback)", addr);
+                Ok(addr)
+            }
             Ok(_) => {
                 self.cache_error(hostname);
                 anyhow::bail!("DNS resolution returned no addresses for {}", hostname);
@@ -323,6 +345,25 @@ impl DnsCache {
 
                 Ok(addrs)
             }
+            Ok(_) | Err(_) if hostname == "localhost" => {
+                let addr = self.localhost_addr();
+                let addrs = vec![addr];
+                let ttl = per_proxy_ttl
+                    .map(Duration::from_secs)
+                    .or(self.valid_ttl_override)
+                    .unwrap_or(self.default_ttl);
+                self.cache.insert(
+                    hostname.to_string(),
+                    DnsCacheEntry {
+                        addresses: addrs.clone(),
+                        expires_at: Instant::now() + ttl,
+                        stale_deadline: Instant::now() + ttl + self.stale_ttl,
+                        record_type_used: None,
+                        is_error: false,
+                    },
+                );
+                Ok(addrs)
+            }
             Ok(_) => {
                 self.cache_error(hostname);
                 anyhow::bail!("DNS resolution returned no addresses for {}", hostname);
@@ -366,6 +407,22 @@ impl DnsCache {
     }
 
     /// Cache a DNS error to prevent hammering DNS for known-bad hostnames.
+    /// Return the loopback address for localhost, respecting `dns_order`.
+    /// If AAAA appears before A in the configured order, return `::1` (IPv6);
+    /// otherwise return `127.0.0.1` (IPv4).  This mirrors what a real resolver
+    /// would return for localhost on a dual-stack host.
+    fn localhost_addr(&self) -> IpAddr {
+        for order in &self.dns_order {
+            match order {
+                DnsRecordOrder::Aaaa => return IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+                DnsRecordOrder::A => return IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                _ => continue,
+            }
+        }
+        // Default to IPv4 if dns_order has no A/AAAA entries
+        IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+    }
+
     fn cache_error(&self, hostname: &str) {
         self.cache.insert(
             hostname.to_string(),
