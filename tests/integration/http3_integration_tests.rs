@@ -368,6 +368,7 @@ async fn test_http3_proxy_state_creation() {
     let plugin_cache = Arc::new(PluginCache::new(&gc).unwrap());
     let consumer_index = Arc::new(ConsumerIndex::new(&gc.consumers));
     let lb_cache = Arc::new(ferrum_edge::LoadBalancerCache::new(&gc));
+    let circuit_breaker_cache = Arc::new(ferrum_edge::circuit_breaker::CircuitBreakerCache::new());
     let slm = Arc::new(
         ferrum_edge::proxy::stream_listener::StreamListenerManager::new(
             std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
@@ -375,6 +376,7 @@ async fn test_http3_proxy_state_creation() {
             dns_cache.clone(),
             lb_cache.clone(),
             plugin_cache.clone(),
+            circuit_breaker_cache.clone(),
             None,
             false,
             300,
@@ -536,6 +538,7 @@ async fn test_http3_full_integration() {
     let plugin_cache = Arc::new(PluginCache::new(&gc).unwrap());
     let consumer_index = Arc::new(ConsumerIndex::new(&gc.consumers));
     let lb_cache = Arc::new(ferrum_edge::LoadBalancerCache::new(&gc));
+    let circuit_breaker_cache = Arc::new(ferrum_edge::circuit_breaker::CircuitBreakerCache::new());
     let slm = Arc::new(
         ferrum_edge::proxy::stream_listener::StreamListenerManager::new(
             std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
@@ -543,6 +546,7 @@ async fn test_http3_full_integration() {
             dns_cache.clone(),
             lb_cache.clone(),
             plugin_cache.clone(),
+            circuit_breaker_cache.clone(),
             None,
             false,
             300,

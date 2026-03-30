@@ -15,6 +15,7 @@ use tokio::net::TcpStream;
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
+use crate::circuit_breaker::CircuitBreakerCache;
 use crate::tls::NoVerifier;
 
 use crate::config::types::{BackendProtocol, GatewayConfig, Proxy};
@@ -110,6 +111,8 @@ pub struct TcpListenerConfig {
     pub plugin_cache: Arc<PluginCache>,
     /// Global default TCP idle timeout in seconds. Per-proxy `tcp_idle_timeout_seconds` overrides.
     pub tcp_idle_timeout_seconds: u64,
+    /// Circuit breaker cache shared with HTTP proxies.
+    pub circuit_breaker_cache: Arc<CircuitBreakerCache>,
 }
 
 /// Start a TCP proxy listener on the given port.
@@ -133,6 +136,7 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
         tls_no_verify,
         plugin_cache,
         tcp_idle_timeout_seconds: global_tcp_idle_timeout,
+        circuit_breaker_cache,
     } = cfg;
     let addr = SocketAddr::new(bind_addr, port);
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -209,6 +213,7 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
                 let backend_tls = backend_tls_cache.clone();
                 let plugins = plugins.clone();
                 let proxy_name = proxy_name.clone();
+                let cb_cache = circuit_breaker_cache.clone();
 
                 tokio::spawn(async move {
                     let connected_at = chrono::Utc::now();
@@ -244,6 +249,7 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
                         frontend_tls.as_ref(),
                         backend_tls.as_deref(),
                         global_tcp_idle_timeout,
+                        &cb_cache,
                     )
                     .await;
 
@@ -319,6 +325,17 @@ struct TcpConnParams {
     dns_cache_ttl_seconds: Option<u64>,
     backend_connect_timeout_ms: u64,
     tcp_idle_timeout_seconds: u64,
+    /// Retry config for connection-phase retries (before data transfer).
+    retry: Option<crate::config::types::RetryConfig>,
+    /// Upstream ID for load-balanced target selection on retry.
+    upstream_id: Option<String>,
+}
+
+/// Lightweight snapshot of the proxy fields needed per TCP connection.
+/// Includes circuit breaker config and target key for circuit breaker checks.
+struct TcpConnCbInfo {
+    cb_config: Option<crate::config::types::CircuitBreakerConfig>,
+    cb_target_key: Option<String>,
 }
 
 /// Handle a single TCP connection: TLS termination → backend resolution → bidirectional copy.
@@ -333,13 +350,14 @@ async fn handle_tcp_connection(
     frontend_tls_config: Option<&Arc<rustls::ServerConfig>>,
     cached_backend_tls: Option<&CachedBackendTlsConfig>,
     global_tcp_idle_timeout: u64,
+    circuit_breaker_cache: &CircuitBreakerCache,
 ) -> Result<(u64, u64, Duration), anyhow::Error> {
     let start = Instant::now();
     let _ = client_stream.set_nodelay(true);
 
     // Look up the proxy config and extract only the fields we need.
     // The ArcSwap guard (and full Proxy) is dropped before any async work.
-    let params = {
+    let (params, cb_info) = {
         let current_config = config.load();
         let proxy = current_config
             .proxies
@@ -349,7 +367,17 @@ async fn handle_tcp_connection(
 
         let (backend_host, backend_port) = resolve_backend_target(proxy, lb_cache)?;
 
-        TcpConnParams {
+        let cb_target_key = proxy
+            .upstream_id
+            .as_ref()
+            .map(|_| crate::circuit_breaker::target_key(&backend_host, backend_port));
+
+        let cb_info = TcpConnCbInfo {
+            cb_config: proxy.circuit_breaker.clone(),
+            cb_target_key,
+        };
+
+        let params = TcpConnParams {
             backend_host,
             backend_port,
             backend_protocol: proxy.backend_protocol,
@@ -359,65 +387,221 @@ async fn handle_tcp_connection(
             tcp_idle_timeout_seconds: proxy
                 .tcp_idle_timeout_seconds
                 .unwrap_or(global_tcp_idle_timeout),
-        }
+            retry: proxy.retry.clone(),
+            upstream_id: proxy.upstream_id.clone(),
+        };
+
+        (params, cb_info)
     };
 
-    // Resolve backend IP via DNS
-    let resolved_ip = dns_cache
-        .resolve(
-            &params.backend_host,
-            params.dns_override.as_deref(),
-            params.dns_cache_ttl_seconds,
-        )
-        .await
-        .map_err(|e| anyhow::anyhow!("DNS resolution failed for {}: {}", params.backend_host, e))?;
-    let backend_addr = SocketAddr::new(resolved_ip, params.backend_port);
-    let connect_timeout = Duration::from_millis(params.backend_connect_timeout_ms);
     let is_backend_tls = params.backend_protocol == BackendProtocol::TcpTls;
-
+    let connect_timeout = Duration::from_millis(params.backend_connect_timeout_ms);
     let idle_timeout = if params.tcp_idle_timeout_seconds > 0 {
         Some(Duration::from_secs(params.tcp_idle_timeout_seconds))
     } else {
         None
     };
 
-    // Apply frontend TLS termination if configured
-    if let Some(tls_config) = frontend_tls_config {
-        let acceptor = tokio_rustls::TlsAcceptor::from(tls_config.clone());
-        let tls_stream = acceptor.accept(client_stream).await.map_err(|e| {
-            anyhow::anyhow!("Frontend TLS handshake failed from {}: {}", remote_addr, e)
-        })?;
+    // Helper: record circuit breaker failure for the current target.
+    let record_cb_failure = |cb_cache: &CircuitBreakerCache,
+                             proxy_id: &str,
+                             cb_info: &TcpConnCbInfo| {
+        if let Some(ref cb_config) = cb_info.cb_config {
+            let cb = cb_cache.get_or_create(proxy_id, cb_info.cb_target_key.as_deref(), cb_config);
+            cb.record_failure(502);
+        }
+    };
 
-        if is_backend_tls {
-            let backend_stream = connect_backend_tls_cached(
-                backend_addr,
-                &params.backend_host,
-                connect_timeout,
-                cached_backend_tls,
+    // Connection-phase retry loop. Retries DNS resolution + backend connect
+    // with a different load-balanced target on each attempt. Once a backend
+    // connection is established, bidirectional_copy begins and no further
+    // retries are possible (bytes may have been exchanged).
+    let can_retry = params
+        .retry
+        .as_ref()
+        .is_some_and(|r| r.retry_on_connect_failure);
+    let max_retries = params.retry.as_ref().map(|r| r.max_retries).unwrap_or(0);
+    let mut current_host = params.backend_host.clone();
+    let mut current_port = params.backend_port;
+    let mut current_cb_info = cb_info;
+    let mut last_connect_err: Option<anyhow::Error> = None;
+
+    let mut attempt = 0u32;
+    let backend_addr = loop {
+        // Circuit breaker check — reject before attempting backend connection if open.
+        if let Some(ref cb_config) = current_cb_info.cb_config
+            && circuit_breaker_cache
+                .can_execute(
+                    proxy_id,
+                    current_cb_info.cb_target_key.as_deref(),
+                    cb_config,
+                )
+                .is_err()
+        {
+            if can_retry && attempt < max_retries {
+                // Circuit open on this target — try another
+                if let Some(next) = try_next_target(&params, &current_host, current_port, lb_cache)
+                {
+                    warn!(
+                        proxy_id = %proxy_id,
+                        attempt,
+                        "TCP circuit breaker open for {}:{}, trying {}:{}",
+                        current_host, current_port, next.0, next.1
+                    );
+                    current_host = next.0;
+                    current_port = next.1;
+                    current_cb_info = TcpConnCbInfo {
+                        cb_config: current_cb_info.cb_config.clone(),
+                        cb_target_key: params.upstream_id.as_ref().map(|_| {
+                            crate::circuit_breaker::target_key(&current_host, current_port)
+                        }),
+                    };
+                    attempt += 1;
+                    continue;
+                }
+            }
+            warn!(proxy_id = %proxy_id, client = %remote_addr, "TCP connection rejected: circuit breaker open");
+            return Err(anyhow::anyhow!("circuit breaker open"));
+        }
+
+        // Resolve backend IP via DNS
+        let resolved_ip = match dns_cache
+            .resolve(
+                &current_host,
+                params.dns_override.as_deref(),
+                params.dns_cache_ttl_seconds,
             )
-            .await?;
-            bidirectional_copy(tls_stream, backend_stream, idle_timeout).await
+            .await
+        {
+            Ok(ip) => ip,
+            Err(e) => {
+                record_cb_failure(circuit_breaker_cache, proxy_id, &current_cb_info);
+                let err_msg = format!("DNS resolution failed for {}: {}", current_host, e);
+                if can_retry
+                    && attempt < max_retries
+                    && let Some(next) =
+                        try_next_target(&params, &current_host, current_port, lb_cache)
+                {
+                    warn!(
+                        proxy_id = %proxy_id,
+                        attempt,
+                        "TCP DNS failed for {}:{}, retrying with {}:{}",
+                        current_host, current_port, next.0, next.1
+                    );
+                    current_host = next.0;
+                    current_port = next.1;
+                    current_cb_info = TcpConnCbInfo {
+                        cb_config: current_cb_info.cb_config.clone(),
+                        cb_target_key: params.upstream_id.as_ref().map(|_| {
+                            crate::circuit_breaker::target_key(&current_host, current_port)
+                        }),
+                    };
+                    last_connect_err = Some(anyhow::anyhow!(err_msg));
+                    attempt += 1;
+                    if let Some(ref retry_config) = params.retry {
+                        tokio::time::sleep(crate::retry::retry_delay(retry_config, attempt)).await;
+                    }
+                    continue;
+                }
+                return Err(anyhow::anyhow!(err_msg));
+            }
+        };
+        let addr = SocketAddr::new(resolved_ip, current_port);
+
+        // Attempt backend TCP connection (with optional TLS origination)
+        let connect_result = if is_backend_tls {
+            connect_backend_tls_cached(addr, &current_host, connect_timeout, cached_backend_tls)
+                .await
+                .map(|s| BackendStream::Tls(Box::new(s)))
         } else {
-            let backend_stream = connect_backend_plain(backend_addr, connect_timeout).await?;
-            bidirectional_copy(tls_stream, backend_stream, idle_timeout).await
+            connect_backend_plain(addr, connect_timeout)
+                .await
+                .map(BackendStream::Plain)
+        };
+
+        match connect_result {
+            Ok(_stream) => {
+                // Connection succeeded — break out of retry loop with the address.
+                // We pass the stream via BackendStream enum below.
+                break (addr, _stream);
+            }
+            Err(e) => {
+                record_cb_failure(circuit_breaker_cache, proxy_id, &current_cb_info);
+                if can_retry
+                    && attempt < max_retries
+                    && let Some(next) =
+                        try_next_target(&params, &current_host, current_port, lb_cache)
+                {
+                    warn!(
+                        proxy_id = %proxy_id,
+                        attempt,
+                        error = %e,
+                        "TCP connect failed to {}:{}, retrying with {}:{}",
+                        current_host, current_port, next.0, next.1
+                    );
+                    current_host = next.0;
+                    current_port = next.1;
+                    current_cb_info = TcpConnCbInfo {
+                        cb_config: current_cb_info.cb_config.clone(),
+                        cb_target_key: params.upstream_id.as_ref().map(|_| {
+                            crate::circuit_breaker::target_key(&current_host, current_port)
+                        }),
+                    };
+                    last_connect_err = Some(e);
+                    attempt += 1;
+                    if let Some(ref retry_config) = params.retry {
+                        tokio::time::sleep(crate::retry::retry_delay(retry_config, attempt)).await;
+                    }
+                    continue;
+                }
+                return Err(e);
+            }
+        }
+    };
+    let (_backend_socket_addr, backend_stream) = backend_addr;
+    let _ = last_connect_err; // consumed by retry loop logging
+
+    // Apply frontend TLS termination if configured, then start bidirectional copy.
+    // From here, no retries — bytes may be exchanged.
+    let copy_result = if let Some(tls_config) = frontend_tls_config {
+        let acceptor = tokio_rustls::TlsAcceptor::from(tls_config.clone());
+        let tls_stream = match acceptor.accept(client_stream).await {
+            Ok(s) => s,
+            Err(e) => {
+                // Frontend TLS failures are client-side — do not penalise the backend CB.
+                return Err(anyhow::anyhow!(
+                    "Frontend TLS handshake failed from {}: {}",
+                    remote_addr,
+                    e
+                ));
+            }
+        };
+
+        match backend_stream {
+            BackendStream::Tls(bs) => bidirectional_copy(tls_stream, bs, idle_timeout).await,
+            BackendStream::Plain(bs) => bidirectional_copy(tls_stream, bs, idle_timeout).await,
         }
     } else {
-        // No frontend TLS — raw TCP
-        if is_backend_tls {
-            let backend_stream = connect_backend_tls_cached(
-                backend_addr,
-                &params.backend_host,
-                connect_timeout,
-                cached_backend_tls,
-            )
-            .await?;
-            bidirectional_copy(client_stream, backend_stream, idle_timeout).await
-        } else {
-            let backend_stream = connect_backend_plain(backend_addr, connect_timeout).await?;
-            bidirectional_copy(client_stream, backend_stream, idle_timeout).await
+        match backend_stream {
+            BackendStream::Tls(bs) => bidirectional_copy(client_stream, bs, idle_timeout).await,
+            BackendStream::Plain(bs) => bidirectional_copy(client_stream, bs, idle_timeout).await,
+        }
+    };
+
+    // Record circuit breaker outcome based on copy result.
+    if let Some(ref cb_config) = current_cb_info.cb_config {
+        let cb = circuit_breaker_cache.get_or_create(
+            proxy_id,
+            current_cb_info.cb_target_key.as_deref(),
+            cb_config,
+        );
+        match &copy_result {
+            Ok(_) => cb.record_success(),
+            Err(_) => cb.record_failure(502),
         }
     }
-    .map(|(bytes_in, bytes_out)| (bytes_in, bytes_out, start.elapsed()))
+
+    copy_result.map(|(bytes_in, bytes_out)| (bytes_in, bytes_out, start.elapsed()))
 }
 
 /// Resolve the backend target — either direct from proxy config or via load balancer.
@@ -433,6 +617,34 @@ fn resolve_backend_target(
     } else {
         Ok((proxy.backend_host.clone(), proxy.backend_port))
     }
+}
+
+/// Backend stream type for the connection-phase retry loop.
+/// Wraps either a plain TCP or TLS stream so the retry loop can return
+/// a single type regardless of backend TLS configuration.
+enum BackendStream {
+    Plain(TcpStream),
+    Tls(Box<tokio_rustls::client::TlsStream<TcpStream>>),
+}
+
+/// Try to select a different upstream target for retry, excluding the current one.
+/// Returns `None` if no upstream is configured or no alternate target is available.
+fn try_next_target(
+    params: &TcpConnParams,
+    current_host: &str,
+    current_port: u16,
+    lb_cache: &LoadBalancerCache,
+) -> Option<(String, u16)> {
+    let upstream_id = params.upstream_id.as_ref()?;
+    let exclude = crate::config::types::UpstreamTarget {
+        host: current_host.to_string(),
+        port: current_port,
+        weight: 1,
+        path: None,
+        tags: std::collections::HashMap::new(),
+    };
+    let next = lb_cache.select_next_target(upstream_id, current_host, &exclude, None)?;
+    Some((next.host, next.port))
 }
 
 /// Connect to a plain TCP backend with the given connect timeout.

@@ -41,7 +41,7 @@ use crate::load_balancer::{HashOnStrategy, LoadBalancerCache};
 use crate::plugin_cache::PluginCache;
 use crate::plugins::{
     Plugin, PluginResult, ProxyProtocol, RequestContext, TransactionSummary,
-    priority as plugin_priority,
+    WebSocketFrameDirection, priority as plugin_priority,
 };
 use crate::retry;
 use crate::retry::ResponseBody;
@@ -262,6 +262,7 @@ impl ProxyState {
             dns_cache.clone(),
             load_balancer_cache.clone(),
             plugin_cache.clone(),
+            circuit_breaker_cache.clone(),
             None, // Frontend TLS for stream proxies is configured per-listener in reconcile()
             env_config_arc.tls_no_verify,
             env_config_arc.tcp_idle_timeout_seconds,
@@ -1257,12 +1258,31 @@ async fn handle_websocket_request_authenticated(
         .body(ProxyBody::empty())
         .unwrap_or_else(|_| Response::new(ProxyBody::empty()));
 
+    // Collect plugins that opted into per-frame WebSocket hooks.
+    // The pre-computed flag avoids iterating the plugin list when no plugin opted in.
+    let ws_frame_plugins: Vec<Arc<dyn Plugin>> =
+        if state.plugin_cache.requires_ws_frame_hooks(&proxy.id) {
+            let all_ws_plugins = state
+                .plugin_cache
+                .get_plugins_for_protocol(&proxy.id, ProxyProtocol::WebSocket);
+            all_ws_plugins
+                .iter()
+                .filter(|p| p.requires_ws_frame_hooks())
+                .cloned()
+                .collect()
+        } else {
+            Vec::new()
+        };
+
     // Spawn bidirectional forwarding task (awaits client upgrade, then proxies)
     let proxy_id = proxy.id.clone();
     tokio::spawn(async move {
         match on_upgrade.await {
             Ok(upgraded) => {
-                if let Err(e) = run_websocket_proxy(upgraded, backend_ws_stream, &proxy_id).await {
+                if let Err(e) =
+                    run_websocket_proxy(upgraded, backend_ws_stream, &proxy_id, ws_frame_plugins)
+                        .await
+                {
                     error!("WebSocket proxying error for {}: {}", proxy_id, e);
                 }
             }
@@ -1522,10 +1542,15 @@ async fn connect_websocket_backend(
 }
 
 /// Run bidirectional WebSocket proxying between upgraded client and connected backend.
+///
+/// `ws_frame_plugins` — plugins that opted into per-frame hooks by returning `true`
+/// from `requires_ws_frame_hooks()`. Pass an empty `Vec` for zero-overhead forwarding
+/// when no plugin on this proxy needs frame inspection.
 async fn run_websocket_proxy(
     upgraded: Upgraded,
     backend_ws_stream: WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
     proxy_id: &str,
+    ws_frame_plugins: Vec<Arc<dyn Plugin>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let ws_config = WebSocketConfig {
         max_frame_size: Some(16 << 20),
@@ -1544,29 +1569,49 @@ async fn run_websocket_proxy(
     let (mut ws_sink, mut ws_stream) = ws_stream.split();
     let (mut backend_sink, mut backend_stream) = backend_ws_stream.split();
 
+    // Clone Arc'd plugin list for each direction task.
+    // When ws_frame_plugins is empty these clones are zero-cost (empty Vec).
+    let ctb_plugins = ws_frame_plugins.clone();
+    let btc_plugins = ws_frame_plugins;
+    let proxy_id_ctb = proxy_id.to_string();
+    let proxy_id_btc = proxy_id.to_string();
+
     // Forward messages from client to backend
     let client_to_backend = async move {
         debug!("Starting client -> backend message forwarding");
         while let Some(msg) = ws_stream.next().await {
             match msg {
-                Ok(Message::Text(text)) => {
-                    trace!("Client -> Backend: Text message");
-                    if let Err(e) = backend_sink.send(Message::Text(text)).await {
-                        error!("Failed to send text to backend: {}", e);
-                        break;
+                Ok(Message::Text(_)) | Ok(Message::Binary(_)) | Ok(Message::Ping(_)) => {
+                    let raw = msg.unwrap(); // safe: matched Ok above
+                    // Apply frame hooks when any plugin opted in (zero overhead when empty)
+                    let outgoing = if ctb_plugins.is_empty() {
+                        raw
+                    } else {
+                        let mut current = raw;
+                        for plugin in &ctb_plugins {
+                            if let Some(transformed) = plugin
+                                .on_ws_frame(
+                                    &proxy_id_ctb,
+                                    WebSocketFrameDirection::ClientToBackend,
+                                    &current,
+                                )
+                                .await
+                            {
+                                current = transformed;
+                            }
+                        }
+                        current
+                    };
+                    match &outgoing {
+                        Message::Text(_) => trace!("Client -> Backend: Text message"),
+                        Message::Binary(d) => {
+                            trace!(bytes = d.len(), "Client -> Backend: Binary message")
+                        }
+                        Message::Ping(_) => trace!("Client -> Backend: Ping"),
+                        _ => {}
                     }
-                }
-                Ok(Message::Binary(data)) => {
-                    trace!(bytes = data.len(), "Client -> Backend: Binary message");
-                    if let Err(e) = backend_sink.send(Message::Binary(data)).await {
-                        error!("Failed to send binary to backend: {}", e);
-                        break;
-                    }
-                }
-                Ok(Message::Ping(data)) => {
-                    trace!("Client -> Backend: Ping");
-                    if let Err(e) = backend_sink.send(Message::Ping(data)).await {
-                        error!("Failed to send ping to backend: {}", e);
+                    if let Err(e) = backend_sink.send(outgoing).await {
+                        error!("Failed to send message to backend: {}", e);
                         break;
                     }
                 }
@@ -1597,24 +1642,37 @@ async fn run_websocket_proxy(
         debug!("Starting backend -> client message forwarding");
         while let Some(msg) = backend_stream.next().await {
             match msg {
-                Ok(Message::Text(text)) => {
-                    trace!("Backend -> Client: Text message");
-                    if let Err(e) = ws_sink.send(Message::Text(text)).await {
-                        error!("Failed to send text to client: {}", e);
-                        break;
+                Ok(Message::Text(_)) | Ok(Message::Binary(_)) | Ok(Message::Ping(_)) => {
+                    let raw = msg.unwrap(); // safe: matched Ok above
+                    // Apply frame hooks when any plugin opted in (zero overhead when empty)
+                    let outgoing = if btc_plugins.is_empty() {
+                        raw
+                    } else {
+                        let mut current = raw;
+                        for plugin in &btc_plugins {
+                            if let Some(transformed) = plugin
+                                .on_ws_frame(
+                                    &proxy_id_btc,
+                                    WebSocketFrameDirection::BackendToClient,
+                                    &current,
+                                )
+                                .await
+                            {
+                                current = transformed;
+                            }
+                        }
+                        current
+                    };
+                    match &outgoing {
+                        Message::Text(_) => trace!("Backend -> Client: Text message"),
+                        Message::Binary(d) => {
+                            trace!(bytes = d.len(), "Backend -> Client: Binary message")
+                        }
+                        Message::Ping(_) => trace!("Backend -> Client: Ping"),
+                        _ => {}
                     }
-                }
-                Ok(Message::Binary(data)) => {
-                    trace!(bytes = data.len(), "Backend -> Client: Binary message");
-                    if let Err(e) = ws_sink.send(Message::Binary(data)).await {
-                        error!("Failed to send binary to client: {}", e);
-                        break;
-                    }
-                }
-                Ok(Message::Ping(data)) => {
-                    trace!("Backend -> Client: Ping");
-                    if let Err(e) = ws_sink.send(Message::Ping(data)).await {
-                        error!("Failed to send ping to client: {}", e);
+                    if let Err(e) = ws_sink.send(outgoing).await {
+                        error!("Failed to send message to client: {}", e);
                         break;
                     }
                 }

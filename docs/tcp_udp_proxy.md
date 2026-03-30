@@ -346,8 +346,8 @@ Stream proxy connections track:
 
 - **No protocol inspection**: Stream proxies forward raw bytes — no HTTP header manipulation, path routing, or content transformation
 - **No WebSocket upgrade**: WebSocket connections should use HTTP proxies with `ws`/`wss` protocol, not TCP proxies
-- **No circuit breaker**: TCP/UDP proxies do not participate in circuit breaker state tracking. Raw byte forwarding provides no semantic failure signal (like HTTP status codes) to trigger state transitions. Use health checks + load balancing for target failover instead.
-- **No retries**: TCP/UDP connections cannot be retried after partial data transfer. Once bytes have been forwarded, the stream cannot be replayed. Client-side retry or health-check-based target exclusion is the recommended approach.
+- **Circuit breaker (connection-phase only)**: TCP/UDP proxies participate in circuit breaker tracking for connection-phase failures (connect refused, timeout, TLS handshake error, DNS failure). Connection errors record `502` failures; clean connection completion records success. Once bidirectional data transfer starts, the circuit breaker does not track per-byte errors since raw byte forwarding has no semantic failure signal (like HTTP status codes).
+- **Connection-phase retries only**: TCP/UDP connections support retries during the connection phase (before data transfer starts). On connect failure, the gateway selects a different load-balanced target and retries with backoff. Once bytes have been forwarded, retries are not possible — the stream cannot be replayed.
 - **UDP max datagram**: Limited to 65,535 bytes per datagram (UDP protocol limit)
 - **Session isolation**: UDP sessions are keyed by source address — NAT'd clients sharing an IP:port will share a session
 - **DTLS key types**: DTLS only supports ECDSA P-256 and Ed25519 certificates — RSA keys are not supported by the underlying `webrtc-dtls` library

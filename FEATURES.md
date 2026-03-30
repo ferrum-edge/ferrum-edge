@@ -327,11 +327,8 @@ The following are known limitations tracked for future improvement:
 
 | Gap | Protocol | Reason | Workaround |
 |-----|----------|--------|------------|
-| No circuit breaker | TCP, UDP | Raw byte forwarding provides no semantic failure signal to trigger circuit state transitions | Use health checks + load balancing for target failover |
-| No retries | TCP, UDP | Cannot replay data after partial byte transfer on a stream connection | Client-side retry or health-check-based target exclusion |
-| No HTTP/2 WebSocket (RFC 8441) | WebSocket | hyper does not implement the Extended CONNECT method for HTTP/2 WebSocket upgrades | Clients must use HTTP/1.1 or TLS-negotiated connections for WebSocket |
-| No per-frame plugin hooks | WebSocket | Plugins act on upgrade/close events only; individual frames are forwarded opaquely | Use HTTP proxies with request/response transformation for inspectable protocols |
-| No DTLS 1.3 | UDP | The `webrtc-dtls` library only supports DTLS 1.2 | Use TLS 1.3 over TCP for protocols that can use either transport |
+| No HTTP/2 WebSocket (RFC 8441) | WebSocket | hyper's server does not implement the Extended CONNECT method (RFC 8441) for HTTP/2 WebSocket upgrades. Client-side support exists in hyper 1.x but server-side requires low-level h2 crate work to handle `:protocol = "websocket"` pseudo-headers and `SETTINGS_ENABLE_CONNECT_PROTOCOL`. Axum added server-side support in 0.8.0 but Ferrum Edge uses hyper directly. | Clients must use HTTP/1.1 Upgrade or TLS-negotiated connections for WebSocket |
+| No DTLS 1.3 | UDP | DTLS 1.3 (RFC 9147, published April 2022) has no production-ready Rust implementation. The `webrtc-dtls` crate only supports DTLS 1.2 (RFC 6347). `rusty-dtls` exists but is early-stage (PSK-only handshakes). FFI to OpenSSL 3.2+ or WolfSSL would break the pure-Rust design. QUIC (already supported via quinn) provides TLS 1.3 over UDP but is not a transparent DTLS replacement. | Use TLS 1.3 over TCP, or use QUIC-based proxying for modern UDP security |
 
 ## Deployment
 

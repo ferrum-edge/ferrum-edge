@@ -10,6 +10,7 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
+use crate::circuit_breaker::CircuitBreakerCache;
 use crate::config::types::{BackendProtocol, GatewayConfig};
 use crate::dns::DnsCache;
 use crate::load_balancer::LoadBalancerCache;
@@ -38,6 +39,7 @@ pub struct StreamListenerManager {
     dns_cache: DnsCache,
     load_balancer_cache: Arc<LoadBalancerCache>,
     plugin_cache: Arc<PluginCache>,
+    circuit_breaker_cache: Arc<CircuitBreakerCache>,
     /// Frontend TLS config for TCP stream proxies with `frontend_tls: true`.
     /// Uses `ArcSwap` because the TLS config may be loaded after `ProxyState::new()`
     /// (e.g., in file mode where TLS certs are validated after the proxy state is built).
@@ -68,6 +70,7 @@ impl StreamListenerManager {
         dns_cache: DnsCache,
         load_balancer_cache: Arc<LoadBalancerCache>,
         plugin_cache: Arc<PluginCache>,
+        circuit_breaker_cache: Arc<CircuitBreakerCache>,
         frontend_tls_config: Option<Arc<rustls::ServerConfig>>,
         tls_no_verify: bool,
         tcp_idle_timeout_seconds: u64,
@@ -81,6 +84,7 @@ impl StreamListenerManager {
             dns_cache,
             load_balancer_cache,
             plugin_cache,
+            circuit_breaker_cache,
             frontend_tls_config: arc_swap::ArcSwap::new(Arc::new(frontend_tls_config)),
             frontend_dtls_cert_key: arc_swap::ArcSwap::new(Arc::new(None)),
             frontend_dtls_client_ca_path: arc_swap::ArcSwap::new(Arc::new(None)),
@@ -203,6 +207,7 @@ impl StreamListenerManager {
             let dns_cache = self.dns_cache.clone();
             let lb_cache = self.load_balancer_cache.clone();
             let tls_no_verify = self.tls_no_verify;
+            let cb_cache = self.circuit_breaker_cache.clone();
 
             let join_handle = if protocol.is_udp() {
                 // UDP or DTLS listener
@@ -254,6 +259,7 @@ impl StreamListenerManager {
                         max_sessions: udp_max_sessions,
                         cleanup_interval_seconds: udp_cleanup_interval,
                         plugin_cache,
+                        circuit_breaker_cache: cb_cache,
                     })
                     .await
                     {
@@ -289,6 +295,7 @@ impl StreamListenerManager {
                         tls_no_verify,
                         plugin_cache,
                         tcp_idle_timeout_seconds: tcp_idle_timeout,
+                        circuit_breaker_cache: cb_cache,
                     })
                     .await
                     {
