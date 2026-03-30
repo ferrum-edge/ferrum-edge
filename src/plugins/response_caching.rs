@@ -294,11 +294,15 @@ impl ResponseCaching {
             .unwrap_or("_");
         let prefix = format!("{}:", proxy_id);
 
-        // Remove entries whose key starts with the proxy_id and contains the same path
+        // Remove entries whose key starts with the proxy_id and whose path segment
+        // matches or is a sub-path of the invalidated path.
+        // Cache key format: "proxy_id:method:path:query:consumer:vary"
+        // We extract the path segment (3rd colon-separated field) and check that it
+        // equals the invalidated path or starts with it as a path prefix.
         let path = &ctx.path;
         let mut removed_size = 0usize;
         self.cache.retain(|key, entry| {
-            if key.starts_with(&prefix) && key.contains(path) {
+            if key.starts_with(&prefix) && cache_key_path_matches(key, path) {
                 removed_size += entry.approx_size();
                 debug!(
                     cache_key = %key,
@@ -314,6 +318,32 @@ impl ResponseCaching {
             self.total_size.fetch_sub(removed_size, Ordering::Relaxed);
         }
     }
+}
+
+/// Check if a cache key's path segment matches the invalidation path.
+///
+/// Cache key format: `proxy_id:method:path:query:consumer:vary`.
+/// Returns true if the cached path equals `target_path` or starts with it
+/// as a proper path prefix (followed by `/` or end of string).
+fn cache_key_path_matches(cache_key: &str, target_path: &str) -> bool {
+    // Skip past "proxy_id:" and "method:" to reach the path segment.
+    let after_proxy_id = match cache_key.find(':') {
+        Some(i) => &cache_key[i + 1..],
+        None => return false,
+    };
+    let after_method = match after_proxy_id.find(':') {
+        Some(i) => &after_proxy_id[i + 1..],
+        None => return false,
+    };
+    // Extract the path segment (up to the next colon).
+    let cached_path = match after_method.find(':') {
+        Some(i) => &after_method[..i],
+        None => after_method,
+    };
+    // Exact match or proper path prefix (e.g., /users invalidates /users/123 but not /users-admin).
+    cached_path == target_path
+        || (cached_path.starts_with(target_path)
+            && cached_path.as_bytes().get(target_path.len()) == Some(&b'/'))
 }
 
 #[async_trait]
@@ -379,11 +409,24 @@ impl Plugin for ResponseCaching {
                     headers.insert("x-cache-status".to_string(), "HIT".to_string());
                 }
 
-                // Return cached response body as string — works for JSON/text API responses
-                let body = String::from_utf8(entry.body.to_vec()).unwrap_or_else(|e| {
-                    // Lossy conversion for binary responses
-                    String::from_utf8_lossy(e.as_bytes()).into_owned()
-                });
+                // Return cached response body as string.
+                // Non-UTF-8 entries should not reach here (filtered at store time),
+                // but if they do, skip the cache hit rather than corrupt the body.
+                let body = match String::from_utf8(entry.body.to_vec()) {
+                    Ok(s) => s,
+                    Err(_) => {
+                        warn!("response_caching: cached entry has non-UTF-8 body, evicting");
+                        drop(entry);
+                        if let Some((_, removed)) = self.cache.remove(&cache_key) {
+                            self.total_size
+                                .fetch_sub(removed.approx_size(), Ordering::Relaxed);
+                        }
+                        ctx.metadata.insert("cache_key".to_string(), cache_key);
+                        ctx.metadata
+                            .insert("cache_status".to_string(), "MISS".to_string());
+                        return PluginResult::Continue;
+                    }
+                };
 
                 return PluginResult::Reject {
                     status_code: entry.status_code,
@@ -497,6 +540,16 @@ impl Plugin for ResponseCaching {
             Some(key) => key.clone(),
             None => return PluginResult::Continue,
         };
+
+        // Skip non-UTF-8 bodies — PluginResult::Reject requires String, so
+        // caching binary responses would corrupt them on cache hit.
+        if std::str::from_utf8(body).is_err() {
+            debug!(
+                cache_key = %cache_key,
+                "response_caching: response body is not valid UTF-8, skipping cache"
+            );
+            return PluginResult::Continue;
+        }
 
         // Check body size limit
         if body.len() > self.config.max_entry_size_bytes {

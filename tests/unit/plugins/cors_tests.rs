@@ -1,7 +1,7 @@
 //! Tests for the CORS plugin
 
-use ferrum_gateway::plugins::cors::CorsPlugin;
-use ferrum_gateway::plugins::{Plugin, PluginResult, RequestContext};
+use ferrum_edge::plugins::cors::CorsPlugin;
+use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext};
 use serde_json::json;
 use std::collections::HashMap;
 

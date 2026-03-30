@@ -1,4 +1,4 @@
-use ferrum_gateway::config::config_backup::load_config_backup;
+use ferrum_edge::config::config_backup::load_config_backup;
 use std::io::Write;
 
 fn write_tmp_file(content: &str) -> (tempfile::NamedTempFile, String) {

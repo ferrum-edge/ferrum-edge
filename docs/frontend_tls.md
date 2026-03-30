@@ -1,10 +1,10 @@
 # Frontend TLS Configuration
 
-This guide explains how to configure TLS (HTTPS) and mutual TLS (mTLS) for client connections to the Ferrum Gateway.
+This guide explains how to configure TLS (HTTPS) and mutual TLS (mTLS) for client connections to the Ferrum Edge.
 
 ## Overview
 
-Ferrum Gateway supports three modes of operation for client connections:
+Ferrum Edge supports three modes of operation for client connections:
 
 1. **HTTP** - Plain text connections (default)
 2. **HTTPS** - Encrypted connections with server authentication
@@ -43,7 +43,7 @@ No TLS configuration needed:
 # Gateway starts with:
 # - HTTP listener on port 8000 (configurable via FERRUM_PROXY_HTTP_PORT)
 # - No HTTPS listener
-./ferrum-gateway
+./ferrum-edge
 ```
 
 ### 2. HTTPS + HTTP (Dual Listeners)
@@ -54,7 +54,7 @@ Enable server TLS:
 export FERRUM_PROXY_TLS_CERT_PATH="/etc/ssl/certs/gateway.crt"
 export FERRUM_PROXY_TLS_KEY_PATH="/etc/ssl/private/gateway.key"
 
-./ferrum-gateway
+./ferrum-edge
 ```
 
 **What happens:**
@@ -74,7 +74,7 @@ export FERRUM_PROXY_TLS_CERT_PATH="/etc/ssl/certs/gateway.crt"
 export FERRUM_PROXY_TLS_KEY_PATH="/etc/ssl/private/gateway.key"
 export FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH="/etc/ssl/certs/client-ca-bundle.pem"
 
-./ferrum-gateway
+./ferrum-edge
 ```
 
 **What happens:**
@@ -118,7 +118,7 @@ TLS not configured - HTTPS listener disabled
 **Development:**
 ```bash
 # HTTP only for easy development
-./ferrum-gateway
+./ferrum-edge
 # Access: http://localhost:8000
 ```
 
@@ -127,7 +127,7 @@ TLS not configured - HTTPS listener disabled
 # Both HTTP and HTTPS for testing
 export FERRUM_PROXY_TLS_CERT_PATH="./staging.crt"
 export FERRUM_PROXY_TLS_KEY_PATH="./staging.key"
-./ferrum-gateway
+./ferrum-edge
 # Access: http://localhost:8000 AND https://localhost:8443
 ```
 
@@ -137,7 +137,7 @@ export FERRUM_PROXY_TLS_KEY_PATH="./staging.key"
 export FERRUM_PROXY_TLS_CERT_PATH="/prod/certs/gateway.crt"
 export FERRUM_PROXY_TLS_KEY_PATH="/prod/certs/gateway.key"
 export FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH="/prod/certs/client-ca.pem"
-./ferrum-gateway
+./ferrum-edge
 # Access: https://localhost:8443 (mTLS required)
 # Firewall blocks port 8000
 ```
@@ -206,7 +206,7 @@ export FERRUM_ADMIN_JWT_SECRET="your-secret-key"
 
 #### **1. Admin HTTP Only (Default)**
 ```bash
-./ferrum-gateway
+./ferrum-edge
 # Admin HTTP: http://localhost:9000
 # No Admin HTTPS
 ```
@@ -215,7 +215,7 @@ export FERRUM_ADMIN_JWT_SECRET="your-secret-key"
 ```bash
 export FERRUM_ADMIN_TLS_CERT_PATH="/etc/ssl/certs/admin.crt"
 export FERRUM_ADMIN_TLS_KEY_PATH="/etc/ssl/private/admin.key"
-./ferrum-gateway
+./ferrum-edge
 # Admin HTTP: http://localhost:9000
 # Admin HTTPS: https://localhost:9443
 ```
@@ -225,7 +225,7 @@ export FERRUM_ADMIN_TLS_KEY_PATH="/etc/ssl/private/admin.key"
 export FERRUM_ADMIN_TLS_CERT_PATH="/etc/ssl/certs/admin.crt"
 export FERRUM_ADMIN_TLS_KEY_PATH="/etc/ssl/private/admin.key"
 export FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH="/etc/ssl/certs/admin-client-ca.pem"
-./ferrum-gateway
+./ferrum-edge
 # Admin HTTP: http://localhost:9000
 # Admin HTTPS/mTLS: https://localhost:9443 (client certs required)
 ```
@@ -235,7 +235,7 @@ export FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH="/etc/ssl/certs/admin-client-ca.pe
 export FERRUM_ADMIN_TLS_CERT_PATH="/etc/ssl/certs/admin.crt"
 export FERRUM_ADMIN_TLS_KEY_PATH="/etc/ssl/private/admin.key"
 export FERRUM_ADMIN_TLS_NO_VERIFY="true"
-./ferrum-gateway
+./ferrum-edge
 # Admin HTTP: http://localhost:9000
 # Admin HTTPS: https://localhost:9443 (no cert verification)
 ```
@@ -319,7 +319,7 @@ export FERRUM_PROXY_TLS_CERT_PATH="./server.crt"
 export FERRUM_PROXY_TLS_KEY_PATH="./server.key"
 export FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH="./client-ca-bundle.pem"
 
-./ferrum-gateway
+./ferrum-edge
 ```
 
 ### Test with Client Certificate
@@ -428,7 +428,7 @@ Enable debug logging to troubleshoot TLS issues:
 
 ```bash
 export RUST_LOG=debug
-./ferrum-gateway
+./ferrum-edge
 ```
 
 Look for messages like:

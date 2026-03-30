@@ -5,12 +5,12 @@
 
 use arc_swap::ArcSwap;
 use chrono::Utc;
-use ferrum_gateway::admin::{
+use ferrum_edge::admin::{
     AdminState,
     jwt_auth::{JwtConfig, JwtManager},
     start_admin_listener,
 };
-use ferrum_gateway::config::types::{
+use ferrum_edge::config::types::{
     AuthMode, BackendProtocol, Consumer, GatewayConfig, PluginConfig, PluginScope, Proxy,
 };
 use jsonwebtoken::{EncodingKey, Header, encode};
@@ -31,7 +31,7 @@ impl Default for TestConfig {
     fn default() -> Self {
         Self {
             jwt_secret: "test-secret-key-for-admin-api".to_string(),
-            jwt_issuer: "test-ferrum-gateway".to_string(),
+            jwt_issuer: "test-ferrum-edge".to_string(),
             max_ttl: 3600,
         }
     }
@@ -799,7 +799,7 @@ async fn test_pagination_limit_clamped_to_max() {
 
 // ---- Batch endpoint tests ----
 
-use ferrum_gateway::config::db_loader::DatabaseStore;
+use ferrum_edge::config::db_loader::DatabaseStore;
 
 async fn create_db_admin_state(tc: &TestConfig) -> (AdminState, tempfile::TempDir) {
     let temp_dir = tempfile::TempDir::new().unwrap();

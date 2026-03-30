@@ -1,6 +1,6 @@
 # Admin Read-Only Mode
 
-The Ferrum Gateway Admin API supports a configurable read-only mode that provides an additional layer of security for production deployments.
+The Ferrum Edge Admin API supports a configurable read-only mode that provides an additional layer of security for production deployments.
 
 ## Overview
 

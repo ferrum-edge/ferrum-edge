@@ -1,6 +1,6 @@
 # Retry Logic
 
-Ferrum Gateway provides configurable retry logic for failed backend requests. Retries are configured per-proxy and support both connection-level and HTTP status-code-level failure detection with fixed or exponential backoff strategies.
+Ferrum Edge provides configurable retry logic for failed backend requests. Retries are configured per-proxy and support both connection-level and HTTP status-code-level failure detection with fixed or exponential backoff strategies.
 
 ## Table of Contents
 

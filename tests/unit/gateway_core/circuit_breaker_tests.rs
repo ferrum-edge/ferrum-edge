@@ -1,7 +1,7 @@
 //! Tests for circuit breaker module
 
-use ferrum_gateway::circuit_breaker::{CircuitBreaker, CircuitBreakerCache, target_key};
-use ferrum_gateway::config::types::CircuitBreakerConfig;
+use ferrum_edge::circuit_breaker::{CircuitBreaker, CircuitBreakerCache, target_key};
+use ferrum_edge::config::types::CircuitBreakerConfig;
 use std::sync::Arc;
 
 fn default_config() -> CircuitBreakerConfig {

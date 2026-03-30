@@ -2,7 +2,7 @@
 
 # ===========================================================================
 # API Gateway Comparison Benchmark
-# Ferrum Gateway vs Pingora vs Kong vs Tyk vs KrakenD vs Envoy
+# Ferrum Edge vs Pingora vs Kong vs Tyk vs KrakenD vs Envoy
 #
 # Runs each gateway sequentially (one at a time) against the same backend
 # echo server, testing both HTTP and HTTPS (TLS termination), then generates
@@ -311,11 +311,11 @@ pull_images() {
 # ===========================================================================
 
 build_project() {
-    log_header "Building Ferrum Gateway and backend server"
+    log_header "Building Ferrum Edge and backend server"
 
     log_info "Building gateway (release)..."
     cd "$PROJECT_ROOT"
-    cargo build --release --bin ferrum-gateway 2>&1 | tail -1
+    cargo build --release --bin ferrum-edge 2>&1 | tail -1
 
     log_info "Building backend server (release)..."
     cd "$PERF_DIR"
@@ -430,11 +430,11 @@ run_wrk_key_auth() {
 }
 
 # ===========================================================================
-# Ferrum Gateway
+# Ferrum Edge
 # ===========================================================================
 
 start_ferrum_http() {
-    log_info "Starting Ferrum Gateway (HTTP) on port $GATEWAY_HTTP_PORT..."
+    log_info "Starting Ferrum Edge (HTTP) on port $GATEWAY_HTTP_PORT..."
     kill_port "$GATEWAY_HTTP_PORT"
     cd "$PROJECT_ROOT"
     FERRUM_MODE=file \
@@ -445,13 +445,13 @@ start_ferrum_http() {
     FERRUM_POOL_ENABLE_HTTP_KEEP_ALIVE=true \
     FERRUM_POOL_ENABLE_HTTP2=false \
     FERRUM_LOG_LEVEL=warn \
-    ./target/release/ferrum-gateway > "$RESULTS_DIR/ferrum_http.log" 2>&1 &
+    ./target/release/ferrum-edge > "$RESULTS_DIR/ferrum_http.log" 2>&1 &
     FERRUM_PID=$!
     wait_for_http "http://127.0.0.1:$GATEWAY_HTTP_PORT/health" "Ferrum (HTTP)"
 }
 
 start_ferrum_https() {
-    log_info "Starting Ferrum Gateway (HTTPS) on port $GATEWAY_HTTPS_PORT..."
+    log_info "Starting Ferrum Edge (HTTPS) on port $GATEWAY_HTTPS_PORT..."
     kill_port "$GATEWAY_HTTP_PORT"
     kill_port "$GATEWAY_HTTPS_PORT"
     cd "$PROJECT_ROOT"
@@ -466,7 +466,7 @@ start_ferrum_https() {
     FERRUM_POOL_ENABLE_HTTP_KEEP_ALIVE=true \
     FERRUM_POOL_ENABLE_HTTP2=false \
     FERRUM_LOG_LEVEL=warn \
-    ./target/release/ferrum-gateway > "$RESULTS_DIR/ferrum_https.log" 2>&1 &
+    ./target/release/ferrum-edge > "$RESULTS_DIR/ferrum_https.log" 2>&1 &
     FERRUM_PID=$!
     wait_for_http "https://127.0.0.1:$GATEWAY_HTTPS_PORT/health" "Ferrum (HTTPS)" 15
 }
@@ -483,7 +483,7 @@ stop_ferrum() {
 }
 
 start_ferrum_e2e_tls() {
-    log_info "Starting Ferrum Gateway (E2E TLS) on port $GATEWAY_HTTPS_PORT..."
+    log_info "Starting Ferrum Edge (E2E TLS) on port $GATEWAY_HTTPS_PORT..."
     kill_port "$GATEWAY_HTTP_PORT"
     kill_port "$GATEWAY_HTTPS_PORT"
     cd "$PROJECT_ROOT"
@@ -498,13 +498,13 @@ start_ferrum_e2e_tls() {
     FERRUM_POOL_ENABLE_HTTP_KEEP_ALIVE=true \
     FERRUM_POOL_ENABLE_HTTP2=false \
     FERRUM_LOG_LEVEL=warn \
-    ./target/release/ferrum-gateway > "$RESULTS_DIR/ferrum_e2e_tls.log" 2>&1 &
+    ./target/release/ferrum-edge > "$RESULTS_DIR/ferrum_e2e_tls.log" 2>&1 &
     FERRUM_PID=$!
     wait_for_http "https://127.0.0.1:$GATEWAY_HTTPS_PORT/health" "Ferrum (E2E TLS)" 15
 }
 
 test_ferrum() {
-    log_header "Testing Ferrum Gateway"
+    log_header "Testing Ferrum Edge"
 
     # HTTP tests
     start_ferrum_http
@@ -1381,7 +1381,7 @@ prepare_tyk_key_auth_config() {
 }
 
 test_ferrum_key_auth() {
-    log_info "Starting Ferrum Gateway (Key Auth HTTP) on port $GATEWAY_HTTP_PORT..."
+    log_info "Starting Ferrum Edge (Key Auth HTTP) on port $GATEWAY_HTTP_PORT..."
     kill_port "$GATEWAY_HTTP_PORT"
     cd "$PROJECT_ROOT"
     FERRUM_MODE=file \
@@ -1392,7 +1392,7 @@ test_ferrum_key_auth() {
     FERRUM_POOL_ENABLE_HTTP_KEEP_ALIVE=true \
     FERRUM_POOL_ENABLE_HTTP2=false \
     FERRUM_LOG_LEVEL=warn \
-    ./target/release/ferrum-gateway > "$RESULTS_DIR/ferrum_key_auth.log" 2>&1 &
+    ./target/release/ferrum-edge > "$RESULTS_DIR/ferrum_key_auth.log" 2>&1 &
     FERRUM_PID=$!
     wait_for_http "http://127.0.0.1:$GATEWAY_HTTP_PORT/health" "Ferrum (Key Auth)"
 

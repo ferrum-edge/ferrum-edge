@@ -21,9 +21,9 @@ use hyper::{Request, Response};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::net::TcpListener;
 
-use ferrum_gateway::config::types::{AuthMode, BackendProtocol, GatewayConfig, Proxy};
-use ferrum_gateway::dns::{DnsCache, DnsConfig};
-use ferrum_gateway::proxy::ProxyState;
+use ferrum_edge::config::types::{AuthMode, BackendProtocol, GatewayConfig, Proxy};
+use ferrum_edge::dns::{DnsCache, DnsConfig};
+use ferrum_edge::proxy::ProxyState;
 
 /// Create a test proxy configured for gRPC backend.
 fn create_grpc_proxy(id: &str, listen_path: &str, backend_port: u16) -> Proxy {
@@ -76,9 +76,9 @@ fn create_grpc_proxy(id: &str, listen_path: &str, backend_port: u16) -> Proxy {
 }
 
 /// Create a test EnvConfig.
-fn create_test_env_config() -> ferrum_gateway::config::EnvConfig {
-    ferrum_gateway::config::EnvConfig {
-        mode: ferrum_gateway::config::env_config::OperatingMode::File,
+fn create_test_env_config() -> ferrum_edge::config::EnvConfig {
+    ferrum_edge::config::EnvConfig {
+        mode: ferrum_edge::config::env_config::OperatingMode::File,
         log_level: "info".into(),
         enable_streaming_latency_tracking: false,
         proxy_http_port: 8000,
@@ -305,7 +305,7 @@ async fn start_test_gateway(state: ProxyState) -> (SocketAddr, tokio::task::Join
                     let state = state.clone();
                     let addr = remote_addr;
                     async move {
-                        ferrum_gateway::proxy::handle_proxy_request(
+                        ferrum_edge::proxy::handle_proxy_request(
                             req, state, addr, false, None, None,
                         )
                         .await

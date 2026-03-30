@@ -1,6 +1,6 @@
 # Plugin Execution Order
 
-Ferrum Gateway executes plugins in a deterministic order based on two dimensions: **lifecycle phases** and **priority within each phase**.
+Ferrum Edge executes plugins in a deterministic order based on two dimensions: **lifecycle phases** and **priority within each phase**.
 
 ## Lifecycle Phases
 

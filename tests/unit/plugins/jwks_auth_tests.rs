@@ -1,7 +1,7 @@
 //! Tests for jwks_auth plugin
 
-use ferrum_gateway::ConsumerIndex;
-use ferrum_gateway::plugins::{Plugin, PluginHttpClient, RequestContext, jwks_auth::JwksAuth};
+use ferrum_edge::ConsumerIndex;
+use ferrum_edge::plugins::{Plugin, PluginHttpClient, RequestContext, jwks_auth::JwksAuth};
 use serde_json::json;
 use std::collections::HashMap;
 
@@ -19,9 +19,9 @@ fn make_ctx() -> RequestContext {
     )
 }
 
-fn create_consumer(username: &str) -> ferrum_gateway::config::types::Consumer {
+fn create_consumer(username: &str) -> ferrum_edge::config::types::Consumer {
     use chrono::Utc;
-    ferrum_gateway::config::types::Consumer {
+    ferrum_edge::config::types::Consumer {
         id: format!("{}-id", username),
         username: username.to_string(),
         custom_id: None,
@@ -34,9 +34,9 @@ fn create_consumer(username: &str) -> ferrum_gateway::config::types::Consumer {
 fn create_consumer_with_custom_id(
     username: &str,
     custom_id: &str,
-) -> ferrum_gateway::config::types::Consumer {
+) -> ferrum_edge::config::types::Consumer {
     use chrono::Utc;
-    ferrum_gateway::config::types::Consumer {
+    ferrum_edge::config::types::Consumer {
         id: format!("{}-id", username),
         username: username.to_string(),
         custom_id: Some(custom_id.to_string()),
@@ -848,7 +848,7 @@ async fn test_jwks_auth_multi_provider_wrong_role_rejected() {
 
 #[test]
 fn test_extract_claim_values_space_delimited_string() {
-    use ferrum_gateway::plugins::jwks_auth::extract_claim_values;
+    use ferrum_edge::plugins::jwks_auth::extract_claim_values;
 
     let claims = json!({"scope": "read:data write:data admin"});
     let values = extract_claim_values(&claims, "scope");
@@ -857,7 +857,7 @@ fn test_extract_claim_values_space_delimited_string() {
 
 #[test]
 fn test_extract_claim_values_array() {
-    use ferrum_gateway::plugins::jwks_auth::extract_claim_values;
+    use ferrum_edge::plugins::jwks_auth::extract_claim_values;
 
     let claims = json!({"scp": ["read", "write"]});
     let values = extract_claim_values(&claims, "scp");
@@ -866,7 +866,7 @@ fn test_extract_claim_values_array() {
 
 #[test]
 fn test_extract_claim_values_nested_dot_path() {
-    use ferrum_gateway::plugins::jwks_auth::extract_claim_values;
+    use ferrum_edge::plugins::jwks_auth::extract_claim_values;
 
     let claims = json!({"realm_access": {"roles": ["admin", "user"]}});
     let values = extract_claim_values(&claims, "realm_access.roles");
@@ -875,7 +875,7 @@ fn test_extract_claim_values_nested_dot_path() {
 
 #[test]
 fn test_extract_claim_values_missing_path() {
-    use ferrum_gateway::plugins::jwks_auth::extract_claim_values;
+    use ferrum_edge::plugins::jwks_auth::extract_claim_values;
 
     let claims = json!({"sub": "user"});
     let values = extract_claim_values(&claims, "nonexistent.path");
@@ -884,7 +884,7 @@ fn test_extract_claim_values_missing_path() {
 
 #[test]
 fn test_extract_claim_values_deeply_nested() {
-    use ferrum_gateway::plugins::jwks_auth::extract_claim_values;
+    use ferrum_edge::plugins::jwks_auth::extract_claim_values;
 
     // Two levels of nesting (Keycloak resource_access style)
     let claims = json!({

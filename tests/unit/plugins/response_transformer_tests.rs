@@ -1,6 +1,6 @@
 //! Tests for response_transformer plugin
 
-use ferrum_gateway::plugins::{Plugin, RequestContext, response_transformer::ResponseTransformer};
+use ferrum_edge::plugins::{Plugin, RequestContext, response_transformer::ResponseTransformer};
 use serde_json::json;
 use std::collections::HashMap;
 
@@ -32,7 +32,7 @@ async fn test_response_transformer_add_header() {
     let result = plugin.after_proxy(&mut ctx, 200, &mut headers).await;
     assert!(matches!(
         result,
-        ferrum_gateway::plugins::PluginResult::Continue
+        ferrum_edge::plugins::PluginResult::Continue
     ));
     assert_eq!(headers.get("x-response-id").unwrap(), "abc-123");
 }
@@ -53,7 +53,7 @@ async fn test_response_transformer_remove_header() {
     let result = plugin.after_proxy(&mut ctx, 200, &mut headers).await;
     assert!(matches!(
         result,
-        ferrum_gateway::plugins::PluginResult::Continue
+        ferrum_edge::plugins::PluginResult::Continue
     ));
     assert!(!headers.contains_key("x-internal"));
     assert!(headers.contains_key("content-type"));
@@ -63,7 +63,7 @@ async fn test_response_transformer_remove_header() {
 async fn test_response_transformer_update_header() {
     let plugin = ResponseTransformer::new(&json!({
         "rules": [
-            {"operation": "update", "key": "Server", "value": "Ferrum Gateway"}
+            {"operation": "update", "key": "Server", "value": "Ferrum Edge"}
         ]
     }));
 
@@ -74,9 +74,9 @@ async fn test_response_transformer_update_header() {
     let result = plugin.after_proxy(&mut ctx, 200, &mut headers).await;
     assert!(matches!(
         result,
-        ferrum_gateway::plugins::PluginResult::Continue
+        ferrum_edge::plugins::PluginResult::Continue
     ));
-    assert_eq!(headers.get("server").unwrap(), "Ferrum Gateway");
+    assert_eq!(headers.get("server").unwrap(), "Ferrum Edge");
 }
 
 #[tokio::test]
@@ -97,7 +97,7 @@ async fn test_response_transformer_multiple_rules() {
     let result = plugin.after_proxy(&mut ctx, 200, &mut headers).await;
     assert!(matches!(
         result,
-        ferrum_gateway::plugins::PluginResult::Continue
+        ferrum_edge::plugins::PluginResult::Continue
     ));
     assert_eq!(headers.get("x-gateway").unwrap(), "ferrum");
     assert!(!headers.contains_key("x-powered-by"));
@@ -115,7 +115,7 @@ async fn test_response_transformer_empty_rules() {
     let result = plugin.after_proxy(&mut ctx, 200, &mut headers).await;
     assert!(matches!(
         result,
-        ferrum_gateway::plugins::PluginResult::Continue
+        ferrum_edge::plugins::PluginResult::Continue
     ));
     assert_eq!(headers.get("x-existing").unwrap(), "unchanged");
 }
@@ -130,7 +130,7 @@ async fn test_response_transformer_no_config() {
     let result = plugin.after_proxy(&mut ctx, 500, &mut headers).await;
     assert!(matches!(
         result,
-        ferrum_gateway::plugins::PluginResult::Continue
+        ferrum_edge::plugins::PluginResult::Continue
     ));
 }
 
@@ -148,7 +148,7 @@ async fn test_response_transformer_add_without_value_ignored() {
     let result = plugin.after_proxy(&mut ctx, 200, &mut headers).await;
     assert!(matches!(
         result,
-        ferrum_gateway::plugins::PluginResult::Continue
+        ferrum_edge::plugins::PluginResult::Continue
     ));
     assert!(!headers.contains_key("x-novalue"));
 }
@@ -167,7 +167,7 @@ async fn test_response_transformer_unknown_operation_ignored() {
     let result = plugin.after_proxy(&mut ctx, 200, &mut headers).await;
     assert!(matches!(
         result,
-        ferrum_gateway::plugins::PluginResult::Continue
+        ferrum_edge::plugins::PluginResult::Continue
     ));
 }
 
@@ -186,7 +186,7 @@ async fn test_response_transformer_handles_various_status_codes() {
         let result = plugin.after_proxy(&mut ctx, status, &mut headers).await;
         assert!(matches!(
             result,
-            ferrum_gateway::plugins::PluginResult::Continue
+            ferrum_edge::plugins::PluginResult::Continue
         ));
         assert_eq!(headers.get("x-processed").unwrap(), "true");
     }
@@ -207,7 +207,7 @@ async fn test_response_transformer_rename_header() {
     let result = plugin.after_proxy(&mut ctx, 200, &mut headers).await;
     assert!(matches!(
         result,
-        ferrum_gateway::plugins::PluginResult::Continue
+        ferrum_edge::plugins::PluginResult::Continue
     ));
     assert!(!headers.contains_key("x-old"));
     assert_eq!(headers.get("x-new").unwrap(), "the-value");
@@ -227,7 +227,7 @@ async fn test_response_transformer_rename_header_nonexistent() {
     let result = plugin.after_proxy(&mut ctx, 200, &mut headers).await;
     assert!(matches!(
         result,
-        ferrum_gateway::plugins::PluginResult::Continue
+        ferrum_edge::plugins::PluginResult::Continue
     ));
     assert!(!headers.contains_key("x-new"));
     assert!(!headers.contains_key("x-missing"));
@@ -248,7 +248,7 @@ async fn test_response_transformer_rename_without_new_key_ignored() {
     let result = plugin.after_proxy(&mut ctx, 200, &mut headers).await;
     assert!(matches!(
         result,
-        ferrum_gateway::plugins::PluginResult::Continue
+        ferrum_edge::plugins::PluginResult::Continue
     ));
     // Without new_key, the rename is a no-op — old key should remain
     assert_eq!(headers.get("x-old").unwrap(), "the-value");
@@ -268,7 +268,7 @@ async fn test_response_transformer_header_key_pre_lowercased() {
     let result = plugin.after_proxy(&mut ctx, 200, &mut headers).await;
     assert!(matches!(
         result,
-        ferrum_gateway::plugins::PluginResult::Continue
+        ferrum_edge::plugins::PluginResult::Continue
     ));
     // Key should be stored as lowercase due to pre-lowercasing at config time
     assert_eq!(headers.get("x-upper").unwrap(), "lowered");
@@ -405,7 +405,7 @@ async fn test_response_transformer_body_mixed_header_and_body_rules() {
     let result = plugin.after_proxy(&mut ctx, 200, &mut headers).await;
     assert!(matches!(
         result,
-        ferrum_gateway::plugins::PluginResult::Continue
+        ferrum_edge::plugins::PluginResult::Continue
     ));
     assert_eq!(headers.get("x-processed").unwrap(), "true");
 

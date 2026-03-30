@@ -1,6 +1,6 @@
 //! Example Custom Plugin
 //!
-//! This is a complete, working example of a custom Ferrum Gateway plugin.
+//! This is a complete, working example of a custom Ferrum Edge plugin.
 //! Copy this file as a starting point for your own plugins.
 //!
 //! This plugin adds a custom `X-Custom-Gateway` header to every request

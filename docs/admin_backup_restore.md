@@ -1,6 +1,6 @@
 # Admin API: Backup & Restore
 
-The Ferrum Gateway Admin API provides dedicated endpoints for full configuration backup and restore, enabling disaster recovery, environment migration, and configuration snapshots.
+The Ferrum Edge Admin API provides dedicated endpoints for full configuration backup and restore, enabling disaster recovery, environment migration, and configuration snapshots.
 
 ## Overview
 

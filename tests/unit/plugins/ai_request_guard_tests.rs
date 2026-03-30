@@ -1,12 +1,12 @@
 //! Tests for ai_request_guard plugin
 
-use ferrum_gateway::plugins::{Plugin, ai_request_guard::AiRequestGuard};
+use ferrum_edge::plugins::{Plugin, ai_request_guard::AiRequestGuard};
 use serde_json::json;
 use std::collections::HashMap;
 
 use super::plugin_utils::{assert_continue, assert_reject, create_test_context};
 
-fn make_post_ctx(body: &serde_json::Value) -> ferrum_gateway::plugins::RequestContext {
+fn make_post_ctx(body: &serde_json::Value) -> ferrum_edge::plugins::RequestContext {
     let mut ctx = create_test_context();
     ctx.method = "POST".to_string();
     ctx.headers

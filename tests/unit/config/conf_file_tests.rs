@@ -1,8 +1,8 @@
 //! Tests for the ferrum.conf configuration file parser and integration
 //! with EnvConfig.
 
-use ferrum_gateway::config::EnvConfig;
-use ferrum_gateway::config::conf_file::ConfFile;
+use ferrum_edge::config::EnvConfig;
+use ferrum_edge::config::conf_file::ConfFile;
 use std::sync::Mutex;
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());

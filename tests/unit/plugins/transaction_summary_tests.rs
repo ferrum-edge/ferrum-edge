@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 
-use ferrum_gateway::plugins::{StreamTransactionSummary, TransactionSummary};
+use ferrum_edge::plugins::{StreamTransactionSummary, TransactionSummary};
 
 /// Build a fully-populated TransactionSummary for testing.
 fn make_full_summary() -> TransactionSummary {
@@ -99,7 +99,7 @@ fn test_summary_clone_preserves_resolved_ip() {
 
 #[test]
 fn test_backend_response_carries_resolved_ip() {
-    use ferrum_gateway::retry::{BackendResponse, ResponseBody};
+    use ferrum_edge::retry::{BackendResponse, ResponseBody};
 
     let resp = BackendResponse {
         status_code: 200,
@@ -121,7 +121,7 @@ fn test_backend_response_carries_resolved_ip() {
 
 #[test]
 fn test_backend_response_none_ip_on_connection_failure() {
-    use ferrum_gateway::retry::{BackendResponse, ResponseBody};
+    use ferrum_edge::retry::{BackendResponse, ResponseBody};
 
     let resp = BackendResponse {
         status_code: 502,
@@ -129,7 +129,7 @@ fn test_backend_response_none_ip_on_connection_failure() {
         headers: HashMap::new(),
         connection_error: true,
         backend_resolved_ip: None,
-        error_class: Some(ferrum_gateway::retry::ErrorClass::ConnectionRefused),
+        error_class: Some(ferrum_edge::retry::ErrorClass::ConnectionRefused),
     };
 
     assert!(resp.connection_error);
@@ -140,7 +140,7 @@ fn test_backend_response_none_ip_on_connection_failure() {
 
 #[tokio::test]
 async fn test_dns_cache_resolve_returns_ip_for_localhost() {
-    use ferrum_gateway::dns::{DnsCache, DnsConfig};
+    use ferrum_edge::dns::{DnsCache, DnsConfig};
 
     let cache = DnsCache::new(DnsConfig::default());
 
@@ -162,7 +162,7 @@ async fn test_dns_cache_resolve_returns_ip_for_localhost() {
 
 #[tokio::test]
 async fn test_dns_cache_resolve_with_static_override() {
-    use ferrum_gateway::dns::{DnsCache, DnsConfig};
+    use ferrum_edge::dns::{DnsCache, DnsConfig};
 
     let cache = DnsCache::new(DnsConfig::default());
 
@@ -176,7 +176,7 @@ async fn test_dns_cache_resolve_with_static_override() {
 
 #[tokio::test]
 async fn test_dns_resolved_ip_would_appear_in_transaction_log() {
-    use ferrum_gateway::dns::{DnsCache, DnsConfig};
+    use ferrum_edge::dns::{DnsCache, DnsConfig};
 
     let cache = DnsCache::new(DnsConfig::default());
 
@@ -295,7 +295,7 @@ fn test_summary_json_omits_error_class_when_none() {
 
 #[test]
 fn test_summary_json_contains_error_class_when_present() {
-    use ferrum_gateway::retry::ErrorClass;
+    use ferrum_edge::retry::ErrorClass;
 
     let mut summary = make_full_summary();
     summary.error_class = Some(ErrorClass::ConnectionTimeout);
@@ -310,7 +310,7 @@ fn test_summary_json_contains_error_class_when_present() {
 
 #[test]
 fn test_error_class_serializes_all_variants() {
-    use ferrum_gateway::retry::ErrorClass;
+    use ferrum_edge::retry::ErrorClass;
 
     let cases = vec![
         (ErrorClass::ConnectionTimeout, "connection_timeout"),
@@ -356,7 +356,7 @@ fn test_error_class_serializes_all_variants() {
 
 #[test]
 fn test_summary_with_error_class_roundtrip() {
-    use ferrum_gateway::retry::ErrorClass;
+    use ferrum_edge::retry::ErrorClass;
 
     let mut summary = make_full_summary();
     summary.response_status_code = 502;
@@ -371,7 +371,7 @@ fn test_summary_with_error_class_roundtrip() {
 
 #[test]
 fn test_backend_response_carries_error_class() {
-    use ferrum_gateway::retry::{BackendResponse, ErrorClass, ResponseBody};
+    use ferrum_edge::retry::{BackendResponse, ErrorClass, ResponseBody};
 
     let resp = BackendResponse {
         status_code: 502,
@@ -429,7 +429,7 @@ fn test_stream_summary_omits_error_class_when_none() {
 
 #[test]
 fn test_stream_summary_contains_error_class_when_present() {
-    use ferrum_gateway::retry::ErrorClass;
+    use ferrum_edge::retry::ErrorClass;
 
     let mut summary = make_stream_summary();
     summary.error_class = Some(ErrorClass::ConnectionTimeout);
@@ -451,7 +451,7 @@ fn test_stream_summary_contains_error_class_when_present() {
 
 #[test]
 fn test_stream_summary_tls_error_class() {
-    use ferrum_gateway::retry::ErrorClass;
+    use ferrum_edge::retry::ErrorClass;
 
     let mut summary = make_stream_summary();
     summary.error_class = Some(ErrorClass::TlsError);
@@ -467,7 +467,7 @@ fn test_stream_summary_tls_error_class() {
 
 #[test]
 fn test_stream_summary_dns_error_class() {
-    use ferrum_gateway::retry::ErrorClass;
+    use ferrum_edge::retry::ErrorClass;
 
     let mut summary = make_stream_summary();
     summary.error_class = Some(ErrorClass::DnsLookupError);
@@ -481,7 +481,7 @@ fn test_stream_summary_dns_error_class() {
 
 #[test]
 fn test_stream_summary_serialization_roundtrip() {
-    use ferrum_gateway::retry::ErrorClass;
+    use ferrum_edge::retry::ErrorClass;
 
     let mut summary = make_stream_summary();
     summary.error_class = Some(ErrorClass::ConnectionRefused);

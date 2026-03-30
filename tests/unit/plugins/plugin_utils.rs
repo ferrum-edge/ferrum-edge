@@ -1,8 +1,8 @@
 //! Common test utilities for plugin tests
 
 use chrono::Utc;
-use ferrum_gateway::config::types::{AuthMode, BackendProtocol, Consumer, Proxy};
-use ferrum_gateway::plugins::{PluginResult, RequestContext};
+use ferrum_edge::config::types::{AuthMode, BackendProtocol, Consumer, Proxy};
+use ferrum_edge::plugins::{PluginResult, RequestContext};
 use serde_json::{Map, Value};
 use std::collections::HashMap;
 
@@ -109,8 +109,8 @@ pub fn create_test_proxy() -> Proxy {
 
 /// Create a test transaction summary for logging plugins
 #[allow(dead_code)]
-pub fn create_test_transaction_summary() -> ferrum_gateway::plugins::TransactionSummary {
-    ferrum_gateway::plugins::TransactionSummary {
+pub fn create_test_transaction_summary() -> ferrum_edge::plugins::TransactionSummary {
+    ferrum_edge::plugins::TransactionSummary {
         timestamp_received: Utc::now().to_rfc3339(),
         client_ip: "127.0.0.1".to_string(),
         consumer_username: Some("testuser".to_string()),

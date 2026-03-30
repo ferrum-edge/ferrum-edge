@@ -1,5 +1,5 @@
 ---
-# Ferrum Gateway comparison benchmark configuration — key-auth enabled
+# Ferrum Edge comparison benchmark configuration — key-auth enabled
 # Includes the same two keyless proxies plus one authenticated proxy
 
 proxies:

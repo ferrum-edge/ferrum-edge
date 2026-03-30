@@ -1,4 +1,4 @@
-//! Multi-protocol load testing tool for Ferrum Gateway performance testing.
+//! Multi-protocol load testing tool for Ferrum Edge performance testing.
 //!
 //! Generates load for HTTP/2, HTTP/3, WebSocket, gRPC, TCP, and UDP protocols
 //! and reports metrics in a wrk-like format.

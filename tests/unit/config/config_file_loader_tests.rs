@@ -1,5 +1,5 @@
-use ferrum_gateway::config::file_loader::{load_config_from_file, reload_config_from_file};
-use ferrum_gateway::config::types::{AuthMode, BackendProtocol, PluginScope};
+use ferrum_edge::config::file_loader::{load_config_from_file, reload_config_from_file};
+use ferrum_edge::config::types::{AuthMode, BackendProtocol, PluginScope};
 use std::io::Write;
 use tempfile::NamedTempFile;
 

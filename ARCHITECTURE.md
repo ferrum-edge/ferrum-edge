@@ -1,14 +1,14 @@
-# Ferrum Gateway Architecture
+# Ferrum Edge Architecture
 
-This document provides a comprehensive overview of the Ferrum Gateway codebase architecture to help new developers understand the project structure and contribute effectively.
+This document provides a comprehensive overview of the Ferrum Edge codebase architecture to help new developers understand the project structure and contribute effectively.
 
 ## High-Level Architecture
 
-Ferrum Gateway is a high-performance API Gateway built in Rust that follows a modular, plugin-based architecture. It supports multiple operating modes and provides dynamic routing, authentication, authorization, and protocol translation capabilities.
+Ferrum Edge is a high-performance edge proxy built in Rust that follows a modular, plugin-based architecture. It supports multiple operating modes and provides dynamic routing, authentication, authorization, and protocol translation capabilities.
 
 ```
 ┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
-│   Client Apps   │───▶│  Ferrum Gateway │───▶│  Backend Services│
+│   Client Apps   │───▶│  Ferrum Edge │───▶│  Backend Services│
 └─────────────────┘    └─────────────────┘    └─────────────────┘
                        │
                        ▼
@@ -610,8 +610,8 @@ The project uses comprehensive testing at multiple levels:
 
 ```bash
 # Clone and build
-git clone https://github.com/QuickLaunchWeb/ferrum-gateway.git
-cd ferrum-gateway
+git clone https://github.com/QuickLaunchWeb/ferrum-edge.git
+cd ferrum-edge
 cargo build
 
 # Run tests
@@ -717,7 +717,7 @@ cargo test --test unit_tests --all-features
 cargo test --test integration_tests --test admin_cached_config_tests --all-features
 
 # Functional / E2E tests (requires binary build)
-cargo build --bin ferrum-gateway
+cargo build --bin ferrum-edge
 cargo test --test functional_tests --all-features -- --ignored
 
 # All tests

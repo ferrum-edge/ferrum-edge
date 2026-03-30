@@ -1,6 +1,6 @@
 //! Tests for DNS cache and resolution module
 
-use ferrum_gateway::dns::{DnsCache, DnsConfig};
+use ferrum_edge::dns::{DnsCache, DnsConfig};
 use std::collections::HashMap;
 
 /// Helper to create a default DnsConfig with custom TTL and overrides.

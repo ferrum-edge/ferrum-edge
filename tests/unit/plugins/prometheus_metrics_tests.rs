@@ -1,9 +1,9 @@
 //! Tests for prometheus_metrics plugin
 
-use ferrum_gateway::plugins::prometheus_metrics::{
+use ferrum_edge::plugins::prometheus_metrics::{
     CounterKey, MetricsRegistry, PrometheusMetrics, global_registry,
 };
-use ferrum_gateway::plugins::{Plugin, TransactionSummary};
+use ferrum_edge::plugins::{Plugin, TransactionSummary};
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
@@ -331,12 +331,11 @@ async fn test_registry_render_contains_gateway_overhead() {
 
     let output = registry.render();
 
-    assert!(output.contains("# HELP ferrum_gateway_overhead_ms"));
-    assert!(output.contains("# TYPE ferrum_gateway_overhead_ms histogram"));
+    assert!(output.contains("# HELP ferrum_edge_overhead_ms"));
+    assert!(output.contains("# TYPE ferrum_edge_overhead_ms histogram"));
     assert!(
-        output.contains(
-            r#"ferrum_gateway_overhead_ms_bucket{proxy_id="overhead-render",le="+Inf"} 1"#
-        )
+        output
+            .contains(r#"ferrum_edge_overhead_ms_bucket{proxy_id="overhead-render",le="+Inf"} 1"#)
     );
 }
 

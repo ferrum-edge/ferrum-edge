@@ -1,7 +1,7 @@
 //! Tests for the Bot Detection plugin
 
-use ferrum_gateway::plugins::bot_detection::{BOT_DETECTION_PRIORITY, BotDetection};
-use ferrum_gateway::plugins::{Plugin, PluginResult, RequestContext};
+use ferrum_edge::plugins::bot_detection::{BOT_DETECTION_PRIORITY, BotDetection};
+use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext};
 use serde_json::json;
 
 use super::plugin_utils;

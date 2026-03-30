@@ -1,6 +1,6 @@
 //! Tests for http_logging plugin
 
-use ferrum_gateway::plugins::{Plugin, PluginHttpClient, http_logging::HttpLogging};
+use ferrum_edge::plugins::{Plugin, PluginHttpClient, http_logging::HttpLogging};
 use serde_json::json;
 
 use super::plugin_utils::create_test_transaction_summary;
@@ -105,42 +105,42 @@ async fn test_http_logging_default_lifecycle_phases() {
     )
     .unwrap();
 
-    let mut ctx = ferrum_gateway::plugins::RequestContext::new(
+    let mut ctx = ferrum_edge::plugins::RequestContext::new(
         "127.0.0.1".to_string(),
         "GET".to_string(),
         "/test".to_string(),
     );
-    let consumer_index = ferrum_gateway::ConsumerIndex::new(&[]);
+    let consumer_index = ferrum_edge::ConsumerIndex::new(&[]);
 
     let result = plugin.on_request_received(&mut ctx).await;
     assert!(matches!(
         result,
-        ferrum_gateway::plugins::PluginResult::Continue
+        ferrum_edge::plugins::PluginResult::Continue
     ));
 
     let result = plugin.authenticate(&mut ctx, &consumer_index).await;
     assert!(matches!(
         result,
-        ferrum_gateway::plugins::PluginResult::Continue
+        ferrum_edge::plugins::PluginResult::Continue
     ));
 
     let result = plugin.authorize(&mut ctx).await;
     assert!(matches!(
         result,
-        ferrum_gateway::plugins::PluginResult::Continue
+        ferrum_edge::plugins::PluginResult::Continue
     ));
 
     let mut headers = std::collections::HashMap::new();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(matches!(
         result,
-        ferrum_gateway::plugins::PluginResult::Continue
+        ferrum_edge::plugins::PluginResult::Continue
     ));
 
     let result = plugin.after_proxy(&mut ctx, 200, &mut headers).await;
     assert!(matches!(
         result,
-        ferrum_gateway::plugins::PluginResult::Continue
+        ferrum_edge::plugins::PluginResult::Continue
     ));
 }
 

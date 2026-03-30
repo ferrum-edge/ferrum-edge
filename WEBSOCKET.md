@@ -1,6 +1,6 @@
 # WebSocket Proxying
 
-Ferrum Gateway supports bidirectional WebSocket proxying for `ws://` and `wss://` backend protocols.
+Ferrum Edge supports bidirectional WebSocket proxying for `ws://` and `wss://` backend protocols.
 
 ## Architecture
 

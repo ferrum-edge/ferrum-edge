@@ -3,8 +3,8 @@
 //! Verifies that each plugin correctly declares which proxy protocols
 //! it supports via the `supported_protocols()` trait method.
 
-use ferrum_gateway::config::types::BackendProtocol;
-use ferrum_gateway::plugins::{
+use ferrum_edge::config::types::BackendProtocol;
+use ferrum_edge::plugins::{
     ALL_PROTOCOLS, HTTP_FAMILY_PROTOCOLS, HTTP_GRPC_PROTOCOLS, HTTP_ONLY_PROTOCOLS, Plugin,
     PluginResult, ProxyProtocol, StreamConnectionContext, StreamTransactionSummary, create_plugin,
 };
@@ -330,7 +330,7 @@ async fn test_prometheus_metrics_stream_disconnect_records() {
     let summary = make_stream_summary();
     plugin.on_stream_disconnect(&summary).await;
 
-    let registry = ferrum_gateway::plugins::prometheus_metrics::global_registry();
+    let registry = ferrum_edge::plugins::prometheus_metrics::global_registry();
     let output = registry.render();
     assert!(
         output.contains("ferrum_stream_connections_total"),

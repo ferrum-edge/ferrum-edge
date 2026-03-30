@@ -1,6 +1,6 @@
 # Backend mTLS Configuration
 
-This document explains how to configure backend mutual TLS (mTLS) authentication in Ferrum Gateway.
+This document explains how to configure backend mutual TLS (mTLS) authentication in Ferrum Edge.
 
 ## Overview
 
@@ -97,7 +97,7 @@ export FERRUM_BACKEND_TLS_CLIENT_CERT_PATH="/etc/ssl/certs/gateway-client.pem"
 export FERRUM_BACKEND_TLS_CLIENT_KEY_PATH="/etc/ssl/private/gateway-client-key.pem"
 
 # Start gateway
-./ferrum-gateway
+./ferrum-edge
 ```
 
 ### Example 2: Mixed Configuration
@@ -123,7 +123,7 @@ proxies:
     backend_tls_client_key_path: "/etc/ssl/private/secure-client-key.pem"
 EOF
 
-./ferrum-gateway --mode file --config config.yaml
+./ferrum-edge --mode file --config config.yaml
 ```
 
 ## Testing
@@ -170,7 +170,7 @@ cargo test test_backend_mtls_global_config -- --nocapture
 
 1. **Enable Debug Logging**
    ```bash
-   RUST_LOG=debug ./ferrum-gateway
+   RUST_LOG=debug ./ferrum-edge
    ```
 
 2. **Test Certificate Loading**

@@ -1,4 +1,4 @@
-use ferrum_gateway::config::db_loader::DatabaseStore;
+use ferrum_edge::config::db_loader::DatabaseStore;
 
 #[test]
 fn extract_hostname_postgres_url() {

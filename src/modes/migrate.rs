@@ -91,7 +91,7 @@ async fn show_db_status(env_config: &EnvConfig) -> Result<(), anyhow::Error> {
     let runner = MigrationRunner::new(pool, db_type.to_string());
     let status = runner.status().await?;
 
-    println!("=== Ferrum Gateway Migration Status ===\n");
+    println!("=== Ferrum Edge Migration Status ===\n");
 
     if status.applied.is_empty() {
         println!("Applied migrations: (none)");

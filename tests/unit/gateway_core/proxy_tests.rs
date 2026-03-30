@@ -1,7 +1,7 @@
 use chrono::Utc;
-use ferrum_gateway::config::types::{AuthMode, BackendProtocol, GatewayConfig, Proxy};
-use ferrum_gateway::proxy::{build_backend_url, build_backend_url_with_target};
-use ferrum_gateway::router_cache::RouterCache;
+use ferrum_edge::config::types::{AuthMode, BackendProtocol, GatewayConfig, Proxy};
+use ferrum_edge::proxy::{build_backend_url, build_backend_url_with_target};
+use ferrum_edge::router_cache::RouterCache;
 
 fn test_proxy() -> Proxy {
     Proxy {

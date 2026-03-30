@@ -73,7 +73,7 @@ jobs:
           RUST_BACKTRACE: 1
 
       - name: Build gateway binary for end-to-end tests
-        run: cargo build --bin ferrum-gateway
+        run: cargo build --bin ferrum-edge
 
       - name: Run end-to-end tests (gRPC, WebSocket, file mode, database, CP/DP)
         run: cargo test --test functional_tests --all-features -- --ignored --skip test_scale_perf_30k_proxies --skip test_load_stress
@@ -178,7 +178,7 @@ jobs:
 
       - name: Build release binaries
         run: |
-          cargo build --profile ci-release --bin ferrum-gateway
+          cargo build --profile ci-release --bin ferrum-edge
           cd tests/performance && cargo build --release --bin backend_server
 
       - name: Start backend server
@@ -206,7 +206,7 @@ jobs:
           FERRUM_POOL_IDLE_TIMEOUT_SECONDS=120 \
           FERRUM_POOL_ENABLE_HTTP_KEEP_ALIVE=true \
           FERRUM_POOL_ENABLE_HTTP2=false \
-          ./target/ci-release/ferrum-gateway > /tmp/gateway.log 2>&1 &
+          ./target/ci-release/ferrum-edge > /tmp/gateway.log 2>&1 &
           echo "GATEWAY_PID=$!" >> $GITHUB_ENV
           for i in $(seq 1 15); do
             if curl -sf http://127.0.0.1:8000/health > /dev/null 2>&1; then
@@ -325,18 +325,18 @@ jobs:
   #       include:
   #         - os: ubuntu-latest
   #           target: x86_64-unknown-linux-gnu
-  #           artifact_name: ferrum-gateway
-  #           asset_name: ferrum-gateway-linux-x86_64
+  #           artifact_name: ferrum-edge
+  #           asset_name: ferrum-edge-linux-x86_64
   #
   #         - os: macos-latest
   #           target: x86_64-apple-darwin
-  #           artifact_name: ferrum-gateway
-  #           asset_name: ferrum-gateway-macos-x86_64
+  #           artifact_name: ferrum-edge
+  #           asset_name: ferrum-edge-macos-x86_64
   #
   #         - os: macos-latest
   #           target: aarch64-apple-darwin
-  #           artifact_name: ferrum-gateway
-  #           asset_name: ferrum-gateway-macos-aarch64
+  #           artifact_name: ferrum-edge
+  #           asset_name: ferrum-edge-macos-aarch64
   #
   #   steps:
   #     - uses: actions/checkout@v4
@@ -416,8 +416,8 @@ jobs:
   #         context: .
   #         push: true
   #         tags: |
-  #           ${{ secrets.DOCKER_USERNAME }}/ferrum-gateway:latest
-  #           ${{ secrets.DOCKER_USERNAME }}/ferrum-gateway:${{ github.sha }}
+  #           ${{ secrets.DOCKER_USERNAME }}/ferrum-edge:latest
+  #           ${{ secrets.DOCKER_USERNAME }}/ferrum-edge:${{ github.sha }}
   #         cache-from: type=gha
   #         cache-to: type=gha,mode=max
   #
@@ -427,6 +427,6 @@ jobs:
   #       with:
   #         context: .
   #         push: false
-  #         tags: ferrum-gateway:latest
+  #         tags: ferrum-edge:latest
   #         cache-from: type=gha
   #         cache-to: type=gha,mode=max

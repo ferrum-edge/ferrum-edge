@@ -1,6 +1,6 @@
 //! Tests for client IP resolution module
 
-use ferrum_gateway::proxy::client_ip::{TrustedProxies, resolve_client_ip};
+use ferrum_edge::proxy::client_ip::{TrustedProxies, resolve_client_ip};
 
 // ── TrustedProxies parsing ───────────────────────────────────────────
 

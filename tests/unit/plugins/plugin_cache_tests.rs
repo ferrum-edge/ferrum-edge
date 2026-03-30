@@ -1,11 +1,11 @@
 //! Tests for PluginCache — pre-resolved plugin instances per proxy
 
 use chrono::Utc;
-use ferrum_gateway::PluginCache;
-use ferrum_gateway::config::types::{
+use ferrum_edge::PluginCache;
+use ferrum_edge::config::types::{
     AuthMode, BackendProtocol, GatewayConfig, PluginAssociation, PluginConfig, PluginScope, Proxy,
 };
-use ferrum_gateway::plugins::ProxyProtocol;
+use ferrum_edge::plugins::ProxyProtocol;
 use serde_json::json;
 
 fn make_proxy(id: &str, listen_path: &str, plugin_ids: Vec<&str>) -> Proxy {
@@ -412,7 +412,7 @@ async fn test_rate_limiter_state_persists_across_calls() {
 
     // Simulate 3 requests from the same IP
     for i in 0..3 {
-        let mut ctx = ferrum_gateway::plugins::RequestContext::new(
+        let mut ctx = ferrum_edge::plugins::RequestContext::new(
             "10.0.0.1".to_string(),
             "GET".to_string(),
             "/api/test".to_string(),
@@ -422,7 +422,7 @@ async fn test_rate_limiter_state_persists_across_calls() {
         if i < 2 {
             // First 2 should pass
             assert!(
-                matches!(result, ferrum_gateway::plugins::PluginResult::Continue),
+                matches!(result, ferrum_edge::plugins::PluginResult::Continue),
                 "Request {} should have been allowed",
                 i
             );
@@ -431,7 +431,7 @@ async fn test_rate_limiter_state_persists_across_calls() {
             assert!(
                 matches!(
                     result,
-                    ferrum_gateway::plugins::PluginResult::Reject {
+                    ferrum_edge::plugins::PluginResult::Reject {
                         status_code: 429,
                         ..
                     }

@@ -1,6 +1,6 @@
-# Features — Ferrum Gateway
+# Features — Ferrum Edge
 
-A comprehensive feature list for Ferrum Gateway.
+A comprehensive feature list for Ferrum Edge.
 
 ## Protocol Support
 

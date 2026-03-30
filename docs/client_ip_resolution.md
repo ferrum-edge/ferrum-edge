@@ -1,6 +1,6 @@
 # Client IP Resolution
 
-When Ferrum Gateway sits behind load balancers, CDNs, or reverse proxies, the TCP socket address is the proxy's IP -- not the real client's. This guide explains how to configure the gateway to accurately and securely resolve the originating client IP.
+When Ferrum Edge sits behind load balancers, CDNs, or reverse proxies, the TCP socket address is the proxy's IP -- not the real client's. This guide explains how to configure the gateway to accurately and securely resolve the originating client IP.
 
 ## Table of Contents
 
@@ -166,7 +166,7 @@ FERRUM_TRUSTED_PROXIES="10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
 ```yaml
 services:
   gateway:
-    image: ferrum-gateway:latest
+    image: ferrum-edge:latest
     environment:
       FERRUM_MODE: file
       FERRUM_FILE_CONFIG_PATH: /config/gateway.yaml

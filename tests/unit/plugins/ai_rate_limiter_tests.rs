@@ -1,6 +1,6 @@
 //! Tests for ai_rate_limiter plugin
 
-use ferrum_gateway::plugins::{Plugin, PluginResult, ai_rate_limiter::AiRateLimiter};
+use ferrum_edge::plugins::{Plugin, PluginResult, ai_rate_limiter::AiRateLimiter};
 use serde_json::json;
 use std::collections::HashMap;
 

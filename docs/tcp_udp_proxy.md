@@ -1,6 +1,6 @@
 # TCP/UDP Stream Proxy
 
-Ferrum Gateway supports raw TCP and UDP stream proxying alongside its HTTP-based proxying. Each stream proxy binds to a dedicated port and forwards traffic bidirectionally between clients and backends.
+Ferrum Edge supports raw TCP and UDP stream proxying alongside its HTTP-based proxying. Each stream proxy binds to a dedicated port and forwards traffic bidirectionally between clients and backends.
 
 ## Use Cases
 

@@ -1,6 +1,6 @@
 # Infrastructure Sizing Guide
 
-This guide helps you estimate the CPU and memory resources needed to run Ferrum Gateway based on your expected workload. Use it to right-size your deployment — whether on bare metal, VMs, containers, or Kubernetes.
+This guide helps you estimate the CPU and memory resources needed to run Ferrum Edge based on your expected workload. Use it to right-size your deployment — whether on bare metal, VMs, containers, or Kubernetes.
 
 ## Key Factors That Affect Resource Usage
 
@@ -100,7 +100,7 @@ At this scale, use the [Control Plane / Data Plane](cp_dp_mode.md) deployment mo
 
 ## How Payload Size Affects Memory
 
-Ferrum Gateway supports two response body modes configured per proxy: **streaming** (default) and **buffered**. The mode significantly affects memory usage.
+Ferrum Edge supports two response body modes configured per proxy: **streaming** (default) and **buffered**. The mode significantly affects memory usage.
 
 - **Streaming mode** (default): Response bodies flow through the gateway without being fully buffered in memory. Only the current chunk is held at any time. This is the most memory-efficient option and is suitable for most workloads.
 - **Buffered mode**: The entire response body is collected in memory before forwarding to the client. Required when plugins need to inspect or modify the full response body. HTTP/3 and gRPC proxying always use buffered mode.
@@ -266,20 +266,20 @@ These settings control the gateway's ability to handle high connection concurren
 
 ### Memory Allocator
 
-Ferrum Gateway uses **jemalloc** as the global memory allocator on Linux and macOS. jemalloc reduces heap fragmentation and improves allocation throughput under high concurrency compared to the system allocator. This is the same allocator used by nginx, Redis, and most high-performance Rust services. No configuration is needed — it is enabled automatically at compile time.
+Ferrum Edge uses **jemalloc** as the global memory allocator on Linux and macOS. jemalloc reduces heap fragmentation and improves allocation throughput under high concurrency compared to the system allocator. This is the same allocator used by nginx, Redis, and most high-performance Rust services. No configuration is needed — it is enabled automatically at compile time.
 
 ## Scaling Strategies
 
 ### Vertical Scaling
 
-Add more CPU and memory to a single instance. Ferrum Gateway's async, lock-free architecture scales well across cores.
+Add more CPU and memory to a single instance. Ferrum Edge's async, lock-free architecture scales well across cores.
 
 - **CPU**: Tokio's work-stealing scheduler distributes work across all available cores automatically.
 - **Memory**: Increase when you need larger body limits or more pooled connections.
 
 ### Horizontal Scaling
 
-Run multiple Ferrum Gateway instances behind an external load balancer.
+Run multiple Ferrum Edge instances behind an external load balancer.
 
 - Use **Control Plane / Data Plane mode** for centralized configuration with distributed traffic handling.
 - Data Plane instances are stateless (config fetched from Control Plane) and can be autoscaled based on CPU or RPS metrics.

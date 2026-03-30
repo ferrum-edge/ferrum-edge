@@ -1,5 +1,5 @@
 use chrono::Utc;
-use ferrum_gateway::config::types::{
+use ferrum_edge::config::types::{
     ActiveHealthCheck, AuthMode, BackendProtocol, BackoffStrategy, CircuitBreakerConfig,
     ConsulConfig, Consumer, GatewayConfig, HealthCheckConfig, KubernetesConfig,
     LoadBalancerAlgorithm, MAX_BACKEND_HOST_LENGTH, MAX_BACKEND_PATH_LENGTH,
@@ -516,7 +516,7 @@ fn test_upstream_passive_health_check_validated() {
 fn test_upstream_service_discovery_dns_sd_validated() {
     let mut upstream = make_upstream("test");
     upstream.service_discovery = Some(ServiceDiscoveryConfig {
-        provider: ferrum_gateway::config::types::SdProvider::DnsSd,
+        provider: ferrum_edge::config::types::SdProvider::DnsSd,
         dns_sd: None, // Missing required config
         kubernetes: None,
         consul: None,
@@ -1074,7 +1074,7 @@ fn test_upstream_hash_on_empty_cookie_name() {
 
 #[test]
 fn test_upstream_hash_on_cookie_config_validation() {
-    use ferrum_gateway::config::types::HashOnCookieConfig;
+    use ferrum_edge::config::types::HashOnCookieConfig;
 
     let mut upstream = make_upstream("u1");
     upstream.hash_on = Some("cookie:session".to_string());
@@ -1095,7 +1095,7 @@ fn test_upstream_hash_on_cookie_config_validation() {
 
 #[test]
 fn test_upstream_hash_on_cookie_config_valid() {
-    use ferrum_gateway::config::types::HashOnCookieConfig;
+    use ferrum_edge::config::types::HashOnCookieConfig;
 
     let mut upstream = make_upstream("u1");
     upstream.hash_on = Some("cookie:session".to_string());

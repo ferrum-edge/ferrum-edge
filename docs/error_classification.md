@@ -1,6 +1,6 @@
 # Error Classification
 
-Ferrum Gateway classifies gateway-level communication failures into human-friendly error categories via the `error_class` field on `TransactionSummary`. This helps operators quickly identify the root cause of failed transactions without parsing raw error messages.
+Ferrum Edge classifies gateway-level communication failures into human-friendly error categories via the `error_class` field on `TransactionSummary`. This helps operators quickly identify the root cause of failed transactions without parsing raw error messages.
 
 ## How It Works
 

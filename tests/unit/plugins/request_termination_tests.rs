@@ -1,7 +1,7 @@
 //! Tests for request_termination plugin
 
-use ferrum_gateway::plugins::request_termination::RequestTermination;
-use ferrum_gateway::plugins::{Plugin, PluginResult, RequestContext};
+use ferrum_edge::plugins::request_termination::RequestTermination;
+use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext};
 use serde_json::json;
 
 fn make_ctx(method: &str, path: &str) -> RequestContext {

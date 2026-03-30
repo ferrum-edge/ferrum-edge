@@ -1,6 +1,6 @@
 //! Database TLS Functional Tests
 //!
-//! Verifies that ferrum-gateway can connect to PostgreSQL, MySQL, and SQLite
+//! Verifies that ferrum-edge can connect to PostgreSQL, MySQL, and SQLite
 //! databases with proper TLS configuration, perform Admin API CRUD operations,
 //! and route proxy traffic through each database-backed mode.
 //!
@@ -42,7 +42,7 @@ impl DbTlsTestHarness {
     async fn new(db_type: &str) -> Result<Self, Box<dyn std::error::Error>> {
         let temp_dir = TempDir::new()?;
         let jwt_secret = "db-tls-test-secret-key-12345".to_string();
-        let jwt_issuer = "ferrum-gateway-db-tls-test".to_string();
+        let jwt_issuer = "ferrum-edge-db-tls-test".to_string();
 
         let admin_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let admin_port = admin_listener.local_addr()?.port();
@@ -76,12 +76,12 @@ impl DbTlsTestHarness {
         cert_dir: &str,
         ssl_mode: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let binary_path = if std::path::Path::new("./target/debug/ferrum-gateway").exists() {
-            "./target/debug/ferrum-gateway"
-        } else if std::path::Path::new("./target/release/ferrum-gateway").exists() {
-            "./target/release/ferrum-gateway"
+        let binary_path = if std::path::Path::new("./target/debug/ferrum-edge").exists() {
+            "./target/debug/ferrum-edge"
+        } else if std::path::Path::new("./target/release/ferrum-edge").exists() {
+            "./target/release/ferrum-edge"
         } else {
-            return Err("ferrum-gateway binary not found. Run `cargo build` first.".into());
+            return Err("ferrum-edge binary not found. Run `cargo build` first.".into());
         };
 
         let ca_cert_path = format!("{}/ca.crt", cert_dir);
@@ -117,12 +117,12 @@ impl DbTlsTestHarness {
         cert_dir: &str,
         insecure: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let binary_path = if std::path::Path::new("./target/debug/ferrum-gateway").exists() {
-            "./target/debug/ferrum-gateway"
-        } else if std::path::Path::new("./target/release/ferrum-gateway").exists() {
-            "./target/release/ferrum-gateway"
+        let binary_path = if std::path::Path::new("./target/debug/ferrum-edge").exists() {
+            "./target/debug/ferrum-edge"
+        } else if std::path::Path::new("./target/release/ferrum-edge").exists() {
+            "./target/release/ferrum-edge"
         } else {
-            return Err("ferrum-gateway binary not found. Run `cargo build` first.".into());
+            return Err("ferrum-edge binary not found. Run `cargo build` first.".into());
         };
 
         let ca_cert_path = format!("{}/ca.crt", cert_dir);
@@ -848,10 +848,10 @@ async fn test_sqlite_ignores_tls_settings() {
     let db_url = format!("sqlite:{}?mode=rwc", db_path.display());
 
     // Start with SSL env vars set — they should be ignored for SQLite
-    let binary_path = if std::path::Path::new("./target/debug/ferrum-gateway").exists() {
-        "./target/debug/ferrum-gateway"
+    let binary_path = if std::path::Path::new("./target/debug/ferrum-edge").exists() {
+        "./target/debug/ferrum-edge"
     } else {
-        "./target/release/ferrum-gateway"
+        "./target/release/ferrum-edge"
     };
 
     let child = std::process::Command::new(binary_path)

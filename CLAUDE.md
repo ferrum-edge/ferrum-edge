@@ -1,14 +1,14 @@
-# CLAUDE.md — Ferrum Gateway
+# CLAUDE.md — Ferrum Edge
 
-This file provides context for Claude Code when working on the Ferrum Gateway codebase.
+This file provides context for Claude Code when working on the Ferrum Edge codebase.
 
 ## Project Overview
 
-Ferrum Gateway is a high-performance API Gateway and reverse proxy built in Rust. It supports HTTP/1.1, HTTP/2, HTTP/3 (QUIC), WebSocket, gRPC, and raw TCP/UDP stream proxying with a plugin architecture (28 built-in plugins including 4 AI/LLM-specific plugins), four operating modes, and load balancing with health checks.
+Ferrum Edge is a high-performance edge proxy built in Rust. It supports HTTP/1.1, HTTP/2, HTTP/3 (QUIC), WebSocket, gRPC, and raw TCP/UDP stream proxying with a plugin architecture (28 built-in plugins including 4 AI/LLM-specific plugins), four operating modes, and load balancing with health checks.
 
 - **Language**: Rust (edition 2024)
 - **Async runtime**: tokio + hyper 1.0
-- **Binary**: `ferrum-gateway` (single binary, mode selected via env var)
+- **Binary**: `ferrum-edge` (single binary, mode selected via env var)
 - **License**: PolyForm Noncommercial 1.0.0 (dual-licensed with paid commercial option)
 
 ## Quick Reference — Commands
@@ -32,7 +32,7 @@ cargo test --test unit_tests --all-features
 cargo test --test integration_tests --test admin_cached_config_tests --all-features
 
 # Functional / end-to-end tests (start real gateway binary, test all modes)
-# Requires: cargo build --bin ferrum-gateway (builds the binary first)
+# Requires: cargo build --bin ferrum-edge (builds the binary first)
 cargo test --test functional_tests --all-features -- --ignored
 
 # All tests together
@@ -202,7 +202,7 @@ tests/
 2. `cargo clippy --all-targets --all-features -- -D warnings` — zero warnings
 3. `cargo test --test unit_tests --all-features` — all unit tests pass
 4. `cargo test --test integration_tests --test admin_cached_config_tests --all-features` — integration tests pass
-5. If changing proxy behavior: `cargo build --bin ferrum-gateway && cargo test --test functional_tests --all-features -- --ignored` — E2E tests pass
+5. If changing proxy behavior: `cargo build --bin ferrum-edge && cargo test --test functional_tests --all-features -- --ignored` — E2E tests pass
 
 ### Code Quality Rules
 

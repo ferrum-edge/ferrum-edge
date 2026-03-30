@@ -1,5 +1,5 @@
 ---
-# Ferrum Gateway comparison benchmark configuration
+# Ferrum Edge comparison benchmark configuration
 # Two proxies matching the same endpoints tested on Kong and Tyk
 
 proxies:

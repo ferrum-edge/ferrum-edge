@@ -1,4 +1,4 @@
-//! Functional test for Ferrum Gateway in file mode.
+//! Functional test for Ferrum Edge in file mode.
 //!
 //! This test:
 //! 1. Builds the gateway binary
@@ -47,14 +47,14 @@ async fn start_echo_server(port: u16) {
     }
 }
 
-/// Start the Ferrum Gateway binary in file mode
+/// Start the Ferrum Edge binary in file mode
 fn start_gateway_in_file_mode(
     config_path: &str,
     http_port: u16,
 ) -> Result<std::process::Child, Box<dyn std::error::Error>> {
     // Build the gateway binary first (debug profile to match `cargo test`)
     let build_output = std::process::Command::new("cargo")
-        .args(["build", "--bin", "ferrum-gateway"])
+        .args(["build", "--bin", "ferrum-edge"])
         .output()?;
 
     if !build_output.status.success() {
@@ -64,10 +64,10 @@ fn start_gateway_in_file_mode(
     }
 
     // Use debug binary (matches default `cargo test` profile), fall back to release
-    let binary_path = if std::path::Path::new("./target/debug/ferrum-gateway").exists() {
-        "./target/debug/ferrum-gateway"
+    let binary_path = if std::path::Path::new("./target/debug/ferrum-edge").exists() {
+        "./target/debug/ferrum-edge"
     } else {
-        "./target/release/ferrum-gateway"
+        "./target/release/ferrum-edge"
     };
 
     // Start the gateway binary
@@ -75,7 +75,7 @@ fn start_gateway_in_file_mode(
         .env("FERRUM_MODE", "file")
         .env("FERRUM_FILE_CONFIG_PATH", config_path)
         .env("FERRUM_PROXY_HTTP_PORT", http_port.to_string())
-        .env("RUST_LOG", "ferrum_gateway=debug")
+        .env("RUST_LOG", "ferrum_edge=debug")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())

@@ -1,4 +1,4 @@
-use ferrum_gateway::plugins::PluginHttpClient;
+use ferrum_edge::plugins::PluginHttpClient;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -59,7 +59,7 @@ async fn test_execute_logs_slow_call() {
 
     // Build a client with a very low threshold (50ms) so the 200ms delay triggers it
     let client = PluginHttpClient::from_pool_config_with_threshold(
-        &ferrum_gateway::config::PoolConfig::default(),
+        &ferrum_edge::config::PoolConfig::default(),
         50,
     );
     let req = client.get().get(format!("{}/slow", mock_server.uri()));
@@ -79,7 +79,7 @@ async fn test_execute_no_warning_for_fast_call() {
 
     // Threshold of 60 seconds — fast local call should never trigger
     let client = PluginHttpClient::from_pool_config_with_threshold(
-        &ferrum_gateway::config::PoolConfig::default(),
+        &ferrum_edge::config::PoolConfig::default(),
         60_000,
     );
     let req = client.get().get(format!("{}/fast", mock_server.uri()));

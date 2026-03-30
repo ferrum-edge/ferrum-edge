@@ -1,12 +1,12 @@
 [package]
-name = "ferrum-gateway"
+name = "ferrum-edge"
 version = "0.1.0"
 edition = "2024"
-description = "A high-performance API Gateway and Reverse Proxy built in Rust"
+description = "A high-performance edge proxy built in Rust"
 license = "PolyForm-Noncommercial-1.0.0"
 
 [[bin]]
-name = "ferrum-gateway"
+name = "ferrum-edge"
 path = "src/main.rs"
 
 [features]

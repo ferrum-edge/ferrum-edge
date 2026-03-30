@@ -1,6 +1,6 @@
 //! Tests for ai_token_metrics plugin
 
-use ferrum_gateway::plugins::{Plugin, PluginResult, ai_token_metrics::AiTokenMetrics};
+use ferrum_edge::plugins::{Plugin, PluginResult, ai_token_metrics::AiTokenMetrics};
 use serde_json::json;
 use std::collections::HashMap;
 

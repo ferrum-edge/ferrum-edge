@@ -1,10 +1,10 @@
 # Custom Plugin Development Guide
 
-This guide explains how to create, register, and build custom plugins for Ferrum Gateway without modifying any core source files.
+This guide explains how to create, register, and build custom plugins for Ferrum Edge without modifying any core source files.
 
 ## Architecture Overview
 
-Ferrum Gateway uses a trait-based plugin system. All plugins implement the `Plugin` trait, which defines lifecycle hooks that the gateway calls during request processing:
+Ferrum Edge uses a trait-based plugin system. All plugins implement the `Plugin` trait, which defines lifecycle hooks that the gateway calls during request processing:
 
 ```
 Request received
@@ -397,7 +397,7 @@ This forces the gateway to buffer the entire response before forwarding it. Use 
 ## Directory Structure
 
 ```
-ferrum-gateway/
+ferrum-edge/
 ├── src/                       # Core gateway source (do not edit for custom plugins)
 │   ├── plugins/
 │   │   ├── mod.rs             # Plugin trait, factory (auto-delegates to custom_plugins)
@@ -439,14 +439,14 @@ cargo build
 cargo build --release
 ```
 
-The output binary at `target/release/ferrum-gateway` includes your custom plugins compiled in.
+The output binary at `target/release/ferrum-edge` includes your custom plugins compiled in.
 
 ### Docker Build
 
 The included `Dockerfile` works with custom plugins out of the box since `custom_plugins/` is part of the project tree:
 
 ```bash
-docker build -t my-ferrum-gateway .
+docker build -t my-ferrum-edge .
 ```
 
 ## Testing Custom Plugins

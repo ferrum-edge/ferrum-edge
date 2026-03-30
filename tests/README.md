@@ -1,6 +1,6 @@
-# Ferrum Gateway Test Suite
+# Ferrum Edge Test Suite
 
-Comprehensive test suite for Ferrum Gateway, organized by test type and component.
+Comprehensive test suite for Ferrum Edge, organized by test type and component.
 
 ## Directory Structure
 
@@ -162,7 +162,7 @@ up in-process TCP/gRPC servers, create mock TLS certificates, or connect to
 databases, but they do not spawn the gateway binary.
 
 **Functional tests** are end-to-end: they compile and launch the actual
-`ferrum-gateway` binary, send real HTTP requests through the proxy, and verify
+`ferrum-edge` binary, send real HTTP requests through the proxy, and verify
 the full request lifecycle. They are gated behind `#[ignore]` to keep the
 default `cargo test` fast.
 

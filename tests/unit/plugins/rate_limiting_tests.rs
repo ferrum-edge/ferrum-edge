@@ -1,6 +1,6 @@
 //! Tests for rate_limiting plugin
 
-use ferrum_gateway::plugins::{Plugin, PluginResult, rate_limiting::RateLimiting};
+use ferrum_edge::plugins::{Plugin, PluginResult, rate_limiting::RateLimiting};
 use serde_json::json;
 use std::collections::HashMap;
 

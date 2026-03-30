@@ -1,8 +1,8 @@
 openapi: 3.1.0
 info:
-  title: Ferrum Gateway Admin API
+  title: Ferrum Edge Admin API
   description: |
-    RESTful API for managing the Ferrum API Gateway configuration at runtime.
+    RESTful API for managing the Ferrum Edge configuration at runtime.
 
     All endpoints except `/health`, `/status`, and `/metrics` require JWT bearer
     token authentication via the `Authorization: Bearer <token>` header.
@@ -964,7 +964,7 @@ components:
         | Variable | Default | Description |
         |----------|---------|-------------|
         | `FERRUM_ADMIN_JWT_SECRET` | *(required)* | Signing key |
-        | `FERRUM_ADMIN_JWT_ISSUER` | `ferrum-gateway` | Expected `iss` claim |
+        | `FERRUM_ADMIN_JWT_ISSUER` | `ferrum-edge` | Expected `iss` claim |
         | `FERRUM_ADMIN_JWT_MAX_TTL` | `3600` | Max token lifetime (seconds) |
 
   # ── Reusable parameters ────────────────────────────────────────────

@@ -1,6 +1,6 @@
 //! Tests for access_control plugin
 
-use ferrum_gateway::plugins::{Plugin, access_control::AccessControl};
+use ferrum_edge::plugins::{Plugin, access_control::AccessControl};
 use serde_json::json;
 
 use super::plugin_utils::{assert_continue, assert_reject, create_test_context};

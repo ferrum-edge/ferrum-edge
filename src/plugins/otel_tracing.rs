@@ -69,7 +69,7 @@ impl OtelTracing {
     ) -> Result<Self, String> {
         let service_name = config["service_name"]
             .as_str()
-            .unwrap_or("ferrum-gateway")
+            .unwrap_or("ferrum-edge")
             .to_string();
         let generate_trace_id = config["generate_trace_id"].as_bool().unwrap_or(true);
 
@@ -617,7 +617,7 @@ fn build_otlp_payload(
     // Build resource attributes
     let mut resource_attributes = vec![otlp_attribute("service.name", service_name)];
     resource_attributes.push(otlp_attribute("service.version", env!("CARGO_PKG_VERSION")));
-    resource_attributes.push(otlp_attribute("telemetry.sdk.name", "ferrum-gateway"));
+    resource_attributes.push(otlp_attribute("telemetry.sdk.name", "ferrum-edge"));
     resource_attributes.push(otlp_attribute(
         "telemetry.sdk.version",
         env!("CARGO_PKG_VERSION"),
@@ -633,7 +633,7 @@ fn build_otlp_payload(
             },
             "scopeSpans": [{
                 "scope": {
-                    "name": "ferrum-gateway",
+                    "name": "ferrum-edge",
                     "version": env!("CARGO_PKG_VERSION")
                 },
                 "spans": otlp_spans

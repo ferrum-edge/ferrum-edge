@@ -1,7 +1,7 @@
 //! Tests for the Correlation ID plugin
 
-use ferrum_gateway::plugins::correlation_id::{CORRELATION_ID_PRIORITY, CorrelationId};
-use ferrum_gateway::plugins::{Plugin, RequestContext};
+use ferrum_edge::plugins::correlation_id::{CORRELATION_ID_PRIORITY, CorrelationId};
+use ferrum_edge::plugins::{Plugin, RequestContext};
 use serde_json::json;
 use std::collections::HashMap;
 

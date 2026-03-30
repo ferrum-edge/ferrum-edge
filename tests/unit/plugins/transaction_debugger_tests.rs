@@ -1,6 +1,6 @@
 //! Tests for transaction_debugger plugin
 
-use ferrum_gateway::plugins::{Plugin, RequestContext, transaction_debugger::TransactionDebugger};
+use ferrum_edge::plugins::{Plugin, RequestContext, transaction_debugger::TransactionDebugger};
 use serde_json::json;
 use std::collections::HashMap;
 
@@ -42,7 +42,7 @@ async fn test_transaction_debugger_on_request_received() {
     let result = plugin.on_request_received(&mut ctx).await;
     assert!(matches!(
         result,
-        ferrum_gateway::plugins::PluginResult::Continue
+        ferrum_edge::plugins::PluginResult::Continue
     ));
 }
 
@@ -54,7 +54,7 @@ async fn test_transaction_debugger_on_request_received_with_body_logging() {
     let result = plugin.on_request_received(&mut ctx).await;
     assert!(matches!(
         result,
-        ferrum_gateway::plugins::PluginResult::Continue
+        ferrum_edge::plugins::PluginResult::Continue
     ));
 }
 
@@ -70,7 +70,7 @@ async fn test_transaction_debugger_after_proxy() {
         .await;
     assert!(matches!(
         result,
-        ferrum_gateway::plugins::PluginResult::Continue
+        ferrum_edge::plugins::PluginResult::Continue
     ));
 }
 
@@ -85,7 +85,7 @@ async fn test_transaction_debugger_after_proxy_with_body_logging() {
         .await;
     assert!(matches!(
         result,
-        ferrum_gateway::plugins::PluginResult::Continue
+        ferrum_edge::plugins::PluginResult::Continue
     ));
 }
 
@@ -101,7 +101,7 @@ async fn test_transaction_debugger_log() {
     assert_eq!(plugin.name(), "transaction_debugger");
     assert_eq!(
         plugin.priority(),
-        ferrum_gateway::plugins::priority::TRANSACTION_DEBUGGER
+        ferrum_edge::plugins::priority::TRANSACTION_DEBUGGER
     );
 }
 
@@ -113,42 +113,42 @@ async fn test_transaction_debugger_full_lifecycle() {
     }));
 
     let mut ctx = make_ctx();
-    let consumer_index = ferrum_gateway::ConsumerIndex::new(&[]);
+    let consumer_index = ferrum_edge::ConsumerIndex::new(&[]);
     let mut headers: HashMap<String, String> = HashMap::new();
 
     // on_request_received
     let result = plugin.on_request_received(&mut ctx).await;
     assert!(matches!(
         result,
-        ferrum_gateway::plugins::PluginResult::Continue
+        ferrum_edge::plugins::PluginResult::Continue
     ));
 
     // authenticate (default - Continue)
     let result = plugin.authenticate(&mut ctx, &consumer_index).await;
     assert!(matches!(
         result,
-        ferrum_gateway::plugins::PluginResult::Continue
+        ferrum_edge::plugins::PluginResult::Continue
     ));
 
     // authorize (default - Continue)
     let result = plugin.authorize(&mut ctx).await;
     assert!(matches!(
         result,
-        ferrum_gateway::plugins::PluginResult::Continue
+        ferrum_edge::plugins::PluginResult::Continue
     ));
 
     // before_proxy (default - Continue)
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(matches!(
         result,
-        ferrum_gateway::plugins::PluginResult::Continue
+        ferrum_edge::plugins::PluginResult::Continue
     ));
 
     // after_proxy
     let result = plugin.after_proxy(&mut ctx, 200, &mut headers).await;
     assert!(matches!(
         result,
-        ferrum_gateway::plugins::PluginResult::Continue
+        ferrum_edge::plugins::PluginResult::Continue
     ));
 
     // log
@@ -189,7 +189,7 @@ async fn test_transaction_debugger_redacts_sensitive_request_headers() {
     let result = plugin.on_request_received(&mut ctx).await;
     assert!(matches!(
         result,
-        ferrum_gateway::plugins::PluginResult::Continue
+        ferrum_edge::plugins::PluginResult::Continue
     ));
     // Sensitive headers should still be in the original context (not modified)
     assert_eq!(
@@ -215,7 +215,7 @@ async fn test_transaction_debugger_redacts_sensitive_response_headers() {
         .await;
     assert!(matches!(
         result,
-        ferrum_gateway::plugins::PluginResult::Continue
+        ferrum_edge::plugins::PluginResult::Continue
     ));
     // Response headers should not be modified by the debugger
     assert_eq!(
@@ -244,7 +244,7 @@ async fn test_transaction_debugger_custom_redacted_headers() {
     let result = plugin.on_request_received(&mut ctx).await;
     assert!(matches!(
         result,
-        ferrum_gateway::plugins::PluginResult::Continue
+        ferrum_edge::plugins::PluginResult::Continue
     ));
 }
 
@@ -257,7 +257,7 @@ async fn test_transaction_debugger_default_body_logging_disabled() {
     let result = plugin.on_request_received(&mut ctx).await;
     assert!(matches!(
         result,
-        ferrum_gateway::plugins::PluginResult::Continue
+        ferrum_edge::plugins::PluginResult::Continue
     ));
 
     let mut response_headers: HashMap<String, String> = HashMap::new();
@@ -266,6 +266,6 @@ async fn test_transaction_debugger_default_body_logging_disabled() {
         .await;
     assert!(matches!(
         result,
-        ferrum_gateway::plugins::PluginResult::Continue
+        ferrum_edge::plugins::PluginResult::Continue
     ));
 }

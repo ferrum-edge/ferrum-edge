@@ -1,4 +1,4 @@
-use ferrum_gateway::plugins::{PluginResult, RequestContext, create_plugin};
+use ferrum_edge::plugins::{PluginResult, RequestContext, create_plugin};
 use serde_json::json;
 use std::collections::HashMap;
 
@@ -43,7 +43,7 @@ fn test_graphql_plugin_creation() {
 
 #[test]
 fn test_graphql_in_available_plugins() {
-    let plugins = ferrum_gateway::plugins::available_plugins();
+    let plugins = ferrum_edge::plugins::available_plugins();
     assert!(plugins.contains(&"graphql"));
 }
 

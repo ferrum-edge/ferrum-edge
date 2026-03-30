@@ -1,5 +1,5 @@
 ---
-# Ferrum Gateway comparison benchmark configuration — end-to-end TLS
+# Ferrum Edge comparison benchmark configuration — end-to-end TLS
 # Frontend: HTTPS (TLS termination) → Backend: HTTPS (re-encryption)
 
 proxies:

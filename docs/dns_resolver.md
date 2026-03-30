@@ -1,6 +1,6 @@
 # DNS Resolver Configuration
 
-Ferrum Gateway includes a full-featured DNS resolver built on [hickory-resolver](https://github.com/hickory-dns/hickory-dns), providing configurable nameservers, hosts file support, record type ordering, TTL management, stale-while-revalidate caching, and error caching — all designed to keep DNS resolution off the hot request path.
+Ferrum Edge includes a full-featured DNS resolver built on [hickory-resolver](https://github.com/hickory-dns/hickory-dns), providing configurable nameservers, hosts file support, record type ordering, TTL management, stale-while-revalidate caching, and error caching — all designed to keep DNS resolution off the hot request path.
 
 ## Environment Variables
 
@@ -31,7 +31,7 @@ Ferrum Gateway includes a full-featured DNS resolver built on [hickory-resolver]
 
 ### System-Level DNS Settings
 
-Ferrum Gateway respects the following system-level environment variables, as parsed from `/etc/resolv.conf`:
+Ferrum Edge respects the following system-level environment variables, as parsed from `/etc/resolv.conf`:
 
 | Variable | Description |
 |----------|-------------|
@@ -60,7 +60,7 @@ This means: first try the record type that worked last time (for speed), then tr
 
 ## Stale-While-Revalidate
 
-When a cached DNS entry expires (past its TTL), Ferrum Gateway doesn't block the request waiting for a fresh DNS lookup. Instead:
+When a cached DNS entry expires (past its TTL), Ferrum Edge doesn't block the request waiting for a fresh DNS lookup. Instead:
 
 1. **Fresh** (within TTL): Return cached result immediately.
 2. **Stale** (past TTL, within `stale_ttl`): Return the stale cached result immediately and trigger a **background refresh** task. The next request will get the fresh result.
@@ -86,7 +86,7 @@ A background task proactively refreshes cache entries when they reach 75% of the
 
 ## DNS Warmup
 
-On startup, Ferrum Gateway resolves all configured hostnames asynchronously before accepting traffic. This includes:
+On startup, Ferrum Edge resolves all configured hostnames asynchronously before accepting traffic. This includes:
 
 - **Proxy backend hostnames** (`backend_host` on each proxy)
 - **Upstream target hostnames** (`host` on each upstream target, when [load balancing](load_balancing.md) is configured)

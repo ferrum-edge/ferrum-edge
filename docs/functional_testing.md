@@ -1,6 +1,6 @@
 # Functional Testing Guide
 
-This document describes the functional testing strategy for the Ferrum Gateway, particularly for Control Plane (CP) and Data Plane (DP) mode integration.
+This document describes the functional testing strategy for the Ferrum Edge, particularly for Control Plane (CP) and Data Plane (DP) mode integration.
 
 ## Test Files
 
@@ -215,7 +215,7 @@ FERRUM_CP_GRPC_LISTEN_ADDR=127.0.0.1:50051 \
 FERRUM_CP_GRPC_JWT_SECRET=test-grpc-secret \
 FERRUM_ADMIN_HTTP_PORT=9000 \
 FERRUM_LOG_LEVEL=debug \
-cargo run --bin ferrum-gateway
+cargo run --bin ferrum-edge
 ```
 
 3. Create a JWT token for Admin API:
@@ -268,7 +268,7 @@ FERRUM_DP_GRPC_AUTH_TOKEN=<jwt-token> \
 FERRUM_ADMIN_JWT_SECRET=test-secret \
 FERRUM_PROXY_HTTP_PORT=8000 \
 FERRUM_LOG_LEVEL=debug \
-cargo run --bin ferrum-gateway
+cargo run --bin ferrum-edge
 ```
 
 7. Test proxy traffic:

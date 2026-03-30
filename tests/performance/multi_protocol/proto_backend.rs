@@ -1,4 +1,4 @@
-//! Multi-protocol echo backend server for performance testing Ferrum Gateway.
+//! Multi-protocol echo backend server for performance testing Ferrum Edge.
 //!
 //! Starts servers on the following ports:
 //!   HTTP/2 h2c:     3002    HTTPS/H2:  3443

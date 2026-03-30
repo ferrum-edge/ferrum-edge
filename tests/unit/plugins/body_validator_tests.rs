@@ -1,6 +1,6 @@
 //! Tests for body_validator plugin — XML CDATA, comments, processing instructions
 
-use ferrum_gateway::plugins::{Plugin, RequestContext, body_validator::BodyValidator};
+use ferrum_edge::plugins::{Plugin, RequestContext, body_validator::BodyValidator};
 use serde_json::json;
 use std::collections::HashMap;
 

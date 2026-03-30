@@ -1,7 +1,7 @@
 //! Tests for health check module
 
-use ferrum_gateway::config::types::{PassiveHealthCheck, UpstreamTarget};
-use ferrum_gateway::health_check::HealthChecker;
+use ferrum_edge::config::types::{PassiveHealthCheck, UpstreamTarget};
+use ferrum_edge::health_check::HealthChecker;
 use std::collections::HashMap;
 
 fn make_target(host: &str, port: u16) -> UpstreamTarget {

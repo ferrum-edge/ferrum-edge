@@ -259,31 +259,31 @@ impl MetricsRegistry {
 
         // Gateway overhead histogram
         output.push_str(
-            "# HELP ferrum_gateway_overhead_ms Gateway overhead (excluding backend and plugins) in milliseconds.\n",
+            "# HELP ferrum_edge_overhead_ms Gateway overhead (excluding backend and plugins) in milliseconds.\n",
         );
-        output.push_str("# TYPE ferrum_gateway_overhead_ms histogram\n");
+        output.push_str("# TYPE ferrum_edge_overhead_ms histogram\n");
         for entry in self.gateway_overhead_buckets.iter() {
             let proxy_id = entry.key();
             let histogram = entry.value();
             for (i, boundary) in histogram.boundaries.iter().enumerate() {
                 let count = histogram.counts[i].load(Ordering::Relaxed);
                 output.push_str(&format!(
-                    "ferrum_gateway_overhead_ms_bucket{{proxy_id=\"{}\",le=\"{}\"}} {}\n",
+                    "ferrum_edge_overhead_ms_bucket{{proxy_id=\"{}\",le=\"{}\"}} {}\n",
                     proxy_id, boundary, count
                 ));
             }
             let total_count = histogram.count.load(Ordering::Relaxed);
             let sum = f64::from_bits(histogram.sum.load(Ordering::Relaxed));
             output.push_str(&format!(
-                "ferrum_gateway_overhead_ms_bucket{{proxy_id=\"{}\",le=\"+Inf\"}} {}\n",
+                "ferrum_edge_overhead_ms_bucket{{proxy_id=\"{}\",le=\"+Inf\"}} {}\n",
                 proxy_id, total_count
             ));
             output.push_str(&format!(
-                "ferrum_gateway_overhead_ms_sum{{proxy_id=\"{}\"}} {:.2}\n",
+                "ferrum_edge_overhead_ms_sum{{proxy_id=\"{}\"}} {:.2}\n",
                 proxy_id, sum
             ));
             output.push_str(&format!(
-                "ferrum_gateway_overhead_ms_count{{proxy_id=\"{}\"}} {}\n",
+                "ferrum_edge_overhead_ms_count{{proxy_id=\"{}\"}} {}\n",
                 proxy_id, total_count
             ));
         }

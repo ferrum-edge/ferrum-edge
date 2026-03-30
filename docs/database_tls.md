@@ -1,6 +1,6 @@
 # Database TLS Configuration
 
-Ferrum Gateway supports TLS-encrypted connections to PostgreSQL and MySQL databases. SQLite is an embedded database with no network layer, so TLS does not apply.
+Ferrum Edge supports TLS-encrypted connections to PostgreSQL and MySQL databases. SQLite is an embedded database with no network layer, so TLS does not apply.
 
 ## Quick Reference
 
@@ -12,7 +12,7 @@ Ferrum Gateway supports TLS-encrypted connections to PostgreSQL and MySQL databa
 
 ## Configuration Approaches
 
-Ferrum Gateway provides two approaches for configuring database TLS. **The native SQL parameter approach is recommended.**
+Ferrum Edge provides two approaches for configuring database TLS. **The native SQL parameter approach is recommended.**
 
 ### Approach 1: Native SQL Parameters (Recommended)
 
@@ -151,7 +151,7 @@ docker run -d \
   -e FERRUM_DB_SSL_ROOT_CERT=/certs/ca.crt \
   -e FERRUM_ADMIN_JWT_SECRET=your-secret \
   -v $(pwd)/certs:/certs:ro \
-  ferrum-gateway
+  ferrum-edge
 ```
 
 ## MySQL TLS Setup
@@ -238,7 +238,7 @@ docker run -d \
   -e FERRUM_DB_SSL_ROOT_CERT=/certs/ca.crt \
   -e FERRUM_ADMIN_JWT_SECRET=your-secret \
   -v $(pwd)/certs:/certs:ro \
-  ferrum-gateway
+  ferrum-edge
 ```
 
 ## SQLite

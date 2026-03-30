@@ -7,10 +7,10 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use ferrum_gateway::plugins::{
+use ferrum_edge::plugins::{
     Plugin, TransactionSummary, create_plugin, priority as plugin_priority,
 };
-use ferrum_gateway::proxy::log_rejected_request;
+use ferrum_edge::proxy::log_rejected_request;
 use serde_json::json;
 
 use super::plugin_utils::{create_test_context, create_test_proxy};

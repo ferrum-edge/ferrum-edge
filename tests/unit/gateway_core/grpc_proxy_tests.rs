@@ -1,7 +1,7 @@
 use chrono::Utc;
-use ferrum_gateway::config::types::{AuthMode, BackendProtocol, Proxy};
-use ferrum_gateway::proxy::build_backend_url;
-use ferrum_gateway::proxy::grpc_proxy;
+use ferrum_edge::config::types::{AuthMode, BackendProtocol, Proxy};
+use ferrum_edge::proxy::build_backend_url;
+use ferrum_edge::proxy::grpc_proxy;
 
 fn test_proxy() -> Proxy {
     Proxy {
@@ -233,7 +233,7 @@ async fn test_grpc_connection_pool_creation() {
     let mut proxy = test_proxy();
     proxy.backend_host = "127.0.0.1".to_string();
     proxy.backend_port = 1; // intentionally unreachable port
-    let dns = ferrum_gateway::dns::DnsCache::new(ferrum_gateway::dns::DnsConfig::default());
+    let dns = ferrum_edge::dns::DnsCache::new(ferrum_edge::dns::DnsConfig::default());
     let result = pool.get_sender(&proxy, &dns).await;
     // Connection should fail (unreachable port), but not panic
     assert!(

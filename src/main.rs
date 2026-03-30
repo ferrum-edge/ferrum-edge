@@ -48,7 +48,7 @@ fn main() {
         .json()
         .init();
 
-    info!("Ferrum Gateway starting...");
+    info!("Ferrum Edge starting...");
 
     // Resolve secrets using a single-threaded runtime so that subsequent
     // env var mutations are safe — no concurrent threads exist yet.
@@ -177,6 +177,6 @@ fn main() {
             std::process::exit(1);
         }
 
-        info!("Ferrum Gateway shut down cleanly");
+        info!("Ferrum Edge shut down cleanly");
     });
 }

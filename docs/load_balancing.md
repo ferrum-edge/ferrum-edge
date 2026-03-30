@@ -1,6 +1,6 @@
 # Load Balancing
 
-Ferrum Gateway provides built-in load balancing to distribute traffic across multiple backend targets. This feature allows you to define **upstreams** — groups of backend servers — and attach them to proxy routes for automatic traffic distribution, health checking, and failover.
+Ferrum Edge provides built-in load balancing to distribute traffic across multiple backend targets. This feature allows you to define **upstreams** — groups of backend servers — and attach them to proxy routes for automatic traffic distribution, health checking, and failover.
 
 ## Table of Contents
 
@@ -387,7 +387,7 @@ upstreams:
 
 ## Health Checks
 
-Health checks automatically detect and exclude unhealthy targets so traffic is only routed to healthy backends. Ferrum Gateway supports both active and passive health checks, which can be used independently or together.
+Health checks automatically detect and exclude unhealthy targets so traffic is only routed to healthy backends. Ferrum Edge supports both active and passive health checks, which can be used independently or together.
 
 ### Active Health Checks
 
@@ -734,7 +734,7 @@ Upstream targets can be updated at runtime by modifying the configuration file a
 vim /etc/ferrum/config.yaml
 
 # Reload configuration without restart
-kill -HUP $(pidof ferrum-gateway)
+kill -HUP $(pidof ferrum-edge)
 ```
 
 ## Examples

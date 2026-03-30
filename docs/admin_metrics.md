@@ -1,6 +1,6 @@
 # Admin API: Runtime Metrics
 
-The Ferrum Gateway Admin API exposes a comprehensive runtime metrics endpoint that provides a real-time snapshot of the gateway's internal state. This endpoint is designed for building dashboards, monitoring integrations, and operational visibility.
+The Ferrum Edge Admin API exposes a comprehensive runtime metrics endpoint that provides a real-time snapshot of the gateway's internal state. This endpoint is designed for building dashboards, monitoring integrations, and operational visibility.
 
 ## Overview
 

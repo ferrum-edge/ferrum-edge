@@ -1,6 +1,6 @@
 //! Tests for request_transformer plugin
 
-use ferrum_gateway::plugins::{Plugin, RequestContext, request_transformer::RequestTransformer};
+use ferrum_edge::plugins::{Plugin, RequestContext, request_transformer::RequestTransformer};
 use serde_json::json;
 use std::collections::HashMap;
 
@@ -32,7 +32,7 @@ async fn test_request_transformer_add_header() {
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(matches!(
         result,
-        ferrum_gateway::plugins::PluginResult::Continue
+        ferrum_edge::plugins::PluginResult::Continue
     ));
     assert_eq!(headers.get("x-custom").unwrap(), "custom-value");
 }
@@ -53,7 +53,7 @@ async fn test_request_transformer_remove_header() {
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(matches!(
         result,
-        ferrum_gateway::plugins::PluginResult::Continue
+        ferrum_edge::plugins::PluginResult::Continue
     ));
     assert!(!headers.contains_key("x-remove-me"));
     assert!(headers.contains_key("x-keep-me"));
@@ -74,7 +74,7 @@ async fn test_request_transformer_update_header() {
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(matches!(
         result,
-        ferrum_gateway::plugins::PluginResult::Continue
+        ferrum_edge::plugins::PluginResult::Continue
     ));
     assert_eq!(headers.get("x-existing").unwrap(), "new-value");
 }
@@ -93,7 +93,7 @@ async fn test_request_transformer_add_query_param() {
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(matches!(
         result,
-        ferrum_gateway::plugins::PluginResult::Continue
+        ferrum_edge::plugins::PluginResult::Continue
     ));
     assert_eq!(ctx.query_params.get("version").unwrap(), "v2");
 }
@@ -116,7 +116,7 @@ async fn test_request_transformer_remove_query_param() {
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(matches!(
         result,
-        ferrum_gateway::plugins::PluginResult::Continue
+        ferrum_edge::plugins::PluginResult::Continue
     ));
     assert!(!ctx.query_params.contains_key("secret"));
     assert!(ctx.query_params.contains_key("keep"));
@@ -137,7 +137,7 @@ async fn test_request_transformer_update_query_param() {
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(matches!(
         result,
-        ferrum_gateway::plugins::PluginResult::Continue
+        ferrum_edge::plugins::PluginResult::Continue
     ));
     assert_eq!(ctx.query_params.get("page").unwrap(), "2");
 }
@@ -162,7 +162,7 @@ async fn test_request_transformer_multiple_rules() {
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(matches!(
         result,
-        ferrum_gateway::plugins::PluginResult::Continue
+        ferrum_edge::plugins::PluginResult::Continue
     ));
     assert_eq!(headers.get("x-added").unwrap(), "yes");
     assert!(!headers.contains_key("x-removed"));
@@ -181,7 +181,7 @@ async fn test_request_transformer_empty_rules() {
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(matches!(
         result,
-        ferrum_gateway::plugins::PluginResult::Continue
+        ferrum_edge::plugins::PluginResult::Continue
     ));
     assert_eq!(headers.get("x-existing").unwrap(), "untouched");
 }
@@ -196,7 +196,7 @@ async fn test_request_transformer_no_config() {
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(matches!(
         result,
-        ferrum_gateway::plugins::PluginResult::Continue
+        ferrum_edge::plugins::PluginResult::Continue
     ));
 }
 
@@ -214,7 +214,7 @@ async fn test_request_transformer_add_without_value_ignored() {
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(matches!(
         result,
-        ferrum_gateway::plugins::PluginResult::Continue
+        ferrum_edge::plugins::PluginResult::Continue
     ));
     // Should not add header without a value
     assert!(!headers.contains_key("x-novalue"));
@@ -234,7 +234,7 @@ async fn test_request_transformer_unknown_operation_ignored() {
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(matches!(
         result,
-        ferrum_gateway::plugins::PluginResult::Continue
+        ferrum_edge::plugins::PluginResult::Continue
     ));
 }
 
@@ -253,7 +253,7 @@ async fn test_request_transformer_body_rules_not_applied_in_before_proxy() {
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(matches!(
         result,
-        ferrum_gateway::plugins::PluginResult::Continue
+        ferrum_edge::plugins::PluginResult::Continue
     ));
     // Body rules are handled separately, headers should be untouched
     assert!(headers.is_empty());
@@ -273,7 +273,7 @@ async fn test_request_transformer_unknown_target_ignored() {
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(matches!(
         result,
-        ferrum_gateway::plugins::PluginResult::Continue
+        ferrum_edge::plugins::PluginResult::Continue
     ));
 }
 
@@ -292,7 +292,7 @@ async fn test_request_transformer_rename_header() {
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(matches!(
         result,
-        ferrum_gateway::plugins::PluginResult::Continue
+        ferrum_edge::plugins::PluginResult::Continue
     ));
     assert!(!headers.contains_key("x-old-name"));
     assert_eq!(headers.get("x-new-name").unwrap(), "the-value");
@@ -312,7 +312,7 @@ async fn test_request_transformer_rename_header_nonexistent() {
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(matches!(
         result,
-        ferrum_gateway::plugins::PluginResult::Continue
+        ferrum_edge::plugins::PluginResult::Continue
     ));
     assert!(!headers.contains_key("x-new-name"));
     assert!(!headers.contains_key("x-does-not-exist"));
@@ -334,7 +334,7 @@ async fn test_request_transformer_rename_query_param() {
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(matches!(
         result,
-        ferrum_gateway::plugins::PluginResult::Continue
+        ferrum_edge::plugins::PluginResult::Continue
     ));
     assert!(!ctx.query_params.contains_key("old_key"));
     assert_eq!(ctx.query_params.get("new_key").unwrap(), "the-value");
@@ -354,7 +354,7 @@ async fn test_request_transformer_rename_query_param_nonexistent() {
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(matches!(
         result,
-        ferrum_gateway::plugins::PluginResult::Continue
+        ferrum_edge::plugins::PluginResult::Continue
     ));
     assert!(!ctx.query_params.contains_key("missing_key"));
     assert!(!ctx.query_params.contains_key("new_key"));
@@ -375,7 +375,7 @@ async fn test_request_transformer_rename_without_new_key_ignored() {
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(matches!(
         result,
-        ferrum_gateway::plugins::PluginResult::Continue
+        ferrum_edge::plugins::PluginResult::Continue
     ));
     // Without new_key, the rename is a no-op — old key should remain
     assert_eq!(headers.get("x-old-name").unwrap(), "the-value");
@@ -395,7 +395,7 @@ async fn test_request_transformer_header_key_pre_lowercased() {
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(matches!(
         result,
-        ferrum_gateway::plugins::PluginResult::Continue
+        ferrum_edge::plugins::PluginResult::Continue
     ));
     // Key should be stored as lowercase due to pre-lowercasing at config time
     assert_eq!(headers.get("x-upper-case").unwrap(), "lowered");
@@ -619,7 +619,7 @@ async fn test_request_transformer_body_mixed_header_and_body_rules() {
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(matches!(
         result,
-        ferrum_gateway::plugins::PluginResult::Continue
+        ferrum_edge::plugins::PluginResult::Continue
     ));
     assert_eq!(headers.get("x-custom").unwrap(), "yes");
     assert!(!ctx.query_params.contains_key("debug"));

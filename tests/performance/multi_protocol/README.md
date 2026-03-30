@@ -1,8 +1,8 @@
 # Multi-Protocol Performance Tests
 
-Performance test suite that benchmarks Ferrum Gateway across all supported protocols: HTTP/1.1, HTTP/1.1+TLS, HTTP/2, HTTP/3 (QUIC), WebSocket, gRPC, TCP, TCP+TLS, UDP, and UDP+DTLS.
+Performance test suite that benchmarks Ferrum Edge across all supported protocols: HTTP/1.1, HTTP/1.1+TLS, HTTP/2, HTTP/3 (QUIC), WebSocket, gRPC, TCP, TCP+TLS, UDP, and UDP+DTLS.
 
-Each test runs a **three-tier setup**: `proto_bench` (load generator) &rarr; `ferrum-gateway` (proxy) &rarr; `proto_backend` (echo backend), then a direct baseline without the gateway for comparison.
+Each test runs a **three-tier setup**: `proto_bench` (load generator) &rarr; `ferrum-edge` (proxy) &rarr; `proto_backend` (echo backend), then a direct baseline without the gateway for comparison.
 
 ## Quick Start
 
@@ -41,7 +41,7 @@ cd tests/performance/multi_protocol
 
 ```
                 ┌───────────┐         ┌───────────────┐         ┌──────────────┐
-                │proto_bench│ ──────► │ferrum-gateway  │ ──────► │proto_backend │
+                │proto_bench│ ──────► │ferrum-edge  │ ──────► │proto_backend │
                 │(load gen) │         │(reverse proxy) │         │(echo server) │
                 └───────────┘         └───────────────┘         └──────────────┘
                                            │

@@ -1,10 +1,10 @@
-# Ferrum Gateway
+# Ferrum Edge
 
-A high-performance API Gateway and Reverse Proxy built in Rust, powered by `tokio` and `hyper`.
+A high-performance edge proxy built in Rust, powered by `tokio` and `hyper`.
 
 ## Overview
 
-Ferrum Gateway is a lightweight, extensible API gateway designed for modern microservice architectures. It provides dynamic routing, protocol flexibility (HTTP/1.1, HTTP/2, HTTP/3, WebSocket, gRPC, raw TCP/UDP with TLS and DTLS support), a robust plugin system with authentication, authorization, rate limiting, and request/response transformation capabilities. It supports multiple deployment topologies through its operating modes — from single-node file-based setups to distributed Control Plane / Data Plane architectures.
+Ferrum Edge is a lightweight, extensible edge proxy designed for modern microservice architectures. It provides dynamic routing, protocol flexibility (HTTP/1.1, HTTP/2, HTTP/3, WebSocket, gRPC, raw TCP/UDP with TLS and DTLS support), a robust plugin system with authentication, authorization, rate limiting, and request/response transformation capabilities. It supports multiple deployment topologies through its operating modes — from single-node file-based setups to distributed Control Plane / Data Plane architectures.
 
 ## Features
 
@@ -88,7 +88,7 @@ See [docs/cp_dp_mode.md](docs/cp_dp_mode.md) for detailed architecture, protocol
 
 ## Admin Read-Only Mode
 
-Ferrum Gateway supports a configurable read-only mode for the Admin API, providing an additional layer of security for production deployments.
+Ferrum Edge supports a configurable read-only mode for the Admin API, providing an additional layer of security for production deployments.
 
 ### Behavior
 
@@ -127,45 +127,45 @@ Ferrum Gateway supports a configurable read-only mode for the Admin API, providi
 
 ```bash
 # Clone the repository
-git clone https://github.com/QuickLaunchWeb/ferrum-gateway.git
-cd ferrum-gateway
+git clone https://github.com/QuickLaunchWeb/ferrum-edge.git
+cd ferrum-edge
 
 # Build in release mode
 cargo build --release
 
-# The binary is at target/release/ferrum-gateway
+# The binary is at target/release/ferrum-edge
 ```
 
 ### From Release Binaries
 
-Download pre-built binaries for your platform from the [GitHub Releases](https://github.com/QuickLaunchWeb/ferrum-gateway/releases) page:
+Download pre-built binaries for your platform from the [GitHub Releases](https://github.com/QuickLaunchWeb/ferrum-edge/releases) page:
 
 ```bash
 # Download the latest release for your platform
 # Linux x86_64
-wget https://github.com/QuickLaunchWeb/ferrum-gateway/releases/download/v0.1.0/ferrum-gateway-linux-x86_64
-chmod +x ferrum-gateway-linux-x86_64
+wget https://github.com/QuickLaunchWeb/ferrum-edge/releases/download/v0.1.0/ferrum-edge-linux-x86_64
+chmod +x ferrum-edge-linux-x86_64
 
 # macOS x86_64 (Intel)
-wget https://github.com/QuickLaunchWeb/ferrum-gateway/releases/download/v0.1.0/ferrum-gateway-macos-x86_64
-chmod +x ferrum-gateway-macos-x86_64
+wget https://github.com/QuickLaunchWeb/ferrum-edge/releases/download/v0.1.0/ferrum-edge-macos-x86_64
+chmod +x ferrum-edge-macos-x86_64
 
 # macOS ARM64 (Apple Silicon)
-wget https://github.com/QuickLaunchWeb/ferrum-gateway/releases/download/v0.1.0/ferrum-gateway-macos-aarch64
-chmod +x ferrum-gateway-macos-aarch64
+wget https://github.com/QuickLaunchWeb/ferrum-edge/releases/download/v0.1.0/ferrum-edge-macos-aarch64
+chmod +x ferrum-edge-macos-aarch64
 
 # Verify checksum
-sha256sum -c ferrum-gateway-linux-x86_64.sha256
+sha256sum -c ferrum-edge-linux-x86_64.sha256
 ```
 
 ### Using Docker
 
 ```bash
 # Pull and run the latest Docker image
-docker pull ghcr.io/quicklaunchweb/ferrum-gateway:latest
+docker pull ghcr.io/quicklaunchweb/ferrum-edge:latest
 
 docker run -d \
-  --name ferrum-gateway \
+  --name ferrum-edge \
   -p 8000:8000 \
   -p 9000:9000 \
   -e FERRUM_MODE=database \
@@ -173,7 +173,7 @@ docker run -d \
   -e FERRUM_DB_URL="sqlite:////data/ferrum.db?mode=rwc" \
   -e FERRUM_ADMIN_JWT_SECRET="dev-secret" \
   -v ferrum_data:/data \
-  ghcr.io/quicklaunchweb/ferrum-gateway:latest
+  ghcr.io/quicklaunchweb/ferrum-edge:latest
 ```
 
 See [Docker Deployment Guide](docs/docker.md) for comprehensive Docker and Docker Compose examples.
@@ -236,7 +236,7 @@ For production deployments, enable TLS or mTLS on the CP/DP gRPC channel. See [C
 
 ## Docker Deployment
 
-Ferrum Gateway can be deployed using Docker or Docker Compose for development, testing, and production.
+Ferrum Edge can be deployed using Docker or Docker Compose for development, testing, and production.
 
 ### Quick Start with Docker Compose
 
@@ -259,10 +259,10 @@ docker-compose --profile cp-dp up
 
 ```bash
 # Build locally
-docker build -t ferrum-gateway:latest .
+docker build -t ferrum-edge:latest .
 
 # Build for specific platform
-docker buildx build --platform linux/amd64,linux/arm64 -t ferrum-gateway:latest .
+docker buildx build --platform linux/amd64,linux/arm64 -t ferrum-edge:latest .
 ```
 
 **Image Features**:
@@ -275,7 +275,7 @@ See [Docker Deployment Guide](docs/docker.md) for detailed examples, configurati
 
 ## CI/CD Pipeline
 
-Ferrum Gateway includes automated CI/CD workflows for testing, building, and releasing.
+Ferrum Edge includes automated CI/CD workflows for testing, building, and releasing.
 
 ### Automated Testing & Builds
 
@@ -303,7 +303,7 @@ git tag -a v0.2.0 -m "Release version 0.2.0"
 git push origin v0.2.0
 
 # Binaries automatically available at:
-# https://github.com/QuickLaunchWeb/ferrum-gateway/releases/tag/v0.2.0
+# https://github.com/QuickLaunchWeb/ferrum-edge/releases/tag/v0.2.0
 ```
 
 See [CI/CD Documentation](docs/ci_cd.md) for complete pipeline overview, secrets configuration, and customization.
@@ -575,7 +575,7 @@ Discovered targets are merged with any statically defined `targets`. If the prov
 
 ## Connection Pooling
 
-Ferrum Gateway includes enterprise-grade connection pooling that significantly improves performance by reusing HTTP/HTTPS/WebSocket connections. This reduces TCP handshake overhead, lowers latency, and increases throughput.
+Ferrum Edge includes enterprise-grade connection pooling that significantly improves performance by reusing HTTP/HTTPS/WebSocket connections. This reduces TCP handshake overhead, lowers latency, and increases throughput.
 
 ### Hybrid Configuration Approach
 
@@ -743,7 +743,7 @@ pooling with properly tuned `FERRUM_POOL_MAX_IDLE_PER_HOST` provides:
 
 ### Performance Testing
 
-Ferrum Gateway includes a comprehensive performance testing suite in the `tests/performance/` directory:
+Ferrum Edge includes a comprehensive performance testing suite in the `tests/performance/` directory:
 
 ```bash
 # Full performance test suite with HTML report
@@ -1549,7 +1549,7 @@ Exported spans include OTel semantic convention attributes (`http.request.method
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `endpoint` | String | _(none)_ | OTLP/HTTP collector endpoint (e.g. `http://collector:4318/v1/traces`). Omit for propagation-only mode |
-| `service_name` | String | `ferrum-gateway` | Service name in spans and resource attributes |
+| `service_name` | String | `ferrum-edge` | Service name in spans and resource attributes |
 | `deployment_environment` | String | _(none)_ | `deployment.environment` resource attribute (e.g. `production`, `staging`) |
 | `generate_trace_id` | Boolean | `true` | Generate trace IDs for requests without incoming `traceparent` |
 | `headers` | Object | `{}` | Custom HTTP headers sent with OTLP exports (e.g. `{"x-honeycomb-team": "key"}`) |
@@ -2023,7 +2023,7 @@ Consumer passwords (for `basic_auth`) are stored as bcrypt hashes. The Admin API
 
 ## License
 
-Copyright (c) 2026 Ferrum Gateway
+Copyright (c) 2026 Ferrum Edge
 
 Licensed under the [PolyForm Noncommercial License 1.0.0](LICENSE).
 

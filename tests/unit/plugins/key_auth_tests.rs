@@ -1,7 +1,7 @@
 //! Tests for key_auth plugin
 
-use ferrum_gateway::ConsumerIndex;
-use ferrum_gateway::plugins::{Plugin, key_auth::KeyAuth};
+use ferrum_edge::ConsumerIndex;
+use ferrum_edge::plugins::{Plugin, key_auth::KeyAuth};
 use serde_json::json;
 
 use super::plugin_utils::{

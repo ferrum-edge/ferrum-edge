@@ -42,7 +42,7 @@ impl LoggingTestHarness {
             .to_string_lossy()
             .to_string();
         let jwt_secret = "logging-test-secret-key-12345".to_string();
-        let jwt_issuer = "ferrum-gateway-logging-test".to_string();
+        let jwt_issuer = "ferrum-edge-logging-test".to_string();
 
         let admin_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let admin_port = admin_listener.local_addr()?.port();
@@ -70,13 +70,13 @@ impl LoggingTestHarness {
 
         let build_status = Command::new("cargo").args(["build"]).status()?;
         if !build_status.success() {
-            return Err("Failed to build ferrum-gateway".into());
+            return Err("Failed to build ferrum-edge".into());
         }
 
-        let binary_path = if std::path::Path::new("./target/debug/ferrum-gateway").exists() {
-            "./target/debug/ferrum-gateway"
+        let binary_path = if std::path::Path::new("./target/debug/ferrum-edge").exists() {
+            "./target/debug/ferrum-edge"
         } else {
-            "./target/release/ferrum-gateway"
+            "./target/release/ferrum-edge"
         };
 
         let child = Command::new(binary_path)
@@ -417,7 +417,7 @@ async fn test_logging_gateway_startup_logs() {
     assert!(
         all_messages
             .iter()
-            .any(|m| m.contains("Ferrum Gateway starting")),
+            .any(|m| m.contains("Ferrum Edge starting")),
         "Should log gateway startup message"
     );
     assert!(

@@ -1,8 +1,8 @@
 //! Integration tests for the plugin system
 //! Tests plugin creation, scope configuration, and error handling
 
-use ferrum_gateway::config::types::{PluginConfig, PluginScope};
-use ferrum_gateway::plugins::{available_plugins, create_plugin};
+use ferrum_edge::config::types::{PluginConfig, PluginScope};
+use ferrum_edge::plugins::{available_plugins, create_plugin};
 use serde_json::json;
 
 use super::plugin_utils::{create_test_consumer, create_test_context};
@@ -144,7 +144,7 @@ async fn test_plugin_configuration_validation() {
 
         // Test basic operations don't panic
         let mut ctx = create_test_context();
-        let consumer_index = ferrum_gateway::ConsumerIndex::new(&[create_test_consumer()]);
+        let consumer_index = ferrum_edge::ConsumerIndex::new(&[create_test_consumer()]);
 
         // These should not panic even with empty config
         let _ = plugin.on_request_received(&mut ctx).await;

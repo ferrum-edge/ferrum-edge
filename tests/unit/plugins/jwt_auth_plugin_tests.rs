@@ -1,7 +1,7 @@
 //! Tests for jwt_auth plugin (proxy-side JWT authentication, not admin JWT)
 
-use ferrum_gateway::ConsumerIndex;
-use ferrum_gateway::plugins::{Plugin, RequestContext, jwt_auth::JwtAuth};
+use ferrum_edge::ConsumerIndex;
+use ferrum_edge::plugins::{Plugin, RequestContext, jwt_auth::JwtAuth};
 use serde_json::json;
 
 use super::plugin_utils::{assert_continue, assert_reject, create_test_consumer};

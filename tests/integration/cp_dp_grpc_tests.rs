@@ -16,12 +16,12 @@ use tokio::time::timeout;
 use tonic::transport::server::ServerTlsConfig;
 use tonic::transport::{Certificate, Identity, Server};
 
-use ferrum_gateway::config::db_loader::IncrementalResult;
-use ferrum_gateway::config::types::{AuthMode, BackendProtocol, GatewayConfig, Proxy};
-use ferrum_gateway::dns::{DnsCache, DnsConfig};
-use ferrum_gateway::grpc::cp_server::CpGrpcServer;
-use ferrum_gateway::grpc::dp_client::{self, DpGrpcTlsConfig};
-use ferrum_gateway::proxy::ProxyState;
+use ferrum_edge::config::db_loader::IncrementalResult;
+use ferrum_edge::config::types::{AuthMode, BackendProtocol, GatewayConfig, Proxy};
+use ferrum_edge::dns::{DnsCache, DnsConfig};
+use ferrum_edge::grpc::cp_server::CpGrpcServer;
+use ferrum_edge::grpc::dp_client::{self, DpGrpcTlsConfig};
+use ferrum_edge::proxy::ProxyState;
 
 const TEST_JWT_SECRET: &str = "test-grpc-secret-key";
 
@@ -108,9 +108,9 @@ fn create_test_config(proxy_count: usize) -> GatewayConfig {
 }
 
 /// Create a minimal EnvConfig for testing (file mode with dummy path).
-fn create_test_env_config() -> ferrum_gateway::config::EnvConfig {
-    ferrum_gateway::config::EnvConfig {
-        mode: ferrum_gateway::config::env_config::OperatingMode::File,
+fn create_test_env_config() -> ferrum_edge::config::EnvConfig {
+    ferrum_edge::config::EnvConfig {
+        mode: ferrum_edge::config::env_config::OperatingMode::File,
         log_level: "info".into(),
         enable_streaming_latency_tracking: false,
         proxy_http_port: 8000,
@@ -230,7 +230,7 @@ async fn start_test_cp_server(
     config: GatewayConfig,
 ) -> (
     SocketAddr,
-    tokio::sync::broadcast::Sender<ferrum_gateway::grpc::proto::ConfigUpdate>,
+    tokio::sync::broadcast::Sender<ferrum_edge::grpc::proto::ConfigUpdate>,
     tokio::task::JoinHandle<()>,
 ) {
     let config_arc = Arc::new(ArcSwap::new(Arc::new(config)));
@@ -491,7 +491,7 @@ async fn test_dp_handles_malformed_config() {
     assert!(received.is_ok(), "Should receive initial config");
 
     // Send a malformed config update (invalid JSON that can't deserialize to GatewayConfig)
-    let malformed_update = ferrum_gateway::grpc::proto::ConfigUpdate {
+    let malformed_update = ferrum_edge::grpc::proto::ConfigUpdate {
         update_type: 0,
         config_json: "{invalid json!!!}".to_string(),
         version: "bad".to_string(),
@@ -630,7 +630,7 @@ async fn start_test_cp_server_with_tls(
     client_ca_pem: Option<&[u8]>,
 ) -> (
     SocketAddr,
-    tokio::sync::broadcast::Sender<ferrum_gateway::grpc::proto::ConfigUpdate>,
+    tokio::sync::broadcast::Sender<ferrum_edge::grpc::proto::ConfigUpdate>,
     tokio::task::JoinHandle<()>,
 ) {
     let config_arc = Arc::new(ArcSwap::new(Arc::new(config)));
@@ -1101,7 +1101,7 @@ async fn test_dp_ignores_malformed_delta() {
     assert!(received.is_ok());
 
     // Send malformed delta (invalid JSON for update_type=1)
-    let malformed = ferrum_gateway::grpc::proto::ConfigUpdate {
+    let malformed = ferrum_edge::grpc::proto::ConfigUpdate {
         update_type: 1, // DELTA
         config_json: "{not valid delta json!!!}".to_string(),
         version: "bad".to_string(),

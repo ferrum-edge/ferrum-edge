@@ -3,12 +3,12 @@
 
 use std::sync::Arc;
 
-use ferrum_gateway::config::types::{BackendProtocol, GatewayConfig, Proxy};
-use ferrum_gateway::config::{EnvConfig, PoolConfig};
-use ferrum_gateway::connection_pool::ConnectionPool;
-use ferrum_gateway::dns::DnsCache;
-use ferrum_gateway::proxy::ProxyState;
-use ferrum_gateway::{ConsumerIndex, PluginCache, RouterCache};
+use ferrum_edge::config::types::{BackendProtocol, GatewayConfig, Proxy};
+use ferrum_edge::config::{EnvConfig, PoolConfig};
+use ferrum_edge::connection_pool::ConnectionPool;
+use ferrum_edge::dns::DnsCache;
+use ferrum_edge::proxy::ProxyState;
+use ferrum_edge::{ConsumerIndex, PluginCache, RouterCache};
 use tracing::info;
 
 // Initialize rustls crypto provider for tests
@@ -69,7 +69,7 @@ fn create_http3_test_proxy() -> Proxy {
         backend_tls_server_ca_cert_path: None,
         dns_override: None,
         dns_cache_ttl_seconds: None,
-        auth_mode: ferrum_gateway::config::types::AuthMode::Single,
+        auth_mode: ferrum_edge::config::types::AuthMode::Single,
         plugins: vec![],
 
         pool_idle_timeout_seconds: Some(90),
@@ -112,7 +112,7 @@ fn create_http3_test_gateway_config() -> GatewayConfig {
 /// Create a test environment configuration for HTTP/3
 fn create_http3_test_env_config() -> EnvConfig {
     EnvConfig {
-        mode: ferrum_gateway::config::OperatingMode::File,
+        mode: ferrum_edge::config::OperatingMode::File,
         log_level: "debug".to_string(),
         enable_streaming_latency_tracking: false,
         proxy_http_port: 8080,
@@ -223,7 +223,7 @@ async fn test_http3_backend_connection() {
     let pool_config = PoolConfig::default();
     let env_config = create_http3_test_env_config();
 
-    let dns_cache = DnsCache::new(ferrum_gateway::dns::DnsConfig::default());
+    let dns_cache = DnsCache::new(ferrum_edge::dns::DnsConfig::default());
     let connection_pool = Arc::new(ConnectionPool::new(
         pool_config,
         env_config,
@@ -248,7 +248,7 @@ async fn test_http3_backend_connection() {
 
     // Test HTTP/3 client creation and basic functionality
     let tls_config = connection_pool.get_tls_config_for_backend(&proxy);
-    let http3_client_result = ferrum_gateway::http3::client::Http3Client::new(tls_config, None);
+    let http3_client_result = ferrum_edge::http3::client::Http3Client::new(tls_config, None);
 
     match http3_client_result {
         Ok(_client) => {
@@ -258,7 +258,7 @@ async fn test_http3_backend_connection() {
             // Use a real HTTP/3-enabled endpoint (facebook.com supports HTTP/3)
             let backend_url = "https://www.facebook.com:443/";
             let headers = std::collections::HashMap::from([
-                ("user-agent".to_string(), "ferrum-gateway-test".to_string()),
+                ("user-agent".to_string(), "ferrum-edge-test".to_string()),
                 ("accept".to_string(), "text/html".to_string()),
             ]);
 
@@ -354,7 +354,7 @@ async fn test_http3_proxy_state_creation() {
     let pool_config = PoolConfig::default();
     let env_config = create_http3_test_env_config();
 
-    let dns_cache = DnsCache::new(ferrum_gateway::dns::DnsConfig::default());
+    let dns_cache = DnsCache::new(ferrum_edge::dns::DnsConfig::default());
     let connection_pool = Arc::new(ConnectionPool::new(
         pool_config,
         env_config,
@@ -365,9 +365,9 @@ async fn test_http3_proxy_state_creation() {
     let router_cache = Arc::new(RouterCache::new(&gc, 10_000));
     let plugin_cache = Arc::new(PluginCache::new(&gc).unwrap());
     let consumer_index = Arc::new(ConsumerIndex::new(&gc.consumers));
-    let lb_cache = Arc::new(ferrum_gateway::LoadBalancerCache::new(&gc));
+    let lb_cache = Arc::new(ferrum_edge::LoadBalancerCache::new(&gc));
     let slm = Arc::new(
-        ferrum_gateway::proxy::stream_listener::StreamListenerManager::new(
+        ferrum_edge::proxy::stream_listener::StreamListenerManager::new(
             std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
             gateway_config.clone(),
             dns_cache.clone(),
@@ -389,22 +389,22 @@ async fn test_http3_proxy_state_creation() {
         consumer_index,
         request_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         status_counts: Arc::new(dashmap::DashMap::new()),
-        grpc_pool: Arc::new(ferrum_gateway::proxy::grpc_proxy::GrpcConnectionPool::default()),
-        http2_pool: Arc::new(ferrum_gateway::proxy::http2_pool::Http2ConnectionPool::default()),
-        h3_pool: Arc::new(ferrum_gateway::http3::client::Http3ConnectionPool::new(
-            Arc::new(ferrum_gateway::config::EnvConfig::default()),
+        grpc_pool: Arc::new(ferrum_edge::proxy::grpc_proxy::GrpcConnectionPool::default()),
+        http2_pool: Arc::new(ferrum_edge::proxy::http2_pool::Http2ConnectionPool::default()),
+        h3_pool: Arc::new(ferrum_edge::http3::client::Http3ConnectionPool::new(
+            Arc::new(ferrum_edge::config::EnvConfig::default()),
         )),
         load_balancer_cache: lb_cache.clone(),
-        health_checker: Arc::new(ferrum_gateway::health_check::HealthChecker::new()),
-        circuit_breaker_cache: Arc::new(ferrum_gateway::circuit_breaker::CircuitBreakerCache::new()),
+        health_checker: Arc::new(ferrum_edge::health_check::HealthChecker::new()),
+        circuit_breaker_cache: Arc::new(ferrum_edge::circuit_breaker::CircuitBreakerCache::new()),
         service_discovery_manager: {
-            let hc = Arc::new(ferrum_gateway::health_check::HealthChecker::new());
+            let hc = Arc::new(ferrum_edge::health_check::HealthChecker::new());
             Arc::new(
-                ferrum_gateway::service_discovery::ServiceDiscoveryManager::new(
+                ferrum_edge::service_discovery::ServiceDiscoveryManager::new(
                     lb_cache,
                     dns_cache_for_sd,
                     hc,
-                    ferrum_gateway::plugins::PluginHttpClient::default(),
+                    ferrum_edge::plugins::PluginHttpClient::default(),
                 ),
             )
         },
@@ -413,8 +413,8 @@ async fn test_http3_proxy_state_creation() {
         max_single_header_size_bytes: 16384,
         max_request_body_size_bytes: 10_485_760,
         max_response_body_size_bytes: 10_485_760,
-        env_config: Arc::new(ferrum_gateway::config::EnvConfig::default()),
-        trusted_proxies: Arc::new(ferrum_gateway::proxy::client_ip::TrustedProxies::parse("")),
+        env_config: Arc::new(ferrum_edge::config::EnvConfig::default()),
+        trusted_proxies: Arc::new(ferrum_edge::proxy::client_ip::TrustedProxies::parse("")),
         stream_listener_manager: slm,
         started_at: std::time::Instant::now(),
     };
@@ -520,7 +520,7 @@ async fn test_http3_full_integration() {
     let pool_config = PoolConfig::default();
     let env_config = create_http3_test_env_config();
 
-    let dns_cache = DnsCache::new(ferrum_gateway::dns::DnsConfig::default());
+    let dns_cache = DnsCache::new(ferrum_edge::dns::DnsConfig::default());
     let connection_pool = Arc::new(ConnectionPool::new(
         pool_config,
         env_config,
@@ -532,9 +532,9 @@ async fn test_http3_full_integration() {
     let router_cache = Arc::new(RouterCache::new(&gc, 10_000));
     let plugin_cache = Arc::new(PluginCache::new(&gc).unwrap());
     let consumer_index = Arc::new(ConsumerIndex::new(&gc.consumers));
-    let lb_cache = Arc::new(ferrum_gateway::LoadBalancerCache::new(&gc));
+    let lb_cache = Arc::new(ferrum_edge::LoadBalancerCache::new(&gc));
     let slm = Arc::new(
-        ferrum_gateway::proxy::stream_listener::StreamListenerManager::new(
+        ferrum_edge::proxy::stream_listener::StreamListenerManager::new(
             std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
             gateway_config.clone(),
             dns_cache.clone(),
@@ -556,22 +556,22 @@ async fn test_http3_full_integration() {
         consumer_index,
         request_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         status_counts: Arc::new(dashmap::DashMap::new()),
-        grpc_pool: Arc::new(ferrum_gateway::proxy::grpc_proxy::GrpcConnectionPool::default()),
-        http2_pool: Arc::new(ferrum_gateway::proxy::http2_pool::Http2ConnectionPool::default()),
-        h3_pool: Arc::new(ferrum_gateway::http3::client::Http3ConnectionPool::new(
-            Arc::new(ferrum_gateway::config::EnvConfig::default()),
+        grpc_pool: Arc::new(ferrum_edge::proxy::grpc_proxy::GrpcConnectionPool::default()),
+        http2_pool: Arc::new(ferrum_edge::proxy::http2_pool::Http2ConnectionPool::default()),
+        h3_pool: Arc::new(ferrum_edge::http3::client::Http3ConnectionPool::new(
+            Arc::new(ferrum_edge::config::EnvConfig::default()),
         )),
         load_balancer_cache: lb_cache.clone(),
-        health_checker: Arc::new(ferrum_gateway::health_check::HealthChecker::new()),
-        circuit_breaker_cache: Arc::new(ferrum_gateway::circuit_breaker::CircuitBreakerCache::new()),
+        health_checker: Arc::new(ferrum_edge::health_check::HealthChecker::new()),
+        circuit_breaker_cache: Arc::new(ferrum_edge::circuit_breaker::CircuitBreakerCache::new()),
         service_discovery_manager: {
-            let hc = Arc::new(ferrum_gateway::health_check::HealthChecker::new());
+            let hc = Arc::new(ferrum_edge::health_check::HealthChecker::new());
             Arc::new(
-                ferrum_gateway::service_discovery::ServiceDiscoveryManager::new(
+                ferrum_edge::service_discovery::ServiceDiscoveryManager::new(
                     lb_cache,
                     dns_cache_for_sd,
                     hc,
-                    ferrum_gateway::plugins::PluginHttpClient::default(),
+                    ferrum_edge::plugins::PluginHttpClient::default(),
                 ),
             )
         },
@@ -580,8 +580,8 @@ async fn test_http3_full_integration() {
         max_single_header_size_bytes: 16384,
         max_request_body_size_bytes: 10_485_760,
         max_response_body_size_bytes: 10_485_760,
-        env_config: Arc::new(ferrum_gateway::config::EnvConfig::default()),
-        trusted_proxies: Arc::new(ferrum_gateway::proxy::client_ip::TrustedProxies::parse("")),
+        env_config: Arc::new(ferrum_edge::config::EnvConfig::default()),
+        trusted_proxies: Arc::new(ferrum_edge::proxy::client_ip::TrustedProxies::parse("")),
         stream_listener_manager: slm,
         started_at: std::time::Instant::now(),
     };
@@ -601,7 +601,7 @@ async fn test_http3_full_integration() {
     assert!(Arc::strong_count(&tls_config) > 0);
 
     // Test HTTP/3 client creation (may fail in test environment, but should not panic)
-    let http3_client_result = ferrum_gateway::http3::client::Http3Client::new(tls_config, None);
+    let http3_client_result = ferrum_edge::http3::client::Http3Client::new(tls_config, None);
     match http3_client_result {
         Ok(_client) => {
             info!("HTTP/3 client created successfully");
@@ -634,14 +634,14 @@ async fn test_http3_connection_performance() {
     let connection_pool = Arc::new(ConnectionPool::new(
         pool_config,
         env_config,
-        DnsCache::new(ferrum_gateway::dns::DnsConfig::default()),
+        DnsCache::new(ferrum_edge::dns::DnsConfig::default()),
     ));
 
     // Test HTTP/3 client creation performance
     let tls_config = connection_pool.get_tls_config_for_backend(&proxy);
 
     let start_time = std::time::Instant::now();
-    let http3_client = ferrum_gateway::http3::client::Http3Client::new(tls_config, None)
+    let http3_client = ferrum_edge::http3::client::Http3Client::new(tls_config, None)
         .expect("HTTP/3 client creation should succeed");
     let client_creation_time = start_time.elapsed();
 
@@ -657,7 +657,7 @@ async fn test_http3_connection_performance() {
     let headers = std::collections::HashMap::from([
         (
             "user-agent".to_string(),
-            "ferrum-gateway-perf-test".to_string(),
+            "ferrum-edge-perf-test".to_string(),
         ),
         ("accept".to_string(), "application/json".to_string()),
     ]);

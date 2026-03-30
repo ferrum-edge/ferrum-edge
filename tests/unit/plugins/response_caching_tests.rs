@@ -2,9 +2,9 @@
 
 use super::plugin_utils::create_test_proxy;
 use chrono::Utc;
-use ferrum_gateway::config::types::Consumer;
-use ferrum_gateway::plugins::response_caching::ResponseCaching;
-use ferrum_gateway::plugins::{Plugin, PluginResult, RequestContext};
+use ferrum_edge::config::types::Consumer;
+use ferrum_edge::plugins::response_caching::ResponseCaching;
+use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext};
 use serde_json::json;
 use std::collections::HashMap;
 
@@ -87,7 +87,7 @@ async fn test_supported_protocols() {
     let plugin = default_plugin();
     let protocols = plugin.supported_protocols();
     assert_eq!(protocols.len(), 1);
-    assert_eq!(protocols[0], ferrum_gateway::plugins::ProxyProtocol::Http);
+    assert_eq!(protocols[0], ferrum_edge::plugins::ProxyProtocol::Http);
 }
 
 // === Cache miss on first request ===

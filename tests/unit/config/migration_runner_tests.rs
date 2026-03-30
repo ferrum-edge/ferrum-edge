@@ -1,6 +1,6 @@
 //! Tests for database migration runner
 
-use ferrum_gateway::config::migrations::MigrationRunner;
+use ferrum_edge::config::migrations::MigrationRunner;
 
 /// Create a single-connection SQLite in-memory pool for testing.
 /// With SQLite in-memory databases, each connection gets a separate DB,

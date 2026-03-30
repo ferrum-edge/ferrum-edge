@@ -1,6 +1,6 @@
 use chrono::Utc;
-use ferrum_gateway::config::types::{AuthMode, BackendProtocol, Proxy, ResponseBodyMode};
-use ferrum_gateway::proxy::body::ProxyBody;
+use ferrum_edge::config::types::{AuthMode, BackendProtocol, Proxy, ResponseBodyMode};
+use ferrum_edge::proxy::body::ProxyBody;
 use http_body::Body;
 
 fn test_proxy() -> Proxy {
@@ -171,7 +171,7 @@ fn test_proxy_body_empty() {
 #[test]
 fn test_plugin_default_does_not_require_buffering() {
     use async_trait::async_trait;
-    use ferrum_gateway::plugins::Plugin;
+    use ferrum_edge::plugins::Plugin;
 
     struct TestPlugin;
 
@@ -189,7 +189,7 @@ fn test_plugin_default_does_not_require_buffering() {
 #[test]
 fn test_plugin_can_require_buffering() {
     use async_trait::async_trait;
-    use ferrum_gateway::plugins::Plugin;
+    use ferrum_edge::plugins::Plugin;
 
     struct BufferingPlugin;
 
@@ -212,7 +212,7 @@ fn test_plugin_can_require_buffering() {
 
 #[test]
 fn test_response_body_buffered() {
-    use ferrum_gateway::retry::ResponseBody;
+    use ferrum_edge::retry::ResponseBody;
 
     let body = ResponseBody::Buffered(b"hello".to_vec());
     match body {
@@ -234,7 +234,7 @@ fn test_streaming_mode_with_buffer_config() {
 #[test]
 fn test_streaming_mode_with_stream_config_no_plugins() {
     let proxy = test_proxy();
-    let plugins: Vec<&dyn ferrum_gateway::plugins::Plugin> = vec![];
+    let plugins: Vec<&dyn ferrum_edge::plugins::Plugin> = vec![];
     let plugin_requires_buffering = plugins.iter().any(|p| p.requires_response_body_buffering());
     let should_stream =
         matches!(proxy.response_body_mode, ResponseBodyMode::Stream) && !plugin_requires_buffering;

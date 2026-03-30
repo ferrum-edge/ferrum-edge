@@ -1,6 +1,6 @@
 # CI/CD Pipeline Documentation
 
-Ferrum Gateway includes comprehensive CI/CD pipelines for automated testing, building, and releasing.
+Ferrum Edge includes comprehensive CI/CD pipelines for automated testing, building, and releasing.
 
 ## Table of Contents
 
@@ -147,8 +147,8 @@ Builds optimized release binaries for all target platforms:
 - Other targets use standard `cargo build`
 
 **Output**:
-- Binary: `ferrum-gateway-{platform}`
-- Checksum: `ferrum-gateway-{platform}.sha256`
+- Binary: `ferrum-edge-{platform}`
+- Checksum: `ferrum-edge-{platform}.sha256`
 
 ### Create Release Job
 
@@ -170,15 +170,15 @@ Creates a GitHub Release with all binaries and checksums:
 
 ## Binaries
 
-- ferrum-gateway-linux-x86_64
-- ferrum-gateway-linux-aarch64
-- ferrum-gateway-macos-x86_64
-- ferrum-gateway-macos-aarch64
+- ferrum-edge-linux-x86_64
+- ferrum-edge-linux-aarch64
+- ferrum-edge-macos-x86_64
+- ferrum-edge-macos-aarch64
 
 ## Checksums
 
-abc123... ferrum-gateway-linux-x86_64
-def456... ferrum-gateway-linux-aarch64
+abc123... ferrum-edge-linux-x86_64
+def456... ferrum-edge-linux-aarch64
 ...
 ```
 
@@ -190,7 +190,7 @@ def456... ferrum-gateway-linux-aarch64
 
 ```toml
 [package]
-name = "ferrum-gateway"
+name = "ferrum-edge"
 version = "0.1.0"
 ```
 
@@ -241,7 +241,7 @@ git tag release-0.2.0
 # Edit Cargo.toml
 cat > Cargo.toml << EOF
 [package]
-name = "ferrum-gateway"
+name = "ferrum-edge"
 version = "0.2.0"
 ...
 EOF
@@ -288,7 +288,7 @@ gh release view v0.2.0
 gh release download v0.2.0 --dir ./binaries
 
 # Verify checksums
-sha256sum -c ferrum-gateway-*.sha256
+sha256sum -c ferrum-edge-*.sha256
 ```
 
 ### Alternative: Manual Release Creation
@@ -303,11 +303,11 @@ cargo build --release --target x86_64-apple-darwin
 cargo build --release --target aarch64-apple-darwin
 
 # Generate checksums
-sha256sum target/*/release/ferrum-gateway > checksums.txt
+sha256sum target/*/release/ferrum-edge > checksums.txt
 
 # Create release in GitHub UI or via gh:
 gh release create v0.2.0 \
-  target/*/release/ferrum-gateway \
+  target/*/release/ferrum-edge \
   checksums.txt \
   --title "Release v0.2.0" \
   --notes "$(cat release-notes.md)"
@@ -319,50 +319,50 @@ gh release create v0.2.0 \
 
 All released binaries available at:
 ```
-https://github.com/your-org/ferrum-gateway/releases
+https://github.com/your-org/ferrum-edge/releases
 ```
 
 ### Download Latest Release
 
 ```bash
 # Using GitHub CLI
-gh release download --repo your-org/ferrum-gateway -p "*linux-x86_64"
+gh release download --repo your-org/ferrum-edge -p "*linux-x86_64"
 
 # Using curl
-RELEASE_URL=$(curl -s https://api.github.com/repos/your-org/ferrum-gateway/releases/latest | \
-  jq -r '.assets[] | select(.name == "ferrum-gateway-linux-x86_64") | .browser_download_url')
-curl -L -o ferrum-gateway $RELEASE_URL
-chmod +x ferrum-gateway
+RELEASE_URL=$(curl -s https://api.github.com/repos/your-org/ferrum-edge/releases/latest | \
+  jq -r '.assets[] | select(.name == "ferrum-edge-linux-x86_64") | .browser_download_url')
+curl -L -o ferrum-edge $RELEASE_URL
+chmod +x ferrum-edge
 ```
 
 ### Platform-Specific Binaries
 
 **Linux x86_64** (Intel/AMD 64-bit)
 ```bash
-gh release download v0.2.0 -p "ferrum-gateway-linux-x86_64"
-chmod +x ferrum-gateway-linux-x86_64
-./ferrum-gateway-linux-x86_64
+gh release download v0.2.0 -p "ferrum-edge-linux-x86_64"
+chmod +x ferrum-edge-linux-x86_64
+./ferrum-edge-linux-x86_64
 ```
 
 **Linux ARM64** (ARM 64-bit, Graviton, etc.)
 ```bash
-gh release download v0.2.0 -p "ferrum-gateway-linux-aarch64"
-chmod +x ferrum-gateway-linux-aarch64
-./ferrum-gateway-linux-aarch64
+gh release download v0.2.0 -p "ferrum-edge-linux-aarch64"
+chmod +x ferrum-edge-linux-aarch64
+./ferrum-edge-linux-aarch64
 ```
 
 **macOS x86_64** (Intel Macs)
 ```bash
-gh release download v0.2.0 -p "ferrum-gateway-macos-x86_64"
-chmod +x ferrum-gateway-macos-x86_64
-./ferrum-gateway-macos-x86_64
+gh release download v0.2.0 -p "ferrum-edge-macos-x86_64"
+chmod +x ferrum-edge-macos-x86_64
+./ferrum-edge-macos-x86_64
 ```
 
 **macOS ARM64** (Apple Silicon M1/M2/M3)
 ```bash
-gh release download v0.2.0 -p "ferrum-gateway-macos-aarch64"
-chmod +x ferrum-gateway-macos-aarch64
-./ferrum-gateway-macos-aarch64
+gh release download v0.2.0 -p "ferrum-edge-macos-aarch64"
+chmod +x ferrum-edge-macos-aarch64
+./ferrum-edge-macos-aarch64
 ```
 
 ### Checksum Verification
@@ -377,10 +377,10 @@ gh release download v0.2.0
 sha256sum -c *.sha256
 
 # Expected output:
-# ferrum-gateway-linux-x86_64: OK
-# ferrum-gateway-linux-aarch64: OK
-# ferrum-gateway-macos-x86_64: OK
-# ferrum-gateway-macos-aarch64: OK
+# ferrum-edge-linux-x86_64: OK
+# ferrum-edge-linux-aarch64: OK
+# ferrum-edge-macos-x86_64: OK
+# ferrum-edge-macos-aarch64: OK
 ```
 
 ### Docker Hub Images
@@ -388,8 +388,8 @@ sha256sum -c *.sha256
 Pre-built Docker images also available (if Docker Hub credentials configured):
 
 ```bash
-docker pull your-registry/ferrum-gateway:v0.2.0
-docker pull your-registry/ferrum-gateway:latest
+docker pull your-registry/ferrum-edge:v0.2.0
+docker pull your-registry/ferrum-edge:latest
 ```
 
 ## GitHub Actions Secrets
@@ -454,8 +454,8 @@ strategy:
       # Add Windows target
       - os: windows-latest
         target: x86_64-pc-windows-gnu
-        artifact_name: ferrum-gateway.exe
-        asset_name: ferrum-gateway-windows-x86_64.exe
+        artifact_name: ferrum-edge.exe
+        asset_name: ferrum-edge-windows-x86_64.exe
 ```
 
 ### Skipping Steps

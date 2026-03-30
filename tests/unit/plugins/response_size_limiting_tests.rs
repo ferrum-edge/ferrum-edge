@@ -1,7 +1,7 @@
 //! Tests for response_size_limiting plugin
 
-use ferrum_gateway::plugins::response_size_limiting::ResponseSizeLimiting;
-use ferrum_gateway::plugins::{Plugin, PluginResult, RequestContext};
+use ferrum_edge::plugins::response_size_limiting::ResponseSizeLimiting;
+use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext};
 use serde_json::json;
 use std::collections::HashMap;
 
@@ -169,9 +169,9 @@ async fn test_no_buffering_when_max_bytes_zero() {
 async fn test_supports_http_and_grpc() {
     let plugin = ResponseSizeLimiting::new(&json!({"max_bytes": 1024}));
     let protocols = plugin.supported_protocols();
-    assert!(protocols.contains(&ferrum_gateway::plugins::ProxyProtocol::Http));
-    assert!(protocols.contains(&ferrum_gateway::plugins::ProxyProtocol::Grpc));
-    assert!(!protocols.contains(&ferrum_gateway::plugins::ProxyProtocol::WebSocket));
+    assert!(protocols.contains(&ferrum_edge::plugins::ProxyProtocol::Http));
+    assert!(protocols.contains(&ferrum_edge::plugins::ProxyProtocol::Grpc));
+    assert!(!protocols.contains(&ferrum_edge::plugins::ProxyProtocol::WebSocket));
 }
 
 // === Rejection body format ===

@@ -1,6 +1,6 @@
 # Authentication & ACL Functional Testing
 
-This document describes the comprehensive end-to-end functional test suite for authentication, access control, and multi-auth flows in ferrum-gateway.
+This document describes the comprehensive end-to-end functional test suite for authentication, access control, and multi-auth flows in ferrum-edge.
 
 ## Overview
 
@@ -166,7 +166,7 @@ Multi-auth mode executes auth plugins sequentially; first success stops iteratio
 |----------|-------|---------|
 | `FERRUM_MODE` | `database` | Operating mode |
 | `FERRUM_ADMIN_JWT_SECRET` | `test-admin-jwt-secret-key-12345` | JWT signing secret for admin API |
-| `FERRUM_ADMIN_JWT_ISSUER` | `ferrum-gateway-auth-test` | JWT issuer claim |
+| `FERRUM_ADMIN_JWT_ISSUER` | `ferrum-edge-auth-test` | JWT issuer claim |
 | `FERRUM_DB_TYPE` | `sqlite` | Database type |
 | `FERRUM_DB_URL` | `sqlite://<temp>/test.db?mode=rwc` | Database connection string |
 | `FERRUM_DB_POLL_INTERVAL` | `2` | Database poll interval (seconds) |

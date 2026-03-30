@@ -1,4 +1,4 @@
-# Multi-stage build for Ferrum Gateway
+# Multi-stage build for Ferrum Edge
 # Stage 1: Builder
 FROM rust:latest AS builder
 
@@ -44,7 +44,7 @@ RUN useradd -m -u 1000 ferrum
 WORKDIR /app
 
 # Copy binary from builder
-COPY --from=builder --chown=ferrum:ferrum /build/target/release/ferrum-gateway /app/ferrum-gateway
+COPY --from=builder --chown=ferrum:ferrum /build/target/release/ferrum-edge /app/ferrum-edge
 
 # Set environment variables
 ENV FERRUM_MODE=database \
@@ -65,10 +65,10 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:9000/health || exit 1
 
 # Add labels
-LABEL org.opencontainers.image.title="Ferrum Gateway" \
-      org.opencontainers.image.description="High-performance API Gateway and Reverse Proxy built in Rust" \
+LABEL org.opencontainers.image.title="Ferrum Edge" \
+      org.opencontainers.image.description="High-performance edge proxy built in Rust" \
       org.opencontainers.image.version="0.1.0" \
-      org.opencontainers.image.source="https://github.com/your-org/ferrum-gateway"
+      org.opencontainers.image.source="https://github.com/your-org/ferrum-edge"
 
 # Run the gateway
-ENTRYPOINT ["/app/ferrum-gateway"]
+ENTRYPOINT ["/app/ferrum-edge"]

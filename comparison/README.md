@@ -1,6 +1,6 @@
 # API Gateway Comparison Benchmarks
 
-Performance comparison suite that benchmarks **Ferrum Gateway** against **Pingora** (Cloudflare), **Kong**, **Tyk**, **KrakenD**, and **Envoy** under identical conditions.
+Performance comparison suite that benchmarks **Ferrum Edge** against **Pingora** (Cloudflare), **Kong**, **Tyk**, **KrakenD**, and **Envoy** under identical conditions.
 
 ## What It Measures
 
@@ -101,7 +101,7 @@ On macOS, Tyk runs in Docker — see the "Docker Overhead" section below for wha
 
 The script will:
 1. Pull Kong, Tyk, KrakenD, and Envoy Docker images
-2. Build Ferrum Gateway and the backend server (release mode)
+2. Build Ferrum Edge and the backend server (release mode)
 3. Run baseline → Ferrum → Pingora → Kong → Tyk → KrakenD → Envoy tests sequentially
 4. Generate an HTML comparison report in `comparison/results/`
 

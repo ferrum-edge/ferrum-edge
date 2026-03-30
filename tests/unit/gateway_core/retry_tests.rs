@@ -1,8 +1,8 @@
 //! Tests for retry logic module
 
-use ferrum_gateway::config::types::{BackoffStrategy, RetryConfig};
-use ferrum_gateway::proxy::grpc_proxy::GrpcProxyError;
-use ferrum_gateway::retry::{
+use ferrum_edge::config::types::{BackoffStrategy, RetryConfig};
+use ferrum_edge::proxy::grpc_proxy::GrpcProxyError;
+use ferrum_edge::retry::{
     BackendResponse, ErrorClass, ResponseBody, classify_boxed_error, classify_grpc_proxy_error,
     retry_delay, should_retry,
 };
@@ -31,7 +31,7 @@ fn connection_failure() -> BackendResponse {
         headers: HashMap::new(),
         connection_error: true,
         backend_resolved_ip: None,
-        error_class: Some(ferrum_gateway::retry::ErrorClass::ConnectionRefused),
+        error_class: Some(ferrum_edge::retry::ErrorClass::ConnectionRefused),
     }
 }
 

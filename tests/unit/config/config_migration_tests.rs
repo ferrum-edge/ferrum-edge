@@ -1,6 +1,6 @@
 //! Tests for config migration module
 
-use ferrum_gateway::config::config_migration::ConfigMigrator;
+use ferrum_edge::config::config_migration::ConfigMigrator;
 
 #[test]
 fn test_migrate_value_already_current() {

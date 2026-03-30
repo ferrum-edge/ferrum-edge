@@ -1,10 +1,8 @@
 //! Tests for load balancer module
 
 use dashmap::DashMap;
-use ferrum_gateway::config::types::{
-    GatewayConfig, LoadBalancerAlgorithm, Upstream, UpstreamTarget,
-};
-use ferrum_gateway::load_balancer::{LoadBalancer, LoadBalancerCache, target_key};
+use ferrum_edge::config::types::{GatewayConfig, LoadBalancerAlgorithm, Upstream, UpstreamTarget};
+use ferrum_edge::load_balancer::{LoadBalancer, LoadBalancerCache, target_key};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
 
@@ -698,7 +696,7 @@ fn test_least_latency_record_for_nonexistent_target() {
 
 // ─── HashOnStrategy Tests ───────────────────────────────────────────────────
 
-use ferrum_gateway::load_balancer::HashOnStrategy;
+use ferrum_edge::load_balancer::HashOnStrategy;
 
 #[test]
 fn test_hash_on_strategy_parse_defaults_to_ip() {

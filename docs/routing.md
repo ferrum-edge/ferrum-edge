@@ -1,6 +1,6 @@
 # Request Routing
 
-Ferrum Gateway routes incoming requests to backend proxies using a combination of **host matching**, **path prefix matching**, and **regex path matching**. This document describes the full routing algorithm, priority rules, and caching behavior.
+Ferrum Edge routes incoming requests to backend proxies using a combination of **host matching**, **path prefix matching**, and **regex path matching**. This document describes the full routing algorithm, priority rules, and caching behavior.
 
 ## Routing Algorithm
 

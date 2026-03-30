@@ -1,4 +1,4 @@
-//! Admin API for Ferrum Gateway
+//! Admin API for Ferrum Edge
 //!
 //! Provides REST API for managing proxies, consumers, and plugins
 //! with JWT-based authentication and authorization.

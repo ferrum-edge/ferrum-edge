@@ -1,5 +1,5 @@
 #!/bin/bash
-# Multi-protocol performance test runner for Ferrum Gateway
+# Multi-protocol performance test runner for Ferrum Edge
 # Usage: ./run_protocol_test.sh <protocol> [options]
 #   Protocols: http1, http1-tls, http2, http3, ws, grpc, tcp, tcp-tls, udp, udp-dtls, all
 #   Options:
@@ -83,7 +83,7 @@ build() {
         return
     fi
 
-    local gateway_bin="$PROJECT_ROOT/target/release/ferrum-gateway"
+    local gateway_bin="$PROJECT_ROOT/target/release/ferrum-edge"
     local bench_bin="$SCRIPT_DIR/target/release/proto_bench"
 
     local need_gateway=true
@@ -104,9 +104,9 @@ build() {
     echo -e "${BLUE}Building multi-protocol test suite...${NC}"
     if $need_gateway; then
         cd "$PROJECT_ROOT"
-        cargo build --release --bin ferrum-gateway 2>&1 | tail -1
+        cargo build --release --bin ferrum-edge 2>&1 | tail -1
     else
-        echo -e "  ${GREEN}ferrum-gateway binary is fresh${NC}"
+        echo -e "  ${GREEN}ferrum-edge binary is fresh${NC}"
     fi
     if $need_bench; then
         cd "$SCRIPT_DIR"
@@ -188,7 +188,7 @@ start_gateway() {
         done
     fi
 
-    "${env_cmd[@]}" ./target/release/ferrum-gateway > "$SCRIPT_DIR/gateway.log" 2>&1 &
+    "${env_cmd[@]}" ./target/release/ferrum-edge > "$SCRIPT_DIR/gateway.log" 2>&1 &
     GATEWAY_PID=$!
 
     for i in $(seq 1 10); do
@@ -334,7 +334,7 @@ kill_stale_processes() {
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 echo -e "${BLUE}╔══════════════════════════════════════════╗${NC}"
-echo -e "${BLUE}║  Ferrum Gateway Multi-Protocol Perf Test ║${NC}"
+echo -e "${BLUE}║  Ferrum Edge Multi-Protocol Perf Test ║${NC}"
 echo -e "${BLUE}╚══════════════════════════════════════════╝${NC}"
 echo ""
 

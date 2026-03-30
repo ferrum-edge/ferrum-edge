@@ -1,8 +1,8 @@
 //! Tests for ConsumerIndex — credential-indexed consumer lookup
 
 use chrono::Utc;
-use ferrum_gateway::ConsumerIndex;
-use ferrum_gateway::config::types::Consumer;
+use ferrum_edge::ConsumerIndex;
+use ferrum_edge::config::types::Consumer;
 use serde_json::{Map, Value};
 use std::collections::HashMap;
 

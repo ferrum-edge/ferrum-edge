@@ -7,7 +7,7 @@
 //! 4. Full TLS: frontend termination + backend origination simultaneously
 //!
 //! All tests are marked `#[ignore]` — run with:
-//!   cargo build --bin ferrum-gateway && cargo test --test functional_tests -- functional_tcp_proxy --ignored --nocapture
+//!   cargo build --bin ferrum-edge && cargo test --test functional_tests -- functional_tcp_proxy --ignored --nocapture
 
 use std::io::Write;
 use std::sync::Arc;
@@ -119,10 +119,10 @@ async fn start_tls_echo_server(port: u16) -> tokio::task::JoinHandle<()> {
 // ============================================================================
 
 fn gateway_binary_path() -> &'static str {
-    if std::path::Path::new("./target/debug/ferrum-gateway").exists() {
-        "./target/debug/ferrum-gateway"
+    if std::path::Path::new("./target/debug/ferrum-edge").exists() {
+        "./target/debug/ferrum-edge"
     } else {
-        "./target/release/ferrum-gateway"
+        "./target/release/ferrum-edge"
     }
 }
 
@@ -137,7 +137,7 @@ fn start_gateway(
         .env("FERRUM_FILE_CONFIG_PATH", config_path)
         .env("FERRUM_PROXY_HTTP_PORT", http_port.to_string())
         .env("FERRUM_TLS_NO_VERIFY", "true")
-        .env("RUST_LOG", "ferrum_gateway=debug")
+        .env("RUST_LOG", "ferrum_edge=debug")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());

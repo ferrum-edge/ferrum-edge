@@ -3,7 +3,7 @@
 //! These test the reference parsing and env var detection logic.
 //! Actual AWS connectivity tests require AWS credentials.
 
-use ferrum_gateway::secrets::resolve_secret;
+use ferrum_edge::secrets::resolve_secret;
 use std::sync::Mutex;
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());

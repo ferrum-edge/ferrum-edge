@@ -1,6 +1,6 @@
 //! Tests for otel_tracing plugin
 
-use ferrum_gateway::plugins::{
+use ferrum_edge::plugins::{
     Plugin, PluginResult, RequestContext, TransactionSummary, otel_tracing::OtelTracing,
     utils::PluginHttpClient,
 };
@@ -426,7 +426,7 @@ async fn test_otel_tracing_error_span_events() {
     // Simulate a gateway error with error_class and client disconnect
     let mut summary = make_summary(metadata);
     summary.response_status_code = 502;
-    summary.error_class = Some(ferrum_gateway::retry::ErrorClass::ConnectionTimeout);
+    summary.error_class = Some(ferrum_edge::retry::ErrorClass::ConnectionTimeout);
     summary.client_disconnected = true;
 
     plugin.log(&summary).await;

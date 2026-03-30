@@ -1,10 +1,10 @@
-# Ferrum Gateway Performance Testing Suite
+# Ferrum Edge Performance Testing Suite
 
-This directory contains a comprehensive performance testing setup for measuring the throughput and latency of the Ferrum Gateway compared to direct backend access.
+This directory contains a comprehensive performance testing setup for measuring the throughput and latency of the Ferrum Edge compared to direct backend access.
 
 ## � Location
 
-This performance testing suite is located at `tests/performance/` within the ferrum-gateway project, organized alongside the unit and integration tests.
+This performance testing suite is located at `tests/performance/` within the ferrum-edge project, organized alongside the unit and integration tests.
 
 ## �🚀 Quick Start
 
@@ -210,7 +210,7 @@ DEBUG=1 ./run_perf_test.sh
 # Check individual components
 ./backend_server  # Backend server
 # and in another terminal:
-FERRUM_MODE=file FERRUM_FILE_CONFIG_PATH=perf_config.yaml cargo run --bin ferrum-gateway
+FERRUM_MODE=file FERRUM_FILE_CONFIG_PATH=perf_config.yaml cargo run --bin ferrum-edge
 ```
 
 ## 🎯 Performance Optimization Tips

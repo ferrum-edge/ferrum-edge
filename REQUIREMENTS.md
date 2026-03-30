@@ -1,12 +1,12 @@
-## Ferrum Gateway: Requirements Specification Document
+## Ferrum Edge: Requirements Specification Document
 
 **Version:** 1.0
 
-**Project:** Ferrum Gateway - A high-performance API Gateway and Reverse Proxy built in Rust.
+**Project:** Ferrum Edge - A high-performance edge proxy built in Rust.
 
 **1. Introduction & Goal**
 
-This document specifies the requirements for building "Ferrum Gateway," a high-performance, extensible API Gateway and Reverse Proxy application. The primary implementation language is Rust. The application must leverage the `tokio` asynchronous runtime and the `hyper` library for core HTTP functionality. Key goals include high throughput, low latency, dynamic configuration, multiple operational modes, robust security features, protocol flexibility (HTTP, WebSockets, gRPC), and extensibility via a plugin system.
+This document specifies the requirements for building "Ferrum Edge," a high-performance, extensible API Gateway and Reverse Proxy application. The primary implementation language is Rust. The application must leverage the `tokio` asynchronous runtime and the `hyper` library for core HTTP functionality. Key goals include high throughput, low latency, dynamic configuration, multiple operational modes, robust security features, protocol flexibility (HTTP, WebSockets, gRPC), and extensibility via a plugin system.
 
 **2. Core Technical Stack**
 
@@ -26,7 +26,7 @@ The implementation MUST utilize the following core technologies:
 
 **3. Operating Modes**
 
-Ferrum Gateway MUST operate in one of three distinct modes, determined by the `FERRUM_MODE` environment variable at runtime.
+Ferrum Edge MUST operate in one of three distinct modes, determined by the `FERRUM_MODE` environment variable at runtime.
 
 *   **3.1. Database Mode (`FERRUM_MODE=database`)**
     *   **Functionality:** In this mode, a single gateway instance reads its configuration (Proxies, Consumers, Plugins) directly from a specified database, handles end-user proxy traffic, and provides an Admin API for configuration management.
@@ -53,7 +53,7 @@ Ferrum Gateway MUST operate in one of three distinct modes, determined by the `F
         *   The reload process MUST be atomic, non-interrupting for active traffic, and MUST re-validate the uniqueness of `listen_path` values. If validation fails during reload, the reload MUST be aborted, and the gateway continues operating with the previous valid configuration, logging an error.
 
 *   **3.3. Control Plane / Data Plane Mode**
-    *   This mode involves two distinct node types running the Ferrum Gateway application with different configurations.
+    *   This mode involves two distinct node types running the Ferrum Edge application with different configurations.
     *   **3.3.1. Control Plane (CP) Node (`FERRUM_MODE=cp`)**
         *   **Functionality:** Acts as the centralized configuration authority. It reads configuration from the database, provides the Admin API for management, and pushes configuration updates to connected Data Plane nodes via gRPC. It does **NOT** process end-user proxy traffic.
         *   **Database Integration:** Connects to the database (`FERRUM_DB_TYPE`, `FERRUM_DB_URL`). Relies on the database schema to enforce `Proxy.listen_path` uniqueness.
@@ -282,7 +282,7 @@ Define Rust structs (using `serde` for serialization/deserialization) for the co
 
 The AI agent MUST generate a comprehensive `README.md` file for the project repository. This file must serve as the primary user documentation and include at least the following sections:
 
-*   **Overview:** High-level description of Ferrum Gateway, its purpose, and core value proposition.
+*   **Overview:** High-level description of Ferrum Edge, its purpose, and core value proposition.
 *   **Features:** Bulleted list of key capabilities.
 *   **Operating Modes:** Detailed explanation of Database, File, and CP/DP modes, including setup and use cases for each.
 *   **Prerequisites:** Required software (Rust toolchain version, potentially database).

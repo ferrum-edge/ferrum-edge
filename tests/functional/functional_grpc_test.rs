@@ -1,4 +1,4 @@
-//! Functional test for gRPC reverse proxying through Ferrum Gateway.
+//! Functional test for gRPC reverse proxying through Ferrum Edge.
 //!
 //! This test:
 //! 1. Starts a local gRPC echo backend (h2c HTTP/2 server)
@@ -132,7 +132,7 @@ async fn start_grpc_echo_backend(port: u16) -> tokio::task::JoinHandle<()> {
 /// Build the gateway binary (debug profile).
 fn build_gateway() -> Result<(), Box<dyn std::error::Error>> {
     let output = std::process::Command::new("cargo")
-        .args(["build", "--bin", "ferrum-gateway"])
+        .args(["build", "--bin", "ferrum-edge"])
         .output()?;
     if !output.status.success() {
         eprintln!("Build stderr: {}", String::from_utf8_lossy(&output.stderr));
@@ -143,10 +143,10 @@ fn build_gateway() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Find the gateway binary path.
 fn gateway_binary_path() -> &'static str {
-    if std::path::Path::new("./target/debug/ferrum-gateway").exists() {
-        "./target/debug/ferrum-gateway"
+    if std::path::Path::new("./target/debug/ferrum-edge").exists() {
+        "./target/debug/ferrum-edge"
     } else {
-        "./target/release/ferrum-gateway"
+        "./target/release/ferrum-edge"
     }
 }
 
@@ -159,7 +159,7 @@ fn start_gateway(
         .env("FERRUM_MODE", "file")
         .env("FERRUM_FILE_CONFIG_PATH", config_path)
         .env("FERRUM_PROXY_HTTP_PORT", http_port.to_string())
-        .env("RUST_LOG", "ferrum_gateway=debug")
+        .env("RUST_LOG", "ferrum_edge=debug")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())

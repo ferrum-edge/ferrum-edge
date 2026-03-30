@@ -5,7 +5,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use ferrum_gateway::admin::{
+use ferrum_edge::admin::{
     AdminState,
     jwt_auth::{JwtConfig, JwtManager},
 };
@@ -24,7 +24,7 @@ impl Default for TestConfig {
     fn default() -> Self {
         Self {
             jwt_secret: "test-secret-key-for-admin-api".to_string(),
-            jwt_issuer: "test-ferrum-gateway".to_string(),
+            jwt_issuer: "test-ferrum-edge".to_string(),
             max_ttl: 3600,
         }
     }

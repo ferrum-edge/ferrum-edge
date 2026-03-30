@@ -1,6 +1,6 @@
 //! Functional Tests
 //!
-//! End-to-end tests that spawn the actual ferrum-gateway binary and exercise
+//! End-to-end tests that spawn the actual ferrum-edge binary and exercise
 //! the full system. These tests are marked with #[ignore] and must be run
 //! explicitly since they require the binary to be compiled first.
 //!

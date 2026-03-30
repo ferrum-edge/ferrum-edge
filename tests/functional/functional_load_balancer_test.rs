@@ -1,4 +1,4 @@
-//! Functional tests for Ferrum Gateway load balancing capabilities.
+//! Functional tests for Ferrum Edge load balancing capabilities.
 //!
 //! These tests validate end-to-end load balancing behavior by:
 //! 1. Starting multiple backend echo servers that identify themselves
@@ -154,7 +154,7 @@ fn start_gateway_in_file_mode(
     http_port: u16,
 ) -> Result<std::process::Child, Box<dyn std::error::Error>> {
     let build_output = std::process::Command::new("cargo")
-        .args(["build", "--bin", "ferrum-gateway"])
+        .args(["build", "--bin", "ferrum-edge"])
         .output()?;
 
     if !build_output.status.success() {
@@ -163,17 +163,17 @@ fn start_gateway_in_file_mode(
         return Err("Build failed".into());
     }
 
-    let binary_path = if std::path::Path::new("./target/debug/ferrum-gateway").exists() {
-        "./target/debug/ferrum-gateway"
+    let binary_path = if std::path::Path::new("./target/debug/ferrum-edge").exists() {
+        "./target/debug/ferrum-edge"
     } else {
-        "./target/release/ferrum-gateway"
+        "./target/release/ferrum-edge"
     };
 
     let child = std::process::Command::new(binary_path)
         .env("FERRUM_MODE", "file")
         .env("FERRUM_FILE_CONFIG_PATH", config_path)
         .env("FERRUM_PROXY_HTTP_PORT", http_port.to_string())
-        .env("RUST_LOG", "ferrum_gateway=debug")
+        .env("RUST_LOG", "ferrum_edge=debug")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())

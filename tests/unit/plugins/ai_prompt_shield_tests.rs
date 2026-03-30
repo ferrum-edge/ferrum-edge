@@ -1,12 +1,12 @@
 //! Tests for ai_prompt_shield plugin
 
-use ferrum_gateway::plugins::{Plugin, PluginResult, ai_prompt_shield::AiPromptShield};
+use ferrum_edge::plugins::{Plugin, PluginResult, ai_prompt_shield::AiPromptShield};
 use serde_json::json;
 use std::collections::HashMap;
 
 use super::plugin_utils::{assert_continue, assert_reject, create_test_context};
 
-fn make_post_ctx(body: &serde_json::Value) -> ferrum_gateway::plugins::RequestContext {
+fn make_post_ctx(body: &serde_json::Value) -> ferrum_edge::plugins::RequestContext {
     let mut ctx = create_test_context();
     ctx.method = "POST".to_string();
     ctx.headers

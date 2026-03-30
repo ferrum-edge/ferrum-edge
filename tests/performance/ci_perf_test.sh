@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# CI-friendly performance test for Ferrum Gateway
+# CI-friendly performance test for Ferrum Edge
 # Runs lighter load tests and outputs machine-readable JSON for baseline comparison
 #
 # Usage:
@@ -57,7 +57,7 @@ binary_is_fresh() {
 }
 
 # Build (skips if binaries are newer than source)
-GATEWAY_BIN="$PROJECT_ROOT/target/release/ferrum-gateway"
+GATEWAY_BIN="$PROJECT_ROOT/target/release/ferrum-edge"
 BACKEND_BIN="$PERF_DIR/target/release/backend_server"
 NEED_GATEWAY=true
 NEED_BACKEND=true
@@ -75,9 +75,9 @@ else
     echo "Building project..."
     if $NEED_GATEWAY; then
         cd "$PROJECT_ROOT"
-        cargo build --release --bin ferrum-gateway 2>&1
+        cargo build --release --bin ferrum-edge 2>&1
     else
-        echo "  ferrum-gateway binary is fresh"
+        echo "  ferrum-edge binary is fresh"
     fi
     if $NEED_BACKEND; then
         cd "$PERF_DIR"
@@ -114,7 +114,7 @@ FERRUM_POOL_MAX_IDLE_PER_HOST=200 \
 FERRUM_POOL_IDLE_TIMEOUT_SECONDS=120 \
 FERRUM_POOL_ENABLE_HTTP_KEEP_ALIVE=true \
 FERRUM_POOL_ENABLE_HTTP2=false \
-./target/release/ferrum-gateway > "$PERF_DIR/gateway.log" 2>&1 &
+./target/release/ferrum-edge > "$PERF_DIR/gateway.log" 2>&1 &
 GATEWAY_PID=$!
 for i in 1 2 3 4 5 6 7 8 9 10; do
     if kill -0 $GATEWAY_PID 2>/dev/null && curl -sf "http://127.0.0.1:$GATEWAY_PORT/health" > /dev/null 2>&1; then

@@ -1,7 +1,7 @@
 //! Tests for JWKS key store module
 
-use ferrum_gateway::plugins::jwks_store::JwksKeyStore;
-use ferrum_gateway::plugins::utils::PluginHttpClient;
+use ferrum_edge::plugins::jwks_store::JwksKeyStore;
+use ferrum_edge::plugins::utils::PluginHttpClient;
 
 #[test]
 fn test_empty_store_has_no_keys() {

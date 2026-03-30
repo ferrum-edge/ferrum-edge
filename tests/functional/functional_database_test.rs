@@ -1,6 +1,6 @@
 //! Comprehensive Functional Test for DATABASE MODE
 //!
-//! This test verifies the complete functionality of ferrum-gateway in database mode:
+//! This test verifies the complete functionality of ferrum-edge in database mode:
 //! - Building the gateway binary
 //! - Creating and using a temporary SQLite database
 //! - Starting the gateway in database mode
@@ -42,7 +42,7 @@ impl DatabaseModeTestHarness {
     async fn new() -> Result<Self, Box<dyn std::error::Error>> {
         let temp_dir = TempDir::new()?;
         let jwt_secret = "test-gateway-secret-key-12345".to_string();
-        let jwt_issuer = "ferrum-gateway-test".to_string();
+        let jwt_issuer = "ferrum-edge-test".to_string();
 
         // Get available ports by binding to 0
         let admin_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
@@ -85,15 +85,15 @@ impl DatabaseModeTestHarness {
         let build_status = Command::new("cargo").args(["build"]).status()?;
 
         if !build_status.success() {
-            return Err("Failed to build ferrum-gateway".into());
+            return Err("Failed to build ferrum-edge".into());
         }
 
         // Use debug binary (matches default `cargo test` profile)
         // Falls back to release if debug doesn't exist
-        let binary_path = if std::path::Path::new("./target/debug/ferrum-gateway").exists() {
-            "./target/debug/ferrum-gateway"
+        let binary_path = if std::path::Path::new("./target/debug/ferrum-edge").exists() {
+            "./target/debug/ferrum-edge"
         } else {
-            "./target/release/ferrum-gateway"
+            "./target/release/ferrum-edge"
         };
 
         // Start the gateway process with database mode environment variables

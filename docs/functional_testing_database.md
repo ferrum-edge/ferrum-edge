@@ -1,10 +1,10 @@
 # Database Mode Functional Testing
 
-This document describes the comprehensive functional test suite for the ferrum-gateway in DATABASE MODE.
+This document describes the comprehensive functional test suite for the ferrum-edge in DATABASE MODE.
 
 ## Overview
 
-The functional test (`tests/functional/functional_database_test.rs`) validates the complete end-to-end functionality of ferrum-gateway when operating in database mode. This includes:
+The functional test (`tests/functional/functional_database_test.rs`) validates the complete end-to-end functionality of ferrum-edge when operating in database mode. This includes:
 
 - Building the gateway binary
 - Creating and initializing a temporary SQLite database
@@ -234,7 +234,7 @@ Lists all proxies.
 |----------|-------|---------|
 | `FERRUM_MODE` | `database` | Operating mode |
 | `FERRUM_ADMIN_JWT_SECRET` | `test-gateway-secret-key-12345` | JWT signing secret |
-| `FERRUM_ADMIN_JWT_ISSUER` | `ferrum-gateway-test` | JWT issuer claim |
+| `FERRUM_ADMIN_JWT_ISSUER` | `ferrum-edge-test` | JWT issuer claim |
 | `FERRUM_DB_TYPE` | `sqlite` | Database type |
 | `FERRUM_DB_URL` | `sqlite:////tmp/xxx/test.db` | Database connection string |
 | `FERRUM_DB_POLL_INTERVAL` | `2` | Database poll interval (seconds) |

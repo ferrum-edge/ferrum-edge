@@ -466,8 +466,12 @@ impl LoadBalancer {
                 } else {
                     // EWMA = alpha * sample + (1 - alpha) * current
                     // Using fixed-point: (alpha_fp * sample + (SCALE - alpha_fp) * current) / SCALE
+                    // Use saturating_mul to prevent overflow with extreme latency values.
                     let alpha = DEFAULT_EWMA_ALPHA_FP;
-                    (alpha * latency_us + (EWMA_SCALE - alpha) * current) / EWMA_SCALE
+                    (alpha
+                        .saturating_mul(latency_us)
+                        .saturating_add((EWMA_SCALE - alpha).saturating_mul(current)))
+                        / EWMA_SCALE
                 };
                 if ewma
                     .compare_exchange_weak(current, new_ewma, Ordering::Relaxed, Ordering::Relaxed)

@@ -1,6 +1,6 @@
 # Load & Stress Testing Guide
 
-This document describes the comprehensive load and stress test suite for the Ferrum Gateway (`functional_load_stress_test.rs`). The test exercises the gateway under realistic production-like conditions with large configuration sets, mixed authentication, varied payload sizes, concurrent admin API mutations, and includes both in-process (reqwest) and native C (wrk) load generators to isolate client overhead from gateway overhead.
+This document describes the comprehensive load and stress test suite for the Ferrum Edge (`functional_load_stress_test.rs`). The test exercises the gateway under realistic production-like conditions with large configuration sets, mixed authentication, varied payload sizes, concurrent admin API mutations, and includes both in-process (reqwest) and native C (wrk) load generators to isolate client overhead from gateway overhead.
 
 ## Overview
 
@@ -59,7 +59,7 @@ The test **defaults to PostgreSQL** if the `ferrum-load-test-pg` Docker containe
 ### Build the Gateway (Release)
 
 ```bash
-cargo build --release --bin ferrum-gateway
+cargo build --release --bin ferrum-edge
 ```
 
 The test will also trigger this build automatically if the release binary is missing, but pre-building saves time.
@@ -452,7 +452,7 @@ The test waits 5 seconds for the DB poller (configured at 2-second interval). If
 If you see a warning about using a debug binary, rebuild in release mode:
 
 ```bash
-cargo build --release --bin ferrum-gateway
+cargo build --release --bin ferrum-edge
 ```
 
 Debug builds are 2-4x slower and will show artificially high latency numbers.

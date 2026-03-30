@@ -2,9 +2,9 @@
 
 use base64::Engine;
 use chrono::Utc;
-use ferrum_gateway::ConsumerIndex;
-use ferrum_gateway::config::types::Consumer;
-use ferrum_gateway::plugins::{Plugin, RequestContext, hmac_auth::HmacAuth};
+use ferrum_edge::ConsumerIndex;
+use ferrum_edge::config::types::Consumer;
+use ferrum_edge::plugins::{Plugin, RequestContext, hmac_auth::HmacAuth};
 use hmac::{Hmac, Mac};
 use serde_json::{Map, Value, json};
 use sha2::{Sha256, Sha512};

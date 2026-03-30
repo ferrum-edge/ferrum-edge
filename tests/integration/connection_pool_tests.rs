@@ -1,10 +1,10 @@
 //! Tests for connection pool manager
 
 use chrono::Utc;
-use ferrum_gateway::config::PoolConfig;
-use ferrum_gateway::config::types::{AuthMode, BackendProtocol, Proxy};
-use ferrum_gateway::connection_pool::ConnectionPool;
-use ferrum_gateway::dns::{DnsCache, DnsConfig};
+use ferrum_edge::config::PoolConfig;
+use ferrum_edge::config::types::{AuthMode, BackendProtocol, Proxy};
+use ferrum_edge::connection_pool::ConnectionPool;
+use ferrum_edge::dns::{DnsCache, DnsConfig};
 
 fn create_test_proxy() -> Proxy {
     Proxy {
@@ -55,9 +55,9 @@ fn create_test_proxy() -> Proxy {
     }
 }
 
-fn create_test_env_config() -> ferrum_gateway::config::EnvConfig {
-    ferrum_gateway::config::EnvConfig {
-        mode: ferrum_gateway::config::OperatingMode::File,
+fn create_test_env_config() -> ferrum_edge::config::EnvConfig {
+    ferrum_edge::config::EnvConfig {
+        mode: ferrum_edge::config::OperatingMode::File,
         log_level: "info".to_string(),
         enable_streaming_latency_tracking: false,
         proxy_http_port: 8000,

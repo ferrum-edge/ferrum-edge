@@ -1,6 +1,6 @@
 # CORS Plugin
 
-This document explains how to configure the Cross-Origin Resource Sharing (CORS) plugin in Ferrum Gateway.
+This document explains how to configure the Cross-Origin Resource Sharing (CORS) plugin in Ferrum Edge.
 
 ## Overview
 
@@ -333,7 +333,7 @@ curl -v http://localhost:8000/api/users
 Enable debug logging to see CORS decisions:
 
 ```bash
-RUST_LOG=debug ./ferrum-gateway
+RUST_LOG=debug ./ferrum-edge
 ```
 
 Look for log lines starting with `cors:` for preflight approvals, rejections, and origin checks.

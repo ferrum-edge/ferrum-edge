@@ -1,6 +1,6 @@
 //! Tests for Azure Key Vault secret resolution.
 
-use ferrum_gateway::secrets::resolve_secret;
+use ferrum_edge::secrets::resolve_secret;
 use std::sync::Mutex;
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());

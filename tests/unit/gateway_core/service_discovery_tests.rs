@@ -1,10 +1,10 @@
 //! Unit tests for the service discovery module.
 
-use ferrum_gateway::config::types::*;
-use ferrum_gateway::load_balancer::LoadBalancerCache;
-use ferrum_gateway::service_discovery::consul::ConsulDiscoverer;
-use ferrum_gateway::service_discovery::kubernetes::KubernetesDiscoverer;
-use ferrum_gateway::service_discovery::{ServiceDiscoverer, ServiceDiscoveryManager};
+use ferrum_edge::config::types::*;
+use ferrum_edge::load_balancer::LoadBalancerCache;
+use ferrum_edge::service_discovery::consul::ConsulDiscoverer;
+use ferrum_edge::service_discovery::kubernetes::KubernetesDiscoverer;
+use ferrum_edge::service_discovery::{ServiceDiscoverer, ServiceDiscoveryManager};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -277,7 +277,7 @@ fn test_merge_targets_no_overlap() {
     let static_targets = vec![make_target("static-1", 8080)];
     let discovered = vec![make_target("discovered-1", 9090)];
 
-    let merged = ferrum_gateway::service_discovery::merge_targets(&static_targets, &discovered);
+    let merged = ferrum_edge::service_discovery::merge_targets(&static_targets, &discovered);
     assert_eq!(merged.len(), 2);
     assert_eq!(merged[0].host, "static-1");
     assert_eq!(merged[1].host, "discovered-1");
@@ -291,7 +291,7 @@ fn test_merge_targets_overlap_keeps_static() {
     let mut discovered = vec![make_target("shared-host", 8080)];
     discovered[0].weight = 1; // discovered has default weight
 
-    let merged = ferrum_gateway::service_discovery::merge_targets(&static_targets, &discovered);
+    let merged = ferrum_edge::service_discovery::merge_targets(&static_targets, &discovered);
     assert_eq!(merged.len(), 1);
     assert_eq!(merged[0].weight, 10); // static weight preserved
 }
@@ -301,7 +301,7 @@ fn test_merge_targets_empty_discovered() {
     let static_targets = vec![make_target("static-1", 8080)];
     let discovered: Vec<UpstreamTarget> = vec![];
 
-    let merged = ferrum_gateway::service_discovery::merge_targets(&static_targets, &discovered);
+    let merged = ferrum_edge::service_discovery::merge_targets(&static_targets, &discovered);
     assert_eq!(merged.len(), 1);
 }
 
@@ -310,7 +310,7 @@ fn test_merge_targets_empty_static() {
     let static_targets: Vec<UpstreamTarget> = vec![];
     let discovered = vec![make_target("discovered-1", 9090)];
 
-    let merged = ferrum_gateway::service_discovery::merge_targets(&static_targets, &discovered);
+    let merged = ferrum_edge::service_discovery::merge_targets(&static_targets, &discovered);
     assert_eq!(merged.len(), 1);
     assert_eq!(merged[0].host, "discovered-1");
 }
@@ -321,35 +321,35 @@ fn test_merge_targets_empty_static() {
 fn test_targets_equal_same_order() {
     let a = vec![make_target("h1", 80), make_target("h2", 90)];
     let b = vec![make_target("h1", 80), make_target("h2", 90)];
-    assert!(ferrum_gateway::service_discovery::targets_equal(&a, &b));
+    assert!(ferrum_edge::service_discovery::targets_equal(&a, &b));
 }
 
 #[test]
 fn test_targets_equal_different_order() {
     let a = vec![make_target("h2", 90), make_target("h1", 80)];
     let b = vec![make_target("h1", 80), make_target("h2", 90)];
-    assert!(ferrum_gateway::service_discovery::targets_equal(&a, &b));
+    assert!(ferrum_edge::service_discovery::targets_equal(&a, &b));
 }
 
 #[test]
 fn test_targets_equal_different_length() {
     let a = vec![make_target("h1", 80)];
     let b = vec![make_target("h1", 80), make_target("h2", 90)];
-    assert!(!ferrum_gateway::service_discovery::targets_equal(&a, &b));
+    assert!(!ferrum_edge::service_discovery::targets_equal(&a, &b));
 }
 
 #[test]
 fn test_targets_equal_different_content() {
     let a = vec![make_target("h1", 80)];
     let b = vec![make_target("h2", 80)];
-    assert!(!ferrum_gateway::service_discovery::targets_equal(&a, &b));
+    assert!(!ferrum_edge::service_discovery::targets_equal(&a, &b));
 }
 
 #[test]
 fn test_targets_equal_empty() {
     let a: Vec<UpstreamTarget> = vec![];
     let b: Vec<UpstreamTarget> = vec![];
-    assert!(ferrum_gateway::service_discovery::targets_equal(&a, &b));
+    assert!(ferrum_edge::service_discovery::targets_equal(&a, &b));
 }
 
 // ── SdProvider::as_str ────────────────────────────────────────────────
@@ -372,12 +372,12 @@ async fn test_manager_start_with_no_sd_upstreams() {
     )]);
 
     let cache = Arc::new(LoadBalancerCache::new(&config));
-    let dns_cache = ferrum_gateway::dns::DnsCache::new(Default::default());
+    let dns_cache = ferrum_edge::dns::DnsCache::new(Default::default());
     let manager = ServiceDiscoveryManager::new(
         cache,
         dns_cache,
-        Arc::new(ferrum_gateway::health_check::HealthChecker::new()),
-        ferrum_gateway::plugins::PluginHttpClient::default(),
+        Arc::new(ferrum_edge::health_check::HealthChecker::new()),
+        ferrum_edge::plugins::PluginHttpClient::default(),
     );
 
     // No SD config → no tasks started
@@ -390,12 +390,12 @@ async fn test_manager_start_with_no_sd_upstreams() {
 async fn test_manager_stop_is_idempotent() {
     let config = make_config_with_upstreams(vec![]);
     let cache = Arc::new(LoadBalancerCache::new(&config));
-    let dns_cache = ferrum_gateway::dns::DnsCache::new(Default::default());
+    let dns_cache = ferrum_edge::dns::DnsCache::new(Default::default());
     let manager = ServiceDiscoveryManager::new(
         cache,
         dns_cache,
-        Arc::new(ferrum_gateway::health_check::HealthChecker::new()),
-        ferrum_gateway::plugins::PluginHttpClient::default(),
+        Arc::new(ferrum_edge::health_check::HealthChecker::new()),
+        ferrum_edge::plugins::PluginHttpClient::default(),
     );
 
     manager.stop();

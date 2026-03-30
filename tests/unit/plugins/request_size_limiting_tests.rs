@@ -1,7 +1,7 @@
 //! Tests for request_size_limiting plugin
 
-use ferrum_gateway::plugins::request_size_limiting::RequestSizeLimiting;
-use ferrum_gateway::plugins::{Plugin, PluginResult, RequestContext};
+use ferrum_edge::plugins::request_size_limiting::RequestSizeLimiting;
+use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext};
 use serde_json::json;
 use std::collections::HashMap;
 
@@ -164,9 +164,9 @@ async fn test_no_buffered_body_passes() {
 async fn test_supports_http_and_grpc() {
     let plugin = RequestSizeLimiting::new(&json!({"max_bytes": 1024}));
     let protocols = plugin.supported_protocols();
-    assert!(protocols.contains(&ferrum_gateway::plugins::ProxyProtocol::Http));
-    assert!(protocols.contains(&ferrum_gateway::plugins::ProxyProtocol::Grpc));
-    assert!(!protocols.contains(&ferrum_gateway::plugins::ProxyProtocol::WebSocket));
+    assert!(protocols.contains(&ferrum_edge::plugins::ProxyProtocol::Http));
+    assert!(protocols.contains(&ferrum_edge::plugins::ProxyProtocol::Grpc));
+    assert!(!protocols.contains(&ferrum_edge::plugins::ProxyProtocol::WebSocket));
 }
 
 // === GET requests with Content-Length (unusual but valid) ===

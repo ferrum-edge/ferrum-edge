@@ -1,5 +1,5 @@
 use chrono::Utc;
-use ferrum_gateway::config::types::{
+use ferrum_edge::config::types::{
     AuthMode, BackendProtocol, Consumer, GatewayConfig, PluginAssociation, PluginConfig, Proxy,
     Upstream, UpstreamTarget, hosts_overlap, validate_host_entry, validate_resource_id,
     wildcard_matches,
@@ -602,7 +602,7 @@ fn test_unique_plugins_per_proxy_valid() {
             id: "pc1".into(),
             plugin_name: "rate_limiting".into(),
             config: serde_json::json!({}),
-            scope: ferrum_gateway::config::types::PluginScope::Proxy,
+            scope: ferrum_edge::config::types::PluginScope::Proxy,
             proxy_id: Some("p1".into()),
             enabled: true,
             created_at: Utc::now(),
@@ -612,7 +612,7 @@ fn test_unique_plugins_per_proxy_valid() {
             id: "pc2".into(),
             plugin_name: "key_auth".into(),
             config: serde_json::json!({}),
-            scope: ferrum_gateway::config::types::PluginScope::Proxy,
+            scope: ferrum_edge::config::types::PluginScope::Proxy,
             proxy_id: Some("p1".into()),
             enabled: true,
             created_at: Utc::now(),
@@ -640,7 +640,7 @@ fn test_unique_plugins_per_proxy_duplicate() {
             id: "pc1".into(),
             plugin_name: "rate_limiting".into(),
             config: serde_json::json!({"window_seconds": 60}),
-            scope: ferrum_gateway::config::types::PluginScope::Proxy,
+            scope: ferrum_edge::config::types::PluginScope::Proxy,
             proxy_id: Some("p1".into()),
             enabled: true,
             created_at: Utc::now(),
@@ -650,7 +650,7 @@ fn test_unique_plugins_per_proxy_duplicate() {
             id: "pc2".into(),
             plugin_name: "rate_limiting".into(),
             config: serde_json::json!({"window_seconds": 120}),
-            scope: ferrum_gateway::config::types::PluginScope::Proxy,
+            scope: ferrum_edge::config::types::PluginScope::Proxy,
             proxy_id: Some("p1".into()),
             enabled: true,
             created_at: Utc::now(),
@@ -1076,35 +1076,35 @@ fn test_regex_listen_path_non_regex_not_checked() {
 
 #[test]
 fn test_anchor_regex_pattern_adds_both_anchors() {
-    use ferrum_gateway::config::types::anchor_regex_pattern;
+    use ferrum_edge::config::types::anchor_regex_pattern;
 
     assert_eq!(anchor_regex_pattern("/users/[^/]+"), "^/users/[^/]+$");
 }
 
 #[test]
 fn test_anchor_regex_pattern_preserves_existing_start() {
-    use ferrum_gateway::config::types::anchor_regex_pattern;
+    use ferrum_edge::config::types::anchor_regex_pattern;
 
     assert_eq!(anchor_regex_pattern("^/users/[^/]+"), "^/users/[^/]+$");
 }
 
 #[test]
 fn test_anchor_regex_pattern_preserves_existing_end() {
-    use ferrum_gateway::config::types::anchor_regex_pattern;
+    use ferrum_edge::config::types::anchor_regex_pattern;
 
     assert_eq!(anchor_regex_pattern("/users/[^/]+$"), "^/users/[^/]+$");
 }
 
 #[test]
 fn test_anchor_regex_pattern_preserves_both_existing() {
-    use ferrum_gateway::config::types::anchor_regex_pattern;
+    use ferrum_edge::config::types::anchor_regex_pattern;
 
     assert_eq!(anchor_regex_pattern("^/users/[^/]+$"), "^/users/[^/]+$");
 }
 
 #[test]
 fn test_anchor_regex_pattern_wildcard_suffix_preserved() {
-    use ferrum_gateway::config::types::anchor_regex_pattern;
+    use ferrum_edge::config::types::anchor_regex_pattern;
 
     // Operators use .* to opt out of strict end-anchoring
     assert_eq!(

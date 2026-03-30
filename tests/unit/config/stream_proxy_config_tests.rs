@@ -1,7 +1,7 @@
 //! Tests for TCP/UDP stream proxy configuration types and validation.
 
 use chrono::Utc;
-use ferrum_gateway::config::types::{
+use ferrum_edge::config::types::{
     ActiveHealthCheck, AuthMode, BackendProtocol, GatewayConfig, HealthProbeType, Proxy,
 };
 

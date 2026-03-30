@@ -40,7 +40,7 @@ impl Default for JwtConfig {
     fn default() -> Self {
         Self {
             secret: String::new(),
-            issuer: "ferrum-gateway".to_string(),
+            issuer: "ferrum-edge".to_string(),
             max_ttl_seconds: 3600,
             algorithm: Algorithm::HS256,
         }
@@ -157,7 +157,7 @@ pub fn create_jwt_manager_from_env() -> Result<JwtManager, JwtError> {
         .map_err(|_| JwtError::VerificationFailed("FERRUM_ADMIN_JWT_SECRET not set".to_string()))?;
 
     let issuer =
-        std::env::var("FERRUM_ADMIN_JWT_ISSUER").unwrap_or_else(|_| "ferrum-gateway".to_string());
+        std::env::var("FERRUM_ADMIN_JWT_ISSUER").unwrap_or_else(|_| "ferrum-edge".to_string());
 
     let max_ttl = std::env::var("FERRUM_ADMIN_JWT_MAX_TTL")
         .ok()

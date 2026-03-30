@@ -1,12 +1,12 @@
-# Ferrum Gateway vs Cloudflare Pingora: Deep Technical Comparison
+# Ferrum Edge vs Cloudflare Pingora: Deep Technical Comparison
 
-A detailed comparison of runtime proxy implementations between Ferrum Gateway and Cloudflare's Pingora framework, covering HTTP/1.1, HTTP/2, HTTP/3, WebSocket, gRPC, connection pooling, load balancing, TLS, and runtime architecture.
+A detailed comparison of runtime proxy implementations between Ferrum Edge and Cloudflare's Pingora framework, covering HTTP/1.1, HTTP/2, HTTP/3, WebSocket, gRPC, connection pooling, load balancing, TLS, and runtime architecture.
 
 ---
 
 ## Executive Summary
 
-| Capability | Ferrum Gateway | Pingora |
+| Capability | Ferrum Edge | Pingora |
 |-----------|----------------|---------|
 | **HTTP/1.1 + HTTP/2** | Full proxy (hyper 1.0 + reqwest) | Full proxy (custom h1 + h2 crate) |
 | **HTTP/3 (QUIC)** | Native support (quinn + h3) | Not supported |

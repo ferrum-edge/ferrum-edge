@@ -1,6 +1,6 @@
 # Request & Response Size Limits
 
-Ferrum Gateway enforces configurable size limits on request headers, request bodies, and response bodies to protect against memory exhaustion (OOM) attacks, oversized payloads, and misbehaving backends. Limits are enforced at multiple layers — the protocol layer (hyper) and the application layer — ensuring defense in depth.
+Ferrum Edge enforces configurable size limits on request headers, request bodies, and response bodies to protect against memory exhaustion (OOM) attacks, oversized payloads, and misbehaving backends. Limits are enforced at multiple layers — the protocol layer (hyper) and the application layer — ensuring defense in depth.
 
 ## Environment Variables
 

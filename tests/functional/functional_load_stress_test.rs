@@ -26,7 +26,7 @@
 //!              falls back to SQLite otherwise.
 //!
 //! Run with:
-//!   cargo build --release --bin ferrum-gateway
+//!   cargo build --release --bin ferrum-edge
 //!   cargo test --test functional_tests test_load_stress_10k_proxies -- --ignored --nocapture
 
 use chrono::Utc;
@@ -318,7 +318,7 @@ impl LoadTestHarness {
         enable_http2: bool,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let jwt_secret = "load-test-secret-key-98765".to_string();
-        let jwt_issuer = "ferrum-gateway-load-test".to_string();
+        let jwt_issuer = "ferrum-edge-load-test".to_string();
         let basic_auth_hmac_secret = "load-test-hmac-secret-54321".to_string();
 
         let admin_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
@@ -347,17 +347,17 @@ impl LoadTestHarness {
         }
 
         // Prefer release binary for production-realistic numbers
-        let binary_path = if std::path::Path::new("./target/release/ferrum-gateway").exists() {
+        let binary_path = if std::path::Path::new("./target/release/ferrum-edge").exists() {
             println!("Using release binary");
-            "./target/release/ferrum-gateway"
-        } else if std::path::Path::new("./target/debug/ferrum-gateway").exists() {
+            "./target/release/ferrum-edge"
+        } else if std::path::Path::new("./target/debug/ferrum-edge").exists() {
             println!(
-                "WARNING: Using debug binary — run `cargo build --release --bin ferrum-gateway` for accurate perf numbers"
+                "WARNING: Using debug binary — run `cargo build --release --bin ferrum-edge` for accurate perf numbers"
             );
-            "./target/debug/ferrum-gateway"
+            "./target/debug/ferrum-edge"
         } else {
             return Err(
-                "ferrum-gateway binary not found. Run `cargo build --release --bin ferrum-gateway` first."
+                "ferrum-edge binary not found. Run `cargo build --release --bin ferrum-edge` first."
                     .into(),
             );
         };
@@ -2389,11 +2389,11 @@ async fn test_load_stress_10k_proxies() {
     // Build release binary if not already built
     println!("Building release binary...");
     let build_status = Command::new("cargo")
-        .args(["build", "--release", "--bin", "ferrum-gateway"])
+        .args(["build", "--release", "--bin", "ferrum-edge"])
         .status()
         .expect("Failed to run cargo build");
     if !build_status.success() {
-        panic!("Failed to build ferrum-gateway in release mode");
+        panic!("Failed to build ferrum-edge in release mode");
     }
     println!("Release binary ready.\n");
 

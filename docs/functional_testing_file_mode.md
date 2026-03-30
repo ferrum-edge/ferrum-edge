@@ -1,10 +1,10 @@
 # Functional Testing for File Mode
 
-This document describes the functional testing strategy for Ferrum Gateway when running in file mode (`FERRUM_MODE=file`).
+This document describes the functional testing strategy for Ferrum Edge when running in file mode (`FERRUM_MODE=file`).
 
 ## Overview
 
-File mode allows Ferrum Gateway to load and manage configurations from static YAML/JSON files rather than a database. The functional tests verify that the gateway correctly:
+File mode allows Ferrum Edge to load and manage configurations from static YAML/JSON files rather than a database. The functional tests verify that the gateway correctly:
 
 1. Loads configuration files
 2. Routes requests to configured backends
@@ -220,7 +220,7 @@ FERRUM_FILE_CONFIG_PATH=/path/to/config.yaml
 FERRUM_MODE=file
 
 # Optional: Logging level (default: error)
-RUST_LOG=ferrum_gateway=debug
+RUST_LOG=ferrum_edge=debug
 
 # Optional: Proxy ports (defaults: 8000 for HTTP, 8443 for HTTPS)
 FERRUM_PROXY_HTTP_PORT=8000
@@ -270,7 +270,7 @@ Common issues:
 
 1. **Port Already in Use**: Kill existing gateway processes
    ```bash
-   pkill -f ferrum-gateway
+   pkill -f ferrum-edge
    ```
 
 2. **Build Failures**: Clean and rebuild
@@ -286,7 +286,7 @@ Common issues:
 
 4. **Permission Denied**: Ensure executable permissions on the binary
    ```bash
-   chmod +x target/release/ferrum-gateway
+   chmod +x target/release/ferrum-edge
    ```
 
 ## Adding New Tests

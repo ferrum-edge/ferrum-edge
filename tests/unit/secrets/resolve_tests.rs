@@ -3,7 +3,7 @@
 //! These tests mutate process-global environment variables, so they MUST run
 //! serially. We use the same ENV_LOCK pattern as env_config_tests.
 
-use ferrum_gateway::secrets::resolve_secret;
+use ferrum_edge::secrets::resolve_secret;
 use std::io::Write;
 use std::sync::Mutex;
 use tempfile::NamedTempFile;

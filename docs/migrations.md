@@ -1,10 +1,10 @@
-# Ferrum Gateway Migration & Upgrade Guide
+# Ferrum Edge Migration & Upgrade Guide
 
-This document explains how Ferrum Gateway handles upgrades between versions, including database schema migrations and configuration file migrations.
+This document explains how Ferrum Edge handles upgrades between versions, including database schema migrations and configuration file migrations.
 
 ## Overview
 
-Ferrum Gateway uses a versioned migration system that:
+Ferrum Edge uses a versioned migration system that:
 
 - **Tracks applied database migrations** in a `_ferrum_migrations` table
 - **Versions configuration files** with a `version` field
@@ -15,7 +15,7 @@ Ferrum Gateway uses a versioned migration system that:
 
 ### How It Works
 
-When Ferrum Gateway starts in `database`, `cp`, or `migrate` mode, it runs the **MigrationRunner** which:
+When Ferrum Edge starts in `database`, `cp`, or `migrate` mode, it runs the **MigrationRunner** which:
 
 1. Creates the `_ferrum_migrations` tracking table if it doesn't exist
 2. Detects pre-migration databases (databases created before the migration system was added) and bootstraps them by marking the initial schema as "already applied"
@@ -37,7 +37,7 @@ CREATE TABLE _ferrum_migrations (
 
 ### Upgrading from Pre-Migration Versions
 
-If you're upgrading from a version of Ferrum Gateway that predates the migration system (any version before this feature was added), the process is automatic:
+If you're upgrading from a version of Ferrum Edge that predates the migration system (any version before this feature was added), the process is automatic:
 
 1. The MigrationRunner detects that the `proxies` table exists but `_ferrum_migrations` does not contain any records
 2. It marks the V1 (initial_schema) migration as already applied
@@ -104,7 +104,7 @@ FERRUM_MODE=migrate \
   FERRUM_MIGRATE_ACTION=up \
   FERRUM_DB_TYPE=sqlite \
   FERRUM_DB_URL=sqlite://ferrum.db \
-  ferrum-gateway
+  ferrum-edge
 ```
 
 ### Check Migration Status
@@ -114,12 +114,12 @@ FERRUM_MODE=migrate \
   FERRUM_MIGRATE_ACTION=status \
   FERRUM_DB_TYPE=sqlite \
   FERRUM_DB_URL=sqlite://ferrum.db \
-  ferrum-gateway
+  ferrum-edge
 ```
 
 Example output:
 ```
-=== Ferrum Gateway Migration Status ===
+=== Ferrum Edge Migration Status ===
 
 Applied migrations:
   V1: initial_schema (applied: 2025-01-15T10:30:00Z, checksum: v001_initial_schema_a1b2c3d4)
@@ -133,7 +133,7 @@ Pending migrations: (none — schema is up to date)
 FERRUM_MODE=migrate \
   FERRUM_MIGRATE_ACTION=config \
   FERRUM_FILE_CONFIG_PATH=./config.yaml \
-  ferrum-gateway
+  ferrum-edge
 ```
 
 ### Dry Run
@@ -146,7 +146,7 @@ FERRUM_MODE=migrate \
   FERRUM_MIGRATE_DRY_RUN=true \
   FERRUM_DB_TYPE=sqlite \
   FERRUM_DB_URL=sqlite://ferrum.db \
-  ferrum-gateway
+  ferrum-edge
 ```
 
 ## Environment Variables Reference

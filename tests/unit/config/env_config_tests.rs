@@ -3,7 +3,7 @@
 //! These tests mutate process-global environment variables, so they MUST run serially.
 //! We use `serial_test` via a simple mutex to enforce this.
 
-use ferrum_gateway::config::{EnvConfig, OperatingMode};
+use ferrum_edge::config::{EnvConfig, OperatingMode};
 use std::sync::Mutex;
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());

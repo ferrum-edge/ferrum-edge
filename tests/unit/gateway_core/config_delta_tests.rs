@@ -1,8 +1,8 @@
 //! Tests for config delta module
 
 use chrono::{DateTime, Utc};
-use ferrum_gateway::config::types::*;
-use ferrum_gateway::config_delta::ConfigDelta;
+use ferrum_edge::config::types::*;
+use ferrum_edge::config_delta::ConfigDelta;
 use std::collections::HashMap;
 
 fn make_proxy(id: &str, listen_path: &str, updated_at: DateTime<Utc>) -> Proxy {

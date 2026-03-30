@@ -1,4 +1,4 @@
-use ferrum_gateway::plugins::body_transform::{
+use ferrum_edge::plugins::body_transform::{
     get_nested_value, is_json_content_type, remove_nested_value, rename_nested_field,
     set_nested_value,
 };

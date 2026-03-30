@@ -1,4 +1,4 @@
-//! Ferrum Gateway - A high-performance API Gateway and Reverse Proxy built in Rust
+//! Ferrum Edge - A high-performance edge proxy built in Rust
 
 pub mod admin;
 pub mod circuit_breaker;

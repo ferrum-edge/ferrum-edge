@@ -11,7 +11,7 @@
 //! 8. Full DTLS: frontend DTLS + backend DTLS (DTLS client → gateway → DTLS echo server)
 //!
 //! All tests are marked `#[ignore]` — run with:
-//!   cargo build --bin ferrum-gateway && cargo test --test functional_tests -- functional_udp_proxy --ignored --nocapture
+//!   cargo build --bin ferrum-edge && cargo test --test functional_tests -- functional_udp_proxy --ignored --nocapture
 
 use std::io::Write;
 use std::sync::Arc;
@@ -45,10 +45,10 @@ async fn start_udp_echo_server(port: u16) -> tokio::task::JoinHandle<()> {
 // ============================================================================
 
 fn gateway_binary_path() -> &'static str {
-    if std::path::Path::new("./target/debug/ferrum-gateway").exists() {
-        "./target/debug/ferrum-gateway"
+    if std::path::Path::new("./target/debug/ferrum-edge").exists() {
+        "./target/debug/ferrum-edge"
     } else {
-        "./target/release/ferrum-gateway"
+        "./target/release/ferrum-edge"
     }
 }
 
@@ -77,7 +77,7 @@ fn start_gateway_with_dtls(
         .env("FERRUM_FILE_CONFIG_PATH", config_path)
         .env("FERRUM_PROXY_HTTP_PORT", http_port.to_string())
         .env("FERRUM_ADMIN_HTTP_PORT", admin_port.to_string())
-        .env("RUST_LOG", "ferrum_gateway=debug")
+        .env("RUST_LOG", "ferrum_edge=debug")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());

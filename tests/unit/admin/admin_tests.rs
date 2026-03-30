@@ -1,9 +1,9 @@
 //! Admin API Tests
 //!
-//! Tests for the Ferrum Gateway Admin API including JWT authentication
+//! Tests for the Ferrum Edge Admin API including JWT authentication
 
 use chrono::Utc;
-use ferrum_gateway::admin::{
+use ferrum_edge::admin::{
     AdminState,
     jwt_auth::{JwtConfig, JwtManager},
 };
@@ -25,7 +25,7 @@ impl Default for TestConfig {
     fn default() -> Self {
         Self {
             jwt_secret: "test-secret-key-for-admin-api".to_string(),
-            jwt_issuer: "test-ferrum-gateway".to_string(),
+            jwt_issuer: "test-ferrum-edge".to_string(),
             max_ttl: 3600,
             admin_addr: "127.0.0.1:0".parse().unwrap(),
         }

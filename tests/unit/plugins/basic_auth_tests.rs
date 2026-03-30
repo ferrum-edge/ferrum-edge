@@ -1,7 +1,7 @@
 //! Tests for basic_auth plugin
 
-use ferrum_gateway::ConsumerIndex;
-use ferrum_gateway::plugins::{Plugin, RequestContext, basic_auth::BasicAuth};
+use ferrum_edge::ConsumerIndex;
+use ferrum_edge::plugins::{Plugin, RequestContext, basic_auth::BasicAuth};
 use serde_json::json;
 
 use super::plugin_utils::{assert_continue, assert_reject};
@@ -21,7 +21,7 @@ fn basic_header(user: &str, pass: &str) -> String {
 }
 
 /// Create a consumer with a known password bcrypt hash.
-fn create_basic_auth_consumer() -> ferrum_gateway::config::types::Consumer {
+fn create_basic_auth_consumer() -> ferrum_edge::config::types::Consumer {
     use chrono::Utc;
     use serde_json::{Map, Value};
     use std::collections::HashMap;
@@ -33,7 +33,7 @@ fn create_basic_auth_consumer() -> ferrum_gateway::config::types::Consumer {
     basicauth_creds.insert("password_hash".to_string(), Value::String(hash));
     credentials.insert("basicauth".to_string(), Value::Object(basicauth_creds));
 
-    ferrum_gateway::config::types::Consumer {
+    ferrum_edge::config::types::Consumer {
         id: "basic-consumer".to_string(),
         username: "testuser".to_string(),
         custom_id: None,
@@ -228,7 +228,7 @@ async fn test_basic_auth_bcrypt_fallback() {
     basicauth_creds.insert("password_hash".to_string(), Value::String(hash));
     credentials.insert("basicauth".to_string(), Value::Object(basicauth_creds));
 
-    let consumer = ferrum_gateway::config::types::Consumer {
+    let consumer = ferrum_edge::config::types::Consumer {
         id: "bcrypt-consumer".to_string(),
         username: "bcryptuser".to_string(),
         custom_id: None,

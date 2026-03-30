@@ -1,5 +1,5 @@
-use ferrum_gateway::plugins::ip_restriction::IpRestriction;
-use ferrum_gateway::plugins::{Plugin, RequestContext};
+use ferrum_edge::plugins::ip_restriction::IpRestriction;
+use ferrum_edge::plugins::{Plugin, RequestContext};
 use serde_json::json;
 
 use super::plugin_utils;
@@ -334,7 +334,7 @@ async fn rejected_ip_returns_403_with_not_allowed_message() {
     let mut ctx = create_context_with_ip("192.168.1.1");
     let result = plugin.on_request_received(&mut ctx).await;
     match result {
-        ferrum_gateway::plugins::PluginResult::Reject {
+        ferrum_edge::plugins::PluginResult::Reject {
             status_code, body, ..
         } => {
             assert_eq!(status_code, 403);
@@ -354,7 +354,7 @@ async fn denied_ip_returns_403_with_denied_message() {
     let mut ctx = create_context_with_ip("192.168.1.1");
     let result = plugin.on_request_received(&mut ctx).await;
     match result {
-        ferrum_gateway::plugins::PluginResult::Reject {
+        ferrum_edge::plugins::PluginResult::Reject {
             status_code, body, ..
         } => {
             assert_eq!(status_code, 403);

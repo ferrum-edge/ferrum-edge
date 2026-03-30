@@ -7,9 +7,9 @@ use tracing::{info, error};
 async fn main() -> Result<(), Box<dyn Error>> {
     tracing_subscriber::fmt::init();
     
-    // Connect to Ferrum Gateway WebSocket proxy
+    // Connect to Ferrum Edge WebSocket proxy
     let gateway_url = "ws://localhost:8000/ws-echo";
-    info!("🚀 Connecting to Ferrum Gateway WebSocket proxy: {}", gateway_url);
+    info!("🚀 Connecting to Ferrum Edge WebSocket proxy: {}", gateway_url);
     
     let (ws_stream, response) = connect_async(gateway_url).await?;
     info!("✅ Connected to gateway! Response status: {}", response.status());
@@ -37,7 +37,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             info!("🎯 Message flow confirmed: Client → Gateway → Backend → Gateway → Client");
             
             if text.contains("Hello from client!") {
-                info!("🎉 PERFECT! Complete bidirectional WebSocket communication through Ferrum Gateway!");
+                info!("🎉 PERFECT! Complete bidirectional WebSocket communication through Ferrum Edge!");
             } else {
                 info!("⚠️  Unexpected response: '{}'", text);
             }

@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Performance testing script for Ferrum Gateway
+# Performance testing script for Ferrum Edge
 # This script runs backend server, gateway, and load tests
 
 set -e
@@ -22,7 +22,7 @@ WRK_DURATION=${WRK_DURATION:-30s}
 WRK_THREADS=${WRK_THREADS:-8}
 WRK_CONNECTIONS=${WRK_CONNECTIONS:-100}
 
-echo -e "${BLUE}Starting Ferrum Gateway Performance Test${NC}"
+echo -e "${BLUE}Starting Ferrum Edge Performance Test${NC}"
 echo "=================================================="
 
 # Kill any existing processes on test ports to prevent conflicts
@@ -60,7 +60,7 @@ binary_is_fresh() {
 
 # Build the project (skips if binaries are newer than source)
 build_project() {
-    local gateway_bin="$PROJECT_ROOT/target/release/ferrum-gateway"
+    local gateway_bin="$PROJECT_ROOT/target/release/ferrum-edge"
     local backend_bin="$PERF_DIR/target/release/backend_server"
     local need_gateway=true
     local need_backend=true
@@ -80,9 +80,9 @@ build_project() {
     echo -e "${YELLOW}Building project...${NC}"
     if $need_gateway; then
         cd "$PROJECT_ROOT"
-        cargo build --release --bin ferrum-gateway
+        cargo build --release --bin ferrum-edge
     else
-        echo -e "  ${GREEN}ferrum-gateway binary is fresh${NC}"
+        echo -e "  ${GREEN}ferrum-edge binary is fresh${NC}"
     fi
     if $need_backend; then
         cd "$PERF_DIR"
@@ -128,7 +128,7 @@ start_gateway() {
     FERRUM_POOL_IDLE_TIMEOUT_SECONDS=120 \
     FERRUM_POOL_ENABLE_HTTP_KEEP_ALIVE=true \
     FERRUM_POOL_ENABLE_HTTP2=false \
-    ./target/release/ferrum-gateway > "$PERF_DIR/gateway.log" 2>&1 &
+    ./target/release/ferrum-edge > "$PERF_DIR/gateway.log" 2>&1 &
     GATEWAY_PID=$!
 
     # Wait for gateway to start with retry — verify it's actually our process

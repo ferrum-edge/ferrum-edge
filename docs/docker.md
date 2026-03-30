@@ -1,6 +1,6 @@
 # Docker Deployment Guide
 
-This guide covers building and running Ferrum Gateway using Docker and Docker Compose.
+This guide covers building and running Ferrum Edge using Docker and Docker Compose.
 
 ## Table of Contents
 
@@ -21,13 +21,13 @@ This guide covers building and running Ferrum Gateway using Docker and Docker Co
 
 ```bash
 # Build the image
-docker build -t ferrum-gateway:latest .
+docker build -t ferrum-edge:latest .
 
 # Build with specific tag
-docker build -t ferrum-gateway:v0.1.0 .
+docker build -t ferrum-edge:v0.1.0 .
 
 # Build with custom name and registry
-docker build -t myregistry.azurecr.io/ferrum-gateway:latest .
+docker build -t myregistry.azurecr.io/ferrum-edge:latest .
 ```
 
 ### Image Details
@@ -53,7 +53,7 @@ Single-node database mode with SQLite:
 
 ```bash
 docker run -d \
-  --name ferrum-gateway \
+  --name ferrum-edge \
   -p 8000:8000 \
   -p 8443:8443 \
   -p 9000:9000 \
@@ -63,7 +63,7 @@ docker run -d \
   -e FERRUM_DB_URL="sqlite:////data/ferrum.db?mode=rwc" \
   -e FERRUM_ADMIN_JWT_SECRET="your-secret-key" \
   -v ferrum_data:/data \
-  ferrum-gateway:latest
+  ferrum-edge:latest
 ```
 
 ### Port Mappings
@@ -85,7 +85,7 @@ For persistent data, mount a volume:
 docker volume create ferrum_data
 
 # Mount volume in container
-docker run -v ferrum_data:/data ferrum-gateway:latest
+docker run -v ferrum_data:/data ferrum-edge:latest
 ```
 
 ### Health Check
@@ -98,12 +98,12 @@ docker ps
 # Shows health status (healthy/starting/unhealthy)
 
 # Test manually
-docker exec ferrum-gateway curl -f http://localhost:9000/health
+docker exec ferrum-edge curl -f http://localhost:9000/health
 ```
 
 ## Running with Docker Compose
 
-Ferrum Gateway includes a comprehensive `docker-compose.yml` with multiple deployment configurations.
+Ferrum Edge includes a comprehensive `docker-compose.yml` with multiple deployment configurations.
 
 ### 1. SQLite Single-Node (Development/Testing)
 
@@ -130,13 +130,13 @@ Production-grade setup with managed PostgreSQL:
 export POSTGRES_PASSWORD="secure-password"
 export FERRUM_ADMIN_JWT_SECRET="jwt-secret-key"
 
-# Start PostgreSQL + Ferrum Gateway
+# Start PostgreSQL + Ferrum Edge
 docker-compose --profile postgres up ferrum-postgres
 ```
 
 **Services Started**:
 - `postgres` - PostgreSQL 16 database
-- `ferrum-postgres` - Ferrum Gateway instance
+- `ferrum-postgres` - Ferrum Edge instance
 
 **Environment**:
 - HTTP: http://localhost:8001
@@ -208,7 +208,7 @@ docker-compose --profile cp-dp up
 
 ## Configuration via Environment Variables
 
-All Ferrum Gateway configuration uses environment variables. See the main [README.md](../README.md) for the complete environment variable reference.
+All Ferrum Edge configuration uses environment variables. See the main [README.md](../README.md) for the complete environment variable reference.
 
 ### Essential Variables
 
@@ -248,7 +248,7 @@ FERRUM_DP_GRPC_AUTH_TOKEN=jwt-token
 
 **Via `-e` flag**:
 ```bash
-docker run -e FERRUM_LOG_LEVEL=debug ferrum-gateway:latest
+docker run -e FERRUM_LOG_LEVEL=debug ferrum-edge:latest
 ```
 
 **Via `.env` file** (docker-compose):
@@ -282,7 +282,7 @@ openssl rand -base64 32  # gRPC secret
 **Use Docker Secrets** (Swarm/Kubernetes):
 ```yaml
 services:
-  ferrum-gateway:
+  ferrum-edge:
     secrets:
       - admin_jwt_secret
 secrets:
@@ -296,7 +296,7 @@ docker run \
   -e FERRUM_PROXY_TLS_CERT_PATH=/etc/ferrum/cert.pem \
   -e FERRUM_PROXY_TLS_KEY_PATH=/etc/ferrum/key.pem \
   -v /etc/ferrum:/etc/ferrum:ro \
-  ferrum-gateway:latest
+  ferrum-edge:latest
 ```
 
 ### 2. Persistent Data
@@ -323,14 +323,14 @@ FERRUM_DB_URL=postgres://user:pass@rds-endpoint.amazonaws.com/ferrum
 **Structured JSON Logs**:
 ```bash
 # Enable JSON logging
-docker run -e FERRUM_LOG_LEVEL=info ferrum-gateway:latest
+docker run -e FERRUM_LOG_LEVEL=info ferrum-edge:latest
 
 # Ship logs to aggregator
 docker run \
   --log-driver json-file \
   --log-opt max-size=10m \
   --log-opt max-file=10 \
-  ferrum-gateway:latest
+  ferrum-edge:latest
 ```
 
 **Prometheus Metrics**:
@@ -358,13 +358,13 @@ docker run \
   --cpus="2" \
   --memory="2g" \
   --memory-swap="2g" \
-  ferrum-gateway:latest
+  ferrum-edge:latest
 ```
 
 **In docker-compose.yml**:
 ```yaml
 services:
-  ferrum-gateway:
+  ferrum-edge:
     deploy:
       resources:
         limits:
@@ -413,7 +413,7 @@ Docker sends SIGTERM to graceful shutdown:
 
 ```bash
 # Container will drain active requests before stopping
-docker stop --time=30 ferrum-gateway
+docker stop --time=30 ferrum-edge
 ```
 
 **In orchestration** (Kubernetes):
@@ -432,18 +432,18 @@ lifecycle:
 docker-compose pull
 
 # Restart with new image (one at a time)
-docker-compose up -d --no-deps --build ferrum-gateway
+docker-compose up -d --no-deps --build ferrum-edge
 ```
 
 **Blue-Green Deployment**:
 ```bash
 # Keep old and new versions running
-docker-compose up -d ferrum-gateway-v1
-docker-compose up -d ferrum-gateway-v2
+docker-compose up -d ferrum-edge-v1
+docker-compose up -d ferrum-edge-v2
 
 # Switch load balancer when ready
 # Remove old version
-docker-compose rm ferrum-gateway-v1
+docker-compose rm ferrum-edge-v1
 ```
 
 ### 8. Backup and Recovery
@@ -474,7 +474,7 @@ docker-compose up -d ferrum-postgres
 docker-compose up -d
 
 # View logs
-docker-compose logs -f ferrum-gateway
+docker-compose logs -f ferrum-edge
 
 # Stop services
 docker-compose down
@@ -483,13 +483,13 @@ docker-compose down
 docker-compose down -v
 
 # Restart a service
-docker-compose restart ferrum-gateway
+docker-compose restart ferrum-edge
 
 # Scale service (for DP mode)
 docker-compose up -d --scale ferrum-dp=5
 
 # Execute command in container
-docker-compose exec ferrum-gateway curl http://localhost:9000/health
+docker-compose exec ferrum-edge curl http://localhost:9000/health
 
 # View resource usage
 docker stats
@@ -501,7 +501,7 @@ docker stats
 
 **Check logs**:
 ```bash
-docker logs ferrum-gateway
+docker logs ferrum-edge
 ```
 
 **Common Issues**:
@@ -515,17 +515,17 @@ The container runs as non-root user (UID 1000). Ensure volume permissions:
 
 ```bash
 # Fix volume permissions
-docker exec ferrum-gateway chown -R 1000:1000 /data
+docker exec ferrum-edge chown -R 1000:1000 /data
 ```
 
 ### Health Check Failing
 
 ```bash
 # Debug health endpoint
-docker exec ferrum-gateway curl -v http://localhost:9000/health
+docker exec ferrum-edge curl -v http://localhost:9000/health
 
 # Check Admin API JWT
-docker exec ferrum-gateway curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/health
+docker exec ferrum-edge curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/health
 ```
 
 ## See Also

@@ -1,7 +1,7 @@
-use ferrum_gateway::config::types::Consumer;
-use ferrum_gateway::consumer_index::ConsumerIndex;
-use ferrum_gateway::plugins::mtls_auth::MtlsAuth;
-use ferrum_gateway::plugins::{Plugin, RequestContext};
+use ferrum_edge::config::types::Consumer;
+use ferrum_edge::consumer_index::ConsumerIndex;
+use ferrum_edge::plugins::mtls_auth::MtlsAuth;
+use ferrum_edge::plugins::{Plugin, RequestContext};
 use serde_json::{Map, Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -592,21 +592,18 @@ fn test_mtls_auth_name() {
 #[test]
 fn test_mtls_auth_priority() {
     let plugin = MtlsAuth::new(&json!({}));
-    assert_eq!(
-        plugin.priority(),
-        ferrum_gateway::plugins::priority::MTLS_AUTH
-    );
+    assert_eq!(plugin.priority(), ferrum_edge::plugins::priority::MTLS_AUTH);
 }
 
 #[test]
 fn test_mtls_auth_supported_protocols() {
     let plugin = MtlsAuth::new(&json!({}));
     let protocols = plugin.supported_protocols();
-    assert!(protocols.contains(&ferrum_gateway::plugins::ProxyProtocol::Http));
-    assert!(protocols.contains(&ferrum_gateway::plugins::ProxyProtocol::Grpc));
-    assert!(protocols.contains(&ferrum_gateway::plugins::ProxyProtocol::WebSocket));
+    assert!(protocols.contains(&ferrum_edge::plugins::ProxyProtocol::Http));
+    assert!(protocols.contains(&ferrum_edge::plugins::ProxyProtocol::Grpc));
+    assert!(protocols.contains(&ferrum_edge::plugins::ProxyProtocol::WebSocket));
     // Should NOT support raw UDP
-    assert!(!protocols.contains(&ferrum_gateway::plugins::ProxyProtocol::Udp));
+    assert!(!protocols.contains(&ferrum_edge::plugins::ProxyProtocol::Udp));
 }
 
 #[test]

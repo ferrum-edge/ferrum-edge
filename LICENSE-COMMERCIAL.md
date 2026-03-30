@@ -1,25 +1,25 @@
 # Commercial License
 
-Copyright (c) 2026 Ferrum Gateway
+Copyright (c) 2026 Ferrum Edge
 
 The software in this repository is licensed under the PolyForm Noncommercial
 License 1.0.0 for noncommercial use. See the [LICENSE](LICENSE) file for details.
 
 ## Commercial Use
 
-If you wish to use Ferrum Gateway for commercial purposes, you must obtain a
+If you wish to use Ferrum Edge for commercial purposes, you must obtain a
 separate commercial license.
 
 Commercial use includes, but is not limited to:
 
-- Using Ferrum Gateway as part of a paid product or service
-- Using Ferrum Gateway in a for-profit company's infrastructure
-- Offering Ferrum Gateway as a managed or hosted service
-- Bundling or distributing Ferrum Gateway with commercial software
+- Using Ferrum Edge as part of a paid product or service
+- Using Ferrum Edge in a for-profit company's infrastructure
+- Offering Ferrum Edge as a managed or hosted service
+- Bundling or distributing Ferrum Edge with commercial software
 
 ## Obtaining a Commercial License
 
-For commercial licensing inquiries, please contact the Ferrum Gateway team.
+For commercial licensing inquiries, please contact the Ferrum Edge team.
 
 ## Dual Licensing Summary
 
