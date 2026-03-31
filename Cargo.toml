@@ -52,7 +52,7 @@ tonic-prost = "0.14.5"
 prost = "0.14.3"
 
 # JWT and auth
-jsonwebtoken = "9"
+jsonwebtoken = { version = "10", features = ["rust_crypto"] }
 bcrypt = "0.19"
 argon2 = "0.5"
 
