@@ -221,7 +221,7 @@ fn check_cp_version_compatibility(cp_version: &str) -> Result<(), String> {
         return Err(format!(
             "Version mismatch: DP is v{} but CP is v{}. \
              Major and minor versions must match. \
-             Align both to the same major.minor version before connecting.",
+             Upgrade the CP first, then upgrade DPs to the same major.minor version.",
             FERRUM_VERSION, cp_version
         ));
     }
