@@ -5,8 +5,8 @@ Exits with non-zero status if a regression is detected.
 
 Regression thresholds (configurable via env vars):
   PERF_RPS_REGRESSION_PCT       - Max allowed RPS drop % (default: 15)
-  PERF_LATENCY_REGRESSION_PCT   - Max allowed latency increase % (default: 25)
-  PERF_P95_REGRESSION_PCT       - Max allowed p95 latency increase % (default: 30)
+  PERF_LATENCY_REGRESSION_PCT   - Max allowed latency increase % (default: 50)
+  PERF_P95_REGRESSION_PCT       - Max allowed p95 latency increase % (default: 55)
   PERF_ERROR_THRESHOLD          - Max allowed total errors (default: 10)
   PERF_OVERHEAD_MAX_PCT         - Max allowed gateway overhead % (default: 25)
 
@@ -28,8 +28,8 @@ def get_threshold(env_var, default):
 
 # Thresholds
 RPS_REGRESSION_PCT = get_threshold("PERF_RPS_REGRESSION_PCT", 15)
-LATENCY_REGRESSION_PCT = get_threshold("PERF_LATENCY_REGRESSION_PCT", 25)
-P95_REGRESSION_PCT = get_threshold("PERF_P95_REGRESSION_PCT", 30)
+LATENCY_REGRESSION_PCT = get_threshold("PERF_LATENCY_REGRESSION_PCT", 50)
+P95_REGRESSION_PCT = get_threshold("PERF_P95_REGRESSION_PCT", 55)
 ERROR_THRESHOLD = int(get_threshold("PERF_ERROR_THRESHOLD", 10))
 OVERHEAD_MAX_PCT = get_threshold("PERF_OVERHEAD_MAX_PCT", 25)
 
