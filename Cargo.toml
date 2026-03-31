@@ -103,6 +103,9 @@ azure_security_keyvault_secrets = { version = "0.12", optional = true }
 azure_identity = { version = "0.33", optional = true }
 azure_core = { version = "0.33", optional = true }
 
+# Redis (optional — centralized rate limiting across multiple gateway instances)
+redis = { version = "1", features = ["tokio-rustls-comp", "tls-rustls-insecure", "connection-manager"] }
+
 # DTLS (secure UDP)
 webrtc-dtls = { package = "dtls", version = "0.17.1", features = ["pem"] }
 webrtc-util = { version = "0.17.1", default-features = false, features = ["conn"] }

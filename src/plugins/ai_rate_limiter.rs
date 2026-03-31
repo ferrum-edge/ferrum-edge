@@ -10,6 +10,12 @@
 //!
 //! Supports OpenAI, Anthropic, Google Gemini, Cohere, Mistral, and AWS Bedrock
 //! response formats with auto-detection.
+//!
+//! # Centralized mode (`sync_mode: "redis"`)
+//!
+//! When configured with Redis, token budgets are shared across all gateway
+//! instances. This prevents consumers from exceeding limits by spreading
+//! requests across multiple data planes.
 
 use async_trait::async_trait;
 use dashmap::DashMap;
@@ -19,7 +25,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, warn};
 
-use super::{Plugin, PluginResult, RequestContext};
+use super::{Plugin, PluginHttpClient, PluginResult, RequestContext};
+
+use super::utils::redis_rate_limiter::{RedisConfig, RedisRateLimitClient};
 
 /// A sliding window that tracks token consumption over time.
 #[derive(Debug)]
@@ -82,10 +90,11 @@ pub struct AiRateLimiter {
     expose_headers: bool,
     provider: String,
     state: Arc<DashMap<String, TokenWindow>>,
+    redis_client: Option<Arc<RedisRateLimitClient>>,
 }
 
 impl AiRateLimiter {
-    pub fn new(config: &Value) -> Self {
+    pub fn new(config: &Value, http_client: PluginHttpClient) -> Self {
         let token_limit = config["token_limit"].as_u64().unwrap_or_else(|| {
             tracing::warn!("ai_rate_limiter: 'token_limit' not configured, defaulting to 100000");
             100_000
@@ -102,6 +111,24 @@ impl AiRateLimiter {
         let expose_headers = config["expose_headers"].as_bool().unwrap_or(false);
         let provider = config["provider"].as_str().unwrap_or("auto").to_string();
 
+        let dns_cache = http_client.dns_cache().cloned();
+        let tls_no_verify = http_client.tls_no_verify();
+        let tls_ca_bundle_path = http_client.tls_ca_bundle_path().map(|s| s.to_string());
+        let redis_client =
+            RedisConfig::from_plugin_config(config, "ferrum:ai_rate_limiter").map(|cfg| {
+                tracing::info!(
+                    redis_url = %cfg.url,
+                    key_prefix = %cfg.key_prefix,
+                    "ai_rate_limiter: centralized Redis mode enabled"
+                );
+                Arc::new(RedisRateLimitClient::new(
+                    cfg,
+                    dns_cache,
+                    tls_no_verify,
+                    tls_ca_bundle_path.as_deref(),
+                ))
+            });
+
         Self {
             token_limit,
             window_seconds,
@@ -110,6 +137,7 @@ impl AiRateLimiter {
             expose_headers,
             provider,
             state: Arc::new(DashMap::new()),
+            redis_client,
         }
     }
 
@@ -134,6 +162,58 @@ impl AiRateLimiter {
         let now = Instant::now();
         self.state
             .retain(|_, window| window.has_recent_activity(now));
+    }
+
+    /// Check token budget against Redis. Returns `None` if Redis is unavailable.
+    async fn check_budget_redis(&self, key: &str) -> Option<(u64, bool)> {
+        let redis = self.redis_client.as_ref()?;
+        if !redis.is_available() {
+            return None;
+        }
+
+        let window_secs = self.window_seconds.max(1);
+        let curr_idx = RedisRateLimitClient::window_index(window_secs);
+        let prev_idx = curr_idx.saturating_sub(1);
+        let elapsed_fraction = RedisRateLimitClient::elapsed_fraction(window_secs);
+
+        let curr_key = redis.make_key(&[key, &curr_idx.to_string()]);
+        let prev_key = redis.make_key(&[key, &prev_idx.to_string()]);
+
+        // GET both current and previous window totals
+        let prev_count = match redis.get_counter(&prev_key).await {
+            Ok(v) => v,
+            Err(()) => return None,
+        };
+        let curr_count = match redis.get_counter(&curr_key).await {
+            Ok(v) => v,
+            Err(()) => return None,
+        };
+
+        let weighted = prev_count as f64 * (1.0 - elapsed_fraction) + curr_count as f64;
+        let current_usage = weighted as u64;
+        let exceeded = current_usage >= self.token_limit;
+
+        Some((current_usage, exceeded))
+    }
+
+    /// Record token usage in Redis. Returns `false` if Redis is unavailable.
+    async fn record_usage_redis(&self, key: &str, tokens: u64) -> bool {
+        let redis = match self.redis_client.as_ref() {
+            Some(r) if r.is_available() => r,
+            _ => return false,
+        };
+
+        let window_secs = self.window_seconds.max(1);
+        let curr_idx = RedisRateLimitClient::window_index(window_secs);
+        let redis_key = redis.make_key(&[key, &curr_idx.to_string()]);
+
+        // TTL: 2x window so previous window data is available for weighted calc
+        let ttl = window_secs * 2 + 1;
+
+        redis
+            .incrby_with_expire(&redis_key, tokens as i64, ttl)
+            .await
+            .is_ok()
     }
 
     /// Try to read the token count from metadata written by ai_token_metrics.
@@ -312,6 +392,14 @@ impl Plugin for AiRateLimiter {
         self.expose_headers
     }
 
+    fn warmup_hostnames(&self) -> Vec<String> {
+        self.redis_client
+            .as_ref()
+            .and_then(|r| r.warmup_hostname())
+            .into_iter()
+            .collect()
+    }
+
     fn requires_response_body_buffering(&self) -> bool {
         true
     }
@@ -326,6 +414,65 @@ impl Plugin for AiRateLimiter {
         let key = self.rate_key(ctx);
         let window_duration = Duration::from_secs(self.window_seconds.max(1));
 
+        // Try Redis first if configured
+        if self.redis_client.is_some()
+            && let Some((current_usage, exceeded)) = self.check_budget_redis(&key).await
+        {
+            if exceeded {
+                warn!(
+                    rate_limit_key = %key,
+                    current_tokens = current_usage,
+                    limit = self.token_limit,
+                    plugin = "ai_rate_limiter",
+                    "AI token rate limit exceeded (redis)"
+                );
+                let mut headers = HashMap::new();
+                if self.expose_headers {
+                    headers.insert(
+                        "x-ai-ratelimit-limit".to_string(),
+                        self.token_limit.to_string(),
+                    );
+                    headers.insert("x-ai-ratelimit-remaining".to_string(), "0".to_string());
+                    headers.insert(
+                        "x-ai-ratelimit-window".to_string(),
+                        self.window_seconds.to_string(),
+                    );
+                    headers.insert(
+                        "x-ai-ratelimit-usage".to_string(),
+                        current_usage.to_string(),
+                    );
+                }
+                return PluginResult::Reject {
+                    status_code: 429,
+                    body: format!(
+                        r#"{{"error":"AI token rate limit exceeded","details":"Token usage {} exceeds limit {} in window of {} seconds"}}"#,
+                        current_usage, self.token_limit, self.window_seconds
+                    ),
+                    headers,
+                };
+            }
+
+            // Store rate info for header injection
+            if self.expose_headers {
+                let remaining = self.token_limit.saturating_sub(current_usage);
+                ctx.metadata.insert(
+                    "ai_ratelimit_limit".to_string(),
+                    self.token_limit.to_string(),
+                );
+                ctx.metadata
+                    .insert("ai_ratelimit_remaining".to_string(), remaining.to_string());
+                ctx.metadata.insert(
+                    "ai_ratelimit_window".to_string(),
+                    self.window_seconds.to_string(),
+                );
+                ctx.metadata
+                    .insert("ai_ratelimit_usage".to_string(), current_usage.to_string());
+            }
+
+            return PluginResult::Continue;
+        }
+
+        // Local mode
         let mut entry = self
             .state
             .entry(key.clone())
@@ -448,6 +595,13 @@ impl Plugin for AiRateLimiter {
 
         // Record token usage
         let key = self.rate_key(ctx);
+
+        // Try Redis first if configured
+        if self.redis_client.is_some() && self.record_usage_redis(&key, tokens).await {
+            return PluginResult::Continue;
+        }
+
+        // Local mode
         let window_duration = Duration::from_secs(self.window_seconds.max(1));
         let mut entry = self
             .state

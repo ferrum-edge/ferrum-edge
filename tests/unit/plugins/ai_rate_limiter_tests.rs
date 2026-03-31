@@ -1,6 +1,8 @@
 //! Tests for ai_rate_limiter plugin
 
-use ferrum_edge::plugins::{Plugin, PluginResult, ai_rate_limiter::AiRateLimiter};
+use ferrum_edge::plugins::{
+    Plugin, PluginHttpClient, PluginResult, ai_rate_limiter::AiRateLimiter,
+};
 use serde_json::json;
 use std::collections::HashMap;
 
@@ -27,7 +29,7 @@ fn openai_response(prompt: u64, completion: u64) -> Vec<u8> {
 
 #[tokio::test]
 async fn test_plugin_name_and_priority() {
-    let plugin = AiRateLimiter::new(&json!({"token_limit": 1000}));
+    let plugin = AiRateLimiter::new(&json!({"token_limit": 1000}), PluginHttpClient::default());
     assert_eq!(plugin.name(), "ai_rate_limiter");
     assert_eq!(plugin.priority(), 4200);
     assert!(plugin.requires_response_body_buffering());
@@ -37,7 +39,10 @@ async fn test_plugin_name_and_priority() {
 
 #[tokio::test]
 async fn test_first_request_passes() {
-    let plugin = AiRateLimiter::new(&json!({"token_limit": 1000, "window_seconds": 60}));
+    let plugin = AiRateLimiter::new(
+        &json!({"token_limit": 1000, "window_seconds": 60}),
+        PluginHttpClient::default(),
+    );
     let mut ctx = create_test_context();
     let mut headers = HashMap::new();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
@@ -46,11 +51,14 @@ async fn test_first_request_passes() {
 
 #[tokio::test]
 async fn test_token_accumulation_and_limit() {
-    let plugin = AiRateLimiter::new(&json!({
-        "token_limit": 200,
-        "window_seconds": 60,
-        "limit_by": "ip"
-    }));
+    let plugin = AiRateLimiter::new(
+        &json!({
+            "token_limit": 200,
+            "window_seconds": 60,
+            "limit_by": "ip"
+        }),
+        PluginHttpClient::default(),
+    );
 
     // First request passes
     let mut ctx = create_test_context();
@@ -86,11 +94,14 @@ async fn test_token_accumulation_and_limit() {
 
 #[tokio::test]
 async fn test_sliding_window_eviction() {
-    let plugin = AiRateLimiter::new(&json!({
-        "token_limit": 100,
-        "window_seconds": 1,
-        "limit_by": "ip"
-    }));
+    let plugin = AiRateLimiter::new(
+        &json!({
+            "token_limit": 100,
+            "window_seconds": 1,
+            "limit_by": "ip"
+        }),
+        PluginHttpClient::default(),
+    );
 
     // Use up the limit
     let mut ctx = create_test_context();
@@ -124,11 +135,14 @@ async fn test_sliding_window_eviction() {
 
 #[tokio::test]
 async fn test_different_consumers_independent() {
-    let plugin = AiRateLimiter::new(&json!({
-        "token_limit": 100,
-        "window_seconds": 60,
-        "limit_by": "consumer"
-    }));
+    let plugin = AiRateLimiter::new(
+        &json!({
+            "token_limit": 100,
+            "window_seconds": 60,
+            "limit_by": "consumer"
+        }),
+        PluginHttpClient::default(),
+    );
     let resp_headers = json_headers();
 
     // Consumer A uses 150 tokens
@@ -162,12 +176,15 @@ async fn test_different_consumers_independent() {
 
 #[tokio::test]
 async fn test_count_mode_prompt_tokens() {
-    let plugin = AiRateLimiter::new(&json!({
-        "token_limit": 100,
-        "window_seconds": 60,
-        "count_mode": "prompt_tokens",
-        "limit_by": "ip"
-    }));
+    let plugin = AiRateLimiter::new(
+        &json!({
+            "token_limit": 100,
+            "window_seconds": 60,
+            "count_mode": "prompt_tokens",
+            "limit_by": "ip"
+        }),
+        PluginHttpClient::default(),
+    );
     let resp_headers = json_headers();
 
     let mut ctx = create_test_context();
@@ -188,12 +205,15 @@ async fn test_count_mode_prompt_tokens() {
 
 #[tokio::test]
 async fn test_count_mode_completion_tokens() {
-    let plugin = AiRateLimiter::new(&json!({
-        "token_limit": 100,
-        "window_seconds": 60,
-        "count_mode": "completion_tokens",
-        "limit_by": "ip"
-    }));
+    let plugin = AiRateLimiter::new(
+        &json!({
+            "token_limit": 100,
+            "window_seconds": 60,
+            "count_mode": "completion_tokens",
+            "limit_by": "ip"
+        }),
+        PluginHttpClient::default(),
+    );
     let resp_headers = json_headers();
 
     let mut ctx = create_test_context();
@@ -216,11 +236,14 @@ async fn test_count_mode_completion_tokens() {
 
 #[tokio::test]
 async fn test_anthropic_format() {
-    let plugin = AiRateLimiter::new(&json!({
-        "token_limit": 100,
-        "window_seconds": 60,
-        "limit_by": "ip"
-    }));
+    let plugin = AiRateLimiter::new(
+        &json!({
+            "token_limit": 100,
+            "window_seconds": 60,
+            "limit_by": "ip"
+        }),
+        PluginHttpClient::default(),
+    );
     let resp_headers = json_headers();
 
     let mut ctx = create_test_context();
@@ -246,11 +269,14 @@ async fn test_anthropic_format() {
 
 #[tokio::test]
 async fn test_google_format() {
-    let plugin = AiRateLimiter::new(&json!({
-        "token_limit": 100,
-        "window_seconds": 60,
-        "limit_by": "ip"
-    }));
+    let plugin = AiRateLimiter::new(
+        &json!({
+            "token_limit": 100,
+            "window_seconds": 60,
+            "limit_by": "ip"
+        }),
+        PluginHttpClient::default(),
+    );
     let resp_headers = json_headers();
 
     let mut ctx = create_test_context();
@@ -282,11 +308,14 @@ async fn test_google_format() {
 
 #[tokio::test]
 async fn test_non_json_response_not_counted() {
-    let plugin = AiRateLimiter::new(&json!({
-        "token_limit": 100,
-        "window_seconds": 60,
-        "limit_by": "ip"
-    }));
+    let plugin = AiRateLimiter::new(
+        &json!({
+            "token_limit": 100,
+            "window_seconds": 60,
+            "limit_by": "ip"
+        }),
+        PluginHttpClient::default(),
+    );
 
     let mut ctx = create_test_context();
     let mut headers = HashMap::new();
@@ -306,11 +335,14 @@ async fn test_non_json_response_not_counted() {
 
 #[tokio::test]
 async fn test_non_2xx_response_not_counted() {
-    let plugin = AiRateLimiter::new(&json!({
-        "token_limit": 100,
-        "window_seconds": 60,
-        "limit_by": "ip"
-    }));
+    let plugin = AiRateLimiter::new(
+        &json!({
+            "token_limit": 100,
+            "window_seconds": 60,
+            "limit_by": "ip"
+        }),
+        PluginHttpClient::default(),
+    );
     let resp_headers = json_headers();
 
     let mut ctx = create_test_context();
@@ -331,11 +363,14 @@ async fn test_non_2xx_response_not_counted() {
 
 #[tokio::test]
 async fn test_empty_body_not_counted() {
-    let plugin = AiRateLimiter::new(&json!({
-        "token_limit": 100,
-        "window_seconds": 60,
-        "limit_by": "ip"
-    }));
+    let plugin = AiRateLimiter::new(
+        &json!({
+            "token_limit": 100,
+            "window_seconds": 60,
+            "limit_by": "ip"
+        }),
+        PluginHttpClient::default(),
+    );
     let resp_headers = json_headers();
 
     let mut ctx = create_test_context();
@@ -352,11 +387,14 @@ async fn test_empty_body_not_counted() {
 
 #[tokio::test]
 async fn test_zero_tokens_counted_but_no_usage() {
-    let plugin = AiRateLimiter::new(&json!({
-        "token_limit": 100,
-        "window_seconds": 60,
-        "limit_by": "ip"
-    }));
+    let plugin = AiRateLimiter::new(
+        &json!({
+            "token_limit": 100,
+            "window_seconds": 60,
+            "limit_by": "ip"
+        }),
+        PluginHttpClient::default(),
+    );
     let resp_headers = json_headers();
 
     let mut ctx = create_test_context();
@@ -378,12 +416,15 @@ async fn test_zero_tokens_counted_but_no_usage() {
 
 #[tokio::test]
 async fn test_expose_headers() {
-    let plugin = AiRateLimiter::new(&json!({
-        "token_limit": 1000,
-        "window_seconds": 60,
-        "limit_by": "ip",
-        "expose_headers": true
-    }));
+    let plugin = AiRateLimiter::new(
+        &json!({
+            "token_limit": 1000,
+            "window_seconds": 60,
+            "limit_by": "ip",
+            "expose_headers": true
+        }),
+        PluginHttpClient::default(),
+    );
 
     let mut ctx = create_test_context();
     let mut headers = HashMap::new();
@@ -407,12 +448,15 @@ async fn test_expose_headers() {
 
 #[tokio::test]
 async fn test_expose_headers_on_rejection() {
-    let plugin = AiRateLimiter::new(&json!({
-        "token_limit": 50,
-        "window_seconds": 60,
-        "limit_by": "ip",
-        "expose_headers": true
-    }));
+    let plugin = AiRateLimiter::new(
+        &json!({
+            "token_limit": 50,
+            "window_seconds": 60,
+            "limit_by": "ip",
+            "expose_headers": true
+        }),
+        PluginHttpClient::default(),
+    );
     let resp_headers = json_headers();
 
     // Record 100 tokens
@@ -444,11 +488,14 @@ async fn test_expose_headers_on_rejection() {
 
 #[tokio::test]
 async fn test_consumer_fallback_to_ip() {
-    let plugin = AiRateLimiter::new(&json!({
-        "token_limit": 100,
-        "window_seconds": 60,
-        "limit_by": "consumer"
-    }));
+    let plugin = AiRateLimiter::new(
+        &json!({
+            "token_limit": 100,
+            "window_seconds": 60,
+            "limit_by": "consumer"
+        }),
+        PluginHttpClient::default(),
+    );
     let resp_headers = json_headers();
 
     // No consumer set — should use IP as key
@@ -481,11 +528,14 @@ async fn test_reads_tokens_from_ai_token_metrics_metadata() {
     // When ai_token_metrics runs first (priority 4100), it writes token counts
     // to ctx.metadata. ai_rate_limiter (priority 4200) should read from
     // metadata instead of re-parsing the response body.
-    let plugin = AiRateLimiter::new(&json!({
-        "token_limit": 100,
-        "window_seconds": 60,
-        "limit_by": "ip"
-    }));
+    let plugin = AiRateLimiter::new(
+        &json!({
+            "token_limit": 100,
+            "window_seconds": 60,
+            "limit_by": "ip"
+        }),
+        PluginHttpClient::default(),
+    );
     let resp_headers = json_headers();
 
     let mut ctx = create_test_context();

@@ -56,12 +56,32 @@ use std::time::Duration;
 /// Includes optional slow-request logging: when `slow_threshold` is set,
 /// calls via [`execute`] that exceed the threshold emit a warning log with
 /// the elapsed time and a caller-provided label.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct PluginHttpClient {
     client: Arc<reqwest::Client>,
     /// Threshold above which outbound plugin HTTP calls are logged as slow.
     /// Configured via `FERRUM_PLUGIN_HTTP_SLOW_THRESHOLD_MS` (default: 1000ms).
     slow_threshold: Duration,
+    /// The gateway's shared DNS cache, available for plugins that need to resolve
+    /// hostnames outside of reqwest (e.g., Redis connections for rate limiting).
+    dns_cache: Option<DnsCache>,
+    /// Whether to skip TLS certificate verification for outbound connections.
+    /// Mirrors `FERRUM_TLS_NO_VERIFY` — shared with Redis rate limiting clients.
+    tls_no_verify: bool,
+    /// Path to a PEM CA bundle for verifying outbound TLS connections.
+    /// Mirrors `FERRUM_TLS_CA_BUNDLE_PATH` — shared with Redis rate limiting clients.
+    tls_ca_bundle_path: Option<String>,
+}
+
+impl std::fmt::Debug for PluginHttpClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PluginHttpClient")
+            .field("slow_threshold", &self.slow_threshold)
+            .field("has_dns_cache", &self.dns_cache.is_some())
+            .field("tls_no_verify", &self.tls_no_verify)
+            .field("has_tls_ca_bundle", &self.tls_ca_bundle_path.is_some())
+            .finish()
+    }
 }
 
 impl PluginHttpClient {
@@ -84,6 +104,7 @@ impl PluginHttpClient {
         tls_no_verify: bool,
         tls_ca_bundle_path: Option<&str>,
     ) -> Self {
+        let dns_cache_clone = dns_cache.clone();
         let resolver = DnsCacheResolver::new(dns_cache);
 
         let mut builder = reqwest::Client::builder()
@@ -133,6 +154,9 @@ impl PluginHttpClient {
         Self {
             client: Arc::new(client),
             slow_threshold: Duration::from_millis(slow_threshold_ms),
+            dns_cache: Some(dns_cache_clone),
+            tls_no_verify,
+            tls_ca_bundle_path: tls_ca_bundle_path.map(|s| s.to_string()),
         }
     }
 
@@ -169,6 +193,9 @@ impl PluginHttpClient {
         Self {
             client: Arc::new(client),
             slow_threshold: Duration::from_millis(1000),
+            dns_cache: None,
+            tls_no_verify: false,
+            tls_ca_bundle_path: None,
         }
     }
 
@@ -182,6 +209,32 @@ impl PluginHttpClient {
         let mut client = Self::from_pool_config(config);
         client.slow_threshold = Duration::from_millis(slow_threshold_ms);
         client
+    }
+
+    /// Get the gateway's shared DNS cache, if available.
+    ///
+    /// Returns `Some` when the client was built with `new()` (production path).
+    /// Returns `None` when built with `from_pool_config()` (tests / fallback).
+    /// Used by plugins that make non-HTTP connections (e.g., Redis for centralized
+    /// rate limiting) and need to resolve hostnames through the gateway's DNS cache.
+    pub fn dns_cache(&self) -> Option<&DnsCache> {
+        self.dns_cache.as_ref()
+    }
+
+    /// Whether TLS certificate verification is disabled (gateway-level setting).
+    ///
+    /// Used by plugins that make non-HTTP TLS connections (e.g., Redis for
+    /// centralized rate limiting) to share the gateway's `FERRUM_TLS_NO_VERIFY` setting.
+    pub fn tls_no_verify(&self) -> bool {
+        self.tls_no_verify
+    }
+
+    /// Path to the gateway's CA bundle for outbound TLS verification.
+    ///
+    /// Used by plugins that make non-HTTP TLS connections (e.g., Redis for
+    /// centralized rate limiting) to share the gateway's `FERRUM_TLS_CA_BUNDLE_PATH`.
+    pub fn tls_ca_bundle_path(&self) -> Option<&str> {
+        self.tls_ca_bundle_path.as_deref()
     }
 
     /// Get the underlying `reqwest::Client` for building requests.

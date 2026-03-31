@@ -314,6 +314,17 @@ Enforces request rate limits per time window. Supports limiting by client IP or 
 | `requests_per_second` | u64 (optional) | — | Max requests per second |
 | `requests_per_minute` | u64 (optional) | — | Max requests per minute |
 | `requests_per_hour` | u64 (optional) | — | Max requests per hour |
+| `sync_mode` | String | `local` | `local` (in-memory per instance) or `redis` (centralized) |
+| `redis_url` | String (optional) | — | Redis connection URL (required when `sync_mode: "redis"`) |
+| `redis_tls` | bool | `false` | Enable TLS for Redis connection |
+| `redis_key_prefix` | String | `ferrum:rate_limiting` | Redis key namespace prefix |
+| `redis_pool_size` | u64 | `4` | Number of multiplexed Redis connections |
+| `redis_connect_timeout_seconds` | u64 | `5` | Redis connection timeout in seconds |
+| `redis_health_check_interval_seconds` | u64 | `5` | Interval for background health check pings when Redis is unavailable |
+| `redis_username` | String (optional) | — | Redis ACL username (Redis 6+) |
+| `redis_password` | String (optional) | — | Redis password |
+
+> **Note:** When `redis_tls` is enabled, CA certificate verification and skip-verify behavior are controlled by the gateway-level `FERRUM_TLS_CA_BUNDLE_PATH` and `FERRUM_TLS_NO_VERIFY` environment variables, not per-plugin settings.
 
 **Behavior by mode:**
 - `limit_by: "ip"` — Enforces in `on_request_received` phase (before auth), keyed by client IP.
@@ -322,6 +333,20 @@ Enforces request rate limits per time window. Supports limiting by client IP or 
 **Rate limit headers** (when `expose_headers: true`): `x-ratelimit-limit`, `x-ratelimit-remaining`, `x-ratelimit-window`, `x-ratelimit-identity`
 
 Returns HTTP `429 Too Many Requests` when exceeded.
+
+**Centralized mode** (`sync_mode: "redis"`): Rate limit counters are stored in Redis so multiple gateway instances (e.g., multiple data planes) share a single global rate limit. Uses a two-window weighted approximation algorithm with native Redis commands (`INCR`, `GET`, `EXPIRE` pipelined) for smooth sliding window semantics. If Redis becomes unreachable, the plugin automatically falls back to local in-memory rate limiting and switches back when connectivity is restored. Compatible with any RESP-protocol server: Redis, Valkey, DragonflyDB, KeyDB, or Garnet.
+
+```yaml
+plugin_name: rate_limiting
+config:
+  limit_by: consumer
+  requests_per_minute: 100
+  expose_headers: true
+  sync_mode: redis
+  redis_url: "redis://redis-host:6379/0"
+  redis_tls: true
+  redis_key_prefix: "myapp:rate_limiting"
+```
 
 ---
 
@@ -646,6 +671,19 @@ Rate-limits consumers by LLM token consumption instead of request count.
 | `limit_by` | String | `"consumer"` | Rate limit key: `consumer` or `ip` |
 | `expose_headers` | Boolean | `false` | Inject `x-ai-ratelimit-*` headers |
 | `provider` | String | `"auto"` | LLM provider format for token extraction |
+| `sync_mode` | String | `local` | `local` (in-memory per instance) or `redis` (centralized) |
+| `redis_url` | String (optional) | — | Redis connection URL (required when `sync_mode: "redis"`) |
+| `redis_tls` | bool | `false` | Enable TLS for Redis connection |
+| `redis_key_prefix` | String | `ferrum:ai_rate_limiter` | Redis key namespace prefix |
+| `redis_pool_size` | u64 | `4` | Number of multiplexed Redis connections |
+| `redis_connect_timeout_seconds` | u64 | `5` | Redis connection timeout in seconds |
+| `redis_health_check_interval_seconds` | u64 | `5` | Interval for background health check pings when Redis is unavailable |
+| `redis_username` | String (optional) | — | Redis ACL username (Redis 6+) |
+| `redis_password` | String (optional) | — | Redis password |
+
+> **Note:** When `redis_tls` is enabled, CA certificate verification and skip-verify behavior are controlled by the gateway-level `FERRUM_TLS_CA_BUNDLE_PATH` and `FERRUM_TLS_NO_VERIFY` environment variables, not per-plugin settings.
+
+**Centralized mode** (`sync_mode: "redis"`): Token budgets are shared across all gateway instances so consumers cannot exceed limits by spreading requests across data planes. Uses the same two-window weighted approximation and automatic fallback as `rate_limiting`. Compatible with any RESP-protocol server: Redis, Valkey, DragonflyDB, KeyDB, or Garnet.
 
 ```yaml
 plugin_name: ai_rate_limiter
@@ -654,6 +692,8 @@ config:
   window_seconds: 3600
   limit_by: consumer
   expose_headers: true
+  sync_mode: redis
+  redis_url: "redis://redis-host:6379/1"
 ```
 
 ### `ai_prompt_shield`
@@ -724,6 +764,86 @@ plugins:
       expose_headers: true
   - plugin_name: stdout_logging
     config: {}
+```
+
+---
+
+## WebSocket Plugins
+
+WebSocket plugins operate at the frame level via the `on_ws_frame` lifecycle hook. They fire on every WebSocket frame (both client-to-backend and backend-to-client directions) and can inspect, modify, or reject individual frames.
+
+### `ws_message_size_limiting`
+
+Enforces maximum frame size for WebSocket connections. Closes the connection with code 1009 (Message Too Big) when a Text, Binary, or Ping frame exceeds the configured limit. Operates in both directions (client-to-backend and backend-to-client).
+
+**Priority:** 2810
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `max_frame_bytes` | u64 | `0` | Maximum allowed frame size in bytes (0 = no effect) |
+| `close_reason` | String | `"Message too large"` | Close frame reason text |
+
+```yaml
+plugin_name: ws_message_size_limiting
+config:
+  max_frame_bytes: 65536
+```
+
+### `ws_rate_limiting`
+
+Rate limits WebSocket frames per-connection using a token bucket algorithm. Closes the connection with code 1008 (Policy Violation) when the configured frame rate is exceeded.
+
+**Priority:** 2910
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `frames_per_second` | u64 | `100` | Maximum frames per second per connection |
+| `burst_size` | u64 | (= `frames_per_second`) | Token bucket capacity (burst allowance) |
+| `close_reason` | String | `"Frame rate exceeded"` | Close frame reason text |
+| `sync_mode` | String | `local` | `local` (in-memory per instance) or `redis` (centralized) |
+| `redis_url` | String (optional) | — | Redis connection URL (required when `sync_mode: "redis"`) |
+| `redis_tls` | bool | `false` | Enable TLS for Redis connection |
+| `redis_key_prefix` | String | `ferrum:ws_rate_limiting` | Redis key namespace prefix |
+| `redis_pool_size` | u64 | `4` | Number of multiplexed Redis connections |
+| `redis_connect_timeout_seconds` | u64 | `5` | Redis connection timeout in seconds |
+| `redis_health_check_interval_seconds` | u64 | `5` | Interval for background health check pings when Redis is unavailable |
+| `redis_username` | String (optional) | — | Redis ACL username (Redis 6+) |
+| `redis_password` | String (optional) | — | Redis password |
+
+> **Note:** When `redis_tls` is enabled, CA certificate verification and skip-verify behavior are controlled by the gateway-level `FERRUM_TLS_CA_BUNDLE_PATH` and `FERRUM_TLS_NO_VERIFY` environment variables, not per-plugin settings.
+
+**Centralized mode** (`sync_mode: "redis"`): Frame counters are shared across gateway instances. This is useful when a load balancer may reconnect a WebSocket client to a different instance. Uses 1-second fixed windows with native Redis `INCR`/`EXPIRE` commands. If Redis becomes unreachable, falls back to local in-memory rate limiting automatically. Compatible with any RESP-protocol server: Redis, Valkey, DragonflyDB, KeyDB, or Garnet.
+
+```yaml
+plugin_name: ws_rate_limiting
+config:
+  frames_per_second: 50
+  burst_size: 75
+  close_reason: "Rate limit exceeded"
+  sync_mode: redis
+  redis_url: "redis://redis-host:6379/2"
+```
+
+### `ws_frame_logging`
+
+Logs metadata for every WebSocket frame passing through the proxy. Provides frame-level observability without requiring packet captures. This plugin never transforms or drops frames — it is purely observational.
+
+**Priority:** 9050
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `log_level` | String | `"info"` | Log level for frame entries: `trace`, `debug`, or `info` |
+| `include_payload_preview` | bool | `false` | Include a payload preview in log entries |
+| `payload_preview_bytes` | u64 | `128` | Maximum payload bytes to preview (clamped to 64 KiB) |
+| `log_ping_pong` | bool | `false` | Log Ping and Pong control frames |
+
+```yaml
+plugin_name: ws_frame_logging
+config:
+  log_level: debug
+  include_payload_preview: true
+  payload_preview_bytes: 256
+  log_ping_pong: false
 ```
 
 ---
