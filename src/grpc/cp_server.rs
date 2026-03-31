@@ -99,8 +99,8 @@ impl CpGrpcServer {
             return Err(Status::failed_precondition(format!(
                 "Version mismatch: CP is v{} but DP is v{}. \
                  Major and minor versions must match. \
-                 Upgrade the DP to v{}.{}.x before connecting.",
-                FERRUM_VERSION, dp_version, cp_parts[0], cp_parts[1]
+                 Align both to the same major.minor version before connecting.",
+                FERRUM_VERSION, dp_version
             )));
         }
 
