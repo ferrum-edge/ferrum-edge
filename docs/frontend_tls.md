@@ -438,18 +438,25 @@ Look for messages like:
 
 ## TLS Policy Hardening
 
-The gateway supports fine-grained control over TLS protocol versions, cipher suites, key exchange groups, and cipher order negotiation. These settings apply globally to all inbound TLS listeners (proxy and admin).
+The gateway supports fine-grained control over TLS protocol versions, cipher suites, key exchange groups, and cipher order negotiation. These settings apply uniformly to **both inbound (frontend) and outbound (backend)** TLS connections across **all protocols**:
+
+| Direction | Protocols |
+|-----------|-----------|
+| **Inbound** | Proxy HTTPS, Admin HTTPS, HTTP/3 (QUIC) listeners |
+| **Outbound** | HTTP/1.1 and HTTP/2 backends (reqwest), hyper HTTP/2 pool, gRPC (grpcs://) backends, WebSocket (wss://) backends, TCP-TLS stream backends, HTTP/3 QUIC backends |
+
+> **Note:** DTLS (UDP-TLS) uses `webrtc-dtls` which has its own cipher negotiation independent of rustls. These TLS policy settings do not affect DTLS connections. `FERRUM_TLS_PREFER_SERVER_CIPHER_ORDER` and `FERRUM_TLS_SESSION_CACHE_SIZE` only apply to inbound listeners.
 
 ### Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `FERRUM_TLS_MIN_VERSION` | `1.2` | Minimum TLS version. Allowed: `1.2`, `1.3` |
-| `FERRUM_TLS_MAX_VERSION` | `1.3` | Maximum TLS version. Allowed: `1.2`, `1.3` |
-| `FERRUM_TLS_CIPHER_SUITES` | *(see defaults below)* | Comma-separated list of cipher suites (OpenSSL naming) |
-| `FERRUM_TLS_CURVES` | *(see defaults below)* | Comma-separated list of key exchange groups |
-| `FERRUM_TLS_PREFER_SERVER_CIPHER_ORDER` | `true` | When `true`, server cipher preference is used during TLS 1.2 negotiation |
-| `FERRUM_TLS_SESSION_CACHE_SIZE` | `4096` | Stateful session ID cache size for TLS 1.2 resumption. TLS 1.3 uses stateless tickets (unlimited). |
+| `FERRUM_TLS_MIN_VERSION` | `1.2` | Minimum TLS version (inbound + outbound). Allowed: `1.2`, `1.3` |
+| `FERRUM_TLS_MAX_VERSION` | `1.3` | Maximum TLS version (inbound + outbound). Allowed: `1.2`, `1.3` |
+| `FERRUM_TLS_CIPHER_SUITES` | *(see defaults below)* | Comma-separated cipher suites (inbound + outbound) |
+| `FERRUM_TLS_CURVES` | *(see defaults below)* | Comma-separated key exchange groups (inbound + outbound) |
+| `FERRUM_TLS_PREFER_SERVER_CIPHER_ORDER` | `true` | Server cipher preference for TLS 1.2 (inbound only) |
+| `FERRUM_TLS_SESSION_CACHE_SIZE` | `4096` | Session ID cache for TLS 1.2 resumption (inbound only) |
 
 ### Protocol Version Examples
 

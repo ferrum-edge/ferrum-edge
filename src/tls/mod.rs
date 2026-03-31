@@ -310,6 +310,32 @@ pub fn load_tls_config_with_client_auth(
     Ok(Arc::new(config))
 }
 
+/// Build a rustls `ClientConfig` builder for backend/outbound connections
+/// using the TLS policy's cipher suites, key exchange groups, and protocol versions.
+///
+/// This ensures outbound connections enforce the same TLS settings (cipher suites,
+/// min/max protocol versions, key exchange groups) as inbound listeners.
+///
+/// Falls back to `ClientConfig::builder()` (using the installed global default
+/// `CryptoProvider`) when no `TlsPolicy` is available — e.g., in unit tests.
+pub fn backend_client_config_builder(
+    tls_policy: Option<&TlsPolicy>,
+) -> Result<rustls::ConfigBuilder<rustls::ClientConfig, rustls::WantsVerifier>, anyhow::Error> {
+    match tls_policy {
+        Some(policy) => rustls::ClientConfig::builder_with_provider(policy.crypto_provider.clone())
+            .with_protocol_versions(&policy.protocol_versions)
+            .map_err(|e| anyhow::anyhow!("Failed to set TLS protocol versions for backend: {}", e)),
+        None => {
+            // Use the ring default provider explicitly so this works even when
+            // no global CryptoProvider is installed (e.g., in unit tests).
+            let provider = Arc::new(rustls::crypto::ring::default_provider());
+            rustls::ClientConfig::builder_with_provider(provider)
+                .with_safe_default_protocol_versions()
+                .map_err(|e| anyhow::anyhow!("Failed to set default TLS protocol versions: {}", e))
+        }
+    }
+}
+
 /// A certificate verifier that accepts any server certificate.
 ///
 /// Used when `backend_tls_verify_server_cert: false` or `FERRUM_TLS_NO_VERIFY=true`.

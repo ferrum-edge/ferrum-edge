@@ -47,7 +47,7 @@ use crate::retry;
 use crate::retry::ResponseBody;
 use crate::router_cache::RouterCache;
 use crate::service_discovery::ServiceDiscoveryManager;
-use crate::tls::NoVerifier;
+use crate::tls::{NoVerifier, TlsPolicy};
 
 pub use self::body::ProxyBody;
 use self::grpc_proxy::{GrpcConnectionPool, GrpcProxyError, GrpcResponseKind};
@@ -171,6 +171,10 @@ pub struct ProxyState {
     /// Monotonic counter for generating unique WebSocket connection IDs.
     /// Used by frame-level plugins (e.g., ws_rate_limiting) for per-connection state.
     pub ws_connection_counter: Arc<AtomicU64>,
+    /// TLS hardening policy for backend/outbound connections.
+    /// When set, all backend TLS connections use the same cipher suites,
+    /// protocol versions, and key exchange groups as inbound listeners.
+    pub tls_policy: Option<Arc<TlsPolicy>>,
 }
 
 impl ProxyState {
@@ -178,6 +182,7 @@ impl ProxyState {
         config: GatewayConfig,
         dns_cache: DnsCache,
         env_config: crate::config::EnvConfig,
+        tls_policy: Option<TlsPolicy>,
     ) -> Result<Self, anyhow::Error> {
         let alt_svc_header = if env_config.enable_http3 {
             Some(format!("h3=\":{}\"; ma=86400", env_config.proxy_https_port))
@@ -193,13 +198,16 @@ impl ProxyState {
         ));
         // Create connection pools with global configuration from environment
         let global_pool_config = PoolConfig::from_env();
+        let tls_policy_arc = tls_policy.map(Arc::new);
         let grpc_pool = Arc::new(GrpcConnectionPool::new(
             global_pool_config.clone(),
             env_config.clone(),
+            tls_policy_arc.clone(),
         ));
         let http2_pool = Arc::new(Http2ConnectionPool::new(
             global_pool_config.clone(),
             env_config.clone(),
+            tls_policy_arc.clone(),
         ));
         let env_config_arc = Arc::new(env_config.clone());
         let h3_pool = Arc::new(Http3ConnectionPool::new(env_config_arc.clone()));
@@ -207,6 +215,7 @@ impl ProxyState {
             global_pool_config.clone(),
             env_config,
             dns_cache.clone(),
+            tls_policy_arc.clone(),
         ));
         // Build router cache with pre-sorted route table for fast prefix matching
         let router_cache = Arc::new(RouterCache::new(&config, 10_000));
@@ -271,6 +280,7 @@ impl ProxyState {
             env_config_arc.tcp_idle_timeout_seconds,
             env_config_arc.udp_max_sessions,
             env_config_arc.udp_cleanup_interval_seconds,
+            tls_policy_arc.clone(),
         ));
 
         // Reconcile stream proxy listeners (TCP/UDP) at startup so that any
@@ -307,6 +317,7 @@ impl ProxyState {
             stream_listener_manager,
             started_at: Instant::now(),
             ws_connection_counter: Arc::new(AtomicU64::new(0)),
+            tls_policy: tls_policy_arc,
         })
     }
 
@@ -1013,8 +1024,14 @@ async fn handle_websocket_request_authenticated(
     let mut ws_attempt = 0u32;
 
     let backend_ws_stream = loop {
-        match connect_websocket_backend(&current_backend_url, &proxy, &env_config, &client_headers)
-            .await
+        match connect_websocket_backend(
+            &current_backend_url,
+            &proxy,
+            &env_config,
+            &client_headers,
+            state.tls_policy.as_deref(),
+        )
+        .await
         {
             Ok(stream) => break stream,
             Err(e) => {
@@ -1392,9 +1409,12 @@ fn build_websocket_backend_url_with_target(
 
 /// Build a rustls TLS connector for WebSocket backends that respects
 /// proxy-level and global TLS settings (CA bundles, client certs, cert verification).
+/// When `tls_policy` is provided, outbound connections use the same cipher suites,
+/// protocol versions, and key exchange groups as inbound listeners.
 fn build_websocket_tls_connector(
     proxy: &Proxy,
     env_config: &crate::config::EnvConfig,
+    tls_policy: Option<&TlsPolicy>,
 ) -> Option<tokio_tungstenite::Connector> {
     // Only build a TLS connector for wss:// backends
     if proxy.backend_protocol != BackendProtocol::Wss {
@@ -1433,8 +1453,19 @@ fn build_websocket_tls_connector(
         }
     }
 
-    // Build client config
-    let builder = rustls::ClientConfig::builder().with_root_certificates(root_store);
+    // Build client config with TLS policy (cipher suites, protocol versions)
+    let builder = match crate::tls::backend_client_config_builder(tls_policy) {
+        Ok(b) => b.with_root_certificates(root_store),
+        Err(e) => {
+            warn!(
+                "Failed to build WebSocket TLS config with policy: {}, using defaults",
+                e
+            );
+            rustls::ClientConfig::builder().with_root_certificates(
+                rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned()),
+            )
+        }
+    };
 
     // Add client certificate for mTLS (proxy-level overrides take priority)
     let cert_path = proxy
@@ -1501,6 +1532,7 @@ async fn connect_websocket_backend(
     proxy: &Proxy,
     env_config: &crate::config::EnvConfig,
     client_headers: &[(String, String)],
+    tls_policy: Option<&TlsPolicy>,
 ) -> Result<
     WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
     Box<dyn std::error::Error + Send + Sync>,
@@ -1521,7 +1553,7 @@ async fn connect_websocket_backend(
         }
     }
 
-    let connector = build_websocket_tls_connector(proxy, env_config);
+    let connector = build_websocket_tls_connector(proxy, env_config, tls_policy);
     let connect_timeout = std::time::Duration::from_millis(proxy.backend_connect_timeout_ms);
     let connect_future =
         connect_async_tls_with_config(ws_request, Some(ws_config), false, connector);

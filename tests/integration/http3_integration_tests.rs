@@ -232,6 +232,7 @@ async fn test_http3_backend_connection() {
         pool_config,
         env_config,
         dns_cache.clone(),
+        None,
     ));
 
     // Test DNS resolution first
@@ -363,6 +364,7 @@ async fn test_http3_proxy_state_creation() {
         pool_config,
         env_config,
         dns_cache.clone(),
+        None,
     ));
 
     let gc = create_http3_test_gateway_config();
@@ -384,6 +386,7 @@ async fn test_http3_proxy_state_creation() {
             300,
             10_000,
             10,
+            None,
         ),
     );
     let dns_cache_for_sd = dns_cache.clone();
@@ -425,6 +428,7 @@ async fn test_http3_proxy_state_creation() {
         stream_listener_manager: slm,
         started_at: std::time::Instant::now(),
         ws_connection_counter: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        tls_policy: None,
     };
 
     // Verify proxy state is created successfully
@@ -533,6 +537,7 @@ async fn test_http3_full_integration() {
         pool_config,
         env_config,
         dns_cache.clone(),
+        None,
     ));
 
     // Create proxy state with HTTP/3 support
@@ -555,6 +560,7 @@ async fn test_http3_full_integration() {
             300,
             10_000,
             10,
+            None,
         ),
     );
     let dns_cache_for_sd = dns_cache.clone();
@@ -596,6 +602,7 @@ async fn test_http3_full_integration() {
         stream_listener_manager: slm,
         started_at: std::time::Instant::now(),
         ws_connection_counter: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        tls_policy: None,
     };
 
     // Verify proxy state is created successfully
@@ -816,6 +823,7 @@ async fn test_http3_connection_performance() {
         pool_config,
         env_config,
         DnsCache::new(ferrum_edge::dns::DnsConfig::default()),
+        None,
     ));
 
     // Test HTTP/3 client creation performance

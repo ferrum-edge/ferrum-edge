@@ -19,7 +19,7 @@ use tracing::{debug, warn};
 use crate::config::PoolConfig;
 use crate::config::types::Proxy;
 use crate::dns::DnsCache;
-use crate::tls::NoVerifier;
+use crate::tls::{NoVerifier, TlsPolicy};
 
 fn now_epoch_ms() -> u64 {
     std::time::SystemTime::now()
@@ -55,11 +55,17 @@ pub struct Http2ConnectionPool {
     global_pool_config: PoolConfig,
     /// Global TLS/mTLS configuration
     global_env_config: crate::config::EnvConfig,
+    /// TLS hardening policy for backend connections (cipher suites, protocol versions).
+    tls_policy: Option<Arc<TlsPolicy>>,
 }
 
 impl Default for Http2ConnectionPool {
     fn default() -> Self {
-        Self::new(PoolConfig::default(), crate::config::EnvConfig::default())
+        Self::new(
+            PoolConfig::default(),
+            crate::config::EnvConfig::default(),
+            None,
+        )
     }
 }
 
@@ -67,12 +73,14 @@ impl Http2ConnectionPool {
     pub fn new(
         global_pool_config: PoolConfig,
         global_env_config: crate::config::EnvConfig,
+        tls_policy: Option<Arc<TlsPolicy>>,
     ) -> Self {
         let pool = Self {
             entries: Arc::new(DashMap::new()),
             rr_counters: Arc::new(DashMap::new()),
             global_pool_config,
             global_env_config,
+            tls_policy,
         };
 
         pool.start_cleanup_task();
@@ -413,14 +421,16 @@ impl Http2ConnectionPool {
                 cert_path, key_path
             );
 
-            rustls::ClientConfig::builder()
+            crate::tls::backend_client_config_builder(self.tls_policy.as_deref())
+                .map_err(|e| Http2PoolError::Internal(format!("TLS policy error: {}", e)))?
                 .with_root_certificates(root_store)
                 .with_client_auth_cert(certs, key)
                 .map_err(|e| {
                     Http2PoolError::Internal(format!("Invalid client certificate/key: {}", e))
                 })?
         } else {
-            rustls::ClientConfig::builder()
+            crate::tls::backend_client_config_builder(self.tls_policy.as_deref())
+                .map_err(|e| Http2PoolError::Internal(format!("TLS policy error: {}", e)))?
                 .with_root_certificates(root_store)
                 .with_no_client_auth()
         };

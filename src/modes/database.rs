@@ -145,9 +145,18 @@ pub async fn run(
         }
     }
 
+    // Build TLS hardening policy from environment (needed for both frontend
+    // and backend TLS — cipher suites, protocol versions, key exchange groups).
+    let tls_policy = TlsPolicy::from_env_config(&env_config)?;
+
     // Build ProxyState first so the plugin cache exists with the shared DNS
     // cache, then collect plugin hostnames to include in warmup.
-    let proxy_state = ProxyState::new(config, dns_cache.clone(), env_config.clone())?;
+    let proxy_state = ProxyState::new(
+        config,
+        dns_cache.clone(),
+        env_config.clone(),
+        Some(tls_policy.clone()),
+    )?;
 
     // Collect plugin endpoint hostnames (http_logging, jwks_auth, etc.)
     let plugin_hosts = proxy_state.plugin_cache.collect_warmup_hostnames();
@@ -164,9 +173,6 @@ pub async fn run(
     // Start service discovery background tasks
     proxy_state.start_service_discovery(Some(shutdown_tx.subscribe()));
     let db = Arc::new(db);
-
-    // Build TLS hardening policy from environment
-    let tls_policy = TlsPolicy::from_env_config(&env_config)?;
 
     // Load TLS configuration if provided
     let tls_config = if let (Some(cert_path), Some(key_path)) = (
