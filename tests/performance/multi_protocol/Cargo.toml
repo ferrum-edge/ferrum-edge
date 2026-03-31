@@ -32,8 +32,9 @@ tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 futures-util = { version = "0.3", features = ["sink"] }
 
 # gRPC
-tonic = { version = "0.12", features = ["tls"] }
-prost = "0.13"
+tonic = { version = "0.14.5", features = ["tls-ring", "tls-webpki-roots"] }
+tonic-prost = "0.14.5"
+prost = "0.14.3"
 
 # HTTP/3 / QUIC
 quinn = "0.11.9"
@@ -63,4 +64,4 @@ dashmap = "6"
 rustls-pemfile = "2"
 
 [build-dependencies]
-tonic-build = "0.12"
+tonic-prost-build = "0.14.5"

@@ -72,7 +72,7 @@ Ferrum supports dynamic upstream target discovery through three providers, confi
 
 - **Access Control** — IP/CIDR and consumer-based allow/deny lists
 - **IP Restriction** — standalone IP/CIDR filtering
-- **Rate Limiting** — per-IP or per-consumer with configurable windows and optional header exposure
+- **Rate Limiting** — per-IP or per-consumer with configurable windows and optional header exposure; supports centralized Redis-backed mode (`sync_mode: "redis"`) for coordinated rate limiting across multiple data plane instances. Compatible with any RESP-protocol server (Redis, Valkey, DragonflyDB, KeyDB, Garnet). TLS uses gateway-level `FERRUM_TLS_CA_BUNDLE_PATH` and `FERRUM_TLS_NO_VERIFY`
 - **Request Size Limiting** — per-proxy request body size limits (lower than global default), Content-Length fast path + buffered body check
 - **Response Size Limiting** — per-proxy response body size limits (lower than global default), Content-Length fast path + optional buffered body check
 - **Bot Detection** — User-Agent pattern blocking with allow-list support
@@ -86,13 +86,13 @@ Ferrum supports dynamic upstream target discovery through three providers, confi
 
 - **AI Token Metrics** — extract token usage (prompt, completion, total) from LLM responses (OpenAI, Anthropic, Google, Cohere, Mistral, Bedrock) into transaction metadata for downstream observability
 - **AI Request Guard** — validate and constrain AI requests: model allow/block lists, max_tokens enforcement (reject or clamp), message count limits, prompt length limits, temperature range, system prompt blocking
-- **AI Rate Limiter** — token-aware rate limiting per consumer or IP with sliding window, auto-detecting provider format from responses
+- **AI Rate Limiter** — token-aware rate limiting per consumer or IP with sliding window, auto-detecting provider format from responses; supports centralized Redis-backed mode for cross-instance token budget coordination. Compatible with any RESP-protocol server (Redis, Valkey, DragonflyDB, KeyDB, Garnet). TLS uses gateway-level settings
 - **AI Prompt Shield** — PII detection and redaction in prompts with built-in patterns (SSN, credit card, email, phone, API keys, AWS keys, IBAN) and custom regex support
 
 ### WebSocket Plugins
 
 - **WebSocket Message Size Limiting** — enforces maximum frame sizes on WebSocket connections, closing with code 1009 (Message Too Big) on violation
-- **WebSocket Rate Limiting** — per-connection frame rate limiting using token bucket algorithm, closing with code 1008 (Policy Violation) on excess
+- **WebSocket Rate Limiting** — per-connection frame rate limiting using token bucket algorithm, closing with code 1008 (Policy Violation) on excess; supports centralized Redis-backed mode for cross-instance frame rate coordination. Compatible with any RESP-protocol server (Redis, Valkey, DragonflyDB, KeyDB, Garnet). TLS uses gateway-level settings
 - **WebSocket Frame Logging** — logs frame metadata (direction, type, size, connection ID) without transforming frames
 
 ### Transform Plugins

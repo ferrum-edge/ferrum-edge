@@ -466,7 +466,7 @@ async fn run_ws(args: &BenchArgs) -> anyhow::Result<()> {
 
             while Instant::now() < deadline {
                 let start = Instant::now();
-                if write.send(Message::Binary(payload.clone())).await.is_err() {
+                if write.send(Message::Binary(payload.clone().into())).await.is_err() {
                     metrics.record_error();
                     break;
                 }

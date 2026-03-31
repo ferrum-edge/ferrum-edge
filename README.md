@@ -233,10 +233,14 @@ Four plugins for AI gateway use cases — cost visibility, budget enforcement, r
 
 - **`ai_token_metrics`** — Extract token usage from LLM responses for observability
 - **`ai_request_guard`** — Enforce model whitelists, token limits, and request policy
-- **`ai_rate_limiter`** — Rate-limit by token consumption instead of request count
+- **`ai_rate_limiter`** — Rate-limit by token consumption instead of request count (supports centralized Redis mode; compatible with any RESP-protocol server: Redis, Valkey, DragonflyDB, KeyDB, Garnet)
 - **`ai_prompt_shield`** — Scan for PII and reject, redact, or warn
 
 Auto-detects OpenAI, Anthropic, Google Gemini, Cohere, Mistral, and AWS Bedrock response formats. See [docs/plugins.md](docs/plugins.md#ai--llm-plugins) for configuration and a composition example.
+
+### Centralized Rate Limiting
+
+All three rate limiting plugins (`rate_limiting`, `ai_rate_limiter`, `ws_rate_limiting`) support centralized mode via `sync_mode: "redis"` for coordinated limits across multiple gateway instances. Compatible with any RESP-protocol server (Redis, Valkey, DragonflyDB, KeyDB, Garnet). Redis TLS uses gateway-level `FERRUM_TLS_CA_BUNDLE_PATH` and `FERRUM_TLS_NO_VERIFY` settings.
 
 ### Custom Plugins
 

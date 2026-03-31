@@ -176,8 +176,8 @@ pub async fn run(
 
     // Load TLS configuration if provided
     let tls_config = if let (Some(cert_path), Some(key_path)) = (
-        &env_config.proxy_tls_cert_path,
-        &env_config.proxy_tls_key_path,
+        &env_config.frontend_tls_cert_path,
+        &env_config.frontend_tls_key_path,
     ) {
         info!("Loading TLS configuration with client certificate verification...");
         let client_ca_bundle_path = env_config.frontend_tls_client_ca_bundle_path.as_deref();

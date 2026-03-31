@@ -5,7 +5,7 @@ use chrono::Utc;
 use ferrum_edge::ConsumerIndex;
 use ferrum_edge::config::types::Consumer;
 use ferrum_edge::plugins::{Plugin, RequestContext, hmac_auth::HmacAuth};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use serde_json::{Map, Value, json};
 use sha2::{Sha256, Sha512};
 use std::collections::HashMap;

@@ -118,8 +118,8 @@ fn create_http3_test_env_config() -> EnvConfig {
         enable_streaming_latency_tracking: false,
         proxy_http_port: 8080,
         proxy_https_port: 8443,
-        proxy_tls_cert_path: None,
-        proxy_tls_key_path: None,
+        frontend_tls_cert_path: None,
+        frontend_tls_key_path: None,
         proxy_bind_address: "0.0.0.0".into(),
         admin_http_port: 9000,
         admin_https_port: 9443,
@@ -252,7 +252,9 @@ async fn test_http3_backend_connection() {
     info!("Resolved {} to {:?}", proxy.backend_host, resolved_ip);
 
     // Test HTTP/3 client creation and basic functionality
-    let tls_config = connection_pool.get_tls_config_for_backend(&proxy);
+    let tls_config = connection_pool
+        .get_tls_config_for_backend(&proxy)
+        .expect("TLS config should succeed for test proxy");
     let http3_client_result = ferrum_edge::http3::client::Http3Client::new(tls_config, None);
 
     match http3_client_result {
@@ -383,6 +385,7 @@ async fn test_http3_proxy_state_creation() {
             circuit_breaker_cache.clone(),
             None,
             false,
+            None,
             300,
             10_000,
             10,
@@ -557,6 +560,7 @@ async fn test_http3_full_integration() {
             circuit_breaker_cache.clone(),
             None,
             false,
+            None,
             300,
             10_000,
             10,
@@ -616,7 +620,8 @@ async fn test_http3_full_integration() {
     // Test HTTP/3 backend connection creation
     let tls_config = proxy_state
         .connection_pool
-        .get_tls_config_for_backend(&proxy);
+        .get_tls_config_for_backend(&proxy)
+        .expect("TLS config should succeed for test proxy");
     assert!(Arc::strong_count(&tls_config) > 0);
 
     // Test HTTP/3 client creation (may fail in test environment, but should not panic)
@@ -827,7 +832,9 @@ async fn test_http3_connection_performance() {
     ));
 
     // Test HTTP/3 client creation performance
-    let tls_config = connection_pool.get_tls_config_for_backend(&proxy);
+    let tls_config = connection_pool
+        .get_tls_config_for_backend(&proxy)
+        .expect("TLS config should succeed for test proxy");
 
     let start_time = std::time::Instant::now();
     let http3_client = ferrum_edge::http3::client::Http3Client::new(tls_config, None)

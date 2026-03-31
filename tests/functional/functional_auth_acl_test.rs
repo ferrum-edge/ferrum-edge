@@ -12,7 +12,7 @@
 
 use base64::Engine;
 use chrono::Utc;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::json;
 use sha2::Sha256;

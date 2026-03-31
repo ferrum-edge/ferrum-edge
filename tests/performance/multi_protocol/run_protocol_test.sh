@@ -175,8 +175,8 @@ start_gateway() {
     )
     if [ -f "$cert_dir/cert.pem" ]; then
         env_cmd+=(
-            "FERRUM_PROXY_TLS_CERT_PATH=$cert_dir/cert.pem"
-            "FERRUM_PROXY_TLS_KEY_PATH=$cert_dir/key.pem"
+            "FERRUM_FRONTEND_TLS_CERT_PATH=$cert_dir/cert.pem"
+            "FERRUM_FRONTEND_TLS_KEY_PATH=$cert_dir/key.pem"
             "FERRUM_DTLS_CERT_PATH=$cert_dir/cert.pem"
             "FERRUM_DTLS_KEY_PATH=$cert_dir/key.pem"
         )

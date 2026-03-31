@@ -7,7 +7,7 @@ Regression thresholds (configurable via env vars):
   PERF_RPS_REGRESSION_PCT       - Max allowed RPS drop % (default: 35)
   PERF_LATENCY_REGRESSION_PCT   - Max allowed latency increase % (default: 50)
   PERF_P95_REGRESSION_PCT       - Max allowed p95 latency increase % (default: 55)
-  PERF_ERROR_THRESHOLD          - Max allowed total errors (default: 01)
+  PERF_ERROR_THRESHOLD          - Max allowed total errors (default: 1)
   PERF_OVERHEAD_MAX_PCT         - Max allowed gateway overhead % (default: 45)
 
 CI environments have inherent variance, so thresholds are intentionally generous.
@@ -30,7 +30,7 @@ def get_threshold(env_var, default):
 RPS_REGRESSION_PCT = get_threshold("PERF_RPS_REGRESSION_PCT", 35)
 LATENCY_REGRESSION_PCT = get_threshold("PERF_LATENCY_REGRESSION_PCT", 50)
 P95_REGRESSION_PCT = get_threshold("PERF_P95_REGRESSION_PCT", 55)
-ERROR_THRESHOLD = int(get_threshold("PERF_ERROR_THRESHOLD", 01))
+ERROR_THRESHOLD = int(get_threshold("PERF_ERROR_THRESHOLD", 1))
 OVERHEAD_MAX_PCT = get_threshold("PERF_OVERHEAD_MAX_PCT", 45)
 
 

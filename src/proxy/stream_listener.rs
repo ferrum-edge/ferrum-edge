@@ -55,6 +55,8 @@ pub struct StreamListenerManager {
     frontend_dtls_client_ca_path: arc_swap::ArcSwap<Option<String>>,
     /// Global override to disable backend TLS certificate verification.
     tls_no_verify: bool,
+    /// Global CA bundle path for outbound TLS verification (fallback when proxy has no per-proxy CA).
+    tls_ca_bundle_path: Option<String>,
     /// Global default TCP idle timeout in seconds (per-proxy `tcp_idle_timeout_seconds` overrides).
     tcp_idle_timeout_seconds: u64,
     /// Maximum concurrent UDP sessions per proxy.
@@ -76,6 +78,7 @@ impl StreamListenerManager {
         circuit_breaker_cache: Arc<CircuitBreakerCache>,
         frontend_tls_config: Option<Arc<rustls::ServerConfig>>,
         tls_no_verify: bool,
+        tls_ca_bundle_path: Option<String>,
         tcp_idle_timeout_seconds: u64,
         udp_max_sessions: usize,
         udp_cleanup_interval_seconds: u64,
@@ -93,6 +96,7 @@ impl StreamListenerManager {
             frontend_dtls_cert_key: arc_swap::ArcSwap::new(Arc::new(None)),
             frontend_dtls_client_ca_path: arc_swap::ArcSwap::new(Arc::new(None)),
             tls_no_verify,
+            tls_ca_bundle_path,
             tcp_idle_timeout_seconds,
             udp_max_sessions,
             udp_cleanup_interval_seconds,
@@ -287,6 +291,7 @@ impl StreamListenerManager {
                 let plugin_cache = self.plugin_cache.clone();
                 let tcp_idle_timeout = self.tcp_idle_timeout_seconds;
                 let tls_policy = self.tls_policy.clone();
+                let tls_ca_bundle_path = self.tls_ca_bundle_path.clone();
                 tokio::spawn(async move {
                     if let Err(e) = super::tcp_proxy::start_tcp_listener(TcpListenerConfig {
                         port: port_val,
@@ -299,6 +304,7 @@ impl StreamListenerManager {
                         shutdown: shutdown_rx,
                         metrics,
                         tls_no_verify,
+                        tls_ca_bundle_path,
                         plugin_cache,
                         tcp_idle_timeout_seconds: tcp_idle_timeout,
                         circuit_breaker_cache: cb_cache,

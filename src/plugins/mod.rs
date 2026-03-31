@@ -603,7 +603,10 @@ pub fn create_plugin_with_http_client(
             config,
         )))),
         "grpc_deadline" => Ok(Some(Arc::new(grpc_deadline::GrpcDeadline::new(config)))),
-        "rate_limiting" => Ok(Some(Arc::new(rate_limiting::RateLimiting::new(config)))),
+        "rate_limiting" => Ok(Some(Arc::new(rate_limiting::RateLimiting::new(
+            config,
+            http_client.clone(),
+        )))),
         "request_size_limiting" => Ok(Some(Arc::new(
             request_size_limiting::RequestSizeLimiting::new(config),
         ))),
@@ -629,7 +632,10 @@ pub fn create_plugin_with_http_client(
         "ai_request_guard" => Ok(Some(Arc::new(ai_request_guard::AiRequestGuard::new(
             config,
         )))),
-        "ai_rate_limiter" => Ok(Some(Arc::new(ai_rate_limiter::AiRateLimiter::new(config)))),
+        "ai_rate_limiter" => Ok(Some(Arc::new(ai_rate_limiter::AiRateLimiter::new(
+            config,
+            http_client.clone(),
+        )))),
         "ai_prompt_shield" => Ok(Some(Arc::new(ai_prompt_shield::AiPromptShield::new(
             config,
         )))),
@@ -641,6 +647,7 @@ pub fn create_plugin_with_http_client(
         )))),
         "ws_rate_limiting" => Ok(Some(Arc::new(ws_rate_limiting::WsRateLimiting::new(
             config,
+            http_client.clone(),
         )))),
         _ => {
             // Fall through to custom plugins registry

@@ -278,6 +278,7 @@ impl ProxyState {
             circuit_breaker_cache.clone(),
             None, // Frontend TLS for stream proxies is configured per-listener in reconcile()
             env_config_arc.tls_no_verify,
+            env_config_arc.tls_ca_bundle_path.clone(),
             env_config_arc.tcp_idle_timeout_seconds,
             env_config_arc.udp_max_sessions,
             env_config_arc.udp_cleanup_interval_seconds,
@@ -1416,41 +1417,41 @@ fn build_websocket_tls_connector(
     proxy: &Proxy,
     env_config: &crate::config::EnvConfig,
     tls_policy: Option<&TlsPolicy>,
-) -> Option<tokio_tungstenite::Connector> {
+) -> Result<Option<tokio_tungstenite::Connector>, anyhow::Error> {
     // Only build a TLS connector for wss:// backends
     if proxy.backend_protocol != BackendProtocol::Wss {
-        return None;
+        return Ok(None);
     }
 
     // Determine if we should skip server cert verification
     let skip_verify = env_config.tls_no_verify || !proxy.backend_tls_verify_server_cert;
 
-    // Build root certificate store
-    let mut root_store =
-        rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-
-    // Add custom CA bundle (proxy-level takes priority over global)
+    // Build root certificate store:
+    // - Custom CA configured → empty store + only that CA (no public roots)
+    // - No CA configured → webpki/system roots as default fallback
     let ca_path = proxy
         .backend_tls_server_ca_cert_path
         .as_ref()
         .or(env_config.tls_ca_bundle_path.as_ref());
+    let mut root_store = if ca_path.is_some() {
+        rustls::RootCertStore::empty()
+    } else {
+        rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned())
+    };
     if let Some(ca_path) = ca_path {
-        match std::fs::read(ca_path) {
-            Ok(ca_pem) => {
-                let mut cursor = std::io::Cursor::new(ca_pem);
-                let certs = rustls_pemfile::certs(&mut cursor);
-                for cert in certs.flatten() {
-                    if let Err(e) = root_store.add(cert) {
-                        warn!("Failed to add CA certificate for WebSocket TLS: {}", e);
-                    }
-                }
-            }
-            Err(e) => {
-                warn!(
-                    "Failed to read CA bundle '{}' for WebSocket TLS: {}",
-                    ca_path, e
-                );
-            }
+        let ca_pem = std::fs::read(ca_path).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to read CA bundle '{}' for WebSocket TLS: {}",
+                ca_path,
+                e
+            )
+        })?;
+        let mut cursor = std::io::Cursor::new(ca_pem);
+        let certs = rustls_pemfile::certs(&mut cursor);
+        for cert in certs.flatten() {
+            root_store.add(cert).map_err(|e| {
+                anyhow::anyhow!("Failed to add CA certificate for WebSocket TLS: {}", e)
+            })?;
         }
     }
 
@@ -1479,38 +1480,42 @@ fn build_websocket_tls_connector(
         .or(env_config.backend_tls_client_key_path.as_ref());
 
     let mut client_config = if let (Some(cert_path), Some(key_path)) = (cert_path, key_path) {
-        match (std::fs::read(cert_path), std::fs::read(key_path)) {
-            (Ok(cert_pem), Ok(key_pem)) => {
-                let certs: Vec<_> = rustls_pemfile::certs(&mut std::io::Cursor::new(&cert_pem))
-                    .flatten()
-                    .collect();
-                let key = rustls_pemfile::private_key(&mut std::io::Cursor::new(&key_pem))
-                    .ok()
-                    .flatten();
-                match key {
-                    Some(key) => match builder.clone().with_client_auth_cert(certs, key) {
-                        Ok(config) => config,
-                        Err(e) => {
-                            warn!("Failed to configure WebSocket mTLS client cert: {}", e);
-                            builder.with_no_client_auth()
-                        }
-                    },
-                    None => {
-                        warn!("No private key found in '{}' for WebSocket mTLS", key_path);
-                        builder.with_no_client_auth()
-                    }
-                }
-            }
-            _ => {
-                warn!("Failed to read client cert/key for WebSocket mTLS");
-                builder.with_no_client_auth()
-            }
-        }
+        let cert_pem = std::fs::read(cert_path).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to read client cert '{}' for WebSocket mTLS: {}",
+                cert_path,
+                e
+            )
+        })?;
+        let key_pem = std::fs::read(key_path).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to read client key '{}' for WebSocket mTLS: {}",
+                key_path,
+                e
+            )
+        })?;
+        let certs: Vec<_> = rustls_pemfile::certs(&mut std::io::Cursor::new(&cert_pem))
+            .flatten()
+            .collect();
+        let key = rustls_pemfile::private_key(&mut std::io::Cursor::new(&key_pem))
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to parse private key '{}' for WebSocket mTLS: {}",
+                    key_path,
+                    e
+                )
+            })?
+            .ok_or_else(|| {
+                anyhow::anyhow!("No private key found in '{}' for WebSocket mTLS", key_path)
+            })?;
+        builder
+            .with_client_auth_cert(certs, key)
+            .map_err(|e| anyhow::anyhow!("Failed to configure WebSocket mTLS client cert: {}", e))?
     } else {
         builder.with_no_client_auth()
     };
 
-    // Disable server certificate verification if configured
+    // Disable server certificate verification only if explicitly opted out
     if skip_verify {
         warn!(
             "WebSocket backend TLS certificate verification DISABLED for proxy {}",
@@ -1521,9 +1526,9 @@ fn build_websocket_tls_connector(
             .set_certificate_verifier(Arc::new(NoVerifier));
     }
 
-    Some(tokio_tungstenite::Connector::Rustls(Arc::new(
+    Ok(Some(tokio_tungstenite::Connector::Rustls(Arc::new(
         client_config,
-    )))
+    ))))
 }
 
 /// Connect to backend WebSocket server before sending 101 to client.
@@ -1538,11 +1543,9 @@ async fn connect_websocket_backend(
     WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
     Box<dyn std::error::Error + Send + Sync>,
 > {
-    let ws_config = WebSocketConfig {
-        max_frame_size: Some(16 << 20),
-        max_message_size: Some(64 << 20),
-        ..Default::default()
-    };
+    let mut ws_config = WebSocketConfig::default();
+    ws_config.max_frame_size = Some(16 << 20);
+    ws_config.max_message_size = Some(64 << 20);
 
     let mut ws_request = backend_url.into_client_request()?;
     for (name, value) in client_headers {
@@ -1554,7 +1557,7 @@ async fn connect_websocket_backend(
         }
     }
 
-    let connector = build_websocket_tls_connector(proxy, env_config, tls_policy);
+    let connector = build_websocket_tls_connector(proxy, env_config, tls_policy)?;
     let connect_timeout = std::time::Duration::from_millis(proxy.backend_connect_timeout_ms);
     let connect_future =
         connect_async_tls_with_config(ws_request, Some(ws_config), false, connector);
@@ -1597,11 +1600,9 @@ async fn run_websocket_proxy(
     connection_id: u64,
     ws_frame_plugins: Vec<Arc<dyn Plugin>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let ws_config = WebSocketConfig {
-        max_frame_size: Some(16 << 20),
-        max_message_size: Some(64 << 20),
-        ..Default::default()
-    };
+    let mut ws_config = WebSocketConfig::default();
+    ws_config.max_frame_size = Some(16 << 20);
+    ws_config.max_message_size = Some(64 << 20);
 
     let ws_stream = WebSocketStream::from_raw_socket(
         TokioIo::new(upgraded),

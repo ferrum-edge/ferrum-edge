@@ -71,8 +71,8 @@ pub struct EnvConfig {
     // Proxy traffic
     pub proxy_http_port: u16,
     pub proxy_https_port: u16,
-    pub proxy_tls_cert_path: Option<String>,
-    pub proxy_tls_key_path: Option<String>,
+    pub frontend_tls_cert_path: Option<String>,
+    pub frontend_tls_key_path: Option<String>,
     /// Bind address for proxy listeners (HTTP, HTTPS, HTTP/3).
     /// Default: "0.0.0.0" (IPv4 only). Set to "::" for dual-stack IPv4+IPv6.
     /// On most operating systems, binding to "::" accepts both IPv4 and IPv6
@@ -366,8 +366,8 @@ impl Default for EnvConfig {
             enable_streaming_latency_tracking: false,
             proxy_http_port: 8000,
             proxy_https_port: 8443,
-            proxy_tls_cert_path: None,
-            proxy_tls_key_path: None,
+            frontend_tls_cert_path: None,
+            frontend_tls_key_path: None,
             proxy_bind_address: "0.0.0.0".into(),
             admin_http_port: 9000,
             admin_https_port: 9443,
@@ -497,8 +497,8 @@ impl EnvConfig {
 
             proxy_http_port: resolve_u16(conf, "FERRUM_PROXY_HTTP_PORT", 8000),
             proxy_https_port: resolve_u16(conf, "FERRUM_PROXY_HTTPS_PORT", 8443),
-            proxy_tls_cert_path: resolve_var(conf, "FERRUM_PROXY_TLS_CERT_PATH"),
-            proxy_tls_key_path: resolve_var(conf, "FERRUM_PROXY_TLS_KEY_PATH"),
+            frontend_tls_cert_path: resolve_var(conf, "FERRUM_FRONTEND_TLS_CERT_PATH"),
+            frontend_tls_key_path: resolve_var(conf, "FERRUM_FRONTEND_TLS_KEY_PATH"),
             proxy_bind_address: resolve_var_or(conf, "FERRUM_PROXY_BIND_ADDRESS", "0.0.0.0"),
 
             admin_http_port: resolve_u16(conf, "FERRUM_ADMIN_HTTP_PORT", 9000),
@@ -1089,6 +1089,39 @@ impl EnvConfig {
                 "Invalid FERRUM_ADMIN_BIND_ADDRESS '{}'. Expected a valid IP address (e.g., 0.0.0.0 or ::)",
                 self.admin_bind_address
             ));
+        }
+
+        // Validate global backend TLS cert/key files exist and are parseable
+        match (
+            &self.backend_tls_client_cert_path,
+            &self.backend_tls_client_key_path,
+        ) {
+            (Some(_), None) => {
+                return Err(
+                    "FERRUM_BACKEND_TLS_CLIENT_CERT_PATH is set but FERRUM_BACKEND_TLS_CLIENT_KEY_PATH is missing — both must be configured together".into(),
+                );
+            }
+            (None, Some(_)) => {
+                return Err(
+                    "FERRUM_BACKEND_TLS_CLIENT_KEY_PATH is set but FERRUM_BACKEND_TLS_CLIENT_CERT_PATH is missing — both must be configured together".into(),
+                );
+            }
+            _ => {}
+        }
+        if let Some(ref path) = self.backend_tls_client_cert_path {
+            crate::config::types::validate_pem_cert_file(
+                "FERRUM_BACKEND_TLS_CLIENT_CERT_PATH",
+                path,
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        if let Some(ref path) = self.backend_tls_client_key_path {
+            crate::config::types::validate_pem_key_file("FERRUM_BACKEND_TLS_CLIENT_KEY_PATH", path)
+                .map_err(|e| e.to_string())?;
+        }
+        if let Some(ref path) = self.tls_ca_bundle_path {
+            crate::config::types::validate_pem_cert_file("FERRUM_TLS_CA_BUNDLE_PATH", path)
+                .map_err(|e| e.to_string())?;
         }
 
         // Non-fatal security warnings

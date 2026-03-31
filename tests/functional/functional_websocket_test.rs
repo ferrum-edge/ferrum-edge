@@ -51,13 +51,13 @@ async fn start_ws_echo_server(port: u16) {
                     match msg {
                         Message::Text(text) => {
                             let echo = format!("Echo: {}", text);
-                            if sink.send(Message::Text(echo)).await.is_err() {
+                            if sink.send(Message::Text(echo.into())).await.is_err() {
                                 break;
                             }
                         }
                         Message::Binary(data) => {
                             let echo = format!("Echo binary: {} bytes", data.len());
-                            if sink.send(Message::Text(echo)).await.is_err() {
+                            if sink.send(Message::Text(echo.into())).await.is_err() {
                                 break;
                             }
                         }
@@ -117,10 +117,10 @@ fn start_gateway(
         cmd.env("FERRUM_PROXY_HTTPS_PORT", port.to_string());
     }
     if let Some(cert) = tls_cert_path {
-        cmd.env("FERRUM_PROXY_TLS_CERT_PATH", cert);
+        cmd.env("FERRUM_FRONTEND_TLS_CERT_PATH", cert);
     }
     if let Some(key) = tls_key_path {
-        cmd.env("FERRUM_PROXY_TLS_KEY_PATH", key);
+        cmd.env("FERRUM_FRONTEND_TLS_KEY_PATH", key);
     }
 
     Ok(cmd.spawn()?)
@@ -255,7 +255,7 @@ async fn test_websocket_plaintext_echo() {
     assert_eq!(reply, Message::Text("Echo: hello world".into()));
 
     // Test binary echo
-    ws.send(Message::Binary(vec![1, 2, 3, 4, 5]))
+    ws.send(Message::Binary(vec![1, 2, 3, 4, 5].into()))
         .await
         .expect("Failed to send binary");
     let reply = ws
@@ -379,21 +379,24 @@ async fn test_websocket_multiple_messages() {
     // Send multiple text messages
     for i in 0..10 {
         let msg = format!("message {}", i);
-        ws.send(Message::Text(msg.clone()))
+        ws.send(Message::Text(msg.clone().into()))
             .await
             .expect("Failed to send");
         let reply = ws.next().await.expect("No reply").expect("Error reading");
-        assert_eq!(reply, Message::Text(format!("Echo: {}", msg)));
+        assert_eq!(reply, Message::Text(format!("Echo: {}", msg).into()));
     }
 
     // Send multiple binary messages
     for size in [0, 1, 100, 1000] {
         let data = vec![0xABu8; size];
-        ws.send(Message::Binary(data))
+        ws.send(Message::Binary(data.into()))
             .await
             .expect("Failed to send binary");
         let reply = ws.next().await.expect("No reply").expect("Error reading");
-        assert_eq!(reply, Message::Text(format!("Echo binary: {} bytes", size)));
+        assert_eq!(
+            reply,
+            Message::Text(format!("Echo binary: {} bytes", size).into())
+        );
     }
 
     // Clean close

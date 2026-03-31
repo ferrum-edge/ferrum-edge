@@ -55,7 +55,7 @@ async fn test_text_frame_passthrough() {
 #[tokio::test]
 async fn test_binary_frame_passthrough() {
     let plugin = WsFrameLogging::new(&json!({}));
-    let msg = Message::Binary(vec![1, 2, 3, 4, 5]);
+    let msg = Message::Binary(vec![1, 2, 3, 4, 5].into());
     let result = plugin
         .on_ws_frame(
             "test-proxy",
@@ -87,7 +87,7 @@ async fn test_backend_to_client_passthrough() {
 #[tokio::test]
 async fn test_ping_skipped_by_default() {
     let plugin = WsFrameLogging::new(&json!({}));
-    let msg = Message::Ping(vec![1, 2, 3]);
+    let msg = Message::Ping(vec![1, 2, 3].into());
     // Should still return None (passthrough), just doesn't log
     let result = plugin
         .on_ws_frame(
@@ -103,7 +103,7 @@ async fn test_ping_skipped_by_default() {
 #[tokio::test]
 async fn test_pong_skipped_by_default() {
     let plugin = WsFrameLogging::new(&json!({}));
-    let msg = Message::Pong(vec![1, 2, 3]);
+    let msg = Message::Pong(vec![1, 2, 3].into());
     let result = plugin
         .on_ws_frame(
             "test-proxy",
@@ -118,7 +118,7 @@ async fn test_pong_skipped_by_default() {
 #[tokio::test]
 async fn test_ping_logged_when_enabled() {
     let plugin = WsFrameLogging::new(&json!({"log_ping_pong": true}));
-    let msg = Message::Ping(vec![1, 2, 3]);
+    let msg = Message::Ping(vec![1, 2, 3].into());
     // Still returns None — logging is a side effect
     let result = plugin
         .on_ws_frame(
@@ -153,7 +153,7 @@ async fn test_with_payload_preview_enabled() {
 async fn test_binary_payload_preview() {
     let plugin =
         WsFrameLogging::new(&json!({"include_payload_preview": true, "payload_preview_bytes": 4}));
-    let msg = Message::Binary(vec![0xDE, 0xAD, 0xBE, 0xEF, 0xFF]);
+    let msg = Message::Binary(vec![0xDE, 0xAD, 0xBE, 0xEF, 0xFF].into());
     let result = plugin
         .on_ws_frame(
             "test-proxy",
@@ -294,7 +294,7 @@ async fn test_payload_preview_bytes_clamped_to_max() {
     let plugin = WsFrameLogging::new(
         &json!({"include_payload_preview": true, "payload_preview_bytes": 999999999}),
     );
-    let msg = Message::Binary(vec![0xAB; 100]);
+    let msg = Message::Binary(vec![0xAB; 100].into());
     let result = plugin
         .on_ws_frame(
             "test-proxy",
@@ -329,7 +329,7 @@ async fn test_payload_preview_all_multibyte_chars() {
 #[tokio::test]
 async fn test_empty_text_frame() {
     let plugin = WsFrameLogging::new(&json!({"include_payload_preview": true}));
-    let msg = Message::Text(String::new());
+    let msg = Message::Text(String::new().into());
     let result = plugin
         .on_ws_frame(
             "test-proxy",
@@ -344,7 +344,7 @@ async fn test_empty_text_frame() {
 #[tokio::test]
 async fn test_empty_binary_frame() {
     let plugin = WsFrameLogging::new(&json!({"include_payload_preview": true}));
-    let msg = Message::Binary(vec![]);
+    let msg = Message::Binary(vec![].into());
     let result = plugin
         .on_ws_frame(
             "test-proxy",

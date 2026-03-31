@@ -224,6 +224,8 @@ Rate limiting sits at the end of the AuthZ band (priority 2900) so it can enforc
 
 **Header exposure** (`expose_headers: true`): When enabled, the plugin injects `x-ratelimit-limit`, `x-ratelimit-remaining`, `x-ratelimit-window`, and `x-ratelimit-identity` headers on both upstream requests (`before_proxy`) and downstream responses (`after_proxy`). This lets backends and clients see current rate-limit state without additional lookups. Disabled by default so gateway admins control whether limit details are exposed.
 
+**Centralized mode** (`sync_mode: "redis"`): All three rate limiting plugins (`rate_limiting`, `ai_rate_limiter`, `ws_rate_limiting`) support storing counters in Redis for coordinated rate limiting across multiple gateway instances. When Redis is unavailable, they automatically fall back to local in-memory state and switch back when connectivity is restored. The Redis backend uses native RESP protocol commands (no Lua scripts), so it works with Redis, Valkey, DragonflyDB, KeyDB, or Garnet. Each plugin instance has its own Redis connection and key prefix for isolation.
+
 ### AI Plugins: PII shield before guard, metrics before rate limiter (2925–4200)
 
 The four AI plugins are ordered to compose correctly:

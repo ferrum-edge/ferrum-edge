@@ -29,7 +29,7 @@ fn test_listener_scenarios() {
     println!("   - Use case: Development, internal networks");
     println!();
     println!("2. HTTPS + HTTP:");
-    println!("   - FERRUM_PROXY_TLS_CERT_PATH and FERRUM_PROXY_TLS_KEY_PATH set");
+    println!("   - FERRUM_FRONTEND_TLS_CERT_PATH and FERRUM_FRONTEND_TLS_KEY_PATH set");
     println!("   - HTTP listener on port 8000");
     println!("   - HTTPS listener on port 8443");
     println!("   - Use case: Migration period, legacy clients");

@@ -34,7 +34,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     Ok(Message::Text(text)) => {
                         debug!("Received text: {}", text);
                         let echo_text = format!("Echo: {}", text);
-                        if let Err(e) = ws_sender.send(Message::Text(echo_text)).await {
+                        if let Err(e) = ws_sender.send(Message::Text(echo_text.into())).await {
                             error!("Failed to send echo: {}", e);
                             break;
                         }
@@ -42,7 +42,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     Ok(Message::Binary(data)) => {
                         debug!("Received binary data: {} bytes", data.len());
                         let echo_data = format!("Echo binary: {} bytes", data.len());
-                        if let Err(e) = ws_sender.send(Message::Text(echo_data)).await {
+                        if let Err(e) = ws_sender.send(Message::Text(echo_data.into())).await {
                             error!("Failed to send binary echo: {}", e);
                             break;
                         }

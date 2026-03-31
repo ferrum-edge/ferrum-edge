@@ -474,7 +474,19 @@ plugin_configs:
 
 #[test]
 fn test_proxy_with_all_optional_fields() {
-    let yaml = r#"
+    // Use real test cert files so TLS file validation passes
+    let cert_path = std::fs::canonicalize("tests/certs/server.crt")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let key_path = std::fs::canonicalize("tests/certs/server.key")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let yaml = format!(
+        r#"
 proxies:
   - id: "proxy-full"
     listen_path: "/api"
@@ -488,10 +500,10 @@ proxies:
     backend_connect_timeout_ms: 8000
     backend_read_timeout_ms: 45000
     backend_write_timeout_ms: 45000
-    backend_tls_client_cert_path: "/etc/certs/client.pem"
-    backend_tls_client_key_path: "/etc/certs/client-key.pem"
+    backend_tls_client_cert_path: "{cert_path}"
+    backend_tls_client_key_path: "{key_path}"
     backend_tls_verify_server_cert: false
-    backend_tls_server_ca_cert_path: "/etc/certs/ca.pem"
+    backend_tls_server_ca_cert_path: "{cert_path}"
     dns_override: "192.168.1.1"
     dns_cache_ttl_seconds: 300
     pool_idle_timeout_seconds: 180
@@ -503,25 +515,20 @@ proxies:
     auth_mode: multi
 consumers: []
 plugin_configs: []
-"#;
+"#
+    );
     let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
     write!(file, "{}", yaml).unwrap();
     let config = load_config_from_file(file.path().to_str().unwrap()).unwrap();
 
     let proxy = &config.proxies[0];
     assert_eq!(proxy.backend_path, Some("/v1/gateway".to_string()));
-    assert_eq!(
-        proxy.backend_tls_client_cert_path,
-        Some("/etc/certs/client.pem".to_string())
-    );
-    assert_eq!(
-        proxy.backend_tls_client_key_path,
-        Some("/etc/certs/client-key.pem".to_string())
-    );
+    assert_eq!(proxy.backend_tls_client_cert_path, Some(cert_path.clone()));
+    assert_eq!(proxy.backend_tls_client_key_path, Some(key_path.clone()));
     assert!(!proxy.backend_tls_verify_server_cert);
     assert_eq!(
         proxy.backend_tls_server_ca_cert_path,
-        Some("/etc/certs/ca.pem".to_string())
+        Some(cert_path.clone())
     );
     assert_eq!(proxy.dns_override, Some("192.168.1.1".to_string()));
     assert_eq!(proxy.dns_cache_ttl_seconds, Some(300));

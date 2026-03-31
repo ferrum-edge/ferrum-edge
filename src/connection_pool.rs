@@ -11,7 +11,6 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
-use tracing::warn;
 
 /// Connection pool entry with client and last used timestamp.
 /// Uses atomic u64 (epoch millis) instead of RwLock<Instant> to avoid
@@ -131,11 +130,17 @@ impl ConnectionPool {
         // Create the custom DNS resolver wrapping our DnsCache
         let dns_resolver = Arc::new(DnsCacheResolver::new(self.dns_cache.clone()));
 
+        // Determine whether to skip server cert verification.
+        // CA trust chain: proxy CA → global CA → webpki/system roots.
+        let skip_verify =
+            !proxy.backend_tls_verify_server_cert || self.global_mtls_config.tls_no_verify;
+
         let mut client_builder = reqwest::Client::builder()
             .dns_resolver(dns_resolver)
             .connect_timeout(Duration::from_millis(proxy.backend_connect_timeout_ms))
             .timeout(Duration::from_millis(proxy.backend_read_timeout_ms))
             .tcp_nodelay(true)
+            .danger_accept_invalid_certs(skip_verify)
             .pool_max_idle_per_host(config.max_idle_per_host)
             .pool_idle_timeout(Duration::from_secs(config.idle_timeout_seconds));
 
@@ -190,31 +195,37 @@ impl ConnectionPool {
     fn build_reqwest_tls_config(&self, proxy: &Proxy) -> Result<rustls::ClientConfig> {
         use crate::tls::NoVerifier;
 
-        // Build root certificate store with system roots
-        let mut root_store =
-            rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        // Build root certificate store:
+        // - Custom CA configured -> empty store + only that CA (no public roots)
+        // - No CA configured -> webpki/system roots as default fallback
+        let ca_path = proxy
+            .backend_tls_server_ca_cert_path
+            .as_ref()
+            .or(self.global_mtls_config.tls_ca_bundle_path.as_ref());
 
-        // Add custom CA bundle (proxy-level takes priority over global)
-        if !self.global_mtls_config.tls_no_verify {
-            let ca_path = proxy
-                .backend_tls_server_ca_cert_path
-                .as_ref()
-                .or(self.global_mtls_config.tls_ca_bundle_path.as_ref());
-            if let Some(ca_bundle_path) = ca_path {
-                let ca_data = std::fs::read(ca_bundle_path).map_err(|e| {
-                    anyhow::anyhow!("Failed to read CA bundle from {}: {}", ca_bundle_path, e)
-                })?;
-                let certs = rustls_pemfile::certs(&mut &ca_data[..])
-                    .filter_map(|r| r.ok())
-                    .collect::<Vec<_>>();
-                let (added, _) = root_store.add_parsable_certificates(certs);
-                if added > 0 {
-                    tracing::debug!(
-                        "Added {} CA certificates from {} for reqwest backend",
-                        added,
-                        ca_bundle_path
-                    );
-                }
+        let mut root_store = if ca_path.is_some() {
+            rustls::RootCertStore::empty()
+        } else {
+            rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned())
+        };
+
+        // Load custom CA bundle (proxy-level takes priority over global)
+        if !self.global_mtls_config.tls_no_verify
+            && let Some(ca_bundle_path) = ca_path
+        {
+            let ca_data = std::fs::read(ca_bundle_path).map_err(|e| {
+                anyhow::anyhow!("Failed to read CA bundle from {}: {}", ca_bundle_path, e)
+            })?;
+            let certs = rustls_pemfile::certs(&mut &ca_data[..])
+                .filter_map(|r| r.ok())
+                .collect::<Vec<_>>();
+            let (added, _) = root_store.add_parsable_certificates(certs);
+            if added > 0 {
+                tracing::debug!(
+                    "Added {} CA certificates from {} for reqwest backend",
+                    added,
+                    ca_bundle_path
+                );
             }
         }
 
@@ -258,7 +269,7 @@ impl ConnectionPool {
 
         // Disable server certificate verification if configured (testing only)
         if !proxy.backend_tls_verify_server_cert || self.global_mtls_config.tls_no_verify {
-            warn!("Backend TLS certificate verification DISABLED (testing mode)");
+            tracing::warn!("Backend TLS certificate verification DISABLED (testing mode)");
             client_config
                 .dangerous()
                 .set_certificate_verifier(Arc::new(NoVerifier));
@@ -394,21 +405,52 @@ impl ConnectionPool {
     /// (required for QUIC/HTTP/3). Respects proxy-specific TLS settings
     /// for custom CA bundles and mTLS client certificates. Uses the TLS
     /// policy's cipher suites and key exchange groups for outbound connections.
-    pub fn get_tls_config_for_backend(&self, proxy: &Proxy) -> Arc<rustls::ClientConfig> {
+    pub fn get_tls_config_for_backend(
+        &self,
+        proxy: &Proxy,
+    ) -> Result<Arc<rustls::ClientConfig>, anyhow::Error> {
         use rustls_pemfile::certs;
         use std::io::BufReader;
 
-        // Build root certificate store, using proxy CA or system roots
-        let mut root_store =
-            rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        // Determine whether to skip server certificate verification
+        let skip_verify =
+            !proxy.backend_tls_verify_server_cert || self.global_mtls_config.tls_no_verify;
 
-        // Add proxy-specific CA certificate if configured
-        if let Some(ref ca_path) = proxy.backend_tls_server_ca_cert_path
-            && let Ok(ca_file) = std::fs::File::open(ca_path)
-        {
+        // Determine CA path: proxy-specific CA takes priority over global CA bundle
+        let ca_path = proxy
+            .backend_tls_server_ca_cert_path
+            .as_ref()
+            .or(self.global_mtls_config.tls_ca_bundle_path.as_ref());
+
+        // Build root certificate store:
+        // - Custom CA configured → empty store + only that CA (no public roots)
+        // - No CA configured → webpki/system roots as default fallback
+        let mut root_store = if ca_path.is_some() {
+            rustls::RootCertStore::empty()
+        } else {
+            rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned())
+        };
+
+        if skip_verify {
+            tracing::warn!("Backend TLS certificate verification DISABLED for HTTP/3 backend");
+        } else if let Some(ca_path) = ca_path {
+            // CA path configured (proxy or global): trust ONLY this CA, not public roots
+            let ca_file = std::fs::File::open(ca_path).map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to open backend CA certificate '{}' for HTTP/3: {}",
+                    ca_path,
+                    e
+                )
+            })?;
             let ca_certs: Vec<_> = certs(&mut BufReader::new(ca_file))
                 .filter_map(|r| r.ok())
                 .collect();
+            if ca_certs.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "No valid CA certificates found in '{}' for HTTP/3 backend",
+                    ca_path
+                ));
+            }
             let (added, _) = root_store.add_parsable_certificates(ca_certs);
             if added > 0 {
                 tracing::debug!(
@@ -435,61 +477,67 @@ impl ConnectionPool {
             &proxy.backend_tls_client_key_path,
         ) {
             // mTLS: load client certificate and key
-            match (
-                std::fs::File::open(cert_path),
-                std::fs::File::open(key_path),
-            ) {
-                (Ok(cert_file), Ok(key_file)) => {
-                    let client_certs: Vec<_> = certs(&mut BufReader::new(cert_file))
-                        .filter_map(|r| r.ok())
-                        .collect();
-                    let client_keys: Vec<_> =
-                        rustls_pemfile::pkcs8_private_keys(&mut BufReader::new(key_file))
-                            .filter_map(|r| r.ok())
-                            .collect();
-                    if let Some(key) = client_keys.into_iter().next() {
-                        policy_builder()
-                            .with_root_certificates(root_store)
-                            .with_client_auth_cert(client_certs, rustls::pki_types::PrivateKeyDer::Pkcs8(key))
-                            .unwrap_or_else(|e| {
-                                tracing::warn!("Failed to configure mTLS for HTTP/3: {}, falling back to no client auth", e);
-                                policy_builder()
-                                    .with_root_certificates(rustls::RootCertStore::from_iter(
-                                        webpki_roots::TLS_SERVER_ROOTS.iter().cloned(),
-                                    ))
-                                    .with_no_client_auth()
-                            })
-                    } else {
-                        tracing::warn!("No private keys found in {} for HTTP/3 mTLS", key_path);
-                        policy_builder()
-                            .with_root_certificates(root_store)
-                            .with_no_client_auth()
-                    }
-                }
-                _ => {
-                    tracing::warn!("Failed to open mTLS certificate files for HTTP/3");
-                    policy_builder()
-                        .with_root_certificates(root_store)
-                        .with_no_client_auth()
-                }
+            let cert_file = std::fs::File::open(cert_path).map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to open client certificate '{}' for HTTP/3 mTLS: {}",
+                    cert_path,
+                    e
+                )
+            })?;
+            let key_file = std::fs::File::open(key_path).map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to open client key '{}' for HTTP/3 mTLS: {}",
+                    key_path,
+                    e
+                )
+            })?;
+            let client_certs: Vec<_> = certs(&mut BufReader::new(cert_file))
+                .filter_map(|r| r.ok())
+                .collect();
+            if client_certs.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "No valid certificates found in '{}' for HTTP/3 mTLS",
+                    cert_path
+                ));
             }
+            let client_keys: Vec<_> =
+                rustls_pemfile::pkcs8_private_keys(&mut BufReader::new(key_file))
+                    .filter_map(|r| r.ok())
+                    .collect();
+            let key = client_keys.into_iter().next().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "No valid PKCS8 private keys found in '{}' for HTTP/3 mTLS",
+                    key_path
+                )
+            })?;
+            policy_builder()
+                .with_root_certificates(root_store)
+                .with_client_auth_cert(client_certs, rustls::pki_types::PrivateKeyDer::Pkcs8(key))
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "Failed to configure mTLS for HTTP/3 (cert='{}', key='{}'): {}",
+                        cert_path,
+                        key_path,
+                        e
+                    )
+                })?
         } else {
             policy_builder()
                 .with_root_certificates(root_store)
                 .with_no_client_auth()
         };
 
-        // HTTP/3 requires ALPN protocol "h3"
-        client_config.alpn_protocols = vec![b"h3".to_vec()];
-
-        // Optionally skip server cert verification
-        if !proxy.backend_tls_verify_server_cert || self.global_mtls_config.tls_no_verify {
+        // Apply NoVerifier if explicitly opted out of verification
+        if skip_verify {
             client_config
                 .dangerous()
                 .set_certificate_verifier(Arc::new(crate::tls::NoVerifier));
         }
 
-        Arc::new(client_config)
+        // HTTP/3 requires ALPN protocol "h3"
+        client_config.alpn_protocols = vec![b"h3".to_vec()];
+
+        Ok(Arc::new(client_config))
     }
 
     /// Clear all pooled connections

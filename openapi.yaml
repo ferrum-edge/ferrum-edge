@@ -1565,6 +1565,7 @@ components:
         Configuration for the `ws_rate_limiting` plugin. Enforces per-connection
         frame rate limiting using a token-bucket algorithm. When the bucket is
         exhausted, the plugin sends a close frame to both client and backend.
+        Supports centralized Redis-backed mode for cross-instance frame rate coordination.
       properties:
         frames_per_second:
           type: integer
@@ -1579,6 +1580,40 @@ components:
           type: string
           default: "Frame rate exceeded"
           description: Close frame reason text sent when the frame rate is exceeded.
+        sync_mode:
+          type: string
+          enum: [local, redis]
+          default: local
+          description: "Frame counter storage: 'local' (in-memory) or 'redis' (centralized). Any RESP-compatible server works."
+        redis_url:
+          type: string
+          description: "Redis connection URL. Required when sync_mode is 'redis'."
+        redis_tls:
+          type: boolean
+          default: false
+          description: "Enable TLS for the Redis connection. CA verification uses gateway-level FERRUM_TLS_CA_BUNDLE_PATH; skip-verify uses FERRUM_TLS_NO_VERIFY."
+        redis_key_prefix:
+          type: string
+          default: "ferrum:ws_rate_limiting"
+          description: Key prefix for all Redis keys
+        redis_pool_size:
+          type: integer
+          default: 4
+          description: Number of multiplexed Redis connections
+        redis_username:
+          type: string
+          description: Redis username for ACL authentication
+        redis_password:
+          type: string
+          description: Redis password
+        redis_connect_timeout_seconds:
+          type: integer
+          default: 5
+          description: Redis connection timeout in seconds
+        redis_health_check_interval_seconds:
+          type: integer
+          default: 5
+          description: Health check ping interval when Redis is unavailable
 
     # ── Circuit Breaker ─────────────────────────────────────────────
     CircuitBreakerConfig:
@@ -2898,7 +2933,7 @@ components:
 
     RateLimitingConfig:
       type: object
-      description: "Plugin: rate_limiting — Per-IP or per-consumer request rate limiting."
+      description: "Plugin: rate_limiting — Per-IP or per-consumer request rate limiting. Supports centralized Redis-backed mode for coordinating rate limits across multiple gateway instances."
       properties:
         limit_by:
           type: string
@@ -2921,6 +2956,40 @@ components:
           type: integer
           format: uint64
           description: Max requests per hour
+        sync_mode:
+          type: string
+          enum: [local, redis]
+          default: local
+          description: "Rate limit state storage: 'local' (in-memory per instance) or 'redis' (centralized across instances). Any RESP-compatible server works (Redis, Valkey, DragonflyDB, KeyDB, Garnet)."
+        redis_url:
+          type: string
+          description: "Redis connection URL (e.g., redis://host:6379/0). Required when sync_mode is 'redis'."
+        redis_tls:
+          type: boolean
+          default: false
+          description: "Enable TLS for the Redis connection (upgrades redis:// to rediss://). CA verification uses gateway-level FERRUM_TLS_CA_BUNDLE_PATH; skip-verify uses FERRUM_TLS_NO_VERIFY."
+        redis_key_prefix:
+          type: string
+          default: "ferrum:rate_limiting"
+          description: Key prefix for all Redis keys (namespace isolation)
+        redis_pool_size:
+          type: integer
+          default: 4
+          description: Number of multiplexed Redis connections
+        redis_username:
+          type: string
+          description: Redis username for ACL-based authentication (Redis 6+)
+        redis_password:
+          type: string
+          description: Redis password for authentication
+        redis_connect_timeout_seconds:
+          type: integer
+          default: 5
+          description: Redis connection timeout in seconds
+        redis_health_check_interval_seconds:
+          type: integer
+          default: 5
+          description: Interval in seconds for health check pings when Redis is marked unavailable
 
     RequestSizeLimitingConfig:
       type: object
@@ -3221,7 +3290,7 @@ components:
 
     AiRateLimiterConfig:
       type: object
-      description: "Plugin: ai_rate_limiter — Token-aware rate limiting for LLM APIs."
+      description: "Plugin: ai_rate_limiter — Token-aware rate limiting for LLM APIs. Supports centralized Redis-backed mode for cross-instance token budget coordination."
       properties:
         token_limit:
           type: integer
@@ -3249,6 +3318,40 @@ components:
           type: string
           default: auto
           description: LLM provider format for token extraction
+        sync_mode:
+          type: string
+          enum: [local, redis]
+          default: local
+          description: "Token budget storage: 'local' (in-memory) or 'redis' (centralized). Any RESP-compatible server works."
+        redis_url:
+          type: string
+          description: "Redis connection URL. Required when sync_mode is 'redis'."
+        redis_tls:
+          type: boolean
+          default: false
+          description: "Enable TLS for the Redis connection. CA verification uses gateway-level FERRUM_TLS_CA_BUNDLE_PATH; skip-verify uses FERRUM_TLS_NO_VERIFY."
+        redis_key_prefix:
+          type: string
+          default: "ferrum:ai_rate_limiter"
+          description: Key prefix for all Redis keys
+        redis_pool_size:
+          type: integer
+          default: 4
+          description: Number of multiplexed Redis connections
+        redis_username:
+          type: string
+          description: Redis username for ACL authentication
+        redis_password:
+          type: string
+          description: Redis password
+        redis_connect_timeout_seconds:
+          type: integer
+          default: 5
+          description: Redis connection timeout in seconds
+        redis_health_check_interval_seconds:
+          type: integer
+          default: 5
+          description: Health check ping interval when Redis is unavailable
 
     AiPromptShieldConfig:
       type: object

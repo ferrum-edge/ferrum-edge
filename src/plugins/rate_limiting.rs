@@ -6,7 +6,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::warn;
 
-use super::{Plugin, PluginResult, RequestContext};
+use super::{Plugin, PluginHttpClient, PluginResult, RequestContext};
+
+use super::utils::redis_rate_limiter::{RedisConfig, RedisRateLimitClient};
 
 /// Sliding window rate limiter. Tracks individual request timestamps within the
 /// window to provide exact counting with zero boundary-burst vulnerability.
@@ -194,12 +196,16 @@ pub struct RateLimiting {
     expose_headers: bool,
     /// Window specifications used to create RateWindows per key.
     window_specs: Vec<WindowSpec>,
-    // key -> windows
+    // key -> windows (local in-memory state)
     state: Arc<DashMap<String, Vec<RateWindow>>>,
+    /// Redis-backed rate limiter for centralized mode. When set, rate limit
+    /// counters are stored in Redis so multiple gateway instances share state.
+    /// Falls back to local `state` DashMap when Redis is unreachable.
+    redis_client: Option<Arc<RedisRateLimitClient>>,
 }
 
 impl RateLimiting {
-    pub fn new(config: &Value) -> Self {
+    pub fn new(config: &Value, http_client: PluginHttpClient) -> Self {
         let limit_by = config["limit_by"].as_str().unwrap_or("ip").to_string();
         let expose_headers = config["expose_headers"].as_bool().unwrap_or(false);
 
@@ -240,11 +246,30 @@ impl RateLimiting {
             );
         }
 
+        let dns_cache = http_client.dns_cache().cloned();
+        let tls_no_verify = http_client.tls_no_verify();
+        let tls_ca_bundle_path = http_client.tls_ca_bundle_path().map(|s| s.to_string());
+        let redis_client =
+            RedisConfig::from_plugin_config(config, "ferrum:rate_limiting").map(|cfg| {
+                tracing::info!(
+                    redis_url = %cfg.url,
+                    key_prefix = %cfg.key_prefix,
+                    "rate_limiting: centralized Redis mode enabled"
+                );
+                Arc::new(RedisRateLimitClient::new(
+                    cfg,
+                    dns_cache,
+                    tls_no_verify,
+                    tls_ca_bundle_path.as_deref(),
+                ))
+            });
+
         Self {
             limit_by,
             expose_headers,
             window_specs,
             state: Arc::new(DashMap::new()),
+            redis_client,
         }
     }
 
@@ -260,9 +285,51 @@ impl RateLimiting {
             .retain(|_, windows| windows.iter().any(|w| w.has_recent_activity(now)));
     }
 
+    /// Check rate limit using Redis (centralized mode).
+    ///
+    /// Uses a two-window weighted approximation for sliding window semantics:
+    /// the previous window's count is weighted by `(1 - elapsed_fraction)` and
+    /// added to the current window's count. This provides smooth rate limiting
+    /// without boundary bursts, using only native Redis commands.
+    ///
+    /// Returns `None` if Redis is unavailable (caller should fall back to local).
+    async fn check_rate_redis(
+        &self,
+        redis: &RedisRateLimitClient,
+        key: &str,
+        spec: &WindowSpec,
+    ) -> Option<RedisCheckResult> {
+        if !redis.is_available() {
+            return None;
+        }
+
+        let window_secs = spec.duration.as_secs().max(1);
+        let curr_idx = RedisRateLimitClient::window_index(window_secs);
+        let prev_idx = curr_idx.saturating_sub(1);
+        let elapsed_fraction = RedisRateLimitClient::elapsed_fraction(window_secs);
+
+        let curr_key = redis.make_key(&[key, &curr_idx.to_string()]);
+        let prev_key = redis.make_key(&[key, &prev_idx.to_string()]);
+
+        // TTL: 2x window to keep previous window data available for the weighted calc
+        let ttl = window_secs * 2 + 1;
+
+        match redis
+            .sliding_window_check(&prev_key, &curr_key, ttl, elapsed_fraction, spec.limit)
+            .await
+        {
+            Ok(result) => Some(RedisCheckResult {
+                allowed: result.allowed,
+                remaining: result.remaining,
+                limit: spec.limit,
+            }),
+            Err(()) => None, // Redis unavailable, fall back to local
+        }
+    }
+
     /// Rate check for stream connections (TCP/UDP). No metadata injection
     /// since streams don't have response headers to inject ratelimit info into.
-    fn check_rate_stream(&self, key: &str) -> PluginResult {
+    fn check_rate_stream_local(&self, key: &str) -> PluginResult {
         self.evict_stale_entries();
 
         let specs = &self.window_specs;
@@ -292,7 +359,37 @@ impl RateLimiting {
         PluginResult::Continue
     }
 
-    fn check_rate(&self, key: &str, ctx: &mut RequestContext) -> PluginResult {
+    /// Rate check for stream connections with Redis support.
+    async fn check_rate_stream_redis(&self, key: &str) -> Option<PluginResult> {
+        let redis = self.redis_client.as_ref()?;
+        if !redis.is_available() {
+            return None;
+        }
+
+        for spec in &self.window_specs {
+            if let Some(result) = self.check_rate_redis(redis, key, spec).await {
+                if !result.allowed {
+                    warn!(rate_limit_key = %key, plugin = "rate_limiting", "Rate limit exceeded (stream, redis)");
+                    let mut headers = HashMap::new();
+                    if self.expose_headers {
+                        headers.insert("x-ratelimit-limit".to_string(), result.limit.to_string());
+                        headers.insert("x-ratelimit-remaining".to_string(), "0".to_string());
+                    }
+                    return Some(PluginResult::Reject {
+                        status_code: 429,
+                        body: r#"{"error":"Rate limit exceeded"}"#.into(),
+                        headers,
+                    });
+                }
+            } else {
+                return None; // Redis unavailable, fall back to local
+            }
+        }
+
+        Some(PluginResult::Continue)
+    }
+
+    fn check_rate_local(&self, key: &str, ctx: &mut RequestContext) -> PluginResult {
         // Periodically evict stale entries to bound memory usage
         self.evict_stale_entries();
 
@@ -360,6 +457,104 @@ impl RateLimiting {
 
         PluginResult::Continue
     }
+
+    /// Check rate limit with Redis fallback to local.
+    async fn check_rate_redis_with_fallback(
+        &self,
+        key: &str,
+        ctx: &mut RequestContext,
+    ) -> Option<PluginResult> {
+        let redis = self.redis_client.as_ref()?;
+        if !redis.is_available() {
+            return None;
+        }
+
+        // Check all window specs against Redis
+        let mut tightest_remaining: Option<(u64, u64, u64)> = None; // (remaining, limit, window_secs)
+
+        for spec in &self.window_specs {
+            if let Some(result) = self.check_rate_redis(redis, key, spec).await {
+                if !result.allowed {
+                    warn!(rate_limit_key = %key, plugin = "rate_limiting", "Rate limit exceeded (redis)");
+                    let mut headers = HashMap::new();
+                    if self.expose_headers {
+                        headers.insert("x-ratelimit-limit".to_string(), result.limit.to_string());
+                        headers.insert("x-ratelimit-remaining".to_string(), "0".to_string());
+                        headers.insert(
+                            "x-ratelimit-window".to_string(),
+                            spec.duration.as_secs().to_string(),
+                        );
+                        headers.insert("x-ratelimit-identity".to_string(), key.to_string());
+                    }
+                    return Some(PluginResult::Reject {
+                        status_code: 429,
+                        body: r#"{"error":"Rate limit exceeded"}"#.into(),
+                        headers,
+                    });
+                }
+
+                // Track tightest window for header reporting
+                match &tightest_remaining {
+                    Some((prev_remaining, _, _)) if result.remaining < *prev_remaining => {
+                        tightest_remaining =
+                            Some((result.remaining, result.limit, spec.duration.as_secs()));
+                    }
+                    None => {
+                        tightest_remaining =
+                            Some((result.remaining, result.limit, spec.duration.as_secs()));
+                    }
+                    _ => {}
+                }
+            } else {
+                return None; // Redis unavailable, fall back to local
+            }
+        }
+
+        // Store rate info in metadata for header injection
+        if self.expose_headers
+            && let Some((remaining, limit, window_secs)) = tightest_remaining
+        {
+            ctx.metadata
+                .insert("ratelimit_limit".to_string(), limit.to_string());
+            ctx.metadata
+                .insert("ratelimit_remaining".to_string(), remaining.to_string());
+            ctx.metadata
+                .insert("ratelimit_window".to_string(), window_secs.to_string());
+            ctx.metadata
+                .insert("ratelimit_identity".to_string(), key.to_string());
+        }
+
+        Some(PluginResult::Continue)
+    }
+
+    /// Unified rate check: tries Redis first (if configured), falls back to local.
+    async fn check_rate(&self, key: &str, ctx: &mut RequestContext) -> PluginResult {
+        if self.redis_client.is_some()
+            && let Some(result) = self.check_rate_redis_with_fallback(key, ctx).await
+        {
+            return result;
+        }
+
+        self.check_rate_local(key, ctx)
+    }
+
+    /// Unified stream rate check: tries Redis first (if configured), falls back to local.
+    async fn check_rate_stream(&self, key: &str) -> PluginResult {
+        if self.redis_client.is_some()
+            && let Some(result) = self.check_rate_stream_redis(key).await
+        {
+            return result;
+        }
+
+        self.check_rate_stream_local(key)
+    }
+}
+
+/// Result of a Redis rate limit check for a single window.
+struct RedisCheckResult {
+    allowed: bool,
+    remaining: u64,
+    limit: u64,
 }
 
 #[async_trait]
@@ -384,19 +579,27 @@ impl Plugin for RateLimiting {
         self.expose_headers
     }
 
+    fn warmup_hostnames(&self) -> Vec<String> {
+        self.redis_client
+            .as_ref()
+            .and_then(|r| r.warmup_hostname())
+            .into_iter()
+            .collect()
+    }
+
     async fn on_stream_connect(
         &self,
         ctx: &mut super::StreamConnectionContext,
     ) -> super::PluginResult {
         let ip_key = format!("ip:{}", ctx.client_ip);
-        self.check_rate_stream(&ip_key)
+        self.check_rate_stream(&ip_key).await
     }
 
     async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult {
         // Phase 1: always enforce IP-based limits early (before auth).
         // This protects auth endpoints from brute-force regardless of limit_by mode.
         let ip_key = format!("ip:{}", ctx.client_ip);
-        self.check_rate(&ip_key, ctx)
+        self.check_rate(&ip_key, ctx).await
     }
 
     async fn authorize(&self, ctx: &mut RequestContext) -> PluginResult {
@@ -409,11 +612,11 @@ impl Plugin for RateLimiting {
 
         if let Some(consumer) = &ctx.identified_consumer {
             let key = format!("consumer:{}", consumer.username);
-            self.check_rate(&key, ctx)
+            self.check_rate(&key, ctx).await
         } else if let Some(ref identity) = ctx.authenticated_identity {
             // External auth (e.g. jwks_auth) identified a user without a gateway Consumer
             let key = format!("consumer:{}", identity);
-            self.check_rate(&key, ctx)
+            self.check_rate(&key, ctx).await
         } else {
             // No consumer identified — IP limit already applied in phase 1
             PluginResult::Continue

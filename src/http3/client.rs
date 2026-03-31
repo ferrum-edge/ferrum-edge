@@ -110,7 +110,7 @@ impl Http3ConnectionPool {
         backend_url: &str,
         headers: &[(http::header::HeaderName, http::header::HeaderValue)],
         body: bytes::Bytes,
-        tls_config_fn: impl FnOnce() -> Arc<rustls::ClientConfig>,
+        tls_config_fn: impl FnOnce() -> Result<Arc<rustls::ClientConfig>, anyhow::Error>,
     ) -> Result<(u16, Vec<u8>, HashMap<String, String>), anyhow::Error> {
         // Per-proxy override takes priority over global default
         let conns_per_backend = proxy
@@ -167,7 +167,7 @@ impl Http3ConnectionPool {
         }
 
         // Create new connection — only now do we need the TLS config
-        let tls_config = tls_config_fn();
+        let tls_config = tls_config_fn()?;
         let h3_config = super::config::Http3ServerConfig::from_env_config(&self.env_config);
         let (endpoint, sr) = Self::create_connection(proxy, &tls_config, Some(&h3_config)).await?;
         let mut sr_for_request = sr.clone();
@@ -208,7 +208,7 @@ impl Http3ConnectionPool {
         backend_url: &str,
         headers: &[(http::header::HeaderName, http::header::HeaderValue)],
         body: bytes::Bytes,
-        tls_config_fn: impl FnOnce() -> Arc<rustls::ClientConfig>,
+        tls_config_fn: impl FnOnce() -> Result<Arc<rustls::ClientConfig>, anyhow::Error>,
     ) -> Result<(u16, Vec<u8>, HashMap<String, String>), anyhow::Error> {
         let conns_per_backend = proxy
             .pool_http3_connections_per_backend
@@ -268,7 +268,7 @@ impl Http3ConnectionPool {
         }
 
         // Create new connection to the explicit target
-        let tls_config = tls_config_fn();
+        let tls_config = tls_config_fn()?;
         let h3_config = super::config::Http3ServerConfig::from_env_config(&self.env_config);
         let (endpoint, sr) = Self::create_connection_to_target(
             target_host,

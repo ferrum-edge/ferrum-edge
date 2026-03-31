@@ -3350,7 +3350,7 @@ fn hash_consumer_secrets(consumer: &mut Consumer) -> Result<(), String> {
 /// Uses HMAC-SHA256 with the configured secret (or default) for ~1μs verification.
 /// Falls back to bcrypt ($2b$, ~100ms) only if HMAC instance creation fails.
 fn hash_basic_auth_password(password: &str) -> Result<String, String> {
-    use hmac::{Hmac, Mac};
+    use hmac::{Hmac, KeyInit, Mac};
     use sha2::Sha256;
     type HmacSha256 = Hmac<Sha256>;
 

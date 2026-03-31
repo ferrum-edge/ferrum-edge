@@ -19,8 +19,8 @@ Ferrum Edge is configured primarily through environment variables. An optional `
 | `FERRUM_PROXY_HTTP_PORT` | No | `8000` | HTTP proxy listener port |
 | `FERRUM_PROXY_HTTPS_PORT` | No | `8443` | HTTPS proxy listener port |
 | `FERRUM_PROXY_BIND_ADDRESS` | No | `0.0.0.0` | Bind address for proxy listeners (HTTP, HTTPS, HTTP/3). Set to `::` for dual-stack IPv4+IPv6 |
-| `FERRUM_PROXY_TLS_CERT_PATH` | If HTTPS | — | Path to proxy TLS certificate |
-| `FERRUM_PROXY_TLS_KEY_PATH` | If HTTPS | — | Path to proxy TLS private key |
+| `FERRUM_FRONTEND_TLS_CERT_PATH` | If HTTPS | — | PEM certificate the gateway presents to incoming clients (HTTPS, WebSocket, gRPC, TCP/TLS) |
+| `FERRUM_FRONTEND_TLS_KEY_PATH` | If HTTPS | — | PEM private key for the gateway's frontend TLS certificate |
 
 ### Admin API
 
@@ -205,7 +205,7 @@ FERRUM_PROXY_HTTPS_PORT = 8443
 FERRUM_TLS_MIN_VERSION = 1.3
 
 # Quoted values for paths with spaces
-FERRUM_PROXY_TLS_CERT_PATH = "/path/with spaces/cert.pem"
+FERRUM_FRONTEND_TLS_CERT_PATH = "/path/with spaces/cert.pem"
 ```
 
 - Lines starting with `#` are comments

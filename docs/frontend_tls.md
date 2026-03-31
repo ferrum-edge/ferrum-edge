@@ -18,10 +18,10 @@ Required for HTTPS mode:
 
 ```bash
 # Server certificate (PEM format)
-export FERRUM_PROXY_TLS_CERT_PATH="/path/to/server.crt"
+export FERRUM_FRONTEND_TLS_CERT_PATH="/path/to/server.crt"
 
 # Server private key (PEM format)  
-export FERRUM_PROXY_TLS_KEY_PATH="/path/to/server.key"
+export FERRUM_FRONTEND_TLS_KEY_PATH="/path/to/server.key"
 ```
 
 ### Client Certificate Verification (mTLS)
@@ -51,8 +51,8 @@ No TLS configuration needed:
 Enable server TLS:
 
 ```bash
-export FERRUM_PROXY_TLS_CERT_PATH="/etc/ssl/certs/gateway.crt"
-export FERRUM_PROXY_TLS_KEY_PATH="/etc/ssl/private/gateway.key"
+export FERRUM_FRONTEND_TLS_CERT_PATH="/etc/ssl/certs/gateway.crt"
+export FERRUM_FRONTEND_TLS_KEY_PATH="/etc/ssl/private/gateway.key"
 
 ./ferrum-edge
 ```
@@ -70,8 +70,8 @@ export FERRUM_PROXY_TLS_KEY_PATH="/etc/ssl/private/gateway.key"
 Enable server TLS + client verification:
 
 ```bash
-export FERRUM_PROXY_TLS_CERT_PATH="/etc/ssl/certs/gateway.crt"
-export FERRUM_PROXY_TLS_KEY_PATH="/etc/ssl/private/gateway.key"
+export FERRUM_FRONTEND_TLS_CERT_PATH="/etc/ssl/certs/gateway.crt"
+export FERRUM_FRONTEND_TLS_KEY_PATH="/etc/ssl/private/gateway.key"
 export FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH="/etc/ssl/certs/client-ca-bundle.pem"
 
 ./ferrum-edge
@@ -125,8 +125,8 @@ TLS not configured - HTTPS listener disabled
 **Staging:**
 ```bash
 # Both HTTP and HTTPS for testing
-export FERRUM_PROXY_TLS_CERT_PATH="./staging.crt"
-export FERRUM_PROXY_TLS_KEY_PATH="./staging.key"
+export FERRUM_FRONTEND_TLS_CERT_PATH="./staging.crt"
+export FERRUM_FRONTEND_TLS_KEY_PATH="./staging.key"
 ./ferrum-edge
 # Access: http://localhost:8000 AND https://localhost:8443
 ```
@@ -134,8 +134,8 @@ export FERRUM_PROXY_TLS_KEY_PATH="./staging.key"
 **Production:**
 ```bash
 # HTTPS/mTLS only, block HTTP at firewall
-export FERRUM_PROXY_TLS_CERT_PATH="/prod/certs/gateway.crt"
-export FERRUM_PROXY_TLS_KEY_PATH="/prod/certs/gateway.key"
+export FERRUM_FRONTEND_TLS_CERT_PATH="/prod/certs/gateway.crt"
+export FERRUM_FRONTEND_TLS_KEY_PATH="/prod/certs/gateway.key"
 export FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH="/prod/certs/client-ca.pem"
 ./ferrum-edge
 # Access: https://localhost:8443 (mTLS required)
@@ -315,8 +315,8 @@ cp ca.crt client-ca-bundle.pem
 ### Configure Gateway
 
 ```bash
-export FERRUM_PROXY_TLS_CERT_PATH="./server.crt"
-export FERRUM_PROXY_TLS_KEY_PATH="./server.key"
+export FERRUM_FRONTEND_TLS_CERT_PATH="./server.crt"
+export FERRUM_FRONTEND_TLS_KEY_PATH="./server.key"
 export FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH="./client-ca-bundle.pem"
 
 ./ferrum-edge
@@ -331,6 +331,31 @@ curl --cert client.crt --key client.key https://localhost:8443/api/v1
 # Test without client certificate (should fail)
 curl https://localhost:8443/api/v1
 ```
+
+## Certificate Reload Behavior
+
+**Ferrum Edge does not dynamically reload any TLS certificate files.** This applies to every TLS surface:
+
+| Category | Environment Variables |
+|----------|---------------------|
+| **Frontend proxy** | `FERRUM_FRONTEND_TLS_CERT_PATH`, `FERRUM_FRONTEND_TLS_KEY_PATH`, `FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH` |
+| **Admin API** | `FERRUM_ADMIN_TLS_CERT_PATH`, `FERRUM_ADMIN_TLS_KEY_PATH`, `FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH` |
+| **Backend mTLS (global)** | `FERRUM_BACKEND_TLS_CLIENT_CERT_PATH`, `FERRUM_BACKEND_TLS_CLIENT_KEY_PATH`, `FERRUM_TLS_CA_BUNDLE_PATH` |
+| **Backend mTLS (per-proxy)** | `backend_tls_client_cert_path`, `backend_tls_client_key_path`, `backend_tls_server_ca_cert_path` in proxy config |
+| **DTLS (UDP)** | `FERRUM_DTLS_CERT_PATH`, `FERRUM_DTLS_KEY_PATH`, `FERRUM_DTLS_CLIENT_CA_CERT_PATH` |
+| **gRPC CP/DP** | `FERRUM_CP_GRPC_TLS_CERT_PATH`, `FERRUM_CP_GRPC_TLS_KEY_PATH`, `FERRUM_CP_GRPC_TLS_CLIENT_CA_PATH`, `FERRUM_DP_GRPC_TLS_CA_CERT_PATH`, `FERRUM_DP_GRPC_TLS_CLIENT_CERT_PATH`, `FERRUM_DP_GRPC_TLS_CLIENT_KEY_PATH` |
+
+**All TLS certificate files are validated at startup and config load time.** If any configured certificate or key file is missing, unreadable (permission denied), or contains invalid/corrupt PEM data, the gateway **refuses to start** (or rejects the config reload). There is no silent fallback to unauthenticated or unencrypted connections. Client cert and key paths must always be configured as a pair.
+
+Frontend, admin, DTLS, and gRPC certificates are read at process startup. Global and per-proxy backend mTLS certificates are validated at config load time and read again when the connection pool entry for a proxy is first created.
+
+**No TLS surface supports hot reload — not frontend, not backend, not admin, not DTLS, not gRPC.** A config reload (SIGHUP in file mode, database polling, or CP→DP gRPC sync) refreshes routing, plugins, consumers, and upstreams — but does **not** re-read any TLS certificate files from disk. This includes frontend server certs, client CA bundles, backend mTLS certs/keys, backend CA bundles, DTLS certs, and gRPC TLS certs.
+
+**To rotate certificates**, replace the files on disk and **restart the gateway process**. In Kubernetes, a rolling restart after a Secret update is the standard approach. For per-proxy backend cert paths, a config reload (SIGHUP, DB poll, or gRPC sync) refreshes the proxy config but does **not** re-read existing TLS files from disk for cached pool entries — only newly created pool entries will read the updated files.
+
+### Backend Connection Pool and TLS Paths
+
+For reqwest-based backend paths (HTTP/1.1, HTTP/2 via reqwest, HTTP/3 frontend-to-backend), each unique combination of `backend_tls_client_cert_path`, `backend_tls_client_key_path`, and `backend_tls_server_ca_cert_path` produces a **separate `reqwest::Client` pool entry**. Two proxies with different cert paths targeting the same backend host will not share connections. For rustls-based paths (gRPC pool, HTTP/2 direct pool), the TLS config is built per-connection rather than per-pool-entry, but the same isolation principle applies — different cert paths produce different TLS configurations.
 
 ## Security Best Practices
 
@@ -576,7 +601,7 @@ When using load balancers:
 ### From HTTP to HTTPS
 
 1. Obtain server certificate and private key
-2. Set `FERRUM_PROXY_TLS_CERT_PATH` and `FERRUM_PROXY_TLS_KEY_PATH`
+2. Set `FERRUM_FRONTEND_TLS_CERT_PATH` and `FERRUM_FRONTEND_TLS_KEY_PATH`
 3. Update client applications to use HTTPS URLs
 4. Test thoroughly before production deployment
 
