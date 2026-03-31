@@ -133,7 +133,7 @@ strip = true
 opt-level = 2           # still optimised, but less aggressive
 
 [build-dependencies]
-tonic-build = "0.12"
+tonic-build = "0.14"
 
 [dev-dependencies]
 tempfile = "3"
