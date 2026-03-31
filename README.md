@@ -119,6 +119,18 @@ cargo run --release
 
 For production CP/DP with TLS, see [docs/cp_dp_mode.md](docs/cp_dp_mode.md#transport-security-tlsmtls).
 
+## Default Ports
+
+| Port | Protocol | Purpose |
+|------|----------|---------|
+| `8000` | HTTP | Proxy traffic |
+| `8443` | HTTPS | Proxy traffic (TLS) |
+| `9000` | HTTP | Admin API |
+| `9443` | HTTPS | Admin API (TLS) |
+| `50051` | gRPC | Control Plane → Data Plane sync |
+
+All ports are configurable via environment variables (`FERRUM_PROXY_HTTP_PORT`, `FERRUM_PROXY_HTTPS_PORT`, `FERRUM_ADMIN_HTTP_PORT`, `FERRUM_ADMIN_HTTPS_PORT`, `FERRUM_CP_GRPC_LISTEN_ADDR`).
+
 ## Configuration
 
 Ferrum Edge is configured through environment variables, with an optional `ferrum.conf` file for defaults. Environment variables take precedence.
