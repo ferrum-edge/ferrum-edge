@@ -12,6 +12,7 @@ use tracing::{debug, error, info, warn};
 
 use super::config::Http3ServerConfig;
 use crate::config::types::{AuthMode, Proxy};
+use crate::dns::DnsCacheResolver;
 use crate::plugins::{Plugin, PluginResult, ProxyProtocol, RequestContext, TransactionSummary};
 use crate::proxy::ProxyState;
 use crate::tls::TlsPolicy;
@@ -1005,6 +1006,7 @@ async fn proxy_to_backend_h3_streaming(
         Ok(client) => client,
         Err(e) => {
             error!("Failed to get client from pool: {}", e);
+            let resolver = DnsCacheResolver::new(state.dns_cache.clone());
             reqwest::Client::builder()
                 .connect_timeout(std::time::Duration::from_millis(
                     proxy.backend_connect_timeout_ms,
@@ -1015,6 +1017,7 @@ async fn proxy_to_backend_h3_streaming(
                 .danger_accept_invalid_certs(
                     !proxy.backend_tls_verify_server_cert || state.env_config.tls_no_verify,
                 )
+                .dns_resolver(Arc::new(resolver))
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new())
         }
@@ -1275,6 +1278,7 @@ async fn proxy_to_backend_h3(
         Ok(client) => client,
         Err(e) => {
             error!("Failed to get client from pool: {}", e);
+            let resolver = DnsCacheResolver::new(state.dns_cache.clone());
             reqwest::Client::builder()
                 .connect_timeout(std::time::Duration::from_millis(
                     proxy.backend_connect_timeout_ms,
@@ -1285,6 +1289,7 @@ async fn proxy_to_backend_h3(
                 .danger_accept_invalid_certs(
                     !proxy.backend_tls_verify_server_cert || state.env_config.tls_no_verify,
                 )
+                .dns_resolver(Arc::new(resolver))
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new())
         }

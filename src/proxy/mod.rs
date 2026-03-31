@@ -34,7 +34,7 @@ use crate::config::types::{
 };
 use crate::connection_pool::ConnectionPool;
 use crate::consumer_index::ConsumerIndex;
-use crate::dns::DnsCache;
+use crate::dns::{DnsCache, DnsCacheResolver};
 use crate::health_check::HealthChecker;
 use crate::http3::client::Http3ConnectionPool;
 use crate::load_balancer::{HashOnStrategy, LoadBalancerCache};
@@ -231,7 +231,8 @@ impl ProxyState {
         // Initialize health checker with the gateway's pool settings so active
         // probes share connection tuning (keep-alive, idle timeout, HTTP/2) with
         // regular proxy traffic.
-        let mut health_checker = HealthChecker::with_pool_config(&global_pool_config);
+        let mut health_checker =
+            HealthChecker::with_pool_config(&global_pool_config, dns_cache.clone());
         health_checker.set_load_balancer_cache(load_balancer_cache.clone());
         health_checker.start(&config);
         let health_checker = Arc::new(health_checker);
@@ -3928,7 +3929,8 @@ async fn proxy_to_backend(
         Ok(client) => client,
         Err(e) => {
             error!("Failed to get client from pool: {}", e);
-            // Fallback to creating new client
+            // Fallback to creating new client with shared DNS cache
+            let resolver = DnsCacheResolver::new(state.dns_cache.clone());
             reqwest::Client::builder()
                 .connect_timeout(std::time::Duration::from_millis(
                     proxy.backend_connect_timeout_ms,
@@ -3939,6 +3941,7 @@ async fn proxy_to_backend(
                 .danger_accept_invalid_certs(
                     !proxy.backend_tls_verify_server_cert || state.env_config.tls_no_verify,
                 )
+                .dns_resolver(Arc::new(resolver))
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new())
         }

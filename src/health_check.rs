@@ -5,8 +5,9 @@
 //!
 //! Active health checks share a single `reqwest::Client` configured with the
 //! gateway's global connection pool settings (keep-alive, idle timeout, HTTP/2,
-//! TCP keep-alive) so that probe connections behave like real proxy traffic and
-//! benefit from connection reuse across targets.
+//! TCP keep-alive) and the shared DNS cache so that probe connections behave
+//! like real proxy traffic and benefit from connection reuse and cached DNS
+//! resolution across targets.
 
 mod grpc_health_v1 {
     tonic::include_proto!("grpc.health.v1");
@@ -16,6 +17,7 @@ use crate::config::pool_config::PoolConfig;
 use crate::config::types::{
     ActiveHealthCheck, GatewayConfig, HealthProbeType, PassiveHealthCheck, UpstreamTarget,
 };
+use crate::dns::{DnsCache, DnsCacheResolver};
 use crate::load_balancer::LoadBalancerCache;
 use dashmap::DashMap;
 use std::sync::Arc;
@@ -82,29 +84,75 @@ pub struct HealthChecker {
 
 impl Default for HealthChecker {
     fn default() -> Self {
-        Self::with_pool_config(&PoolConfig::default())
+        Self::without_dns_cache(&PoolConfig::default())
     }
 }
 
 impl HealthChecker {
-    /// Create a health checker using default pool settings.
+    /// Create a health checker using default pool settings and no DNS cache.
     ///
     /// Prefer [`with_pool_config`] in production to inherit the gateway's
-    /// tuned connection pool settings. Kept for tests and integration code
-    /// that constructs `HealthChecker` without a full `PoolConfig`.
+    /// tuned connection pool settings and DNS cache. Kept for tests and
+    /// integration code that constructs `HealthChecker` without a full config.
     #[allow(dead_code)]
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Create a health checker with an HTTP client configured from the
-    /// gateway's global pool settings.
+    /// gateway's global pool settings and shared DNS cache.
     ///
-    /// The shared client inherits keep-alive, idle timeout, HTTP/2, and
-    /// TCP keep-alive settings so that health probe connections behave
-    /// like real proxy traffic and benefit from connection reuse.
-    pub fn with_pool_config(pool_config: &PoolConfig) -> Self {
-        let client = build_health_check_client(pool_config);
+    /// The shared client inherits keep-alive, idle timeout, HTTP/2,
+    /// TCP keep-alive, and DNS cache settings so that health probe
+    /// connections behave like real proxy traffic and benefit from
+    /// connection reuse and cached DNS resolution.
+    pub fn with_pool_config(pool_config: &PoolConfig, dns_cache: DnsCache) -> Self {
+        let client = build_health_check_client(pool_config, dns_cache);
+        Self {
+            unhealthy_targets: Arc::new(DashMap::new()),
+            target_states: Arc::new(DashMap::new()),
+            http_client: Arc::new(client),
+            active_check_handles: Vec::new(),
+            lb_cache: None,
+        }
+    }
+
+    /// Create a health checker without DNS cache (for tests).
+    ///
+    /// Uses reqwest's default DNS resolution. Prefer [`with_pool_config`]
+    /// in production to share the gateway's DNS cache.
+    fn without_dns_cache(pool_config: &PoolConfig) -> Self {
+        let mut builder = reqwest::Client::builder()
+            .pool_max_idle_per_host(pool_config.max_idle_per_host)
+            .pool_idle_timeout(Duration::from_secs(pool_config.idle_timeout_seconds))
+            .danger_accept_invalid_certs(true);
+
+        if pool_config.enable_http_keep_alive {
+            builder = builder.tcp_keepalive(Duration::from_secs(pool_config.tcp_keepalive_seconds));
+        }
+
+        if pool_config.enable_http2 {
+            builder = builder
+                .http2_keep_alive_interval(Duration::from_secs(
+                    pool_config.http2_keep_alive_interval_seconds,
+                ))
+                .http2_keep_alive_timeout(Duration::from_secs(
+                    pool_config.http2_keep_alive_timeout_seconds,
+                ));
+        }
+
+        let client = match builder.build() {
+            Ok(client) => client,
+            Err(e) => {
+                tracing::error!(
+                    "Failed to build health check HTTP client: {}. \
+                     Falling back to default client.",
+                    e
+                );
+                reqwest::Client::new()
+            }
+        };
+
         Self {
             unhealthy_targets: Arc::new(DashMap::new()),
             target_states: Arc::new(DashMap::new()),
@@ -641,22 +689,25 @@ async fn grpc_probe(
 }
 
 /// Build a shared `reqwest::Client` for active health check probes using the
-/// gateway's global pool configuration.
+/// gateway's global pool configuration and shared DNS cache.
 ///
 /// The client inherits:
 /// - `pool_max_idle_per_host` — connection reuse across periodic probes
 /// - `pool_idle_timeout` — stale probe connections cleaned up automatically
 /// - TCP keep-alive — detects dead connections between probe intervals
 /// - HTTP/2 keep-alive — multiplexed probe streams stay healthy
+/// - Gateway DNS cache — shared TTL, stale-while-revalidate, background refresh
 ///
 /// TLS verification is relaxed for health probes since backends may use
 /// self-signed certs in internal environments. The per-probe timeout is
 /// applied at the request level in `start_active_check`, not here.
-fn build_health_check_client(pool_config: &PoolConfig) -> reqwest::Client {
+fn build_health_check_client(pool_config: &PoolConfig, dns_cache: DnsCache) -> reqwest::Client {
+    let resolver = DnsCacheResolver::new(dns_cache);
     let mut builder = reqwest::Client::builder()
         .pool_max_idle_per_host(pool_config.max_idle_per_host)
         .pool_idle_timeout(Duration::from_secs(pool_config.idle_timeout_seconds))
-        .danger_accept_invalid_certs(true);
+        .danger_accept_invalid_certs(true)
+        .dns_resolver(Arc::new(resolver));
 
     if pool_config.enable_http_keep_alive {
         builder = builder.tcp_keepalive(Duration::from_secs(pool_config.tcp_keepalive_seconds));
