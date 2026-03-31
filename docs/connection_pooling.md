@@ -138,5 +138,5 @@ In performance tests (8 threads, 100 connections, 30 seconds):
 - **2-3x Higher Throughput**: Connection reuse eliminates setup overhead
 - **Lower Latency**: Persistent connections avoid TCP handshakes
 - **Resource Efficiency**: Fewer file descriptors and memory usage
-- **Protocol Support**: HTTP/1.1 keep-alive, HTTP/2, HTTPS, WebSocket (WS/WSS)
+- **Protocol Support**: HTTP/1.1 keep-alive, HTTP/2, HTTP/3, HTTPS, WebSocket (WS/WSS), gRPC (dedicated H2 pool)
 - **Flexible Configuration**: Global defaults with per-proxy fine-tuning
