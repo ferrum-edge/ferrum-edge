@@ -20,7 +20,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let test_message = "Hello from client! This should echo back through the gateway!";
     info!("📤 Sending test message: '{}'", test_message);
     
-    if let Err(e) = ws_sender.send(Message::Text(test_message.to_string())).await {
+    if let Err(e) = ws_sender
+        .send(Message::Text(test_message.to_string().into()))
+        .await
+    {
         error!("❌ Failed to send message: {}", e);
         return Err(e.into());
     }
@@ -46,7 +49,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
             let second_message = "Second message - testing bidirectional flow again!";
             info!("📤 Sending second message: '{}'", second_message);
             
-            if let Err(e) = ws_sender.send(Message::Text(second_message.to_string())).await {
+            if let Err(e) = ws_sender
+                .send(Message::Text(second_message.to_string().into()))
+                .await
+            {
                 error!("❌ Failed to send second message: {}", e);
             } else {
                 // Wait for second response

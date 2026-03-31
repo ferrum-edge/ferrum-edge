@@ -115,7 +115,7 @@ async fn test_text_frame_over_limit_returns_close_1009() {
                 cf.code,
                 tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Size
             );
-            assert_eq!(cf.reason.as_ref(), "Message too large");
+            assert_eq!(cf.reason.as_str(), "Message too large");
         }
         other => panic!("Expected Close frame, got {:?}", other),
     }
@@ -126,7 +126,7 @@ async fn test_text_frame_over_limit_returns_close_1009() {
 #[tokio::test]
 async fn test_binary_frame_under_limit_passes() {
     let plugin = WsMessageSizeLimiting::new(&json!({"max_frame_bytes": 100}));
-    let msg = Message::Binary(vec![0u8; 50]);
+    let msg = Message::Binary(vec![0u8; 50].into());
     let result = plugin
         .on_ws_frame(
             "test-proxy",
@@ -141,7 +141,7 @@ async fn test_binary_frame_under_limit_passes() {
 #[tokio::test]
 async fn test_binary_frame_over_limit_returns_close() {
     let plugin = WsMessageSizeLimiting::new(&json!({"max_frame_bytes": 10}));
-    let msg = Message::Binary(vec![0u8; 11]);
+    let msg = Message::Binary(vec![0u8; 11].into());
     let result = plugin
         .on_ws_frame(
             "test-proxy",
@@ -159,7 +159,7 @@ async fn test_binary_frame_over_limit_returns_close() {
 #[tokio::test]
 async fn test_ping_frame_under_limit_passes() {
     let plugin = WsMessageSizeLimiting::new(&json!({"max_frame_bytes": 100}));
-    let msg = Message::Ping(vec![1, 2, 3]);
+    let msg = Message::Ping(vec![1, 2, 3].into());
     let result = plugin
         .on_ws_frame(
             "test-proxy",
@@ -174,7 +174,7 @@ async fn test_ping_frame_under_limit_passes() {
 #[tokio::test]
 async fn test_ping_frame_over_limit_returns_close() {
     let plugin = WsMessageSizeLimiting::new(&json!({"max_frame_bytes": 2}));
-    let msg = Message::Ping(vec![1, 2, 3]);
+    let msg = Message::Ping(vec![1, 2, 3].into());
     let result = plugin
         .on_ws_frame(
             "test-proxy",
@@ -235,7 +235,7 @@ async fn test_custom_close_reason() {
         .await;
     match result.unwrap() {
         Message::Close(Some(cf)) => {
-            assert_eq!(cf.reason.as_ref(), "Payload exceeds proxy limit");
+            assert_eq!(cf.reason.as_str(), "Payload exceeds proxy limit");
         }
         other => panic!("Expected Close frame, got {:?}", other),
     }
@@ -261,7 +261,7 @@ async fn test_close_frame_passthrough() {
 #[tokio::test]
 async fn test_pong_frame_passthrough() {
     let plugin = WsMessageSizeLimiting::new(&json!({"max_frame_bytes": 1}));
-    let msg = Message::Pong(vec![0; 100]);
+    let msg = Message::Pong(vec![0; 100].into());
     let result = plugin
         .on_ws_frame(
             "test-proxy",
@@ -279,7 +279,7 @@ async fn test_pong_frame_passthrough() {
 #[tokio::test]
 async fn test_empty_text_frame_always_passes() {
     let plugin = WsMessageSizeLimiting::new(&json!({"max_frame_bytes": 1}));
-    let msg = Message::Text(String::new());
+    let msg = Message::Text(String::new().into());
     let result = plugin
         .on_ws_frame(
             "test-proxy",
@@ -294,7 +294,7 @@ async fn test_empty_text_frame_always_passes() {
 #[tokio::test]
 async fn test_empty_binary_frame_always_passes() {
     let plugin = WsMessageSizeLimiting::new(&json!({"max_frame_bytes": 1}));
-    let msg = Message::Binary(vec![]);
+    let msg = Message::Binary(vec![].into());
     let result = plugin
         .on_ws_frame(
             "test-proxy",
@@ -309,7 +309,7 @@ async fn test_empty_binary_frame_always_passes() {
 #[tokio::test]
 async fn test_large_binary_frame_rejected() {
     let plugin = WsMessageSizeLimiting::new(&json!({"max_frame_bytes": 65536}));
-    let msg = Message::Binary(vec![0u8; 65537]); // 1 byte over 64 KiB
+    let msg = Message::Binary(vec![0u8; 65537].into()); // 1 byte over 64 KiB
     let result = plugin
         .on_ws_frame(
             "test-proxy",
