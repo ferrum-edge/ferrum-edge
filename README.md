@@ -364,3 +364,5 @@ See [docs/ci_cd.md](docs/ci_cd.md) for pipeline details.
 Copyright (c) 2026 Ferrum Edge
 
 Licensed under the [PolyForm Noncommercial License 1.0.0](LICENSE).
+
+**TL;DR**: Free to use as long as you're not reselling our technology. Hobbyists, students, researchers, nonprofits — go wild. Companies evaluating Ferrum for a proof-of-concept or demo? Also totally fine, kick the tires. But if you're dropping this into your production network stack, we kindly ask that you grab a [commercial license](LICENSE-COMMERCIAL.md) and help fund our caffeine supply. Open source doesn't run on exposure — it runs on coffee, and coffee costs money.
