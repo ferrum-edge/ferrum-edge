@@ -1495,6 +1495,42 @@ fn validate_string_field(field_name: &str, value: &str, max_len: usize) -> Resul
     Ok(())
 }
 
+/// Validate that a PEM certificate file exists, is readable, and contains at least one valid certificate.
+pub fn validate_pem_cert_file(field_name: &str, path: &str) -> Result<(), String> {
+    let file = std::fs::File::open(path).map_err(|e| {
+        format!(
+            "{}: failed to open certificate file '{}': {}",
+            field_name, path, e
+        )
+    })?;
+    let certs: Vec<_> = rustls_pemfile::certs(&mut std::io::BufReader::new(file))
+        .filter_map(|r| r.ok())
+        .collect();
+    if certs.is_empty() {
+        return Err(format!(
+            "{}: no valid PEM certificates found in '{}'",
+            field_name, path
+        ));
+    }
+    Ok(())
+}
+
+/// Validate that a PEM private key file exists, is readable, and contains at least one valid PKCS8 private key.
+pub fn validate_pem_key_file(field_name: &str, path: &str) -> Result<(), String> {
+    let file = std::fs::File::open(path)
+        .map_err(|e| format!("{}: failed to open key file '{}': {}", field_name, path, e))?;
+    let keys: Vec<_> = rustls_pemfile::pkcs8_private_keys(&mut std::io::BufReader::new(file))
+        .filter_map(|r| r.ok())
+        .collect();
+    if keys.is_empty() {
+        return Err(format!(
+            "{}: no valid PKCS8 private keys found in '{}'",
+            field_name, path
+        ));
+    }
+    Ok(())
+}
+
 /// Validate a u64 field is within a range.
 fn validate_u64_range(field_name: &str, value: u64, min: u64, max: u64) -> Result<(), String> {
     if value < min || value > max {
@@ -1544,6 +1580,23 @@ impl Proxy {
     /// This validates field values only — uniqueness checks (listen_path conflicts,
     /// name uniqueness, upstream_id existence) are done separately in the admin handlers.
     pub fn validate_fields(&self) -> Result<(), Vec<String>> {
+        self.validate_fields_inner(None)
+    }
+
+    /// Validate fields with a shared cache of already-validated TLS file paths.
+    /// When multiple proxies reference the same cert/key/CA file, each path is
+    /// opened and parsed only once — subsequent proxies skip the I/O.
+    pub fn validate_fields_with_cache(
+        &self,
+        validated_tls_paths: &mut std::collections::HashSet<String>,
+    ) -> Result<(), Vec<String>> {
+        self.validate_fields_inner(Some(validated_tls_paths))
+    }
+
+    fn validate_fields_inner(
+        &self,
+        mut validated_tls_paths: Option<&mut std::collections::HashSet<String>>,
+    ) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
 
         // Name
@@ -1747,6 +1800,65 @@ impl Proxy {
             )
         {
             errors.push(e);
+        }
+
+        // TLS cert/key pairing: both must be set or neither
+        match (
+            &self.backend_tls_client_cert_path,
+            &self.backend_tls_client_key_path,
+        ) {
+            (Some(_), None) => {
+                errors.push(
+                    "backend_tls_client_cert_path is set but backend_tls_client_key_path is missing — both must be configured together".to_string(),
+                );
+            }
+            (None, Some(_)) => {
+                errors.push(
+                    "backend_tls_client_key_path is set but backend_tls_client_cert_path is missing — both must be configured together".to_string(),
+                );
+            }
+            _ => {}
+        }
+
+        // TLS file content validation: open, read, and parse PEM files.
+        // When a validated_tls_paths cache is provided (batch validation), paths
+        // that were already validated by a prior proxy are skipped to avoid
+        // redundant file I/O when many proxies share the same cert files.
+        if let Some(ref path) = self.backend_tls_client_cert_path {
+            let already_validated = validated_tls_paths
+                .as_ref()
+                .is_some_and(|s| s.contains(path.as_str()));
+            if !already_validated {
+                if let Err(e) = validate_pem_cert_file("backend_tls_client_cert_path", path) {
+                    errors.push(e);
+                } else if let Some(ref mut cache) = validated_tls_paths {
+                    cache.insert(path.clone());
+                }
+            }
+        }
+        if let Some(ref path) = self.backend_tls_client_key_path {
+            let already_validated = validated_tls_paths
+                .as_ref()
+                .is_some_and(|s| s.contains(path.as_str()));
+            if !already_validated {
+                if let Err(e) = validate_pem_key_file("backend_tls_client_key_path", path) {
+                    errors.push(e);
+                } else if let Some(ref mut cache) = validated_tls_paths {
+                    cache.insert(path.clone());
+                }
+            }
+        }
+        if let Some(ref path) = self.backend_tls_server_ca_cert_path {
+            let already_validated = validated_tls_paths
+                .as_ref()
+                .is_some_and(|s| s.contains(path.as_str()));
+            if !already_validated {
+                if let Err(e) = validate_pem_cert_file("backend_tls_server_ca_cert_path", path) {
+                    errors.push(e);
+                } else if let Some(ref mut cache) = validated_tls_paths {
+                    cache.insert(path.clone());
+                }
+            }
         }
 
         // Allowed methods validation
@@ -2436,8 +2548,11 @@ impl GatewayConfig {
     pub fn validate_all_fields(&self) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
 
+        // Shared cache: when multiple proxies reference the same TLS file path,
+        // each file is opened and parsed only once during batch validation.
+        let mut validated_tls_paths = std::collections::HashSet::new();
         for proxy in &self.proxies {
-            if let Err(errs) = proxy.validate_fields() {
+            if let Err(errs) = proxy.validate_fields_with_cache(&mut validated_tls_paths) {
                 for e in errs {
                     errors.push(format!("Proxy '{}': {}", proxy.id, e));
                 }

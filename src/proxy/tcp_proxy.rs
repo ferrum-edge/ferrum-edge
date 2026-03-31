@@ -38,11 +38,17 @@ impl CachedBackendTlsConfig {
     fn build(
         proxy: &Proxy,
         tls_no_verify: bool,
+        global_tls_ca_bundle_path: Option<&str>,
         tls_policy: Option<&TlsPolicy>,
     ) -> Result<Self, anyhow::Error> {
-        // Build root certificate store
+        // Build root certificate store: proxy CA → global CA → empty (with NoVerifier)
         let mut root_store = rustls::RootCertStore::empty();
-        if let Some(ca_path) = &proxy.backend_tls_server_ca_cert_path {
+        let ca_path = proxy
+            .backend_tls_server_ca_cert_path
+            .as_deref()
+            .or(global_tls_ca_bundle_path);
+        let has_ca = ca_path.is_some();
+        if let Some(ca_path) = ca_path {
             let ca_data = std::fs::read(ca_path)
                 .map_err(|e| anyhow::anyhow!("Failed to read CA cert {}: {}", ca_path, e))?;
             let certs = rustls_pemfile::certs(&mut &ca_data[..])
@@ -53,8 +59,6 @@ impl CachedBackendTlsConfig {
                     .add(cert)
                     .map_err(|e| anyhow::anyhow!("Failed to add CA cert: {}", e))?;
             }
-        } else {
-            root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
         }
 
         // Build TLS client config with optional client auth, using TLS policy
@@ -81,7 +85,9 @@ impl CachedBackendTlsConfig {
                 .with_no_client_auth()
         };
 
-        if !proxy.backend_tls_verify_server_cert || tls_no_verify {
+        // Disable verification if explicitly requested OR if no CA is configured at all
+        // (empty root store would reject every cert, so NoVerifier is more useful).
+        if !proxy.backend_tls_verify_server_cert || tls_no_verify || !has_ca {
             tls_config
                 .dangerous()
                 .set_certificate_verifier(Arc::new(NoVerifier));
@@ -114,6 +120,8 @@ pub struct TcpListenerConfig {
     pub shutdown: watch::Receiver<bool>,
     pub metrics: Arc<TcpProxyMetrics>,
     pub tls_no_verify: bool,
+    /// Global CA bundle path for outbound TLS verification (fallback when proxy has no per-proxy CA).
+    pub tls_ca_bundle_path: Option<String>,
     pub plugin_cache: Arc<PluginCache>,
     /// Global default TCP idle timeout in seconds. Per-proxy `tcp_idle_timeout_seconds` overrides.
     pub tcp_idle_timeout_seconds: u64,
@@ -142,6 +150,7 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
         shutdown,
         metrics,
         tls_no_verify,
+        tls_ca_bundle_path,
         plugin_cache,
         tcp_idle_timeout_seconds: global_tcp_idle_timeout,
         circuit_breaker_cache,
@@ -181,7 +190,7 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
             .find(|p| *p.id == *proxy_id)
             .filter(|p| p.backend_protocol == BackendProtocol::TcpTls)
             .map(|proxy| {
-                CachedBackendTlsConfig::build(proxy, tls_no_verify, tls_policy.as_deref())
+                CachedBackendTlsConfig::build(proxy, tls_no_verify, tls_ca_bundle_path.as_deref(), tls_policy.as_deref())
                     .map(Arc::new)
                     .unwrap_or_else(|e| {
                         warn!(proxy_id = %proxy_id, "Failed to pre-build backend TLS config: {}, will retry per-connection", e);

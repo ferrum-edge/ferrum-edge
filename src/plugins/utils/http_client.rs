@@ -91,10 +91,11 @@ impl PluginHttpClient {
             .pool_idle_timeout(Duration::from_secs(pool_config.idle_timeout_seconds))
             .connect_timeout(Duration::from_secs(30))
             .timeout(Duration::from_secs(60))
-            .danger_accept_invalid_certs(tls_no_verify)
+            .danger_accept_invalid_certs(tls_no_verify || tls_ca_bundle_path.is_none())
             .dns_resolver(Arc::new(resolver));
 
-        // Load custom CA bundle for verifying internal/corporate CAs
+        // Load custom CA bundle for verifying internal/corporate CAs.
+        // When no CA is configured, danger_accept_invalid_certs is already true.
         if !tls_no_verify && let Some(ca_path) = tls_ca_bundle_path {
             match std::fs::read(ca_path) {
                 Ok(ca_pem) => match reqwest::Certificate::from_pem(&ca_pem) {

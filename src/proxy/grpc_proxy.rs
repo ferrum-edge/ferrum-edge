@@ -411,50 +411,30 @@ impl GrpcConnectionPool {
         use rustls::pki_types::ServerName;
         use tokio_rustls::TlsConnector;
 
-        // Build root certificate store
-        let mut root_store = rustls::RootCertStore {
-            roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
-        };
+        // Build root certificate store — proxy-specific CA takes priority over global CA.
+        // No webpki roots: if no CA is configured, we use an empty store and set NoVerifier below.
+        let mut root_store = rustls::RootCertStore::empty();
+        let ca_path = proxy
+            .backend_tls_server_ca_cert_path
+            .as_ref()
+            .or(self.global_env_config.tls_ca_bundle_path.as_ref());
+        let has_ca = ca_path.is_some();
 
-        // Add per-proxy CA certificate if configured (takes priority over global bundle)
-        if let Some(ref ca_path) = proxy.backend_tls_server_ca_cert_path {
-            match std::fs::read(ca_path) {
-                Ok(ca_pem) => {
-                    let mut reader = std::io::BufReader::new(&ca_pem[..]);
-                    let certs = rustls_pemfile::certs(&mut reader);
-                    for cert in certs.flatten() {
-                        if let Err(e) = root_store.add(cert) {
-                            warn!("gRPC: failed to add CA cert from {}: {}", ca_path, e);
-                        }
-                    }
-                    debug!("gRPC: loaded per-proxy CA cert from {}", ca_path);
-                }
-                Err(e) => {
-                    warn!("gRPC: failed to read CA cert from {}: {}", ca_path, e);
+        if let Some(ca_bundle_path) = ca_path {
+            let ca_pem = std::fs::read(ca_bundle_path).map_err(|e| {
+                GrpcProxyError::Internal(format!(
+                    "Failed to read CA bundle from {}: {}",
+                    ca_bundle_path, e
+                ))
+            })?;
+            let mut reader = std::io::BufReader::new(&ca_pem[..]);
+            let certs = rustls_pemfile::certs(&mut reader);
+            for cert in certs.flatten() {
+                if let Err(e) = root_store.add(cert) {
+                    warn!("gRPC: failed to add CA cert from bundle: {}", e);
                 }
             }
-        } else if !self.global_env_config.tls_no_verify
-            && let Some(ca_bundle_path) = &self.global_env_config.tls_ca_bundle_path
-        {
-            // Fall back to global CA bundle
-            match std::fs::read(ca_bundle_path) {
-                Ok(ca_pem) => {
-                    let mut reader = std::io::BufReader::new(&ca_pem[..]);
-                    let certs = rustls_pemfile::certs(&mut reader);
-                    for cert in certs.flatten() {
-                        if let Err(e) = root_store.add(cert) {
-                            warn!("gRPC: failed to add CA cert from bundle: {}", e);
-                        }
-                    }
-                    debug!("gRPC: loaded custom CA bundle from {}", ca_bundle_path);
-                }
-                Err(e) => {
-                    warn!(
-                        "gRPC: failed to read CA bundle from {}: {}",
-                        ca_bundle_path, e
-                    );
-                }
-            }
+            debug!("gRPC: loaded custom CA bundle from {}", ca_bundle_path);
         }
 
         // Load mTLS client certificate if configured (proxy-specific overrides take priority)
@@ -519,8 +499,9 @@ impl GrpcConnectionPool {
         // Force HTTP/2 via ALPN
         tls_config.alpn_protocols = vec![b"h2".to_vec()];
 
-        // Optionally skip server cert verification
-        if !proxy.backend_tls_verify_server_cert || self.global_env_config.tls_no_verify {
+        // Skip server cert verification if explicitly disabled, global no_verify, or no CA configured
+        if !proxy.backend_tls_verify_server_cert || self.global_env_config.tls_no_verify || !has_ca
+        {
             tls_config
                 .dangerous()
                 .set_certificate_verifier(Arc::new(NoVerifier));

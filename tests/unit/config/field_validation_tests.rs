@@ -821,6 +821,118 @@ fn test_proxy_tls_paths_control_chars() {
     );
 }
 
+// ---- TLS cert file content validation tests ----
+
+#[test]
+fn test_proxy_tls_cert_file_not_found() {
+    let mut proxy = make_proxy("test", "/api");
+    proxy.backend_tls_client_cert_path = Some("/nonexistent/cert.pem".into());
+    proxy.backend_tls_client_key_path = Some("/nonexistent/key.pem".into());
+    let errs = proxy.validate_fields().unwrap_err();
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("backend_tls_client_cert_path") && e.contains("failed to open")),
+        "Expected cert file-not-found error, got: {:?}",
+        errs
+    );
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("backend_tls_client_key_path") && e.contains("failed to open")),
+        "Expected key file-not-found error, got: {:?}",
+        errs
+    );
+}
+
+#[test]
+fn test_proxy_tls_ca_cert_file_not_found() {
+    let mut proxy = make_proxy("test", "/api");
+    proxy.backend_tls_server_ca_cert_path = Some("/nonexistent/ca.pem".into());
+    let errs = proxy.validate_fields().unwrap_err();
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("backend_tls_server_ca_cert_path") && e.contains("failed to open")),
+        "Expected CA file-not-found error, got: {:?}",
+        errs
+    );
+}
+
+#[test]
+fn test_proxy_tls_cert_file_invalid_pem() {
+    use std::io::Write;
+    let cert_file = tempfile::NamedTempFile::new().unwrap();
+    let key_file = tempfile::NamedTempFile::new().unwrap();
+    // Write garbage, not valid PEM
+    write!(&cert_file, "not a valid PEM certificate").unwrap();
+    write!(&key_file, "not a valid PEM key").unwrap();
+
+    let mut proxy = make_proxy("test", "/api");
+    proxy.backend_tls_client_cert_path = Some(cert_file.path().to_str().unwrap().to_string());
+    proxy.backend_tls_client_key_path = Some(key_file.path().to_str().unwrap().to_string());
+    let errs = proxy.validate_fields().unwrap_err();
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("backend_tls_client_cert_path")
+                && e.contains("no valid PEM certificates")),
+        "Expected invalid PEM cert error, got: {:?}",
+        errs
+    );
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("backend_tls_client_key_path")
+                && e.contains("no valid PKCS8 private keys")),
+        "Expected invalid PEM key error, got: {:?}",
+        errs
+    );
+}
+
+#[test]
+fn test_proxy_tls_cert_without_key_pairing_error() {
+    let mut proxy = make_proxy("test", "/api");
+    proxy.backend_tls_client_cert_path = Some("/some/cert.pem".into());
+    // key_path intentionally not set
+    let errs = proxy.validate_fields().unwrap_err();
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("backend_tls_client_key_path is missing")),
+        "Expected cert/key pairing error, got: {:?}",
+        errs
+    );
+}
+
+#[test]
+fn test_proxy_tls_key_without_cert_pairing_error() {
+    let mut proxy = make_proxy("test", "/api");
+    proxy.backend_tls_client_key_path = Some("/some/key.pem".into());
+    // cert_path intentionally not set
+    let errs = proxy.validate_fields().unwrap_err();
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("backend_tls_client_cert_path is missing")),
+        "Expected cert/key pairing error, got: {:?}",
+        errs
+    );
+}
+
+#[test]
+fn test_proxy_tls_valid_cert_files_pass() {
+    let cert_path = std::fs::canonicalize("tests/certs/server.crt")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let key_path = std::fs::canonicalize("tests/certs/server.key")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    let mut proxy = make_proxy("test", "/api");
+    proxy.backend_tls_client_cert_path = Some(cert_path.clone());
+    proxy.backend_tls_client_key_path = Some(key_path);
+    proxy.backend_tls_server_ca_cert_path = Some(cert_path);
+    assert!(proxy.validate_fields().is_ok());
+}
+
 // ---- Allowed methods validation tests ----
 
 #[test]

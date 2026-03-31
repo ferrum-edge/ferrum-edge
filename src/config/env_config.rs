@@ -1091,6 +1091,39 @@ impl EnvConfig {
             ));
         }
 
+        // Validate global backend TLS cert/key files exist and are parseable
+        match (
+            &self.backend_tls_client_cert_path,
+            &self.backend_tls_client_key_path,
+        ) {
+            (Some(_), None) => {
+                return Err(
+                    "FERRUM_BACKEND_TLS_CLIENT_CERT_PATH is set but FERRUM_BACKEND_TLS_CLIENT_KEY_PATH is missing — both must be configured together".into(),
+                );
+            }
+            (None, Some(_)) => {
+                return Err(
+                    "FERRUM_BACKEND_TLS_CLIENT_KEY_PATH is set but FERRUM_BACKEND_TLS_CLIENT_CERT_PATH is missing — both must be configured together".into(),
+                );
+            }
+            _ => {}
+        }
+        if let Some(ref path) = self.backend_tls_client_cert_path {
+            crate::config::types::validate_pem_cert_file(
+                "FERRUM_BACKEND_TLS_CLIENT_CERT_PATH",
+                path,
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        if let Some(ref path) = self.backend_tls_client_key_path {
+            crate::config::types::validate_pem_key_file("FERRUM_BACKEND_TLS_CLIENT_KEY_PATH", path)
+                .map_err(|e| e.to_string())?;
+        }
+        if let Some(ref path) = self.tls_ca_bundle_path {
+            crate::config::types::validate_pem_cert_file("FERRUM_TLS_CA_BUNDLE_PATH", path)
+                .map_err(|e| e.to_string())?;
+        }
+
         // Non-fatal security warnings
         if self.tls_no_verify {
             eprintln!(

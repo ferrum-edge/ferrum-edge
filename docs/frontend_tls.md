@@ -332,6 +332,27 @@ curl --cert client.crt --key client.key https://localhost:8443/api/v1
 curl https://localhost:8443/api/v1
 ```
 
+## Certificate Reload Behavior
+
+**Ferrum Edge does not dynamically reload any TLS certificate files.** This applies to every TLS surface:
+
+| Category | Environment Variables |
+|----------|---------------------|
+| **Frontend proxy** | `FERRUM_PROXY_TLS_CERT_PATH`, `FERRUM_PROXY_TLS_KEY_PATH`, `FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH` |
+| **Admin API** | `FERRUM_ADMIN_TLS_CERT_PATH`, `FERRUM_ADMIN_TLS_KEY_PATH`, `FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH` |
+| **Backend mTLS (global)** | `FERRUM_BACKEND_TLS_CLIENT_CERT_PATH`, `FERRUM_BACKEND_TLS_CLIENT_KEY_PATH`, `FERRUM_TLS_CA_BUNDLE_PATH` |
+| **Backend mTLS (per-proxy)** | `backend_tls_client_cert_path`, `backend_tls_client_key_path`, `backend_tls_server_ca_cert_path` in proxy config |
+| **DTLS (UDP)** | `FERRUM_DTLS_CERT_PATH`, `FERRUM_DTLS_KEY_PATH`, `FERRUM_DTLS_CLIENT_CA_CERT_PATH` |
+| **gRPC CP/DP** | `FERRUM_CP_GRPC_TLS_CERT_PATH`, `FERRUM_CP_GRPC_TLS_KEY_PATH`, `FERRUM_CP_GRPC_TLS_CLIENT_CA_PATH`, `FERRUM_DP_GRPC_TLS_CA_CERT_PATH`, `FERRUM_DP_GRPC_TLS_CLIENT_CERT_PATH`, `FERRUM_DP_GRPC_TLS_CLIENT_KEY_PATH` |
+
+**All TLS certificate files are validated at startup and config load time.** If any configured certificate or key file is missing, unreadable (permission denied), or contains invalid/corrupt PEM data, the gateway **refuses to start** (or rejects the config reload). There is no silent fallback to unauthenticated or unencrypted connections. Client cert and key paths must always be configured as a pair.
+
+Frontend, admin, DTLS, and gRPC certificates are read at process startup. Global and per-proxy backend mTLS certificates are validated at config load time and read again when the connection pool entry for a proxy is first created.
+
+**No TLS surface supports hot reload — not frontend, not backend, not admin, not DTLS, not gRPC.** A config reload (SIGHUP in file mode, database polling, or CP→DP gRPC sync) refreshes routing, plugins, consumers, and upstreams — but does **not** re-read any TLS certificate files from disk. This includes frontend server certs, client CA bundles, backend mTLS certs/keys, backend CA bundles, DTLS certs, and gRPC TLS certs.
+
+**To rotate certificates**, replace the files on disk and **restart the gateway process**. In Kubernetes, a rolling restart after a Secret update is the standard approach.
+
 ## Security Best Practices
 
 ### Production Environments

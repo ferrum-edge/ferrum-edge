@@ -1007,6 +1007,9 @@ async fn proxy_to_backend_h3_streaming(
         Err(e) => {
             error!("Failed to get client from pool: {}", e);
             let resolver = DnsCacheResolver::new(state.dns_cache.clone());
+            // No CA configured (proxy or global) = no verify, same as pool path
+            let has_ca = proxy.backend_tls_server_ca_cert_path.is_some()
+                || state.env_config.tls_ca_bundle_path.is_some();
             reqwest::Client::builder()
                 .connect_timeout(std::time::Duration::from_millis(
                     proxy.backend_connect_timeout_ms,
@@ -1015,7 +1018,9 @@ async fn proxy_to_backend_h3_streaming(
                     proxy.backend_read_timeout_ms,
                 ))
                 .danger_accept_invalid_certs(
-                    !proxy.backend_tls_verify_server_cert || state.env_config.tls_no_verify,
+                    !proxy.backend_tls_verify_server_cert
+                        || state.env_config.tls_no_verify
+                        || !has_ca,
                 )
                 .dns_resolver(Arc::new(resolver))
                 .build()
@@ -1279,6 +1284,9 @@ async fn proxy_to_backend_h3(
         Err(e) => {
             error!("Failed to get client from pool: {}", e);
             let resolver = DnsCacheResolver::new(state.dns_cache.clone());
+            // No CA configured (proxy or global) = no verify, same as pool path
+            let has_ca = proxy.backend_tls_server_ca_cert_path.is_some()
+                || state.env_config.tls_ca_bundle_path.is_some();
             reqwest::Client::builder()
                 .connect_timeout(std::time::Duration::from_millis(
                     proxy.backend_connect_timeout_ms,
@@ -1287,7 +1295,9 @@ async fn proxy_to_backend_h3(
                     proxy.backend_read_timeout_ms,
                 ))
                 .danger_accept_invalid_certs(
-                    !proxy.backend_tls_verify_server_cert || state.env_config.tls_no_verify,
+                    !proxy.backend_tls_verify_server_cert
+                        || state.env_config.tls_no_verify
+                        || !has_ca,
                 )
                 .dns_resolver(Arc::new(resolver))
                 .build()
