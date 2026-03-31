@@ -1616,7 +1616,7 @@ dependencies = [
  "pin-project-lite",
  "prost",
  "quinn",
- "rand 0.8.5",
+ "rand 0.10.0",
  "rcgen",
  "regex",
  "reqwest 0.12.28",
