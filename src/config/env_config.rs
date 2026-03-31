@@ -1037,13 +1037,19 @@ impl EnvConfig {
 
         // Non-fatal security warnings
         if self.tls_no_verify {
-            eprintln!("WARNING: FERRUM_TLS_NO_VERIFY=true — outbound TLS certificate verification is DISABLED. Do not use in production.");
+            eprintln!(
+                "WARNING: FERRUM_TLS_NO_VERIFY=true — outbound TLS certificate verification is DISABLED. Do not use in production."
+            );
         }
         if self.admin_tls_no_verify {
-            eprintln!("WARNING: FERRUM_ADMIN_TLS_NO_VERIFY=true — admin TLS certificate verification is DISABLED. Do not use in production.");
+            eprintln!(
+                "WARNING: FERRUM_ADMIN_TLS_NO_VERIFY=true — admin TLS certificate verification is DISABLED. Do not use in production."
+            );
         }
         if self.dp_grpc_tls_no_verify {
-            eprintln!("WARNING: FERRUM_DP_GRPC_TLS_NO_VERIFY=true — gRPC TLS certificate verification is DISABLED. Do not use in production.");
+            eprintln!(
+                "WARNING: FERRUM_DP_GRPC_TLS_NO_VERIFY=true — gRPC TLS certificate verification is DISABLED. Do not use in production."
+            );
         }
 
         Ok(())
