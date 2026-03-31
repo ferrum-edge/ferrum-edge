@@ -863,6 +863,8 @@ paths:
                 type: array
                 items:
                   $ref: "#/components/schemas/Upstream"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
     post:
@@ -884,8 +886,12 @@ paths:
                 $ref: "#/components/schemas/Upstream"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/ReadOnly"
+        "409":
+          $ref: "#/components/responses/Conflict"
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
 
@@ -906,6 +912,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Upstream"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
         "404":
           $ref: "#/components/responses/NotFound"
         "503":
@@ -929,10 +937,14 @@ paths:
                 $ref: "#/components/schemas/Upstream"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/ReadOnly"
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
     delete:
@@ -942,6 +954,8 @@ paths:
       responses:
         "204":
           description: Upstream deleted
+        "401":
+          $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/ReadOnly"
         "404":

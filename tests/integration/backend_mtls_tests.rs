@@ -172,6 +172,7 @@ fn create_test_env_config_with_mtls(
         max_connections: 0,
         tcp_listen_backlog: 2048,
         server_http2_max_concurrent_streams: 250,
+        ..Default::default()
     }
 }
 

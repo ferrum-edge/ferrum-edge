@@ -1265,3 +1265,115 @@ fn test_env_config_tcp_idle_timeout_zero_disables() {
         },
     );
 }
+
+// ============================================================================
+// Database Connection Pool Configuration Tests
+// ============================================================================
+
+#[test]
+fn test_env_config_db_pool_defaults() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+        ],
+        || {
+            remove_var("FERRUM_DB_POOL_MAX_CONNECTIONS");
+            remove_var("FERRUM_DB_POOL_MIN_CONNECTIONS");
+            remove_var("FERRUM_DB_POOL_ACQUIRE_TIMEOUT_SECONDS");
+            remove_var("FERRUM_DB_POOL_IDLE_TIMEOUT_SECONDS");
+            remove_var("FERRUM_DB_POOL_MAX_LIFETIME_SECONDS");
+
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.db_pool_max_connections, 10);
+            assert_eq!(config.db_pool_min_connections, 1);
+            assert_eq!(config.db_pool_acquire_timeout_seconds, 30);
+            assert_eq!(config.db_pool_idle_timeout_seconds, 600);
+            assert_eq!(config.db_pool_max_lifetime_seconds, 300);
+        },
+    );
+}
+
+#[test]
+fn test_env_config_db_pool_custom_values() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "database"),
+            ("FERRUM_ADMIN_JWT_SECRET", "secret"),
+            ("FERRUM_DB_TYPE", "postgres"),
+            ("FERRUM_DB_URL", "postgres://localhost/ferrum"),
+            ("FERRUM_DB_POOL_MAX_CONNECTIONS", "50"),
+            ("FERRUM_DB_POOL_MIN_CONNECTIONS", "5"),
+            ("FERRUM_DB_POOL_ACQUIRE_TIMEOUT_SECONDS", "60"),
+            ("FERRUM_DB_POOL_IDLE_TIMEOUT_SECONDS", "1200"),
+            ("FERRUM_DB_POOL_MAX_LIFETIME_SECONDS", "600"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.db_pool_max_connections, 50);
+            assert_eq!(config.db_pool_min_connections, 5);
+            assert_eq!(config.db_pool_acquire_timeout_seconds, 60);
+            assert_eq!(config.db_pool_idle_timeout_seconds, 1200);
+            assert_eq!(config.db_pool_max_lifetime_seconds, 600);
+        },
+    );
+}
+
+#[test]
+fn test_env_config_db_pool_max_connections_minimum_clamped() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_DB_POOL_MAX_CONNECTIONS", "0"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(
+                config.db_pool_max_connections, 1,
+                "max_connections should be clamped to at least 1"
+            );
+        },
+    );
+}
+
+#[test]
+fn test_env_config_db_pool_min_connections_zero_allowed() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_DB_POOL_MIN_CONNECTIONS", "0"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(
+                config.db_pool_min_connections, 0,
+                "min_connections=0 should be allowed (no eager warming)"
+            );
+        },
+    );
+}
+
+#[test]
+fn test_env_config_db_pool_invalid_values_use_defaults() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_DB_POOL_MAX_CONNECTIONS", "not_a_number"),
+            ("FERRUM_DB_POOL_MIN_CONNECTIONS", "abc"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(
+                config.db_pool_max_connections, 10,
+                "invalid max_connections should fall back to default"
+            );
+            assert_eq!(
+                config.db_pool_min_connections, 1,
+                "invalid min_connections should fall back to default"
+            );
+        },
+    );
+}

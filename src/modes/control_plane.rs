@@ -11,7 +11,7 @@ use tracing::{error, info, warn};
 use crate::admin::jwt_auth::create_jwt_manager_from_env;
 use crate::admin::{self, AdminState};
 use crate::config::EnvConfig;
-use crate::config::db_loader::DatabaseStore;
+use crate::config::db_loader::{DatabaseStore, DbPoolConfig};
 use crate::dns::{DnsCache, DnsConfig};
 use crate::grpc::cp_server::CpGrpcServer;
 use crate::tls::{self, TlsPolicy};
@@ -24,6 +24,13 @@ pub async fn run(
         .effective_db_url()
         .unwrap_or_else(|| "sqlite://ferrum.db".to_string());
     let failover_urls = env_config.effective_db_failover_urls();
+    let pool_config = DbPoolConfig {
+        max_connections: env_config.db_pool_max_connections,
+        min_connections: env_config.db_pool_min_connections,
+        acquire_timeout_seconds: env_config.db_pool_acquire_timeout_seconds,
+        idle_timeout_seconds: env_config.db_pool_idle_timeout_seconds,
+        max_lifetime_seconds: env_config.db_pool_max_lifetime_seconds,
+    };
     let mut db = DatabaseStore::connect_with_failover(
         env_config.db_type.as_deref().unwrap_or("sqlite"),
         &effective_url,
@@ -33,6 +40,7 @@ pub async fn run(
         env_config.db_tls_client_cert_path.as_deref(),
         env_config.db_tls_client_key_path.as_deref(),
         env_config.db_tls_insecure,
+        pool_config,
     )
     .await?;
 

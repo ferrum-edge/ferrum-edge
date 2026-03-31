@@ -135,6 +135,27 @@ pub struct EnvConfig {
     /// back to primary if the replica is unreachable.
     pub db_read_replica_url: Option<String>,
 
+    // Database connection pool tuning
+    /// Maximum number of connections in the database pool. Default: 10.
+    /// Increase for CP mode with many DPs or high admin API concurrency.
+    pub db_pool_max_connections: u32,
+    /// Minimum number of idle connections maintained in the pool. Default: 1.
+    /// Higher values reduce cold-start latency at the cost of holding open
+    /// connections. Set to 0 to allow the pool to shrink to zero idle.
+    pub db_pool_min_connections: u32,
+    /// Maximum time (seconds) to wait for a connection from the pool before
+    /// returning an error. Default: 30. Prevents unbounded waits when the
+    /// pool is exhausted under load.
+    pub db_pool_acquire_timeout_seconds: u64,
+    /// Maximum time (seconds) a connection can sit idle before being closed.
+    /// Default: 600 (10 minutes). Keeps the pool from holding stale connections.
+    pub db_pool_idle_timeout_seconds: u64,
+    /// Maximum lifetime (seconds) of a connection before it is closed and
+    /// replaced. Default: 300 (5 minutes). Forces DNS re-resolution and
+    /// prevents stale server-side state. Defence-in-depth alongside the
+    /// explicit DnsCache-based reconnect.
+    pub db_pool_max_lifetime_seconds: u64,
+
     // CP/DP
     pub cp_grpc_listen_addr: Option<String>,
     pub cp_grpc_jwt_secret: Option<String>,
@@ -366,6 +387,11 @@ impl Default for EnvConfig {
             db_config_backup_path: None,
             db_failover_urls: Vec::new(),
             db_read_replica_url: None,
+            db_pool_max_connections: 10,
+            db_pool_min_connections: 1,
+            db_pool_acquire_timeout_seconds: 30,
+            db_pool_idle_timeout_seconds: 600,
+            db_pool_max_lifetime_seconds: 300,
             cp_grpc_listen_addr: None,
             cp_grpc_jwt_secret: None,
             dp_cp_grpc_url: None,
@@ -502,6 +528,30 @@ impl EnvConfig {
                 })
                 .unwrap_or_default(),
             db_read_replica_url: resolve_var(conf, "FERRUM_DB_READ_REPLICA_URL"),
+
+            // Database connection pool tuning
+            db_pool_max_connections: resolve_var(conf, "FERRUM_DB_POOL_MAX_CONNECTIONS")
+                .and_then(|v| v.parse().ok())
+                .map(|v: u32| v.max(1))
+                .unwrap_or(10),
+            db_pool_min_connections: resolve_var(conf, "FERRUM_DB_POOL_MIN_CONNECTIONS")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1),
+            db_pool_acquire_timeout_seconds: resolve_u64(
+                conf,
+                "FERRUM_DB_POOL_ACQUIRE_TIMEOUT_SECONDS",
+                30,
+            ),
+            db_pool_idle_timeout_seconds: resolve_u64(
+                conf,
+                "FERRUM_DB_POOL_IDLE_TIMEOUT_SECONDS",
+                600,
+            ),
+            db_pool_max_lifetime_seconds: resolve_u64(
+                conf,
+                "FERRUM_DB_POOL_MAX_LIFETIME_SECONDS",
+                300,
+            ),
 
             cp_grpc_listen_addr: resolve_var(conf, "FERRUM_CP_GRPC_LISTEN_ADDR"),
             cp_grpc_jwt_secret: resolve_var(conf, "FERRUM_CP_GRPC_JWT_SECRET"),

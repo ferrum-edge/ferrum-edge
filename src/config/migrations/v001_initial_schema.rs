@@ -141,6 +141,7 @@ impl V001InitialSchema {
                 listen_port INTEGER,
                 frontend_tls INTEGER NOT NULL DEFAULT 0,
                 udp_idle_timeout_seconds INTEGER NOT NULL DEFAULT 60,
+                tcp_idle_timeout_seconds INTEGER,
                 allowed_methods TEXT,
                 created_at VARCHAR(50) NOT NULL,
                 updated_at VARCHAR(50) NOT NULL,
@@ -190,6 +191,7 @@ impl V001InitialSchema {
                 listen_port INTEGER,
                 frontend_tls INTEGER NOT NULL DEFAULT 0,
                 udp_idle_timeout_seconds INTEGER NOT NULL DEFAULT 60,
+                tcp_idle_timeout_seconds INTEGER,
                 allowed_methods TEXT,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP

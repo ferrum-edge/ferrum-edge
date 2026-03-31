@@ -312,9 +312,10 @@ Each test runs a gateway with protocol-specific config (`configs/*.yaml`) and a 
 
 1. Add the field to the appropriate struct in `src/config/types.rs` with `#[serde(default)]`
 2. If env-var driven: add parsing in `src/config/env_config.rs`
-3. If database-stored: update migration in `src/config/migrations/` and `db_loader.rs`
-4. Add unit tests for deserialization in `tests/unit/config/`
-5. Update `openapi.yaml` if the Admin API exposes it
+3. **Update `ferrum.conf`** — every new `FERRUM_*` env var must also be added to `ferrum.conf` with a commented-out default and descriptive comment. The conf file and env vars must stay in sync.
+4. If database-stored: update migration in `src/config/migrations/` and `db_loader.rs`
+5. Add unit tests for deserialization in `tests/unit/config/`
+6. Update `openapi.yaml` if the Admin API exposes it
 
 ### Database Considerations
 
@@ -346,6 +347,7 @@ Each test runs a gateway with protocol-specific config (`configs/*.yaml`) and a 
 - [ ] No dead code (clippy enforces `-D dead-code`)
 - [ ] PR description includes a summary, list of changes, and test plan
 - [ ] Documentation updated if adding/changing features (FEATURES.md, README.md, docs/, openapi.yaml)
+- [ ] New `FERRUM_*` env vars added to `ferrum.conf` with commented defaults
 
 ### Commit Message Style
 
@@ -382,6 +384,11 @@ Reduce per-request allocations in plugin lookup
 | `FERRUM_DB_CONFIG_BACKUP_PATH` | (none) | Path to externally provided JSON config backup for startup failover when DB is unreachable |
 | `FERRUM_DB_FAILOVER_URLS` | (empty) | Comma-separated failover database URLs (tried in order when primary is unreachable) |
 | `FERRUM_DB_READ_REPLICA_URL` | (none) | Read replica URL for config polling (reduces primary load, falls back to primary) |
+| `FERRUM_DB_POOL_MAX_CONNECTIONS` | `10` | Max connections in the database pool. Increase for CP mode with many DPs |
+| `FERRUM_DB_POOL_MIN_CONNECTIONS` | `1` | Min idle connections maintained in the pool (eager warming) |
+| `FERRUM_DB_POOL_ACQUIRE_TIMEOUT_SECONDS` | `30` | Max seconds to wait for a pool connection before error |
+| `FERRUM_DB_POOL_IDLE_TIMEOUT_SECONDS` | `600` | Max seconds a connection can sit idle before eviction |
+| `FERRUM_DB_POOL_MAX_LIFETIME_SECONDS` | `300` | Max lifetime of a connection (forces DNS re-resolution) |
 | `FERRUM_CP_GRPC_LISTEN_ADDR` | `0.0.0.0:50051` | CP gRPC server listen address |
 | `FERRUM_CP_GRPC_TLS_CERT_PATH` | (none) | PEM cert for CP gRPC TLS |
 | `FERRUM_CP_GRPC_TLS_KEY_PATH` | (none) | PEM key for CP gRPC TLS |

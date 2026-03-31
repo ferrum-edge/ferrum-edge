@@ -83,3 +83,56 @@ async fn test_migration_status() {
     assert_eq!(status.applied.len(), 1);
     assert!(status.pending.is_empty());
 }
+
+#[tokio::test]
+async fn test_v001_schema_includes_tcp_idle_timeout_seconds() {
+    let pool = test_pool().await;
+
+    // Run V1 migration
+    let runner = MigrationRunner::new(pool.clone(), "sqlite".to_string());
+    runner.run_pending().await.unwrap();
+
+    // Verify the tcp_idle_timeout_seconds column exists by inserting a row that uses it
+    sqlx::query(
+        "INSERT INTO proxies (id, name, listen_path, backend_host, backend_port, hosts, tcp_idle_timeout_seconds, created_at, updated_at) VALUES ('test-proxy', 'test', '/test', 'localhost', 8080, '[]', 120, '2025-01-01T00:00:00Z', '2025-01-01T00:00:00Z')"
+    )
+    .execute(&pool)
+    .await
+    .expect("INSERT with tcp_idle_timeout_seconds should succeed");
+
+    // Read it back
+    let row: (i64,) =
+        sqlx::query_as("SELECT tcp_idle_timeout_seconds FROM proxies WHERE id = 'test-proxy'")
+            .fetch_one(&pool)
+            .await
+            .expect("Should be able to read tcp_idle_timeout_seconds");
+
+    assert_eq!(row.0, 120);
+}
+
+#[tokio::test]
+async fn test_v001_tcp_idle_timeout_seconds_nullable() {
+    let pool = test_pool().await;
+
+    let runner = MigrationRunner::new(pool.clone(), "sqlite".to_string());
+    runner.run_pending().await.unwrap();
+
+    // Insert without tcp_idle_timeout_seconds — should default to NULL
+    sqlx::query(
+        "INSERT INTO proxies (id, name, listen_path, backend_host, backend_port, hosts, created_at, updated_at) VALUES ('test-null', 'test-null', '/null', 'localhost', 8080, '[]', '2025-01-01T00:00:00Z', '2025-01-01T00:00:00Z')"
+    )
+    .execute(&pool)
+    .await
+    .expect("INSERT without tcp_idle_timeout_seconds should succeed (nullable column)");
+
+    // Verify the value is NULL
+    let row = sqlx::query("SELECT tcp_idle_timeout_seconds FROM proxies WHERE id = 'test-null'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let val: Option<i64> = sqlx::Row::try_get(&row, "tcp_idle_timeout_seconds").ok();
+    assert!(
+        val.is_none(),
+        "tcp_idle_timeout_seconds should be NULL when not specified"
+    );
+}

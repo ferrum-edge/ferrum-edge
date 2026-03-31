@@ -833,16 +833,24 @@ async fn test_pagination_limit_clamped_to_max() {
 
 // ---- Batch endpoint tests ----
 
-use ferrum_edge::config::db_loader::DatabaseStore;
+use ferrum_edge::config::db_loader::{DatabaseStore, DbPoolConfig};
 
 async fn create_db_admin_state(tc: &TestConfig) -> (AdminState, tempfile::TempDir) {
     let temp_dir = tempfile::TempDir::new().unwrap();
     let db_path = temp_dir.path().join("test_batch.db");
     let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
-    let db =
-        DatabaseStore::connect_with_tls_config("sqlite", &db_url, false, None, None, None, false)
-            .await
-            .expect("Failed to connect to test database");
+    let db = DatabaseStore::connect_with_tls_config(
+        "sqlite",
+        &db_url,
+        false,
+        None,
+        None,
+        None,
+        false,
+        DbPoolConfig::default(),
+    )
+    .await
+    .expect("Failed to connect to test database");
     let state = AdminState {
         db: Some(Arc::new(db)),
         jwt_manager: create_test_jwt_manager(tc),
@@ -906,10 +914,18 @@ async fn create_db_admin_state_with_availability(
     let temp_dir = tempfile::TempDir::new().unwrap();
     let db_path = temp_dir.path().join("test_avail.db");
     let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
-    let db =
-        DatabaseStore::connect_with_tls_config("sqlite", &db_url, false, None, None, None, false)
-            .await
-            .expect("Failed to connect to test database");
+    let db = DatabaseStore::connect_with_tls_config(
+        "sqlite",
+        &db_url,
+        false,
+        None,
+        None,
+        None,
+        false,
+        DbPoolConfig::default(),
+    )
+    .await
+    .expect("Failed to connect to test database");
     let state = AdminState {
         db: Some(Arc::new(db)),
         jwt_manager: create_test_jwt_manager(tc),

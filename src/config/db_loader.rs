@@ -47,6 +47,31 @@ impl IncrementalResult {
     }
 }
 
+/// Database connection pool tuning parameters.
+///
+/// These are exposed via `FERRUM_DB_POOL_*` environment variables and applied
+/// to all SQLx pools (primary, failover, and read replica).
+#[derive(Debug, Clone)]
+pub struct DbPoolConfig {
+    pub max_connections: u32,
+    pub min_connections: u32,
+    pub acquire_timeout_seconds: u64,
+    pub idle_timeout_seconds: u64,
+    pub max_lifetime_seconds: u64,
+}
+
+impl Default for DbPoolConfig {
+    fn default() -> Self {
+        Self {
+            max_connections: 10,
+            min_connections: 1,
+            acquire_timeout_seconds: 30,
+            idle_timeout_seconds: 600,
+            max_lifetime_seconds: 300,
+        }
+    }
+}
+
 /// Database configuration store.
 ///
 /// The inner pool is wrapped in `ArcSwap` so it can be atomically replaced
@@ -60,6 +85,7 @@ pub struct DatabaseStore {
     read_replica_pool: Option<Arc<ArcSwap<AnyPool>>>,
     db_type: String,
     failover_urls: Vec<String>,
+    pool_config: DbPoolConfig,
 }
 
 impl DatabaseStore {
@@ -91,7 +117,40 @@ impl DatabaseStore {
         result
     }
 
+    /// Build `AnyPoolOptions` from the stored pool configuration.
+    ///
+    /// Used by all pool creation paths (initial connect, reconnect, read replica)
+    /// to ensure consistent tuning from `FERRUM_DB_POOL_*` env vars.
+    fn build_pool_options(&self) -> AnyPoolOptions {
+        Self::build_pool_options_from_config(&self.pool_config, self.db_type == "sqlite")
+    }
+
+    /// Build `AnyPoolOptions` from a given pool configuration.
+    fn build_pool_options_from_config(config: &DbPoolConfig, is_sqlite: bool) -> AnyPoolOptions {
+        AnyPoolOptions::new()
+            .max_connections(config.max_connections)
+            .min_connections(config.min_connections)
+            .acquire_timeout(std::time::Duration::from_secs(
+                config.acquire_timeout_seconds,
+            ))
+            .idle_timeout(std::time::Duration::from_secs(config.idle_timeout_seconds))
+            // Force connection cycling so new TCP connections re-resolve DNS.
+            // Defence-in-depth alongside the explicit DnsCache-based reconnect.
+            .max_lifetime(std::time::Duration::from_secs(config.max_lifetime_seconds))
+            .after_connect(move |conn, _meta| {
+                Box::pin(async move {
+                    // Enable foreign key enforcement on every SQLite connection
+                    // (PRAGMA is per-connection, not persistent across pool connections)
+                    if is_sqlite {
+                        conn.execute("PRAGMA foreign_keys = ON").await?;
+                    }
+                    Ok(())
+                })
+            })
+    }
+
     /// Connect to the database with optional TLS configuration and run migrations.
+    #[allow(clippy::too_many_arguments)]
     pub async fn connect_with_tls_config(
         db_type: &str,
         db_url: &str,
@@ -100,6 +159,7 @@ impl DatabaseStore {
         tls_client_cert_path: Option<&str>,
         tls_client_key_path: Option<&str>,
         tls_insecure: bool,
+        pool_config: DbPoolConfig,
     ) -> Result<Self, anyhow::Error> {
         // Install all drivers
         sqlx::any::install_default_drivers();
@@ -119,21 +179,7 @@ impl DatabaseStore {
         };
 
         let is_sqlite = db_type == "sqlite";
-        let pool = AnyPoolOptions::new()
-            .max_connections(10)
-            // Force connection cycling so new TCP connections re-resolve DNS.
-            // Defence-in-depth alongside the explicit DnsCache-based reconnect.
-            .max_lifetime(std::time::Duration::from_secs(300))
-            .after_connect(move |conn, _meta| {
-                Box::pin(async move {
-                    // Enable foreign key enforcement on every SQLite connection
-                    // (PRAGMA is per-connection, not persistent across pool connections)
-                    if is_sqlite {
-                        conn.execute("PRAGMA foreign_keys = ON").await?;
-                    }
-                    Ok(())
-                })
-            })
+        let pool = Self::build_pool_options_from_config(&pool_config, is_sqlite)
             .connect(&final_url)
             .await?;
 
@@ -142,13 +188,17 @@ impl DatabaseStore {
             read_replica_pool: None,
             db_type: db_type.to_string(),
             failover_urls: Vec::new(),
+            pool_config,
         };
 
         store.run_migrations().await?;
 
         info!(
-            "Database connected and migrations applied (type={}, tls_enabled={})",
-            db_type, tls_enabled
+            "Database connected and migrations applied (type={}, tls_enabled={}, max_connections={}, min_connections={})",
+            db_type,
+            tls_enabled,
+            store.pool_config.max_connections,
+            store.pool_config.min_connections
         );
         Ok(store)
     }
@@ -423,7 +473,7 @@ impl DatabaseStore {
         let hosts_json = serde_json::to_string(&proxy.hosts)?;
 
         sqlx::query(
-            &self.q("INSERT INTO proxies (id, name, hosts, listen_path, backend_protocol, backend_host, backend_port, backend_path, strip_listen_path, preserve_host_header, backend_connect_timeout_ms, backend_read_timeout_ms, backend_write_timeout_ms, backend_tls_client_cert_path, backend_tls_client_key_path, backend_tls_verify_server_cert, backend_tls_server_ca_cert_path, dns_override, dns_cache_ttl_seconds, auth_mode, upstream_id, circuit_breaker, retry, response_body_mode, pool_idle_timeout_seconds, pool_enable_http_keep_alive, pool_enable_http2, pool_tcp_keepalive_seconds, pool_http2_keep_alive_interval_seconds, pool_http2_keep_alive_timeout_seconds, pool_http2_initial_stream_window_size, pool_http2_initial_connection_window_size, pool_http2_adaptive_window, pool_http2_max_frame_size, pool_http2_max_concurrent_streams, pool_http3_connections_per_backend, listen_port, frontend_tls, udp_idle_timeout_seconds, allowed_methods, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+            &self.q("INSERT INTO proxies (id, name, hosts, listen_path, backend_protocol, backend_host, backend_port, backend_path, strip_listen_path, preserve_host_header, backend_connect_timeout_ms, backend_read_timeout_ms, backend_write_timeout_ms, backend_tls_client_cert_path, backend_tls_client_key_path, backend_tls_verify_server_cert, backend_tls_server_ca_cert_path, dns_override, dns_cache_ttl_seconds, auth_mode, upstream_id, circuit_breaker, retry, response_body_mode, pool_idle_timeout_seconds, pool_enable_http_keep_alive, pool_enable_http2, pool_tcp_keepalive_seconds, pool_http2_keep_alive_interval_seconds, pool_http2_keep_alive_timeout_seconds, pool_http2_initial_stream_window_size, pool_http2_initial_connection_window_size, pool_http2_adaptive_window, pool_http2_max_frame_size, pool_http2_max_concurrent_streams, pool_http3_connections_per_backend, listen_port, frontend_tls, udp_idle_timeout_seconds, tcp_idle_timeout_seconds, allowed_methods, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
         )
         .bind(&proxy.id)
         .bind(&proxy.name)
@@ -464,6 +514,7 @@ impl DatabaseStore {
         .bind(proxy.listen_port.map(|v| v as i32))
         .bind(if proxy.frontend_tls { 1i32 } else { 0 })
         .bind(proxy.udp_idle_timeout_seconds as i64)
+        .bind(proxy.tcp_idle_timeout_seconds.map(|v| v as i64))
         .bind(proxy.allowed_methods.as_ref().map(serde_json::to_string).transpose()?)
         .bind(proxy.created_at.to_rfc3339())
         .bind(proxy.updated_at.to_rfc3339())
@@ -507,7 +558,7 @@ impl DatabaseStore {
         let hosts_json = serde_json::to_string(&proxy.hosts)?;
 
         sqlx::query(
-            &self.q("UPDATE proxies SET name=?, hosts=?, listen_path=?, backend_protocol=?, backend_host=?, backend_port=?, backend_path=?, strip_listen_path=?, preserve_host_header=?, backend_connect_timeout_ms=?, backend_read_timeout_ms=?, backend_write_timeout_ms=?, backend_tls_client_cert_path=?, backend_tls_client_key_path=?, backend_tls_verify_server_cert=?, backend_tls_server_ca_cert_path=?, dns_override=?, dns_cache_ttl_seconds=?, auth_mode=?, upstream_id=?, circuit_breaker=?, retry=?, response_body_mode=?, pool_idle_timeout_seconds=?, pool_enable_http_keep_alive=?, pool_enable_http2=?, pool_tcp_keepalive_seconds=?, pool_http2_keep_alive_interval_seconds=?, pool_http2_keep_alive_timeout_seconds=?, pool_http2_initial_stream_window_size=?, pool_http2_initial_connection_window_size=?, pool_http2_adaptive_window=?, pool_http2_max_frame_size=?, pool_http2_max_concurrent_streams=?, pool_http3_connections_per_backend=?, listen_port=?, frontend_tls=?, udp_idle_timeout_seconds=?, allowed_methods=?, updated_at=? WHERE id=?")
+            &self.q("UPDATE proxies SET name=?, hosts=?, listen_path=?, backend_protocol=?, backend_host=?, backend_port=?, backend_path=?, strip_listen_path=?, preserve_host_header=?, backend_connect_timeout_ms=?, backend_read_timeout_ms=?, backend_write_timeout_ms=?, backend_tls_client_cert_path=?, backend_tls_client_key_path=?, backend_tls_verify_server_cert=?, backend_tls_server_ca_cert_path=?, dns_override=?, dns_cache_ttl_seconds=?, auth_mode=?, upstream_id=?, circuit_breaker=?, retry=?, response_body_mode=?, pool_idle_timeout_seconds=?, pool_enable_http_keep_alive=?, pool_enable_http2=?, pool_tcp_keepalive_seconds=?, pool_http2_keep_alive_interval_seconds=?, pool_http2_keep_alive_timeout_seconds=?, pool_http2_initial_stream_window_size=?, pool_http2_initial_connection_window_size=?, pool_http2_adaptive_window=?, pool_http2_max_frame_size=?, pool_http2_max_concurrent_streams=?, pool_http3_connections_per_backend=?, listen_port=?, frontend_tls=?, udp_idle_timeout_seconds=?, tcp_idle_timeout_seconds=?, allowed_methods=?, updated_at=? WHERE id=?")
         )
         .bind(&proxy.name)
         .bind(&hosts_json)
@@ -547,6 +598,7 @@ impl DatabaseStore {
         .bind(proxy.listen_port.map(|v| v as i32))
         .bind(if proxy.frontend_tls { 1i32 } else { 0 })
         .bind(proxy.udp_idle_timeout_seconds as i64)
+        .bind(proxy.tcp_idle_timeout_seconds.map(|v| v as i64))
         .bind(proxy.allowed_methods.as_ref().map(serde_json::to_string).transpose()?)
         .bind(Utc::now().to_rfc3339())
         .bind(&proxy.id)
@@ -1442,7 +1494,7 @@ impl DatabaseStore {
     /// Insert a single chunk of proxies in one transaction.
     async fn batch_create_proxies_chunk(&self, proxies: &[Proxy]) -> Result<usize, anyhow::Error> {
         let mut tx = self.pool().begin().await?;
-        let insert_sql = self.q("INSERT INTO proxies (id, name, hosts, listen_path, backend_protocol, backend_host, backend_port, backend_path, strip_listen_path, preserve_host_header, backend_connect_timeout_ms, backend_read_timeout_ms, backend_write_timeout_ms, backend_tls_client_cert_path, backend_tls_client_key_path, backend_tls_verify_server_cert, backend_tls_server_ca_cert_path, dns_override, dns_cache_ttl_seconds, auth_mode, upstream_id, circuit_breaker, retry, response_body_mode, pool_idle_timeout_seconds, pool_enable_http_keep_alive, pool_enable_http2, pool_tcp_keepalive_seconds, pool_http2_keep_alive_interval_seconds, pool_http2_keep_alive_timeout_seconds, pool_http2_initial_stream_window_size, pool_http2_initial_connection_window_size, pool_http2_adaptive_window, pool_http2_max_frame_size, pool_http2_max_concurrent_streams, pool_http3_connections_per_backend, listen_port, frontend_tls, udp_idle_timeout_seconds, allowed_methods, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+        let insert_sql = self.q("INSERT INTO proxies (id, name, hosts, listen_path, backend_protocol, backend_host, backend_port, backend_path, strip_listen_path, preserve_host_header, backend_connect_timeout_ms, backend_read_timeout_ms, backend_write_timeout_ms, backend_tls_client_cert_path, backend_tls_client_key_path, backend_tls_verify_server_cert, backend_tls_server_ca_cert_path, dns_override, dns_cache_ttl_seconds, auth_mode, upstream_id, circuit_breaker, retry, response_body_mode, pool_idle_timeout_seconds, pool_enable_http_keep_alive, pool_enable_http2, pool_tcp_keepalive_seconds, pool_http2_keep_alive_interval_seconds, pool_http2_keep_alive_timeout_seconds, pool_http2_initial_stream_window_size, pool_http2_initial_connection_window_size, pool_http2_adaptive_window, pool_http2_max_frame_size, pool_http2_max_concurrent_streams, pool_http3_connections_per_backend, listen_port, frontend_tls, udp_idle_timeout_seconds, tcp_idle_timeout_seconds, allowed_methods, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
         let assoc_sql =
             self.q("INSERT INTO proxy_plugins (proxy_id, plugin_config_id) VALUES (?, ?)");
 
@@ -1534,6 +1586,7 @@ impl DatabaseStore {
                 .bind(proxy.listen_port.map(|v| v as i32))
                 .bind(if proxy.frontend_tls { 1i32 } else { 0 })
                 .bind(proxy.udp_idle_timeout_seconds as i64)
+                .bind(proxy.tcp_idle_timeout_seconds.map(|v| v as i64))
                 .bind(
                     proxy
                         .allowed_methods
@@ -1783,20 +1836,7 @@ impl DatabaseStore {
             db_url.to_string()
         };
 
-        let is_sqlite = self.db_type == "sqlite";
-        let new_pool = AnyPoolOptions::new()
-            .max_connections(10)
-            .max_lifetime(std::time::Duration::from_secs(300))
-            .after_connect(move |conn, _meta| {
-                Box::pin(async move {
-                    if is_sqlite {
-                        conn.execute("PRAGMA foreign_keys = ON").await?;
-                    }
-                    Ok(())
-                })
-            })
-            .connect(&final_url)
-            .await?;
+        let new_pool = self.build_pool_options().connect(&final_url).await?;
 
         // Atomic swap — readers that already loaded the old pool keep using it.
         let old_pool = self.pool.swap(Arc::new(new_pool));
@@ -1855,6 +1895,7 @@ impl DatabaseStore {
         tls_client_cert_path: Option<&str>,
         tls_client_key_path: Option<&str>,
         tls_insecure: bool,
+        pool_config: DbPoolConfig,
     ) -> Result<Self, anyhow::Error> {
         match Self::connect_with_tls_config(
             db_type,
@@ -1864,6 +1905,7 @@ impl DatabaseStore {
             tls_client_cert_path,
             tls_client_key_path,
             tls_insecure,
+            pool_config.clone(),
         )
         .await
         {
@@ -1889,6 +1931,7 @@ impl DatabaseStore {
                         tls_client_cert_path,
                         tls_client_key_path,
                         tls_insecure,
+                        pool_config.clone(),
                     )
                     .await
                     {
@@ -1948,20 +1991,7 @@ impl DatabaseStore {
             replica_url.to_string()
         };
 
-        let is_sqlite = self.db_type == "sqlite";
-        let pool = AnyPoolOptions::new()
-            .max_connections(10)
-            .max_lifetime(std::time::Duration::from_secs(300))
-            .after_connect(move |conn, _meta| {
-                Box::pin(async move {
-                    if is_sqlite {
-                        conn.execute("PRAGMA foreign_keys = ON").await?;
-                    }
-                    Ok(())
-                })
-            })
-            .connect(&final_url)
-            .await?;
+        let pool = self.build_pool_options().connect(&final_url).await?;
 
         self.read_replica_pool = Some(Arc::new(ArcSwap::from_pointee(pool)));
         info!(
@@ -2018,20 +2048,7 @@ impl DatabaseStore {
             replica_url.to_string()
         };
 
-        let is_sqlite = self.db_type == "sqlite";
-        let new_pool = AnyPoolOptions::new()
-            .max_connections(10)
-            .max_lifetime(std::time::Duration::from_secs(300))
-            .after_connect(move |conn, _meta| {
-                Box::pin(async move {
-                    if is_sqlite {
-                        conn.execute("PRAGMA foreign_keys = ON").await?;
-                    }
-                    Ok(())
-                })
-            })
-            .connect(&final_url)
-            .await?;
+        let new_pool = self.build_pool_options().connect(&final_url).await?;
 
         let old_pool = rp.swap(Arc::new(new_pool));
         info!(

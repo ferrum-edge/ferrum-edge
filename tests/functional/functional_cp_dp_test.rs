@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use chrono::Utc;
-use ferrum_edge::config::db_loader::DatabaseStore;
+use ferrum_edge::config::db_loader::{DatabaseStore, DbPoolConfig};
 use ferrum_edge::config::types::{AuthMode, BackendProtocol, Consumer, GatewayConfig, Proxy};
 use ferrum_edge::config::{EnvConfig, OperatingMode};
 use ferrum_edge::dns::{DnsCache, DnsConfig};
@@ -132,6 +132,7 @@ fn create_test_env_config() -> EnvConfig {
         max_connections: 0,
         tcp_listen_backlog: 2048,
         server_http2_max_concurrent_streams: 250,
+        ..Default::default()
     }
 }
 
@@ -352,10 +353,18 @@ async fn test_database_connection_with_tls_config() {
 
     // Test 1: Connect without TLS (plaintext)
     println!("Test 1: Connecting to SQLite without TLS...");
-    let db =
-        DatabaseStore::connect_with_tls_config("sqlite", &db_url, false, None, None, None, false)
-            .await
-            .expect("Failed to connect to plaintext SQLite database");
+    let db = DatabaseStore::connect_with_tls_config(
+        "sqlite",
+        &db_url,
+        false,
+        None,
+        None,
+        None,
+        false,
+        DbPoolConfig::default(),
+    )
+    .await
+    .expect("Failed to connect to plaintext SQLite database");
 
     // Verify we can load config from the database
     let config = db
@@ -397,6 +406,7 @@ async fn test_database_connection_with_tls_config() {
         Some("/path/to/client.pem"),
         Some("/path/to/client-key.pem"),
         false,
+        DbPoolConfig::default(),
     )
     .await
     .expect("Failed to connect with TLS parameters");
@@ -414,10 +424,18 @@ async fn test_database_connection_with_tls_config() {
 
     // Test 5: Test TLS insecure mode
     println!("Test 5: Database connection with TLS insecure mode...");
-    let db_insecure =
-        DatabaseStore::connect_with_tls_config("sqlite", &db_url, true, None, None, None, true)
-            .await
-            .expect("Failed to connect with TLS insecure");
+    let db_insecure = DatabaseStore::connect_with_tls_config(
+        "sqlite",
+        &db_url,
+        true,
+        None,
+        None,
+        None,
+        true,
+        DbPoolConfig::default(),
+    )
+    .await
+    .expect("Failed to connect with TLS insecure");
 
     let config = db_insecure
         .load_full_config()
@@ -485,6 +503,7 @@ async fn test_grpc_url_construction() {
         Some("/path/to/client.pem"),
         Some("/path/to/client-key.pem"),
         false,
+        DbPoolConfig::default(),
     )
     .await;
 
@@ -505,6 +524,7 @@ async fn test_grpc_url_construction() {
         None,
         None,
         false,
+        DbPoolConfig::default(),
     )
     .await;
 
