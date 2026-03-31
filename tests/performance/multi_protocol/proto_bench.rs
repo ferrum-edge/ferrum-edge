@@ -263,10 +263,10 @@ async fn run_http2(args: &BenchArgs) -> anyhow::Result<()> {
         let mut builder = http2::Builder::new(TokioExecutor::new());
         builder
             .timer(TokioTimer::new())
-            .initial_stream_window_size(8_388_608)         // 8 MiB
-            .initial_connection_window_size(33_554_432)     // 32 MiB
-            .adaptive_window(false)                         // Fixed windows
-            .max_frame_size(65_535);                        // Max frame size
+            .initial_stream_window_size(8_388_608) // 8 MiB
+            .initial_connection_window_size(33_554_432) // 32 MiB
+            .adaptive_window(false) // Fixed windows
+            .max_frame_size(65_535); // Max frame size
         builder
     };
 
@@ -362,12 +362,19 @@ async fn run_http3(args: &BenchArgs) -> anyhow::Result<()> {
 
     // HTTP/3 multiplexes streams over QUIC connections. Use a connection pool
     // similar to HTTP/2: ~10 streams per connection for good throughput balance.
-    let num_conns = std::cmp::max(1, std::cmp::min(args.concurrency as usize, args.concurrency as usize / 10 + 1));
+    let num_conns = std::cmp::max(
+        1,
+        std::cmp::min(
+            args.concurrency as usize,
+            args.concurrency as usize / 10 + 1,
+        ),
+    );
     let host_str = host.to_string();
     let full_uri = format!("https://{host_str}:{port}{path}");
 
     // Create a pool of QUIC connections with shared endpoints
-    let mut senders: Vec<h3::client::SendRequest<h3_quinn::OpenStreams, bytes::Bytes>> = Vec::with_capacity(num_conns);
+    let mut senders: Vec<h3::client::SendRequest<h3_quinn::OpenStreams, bytes::Bytes>> =
+        Vec::with_capacity(num_conns);
 
     for _ in 0..num_conns {
         let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap())?;
@@ -495,14 +502,20 @@ async fn run_grpc(args: &BenchArgs) -> anyhow::Result<()> {
 
     // gRPC uses HTTP/2 multiplexing. Share a pool of channels across tasks
     // (~10 streams per channel) instead of one channel per task.
-    let num_conns = std::cmp::max(1, std::cmp::min(args.concurrency as usize, args.concurrency as usize / 10 + 1));
+    let num_conns = std::cmp::max(
+        1,
+        std::cmp::min(
+            args.concurrency as usize,
+            args.concurrency as usize / 10 + 1,
+        ),
+    );
     let mut channels = Vec::with_capacity(num_conns);
 
     for _ in 0..num_conns {
         let channel = tonic::transport::Channel::from_shared(args.target.clone())
             .map_err(|e| anyhow::anyhow!("invalid gRPC target: {e}"))?
-            .initial_stream_window_size(8_388_608)         // 8 MiB (vs 64 KB default)
-            .initial_connection_window_size(33_554_432)     // 32 MiB
+            .initial_stream_window_size(8_388_608) // 8 MiB (vs 64 KB default)
+            .initial_connection_window_size(33_554_432) // 32 MiB
             .connect()
             .await
             .map_err(|e| anyhow::anyhow!("gRPC connect to {}: {e}", args.target))?;

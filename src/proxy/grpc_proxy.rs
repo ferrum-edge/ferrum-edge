@@ -641,20 +641,37 @@ pub async fn proxy_grpc_request(
         }
     };
 
-    let result = proxy_grpc_request_core(
-        parts.method.clone(),
-        parts.headers.clone(),
-        body_bytes.clone(),
-        proxy,
-        backend_url,
-        grpc_pool,
-        dns_cache,
-        proxy_headers,
-        stream_response,
-    )
-    .await;
-
-    (result, body_bytes)
+    if stream_response {
+        // Streaming — no retries possible, avoid clones
+        let result = proxy_grpc_request_core(
+            parts.method,
+            parts.headers,
+            body_bytes,
+            proxy,
+            backend_url,
+            grpc_pool,
+            dns_cache,
+            proxy_headers,
+            true,
+        )
+        .await;
+        (result, Bytes::new()) // No body to return for retry
+    } else {
+        // Buffered — caller may retry, preserve body
+        let result = proxy_grpc_request_core(
+            parts.method.clone(),
+            parts.headers.clone(),
+            body_bytes.clone(),
+            proxy,
+            backend_url,
+            grpc_pool,
+            dns_cache,
+            proxy_headers,
+            false,
+        )
+        .await;
+        (result, body_bytes)
+    }
 }
 
 /// Proxy a gRPC request using pre-collected body bytes.
@@ -755,7 +772,7 @@ async fn proxy_grpc_request_core(
 
     // Extract response status and headers
     let status = response.status().as_u16();
-    let mut resp_headers = HashMap::new();
+    let mut resp_headers = HashMap::with_capacity(response.headers().keys_len());
     for (k, v) in response.headers() {
         if let Ok(vs) = v.to_str() {
             resp_headers.insert(k.as_str().to_string(), vs.to_string());
@@ -774,7 +791,13 @@ async fn proxy_grpc_request_core(
     }
 
     // Buffered mode: collect body and extract trailers (also under read timeout).
-    let mut body_bytes = Vec::new();
+    let body_capacity = response
+        .headers()
+        .get("content-length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(256);
+    let mut body_bytes = Vec::with_capacity(body_capacity);
     let mut trailers = HashMap::new();
 
     let body_collection = async {

@@ -90,15 +90,13 @@ async fn handle_http(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, In
             .header("content-type", "application/json")
             .body(Full::new(Bytes::from_static(b"{\"status\":\"healthy\"}")))
             .unwrap_or_else(|_| Response::new(Full::new(Bytes::new()))),
-        (ref m, "/api/users") if m == hyper::Method::GET => {
-            Response::builder()
-                .status(StatusCode::OK)
-                .header("content-type", "application/json")
-                .body(Full::new(Bytes::from_static(
-                    b"{\"users\":[{\"id\":1,\"name\":\"Alice\"},{\"id\":2,\"name\":\"Bob\"}]}",
-                )))
-                .unwrap_or_else(|_| Response::new(Full::new(Bytes::new())))
-        }
+        (ref m, "/api/users") if m == hyper::Method::GET => Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "application/json")
+            .body(Full::new(Bytes::from_static(
+                b"{\"users\":[{\"id\":1,\"name\":\"Alice\"},{\"id\":2,\"name\":\"Bob\"}]}",
+            )))
+            .unwrap_or_else(|_| Response::new(Full::new(Bytes::new()))),
         (_, "/echo") => {
             use http_body_util::BodyExt;
             let body = req
