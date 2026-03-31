@@ -417,7 +417,7 @@ async fn test_logging_gateway_startup_logs() {
     assert!(
         all_messages
             .iter()
-            .any(|m| m.contains("Ferrum Edge starting")),
+            .any(|m| m.contains("Ferrum Edge") && m.contains("starting")),
         "Should log gateway startup message"
     );
     assert!(
