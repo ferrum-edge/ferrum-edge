@@ -3,12 +3,12 @@ use std::fs;
 use std::path::Path;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tonic_build::configure()
+    tonic_prost_build::configure()
         .build_server(true)
         .build_client(true)
         .compile_protos(&["proto/ferrum.proto"], &["proto/"])?;
 
-    tonic_build::compile_protos("proto/health.proto")?;
+    tonic_prost_build::compile_protos("proto/health.proto")?;
 
     // ── Auto-discover custom plugins ────────────────────────────────────
     //
