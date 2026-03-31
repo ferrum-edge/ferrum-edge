@@ -637,6 +637,15 @@ proxies:
 - **Open** — All requests immediately return `503 Service Unavailable` without contacting the backend. After `timeout_seconds`, the circuit transitions to Half-Open.
 - **Half-Open** — The circuit allows up to `half_open_max_requests` concurrent probe requests. Successful responses count toward `success_threshold`; when reached, the circuit closes (recovered). Any failure immediately reopens the circuit.
 
+**Failure detection:**
+
+The circuit breaker counts failures from two sources:
+
+1. **HTTP response status codes** — backend responses with a status code in `failure_status_codes` are counted as failures.
+2. **Connection-level errors** — TCP connection refused, connection timeout, DNS resolution failure, and TLS handshake errors are recorded as a synthetic `502` status code. These always count as failures as long as `502` is in `failure_status_codes` (which it is by default).
+
+> **Note:** Connection-level errors and real HTTP 502 responses from backends share the same `502` code for circuit breaker tracking. They cannot be configured independently — removing `502` from `failure_status_codes` would suppress both. If you only want to trip the breaker on connection errors and not on backend 502 responses (or vice versa), that distinction is not currently supported.
+
 ## Configuration Reference
 
 ### Complete YAML Example
