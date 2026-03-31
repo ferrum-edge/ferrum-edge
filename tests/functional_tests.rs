@@ -7,6 +7,7 @@
 //! Tests:
 //!   - functional_cp_dp_test: CP/DP mode with gRPC, database TLS config
 //!   - functional_database_test: Database mode with SQLite, Admin API, proxy routing
+//!   - functional_db_outage_test: DB outage resilience (proxy+plugins continue, admin reads/writes)
 //!   - functional_db_tls_test: Database TLS (PostgreSQL/MySQL/SQLite) connectivity + CRUD
 //!   - functional_db_upstream_test: Upstream management via database mode
 //!   - functional_file_mode_test: File mode with YAML config, SIGHUP reload

@@ -3,6 +3,7 @@ mod functional_auth_acl_test;
 mod functional_circuit_breaker_retry_test;
 mod functional_cp_dp_test;
 mod functional_database_test;
+mod functional_db_outage_test;
 mod functional_db_tls_test;
 mod functional_db_upstream_test;
 mod functional_file_mode_test;
