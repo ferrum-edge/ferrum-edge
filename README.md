@@ -387,7 +387,7 @@ See [CI/CD Documentation](docs/ci_cd.md) for complete pipeline overview, secrets
 | `FERRUM_HTTP3_STREAM_RECEIVE_WINDOW` | No | `8388608` | HTTP/3 per-stream receive window in bytes (default: 8 MiB) |
 | `FERRUM_HTTP3_RECEIVE_WINDOW` | No | `33554432` | HTTP/3 connection-level receive window in bytes (default: 32 MiB) |
 | `FERRUM_HTTP3_SEND_WINDOW` | No | `8388608` | HTTP/3 per-connection send window in bytes (default: 8 MiB) |
-| `FERRUM_BASIC_AUTH_HMAC_SECRET` | No | — | Server secret for HMAC-SHA256 password verification (~1μs). When set, the Admin API stores `hmac_sha256:<hex>` hashes instead of bcrypt. Existing bcrypt hashes remain valid. |
+| `FERRUM_BASIC_AUTH_HMAC_SECRET` | No | `ferrum-edge-change-me-in-production` | Server secret for HMAC-SHA256 password verification (~1μs). The Admin API stores `hmac_sha256:<hex>` hashes. Existing bcrypt hashes remain valid. **Must be changed in production** — using the default allows anyone who knows it to compute valid credential hashes. |
 | `FERRUM_TRUSTED_PROXIES` | No | — | Comma-separated trusted proxy CIDRs/IPs for client IP resolution via `X-Forwarded-For` |
 | `FERRUM_REAL_IP_HEADER` | No | — | Authoritative real-IP header name (e.g., `CF-Connecting-IP`, `X-Real-IP`) |
 | `FERRUM_STREAM_PROXY_BIND_ADDRESS` | No | `0.0.0.0` | Bind address for TCP/UDP/DTLS stream proxy listeners |
@@ -1223,7 +1223,9 @@ credentials:
 
 #### `basic_auth`
 
-Authenticates using HTTP Basic credentials with bcrypt-hashed password verification.
+Authenticates using HTTP Basic credentials. Supports two hash formats:
+- **HMAC-SHA256** (~1μs) — default when `FERRUM_BASIC_AUTH_HMAC_SECRET` is set (recommended). A default secret is provided but **must be changed in production**.
+- **bcrypt** (~100ms) — backward-compatible fallback for `$2b$`/`$2a$` hashes.
 
 **Config**: None required.
 
@@ -1231,7 +1233,8 @@ Authenticates using HTTP Basic credentials with bcrypt-hashed password verificat
 ```yaml
 credentials:
   basicauth:
-    password_hash: "$2b$12$..." # bcrypt hash
+    password_hash: "hmac_sha256:ab3f..." # HMAC-SHA256 (preferred)
+    # or: "$2b$12$..."                   # bcrypt (legacy)
 ```
 
 #### `jwks_auth`
@@ -1995,7 +1998,7 @@ backend_tls_server_ca_cert_path: "/path/to/ca.pem"
 
 ### Credential Hashing
 
-Consumer passwords (for `basic_auth`) are stored as bcrypt hashes. The Admin API automatically hashes plaintext passwords on creation/update.
+Consumer passwords (for `basic_auth`) are stored as HMAC-SHA256 hashes by default (or bcrypt for legacy hashes). The Admin API automatically hashes plaintext passwords on creation/update using the configured `FERRUM_BASIC_AUTH_HMAC_SECRET`.
 
 ## Troubleshooting
 

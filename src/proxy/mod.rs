@@ -2756,7 +2756,12 @@ pub async fn handle_proxy_request(
                 let mut resp_builder = Response::builder()
                     .status(StatusCode::from_u16(grpc_streaming.status).unwrap_or(StatusCode::OK));
                 for (k, v) in &response_headers {
-                    resp_builder = resp_builder.header(k.as_str(), v.as_str());
+                    if let (Ok(name), Ok(val)) = (
+                        hyper::header::HeaderName::from_bytes(k.as_bytes()),
+                        hyper::header::HeaderValue::from_str(v),
+                    ) {
+                        resp_builder = resp_builder.header(name, val);
+                    }
                 }
 
                 return Ok(resp_builder
@@ -2879,7 +2884,12 @@ pub async fn handle_proxy_request(
                 let mut resp_builder = Response::builder()
                     .status(StatusCode::from_u16(grpc_resp.status).unwrap_or(StatusCode::OK));
                 for (k, v) in &response_headers {
-                    resp_builder = resp_builder.header(k.as_str(), v.as_str());
+                    if let (Ok(name), Ok(val)) = (
+                        hyper::header::HeaderName::from_bytes(k.as_bytes()),
+                        hyper::header::HeaderValue::from_str(v),
+                    ) {
+                        resp_builder = resp_builder.header(name, val);
+                    }
                 }
 
                 return Ok(resp_builder
@@ -3390,10 +3400,15 @@ pub async fn handle_proxy_request(
             // Set-Cookie values were stored newline-separated to avoid RFC-violating
             // comma folding. Emit each value as a separate header line.
             for cookie_val in v.split('\n') {
-                resp_builder = resp_builder.header("set-cookie", cookie_val);
+                if let Ok(val) = hyper::header::HeaderValue::from_str(cookie_val) {
+                    resp_builder = resp_builder.header("set-cookie", val);
+                }
             }
-        } else {
-            resp_builder = resp_builder.header(k.as_str(), v.as_str());
+        } else if let (Ok(name), Ok(val)) = (
+            hyper::header::HeaderName::from_bytes(k.as_bytes()),
+            hyper::header::HeaderValue::from_str(v),
+        ) {
+            resp_builder = resp_builder.header(name, val);
         }
     }
 
