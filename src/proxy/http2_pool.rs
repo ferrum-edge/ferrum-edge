@@ -84,9 +84,19 @@ impl Http2ConnectionPool {
         self.entries.len()
     }
 
-    /// Pool key — kept minimal to avoid fragmentation.
+    /// Pool key — includes all fields that affect connection identity.
+    /// Uses `|` as delimiter to avoid ambiguity with `:` in IPv6 addresses.
     fn pool_key(proxy: &Proxy) -> String {
-        format!("{}:{}", proxy.backend_host, proxy.backend_port)
+        let dns = proxy.dns_override.as_deref().unwrap_or_default();
+        let mtls_cert = proxy
+            .backend_tls_client_cert_path
+            .as_deref()
+            .unwrap_or_default();
+        let verify = proxy.backend_tls_verify_server_cert;
+        format!(
+            "{}|{}|{}|{}|{}",
+            proxy.backend_host, proxy.backend_port, dns, mtls_cert, verify as u8,
+        )
     }
 
     fn shard_key(base_key: &str, shard: usize) -> String {

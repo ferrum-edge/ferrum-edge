@@ -103,11 +103,24 @@ impl GrpcConnectionPool {
     /// Adding fields causes pool fragmentation and P95 latency regressions.
     /// See `ConnectionPool::create_pool_key` for detailed rationale.
     ///
+    /// Includes all fields that affect connection *identity*: destination,
+    /// TLS mode, DNS override, mTLS client cert, and server cert verification.
+    /// Uses `|` as field delimiter to avoid ambiguity with `:` in IPv6 addresses.
+    ///
     /// Returns the base key (without shard suffix). For shard keys, the caller
     /// appends `#N` using `write!` to avoid extra allocations.
     fn pool_key(proxy: &Proxy) -> String {
         let tls = matches!(proxy.backend_protocol, BackendProtocol::Grpcs);
-        format!("{}:{}:{}", proxy.backend_host, proxy.backend_port, tls)
+        let dns = proxy.dns_override.as_deref().unwrap_or_default();
+        let mtls_cert = proxy
+            .backend_tls_client_cert_path
+            .as_deref()
+            .unwrap_or_default();
+        let verify = proxy.backend_tls_verify_server_cert;
+        format!(
+            "{}|{}|{}|{}|{}|{}",
+            proxy.backend_host, proxy.backend_port, tls, dns, mtls_cert, verify as u8,
+        )
     }
 
     /// Build a shard key by appending the shard index to a pre-allocated buffer.
