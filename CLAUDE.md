@@ -249,6 +249,21 @@ Each protocol has its own proxy path, connection pool, and backend dispatch. Und
 
 **gRPC proxy architecture**: Uses hyper's HTTP/2 client directly (not reqwest) to preserve HTTP/2 trailers (`grpc-status`, `grpc-message`). The `GrpcConnectionPool` maintains sharded H2 connections with round-robin distribution. When `stream_response=true` (no retries, no body-buffering plugins), the response `Incoming` body is passed through as `ProxyBody::streaming_h2` — hyper forwards DATA and TRAILERS frames directly to the client without buffering.
 
+**Connection pool keys**: Each pool uses a string key to decide whether two proxies can share a pooled connection. The key must include every field that affects connection *identity* — destination, TLS trust, client credentials, and DNS routing. Missing a field allows two proxies with different configs to share a connection (pool poisoning); adding unnecessary fields causes fragmentation and P95 regressions. All keys use `|` as the field delimiter because `:` appears in IPv6 addresses and would create ambiguous key boundaries.
+
+| Pool | File | Key Format | Sharding | Notes |
+|------|------|-----------|----------|-------|
+| HTTP | `connection_pool.rs` | `{dest}\|{proto}\|{dns_override}\|{ca_path}\|{mtls_cert}\|{verify}` | No (reqwest internal) | `dest` is `u={upstream_id}` or `d={host}:{port}` to prevent namespace collisions. `verify` is the effective flag (proxy AND global). |
+| gRPC | `proxy/grpc_proxy.rs` | `{host}\|{port}\|{tls}\|{dns_override}\|{mtls_cert}\|{verify}` | `#N` suffix | `tls` is bool from `BackendProtocol::Grpcs`. Shard key reuses a pre-allocated buffer. |
+| HTTP/2 | `proxy/http2_pool.rs` | `{host}\|{port}\|{dns_override}\|{mtls_cert}\|{verify}` | `#N` suffix | Always TLS (no tls flag needed). |
+| HTTP/3 | `http3/client.rs` | `{host}\|{port}\|{index}\|{ca_path}\|{mtls_cert}\|{verify}` | Index in key | `index` distributes across `connections_per_backend` QUIC connections. Target-path keys use `{host}\|{port}\|{index}` only (TLS inherited from proxy). |
+
+**Rules for modifying pool keys:**
+- **Every field that affects `create_connection()` output must be in the key.** If two proxies with different values for a field would get different TLS configs, different resolved IPs, or different client identities, that field must be in the key.
+- **Never add fields that only affect policy** (timeouts, pool sizes, keepalive intervals). These don't change connection identity and adding them causes fragmentation.
+- **Empty/default values are free** — most proxies won't set per-proxy mTLS or dns_override, so these fields are empty strings and all proxies sharing a backend still share one pool entry.
+- **Keep the `|` delimiter** — do not switch to `:` or any character that can appear in hostnames, IPv6 addresses, or file paths.
+
 ### Performance Optimization Lessons
 
 These are hard-won findings from profiling. Violating them causes measurable regressions.
