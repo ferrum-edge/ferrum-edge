@@ -83,6 +83,7 @@ base64 = "0.22"
 url = "2"
 percent-encoding = "2"
 socket2 = { version = "0.6.3", features = ["all"] }
+tokio-util = { version = "0.7.18", default-features = false }
 
 # Memory allocator — jemalloc reduces fragmentation and improves throughput
 # under high concurrency (50k+ connections). Not available on Windows.

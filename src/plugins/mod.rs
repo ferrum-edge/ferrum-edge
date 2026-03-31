@@ -31,6 +31,9 @@ pub mod response_transformer;
 pub mod stdout_logging;
 pub mod transaction_debugger;
 pub mod utils;
+pub mod ws_frame_logging;
+pub mod ws_message_size_limiting;
+pub mod ws_rate_limiting;
 
 pub use utils::PluginHttpClient;
 
@@ -82,6 +85,9 @@ pub const HTTP_GRPC_PROTOCOLS: &[ProxyProtocol] = &[ProxyProtocol::Http, ProxyPr
 
 /// HTTP-only (single protocol).
 pub const HTTP_ONLY_PROTOCOLS: &[ProxyProtocol] = &[ProxyProtocol::Http];
+
+/// WebSocket-only (plugins that operate on WebSocket frames, not HTTP request/response).
+pub const WS_ONLY_PROTOCOLS: &[ProxyProtocol] = &[ProxyProtocol::WebSocket];
 
 /// Direction of a WebSocket frame being proxied.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -296,6 +302,9 @@ pub mod priority {
     pub const HTTP_LOGGING: u16 = 9100;
     pub const TRANSACTION_DEBUGGER: u16 = 9200;
     pub const PROMETHEUS_METRICS: u16 = 9300;
+    pub const WS_MESSAGE_SIZE_LIMITING: u16 = 2810;
+    pub const WS_RATE_LIMITING: u16 = 2910;
+    pub const WS_FRAME_LOGGING: u16 = 9050;
     /// Default priority for unknown/custom plugins — runs after transforms, before logging.
     pub const DEFAULT: u16 = 5000;
 }
@@ -508,10 +517,16 @@ pub trait Plugin: Send + Sync {
     }
 
     /// Called for each WebSocket frame when at least one plugin on the proxy opts in.
+    ///
+    /// `connection_id` is a unique per-connection identifier (monotonic counter) that
+    /// stateful plugins (e.g., ws_rate_limiting) can use to track per-connection state.
+    ///
     /// Return `Some(message)` to replace the frame, `None` to pass through unchanged.
+    /// Returning `Some(Message::Close(...))` will close the WebSocket in both directions.
     async fn on_ws_frame(
         &self,
         _proxy_id: &str,
+        _connection_id: u64,
         _direction: WebSocketFrameDirection,
         _message: &tokio_tungstenite::tungstenite::Message,
     ) -> Option<tokio_tungstenite::tungstenite::Message> {
@@ -607,6 +622,15 @@ pub fn create_plugin_with_http_client(
         "ai_prompt_shield" => Ok(Some(Arc::new(ai_prompt_shield::AiPromptShield::new(
             config,
         )))),
+        "ws_message_size_limiting" => Ok(Some(Arc::new(
+            ws_message_size_limiting::WsMessageSizeLimiting::new(config),
+        ))),
+        "ws_frame_logging" => Ok(Some(Arc::new(ws_frame_logging::WsFrameLogging::new(
+            config,
+        )))),
+        "ws_rate_limiting" => Ok(Some(Arc::new(ws_rate_limiting::WsRateLimiting::new(
+            config,
+        )))),
         _ => {
             // Fall through to custom plugins registry
             let result = crate::custom_plugins::create_custom_plugin(name, config, http_client);
@@ -668,6 +692,9 @@ pub fn available_plugins() -> Vec<&'static str> {
         "ai_request_guard",
         "ai_rate_limiter",
         "ai_prompt_shield",
+        "ws_message_size_limiting",
+        "ws_frame_logging",
+        "ws_rate_limiting",
     ];
     plugins.extend(crate::custom_plugins::custom_plugin_names());
     plugins

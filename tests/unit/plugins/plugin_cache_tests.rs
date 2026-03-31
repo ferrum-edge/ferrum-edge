@@ -845,9 +845,18 @@ async fn test_requires_ws_frame_hooks_defaults_false_for_all_plugins() {
     use ferrum_edge::plugins::available_plugins;
     use ferrum_edge::plugins::create_plugin;
 
-    // Every built-in plugin must return false for requires_ws_frame_hooks() by default.
-    // This is the zero-overhead guarantee — no existing plugin opts in.
+    // Every non-WS-frame built-in plugin must return false for requires_ws_frame_hooks().
+    // This is the zero-overhead guarantee — only explicit WS frame plugins opt in.
+    const WS_FRAME_PLUGINS: &[&str] = &[
+        "ws_message_size_limiting",
+        "ws_frame_logging",
+        "ws_rate_limiting",
+    ];
+
     for name in available_plugins() {
+        if WS_FRAME_PLUGINS.contains(&name) {
+            continue; // These intentionally return true
+        }
         let config = match name {
             "access_control" => serde_json::json!({"allowed_ips": ["0.0.0.0/0"]}),
             "ip_restriction" => serde_json::json!({"allow": ["0.0.0.0/0"]}),
@@ -882,7 +891,7 @@ async fn test_on_ws_frame_default_returns_none() {
 
     let msg = Message::Text("hello".to_string());
     let result = plugin
-        .on_ws_frame("proxy-1", WebSocketFrameDirection::ClientToBackend, &msg)
+        .on_ws_frame("proxy-1", 1, WebSocketFrameDirection::ClientToBackend, &msg)
         .await;
     assert!(
         result.is_none(),
@@ -890,7 +899,7 @@ async fn test_on_ws_frame_default_returns_none() {
     );
 
     let result = plugin
-        .on_ws_frame("proxy-1", WebSocketFrameDirection::BackendToClient, &msg)
+        .on_ws_frame("proxy-1", 1, WebSocketFrameDirection::BackendToClient, &msg)
         .await;
     assert!(
         result.is_none(),
@@ -1008,4 +1017,145 @@ fn test_ws_frame_direction_debug_and_equality() {
     // Debug formatting should not panic
     let _ = format!("{:?}", ctb);
     let _ = format!("{:?}", btc);
+}
+
+#[test]
+fn test_plugin_cache_requires_ws_frame_hooks_true_with_ws_size_plugin() {
+    // When a WS frame plugin is assigned to a proxy, requires_ws_frame_hooks must be TRUE.
+    let config = make_config(
+        vec![make_proxy("p1", "/ws", vec!["ws1"])],
+        vec![make_plugin_config(
+            "ws1",
+            "ws_message_size_limiting",
+            PluginScope::Proxy,
+            Some("p1"),
+            true,
+        )],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+    assert!(
+        cache.requires_ws_frame_hooks("p1"),
+        "requires_ws_frame_hooks must be TRUE when ws_message_size_limiting is attached"
+    );
+}
+
+#[test]
+fn test_plugin_cache_requires_ws_frame_hooks_true_with_ws_rate_plugin() {
+    let config = make_config(
+        vec![make_proxy("p1", "/ws", vec!["ws1"])],
+        vec![make_plugin_config(
+            "ws1",
+            "ws_rate_limiting",
+            PluginScope::Proxy,
+            Some("p1"),
+            true,
+        )],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+    assert!(
+        cache.requires_ws_frame_hooks("p1"),
+        "requires_ws_frame_hooks must be TRUE when ws_rate_limiting is attached"
+    );
+}
+
+#[test]
+fn test_plugin_cache_requires_ws_frame_hooks_true_with_ws_logging_plugin() {
+    let config = make_config(
+        vec![make_proxy("p1", "/ws", vec!["ws1"])],
+        vec![make_plugin_config(
+            "ws1",
+            "ws_frame_logging",
+            PluginScope::Proxy,
+            Some("p1"),
+            true,
+        )],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+    assert!(
+        cache.requires_ws_frame_hooks("p1"),
+        "requires_ws_frame_hooks must be TRUE when ws_frame_logging is attached"
+    );
+}
+
+#[test]
+fn test_plugin_cache_ws_plugins_filtered_to_websocket_protocol_only() {
+    // WS-only plugins should NOT appear in the HTTP plugin list for a proxy.
+    let config = make_config(
+        vec![make_proxy("p1", "/ws", vec!["ws1", "http1"])],
+        vec![
+            make_plugin_config(
+                "ws1",
+                "ws_message_size_limiting",
+                PluginScope::Proxy,
+                Some("p1"),
+                true,
+            ),
+            make_plugin_config(
+                "http1",
+                "rate_limiting",
+                PluginScope::Proxy,
+                Some("p1"),
+                true,
+            ),
+        ],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+
+    // HTTP protocol should only include rate_limiting, not ws_message_size_limiting
+    let http_plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Http);
+    assert_eq!(
+        http_plugins.len(),
+        1,
+        "HTTP should have only rate_limiting, not WS plugins"
+    );
+    assert_eq!(http_plugins[0].name(), "rate_limiting");
+
+    // WebSocket protocol should include both
+    let ws_plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::WebSocket);
+    let ws_names: Vec<&str> = ws_plugins.iter().map(|p| p.name()).collect();
+    assert!(
+        ws_names.contains(&"ws_message_size_limiting"),
+        "WebSocket protocol should include ws_message_size_limiting"
+    );
+    assert!(
+        ws_names.contains(&"rate_limiting"),
+        "WebSocket protocol should include rate_limiting (ALL_PROTOCOLS)"
+    );
+}
+
+#[test]
+fn test_plugin_cache_rebuild_adds_ws_frame_hooks_flag() {
+    // Start with no WS plugins → flag is false
+    let config1 = make_config(
+        vec![make_proxy("p1", "/ws", vec!["ps1"])],
+        vec![make_plugin_config(
+            "ps1",
+            "rate_limiting",
+            PluginScope::Proxy,
+            Some("p1"),
+            true,
+        )],
+    );
+    let cache = PluginCache::new(&config1).unwrap();
+    assert!(!cache.requires_ws_frame_hooks("p1"));
+
+    // Rebuild with WS plugin → flag must become true
+    let config2 = make_config(
+        vec![make_proxy("p1", "/ws", vec!["ps1", "ws1"])],
+        vec![
+            make_plugin_config("ps1", "rate_limiting", PluginScope::Proxy, Some("p1"), true),
+            make_plugin_config(
+                "ws1",
+                "ws_frame_logging",
+                PluginScope::Proxy,
+                Some("p1"),
+                true,
+            ),
+        ],
+    );
+    cache.rebuild(&config2).unwrap();
+    assert!(
+        cache.requires_ws_frame_hooks("p1"),
+        "requires_ws_frame_hooks must be TRUE after rebuild adds ws_frame_logging"
+    );
 }

@@ -168,6 +168,9 @@ pub struct ProxyState {
     pub stream_listener_manager: Arc<stream_listener::StreamListenerManager>,
     /// Monotonic instant captured at ProxyState creation for uptime calculation.
     pub started_at: Instant,
+    /// Monotonic counter for generating unique WebSocket connection IDs.
+    /// Used by frame-level plugins (e.g., ws_rate_limiting) for per-connection state.
+    pub ws_connection_counter: Arc<AtomicU64>,
 }
 
 impl ProxyState {
@@ -303,6 +306,7 @@ impl ProxyState {
             trusted_proxies,
             stream_listener_manager,
             started_at: Instant::now(),
+            ws_connection_counter: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -1276,12 +1280,18 @@ async fn handle_websocket_request_authenticated(
 
     // Spawn bidirectional forwarding task (awaits client upgrade, then proxies)
     let proxy_id = proxy.id.clone();
+    let ws_conn_id = state.ws_connection_counter.fetch_add(1, Ordering::Relaxed);
     tokio::spawn(async move {
         match on_upgrade.await {
             Ok(upgraded) => {
-                if let Err(e) =
-                    run_websocket_proxy(upgraded, backend_ws_stream, &proxy_id, ws_frame_plugins)
-                        .await
+                if let Err(e) = run_websocket_proxy(
+                    upgraded,
+                    backend_ws_stream,
+                    &proxy_id,
+                    ws_conn_id,
+                    ws_frame_plugins,
+                )
+                .await
                 {
                     error!("WebSocket proxying error for {}: {}", proxy_id, e);
                 }
@@ -1543,6 +1553,7 @@ async fn connect_websocket_backend(
 
 /// Run bidirectional WebSocket proxying between upgraded client and connected backend.
 ///
+/// `connection_id` — unique per-connection identifier for stateful frame plugins.
 /// `ws_frame_plugins` — plugins that opted into per-frame hooks by returning `true`
 /// from `requires_ws_frame_hooks()`. Pass an empty `Vec` for zero-overhead forwarding
 /// when no plugin on this proxy needs frame inspection.
@@ -1550,6 +1561,7 @@ async fn run_websocket_proxy(
     upgraded: Upgraded,
     backend_ws_stream: WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
     proxy_id: &str,
+    connection_id: u64,
     ws_frame_plugins: Vec<Arc<dyn Plugin>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let ws_config = WebSocketConfig {
@@ -1576,61 +1588,86 @@ async fn run_websocket_proxy(
     let proxy_id_ctb = proxy_id.to_string();
     let proxy_id_btc = proxy_id.to_string();
 
+    // Cancellation token for clean bidirectional close when a plugin triggers Close.
+    // Each direction checks this token to know if the other side initiated a close.
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let cancel_ctb = cancel.clone();
+    let cancel_btc = cancel.clone();
+
     // Forward messages from client to backend
     let client_to_backend = async move {
         debug!("Starting client -> backend message forwarding");
-        while let Some(msg) = ws_stream.next().await {
-            match msg {
-                Ok(Message::Text(_)) | Ok(Message::Binary(_)) | Ok(Message::Ping(_)) => {
-                    let raw = msg.unwrap(); // safe: matched Ok above
-                    // Apply frame hooks when any plugin opted in (zero overhead when empty)
-                    let outgoing = if ctb_plugins.is_empty() {
-                        raw
-                    } else {
-                        let mut current = raw;
-                        for plugin in &ctb_plugins {
-                            if let Some(transformed) = plugin
-                                .on_ws_frame(
-                                    &proxy_id_ctb,
-                                    WebSocketFrameDirection::ClientToBackend,
-                                    &current,
-                                )
-                                .await
-                            {
-                                current = transformed;
+        loop {
+            tokio::select! {
+                biased;
+                _ = cancel_ctb.cancelled() => {
+                    debug!("Client->backend: other direction triggered close");
+                    let _ = backend_sink.send(Message::Close(None)).await;
+                    break;
+                }
+                msg = ws_stream.next() => {
+                    let Some(msg) = msg else { break };
+                    match msg {
+                        Ok(Message::Text(_)) | Ok(Message::Binary(_)) | Ok(Message::Ping(_)) => {
+                            let raw = msg.unwrap(); // safe: matched Ok above
+                            // Apply frame hooks when any plugin opted in (zero overhead when empty)
+                            let outgoing = if ctb_plugins.is_empty() {
+                                raw
+                            } else {
+                                let mut current = raw;
+                                for plugin in &ctb_plugins {
+                                    if let Some(transformed) = plugin
+                                        .on_ws_frame(
+                                            &proxy_id_ctb,
+                                            connection_id,
+                                            WebSocketFrameDirection::ClientToBackend,
+                                            &current,
+                                        )
+                                        .await
+                                    {
+                                        current = transformed;
+                                    }
+                                }
+                                current
+                            };
+                            // If a plugin transformed the frame into a Close, close both sides
+                            if matches!(&outgoing, Message::Close(_)) {
+                                debug!("Plugin triggered close on client->backend frame");
+                                let _ = backend_sink.send(outgoing).await;
+                                cancel_ctb.cancel(); // signal other direction
+                                break;
+                            }
+                            match &outgoing {
+                                Message::Text(_) => trace!("Client -> Backend: Text message"),
+                                Message::Binary(d) => {
+                                    trace!(bytes = d.len(), "Client -> Backend: Binary message")
+                                }
+                                Message::Ping(_) => trace!("Client -> Backend: Ping"),
+                                _ => {}
+                            }
+                            if let Err(e) = backend_sink.send(outgoing).await {
+                                error!("Failed to send message to backend: {}", e);
+                                break;
                             }
                         }
-                        current
-                    };
-                    match &outgoing {
-                        Message::Text(_) => trace!("Client -> Backend: Text message"),
-                        Message::Binary(d) => {
-                            trace!(bytes = d.len(), "Client -> Backend: Binary message")
+                        Ok(Message::Close(close_frame)) => {
+                            debug!("Client sent close frame");
+                            if let Err(e) = backend_sink.send(Message::Close(close_frame)).await {
+                                error!("Failed to send close to backend: {}", e);
+                            }
+                            break;
                         }
-                        Message::Ping(_) => trace!("Client -> Backend: Ping"),
-                        _ => {}
+                        Ok(Message::Pong(_data)) => {
+                            trace!("Client -> Backend: Pong");
+                        }
+                        Ok(Message::Frame(_)) => {
+                            trace!("Client -> Backend: Frame");
+                        }
+                        Err(e) => {
+                            error!("Error receiving from client: {}", e);
+                            break;
+                        }
                     }
-                    if let Err(e) = backend_sink.send(outgoing).await {
-                        error!("Failed to send message to backend: {}", e);
-                        break;
-                    }
-                }
-                Ok(Message::Close(close_frame)) => {
-                    debug!("Client sent close frame");
-                    if let Err(e) = backend_sink.send(Message::Close(close_frame)).await {
-                        error!("Failed to send close to backend: {}", e);
-                    }
-                    break;
-                }
-                Ok(Message::Pong(_data)) => {
-                    trace!("Client -> Backend: Pong");
-                }
-                Ok(Message::Frame(_)) => {
-                    trace!("Client -> Backend: Frame");
-                }
-                Err(e) => {
-                    error!("Error receiving from client: {}", e);
-                    break;
                 }
             }
         }
@@ -1640,58 +1677,77 @@ async fn run_websocket_proxy(
     // Forward messages from backend to client
     let backend_to_client = async move {
         debug!("Starting backend -> client message forwarding");
-        while let Some(msg) = backend_stream.next().await {
-            match msg {
-                Ok(Message::Text(_)) | Ok(Message::Binary(_)) | Ok(Message::Ping(_)) => {
-                    let raw = msg.unwrap(); // safe: matched Ok above
-                    // Apply frame hooks when any plugin opted in (zero overhead when empty)
-                    let outgoing = if btc_plugins.is_empty() {
-                        raw
-                    } else {
-                        let mut current = raw;
-                        for plugin in &btc_plugins {
-                            if let Some(transformed) = plugin
-                                .on_ws_frame(
-                                    &proxy_id_btc,
-                                    WebSocketFrameDirection::BackendToClient,
-                                    &current,
-                                )
-                                .await
-                            {
-                                current = transformed;
+        loop {
+            tokio::select! {
+                biased;
+                _ = cancel_btc.cancelled() => {
+                    debug!("Backend->client: other direction triggered close");
+                    let _ = ws_sink.send(Message::Close(None)).await;
+                    break;
+                }
+                msg = backend_stream.next() => {
+                    let Some(msg) = msg else { break };
+                    match msg {
+                        Ok(Message::Text(_)) | Ok(Message::Binary(_)) | Ok(Message::Ping(_)) => {
+                            let raw = msg.unwrap(); // safe: matched Ok above
+                            // Apply frame hooks when any plugin opted in (zero overhead when empty)
+                            let outgoing = if btc_plugins.is_empty() {
+                                raw
+                            } else {
+                                let mut current = raw;
+                                for plugin in &btc_plugins {
+                                    if let Some(transformed) = plugin
+                                        .on_ws_frame(
+                                            &proxy_id_btc,
+                                            connection_id,
+                                            WebSocketFrameDirection::BackendToClient,
+                                            &current,
+                                        )
+                                        .await
+                                    {
+                                        current = transformed;
+                                    }
+                                }
+                                current
+                            };
+                            // If a plugin transformed the frame into a Close, close both sides
+                            if matches!(&outgoing, Message::Close(_)) {
+                                debug!("Plugin triggered close on backend->client frame");
+                                let _ = ws_sink.send(outgoing).await;
+                                cancel_btc.cancel(); // signal other direction
+                                break;
+                            }
+                            match &outgoing {
+                                Message::Text(_) => trace!("Backend -> Client: Text message"),
+                                Message::Binary(d) => {
+                                    trace!(bytes = d.len(), "Backend -> Client: Binary message")
+                                }
+                                Message::Ping(_) => trace!("Backend -> Client: Ping"),
+                                _ => {}
+                            }
+                            if let Err(e) = ws_sink.send(outgoing).await {
+                                error!("Failed to send message to client: {}", e);
+                                break;
                             }
                         }
-                        current
-                    };
-                    match &outgoing {
-                        Message::Text(_) => trace!("Backend -> Client: Text message"),
-                        Message::Binary(d) => {
-                            trace!(bytes = d.len(), "Backend -> Client: Binary message")
+                        Ok(Message::Close(close_frame)) => {
+                            debug!("Backend sent close frame");
+                            if let Err(e) = ws_sink.send(Message::Close(close_frame)).await {
+                                error!("Failed to send close to client: {}", e);
+                            }
+                            break;
                         }
-                        Message::Ping(_) => trace!("Backend -> Client: Ping"),
-                        _ => {}
+                        Ok(Message::Pong(_data)) => {
+                            trace!("Backend -> Client: Pong");
+                        }
+                        Ok(Message::Frame(_)) => {
+                            trace!("Backend -> Client: Frame");
+                        }
+                        Err(e) => {
+                            error!("Error receiving from backend: {}", e);
+                            break;
+                        }
                     }
-                    if let Err(e) = ws_sink.send(outgoing).await {
-                        error!("Failed to send message to client: {}", e);
-                        break;
-                    }
-                }
-                Ok(Message::Close(close_frame)) => {
-                    debug!("Backend sent close frame");
-                    if let Err(e) = ws_sink.send(Message::Close(close_frame)).await {
-                        error!("Failed to send close to client: {}", e);
-                    }
-                    break;
-                }
-                Ok(Message::Pong(_data)) => {
-                    trace!("Backend -> Client: Pong");
-                }
-                Ok(Message::Frame(_)) => {
-                    trace!("Backend -> Client: Frame");
-                }
-                Err(e) => {
-                    error!("Error receiving from backend: {}", e);
-                    break;
                 }
             }
         }

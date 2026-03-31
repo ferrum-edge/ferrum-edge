@@ -96,6 +96,52 @@ Connection/Session In
 | **UDP** | On first datagram from new client (session creation) | When session is cleaned up (idle timeout) |
 | **UDP+DTLS** | After DTLS `accept()`, before backend connection | When DTLS handler exits |
 
+## WebSocket Frame Lifecycle (`on_ws_frame`)
+
+WebSocket connections go through the normal HTTP plugin pipeline during the upgrade handshake — authentication, authorization, rate limiting, and all other HTTP phases execute before the connection is upgraded. Once the WebSocket upgrade completes, the frame-level hooks kick in.
+
+The `on_ws_frame` phase fires for every **Text**, **Binary**, and **Ping** frame in both directions:
+
+```
+WebSocket Upgrade (HTTP pipeline: authenticate → authorize → before_proxy → ...)
+    │
+    ▼
+┌─────────────────────────────────────┐
+│  Frame Forwarding Loop              │
+│                                     │
+│  ┌───────────────────────────────┐  │
+│  │ on_ws_frame (ClientToBackend) │──┼── For each Text/Binary/Ping from client
+│  └───────────────────────────────┘  │
+│                                     │
+│  ┌───────────────────────────────┐  │
+│  │ on_ws_frame (BackendToClient) │──┼── For each Text/Binary/Ping from backend
+│  └───────────────────────────────┘  │
+│                                     │
+└─────────────────────────────────────┘
+```
+
+### Connection Tracking
+
+Each WebSocket connection is assigned a `connection_id` — a monotonic `u64` counter unique per WebSocket connection. Plugins use this identifier for per-connection state tracking (e.g., per-connection rate limit buckets, per-connection frame counters).
+
+### Frame Rejection
+
+Plugins can return `Some(Message::Close(...))` to close the connection in both directions. When a plugin returns a close frame, the gateway sends it to both client and backend and tears down the connection.
+
+### Execution Order
+
+Plugins execute in priority order (lower number runs first):
+
+| # | Plugin | Priority | Behavior |
+|---|--------|----------|----------|
+| 1 | `ws_message_size_limiting` | 2810 | Rejects frames exceeding max payload size |
+| 2 | `ws_rate_limiting` | 2910 | Per-connection token-bucket frame rate limiting |
+| 3 | `ws_frame_logging` | 9050 | Logs frame metadata (direction, opcode, payload size) |
+
+### Zero-Overhead Opt-In
+
+When no plugins on a proxy return `true` from `requires_ws_frame_hooks()`, the frame forwarding loop has zero overhead — frames are forwarded directly without entering the plugin pipeline. The `requires_ws_frame_hooks` flag is pre-computed per-proxy in `PluginCache` at config reload time.
+
 ## Priority Bands
 
 Within each lifecycle phase, plugins are sorted by **priority** (lower number runs first). Priority is intrinsic to each plugin — it is not user-configurable. Plugins at the same priority have no guaranteed relative order.
@@ -106,11 +152,11 @@ Priority bands are spaced with gaps so future plugins can slot in without renumb
 |------|---------------|---------|---------|
 | **Early** | 0–949 | Pre-processing that must run before auth | `otel_tracing` (25), `cors` (100), `ip_restriction` (150), `bot_detection` (200) |
 | **AuthN** | 950–1999 | Authentication / identity verification | `mtls_auth` (950), `jwks_auth` (1000), `jwt_auth` (1100), `key_auth` (1200), `basic_auth` (1300), `hmac_auth` (1400) |
-| **AuthZ** | 2000–2999 | Authorization & post-auth enforcement | `access_control` (2000), `request_size_limiting` (2800), `graphql` (2850), `rate_limiting` (2900), `ai_prompt_shield` (2925) |
+| **AuthZ** | 2000–2999 | Authorization & post-auth enforcement | `access_control` (2000), `request_size_limiting` (2800), `ws_message_size_limiting` (2810), `graphql` (2850), `rate_limiting` (2900), `ws_rate_limiting` (2910), `ai_prompt_shield` (2925) |
 | **Transform** | 3000–3999 | Request modification before backend call | `body_validator` (2950), `ai_request_guard` (2975), `request_transformer` (3000), `request_termination` (3200), `response_size_limiting` (3950) |
 | **Response** | 4000–4999 | Response modification after backend call | `response_transformer` (4000), `ai_token_metrics` (4100), `ai_rate_limiter` (4200) |
 | **Custom** | 5000 | Default for unrecognized/custom plugins | _(future plugins)_ |
-| **Logging** | 9000–9999 | Observability, runs outside the hot path | `stdout_logging` (9000), `correlation_id` (9050), `http_logging` (9100), `transaction_debugger` (9200), `prometheus_metrics` (9300) |
+| **Logging** | 9000–9999 | Observability, runs outside the hot path | `stdout_logging` (9000), `ws_frame_logging` (9050), `correlation_id` (9050), `http_logging` (9100), `transaction_debugger` (9200), `prometheus_metrics` (9300) |
 
 ## Complete Execution Order
 
@@ -130,22 +176,25 @@ Given all built-in plugins enabled, the execution order is:
 | 10 | `hmac_auth` | 1400 | authenticate |
 | 11 | `access_control` | 2000 | authorize |
 | 12 | `request_size_limiting` | 2800 | on_request_received, before_proxy |
-| 13 | `graphql` | 2850 | before_proxy |
-| 14 | `rate_limiting` | 2900 | on_request_received (IP mode), authorize (consumer mode), on_stream_connect |
-| 15 | `ai_prompt_shield` | 2925 | before_proxy, transform_request_body |
-| 16 | `body_validator` | 2950 | before_proxy, on_response_body |
-| 17 | `ai_request_guard` | 2975 | before_proxy, transform_request_body |
-| 18 | `request_transformer` | 3000 | before_proxy |
-| 19 | `request_termination` | 3200 | before_proxy |
-| 20 | `response_size_limiting` | 3950 | after_proxy, on_response_body |
-| 21 | `response_transformer` | 4000 | after_proxy |
-| 22 | `ai_token_metrics` | 4100 | on_response_body |
-| 23 | `ai_rate_limiter` | 4200 | before_proxy, on_response_body, after_proxy |
-| 24 | `stdout_logging` | 9000 | log, on_stream_disconnect |
-| 25 | `correlation_id` | 9050 | on_request_received, on_stream_connect, log |
-| 26 | `http_logging` | 9100 | log, on_stream_disconnect |
-| 27 | `transaction_debugger` | 9200 | on_request_received, after_proxy, log, on_stream_disconnect |
-| 28 | `prometheus_metrics` | 9300 | after_proxy, log, on_stream_disconnect |
+| 13 | `ws_message_size_limiting` | 2810 | on_ws_frame |
+| 14 | `graphql` | 2850 | before_proxy |
+| 15 | `rate_limiting` | 2900 | on_request_received (IP mode), authorize (consumer mode), on_stream_connect |
+| 16 | `ws_rate_limiting` | 2910 | on_ws_frame |
+| 17 | `ai_prompt_shield` | 2925 | before_proxy, transform_request_body |
+| 18 | `body_validator` | 2950 | before_proxy, on_response_body |
+| 19 | `ai_request_guard` | 2975 | before_proxy, transform_request_body |
+| 20 | `request_transformer` | 3000 | before_proxy |
+| 21 | `request_termination` | 3200 | before_proxy |
+| 22 | `response_size_limiting` | 3950 | after_proxy, on_response_body |
+| 23 | `response_transformer` | 4000 | after_proxy |
+| 24 | `ai_token_metrics` | 4100 | on_response_body |
+| 25 | `ai_rate_limiter` | 4200 | before_proxy, on_response_body, after_proxy |
+| 26 | `stdout_logging` | 9000 | log, on_stream_disconnect |
+| 27 | `ws_frame_logging` | 9050 | on_ws_frame |
+| 28 | `correlation_id` | 9050 | on_request_received, on_stream_connect, log |
+| 29 | `http_logging` | 9100 | log, on_stream_disconnect |
+| 30 | `transaction_debugger` | 9200 | on_request_received, after_proxy, log, on_stream_disconnect |
+| 31 | `prometheus_metrics` | 9300 | after_proxy, log, on_stream_disconnect |
 
 ## Why This Order Matters
 
@@ -297,6 +346,9 @@ TLS/DTLS are transport-layer concerns, not separate protocols. A plugin that sup
 | `ai_request_guard` | ✓ | ✓ | | | | Validates JSON request bodies |
 | `ai_token_metrics` | ✓ | ✓ | | | | Parses JSON response bodies for token usage |
 | `ai_rate_limiter` | ✓ | ✓ | | | | Parses JSON response bodies for token counts |
+| `ws_message_size_limiting` | | | ✓ | | | Enforces max frame size on WebSocket connections |
+| `ws_rate_limiting` | | | ✓ | | | Per-connection frame rate limiting for WebSocket |
+| `ws_frame_logging` | | | ✓ | | | Logs WebSocket frame metadata |
 | `stdout_logging` | ✓ | ✓ | ✓ | ✓ | ✓ | Observability applies everywhere |
 | `correlation_id` | ✓ | ✓ | ✓ | ✓ | ✓ | ID assignment is protocol-agnostic |
 | `http_logging` | ✓ | ✓ | ✓ | ✓ | ✓ | Observability applies everywhere |

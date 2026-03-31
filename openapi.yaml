@@ -713,6 +713,9 @@ paths:
                 - request_termination
                 - prometheus_metrics
                 - otel_tracing
+                - ws_message_size_limiting
+                - ws_frame_logging
+                - ws_rate_limiting
         "401":
           $ref: "#/components/responses/Unauthorized"
 
@@ -1470,7 +1473,9 @@ components:
             instantiated at config reload time. Security plugins (key_auth,
             basic_auth, jwt_auth, hmac_auth, jwks_auth, mtls_auth,
             access_control, ip_restriction) block gateway startup if their
-            config is invalid.
+            config is invalid. See per-plugin schemas:
+            `WsMessageSizeLimitingConfig`, `WsFrameLoggingConfig`,
+            `WsRateLimitingConfig`.
         scope:
           $ref: "#/components/schemas/PluginScope"
         proxy_id:
@@ -1505,6 +1510,74 @@ components:
         `global` — plugin applies to all proxies; `proxy_id` must be null.
         `proxy` — plugin applies only to the proxy referenced by `proxy_id`;
         `proxy_id` is required.
+
+    # ── WebSocket Plugin Configs ─────────────────────────────────────
+    WsMessageSizeLimitingConfig:
+      type: object
+      description: |
+        Configuration for the `ws_message_size_limiting` plugin. Enforces a
+        maximum frame payload size on WebSocket connections. Frames exceeding
+        the limit trigger a close frame sent to both client and backend.
+      properties:
+        max_frame_bytes:
+          type: integer
+          default: 0
+          description: >-
+            Maximum frame payload size in bytes. Required for the plugin to
+            take effect — a value of 0 means no limit is enforced.
+        close_reason:
+          type: string
+          default: "Message too large"
+          description: Close frame reason text sent when a frame exceeds the limit.
+
+    WsFrameLoggingConfig:
+      type: object
+      description: |
+        Configuration for the `ws_frame_logging` plugin. Logs WebSocket frame
+        metadata (direction, opcode, payload size) for each Text, Binary, and
+        Ping frame.
+      properties:
+        log_level:
+          type: string
+          enum: [trace, debug, info]
+          default: info
+          description: Tracing level for frame log output.
+        include_payload_preview:
+          type: boolean
+          default: false
+          description: Include a payload preview in log output.
+        payload_preview_bytes:
+          type: integer
+          default: 128
+          maximum: 65536
+          description: >-
+            Maximum number of bytes to include in the payload preview. Only
+            applies when `include_payload_preview` is true.
+        log_ping_pong:
+          type: boolean
+          default: false
+          description: Whether to log ping/pong frames in addition to text/binary frames.
+
+    WsRateLimitingConfig:
+      type: object
+      description: |
+        Configuration for the `ws_rate_limiting` plugin. Enforces per-connection
+        frame rate limiting using a token-bucket algorithm. When the bucket is
+        exhausted, the plugin sends a close frame to both client and backend.
+      properties:
+        frames_per_second:
+          type: integer
+          default: 100
+          description: Token refill rate per second.
+        burst_size:
+          type: integer
+          description: >-
+            Maximum burst capacity (tokens). Defaults to the value of
+            `frames_per_second` when not explicitly set.
+        close_reason:
+          type: string
+          default: "Frame rate exceeded"
+          description: Close frame reason text sent when the frame rate is exceeded.
 
     # ── Circuit Breaker ─────────────────────────────────────────────
     CircuitBreakerConfig:

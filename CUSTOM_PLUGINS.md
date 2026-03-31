@@ -153,18 +153,22 @@ Every plugin implements the `Plugin` trait from `src/plugins/mod.rs`. All method
 | `before_proxy(&mut ctx, &mut headers)` | Pre-backend | Yes | Transform request headers, add tracing IDs |
 | `after_proxy(&mut ctx, status, &mut headers)` | Post-backend | No* | Transform response headers |
 | `log(&summary)` | Logging | No | Send transaction data to external systems |
+| `on_ws_frame(&self, proxy_id, connection_id, direction, &message)` | WebSocket Frame | Close* | Inspect/transform per-frame WebSocket traffic |
 
 *`after_proxy` return values are ignored — it cannot reject the response.
+
+*`on_ws_frame` cannot return `PluginResult::Reject`. Instead, return `Some(Message::Close(...))` to close the connection in both directions. Return `None` for passthrough, or `Some(transformed_message)` to replace the frame.
 
 ### Optional Capability Methods
 
 | Method | Default | Description |
 |--------|---------|-------------|
 | `fn priority(&self) -> u16` | `5000` | Execution order (lower = earlier). See priority bands below. |
-| `fn supported_protocols(&self) -> &'static [ProxyProtocol]` | `HTTP_ONLY_PROTOCOLS` | Which proxy protocols this plugin supports. Use `ALL_PROTOCOLS` for protocol-agnostic plugins, `HTTP_FAMILY_PROTOCOLS` for HTTP/gRPC/WebSocket, `HTTP_GRPC_PROTOCOLS` for HTTP/gRPC, or `HTTP_ONLY_PROTOCOLS` for HTTP only. |
+| `fn supported_protocols(&self) -> &'static [ProxyProtocol]` | `HTTP_ONLY_PROTOCOLS` | Which proxy protocols this plugin supports. Use `ALL_PROTOCOLS` for protocol-agnostic plugins, `HTTP_FAMILY_PROTOCOLS` for HTTP/gRPC/WebSocket, `HTTP_GRPC_PROTOCOLS` for HTTP/gRPC, `HTTP_ONLY_PROTOCOLS` for HTTP only, or `WS_ONLY_PROTOCOLS` for WebSocket frame-level plugins. |
 | `fn is_auth_plugin(&self) -> bool` | `false` | Set to `true` if your plugin participates in the authentication phase. |
 | `fn requires_response_body_buffering(&self) -> bool` | `false` | Set to `true` if your plugin needs to inspect the response body. Disables streaming. |
 | `fn warmup_hostnames(&self) -> Vec<String>` | `[]` | Hostnames your plugin connects to (for DNS pre-warming). |
+| `fn requires_ws_frame_hooks(&self) -> bool` | `false` | Set to `true` if your plugin implements `on_ws_frame()`. The gateway pre-computes this flag per proxy for zero-overhead when no plugin opts in. |
 
 ## Priority Bands
 
@@ -174,11 +178,11 @@ Plugins execute in priority order (lowest number first) within each lifecycle ph
 |------|-------|---------|-------------------|
 | Preflight | 0–999 | Pre-processing, CORS, IP filtering | cors (100), ip_restriction (150) |
 | Authentication | 1000–1999 | Identity verification | jwt_auth (1100), key_auth (1200) |
-| Authorization | 2000–2999 | Access control, rate limiting | access_control (2000), rate_limiting (2900) |
+| Authorization | 2000–2999 | Access control, rate limiting, WS frame enforcement | access_control (2000), ws_message_size_limiting (2810), rate_limiting (2900), ws_rate_limiting (2910) |
 | Request Transform | 3000–3999 | Modify request before backend | request_transformer (3000) |
 | Response Transform | 4000–4999 | Modify response after backend | response_transformer (4000) |
 | **Custom Default** | **5000** | **Default for custom plugins** | — |
-| Logging | 9000–9999 | Observability, metrics | stdout_logging (9000), prometheus (9300) |
+| Logging | 9000–9999 | Observability, metrics, WS frame logging | stdout_logging (9000), ws_frame_logging (9050), prometheus (9300) |
 
 To set a priority, override the `priority()` method:
 

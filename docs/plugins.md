@@ -1,6 +1,6 @@
 # Plugin Reference
 
-Ferrum Edge includes 28 built-in plugins organized into lifecycle phases. Each plugin executes at a specific priority (lower number = runs first).
+Ferrum Edge includes 31 built-in plugins organized into lifecycle phases. Each plugin executes at a specific priority (lower number = runs first).
 
 For execution order, protocol support matrix, and design rationale, see [plugin_execution_order.md](plugin_execution_order.md).
 
@@ -13,6 +13,7 @@ For execution order, protocol support matrix, and design rationale, see [plugin_
 5. **`after_proxy`** — Modifies the response from the backend (Response Transformer, CORS headers)
 6. **`on_response_body`** — Processes response body (AI token metrics, AI rate limiter)
 7. **`log`** — Logs the transaction summary (Stdout/HTTP Logging)
+8. **`on_ws_frame`** — Per-frame WebSocket hooks (Size Limiting, Rate Limiting, Frame Logging)
 
 ## Scope
 

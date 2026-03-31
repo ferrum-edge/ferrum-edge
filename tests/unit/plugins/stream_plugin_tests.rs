@@ -356,6 +356,62 @@ async fn test_stream_metadata_flows_from_connect_to_disconnect() {
     );
 }
 
+// ---- WebSocket-only frame plugins ----
+
+#[test]
+fn test_ws_only_plugins() {
+    let plugins = vec![
+        ("ws_message_size_limiting", json!({"max_frame_bytes": 1024})),
+        ("ws_frame_logging", json!({})),
+        ("ws_rate_limiting", json!({"frames_per_second": 100})),
+    ];
+
+    for (name, config) in plugins {
+        let plugin = make_plugin(name, config);
+        assert!(plugin.is_some(), "Failed to create plugin: {}", name);
+        let plugin = plugin.unwrap();
+        let protocols = plugin.supported_protocols();
+        assert_eq!(
+            protocols.len(),
+            1,
+            "Plugin {} should support exactly 1 protocol (WebSocket), got {:?}",
+            name,
+            protocols
+        );
+        assert!(
+            protocols.contains(&ProxyProtocol::WebSocket),
+            "Plugin {} must support WebSocket",
+            name
+        );
+        assert!(
+            !protocols.contains(&ProxyProtocol::Http),
+            "Plugin {} must NOT support HTTP",
+            name
+        );
+        assert!(
+            !protocols.contains(&ProxyProtocol::Grpc),
+            "Plugin {} must NOT support gRPC",
+            name
+        );
+        assert!(
+            !protocols.contains(&ProxyProtocol::Tcp),
+            "Plugin {} must NOT support TCP",
+            name
+        );
+        assert!(
+            !protocols.contains(&ProxyProtocol::Udp),
+            "Plugin {} must NOT support UDP",
+            name
+        );
+        // All WS frame plugins must opt into frame hooks
+        assert!(
+            plugin.requires_ws_frame_hooks(),
+            "Plugin {} must return true from requires_ws_frame_hooks()",
+            name
+        );
+    }
+}
+
 // ---- Complete protocol declaration coverage for ALL plugins ----
 
 #[tokio::test]

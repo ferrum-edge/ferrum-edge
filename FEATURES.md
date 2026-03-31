@@ -54,7 +54,7 @@ Ferrum supports dynamic upstream target discovery through three providers, confi
 
 ## Plugin System
 
-- 28 built-in plugins with lifecycle hooks (request received, authenticate, authorize, before proxy, after proxy, on response body, log)
+- 31 built-in plugins with lifecycle hooks (request received, authenticate, authorize, before proxy, after proxy, on response body, on WebSocket frame, log)
 - Priority-ordered execution with protocol-aware filtering (HTTP, gRPC, WebSocket, TCP, UDP)
 - Global and per-proxy scoping with same-type override semantics
 - Multi-authentication mode with first-match consumer identification
@@ -86,6 +86,12 @@ Ferrum supports dynamic upstream target discovery through three providers, confi
 - **AI Request Guard** — validate and constrain AI requests: model allow/block lists, max_tokens enforcement (reject or clamp), message count limits, prompt length limits, temperature range, system prompt blocking
 - **AI Rate Limiter** — token-aware rate limiting per consumer or IP with sliding window, auto-detecting provider format from responses
 - **AI Prompt Shield** — PII detection and redaction in prompts with built-in patterns (SSN, credit card, email, phone, API keys, AWS keys, IBAN) and custom regex support
+
+### WebSocket Plugins
+
+- **WebSocket Message Size Limiting** — enforces maximum frame sizes on WebSocket connections, closing with code 1009 (Message Too Big) on violation
+- **WebSocket Rate Limiting** — per-connection frame rate limiting using token bucket algorithm, closing with code 1008 (Policy Violation) on excess
+- **WebSocket Frame Logging** — logs frame metadata (direction, type, size, connection ID) without transforming frames
 
 ### Transform Plugins
 

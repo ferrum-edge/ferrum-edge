@@ -424,6 +424,7 @@ async fn test_http3_proxy_state_creation() {
         trusted_proxies: Arc::new(ferrum_edge::proxy::client_ip::TrustedProxies::parse("")),
         stream_listener_manager: slm,
         started_at: std::time::Instant::now(),
+        ws_connection_counter: Arc::new(std::sync::atomic::AtomicU64::new(0)),
     };
 
     // Verify proxy state is created successfully
@@ -594,6 +595,7 @@ async fn test_http3_full_integration() {
         trusted_proxies: Arc::new(ferrum_edge::proxy::client_ip::TrustedProxies::parse("")),
         stream_listener_manager: slm,
         started_at: std::time::Instant::now(),
+        ws_connection_counter: Arc::new(std::sync::atomic::AtomicU64::new(0)),
     };
 
     // Verify proxy state is created successfully

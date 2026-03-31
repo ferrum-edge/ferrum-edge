@@ -4,7 +4,7 @@ This file provides context for Claude Code when working on the Ferrum Edge codeb
 
 ## Project Overview
 
-Ferrum Edge is a high-performance edge proxy built in Rust. It supports HTTP/1.1, HTTP/2, HTTP/3 (QUIC), WebSocket, gRPC, and raw TCP/UDP stream proxying with a plugin architecture (28 built-in plugins including 4 AI/LLM-specific plugins), four operating modes, and load balancing with health checks.
+Ferrum Edge is a high-performance edge proxy built in Rust. It supports HTTP/1.1, HTTP/2, HTTP/3 (QUIC), WebSocket, gRPC, and raw TCP/UDP stream proxying with a plugin architecture (31 built-in plugins including 4 AI/LLM-specific plugins and 3 WebSocket frame-level plugins), four operating modes, and load balancing with health checks.
 
 - **Language**: Rust (edition 2024)
 - **Async runtime**: tokio + hyper 1.0
@@ -112,7 +112,7 @@ src/
 │   ├── tcp_proxy.rs           # Raw TCP stream proxy with TLS termination/origination
 │   ├── udp_proxy.rs           # UDP datagram proxy with per-client session tracking, DTLS frontend/backend
 │   └── stream_listener.rs     # Stream listener lifecycle manager (reconcile on config reload)
-├── plugins/                   # Plugin system (28 plugins, including 4 AI/LLM plugins)
+├── plugins/                   # Plugin system (31 plugins, including 4 AI/LLM and 3 WS frame plugins)
 │   ├── mod.rs                 # Plugin trait, registry, priority constants, lifecycle
 │   └── [plugin_name].rs       # Individual plugin implementations
 ├── grpc/                      # CP/DP gRPC communication
@@ -166,8 +166,9 @@ Plugins execute in priority order (lower number = runs first). The lifecycle pha
 5. `after_proxy` — Response transformer, CORS headers
 6. `on_response_body` — AI token metrics, AI rate limiter (token counting)
 7. `log` — Stdout logging, HTTP logging, Prometheus, OpenTelemetry
+8. `on_ws_frame` — WebSocket frame-level hooks: ws_message_size_limiting (2810), ws_rate_limiting (2910), ws_frame_logging (9050)
 
-Plugin priority constants are defined in `src/plugins/mod.rs` (e.g., `priority::CORS = 100`, `priority::RATE_LIMITING = 2900`, `priority::AI_TOKEN_METRICS = 4100`).
+Plugin priority constants are defined in `src/plugins/mod.rs` (e.g., `priority::CORS = 100`, `priority::RATE_LIMITING = 2900`, `priority::WS_MESSAGE_SIZE_LIMITING = 2810`).
 
 ### Test Structure
 
