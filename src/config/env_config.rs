@@ -287,6 +287,10 @@ pub struct EnvConfig {
     pub tls_prefer_server_cipher_order: bool,
     /// Comma-separated ECDH curves/groups: X25519, secp256r1, secp384r1 (default: "X25519,secp256r1")
     pub tls_curves: Option<String>,
+    /// TLS session resumption cache size for TLS 1.2 stateful session IDs.
+    /// TLS 1.3 uses stateless tickets (unlimited) so this only affects TLS 1.2 clients.
+    /// (default: 4096)
+    pub tls_session_cache_size: usize,
 
     // Stream proxy (TCP/UDP)
     /// Bind address for TCP/UDP stream proxy listeners (default: 0.0.0.0).
@@ -446,6 +450,7 @@ impl Default for EnvConfig {
             tls_cipher_suites: None,
             tls_prefer_server_cipher_order: true,
             tls_curves: None,
+            tls_session_cache_size: 4096,
             trusted_proxies: String::new(),
             real_ip_header: None,
             plugin_http_slow_threshold_ms: 1000,
@@ -686,6 +691,7 @@ impl EnvConfig {
             .map(|v| v == "true")
             .unwrap_or(true),
             tls_curves: resolve_var(conf, "FERRUM_TLS_CURVES"),
+            tls_session_cache_size: resolve_usize(conf, "FERRUM_TLS_SESSION_CACHE_SIZE", 4096),
 
             // Client IP resolution
             trusted_proxies: resolve_var_or(conf, "FERRUM_TRUSTED_PROXIES", ""),

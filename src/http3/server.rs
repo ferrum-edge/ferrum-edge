@@ -104,6 +104,24 @@ pub async fn start_http3_listener(
     // for non-idempotent operations proxied through an API gateway.
     server_tls_config.max_early_data_size = 0;
 
+    // Enable TLS 1.3 session resumption for QUIC connections.
+    // Stateless tickets allow clients to resume sessions without a full handshake,
+    // saving 1 RTT on reconnections. This is safe (no replay risk — 0-RTT is still
+    // disabled separately via max_early_data_size=0).
+    match rustls::crypto::ring::Ticketer::new() {
+        Ok(ticketer) => {
+            server_tls_config.ticketer = ticketer;
+        }
+        Err(e) => {
+            warn!(
+                "Failed to create QUIC session ticket rotator, resumption will use stateful cache only: {}",
+                e
+            );
+        }
+    }
+    server_tls_config.session_storage =
+        rustls::server::ServerSessionMemoryCache::new(tls_policy.session_cache_size);
+
     let quic_server_config = QuicServerConfig::try_from(server_tls_config)
         .map_err(|e| anyhow::anyhow!("Failed to create QUIC server config: {}", e))?;
 
@@ -196,18 +214,30 @@ async fn handle_h3_connection(
 
     let mut h3_conn = h3::server::Connection::new(h3_quinn::Connection::new(connection)).await?;
 
+    // Pre-format socket IP string once per connection — shared across all streams
+    // to avoid per-request String allocation from SocketAddr::ip().to_string().
+    let socket_ip: Arc<str> = Arc::from(remote_addr.ip().to_string());
+
     loop {
         match h3_conn.accept().await {
             Ok(Some(resolver)) => {
                 let state = state.clone();
                 let cert = client_cert_der.clone();
                 let chain = client_cert_chain_der.clone();
+                let socket_ip = Arc::clone(&socket_ip);
                 tokio::spawn(async move {
                     match resolver.resolve_request().await {
                         Ok((req, stream)) => {
-                            if let Err(e) =
-                                handle_h3_request(req, stream, state, remote_addr, cert, chain)
-                                    .await
+                            if let Err(e) = handle_h3_request(
+                                req,
+                                stream,
+                                state,
+                                remote_addr,
+                                &socket_ip,
+                                cert,
+                                chain,
+                            )
+                            .await
                             {
                                 error!("HTTP/3 request error: {}", e);
                             }
@@ -238,6 +268,7 @@ async fn handle_h3_request(
     mut stream: RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
     state: ProxyState,
     remote_addr: SocketAddr,
+    socket_ip: &str,
     tls_client_cert_der: Option<Arc<Vec<u8>>>,
     tls_client_cert_chain_der: Option<Arc<Vec<Vec<u8>>>>,
 ) -> Result<(), anyhow::Error> {
@@ -247,14 +278,13 @@ async fn handle_h3_request(
     let path = req.uri().path().to_string();
     let query_string = req.uri().query().unwrap_or("").to_string();
 
-    let socket_ip = remote_addr.ip().to_string();
-
     // Build request context (client_ip resolved below after headers are parsed)
-    let mut ctx = RequestContext::new(socket_ip.clone(), method.clone(), path.clone());
+    let mut ctx = RequestContext::new(socket_ip.to_owned(), method.clone(), path.clone());
     ctx.tls_client_cert_der = tls_client_cert_der;
     ctx.tls_client_cert_chain_der = tls_client_cert_chain_der;
 
     // Validate and extract headers with size limits
+    ctx.headers.reserve(req.headers().keys_len());
     let mut total_header_size: usize = 0;
     for (name, value) in req.headers() {
         let header_size = name.as_str().len() + value.len();
@@ -274,8 +304,9 @@ async fn handle_h3_request(
         }
         total_header_size += header_size;
         if let Ok(v) = value.to_str() {
-            ctx.headers
-                .insert(name.as_str().to_lowercase(), v.to_string());
+            // http::HeaderName stores names in lowercase already (per HTTP/2+3 spec),
+            // so .as_str() returns lowercase — no need for .to_lowercase().
+            ctx.headers.insert(name.as_str().to_owned(), v.to_string());
         }
     }
     if total_header_size > state.max_header_size_bytes {
@@ -289,32 +320,31 @@ async fn handle_h3_request(
         return Ok(());
     }
 
-    // Resolve real client IP using trusted proxy configuration
+    // Resolve real client IP using trusted proxy configuration.
+    // Parse socket IP once upfront to avoid redundant parsing in each branch.
     if !state.trusted_proxies.is_empty() {
+        let socket_addr: std::net::IpAddr = remote_addr.ip();
+        let xff = ctx.headers.get("x-forwarded-for").map(|s| s.as_str());
         let resolved = if let Some(ref real_ip_header) = state.env_config.real_ip_header {
-            let header_val = ctx.headers.get(&real_ip_header.to_lowercase());
-            if let Some(val) = header_val {
-                let socket_addr: Option<std::net::IpAddr> = socket_ip.parse().ok();
-                if socket_addr.is_some_and(|ip| state.trusted_proxies.contains(&ip)) {
-                    val.trim().to_string()
-                } else {
-                    crate::proxy::client_ip::resolve_client_ip(
-                        &socket_ip,
-                        ctx.headers.get("x-forwarded-for").map(|s| s.as_str()),
-                        &state.trusted_proxies,
-                    )
-                }
+            // real_ip_header is already lowercase from env config parsing
+            let header_val = ctx.headers.get(real_ip_header.as_str());
+            if let Some(val) = header_val
+                && state.trusted_proxies.contains(&socket_addr)
+            {
+                val.trim().to_string()
             } else {
-                crate::proxy::client_ip::resolve_client_ip(
-                    &socket_ip,
-                    ctx.headers.get("x-forwarded-for").map(|s| s.as_str()),
+                crate::proxy::client_ip::resolve_client_ip_parsed(
+                    socket_ip,
+                    &socket_addr,
+                    xff,
                     &state.trusted_proxies,
                 )
             }
         } else {
-            crate::proxy::client_ip::resolve_client_ip(
-                &socket_ip,
-                ctx.headers.get("x-forwarded-for").map(|s| s.as_str()),
+            crate::proxy::client_ip::resolve_client_ip_parsed(
+                socket_ip,
+                &socket_addr,
+                xff,
                 &state.trusted_proxies,
             )
         };
@@ -322,9 +352,11 @@ async fn handle_h3_request(
     }
 
     // Parse query params
-    for pair in query_string.split('&') {
-        if let Some((k, v)) = pair.split_once('=') {
-            ctx.query_params.insert(k.to_string(), v.to_string());
+    if !query_string.is_empty() {
+        for pair in query_string.split('&') {
+            if let Some((k, v)) = pair.split_once('=') {
+                ctx.query_params.insert(k.to_string(), v.to_string());
+            }
         }
     }
 
@@ -517,12 +549,16 @@ async fn handle_h3_request(
         plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
     }
 
-    // before_proxy hooks
-    let mut proxy_headers = ctx.headers.clone();
-    {
+    // before_proxy hooks — only clone headers if at least one plugin modifies them.
+    // When no plugin modifies headers, use std::mem::take to avoid a per-request HashMap clone.
+    let needs_header_clone =
+        !plugins.is_empty() && plugins.iter().any(|p| p.modifies_request_headers());
+    let mut owned_proxy_headers: Option<HashMap<String, String>> = None;
+    if needs_header_clone {
         let phase_start = std::time::Instant::now();
+        let mut cloned = ctx.headers.clone();
         for plugin in plugins.iter() {
-            match plugin.before_proxy(&mut ctx, &mut proxy_headers).await {
+            match plugin.before_proxy(&mut ctx, &mut cloned).await {
                 PluginResult::Reject {
                     status_code,
                     body,
@@ -543,11 +579,62 @@ async fn handle_h3_request(
             }
         }
         plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
+        owned_proxy_headers = Some(cloned);
+    } else if !plugins.is_empty() {
+        // No plugin modifies headers — swap headers out of ctx temporarily to
+        // satisfy the borrow checker without cloning (zero allocation hot path).
+        let phase_start = std::time::Instant::now();
+        let mut tmp_headers = std::mem::take(&mut ctx.headers);
+        for plugin in plugins.iter() {
+            match plugin.before_proxy(&mut ctx, &mut tmp_headers).await {
+                PluginResult::Reject {
+                    status_code,
+                    body,
+                    headers,
+                } => {
+                    ctx.headers = tmp_headers;
+                    record_request(&state, status_code);
+                    send_h3_reject_response(
+                        &mut stream,
+                        StatusCode::from_u16(status_code)
+                            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                        &body,
+                        &headers,
+                    )
+                    .await?;
+                    return Ok(());
+                }
+                PluginResult::Continue => {}
+            }
+        }
+        plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
+        ctx.headers = tmp_headers;
     }
+    // Inject X-Consumer-Username header when a consumer has been authenticated
+    if let Some(ref consumer) = ctx.identified_consumer {
+        let headers = owned_proxy_headers.get_or_insert_with(|| ctx.headers.clone());
+        headers.insert("X-Consumer-Username".to_string(), consumer.username.clone());
+        if let Some(ref custom_id) = consumer.custom_id {
+            headers.insert("X-Consumer-Custom-Id".to_string(), custom_id.clone());
+        }
+    } else if ctx.authenticated_identity.is_some() || ctx.authenticated_identity_header.is_some() {
+        let headers = owned_proxy_headers.get_or_insert_with(|| ctx.headers.clone());
+        let header_val = ctx
+            .authenticated_identity_header
+            .as_deref()
+            .or(ctx.authenticated_identity.as_deref());
+        if let Some(val) = header_val {
+            headers.insert("X-Consumer-Username".to_string(), val.to_string());
+        }
+    }
+    // Resolve proxy_headers into an owned HashMap to avoid borrowing ctx.headers
+    // while ctx is passed as &mut to proxy functions downstream.
+    let proxy_headers: HashMap<String, String> =
+        owned_proxy_headers.unwrap_or_else(|| std::mem::take(&mut ctx.headers));
 
     // Enforce request body size limit via Content-Length fast path
     if state.max_request_body_size_bytes > 0
-        && let Some(content_length) = ctx.headers.get("content-length")
+        && let Some(content_length) = proxy_headers.get("content-length")
         && let Ok(len) = content_length.parse::<usize>()
         && len > state.max_request_body_size_bytes
     {
@@ -606,7 +693,7 @@ async fn handle_h3_request(
         && !body_data.is_empty()
         && plugins.iter().any(|p| p.modifies_request_body())
     {
-        let content_type = ctx.headers.get("content-type").map(|s| s.as_str());
+        let content_type = proxy_headers.get("content-type").map(|s| s.as_str());
         let mut current = body_data;
         for plugin in plugins.iter() {
             if plugin.modifies_request_body()
@@ -695,7 +782,7 @@ async fn handle_h3_request(
             latency_plugin_execution_ms: plugin_execution_ms,
             latency_plugin_external_io_ms: plugin_external_io_ms,
             latency_gateway_overhead_ms: gateway_overhead_ms,
-            request_user_agent: ctx.headers.get("user-agent").cloned(),
+            request_user_agent: proxy_headers.get("user-agent").cloned(),
             response_streamed: true,
             client_disconnected: false,
             error_class: h3_error_class,
@@ -830,7 +917,7 @@ async fn handle_h3_request(
             latency_plugin_execution_ms: plugin_execution_ms,
             latency_plugin_external_io_ms: plugin_external_io_ms,
             latency_gateway_overhead_ms: gateway_overhead_ms,
-            request_user_agent: ctx.headers.get("user-agent").cloned(),
+            request_user_agent: proxy_headers.get("user-agent").cloned(),
             response_streamed: false,
             client_disconnected: false,
             error_class: h3_error_class,
@@ -1006,7 +1093,7 @@ async fn proxy_to_backend_h3_streaming(
     };
 
     let response_status = response.status().as_u16();
-    let mut response_headers = HashMap::new();
+    let mut response_headers = HashMap::with_capacity(response.headers().keys_len());
     for (k, v) in response.headers() {
         if let Ok(vs) = v.to_str() {
             response_headers.insert(k.as_str().to_string(), vs.to_string());
@@ -1263,7 +1350,8 @@ async fn proxy_to_backend_h3(
     match req_builder.send().await {
         Ok(response) => {
             let status = response.status().as_u16();
-            let mut resp_headers = std::collections::HashMap::new();
+            let mut resp_headers =
+                std::collections::HashMap::with_capacity(response.headers().keys_len());
             for (k, v) in response.headers() {
                 if let Ok(vs) = v.to_str() {
                     resp_headers.insert(k.as_str().to_string(), vs.to_string());

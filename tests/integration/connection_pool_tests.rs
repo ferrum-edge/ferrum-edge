@@ -136,6 +136,7 @@ fn create_test_env_config() -> ferrum_edge::config::EnvConfig {
         tls_cipher_suites: None,
         tls_prefer_server_cipher_order: true,
         tls_curves: None,
+        tls_session_cache_size: 4096,
         dns_cache_max_size: 10_000,
         dns_slow_threshold_ms: None,
         stream_proxy_bind_address: "0.0.0.0".into(),

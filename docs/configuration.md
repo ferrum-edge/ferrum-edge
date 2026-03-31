@@ -123,6 +123,7 @@ See [dns_resolver.md](dns_resolver.md) for full configuration reference.
 | `FERRUM_TLS_CIPHER_SUITES` | No | *(secure defaults)* | Comma-separated cipher suites (see [TLS Policy Hardening](frontend_tls.md#tls-policy-hardening)) |
 | `FERRUM_TLS_CURVES` | No | `X25519,secp256r1` | Comma-separated key exchange groups |
 | `FERRUM_TLS_PREFER_SERVER_CIPHER_ORDER` | No | `true` | Prefer server cipher order during TLS 1.2 negotiation |
+| `FERRUM_TLS_SESSION_CACHE_SIZE` | No | `4096` | TLS session resumption cache size (stateful session IDs for TLS 1.2 clients) |
 
 See [frontend_tls.md](frontend_tls.md) and [backend_mtls.md](backend_mtls.md) for detailed TLS configuration guides.
 

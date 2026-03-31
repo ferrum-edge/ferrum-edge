@@ -449,6 +449,7 @@ The gateway supports fine-grained control over TLS protocol versions, cipher sui
 | `FERRUM_TLS_CIPHER_SUITES` | *(see defaults below)* | Comma-separated list of cipher suites (OpenSSL naming) |
 | `FERRUM_TLS_CURVES` | *(see defaults below)* | Comma-separated list of key exchange groups |
 | `FERRUM_TLS_PREFER_SERVER_CIPHER_ORDER` | `true` | When `true`, server cipher preference is used during TLS 1.2 negotiation |
+| `FERRUM_TLS_SESSION_CACHE_SIZE` | `4096` | Stateful session ID cache size for TLS 1.2 resumption. TLS 1.3 uses stateless tickets (unlimited). |
 
 ### Protocol Version Examples
 
@@ -559,7 +560,7 @@ When using load balancers:
 ## Performance Considerations
 
 - **TLS Handshake Overhead**: Initial connections have higher latency
-- **Session Resumption**: Configure for better performance
+- **Session Resumption**: Enabled by default. TLS 1.3 uses stateless session tickets (auto-rotating keys, unlimited capacity). TLS 1.2 falls back to a stateful session ID cache sized by `FERRUM_TLS_SESSION_CACHE_SIZE` (default 4096). Resumption saves 1 RTT on reconnections. 0-RTT early data is disabled for security (replay risk).
 - **Hardware Acceleration**: Consider for high-throughput scenarios
 - **Certificate Size**: Smaller certificates improve performance
 

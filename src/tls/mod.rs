@@ -14,6 +14,7 @@ pub struct TlsPolicy {
     pub protocol_versions: Vec<&'static rustls::SupportedProtocolVersion>,
     pub crypto_provider: Arc<CryptoProvider>,
     pub prefer_server_cipher_order: bool,
+    pub session_cache_size: usize,
 }
 
 impl TlsPolicy {
@@ -95,6 +96,7 @@ impl TlsPolicy {
             protocol_versions: versions,
             crypto_provider: Arc::new(provider),
             prefer_server_cipher_order: env_config.tls_prefer_server_cipher_order,
+            session_cache_size: env_config.tls_session_cache_size,
         })
     }
 }
@@ -286,6 +288,24 @@ pub fn load_tls_config_with_client_auth(
 
     // Advertise HTTP/2 and HTTP/1.1 via ALPN so clients can negotiate HTTP/2 over TLS
     config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+
+    // Enable TLS session resumption for reduced handshake latency on reconnections.
+    // Stateless tickets (TLS 1.3): server encrypts session state into the ticket,
+    // no server-side storage needed. Tickets rotate keys every 6 hours automatically.
+    // Stateful cache (TLS 1.2 fallback): configurable LRU for session ID resumption.
+    match rustls::crypto::ring::Ticketer::new() {
+        Ok(ticketer) => {
+            config.ticketer = ticketer;
+        }
+        Err(e) => {
+            warn!(
+                "Failed to create TLS session ticket rotator, resumption will use stateful cache only: {}",
+                e
+            );
+        }
+    }
+    config.session_storage =
+        rustls::server::ServerSessionMemoryCache::new(tls_policy.session_cache_size);
 
     Ok(Arc::new(config))
 }

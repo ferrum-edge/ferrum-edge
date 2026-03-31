@@ -167,6 +167,7 @@ impl CidrEntry {
 ///
 /// The `socket_addr` variant accepts a pre-parsed `IpAddr` to avoid redundant
 /// parsing on the hot path when the caller already has a parsed IP.
+#[allow(dead_code)] // Used by external test crates via public API
 pub fn resolve_client_ip(
     socket_ip: &str,
     xff_header: Option<&str>,
