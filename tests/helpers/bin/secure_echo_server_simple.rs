@@ -44,7 +44,7 @@ async fn handle_websocket_connection(
             Ok(Message::Text(text)) => {
                 let echo_text = format!("Secure Echo: {}", text);
                 info!("📤 Echoing secure text: {}", echo_text);
-                if let Err(e) = ws_stream.send(Message::Text(echo_text)).await {
+                if let Err(e) = ws_stream.send(Message::Text(echo_text.into())).await {
                     error!("❌ Failed to send echo: {}", e);
                     break;
                 }
@@ -52,7 +52,7 @@ async fn handle_websocket_connection(
             Ok(Message::Binary(data)) => {
                 let echo_text = format!("Secure Echo Binary: {} bytes", data.len());
                 info!("📤 Echoing secure binary: {}", echo_text);
-                if let Err(e) = ws_stream.send(Message::Text(echo_text)).await {
+                if let Err(e) = ws_stream.send(Message::Text(echo_text.into())).await {
                     error!("❌ Failed to send binary echo: {}", e);
                     break;
                 }

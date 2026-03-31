@@ -889,7 +889,7 @@ async fn test_on_ws_frame_default_returns_none() {
         .unwrap()
         .unwrap();
 
-    let msg = Message::Text("hello".to_string());
+    let msg = Message::Text("hello".to_string().into());
     let result = plugin
         .on_ws_frame("proxy-1", 1, WebSocketFrameDirection::ClientToBackend, &msg)
         .await;

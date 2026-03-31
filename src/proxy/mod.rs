@@ -1543,11 +1543,9 @@ async fn connect_websocket_backend(
     WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
     Box<dyn std::error::Error + Send + Sync>,
 > {
-    let ws_config = WebSocketConfig {
-        max_frame_size: Some(16 << 20),
-        max_message_size: Some(64 << 20),
-        ..Default::default()
-    };
+    let mut ws_config = WebSocketConfig::default();
+    ws_config.max_frame_size = Some(16 << 20);
+    ws_config.max_message_size = Some(64 << 20);
 
     let mut ws_request = backend_url.into_client_request()?;
     for (name, value) in client_headers {
@@ -1602,11 +1600,9 @@ async fn run_websocket_proxy(
     connection_id: u64,
     ws_frame_plugins: Vec<Arc<dyn Plugin>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let ws_config = WebSocketConfig {
-        max_frame_size: Some(16 << 20),
-        max_message_size: Some(64 << 20),
-        ..Default::default()
-    };
+    let mut ws_config = WebSocketConfig::default();
+    ws_config.max_frame_size = Some(16 << 20);
+    ws_config.max_message_size = Some(64 << 20);
 
     let ws_stream = WebSocketStream::from_raw_socket(
         TokioIo::new(upgraded),

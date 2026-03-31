@@ -104,7 +104,7 @@ async fn test_frames_exceeding_limit_return_close_1008() {
                 cf.code,
                 tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Policy
             );
-            assert_eq!(cf.reason.as_ref(), "Frame rate exceeded");
+            assert_eq!(cf.reason.as_str(), "Frame rate exceeded");
         }
         other => panic!("Expected Close frame, got {:?}", other),
     }
@@ -324,7 +324,7 @@ async fn test_custom_close_reason() {
         .await;
     match result.unwrap() {
         Message::Close(Some(cf)) => {
-            assert_eq!(cf.reason.as_ref(), "Too many messages");
+            assert_eq!(cf.reason.as_str(), "Too many messages");
         }
         other => panic!("Expected Close frame, got {:?}", other),
     }
@@ -399,7 +399,7 @@ async fn test_binary_frames_rate_limited() {
             "test-proxy",
             1,
             WebSocketFrameDirection::ClientToBackend,
-            &Message::Binary(vec![1, 2, 3]),
+            &Message::Binary(vec![1, 2, 3].into()),
         )
         .await;
 

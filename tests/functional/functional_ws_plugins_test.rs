@@ -47,13 +47,13 @@ async fn start_ws_echo_server(port: u16) {
                     match msg {
                         Message::Text(text) => {
                             let echo = format!("Echo: {}", text);
-                            if sink.send(Message::Text(echo)).await.is_err() {
+                            if sink.send(Message::Text(echo.into())).await.is_err() {
                                 break;
                             }
                         }
                         Message::Binary(data) => {
                             let echo = format!("Echo binary: {} bytes", data.len());
-                            if sink.send(Message::Text(echo)).await.is_err() {
+                            if sink.send(Message::Text(echo.into())).await.is_err() {
                                 break;
                             }
                         }
@@ -170,7 +170,7 @@ async fn test_ws_message_size_limiting_e2e() {
 
     // Large message (> 50 bytes) should trigger close
     let large_msg = "x".repeat(60);
-    ws.send(Message::Text(large_msg)).await.unwrap();
+    ws.send(Message::Text(large_msg.into())).await.unwrap();
 
     // Should receive a close frame with code 1009
     let reply = ws.next().await;
@@ -249,13 +249,13 @@ async fn test_ws_frame_logging_e2e() {
     // Send multiple messages — all should echo correctly (logging is transparent)
     for i in 0..5 {
         let msg = format!("logged message {}", i);
-        ws.send(Message::Text(msg.clone())).await.unwrap();
+        ws.send(Message::Text(msg.clone().into())).await.unwrap();
         let reply = ws.next().await.unwrap().unwrap();
-        assert_eq!(reply, Message::Text(format!("Echo: {}", msg)));
+        assert_eq!(reply, Message::Text(format!("Echo: {}", msg).into()));
     }
 
     // Binary message should also pass
-    ws.send(Message::Binary(vec![0xDE, 0xAD, 0xBE, 0xEF]))
+    ws.send(Message::Binary(vec![0xDE, 0xAD, 0xBE, 0xEF].into()))
         .await
         .unwrap();
     let reply = ws.next().await.unwrap().unwrap();
@@ -314,11 +314,11 @@ async fn test_ws_rate_limiting_e2e() {
     // Send messages within the limit (burst_size=20 allows ~10 round-trips)
     for i in 0..5 {
         let msg = format!("msg {}", i);
-        ws.send(Message::Text(msg.clone())).await.unwrap();
+        ws.send(Message::Text(msg.clone().into())).await.unwrap();
         let reply = ws.next().await.unwrap().unwrap();
         assert_eq!(
             reply,
-            Message::Text(format!("Echo: {}", msg)),
+            Message::Text(format!("Echo: {}", msg).into()),
             "Message {} within limit should echo",
             i
         );
@@ -330,7 +330,7 @@ async fn test_ws_rate_limiting_e2e() {
     let mut connection_closed = false;
     for i in 5..50 {
         let msg = format!("burst msg {}", i);
-        match ws.send(Message::Text(msg)).await {
+        match ws.send(Message::Text(msg.into())).await {
             Ok(_) => {
                 // Try to read the reply
                 match tokio::time::timeout(Duration::from_millis(500), ws.next()).await {
@@ -436,9 +436,9 @@ async fn test_ws_combined_plugins_e2e() {
     // Normal messages should work with all three plugins active
     for i in 0..10 {
         let msg = format!("combined test {}", i);
-        ws.send(Message::Text(msg.clone())).await.unwrap();
+        ws.send(Message::Text(msg.clone().into())).await.unwrap();
         let reply = ws.next().await.unwrap().unwrap();
-        assert_eq!(reply, Message::Text(format!("Echo: {}", msg)));
+        assert_eq!(reply, Message::Text(format!("Echo: {}", msg).into()));
     }
 
     // Clean close

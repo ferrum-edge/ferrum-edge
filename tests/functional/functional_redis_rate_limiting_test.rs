@@ -384,13 +384,13 @@ async fn start_ws_echo_server(port: u16) {
                     match msg {
                         Message::Text(text) => {
                             let echo = format!("Echo: {}", text);
-                            if sink.send(Message::Text(echo)).await.is_err() {
+                            if sink.send(Message::Text(echo.into())).await.is_err() {
                                 break;
                             }
                         }
                         Message::Binary(data) => {
                             let echo = format!("Echo binary: {} bytes", data.len());
-                            if sink.send(Message::Text(echo)).await.is_err() {
+                            if sink.send(Message::Text(echo.into())).await.is_err() {
                                 break;
                             }
                         }
@@ -812,11 +812,11 @@ plugin_configs:
     // Send messages within limit — should pass
     for i in 0..5 {
         let msg = format!("msg {}", i);
-        ws.send(Message::Text(msg.clone())).await.unwrap();
+        ws.send(Message::Text(msg.clone().into())).await.unwrap();
         let reply = ws.next().await.unwrap().unwrap();
         assert_eq!(
             reply,
-            Message::Text(format!("Echo: {}", msg)),
+            Message::Text(format!("Echo: {}", msg).into()),
             "Message {} within limit should echo via Redis mode",
             i
         );
@@ -826,7 +826,7 @@ plugin_configs:
     let mut connection_closed = false;
     for i in 5..100 {
         let msg = format!("burst msg {}", i);
-        match ws.send(Message::Text(msg)).await {
+        match ws.send(Message::Text(msg.into())).await {
             Ok(_) => {
                 match tokio::time::timeout(Duration::from_millis(500), ws.next()).await {
                     Ok(Some(Ok(Message::Close(_)))) => {
