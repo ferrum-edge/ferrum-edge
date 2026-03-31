@@ -264,7 +264,7 @@ impl RedisRateLimitClient {
             connect_mutex: tokio::sync::Mutex::new(()),
             config,
             dns_cache,
-            available: Arc::new(AtomicBool::new(false)),
+            available: Arc::new(AtomicBool::new(true)),
             health_checker_started: AtomicBool::new(false),
             tls_no_verify,
             tls_ca_bundle_pem,

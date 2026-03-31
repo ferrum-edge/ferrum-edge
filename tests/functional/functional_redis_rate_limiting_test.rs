@@ -97,38 +97,24 @@ impl RedisRateLimitHarness {
         let proxy_port = proxy_listener.local_addr()?.port();
         drop(proxy_listener);
 
-        let db_path = temp_dir
-            .path()
-            .join("test_redis_rl.db")
-            .to_str()
-            .unwrap()
-            .to_string();
+        let db_url = format!(
+            "sqlite:{}?mode=rwc",
+            temp_dir.path().join("test_redis_rl.db").to_string_lossy()
+        );
 
-        // Run migrations
+        // Start gateway (SQLite with ?mode=rwc auto-creates the database)
         let binary_path = gateway_binary_path();
-        let migrate_status = Command::new(binary_path)
-            .env("FERRUM_MODE", "migrate")
-            .env("FERRUM_DB_TYPE", "sqlite")
-            .env("FERRUM_DB_URL", format!("sqlite:{}", db_path))
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()?;
-
-        if !migrate_status.success() {
-            return Err("Migration failed".into());
-        }
-
-        // Start gateway
         let gateway_process = Command::new(binary_path)
             .env("FERRUM_MODE", "database")
             .env("FERRUM_ADMIN_JWT_SECRET", &jwt_secret)
             .env("FERRUM_ADMIN_JWT_ISSUER", &jwt_issuer)
             .env("FERRUM_DB_TYPE", "sqlite")
-            .env("FERRUM_DB_URL", format!("sqlite:{}", db_path))
-            .env("FERRUM_DB_POLL_INTERVAL_SECONDS", "2")
+            .env("FERRUM_DB_URL", &db_url)
+            .env("FERRUM_DB_POLL_INTERVAL", "2")
             .env("FERRUM_PROXY_HTTP_PORT", proxy_port.to_string())
             .env("FERRUM_ADMIN_HTTP_PORT", admin_port.to_string())
             .env("FERRUM_LOG_LEVEL", "debug")
+            .env("FERRUM_TRUSTED_PROXIES", "127.0.0.1")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -166,18 +152,18 @@ impl RedisRateLimitHarness {
     }
 
     fn generate_admin_token(&self) -> String {
+        let now = Utc::now();
         let claims = json!({
-            "sub": "admin",
             "iss": self.jwt_issuer,
-            "iat": Utc::now().timestamp(),
-            "exp": Utc::now().timestamp() + 3600,
+            "sub": "test-admin",
+            "iat": now.timestamp(),
+            "nbf": now.timestamp(),
+            "exp": (now + chrono::Duration::seconds(3600)).timestamp(),
+            "jti": Uuid::new_v4().to_string()
         });
-        encode(
-            &Header::default(),
-            &claims,
-            &EncodingKey::from_secret(self.jwt_secret.as_bytes()),
-        )
-        .unwrap()
+        let header = Header::new(jsonwebtoken::Algorithm::HS256);
+        let key = EncodingKey::from_secret(self.jwt_secret.as_bytes());
+        encode(&header, &claims, &key).expect("Failed to encode admin JWT")
     }
 
     fn auth_header(&self) -> String {
@@ -970,10 +956,37 @@ plugin_configs:
     let mut gw1 = start_instance(1, port1, unique_prefix.clone());
     let mut gw2 = start_instance(2, port2, unique_prefix.clone());
 
-    // Wait for both gateways to start
-    sleep(Duration::from_secs(4)).await;
+    // Wait for both gateways to start and load config
+    sleep(Duration::from_secs(5)).await;
 
     let client = reqwest::Client::new();
+
+    // Verify both gateways are serving the route by hitting a non-existent path
+    // (which returns 404 but proves the gateway is up and listening)
+    for port in [port1, port2] {
+        let deadline = SystemTime::now() + Duration::from_secs(10);
+        loop {
+            if SystemTime::now() >= deadline {
+                panic!("Gateway on port {} did not start", port);
+            }
+            match client
+                .get(format!(
+                    "http://127.0.0.1:{}/health-probe-nonexistent",
+                    port
+                ))
+                .send()
+                .await
+            {
+                // Any response (including 404) means the gateway is up
+                Ok(_) => break,
+                _ => sleep(Duration::from_millis(500)).await,
+            }
+        }
+    }
+
+    // Flush Redis to start with clean counters (no warmup interference)
+    flush_redis_db().await;
+    sleep(Duration::from_millis(200)).await;
 
     // Send 2 requests to gateway 1 — should succeed
     for i in 1..=2 {
