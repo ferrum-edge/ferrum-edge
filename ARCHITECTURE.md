@@ -148,8 +148,7 @@ tests/
 │   └── secrets/                        # Secret provider tests
 │
 ├── integration_tests.rs                # Entry point: integration test crate
-├── admin_cached_config_tests.rs        # Admin API cached config tests
-├── integration/                        # Integration tests
+├── integration/                        # Integration tests (mTLS, connection pool, gRPC, HTTP/3, admin API)
 │
 ├── functional_tests.rs                 # Entry point: functional test crate
 ├── functional/                         # End-to-end functional tests
@@ -714,7 +713,7 @@ pub struct MyConfig {
 cargo test --test unit_tests --all-features
 
 # Integration tests
-cargo test --test integration_tests --test admin_cached_config_tests --all-features
+cargo test --test integration_tests --all-features
 
 # Functional / E2E tests (requires binary build)
 cargo build --bin ferrum-edge

@@ -11,13 +11,15 @@ use ferrum_edge::admin::{
     start_admin_listener,
 };
 use ferrum_edge::config::types::{
-    AuthMode, BackendProtocol, Consumer, GatewayConfig, PluginConfig, PluginScope, Proxy,
+    AuthMode, BackendProtocol, Consumer, GatewayConfig, PluginConfig, PluginScope, Proxy, Upstream,
+    UpstreamTarget,
 };
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Test configuration
 #[derive(Clone)]
@@ -141,6 +143,37 @@ fn create_test_gateway_config() -> GatewayConfig {
         upstreams: vec![],
         loaded_at: Utc::now(),
     }
+}
+
+fn create_test_upstream(id: &str, name: &str) -> Upstream {
+    Upstream {
+        id: id.to_string(),
+        name: Some(name.to_string()),
+        targets: vec![UpstreamTarget {
+            host: "10.0.0.1".to_string(),
+            port: 8080,
+            weight: 100,
+            tags: HashMap::new(),
+            path: None,
+        }],
+        algorithm: Default::default(),
+        hash_on: None,
+        hash_on_cookie_config: None,
+        health_checks: None,
+        service_discovery: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    }
+}
+
+/// Create a GatewayConfig that includes upstreams for testing upstream cache fallback.
+fn create_test_gateway_config_with_upstreams() -> GatewayConfig {
+    let mut config = create_test_gateway_config();
+    config.upstreams = vec![
+        create_test_upstream("upstream-1", "backend-pool-1"),
+        create_test_upstream("upstream-2", "backend-pool-2"),
+    ];
+    config
 }
 
 /// Start an admin server with the given state on a random port, returns the base URL.
@@ -837,6 +870,59 @@ async fn admin_post(base_url: &str, path: &str, token: &str, body: &Value) -> (u
     (status, body)
 }
 
+async fn admin_put(base_url: &str, path: &str, token: &str, body: &Value) -> (u16, Value) {
+    let client = reqwest::Client::new();
+    let resp = client
+        .put(format!("{}{}", base_url, path))
+        .header("Authorization", format!("Bearer {}", token))
+        .json(body)
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status().as_u16();
+    let body: Value = resp.json().await.unwrap_or(json!({}));
+    (status, body)
+}
+
+async fn admin_delete(base_url: &str, path: &str, token: &str) -> (u16, Value) {
+    let client = reqwest::Client::new();
+    let resp = client
+        .delete(format!("{}{}", base_url, path))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status().as_u16();
+    // DELETE 204 may have empty body
+    let body: Value = resp.json().await.unwrap_or(json!({}));
+    (status, body)
+}
+
+/// Create admin state with real SQLite DB and configurable db_available flag.
+async fn create_db_admin_state_with_availability(
+    tc: &TestConfig,
+    db_available: Option<Arc<AtomicBool>>,
+) -> (AdminState, tempfile::TempDir) {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("test_avail.db");
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
+    let db =
+        DatabaseStore::connect_with_tls_config("sqlite", &db_url, false, None, None, None, false)
+            .await
+            .expect("Failed to connect to test database");
+    let state = AdminState {
+        db: Some(Arc::new(db)),
+        jwt_manager: create_test_jwt_manager(tc),
+        cached_config: None,
+        proxy_state: None,
+        mode: "database".to_string(),
+        read_only: false,
+        db_available,
+        admin_restore_max_body_size_mib: 100,
+    };
+    (state, temp_dir)
+}
+
 #[tokio::test]
 async fn test_batch_create_consumers_and_proxies() {
     let tc = TestConfig::default();
@@ -1292,4 +1378,877 @@ async fn test_restore_hashes_consumer_secrets() {
         "Plaintext password should be removed after hashing, got: {:?}",
         creds
     );
+}
+
+// ============================================================================
+// Upstream Cached Config Fallback Tests
+// ============================================================================
+
+#[tokio::test]
+async fn test_list_upstreams_falls_back_to_cached_config() {
+    let tc = TestConfig::default();
+    let state = AdminState {
+        db: None,
+        jwt_manager: create_test_jwt_manager(&tc),
+        cached_config: Some(Arc::new(ArcSwap::new(Arc::new(
+            create_test_gateway_config_with_upstreams(),
+        )))),
+        proxy_state: None,
+        mode: "test".to_string(),
+        read_only: true,
+        db_available: None,
+        admin_restore_max_body_size_mib: 100,
+    };
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let (status, body, data_source) = admin_get(&base_url, "/upstreams", &token).await;
+
+    assert_eq!(status, 200);
+    let upstreams = body.as_array().expect("Should return array of upstreams");
+    assert_eq!(upstreams.len(), 2);
+    assert_eq!(upstreams[0]["id"], "upstream-1");
+    assert_eq!(upstreams[1]["id"], "upstream-2");
+    assert_eq!(
+        data_source.as_deref(),
+        Some("cached"),
+        "Should indicate data is from cache"
+    );
+}
+
+#[tokio::test]
+async fn test_get_upstream_by_id_falls_back_to_cached_config() {
+    let tc = TestConfig::default();
+    let state = AdminState {
+        db: None,
+        jwt_manager: create_test_jwt_manager(&tc),
+        cached_config: Some(Arc::new(ArcSwap::new(Arc::new(
+            create_test_gateway_config_with_upstreams(),
+        )))),
+        proxy_state: None,
+        mode: "test".to_string(),
+        read_only: true,
+        db_available: None,
+        admin_restore_max_body_size_mib: 100,
+    };
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let (status, body, data_source) = admin_get(&base_url, "/upstreams/upstream-2", &token).await;
+
+    assert_eq!(status, 200);
+    assert_eq!(body["id"], "upstream-2");
+    assert_eq!(body["name"], "backend-pool-2");
+    assert_eq!(data_source.as_deref(), Some("cached"));
+}
+
+#[tokio::test]
+async fn test_get_upstream_not_found_in_cache() {
+    let tc = TestConfig::default();
+    let state = AdminState {
+        db: None,
+        jwt_manager: create_test_jwt_manager(&tc),
+        cached_config: Some(Arc::new(ArcSwap::new(Arc::new(
+            create_test_gateway_config_with_upstreams(),
+        )))),
+        proxy_state: None,
+        mode: "test".to_string(),
+        read_only: true,
+        db_available: None,
+        admin_restore_max_body_size_mib: 100,
+    };
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let (status, body, _) = admin_get(&base_url, "/upstreams/nonexistent", &token).await;
+
+    assert_eq!(status, 404);
+    assert!(body["error"].as_str().unwrap().contains("not found"));
+}
+
+#[tokio::test]
+async fn test_list_upstreams_no_db_no_cache_returns_503() {
+    let tc = TestConfig::default();
+    let state = AdminState {
+        db: None,
+        jwt_manager: create_test_jwt_manager(&tc),
+        cached_config: None,
+        proxy_state: None,
+        mode: "test".to_string(),
+        read_only: true,
+        db_available: None,
+        admin_restore_max_body_size_mib: 100,
+    };
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let (status, body, _) = admin_get(&base_url, "/upstreams", &token).await;
+
+    assert_eq!(status, 503);
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("No database and no cached config")
+    );
+}
+
+#[tokio::test]
+async fn test_get_upstream_no_db_no_cache_returns_503() {
+    let tc = TestConfig::default();
+    let state = AdminState {
+        db: None,
+        jwt_manager: create_test_jwt_manager(&tc),
+        cached_config: None,
+        proxy_state: None,
+        mode: "test".to_string(),
+        read_only: true,
+        db_available: None,
+        admin_restore_max_body_size_mib: 100,
+    };
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let (status, body, _) = admin_get(&base_url, "/upstreams/any-id", &token).await;
+
+    assert_eq!(status, 503);
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("No database and no cached config")
+    );
+}
+
+// ============================================================================
+// Upstream CRUD with Real SQLite DB
+// ============================================================================
+
+#[tokio::test]
+async fn test_upstream_crud_create_and_read() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let upstream = json!({
+        "id": "crud-u1",
+        "name": "test-upstream",
+        "targets": [
+            {"host": "10.0.0.1", "port": 8080, "weight": 100},
+            {"host": "10.0.0.2", "port": 8080, "weight": 50}
+        ],
+        "algorithm": "round_robin"
+    });
+
+    let (status, body) = admin_post(&base_url, "/upstreams", &token, &upstream).await;
+    assert_eq!(status, 201, "Create upstream failed: {:?}", body);
+
+    // Read it back
+    let (status, body, _) = admin_get(&base_url, "/upstreams/crud-u1", &token).await;
+    assert_eq!(status, 200);
+    assert_eq!(body["id"], "crud-u1");
+    assert_eq!(body["name"], "test-upstream");
+    let targets = body["targets"].as_array().unwrap();
+    assert_eq!(targets.len(), 2);
+    assert_eq!(targets[0]["host"], "10.0.0.1");
+    assert_eq!(targets[1]["host"], "10.0.0.2");
+
+    // List should include it
+    let (status, body, _) = admin_get(&base_url, "/upstreams", &token).await;
+    assert_eq!(status, 200);
+    let upstreams = body.as_array().unwrap();
+    assert_eq!(upstreams.len(), 1);
+    assert_eq!(upstreams[0]["id"], "crud-u1");
+}
+
+#[tokio::test]
+async fn test_upstream_crud_update() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    // Create
+    let upstream = json!({
+        "id": "upd-u1",
+        "name": "original-upstream",
+        "targets": [{"host": "10.0.0.1", "port": 8080, "weight": 100}]
+    });
+    let (status, _) = admin_post(&base_url, "/upstreams", &token, &upstream).await;
+    assert_eq!(status, 201);
+
+    // Update with new targets and name
+    let updated = json!({
+        "id": "upd-u1",
+        "name": "updated-upstream",
+        "targets": [
+            {"host": "10.0.0.5", "port": 9090, "weight": 200},
+            {"host": "10.0.0.6", "port": 9090, "weight": 300}
+        ],
+        "algorithm": "least_connections"
+    });
+    let (status, body) = admin_put(&base_url, "/upstreams/upd-u1", &token, &updated).await;
+    assert_eq!(status, 200, "Update upstream failed: {:?}", body);
+
+    // Verify update
+    let (status, body, _) = admin_get(&base_url, "/upstreams/upd-u1", &token).await;
+    assert_eq!(status, 200);
+    assert_eq!(body["name"], "updated-upstream");
+    let targets = body["targets"].as_array().unwrap();
+    assert_eq!(targets.len(), 2);
+    assert_eq!(targets[0]["host"], "10.0.0.5");
+}
+
+#[tokio::test]
+async fn test_upstream_crud_delete() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    // Create
+    let upstream = json!({
+        "id": "del-u1",
+        "name": "delete-me",
+        "targets": [{"host": "10.0.0.1", "port": 8080, "weight": 100}]
+    });
+    let (status, _) = admin_post(&base_url, "/upstreams", &token, &upstream).await;
+    assert_eq!(status, 201);
+
+    // Delete
+    let (status, _) = admin_delete(&base_url, "/upstreams/del-u1", &token).await;
+    assert_eq!(status, 204);
+
+    // Verify gone
+    let (status, _, _) = admin_get(&base_url, "/upstreams/del-u1", &token).await;
+    assert_eq!(status, 404);
+}
+
+#[tokio::test]
+async fn test_upstream_delete_referenced_by_proxy_returns_409() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    // Create upstream
+    let upstream = json!({
+        "id": "ref-u1",
+        "name": "referenced-upstream",
+        "targets": [{"host": "10.0.0.1", "port": 8080, "weight": 100}]
+    });
+    let (status, _) = admin_post(&base_url, "/upstreams", &token, &upstream).await;
+    assert_eq!(status, 201);
+
+    // Create proxy referencing the upstream
+    let proxy = json!({
+        "id": "ref-p1",
+        "listen_path": "/ref-test",
+        "backend_protocol": "http",
+        "backend_host": "localhost",
+        "backend_port": 8080,
+        "strip_listen_path": true,
+        "upstream_id": "ref-u1"
+    });
+    let (status, body) = admin_post(&base_url, "/proxies", &token, &proxy).await;
+    assert_eq!(status, 201, "Create proxy failed: {:?}", body);
+
+    // Attempt to delete upstream — should be blocked with 409
+    let (status, body) = admin_delete(&base_url, "/upstreams/ref-u1", &token).await;
+    assert_eq!(
+        status, 409,
+        "Should return 409 CONFLICT when upstream is referenced by proxy: {:?}",
+        body
+    );
+    assert!(
+        body["error"].as_str().unwrap_or("").contains("referenced"),
+        "Error should mention upstream is referenced: {:?}",
+        body
+    );
+}
+
+// ============================================================================
+// DB Outage Write Blocking Tests (503 via db_available flag)
+// ============================================================================
+
+#[tokio::test]
+async fn test_create_proxy_returns_503_when_db_unavailable() {
+    let tc = TestConfig::default();
+    let db_flag = Arc::new(AtomicBool::new(false));
+    let (state, _dir) = create_db_admin_state_with_availability(&tc, Some(db_flag)).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let proxy = json!({
+        "listen_path": "/blocked",
+        "backend_protocol": "http",
+        "backend_host": "localhost",
+        "backend_port": 8080,
+    });
+    let (status, body) = admin_post(&base_url, "/proxies", &token, &proxy).await;
+    assert_eq!(
+        status, 503,
+        "Should return 503 when DB unavailable: {:?}",
+        body
+    );
+}
+
+#[tokio::test]
+async fn test_create_consumer_returns_503_when_db_unavailable() {
+    let tc = TestConfig::default();
+    let db_flag = Arc::new(AtomicBool::new(false));
+    let (state, _dir) = create_db_admin_state_with_availability(&tc, Some(db_flag)).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let consumer = json!({"username": "blocked-user"});
+    let (status, body) = admin_post(&base_url, "/consumers", &token, &consumer).await;
+    assert_eq!(
+        status, 503,
+        "Should return 503 when DB unavailable: {:?}",
+        body
+    );
+}
+
+#[tokio::test]
+async fn test_create_upstream_returns_503_when_db_unavailable() {
+    let tc = TestConfig::default();
+    let db_flag = Arc::new(AtomicBool::new(false));
+    let (state, _dir) = create_db_admin_state_with_availability(&tc, Some(db_flag)).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let upstream = json!({
+        "name": "blocked-upstream",
+        "targets": [{"host": "10.0.0.1", "port": 8080, "weight": 100}]
+    });
+    let (status, body) = admin_post(&base_url, "/upstreams", &token, &upstream).await;
+    assert_eq!(
+        status, 503,
+        "Should return 503 when DB unavailable: {:?}",
+        body
+    );
+}
+
+#[tokio::test]
+async fn test_create_plugin_config_returns_503_when_db_unavailable() {
+    let tc = TestConfig::default();
+    let db_flag = Arc::new(AtomicBool::new(false));
+    let (state, _dir) = create_db_admin_state_with_availability(&tc, Some(db_flag)).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let plugin = json!({
+        "plugin_name": "rate_limiting",
+        "scope": "global",
+        "enabled": true,
+        "config": {"rate": 100}
+    });
+    let (status, body) = admin_post(&base_url, "/plugins/config", &token, &plugin).await;
+    assert_eq!(
+        status, 503,
+        "Should return 503 when DB unavailable: {:?}",
+        body
+    );
+}
+
+#[tokio::test]
+async fn test_update_proxy_returns_503_when_db_unavailable() {
+    let tc = TestConfig::default();
+    let db_flag = Arc::new(AtomicBool::new(false));
+    let (state, _dir) = create_db_admin_state_with_availability(&tc, Some(db_flag)).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let proxy = json!({
+        "id": "any-id",
+        "listen_path": "/any",
+        "backend_protocol": "http",
+        "backend_host": "localhost",
+        "backend_port": 8080,
+    });
+    let (status, body) = admin_put(&base_url, "/proxies/any-id", &token, &proxy).await;
+    assert_eq!(
+        status, 503,
+        "Should return 503 when DB unavailable: {:?}",
+        body
+    );
+}
+
+#[tokio::test]
+async fn test_delete_upstream_returns_503_when_db_unavailable() {
+    let tc = TestConfig::default();
+    let db_flag = Arc::new(AtomicBool::new(false));
+    let (state, _dir) = create_db_admin_state_with_availability(&tc, Some(db_flag)).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let (status, body) = admin_delete(&base_url, "/upstreams/any-id", &token).await;
+    assert_eq!(
+        status, 503,
+        "Should return 503 when DB unavailable: {:?}",
+        body
+    );
+}
+
+// ============================================================================
+// Backup Cached Config Fallback Tests
+// ============================================================================
+
+#[tokio::test]
+async fn test_backup_falls_back_to_cached_config_when_no_db() {
+    let tc = TestConfig::default();
+    let state = AdminState {
+        db: None,
+        jwt_manager: create_test_jwt_manager(&tc),
+        cached_config: Some(Arc::new(ArcSwap::new(Arc::new(
+            create_test_gateway_config_with_upstreams(),
+        )))),
+        proxy_state: None,
+        mode: "test".to_string(),
+        read_only: true,
+        db_available: None,
+        admin_restore_max_body_size_mib: 100,
+    };
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let (status, body, data_source) = admin_get(&base_url, "/backup", &token).await;
+
+    assert_eq!(status, 200);
+    assert_eq!(body["source"], "cached");
+    assert_eq!(
+        data_source.as_deref(),
+        Some("cached"),
+        "X-Data-Source header should be 'cached'"
+    );
+    assert_eq!(body["counts"]["proxies"], 2);
+    assert_eq!(body["counts"]["consumers"], 1);
+    assert_eq!(body["counts"]["upstreams"], 2);
+    assert_eq!(body["counts"]["plugin_configs"], 1);
+}
+
+#[tokio::test]
+async fn test_backup_no_db_no_cache_returns_503() {
+    let tc = TestConfig::default();
+    let state = AdminState {
+        db: None,
+        jwt_manager: create_test_jwt_manager(&tc),
+        cached_config: None,
+        proxy_state: None,
+        mode: "test".to_string(),
+        read_only: true,
+        db_available: None,
+        admin_restore_max_body_size_mib: 100,
+    };
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let (status, body, _) = admin_get(&base_url, "/backup", &token).await;
+
+    assert_eq!(status, 503);
+    assert!(
+        body["error"].as_str().unwrap().contains("No database"),
+        "Error should mention no database: {:?}",
+        body
+    );
+}
+
+// ============================================================================
+// Write Operations with No DB Returns 503
+// ============================================================================
+
+#[tokio::test]
+async fn test_create_proxy_returns_503_when_no_db() {
+    let tc = TestConfig::default();
+    let state = AdminState {
+        db: None,
+        jwt_manager: create_test_jwt_manager(&tc),
+        cached_config: None,
+        proxy_state: None,
+        mode: "database".to_string(),
+        read_only: false,
+        db_available: None,
+        admin_restore_max_body_size_mib: 100,
+    };
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let proxy = json!({
+        "listen_path": "/no-db",
+        "backend_protocol": "http",
+        "backend_host": "localhost",
+        "backend_port": 8080,
+    });
+    let (status, body) = admin_post(&base_url, "/proxies", &token, &proxy).await;
+    assert_eq!(status, 503, "Should return 503 when no DB: {:?}", body);
+    assert!(body["error"].as_str().unwrap().contains("No database"));
+}
+
+#[tokio::test]
+async fn test_create_upstream_returns_503_when_no_db() {
+    let tc = TestConfig::default();
+    let state = AdminState {
+        db: None,
+        jwt_manager: create_test_jwt_manager(&tc),
+        cached_config: None,
+        proxy_state: None,
+        mode: "database".to_string(),
+        read_only: false,
+        db_available: None,
+        admin_restore_max_body_size_mib: 100,
+    };
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let upstream = json!({
+        "name": "no-db-upstream",
+        "targets": [{"host": "10.0.0.1", "port": 8080, "weight": 100}]
+    });
+    let (status, body) = admin_post(&base_url, "/upstreams", &token, &upstream).await;
+    assert_eq!(status, 503, "Should return 503 when no DB: {:?}", body);
+    assert!(body["error"].as_str().unwrap().contains("No database"));
+}
+
+// ============================================================================
+// DB Recovery Transition Test
+// ============================================================================
+
+#[tokio::test]
+async fn test_db_recovery_allows_writes_after_outage() {
+    let tc = TestConfig::default();
+    let db_flag = Arc::new(AtomicBool::new(false));
+    let (state, _dir) = create_db_admin_state_with_availability(&tc, Some(db_flag.clone())).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    // DB is down — writes should be blocked
+    let proxy = json!({
+        "id": "recovery-p1",
+        "listen_path": "/recovery",
+        "backend_protocol": "http",
+        "backend_host": "localhost",
+        "backend_port": 8080,
+        "strip_listen_path": true,
+    });
+    let (status, _) = admin_post(&base_url, "/proxies", &token, &proxy).await;
+    assert_eq!(status, 503, "Writes should be blocked while DB is down");
+
+    // Simulate DB recovery
+    db_flag.store(true, Ordering::Relaxed);
+
+    // Writes should now succeed
+    let (status, body) = admin_post(&base_url, "/proxies", &token, &proxy).await;
+    assert_eq!(
+        status, 201,
+        "Writes should work after DB recovery: {:?}",
+        body
+    );
+
+    // Verify the proxy was created
+    let (status, body, _) = admin_get(&base_url, "/proxies/recovery-p1", &token).await;
+    assert_eq!(status, 200);
+    assert_eq!(body["id"], "recovery-p1");
+}
+
+// ============================================================================
+// Cached config reflects upstream updates
+// ============================================================================
+
+#[tokio::test]
+async fn test_cached_config_reflects_upstream_updates() {
+    let tc = TestConfig::default();
+    let cached = Arc::new(ArcSwap::new(Arc::new(
+        create_test_gateway_config_with_upstreams(),
+    )));
+    let state = AdminState {
+        db: None,
+        jwt_manager: create_test_jwt_manager(&tc),
+        cached_config: Some(cached.clone()),
+        proxy_state: None,
+        mode: "test".to_string(),
+        read_only: true,
+        db_available: None,
+        admin_restore_max_body_size_mib: 100,
+    };
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    // Initial read: 2 upstreams
+    let (status, body, _) = admin_get(&base_url, "/upstreams", &token).await;
+    assert_eq!(status, 200);
+    assert_eq!(body.as_array().unwrap().len(), 2);
+
+    // Simulate config update (e.g., from polling loop)
+    let mut updated_config = create_test_gateway_config_with_upstreams();
+    updated_config
+        .upstreams
+        .push(create_test_upstream("upstream-3", "backend-pool-3"));
+    cached.store(Arc::new(updated_config));
+
+    // Read again: should see 3 upstreams now
+    let (status, body, _) = admin_get(&base_url, "/upstreams", &token).await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        body.as_array().unwrap().len(),
+        3,
+        "Updated cached config should be reflected immediately"
+    );
+}
+
+// ============================================================================
+// Proxy & Consumer CRUD with Real SQLite DB (extended coverage)
+// ============================================================================
+
+#[tokio::test]
+async fn test_proxy_crud_create_update_delete() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    // Create
+    let proxy = json!({
+        "id": "crud-proxy-1",
+        "name": "My Proxy",
+        "listen_path": "/crud-proxy",
+        "backend_protocol": "http",
+        "backend_host": "localhost",
+        "backend_port": 9999,
+        "strip_listen_path": true,
+    });
+    let (status, body) = admin_post(&base_url, "/proxies", &token, &proxy).await;
+    assert_eq!(status, 201, "Create proxy failed: {:?}", body);
+
+    // Read
+    let (status, body, _) = admin_get(&base_url, "/proxies/crud-proxy-1", &token).await;
+    assert_eq!(status, 200);
+    assert_eq!(body["name"], "My Proxy");
+    assert_eq!(body["listen_path"], "/crud-proxy");
+
+    // Update
+    let updated = json!({
+        "id": "crud-proxy-1",
+        "name": "Updated Proxy",
+        "listen_path": "/crud-proxy-updated",
+        "backend_protocol": "http",
+        "backend_host": "new-host.example.com",
+        "backend_port": 7777,
+        "strip_listen_path": false,
+    });
+    let (status, body) = admin_put(&base_url, "/proxies/crud-proxy-1", &token, &updated).await;
+    assert_eq!(status, 200, "Update proxy failed: {:?}", body);
+
+    // Verify update
+    let (status, body, _) = admin_get(&base_url, "/proxies/crud-proxy-1", &token).await;
+    assert_eq!(status, 200);
+    assert_eq!(body["name"], "Updated Proxy");
+    assert_eq!(body["listen_path"], "/crud-proxy-updated");
+    assert_eq!(body["backend_host"], "new-host.example.com");
+    assert_eq!(body["backend_port"], 7777);
+
+    // Delete
+    let (status, _) = admin_delete(&base_url, "/proxies/crud-proxy-1", &token).await;
+    assert_eq!(status, 204);
+
+    // Verify gone
+    let (status, _, _) = admin_get(&base_url, "/proxies/crud-proxy-1", &token).await;
+    assert_eq!(status, 404);
+}
+
+#[tokio::test]
+async fn test_consumer_crud_create_update_delete() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    // Create
+    let consumer = json!({
+        "id": "crud-consumer-1",
+        "username": "crud_user",
+        "custom_id": "crud-custom-1",
+    });
+    let (status, body) = admin_post(&base_url, "/consumers", &token, &consumer).await;
+    assert_eq!(status, 201, "Create consumer failed: {:?}", body);
+
+    // Read
+    let (status, body, _) = admin_get(&base_url, "/consumers/crud-consumer-1", &token).await;
+    assert_eq!(status, 200);
+    assert_eq!(body["username"], "crud_user");
+    assert_eq!(body["custom_id"], "crud-custom-1");
+
+    // Update
+    let updated = json!({
+        "id": "crud-consumer-1",
+        "username": "updated_user",
+        "custom_id": "updated-custom-1",
+    });
+    let (status, body) = admin_put(&base_url, "/consumers/crud-consumer-1", &token, &updated).await;
+    assert_eq!(status, 200, "Update consumer failed: {:?}", body);
+
+    // Verify update
+    let (status, body, _) = admin_get(&base_url, "/consumers/crud-consumer-1", &token).await;
+    assert_eq!(status, 200);
+    assert_eq!(body["username"], "updated_user");
+
+    // Delete
+    let (status, _) = admin_delete(&base_url, "/consumers/crud-consumer-1", &token).await;
+    assert_eq!(status, 204);
+
+    // Verify gone
+    let (status, _, _) = admin_get(&base_url, "/consumers/crud-consumer-1", &token).await;
+    assert_eq!(status, 404);
+}
+
+// ============================================================================
+// Health Endpoint with DB Availability Info
+// ============================================================================
+
+#[tokio::test]
+async fn test_health_endpoint_shows_db_availability() {
+    let tc = TestConfig::default();
+    let db_flag = Arc::new(AtomicBool::new(true));
+    let cached = Arc::new(ArcSwap::new(Arc::new(create_test_gateway_config())));
+    let state = AdminState {
+        db: None,
+        jwt_manager: create_test_jwt_manager(&tc),
+        cached_config: Some(cached),
+        proxy_state: None,
+        mode: "database".to_string(),
+        read_only: false,
+        db_available: Some(db_flag.clone()),
+        admin_restore_max_body_size_mib: 100,
+    };
+    let (base_url, _shutdown) = start_test_admin(state).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(format!("{}/health", base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["status"], "ok");
+    assert_eq!(body["cached_config"]["available"], true);
+
+    // Simulate DB going down
+    db_flag.store(false, Ordering::Relaxed);
+
+    let resp = client
+        .get(format!("{}/health", base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    // Health returns 200 but status is "degraded" when DB is unavailable
+    assert_eq!(
+        body["status"], "degraded",
+        "Status should be 'degraded' when DB is down but gateway is operational"
+    );
+}
+
+// ============================================================================
+// Batch Operations During DB Outage
+// ============================================================================
+
+#[tokio::test]
+async fn test_batch_create_returns_503_when_db_unavailable() {
+    let tc = TestConfig::default();
+    let db_flag = Arc::new(AtomicBool::new(false));
+    let (state, _dir) = create_db_admin_state_with_availability(&tc, Some(db_flag)).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let batch = json!({
+        "proxies": [
+            {"id": "batch-blocked", "listen_path": "/blocked", "backend_protocol": "http", "backend_host": "localhost", "backend_port": 8080, "strip_listen_path": true}
+        ]
+    });
+    let (status, body) = admin_post(&base_url, "/batch", &token, &batch).await;
+    assert_eq!(
+        status, 503,
+        "Batch should be blocked when DB unavailable: {:?}",
+        body
+    );
+}
+
+#[tokio::test]
+async fn test_restore_returns_503_when_db_unavailable() {
+    let tc = TestConfig::default();
+    let db_flag = Arc::new(AtomicBool::new(false));
+    let (state, _dir) = create_db_admin_state_with_availability(&tc, Some(db_flag)).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let (status, body) = admin_post(
+        &base_url,
+        "/restore?confirm=true",
+        &token,
+        &json!({"proxies": []}),
+    )
+    .await;
+    assert_eq!(
+        status, 503,
+        "Restore should be blocked when DB unavailable: {:?}",
+        body
+    );
+}
+
+// ============================================================================
+// Upstream Duplicate ID and Name Uniqueness Tests
+// ============================================================================
+
+#[tokio::test]
+async fn test_upstream_duplicate_id_returns_409() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let upstream = json!({
+        "id": "dup-u1",
+        "name": "first",
+        "targets": [{"host": "10.0.0.1", "port": 8080, "weight": 100}]
+    });
+    let (status, _) = admin_post(&base_url, "/upstreams", &token, &upstream).await;
+    assert_eq!(status, 201);
+
+    // Same ID again
+    let upstream2 = json!({
+        "id": "dup-u1",
+        "name": "second",
+        "targets": [{"host": "10.0.0.2", "port": 8080, "weight": 100}]
+    });
+    let (status, body) = admin_post(&base_url, "/upstreams", &token, &upstream2).await;
+    assert_eq!(status, 409, "Duplicate ID should return 409: {:?}", body);
+}
+
+#[tokio::test]
+async fn test_upstream_duplicate_name_returns_409() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let upstream = json!({
+        "id": "name-u1",
+        "name": "same-name",
+        "targets": [{"host": "10.0.0.1", "port": 8080, "weight": 100}]
+    });
+    let (status, _) = admin_post(&base_url, "/upstreams", &token, &upstream).await;
+    assert_eq!(status, 201);
+
+    // Different ID but same name
+    let upstream2 = json!({
+        "id": "name-u2",
+        "name": "same-name",
+        "targets": [{"host": "10.0.0.2", "port": 8080, "weight": 100}]
+    });
+    let (status, body) = admin_post(&base_url, "/upstreams", &token, &upstream2).await;
+    assert_eq!(status, 409, "Duplicate name should return 409: {:?}", body);
 }

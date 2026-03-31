@@ -28,8 +28,8 @@ cargo build --release                    # Release build (O3, thin LTO, strip)
 # Unit tests (fast, no I/O)
 cargo test --test unit_tests --all-features
 
-# Integration tests (component interaction — mTLS, connection pool, gRPC, HTTP/3)
-cargo test --test integration_tests --test admin_cached_config_tests --all-features
+# Integration tests (component interaction — mTLS, connection pool, gRPC, HTTP/3, admin API)
+cargo test --test integration_tests --all-features
 
 # Functional / end-to-end tests (start real gateway binary, test all modes)
 # Requires: cargo build --bin ferrum-edge (builds the binary first)
@@ -176,7 +176,6 @@ tests/
 ├── unit_tests.rs              # Entry point → tests/unit/
 ├── integration_tests.rs       # Entry point → tests/integration/
 ├── functional_tests.rs        # Entry point → tests/functional/ (all #[ignored])
-├── admin_cached_config_tests.rs
 ├── unit/
 │   ├── config/                # Config parsing, env vars, TLS, pool config
 │   ├── plugins/               # Per-plugin unit tests
@@ -201,7 +200,7 @@ tests/
 1. `cargo fmt` — format all code
 2. `cargo clippy --all-targets --all-features -- -D warnings` — zero warnings
 3. `cargo test --test unit_tests --all-features` — all unit tests pass
-4. `cargo test --test integration_tests --test admin_cached_config_tests --all-features` — integration tests pass
+4. `cargo test --test integration_tests --all-features` — integration tests pass
 5. If changing proxy behavior: `cargo build --bin ferrum-edge && cargo test --test functional_tests --all-features -- --ignored` — E2E tests pass
 
 ### Code Quality Rules
@@ -264,7 +263,7 @@ tests/
 - [ ] `cargo fmt` — no formatting diffs
 - [ ] `cargo clippy --all-targets --all-features -- -D warnings` — zero warnings
 - [ ] `cargo test --test unit_tests --all-features` — unit tests pass
-- [ ] `cargo test --test integration_tests --test admin_cached_config_tests --all-features` — integration tests pass
+- [ ] `cargo test --test integration_tests --all-features` — integration tests pass
 - [ ] New features have unit tests covering normal, edge, and error cases
 - [ ] No `.unwrap()` or `.expect()` in production code paths
 - [ ] No dead code (clippy enforces `-D dead-code`)
