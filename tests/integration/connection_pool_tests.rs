@@ -168,6 +168,7 @@ async fn test_connection_pool_creation() {
         PoolConfig::default(),
         create_test_env_config(),
         create_test_dns_cache(),
+        None,
     );
     let proxy = create_test_proxy();
 
@@ -185,6 +186,7 @@ async fn test_pool_stats() {
         PoolConfig::default(),
         create_test_env_config(),
         create_test_dns_cache(),
+        None,
     );
     let proxy = create_test_proxy();
 
@@ -202,6 +204,7 @@ async fn test_different_proxy_configs_produce_different_pool_keys() {
         PoolConfig::default(),
         create_test_env_config(),
         create_test_dns_cache(),
+        None,
     );
 
     let mut proxy1 = create_test_proxy();
@@ -226,6 +229,7 @@ async fn test_different_protocols_produce_different_pool_keys() {
         PoolConfig::default(),
         create_test_env_config(),
         create_test_dns_cache(),
+        None,
     );
 
     let mut proxy_http = create_test_proxy();
@@ -250,6 +254,7 @@ async fn test_same_proxy_reuses_cached_client() {
         PoolConfig::default(),
         create_test_env_config(),
         create_test_dns_cache(),
+        None,
     );
     let proxy = create_test_proxy();
 
@@ -270,6 +275,7 @@ async fn test_dns_override_affects_pool_key() {
         PoolConfig::default(),
         create_test_env_config(),
         create_test_dns_cache(),
+        None,
     );
 
     let mut proxy1 = create_test_proxy();
@@ -294,6 +300,7 @@ async fn test_pool_clear() {
         PoolConfig::default(),
         create_test_env_config(),
         create_test_dns_cache(),
+        None,
     );
     let proxy = create_test_proxy();
 
@@ -310,6 +317,7 @@ async fn test_pool_with_proxy_config_overrides() {
         PoolConfig::default(),
         create_test_env_config(),
         create_test_dns_cache(),
+        None,
     );
 
     let mut proxy = create_test_proxy();
@@ -330,6 +338,7 @@ async fn test_pool_websocket_protocol_creates_client() {
         PoolConfig::default(),
         create_test_env_config(),
         create_test_dns_cache(),
+        None,
     );
 
     let mut proxy = create_test_proxy();
@@ -348,6 +357,7 @@ async fn test_upstream_id_pools_separately_from_backend_host() {
         PoolConfig::default(),
         create_test_env_config(),
         create_test_dns_cache(),
+        None,
     );
 
     // Proxy with direct backend
@@ -373,6 +383,7 @@ async fn test_different_upstream_ids_pool_separately() {
         PoolConfig::default(),
         create_test_env_config(),
         create_test_dns_cache(),
+        None,
     );
 
     let mut proxy1 = create_test_proxy();
@@ -399,6 +410,7 @@ async fn test_concurrent_pool_access() {
         PoolConfig::default(),
         create_test_env_config(),
         create_test_dns_cache(),
+        None,
     ));
 
     let mut handles = Vec::new();
@@ -428,6 +440,7 @@ async fn test_idle_timeout_does_not_fragment_pool() {
         PoolConfig::default(),
         create_test_env_config(),
         create_test_dns_cache(),
+        None,
     );
 
     // Two proxies with same host/port/protocol but different idle timeouts

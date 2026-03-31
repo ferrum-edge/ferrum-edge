@@ -35,7 +35,7 @@ use tracing::{debug, error, warn};
 use crate::config::PoolConfig;
 use crate::config::types::{BackendProtocol, Proxy};
 use crate::dns::DnsCache;
-use crate::tls::NoVerifier;
+use crate::tls::{NoVerifier, TlsPolicy};
 
 /// Pool entry tracking a sender handle and its last-used timestamp.
 struct GrpcPoolEntry {
@@ -70,11 +70,17 @@ pub struct GrpcConnectionPool {
     global_pool_config: PoolConfig,
     /// Global TLS/mTLS configuration
     global_env_config: crate::config::EnvConfig,
+    /// TLS hardening policy for backend connections (cipher suites, protocol versions).
+    tls_policy: Option<Arc<TlsPolicy>>,
 }
 
 impl Default for GrpcConnectionPool {
     fn default() -> Self {
-        Self::new(PoolConfig::default(), crate::config::EnvConfig::default())
+        Self::new(
+            PoolConfig::default(),
+            crate::config::EnvConfig::default(),
+            None,
+        )
     }
 }
 
@@ -82,12 +88,14 @@ impl GrpcConnectionPool {
     pub fn new(
         global_pool_config: PoolConfig,
         global_env_config: crate::config::EnvConfig,
+        tls_policy: Option<Arc<TlsPolicy>>,
     ) -> Self {
         let pool = Self {
             entries: Arc::new(DashMap::new()),
             rr_counters: Arc::new(DashMap::new()),
             global_pool_config,
             global_env_config,
+            tls_policy,
         };
 
         pool.start_cleanup_task();
@@ -457,14 +465,16 @@ impl GrpcConnectionPool {
                 cert_path, key_path
             );
 
-            rustls::ClientConfig::builder()
+            crate::tls::backend_client_config_builder(self.tls_policy.as_deref())
+                .map_err(|e| GrpcProxyError::Internal(format!("TLS policy error: {}", e)))?
                 .with_root_certificates(root_store)
                 .with_client_auth_cert(certs, key)
                 .map_err(|e| {
                     GrpcProxyError::Internal(format!("Invalid client certificate/key: {}", e))
                 })?
         } else {
-            rustls::ClientConfig::builder()
+            crate::tls::backend_client_config_builder(self.tls_policy.as_deref())
+                .map_err(|e| GrpcProxyError::Internal(format!("TLS policy error: {}", e)))?
                 .with_root_certificates(root_store)
                 .with_no_client_auth()
         };

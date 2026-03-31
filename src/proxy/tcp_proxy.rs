@@ -16,7 +16,7 @@ use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
 use crate::circuit_breaker::CircuitBreakerCache;
-use crate::tls::NoVerifier;
+use crate::tls::{NoVerifier, TlsPolicy};
 
 use crate::config::types::{BackendProtocol, GatewayConfig, Proxy};
 use crate::dns::DnsCache;
@@ -34,7 +34,12 @@ struct CachedBackendTlsConfig {
 
 impl CachedBackendTlsConfig {
     /// Build a TLS client config from proxy settings, reading cert files once.
-    fn build(proxy: &Proxy, tls_no_verify: bool) -> Result<Self, anyhow::Error> {
+    /// Uses the TLS policy's cipher suites and protocol versions when available.
+    fn build(
+        proxy: &Proxy,
+        tls_no_verify: bool,
+        tls_policy: Option<&TlsPolicy>,
+    ) -> Result<Self, anyhow::Error> {
         // Build root certificate store
         let mut root_store = rustls::RootCertStore::empty();
         if let Some(ca_path) = &proxy.backend_tls_server_ca_cert_path {
@@ -52,7 +57,8 @@ impl CachedBackendTlsConfig {
             root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
         }
 
-        // Build TLS client config with optional client auth
+        // Build TLS client config with optional client auth, using TLS policy
+        let builder = crate::tls::backend_client_config_builder(tls_policy)?;
         let mut tls_config = if let (Some(cert_path), Some(key_path)) = (
             &proxy.backend_tls_client_cert_path,
             &proxy.backend_tls_client_key_path,
@@ -65,12 +71,12 @@ impl CachedBackendTlsConfig {
             let key = rustls_pemfile::private_key(&mut &key_data[..])
                 .map_err(|e| anyhow::anyhow!("Failed to parse private key: {}", e))?
                 .ok_or_else(|| anyhow::anyhow!("No private key found in {}", key_path))?;
-            rustls::ClientConfig::builder()
+            builder
                 .with_root_certificates(root_store)
                 .with_client_auth_cert(certs, key)
                 .map_err(|e| anyhow::anyhow!("Failed to set client auth cert: {}", e))?
         } else {
-            rustls::ClientConfig::builder()
+            builder
                 .with_root_certificates(root_store)
                 .with_no_client_auth()
         };
@@ -113,6 +119,8 @@ pub struct TcpListenerConfig {
     pub tcp_idle_timeout_seconds: u64,
     /// Circuit breaker cache shared with HTTP proxies.
     pub circuit_breaker_cache: Arc<CircuitBreakerCache>,
+    /// TLS hardening policy for backend connections (cipher suites, protocol versions).
+    pub tls_policy: Option<Arc<TlsPolicy>>,
 }
 
 /// Start a TCP proxy listener on the given port.
@@ -137,6 +145,7 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
         plugin_cache,
         tcp_idle_timeout_seconds: global_tcp_idle_timeout,
         circuit_breaker_cache,
+        tls_policy,
     } = cfg;
     let addr = SocketAddr::new(bind_addr, port);
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -172,14 +181,16 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
             .find(|p| *p.id == *proxy_id)
             .filter(|p| p.backend_protocol == BackendProtocol::TcpTls)
             .map(|proxy| {
-                CachedBackendTlsConfig::build(proxy, tls_no_verify)
+                CachedBackendTlsConfig::build(proxy, tls_no_verify, tls_policy.as_deref())
                     .map(Arc::new)
                     .unwrap_or_else(|e| {
                         warn!(proxy_id = %proxy_id, "Failed to pre-build backend TLS config: {}, will retry per-connection", e);
                         // Return a dummy config that will be rebuilt per-connection
+                        let dummy_builder = crate::tls::backend_client_config_builder(tls_policy.as_deref())
+                            .unwrap_or_else(|_| rustls::ClientConfig::builder());
                         Arc::new(CachedBackendTlsConfig {
                             config: Arc::new(
-                                rustls::ClientConfig::builder()
+                                dummy_builder
                                     .with_root_certificates(rustls::RootCertStore::empty())
                                     .with_no_client_auth()
                             ),

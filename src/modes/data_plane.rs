@@ -33,8 +33,17 @@ pub async fn run(
     let dns_handle =
         dns_cache.start_background_refresh_with_shutdown(Some(shutdown_tx.subscribe()));
 
+    // Build TLS hardening policy from environment (needed for both frontend
+    // and backend TLS — cipher suites, protocol versions, key exchange groups).
+    let tls_policy = TlsPolicy::from_env_config(&env_config)?;
+
     // Start with empty config; CP will push the real one via gRPC
-    let proxy_state = ProxyState::new(GatewayConfig::default(), dns_cache, env_config.clone())?;
+    let proxy_state = ProxyState::new(
+        GatewayConfig::default(),
+        dns_cache,
+        env_config.clone(),
+        Some(tls_policy.clone()),
+    )?;
 
     // Start service discovery background tasks (initially no-op with empty config;
     // tasks are reconciled when CP pushes config via update_config)
@@ -118,9 +127,6 @@ pub async fn run(
         )
         .await;
     });
-
-    // Build TLS hardening policy from environment
-    let tls_policy = TlsPolicy::from_env_config(&env_config)?;
 
     // Load TLS configuration if provided
     let tls_config = if let (Some(cert_path), Some(key_path)) = (

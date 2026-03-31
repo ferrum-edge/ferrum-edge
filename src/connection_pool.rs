@@ -4,6 +4,7 @@
 use crate::config::PoolConfig;
 use crate::config::types::Proxy;
 use crate::dns::{DnsCache, DnsCacheResolver};
+use crate::tls::TlsPolicy;
 use anyhow::Result;
 use dashmap::DashMap;
 use std::net::SocketAddr;
@@ -46,6 +47,10 @@ pub struct ConnectionPool {
     global_mtls_config: crate::config::EnvConfig,
     /// DNS cache used as the custom resolver for all reqwest clients
     dns_cache: DnsCache,
+    /// TLS hardening policy for backend connections (cipher suites, protocol versions).
+    /// When set, reqwest clients use a pre-configured rustls `ClientConfig` with the
+    /// same cipher suites and protocol versions as inbound listeners.
+    tls_policy: Option<Arc<TlsPolicy>>,
 }
 
 impl ConnectionPool {
@@ -58,6 +63,7 @@ impl ConnectionPool {
         global_config: PoolConfig,
         mtls_config: crate::config::EnvConfig,
         dns_cache: DnsCache,
+        tls_policy: Option<Arc<TlsPolicy>>,
     ) -> Self {
         let cleanup_secs = mtls_config.pool_cleanup_interval_seconds;
         let pool = Self {
@@ -66,6 +72,7 @@ impl ConnectionPool {
             global_config,
             global_mtls_config: mtls_config,
             dns_cache,
+            tls_policy,
         };
 
         // Start cleanup task
@@ -125,16 +132,18 @@ impl ConnectionPool {
         let dns_resolver = Arc::new(DnsCacheResolver::new(self.dns_cache.clone()));
 
         let mut client_builder = reqwest::Client::builder()
-            .use_rustls_tls()
             .dns_resolver(dns_resolver)
             .connect_timeout(Duration::from_millis(proxy.backend_connect_timeout_ms))
             .timeout(Duration::from_millis(proxy.backend_read_timeout_ms))
             .tcp_nodelay(true)
-            .danger_accept_invalid_certs(
-                !proxy.backend_tls_verify_server_cert || self.global_mtls_config.tls_no_verify,
-            )
             .pool_max_idle_per_host(config.max_idle_per_host)
             .pool_idle_timeout(Duration::from_secs(config.idle_timeout_seconds));
+
+        // Build a custom rustls ClientConfig with the TLS policy's cipher suites,
+        // protocol versions, and key exchange groups — ensuring outbound connections
+        // enforce the same TLS settings as inbound listeners.
+        let tls_config = self.build_reqwest_tls_config(proxy)?;
+        client_builder = client_builder.use_preconfigured_tls(tls_config);
 
         // Enable TCP keep-alive if configured (detects dead backend connections)
         if config.enable_http_keep_alive {
@@ -160,59 +169,6 @@ impl ConnectionPool {
                 .http2_max_frame_size(config.http2_max_frame_size);
         }
 
-        // Add custom CA bundle for server certificate verification (unless no_verify is set).
-        // Per-proxy backend_tls_server_ca_cert_path takes priority over the global
-        // FERRUM_TLS_CA_BUNDLE_PATH env var.
-        if !self.global_mtls_config.tls_no_verify {
-            let ca_path = proxy
-                .backend_tls_server_ca_cert_path
-                .as_ref()
-                .or(self.global_mtls_config.tls_ca_bundle_path.as_ref());
-            if let Some(ca_bundle_path) = ca_path {
-                let ca_pem = std::fs::read_to_string(ca_bundle_path).map_err(|e| {
-                    anyhow::anyhow!("Failed to read CA bundle from {}: {}", ca_bundle_path, e)
-                })?;
-                let certificate = reqwest::Certificate::from_pem(ca_pem.as_bytes())
-                    .map_err(|e| anyhow::anyhow!("Failed to parse CA bundle: {}", e))?;
-                client_builder = client_builder.add_root_certificate(certificate);
-            }
-        } else {
-            // Danger: Disable certificate verification (for testing only)
-            warn!("Backend TLS certificate verification DISABLED (testing mode)");
-            client_builder = client_builder.danger_accept_invalid_certs(true);
-        }
-
-        // Add client certificate for mTLS (proxy-specific overrides take priority)
-        let cert_path = proxy.backend_tls_client_cert_path.as_ref().or(self
-            .global_mtls_config
-            .backend_tls_client_cert_path
-            .as_ref());
-        let key_path = proxy
-            .backend_tls_client_key_path
-            .as_ref()
-            .or(self.global_mtls_config.backend_tls_client_key_path.as_ref());
-
-        if let (Some(cert_path), Some(key_path)) = (cert_path, key_path) {
-            // Load client certificate and key
-            let cert_pem = std::fs::read_to_string(cert_path).map_err(|e| {
-                anyhow::anyhow!(
-                    "Failed to read client certificate from {}: {}",
-                    cert_path,
-                    e
-                )
-            })?;
-            let key_pem = std::fs::read_to_string(key_path).map_err(|e| {
-                anyhow::anyhow!("Failed to read client key from {}: {}", key_path, e)
-            })?;
-
-            // Parse certificate and key
-            let combined_pem = format!("{}\n{}", cert_pem, key_pem);
-            let identity = reqwest::Identity::from_pem(combined_pem.as_bytes())
-                .map_err(|e| anyhow::anyhow!("Failed to parse client certificate/key: {}", e))?;
-
-            client_builder = client_builder.identity(identity);
-        }
-
         // If the proxy has a static DNS override, set a resolve hint so the
         // override IP takes priority over the DnsCacheResolver for this
         // specific hostname. This preserves backward compatibility with
@@ -226,6 +182,89 @@ impl ConnectionPool {
 
         let client = client_builder.build()?;
         Ok(client)
+    }
+
+    /// Build a rustls `ClientConfig` for reqwest using the TLS policy's cipher suites,
+    /// protocol versions, and key exchange groups. Also configures root certificates,
+    /// client mTLS certificates, and certificate verification per-proxy settings.
+    fn build_reqwest_tls_config(&self, proxy: &Proxy) -> Result<rustls::ClientConfig> {
+        use crate::tls::NoVerifier;
+
+        // Build root certificate store with system roots
+        let mut root_store =
+            rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
+        // Add custom CA bundle (proxy-level takes priority over global)
+        if !self.global_mtls_config.tls_no_verify {
+            let ca_path = proxy
+                .backend_tls_server_ca_cert_path
+                .as_ref()
+                .or(self.global_mtls_config.tls_ca_bundle_path.as_ref());
+            if let Some(ca_bundle_path) = ca_path {
+                let ca_data = std::fs::read(ca_bundle_path).map_err(|e| {
+                    anyhow::anyhow!("Failed to read CA bundle from {}: {}", ca_bundle_path, e)
+                })?;
+                let certs = rustls_pemfile::certs(&mut &ca_data[..])
+                    .filter_map(|r| r.ok())
+                    .collect::<Vec<_>>();
+                let (added, _) = root_store.add_parsable_certificates(certs);
+                if added > 0 {
+                    tracing::debug!(
+                        "Added {} CA certificates from {} for reqwest backend",
+                        added,
+                        ca_bundle_path
+                    );
+                }
+            }
+        }
+
+        // Build ClientConfig with TLS policy (cipher suites, protocol versions, kx groups)
+        let builder = crate::tls::backend_client_config_builder(self.tls_policy.as_deref())?
+            .with_root_certificates(root_store);
+
+        // Add client certificate for mTLS (proxy-specific overrides take priority)
+        let cert_path = proxy.backend_tls_client_cert_path.as_ref().or(self
+            .global_mtls_config
+            .backend_tls_client_cert_path
+            .as_ref());
+        let key_path = proxy
+            .backend_tls_client_key_path
+            .as_ref()
+            .or(self.global_mtls_config.backend_tls_client_key_path.as_ref());
+
+        let mut client_config = if let (Some(cert_path), Some(key_path)) = (cert_path, key_path) {
+            let cert_data = std::fs::read(cert_path).map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to read client certificate from {}: {}",
+                    cert_path,
+                    e
+                )
+            })?;
+            let key_data = std::fs::read(key_path).map_err(|e| {
+                anyhow::anyhow!("Failed to read client key from {}: {}", key_path, e)
+            })?;
+            let certs: Vec<_> = rustls_pemfile::certs(&mut &cert_data[..])
+                .filter_map(|r| r.ok())
+                .collect();
+            let key = rustls_pemfile::private_key(&mut &key_data[..])
+                .map_err(|e| anyhow::anyhow!("Failed to parse client key: {}", e))?
+                .ok_or_else(|| anyhow::anyhow!("No private key found in {}", key_path))?;
+            builder
+                .with_client_auth_cert(certs, key)
+                .map_err(|e| anyhow::anyhow!("Failed to set client auth cert: {}", e))?
+        } else {
+            builder.with_no_client_auth()
+        };
+
+        // Disable server certificate verification if configured (testing only)
+        if !proxy.backend_tls_verify_server_cert || self.global_mtls_config.tls_no_verify {
+            warn!("Backend TLS certificate verification DISABLED (testing mode)");
+            client_config
+                .dangerous()
+                .set_certificate_verifier(Arc::new(NoVerifier));
+        }
+
+        Ok(client_config)
     }
 
     /// Create pool key for caching clients.
@@ -326,7 +365,8 @@ impl ConnectionPool {
     ///
     /// Configures ALPN with `h3` protocol and ensures TLS 1.3 is available
     /// (required for QUIC/HTTP/3). Respects proxy-specific TLS settings
-    /// for custom CA bundles and mTLS client certificates.
+    /// for custom CA bundles and mTLS client certificates. Uses the TLS
+    /// policy's cipher suites and key exchange groups for outbound connections.
     pub fn get_tls_config_for_backend(&self, proxy: &Proxy) -> Arc<rustls::ClientConfig> {
         use rustls_pemfile::certs;
         use std::io::BufReader;
@@ -352,6 +392,16 @@ impl ConnectionPool {
             }
         }
 
+        // Helper: build a ClientConfig builder using TLS policy or defaults.
+        // For HTTP/3, TLS 1.3 is mandatory (QUIC requires it). If the TLS policy
+        // restricts to TLS 1.2 only, we still need TLS 1.3 for HTTP/3 — so the
+        // policy is applied best-effort.
+        let policy_builder =
+            || -> rustls::ConfigBuilder<rustls::ClientConfig, rustls::WantsVerifier> {
+                crate::tls::backend_client_config_builder(self.tls_policy.as_deref())
+                    .unwrap_or_else(|_| rustls::ClientConfig::builder())
+            };
+
         // Build client config with optional mTLS
         let mut client_config = if let (Some(cert_path), Some(key_path)) = (
             &proxy.backend_tls_client_cert_path,
@@ -371,12 +421,12 @@ impl ConnectionPool {
                             .filter_map(|r| r.ok())
                             .collect();
                     if let Some(key) = client_keys.into_iter().next() {
-                        rustls::ClientConfig::builder()
+                        policy_builder()
                             .with_root_certificates(root_store)
                             .with_client_auth_cert(client_certs, rustls::pki_types::PrivateKeyDer::Pkcs8(key))
                             .unwrap_or_else(|e| {
                                 tracing::warn!("Failed to configure mTLS for HTTP/3: {}, falling back to no client auth", e);
-                                rustls::ClientConfig::builder()
+                                policy_builder()
                                     .with_root_certificates(rustls::RootCertStore::from_iter(
                                         webpki_roots::TLS_SERVER_ROOTS.iter().cloned(),
                                     ))
@@ -384,20 +434,20 @@ impl ConnectionPool {
                             })
                     } else {
                         tracing::warn!("No private keys found in {} for HTTP/3 mTLS", key_path);
-                        rustls::ClientConfig::builder()
+                        policy_builder()
                             .with_root_certificates(root_store)
                             .with_no_client_auth()
                     }
                 }
                 _ => {
                     tracing::warn!("Failed to open mTLS certificate files for HTTP/3");
-                    rustls::ClientConfig::builder()
+                    policy_builder()
                         .with_root_certificates(root_store)
                         .with_no_client_auth()
                 }
             }
         } else {
-            rustls::ClientConfig::builder()
+            policy_builder()
                 .with_root_certificates(root_store)
                 .with_no_client_auth()
         };

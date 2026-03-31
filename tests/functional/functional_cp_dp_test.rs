@@ -220,7 +220,7 @@ fn create_proxy_state() -> ProxyState {
         slow_threshold_ms: None,
     });
     let env_config = create_test_env_config();
-    ProxyState::new(GatewayConfig::default(), dns_cache, env_config).unwrap()
+    ProxyState::new(GatewayConfig::default(), dns_cache, env_config, None).unwrap()
 }
 
 #[ignore]
