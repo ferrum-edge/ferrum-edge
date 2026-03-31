@@ -778,7 +778,7 @@ fn test_proxy_http3_connections_valid() {
 // ---- TLS file path validation tests ----
 
 #[test]
-fn test_proxy_tls_cert_path_too_long() {
+fn test_frontend_tls_cert_path_too_long() {
     let mut proxy = make_proxy("test", "/api");
     proxy.backend_tls_client_cert_path = Some("a".repeat(MAX_FILE_PATH_LENGTH + 1));
     let errs = proxy.validate_fields().unwrap_err();
@@ -789,7 +789,7 @@ fn test_proxy_tls_cert_path_too_long() {
 }
 
 #[test]
-fn test_proxy_tls_key_path_too_long() {
+fn test_frontend_tls_key_path_too_long() {
     let mut proxy = make_proxy("test", "/api");
     proxy.backend_tls_client_key_path = Some("a".repeat(MAX_FILE_PATH_LENGTH + 1));
     let errs = proxy.validate_fields().unwrap_err();

@@ -50,7 +50,7 @@ fn test_no_verify_scenarios() {
     println!("✅ No-verify configuration scenarios:");
     println!();
     println!("Proxy Frontend No-Verify:");
-    println!("  - FERRUM_PROXY_TLS_CERT_PATH and FERRUM_PROXY_TLS_KEY_PATH set");
+    println!("  - FERRUM_FRONTEND_TLS_CERT_PATH and FERRUM_FRONTEND_TLS_KEY_PATH set");
     println!("  - FERRUM_TLS_NO_VERIFY=true");
     println!("  - Frontend TLS works but backend verification disabled");
     println!("  - Use case: Testing with self-signed backend certificates");

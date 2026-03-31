@@ -77,8 +77,8 @@ The gateway uses distinct network listeners for different traffic types. Default
 *   **Proxy Traffic Listeners (All Modes except CP):**
     *   HTTP Port: Configurable via `FERRUM_PROXY_HTTP_PORT` (Default: `8000`).
     *   HTTPS Port: Configurable via `FERRUM_PROXY_HTTPS_PORT` (Default: `8443`).
-        *   TLS Certificate Path: `FERRUM_PROXY_TLS_CERT_PATH` (Required if HTTPS port is active).
-        *   TLS Private Key Path: `FERRUM_PROXY_TLS_KEY_PATH` (Required if HTTPS port is active).
+        *   TLS Certificate Path: `FERRUM_FRONTEND_TLS_CERT_PATH` (Required if HTTPS port is active).
+        *   TLS Private Key Path: `FERRUM_FRONTEND_TLS_KEY_PATH` (Required if HTTPS port is active).
 *   **Admin API Listeners (Database & CP Modes Only):**
     *   HTTP Port: Configurable via `FERRUM_ADMIN_HTTP_PORT` (Default: `9000`).
     *   HTTPS Port: Configurable via `FERRUM_ADMIN_HTTPS_PORT` (Default: `9443`).
@@ -95,7 +95,7 @@ All operational parameters MUST be configurable via environment variables.
     *   `FERRUM_MODE`: (`database`, `file`, `cp`, `dp`) - **Required**.
     *   `FERRUM_LOG_LEVEL`: (`error`, `warn`, `info`, `debug`, `trace`) - Default: `error`.
 *   **Network Ports & TLS:**
-    *   `FERRUM_PROXY_HTTP_PORT`, `FERRUM_PROXY_HTTPS_PORT`, `FERRUM_PROXY_TLS_CERT_PATH`, `FERRUM_PROXY_TLS_KEY_PATH`
+    *   `FERRUM_PROXY_HTTP_PORT`, `FERRUM_PROXY_HTTPS_PORT`, `FERRUM_FRONTEND_TLS_CERT_PATH`, `FERRUM_FRONTEND_TLS_KEY_PATH`
     *   `FERRUM_ADMIN_HTTP_PORT`, `FERRUM_ADMIN_HTTPS_PORT`, `FERRUM_ADMIN_TLS_CERT_PATH`, `FERRUM_ADMIN_TLS_KEY_PATH`
 *   **Admin & CP/DP Security:**
     *   `FERRUM_ADMIN_JWT_SECRET`: (HS256 secret string) - **Required** in Database & CP modes.

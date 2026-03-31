@@ -117,10 +117,10 @@ fn start_gateway(
         cmd.env("FERRUM_PROXY_HTTPS_PORT", port.to_string());
     }
     if let Some(cert) = tls_cert_path {
-        cmd.env("FERRUM_PROXY_TLS_CERT_PATH", cert);
+        cmd.env("FERRUM_FRONTEND_TLS_CERT_PATH", cert);
     }
     if let Some(key) = tls_key_path {
-        cmd.env("FERRUM_PROXY_TLS_KEY_PATH", key);
+        cmd.env("FERRUM_FRONTEND_TLS_KEY_PATH", key);
     }
 
     Ok(cmd.spawn()?)

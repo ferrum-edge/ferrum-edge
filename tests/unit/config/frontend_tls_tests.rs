@@ -7,12 +7,14 @@ fn test_frontend_tls_configuration() {
     // Test without client CA bundle (regular HTTPS)
     let _config_without_client_ca = r#"
     # Server certificate and key
-    FERRUM_PROXY_TLS_CERT_PATH="/path/to/server.crt"
-    FERRUM_PROXY_TLS_KEY_PATH="/path/to/server.key"
+    FERRUM_FRONTEND_TLS_CERT_PATH="/path/to/server.crt"
+    FERRUM_FRONTEND_TLS_KEY_PATH="/path/to/server.key"
     "#;
 
     println!("✅ Frontend TLS configuration test:");
-    println!("   - Server certificates: FERRUM_PROXY_TLS_CERT_PATH, FERRUM_PROXY_TLS_KEY_PATH");
+    println!(
+        "   - Server certificates: FERRUM_FRONTEND_TLS_CERT_PATH, FERRUM_FRONTEND_TLS_KEY_PATH"
+    );
     println!("   - Optional client CA: FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH");
     println!("   - When client CA is provided: mTLS (mutual TLS) is enabled");
     println!("   - When client CA is not provided: regular HTTPS");
@@ -24,11 +26,11 @@ fn test_frontend_tls_env_vars() {
     // Verify the expected environment variables are documented
     let expected_env_vars = vec![
         (
-            "FERRUM_PROXY_TLS_CERT_PATH",
+            "FERRUM_FRONTEND_TLS_CERT_PATH",
             "Path to server TLS certificate",
         ),
         (
-            "FERRUM_PROXY_TLS_KEY_PATH",
+            "FERRUM_FRONTEND_TLS_KEY_PATH",
             "Path to server TLS private key",
         ),
         (
@@ -50,11 +52,11 @@ fn test_tls_scenarios() {
     println!("✅ Frontend TLS scenarios:");
     println!();
     println!("1. HTTP Only (no TLS):");
-    println!("   - No FERRUM_PROXY_TLS_CERT_PATH or FERRUM_PROXY_TLS_KEY_PATH");
+    println!("   - No FERRUM_FRONTEND_TLS_CERT_PATH or FERRUM_FRONTEND_TLS_KEY_PATH");
     println!("   - Gateway listens on HTTP port only");
     println!();
     println!("2. HTTPS (server TLS only):");
-    println!("   - FERRUM_PROXY_TLS_CERT_PATH and FERRUM_PROXY_TLS_KEY_PATH provided");
+    println!("   - FERRUM_FRONTEND_TLS_CERT_PATH and FERRUM_FRONTEND_TLS_KEY_PATH provided");
     println!("   - No FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH");
     println!("   - Gateway presents server certificate to clients");
     println!("   - Clients verify server certificate using system trust store");

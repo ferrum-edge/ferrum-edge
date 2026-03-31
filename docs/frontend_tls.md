@@ -18,10 +18,10 @@ Required for HTTPS mode:
 
 ```bash
 # Server certificate (PEM format)
-export FERRUM_PROXY_TLS_CERT_PATH="/path/to/server.crt"
+export FERRUM_FRONTEND_TLS_CERT_PATH="/path/to/server.crt"
 
 # Server private key (PEM format)  
-export FERRUM_PROXY_TLS_KEY_PATH="/path/to/server.key"
+export FERRUM_FRONTEND_TLS_KEY_PATH="/path/to/server.key"
 ```
 
 ### Client Certificate Verification (mTLS)
@@ -51,8 +51,8 @@ No TLS configuration needed:
 Enable server TLS:
 
 ```bash
-export FERRUM_PROXY_TLS_CERT_PATH="/etc/ssl/certs/gateway.crt"
-export FERRUM_PROXY_TLS_KEY_PATH="/etc/ssl/private/gateway.key"
+export FERRUM_FRONTEND_TLS_CERT_PATH="/etc/ssl/certs/gateway.crt"
+export FERRUM_FRONTEND_TLS_KEY_PATH="/etc/ssl/private/gateway.key"
 
 ./ferrum-edge
 ```
@@ -70,8 +70,8 @@ export FERRUM_PROXY_TLS_KEY_PATH="/etc/ssl/private/gateway.key"
 Enable server TLS + client verification:
 
 ```bash
-export FERRUM_PROXY_TLS_CERT_PATH="/etc/ssl/certs/gateway.crt"
-export FERRUM_PROXY_TLS_KEY_PATH="/etc/ssl/private/gateway.key"
+export FERRUM_FRONTEND_TLS_CERT_PATH="/etc/ssl/certs/gateway.crt"
+export FERRUM_FRONTEND_TLS_KEY_PATH="/etc/ssl/private/gateway.key"
 export FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH="/etc/ssl/certs/client-ca-bundle.pem"
 
 ./ferrum-edge
@@ -125,8 +125,8 @@ TLS not configured - HTTPS listener disabled
 **Staging:**
 ```bash
 # Both HTTP and HTTPS for testing
-export FERRUM_PROXY_TLS_CERT_PATH="./staging.crt"
-export FERRUM_PROXY_TLS_KEY_PATH="./staging.key"
+export FERRUM_FRONTEND_TLS_CERT_PATH="./staging.crt"
+export FERRUM_FRONTEND_TLS_KEY_PATH="./staging.key"
 ./ferrum-edge
 # Access: http://localhost:8000 AND https://localhost:8443
 ```
@@ -134,8 +134,8 @@ export FERRUM_PROXY_TLS_KEY_PATH="./staging.key"
 **Production:**
 ```bash
 # HTTPS/mTLS only, block HTTP at firewall
-export FERRUM_PROXY_TLS_CERT_PATH="/prod/certs/gateway.crt"
-export FERRUM_PROXY_TLS_KEY_PATH="/prod/certs/gateway.key"
+export FERRUM_FRONTEND_TLS_CERT_PATH="/prod/certs/gateway.crt"
+export FERRUM_FRONTEND_TLS_KEY_PATH="/prod/certs/gateway.key"
 export FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH="/prod/certs/client-ca.pem"
 ./ferrum-edge
 # Access: https://localhost:8443 (mTLS required)
@@ -315,8 +315,8 @@ cp ca.crt client-ca-bundle.pem
 ### Configure Gateway
 
 ```bash
-export FERRUM_PROXY_TLS_CERT_PATH="./server.crt"
-export FERRUM_PROXY_TLS_KEY_PATH="./server.key"
+export FERRUM_FRONTEND_TLS_CERT_PATH="./server.crt"
+export FERRUM_FRONTEND_TLS_KEY_PATH="./server.key"
 export FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH="./client-ca-bundle.pem"
 
 ./ferrum-edge
@@ -338,7 +338,7 @@ curl https://localhost:8443/api/v1
 
 | Category | Environment Variables |
 |----------|---------------------|
-| **Frontend proxy** | `FERRUM_PROXY_TLS_CERT_PATH`, `FERRUM_PROXY_TLS_KEY_PATH`, `FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH` |
+| **Frontend proxy** | `FERRUM_FRONTEND_TLS_CERT_PATH`, `FERRUM_FRONTEND_TLS_KEY_PATH`, `FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH` |
 | **Admin API** | `FERRUM_ADMIN_TLS_CERT_PATH`, `FERRUM_ADMIN_TLS_KEY_PATH`, `FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH` |
 | **Backend mTLS (global)** | `FERRUM_BACKEND_TLS_CLIENT_CERT_PATH`, `FERRUM_BACKEND_TLS_CLIENT_KEY_PATH`, `FERRUM_TLS_CA_BUNDLE_PATH` |
 | **Backend mTLS (per-proxy)** | `backend_tls_client_cert_path`, `backend_tls_client_key_path`, `backend_tls_server_ca_cert_path` in proxy config |
@@ -601,7 +601,7 @@ When using load balancers:
 ### From HTTP to HTTPS
 
 1. Obtain server certificate and private key
-2. Set `FERRUM_PROXY_TLS_CERT_PATH` and `FERRUM_PROXY_TLS_KEY_PATH`
+2. Set `FERRUM_FRONTEND_TLS_CERT_PATH` and `FERRUM_FRONTEND_TLS_KEY_PATH`
 3. Update client applications to use HTTPS URLs
 4. Test thoroughly before production deployment
 

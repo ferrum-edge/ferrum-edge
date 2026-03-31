@@ -431,6 +431,8 @@ Reduce per-request allocations in plugin lookup
 | `FERRUM_PROXY_HTTP_PORT` | `8000` | Proxy HTTP listen port |
 | `FERRUM_PROXY_HTTPS_PORT` | `8443` | Proxy HTTPS listen port |
 | `FERRUM_PROXY_BIND_ADDRESS` | `0.0.0.0` | Bind address for proxy listeners. Set to `::` for dual-stack IPv4+IPv6 |
+| `FERRUM_FRONTEND_TLS_CERT_PATH` | (none) | PEM certificate the gateway presents to incoming clients (HTTPS, WebSocket, gRPC, TCP/TLS) |
+| `FERRUM_FRONTEND_TLS_KEY_PATH` | (none) | PEM private key for the gateway's frontend TLS certificate |
 | `FERRUM_ADMIN_HTTP_PORT` | `9000` | Admin API HTTP port |
 | `FERRUM_ADMIN_HTTPS_PORT` | `9443` | Admin API HTTPS port |
 | `FERRUM_ADMIN_BIND_ADDRESS` | `0.0.0.0` | Bind address for admin listeners. Set to `::` for dual-stack IPv4+IPv6 |

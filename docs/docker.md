@@ -222,8 +222,8 @@ FERRUM_LOG_LEVEL=info            # error, warn, info, debug, trace
 # Proxy listeners
 FERRUM_PROXY_HTTP_PORT=8000
 FERRUM_PROXY_HTTPS_PORT=8443
-FERRUM_PROXY_TLS_CERT_PATH=/path/to/cert.pem
-FERRUM_PROXY_TLS_KEY_PATH=/path/to/key.pem
+FERRUM_FRONTEND_TLS_CERT_PATH=/path/to/cert.pem
+FERRUM_FRONTEND_TLS_KEY_PATH=/path/to/key.pem
 
 # Admin API
 FERRUM_ADMIN_HTTP_PORT=9000
@@ -293,8 +293,8 @@ secrets:
 **Enable TLS**:
 ```bash
 docker run \
-  -e FERRUM_PROXY_TLS_CERT_PATH=/etc/ferrum/cert.pem \
-  -e FERRUM_PROXY_TLS_KEY_PATH=/etc/ferrum/key.pem \
+  -e FERRUM_FRONTEND_TLS_CERT_PATH=/etc/ferrum/cert.pem \
+  -e FERRUM_FRONTEND_TLS_KEY_PATH=/etc/ferrum/key.pem \
   -v /etc/ferrum:/etc/ferrum:ro \
   ferrum-edge:latest
 ```
