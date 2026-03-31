@@ -244,7 +244,9 @@ credentials:
 
 ### `basic_auth`
 
-Authenticates using HTTP Basic credentials with bcrypt-hashed password verification.
+Authenticates using HTTP Basic credentials. Supports two hash formats:
+- **HMAC-SHA256** (~1μs) — default when `FERRUM_BASIC_AUTH_HMAC_SECRET` is set (recommended). A default secret is provided but **must be changed in production**.
+- **bcrypt** (~100ms) — backward-compatible fallback for `$2b$`/`$2a$` hashes.
 
 **Priority:** 1300
 
@@ -254,7 +256,8 @@ Authenticates using HTTP Basic credentials with bcrypt-hashed password verificat
 ```yaml
 credentials:
   basicauth:
-    password_hash: "$2b$12$..." # bcrypt hash
+    password_hash: "hmac_sha256:ab3f..." # HMAC-SHA256 (preferred)
+    # or: "$2b$12$..."                   # bcrypt (legacy)
 ```
 
 ### `hmac_auth`

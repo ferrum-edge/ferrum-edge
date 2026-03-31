@@ -848,7 +848,12 @@ async fn handle_h3_request(
         let mut resp_builder = Response::builder().status(status);
 
         for (k, v) in &response_headers {
-            resp_builder = resp_builder.header(k.as_str(), v.as_str());
+            if let (Ok(name), Ok(val)) = (
+                hyper::header::HeaderName::from_bytes(k.as_bytes()),
+                hyper::header::HeaderValue::from_str(v),
+            ) {
+                resp_builder = resp_builder.header(name, val);
+            }
         }
 
         if !response_headers.contains_key("content-type") {
@@ -1049,7 +1054,12 @@ async fn proxy_to_backend_h3_streaming(
     let status = StatusCode::from_u16(response_status).unwrap_or(StatusCode::BAD_GATEWAY);
     let mut resp_builder = Response::builder().status(status);
     for (k, v) in &response_headers {
-        resp_builder = resp_builder.header(k.as_str(), v.as_str());
+        if let (Ok(name), Ok(val)) = (
+            hyper::header::HeaderName::from_bytes(k.as_bytes()),
+            hyper::header::HeaderValue::from_str(v),
+        ) {
+            resp_builder = resp_builder.header(name, val);
+        }
     }
     if !response_headers.contains_key("content-type") {
         resp_builder = resp_builder.header("content-type", "application/json");
@@ -1353,7 +1363,12 @@ async fn send_h3_reject_response(
         .status(status)
         .header("content-type", "application/json");
     for (k, v) in headers {
-        builder = builder.header(k.as_str(), v.as_str());
+        if let (Ok(name), Ok(val)) = (
+            hyper::header::HeaderName::from_bytes(k.as_bytes()),
+            hyper::header::HeaderValue::from_str(v),
+        ) {
+            builder = builder.header(name, val);
+        }
     }
     let resp = builder
         .body(())

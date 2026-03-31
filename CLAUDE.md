@@ -197,11 +197,14 @@ tests/
 
 ### Before Every Commit
 
-1. `cargo fmt` — format all code
-2. `cargo clippy --all-targets --all-features -- -D warnings` — zero warnings
-3. `cargo test --test unit_tests --all-features` — all unit tests pass
-4. `cargo test --test integration_tests --all-features` — integration tests pass
-5. If changing proxy behavior: `cargo build --bin ferrum-edge && cargo test --test functional_tests --all-features -- --ignored` — E2E tests pass
+1. `cargo fmt --all` — format all code
+2. `cargo fmt --all -- --check` — **verify** no formatting diffs remain (CI enforces this)
+3. `cargo clippy --all-targets --all-features -- -D warnings` — zero warnings
+4. `cargo test --test unit_tests --all-features` — all unit tests pass
+5. `cargo test --test integration_tests --all-features` — integration tests pass
+6. If changing proxy behavior: `cargo build --bin ferrum-edge && cargo test --test functional_tests --all-features -- --ignored` — E2E tests pass
+
+**All steps (1-5) must pass locally before pushing. Do not skip step 2 — `cargo fmt` can miss files that `cargo fmt --all -- --check` catches.**
 
 ### Code Quality Rules
 
@@ -391,7 +394,7 @@ Reduce per-request allocations in plugin lookup
 | `FERRUM_TLS_NO_VERIFY` | `false` | Skip outbound TLS verification for all connections (testing only) |
 | `FERRUM_TLS_CA_BUNDLE_PATH` | (none) | Path to PEM CA bundle for outbound TLS verification (internal CAs) |
 | `FERRUM_ENABLE_STREAMING_LATENCY_TRACKING` | `false` | Track streaming response total latency (adds per-stream overhead) |
-| `FERRUM_BASIC_AUTH_HMAC_SECRET` | (none) | HMAC-SHA256 server secret for basic_auth (~1μs vs ~100ms bcrypt) |
+| `FERRUM_BASIC_AUTH_HMAC_SECRET` | `ferrum-edge-change-me-in-production` | HMAC-SHA256 server secret for basic_auth (~1μs vs ~100ms bcrypt). **Must be changed in production.** |
 | `FERRUM_TRUSTED_PROXIES` | (empty) | Comma-separated CIDRs for XFF trust |
 | `FERRUM_DTLS_CERT_PATH` | (none) | PEM cert for frontend DTLS termination (ECDSA P-256 / Ed25519) |
 | `FERRUM_DTLS_KEY_PATH` | (none) | PEM key for frontend DTLS termination |

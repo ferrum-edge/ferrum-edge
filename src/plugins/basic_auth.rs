@@ -4,7 +4,7 @@ use hmac::{Hmac, Mac};
 use serde_json::Value;
 use sha2::Sha256;
 use std::collections::HashMap;
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 use crate::consumer_index::ConsumerIndex;
 
@@ -12,25 +12,41 @@ use super::{Plugin, PluginResult, RequestContext};
 
 type HmacSha256 = Hmac<Sha256>;
 
+/// Default HMAC secret used when FERRUM_BASIC_AUTH_HMAC_SECRET is not set.
+/// This enables HMAC-SHA256 mode by default for performance (~1μs vs ~100ms bcrypt)
+/// and eliminates bcrypt timing side-channels for username enumeration.
+///
+/// IMPORTANT: Operators MUST override this in production by setting
+/// FERRUM_BASIC_AUTH_HMAC_SECRET to a unique, random value. Using the default
+/// means any attacker who knows it can compute valid HMAC hashes.
+pub const DEFAULT_HMAC_SECRET: &str = "ferrum-edge-change-me-in-production";
+
 pub struct BasicAuth {
-    /// Pre-computed HMAC key from FERRUM_BASIC_AUTH_HMAC_SECRET.
-    /// When Some, password hashes prefixed with `hmac_sha256:` are verified
-    /// using HMAC-SHA256 (~1μs). Bcrypt hashes ($2b$/$2a$) are always
-    /// supported as a fallback regardless of this setting.
-    hmac_secret: Option<Vec<u8>>,
+    /// Pre-computed HMAC key from FERRUM_BASIC_AUTH_HMAC_SECRET (or default).
+    /// Password hashes prefixed with `hmac_sha256:` are verified using
+    /// HMAC-SHA256 (~1μs). Bcrypt hashes ($2b$/$2a$) are always supported
+    /// as a fallback regardless of this setting.
+    hmac_secret: Vec<u8>,
 }
 
 impl BasicAuth {
     pub fn new(_config: &Value) -> Self {
-        let hmac_secret = std::env::var("FERRUM_BASIC_AUTH_HMAC_SECRET")
+        let (hmac_secret, is_default) = match std::env::var("FERRUM_BASIC_AUTH_HMAC_SECRET")
             .ok()
             .filter(|s| !s.is_empty())
-            .map(|s| s.into_bytes());
+        {
+            Some(s) => (s.into_bytes(), false),
+            None => {
+                error!(
+                    "basic_auth: FERRUM_BASIC_AUTH_HMAC_SECRET is not set — using insecure default. \
+                     Set this to a unique, random value in production to secure HMAC-SHA256 password verification."
+                );
+                (DEFAULT_HMAC_SECRET.as_bytes().to_vec(), true)
+            }
+        };
 
-        if hmac_secret.is_none() {
-            debug!(
-                "basic_auth: HMAC-SHA256 not configured (FERRUM_BASIC_AUTH_HMAC_SECRET unset), using bcrypt only"
-            );
+        if !is_default {
+            debug!("basic_auth: HMAC-SHA256 configured with custom secret");
         }
 
         Self { hmac_secret }
@@ -39,19 +55,12 @@ impl BasicAuth {
     /// Verify a password against a stored hash.
     ///
     /// Supports two formats:
-    /// - `hmac_sha256:<hex>` — HMAC-SHA256 with server secret (~1μs, requires FERRUM_BASIC_AUTH_HMAC_SECRET)
+    /// - `hmac_sha256:<hex>` — HMAC-SHA256 with server secret (~1μs)
     /// - `$2b$...` / `$2a$...` — bcrypt (~100ms, always available, backward compatible)
     fn verify_password(&self, password: &str, stored_hash: &str) -> bool {
         if let Some(hex_hash) = stored_hash.strip_prefix("hmac_sha256:") {
             // HMAC-SHA256 verification
-            let Some(ref secret) = self.hmac_secret else {
-                warn!(
-                    "basic_auth: consumer has hmac_sha256 hash but FERRUM_BASIC_AUTH_HMAC_SECRET is not set"
-                );
-                return false;
-            };
-
-            let Ok(mut mac) = HmacSha256::new_from_slice(secret) else {
+            let Ok(mut mac) = HmacSha256::new_from_slice(&self.hmac_secret) else {
                 warn!("basic_auth: failed to create HMAC instance");
                 return false;
             };

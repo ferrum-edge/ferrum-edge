@@ -152,7 +152,7 @@ See [tcp_udp_proxy.md](tcp_udp_proxy.md) for full TCP/UDP proxy documentation.
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `FERRUM_BASIC_AUTH_HMAC_SECRET` | No | — | Server secret for HMAC-SHA256 password verification (~1μs). When set, the Admin API stores `hmac_sha256:<hex>` hashes instead of bcrypt. Existing bcrypt hashes remain valid. |
+| `FERRUM_BASIC_AUTH_HMAC_SECRET` | No | `ferrum-edge-change-me-in-production` | Server secret for HMAC-SHA256 password verification (~1μs). The Admin API stores `hmac_sha256:<hex>` hashes. Existing bcrypt hashes remain valid. **Must be changed in production** — using the default allows anyone who knows it to compute valid credential hashes. |
 | `FERRUM_TRUSTED_PROXIES` | No | — | Comma-separated trusted proxy CIDRs/IPs for client IP resolution via `X-Forwarded-For` |
 | `FERRUM_REAL_IP_HEADER` | No | — | Authoritative real-IP header name (e.g., `CF-Connecting-IP`, `X-Real-IP`) |
 

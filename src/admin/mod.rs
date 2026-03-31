@@ -299,11 +299,10 @@ pub async fn handle_admin_request(
                     });
                 }
                 Err(e) => {
+                    warn!("Health check database query failed: {}", e);
                     health_status["status"] = json!("degraded");
                     health_status["database"] = json!({
-                        "status": "disconnected",
-                        "type": db.db_type(),
-                        "error": e.to_string()
+                        "status": "disconnected"
                     });
                 }
             }
@@ -3344,24 +3343,21 @@ fn hash_consumer_secrets(consumer: &mut Consumer) -> Result<(), String> {
 
 /// Hash a plaintext password for basic_auth storage.
 ///
-/// When `FERRUM_BASIC_AUTH_HMAC_SECRET` is set, produces an `hmac_sha256:<hex>` hash
-/// (~1μs verification). Otherwise falls back to bcrypt ($2b$, ~100ms verification).
+/// Uses HMAC-SHA256 with the configured secret (or default) for ~1μs verification.
+/// Falls back to bcrypt ($2b$, ~100ms) only if HMAC instance creation fails.
 fn hash_basic_auth_password(password: &str) -> Result<String, String> {
-    if let Ok(secret) = std::env::var("FERRUM_BASIC_AUTH_HMAC_SECRET")
-        && !secret.is_empty()
-    {
-        use hmac::{Hmac, Mac};
-        use sha2::Sha256;
-        type HmacSha256 = Hmac<Sha256>;
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    type HmacSha256 = Hmac<Sha256>;
 
-        let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
-            .map_err(|e| format!("Failed to create HMAC instance: {}", e))?;
-        mac.update(password.as_bytes());
-        let hash = hex::encode(mac.finalize().into_bytes());
-        return Ok(format!("hmac_sha256:{}", hash));
-    }
+    let secret = std::env::var("FERRUM_BASIC_AUTH_HMAC_SECRET")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| crate::plugins::basic_auth::DEFAULT_HMAC_SECRET.to_string());
 
-    // Fallback to bcrypt
-    bcrypt::hash(password, bcrypt::DEFAULT_COST)
-        .map_err(|e| format!("Failed to hash password: {}", e))
+    let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
+        .map_err(|e| format!("Failed to create HMAC instance: {}", e))?;
+    mac.update(password.as_bytes());
+    let hash = hex::encode(mac.finalize().into_bytes());
+    Ok(format!("hmac_sha256:{}", hash))
 }

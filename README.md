@@ -212,6 +212,7 @@ Plugins are protocol-aware — the gateway automatically skips plugins that don'
 
 See [docs/plugins.md](docs/plugins.md) for detailed configuration of each plugin, and [docs/plugin_execution_order.md](docs/plugin_execution_order.md) for the full protocol support matrix.
 
+
 ### AI / LLM Plugins
 
 Four plugins for AI gateway use cases — cost visibility, budget enforcement, request policy, and PII protection:
@@ -302,6 +303,7 @@ Multi-protocol benchmark results (macOS Apple Silicon, 200 concurrent, 10s):
 | TCP | 108,332 | 215,646 | ~50% |
 
 See `tests/performance/` for the full benchmark suite.
+
 
 ## Troubleshooting
 
