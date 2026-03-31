@@ -274,29 +274,36 @@ impl ConnectionPool {
     /// create N separate reqwest::Client instances instead of sharing one,
     /// which destroys connection reuse and causes P95 latency regressions.
     ///
-    /// Only includes fields that affect connection *routing* — destination,
-    /// protocol, and DNS override.  Configuration-only fields like
-    /// `idle_timeout_seconds` and `max_idle_per_host` are intentionally
-    /// excluded: they control cleanup/sizing policy but don't change how
-    /// connections are created or routed.  `max_idle_per_host` is global-only
-    /// (set via `FERRUM_POOL_MAX_IDLE_PER_HOST`) so all clients sharing a
-    /// destination use the same pool ceiling, maximizing connection reuse.
+    /// Only includes fields that affect connection *identity* — destination,
+    /// protocol, DNS override, TLS trust (CA cert, verify flag), and mTLS
+    /// client credentials. Configuration-only fields like `idle_timeout_seconds`
+    /// and `max_idle_per_host` are intentionally excluded: they control
+    /// cleanup/sizing policy but don't change how connections are created or
+    /// routed. `max_idle_per_host` is global-only (set via
+    /// `FERRUM_POOL_MAX_IDLE_PER_HOST`) so all clients sharing a destination
+    /// use the same pool ceiling, maximizing connection reuse.
     ///
     /// All upstream targets in the same proxy share one pool entry because
     /// `reqwest::Client` handles per-host connection pooling internally —
     /// different target hostnames in the URL get separate TCP connections
     /// and TLS sessions (with correct SNI) automatically.
+    ///
+    /// Uses `|` as field delimiter (invalid in hostnames per RFC 952, cannot
+    /// appear in IP addresses or port numbers) to prevent key collisions
+    /// from fields containing `:` (e.g., IPv6 addresses, file paths).
     fn create_pool_key(&self, proxy: &Proxy) -> String {
-        let override_str = proxy.dns_override.as_deref().unwrap_or_default();
         // When the proxy uses an upstream for load balancing, key by upstream_id
         // instead of backend_host:port. The upstream defines the actual targets;
         // backend_host:port is ignored for routing. reqwest internally pools
         // TCP connections per URL host:port, so different targets within the
         // same upstream get separate connections automatically.
+        //
+        // Prefix with "u=" or "d=" to prevent namespace collisions (e.g., a
+        // backend_host of "upstream" with port matching an upstream_id).
         let destination = if let Some(ref upstream_id) = proxy.upstream_id {
-            format!("upstream:{}", upstream_id)
+            format!("u={}", upstream_id)
         } else {
-            format!("{}:{}", proxy.backend_host, proxy.backend_port)
+            format!("d={}:{}", proxy.backend_host, proxy.backend_port)
         };
         // Include per-proxy CA cert path — proxies with different CAs need
         // separate clients since add_root_certificate is set at build time.
@@ -304,9 +311,29 @@ impl ConnectionPool {
             .backend_tls_server_ca_cert_path
             .as_deref()
             .unwrap_or_default();
+        let override_str = proxy.dns_override.as_deref().unwrap_or_default();
+        // Include mTLS client cert path — proxies presenting different client
+        // identities need separate clients since reqwest::Identity is set at
+        // build time.
+        let mtls_cert = proxy
+            .backend_tls_client_cert_path
+            .as_deref()
+            .or(self
+                .global_mtls_config
+                .backend_tls_client_cert_path
+                .as_deref())
+            .unwrap_or_default();
+        // Include verify flag — a proxy with verification disabled must not
+        // share a client with one that requires verification.
+        let verify = proxy.backend_tls_verify_server_cert && !self.global_mtls_config.tls_no_verify;
         format!(
-            "{}:{}:{}:{}",
-            destination, proxy.backend_protocol as u8, override_str, ca_str
+            "{}|{}|{}|{}|{}|{}",
+            destination,
+            proxy.backend_protocol as u8,
+            override_str,
+            ca_str,
+            mtls_cert,
+            verify as u8,
         )
     }
 
@@ -454,6 +481,13 @@ impl ConnectionPool {
 
         // HTTP/3 requires ALPN protocol "h3"
         client_config.alpn_protocols = vec![b"h3".to_vec()];
+
+        // Optionally skip server cert verification
+        if !proxy.backend_tls_verify_server_cert || self.global_mtls_config.tls_no_verify {
+            client_config
+                .dangerous()
+                .set_certificate_verifier(Arc::new(crate::tls::NoVerifier));
+        }
 
         Arc::new(client_config)
     }

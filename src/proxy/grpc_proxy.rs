@@ -111,11 +111,28 @@ impl GrpcConnectionPool {
     /// Adding fields causes pool fragmentation and P95 latency regressions.
     /// See `ConnectionPool::create_pool_key` for detailed rationale.
     ///
+    /// Includes all fields that affect connection *identity*: destination,
+    /// TLS mode, DNS override, CA cert, mTLS client cert, and server cert verification.
+    /// Uses `|` as field delimiter to avoid ambiguity with `:` in IPv6 addresses.
+    ///
     /// Returns the base key (without shard suffix). For shard keys, the caller
     /// appends `#N` using `write!` to avoid extra allocations.
     fn pool_key(proxy: &Proxy) -> String {
         let tls = matches!(proxy.backend_protocol, BackendProtocol::Grpcs);
-        format!("{}:{}:{}", proxy.backend_host, proxy.backend_port, tls)
+        let dns = proxy.dns_override.as_deref().unwrap_or_default();
+        let ca = proxy
+            .backend_tls_server_ca_cert_path
+            .as_deref()
+            .unwrap_or_default();
+        let mtls_cert = proxy
+            .backend_tls_client_cert_path
+            .as_deref()
+            .unwrap_or_default();
+        let verify = proxy.backend_tls_verify_server_cert;
+        format!(
+            "{}|{}|{}|{}|{}|{}|{}",
+            proxy.backend_host, proxy.backend_port, tls, dns, ca, mtls_cert, verify as u8,
+        )
     }
 
     /// Build a shard key by appending the shard index to a pre-allocated buffer.
@@ -399,10 +416,27 @@ impl GrpcConnectionPool {
             roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
         };
 
-        // Add custom CA bundle if configured (unless no_verify is set)
-        if !self.global_env_config.tls_no_verify
+        // Add per-proxy CA certificate if configured (takes priority over global bundle)
+        if let Some(ref ca_path) = proxy.backend_tls_server_ca_cert_path {
+            match std::fs::read(ca_path) {
+                Ok(ca_pem) => {
+                    let mut reader = std::io::BufReader::new(&ca_pem[..]);
+                    let certs = rustls_pemfile::certs(&mut reader);
+                    for cert in certs.flatten() {
+                        if let Err(e) = root_store.add(cert) {
+                            warn!("gRPC: failed to add CA cert from {}: {}", ca_path, e);
+                        }
+                    }
+                    debug!("gRPC: loaded per-proxy CA cert from {}", ca_path);
+                }
+                Err(e) => {
+                    warn!("gRPC: failed to read CA cert from {}: {}", ca_path, e);
+                }
+            }
+        } else if !self.global_env_config.tls_no_verify
             && let Some(ca_bundle_path) = &self.global_env_config.tls_ca_bundle_path
         {
+            // Fall back to global CA bundle
             match std::fs::read(ca_bundle_path) {
                 Ok(ca_pem) => {
                     let mut reader = std::io::BufReader::new(&ca_pem[..]);

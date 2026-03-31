@@ -67,12 +67,31 @@ impl Http3ConnectionPool {
         self.entries.len()
     }
 
+    /// Pool key — includes TLS-differentiating fields (CA, mTLS, verify).
+    /// Uses `|` as delimiter to avoid ambiguity with `:` in IPv6 addresses.
     fn pool_key(proxy: &Proxy, index: usize) -> String {
-        format!("{}:{}:{}", proxy.backend_host, proxy.backend_port, index)
+        let ca = proxy
+            .backend_tls_server_ca_cert_path
+            .as_deref()
+            .unwrap_or_default();
+        let mtls_cert = proxy
+            .backend_tls_client_cert_path
+            .as_deref()
+            .unwrap_or_default();
+        let verify = proxy.backend_tls_verify_server_cert;
+        format!(
+            "{}|{}|{}|{}|{}|{}",
+            proxy.backend_host, proxy.backend_port, index, ca, mtls_cert, verify as u8,
+        )
     }
 
     fn pool_key_for_target(host: &str, port: u16, index: usize) -> String {
-        format!("{}:{}:{}", host, port, index)
+        // Target keys are used by the retry path where host:port come from
+        // upstream targets. TLS config is inherited from the proxy that
+        // originated the request, but all requests through this path share
+        // the same proxy TLS settings, so host|port|index is sufficient
+        // for uniqueness within a single retry sequence.
+        format!("{}|{}|{}", host, port, index)
     }
 
     /// Send an HTTP/3 request, reusing a cached QUIC connection if available.
@@ -98,10 +117,10 @@ impl Http3ConnectionPool {
             .pool_http3_connections_per_backend
             .unwrap_or(self.connections_per_backend)
             .max(1);
-        let index = self.conn_counter.fetch_add(1, Ordering::Relaxed) as usize % conns_per_backend;
-        let key = Self::pool_key(proxy, index);
+        let start = self.conn_counter.fetch_add(1, Ordering::Relaxed) as usize % conns_per_backend;
+        let key = Self::pool_key(proxy, start);
 
-        // Try cached connection first
+        // Try cached connection on the selected index first
         if let Some(entry) = self.entries.get(&key) {
             entry
                 .last_used_epoch_ms
@@ -115,6 +134,34 @@ impl Http3ConnectionPool {
                 Err(e) => {
                     debug!("HTTP/3 cached connection failed, reconnecting: {}", e);
                     self.entries.remove(&key);
+
+                    // Try other cached indices before creating a new connection
+                    for offset in 1..conns_per_backend {
+                        let fallback_index = (start + offset) % conns_per_backend;
+                        let fallback_key = Self::pool_key(proxy, fallback_index);
+                        if let Some(entry) = self.entries.get(&fallback_key) {
+                            entry
+                                .last_used_epoch_ms
+                                .store(now_epoch_ms(), Ordering::Relaxed);
+                            let mut fallback_sr = entry.send_request.clone();
+                            drop(entry);
+                            match Self::do_request(
+                                &mut fallback_sr,
+                                proxy,
+                                method,
+                                backend_url,
+                                headers,
+                                body.clone(),
+                            )
+                            .await
+                            {
+                                Ok(result) => return Ok(result),
+                                Err(_) => {
+                                    self.entries.remove(&fallback_key);
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -167,10 +214,10 @@ impl Http3ConnectionPool {
             .pool_http3_connections_per_backend
             .unwrap_or(self.connections_per_backend)
             .max(1);
-        let index = self.conn_counter.fetch_add(1, Ordering::Relaxed) as usize % conns_per_backend;
-        let key = Self::pool_key_for_target(target_host, target_port, index);
+        let start = self.conn_counter.fetch_add(1, Ordering::Relaxed) as usize % conns_per_backend;
+        let key = Self::pool_key_for_target(target_host, target_port, start);
 
-        // Try cached connection first
+        // Try cached connection on the selected index first
         if let Some(entry) = self.entries.get(&key) {
             entry
                 .last_used_epoch_ms
@@ -187,6 +234,35 @@ impl Http3ConnectionPool {
                         target_host, target_port, e
                     );
                     self.entries.remove(&key);
+
+                    // Try other cached indices before creating a new connection
+                    for offset in 1..conns_per_backend {
+                        let fallback_index = (start + offset) % conns_per_backend;
+                        let fallback_key =
+                            Self::pool_key_for_target(target_host, target_port, fallback_index);
+                        if let Some(entry) = self.entries.get(&fallback_key) {
+                            entry
+                                .last_used_epoch_ms
+                                .store(now_epoch_ms(), Ordering::Relaxed);
+                            let mut fallback_sr = entry.send_request.clone();
+                            drop(entry);
+                            match Self::do_request(
+                                &mut fallback_sr,
+                                proxy,
+                                method,
+                                backend_url,
+                                headers,
+                                body.clone(),
+                            )
+                            .await
+                            {
+                                Ok(result) => return Ok(result),
+                                Err(_) => {
+                                    self.entries.remove(&fallback_key);
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }

@@ -92,13 +92,37 @@ impl Http2ConnectionPool {
         self.entries.len()
     }
 
-    /// Pool key — kept minimal to avoid fragmentation.
+    /// Pool key — includes all fields that affect connection identity.
+    /// Uses `|` as delimiter to avoid ambiguity with `:` in IPv6 addresses.
     fn pool_key(proxy: &Proxy) -> String {
-        format!("{}:{}", proxy.backend_host, proxy.backend_port)
+        let dns = proxy.dns_override.as_deref().unwrap_or_default();
+        let ca = proxy
+            .backend_tls_server_ca_cert_path
+            .as_deref()
+            .unwrap_or_default();
+        let mtls_cert = proxy
+            .backend_tls_client_cert_path
+            .as_deref()
+            .unwrap_or_default();
+        let verify = proxy.backend_tls_verify_server_cert;
+        format!(
+            "{}|{}|{}|{}|{}|{}",
+            proxy.backend_host, proxy.backend_port, dns, ca, mtls_cert, verify as u8,
+        )
     }
 
-    fn shard_key(base_key: &str, shard: usize) -> String {
-        format!("{base_key}#{shard}")
+    /// Build a shard key by appending the shard index to a pre-allocated buffer.
+    /// Reuses the same buffer across calls to minimize allocations.
+    fn write_shard_key(buf: &mut String, base_key: &str, shard: usize) {
+        buf.clear();
+        buf.push_str(base_key);
+        buf.push('#');
+        if shard < 10 {
+            buf.push((b'0' + shard as u8) as char);
+        } else {
+            use std::fmt::Write;
+            let _ = write!(buf, "{shard}");
+        }
     }
 
     /// Get or create an HTTP/2 connection to the HTTPS backend.
@@ -127,6 +151,9 @@ impl Http2ConnectionPool {
             .clone();
         let start = rr.fetch_add(1, Ordering::Relaxed) % shard_count;
 
+        // Reusable buffer for shard key construction (avoids per-shard String allocation)
+        let mut key_buf = String::with_capacity(base_key.len() + 4);
+
         // Two-phase readiness check:
         //
         // Phase 1 (zero-cost): poll each shard's sender once without blocking.
@@ -139,12 +166,12 @@ impl Http2ConnectionPool {
         let mut first_live_key: Option<String> = None;
         for offset in 0..shard_count {
             let shard = (start + offset) % shard_count;
-            let key = Self::shard_key(&base_key, shard);
+            Self::write_shard_key(&mut key_buf, &base_key, shard);
 
-            if let Some(entry) = self.entries.get(&key) {
+            if let Some(entry) = self.entries.get(&key_buf) {
                 if entry.sender.is_closed() {
                     drop(entry);
-                    self.entries.remove(&key);
+                    self.entries.remove(&key_buf);
                     continue;
                 }
                 let mut sender = entry.sender.clone();
@@ -158,13 +185,13 @@ impl Http2ConnectionPool {
                     Some(Ok(())) => return Ok(sender),
                     Some(Err(_)) => {
                         // Connection error — evict and try next shard
-                        self.entries.remove(&key);
+                        self.entries.remove(&key_buf);
                         continue;
                     }
                     None => {
                         // Not ready yet — remember this shard for phase 2
                         if first_live_key.is_none() {
-                            first_live_key = Some(key);
+                            first_live_key = Some(key_buf.clone());
                         }
                     }
                 }
@@ -191,15 +218,15 @@ impl Http2ConnectionPool {
 
         // No existing shard was ready — create a new connection on the
         // originally selected shard.
-        let selected_key = Self::shard_key(&base_key, start);
+        Self::write_shard_key(&mut key_buf, &base_key, start);
         let sender = match self.create_connection(proxy, dns_cache).await {
             Ok(sender) => sender,
             Err(err) => {
                 // Connection failed — try to find any live shard as fallback
                 for offset in 1..shard_count {
                     let shard = (start + offset) % shard_count;
-                    let key = Self::shard_key(&base_key, shard);
-                    if let Some(entry) = self.entries.get(&key) {
+                    Self::write_shard_key(&mut key_buf, &base_key, shard);
+                    if let Some(entry) = self.entries.get(&key_buf) {
                         if !entry.sender.is_closed() {
                             entry
                                 .last_used_epoch_ms
@@ -207,13 +234,13 @@ impl Http2ConnectionPool {
                             return Ok(entry.sender.clone());
                         }
                         drop(entry);
-                        self.entries.remove(&key);
+                        self.entries.remove(&key_buf);
                     }
                 }
                 return Err(err);
             }
         };
-        let sender = match self.entries.entry(selected_key) {
+        let sender = match self.entries.entry(key_buf) {
             dashmap::mapref::entry::Entry::Occupied(mut occupied) => {
                 if occupied.get().sender.is_closed() {
                     occupied.insert(Http2PoolEntry {
@@ -352,10 +379,27 @@ impl Http2ConnectionPool {
             roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
         };
 
-        // Add custom CA bundle if configured (unless no_verify is set)
-        if !self.global_env_config.tls_no_verify
+        // Add per-proxy CA certificate if configured (takes priority over global bundle)
+        if let Some(ref ca_path) = proxy.backend_tls_server_ca_cert_path {
+            match std::fs::read(ca_path) {
+                Ok(ca_pem) => {
+                    let mut reader = std::io::BufReader::new(&ca_pem[..]);
+                    let certs = rustls_pemfile::certs(&mut reader);
+                    for cert in certs.flatten() {
+                        if let Err(e) = root_store.add(cert) {
+                            warn!("http2_pool: failed to add CA cert from {}: {}", ca_path, e);
+                        }
+                    }
+                    debug!("http2_pool: loaded per-proxy CA cert from {}", ca_path);
+                }
+                Err(e) => {
+                    warn!("http2_pool: failed to read CA cert from {}: {}", ca_path, e);
+                }
+            }
+        } else if !self.global_env_config.tls_no_verify
             && let Some(ca_bundle_path) = &self.global_env_config.tls_ca_bundle_path
         {
+            // Fall back to global CA bundle
             match std::fs::read(ca_bundle_path) {
                 Ok(ca_pem) => {
                     let mut reader = std::io::BufReader::new(&ca_pem[..]);
