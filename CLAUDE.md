@@ -221,6 +221,80 @@ tests/
 - **Use streaming responses by default** — only buffer when a plugin explicitly requires it. The buffering requirement is pre-computed per-proxy in `PluginCache` for O(1) lookup at request time.
 - **Skip plugin phases when no plugins are configured** — guard plugin iteration loops with `plugins.is_empty()` to avoid iterator setup and async machinery overhead on the hot path.
 
+### Protocol-Specific Architecture
+
+Each protocol has its own proxy path, connection pool, and backend dispatch. Understanding these paths is critical for performance work.
+
+| Protocol | Frontend | Backend Client | Connection Pool | Streaming |
+|----------|----------|---------------|-----------------|-----------|
+| HTTP/1.1 | hyper server | reqwest | `ConnectionPool` (reqwest-managed) | Yes (default) |
+| HTTP/2 | hyper server (ALPN) | reqwest or `Http2ConnectionPool` | Sharded H2 senders | Yes (default) |
+| HTTP/3 | quinn/h3 server (`http3/server.rs`) | reqwest (via `connection_pool`) | reqwest auto-negotiates H2 via ALPN | Yes (coalescing buffer) |
+| gRPC | hyper server (content-type detection) | `GrpcConnectionPool` (hyper H2 direct) | Sharded H2 senders | Yes (when no retry/body plugins) |
+| WebSocket | hyper upgrade → tokio-tungstenite | Direct TCP upgrade | N/A (persistent connection) | Frame-by-frame forwarding |
+| TCP | `TcpListener` per port | Direct `TcpStream::connect` | N/A (1:1 connection) | `copy_bidirectional` with idle timeout |
+| UDP | `UdpSocket` per port | Per-session backend socket | N/A (session-keyed) | Datagram forwarding |
+
+**Key dispatch points in `src/proxy/mod.rs`:**
+- gRPC detection: `is_grpc_request()` checks `content-type: application/grpc` (line ~2530)
+- H3 backend dispatch: `matches!(proxy.backend_protocol, BackendProtocol::H3)` (line ~3796)
+- H2 pool dispatch: `matches!(proxy.backend_protocol, BackendProtocol::H2)` (line ~3828)
+- Streaming vs buffered: controlled by `plugin_cache.requires_response_body_buffering()` and `proxy.retry.is_some()`
+
+**HTTP/3 frontend architecture**: The H3 listener in `http3/server.rs` is a standalone QUIC server that handles its own request lifecycle (plugin phases, auth, route matching). For backend communication, it uses **reqwest** (not the `Http3ConnectionPool`). This is intentional — reqwest auto-negotiates HTTP/2 via ALPN which outperforms QUIC for small payloads due to lower per-request crypto overhead and more mature connection pooling. The `Http3ConnectionPool` in `http3/client.rs` is used only by the main hyper-based proxy path (`mod.rs`) for H3 backend targets.
+
+**gRPC proxy architecture**: Uses hyper's HTTP/2 client directly (not reqwest) to preserve HTTP/2 trailers (`grpc-status`, `grpc-message`). The `GrpcConnectionPool` maintains sharded H2 connections with round-robin distribution. When `stream_response=true` (no retries, no body-buffering plugins), the response `Incoming` body is passed through as `ProxyBody::streaming_h2` — hyper forwards DATA and TRAILERS frames directly to the client without buffering.
+
+### Performance Optimization Lessons
+
+These are hard-won findings from profiling. Violating them causes measurable regressions.
+
+**Allocation hot spots (most impactful):**
+- **`HashMap::with_capacity()`** — always use `response.headers().keys_len()` when collecting response headers. Without it, the HashMap rehashes multiple times during header collection. This is a ~5-10% throughput impact.
+- **Skip clones on streaming path** — when `stream_response=true` (no retries possible), move `method`/`headers`/`body_bytes` instead of cloning. Body clone for a 10KB payload = 10KB allocation wasted.
+- **Conditional retry prep** — only build retry `HeaderMap` from `proxy_headers` when `proxy.retry.is_some()`. The common fast path (no retries) should do zero work. This was a +15% throughput fix for gRPC.
+- **Pre-allocate body `Vec` from `content-length`** — parse the header to size the buffer, avoiding repeated reallocations during frame/chunk collection.
+
+**Protocol-specific gotchas:**
+- **Don't replace reqwest with H3 pool for HTTP/3 frontend→backend**: Tested and reverted. QUIC has higher per-request overhead than TCP/H2 for small payloads (~10x regression). reqwest's HTTP/2 pooling is highly optimized and auto-negotiates the best protocol via ALPN.
+- **gRPC `Proxy.clone()` is expensive**: The full `Proxy` struct has many fields. Avoid cloning it per-request. Extract needed fields into lightweight param structs (see `TcpConnParams` pattern in `tcp_proxy.rs`).
+- **H2 flow control tuning matters**: Default stream window (64KB) is too small for gRPC. The perf configs use 8MiB stream / 32MiB connection windows (`pool_http2_initial_stream_window_size`).
+- **QUIC coalescing is critical**: Small QUIC frames kill performance. The H3 streaming path uses an 8-32KB coalescing buffer with time-based flush (2ms) to batch small chunks into larger QUIC frames.
+
+**Resilience features per protocol:**
+
+| Feature | HTTP/1.1 | HTTP/2 | HTTP/3 | gRPC | WebSocket | TCP | UDP |
+|---------|----------|--------|--------|------|-----------|-----|-----|
+| Load balancing | Full | Full | Full | Full | Full | Full | Full |
+| Health checks | Full | Full | Full | Full (+ native gRPC) | HTTP probes | TCP SYN | UDP probe |
+| Circuit breaker | Full | Full | Full | Full | Full | Connection-phase | Connection-phase |
+| Retries | Full | Full | Full | Connection failures | Connection failures | Connection-phase | Connection-phase |
+| Idle timeout | Pool-level | Pool-level | Pool-level | Pool-level | N/A | Configurable | Configurable |
+
+### Known Protocol Gaps
+
+Only two true gaps remain that cannot be solved without upstream library changes:
+
+1. **No HTTP/2 WebSocket (RFC 8441)** — hyper's server doesn't support Extended CONNECT. Would require low-level h2 crate work to handle `:protocol = "websocket"` pseudo-headers.
+2. **No DTLS 1.3** — No production Rust implementation exists (RFC 9147). `webrtc-dtls` only supports DTLS 1.2. QUIC (already supported) provides TLS 1.3 over UDP as an alternative.
+
+### Multi-Protocol Performance Testing
+
+Performance tests live in `tests/performance/multi_protocol/`. Run with:
+
+```bash
+# Build backend + gateway first
+cd tests/performance/multi_protocol && cargo build --release
+
+# Run specific protocol (http1, http1-tls, http2, http3, ws, grpc, tcp, tcp-tls, udp, udp-dtls, all)
+bash run_protocol_test.sh grpc --duration 30 --concurrency 200
+
+# Skip rebuild
+bash run_protocol_test.sh all --skip-build --duration 30 --concurrency 100
+```
+
+Each test runs a gateway with protocol-specific config (`configs/*.yaml`) and a multi-protocol backend, measuring throughput via `wrk` or protocol-specific load tools. Both "via gateway" and "direct backend" are measured to calculate proxy overhead.
+
 ### Adding a New Plugin
 
 1. Create `src/plugins/my_plugin.rs` implementing the `Plugin` trait

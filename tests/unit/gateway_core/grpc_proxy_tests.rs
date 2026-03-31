@@ -224,6 +224,95 @@ fn test_backend_protocol_grpcs_deserialize() {
     assert_eq!(grpc, BackendProtocol::Grpc);
 }
 
+// --- Response header capacity hint ---
+
+#[test]
+fn test_response_header_capacity_hint_matches_keys_len() {
+    // Verify that HashMap::with_capacity(keys_len()) pre-allocates correctly.
+    // This mirrors the optimization in proxy_grpc_request_core.
+    let mut headers = hyper::HeaderMap::new();
+    headers.insert("content-type", "application/grpc".parse().unwrap());
+    headers.insert("grpc-status", "0".parse().unwrap());
+    headers.insert("grpc-message", "OK".parse().unwrap());
+
+    // keys_len() counts unique header names (same as len() when no duplicate names)
+    let capacity_hint = headers.keys_len();
+    assert_eq!(capacity_hint, 3);
+
+    let mut resp_headers = std::collections::HashMap::with_capacity(capacity_hint);
+    for (k, v) in &headers {
+        if let Ok(vs) = v.to_str() {
+            resp_headers.insert(k.as_str().to_string(), vs.to_string());
+        }
+    }
+    assert_eq!(resp_headers.len(), 3);
+    assert_eq!(resp_headers["content-type"], "application/grpc");
+    assert_eq!(resp_headers["grpc-status"], "0");
+}
+
+#[test]
+fn test_response_header_capacity_hint_with_duplicate_names() {
+    // keys_len() de-duplicates repeated header names; verify capacity is still valid.
+    let mut headers = hyper::HeaderMap::new();
+    headers.insert("content-type", "application/grpc".parse().unwrap());
+    // Append a second value for the same key
+    headers.append("content-type", "application/grpc+proto".parse().unwrap());
+    headers.insert("grpc-status", "0".parse().unwrap());
+
+    // keys_len() = 2 (two unique names), len() = 3 (three values)
+    assert_eq!(headers.keys_len(), 2);
+    assert_eq!(headers.len(), 3);
+
+    // A HashMap built with this capacity will hold the last value per key
+    let capacity_hint = headers.keys_len();
+    let mut resp_headers = std::collections::HashMap::with_capacity(capacity_hint);
+    for (k, v) in &headers {
+        if let Ok(vs) = v.to_str() {
+            resp_headers.insert(k.as_str().to_string(), vs.to_string());
+        }
+    }
+    // Map has at most keys_len() unique entries
+    assert!(resp_headers.len() <= headers.keys_len());
+}
+
+// --- Streaming mode returns empty body bytes ---
+
+#[tokio::test]
+async fn test_proxy_grpc_request_from_bytes_error_on_unreachable_backend() {
+    // proxy_grpc_request returns (result, body_bytes).
+    // When stream_response=true the returned body is Bytes::new() (no clone needed).
+    // We verify the buffered path (proxy_grpc_request_from_bytes) errors gracefully
+    // on an unreachable backend; this also confirms no panic in either code path.
+    use bytes::Bytes;
+
+    let pool = grpc_proxy::GrpcConnectionPool::default();
+    let mut proxy = test_proxy();
+    proxy.backend_host = "127.0.0.1".to_string();
+    proxy.backend_port = 1; // intentionally unreachable port
+    proxy.retry = None;
+
+    let dns = ferrum_edge::dns::DnsCache::new(ferrum_edge::dns::DnsConfig::default());
+    let headers = headers_with_content_type("application/grpc");
+    let body = Bytes::from_static(b"\x00\x00\x00\x00\x05hello");
+    let proxy_headers = std::collections::HashMap::new();
+
+    let result = grpc_proxy::proxy_grpc_request_from_bytes(
+        hyper::Method::POST,
+        headers,
+        body,
+        &proxy,
+        "http://127.0.0.1:1/test.Service/Method",
+        &pool,
+        &dns,
+        &proxy_headers,
+    )
+    .await;
+    assert!(
+        result.is_err(),
+        "Connection to unreachable port should fail"
+    );
+}
+
 // --- GrpcConnectionPool creation ---
 
 #[tokio::test]

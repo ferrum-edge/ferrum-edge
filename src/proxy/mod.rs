@@ -2575,9 +2575,9 @@ pub async fn handle_proxy_request(
         )
         .await;
 
-        // Retain request parts for retry
+        // Only build retry parts when retries are configured
         let grpc_method = hyper::Method::POST; // gRPC always uses POST
-        let grpc_req_headers: hyper::HeaderMap = {
+        let grpc_req_headers: hyper::HeaderMap = if proxy.retry.is_some() {
             let mut hm = hyper::HeaderMap::new();
             for (k, v) in proxy_headers {
                 if let (Ok(name), Ok(val)) = (
@@ -2588,6 +2588,8 @@ pub async fn handle_proxy_request(
                 }
             }
             hm
+        } else {
+            hyper::HeaderMap::new()
         };
 
         // gRPC retry loop — retries on connection failures
