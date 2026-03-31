@@ -192,7 +192,7 @@ impl WsRateLimiting {
 
         // INCR + EXPIRE with 2s TTL (current + previous window)
         match redis.incr_with_expire(&key, 2).await {
-            Ok(count) => Some(count <= self.frames_per_second as i64),
+            Ok(count) => Some(count <= self.burst_size as i64),
             Err(()) => None,
         }
     }

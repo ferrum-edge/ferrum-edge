@@ -40,10 +40,10 @@
 //! periodically pings Redis to detect recovery.
 
 use crate::dns::DnsCache;
+use arc_swap::ArcSwap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
-use tokio::sync::RwLock;
 use tracing::{info, warn};
 
 /// Configuration parsed from a plugin's JSON config for Redis connectivity.
@@ -142,6 +142,10 @@ impl RedisConfig {
             .rsplit_once('@')
             .map(|(_, rest)| rest)
             .unwrap_or(after_scheme);
+        // IPv6 bracket notation (e.g., [::1]:6379) — always an IP, return None
+        if after_auth.starts_with('[') {
+            return None;
+        }
         // Extract host (before : or / or end of string)
         let host = after_auth
             .split_once(':')
@@ -178,7 +182,12 @@ impl RedisConfig {
         }
 
         if let Some(hostname) = self.hostname() {
-            url.replacen(&hostname, &resolved_ip.to_string(), 1)
+            // IPv6 resolved addresses need bracket notation in URLs
+            let ip_str = match resolved_ip {
+                std::net::IpAddr::V6(v6) => format!("[{v6}]"),
+                std::net::IpAddr::V4(v4) => v4.to_string(),
+            };
+            url.replacen(&hostname, &ip_str, 1)
         } else {
             url
         }
@@ -196,9 +205,11 @@ impl RedisConfig {
 /// so the next attempt re-resolves DNS (handling IP changes gracefully).
 pub struct RedisRateLimitClient {
     /// The Redis connection manager (auto-reconnecting, multiplexed).
-    /// Using RwLock instead of OnceCell so we can clear and re-create the
-    /// connection when DNS changes or after failures.
-    connection: RwLock<Option<redis::aio::ConnectionManager>>,
+    /// Uses ArcSwap for lock-free reads on the hot path. The connect_mutex
+    /// serializes connection establishment on the slow path only.
+    connection: ArcSwap<Option<redis::aio::ConnectionManager>>,
+    /// Mutex for serializing connection establishment (slow path only).
+    connect_mutex: tokio::sync::Mutex<()>,
     /// Configuration for connecting to Redis.
     config: RedisConfig,
     /// The gateway's shared DNS cache for resolving Redis hostnames.
@@ -249,7 +260,8 @@ impl RedisRateLimitClient {
         };
 
         Self {
-            connection: RwLock::new(None),
+            connection: ArcSwap::from_pointee(None),
+            connect_mutex: tokio::sync::Mutex::new(()),
             config,
             dns_cache,
             available: Arc::new(AtomicBool::new(false)),
@@ -323,22 +335,26 @@ impl RedisRateLimitClient {
     }
 
     /// Get or create the Redis connection, establishing it lazily.
+    ///
+    /// Fast path (hot): lock-free `ArcSwap::load()` — O(1) atomic load.
+    /// Slow path (cold): `Mutex`-guarded connection establishment with double-check.
     async fn get_connection(&self) -> Option<redis::aio::ConnectionManager> {
-        // Fast path: connection already exists
-        {
-            let guard = self.connection.read().await;
-            if let Some(ref conn) = *guard {
-                return Some(conn.clone());
-            }
-        }
-
-        // Slow path: create a new connection
-        let mut guard = self.connection.write().await;
-
-        // Double-check after acquiring write lock
-        if let Some(ref conn) = *guard {
+        // Fast path: lock-free read via ArcSwap
+        let guard = self.connection.load();
+        if let Some(ref conn) = **guard {
             return Some(conn.clone());
         }
+        drop(guard);
+
+        // Slow path: serialize connection establishment
+        let _lock = self.connect_mutex.lock().await;
+
+        // Double-check after acquiring mutex
+        let guard = self.connection.load();
+        if let Some(ref conn) = **guard {
+            return Some(conn.clone());
+        }
+        drop(guard);
 
         let url = self.resolve_url().await;
         let client = match self.build_client(&url) {
@@ -363,7 +379,7 @@ impl RedisRateLimitClient {
                     "Redis rate limiting connected"
                 );
                 self.start_health_checker_if_needed();
-                *guard = Some(manager.clone());
+                self.connection.store(Arc::new(Some(manager.clone())));
                 Some(manager)
             }
             Err(e) => {
@@ -380,15 +396,14 @@ impl RedisRateLimitClient {
 
     /// Clear the cached connection so the next `get_connection()` call
     /// re-resolves DNS and creates a fresh connection.
-    async fn clear_connection(&self) {
-        let mut guard = self.connection.write().await;
-        *guard = None;
+    fn clear_connection(&self) {
+        self.connection.store(Arc::new(None));
     }
 
     /// Mark Redis as unavailable and clear the connection for re-resolution.
-    async fn mark_unavailable(&self) {
+    fn mark_unavailable(&self) {
         self.available.store(false, Ordering::Relaxed);
-        self.clear_connection().await;
+        self.clear_connection();
     }
 
     /// Start a background task that periodically pings Redis to detect recovery.
@@ -501,7 +516,7 @@ impl RedisRateLimitClient {
                     error = %e,
                     "Redis INCR+EXPIRE failed — falling back to local rate limiting"
                 );
-                self.mark_unavailable().await;
+                self.mark_unavailable();
                 Err(())
             }
         }
@@ -543,31 +558,38 @@ impl RedisRateLimitClient {
                     error = %e,
                     "Redis INCRBY+EXPIRE failed — falling back to local rate limiting"
                 );
-                self.mark_unavailable().await;
+                self.mark_unavailable();
                 Err(())
             }
         }
     }
 
-    /// Get the current value of a counter. Returns 0 if the key doesn't exist.
-    pub async fn get_counter(&self, key: &str) -> Result<i64, ()> {
+    /// Get two counters in a single pipelined round-trip. Returns (0, 0) for missing keys.
+    ///
+    /// Used by the AI token rate limiter to fetch both the previous and current
+    /// window counters without two separate round-trips.
+    pub async fn get_two_counters(&self, key1: &str, key2: &str) -> Result<(i64, i64), ()> {
         let mut conn = self.get_connection().await.ok_or(())?;
 
-        let result: Result<Option<i64>, redis::RedisError> =
-            redis::cmd("GET").arg(key).query_async(&mut conn).await;
+        let result: Result<(Option<i64>, Option<i64>), redis::RedisError> = redis::pipe()
+            .cmd("GET")
+            .arg(key1)
+            .cmd("GET")
+            .arg(key2)
+            .query_async(&mut conn)
+            .await;
 
         match result {
-            Ok(val) => {
+            Ok((v1, v2)) => {
                 self.available.store(true, Ordering::Relaxed);
-                Ok(val.unwrap_or(0))
+                Ok((v1.unwrap_or(0), v2.unwrap_or(0)))
             }
             Err(e) => {
                 warn!(
-                    key = %key,
                     error = %e,
-                    "Redis GET failed — falling back to local rate limiting"
+                    "Redis GET+GET pipeline failed — falling back to local rate limiting"
                 );
-                self.mark_unavailable().await;
+                self.mark_unavailable();
                 Err(())
             }
         }
@@ -620,7 +642,7 @@ impl RedisRateLimitClient {
                     error = %e,
                     "Redis sliding window check failed — falling back to local rate limiting"
                 );
-                self.mark_unavailable().await;
+                self.mark_unavailable();
                 Err(())
             }
         }

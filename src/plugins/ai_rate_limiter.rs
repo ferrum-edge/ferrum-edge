@@ -179,12 +179,8 @@ impl AiRateLimiter {
         let curr_key = redis.make_key(&[key, &curr_idx.to_string()]);
         let prev_key = redis.make_key(&[key, &prev_idx.to_string()]);
 
-        // GET both current and previous window totals
-        let prev_count = match redis.get_counter(&prev_key).await {
-            Ok(v) => v,
-            Err(()) => return None,
-        };
-        let curr_count = match redis.get_counter(&curr_key).await {
+        // Pipeline both GETs in a single round-trip
+        let (prev_count, curr_count) = match redis.get_two_counters(&prev_key, &curr_key).await {
             Ok(v) => v,
             Err(()) => return None,
         };
