@@ -44,6 +44,9 @@ pub struct AdminState {
     pub cached_config: Option<Arc<ArcSwap<GatewayConfig>>>,
     pub mode: String,
     pub read_only: bool,
+    /// Startup readiness flag flipped by the mode once listeners are bound and
+    /// the gateway has finished its initial loading work.
+    pub startup_ready: Option<Arc<AtomicBool>>,
     /// Dynamic flag set by the DB polling loop. When `false`, write operations
     /// are rejected early to preserve the cached config until the DB recovers.
     pub db_available: Option<Arc<AtomicBool>>,
@@ -316,6 +319,12 @@ pub async fn handle_admin_request(
             health_status["status"] = json!("degraded");
         }
 
+        let startup_ready = state
+            .startup_ready
+            .as_ref()
+            .is_none_or(|flag| flag.load(Ordering::Relaxed));
+        health_status["ready"] = json!(startup_ready);
+
         // Report cached config availability for resilience visibility
         if let Some(config) = state.cached_gateway_config() {
             health_status["cached_config"] = json!({
@@ -328,6 +337,14 @@ pub async fn handle_admin_request(
             health_status["cached_config"] = json!({
                 "available": false
             });
+        }
+
+        if !startup_ready {
+            health_status["status"] = json!("starting");
+            return Ok(json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &health_status,
+            ));
         }
 
         return Ok(json_response(StatusCode::OK, &health_status));

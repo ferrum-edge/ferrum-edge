@@ -28,6 +28,7 @@ mod retry;
 mod router_cache;
 mod secrets;
 mod service_discovery;
+mod startup;
 mod tls;
 
 use config::{EnvConfig, OperatingMode};

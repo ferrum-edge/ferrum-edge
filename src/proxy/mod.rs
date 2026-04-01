@@ -1886,6 +1886,7 @@ async fn run_websocket_proxy(
 }
 
 /// Start the proxy HTTP listener with dual-path handling.
+#[allow(dead_code)] // Used by library consumers and tests; binary startup uses the signaled variant.
 pub async fn start_proxy_listener(
     addr: SocketAddr,
     state: ProxyState,
@@ -1895,11 +1896,23 @@ pub async fn start_proxy_listener(
 }
 
 /// Start the proxy listener with optional TLS and client certificate verification.
+#[allow(dead_code)] // Used by library consumers and tests; binary startup uses the signaled variant.
 pub async fn start_proxy_listener_with_tls(
     addr: SocketAddr,
     state: ProxyState,
     shutdown: tokio::sync::watch::Receiver<bool>,
     tls_config: Option<Arc<rustls::ServerConfig>>,
+) -> Result<(), anyhow::Error> {
+    start_proxy_listener_with_tls_and_signal(addr, state, shutdown, tls_config, None).await
+}
+
+/// Start the proxy listener with an optional startup signal sent after bind.
+pub async fn start_proxy_listener_with_tls_and_signal(
+    addr: SocketAddr,
+    state: ProxyState,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+    tls_config: Option<Arc<rustls::ServerConfig>>,
+    started_tx: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<(), anyhow::Error> {
     // Use socket2 for fine-grained socket options before binding.
     let socket = socket2::Socket::new(
@@ -1930,6 +1943,9 @@ pub async fn start_proxy_listener_with_tls(
 
     let listener = TcpListener::from_std(socket.into())?;
     info!("Proxy listener started on {} (backlog={})", addr, backlog);
+    if let Some(started_tx) = started_tx {
+        let _ = started_tx.send(());
+    }
 
     // Optional connection limit. When max_connections > 0, a semaphore bounds
     // the number of concurrent connections to prevent resource exhaustion

@@ -50,6 +50,7 @@ fn create_test_admin_state(config: &TestConfig, read_only: bool) -> AdminState {
         proxy_state: None,
         mode: "test".to_string(),
         read_only,
+        startup_ready: None,
         db_available: None,
         admin_restore_max_body_size_mib: 100,
     }
@@ -166,6 +167,7 @@ async fn test_admin_state_mode_field() {
         proxy_state: None,
         mode: "production".to_string(),
         read_only: false,
+        startup_ready: None,
         db_available: None,
         admin_restore_max_body_size_mib: 100,
     };
@@ -194,6 +196,7 @@ async fn test_check_write_allowed_permits_when_db_available() {
         proxy_state: None,
         mode: "database".to_string(),
         read_only: false,
+        startup_ready: None,
         db_available: Some(db_flag),
         admin_restore_max_body_size_mib: 100,
     };
@@ -214,6 +217,7 @@ async fn test_check_write_allowed_blocks_when_db_unavailable() {
         proxy_state: None,
         mode: "database".to_string(),
         read_only: false,
+        startup_ready: None,
         db_available: Some(db_flag),
         admin_restore_max_body_size_mib: 100,
     };
@@ -240,6 +244,7 @@ async fn test_check_write_allowed_blocks_when_read_only() {
         proxy_state: None,
         mode: "database".to_string(),
         read_only: true,
+        startup_ready: None,
         db_available: Some(db_flag),
         admin_restore_max_body_size_mib: 100,
     };
@@ -265,6 +270,7 @@ async fn test_check_write_allowed_permits_when_no_db_flag() {
         proxy_state: None,
         mode: "file".to_string(),
         read_only: false,
+        startup_ready: None,
         db_available: None,
         admin_restore_max_body_size_mib: 100,
     };
@@ -285,6 +291,7 @@ async fn test_db_available_flag_transitions() {
         proxy_state: None,
         mode: "database".to_string(),
         read_only: false,
+        startup_ready: None,
         db_available: Some(db_flag.clone()),
         admin_restore_max_body_size_mib: 100,
     };

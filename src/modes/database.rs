@@ -29,6 +29,7 @@ use crate::config::config_backup::load_config_backup;
 use crate::config::db_loader::{DatabaseStore, DbPoolConfig};
 use crate::dns::{DnsCache, DnsConfig};
 use crate::proxy::{self, ProxyState};
+use crate::startup::wait_for_start_signals;
 use crate::tls::{self, TlsPolicy};
 
 pub async fn run(
@@ -245,43 +246,46 @@ pub async fn run(
             );
     }
 
-    // Re-reconcile to start any deferred frontend_tls / frontend DTLS listeners
-    if tls_config.is_some()
-        || (env_config.dtls_cert_path.is_some() && env_config.dtls_key_path.is_some())
-    {
-        let slm = proxy_state.stream_listener_manager.clone();
-        tokio::spawn(async move {
-            slm.reconcile().await;
-        });
-    }
-
     // Start separate listeners for HTTP and HTTPS
     let mut handles = Vec::new();
+    let mut startup_signals = Vec::new();
 
     // HTTP listener (always enabled)
     let http_addr: SocketAddr = env_config.proxy_socket_addr(env_config.proxy_http_port);
     let http_state = proxy_state.clone();
     let http_shutdown = shutdown_tx.subscribe();
+    let (http_started_tx, http_started_rx) = tokio::sync::oneshot::channel();
     let http_handle = tokio::spawn(async move {
         info!("Starting HTTP proxy listener on {}", http_addr);
-        if let Err(e) = proxy::start_proxy_listener(http_addr, http_state, http_shutdown).await {
+        if let Err(e) = proxy::start_proxy_listener_with_tls_and_signal(
+            http_addr,
+            http_state,
+            http_shutdown,
+            None,
+            Some(http_started_tx),
+        )
+        .await
+        {
             error!("HTTP proxy listener error: {}", e);
         }
     });
     handles.push(http_handle);
+    startup_signals.push(("HTTP proxy listener".to_string(), http_started_rx));
 
     // HTTPS listener (only if TLS is configured)
     if let Some(tls_config) = tls_config.clone() {
         let https_addr: SocketAddr = env_config.proxy_socket_addr(env_config.proxy_https_port);
         let https_state = proxy_state.clone();
         let https_shutdown = shutdown_tx.subscribe();
+        let (https_started_tx, https_started_rx) = tokio::sync::oneshot::channel();
         let https_handle = tokio::spawn(async move {
             info!("Starting HTTPS proxy listener on {}", https_addr);
-            if let Err(e) = proxy::start_proxy_listener_with_tls(
+            if let Err(e) = proxy::start_proxy_listener_with_tls_and_signal(
                 https_addr,
                 https_state,
                 https_shutdown,
                 Some(tls_config),
+                Some(https_started_tx),
             )
             .await
             {
@@ -289,6 +293,7 @@ pub async fn run(
             }
         });
         handles.push(https_handle);
+        startup_signals.push(("HTTPS proxy listener".to_string(), https_started_rx));
     } else {
         info!("TLS not configured - HTTPS listener disabled");
     }
@@ -302,16 +307,20 @@ pub async fn run(
             let h3_config = crate::http3::config::Http3ServerConfig::from_env_config(&env_config);
             let h3_tls_policy = tls_policy.clone();
             let h3_client_ca = env_config.frontend_tls_client_ca_bundle_path.clone();
+            let (h3_started_tx, h3_started_rx) = tokio::sync::oneshot::channel();
             let h3_handle = tokio::spawn(async move {
                 info!("Starting HTTP/3 (QUIC) proxy listener on {}", h3_addr);
-                if let Err(e) = crate::http3::server::start_http3_listener(
+                if let Err(e) = crate::http3::server::start_http3_listener_with_signal(
                     h3_addr,
                     h3_state,
                     h3_shutdown,
                     tls_config,
                     h3_config,
                     &h3_tls_policy,
-                    h3_client_ca,
+                    crate::http3::server::Http3ListenerOptions {
+                        client_ca_bundle_path: h3_client_ca,
+                        started_tx: Some(h3_started_tx),
+                    },
                 )
                 .await
                 {
@@ -319,6 +328,7 @@ pub async fn run(
                 }
             });
             handles.push(h3_handle);
+            startup_signals.push(("HTTP/3 proxy listener".to_string(), h3_started_rx));
         } else {
             error!("HTTP/3 requires TLS configuration - HTTP/3 listener disabled");
         }
@@ -332,6 +342,7 @@ pub async fn run(
     // Shared flag: DB polling loop sets this to false when the database is
     // unreachable, causing the admin API to reject writes early and preserve
     // the cached config until the DB recovers.
+    let startup_ready = Arc::new(AtomicBool::new(false));
     let db_available = Arc::new(AtomicBool::new(true));
 
     let admin_state = AdminState {
@@ -341,6 +352,7 @@ pub async fn run(
         proxy_state: Some(proxy_state.clone()),
         mode: "database".into(),
         read_only: env_config.admin_read_only,
+        startup_ready: Some(startup_ready.clone()),
         db_available: Some(db_available.clone()),
         admin_restore_max_body_size_mib: env_config.admin_restore_max_body_size_mib,
     };
@@ -372,6 +384,7 @@ pub async fn run(
             proxy_state: Some(proxy_state.clone()),
             mode: "database".into(),
             read_only: env_config.admin_read_only,
+            startup_ready: Some(startup_ready.clone()),
             db_available: Some(db_available.clone()),
             admin_restore_max_body_size_mib: env_config.admin_restore_max_body_size_mib,
         };
@@ -425,6 +438,15 @@ pub async fn run(
     } else {
         info!("Admin TLS not configured - HTTPS listener disabled");
     }
+
+    proxy_state.stream_listener_manager.reconcile().await;
+    wait_for_start_signals(startup_signals, Duration::from_secs(10)).await?;
+    proxy_state
+        .stream_listener_manager
+        .wait_until_started(Duration::from_secs(10))
+        .await?;
+    startup_ready.store(true, Ordering::Relaxed);
+    info!("Gateway startup complete; /health now reports ready");
 
     // Database polling loop (with shutdown) — uses incremental polling
     // to avoid full table scans on every cycle.

@@ -30,6 +30,7 @@ pub mod retry;
 pub mod router_cache;
 pub mod secrets;
 pub mod service_discovery;
+pub mod startup;
 pub mod tls;
 
 pub use config::types::{AuthMode, BackendProtocol, GatewayConfig, Proxy};

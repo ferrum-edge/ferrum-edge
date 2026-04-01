@@ -29,11 +29,19 @@ use crate::plugins::{Plugin, PluginResult, ProxyProtocol, RequestContext, Transa
 use crate::proxy::ProxyState;
 use crate::tls::TlsPolicy;
 
+/// Optional HTTP/3 listener settings that don't affect the core bind contract.
+#[derive(Default)]
+pub struct Http3ListenerOptions {
+    pub client_ca_bundle_path: Option<String>,
+    pub started_tx: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
 /// Start the HTTP/3 (QUIC) proxy listener.
 ///
 /// HTTP/3 (QUIC) mandates TLS 1.3. If the provided TLS policy does not include
 /// TLS 1.3, this function will override it to force TLS 1.3 for the QUIC listener
 /// and log a warning.
+#[allow(dead_code)] // Used by library consumers and tests; binary startup uses the signaled variant.
 pub async fn start_http3_listener(
     addr: SocketAddr,
     state: ProxyState,
@@ -43,6 +51,36 @@ pub async fn start_http3_listener(
     tls_policy: &TlsPolicy,
     client_ca_bundle_path: Option<String>,
 ) -> Result<(), anyhow::Error> {
+    start_http3_listener_with_signal(
+        addr,
+        state,
+        shutdown,
+        tls_config,
+        h3_config,
+        tls_policy,
+        Http3ListenerOptions {
+            client_ca_bundle_path,
+            started_tx: None,
+        },
+    )
+    .await
+}
+
+/// Start the HTTP/3 listener and optionally emit a startup signal after bind.
+pub async fn start_http3_listener_with_signal(
+    addr: SocketAddr,
+    state: ProxyState,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+    tls_config: Arc<rustls::ServerConfig>,
+    h3_config: Http3ServerConfig,
+    tls_policy: &TlsPolicy,
+    options: Http3ListenerOptions,
+) -> Result<(), anyhow::Error> {
+    let Http3ListenerOptions {
+        client_ca_bundle_path,
+        started_tx,
+    } = options;
+
     // HTTP/3 (QUIC) requires TLS 1.3 — rebuild the server config with TLS 1.3 forced.
     // Filter cipher suites to TLS 1.3 only and force TLS 1.3 protocol version.
     let has_tls13 = tls_policy
@@ -163,6 +201,9 @@ pub async fn start_http3_listener(
 
     let endpoint = quinn::Endpoint::server(server_config, addr)?;
     info!("HTTP/3 (QUIC) listener started on {}", addr);
+    if let Some(started_tx) = started_tx {
+        let _ = started_tx.send(());
+    }
 
     let mut shutdown_rx = shutdown;
 

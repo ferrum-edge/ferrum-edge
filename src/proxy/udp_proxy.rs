@@ -16,7 +16,7 @@
 use dashmap::DashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::sync::watch;
@@ -91,6 +91,8 @@ pub struct UdpListenerConfig {
     pub plugin_cache: Arc<PluginCache>,
     /// Circuit breaker cache shared with HTTP proxies.
     pub circuit_breaker_cache: Arc<CircuitBreakerCache>,
+    /// Flipped once the listener successfully binds and can accept traffic.
+    pub started: Arc<AtomicBool>,
 }
 
 /// Start a UDP proxy listener on the given port.
@@ -117,6 +119,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
         cleanup_interval_seconds,
         plugin_cache,
         circuit_breaker_cache,
+        started,
     } = cfg;
 
     if let Some(dtls_config) = frontend_dtls_config {
@@ -134,6 +137,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
             max_sessions,
             plugin_cache,
             circuit_breaker_cache,
+            started,
         )
         .await;
     }
@@ -141,6 +145,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
     let addr = SocketAddr::new(bind_addr, port);
     let frontend_socket = Arc::new(UdpSocket::bind(addr).await?);
     ensure_coarse_timer_started();
+    started.store(true, Ordering::Release);
     info!(proxy_id = %proxy_id, "UDP proxy listener started on {}", addr);
 
     let sessions: SessionMap = Arc::new(DashMap::new());
@@ -561,10 +566,12 @@ async fn start_dtls_frontend_listener(
     max_sessions: usize,
     plugin_cache: Arc<PluginCache>,
     circuit_breaker_cache: Arc<CircuitBreakerCache>,
+    started: Arc<AtomicBool>,
 ) -> Result<(), anyhow::Error> {
     let addr = SocketAddr::new(bind_addr, port);
     let server = Arc::new(crate::dtls::DtlsServer::bind(addr, dtls_config).await?);
     ensure_coarse_timer_started();
+    started.store(true, Ordering::Release);
     info!(proxy_id = %proxy_id, "DTLS frontend listener started on {}", addr);
 
     // Pre-resolve plugins and proxy metadata for this listener.

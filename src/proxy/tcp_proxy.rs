@@ -7,7 +7,7 @@
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -133,6 +133,8 @@ pub struct TcpListenerConfig {
     pub circuit_breaker_cache: Arc<CircuitBreakerCache>,
     /// TLS hardening policy for backend connections (cipher suites, protocol versions).
     pub tls_policy: Option<Arc<TlsPolicy>>,
+    /// Flipped once the listener successfully binds and can accept traffic.
+    pub started: Arc<AtomicBool>,
 }
 
 /// Start a TCP proxy listener on the given port.
@@ -159,11 +161,13 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
         tcp_idle_timeout_seconds: global_tcp_idle_timeout,
         circuit_breaker_cache,
         tls_policy,
+        started,
     } = cfg;
     let addr = SocketAddr::new(bind_addr, port);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     // Convert to Arc<str> so per-connection clones are a cheap pointer bump.
     let proxy_id: Arc<str> = Arc::from(proxy_id);
+    started.store(true, Ordering::Release);
     info!(
         proxy_id = %proxy_id,
         "TCP proxy listener started on {}",
