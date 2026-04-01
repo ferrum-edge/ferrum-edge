@@ -1,3 +1,14 @@
+//! Config backup loader for database mode startup failover.
+//!
+//! When the database is unreachable at startup, this loads a read-only JSON
+//! backup file (provisioned externally via ConfigMap, PersistentVolume, etc.)
+//! so the gateway can start serving with stale-but-working config rather than
+//! failing entirely. The backup is never written by the gateway — it's purely
+//! an external resilience mechanism for Kubernetes and similar environments.
+//!
+//! The backup intentionally skips the full validation pipeline because
+//! stale-but-working config is preferred over failing to start.
+
 use crate::config::types::GatewayConfig;
 use std::path::Path;
 use tracing::{error, info, warn};

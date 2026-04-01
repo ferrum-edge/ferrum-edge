@@ -1,3 +1,12 @@
+//! Migration mode — database schema and config file version migrations.
+//!
+//! Three sub-actions selected by `FERRUM_MIGRATE_ACTION`:
+//! - `up` — apply pending SQL schema migrations (creates tables, indexes, columns)
+//! - `status` — show which migrations are applied/pending without making changes
+//! - `config` — migrate a YAML/JSON config file to the current format version
+//!
+//! This mode exits after completion (no long-running process).
+
 use tracing::{error, info};
 
 use crate::config::EnvConfig;

@@ -1,3 +1,13 @@
+//! Data Plane mode — proxy-only node that receives config from a Control Plane.
+//!
+//! The DP starts with an empty `GatewayConfig` and receives its first full
+//! snapshot from the CP within seconds of establishing the gRPC `Subscribe`
+//! stream. Subsequent updates arrive as incremental deltas (`update_type=1`).
+//!
+//! The DP has no direct database access. Its admin API is always read-only.
+//! If the gRPC connection to the CP drops, the DP continues serving with
+//! cached config and reconnects with a 5-second backoff loop.
+
 use std::net::SocketAddr;
 use std::time::Duration;
 use tracing::{error, info, warn};

@@ -1,3 +1,18 @@
+//! Pre-resolved plugin cache for O(1) per-request plugin lookup.
+//!
+//! Plugins are created once at config load time — not per-request. This is
+//! critical for stateful plugins (e.g., `rate_limiting`) whose internal DashMap
+//! counters must persist across requests. Without caching, a fresh rate limiter
+//! would be created per request and limits would never be enforced.
+//!
+//! Each proxy gets a merged plugin list: global plugins + proxy-scoped plugins,
+//! sorted by priority. Pre-computed flags (`requires_response_body_buffering`,
+//! `requires_request_body_buffering`, `requires_ws_frame_hooks`) enable O(1)
+//! decisions on the hot path instead of per-request plugin iteration.
+//!
+//! Incremental updates via `apply_delta()` preserve unchanged proxy plugin
+//! lists (including their stateful instances) and only rebuild affected proxies.
+
 use arc_swap::ArcSwap;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;

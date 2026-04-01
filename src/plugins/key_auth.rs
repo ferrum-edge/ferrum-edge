@@ -1,3 +1,13 @@
+//! API key authentication plugin.
+//!
+//! Extracts an API key from a configurable location (header or query parameter)
+//! and looks up the corresponding consumer via the `ConsumerIndex` for O(1)
+//! credential matching. Provides transport-level authentication only — the key
+//! is transmitted in plaintext, so TLS is required in production.
+//!
+//! Default key location: `header:X-API-Key`. Configurable via `key_location`
+//! in the plugin config (e.g., `"query:api_key"` for query parameter extraction).
+
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -8,6 +18,7 @@ use crate::consumer_index::ConsumerIndex;
 use super::{Plugin, PluginResult, RequestContext};
 
 pub struct KeyAuth {
+    /// Where to extract the API key from: "header:<name>" or "query:<name>".
     key_location: String,
 }
 

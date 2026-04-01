@@ -1,3 +1,14 @@
+//! Environment variable parsing for the gateway's 90+ configuration options.
+//!
+//! **Three-tier resolution** (highest precedence first):
+//! 1. Environment variable (`std::env::var`)
+//! 2. Conf file value (`ferrum.conf`, parsed by `ConfFile`)
+//! 3. Hardcoded default in this file
+//!
+//! The `resolve_var()` helper implements this precedence chain and logs an
+//! info message when a conf file value is overridden by an env var, helping
+//! operators debug "why isn't my conf file change taking effect?" issues.
+
 use super::conf_file::ConfFile;
 use std::collections::HashMap;
 use std::env;

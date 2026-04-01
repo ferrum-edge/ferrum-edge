@@ -1,3 +1,25 @@
+//! Core reverse proxy engine — the gateway's hot path.
+//!
+//! This module handles all HTTP/HTTPS/WebSocket proxy requests through a
+//! multi-phase plugin pipeline:
+//!
+//! 1. **Route matching** — `RouterCache::find_proxy()` (O(1) cached, longest-prefix)
+//! 2. **Plugin: on_request_received** — correlation ID, request transformer, bot detection
+//! 3. **Plugin: authenticate** — key_auth, basic_auth, jwt, hmac, jwks, mtls
+//! 4. **Plugin: authorize** — ACL, IP restriction
+//! 5. **Plugin: before_proxy** — rate limiting, body validation, request termination
+//! 6. **Backend dispatch** — protocol-specific: reqwest (HTTP), GrpcConnectionPool (gRPC),
+//!    Http2ConnectionPool (H2 direct), Http3ConnectionPool (QUIC), WebSocket upgrade
+//! 7. **Plugin: after_proxy** — response transformer, CORS
+//! 8. **Plugin: on_response_body** — AI token metrics, AI rate limiter
+//! 9. **Plugin: log** — stdout/HTTP logging, Prometheus, OpenTelemetry
+//!
+//! Key design principles:
+//! - **Lock-free reads**: All config access uses `ArcSwap::load()` — no mutexes on the hot path
+//! - **Pre-computed indexes**: Route table, plugin cache, consumer index rebuilt at config reload
+//! - **Streaming by default**: Response bodies are streamed unless a plugin requires buffering
+//! - **Atomic config reload**: `update_config()` and `apply_incremental()` swap config atomically
+
 pub mod body;
 pub mod client_ip;
 pub mod grpc_proxy;

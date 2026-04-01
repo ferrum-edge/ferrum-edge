@@ -1,3 +1,13 @@
+//! File mode — single-instance gateway backed by a YAML/JSON config file.
+//!
+//! Config is loaded once at startup. On Unix, sending SIGHUP triggers a
+//! hot reload: the file is re-parsed, validated, and atomically swapped
+//! into the running gateway without dropping connections.
+//!
+//! The admin API is always read-only in this mode (no database to write to).
+//! If `FERRUM_ADMIN_JWT_SECRET` is not set, a random secret is generated —
+//! any externally-crafted JWT will be rejected since nobody knows the secret.
+
 use std::net::SocketAddr;
 use std::time::Duration;
 use tracing::{error, info, warn};

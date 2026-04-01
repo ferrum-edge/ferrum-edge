@@ -1,3 +1,19 @@
+//! TLS/mTLS configuration for all gateway surfaces (frontend, backend, admin, gRPC).
+//!
+//! **CA trust chain resolution** (all 8 backend protocol paths follow this):
+//! 1. Proxy-specific CA (`backend_tls_server_ca_cert_path`) → sole trust anchor
+//! 2. Global CA bundle (`FERRUM_TLS_CA_BUNDLE_PATH`) → sole trust anchor
+//! 3. Neither set → webpki/system roots (secure default)
+//! 4. Explicit opt-out → `backend_tls_verify_server_cert: false` skips verification
+//!
+//! **CA exclusivity**: When a custom CA is configured, it is the **sole** trust
+//! anchor — webpki/system roots are NOT added. This prevents internal backends
+//! from being MITMed via any public CA.
+//!
+//! **TLS policy**: Optional hardening via `FERRUM_TLS_CIPHER_SUITES`,
+//! `FERRUM_TLS_MIN_VERSION`, `FERRUM_TLS_KEY_EXCHANGE_GROUPS`. Applied to
+//! both inbound listeners and outbound backend connections.
+
 use rustls::ServerConfig;
 use rustls::crypto::CryptoProvider;
 use rustls_pemfile::{certs, private_key};

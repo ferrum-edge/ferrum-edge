@@ -1,3 +1,17 @@
+//! Plugin system — 33+ built-in plugins with a trait-based architecture.
+//!
+//! Plugins execute in priority order (lower number = runs first) through
+//! lifecycle phases: `on_request_received` → `authenticate` → `authorize` →
+//! `before_proxy` → `after_proxy` → `on_response_body` → `log` → `on_ws_frame`.
+//!
+//! Each plugin declares which protocols it supports via `supported_protocols()`.
+//! The `PluginCache` pre-filters plugins per protocol at config reload time
+//! so the hot path does zero filtering.
+//!
+//! Security plugins (auth, ACL, IP restriction) that fail config validation
+//! cause the gateway to refuse startup — they never silently degrade.
+//! Non-security plugins that fail validation are skipped with a warning.
+
 pub mod access_control;
 pub mod ai_prompt_shield;
 pub mod ai_rate_limiter;

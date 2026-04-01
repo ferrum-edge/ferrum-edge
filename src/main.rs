@@ -1,3 +1,7 @@
+// Use jemalloc as the global allocator on non-Windows platforms.
+// jemalloc significantly reduces memory fragmentation under high-concurrency
+// workloads compared to the system allocator, which matters for a proxy that
+// creates/destroys many small allocations (headers, buffers) per request.
 #[cfg(not(windows))]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
@@ -33,6 +37,17 @@ use tracing_subscriber::EnvFilter;
 /// The Ferrum Edge binary version (sourced from Cargo.toml at compile time).
 pub const FERRUM_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Entry point for the Ferrum Edge gateway binary.
+///
+/// Startup sequence:
+/// 1. Install rustls crypto provider (ring backend)
+/// 2. Initialize structured JSON logging
+/// 3. Resolve external secrets (Vault, AWS, Azure, GCP, env, file) using a
+///    single-threaded runtime — env var mutations are unsafe with multiple threads
+/// 4. Parse environment configuration (`EnvConfig::from_env()`)
+/// 5. Build the multi-threaded tokio runtime with configured worker/blocking threads
+/// 6. Dispatch to the appropriate operating mode (database, file, cp, dp, migrate)
+/// 7. Wait for SIGINT/SIGTERM for graceful shutdown
 fn main() {
     // Initialize rustls crypto provider
     if rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider())

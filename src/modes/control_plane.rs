@@ -1,3 +1,15 @@
+//! Control Plane mode — config broker with no proxy.
+//!
+//! The CP polls the database using the same incremental strategy as database
+//! mode, but instead of proxying traffic, it broadcasts config deltas to
+//! connected Data Planes via a tokio `broadcast` channel → gRPC `Subscribe`
+//! stream. On incremental poll failure, it falls back to a full reload and
+//! broadcasts a `FULL_SNAPSHOT` to all DPs.
+//!
+//! The admin API is read/write (same as database mode). The CP validates
+//! DP client JWT tokens using `FERRUM_CP_GRPC_JWT_SECRET` and enforces
+//! `major.minor` version compatibility between CP and DP.
+
 use arc_swap::ArcSwap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;

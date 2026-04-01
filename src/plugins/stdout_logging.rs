@@ -1,3 +1,10 @@
+//! Stdout access logging plugin.
+//!
+//! Serializes the `TransactionSummary` to JSON and emits it via `tracing::info!`
+//! on the `access_log` target. This allows structured log collectors (Fluentd,
+//! Vector, etc.) to capture per-request access logs without additional I/O.
+//! Supports all proxy protocols (HTTP, gRPC, WebSocket, TCP, UDP).
+
 use async_trait::async_trait;
 use serde_json::Value;
 

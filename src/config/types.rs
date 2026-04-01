@@ -1,3 +1,15 @@
+//! Core domain model types and validation for the gateway configuration.
+//!
+//! Key design decisions:
+//! - **Regex auto-anchoring**: `anchor_regex_pattern()` adds `^`/`$` to regex
+//!   listen_paths for full-path matching, preventing accidental prefix matches.
+//! - **Stream proxy paths**: TCP/UDP proxies get synthetic paths (`__tcp:PORT`,
+//!   `__udp:PORT`) via `normalize_stream_proxy_paths()` for consistent routing.
+//! - **Validation deduplication**: TLS cert/key paths are validated via a
+//!   `validated_tls_paths` cache so each unique file is parsed only once.
+//! - **Control character rejection**: Resource IDs, hostnames, and paths reject
+//!   control characters to prevent log injection attacks.
+
 use chrono::{DateTime, Utc};
 use regex::Regex;
 use serde::{Deserialize, Serialize};

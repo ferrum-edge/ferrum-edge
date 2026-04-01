@@ -1,3 +1,16 @@
+//! YAML/JSON configuration file loader for file mode.
+//!
+//! Uses a two-pass deserialization strategy:
+//! 1. Parse to `serde_json::Value` for version detection and in-memory migration.
+//! 2. Deserialize from the original format (YAML or JSON) to `GatewayConfig`.
+//!
+//! The file on disk is never modified — in-memory migration preserves the
+//! original format. Use `FERRUM_MODE=migrate FERRUM_MIGRATE_ACTION=config`
+//! to persist config file version upgrades.
+//!
+//! Validation is strict in file mode (errors fail startup) vs. warn-only in
+//! database mode (stale config is better than no config).
+
 use crate::config::config_migration::ConfigMigrator;
 use crate::config::types::{CURRENT_CONFIG_VERSION, GatewayConfig};
 use std::path::Path;

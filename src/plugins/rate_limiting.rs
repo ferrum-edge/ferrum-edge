@@ -1,3 +1,21 @@
+//! Rate limiting plugin with dual-algorithm design and optional Redis sync.
+//!
+//! **Algorithm selection** (automatic based on window duration):
+//! - **Token bucket** (`window_seconds <= 5`): Fixed-capacity bucket refilled at
+//!   `limit / window_seconds` tokens/sec. Best for TPS limiting where sub-second
+//!   burst control matters. O(1) memory per key.
+//! - **Sliding window** (`window_seconds > 5`): Tracks individual request timestamps
+//!   within the window for exact counting with zero boundary-burst vulnerability.
+//!   Best for longer windows (minutes, hours). O(n) memory per key where n = requests
+//!   in window.
+//!
+//! **Dual-phase execution**: Runs in both `before_proxy` (to reject over-limit
+//! requests early) and `on_response_body` (to count requests that actually completed).
+//!
+//! **Redis sync** (`sync_mode: "redis"`): When enabled, counters are stored in Redis
+//! using a two-window weighted approximation algorithm (no Lua scripts, single
+//! pipelined round-trip). Falls back to local DashMap state if Redis is unavailable.
+
 use async_trait::async_trait;
 use dashmap::DashMap;
 use serde_json::Value;

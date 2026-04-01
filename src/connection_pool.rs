@@ -1,5 +1,16 @@
-//! Connection pool manager for HTTP/HTTPS/WebSocket clients
-//! Provides efficient connection reuse and keep-alive support
+//! Connection pool manager for HTTP/HTTPS/WebSocket backend clients.
+//!
+//! Provides `reqwest::Client` reuse keyed by connection identity (destination,
+//! protocol, DNS override, TLS trust, mTLS credentials). Each unique key gets
+//! one `reqwest::Client` which internally manages its own TCP connection pool.
+//!
+//! All clients use the gateway's shared `DnsCache` as their resolver, keeping
+//! DNS lookups off the hot request path. A background cleanup task evicts idle
+//! pool entries based on configurable timeout.
+//!
+//! **Pool key design**: Only includes fields that affect connection *identity*.
+//! Adding unnecessary fields (timeouts, pool sizes) causes fragmentation and
+//! P95 regressions. Uses `|` as delimiter (not `:`) to avoid IPv6 ambiguity.
 
 use crate::config::PoolConfig;
 use crate::config::types::Proxy;

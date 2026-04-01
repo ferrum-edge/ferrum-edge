@@ -1,4 +1,16 @@
-//! HTTP/3 server listener using Quinn (QUIC) and h3
+//! HTTP/3 server listener using Quinn (QUIC) and h3.
+//!
+//! Runs as a standalone QUIC server alongside the main hyper-based HTTP server.
+//! Handles its own request lifecycle (route matching, plugin phases, auth) but
+//! uses **reqwest** (not the `Http3ConnectionPool`) for backend communication.
+//! This is intentional — reqwest auto-negotiates HTTP/2 via ALPN which outperforms
+//! QUIC for small payloads due to lower per-request crypto overhead and more
+//! mature connection pooling.
+//!
+//! QUIC requires TLS 1.3 exclusively (RFC 9001), so the server forces TLS 1.3
+//! and uses a separate ALPN advertisement (`h3`). 0-RTT is disabled for replay
+//! safety, but stateless session ticket resumption is enabled (saves 1 RTT on
+//! reconnects).
 
 use std::collections::HashMap;
 use std::net::SocketAddr;

@@ -1,3 +1,22 @@
+//! Database config loader with incremental polling.
+//!
+//! **Incremental polling strategy** (two-phase):
+//! 1. **Change detection**: Indexed `WHERE updated_at > ?` queries on 4 tables to
+//!    fetch only rows modified since the last poll. A 1-second safety margin on the
+//!    timestamp prevents missing boundary writes due to clock skew or in-flight commits.
+//! 2. **Deletion detection**: Lightweight `SELECT id` queries on all 4 tables, diffed
+//!    against the poller's known ID sets to find removed rows.
+//!
+//! On startup, a full `SELECT *` seeds the initial config and known ID sets.
+//! If an incremental poll fails for any reason, the loop falls back to a full
+//! reload and re-seeds. Known ID sets are only updated after successful apply.
+//!
+//! **Key implementation details**:
+//! - Postgres `?` → `$N` placeholder rewrite via `q()` method (sqlx `Any` uses `?`)
+//! - `>500` IN-clause threshold switches to full-table fetch + in-memory filter
+//! - `ArcSwap`-based pool swap enables zero-downtime DNS re-resolution on failover
+//! - Batch chunking (`BATCH_CHUNK_SIZE`) for large imports to stay within DB limits
+
 use crate::config::types::{
     AuthMode, BackendProtocol, CircuitBreakerConfig, Consumer, GatewayConfig, HealthCheckConfig,
     LoadBalancerAlgorithm, PluginAssociation, PluginConfig, PluginScope, Proxy, ResponseBodyMode,

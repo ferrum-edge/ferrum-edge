@@ -1,3 +1,13 @@
+//! Cross-Origin Resource Sharing (CORS) plugin.
+//!
+//! Handles preflight OPTIONS requests and injects CORS response headers
+//! (`Access-Control-Allow-Origin`, `-Methods`, `-Headers`, `-Credentials`, etc.).
+//!
+//! Supports exact origin matching and wildcard subdomain patterns (e.g.,
+//! `"*.company.com"` matches `https://app.company.com`). When `allowed_origins`
+//! contains `"*"`, all origins are allowed. Preflight requests are short-circuited
+//! with a 204 response before reaching the backend.
+
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashMap;

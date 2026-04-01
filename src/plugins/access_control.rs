@@ -1,3 +1,14 @@
+//! Access Control List (ACL) plugin — post-authentication authorization.
+//!
+//! Runs in the `authorize` phase after authentication plugins have identified
+//! the consumer. Provides two layers of access control:
+//! 1. **Consumer-based**: Allow/deny lists checked by consumer username (O(1) HashSet).
+//! 2. **IP-based**: Allow/block lists checked against the client IP (reuses the
+//!    `ip_restriction` module's CIDR parsing for consistent behavior).
+//!
+//! Evaluation order: consumer deny → consumer allow → IP block → IP allow.
+//! If no rules match, the request is allowed (open by default).
+
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};

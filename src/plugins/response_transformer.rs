@@ -1,3 +1,10 @@
+//! Response transformer plugin — modifies response headers and body after proxying.
+//!
+//! Header rules (add/remove/update/rename) execute in `after_proxy`.
+//! Body rules require `requires_response_body_buffering()` = true so the
+//! response body is collected before being forwarded to the client.
+//! Header keys are pre-lowercased at config parse time.
+
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashMap;

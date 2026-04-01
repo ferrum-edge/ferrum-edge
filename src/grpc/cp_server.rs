@@ -1,3 +1,16 @@
+//! Control Plane gRPC server implementing the `ConfigSync` service.
+//!
+//! Provides two RPCs:
+//! - `Subscribe` — server-streaming: DP connects and receives a `FULL_SNAPSHOT`
+//!   (update_type=0), then incremental `DELTA` updates (update_type=1) as config changes.
+//!   If a DP lags behind the broadcast channel (capacity 128), it receives a fresh
+//!   full snapshot instead of the missed deltas.
+//! - `GetFullConfig` — unary: returns the current full config snapshot on demand.
+//!
+//! Authentication: HS256 JWT in the `authorization` gRPC metadata key.
+//! Required claims: `exp`, `iat`, `sub`. The CP enforces `major.minor` version
+//! compatibility — a DP running a different minor version is rejected.
+
 use arc_swap::ArcSwap;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
 use serde_json::Value;

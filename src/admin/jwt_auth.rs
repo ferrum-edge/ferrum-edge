@@ -1,5 +1,12 @@
-//! Enhanced JWT authentication for Admin API
-//! Supports ISS claim validation, TTL enforcement, and token generation
+//! JWT authentication for the Admin API.
+//!
+//! Validates all six required claims (`iss`, `sub`, `exp`, `iat`, `nbf`, `jti`)
+//! and enforces a max-TTL to prevent very long-lived tokens. When
+//! `FERRUM_ADMIN_JWT_SECRET` is not set, a random secret is generated at startup
+//! so externally-crafted tokens are always rejected (safe default).
+//!
+//! Also provides token generation (`generate_token`) for use by the Admin API's
+//! `/auth/token` endpoint.
 
 use jsonwebtoken::{
     Algorithm, DecodingKey, TokenData, Validation, decode, errors::Error as JwtEncodeError,

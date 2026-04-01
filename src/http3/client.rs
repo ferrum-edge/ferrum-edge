@@ -1,4 +1,15 @@
-//! HTTP/3 client for proxying requests to HTTP/3 backends
+//! HTTP/3 client connection pool for proxying to HTTP/3 backends.
+//!
+//! Uses `connections_per_backend` QUIC connections per target to distribute
+//! frame processing across driver tasks (prevents CPU bottleneck on a single
+//! QUIC connection). The pool key includes a connection index for sharding.
+//!
+//! TLS config is constructed lazily via closure to avoid cloning root cert
+//! stores on every request. On connection failure, a fallback scan checks
+//! other cached connection indices before creating a new connection.
+//!
+//! Note: This pool is used only by the main hyper-based proxy path (`proxy/mod.rs`)
+//! for H3 backend targets. The H3 frontend server uses reqwest instead.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;

@@ -1,3 +1,16 @@
+//! DNS resolution cache with TTL, stale-while-revalidate, and background refresh.
+//!
+//! All gateway components (connection pool, health probes, service discovery,
+//! plugin HTTP clients) share a single `DnsCache` instance so that:
+//! - DNS lookups are off the hot request path (pre-warmed at startup)
+//! - TTL-based expiration prevents stale entries from persisting
+//! - Stale-while-revalidate serves the old IP while refreshing in the background
+//! - Background refresh keeps entries warm without per-request DNS queries
+//!
+//! The cache also provides `DnsCacheResolver` — a `reqwest::dns::Resolve`
+//! implementation that plugs into every `reqwest::Client` so all HTTP clients
+//! automatically use the shared cache.
+
 use dashmap::DashMap;
 use hickory_resolver::Resolver;
 use hickory_resolver::config::{

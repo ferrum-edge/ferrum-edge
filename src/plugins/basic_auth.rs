@@ -1,3 +1,18 @@
+//! HTTP Basic Authentication plugin with dual hash verification.
+//!
+//! Supports two password hash formats:
+//! - **HMAC-SHA256** (`hmac_sha256:<hex>`) — ~1μs verification using a server secret.
+//!   This is the recommended format for high-throughput gateways.
+//! - **bcrypt** (`$2b$...` / `$2a$...`) — ~100ms verification, always available as
+//!   a backward-compatible fallback.
+//!
+//! The HMAC-SHA256 fast path eliminates bcrypt's per-request CPU overhead and
+//! removes timing side-channels that could be used for username enumeration
+//! (bcrypt's variable-time comparison leaks whether a username exists).
+//!
+//! The server secret (`FERRUM_BASIC_AUTH_HMAC_SECRET`) MUST be set to a unique,
+//! random value in production. The default value is public and insecure.
+
 use async_trait::async_trait;
 use base64::Engine;
 use hmac::{Hmac, KeyInit, Mac};

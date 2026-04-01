@@ -1,3 +1,10 @@
+//! `ferrum.conf` file parser — provides defaults overridable by environment variables.
+//!
+//! The conf file uses a simple `KEY=value` format (one per line, `#` comments).
+//! Values here serve as defaults in a 3-tier resolution chain:
+//! **env var > conf file > hardcoded default**. The `resolve_var()` function
+//! in `env_config.rs` implements this precedence.
+
 use std::collections::HashMap;
 use std::path::Path;
 use tracing::info;

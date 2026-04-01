@@ -1,3 +1,13 @@
+//! Data Plane gRPC client — subscribes to the CP's config stream.
+//!
+//! The outer reconnect loop (`start_dp_client_with_shutdown`) retries every
+//! 5 seconds on disconnect. Inside the stream handler, two message types:
+//! - `update_type=0` (FULL_SNAPSHOT): replaces the entire `GatewayConfig`
+//! - `update_type=1` (DELTA): applies incremental changes via `apply_incremental()`
+//!
+//! SNI is extracted from the CP URL so TLS certificate validation works
+//! correctly even when connecting via IP address with a hostname-based cert.
+
 use std::time::Duration;
 use tonic::metadata::MetadataValue;
 use tonic::transport::channel::ClientTlsConfig;

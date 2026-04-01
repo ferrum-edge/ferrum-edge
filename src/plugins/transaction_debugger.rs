@@ -1,3 +1,12 @@
+//! Transaction debugger plugin — detailed per-request diagnostics.
+//!
+//! Injects debug headers into responses showing the full request/response
+//! lifecycle: matched proxy, consumer identity, plugin execution timing,
+//! backend connection details, and optionally request/response bodies.
+//! Sensitive headers (Authorization, Cookie, API keys) are automatically
+//! redacted. Intended for development and troubleshooting — should not be
+//! enabled in production due to information disclosure risk.
+
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashMap;

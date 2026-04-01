@@ -80,6 +80,32 @@ All four jobs must pass for a PR to merge.
 3. **Atomic config reload**: Config changes are loaded in background, validated, then swapped atomically via `ArcSwap`. Requests in-flight see old or new config — never partial.
 4. **Resilience**: If the config source (DB/file/gRPC) is unavailable, the gateway continues serving with cached config.
 
+### Startup Sequence
+
+1. **jemalloc** — Global allocator on non-Windows (reduces fragmentation under high concurrency)
+2. **rustls crypto provider** — Install ring as the TLS backend (must be first)
+3. **Logging** — JSON structured logging via `tracing-subscriber`
+4. **Secret resolution** — Single-threaded tokio runtime resolves `FERRUM_*_SECRET_*` env vars from Vault/AWS/Azure/GCP/file backends. Uses single-threaded runtime because `std::env::set_var` is unsafe with concurrent threads
+5. **EnvConfig parsing** — 90+ env vars parsed into `EnvConfig` (now includes resolved secrets)
+6. **Multi-threaded runtime** — tokio `new_multi_thread()` with configurable worker/blocking threads
+7. **Mode dispatch** — Runs the selected operating mode (database/file/cp/dp/migrate)
+8. **Signal handling** — SIGINT/SIGTERM trigger graceful shutdown via `watch::channel`
+
+### External Secret Resolution
+
+The gateway resolves secrets from external providers at startup, before any config is loaded. Env vars with provider-specific suffixes are resolved and the base env var is set:
+
+| Suffix | Provider | Example |
+|--------|----------|---------|
+| `_VAULT` | HashiCorp Vault | `FERRUM_DB_URL_VAULT=secret/data/db#url` |
+| `_AWS` | AWS Secrets Manager | `FERRUM_DB_URL_AWS=my-secret#password` |
+| `_AZURE` | Azure Key Vault | `FERRUM_DB_URL_AZURE=https://vault.azure.net/secrets/db-url` |
+| `_GCP` | GCP Secret Manager | `FERRUM_DB_URL_GCP=projects/P/secrets/S/versions/latest` |
+| `_FILE` | File on disk | `FERRUM_DB_URL_FILE=/run/secrets/db_url` |
+| `_ENV` | Another env var | `FERRUM_DB_URL_ENV=DATABASE_URL` |
+
+Backends are grouped so a single client is created per provider type (avoids repeated credential initialization). Conflict detection prevents two providers from setting the same base key.
+
 ### Source Layout
 
 ```
@@ -109,6 +135,7 @@ src/
 │   ├── body.rs                # ProxyBody sum type (Full vs Tracked) with StreamingMetrics
 │   ├── client_ip.rs           # Client IP resolution (trusted proxies, XFF)
 │   ├── grpc_proxy.rs          # gRPC reverse proxy with HTTP/2 trailer support
+│   ├── http2_pool.rs          # HTTP/2 direct connection pool (hyper H2, sharded senders)
 │   ├── tcp_proxy.rs           # Raw TCP stream proxy with TLS termination/origination
 │   ├── udp_proxy.rs           # UDP datagram proxy with per-client session tracking, DTLS frontend/backend
 │   └── stream_listener.rs     # Stream listener lifecycle manager (reconcile on config reload)
@@ -131,8 +158,16 @@ src/
 ├── consumer_index.rs          # Consumer lookup index (O(1) by credential type)
 ├── config_delta.rs            # Incremental config updates for CP/DP
 ├── dtls/                      # DTLS support (frontend termination, backend origination, cert helpers)
-├── dns/                       # DNS resolution with caching
+├── dns/                       # DNS resolution with caching, stale-while-revalidate, background refresh
 ├── service_discovery/         # Dynamic upstream discovery (DNS-SD, Kubernetes, Consul)
+├── secrets/                   # External secret resolution (Vault, AWS, Azure, GCP, env, file)
+│   ├── mod.rs                 # Secret backend registry + conflict detection
+│   ├── vault.rs               # HashiCorp Vault KV v2
+│   ├── aws.rs                 # AWS Secrets Manager
+│   ├── azure.rs               # Azure Key Vault
+│   ├── gcp.rs                 # Google Cloud Secret Manager
+│   ├── env.rs                 # Environment variable references
+│   └── file.rs                # File-based secrets (Docker Swarm, K8s volume mounts)
 ├── tls/                       # TLS/mTLS listener configuration
 ├── http3/                     # HTTP/3 (QUIC) support
 └── custom_plugins/            # Drop-in custom plugins (auto-discovered by build.rs)
@@ -172,6 +207,18 @@ Plugins execute in priority order (lower number = runs first). The lifecycle pha
 8. `on_ws_frame` — WebSocket frame-level hooks: ws_message_size_limiting (2810), ws_rate_limiting (2910), ws_frame_logging (9050)
 
 Plugin priority constants are defined in `src/plugins/mod.rs` (e.g., `priority::CORS = 100`, `priority::RATE_LIMITING = 2900`, `priority::WS_MESSAGE_SIZE_LIMITING = 2810`).
+
+### DNS Cache (`src/dns/mod.rs`)
+
+All gateway components share a single `DnsCache` instance:
+
+- **Pre-warmed at startup**: Backend hostnames, plugin target hostnames, and upstream targets are resolved before traffic starts flowing
+- **TTL-based expiration**: Cache entries expire based on configurable TTL (default from `FERRUM_DNS_CACHE_TTL_SECONDS`)
+- **Stale-while-revalidate**: Serves the old IP while refreshing in the background, avoiding DNS latency on the hot path
+- **Background refresh**: A dedicated task refreshes entries before they expire, keeping the cache warm
+- **`DnsCacheResolver`**: Implements `reqwest::dns::Resolve` — plugged into every `reqwest::Client` for automatic cache integration
+- **Custom nameservers**: Supports `FERRUM_DNS_NAMESERVERS` for internal DNS (e.g., Consul DNS, CoreDNS) and DNS-over-TLS via `FERRUM_DNS_TLS_NAMESERVERS`
+- **Record type optimization**: Remembers whether A or AAAA succeeded last for each hostname, querying that type first on refresh
 
 ### Centralized Rate Limiting (Redis)
 

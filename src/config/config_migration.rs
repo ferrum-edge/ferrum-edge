@@ -1,3 +1,10 @@
+//! Config file version migrations using a chain-of-responsibility pattern.
+//!
+//! Each migration step transforms a `serde_json::Value` from version N to N+1.
+//! The chain is walked linearly: v1→v2→v3→...→current. If the chain is broken
+//! (missing step), migration fails fast. `migrate_file()` creates a timestamped
+//! backup of the original file before writing the migrated version.
+
 use std::path::Path;
 use tracing::{info, warn};
 

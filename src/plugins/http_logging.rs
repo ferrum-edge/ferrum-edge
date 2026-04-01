@@ -1,3 +1,15 @@
+//! HTTP access logging plugin — batched async log shipping.
+//!
+//! Serializes `TransactionSummary` entries and sends them to a remote HTTP
+//! endpoint in batches. Uses an mpsc channel to decouple the proxy hot path
+//! from network I/O: the `log()` hook enqueues the entry (non-blocking), and
+//! a background task drains the channel in configurable batch sizes with a
+//! flush interval timer. Failed batches are retried with configurable delay.
+//!
+//! Supports both HTTP and stream (TCP/UDP) transaction summaries via the
+//! `LogEntry` union type, and uses the shared `PluginHttpClient` for
+//! connection pooling and DNS cache integration.
+
 use async_trait::async_trait;
 use serde_json::Value;
 use tokio::sync::mpsc;

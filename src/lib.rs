@@ -1,4 +1,9 @@
-//! Ferrum Edge - A high-performance edge proxy built in Rust
+//! Ferrum Edge — A high-performance edge proxy built in Rust.
+//!
+//! This crate re-exports the public API surface used by integration tests,
+//! functional tests, and custom plugins. The binary entry point is in `main.rs`;
+//! this `lib.rs` simply makes internal modules accessible to external test crates
+//! without duplicating module declarations.
 
 /// The Ferrum Edge binary/crate version (sourced from Cargo.toml at compile time).
 pub const FERRUM_VERSION: &str = env!("CARGO_PKG_VERSION");

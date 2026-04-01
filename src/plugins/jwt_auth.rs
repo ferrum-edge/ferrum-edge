@@ -1,3 +1,18 @@
+//! JWT authentication plugin with two-phase token verification.
+//!
+//! Uses a two-phase decode approach:
+//! 1. **Insecure decode** — peek at the unverified claims to extract the consumer
+//!    identity (via `consumer_claim_field`, default `"sub"`). This is safe because
+//!    the identity is only used to look up the consumer's signing secret.
+//! 2. **Full verification** — decode again with the consumer's secret to validate
+//!    the signature and expiration. Only after this succeeds is the consumer trusted.
+//!
+//! This design allows each consumer to have their own JWT secret (stored in
+//! `consumer.credentials["jwt_auth"]["secret"]`), avoiding a single shared secret.
+//!
+//! Token location is configurable via `token_lookup` (default `"header:Authorization"`).
+//! Supports `"header:<name>"` and `"query:<name>"` extraction modes.
+
 use async_trait::async_trait;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, dangerous::insecure_decode, decode};
 use serde_json::Value;

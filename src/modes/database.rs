@@ -1,3 +1,18 @@
+//! Database mode — single-instance gateway backed by PostgreSQL, MySQL, or SQLite.
+//!
+//! Lifecycle:
+//! 1. Connect to the primary DB (with failover URL retry)
+//! 2. Optionally connect a read replica for polling (reduces primary load)
+//! 3. Load full config from DB (falls back to on-disk JSON backup if DB is unreachable)
+//! 4. Build all caches (router, plugin, consumer, load balancer, circuit breaker)
+//! 5. Start proxy + admin listeners
+//! 6. Enter the polling loop: incremental `WHERE updated_at > ?` queries every N seconds,
+//!    with automatic fallback to full reload + DB failover on error
+//!
+//! The admin API is read/write in this mode. A `db_available` AtomicBool gates
+//! write endpoints — when the DB is unreachable, the admin API becomes temporarily
+//! read-only and returns 503 on mutations.
+
 use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
