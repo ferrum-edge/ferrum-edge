@@ -86,8 +86,11 @@ readinessProbe:
       - |
         body="$(curl -fsS http://127.0.0.1:9000/health)"
         echo "$body" | grep -q '"status":"ok"'
+        echo "$body" | grep -q '"cached_config":{"available":true'
         echo "$body" | grep -Eq '"proxy_count":[1-9][0-9]*'
 ```
+
+`proxy_count` is reported inside `cached_config`, not as a top-level health field.
 
 If a zero-proxy config is valid in your environment, use a different readiness rule instead of the `proxy_count` check.
 
