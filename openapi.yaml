@@ -2820,18 +2820,8 @@ components:
 
     AccessControlConfig:
       type: object
-      description: "Plugin: access_control — IP/CIDR and consumer-based allow/deny."
+      description: "Plugin: access_control — consumer-based allow/deny. Use ip_restriction for IP/CIDR rules."
       properties:
-        allowed_ips:
-          type: array
-          items:
-            type: string
-          description: IP addresses or CIDR ranges allowed
-        blocked_ips:
-          type: array
-          items:
-            type: string
-          description: IP addresses or CIDR ranges explicitly denied
         allowed_consumers:
           type: array
           items:

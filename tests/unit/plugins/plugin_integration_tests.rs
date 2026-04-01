@@ -60,7 +60,7 @@ async fn test_plugin_creation_all_plugins() {
                 json!({"providers": [{"jwks_uri": "https://example.com/.well-known/jwks.json"}]})
             }
             "ip_restriction" => json!({"allow": ["0.0.0.0/0"]}),
-            "access_control" => json!({"allowed_ips": ["0.0.0.0/0"]}),
+            "access_control" => json!({"allowed_consumers": ["testuser"]}),
             _ => json!({}),
         };
         let plugin = create_plugin(plugin_name, &config);
@@ -173,9 +173,8 @@ async fn test_plugin_complex_configurations() {
         (
             "access_control",
             json!({
-                "allowed_ips": ["127.0.0.1", "10.0.0.0/8", "192.168.0.0/16"],
-                "blocked_ips": ["172.16.0.0/12"],
-                "default_action": "allow"
+                "allowed_consumers": ["alice", "bob", "service-account"],
+                "disallowed_consumers": ["blocked-user"]
             }),
         ),
         (

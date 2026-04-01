@@ -72,7 +72,7 @@ fn make_plugin_config(
 ) -> PluginConfig {
     // Some plugins now require non-empty config to be created successfully.
     let config = match plugin_name {
-        "access_control" => json!({"allowed_ips": ["0.0.0.0/0"]}),
+        "access_control" => json!({"allowed_consumers": ["testuser"]}),
         "ip_restriction" => json!({"allow": ["0.0.0.0/0"]}),
         _ => json!({}),
     };
@@ -858,7 +858,7 @@ async fn test_requires_ws_frame_hooks_defaults_false_for_all_plugins() {
             continue; // These intentionally return true
         }
         let config = match name {
-            "access_control" => serde_json::json!({"allowed_ips": ["0.0.0.0/0"]}),
+            "access_control" => serde_json::json!({"allowed_consumers": ["testuser"]}),
             "ip_restriction" => serde_json::json!({"allow": ["0.0.0.0/0"]}),
             "cors" => serde_json::json!({"origins": ["*"]}),
             "response_caching" => serde_json::json!({"ttl_seconds": 60}),

@@ -16,7 +16,7 @@ tests/
 │   ├── plugins/                        # Plugin unit tests
 │   │   ├── mod.rs
 │   │   ├── plugin_utils.rs             # Shared plugin test helpers
-│   │   ├── access_control_tests.rs     # IP/CIDR + consumer access control
+│   │   ├── access_control_tests.rs     # Consumer access control
 │   │   ├── basic_auth_tests.rs         # Basic auth plugin
 │   │   ├── http_logging_tests.rs       # HTTP logging plugin
 │   │   ├── jwt_auth_plugin_tests.rs    # JWT auth plugin

@@ -234,6 +234,7 @@ async fn test_list_proxies_falls_back_to_cached_config() {
         proxy_state: None,
         mode: "test".to_string(),
         read_only: true,
+        startup_ready: None,
         db_available: None,
         admin_restore_max_body_size_mib: 100,
         reserved_ports: std::collections::HashSet::new(),
@@ -268,6 +269,7 @@ async fn test_list_consumers_falls_back_to_cached_config() {
         proxy_state: None,
         mode: "test".to_string(),
         read_only: true,
+        startup_ready: None,
         db_available: None,
         admin_restore_max_body_size_mib: 100,
         reserved_ports: std::collections::HashSet::new(),
@@ -297,6 +299,7 @@ async fn test_list_plugin_configs_falls_back_to_cached_config() {
         proxy_state: None,
         mode: "test".to_string(),
         read_only: true,
+        startup_ready: None,
         db_available: None,
         admin_restore_max_body_size_mib: 100,
         reserved_ports: std::collections::HashSet::new(),
@@ -330,6 +333,7 @@ async fn test_get_proxy_by_id_falls_back_to_cached_config() {
         proxy_state: None,
         mode: "test".to_string(),
         read_only: true,
+        startup_ready: None,
         db_available: None,
         admin_restore_max_body_size_mib: 100,
         reserved_ports: std::collections::HashSet::new(),
@@ -358,6 +362,7 @@ async fn test_get_proxy_not_found_in_cache() {
         proxy_state: None,
         mode: "test".to_string(),
         read_only: true,
+        startup_ready: None,
         db_available: None,
         admin_restore_max_body_size_mib: 100,
         reserved_ports: std::collections::HashSet::new(),
@@ -384,6 +389,7 @@ async fn test_get_consumer_by_id_falls_back_to_cached_config() {
         proxy_state: None,
         mode: "test".to_string(),
         read_only: true,
+        startup_ready: None,
         db_available: None,
         admin_restore_max_body_size_mib: 100,
         reserved_ports: std::collections::HashSet::new(),
@@ -412,6 +418,7 @@ async fn test_get_consumer_not_found_in_cache() {
         proxy_state: None,
         mode: "test".to_string(),
         read_only: true,
+        startup_ready: None,
         db_available: None,
         admin_restore_max_body_size_mib: 100,
         reserved_ports: std::collections::HashSet::new(),
@@ -438,6 +445,7 @@ async fn test_get_plugin_config_by_id_falls_back_to_cached_config() {
         proxy_state: None,
         mode: "test".to_string(),
         read_only: true,
+        startup_ready: None,
         db_available: None,
         admin_restore_max_body_size_mib: 100,
         reserved_ports: std::collections::HashSet::new(),
@@ -467,6 +475,7 @@ async fn test_get_plugin_config_not_found_in_cache() {
         proxy_state: None,
         mode: "test".to_string(),
         read_only: true,
+        startup_ready: None,
         db_available: None,
         admin_restore_max_body_size_mib: 100,
         reserved_ports: std::collections::HashSet::new(),
@@ -493,6 +502,7 @@ async fn test_list_proxies_no_db_no_cache_returns_503() {
         proxy_state: None,
         mode: "test".to_string(),
         read_only: true,
+        startup_ready: None,
         db_available: None,
         admin_restore_max_body_size_mib: 100,
         reserved_ports: std::collections::HashSet::new(),
@@ -522,6 +532,7 @@ async fn test_list_consumers_no_db_no_cache_returns_503() {
         proxy_state: None,
         mode: "test".to_string(),
         read_only: true,
+        startup_ready: None,
         db_available: None,
         admin_restore_max_body_size_mib: 100,
         reserved_ports: std::collections::HashSet::new(),
@@ -551,6 +562,7 @@ async fn test_get_proxy_no_db_no_cache_returns_503() {
         proxy_state: None,
         mode: "test".to_string(),
         read_only: true,
+        startup_ready: None,
         db_available: None,
         admin_restore_max_body_size_mib: 100,
         reserved_ports: std::collections::HashSet::new(),
@@ -584,6 +596,7 @@ async fn test_health_endpoint_shows_cached_config_info() {
         proxy_state: None,
         mode: "test".to_string(),
         read_only: true,
+        startup_ready: None,
         db_available: None,
         admin_restore_max_body_size_mib: 100,
         reserved_ports: std::collections::HashSet::new(),
@@ -618,6 +631,7 @@ async fn test_health_endpoint_shows_no_cached_config() {
         proxy_state: None,
         mode: "test".to_string(),
         read_only: true,
+        startup_ready: None,
         db_available: None,
         admin_restore_max_body_size_mib: 100,
         reserved_ports: std::collections::HashSet::new(),
@@ -637,6 +651,51 @@ async fn test_health_endpoint_shows_no_cached_config() {
     assert_eq!(body["cached_config"]["available"], false);
 }
 
+#[tokio::test]
+async fn test_health_endpoint_returns_503_until_startup_is_ready() {
+    let tc = TestConfig::default();
+    let startup_ready = Arc::new(AtomicBool::new(false));
+    let state = AdminState {
+        db: None,
+        jwt_manager: create_test_jwt_manager(&tc),
+        cached_config: Some(Arc::new(ArcSwap::new(Arc::new(
+            create_test_gateway_config(),
+        )))),
+        proxy_state: None,
+        mode: "test".to_string(),
+        read_only: true,
+        startup_ready: Some(startup_ready.clone()),
+        db_available: None,
+        admin_restore_max_body_size_mib: 100,
+        reserved_ports: std::collections::HashSet::new(),
+        stream_proxy_bind_address: "0.0.0.0".to_string(),
+    };
+    let (base_url, _shutdown) = start_test_admin(state).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(format!("{}/health", base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 503);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["status"], "starting");
+    assert_eq!(body["ready"], false);
+
+    startup_ready.store(true, Ordering::Relaxed);
+
+    let resp = client
+        .get(format!("{}/health", base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["status"], "ok");
+    assert_eq!(body["ready"], true);
+}
+
 // ---- Config updates are reflected in cached reads ----
 
 #[tokio::test]
@@ -650,6 +709,7 @@ async fn test_cached_config_reflects_live_updates() {
         proxy_state: None,
         mode: "test".to_string(),
         read_only: true,
+        startup_ready: None,
         db_available: None,
         admin_restore_max_body_size_mib: 100,
         reserved_ports: std::collections::HashSet::new(),
@@ -736,6 +796,7 @@ fn create_pagination_admin_state(tc: &TestConfig) -> AdminState {
         proxy_state: None,
         mode: "test".to_string(),
         read_only: true,
+        startup_ready: None,
         db_available: None,
         admin_restore_max_body_size_mib: 100,
         reserved_ports: std::collections::HashSet::new(),
@@ -890,6 +951,7 @@ async fn create_db_admin_state(tc: &TestConfig) -> (AdminState, tempfile::TempDi
         proxy_state: None,
         mode: "database".to_string(),
         read_only: false,
+        startup_ready: None,
         db_available: None,
         admin_restore_max_body_size_mib: 100,
         reserved_ports: std::collections::HashSet::new(),
@@ -967,6 +1029,7 @@ async fn create_db_admin_state_with_availability(
         proxy_state: None,
         mode: "database".to_string(),
         read_only: false,
+        startup_ready: None,
         db_available,
         admin_restore_max_body_size_mib: 100,
         reserved_ports: std::collections::HashSet::new(),
@@ -1048,6 +1111,7 @@ async fn test_batch_create_read_only_rejected() {
         proxy_state: None,
         mode: "test".to_string(),
         read_only: true,
+        startup_ready: None,
         db_available: None,
         admin_restore_max_body_size_mib: 100,
         reserved_ports: std::collections::HashSet::new(),
@@ -1311,6 +1375,7 @@ async fn test_restore_read_only_rejected() {
         proxy_state: None,
         mode: "test".to_string(),
         read_only: true,
+        startup_ready: None,
         db_available: None,
         admin_restore_max_body_size_mib: 100,
         reserved_ports: std::collections::HashSet::new(),
@@ -1452,6 +1517,7 @@ async fn test_list_upstreams_falls_back_to_cached_config() {
         proxy_state: None,
         mode: "test".to_string(),
         read_only: true,
+        startup_ready: None,
         db_available: None,
         admin_restore_max_body_size_mib: 100,
         reserved_ports: std::collections::HashSet::new(),
@@ -1486,6 +1552,7 @@ async fn test_get_upstream_by_id_falls_back_to_cached_config() {
         proxy_state: None,
         mode: "test".to_string(),
         read_only: true,
+        startup_ready: None,
         db_available: None,
         admin_restore_max_body_size_mib: 100,
         reserved_ports: std::collections::HashSet::new(),
@@ -1514,6 +1581,7 @@ async fn test_get_upstream_not_found_in_cache() {
         proxy_state: None,
         mode: "test".to_string(),
         read_only: true,
+        startup_ready: None,
         db_available: None,
         admin_restore_max_body_size_mib: 100,
         reserved_ports: std::collections::HashSet::new(),
@@ -1538,6 +1606,7 @@ async fn test_list_upstreams_no_db_no_cache_returns_503() {
         proxy_state: None,
         mode: "test".to_string(),
         read_only: true,
+        startup_ready: None,
         db_available: None,
         admin_restore_max_body_size_mib: 100,
         reserved_ports: std::collections::HashSet::new(),
@@ -1567,6 +1636,7 @@ async fn test_get_upstream_no_db_no_cache_returns_503() {
         proxy_state: None,
         mode: "test".to_string(),
         read_only: true,
+        startup_ready: None,
         db_available: None,
         admin_restore_max_body_size_mib: 100,
         reserved_ports: std::collections::HashSet::new(),
@@ -1874,6 +1944,7 @@ async fn test_backup_falls_back_to_cached_config_when_no_db() {
         proxy_state: None,
         mode: "test".to_string(),
         read_only: true,
+        startup_ready: None,
         db_available: None,
         admin_restore_max_body_size_mib: 100,
         reserved_ports: std::collections::HashSet::new(),
@@ -1907,6 +1978,7 @@ async fn test_backup_no_db_no_cache_returns_503() {
         proxy_state: None,
         mode: "test".to_string(),
         read_only: true,
+        startup_ready: None,
         db_available: None,
         admin_restore_max_body_size_mib: 100,
         reserved_ports: std::collections::HashSet::new(),
@@ -1939,6 +2011,7 @@ async fn test_create_proxy_returns_503_when_no_db() {
         proxy_state: None,
         mode: "database".to_string(),
         read_only: false,
+        startup_ready: None,
         db_available: None,
         admin_restore_max_body_size_mib: 100,
         reserved_ports: std::collections::HashSet::new(),
@@ -1968,6 +2041,7 @@ async fn test_create_upstream_returns_503_when_no_db() {
         proxy_state: None,
         mode: "database".to_string(),
         read_only: false,
+        startup_ready: None,
         db_available: None,
         admin_restore_max_body_size_mib: 100,
         reserved_ports: std::collections::HashSet::new(),
@@ -2043,6 +2117,7 @@ async fn test_cached_config_reflects_upstream_updates() {
         proxy_state: None,
         mode: "test".to_string(),
         read_only: true,
+        startup_ready: None,
         db_available: None,
         admin_restore_max_body_size_mib: 100,
         reserved_ports: std::collections::HashSet::new(),
@@ -2194,6 +2269,7 @@ async fn test_health_endpoint_shows_db_availability() {
         proxy_state: None,
         mode: "database".to_string(),
         read_only: false,
+        startup_ready: None,
         db_available: Some(db_flag.clone()),
         admin_restore_max_body_size_mib: 100,
         reserved_ports: std::collections::HashSet::new(),

@@ -7,7 +7,8 @@
 //!
 //! SNI is extracted from the CP URL so TLS certificate validation works
 //! correctly even when connecting via IP address with a hostname-based cert.
-
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tonic::metadata::MetadataValue;
 use tonic::transport::channel::ClientTlsConfig;
@@ -37,12 +38,33 @@ pub struct DpGrpcTlsConfig {
 }
 
 /// Connect to the Control Plane with an optional shutdown signal.
+#[allow(dead_code)] // Used by tests and library callers; binary startup uses the startup-aware variant.
 pub async fn start_dp_client_with_shutdown(
     cp_url: String,
     auth_token: String,
     proxy_state: ProxyState,
     shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
     tls_config: Option<DpGrpcTlsConfig>,
+) {
+    start_dp_client_with_shutdown_and_startup_ready(
+        cp_url,
+        auth_token,
+        proxy_state,
+        shutdown_rx,
+        tls_config,
+        None,
+    )
+    .await;
+}
+
+/// Connect to the Control Plane with an optional startup readiness flag.
+pub async fn start_dp_client_with_shutdown_and_startup_ready(
+    cp_url: String,
+    auth_token: String,
+    proxy_state: ProxyState,
+    shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
+    tls_config: Option<DpGrpcTlsConfig>,
+    startup_ready: Option<Arc<AtomicBool>>,
 ) {
     let node_id = uuid::Uuid::new_v4().to_string();
     info!("DP client starting, connecting to CP at {}", cp_url);
@@ -55,12 +77,13 @@ pub async fn start_dp_client_with_shutdown(
             return;
         }
 
-        match connect_and_subscribe(
+        match connect_and_subscribe_with_startup_ready(
             &cp_url,
             &auth_token,
             &node_id,
             &proxy_state,
             tls_config.as_ref(),
+            startup_ready.clone(),
         )
         .await
         {
@@ -92,12 +115,33 @@ pub async fn start_dp_client_with_shutdown(
     }
 }
 
+#[allow(dead_code)] // Used by tests and library callers; binary startup uses the startup-aware variant.
 pub async fn connect_and_subscribe(
     cp_url: &str,
     auth_token: &str,
     node_id: &str,
     proxy_state: &ProxyState,
     tls_config: Option<&DpGrpcTlsConfig>,
+) -> Result<(), anyhow::Error> {
+    connect_and_subscribe_with_startup_ready(
+        cp_url,
+        auth_token,
+        node_id,
+        proxy_state,
+        tls_config,
+        None,
+    )
+    .await
+}
+
+/// Connect to CP and optionally flip startup readiness after the first applied snapshot.
+pub async fn connect_and_subscribe_with_startup_ready(
+    cp_url: &str,
+    auth_token: &str,
+    node_id: &str,
+    proxy_state: &ProxyState,
+    tls_config: Option<&DpGrpcTlsConfig>,
+    startup_ready: Option<Arc<AtomicBool>>,
 ) -> Result<(), anyhow::Error> {
     let mut endpoint =
         Channel::from_shared(cp_url.to_string())?.connect_timeout(Duration::from_secs(10));
@@ -146,6 +190,7 @@ pub async fn connect_and_subscribe(
     });
 
     let mut stream = client.subscribe(request).await?.into_inner();
+    let mut initial_snapshot_applied = startup_ready.is_none();
 
     while let Some(update) = stream.message().await? {
         info!(
@@ -183,6 +228,17 @@ pub async fn connect_and_subscribe(
                         }
                         config.normalize_stream_proxy_paths();
                         proxy_state.update_config(config);
+                        if !initial_snapshot_applied {
+                            proxy_state
+                                .stream_listener_manager
+                                .wait_until_started(Duration::from_secs(10))
+                                .await?;
+                            if let Some(ref startup_ready) = startup_ready {
+                                startup_ready.store(true, Ordering::Relaxed);
+                            }
+                            initial_snapshot_applied = true;
+                            info!("DP startup complete; /health now reports ready");
+                        }
                         info!("Full configuration snapshot applied from CP");
                     }
                     Err(e) => {

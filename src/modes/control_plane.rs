@@ -15,6 +15,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
 use tonic::transport::server::ServerTlsConfig;
 use tonic::transport::{Certificate, Identity};
@@ -26,6 +27,7 @@ use crate::config::EnvConfig;
 use crate::config::db_loader::{DatabaseStore, DbPoolConfig};
 use crate::dns::{DnsCache, DnsConfig};
 use crate::grpc::cp_server::CpGrpcServer;
+use crate::startup::wait_for_start_signals;
 use crate::tls::{self, TlsPolicy};
 
 pub async fn run(
@@ -112,6 +114,7 @@ pub async fn run(
     // Shared flag: DB polling loop sets this to false when the database is
     // unreachable, causing the admin API to reject writes early and preserve
     // the cached config until the DB recovers.
+    let startup_ready = Arc::new(AtomicBool::new(false));
     let db_available = Arc::new(AtomicBool::new(true));
 
     let reserved_ports = env_config.reserved_gateway_ports();
@@ -122,6 +125,7 @@ pub async fn run(
         proxy_state: None,
         mode: "cp".into(),
         read_only: env_config.admin_read_only,
+        startup_ready: Some(startup_ready.clone()),
         db_available: Some(db_available.clone()),
         admin_restore_max_body_size_mib: env_config.admin_restore_max_body_size_mib,
         reserved_ports: reserved_ports.clone(),
@@ -154,6 +158,7 @@ pub async fn run(
             proxy_state: None,
             mode: "cp".into(),
             read_only: env_config.admin_read_only,
+            startup_ready: Some(startup_ready.clone()),
             db_available: Some(db_available.clone()),
             admin_restore_max_body_size_mib: env_config.admin_restore_max_body_size_mib,
             reserved_ports: reserved_ports.clone(),
@@ -254,12 +259,14 @@ pub async fn run(
         None
     };
 
+    let grpc_listener = tokio::net::TcpListener::bind(grpc_addr).await?;
     info!("CP gRPC server listening on {}", grpc_addr);
     let grpc_http2_max_concurrent_streams = env_config.server_http2_max_concurrent_streams;
     let grpc_http2_max_pending_accept_reset_streams =
         env_config.server_http2_max_pending_accept_reset_streams;
     let grpc_http2_max_local_error_reset_streams =
         env_config.server_http2_max_local_error_reset_streams;
+    let (grpc_started_tx, grpc_started_rx) = tokio::sync::oneshot::channel();
     let mut grpc_shutdown = shutdown_tx.subscribe();
     let grpc_handle = tokio::spawn(async move {
         let mut builder = Server::builder()
@@ -285,14 +292,24 @@ pub async fn run(
             }
             info!("CP gRPC server shutting down");
         };
+        let incoming = TcpListenerStream::new(grpc_listener);
+        let _ = grpc_started_tx.send(());
         if let Err(e) = builder
             .add_service(grpc_server.into_service())
-            .serve_with_shutdown(grpc_addr, shutdown_signal)
+            .serve_with_incoming_shutdown(incoming, shutdown_signal)
             .await
         {
             error!("gRPC server error: {}", e);
         }
     });
+
+    wait_for_start_signals(
+        vec![("CP gRPC listener".to_string(), grpc_started_rx)],
+        Duration::from_secs(10),
+    )
+    .await?;
+    startup_ready.store(true, Ordering::Relaxed);
+    info!("Control plane startup complete; /health now reports ready");
 
     // Database polling loop -> push incremental deltas to DPs (with shutdown).
     //

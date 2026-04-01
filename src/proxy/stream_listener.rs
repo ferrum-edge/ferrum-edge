@@ -6,6 +6,8 @@
 
 use std::net::IpAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
@@ -27,6 +29,7 @@ struct ListenerHandle {
     listen_port: u16,
     protocol: BackendProtocol,
     frontend_tls: bool,
+    started: Arc<AtomicBool>,
 }
 
 /// Manages the set of active TCP/UDP stream listeners.
@@ -246,8 +249,10 @@ impl StreamListenerManager {
             let lb_cache = self.load_balancer_cache.clone();
             let tls_no_verify = self.tls_no_verify;
             let cb_cache = self.circuit_breaker_cache.clone();
+            let started = Arc::new(AtomicBool::new(false));
 
             let join_handle = if protocol.is_udp() {
+                let started_for_listener = started.clone();
                 // UDP or DTLS listener
                 let frontend_dtls_config = if *frontend_tls {
                     let paths = self.frontend_dtls_cert_key.load();
@@ -298,6 +303,7 @@ impl StreamListenerManager {
                         cleanup_interval_seconds: udp_cleanup_interval,
                         plugin_cache,
                         circuit_breaker_cache: cb_cache,
+                        started: started_for_listener,
                     })
                     .await
                     {
@@ -310,6 +316,7 @@ impl StreamListenerManager {
                     }
                 })
             } else {
+                let started_for_listener = started.clone();
                 // TCP or TcpTls listener
                 let tls_config = if *frontend_tls {
                     self.frontend_tls_config.load().as_ref().clone()
@@ -338,6 +345,7 @@ impl StreamListenerManager {
                         tcp_idle_timeout_seconds: tcp_idle_timeout,
                         circuit_breaker_cache: cb_cache,
                         tls_policy,
+                        started: started_for_listener,
                     })
                     .await
                     {
@@ -366,11 +374,61 @@ impl StreamListenerManager {
                     listen_port: *port,
                     protocol: *protocol,
                     frontend_tls: *frontend_tls,
+                    started,
                 },
             );
         }
 
         bind_failures
+    }
+
+    /// Wait until all currently configured stream listeners have successfully
+    /// bound and can accept traffic.
+    pub async fn wait_until_started(&self, timeout: Duration) -> Result<(), anyhow::Error> {
+        let deadline = Instant::now() + timeout;
+
+        loop {
+            let current_config = self.config.load();
+            let desired: Vec<(String, u16, BackendProtocol, bool)> = current_config
+                .proxies
+                .iter()
+                .filter(|p| p.backend_protocol.is_stream_proxy())
+                .filter_map(|p| {
+                    p.listen_port
+                        .map(|port| (p.id.clone(), port, p.backend_protocol, p.frontend_tls))
+                })
+                .collect();
+
+            if desired.is_empty() {
+                return Ok(());
+            }
+
+            let all_started = {
+                let listeners = self.listeners.lock().await;
+                desired
+                    .iter()
+                    .all(|(proxy_id, port, protocol, frontend_tls)| {
+                        listeners.get(proxy_id).is_some_and(|handle| {
+                            handle.listen_port == *port
+                                && handle.protocol == *protocol
+                                && handle.frontend_tls == *frontend_tls
+                                && handle.started.load(Ordering::Acquire)
+                        })
+                    })
+            };
+
+            if all_started {
+                return Ok(());
+            }
+
+            if Instant::now() >= deadline {
+                return Err(anyhow::anyhow!(
+                    "Timed out waiting for stream listeners to complete startup"
+                ));
+            }
+
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     /// Shut down all active stream listeners.
