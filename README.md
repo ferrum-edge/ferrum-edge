@@ -347,6 +347,7 @@ See `tests/performance/` for the full benchmark suite.
 | Connection pooling | [docs/connection_pooling.md](docs/connection_pooling.md) |
 | Load balancing | [docs/load_balancing.md](docs/load_balancing.md) |
 | CP/DP distributed mode | [docs/cp_dp_mode.md](docs/cp_dp_mode.md) |
+| Kubernetes deployment | [docs/kubernetes_deployment.md](docs/kubernetes_deployment.md) |
 | TCP/UDP/DTLS proxy | [docs/tcp_udp_proxy.md](docs/tcp_udp_proxy.md) |
 | Frontend TLS/mTLS | [docs/frontend_tls.md](docs/frontend_tls.md) |
 | Backend mTLS | [docs/backend_mtls.md](docs/backend_mtls.md) |
