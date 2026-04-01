@@ -630,58 +630,120 @@ async fn run_udp(args: &BenchArgs) -> anyhow::Result<()> {
             let mut metrics = BenchMetrics::new();
 
             if use_dtls {
-                use webrtc_dtls::config::Config as DtlsConfig;
-                use webrtc_dtls::conn::DTLSConn;
-                use webrtc_util::Conn;
+                use dimpl::{Config, Dtls, Output};
 
-                let cfg = DtlsConfig {
-                    insecure_skip_verify: true,
-                    ..Default::default()
-                };
-
-                let sock = Arc::new(
-                    tokio::net::UdpSocket::bind("0.0.0.0:0")
-                        .await
-                        .map_err(|e| anyhow::anyhow!("udp bind: {e}"))?,
-                );
+                let sock = tokio::net::UdpSocket::bind("0.0.0.0:0")
+                    .await
+                    .map_err(|e| anyhow::anyhow!("udp bind: {e}"))?;
                 sock.connect(addr)
                     .await
                     .map_err(|e| anyhow::anyhow!("udp connect: {e}"))?;
 
-                let dtls_conn = tokio::time::timeout(
-                    Duration::from_secs(10),
-                    DTLSConn::new(
-                        Arc::clone(&sock) as Arc<dyn webrtc_util::Conn + Send + Sync>,
-                        cfg,
-                        true, // is_client
-                        None, // no existing state
-                    ),
-                )
-                .await
-                .map_err(|_| anyhow::anyhow!("dtls handshake timed out after 10s"))?
-                .map_err(|e| anyhow::anyhow!("dtls connect: {e}"))?;
+                let cert = dimpl::certificate::generate_self_signed_certificate()
+                    .map_err(|e| anyhow::anyhow!("cert gen: {e}"))?;
+                let config = Arc::new(Config::default());
+                let mut dtls = Dtls::new_auto(config, cert, std::time::Instant::now());
+                dtls.set_active(true); // client
 
-                let mut buf = vec![0u8; 65535];
+                // Drive handshake
+                let mut out_buf = vec![0u8; 2048];
+                let mut recv_buf = vec![0u8; 65536];
+                let hs_deadline = std::time::Instant::now() + Duration::from_secs(10);
+                let mut next_timeout: Option<std::time::Instant> = None;
+                let mut connected = false;
+
+                // Kick off handshake
+                loop {
+                    match dtls.poll_output(&mut out_buf) {
+                        Output::Packet(d) => { sock.send(d).await.map_err(|e| anyhow::anyhow!("hs send: {e}"))?; }
+                        Output::Timeout(t) => { next_timeout = Some(t); break; }
+                        _ => break,
+                    }
+                }
+
+                while !connected {
+                    if std::time::Instant::now() > hs_deadline {
+                        return Err(anyhow::anyhow!("dtls handshake timed out after 10s"));
+                    }
+                    let sleep_dur = next_timeout
+                        .map(|t| t.saturating_duration_since(std::time::Instant::now()))
+                        .unwrap_or(Duration::from_secs(5));
+                    tokio::select! {
+                        Ok(len) = sock.recv(&mut recv_buf) => {
+                            dtls.handle_packet(&recv_buf[..len]).map_err(|e| anyhow::anyhow!("hs pkt: {e}"))?;
+                        }
+                        _ = tokio::time::sleep(sleep_dur) => {
+                            if let Some(t) = next_timeout {
+                                if std::time::Instant::now() >= t {
+                                    dtls.handle_timeout(std::time::Instant::now()).map_err(|e| anyhow::anyhow!("hs timeout: {e}"))?;
+                                    next_timeout = None;
+                                }
+                            }
+                        }
+                    }
+                    loop {
+                        match dtls.poll_output(&mut out_buf) {
+                            Output::Packet(d) => { let _ = sock.send(d).await; }
+                            Output::Timeout(t) => { next_timeout = Some(t); break; }
+                            Output::Connected => { connected = true; }
+                            _ => break,
+                        }
+                    }
+                }
+
+                // Connected — run echo benchmark using Sans-IO loop
                 while Instant::now() < deadline {
                     let start = Instant::now();
-                    dtls_conn
-                        .send(&payload)
-                        .await
-                        .map_err(|e| anyhow::anyhow!("dtls send: {e}"))?;
-                    match tokio::time::timeout(Duration::from_secs(5), dtls_conn.recv(&mut buf))
-                        .await
-                    {
-                        Ok(Ok(n)) => {
-                            let latency = start.elapsed().as_micros() as u64;
-                            metrics.record(latency, n);
+                    dtls.send_application_data(&payload).map_err(|e| anyhow::anyhow!("dtls send: {e}"))?;
+
+                    // Drain encrypted packets
+                    loop {
+                        match dtls.poll_output(&mut out_buf) {
+                            Output::Packet(d) => { sock.send(d).await.map_err(|e| anyhow::anyhow!("send: {e}"))?; }
+                            Output::Timeout(t) => { next_timeout = Some(t); break; }
+                            _ => break,
                         }
-                        Ok(Err(e)) => {
-                            eprintln!("  dtls recv error: {e}");
-                            break;
+                    }
+
+                    // Wait for reply
+                    let mut got_reply = false;
+                    while !got_reply {
+                        let sleep_dur = next_timeout
+                            .map(|t| t.saturating_duration_since(std::time::Instant::now()))
+                            .unwrap_or(Duration::from_secs(5));
+                        tokio::select! {
+                            result = sock.recv(&mut recv_buf) => {
+                                match result {
+                                    Ok(len) => {
+                                        dtls.handle_packet(&recv_buf[..len]).map_err(|e| anyhow::anyhow!("pkt: {e}"))?;
+                                    }
+                                    Err(e) => {
+                                        eprintln!("  dtls recv error: {e}");
+                                        got_reply = true; // exit
+                                    }
+                                }
+                            }
+                            _ = tokio::time::sleep(sleep_dur) => {
+                                if let Some(t) = next_timeout {
+                                    if std::time::Instant::now() >= t {
+                                        let _ = dtls.handle_timeout(std::time::Instant::now());
+                                        next_timeout = None;
+                                    }
+                                }
+                            }
                         }
-                        Err(_) => {
-                            eprintln!("  dtls recv timeout");
-                            break;
+                        loop {
+                            match dtls.poll_output(&mut out_buf) {
+                                Output::Packet(d) => { let _ = sock.send(d).await; }
+                                Output::Timeout(t) => { next_timeout = Some(t); break; }
+                                Output::ApplicationData(d) => {
+                                    let latency = start.elapsed().as_micros() as u64;
+                                    metrics.record(latency, d.len());
+                                    got_reply = true;
+                                    break;
+                                }
+                                _ => break,
+                            }
                         }
                     }
                 }

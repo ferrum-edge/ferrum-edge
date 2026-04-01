@@ -17,7 +17,7 @@ Ferrum Edge supports raw TCP and UDP stream proxying alongside its HTTP-based pr
 | `tcp` | Plain TCP stream forwarding |
 | `tcp_tls` | TCP with TLS origination to backend (gateway connects to backend over TLS) |
 | `udp` | Plain UDP datagram forwarding with session tracking |
-| `dtls` | UDP with DTLS encryption to backend (DTLS 1.2 via `webrtc-dtls`) |
+| `dtls` | UDP with DTLS 1.2/1.3 encryption to backend (auto-negotiated via `dimpl`) |
 
 ## Configuration
 
@@ -136,11 +136,11 @@ FERRUM_DTLS_CERT_PATH=/path/to/dtls-cert.pem
 FERRUM_DTLS_KEY_PATH=/path/to/dtls-key.pem
 ```
 
-**Important:** DTLS requires ECDSA P-256 or Ed25519 certificates. RSA keys are not supported.
+**Important:** DTLS requires ECDSA P-256 or P-384 certificates. RSA and Ed25519 keys are not supported by the underlying `dimpl` library.
 
 ### Backend DTLS Origination (UDP)
 
-Use `backend_protocol: dtls` to encrypt UDP datagrams to the backend using DTLS 1.2. The gateway accepts plain UDP from clients and establishes a DTLS session per client to the backend.
+Use `backend_protocol: dtls` to encrypt UDP datagrams to the backend using DTLS 1.2/1.3 (auto-negotiated). The gateway accepts plain UDP from clients and establishes a DTLS session per client to the backend.
 
 DTLS uses the same `backend_tls_*` proxy fields as TCP TLS:
 
@@ -350,6 +350,6 @@ Stream proxy connections track:
 - **Connection-phase retries only**: TCP/UDP connections support retries during the connection phase (before data transfer starts). On connect failure, the gateway selects a different load-balanced target and retries with backoff. Once bytes have been forwarded, retries are not possible — the stream cannot be replayed.
 - **UDP max datagram**: Limited to 65,535 bytes per datagram (UDP protocol limit)
 - **Session isolation**: UDP sessions are keyed by source address — NAT'd clients sharing an IP:port will share a session
-- **DTLS key types**: DTLS only supports ECDSA P-256 and Ed25519 certificates — RSA keys are not supported by the underlying `webrtc-dtls` library
-- **DTLS protocol version**: Only DTLS 1.2 is supported (no DTLS 1.3). The `webrtc-dtls` library does not implement DTLS 1.3.
+- **DTLS key types**: DTLS supports ECDSA P-256 and P-384 certificates — RSA keys are not supported by the underlying `dimpl` library
+- **DTLS protocol version**: Both DTLS 1.2 and DTLS 1.3 (RFC 9147) are supported. Version is auto-negotiated — the highest mutually supported version is used.
 - **DTLS cert separation**: Frontend DTLS uses separate cert/key from TLS (`FERRUM_DTLS_CERT_PATH` / `FERRUM_DTLS_KEY_PATH` env vars, not the gateway's TLS cert)

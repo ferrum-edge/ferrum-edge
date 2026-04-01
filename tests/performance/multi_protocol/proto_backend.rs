@@ -314,47 +314,104 @@ async fn run_h3_server(addr: SocketAddr, server_config: quinn::ServerConfig) -> 
 }
 
 async fn run_dtls_echo(addr: SocketAddr, cert_path: &str, key_path: &str) -> anyhow::Result<()> {
-    use webrtc_dtls::config::Config as DtlsConfig;
-    use webrtc_dtls::crypto::Certificate as DtlsCert;
-    use webrtc_dtls::listener;
-    use webrtc_util::conn::Listener;
+    use dimpl::{Config, Dtls, DtlsCertificate, Output};
 
-    // from_pem expects key PEM before cert PEM
-    let cert_pem = std::fs::read_to_string(cert_path).context("reading DTLS cert")?;
-    let key_pem = std::fs::read_to_string(key_path).context("reading DTLS key")?;
-    let key_pem = key_pem
-        .replace("BEGIN PRIVATE KEY", "BEGIN PRIVATE_KEY")
-        .replace("END PRIVATE KEY", "END PRIVATE_KEY");
-    let combined_pem = format!("{key_pem}\n{cert_pem}");
-    let cert = DtlsCert::from_pem(&combined_pem)
-        .map_err(|e| anyhow::anyhow!("loading DTLS certificate: {e}"))?;
+    // Load certificate from PEM files
+    let cert_pem = std::fs::read(cert_path).context("reading DTLS cert")?;
+    let key_pem = std::fs::read(key_path).context("reading DTLS key")?;
 
-    let cfg = DtlsConfig {
-        certificates: vec![cert],
-        ..Default::default()
+    let cert_der = rustls_pemfile::certs(&mut &cert_pem[..])
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("No cert in PEM"))?
+        .map_err(|e| anyhow::anyhow!("cert parse: {e}"))?;
+    let key_der = rustls_pemfile::private_key(&mut &key_pem[..])
+        .map_err(|e| anyhow::anyhow!("key parse: {e}"))?
+        .ok_or_else(|| anyhow::anyhow!("No key in PEM"))?;
+
+    let certificate = DtlsCertificate {
+        certificate: cert_der.to_vec(),
+        private_key: key_der.secret_der().to_vec(),
     };
 
-    let listener = listener::listen(addr.to_string(), cfg)
-        .await
-        .map_err(|e| anyhow::anyhow!("DTLS listener bind error: {e}"))?;
+    let config = Arc::new(Config::default());
+    let socket = Arc::new(tokio::net::UdpSocket::bind(addr).await?);
+    eprintln!("  DTLS echo server listening on {addr}");
 
+    // Sans-IO demuxer: track per-client DTLS state machines
+    let sessions: Arc<dashmap::DashMap<SocketAddr, tokio::sync::mpsc::Sender<Vec<u8>>>> =
+        Arc::new(dashmap::DashMap::new());
+
+    let mut buf = vec![0u8; 65536];
     loop {
-        let (conn, _peer): (Arc<dyn webrtc_util::Conn + Send + Sync>, SocketAddr) = listener
-            .accept()
-            .await
-            .map_err(|e| anyhow::anyhow!("DTLS accept error: {e}"))?;
-        tokio::spawn(async move {
-            let mut buf = vec![0u8; 65535];
-            loop {
-                let n = match conn.recv(&mut buf).await {
-                    Ok(n) if n > 0 => n,
-                    _ => break,
-                };
-                if conn.send(&buf[..n]).await.is_err() {
-                    break;
+        let (len, peer) = socket.recv_from(&mut buf).await?;
+        let data = buf[..len].to_vec();
+
+        if let Some(tx) = sessions.get(&peer) {
+            let _ = tx.send(data).await;
+        } else {
+            // New client — spawn a DTLS server session
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(256);
+            let _ = tx.send(data).await;
+            sessions.insert(peer, tx);
+
+            let socket = socket.clone();
+            let config = config.clone();
+            let cert = certificate.clone();
+            let sessions = sessions.clone();
+
+            tokio::spawn(async move {
+                let mut dtls = Dtls::new_auto(config, cert, std::time::Instant::now());
+                let mut out_buf = vec![0u8; 2048];
+                let mut connected = false;
+                let mut next_timeout: Option<std::time::Instant> = None;
+
+                loop {
+                    let sleep_dur = next_timeout
+                        .map(|t| t.saturating_duration_since(std::time::Instant::now()))
+                        .unwrap_or(std::time::Duration::from_secs(60));
+
+                    tokio::select! {
+                        Some(pkt) = rx.recv() => {
+                            if dtls.handle_packet(&pkt).is_err() { break; }
+                        }
+                        _ = tokio::time::sleep(sleep_dur) => {
+                            if let Some(t) = next_timeout {
+                                if std::time::Instant::now() >= t {
+                                    if dtls.handle_timeout(std::time::Instant::now()).is_err() { break; }
+                                    next_timeout = None;
+                                }
+                            }
+                        }
+                    }
+
+                    // Drain outputs — echo application data
+                    for _ in 0..64 {
+                        match dtls.poll_output(&mut out_buf) {
+                            Output::Packet(d) => { let _ = socket.send_to(d, peer).await; }
+                            Output::Timeout(t) => { next_timeout = Some(t); break; }
+                            Output::Connected => { connected = true; }
+                            Output::ApplicationData(d) if connected => {
+                                // Echo: send the data right back
+                                if dtls.send_application_data(d).is_err() { break; }
+                            }
+                            _ => break,
+                        }
+                    }
+
+                    // After echoing, drain the resulting Packet outputs
+                    if connected {
+                        for _ in 0..64 {
+                            match dtls.poll_output(&mut out_buf) {
+                                Output::Packet(d) => { let _ = socket.send_to(d, peer).await; }
+                                Output::Timeout(t) => { next_timeout = Some(t); break; }
+                                _ => break,
+                            }
+                        }
+                    }
                 }
-            }
-        });
+                sessions.remove(&peer);
+            });
+        }
     }
 }
 

@@ -14,7 +14,6 @@
 //!   cargo build --bin ferrum-edge && cargo test --test functional_tests -- functional_udp_proxy --ignored --nocapture
 
 use std::io::Write;
-use std::sync::Arc;
 use std::time::Duration;
 use tempfile::TempDir;
 use tokio::net::UdpSocket;
@@ -77,7 +76,7 @@ fn start_gateway_with_dtls(
         .env("FERRUM_FILE_CONFIG_PATH", config_path)
         .env("FERRUM_PROXY_HTTP_PORT", http_port.to_string())
         .env("FERRUM_ADMIN_HTTP_PORT", admin_port.to_string())
-        .env("RUST_LOG", "ferrum_edge=debug")
+        .env("FERRUM_LOG_LEVEL", "error")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
@@ -585,33 +584,32 @@ plugin_configs: []
     // Connect as a DTLS client to the gateway (with retries for CI timing)
     let dtls_client = connect_dtls_client_with_retry(proxy_port, 5).await;
 
-    // Send data through DTLS (use write/read — DTLSConn's public methods)
+    // Send data through DTLS (DtlsConnection send/recv)
     let msg1 = b"Hello through frontend DTLS!";
     dtls_client
-        .write(msg1, None)
+        .send(msg1)
         .await
         .expect("Failed to send via DTLS");
 
-    let mut buf = vec![0u8; 1024];
-    let n = tokio::time::timeout(Duration::from_secs(10), dtls_client.read(&mut buf, None))
+    let reply = tokio::time::timeout(Duration::from_secs(10), dtls_client.recv())
         .await
         .expect("DTLS recv timed out")
         .expect("DTLS recv error");
 
-    assert_eq!(&buf[..n], msg1, "Frontend DTLS echo should match sent data");
+    assert_eq!(&reply, msg1, "Frontend DTLS echo should match sent data");
 
     // Second datagram
     let msg2 = b"Second DTLS frontend datagram";
-    dtls_client.write(msg2, None).await.expect("send2 failed");
+    dtls_client.send(msg2).await.expect("send2 failed");
 
-    let n2 = tokio::time::timeout(Duration::from_secs(10), dtls_client.read(&mut buf, None))
+    let reply2 = tokio::time::timeout(Duration::from_secs(10), dtls_client.recv())
         .await
         .expect("recv2 timed out")
         .expect("recv2 error");
-    assert_eq!(&buf[..n2], msg2, "Second echo should match");
+    assert_eq!(&reply2, msg2, "Second echo should match");
 
     // Cleanup
-    let _ = dtls_client.close().await;
+    dtls_client.close().await;
     let _ = gateway.kill();
     let _ = gateway.wait();
     echo_server.abort();
@@ -671,20 +669,19 @@ plugin_configs: []
     // Connect as DTLS client (with retries for CI timing)
     let dtls_client = connect_dtls_client_with_retry(proxy_port, 5).await;
 
-    // Send data through full DTLS pipeline (use write/read — DTLSConn's public methods)
+    // Send data through full DTLS pipeline (DtlsConnection send/recv)
     let msg = b"Full DTLS end-to-end!";
-    dtls_client.write(msg, None).await.expect("Failed to send");
+    dtls_client.send(msg).await.expect("Failed to send");
 
-    let mut buf = vec![0u8; 1024];
-    let n = tokio::time::timeout(Duration::from_secs(10), dtls_client.read(&mut buf, None))
+    let reply = tokio::time::timeout(Duration::from_secs(10), dtls_client.recv())
         .await
         .expect("Full DTLS recv timed out")
         .expect("Full DTLS recv error");
 
-    assert_eq!(&buf[..n], msg, "Full DTLS e2e echo should match");
+    assert_eq!(&reply, msg, "Full DTLS e2e echo should match");
 
     // Cleanup
-    let _ = dtls_client.close().await;
+    dtls_client.close().await;
     let _ = gateway.kill();
     let _ = gateway.wait();
     dtls_echo.abort();
@@ -699,30 +696,30 @@ plugin_configs: []
 async fn connect_dtls_client_with_retry(
     proxy_port: u16,
     max_attempts: u32,
-) -> webrtc_dtls::conn::DTLSConn {
-    use webrtc_dtls::config::Config as DtlsConfig;
-
+) -> ferrum_edge::dtls::DtlsConnection {
     let mut last_err = String::new();
     for attempt in 1..=max_attempts {
-        let client_config = DtlsConfig {
-            insecure_skip_verify: true,
-            ..Default::default()
-        };
-
         let client_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         client_socket
             .connect(format!("127.0.0.1:{}", proxy_port))
             .await
             .unwrap();
-        let conn: Arc<dyn webrtc_util::Conn + Send + Sync> = Arc::new(client_socket);
+
+        let params = ferrum_edge::dtls::BackendDtlsParams {
+            config: std::sync::Arc::new(dimpl::Config::default()),
+            certificate: dimpl::certificate::generate_self_signed_certificate()
+                .expect("generate ephemeral cert"),
+            server_name: None,
+            server_cert_verifier: None,
+        };
 
         match tokio::time::timeout(
             Duration::from_secs(5),
-            webrtc_dtls::conn::DTLSConn::new(conn, client_config, true, None),
+            ferrum_edge::dtls::DtlsConnection::connect(client_socket, params),
         )
         .await
         {
-            Ok(Ok(dtls_conn)) => return dtls_conn,
+            Ok(Ok(conn)) => return conn,
             Ok(Err(e)) => {
                 last_err = format!("{}", e);
                 if attempt < max_attempts {
@@ -751,36 +748,39 @@ async fn connect_dtls_client_with_retry(
 ///
 /// Accepts DTLS connections and echoes back received datagrams.
 async fn start_dtls_echo_server(port: u16) -> tokio::task::JoinHandle<()> {
-    use webrtc_dtls::config::Config as DtlsConfig;
-    use webrtc_dtls::crypto::Certificate as DtlsCertificate;
-    use webrtc_util::conn::Listener;
-
     // Ensure rustls crypto provider is installed (needed for cert generation)
     let _ =
         rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
 
     let handle = tokio::spawn(async move {
-        let cert = DtlsCertificate::generate_self_signed(vec!["localhost".to_string()])
+        let cert = dimpl::certificate::generate_self_signed_certificate()
             .expect("Failed to generate self-signed cert");
 
-        let config = DtlsConfig {
-            certificates: vec![cert],
-            ..Default::default()
+        let addr: std::net::SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+        let frontend_config = ferrum_edge::dtls::FrontendDtlsConfig {
+            dimpl_config: std::sync::Arc::new(dimpl::Config::default()),
+            certificate: cert,
+            client_cert_verifier: None,
         };
 
-        let addr = format!("127.0.0.1:{}", port);
-        let listener = webrtc_dtls::listener::listen(addr, config)
+        let server = ferrum_edge::dtls::DtlsServer::bind(addr, frontend_config)
             .await
-            .expect("Failed to start DTLS listener");
+            .expect("Failed to start DTLS server");
+        let server = std::sync::Arc::new(server);
 
-        while let Ok((conn, _remote_addr)) = listener.accept().await {
-            // Spawn echo handler per connection
+        // Spawn the recv loop
+        let server_runner = server.clone();
+        tokio::spawn(async move {
+            let _ = server_runner.run().await;
+        });
+
+        // Accept and echo
+        while let Ok((conn, _remote_addr)) = server.accept().await {
             tokio::spawn(async move {
-                let mut buf = vec![0u8; 65535];
                 loop {
-                    match conn.recv(&mut buf).await {
-                        Ok(n) if n > 0 => {
-                            if conn.send(&buf[..n]).await.is_err() {
+                    match conn.recv().await {
+                        Ok(data) if !data.is_empty() => {
+                            if conn.send(&data).await.is_err() {
                                 break;
                             }
                         }

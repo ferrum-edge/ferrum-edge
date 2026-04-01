@@ -297,7 +297,7 @@ pub struct EnvConfig {
     #[allow(dead_code)] // Used in Phase 2 (stream listener startup)
     pub stream_proxy_bind_address: String,
 
-    // DTLS frontend certificates (ECDSA P-256 or Ed25519 required)
+    // DTLS frontend certificates (ECDSA P-256 or P-384 required)
     /// Path to DTLS server certificate (PEM) for frontend DTLS termination.
     /// If not set, a self-signed ECDSA P-256 certificate is generated at startup.
     pub dtls_cert_path: Option<String>,

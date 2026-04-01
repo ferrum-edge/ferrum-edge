@@ -470,7 +470,7 @@ The gateway supports fine-grained control over TLS protocol versions, cipher sui
 | **Inbound** | Proxy HTTPS, Admin HTTPS, HTTP/3 (QUIC) listeners |
 | **Outbound** | HTTP/1.1 and HTTP/2 backends (reqwest), hyper HTTP/2 pool, gRPC (grpcs://) backends, WebSocket (wss://) backends, TCP-TLS stream backends, HTTP/3 QUIC backends |
 
-> **Note:** DTLS (UDP-TLS) uses `webrtc-dtls` which has its own cipher negotiation independent of rustls. These TLS policy settings do not affect DTLS connections. `FERRUM_TLS_PREFER_SERVER_CIPHER_ORDER` and `FERRUM_TLS_SESSION_CACHE_SIZE` only apply to inbound listeners.
+> **Note:** DTLS (UDP-TLS) uses `dimpl` which has its own cipher negotiation independent of rustls. These TLS policy settings do not affect DTLS connections. `FERRUM_TLS_PREFER_SERVER_CIPHER_ORDER` and `FERRUM_TLS_SESSION_CACHE_SIZE` only apply to inbound listeners.
 
 ### Environment Variables
 

@@ -5,7 +5,7 @@
 //! to the original client address. Sessions are cleaned up after an idle timeout.
 //!
 //! **Backend DTLS**: When `backend_protocol` is `Dtls`, backend connections are
-//! wrapped with DTLS encryption using the `webrtc-dtls` crate. The proxy TLS
+//! wrapped with DTLS 1.2/1.3 encryption using the `dimpl` crate. The proxy TLS
 //! settings (`backend_tls_verify_server_cert`, etc.) control the DTLS handshake.
 //!
 //! **Frontend DTLS**: When `frontend_dtls_config` is provided, the listener
@@ -55,7 +55,7 @@ struct UdpSession {
     /// Plain UDP backend socket. `None` when using DTLS (traffic goes through `dtls_conn`).
     backend_socket: Option<Arc<UdpSocket>>,
     /// DTLS connection wrapping the backend socket (set when `backend_protocol == Dtls`).
-    dtls_conn: Option<Arc<webrtc_dtls::conn::DTLSConn>>,
+    dtls_conn: Option<Arc<crate::dtls::DtlsConnection>>,
     last_activity: AtomicU64, // epoch millis
     created_at: AtomicU64,    // epoch millis
     bytes_sent: AtomicU64,
@@ -82,7 +82,7 @@ pub struct UdpListenerConfig {
     pub metrics: Arc<UdpProxyMetrics>,
     /// DTLS server config for frontend termination. When `Some`, the listener
     /// accepts DTLS connections from clients instead of plain UDP.
-    pub frontend_dtls_config: Option<webrtc_dtls::config::Config>,
+    pub frontend_dtls_config: Option<crate::dtls::FrontendDtlsConfig>,
     pub tls_no_verify: bool,
     /// Maximum concurrent sessions per proxy (from `FERRUM_UDP_MAX_SESSIONS`, default 10000).
     pub max_sessions: usize,
@@ -363,8 +363,9 @@ async fn process_datagram(
         .last_activity
         .store(coarse_epoch_millis(), Ordering::Relaxed);
     let send_result = if let Some(ref dtls) = session.dtls_conn {
-        dtls.write(data, None)
+        dtls.send(data)
             .await
+            .map(|()| data.len())
             .map_err(|e| std::io::Error::other(e.to_string()))
     } else if let Some(ref sock) = session.backend_socket {
         sock.send(data).await
@@ -542,10 +543,9 @@ fn spawn_session_cleanup(
 
 /// Start a DTLS frontend listener that accepts encrypted client connections.
 ///
-/// Unlike the plain UDP path (which uses a single socket with `recv_from` to demux
-/// by client address), the DTLS path uses `DTLSListener::accept()` which yields a
-/// per-client `Arc<dyn Conn>` with transparent DTLS encryption/decryption. Each
-/// accepted client is handled in its own spawned task.
+/// Uses `DtlsServer` from the `dtls` module which demultiplexes incoming UDP
+/// datagrams by source address and manages per-client DTLS 1.2/1.3 sessions.
+/// Each accepted client (post-handshake) is handled in its own spawned task.
 #[allow(clippy::too_many_arguments)]
 async fn start_dtls_frontend_listener(
     port: u16,
@@ -556,16 +556,14 @@ async fn start_dtls_frontend_listener(
     load_balancer_cache: Arc<LoadBalancerCache>,
     shutdown: watch::Receiver<bool>,
     metrics: Arc<UdpProxyMetrics>,
-    dtls_config: webrtc_dtls::config::Config,
+    dtls_config: crate::dtls::FrontendDtlsConfig,
     tls_no_verify: bool,
     max_sessions: usize,
     plugin_cache: Arc<PluginCache>,
     circuit_breaker_cache: Arc<CircuitBreakerCache>,
 ) -> Result<(), anyhow::Error> {
-    use webrtc_util::conn::Listener;
-
     let addr = SocketAddr::new(bind_addr, port);
-    let listener = crate::dtls::start_dtls_listener(addr, dtls_config).await?;
+    let server = Arc::new(crate::dtls::DtlsServer::bind(addr, dtls_config).await?);
     ensure_coarse_timer_started();
     info!(proxy_id = %proxy_id, "DTLS frontend listener started on {}", addr);
 
@@ -581,12 +579,21 @@ async fn start_dtls_frontend_listener(
             .unwrap_or((None, BackendProtocol::Dtls))
     };
 
+    // Spawn the server's recv loop in a background task
+    let server_runner = server.clone();
+    let runner_proxy_id = proxy_id.clone();
+    let server_task = tokio::spawn(async move {
+        if let Err(e) = server_runner.run().await {
+            warn!(proxy_id = %runner_proxy_id, "DTLS server recv loop error: {}", e);
+        }
+    });
+
     let mut shutdown_rx = shutdown;
 
     loop {
         tokio::select! {
-            result = listener.accept() => {
-                let (client_conn, client_addr): (Arc<dyn webrtc_util::Conn + Send + Sync>, SocketAddr) = match result {
+            result = server.accept() => {
+                let (client_conn, client_addr) = match result {
                     Ok(r) => r,
                     Err(e) => {
                         warn!(proxy_id = %proxy_id, "DTLS accept error: {}", e);
@@ -594,8 +601,7 @@ async fn start_dtls_frontend_listener(
                     }
                 };
 
-                // Atomically reserve a session slot before the DTLS handshake
-                // to prevent TOCTOU race where concurrent accepts all pass a load() check.
+                // Atomically reserve a session slot
                 let prev = metrics.active_sessions.fetch_add(1, Ordering::Relaxed);
                 if prev >= max_sessions as u64 {
                     metrics.active_sessions.fetch_sub(1, Ordering::Relaxed);
@@ -605,7 +611,7 @@ async fn start_dtls_frontend_listener(
                         "DTLS session limit reached ({}), rejecting connection",
                         max_sessions
                     );
-                    let _ = client_conn.close().await;
+                    client_conn.close().await;
                     continue;
                 }
 
@@ -626,13 +632,12 @@ async fn start_dtls_frontend_listener(
                             client = %client_addr,
                             "DTLS connection rejected by plugin"
                         );
-                        let _ = client_conn.close().await;
+                        client_conn.close().await;
                         rejected = true;
                         break;
                     }
                 }
                 if rejected {
-                    // Release the reserved slot since we're not proceeding.
                     metrics.active_sessions.fetch_sub(1, Ordering::Relaxed);
                     continue;
                 }
@@ -715,7 +720,8 @@ async fn start_dtls_frontend_listener(
             }
             _ = shutdown_rx.changed() => {
                 info!(proxy_id = %proxy_id, "DTLS frontend listener shutting down on port {}", port);
-                let _ = listener.close().await;
+                server.close().await;
+                let _ = server_task.await;
                 return Ok(());
             }
         }
@@ -747,7 +753,7 @@ struct DtlsHandlerResult {
 /// and the connection outcome, so even failed connections log which backend was attempted.
 #[allow(clippy::too_many_arguments)]
 async fn handle_dtls_client(
-    client_conn: Arc<dyn webrtc_util::Conn + Send + Sync>,
+    client_conn: crate::dtls::DtlsServerConn,
     client_addr: SocketAddr,
     proxy_id: &str,
     config: &arc_swap::ArcSwap<GatewayConfig>,
@@ -782,7 +788,7 @@ async fn handle_dtls_client(
 
 #[allow(clippy::too_many_arguments)]
 async fn handle_dtls_client_inner(
-    client_conn: Arc<dyn webrtc_util::Conn + Send + Sync>,
+    client_conn: crate::dtls::DtlsServerConn,
     client_addr: SocketAddr,
     proxy_id: &str,
     config: &arc_swap::ArcSwap<GatewayConfig>,
@@ -864,7 +870,7 @@ async fn handle_dtls_client_inner(
     };
     let (backend_udp, backend_dtls): (
         Option<Arc<UdpSocket>>,
-        Option<Arc<webrtc_dtls::conn::DTLSConn>>,
+        Option<Arc<crate::dtls::DtlsConnection>>,
     ) = if proxy.backend_protocol == BackendProtocol::Dtls {
         let socket = match UdpSocket::bind(ephemeral_bind).await {
             Ok(s) => s,
@@ -895,10 +901,10 @@ async fn handle_dtls_client_inner(
                 e
             ));
         }
-        let dtls_config =
+        let dtls_params =
             crate::dtls::build_backend_dtls_config(&proxy, &backend_host, tls_no_verify)?;
-        let dtls = match crate::dtls::connect_dtls_backend(socket, dtls_config).await {
-            Ok(d) => d,
+        let dtls = match crate::dtls::DtlsConnection::connect(socket, dtls_params).await {
+            Ok(d) => Arc::new(d),
             Err(e) => {
                 if let Some(ref cb_config) = proxy.circuit_breaker {
                     let cb = circuit_breaker_cache.get_or_create(
@@ -966,21 +972,24 @@ async fn handle_dtls_client_inner(
     );
 
     // Bidirectional forwarding: client (DTLS) ↔ backend (UDP or DTLS)
-    let client_read = client_conn.clone();
+    // Clone a sender for the backend→client direction before moving client_conn.
+    let client_sender = client_conn.clone_sender();
+    let client_close = client_sender.clone();
     let backend_dtls_write = backend_dtls.clone();
     let backend_udp_write = backend_udp.clone();
+    let backend_dtls_cleanup = backend_dtls.clone();
     let metrics_fwd = metrics.clone();
     let proxy_id_fwd = proxy_id.to_string();
 
     // Client → Backend
     let client_to_backend = tokio::spawn(async move {
-        let mut buf = vec![0u8; MAX_UDP_DATAGRAM_SIZE];
         loop {
-            let len = match client_read.recv(&mut buf).await {
-                Ok(0) => break,
-                Ok(n) => n,
+            let data = match client_conn.recv().await {
+                Ok(d) if d.is_empty() => break,
+                Ok(d) => d,
                 Err(_) => break,
             };
+            let len = data.len();
 
             metrics_fwd.datagrams_in.fetch_add(1, Ordering::Relaxed);
             metrics_fwd
@@ -988,12 +997,9 @@ async fn handle_dtls_client_inner(
                 .fetch_add(len as u64, Ordering::Relaxed);
 
             let send_ok = if let Some(ref dtls) = backend_dtls_write {
-                dtls.write(&buf[..len], None)
-                    .await
-                    .map(|_| ())
-                    .map_err(|e| e.to_string())
+                dtls.send(&data).await.map_err(|e| e.to_string())
             } else if let Some(ref sock) = backend_udp_write {
-                sock.send(&buf[..len])
+                sock.send(&data)
                     .await
                     .map(|_| ())
                     .map_err(|e| e.to_string())
@@ -1017,35 +1023,35 @@ async fn handle_dtls_client_inner(
     });
 
     // Backend → Client
-    let client_write = client_conn.clone();
     let metrics_rev = metrics.clone();
     let proxy_id_rev = proxy_id.to_string();
 
     let backend_to_client = tokio::spawn(async move {
         let mut buf = vec![0u8; MAX_UDP_DATAGRAM_SIZE];
         loop {
-            let len = if let Some(ref dtls) = backend_dtls {
-                match dtls.read(&mut buf, None).await {
-                    Ok(0) => break,
-                    Ok(n) => n,
+            let data = if let Some(ref dtls) = backend_dtls {
+                match dtls.recv().await {
+                    Ok(d) if d.is_empty() => break,
+                    Ok(d) => d,
                     Err(_) => break,
                 }
             } else if let Some(ref sock) = backend_udp {
                 match sock.recv(&mut buf).await {
                     Ok(0) => break,
-                    Ok(n) => n,
+                    Ok(n) => buf[..n].to_vec(),
                     Err(_) => break,
                 }
             } else {
                 break;
             };
+            let len = data.len();
 
             metrics_rev.datagrams_in.fetch_add(1, Ordering::Relaxed);
             metrics_rev
                 .bytes_in
                 .fetch_add(len as u64, Ordering::Relaxed);
 
-            if client_write.send(&buf[..len]).await.is_err() {
+            if client_sender.send(&data).await.is_err() {
                 debug!(
                     proxy_id = %proxy_id_rev,
                     "DTLS backend→client send failed"
@@ -1066,8 +1072,10 @@ async fn handle_dtls_client_inner(
         _ = backend_to_client => {}
     }
 
-    // Close client DTLS connection
-    let _ = client_conn.close().await;
+    client_close.close().await;
+    if let Some(ref dtls) = backend_dtls_cleanup {
+        dtls.close().await;
+    }
 
     Ok(())
 }
@@ -1170,8 +1178,7 @@ async fn create_session(
         "0.0.0.0:0"
     };
     let (backend_socket, dtls_conn) = if proxy.backend_protocol == BackendProtocol::Dtls {
-        // DTLS: create a connected socket and wrap it with DTLSConn.
-        // The DTLS layer takes ownership of the socket; no placeholder needed.
+        // DTLS: create a connected socket and perform DTLS handshake via dimpl.
         let socket = match UdpSocket::bind(ephemeral_bind).await {
             Ok(s) => s,
             Err(e) => {
@@ -1202,10 +1209,10 @@ async fn create_session(
             ));
         }
 
-        let dtls_config =
+        let dtls_params =
             crate::dtls::build_backend_dtls_config(&proxy, &backend_host, tls_no_verify)?;
-        let dtls = match crate::dtls::connect_dtls_backend(socket, dtls_config).await {
-            Ok(d) => d,
+        let dtls = match crate::dtls::DtlsConnection::connect(socket, dtls_params).await {
+            Ok(d) => Arc::new(d),
             Err(e) => {
                 if let Some(ref cb_config) = proxy.circuit_breaker {
                     let cb = circuit_breaker_cache.get_or_create(
@@ -1301,28 +1308,55 @@ async fn create_session(
     tokio::spawn(async move {
         let mut buf = vec![0u8; MAX_UDP_DATAGRAM_SIZE];
         loop {
-            // Read from backend — via DTLS or raw UDP
-            let recv_result = if let Some(ref dtls) = reply_dtls {
-                dtls.read(&mut buf, None)
-                    .await
-                    .map_err(|e| std::io::Error::other(e.to_string()))
+            // Read from backend — via DTLS (channel-based) or raw UDP (socket-based)
+            let (data_slice, data_vec);
+            let len;
+            if let Some(ref dtls) = reply_dtls {
+                match dtls.recv().await {
+                    Ok(d) if d.is_empty() => break,
+                    Ok(d) => {
+                        len = d.len();
+                        data_vec = Some(d);
+                        data_slice = None;
+                    }
+                    Err(e) => {
+                        debug!(
+                            proxy_id = %reply_proxy_id,
+                            client = %client_addr,
+                            "UDP backend DTLS recv error: {}",
+                            e
+                        );
+                        break;
+                    }
+                }
             } else if let Some(ref sock) = backend_socket {
-                sock.recv(&mut buf).await
+                match sock.recv(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        len = n;
+                        data_vec = None;
+                        data_slice = Some(&buf[..n]);
+                    }
+                    Err(e) => {
+                        debug!(
+                            proxy_id = %reply_proxy_id,
+                            client = %client_addr,
+                            "UDP backend recv error: {}",
+                            e
+                        );
+                        break;
+                    }
+                }
             } else {
                 break;
             };
 
-            let len = match recv_result {
-                Ok(len) => len,
-                Err(e) => {
-                    debug!(
-                        proxy_id = %reply_proxy_id,
-                        client = %client_addr,
-                        "UDP backend recv error: {}",
-                        e
-                    );
-                    break;
-                }
+            let send_data = if let Some(ref d) = data_vec {
+                d.as_slice()
+            } else if let Some(d) = data_slice {
+                d
+            } else {
+                break;
             };
 
             // Batch-local counters for this recv burst.
@@ -1331,7 +1365,7 @@ async fn create_session(
             let mut batch_bytes_received: u64 = len as u64;
             let now = coarse_epoch_millis();
 
-            if let Err(e) = frontend.send_to(&buf[..len], client_addr).await {
+            if let Err(e) = frontend.send_to(send_data, client_addr).await {
                 debug!(
                     proxy_id = %reply_proxy_id,
                     client = %client_addr,
@@ -1342,7 +1376,7 @@ async fn create_session(
             }
 
             // For plain UDP, drain additional pending replies without yielding.
-            // DTLS reads cannot use try_recv, so skip batching for DTLS backends.
+            // DTLS reads are channel-based (async only), so skip batching for DTLS backends.
             if !is_dtls {
                 let Some(ref sock) = backend_socket else {
                     break;
@@ -1374,7 +1408,7 @@ async fn create_session(
                                     .fetch_add(batch_bytes, Ordering::Relaxed);
                                 // Exit outer loop via return.
                                 if let Some(ref dtls) = reply_dtls {
-                                    let _ = dtls.close().await;
+                                    dtls.close().await;
                                 }
                                 // Only decrement if we actually removed (cleanup may have already).
                                 if reply_sessions.remove(&client_addr).is_some() {
@@ -1405,7 +1439,7 @@ async fn create_session(
         // Session's backend receiver exited — remove session
         // Close DTLS connection if active
         if let Some(ref dtls) = reply_dtls {
-            let _ = dtls.close().await;
+            dtls.close().await;
         }
         // Only decrement active_sessions if we actually removed the session
         // (the cleanup task may have already removed and decremented it).

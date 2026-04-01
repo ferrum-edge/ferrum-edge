@@ -1374,7 +1374,7 @@ components:
         Protocol used to communicate with the backend.
         TCP/UDP protocols (tcp, tcp_tls, udp, dtls) are raw stream proxies
         that require a `listen_port` instead of `listen_path`.
-        `dtls` encrypts UDP datagrams to the backend using DTLS 1.2 (ECDSA/Ed25519 keys only).
+        `dtls` encrypts UDP datagrams to the backend using DTLS 1.2/1.3 (ECDSA P-256/P-384 keys only, version auto-negotiated).
 
     AuthMode:
       type: string

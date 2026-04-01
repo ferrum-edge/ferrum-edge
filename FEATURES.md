@@ -132,7 +132,7 @@ Ferrum supports dynamic upstream target discovery through three providers, confi
 - Frontend mTLS with client certificate verification
 - Backend mTLS with per-proxy certificate configuration
 - CP/DP gRPC channel TLS and mTLS (one-way TLS or mutual certificate verification)
-- DTLS frontend termination and backend origination (ECDSA P-256 / Ed25519)
+- DTLS 1.2/1.3 frontend termination and backend origination (ECDSA P-256/P-384)
 - Configurable cipher suites, key exchange groups, and protocol versions
 - Database TLS/SSL with PostgreSQL and MySQL support
 
@@ -336,7 +336,6 @@ The following are known limitations tracked for future improvement:
 | Gap | Protocol | Reason | Workaround |
 |-----|----------|--------|------------|
 | No HTTP/2 WebSocket (RFC 8441) | WebSocket | hyper's server does not implement the Extended CONNECT method (RFC 8441) for HTTP/2 WebSocket upgrades. Client-side support exists in hyper 1.x but server-side requires low-level h2 crate work to handle `:protocol = "websocket"` pseudo-headers and `SETTINGS_ENABLE_CONNECT_PROTOCOL`. Axum added server-side support in 0.8.0 but Ferrum Edge uses hyper directly. | Clients must use HTTP/1.1 Upgrade or TLS-negotiated connections for WebSocket |
-| No DTLS 1.3 | UDP | DTLS 1.3 (RFC 9147, published April 2022) has no production-ready Rust implementation. The `webrtc-dtls` crate only supports DTLS 1.2 (RFC 6347). `rusty-dtls` exists but is early-stage (PSK-only handshakes). FFI to OpenSSL 3.2+ or WolfSSL would break the pure-Rust design. QUIC (already supported via quinn) provides TLS 1.3 over UDP but is not a transparent DTLS replacement. | Use TLS 1.3 over TCP, or use QUIC-based proxying for modern UDP security |
 
 ## Deployment
 

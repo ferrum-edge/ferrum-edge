@@ -358,10 +358,9 @@ These are hard-won findings from profiling. Violating them causes measurable reg
 
 ### Known Protocol Gaps
 
-Only two true gaps remain that cannot be solved without upstream library changes:
+Only one true gap remains that cannot be solved without upstream library changes:
 
 1. **No HTTP/2 WebSocket (RFC 8441)** — hyper's server doesn't support Extended CONNECT. Would require low-level h2 crate work to handle `:protocol = "websocket"` pseudo-headers.
-2. **No DTLS 1.3** — No production Rust implementation exists (RFC 9147). `webrtc-dtls` only supports DTLS 1.2. QUIC (already supported) provides TLS 1.3 over UDP as an alternative.
 
 ### Multi-Protocol Performance Testing
 
@@ -487,7 +486,7 @@ Reduce per-request allocations in plugin lookup
 | `FERRUM_ENABLE_STREAMING_LATENCY_TRACKING` | `false` | Track streaming response total latency (adds per-stream overhead) |
 | `FERRUM_BASIC_AUTH_HMAC_SECRET` | `ferrum-edge-change-me-in-production` | HMAC-SHA256 server secret for basic_auth (~1μs vs ~100ms bcrypt). **Must be changed in production.** |
 | `FERRUM_TRUSTED_PROXIES` | (empty) | Comma-separated CIDRs for XFF trust |
-| `FERRUM_DTLS_CERT_PATH` | (none) | PEM cert for frontend DTLS termination (ECDSA P-256 / Ed25519) |
+| `FERRUM_DTLS_CERT_PATH` | (none) | PEM cert for frontend DTLS termination (ECDSA P-256 / P-384) |
 | `FERRUM_DTLS_KEY_PATH` | (none) | PEM key for frontend DTLS termination |
 | `FERRUM_DTLS_CLIENT_CA_CERT_PATH` | (none) | PEM CA cert for verifying DTLS client certs (frontend mTLS) |
 | `FERRUM_PLUGIN_HTTP_SLOW_THRESHOLD_MS` | `1000` | Threshold (ms) for warning-level logs on slow plugin HTTP calls |
