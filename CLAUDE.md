@@ -558,6 +558,9 @@ Reduce per-request allocations in plugin lookup
 | `FERRUM_MAX_CONNECTIONS` | `100000` | Max concurrent proxy connections (semaphore-bounded; 0 = unlimited) |
 | `FERRUM_TCP_LISTEN_BACKLOG` | `2048` | TCP listen backlog size (min 128) |
 | `FERRUM_SERVER_HTTP2_MAX_CONCURRENT_STREAMS` | `1000` | Server-side HTTP/2 max concurrent streams per inbound connection |
+| `FERRUM_SERVER_HTTP2_MAX_PENDING_ACCEPT_RESET_STREAMS` | `64` | Server-side HTTP/2 pending reset-stream threshold before GOAWAY |
+| `FERRUM_SERVER_HTTP2_MAX_LOCAL_ERROR_RESET_STREAMS` | `256` | Server-side HTTP/2 local reset-stream threshold before GOAWAY |
+| `FERRUM_WEBSOCKET_MAX_CONNECTIONS` | `20000` | Max concurrently upgraded WebSocket connections (`0` = disabled) |
 
 See `src/config/env_config.rs` for the full list of 90+ environment variables.
 

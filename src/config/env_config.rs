@@ -367,6 +367,18 @@ pub struct EnvConfig {
     /// Limits how many requests a single HTTP/2 client can multiplex.
     /// Default: 1000 (nginx=128, envoy=100, unlimited by spec).
     pub server_http2_max_concurrent_streams: u32,
+    /// Server-side HTTP/2 max pending accept-reset streams per connection.
+    /// When exceeded, the server sends GOAWAY to mitigate rapid-reset abuse.
+    /// Default: 64.
+    pub server_http2_max_pending_accept_reset_streams: usize,
+    /// Server-side HTTP/2 max locally reset streams per connection.
+    /// When exceeded, the server sends GOAWAY to bound repeated local reset churn.
+    /// Default: 256.
+    pub server_http2_max_local_error_reset_streams: usize,
+    /// Maximum concurrently upgraded WebSocket connections.
+    /// Default: 20_000. Set to 0 to disable the dedicated WebSocket cap and
+    /// rely only on the global connection limit.
+    pub websocket_max_connections: usize,
 }
 
 impl Default for EnvConfig {
@@ -473,6 +485,9 @@ impl Default for EnvConfig {
             max_connections: 100_000,
             tcp_listen_backlog: 2048,
             server_http2_max_concurrent_streams: 1000,
+            server_http2_max_pending_accept_reset_streams: 64,
+            server_http2_max_local_error_reset_streams: 256,
+            websocket_max_connections: 20_000,
         }
     }
 }
@@ -744,6 +759,23 @@ impl EnvConfig {
             .and_then(|v| v.parse().ok())
             .map(|v: u32| v.max(1))
             .unwrap_or(1000),
+            server_http2_max_pending_accept_reset_streams: resolve_var(
+                conf,
+                "FERRUM_SERVER_HTTP2_MAX_PENDING_ACCEPT_RESET_STREAMS",
+            )
+            .and_then(|v| v.parse().ok())
+            .map(|v: usize| v.max(1))
+            .unwrap_or(64),
+            server_http2_max_local_error_reset_streams: resolve_var(
+                conf,
+                "FERRUM_SERVER_HTTP2_MAX_LOCAL_ERROR_RESET_STREAMS",
+            )
+            .and_then(|v| v.parse().ok())
+            .map(|v: usize| v.max(1))
+            .unwrap_or(256),
+            websocket_max_connections: resolve_var(conf, "FERRUM_WEBSOCKET_MAX_CONNECTIONS")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(20_000),
         };
 
         config.validate()?;
