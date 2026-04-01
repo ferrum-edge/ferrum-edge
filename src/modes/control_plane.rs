@@ -238,9 +238,19 @@ pub async fn run(
     };
 
     info!("CP gRPC server listening on {}", grpc_addr);
+    let grpc_http2_max_concurrent_streams = env_config.server_http2_max_concurrent_streams;
+    let grpc_http2_max_pending_accept_reset_streams =
+        env_config.server_http2_max_pending_accept_reset_streams;
+    let grpc_http2_max_local_error_reset_streams =
+        env_config.server_http2_max_local_error_reset_streams;
     let mut grpc_shutdown = shutdown_tx.subscribe();
     let grpc_handle = tokio::spawn(async move {
-        let mut builder = Server::builder();
+        let mut builder = Server::builder()
+            .max_concurrent_streams(Some(grpc_http2_max_concurrent_streams))
+            .http2_max_pending_accept_reset_streams(Some(
+                grpc_http2_max_pending_accept_reset_streams,
+            ))
+            .http2_max_local_error_reset_streams(Some(grpc_http2_max_local_error_reset_streams));
         if let Some(tls) = grpc_tls_config {
             builder = match builder.tls_config(tls) {
                 Ok(b) => b,

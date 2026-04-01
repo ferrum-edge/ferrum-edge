@@ -164,6 +164,9 @@ pub struct ProxyState {
     /// Parsed trusted proxy CIDRs for X-Forwarded-For client IP resolution.
     /// Pre-parsed from `env_config.trusted_proxies` to avoid re-parsing on every request.
     pub trusted_proxies: Arc<client_ip::TrustedProxies>,
+    /// Optional dedicated WebSocket admission control.
+    /// Enforced only on the upgrade path, never on the frame-forwarding hot path.
+    pub websocket_conn_limit: Option<Arc<tokio::sync::Semaphore>>,
     /// Manages TCP/UDP stream proxy listeners (dedicated port per proxy).
     pub stream_listener_manager: Arc<stream_listener::StreamListenerManager>,
     /// Monotonic instant captured at ProxyState creation for uptime calculation.
@@ -196,6 +199,13 @@ impl ProxyState {
         let trusted_proxies = Arc::new(client_ip::TrustedProxies::parse(
             &env_config.trusted_proxies,
         ));
+        let websocket_conn_limit = if env_config.websocket_max_connections > 0 {
+            Some(Arc::new(tokio::sync::Semaphore::new(
+                env_config.websocket_max_connections,
+            )))
+        } else {
+            None
+        };
         // Create connection pools with global configuration from environment
         let global_pool_config = PoolConfig::from_env();
         let tls_policy_arc = tls_policy.map(Arc::new);
@@ -316,6 +326,7 @@ impl ProxyState {
             max_request_body_size_bytes,
             max_response_body_size_bytes,
             trusted_proxies,
+            websocket_conn_limit,
             stream_listener_manager,
             started_at: Instant::now(),
             ws_connection_counter: Arc::new(AtomicU64::new(0)),
@@ -905,7 +916,15 @@ async fn handle_connection(
         .initial_connection_window_size(pool_cfg.http2_initial_connection_window_size)
         .adaptive_window(pool_cfg.http2_adaptive_window)
         .max_frame_size(pool_cfg.http2_max_frame_size)
-        .max_concurrent_streams(state.env_config.server_http2_max_concurrent_streams);
+        .max_concurrent_streams(state.env_config.server_http2_max_concurrent_streams)
+        .max_pending_accept_reset_streams(Some(
+            state
+                .env_config
+                .server_http2_max_pending_accept_reset_streams,
+        ))
+        .max_local_error_reset_streams(Some(
+            state.env_config.server_http2_max_local_error_reset_streams,
+        ));
 
     // WebSocket requests flow through handle_proxy_request so that authentication
     // and authorization plugins execute before the upgrade handshake.
@@ -952,6 +971,15 @@ fn set_tcp_keepalive(stream: &tokio::net::TcpStream) {
     let keepalive = socket2::TcpKeepalive::new().with_time(std::time::Duration::from_secs(60));
     if let Err(e) = socket.set_tcp_keepalive(&keepalive) {
         debug!("Failed to set TCP keepalive: {}", e);
+    }
+}
+
+fn try_acquire_websocket_connection_permit(
+    limit: Option<&Arc<tokio::sync::Semaphore>>,
+) -> Result<Option<tokio::sync::OwnedSemaphorePermit>, tokio::sync::TryAcquireError> {
+    match limit {
+        Some(limit) => limit.clone().try_acquire_owned().map(Some),
+        None => Ok(None),
     }
 }
 
@@ -1005,6 +1033,28 @@ async fn handle_websocket_request_authenticated(
             ));
         }
     };
+
+    // Reject upgrades once the dedicated WebSocket pool is full.
+    // This protects against idle upgraded-connection exhaustion without adding
+    // any work to the per-frame forwarding path.
+    let ws_connection_permit =
+        match try_acquire_websocket_connection_permit(state.websocket_conn_limit.as_ref()) {
+            Ok(permit) => permit,
+            Err(_) => {
+                warn!(
+                    proxy_id = %proxy.id,
+                    client_ip = %ctx.client_ip,
+                    websocket_limit = state.env_config.websocket_max_connections,
+                    "Rejecting WebSocket upgrade: connection limit reached"
+                );
+                state.request_count.fetch_add(1, Ordering::Relaxed);
+                record_status(&state, 503);
+                return Ok(build_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    r#"{"error":"WebSocket connection limit exceeded"}"#,
+                ));
+            }
+        };
 
     // Collect client headers to forward to backend
     let mut client_headers = collect_forwardable_headers(&parts.headers);
@@ -1309,6 +1359,7 @@ async fn handle_websocket_request_authenticated(
                     &proxy_id,
                     ws_conn_id,
                     ws_frame_plugins,
+                    ws_connection_permit,
                 )
                 .await
                 {
@@ -1599,6 +1650,7 @@ async fn run_websocket_proxy(
     proxy_id: &str,
     connection_id: u64,
     ws_frame_plugins: Vec<Arc<dyn Plugin>>,
+    _ws_connection_permit: Option<tokio::sync::OwnedSemaphorePermit>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut ws_config = WebSocketConfig::default();
     ws_config.max_frame_size = Some(16 << 20);
@@ -1965,7 +2017,15 @@ async fn handle_tls_connection(
         .initial_connection_window_size(pool_cfg.http2_initial_connection_window_size)
         .adaptive_window(pool_cfg.http2_adaptive_window)
         .max_frame_size(pool_cfg.http2_max_frame_size)
-        .max_concurrent_streams(state.env_config.server_http2_max_concurrent_streams);
+        .max_concurrent_streams(state.env_config.server_http2_max_concurrent_streams)
+        .max_pending_accept_reset_streams(Some(
+            state
+                .env_config
+                .server_http2_max_pending_accept_reset_streams,
+        ))
+        .max_local_error_reset_streams(Some(
+            state.env_config.server_http2_max_local_error_reset_streams,
+        ));
 
     // WebSocket requests flow through handle_proxy_request so that authentication
     // and authorization plugins execute before the upgrade handshake.
@@ -4996,6 +5056,29 @@ async fn proxy_to_backend_http3(
                 retained_body,
             )
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::try_acquire_websocket_connection_permit;
+    use std::sync::Arc;
+
+    #[test]
+    fn websocket_connection_permit_is_optional() {
+        let permit = try_acquire_websocket_connection_permit(None).unwrap();
+        assert!(permit.is_none());
+    }
+
+    #[test]
+    fn websocket_connection_permit_rejects_when_limit_is_exhausted() {
+        let limit = Arc::new(tokio::sync::Semaphore::new(1));
+        let _first = try_acquire_websocket_connection_permit(Some(&limit))
+            .unwrap()
+            .expect("first permit should be available");
+
+        let second = try_acquire_websocket_connection_permit(Some(&limit));
+        assert!(second.is_err(), "second permit should be rejected");
     }
 }
 

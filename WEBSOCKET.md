@@ -44,8 +44,10 @@ All other headers (including `authorization`, `cookie`, `sec-websocket-protocol`
 ## Timeouts and Limits
 
 - **Connect timeout**: Uses the proxy's `backend_connect_timeout_ms` setting (default: 5000ms) for the backend WebSocket connection
+- **Active connection cap**: `FERRUM_WEBSOCKET_MAX_CONNECTIONS` limits concurrently upgraded WebSocket connections (default: 20,000). Upgrades beyond the cap are rejected with `503 Service Unavailable`
 - **Max frame size**: 16 MiB per WebSocket frame
 - **Max message size**: 64 MiB per WebSocket message (a message can span multiple frames)
+- **Upgrade flood protection**: WebSocket requests go through the normal plugin pipeline before upgrade, so `rate_limiting` and `ip_restriction` can throttle abusive upgrade bursts
 
 ## URL Routing
 
