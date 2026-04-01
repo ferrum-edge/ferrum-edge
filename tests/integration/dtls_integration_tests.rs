@@ -704,7 +704,7 @@ async fn test_dtls_server_accepts_strict_dtls13_client() {
     assert_eq!(reply, b"strict-dtls13");
 
     server.close().await;
-    let _ = tokio::time::timeout(Duration::from_secs(5), accept_task)
+    tokio::time::timeout(Duration::from_secs(5), accept_task)
         .await
         .expect("accept task timeout")
         .expect("accept task join");
