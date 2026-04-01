@@ -1114,12 +1114,17 @@ async fn handle_update_proxy(
                 }
                 // Check OS-level port availability (best-effort TOCTOU check).
                 // For updates, the port may already be bound by the existing listener
-                // for this proxy — that's OK. We only check if the port changed.
-                let old_port = match db.get_proxy(id).await {
-                    Ok(Some(old)) => old.listen_port,
-                    _ => None,
+                // for this proxy — that's OK, unless the transport changed (e.g.
+                // TCP→UDP on the same port), in which case we must re-probe.
+                let (old_port, old_protocol) = match db.get_proxy(id).await {
+                    Ok(Some(old)) => (old.listen_port, Some(old.backend_protocol)),
+                    _ => (None, None),
                 };
-                if old_port != Some(port)
+                let port_changed = old_port != Some(port);
+                let transport_changed = old_protocol
+                    .map(|p| p.is_udp() != proxy.backend_protocol.is_udp())
+                    .unwrap_or(false);
+                if (port_changed || transport_changed)
                     && let Err(e) = check_port_available(
                         port,
                         &state.stream_proxy_bind_address,

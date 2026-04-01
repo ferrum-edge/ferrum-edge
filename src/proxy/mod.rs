@@ -385,12 +385,23 @@ impl ProxyState {
         use crate::config_delta::ConfigDelta;
 
         // Validate stream proxy port conflicts before applying any config.
+        // In DP mode, warn but don't reject — the DP doesn't control its config
+        // and one bad stream proxy port shouldn't block all other config updates.
         let reserved_ports = self.env_config.reserved_gateway_ports();
         if let Err(errors) = new_config.validate_stream_proxy_port_conflicts(&reserved_ports) {
-            for msg in &errors {
-                error!("Config reload rejected: {}", msg);
+            if matches!(
+                self.env_config.mode,
+                crate::config::env_config::OperatingMode::DataPlane
+            ) {
+                for msg in &errors {
+                    warn!("Stream proxy port conflict (non-fatal in DP mode): {}", msg);
+                }
+            } else {
+                for msg in &errors {
+                    error!("Config reload rejected: {}", msg);
+                }
+                return false;
             }
-            return false;
         }
 
         let old_config = self.config.load_full();
@@ -800,10 +811,22 @@ impl ProxyState {
         }
         let reserved_ports = self.env_config.reserved_gateway_ports();
         if let Err(errors) = new_config.validate_stream_proxy_port_conflicts(&reserved_ports) {
-            for msg in &errors {
-                error!("Incremental config rejected: {}", msg);
+            if matches!(
+                self.env_config.mode,
+                crate::config::env_config::OperatingMode::DataPlane
+            ) {
+                for msg in &errors {
+                    warn!(
+                        "Incremental stream proxy port conflict (non-fatal in DP mode): {}",
+                        msg
+                    );
+                }
+            } else {
+                for msg in &errors {
+                    error!("Incremental config rejected: {}", msg);
+                }
+                return false;
             }
-            return false;
         }
         if let Err(errors) = new_config.validate_upstream_references() {
             for msg in &errors {
