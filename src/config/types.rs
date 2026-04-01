@@ -1359,6 +1359,35 @@ impl GatewayConfig {
         }
     }
 
+    /// Validate that stream proxy ports do not conflict with gateway reserved ports.
+    ///
+    /// Reserved ports are the gateway's own listener ports (proxy HTTP/HTTPS,
+    /// admin HTTP/HTTPS, CP gRPC). A stream proxy binding to one of these would
+    /// shadow the gateway listener and cause startup failures or undefined behavior.
+    pub fn validate_stream_proxy_port_conflicts(
+        &self,
+        reserved_ports: &std::collections::HashSet<u16>,
+    ) -> Result<(), Vec<String>> {
+        let mut errors = Vec::new();
+        for proxy in &self.proxies {
+            if proxy.backend_protocol.is_stream_proxy()
+                && let Some(port) = proxy.listen_port
+                && reserved_ports.contains(&port)
+            {
+                errors.push(format!(
+                    "Stream proxy '{}' listen_port {} conflicts with a gateway reserved port \
+                     (proxy/admin/gRPC listener)",
+                    proxy.id, port
+                ));
+            }
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+
     /// Normalize stream proxy listen_paths to synthetic values.
     ///
     /// TCP/UDP proxies don't use URL path routing. This sets their `listen_path`

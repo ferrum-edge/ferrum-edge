@@ -391,7 +391,7 @@ paths:
         "403":
           $ref: "#/components/responses/ReadOnly"
         "409":
-          description: Conflict — `listen_path` already exists
+          description: Conflict — `listen_path` already exists, or stream proxy `listen_port` conflicts with another proxy, a gateway reserved port, or is not available on the host
           content:
             application/json:
               schema:
@@ -452,7 +452,7 @@ paths:
         "403":
           $ref: "#/components/responses/ReadOnly"
         "409":
-          description: Conflict — `listen_path` already exists on another proxy
+          description: Conflict — `listen_path` already exists on another proxy, or stream proxy `listen_port` conflicts with another proxy, a gateway reserved port, or is not available on the host
           content:
             application/json:
               schema:
@@ -1285,7 +1285,10 @@ components:
             Port for this TCP/UDP proxy to listen on (must be >= 1). Required when
             backend_protocol is tcp, tcp_tls, udp, or dtls. Must NOT be set for HTTP
             proxies. Each stream proxy binds its own dedicated port; duplicate ports
-            across stream proxies are rejected.
+            across stream proxies are rejected. In database mode, the Admin API also
+            rejects ports that conflict with gateway reserved ports (proxy/admin/gRPC
+            listeners) or are already bound on the host. In CP mode, local port
+            checks are skipped since stream proxies run on remote DP nodes.
         frontend_tls:
           type: boolean
           default: false

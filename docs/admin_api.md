@@ -62,6 +62,31 @@ curl -X PUT -H "Authorization: Bearer $TOKEN" \
 curl -X DELETE -H "Authorization: Bearer $TOKEN" http://localhost:9000/proxies/{proxy_id}
 ```
 
+### Stream Proxy (TCP/UDP)
+
+Stream proxies use `listen_port` instead of `listen_path`:
+
+```bash
+# Create a TCP stream proxy
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "listen_path": "",
+    "listen_port": 5432,
+    "backend_protocol": "tcp",
+    "backend_host": "db.internal",
+    "backend_port": 5432
+  }' \
+  http://localhost:9000/proxies
+```
+
+The Admin API validates `listen_port` at creation and update time:
+- **409 Conflict** if the port is already used by another stream proxy
+- **409 Conflict** if the port conflicts with a gateway reserved port (proxy HTTP/HTTPS, admin HTTP/HTTPS, or CP gRPC)
+- **409 Conflict** if the port is already bound by another process on the host (OS-level probe)
+
+In **CP mode**, the gateway reserved port and OS-level checks are skipped since stream proxies run on remote Data Plane nodes.
+
 ## Consumers
 
 ```bash

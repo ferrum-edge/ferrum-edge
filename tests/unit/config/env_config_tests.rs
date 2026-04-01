@@ -1399,3 +1399,69 @@ fn test_env_config_db_pool_invalid_values_use_defaults() {
         },
     );
 }
+
+// --- reserved_gateway_ports tests ---
+
+#[test]
+fn test_reserved_gateway_ports_defaults() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/tmp/test.yaml"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            let ports = config.reserved_gateway_ports();
+            assert!(
+                ports.contains(&8000),
+                "should contain default proxy HTTP port"
+            );
+            assert!(
+                ports.contains(&8443),
+                "should contain default proxy HTTPS port"
+            );
+            assert!(
+                ports.contains(&9000),
+                "should contain default admin HTTP port"
+            );
+            assert!(
+                ports.contains(&9443),
+                "should contain default admin HTTPS port"
+            );
+        },
+    );
+}
+
+#[test]
+fn test_reserved_gateway_ports_custom_ports() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/tmp/test.yaml"),
+            ("FERRUM_PROXY_HTTP_PORT", "3000"),
+            ("FERRUM_ADMIN_HTTP_PORT", "4000"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            let ports = config.reserved_gateway_ports();
+            assert!(ports.contains(&3000));
+            assert!(ports.contains(&4000));
+        },
+    );
+}
+
+#[test]
+fn test_reserved_gateway_ports_includes_grpc() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/tmp/test.yaml"),
+            ("FERRUM_CP_GRPC_LISTEN_ADDR", "0.0.0.0:50051"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            let ports = config.reserved_gateway_ports();
+            assert!(ports.contains(&50051), "should contain CP gRPC port");
+        },
+    );
+}

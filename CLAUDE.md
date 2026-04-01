@@ -99,6 +99,8 @@ Within each mode (database/file/dp), after config is loaded:
 12. **DTLS certs** — Loads `FERRUM_DTLS_CERT_PATH` / `FERRUM_DTLS_KEY_PATH` for UDP proxy frontend DTLS termination (ECDSA P-256 / Ed25519)
 13. **Backend TLS** — Per-proxy `backend_tls_client_cert_path`, `backend_tls_client_key_path`, and `backend_tls_server_ca_cert_path` are validated at config load time (startup and each reload). Invalid paths reject the config — no silent degradation.
 14. **CP/DP gRPC TLS** — CP loads `FERRUM_CP_GRPC_TLS_CERT_PATH` / key / client CA for the gRPC server. DP loads `FERRUM_DP_GRPC_TLS_*` certs for the gRPC client connection to CP.
+15. **Stream proxy port validation** — Validates that stream proxy `listen_port` values do not conflict with gateway reserved ports (`FERRUM_PROXY_HTTP_PORT`, `FERRUM_PROXY_HTTPS_PORT`, `FERRUM_ADMIN_HTTP_PORT`, `FERRUM_ADMIN_HTTPS_PORT`, CP gRPC port). Conflicts are fatal in database/file modes.
+16. **Stream listener bind** — `initial_reconcile_stream_listeners()` binds TCP/UDP stream proxy ports. In database/file modes, bind failure is fatal (gateway exits). In DP mode, bind failures are logged as errors but non-fatal — the DP continues serving HTTP traffic and retries when the CP pushes corrected config.
 
 ### External Secret Resolution
 
@@ -147,7 +149,7 @@ src/
 │   ├── http2_pool.rs          # HTTP/2 direct connection pool (hyper H2, sharded senders)
 │   ├── tcp_proxy.rs           # Raw TCP stream proxy with TLS termination/origination
 │   ├── udp_proxy.rs           # UDP datagram proxy with per-client session tracking, DTLS frontend/backend
-│   └── stream_listener.rs     # Stream listener lifecycle manager (reconcile on config reload)
+│   └── stream_listener.rs     # Stream listener lifecycle manager (reconcile on config reload, port pre-bind check)
 ├── plugins/                   # Plugin system (33 plugins, including 4 AI/LLM, 2 gRPC, and 3 WS frame plugins)
 │   ├── mod.rs                 # Plugin trait, registry, priority constants, lifecycle
 │   ├── [plugin_name].rs       # Individual plugin implementations
@@ -201,6 +203,29 @@ Routes are matched in priority order within each host tier (exact host → wildc
 2. **Regex routes second** — first match in config order wins
 
 **Regex listen_path patterns** (prefixed with `~`) are **auto-anchored for full-path matching**: `^` is prepended and `$` is appended if not already present. This means `~/users/[^/]+` becomes `^/users/[^/]+$` and will only match `/users/42`, not `/users/42/profile`. Operators who need prefix-style regex matching can end their pattern with `.*` (e.g., `~/api/v[0-9]+/.*`). The shared helper `anchor_regex_pattern()` in `src/config/types.rs` is used by the router, validation, and admin endpoints.
+
+### Stream Proxy Port Validation
+
+TCP/UDP stream proxies bind dedicated ports via `listen_port`. Port conflicts are detected at multiple levels:
+
+**Config validation** (`validate_stream_proxies()` + `validate_stream_proxy_port_conflicts()`):
+- `listen_port` required for stream proxies, forbidden for HTTP proxies
+- Unique across all stream proxies (in-memory check)
+- Must not collide with gateway reserved ports — collected by `EnvConfig::reserved_gateway_ports()` (proxy HTTP/HTTPS, admin HTTP/HTTPS, CP gRPC)
+
+**Admin API** (database/CP modes only):
+- Port uniqueness via DB query (`check_listen_port_unique()`)
+- Gateway reserved port conflict check (skipped in CP mode — proxies run on remote DPs)
+- OS-level port availability probe via `check_port_available()` — probes only the matching transport (TCP or UDP) then drops (skipped in CP mode)
+
+**Startup reconcile** (`initial_reconcile_stream_listeners()`):
+- Pre-binds each port before spawning the listener task; bind failures are collected
+- In database/file modes: bind failure is **fatal** — gateway exits with a clear error
+- In DP mode: bind failure is **non-fatal** — error logged, DP continues. This prevents a bad port pushed by the CP from permanently bricking the DP on restart. The DP retries when the CP pushes corrected config.
+
+**Runtime reconcile** (config reload / incremental update):
+- Bind failures are logged as errors but never crash the gateway
+- Failed listeners are skipped; existing working listeners continue unaffected
 
 ### Plugin System
 
@@ -464,7 +489,7 @@ Each test runs a gateway with protocol-specific config (`configs/*.yaml`) and a 
 - **Incremental Polling**: Database mode polls for changes at `FERRUM_DB_POLL_INTERVAL_SECONDS` (default 30s) using a two-phase incremental strategy:
   1. **Startup**: Full `SELECT *` on all 4 tables to build the initial config and seed the poller's known ID sets. The `loaded_at` timestamp is captured **before** queries execute so the safety margin covers the full load duration.
   2. **Subsequent polls**: `load_incremental_config()` uses indexed `SELECT * FROM X WHERE updated_at > ?` queries (4 tables) to fetch only changed rows, plus lightweight `SELECT id FROM X` queries (4 tables) to detect deletions by diffing against the known ID set. A 1-second safety margin on the timestamp prevents missing boundary writes.
-  3. **Validation**: Incremental results are validated (hosts, regex listen_paths, unique listen_paths, stream proxies, upstream references) before being applied — same as the full-load path. Invalid incremental configs are rejected and the previous valid config remains in effect.
+  3. **Validation**: Incremental results are validated (hosts, regex listen_paths, unique listen_paths, stream proxies, stream proxy gateway port conflicts, upstream references) before being applied — same as the full-load path. Invalid incremental configs are rejected and the previous valid config remains in effect.
   4. **Consistency**: The poller's known ID sets are only updated **after** `apply_incremental()` succeeds. If validation rejects the config, known IDs stay unchanged so the next poll re-fetches the same changes.
   5. **Fallback**: If the incremental poll fails for any reason, the loop automatically falls back to a full `load_full_config()` + `update_config()` cycle and re-seeds the known IDs.
   - The `updated_at` columns are indexed (`idx_proxies_updated_at`, `idx_consumers_updated_at`, `idx_plugin_configs_updated_at`, `idx_upstreams_updated_at`) so incremental queries use index scans, not full table scans.

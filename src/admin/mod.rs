@@ -52,6 +52,11 @@ pub struct AdminState {
     pub db_available: Option<Arc<AtomicBool>>,
     /// Max request body size in MiB for POST /restore.
     pub admin_restore_max_body_size_mib: usize,
+    /// Ports reserved by the gateway's own listeners (proxy, admin, gRPC).
+    /// Stream proxy `listen_port` values must not collide with these.
+    pub reserved_ports: std::collections::HashSet<u16>,
+    /// Bind address used for stream proxy listeners (for OS port availability checks).
+    pub stream_proxy_bind_address: String,
 }
 
 impl AdminState {
@@ -772,6 +777,37 @@ async fn handle_create_proxy(
                     ));
                 }
             }
+            // In CP mode the proxy runs on remote DPs, not this host — skip
+            // local port checks since they would test the wrong machine.
+            if state.mode != "cp" {
+                // Check against gateway reserved ports (proxy/admin/gRPC listeners)
+                if state.reserved_ports.contains(&port) {
+                    return Ok(json_response(
+                        StatusCode::CONFLICT,
+                        &json!({"error": format!(
+                            "listen_port {} conflicts with a gateway reserved port (proxy/admin/gRPC listener)",
+                            port
+                        )}),
+                    ));
+                }
+                // Check OS-level port availability (best-effort TOCTOU check).
+                // Only probe the transport the proxy will actually bind.
+                if let Err(e) = check_port_available(
+                    port,
+                    &state.stream_proxy_bind_address,
+                    proxy.backend_protocol.is_udp(),
+                )
+                .await
+                {
+                    return Ok(json_response(
+                        StatusCode::CONFLICT,
+                        &json!({"error": format!(
+                            "listen_port {} is not available on the host: {}",
+                            port, e
+                        )}),
+                    ));
+                }
+            }
         }
     } else if proxy.listen_port.is_some() {
         return Ok(json_response(
@@ -1060,6 +1096,48 @@ async fn handle_update_proxy(
                     return Ok(json_response(
                         StatusCode::SERVICE_UNAVAILABLE,
                         &db_error_response(&e),
+                    ));
+                }
+            }
+            // In CP mode the proxy runs on remote DPs, not this host — skip
+            // local port checks since they would test the wrong machine.
+            if state.mode != "cp" {
+                // Check against gateway reserved ports (proxy/admin/gRPC listeners)
+                if state.reserved_ports.contains(&port) {
+                    return Ok(json_response(
+                        StatusCode::CONFLICT,
+                        &json!({"error": format!(
+                            "listen_port {} conflicts with a gateway reserved port (proxy/admin/gRPC listener)",
+                            port
+                        )}),
+                    ));
+                }
+                // Check OS-level port availability (best-effort TOCTOU check).
+                // For updates, the port may already be bound by the existing listener
+                // for this proxy — that's OK, unless the transport changed (e.g.
+                // TCP→UDP on the same port), in which case we must re-probe.
+                let (old_port, old_protocol) = match db.get_proxy(id).await {
+                    Ok(Some(old)) => (old.listen_port, Some(old.backend_protocol)),
+                    _ => (None, None),
+                };
+                let port_changed = old_port != Some(port);
+                let transport_changed = old_protocol
+                    .map(|p| p.is_udp() != proxy.backend_protocol.is_udp())
+                    .unwrap_or(false);
+                if (port_changed || transport_changed)
+                    && let Err(e) = check_port_available(
+                        port,
+                        &state.stream_proxy_bind_address,
+                        proxy.backend_protocol.is_udp(),
+                    )
+                    .await
+                {
+                    return Ok(json_response(
+                        StatusCode::CONFLICT,
+                        &json!({"error": format!(
+                            "listen_port {} is not available on the host: {}",
+                            port, e
+                        )}),
                     ));
                 }
             }
@@ -3381,4 +3459,33 @@ fn hash_basic_auth_password(password: &str) -> Result<String, String> {
     mac.update(password.as_bytes());
     let hash = hex::encode(mac.finalize().into_bytes());
     Ok(format!("hmac_sha256:{}", hash))
+}
+
+/// Best-effort OS-level port availability check.
+///
+/// Probes only the transport that the stream proxy will actually bind (TCP or
+/// UDP), matching the runtime behavior in `stream_listener.rs`. This avoids
+/// false positives where an unrelated service on a different transport occupies
+/// the same numeric port.
+///
+/// There is an inherent TOCTOU race (the port could be taken between the check
+/// and the actual listener bind), but this catches the vast majority of real
+/// conflicts and provides a clear error at the admin API level rather than a
+/// silent startup failure.
+async fn check_port_available(port: u16, bind_address: &str, udp: bool) -> Result<(), String> {
+    let ip: std::net::IpAddr = bind_address
+        .parse()
+        .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+    let addr = std::net::SocketAddr::new(ip, port);
+
+    if udp {
+        if let Err(e) = tokio::net::UdpSocket::bind(addr).await {
+            return Err(format!("UDP bind failed: {}", e));
+        }
+    } else {
+        if let Err(e) = tokio::net::TcpListener::bind(addr).await {
+            return Err(format!("TCP bind failed: {}", e));
+        }
+    }
+    Ok(())
 }

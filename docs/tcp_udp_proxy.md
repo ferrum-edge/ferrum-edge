@@ -328,10 +328,29 @@ See [docs/plugin_execution_order.md](plugin_execution_order.md) for the full per
 ## Validation Rules
 
 - `listen_port` is required for stream proxies (1024-65535)
-- `listen_port` must be unique across all stream proxies
-- `listen_port` must not conflict with HTTP proxy ports, admin ports, or gRPC port
+- `listen_port` must be unique across all stream proxies (checked via database in DB/CP mode, in-memory in file mode)
+- `listen_port` must not conflict with gateway reserved ports — the proxy HTTP/HTTPS ports (`FERRUM_PROXY_HTTP_PORT`, `FERRUM_PROXY_HTTPS_PORT`), admin HTTP/HTTPS ports (`FERRUM_ADMIN_HTTP_PORT`, `FERRUM_ADMIN_HTTPS_PORT`), or CP gRPC port (`FERRUM_CP_GRPC_LISTEN_ADDR`)
 - HTTP proxies must not set `listen_port`
 - Stream proxies are excluded from the HTTP router (routed by port, not path)
+
+### Port Availability Enforcement
+
+Port conflicts are detected at multiple levels depending on the operating mode:
+
+| Check | Database Mode | File Mode | CP Mode | DP Mode |
+|-------|---------------|-----------|---------|---------|
+| Port uniqueness across proxies | Admin API (DB query) | Config load | Admin API (DB query) | N/A (read-only) |
+| Gateway reserved port conflict | Admin API (reject) | Startup (fatal) | Skipped¹ | Startup (warn) |
+| OS-level port availability | Admin API (probe) | Startup (fatal) | Skipped¹ | Startup (warn) |
+| Bind failure at listener start | Startup: fatal | Startup: fatal | N/A (no proxy) | Startup: warn, runtime: warn |
+
+¹ In CP mode, stream proxies run on remote Data Plane nodes, not the CP host. The CP cannot probe DP ports, so local port checks are skipped. Port conflicts are caught when the DP attempts to bind.
+
+**Database mode** provides the strongest pre-flight validation: the Admin API rejects a stream proxy configuration if the port conflicts with a gateway reserved port or is already bound by another process on the host.
+
+**File mode** validates at startup — the gateway exits with a clear error if any stream proxy port conflicts with a gateway port or cannot be bound.
+
+**DP mode** is intentionally lenient: the DP does not control its own configuration (it receives config from the CP), so port bind failures are logged as errors but do not prevent the DP from starting. This avoids a situation where a bad port pushed by the CP permanently prevents the DP from restarting. The DP continues serving HTTP traffic and any working stream proxies. When the CP pushes corrected config, the DP retries the failed listeners.
 
 ## Metrics
 

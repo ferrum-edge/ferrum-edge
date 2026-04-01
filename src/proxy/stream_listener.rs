@@ -136,7 +136,12 @@ impl StreamListenerManager {
     /// - Starts listeners for new stream proxies (TCP and UDP)
     /// - Stops listeners for removed stream proxies
     /// - Restarts listeners whose port or protocol changed
-    pub async fn reconcile(&self) {
+    ///
+    /// Returns a list of `(proxy_id, port, error_message)` for any listeners
+    /// that failed to start due to port binding errors. An empty vec means all
+    /// listeners started successfully.
+    pub async fn reconcile(&self) -> Vec<(String, u16, String)> {
+        let mut bind_failures = Vec::new();
         let current_config = self.config.load();
         let mut listeners = self.listeners.lock().await;
 
@@ -211,10 +216,34 @@ impl StreamListenerManager {
                 }
             }
 
-            let (shutdown_tx, shutdown_rx) = watch::channel(false);
-            let proxy_id_owned = proxy_id.clone();
+            // Pre-check port availability before spawning the listener task.
+            // This catches EADDRINUSE early with a clear error rather than having
+            // the spawned task fail silently in the background.
             let bind_addr = self.bind_addr;
             let port_val = *port;
+            let probe_addr = std::net::SocketAddr::new(bind_addr, port_val);
+            let probe_result = if protocol.is_udp() {
+                tokio::net::UdpSocket::bind(probe_addr).await.map(drop)
+            } else {
+                tokio::net::TcpListener::bind(probe_addr).await.map(drop)
+            };
+            if let Err(e) = probe_result {
+                let msg = format!(
+                    "Port {} is already in use on {}: {}",
+                    port_val, bind_addr, e
+                );
+                error!(
+                    proxy_id = %proxy_id,
+                    port = port_val,
+                    "Stream listener bind failed: {}",
+                    msg
+                );
+                bind_failures.push((proxy_id.clone(), port_val, msg));
+                continue;
+            }
+
+            let (shutdown_tx, shutdown_rx) = watch::channel(false);
+            let proxy_id_owned = proxy_id.clone();
             let config = self.config.clone();
             let dns_cache = self.dns_cache.clone();
             let lb_cache = self.load_balancer_cache.clone();
@@ -349,6 +378,8 @@ impl StreamListenerManager {
                 },
             );
         }
+
+        bind_failures
     }
 
     /// Wait until all currently configured stream listeners have successfully

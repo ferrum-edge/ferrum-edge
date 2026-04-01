@@ -292,7 +292,7 @@ proxies:
     backend_tls_verify_server_cert: false
 ```
 
-See [tcp_udp_proxy.md](tcp_udp_proxy.md) for full documentation.
+**Port validation:** Each `listen_port` must be unique across all stream proxies and must not conflict with gateway reserved ports (`FERRUM_PROXY_HTTP_PORT`, `FERRUM_PROXY_HTTPS_PORT`, `FERRUM_ADMIN_HTTP_PORT`, `FERRUM_ADMIN_HTTPS_PORT`, CP gRPC port). In database mode, the Admin API also probes OS-level port availability before accepting the config. See [tcp_udp_proxy.md](tcp_udp_proxy.md) for full documentation including per-mode behavior.
 
 ### Service Discovery
 

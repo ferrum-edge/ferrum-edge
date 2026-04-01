@@ -124,6 +124,17 @@ pub async fn run(
         }
     };
 
+    // Validate stream proxy ports don't conflict with gateway reserved ports
+    let reserved_ports = env_config.reserved_gateway_ports();
+    if let Err(errors) = config.validate_stream_proxy_port_conflicts(&reserved_ports) {
+        for msg in &errors {
+            error!("{}", msg);
+        }
+        return Err(anyhow::anyhow!(
+            "Stream proxy port conflicts with gateway reserved ports"
+        ));
+    }
+
     // DNS cache
     let dns_cache = DnsCache::new(DnsConfig {
         default_ttl_seconds: env_config.dns_cache_ttl_seconds,
@@ -355,6 +366,8 @@ pub async fn run(
         startup_ready: Some(startup_ready.clone()),
         db_available: Some(db_available.clone()),
         admin_restore_max_body_size_mib: env_config.admin_restore_max_body_size_mib,
+        reserved_ports: reserved_ports.clone(),
+        stream_proxy_bind_address: env_config.stream_proxy_bind_address.clone(),
     };
     let admin_shutdown = shutdown_tx.subscribe();
 
@@ -387,6 +400,8 @@ pub async fn run(
             startup_ready: Some(startup_ready.clone()),
             db_available: Some(db_available.clone()),
             admin_restore_max_body_size_mib: env_config.admin_restore_max_body_size_mib,
+            reserved_ports: reserved_ports.clone(),
+            stream_proxy_bind_address: env_config.stream_proxy_bind_address.clone(),
         };
         let admin_https_shutdown = shutdown_tx.subscribe();
 
@@ -439,7 +454,8 @@ pub async fn run(
         info!("Admin TLS not configured - HTTPS listener disabled");
     }
 
-    proxy_state.stream_listener_manager.reconcile().await;
+    // Start stream proxy listeners (TCP/UDP) — bind failures are fatal in database mode.
+    proxy_state.initial_reconcile_stream_listeners().await?;
     wait_for_start_signals(startup_signals, Duration::from_secs(10)).await?;
     proxy_state
         .stream_listener_manager

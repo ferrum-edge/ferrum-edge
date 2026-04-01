@@ -276,6 +276,7 @@ pub async fn run(
     let admin_http_addr: SocketAddr = env_config.admin_socket_addr(env_config.admin_http_port);
     let jwt_manager = create_jwt_manager_from_env()
         .map_err(|e| anyhow::anyhow!("Failed to create JWT manager: {}", e))?;
+    let reserved_ports = env_config.reserved_gateway_ports();
     let startup_ready = Arc::new(AtomicBool::new(false));
     let admin_state = AdminState {
         db: None, // DP has no direct DB access
@@ -287,6 +288,8 @@ pub async fn run(
         startup_ready: Some(startup_ready.clone()),
         db_available: None,
         admin_restore_max_body_size_mib: env_config.admin_restore_max_body_size_mib,
+        reserved_ports: reserved_ports.clone(),
+        stream_proxy_bind_address: env_config.stream_proxy_bind_address.clone(),
     };
     let admin_shutdown = shutdown_tx.subscribe();
 
@@ -319,6 +322,8 @@ pub async fn run(
             startup_ready: Some(startup_ready.clone()),
             db_available: None,
             admin_restore_max_body_size_mib: env_config.admin_restore_max_body_size_mib,
+            reserved_ports: reserved_ports.clone(),
+            stream_proxy_bind_address: env_config.stream_proxy_bind_address.clone(),
         };
         let admin_https_shutdown = shutdown_tx.subscribe();
 
@@ -371,12 +376,26 @@ pub async fn run(
         info!("Admin TLS not configured - HTTPS listener disabled");
     }
 
-    proxy_state.stream_listener_manager.reconcile().await;
+    // Start stream proxy listeners (TCP/UDP). In DP mode bind failures are non-fatal:
+    // the DP doesn't control its own config (it comes from CP), so a port
+    // conflict shouldn't prevent the DP from starting.
+    let failures = proxy_state.stream_listener_manager.reconcile().await;
+    for (proxy_id, port, err) in &failures {
+        error!(
+            proxy_id = %proxy_id,
+            port = port,
+            "Stream listener failed to bind at startup (non-fatal in DP mode): {}",
+            err
+        );
+    }
     wait_for_start_signals(startup_signals, Duration::from_secs(10)).await?;
-    proxy_state
-        .stream_listener_manager
-        .wait_until_started(Duration::from_secs(10))
-        .await?;
+    // wait_until_started is best-effort in DP mode — don't fail if some listeners couldn't bind
+    if failures.is_empty() {
+        proxy_state
+            .stream_listener_manager
+            .wait_until_started(Duration::from_secs(10))
+            .await?;
+    }
 
     let dp_proxy_state = proxy_state.clone();
     let dp_shutdown = shutdown_tx.subscribe();

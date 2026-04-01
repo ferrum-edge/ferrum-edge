@@ -317,14 +317,6 @@ impl ProxyState {
             tls_policy_arc.clone(),
         ));
 
-        // Reconcile stream proxy listeners (TCP/UDP) at startup so that any
-        // stream proxies in the initial config begin accepting connections
-        // immediately, without waiting for a config reload event.
-        let slm_startup = stream_listener_manager.clone();
-        tokio::spawn(async move {
-            slm_startup.reconcile().await;
-        });
-
         Ok(Self {
             config: config_arc,
             dns_cache,
@@ -356,6 +348,27 @@ impl ProxyState {
         })
     }
 
+    /// Reconcile stream proxy listeners at startup.
+    ///
+    /// This must be called after `ProxyState::new()` to start TCP/UDP listeners
+    /// for any stream proxies in the initial config. Returns an error if any
+    /// listener failed to bind its port (e.g., port already in use by another
+    /// process). The caller should fail startup on error.
+    pub async fn initial_reconcile_stream_listeners(&self) -> Result<(), anyhow::Error> {
+        let failures = self.stream_listener_manager.reconcile().await;
+        if failures.is_empty() {
+            return Ok(());
+        }
+        let mut msg = String::from("Stream listener(s) failed to bind:\n");
+        for (proxy_id, port, err) in &failures {
+            msg.push_str(&format!(
+                "  - proxy '{}' port {}: {}\n",
+                proxy_id, port, err
+            ));
+        }
+        Err(anyhow::anyhow!("{}", msg.trim_end()))
+    }
+
     /// Apply a new configuration, using incremental (surgical) updates when
     /// possible to avoid disrupting the hot request path.
     ///
@@ -370,6 +383,26 @@ impl ProxyState {
     /// Update the proxy configuration. Returns `true` if changes were applied.
     pub fn update_config(&self, new_config: GatewayConfig) -> bool {
         use crate::config_delta::ConfigDelta;
+
+        // Validate stream proxy port conflicts before applying any config.
+        // In DP mode, warn but don't reject — the DP doesn't control its config
+        // and one bad stream proxy port shouldn't block all other config updates.
+        let reserved_ports = self.env_config.reserved_gateway_ports();
+        if let Err(errors) = new_config.validate_stream_proxy_port_conflicts(&reserved_ports) {
+            if matches!(
+                self.env_config.mode,
+                crate::config::env_config::OperatingMode::DataPlane
+            ) {
+                for msg in &errors {
+                    warn!("Stream proxy port conflict (non-fatal in DP mode): {}", msg);
+                }
+            } else {
+                for msg in &errors {
+                    error!("Config reload rejected: {}", msg);
+                }
+                return false;
+            }
+        }
 
         let old_config = self.config.load_full();
 
@@ -425,7 +458,15 @@ impl ProxyState {
             // Reconcile stream proxy listeners (TCP/UDP)
             let slm = self.stream_listener_manager.clone();
             tokio::spawn(async move {
-                slm.reconcile().await;
+                let failures = slm.reconcile().await;
+                for (proxy_id, port, err) in &failures {
+                    tracing::error!(
+                        proxy_id = %proxy_id,
+                        port = port,
+                        "Stream listener failed to bind on config reload: {}",
+                        err
+                    );
+                }
             });
 
             // Reconcile service discovery tasks
@@ -543,7 +584,15 @@ impl ProxyState {
         if stream_proxies_changed {
             let slm = self.stream_listener_manager.clone();
             tokio::spawn(async move {
-                slm.reconcile().await;
+                let failures = slm.reconcile().await;
+                for (proxy_id, port, err) in &failures {
+                    tracing::error!(
+                        proxy_id = %proxy_id,
+                        port = port,
+                        "Stream listener failed to bind on config update: {}",
+                        err
+                    );
+                }
             });
         }
 
@@ -760,6 +809,25 @@ impl ProxyState {
             }
             return false;
         }
+        let reserved_ports = self.env_config.reserved_gateway_ports();
+        if let Err(errors) = new_config.validate_stream_proxy_port_conflicts(&reserved_ports) {
+            if matches!(
+                self.env_config.mode,
+                crate::config::env_config::OperatingMode::DataPlane
+            ) {
+                for msg in &errors {
+                    warn!(
+                        "Incremental stream proxy port conflict (non-fatal in DP mode): {}",
+                        msg
+                    );
+                }
+            } else {
+                for msg in &errors {
+                    error!("Incremental config rejected: {}", msg);
+                }
+                return false;
+            }
+        }
         if let Err(errors) = new_config.validate_upstream_references() {
             for msg in &errors {
                 warn!("Incremental config: {}", msg);
@@ -872,7 +940,15 @@ impl ProxyState {
         if stream_proxies_changed {
             let slm = self.stream_listener_manager.clone();
             tokio::spawn(async move {
-                slm.reconcile().await;
+                let failures = slm.reconcile().await;
+                for (proxy_id, port, err) in &failures {
+                    tracing::error!(
+                        proxy_id = %proxy_id,
+                        port = port,
+                        "Stream listener failed to bind on incremental config update: {}",
+                        err
+                    );
+                }
             });
         }
 

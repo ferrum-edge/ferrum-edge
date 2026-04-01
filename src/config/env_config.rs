@@ -801,6 +801,26 @@ impl EnvConfig {
         std::net::SocketAddr::new(ip, port)
     }
 
+    /// Collect all ports reserved by the gateway's own listeners.
+    ///
+    /// Stream proxy `listen_port` values must not collide with these ports.
+    /// Includes proxy HTTP/HTTPS, admin HTTP/HTTPS, and CP gRPC (when configured).
+    pub fn reserved_gateway_ports(&self) -> std::collections::HashSet<u16> {
+        let mut ports = std::collections::HashSet::new();
+        ports.insert(self.proxy_http_port);
+        ports.insert(self.proxy_https_port);
+        ports.insert(self.admin_http_port);
+        ports.insert(self.admin_https_port);
+        // CP gRPC listen address is "host:port" — extract the port if present.
+        if let Some(ref addr) = self.cp_grpc_listen_addr
+            && let Some(port_str) = addr.rsplit(':').next()
+            && let Ok(port) = port_str.parse::<u16>()
+        {
+            ports.insert(port);
+        }
+        ports
+    }
+
     /// Returns the database URL with TLS/SSL query parameters appended based on
     /// the `FERRUM_DB_SSL_*` environment variables. For PostgreSQL and MySQL, the
     /// SSL settings are translated into the appropriate connection string parameters.

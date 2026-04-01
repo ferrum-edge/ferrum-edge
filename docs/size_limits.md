@@ -245,7 +245,7 @@ All string fields reject ASCII control characters (null bytes, escape sequences,
 - **Referential integrity**: Proxy `upstream_id` must reference an existing upstream
 - **Plugin uniqueness**: Each proxy can have at most one plugin of each type
 - **Host/path uniqueness**: No two proxies can share overlapping host + listen_path combinations
-- **Stream proxy rules**: TCP/UDP proxies require `listen_port`; HTTP proxies must not set it
+- **Stream proxy rules**: TCP/UDP proxies require `listen_port`; HTTP proxies must not set it. In database mode, `listen_port` is also validated against gateway reserved ports (proxy/admin/gRPC) and checked for OS-level availability. In CP mode, local port checks are skipped since proxies run on remote DP nodes
 
 These limits are enforced during:
 - Admin API `POST`/`PUT` operations on all resource types

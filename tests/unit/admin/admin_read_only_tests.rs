@@ -53,6 +53,8 @@ fn create_test_admin_state(config: &TestConfig, read_only: bool) -> AdminState {
         startup_ready: None,
         db_available: None,
         admin_restore_max_body_size_mib: 100,
+        reserved_ports: std::collections::HashSet::new(),
+        stream_proxy_bind_address: "0.0.0.0".to_string(),
     }
 }
 
@@ -170,6 +172,8 @@ async fn test_admin_state_mode_field() {
         startup_ready: None,
         db_available: None,
         admin_restore_max_body_size_mib: 100,
+        reserved_ports: std::collections::HashSet::new(),
+        stream_proxy_bind_address: "0.0.0.0".to_string(),
     };
     assert_eq!(admin_state_prod.mode, "production");
 }
@@ -199,6 +203,8 @@ async fn test_check_write_allowed_permits_when_db_available() {
         startup_ready: None,
         db_available: Some(db_flag),
         admin_restore_max_body_size_mib: 100,
+        reserved_ports: std::collections::HashSet::new(),
+        stream_proxy_bind_address: "0.0.0.0".to_string(),
     };
     assert!(
         state.check_write_allowed().is_none(),
@@ -220,6 +226,8 @@ async fn test_check_write_allowed_blocks_when_db_unavailable() {
         startup_ready: None,
         db_available: Some(db_flag),
         admin_restore_max_body_size_mib: 100,
+        reserved_ports: std::collections::HashSet::new(),
+        stream_proxy_bind_address: "0.0.0.0".to_string(),
     };
     let resp = state.check_write_allowed();
     assert!(
@@ -247,6 +255,8 @@ async fn test_check_write_allowed_blocks_when_read_only() {
         startup_ready: None,
         db_available: Some(db_flag),
         admin_restore_max_body_size_mib: 100,
+        reserved_ports: std::collections::HashSet::new(),
+        stream_proxy_bind_address: "0.0.0.0".to_string(),
     };
     let resp = state.check_write_allowed();
     assert!(
@@ -273,6 +283,8 @@ async fn test_check_write_allowed_permits_when_no_db_flag() {
         startup_ready: None,
         db_available: None,
         admin_restore_max_body_size_mib: 100,
+        reserved_ports: std::collections::HashSet::new(),
+        stream_proxy_bind_address: "0.0.0.0".to_string(),
     };
     assert!(
         state.check_write_allowed().is_none(),
@@ -294,6 +306,8 @@ async fn test_db_available_flag_transitions() {
         startup_ready: None,
         db_available: Some(db_flag.clone()),
         admin_restore_max_body_size_mib: 100,
+        reserved_ports: std::collections::HashSet::new(),
+        stream_proxy_bind_address: "0.0.0.0".to_string(),
     };
 
     // Initially available

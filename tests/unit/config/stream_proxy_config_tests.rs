@@ -235,6 +235,70 @@ fn test_validate_mixed_http_and_stream_proxies() {
     assert!(config.validate_stream_proxies().is_ok());
 }
 
+// --- Gateway port conflict validation ---
+
+#[test]
+fn test_validate_stream_proxy_no_gateway_port_conflicts() {
+    let reserved: std::collections::HashSet<u16> = [8000, 8443, 9000, 9443].into();
+    let config = test_config(vec![
+        make_stream_proxy("tcp1", BackendProtocol::Tcp, 5432),
+        make_stream_proxy("udp1", BackendProtocol::Udp, 5353),
+    ]);
+    assert!(
+        config
+            .validate_stream_proxy_port_conflicts(&reserved)
+            .is_ok()
+    );
+}
+
+#[test]
+fn test_validate_stream_proxy_conflicts_with_proxy_http_port() {
+    let reserved: std::collections::HashSet<u16> = [8000, 8443, 9000, 9443].into();
+    let config = test_config(vec![make_stream_proxy("tcp1", BackendProtocol::Tcp, 8000)]);
+    let err = config
+        .validate_stream_proxy_port_conflicts(&reserved)
+        .unwrap_err();
+    assert_eq!(err.len(), 1);
+    assert!(err[0].contains("conflicts with a gateway reserved port"));
+    assert!(err[0].contains("8000"));
+}
+
+#[test]
+fn test_validate_stream_proxy_conflicts_with_admin_port() {
+    let reserved: std::collections::HashSet<u16> = [8000, 8443, 9000, 9443].into();
+    let config = test_config(vec![make_stream_proxy("udp1", BackendProtocol::Udp, 9000)]);
+    let err = config
+        .validate_stream_proxy_port_conflicts(&reserved)
+        .unwrap_err();
+    assert_eq!(err.len(), 1);
+    assert!(err[0].contains("9000"));
+}
+
+#[test]
+fn test_validate_stream_proxy_multiple_gateway_conflicts() {
+    let reserved: std::collections::HashSet<u16> = [8000, 8443, 9000, 9443].into();
+    let config = test_config(vec![
+        make_stream_proxy("tcp1", BackendProtocol::Tcp, 8000),
+        make_stream_proxy("tcp2", BackendProtocol::TcpTls, 9443),
+    ]);
+    let err = config
+        .validate_stream_proxy_port_conflicts(&reserved)
+        .unwrap_err();
+    assert_eq!(err.len(), 2);
+}
+
+#[test]
+fn test_validate_http_proxy_ignored_for_port_conflicts() {
+    // HTTP proxies don't have listen_port, so they should not trigger conflicts
+    let reserved: std::collections::HashSet<u16> = [8000, 8443, 9000, 9443].into();
+    let config = test_config(vec![make_http_proxy("http1", "/api")]);
+    assert!(
+        config
+            .validate_stream_proxy_port_conflicts(&reserved)
+            .is_ok()
+    );
+}
+
 // --- Normalize stream proxy paths ---
 
 #[test]
