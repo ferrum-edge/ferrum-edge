@@ -92,7 +92,7 @@ Each resource in the arrays uses the same schema as the individual `POST` endpoi
       "enabled": true,
       "proxy_id": "<proxy-id>",
       "config": {
-        "allow": ["user-1"]
+        "allowed_consumers": ["user-1"]
       }
     }
   ]
@@ -161,7 +161,7 @@ Create consumers, proxies, and plugin configs in a single request:
       "name": "access_control",
       "enabled": true,
       "proxy_id": "proxy-1",
-      "config": {"allow": ["tenant-1"]}
+      "config": {"allowed_consumers": ["tenant-1"]}
     },
     {
       "name": "key_auth",
@@ -173,7 +173,7 @@ Create consumers, proxies, and plugin configs in a single request:
       "name": "access_control",
       "enabled": true,
       "proxy_id": "proxy-2",
-      "config": {"allow": ["tenant-2"]}
+      "config": {"allowed_consumers": ["tenant-2"]}
     }
   ]
 }
@@ -238,7 +238,7 @@ curl -X POST http://localhost:9000/batch \
         "name": "access_control",
         "enabled": true,
         "proxy_id": "payments-proxy",
-        "config": {"allow": ["mobile-app"]}
+        "config": {"allowed_consumers": ["mobile-app"]}
       },
       {
         "name": "rate_limiting",
@@ -349,7 +349,7 @@ for i in range(0, len(tenants), CHUNK_SIZE):
             "name": "access_control",
             "enabled": True,
             "proxy_id": proxy_id,
-            "config": {"allow": [consumer_name]},
+            "config": {"allowed_consumers": [consumer_name]},
         })
 
     resp = requests.post(

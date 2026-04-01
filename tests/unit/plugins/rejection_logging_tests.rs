@@ -79,9 +79,12 @@ async fn test_rejected_request_summary_has_rejection_phase() {
 async fn test_log_rejected_request_noop_without_logging_plugins() {
     // Only auth plugins, no logging plugins
     let key_auth = create_plugin("key_auth", &json!({})).unwrap().unwrap();
-    let access_ctrl = create_plugin("access_control", &json!({"allowed_ips": ["0.0.0.0/0"]}))
-        .unwrap()
-        .unwrap();
+    let access_ctrl = create_plugin(
+        "access_control",
+        &json!({"allowed_consumers": ["testuser"]}),
+    )
+    .unwrap()
+    .unwrap();
 
     let plugins: Vec<Arc<dyn Plugin>> = vec![key_auth, access_ctrl];
 

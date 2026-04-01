@@ -181,7 +181,7 @@ The resolved client IP (`ctx.client_ip`) is used throughout the gateway:
 
 | Feature | How IP Is Used |
 |---|---|
-| **IP Whitelisting / Blacklisting** | `access_control` plugin checks `client_ip` against allow/block lists |
+| **IP Whitelisting / Blacklisting** | `ip_restriction` plugin checks `client_ip` against allow/deny lists |
 | **IP Restriction** | `ip_restriction` plugin enforces allow-first or deny-first IP policies |
 | **Rate Limiting** | When `limit_by="ip"` (default), rate limit key is `ip:{client_ip}` |
 | **Load Balancer Hashing** | `client_ip` used as hash key for consistent upstream selection |
