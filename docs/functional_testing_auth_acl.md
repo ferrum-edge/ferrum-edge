@@ -191,7 +191,7 @@ Plugins execute by priority (lower = first):
 2. `key_auth` (priority 1200) — API key lookup
 3. `basic_auth` (priority 1300) — Username/password verification
 4. `hmac_auth` (priority 1400) — HMAC signature verification
-5. `access_control` (priority 2000) — Consumer/IP authorization (runs in authorize phase, after auth)
+5. `access_control` (priority 2000) — Consumer authorization (runs in authorize phase, after auth)
 
 ### Consumer Credential Types
 

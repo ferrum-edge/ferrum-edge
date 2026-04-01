@@ -70,7 +70,7 @@ Ferrum supports dynamic upstream target discovery through three providers, confi
 
 ### Authorization & Security Plugins
 
-- **Access Control** — IP/CIDR and consumer-based allow/deny lists
+- **Access Control** — consumer-based allow/deny lists
 - **IP Restriction** — standalone IP/CIDR filtering
 - **Rate Limiting** — per-IP or per-consumer with configurable windows and optional header exposure; supports centralized Redis-backed mode (`sync_mode: "redis"`) for coordinated rate limiting across multiple data plane instances. Compatible with any RESP-protocol server (Redis, Valkey, DragonflyDB, KeyDB, Garnet). TLS uses gateway-level `FERRUM_TLS_CA_BUNDLE_PATH` and `FERRUM_TLS_NO_VERIFY`
 - **Request Size Limiting** — per-proxy request body size limits (lower than global default), Content-Length fast path + buffered body check

@@ -188,6 +188,8 @@ plugin_configs:
     enabled: true
 ```
 
+Operational note: keep application logs on `stdout`/`stderr` by default. In containers, let the container runtime or platform collect and rotate the stream. On VMs, prefer running Ferrum Edge under `systemd` or another supervisor and let `journald`, `rsyslog`, `logrotate`, or a host log agent handle retention and rotation. Only add application-level file logging if you have a specific requirement for local log files.
+
 See [docs/configuration.md](docs/configuration.md) for stream proxy config, service discovery, and the `ferrum.conf` reference.
 
 ## Admin API

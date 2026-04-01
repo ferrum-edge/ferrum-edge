@@ -239,7 +239,8 @@ The proxy engine handles all request routing and processing with **consistent se
 **Security Model**:
 - **WebSocket requests** go through the same plugin pipeline as HTTP requests
 - **Authentication plugins** (key_auth, jwt_auth, mtls_auth, etc.) protect WebSocket endpoints
-- **Authorization plugins** (access_control) enforce IP restrictions on WebSocket connections
+- **Authorization plugins** (`access_control`) enforce consumer authorization on WebSocket connections
+- **Pre-auth IP plugins** (`ip_restriction`) enforce IP/CIDR restrictions on WebSocket connections
 - **Rate limiting plugins** prevent WebSocket connection abuse
 - **Logging plugins** provide complete audit trail for WebSocket connections
 

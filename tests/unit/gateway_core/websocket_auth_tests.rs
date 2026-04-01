@@ -71,7 +71,11 @@ fn test_websocket_auth_configuration() {
           - name: "access_control" 
             enabled: true
             config:
-              allowed_ips: ["10.0.0.0/8", "192.168.0.0/16"]
+              allowed_consumers: ["trusted-websocket-client"]
+          - name: "ip_restriction"
+            enabled: true
+            config:
+              allow: ["10.0.0.0/8", "192.168.0.0/16"]
           - name: "rate_limiting"
             enabled: true
             config:
@@ -83,12 +87,14 @@ fn test_websocket_auth_configuration() {
     assert!(expected_config.contains("auth_mode"));
     assert!(expected_config.contains("key_auth"));
     assert!(expected_config.contains("access_control"));
+    assert!(expected_config.contains("ip_restriction"));
     assert!(expected_config.contains("rate_limiting"));
     assert!(expected_config.contains("wss")); // Secure WebSocket
 
     println!("✅ WebSocket security configuration validated:");
     println!("   - Authentication required (key_auth)");
     println!("   - Authorization enforced (access_control)");
+    println!("   - Client IP restriction enforced (ip_restriction)");
     println!("   - Rate limiting applied");
     println!("   - Secure WebSocket protocol (wss)");
 }

@@ -654,16 +654,16 @@ Authenticates requests using HMAC signatures.
 
 ### `access_control`
 
-Authorizes requests based on IP address, CIDR range, and/or the identified consumer's username. Blocked IPs take precedence over allowed IPs.
+Authorizes requests based on the identified consumer's username.
 
 **Priority:** 2000
 
 | Parameter | Type | Description |
 |---|---|---|
-| `allowed_ips` | String[] | IP addresses or CIDR ranges allowed |
-| `blocked_ips` | String[] | IP addresses or CIDR ranges explicitly denied |
 | `allowed_consumers` | String[] | Usernames allowed access (empty = allow all) |
 | `disallowed_consumers` | String[] | Usernames explicitly denied |
+
+Use [`ip_restriction`](#ip_restriction) for IP address or CIDR-based enforcement.
 
 ### `ip_restriction`
 
