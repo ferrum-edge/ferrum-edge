@@ -131,6 +131,7 @@ FERRUM_ADMIN_HTTP_PORT = 4000
 FERRUM_MAX_REQUEST_BODY_SIZE_BYTES = 5242880
 FERRUM_DNS_CACHE_TTL_SECONDS = 600
 FERRUM_HTTP3_MAX_STREAMS = 200
+FERRUM_GRPC_POOL_READY_WAIT_MS = 3
 FERRUM_SERVER_HTTP2_MAX_PENDING_ACCEPT_RESET_STREAMS = 80
 FERRUM_SERVER_HTTP2_MAX_LOCAL_ERROR_RESET_STREAMS = 320
 FERRUM_WEBSOCKET_MAX_CONNECTIONS = 1234
@@ -147,6 +148,7 @@ FERRUM_WEBSOCKET_MAX_CONNECTIONS = 1234
             assert_eq!(config.max_request_body_size_bytes, 5_242_880);
             assert_eq!(config.dns_cache_ttl_seconds, 600);
             assert_eq!(config.http3_max_streams, 200);
+            assert_eq!(config.grpc_pool_ready_wait_ms, 3);
             assert_eq!(config.server_http2_max_pending_accept_reset_streams, 80);
             assert_eq!(config.server_http2_max_local_error_reset_streams, 320);
             assert_eq!(config.websocket_max_connections, 1234);

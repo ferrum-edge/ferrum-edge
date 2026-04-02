@@ -141,6 +141,7 @@ fn create_test_env_config_with_mtls(
         http3_send_window: 8_388_608,
         http3_connections_per_backend: 4,
         http3_pool_idle_timeout_seconds: 120,
+        grpc_pool_ready_wait_ms: 1,
         pool_cleanup_interval_seconds: 30,
         tcp_idle_timeout_seconds: 300,
         udp_max_sessions: 10_000,

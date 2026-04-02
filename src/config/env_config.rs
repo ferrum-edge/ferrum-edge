@@ -266,6 +266,11 @@ pub struct EnvConfig {
     /// HTTP/3 pool idle timeout in seconds (default: 120).
     /// Connections idle longer than this are evicted from the pool.
     pub http3_pool_idle_timeout_seconds: u64,
+    /// Milliseconds the gRPC backend pool waits on a saturated HTTP/2 sender
+    /// for a free stream before opening a fresh connection (default: 1).
+    /// Lower values reduce queueing for unary gRPC under load. Set to 0 to
+    /// skip the wait and open a new backend connection immediately.
+    pub grpc_pool_ready_wait_ms: u64,
 
     // Connection pool cleanup
     /// Interval in seconds between connection pool cleanup sweeps (default: 30).
@@ -464,6 +469,7 @@ impl Default for EnvConfig {
             http3_send_window: 8_388_608,           // 8 MiB
             http3_connections_per_backend: 4,
             http3_pool_idle_timeout_seconds: 120,
+            grpc_pool_ready_wait_ms: 1,
             pool_cleanup_interval_seconds: 30,
             tcp_idle_timeout_seconds: 300,
             udp_max_sessions: 10_000,
@@ -684,6 +690,7 @@ impl EnvConfig {
                 "FERRUM_HTTP3_POOL_IDLE_TIMEOUT_SECONDS",
                 120,
             ),
+            grpc_pool_ready_wait_ms: resolve_u64(conf, "FERRUM_GRPC_POOL_READY_WAIT_MS", 1),
 
             // Connection pool cleanup
             pool_cleanup_interval_seconds: resolve_u64(
