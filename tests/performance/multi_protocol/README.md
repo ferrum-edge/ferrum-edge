@@ -101,6 +101,7 @@ Key environment variables set by the test runner:
 | `FERRUM_HTTP3_*` | (tuned) | H3/QUIC: 8 MiB stream, 32 MiB conn, 1000 max streams |
 | `FERRUM_HTTP3_CONNECTIONS_PER_BACKEND` | `4` | QUIC connections per backend |
 | `FERRUM_HTTP3_POOL_IDLE_TIMEOUT_SECONDS` | `120` | H3 pool idle eviction timeout |
+| `FERRUM_GRPC_POOL_READY_WAIT_MS` | `1` | gRPC pool sender wait before opening another backend H2 connection |
 | `FERRUM_POOL_CLEANUP_INTERVAL_SECONDS` | `30` | Pool cleanup sweep interval (all pools) |
 | `FERRUM_UDP_MAX_SESSIONS` | `10000` | Max concurrent UDP sessions per proxy |
 | `FERRUM_UDP_CLEANUP_INTERVAL_SECONDS` | `10` | UDP session cleanup interval |
@@ -203,6 +204,11 @@ Results from a local run on macOS (Apple Silicon), 10s duration, 200 concurrent 
 | TCP+TLS | 112,017 | 222,303 | ~50% | TLS termination + bidirectional copy (cached TLS config) |
 | UDP | 81,924 | 247,271 | ~67% | Per-datagram session lookup + forwarding |
 | UDP+DTLS | 75,150 | 101,452 | ~26% | DTLS termination + plain UDP forwarding |
+
+> Tuning note: in one back-to-back local comparison, lowering the gRPC pool
+> sender-ready wait from `5ms` to `1ms` improved gateway throughput by about
+> `3.8%` (`64,278` -> `66,734` requests/sec at `10s`, `200` concurrency).
+> Ferrum now defaults this knob to `1ms` via `FERRUM_GRPC_POOL_READY_WAIT_MS`.
 
 ## Prerequisites
 

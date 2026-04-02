@@ -23,6 +23,7 @@ FERRUM_POOL_HTTP2_INITIAL_CONNECTION_WINDOW_SIZE=33554432   # 32 MiB
 FERRUM_POOL_HTTP2_ADAPTIVE_WINDOW=false
 FERRUM_POOL_HTTP2_MAX_FRAME_SIZE=65535
 FERRUM_POOL_HTTP2_MAX_CONCURRENT_STREAMS=1000
+FERRUM_GRPC_POOL_READY_WAIT_MS=1
 ```
 
 ### Per-Proxy Overrides
@@ -55,6 +56,7 @@ proxies:
 | `FERRUM_POOL_HTTP2_ADAPTIVE_WINDOW` | `true` | Enable adaptive flow-control (BDP probing) |
 | `FERRUM_POOL_HTTP2_MAX_FRAME_SIZE` | `1048576` | Maximum HTTP/2 frame payload (bytes). Range: 16384–1048576. Default: 1 MiB |
 | `FERRUM_POOL_HTTP2_MAX_CONCURRENT_STREAMS` | `1000` | Max concurrent HTTP/2 streams per backend connection |
+| `FERRUM_GRPC_POOL_READY_WAIT_MS` | `1` | Milliseconds the dedicated gRPC pool waits for a free H2 stream before opening another backend connection |
 
 ## Sizing `FERRUM_POOL_MAX_IDLE_PER_HOST`
 
@@ -120,6 +122,12 @@ pool_enable_http2: false  # HTTP/1.1 recommended for WebSockets
 ```yaml
 pool_enable_http2: false  # Better compatibility with auth plugins
 ```
+
+## gRPC Saturation Tuning
+
+`FERRUM_GRPC_POOL_READY_WAIT_MS` only affects the dedicated `GrpcConnectionPool`. When all existing gRPC HTTP/2 senders are live but temporarily out of stream capacity, Ferrum waits this long before opening another backend connection.
+
+The default is `1ms`. In one back-to-back local multi-protocol benchmark comparison (`10s`, `200` concurrency, unary echo), `1ms` improved gRPC throughput by about `3.8%` versus `5ms` (`64,278` -> `66,734` requests/sec). Treat that as workload-specific guidance rather than a universal guarantee.
 
 ## Performance Impact
 

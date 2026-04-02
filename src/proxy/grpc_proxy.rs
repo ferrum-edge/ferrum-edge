@@ -72,6 +72,9 @@ pub struct GrpcConnectionPool {
     global_env_config: crate::config::EnvConfig,
     /// TLS hardening policy for backend connections (cipher suites, protocol versions).
     tls_policy: Option<Arc<TlsPolicy>>,
+    /// How long to wait for stream capacity on a live sender before opening a
+    /// new backend connection shard.
+    sender_ready_wait: Duration,
 }
 
 impl Default for GrpcConnectionPool {
@@ -90,12 +93,14 @@ impl GrpcConnectionPool {
         global_env_config: crate::config::EnvConfig,
         tls_policy: Option<Arc<TlsPolicy>>,
     ) -> Self {
+        let sender_ready_wait = Duration::from_millis(global_env_config.grpc_pool_ready_wait_ms);
         let pool = Self {
             entries: Arc::new(DashMap::new()),
             rr_counters: Arc::new(DashMap::new()),
             global_pool_config,
             global_env_config,
             tls_policy,
+            sender_ready_wait,
         };
 
         pool.start_cleanup_task();
@@ -209,18 +214,21 @@ impl GrpcConnectionPool {
         }
 
         // Phase 2: wait briefly on first live shard for a stream slot to free up.
+        // Keep this shorter than a typical successful unary gRPC round trip so
+        // backpressure doesn't turn into queueing latency under load.
         if let Some(key) = first_live_key
             && let Some(entry) = self.entries.get(&key)
         {
             let mut sender = entry.sender.clone();
             drop(entry);
-            match tokio::time::timeout(Duration::from_millis(5), sender.ready()).await {
+            match tokio::time::timeout(self.sender_ready_wait, sender.ready()).await {
                 Ok(Ok(())) => return Ok(sender),
                 Ok(Err(_)) => {
                     self.entries.remove(&key);
                 }
                 Err(_) => {
-                    // Still not ready after 5ms — fall through to create new connection
+                    // Still not ready after the configured wait — fall through
+                    // to create a new connection.
                 }
             }
         }

@@ -1342,6 +1342,36 @@ fn test_env_config_db_pool_custom_values() {
 }
 
 #[test]
+fn test_env_config_grpc_pool_ready_wait_default() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+        ],
+        || {
+            remove_var("FERRUM_GRPC_POOL_READY_WAIT_MS");
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.grpc_pool_ready_wait_ms, 1);
+        },
+    );
+}
+
+#[test]
+fn test_env_config_grpc_pool_ready_wait_custom_value() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_GRPC_POOL_READY_WAIT_MS", "7"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.grpc_pool_ready_wait_ms, 7);
+        },
+    );
+}
+
+#[test]
 fn test_env_config_db_pool_max_connections_minimum_clamped() {
     with_env_vars(
         &[
