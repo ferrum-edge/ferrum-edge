@@ -67,7 +67,7 @@ fn test_load_config_backup_empty_config() {
 }
 
 #[test]
-fn test_load_config_backup_normalizes_stream_proxy_paths() {
+fn test_load_config_backup_preserves_stream_proxy_listen_path() {
     let json = r#"{
         "version": "1",
         "proxies": [{
@@ -87,8 +87,8 @@ fn test_load_config_backup_normalizes_stream_proxy_paths() {
     let (_tmp, path) = write_tmp_file(json);
     let loaded = load_config_backup(&path).unwrap();
     assert_eq!(
-        loaded.proxies[0].listen_path, "__tcp:9999",
-        "stream proxy paths should be normalized"
+        loaded.proxies[0].listen_path, "/ignored",
+        "backup loading should preserve the user-facing stream listen_path"
     );
 }
 

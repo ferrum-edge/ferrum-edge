@@ -179,6 +179,24 @@ fn test_proxy_listen_path_control_chars() {
 }
 
 #[test]
+fn test_proxy_http_listen_path_must_start_with_slash_or_regex_prefix() {
+    let proxy = make_proxy("test", "api");
+    let errs = proxy.validate_fields().unwrap_err();
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("listen_path must start with '/' or '~'"))
+    );
+}
+
+#[test]
+fn test_stream_proxy_allows_empty_listen_path() {
+    let mut proxy = make_proxy("test", "");
+    proxy.backend_protocol = BackendProtocol::Tcp;
+    proxy.listen_port = Some(5432);
+    assert!(proxy.validate_fields().is_ok());
+}
+
+#[test]
 fn test_proxy_backend_host_control_chars() {
     let mut proxy = make_proxy("test", "/api");
     proxy.backend_host = "localhost\x00evil".into();
@@ -328,6 +346,16 @@ fn test_consumer_custom_id_too_long() {
 }
 
 #[test]
+fn test_consumer_username_empty_rejected() {
+    let consumer = make_consumer("test", "   ");
+    let errs = consumer.validate_fields().unwrap_err();
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("username must not be empty"))
+    );
+}
+
+#[test]
 fn test_consumer_credential_value_too_long() {
     let mut consumer = make_consumer("test", "alice");
     consumer.credentials.insert(
@@ -375,6 +403,18 @@ fn test_consumer_credentials_total_size_limit() {
 fn test_upstream_valid_fields_passes() {
     let upstream = make_upstream("test");
     assert!(upstream.validate_fields().is_ok());
+}
+
+#[test]
+fn test_upstream_requires_targets_or_service_discovery() {
+    let mut upstream = make_upstream("test");
+    upstream.targets.clear();
+    upstream.service_discovery = None;
+    let errs = upstream.validate_fields().unwrap_err();
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("must have at least one target or service_discovery"))
+    );
 }
 
 #[test]
@@ -559,6 +599,17 @@ fn test_plugin_config_deeply_nested_json() {
     pc.config = val;
     let errs = pc.validate_fields().unwrap_err();
     assert!(errs.iter().any(|e| e.contains("nesting depth")));
+}
+
+#[test]
+fn test_plugin_config_proxy_scope_requires_proxy_id() {
+    let mut pc = make_plugin_config("test");
+    pc.scope = PluginScope::Proxy;
+    let errs = pc.validate_fields().unwrap_err();
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("scope 'proxy' requires proxy_id"))
+    );
 }
 
 // ---- GatewayConfig.validate_all_fields() tests ----

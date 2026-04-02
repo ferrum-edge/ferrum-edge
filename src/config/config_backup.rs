@@ -29,8 +29,7 @@ pub fn load_config_backup(path: &str) -> Option<GatewayConfig> {
     match std::fs::read_to_string(file_path) {
         Ok(content) => match serde_json::from_str::<GatewayConfig>(&content) {
             Ok(mut config) => {
-                // Normalize stream proxy paths (same as file_loader)
-                config.normalize_stream_proxy_paths();
+                config.normalize_fields();
                 info!(
                     "Config backup loaded: {} proxies, {} consumers from {}",
                     config.proxies.len(),

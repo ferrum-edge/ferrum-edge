@@ -211,12 +211,33 @@ pub async fn connect_and_subscribe_with_startup_ready(
                 // FULL_SNAPSHOT — replace entire config
                 match serde_json::from_str::<GatewayConfig>(&update.config_json) {
                     Ok(mut config) => {
-                        config.normalize_hosts();
+                        config.normalize_fields();
+                        if let Err(errors) = config.validate_all_fields() {
+                            for msg in &errors {
+                                error!("CP config rejected — {}", msg);
+                            }
+                            error!("Ignoring config update with invalid field values");
+                            continue;
+                        }
+                        if let Err(errors) = config.validate_hosts() {
+                            for msg in &errors {
+                                error!("CP config rejected — {}", msg);
+                            }
+                            error!("Ignoring config update with invalid hosts");
+                            continue;
+                        }
                         if let Err(errors) = config.validate_regex_listen_paths() {
                             for msg in &errors {
                                 error!("CP config rejected — {}", msg);
                             }
                             error!("Ignoring config update with invalid regex listen_paths");
+                            continue;
+                        }
+                        if let Err(errors) = config.validate_unique_listen_paths() {
+                            for msg in &errors {
+                                error!("CP config rejected — {}", msg);
+                            }
+                            error!("Ignoring config update with conflicting listen paths");
                             continue;
                         }
                         if let Err(errors) = config.validate_stream_proxies() {
@@ -226,7 +247,27 @@ pub async fn connect_and_subscribe_with_startup_ready(
                             error!("Ignoring config update with invalid stream proxy config");
                             continue;
                         }
-                        config.normalize_stream_proxy_paths();
+                        if let Err(errors) = config.validate_upstream_references() {
+                            for msg in &errors {
+                                error!("CP config rejected — {}", msg);
+                            }
+                            error!("Ignoring config update with invalid upstream references");
+                            continue;
+                        }
+                        if let Err(errors) = config.validate_plugin_references() {
+                            for msg in &errors {
+                                error!("CP config rejected — {}", msg);
+                            }
+                            error!("Ignoring config update with invalid plugin references");
+                            continue;
+                        }
+                        if let Err(errors) = config.validate_unique_plugins_per_proxy() {
+                            for msg in &errors {
+                                error!("CP config rejected — {}", msg);
+                            }
+                            error!("Ignoring config update with duplicate proxy plugins");
+                            continue;
+                        }
                         proxy_state.update_config(config);
                         if !initial_snapshot_applied {
                             proxy_state

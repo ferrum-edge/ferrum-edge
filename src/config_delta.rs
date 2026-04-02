@@ -169,7 +169,9 @@ impl ConfigDelta {
 
         // Added proxies: their listen_paths may now take priority over existing cache entries
         for p in &self.added_proxies {
-            paths.push(p.listen_path.clone());
+            if !p.backend_protocol.is_stream_proxy() {
+                paths.push(p.listen_path.clone());
+            }
         }
 
         // Removed proxies: cache entries pointing to them are stale
@@ -179,18 +181,25 @@ impl ConfigDelta {
             .map(|p| (p.id.as_str(), p))
             .collect();
         for id in &self.removed_proxy_ids {
-            if let Some(old_proxy) = old_proxy_map.get(id.as_str()) {
+            if let Some(old_proxy) = old_proxy_map.get(id.as_str())
+                && !old_proxy.backend_protocol.is_stream_proxy()
+            {
                 paths.push(old_proxy.listen_path.clone());
             }
         }
 
         // Modified proxies: both old and new listen_paths (in case listen_path changed)
         for p in &self.modified_proxies {
-            paths.push(p.listen_path.clone());
-            if let Some(old_proxy) = old_proxy_map.get(p.id.as_str())
-                && old_proxy.listen_path != p.listen_path
-            {
-                paths.push(old_proxy.listen_path.clone());
+            if !p.backend_protocol.is_stream_proxy() {
+                paths.push(p.listen_path.clone());
+            }
+            if let Some(old_proxy) = old_proxy_map.get(p.id.as_str()) {
+                let old_needs_invalidation = !old_proxy.backend_protocol.is_stream_proxy()
+                    && (old_proxy.listen_path != p.listen_path
+                        || p.backend_protocol.is_stream_proxy());
+                if old_needs_invalidation {
+                    paths.push(old_proxy.listen_path.clone());
+                }
             }
         }
 

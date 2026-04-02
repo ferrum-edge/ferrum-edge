@@ -3,8 +3,8 @@
 //! Key design decisions:
 //! - **Regex auto-anchoring**: `anchor_regex_pattern()` adds `^`/`$` to regex
 //!   listen_paths for full-path matching, preventing accidental prefix matches.
-//! - **Stream proxy paths**: TCP/UDP proxies get synthetic paths (`__tcp:PORT`,
-//!   `__udp:PORT`) via `normalize_stream_proxy_paths()` for consistent routing.
+//! - **Stream proxy routing**: TCP/UDP proxies are matched by `listen_port`,
+//!   not `listen_path`, so path validation and router invalidation skip them.
 //! - **Validation deduplication**: TLS cert/key paths are validated via a
 //!   `validated_tls_paths` cache so each unique file is parsed only once.
 //! - **Control character rejection**: Resource IDs, hostnames, and paths reject
@@ -915,6 +915,9 @@ impl GatewayConfig {
         // group, where k is the number of proxies sharing a single listen_path (typically 1).
         let mut by_path: HashMap<&str, Vec<&Proxy>> = HashMap::new();
         for proxy in &self.proxies {
+            if proxy.backend_protocol.is_stream_proxy() {
+                continue;
+            }
             by_path
                 .entry(proxy.listen_path.as_str())
                 .or_default()
@@ -981,6 +984,9 @@ impl GatewayConfig {
     pub fn validate_regex_listen_paths(&self) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
         for proxy in &self.proxies {
+            if proxy.backend_protocol.is_stream_proxy() {
+                continue;
+            }
             if proxy.listen_path.starts_with('~') {
                 let pattern = &proxy.listen_path[1..];
                 if pattern.is_empty() {
@@ -1009,9 +1015,18 @@ impl GatewayConfig {
     /// Normalize all proxy host entries to lowercase.
     pub fn normalize_hosts(&mut self) {
         for proxy in &mut self.proxies {
-            for host in &mut proxy.hosts {
-                *host = host.to_lowercase();
-            }
+            proxy.normalize_fields();
+        }
+    }
+
+    /// Normalize all resource fields that have canonical in-memory forms.
+    pub fn normalize_fields(&mut self) {
+        self.normalize_hosts();
+        for consumer in &mut self.consumers {
+            consumer.normalize_fields();
+        }
+        for plugin_config in &mut self.plugin_configs {
+            plugin_config.normalize_fields();
         }
     }
 
@@ -1187,6 +1202,89 @@ impl GatewayConfig {
                     "Proxy '{}' references non-existent upstream_id '{}'",
                     proxy.id, uid
                 ));
+            }
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+
+    /// Validate plugin resource invariants and proxy/plugin associations.
+    pub fn validate_plugin_references(&self) -> Result<(), Vec<String>> {
+        let proxy_ids: HashSet<&str> = self.proxies.iter().map(|p| p.id.as_str()).collect();
+        let plugin_by_id: HashMap<&str, &PluginConfig> = self
+            .plugin_configs
+            .iter()
+            .map(|pc| (pc.id.as_str(), pc))
+            .collect();
+        let mut errors = Vec::new();
+
+        for plugin in &self.plugin_configs {
+            match plugin.scope {
+                PluginScope::Global => {
+                    if plugin.proxy_id.is_some() {
+                        errors.push(format!(
+                            "PluginConfig '{}' with scope 'global' must not have proxy_id",
+                            plugin.id
+                        ));
+                    }
+                }
+                PluginScope::Proxy => match plugin.proxy_id.as_deref() {
+                    Some(proxy_id) => {
+                        if !proxy_ids.contains(proxy_id) {
+                            errors.push(format!(
+                                "PluginConfig '{}' references non-existent proxy_id '{}'",
+                                plugin.id, proxy_id
+                            ));
+                        }
+                    }
+                    None => errors.push(format!(
+                        "PluginConfig '{}' with scope 'proxy' must have proxy_id",
+                        plugin.id
+                    )),
+                },
+            }
+        }
+
+        for proxy in &self.proxies {
+            let mut seen_assoc_ids: HashSet<&str> = HashSet::new();
+            for assoc in &proxy.plugins {
+                if !seen_assoc_ids.insert(assoc.plugin_config_id.as_str()) {
+                    errors.push(format!(
+                        "Proxy '{}' references plugin_config '{}' more than once",
+                        proxy.id, assoc.plugin_config_id
+                    ));
+                }
+
+                match plugin_by_id.get(assoc.plugin_config_id.as_str()) {
+                    Some(plugin) => {
+                        if plugin.scope != PluginScope::Proxy {
+                            errors.push(format!(
+                                "Proxy '{}' references plugin_config '{}' with scope '{}' — proxy associations may only reference proxy-scoped plugin configs",
+                                proxy.id,
+                                plugin.id,
+                                match plugin.scope {
+                                    PluginScope::Global => "global",
+                                    PluginScope::Proxy => "proxy",
+                                }
+                            ));
+                        } else if plugin.proxy_id.as_deref() != Some(proxy.id.as_str()) {
+                            errors.push(format!(
+                                "Proxy '{}' references plugin_config '{}' targeted to proxy '{}'",
+                                proxy.id,
+                                plugin.id,
+                                plugin.proxy_id.as_deref().unwrap_or("<none>")
+                            ));
+                        }
+                    }
+                    None => errors.push(format!(
+                        "Proxy '{}' references non-existent plugin_config '{}'",
+                        proxy.id, assoc.plugin_config_id
+                    )),
+                }
             }
         }
 
@@ -1393,6 +1491,7 @@ impl GatewayConfig {
     /// TCP/UDP proxies don't use URL path routing. This sets their `listen_path`
     /// to a synthetic value like `__tcp:5432` or `__udp:5353` so the existing
     /// UNIQUE constraint and config delta logic works unchanged.
+    #[allow(dead_code)]
     pub fn normalize_stream_proxy_paths(&mut self) {
         for proxy in &mut self.proxies {
             if proxy.backend_protocol.is_stream_proxy()
@@ -1616,6 +1715,13 @@ fn validate_status_codes(field_name: &str, codes: &[u16]) -> Result<(), String> 
 }
 
 impl Proxy {
+    /// Normalize proxy fields to their canonical in-memory form.
+    pub fn normalize_fields(&mut self) {
+        for host in &mut self.hosts {
+            *host = host.to_lowercase();
+        }
+    }
+
     /// Validate all fields of a proxy for correctness and safe lengths.
     ///
     /// This validates field values only — uniqueness checks (listen_path conflicts,
@@ -1639,6 +1745,7 @@ impl Proxy {
         mut validated_tls_paths: Option<&mut std::collections::HashSet<String>>,
     ) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
+        let is_stream_proxy = self.backend_protocol.is_stream_proxy();
 
         // Name
         if let Some(ref name) = self.name
@@ -1665,8 +1772,8 @@ impl Proxy {
             }
         }
 
-        // listen_path length (regex pattern length is checked separately in admin handler)
-        if !self.listen_path.starts_with('~') && self.listen_path.len() > MAX_LISTEN_PATH_LENGTH {
+        // listen_path
+        if self.listen_path.len() > MAX_LISTEN_PATH_LENGTH {
             errors.push(format!(
                 "listen_path must not exceed {} characters (got {})",
                 MAX_LISTEN_PATH_LENGTH,
@@ -1675,6 +1782,17 @@ impl Proxy {
         }
         if contains_control_chars(&self.listen_path) {
             errors.push("listen_path must not contain control characters".to_string());
+        }
+        if !is_stream_proxy {
+            if self.listen_path.is_empty() {
+                errors.push("listen_path must be non-empty".to_string());
+            } else if self.listen_path.starts_with('~') {
+                if self.listen_path.len() == 1 {
+                    errors.push("regex listen_path '~' has empty pattern".to_string());
+                }
+            } else if !self.listen_path.starts_with('/') {
+                errors.push("listen_path must start with '/' or '~' (regex)".to_string());
+            }
         }
 
         // backend_host
@@ -1685,6 +1803,12 @@ impl Proxy {
         }
         if self.backend_host.contains("://") {
             errors.push("backend_host must not contain a scheme (e.g., 'http://')".to_string());
+        }
+        if self.upstream_id.is_none() && self.backend_host.is_empty() {
+            errors.push("backend_host must be non-empty (or set upstream_id)".to_string());
+        }
+        if self.upstream_id.is_none() && self.backend_port == 0 {
+            errors.push("backend_port must be greater than 0 (or set upstream_id)".to_string());
         }
 
         // backend_path
@@ -1904,8 +2028,13 @@ impl Proxy {
 
         // Allowed methods validation
         if let Some(ref methods) = self.allowed_methods {
+            if methods.is_empty() {
+                errors.push(
+                    "allowed_methods must be null (allow all) or a non-empty array".to_string(),
+                );
+            }
             for method in methods {
-                let upper = method.to_uppercase();
+                let upper = method.trim().to_uppercase();
                 if !VALID_HTTP_METHODS.contains(&upper.as_str()) {
                     errors.push(format!(
                         "allowed_methods contains invalid HTTP method: {}",
@@ -1940,6 +2069,10 @@ impl Proxy {
             }
         }
 
+        if is_stream_proxy && self.response_body_mode != ResponseBodyMode::Stream {
+            errors.push("Stream proxies (TCP/UDP) must use response_body_mode 'stream'".into());
+        }
+
         if errors.is_empty() {
             Ok(())
         } else {
@@ -1949,11 +2082,25 @@ impl Proxy {
 }
 
 impl Consumer {
+    /// Normalize consumer fields to their canonical in-memory form.
+    pub fn normalize_fields(&mut self) {
+        if self
+            .custom_id
+            .as_ref()
+            .is_some_and(|custom_id| custom_id.trim().is_empty())
+        {
+            self.custom_id = None;
+        }
+    }
+
     /// Validate all fields of a consumer for correctness and safe lengths.
     pub fn validate_fields(&self) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
 
         // Username
+        if self.username.trim().is_empty() {
+            errors.push("username must not be empty".to_string());
+        }
         if let Err(e) = validate_string_field("username", &self.username, MAX_USERNAME_LENGTH) {
             errors.push(e);
         }
@@ -2015,6 +2162,10 @@ impl Upstream {
     /// Validate all fields of an upstream for correctness and safe lengths.
     pub fn validate_fields(&self) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
+
+        if self.targets.is_empty() && self.service_discovery.is_none() {
+            errors.push("must have at least one target or service_discovery".to_string());
+        }
 
         // Name
         if let Some(ref name) = self.name
@@ -2182,14 +2333,44 @@ impl Upstream {
 }
 
 impl PluginConfig {
+    /// Normalize plugin config fields to their canonical in-memory form.
+    pub fn normalize_fields(&mut self) {
+        if self
+            .proxy_id
+            .as_ref()
+            .is_some_and(|proxy_id| proxy_id.trim().is_empty())
+        {
+            self.proxy_id = None;
+        }
+    }
+
     /// Validate all fields of a plugin config for correctness and safe lengths.
     pub fn validate_fields(&self) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
 
         // Plugin name length (should already be validated against known plugins,
         // but enforce a length limit as defense-in-depth)
+        if self.plugin_name.trim().is_empty() {
+            errors.push("plugin_name must not be empty".to_string());
+        }
         if let Err(e) = validate_string_field("plugin_name", &self.plugin_name, MAX_NAME_LENGTH) {
             errors.push(e);
+        }
+
+        match self.scope {
+            PluginScope::Proxy => match self.proxy_id.as_deref() {
+                Some(proxy_id) => {
+                    if let Err(e) = validate_resource_id(proxy_id) {
+                        errors.push(format!("proxy_id {}", e));
+                    }
+                }
+                None => errors.push("scope 'proxy' requires proxy_id".to_string()),
+            },
+            PluginScope::Global => {
+                if self.proxy_id.is_some() {
+                    errors.push("scope 'global' must not have proxy_id".to_string());
+                }
+            }
         }
 
         // Config JSON size

@@ -31,6 +31,13 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
+struct PluginConfigRef {
+    id: String,
+    plugin_name: String,
+    scope: PluginScope,
+    proxy_id: Option<String>,
+}
+
 /// Result of an incremental config poll.
 ///
 /// Contains only the resources that changed since the last poll, plus IDs of
@@ -324,8 +331,8 @@ impl DatabaseStore {
             loaded_at,
         };
 
-        // Normalize host entries to lowercase
-        config.normalize_hosts();
+        // Normalize canonical in-memory fields before validation.
+        config.normalize_fields();
 
         // Validate all field-level constraints (lengths, ranges, nested configs).
         // Warn-only since data already exists in the database.
@@ -383,8 +390,26 @@ impl DatabaseStore {
             }
         }
 
-        // Normalize stream proxy listen_paths to synthetic values (__tcp:PORT, __udp:PORT)
-        config.normalize_stream_proxy_paths();
+        if let Err(errors) = config.validate_upstream_references() {
+            for msg in &errors {
+                error!("{}", msg);
+            }
+            anyhow::bail!("Database has invalid upstream reference(s)");
+        }
+
+        if let Err(errors) = config.validate_plugin_references() {
+            for msg in &errors {
+                error!("{}", msg);
+            }
+            anyhow::bail!("Database has invalid plugin reference(s)");
+        }
+
+        if let Err(errors) = config.validate_unique_plugins_per_proxy() {
+            for msg in &errors {
+                error!("{}", msg);
+            }
+            anyhow::bail!("Database has duplicate plugins per proxy");
+        }
 
         Ok(config)
     }
@@ -730,7 +755,17 @@ impl DatabaseStore {
             })
             .collect();
 
-        Ok(Some(row_to_proxy(&row, id.to_string(), plugins)?))
+        let mut proxy = row_to_proxy(&row, id.to_string(), plugins)?;
+        proxy.normalize_fields();
+        Ok(Some(proxy))
+    }
+
+    pub async fn check_proxy_exists(&self, proxy_id: &str) -> Result<bool, anyhow::Error> {
+        let row: Option<AnyRow> = sqlx::query(&self.q("SELECT id FROM proxies WHERE id = ?"))
+            .bind(proxy_id)
+            .fetch_optional(&self.pool())
+            .await?;
+        Ok(row.is_some())
     }
 
     pub async fn create_consumer(&self, consumer: &Consumer) -> Result<(), anyhow::Error> {
@@ -781,7 +816,11 @@ impl DatabaseStore {
             .await?;
 
         match row {
-            Some(r) => Ok(Some(row_to_consumer(&r)?)),
+            Some(r) => {
+                let mut consumer = row_to_consumer(&r)?;
+                consumer.normalize_fields();
+                Ok(Some(consumer))
+            }
             None => Ok(None),
         }
     }
@@ -856,7 +895,11 @@ impl DatabaseStore {
             .await?;
 
         match row {
-            Some(r) => Ok(Some(row_to_plugin_config(&r)?)),
+            Some(r) => {
+                let mut plugin_config = row_to_plugin_config(&r)?;
+                plugin_config.normalize_fields();
+                Ok(Some(plugin_config))
+            }
             None => Ok(None),
         }
     }
@@ -1041,16 +1084,21 @@ impl DatabaseStore {
         exclude_id: Option<&str>,
     ) -> Result<bool, anyhow::Error> {
         let rows: Vec<AnyRow> = if let Some(eid) = exclude_id {
-            sqlx::query(&self.q("SELECT id, hosts FROM proxies WHERE listen_path = ? AND id != ?"))
-                .bind(listen_path)
-                .bind(eid)
-                .fetch_all(&self.pool())
-                .await?
+            sqlx::query(&self.q("SELECT id, hosts FROM proxies \
+                 WHERE listen_path = ? \
+                   AND backend_protocol NOT IN ('tcp', 'tcp_tls', 'udp', 'dtls') \
+                   AND id != ?"))
+            .bind(listen_path)
+            .bind(eid)
+            .fetch_all(&self.pool())
+            .await?
         } else {
-            sqlx::query(&self.q("SELECT id, hosts FROM proxies WHERE listen_path = ?"))
-                .bind(listen_path)
-                .fetch_all(&self.pool())
-                .await?
+            sqlx::query(&self.q("SELECT id, hosts FROM proxies \
+                 WHERE listen_path = ? \
+                   AND backend_protocol NOT IN ('tcp', 'tcp_tls', 'udp', 'dtls')"))
+            .bind(listen_path)
+            .fetch_all(&self.pool())
+            .await?
         };
 
         // No other proxy with this listen_path — unique
@@ -1122,6 +1170,79 @@ impl DatabaseStore {
                 .await?
         };
         Ok(rows.is_empty())
+    }
+
+    /// Check that a consumer username/custom_id combination does not collide
+    /// with another consumer's username/custom_id namespace.
+    pub async fn check_consumer_identity_unique(
+        &self,
+        username: &str,
+        custom_id: Option<&str>,
+        exclude_id: Option<&str>,
+    ) -> Result<Option<String>, anyhow::Error> {
+        let (sql, binds): (String, Vec<&str>) = match custom_id {
+            Some(custom_id) => (
+                self.q("SELECT id, username, custom_id FROM consumers \
+                     WHERE (username = ? OR custom_id = ? OR username = ? OR custom_id = ?)"),
+                vec![username, custom_id, custom_id, username],
+            ),
+            None => (
+                self.q("SELECT id, username, custom_id FROM consumers \
+                     WHERE (username = ? OR custom_id = ?)"),
+                vec![username, username],
+            ),
+        };
+
+        let sql = if exclude_id.is_some() {
+            format!("{} AND id != ?", sql)
+        } else {
+            sql
+        };
+
+        let mut query = sqlx::query(&sql);
+        for value in binds {
+            query = query.bind(value);
+        }
+        if let Some(exclude_id) = exclude_id {
+            query = query.bind(exclude_id);
+        }
+
+        let rows = query.fetch_all(&self.pool()).await?;
+        for row in rows {
+            let id: String = row.try_get("id")?;
+            let existing_username: String = row.try_get("username")?;
+            let existing_custom_id: Option<String> = row.try_get("custom_id").ok();
+
+            if existing_username == username {
+                return Ok(Some(format!(
+                    "A consumer with username '{}' already exists (consumer '{}')",
+                    username, id
+                )));
+            }
+            if existing_custom_id.as_deref() == Some(username) {
+                return Ok(Some(format!(
+                    "Consumer username '{}' conflicts with custom_id of consumer '{}'",
+                    username, id
+                )));
+            }
+
+            if let Some(custom_id) = custom_id {
+                if existing_custom_id.as_deref() == Some(custom_id) {
+                    return Ok(Some(format!(
+                        "A consumer with custom_id '{}' already exists (consumer '{}')",
+                        custom_id, id
+                    )));
+                }
+                if existing_username == custom_id {
+                    return Ok(Some(format!(
+                        "Consumer custom_id '{}' conflicts with username of consumer '{}'",
+                        custom_id, id
+                    )));
+                }
+            }
+        }
+
+        Ok(None)
     }
 
     /// Check if a keyauth API key is unique across all consumers.
@@ -1240,6 +1361,75 @@ impl DatabaseStore {
             .fetch_optional(&self.pool())
             .await?;
         Ok(row.is_some())
+    }
+
+    /// Validate that a proxy's plugin associations reference existing
+    /// proxy-scoped plugin configs targeted at the same proxy, and that the
+    /// resolved plugin names remain unique for that proxy.
+    pub async fn validate_proxy_plugin_associations(
+        &self,
+        proxy_id: &str,
+        associations: &[PluginAssociation],
+    ) -> Result<Vec<String>, anyhow::Error> {
+        if associations.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut requested_ids = Vec::with_capacity(associations.len());
+        let mut seen_assoc_ids: HashSet<&str> = HashSet::new();
+        let mut errors = Vec::new();
+
+        for assoc in associations {
+            if !seen_assoc_ids.insert(assoc.plugin_config_id.as_str()) {
+                errors.push(format!(
+                    "Proxy '{}' references plugin_config '{}' more than once",
+                    proxy_id, assoc.plugin_config_id
+                ));
+            } else {
+                requested_ids.push(assoc.plugin_config_id.clone());
+            }
+        }
+
+        let plugin_refs = self.load_plugin_config_refs(&requested_ids).await?;
+        let mut seen_names: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+
+        for assoc in associations {
+            match plugin_refs.get(assoc.plugin_config_id.as_str()) {
+                Some(plugin) => {
+                    if plugin.scope != PluginScope::Proxy {
+                        errors.push(format!(
+                            "Proxy '{}' references plugin_config '{}' with scope 'global' — proxy associations may only reference proxy-scoped plugin configs",
+                            proxy_id, plugin.id
+                        ));
+                        continue;
+                    }
+                    if plugin.proxy_id.as_deref() != Some(proxy_id) {
+                        errors.push(format!(
+                            "Proxy '{}' references plugin_config '{}' targeted to proxy '{}'",
+                            proxy_id,
+                            plugin.id,
+                            plugin.proxy_id.as_deref().unwrap_or("<none>")
+                        ));
+                        continue;
+                    }
+                    if let Some(existing_config_id) =
+                        seen_names.insert(plugin.plugin_name.clone(), plugin.id.clone())
+                    {
+                        errors.push(format!(
+                            "Proxy '{}' has duplicate plugin '{}' (config IDs '{}' and '{}')",
+                            proxy_id, plugin.plugin_name, existing_config_id, plugin.id
+                        ));
+                    }
+                }
+                None => errors.push(format!(
+                    "Proxy '{}' references non-existent plugin_config '{}'",
+                    proxy_id, assoc.plugin_config_id
+                )),
+            }
+        }
+
+        Ok(errors)
     }
 
     // ---- Incremental Polling ----
@@ -1473,6 +1663,49 @@ impl DatabaseStore {
         Ok(ids)
     }
 
+    async fn load_plugin_config_refs(
+        &self,
+        ids: &[String],
+    ) -> Result<std::collections::HashMap<String, PluginConfigRef>, anyhow::Error> {
+        if ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+
+        let placeholders = std::iter::repeat_n("?", ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = self.q(&format!(
+            "SELECT id, plugin_name, scope, proxy_id FROM plugin_configs WHERE id IN ({})",
+            placeholders
+        ));
+
+        let mut query = sqlx::query(&sql);
+        for id in ids {
+            query = query.bind(id);
+        }
+
+        let rows = query.fetch_all(&self.pool()).await?;
+        let mut plugin_refs = std::collections::HashMap::with_capacity(rows.len());
+        for row in rows {
+            let id: String = row.try_get("id")?;
+            let scope = match row.try_get::<String, _>("scope")?.as_str() {
+                "proxy" => PluginScope::Proxy,
+                _ => PluginScope::Global,
+            };
+            plugin_refs.insert(
+                id.clone(),
+                PluginConfigRef {
+                    id,
+                    plugin_name: row.try_get("plugin_name")?,
+                    scope,
+                    proxy_id: row.try_get("proxy_id").ok(),
+                },
+            );
+        }
+
+        Ok(plugin_refs)
+    }
+
     /// Extract known IDs from a full config (used to seed the incremental poller).
     pub fn extract_known_ids(
         config: &GatewayConfig,
@@ -1499,19 +1732,41 @@ impl DatabaseStore {
 
     /// Batch-create multiple proxies, chunked into transactions of
     /// [`BATCH_CHUNK_SIZE`] for large-scale imports.
+    #[allow(dead_code)]
     pub async fn batch_create_proxies(&self, proxies: &[Proxy]) -> Result<usize, anyhow::Error> {
+        self.batch_create_proxies_internal(proxies, true).await
+    }
+
+    pub async fn batch_create_proxies_without_plugins(
+        &self,
+        proxies: &[Proxy],
+    ) -> Result<usize, anyhow::Error> {
+        self.batch_create_proxies_internal(proxies, false).await
+    }
+
+    async fn batch_create_proxies_internal(
+        &self,
+        proxies: &[Proxy],
+        attach_plugins: bool,
+    ) -> Result<usize, anyhow::Error> {
         if proxies.is_empty() {
             return Ok(0);
         }
         let mut total = 0usize;
         for chunk in proxies.chunks(Self::BATCH_CHUNK_SIZE) {
-            total += self.batch_create_proxies_chunk(chunk).await?;
+            total += self
+                .batch_create_proxies_chunk(chunk, attach_plugins)
+                .await?;
         }
         Ok(total)
     }
 
     /// Insert a single chunk of proxies in one transaction.
-    async fn batch_create_proxies_chunk(&self, proxies: &[Proxy]) -> Result<usize, anyhow::Error> {
+    async fn batch_create_proxies_chunk(
+        &self,
+        proxies: &[Proxy],
+        attach_plugins: bool,
+    ) -> Result<usize, anyhow::Error> {
         let mut tx = self.pool().begin().await?;
         let insert_sql = self.q("INSERT INTO proxies (id, name, hosts, listen_path, backend_protocol, backend_host, backend_port, backend_path, strip_listen_path, preserve_host_header, backend_connect_timeout_ms, backend_read_timeout_ms, backend_write_timeout_ms, backend_tls_client_cert_path, backend_tls_client_key_path, backend_tls_verify_server_cert, backend_tls_server_ca_cert_path, dns_override, dns_cache_ttl_seconds, auth_mode, upstream_id, circuit_breaker, retry, response_body_mode, pool_idle_timeout_seconds, pool_enable_http_keep_alive, pool_enable_http2, pool_tcp_keepalive_seconds, pool_http2_keep_alive_interval_seconds, pool_http2_keep_alive_timeout_seconds, pool_http2_initial_stream_window_size, pool_http2_initial_connection_window_size, pool_http2_adaptive_window, pool_http2_max_frame_size, pool_http2_max_concurrent_streams, pool_http3_connections_per_backend, listen_port, frontend_tls, udp_idle_timeout_seconds, tcp_idle_timeout_seconds, allowed_methods, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
         let assoc_sql =
@@ -1618,18 +1873,44 @@ impl DatabaseStore {
                 .execute(&mut *tx)
                 .await?;
 
-            for assoc in &proxy.plugins {
-                sqlx::query(&assoc_sql)
-                    .bind(&proxy.id)
-                    .bind(&assoc.plugin_config_id)
-                    .execute(&mut *tx)
-                    .await?;
+            if attach_plugins {
+                for assoc in &proxy.plugins {
+                    sqlx::query(&assoc_sql)
+                        .bind(&proxy.id)
+                        .bind(&assoc.plugin_config_id)
+                        .execute(&mut *tx)
+                        .await?;
+                }
             }
         }
 
         let count = proxies.len();
         tx.commit().await?;
         Ok(count)
+    }
+
+    pub async fn batch_attach_proxy_plugins(&self, proxies: &[Proxy]) -> Result<(), anyhow::Error> {
+        if proxies.is_empty() {
+            return Ok(());
+        }
+
+        let assoc_sql =
+            self.q("INSERT INTO proxy_plugins (proxy_id, plugin_config_id) VALUES (?, ?)");
+        for chunk in proxies.chunks(Self::BATCH_CHUNK_SIZE) {
+            let mut tx = self.pool().begin().await?;
+            for proxy in chunk {
+                for assoc in &proxy.plugins {
+                    sqlx::query(&assoc_sql)
+                        .bind(&proxy.id)
+                        .bind(&assoc.plugin_config_id)
+                        .execute(&mut *tx)
+                        .await?;
+                }
+            }
+            tx.commit().await?;
+        }
+
+        Ok(())
     }
 
     /// Batch-create multiple consumers, chunked into transactions of

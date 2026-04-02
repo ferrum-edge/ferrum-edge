@@ -1,8 +1,8 @@
 use chrono::Utc;
 use ferrum_edge::config::types::{
-    AuthMode, BackendProtocol, Consumer, GatewayConfig, PluginAssociation, PluginConfig, Proxy,
-    Upstream, UpstreamTarget, hosts_overlap, validate_host_entry, validate_resource_id,
-    wildcard_matches,
+    AuthMode, BackendProtocol, Consumer, GatewayConfig, PluginAssociation, PluginConfig,
+    PluginScope, Proxy, Upstream, UpstreamTarget, hosts_overlap, validate_host_entry,
+    validate_resource_id, wildcard_matches,
 };
 use std::collections::HashMap;
 
@@ -677,6 +677,58 @@ fn test_unique_plugins_per_proxy_duplicate() {
     assert!(err[0].contains("duplicate plugin 'rate_limiting'"));
 }
 
+#[test]
+fn test_validate_plugin_references_rejects_global_plugin_association() {
+    let mut config = empty_config();
+    config.plugin_configs = vec![PluginConfig {
+        id: "pc1".into(),
+        plugin_name: "cors".into(),
+        config: serde_json::json!({}),
+        scope: PluginScope::Global,
+        proxy_id: None,
+        enabled: true,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    }];
+    let mut proxy = make_proxy("p1", "/api");
+    proxy.plugins = vec![PluginAssociation {
+        plugin_config_id: "pc1".into(),
+    }];
+    config.proxies = vec![proxy];
+
+    let errs = config.validate_plugin_references().unwrap_err();
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("proxy-scoped plugin configs"))
+    );
+}
+
+#[test]
+fn test_validate_plugin_references_rejects_wrong_proxy_target() {
+    let mut config = empty_config();
+    config.plugin_configs = vec![PluginConfig {
+        id: "pc1".into(),
+        plugin_name: "key_auth".into(),
+        config: serde_json::json!({}),
+        scope: PluginScope::Proxy,
+        proxy_id: Some("other-proxy".into()),
+        enabled: true,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    }];
+    let mut proxy = make_proxy("p1", "/api");
+    proxy.plugins = vec![PluginAssociation {
+        plugin_config_id: "pc1".into(),
+    }];
+    config.proxies = vec![proxy];
+
+    let errs = config.validate_plugin_references().unwrap_err();
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("targeted to proxy 'other-proxy'"))
+    );
+}
+
 // ---- Resource ID validation tests ----
 
 #[test]
@@ -1206,6 +1258,20 @@ fn test_restore_payload_rejects_duplicate_listen_paths() {
     config.proxies = vec![make_proxy("p1", "/api"), make_proxy("p2", "/api")];
     let err = config.validate_unique_listen_paths().unwrap_err();
     assert!(!err.is_empty());
+}
+
+#[test]
+fn test_restore_payload_ignores_stream_proxy_listen_path_collisions() {
+    let mut p1 = make_proxy("p1", "");
+    p1.backend_protocol = BackendProtocol::Tcp;
+    p1.listen_port = Some(5432);
+    let mut p2 = make_proxy("p2", "");
+    p2.backend_protocol = BackendProtocol::Udp;
+    p2.listen_port = Some(5353);
+    let mut config = empty_config();
+    config.proxies = vec![p1, p2];
+    assert!(config.validate_unique_listen_paths().is_ok());
+    assert!(config.validate_regex_listen_paths().is_ok());
 }
 
 #[test]

@@ -27,8 +27,7 @@ proxies:
     # to inspect or transform the response body.
     # response_body_mode: stream  # (default — omitted is the same as "stream")
     auth_mode: single
-    plugins:
-      - plugin_config_id: "plugin-stdout"
+    plugins: []
 
   - id: "proxy-jsonplaceholder"
     name: "JSONPlaceholder API"
@@ -59,8 +58,7 @@ proxies:
     pool_enable_http2: false  # HTTP/1.1 recommended for WebSockets
     # pool_enable_http_keep_alive uses global default (true)
     auth_mode: single
-    plugins:
-      - plugin_config_id: "plugin-stdout"
+    plugins: []
 
   - id: "proxy-websocket-secure"
     name: "Secure WebSocket Echo Test"
@@ -76,8 +74,7 @@ proxies:
     pool_http2_keep_alive_timeout_seconds: 90  # Longer timeout for WebSocket stability
     pool_enable_http2: false  # HTTP/1.1 recommended for WebSockets
     auth_mode: single
-    plugins:
-      - plugin_config_id: "plugin-stdout"
+    plugins: []
 
   - id: "proxy-protected"
     name: "Protected API"
@@ -94,10 +91,9 @@ proxies:
     response_body_mode: buffer
     auth_mode: single
     plugins:
-      - plugin_config_id: "plugin-keyauth"
-      - plugin_config_id: "plugin-acl"
-      - plugin_config_id: "plugin-ratelimit"
-      - plugin_config_id: "plugin-stdout"
+      - plugin_config_id: "plugin-keyauth-protected"
+      - plugin_config_id: "plugin-acl-protected"
+      - plugin_config_id: "plugin-ratelimit-protected"
 
   - id: "proxy-multi-auth"
     name: "Multi-Auth API"
@@ -112,9 +108,8 @@ proxies:
     auth_mode: multi
     plugins:
       - plugin_config_id: "plugin-jwtauth"
-      - plugin_config_id: "plugin-keyauth"
-      - plugin_config_id: "plugin-acl"
-      - plugin_config_id: "plugin-stdout"
+      - plugin_config_id: "plugin-keyauth-multi-auth"
+      - plugin_config_id: "plugin-acl-multi-auth"
 
 consumers:
   - id: "consumer-alice"
@@ -144,7 +139,7 @@ plugin_configs:
     scope: global
     enabled: true
 
-  - id: "plugin-keyauth"
+  - id: "plugin-keyauth-protected"
     plugin_name: "key_auth"
     config:
       key_location: "header:X-API-Key"
@@ -161,7 +156,15 @@ plugin_configs:
     proxy_id: "proxy-multi-auth"
     enabled: true
 
-  - id: "plugin-acl"
+  - id: "plugin-keyauth-multi-auth"
+    plugin_name: "key_auth"
+    config:
+      key_location: "header:X-API-Key"
+    scope: proxy
+    proxy_id: "proxy-multi-auth"
+    enabled: true
+
+  - id: "plugin-acl-protected"
     plugin_name: "access_control"
     config:
       allowed_consumers:
@@ -172,7 +175,18 @@ plugin_configs:
     proxy_id: "proxy-protected"
     enabled: true
 
-  - id: "plugin-ratelimit"
+  - id: "plugin-acl-multi-auth"
+    plugin_name: "access_control"
+    config:
+      allowed_consumers:
+        - "alice"
+        - "bob"
+      disallowed_consumers: []
+    scope: proxy
+    proxy_id: "proxy-multi-auth"
+    enabled: true
+
+  - id: "plugin-ratelimit-protected"
     plugin_name: "rate_limiting"
     config:
       limit_by: "consumer"

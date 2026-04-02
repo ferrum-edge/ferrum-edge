@@ -95,8 +95,7 @@ proxies:
     pool_http2_keep_alive_interval_seconds: 20
     pool_http2_keep_alive_timeout_seconds: 30
     auth_mode: single
-    plugins:
-      - plugin_config_id: "plugin-stdout"
+    plugins: []
 
   - id: "proxy-multi-auth"
     listen_path: "/multi-auth"
@@ -137,7 +136,7 @@ plugin_configs:
     config:
       key_location: "header:X-API-Key"
     scope: proxy
-    proxy_id: "proxy-protected"
+    proxy_id: "proxy-multi-auth"
     enabled: true
 "#;
     let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
@@ -181,7 +180,26 @@ plugin_configs:
     assert_eq!(config.plugin_configs[1].scope, PluginScope::Proxy);
     assert_eq!(
         config.plugin_configs[1].proxy_id,
-        Some("proxy-protected".to_string())
+        Some("proxy-multi-auth".to_string())
+    );
+}
+
+#[test]
+fn test_load_shared_example_config_fixture() {
+    let config = load_config_from_file("tests/config.yaml").unwrap();
+
+    assert!(!config.proxies.is_empty());
+    assert!(
+        config
+            .plugin_configs
+            .iter()
+            .any(|plugin| plugin.scope == PluginScope::Global)
+    );
+    assert!(
+        config
+            .plugin_configs
+            .iter()
+            .any(|plugin| plugin.scope == PluginScope::Proxy)
     );
 }
 
@@ -418,7 +436,12 @@ plugin_configs:
 #[test]
 fn test_plugin_config_proxy_scope() {
     let yaml = r#"
-proxies: []
+proxies:
+  - id: "proxy-protected"
+    listen_path: "/protected"
+    backend_protocol: http
+    backend_host: "localhost"
+    backend_port: 3000
 consumers: []
 plugin_configs:
   - id: "plugin-1"
@@ -733,7 +756,27 @@ proxies:
       - plugin_config_id: "plugin-ratelimit"
       - plugin_config_id: "plugin-logging"
 consumers: []
-plugin_configs: []
+plugin_configs:
+  - id: "plugin-auth"
+    plugin_name: "key_auth"
+    config:
+      key_location: "header:X-API-Key"
+    scope: proxy
+    proxy_id: "proxy-1"
+    enabled: true
+  - id: "plugin-ratelimit"
+    plugin_name: "rate_limiting"
+    config:
+      requests_per_second: 10
+    scope: proxy
+    proxy_id: "proxy-1"
+    enabled: true
+  - id: "plugin-logging"
+    plugin_name: "stdout_logging"
+    config: {}
+    scope: proxy
+    proxy_id: "proxy-1"
+    enabled: true
 "#;
     let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
     write!(file, "{}", yaml).unwrap();

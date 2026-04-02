@@ -1102,6 +1102,47 @@ async fn test_batch_create_plugin_configs() {
 }
 
 #[tokio::test]
+async fn test_batch_create_proxy_and_proxy_plugin_association_same_request() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let batch = json!({
+        "proxies": [
+            {
+                "id": "assoc-proxy",
+                "listen_path": "/assoc",
+                "backend_protocol": "http",
+                "backend_host": "localhost",
+                "backend_port": 8080,
+                "strip_listen_path": true,
+                "plugins": [{"plugin_config_id": "assoc-pc"}]
+            }
+        ],
+        "plugin_configs": [
+            {
+                "id": "assoc-pc",
+                "plugin_name": "key_auth",
+                "scope": "proxy",
+                "proxy_id": "assoc-proxy",
+                "enabled": true,
+                "config": {"key_location": "header:X-API-Key"}
+            }
+        ]
+    });
+
+    let (status, body) = admin_post(&base_url, "/batch", &token, &batch).await;
+    assert_eq!(status, 201, "Batch create failed: {:?}", body);
+    assert_eq!(body["created"]["proxies"], 1);
+    assert_eq!(body["created"]["plugin_configs"], 1);
+
+    let (status, proxy_body, _) = admin_get(&base_url, "/proxies/assoc-proxy", &token).await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(proxy_body["plugins"][0]["plugin_config_id"], "assoc-pc");
+}
+
+#[tokio::test]
 async fn test_batch_create_read_only_rejected() {
     let tc = TestConfig::default();
     let state = AdminState {
@@ -1363,6 +1404,52 @@ async fn test_backup_then_restore_roundtrip() {
     assert_eq!(status, reqwest::StatusCode::OK);
     let (status, _, _) = admin_get(&base_url, "/proxies/rt_p1", &token).await;
     assert_eq!(status, reqwest::StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_backup_then_restore_roundtrip_with_proxy_plugin_association() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let seed = json!({
+        "proxies": [
+            {
+                "id": "assoc-rt-proxy",
+                "listen_path": "/assoc-rt",
+                "backend_protocol": "http",
+                "backend_host": "localhost",
+                "backend_port": 8080,
+                "strip_listen_path": true,
+                "plugins": [{"plugin_config_id": "assoc-rt-pc"}]
+            }
+        ],
+        "plugin_configs": [
+            {
+                "id": "assoc-rt-pc",
+                "plugin_name": "key_auth",
+                "scope": "proxy",
+                "proxy_id": "assoc-rt-proxy",
+                "enabled": true,
+                "config": {"key_location": "header:X-API-Key"}
+            }
+        ]
+    });
+    let (status, body) = admin_post(&base_url, "/batch", &token, &seed).await;
+    assert_eq!(status, 201, "Seed batch failed: {:?}", body);
+
+    let (status, backup, _) = admin_get(&base_url, "/backup", &token).await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+
+    let (status, body) = admin_post(&base_url, "/restore?confirm=true", &token, &backup).await;
+    assert_eq!(status, 200, "Roundtrip restore failed: {:?}", body);
+    assert_eq!(body["restored"]["proxies"], 1);
+    assert_eq!(body["restored"]["plugin_configs"], 1);
+
+    let (status, proxy_body, _) = admin_get(&base_url, "/proxies/assoc-rt-proxy", &token).await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(proxy_body["plugins"][0]["plugin_config_id"], "assoc-rt-pc");
 }
 
 #[tokio::test]
@@ -2251,6 +2338,97 @@ async fn test_consumer_crud_create_update_delete() {
     // Verify gone
     let (status, _, _) = admin_get(&base_url, "/consumers/crud-consumer-1", &token).await;
     assert_eq!(status, 404);
+}
+
+#[tokio::test]
+async fn test_create_consumer_rejects_custom_id_collision_with_existing_username() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let alice = json!({
+        "id": "collision-c1",
+        "username": "alice"
+    });
+    let (status, body) = admin_post(&base_url, "/consumers", &token, &alice).await;
+    assert_eq!(status, 201, "Create consumer failed: {:?}", body);
+
+    let colliding = json!({
+        "id": "collision-c2",
+        "username": "bob",
+        "custom_id": "alice"
+    });
+    let (status, body) = admin_post(&base_url, "/consumers", &token, &colliding).await;
+    assert_eq!(status, 409, "Expected conflict, got: {:?}", body);
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("conflicts with username")
+    );
+}
+
+#[tokio::test]
+async fn test_update_consumer_rejects_empty_username() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let consumer = json!({
+        "id": "empty-user-c1",
+        "username": "valid-user"
+    });
+    let (status, body) = admin_post(&base_url, "/consumers", &token, &consumer).await;
+    assert_eq!(status, 201, "Create consumer failed: {:?}", body);
+
+    let updated = json!({
+        "id": "empty-user-c1",
+        "username": "   "
+    });
+    let (status, body) = admin_put(&base_url, "/consumers/empty-user-c1", &token, &updated).await;
+    assert_eq!(status, 400, "Expected validation error, got: {:?}", body);
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("username must not be empty")
+    );
+}
+
+#[tokio::test]
+async fn test_stream_proxy_admin_shape_preserved_across_get_and_backup() {
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let proxy = json!({
+        "id": "stream-shape-proxy",
+        "listen_path": "",
+        "backend_protocol": "tcp",
+        "backend_host": "localhost",
+        "backend_port": 5432,
+        "listen_port": 19010,
+        "response_body_mode": "stream"
+    });
+    let (status, body) = admin_post(&base_url, "/proxies", &token, &proxy).await;
+    assert_eq!(status, 201, "Create stream proxy failed: {:?}", body);
+
+    let (status, proxy_body, _) = admin_get(&base_url, "/proxies/stream-shape-proxy", &token).await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(proxy_body["listen_path"], "");
+
+    let (status, backup, _) = admin_get(&base_url, "/backup", &token).await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    let proxy_entry = backup["proxies"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|proxy| proxy["id"] == "stream-shape-proxy")
+        .unwrap();
+    assert_eq!(proxy_entry["listen_path"], "");
 }
 
 // ============================================================================

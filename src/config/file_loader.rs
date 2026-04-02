@@ -132,8 +132,8 @@ pub fn load_config_from_file(path: &str) -> Result<GatewayConfig, anyhow::Error>
         );
     }
 
-    // Normalize and validate host entries
-    config.normalize_hosts();
+    // Normalize canonical in-memory fields before cross-resource validation.
+    config.normalize_fields();
     if let Err(errors) = config.validate_hosts() {
         for msg in &errors {
             error!("{}", msg);
@@ -223,7 +223,18 @@ pub fn load_config_from_file(path: &str) -> Result<GatewayConfig, anyhow::Error>
         );
     }
 
-    // Validate plugin name uniqueness per proxy
+    // Validate plugin config targets and proxy/plugin association integrity.
+    if let Err(errors) = config.validate_plugin_references() {
+        for msg in &errors {
+            error!("{}", msg);
+        }
+        anyhow::bail!(
+            "Configuration validation failed: {} invalid plugin reference(s) found",
+            errors.len()
+        );
+    }
+
+    // Validate plugin name uniqueness per proxy.
     if let Err(errors) = config.validate_unique_plugins_per_proxy() {
         for msg in &errors {
             error!("{}", msg);
@@ -244,9 +255,6 @@ pub fn load_config_from_file(path: &str) -> Result<GatewayConfig, anyhow::Error>
             errors.len()
         );
     }
-
-    // Normalize stream proxy listen_paths to synthetic values (__tcp:PORT, __udp:PORT)
-    config.normalize_stream_proxy_paths();
 
     info!(
         "Configuration loaded (version {}): {} proxies, {} consumers, {} plugin configs",

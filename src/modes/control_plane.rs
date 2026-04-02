@@ -494,6 +494,7 @@ pub async fn run(
                                 // Clone current config, apply incremental changes, store.
                                 let mut new_config = (*config_poll.load_full()).clone();
                                 apply_incremental_to_config(&mut new_config, result);
+                                new_config.normalize_fields();
                                 new_config.loaded_at = poll_ts;
                                 config_poll.store(Arc::new(new_config));
 

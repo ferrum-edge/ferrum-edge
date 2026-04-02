@@ -25,8 +25,7 @@ use uuid::Uuid;
 use crate::admin::jwt_auth::{JwtError, JwtManager};
 use crate::config::db_loader::DatabaseStore;
 use crate::config::types::{
-    Consumer, GatewayConfig, PluginConfig, PluginScope, Proxy, Upstream, VALID_HTTP_METHODS,
-    validate_resource_id,
+    Consumer, GatewayConfig, PluginConfig, PluginScope, Proxy, Upstream, validate_resource_id,
 };
 use crate::plugins;
 use crate::proxy::ProxyState;
@@ -551,84 +550,37 @@ async fn handle_create_proxy(
         }
     };
 
-    // Validate proxy fields
-    if proxy.listen_path.is_empty() {
-        return Ok(json_response(
-            StatusCode::BAD_REQUEST,
-            &json!({"error": "listen_path must be non-empty"}),
-        ));
-    }
-    if proxy.listen_path.starts_with('~') {
-        // Regex listen_path — validate pattern compiles
-        let pattern = &proxy.listen_path[1..];
-        if pattern.is_empty() {
-            return Ok(json_response(
-                StatusCode::BAD_REQUEST,
-                &json!({"error": "regex listen_path '~' has empty pattern"}),
-            ));
-        }
-        if pattern.len() > 1024 {
-            return Ok(json_response(
-                StatusCode::BAD_REQUEST,
-                &json!({"error": "regex listen_path pattern must not exceed 1024 characters"}),
-            ));
-        }
-        let anchored = crate::config::types::anchor_regex_pattern(pattern);
-        if let Err(e) = regex::Regex::new(&anchored) {
-            return Ok(json_response(
-                StatusCode::BAD_REQUEST,
-                &json!({"error": format!("invalid regex listen_path: {}", e)}),
-            ));
-        }
-    } else if !proxy.listen_path.starts_with('/') {
-        return Ok(json_response(
-            StatusCode::BAD_REQUEST,
-            &json!({"error": "listen_path must start with '/' or '~' (regex)"}),
-        ));
-    }
-    // backend_host and backend_port are required unless upstream_id is set
-    // (upstream targets override these fields at request time)
-    if proxy.upstream_id.is_none() {
-        if proxy.backend_host.is_empty() {
-            return Ok(json_response(
-                StatusCode::BAD_REQUEST,
-                &json!({"error": "backend_host must be non-empty (or set upstream_id)"}),
-            ));
-        }
-        if proxy.backend_port == 0 {
-            return Ok(json_response(
-                StatusCode::BAD_REQUEST,
-                &json!({"error": "backend_port must be greater than 0 (or set upstream_id)"}),
-            ));
-        }
-    }
-
     // Validate and normalize allowed_methods
     if let Some(ref mut methods) = proxy.allowed_methods {
-        if methods.is_empty() {
-            return Ok(json_response(
-                StatusCode::BAD_REQUEST,
-                &json!({"error": "allowed_methods must be null (allow all) or a non-empty array"}),
-            ));
-        }
         for m in methods.iter_mut() {
             *m = m.to_uppercase();
         }
-        for m in methods.iter() {
-            if !VALID_HTTP_METHODS.contains(&m.as_str()) {
-                return Ok(json_response(
-                    StatusCode::BAD_REQUEST,
-                    &json!({"error": format!("Invalid HTTP method: {}", m)}),
-                ));
-            }
-        }
     }
 
-    // Validate field lengths, numeric ranges, and nested config objects
+    proxy.normalize_fields();
+
+    // Validate field lengths, numeric ranges, and nested config objects.
     if let Err(field_errors) = proxy.validate_fields() {
         return Ok(json_response(
             StatusCode::BAD_REQUEST,
             &json!({"error": format!("Invalid proxy fields: {}", field_errors.join("; "))}),
+        ));
+    }
+
+    let proxy_validation_config = GatewayConfig {
+        proxies: vec![proxy.clone()],
+        ..Default::default()
+    };
+    if let Err(errors) = proxy_validation_config.validate_hosts() {
+        return Ok(json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"error": format!("Invalid proxy hosts: {}", errors.join("; "))}),
+        ));
+    }
+    if let Err(errors) = proxy_validation_config.validate_regex_listen_paths() {
+        return Ok(json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"error": format!("Invalid proxy listen_path: {}", errors.join("; "))}),
         ));
     }
 
@@ -660,36 +612,25 @@ async fn handle_create_proxy(
         }
     }
 
-    // Validate and normalize host entries
-    for host in &mut proxy.hosts {
-        *host = host.to_lowercase();
-    }
-    for host in &proxy.hosts {
-        if let Err(msg) = crate::config::types::validate_host_entry(host) {
-            return Ok(json_response(
-                StatusCode::BAD_REQUEST,
-                &json!({"error": msg}),
-            ));
-        }
-    }
-
-    // Check host+listen_path uniqueness
-    match db
-        .check_listen_path_unique(&proxy.listen_path, &proxy.hosts, None)
-        .await
-    {
-        Ok(true) => {}
-        Ok(false) => {
-            return Ok(json_response(
-                StatusCode::CONFLICT,
-                &json!({"error": "A proxy with overlapping hosts and listen_path already exists"}),
-            ));
-        }
-        Err(e) => {
-            return Ok(json_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                &db_error_response(&e),
-            ));
+    // Check host+listen_path uniqueness for HTTP-style routes.
+    if !proxy.backend_protocol.is_stream_proxy() {
+        match db
+            .check_listen_path_unique(&proxy.listen_path, &proxy.hosts, None)
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                return Ok(json_response(
+                    StatusCode::CONFLICT,
+                    &json!({"error": "A proxy with overlapping hosts and listen_path already exists"}),
+                ));
+            }
+            Err(e) => {
+                return Ok(json_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    &db_error_response(&e),
+                ));
+            }
         }
     }
 
@@ -728,6 +669,25 @@ async fn handle_create_proxy(
                     &db_error_response(&e),
                 ));
             }
+        }
+    }
+
+    match db
+        .validate_proxy_plugin_associations(&proxy.id, &proxy.plugins)
+        .await
+    {
+        Ok(errors) if !errors.is_empty() => {
+            return Ok(json_response(
+                StatusCode::BAD_REQUEST,
+                &json!({"error": format!("Invalid proxy plugin associations: {}", errors.join("; "))}),
+            ));
+        }
+        Ok(_) => {}
+        Err(e) => {
+            return Ok(json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &db_error_response(&e),
+            ));
         }
     }
 
@@ -898,80 +858,16 @@ async fn handle_update_proxy(
         }
     };
 
-    // Validate proxy fields
-    if proxy.listen_path.is_empty() {
-        return Ok(json_response(
-            StatusCode::BAD_REQUEST,
-            &json!({"error": "listen_path must be non-empty"}),
-        ));
-    }
-    if proxy.listen_path.starts_with('~') {
-        // Regex listen_path — validate pattern compiles
-        let pattern = &proxy.listen_path[1..];
-        if pattern.is_empty() {
-            return Ok(json_response(
-                StatusCode::BAD_REQUEST,
-                &json!({"error": "regex listen_path '~' has empty pattern"}),
-            ));
-        }
-        if pattern.len() > 1024 {
-            return Ok(json_response(
-                StatusCode::BAD_REQUEST,
-                &json!({"error": "regex listen_path pattern must not exceed 1024 characters"}),
-            ));
-        }
-        let anchored = crate::config::types::anchor_regex_pattern(pattern);
-        if let Err(e) = regex::Regex::new(&anchored) {
-            return Ok(json_response(
-                StatusCode::BAD_REQUEST,
-                &json!({"error": format!("invalid regex listen_path: {}", e)}),
-            ));
-        }
-    } else if !proxy.listen_path.starts_with('/') {
-        return Ok(json_response(
-            StatusCode::BAD_REQUEST,
-            &json!({"error": "listen_path must start with '/' or '~' (regex)"}),
-        ));
-    }
-    // backend_host and backend_port are required unless upstream_id is set
-    // (upstream targets override these fields at request time)
-    if proxy.upstream_id.is_none() {
-        if proxy.backend_host.is_empty() {
-            return Ok(json_response(
-                StatusCode::BAD_REQUEST,
-                &json!({"error": "backend_host must be non-empty (or set upstream_id)"}),
-            ));
-        }
-        if proxy.backend_port == 0 {
-            return Ok(json_response(
-                StatusCode::BAD_REQUEST,
-                &json!({"error": "backend_port must be greater than 0 (or set upstream_id)"}),
-            ));
-        }
-    }
-
     // Validate and normalize allowed_methods
     if let Some(ref mut methods) = proxy.allowed_methods {
-        if methods.is_empty() {
-            return Ok(json_response(
-                StatusCode::BAD_REQUEST,
-                &json!({"error": "allowed_methods must be null (allow all) or a non-empty array"}),
-            ));
-        }
         for m in methods.iter_mut() {
             *m = m.to_uppercase();
         }
-        for m in methods.iter() {
-            if !VALID_HTTP_METHODS.contains(&m.as_str()) {
-                return Ok(json_response(
-                    StatusCode::BAD_REQUEST,
-                    &json!({"error": format!("Invalid HTTP method: {}", m)}),
-                ));
-            }
-        }
     }
 
-    // Validate field lengths, numeric ranges, and nested config objects
+    proxy.normalize_fields();
+
+    // Validate field lengths, numeric ranges, and nested config objects.
     if let Err(field_errors) = proxy.validate_fields() {
         return Ok(json_response(
             StatusCode::BAD_REQUEST,
@@ -982,36 +878,42 @@ async fn handle_update_proxy(
     proxy.id = id.to_string();
     proxy.updated_at = Utc::now();
 
-    // Validate and normalize host entries
-    for host in &mut proxy.hosts {
-        *host = host.to_lowercase();
+    let proxy_validation_config = GatewayConfig {
+        proxies: vec![proxy.clone()],
+        ..Default::default()
+    };
+    if let Err(errors) = proxy_validation_config.validate_hosts() {
+        return Ok(json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"error": format!("Invalid proxy hosts: {}", errors.join("; "))}),
+        ));
     }
-    for host in &proxy.hosts {
-        if let Err(msg) = crate::config::types::validate_host_entry(host) {
-            return Ok(json_response(
-                StatusCode::BAD_REQUEST,
-                &json!({"error": msg}),
-            ));
-        }
+    if let Err(errors) = proxy_validation_config.validate_regex_listen_paths() {
+        return Ok(json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"error": format!("Invalid proxy listen_path: {}", errors.join("; "))}),
+        ));
     }
 
-    // Check host+listen_path uniqueness (excluding self)
-    match db
-        .check_listen_path_unique(&proxy.listen_path, &proxy.hosts, Some(id))
-        .await
-    {
-        Ok(true) => {}
-        Ok(false) => {
-            return Ok(json_response(
-                StatusCode::CONFLICT,
-                &json!({"error": "A proxy with overlapping hosts and listen_path already exists"}),
-            ));
-        }
-        Err(e) => {
-            return Ok(json_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                &json!({"error": format!("{}", e)}),
-            ));
+    // Check host+listen_path uniqueness (excluding self) for HTTP-style routes.
+    if !proxy.backend_protocol.is_stream_proxy() {
+        match db
+            .check_listen_path_unique(&proxy.listen_path, &proxy.hosts, Some(id))
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                return Ok(json_response(
+                    StatusCode::CONFLICT,
+                    &json!({"error": "A proxy with overlapping hosts and listen_path already exists"}),
+                ));
+            }
+            Err(e) => {
+                return Ok(json_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    &json!({"error": format!("{}", e)}),
+                ));
+            }
         }
     }
 
@@ -1050,6 +952,25 @@ async fn handle_update_proxy(
                     &db_error_response(&e),
                 ));
             }
+        }
+    }
+
+    match db
+        .validate_proxy_plugin_associations(id, &proxy.plugins)
+        .await
+    {
+        Ok(errors) if !errors.is_empty() => {
+            return Ok(json_response(
+                StatusCode::BAD_REQUEST,
+                &json!({"error": format!("Invalid proxy plugin associations: {}", errors.join("; "))}),
+            ));
+        }
+        Ok(_) => {}
+        Err(e) => {
+            return Ok(json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &db_error_response(&e),
+            ));
         }
     }
 
@@ -1290,26 +1211,7 @@ async fn handle_create_consumer(
         ));
     }
 
-    // Validate username is non-empty and within length limits
-    if consumer.username.trim().is_empty() {
-        return Ok(json_response(
-            StatusCode::BAD_REQUEST,
-            &json!({"error": "Consumer username must not be empty"}),
-        ));
-    }
-    if consumer.username.len() > 255 {
-        return Ok(json_response(
-            StatusCode::BAD_REQUEST,
-            &json!({"error": "Consumer username must not exceed 255 characters"}),
-        ));
-    }
-
-    // Normalize custom_id: treat empty string as None
-    if let Some(ref cid) = consumer.custom_id
-        && cid.trim().is_empty()
-    {
-        consumer.custom_id = None;
-    }
+    consumer.normalize_fields();
 
     // Validate field lengths, credential sizes, and control characters
     if let Err(field_errors) = consumer.validate_fields() {
@@ -1329,6 +1231,22 @@ async fn handle_create_consumer(
                 StatusCode::CONFLICT,
                 &json!({"error": format!("Consumer with ID '{}' already exists", consumer.id)}),
             ));
+        }
+        Ok(None) => {}
+        Err(e) => {
+            return Ok(json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &db_error_response(&e),
+            ));
+        }
+    }
+
+    match db
+        .check_consumer_identity_unique(&consumer.username, consumer.custom_id.as_deref(), None)
+        .await
+    {
+        Ok(Some(msg)) => {
+            return Ok(json_response(StatusCode::CONFLICT, &json!({"error": msg})));
         }
         Ok(None) => {}
         Err(e) => {
@@ -1486,13 +1404,7 @@ async fn handle_update_consumer(
 
     consumer.id = id.to_string();
     consumer.updated_at = Utc::now();
-
-    // Normalize custom_id: treat empty string as None
-    if let Some(ref cid) = consumer.custom_id
-        && cid.trim().is_empty()
-    {
-        consumer.custom_id = None;
-    }
+    consumer.normalize_fields();
 
     // Validate field lengths, credential sizes, and control characters
     if let Err(field_errors) = consumer.validate_fields() {
@@ -1507,6 +1419,22 @@ async fn handle_update_consumer(
             StatusCode::INTERNAL_SERVER_ERROR,
             &json!({"error": e}),
         ));
+    }
+
+    match db
+        .check_consumer_identity_unique(&consumer.username, consumer.custom_id.as_deref(), Some(id))
+        .await
+    {
+        Ok(Some(msg)) => {
+            return Ok(json_response(StatusCode::CONFLICT, &json!({"error": msg})));
+        }
+        Ok(None) => {}
+        Err(e) => {
+            return Ok(json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &db_error_response(&e),
+            ));
+        }
     }
 
     // Check keyauth API key uniqueness excluding self (if present)
@@ -1869,6 +1797,8 @@ async fn handle_create_plugin_config(
         }
     };
 
+    pc.normalize_fields();
+
     if pc.id.is_empty() {
         pc.id = Uuid::new_v4().to_string();
     } else if let Err(msg) = validate_resource_id(&pc.id) {
@@ -1912,34 +1842,20 @@ async fn handle_create_plugin_config(
         ));
     }
 
-    // Validate scope and proxy_id consistency
-    if pc.scope == PluginScope::Proxy && pc.proxy_id.is_none() {
-        return Ok(json_response(
-            StatusCode::BAD_REQUEST,
-            &json!({"error": "Plugin with scope 'proxy' must have a proxy_id"}),
-        ));
-    }
-    if pc.scope == PluginScope::Global && pc.proxy_id.is_some() {
-        return Ok(json_response(
-            StatusCode::BAD_REQUEST,
-            &json!({"error": "Plugin with scope 'global' must not have a proxy_id"}),
-        ));
-    }
     // Validate proxy_id references an existing proxy
     if let Some(ref proxy_id) = pc.proxy_id {
-        match db.get_proxy(proxy_id).await {
-            Ok(Some(_)) => {}
-            Ok(None) => {
+        match db.check_proxy_exists(proxy_id).await {
+            Ok(true) => {}
+            Ok(false) => {
                 return Ok(json_response(
                     StatusCode::BAD_REQUEST,
                     &json!({"error": format!("proxy_id '{}' does not exist", proxy_id)}),
                 ));
             }
             Err(e) => {
-                error!("Database error checking proxy_id reference: {}", e);
                 return Ok(json_response(
                     StatusCode::SERVICE_UNAVAILABLE,
-                    &json!({"error": "Database error checking proxy reference"}),
+                    &db_error_response(&e),
                 ));
             }
         }
@@ -2029,6 +1945,7 @@ async fn handle_update_plugin_config(
 
     pc.id = id.to_string();
     pc.updated_at = Utc::now();
+    pc.normalize_fields();
 
     // Validate plugin name is known
     let known_plugins = crate::plugins::available_plugins();
@@ -2047,34 +1964,20 @@ async fn handle_update_plugin_config(
         ));
     }
 
-    // Validate scope and proxy_id consistency
-    if pc.scope == PluginScope::Proxy && pc.proxy_id.is_none() {
-        return Ok(json_response(
-            StatusCode::BAD_REQUEST,
-            &json!({"error": "Plugin with scope 'proxy' must have a proxy_id"}),
-        ));
-    }
-    if pc.scope == PluginScope::Global && pc.proxy_id.is_some() {
-        return Ok(json_response(
-            StatusCode::BAD_REQUEST,
-            &json!({"error": "Plugin with scope 'global' must not have a proxy_id"}),
-        ));
-    }
     // Validate proxy_id references an existing proxy
     if let Some(ref proxy_id) = pc.proxy_id {
-        match db.get_proxy(proxy_id).await {
-            Ok(Some(_)) => {}
-            Ok(None) => {
+        match db.check_proxy_exists(proxy_id).await {
+            Ok(true) => {}
+            Ok(false) => {
                 return Ok(json_response(
                     StatusCode::BAD_REQUEST,
                     &json!({"error": format!("proxy_id '{}' does not exist", proxy_id)}),
                 ));
             }
             Err(e) => {
-                error!("Database error checking proxy_id reference: {}", e);
                 return Ok(json_response(
                     StatusCode::SERVICE_UNAVAILABLE,
-                    &json!({"error": "Database error checking proxy reference"}),
+                    &db_error_response(&e),
                 ));
             }
         }
@@ -2658,7 +2561,7 @@ async fn handle_batch_create(
         }
     };
 
-    let batch: Value = match serde_json::from_slice(body) {
+    let mut batch: RestorePayload = match serde_json::from_slice(body) {
         Ok(v) => v,
         Err(e) => {
             return Ok(json_response(
@@ -2668,239 +2571,281 @@ async fn handle_batch_create(
         }
     };
 
+    let now = Utc::now();
+    let known_plugins = crate::plugins::available_plugins();
+    let mut validation_errors: Vec<String> = Vec::new();
+
+    for consumer in &mut batch.consumers {
+        if consumer.id.is_empty() {
+            consumer.id = Uuid::new_v4().to_string();
+        } else if let Err(msg) = validate_resource_id(&consumer.id) {
+            validation_errors.push(format!("Consumer '{}': {}", consumer.id, msg));
+        }
+        consumer.normalize_fields();
+        if let Err(field_errs) = consumer.validate_fields() {
+            for err in field_errs {
+                validation_errors.push(format!("Consumer '{}': {}", consumer.id, err));
+            }
+        }
+        consumer.created_at = now;
+        consumer.updated_at = now;
+        if let Err(err) = hash_consumer_secrets(consumer) {
+            validation_errors.push(format!("Consumer '{}': {}", consumer.id, err));
+        }
+    }
+
+    for upstream in &mut batch.upstreams {
+        if upstream.id.is_empty() {
+            upstream.id = Uuid::new_v4().to_string();
+        } else if let Err(msg) = validate_resource_id(&upstream.id) {
+            validation_errors.push(format!("Upstream '{}': {}", upstream.id, msg));
+        }
+        if let Err(field_errs) = upstream.validate_fields() {
+            for err in field_errs {
+                validation_errors.push(format!("Upstream '{}': {}", upstream.id, err));
+            }
+        }
+        upstream.created_at = now;
+        upstream.updated_at = now;
+    }
+
+    for proxy in &mut batch.proxies {
+        if proxy.id.is_empty() {
+            proxy.id = Uuid::new_v4().to_string();
+        } else if let Err(msg) = validate_resource_id(&proxy.id) {
+            validation_errors.push(format!("Proxy '{}': {}", proxy.id, msg));
+        }
+        if let Some(ref mut methods) = proxy.allowed_methods {
+            for method in methods.iter_mut() {
+                *method = method.to_uppercase();
+            }
+        }
+        proxy.normalize_fields();
+        if let Err(field_errs) = proxy.validate_fields() {
+            for err in field_errs {
+                validation_errors.push(format!("Proxy '{}': {}", proxy.id, err));
+            }
+        }
+        proxy.created_at = now;
+        proxy.updated_at = now;
+    }
+
+    for plugin_config in &mut batch.plugin_configs {
+        if plugin_config.id.is_empty() {
+            plugin_config.id = Uuid::new_v4().to_string();
+        } else if let Err(msg) = validate_resource_id(&plugin_config.id) {
+            validation_errors.push(format!("PluginConfig '{}': {}", plugin_config.id, msg));
+        }
+        plugin_config.normalize_fields();
+        if !known_plugins.contains(&plugin_config.plugin_name.as_str()) {
+            validation_errors.push(format!(
+                "PluginConfig '{}': unknown plugin name '{}'",
+                plugin_config.id, plugin_config.plugin_name
+            ));
+        }
+        if let Err(field_errs) = plugin_config.validate_fields() {
+            for err in field_errs {
+                validation_errors.push(format!("PluginConfig '{}': {}", plugin_config.id, err));
+            }
+        }
+        plugin_config.created_at = now;
+        plugin_config.updated_at = now;
+    }
+
+    let mut batch_config = GatewayConfig {
+        version: crate::config::types::CURRENT_CONFIG_VERSION.to_string(),
+        proxies: batch.proxies.clone(),
+        consumers: batch.consumers.clone(),
+        plugin_configs: batch.plugin_configs.clone(),
+        upstreams: batch.upstreams.clone(),
+        loaded_at: now,
+    };
+    batch_config.normalize_fields();
+
+    if let Err(errs) = batch_config.validate_all_fields() {
+        validation_errors.extend(errs);
+    }
+    if let Err(errs) = batch_config.validate_unique_resource_ids() {
+        validation_errors.extend(errs);
+    }
+    if let Err(errs) = batch_config.validate_unique_consumer_identities() {
+        validation_errors.extend(errs);
+    }
+    if let Err(errs) = batch_config.validate_unique_consumer_credentials() {
+        validation_errors.extend(errs);
+    }
+    if let Err(errs) = batch_config.validate_unique_upstream_names() {
+        validation_errors.extend(errs);
+    }
+    if let Err(errs) = batch_config.validate_unique_proxy_names() {
+        validation_errors.extend(errs);
+    }
+    if let Err(errs) = batch_config.validate_hosts() {
+        validation_errors.extend(errs);
+    }
+    if let Err(errs) = batch_config.validate_regex_listen_paths() {
+        validation_errors.extend(errs);
+    }
+    if let Err(errs) = batch_config.validate_unique_listen_paths() {
+        validation_errors.extend(errs);
+    }
+    if let Err(errs) = batch_config.validate_stream_proxies() {
+        validation_errors.extend(errs);
+    }
+
+    let batch_proxy_ids: HashSet<&str> = batch
+        .proxies
+        .iter()
+        .map(|proxy| proxy.id.as_str())
+        .collect();
+    let batch_upstream_ids: HashSet<&str> = batch
+        .upstreams
+        .iter()
+        .map(|upstream| upstream.id.as_str())
+        .collect();
+    let batch_plugin_configs: std::collections::HashMap<&str, &PluginConfig> = batch
+        .plugin_configs
+        .iter()
+        .map(|plugin_config| (plugin_config.id.as_str(), plugin_config))
+        .collect();
+
+    for proxy in &batch.proxies {
+        if let Some(upstream_id) = proxy.upstream_id.as_deref()
+            && !batch_upstream_ids.contains(upstream_id)
+        {
+            match db.check_upstream_exists(upstream_id).await {
+                Ok(true) => {}
+                Ok(false) => validation_errors.push(format!(
+                    "Proxy '{}' references non-existent upstream_id '{}'",
+                    proxy.id, upstream_id
+                )),
+                Err(err) => validation_errors.push(format!(
+                    "Proxy '{}' upstream reference check failed: {}",
+                    proxy.id, err
+                )),
+            }
+        }
+
+        let mut unresolved = Vec::new();
+        let mut seen_plugin_names: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+
+        for assoc in &proxy.plugins {
+            match batch_plugin_configs.get(assoc.plugin_config_id.as_str()) {
+                Some(plugin_config) => {
+                    if plugin_config.scope != PluginScope::Proxy {
+                        validation_errors.push(format!(
+                            "Proxy '{}' references plugin_config '{}' with scope 'global' — proxy associations may only reference proxy-scoped plugin configs",
+                            proxy.id, plugin_config.id
+                        ));
+                        continue;
+                    }
+                    if plugin_config.proxy_id.as_deref() != Some(proxy.id.as_str()) {
+                        validation_errors.push(format!(
+                            "Proxy '{}' references plugin_config '{}' targeted to proxy '{}'",
+                            proxy.id,
+                            plugin_config.id,
+                            plugin_config.proxy_id.as_deref().unwrap_or("<none>")
+                        ));
+                        continue;
+                    }
+                    if let Some(existing_id) = seen_plugin_names
+                        .insert(plugin_config.plugin_name.clone(), plugin_config.id.clone())
+                    {
+                        validation_errors.push(format!(
+                            "Proxy '{}' has duplicate plugin '{}' (config IDs '{}' and '{}')",
+                            proxy.id, plugin_config.plugin_name, existing_id, plugin_config.id
+                        ));
+                    }
+                }
+                None => unresolved.push(assoc.clone()),
+            }
+        }
+
+        if !unresolved.is_empty() {
+            match db
+                .validate_proxy_plugin_associations(&proxy.id, &unresolved)
+                .await
+            {
+                Ok(errs) => validation_errors.extend(errs),
+                Err(err) => validation_errors.push(format!(
+                    "Proxy '{}' plugin association check failed: {}",
+                    proxy.id, err
+                )),
+            }
+        }
+    }
+
+    for plugin_config in &batch.plugin_configs {
+        if let Some(proxy_id) = plugin_config.proxy_id.as_deref()
+            && !batch_proxy_ids.contains(proxy_id)
+        {
+            match db.check_proxy_exists(proxy_id).await {
+                Ok(true) => {}
+                Ok(false) => validation_errors.push(format!(
+                    "PluginConfig '{}' references non-existent proxy_id '{}'",
+                    plugin_config.id, proxy_id
+                )),
+                Err(err) => validation_errors.push(format!(
+                    "PluginConfig '{}' proxy reference check failed: {}",
+                    plugin_config.id, err
+                )),
+            }
+        }
+    }
+
+    if !validation_errors.is_empty() {
+        return Ok(json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({
+                "error": "Batch validation failed",
+                "validation_errors": validation_errors
+            }),
+        ));
+    }
+
     let mut created_proxies = 0usize;
     let mut created_consumers = 0usize;
     let mut created_plugin_configs = 0usize;
     let mut created_upstreams = 0usize;
     let mut errors: Vec<String> = Vec::new();
 
-    // Batch create consumers (before proxies, since proxies may reference consumer ACLs)
-    if let Some(consumers_val) = batch.get("consumers") {
-        match serde_json::from_value::<Vec<Consumer>>(consumers_val.clone()) {
-            Ok(mut consumers) => {
-                let now = Utc::now();
-                let mut seen_ids: HashSet<String> = HashSet::new();
-                let mut seen_usernames: HashSet<String> = HashSet::new();
-                let mut seen_custom_ids: HashSet<String> = HashSet::new();
-                for c in &mut consumers {
-                    if c.id.is_empty() {
-                        c.id = Uuid::new_v4().to_string();
-                    } else if let Err(msg) = validate_resource_id(&c.id) {
-                        errors.push(format!("Consumer '{}': {}", c.id, msg));
-                    }
-                    if !seen_ids.insert(c.id.clone()) {
-                        errors.push(format!("Duplicate consumer ID '{}' in batch", c.id));
-                    }
-                    if c.username.trim().is_empty() {
-                        errors.push(format!("Consumer '{}': username must not be empty", c.id));
-                    } else if !seen_usernames.insert(c.username.clone()) {
-                        errors.push(format!(
-                            "Duplicate consumer username '{}' in batch",
-                            c.username
-                        ));
-                    }
-                    // Normalize custom_id: treat empty string as None
-                    if let Some(ref cid) = c.custom_id
-                        && cid.trim().is_empty()
-                    {
-                        c.custom_id = None;
-                    }
-                    if let Some(ref cid) = c.custom_id
-                        && !seen_custom_ids.insert(cid.clone())
-                    {
-                        errors.push(format!("Duplicate consumer custom_id '{}' in batch", cid));
-                    }
-                    // Validate field lengths and credential sizes
-                    if let Err(field_errs) = c.validate_fields() {
-                        for e in field_errs {
-                            errors.push(format!("Consumer '{}': {}", c.id, e));
-                        }
-                    }
-                    c.created_at = now;
-                    c.updated_at = now;
-                    if let Err(e) = hash_consumer_secrets(c) {
-                        errors.push(format!("Consumer '{}': {}", c.id, e));
-                    }
-                }
-                if errors.is_empty() {
-                    match db.batch_create_consumers(&consumers).await {
-                        Ok(n) => created_consumers = n,
-                        Err(e) => errors.push(format!("consumers: {}", e)),
-                    }
-                }
-            }
-            Err(e) => errors.push(format!("consumers parse error: {}", e)),
+    if !batch.consumers.is_empty() {
+        match db.batch_create_consumers(&batch.consumers).await {
+            Ok(n) => created_consumers = n,
+            Err(e) => errors.push(format!("consumers: {}", e)),
         }
     }
 
-    // Batch create upstreams (before proxies, since proxies may reference upstream_id)
-    if let Some(upstreams_val) = batch.get("upstreams") {
-        match serde_json::from_value::<Vec<Upstream>>(upstreams_val.clone()) {
-            Ok(mut upstreams) => {
-                let now = Utc::now();
-                let mut seen_ids: HashSet<String> = HashSet::new();
-                let mut seen_names: HashSet<String> = HashSet::new();
-                for u in &mut upstreams {
-                    if u.id.is_empty() {
-                        u.id = Uuid::new_v4().to_string();
-                    } else if let Err(msg) = validate_resource_id(&u.id) {
-                        errors.push(format!("Upstream '{}': {}", u.id, msg));
-                    }
-                    if !seen_ids.insert(u.id.clone()) {
-                        errors.push(format!("Duplicate upstream ID '{}' in batch", u.id));
-                    }
-                    if let Some(ref name) = u.name
-                        && !seen_names.insert(name.clone())
-                    {
-                        errors.push(format!("Duplicate upstream name '{}' in batch", name));
-                    }
-                    if u.targets.is_empty() && u.service_discovery.is_none() {
-                        errors.push(format!(
-                            "Upstream '{}': must have at least one target or service_discovery",
-                            u.id
-                        ));
-                    }
-                    // Validate field lengths, target hosts/ports/weights
-                    if let Err(field_errs) = u.validate_fields() {
-                        for e in field_errs {
-                            errors.push(format!("Upstream '{}': {}", u.id, e));
-                        }
-                    }
-                    u.created_at = now;
-                    u.updated_at = now;
-                }
-                if errors.is_empty() {
-                    match db.batch_create_upstreams(&upstreams).await {
-                        Ok(n) => created_upstreams = n,
-                        Err(e) => errors.push(format!("upstreams: {}", e)),
-                    }
-                }
-            }
-            Err(e) => errors.push(format!("upstreams parse error: {}", e)),
+    if errors.is_empty() && !batch.upstreams.is_empty() {
+        match db.batch_create_upstreams(&batch.upstreams).await {
+            Ok(n) => created_upstreams = n,
+            Err(e) => errors.push(format!("upstreams: {}", e)),
         }
     }
 
-    // Batch create proxies
-    if let Some(proxies_val) = batch.get("proxies") {
-        match serde_json::from_value::<Vec<Proxy>>(proxies_val.clone()) {
-            Ok(mut proxies) => {
-                let now = Utc::now();
-                let mut seen_ids: HashSet<String> = HashSet::new();
-                for p in &mut proxies {
-                    if p.id.is_empty() {
-                        p.id = Uuid::new_v4().to_string();
-                    } else if let Err(msg) = validate_resource_id(&p.id) {
-                        errors.push(format!("Proxy '{}': {}", p.id, msg));
-                    }
-                    if !seen_ids.insert(p.id.clone()) {
-                        errors.push(format!("Duplicate proxy ID '{}' in batch", p.id));
-                    }
-                    if p.listen_path.is_empty() {
-                        errors.push(format!("Proxy '{}': listen_path must be non-empty", p.id));
-                    } else if p.listen_path.starts_with('~') {
-                        // Validate regex compilation
-                        let pattern = &p.listen_path[1..];
-                        if pattern.is_empty() {
-                            errors.push(format!(
-                                "Proxy '{}': regex listen_path '~' has empty pattern",
-                                p.id
-                            ));
-                        } else {
-                            let anchored = crate::config::types::anchor_regex_pattern(pattern);
-                            if let Err(e) = regex::Regex::new(&anchored) {
-                                errors.push(format!(
-                                    "Proxy '{}': invalid regex listen_path: {}",
-                                    p.id, e
-                                ));
-                            }
-                        }
-                    } else if !p.listen_path.starts_with('/') {
-                        errors.push(format!(
-                            "Proxy '{}': listen_path must start with '/' or '~' (regex)",
-                            p.id
-                        ));
-                    }
-                    // Normalize and validate hosts
-                    for host in &mut p.hosts {
-                        *host = host.to_lowercase();
-                    }
-                    for host in &p.hosts {
-                        if let Err(msg) = crate::config::types::validate_host_entry(host) {
-                            errors.push(format!("Proxy '{}': {}", p.id, msg));
-                        }
-                    }
-                    // Validate field lengths, numeric ranges, and nested configs
-                    if let Err(field_errs) = p.validate_fields() {
-                        for e in field_errs {
-                            errors.push(format!("Proxy '{}': {}", p.id, e));
-                        }
-                    }
-                    p.created_at = now;
-                    p.updated_at = now;
-                }
-                if errors.is_empty() {
-                    match db.batch_create_proxies(&proxies).await {
-                        Ok(n) => created_proxies = n,
-                        Err(e) => errors.push(format!("proxies: {}", e)),
-                    }
-                }
-            }
-            Err(e) => errors.push(format!("proxies parse error: {}", e)),
+    if errors.is_empty() && !batch.proxies.is_empty() {
+        match db
+            .batch_create_proxies_without_plugins(&batch.proxies)
+            .await
+        {
+            Ok(n) => created_proxies = n,
+            Err(e) => errors.push(format!("proxies: {}", e)),
         }
     }
 
-    // Batch create plugin configs (after proxies, since they reference proxy_id)
-    if let Some(pcs_val) = batch.get("plugin_configs") {
-        match serde_json::from_value::<Vec<PluginConfig>>(pcs_val.clone()) {
-            Ok(mut pcs) => {
-                let known_plugins = crate::plugins::available_plugins();
-                let now = Utc::now();
-                let mut seen_ids: HashSet<String> = HashSet::new();
-                for pc in &mut pcs {
-                    if pc.id.is_empty() {
-                        pc.id = Uuid::new_v4().to_string();
-                    } else if let Err(msg) = validate_resource_id(&pc.id) {
-                        errors.push(format!("PluginConfig '{}': {}", pc.id, msg));
-                    }
-                    if !seen_ids.insert(pc.id.clone()) {
-                        errors.push(format!("Duplicate plugin config ID '{}' in batch", pc.id));
-                    }
-                    if !known_plugins.contains(&pc.plugin_name.as_str()) {
-                        errors.push(format!(
-                            "PluginConfig '{}': unknown plugin name '{}'",
-                            pc.id, pc.plugin_name
-                        ));
-                    }
-                    if pc.scope == PluginScope::Proxy && pc.proxy_id.is_none() {
-                        errors.push(format!(
-                            "PluginConfig '{}': scope 'proxy' requires proxy_id",
-                            pc.id
-                        ));
-                    }
-                    if pc.scope == PluginScope::Global && pc.proxy_id.is_some() {
-                        errors.push(format!(
-                            "PluginConfig '{}': scope 'global' must not have proxy_id",
-                            pc.id
-                        ));
-                    }
-                    // Validate field lengths, config JSON size, nesting depth
-                    if let Err(field_errs) = pc.validate_fields() {
-                        for e in field_errs {
-                            errors.push(format!("PluginConfig '{}': {}", pc.id, e));
-                        }
-                    }
-                    pc.created_at = now;
-                    pc.updated_at = now;
-                }
-                if errors.is_empty() {
-                    match db.batch_create_plugin_configs(&pcs).await {
-                        Ok(n) => created_plugin_configs = n,
-                        Err(e) => errors.push(format!("plugin_configs: {}", e)),
-                    }
-                }
-            }
-            Err(e) => errors.push(format!("plugin_configs parse error: {}", e)),
+    if errors.is_empty() && !batch.plugin_configs.is_empty() {
+        match db.batch_create_plugin_configs(&batch.plugin_configs).await {
+            Ok(n) => created_plugin_configs = n,
+            Err(e) => errors.push(format!("plugin_configs: {}", e)),
         }
+    }
+
+    if errors.is_empty()
+        && !batch.proxies.is_empty()
+        && let Err(e) = db.batch_attach_proxy_plugins(&batch.proxies).await
+    {
+        errors.push(format!("proxy_plugins: {}", e));
     }
 
     let mut response = json!({
@@ -3216,7 +3161,7 @@ async fn handle_restore(
     // Phase 2: Validate payload BEFORE deleting anything.
     // Assemble a temporary GatewayConfig and run the same validations as file mode.
     {
-        let temp_config = GatewayConfig {
+        let mut temp_config = GatewayConfig {
             version: crate::config::types::CURRENT_CONFIG_VERSION.to_string(),
             proxies: payload.proxies.clone(),
             consumers: payload.consumers.clone(),
@@ -3224,6 +3169,7 @@ async fn handle_restore(
             upstreams: payload.upstreams.clone(),
             loaded_at: Utc::now(),
         };
+        temp_config.normalize_fields();
         let mut validation_errors: Vec<String> = Vec::new();
 
         if let Err(errs) = temp_config.validate_all_fields() {
@@ -3238,6 +3184,9 @@ async fn handle_restore(
         if let Err(errs) = temp_config.validate_unique_consumer_credentials() {
             validation_errors.extend(errs);
         }
+        if let Err(errs) = temp_config.validate_hosts() {
+            validation_errors.extend(errs);
+        }
         if let Err(errs) = temp_config.validate_regex_listen_paths() {
             validation_errors.extend(errs);
         }
@@ -3248,6 +3197,12 @@ async fn handle_restore(
             validation_errors.extend(errs);
         }
         if let Err(errs) = temp_config.validate_upstream_references() {
+            validation_errors.extend(errs);
+        }
+        if let Err(errs) = temp_config.validate_plugin_references() {
+            validation_errors.extend(errs);
+        }
+        if let Err(errs) = temp_config.validate_unique_plugins_per_proxy() {
             validation_errors.extend(errs);
         }
 
@@ -3304,9 +3259,13 @@ async fn handle_restore(
         }
     }
 
-    // Proxies (may reference upstreams)
+    // Proxies (may reference upstreams). Persist rows first; proxy/plugin
+    // associations are attached after plugin configs exist.
     if !payload.proxies.is_empty() {
-        match db.batch_create_proxies(&payload.proxies).await {
+        match db
+            .batch_create_proxies_without_plugins(&payload.proxies)
+            .await
+        {
             Ok(n) => created_proxies = n,
             Err(e) => errors.push(format!("proxies: {}", e)),
         }
@@ -3321,6 +3280,13 @@ async fn handle_restore(
             Ok(n) => created_plugin_configs = n,
             Err(e) => errors.push(format!("plugin_configs: {}", e)),
         }
+    }
+
+    if errors.is_empty()
+        && !payload.proxies.is_empty()
+        && let Err(e) = db.batch_attach_proxy_plugins(&payload.proxies).await
+    {
+        errors.push(format!("proxy_plugins: {}", e));
     }
 
     info!(
