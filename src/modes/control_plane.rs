@@ -58,6 +58,8 @@ pub async fn run(
     )
     .await?;
 
+    db.set_slow_query_threshold(env_config.db_slow_query_threshold_ms);
+
     // Connect read replica for config polling (reduces primary load)
     let effective_replica_url = env_config.effective_db_read_replica_url();
     if let Some(ref replica_url) = effective_replica_url {

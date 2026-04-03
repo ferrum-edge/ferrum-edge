@@ -146,6 +146,11 @@ pub struct EnvConfig {
     /// back to primary if the replica is unreachable.
     pub db_read_replica_url: Option<String>,
 
+    /// Threshold in milliseconds for logging slow database queries.
+    /// When a database query exceeds this duration, a warning is logged with
+    /// the operation name and elapsed time. Default: disabled (None).
+    pub db_slow_query_threshold_ms: Option<u64>,
+
     // Database connection pool tuning
     /// Maximum number of connections in the database pool. Default: 10.
     /// Increase for CP mode with many DPs or high admin API concurrency.
@@ -428,6 +433,7 @@ impl Default for EnvConfig {
             db_config_backup_path: None,
             db_failover_urls: Vec::new(),
             db_read_replica_url: None,
+            db_slow_query_threshold_ms: None,
             db_pool_max_connections: 10,
             db_pool_min_connections: 1,
             db_pool_acquire_timeout_seconds: 30,
@@ -577,6 +583,9 @@ impl EnvConfig {
                 })
                 .unwrap_or_default(),
             db_read_replica_url: resolve_var(conf, "FERRUM_DB_READ_REPLICA_URL"),
+
+            db_slow_query_threshold_ms: resolve_var(conf, "FERRUM_DB_SLOW_QUERY_THRESHOLD_MS")
+                .and_then(|v| v.parse().ok()),
 
             // Database connection pool tuning
             db_pool_max_connections: resolve_var(conf, "FERRUM_DB_POOL_MAX_CONNECTIONS")
