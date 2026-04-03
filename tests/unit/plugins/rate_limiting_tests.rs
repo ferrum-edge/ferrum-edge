@@ -421,7 +421,7 @@ async fn test_rate_limiting_high_tps_limit() {
         let result = plugin.on_request_received(&mut ctx).await;
         match result {
             PluginResult::Continue => passed += 1,
-            PluginResult::Reject { .. } => rejected += 1,
+            PluginResult::Reject { .. } | PluginResult::RejectBinary { .. } => rejected += 1,
         }
     }
 

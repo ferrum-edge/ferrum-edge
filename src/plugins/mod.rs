@@ -239,6 +239,12 @@ pub enum PluginResult {
         body: String,
         headers: HashMap<String, String>,
     },
+    /// Short-circuit with an arbitrary byte body.
+    RejectBinary {
+        status_code: u16,
+        body: bytes::Bytes,
+        headers: HashMap<String, String>,
+    },
 }
 
 /// Transaction summary for logging plugins.

@@ -929,6 +929,40 @@ Enforces per-proxy response body size limits. Rejects with HTTP 502.
 | `max_bytes` | u64 | `0` (disabled) | Maximum allowed response body size in bytes |
 | `require_buffered_check` | bool | `false` | Force response body buffering to verify actual final size when `Content-Length` is absent |
 
+### `response_caching`
+
+Caches final client-visible HTTP responses in gateway memory. The cache key includes the matched proxy, request method, path, optional query string, optional authenticated identity, and any request headers selected by plugin config or backend `Vary`.
+
+**Priority:** 3500
+**Protocol:** HTTP only
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `ttl_seconds` | u64 | `300` | Default TTL when the backend response does not provide cache freshness headers |
+| `max_entries` | u64 | `10000` | Maximum number of in-memory cache entries before eviction |
+| `max_entry_size_bytes` | u64 | `1048576` | Maximum size of a single cached response body |
+| `max_total_size_bytes` | u64 | `104857600` | Maximum total in-memory cache size across all entries |
+| `cacheable_methods` | String[] | `["GET","HEAD"]` | Methods eligible for caching |
+| `cacheable_status_codes` | u16[] | `[200,301,404]` | Response status codes eligible for caching |
+| `respect_cache_control` | bool | `true` | Honor backend `Cache-Control` directives such as `no-store`, `private`, `max-age`, and `s-maxage` |
+| `respect_no_cache` | bool | `true` | Bypass cache lookup when the client sends `Cache-Control: no-cache` or `no-store` |
+| `vary_by_headers` | String[] | `[]` | Additional request headers to include in the cache key even when the backend does not send `Vary` |
+| `cache_key_include_query` | bool | `true` | Include query parameters in the cache key |
+| `cache_key_include_consumer` | bool | `false` | Partition the cache by authenticated identity / consumer |
+| `add_cache_status_header` | bool | `true` | Add `X-Cache-Status` (`MISS`, `HIT`, `BYPASS`, `REVALIDATED`) to downstream responses |
+| `invalidate_on_unsafe_methods` | bool | `true` | Invalidate cached entries for the same path prefix on non-cacheable methods such as `POST`, `PUT`, `PATCH`, and `DELETE` |
+
+Behavior:
+- The plugin caches the final post-transform response body and headers, so cached hits include `response_transformer` output rather than the raw backend payload.
+- Backend `Vary` is honored automatically. If the origin returns `Vary: Accept-Encoding`, compressed and uncompressed representations are cached separately.
+- Conditional requests are served from cache. Matching `If-None-Match` or `If-Modified-Since` requests return `304 Not Modified` directly from the edge cache when a fresh cached validator exists.
+- Responses with `Authorization` on the request are not shared-cached unless the backend explicitly allows it via `Cache-Control: public`, `must-revalidate`, or `s-maxage`, or you partition the key with `cache_key_include_consumer: true`.
+- The plugin stores arbitrary response bytes, so binary responses and backend-compressed payloads can be cached safely.
+
+Compression note:
+- Ferrum currently does **not** generate gzip or brotli on its own.
+- It forwards backend `Content-Encoding` as-is and caches compressed variants correctly when the origin sends the matching `Vary` header.
+
 ### `graphql`
 
 GraphQL-aware proxying with query analysis, depth/complexity limiting, and per-operation rate limiting.

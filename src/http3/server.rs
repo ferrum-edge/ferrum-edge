@@ -27,8 +27,8 @@ use crate::config::types::Proxy;
 use crate::dns::DnsCacheResolver;
 use crate::plugins::{Plugin, PluginResult, ProxyProtocol, RequestContext, TransactionSummary};
 use crate::proxy::{
-    ProxyState, apply_after_proxy_hooks_to_rejection, run_after_proxy_hooks,
-    run_authentication_phase,
+    ProxyState, apply_after_proxy_hooks_to_rejection, plugin_result_into_reject_parts,
+    run_after_proxy_hooks, run_authentication_phase,
 };
 use crate::tls::TlsPolicy;
 
@@ -470,7 +470,7 @@ async fn handle_h3_request(
         send_h3_reject_response(
             &mut stream,
             StatusCode::METHOD_NOT_ALLOWED,
-            r#"{"error":"Method Not Allowed"}"#,
+            r#"{"error":"Method Not Allowed"}"#.as_bytes(),
             &headers,
         )
         .await?;
@@ -488,24 +488,29 @@ async fn handle_h3_request(
     let phase_start = std::time::Instant::now();
     for plugin in plugins.iter() {
         match plugin.on_request_received(&mut ctx).await {
-            PluginResult::Reject {
-                status_code,
-                body,
-                mut headers,
-            } => {
-                record_request(&state, status_code);
-                apply_after_proxy_hooks_to_rejection(&plugins, &mut ctx, status_code, &mut headers)
-                    .await;
+            PluginResult::Continue => {}
+            reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
+                let reject = plugin_result_into_reject_parts(reject)
+                    .expect("reject result should convert to rejection parts");
+                record_request(&state, reject.status_code);
+                let mut headers = reject.headers;
+                apply_after_proxy_hooks_to_rejection(
+                    &plugins,
+                    &mut ctx,
+                    reject.status_code,
+                    &mut headers,
+                )
+                .await;
                 send_h3_reject_response(
                     &mut stream,
-                    StatusCode::from_u16(status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-                    &body,
+                    StatusCode::from_u16(reject.status_code)
+                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                    &reject.body,
                     &headers,
                 )
                 .await?;
                 return Ok(());
             }
-            PluginResult::Continue => {}
         }
     }
     plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
@@ -542,29 +547,30 @@ async fn handle_h3_request(
         for plugin in plugins.iter() {
             if plugin.name() == "access_control" {
                 match plugin.authorize(&mut ctx).await {
-                    PluginResult::Reject {
-                        status_code,
-                        body,
-                        mut headers,
-                    } => {
-                        record_request(&state, status_code);
+                    PluginResult::Continue => {}
+                    reject @ PluginResult::Reject { .. }
+                    | reject @ PluginResult::RejectBinary { .. } => {
+                        let reject = plugin_result_into_reject_parts(reject)
+                            .expect("reject result should convert to rejection parts");
+                        record_request(&state, reject.status_code);
+                        let mut headers = reject.headers;
                         apply_after_proxy_hooks_to_rejection(
                             &plugins,
                             &mut ctx,
-                            status_code,
+                            reject.status_code,
                             &mut headers,
                         )
                         .await;
                         send_h3_reject_response(
                             &mut stream,
-                            StatusCode::from_u16(status_code).unwrap_or(StatusCode::FORBIDDEN),
-                            &body,
+                            StatusCode::from_u16(reject.status_code)
+                                .unwrap_or(StatusCode::FORBIDDEN),
+                            &reject.body,
                             &headers,
                         )
                         .await?;
                         return Ok(());
                     }
-                    PluginResult::Continue => {}
                 }
             }
         }
@@ -618,30 +624,30 @@ async fn handle_h3_request(
         let mut cloned = ctx.headers.clone();
         for plugin in plugins.iter() {
             match plugin.before_proxy(&mut ctx, &mut cloned).await {
-                PluginResult::Reject {
-                    status_code,
-                    body,
-                    mut headers,
-                } => {
-                    record_request(&state, status_code);
+                PluginResult::Continue => {}
+                reject @ PluginResult::Reject { .. }
+                | reject @ PluginResult::RejectBinary { .. } => {
+                    let reject = plugin_result_into_reject_parts(reject)
+                        .expect("reject result should convert to rejection parts");
+                    record_request(&state, reject.status_code);
+                    let mut headers = reject.headers;
                     apply_after_proxy_hooks_to_rejection(
                         &plugins,
                         &mut ctx,
-                        status_code,
+                        reject.status_code,
                         &mut headers,
                     )
                     .await;
                     send_h3_reject_response(
                         &mut stream,
-                        StatusCode::from_u16(status_code)
+                        StatusCode::from_u16(reject.status_code)
                             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-                        &body,
+                        &reject.body,
                         &headers,
                     )
                     .await?;
                     return Ok(());
                 }
-                PluginResult::Continue => {}
             }
         }
         plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
@@ -653,31 +659,31 @@ async fn handle_h3_request(
         let mut tmp_headers = std::mem::take(&mut ctx.headers);
         for plugin in plugins.iter() {
             match plugin.before_proxy(&mut ctx, &mut tmp_headers).await {
-                PluginResult::Reject {
-                    status_code,
-                    body,
-                    mut headers,
-                } => {
+                PluginResult::Continue => {}
+                reject @ PluginResult::Reject { .. }
+                | reject @ PluginResult::RejectBinary { .. } => {
+                    let reject = plugin_result_into_reject_parts(reject)
+                        .expect("reject result should convert to rejection parts");
                     ctx.headers = tmp_headers;
-                    record_request(&state, status_code);
+                    record_request(&state, reject.status_code);
+                    let mut headers = reject.headers;
                     apply_after_proxy_hooks_to_rejection(
                         &plugins,
                         &mut ctx,
-                        status_code,
+                        reject.status_code,
                         &mut headers,
                     )
                     .await;
                     send_h3_reject_response(
                         &mut stream,
-                        StatusCode::from_u16(status_code)
+                        StatusCode::from_u16(reject.status_code)
                             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-                        &body,
+                        &reject.body,
                         &headers,
                     )
                     .await?;
                     return Ok(());
                 }
-                PluginResult::Continue => {}
             }
         }
         plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
@@ -774,18 +780,23 @@ async fn handle_h3_request(
 
     match crate::proxy::run_final_request_body_hooks(&plugins, &proxy_headers, &body_data).await {
         crate::plugins::PluginResult::Continue => {}
-        crate::plugins::PluginResult::Reject {
-            status_code,
-            body,
-            mut headers,
-        } => {
-            record_request(&state, status_code);
-            apply_after_proxy_hooks_to_rejection(&plugins, &mut ctx, status_code, &mut headers)
-                .await;
+        reject @ crate::plugins::PluginResult::Reject { .. }
+        | reject @ crate::plugins::PluginResult::RejectBinary { .. } => {
+            let reject = plugin_result_into_reject_parts(reject)
+                .expect("reject result should convert to rejection parts");
+            record_request(&state, reject.status_code);
+            let mut headers = reject.headers;
+            apply_after_proxy_hooks_to_rejection(
+                &plugins,
+                &mut ctx,
+                reject.status_code,
+                &mut headers,
+            )
+            .await;
             send_h3_reject_response(
                 &mut stream,
-                StatusCode::from_u16(status_code).unwrap_or(StatusCode::PAYLOAD_TOO_LARGE),
-                &body,
+                StatusCode::from_u16(reject.status_code).unwrap_or(StatusCode::PAYLOAD_TOO_LARGE),
+                &reject.body,
                 &headers,
             )
             .await?;
@@ -907,7 +918,7 @@ async fn handle_h3_request(
                 response_headers
                     .entry("content-type".to_string())
                     .or_insert_with(|| "application/json".to_string());
-                response_body = reject.body.into_bytes();
+                response_body = reject.body;
                 after_proxy_rejected = true;
             }
             plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
@@ -923,23 +934,23 @@ async fn handle_h3_request(
                     .await;
                 match result {
                     PluginResult::Continue => {}
-                    PluginResult::Reject {
-                        status_code,
-                        body: reject_body,
-                        headers: reject_headers,
-                    } => {
+                    reject @ PluginResult::Reject { .. }
+                    | reject @ PluginResult::RejectBinary { .. } => {
+                        let reject = plugin_result_into_reject_parts(reject)
+                            .expect("reject result should convert to rejection parts");
                         debug!(
                             plugin = plugin.name(),
-                            status_code, "Plugin rejected response body (HTTP/3)"
+                            status_code = reject.status_code,
+                            "Plugin rejected response body (HTTP/3)"
                         );
-                        response_status = status_code;
+                        response_status = reject.status_code;
                         response_headers.clear();
                         response_headers
                             .insert("content-type".to_string(), "application/json".to_string());
-                        for (k, v) in reject_headers {
+                        for (k, v) in reject.headers {
                             response_headers.insert(k, v);
                         }
-                        response_body = reject_body.into_bytes();
+                        response_body = reject.body;
                         break;
                     }
                 }
@@ -977,23 +988,23 @@ async fn handle_h3_request(
                     .await;
                 match result {
                     PluginResult::Continue => {}
-                    PluginResult::Reject {
-                        status_code,
-                        body: reject_body,
-                        headers: reject_headers,
-                    } => {
+                    reject @ PluginResult::Reject { .. }
+                    | reject @ PluginResult::RejectBinary { .. } => {
+                        let reject = plugin_result_into_reject_parts(reject)
+                            .expect("reject result should convert to rejection parts");
                         debug!(
                             plugin = plugin.name(),
-                            status_code, "Plugin rejected finalized response body (HTTP/3)"
+                            status_code = reject.status_code,
+                            "Plugin rejected finalized response body (HTTP/3)"
                         );
-                        response_status = status_code;
+                        response_status = reject.status_code;
                         response_headers.clear();
                         response_headers
                             .insert("content-type".to_string(), "application/json".to_string());
-                        for (k, v) in reject_headers {
+                        for (k, v) in reject.headers {
                             response_headers.insert(k, v);
                         }
-                        response_body = reject_body.into_bytes();
+                        response_body = reject.body;
                         break;
                     }
                 }
@@ -1570,7 +1581,7 @@ async fn send_h3_response(
 async fn send_h3_reject_response(
     stream: &mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
     status: StatusCode,
-    body: &str,
+    body: &[u8],
     headers: &HashMap<String, String>,
 ) -> Result<(), anyhow::Error> {
     let mut builder = Response::builder()
@@ -1588,7 +1599,7 @@ async fn send_h3_reject_response(
         .body(())
         .map_err(|e| anyhow::anyhow!("Failed to build HTTP/3 reject response: {}", e))?;
     stream.send_response(resp).await?;
-    stream.send_data(Bytes::from(body.to_string())).await?;
+    stream.send_data(Bytes::copy_from_slice(body)).await?;
     stream.finish().await?;
     Ok(())
 }

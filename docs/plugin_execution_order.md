@@ -226,6 +226,16 @@ Given all built-in plugins enabled, the execution order is:
 
 ## Why This Order Matters
 
+### Response caching runs after response size limiting (3490 -> 3500)
+
+`response_size_limiting` gets the first chance to reject oversized backend payloads before anything is written into cache. `response_caching` then records the surviving final representation in `on_final_response_body`, after all response-body transforms have completed.
+
+That ordering has a few practical effects:
+- Cache entries include the final client-visible body and headers, not the raw backend response.
+- Backend `Vary` headers are respected when building the cache key, so variants such as `Accept-Encoding: gzip` stay isolated from uncompressed responses.
+- Fresh cached validators (`ETag`, `Last-Modified`) can satisfy conditional requests at the edge with a `304 Not Modified` response.
+- Ferrum still does not generate gzip/brotli on its own; compression remains backend-driven pass-through. The cache can store and replay those compressed backend variants safely.
+
 ### OTel tracing runs first (priority 25)
 
 OpenTelemetry tracing runs at priority 25 — the earliest of any plugin — so it can capture trace context before any other plugin runs. This ensures accurate timing: the gateway span's start time reflects the true moment the request was received, not the time after CORS/auth/etc. have executed. The `before_proxy` phase injects traceparent into backend requests, `after_proxy` echoes it to clients, and `log` exports the completed span to the OTLP collector.

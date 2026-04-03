@@ -45,6 +45,29 @@ fn plugin_with_config(config: serde_json::Value) -> ResponseCaching {
     ResponseCaching::new(&config)
 }
 
+fn expect_reject(result: PluginResult) -> (u16, Vec<u8>, HashMap<String, String>) {
+    match result {
+        PluginResult::Reject {
+            status_code,
+            body,
+            headers,
+        } => (status_code, body.into_bytes(), headers),
+        PluginResult::RejectBinary {
+            status_code,
+            body,
+            headers,
+        } => (status_code, body.to_vec(), headers),
+        PluginResult::Continue => panic!("Expected cache hit"),
+    }
+}
+
+fn is_reject(result: &PluginResult) -> bool {
+    matches!(
+        result,
+        PluginResult::Reject { .. } | PluginResult::RejectBinary { .. }
+    )
+}
+
 // Helper to simulate a full cache flow: before_proxy (miss) -> after_proxy -> on_final_response_body
 async fn cache_response(
     plugin: &ResponseCaching,
@@ -101,7 +124,7 @@ async fn test_cache_miss_first_request() {
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(matches!(result, PluginResult::Continue));
     assert_eq!(ctx.metadata.get("cache_status").unwrap(), "MISS");
-    assert!(ctx.metadata.contains_key("cache_key"));
+    assert!(ctx.metadata.contains_key("cache_base_key"));
 }
 
 // === Cache hit on second request ===
@@ -126,20 +149,11 @@ async fn test_cache_hit_second_request() {
     let mut ctx = make_ctx("GET", "/api/data");
     let mut headers = HashMap::new();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
-
-    match result {
-        PluginResult::Reject {
-            status_code,
-            body,
-            headers,
-        } => {
-            assert_eq!(status_code, 200);
-            assert_eq!(body, "{\"key\":\"value\"}");
-            assert_eq!(headers.get("content-type").unwrap(), "application/json");
-            assert_eq!(headers.get("x-cache-status").unwrap(), "HIT");
-        }
-        _ => panic!("Expected Reject (cache HIT)"),
-    }
+    let (status_code, body, headers) = expect_reject(result);
+    assert_eq!(status_code, 200);
+    assert_eq!(body, b"{\"key\":\"value\"}");
+    assert_eq!(headers.get("content-type").unwrap(), "application/json");
+    assert_eq!(headers.get("x-cache-status").unwrap(), "HIT");
 }
 
 // === TTL expiry ===
@@ -237,7 +251,7 @@ async fn test_cache_control_max_age() {
     let mut ctx = make_ctx("GET", "/api/data");
     let mut headers = HashMap::new();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
-    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert!(is_reject(&result));
 }
 
 // === Cache-Control: s-maxage takes precedence ===
@@ -268,7 +282,7 @@ async fn test_cache_control_s_maxage_precedence() {
     let mut ctx = make_ctx("GET", "/api/data");
     let mut headers = HashMap::new();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
-    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert!(is_reject(&result));
 }
 
 // === Client Cache-Control: no-cache bypasses cache ===
@@ -365,7 +379,7 @@ async fn test_post_invalidates_cached_get() {
     let mut ctx = make_ctx("GET", "/api/items");
     let mut headers = HashMap::new();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
-    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert!(is_reject(&result));
 
     // POST to the same path should invalidate
     let mut ctx = make_ctx("POST", "/api/items");
@@ -431,7 +445,7 @@ async fn test_max_entries_eviction() {
     let mut ctx = make_ctx("GET", "/api/item/2");
     let mut headers = HashMap::new();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
-    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert!(is_reject(&result));
 }
 
 // === Vary header ===
@@ -476,12 +490,8 @@ async fn test_vary_by_headers() {
         .headers
         .insert("accept".to_string(), "application/json".to_string());
     let mut h = HashMap::new();
-    match plugin.before_proxy(&mut ctx_json, &mut h).await {
-        PluginResult::Reject { body, .. } => {
-            assert_eq!(body, "{\"json\":true}");
-        }
-        _ => panic!("Expected cache HIT for JSON"),
-    }
+    let (_, body, _) = expect_reject(plugin.before_proxy(&mut ctx_json, &mut h).await);
+    assert_eq!(body, b"{\"json\":true}");
 
     // XML accept should get XML response
     let mut ctx_xml = make_ctx("GET", "/api/data");
@@ -489,12 +499,166 @@ async fn test_vary_by_headers() {
         .headers
         .insert("accept".to_string(), "application/xml".to_string());
     let mut h2 = HashMap::new();
-    match plugin.before_proxy(&mut ctx_xml, &mut h2).await {
-        PluginResult::Reject { body, .. } => {
-            assert_eq!(body, "<xml/>");
-        }
-        _ => panic!("Expected cache HIT for XML"),
-    }
+    let (_, body, _) = expect_reject(plugin.before_proxy(&mut ctx_xml, &mut h2).await);
+    assert_eq!(body, b"<xml/>");
+}
+
+#[tokio::test]
+async fn test_backend_vary_accept_encoding_caches_binary_variant() {
+    let plugin = default_plugin();
+    let compressed = vec![0x1f, 0x8b, 0x08, 0x00, 0x00, 0xff];
+
+    let mut ctx = make_ctx("GET", "/assets/app.js");
+    ctx.headers
+        .insert("accept-encoding".to_string(), "gzip".to_string());
+    let mut headers = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    let mut response_headers = HashMap::new();
+    response_headers.insert("content-encoding".to_string(), "gzip".to_string());
+    response_headers.insert("vary".to_string(), "Accept-Encoding".to_string());
+    plugin
+        .after_proxy(&mut ctx, 200, &mut response_headers)
+        .await;
+    plugin
+        .on_final_response_body(&mut ctx, 200, &response_headers, &compressed)
+        .await;
+
+    let mut gzip_ctx = make_ctx("GET", "/assets/app.js");
+    gzip_ctx
+        .headers
+        .insert("accept-encoding".to_string(), "gzip".to_string());
+    let mut gzip_headers = HashMap::new();
+    let (status_code, body, headers) =
+        expect_reject(plugin.before_proxy(&mut gzip_ctx, &mut gzip_headers).await);
+    assert_eq!(status_code, 200);
+    assert_eq!(body, compressed);
+    assert_eq!(headers.get("content-encoding"), Some(&"gzip".to_string()));
+    assert_eq!(headers.get("x-cache-status"), Some(&"HIT".to_string()));
+
+    let mut plain_ctx = make_ctx("GET", "/assets/app.js");
+    let mut plain_headers = HashMap::new();
+    let miss = plugin
+        .before_proxy(&mut plain_ctx, &mut plain_headers)
+        .await;
+    assert!(matches!(miss, PluginResult::Continue));
+}
+
+#[tokio::test]
+async fn test_vary_wildcard_not_cached() {
+    let plugin = default_plugin();
+    let mut response_headers = HashMap::new();
+    response_headers.insert("vary".to_string(), "*".to_string());
+
+    cache_response(
+        &plugin,
+        "GET",
+        "/api/data",
+        200,
+        &response_headers,
+        b"volatile",
+    )
+    .await;
+
+    let mut ctx = make_ctx("GET", "/api/data");
+    let mut headers = HashMap::new();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+}
+
+#[tokio::test]
+async fn test_if_none_match_returns_304_from_cache() {
+    let plugin = default_plugin();
+    let mut response_headers = HashMap::new();
+    response_headers.insert("etag".to_string(), r#"W/"abc123""#.to_string());
+    response_headers.insert("cache-control".to_string(), "max-age=60".to_string());
+
+    cache_response(
+        &plugin,
+        "GET",
+        "/api/data",
+        200,
+        &response_headers,
+        b"cached-body",
+    )
+    .await;
+
+    let mut ctx = make_ctx("GET", "/api/data");
+    ctx.headers
+        .insert("if-none-match".to_string(), r#""abc123""#.to_string());
+    let mut headers = HashMap::new();
+    let (status_code, body, headers) =
+        expect_reject(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(status_code, 304);
+    assert!(body.is_empty());
+    assert_eq!(headers.get("etag"), Some(&r#"W/"abc123""#.to_string()));
+    assert_eq!(
+        headers.get("x-cache-status"),
+        Some(&"REVALIDATED".to_string())
+    );
+}
+
+#[tokio::test]
+async fn test_authorization_response_not_shared_cached_without_public() {
+    let plugin = default_plugin();
+    let mut ctx = make_ctx("GET", "/api/private");
+    ctx.headers
+        .insert("authorization".to_string(), "Bearer token-a".to_string());
+    let mut headers = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    let mut response_headers = HashMap::new();
+    response_headers.insert("cache-control".to_string(), "max-age=60".to_string());
+    plugin
+        .after_proxy(&mut ctx, 200, &mut response_headers)
+        .await;
+    plugin
+        .on_final_response_body(&mut ctx, 200, &response_headers, b"user-a")
+        .await;
+
+    let mut second_ctx = make_ctx("GET", "/api/private");
+    second_ctx
+        .headers
+        .insert("authorization".to_string(), "Bearer token-a".to_string());
+    let mut second_headers = HashMap::new();
+    let result = plugin
+        .before_proxy(&mut second_ctx, &mut second_headers)
+        .await;
+    assert!(matches!(result, PluginResult::Continue));
+}
+
+#[tokio::test]
+async fn test_authorization_response_with_public_can_be_cached() {
+    let plugin = default_plugin();
+    let mut ctx = make_ctx("GET", "/api/public-auth");
+    ctx.headers
+        .insert("authorization".to_string(), "Bearer token-a".to_string());
+    let mut headers = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    let mut response_headers = HashMap::new();
+    response_headers.insert(
+        "cache-control".to_string(),
+        "public, max-age=60".to_string(),
+    );
+    plugin
+        .after_proxy(&mut ctx, 200, &mut response_headers)
+        .await;
+    plugin
+        .on_final_response_body(&mut ctx, 200, &response_headers, b"shared")
+        .await;
+
+    let mut second_ctx = make_ctx("GET", "/api/public-auth");
+    second_ctx
+        .headers
+        .insert("authorization".to_string(), "Bearer token-a".to_string());
+    let mut second_headers = HashMap::new();
+    let (_, body, _) = expect_reject(
+        plugin
+            .before_proxy(&mut second_ctx, &mut second_headers)
+            .await,
+    );
+    assert_eq!(body, b"shared");
 }
 
 // === X-Cache-Status header ===
@@ -558,12 +722,8 @@ async fn test_consumer_keyed_caching() {
     let mut ctx_a2 = make_ctx("GET", "/api/data");
     ctx_a2.identified_consumer = Some(make_consumer("a", "alice"));
     let mut h3 = HashMap::new();
-    match plugin.before_proxy(&mut ctx_a2, &mut h3).await {
-        PluginResult::Reject { body, .. } => {
-            assert_eq!(body, "alice-data");
-        }
-        _ => panic!("Expected cache HIT for alice"),
-    }
+    let (_, body, _) = expect_reject(plugin.before_proxy(&mut ctx_a2, &mut h3).await);
+    assert_eq!(body, b"alice-data");
 }
 
 #[tokio::test]
@@ -593,13 +753,12 @@ async fn test_consumer_keyed_caching_uses_authenticated_identity_fallback() {
     let mut ctx_external_again = make_ctx("GET", "/api/data");
     ctx_external_again.authenticated_identity = Some("oidc-alice".to_string());
     let mut hit_headers = HashMap::new();
-    match plugin
-        .before_proxy(&mut ctx_external_again, &mut hit_headers)
-        .await
-    {
-        PluginResult::Reject { body, .. } => assert_eq!(body, "alice-data"),
-        _ => panic!("Expected cache HIT for authenticated_identity fallback"),
-    }
+    let (_, body, _) = expect_reject(
+        plugin
+            .before_proxy(&mut ctx_external_again, &mut hit_headers)
+            .await,
+    );
+    assert_eq!(body, b"alice-data");
 }
 
 // === Query string caching ===
@@ -630,12 +789,8 @@ async fn test_different_query_params_different_cache() {
     let mut ctx3 = make_ctx_with_query("GET", "/api/items", &[("page", "1")]);
     ctx3.matched_proxy = Some(std::sync::Arc::new(create_test_proxy()));
     let mut h3 = HashMap::new();
-    match plugin.before_proxy(&mut ctx3, &mut h3).await {
-        PluginResult::Reject { body, .. } => {
-            assert_eq!(body, "page-1-data");
-        }
-        _ => panic!("Expected cache HIT"),
-    }
+    let (_, body, _) = expect_reject(plugin.before_proxy(&mut ctx3, &mut h3).await);
+    assert_eq!(body, b"page-1-data");
 }
 
 // === Query-insensitive caching ===
@@ -662,7 +817,7 @@ async fn test_query_excluded_from_cache_key() {
     ctx2.matched_proxy = Some(std::sync::Arc::new(create_test_proxy()));
     let mut h2 = HashMap::new();
     let result = plugin.before_proxy(&mut ctx2, &mut h2).await;
-    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert!(is_reject(&result));
 }
 
 // === HEAD method cacheable ===
@@ -676,7 +831,7 @@ async fn test_head_method_cacheable() {
     let mut ctx = make_ctx("HEAD", "/api/data");
     let mut headers = HashMap::new();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
-    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert!(is_reject(&result));
 }
 
 // === respect_cache_control disabled ===
@@ -705,7 +860,7 @@ async fn test_respect_cache_control_disabled() {
     let mut ctx = make_ctx("GET", "/api/data");
     let mut headers = HashMap::new();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
-    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert!(is_reject(&result));
 }
 
 // === Cache-Control: no-cache response not cached ===
@@ -744,14 +899,8 @@ async fn test_301_cacheable() {
 
     let mut ctx = make_ctx("GET", "/old-path");
     let mut headers = HashMap::new();
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
-    assert!(matches!(
-        result,
-        PluginResult::Reject {
-            status_code: 301,
-            ..
-        }
-    ));
+    let (status_code, _, _) = expect_reject(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(status_code, 301);
 }
 
 #[tokio::test]
@@ -770,14 +919,8 @@ async fn test_404_cacheable() {
 
     let mut ctx = make_ctx("GET", "/not-found");
     let mut headers = HashMap::new();
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
-    assert!(matches!(
-        result,
-        PluginResult::Reject {
-            status_code: 404,
-            ..
-        }
-    ));
+    let (status_code, _, _) = expect_reject(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(status_code, 404);
 }
 
 // === Invalidation disabled ===
@@ -799,7 +942,7 @@ async fn test_invalidation_disabled() {
     let mut ctx = make_ctx("GET", "/api/items");
     let mut headers = HashMap::new();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
-    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert!(is_reject(&result));
 }
 
 // === Max total size ===
@@ -822,7 +965,7 @@ async fn test_max_total_size_exceeded() {
     let mut ctx = make_ctx("GET", "/api/a");
     let mut headers = HashMap::new();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
-    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert!(is_reject(&result));
 
     // Second should NOT be cached (total size exceeded)
     let mut ctx = make_ctx("GET", "/api/b");

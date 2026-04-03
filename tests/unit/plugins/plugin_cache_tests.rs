@@ -500,6 +500,9 @@ async fn test_cors_preflight_runs_before_request_termination() {
                 );
                 return;
             }
+            PluginResult::RejectBinary { .. } => {
+                panic!("cors preflight should reject with an empty text body");
+            }
         }
     }
 

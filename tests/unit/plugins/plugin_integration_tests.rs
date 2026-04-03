@@ -23,6 +23,22 @@ fn sort_plugins(mut plugins: Vec<Arc<dyn Plugin>>) -> Vec<Arc<dyn Plugin>> {
     plugins
 }
 
+fn reject_parts(result: PluginResult) -> Option<(u16, Vec<u8>, HashMap<String, String>)> {
+    match result {
+        PluginResult::Reject {
+            status_code,
+            body,
+            headers,
+        } => Some((status_code, body.into_bytes(), headers)),
+        PluginResult::RejectBinary {
+            status_code,
+            body,
+            headers,
+        } => Some((status_code, body.to_vec(), headers)),
+        PluginResult::Continue => None,
+    }
+}
+
 async fn run_buffered_response_lifecycle(
     plugins: &[Arc<dyn Plugin>],
     ctx: &mut RequestContext,
@@ -32,31 +48,25 @@ async fn run_buffered_response_lifecycle(
 ) -> (u16, HashMap<String, String>, Vec<u8>) {
     let mut proxy_headers = HashMap::new();
     for plugin in plugins {
-        if let PluginResult::Reject {
-            status_code,
-            body,
-            headers,
-        } = plugin.before_proxy(ctx, &mut proxy_headers).await
+        if let Some((status_code, body, headers)) =
+            reject_parts(plugin.before_proxy(ctx, &mut proxy_headers).await)
         {
-            return (status_code, headers, body.into_bytes());
+            return (status_code, headers, body);
         }
     }
 
     for plugin in plugins {
-        if let PluginResult::Reject {
-            status_code,
-            body,
-            headers,
-        } = plugin
-            .after_proxy(ctx, response_status, &mut response_headers)
-            .await
-        {
+        if let Some((status_code, body, headers)) = reject_parts(
+            plugin
+                .after_proxy(ctx, response_status, &mut response_headers)
+                .await,
+        ) {
             response_status = status_code;
             response_headers = headers;
             response_headers
                 .entry("content-type".to_string())
                 .or_insert_with(|| "application/json".to_string());
-            response_body = body.into_bytes();
+            response_body = body;
             return (response_status, response_headers, response_body);
         }
     }
@@ -67,18 +77,16 @@ async fn run_buffered_response_lifecycle(
             .await
         {
             PluginResult::Continue => {}
-            PluginResult::Reject {
-                status_code,
-                body,
-                headers,
-            } => {
+            reject => {
+                let (status_code, body, headers) =
+                    reject_parts(reject).expect("expected rejection");
                 response_status = status_code;
                 response_headers.clear();
                 response_headers.insert("content-type".to_string(), "application/json".to_string());
                 for (key, value) in headers {
                     response_headers.insert(key, value);
                 }
-                response_body = body.into_bytes();
+                response_body = body;
                 break;
             }
         }
@@ -102,18 +110,16 @@ async fn run_buffered_response_lifecycle(
             .await
         {
             PluginResult::Continue => {}
-            PluginResult::Reject {
-                status_code,
-                body,
-                headers,
-            } => {
+            reject => {
+                let (status_code, body, headers) =
+                    reject_parts(reject).expect("expected rejection");
                 response_status = status_code;
                 response_headers.clear();
                 response_headers.insert("content-type".to_string(), "application/json".to_string());
                 for (key, value) in headers {
                     response_headers.insert(key, value);
                 }
-                response_body = body.into_bytes();
+                response_body = body;
                 break;
             }
         }
@@ -131,7 +137,9 @@ async fn run_buffered_request_lifecycle(
     for plugin in plugins {
         match plugin.before_proxy(ctx, &mut request_headers).await {
             PluginResult::Continue => {}
-            reject @ PluginResult::Reject { .. } => return reject,
+            reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
+                return reject;
+            }
         }
     }
 
@@ -153,7 +161,9 @@ async fn run_buffered_request_lifecycle(
             .await
         {
             PluginResult::Continue => {}
-            reject @ PluginResult::Reject { .. } => return reject,
+            reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
+                return reject;
+            }
         }
     }
 
@@ -430,25 +440,19 @@ async fn test_response_caching_stores_transformed_body() {
     for plugin in &plugins {
         match plugin.before_proxy(&mut hit_ctx, &mut proxy_headers).await {
             PluginResult::Continue => {}
-            result @ PluginResult::Reject { .. } => {
+            result @ PluginResult::Reject { .. } | result @ PluginResult::RejectBinary { .. } => {
                 cache_hit = Some(result);
                 break;
             }
         }
     }
 
-    match cache_hit.expect("expected response_caching cache HIT") {
-        PluginResult::Reject {
-            status_code,
-            body,
-            headers,
-        } => {
-            assert_eq!(status_code, 200);
-            assert_eq!(body, r#"{"message":"gateway"}"#);
-            assert_eq!(headers.get("x-cache-status"), Some(&"HIT".to_string()));
-        }
-        PluginResult::Continue => unreachable!(),
-    }
+    let (status_code, body, headers) =
+        reject_parts(cache_hit.expect("expected response_caching cache HIT"))
+            .expect("expected rejection");
+    assert_eq!(status_code, 200);
+    assert_eq!(String::from_utf8(body).unwrap(), r#"{"message":"gateway"}"#);
+    assert_eq!(headers.get("x-cache-status"), Some(&"HIT".to_string()));
 }
 
 #[tokio::test]
@@ -525,15 +529,10 @@ async fn test_request_size_limiting_checks_transformed_body() {
         run_buffered_request_lifecycle(&plugins, &mut ctx, headers, br#"{"ok":true}"#.to_vec())
             .await;
 
-    match result {
-        PluginResult::Reject {
-            status_code, body, ..
-        } => {
-            assert_eq!(status_code, 413);
-            let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
-            assert_eq!(parsed["error"], "Request body too large");
-            assert_eq!(parsed["limit"], 20);
-        }
-        PluginResult::Continue => panic!("expected transformed request body to be rejected"),
-    }
+    let (status_code, body, _) =
+        reject_parts(result).expect("expected transformed request body to be rejected");
+    assert_eq!(status_code, 413);
+    let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(parsed["error"], "Request body too large");
+    assert_eq!(parsed["limit"], 20);
 }
