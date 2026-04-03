@@ -29,6 +29,7 @@ use sqlx::Row;
 use sqlx::{AnyPool, any::AnyPoolOptions, any::AnyRow};
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Instant;
 use tracing::{debug, error, info, warn};
 
 struct PluginConfigRef {
@@ -112,6 +113,7 @@ pub struct DatabaseStore {
     db_type: String,
     failover_urls: Vec<String>,
     pool_config: DbPoolConfig,
+    slow_query_threshold_ms: Option<u64>,
 }
 
 impl DatabaseStore {
@@ -141,6 +143,27 @@ impl DatabaseStore {
             }
         }
         result
+    }
+
+    /// Set the slow query threshold (in milliseconds). When set, any database
+    /// query that exceeds this duration is logged at warn level with the
+    /// operation name and elapsed time.
+    pub fn set_slow_query_threshold(&mut self, threshold_ms: Option<u64>) {
+        self.slow_query_threshold_ms = threshold_ms;
+    }
+
+    /// Log a warning if the elapsed time since `start` exceeds the configured
+    /// slow query threshold. No-op when the threshold is disabled.
+    fn check_slow_query(&self, operation: &str, start: Instant) {
+        if let Some(threshold_ms) = self.slow_query_threshold_ms {
+            let elapsed_ms = start.elapsed().as_millis() as u64;
+            if elapsed_ms > threshold_ms {
+                warn!(
+                    "Slow database query: {} took {}ms (threshold: {}ms)",
+                    operation, elapsed_ms, threshold_ms
+                );
+            }
+        }
     }
 
     /// Build `AnyPoolOptions` from the stored pool configuration.
@@ -215,6 +238,7 @@ impl DatabaseStore {
             db_type: db_type.to_string(),
             failover_urls: Vec::new(),
             pool_config,
+            slow_query_threshold_ms: None,
         };
 
         store.run_migrations().await?;
@@ -314,6 +338,7 @@ impl DatabaseStore {
 
     /// Load the full gateway configuration from the database.
     pub async fn load_full_config(&self) -> Result<GatewayConfig, anyhow::Error> {
+        let start = Instant::now();
         // Capture timestamp before queries so the incremental polling safety
         // margin covers the full load duration.
         let loaded_at = Utc::now();
@@ -411,10 +436,12 @@ impl DatabaseStore {
             anyhow::bail!("Database has duplicate plugins per proxy");
         }
 
+        self.check_slow_query("load_full_config", start);
         Ok(config)
     }
 
     async fn load_proxies(&self) -> Result<Vec<Proxy>, anyhow::Error> {
+        let start = Instant::now();
         let rows: Vec<AnyRow> = sqlx::query("SELECT * FROM proxies")
             .fetch_all(&self.rpool())
             .await?;
@@ -465,10 +492,12 @@ impl DatabaseStore {
             proxies.push(row_to_proxy(&row, id, plugins)?);
         }
 
+        self.check_slow_query("load_proxies", start);
         Ok(proxies)
     }
 
     async fn load_consumers(&self) -> Result<Vec<Consumer>, anyhow::Error> {
+        let start = Instant::now();
         let rows: Vec<AnyRow> = sqlx::query("SELECT * FROM consumers")
             .fetch_all(&self.rpool())
             .await?;
@@ -478,10 +507,12 @@ impl DatabaseStore {
             consumers.push(row_to_consumer(&row)?);
         }
 
+        self.check_slow_query("load_consumers", start);
         Ok(consumers)
     }
 
     async fn load_plugin_configs(&self) -> Result<Vec<PluginConfig>, anyhow::Error> {
+        let start = Instant::now();
         let rows: Vec<AnyRow> = sqlx::query("SELECT * FROM plugin_configs")
             .fetch_all(&self.rpool())
             .await?;
@@ -491,12 +522,14 @@ impl DatabaseStore {
             configs.push(row_to_plugin_config(&row)?);
         }
 
+        self.check_slow_query("load_plugin_configs", start);
         Ok(configs)
     }
 
     // ---- CRUD for Admin API ----
 
     pub async fn create_proxy(&self, proxy: &Proxy) -> Result<(), anyhow::Error> {
+        let start = Instant::now();
         let circuit_breaker_json = proxy
             .circuit_breaker
             .as_ref()
@@ -578,10 +611,12 @@ impl DatabaseStore {
 
         tx.commit().await?;
 
+        self.check_slow_query("create_proxy", start);
         Ok(())
     }
 
     pub async fn update_proxy(&self, proxy: &Proxy) -> Result<(), anyhow::Error> {
+        let start = Instant::now();
         let circuit_breaker_json = proxy
             .circuit_breaker
             .as_ref()
@@ -667,10 +702,12 @@ impl DatabaseStore {
 
         tx.commit().await?;
 
+        self.check_slow_query("update_proxy", start);
         Ok(())
     }
 
     pub async fn delete_proxy(&self, id: &str) -> Result<bool, anyhow::Error> {
+        let start = Instant::now();
         let mut tx = self.pool().begin().await?;
 
         // Look up the proxy's upstream_id before deleting so we can cascade-delete
@@ -716,10 +753,12 @@ impl DatabaseStore {
 
         tx.commit().await?;
 
+        self.check_slow_query("delete_proxy", start);
         Ok(true)
     }
 
     pub async fn get_proxy(&self, id: &str) -> Result<Option<Proxy>, anyhow::Error> {
+        let start = Instant::now();
         let row: Option<AnyRow> = sqlx::query(&self.q("SELECT * FROM proxies WHERE id = ?"))
             .bind(id)
             .fetch_optional(&self.pool())
@@ -757,18 +796,22 @@ impl DatabaseStore {
 
         let mut proxy = row_to_proxy(&row, id.to_string(), plugins)?;
         proxy.normalize_fields();
+        self.check_slow_query("get_proxy", start);
         Ok(Some(proxy))
     }
 
     pub async fn check_proxy_exists(&self, proxy_id: &str) -> Result<bool, anyhow::Error> {
+        let start = Instant::now();
         let row: Option<AnyRow> = sqlx::query(&self.q("SELECT id FROM proxies WHERE id = ?"))
             .bind(proxy_id)
             .fetch_optional(&self.pool())
             .await?;
+        self.check_slow_query("check_proxy_exists", start);
         Ok(row.is_some())
     }
 
     pub async fn create_consumer(&self, consumer: &Consumer) -> Result<(), anyhow::Error> {
+        let start = Instant::now();
         let creds_json = serde_json::to_string(&consumer.credentials)?;
         sqlx::query(
             &self.q("INSERT INTO consumers (id, username, custom_id, credentials, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)")
@@ -782,10 +825,12 @@ impl DatabaseStore {
         .execute(&self.pool())
         .await?;
 
+        self.check_slow_query("create_consumer", start);
         Ok(())
     }
 
     pub async fn update_consumer(&self, consumer: &Consumer) -> Result<(), anyhow::Error> {
+        let start = Instant::now();
         let creds_json = serde_json::to_string(&consumer.credentials)?;
         sqlx::query(&self.q(
             "UPDATE consumers SET username=?, custom_id=?, credentials=?, updated_at=? WHERE id=?",
@@ -798,34 +843,41 @@ impl DatabaseStore {
         .execute(&self.pool())
         .await?;
 
+        self.check_slow_query("update_consumer", start);
         Ok(())
     }
 
     pub async fn delete_consumer(&self, id: &str) -> Result<bool, anyhow::Error> {
+        let start = Instant::now();
         let result = sqlx::query(&self.q("DELETE FROM consumers WHERE id = ?"))
             .bind(id)
             .execute(&self.pool())
             .await?;
+        self.check_slow_query("delete_consumer", start);
         Ok(result.rows_affected() > 0)
     }
 
     pub async fn get_consumer(&self, id: &str) -> Result<Option<Consumer>, anyhow::Error> {
+        let start = Instant::now();
         let row: Option<AnyRow> = sqlx::query(&self.q("SELECT * FROM consumers WHERE id = ?"))
             .bind(id)
             .fetch_optional(&self.pool())
             .await?;
 
-        match row {
+        let result = match row {
             Some(r) => {
                 let mut consumer = row_to_consumer(&r)?;
                 consumer.normalize_fields();
                 Ok(Some(consumer))
             }
             None => Ok(None),
-        }
+        };
+        self.check_slow_query("get_consumer", start);
+        result
     }
 
     pub async fn create_plugin_config(&self, pc: &PluginConfig) -> Result<(), anyhow::Error> {
+        let start = Instant::now();
         let config_json = serde_json::to_string(&pc.config)?;
         let scope_str = match pc.scope {
             PluginScope::Proxy => "proxy",
@@ -845,10 +897,12 @@ impl DatabaseStore {
         .execute(&self.pool())
         .await?;
 
+        self.check_slow_query("create_plugin_config", start);
         Ok(())
     }
 
     pub async fn update_plugin_config(&self, pc: &PluginConfig) -> Result<(), anyhow::Error> {
+        let start = Instant::now();
         let config_json = serde_json::to_string(&pc.config)?;
         let scope_str = match pc.scope {
             PluginScope::Proxy => "proxy",
@@ -867,10 +921,12 @@ impl DatabaseStore {
         .execute(&self.pool())
         .await?;
 
+        self.check_slow_query("update_plugin_config", start);
         Ok(())
     }
 
     pub async fn delete_plugin_config(&self, id: &str) -> Result<bool, anyhow::Error> {
+        let start = Instant::now();
         let mut tx = self.pool().begin().await?;
 
         // Clean up junction table (defense in depth alongside ON DELETE CASCADE)
@@ -885,28 +941,33 @@ impl DatabaseStore {
 
         tx.commit().await?;
 
+        self.check_slow_query("delete_plugin_config", start);
         Ok(result.rows_affected() > 0)
     }
 
     pub async fn get_plugin_config(&self, id: &str) -> Result<Option<PluginConfig>, anyhow::Error> {
+        let start = Instant::now();
         let row: Option<AnyRow> = sqlx::query(&self.q("SELECT * FROM plugin_configs WHERE id = ?"))
             .bind(id)
             .fetch_optional(&self.pool())
             .await?;
 
-        match row {
+        let result = match row {
             Some(r) => {
                 let mut plugin_config = row_to_plugin_config(&r)?;
                 plugin_config.normalize_fields();
                 Ok(Some(plugin_config))
             }
             None => Ok(None),
-        }
+        };
+        self.check_slow_query("get_plugin_config", start);
+        result
     }
 
     // ---- Upstream CRUD ----
 
     async fn load_upstreams(&self) -> Result<Vec<Upstream>, anyhow::Error> {
+        let start = Instant::now();
         let rows: Vec<AnyRow> = sqlx::query("SELECT * FROM upstreams")
             .fetch_all(&self.rpool())
             .await?;
@@ -916,10 +977,12 @@ impl DatabaseStore {
             upstreams.push(row_to_upstream(&row)?);
         }
 
+        self.check_slow_query("load_upstreams", start);
         Ok(upstreams)
     }
 
     pub async fn create_upstream(&self, upstream: &Upstream) -> Result<(), anyhow::Error> {
+        let start = Instant::now();
         let targets_json = serde_json::to_string(&upstream.targets)?;
         let algo_json = serde_json::to_string(&upstream.algorithm)?;
         // algo_json is quoted like "\"round_robin\"", strip the quotes
@@ -957,10 +1020,12 @@ impl DatabaseStore {
         .execute(&self.pool())
         .await?;
 
+        self.check_slow_query("create_upstream", start);
         Ok(())
     }
 
     pub async fn update_upstream(&self, upstream: &Upstream) -> Result<(), anyhow::Error> {
+        let start = Instant::now();
         let targets_json = serde_json::to_string(&upstream.targets)?;
         let algo_json = serde_json::to_string(&upstream.algorithm)?;
         let algo_str = algo_json.trim_matches('"');
@@ -996,6 +1061,7 @@ impl DatabaseStore {
         .execute(&self.pool())
         .await?;
 
+        self.check_slow_query("update_upstream", start);
         Ok(())
     }
 
@@ -1004,6 +1070,7 @@ impl DatabaseStore {
     /// Uses a transaction to prevent race conditions between the reference
     /// check and the delete.
     pub async fn delete_upstream(&self, id: &str) -> Result<bool, anyhow::Error> {
+        let start = Instant::now();
         let mut tx = self.pool().begin().await?;
 
         // Check reference within the transaction to prevent races
@@ -1027,6 +1094,7 @@ impl DatabaseStore {
 
         tx.commit().await?;
 
+        self.check_slow_query("delete_upstream", start);
         Ok(result.rows_affected() > 0)
     }
 
@@ -1037,6 +1105,7 @@ impl DatabaseStore {
         &self,
         old_upstream_id: &str,
     ) -> Result<(), anyhow::Error> {
+        let start = Instant::now();
         let mut tx = self.pool().begin().await?;
 
         let ref_rows: Vec<AnyRow> =
@@ -1058,19 +1127,23 @@ impl DatabaseStore {
 
         tx.commit().await?;
 
+        self.check_slow_query("cleanup_orphaned_upstream", start);
         Ok(())
     }
 
     pub async fn get_upstream(&self, id: &str) -> Result<Option<Upstream>, anyhow::Error> {
+        let start = Instant::now();
         let row: Option<AnyRow> = sqlx::query(&self.q("SELECT * FROM upstreams WHERE id = ?"))
             .bind(id)
             .fetch_optional(&self.pool())
             .await?;
 
-        match row {
+        let result = match row {
             Some(r) => Ok(Some(row_to_upstream(&r)?)),
             None => Ok(None),
-        }
+        };
+        self.check_slow_query("get_upstream", start);
+        result
     }
 
     /// Check if a proxy's (hosts, listen_path) combination is unique.
@@ -1083,6 +1156,7 @@ impl DatabaseStore {
         hosts: &[String],
         exclude_id: Option<&str>,
     ) -> Result<bool, anyhow::Error> {
+        let start = Instant::now();
         let rows: Vec<AnyRow> = if let Some(eid) = exclude_id {
             sqlx::query(&self.q("SELECT id, hosts FROM proxies \
                  WHERE listen_path = ? \
@@ -1100,6 +1174,8 @@ impl DatabaseStore {
             .fetch_all(&self.pool())
             .await?
         };
+
+        self.check_slow_query("check_listen_path_unique", start);
 
         // No other proxy with this listen_path — unique
         if rows.is_empty() {
@@ -1135,6 +1211,7 @@ impl DatabaseStore {
         name: &str,
         exclude_id: Option<&str>,
     ) -> Result<bool, anyhow::Error> {
+        let start = Instant::now();
         let rows: Vec<AnyRow> = if let Some(eid) = exclude_id {
             sqlx::query(&self.q("SELECT id FROM proxies WHERE name = ? AND id != ?"))
                 .bind(name)
@@ -1147,6 +1224,7 @@ impl DatabaseStore {
                 .fetch_all(&self.pool())
                 .await?
         };
+        self.check_slow_query("check_proxy_name_unique", start);
         Ok(rows.is_empty())
     }
 
@@ -1157,6 +1235,7 @@ impl DatabaseStore {
         name: &str,
         exclude_id: Option<&str>,
     ) -> Result<bool, anyhow::Error> {
+        let start = Instant::now();
         let rows: Vec<AnyRow> = if let Some(eid) = exclude_id {
             sqlx::query(&self.q("SELECT id FROM upstreams WHERE name = ? AND id != ?"))
                 .bind(name)
@@ -1169,6 +1248,7 @@ impl DatabaseStore {
                 .fetch_all(&self.pool())
                 .await?
         };
+        self.check_slow_query("check_upstream_name_unique", start);
         Ok(rows.is_empty())
     }
 
@@ -1180,6 +1260,7 @@ impl DatabaseStore {
         custom_id: Option<&str>,
         exclude_id: Option<&str>,
     ) -> Result<Option<String>, anyhow::Error> {
+        let start = Instant::now();
         let (sql, binds): (String, Vec<&str>) = match custom_id {
             Some(custom_id) => (
                 self.q("SELECT id, username, custom_id FROM consumers \
@@ -1242,6 +1323,7 @@ impl DatabaseStore {
             }
         }
 
+        self.check_slow_query("check_consumer_identity_unique", start);
         Ok(None)
     }
 
@@ -1255,6 +1337,7 @@ impl DatabaseStore {
         api_key: &str,
         exclude_consumer_id: Option<&str>,
     ) -> Result<bool, anyhow::Error> {
+        let start = Instant::now();
         let rows: Vec<AnyRow> = sqlx::query("SELECT id, credentials FROM consumers")
             .fetch_all(&self.pool())
             .await?;
@@ -1284,6 +1367,7 @@ impl DatabaseStore {
             }
         }
 
+        self.check_slow_query("check_keyauth_key_unique", start);
         Ok(true)
     }
 
@@ -1299,6 +1383,7 @@ impl DatabaseStore {
         mtls_identity: &str,
         exclude_consumer_id: Option<&str>,
     ) -> Result<bool, anyhow::Error> {
+        let start = Instant::now();
         let rows: Vec<AnyRow> = sqlx::query("SELECT id, credentials FROM consumers")
             .fetch_all(&self.pool())
             .await?;
@@ -1328,6 +1413,7 @@ impl DatabaseStore {
             }
         }
 
+        self.check_slow_query("check_mtls_identity_unique", start);
         Ok(true)
     }
 
@@ -1338,6 +1424,7 @@ impl DatabaseStore {
         port: u16,
         exclude_id: Option<&str>,
     ) -> Result<bool, anyhow::Error> {
+        let start = Instant::now();
         let rows: Vec<AnyRow> = if let Some(eid) = exclude_id {
             sqlx::query(&self.q("SELECT id FROM proxies WHERE listen_port = ? AND id != ?"))
                 .bind(port as i32)
@@ -1350,16 +1437,19 @@ impl DatabaseStore {
                 .fetch_all(&self.pool())
                 .await?
         };
+        self.check_slow_query("check_listen_port_unique", start);
         Ok(rows.is_empty())
     }
 
     /// Check if an upstream with the given ID exists.
     /// Returns `true` if the upstream exists.
     pub async fn check_upstream_exists(&self, upstream_id: &str) -> Result<bool, anyhow::Error> {
+        let start = Instant::now();
         let row: Option<AnyRow> = sqlx::query(&self.q("SELECT id FROM upstreams WHERE id = ?"))
             .bind(upstream_id)
             .fetch_optional(&self.pool())
             .await?;
+        self.check_slow_query("check_upstream_exists", start);
         Ok(row.is_some())
     }
 
@@ -1448,6 +1538,7 @@ impl DatabaseStore {
         known_plugin_config_ids: &HashSet<String>,
         known_upstream_ids: &HashSet<String>,
     ) -> Result<IncrementalResult, anyhow::Error> {
+        let start = Instant::now();
         let poll_timestamp = Utc::now();
 
         // Subtract 1 second safety margin to handle boundary writes
@@ -1501,11 +1592,13 @@ impl DatabaseStore {
             );
         }
 
+        self.check_slow_query("load_incremental_config", start);
         Ok(result)
     }
 
     /// Load proxies modified since `since_str` (RFC 3339 timestamp).
     async fn load_proxies_since(&self, since_str: &str) -> Result<Vec<Proxy>, anyhow::Error> {
+        let start = Instant::now();
         let rows: Vec<AnyRow> = sqlx::query(&self.q("SELECT * FROM proxies WHERE updated_at > ?"))
             .bind(since_str)
             .fetch_all(&self.rpool())
@@ -1597,11 +1690,13 @@ impl DatabaseStore {
             proxies.push(row_to_proxy(row, id, plugins)?);
         }
 
+        self.check_slow_query("load_proxies_since", start);
         Ok(proxies)
     }
 
     /// Load consumers modified since `since_str`.
     async fn load_consumers_since(&self, since_str: &str) -> Result<Vec<Consumer>, anyhow::Error> {
+        let start = Instant::now();
         let rows: Vec<AnyRow> =
             sqlx::query(&self.q("SELECT * FROM consumers WHERE updated_at > ?"))
                 .bind(since_str)
@@ -1612,6 +1707,7 @@ impl DatabaseStore {
         for row in rows {
             consumers.push(row_to_consumer(&row)?);
         }
+        self.check_slow_query("load_consumers_since", start);
         Ok(consumers)
     }
 
@@ -1620,6 +1716,7 @@ impl DatabaseStore {
         &self,
         since_str: &str,
     ) -> Result<Vec<PluginConfig>, anyhow::Error> {
+        let start = Instant::now();
         let rows: Vec<AnyRow> =
             sqlx::query(&self.q("SELECT * FROM plugin_configs WHERE updated_at > ?"))
                 .bind(since_str)
@@ -1630,11 +1727,13 @@ impl DatabaseStore {
         for row in rows {
             configs.push(row_to_plugin_config(&row)?);
         }
+        self.check_slow_query("load_plugin_configs_since", start);
         Ok(configs)
     }
 
     /// Load upstreams modified since `since_str`.
     async fn load_upstreams_since(&self, since_str: &str) -> Result<Vec<Upstream>, anyhow::Error> {
+        let start = Instant::now();
         let rows: Vec<AnyRow> =
             sqlx::query(&self.q("SELECT * FROM upstreams WHERE updated_at > ?"))
                 .bind(since_str)
@@ -1645,11 +1744,13 @@ impl DatabaseStore {
         for row in rows {
             upstreams.push(row_to_upstream(&row)?);
         }
+        self.check_slow_query("load_upstreams_since", start);
         Ok(upstreams)
     }
 
     /// Load all IDs from a table (lightweight — one TEXT column, no deserialization).
     async fn load_table_ids(&self, table: &str) -> Result<HashSet<String>, anyhow::Error> {
+        let start = Instant::now();
         // Table name is a compile-time constant from the caller, not user input.
         let sql = format!("SELECT id FROM {}", table);
         let rows: Vec<AnyRow> = sqlx::query(&sql).fetch_all(&self.rpool()).await?;
@@ -1660,6 +1761,7 @@ impl DatabaseStore {
                 ids.insert(id);
             }
         }
+        self.check_slow_query(&format!("load_table_ids({})", table), start);
         Ok(ids)
     }
 
@@ -1749,6 +1851,7 @@ impl DatabaseStore {
         proxies: &[Proxy],
         attach_plugins: bool,
     ) -> Result<usize, anyhow::Error> {
+        let start = Instant::now();
         if proxies.is_empty() {
             return Ok(0);
         }
@@ -1758,6 +1861,7 @@ impl DatabaseStore {
                 .batch_create_proxies_chunk(chunk, attach_plugins)
                 .await?;
         }
+        self.check_slow_query("batch_create_proxies", start);
         Ok(total)
     }
 
@@ -1890,6 +1994,7 @@ impl DatabaseStore {
     }
 
     pub async fn batch_attach_proxy_plugins(&self, proxies: &[Proxy]) -> Result<(), anyhow::Error> {
+        let start = Instant::now();
         if proxies.is_empty() {
             return Ok(());
         }
@@ -1910,6 +2015,7 @@ impl DatabaseStore {
             tx.commit().await?;
         }
 
+        self.check_slow_query("batch_attach_proxy_plugins", start);
         Ok(())
     }
 
@@ -1919,6 +2025,7 @@ impl DatabaseStore {
         &self,
         consumers: &[Consumer],
     ) -> Result<usize, anyhow::Error> {
+        let start = Instant::now();
         if consumers.is_empty() {
             return Ok(0);
         }
@@ -1926,6 +2033,7 @@ impl DatabaseStore {
         for chunk in consumers.chunks(Self::BATCH_CHUNK_SIZE) {
             total += self.batch_create_consumers_chunk(chunk).await?;
         }
+        self.check_slow_query("batch_create_consumers", start);
         Ok(total)
     }
 
@@ -1961,6 +2069,7 @@ impl DatabaseStore {
         &self,
         configs: &[PluginConfig],
     ) -> Result<usize, anyhow::Error> {
+        let start = Instant::now();
         if configs.is_empty() {
             return Ok(0);
         }
@@ -1968,6 +2077,7 @@ impl DatabaseStore {
         for chunk in configs.chunks(Self::BATCH_CHUNK_SIZE) {
             total += self.batch_create_plugin_configs_chunk(chunk).await?;
         }
+        self.check_slow_query("batch_create_plugin_configs", start);
         Ok(total)
     }
 
@@ -2009,6 +2119,7 @@ impl DatabaseStore {
         &self,
         upstreams: &[Upstream],
     ) -> Result<usize, anyhow::Error> {
+        let start = Instant::now();
         if upstreams.is_empty() {
             return Ok(0);
         }
@@ -2016,6 +2127,7 @@ impl DatabaseStore {
         for chunk in upstreams.chunks(Self::BATCH_CHUNK_SIZE) {
             total += self.batch_create_upstreams_chunk(chunk).await?;
         }
+        self.check_slow_query("batch_create_upstreams", start);
         Ok(total)
     }
 
@@ -2075,6 +2187,7 @@ impl DatabaseStore {
     /// 4. consumers
     /// 5. upstreams
     pub async fn delete_all_resources(&self) -> Result<(), anyhow::Error> {
+        let start = Instant::now();
         let mut tx = self.pool().begin().await?;
 
         sqlx::query("DELETE FROM proxy_plugins")
@@ -2092,6 +2205,7 @@ impl DatabaseStore {
             .await?;
 
         tx.commit().await?;
+        self.check_slow_query("delete_all_resources", start);
         Ok(())
     }
 

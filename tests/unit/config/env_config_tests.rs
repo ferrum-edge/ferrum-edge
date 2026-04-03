@@ -1546,3 +1546,48 @@ fn test_reserved_gateway_ports_includes_grpc() {
         },
     );
 }
+
+#[test]
+fn test_db_slow_query_threshold_default() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+        ],
+        || {
+            remove_var("FERRUM_DB_SLOW_QUERY_THRESHOLD_MS");
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.db_slow_query_threshold_ms, None);
+        },
+    );
+}
+
+#[test]
+fn test_db_slow_query_threshold_custom() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_DB_SLOW_QUERY_THRESHOLD_MS", "500"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.db_slow_query_threshold_ms, Some(500));
+        },
+    );
+}
+
+#[test]
+fn test_db_slow_query_threshold_invalid_falls_back_to_none() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_DB_SLOW_QUERY_THRESHOLD_MS", "not_a_number"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.db_slow_query_threshold_ms, None);
+        },
+    );
+}
