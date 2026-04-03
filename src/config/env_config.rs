@@ -340,9 +340,16 @@ pub struct EnvConfig {
 
     /// Threshold in milliseconds for logging slow plugin outbound HTTP calls.
     /// When a plugin HTTP request (e.g. http_logging, JWKS fetch,
-    /// JWKS fetch, OTLP export) exceeds this duration, a warning is logged.
+    /// OIDC discovery, OTLP export) exceeds this duration, a warning is logged.
     /// Default: 1000 (1 second).
     pub plugin_http_slow_threshold_ms: u64,
+    /// Maximum retry attempts for safe/idempotent plugin outbound HTTP calls
+    /// when the failure is transport-level (connection refused/reset/closed,
+    /// connect timeout, DNS lookup failure). Default: 0 (disabled).
+    pub plugin_http_max_retries: u32,
+    /// Delay in milliseconds between automatic plugin outbound HTTP retries.
+    /// Default: 100.
+    pub plugin_http_retry_delay_ms: u64,
 
     /// Max request body size in MiB for POST /restore (large config backups).
     /// Default: 100 MiB.
@@ -483,6 +490,8 @@ impl Default for EnvConfig {
             trusted_proxies: String::new(),
             real_ip_header: None,
             plugin_http_slow_threshold_ms: 1000,
+            plugin_http_max_retries: 0,
+            plugin_http_retry_delay_ms: 100,
             admin_restore_max_body_size_mib: 100,
             migrate_action: "up".into(),
             migrate_dry_run: false,
@@ -738,6 +747,10 @@ impl EnvConfig {
                 "FERRUM_PLUGIN_HTTP_SLOW_THRESHOLD_MS",
                 1000,
             ),
+            plugin_http_max_retries: resolve_var(conf, "FERRUM_PLUGIN_HTTP_MAX_RETRIES")
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(0),
+            plugin_http_retry_delay_ms: resolve_u64(conf, "FERRUM_PLUGIN_HTTP_RETRY_DELAY_MS", 100),
 
             admin_restore_max_body_size_mib: resolve_usize(
                 conf,

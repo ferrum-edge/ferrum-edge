@@ -32,9 +32,9 @@
 //! #[async_trait]
 //! impl Plugin for MyPlugin {
 //!     async fn log(&self, summary: &TransactionSummary) {
-//!         // Uses pooled connections + gateway DNS cache — no per-call overhead.
-//!         // execute() automatically logs a warning when the call exceeds the
-//!         // configured FERRUM_PLUGIN_HTTP_SLOW_THRESHOLD_MS threshold.
+//!         // Uses pooled connections + gateway DNS cache - no per-call overhead.
+//!         // execute() automatically logs slow calls and can retry
+//!         // safe/idempotent requests on transport failures.
 //!         let req = self.http_client.get()
 //!             .post(&self.endpoint)
 //!             .json(summary);
@@ -45,13 +45,15 @@
 
 use crate::config::PoolConfig;
 use crate::dns::{DnsCache, DnsCacheResolver};
+use crate::retry::{ErrorClass, classify_reqwest_error};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 /// Shared, pooled HTTP client for plugin outbound calls.
 ///
 /// Wraps a `reqwest::Client` configured with the gateway's connection pool
-/// settings and DNS cache. Clone-cheap (Arc internally) — pass freely to all plugins.
+/// settings and DNS cache. Clone-cheap (Arc internally) - pass freely to all plugins.
 ///
 /// Includes optional slow-request logging: when `slow_threshold` is set,
 /// calls via [`execute`] that exceed the threshold emit a warning log with
@@ -62,14 +64,21 @@ pub struct PluginHttpClient {
     /// Threshold above which outbound plugin HTTP calls are logged as slow.
     /// Configured via `FERRUM_PLUGIN_HTTP_SLOW_THRESHOLD_MS` (default: 1000ms).
     slow_threshold: Duration,
+    /// Maximum retry attempts for safe/idempotent outbound plugin HTTP calls
+    /// on transport-level failures. Configured via
+    /// `FERRUM_PLUGIN_HTTP_MAX_RETRIES` (default: 0).
+    max_retries: u32,
+    /// Delay between plugin HTTP transport retries.
+    /// Configured via `FERRUM_PLUGIN_HTTP_RETRY_DELAY_MS` (default: 100ms).
+    retry_delay: Duration,
     /// The gateway's shared DNS cache, available for plugins that need to resolve
     /// hostnames outside of reqwest (e.g., Redis connections for rate limiting).
     dns_cache: Option<DnsCache>,
     /// Whether to skip TLS certificate verification for outbound connections.
-    /// Mirrors `FERRUM_TLS_NO_VERIFY` — shared with Redis rate limiting clients.
+    /// Mirrors `FERRUM_TLS_NO_VERIFY` - shared with Redis rate limiting clients.
     tls_no_verify: bool,
     /// Path to a PEM CA bundle for verifying outbound TLS connections.
-    /// Mirrors `FERRUM_TLS_CA_BUNDLE_PATH` — shared with Redis rate limiting clients.
+    /// Mirrors `FERRUM_TLS_CA_BUNDLE_PATH` - shared with Redis rate limiting clients.
     tls_ca_bundle_path: Option<String>,
 }
 
@@ -77,6 +86,8 @@ impl std::fmt::Debug for PluginHttpClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PluginHttpClient")
             .field("slow_threshold", &self.slow_threshold)
+            .field("max_retries", &self.max_retries)
+            .field("retry_delay", &self.retry_delay)
             .field("has_dns_cache", &self.dns_cache.is_some())
             .field("tls_no_verify", &self.tls_no_verify)
             .field("has_tls_ca_bundle", &self.tls_ca_bundle_path.is_some())
@@ -101,6 +112,8 @@ impl PluginHttpClient {
         pool_config: &PoolConfig,
         dns_cache: DnsCache,
         slow_threshold_ms: u64,
+        max_retries: u32,
+        retry_delay_ms: u64,
         tls_no_verify: bool,
         tls_ca_bundle_path: Option<&str>,
     ) -> Self {
@@ -116,8 +129,8 @@ impl PluginHttpClient {
             .dns_resolver(Arc::new(resolver));
 
         // Load custom CA bundle for verifying internal/corporate CAs.
-        // - Custom CA configured → disable built-in roots, trust ONLY the custom CA
-        // - No CA configured → reqwest uses webpki/system roots by default
+        // - Custom CA configured -> disable built-in roots, trust ONLY the custom CA
+        // - No CA configured -> reqwest uses webpki/system roots by default
         if !tls_no_verify && let Some(ca_path) = tls_ca_bundle_path {
             match std::fs::read(ca_path) {
                 Ok(ca_pem) => match reqwest::Certificate::from_pem(&ca_pem) {
@@ -158,6 +171,8 @@ impl PluginHttpClient {
         Self {
             client: Arc::new(client),
             slow_threshold: Duration::from_millis(slow_threshold_ms),
+            max_retries,
+            retry_delay: Duration::from_millis(retry_delay_ms),
             dns_cache: Some(dns_cache_clone),
             tls_no_verify,
             tls_ca_bundle_path: tls_ca_bundle_path.map(|s| s.to_string()),
@@ -197,6 +212,8 @@ impl PluginHttpClient {
         Self {
             client: Arc::new(client),
             slow_threshold: Duration::from_millis(1000),
+            max_retries: 0,
+            retry_delay: Duration::from_millis(100),
             dns_cache: None,
             tls_no_verify: false,
             tls_ca_bundle_path: None,
@@ -212,6 +229,24 @@ impl PluginHttpClient {
     pub fn from_pool_config_with_threshold(config: &PoolConfig, slow_threshold_ms: u64) -> Self {
         let mut client = Self::from_pool_config(config);
         client.slow_threshold = Duration::from_millis(slow_threshold_ms);
+        client
+    }
+
+    /// Build a plugin HTTP client from pool config with custom slow-call and
+    /// retry settings, without a DNS cache.
+    ///
+    /// Useful for tests that need to verify retry behavior deterministically.
+    #[allow(dead_code)] // Used by integration tests in tests/unit/plugins/
+    pub fn from_pool_config_with_settings(
+        config: &PoolConfig,
+        slow_threshold_ms: u64,
+        max_retries: u32,
+        retry_delay_ms: u64,
+    ) -> Self {
+        let mut client = Self::from_pool_config(config);
+        client.slow_threshold = Duration::from_millis(slow_threshold_ms);
+        client.max_retries = max_retries;
+        client.retry_delay = Duration::from_millis(retry_delay_ms);
         client
     }
 
@@ -243,7 +278,7 @@ impl PluginHttpClient {
 
     /// Get the underlying `reqwest::Client` for building requests.
     ///
-    /// The returned client uses pooled connections — no per-call overhead.
+    /// The returned client uses pooled connections - no per-call overhead.
     /// Prefer [`execute`] over calling `.send()` directly so that slow
     /// outbound calls are automatically logged with the destination URL.
     pub fn get(&self) -> &reqwest::Client {
@@ -257,6 +292,9 @@ impl PluginHttpClient {
     /// `label` identifies the caller in log output (e.g. "http_logging",
     /// "jwks_fetch", "jwks_auth_oidc_discovery", "otel_export").
     ///
+    /// Safe/idempotent requests (`GET`, `HEAD`, `OPTIONS`) are retried on
+    /// transport-level failures when `FERRUM_PLUGIN_HTTP_MAX_RETRIES` is set.
+    ///
     /// The destination URL is extracted from the request and included in the
     /// slow-call warning so operators can identify which external endpoint is slow.
     pub async fn execute(
@@ -264,22 +302,8 @@ impl PluginHttpClient {
         request: reqwest::RequestBuilder,
         label: &str,
     ) -> Result<reqwest::Response, reqwest::Error> {
-        // Build the request so we can extract the URL before sending.
         let request = request.build()?;
-        let url = request.url().to_string();
-        let start = std::time::Instant::now();
-        let result = self.client.execute(request).await;
-        let elapsed = start.elapsed();
-        if elapsed > self.slow_threshold {
-            tracing::warn!(
-                plugin = label,
-                url = %url,
-                elapsed_ms = elapsed.as_millis() as u64,
-                threshold_ms = self.slow_threshold.as_millis() as u64,
-                "Slow plugin HTTP call"
-            );
-        }
-        result
+        self.execute_request(request, label, None).await
     }
 
     /// Send a request and accumulate the elapsed time into a shared counter.
@@ -293,17 +317,84 @@ impl PluginHttpClient {
         &self,
         request: reqwest::RequestBuilder,
         label: &str,
-        accumulator: &std::sync::atomic::AtomicU64,
+        accumulator: &AtomicU64,
     ) -> Result<reqwest::Response, reqwest::Error> {
         let request = request.build()?;
+        self.execute_request(request, label, Some(accumulator))
+            .await
+    }
+
+    async fn execute_request(
+        &self,
+        request: reqwest::Request,
+        label: &str,
+        accumulator: Option<&AtomicU64>,
+    ) -> Result<reqwest::Response, reqwest::Error> {
         let url = request.url().to_string();
-        let start = std::time::Instant::now();
-        let result = self.client.execute(request).await;
+        let method = request.method().clone();
+        let total_start = std::time::Instant::now();
+        let retry_template = request.try_clone();
+        let can_retry = self.max_retries > 0
+            && matches!(method.as_str(), "GET" | "HEAD" | "OPTIONS")
+            && retry_template.is_some();
+
+        let mut current_request = request;
+        let mut attempt = 0_u32;
+
+        loop {
+            let attempt_start = std::time::Instant::now();
+            let result = self.client.execute(current_request).await;
+            let attempt_elapsed = attempt_start.elapsed();
+            if let Some(accumulator) = accumulator {
+                accumulator.fetch_add(attempt_elapsed.as_nanos() as u64, Ordering::Relaxed);
+            }
+
+            if can_retry
+                && attempt < self.max_retries
+                && result
+                    .as_ref()
+                    .err()
+                    .is_some_and(Self::is_retryable_transport_error)
+            {
+                if let Some(error) = result.as_ref().err() {
+                    let error_class = classify_reqwest_error(error);
+                    tracing::warn!(
+                        plugin = label,
+                        method = %method,
+                        url = %url,
+                        attempt = attempt + 1,
+                        max_retries = self.max_retries,
+                        retry_delay_ms = self.retry_delay.as_millis() as u64,
+                        error_class = %error_class,
+                        "Retrying plugin HTTP call after transport failure"
+                    );
+                }
+
+                tokio::time::sleep(self.retry_delay).await;
+
+                let Some(template) = retry_template.as_ref() else {
+                    return self.finish_request(result, label, &url, total_start);
+                };
+                let Some(next_request) = template.try_clone() else {
+                    return self.finish_request(result, label, &url, total_start);
+                };
+                current_request = next_request;
+                attempt += 1;
+                continue;
+            }
+
+            return self.finish_request(result, label, &url, total_start);
+        }
+    }
+
+    fn finish_request(
+        &self,
+        result: Result<reqwest::Response, reqwest::Error>,
+        label: &str,
+        url: &str,
+        start: std::time::Instant,
+    ) -> Result<reqwest::Response, reqwest::Error> {
         let elapsed = start.elapsed();
-        accumulator.fetch_add(
-            elapsed.as_nanos() as u64,
-            std::sync::atomic::Ordering::Relaxed,
-        );
         if elapsed > self.slow_threshold {
             tracing::warn!(
                 plugin = label,
@@ -314,6 +405,20 @@ impl PluginHttpClient {
             );
         }
         result
+    }
+
+    fn is_retryable_transport_error(error: &reqwest::Error) -> bool {
+        matches!(
+            classify_reqwest_error(error),
+            ErrorClass::ConnectionTimeout
+                | ErrorClass::ConnectionRefused
+                | ErrorClass::ReadWriteTimeout
+                | ErrorClass::ConnectionReset
+                | ErrorClass::ConnectionClosed
+                | ErrorClass::DnsLookupError
+                | ErrorClass::ProtocolError
+                | ErrorClass::RequestError
+        )
     }
 }
 

@@ -687,6 +687,8 @@ impl ProxyState {
             &global_pool_config,
             dns_cache.clone(),
             env_config_arc.plugin_http_slow_threshold_ms,
+            env_config_arc.plugin_http_max_retries,
+            env_config_arc.plugin_http_retry_delay_ms,
             env_config_arc.tls_no_verify,
             env_config_arc.tls_ca_bundle_path.as_deref(),
         );

@@ -165,6 +165,8 @@ See [client_ip_resolution.md](client_ip_resolution.md) for the security model an
 |---|---|---|---|
 | `FERRUM_ENABLE_STREAMING_LATENCY_TRACKING` | No | `false` | Track streaming response total latency (adds per-stream overhead) |
 | `FERRUM_PLUGIN_HTTP_SLOW_THRESHOLD_MS` | No | `1000` | Threshold (ms) for logging slow plugin outbound HTTP calls |
+| `FERRUM_PLUGIN_HTTP_MAX_RETRIES` | No | `0` | Retry count for safe plugin outbound HTTP calls on transport failures (JWKS/OIDC fetches, etc.) |
+| `FERRUM_PLUGIN_HTTP_RETRY_DELAY_MS` | No | `100` | Delay between plugin HTTP transport retry attempts |
 
 ### Runtime Tuning
 

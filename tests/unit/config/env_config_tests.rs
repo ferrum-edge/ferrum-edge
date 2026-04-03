@@ -1043,6 +1043,57 @@ fn test_plugin_http_slow_threshold_invalid_falls_back_to_default() {
 }
 
 #[test]
+fn test_plugin_http_retries_default() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+        ],
+        || {
+            remove_var("FERRUM_PLUGIN_HTTP_MAX_RETRIES");
+            remove_var("FERRUM_PLUGIN_HTTP_RETRY_DELAY_MS");
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.plugin_http_max_retries, 0);
+            assert_eq!(config.plugin_http_retry_delay_ms, 100);
+        },
+    );
+}
+
+#[test]
+fn test_plugin_http_retries_custom() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_PLUGIN_HTTP_MAX_RETRIES", "4"),
+            ("FERRUM_PLUGIN_HTTP_RETRY_DELAY_MS", "250"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.plugin_http_max_retries, 4);
+            assert_eq!(config.plugin_http_retry_delay_ms, 250);
+        },
+    );
+}
+
+#[test]
+fn test_plugin_http_retries_invalid_fall_back_to_defaults() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_PLUGIN_HTTP_MAX_RETRIES", "not_a_number"),
+            ("FERRUM_PLUGIN_HTTP_RETRY_DELAY_MS", "also_bad"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.plugin_http_max_retries, 0);
+            assert_eq!(config.plugin_http_retry_delay_ms, 100);
+        },
+    );
+}
+
+#[test]
 fn test_effective_db_url_none_when_no_db_url() {
     with_env_vars(
         &[
