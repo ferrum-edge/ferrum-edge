@@ -18,11 +18,11 @@ fn make_consumer(username: &str) -> Consumer {
     }
 }
 
-fn make_ctx(ip: &str, consumer: Option<&str>) -> StreamConnectionContext {
+fn make_ctx(proxy_id: &str, ip: &str, consumer: Option<&str>) -> StreamConnectionContext {
     StreamConnectionContext {
         client_ip: ip.to_string(),
-        proxy_id: "tcp-proxy".to_string(),
-        proxy_name: Some("TCP Proxy".to_string()),
+        proxy_id: proxy_id.to_string(),
+        proxy_name: Some(format!("TCP Proxy {proxy_id}")),
         listen_port: 5432,
         backend_protocol: BackendProtocol::Tcp,
         consumer_index: Arc::new(ferrum_edge::ConsumerIndex::new(&[])),
@@ -80,13 +80,13 @@ fn test_tcp_connection_throttle_protocol_and_priority() {
 async fn test_tcp_connection_throttle_rejects_second_connection_for_same_ip() {
     let plugin = TcpConnectionThrottle::new(&json!({"max_connections_per_key": 1})).unwrap();
 
-    let mut ctx1 = make_ctx("10.0.0.1", None);
+    let mut ctx1 = make_ctx("tcp-proxy", "10.0.0.1", None);
     assert!(matches!(
         plugin.on_stream_connect(&mut ctx1).await,
         PluginResult::Continue
     ));
 
-    let mut ctx2 = make_ctx("10.0.0.1", None);
+    let mut ctx2 = make_ctx("tcp-proxy", "10.0.0.1", None);
     assert!(matches!(
         plugin.on_stream_connect(&mut ctx2).await,
         PluginResult::Reject {
@@ -100,7 +100,7 @@ async fn test_tcp_connection_throttle_rejects_second_connection_for_same_ip() {
 async fn test_tcp_connection_throttle_releases_slot_on_disconnect() {
     let plugin = TcpConnectionThrottle::new(&json!({"max_connections_per_key": 1})).unwrap();
 
-    let mut ctx1 = make_ctx("10.0.0.1", None);
+    let mut ctx1 = make_ctx("tcp-proxy", "10.0.0.1", None);
     assert!(matches!(
         plugin.on_stream_connect(&mut ctx1).await,
         PluginResult::Continue
@@ -110,7 +110,7 @@ async fn test_tcp_connection_throttle_releases_slot_on_disconnect() {
         .on_stream_disconnect(&make_summary(ctx1.metadata.clone()))
         .await;
 
-    let mut ctx2 = make_ctx("10.0.0.1", None);
+    let mut ctx2 = make_ctx("tcp-proxy", "10.0.0.1", None);
     assert!(matches!(
         plugin.on_stream_connect(&mut ctx2).await,
         PluginResult::Continue
@@ -121,13 +121,13 @@ async fn test_tcp_connection_throttle_releases_slot_on_disconnect() {
 async fn test_tcp_connection_throttle_uses_consumer_identity_when_present() {
     let plugin = TcpConnectionThrottle::new(&json!({"max_connections_per_key": 1})).unwrap();
 
-    let mut ctx1 = make_ctx("10.0.0.1", Some("alice"));
+    let mut ctx1 = make_ctx("tcp-proxy", "10.0.0.1", Some("alice"));
     assert!(matches!(
         plugin.on_stream_connect(&mut ctx1).await,
         PluginResult::Continue
     ));
 
-    let mut ctx2 = make_ctx("10.0.0.2", Some("alice"));
+    let mut ctx2 = make_ctx("tcp-proxy", "10.0.0.2", Some("alice"));
     assert!(matches!(
         plugin.on_stream_connect(&mut ctx2).await,
         PluginResult::Reject {
@@ -136,7 +136,30 @@ async fn test_tcp_connection_throttle_uses_consumer_identity_when_present() {
         }
     ));
 
-    let mut ctx3 = make_ctx("10.0.0.3", Some("bob"));
+    let mut ctx3 = make_ctx("tcp-proxy", "10.0.0.3", Some("bob"));
+    assert!(matches!(
+        plugin.on_stream_connect(&mut ctx3).await,
+        PluginResult::Continue
+    ));
+}
+
+#[tokio::test]
+async fn test_tcp_connection_throttle_allows_same_identity_on_different_proxies() {
+    let plugin = TcpConnectionThrottle::new(&json!({"max_connections_per_key": 1})).unwrap();
+
+    let mut ctx1 = make_ctx("tcp-proxy-a", "10.0.0.1", Some("alice"));
+    assert!(matches!(
+        plugin.on_stream_connect(&mut ctx1).await,
+        PluginResult::Continue
+    ));
+
+    let mut ctx2 = make_ctx("tcp-proxy-b", "10.0.0.2", Some("alice"));
+    assert!(matches!(
+        plugin.on_stream_connect(&mut ctx2).await,
+        PluginResult::Continue
+    ));
+
+    let mut ctx3 = make_ctx("tcp-proxy-c", "10.0.0.1", None);
     assert!(matches!(
         plugin.on_stream_connect(&mut ctx3).await,
         PluginResult::Continue

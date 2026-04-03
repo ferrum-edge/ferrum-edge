@@ -1,6 +1,6 @@
 //! TCP-only concurrent connection throttling.
 //!
-//! Tracks active TCP connections per observed identity for the proxy:
+//! Tracks active TCP connections per proxy and observed identity:
 //! - authenticated consumer identity when a prior stream auth plugin set one
 //! - otherwise the client IP address
 //!
@@ -46,8 +46,8 @@ impl TcpConnectionThrottle {
 
     fn throttle_key(&self, ctx: &StreamConnectionContext) -> String {
         match ctx.effective_identity() {
-            Some(identity) => format!("consumer:{identity}"),
-            None => format!("ip:{}", ctx.client_ip),
+            Some(identity) => format!("proxy:{}:consumer:{identity}", ctx.proxy_id),
+            None => format!("proxy:{}:ip:{}", ctx.proxy_id, ctx.client_ip),
         }
     }
 
