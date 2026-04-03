@@ -582,6 +582,8 @@ Reduce per-request allocations in plugin lookup
 | `FERRUM_DTLS_KEY_PATH` | (none) | PEM key for frontend DTLS termination |
 | `FERRUM_DTLS_CLIENT_CA_CERT_PATH` | (none) | PEM CA cert for verifying DTLS client certs (frontend mTLS) |
 | `FERRUM_PLUGIN_HTTP_SLOW_THRESHOLD_MS` | `1000` | Threshold (ms) for warning-level logs on slow plugin HTTP calls |
+| `FERRUM_PLUGIN_HTTP_MAX_RETRIES` | `0` | Retry count for safe plugin HTTP calls (GET/HEAD/OPTIONS) on transport failures |
+| `FERRUM_PLUGIN_HTTP_RETRY_DELAY_MS` | `100` | Delay (ms) between plugin HTTP transport retries |
 | `FERRUM_ADMIN_RESTORE_MAX_BODY_SIZE_MIB` | `100` | Max request body size (MiB) for `POST /restore` |
 | `FERRUM_HTTP3_CONNECTIONS_PER_BACKEND` | `4` | QUIC connections per HTTP/3 backend (distributes frame processing) |
 | `FERRUM_HTTP3_POOL_IDLE_TIMEOUT_SECONDS` | `120` | HTTP/3 connection pool idle eviction timeout |
