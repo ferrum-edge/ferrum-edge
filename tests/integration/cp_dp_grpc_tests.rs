@@ -164,6 +164,7 @@ fn create_test_env_config() -> ferrum_edge::config::EnvConfig {
         dns_valid_ttl: None,
         dns_stale_ttl: 3600,
         dns_error_ttl: 1,
+        dns_warmup_concurrency: 500,
         tls_ca_bundle_path: None,
         backend_tls_client_cert_path: None,
         backend_tls_client_key_path: None,
@@ -224,6 +225,7 @@ fn create_test_proxy_state() -> ProxyState {
         stale_ttl_seconds: 3600,
         error_ttl_seconds: 1,
         max_cache_size: 10_000,
+        warmup_concurrency: 500,
         slow_threshold_ms: None,
     });
     let env_config = create_test_env_config();

@@ -654,6 +654,51 @@ fn test_env_config_dns_error_ttl_custom() {
     );
 }
 
+#[test]
+fn test_env_config_dns_warmup_concurrency_default() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+        ],
+        || {
+            remove_var("FERRUM_DNS_WARMUP_CONCURRENCY");
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.dns_warmup_concurrency, 500);
+        },
+    );
+}
+
+#[test]
+fn test_env_config_dns_warmup_concurrency_custom() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_DNS_WARMUP_CONCURRENCY", "128"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.dns_warmup_concurrency, 128);
+        },
+    );
+}
+
+#[test]
+fn test_env_config_dns_warmup_concurrency_clamps_zero() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_DNS_WARMUP_CONCURRENCY", "0"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.dns_warmup_concurrency, 1);
+        },
+    );
+}
+
 // --- Size Limit Tests ---
 
 #[test]

@@ -219,6 +219,8 @@ pub struct EnvConfig {
     pub dns_error_ttl: u64,
     /// Maximum number of entries in the DNS cache. Default: 10000
     pub dns_cache_max_size: usize,
+    /// Maximum number of concurrent DNS warmup resolutions. Default: 500.
+    pub dns_warmup_concurrency: usize,
     /// Threshold in milliseconds above which DNS resolutions are logged as slow. Default: disabled
     pub dns_slow_threshold_ms: Option<u64>,
 
@@ -455,6 +457,7 @@ impl Default for EnvConfig {
             dns_stale_ttl: 3600,
             dns_error_ttl: 1,
             dns_cache_max_size: 10_000,
+            dns_warmup_concurrency: 500,
             dns_slow_threshold_ms: None,
             tls_ca_bundle_path: None,
             backend_tls_client_cert_path: None,
@@ -643,6 +646,10 @@ impl EnvConfig {
             dns_cache_max_size: resolve_var(conf, "FERRUM_DNS_CACHE_MAX_SIZE")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(10_000),
+            dns_warmup_concurrency: resolve_var(conf, "FERRUM_DNS_WARMUP_CONCURRENCY")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(500)
+                .max(1),
             dns_slow_threshold_ms: resolve_var(conf, "FERRUM_DNS_SLOW_THRESHOLD_MS")
                 .and_then(|v| v.parse().ok()),
 

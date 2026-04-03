@@ -161,6 +161,7 @@ fn create_http3_test_env_config() -> EnvConfig {
         dns_valid_ttl: None,
         dns_stale_ttl: 3600,
         dns_error_ttl: 1,
+        dns_warmup_concurrency: 500,
         tls_ca_bundle_path: None,
         backend_tls_client_cert_path: None,
         backend_tls_client_key_path: None,

@@ -339,6 +339,7 @@ pub async fn run(
         stale_ttl_seconds: env_config.dns_stale_ttl,
         error_ttl_seconds: env_config.dns_error_ttl,
         max_cache_size: env_config.dns_cache_max_size,
+        warmup_concurrency: env_config.dns_warmup_concurrency,
         slow_threshold_ms: env_config.dns_slow_threshold_ms,
     });
     let db_url_for_reconnect = effective_url.clone();

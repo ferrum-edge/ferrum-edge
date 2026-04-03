@@ -481,6 +481,7 @@ async fn test_dns_config_default() {
     assert!(config.hosts_file_path.is_none());
     assert!(config.dns_order.is_none());
     assert!(config.global_overrides.is_empty());
+    assert_eq!(config.warmup_concurrency, 500);
     assert!(
         config.slow_threshold_ms.is_none(),
         "Slow threshold should be disabled by default"

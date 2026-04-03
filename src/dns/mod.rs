@@ -12,13 +12,14 @@
 //! automatically use the shared cache.
 
 use dashmap::DashMap;
+use futures_util::stream::{self, StreamExt};
 use hickory_resolver::Resolver;
 use hickory_resolver::config::{
     NameServerConfig, NameServerConfigGroup, ResolveHosts, ResolverConfig, ResolverOpts,
 };
 use hickory_resolver::name_server::TokioConnectionProvider;
 use hickory_resolver::proto::xfer::Protocol;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::BufReader;
 use std::net::{IpAddr, SocketAddr};
@@ -81,6 +82,8 @@ pub struct DnsConfig {
     /// Threshold in milliseconds above which DNS resolutions are logged as slow.
     /// None = disabled (no slow resolution warnings). Default: None.
     pub slow_threshold_ms: Option<u64>,
+    /// Maximum number of concurrent DNS warmup resolutions. Default: 500.
+    pub warmup_concurrency: usize,
 }
 
 impl Default for DnsConfig {
@@ -96,6 +99,7 @@ impl Default for DnsConfig {
             error_ttl_seconds: 1,
             max_cache_size: 10_000,
             slow_threshold_ms: None,
+            warmup_concurrency: 500,
         }
     }
 }
@@ -133,6 +137,8 @@ pub struct DnsCache {
     slow_threshold: Option<Duration>,
     /// Pre-computed label describing which nameservers are in use (for slow resolution logs).
     resolver_label: Arc<str>,
+    /// Maximum number of concurrent DNS resolutions during config warmup.
+    warmup_concurrency: usize,
 }
 
 impl DnsCache {
@@ -159,6 +165,7 @@ impl DnsCache {
             refreshing: Arc::new(DashMap::new()),
             slow_threshold: config.slow_threshold_ms.map(Duration::from_millis),
             resolver_label,
+            warmup_concurrency: config.warmup_concurrency.max(1),
         }
     }
 
@@ -757,12 +764,12 @@ impl DnsCache {
     ///
     /// Hostnames are deduplicated before resolution — if multiple proxies or
     /// plugins share the same hostname, only one DNS lookup is performed.
-    /// Each unique hostname is resolved concurrently.
+    /// Unique hostnames are resolved concurrently up to the configured limit.
     pub async fn warmup(&self, hostnames: Vec<(String, Option<String>, Option<u64>)>) {
+        let total_hostnames = hostnames.len();
+
         // Deduplicate by hostname, keeping the first override/TTL seen for each.
-        // Hostnames with a static override still go through resolve() to populate
-        // the cache, but they won't trigger actual DNS queries.
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = HashSet::new();
         let unique: Vec<_> = hostnames
             .into_iter()
             .filter(|(host, _, _)| seen.insert(host.clone()))
@@ -774,25 +781,23 @@ impl DnsCache {
         }
 
         info!(
-            "DNS warmup: resolving {} unique hostnames ({} before dedup)",
+            "DNS warmup: resolving {} unique hostnames ({} before dedup, concurrency={})",
             unique.len(),
-            seen.len()
+            total_hostnames,
+            self.warmup_concurrency,
         );
-        let mut handles = Vec::new();
 
-        for (host, override_ip, ttl) in unique {
-            let cache = self.clone();
-            handles.push(tokio::spawn(async move {
-                match cache.resolve(&host, override_ip.as_deref(), ttl).await {
-                    Ok(addr) => debug!("DNS warmup: {} -> {}", host, addr),
-                    Err(e) => warn!("DNS warmup failed for {}: {}", host, e),
+        stream::iter(unique)
+            .for_each_concurrent(self.warmup_concurrency, |(host, override_ip, ttl)| {
+                let cache = self.clone();
+                async move {
+                    match cache.resolve(&host, override_ip.as_deref(), ttl).await {
+                        Ok(addr) => debug!("DNS warmup: {} -> {}", host, addr),
+                        Err(e) => warn!("DNS warmup failed for {}: {}", host, e),
+                    }
                 }
-            }));
-        }
-
-        for handle in handles {
-            let _ = handle.await;
-        }
+            })
+            .await;
 
         info!("DNS warmup complete");
     }
