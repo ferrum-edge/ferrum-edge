@@ -33,8 +33,14 @@ use tracing::warn;
 
 use super::{Plugin, ProxyProtocol, UDP_ONLY_PROTOCOLS, UdpDatagramContext, UdpDatagramVerdict};
 
-/// Maximum tracked client IPs before triggering forced eviction.
+/// Hard cap on tracked client IPs. When exceeded after eviction, new IPs
+/// are rejected without inserting state — preventing spoofed-IP floods
+/// from causing unbounded memory growth.
 const MAX_STATE_ENTRIES: usize = 100_000;
+
+/// Minimum interval between eviction sweeps in seconds. Prevents O(n) retain
+/// scans from running on every datagram during high-cardinality floods.
+const EVICTION_COOLDOWN_SECS: f64 = 1.0;
 
 /// Interval between periodic eviction sweeps (every N datagram checks).
 /// At 10k datagrams/sec, this triggers roughly every 10 seconds.
@@ -84,6 +90,9 @@ pub struct UdpRateLimiting {
     check_counter: AtomicU64,
     /// Startup instant used to compute window epochs from Instant::now().
     epoch_base: Instant,
+    /// Last eviction sweep time — prevents O(n) retain from running on every
+    /// datagram during high-cardinality floods.
+    last_eviction: std::sync::Mutex<Instant>,
 }
 
 impl UdpRateLimiting {
@@ -110,6 +119,7 @@ impl UdpRateLimiting {
             state: DashMap::new(),
             check_counter: AtomicU64::new(0),
             epoch_base: Instant::now(),
+            last_eviction: std::sync::Mutex::new(Instant::now()),
         })
     }
 
@@ -120,19 +130,39 @@ impl UdpRateLimiting {
     }
 
     /// Evict stale entries to prevent unbounded memory growth.
-    fn maybe_evict(&self) {
+    ///
+    /// Returns `true` if the state map is over the hard cap after eviction,
+    /// meaning new IPs should be rejected without inserting state.
+    fn maybe_evict(&self) -> bool {
         let count = self.check_counter.fetch_add(1, Ordering::Relaxed);
+        let len = self.state.len();
 
-        let over_capacity = self.state.len() > MAX_STATE_ENTRIES;
+        let over_capacity = len > MAX_STATE_ENTRIES;
         let periodic =
             count > 0 && count.is_multiple_of(EVICTION_CHECK_INTERVAL) && !self.state.is_empty();
 
         if over_capacity || periodic {
-            let now = Instant::now();
-            // Evict entries idle for more than 2x the window duration (minimum 10s).
-            let max_idle = (self.window_seconds as f64 * 2.0).max(10.0);
-            self.state.retain(|_, v| !v.is_stale(now, max_idle));
+            // Time-gate eviction sweeps to prevent O(n) retain on every datagram
+            // during high-cardinality floods.
+            let should_sweep = self
+                .last_eviction
+                .lock()
+                .ok()
+                .is_some_and(|last| last.elapsed().as_secs_f64() >= EVICTION_COOLDOWN_SECS);
+
+            if should_sweep {
+                let now = Instant::now();
+                let max_idle = (self.window_seconds as f64 * 2.0).max(10.0);
+                self.state.retain(|_, v| !v.is_stale(now, max_idle));
+                if let Ok(mut last) = self.last_eviction.lock() {
+                    *last = now;
+                }
+            }
         }
+
+        // Hard cap: after eviction, if still over capacity, signal callers to
+        // reject unknown IPs without inserting state.
+        self.state.len() > MAX_STATE_ENTRIES
     }
 }
 
@@ -159,10 +189,17 @@ impl Plugin for UdpRateLimiting {
     }
 
     async fn on_udp_datagram(&self, ctx: &UdpDatagramContext) -> UdpDatagramVerdict {
-        self.maybe_evict();
+        let over_capacity = self.maybe_evict();
 
         let current_epoch = self.current_epoch();
         let key = &ctx.client_ip;
+
+        // Hard cap: when over capacity, only allow datagrams from already-tracked
+        // IPs. New IPs are dropped without inserting state to prevent spoofed-IP
+        // floods from causing unbounded memory growth.
+        if over_capacity && !self.state.contains_key(key) {
+            return UdpDatagramVerdict::Drop;
+        }
 
         let entry = self
             .state

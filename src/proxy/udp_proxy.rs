@@ -424,6 +424,26 @@ async fn process_datagram(
     consumer_index: &Arc<ConsumerIndex>,
     has_datagram_plugins: bool,
 ) -> Result<(), anyhow::Error> {
+    // Run per-datagram plugins (e.g., udp_rate_limiting) before session
+    // allocation so dropped datagrams don't consume session slots or trigger
+    // backend connection setup.
+    if has_datagram_plugins {
+        let ctx = UdpDatagramContext {
+            client_ip: client_addr.ip().to_string(),
+            proxy_id: proxy_id.to_string(),
+            proxy_name: proxy_name.map(str::to_string),
+            listen_port,
+            datagram_size: data.len(),
+        };
+        for plugin in plugins {
+            if plugin.requires_udp_datagram_hooks()
+                && matches!(plugin.on_udp_datagram(&ctx).await, UdpDatagramVerdict::Drop)
+            {
+                return Ok(()); // Silent drop — standard UDP behavior
+            }
+        }
+    }
+
     // Fast path: check last-client cache before hitting DashMap.
     let session = if let Some((cached_addr, ref cached_session)) = *last_client {
         if cached_addr == client_addr {
@@ -473,24 +493,6 @@ async fn process_datagram(
 
     // Update cache for next datagram.
     *last_client = Some((client_addr, session.clone()));
-
-    // Run per-datagram plugins (e.g., udp_rate_limiting) before forwarding.
-    if has_datagram_plugins {
-        let ctx = UdpDatagramContext {
-            client_ip: client_addr.ip().to_string(),
-            proxy_id: proxy_id.to_string(),
-            proxy_name: proxy_name.map(str::to_string),
-            listen_port,
-            datagram_size: data.len(),
-        };
-        for plugin in plugins {
-            if plugin.requires_udp_datagram_hooks()
-                && matches!(plugin.on_udp_datagram(&ctx).await, UdpDatagramVerdict::Drop)
-            {
-                return Ok(()); // Silent drop — standard UDP behavior
-            }
-        }
-    }
 
     // Forward to backend.
     session
