@@ -133,6 +133,14 @@ fn resolve_bool(conf: &ConfFile, key: &str, default: bool) -> bool {
 pub struct EnvConfig {
     pub mode: OperatingMode,
     pub log_level: String,
+    /// Maximum number of buffered log lines in the non-blocking writer's channel.
+    /// When the buffer is full, new log events are dropped (lossy mode) to avoid
+    /// backpressure on request-processing threads. Larger values reduce the chance
+    /// of log loss under extreme throughput but consume more memory. Default: 128000.
+    /// Note: consumed in main() before EnvConfig is constructed (tracing must init
+    /// first), but stored here for completeness alongside other FERRUM_* vars.
+    #[allow(dead_code)]
+    pub log_buffer_capacity: usize,
     /// When true, streaming responses are wrapped with a lightweight tracker
     /// that records the final transfer time via a deferred task. Adds one
     /// `Arc<StreamingMetrics>` + one `tokio::spawn` per streaming request.
@@ -523,6 +531,7 @@ impl Default for EnvConfig {
         Self {
             mode: OperatingMode::File,
             log_level: "error".into(),
+            log_buffer_capacity: 128_000,
             enable_streaming_latency_tracking: false,
             proxy_http_port: 8000,
             proxy_https_port: 8443,
@@ -674,6 +683,7 @@ impl EnvConfig {
         let config = Self {
             mode: mode.clone(),
             log_level: resolve_var_or(conf, "FERRUM_LOG_LEVEL", "error"),
+            log_buffer_capacity: resolve_usize(conf, "FERRUM_LOG_BUFFER_CAPACITY", 128_000),
             enable_streaming_latency_tracking: resolve_bool(
                 conf,
                 "FERRUM_ENABLE_STREAMING_LATENCY_TRACKING",

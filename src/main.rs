@@ -68,7 +68,13 @@ fn main() {
     // hot-path log call a fast channel send instead of a blocking I/O write.
     // The `_guard` must be held until shutdown to keep the writer thread alive
     // and flush remaining events on drop.
-    let (non_blocking, _guard) = tracing_appender::non_blocking(std::io::stdout());
+    let log_buffer_capacity: usize = std::env::var("FERRUM_LOG_BUFFER_CAPACITY")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(128_000);
+    let (non_blocking, _guard) = tracing_appender::non_blocking::NonBlockingBuilder::default()
+        .buffered_lines_limit(log_buffer_capacity)
+        .finish(std::io::stdout());
     let log_level = std::env::var("FERRUM_LOG_LEVEL").unwrap_or_else(|_| "error".into());
     tracing_subscriber::fmt()
         .with_env_filter(

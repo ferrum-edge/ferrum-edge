@@ -1,11 +1,12 @@
 //! Transaction debugger plugin — detailed per-request diagnostics.
 //!
-//! Prints debug output to stdout showing the request/response lifecycle:
-//! matched proxy, consumer identity, plugin execution timing, backend
-//! connection details, and optionally request/response body logging markers.
-//! Sensitive headers (Authorization, Cookie, API keys) are automatically
-//! redacted. Intended for development and troubleshooting — should not be
-//! enabled in production due to information disclosure risk.
+//! Emits debug output via `tracing::debug!` on the `transaction_debug` target,
+//! showing the request/response lifecycle: matched proxy, consumer identity,
+//! plugin execution timing, backend connection details, and optionally
+//! request/response body logging markers. Sensitive headers (Authorization,
+//! Cookie, API keys) are automatically redacted. Intended for development and
+//! troubleshooting — should not be enabled in production due to information
+//! disclosure risk.
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -94,11 +95,9 @@ impl Plugin for TransactionDebugger {
 
     async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult {
         let safe_headers = self.redact_headers(&ctx.headers);
-        println!("[DEBUG] === Incoming Request ===");
-        println!("[DEBUG] {} {} from {}", ctx.method, ctx.path, ctx.client_ip);
-        println!("[DEBUG] Headers: {:?}", safe_headers);
+        tracing::debug!(target: "transaction_debug", method = %ctx.method, path = %ctx.path, client_ip = %ctx.client_ip, headers = ?safe_headers, "Incoming request");
         if self.log_request_body {
-            println!("[DEBUG] (Request body logging enabled)");
+            tracing::debug!(target: "transaction_debug", "Request body logging enabled");
         }
         PluginResult::Continue
     }
@@ -110,66 +109,65 @@ impl Plugin for TransactionDebugger {
         response_headers: &mut HashMap<String, String>,
     ) -> PluginResult {
         let safe_headers = self.redact_headers(response_headers);
-        println!("[DEBUG] === Backend Response ===");
-        println!(
-            "[DEBUG] Status: {} for {} {}",
-            response_status, ctx.method, ctx.path
-        );
-        println!("[DEBUG] Response Headers: {:?}", safe_headers);
+        tracing::debug!(target: "transaction_debug", status = response_status, method = %ctx.method, path = %ctx.path, headers = ?safe_headers, "Backend response");
         if self.log_response_body {
-            println!("[DEBUG] (Response body logging enabled)");
+            tracing::debug!(target: "transaction_debug", "Response body logging enabled");
         }
         PluginResult::Continue
     }
 
     async fn on_stream_disconnect(&self, summary: &StreamTransactionSummary) {
         if let Some(ref error) = summary.connection_error {
-            println!(
-                "[DEBUG] Stream: {} {}:{} -> {} [{}] ({:.0}ms, {} bytes in, {} bytes out)",
-                summary.protocol,
-                summary.proxy_id,
-                summary.listen_port,
-                summary.backend_target,
-                error,
-                summary.duration_ms,
-                summary.bytes_sent,
-                summary.bytes_received,
+            tracing::debug!(
+                target: "transaction_debug",
+                protocol = %summary.protocol,
+                proxy_id = %summary.proxy_id,
+                listen_port = %summary.listen_port,
+                backend_target = %summary.backend_target,
+                error = %error,
+                duration_ms = summary.duration_ms,
+                bytes_sent = summary.bytes_sent,
+                bytes_received = summary.bytes_received,
+                "Stream disconnected with error",
             );
         } else {
-            println!(
-                "[DEBUG] Stream: {} {}:{} -> {} ({:.0}ms, {} bytes in, {} bytes out)",
-                summary.protocol,
-                summary.proxy_id,
-                summary.listen_port,
-                summary.backend_target,
-                summary.duration_ms,
-                summary.bytes_sent,
-                summary.bytes_received,
+            tracing::debug!(
+                target: "transaction_debug",
+                protocol = %summary.protocol,
+                proxy_id = %summary.proxy_id,
+                listen_port = %summary.listen_port,
+                backend_target = %summary.backend_target,
+                duration_ms = summary.duration_ms,
+                bytes_sent = summary.bytes_sent,
+                bytes_received = summary.bytes_received,
+                "Stream disconnected",
             );
         }
     }
 
     async fn log(&self, summary: &TransactionSummary) {
         if let Some(ref error_class) = summary.error_class {
-            println!(
-                "[DEBUG] Transaction: {} {} -> {} [{}] ({}ms total, {:.2}ms plugins, {:.2}ms gw overhead)",
-                summary.http_method,
-                summary.request_path,
-                summary.response_status_code,
-                error_class,
-                summary.latency_total_ms,
-                summary.latency_plugin_execution_ms,
-                summary.latency_gateway_overhead_ms,
+            tracing::debug!(
+                target: "transaction_debug",
+                method = %summary.http_method,
+                path = %summary.request_path,
+                status = summary.response_status_code,
+                error_class = %error_class,
+                latency_total_ms = summary.latency_total_ms,
+                latency_plugin_ms = summary.latency_plugin_execution_ms,
+                latency_gw_overhead_ms = summary.latency_gateway_overhead_ms,
+                "Transaction completed with error",
             );
         } else {
-            println!(
-                "[DEBUG] Transaction: {} {} -> {} ({}ms total, {:.2}ms plugins, {:.2}ms gw overhead)",
-                summary.http_method,
-                summary.request_path,
-                summary.response_status_code,
-                summary.latency_total_ms,
-                summary.latency_plugin_execution_ms,
-                summary.latency_gateway_overhead_ms,
+            tracing::debug!(
+                target: "transaction_debug",
+                method = %summary.http_method,
+                path = %summary.request_path,
+                status = summary.response_status_code,
+                latency_total_ms = summary.latency_total_ms,
+                latency_plugin_ms = summary.latency_plugin_execution_ms,
+                latency_gw_overhead_ms = summary.latency_gateway_overhead_ms,
+                "Transaction completed",
             );
         }
     }
