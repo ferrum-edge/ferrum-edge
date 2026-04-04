@@ -49,7 +49,7 @@ fn make_summary(metadata: HashMap<String, String>) -> TransactionSummary {
         response_streamed: false,
         client_disconnected: false,
         error_class: None,
-        mirror: None,
+        mirror: false,
         metadata,
     }
 }
@@ -77,7 +77,7 @@ fn make_rich_summary(metadata: HashMap<String, String>) -> TransactionSummary {
         response_streamed: true,
         client_disconnected: false,
         error_class: None,
-        mirror: None,
+        mirror: false,
         metadata,
     }
 }

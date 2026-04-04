@@ -319,27 +319,24 @@ pub enum PluginResult {
     },
 }
 
-/// Mirror response metadata captured by the `request_mirror` plugin.
+/// Mirror response metadata from the `request_mirror` plugin's spawned task.
 ///
-/// Included in `TransactionSummary.mirror` when a mirror request was dispatched,
-/// so all logging plugins (stdout, http_logging, prometheus, transaction_debugger)
-/// automatically receive mirror results without special-casing.
-#[derive(Debug, Clone, serde::Serialize)]
+/// Communicated via `tokio::sync::watch` channel from the spawned mirror task
+/// to the proxy handler, which builds a second `TransactionSummary` (with
+/// `mirror: true`) and logs it through the normal plugin pipeline.
+#[derive(Debug, Clone)]
 pub struct MirrorResponseMeta {
     /// URL the mirror request was sent to.
     pub mirror_target_url: String,
     /// HTTP status code from the mirror target. `None` when the request failed
     /// before a response was received (DNS, connect, timeout errors).
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub mirror_response_status_code: Option<u16>,
     /// Response body size in bytes from the mirror target. Derived from
     /// `content-length` header when present, otherwise from reading the body.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub mirror_response_size_bytes: Option<u64>,
     /// Wall-clock latency of the mirror request in milliseconds.
     pub mirror_latency_ms: f64,
     /// Human-readable error message when the mirror request failed.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub mirror_error: Option<String>,
 }
 
@@ -392,11 +389,70 @@ pub struct TransactionSummary {
     /// and normal HTTP error responses from the backend.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_class: Option<crate::retry::ErrorClass>,
-    /// Mirror response metadata from the `request_mirror` plugin. Present when
-    /// a mirror request was dispatched and its result was collected before logging.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub mirror: Option<MirrorResponseMeta>,
+    /// True when this summary represents a mirror (shadow) request, not the
+    /// actual client-facing proxy traffic. Logged as a separate entry with the
+    /// same schema so existing log queries and dashboards work without changes.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub mirror: bool,
     pub metadata: HashMap<String, String>,
+}
+
+impl TransactionSummary {
+    /// Build a mirror transaction summary from this summary and a mirror result.
+    ///
+    /// Clones the original request context fields (client_ip, method, path, proxy,
+    /// consumer) and overlays the mirror response metadata (status, latency, target
+    /// URL). Response size and error details go into metadata since there are no
+    /// dedicated fields for them in the standard schema.
+    pub fn as_mirror_entry(&self, result: MirrorResponseMeta) -> Self {
+        let mut mirror = self.clone();
+        mirror.mirror = true;
+        mirror.backend_target_url = Some(result.mirror_target_url);
+        mirror.response_status_code = result.mirror_response_status_code.unwrap_or(0);
+        mirror.backend_resolved_ip = None;
+        mirror.latency_total_ms = result.mirror_latency_ms;
+        mirror.latency_backend_ttfb_ms = result.mirror_latency_ms;
+        mirror.latency_backend_total_ms = result.mirror_latency_ms;
+        mirror.latency_gateway_processing_ms = 0.0;
+        mirror.latency_plugin_execution_ms = 0.0;
+        mirror.latency_plugin_external_io_ms = 0.0;
+        mirror.latency_gateway_overhead_ms = 0.0;
+        mirror.response_streamed = false;
+        mirror.client_disconnected = false;
+        mirror.error_class = None;
+        if let Some(size) = result.mirror_response_size_bytes {
+            mirror
+                .metadata
+                .insert("response_size_bytes".to_string(), size.to_string());
+        }
+        if let Some(err) = result.mirror_error {
+            mirror.metadata.insert("mirror_error".to_string(), err);
+        }
+        mirror
+    }
+}
+
+/// Log a transaction summary through all logging plugins, then log a mirror
+/// summary if a mirror request was dispatched.
+///
+/// Mirror results are collected after the main summary is logged, giving the
+/// spawned mirror task maximum time to complete. The mirror entry uses the
+/// same `TransactionSummary` schema with `mirror: true` so existing log
+/// pipelines work without changes.
+pub async fn log_with_mirror(
+    plugins: &[Arc<dyn Plugin>],
+    summary: &TransactionSummary,
+    ctx: &RequestContext,
+) {
+    for plugin in plugins {
+        plugin.log(summary).await;
+    }
+    if let Some(mirror_result) = ctx.collect_mirror_result().await {
+        let mirror_summary = summary.as_mirror_entry(mirror_result);
+        for plugin in plugins {
+            plugin.log(&mirror_summary).await;
+        }
+    }
 }
 
 /// Context for stream proxy (TCP/UDP) plugin hooks.

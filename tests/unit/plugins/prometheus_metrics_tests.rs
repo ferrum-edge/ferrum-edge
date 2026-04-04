@@ -37,7 +37,7 @@ fn make_summary(
         response_streamed: false,
         client_disconnected: false,
         error_class: None,
-        mirror: None,
+        mirror: false,
         metadata: HashMap::new(),
     }
 }
