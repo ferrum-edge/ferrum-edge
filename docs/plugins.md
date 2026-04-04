@@ -1098,8 +1098,9 @@ Behavior:
 - The plugin stores arbitrary response bytes, so binary responses and backend-compressed payloads can be cached safely.
 
 Compression note:
-- Ferrum currently does **not** generate gzip or brotli on its own.
+- Ferrum does **not** generate gzip or brotli on its own — compression remains backend-driven pass-through.
 - It forwards backend `Content-Encoding` as-is and caches compressed variants correctly when the origin sends the matching `Vary` header.
+- The `body_validator` plugin decompresses gzip-compressed gRPC frames for protobuf validation, but this is internal to the validation path and does not affect the cached or forwarded body.
 
 ### `graphql`
 
