@@ -376,6 +376,61 @@ async fn handle_h3_request(
         .await?;
         return Ok(());
     }
+    if state.max_header_count > 0 && req.headers().len() > state.max_header_count {
+        record_request(&state, 431);
+        send_h3_response(
+            &mut stream,
+            StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
+            &format!(
+                r#"{{"error":"Request header count ({}) exceeds maximum of {}"}}"#,
+                req.headers().len(),
+                state.max_header_count
+            ),
+        )
+        .await?;
+        return Ok(());
+    }
+
+    // Validate URL length (path + query string)
+    if state.max_url_length_bytes > 0 {
+        let url_len = path.len()
+            + if query_string.is_empty() {
+                0
+            } else {
+                1 + query_string.len()
+            };
+        if url_len > state.max_url_length_bytes {
+            record_request(&state, 414);
+            send_h3_response(
+                &mut stream,
+                StatusCode::URI_TOO_LONG,
+                &format!(
+                    r#"{{"error":"Request URL length ({} bytes) exceeds maximum of {} bytes"}}"#,
+                    url_len, state.max_url_length_bytes
+                ),
+            )
+            .await?;
+            return Ok(());
+        }
+    }
+
+    // Validate query parameter count
+    if state.max_query_params > 0 && !query_string.is_empty() {
+        let param_count = query_string.split('&').count();
+        if param_count > state.max_query_params {
+            record_request(&state, 400);
+            send_h3_response(
+                &mut stream,
+                StatusCode::BAD_REQUEST,
+                &format!(
+                    r#"{{"error":"Query parameter count ({}) exceeds maximum of {}"}}"#,
+                    param_count, state.max_query_params
+                ),
+            )
+            .await?;
+            return Ok(());
+        }
+    }
 
     // Resolve real client IP using trusted proxy configuration.
     // Parse socket IP once upfront to avoid redundant parsing in each branch.

@@ -422,6 +422,11 @@ fn test_env_config_request_limits_defaults() {
             assert_eq!(config.max_single_header_size_bytes, 16384);
             assert_eq!(config.max_request_body_size_bytes, 10_485_760);
             assert_eq!(config.max_response_body_size_bytes, 10_485_760);
+            assert_eq!(config.max_header_count, 100);
+            assert_eq!(config.max_url_length_bytes, 8_192);
+            assert_eq!(config.max_query_params, 100);
+            assert_eq!(config.max_grpc_message_size_bytes, 4_194_304);
+            assert_eq!(config.max_websocket_frame_size_bytes, 16_777_216);
         },
     );
 }
@@ -781,6 +786,171 @@ fn test_env_config_max_header_size_updated_default() {
                 config.max_header_size_bytes, 32768,
                 "max_header_size_bytes should default to 32KB"
             );
+        },
+    );
+}
+
+#[test]
+fn test_env_config_max_header_count_default() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+        ],
+        || {
+            remove_var("FERRUM_MAX_HEADER_COUNT");
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(
+                config.max_header_count, 100,
+                "max_header_count should default to 100"
+            );
+        },
+    );
+}
+
+#[test]
+fn test_env_config_max_header_count_custom() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_MAX_HEADER_COUNT", "200"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.max_header_count, 200);
+        },
+    );
+}
+
+#[test]
+fn test_env_config_max_url_length_bytes_default() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+        ],
+        || {
+            remove_var("FERRUM_MAX_URL_LENGTH_BYTES");
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(
+                config.max_url_length_bytes, 8_192,
+                "max_url_length_bytes should default to 8KB"
+            );
+        },
+    );
+}
+
+#[test]
+fn test_env_config_max_url_length_bytes_custom() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_MAX_URL_LENGTH_BYTES", "16384"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.max_url_length_bytes, 16_384);
+        },
+    );
+}
+
+#[test]
+fn test_env_config_max_query_params_default() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+        ],
+        || {
+            remove_var("FERRUM_MAX_QUERY_PARAMS");
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(
+                config.max_query_params, 100,
+                "max_query_params should default to 100"
+            );
+        },
+    );
+}
+
+#[test]
+fn test_env_config_max_query_params_custom() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_MAX_QUERY_PARAMS", "50"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.max_query_params, 50);
+        },
+    );
+}
+
+#[test]
+fn test_env_config_max_grpc_message_size_bytes_default() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+        ],
+        || {
+            remove_var("FERRUM_MAX_GRPC_MESSAGE_SIZE_BYTES");
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(
+                config.max_grpc_message_size_bytes, 4_194_304,
+                "max_grpc_message_size_bytes should default to 4MB"
+            );
+        },
+    );
+}
+
+#[test]
+fn test_env_config_max_grpc_message_size_bytes_custom() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_MAX_GRPC_MESSAGE_SIZE_BYTES", "8388608"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.max_grpc_message_size_bytes, 8_388_608);
+        },
+    );
+}
+
+#[test]
+fn test_env_config_max_websocket_frame_size_bytes_default() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+        ],
+        || {
+            remove_var("FERRUM_MAX_WEBSOCKET_FRAME_SIZE_BYTES");
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(
+                config.max_websocket_frame_size_bytes, 16_777_216,
+                "max_websocket_frame_size_bytes should default to 16MB"
+            );
+        },
+    );
+}
+
+#[test]
+fn test_env_config_max_websocket_frame_size_bytes_custom() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_MAX_WEBSOCKET_FRAME_SIZE_BYTES", "33554432"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.max_websocket_frame_size_bytes, 33_554_432);
         },
     );
 }

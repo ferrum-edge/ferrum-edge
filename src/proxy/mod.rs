@@ -639,8 +639,13 @@ pub struct ProxyState {
     // Size limits
     pub max_header_size_bytes: usize,
     pub max_single_header_size_bytes: usize,
+    pub max_header_count: usize,
     pub max_request_body_size_bytes: usize,
     pub max_response_body_size_bytes: usize,
+    pub max_url_length_bytes: usize,
+    pub max_query_params: usize,
+    pub max_grpc_message_size_bytes: usize,
+    pub max_websocket_frame_size_bytes: usize,
     /// Parsed trusted proxy CIDRs for X-Forwarded-For client IP resolution.
     /// Pre-parsed from `env_config.trusted_proxies` to avoid re-parsing on every request.
     pub trusted_proxies: Arc<client_ip::TrustedProxies>,
@@ -674,8 +679,13 @@ impl ProxyState {
         };
         let max_header_size_bytes = env_config.max_header_size_bytes;
         let max_single_header_size_bytes = env_config.max_single_header_size_bytes;
+        let max_header_count = env_config.max_header_count;
         let max_request_body_size_bytes = env_config.max_request_body_size_bytes;
         let max_response_body_size_bytes = env_config.max_response_body_size_bytes;
+        let max_url_length_bytes = env_config.max_url_length_bytes;
+        let max_query_params = env_config.max_query_params;
+        let max_grpc_message_size_bytes = env_config.max_grpc_message_size_bytes;
+        let max_websocket_frame_size_bytes = env_config.max_websocket_frame_size_bytes;
         let trusted_proxies = Arc::new(client_ip::TrustedProxies::parse(
             &env_config.trusted_proxies,
         ));
@@ -798,8 +808,13 @@ impl ProxyState {
             env_config: env_config_arc,
             max_header_size_bytes,
             max_single_header_size_bytes,
+            max_header_count,
             max_request_body_size_bytes,
             max_response_body_size_bytes,
+            max_url_length_bytes,
+            max_query_params,
+            max_grpc_message_size_bytes,
+            max_websocket_frame_size_bytes,
             trusted_proxies,
             websocket_conn_limit,
             stream_listener_manager,
@@ -1664,6 +1679,7 @@ async fn handle_websocket_request_authenticated(
             &env_config,
             &client_headers,
             state.tls_policy.as_deref(),
+            state.max_websocket_frame_size_bytes,
         )
         .await
         {
@@ -1930,6 +1946,7 @@ async fn handle_websocket_request_authenticated(
     // Spawn bidirectional forwarding task (awaits client upgrade, then proxies)
     let proxy_id = proxy.id.clone();
     let ws_conn_id = state.ws_connection_counter.fetch_add(1, Ordering::Relaxed);
+    let max_ws_frame = state.max_websocket_frame_size_bytes;
     tokio::spawn(async move {
         match on_upgrade.await {
             Ok(upgraded) => {
@@ -1940,6 +1957,7 @@ async fn handle_websocket_request_authenticated(
                     ws_conn_id,
                     ws_frame_plugins,
                     ws_connection_permit,
+                    max_ws_frame,
                 )
                 .await
                 {
@@ -2170,13 +2188,14 @@ async fn connect_websocket_backend(
     env_config: &crate::config::EnvConfig,
     client_headers: &[(String, String)],
     tls_policy: Option<&TlsPolicy>,
+    max_websocket_frame_size_bytes: usize,
 ) -> Result<
     WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
     Box<dyn std::error::Error + Send + Sync>,
 > {
     let mut ws_config = WebSocketConfig::default();
-    ws_config.max_frame_size = Some(16 << 20);
-    ws_config.max_message_size = Some(64 << 20);
+    ws_config.max_frame_size = Some(max_websocket_frame_size_bytes);
+    ws_config.max_message_size = Some(max_websocket_frame_size_bytes.saturating_mul(4));
 
     let mut ws_request = backend_url.into_client_request()?;
     for (name, value) in client_headers {
@@ -2231,10 +2250,11 @@ async fn run_websocket_proxy(
     connection_id: u64,
     ws_frame_plugins: Vec<Arc<dyn Plugin>>,
     _ws_connection_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    max_websocket_frame_size_bytes: usize,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut ws_config = WebSocketConfig::default();
-    ws_config.max_frame_size = Some(16 << 20);
-    ws_config.max_message_size = Some(64 << 20);
+    ws_config.max_frame_size = Some(max_websocket_frame_size_bytes);
+    ws_config.max_message_size = Some(max_websocket_frame_size_bytes.saturating_mul(4));
 
     let ws_stream = WebSocketStream::from_raw_socket(
         TokioIo::new(upgraded),
@@ -3103,6 +3123,52 @@ pub async fn handle_proxy_request(
             r#"{"error":"Total request headers exceed maximum size"}"#,
         ));
     }
+    if state.max_header_count > 0 && req.headers().len() > state.max_header_count {
+        record_request(&state, 431);
+        return Ok(build_response(
+            StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
+            &format!(
+                r#"{{"error":"Request header count ({}) exceeds maximum of {}"}}"#,
+                req.headers().len(),
+                state.max_header_count
+            ),
+        ));
+    }
+
+    // Validate URL length (path + query string)
+    if state.max_url_length_bytes > 0 {
+        let url_len = path.len()
+            + if query_string.is_empty() {
+                0
+            } else {
+                1 + query_string.len()
+            };
+        if url_len > state.max_url_length_bytes {
+            record_request(&state, 414);
+            return Ok(build_response(
+                StatusCode::URI_TOO_LONG,
+                &format!(
+                    r#"{{"error":"Request URL length ({} bytes) exceeds maximum of {} bytes"}}"#,
+                    url_len, state.max_url_length_bytes
+                ),
+            ));
+        }
+    }
+
+    // Validate query parameter count
+    if state.max_query_params > 0 && !query_string.is_empty() {
+        let param_count = query_string.split('&').count();
+        if param_count > state.max_query_params {
+            record_request(&state, 400);
+            return Ok(build_response(
+                StatusCode::BAD_REQUEST,
+                &format!(
+                    r#"{{"error":"Query parameter count ({}) exceeds maximum of {}"}}"#,
+                    param_count, state.max_query_params
+                ),
+            ));
+        }
+    }
 
     // Resolve real client IP using trusted proxy configuration.
     // Parse the socket IP once and reuse the parsed value to avoid redundant
@@ -3699,6 +3765,7 @@ pub async fn handle_proxy_request(
             &state.dns_cache,
             proxy_headers,
             grpc_should_stream,
+            state.max_grpc_message_size_bytes,
         )
         .await;
 
@@ -4157,6 +4224,9 @@ pub async fn handle_proxy_request(
                     }
                     GrpcProxyError::BackendTimeout(m) => {
                         (grpc_proxy::grpc_status::DEADLINE_EXCEEDED, m.as_str())
+                    }
+                    GrpcProxyError::ResourceExhausted(m) => {
+                        (grpc_proxy::grpc_status::RESOURCE_EXHAUSTED, m.as_str())
                     }
                     GrpcProxyError::Internal(m) => {
                         (grpc_proxy::grpc_status::UNAVAILABLE, m.as_str())
