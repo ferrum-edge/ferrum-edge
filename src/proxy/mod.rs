@@ -100,6 +100,23 @@ type WarmupTask =
 /// key causes the handshake to be treated as a non-WebSocket request, which the
 /// backend will handle as a regular HTTP request rather than proceeding with a
 /// broken upgrade.
+/// Check if the request is an HTTP/2 Extended CONNECT WebSocket request (RFC 8441).
+///
+/// In HTTP/2, WebSocket upgrades use the CONNECT method with a `:protocol = "websocket"`
+/// pseudo-header instead of the HTTP/1.1 Upgrade mechanism. hyper exposes the pseudo-header
+/// as a `hyper::ext::Protocol` extension on the request.
+///
+/// Generic over the body type so unit tests can use `Request<()>` without constructing
+/// an `Incoming` body.
+pub fn is_h2_websocket_connect<B>(req: &Request<B>) -> bool {
+    req.method() == hyper::Method::CONNECT
+        && req.version() == hyper::Version::HTTP_2
+        && req
+            .extensions()
+            .get::<hyper::ext::Protocol>()
+            .is_some_and(|p| p.as_ref().eq_ignore_ascii_case(b"websocket"))
+}
+
 fn is_websocket_upgrade(req: &Request<Incoming>) -> bool {
     let headers = req.headers();
     let connection = headers.get("connection").and_then(|v| v.to_str().ok());
@@ -2021,7 +2038,10 @@ async fn handle_connection(
         ))
         .max_local_error_reset_streams(Some(
             state.env_config.server_http2_max_local_error_reset_streams,
-        ));
+        ))
+        // RFC 8441: Advertise SETTINGS_ENABLE_CONNECT_PROTOCOL so HTTP/2 clients
+        // can initiate WebSocket connections via Extended CONNECT.
+        .enable_connect_protocol();
 
     // WebSocket requests flow through handle_proxy_request so that authentication
     // and authorization plugins execute before the upgrade handshake.
@@ -2080,7 +2100,11 @@ pub fn try_acquire_websocket_connection_permit(
     }
 }
 
-/// Handle WebSocket requests AFTER authentication and authorization plugins have run
+/// Handle WebSocket requests AFTER authentication and authorization plugins have run.
+///
+/// Supports both HTTP/1.1 Upgrade (101 Switching Protocols) and HTTP/2 Extended CONNECT
+/// (RFC 8441, 200 OK). The `is_h2_websocket` flag selects the response path; the backend
+/// connection, bidirectional relay, and frame-level plugins are identical for both.
 #[allow(clippy::too_many_arguments)]
 async fn handle_websocket_request_authenticated(
     req: Request<Incoming>,
@@ -2094,6 +2118,7 @@ async fn handle_websocket_request_authenticated(
     lb_hash_key: String,
     sticky_cookie_needed: bool,
     start_time: Instant,
+    is_h2_websocket: bool,
 ) -> Result<Response<ProxyBody>, hyper::Error> {
     info!(
         "WebSocket upgrade request authenticated for proxy: {} from: {}",
@@ -2302,11 +2327,12 @@ async fn handle_websocket_request_authenticated(
                             "rejection_phase".to_string(),
                             "websocket_backend_error".to_string(),
                         );
+                        let ws_err_method = if is_h2_websocket { "CONNECT" } else { "GET" };
                         let summary = TransactionSummary {
                             timestamp_received: ctx.timestamp_received.to_rfc3339(),
                             client_ip: ctx.client_ip.clone(),
                             consumer_username: ctx.effective_identity().map(str::to_owned),
-                            http_method: "GET".to_string(),
+                            http_method: ws_err_method.to_string(),
                             request_path: ctx.path.clone(),
                             matched_proxy_id: Some(proxy.id.clone()),
                             matched_proxy_name: proxy.name.clone(),
@@ -2343,9 +2369,11 @@ async fn handle_websocket_request_authenticated(
         }
     };
 
-    // Backend verified — now record 101 and log
+    // Backend verified — record status and log.
+    // HTTP/2 Extended CONNECT returns 200 OK; HTTP/1.1 returns 101 Switching Protocols.
+    let ws_status_code: u16 = if is_h2_websocket { 200 } else { 101 };
     state.request_count.fetch_add(1, Ordering::Relaxed);
-    record_status(&state, 101);
+    record_status(&state, ws_status_code);
 
     // Measure total latency from when the request was received
     let total_ms = (chrono::Utc::now() - ctx.timestamp_received)
@@ -2369,17 +2397,18 @@ async fn handle_websocket_request_authenticated(
         ctx.plugin_http_call_ns.load(Ordering::Relaxed) as f64 / 1_000_000.0;
     let ws_gateway_overhead_ms = (total_ms - ws_plugin_execution_ms).max(0.0);
 
+    let ws_method = if is_h2_websocket { "CONNECT" } else { "GET" };
     let summary = TransactionSummary {
         timestamp_received: ctx.timestamp_received.to_rfc3339(),
         client_ip: ctx.client_ip.clone(),
         consumer_username: ctx.effective_identity().map(str::to_owned),
-        http_method: "GET".to_string(),
+        http_method: ws_method.to_string(),
         request_path: ctx.path.clone(),
         matched_proxy_id: Some(proxy.id.clone()),
         matched_proxy_name: proxy.name.clone(),
         backend_target_url: Some(strip_query_params(&current_backend_url).to_string()),
         backend_resolved_ip: ws_resolved_ip,
-        response_status_code: 101,
+        response_status_code: ws_status_code,
         latency_total_ms: total_ms,
         latency_gateway_processing_ms: total_ms,
         latency_backend_ttfb_ms: 0.0,
@@ -2397,22 +2426,29 @@ async fn handle_websocket_request_authenticated(
 
     crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
 
-    // Create the upgrade response with proper headers
-    let mut ws_resp_builder = Response::builder()
-        .status(StatusCode::SWITCHING_PROTOCOLS)
-        .header("upgrade", "websocket")
-        .header("connection", "upgrade")
-        .header(
-            "sec-websocket-accept",
-            derive_accept_key(
-                parts
-                    .headers
-                    .get("sec-websocket-key")
-                    .and_then(|k| k.to_str().ok())
-                    .unwrap_or("")
-                    .as_bytes(),
-            ),
-        );
+    // Build the upgrade response.
+    // HTTP/2 Extended CONNECT (RFC 8441): 200 OK — the H2 stream becomes the WebSocket
+    // transport. No Upgrade/Connection/Sec-WebSocket-Accept headers (those are HTTP/1.1).
+    // HTTP/1.1: 101 Switching Protocols with standard WebSocket handshake headers.
+    let mut ws_resp_builder = if is_h2_websocket {
+        Response::builder().status(StatusCode::OK)
+    } else {
+        Response::builder()
+            .status(StatusCode::SWITCHING_PROTOCOLS)
+            .header("upgrade", "websocket")
+            .header("connection", "upgrade")
+            .header(
+                "sec-websocket-accept",
+                derive_accept_key(
+                    parts
+                        .headers
+                        .get("sec-websocket-key")
+                        .and_then(|k| k.to_str().ok())
+                        .unwrap_or("")
+                        .as_bytes(),
+                ),
+            )
+    };
 
     // Inject sticky session cookie on WebSocket upgrade responses
     if sticky_cookie_needed
@@ -3164,7 +3200,10 @@ async fn handle_tls_connection(
         ))
         .max_local_error_reset_streams(Some(
             state.env_config.server_http2_max_local_error_reset_streams,
-        ));
+        ))
+        // RFC 8441: Advertise SETTINGS_ENABLE_CONNECT_PROTOCOL so HTTP/2 clients
+        // can initiate WebSocket connections via Extended CONNECT.
+        .enable_connect_protocol();
 
     // WebSocket requests flow through handle_proxy_request so that authentication
     // and authorization plugins execute before the upgrade handshake.
@@ -3861,7 +3900,8 @@ pub async fn handle_proxy_request(
 
     // Detect request protocol early so we fetch only plugins that support it.
     // WebSocket and gRPC are detected from headers; everything else is plain HTTP.
-    let request_protocol = if is_websocket_upgrade(&req)
+    let is_h2_ws = is_h2_websocket_connect(&req);
+    let request_protocol = if (is_websocket_upgrade(&req) || is_h2_ws)
         && matches!(
             proxy.backend_protocol,
             BackendProtocol::Ws | BackendProtocol::Wss
@@ -4319,6 +4359,7 @@ pub async fn handle_proxy_request(
             lb_hash_key.0,
             sticky_cookie_needed,
             start_time,
+            is_h2_ws,
         )
         .await;
     }

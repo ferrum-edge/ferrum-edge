@@ -106,9 +106,9 @@ HTTP/3 responses now support **backpressure-aware streaming** with adaptive coal
 
 Ferrum implements WebSocket proxying as a **first-class feature** in the main proxy handler:
 
-1. **Detection**: Checks `connection: upgrade`, `upgrade: websocket`, `sec-websocket-key`, `sec-websocket-version: 13`
+1. **Detection**: HTTP/1.1 checks `connection: upgrade`, `upgrade: websocket`, `sec-websocket-key`, `sec-websocket-version: 13`. HTTP/2 detects Extended CONNECT with `:protocol = "websocket"` (RFC 8441)
 2. **Security-first**: WebSocket upgrade happens AFTER authentication and authorization plugins run — prevents unauthenticated upgrades
-3. **Backend-first verification**: Connects to the backend WebSocket BEFORE sending 101 to the client — if backend is unreachable, returns 502 instead of a premature 101
+3. **Backend-first verification**: Connects to the backend WebSocket BEFORE sending the upgrade response (101 for HTTP/1.1, 200 OK for HTTP/2) — if backend is unreachable, returns 502 instead of a premature upgrade
 4. **Bidirectional proxy**: Uses tokio-tungstenite for full-duplex message forwarding
 5. **TLS support**: ws:// and wss:// with per-proxy TLS config (custom CA, client certs, cert verification override)
 6. **Size limits**: `max_frame_size` 16MB, `max_message_size` 64MB
@@ -131,7 +131,7 @@ Pingora handles WebSocket via the **custom protocol abstraction**:
 | Aspect | Ferrum | Pingora | Winner |
 |--------|--------|---------|--------|
 | Authentication before upgrade | Yes (plugin pipeline runs first) | User must implement in filter phase | Ferrum |
-| Backend verification before 101 | Yes (prevents premature 101) | Not built-in | Ferrum |
+| Backend verification before upgrade | Yes (prevents premature upgrade response) | Not built-in | Ferrum |
 | Protocol-agnostic upgrades | WebSocket-specific | Any protocol via custom abstraction | Pingora |
 | TLS on WebSocket backend | Full support (wss://) | Via transport layer | Tie |
 | Frame size limits | Configurable (16MB/64MB defaults) | Protocol-dependent | Ferrum |
@@ -142,7 +142,7 @@ Pingora handles WebSocket via the **custom protocol abstraction**:
 
 ### Where Pingora Could Learn from Ferrum
 
-1. **Backend-first verification**: Ferrum's pattern of connecting to the backend before sending 101 to the client prevents a common failure mode where the client gets 101 but the backend is down, leaving the client in a broken upgraded state.
+1. **Backend-first verification**: Ferrum's pattern of connecting to the backend before sending the upgrade response to the client prevents a common failure mode where the client receives an upgrade but the backend is down, leaving the client in a broken upgraded state.
 
 2. **Integrated auth before upgrade**: Ferrum's plugin pipeline running before WebSocket upgrade is a significant security advantage for API gateway use cases.
 

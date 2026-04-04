@@ -1,4 +1,6 @@
-use ferrum_edge::proxy::{build_forwarded_value, check_protocol_headers, is_valid_websocket_key};
+use ferrum_edge::proxy::{
+    build_forwarded_value, check_protocol_headers, is_h2_websocket_connect, is_valid_websocket_key,
+};
 use hyper::header::HeaderValue;
 
 // ============================================================================
@@ -436,6 +438,71 @@ fn invalid_websocket_key_17_bytes() {
     // Actually base64 of 17 bytes = 24 chars. Let me use a real 17-byte value.
     // b"\x00" * 17 = "AAAAAAAAAAAAAAAAAAAAAAA=" (23 chars + padding)
     assert!(!is_valid_websocket_key("AAAAAAAAAAAAAAAAAAAAAAA="));
+}
+
+// ============================================================================
+// is_h2_websocket_connect tests (RFC 8441 Extended CONNECT)
+// ============================================================================
+
+/// Helper to build a test request with the given method, version, and optional Protocol extension.
+fn build_test_request(
+    method: &str,
+    version: hyper::Version,
+    protocol: Option<&'static str>,
+) -> hyper::Request<()> {
+    let mut req = hyper::Request::builder()
+        .method(method)
+        .version(version)
+        .uri("https://example.com/ws")
+        .body(())
+        .unwrap();
+    if let Some(proto) = protocol {
+        req.extensions_mut()
+            .insert(hyper::ext::Protocol::from_static(proto));
+    }
+    req
+}
+
+#[test]
+fn h2_connect_with_websocket_protocol_is_detected() {
+    let req = build_test_request("CONNECT", hyper::Version::HTTP_2, Some("websocket"));
+    assert!(is_h2_websocket_connect(&req));
+}
+
+#[test]
+fn h2_connect_with_websocket_protocol_case_insensitive() {
+    let req = build_test_request("CONNECT", hyper::Version::HTTP_2, Some("WebSocket"));
+    assert!(is_h2_websocket_connect(&req));
+}
+
+#[test]
+fn h2_connect_without_protocol_extension_is_not_websocket() {
+    let req = build_test_request("CONNECT", hyper::Version::HTTP_2, None);
+    assert!(!is_h2_websocket_connect(&req));
+}
+
+#[test]
+fn h2_connect_with_wrong_protocol_is_not_websocket() {
+    let req = build_test_request("CONNECT", hyper::Version::HTTP_2, Some("mqtt"));
+    assert!(!is_h2_websocket_connect(&req));
+}
+
+#[test]
+fn http11_connect_with_websocket_protocol_is_not_detected() {
+    let req = build_test_request("CONNECT", hyper::Version::HTTP_11, Some("websocket"));
+    assert!(!is_h2_websocket_connect(&req));
+}
+
+#[test]
+fn h2_get_with_websocket_protocol_is_not_detected() {
+    let req = build_test_request("GET", hyper::Version::HTTP_2, Some("websocket"));
+    assert!(!is_h2_websocket_connect(&req));
+}
+
+#[test]
+fn h2_post_with_websocket_protocol_is_not_detected() {
+    let req = build_test_request("POST", hyper::Version::HTTP_2, Some("websocket"));
+    assert!(!is_h2_websocket_connect(&req));
 }
 
 // ============================================================================

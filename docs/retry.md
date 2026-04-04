@@ -44,7 +44,7 @@ HTTP-family protocols (HTTP/1.1, HTTP/2, HTTP/3) share the same retry loop in th
 
 gRPC retries handle connection-level failures (connect refused, timeout, DNS, TLS) by buffering the request body and replaying it against alternative upstream targets. Read timeouts and gRPC application-level errors (e.g., UNAVAILABLE status in trailers) are not retried because the request was already sent to the backend.
 
-WebSocket retries handle connection-level failures during the initial backend connection attempt (before the 101 Switching Protocols response). Once the WebSocket connection is established, retries no longer apply — the bidirectional stream is managed by the application layer.
+WebSocket retries handle connection-level failures during the initial backend connection attempt (before the upgrade response — 101 Switching Protocols for HTTP/1.1, 200 OK for HTTP/2 Extended CONNECT). Once the WebSocket connection is established, retries no longer apply — the bidirectional stream is managed by the application layer.
 
 ## Configuration
 

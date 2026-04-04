@@ -449,7 +449,7 @@ Each protocol has its own proxy path, connection pool, and backend dispatch. Und
 | HTTP/2 | hyper server (ALPN) | reqwest or `Http2ConnectionPool` | Sharded H2 senders | Yes (default) |
 | HTTP/3 | quinn/h3 server (`http3/server.rs`) | reqwest (via `connection_pool`) | reqwest auto-negotiates H2 via ALPN | Yes (coalescing buffer) |
 | gRPC | hyper server (content-type detection) | `GrpcConnectionPool` (hyper H2 direct) | Sharded H2 senders | Yes (when no retry/body plugins) |
-| WebSocket | hyper upgrade → tokio-tungstenite | Direct TCP upgrade | N/A (persistent connection) | Frame-by-frame forwarding |
+| WebSocket | hyper upgrade (H1 101) or H2 Extended CONNECT (RFC 8441 200 OK) → tokio-tungstenite | Direct TCP upgrade | N/A (persistent connection) | Frame-by-frame forwarding |
 | TCP | `TcpListener` per port | Direct `TcpStream::connect` | N/A (1:1 connection) | `copy_bidirectional` with idle timeout |
 | UDP | `UdpSocket` per port | Per-session backend socket | N/A (session-keyed) | Datagram forwarding |
 
@@ -505,12 +505,6 @@ These are hard-won findings from profiling. Violating them causes measurable reg
 | Circuit breaker | Full | Full | Full | Full | Full | Connection-phase | Connection-phase |
 | Retries | Full | Full | Full | Connection failures | Connection failures | Connection-phase | Connection-phase |
 | Idle timeout | Pool-level | Pool-level | Pool-level | Pool-level | N/A | Configurable | Configurable |
-
-### Known Protocol Gaps
-
-Only one true gap remains that cannot be solved without upstream library changes:
-
-1. **No HTTP/2 WebSocket (RFC 8441)** — hyper's server doesn't support Extended CONNECT. Would require low-level h2 crate work to handle `:protocol = "websocket"` pseudo-headers.
 
 ### Multi-Protocol Performance Testing
 

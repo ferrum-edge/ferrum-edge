@@ -322,7 +322,7 @@ gRPC errors return HTTP 200 with the error in `grpc-status`/`grpc-message` trail
 }
 ```
 
-WebSocket transaction logging captures the HTTP upgrade handshake only. After the 101 response, the connection is upgraded and no further `TransactionSummary` is emitted. For frame-level observability, use the `ws_frame_logging` plugin.
+WebSocket transaction logging captures the HTTP upgrade handshake only. After the upgrade response (101 Switching Protocols for HTTP/1.1, or 200 OK for HTTP/2 Extended CONNECT per RFC 8441), the connection is upgraded and no further `TransactionSummary` is emitted. For HTTP/2 WebSocket, `http_method` is `"CONNECT"` and `response_status_code` is `200`. For frame-level observability, use the `ws_frame_logging` plugin.
 
 #### Example: WebSocket (Upgrade Failed)
 

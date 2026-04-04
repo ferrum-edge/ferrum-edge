@@ -128,7 +128,7 @@ Not all error classes apply to all protocols equally:
 
 **Notes:**
 - gRPC uses hyper's HTTP/2 client (not reqwest), so its error classification maps from `GrpcProxyError` variants which carry enough context to distinguish timeout, TLS, refused, and protocol errors.
-- WebSocket errors are classified during the backend connection phase (before the 101 upgrade). Once the connection is upgraded, errors occur at the frame level and are not classified (the connection is already established). `ReadWriteTimeout` does not apply because WebSocket connections are long-lived and use connect-phase timeouts only.
+- WebSocket errors are classified during the backend connection phase (before the upgrade response — 101 for HTTP/1.1, 200 OK for HTTP/2 Extended CONNECT). Once the connection is upgraded, errors occur at the frame level and are not classified (the connection is already established). `ReadWriteTimeout` does not apply because WebSocket connections are long-lived and use connect-phase timeouts only.
 - TCP/UDP streams don't have request/response semantics, so body size limits and client disconnect don't apply. Their primary error classes are connection-level: timeout, refused, reset, DNS, and TLS.
 
 ## Implementation Details
