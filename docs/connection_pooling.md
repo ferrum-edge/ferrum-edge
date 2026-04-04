@@ -149,11 +149,11 @@ By default, Ferrum Edge **pre-establishes backend connections** at startup after
 
 1. After DNS warmup resolves all backend hostnames, the gateway iterates every configured proxy.
 2. For each HTTP-family proxy (HTTP, HTTPS, WebSocket, gRPC, H2, H3), it creates connections in the appropriate pool:
-   - **Reqwest pool** (HTTP/1.1, HTTPS, WS, WSS): Creates and caches the `reqwest::Client` with full TLS configuration (cert parsing, root store, mTLS identity).
+   - **Reqwest pool** (HTTP/1.1, HTTPS, WS, WSS): Creates the `reqwest::Client` with full TLS configuration, then sends a lightweight HEAD request to each backend host:port to force TCP/TLS connection establishment. The HTTP response status is ignored — only the transport connection matters.
    - **gRPC pool** (Grpc/Grpcs): Establishes TCP + TLS + HTTP/2 connections (shard 0).
    - **HTTP/2 direct pool** (HTTPS with `enable_http2`): Establishes TCP + TLS + HTTP/2 connections (shard 0).
    - **HTTP/3 pool**: Establishes QUIC + TLS 1.3 connections (shard 0).
-3. For upstream-backed proxies, every target in the upstream is warmed individually for pools that key by `(host, port)` (gRPC, HTTP/2 direct, HTTP/3). The reqwest pool keys by `upstream_id`, so one `get_client()` call covers all targets.
+3. For upstream-backed proxies, every target in the upstream is warmed individually across all pool types. reqwest internally pools connections by URL host:port, so each target gets its own warmed TCP/TLS connection.
 4. **TCP/UDP stream proxies are skipped** — they create per-session connections with no persistent pool to warm.
 
 ### Configuration

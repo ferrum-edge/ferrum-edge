@@ -883,19 +883,12 @@ impl ProxyState {
                 | BackendProtocol::Https
                 | BackendProtocol::Ws
                 | BackendProtocol::Wss => {
-                    let pool_key = self.connection_pool.pool_key_for_warmup(proxy);
-                    if seen_reqwest.insert(pool_key) {
-                        let pool = self.connection_pool.clone();
-                        let proxy = proxy.clone();
-                        tasks.push(Box::pin(async move {
-                            let desc =
-                                format!("reqwest {}:{}", proxy.backend_host, proxy.backend_port);
-                            pool.get_client(&proxy)
-                                .await
-                                .map(|_| desc.clone())
-                                .map_err(|e| format!("{}: {}", desc, e))
-                        }));
-                    }
+                    self.collect_reqwest_warmup_tasks(
+                        proxy,
+                        &upstream_map,
+                        &mut seen_reqwest,
+                        &mut tasks,
+                    );
 
                     // If HTTPS with enable_http2, also warm the direct H2 pool
                     if matches!(proxy.backend_protocol, BackendProtocol::Https) {
@@ -977,6 +970,86 @@ impl ProxyState {
             );
         } else {
             info!("Pool warmup complete: all {} targets ok", total);
+        }
+    }
+
+    /// Collect reqwest pool warmup tasks for a proxy.
+    ///
+    /// Creates the `reqwest::Client` (TLS config, cert parsing) and then sends
+    /// a lightweight HEAD request to each unique backend host:port to force
+    /// TCP/TLS connection establishment. reqwest caches connections internally
+    /// by host:port, so subsequent requests reuse the warmed connection.
+    ///
+    /// For upstream-backed proxies, every target is warmed individually because
+    /// reqwest pools connections per URL host:port.
+    fn collect_reqwest_warmup_tasks(
+        &self,
+        proxy: &Proxy,
+        upstream_map: &HashMap<&str, &crate::config::types::Upstream>,
+        seen: &mut std::collections::HashSet<String>,
+        tasks: &mut Vec<WarmupTask>,
+    ) {
+        let scheme = match proxy.backend_protocol {
+            BackendProtocol::Http | BackendProtocol::Ws => "http",
+            _ => "https",
+        };
+
+        // Collect (host, port) targets to warm
+        let mut targets: Vec<(String, u16)> = Vec::new();
+        if let Some(ref upstream_id) = proxy.upstream_id
+            && let Some(upstream) = upstream_map.get(upstream_id.as_str())
+        {
+            for target in &upstream.targets {
+                targets.push((target.host.clone(), target.port));
+            }
+        }
+        if targets.is_empty() {
+            targets.push((proxy.backend_host.clone(), proxy.backend_port));
+        }
+
+        // First, ensure the reqwest::Client is created and cached (TLS config,
+        // cert parsing, root store). This is shared across all targets.
+        let pool_key = self.connection_pool.pool_key_for_warmup(proxy);
+        let client_created = seen.contains(&pool_key);
+        if !client_created {
+            seen.insert(pool_key);
+        }
+
+        for (host, port) in targets {
+            let dedup_key = format!("reqwest_conn|{}|{}|{}", scheme, host, port);
+            if !seen.insert(dedup_key) {
+                continue;
+            }
+
+            let pool = self.connection_pool.clone();
+            let proxy = proxy.clone();
+            let scheme = scheme.to_string();
+            tasks.push(Box::pin(async move {
+                let desc = format!("reqwest {}:{}", host, port);
+                let client = pool
+                    .get_client(&proxy)
+                    .await
+                    .map_err(|e| format!("{}: {}", desc, e))?;
+
+                // Send a HEAD request to force TCP/TLS connection establishment.
+                // The backend will likely return an error (404, 503, etc.) but
+                // the underlying TCP/TLS connection is kept in reqwest's internal
+                // pool for reuse. We ignore the HTTP response status entirely.
+                let url = format!("{}://{}:{}/", scheme, host, port);
+                let result = client
+                    .head(&url)
+                    .timeout(Duration::from_secs(5))
+                    .send()
+                    .await;
+
+                match result {
+                    Ok(_) => Ok(desc),
+                    Err(e) if e.is_connect() || e.is_timeout() => Err(format!("{}: {}", desc, e)),
+                    // Non-connect errors (4xx, 5xx, etc.) are fine — the TCP/TLS
+                    // connection was established and is now pooled.
+                    Err(_) => Ok(desc),
+                }
+            }));
         }
     }
 
