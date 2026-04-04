@@ -29,6 +29,7 @@
 //! | `aws_access_key_id` | `AWS_ACCESS_KEY_ID` |
 //! | `aws_secret_access_key` | `AWS_SECRET_ACCESS_KEY` |
 //! | `aws_function_name` | `AWS_LAMBDA_FUNCTION_NAME` |
+//! | `aws_session_token` | `AWS_SESSION_TOKEN` |
 //! | `azure_function_key` | `AZURE_FUNCTIONS_KEY` |
 //! | `gcp_bearer_token` | `GCP_CLOUD_FUNCTIONS_BEARER_TOKEN` |
 //!
@@ -102,6 +103,7 @@ struct AwsLambdaConfig {
     region: String,
     access_key_id: String,
     secret_access_key: String,
+    session_token: Option<String>,
     function_name: String,
     qualifier: Option<String>,
 }
@@ -221,6 +223,9 @@ impl ServerlessFunction {
                                 .to_string()
                         })?;
 
+                let session_token =
+                    config_or_env(&config["aws_session_token"], "AWS_SESSION_TOKEN");
+
                 let qualifier = config["aws_qualifier"]
                     .as_str()
                     .filter(|s| !s.is_empty())
@@ -258,6 +263,7 @@ impl ServerlessFunction {
                     region,
                     access_key_id,
                     secret_access_key,
+                    session_token,
                     function_name,
                     qualifier,
                 };
@@ -482,6 +488,18 @@ impl ServerlessFunction {
             ));
         }
 
+        // AWS Lambda returns HTTP 200 even on function errors, signaling via
+        // X-Amz-Function-Error header. Treat this as an invocation failure.
+        if self.provider == Provider::AwsLambda
+            && let Some(error_type) = response_headers.get("x-amz-function-error")
+        {
+            return Err(format!(
+                "serverless_function: Lambda function error ({}): {}",
+                error_type,
+                String::from_utf8_lossy(&body),
+            ));
+        }
+
         Ok((status, response_headers, body.to_vec()))
     }
 }
@@ -602,12 +620,28 @@ fn sign_aws_request(
 
     let payload_hash = sha256_hex(payload);
 
-    // Canonical headers (must be sorted)
-    let canonical_headers = format!(
-        "content-type:application/json\nhost:{}\nx-amz-content-sha256:{}\nx-amz-date:{}\n",
-        host, payload_hash, amz_date
-    );
-    let signed_headers = "content-type;host;x-amz-content-sha256;x-amz-date";
+    // Canonical headers (must be sorted alphabetically by header name).
+    // When a session token is present, x-amz-security-token is included.
+    let (canonical_headers, signed_headers) = if aws.session_token.is_some() {
+        (
+            format!(
+                "content-type:application/json\nhost:{}\nx-amz-content-sha256:{}\nx-amz-date:{}\nx-amz-security-token:{}\n",
+                host,
+                payload_hash,
+                amz_date,
+                aws.session_token.as_deref().unwrap_or_default()
+            ),
+            "content-type;host;x-amz-content-sha256;x-amz-date;x-amz-security-token",
+        )
+    } else {
+        (
+            format!(
+                "content-type:application/json\nhost:{}\nx-amz-content-sha256:{}\nx-amz-date:{}\n",
+                host, payload_hash, amz_date
+            ),
+            "content-type;host;x-amz-content-sha256;x-amz-date",
+        )
+    };
 
     let canonical_request = format!(
         "POST\n{}\n{}\n{}\n{}\n{}",
@@ -630,11 +664,17 @@ fn sign_aws_request(
         aws.access_key_id, credential_scope, signed_headers, signature
     );
 
-    vec![
+    let mut headers = vec![
         ("authorization".to_string(), authorization),
         ("x-amz-date".to_string(), amz_date),
         ("x-amz-content-sha256".to_string(), payload_hash),
-    ]
+    ];
+
+    if let Some(ref token) = aws.session_token {
+        headers.push(("x-amz-security-token".to_string(), token.clone()));
+    }
+
+    headers
 }
 
 /// Test helpers — exposed for unit tests.
@@ -665,6 +705,10 @@ pub mod test_helpers {
                 .as_str()
                 .unwrap_or_default()
                 .to_string(),
+            session_token: aws_config["session_token"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .map(String::from),
             function_name: aws_config["function_name"]
                 .as_str()
                 .unwrap_or_default()
@@ -718,6 +762,27 @@ impl Plugin for ServerlessFunction {
         ctx: &mut RequestContext,
         headers: &mut HashMap<String, String>,
     ) -> PluginResult {
+        // Terminate mode is incompatible with gRPC: the gateway normalizes
+        // RejectBinary into trailers-only gRPC errors, dropping the body.
+        // Fail clearly rather than silently losing the function response.
+        if self.mode == InvocationMode::Terminate {
+            let is_grpc = headers
+                .get("content-type")
+                .or_else(|| ctx.headers.get("content-type"))
+                .is_some_and(|ct| ct.starts_with("application/grpc"));
+            if is_grpc {
+                warn!(
+                    "serverless_function: terminate mode is not supported for gRPC requests — \
+                     the gateway normalizes plugin rejects into trailers-only gRPC errors"
+                );
+                return PluginResult::Reject {
+                    status_code: 500,
+                    body: r#"{"error":"serverless_function terminate mode is not supported for gRPC"}"#.to_string(),
+                    headers: HashMap::new(),
+                };
+            }
+        }
+
         let payload = self.build_invocation_payload(ctx, headers);
 
         let (status, response_headers, body) = match self.invoke(&payload, ctx).await {

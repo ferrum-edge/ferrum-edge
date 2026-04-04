@@ -844,6 +844,7 @@ Invokes AWS Lambda, Azure Functions, or Google Cloud Functions as middleware in 
 | `aws_access_key_id` | String | — | IAM access key. Falls back to `AWS_ACCESS_KEY_ID` env var |
 | `aws_secret_access_key` | String | — | IAM secret key. Falls back to `AWS_SECRET_ACCESS_KEY` env var |
 | `aws_function_name` | String | — | Lambda function name or ARN. Falls back to `AWS_LAMBDA_FUNCTION_NAME` env var |
+| `aws_session_token` | String | — | STS session token. Falls back to `AWS_SESSION_TOKEN` env var |
 | `aws_qualifier` | String | — | Optional version/alias qualifier (e.g., `$LATEST`, `prod`) |
 
 **Azure Functions** — calls the HTTP trigger URL:

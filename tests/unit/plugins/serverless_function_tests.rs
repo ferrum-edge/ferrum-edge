@@ -465,6 +465,132 @@ async fn test_before_proxy_error_continue_mode() {
 }
 
 // ---------------------------------------------------------------------------
+// Terminate mode + gRPC incompatibility
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_terminate_mode_rejects_grpc_requests() {
+    let plugin = ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": "https://example.com/func",
+            "mode": "terminate"
+        }),
+        default_client(),
+    )
+    .unwrap();
+
+    let mut ctx = create_test_context();
+    ctx.headers
+        .insert("content-type".to_string(), "application/grpc".to_string());
+    let mut headers = HashMap::new();
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    match result {
+        PluginResult::Reject {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 500);
+            assert!(body.contains("not supported for gRPC"));
+        }
+        other => panic!("Expected Reject for gRPC terminate, got {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn test_pre_proxy_mode_allows_grpc_requests() {
+    // pre_proxy mode should NOT reject gRPC — only terminate does
+    let plugin = ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": "http://127.0.0.1:1/unreachable",
+            "mode": "pre_proxy",
+            "on_error": "continue",
+            "timeout_ms": 500
+        }),
+        default_client(),
+    )
+    .unwrap();
+
+    let mut ctx = create_test_context();
+    ctx.headers
+        .insert("content-type".to_string(), "application/grpc".to_string());
+    let mut headers = HashMap::new();
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    // Should NOT get the gRPC rejection — should proceed to invoke (and fail with continue)
+    match result {
+        PluginResult::Continue => {
+            assert!(ctx.metadata.contains_key("serverless_function_error"));
+        }
+        other => panic!("Expected Continue (not gRPC rejection), got {:?}", other),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SigV4 session token support
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_aws_sigv4_includes_security_token_when_present() {
+    let aws_config = json!({
+        "region": "us-east-1",
+        "access_key_id": "ASIAIOSFODNN7EXAMPLE",
+        "secret_access_key": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+        "session_token": "FwoGZXIvYXdzEBYaDH/test-session-token",
+        "function_name": "my-function"
+    });
+    let url = "https://lambda.us-east-1.amazonaws.com/2015-03-31/functions/my-function/invocations";
+    let now = chrono::DateTime::parse_from_rfc3339("2024-01-15T12:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+
+    let headers = ferrum_edge::plugins::serverless_function::test_helpers::sign_aws_request_test(
+        &aws_config,
+        url,
+        b"{}",
+        &now,
+    );
+
+    // Should produce 4 headers (including x-amz-security-token)
+    assert_eq!(headers.len(), 4);
+
+    let token_header = headers
+        .iter()
+        .find(|(k, _)| k == "x-amz-security-token")
+        .expect("x-amz-security-token header missing");
+    assert_eq!(token_header.1, "FwoGZXIvYXdzEBYaDH/test-session-token");
+
+    // Authorization header should include x-amz-security-token in SignedHeaders
+    let auth_header = headers.iter().find(|(k, _)| k == "authorization").unwrap();
+    assert!(auth_header.1.contains("x-amz-security-token"));
+}
+
+#[test]
+fn test_aws_sigv4_omits_security_token_when_absent() {
+    let aws_config = create_test_aws_config();
+    let url = "https://lambda.us-east-1.amazonaws.com/2015-03-31/functions/my-function/invocations";
+    let now = chrono::DateTime::parse_from_rfc3339("2024-01-15T12:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+
+    let headers = ferrum_edge::plugins::serverless_function::test_helpers::sign_aws_request_test(
+        &aws_config,
+        url,
+        b"{}",
+        &now,
+    );
+
+    // Should produce 3 headers (no x-amz-security-token)
+    assert_eq!(headers.len(), 3);
+    assert!(headers.iter().all(|(k, _)| k != "x-amz-security-token"));
+
+    // Authorization header should NOT include x-amz-security-token in SignedHeaders
+    let auth_header = headers.iter().find(|(k, _)| k == "authorization").unwrap();
+    assert!(!auth_header.1.contains("x-amz-security-token"));
+}
+
+// ---------------------------------------------------------------------------
 // forward_headers config
 // ---------------------------------------------------------------------------
 
