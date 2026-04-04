@@ -1,5 +1,6 @@
 use ferrum_edge::plugins::{
-    Plugin, ProxyProtocol, UDP_ONLY_PROTOCOLS, UdpDatagramContext, UdpDatagramVerdict,
+    Plugin, ProxyProtocol, UDP_ONLY_PROTOCOLS, UdpDatagramContext, UdpDatagramDirection,
+    UdpDatagramVerdict,
 };
 use serde_json::json;
 
@@ -16,6 +17,7 @@ fn make_ctx(client_ip: &str, datagram_size: usize) -> UdpDatagramContext {
         proxy_name: Some("test-proxy".to_string()),
         listen_port: 5353,
         datagram_size,
+        direction: UdpDatagramDirection::ClientToBackend,
     }
 }
 

@@ -134,10 +134,19 @@ pub const TCP_ONLY_PROTOCOLS: &[ProxyProtocol] = &[ProxyProtocol::Tcp];
 /// UDP-only (datagram-level plugins that do not apply to TCP or HTTP).
 pub const UDP_ONLY_PROTOCOLS: &[ProxyProtocol] = &[ProxyProtocol::Udp];
 
+/// Direction of a UDP datagram being proxied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UdpDatagramDirection {
+    ClientToBackend,
+    BackendToClient,
+}
+
 /// Context for per-datagram UDP plugin hooks.
 ///
-/// Passed to `on_udp_datagram` for every client→backend datagram when at least
-/// one plugin on the proxy opts in via `requires_udp_datagram_hooks()`.
+/// Passed to `on_udp_datagram` for every datagram when at least one plugin
+/// on the proxy opts in via `requires_udp_datagram_hooks()`. Fired in both
+/// directions: client→backend (before forwarding) and backend→client (before
+/// relaying the response to the client).
 #[allow(dead_code)]
 pub struct UdpDatagramContext {
     pub client_ip: String,
@@ -145,6 +154,7 @@ pub struct UdpDatagramContext {
     pub proxy_name: Option<String>,
     pub listen_port: u16,
     pub datagram_size: usize,
+    pub direction: UdpDatagramDirection,
 }
 
 /// Verdict from a per-datagram UDP plugin hook.
@@ -153,7 +163,7 @@ pub struct UdpDatagramContext {
 /// are silently dropped when rate limited — standard UDP behavior.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UdpDatagramVerdict {
-    /// Forward the datagram to the backend.
+    /// Forward the datagram to its destination.
     Forward,
     /// Silently drop the datagram (standard UDP flood mitigation).
     Drop,
@@ -758,11 +768,12 @@ pub trait Plugin: Send + Sync {
         false
     }
 
-    /// Called for each UDP datagram before it is forwarded to the backend.
+    /// Called for each UDP datagram in both directions (client→backend and backend→client).
     ///
     /// Only invoked when at least one plugin on the proxy opts in via
     /// `requires_udp_datagram_hooks()`. Return `UdpDatagramVerdict::Drop` to
     /// silently discard the datagram (standard UDP flood mitigation).
+    /// Use `ctx.direction` to distinguish client→backend from backend→client.
     async fn on_udp_datagram(&self, _ctx: &UdpDatagramContext) -> UdpDatagramVerdict {
         UdpDatagramVerdict::Forward
     }

@@ -20,5 +20,7 @@ pub mod migrations;
 pub mod pool_config;
 pub mod types;
 
-pub use env_config::{EnvConfig, OperatingMode};
+#[allow(unused_imports)] // Used by unit tests
+pub use env_config::is_private_ip;
+pub use env_config::{BackendAllowIps, EnvConfig, OperatingMode, check_backend_ip_allowed};
 pub use pool_config::PoolConfig;

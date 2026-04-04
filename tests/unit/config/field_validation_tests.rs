@@ -57,6 +57,8 @@ fn make_proxy(id: &str, listen_path: &str) -> Proxy {
         udp_idle_timeout_seconds: 60,
         tcp_idle_timeout_seconds: Some(300),
         allowed_methods: None,
+        allowed_ws_origins: vec![],
+        udp_max_response_amplification_factor: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }
@@ -1095,6 +1097,47 @@ fn test_proxy_allowed_methods_valid() {
     assert!(proxy.validate_fields().is_ok());
 }
 
+// ---- Allowed WebSocket origins validation tests ----
+
+#[test]
+fn test_proxy_allowed_ws_origins_empty_is_valid() {
+    let mut proxy = make_proxy("test", "/api");
+    proxy.allowed_ws_origins = vec![];
+    assert!(proxy.validate_fields().is_ok());
+}
+
+#[test]
+fn test_proxy_allowed_ws_origins_valid_entries() {
+    let mut proxy = make_proxy("test", "/api");
+    proxy.allowed_ws_origins = vec![
+        "https://example.com".into(),
+        "https://app.example.com".into(),
+    ];
+    assert!(proxy.validate_fields().is_ok());
+}
+
+#[test]
+fn test_proxy_allowed_ws_origins_rejects_empty_string() {
+    let mut proxy = make_proxy("test", "/api");
+    proxy.allowed_ws_origins = vec!["https://example.com".into(), "".into()];
+    let errs = proxy.validate_fields().unwrap_err();
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("allowed_ws_origins") && e.contains("must not be empty"))
+    );
+}
+
+#[test]
+fn test_proxy_allowed_ws_origins_rejects_whitespace_only() {
+    let mut proxy = make_proxy("test", "/api");
+    proxy.allowed_ws_origins = vec!["   ".into()];
+    let errs = proxy.validate_fields().unwrap_err();
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("allowed_ws_origins") && e.contains("must not be empty"))
+    );
+}
+
 // ---- Retryable methods validation tests ----
 
 #[test]
@@ -1363,4 +1406,164 @@ fn test_upstream_hash_on_cookie_config_valid() {
         same_site: Some("Lax".to_string()),
     });
     assert!(upstream.validate_fields().is_ok());
+}
+
+// ---- UDP amplification factor validation tests ----
+
+#[test]
+fn test_proxy_udp_amplification_factor_valid() {
+    let mut proxy = make_proxy("test", "/api");
+    proxy.udp_max_response_amplification_factor = Some(10.0);
+    assert!(proxy.validate_fields().is_ok());
+}
+
+#[test]
+fn test_proxy_udp_amplification_factor_none_is_valid() {
+    let mut proxy = make_proxy("test", "/api");
+    proxy.udp_max_response_amplification_factor = None;
+    assert!(proxy.validate_fields().is_ok());
+}
+
+#[test]
+fn test_proxy_udp_amplification_factor_zero_rejected() {
+    let mut proxy = make_proxy("test", "/api");
+    proxy.udp_max_response_amplification_factor = Some(0.0);
+    let errs = proxy.validate_fields().unwrap_err();
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("udp_max_response_amplification_factor"))
+    );
+}
+
+#[test]
+fn test_proxy_udp_amplification_factor_negative_rejected() {
+    let mut proxy = make_proxy("test", "/api");
+    proxy.udp_max_response_amplification_factor = Some(-1.0);
+    let errs = proxy.validate_fields().unwrap_err();
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("udp_max_response_amplification_factor"))
+    );
+}
+
+// ---- SSRF: Backend IP policy validation tests ----
+
+use ferrum_edge::config::BackendAllowIps;
+
+#[test]
+fn test_validate_backend_ip_policy_public_denies_private_proxy() {
+    let proxy = make_proxy("test", "/api");
+    let config = GatewayConfig {
+        proxies: vec![Proxy {
+            backend_host: "10.0.0.1".to_string(),
+            ..proxy
+        }],
+        ..Default::default()
+    };
+    let result = config.validate_all_fields_with_ip_policy(30, &BackendAllowIps::Public);
+    assert!(result.is_err());
+    let errs = result.unwrap_err();
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("denied by FERRUM_BACKEND_ALLOW_IPS"))
+    );
+}
+
+#[test]
+fn test_validate_backend_ip_policy_public_allows_public_proxy() {
+    let proxy = make_proxy("test", "/api");
+    let config = GatewayConfig {
+        proxies: vec![Proxy {
+            backend_host: "8.8.8.8".to_string(),
+            ..proxy
+        }],
+        ..Default::default()
+    };
+    assert!(
+        config
+            .validate_all_fields_with_ip_policy(30, &BackendAllowIps::Public)
+            .is_ok()
+    );
+}
+
+#[test]
+fn test_validate_backend_ip_policy_private_denies_public_proxy() {
+    let proxy = make_proxy("test", "/api");
+    let config = GatewayConfig {
+        proxies: vec![Proxy {
+            backend_host: "8.8.8.8".to_string(),
+            ..proxy
+        }],
+        ..Default::default()
+    };
+    let result = config.validate_all_fields_with_ip_policy(30, &BackendAllowIps::Private);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_validate_backend_ip_policy_both_allows_everything() {
+    let proxy = make_proxy("test", "/api");
+    let config = GatewayConfig {
+        proxies: vec![Proxy {
+            backend_host: "169.254.169.254".to_string(),
+            ..proxy
+        }],
+        ..Default::default()
+    };
+    assert!(
+        config
+            .validate_all_fields_with_ip_policy(30, &BackendAllowIps::Both)
+            .is_ok()
+    );
+}
+
+#[test]
+fn test_validate_backend_ip_policy_hostname_skipped() {
+    // Hostnames can't be checked at config time — only literal IPs are validated
+    let proxy = make_proxy("test", "/api");
+    let config = GatewayConfig {
+        proxies: vec![Proxy {
+            backend_host: "internal.evil.com".to_string(),
+            ..proxy
+        }],
+        ..Default::default()
+    };
+    assert!(
+        config
+            .validate_all_fields_with_ip_policy(30, &BackendAllowIps::Public)
+            .is_ok()
+    );
+}
+
+#[test]
+fn test_validate_backend_ip_policy_upstream_target_denied() {
+    let upstream = Upstream {
+        id: "up1".to_string(),
+        name: Some("test-upstream".to_string()),
+        targets: vec![UpstreamTarget {
+            host: "169.254.169.254".to_string(),
+            port: 80,
+            weight: 100,
+            path: None,
+            tags: HashMap::new(),
+        }],
+        algorithm: LoadBalancerAlgorithm::RoundRobin,
+        hash_on: None,
+        hash_on_cookie_config: None,
+        health_checks: None,
+        service_discovery: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+    let config = GatewayConfig {
+        upstreams: vec![upstream],
+        ..Default::default()
+    };
+    let result = config.validate_all_fields_with_ip_policy(30, &BackendAllowIps::Public);
+    assert!(result.is_err());
+    let errs = result.unwrap_err();
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("Upstream") && e.contains("169.254.169.254"))
+    );
 }

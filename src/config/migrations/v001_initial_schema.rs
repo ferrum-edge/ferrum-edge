@@ -143,6 +143,8 @@ impl V001InitialSchema {
                 udp_idle_timeout_seconds INTEGER NOT NULL DEFAULT 60,
                 tcp_idle_timeout_seconds INTEGER,
                 allowed_methods TEXT,
+                allowed_ws_origins TEXT,
+                udp_max_response_amplification_factor REAL,
                 created_at VARCHAR(50) NOT NULL,
                 updated_at VARCHAR(50) NOT NULL,
                 CONSTRAINT fk_proxies_upstream FOREIGN KEY (upstream_id) REFERENCES upstreams(id) ON DELETE RESTRICT
@@ -193,6 +195,8 @@ impl V001InitialSchema {
                 udp_idle_timeout_seconds INTEGER NOT NULL DEFAULT 60,
                 tcp_idle_timeout_seconds INTEGER,
                 allowed_methods TEXT,
+                allowed_ws_origins TEXT,
+                udp_max_response_amplification_factor REAL,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             )

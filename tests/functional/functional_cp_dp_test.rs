@@ -91,6 +91,7 @@ fn create_test_env_config() -> EnvConfig {
         dns_stale_ttl: 3600,
         dns_error_ttl: 1,
         dns_warmup_concurrency: 500,
+        backend_allow_ips: ferrum_edge::config::BackendAllowIps::Both,
         tls_ca_bundle_path: None,
         backend_tls_client_cert_path: None,
         backend_tls_client_key_path: None,
@@ -119,6 +120,7 @@ fn create_test_env_config() -> EnvConfig {
         tls_curves: None,
         tls_session_cache_size: 4096,
         stream_proxy_bind_address: "0.0.0.0".into(),
+        admin_allowed_cidrs: String::new(),
         trusted_proxies: String::new(),
         dns_cache_max_size: 10_000,
         dns_slow_threshold_ms: None,
@@ -185,6 +187,8 @@ fn create_test_proxy(id: &str, listen_path: &str, backend_port: u16) -> Proxy {
         udp_idle_timeout_seconds: 60,
         tcp_idle_timeout_seconds: Some(300),
         allowed_methods: None,
+        allowed_ws_origins: vec![],
+        udp_max_response_amplification_factor: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }
@@ -220,6 +224,7 @@ fn create_proxy_state() -> ProxyState {
         error_ttl_seconds: 1,
         max_cache_size: 10_000,
         warmup_concurrency: 500,
+        backend_allow_ips: ferrum_edge::config::BackendAllowIps::Both,
         slow_threshold_ms: None,
     });
     let env_config = create_test_env_config();

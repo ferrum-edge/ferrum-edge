@@ -193,7 +193,7 @@ src/
 | Type | Description | Key Fields |
 |------|-------------|------------|
 | `GatewayConfig` | Top-level config container | proxies, consumers, upstreams, plugins |
-| `Proxy` | A route + backend target | listen_path, hosts, backend_host/port/protocol, plugins, TLS/DNS/timeout overrides, pool_*, circuit_breaker, retry, response_body_mode |
+| `Proxy` | A route + backend target | listen_path, hosts, backend_host/port/protocol, plugins, TLS/DNS/timeout overrides, pool_*, circuit_breaker, retry, response_body_mode, allowed_ws_origins, udp_max_response_amplification_factor |
 | `Consumer` | An authenticated client identity | username, custom_id, credentials (HashMap), tags |
 | `Upstream` | A load-balanced target group | targets (host/port/weight/path), algorithm, health_checks |
 | `PluginConfig` | Plugin instance configuration | name, enabled, config (serde_json::Value) |
@@ -216,20 +216,37 @@ The gateway validates protocol-level constraints before routing to block smuggli
 
 | Check | HTTP/1.x | HTTP/2 | HTTP/3 | Response |
 |-------|----------|--------|--------|----------|
+| **HTTP/1.0 + TE** (no chunked in 1.0) | Reject 400 | N/A | N/A | `{"error":"HTTP/1.0 does not support Transfer-Encoding"}` |
 | **CL + TE conflict** (request smuggling) | Reject 400 | N/A (no TE) | N/A (no TE) | `{"error":"Request contains both Content-Length and Transfer-Encoding headers"}` |
 | **Multiple Content-Length** (mismatched values) | Reject 400 | Reject 400 | Reject 400 | `{"error":"Multiple Content-Length headers with conflicting values"}` |
 | **Multiple Host headers** | Reject 400 | N/A (:authority) | N/A (:authority) | `{"error":"Request contains multiple Host headers"}` |
 | **TE header value** | Any allowed | Only "trailers" | N/A | `{"error":"HTTP/2 TE header must be 'trailers' or absent"}` |
+| **Content-Length non-numeric** | Reject 400 | Reject 400 | Reject 400 | `{"error":"Content-Length header contains invalid non-numeric value"}` |
+| **TRACE method** | Reject 405 | Reject 405 | Reject 405 | `{"error":"TRACE method is not allowed"}` |
 | **gRPC non-POST method** | Reject (gRPC error) | Reject (gRPC error) | N/A | gRPC trailers-only error |
 | **WebSocket Sec-WebSocket-Key** | Format validated | N/A | N/A | Treated as non-WS request |
+| **WebSocket Origin** | Per-proxy | N/A | N/A | Reject 403 when `allowed_ws_origins` is set and Origin doesn't match |
 
 **CL + TE conflict** is the most critical check — it prevents HTTP request smuggling attacks that exploit parsing disagreements between the proxy and backend about message boundaries (RFC 9112 §6.1).
 
+**Content-Length non-numeric validation**: RFC 9110 §8.6 specifies Content-Length MUST be a non-negative integer (ASCII digits only). Values like `-1`, `1.5`, `0x10`, or `abc` are rejected before routing. This check is integrated into the existing CL conflict detection loop in `check_protocol_headers()`.
+
+**TRACE method blocking**: TRACE is blocked globally before routing to prevent Cross-Site Tracing (XST) attacks, where TRACE echoes request headers (including cookies and auth tokens) in the response body.
+
+**WebSocket Origin validation**: When a proxy's `allowed_ws_origins` is non-empty, WebSocket upgrade requests must include an `Origin` header matching one of the allowed values (case-insensitive). This protects against Cross-Site WebSocket Hijacking (CSWSH) per RFC 6455 §10.2. The check runs after authentication/authorization plugins, before the upgrade handshake.
+
 **WebSocket Sec-WebSocket-Key validation**: RFC 6455 §4.1 requires the key to be a base64-encoded 16-byte nonce. The `is_valid_websocket_key()` helper validates this; requests with malformed keys are not treated as WebSocket upgrades, falling through to regular HTTP handling.
+
+**HTTP/1.1 Transfer-Encoding values** (intentionally not validated): The gateway accepts any TE value on HTTP/1.1 (e.g., `gzip`, `deflate`, `trailers`) because RFC 9110 §10.1.4 permits them. TE is stripped as a hop-by-hop header before forwarding to backends, so unknown values cannot cause parsing disagreements. The real danger (CL+TE smuggling) is caught by the conflict check. HTTP/1.0 + TE is rejected since HTTP/1.0 has no chunked encoding.
+
+**H2.CL downgrade smuggling** (verified safe): When proxying HTTP/2 requests to HTTP/1.1 backends, the gateway strips `Content-Length` as a hop-by-hop header at all proxy dispatch paths (reqwest first attempt, retries, and HTTP/3). Reqwest then recalculates `Content-Length` from the actual body bytes via `req_builder.body()`. An attacker cannot smuggle a mismatched CL from HTTP/2 to HTTP/1.1.
+
+**TE.TE obfuscation** (verified safe): Transfer-Encoding obfuscation variants (e.g., `"Chunked"`, `" chunked"`, `"chunked, identity"`) cannot reach backends because: (1) HTTP/1.0 rejects all TE outright, (2) HTTP/1.1 strips TE as hop-by-hop before forwarding, (3) HTTP/2 validates TE must be exactly `"trailers"` (case-insensitive with whitespace trim), (4) hyper normalizes header names to lowercase preventing name-case obfuscation. Tested with 10+ TE obfuscation variants in `protocol_validation_tests.rs`.
 
 **What hyper/h2/quinn already validate** (no additional checks needed):
 - HTTP method token syntax (RFC 7230)
 - Header name/value syntax
+- Header name normalization to lowercase (prevents header name case obfuscation)
 - HTTP/2 pseudo-header presence and ordering (`:method`, `:path`, `:scheme`, `:authority`)
 - HTTP/2 frame format, stream state machine, flow control
 - HTTP/2 stream abuse detection (`max_pending_accept_reset_streams`, `max_local_error_reset_streams`)
@@ -276,7 +293,7 @@ Plugins execute in priority order (lower number = runs first). The lifecycle pha
 9. `log` — Stdout logging (9000), HTTP logging (9100), transaction debugger (9200), Prometheus (9300), OTel tracing (25)
 10. `on_ws_frame` — WebSocket frame-level hooks: ws_message_size_limiting (2810), ws_rate_limiting (2910), ws_frame_logging (9050)
 11. `on_stream_connect` / `on_stream_disconnect` — TCP/UDP stream lifecycle hooks for auth (mTLS), authz (ACL), throttling (tcp_connection_throttle), rate limiting, logging, metrics, and tracing plugins. For TCP+TLS proxies, `on_stream_connect` runs after the frontend TLS handshake so client cert data is available. For UDP+DTLS proxies, `on_stream_connect` runs after the DTLS handshake completes, with client certificate DER bytes available in `StreamConnectionContext` for mTLS authentication
-12. `on_udp_datagram` — Per-datagram UDP hooks fired before each client→backend datagram is forwarded. udp_rate_limiting (2910) uses this for datagram/byte rate limiting. Zero overhead when no plugin opts in via `requires_udp_datagram_hooks()`
+12. `on_udp_datagram` — Per-datagram UDP hooks fired in both directions (client→backend and backend→client). `UdpDatagramContext.direction` distinguishes the two. udp_rate_limiting (2910) uses this for datagram/byte rate limiting. Zero overhead when no plugin opts in via `requires_udp_datagram_hooks()`. Backend→client hooks run before each response datagram is relayed to the client, enabling response-side rate limiting and filtering
 
 **Multi-auth**: `AuthMode::Multi` recognizes both `ctx.identified_consumer` (consumer-backed auth) and `ctx.authenticated_identity` (external JWKS/OIDC identity) as successful authentication. First-success-wins semantics apply.
 
@@ -388,6 +405,8 @@ tests/
 **No silent fallbacks**: All protocol paths hard-error on cert load failure. No degradation to unauthenticated connections.
 
 **Certificate expiration checking**: All TLS surfaces (frontend, admin, DTLS, CP/DP gRPC, per-proxy backend certs, CA bundles) check X.509 `notBefore`/`notAfter` at load time. Expired certificates are rejected (hard failure). Certificates expiring within `FERRUM_TLS_CERT_EXPIRY_WARNING_DAYS` (default 30) emit a warning log. Set to 0 to disable near-expiry warnings. The `check_cert_expiry()` helper in `src/tls/mod.rs` is shared across all surfaces.
+
+**Certificate revocation (CRL)**: When `FERRUM_TLS_CRL_FILE_PATH` is set, all TLS/DTLS surfaces reject certificates listed in the CRL. The CRL file is PEM-encoded and may contain multiple `-----BEGIN X509 CRL-----` blocks (e.g., one per issuing CA). Loaded once at startup via `tls::load_crls()` and shared across all surfaces via `Arc`. Policy: `allow_unknown_revocation_status()` (certs not covered by any CRL are accepted — avoids breaking public CA backends) + `only_check_end_entity_revocation()` (checks leaf cert only, not intermediates). Applied to: frontend mTLS (`WebPkiClientVerifier`), all 6 backend paths (`WebPkiServerVerifier` via `build_server_verifier_with_crls()`), DTLS frontend mTLS, DTLS backend. Not applied to DP→CP gRPC client (tonic manages TLS internally). Requires restart to reload — no hot-reload (consistent with all other TLS surfaces).
 
 **No hot reload for any TLS surface**: Updating a cert file on disk has no effect until restart (or config reload for per-proxy paths, which creates new pool entries but does not re-read files for existing ones). This applies to frontend, backend, admin, DTLS, and gRPC TLS surfaces. See `docs/frontend_tls.md` for the complete list.
 
@@ -618,6 +637,7 @@ Reduce per-request allocations in plugin lookup
 | `FERRUM_DP_GRPC_TLS_NO_VERIFY` | `false` | Skip gRPC TLS cert verification (testing only) |
 | `FERRUM_TLS_NO_VERIFY` | `false` | Skip outbound TLS verification for all connections (testing only) |
 | `FERRUM_TLS_CA_BUNDLE_PATH` | (none) | Path to PEM CA bundle for outbound TLS verification (internal CAs) |
+| `FERRUM_TLS_CRL_FILE_PATH` | (none) | Path to PEM CRL file for certificate revocation checking across all TLS/DTLS surfaces |
 | `FERRUM_TLS_CERT_EXPIRY_WARNING_DAYS` | `30` | Days before cert expiration to warn. Expired certs are always rejected. 0 = disable warnings |
 | `FERRUM_ENABLE_STREAMING_LATENCY_TRACKING` | `false` | Track streaming response total latency (adds per-stream overhead) |
 | `FERRUM_BASIC_AUTH_HMAC_SECRET` | `ferrum-edge-change-me-in-production` | HMAC-SHA256 server secret for basic_auth (~1μs vs ~100ms bcrypt). **Must be changed in production.** |
@@ -650,6 +670,13 @@ Reduce per-request allocations in plugin lookup
 | `FERRUM_MAX_QUERY_PARAMS` | `100` | Max number of query parameters allowed. `0` = unlimited |
 | `FERRUM_MAX_GRPC_RECV_SIZE_BYTES` | `4194304` | Max total received gRPC payload size in bytes (4 MiB). `0` = unlimited |
 | `FERRUM_MAX_WEBSOCKET_FRAME_SIZE_BYTES` | `16777216` | Max WebSocket frame size in bytes (16 MiB). Also sets max message size to 4x frame size |
+| `FERRUM_HTTP_HEADER_READ_TIMEOUT_SECONDS` | `10` | HTTP/1.1 header read timeout in seconds. Protects against slowloris attacks. `0` = disabled |
+| `FERRUM_BACKEND_ALLOW_IPS` | `both` | Backend IP allowlist policy: `private` (only RFC 1918/loopback/link-local/CGNAT), `public` (only non-private), `both` (no restriction) |
+| `FERRUM_MAX_CONCURRENT_REQUESTS_PER_IP` | `0` | Max concurrent proxy requests per resolved client IP. `0` = disabled. Uses trusted proxy XFF resolution |
+| `FERRUM_ADMIN_ALLOWED_CIDRS` | (empty) | Comma-separated CIDRs/IPs allowed to connect to admin API. Empty = all allowed |
+| `FERRUM_ADD_VIA_HEADER` | `true` | Add Via header (RFC 9110 §7.6.3) on request and response paths |
+| `FERRUM_VIA_PSEUDONYM` | `ferrum-edge` | Pseudonym in the Via header (e.g., `1.1 ferrum-edge`) |
+| `FERRUM_ADD_FORWARDED_HEADER` | `false` | Add Forwarded header (RFC 7239) alongside X-Forwarded-* headers |
 
 See `src/config/env_config.rs` for the full list of 90+ environment variables.
 

@@ -61,6 +61,8 @@ pub struct ConnectionPool {
     /// When set, reqwest clients use a pre-configured rustls `ClientConfig` with the
     /// same cipher suites and protocol versions as inbound listeners.
     tls_policy: Option<Arc<TlsPolicy>>,
+    /// Certificate Revocation Lists for backend TLS verification.
+    crls: crate::tls::CrlList,
 }
 
 impl ConnectionPool {
@@ -74,6 +76,7 @@ impl ConnectionPool {
         mtls_config: crate::config::EnvConfig,
         dns_cache: DnsCache,
         tls_policy: Option<Arc<TlsPolicy>>,
+        crls: crate::tls::CrlList,
     ) -> Self {
         let cleanup_secs = mtls_config.pool_cleanup_interval_seconds;
         let pool = Self {
@@ -83,6 +86,7 @@ impl ConnectionPool {
             global_mtls_config: mtls_config,
             dns_cache,
             tls_policy,
+            crls,
         };
 
         // Start cleanup task
@@ -241,8 +245,9 @@ impl ConnectionPool {
         }
 
         // Build ClientConfig with TLS policy (cipher suites, protocol versions, kx groups)
+        let verifier = crate::tls::build_server_verifier_with_crls(root_store, &self.crls)?;
         let builder = crate::tls::backend_client_config_builder(self.tls_policy.as_deref())?
-            .with_root_certificates(root_store);
+            .with_webpki_verifier(verifier);
 
         // Add client certificate for mTLS (proxy-specific overrides take priority)
         let cert_path = proxy.backend_tls_client_cert_path.as_ref().or(self
@@ -529,8 +534,9 @@ impl ConnectionPool {
                     key_path
                 )
             })?;
+            let verifier = crate::tls::build_server_verifier_with_crls(root_store, &self.crls)?;
             policy_builder()
-                .with_root_certificates(root_store)
+                .with_webpki_verifier(verifier)
                 .with_client_auth_cert(client_certs, rustls::pki_types::PrivateKeyDer::Pkcs8(key))
                 .map_err(|e| {
                     anyhow::anyhow!(
@@ -541,8 +547,9 @@ impl ConnectionPool {
                     )
                 })?
         } else {
+            let verifier = crate::tls::build_server_verifier_with_crls(root_store, &self.crls)?;
             policy_builder()
-                .with_root_certificates(root_store)
+                .with_webpki_verifier(verifier)
                 .with_no_client_auth()
         };
 

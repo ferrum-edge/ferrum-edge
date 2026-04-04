@@ -560,6 +560,7 @@ async fn test_dtls_pem_cert_handshake() {
         cert_path.to_str().unwrap(),
         key_path.to_str().unwrap(),
         None,
+        &[],
     )
     .expect("build frontend config");
 
@@ -646,6 +647,7 @@ async fn test_frontend_dtls_config_disables_client_auth_without_ca() {
         cert_path.to_str().unwrap(),
         key_path.to_str().unwrap(),
         None,
+        &[],
     )
     .expect("build frontend config");
 
@@ -728,7 +730,7 @@ async fn test_backend_dtls_verification_rejects_hostname_mismatch() {
     let ca_path = write_pem(&temp_dir, "ca.pem", &ca.cert_pem);
 
     let frontend_config =
-        ferrum_edge::dtls::build_frontend_dtls_config(&cert_path, &key_path, None)
+        ferrum_edge::dtls::build_frontend_dtls_config(&cert_path, &key_path, None, &[])
             .expect("build frontend config");
     let server = Arc::new(
         ferrum_edge::dtls::DtlsServer::bind("127.0.0.1:0".parse().unwrap(), frontend_config)
@@ -743,8 +745,13 @@ async fn test_backend_dtls_verification_rejects_hostname_mismatch() {
     client_socket.connect(server_addr).await.unwrap();
 
     let proxy = build_dtls_proxy("wrong.example", server_addr.port(), Some(ca_path));
-    let params =
-        ferrum_edge::dtls::build_backend_dtls_config(&proxy, &proxy.backend_host, false).unwrap();
+    let params = ferrum_edge::dtls::build_backend_dtls_config(
+        &proxy,
+        &proxy.backend_host,
+        false,
+        &std::sync::Arc::new(Vec::new()),
+    )
+    .unwrap();
     let err = match ferrum_edge::dtls::DtlsConnection::connect(client_socket, params).await {
         Ok(_) => panic!("hostname mismatch should fail DTLS verification"),
         Err(err) => err,

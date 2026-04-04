@@ -93,6 +93,8 @@ fn create_http3_test_proxy() -> Proxy {
         udp_idle_timeout_seconds: 60,
         tcp_idle_timeout_seconds: Some(300),
         allowed_methods: None,
+        allowed_ws_origins: vec![],
+        udp_max_response_amplification_factor: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     }
@@ -201,6 +203,7 @@ fn create_http3_test_env_config() -> EnvConfig {
         tls_curves: None,
         tls_session_cache_size: 4096,
         stream_proxy_bind_address: "0.0.0.0".into(),
+        admin_allowed_cidrs: String::new(),
         trusted_proxies: String::new(),
         dns_cache_max_size: 10_000,
         dns_slow_threshold_ms: None,
@@ -240,6 +243,7 @@ async fn test_http3_backend_connection() {
         env_config,
         dns_cache.clone(),
         None,
+        std::sync::Arc::new(Vec::new()),
     ));
 
     // Test DNS resolution first
@@ -374,6 +378,7 @@ async fn test_http3_proxy_state_creation() {
         env_config,
         dns_cache.clone(),
         None,
+        std::sync::Arc::new(Vec::new()),
     ));
 
     let gc = create_http3_test_gateway_config();
@@ -398,6 +403,7 @@ async fn test_http3_proxy_state_creation() {
             10_000,
             10,
             None,
+            std::sync::Arc::new(Vec::new()),
         ),
     );
     let dns_cache_for_sd = dns_cache.clone();
@@ -430,6 +436,10 @@ async fn test_http3_proxy_state_creation() {
             )
         },
         alt_svc_header: Some("h3=\":8443\"; ma=86400".to_string()),
+        via_header_http11: None,
+        via_header_http2: None,
+        via_header_http3: None,
+        add_forwarded_header: false,
         max_header_size_bytes: 32768,
         max_single_header_size_bytes: 16384,
         max_header_count: 100,
@@ -442,10 +452,13 @@ async fn test_http3_proxy_state_creation() {
         env_config: Arc::new(ferrum_edge::config::EnvConfig::default()),
         trusted_proxies: Arc::new(ferrum_edge::proxy::client_ip::TrustedProxies::parse("")),
         websocket_conn_limit: None,
+        per_ip_request_counts: None,
+        max_concurrent_requests_per_ip: 0,
         stream_listener_manager: slm,
         started_at: std::time::Instant::now(),
         ws_connection_counter: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         tls_policy: None,
+        crls: std::sync::Arc::new(Vec::new()),
     };
 
     // Verify proxy state is created successfully
@@ -555,6 +568,7 @@ async fn test_http3_full_integration() {
         env_config,
         dns_cache.clone(),
         None,
+        std::sync::Arc::new(Vec::new()),
     ));
 
     // Create proxy state with HTTP/3 support
@@ -580,6 +594,7 @@ async fn test_http3_full_integration() {
             10_000,
             10,
             None,
+            std::sync::Arc::new(Vec::new()),
         ),
     );
     let dns_cache_for_sd = dns_cache.clone();
@@ -612,6 +627,10 @@ async fn test_http3_full_integration() {
             )
         },
         alt_svc_header: Some("h3=\":8443\"; ma=86400".to_string()),
+        via_header_http11: None,
+        via_header_http2: None,
+        via_header_http3: None,
+        add_forwarded_header: false,
         max_header_size_bytes: 32768,
         max_single_header_size_bytes: 16384,
         max_header_count: 100,
@@ -624,10 +643,13 @@ async fn test_http3_full_integration() {
         env_config: Arc::new(ferrum_edge::config::EnvConfig::default()),
         trusted_proxies: Arc::new(ferrum_edge::proxy::client_ip::TrustedProxies::parse("")),
         websocket_conn_limit: None,
+        per_ip_request_counts: None,
+        max_concurrent_requests_per_ip: 0,
         stream_listener_manager: slm,
         started_at: std::time::Instant::now(),
         ws_connection_counter: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         tls_policy: None,
+        crls: std::sync::Arc::new(Vec::new()),
     };
 
     // Verify proxy state is created successfully
@@ -713,6 +735,8 @@ async fn test_http3_streaming_decision_logic() {
         udp_idle_timeout_seconds: 60,
         tcp_idle_timeout_seconds: Some(300),
         allowed_methods: None,
+        allowed_ws_origins: vec![],
+        udp_max_response_amplification_factor: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     };
@@ -850,6 +874,7 @@ async fn test_http3_connection_performance() {
         env_config,
         DnsCache::new(ferrum_edge::dns::DnsConfig::default()),
         None,
+        std::sync::Arc::new(Vec::new()),
     ));
 
     // Test HTTP/3 client creation performance

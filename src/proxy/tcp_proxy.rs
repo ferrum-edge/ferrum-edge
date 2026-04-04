@@ -45,6 +45,7 @@ impl CachedBackendTlsConfig {
         tls_no_verify: bool,
         global_tls_ca_bundle_path: Option<&str>,
         tls_policy: Option<&TlsPolicy>,
+        crls: &crate::tls::CrlList,
     ) -> Result<Self, anyhow::Error> {
         // Build root certificate store:
         // - Custom CA configured → empty store + only that CA (no public roots)
@@ -72,6 +73,7 @@ impl CachedBackendTlsConfig {
         }
 
         // Build TLS client config with optional client auth, using TLS policy
+        let verifier = crate::tls::build_server_verifier_with_crls(root_store, crls)?;
         let builder = crate::tls::backend_client_config_builder(tls_policy)?;
         let mut tls_config = if let (Some(cert_path), Some(key_path)) = (
             &proxy.backend_tls_client_cert_path,
@@ -86,13 +88,11 @@ impl CachedBackendTlsConfig {
                 .map_err(|e| anyhow::anyhow!("Failed to parse private key: {}", e))?
                 .ok_or_else(|| anyhow::anyhow!("No private key found in {}", key_path))?;
             builder
-                .with_root_certificates(root_store)
+                .with_webpki_verifier(verifier)
                 .with_client_auth_cert(certs, key)
                 .map_err(|e| anyhow::anyhow!("Failed to set client auth cert: {}", e))?
         } else {
-            builder
-                .with_root_certificates(root_store)
-                .with_no_client_auth()
+            builder.with_webpki_verifier(verifier).with_no_client_auth()
         };
 
         // Disable verification only if explicitly requested
@@ -139,6 +139,8 @@ pub struct TcpListenerConfig {
     pub circuit_breaker_cache: Arc<CircuitBreakerCache>,
     /// TLS hardening policy for backend connections (cipher suites, protocol versions).
     pub tls_policy: Option<Arc<TlsPolicy>>,
+    /// Certificate Revocation Lists for backend TLS verification.
+    pub crls: crate::tls::CrlList,
     /// Flipped once the listener successfully binds and can accept traffic.
     pub started: Arc<AtomicBool>,
 }
@@ -168,6 +170,7 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
         tcp_idle_timeout_seconds: global_tcp_idle_timeout,
         circuit_breaker_cache,
         tls_policy,
+        crls,
         started,
     } = cfg;
     let addr = SocketAddr::new(bind_addr, port);
@@ -205,7 +208,7 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
             .find(|p| *p.id == *proxy_id)
             .filter(|p| p.backend_protocol == BackendProtocol::TcpTls)
             .map(|proxy| {
-                CachedBackendTlsConfig::build(proxy, tls_no_verify, tls_ca_bundle_path.as_deref(), tls_policy.as_deref())
+                CachedBackendTlsConfig::build(proxy, tls_no_verify, tls_ca_bundle_path.as_deref(), tls_policy.as_deref(), &crls)
                     .map(Arc::new)
                     .unwrap_or_else(|e| {
                         warn!(proxy_id = %proxy_id, "Failed to pre-build backend TLS config: {}, will retry per-connection", e);

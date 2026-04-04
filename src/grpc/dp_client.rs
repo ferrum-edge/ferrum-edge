@@ -245,8 +245,9 @@ pub async fn connect_and_subscribe_with_startup_ready(
                 match serde_json::from_str::<GatewayConfig>(&update.config_json) {
                     Ok(mut config) => {
                         config.normalize_fields();
-                        if let Err(errors) = config.validate_all_fields(
+                        if let Err(errors) = config.validate_all_fields_with_ip_policy(
                             proxy_state.env_config.tls_cert_expiry_warning_days,
+                            &proxy_state.env_config.backend_allow_ips,
                         ) {
                             for msg in &errors {
                                 error!("CP config rejected — {}", msg);

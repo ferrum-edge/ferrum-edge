@@ -51,6 +51,8 @@ fn create_test_proxy() -> Proxy {
         udp_idle_timeout_seconds: 60,
         tcp_idle_timeout_seconds: Some(300),
         allowed_methods: None,
+        allowed_ws_origins: vec![],
+        udp_max_response_amplification_factor: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }
@@ -142,6 +144,7 @@ fn create_test_env_config() -> ferrum_edge::config::EnvConfig {
         dns_cache_max_size: 10_000,
         dns_slow_threshold_ms: None,
         stream_proxy_bind_address: "0.0.0.0".into(),
+        admin_allowed_cidrs: String::new(),
         trusted_proxies: String::new(),
         real_ip_header: None,
         dtls_cert_path: None,
@@ -171,6 +174,7 @@ async fn test_connection_pool_creation() {
         create_test_env_config(),
         create_test_dns_cache(),
         None,
+        std::sync::Arc::new(Vec::new()),
     );
     let proxy = create_test_proxy();
 
@@ -189,6 +193,7 @@ async fn test_pool_stats() {
         create_test_env_config(),
         create_test_dns_cache(),
         None,
+        std::sync::Arc::new(Vec::new()),
     );
     let proxy = create_test_proxy();
 
@@ -207,6 +212,7 @@ async fn test_different_proxy_configs_produce_different_pool_keys() {
         create_test_env_config(),
         create_test_dns_cache(),
         None,
+        std::sync::Arc::new(Vec::new()),
     );
 
     let mut proxy1 = create_test_proxy();
@@ -232,6 +238,7 @@ async fn test_different_protocols_produce_different_pool_keys() {
         create_test_env_config(),
         create_test_dns_cache(),
         None,
+        std::sync::Arc::new(Vec::new()),
     );
 
     let mut proxy_http = create_test_proxy();
@@ -257,6 +264,7 @@ async fn test_same_proxy_reuses_cached_client() {
         create_test_env_config(),
         create_test_dns_cache(),
         None,
+        std::sync::Arc::new(Vec::new()),
     );
     let proxy = create_test_proxy();
 
@@ -278,6 +286,7 @@ async fn test_dns_override_affects_pool_key() {
         create_test_env_config(),
         create_test_dns_cache(),
         None,
+        std::sync::Arc::new(Vec::new()),
     );
 
     let mut proxy1 = create_test_proxy();
@@ -303,6 +312,7 @@ async fn test_pool_clear() {
         create_test_env_config(),
         create_test_dns_cache(),
         None,
+        std::sync::Arc::new(Vec::new()),
     );
     let proxy = create_test_proxy();
 
@@ -320,6 +330,7 @@ async fn test_pool_with_proxy_config_overrides() {
         create_test_env_config(),
         create_test_dns_cache(),
         None,
+        std::sync::Arc::new(Vec::new()),
     );
 
     let mut proxy = create_test_proxy();
@@ -341,6 +352,7 @@ async fn test_pool_websocket_protocol_creates_client() {
         create_test_env_config(),
         create_test_dns_cache(),
         None,
+        std::sync::Arc::new(Vec::new()),
     );
 
     let mut proxy = create_test_proxy();
@@ -360,6 +372,7 @@ async fn test_upstream_id_pools_separately_from_backend_host() {
         create_test_env_config(),
         create_test_dns_cache(),
         None,
+        std::sync::Arc::new(Vec::new()),
     );
 
     // Proxy with direct backend
@@ -386,6 +399,7 @@ async fn test_different_upstream_ids_pool_separately() {
         create_test_env_config(),
         create_test_dns_cache(),
         None,
+        std::sync::Arc::new(Vec::new()),
     );
 
     let mut proxy1 = create_test_proxy();
@@ -413,6 +427,7 @@ async fn test_concurrent_pool_access() {
         create_test_env_config(),
         create_test_dns_cache(),
         None,
+        std::sync::Arc::new(Vec::new()),
     ));
 
     let mut handles = Vec::new();
@@ -443,6 +458,7 @@ async fn test_idle_timeout_does_not_fragment_pool() {
         create_test_env_config(),
         create_test_dns_cache(),
         None,
+        std::sync::Arc::new(Vec::new()),
     );
 
     // Two proxies with same host/port/protocol but different idle timeouts

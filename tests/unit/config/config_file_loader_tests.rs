@@ -21,7 +21,12 @@ plugin_configs: []
 "#;
     let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
     write!(file, "{}", yaml).unwrap();
-    let config = load_config_from_file(file.path().to_str().unwrap(), 30).unwrap();
+    let config = load_config_from_file(
+        file.path().to_str().unwrap(),
+        30,
+        &ferrum_edge::config::BackendAllowIps::Both,
+    )
+    .unwrap();
     assert_eq!(config.proxies.len(), 1);
     assert_eq!(config.proxies[0].listen_path, "/api/v1");
 }
@@ -41,7 +46,12 @@ fn test_load_json_config() {
 }"#;
     let mut file = NamedTempFile::with_suffix(".json").unwrap();
     write!(file, "{}", json).unwrap();
-    let config = load_config_from_file(file.path().to_str().unwrap(), 30).unwrap();
+    let config = load_config_from_file(
+        file.path().to_str().unwrap(),
+        30,
+        &ferrum_edge::config::BackendAllowIps::Both,
+    )
+    .unwrap();
     assert_eq!(config.proxies.len(), 1);
 }
 
@@ -64,7 +74,11 @@ plugin_configs: []
 "#;
     let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
     write!(file, "{}", yaml).unwrap();
-    let result = load_config_from_file(file.path().to_str().unwrap(), 30);
+    let result = load_config_from_file(
+        file.path().to_str().unwrap(),
+        30,
+        &ferrum_edge::config::BackendAllowIps::Both,
+    );
     assert!(result.is_err());
     let error_msg = result.unwrap_err().to_string();
     assert!(error_msg.contains("duplicate") || error_msg.contains("Duplicate"));
@@ -142,7 +156,12 @@ plugin_configs:
     let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
     write!(file, "{}", yaml).unwrap();
 
-    let config = load_config_from_file(file.path().to_str().unwrap(), 30).unwrap();
+    let config = load_config_from_file(
+        file.path().to_str().unwrap(),
+        30,
+        &ferrum_edge::config::BackendAllowIps::Both,
+    )
+    .unwrap();
 
     // Verify proxies
     assert_eq!(config.proxies.len(), 2);
@@ -186,7 +205,12 @@ plugin_configs:
 
 #[test]
 fn test_load_shared_example_config_fixture() {
-    let config = load_config_from_file("tests/config.yaml", 30).unwrap();
+    let config = load_config_from_file(
+        "tests/config.yaml",
+        30,
+        &ferrum_edge::config::BackendAllowIps::Both,
+    )
+    .unwrap();
 
     assert!(!config.proxies.is_empty());
     assert!(
@@ -236,7 +260,12 @@ plugin_configs: []
 
         let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
         write!(file, "{}", yaml).unwrap();
-        let config = load_config_from_file(file.path().to_str().unwrap(), 30).unwrap();
+        let config = load_config_from_file(
+            file.path().to_str().unwrap(),
+            30,
+            &ferrum_edge::config::BackendAllowIps::Both,
+        )
+        .unwrap();
 
         assert_eq!(
             config.proxies[0].backend_protocol, expected,
@@ -265,7 +294,12 @@ plugin_configs: []
 "#;
     let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
     write!(file, "{}", yaml).unwrap();
-    let config = load_config_from_file(file.path().to_str().unwrap(), 30).unwrap();
+    let config = load_config_from_file(
+        file.path().to_str().unwrap(),
+        30,
+        &ferrum_edge::config::BackendAllowIps::Both,
+    )
+    .unwrap();
     assert_eq!(config.proxies[0].auth_mode, AuthMode::Single);
 }
 
@@ -284,7 +318,12 @@ plugin_configs: []
 "#;
     let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
     write!(file, "{}", yaml).unwrap();
-    let config = load_config_from_file(file.path().to_str().unwrap(), 30).unwrap();
+    let config = load_config_from_file(
+        file.path().to_str().unwrap(),
+        30,
+        &ferrum_edge::config::BackendAllowIps::Both,
+    )
+    .unwrap();
     assert_eq!(config.proxies[0].auth_mode, AuthMode::Multi);
 }
 
@@ -302,7 +341,12 @@ plugin_configs: []
 "#;
     let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
     write!(file, "{}", yaml).unwrap();
-    let config = load_config_from_file(file.path().to_str().unwrap(), 30).unwrap();
+    let config = load_config_from_file(
+        file.path().to_str().unwrap(),
+        30,
+        &ferrum_edge::config::BackendAllowIps::Both,
+    )
+    .unwrap();
     assert_eq!(config.proxies[0].auth_mode, AuthMode::Single);
 }
 
@@ -324,7 +368,12 @@ plugin_configs: []
 "#;
     let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
     write!(file, "{}", yaml).unwrap();
-    let config = load_config_from_file(file.path().to_str().unwrap(), 30).unwrap();
+    let config = load_config_from_file(
+        file.path().to_str().unwrap(),
+        30,
+        &ferrum_edge::config::BackendAllowIps::Both,
+    )
+    .unwrap();
 
     assert_eq!(config.consumers.len(), 1);
     assert!(config.consumers[0].credentials.contains_key("keyauth"));
@@ -347,7 +396,12 @@ plugin_configs: []
 "#;
     let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
     write!(file, "{}", yaml).unwrap();
-    let config = load_config_from_file(file.path().to_str().unwrap(), 30).unwrap();
+    let config = load_config_from_file(
+        file.path().to_str().unwrap(),
+        30,
+        &ferrum_edge::config::BackendAllowIps::Both,
+    )
+    .unwrap();
 
     assert_eq!(config.consumers.len(), 1);
     assert!(config.consumers[0].credentials.contains_key("jwt"));
@@ -369,7 +423,12 @@ plugin_configs: []
 "#;
     let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
     write!(file, "{}", yaml).unwrap();
-    let config = load_config_from_file(file.path().to_str().unwrap(), 30).unwrap();
+    let config = load_config_from_file(
+        file.path().to_str().unwrap(),
+        30,
+        &ferrum_edge::config::BackendAllowIps::Both,
+    )
+    .unwrap();
 
     assert_eq!(config.consumers.len(), 1);
     assert!(config.consumers[0].credentials.contains_key("basicauth"));
@@ -398,7 +457,12 @@ plugin_configs: []
 "#;
     let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
     write!(file, "{}", yaml).unwrap();
-    let config = load_config_from_file(file.path().to_str().unwrap(), 30).unwrap();
+    let config = load_config_from_file(
+        file.path().to_str().unwrap(),
+        30,
+        &ferrum_edge::config::BackendAllowIps::Both,
+    )
+    .unwrap();
 
     assert_eq!(config.consumers.len(), 1);
     let creds = &config.consumers[0].credentials;
@@ -426,7 +490,12 @@ plugin_configs:
 "#;
     let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
     write!(file, "{}", yaml).unwrap();
-    let config = load_config_from_file(file.path().to_str().unwrap(), 30).unwrap();
+    let config = load_config_from_file(
+        file.path().to_str().unwrap(),
+        30,
+        &ferrum_edge::config::BackendAllowIps::Both,
+    )
+    .unwrap();
 
     assert_eq!(config.plugin_configs.len(), 1);
     assert_eq!(config.plugin_configs[0].scope, PluginScope::Global);
@@ -454,7 +523,12 @@ plugin_configs:
 "#;
     let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
     write!(file, "{}", yaml).unwrap();
-    let config = load_config_from_file(file.path().to_str().unwrap(), 30).unwrap();
+    let config = load_config_from_file(
+        file.path().to_str().unwrap(),
+        30,
+        &ferrum_edge::config::BackendAllowIps::Both,
+    )
+    .unwrap();
 
     assert_eq!(config.plugin_configs.len(), 1);
     assert_eq!(config.plugin_configs[0].scope, PluginScope::Proxy);
@@ -482,7 +556,12 @@ plugin_configs:
 "#;
     let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
     write!(file, "{}", yaml).unwrap();
-    let config = load_config_from_file(file.path().to_str().unwrap(), 30).unwrap();
+    let config = load_config_from_file(
+        file.path().to_str().unwrap(),
+        30,
+        &ferrum_edge::config::BackendAllowIps::Both,
+    )
+    .unwrap();
 
     assert_eq!(config.plugin_configs.len(), 1);
     let plugin_cfg = &config.plugin_configs[0];
@@ -542,7 +621,12 @@ plugin_configs: []
     );
     let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
     write!(file, "{}", yaml).unwrap();
-    let config = load_config_from_file(file.path().to_str().unwrap(), 30).unwrap();
+    let config = load_config_from_file(
+        file.path().to_str().unwrap(),
+        30,
+        &ferrum_edge::config::BackendAllowIps::Both,
+    )
+    .unwrap();
 
     let proxy = &config.proxies[0];
     assert_eq!(proxy.backend_path, Some("/v1/gateway".to_string()));
@@ -578,7 +662,12 @@ plugin_configs: []
 "#;
     let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
     write!(file, "{}", yaml).unwrap();
-    let config = load_config_from_file(file.path().to_str().unwrap(), 30).unwrap();
+    let config = load_config_from_file(
+        file.path().to_str().unwrap(),
+        30,
+        &ferrum_edge::config::BackendAllowIps::Both,
+    )
+    .unwrap();
 
     let proxy = &config.proxies[0];
     assert_eq!(proxy.name, None);
@@ -610,7 +699,9 @@ plugin_configs: []
     let file_path = file.path().to_str().unwrap();
 
     // Initial load
-    let config1 = reload_config_from_file(file_path, 30).unwrap();
+    let config1 =
+        reload_config_from_file(file_path, 30, &ferrum_edge::config::BackendAllowIps::Both)
+            .unwrap();
     assert_eq!(config1.proxies.len(), 1);
 
     // Modify file and reload
@@ -632,7 +723,9 @@ plugin_configs: []
     write!(file.reopen().unwrap(), "{}", yaml_updated).unwrap();
 
     // Reload should get new config
-    let config2 = reload_config_from_file(file_path, 30).unwrap();
+    let config2 =
+        reload_config_from_file(file_path, 30, &ferrum_edge::config::BackendAllowIps::Both)
+            .unwrap();
     assert_eq!(config2.proxies.len(), 2);
 }
 
@@ -642,7 +735,11 @@ plugin_configs: []
 
 #[test]
 fn test_missing_config_file() {
-    let result = load_config_from_file("/nonexistent/path/config.yaml", 30);
+    let result = load_config_from_file(
+        "/nonexistent/path/config.yaml",
+        30,
+        &ferrum_edge::config::BackendAllowIps::Both,
+    );
     assert!(result.is_err());
     let error = result.unwrap_err().to_string();
     assert!(error.contains("Configuration file not found") || error.contains("not found"));
@@ -662,7 +759,11 @@ plugin_configs: []
 "#;
     let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
     write!(file, "{}", yaml).unwrap();
-    let result = load_config_from_file(file.path().to_str().unwrap(), 30);
+    let result = load_config_from_file(
+        file.path().to_str().unwrap(),
+        30,
+        &ferrum_edge::config::BackendAllowIps::Both,
+    );
     assert!(result.is_err());
 }
 
@@ -677,7 +778,11 @@ fn test_malformed_json() {
 }"#;
     let mut file = NamedTempFile::with_suffix(".json").unwrap();
     write!(file, "{}", json).unwrap();
-    let result = load_config_from_file(file.path().to_str().unwrap(), 30);
+    let result = load_config_from_file(
+        file.path().to_str().unwrap(),
+        30,
+        &ferrum_edge::config::BackendAllowIps::Both,
+    );
     assert!(result.is_err());
 }
 
@@ -690,7 +795,12 @@ plugin_configs: []
 "#;
     let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
     write!(file, "{}", yaml).unwrap();
-    let config = load_config_from_file(file.path().to_str().unwrap(), 30).unwrap();
+    let config = load_config_from_file(
+        file.path().to_str().unwrap(),
+        30,
+        &ferrum_edge::config::BackendAllowIps::Both,
+    )
+    .unwrap();
 
     assert_eq!(config.proxies.len(), 0);
     assert_eq!(config.consumers.len(), 0);
@@ -715,7 +825,12 @@ plugin_configs: []
 "#;
     let mut file = NamedTempFile::with_suffix(".conf").unwrap();
     write!(file, "{}", yaml).unwrap();
-    let config = load_config_from_file(file.path().to_str().unwrap(), 30).unwrap();
+    let config = load_config_from_file(
+        file.path().to_str().unwrap(),
+        30,
+        &ferrum_edge::config::BackendAllowIps::Both,
+    )
+    .unwrap();
     assert_eq!(config.proxies.len(), 1);
 }
 
@@ -734,7 +849,12 @@ fn test_unknown_extension_fallback_to_json() {
 }"#;
     let mut file = NamedTempFile::with_suffix(".config").unwrap();
     write!(file, "{}", json).unwrap();
-    let config = load_config_from_file(file.path().to_str().unwrap(), 30).unwrap();
+    let config = load_config_from_file(
+        file.path().to_str().unwrap(),
+        30,
+        &ferrum_edge::config::BackendAllowIps::Both,
+    )
+    .unwrap();
     assert_eq!(config.proxies.len(), 1);
 }
 
@@ -780,7 +900,12 @@ plugin_configs:
 "#;
     let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
     write!(file, "{}", yaml).unwrap();
-    let config = load_config_from_file(file.path().to_str().unwrap(), 30).unwrap();
+    let config = load_config_from_file(
+        file.path().to_str().unwrap(),
+        30,
+        &ferrum_edge::config::BackendAllowIps::Both,
+    )
+    .unwrap();
 
     assert_eq!(config.proxies[0].plugins.len(), 3);
     assert_eq!(config.proxies[0].plugins[0].plugin_config_id, "plugin-auth");
@@ -809,7 +934,12 @@ plugin_configs: []
 "#;
     let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
     write!(file, "{}", yaml).unwrap();
-    let config = load_config_from_file(file.path().to_str().unwrap(), 30).unwrap();
+    let config = load_config_from_file(
+        file.path().to_str().unwrap(),
+        30,
+        &ferrum_edge::config::BackendAllowIps::Both,
+    )
+    .unwrap();
 
     assert_eq!(config.proxies[0].plugins.len(), 0);
 }

@@ -45,6 +45,66 @@ impl OperatingMode {
     }
 }
 
+/// Backend IP allowlist policy for SSRF protection.
+///
+/// Controls which resolved backend IPs are permitted as proxy/upstream targets:
+/// - `Private`: only private/reserved IPs (RFC 1918, loopback, link-local, CGNAT)
+/// - `Public`: only public IPs (blocks internal/metadata endpoints)
+/// - `Both`: all IPs allowed (default, no restriction)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BackendAllowIps {
+    /// Only private/reserved IPs allowed as backends.
+    Private,
+    /// Only public (non-private) IPs allowed as backends.
+    Public,
+    /// All IPs allowed — no restriction (default).
+    Both,
+}
+
+impl std::fmt::Display for BackendAllowIps {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Private => write!(f, "private"),
+            Self::Public => write!(f, "public"),
+            Self::Both => write!(f, "both"),
+        }
+    }
+}
+
+/// Check whether an IP address falls within private/reserved ranges.
+///
+/// Private/reserved ranges (denied in `Public` mode, allowed in `Private` mode):
+/// - IPv4: 127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16,
+///   169.254.0.0/16 (link-local / cloud metadata), 0.0.0.0/8, 100.64.0.0/10 (CGNAT)
+/// - IPv6: ::1, ::, fe80::/10 (link-local), fd00::/8 (unique local)
+pub fn is_private_ip(addr: &std::net::IpAddr) -> bool {
+    match addr {
+        std::net::IpAddr::V4(ip) => {
+            ip.is_loopback()                // 127.0.0.0/8
+            || ip.is_private()              // 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
+            || ip.is_link_local()           // 169.254.0.0/16
+            || ip.is_unspecified()          // 0.0.0.0
+            || ip.octets()[0] == 0          // 0.0.0.0/8 (full range)
+            || (ip.octets()[0] == 100 && (ip.octets()[1] & 0xC0) == 64) // 100.64.0.0/10 (CGNAT)
+        }
+        std::net::IpAddr::V6(ip) => {
+            ip.is_loopback()                                // ::1
+            || ip.is_unspecified()                          // ::
+            || (ip.segments()[0] & 0xffc0) == 0xfe80        // fe80::/10 (link-local)
+            || (ip.segments()[0] & 0xff00) == 0xfd00 // fd00::/8 (unique local)
+        }
+    }
+}
+
+/// Check whether an IP is allowed under the given backend IP policy.
+pub fn check_backend_ip_allowed(addr: &std::net::IpAddr, policy: &BackendAllowIps) -> bool {
+    match policy {
+        BackendAllowIps::Both => true,
+        BackendAllowIps::Private => is_private_ip(addr),
+        BackendAllowIps::Public => !is_private_ip(addr),
+    }
+}
+
 /// Resolve a configuration value: env var takes precedence over conf file.
 fn resolve_var(conf: &ConfFile, key: &str) -> Option<String> {
     if let Ok(env_val) = env::var(key) {
@@ -222,6 +282,10 @@ pub struct EnvConfig {
     pub max_grpc_recv_size_bytes: usize,
     /// Maximum WebSocket frame size in bytes. Applied to both client and backend connections.
     pub max_websocket_frame_size_bytes: usize,
+    /// HTTP/1.1 header read timeout in seconds. Protects against slowloris attacks
+    /// by closing connections that take too long to send complete request headers.
+    /// 0 = disabled (no timeout). Default: 10 seconds.
+    pub http_header_read_timeout_seconds: u64,
 
     // DNS
     pub dns_cache_ttl_seconds: u64,
@@ -369,6 +433,15 @@ pub struct EnvConfig {
     /// address is always used (secure default for edge deployments).
     /// Example: "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,::1"
     pub trusted_proxies: String,
+    /// Backend IP allowlist policy for SSRF protection.
+    /// "private" = only private/reserved IPs, "public" = only public IPs, "both" = all (default).
+    pub backend_allow_ips: BackendAllowIps,
+    /// When true, add a Via header on both request and response paths per RFC 9110 §7.6.3.
+    pub add_via_header: bool,
+    /// Pseudonym used in the Via header. Defaults to "ferrum-edge".
+    pub via_pseudonym: String,
+    /// When true, add a Forwarded header (RFC 7239) alongside X-Forwarded-* headers.
+    pub add_forwarded_header: bool,
     /// Header to use as the authoritative source of client IP. When set, this
     /// header is checked first (e.g., "CF-Connecting-IP" for Cloudflare, or
     /// "X-Real-IP" for nginx). If the header is absent or the direct connection
@@ -387,6 +460,17 @@ pub struct EnvConfig {
     /// Delay in milliseconds between automatic plugin outbound HTTP retries.
     /// Default: 100.
     pub plugin_http_retry_delay_ms: u64,
+
+    /// Path to a PEM file containing Certificate Revocation Lists (CRLs).
+    /// When set, all TLS/DTLS surfaces (frontend mTLS, backend verification, gRPC, WebSocket)
+    /// will reject certificates listed in the CRL. Supports multiple CRLs in one file.
+    /// Uses `-----BEGIN X509 CRL-----` PEM blocks.
+    pub tls_crl_file_path: Option<String>,
+    /// Comma-separated CIDRs/IPs allowed to connect to the admin API.
+    /// When empty (default), all IPs are permitted. When set, connections from
+    /// non-matching IPs are rejected at the TCP level before any request processing.
+    /// Example: "10.0.100.0/24,10.0.200.5,::1"
+    pub admin_allowed_cidrs: String,
 
     /// Max request body size in MiB for POST /restore (large config backups).
     /// Default: 100 MiB.
@@ -409,6 +493,10 @@ pub struct EnvConfig {
     /// Default: 100000. When the limit is reached, new connections queue
     /// until a slot frees up. Set to 0 to disable the limit entirely.
     pub max_connections: usize,
+    /// Maximum concurrent proxy requests per resolved client IP.
+    /// Uses the same client IP resolution as trusted proxy XFF walk.
+    /// Default: 0 (disabled). When exceeded, returns 429 Too Many Requests.
+    pub max_concurrent_requests_per_ip: u64,
     /// TCP listen backlog size for proxy listeners. Default: 2048.
     /// Higher values absorb connection bursts without SYN drops.
     pub tcp_listen_backlog: u32,
@@ -490,6 +578,7 @@ impl Default for EnvConfig {
             max_query_params: 100,
             max_grpc_recv_size_bytes: 4_194_304,
             max_websocket_frame_size_bytes: 16_777_216,
+            http_header_read_timeout_seconds: 10,
             dns_cache_ttl_seconds: 300,
             dns_overrides: HashMap::new(),
             dns_resolver_address: None,
@@ -536,16 +625,23 @@ impl Default for EnvConfig {
             tls_session_cache_size: 4096,
             tls_cert_expiry_warning_days: 30,
             trusted_proxies: String::new(),
+            backend_allow_ips: BackendAllowIps::Both,
+            add_via_header: true,
+            via_pseudonym: "ferrum-edge".into(),
+            add_forwarded_header: false,
             real_ip_header: None,
             plugin_http_slow_threshold_ms: 1000,
             plugin_http_max_retries: 0,
             plugin_http_retry_delay_ms: 100,
+            tls_crl_file_path: None,
+            admin_allowed_cidrs: String::new(),
             admin_restore_max_body_size_mib: 100,
             migrate_action: "up".into(),
             migrate_dry_run: false,
             worker_threads: None,
             blocking_threads: None,
             max_connections: 100_000,
+            max_concurrent_requests_per_ip: 0,
             tcp_listen_backlog: 2048,
             server_http2_max_concurrent_streams: 1000,
             server_http2_max_pending_accept_reset_streams: 64,
@@ -700,6 +796,11 @@ impl EnvConfig {
                 "FERRUM_MAX_WEBSOCKET_FRAME_SIZE_BYTES",
                 16_777_216,
             ),
+            http_header_read_timeout_seconds: resolve_u64(
+                conf,
+                "FERRUM_HTTP_HEADER_READ_TIMEOUT_SECONDS",
+                10,
+            ),
 
             dns_cache_ttl_seconds: resolve_u64(conf, "FERRUM_DNS_CACHE_TTL_SECONDS", 300),
             dns_overrides,
@@ -822,6 +923,25 @@ impl EnvConfig {
 
             // Client IP resolution
             trusted_proxies: resolve_var_or(conf, "FERRUM_TRUSTED_PROXIES", ""),
+            backend_allow_ips: match resolve_var_or(conf, "FERRUM_BACKEND_ALLOW_IPS", "both")
+                .to_lowercase()
+                .as_str()
+            {
+                "private" => BackendAllowIps::Private,
+                "public" => BackendAllowIps::Public,
+                "both" => BackendAllowIps::Both,
+                other => {
+                    return Err(format!(
+                        "Invalid FERRUM_BACKEND_ALLOW_IPS '{}'. Expected: private, public, both",
+                        other
+                    ));
+                }
+            },
+            add_via_header: resolve_var_or(conf, "FERRUM_ADD_VIA_HEADER", "true")
+                .eq_ignore_ascii_case("true"),
+            via_pseudonym: resolve_var_or(conf, "FERRUM_VIA_PSEUDONYM", "ferrum-edge"),
+            add_forwarded_header: resolve_var_or(conf, "FERRUM_ADD_FORWARDED_HEADER", "false")
+                .eq_ignore_ascii_case("true"),
             // Pre-lowercase at load time so the hot path avoids per-request
             // to_lowercase() allocation when looking up this header in ctx.headers
             // (which stores hyper's already-lowercased header names).
@@ -837,6 +957,8 @@ impl EnvConfig {
                 .unwrap_or(0),
             plugin_http_retry_delay_ms: resolve_u64(conf, "FERRUM_PLUGIN_HTTP_RETRY_DELAY_MS", 100),
 
+            tls_crl_file_path: resolve_var(conf, "FERRUM_TLS_CRL_FILE_PATH"),
+            admin_allowed_cidrs: resolve_var_or(conf, "FERRUM_ADMIN_ALLOWED_CIDRS", ""),
             admin_restore_max_body_size_mib: resolve_usize(
                 conf,
                 "FERRUM_ADMIN_RESTORE_MAX_BODY_SIZE_MIB",
@@ -853,6 +975,11 @@ impl EnvConfig {
             max_connections: resolve_var(conf, "FERRUM_MAX_CONNECTIONS")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(100_000),
+            max_concurrent_requests_per_ip: resolve_u64(
+                conf,
+                "FERRUM_MAX_CONCURRENT_REQUESTS_PER_IP",
+                0,
+            ),
             tcp_listen_backlog: resolve_var(conf, "FERRUM_TCP_LISTEN_BACKLOG")
                 .and_then(|v| v.parse().ok())
                 .map(|v: u32| v.max(128))

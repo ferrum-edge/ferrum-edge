@@ -54,6 +54,7 @@ pub fn build_backend_dtls_config(
     proxy: &Proxy,
     backend_host: &str,
     tls_no_verify: bool,
+    crls: &crate::tls::CrlList,
 ) -> Result<BackendDtlsParams, anyhow::Error> {
     let skip_verify = !proxy.backend_tls_verify_server_cert || tls_no_verify;
 
@@ -79,9 +80,7 @@ pub fn build_backend_dtls_config(
                     backend_host
                 )
             })?;
-        let verifier = rustls::client::WebPkiServerVerifier::builder(Arc::new(root_store))
-            .build()
-            .map_err(|e| anyhow::anyhow!("Failed to build DTLS server verifier: {}", e))?;
+        let verifier = crate::tls::build_server_verifier_with_crls(root_store, crls)?;
         (Some(server_name), Some(verifier as _))
     };
 
@@ -114,12 +113,21 @@ pub fn build_frontend_dtls_config(
     cert_path: &str,
     key_path: &str,
     client_ca_cert_path: Option<&str>,
+    crls: &[rustls::pki_types::CertificateRevocationListDer<'static>],
 ) -> Result<FrontendDtlsConfig, anyhow::Error> {
     let certificate = load_dtls_certificate(cert_path, key_path)?;
 
     let (require_client_cert, client_cert_verifier) = if let Some(ca_path) = client_ca_cert_path {
         let root_store = load_root_store_from_pem(ca_path)?;
-        let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(root_store))
+        let mut verifier_builder =
+            rustls::server::WebPkiClientVerifier::builder(Arc::new(root_store));
+        if !crls.is_empty() {
+            verifier_builder = verifier_builder
+                .with_crls(crls.iter().cloned())
+                .allow_unknown_revocation_status()
+                .only_check_end_entity_revocation();
+        }
+        let verifier = verifier_builder
             .build()
             .map_err(|e| anyhow::anyhow!("Failed to build DTLS client verifier: {}", e))?;
         debug!(

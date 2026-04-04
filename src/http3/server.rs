@@ -466,6 +466,19 @@ async fn handle_h3_request(
         return Ok(());
     }
 
+    // Block TRACE method to prevent Cross-Site Tracing (XST) attacks.
+    if method == "TRACE" {
+        warn!("Rejected HTTP/3 TRACE request");
+        record_request(&state, 405);
+        send_h3_response(
+            &mut stream,
+            StatusCode::METHOD_NOT_ALLOWED,
+            r#"{"error":"TRACE method is not allowed"}"#,
+        )
+        .await?;
+        return Ok(());
+    }
+
     // Resolve real client IP using trusted proxy configuration.
     // Parse socket IP once upfront to avoid redundant parsing in each branch.
     if !state.trusted_proxies.is_empty() {
@@ -496,6 +509,41 @@ async fn handle_h3_request(
         };
         ctx.client_ip = resolved;
     }
+
+    // Per-IP concurrent request limiting (same as HTTP/1.1 and HTTP/2 paths).
+    let _per_ip_guard = if let Some(ref counts) = state.per_ip_request_counts {
+        let count = counts
+            .entry(ctx.client_ip.clone())
+            .or_insert_with(|| std::sync::atomic::AtomicU64::new(0));
+        let current = count
+            .value()
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        let guard = Some(crate::proxy::PerIpRequestGuard {
+            ip: ctx.client_ip.clone(),
+            counts: counts.clone(),
+        });
+        if current > state.max_concurrent_requests_per_ip {
+            drop(guard);
+            warn!(
+                client_ip = %ctx.client_ip,
+                concurrent = current,
+                limit = state.max_concurrent_requests_per_ip,
+                "Per-IP concurrent request limit exceeded (HTTP/3)"
+            );
+            record_request(&state, 429);
+            send_h3_response(
+                &mut stream,
+                http::StatusCode::TOO_MANY_REQUESTS,
+                r#"{"error":"Too many concurrent requests from this IP"}"#,
+            )
+            .await?;
+            return Ok(());
+        }
+        guard
+    } else {
+        None
+    };
 
     // Parse query params
     if !query_string.is_empty() {
@@ -1296,6 +1344,19 @@ async fn proxy_to_backend_h3_streaming(
     if let Some(host) = headers.get("host").or_else(|| headers.get(":authority")) {
         req_builder = req_builder.header("X-Forwarded-Host", host.as_str());
     }
+    if let Some(ref via) = state.via_header_http3 {
+        req_builder = req_builder.header("Via", via.as_str());
+    }
+    if state.add_forwarded_header {
+        let host = headers
+            .get("host")
+            .or_else(|| headers.get(":authority"))
+            .map(|s| s.as_str());
+        req_builder = req_builder.header(
+            "Forwarded",
+            crate::proxy::build_forwarded_value(client_ip, "h3", host),
+        );
+    }
 
     if !body_bytes.is_empty() {
         req_builder = req_builder.body(body_bytes);
@@ -1567,6 +1628,19 @@ async fn proxy_to_backend_h3(
     req_builder = req_builder.header("X-Forwarded-Proto", "h3");
     if let Some(host) = headers.get("host").or_else(|| headers.get(":authority")) {
         req_builder = req_builder.header("X-Forwarded-Host", host.as_str());
+    }
+    if let Some(ref via) = state.via_header_http3 {
+        req_builder = req_builder.header("Via", via.as_str());
+    }
+    if state.add_forwarded_header {
+        let host = headers
+            .get("host")
+            .or_else(|| headers.get(":authority"))
+            .map(|s| s.as_str());
+        req_builder = req_builder.header(
+            "Forwarded",
+            crate::proxy::build_forwarded_value(client_ip, "h3", host),
+        );
     }
 
     if !body_bytes.is_empty() {

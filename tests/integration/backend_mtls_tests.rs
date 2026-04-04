@@ -57,6 +57,8 @@ fn create_test_mtls_proxy() -> Proxy {
         udp_idle_timeout_seconds: 60,
         tcp_idle_timeout_seconds: Some(300),
         allowed_methods: None,
+        allowed_ws_origins: vec![],
+        udp_max_response_amplification_factor: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }
@@ -161,6 +163,7 @@ fn create_test_env_config_with_mtls(
         dns_cache_max_size: 10_000,
         dns_slow_threshold_ms: None,
         stream_proxy_bind_address: "0.0.0.0".into(),
+        admin_allowed_cidrs: String::new(),
         trusted_proxies: String::new(),
         real_ip_header: None,
         dtls_cert_path: None,
@@ -212,6 +215,7 @@ async fn test_backend_mtls_global_config() {
         env_config,
         ferrum_edge::dns::DnsCache::new(ferrum_edge::dns::DnsConfig::default()),
         None,
+        std::sync::Arc::new(Vec::new()),
     );
 
     // Create proxy without specific mTLS config (should use global)
@@ -270,6 +274,7 @@ async fn test_backend_mtls_proxy_specific_override() {
         env_config,
         ferrum_edge::dns::DnsCache::new(ferrum_edge::dns::DnsConfig::default()),
         None,
+        std::sync::Arc::new(Vec::new()),
     );
 
     // Create proxy with specific mTLS config (should override global)
@@ -319,6 +324,7 @@ async fn test_backend_mtls_no_certificates() {
         env_config,
         ferrum_edge::dns::DnsCache::new(ferrum_edge::dns::DnsConfig::default()),
         None,
+        std::sync::Arc::new(Vec::new()),
     );
 
     // Create proxy without mTLS config
@@ -355,6 +361,7 @@ async fn test_backend_mtls_partial_config() {
         env_config,
         ferrum_edge::dns::DnsCache::new(ferrum_edge::dns::DnsConfig::default()),
         None,
+        std::sync::Arc::new(Vec::new()),
     );
 
     // Create proxy without mTLS config
@@ -396,6 +403,7 @@ async fn test_backend_ca_bundle_global_config() {
         env_config,
         ferrum_edge::dns::DnsCache::new(ferrum_edge::dns::DnsConfig::default()),
         None,
+        std::sync::Arc::new(Vec::new()),
     );
 
     // Create proxy without specific mTLS config (should use global CA bundle)

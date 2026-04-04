@@ -72,6 +72,8 @@ pub struct GrpcConnectionPool {
     global_env_config: crate::config::EnvConfig,
     /// TLS hardening policy for backend connections (cipher suites, protocol versions).
     tls_policy: Option<Arc<TlsPolicy>>,
+    /// Certificate Revocation Lists for backend TLS verification.
+    crls: crate::tls::CrlList,
     /// How long to wait for stream capacity on a live sender before opening a
     /// new backend connection shard.
     sender_ready_wait: Duration,
@@ -83,6 +85,7 @@ impl Default for GrpcConnectionPool {
             PoolConfig::default(),
             crate::config::EnvConfig::default(),
             None,
+            Arc::new(Vec::new()),
         )
     }
 }
@@ -92,6 +95,7 @@ impl GrpcConnectionPool {
         global_pool_config: PoolConfig,
         global_env_config: crate::config::EnvConfig,
         tls_policy: Option<Arc<TlsPolicy>>,
+        crls: crate::tls::CrlList,
     ) -> Self {
         let sender_ready_wait = Duration::from_millis(global_env_config.grpc_pool_ready_wait_ms);
         let pool = Self {
@@ -100,6 +104,7 @@ impl GrpcConnectionPool {
             global_pool_config,
             global_env_config,
             tls_policy,
+            crls,
             sender_ready_wait,
         };
 
@@ -509,17 +514,21 @@ impl GrpcConnectionPool {
                 cert_path, key_path
             );
 
+            let verifier = crate::tls::build_server_verifier_with_crls(root_store, &self.crls)
+                .map_err(|e| GrpcProxyError::Internal(format!("CRL verifier error: {}", e)))?;
             crate::tls::backend_client_config_builder(self.tls_policy.as_deref())
                 .map_err(|e| GrpcProxyError::Internal(format!("TLS policy error: {}", e)))?
-                .with_root_certificates(root_store)
+                .with_webpki_verifier(verifier)
                 .with_client_auth_cert(certs, key)
                 .map_err(|e| {
                     GrpcProxyError::Internal(format!("Invalid client certificate/key: {}", e))
                 })?
         } else {
+            let verifier = crate::tls::build_server_verifier_with_crls(root_store, &self.crls)
+                .map_err(|e| GrpcProxyError::Internal(format!("CRL verifier error: {}", e)))?;
             crate::tls::backend_client_config_builder(self.tls_policy.as_deref())
                 .map_err(|e| GrpcProxyError::Internal(format!("TLS policy error: {}", e)))?
-                .with_root_certificates(root_store)
+                .with_webpki_verifier(verifier)
                 .with_no_client_auth()
         };
 

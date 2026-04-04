@@ -810,6 +810,12 @@ pub struct Proxy {
     /// the UDP session mapping is removed. Default: 60 seconds.
     #[serde(default = "default_udp_idle_timeout")]
     pub udp_idle_timeout_seconds: u64,
+    /// Maximum allowed response amplification factor for UDP proxies.
+    /// When set, backend→client datagrams are dropped if their size exceeds
+    /// `last_request_size * factor`. Protects against UDP amplification attacks.
+    /// `None` (default) = no limit.
+    #[serde(default)]
+    pub udp_max_response_amplification_factor: Option<f32>,
     /// TCP stream idle timeout in seconds. After this duration of no data
     /// transfer in either direction, the connection is closed.
     /// Per-proxy override; when `None`, uses the global `FERRUM_TCP_IDLE_TIMEOUT_SECONDS`
@@ -821,6 +827,13 @@ pub struct Proxy {
     /// with methods not in the list receive 405 Method Not Allowed.
     #[serde(default)]
     pub allowed_methods: Option<Vec<String>>,
+    /// Optional list of allowed WebSocket Origin values (e.g., ["https://example.com"]).
+    /// When non-empty, WebSocket upgrade requests must include an Origin header
+    /// matching one of these values (case-insensitive). Empty list (default) means
+    /// no origin check — all origins are permitted. Protects against Cross-Site
+    /// WebSocket Hijacking (CSWSH) per RFC 6455 §10.2.
+    #[serde(default)]
+    pub allowed_ws_origins: Vec<String>,
     #[serde(default = "Utc::now")]
     pub created_at: DateTime<Utc>,
     #[serde(default = "Utc::now")]
@@ -2102,6 +2115,20 @@ impl Proxy {
             }
         }
 
+        // UDP amplification factor validation
+        if let Some(factor) = self.udp_max_response_amplification_factor
+            && factor <= 0.0
+        {
+            errors.push("udp_max_response_amplification_factor must be positive".to_string());
+        }
+
+        // Allowed WebSocket origins validation
+        for (i, origin) in self.allowed_ws_origins.iter().enumerate() {
+            if origin.trim().is_empty() {
+                errors.push(format!("allowed_ws_origins[{}] must not be empty", i));
+            }
+        }
+
         // DNS override
         if let Some(ref dns) = self.dns_override
             && let Err(e) = validate_string_field("dns_override", dns, MAX_BACKEND_HOST_LENGTH)
@@ -2839,6 +2866,18 @@ impl GatewayConfig {
     /// `cert_expiry_warning_days` controls the near-expiry warning threshold
     /// for TLS certificate files. Expired certificates are always rejected.
     pub fn validate_all_fields(&self, cert_expiry_warning_days: u64) -> Result<(), Vec<String>> {
+        self.validate_all_fields_with_ip_policy(
+            cert_expiry_warning_days,
+            &crate::config::BackendAllowIps::Both,
+        )
+    }
+
+    /// Validate all fields with backend IP policy enforcement.
+    pub fn validate_all_fields_with_ip_policy(
+        &self,
+        cert_expiry_warning_days: u64,
+        backend_allow_ips: &crate::config::BackendAllowIps,
+    ) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
 
         // Shared cache: when multiple proxies reference the same TLS file path,
@@ -2871,6 +2910,32 @@ impl GatewayConfig {
             if let Err(errs) = pc.validate_fields() {
                 for e in errs {
                     errors.push(format!("PluginConfig '{}': {}", pc.id, e));
+                }
+            }
+        }
+
+        // SSRF: validate literal IP backend_host / upstream target host values
+        if !matches!(backend_allow_ips, crate::config::BackendAllowIps::Both) {
+            for proxy in &self.proxies {
+                if let Ok(ip) = proxy.backend_host.parse::<std::net::IpAddr>()
+                    && !crate::config::check_backend_ip_allowed(&ip, backend_allow_ips)
+                {
+                    errors.push(format!(
+                        "Proxy '{}': backend_host IP {} denied by FERRUM_BACKEND_ALLOW_IPS={} policy",
+                        proxy.id, ip, backend_allow_ips
+                    ));
+                }
+            }
+            for upstream in &self.upstreams {
+                for (i, target) in upstream.targets.iter().enumerate() {
+                    if let Ok(ip) = target.host.parse::<std::net::IpAddr>()
+                        && !crate::config::check_backend_ip_allowed(&ip, backend_allow_ips)
+                    {
+                        errors.push(format!(
+                            "Upstream '{}': targets[{}].host IP {} denied by FERRUM_BACKEND_ALLOW_IPS={} policy",
+                            upstream.id, i, ip, backend_allow_ips
+                        ));
+                    }
                 }
             }
         }

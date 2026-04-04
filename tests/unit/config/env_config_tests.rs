@@ -427,6 +427,10 @@ fn test_env_config_request_limits_defaults() {
             assert_eq!(config.max_query_params, 100);
             assert_eq!(config.max_grpc_recv_size_bytes, 4_194_304);
             assert_eq!(config.max_websocket_frame_size_bytes, 16_777_216);
+            assert_eq!(config.http_header_read_timeout_seconds, 10);
+            assert!(config.add_via_header);
+            assert_eq!(config.via_pseudonym, "ferrum-edge");
+            assert!(!config.add_forwarded_header);
         },
     );
 }
@@ -1030,6 +1034,394 @@ fn test_env_config_max_websocket_frame_size_bytes_custom() {
             assert_eq!(config.max_websocket_frame_size_bytes, 33_554_432);
         },
     );
+}
+
+// ============================================================================
+// HTTP Header Read Timeout Tests
+// ============================================================================
+
+#[test]
+fn test_env_config_http_header_read_timeout_default() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+        ],
+        || {
+            remove_var("FERRUM_HTTP_HEADER_READ_TIMEOUT_SECONDS");
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(
+                config.http_header_read_timeout_seconds, 10,
+                "http_header_read_timeout_seconds should default to 10"
+            );
+        },
+    );
+}
+
+#[test]
+fn test_env_config_http_header_read_timeout_custom() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_HTTP_HEADER_READ_TIMEOUT_SECONDS", "60"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.http_header_read_timeout_seconds, 60);
+        },
+    );
+}
+
+#[test]
+fn test_env_config_http_header_read_timeout_disabled() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_HTTP_HEADER_READ_TIMEOUT_SECONDS", "0"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(
+                config.http_header_read_timeout_seconds, 0,
+                "0 should disable the header read timeout"
+            );
+        },
+    );
+}
+
+// ============================================================================
+// Per-IP Concurrent Request Limit Tests
+// ============================================================================
+
+#[test]
+fn test_env_config_max_concurrent_requests_per_ip_default() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+        ],
+        || {
+            remove_var("FERRUM_MAX_CONCURRENT_REQUESTS_PER_IP");
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(
+                config.max_concurrent_requests_per_ip, 0,
+                "max_concurrent_requests_per_ip should default to 0 (disabled)"
+            );
+        },
+    );
+}
+
+#[test]
+fn test_env_config_max_concurrent_requests_per_ip_custom() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_MAX_CONCURRENT_REQUESTS_PER_IP", "100"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.max_concurrent_requests_per_ip, 100);
+        },
+    );
+}
+
+// ============================================================================
+// Admin Allowed CIDRs Tests
+// ============================================================================
+
+#[test]
+fn test_env_config_admin_allowed_cidrs_default_empty() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+        ],
+        || {
+            remove_var("FERRUM_ADMIN_ALLOWED_CIDRS");
+            let config = EnvConfig::from_env().unwrap();
+            assert!(config.admin_allowed_cidrs.is_empty());
+        },
+    );
+}
+
+#[test]
+fn test_env_config_admin_allowed_cidrs_set() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_ADMIN_ALLOWED_CIDRS", "10.0.100.0/24,127.0.0.1,::1"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.admin_allowed_cidrs, "10.0.100.0/24,127.0.0.1,::1");
+        },
+    );
+}
+
+// ============================================================================
+// Via / Forwarded Header Tests
+// ============================================================================
+
+#[test]
+fn test_env_config_add_via_header_enabled() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_ADD_VIA_HEADER", "true"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert!(config.add_via_header);
+        },
+    );
+}
+
+#[test]
+fn test_env_config_via_pseudonym_custom() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_VIA_PSEUDONYM", "my-gateway"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.via_pseudonym, "my-gateway");
+        },
+    );
+}
+
+#[test]
+fn test_env_config_add_forwarded_header_enabled() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_ADD_FORWARDED_HEADER", "true"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert!(config.add_forwarded_header);
+        },
+    );
+}
+
+// ============================================================================
+// Backend Allow IPs (SSRF Protection) Tests
+// ============================================================================
+
+#[test]
+fn test_env_config_backend_allow_ips_default_both() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+        ],
+        || {
+            remove_var("FERRUM_BACKEND_ALLOW_IPS");
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.backend_allow_ips, BackendAllowIps::Both);
+        },
+    );
+}
+
+#[test]
+fn test_env_config_backend_allow_ips_private() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_BACKEND_ALLOW_IPS", "private"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.backend_allow_ips, BackendAllowIps::Private);
+        },
+    );
+}
+
+#[test]
+fn test_env_config_backend_allow_ips_public() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_BACKEND_ALLOW_IPS", "public"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.backend_allow_ips, BackendAllowIps::Public);
+        },
+    );
+}
+
+#[test]
+fn test_env_config_backend_allow_ips_case_insensitive() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_BACKEND_ALLOW_IPS", "PRIVATE"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.backend_allow_ips, BackendAllowIps::Private);
+        },
+    );
+}
+
+#[test]
+fn test_env_config_backend_allow_ips_invalid() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_BACKEND_ALLOW_IPS", "invalid"),
+        ],
+        || {
+            let result = EnvConfig::from_env();
+            assert!(result.is_err());
+            assert!(
+                result
+                    .unwrap_err()
+                    .contains("Invalid FERRUM_BACKEND_ALLOW_IPS")
+            );
+        },
+    );
+}
+
+// ============================================================================
+// is_private_ip / check_backend_ip_allowed Tests
+// ============================================================================
+
+use ferrum_edge::config::{BackendAllowIps, check_backend_ip_allowed, is_private_ip};
+
+#[test]
+fn test_is_private_ip_loopback_v4() {
+    assert!(is_private_ip(&"127.0.0.1".parse().unwrap()));
+    assert!(is_private_ip(&"127.255.255.255".parse().unwrap()));
+}
+
+#[test]
+fn test_is_private_ip_rfc1918() {
+    assert!(is_private_ip(&"10.0.0.1".parse().unwrap()));
+    assert!(is_private_ip(&"10.255.255.255".parse().unwrap()));
+    assert!(is_private_ip(&"172.16.0.1".parse().unwrap()));
+    assert!(is_private_ip(&"172.31.255.255".parse().unwrap()));
+    assert!(is_private_ip(&"192.168.0.1".parse().unwrap()));
+    assert!(is_private_ip(&"192.168.255.255".parse().unwrap()));
+}
+
+#[test]
+fn test_is_private_ip_link_local_v4() {
+    assert!(is_private_ip(&"169.254.0.1".parse().unwrap()));
+    assert!(is_private_ip(&"169.254.169.254".parse().unwrap()));
+}
+
+#[test]
+fn test_is_private_ip_unspecified_v4() {
+    assert!(is_private_ip(&"0.0.0.0".parse().unwrap()));
+    assert!(is_private_ip(&"0.1.2.3".parse().unwrap()));
+}
+
+#[test]
+fn test_is_private_ip_cgnat() {
+    assert!(is_private_ip(&"100.64.0.1".parse().unwrap()));
+    assert!(is_private_ip(&"100.127.255.255".parse().unwrap()));
+    // 100.128.x.x is NOT CGNAT
+    assert!(!is_private_ip(&"100.128.0.1".parse().unwrap()));
+}
+
+#[test]
+fn test_is_private_ip_public_v4() {
+    assert!(!is_private_ip(&"8.8.8.8".parse().unwrap()));
+    assert!(!is_private_ip(&"1.1.1.1".parse().unwrap()));
+    assert!(!is_private_ip(&"203.0.113.5".parse().unwrap()));
+}
+
+#[test]
+fn test_is_private_ip_ipv6() {
+    assert!(is_private_ip(&"::1".parse().unwrap()));
+    assert!(is_private_ip(&"::".parse().unwrap()));
+    assert!(is_private_ip(&"fe80::1".parse().unwrap()));
+    assert!(is_private_ip(&"fd00::1".parse().unwrap()));
+    // Public IPv6
+    assert!(!is_private_ip(&"2001:db8::1".parse().unwrap()));
+    assert!(!is_private_ip(&"2607:f8b0:4004:800::200e".parse().unwrap()));
+}
+
+#[test]
+fn test_check_backend_ip_allowed_both_allows_all() {
+    let policy = BackendAllowIps::Both;
+    assert!(check_backend_ip_allowed(
+        &"10.0.0.1".parse().unwrap(),
+        &policy
+    ));
+    assert!(check_backend_ip_allowed(
+        &"8.8.8.8".parse().unwrap(),
+        &policy
+    ));
+    assert!(check_backend_ip_allowed(
+        &"169.254.169.254".parse().unwrap(),
+        &policy
+    ));
+}
+
+#[test]
+fn test_check_backend_ip_allowed_public_denies_private() {
+    let policy = BackendAllowIps::Public;
+    assert!(!check_backend_ip_allowed(
+        &"10.0.0.1".parse().unwrap(),
+        &policy
+    ));
+    assert!(!check_backend_ip_allowed(
+        &"127.0.0.1".parse().unwrap(),
+        &policy
+    ));
+    assert!(!check_backend_ip_allowed(
+        &"169.254.169.254".parse().unwrap(),
+        &policy
+    ));
+    assert!(!check_backend_ip_allowed(
+        &"100.64.0.1".parse().unwrap(),
+        &policy
+    ));
+    // Public allowed
+    assert!(check_backend_ip_allowed(
+        &"8.8.8.8".parse().unwrap(),
+        &policy
+    ));
+}
+
+#[test]
+fn test_check_backend_ip_allowed_private_denies_public() {
+    let policy = BackendAllowIps::Private;
+    assert!(!check_backend_ip_allowed(
+        &"8.8.8.8".parse().unwrap(),
+        &policy
+    ));
+    assert!(!check_backend_ip_allowed(
+        &"1.1.1.1".parse().unwrap(),
+        &policy
+    ));
+    // Private allowed
+    assert!(check_backend_ip_allowed(
+        &"10.0.0.1".parse().unwrap(),
+        &policy
+    ));
+    assert!(check_backend_ip_allowed(
+        &"127.0.0.1".parse().unwrap(),
+        &policy
+    ));
+    assert!(check_backend_ip_allowed(
+        &"169.254.169.254".parse().unwrap(),
+        &policy
+    ));
 }
 
 // ============================================================================

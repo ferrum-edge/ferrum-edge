@@ -84,6 +84,8 @@ pub struct DnsConfig {
     pub slow_threshold_ms: Option<u64>,
     /// Maximum number of concurrent DNS warmup resolutions. Default: 500.
     pub warmup_concurrency: usize,
+    /// Backend IP allowlist policy for SSRF protection.
+    pub backend_allow_ips: crate::config::BackendAllowIps,
 }
 
 impl Default for DnsConfig {
@@ -100,6 +102,7 @@ impl Default for DnsConfig {
             max_cache_size: 10_000,
             slow_threshold_ms: None,
             warmup_concurrency: 500,
+            backend_allow_ips: crate::config::BackendAllowIps::Both,
         }
     }
 }
@@ -139,6 +142,8 @@ pub struct DnsCache {
     resolver_label: Arc<str>,
     /// Maximum number of concurrent DNS resolutions during config warmup.
     warmup_concurrency: usize,
+    /// Backend IP allowlist policy for SSRF protection.
+    backend_allow_ips: crate::config::BackendAllowIps,
 }
 
 impl DnsCache {
@@ -166,11 +171,30 @@ impl DnsCache {
             slow_threshold: config.slow_threshold_ms.map(Duration::from_millis),
             resolver_label,
             warmup_concurrency: config.warmup_concurrency.max(1),
+            backend_allow_ips: config.backend_allow_ips,
         }
     }
 
     /// Resolve a hostname to an IP address, using cache, overrides, or actual DNS.
     ///
+    /// Check whether a resolved IP is allowed by the backend IP policy.
+    /// Returns `Ok(addr)` if allowed, `Err` if denied.
+    fn check_backend_ip_policy(
+        &self,
+        addr: IpAddr,
+        hostname: &str,
+    ) -> Result<IpAddr, anyhow::Error> {
+        if !crate::config::check_backend_ip_allowed(&addr, &self.backend_allow_ips) {
+            anyhow::bail!(
+                "Backend IP {} (resolved from '{}') denied by FERRUM_BACKEND_ALLOW_IPS={} policy",
+                addr,
+                hostname,
+                self.backend_allow_ips
+            );
+        }
+        Ok(addr)
+    }
+
     /// Resolution priority:
     /// 1. Per-proxy static override (highest priority)
     /// 2. Global static overrides
@@ -185,13 +209,13 @@ impl DnsCache {
         // 1. Check per-proxy static override first
         if let Some(ip_str) = per_proxy_override {
             let addr: IpAddr = ip_str.parse()?;
-            return Ok(addr);
+            return self.check_backend_ip_policy(addr, hostname);
         }
 
         // 2. Check global overrides
         if let Some(ip_str) = self.global_overrides.get(hostname) {
             let addr: IpAddr = ip_str.parse()?;
-            return Ok(addr);
+            return self.check_backend_ip_policy(addr, hostname);
         }
 
         // 3. Check cache with stale-while-revalidate
@@ -238,6 +262,10 @@ impl DnsCache {
         // 4. Perform actual DNS resolution
         match self.timed_resolve(hostname).await {
             Ok((addrs, record_type)) if !addrs.is_empty() => {
+                // Check backend IP policy BEFORE caching to prevent denied IPs
+                // from being served on subsequent requests via the cache.
+                self.check_backend_ip_policy(addrs[0], hostname)?;
+
                 let ttl = per_proxy_ttl
                     .map(Duration::from_secs)
                     .or(self.valid_ttl_override)

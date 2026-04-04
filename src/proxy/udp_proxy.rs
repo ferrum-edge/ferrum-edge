@@ -30,7 +30,7 @@ use crate::load_balancer::LoadBalancerCache;
 use crate::plugin_cache::PluginCache;
 use crate::plugins::{
     Plugin, PluginResult, ProxyProtocol, StreamConnectionContext, StreamTransactionSummary,
-    UdpDatagramContext, UdpDatagramVerdict,
+    UdpDatagramContext, UdpDatagramDirection, UdpDatagramVerdict,
 };
 
 /// Maximum datagram size for UDP forwarding.
@@ -62,6 +62,9 @@ struct UdpSession {
     created_at: AtomicU64,    // epoch millis
     bytes_sent: AtomicU64,
     bytes_received: AtomicU64,
+    /// Size of the last client→backend datagram for amplification factor checking.
+    /// Updated on each forwarded request; read on each backend→client response.
+    last_request_size: AtomicU64,
     /// Backend target for logging (e.g., "10.0.2.10:5353").
     backend_target: String,
     /// DNS-resolved IP address of the backend for logging.
@@ -191,6 +194,8 @@ pub struct UdpListenerConfig {
     pub plugin_cache: Arc<PluginCache>,
     /// Circuit breaker cache shared with HTTP proxies.
     pub circuit_breaker_cache: Arc<CircuitBreakerCache>,
+    /// Certificate Revocation Lists for backend DTLS verification.
+    pub crls: crate::tls::CrlList,
     /// Flipped once the listener successfully binds and can accept traffic.
     pub started: Arc<AtomicBool>,
 }
@@ -220,6 +225,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
         cleanup_interval_seconds,
         plugin_cache,
         circuit_breaker_cache,
+        crls,
         started,
     } = cfg;
 
@@ -239,6 +245,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
             max_sessions,
             plugin_cache,
             circuit_breaker_cache,
+            crls,
             started,
         )
         .await;
@@ -337,6 +344,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                     &circuit_breaker_cache,
                     &consumer_index,
                     has_datagram_plugins,
+                    &crls,
                 )
                 .await;
                 if let Err(e) = result {
@@ -372,6 +380,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                                 &circuit_breaker_cache,
                                 &consumer_index,
                                 has_datagram_plugins,
+                                &crls,
                             )
                             .await;
                             if let Err(e) = result {
@@ -423,6 +432,7 @@ async fn process_datagram(
     circuit_breaker_cache: &CircuitBreakerCache,
     consumer_index: &Arc<ConsumerIndex>,
     has_datagram_plugins: bool,
+    crls: &crate::tls::CrlList,
 ) -> Result<(), anyhow::Error> {
     // Run per-datagram plugins (e.g., udp_rate_limiting) before session
     // allocation so dropped datagrams don't consume session slots or trigger
@@ -434,6 +444,7 @@ async fn process_datagram(
             proxy_name: proxy_name.map(str::to_string),
             listen_port,
             datagram_size: data.len(),
+            direction: UdpDatagramDirection::ClientToBackend,
         };
         for plugin in plugins {
             if plugin.requires_udp_datagram_hooks()
@@ -466,6 +477,7 @@ async fn process_datagram(
                 listen_port,
                 circuit_breaker_cache,
                 consumer_index,
+                crls,
             )
             .await?
         }
@@ -487,6 +499,7 @@ async fn process_datagram(
             listen_port,
             circuit_breaker_cache,
             consumer_index,
+            crls,
         )
         .await?
     };
@@ -514,6 +527,9 @@ async fn process_datagram(
             session
                 .bytes_sent
                 .fetch_add(data.len() as u64, Ordering::Relaxed);
+            session
+                .last_request_size
+                .store(data.len() as u64, Ordering::Relaxed);
             *batch_dgrams_out += 1;
             *batch_bytes_out += data.len() as u64;
             Ok(())
@@ -541,6 +557,7 @@ async fn lookup_or_create_session(
     listen_port: u16,
     circuit_breaker_cache: &CircuitBreakerCache,
     consumer_index: &Arc<ConsumerIndex>,
+    crls: &crate::tls::CrlList,
 ) -> Result<Arc<UdpSession>, anyhow::Error> {
     if let Some(existing) = sessions.get(&client_addr) {
         return Ok(existing.value().clone());
@@ -574,6 +591,7 @@ async fn lookup_or_create_session(
         listen_port,
         circuit_breaker_cache,
         consumer_index,
+        crls,
     )
     .await
     {
@@ -682,6 +700,7 @@ async fn start_dtls_frontend_listener(
     max_sessions: usize,
     plugin_cache: Arc<PluginCache>,
     circuit_breaker_cache: Arc<CircuitBreakerCache>,
+    crls: crate::tls::CrlList,
     started: Arc<AtomicBool>,
 ) -> Result<(), anyhow::Error> {
     let addr = SocketAddr::new(bind_addr, port);
@@ -792,6 +811,7 @@ async fn start_dtls_frontend_listener(
                 let connected_at = chrono::Utc::now();
 
                 let handler_has_dgram_plugins = has_datagram_plugins;
+                let handler_crls = crls.clone();
                 tokio::spawn(async move {
                     let result = handle_dtls_client(
                         client_conn,
@@ -807,6 +827,7 @@ async fn start_dtls_frontend_listener(
                         handler_proxy_name.as_deref(),
                         port,
                         handler_has_dgram_plugins,
+                        &handler_crls,
                     )
                     .await;
                     let (err_msg, error_class) = match &result.outcome {
@@ -904,6 +925,7 @@ async fn handle_dtls_client(
     proxy_name: Option<&str>,
     listen_port: u16,
     has_datagram_plugins: bool,
+    crls: &crate::tls::CrlList,
 ) -> DtlsHandlerResult {
     let mut backend_info = DtlsBackendInfo {
         backend_target: String::new(),
@@ -911,6 +933,7 @@ async fn handle_dtls_client(
     };
     let bytes_sent = Arc::new(AtomicU64::new(0));
     let bytes_received = Arc::new(AtomicU64::new(0));
+    let last_request_size = Arc::new(AtomicU64::new(0));
     let outcome = handle_dtls_client_inner(
         client_conn,
         client_addr,
@@ -924,10 +947,12 @@ async fn handle_dtls_client(
         &mut backend_info,
         Arc::clone(&bytes_sent),
         Arc::clone(&bytes_received),
+        Arc::clone(&last_request_size),
         plugins,
         proxy_name,
         listen_port,
         has_datagram_plugins,
+        crls,
     )
     .await;
     DtlsHandlerResult {
@@ -952,10 +977,12 @@ async fn handle_dtls_client_inner(
     backend_info: &mut DtlsBackendInfo,
     bytes_sent: Arc<AtomicU64>,
     bytes_received: Arc<AtomicU64>,
+    last_request_size: Arc<AtomicU64>,
     plugins: &[Arc<dyn Plugin>],
     proxy_name: Option<&str>,
     listen_port: u16,
     has_datagram_plugins: bool,
+    crls: &crate::tls::CrlList,
 ) -> Result<(), anyhow::Error> {
     // Look up proxy config
     let current_config = config.load();
@@ -1060,7 +1087,7 @@ async fn handle_dtls_client_inner(
             ));
         }
         let dtls_params =
-            crate::dtls::build_backend_dtls_config(&proxy, &backend_host, tls_no_verify)?;
+            crate::dtls::build_backend_dtls_config(&proxy, &backend_host, tls_no_verify, crls)?;
         let dtls = match crate::dtls::DtlsConnection::connect(socket, dtls_params).await {
             Ok(d) => Arc::new(d),
             Err(e) => {
@@ -1139,6 +1166,7 @@ async fn handle_dtls_client_inner(
     let metrics_fwd = metrics.clone();
     let proxy_id_fwd = proxy_id.to_string();
     let bytes_sent_fwd = Arc::clone(&bytes_sent);
+    let last_request_size_fwd = Arc::clone(&last_request_size);
     let dgram_plugins: Vec<Arc<dyn Plugin>> = if has_datagram_plugins {
         plugins
             .iter()
@@ -1176,6 +1204,7 @@ async fn handle_dtls_client_inner(
                     proxy_name: dgram_proxy_name.clone(),
                     listen_port: dgram_listen_port,
                     datagram_size: len,
+                    direction: UdpDatagramDirection::ClientToBackend,
                 };
                 let mut dropped = false;
                 for plugin in &dgram_plugins {
@@ -1213,6 +1242,7 @@ async fn handle_dtls_client_inner(
                 .bytes_out
                 .fetch_add(len as u64, Ordering::Relaxed);
             bytes_sent_fwd.fetch_add(len as u64, Ordering::Relaxed);
+            last_request_size_fwd.store(len as u64, Ordering::Relaxed);
         }
     });
 
@@ -1220,6 +1250,20 @@ async fn handle_dtls_client_inner(
     let metrics_rev = metrics.clone();
     let proxy_id_rev = proxy_id.to_string();
     let bytes_received_rev = Arc::clone(&bytes_received);
+    let amplification_factor_rev = proxy.udp_max_response_amplification_factor;
+    let last_request_size_rev = Arc::clone(&last_request_size);
+    let dgram_plugins_rev: Vec<Arc<dyn Plugin>> = if has_datagram_plugins {
+        plugins
+            .iter()
+            .filter(|p| p.requires_udp_datagram_hooks())
+            .cloned()
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let dgram_client_ip_rev = client_addr.ip().to_string();
+    let dgram_proxy_id_rev = proxy_id.to_string();
+    let dgram_proxy_name_rev = proxy_name.map(str::to_string);
 
     let backend_to_client = tokio::spawn(async move {
         let mut buf = vec![0u8; MAX_UDP_DATAGRAM_SIZE];
@@ -1245,6 +1289,39 @@ async fn handle_dtls_client_inner(
             metrics_rev
                 .bytes_in
                 .fetch_add(len as u64, Ordering::Relaxed);
+
+            // Amplification factor check for DTLS path
+            if let Some(factor) = amplification_factor_rev {
+                let req_size = last_request_size_rev.load(Ordering::Relaxed);
+                if req_size > 0 {
+                    let max_response = (req_size as f64 * factor as f64) as u64;
+                    if len as u64 > max_response {
+                        continue; // Drop oversized response
+                    }
+                }
+            }
+
+            // Backend→client plugin hooks for DTLS path
+            if !dgram_plugins_rev.is_empty() {
+                let ctx = UdpDatagramContext {
+                    client_ip: dgram_client_ip_rev.clone(),
+                    proxy_id: dgram_proxy_id_rev.clone(),
+                    proxy_name: dgram_proxy_name_rev.clone(),
+                    listen_port,
+                    datagram_size: len,
+                    direction: UdpDatagramDirection::BackendToClient,
+                };
+                let mut drop = false;
+                for plugin in &dgram_plugins_rev {
+                    if matches!(plugin.on_udp_datagram(&ctx).await, UdpDatagramVerdict::Drop) {
+                        drop = true;
+                        break;
+                    }
+                }
+                if drop {
+                    continue;
+                }
+            }
 
             if client_sender.send(&data).await.is_err() {
                 debug!(
@@ -1294,6 +1371,7 @@ async fn create_session(
     listen_port: u16,
     circuit_breaker_cache: &CircuitBreakerCache,
     consumer_index: &Arc<ConsumerIndex>,
+    crls: &crate::tls::CrlList,
 ) -> Result<Arc<UdpSession>, anyhow::Error> {
     // Run on_stream_connect plugins before creating backend connection
     let mut stream_ctx = StreamConnectionContext {
@@ -1412,7 +1490,7 @@ async fn create_session(
         }
 
         let dtls_params =
-            crate::dtls::build_backend_dtls_config(&proxy, &backend_host, tls_no_verify)?;
+            crate::dtls::build_backend_dtls_config(&proxy, &backend_host, tls_no_verify, crls)?;
         let dtls = match crate::dtls::DtlsConnection::connect(socket, dtls_params).await {
             Ok(d) => Arc::new(d),
             Err(e) => {
@@ -1482,6 +1560,7 @@ async fn create_session(
         created_at: AtomicU64::new(now),
         bytes_sent: AtomicU64::new(0),
         bytes_received: AtomicU64::new(0),
+        last_request_size: AtomicU64::new(0),
         backend_target: format!("{}:{}", backend_host, backend_port),
         backend_resolved_ip: resolved_ip.to_string(),
         metadata: std::sync::Mutex::new(stream_ctx.metadata),
@@ -1509,6 +1588,20 @@ async fn create_session(
     let reply_plugins = plugins.to_vec();
     let reply_proxy_name = proxy_name.map(str::to_string);
     let reply_backend_protocol = backend_protocol;
+    let reply_amplification_factor = proxy.udp_max_response_amplification_factor;
+    let reply_has_datagram_plugins = plugins.iter().any(|p| p.requires_udp_datagram_hooks());
+    let reply_datagram_plugins: Vec<Arc<dyn Plugin>> = if reply_has_datagram_plugins {
+        plugins
+            .iter()
+            .filter(|p| p.requires_udp_datagram_hooks())
+            .cloned()
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let reply_dgram_client_ip = client_addr.ip().to_string();
+    let reply_dgram_proxy_id = proxy_id.to_string();
+    let reply_dgram_proxy_name2 = proxy_name.map(str::to_string);
     let reply_listen_port = listen_port;
     let is_dtls = reply_dtls.is_some();
     tokio::spawn(async move {
@@ -1580,6 +1673,48 @@ async fn create_session(
                 break;
             };
 
+            // Amplification factor check: drop backend responses that exceed
+            // the configured ratio relative to the last client request size.
+            if let Some(factor) = reply_amplification_factor {
+                let req_size = reply_session.last_request_size.load(Ordering::Relaxed);
+                if req_size > 0 {
+                    let max_response = (req_size as f64 * factor as f64) as u64;
+                    if len as u64 > max_response {
+                        warn!(
+                            proxy_id = %reply_proxy_id,
+                            client = %client_addr,
+                            response_size = len,
+                            request_size = req_size,
+                            factor = factor,
+                            "UDP response dropped: exceeds amplification factor"
+                        );
+                        continue; // Drop this response datagram, continue receiving
+                    }
+                }
+            }
+
+            // Run backend→client per-datagram plugin hooks.
+            if reply_has_datagram_plugins {
+                let ctx = UdpDatagramContext {
+                    client_ip: reply_dgram_client_ip.clone(),
+                    proxy_id: reply_dgram_proxy_id.clone(),
+                    proxy_name: reply_dgram_proxy_name2.clone(),
+                    listen_port: reply_listen_port,
+                    datagram_size: len,
+                    direction: UdpDatagramDirection::BackendToClient,
+                };
+                let mut drop = false;
+                for plugin in &reply_datagram_plugins {
+                    if matches!(plugin.on_udp_datagram(&ctx).await, UdpDatagramVerdict::Drop) {
+                        drop = true;
+                        break;
+                    }
+                }
+                if drop {
+                    continue; // Silent drop
+                }
+            }
+
             // Batch-local counters for this recv burst.
             let mut batch_dgrams: u64 = 1;
             let mut batch_bytes: u64 = len as u64;
@@ -1610,6 +1745,42 @@ async fn create_session(
                 for _ in 0..RECV_BATCH_LIMIT {
                     match sock.try_recv(&mut buf) {
                         Ok(len2) => {
+                            // Amplification check on batched response datagram
+                            if let Some(factor) = reply_amplification_factor {
+                                let req_size =
+                                    reply_session.last_request_size.load(Ordering::Relaxed);
+                                if req_size > 0 {
+                                    let max_response = (req_size as f64 * factor as f64) as u64;
+                                    if len2 as u64 > max_response {
+                                        continue; // Drop oversized response
+                                    }
+                                }
+                            }
+                            // Backend→client plugin hooks on batched datagram
+                            if reply_has_datagram_plugins {
+                                let ctx = UdpDatagramContext {
+                                    client_ip: reply_dgram_client_ip.clone(),
+                                    proxy_id: reply_dgram_proxy_id.clone(),
+                                    proxy_name: reply_dgram_proxy_name2.clone(),
+                                    listen_port: reply_listen_port,
+                                    datagram_size: len2,
+                                    direction: UdpDatagramDirection::BackendToClient,
+                                };
+                                let mut drop = false;
+                                for plugin in &reply_datagram_plugins {
+                                    if matches!(
+                                        plugin.on_udp_datagram(&ctx).await,
+                                        UdpDatagramVerdict::Drop
+                                    ) {
+                                        drop = true;
+                                        break;
+                                    }
+                                }
+                                if drop {
+                                    continue;
+                                }
+                            }
+
                             batch_dgrams += 1;
                             batch_bytes += len2 as u64;
                             batch_bytes_received += len2 as u64;
@@ -1795,6 +1966,7 @@ mod tests {
             created_at: AtomicU64::new(1_710_000_000_000),
             bytes_sent: AtomicU64::new(128),
             bytes_received: AtomicU64::new(256),
+            last_request_size: AtomicU64::new(64),
             backend_target: "10.0.0.50:5353".to_string(),
             backend_resolved_ip: "10.0.0.50".to_string(),
             metadata: std::sync::Mutex::new(HashMap::from([(

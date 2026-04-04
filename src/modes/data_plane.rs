@@ -41,6 +41,7 @@ pub async fn run(
         max_cache_size: env_config.dns_cache_max_size,
         warmup_concurrency: env_config.dns_warmup_concurrency,
         slow_threshold_ms: env_config.dns_slow_threshold_ms,
+        backend_allow_ips: env_config.backend_allow_ips.clone(),
     });
 
     // Start DNS background refresh
@@ -50,6 +51,11 @@ pub async fn run(
     // Build TLS hardening policy from environment (needed for both frontend
     // and backend TLS — cipher suites, protocol versions, key exchange groups).
     let tls_policy = TlsPolicy::from_env_config(&env_config)?;
+    let crls = tls::load_crls(env_config.tls_crl_file_path.as_deref())?;
+    let admin_allowed_cidrs = Arc::new(
+        crate::proxy::client_ip::TrustedProxies::parse_strict(&env_config.admin_allowed_cidrs)
+            .map_err(|e| anyhow::anyhow!("FERRUM_ADMIN_ALLOWED_CIDRS: {}", e))?,
+    );
 
     // Start with empty config; CP will push the real one via gRPC
     let proxy_state = ProxyState::new(
@@ -159,6 +165,7 @@ pub async fn run(
             env_config.tls_no_verify,
             &tls_policy,
             env_config.tls_cert_expiry_warning_days,
+            &crls,
         ) {
             Ok(config) => {
                 if client_ca_bundle_path.is_some() {
@@ -320,6 +327,7 @@ pub async fn run(
         admin_restore_max_body_size_mib: env_config.admin_restore_max_body_size_mib,
         reserved_ports: reserved_ports.clone(),
         stream_proxy_bind_address: env_config.stream_proxy_bind_address.clone(),
+        admin_allowed_cidrs: admin_allowed_cidrs.clone(),
     };
     let admin_shutdown = shutdown_tx.subscribe();
 
@@ -354,6 +362,7 @@ pub async fn run(
             admin_restore_max_body_size_mib: env_config.admin_restore_max_body_size_mib,
             reserved_ports: reserved_ports.clone(),
             stream_proxy_bind_address: env_config.stream_proxy_bind_address.clone(),
+            admin_allowed_cidrs: admin_allowed_cidrs.clone(),
         };
         let admin_https_shutdown = shutdown_tx.subscribe();
 
@@ -366,6 +375,7 @@ pub async fn run(
             env_config.admin_tls_no_verify,
             &tls_policy,
             env_config.tls_cert_expiry_warning_days,
+            &crls,
         ) {
             Ok(config) => {
                 if admin_client_ca_bundle.is_some() {

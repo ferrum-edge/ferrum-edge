@@ -55,6 +55,9 @@ fn create_test_admin_state(config: &TestConfig, read_only: bool) -> AdminState {
         admin_restore_max_body_size_mib: 100,
         reserved_ports: std::collections::HashSet::new(),
         stream_proxy_bind_address: "0.0.0.0".to_string(),
+        admin_allowed_cidrs: std::sync::Arc::new(
+            ferrum_edge::proxy::client_ip::TrustedProxies::none(),
+        ),
     }
 }
 
@@ -174,6 +177,9 @@ async fn test_admin_state_mode_field() {
         admin_restore_max_body_size_mib: 100,
         reserved_ports: std::collections::HashSet::new(),
         stream_proxy_bind_address: "0.0.0.0".to_string(),
+        admin_allowed_cidrs: std::sync::Arc::new(
+            ferrum_edge::proxy::client_ip::TrustedProxies::none(),
+        ),
     };
     assert_eq!(admin_state_prod.mode, "production");
 }
@@ -205,6 +211,9 @@ async fn test_check_write_allowed_permits_when_db_available() {
         admin_restore_max_body_size_mib: 100,
         reserved_ports: std::collections::HashSet::new(),
         stream_proxy_bind_address: "0.0.0.0".to_string(),
+        admin_allowed_cidrs: std::sync::Arc::new(
+            ferrum_edge::proxy::client_ip::TrustedProxies::none(),
+        ),
     };
     assert!(
         state.check_write_allowed().is_none(),
@@ -228,6 +237,9 @@ async fn test_check_write_allowed_blocks_when_db_unavailable() {
         admin_restore_max_body_size_mib: 100,
         reserved_ports: std::collections::HashSet::new(),
         stream_proxy_bind_address: "0.0.0.0".to_string(),
+        admin_allowed_cidrs: std::sync::Arc::new(
+            ferrum_edge::proxy::client_ip::TrustedProxies::none(),
+        ),
     };
     let resp = state.check_write_allowed();
     assert!(
@@ -257,6 +269,9 @@ async fn test_check_write_allowed_blocks_when_read_only() {
         admin_restore_max_body_size_mib: 100,
         reserved_ports: std::collections::HashSet::new(),
         stream_proxy_bind_address: "0.0.0.0".to_string(),
+        admin_allowed_cidrs: std::sync::Arc::new(
+            ferrum_edge::proxy::client_ip::TrustedProxies::none(),
+        ),
     };
     let resp = state.check_write_allowed();
     assert!(
@@ -285,6 +300,9 @@ async fn test_check_write_allowed_permits_when_no_db_flag() {
         admin_restore_max_body_size_mib: 100,
         reserved_ports: std::collections::HashSet::new(),
         stream_proxy_bind_address: "0.0.0.0".to_string(),
+        admin_allowed_cidrs: std::sync::Arc::new(
+            ferrum_edge::proxy::client_ip::TrustedProxies::none(),
+        ),
     };
     assert!(
         state.check_write_allowed().is_none(),
@@ -308,6 +326,9 @@ async fn test_db_available_flag_transitions() {
         admin_restore_max_body_size_mib: 100,
         reserved_ports: std::collections::HashSet::new(),
         stream_proxy_bind_address: "0.0.0.0".to_string(),
+        admin_allowed_cidrs: std::sync::Arc::new(
+            ferrum_edge::proxy::client_ip::TrustedProxies::none(),
+        ),
     };
 
     // Initially available

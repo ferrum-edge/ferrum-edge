@@ -25,6 +25,7 @@ use tracing::{error, info, warn};
 pub fn load_config_from_file(
     path: &str,
     cert_expiry_warning_days: u64,
+    backend_allow_ips: &crate::config::BackendAllowIps,
 ) -> Result<GatewayConfig, anyhow::Error> {
     let file_path = Path::new(path);
     if !file_path.exists() {
@@ -114,7 +115,9 @@ pub fn load_config_from_file(
     }
 
     // Validate all field-level constraints (lengths, ranges, nested configs)
-    if let Err(errors) = config.validate_all_fields(cert_expiry_warning_days) {
+    if let Err(errors) =
+        config.validate_all_fields_with_ip_policy(cert_expiry_warning_days, backend_allow_ips)
+    {
         for msg in &errors {
             error!("{}", msg);
         }
@@ -274,7 +277,8 @@ pub fn load_config_from_file(
 pub fn reload_config_from_file(
     path: &str,
     cert_expiry_warning_days: u64,
+    backend_allow_ips: &crate::config::BackendAllowIps,
 ) -> Result<GatewayConfig, anyhow::Error> {
     info!("Reloading configuration from file: {}", path);
-    load_config_from_file(path, cert_expiry_warning_days)
+    load_config_from_file(path, cert_expiry_warning_days, backend_allow_ips)
 }

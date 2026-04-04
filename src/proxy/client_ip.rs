@@ -75,6 +75,40 @@ impl TrustedProxies {
         Self { cidrs }
     }
 
+    /// Parse a comma-separated list of CIDRs/IPs, failing if any entry is invalid.
+    ///
+    /// Unlike `parse()` which skips invalid entries, this method returns an error
+    /// if the input is non-empty but produces zero valid CIDRs. Used for security-
+    /// critical allowlists (e.g., admin API) where a typo must not silently fail open.
+    pub fn parse_strict(raw: &str) -> Result<Self, String> {
+        if raw.trim().is_empty() {
+            return Ok(Self { cidrs: Vec::new() });
+        }
+        let mut cidrs = Vec::new();
+        let mut invalid = Vec::new();
+        for entry in raw.split(',') {
+            let entry = entry.trim();
+            if entry.is_empty() {
+                continue;
+            }
+            if let Some(cidr) = Self::parse_cidr(entry) {
+                cidrs.push(cidr);
+            } else {
+                invalid.push(entry.to_string());
+            }
+        }
+        if !invalid.is_empty() {
+            return Err(format!(
+                "Invalid CIDR/IP entries: {}. Expected formats: 10.0.0.0/8, 192.168.1.1, ::1",
+                invalid.join(", ")
+            ));
+        }
+        if !cidrs.is_empty() {
+            tracing::info!("Configured {} admin allowed CIDR(s)", cidrs.len());
+        }
+        Ok(Self { cidrs })
+    }
+
     /// Returns an empty set (no trusted proxies — XFF headers will be ignored).
     #[allow(dead_code)] // Used by tests
     pub fn none() -> Self {

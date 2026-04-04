@@ -26,6 +26,7 @@ A comprehensive feature list for Ferrum Edge.
 - Pre-sorted route table with bounded O(1) path cache, rebuilt atomically on config changes
 - Configurable path stripping and backend path prefixing
 - Per-proxy HTTP method filtering (`allowed_methods`) with 405 Method Not Allowed responses
+- Per-proxy WebSocket Origin validation (`allowed_ws_origins`) for CSWSH protection (RFC 6455 §10.2)
 
 ## Load Balancing
 
@@ -149,10 +150,24 @@ Ferrum supports dynamic upstream target discovery through three providers, confi
 - Protocol-level request validation (anti-smuggling, desync prevention):
   - HTTP/1.x: Content-Length + Transfer-Encoding conflict rejection
   - All versions: Multiple Content-Length with mismatched values rejection
+  - HTTP/1.0: Transfer-Encoding rejection (RFC 9112 §6.2 — no chunked in 1.0)
+  - All versions: Content-Length non-numeric value rejection (RFC 9110 §8.6)
   - HTTP/1.x: Multiple Host header rejection
   - HTTP/2: TE header restricted to "trailers" only
+  - All versions: TRACE method blocked (anti-XST)
   - gRPC: POST method enforcement
   - WebSocket: Sec-WebSocket-Key format validation (base64 16-byte nonce)
+  - WebSocket: Per-proxy Origin validation (`allowed_ws_origins`) for CSWSH protection
+- Admin API security headers (X-Content-Type-Options, Cache-Control, X-Frame-Options)
+- HTTP/1.1 header read timeout for slowloris protection (`FERRUM_HTTP_HEADER_READ_TIMEOUT_SECONDS`)
+- Hop-by-hop header stripping per RFC 9110 §7.6.1 (including Proxy-Authenticate)
+- Backend IP allowlist policy (`FERRUM_BACKEND_ALLOW_IPS`) for SSRF protection with three-layer enforcement (config-time, DNS-resolution-time, connection-time)
+- UDP response amplification protection (`udp_max_response_amplification_factor` per-proxy) with symmetric `on_udp_datagram` plugin hooks (client→backend and backend→client)
+- Per-IP concurrent request limiting (`FERRUM_MAX_CONCURRENT_REQUESTS_PER_IP`) with RAII Drop guard for leak-free tracking across 30+ return paths
+- Admin API IP allowlist (`FERRUM_ADMIN_ALLOWED_CIDRS`) — TCP-level rejection before TLS handshake or request processing
+- Opt-in Via header (RFC 9110 §7.6.3) on request and response paths (`FERRUM_ADD_VIA_HEADER`)
+- Opt-in Forwarded header (RFC 7239) alongside X-Forwarded-* (`FERRUM_ADD_FORWARDED_HEADER`)
+- Certificate Revocation List (CRL) checking across all TLS/DTLS surfaces (`FERRUM_TLS_CRL_FILE_PATH`)
 
 ## DNS Caching
 

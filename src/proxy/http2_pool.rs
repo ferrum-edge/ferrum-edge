@@ -57,6 +57,8 @@ pub struct Http2ConnectionPool {
     global_env_config: crate::config::EnvConfig,
     /// TLS hardening policy for backend connections (cipher suites, protocol versions).
     tls_policy: Option<Arc<TlsPolicy>>,
+    /// Certificate Revocation Lists for backend TLS verification.
+    crls: crate::tls::CrlList,
 }
 
 impl Default for Http2ConnectionPool {
@@ -65,6 +67,7 @@ impl Default for Http2ConnectionPool {
             PoolConfig::default(),
             crate::config::EnvConfig::default(),
             None,
+            Arc::new(Vec::new()),
         )
     }
 }
@@ -74,6 +77,7 @@ impl Http2ConnectionPool {
         global_pool_config: PoolConfig,
         global_env_config: crate::config::EnvConfig,
         tls_policy: Option<Arc<TlsPolicy>>,
+        crls: crate::tls::CrlList,
     ) -> Self {
         let pool = Self {
             entries: Arc::new(DashMap::new()),
@@ -81,6 +85,7 @@ impl Http2ConnectionPool {
             global_pool_config,
             global_env_config,
             tls_policy,
+            crls,
         };
 
         pool.start_cleanup_task();
@@ -454,17 +459,21 @@ impl Http2ConnectionPool {
                 cert_path, key_path
             );
 
+            let verifier = crate::tls::build_server_verifier_with_crls(root_store, &self.crls)
+                .map_err(|e| Http2PoolError::Internal(format!("CRL verifier error: {}", e)))?;
             crate::tls::backend_client_config_builder(self.tls_policy.as_deref())
                 .map_err(|e| Http2PoolError::Internal(format!("TLS policy error: {}", e)))?
-                .with_root_certificates(root_store)
+                .with_webpki_verifier(verifier)
                 .with_client_auth_cert(certs, key)
                 .map_err(|e| {
                     Http2PoolError::Internal(format!("Invalid client certificate/key: {}", e))
                 })?
         } else {
+            let verifier = crate::tls::build_server_verifier_with_crls(root_store, &self.crls)
+                .map_err(|e| Http2PoolError::Internal(format!("CRL verifier error: {}", e)))?;
             crate::tls::backend_client_config_builder(self.tls_policy.as_deref())
                 .map_err(|e| Http2PoolError::Internal(format!("TLS policy error: {}", e)))?
-                .with_root_certificates(root_store)
+                .with_webpki_verifier(verifier)
                 .with_no_client_auth()
         };
 

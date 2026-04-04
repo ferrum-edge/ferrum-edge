@@ -544,6 +544,42 @@ fn build_xff_value(existing_xff: Option<&str>, client_ip: &str) -> String {
     }
 }
 
+/// RAII guard that decrements the per-IP concurrent request counter on drop.
+/// Created after client IP resolution; guarantees decrement on every exit path
+/// (including early returns and panics).
+pub struct PerIpRequestGuard {
+    pub ip: String,
+    pub counts: Arc<dashmap::DashMap<String, AtomicU64>>,
+}
+
+impl Drop for PerIpRequestGuard {
+    fn drop(&mut self) {
+        if let Some(entry) = self.counts.get(&self.ip) {
+            entry.value().fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Build RFC 7239 Forwarded header value.
+/// IPv6 addresses are quoted per RFC 7239 §6.
+pub fn build_forwarded_value(client_ip: &str, proto: &str, host: Option<&str>) -> String {
+    // Quote IPv6 addresses: for="[2001:db8::1]"
+    let for_part = if client_ip.contains(':') {
+        format!("for=\"[{}]\"", client_ip)
+    } else {
+        format!("for={}", client_ip)
+    };
+    let mut val = String::with_capacity(64);
+    val.push_str(&for_part);
+    val.push_str(";proto=");
+    val.push_str(proto);
+    if let Some(h) = host {
+        val.push_str(";host=");
+        val.push_str(h);
+    }
+    val
+}
+
 async fn apply_request_body_plugins(
     plugins: &[Arc<dyn Plugin>],
     headers: &HashMap<String, String>,
@@ -657,6 +693,13 @@ pub struct ProxyState {
     /// Pre-computed Alt-Svc header value for HTTP/3 advertisement.
     /// `None` when HTTP/3 is disabled; avoids a `format!()` allocation per response.
     pub alt_svc_header: Option<String>,
+    /// Pre-computed Via header values per protocol version (RFC 9110 §7.6.3).
+    /// `None` when `FERRUM_ADD_VIA_HEADER=false` (default). Keyed by protocol version string.
+    pub via_header_http11: Option<String>,
+    pub via_header_http2: Option<String>,
+    pub via_header_http3: Option<String>,
+    /// Whether to add Forwarded header (RFC 7239) alongside X-Forwarded-*.
+    pub add_forwarded_header: bool,
     /// Environment config for backend TLS settings (WebSocket, etc.)
     pub env_config: Arc<crate::config::EnvConfig>,
     // Size limits
@@ -675,6 +718,11 @@ pub struct ProxyState {
     /// Optional dedicated WebSocket admission control.
     /// Enforced only on the upgrade path, never on the frame-forwarding hot path.
     pub websocket_conn_limit: Option<Arc<tokio::sync::Semaphore>>,
+    /// Per-IP concurrent request counters. Each IP gets an AtomicU64 tracking
+    /// active requests. `None` when `FERRUM_MAX_CONCURRENT_REQUESTS_PER_IP=0` (disabled).
+    pub per_ip_request_counts: Option<Arc<dashmap::DashMap<String, AtomicU64>>>,
+    /// Maximum concurrent requests per resolved client IP. 0 = disabled.
+    pub max_concurrent_requests_per_ip: u64,
     /// Manages TCP/UDP stream proxy listeners (dedicated port per proxy).
     pub stream_listener_manager: Arc<stream_listener::StreamListenerManager>,
     /// Monotonic instant captured at ProxyState creation for uptime calculation.
@@ -686,6 +734,9 @@ pub struct ProxyState {
     /// When set, all backend TLS connections use the same cipher suites,
     /// protocol versions, and key exchange groups as inbound listeners.
     pub tls_policy: Option<Arc<TlsPolicy>>,
+    /// Certificate Revocation Lists for backend TLS verification.
+    /// Loaded once at startup from `FERRUM_TLS_CRL_FILE_PATH` and shared via Arc.
+    pub crls: crate::tls::CrlList,
 }
 
 impl ProxyState {
@@ -700,6 +751,17 @@ impl ProxyState {
         } else {
             None
         };
+        let (via_header_http11, via_header_http2, via_header_http3) = if env_config.add_via_header {
+            let p = &env_config.via_pseudonym;
+            (
+                Some(format!("1.1 {p}")),
+                Some(format!("2.0 {p}")),
+                Some(format!("3.0 {p}")),
+            )
+        } else {
+            (None, None, None)
+        };
+        let add_forwarded_header = env_config.add_forwarded_header;
         let max_header_size_bytes = env_config.max_header_size_bytes;
         let max_single_header_size_bytes = env_config.max_single_header_size_bytes;
         let max_header_count = env_config.max_header_count;
@@ -709,6 +771,7 @@ impl ProxyState {
         let max_query_params = env_config.max_query_params;
         let max_grpc_recv_size_bytes = env_config.max_grpc_recv_size_bytes;
         let max_websocket_frame_size_bytes = env_config.max_websocket_frame_size_bytes;
+        let max_concurrent_requests_per_ip = env_config.max_concurrent_requests_per_ip;
         let trusted_proxies = Arc::new(client_ip::TrustedProxies::parse(
             &env_config.trusted_proxies,
         ));
@@ -722,15 +785,18 @@ impl ProxyState {
         // Create connection pools with global configuration from environment
         let global_pool_config = PoolConfig::from_env();
         let tls_policy_arc = tls_policy.map(Arc::new);
+        let crls = crate::tls::load_crls(env_config.tls_crl_file_path.as_deref())?;
         let grpc_pool = Arc::new(GrpcConnectionPool::new(
             global_pool_config.clone(),
             env_config.clone(),
             tls_policy_arc.clone(),
+            crls.clone(),
         ));
         let http2_pool = Arc::new(Http2ConnectionPool::new(
             global_pool_config.clone(),
             env_config.clone(),
             tls_policy_arc.clone(),
+            crls.clone(),
         ));
         let env_config_arc = Arc::new(env_config.clone());
         let h3_pool = Arc::new(Http3ConnectionPool::new(env_config_arc.clone()));
@@ -739,6 +805,7 @@ impl ProxyState {
             env_config,
             dns_cache.clone(),
             tls_policy_arc.clone(),
+            crls.clone(),
         ));
         // Build router cache with pre-sorted route table for fast prefix matching
         let router_cache = Arc::new(RouterCache::new(&config, 10_000));
@@ -809,6 +876,7 @@ impl ProxyState {
             env_config_arc.udp_max_sessions,
             env_config_arc.udp_cleanup_interval_seconds,
             tls_policy_arc.clone(),
+            crls.clone(),
         ));
 
         Ok(Self {
@@ -828,6 +896,10 @@ impl ProxyState {
             http2_pool,
             h3_pool,
             alt_svc_header,
+            via_header_http11,
+            via_header_http2,
+            via_header_http3,
+            add_forwarded_header,
             env_config: env_config_arc,
             max_header_size_bytes,
             max_single_header_size_bytes,
@@ -840,10 +912,17 @@ impl ProxyState {
             max_websocket_frame_size_bytes,
             trusted_proxies,
             websocket_conn_limit,
+            per_ip_request_counts: if max_concurrent_requests_per_ip > 0 {
+                Some(Arc::new(dashmap::DashMap::new()))
+            } else {
+                None
+            },
+            max_concurrent_requests_per_ip,
             stream_listener_manager,
             started_at: Instant::now(),
             ws_connection_counter: Arc::new(AtomicU64::new(0)),
             tls_policy: tls_policy_arc,
+            crls,
         })
     }
 
@@ -1671,9 +1750,10 @@ impl ProxyState {
 
         // Validate the patched config before applying (same validations as load_full_config)
         new_config.normalize_fields();
-        if let Err(errors) =
-            new_config.validate_all_fields(self.env_config.tls_cert_expiry_warning_days)
-        {
+        if let Err(errors) = new_config.validate_all_fields_with_ip_policy(
+            self.env_config.tls_cert_expiry_warning_days,
+            &self.env_config.backend_allow_ips,
+        ) {
             for msg in &errors {
                 warn!("Incremental config field validation: {}", msg);
             }
@@ -1909,7 +1989,17 @@ async fn handle_connection(
     // This is needed for gRPC clients that use h2c prior knowledge.
     let mut builder =
         hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
-    builder.http1().max_buf_size(state.max_header_size_bytes);
+    {
+        let mut http1 = builder.http1();
+        http1.max_buf_size(state.max_header_size_bytes);
+        // Slowloris protection: close connections that take too long to send headers.
+        if state.env_config.http_header_read_timeout_seconds > 0 {
+            http1.timer(hyper_util::rt::TokioTimer::new());
+            http1.header_read_timeout(std::time::Duration::from_secs(
+                state.env_config.http_header_read_timeout_seconds,
+            ));
+        }
+    }
     let pool_cfg = state.connection_pool.global_pool_config();
     builder
         .http2()
@@ -2093,6 +2183,7 @@ async fn handle_websocket_request_authenticated(
             &env_config,
             &client_headers,
             state.tls_policy.as_deref(),
+            &state.crls,
             state.max_websocket_frame_size_bytes,
         )
         .await
@@ -2398,7 +2489,7 @@ async fn handle_websocket_request_authenticated(
 /// Collect headers from the client request that should be forwarded to the backend WebSocket.
 /// Hop-by-hop headers and WebSocket handshake headers are excluded.
 fn collect_forwardable_headers(headers: &hyper::HeaderMap) -> Vec<(String, String)> {
-    /// Headers that must not be forwarded (hop-by-hop + WS handshake).
+    /// Headers that must not be forwarded (hop-by-hop per RFC 9110 §7.6.1 + WS handshake).
     const SKIP_HEADERS: &[&str] = &[
         "connection",
         "upgrade",
@@ -2410,6 +2501,7 @@ fn collect_forwardable_headers(headers: &hyper::HeaderMap) -> Vec<(String, Strin
         "te",
         "trailer",
         "keep-alive",
+        "proxy-authenticate",
         "proxy-authorization",
         "proxy-connection",
     ];
@@ -2480,6 +2572,7 @@ fn build_websocket_tls_connector(
     proxy: &Proxy,
     env_config: &crate::config::EnvConfig,
     tls_policy: Option<&TlsPolicy>,
+    crls: &crate::tls::CrlList,
 ) -> Result<Option<tokio_tungstenite::Connector>, anyhow::Error> {
     // Only build a TLS connector for wss:// backends
     if proxy.backend_protocol != BackendProtocol::Wss {
@@ -2520,15 +2613,19 @@ fn build_websocket_tls_connector(
 
     // Build client config with TLS policy (cipher suites, protocol versions)
     let builder = match crate::tls::backend_client_config_builder(tls_policy) {
-        Ok(b) => b.with_root_certificates(root_store),
+        Ok(b) => {
+            let verifier = crate::tls::build_server_verifier_with_crls(root_store, crls)?;
+            b.with_webpki_verifier(verifier)
+        }
         Err(e) => {
             warn!(
                 "Failed to build WebSocket TLS config with policy: {}, using defaults",
                 e
             );
-            rustls::ClientConfig::builder().with_root_certificates(
-                rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned()),
-            )
+            let fallback_store =
+                rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            let verifier = crate::tls::build_server_verifier_with_crls(fallback_store, crls)?;
+            rustls::ClientConfig::builder().with_webpki_verifier(verifier)
         }
     };
 
@@ -2602,6 +2699,7 @@ async fn connect_websocket_backend(
     env_config: &crate::config::EnvConfig,
     client_headers: &[(String, String)],
     tls_policy: Option<&TlsPolicy>,
+    crls: &crate::tls::CrlList,
     max_websocket_frame_size_bytes: usize,
 ) -> Result<
     WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
@@ -2621,7 +2719,7 @@ async fn connect_websocket_backend(
         }
     }
 
-    let connector = build_websocket_tls_connector(proxy, env_config, tls_policy)?;
+    let connector = build_websocket_tls_connector(proxy, env_config, tls_policy, crls)?;
     let connect_timeout = std::time::Duration::from_millis(proxy.backend_connect_timeout_ms);
     let connect_future =
         connect_async_tls_with_config(ws_request, Some(ws_config), false, connector);
@@ -3036,7 +3134,17 @@ async fn handle_tls_connection(
     // HTTP/2 clients get multiplexed streams; HTTP/1.1 clients get upgrade support.
     let mut builder =
         hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
-    builder.http1().max_buf_size(state.max_header_size_bytes);
+    {
+        let mut http1 = builder.http1();
+        http1.max_buf_size(state.max_header_size_bytes);
+        // Slowloris protection: close connections that take too long to send headers.
+        if state.env_config.http_header_read_timeout_seconds > 0 {
+            http1.timer(hyper_util::rt::TokioTimer::new());
+            http1.header_read_timeout(std::time::Duration::from_secs(
+                state.env_config.http_header_read_timeout_seconds,
+            ));
+        }
+    }
     let pool_cfg = state.connection_pool.global_pool_config();
     builder
         .http2()
@@ -3593,6 +3701,18 @@ pub async fn handle_proxy_request(
         return Ok(build_response(StatusCode::BAD_REQUEST, error_body));
     }
 
+    // Block TRACE method to prevent Cross-Site Tracing (XST) attacks.
+    // TRACE echoes request headers (including cookies and auth tokens) in the
+    // response body, which can be exploited to steal credentials.
+    if method == "TRACE" {
+        warn!("Rejected TRACE request");
+        record_request(&state, 405);
+        return Ok(build_response(
+            StatusCode::METHOD_NOT_ALLOWED,
+            r#"{"error":"TRACE method is not allowed"}"#,
+        ));
+    }
+
     // Resolve real client IP using trusted proxy configuration.
     // Parse the socket IP once and reuse the parsed value to avoid redundant
     // parsing across the real-IP-header check and the XFF walk.
@@ -3631,6 +3751,37 @@ pub async fn handle_proxy_request(
         };
         ctx.client_ip = resolved;
     }
+
+    // Per-IP concurrent request limiting. The guard auto-decrements on drop,
+    // covering all 30+ return paths without manual tracking.
+    let _per_ip_guard = if let Some(ref counts) = state.per_ip_request_counts {
+        let count = counts
+            .entry(ctx.client_ip.clone())
+            .or_insert_with(|| AtomicU64::new(0));
+        let current = count.value().fetch_add(1, Ordering::Relaxed) + 1;
+        let guard = Some(PerIpRequestGuard {
+            ip: ctx.client_ip.clone(),
+            counts: counts.clone(),
+        });
+        if current > state.max_concurrent_requests_per_ip {
+            // Guard will be dropped immediately, decrementing the counter
+            drop(guard);
+            warn!(
+                client_ip = %ctx.client_ip,
+                concurrent = current,
+                limit = state.max_concurrent_requests_per_ip,
+                "Per-IP concurrent request limit exceeded"
+            );
+            record_request(&state, 429);
+            return Ok(build_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                r#"{"error":"Too many concurrent requests from this IP"}"#,
+            ));
+        }
+        guard
+    } else {
+        None
+    };
 
     // Parse query params (skip when empty — most requests have no query string)
     if !query_string.is_empty() {
@@ -4119,6 +4270,27 @@ pub async fn handle_proxy_request(
             BackendProtocol::Ws | BackendProtocol::Wss
         )
     {
+        // Cross-Site WebSocket Hijacking (CSWSH) protection per RFC 6455 §10.2.
+        // When allowed_ws_origins is non-empty, reject upgrades from unlisted origins.
+        if !proxy.allowed_ws_origins.is_empty() {
+            let origin = ctx.headers.get("origin").map(|s| s.as_str()).unwrap_or("");
+            if !proxy
+                .allowed_ws_origins
+                .iter()
+                .any(|allowed| allowed.eq_ignore_ascii_case(origin))
+            {
+                warn!(
+                    "WebSocket upgrade rejected: Origin '{}' not in allowed_ws_origins for proxy {}",
+                    origin, proxy.id
+                );
+                record_request(&state, 403);
+                return Ok(build_response(
+                    StatusCode::FORBIDDEN,
+                    r#"{"error":"WebSocket Origin not allowed"}"#,
+                ));
+            }
+        }
+
         let request = match client_request_body {
             ClientRequestBody::Streaming(request) => *request,
             ClientRequestBody::Buffered(_) => {
@@ -5317,6 +5489,11 @@ pub async fn handle_proxy_request(
         resp_builder = resp_builder.header("alt-svc", alt_svc.as_str());
     }
 
+    // Via header on response path (RFC 9110 §7.6.3)
+    if let Some(ref via) = state.via_header_http11 {
+        resp_builder = resp_builder.header("via", via.as_str());
+    }
+
     // Build response body: either stream from backend or return buffered data.
     // When FERRUM_ENABLE_STREAMING_LATENCY_TRACKING=true, streaming responses are
     // wrapped with a TrackedBody that records the final transfer time via a shared
@@ -5572,10 +5749,24 @@ async fn proxy_to_backend_retry(
         headers.get("x-forwarded-for").map(|s| s.as_str()),
         client_ip,
     );
+    let proto_str = if is_tls { "https" } else { "http" };
     req_builder = req_builder.header("X-Forwarded-For", xff_val);
-    req_builder = req_builder.header("X-Forwarded-Proto", if is_tls { "https" } else { "http" });
+    req_builder = req_builder.header("X-Forwarded-Proto", proto_str);
     if let Some(host) = headers.get("host") {
         req_builder = req_builder.header("X-Forwarded-Host", host.as_str());
+    }
+    if let Some(ref via) = state.via_header_http11 {
+        req_builder = req_builder.header("Via", via.as_str());
+    }
+    if state.add_forwarded_header {
+        req_builder = req_builder.header(
+            "Forwarded",
+            build_forwarded_value(
+                client_ip,
+                proto_str,
+                headers.get("host").map(|s| s.as_str()),
+            ),
+        );
     }
 
     // Replay the original request body on retry if available.
@@ -5867,10 +6058,24 @@ async fn proxy_to_backend(
         headers.get("x-forwarded-for").map(|s| s.as_str()),
         client_ip,
     );
+    let proto_str = if is_tls { "https" } else { "http" };
     req_builder = req_builder.header("X-Forwarded-For", xff_val);
-    req_builder = req_builder.header("X-Forwarded-Proto", if is_tls { "https" } else { "http" });
+    req_builder = req_builder.header("X-Forwarded-Proto", proto_str);
     if let Some(host) = headers.get("host") {
         req_builder = req_builder.header("X-Forwarded-Host", host.as_str());
+    }
+    if let Some(ref via) = state.via_header_http11 {
+        req_builder = req_builder.header("Via", via.as_str());
+    }
+    if state.add_forwarded_header {
+        req_builder = req_builder.header(
+            "Forwarded",
+            build_forwarded_value(
+                client_ip,
+                proto_str,
+                headers.get("host").map(|s| s.as_str()),
+            ),
+        );
     }
 
     let has_body = request_may_have_body(method, headers);
@@ -6420,7 +6625,12 @@ pub fn check_protocol_headers(
 ) -> Option<&'static str> {
     let is_http1 = version == hyper::Version::HTTP_10 || version == hyper::Version::HTTP_11;
 
-    // 1. Content-Length + Transfer-Encoding conflict (HTTP/1.x request smuggling)
+    // 1a. HTTP/1.0 must not use Transfer-Encoding (RFC 9112 §6.2 — HTTP/1.0 has no chunked encoding)
+    if version == hyper::Version::HTTP_10 && headers.contains_key("transfer-encoding") {
+        return Some(r#"{"error":"HTTP/1.0 does not support Transfer-Encoding"}"#);
+    }
+
+    // 1b. Content-Length + Transfer-Encoding conflict (HTTP/1.x request smuggling)
     // HTTP/2 and HTTP/3 don't use Transfer-Encoding (framing is at the protocol layer).
     if is_http1
         && headers.contains_key("transfer-encoding")
@@ -6431,11 +6641,14 @@ pub fn check_protocol_headers(
         );
     }
 
-    // 2. Multiple Content-Length with mismatched values (all HTTP versions)
-    // An intermediary may coalesce duplicate CL headers into a single comma-separated
-    // field line (e.g. "Content-Length: 42, 0"). We must split on commas, trim OWS,
-    // and reject if any parsed value differs — otherwise a smuggling variant that
-    // relies on coalesced CL values can bypass the guard.
+    // 2. Content-Length validation (all HTTP versions)
+    // a) Each token must be ASCII digits only (RFC 9110 §8.6 — non-negative integer).
+    //    Rejecting signs, decimals, hex prefixes, and garbage prevents parsing
+    //    disagreements between the proxy and backend about message boundaries.
+    // b) An intermediary may coalesce duplicate CL headers into a single comma-separated
+    //    field line (e.g. "Content-Length: 42, 0"). We must split on commas, trim OWS,
+    //    and reject if any parsed value differs — otherwise a smuggling variant that
+    //    relies on coalesced CL values can bypass the guard.
     {
         let mut canonical: Option<&[u8]> = None;
         for val in headers.get_all("content-length") {
@@ -6444,6 +6657,13 @@ pub fn check_protocol_headers(
                 if trimmed.is_empty() {
                     continue;
                 }
+                // 2a. Must be ASCII digits only (no signs, decimals, hex, or garbage)
+                if !trimmed.iter().all(|&b| b.is_ascii_digit()) {
+                    return Some(
+                        r#"{"error":"Content-Length header contains invalid non-numeric value"}"#,
+                    );
+                }
+                // 2b. All tokens must agree on the same value
                 match canonical {
                     None => canonical = Some(trimmed),
                     Some(prev) if prev != trimmed => {
@@ -6635,6 +6855,22 @@ async fn proxy_to_backend_http2(
         && let Ok(val) = hyper::header::HeaderValue::from_str(host)
     {
         parts.headers.insert("x-forwarded-host", val);
+    }
+    if let Some(ref via) = state.via_header_http2
+        && let Ok(val) = hyper::header::HeaderValue::from_str(via)
+    {
+        parts.headers.insert("via", val);
+    }
+    if state.add_forwarded_header {
+        let proto_str = if is_tls { "https" } else { "http" };
+        let fwd = build_forwarded_value(
+            client_ip,
+            proto_str,
+            headers.get("host").map(|s| s.as_str()),
+        );
+        if let Ok(val) = hyper::header::HeaderValue::from_str(&fwd) {
+            parts.headers.insert("forwarded", val);
+        }
     }
 
     let backend_req = Request::from_parts(parts, body);
@@ -6885,6 +7121,18 @@ async fn proxy_to_backend_http3(
             hyper::header::HeaderName::from_static("x-forwarded-host"),
             v,
         ));
+    }
+    if let Some(ref via) = state.via_header_http3
+        && let Ok(v) = via.parse()
+    {
+        http3_headers.push((hyper::header::HeaderName::from_static("via"), v));
+    }
+    if state.add_forwarded_header {
+        let fwd =
+            build_forwarded_value(client_ip, "https", headers.get("host").map(|s| s.as_str()));
+        if let Ok(v) = fwd.parse() {
+            http3_headers.push((hyper::header::HeaderName::from_static("forwarded"), v));
+        }
     }
 
     // Make HTTP/3 request via connection pool (reuses QUIC connections).

@@ -56,6 +56,9 @@ pub struct AdminState {
     pub reserved_ports: std::collections::HashSet<u16>,
     /// Bind address used for stream proxy listeners (for OS port availability checks).
     pub stream_proxy_bind_address: String,
+    /// Parsed admin API IP allowlist. When non-empty, only connections from
+    /// matching IPs are accepted. Checked at the TCP level before any processing.
+    pub admin_allowed_cidrs: Arc<crate::proxy::client_ip::TrustedProxies>,
 }
 
 impl AdminState {
@@ -111,6 +114,19 @@ pub async fn start_admin_listener_with_tls(
             result = listener.accept() => {
                 match result {
                     Ok((stream, remote_addr)) => {
+                        // Admin IP allowlist: reject connections from non-allowed IPs
+                        // at the TCP level, before TLS handshake or request processing.
+                        if !state.admin_allowed_cidrs.is_empty()
+                            && !state.admin_allowed_cidrs.contains(&remote_addr.ip())
+                        {
+                            debug!(
+                                remote_addr = %remote_addr.ip(),
+                                "Admin connection rejected: IP not in FERRUM_ADMIN_ALLOWED_CIDRS"
+                            );
+                            drop(stream);
+                            continue;
+                        }
+
                         let state = state.clone();
                         let tls_config = tls_config.clone();
 
@@ -361,6 +377,8 @@ pub async fn handle_admin_request(
         let resp = Response::builder()
             .status(StatusCode::OK)
             .header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+            .header("X-Content-Type-Options", "nosniff")
+            .header("Cache-Control", "no-store")
             .body(Full::new(Bytes::from(metrics_output)))
             .unwrap_or_else(|_| {
                 Response::new(Full::new(Bytes::from("# error rendering metrics\n")))
@@ -2368,6 +2386,9 @@ async fn handle_metrics(state: &AdminState) -> Result<Response<Full<Bytes>>, hyp
             .status(StatusCode::OK)
             .header("Content-Type", "application/json")
             .header("X-Cache", "hit")
+            .header("X-Content-Type-Options", "nosniff")
+            .header("Cache-Control", "no-store")
+            .header("X-Frame-Options", "DENY")
             .body(Full::new(bytes.clone()))
             .unwrap_or_else(|_| Response::new(Full::new(Bytes::from("{}"))));
         return Ok(resp);
@@ -2383,6 +2404,9 @@ async fn handle_metrics(state: &AdminState) -> Result<Response<Full<Bytes>>, hyp
         .status(StatusCode::OK)
         .header("Content-Type", "application/json")
         .header("X-Cache", "miss")
+        .header("X-Content-Type-Options", "nosniff")
+        .header("Cache-Control", "no-store")
+        .header("X-Frame-Options", "DENY")
         .body(Full::new(body_bytes))
         .unwrap_or_else(|_| Response::new(Full::new(Bytes::from("{}"))));
     Ok(resp)
@@ -3073,6 +3097,9 @@ async fn handle_backup(
             "attachment; filename=\"ferrum-backup.json\"",
         )
         .header("X-Data-Source", source)
+        .header("X-Content-Type-Options", "nosniff")
+        .header("Cache-Control", "no-store")
+        .header("X-Frame-Options", "DENY")
         .body(Full::new(Bytes::from(body_bytes)))
         .unwrap_or_else(|_| {
             Response::new(Full::new(Bytes::from(
@@ -3364,6 +3391,9 @@ fn json_response(status: StatusCode, body: &Value) -> Response<Full<Bytes>> {
     Response::builder()
         .status(status)
         .header("Content-Type", "application/json")
+        .header("X-Content-Type-Options", "nosniff")
+        .header("Cache-Control", "no-store")
+        .header("X-Frame-Options", "DENY")
         .body(Full::new(Bytes::from(body_str)))
         .unwrap_or_else(|_| {
             Response::new(Full::new(Bytes::from(
@@ -3379,6 +3409,9 @@ fn json_response_with_stale(status: StatusCode, body: &Value) -> Response<Full<B
         .status(status)
         .header("Content-Type", "application/json")
         .header("X-Data-Source", "cached")
+        .header("X-Content-Type-Options", "nosniff")
+        .header("Cache-Control", "no-store")
+        .header("X-Frame-Options", "DENY")
         .body(Full::new(Bytes::from(body_str)))
         .unwrap_or_else(|_| {
             Response::new(Full::new(Bytes::from(

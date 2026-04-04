@@ -24,6 +24,42 @@ use tracing::{info, warn};
 use x509_parser::prelude::*;
 
 use crate::config::EnvConfig;
+use rustls::pki_types::CertificateRevocationListDer;
+
+/// Loaded CRL data shared across all TLS surfaces. Empty when no CRL file is configured.
+pub type CrlList = Arc<Vec<CertificateRevocationListDer<'static>>>;
+
+/// Load Certificate Revocation Lists from a PEM file.
+///
+/// The file may contain multiple `-----BEGIN X509 CRL-----` blocks.
+/// Returns an empty Vec if `path` is `None`.
+pub fn load_crls(path: Option<&str>) -> Result<CrlList, anyhow::Error> {
+    let Some(crl_path) = path else {
+        return Ok(Arc::new(Vec::new()));
+    };
+
+    let file = File::open(crl_path)
+        .map_err(|e| anyhow::anyhow!("Failed to open CRL file '{}': {}", crl_path, e))?;
+    let mut reader = BufReader::new(file);
+
+    let crls: Vec<CertificateRevocationListDer<'static>> = rustls_pemfile::crls(&mut reader)
+        .filter_map(|r| r.ok())
+        .collect();
+
+    if crls.is_empty() {
+        return Err(anyhow::anyhow!(
+            "No valid CRL entries found in '{}'. Expected PEM blocks with '-----BEGIN X509 CRL-----'",
+            crl_path
+        ));
+    }
+
+    info!(
+        "Loaded {} CRL(s) from {} for certificate revocation checking",
+        crls.len(),
+        crl_path
+    );
+    Ok(Arc::new(crls))
+}
 
 /// Default number of days before expiration to emit a warning.
 pub const DEFAULT_CERT_EXPIRY_WARNING_DAYS: u64 = 30;
@@ -238,6 +274,7 @@ pub fn load_tls_config_with_client_auth(
     no_verify: bool,
     tls_policy: &TlsPolicy,
     cert_expiry_warning_days: u64,
+    crls: &[CertificateRevocationListDer<'static>],
 ) -> Result<Arc<ServerConfig>, anyhow::Error> {
     // Check certificate expiration before loading
     check_cert_expiry(cert_path, "server TLS cert", cert_expiry_warning_days)?;
@@ -291,12 +328,21 @@ pub fn load_tls_config_with_client_auth(
             cert_path, key_path, ca_bundle_path, added, ignored
         );
 
-        let client_cert_verifier =
-            rustls::server::WebPkiClientVerifier::builder(Arc::new(client_auth_roots))
-                .build()
-                .map_err(|e| {
-                    anyhow::anyhow!("Failed to build client certificate verifier: {}", e)
-                })?;
+        let mut verifier_builder =
+            rustls::server::WebPkiClientVerifier::builder(Arc::new(client_auth_roots));
+        if !crls.is_empty() {
+            verifier_builder = verifier_builder
+                .with_crls(crls.iter().cloned())
+                .allow_unknown_revocation_status()
+                .only_check_end_entity_revocation();
+            info!(
+                "Client certificate CRL checking enabled ({} CRL(s))",
+                crls.len()
+            );
+        }
+        let client_cert_verifier = verifier_builder
+            .build()
+            .map_err(|e| anyhow::anyhow!("Failed to build client certificate verifier: {}", e))?;
 
         builder
             .with_client_cert_verifier(client_cert_verifier)
@@ -364,6 +410,31 @@ pub fn backend_client_config_builder(
                 .map_err(|e| anyhow::anyhow!("Failed to set default TLS protocol versions: {}", e))
         }
     }
+}
+
+/// Build a `WebPkiServerVerifier` with optional CRL checking.
+///
+/// When CRLs are provided, the verifier rejects certificates that appear in any CRL.
+/// Uses `allow_unknown_revocation_status()` so certificates not covered by any CRL
+/// (e.g., from public CAs without matching CRLs) are still accepted.
+pub fn build_server_verifier_with_crls(
+    root_store: rustls::RootCertStore,
+    crls: &[CertificateRevocationListDer<'static>],
+) -> Result<Arc<rustls::client::WebPkiServerVerifier>, anyhow::Error> {
+    // Use ring provider explicitly so this works even when no global CryptoProvider
+    // is installed (e.g., in unit/integration tests).
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let mut builder =
+        rustls::client::WebPkiServerVerifier::builder_with_provider(Arc::new(root_store), provider);
+    if !crls.is_empty() {
+        builder = builder
+            .with_crls(crls.iter().cloned())
+            .allow_unknown_revocation_status()
+            .only_check_end_entity_revocation();
+    }
+    builder
+        .build()
+        .map_err(|e| anyhow::anyhow!("Failed to build server certificate verifier: {}", e))
 }
 
 /// A certificate verifier that accepts any server certificate.
