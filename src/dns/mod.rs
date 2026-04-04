@@ -262,6 +262,10 @@ impl DnsCache {
         // 4. Perform actual DNS resolution
         match self.timed_resolve(hostname).await {
             Ok((addrs, record_type)) if !addrs.is_empty() => {
+                // Check backend IP policy BEFORE caching to prevent denied IPs
+                // from being served on subsequent requests via the cache.
+                self.check_backend_ip_policy(addrs[0], hostname)?;
+
                 let ttl = per_proxy_ttl
                     .map(Duration::from_secs)
                     .or(self.valid_ttl_override)
@@ -282,7 +286,7 @@ impl DnsCache {
                     "DNS resolved {} -> {:?} (ttl={:?})",
                     hostname, addrs[0], ttl
                 );
-                self.check_backend_ip_policy(addrs[0], hostname)
+                Ok(addrs[0])
             }
             Ok(_) | Err(_) if hostname == "localhost" => {
                 // Fallback for localhost — hickory-resolver may not read
