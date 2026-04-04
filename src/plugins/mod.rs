@@ -1088,6 +1088,7 @@ pub fn available_plugins() -> Vec<&'static str> {
         "ws_frame_logging",
         "ws_rate_limiting",
         "udp_rate_limiting",
+        "request_mirror",
     ];
     plugins.extend(crate::custom_plugins::custom_plugin_names());
     plugins
