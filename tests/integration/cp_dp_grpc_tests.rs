@@ -17,7 +17,10 @@ use tonic::transport::server::ServerTlsConfig;
 use tonic::transport::{Certificate, Identity, Server};
 
 use ferrum_edge::config::db_loader::IncrementalResult;
-use ferrum_edge::config::types::{AuthMode, BackendProtocol, GatewayConfig, Proxy};
+use ferrum_edge::config::types::{
+    AuthMode, BackendProtocol, Consumer, GatewayConfig, LoadBalancerAlgorithm, Proxy, Upstream,
+    UpstreamTarget,
+};
 use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::grpc::cp_server::CpGrpcServer;
 use ferrum_edge::grpc::dp_client::{self, DpGrpcTlsConfig};
@@ -1494,4 +1497,479 @@ async fn test_cp_rejects_dp_with_empty_version() {
     );
 
     server_handle.abort();
+}
+
+// ─── Upstream delta tests ────────────────────────────────────────────────────
+
+fn create_test_upstream(id: &str, hosts: &[(&str, u16)]) -> Upstream {
+    Upstream {
+        id: id.to_string(),
+        name: Some(format!("upstream-{}", id)),
+        targets: hosts
+            .iter()
+            .map(|(h, p)| UpstreamTarget {
+                host: h.to_string(),
+                port: *p,
+                weight: 100,
+                tags: HashMap::new(),
+                path: None,
+            })
+            .collect(),
+        algorithm: LoadBalancerAlgorithm::RoundRobin,
+        hash_on: None,
+        hash_on_cookie_config: None,
+        health_checks: None,
+        service_discovery: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    }
+}
+
+fn create_test_consumer(id: &str, username: &str) -> Consumer {
+    Consumer {
+        id: id.to_string(),
+        username: username.to_string(),
+        custom_id: None,
+        credentials: HashMap::new(),
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_dp_applies_delta_adding_upstream() {
+    let initial = GatewayConfig::default();
+    let (addr, update_tx, _server_handle) = start_test_cp_server(initial).await;
+
+    let proxy_state = create_test_proxy_state();
+    let cp_url = format!("http://127.0.0.1:{}", addr.port());
+    let token = create_test_token();
+
+    let ps = proxy_state.clone();
+    let client_handle = tokio::spawn(async move {
+        dp_client::connect_and_subscribe(&cp_url, &token, "upstream-add-node", &ps, None).await
+    });
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let delta = IncrementalResult {
+        added_or_modified_proxies: vec![],
+        removed_proxy_ids: vec![],
+        added_or_modified_consumers: vec![],
+        removed_consumer_ids: vec![],
+        added_or_modified_plugin_configs: vec![],
+        removed_plugin_config_ids: vec![],
+        added_or_modified_upstreams: vec![create_test_upstream(
+            "u1",
+            &[("backend1.local", 8080), ("backend2.local", 8081)],
+        )],
+        removed_upstream_ids: vec![],
+        poll_timestamp: Utc::now(),
+    };
+    CpGrpcServer::broadcast_delta(&update_tx, &delta, "v2");
+
+    let applied = timeout(Duration::from_secs(5), async {
+        loop {
+            if proxy_state.config.load().upstreams.len() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    assert!(applied.is_ok(), "DP should apply upstream delta within 5s");
+
+    let cfg = proxy_state.config.load();
+    assert_eq!(cfg.upstreams[0].id, "u1");
+    assert_eq!(cfg.upstreams[0].targets.len(), 2);
+
+    client_handle.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_dp_applies_delta_removing_upstream() {
+    let initial = GatewayConfig {
+        upstreams: vec![create_test_upstream("u1", &[("host1", 80)])],
+        ..Default::default()
+    };
+    let (addr, update_tx, _server_handle) = start_test_cp_server(initial).await;
+
+    let proxy_state = create_test_proxy_state();
+    let cp_url = format!("http://127.0.0.1:{}", addr.port());
+    let token = create_test_token();
+
+    let ps = proxy_state.clone();
+    let client_handle = tokio::spawn(async move {
+        dp_client::connect_and_subscribe(&cp_url, &token, "upstream-rm-node", &ps, None).await
+    });
+
+    let applied = timeout(Duration::from_secs(5), async {
+        loop {
+            if proxy_state.config.load().upstreams.len() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    assert!(
+        applied.is_ok(),
+        "DP should receive initial config with 1 upstream"
+    );
+
+    let delta = IncrementalResult {
+        added_or_modified_proxies: vec![],
+        removed_proxy_ids: vec![],
+        added_or_modified_consumers: vec![],
+        removed_consumer_ids: vec![],
+        added_or_modified_plugin_configs: vec![],
+        removed_plugin_config_ids: vec![],
+        added_or_modified_upstreams: vec![],
+        removed_upstream_ids: vec!["u1".to_string()],
+        poll_timestamp: Utc::now(),
+    };
+    CpGrpcServer::broadcast_delta(&update_tx, &delta, "v3");
+
+    let applied = timeout(Duration::from_secs(5), async {
+        loop {
+            if proxy_state.config.load().upstreams.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    assert!(applied.is_ok(), "DP should remove upstream via delta");
+
+    client_handle.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_dp_applies_delta_modifying_upstream_targets() {
+    let initial = GatewayConfig {
+        upstreams: vec![create_test_upstream("u1", &[("old-host", 80)])],
+        ..Default::default()
+    };
+    let (addr, update_tx, _server_handle) = start_test_cp_server(initial).await;
+
+    let proxy_state = create_test_proxy_state();
+    let cp_url = format!("http://127.0.0.1:{}", addr.port());
+    let token = create_test_token();
+
+    let ps = proxy_state.clone();
+    let client_handle = tokio::spawn(async move {
+        dp_client::connect_and_subscribe(&cp_url, &token, "upstream-mod-node", &ps, None).await
+    });
+
+    let applied = timeout(Duration::from_secs(5), async {
+        loop {
+            if proxy_state.config.load().upstreams.len() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    assert!(applied.is_ok());
+
+    let mut modified_upstream =
+        create_test_upstream("u1", &[("new-host-a", 9090), ("new-host-b", 9091)]);
+    modified_upstream.updated_at = Utc::now() + chrono::Duration::seconds(10);
+
+    let delta = IncrementalResult {
+        added_or_modified_proxies: vec![],
+        removed_proxy_ids: vec![],
+        added_or_modified_consumers: vec![],
+        removed_consumer_ids: vec![],
+        added_or_modified_plugin_configs: vec![],
+        removed_plugin_config_ids: vec![],
+        added_or_modified_upstreams: vec![modified_upstream],
+        removed_upstream_ids: vec![],
+        poll_timestamp: Utc::now(),
+    };
+    CpGrpcServer::broadcast_delta(&update_tx, &delta, "v3");
+
+    let applied = timeout(Duration::from_secs(5), async {
+        loop {
+            let cfg = proxy_state.config.load();
+            if !cfg.upstreams.is_empty() && cfg.upstreams[0].targets.len() == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    assert!(applied.is_ok(), "DP should apply modified upstream targets");
+
+    let cfg = proxy_state.config.load();
+    assert_eq!(cfg.upstreams[0].targets[0].host, "new-host-a");
+    assert_eq!(cfg.upstreams[0].targets[1].host, "new-host-b");
+
+    client_handle.abort();
+}
+
+// ─── Consumer delta tests ────────────────────────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_dp_applies_delta_adding_consumer() {
+    let initial = GatewayConfig::default();
+    let (addr, update_tx, _server_handle) = start_test_cp_server(initial).await;
+
+    let proxy_state = create_test_proxy_state();
+    let cp_url = format!("http://127.0.0.1:{}", addr.port());
+    let token = create_test_token();
+
+    let ps = proxy_state.clone();
+    let client_handle = tokio::spawn(async move {
+        dp_client::connect_and_subscribe(&cp_url, &token, "consumer-add-node", &ps, None).await
+    });
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let delta = IncrementalResult {
+        added_or_modified_proxies: vec![],
+        removed_proxy_ids: vec![],
+        added_or_modified_consumers: vec![
+            create_test_consumer("c1", "alice"),
+            create_test_consumer("c2", "bob"),
+        ],
+        removed_consumer_ids: vec![],
+        added_or_modified_plugin_configs: vec![],
+        removed_plugin_config_ids: vec![],
+        added_or_modified_upstreams: vec![],
+        removed_upstream_ids: vec![],
+        poll_timestamp: Utc::now(),
+    };
+    CpGrpcServer::broadcast_delta(&update_tx, &delta, "v2");
+
+    let applied = timeout(Duration::from_secs(5), async {
+        loop {
+            if proxy_state.config.load().consumers.len() == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    assert!(applied.is_ok(), "DP should apply consumer delta");
+
+    let cfg = proxy_state.config.load();
+    assert_eq!(cfg.consumers[0].username, "alice");
+    assert_eq!(cfg.consumers[1].username, "bob");
+
+    client_handle.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_dp_applies_delta_removing_consumer() {
+    let initial = GatewayConfig {
+        consumers: vec![
+            create_test_consumer("c1", "alice"),
+            create_test_consumer("c2", "bob"),
+        ],
+        ..Default::default()
+    };
+    let (addr, update_tx, _server_handle) = start_test_cp_server(initial).await;
+
+    let proxy_state = create_test_proxy_state();
+    let cp_url = format!("http://127.0.0.1:{}", addr.port());
+    let token = create_test_token();
+
+    let ps = proxy_state.clone();
+    let client_handle = tokio::spawn(async move {
+        dp_client::connect_and_subscribe(&cp_url, &token, "consumer-rm-node", &ps, None).await
+    });
+
+    let applied = timeout(Duration::from_secs(5), async {
+        loop {
+            if proxy_state.config.load().consumers.len() == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    assert!(applied.is_ok());
+
+    let delta = IncrementalResult {
+        added_or_modified_proxies: vec![],
+        removed_proxy_ids: vec![],
+        added_or_modified_consumers: vec![],
+        removed_consumer_ids: vec!["c1".to_string()],
+        added_or_modified_plugin_configs: vec![],
+        removed_plugin_config_ids: vec![],
+        added_or_modified_upstreams: vec![],
+        removed_upstream_ids: vec![],
+        poll_timestamp: Utc::now(),
+    };
+    CpGrpcServer::broadcast_delta(&update_tx, &delta, "v3");
+
+    let applied = timeout(Duration::from_secs(5), async {
+        loop {
+            if proxy_state.config.load().consumers.len() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    assert!(applied.is_ok(), "DP should remove consumer via delta");
+
+    let cfg = proxy_state.config.load();
+    assert_eq!(cfg.consumers[0].username, "bob");
+
+    client_handle.abort();
+}
+
+// ─── Multi-DP broadcast test ─────────────────────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_cp_broadcasts_delta_to_multiple_dps() {
+    let initial = create_test_config(1);
+    let (addr, update_tx, _server_handle) = start_test_cp_server(initial).await;
+
+    let proxy_state_1 = create_test_proxy_state();
+    let proxy_state_2 = create_test_proxy_state();
+    let cp_url = format!("http://127.0.0.1:{}", addr.port());
+
+    let ps1 = proxy_state_1.clone();
+    let url1 = cp_url.clone();
+    let token1 = create_test_token();
+    let dp_handle_1 = tokio::spawn(async move {
+        dp_client::connect_and_subscribe(&url1, &token1, "multi-dp-1", &ps1, None).await
+    });
+
+    let ps2 = proxy_state_2.clone();
+    let url2 = cp_url.clone();
+    let token2 = create_test_token();
+    let dp_handle_2 = tokio::spawn(async move {
+        dp_client::connect_and_subscribe(&url2, &token2, "multi-dp-2", &ps2, None).await
+    });
+
+    // Wait for both DPs to receive initial config
+    let both_ready = timeout(Duration::from_secs(5), async {
+        loop {
+            let c1 = proxy_state_1.config.load().proxies.len();
+            let c2 = proxy_state_2.config.load().proxies.len();
+            if c1 == 1 && c2 == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    assert!(both_ready.is_ok(), "Both DPs should receive initial config");
+
+    // Broadcast delta adding a new proxy
+    let new_proxy = create_test_proxy("proxy-new", "/new-route");
+    let delta = IncrementalResult {
+        added_or_modified_proxies: vec![new_proxy],
+        removed_proxy_ids: vec![],
+        added_or_modified_consumers: vec![],
+        removed_consumer_ids: vec![],
+        added_or_modified_plugin_configs: vec![],
+        removed_plugin_config_ids: vec![],
+        added_or_modified_upstreams: vec![],
+        removed_upstream_ids: vec![],
+        poll_timestamp: Utc::now(),
+    };
+    CpGrpcServer::broadcast_delta(&update_tx, &delta, "v2");
+
+    // Both DPs should receive and apply the delta
+    let both_applied = timeout(Duration::from_secs(5), async {
+        loop {
+            let c1 = proxy_state_1.config.load().proxies.len();
+            let c2 = proxy_state_2.config.load().proxies.len();
+            if c1 == 2 && c2 == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    assert!(
+        both_applied.is_ok(),
+        "Both DPs should apply the delta (DP1: {}, DP2: {})",
+        proxy_state_1.config.load().proxies.len(),
+        proxy_state_2.config.load().proxies.len()
+    );
+
+    let cfg1 = proxy_state_1.config.load();
+    let cfg2 = proxy_state_2.config.load();
+    assert_eq!(cfg1.proxies.len(), cfg2.proxies.len());
+
+    dp_handle_1.abort();
+    dp_handle_2.abort();
+}
+
+// ─── Mixed entity delta test ─────────────────────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_dp_applies_delta_with_all_entity_types() {
+    let initial = GatewayConfig {
+        proxies: vec![create_test_proxy("p1", "/api")],
+        consumers: vec![create_test_consumer("c1", "alice")],
+        upstreams: vec![create_test_upstream("u1", &[("host1", 80)])],
+        ..Default::default()
+    };
+    let (addr, update_tx, _server_handle) = start_test_cp_server(initial).await;
+
+    let proxy_state = create_test_proxy_state();
+    let cp_url = format!("http://127.0.0.1:{}", addr.port());
+    let token = create_test_token();
+
+    let ps = proxy_state.clone();
+    let client_handle = tokio::spawn(async move {
+        dp_client::connect_and_subscribe(&cp_url, &token, "mixed-delta-node", &ps, None).await
+    });
+
+    let ready = timeout(Duration::from_secs(5), async {
+        loop {
+            let cfg = proxy_state.config.load();
+            if cfg.proxies.len() == 1 && cfg.consumers.len() == 1 && cfg.upstreams.len() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    assert!(ready.is_ok());
+
+    // Send a mixed delta: add proxy, remove consumer, modify upstream
+    let mut modified_upstream = create_test_upstream("u1", &[("new-host", 9090)]);
+    modified_upstream.updated_at = Utc::now() + chrono::Duration::seconds(10);
+
+    let delta = IncrementalResult {
+        added_or_modified_proxies: vec![create_test_proxy("p2", "/new")],
+        removed_proxy_ids: vec![],
+        added_or_modified_consumers: vec![],
+        removed_consumer_ids: vec!["c1".to_string()],
+        added_or_modified_plugin_configs: vec![],
+        removed_plugin_config_ids: vec![],
+        added_or_modified_upstreams: vec![modified_upstream],
+        removed_upstream_ids: vec![],
+        poll_timestamp: Utc::now(),
+    };
+    CpGrpcServer::broadcast_delta(&update_tx, &delta, "v3");
+
+    let applied = timeout(Duration::from_secs(5), async {
+        loop {
+            let cfg = proxy_state.config.load();
+            if cfg.proxies.len() == 2
+                && cfg.consumers.is_empty()
+                && cfg.upstreams.len() == 1
+                && cfg.upstreams[0].targets[0].host == "new-host"
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    assert!(
+        applied.is_ok(),
+        "DP should apply mixed delta across all entity types"
+    );
+
+    client_handle.abort();
 }

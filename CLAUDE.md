@@ -159,8 +159,8 @@ src/
 │       ├── http_client.rs     # Shared HTTP client for plugin outbound calls
 │       └── redis_rate_limiter.rs  # Shared Redis client for centralized rate limiting
 ├── grpc/                      # CP/DP gRPC communication
-│   ├── cp_server.rs           # Control Plane gRPC server (ConfigSync service)
-│   └── dp_client.rs           # Data Plane gRPC client (subscribe + reconnect)
+│   ├── cp_server.rs           # Control Plane gRPC server (ConfigSync service, broadcast channel)
+│   └── dp_client.rs           # Data Plane gRPC client (subscribe + exponential backoff reconnect)
 ├── load_balancer.rs           # Load balancing algorithms + per-upstream cache
 ├── health_check.rs            # Active (HTTP/TCP/UDP probes) + passive health checking
 ├── circuit_breaker.rs         # Three-state circuit breaker
@@ -514,7 +514,7 @@ Each test runs a gateway with protocol-specific config (`configs/*.yaml`) and a 
   5. **Fallback**: If the incremental poll fails for any reason, the loop automatically falls back to a full `load_full_config()` + `update_config()` cycle and re-seeds the known IDs.
   - The `updated_at` columns are indexed (`idx_proxies_updated_at`, `idx_consumers_updated_at`, `idx_plugin_configs_updated_at`, `idx_upstreams_updated_at`) so incremental queries use index scans, not full table scans.
   - Incremental results feed into `ProxyState::apply_incremental()` which patches the in-memory `GatewayConfig` and drives the same surgical cache updates (router, plugin, consumer, load balancer, circuit breaker, DNS warmup) as the full-reload path.
-  - **CP mode** uses the same incremental polling strategy. Deltas are serialized and broadcast to DPs as `DELTA` updates (update_type=1) via gRPC. DPs apply them via `apply_incremental()`. On incremental poll failure, the CP falls back to a full reload and broadcasts a `FULL_SNAPSHOT`.
+  - **CP mode** uses the same incremental polling strategy. Deltas are serialized and broadcast to DPs as `DELTA` updates (update_type=1) via a tokio `broadcast` channel (capacity configurable via `FERRUM_CP_BROADCAST_CHANNEL_CAPACITY`, default 128). DPs apply them via `apply_incremental()`. On incremental poll failure, the CP falls back to a full reload and broadcasts a `FULL_SNAPSHOT`. If a DP lags behind by more than the channel capacity, it automatically receives a fresh full snapshot instead of the missed deltas (self-healing). The broadcast is lock-free — `tx.send()` writes once to a ring buffer that all receivers share; it never blocks on slow DPs.
 - **Multi-URL Failover**: `FERRUM_DB_FAILOVER_URLS` accepts comma-separated fallback database URLs. On startup, if the primary `FERRUM_DB_URL` is unreachable, failover URLs are tried in order. During polling, if both incremental and full reload fail, the gateway attempts to reconnect via failover URLs before marking the DB as unavailable. All failover URLs must use the same `FERRUM_DB_TYPE` and share TLS settings.
 - **Read Replica**: `FERRUM_DB_READ_REPLICA_URL` offloads config polling reads to a read replica. The polling loop (both full and incremental) queries the replica, while Admin API writes always go to the primary. If the replica is unreachable at startup, polling transparently falls back to the primary. DNS re-resolution is performed independently for both primary and replica hostnames.
 
@@ -580,6 +580,7 @@ Reduce per-request allocations in plugin lookup
 | `FERRUM_CP_GRPC_TLS_CERT_PATH` | (none) | PEM cert for CP gRPC TLS |
 | `FERRUM_CP_GRPC_TLS_KEY_PATH` | (none) | PEM key for CP gRPC TLS |
 | `FERRUM_CP_GRPC_TLS_CLIENT_CA_PATH` | (none) | PEM CA for verifying DP client certs (mTLS) |
+| `FERRUM_CP_BROADCAST_CHANNEL_CAPACITY` | `128` | Broadcast channel capacity for CP-to-DP delta fan-out. DPs that lag behind by more than this many updates receive a full snapshot instead. Increase for high config churn |
 | `FERRUM_DP_CP_GRPC_URL` | (required for dp mode) | CP gRPC URL for DP to connect to (`http://` or `https://`) |
 | `FERRUM_DP_GRPC_TLS_CA_CERT_PATH` | (none) | PEM CA cert for verifying CP server cert |
 | `FERRUM_DP_GRPC_TLS_CLIENT_CERT_PATH` | (none) | PEM client cert for DP-to-CP mTLS |
@@ -621,6 +622,8 @@ See `src/config/env_config.rs` for the full list of 90+ environment variables.
 - Build script: `build.rs` compiles protos via `tonic_build`
 - Service: `ConfigSync` with `Subscribe` (streaming) and `GetFullConfig` (unary)
 - Auth: HS256 JWT in gRPC metadata (`authorization` key)
+- **CP broadcast**: `CpGrpcServer::with_channel_capacity()` creates the tokio broadcast channel. `CpGrpcServer::new()` is a convenience wrapper that defaults to capacity 128 (used by tests). Production code in `control_plane.rs` calls `with_channel_capacity()` passing `env_config.cp_broadcast_channel_capacity`.
+- **DP reconnect**: `start_dp_client_with_shutdown_and_startup_ready()` uses exponential backoff with jitter (1s → 2s → 4s → … → 30s cap, ±25% jitter) to prevent thundering-herd reconnection storms when many DPs restart simultaneously. Backoff resets to 1s on clean stream disconnect (CP graceful shutdown). The single-shot `connect_and_subscribe()` has no retry loop (used by tests and one-off callers).
 
 ## Docker
 

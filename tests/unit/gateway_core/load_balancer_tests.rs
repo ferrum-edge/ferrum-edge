@@ -1,5 +1,6 @@
 //! Tests for load balancer module
 
+use chrono::Utc;
 use dashmap::DashMap;
 use ferrum_edge::config::types::{GatewayConfig, LoadBalancerAlgorithm, Upstream, UpstreamTarget};
 use ferrum_edge::load_balancer::{LoadBalancer, LoadBalancerCache, target_key};
@@ -817,4 +818,177 @@ fn test_load_balancer_cache_get_hash_on_strategy() {
         cache.get_hash_on_strategy("nonexistent"),
         HashOnStrategy::Ip
     );
+}
+
+// ─── LoadBalancerCache apply_delta Tests ─────────────────────────────────────
+
+fn make_upstream(id: &str, targets: Vec<UpstreamTarget>) -> Upstream {
+    Upstream {
+        id: id.to_string(),
+        name: Some(format!("upstream-{}", id)),
+        targets,
+        algorithm: LoadBalancerAlgorithm::RoundRobin,
+        hash_on: None,
+        hash_on_cookie_config: None,
+        health_checks: None,
+        service_discovery: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    }
+}
+
+#[test]
+fn test_apply_delta_add_upstream() {
+    let config = GatewayConfig::default();
+    let cache = LoadBalancerCache::new(&config);
+
+    // Initially no upstreams
+    assert!(cache.select_target("u1", "", None).is_none());
+
+    let added = vec![make_upstream("u1", make_targets(2))];
+    let new_config = GatewayConfig {
+        upstreams: added.clone(),
+        ..Default::default()
+    };
+    cache.apply_delta(&new_config, &added, &[], &[]);
+
+    // Now u1 should be available
+    let sel = cache.select_target("u1", "", None);
+    assert!(sel.is_some(), "Upstream u1 should be selectable after add");
+}
+
+#[test]
+fn test_apply_delta_remove_upstream() {
+    let u1 = make_upstream("u1", make_targets(2));
+    let config = GatewayConfig {
+        upstreams: vec![u1],
+        ..Default::default()
+    };
+    let cache = LoadBalancerCache::new(&config);
+
+    // u1 exists
+    assert!(cache.select_target("u1", "", None).is_some());
+
+    let new_config = GatewayConfig::default();
+    cache.apply_delta(&new_config, &[], &["u1".to_string()], &[]);
+
+    // u1 should be gone
+    assert!(
+        cache.select_target("u1", "", None).is_none(),
+        "Upstream u1 should be gone after removal"
+    );
+}
+
+#[test]
+fn test_apply_delta_modify_upstream_targets() {
+    let u1 = make_upstream("u1", make_targets(2));
+    let config = GatewayConfig {
+        upstreams: vec![u1],
+        ..Default::default()
+    };
+    let cache = LoadBalancerCache::new(&config);
+
+    // Modify u1 to have a single target on port 9999
+    let new_target = UpstreamTarget {
+        host: "new-backend".into(),
+        port: 9999,
+        weight: 1,
+        tags: HashMap::new(),
+        path: None,
+    };
+    let modified_u1 = make_upstream("u1", vec![new_target]);
+    let new_config = GatewayConfig {
+        upstreams: vec![modified_u1.clone()],
+        ..Default::default()
+    };
+    cache.apply_delta(&new_config, &[], &[], &[modified_u1]);
+
+    let sel = cache.select_target("u1", "", None).unwrap();
+    assert_eq!(sel.target.host, "new-backend");
+    assert_eq!(sel.target.port, 9999);
+}
+
+#[test]
+fn test_apply_delta_mixed_add_remove_modify() {
+    let u1 = make_upstream("u1", make_targets(2));
+    let u2 = make_upstream("u2", make_targets(1));
+    let config = GatewayConfig {
+        upstreams: vec![u1, u2],
+        ..Default::default()
+    };
+    let cache = LoadBalancerCache::new(&config);
+
+    // Verify both exist
+    assert!(cache.select_target("u1", "", None).is_some());
+    assert!(cache.select_target("u2", "", None).is_some());
+
+    // Add u3, remove u1, modify u2
+    let u3 = make_upstream("u3", make_targets(3));
+    let modified_u2 = Upstream {
+        algorithm: LoadBalancerAlgorithm::Random,
+        ..make_upstream("u2", make_targets(1))
+    };
+    let new_config = GatewayConfig {
+        upstreams: vec![modified_u2.clone(), u3.clone()],
+        ..Default::default()
+    };
+    cache.apply_delta(&new_config, &[u3], &["u1".to_string()], &[modified_u2]);
+
+    assert!(
+        cache.select_target("u1", "", None).is_none(),
+        "u1 should be removed"
+    );
+    assert!(
+        cache.select_target("u2", "", None).is_some(),
+        "u2 should still exist (modified)"
+    );
+    assert!(
+        cache.select_target("u3", "", None).is_some(),
+        "u3 should be added"
+    );
+}
+
+#[test]
+fn test_apply_delta_empty_is_noop() {
+    let u1 = make_upstream("u1", make_targets(2));
+    let config = GatewayConfig {
+        upstreams: vec![u1],
+        ..Default::default()
+    };
+    let cache = LoadBalancerCache::new(&config);
+
+    // Empty delta should be a no-op
+    cache.apply_delta(&config, &[], &[], &[]);
+
+    assert!(
+        cache.select_target("u1", "", None).is_some(),
+        "u1 should still exist after empty delta"
+    );
+}
+
+#[test]
+fn test_apply_delta_preserves_unaffected_upstreams() {
+    let u1 = make_upstream("u1", make_targets(2));
+    let u2 = make_upstream("u2", make_targets(3));
+    let config = GatewayConfig {
+        upstreams: vec![u1, u2],
+        ..Default::default()
+    };
+    let cache = LoadBalancerCache::new(&config);
+
+    // Only add u3 — u1 and u2 should be preserved
+    let u3 = make_upstream("u3", make_targets(1));
+    let new_config = GatewayConfig {
+        upstreams: vec![
+            make_upstream("u1", make_targets(2)),
+            make_upstream("u2", make_targets(3)),
+            u3.clone(),
+        ],
+        ..Default::default()
+    };
+    cache.apply_delta(&new_config, &[u3], &[], &[]);
+
+    assert!(cache.select_target("u1", "", None).is_some());
+    assert!(cache.select_target("u2", "", None).is_some());
+    assert!(cache.select_target("u3", "", None).is_some());
 }

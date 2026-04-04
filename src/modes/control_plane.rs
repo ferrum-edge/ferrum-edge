@@ -104,7 +104,11 @@ pub async fn run(
     };
 
     // Create gRPC server
-    let (grpc_server, update_tx) = CpGrpcServer::new(config_arc.clone(), grpc_secret);
+    let (grpc_server, update_tx) = CpGrpcServer::with_channel_capacity(
+        config_arc.clone(),
+        grpc_secret,
+        env_config.cp_broadcast_channel_capacity,
+    );
 
     // Build TLS hardening policy from environment
     let tls_policy = TlsPolicy::from_env_config(&env_config)?;

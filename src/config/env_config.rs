@@ -187,6 +187,12 @@ pub struct EnvConfig {
     /// Path to PEM CA bundle for verifying DP client certificates (mTLS).
     /// When set, the CP requires and verifies client certificates from DPs.
     pub cp_grpc_tls_client_ca_path: Option<String>,
+    /// Capacity of the tokio broadcast channel used to fan out config deltas
+    /// to subscribed Data Planes. When a DP lags behind by more than this many
+    /// updates, it receives a full config snapshot instead of the missed deltas.
+    /// Higher values trade memory for fewer full-snapshot recoveries under
+    /// high config churn. Default: 128.
+    pub cp_broadcast_channel_capacity: usize,
 
     // DP gRPC TLS (client-side)
     /// Path to PEM CA certificate for verifying the CP server certificate.
@@ -450,6 +456,7 @@ impl Default for EnvConfig {
             cp_grpc_tls_cert_path: None,
             cp_grpc_tls_key_path: None,
             cp_grpc_tls_client_ca_path: None,
+            cp_broadcast_channel_capacity: 128,
             dp_grpc_tls_ca_cert_path: None,
             dp_grpc_tls_client_cert_path: None,
             dp_grpc_tls_client_key_path: None,
@@ -625,6 +632,11 @@ impl EnvConfig {
             cp_grpc_tls_cert_path: resolve_var(conf, "FERRUM_CP_GRPC_TLS_CERT_PATH"),
             cp_grpc_tls_key_path: resolve_var(conf, "FERRUM_CP_GRPC_TLS_KEY_PATH"),
             cp_grpc_tls_client_ca_path: resolve_var(conf, "FERRUM_CP_GRPC_TLS_CLIENT_CA_PATH"),
+            cp_broadcast_channel_capacity: resolve_usize(
+                conf,
+                "FERRUM_CP_BROADCAST_CHANNEL_CAPACITY",
+                128,
+            ),
 
             // DP gRPC TLS
             dp_grpc_tls_ca_cert_path: resolve_var(conf, "FERRUM_DP_GRPC_TLS_CA_CERT_PATH"),

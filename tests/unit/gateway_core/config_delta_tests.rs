@@ -55,6 +55,50 @@ fn make_proxy(id: &str, listen_path: &str, updated_at: DateTime<Utc>) -> Proxy {
     }
 }
 
+fn make_upstream(id: &str, targets: Vec<UpstreamTarget>, updated_at: DateTime<Utc>) -> Upstream {
+    Upstream {
+        id: id.to_string(),
+        name: None,
+        targets,
+        algorithm: LoadBalancerAlgorithm::default(),
+        hash_on: None,
+        hash_on_cookie_config: None,
+        health_checks: None,
+        service_discovery: None,
+        created_at: updated_at,
+        updated_at,
+    }
+}
+
+fn make_target(host: &str, port: u16) -> UpstreamTarget {
+    UpstreamTarget {
+        host: host.to_string(),
+        port,
+        weight: 100,
+        tags: HashMap::new(),
+        path: None,
+    }
+}
+
+fn make_plugin_config(
+    id: &str,
+    name: &str,
+    scope: PluginScope,
+    proxy_id: Option<&str>,
+    updated_at: DateTime<Utc>,
+) -> PluginConfig {
+    PluginConfig {
+        id: id.to_string(),
+        plugin_name: name.to_string(),
+        config: serde_json::Value::Object(serde_json::Map::new()),
+        scope,
+        proxy_id: proxy_id.map(|s| s.to_string()),
+        enabled: true,
+        created_at: updated_at,
+        updated_at,
+    }
+}
+
 fn make_consumer(id: &str, username: &str, updated_at: DateTime<Utc>) -> Consumer {
     Consumer {
         id: id.to_string(),
@@ -192,4 +236,261 @@ fn test_affected_listen_paths() {
     assert!(paths.contains(&"/new-path".to_string())); // modified proxy's new path
     assert!(paths.contains(&"/old-path".to_string())); // modified proxy's old path
     assert!(paths.contains(&"/added".to_string())); // added proxy's path
+}
+
+// --- Upstream delta tests ---
+
+#[test]
+fn test_detects_added_upstream() {
+    let t = Utc::now();
+    let old = GatewayConfig::default();
+    let new = GatewayConfig {
+        upstreams: vec![make_upstream("u1", vec![make_target("backend1", 8080)], t)],
+        ..Default::default()
+    };
+    let delta = ConfigDelta::compute(&old, &new);
+    assert_eq!(delta.added_upstreams.len(), 1);
+    assert_eq!(delta.added_upstreams[0].id, "u1");
+    assert!(delta.removed_upstream_ids.is_empty());
+    assert!(delta.modified_upstreams.is_empty());
+}
+
+#[test]
+fn test_detects_removed_upstream() {
+    let t = Utc::now();
+    let old = GatewayConfig {
+        upstreams: vec![make_upstream("u1", vec![make_target("backend1", 8080)], t)],
+        ..Default::default()
+    };
+    let new = GatewayConfig::default();
+    let delta = ConfigDelta::compute(&old, &new);
+    assert!(delta.added_upstreams.is_empty());
+    assert_eq!(delta.removed_upstream_ids, vec!["u1"]);
+    assert!(delta.modified_upstreams.is_empty());
+}
+
+#[test]
+fn test_detects_modified_upstream() {
+    let t1 = Utc::now();
+    let t2 = t1 + chrono::Duration::seconds(10);
+    let old = GatewayConfig {
+        upstreams: vec![make_upstream("u1", vec![make_target("backend1", 8080)], t1)],
+        ..Default::default()
+    };
+    let new = GatewayConfig {
+        upstreams: vec![make_upstream("u1", vec![make_target("backend2", 9090)], t2)],
+        ..Default::default()
+    };
+    let delta = ConfigDelta::compute(&old, &new);
+    assert!(delta.added_upstreams.is_empty());
+    assert!(delta.removed_upstream_ids.is_empty());
+    assert_eq!(delta.modified_upstreams.len(), 1);
+    assert_eq!(delta.modified_upstreams[0].targets[0].host, "backend2");
+}
+
+#[test]
+fn test_unchanged_upstream_not_in_delta() {
+    let t = Utc::now();
+    let config = GatewayConfig {
+        upstreams: vec![make_upstream("u1", vec![make_target("backend1", 8080)], t)],
+        ..Default::default()
+    };
+    let delta = ConfigDelta::compute(&config, &config);
+    assert!(delta.added_upstreams.is_empty());
+    assert!(delta.removed_upstream_ids.is_empty());
+    assert!(delta.modified_upstreams.is_empty());
+}
+
+#[test]
+fn test_upstream_mixed_add_remove_modify() {
+    let t1 = Utc::now();
+    let t2 = t1 + chrono::Duration::seconds(5);
+    let old = GatewayConfig {
+        upstreams: vec![
+            make_upstream("u1", vec![make_target("a", 80)], t1),
+            make_upstream("u2", vec![make_target("b", 80)], t1),
+        ],
+        ..Default::default()
+    };
+    let new = GatewayConfig {
+        upstreams: vec![
+            make_upstream("u1", vec![make_target("a-new", 8080)], t2), // modified
+            make_upstream("u3", vec![make_target("c", 80)], t2),       // added
+                                                                       // u2 removed
+        ],
+        ..Default::default()
+    };
+    let delta = ConfigDelta::compute(&old, &new);
+    assert_eq!(delta.added_upstreams.len(), 1);
+    assert_eq!(delta.added_upstreams[0].id, "u3");
+    assert_eq!(delta.removed_upstream_ids, vec!["u2"]);
+    assert_eq!(delta.modified_upstreams.len(), 1);
+    assert_eq!(delta.modified_upstreams[0].id, "u1");
+}
+
+// --- PluginConfig delta tests ---
+
+#[test]
+fn test_detects_added_plugin_config() {
+    let t = Utc::now();
+    let old = GatewayConfig::default();
+    let new = GatewayConfig {
+        plugin_configs: vec![make_plugin_config(
+            "pc1",
+            "rate_limiting",
+            PluginScope::Global,
+            None,
+            t,
+        )],
+        ..Default::default()
+    };
+    let delta = ConfigDelta::compute(&old, &new);
+    assert_eq!(delta.added_plugin_configs.len(), 1);
+    assert_eq!(delta.added_plugin_configs[0].id, "pc1");
+    assert!(delta.removed_plugin_config_ids.is_empty());
+    assert!(delta.modified_plugin_configs.is_empty());
+}
+
+#[test]
+fn test_detects_removed_plugin_config() {
+    let t = Utc::now();
+    let old = GatewayConfig {
+        plugin_configs: vec![make_plugin_config(
+            "pc1",
+            "rate_limiting",
+            PluginScope::Global,
+            None,
+            t,
+        )],
+        ..Default::default()
+    };
+    let new = GatewayConfig::default();
+    let delta = ConfigDelta::compute(&old, &new);
+    assert!(delta.added_plugin_configs.is_empty());
+    assert_eq!(delta.removed_plugin_config_ids, vec!["pc1"]);
+    assert!(delta.modified_plugin_configs.is_empty());
+}
+
+#[test]
+fn test_detects_modified_plugin_config() {
+    let t1 = Utc::now();
+    let t2 = t1 + chrono::Duration::seconds(5);
+    let old = GatewayConfig {
+        plugin_configs: vec![make_plugin_config(
+            "pc1",
+            "rate_limiting",
+            PluginScope::Global,
+            None,
+            t1,
+        )],
+        ..Default::default()
+    };
+    let new = GatewayConfig {
+        plugin_configs: vec![make_plugin_config(
+            "pc1",
+            "rate_limiting",
+            PluginScope::Global,
+            None,
+            t2,
+        )],
+        ..Default::default()
+    };
+    let delta = ConfigDelta::compute(&old, &new);
+    assert!(delta.added_plugin_configs.is_empty());
+    assert!(delta.removed_plugin_config_ids.is_empty());
+    assert_eq!(delta.modified_plugin_configs.len(), 1);
+    assert_eq!(delta.modified_plugin_configs[0].id, "pc1");
+}
+
+// --- proxy_ids_needing_plugin_rebuild tests ---
+
+#[test]
+fn test_proxy_ids_needing_plugin_rebuild_from_proxy_change() {
+    let t1 = Utc::now();
+    let t2 = t1 + chrono::Duration::seconds(5);
+    let old = GatewayConfig {
+        proxies: vec![make_proxy("p1", "/api", t1)],
+        ..Default::default()
+    };
+    let new = GatewayConfig {
+        proxies: vec![make_proxy("p1", "/api/v2", t2)],
+        ..Default::default()
+    };
+    let delta = ConfigDelta::compute(&old, &new);
+    let ids = delta.proxy_ids_needing_plugin_rebuild(&new);
+    assert!(ids.contains("p1"));
+}
+
+#[test]
+fn test_proxy_ids_needing_plugin_rebuild_from_global_plugin_change() {
+    let t1 = Utc::now();
+    let t2 = t1 + chrono::Duration::seconds(5);
+    let proxy = make_proxy("p1", "/api", t1);
+    let old = GatewayConfig {
+        proxies: vec![proxy.clone()],
+        plugin_configs: vec![make_plugin_config(
+            "pc1",
+            "rate_limiting",
+            PluginScope::Global,
+            None,
+            t1,
+        )],
+        ..Default::default()
+    };
+    let new = GatewayConfig {
+        proxies: vec![proxy],
+        plugin_configs: vec![make_plugin_config(
+            "pc1",
+            "rate_limiting",
+            PluginScope::Global,
+            None,
+            t2,
+        )],
+        ..Default::default()
+    };
+    let delta = ConfigDelta::compute(&old, &new);
+    let ids = delta.proxy_ids_needing_plugin_rebuild(&new);
+    // Global plugin change should trigger rebuild for ALL proxies
+    assert!(ids.contains("p1"));
+}
+
+// --- Full mixed delta across all entity types ---
+
+#[test]
+fn test_full_mixed_delta_all_entity_types() {
+    let t1 = Utc::now();
+    let t2 = t1 + chrono::Duration::seconds(5);
+    let old = GatewayConfig {
+        proxies: vec![make_proxy("p1", "/api", t1)],
+        consumers: vec![make_consumer("c1", "alice", t1)],
+        plugin_configs: vec![make_plugin_config(
+            "pc1",
+            "key_auth",
+            PluginScope::Global,
+            None,
+            t1,
+        )],
+        upstreams: vec![make_upstream("u1", vec![make_target("host", 80)], t1)],
+        ..Default::default()
+    };
+    let new = GatewayConfig {
+        proxies: vec![make_proxy("p2", "/new", t2)], // p1 removed, p2 added
+        consumers: vec![make_consumer("c1", "bob", t2)], // c1 modified
+        plugin_configs: vec![],                      // pc1 removed
+        upstreams: vec![
+            make_upstream("u1", vec![make_target("host2", 8080)], t2), // u1 modified
+            make_upstream("u2", vec![make_target("host3", 80)], t2),   // u2 added
+        ],
+        ..Default::default()
+    };
+    let delta = ConfigDelta::compute(&old, &new);
+
+    assert_eq!(delta.added_proxies.len(), 1);
+    assert_eq!(delta.removed_proxy_ids, vec!["p1"]);
+    assert!(delta.added_consumers.is_empty());
+    assert_eq!(delta.modified_consumers.len(), 1);
+    assert_eq!(delta.removed_plugin_config_ids, vec!["pc1"]);
+    assert_eq!(delta.added_upstreams.len(), 1);
+    assert_eq!(delta.modified_upstreams.len(), 1);
+    assert!(!delta.is_empty());
 }

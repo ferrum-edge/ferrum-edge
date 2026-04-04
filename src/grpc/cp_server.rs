@@ -3,7 +3,8 @@
 //! Provides two RPCs:
 //! - `Subscribe` — server-streaming: DP connects and receives a `FULL_SNAPSHOT`
 //!   (update_type=0), then incremental `DELTA` updates (update_type=1) as config changes.
-//!   If a DP lags behind the broadcast channel (capacity 128), it receives a fresh
+//!   If a DP lags behind the broadcast channel (default capacity 128, configurable
+//!   via `FERRUM_CP_BROADCAST_CHANNEL_CAPACITY`), it receives a fresh
 //!   full snapshot instead of the missed deltas.
 //! - `GetFullConfig` — unary: returns the current full config snapshot on demand.
 //!
@@ -35,11 +36,24 @@ pub struct CpGrpcServer {
 }
 
 impl CpGrpcServer {
+    /// Create a new CP gRPC server with the default broadcast channel capacity (128).
+    ///
+    /// Used by tests. Production code calls `with_channel_capacity` directly
+    /// to pass the operator-configured capacity from `EnvConfig`.
+    #[allow(dead_code)]
     pub fn new(
         config: Arc<ArcSwap<GatewayConfig>>,
         jwt_secret: String,
     ) -> (Self, broadcast::Sender<ConfigUpdate>) {
-        let (tx, _) = broadcast::channel(128);
+        Self::with_channel_capacity(config, jwt_secret, 128)
+    }
+
+    pub fn with_channel_capacity(
+        config: Arc<ArcSwap<GatewayConfig>>,
+        jwt_secret: String,
+        channel_capacity: usize,
+    ) -> (Self, broadcast::Sender<ConfigUpdate>) {
+        let (tx, _) = broadcast::channel(channel_capacity.max(1));
         let tx_clone = tx.clone();
         (
             Self {

@@ -1,7 +1,9 @@
 //! Data Plane gRPC client — subscribes to the CP's config stream.
 //!
-//! The outer reconnect loop (`start_dp_client_with_shutdown`) retries every
-//! 5 seconds on disconnect. Inside the stream handler, two message types:
+//! The outer reconnect loop (`start_dp_client_with_shutdown`) uses exponential
+//! backoff with jitter (1s → 2s → 4s → … → 30s cap, ±25% jitter) to avoid
+//! thundering-herd reconnection storms when many DPs restart simultaneously.
+//! Inside the stream handler, two message types:
 //! - `update_type=0` (FULL_SNAPSHOT): replaces the entire `GatewayConfig`
 //! - `update_type=1` (DELTA): applies incremental changes via `apply_incremental()`
 //!
@@ -69,6 +71,12 @@ pub async fn start_dp_client_with_shutdown_and_startup_ready(
     let node_id = uuid::Uuid::new_v4().to_string();
     info!("DP client starting, connecting to CP at {}", cp_url);
 
+    // Exponential backoff with jitter to prevent thundering-herd reconnection
+    // storms when many DPs restart simultaneously (e.g., Kubernetes rollout).
+    const BACKOFF_INITIAL_SECS: u64 = 1;
+    const BACKOFF_MAX_SECS: u64 = 30;
+    let mut backoff_secs = BACKOFF_INITIAL_SECS;
+
     loop {
         if let Some(ref rx) = shutdown_rx
             && *rx.borrow()
@@ -89,17 +97,38 @@ pub async fn start_dp_client_with_shutdown_and_startup_ready(
         {
             Ok(_) => {
                 warn!("CP connection stream ended, will reconnect...");
+                // Reset backoff on clean disconnect (stream ended normally)
+                backoff_secs = BACKOFF_INITIAL_SECS;
             }
             Err(e) => {
-                error!("CP connection error: {}, will retry in 5s", e);
+                error!(
+                    "CP connection error: {}, will retry in ~{}s",
+                    e, backoff_secs
+                );
             }
         }
+
+        // Apply ±25% jitter to the backoff to desynchronize reconnection attempts
+        let jitter_range = backoff_secs / 4; // 25% of base
+        let jitter_ms = if jitter_range > 0 {
+            let range_ms = jitter_range * 1000 * 2; // full ±25% range in ms
+            // Simple deterministic-enough jitter from current time nanos
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos() as u64;
+            (nanos % range_ms) as i64 - (range_ms / 2) as i64
+        } else {
+            0
+        };
+        let sleep_ms = (backoff_secs * 1000) as i64 + jitter_ms;
+        let sleep_duration = Duration::from_millis(sleep_ms.max(100) as u64);
 
         // Continue serving with cached config; retry connection
         if let Some(ref rx) = shutdown_rx {
             let mut rx_clone = rx.clone();
             tokio::select! {
-                _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+                _ = tokio::time::sleep(sleep_duration) => {}
                 _ = async {
                     while !*rx_clone.borrow() {
                         if rx_clone.changed().await.is_err() { return; }
@@ -110,8 +139,11 @@ pub async fn start_dp_client_with_shutdown_and_startup_ready(
                 }
             }
         } else {
-            tokio::time::sleep(Duration::from_secs(5)).await;
+            tokio::time::sleep(sleep_duration).await;
         }
+
+        // Exponential increase capped at BACKOFF_MAX_SECS
+        backoff_secs = (backoff_secs * 2).min(BACKOFF_MAX_SECS);
     }
 }
 
