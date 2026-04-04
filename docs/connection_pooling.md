@@ -141,10 +141,49 @@ In performance tests (8 threads, 100 connections, 30 seconds):
 
 *Results from local run on macOS Apple Silicon, release build, 8 threads, 100 connections, 30s duration.*
 
+## Connection Pool Warmup
+
+By default, Ferrum Edge **pre-establishes backend connections** at startup after DNS warmup completes. This eliminates first-request latency spikes caused by TCP/TLS/QUIC handshakes.
+
+### How It Works
+
+1. After DNS warmup resolves all backend hostnames, the gateway iterates every configured proxy.
+2. For each HTTP-family proxy (HTTP, HTTPS, WebSocket, gRPC, H2, H3), it creates connections in the appropriate pool:
+   - **Reqwest pool** (HTTP/1.1, HTTPS, WS, WSS): Creates and caches the `reqwest::Client` with full TLS configuration (cert parsing, root store, mTLS identity).
+   - **gRPC pool** (Grpc/Grpcs): Establishes TCP + TLS + HTTP/2 connections (shard 0).
+   - **HTTP/2 direct pool** (HTTPS with `enable_http2`): Establishes TCP + TLS + HTTP/2 connections (shard 0).
+   - **HTTP/3 pool**: Establishes QUIC + TLS 1.3 connections (shard 0).
+3. For upstream-backed proxies, every target in the upstream is warmed individually for pools that key by `(host, port)` (gRPC, HTTP/2 direct, HTTP/3). The reqwest pool keys by `upstream_id`, so one `get_client()` call covers all targets.
+4. **TCP/UDP stream proxies are skipped** — they create per-session connections with no persistent pool to warm.
+
+### Configuration
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `FERRUM_POOL_WARMUP_ENABLED` | `true` | Enable connection pool warmup at startup |
+| `FERRUM_POOL_WARMUP_CONCURRENCY` | `500` | Maximum concurrent connection warmup attempts |
+
+### Behavior
+
+- **Best-effort**: Failed warmup connections are logged as warnings but never block startup.
+- **Deduplicated**: Multiple proxies sharing the same backend and TLS config produce only one warmup attempt per unique pool key.
+- **Uses proxy TLS settings**: Each warmup connection uses the proxy's configured CA cert, mTLS client cert, and server cert verification settings — identical to what the first real request would use.
+- **Respects DNS overrides**: Proxies with `dns_override` use the static IP during warmup, just like production traffic.
+- **DP mode**: Warmup runs in database and file modes. In Data Plane mode, pools warm naturally when the first config arrives from the Control Plane.
+
+### Disabling Warmup
+
+```bash
+# Disable pool warmup (first requests will pay handshake latency)
+FERRUM_POOL_WARMUP_ENABLED=false
+```
+
+This may be useful in development or when backends are not yet available at gateway startup time.
+
 ## Benefits
 
 - **2-3x Higher Throughput**: Connection reuse eliminates setup overhead
-- **Lower Latency**: Persistent connections avoid TCP handshakes
+- **Lower Latency**: Persistent connections avoid TCP handshakes; pool warmup eliminates first-request cold start
 - **Resource Efficiency**: Fewer file descriptors and memory usage
 - **Protocol Support**: HTTP/1.1 keep-alive, HTTP/2, HTTP/3, HTTPS, WebSocket (WS/WSS), gRPC (dedicated H2 pool)
 - **Flexible Configuration**: Global defaults with per-proxy fine-tuning

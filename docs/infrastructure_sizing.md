@@ -168,6 +168,8 @@ pool_memory ≈ num_upstream_hosts × max_idle_per_host × 20 KB
 | 200 | 128 | ~512 MB |
 | 200 | 32 | ~128 MB |
 
+**Connection pool warmup:** When `FERRUM_POOL_WARMUP_ENABLED=true` (the default), the gateway pre-establishes connections to all HTTP-family backends at startup. This adds a small amount of time to startup (typically sub-second for most configs, depending on backend latency and `FERRUM_POOL_WARMUP_CONCURRENCY`) but eliminates first-request latency spikes. The warmed connections consume the same memory as connections created during normal traffic. For Kubernetes deployments, account for warmup time in your `startupProbe.initialDelaySeconds`. See [connection_pooling.md](connection_pooling.md#connection-pool-warmup) for configuration details.
+
 **Recommendations:**
 - With HTTP/2 enabled, a single connection can multiplex many requests — reduce `max_idle_per_host` to 4–16.
 - For backends with bursty traffic patterns, increase `max_idle_per_host` to avoid connection churn.

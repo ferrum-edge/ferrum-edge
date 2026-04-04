@@ -42,7 +42,7 @@ Load balancers are rebuilt atomically on configuration changes (file reload via 
 
 Upstream target hostnames are automatically resolved through the gateway's [central DNS cache](dns_resolver.md). This means:
 
-- **Startup warmup**: All upstream target hostnames are pre-resolved alongside proxy backend hostnames before the gateway accepts traffic — no cold-cache DNS lookups on the first request.
+- **Startup warmup**: All upstream target hostnames are pre-resolved alongside proxy backend hostnames before the gateway accepts traffic — no cold-cache DNS lookups on the first request. After DNS warmup, [connection pool warmup](connection_pooling.md#connection-pool-warmup) pre-establishes backend connections to each upstream target for HTTP-family pools.
 - **Hot-path efficiency**: DNS resolution never happens in the request hot path. All HTTP clients use a custom `DnsCacheResolver` that transparently routes lookups through the in-memory cache.
 - **Background refresh**: DNS entries for upstream targets are proactively refreshed at 75% TTL, just like proxy backend hostnames.
 

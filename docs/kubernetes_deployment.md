@@ -29,6 +29,10 @@ Important behavior:
 - The endpoint returns HTTP `200` when the admin listener is healthy.
 - The JSON `status` field changes to `"degraded"` when the process is alive but running with a degraded dependency state, such as a disconnected database while serving from cached config.
 
+### Startup Timing
+
+At startup, the gateway runs DNS warmup followed by optional connection pool warmup (`FERRUM_POOL_WARMUP_ENABLED=true` by default) before accepting traffic. With many backends, this can add a few seconds to startup. If your startup probe is too aggressive, increase `failureThreshold` or `initialDelaySeconds` to accommodate warmup time. See [connection_pooling.md](connection_pooling.md#connection-pool-warmup) for details.
+
 ### Default Probe Strategy
 
 Use this when cached config is acceptable and you mainly want to know whether the process and admin listener are alive:

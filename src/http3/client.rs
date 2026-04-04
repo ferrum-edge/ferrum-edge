@@ -105,6 +105,60 @@ impl Http3ConnectionPool {
         format!("{}|{}|{}", host, port, index)
     }
 
+    /// Pre-establish a QUIC connection and cache it in the pool (shard 0 only).
+    ///
+    /// Used at startup to warm the connection pool so the first request to each
+    /// H3 backend does not pay the QUIC + TLS 1.3 handshake cost.
+    pub async fn warmup_connection(
+        &self,
+        proxy: &Proxy,
+        tls_config: &Arc<rustls::ClientConfig>,
+    ) -> Result<(), anyhow::Error> {
+        let key = Self::pool_key(proxy, 0);
+        if self.entries.contains_key(&key) {
+            return Ok(());
+        }
+        let h3_config = super::config::Http3ServerConfig::from_env_config(&self.env_config);
+        let (endpoint, sr) = Self::create_connection(proxy, tls_config, Some(&h3_config)).await?;
+        self.entries.insert(
+            key,
+            H3PoolEntry {
+                send_request: sr,
+                _endpoint: endpoint,
+                last_used_epoch_ms: Arc::new(AtomicU64::new(now_epoch_ms())),
+            },
+        );
+        Ok(())
+    }
+
+    /// Pre-establish a QUIC connection to an explicit host/port target.
+    ///
+    /// Used at startup to warm pool entries for upstream targets where the
+    /// backend host/port differs from the proxy's configured backend.
+    pub async fn warmup_connection_to_target(
+        &self,
+        host: &str,
+        port: u16,
+        tls_config: &Arc<rustls::ClientConfig>,
+    ) -> Result<(), anyhow::Error> {
+        let key = Self::pool_key_for_target(host, port, 0);
+        if self.entries.contains_key(&key) {
+            return Ok(());
+        }
+        let h3_config = super::config::Http3ServerConfig::from_env_config(&self.env_config);
+        let (endpoint, sr) =
+            Self::create_connection_to_target(host, port, tls_config, Some(&h3_config)).await?;
+        self.entries.insert(
+            key,
+            H3PoolEntry {
+                send_request: sr,
+                _endpoint: endpoint,
+                last_used_epoch_ms: Arc::new(AtomicU64::new(now_epoch_ms())),
+            },
+        );
+        Ok(())
+    }
+
     /// Send an HTTP/3 request, reusing a cached QUIC connection if available.
     ///
     /// Round-robins across `connections_per_backend` connections to distribute

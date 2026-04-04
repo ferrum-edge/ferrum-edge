@@ -129,6 +129,13 @@ pub async fn run(
 
     dns_cache.warmup(hostnames).await;
 
+    // Connection pool warmup — pre-establish backend connections for HTTP-family
+    // proxies so the first request to each backend avoids TCP/TLS/QUIC handshake
+    // latency. Must run after DNS warmup (needs resolved IPs).
+    if env_config.pool_warmup_enabled {
+        proxy_state.warmup_connection_pools().await;
+    }
+
     // Start background TTL refresh to keep cache warm (with shutdown)
     let dns_handle =
         dns_cache.start_background_refresh_with_shutdown(Some(shutdown_tx.subscribe()));

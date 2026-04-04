@@ -359,6 +359,14 @@ impl ConnectionPool {
         )
     }
 
+    /// Expose the pool key for warmup deduplication.
+    ///
+    /// Uses the same key format as `create_pool_key()` so warmup targets are
+    /// deduplicated identically to runtime pool entries.
+    pub(crate) fn pool_key_for_warmup(&self, proxy: &Proxy) -> String {
+        self.create_pool_key(proxy)
+    }
+
     /// Start background cleanup task for idle connections
     fn start_cleanup_task(&self) {
         let pools = self.pools.clone();

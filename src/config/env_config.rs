@@ -279,6 +279,14 @@ pub struct EnvConfig {
     /// skip the wait and open a new backend connection immediately.
     pub grpc_pool_ready_wait_ms: u64,
 
+    // Connection pool warmup
+    /// Pre-establish backend connections at startup (default: true).
+    /// Warms HTTP, gRPC, HTTP/2, and HTTP/3 pools after DNS warmup completes.
+    /// Skipped for TCP/UDP stream proxies (no persistent connection pools).
+    pub pool_warmup_enabled: bool,
+    /// Maximum concurrent connection warmup attempts at startup (default: 500).
+    pub pool_warmup_concurrency: usize,
+
     // Connection pool cleanup
     /// Interval in seconds between connection pool cleanup sweeps (default: 30).
     /// Applies to HTTP, gRPC, HTTP/2, and HTTP/3 connection pools.
@@ -490,6 +498,8 @@ impl Default for EnvConfig {
             http3_connections_per_backend: 4,
             http3_pool_idle_timeout_seconds: 120,
             grpc_pool_ready_wait_ms: 1,
+            pool_warmup_enabled: true,
+            pool_warmup_concurrency: 500,
             pool_cleanup_interval_seconds: 30,
             tcp_idle_timeout_seconds: 300,
             udp_max_sessions: 10_000,
@@ -721,6 +731,13 @@ impl EnvConfig {
                 120,
             ),
             grpc_pool_ready_wait_ms: resolve_u64(conf, "FERRUM_GRPC_POOL_READY_WAIT_MS", 1),
+
+            // Connection pool warmup
+            pool_warmup_enabled: resolve_bool(conf, "FERRUM_POOL_WARMUP_ENABLED", true),
+            pool_warmup_concurrency: resolve_var(conf, "FERRUM_POOL_WARMUP_CONCURRENCY")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(500)
+                .max(1),
 
             // Connection pool cleanup
             pool_cleanup_interval_seconds: resolve_u64(

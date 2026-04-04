@@ -181,6 +181,20 @@ See [client_ip_resolution.md](client_ip_resolution.md) for the security model an
 
 See [infrastructure_sizing.md](infrastructure_sizing.md) for detailed tuning guidance.
 
+### Connection Pooling
+
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `FERRUM_POOL_WARMUP_ENABLED` | No | `true` | Pre-establish backend connections at startup after DNS warmup. Skipped for TCP/UDP stream proxies |
+| `FERRUM_POOL_WARMUP_CONCURRENCY` | No | `500` | Maximum concurrent connection warmup attempts at startup |
+| `FERRUM_POOL_CLEANUP_INTERVAL_SECONDS` | No | `30` | Cleanup sweep interval for all connection pools |
+| `FERRUM_POOL_MAX_IDLE_PER_HOST` | No | `64` | Maximum idle connections per backend host (reqwest pool) |
+| `FERRUM_POOL_IDLE_TIMEOUT_SECONDS` | No | `90` | Seconds before idle connections are closed |
+| `FERRUM_POOL_ENABLE_HTTP2` | No | `true` | Enable HTTP/2 multiplexing when supported |
+| `FERRUM_POOL_TCP_KEEPALIVE_SECONDS` | No | `60` | TCP keep-alive interval in seconds |
+
+See [connection_pooling.md](connection_pooling.md) for the full configuration reference and pool warmup details.
+
 The full list of 90+ environment variables is defined in `src/config/env_config.rs`.
 
 ## Configuration File (`ferrum.conf`)

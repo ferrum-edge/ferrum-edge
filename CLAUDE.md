@@ -103,6 +103,8 @@ Within each mode (database/file/dp), after config is loaded:
 14. **CP/DP gRPC TLS** — CP loads `FERRUM_CP_GRPC_TLS_CERT_PATH` / key / client CA for the gRPC server. DP loads `FERRUM_DP_GRPC_TLS_*` certs for the gRPC client connection to CP.
 15. **Stream proxy port validation** — Validates that stream proxy `listen_port` values do not conflict with gateway reserved ports (`FERRUM_PROXY_HTTP_PORT`, `FERRUM_PROXY_HTTPS_PORT`, `FERRUM_ADMIN_HTTP_PORT`, `FERRUM_ADMIN_HTTPS_PORT`, CP gRPC port). Conflicts are fatal in database/file modes.
 16. **Stream listener bind** — `initial_reconcile_stream_listeners()` binds TCP/UDP stream proxy ports. In database/file modes, bind failure is fatal (gateway exits). In DP mode, bind failures are logged as errors but non-fatal — the DP continues serving HTTP traffic and retries when the CP pushes corrected config.
+17. **DNS warmup** — All backend hostnames (proxy backends, upstream targets, plugin endpoints) are resolved concurrently before accepting traffic.
+18. **Connection pool warmup** — When `FERRUM_POOL_WARMUP_ENABLED=true` (default), pre-establishes backend connections for HTTP-family pools (reqwest, gRPC, HTTP/2 direct, HTTP/3) after DNS warmup. TCP/UDP stream proxies are skipped (no persistent pools). Upstream targets are expanded so each target gets a warmed connection. Failures are logged as warnings but never block startup.
 
 ### External Secret Resolution
 
@@ -600,6 +602,8 @@ Reduce per-request allocations in plugin lookup
 | `FERRUM_ADMIN_RESTORE_MAX_BODY_SIZE_MIB` | `100` | Max request body size (MiB) for `POST /restore` |
 | `FERRUM_HTTP3_CONNECTIONS_PER_BACKEND` | `4` | QUIC connections per HTTP/3 backend (distributes frame processing) |
 | `FERRUM_HTTP3_POOL_IDLE_TIMEOUT_SECONDS` | `120` | HTTP/3 connection pool idle eviction timeout |
+| `FERRUM_POOL_WARMUP_ENABLED` | `true` | Pre-establish backend connections at startup after DNS warmup. Skipped for TCP/UDP |
+| `FERRUM_POOL_WARMUP_CONCURRENCY` | `500` | Maximum concurrent connection warmup attempts at startup |
 | `FERRUM_POOL_CLEANUP_INTERVAL_SECONDS` | `30` | Cleanup sweep interval for HTTP, gRPC, HTTP/2, HTTP/3 pools |
 | `FERRUM_TCP_IDLE_TIMEOUT_SECONDS` | `300` | Default TCP idle timeout (5 min). Per-proxy `tcp_idle_timeout_seconds` overrides. 0 = disabled |
 | `FERRUM_UDP_MAX_SESSIONS` | `10000` | Maximum concurrent UDP sessions per proxy |

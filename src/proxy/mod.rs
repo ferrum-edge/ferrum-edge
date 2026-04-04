@@ -85,6 +85,11 @@ pub use self::body::ProxyBody;
 use self::grpc_proxy::{GrpcConnectionPool, GrpcProxyError, GrpcResponseKind};
 use self::http2_pool::Http2ConnectionPool;
 
+/// Boxed future type for pool warmup tasks.
+/// Returns `Ok(description)` on success or `Err(message)` on failure.
+type WarmupTask =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send>>;
+
 /// Check if the request is a WebSocket upgrade request.
 ///
 /// Uses ASCII case-insensitive comparisons to avoid per-request `to_lowercase()`
@@ -828,6 +833,324 @@ impl ProxyState {
             ));
         }
         Err(anyhow::anyhow!("{}", msg.trim_end()))
+    }
+
+    /// Pre-establish backend connections for all HTTP-family proxies.
+    ///
+    /// Warms four pool types (reqwest, gRPC, HTTP/2 direct, HTTP/3) after DNS
+    /// warmup completes, so the first request to each backend does not pay
+    /// TCP/TLS/QUIC handshake latency. Stream proxies (TCP/UDP) are skipped
+    /// because they create per-session connections with no persistent pool.
+    ///
+    /// For upstream-backed proxies, every target in the upstream is warmed for
+    /// pools that key by (host, port) — gRPC, HTTP/2 direct, HTTP/3. The
+    /// reqwest pool keys by `upstream_id` so one `get_client()` call covers
+    /// all targets (reqwest handles per-host pooling internally).
+    pub async fn warmup_connection_pools(&self) {
+        use futures_util::stream;
+        use std::collections::HashSet;
+
+        let config = self.config.load_full();
+        let concurrency = self.env_config.pool_warmup_concurrency;
+
+        // Build a deduplication set for per-host pools (gRPC, H2, H3) keyed by
+        // the same pool key the pool itself uses, preventing redundant warmups.
+        let mut seen_reqwest = HashSet::new();
+        let mut seen_grpc = HashSet::new();
+        let mut seen_h2 = HashSet::new();
+        let mut seen_h3 = HashSet::new();
+
+        // Collect all warmup tasks as boxed futures.
+        let mut tasks: Vec<WarmupTask> = Vec::new();
+
+        // Helper: build upstream target map for O(1) lookup
+        let upstream_map: HashMap<&str, &crate::config::types::Upstream> = config
+            .upstreams
+            .iter()
+            .map(|u| (u.id.as_str(), u))
+            .collect();
+
+        for proxy in &config.proxies {
+            // Skip stream proxies — no persistent connection pools
+            if proxy.backend_protocol.is_stream_proxy() {
+                continue;
+            }
+
+            match proxy.backend_protocol {
+                // ── reqwest pool (HTTP/1.1, HTTPS, WS, WSS) ──
+                // Also covers HTTPS when H2 direct pool is not eligible.
+                BackendProtocol::Http
+                | BackendProtocol::Https
+                | BackendProtocol::Ws
+                | BackendProtocol::Wss => {
+                    let pool_key = self.connection_pool.pool_key_for_warmup(proxy);
+                    if seen_reqwest.insert(pool_key) {
+                        let pool = self.connection_pool.clone();
+                        let proxy = proxy.clone();
+                        tasks.push(Box::pin(async move {
+                            let desc =
+                                format!("reqwest {}:{}", proxy.backend_host, proxy.backend_port);
+                            pool.get_client(&proxy)
+                                .await
+                                .map(|_| desc.clone())
+                                .map_err(|e| format!("{}: {}", desc, e))
+                        }));
+                    }
+
+                    // If HTTPS with enable_http2, also warm the direct H2 pool
+                    if matches!(proxy.backend_protocol, BackendProtocol::Https) {
+                        let pool_config =
+                            self.connection_pool.global_pool_config().for_proxy(proxy);
+                        if pool_config.enable_http2 {
+                            self.collect_h2_warmup_tasks(
+                                proxy,
+                                &upstream_map,
+                                &mut seen_h2,
+                                &mut tasks,
+                            );
+                        }
+                    }
+                }
+
+                // ── gRPC pool (Grpc/Grpcs) ──
+                BackendProtocol::Grpc | BackendProtocol::Grpcs => {
+                    self.collect_grpc_warmup_tasks(
+                        proxy,
+                        &upstream_map,
+                        &mut seen_grpc,
+                        &mut tasks,
+                    );
+                }
+
+                // ── HTTP/3 pool ──
+                BackendProtocol::H3 => {
+                    self.collect_h3_warmup_tasks(proxy, &upstream_map, &mut seen_h3, &mut tasks);
+                }
+
+                // Stream protocols already filtered above
+                _ => {}
+            }
+        }
+
+        if tasks.is_empty() {
+            debug!("Pool warmup: no HTTP-family backends to warm");
+            return;
+        }
+
+        let total = tasks.len();
+        info!(
+            "Pool warmup: establishing {} backend connections (concurrency={})",
+            total, concurrency
+        );
+
+        let ok = Arc::new(AtomicU64::new(0));
+        let failed = Arc::new(AtomicU64::new(0));
+
+        let ok_ref = ok.clone();
+        let failed_ref = failed.clone();
+
+        stream::iter(tasks)
+            .for_each_concurrent(concurrency, |task| {
+                let ok = ok_ref.clone();
+                let failed = failed_ref.clone();
+                async move {
+                    match task.await {
+                        Ok(desc) => {
+                            debug!("Pool warmup: {} ok", desc);
+                            ok.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(msg) => {
+                            warn!("Pool warmup failed: {}", msg);
+                            failed.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
+            })
+            .await;
+
+        let ok_count = ok.load(Ordering::Relaxed);
+        let failed_count = failed.load(Ordering::Relaxed);
+        if failed_count > 0 {
+            info!(
+                "Pool warmup complete: {} ok, {} failed out of {} targets",
+                ok_count, failed_count, total
+            );
+        } else {
+            info!("Pool warmup complete: all {} targets ok", total);
+        }
+    }
+
+    /// Collect gRPC pool warmup tasks for a proxy, expanding upstream targets.
+    fn collect_grpc_warmup_tasks(
+        &self,
+        proxy: &Proxy,
+        upstream_map: &HashMap<&str, &crate::config::types::Upstream>,
+        seen: &mut std::collections::HashSet<String>,
+        tasks: &mut Vec<WarmupTask>,
+    ) {
+        if let Some(ref upstream_id) = proxy.upstream_id {
+            if let Some(upstream) = upstream_map.get(upstream_id.as_str()) {
+                for target in &upstream.targets {
+                    let mut target_proxy = proxy.clone();
+                    target_proxy.backend_host = target.host.clone();
+                    target_proxy.backend_port = target.port;
+                    let key = grpc_proxy::GrpcConnectionPool::pool_key_for_warmup(&target_proxy);
+                    if seen.insert(key) {
+                        let pool = self.grpc_pool.clone();
+                        let dns = self.dns_cache.clone();
+                        tasks.push(Box::pin(async move {
+                            let desc = format!(
+                                "gRPC {}:{}",
+                                target_proxy.backend_host, target_proxy.backend_port
+                            );
+                            pool.get_sender(&target_proxy, &dns)
+                                .await
+                                .map(|_| desc.clone())
+                                .map_err(|e| format!("{}: {:?}", desc, e))
+                        }));
+                    }
+                }
+            }
+        } else {
+            let key = grpc_proxy::GrpcConnectionPool::pool_key_for_warmup(proxy);
+            if seen.insert(key) {
+                let pool = self.grpc_pool.clone();
+                let dns = self.dns_cache.clone();
+                let proxy = proxy.clone();
+                tasks.push(Box::pin(async move {
+                    let desc = format!("gRPC {}:{}", proxy.backend_host, proxy.backend_port);
+                    pool.get_sender(&proxy, &dns)
+                        .await
+                        .map(|_| desc.clone())
+                        .map_err(|e| format!("{}: {:?}", desc, e))
+                }));
+            }
+        }
+    }
+
+    /// Collect HTTP/2 direct pool warmup tasks for a proxy, expanding upstream targets.
+    fn collect_h2_warmup_tasks(
+        &self,
+        proxy: &Proxy,
+        upstream_map: &HashMap<&str, &crate::config::types::Upstream>,
+        seen: &mut std::collections::HashSet<String>,
+        tasks: &mut Vec<WarmupTask>,
+    ) {
+        if let Some(ref upstream_id) = proxy.upstream_id {
+            if let Some(upstream) = upstream_map.get(upstream_id.as_str()) {
+                for target in &upstream.targets {
+                    let mut target_proxy = proxy.clone();
+                    target_proxy.backend_host = target.host.clone();
+                    target_proxy.backend_port = target.port;
+                    let key = Http2ConnectionPool::pool_key_for_warmup(&target_proxy);
+                    if seen.insert(key) {
+                        let pool = self.http2_pool.clone();
+                        let dns = self.dns_cache.clone();
+                        tasks.push(Box::pin(async move {
+                            let desc = format!(
+                                "H2 {}:{}",
+                                target_proxy.backend_host, target_proxy.backend_port
+                            );
+                            pool.get_sender(&target_proxy, &dns)
+                                .await
+                                .map(|_| desc.clone())
+                                .map_err(|e| format!("{}: {:?}", desc, e))
+                        }));
+                    }
+                }
+            }
+        } else {
+            let key = Http2ConnectionPool::pool_key_for_warmup(proxy);
+            if seen.insert(key) {
+                let pool = self.http2_pool.clone();
+                let dns = self.dns_cache.clone();
+                let proxy = proxy.clone();
+                tasks.push(Box::pin(async move {
+                    let desc = format!("H2 {}:{}", proxy.backend_host, proxy.backend_port);
+                    pool.get_sender(&proxy, &dns)
+                        .await
+                        .map(|_| desc.clone())
+                        .map_err(|e| format!("{}: {:?}", desc, e))
+                }));
+            }
+        }
+    }
+
+    /// Collect HTTP/3 pool warmup tasks for a proxy, expanding upstream targets.
+    fn collect_h3_warmup_tasks(
+        &self,
+        proxy: &Proxy,
+        upstream_map: &HashMap<&str, &crate::config::types::Upstream>,
+        seen: &mut std::collections::HashSet<String>,
+        tasks: &mut Vec<WarmupTask>,
+    ) {
+        if let Some(ref upstream_id) = proxy.upstream_id {
+            if let Some(upstream) = upstream_map.get(upstream_id.as_str()) {
+                for target in &upstream.targets {
+                    let key = format!(
+                        "h3|{}|{}|{}|{}|{}",
+                        target.host,
+                        target.port,
+                        proxy
+                            .backend_tls_server_ca_cert_path
+                            .as_deref()
+                            .unwrap_or_default(),
+                        proxy
+                            .backend_tls_client_cert_path
+                            .as_deref()
+                            .unwrap_or_default(),
+                        proxy.backend_tls_verify_server_cert as u8,
+                    );
+                    if seen.insert(key) {
+                        let pool = self.h3_pool.clone();
+                        let conn_pool = self.connection_pool.clone();
+                        let proxy = proxy.clone();
+                        let host = target.host.clone();
+                        let port = target.port;
+                        tasks.push(Box::pin(async move {
+                            let desc = format!("H3 {}:{}", host, port);
+                            let tls_config = conn_pool
+                                .get_tls_config_for_backend(&proxy)
+                                .map_err(|e| format!("{}: TLS config: {}", desc, e))?;
+                            pool.warmup_connection_to_target(&host, port, &tls_config)
+                                .await
+                                .map(|_| desc.clone())
+                                .map_err(|e| format!("{}: {}", desc, e))
+                        }));
+                    }
+                }
+            }
+        } else {
+            let key = format!(
+                "h3|{}|{}|{}|{}|{}",
+                proxy.backend_host,
+                proxy.backend_port,
+                proxy
+                    .backend_tls_server_ca_cert_path
+                    .as_deref()
+                    .unwrap_or_default(),
+                proxy
+                    .backend_tls_client_cert_path
+                    .as_deref()
+                    .unwrap_or_default(),
+                proxy.backend_tls_verify_server_cert as u8,
+            );
+            if seen.insert(key) {
+                let pool = self.h3_pool.clone();
+                let conn_pool = self.connection_pool.clone();
+                let proxy = proxy.clone();
+                tasks.push(Box::pin(async move {
+                    let desc = format!("H3 {}:{}", proxy.backend_host, proxy.backend_port);
+                    let tls_config = conn_pool
+                        .get_tls_config_for_backend(&proxy)
+                        .map_err(|e| format!("{}: TLS config: {}", desc, e))?;
+                    pool.warmup_connection(&proxy, &tls_config)
+                        .await
+                        .map(|_| desc.clone())
+                        .map_err(|e| format!("{}: {}", desc, e))
+                }));
+            }
+        }
     }
 
     /// Apply a new configuration, using incremental (surgical) updates when

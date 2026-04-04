@@ -95,6 +95,8 @@ On startup, Ferrum Edge resolves all configured hostnames asynchronously before 
 
 Hostnames are **deduplicated** before resolution — if multiple proxies or plugins share the same hostname, only one DNS lookup is performed. Warmup remains parallel, but concurrency is bounded by `FERRUM_DNS_WARMUP_CONCURRENCY` to avoid unbounded task bursts on very large configs. This ensures no cold-cache DNS lookups on the first request, whether the proxy uses a single backend, a load-balanced upstream pool, or a plugin with an outbound endpoint.
 
+After DNS warmup completes, the gateway optionally **warms connection pools** for all HTTP-family backends (HTTP, HTTPS, gRPC, HTTP/2, HTTP/3) — pre-establishing TCP/TLS/QUIC connections so the first request to each backend avoids handshake latency. This is controlled by `FERRUM_POOL_WARMUP_ENABLED` (default: `true`). See [connection_pooling.md](connection_pooling.md#connection-pool-warmup) for details.
+
 ## Transparent DNS Cache for HTTP Clients
 
 All outbound HTTP clients (proxy traffic, health check probes, plugin outbound calls) use a custom DNS resolver that transparently routes DNS lookups through the gateway's central DNS cache. This is set via `reqwest::ClientBuilder::dns_resolver()` on every client, ensuring that:

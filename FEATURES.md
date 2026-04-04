@@ -116,6 +116,7 @@ Ferrum supports dynamic upstream target discovery through three providers, confi
 - Global defaults with per-proxy overrides (max idle, idle timeout, keep-alive, HTTP/2)
 - HTTP/2 multiplexing via ALPN negotiation
 - TCP and HTTP/2 keep-alive with configurable intervals
+- **Startup pool warmup** — pre-establishes backend connections (reqwest, gRPC, HTTP/2, HTTP/3) after DNS warmup to eliminate first-request cold-start latency (configurable via `FERRUM_POOL_WARMUP_ENABLED`)
 
 ## High-Concurrency & Runtime Tuning
 

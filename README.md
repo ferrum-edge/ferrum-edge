@@ -287,9 +287,9 @@ See [docs/load_balancing.md](docs/load_balancing.md), [docs/retry.md](docs/retry
 
 ## Connection Pooling
 
-Lock-free connection reuse with per-proxy pool keys and HTTP/2 flow control tuning. Hybrid configuration with global defaults and per-proxy overrides.
+Lock-free connection reuse with per-proxy pool keys and HTTP/2 flow control tuning. Hybrid configuration with global defaults and per-proxy overrides. Startup pool warmup pre-establishes backend connections after DNS warmup to eliminate first-request cold-start latency.
 
-See [docs/connection_pooling.md](docs/connection_pooling.md) for sizing guidance and configuration.
+See [docs/connection_pooling.md](docs/connection_pooling.md) for sizing guidance, pool warmup, and configuration.
 
 ## Security
 
