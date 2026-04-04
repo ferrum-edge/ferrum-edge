@@ -54,7 +54,7 @@ Ferrum supports dynamic upstream target discovery through three providers, confi
 
 ## Plugin System
 
-- 36 built-in plugins with lifecycle hooks (request received, authenticate, authorize, before proxy, after proxy, on final request/response body, on response body, on WebSocket frame, on UDP datagram, log)
+- 37 built-in plugins with lifecycle hooks (request received, authenticate, authorize, before proxy, after proxy, on final request/response body, on response body, on WebSocket frame, on UDP datagram, log)
 - Priority-ordered execution with protocol-aware filtering (HTTP, gRPC, WebSocket, TCP, UDP)
 - Global and per-proxy scoping with same-type override semantics
 - Multi-authentication mode with first-match consumer identification
@@ -94,6 +94,10 @@ Ferrum supports dynamic upstream target discovery through three providers, confi
 - **WebSocket Message Size Limiting** — enforces maximum frame sizes on WebSocket connections, closing with code 1009 (Message Too Big) on violation
 - **WebSocket Rate Limiting** — per-connection frame rate limiting using token bucket algorithm, closing with code 1008 (Policy Violation) on excess; supports centralized Redis-backed mode for cross-instance frame rate coordination. Compatible with any RESP-protocol server (Redis, Valkey, DragonflyDB, KeyDB, Garnet). TLS uses gateway-level settings
 - **WebSocket Frame Logging** — logs frame metadata (direction, type, size, connection ID) without transforming frames
+
+### Serverless Function Plugin
+
+- **Serverless Function** — invoke AWS Lambda, Azure Functions, or Google Cloud Functions as middleware. Pre-proxy mode enriches requests with function-computed headers; terminate mode returns function responses directly. Supports SigV4 signing for AWS, function key auth for Azure, and bearer token auth for GCP. Cloud credentials fall back to standard environment variables (`AWS_ACCESS_KEY_ID`, `AZURE_FUNCTIONS_KEY`, etc.) when not set in plugin config.
 
 ### Transform Plugins
 

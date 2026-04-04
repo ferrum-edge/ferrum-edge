@@ -1,4 +1,4 @@
-//! Plugin system — 36 built-in plugins with a trait-based architecture.
+//! Plugin system — 37 built-in plugins with a trait-based architecture.
 //!
 //! Plugins execute in priority order (lower number = runs first) through
 //! lifecycle phases: `on_request_received` → `authenticate` → `authorize` →
@@ -46,6 +46,7 @@ pub mod request_transformer;
 pub mod response_caching;
 pub mod response_size_limiting;
 pub mod response_transformer;
+pub mod serverless_function;
 pub mod stdout_logging;
 pub mod tcp_connection_throttle;
 pub mod transaction_debugger;
@@ -443,6 +444,7 @@ pub mod priority {
     pub const BODY_VALIDATOR: u16 = 2950;
     pub const AI_REQUEST_GUARD: u16 = 2975;
     pub const REQUEST_TRANSFORMER: u16 = 3000;
+    pub const SERVERLESS_FUNCTION: u16 = 3025;
     pub const GRPC_DEADLINE: u16 = 3050;
     pub const RESPONSE_SIZE_LIMITING: u16 = 3490;
     pub const RESPONSE_CACHING: u16 = 3500;
@@ -851,6 +853,9 @@ pub fn create_plugin_with_http_client(
         "response_caching" => Ok(Some(Arc::new(response_caching::ResponseCaching::new(
             config,
         )))),
+        "serverless_function" => Ok(Some(Arc::new(
+            serverless_function::ServerlessFunction::new(config, http_client)?,
+        ))),
         "prometheus_metrics" => Ok(Some(Arc::new(prometheus_metrics::PrometheusMetrics::new(
             config,
         )))),
@@ -942,6 +947,7 @@ pub fn available_plugins() -> Vec<&'static str> {
         "body_validator",
         "request_termination",
         "response_caching",
+        "serverless_function",
         "prometheus_metrics",
         "otel_tracing",
         "ai_token_metrics",

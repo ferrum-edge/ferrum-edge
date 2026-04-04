@@ -219,6 +219,7 @@ async fn test_all_plugins_available() {
         "ws_frame_logging",
         "ws_rate_limiting",
         "udp_rate_limiting",
+        "serverless_function",
     ]
     .into_iter()
     .collect();
@@ -248,6 +249,9 @@ async fn test_plugin_creation_all_plugins() {
             "access_control" => json!({"allowed_consumers": ["testuser"]}),
             "tcp_connection_throttle" => json!({"max_connections_per_key": 10}),
             "udp_rate_limiting" => json!({"datagrams_per_second": 1000}),
+            "serverless_function" => {
+                json!({"provider": "azure_functions", "function_url": "https://example.com/func"})
+            }
             _ => json!({}),
         };
         let plugin = create_plugin(plugin_name, &config);

@@ -1,6 +1,6 @@
 # Plugin Reference
 
-Ferrum Edge includes 35 built-in plugins organized into lifecycle phases. Each plugin executes at a specific priority (lower number = runs first).
+Ferrum Edge includes 37 built-in plugins organized into lifecycle phases. Each plugin executes at a specific priority (lower number = runs first).
 
 For execution order, protocol support matrix, and design rationale, see [plugin_execution_order.md](plugin_execution_order.md).
 
@@ -818,6 +818,129 @@ Returns a predefined response without proxying to the backend. Useful for mainte
 | `trigger.path_prefix` | String | _(none)_ | Only terminate when the request path starts with this prefix |
 | `trigger.header` | String | _(none)_ | Only terminate when this request header is present |
 | `trigger.header_value` | String | `""` | Optional exact value for `trigger.header`; empty means any value |
+
+---
+
+## Serverless Function Plugin
+
+### `serverless_function`
+
+Invokes AWS Lambda, Azure Functions, or Google Cloud Functions as middleware in the proxy pipeline. Two modes are supported:
+
+- **`pre_proxy`** (default) — calls the function with request context, injects response headers/metadata into the proxied request, then continues to the backend.
+- **`terminate`** — calls the function and returns its response directly to the client, bypassing backend proxying.
+
+**Priority:** 3025
+**Protocols:** HTTP, gRPC
+
+#### Provider Configuration
+
+**AWS Lambda** — uses the Lambda Invoke API with SigV4 request signing:
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `provider` | String | (required) | `"aws_lambda"` |
+| `aws_region` | String | — | AWS region. Falls back to `AWS_DEFAULT_REGION` / `AWS_REGION` env var |
+| `aws_access_key_id` | String | — | IAM access key. Falls back to `AWS_ACCESS_KEY_ID` env var |
+| `aws_secret_access_key` | String | — | IAM secret key. Falls back to `AWS_SECRET_ACCESS_KEY` env var |
+| `aws_function_name` | String | — | Lambda function name or ARN. Falls back to `AWS_LAMBDA_FUNCTION_NAME` env var |
+| `aws_qualifier` | String | — | Optional version/alias qualifier (e.g., `$LATEST`, `prod`) |
+
+**Azure Functions** — calls the HTTP trigger URL:
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `provider` | String | (required) | `"azure_functions"` |
+| `function_url` | String | (required) | HTTPS trigger URL |
+| `azure_function_key` | String | — | Function key for auth. Falls back to `AZURE_FUNCTIONS_KEY` env var |
+
+**GCP Cloud Functions** — calls the HTTPS trigger URL:
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `provider` | String | (required) | `"gcp_cloud_functions"` |
+| `function_url` | String | (required) | HTTPS trigger URL |
+| `gcp_bearer_token` | String | — | Bearer token for auth. Falls back to `GCP_CLOUD_FUNCTIONS_BEARER_TOKEN` env var |
+
+#### Common Parameters
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `mode` | String | `"pre_proxy"` | `"pre_proxy"` or `"terminate"` |
+| `forward_body` | bool | `false` | Include request body in function payload |
+| `forward_headers` | String[] | `[]` | Header names to forward to the function |
+| `forward_query_params` | bool | `false` | Include query parameters in function payload |
+| `timeout_ms` | u64 | `5000` | Function invocation timeout in milliseconds |
+| `max_response_body_bytes` | u64 | `10485760` | Max function response body size (10 MiB) |
+| `on_error` | String | `"reject"` | `"reject"` returns error to client; `"continue"` skips and proxies normally |
+| `error_status_code` | u16 | `502` | HTTP status when rejecting on error |
+
+#### Function Request Payload
+
+The plugin sends a JSON payload to the function:
+
+```json
+{
+  "method": "POST",
+  "path": "/api/v1/users",
+  "client_ip": "10.0.0.1",
+  "consumer_username": "alice",
+  "authenticated_identity": "user@example.com",
+  "headers": { "x-request-id": "abc-123" },
+  "query_params": { "page": "1" },
+  "body": { "name": "Alice" }
+}
+```
+
+#### Function Response Format (pre_proxy mode)
+
+The function should return JSON with optional `headers` and `metadata` fields:
+
+```json
+{
+  "headers": {
+    "x-custom-header": "computed-value",
+    "x-user-tier": "premium"
+  },
+  "metadata": {
+    "decision": "allowed",
+    "reason": "user is premium"
+  }
+}
+```
+
+Headers are injected into the proxied request. Metadata is stored in `ctx.metadata` with a `serverless_` prefix and flows into transaction logs.
+
+#### Environment Variable Fallback
+
+Cloud credential fields fall back to well-known environment variables when not set in plugin config. Config values always take precedence. These env vars may themselves be resolved by the gateway's secret resolution system (Vault, AWS Secrets Manager, etc.).
+
+#### Example: AWS Lambda pre-proxy enrichment
+
+```yaml
+plugin_name: serverless_function
+config:
+  provider: aws_lambda
+  aws_region: us-east-1
+  aws_function_name: enrich-request
+  mode: pre_proxy
+  forward_headers: ["authorization", "x-request-id"]
+  forward_body: true
+  timeout_ms: 3000
+  on_error: continue
+```
+
+#### Example: Azure Functions terminate mode
+
+```yaml
+plugin_name: serverless_function
+config:
+  provider: azure_functions
+  function_url: https://my-app.azurewebsites.net/api/compute
+  mode: terminate
+  forward_body: true
+  timeout_ms: 10000
+```
 
 ---
 
