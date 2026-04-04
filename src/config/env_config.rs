@@ -208,8 +208,20 @@ pub struct EnvConfig {
     // Request/Response limits
     pub max_header_size_bytes: usize,
     pub max_single_header_size_bytes: usize,
+    /// Maximum number of request headers allowed. 0 = unlimited.
+    pub max_header_count: usize,
     pub max_request_body_size_bytes: usize,
     pub max_response_body_size_bytes: usize,
+    /// Maximum URL length in bytes (path + query string). 0 = unlimited.
+    pub max_url_length_bytes: usize,
+    /// Maximum number of query parameters allowed. 0 = unlimited.
+    pub max_query_params: usize,
+    /// Maximum total received gRPC payload size in bytes. For unary RPCs this is
+    /// effectively a per-message limit (plus 5 bytes of gRPC framing). For streaming
+    /// RPCs this caps the cumulative body size across all messages. 0 = unlimited.
+    pub max_grpc_recv_size_bytes: usize,
+    /// Maximum WebSocket frame size in bytes. Applied to both client and backend connections.
+    pub max_websocket_frame_size_bytes: usize,
 
     // DNS
     pub dns_cache_ttl_seconds: u64,
@@ -471,8 +483,13 @@ impl Default for EnvConfig {
             dp_grpc_tls_no_verify: false,
             max_header_size_bytes: 32_768,
             max_single_header_size_bytes: 16_384,
+            max_header_count: 100,
             max_request_body_size_bytes: 10_485_760,
             max_response_body_size_bytes: 10_485_760,
+            max_url_length_bytes: 8_192,
+            max_query_params: 100,
+            max_grpc_recv_size_bytes: 4_194_304,
+            max_websocket_frame_size_bytes: 16_777_216,
             dns_cache_ttl_seconds: 300,
             dns_overrides: HashMap::new(),
             dns_resolver_address: None,
@@ -660,6 +677,7 @@ impl EnvConfig {
                 "FERRUM_MAX_SINGLE_HEADER_SIZE_BYTES",
                 16_384,
             ),
+            max_header_count: resolve_usize(conf, "FERRUM_MAX_HEADER_COUNT", 100),
             max_request_body_size_bytes: resolve_usize(
                 conf,
                 "FERRUM_MAX_REQUEST_BODY_SIZE_BYTES",
@@ -669,6 +687,18 @@ impl EnvConfig {
                 conf,
                 "FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES",
                 10_485_760,
+            ),
+            max_url_length_bytes: resolve_usize(conf, "FERRUM_MAX_URL_LENGTH_BYTES", 8_192),
+            max_query_params: resolve_usize(conf, "FERRUM_MAX_QUERY_PARAMS", 100),
+            max_grpc_recv_size_bytes: resolve_usize(
+                conf,
+                "FERRUM_MAX_GRPC_RECV_SIZE_BYTES",
+                4_194_304,
+            ),
+            max_websocket_frame_size_bytes: resolve_usize(
+                conf,
+                "FERRUM_MAX_WEBSOCKET_FRAME_SIZE_BYTES",
+                16_777_216,
             ),
 
             dns_cache_ttl_seconds: resolve_u64(conf, "FERRUM_DNS_CACHE_TTL_SECONDS", 300),

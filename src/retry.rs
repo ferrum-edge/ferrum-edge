@@ -102,6 +102,7 @@ pub fn classify_grpc_proxy_error(e: &crate::proxy::grpc_proxy::GrpcProxyError) -
                 ErrorClass::ConnectionRefused
             }
         }
+        GrpcProxyError::ResourceExhausted(_) => ErrorClass::RequestError,
         GrpcProxyError::Internal(_) => ErrorClass::RequestError,
     }
 }

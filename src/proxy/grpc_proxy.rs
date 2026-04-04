@@ -609,6 +609,7 @@ impl GrpcConnectionPool {
 pub enum GrpcProxyError {
     BackendUnavailable(String),
     BackendTimeout(String),
+    ResourceExhausted(String),
     Internal(String),
 }
 
@@ -680,6 +681,7 @@ pub enum GrpcResponseKind {
 /// returned as a live `Incoming` stream so frames flow frame-by-frame to the
 /// downstream client. This is only safe when retries are NOT configured (the
 /// body has already been consumed by the time we know if a retry is needed).
+#[allow(clippy::too_many_arguments)]
 pub async fn proxy_grpc_request(
     req: Request<Incoming>,
     proxy: &Proxy,
@@ -688,19 +690,47 @@ pub async fn proxy_grpc_request(
     dns_cache: &DnsCache,
     proxy_headers: &HashMap<String, String>,
     stream_response: bool,
+    max_grpc_recv_size_bytes: usize,
 ) -> (Result<GrpcResponseKind, GrpcProxyError>, Bytes) {
     // Collect the incoming body for potential retry replay
     let (parts, body) = req.into_parts();
-    let body_bytes = match BodyExt::collect(body).await {
-        Ok(collected) => collected.to_bytes(),
-        Err(e) => {
-            return (
-                Err(GrpcProxyError::Internal(format!(
-                    "Failed to read request body: {}",
-                    e
-                ))),
-                Bytes::new(),
-            );
+    let body_bytes = if max_grpc_recv_size_bytes > 0 {
+        // Use http_body_util::Limited to enforce max gRPC recv size during body collection
+        let limited = http_body_util::Limited::new(body, max_grpc_recv_size_bytes);
+        match BodyExt::collect(limited).await {
+            Ok(collected) => collected.to_bytes(),
+            Err(e) => {
+                let err_str = e.to_string();
+                if err_str.contains("length limit exceeded") {
+                    return (
+                        Err(GrpcProxyError::ResourceExhausted(format!(
+                            "gRPC request payload size exceeds maximum of {} bytes",
+                            max_grpc_recv_size_bytes
+                        ))),
+                        Bytes::new(),
+                    );
+                }
+                return (
+                    Err(GrpcProxyError::Internal(format!(
+                        "Failed to read request body: {}",
+                        e
+                    ))),
+                    Bytes::new(),
+                );
+            }
+        }
+    } else {
+        match BodyExt::collect(body).await {
+            Ok(collected) => collected.to_bytes(),
+            Err(e) => {
+                return (
+                    Err(GrpcProxyError::Internal(format!(
+                        "Failed to read request body: {}",
+                        e
+                    ))),
+                    Bytes::new(),
+                );
+            }
         }
     };
 

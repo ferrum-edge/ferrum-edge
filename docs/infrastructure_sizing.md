@@ -142,6 +142,11 @@ See [Response Body Streaming](response_body_streaming.md) for full details on st
 | `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES` | 10 MB | Maximum response body size |
 | `FERRUM_MAX_HEADER_SIZE_BYTES` | 32 KB | Maximum total header size |
 | `FERRUM_MAX_SINGLE_HEADER_SIZE_BYTES` | 16 KB | Maximum single header value size |
+| `FERRUM_MAX_HEADER_COUNT` | 100 | Maximum number of request headers (0=unlimited) |
+| `FERRUM_MAX_URL_LENGTH_BYTES` | 8 KB | Maximum URL length (path + query string) |
+| `FERRUM_MAX_QUERY_PARAMS` | 100 | Maximum number of query parameters |
+| `FERRUM_MAX_GRPC_RECV_SIZE_BYTES` | 4 MB | Maximum total received gRPC payload size |
+| `FERRUM_MAX_WEBSOCKET_FRAME_SIZE_BYTES` | 16 MB | Maximum WebSocket frame size (max message size = 4x frame size) |
 
 See [Size Limits](size_limits.md) for full details on enforcement layers.
 

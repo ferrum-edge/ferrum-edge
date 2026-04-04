@@ -8,8 +8,13 @@ Ferrum Edge enforces configurable size limits on request headers, request bodies
 |----------|------|---------|-------------|
 | `FERRUM_MAX_HEADER_SIZE_BYTES` | `usize` | `32768` (32KB) | Maximum total size of all request headers combined. Enforced at both the hyper protocol layer (HTTP/1.1 `max_buf_size`, HTTP/2 `max_header_list_size`) and the application layer. |
 | `FERRUM_MAX_SINGLE_HEADER_SIZE_BYTES` | `usize` | `16384` (16KB) | Maximum size of any single request header (name + value in bytes). Prevents individual oversized headers. |
+| `FERRUM_MAX_HEADER_COUNT` | `usize` | `100` | Maximum number of request headers allowed. Set to `0` for unlimited. |
 | `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES` | `usize` | `10485760` (10MB) | Maximum request body size. Set to `0` for unlimited. Checked via `Content-Length` header (fast reject) and enforced during body collection via `http_body_util::Limited`. |
 | `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES` | `usize` | `10485760` (10MB) | Maximum response body size from backends. Set to `0` for unlimited. Protects against backends sending unexpectedly large responses. |
+| `FERRUM_MAX_URL_LENGTH_BYTES` | `usize` | `8192` (8KB) | Maximum URL length in bytes (path + query string). Set to `0` for unlimited. |
+| `FERRUM_MAX_QUERY_PARAMS` | `usize` | `100` | Maximum number of query parameters allowed. Set to `0` for unlimited. |
+| `FERRUM_MAX_GRPC_RECV_SIZE_BYTES` | `usize` | `4194304` (4MB) | Maximum total received gRPC payload size in bytes. For unary RPCs this is effectively a per-message limit. For streaming RPCs it caps the cumulative body size. Set to `0` for unlimited. |
+| `FERRUM_MAX_WEBSOCKET_FRAME_SIZE_BYTES` | `usize` | `16777216` (16MB) | Maximum WebSocket frame size in bytes. Also sets max message size to 4x frame size. |
 
 ## Enforcement Layers
 
