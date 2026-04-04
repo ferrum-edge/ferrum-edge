@@ -713,6 +713,7 @@ paths:
                 - graphql
                 - grpc_method_router
                 - grpc_deadline
+                - grpc_web
                 - rate_limiting
                 - request_size_limiting
                 - response_size_limiting
@@ -3360,6 +3361,22 @@ components:
           description: >-
             Rate limit key. When consumer, uses identified_consumer then
             authenticated_identity then client IP as fallback.
+
+    GrpcWebConfig:
+      type: object
+      description: >-
+        Plugin: grpc_web — Translates between gRPC-Web (browser-compatible)
+        and native gRPC (HTTP/2) wire formats. Supports binary
+        (application/grpc-web) and text (application/grpc-web-text) encoding.
+      properties:
+        expose_headers:
+          type: array
+          items:
+            type: string
+          description: >-
+            Additional response headers to include in
+            Access-Control-Expose-Headers for browser CORS compatibility.
+            grpc-status and grpc-message are always exposed.
 
     GrpcDeadlineConfig:
       type: object

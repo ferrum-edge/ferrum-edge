@@ -203,6 +203,7 @@ async fn test_all_plugins_available() {
         "graphql",
         "grpc_method_router",
         "grpc_deadline",
+        "grpc_web",
         "rate_limiting",
         "request_size_limiting",
         "response_size_limiting",

@@ -1,4 +1,4 @@
-//! Plugin system — 40 built-in plugins with a trait-based architecture.
+//! Plugin system — 41 built-in plugins with a trait-based architecture.
 //!
 //! Plugins execute in priority order (lower number = runs first) through
 //! lifecycle phases: `on_request_received` → `authenticate` → `authorize` →
@@ -28,6 +28,7 @@ pub mod cors;
 pub mod graphql;
 pub mod grpc_deadline;
 pub mod grpc_method_router;
+pub mod grpc_web;
 pub mod hmac_auth;
 pub mod http_logging;
 pub mod ip_restriction;
@@ -531,7 +532,7 @@ pub struct StreamTransactionSummary {
 ///
 /// | Band      | Range       | Purpose                                   | Plugins |
 /// |-----------|-------------|-------------------------------------------|---------|
-/// | Early     | 0–949       | Pre-routing, tracing, and preflight       | otel_tracing (25), correlation_id (50), cors (100), request_termination (125), ip_restriction (150), bot_detection (200), sse (250), grpc_method_router (275) |
+/// | Early     | 0–949       | Pre-routing, tracing, and preflight       | otel_tracing (25), correlation_id (50), cors (100), request_termination (125), ip_restriction (150), bot_detection (200), sse (250), grpc_web (260), grpc_method_router (275) |
 /// | AuthN     | 950–1999    | Authentication / identity verification    | mtls_auth (950), jwks_auth (1000), jwt_auth (1100), key_auth (1200), basic_auth (1300), hmac_auth (1400) |
 /// | AuthZ     | 2000–2999   | Authorization and admission control       | access_control (2000), tcp_connection_throttle (2050), request_size_limiting (2800), graphql (2850), rate_limiting (2900), ai_prompt_shield (2925), body_validator (2950), ai_request_guard (2975) |
 /// | Transform | 3000–3999   | Request shaping and response buffering    | request_transformer (3000), grpc_deadline (3050), request_mirror (3075), response_size_limiting (3490), response_caching (3500) |
@@ -546,6 +547,7 @@ pub mod priority {
     pub const IP_RESTRICTION: u16 = 150;
     pub const BOT_DETECTION: u16 = 200;
     pub const SSE: u16 = 250;
+    pub const GRPC_WEB: u16 = 260;
     pub const GRPC_METHOD_ROUTER: u16 = 275;
     pub const MTLS_AUTH: u16 = 950;
     pub const JWKS_AUTH: u16 = 1000;
@@ -965,6 +967,7 @@ pub fn create_plugin_with_http_client(
             config,
         )))),
         "grpc_deadline" => Ok(Some(Arc::new(grpc_deadline::GrpcDeadline::new(config)))),
+        "grpc_web" => Ok(Some(Arc::new(grpc_web::GrpcWebPlugin::new(config)))),
         "rate_limiting" => Ok(Some(Arc::new(rate_limiting::RateLimiting::new(
             config,
             http_client.clone(),
@@ -1074,6 +1077,7 @@ pub fn available_plugins() -> Vec<&'static str> {
         "graphql",
         "grpc_method_router",
         "grpc_deadline",
+        "grpc_web",
         "rate_limiting",
         "request_size_limiting",
         "response_size_limiting",

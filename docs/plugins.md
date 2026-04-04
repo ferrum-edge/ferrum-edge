@@ -1,6 +1,6 @@
 # Plugin Reference
 
-Ferrum Edge includes 40 built-in plugins organized into lifecycle phases. Each plugin executes at a specific priority (lower number = runs first).
+Ferrum Edge includes 41 built-in plugins organized into lifecycle phases. Each plugin executes at a specific priority (lower number = runs first).
 
 For execution order, protocol support matrix, and design rationale, see [plugin_execution_order.md](plugin_execution_order.md).
 
@@ -1260,6 +1260,31 @@ config:
 ---
 
 ## gRPC Plugins
+
+### `grpc_web`
+
+Translates between gRPC-Web (browser-compatible) and native gRPC (HTTP/2) wire formats. Enables browser clients to call gRPC backends through the gateway without a dedicated gRPC-Web proxy.
+
+Supports both encoding modes:
+- **Binary** (`application/grpc-web`, `application/grpc-web+proto`): same length-prefixed framing as native gRPC — request body passes through unchanged.
+- **Text** (`application/grpc-web-text`, `application/grpc-web-text+proto`): base64-encoded binary frames — decoded on request and re-encoded on response.
+
+On the request path, the plugin rewrites `content-type` to `application/grpc` so downstream plugins (`grpc_method_router`, `grpc_deadline`, etc.) treat the request as native gRPC. On the response path, it embeds HTTP/2 trailers (`grpc-status`, `grpc-message`, and custom trailing metadata) as a length-prefixed trailer frame (flag byte `0x80`) in the response body, then rewrites `content-type` back to the original gRPC-Web variant.
+
+**Priority:** 260 (runs before `grpc_method_router` at 275)
+**Protocols:** HTTP, gRPC
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `expose_headers` | String[] | `[]` | Additional response headers to include in `Access-Control-Expose-Headers` for browser CORS compatibility. `grpc-status` and `grpc-message` are always exposed. |
+
+```yaml
+plugin_name: grpc_web
+config:
+  expose_headers:
+    - custom-header-bin
+    - x-request-id
+```
 
 ### `grpc_method_router`
 
