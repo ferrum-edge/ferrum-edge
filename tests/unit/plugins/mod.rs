@@ -40,6 +40,7 @@ mod response_caching_tests;
 mod response_size_limiting_tests;
 mod response_transformer_tests;
 mod serverless_function_tests;
+mod sse_tests;
 mod stdout_logging_tests;
 mod stream_plugin_tests;
 mod tcp_connection_throttle_tests;

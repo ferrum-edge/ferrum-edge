@@ -72,7 +72,7 @@ src/
 │   ├── database.rs            # Database mode
 │   ├── file.rs                # File mode
 │   └── migrate.rs             # Database migration mode
-├── plugins/                   # Plugin system (22 built-in plugins)
+├── plugins/                   # Plugin system (40 built-in plugins)
 │   ├── mod.rs                 # Plugin framework, registry, and priority constants
 │   ├── access_control.rs      # Consumer-based authorization
 │   ├── basic_auth.rs          # HTTP Basic auth with bcrypt
@@ -141,7 +141,7 @@ tests/
 │
 ├── unit_tests.rs                       # Entry point: unit test crate
 ├── unit/                               # Unit tests by component
-│   ├── plugins/                        # All 22 plugin tests
+│   ├── plugins/                        # All 40 plugin tests
 │   ├── config/                         # Configuration parsing tests
 │   ├── admin/                          # Admin API tests
 │   ├── gateway_core/                   # Core data structure tests
