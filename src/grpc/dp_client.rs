@@ -108,20 +108,21 @@ pub async fn start_dp_client_with_shutdown_and_startup_ready(
             }
         }
 
-        // Apply ±25% jitter to the backoff to desynchronize reconnection attempts
-        let jitter_range = backoff_secs / 4; // 25% of base
-        let jitter_ms = if jitter_range > 0 {
-            let range_ms = jitter_range * 1000 * 2; // full ±25% range in ms
-            // Simple deterministic-enough jitter from current time nanos
+        // Apply ±25% jitter to the backoff to desynchronize reconnection attempts.
+        // Work in milliseconds so even a 1s backoff gets ±250ms jitter.
+        let base_ms = backoff_secs * 1000;
+        let jitter_range_ms = base_ms / 4; // 25% of base in ms (always ≥250 for 1s+)
+        let jitter_ms = if jitter_range_ms > 0 {
+            let full_range = jitter_range_ms * 2; // ±25% window
             let nanos = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .subsec_nanos() as u64;
-            (nanos % range_ms) as i64 - (range_ms / 2) as i64
+            (nanos % full_range) as i64 - jitter_range_ms as i64
         } else {
             0
         };
-        let sleep_ms = (backoff_secs * 1000) as i64 + jitter_ms;
+        let sleep_ms = base_ms as i64 + jitter_ms;
         let sleep_duration = Duration::from_millis(sleep_ms.max(100) as u64);
 
         // Continue serving with cached config; retry connection
