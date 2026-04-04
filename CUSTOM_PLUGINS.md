@@ -761,17 +761,210 @@ ferrum-edge/
 │   │   ├── mod.rs             # Plugin trait, factory (auto-delegates to custom_plugins)
 │   │   ├── jwt_auth.rs        # Built-in plugins...
 │   │   └── ...
+│   ├── config/
+│   │   └── migrations/
+│   │       └── mod.rs         # MigrationRunner + CustomPluginMigration type
 │   ├── main.rs
 │   └── lib.rs
-├── build.rs                   # Auto-discovers custom plugins at compile time
+├── build.rs                   # Auto-discovers plugins + migrations at compile time
 ├── custom_plugins/            # YOUR PLUGINS GO HERE — just drop .rs files
 │   ├── mod.rs                 # Thin shim (includes build-script-generated code)
-│   ├── example_plugin.rs      # Working example (can be removed)
+│   ├── example_plugin.rs      # Working example — header injection (can be removed)
+│   ├── example_audit_plugin.rs # Working example — database migrations (can be removed)
 │   ├── my_header_injector.rs  # Your plugin
 │   └── my_custom_auth.rs      # Your plugin
 ├── CUSTOM_PLUGINS.md          # This guide
 └── Cargo.toml
 ```
+
+## Database Migrations
+
+Custom plugins that need their own database tables can declare migrations that run alongside the gateway's core schema migrations. This uses the same `FERRUM_MODE=migrate` infrastructure, with a separate tracking table (`_ferrum_plugin_migrations`) so plugin version numbers are scoped per-plugin and never conflict with core migrations.
+
+### How It Works
+
+1. Export a `plugin_migrations()` function from your plugin file
+2. The build script detects it automatically (no registration needed)
+3. Run `FERRUM_MODE=migrate FERRUM_MIGRATE_ACTION=up` to apply pending migrations
+4. Plugin migrations run after core migrations in the same database transaction
+
+### Declaring Migrations
+
+Add a `plugin_migrations()` function to your plugin file that returns a `Vec<CustomPluginMigration>`:
+
+```rust
+use crate::config::migrations::CustomPluginMigration;
+
+pub fn plugin_migrations() -> Vec<CustomPluginMigration> {
+    vec![
+        CustomPluginMigration {
+            version: 1,
+            name: "create_my_table",
+            checksum: "v1_create_my_table_a1b2c3",
+            sql: r#"
+                CREATE TABLE IF NOT EXISTS my_plugin_data (
+                    id TEXT PRIMARY KEY,
+                    proxy_id TEXT NOT NULL,
+                    value TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_my_plugin_data_proxy
+                    ON my_plugin_data (proxy_id)
+            "#,
+            sql_postgres: None,  // Use default SQL
+            sql_mysql: None,     // Use default SQL
+        },
+        CustomPluginMigration {
+            version: 2,
+            name: "add_ttl_column",
+            checksum: "v2_add_ttl_col_d4e5f6",
+            sql: "ALTER TABLE my_plugin_data ADD COLUMN ttl_seconds INTEGER",
+            sql_postgres: None,
+            sql_mysql: None,
+        },
+    ]
+}
+```
+
+### CustomPluginMigration Fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `version` | `i64` | Migration version number, scoped per plugin. Must be positive and monotonically increasing. |
+| `name` | `&'static str` | Human-readable name (e.g., `"create_audit_log"`). |
+| `checksum` | `&'static str` | Unique checksum for tamper detection. Convention: `v{N}_{name}_{short_hash}`. |
+| `sql` | `&'static str` | Default SQL for all databases. Must be SQLite/PostgreSQL/MySQL compatible when no overrides are set. |
+| `sql_postgres` | `Option<&'static str>` | PostgreSQL-specific override. Use when you need `JSONB`, `TIMESTAMPTZ`, `SERIAL`, etc. |
+| `sql_mysql` | `Option<&'static str>` | MySQL-specific override. Use when you need `AUTO_INCREMENT`, `JSON`, `DATETIME(3)`, etc. |
+
+### Database-Specific SQL
+
+Most simple table definitions work across all three databases. Use overrides when you need vendor-specific features:
+
+```rust
+CustomPluginMigration {
+    version: 1,
+    name: "create_events",
+    checksum: "v1_create_events_c3d4e5",
+    // Default: works for SQLite
+    sql: r#"
+        CREATE TABLE IF NOT EXISTS my_events (
+            id TEXT PRIMARY KEY,
+            timestamp TEXT NOT NULL,
+            payload TEXT
+        )
+    "#,
+    // PostgreSQL: use TIMESTAMPTZ and JSONB for richer querying
+    sql_postgres: Some(r#"
+        CREATE TABLE IF NOT EXISTS my_events (
+            id TEXT PRIMARY KEY,
+            timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            payload JSONB
+        )
+    "#),
+    // MySQL: use VARCHAR for primary key, DATETIME(3) for millisecond precision
+    sql_mysql: Some(r#"
+        CREATE TABLE IF NOT EXISTS my_events (
+            id VARCHAR(255) PRIMARY KEY,
+            timestamp DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+            payload JSON
+        )
+    "#),
+}
+```
+
+### Multi-Statement Migrations
+
+Separate multiple SQL statements with semicolons. Each statement is executed independently:
+
+```rust
+CustomPluginMigration {
+    version: 1,
+    name: "create_table_and_indexes",
+    checksum: "v1_create_tbl_idx_a1b2",
+    sql: r#"
+        CREATE TABLE IF NOT EXISTS my_cache (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            expires_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_my_cache_expires ON my_cache (expires_at)
+    "#,
+    sql_postgres: None,
+    sql_mysql: None,
+}
+```
+
+### Running Migrations
+
+```bash
+# Apply all pending migrations (core + plugin)
+FERRUM_MODE=migrate FERRUM_MIGRATE_ACTION=up \
+  FERRUM_DB_TYPE=sqlite FERRUM_DB_URL=sqlite://ferrum.db \
+  cargo run
+
+# Dry run — show what would be applied without making changes
+FERRUM_MODE=migrate FERRUM_MIGRATE_ACTION=up FERRUM_MIGRATE_DRY_RUN=true \
+  FERRUM_DB_TYPE=sqlite FERRUM_DB_URL=sqlite://ferrum.db \
+  cargo run
+
+# Check migration status (core + plugin)
+FERRUM_MODE=migrate FERRUM_MIGRATE_ACTION=status \
+  FERRUM_DB_TYPE=sqlite FERRUM_DB_URL=sqlite://ferrum.db \
+  cargo run
+```
+
+Example output:
+
+```
+=== Ferrum Edge Migration Status ===
+
+Applied migrations:
+  V1: initial_schema (applied: 2026-04-01T..., checksum: v001_initial_schema)
+
+Pending migrations: (none — schema is up to date)
+
+=== Custom Plugin Migration Status ===
+
+Applied plugin migrations:
+  [example_audit_plugin] V1: create_audit_log (applied: 2026-04-01T..., checksum: v1_create_audit_log_f8a3e1)
+
+Pending plugin migrations:
+  [example_audit_plugin] V2: add_status_timestamp_index
+```
+
+### Migration Tracking
+
+Plugin migrations are tracked in the `_ferrum_plugin_migrations` table with a composite primary key of `(plugin_name, version)`:
+
+| Column | Description |
+|--------|-------------|
+| `plugin_name` | The plugin's name (matches the `.rs` file name) |
+| `version` | Migration version within the plugin |
+| `name` | Human-readable migration name |
+| `applied_at` | RFC 3339 timestamp of when the migration was applied |
+| `checksum` | Checksum at the time of application (warns if source changes later) |
+| `execution_time_ms` | How long the migration took to execute |
+
+This is separate from the core `_ferrum_migrations` table, so plugin versions never conflict with gateway versions.
+
+### Table Naming Convention
+
+Prefix your tables with a short identifier related to your plugin name to avoid collisions with the gateway's core tables (`proxies`, `consumers`, `upstreams`, `plugin_configs`, `proxy_plugins`) and other custom plugins:
+
+```
+audit_log           ← example_audit_plugin
+my_cache_entries    ← my_cache_plugin
+acme_rate_counters  ← acme_rate_limiter
+```
+
+### Complete Example
+
+See `custom_plugins/example_audit_plugin.rs` for a full working example that demonstrates:
+- Multi-version migrations (V1: create table + indexes, V2: add composite index)
+- PostgreSQL overrides (`TIMESTAMPTZ`, `JSONB`)
+- MySQL overrides (`DATETIME(3)`, `JSON`, `VARCHAR`)
+- Multi-statement SQL (CREATE TABLE + CREATE INDEX in one migration)
 
 ## Adding Dependencies
 
@@ -861,5 +1054,8 @@ Use the gateway's test infrastructure in `tests/` to create end-to-end tests wit
 - [ ] `requires_response_body_buffering()` returns `true` if it reads the response body
 - [ ] `requires_ws_frame_hooks()` returns `true` if it implements `on_ws_frame()`
 - [ ] `warmup_hostnames()` returns external hosts if applicable
+- [ ] If using database tables: `plugin_migrations()` exported with versioned migrations
+- [ ] If using database tables: table names prefixed to avoid collisions
+- [ ] If using database tables: `FERRUM_MODE=migrate FERRUM_MIGRATE_ACTION=up` tested
 - [ ] Unit tests written and passing
 - [ ] `cargo build` succeeds with no warnings

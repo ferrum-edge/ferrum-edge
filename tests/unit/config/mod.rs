@@ -10,6 +10,7 @@ mod env_config_tests;
 mod field_validation_tests;
 mod frontend_tls_tests;
 mod migration_runner_tests;
+mod plugin_migration_tests;
 mod pool_config_tests;
 mod separate_listeners_tests;
 mod stream_proxy_config_tests;

@@ -137,7 +137,7 @@ src/
 │   ├── file_loader.rs         # YAML/JSON file loader
 │   ├── pool_config.rs         # Connection pool configuration
 │   ├── config_migration.rs    # Config version migrations
-│   └── migrations/            # SQL schema migrations (v001_initial_schema.rs)
+│   └── migrations/            # SQL schema migrations (v001_initial_schema.rs) + CustomPluginMigration support
 ├── modes/                     # Operating mode implementations
 │   ├── database.rs            # Database mode entry point
 │   ├── file.rs                # File mode entry point
@@ -185,7 +185,7 @@ src/
 │   └── file.rs                # File-based secrets (Docker Swarm, K8s volume mounts)
 ├── tls/                       # TLS/mTLS listener configuration
 ├── http3/                     # HTTP/3 (QUIC) support
-└── custom_plugins/            # Drop-in custom plugins (auto-discovered by build.rs)
+└── custom_plugins/            # Drop-in custom plugins (auto-discovered by build.rs, supports plugin_migrations())
 ```
 
 ### Domain Model (src/config/types.rs)
@@ -539,6 +539,18 @@ Each test runs a gateway with protocol-specific config (`configs/*.yaml`) and a 
 6. Add the module to `tests/unit/plugins/mod.rs`
 7. Update `FEATURES.md`, `README.md`, and `docs/plugin_execution_order.md` (protocol matrix)
 
+### Adding a Custom Plugin with Database Migrations
+
+Custom plugins that need their own database tables can declare migrations via a `plugin_migrations()` function alongside their `create_plugin()` factory. The build script auto-discovers plugins that export `plugin_migrations()` and generates a collector function.
+
+1. Create `custom_plugins/my_plugin.rs` with `create_plugin()` (standard custom plugin convention)
+2. Export a `plugin_migrations()` function returning `Vec<CustomPluginMigration>` from `crate::config::migrations`
+3. Each migration has: `version` (scoped per-plugin), `name`, `checksum`, `sql` (default), optional `sql_postgres`/`sql_mysql` overrides
+4. Prefix table names with the plugin name to avoid collisions with core tables
+5. Multi-statement SQL is supported (semicolon-separated)
+6. Run `FERRUM_MODE=migrate FERRUM_MIGRATE_ACTION=up` to apply — plugin migrations are tracked separately in `_ferrum_plugin_migrations` with composite PK `(plugin_name, version)`
+7. See `custom_plugins/example_audit_plugin.rs` for a complete working example and `CUSTOM_PLUGINS.md` for the full guide
+
 ### Adding a New Config Field
 
 1. Add the field to the appropriate struct in `src/config/types.rs` with `#[serde(default)]`
@@ -551,7 +563,7 @@ Each test runs a gateway with protocol-specific config (`configs/*.yaml`) and a 
 ### Database Considerations
 
 - **Supported databases**: PostgreSQL, MySQL, SQLite (via sqlx)
-- **Migrations**: Located in `src/config/migrations/`. Run via `FERRUM_MODE=migrate`.
+- **Migrations**: Core gateway migrations in `src/config/migrations/`. Custom plugin migrations declared via `plugin_migrations()` in plugin files and tracked in `_ferrum_plugin_migrations`. Both run via `FERRUM_MODE=migrate`.
 - **Schema relationships**: Proxies reference upstreams via `upstream_id`. Plugins are associated with proxies via the `proxy_plugins` junction table. Consumers have credentials keyed by auth type and an `acl_groups` JSON array for group-based access control.
 - **Transactions**: All multi-step CRUD operations (create/update/delete proxy, delete plugin_config, delete upstream, cleanup orphaned upstream) are wrapped in `sqlx::Transaction` to prevent partial updates on crash or concurrent access.
 - **Full proxy persistence**: All Proxy struct fields are persisted in the database, including `circuit_breaker` (JSON), `retry` (JSON), `response_body_mode`, and all `pool_*` override fields.

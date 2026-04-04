@@ -58,6 +58,94 @@ Each migration is a Rust function that can dispatch different SQL based on the d
 
 Each migration has a compile-time checksum. When the gateway starts, it compares the checksum of each applied migration against the expected checksum in the code. If a mismatch is detected (indicating the migration source was modified after being applied), a warning is logged. This is a diagnostic aid, not a hard error.
 
+## Custom Plugin Migrations
+
+Custom plugins can declare their own database migrations that run alongside core gateway migrations. This allows plugins to create and manage private tables without modifying any core source files.
+
+### How It Works
+
+1. A custom plugin exports a `plugin_migrations()` function from its `.rs` file in `custom_plugins/`
+2. The build script detects this function automatically and generates a collector
+3. When `FERRUM_MODE=migrate FERRUM_MIGRATE_ACTION=up` is run, plugin migrations execute **after** core migrations
+4. Plugin migrations are tracked in `_ferrum_plugin_migrations` (separate from `_ferrum_migrations`)
+
+### Plugin Migration Tracking Table
+
+```sql
+CREATE TABLE _ferrum_plugin_migrations (
+    plugin_name TEXT NOT NULL,          -- Plugin name (matches .rs file name)
+    version INTEGER NOT NULL,           -- Migration version within the plugin
+    name TEXT NOT NULL,                 -- Human-readable migration name
+    applied_at TEXT NOT NULL,           -- ISO 8601 timestamp
+    checksum TEXT NOT NULL,             -- Integrity check
+    execution_time_ms INTEGER NOT NULL, -- Execution duration
+    PRIMARY KEY (plugin_name, version)
+);
+```
+
+The composite primary key `(plugin_name, version)` means each plugin maintains its own independent migration sequence. Plugin versions never conflict with core gateway migration versions.
+
+### Defining Plugin Migrations
+
+In your custom plugin file, export a `plugin_migrations()` function:
+
+```rust
+use crate::config::migrations::CustomPluginMigration;
+
+pub fn plugin_migrations() -> Vec<CustomPluginMigration> {
+    vec![
+        CustomPluginMigration {
+            version: 1,
+            name: "create_my_table",
+            checksum: "v1_create_my_table_a1b2c3",
+            sql: "CREATE TABLE IF NOT EXISTS my_plugin_data (
+                id TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )",
+            sql_postgres: None,  // Use default SQL for PostgreSQL
+            sql_mysql: None,     // Use default SQL for MySQL
+        },
+    ]
+}
+```
+
+### Cross-Database SQL Support
+
+Each `CustomPluginMigration` has three SQL fields:
+
+| Field | Purpose |
+|-------|---------|
+| `sql` | Default SQL used for all databases (must work for SQLite at minimum) |
+| `sql_postgres` | Optional PostgreSQL override (for `JSONB`, `TIMESTAMPTZ`, etc.) |
+| `sql_mysql` | Optional MySQL override (for `JSON`, `DATETIME(3)`, `VARCHAR` PKs, etc.) |
+
+When `sql_postgres` or `sql_mysql` is `Some(...)`, that SQL is used instead of `sql` for that database. When `None`, the default `sql` is used.
+
+### Multi-Statement Migrations
+
+SQL statements separated by semicolons are executed independently:
+
+```rust
+sql: r#"
+    CREATE TABLE IF NOT EXISTS my_cache (key TEXT PRIMARY KEY, value TEXT);
+    CREATE INDEX IF NOT EXISTS idx_my_cache_key ON my_cache (key)
+"#,
+```
+
+### Checksum Validation
+
+Like core migrations, checksums are validated on each run. If a plugin migration's checksum differs from what was recorded when it was applied, a warning is logged. This helps detect unintended modifications to already-applied migrations.
+
+### Table Naming Convention
+
+Prefix custom tables to avoid collisions with core gateway tables (`proxies`, `consumers`, `upstreams`, `plugin_configs`, `proxy_plugins`) and other plugins.
+
+### Complete Example
+
+See `custom_plugins/example_audit_plugin.rs` for a full working example with multi-version migrations, PostgreSQL/MySQL overrides, and multi-statement SQL.
+
+See [CUSTOM_PLUGINS.md](../CUSTOM_PLUGINS.md#database-migrations) for the complete developer guide.
+
 ## Configuration File Migrations
 
 ### Version Field
@@ -125,6 +213,13 @@ Applied migrations:
   V1: initial_schema (applied: 2025-01-15T10:30:00Z, checksum: v001_initial_schema_a1b2c3d4)
 
 Pending migrations: (none — schema is up to date)
+
+=== Custom Plugin Migration Status ===
+
+Applied plugin migrations:
+  [example_audit_plugin] V1: create_audit_log (applied: 2025-01-15T10:30:01Z, checksum: v1_create_audit_log_f8a3e1)
+
+Pending plugin migrations: (none — all plugins up to date)
 ```
 
 ### Migrate a Config File

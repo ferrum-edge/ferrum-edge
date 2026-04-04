@@ -59,6 +59,7 @@ Ferrum supports dynamic upstream target discovery through three providers, confi
 - Priority-ordered execution with protocol-aware filtering (HTTP, gRPC, WebSocket, TCP, UDP)
 - Global and per-proxy scoping with same-type override semantics
 - Multi-authentication mode with first-match consumer identification
+- Custom plugin database migrations — plugins declare migrations via `plugin_migrations()`, auto-discovered at build time, tracked separately in `_ferrum_plugin_migrations` with per-plugin version scoping. Supports cross-database SQL (PostgreSQL/MySQL/SQLite overrides)
 
 ### Authentication Plugins
 

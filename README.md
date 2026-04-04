@@ -246,7 +246,7 @@ All three rate limiting plugins (`rate_limiting`, `ai_rate_limiter`, `ws_rate_li
 
 ### Custom Plugins
 
-Drop-in custom plugins via `custom_plugins/` directory — auto-discovered at build time. See [CUSTOM_PLUGINS.md](CUSTOM_PLUGINS.md).
+Drop-in custom plugins via `custom_plugins/` directory — auto-discovered at build time. Custom plugins can declare their own database migrations via `plugin_migrations()` for creating and managing private tables, tracked independently from core migrations. See [CUSTOM_PLUGINS.md](CUSTOM_PLUGINS.md).
 
 ## Routing
 

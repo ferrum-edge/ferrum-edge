@@ -6,6 +6,90 @@ use sqlx::{AnyPool, Row};
 use std::time::Instant;
 use tracing::{info, warn};
 
+// ---------------------------------------------------------------------------
+// Custom plugin migration support
+// ---------------------------------------------------------------------------
+
+/// A database migration declared by a custom plugin.
+///
+/// Custom plugins define migrations inline using this struct. Each migration
+/// has a version number (scoped to the plugin), a name, a checksum for
+/// tamper detection, and SQL statements for each supported database.
+///
+/// # Example
+///
+/// ```ignore
+/// pub fn plugin_migrations() -> Vec<CustomPluginMigration> {
+///     vec![
+///         CustomPluginMigration {
+///             version: 1,
+///             name: "create_audit_log",
+///             checksum: "v1_create_audit_log_a1b2c3",
+///             sql: "CREATE TABLE IF NOT EXISTS audit_log (
+///                 id TEXT PRIMARY KEY,
+///                 timestamp TEXT NOT NULL,
+///                 action TEXT NOT NULL
+///             )",
+///             sql_postgres: None,
+///             sql_mysql: None,
+///         },
+///     ]
+/// }
+/// ```
+pub struct CustomPluginMigration {
+    /// Migration version number, scoped per plugin. Must be positive and
+    /// monotonically increasing within each plugin.
+    pub version: i64,
+    /// Human-readable migration name (e.g., "create_audit_log").
+    pub name: &'static str,
+    /// Unique checksum for tamper detection. Convention: `v{N}_{name}_{short_hash}`.
+    pub checksum: &'static str,
+    /// Default SQL used for all databases unless overridden by a db-specific field.
+    /// Must be compatible with PostgreSQL, MySQL, and SQLite when no overrides are set.
+    pub sql: &'static str,
+    /// PostgreSQL-specific SQL override. When `Some`, used instead of `sql` for PostgreSQL.
+    pub sql_postgres: Option<&'static str>,
+    /// MySQL-specific SQL override. When `Some`, used instead of `sql` for MySQL.
+    pub sql_mysql: Option<&'static str>,
+}
+
+impl CustomPluginMigration {
+    /// Returns the SQL appropriate for the given database type.
+    pub fn sql_for_db(&self, db_type: &str) -> &str {
+        match db_type {
+            "postgres" => self.sql_postgres.unwrap_or(self.sql),
+            "mysql" => self.sql_mysql.unwrap_or(self.sql),
+            _ => self.sql,
+        }
+    }
+}
+
+/// Record of a custom plugin migration that was applied.
+#[derive(Debug, Clone)]
+pub struct PluginMigrationRecord {
+    pub plugin_name: String,
+    pub version: i64,
+    pub name: String,
+    pub applied_at: String,
+    pub checksum: String,
+    pub execution_time_ms: i64,
+}
+
+/// Summary of custom plugin migration status.
+#[derive(Debug)]
+pub struct PluginMigrationStatus {
+    pub applied: Vec<PluginMigrationRecord>,
+    pub pending: Vec<PendingPluginMigration>,
+}
+
+/// A custom plugin migration that has not yet been applied.
+#[derive(Debug)]
+pub struct PendingPluginMigration {
+    pub plugin_name: String,
+    pub version: i64,
+    pub name: String,
+}
+
 /// Trait that all database migrations implement.
 ///
 /// Because async trait methods with `&self` are not yet object-safe in stable Rust,
@@ -276,6 +360,211 @@ impl MigrationRunner {
             .collect();
 
         Ok(MigrationStatus { applied, pending })
+    }
+
+    // -----------------------------------------------------------------------
+    // Custom plugin migration support
+    // -----------------------------------------------------------------------
+
+    /// Ensure the `_ferrum_plugin_migrations` tracking table exists.
+    ///
+    /// This table is separate from `_ferrum_migrations` so that core gateway
+    /// migrations and custom plugin migrations have independent version spaces.
+    /// The composite primary key `(plugin_name, version)` allows each plugin
+    /// to maintain its own migration sequence.
+    async fn ensure_plugin_tracking_table(&self) -> Result<(), anyhow::Error> {
+        let sql = if self.db_type == "mysql" {
+            r#"
+            CREATE TABLE IF NOT EXISTS _ferrum_plugin_migrations (
+                plugin_name VARCHAR(255) NOT NULL,
+                version INTEGER NOT NULL,
+                name VARCHAR(255) NOT NULL,
+                applied_at VARCHAR(50) NOT NULL,
+                checksum VARCHAR(255) NOT NULL,
+                execution_time_ms INTEGER NOT NULL,
+                PRIMARY KEY (plugin_name, version)
+            )
+            "#
+        } else {
+            r#"
+            CREATE TABLE IF NOT EXISTS _ferrum_plugin_migrations (
+                plugin_name TEXT NOT NULL,
+                version INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                applied_at TEXT NOT NULL,
+                checksum TEXT NOT NULL,
+                execution_time_ms INTEGER NOT NULL,
+                PRIMARY KEY (plugin_name, version)
+            )
+            "#
+        };
+        sqlx::query(sql).execute(&self.pool).await?;
+        Ok(())
+    }
+
+    /// Return the INSERT statement for the plugin migration tracking table.
+    fn plugin_migration_insert_sql(db_type: &str) -> String {
+        if db_type == "postgres" {
+            "INSERT INTO _ferrum_plugin_migrations (plugin_name, version, name, applied_at, checksum, execution_time_ms) VALUES ($1, $2, $3, $4, $5, $6)".to_string()
+        } else {
+            "INSERT INTO _ferrum_plugin_migrations (plugin_name, version, name, applied_at, checksum, execution_time_ms) VALUES (?, ?, ?, ?, ?, ?)".to_string()
+        }
+    }
+
+    /// Get all applied plugin migration records.
+    async fn applied_plugin_versions(&self) -> Result<Vec<PluginMigrationRecord>, anyhow::Error> {
+        let rows: Vec<AnyRow> =
+            sqlx::query("SELECT plugin_name, version, name, applied_at, checksum, execution_time_ms FROM _ferrum_plugin_migrations ORDER BY plugin_name, version")
+                .fetch_all(&self.pool)
+                .await?;
+
+        let mut records = Vec::new();
+        for row in rows {
+            records.push(PluginMigrationRecord {
+                plugin_name: row.try_get("plugin_name")?,
+                version: row.try_get::<i32, _>("version")? as i64,
+                name: row.try_get("name")?,
+                applied_at: row.try_get("applied_at")?,
+                checksum: row.try_get("checksum")?,
+                execution_time_ms: row.try_get::<i32, _>("execution_time_ms")? as i64,
+            });
+        }
+        Ok(records)
+    }
+
+    /// Run all pending custom plugin migrations.
+    ///
+    /// `plugin_migrations` is a list of `(plugin_name, migrations)` tuples,
+    /// typically collected from the build-script-generated registry via
+    /// `crate::custom_plugins::collect_all_custom_plugin_migrations()`.
+    ///
+    /// Each plugin's migrations are applied in version order. Migrations are
+    /// tracked per-plugin in `_ferrum_plugin_migrations` with a composite
+    /// `(plugin_name, version)` key.
+    pub async fn run_plugin_pending(
+        &self,
+        plugin_migrations: &[(&str, Vec<CustomPluginMigration>)],
+    ) -> Result<Vec<PluginMigrationRecord>, anyhow::Error> {
+        if plugin_migrations.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        self.ensure_plugin_tracking_table().await?;
+
+        let applied = self.applied_plugin_versions().await?;
+        let mut newly_applied = Vec::new();
+
+        for (plugin_name, migrations) in plugin_migrations {
+            // Validate checksums of already-applied migrations for this plugin
+            let plugin_applied: Vec<&PluginMigrationRecord> = applied
+                .iter()
+                .filter(|r| r.plugin_name == *plugin_name)
+                .collect();
+            let applied_versions: Vec<i64> = plugin_applied.iter().map(|r| r.version).collect();
+
+            for record in &plugin_applied {
+                if let Some(migration) = migrations.iter().find(|m| m.version == record.version)
+                    && migration.checksum != record.checksum
+                {
+                    warn!(
+                        "Plugin '{}' migration V{} ({}) checksum mismatch: expected '{}', found '{}' in database. \
+                         This may indicate the migration source was modified after being applied.",
+                        plugin_name,
+                        record.version,
+                        record.name,
+                        migration.checksum,
+                        record.checksum
+                    );
+                }
+            }
+
+            for migration in migrations {
+                if applied_versions.contains(&migration.version) {
+                    continue;
+                }
+
+                info!(
+                    "Applying plugin '{}' migration V{}: {}",
+                    plugin_name, migration.version, migration.name
+                );
+
+                let sql = migration.sql_for_db(&self.db_type);
+                let start = Instant::now();
+
+                // Execute each statement separated by semicolons, supporting
+                // multi-statement migrations (e.g., CREATE TABLE + CREATE INDEX).
+                for statement in sql.split(';') {
+                    let trimmed = statement.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    sqlx::query(trimmed).execute(&self.pool).await?;
+                }
+
+                let elapsed_ms = start.elapsed().as_millis() as i64;
+
+                let now = Utc::now().to_rfc3339();
+                let insert_sql = Self::plugin_migration_insert_sql(&self.db_type);
+                sqlx::query(&insert_sql)
+                    .bind(*plugin_name)
+                    .bind(migration.version as i32)
+                    .bind(migration.name)
+                    .bind(&now)
+                    .bind(migration.checksum)
+                    .bind(elapsed_ms as i32)
+                    .execute(&self.pool)
+                    .await?;
+
+                let record = PluginMigrationRecord {
+                    plugin_name: plugin_name.to_string(),
+                    version: migration.version,
+                    name: migration.name.to_string(),
+                    applied_at: now,
+                    checksum: migration.checksum.to_string(),
+                    execution_time_ms: elapsed_ms,
+                };
+
+                info!(
+                    "Applied plugin '{}' migration V{}: {} ({}ms)",
+                    plugin_name, record.version, record.name, record.execution_time_ms
+                );
+
+                newly_applied.push(record);
+            }
+        }
+
+        Ok(newly_applied)
+    }
+
+    /// Get current custom plugin migration status (applied and pending).
+    pub async fn plugin_status(
+        &self,
+        plugin_migrations: &[(&str, Vec<CustomPluginMigration>)],
+    ) -> Result<PluginMigrationStatus, anyhow::Error> {
+        self.ensure_plugin_tracking_table().await?;
+
+        let applied = self.applied_plugin_versions().await?;
+
+        let mut pending = Vec::new();
+        for (plugin_name, migrations) in plugin_migrations {
+            let applied_versions: Vec<i64> = applied
+                .iter()
+                .filter(|r| r.plugin_name == *plugin_name)
+                .map(|r| r.version)
+                .collect();
+
+            for migration in migrations {
+                if !applied_versions.contains(&migration.version) {
+                    pending.push(PendingPluginMigration {
+                        plugin_name: plugin_name.to_string(),
+                        version: migration.version,
+                        name: migration.name.to_string(),
+                    });
+                }
+            }
+        }
+
+        Ok(PluginMigrationStatus { applied, pending })
     }
 }
 

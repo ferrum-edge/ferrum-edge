@@ -17,6 +17,10 @@ For execution order, protocol support matrix, and design rationale, see [plugin_
 9. **`log`** — Logs the transaction summary (Stdout/HTTP Logging)
 10. **`on_ws_frame`** — Per-frame WebSocket hooks (Size Limiting, Rate Limiting, Frame Logging)
 
+## Custom Plugins
+
+Custom plugins are auto-discovered from the `custom_plugins/` directory at build time. They can also declare database migrations via `plugin_migrations()` for creating private tables. See [CUSTOM_PLUGINS.md](../CUSTOM_PLUGINS.md) for the full development guide and [migrations.md](migrations.md#custom-plugin-migrations) for migration details.
+
 ## Scope
 
 - **Global** plugins apply to all proxies
