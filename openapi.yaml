@@ -725,6 +725,8 @@ paths:
                 - ai_request_guard
                 - ai_rate_limiter
                 - ai_prompt_shield
+                - sse
+                - request_mirror
                 - ws_message_size_limiting
                 - ws_frame_logging
                 - ws_rate_limiting
@@ -3051,6 +3053,43 @@ components:
           format: uint64
           default: 10485760
           description: "Zip bomb protection: max decompressed request body size in bytes (10 MB)"
+
+    SseConfig:
+      type: object
+      description: "Plugin: sse — Server-Sent Events stream handler. Validates SSE client criteria, shapes requests, and ensures proper streaming response headers."
+      properties:
+        require_get_method:
+          type: boolean
+          default: true
+          description: "Reject non-GET requests with 405 (SSE is read-only)"
+        require_accept_header:
+          type: boolean
+          default: true
+          description: "Require Accept: text/event-stream header (406 if missing)"
+        strip_accept_encoding:
+          type: boolean
+          default: true
+          description: "Strip Accept-Encoding to prevent compressed responses breaking SSE framing"
+        add_no_buffering_header:
+          type: boolean
+          default: true
+          description: "Add X-Accel-Buffering: no to disable nginx/ALB response buffering"
+        strip_content_length:
+          type: boolean
+          default: true
+          description: "Remove Content-Length from SSE responses (streams are indefinite)"
+        retry_ms:
+          type: integer
+          format: uint64
+          description: "EventSource reconnection hint in milliseconds"
+        force_sse_content_type:
+          type: boolean
+          default: false
+          description: "Force Content-Type: text/event-stream even if backend returns something else"
+        wrap_non_sse_responses:
+          type: boolean
+          default: false
+          description: "Wrap non-SSE response bodies in data: ...\\n\\n SSE event framing (enables response buffering)"
 
     RateLimitingConfig:
       type: object

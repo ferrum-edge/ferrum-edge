@@ -1,4 +1,4 @@
-//! Plugin system — 39 built-in plugins with a trait-based architecture.
+//! Plugin system — 40 built-in plugins with a trait-based architecture.
 //!
 //! Plugins execute in priority order (lower number = runs first) through
 //! lifecycle phases: `on_request_received` → `authenticate` → `authorize` →
@@ -46,6 +46,7 @@ pub mod response_caching;
 pub mod response_size_limiting;
 pub mod response_transformer;
 pub mod serverless_function;
+pub mod sse;
 pub mod stdout_logging;
 pub mod tcp_connection_throttle;
 pub mod transaction_debugger;
@@ -530,7 +531,7 @@ pub struct StreamTransactionSummary {
 ///
 /// | Band      | Range       | Purpose                                   | Plugins |
 /// |-----------|-------------|-------------------------------------------|---------|
-/// | Early     | 0–949       | Pre-routing, tracing, and preflight       | otel_tracing (25), correlation_id (50), cors (100), request_termination (125), ip_restriction (150), bot_detection (200), grpc_method_router (275) |
+/// | Early     | 0–949       | Pre-routing, tracing, and preflight       | otel_tracing (25), correlation_id (50), cors (100), request_termination (125), ip_restriction (150), bot_detection (200), sse (250), grpc_method_router (275) |
 /// | AuthN     | 950–1999    | Authentication / identity verification    | mtls_auth (950), jwks_auth (1000), jwt_auth (1100), key_auth (1200), basic_auth (1300), hmac_auth (1400) |
 /// | AuthZ     | 2000–2999   | Authorization and admission control       | access_control (2000), tcp_connection_throttle (2050), request_size_limiting (2800), graphql (2850), rate_limiting (2900), ai_prompt_shield (2925), body_validator (2950), ai_request_guard (2975) |
 /// | Transform | 3000–3999   | Request shaping and response buffering    | request_transformer (3000), grpc_deadline (3050), request_mirror (3075), response_size_limiting (3490), response_caching (3500) |
@@ -544,6 +545,7 @@ pub mod priority {
     pub const CORS: u16 = 100;
     pub const IP_RESTRICTION: u16 = 150;
     pub const BOT_DETECTION: u16 = 200;
+    pub const SSE: u16 = 250;
     pub const GRPC_METHOD_ROUTER: u16 = 275;
     pub const MTLS_AUTH: u16 = 950;
     pub const JWKS_AUTH: u16 = 1000;
@@ -957,6 +959,7 @@ pub fn create_plugin_with_http_client(
         "response_transformer" => Ok(Some(Arc::new(
             response_transformer::ResponseTransformer::new(config),
         ))),
+        "sse" => Ok(Some(Arc::new(sse::SsePlugin::new(config)))),
         "graphql" => Ok(Some(Arc::new(graphql::GraphqlPlugin::new(config)))),
         "grpc_method_router" => Ok(Some(Arc::new(grpc_method_router::GrpcMethodRouter::new(
             config,

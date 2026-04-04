@@ -1,6 +1,6 @@
 # Plugin Reference
 
-Ferrum Edge includes 39 built-in plugins organized into lifecycle phases. Each plugin executes at a specific priority (lower number = runs first).
+Ferrum Edge includes 40 built-in plugins organized into lifecycle phases. Each plugin executes at a specific priority (lower number = runs first).
 
 For execution order, protocol support matrix, and design rationale, see [plugin_execution_order.md](plugin_execution_order.md).
 
@@ -1062,6 +1062,57 @@ config:
 ```
 
 **Note:** This plugin handles HTTP-level `Content-Encoding` compression/decompression. gRPC message-level compression (the compressed flag in gRPC wire frames) is handled separately by `body_validator` for protobuf validation — these are different protocol layers and should not be confused.
+
+---
+
+### `sse`
+
+Server-Sent Events stream handler. Validates inbound SSE client criteria, shapes requests for backends, and ensures proper streaming response headers for SSE delivery.
+
+**Priority:** 250
+
+**Lifecycle:**
+
+1. **`on_request_received`** — Validates SSE client conformance: rejects non-GET with 405 + `Allow: GET`, rejects missing/wrong `Accept` with 406, stashes `Last-Event-ID` in metadata for reconnection.
+2. **`before_proxy`** — Strips `Accept-Encoding` to prevent compressed responses from breaking SSE line-delimited framing. Forwards `Last-Event-ID` header to the backend.
+3. **`after_proxy`** — Sets `Cache-Control: no-cache`, `Connection: keep-alive`, `X-Accel-Buffering: no`. Strips `Content-Length`. Optionally forces `Content-Type: text/event-stream`.
+4. **`transform_response_body`** — Optionally wraps non-SSE response bodies in `data: ...\n\n` SSE event framing (buffered responses only).
+
+**Request validation:**
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `require_get_method` | bool | `true` | Reject non-GET requests with 405 |
+| `require_accept_header` | bool | `true` | Require `Accept: text/event-stream` header (406 if missing) |
+
+**Request shaping:**
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `strip_accept_encoding` | bool | `true` | Strip `Accept-Encoding` to prevent compressed chunked responses breaking SSE framing |
+
+**Response shaping:**
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `add_no_buffering_header` | bool | `true` | Add `X-Accel-Buffering: no` to disable nginx/ALB buffering |
+| `strip_content_length` | bool | `true` | Remove `Content-Length` (SSE streams are indefinite) |
+| `retry_ms` | u64 | _(none)_ | EventSource reconnection hint (ms), prepended as `retry:` when wrapping |
+| `force_sse_content_type` | bool | `false` | Force `Content-Type: text/event-stream` even if backend returns something else |
+| `wrap_non_sse_responses` | bool | `false` | Wrap non-SSE response bodies in `data: ...\n\n` SSE event framing |
+
+**Note:** When `wrap_non_sse_responses` is enabled, the plugin requires response body buffering. When disabled (default), the response streams through with zero overhead — ideal for backends that already emit `text/event-stream`.
+
+```yaml
+config:
+  require_get_method: true
+  require_accept_header: true
+  strip_accept_encoding: true
+  add_no_buffering_header: true
+  retry_ms: 3000
+  force_sse_content_type: false
+  wrap_non_sse_responses: false
+```
 
 ---
 
