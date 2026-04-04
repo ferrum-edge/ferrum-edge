@@ -72,6 +72,7 @@ Ferrum supports dynamic upstream target discovery through three providers, confi
 
 - **Access Control** — consumer-based allow/deny lists
 - **IP Restriction** — standalone IP/CIDR filtering
+- **TCP Connection Throttle** — caps active TCP connections per Consumer or client IP
 - **Rate Limiting** — per-IP or per-consumer with configurable windows and optional header exposure; supports centralized Redis-backed mode (`sync_mode: "redis"`) for coordinated rate limiting across multiple data plane instances. Compatible with any RESP-protocol server (Redis, Valkey, DragonflyDB, KeyDB, Garnet). TLS uses gateway-level `FERRUM_TLS_CA_BUNDLE_PATH` and `FERRUM_TLS_NO_VERIFY`
 - **Request Size Limiting** — per-proxy request body size limits (lower than global default), Content-Length fast path + buffered body check
 - **Response Size Limiting** — per-proxy response body size limits (lower than global default), Content-Length fast path + optional buffered body check
@@ -95,6 +96,10 @@ Ferrum supports dynamic upstream target discovery through three providers, confi
 - **WebSocket Rate Limiting** — per-connection frame rate limiting using token bucket algorithm, closing with code 1008 (Policy Violation) on excess; supports centralized Redis-backed mode for cross-instance frame rate coordination. Compatible with any RESP-protocol server (Redis, Valkey, DragonflyDB, KeyDB, Garnet). TLS uses gateway-level settings
 - **WebSocket Frame Logging** — logs frame metadata (direction, type, size, connection ID) without transforming frames
 
+### UDP Plugins
+
+- **UDP Rate Limiting** — per-client-IP datagram and byte rate limiting for UDP proxies; supports centralized Redis-backed mode. Compatible with any RESP-protocol server (Redis, Valkey, DragonflyDB, KeyDB, Garnet)
+
 ### Serverless Function Plugin
 
 - **Serverless Function** — invoke AWS Lambda, Azure Functions, or Google Cloud Functions as middleware. Pre-proxy mode enriches requests with function-computed headers; terminate mode returns function responses directly. Supports SigV4 signing for AWS, function key auth for Azure, and bearer token auth for GCP. Cloud credentials fall back to standard environment variables (`AWS_ACCESS_KEY_ID`, `AZURE_FUNCTIONS_KEY`, etc.) when not set in plugin config.
@@ -103,6 +108,7 @@ Ferrum supports dynamic upstream target discovery through three providers, confi
 
 - **Request Transformer** — add, remove, or update headers and query parameters
 - **Response Transformer** — modify response headers
+- **Response Caching** — cache backend responses with TTL, cache key rules, and conditional caching
 - **Request Termination** — return static responses without proxying
 
 ### Observability Plugins

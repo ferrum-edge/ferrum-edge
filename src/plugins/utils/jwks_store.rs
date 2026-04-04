@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, warn};
 
-use super::utils::PluginHttpClient;
+use super::PluginHttpClient;
 
 /// A cached JWKS key with its algorithm and decoding key.
 #[derive(Clone)]

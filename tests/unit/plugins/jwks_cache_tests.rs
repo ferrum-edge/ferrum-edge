@@ -1,5 +1,5 @@
 use ferrum_edge::plugins::PluginHttpClient;
-use ferrum_edge::plugins::jwks_cache::{clear_jwks_cache, get_or_create_jwks_store};
+use ferrum_edge::plugins::utils::jwks_cache::{clear_jwks_cache, get_or_create_jwks_store};
 use std::sync::Arc;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;

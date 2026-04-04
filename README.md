@@ -214,15 +214,12 @@ Plugins execute in a defined pipeline with priority ordering (lower = runs first
 | Phase | Plugins |
 |-------|---------|
 | **Tracing** (25) | `otel_tracing` |
-| **Early** (100) | `cors`, `ip_restriction`, `bot_detection` |
-| **Authentication** (950-1400) | `mtls_auth`, `jwks_auth`, `jwt_auth`, `key_auth`, `basic_auth`, `hmac_auth` |
-| **gRPC** (275) | `grpc_method_router` |
-| **Authorization** (2000-2900) | `access_control`, `tcp_connection_throttle`, `graphql`, `rate_limiting` |
-| **AI Pre-proxy** (2925-2975) | `ai_prompt_shield`, `ai_request_guard` |
-| **Transform** (3000-3050) | `request_transformer`, `serverless_function`, `body_validator` (JSON/XML/protobuf), `request_size_limiting`, `request_termination`, `grpc_deadline` |
-| **WebSocket** (2810-2910) | `ws_message_size_limiting`, `ws_rate_limiting` |
-| **Response** (4000-4200) | `response_transformer`, `response_size_limiting`, `ai_token_metrics`, `ai_rate_limiter` |
-| **Logging** (9000-9300) | `stdout_logging`, `ws_frame_logging`, `http_logging`, `transaction_debugger`, `correlation_id`, `prometheus_metrics` |
+| **Early** (50-275) | `correlation_id` (50), `cors` (100), `request_termination` (125), `ip_restriction` (150), `bot_detection` (200), `grpc_method_router` (275) |
+| **Authentication** (950-1400) | `mtls_auth` (950), `jwks_auth` (1000), `jwt_auth` (1100), `key_auth` (1200), `basic_auth` (1300), `hmac_auth` (1400) |
+| **Admission** (2000-2999) | `access_control` (2000), `tcp_connection_throttle` (2050), `request_size_limiting` (2800), `ws_message_size_limiting` (2810), `graphql` (2850), `rate_limiting` (2900), `ws_rate_limiting` (2910), `udp_rate_limiting` (2910), `ai_prompt_shield` (2925), `body_validator` (2950), `ai_request_guard` (2975) |
+| **Transform** (3000-3999) | `request_transformer` (3000), `serverless_function` (3025), `grpc_deadline` (3050), `response_size_limiting` (3490), `response_caching` (3500) |
+| **Response** (4000-4999) | `response_transformer` (4000), `ai_token_metrics` (4100), `ai_rate_limiter` (4200) |
+| **Logging** (9000-9999) | `stdout_logging` (9000), `ws_frame_logging` (9050), `http_logging` (9100), `transaction_debugger` (9200), `prometheus_metrics` (9300) |
 
 Plugins are protocol-aware — the gateway automatically skips plugins that don't apply to the current protocol (e.g., CORS is never invoked on TCP streams).
 
