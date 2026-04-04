@@ -136,3 +136,42 @@ async fn test_v001_tcp_idle_timeout_seconds_nullable() {
         "tcp_idle_timeout_seconds should be NULL when not specified"
     );
 }
+
+#[tokio::test]
+async fn test_v001_schema_includes_acl_groups_column() {
+    let pool = test_pool().await;
+
+    let runner = MigrationRunner::new(pool.clone(), "sqlite".to_string());
+    runner.run_pending().await.unwrap();
+
+    // Insert a consumer without specifying acl_groups — should default to '[]'
+    sqlx::query(
+        "INSERT INTO consumers (id, username, credentials, created_at, updated_at) VALUES ('c1', 'alice', '{}', '2025-01-01T00:00:00Z', '2025-01-01T00:00:00Z')"
+    )
+    .execute(&pool)
+    .await
+    .expect("INSERT without acl_groups should succeed (defaults to '[]')");
+
+    let row = sqlx::query("SELECT acl_groups FROM consumers WHERE id = 'c1'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let val: String = sqlx::Row::try_get(&row, "acl_groups").unwrap();
+    assert_eq!(val, "[]");
+
+    // Insert with explicit acl_groups
+    sqlx::query(
+        r#"INSERT INTO consumers (id, username, credentials, acl_groups, created_at, updated_at) VALUES ('c2', 'bob', '{}', '["engineering","platform"]', '2025-01-01T00:00:00Z', '2025-01-01T00:00:00Z')"#
+    )
+    .execute(&pool)
+    .await
+    .expect("INSERT with acl_groups should succeed");
+
+    let row = sqlx::query("SELECT acl_groups FROM consumers WHERE id = 'c2'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let val: String = sqlx::Row::try_get(&row, "acl_groups").unwrap();
+    let groups: Vec<String> = serde_json::from_str(&val).unwrap();
+    assert_eq!(groups, vec!["engineering", "platform"]);
+}

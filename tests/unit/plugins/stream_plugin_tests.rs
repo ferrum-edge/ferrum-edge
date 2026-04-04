@@ -29,6 +29,7 @@ fn test_consumer(username: &str) -> ferrum_edge::config::types::Consumer {
         username: username.to_string(),
         custom_id: None,
         credentials: HashMap::new(),
+        acl_groups: Vec::new(),
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     }

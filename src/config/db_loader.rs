@@ -834,13 +834,15 @@ impl DatabaseStore {
     pub async fn create_consumer(&self, consumer: &Consumer) -> Result<(), anyhow::Error> {
         let start = Instant::now();
         let creds_json = serde_json::to_string(&consumer.credentials)?;
+        let acl_groups_json = serde_json::to_string(&consumer.acl_groups)?;
         sqlx::query(
-            &self.q("INSERT INTO consumers (id, username, custom_id, credentials, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)")
+            &self.q("INSERT INTO consumers (id, username, custom_id, credentials, acl_groups, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)")
         )
         .bind(&consumer.id)
         .bind(&consumer.username)
         .bind(&consumer.custom_id)
         .bind(&creds_json)
+        .bind(&acl_groups_json)
         .bind(consumer.created_at.to_rfc3339())
         .bind(consumer.updated_at.to_rfc3339())
         .execute(&self.pool())
@@ -853,12 +855,14 @@ impl DatabaseStore {
     pub async fn update_consumer(&self, consumer: &Consumer) -> Result<(), anyhow::Error> {
         let start = Instant::now();
         let creds_json = serde_json::to_string(&consumer.credentials)?;
+        let acl_groups_json = serde_json::to_string(&consumer.acl_groups)?;
         sqlx::query(&self.q(
-            "UPDATE consumers SET username=?, custom_id=?, credentials=?, updated_at=? WHERE id=?",
+            "UPDATE consumers SET username=?, custom_id=?, credentials=?, acl_groups=?, updated_at=? WHERE id=?",
         ))
         .bind(&consumer.username)
         .bind(&consumer.custom_id)
         .bind(&creds_json)
+        .bind(&acl_groups_json)
         .bind(Utc::now().to_rfc3339())
         .bind(&consumer.id)
         .execute(&self.pool())
@@ -2074,15 +2078,17 @@ impl DatabaseStore {
         consumers: &[Consumer],
     ) -> Result<usize, anyhow::Error> {
         let mut tx = self.pool().begin().await?;
-        let sql = self.q("INSERT INTO consumers (id, username, custom_id, credentials, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)");
+        let sql = self.q("INSERT INTO consumers (id, username, custom_id, credentials, acl_groups, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)");
 
         for consumer in consumers {
             let creds_json = serde_json::to_string(&consumer.credentials)?;
+            let acl_groups_json = serde_json::to_string(&consumer.acl_groups)?;
             sqlx::query(&sql)
                 .bind(&consumer.id)
                 .bind(&consumer.username)
                 .bind(&consumer.custom_id)
                 .bind(&creds_json)
+                .bind(&acl_groups_json)
                 .bind(consumer.created_at.to_rfc3339())
                 .bind(consumer.updated_at.to_rfc3339())
                 .execute(&mut *tx)
@@ -2816,11 +2822,18 @@ fn row_to_consumer(row: &AnyRow) -> Result<Consumer, anyhow::Error> {
         std::collections::HashMap::new()
     });
 
+    let acl_groups_str: String = row.try_get("acl_groups").unwrap_or_else(|_| "[]".into());
+    let acl_groups: Vec<String> = serde_json::from_str(&acl_groups_str).unwrap_or_else(|e| {
+        warn!("Failed to parse acl_groups JSON for consumer: {}", e);
+        Vec::new()
+    });
+
     Ok(Consumer {
         id: row.try_get("id")?,
         username: row.try_get("username")?,
         custom_id: row.try_get("custom_id").ok(),
         credentials,
+        acl_groups,
         created_at: parse_datetime_column(row, "created_at"),
         updated_at: parse_datetime_column(row, "updated_at"),
     })

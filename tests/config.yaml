@@ -122,6 +122,8 @@ consumers:
         secret: "alice-jwt-secret-key"
       basicauth:
         password_hash: "$2b$12$LJ3m4ys3Lk0TSwHjOHRHOeUK/6Nh1GUz8QLXfYcR8x0e3kYzLhWS"
+    acl_groups:
+      - "engineering"
 
   - id: "consumer-bob"
     username: "bob"
@@ -131,6 +133,9 @@ consumers:
         key: "bob-secret-api-key-67890"
       jwt:
         secret: "bob-jwt-secret-key"
+    acl_groups:
+      - "engineering"
+      - "platform"
 
 plugin_configs:
   - id: "plugin-stdout"
@@ -171,6 +176,9 @@ plugin_configs:
         - "alice"
         - "bob"
       disallowed_consumers: []
+      allowed_groups:
+        - "engineering"
+      disallowed_groups: []
     scope: proxy
     proxy_id: "proxy-protected"
     enabled: true

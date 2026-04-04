@@ -29,6 +29,7 @@ fn create_hmac_consumer() -> Consumer {
         username: "hmacuser".to_string(),
         custom_id: None,
         credentials,
+        acl_groups: Vec::new(),
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }
@@ -46,6 +47,7 @@ fn create_consumer_without_hmac_creds() -> Consumer {
         username: "nokeyuser".to_string(),
         custom_id: None,
         credentials,
+        acl_groups: Vec::new(),
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }

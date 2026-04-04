@@ -70,6 +70,7 @@ fn make_consumer(id: &str, username: &str) -> Consumer {
         username: username.into(),
         custom_id: None,
         credentials: HashMap::new(),
+        acl_groups: Vec::new(),
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }
@@ -398,6 +399,54 @@ fn test_consumer_credentials_total_size_limit() {
     assert!(
         errs.iter()
             .any(|e| e.contains("credentials JSON") && e.contains("exceed"))
+    );
+}
+
+#[test]
+fn test_consumer_acl_groups_valid() {
+    let mut consumer = make_consumer("test", "alice");
+    consumer.acl_groups = vec!["engineering".into(), "platform".into()];
+    assert!(consumer.validate_fields().is_ok());
+}
+
+#[test]
+fn test_consumer_acl_groups_empty_entry_rejected() {
+    let mut consumer = make_consumer("test", "alice");
+    consumer.acl_groups = vec!["engineering".into(), "".into()];
+    let errs = consumer.validate_fields().unwrap_err();
+    assert!(errs.iter().any(|e| e.contains("acl_groups[1]")));
+}
+
+#[test]
+fn test_consumer_acl_groups_too_many_rejected() {
+    let mut consumer = make_consumer("test", "alice");
+    consumer.acl_groups = (0..501).map(|i| format!("group-{}", i)).collect();
+    let errs = consumer.validate_fields().unwrap_err();
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("acl_groups") && e.contains("500"))
+    );
+}
+
+#[test]
+fn test_consumer_acl_groups_entry_too_long_rejected() {
+    let mut consumer = make_consumer("test", "alice");
+    consumer.acl_groups = vec!["a".repeat(256)];
+    let errs = consumer.validate_fields().unwrap_err();
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("acl_groups entry") && e.contains("255"))
+    );
+}
+
+#[test]
+fn test_consumer_acl_groups_control_chars_rejected() {
+    let mut consumer = make_consumer("test", "alice");
+    consumer.acl_groups = vec!["group\x00evil".into()];
+    let errs = consumer.validate_fields().unwrap_err();
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("acl_groups entry") && e.contains("control"))
     );
 }
 

@@ -173,6 +173,8 @@ consumers:
     credentials:
       keyauth:
         key: "alice-api-key"
+    acl_groups:
+      - "engineering"
 
 plugin_configs:
   - id: "log-plugin"

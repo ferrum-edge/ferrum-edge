@@ -26,6 +26,7 @@ fn create_consumer(username: &str) -> ferrum_edge::config::types::Consumer {
         username: username.to_string(),
         custom_id: None,
         credentials: HashMap::new(),
+        acl_groups: Vec::new(),
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }
@@ -41,6 +42,7 @@ fn create_consumer_with_custom_id(
         username: username.to_string(),
         custom_id: Some(custom_id.to_string()),
         credentials: HashMap::new(),
+        acl_groups: Vec::new(),
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }

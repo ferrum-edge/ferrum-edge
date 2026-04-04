@@ -245,6 +245,7 @@ async fn test_cp_dp_grpc_config_sync() {
             username: "test-user".into(),
             custom_id: Some("custom-1".into()),
             credentials: Default::default(),
+            acl_groups: Vec::new(),
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }],

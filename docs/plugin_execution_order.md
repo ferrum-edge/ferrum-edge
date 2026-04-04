@@ -101,7 +101,7 @@ Body-aware `before_proxy` plugins such as `graphql`, request-side `body_validato
 |--------|:-------------------:|:----------------------:|----------|
 | `ip_restriction` | ✓ | | Rejects connections from denied IPs |
 | `mtls_auth` | ✓ | | Maps the client certificate to a Consumer on TCP+TLS or UDP+DTLS |
-| `access_control` | ✓ | | Applies consumer allow/deny rules once a stream Consumer exists |
+| `access_control` | ✓ | | Applies consumer and group allow/deny rules once a stream Consumer exists |
 | `tcp_connection_throttle` | ✓ | ✓ | Caps active TCP connections per Consumer, else per client IP |
 | `rate_limiting` | ✓ | | Consumer-aware rate limiting when a stream identity exists, else IP-based |
 | `correlation_id` | ✓ | | Assigns a UUID request ID to metadata |
@@ -289,7 +289,7 @@ Browser preflight (`OPTIONS`) requests must be answered before authentication. I
 
 ### Authentication before authorization (1000s before 2000s)
 
-Authentication plugins identify *who* the caller is (setting `ctx.identified_consumer` and/or `ctx.authenticated_identity`). Authorization plugins like `access_control` then decide *whether* that identity is allowed. Running auth first is required — ACL checks are meaningless without a verified identity.
+Authentication plugins identify *who* the caller is (setting `ctx.identified_consumer` and/or `ctx.authenticated_identity`). Authorization plugins like `access_control` then decide *whether* that identity is allowed — by consumer username, ACL group membership, or both. Running auth first is required — ACL checks are meaningless without a verified identity.
 
 After all plugin phases complete, the gateway automatically injects `X-Consumer-Username` (and `X-Consumer-Custom-Id` when set) headers into the request forwarded to the backend, so upstream services can identify the authenticated caller. `X-Consumer-Username` uses the mapped Consumer username when available, otherwise an external auth header/display identity (for example from `jwks_auth`), otherwise the raw external authenticated identity.
 
@@ -423,7 +423,7 @@ TLS/DTLS are transport-layer concerns, not separate protocols. A plugin that sup
 | `key_auth` | ✓ | ✓ | ✓ | | | Requires HTTP headers |
 | `basic_auth` | ✓ | ✓ | ✓ | | | Requires HTTP headers |
 | `hmac_auth` | ✓ | ✓ | ✓ | | | Requires HTTP headers |
-| `access_control` | ✓ | ✓ | ✓ | ✓ | | Needs authenticated identity from an auth plugin; consumer rules remain primary |
+| `access_control` | ✓ | ✓ | ✓ | ✓ | | Needs authenticated identity from an auth plugin; supports consumer username and ACL group allow/deny lists |
 | `tcp_connection_throttle` | | | | ✓ | | Tracks active TCP connections per Consumer or client IP |
 | `grpc_method_router` | | ✓ | | | | gRPC method-level access control and rate limiting |
 | `grpc_deadline` | | ✓ | | | | gRPC timeout enforcement and propagation |

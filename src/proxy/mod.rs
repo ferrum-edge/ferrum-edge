@@ -364,6 +364,7 @@ mod tests {
             username: "mapped-consumer".to_string(),
             custom_id: None,
             credentials: HashMap::new(),
+            acl_groups: Vec::new(),
             created_at: Utc::now(),
             updated_at: Utc::now(),
         });
@@ -390,6 +391,7 @@ mod tests {
             username: "mapped-consumer".to_string(),
             custom_id: Some("custom-123".to_string()),
             credentials: HashMap::new(),
+            acl_groups: Vec::new(),
             created_at: Utc::now(),
             updated_at: Utc::now(),
         });

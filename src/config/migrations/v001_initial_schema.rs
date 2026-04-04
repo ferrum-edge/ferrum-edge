@@ -80,6 +80,7 @@ impl V001InitialSchema {
                 username VARCHAR(255) NOT NULL UNIQUE,
                 custom_id VARCHAR(255) UNIQUE,
                 credentials TEXT NOT NULL,
+                acl_groups VARCHAR(8192) NOT NULL DEFAULT '[]',
                 created_at VARCHAR(50) NOT NULL,
                 updated_at VARCHAR(50) NOT NULL
             )
@@ -91,6 +92,7 @@ impl V001InitialSchema {
                 username TEXT NOT NULL UNIQUE,
                 custom_id TEXT UNIQUE,
                 credentials TEXT NOT NULL DEFAULT '{}',
+                acl_groups TEXT NOT NULL DEFAULT '[]',
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             )

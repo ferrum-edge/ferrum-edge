@@ -58,6 +58,7 @@ fn make_consumer(
         username: "test-user".to_string(),
         custom_id: None,
         credentials,
+        acl_groups: Vec::new(),
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     }

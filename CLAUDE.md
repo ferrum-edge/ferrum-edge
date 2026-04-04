@@ -194,7 +194,7 @@ src/
 |------|-------------|------------|
 | `GatewayConfig` | Top-level config container | proxies, consumers, upstreams, plugins |
 | `Proxy` | A route + backend target | listen_path, hosts, backend_host/port/protocol, plugins, TLS/DNS/timeout overrides, pool_*, circuit_breaker, retry, response_body_mode, allowed_ws_origins, udp_max_response_amplification_factor |
-| `Consumer` | An authenticated client identity | username, custom_id, credentials (HashMap), tags |
+| `Consumer` | An authenticated client identity | username, custom_id, credentials (HashMap), acl_groups (Vec), tags |
 | `Upstream` | A load-balanced target group | targets (host/port/weight/path), algorithm, health_checks |
 | `PluginConfig` | Plugin instance configuration | name, enabled, config (serde_json::Value) |
 | `ServiceDiscoveryConfig` | Dynamic upstream target discovery | provider (dns_sd/kubernetes/consul), poll_interval_seconds, provider-specific settings |
@@ -284,7 +284,7 @@ Plugins execute in priority order (lower number = runs first). The lifecycle pha
 
 1. `on_request_received` — OTel tracing (25), correlation ID (50), CORS preflight (100), request termination (125), IP restriction (150), bot detection (200), gRPC method router (275)
 2. `authenticate` — mTLS auth (950), JWKS auth (1000), JWT auth (1100), key auth (1200), basic auth (1300), HMAC auth (1400)
-3. `authorize` — Access control / ACL (2000), TCP connection throttle (2050). Supports `allow_authenticated_identity` for external JWKS/OIDC identities without consumer mapping
+3. `authorize` — Access control / ACL (2000), TCP connection throttle (2050). Supports consumer username and ACL group allow/deny lists, plus `allow_authenticated_identity` for external JWKS/OIDC identities without consumer mapping
 4. `before_proxy` — Request size limiting (2800), GraphQL (2850), rate limiting (2900), AI prompt shield (2925), body validator (2950), AI request guard (2975), request transformer (3000), serverless function (3025), gRPC deadline (3050), compression (4050)
 5. `on_final_request_body` — Post-transform request body validation. Request size limiting re-checks after request_transformer rewrites. Body validator validates gRPC protobuf requests against descriptors (unary RPCs only, with gzip decompression for compressed frames) and re-checks JSON/XML after request_transformer rewrites
 6. `after_proxy` — Response size limiting (3490), response caching (3500), response transformer (4000), compression (4050), CORS headers (100). Rejects are now enforced on the response path across HTTP, HTTP/3, and gRPC
@@ -552,7 +552,7 @@ Each test runs a gateway with protocol-specific config (`configs/*.yaml`) and a 
 
 - **Supported databases**: PostgreSQL, MySQL, SQLite (via sqlx)
 - **Migrations**: Located in `src/config/migrations/`. Run via `FERRUM_MODE=migrate`.
-- **Schema relationships**: Proxies reference upstreams via `upstream_id`. Plugins are associated with proxies via the `proxy_plugins` junction table. Consumers have credentials keyed by auth type.
+- **Schema relationships**: Proxies reference upstreams via `upstream_id`. Plugins are associated with proxies via the `proxy_plugins` junction table. Consumers have credentials keyed by auth type and an `acl_groups` JSON array for group-based access control.
 - **Transactions**: All multi-step CRUD operations (create/update/delete proxy, delete plugin_config, delete upstream, cleanup orphaned upstream) are wrapped in `sqlx::Transaction` to prevent partial updates on crash or concurrent access.
 - **Full proxy persistence**: All Proxy struct fields are persisted in the database, including `circuit_breaker` (JSON), `retry` (JSON), `response_body_mode`, and all `pool_*` override fields.
 - **Incremental Polling**: Database mode polls for changes at `FERRUM_DB_POLL_INTERVAL_SECONDS` (default 30s) using a two-phase incremental strategy:

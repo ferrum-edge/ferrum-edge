@@ -85,6 +85,7 @@ fn create_mtls_consumer(id: &str, username: &str, identity: &str) -> Consumer {
         username: username.to_string(),
         custom_id: Some(identity.to_string()),
         credentials,
+        acl_groups: Vec::new(),
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     }

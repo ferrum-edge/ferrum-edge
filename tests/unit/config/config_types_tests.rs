@@ -66,6 +66,7 @@ fn make_consumer(id: &str, username: &str) -> Consumer {
         username: username.into(),
         custom_id: None,
         credentials: HashMap::new(),
+        acl_groups: Vec::new(),
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }

@@ -49,6 +49,10 @@ pub const MAX_PLUGIN_CONFIG_SIZE: usize = 1_048_576; // 1 MiB
 pub const MAX_CREDENTIALS_SIZE: usize = 65_536; // 64 KiB
 /// Maximum length for individual credential string values (API keys, secrets, identities).
 pub const MAX_CREDENTIAL_VALUE_LENGTH: usize = 4096;
+/// Maximum number of ACL groups per consumer.
+pub const MAX_ACL_GROUPS_PER_CONSUMER: usize = 500;
+/// Maximum length for an ACL group name.
+pub const MAX_ACL_GROUP_LENGTH: usize = 255;
 /// Maximum length for hash_on field in upstream.
 pub const MAX_HASH_ON_LENGTH: usize = 255;
 /// Maximum number of status codes in circuit breaker / retry / health check lists.
@@ -855,6 +859,11 @@ pub struct Consumer {
     pub custom_id: Option<String>,
     #[serde(default)]
     pub credentials: HashMap<String, serde_json::Value>,
+    /// ACL group memberships. A consumer can belong to multiple groups, and the
+    /// `access_control` plugin can allow/deny by group instead of (or in
+    /// addition to) individual consumer usernames.
+    #[serde(default)]
+    pub acl_groups: Vec<String>,
     #[serde(default = "Utc::now")]
     pub created_at: DateTime<Utc>,
     #[serde(default = "Utc::now")]
@@ -2195,6 +2204,23 @@ impl Consumer {
             && let Err(e) = validate_string_field("custom_id", cid, MAX_CUSTOM_ID_LENGTH)
         {
             errors.push(e);
+        }
+
+        // ACL groups
+        if self.acl_groups.len() > MAX_ACL_GROUPS_PER_CONSUMER {
+            errors.push(format!(
+                "acl_groups must not have more than {} entries (got {})",
+                MAX_ACL_GROUPS_PER_CONSUMER,
+                self.acl_groups.len()
+            ));
+        }
+        for (i, group) in self.acl_groups.iter().enumerate() {
+            if group.trim().is_empty() {
+                errors.push(format!("acl_groups[{}] must not be empty", i));
+            }
+            if let Err(e) = validate_string_field("acl_groups entry", group, MAX_ACL_GROUP_LENGTH) {
+                errors.push(e);
+            }
         }
 
         // Credentials total size
