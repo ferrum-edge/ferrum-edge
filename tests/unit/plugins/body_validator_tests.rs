@@ -1200,3 +1200,416 @@ async fn test_response_no_validation_skips() {
             .await,
     );
 }
+
+// ════════════════════════════════════��══════════════════════════════════
+//  Protobuf Validation Tests (gRPC)
+// ══════════════════��═════════════════════════════��══════════════════════
+
+/// Path to the test descriptor file compiled from test_validator.proto.
+fn test_descriptor_path() -> String {
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
+    format!("{}/tests/fixtures/test_validator.bin", manifest_dir)
+}
+
+/// Build a gRPC length-prefixed frame: [0x00] [4-byte big-endian length] [payload].
+fn grpc_frame(payload: &[u8]) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(5 + payload.len());
+    frame.push(0); // not compressed
+    frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    frame.extend_from_slice(payload);
+    frame
+}
+
+/// Encode a valid HelloRequest protobuf using prost-reflect.
+fn encode_hello_request(name: &str, age: i32) -> Vec<u8> {
+    use prost::Message;
+    use prost_reflect::{DescriptorPool, DynamicMessage, Value};
+
+    let descriptor_bytes = std::fs::read(test_descriptor_path()).unwrap();
+    let pool = DescriptorPool::decode(descriptor_bytes.as_slice()).unwrap();
+    let msg_desc = pool.get_message_by_name("test.HelloRequest").unwrap();
+    let mut msg = DynamicMessage::new(msg_desc);
+    msg.set_field_by_name("name", Value::String(name.to_string()));
+    msg.set_field_by_name("age", Value::I32(age));
+    msg.encode_to_vec()
+}
+
+/// Encode a valid HelloResponse protobuf using prost-reflect.
+fn encode_hello_response(message: &str, success: bool) -> Vec<u8> {
+    use prost::Message;
+    use prost_reflect::{DescriptorPool, DynamicMessage, Value};
+
+    let descriptor_bytes = std::fs::read(test_descriptor_path()).unwrap();
+    let pool = DescriptorPool::decode(descriptor_bytes.as_slice()).unwrap();
+    let msg_desc = pool.get_message_by_name("test.HelloResponse").unwrap();
+    let mut msg = DynamicMessage::new(msg_desc);
+    msg.set_field_by_name("message", Value::String(message.to_string()));
+    msg.set_field_by_name("success", Value::Bool(success));
+    msg.encode_to_vec()
+}
+
+fn protobuf_plugin() -> BodyValidator {
+    BodyValidator::new(&serde_json::json!({
+        "protobuf_descriptor_path": test_descriptor_path(),
+        "protobuf_request_type": "test.HelloRequest",
+        "protobuf_response_type": "test.HelloResponse"
+    }))
+}
+
+fn protobuf_plugin_with_method_messages() -> BodyValidator {
+    BodyValidator::new(&serde_json::json!({
+        "protobuf_descriptor_path": test_descriptor_path(),
+        "protobuf_method_messages": {
+            "/test.Greeter/SayHello": {
+                "request": "test.HelloRequest",
+                "response": "test.HelloResponse"
+            }
+        }
+    }))
+}
+
+fn protobuf_plugin_reject_unknown() -> BodyValidator {
+    BodyValidator::new(&serde_json::json!({
+        "protobuf_descriptor_path": test_descriptor_path(),
+        "protobuf_request_type": "test.HelloRequest",
+        "protobuf_reject_unknown_fields": true
+    }))
+}
+
+// ─── Config and Buffering Flags ─��───────────────────────────────────
+
+#[test]
+fn test_protobuf_config_sets_validation_flags() {
+    let plugin = protobuf_plugin();
+    assert!(plugin.requires_request_body_buffering());
+    assert!(plugin.requires_response_body_buffering());
+}
+
+#[test]
+fn test_protobuf_request_only_config() {
+    let plugin = BodyValidator::new(&serde_json::json!({
+        "protobuf_descriptor_path": test_descriptor_path(),
+        "protobuf_request_type": "test.HelloRequest"
+    }));
+    assert!(plugin.requires_request_body_buffering());
+    assert!(!plugin.requires_response_body_buffering());
+}
+
+#[test]
+fn test_protobuf_response_only_config() {
+    let plugin = BodyValidator::new(&serde_json::json!({
+        "protobuf_descriptor_path": test_descriptor_path(),
+        "protobuf_response_type": "test.HelloResponse"
+    }));
+    assert!(!plugin.requires_request_body_buffering());
+    assert!(plugin.requires_response_body_buffering());
+}
+
+#[test]
+fn test_protobuf_should_buffer_grpc_content_type() {
+    let plugin = protobuf_plugin();
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/test.Greeter/SayHello".to_string(),
+    );
+    ctx.headers
+        .insert("content-type".to_string(), "application/grpc".to_string());
+    assert!(plugin.should_buffer_request_body(&ctx));
+}
+
+#[test]
+fn test_protobuf_should_buffer_grpc_proto_content_type() {
+    let plugin = protobuf_plugin();
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/test.Greeter/SayHello".to_string(),
+    );
+    ctx.headers.insert(
+        "content-type".to_string(),
+        "application/grpc+proto".to_string(),
+    );
+    assert!(plugin.should_buffer_request_body(&ctx));
+}
+
+#[test]
+fn test_protobuf_does_not_buffer_non_matching_content_types() {
+    // Protobuf-only config with content_types restricted to gRPC
+    let plugin = BodyValidator::new(&serde_json::json!({
+        "protobuf_descriptor_path": test_descriptor_path(),
+        "protobuf_request_type": "test.HelloRequest",
+        "content_types": ["application/grpc"]
+    }));
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api/json".to_string(),
+    );
+    ctx.headers
+        .insert("content-type".to_string(), "application/json".to_string());
+    // JSON content-type doesn't match the explicit content_types list
+    assert!(!plugin.should_buffer_request_body(&ctx));
+}
+
+// ─── gRPC Frame Parsing ───────��──────────────────────────────────────
+
+#[tokio::test]
+async fn test_protobuf_valid_request() {
+    let plugin = protobuf_plugin();
+    let payload = encode_hello_request("Alice", 30);
+    let frame = grpc_frame(&payload);
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/grpc".to_string());
+    headers.insert(":path".to_string(), "/test.Greeter/SayHello".to_string());
+    assert_continue(plugin.on_final_request_body(&headers, &frame).await);
+}
+
+#[tokio::test]
+async fn test_protobuf_invalid_request_body() {
+    let plugin = protobuf_plugin();
+    // Random bytes that are not valid protobuf for HelloRequest
+    let invalid_payload = vec![0xFF, 0xFE, 0xFD, 0xFC, 0xFB, 0xFA, 0xF9, 0xF8];
+    let frame = grpc_frame(&invalid_payload);
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/grpc".to_string());
+    headers.insert(":path".to_string(), "/test.Greeter/SayHello".to_string());
+    assert_reject(
+        plugin.on_final_request_body(&headers, &frame).await,
+        Some(400),
+    );
+}
+
+#[tokio::test]
+async fn test_protobuf_frame_too_short() {
+    let plugin = protobuf_plugin();
+    let frame = vec![0x00, 0x01]; // Only 2 bytes, need at least 5
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/grpc".to_string());
+    headers.insert(":path".to_string(), "/test.Greeter/SayHello".to_string());
+    assert_reject(
+        plugin.on_final_request_body(&headers, &frame).await,
+        Some(400),
+    );
+}
+
+#[tokio::test]
+async fn test_protobuf_frame_length_mismatch() {
+    let plugin = protobuf_plugin();
+    // Frame says 100 bytes but only has 3
+    let mut frame = vec![0x00]; // not compressed
+    frame.extend_from_slice(&100u32.to_be_bytes());
+    frame.extend_from_slice(&[0x01, 0x02, 0x03]);
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/grpc".to_string());
+    headers.insert(":path".to_string(), "/test.Greeter/SayHello".to_string());
+    assert_reject(
+        plugin.on_final_request_body(&headers, &frame).await,
+        Some(400),
+    );
+}
+
+#[tokio::test]
+async fn test_protobuf_compressed_frame_rejected() {
+    let plugin = protobuf_plugin();
+    let payload = encode_hello_request("Bob", 25);
+    let mut frame = Vec::with_capacity(5 + payload.len());
+    frame.push(1); // compressed flag = 1
+    frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    frame.extend_from_slice(&payload);
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/grpc".to_string());
+    headers.insert(":path".to_string(), "/test.Greeter/SayHello".to_string());
+    assert_reject(
+        plugin.on_final_request_body(&headers, &frame).await,
+        Some(400),
+    );
+}
+
+#[tokio::test]
+async fn test_protobuf_empty_body_skipped() {
+    let plugin = protobuf_plugin();
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/grpc".to_string());
+    headers.insert(":path".to_string(), "/test.Greeter/SayHello".to_string());
+    assert_continue(plugin.on_final_request_body(&headers, &[]).await);
+}
+
+#[tokio::test]
+async fn test_protobuf_non_grpc_content_type_skipped() {
+    let plugin = protobuf_plugin();
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+    assert_continue(
+        plugin
+            .on_final_request_body(&headers, b"not protobuf")
+            .await,
+    );
+}
+
+// ─── Method-based Message Type Routing ──────────────────────────────
+
+#[tokio::test]
+async fn test_protobuf_method_message_lookup() {
+    let plugin = protobuf_plugin_with_method_messages();
+    let payload = encode_hello_request("Charlie", 40);
+    let frame = grpc_frame(&payload);
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/grpc".to_string());
+    headers.insert(":path".to_string(), "/test.Greeter/SayHello".to_string());
+    assert_continue(plugin.on_final_request_body(&headers, &frame).await);
+}
+
+#[tokio::test]
+async fn test_protobuf_unknown_method_skipped_when_no_default() {
+    let plugin = protobuf_plugin_with_method_messages();
+    let payload = encode_hello_request("Charlie", 40);
+    let frame = grpc_frame(&payload);
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/grpc".to_string());
+    headers.insert(
+        ":path".to_string(),
+        "/test.Greeter/UnknownMethod".to_string(),
+    );
+    // No default type and method not in map — skip validation
+    assert_continue(plugin.on_final_request_body(&headers, &frame).await);
+}
+
+#[tokio::test]
+async fn test_protobuf_unknown_method_uses_default_type() {
+    let plugin = protobuf_plugin();
+    let payload = encode_hello_request("Dave", 50);
+    let frame = grpc_frame(&payload);
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/grpc".to_string());
+    headers.insert(":path".to_string(), "/test.Greeter/AnyMethod".to_string());
+    // Default type is configured, so validation runs
+    assert_continue(plugin.on_final_request_body(&headers, &frame).await);
+}
+
+// ���── Unknown Fields ���────────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_protobuf_unknown_fields_allowed_by_default() {
+    let plugin = protobuf_plugin();
+    // Encode a message with an extra field (field number 99)
+    let mut payload = encode_hello_request("Eve", 25);
+    // Append a varint field: tag = (99 << 3) | 0 = 792, value = 42
+    // 792 = 0x318, varint encoding: 0x98 0x06
+    payload.extend_from_slice(&[0x98, 0x06, 42]);
+    let frame = grpc_frame(&payload);
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/grpc".to_string());
+    headers.insert(":path".to_string(), "/test.Greeter/SayHello".to_string());
+    assert_continue(plugin.on_final_request_body(&headers, &frame).await);
+}
+
+#[tokio::test]
+async fn test_protobuf_unknown_fields_rejected_when_configured() {
+    let plugin = protobuf_plugin_reject_unknown();
+    let mut payload = encode_hello_request("Eve", 25);
+    // Same unknown field as above
+    payload.extend_from_slice(&[0x98, 0x06, 42]);
+    let frame = grpc_frame(&payload);
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/grpc".to_string());
+    headers.insert(":path".to_string(), "/test.Greeter/SayHello".to_string());
+    assert_reject(
+        plugin.on_final_request_body(&headers, &frame).await,
+        Some(400),
+    );
+}
+
+// ─── Response Validation ���────────────────────────────────���──────────
+
+#[tokio::test]
+async fn test_protobuf_valid_response() {
+    let plugin = protobuf_plugin();
+    let payload = encode_hello_response("Hello, Alice!", true);
+    let frame = grpc_frame(&payload);
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/test.Greeter/SayHello".to_string(),
+    );
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/grpc".to_string());
+    assert_continue(
+        plugin
+            .on_final_response_body(&mut ctx, 200, &headers, &frame)
+            .await,
+    );
+}
+
+#[tokio::test]
+async fn test_protobuf_invalid_response() {
+    let plugin = protobuf_plugin();
+    let invalid_payload = vec![0xFF, 0xFE, 0xFD, 0xFC, 0xFB, 0xFA];
+    let frame = grpc_frame(&invalid_payload);
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/test.Greeter/SayHello".to_string(),
+    );
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/grpc".to_string());
+    assert_reject(
+        plugin
+            .on_final_response_body(&mut ctx, 200, &headers, &frame)
+            .await,
+        Some(502),
+    );
+}
+
+// ─── Invalid Config Graceful Handling ───────────���───────────────────
+
+#[test]
+fn test_protobuf_invalid_descriptor_path_degrades_gracefully() {
+    let plugin = BodyValidator::new(&serde_json::json!({
+        "protobuf_descriptor_path": "/nonexistent/path/descriptor.bin",
+        "protobuf_request_type": "test.HelloRequest"
+    }));
+    // Plugin should still be created, but without protobuf validation
+    assert!(!plugin.requires_request_body_buffering());
+}
+
+#[test]
+fn test_protobuf_invalid_message_type_degrades_gracefully() {
+    let plugin = BodyValidator::new(&serde_json::json!({
+        "protobuf_descriptor_path": test_descriptor_path(),
+        "protobuf_request_type": "nonexistent.MessageType"
+    }));
+    // Plugin created but no valid descriptor — no request buffering needed
+    assert!(!plugin.requires_request_body_buffering());
+}
+
+// ─── gRPC before_proxy is skipped (uses on_final_request_body instead) ──
+
+#[tokio::test]
+async fn test_protobuf_before_proxy_skips_grpc() {
+    let plugin = protobuf_plugin();
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/test.Greeter/SayHello".to_string(),
+    );
+    ctx.headers
+        .insert("content-type".to_string(), "application/grpc".to_string());
+    // before_proxy should return Continue for gRPC — validation happens in on_final_request_body
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/grpc".to_string());
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+}
+
+// ─── Empty protobuf message (valid for proto3) ──────────────────────
+
+#[tokio::test]
+async fn test_protobuf_empty_message_valid() {
+    let plugin = protobuf_plugin();
+    // Empty protobuf payload is valid in proto3 (all fields have defaults)
+    let frame = grpc_frame(&[]);
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/grpc".to_string());
+    headers.insert(":path".to_string(), "/test.Greeter/SayHello".to_string());
+    assert_continue(plugin.on_final_request_body(&headers, &frame).await);
+}

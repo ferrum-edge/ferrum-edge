@@ -999,7 +999,7 @@ Header rules default to `target: header` (no `target` field required). Body rule
 
 ### `body_validator`
 
-Validates JSON and XML request and response bodies against schemas. Supports comprehensive JSON Schema validation.
+Validates JSON, XML, and gRPC protobuf request and response bodies against schemas. Supports comprehensive JSON Schema validation.
 
 Request-side validation only buffers matching request bodies: methods that can carry a body and whose `content-type` matches `content_types`. Response-only configs do not force request buffering.
 
@@ -1024,6 +1024,16 @@ Request-side validation only buffers matching request bodies: methods that can c
 | `response_validate_xml` | bool | `false` | XML validation for responses |
 | `response_required_xml_elements` | String[] | `[]` | Required XML elements in responses |
 | `response_content_types` | String[] | `["application/json","application/xml","text/xml"]` | Response MIME types to validate |
+
+**Protobuf validation (gRPC):**
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `protobuf_descriptor_path` | String | — | Path to compiled `FileDescriptorSet` binary (`protoc --descriptor_set_out --include_imports`) |
+| `protobuf_request_type` | String | — | Default fully-qualified protobuf message type for request validation |
+| `protobuf_response_type` | String | — | Default fully-qualified protobuf message type for response validation |
+| `protobuf_method_messages` | Object | `{}` | Per-method message type overrides keyed by gRPC path (e.g., `/pkg.Svc/Method`). Each value has `request` and/or `response` string fields |
+| `protobuf_reject_unknown_fields` | bool | `false` | Reject messages containing field numbers not in the descriptor |
 
 **Supported JSON Schema `format` values**: `email`, `ipv4`, `ipv6`, `uri`, `date-time`, `date`, `uuid`
 

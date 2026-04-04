@@ -3652,20 +3652,6 @@ pub async fn handle_proxy_request(
             BackendProtocol::Grpc | BackendProtocol::Grpcs
         )
     {
-        let request = match client_request_body {
-            ClientRequestBody::Streaming(request) => *request,
-            ClientRequestBody::Buffered(_) => {
-                debug_assert!(
-                    false,
-                    "gRPC requests should not be pre-buffered by HTTP body plugins"
-                );
-                record_request(&state, 500);
-                return Ok(build_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    r#"{"error":"gRPC request buffering invariant violated"}"#,
-                ));
-            }
-        };
         let (grpc_effective_host, grpc_effective_port) = if let Some(ref target) = upstream_target {
             (target.host.as_str(), target.port)
         } else {
@@ -3690,17 +3676,114 @@ pub async fn handle_proxy_request(
                 .plugin_cache
                 .requires_response_body_buffering(&proxy.id);
 
-        // First attempt — also captures the buffered body for potential retries
-        let (mut grpc_result, grpc_body_bytes) = grpc_proxy::proxy_grpc_request(
-            request,
-            &proxy,
-            &grpc_backend_url,
-            &state.grpc_pool,
-            &state.dns_cache,
-            proxy_headers,
-            grpc_should_stream,
-        )
-        .await;
+        // When plugins need request body access (e.g., protobuf validation),
+        // collect the body first, run hooks, then dispatch to backend.
+        // Otherwise, use the fast combined collect+dispatch path.
+        let grpc_needs_request_body_hooks = requires_request_body_buffering;
+        let (mut grpc_result, grpc_body_bytes) = if grpc_needs_request_body_hooks {
+            // Split path: collect body → run plugin hooks → dispatch
+            let request = match client_request_body {
+                ClientRequestBody::Streaming(request) => *request,
+                ClientRequestBody::Buffered(_) => {
+                    record_request(&state, 500);
+                    return Ok(build_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        r#"{"error":"Internal error"}"#,
+                    ));
+                }
+            };
+            let (grpc_method, grpc_headers, grpc_req_body) =
+                match grpc_proxy::collect_grpc_request_body(request).await {
+                    Ok(parts) => parts,
+                    Err(e) => {
+                        record_request(&state, 500);
+                        return Ok(grpc_proxy::build_grpc_error_response(
+                            13, // INTERNAL
+                            &format!("Failed to read gRPC request body: {:?}", e),
+                        ));
+                    }
+                };
+
+            // Store body metadata for plugins that read via ctx.metadata
+            ctx.metadata.insert(
+                "request_body_size_bytes".to_string(),
+                grpc_req_body.len().to_string(),
+            );
+
+            // Run on_final_request_body hooks (e.g., protobuf validation)
+            let mut hook_headers = proxy_headers.clone();
+            hook_headers
+                .entry(":path".to_string())
+                .or_insert_with(|| path.clone());
+            match run_final_request_body_hooks(&plugins, &hook_headers, &grpc_req_body).await {
+                PluginResult::Continue => {}
+                reject @ PluginResult::Reject { .. }
+                | reject @ PluginResult::RejectBinary { .. } => {
+                    let (status, body, headers) = match reject {
+                        PluginResult::Reject {
+                            status_code,
+                            body,
+                            headers,
+                        } => (status_code, body.into_bytes(), headers),
+                        PluginResult::RejectBinary {
+                            status_code,
+                            body,
+                            headers,
+                        } => (status_code, body.to_vec(), headers),
+                        _ => unreachable!(),
+                    };
+                    let normalized = normalize_reject_response(
+                        StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_REQUEST),
+                        &body,
+                        &headers,
+                        true, // is_grpc_request
+                    );
+                    record_request(&state, normalized.http_status.as_u16());
+                    return Ok(build_response_from_normalized_reject(normalized));
+                }
+            }
+
+            // Dispatch to backend with pre-collected body bytes
+            let result = grpc_proxy::proxy_grpc_request_core(
+                grpc_method,
+                grpc_headers,
+                grpc_req_body.clone(),
+                &proxy,
+                &grpc_backend_url,
+                &state.grpc_pool,
+                &state.dns_cache,
+                proxy_headers,
+                grpc_should_stream,
+            )
+            .await;
+            if grpc_should_stream {
+                (result, Bytes::new())
+            } else {
+                (result, grpc_req_body)
+            }
+        } else {
+            // Fast path: combined collect+dispatch (no plugin body hooks needed)
+            let request = match client_request_body {
+                ClientRequestBody::Streaming(request) => *request,
+                ClientRequestBody::Buffered(_) => {
+                    record_request(&state, 500);
+                    return Ok(build_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        r#"{"error":"Internal error"}"#,
+                    ));
+                }
+            };
+            grpc_proxy::proxy_grpc_request(
+                request,
+                &proxy,
+                &grpc_backend_url,
+                &state.grpc_pool,
+                &state.dns_cache,
+                proxy_headers,
+                grpc_should_stream,
+            )
+            .await
+        };
 
         // Only build retry parts when retries are configured
         let grpc_method = hyper::Method::POST; // gRPC always uses POST

@@ -245,7 +245,7 @@ Given all built-in plugins enabled, the execution order is:
 | 20 | `ws_rate_limiting` | 2910 | on_ws_frame |
 | 21 | `udp_rate_limiting` | 2910 | on_udp_datagram |
 | 22 | `ai_prompt_shield` | 2925 | before_proxy, transform_request_body |
-| 23 | `body_validator` | 2950 | before_proxy, on_final_response_body |
+| 23 | `body_validator` | 2950 | before_proxy, on_final_request_body, on_final_response_body |
 | 24 | `ai_request_guard` | 2975 | before_proxy, transform_request_body |
 | 25 | `request_transformer` | 3000 | before_proxy, transform_request_body |
 | 26 | `serverless_function` | 3025 | before_proxy |

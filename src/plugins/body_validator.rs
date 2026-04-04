@@ -1,19 +1,28 @@
 //! Body Validation Plugin
 //!
-//! Validates JSON and XML request and response bodies against schemas.
+//! Validates JSON, XML, and gRPC protobuf request and response bodies against schemas.
 //! For JSON, validates against a JSON Schema. For XML, validates that the
 //! body is well-formed XML and optionally checks for required elements.
+//! For gRPC protobuf, validates against a compiled `FileDescriptorSet`.
 //!
-//! Request validation runs in `before_proxy` (rejects with 400).
-//! Response validation runs in `on_response_body` (rejects with 502)
+//! Request validation for JSON/XML runs in `before_proxy` (rejects with 400).
+//! Request validation for protobuf runs in `on_final_request_body` (rejects with 400).
+//! Response validation runs in `on_final_response_body` (rejects with 502)
 //! and requires response body buffering when configured.
 
 use async_trait::async_trait;
+use prost_reflect::{DescriptorPool, DynamicMessage, MessageDescriptor};
 use serde_json::Value;
 use std::collections::HashMap;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use super::{Plugin, PluginResult, RequestContext};
+
+/// Per-method message type descriptors for protobuf validation.
+struct ProtobufMethodEntry {
+    request: Option<MessageDescriptor>,
+    response: Option<MessageDescriptor>,
+}
 
 pub struct BodyValidator {
     // ── Request validation config ──
@@ -43,10 +52,29 @@ pub struct BodyValidator {
     response_content_types: Vec<String>,
     /// Pre-compiled regexes for response JSON Schema `pattern` constraints.
     response_compiled_patterns: HashMap<String, regex::Regex>,
+
+    // ── Protobuf validation config ──
+    /// Descriptor pool loaded from the compiled `FileDescriptorSet` binary.
+    /// Retained so message descriptors remain valid (they borrow from the pool).
+    _protobuf_pool: Option<DescriptorPool>,
+    /// Default request message descriptor (for methods not in `protobuf_method_messages`).
+    protobuf_request_descriptor: Option<MessageDescriptor>,
+    /// Default response message descriptor.
+    protobuf_response_descriptor: Option<MessageDescriptor>,
+    /// Per-method message type overrides keyed by gRPC path (e.g., `/pkg.Svc/Method`).
+    protobuf_method_messages: HashMap<String, ProtobufMethodEntry>,
+    /// Whether to reject messages with unknown field numbers.
+    protobuf_reject_unknown_fields: bool,
+
+    // ── Cached flags ──
     /// Whether any request validation is configured (cached for O(1) checks).
     has_request_validation: bool,
     /// Whether any response validation is configured (cached for O(1) check).
     has_response_validation: bool,
+    /// Whether protobuf request validation is configured.
+    has_protobuf_request_validation: bool,
+    /// Whether protobuf response validation is configured.
+    has_protobuf_response_validation: bool,
 }
 
 impl BodyValidator {
@@ -126,19 +154,41 @@ impl BodyValidator {
                 ]
             });
 
-        let has_response_validation = response_json_schema.is_some()
+        // ── Protobuf validation config ──
+        let (
+            protobuf_pool,
+            protobuf_request_descriptor,
+            protobuf_response_descriptor,
+            protobuf_method_messages,
+        ) = load_protobuf_config(config);
+        let protobuf_reject_unknown_fields = config["protobuf_reject_unknown_fields"]
+            .as_bool()
+            .unwrap_or(false);
+
+        let has_protobuf_request_validation = protobuf_request_descriptor.is_some()
+            || protobuf_method_messages
+                .values()
+                .any(|e| e.request.is_some());
+        let has_protobuf_response_validation = protobuf_response_descriptor.is_some()
+            || protobuf_method_messages
+                .values()
+                .any(|e| e.response.is_some());
+
+        let has_json_xml_request = json_schema.is_some()
+            || !required_fields.is_empty()
+            || validate_xml
+            || !required_xml_elements.is_empty();
+        let has_json_xml_response = response_json_schema.is_some()
             || !response_required_fields.is_empty()
             || response_validate_xml
             || !response_required_xml_elements.is_empty();
 
-        let has_request_validation = json_schema.is_some()
-            || !required_fields.is_empty()
-            || validate_xml
-            || !required_xml_elements.is_empty();
+        let has_request_validation = has_json_xml_request || has_protobuf_request_validation;
+        let has_response_validation = has_json_xml_response || has_protobuf_response_validation;
 
         if !has_request_validation && !has_response_validation {
-            tracing::warn!(
-                "body_validator: no validation rules configured — set 'json_schema', 'required_fields', 'validate_xml', 'required_xml_elements' (request) or their 'response_*' equivalents"
+            warn!(
+                "body_validator: no validation rules configured — set 'json_schema', 'required_fields', 'validate_xml', 'required_xml_elements' (request), their 'response_*' equivalents, or 'protobuf_descriptor_path' with message types"
             );
         }
 
@@ -165,8 +215,15 @@ impl BodyValidator {
             response_required_xml_elements,
             response_content_types,
             response_compiled_patterns,
+            _protobuf_pool: protobuf_pool,
+            protobuf_request_descriptor,
+            protobuf_response_descriptor,
+            protobuf_method_messages,
+            protobuf_reject_unknown_fields,
             has_request_validation,
             has_response_validation,
+            has_protobuf_request_validation,
+            has_protobuf_response_validation,
         }
     }
 
@@ -594,6 +651,185 @@ impl BodyValidator {
 
         Ok(())
     }
+
+    /// Validate a gRPC protobuf body (request or response) against a message descriptor.
+    ///
+    /// The body uses gRPC length-prefixed framing: 1 byte compressed flag + 4 bytes
+    /// big-endian u32 message length + protobuf payload bytes.
+    fn validate_protobuf_body(
+        &self,
+        body: &[u8],
+        descriptor: &MessageDescriptor,
+    ) -> Result<(), String> {
+        let payload = parse_grpc_frame(body)?;
+        let msg = DynamicMessage::decode(descriptor.clone(), payload)
+            .map_err(|e| format!("Protobuf decode failed: {}", e))?;
+        if self.protobuf_reject_unknown_fields {
+            let unknown_count = msg.unknown_fields().count();
+            if unknown_count > 0 {
+                return Err(format!(
+                    "Message contains {} unknown field(s)",
+                    unknown_count
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Look up the request message descriptor for a given gRPC path.
+    fn get_request_descriptor(&self, grpc_path: &str) -> Option<&MessageDescriptor> {
+        self.protobuf_method_messages
+            .get(grpc_path)
+            .and_then(|e| e.request.as_ref())
+            .or(self.protobuf_request_descriptor.as_ref())
+    }
+
+    /// Look up the response message descriptor for a given gRPC path.
+    fn get_response_descriptor(&self, grpc_path: &str) -> Option<&MessageDescriptor> {
+        self.protobuf_method_messages
+            .get(grpc_path)
+            .and_then(|e| e.response.as_ref())
+            .or(self.protobuf_response_descriptor.as_ref())
+    }
+}
+
+/// Parse the gRPC length-prefixed frame and return the protobuf payload bytes.
+///
+/// Frame format: [1 byte compressed flag] [4 bytes big-endian u32 length] [payload]
+fn parse_grpc_frame(body: &[u8]) -> Result<&[u8], String> {
+    if body.len() < 5 {
+        return Err(format!(
+            "gRPC frame too short: {} bytes (minimum 5)",
+            body.len()
+        ));
+    }
+    let compressed = body[0];
+    if compressed != 0 {
+        return Err("Compressed gRPC frames are not supported for protobuf validation".to_string());
+    }
+    let msg_len = u32::from_be_bytes([body[1], body[2], body[3], body[4]]) as usize;
+    let payload = &body[5..];
+    if payload.len() != msg_len {
+        return Err(format!(
+            "gRPC frame length mismatch: header says {} bytes but payload is {} bytes",
+            msg_len,
+            payload.len()
+        ));
+    }
+    Ok(payload)
+}
+
+/// Load protobuf validation config from the plugin config JSON.
+///
+/// Reads `protobuf_descriptor_path`, resolves message types from
+/// `protobuf_request_type`, `protobuf_response_type`, and `protobuf_method_messages`.
+fn load_protobuf_config(
+    config: &Value,
+) -> (
+    Option<DescriptorPool>,
+    Option<MessageDescriptor>,
+    Option<MessageDescriptor>,
+    HashMap<String, ProtobufMethodEntry>,
+) {
+    let descriptor_path = match config
+        .get("protobuf_descriptor_path")
+        .and_then(|v| v.as_str())
+    {
+        Some(p) => p,
+        None => return (None, None, None, HashMap::new()),
+    };
+
+    let descriptor_bytes = match std::fs::read(descriptor_path) {
+        Ok(b) => b,
+        Err(e) => {
+            warn!(
+                "body_validator: failed to read protobuf descriptor file '{}': {}",
+                descriptor_path, e
+            );
+            return (None, None, None, HashMap::new());
+        }
+    };
+
+    let pool = match DescriptorPool::decode(descriptor_bytes.as_slice()) {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(
+                "body_validator: failed to parse protobuf descriptor '{}': {}",
+                descriptor_path, e
+            );
+            return (None, None, None, HashMap::new());
+        }
+    };
+
+    let request_desc = config
+        .get("protobuf_request_type")
+        .and_then(|v| v.as_str())
+        .and_then(|name| {
+            pool.get_message_by_name(name).or_else(|| {
+                warn!(
+                    "body_validator: protobuf_request_type '{}' not found in descriptor",
+                    name
+                );
+                None
+            })
+        });
+
+    let response_desc = config
+        .get("protobuf_response_type")
+        .and_then(|v| v.as_str())
+        .and_then(|name| {
+            pool.get_message_by_name(name).or_else(|| {
+                warn!(
+                    "body_validator: protobuf_response_type '{}' not found in descriptor",
+                    name
+                );
+                None
+            })
+        });
+
+    let mut method_map = HashMap::new();
+    if let Some(methods) = config
+        .get("protobuf_method_messages")
+        .and_then(|v| v.as_object())
+    {
+        for (method_path, method_config) in methods {
+            let req = method_config
+                .get("request")
+                .and_then(|v| v.as_str())
+                .and_then(|name| {
+                    pool.get_message_by_name(name).or_else(|| {
+                        warn!(
+                            "body_validator: method '{}' request type '{}' not found in descriptor",
+                            method_path, name
+                        );
+                        None
+                    })
+                });
+            let resp = method_config
+                .get("response")
+                .and_then(|v| v.as_str())
+                .and_then(|name| {
+                    pool.get_message_by_name(name).or_else(|| {
+                        warn!(
+                            "body_validator: method '{}' response type '{}' not found in descriptor",
+                            method_path, name
+                        );
+                        None
+                    })
+                });
+            if req.is_some() || resp.is_some() {
+                method_map.insert(
+                    method_path.clone(),
+                    ProtobufMethodEntry {
+                        request: req,
+                        response: resp,
+                    },
+                );
+            }
+        }
+    }
+
+    (Some(pool), request_desc, response_desc, method_map)
 }
 
 /// Recursively walk a JSON Schema and pre-compile all `pattern` regex strings.
@@ -606,10 +842,9 @@ fn collect_patterns(schema: &Value, patterns: &mut HashMap<String, regex::Regex>
                 patterns.insert(pattern.to_string(), re);
             }
             Err(e) => {
-                tracing::warn!(
+                warn!(
                     "body_validator: invalid regex pattern '{}' in schema: {}",
-                    pattern,
-                    e
+                    pattern, e
                 );
             }
         }
@@ -712,6 +947,28 @@ fn json_type_name(v: &Value) -> &'static str {
     }
 }
 
+/// Helper to build a rejection `PluginResult` for protobuf validation failures.
+fn protobuf_reject(status_code: u16, direction: &str, msg: &str) -> PluginResult {
+    debug!(
+        "body_validator: {} protobuf validation failed: {}",
+        direction, msg
+    );
+    let escaped_msg = msg.replace('\\', "\\\\").replace('"', "\\\"");
+    PluginResult::Reject {
+        status_code,
+        body: format!(
+            r#"{{"error":"{} body validation failed","details":"{}"}}"#,
+            if status_code == 400 {
+                "Request"
+            } else {
+                "Response"
+            },
+            escaped_msg
+        ),
+        headers: HashMap::new(),
+    }
+}
+
 /// Plugin priority: runs in transform band, before proxying.
 pub const BODY_VALIDATOR_PRIORITY: u16 = 2950;
 
@@ -730,6 +987,12 @@ impl Plugin for BodyValidator {
     }
 
     fn requires_request_body_before_before_proxy(&self) -> bool {
+        // JSON/XML validation reads request_body from metadata in before_proxy.
+        // Protobuf validation uses on_final_request_body, but still needs body collected.
+        self.has_request_validation
+    }
+
+    fn requires_request_body_buffering(&self) -> bool {
         self.has_request_validation
     }
 
@@ -745,6 +1008,11 @@ impl Plugin for BodyValidator {
             .get("content-type")
             .map(|value| value.to_lowercase())
             .unwrap_or_default();
+
+        // For gRPC protobuf validation, buffer if content-type is application/grpc
+        if self.has_protobuf_request_validation && content_type.starts_with("application/grpc") {
+            return true;
+        }
 
         self.content_types.is_empty()
             || self
@@ -770,6 +1038,11 @@ impl Plugin for BodyValidator {
             .cloned()
             .unwrap_or_default()
             .to_lowercase();
+
+        // gRPC protobuf validation is handled in on_final_request_body, not here
+        if content_type.starts_with("application/grpc") {
+            return PluginResult::Continue;
+        }
 
         let should_validate = self.content_types.is_empty()
             || self
@@ -826,6 +1099,47 @@ impl Plugin for BodyValidator {
         }
     }
 
+    async fn on_final_request_body(
+        &self,
+        headers: &HashMap<String, String>,
+        body: &[u8],
+    ) -> PluginResult {
+        if !self.has_protobuf_request_validation {
+            return PluginResult::Continue;
+        }
+
+        let content_type = headers
+            .get("content-type")
+            .map(|v| v.to_lowercase())
+            .unwrap_or_default();
+        if !content_type.starts_with("application/grpc") {
+            return PluginResult::Continue;
+        }
+
+        if body.is_empty() {
+            return PluginResult::Continue;
+        }
+
+        // Resolve gRPC method path from headers (injected by the proxy handler)
+        let grpc_path = headers.get(":path").map(|s| s.as_str()).unwrap_or("");
+        let descriptor = match self.get_request_descriptor(grpc_path) {
+            Some(d) => d,
+            None => {
+                // No descriptor for this method — skip validation
+                debug!(
+                    "body_validator: no protobuf request descriptor for method '{}'",
+                    grpc_path
+                );
+                return PluginResult::Continue;
+            }
+        };
+
+        match self.validate_protobuf_body(body, descriptor) {
+            Ok(()) => PluginResult::Continue,
+            Err(msg) => protobuf_reject(400, "request", &msg),
+        }
+    }
+
     fn requires_response_body_buffering(&self) -> bool {
         self.has_response_validation
     }
@@ -847,6 +1161,27 @@ impl Plugin for BodyValidator {
             .cloned()
             .unwrap_or_default()
             .to_lowercase();
+
+        // gRPC protobuf response validation
+        if content_type.starts_with("application/grpc") {
+            if !self.has_protobuf_response_validation || body.is_empty() {
+                return PluginResult::Continue;
+            }
+            // For response, use the request path stored in ctx metadata
+            // The response headers may contain :path from the original request
+            let grpc_path = response_headers
+                .get(":path")
+                .map(|s| s.as_str())
+                .unwrap_or("");
+            let descriptor = match self.get_response_descriptor(grpc_path) {
+                Some(d) => d,
+                None => return PluginResult::Continue,
+            };
+            return match self.validate_protobuf_body(body, descriptor) {
+                Ok(()) => PluginResult::Continue,
+                Err(msg) => protobuf_reject(502, "response", &msg),
+            };
+        }
 
         let should_validate = self.response_content_types.is_empty()
             || self

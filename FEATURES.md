@@ -77,7 +77,7 @@ Ferrum supports dynamic upstream target discovery through three providers, confi
 - **Response Size Limiting** — per-proxy response body size limits (lower than global default), Content-Length fast path + optional buffered body check
 - **Bot Detection** — User-Agent pattern blocking with allow-list support
 - **CORS** — preflight handling with origin, method, and header validation
-- **Body Validator** — JSON Schema and XML validation
+- **Body Validator** — JSON Schema, XML, and gRPC protobuf validation
 - **GraphQL** — query depth/complexity limiting, alias limiting, introspection control, per-operation rate limiting
 - **gRPC Method Router** — per-method access control (allow/deny lists) and per-method rate limiting with metadata enrichment
 - **gRPC Deadline** — `grpc-timeout` enforcement, default injection, max capping, and gateway processing time subtraction

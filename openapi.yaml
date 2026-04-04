@@ -3046,7 +3046,7 @@ components:
 
     BodyValidatorConfig:
       type: object
-      description: "Plugin: body_validator — JSON Schema and XML validation for request/response bodies."
+      description: "Plugin: body_validator — JSON Schema, XML, and gRPC protobuf validation for request/response bodies."
       properties:
         json_schema:
           type: object
@@ -3095,6 +3095,31 @@ components:
           items:
             type: string
           default: ["application/json", "application/xml", "text/xml"]
+        protobuf_descriptor_path:
+          type: string
+          description: Path to compiled FileDescriptorSet binary (protoc --descriptor_set_out --include_imports)
+        protobuf_request_type:
+          type: string
+          description: Default fully-qualified protobuf message type for request validation
+        protobuf_response_type:
+          type: string
+          description: Default fully-qualified protobuf message type for response validation
+        protobuf_method_messages:
+          type: object
+          additionalProperties:
+            type: object
+            properties:
+              request:
+                type: string
+                description: Fully-qualified protobuf message type for request validation
+              response:
+                type: string
+                description: Fully-qualified protobuf message type for response validation
+          description: Per-method message type overrides keyed by gRPC path
+        protobuf_reject_unknown_fields:
+          type: boolean
+          default: false
+          description: Reject messages containing field numbers not in the descriptor
 
     RequestTerminationConfig:
       type: object

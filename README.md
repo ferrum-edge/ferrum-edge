@@ -219,7 +219,7 @@ Plugins execute in a defined pipeline with priority ordering (lower = runs first
 | **gRPC** (275) | `grpc_method_router` |
 | **Authorization** (2000-2900) | `access_control`, `tcp_connection_throttle`, `graphql`, `rate_limiting` |
 | **AI Pre-proxy** (2925-2975) | `ai_prompt_shield`, `ai_request_guard` |
-| **Transform** (3000-3050) | `request_transformer`, `serverless_function`, `body_validator`, `request_size_limiting`, `request_termination`, `grpc_deadline` |
+| **Transform** (3000-3050) | `request_transformer`, `serverless_function`, `body_validator` (JSON/XML/protobuf), `request_size_limiting`, `request_termination`, `grpc_deadline` |
 | **WebSocket** (2810-2910) | `ws_message_size_limiting`, `ws_rate_limiting` |
 | **Response** (4000-4200) | `response_transformer`, `response_size_limiting`, `ai_token_metrics`, `ai_rate_limiter` |
 | **Logging** (9000-9300) | `stdout_logging`, `ws_frame_logging`, `http_logging`, `transaction_debugger`, `correlation_id`, `prometheus_metrics` |

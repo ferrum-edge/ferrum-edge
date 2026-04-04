@@ -762,13 +762,30 @@ pub async fn proxy_grpc_request_from_bytes(
     .await
 }
 
+/// Collect the incoming gRPC request body and split the `Request<Incoming>` into
+/// its constituent parts for separate validation and dispatch.
+///
+/// This is used when plugins require request body buffering for gRPC proxies
+/// (e.g., protobuf validation). The body bytes, method, and headers are returned
+/// so the caller can run plugin hooks before dispatching via `proxy_grpc_request_core`.
+pub async fn collect_grpc_request_body(
+    req: Request<Incoming>,
+) -> Result<(hyper::Method, hyper::HeaderMap, Bytes), GrpcProxyError> {
+    let (parts, body) = req.into_parts();
+    let body_bytes = BodyExt::collect(body)
+        .await
+        .map_err(|e| GrpcProxyError::Internal(format!("Failed to read request body: {}", e)))?
+        .to_bytes();
+    Ok((parts.method, parts.headers, body_bytes))
+}
+
 /// Core gRPC proxy logic shared by initial requests and retries.
 ///
 /// When `stream_response` is true, returns `GrpcResponseKind::Streaming` with
 /// the live `Incoming` body instead of buffering the full response. The caller
 /// is responsible for ensuring this is only used when retries are not needed.
 #[allow(clippy::too_many_arguments)]
-async fn proxy_grpc_request_core(
+pub(crate) async fn proxy_grpc_request_core(
     method: hyper::Method,
     mut headers: hyper::HeaderMap,
     body_bytes: Bytes,

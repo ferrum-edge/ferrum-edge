@@ -241,7 +241,7 @@ Plugins execute in priority order (lower number = runs first). The lifecycle pha
 2. `authenticate` — mTLS auth (950), JWKS auth (1000), JWT auth (1100), key auth (1200), basic auth (1300), HMAC auth (1400)
 3. `authorize` — Access control / ACL (2000), TCP connection throttle (2050). Supports `allow_authenticated_identity` for external JWKS/OIDC identities without consumer mapping
 4. `before_proxy` — Request size limiting (2800), GraphQL (2850), rate limiting (2900), AI prompt shield (2925), body validator (2950), AI request guard (2975), request transformer (3000), serverless function (3025), gRPC deadline (3050)
-5. `on_final_request_body` — Post-transform request body validation. Request size limiting re-checks after request_transformer rewrites
+5. `on_final_request_body` — Post-transform request body validation. Request size limiting re-checks after request_transformer rewrites. Body validator validates gRPC protobuf requests against descriptors and re-checks JSON/XML after request_transformer rewrites
 6. `after_proxy` — Response size limiting (3490), response caching (3500), response transformer (4000), CORS headers (100). Rejects are now enforced on the response path across HTTP, HTTP/3, and gRPC
 7. `on_final_response_body` — Post-transform response body hooks. Response size limiting, response caching, and response-side body validator operate on the final client-visible body (after response_transformer), not the raw backend body
 8. `on_response_body` — AI token metrics (4100), AI rate limiter (4200)
