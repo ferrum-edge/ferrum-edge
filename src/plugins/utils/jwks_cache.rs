@@ -13,7 +13,7 @@ use std::time::Duration;
 use tracing::info;
 
 use super::jwks_store::JwksKeyStore;
-use super::utils::PluginHttpClient;
+use super::PluginHttpClient;
 
 /// Global, process-wide cache of JWKS key stores keyed by `jwks_uri`.
 static JWKS_CACHE: OnceLock<Arc<DashMap<String, Arc<JwksKeyStore>>>> = OnceLock::new();

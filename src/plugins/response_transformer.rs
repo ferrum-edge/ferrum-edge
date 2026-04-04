@@ -10,7 +10,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use tracing::debug;
 
-use super::body_transform::{self, BodyRule};
+use super::utils::body_transform::{self, BodyRule};
 use super::{Plugin, PluginResult, RequestContext};
 
 #[derive(Debug, Clone)]

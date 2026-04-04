@@ -10,8 +10,8 @@ use url::Url;
 
 use crate::consumer_index::ConsumerIndex;
 
-use super::jwks_cache::get_or_create_jwks_store;
-use super::jwks_store::JwksKeyStore;
+use super::utils::jwks_cache::get_or_create_jwks_store;
+use super::utils::jwks_store::JwksKeyStore;
 use super::utils::PluginHttpClient;
 use super::{Plugin, PluginResult, RequestContext};
 
