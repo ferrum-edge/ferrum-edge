@@ -4444,13 +4444,14 @@ pub async fn handle_proxy_request(
             final_cb_target_key.as_deref(),
             cb_config,
         );
-        let is_cb_failure = if backend_resp.connection_error {
-            cb.config().trip_on_connection_errors
-        } else {
-            cb.config().failure_status_codes.contains(&response_status)
-        };
-        if is_cb_failure {
-            cb.record_failure(response_status, backend_resp.connection_error);
+        if backend_resp.connection_error {
+            // Connection errors are controlled by trip_on_connection_errors.
+            // When disabled, connection errors are neutral — no state mutation.
+            if cb.config().trip_on_connection_errors {
+                cb.record_failure(response_status, true);
+            }
+        } else if cb.config().failure_status_codes.contains(&response_status) {
+            cb.record_failure(response_status, false);
         } else {
             cb.record_success();
         }

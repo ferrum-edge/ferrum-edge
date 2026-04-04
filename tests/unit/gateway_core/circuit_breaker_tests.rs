@@ -657,6 +657,40 @@ fn test_connection_error_ignored_in_half_open_when_disabled() {
     assert_eq!(cb.state_name(), "open");
 }
 
+/// Connection errors with trip_on_connection_errors=false must be neutral —
+/// they must NOT reset the accumulated failure count (i.e., not call record_success).
+#[test]
+fn test_connection_errors_disabled_do_not_reset_failure_count() {
+    let config = CircuitBreakerConfig {
+        failure_threshold: 3,
+        success_threshold: 1,
+        timeout_seconds: 60,
+        failure_status_codes: vec![500],
+        half_open_max_requests: 1,
+        trip_on_connection_errors: false,
+    };
+    let cb = CircuitBreaker::new(config);
+
+    // Accumulate 2 real failures
+    cb.record_failure(500, false);
+    cb.record_failure(500, false);
+    assert_eq!(cb.state_name(), "closed"); // threshold is 3
+
+    // A connection error with trip_on_connection_errors=false should be neutral.
+    // If it were incorrectly treated as a success, the failure count would reset
+    // and the next failure wouldn't trip the breaker.
+    cb.record_failure(502, true);
+    assert_eq!(cb.state_name(), "closed"); // still 2 failures, neutral
+
+    // One more real failure should now trip the breaker (2 + 1 = 3 = threshold)
+    cb.record_failure(500, false);
+    assert_eq!(
+        cb.state_name(),
+        "open",
+        "Ignored connection error must not have reset the failure counter"
+    );
+}
+
 /// Default config has trip_on_connection_errors = true.
 #[test]
 fn test_default_config_has_trip_on_connection_errors_true() {
