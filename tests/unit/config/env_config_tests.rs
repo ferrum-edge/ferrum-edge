@@ -425,7 +425,7 @@ fn test_env_config_request_limits_defaults() {
             assert_eq!(config.max_header_count, 100);
             assert_eq!(config.max_url_length_bytes, 8_192);
             assert_eq!(config.max_query_params, 100);
-            assert_eq!(config.max_grpc_message_size_bytes, 4_194_304);
+            assert_eq!(config.max_grpc_recv_size_bytes, 4_194_304);
             assert_eq!(config.max_websocket_frame_size_bytes, 16_777_216);
         },
     );
@@ -890,34 +890,34 @@ fn test_env_config_max_query_params_custom() {
 }
 
 #[test]
-fn test_env_config_max_grpc_message_size_bytes_default() {
+fn test_env_config_max_grpc_recv_size_bytes_default() {
     with_env_vars(
         &[
             ("FERRUM_MODE", "file"),
             ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
         ],
         || {
-            remove_var("FERRUM_MAX_GRPC_MESSAGE_SIZE_BYTES");
+            remove_var("FERRUM_MAX_GRPC_RECV_SIZE_BYTES");
             let config = EnvConfig::from_env().unwrap();
             assert_eq!(
-                config.max_grpc_message_size_bytes, 4_194_304,
-                "max_grpc_message_size_bytes should default to 4MB"
+                config.max_grpc_recv_size_bytes, 4_194_304,
+                "max_grpc_recv_size_bytes should default to 4MB"
             );
         },
     );
 }
 
 #[test]
-fn test_env_config_max_grpc_message_size_bytes_custom() {
+fn test_env_config_max_grpc_recv_size_bytes_custom() {
     with_env_vars(
         &[
             ("FERRUM_MODE", "file"),
             ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
-            ("FERRUM_MAX_GRPC_MESSAGE_SIZE_BYTES", "8388608"),
+            ("FERRUM_MAX_GRPC_RECV_SIZE_BYTES", "8388608"),
         ],
         || {
             let config = EnvConfig::from_env().unwrap();
-            assert_eq!(config.max_grpc_message_size_bytes, 8_388_608);
+            assert_eq!(config.max_grpc_recv_size_bytes, 8_388_608);
         },
     );
 }

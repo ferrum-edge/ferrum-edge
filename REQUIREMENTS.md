@@ -118,7 +118,7 @@ All operational parameters MUST be configurable via environment variables.
     *   `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES`: (Integer bytes, `0` for unlimited) - Default: `10485760` (10 MiB).
     *   `FERRUM_MAX_URL_LENGTH_BYTES`: (Integer bytes, `0` for unlimited) - Default: `8192` (8 KiB).
     *   `FERRUM_MAX_QUERY_PARAMS`: (Integer, `0` for unlimited) - Default: `100`.
-    *   `FERRUM_MAX_GRPC_MESSAGE_SIZE_BYTES`: (Integer bytes, `0` for unlimited) - Default: `4194304` (4 MiB).
+    *   `FERRUM_MAX_GRPC_RECV_SIZE_BYTES`: (Integer bytes, `0` for unlimited) - Default: `4194304` (4 MiB). Limits total received gRPC payload; for streaming RPCs this caps cumulative body size.
     *   `FERRUM_MAX_WEBSOCKET_FRAME_SIZE_BYTES`: (Integer bytes) - Default: `16777216` (16 MiB). Also sets max message size to 4x frame size.
 *   **Client IP Resolution:**
     *   `FERRUM_TRUSTED_PROXIES`: (Comma-separated CIDRs/IPs, e.g., `10.0.0.0/8,172.16.0.0/12`) - Default: empty (XFF headers ignored; socket IP used).

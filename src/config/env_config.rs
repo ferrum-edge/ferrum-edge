@@ -210,8 +210,10 @@ pub struct EnvConfig {
     pub max_url_length_bytes: usize,
     /// Maximum number of query parameters allowed. 0 = unlimited.
     pub max_query_params: usize,
-    /// Maximum gRPC message size in bytes (applies to both send and receive). 0 = unlimited.
-    pub max_grpc_message_size_bytes: usize,
+    /// Maximum total received gRPC payload size in bytes. For unary RPCs this is
+    /// effectively a per-message limit (plus 5 bytes of gRPC framing). For streaming
+    /// RPCs this caps the cumulative body size across all messages. 0 = unlimited.
+    pub max_grpc_recv_size_bytes: usize,
     /// Maximum WebSocket frame size in bytes. Applied to both client and backend connections.
     pub max_websocket_frame_size_bytes: usize,
 
@@ -471,7 +473,7 @@ impl Default for EnvConfig {
             max_response_body_size_bytes: 10_485_760,
             max_url_length_bytes: 8_192,
             max_query_params: 100,
-            max_grpc_message_size_bytes: 4_194_304,
+            max_grpc_recv_size_bytes: 4_194_304,
             max_websocket_frame_size_bytes: 16_777_216,
             dns_cache_ttl_seconds: 300,
             dns_overrides: HashMap::new(),
@@ -666,9 +668,9 @@ impl EnvConfig {
             ),
             max_url_length_bytes: resolve_usize(conf, "FERRUM_MAX_URL_LENGTH_BYTES", 8_192),
             max_query_params: resolve_usize(conf, "FERRUM_MAX_QUERY_PARAMS", 100),
-            max_grpc_message_size_bytes: resolve_usize(
+            max_grpc_recv_size_bytes: resolve_usize(
                 conf,
-                "FERRUM_MAX_GRPC_MESSAGE_SIZE_BYTES",
+                "FERRUM_MAX_GRPC_RECV_SIZE_BYTES",
                 4_194_304,
             ),
             max_websocket_frame_size_bytes: resolve_usize(

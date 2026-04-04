@@ -615,7 +615,7 @@ Reduce per-request allocations in plugin lookup
 | `FERRUM_MAX_HEADER_COUNT` | `100` | Max number of request headers allowed. `0` = unlimited |
 | `FERRUM_MAX_URL_LENGTH_BYTES` | `8192` | Max URL length in bytes (path + query string). `0` = unlimited |
 | `FERRUM_MAX_QUERY_PARAMS` | `100` | Max number of query parameters allowed. `0` = unlimited |
-| `FERRUM_MAX_GRPC_MESSAGE_SIZE_BYTES` | `4194304` | Max gRPC message size in bytes (4 MiB). `0` = unlimited |
+| `FERRUM_MAX_GRPC_RECV_SIZE_BYTES` | `4194304` | Max total received gRPC payload size in bytes (4 MiB). `0` = unlimited |
 | `FERRUM_MAX_WEBSOCKET_FRAME_SIZE_BYTES` | `16777216` | Max WebSocket frame size in bytes (16 MiB). Also sets max message size to 4x frame size |
 
 See `src/config/env_config.rs` for the full list of 90+ environment variables.

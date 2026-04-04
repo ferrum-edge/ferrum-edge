@@ -685,13 +685,13 @@ pub async fn proxy_grpc_request(
     dns_cache: &DnsCache,
     proxy_headers: &HashMap<String, String>,
     stream_response: bool,
-    max_grpc_message_size_bytes: usize,
+    max_grpc_recv_size_bytes: usize,
 ) -> (Result<GrpcResponseKind, GrpcProxyError>, Bytes) {
     // Collect the incoming body for potential retry replay
     let (parts, body) = req.into_parts();
-    let body_bytes = if max_grpc_message_size_bytes > 0 {
-        // Use http_body_util::Limited to enforce max gRPC message size during collection
-        let limited = http_body_util::Limited::new(body, max_grpc_message_size_bytes);
+    let body_bytes = if max_grpc_recv_size_bytes > 0 {
+        // Use http_body_util::Limited to enforce max gRPC recv size during body collection
+        let limited = http_body_util::Limited::new(body, max_grpc_recv_size_bytes);
         match BodyExt::collect(limited).await {
             Ok(collected) => collected.to_bytes(),
             Err(e) => {
@@ -699,8 +699,8 @@ pub async fn proxy_grpc_request(
                 if err_str.contains("length limit exceeded") {
                     return (
                         Err(GrpcProxyError::ResourceExhausted(format!(
-                            "gRPC message size exceeds maximum of {} bytes",
-                            max_grpc_message_size_bytes
+                            "gRPC request payload size exceeds maximum of {} bytes",
+                            max_grpc_recv_size_bytes
                         ))),
                         Bytes::new(),
                     );

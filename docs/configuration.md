@@ -91,7 +91,7 @@ See [cp_dp_mode.md](cp_dp_mode.md) for CP/DP TLS environment variables (`FERRUM_
 | `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES` | No | `10485760` | Maximum response body size from backends (0=unlimited) |
 | `FERRUM_MAX_URL_LENGTH_BYTES` | No | `8192` | Maximum URL length in bytes (path + query string, 0=unlimited) |
 | `FERRUM_MAX_QUERY_PARAMS` | No | `100` | Maximum number of query parameters allowed (0=unlimited) |
-| `FERRUM_MAX_GRPC_MESSAGE_SIZE_BYTES` | No | `4194304` | Maximum gRPC message size in bytes (0=unlimited) |
+| `FERRUM_MAX_GRPC_RECV_SIZE_BYTES` | No | `4194304` | Maximum total received gRPC payload size in bytes (0=unlimited) |
 | `FERRUM_MAX_WEBSOCKET_FRAME_SIZE_BYTES` | No | `16777216` | Maximum WebSocket frame size in bytes; max message size = 4x frame size |
 
 See [size_limits.md](size_limits.md) for detailed sizing guidance.

@@ -644,7 +644,7 @@ pub struct ProxyState {
     pub max_response_body_size_bytes: usize,
     pub max_url_length_bytes: usize,
     pub max_query_params: usize,
-    pub max_grpc_message_size_bytes: usize,
+    pub max_grpc_recv_size_bytes: usize,
     pub max_websocket_frame_size_bytes: usize,
     /// Parsed trusted proxy CIDRs for X-Forwarded-For client IP resolution.
     /// Pre-parsed from `env_config.trusted_proxies` to avoid re-parsing on every request.
@@ -684,7 +684,7 @@ impl ProxyState {
         let max_response_body_size_bytes = env_config.max_response_body_size_bytes;
         let max_url_length_bytes = env_config.max_url_length_bytes;
         let max_query_params = env_config.max_query_params;
-        let max_grpc_message_size_bytes = env_config.max_grpc_message_size_bytes;
+        let max_grpc_recv_size_bytes = env_config.max_grpc_recv_size_bytes;
         let max_websocket_frame_size_bytes = env_config.max_websocket_frame_size_bytes;
         let trusted_proxies = Arc::new(client_ip::TrustedProxies::parse(
             &env_config.trusted_proxies,
@@ -813,7 +813,7 @@ impl ProxyState {
             max_response_body_size_bytes,
             max_url_length_bytes,
             max_query_params,
-            max_grpc_message_size_bytes,
+            max_grpc_recv_size_bytes,
             max_websocket_frame_size_bytes,
             trusted_proxies,
             websocket_conn_limit,
@@ -3765,7 +3765,7 @@ pub async fn handle_proxy_request(
             &state.dns_cache,
             proxy_headers,
             grpc_should_stream,
-            state.max_grpc_message_size_bytes,
+            state.max_grpc_recv_size_bytes,
         )
         .await;
 
