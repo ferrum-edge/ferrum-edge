@@ -60,13 +60,22 @@ fn main() {
         std::process::exit(1);
     }
 
-    // Initialize tracing/logging
+    // Initialize tracing/logging with a non-blocking writer. The default
+    // tracing-subscriber fmt layer writes synchronously to stdout, acquiring a
+    // mutex lock on every log event. Under high concurrency this creates
+    // contention across tokio worker threads. `tracing_appender::non_blocking`
+    // sends events through a channel to a dedicated writer thread, making the
+    // hot-path log call a fast channel send instead of a blocking I/O write.
+    // The `_guard` must be held until shutdown to keep the writer thread alive
+    // and flush remaining events on drop.
+    let (non_blocking, _guard) = tracing_appender::non_blocking(std::io::stdout());
     let log_level = std::env::var("FERRUM_LOG_LEVEL").unwrap_or_else(|_| "error".into());
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&log_level)),
         )
         .json()
+        .with_writer(non_blocking)
         .init();
 
     info!("Ferrum Edge v{} starting...", env!("CARGO_PKG_VERSION"));
