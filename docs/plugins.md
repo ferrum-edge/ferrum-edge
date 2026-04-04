@@ -43,7 +43,7 @@ These headers are injected on all proxy paths (HTTP, gRPC, and WebSocket).
 
 ### `stdout_logging`
 
-Logs a JSON transaction summary to stdout for each request.
+Logs a JSON transaction summary to stdout for each request via `tracing::info!` on the `access_log` target. Output flows through the non-blocking writer, so logging never blocks request-processing threads.
 
 **Priority:** 9000
 **Config**: None required.
@@ -459,7 +459,7 @@ UDP sessions are logged when the session is cleaned up after idle timeout.
 
 ### `transaction_debugger`
 
-Logs verbose request/response details to stdout. Sensitive headers are automatically redacted. Enable per-proxy only for debugging.
+Emits verbose request/response diagnostics via `tracing::debug!` on the `transaction_debug` target. All output flows through the non-blocking writer, avoiding synchronous stdout mutex contention. Sensitive headers are automatically redacted. Enable per-proxy only for debugging — not recommended for production due to information disclosure risk. Requires `FERRUM_LOG_LEVEL=debug` (or `RUST_LOG=transaction_debug=debug`) to see output.
 
 **Priority:** 9200
 

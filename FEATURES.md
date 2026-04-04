@@ -116,7 +116,7 @@ Ferrum supports dynamic upstream target discovery through three providers, confi
 
 - **Stdout Logging** — JSON transaction summaries
 - **HTTP Logging** — batched delivery to external endpoints with retry
-- **Transaction Debugger** — verbose request/response logging with header redaction
+- **Transaction Debugger** — verbose request/response diagnostics via `tracing::debug` with header redaction (development only)
 - **Correlation ID** — UUID generation and propagation
 - **Prometheus Metrics** — exposition format endpoint
 - **OpenTelemetry Tracing** — W3C Trace Context propagation + OTLP/HTTP span export with batching, custom headers, rich semantic attributes, and propagation-only mode

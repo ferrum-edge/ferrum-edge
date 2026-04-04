@@ -2593,7 +2593,7 @@ components:
 
     TransactionDebuggerConfig:
       type: object
-      description: "Plugin: transaction_debugger — Logs verbose request/response details to stdout."
+      description: "Plugin: transaction_debugger — Emits verbose request/response diagnostics via tracing::debug on the transaction_debug target. Requires FERRUM_LOG_LEVEL=debug to see output."
       properties:
         log_request_body:
           type: boolean

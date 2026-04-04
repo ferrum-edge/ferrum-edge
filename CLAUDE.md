@@ -86,7 +86,7 @@ All four jobs must pass for a PR to merge.
 
 1. **jemalloc** — Global allocator on non-Windows (reduces fragmentation under high concurrency)
 2. **rustls crypto provider** — Install ring as the TLS backend (must be first)
-3. **Logging** — JSON structured logging via `tracing-subscriber`
+3. **Logging** — JSON structured logging via `tracing-subscriber` with a non-blocking stdout writer (`tracing-appender`). Buffer capacity is tunable via `FERRUM_LOG_BUFFER_CAPACITY`
 4. **Secret resolution** — Single-threaded tokio runtime resolves `FERRUM_*_SECRET_*` env vars from Vault/AWS/Azure/GCP/file backends. Uses single-threaded runtime because `std::env::set_var` is unsafe with concurrent threads
 5. **EnvConfig parsing** — 90+ env vars parsed into `EnvConfig` (now includes resolved secrets)
 6. **Multi-threaded runtime** — tokio `new_multi_thread()` with configurable worker/blocking threads
@@ -290,7 +290,7 @@ Plugins execute in priority order (lower number = runs first). The lifecycle pha
 6. `after_proxy` — Response size limiting (3490), response caching (3500), response transformer (4000), CORS headers (100). Rejects are now enforced on the response path across HTTP, HTTP/3, and gRPC
 7. `on_final_response_body` — Post-transform response body hooks. Response size limiting, response caching, and response-side body validator operate on the final client-visible body (after response_transformer), not the raw backend body
 8. `on_response_body` — AI token metrics (4100), AI rate limiter (4200)
-9. `log` — Stdout logging (9000), HTTP logging (9100), transaction debugger (9200), Prometheus (9300), OTel tracing (25)
+9. `log` — Stdout logging (9000), HTTP logging (9100), transaction debugger (9200, `tracing::debug` on `transaction_debug` target), Prometheus (9300), OTel tracing (25)
 10. `on_ws_frame` — WebSocket frame-level hooks: ws_message_size_limiting (2810), ws_rate_limiting (2910), ws_frame_logging (9050)
 11. `on_stream_connect` / `on_stream_disconnect` — TCP/UDP stream lifecycle hooks for auth (mTLS), authz (ACL), throttling (tcp_connection_throttle), rate limiting, logging, metrics, and tracing plugins. For TCP+TLS proxies, `on_stream_connect` runs after the frontend TLS handshake so client cert data is available. For UDP+DTLS proxies, `on_stream_connect` runs after the DTLS handshake completes, with client certificate DER bytes available in `StreamConnectionContext` for mTLS authentication
 12. `on_udp_datagram` — Per-datagram UDP hooks fired in both directions (client→backend and backend→client). `UdpDatagramContext.direction` distinguishes the two. udp_rate_limiting (2910) uses this for datagram/byte rate limiting. Zero overhead when no plugin opts in via `requires_udp_datagram_hooks()`. Backend→client hooks run before each response datagram is relayed to the client, enabling response-side rate limiting and filtering
@@ -602,6 +602,7 @@ Reduce per-request allocations in plugin lookup
 |----------|---------|-------------|
 | `FERRUM_MODE` | (required) | `database`, `file`, `cp`, `dp`, `migrate` |
 | `FERRUM_LOG_LEVEL` | `error` | `error`, `warn`, `info`, `debug`, `trace` |
+| `FERRUM_LOG_BUFFER_CAPACITY` | `128000` | Max buffered log lines in the non-blocking writer channel. When full, new events are dropped (lossy) to avoid backpressure |
 | `FERRUM_PROXY_HTTP_PORT` | `8000` | Proxy HTTP listen port |
 | `FERRUM_PROXY_HTTPS_PORT` | `8443` | Proxy HTTPS listen port |
 | `FERRUM_PROXY_BIND_ADDRESS` | `0.0.0.0` | Bind address for proxy listeners. Set to `::` for dual-stack IPv4+IPv6 |

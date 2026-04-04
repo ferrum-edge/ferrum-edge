@@ -98,8 +98,8 @@ src/
 │   ├── request_transformer.rs # Header/query modification
 │   ├── response_caching.rs    # Response caching
 │   ├── response_transformer.rs # Response header modification
-│   ├── stdout_logging.rs      # JSON transaction logging
-│   ├── transaction_debugger.rs # Verbose request/response debugging
+│   ├── stdout_logging.rs      # JSON transaction logging (tracing::info on access_log target)
+│   ├── transaction_debugger.rs # Verbose request/response diagnostics (tracing::debug on transaction_debug target)
 │   └── utils/                 # Plugin utilities
 │       ├── mod.rs
 │       └── http_client.rs     # Shared HTTP client for plugin outbound calls
