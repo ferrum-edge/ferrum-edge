@@ -12,6 +12,7 @@
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::fmt;
 use std::io::{Read, Write};
 use tracing::{debug, warn};
 
@@ -21,6 +22,12 @@ use super::{Plugin, PluginResult, RequestContext};
 enum Algorithm {
     Gzip,
     Brotli,
+}
+
+impl fmt::Display for Algorithm {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.content_encoding())
+    }
 }
 
 impl Algorithm {

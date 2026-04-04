@@ -457,8 +457,8 @@ pub mod priority {
     pub const RESPONSE_SIZE_LIMITING: u16 = 3490;
     pub const RESPONSE_CACHING: u16 = 3500;
     pub const RESPONSE_TRANSFORMER: u16 = 4000;
-    pub const AI_TOKEN_METRICS: u16 = 4100;
     pub const COMPRESSION: u16 = 4050;
+    pub const AI_TOKEN_METRICS: u16 = 4100;
     pub const AI_RATE_LIMITER: u16 = 4200;
     pub const STDOUT_LOGGING: u16 = 9000;
     pub const HTTP_LOGGING: u16 = 9100;
