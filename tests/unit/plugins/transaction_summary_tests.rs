@@ -29,6 +29,7 @@ fn make_full_summary() -> TransactionSummary {
         response_streamed: false,
         client_disconnected: false,
         error_class: None,
+        mirror: false,
         metadata: HashMap::new(),
     }
 }

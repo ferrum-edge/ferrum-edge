@@ -1016,12 +1016,11 @@ async fn handle_h3_request(
             response_streamed: true,
             client_disconnected: false,
             error_class: h3_error_class,
+            mirror: false,
             metadata: ctx.metadata.clone(),
         };
 
-        for plugin in plugins.iter() {
-            plugin.log(&summary).await;
-        }
+        crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
 
         record_request(&state, response_status);
     } else {
@@ -1193,12 +1192,11 @@ async fn handle_h3_request(
             response_streamed: false,
             client_disconnected: false,
             error_class: h3_error_class,
+            mirror: false,
             metadata: ctx.metadata.clone(),
         };
 
-        for plugin in plugins.iter() {
-            plugin.log(&summary).await;
-        }
+        crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
 
         record_request(&state, response_status);
 

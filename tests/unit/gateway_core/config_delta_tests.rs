@@ -107,6 +107,7 @@ fn make_consumer(id: &str, username: &str, updated_at: DateTime<Utc>) -> Consume
         username: username.to_string(),
         custom_id: None,
         credentials: HashMap::new(),
+        acl_groups: Vec::new(),
         created_at: updated_at,
         updated_at,
     }

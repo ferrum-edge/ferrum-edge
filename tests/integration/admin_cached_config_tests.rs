@@ -129,6 +129,7 @@ fn create_test_gateway_config() -> GatewayConfig {
             username: "alice".to_string(),
             custom_id: Some("alice-custom".to_string()),
             credentials: HashMap::new(),
+            acl_groups: Vec::new(),
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }],
@@ -812,6 +813,7 @@ fn create_pagination_test_config() -> GatewayConfig {
             username: format!("user-{}", i),
             custom_id: None,
             credentials: HashMap::new(),
+            acl_groups: Vec::new(),
             created_at: Utc::now(),
             updated_at: Utc::now(),
         });

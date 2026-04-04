@@ -121,6 +121,10 @@ The test follows a specific ordering to satisfy database foreign key constraints
 
 ### Access Control (ACL) Tests (Tests 22-27)
 
+The `access_control` plugin supports both consumer-username and group-based rules.
+Consumers declare group membership via the `acl_groups` field; the plugin checks
+`allowed_groups` / `disallowed_groups` against those groups. Deny always wins over allow.
+
 | # | Test | ACL Config | Consumer | Expected |
 |---|------|-----------|----------|----------|
 | 22 | Allow list — allowed | `allowed_consumers: [alice, bob]` | alice | 200 OK |
@@ -129,6 +133,17 @@ The test follows a specific ordering to satisfy database foreign key constraints
 | 25 | Deny list — allowed | `disallowed_consumers: [charlie]` | alice | 200 OK |
 | 26 | Deny list — blocked | `disallowed_consumers: [charlie]` | charlie | 403 |
 | 27 | Deny list — allowed | `disallowed_consumers: [charlie]` | bob | 200 OK |
+
+#### Group-based ACL (unit-tested)
+
+| Scenario | ACL Config | Consumer `acl_groups` | Expected |
+|----------|-----------|----------------------|----------|
+| Group allow — match | `allowed_groups: [engineering]` | `[engineering]` | 200 OK |
+| Group allow — no match | `allowed_groups: [engineering]` | `[marketing]` | 403 |
+| Group deny — match | `disallowed_groups: [banned]` | `[engineering, banned]` | 403 |
+| Group deny — no match | `disallowed_groups: [banned]` | `[engineering]` | 200 OK |
+| Group deny beats username allow | `allowed_consumers: [alice], disallowed_groups: [banned]` | alice, `[banned]` | 403 |
+| Group allow + username allow (OR) | `allowed_consumers: [admin], allowed_groups: [engineering]` | alice, `[engineering]` | 200 OK |
 
 ### Multi-Auth Mode Tests (Tests 28-32)
 

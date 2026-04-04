@@ -1,6 +1,6 @@
 # Plugin Reference
 
-Ferrum Edge includes 38 built-in plugins organized into lifecycle phases. Each plugin executes at a specific priority (lower number = runs first).
+Ferrum Edge includes 39 built-in plugins organized into lifecycle phases. Each plugin executes at a specific priority (lower number = runs first).
 
 For execution order, protocol support matrix, and design rationale, see [plugin_execution_order.md](plugin_execution_order.md).
 
@@ -678,8 +678,11 @@ credentials:
 
 ### `access_control`
 
-Authorizes requests based on the authenticated caller. By default it checks the
-identified consumer's username. Optionally it can also allow externally
+Authorizes requests based on the authenticated caller. Checks the identified
+consumer's username and/or their `acl_groups` membership. Groups let you map a
+single consumer into access across multiple proxies — assign the consumer to an
+ACL group once and reference the group in each proxy's plugin config instead of
+listing every username individually. Optionally it can also allow externally
 authenticated identities (for example `jwks_auth` users without a mapped
 gateway Consumer). On TCP stream proxies, it uses the consumer already placed
 in the stream context by an earlier auth plugin such as [`mtls_auth`](#mtls_auth).
@@ -688,9 +691,18 @@ in the stream context by an earlier auth plugin such as [`mtls_auth`](#mtls_auth
 
 | Parameter | Type | Description |
 |---|---|---|
-| `allowed_consumers` | String[] | Usernames allowed access (empty = allow all) |
+| `allowed_consumers` | String[] | Usernames allowed access (empty = no username-level allow rule) |
 | `disallowed_consumers` | String[] | Usernames explicitly denied |
+| `allowed_groups` | String[] | ACL group names allowed access — matches against the consumer's `acl_groups` list (empty = no group-level allow rule) |
+| `disallowed_groups` | String[] | ACL group names explicitly denied — matches against the consumer's `acl_groups` list |
 | `allow_authenticated_identity` | bool | Allows requests with `ctx.authenticated_identity` set even when no Consumer was mapped |
+
+At least one of the above must be configured (non-empty list or `allow_authenticated_identity: true`).
+
+**Evaluation order:** deny (consumer username → group) → allow (consumer username → group).
+If both `allowed_consumers` and `allowed_groups` are set, matching _either_ grants access.
+Deny always takes precedence — a consumer whose username is in `allowed_consumers` is still
+rejected if any of their groups appear in `disallowed_groups`.
 
 Use [`ip_restriction`](#ip_restriction) for IP address or CIDR-based enforcement.
 
@@ -1261,6 +1273,34 @@ config:
   max_deadline_ms: 30000
   default_deadline_ms: 5000
   subtract_gateway_processing: true
+```
+
+### `request_mirror`
+
+Duplicates live proxy traffic to a secondary destination for shadow testing, validation, or migration checks without affecting client responses. The mirror request is fire-and-forget — the gateway spawns an async task and proceeds with the real backend call immediately.
+
+**Priority:** 3075
+**Protocols:** HTTP, gRPC
+
+Mirror response metadata (status code, response size, latency) is logged as a separate `TransactionSummary` entry with `mirror: true`, flowing through all logging plugins (stdout, http_logging, prometheus, transaction_debugger). The mirror request uses the proxy's `backend_read_timeout_ms` and the gateway's shared DNS cache and connection pool.
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `mirror_host` | String | **(required)** | Hostname or IP of the mirror target |
+| `mirror_port` | Integer | 80/443 | Port of the mirror target (default based on protocol) |
+| `mirror_protocol` | String | `"http"` | `"http"` or `"https"` |
+| `mirror_path` | String | _(none)_ | Override the request path for the mirror. When unset, uses the original request path |
+| `percentage` | Float | `100.0` | Percentage of requests to mirror (0.0–100.0) |
+| `mirror_request_body` | Boolean | `true` | Whether to include the request body in the mirror request |
+
+```yaml
+plugin_name: request_mirror
+config:
+  mirror_host: shadow.internal
+  mirror_port: 8443
+  mirror_protocol: https
+  percentage: 50.0
+  mirror_request_body: true
 ```
 
 ---

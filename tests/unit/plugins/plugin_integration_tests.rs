@@ -220,6 +220,7 @@ async fn test_all_plugins_available() {
         "ws_rate_limiting",
         "udp_rate_limiting",
         "serverless_function",
+        "request_mirror",
     ]
     .into_iter()
     .collect();
@@ -252,6 +253,7 @@ async fn test_plugin_creation_all_plugins() {
             "serverless_function" => {
                 json!({"provider": "azure_functions", "function_url": "https://example.com/func"})
             }
+            "request_mirror" => json!({"mirror_host": "mirror.local"}),
             _ => json!({}),
         };
         let plugin = create_plugin(plugin_name, &config);

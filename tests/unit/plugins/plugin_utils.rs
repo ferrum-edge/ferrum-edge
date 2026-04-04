@@ -32,6 +32,7 @@ pub fn create_test_consumer() -> Consumer {
         username: "testuser".to_string(),
         custom_id: Some("custom-123".to_string()),
         credentials,
+        acl_groups: Vec::new(),
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }
@@ -135,6 +136,7 @@ pub fn create_test_transaction_summary() -> ferrum_edge::plugins::TransactionSum
         response_streamed: false,
         client_disconnected: false,
         error_class: None,
+        mirror: false,
         metadata: HashMap::new(),
     }
 }

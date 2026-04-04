@@ -1,4 +1,4 @@
-//! Plugin system — 38 built-in plugins with a trait-based architecture.
+//! Plugin system — 39 built-in plugins with a trait-based architecture.
 //!
 //! Plugins execute in priority order (lower number = runs first) through
 //! lifecycle phases: `on_request_received` → `authenticate` → `authorize` →
@@ -38,6 +38,7 @@ pub mod mtls_auth;
 pub mod otel_tracing;
 pub mod prometheus_metrics;
 pub mod rate_limiting;
+pub mod request_mirror;
 pub mod request_size_limiting;
 pub mod request_termination;
 pub mod request_transformer;
@@ -209,6 +210,10 @@ pub struct RequestContext {
     /// (via `PluginHttpClient::execute_tracked`). Shared across all plugin
     /// invocations for this request — clone-safe via Arc.
     pub plugin_http_call_ns: Arc<std::sync::atomic::AtomicU64>,
+    /// Receiver for mirror response metadata from the `request_mirror` plugin.
+    /// Set by the plugin in `before_proxy`; collected before building
+    /// `TransactionSummary` so all logging plugins receive mirror results.
+    pub mirror_result_rx: Option<tokio::sync::watch::Receiver<Option<MirrorResponseMeta>>>,
 }
 
 impl RequestContext {
@@ -228,6 +233,25 @@ impl RequestContext {
             tls_client_cert_der: None,
             tls_client_cert_chain_der: None,
             plugin_http_call_ns: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            mirror_result_rx: None,
+        }
+    }
+
+    /// Collect mirror response metadata from the `request_mirror` plugin.
+    ///
+    /// Returns `Some(meta)` if a mirror request was dispatched and completed
+    /// before the timeout. The 5-second timeout is a safety net — the mirror
+    /// task always completes within the proxy's `backend_read_timeout_ms`
+    /// (set via `reqwest::RequestBuilder::timeout`). Since this runs after
+    /// the response is sent to the client, the wait has zero impact on
+    /// client-facing latency.
+    pub async fn collect_mirror_result(&self) -> Option<MirrorResponseMeta> {
+        let rx = self.mirror_result_rx.as_ref()?;
+        let mut rx_clone = rx.clone();
+        match tokio::time::timeout(std::time::Duration::from_secs(5), rx_clone.changed()).await {
+            Ok(Ok(())) => rx_clone.borrow().clone(),
+            // Timeout or sender dropped — return whatever is currently available
+            _ => rx.borrow().clone(),
         }
     }
 
@@ -295,6 +319,27 @@ pub enum PluginResult {
     },
 }
 
+/// Mirror response metadata from the `request_mirror` plugin's spawned task.
+///
+/// Communicated via `tokio::sync::watch` channel from the spawned mirror task
+/// to the proxy handler, which builds a second `TransactionSummary` (with
+/// `mirror: true`) and logs it through the normal plugin pipeline.
+#[derive(Debug, Clone)]
+pub struct MirrorResponseMeta {
+    /// URL the mirror request was sent to.
+    pub mirror_target_url: String,
+    /// HTTP status code from the mirror target. `None` when the request failed
+    /// before a response was received (DNS, connect, timeout errors).
+    pub mirror_response_status_code: Option<u16>,
+    /// Response body size in bytes from the mirror target. Derived from
+    /// `content-length` header when present, otherwise from reading the body.
+    pub mirror_response_size_bytes: Option<u64>,
+    /// Wall-clock latency of the mirror request in milliseconds.
+    pub mirror_latency_ms: f64,
+    /// Human-readable error message when the mirror request failed.
+    pub mirror_error: Option<String>,
+}
+
 /// Transaction summary for logging plugins.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct TransactionSummary {
@@ -344,7 +389,70 @@ pub struct TransactionSummary {
     /// and normal HTTP error responses from the backend.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_class: Option<crate::retry::ErrorClass>,
+    /// True when this summary represents a mirror (shadow) request, not the
+    /// actual client-facing proxy traffic. Logged as a separate entry with the
+    /// same schema so existing log queries and dashboards work without changes.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub mirror: bool,
     pub metadata: HashMap<String, String>,
+}
+
+impl TransactionSummary {
+    /// Build a mirror transaction summary from this summary and a mirror result.
+    ///
+    /// Clones the original request context fields (client_ip, method, path, proxy,
+    /// consumer) and overlays the mirror response metadata (status, latency, target
+    /// URL). Response size and error details go into metadata since there are no
+    /// dedicated fields for them in the standard schema.
+    pub fn as_mirror_entry(&self, result: MirrorResponseMeta) -> Self {
+        let mut mirror = self.clone();
+        mirror.mirror = true;
+        mirror.backend_target_url = Some(result.mirror_target_url);
+        mirror.response_status_code = result.mirror_response_status_code.unwrap_or(0);
+        mirror.backend_resolved_ip = None;
+        mirror.latency_total_ms = result.mirror_latency_ms;
+        mirror.latency_backend_ttfb_ms = result.mirror_latency_ms;
+        mirror.latency_backend_total_ms = result.mirror_latency_ms;
+        mirror.latency_gateway_processing_ms = 0.0;
+        mirror.latency_plugin_execution_ms = 0.0;
+        mirror.latency_plugin_external_io_ms = 0.0;
+        mirror.latency_gateway_overhead_ms = 0.0;
+        mirror.response_streamed = false;
+        mirror.client_disconnected = false;
+        mirror.error_class = None;
+        if let Some(size) = result.mirror_response_size_bytes {
+            mirror
+                .metadata
+                .insert("response_size_bytes".to_string(), size.to_string());
+        }
+        if let Some(err) = result.mirror_error {
+            mirror.metadata.insert("mirror_error".to_string(), err);
+        }
+        mirror
+    }
+}
+
+/// Log a transaction summary through all logging plugins, then log a mirror
+/// summary if a mirror request was dispatched.
+///
+/// Mirror results are collected after the main summary is logged, giving the
+/// spawned mirror task maximum time to complete. The mirror entry uses the
+/// same `TransactionSummary` schema with `mirror: true` so existing log
+/// pipelines work without changes.
+pub async fn log_with_mirror(
+    plugins: &[Arc<dyn Plugin>],
+    summary: &TransactionSummary,
+    ctx: &RequestContext,
+) {
+    for plugin in plugins {
+        plugin.log(summary).await;
+    }
+    if let Some(mirror_result) = ctx.collect_mirror_result().await {
+        let mirror_summary = summary.as_mirror_entry(mirror_result);
+        for plugin in plugins {
+            plugin.log(&mirror_summary).await;
+        }
+    }
 }
 
 /// Context for stream proxy (TCP/UDP) plugin hooks.
@@ -425,7 +533,7 @@ pub struct StreamTransactionSummary {
 /// | Early     | 0–949       | Pre-routing, tracing, and preflight       | otel_tracing (25), correlation_id (50), cors (100), request_termination (125), ip_restriction (150), bot_detection (200), grpc_method_router (275) |
 /// | AuthN     | 950–1999    | Authentication / identity verification    | mtls_auth (950), jwks_auth (1000), jwt_auth (1100), key_auth (1200), basic_auth (1300), hmac_auth (1400) |
 /// | AuthZ     | 2000–2999   | Authorization and admission control       | access_control (2000), tcp_connection_throttle (2050), request_size_limiting (2800), graphql (2850), rate_limiting (2900), ai_prompt_shield (2925), body_validator (2950), ai_request_guard (2975) |
-/// | Transform | 3000–3999   | Request shaping and response buffering    | request_transformer (3000), grpc_deadline (3050), response_size_limiting (3490), response_caching (3500) |
+/// | Transform | 3000–3999   | Request shaping and response buffering    | request_transformer (3000), grpc_deadline (3050), request_mirror (3075), response_size_limiting (3490), response_caching (3500) |
 /// | Response  | 4000–4999   | Response transformation and AI accounting | response_transformer (4000), ai_token_metrics (4100), ai_rate_limiter (4200) |
 /// | Logging   | 9000–9999   | Observability and frame logging           | stdout_logging (9000), ws_frame_logging (9050), http_logging (9100), transaction_debugger (9200), prometheus_metrics (9300) |
 #[allow(dead_code)]
@@ -454,6 +562,7 @@ pub mod priority {
     pub const REQUEST_TRANSFORMER: u16 = 3000;
     pub const SERVERLESS_FUNCTION: u16 = 3025;
     pub const GRPC_DEADLINE: u16 = 3050;
+    pub const REQUEST_MIRROR: u16 = 3075;
     pub const RESPONSE_SIZE_LIMITING: u16 = 3490;
     pub const RESPONSE_CACHING: u16 = 3500;
     pub const RESPONSE_TRANSFORMER: u16 = 4000;
@@ -857,6 +966,10 @@ pub fn create_plugin_with_http_client(
             config,
             http_client.clone(),
         )))),
+        "request_mirror" => Ok(Some(Arc::new(request_mirror::RequestMirror::new(
+            config,
+            http_client.clone(),
+        )?))),
         "request_size_limiting" => Ok(Some(Arc::new(
             request_size_limiting::RequestSizeLimiting::new(config),
         ))),
@@ -975,6 +1088,7 @@ pub fn available_plugins() -> Vec<&'static str> {
         "ws_frame_logging",
         "ws_rate_limiting",
         "udp_rate_limiting",
+        "request_mirror",
     ];
     plugins.extend(crate::custom_plugins::custom_plugin_names());
     plugins

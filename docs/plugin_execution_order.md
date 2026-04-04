@@ -101,7 +101,7 @@ Body-aware `before_proxy` plugins such as `graphql`, request-side `body_validato
 |--------|:-------------------:|:----------------------:|----------|
 | `ip_restriction` | ✓ | | Rejects connections from denied IPs |
 | `mtls_auth` | ✓ | | Maps the client certificate to a Consumer on TCP+TLS or UDP+DTLS |
-| `access_control` | ✓ | | Applies consumer allow/deny rules once a stream Consumer exists |
+| `access_control` | ✓ | | Applies consumer and group allow/deny rules once a stream Consumer exists |
 | `tcp_connection_throttle` | ✓ | ✓ | Caps active TCP connections per Consumer, else per client IP |
 | `rate_limiting` | ✓ | | Consumer-aware rate limiting when a stream identity exists, else IP-based |
 | `correlation_id` | ✓ | | Assigns a UUID request ID to metadata |
@@ -212,7 +212,7 @@ Priority bands are spaced with gaps so future plugins can slot in without renumb
 | **Early** | 0–949 | Tracing, IDs, preflight, and request short-circuiting before auth | `otel_tracing` (25), `correlation_id` (50), `cors` (100), `request_termination` (125), `ip_restriction` (150), `bot_detection` (200), `grpc_method_router` (275) |
 | **AuthN** | 950–1999 | Authentication / identity verification | `mtls_auth` (950), `jwks_auth` (1000), `jwt_auth` (1100), `key_auth` (1200), `basic_auth` (1300), `hmac_auth` (1400) |
 | **Admission** | 2000–2999 | Authorization, validation, and request admission control | `access_control` (2000), `tcp_connection_throttle` (2050), `request_size_limiting` (2800), `ws_message_size_limiting` (2810), `graphql` (2850), `rate_limiting` (2900), `ws_rate_limiting` (2910), `udp_rate_limiting` (2910), `ai_prompt_shield` (2925), `body_validator` (2950), `ai_request_guard` (2975) |
-| **Transform** | 3000–3999 | Request shaping and response buffering decisions | `request_transformer` (3000), `serverless_function` (3025), `grpc_deadline` (3050), `response_size_limiting` (3490), `response_caching` (3500) |
+| **Transform** | 3000–3999 | Request shaping and response buffering decisions | `request_transformer` (3000), `serverless_function` (3025), `grpc_deadline` (3050), `request_mirror` (3075), `response_size_limiting` (3490), `response_caching` (3500) |
 | **Response** | 4000–4999 | Response transformation, compression, and AI accounting | `response_transformer` (4000), `compression` (4050), `ai_token_metrics` (4100), `ai_rate_limiter` (4200) |
 | **Custom** | 5000 | Default for unrecognized/custom plugins | _(future plugins)_ |
 | **Logging** | 9000–9999 | Observability and frame logging | `stdout_logging` (9000), `ws_frame_logging` (9050), `http_logging` (9100), `transaction_debugger` (9200), `prometheus_metrics` (9300) |
@@ -250,17 +250,18 @@ Given all built-in plugins enabled, the execution order is:
 | 25 | `request_transformer` | 3000 | before_proxy, transform_request_body |
 | 26 | `serverless_function` | 3025 | before_proxy |
 | 27 | `grpc_deadline` | 3050 | before_proxy |
-| 28 | `response_size_limiting` | 3490 | after_proxy, on_final_response_body |
-| 29 | `response_caching` | 3500 | before_proxy, after_proxy, on_final_response_body |
-| 30 | `response_transformer` | 4000 | after_proxy, transform_response_body |
-| 31 | `compression` | 4050 | before_proxy, after_proxy, transform_request_body, transform_response_body |
-| 32 | `ai_token_metrics` | 4100 | on_response_body |
-| 33 | `ai_rate_limiter` | 4200 | before_proxy, after_proxy, on_response_body |
-| 34 | `stdout_logging` | 9000 | log, on_stream_disconnect |
-| 35 | `ws_frame_logging` | 9050 | on_ws_frame |
-| 36 | `http_logging` | 9100 | log, on_stream_disconnect |
-| 37 | `transaction_debugger` | 9200 | on_request_received, after_proxy, log, on_stream_disconnect |
-| 38 | `prometheus_metrics` | 9300 | log, on_stream_disconnect |
+| 28 | `request_mirror` | 3075 | before_proxy |
+| 29 | `response_size_limiting` | 3490 | after_proxy, on_final_response_body |
+| 30 | `response_caching` | 3500 | before_proxy, after_proxy, on_final_response_body |
+| 31 | `response_transformer` | 4000 | after_proxy, transform_response_body |
+| 32 | `compression` | 4050 | before_proxy, after_proxy, transform_request_body, transform_response_body |
+| 33 | `ai_token_metrics` | 4100 | on_response_body |
+| 34 | `ai_rate_limiter` | 4200 | before_proxy, after_proxy, on_response_body |
+| 35 | `stdout_logging` | 9000 | log, on_stream_disconnect |
+| 36 | `ws_frame_logging` | 9050 | on_ws_frame |
+| 37 | `http_logging` | 9100 | log, on_stream_disconnect |
+| 38 | `transaction_debugger` | 9200 | on_request_received, after_proxy, log, on_stream_disconnect |
+| 39 | `prometheus_metrics` | 9300 | log, on_stream_disconnect |
 
 ## Why This Order Matters
 
@@ -288,7 +289,7 @@ Browser preflight (`OPTIONS`) requests must be answered before authentication. I
 
 ### Authentication before authorization (1000s before 2000s)
 
-Authentication plugins identify *who* the caller is (setting `ctx.identified_consumer` and/or `ctx.authenticated_identity`). Authorization plugins like `access_control` then decide *whether* that identity is allowed. Running auth first is required — ACL checks are meaningless without a verified identity.
+Authentication plugins identify *who* the caller is (setting `ctx.identified_consumer` and/or `ctx.authenticated_identity`). Authorization plugins like `access_control` then decide *whether* that identity is allowed — by consumer username, ACL group membership, or both. Running auth first is required — ACL checks are meaningless without a verified identity.
 
 After all plugin phases complete, the gateway automatically injects `X-Consumer-Username` (and `X-Consumer-Custom-Id` when set) headers into the request forwarded to the backend, so upstream services can identify the authenticated caller. `X-Consumer-Username` uses the mapped Consumer username when available, otherwise an external auth header/display identity (for example from `jwks_auth`), otherwise the raw external authenticated identity.
 
@@ -422,7 +423,7 @@ TLS/DTLS are transport-layer concerns, not separate protocols. A plugin that sup
 | `key_auth` | ✓ | ✓ | ✓ | | | Requires HTTP headers |
 | `basic_auth` | ✓ | ✓ | ✓ | | | Requires HTTP headers |
 | `hmac_auth` | ✓ | ✓ | ✓ | | | Requires HTTP headers |
-| `access_control` | ✓ | ✓ | ✓ | ✓ | | Needs authenticated identity from an auth plugin; consumer rules remain primary |
+| `access_control` | ✓ | ✓ | ✓ | ✓ | | Needs authenticated identity from an auth plugin; supports consumer username and ACL group allow/deny lists |
 | `tcp_connection_throttle` | | | | ✓ | | Tracks active TCP connections per Consumer or client IP |
 | `grpc_method_router` | | ✓ | | | | gRPC method-level access control and rate limiting |
 | `grpc_deadline` | | ✓ | | | | gRPC timeout enforcement and propagation |
@@ -430,6 +431,7 @@ TLS/DTLS are transport-layer concerns, not separate protocols. A plugin that sup
 | `request_size_limiting` | ✓ | ✓ | | | | Enforces per-proxy request body size limits |
 | `rate_limiting` | ✓ | ✓ | ✓ | ✓ | ✓ | Connection/session rate applies everywhere |
 | `request_transformer` | ✓ | ✓ | | | | Modifies HTTP headers/query/body |
+| `request_mirror` | ✓ | ✓ | | | | Duplicates traffic to a shadow destination for validation |
 | `serverless_function` | ✓ | ✓ | | | | Invokes cloud functions (AWS Lambda, Azure Functions, GCP Cloud Functions) |
 | `body_validator` | ✓ | ✓ | | | | Validates request and response bodies |
 | `request_termination` | ✓ | ✓ | ✓ | | | Returns HTTP error response |

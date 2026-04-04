@@ -32,6 +32,7 @@ fn make_consumer(
         username: username.to_string(),
         custom_id: custom_id.map(|s| s.to_string()),
         credentials,
+        acl_groups: Vec::new(),
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }
@@ -178,6 +179,7 @@ fn test_consumer_with_no_keyauth_credentials() {
         username: "nokey".to_string(),
         custom_id: None,
         credentials,
+        acl_groups: Vec::new(),
         created_at: Utc::now(),
         updated_at: Utc::now(),
     };

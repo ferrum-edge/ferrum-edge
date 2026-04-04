@@ -1464,6 +1464,18 @@ components:
             | `jwt_auth` | (identity from JWT claim) | Looked up by `username`, `id`, or `custom_id` |
             | `jwks_auth` | (identity from JWT claim) | Looked up by `username`, `id`, or `custom_id` (optional — consumer-less flow supported) |
             | `hmac_auth` | `secret` | Looked up by username in Authorization header |
+        acl_groups:
+          type: array
+          items:
+            type: string
+            maxLength: 255
+          default: []
+          maxItems: 500
+          description: >-
+            ACL group memberships for group-based access control. The
+            `access_control` plugin can allow/deny by group instead of (or in
+            addition to) individual consumer usernames. A consumer can belong to
+            up to 500 groups.
         created_at:
           type: [string, "null"]
           format: date-time
@@ -2856,18 +2868,36 @@ components:
 
     AccessControlConfig:
       type: object
-      description: "Plugin: access_control — consumer-based allow/deny for HTTP-family and TCP stream proxies. Use ip_restriction for IP/CIDR rules."
+      description: >-
+        Plugin: access_control — consumer-based and group-based allow/deny for
+        HTTP-family and TCP stream proxies. Evaluation order: deny (consumer
+        username → group) then allow (consumer username → group). At least one
+        rule must be configured. Use ip_restriction for IP/CIDR rules.
       properties:
         allowed_consumers:
           type: array
           items:
             type: string
-          description: Usernames allowed access (empty = allow all)
+          description: Usernames allowed access (empty = no username-level allow rule)
         disallowed_consumers:
           type: array
           items:
             type: string
           description: Usernames explicitly denied
+        allowed_groups:
+          type: array
+          items:
+            type: string
+          description: ACL group names allowed access — matches against consumer acl_groups
+        disallowed_groups:
+          type: array
+          items:
+            type: string
+          description: ACL group names explicitly denied — matches against consumer acl_groups
+        allow_authenticated_identity:
+          type: boolean
+          default: false
+          description: Allow requests with an external authenticated identity even when no Consumer was mapped
 
     TcpConnectionThrottleConfig:
       type: object

@@ -38,6 +38,7 @@ fn create_basic_auth_consumer() -> ferrum_edge::config::types::Consumer {
         username: "testuser".to_string(),
         custom_id: None,
         credentials,
+        acl_groups: Vec::new(),
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }
@@ -251,6 +252,7 @@ async fn test_basic_auth_bcrypt_fallback() {
         username: "bcryptuser".to_string(),
         custom_id: None,
         credentials,
+        acl_groups: Vec::new(),
         created_at: Utc::now(),
         updated_at: Utc::now(),
     };
