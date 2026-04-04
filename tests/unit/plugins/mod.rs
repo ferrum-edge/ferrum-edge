@@ -16,6 +16,7 @@ mod cors_tests;
 mod graphql_tests;
 mod grpc_deadline_tests;
 mod grpc_method_router_tests;
+mod grpc_web_tests;
 mod hmac_auth_tests;
 mod http_logging_tests;
 mod ip_restriction_tests;

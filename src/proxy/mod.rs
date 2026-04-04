@@ -4431,11 +4431,16 @@ pub async fn handle_proxy_request(
                 grpc_req_body.len().to_string(),
             );
 
-            // Run on_final_request_body hooks (e.g., protobuf validation)
+            // Transform request body via plugins (e.g., gRPC-Web base64 decoding)
             let mut hook_headers = proxy_headers.clone();
             hook_headers
                 .entry(":path".to_string())
                 .or_insert_with(|| path.clone());
+            let grpc_req_body = bytes::Bytes::from(
+                apply_request_body_plugins(&plugins, &hook_headers, grpc_req_body.to_vec()).await,
+            );
+
+            // Run on_final_request_body hooks (e.g., protobuf validation)
             match run_final_request_body_hooks(&plugins, &hook_headers, &grpc_req_body).await {
                 PluginResult::Continue => {}
                 reject @ PluginResult::Reject { .. }

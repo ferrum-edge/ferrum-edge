@@ -55,7 +55,7 @@ Ferrum supports dynamic upstream target discovery through three providers, confi
 
 ## Plugin System
 
-- 40 built-in plugins with lifecycle hooks (request received, authenticate, authorize, before proxy, after proxy, on final request/response body, on response body, on WebSocket frame, on UDP datagram, log)
+- 41 built-in plugins with lifecycle hooks (request received, authenticate, authorize, before proxy, after proxy, on final request/response body, on response body, on WebSocket frame, on UDP datagram, log)
 - Priority-ordered execution with protocol-aware filtering (HTTP, gRPC, WebSocket, TCP, UDP)
 - Global and per-proxy scoping with same-type override semantics
 - Multi-authentication mode with first-match consumer identification
@@ -82,6 +82,7 @@ Ferrum supports dynamic upstream target discovery through three providers, confi
 - **CORS** — preflight handling with origin, method, and header validation
 - **Body Validator** — JSON Schema, XML, and gRPC protobuf validation
 - **GraphQL** — query depth/complexity limiting, alias limiting, introspection control, per-operation rate limiting
+- **gRPC-Web** — bidirectional protocol translation between gRPC-Web (browser) and native gRPC (HTTP/2), supporting binary and base64 text encoding modes with trailer frame embedding
 - **gRPC Method Router** — per-method access control (allow/deny lists) and per-method rate limiting with metadata enrichment
 - **gRPC Deadline** — `grpc-timeout` enforcement, default injection, max capping, and gateway processing time subtraction
 
