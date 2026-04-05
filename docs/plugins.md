@@ -122,7 +122,6 @@ The table below summarizes how to configure `http_logging` for popular log inges
 | **New Relic** | `https://log-api.newrelic.com/log/v1` | `Api-Key: "<license-key>"` | Dedicated API key header | Yes | 1MB compressed | EU: `log-api.eu.newrelic.com` |
 | **Sumo Logic** | `https://<endpoint>.sumologic.com/receiver/v1/http/<token>` | `X-Sumo-Category`, `X-Sumo-Name`, `X-Sumo-Host` (optional metadata) | Token embedded in URL | Yes | 1MB default | No auth header needed — token is in the URL path |
 | **Elastic / OpenSearch** | `https://<host>:9200/<index>/_bulk` | `Authorization: "Basic <b64>"` or `Authorization: "Bearer <token>"` | Standard Authorization header | Yes (bulk API) | 100MB default | Consider using `_bulk` with NDJSON adapter or direct index API |
-| **Grafana Loki** | Requires intermediary (Promtail/Alloy/Fluentd) | `X-Scope-OrgID: "<tenant>"` (multi-tenant) | Varies by setup | **No** — needs `{"streams": [...]}` format | 4MB default | Cannot ingest raw JSON arrays directly; use a log shipper as intermediary |
 | **Azure Monitor** | `https://<dce>.ingest.monitor.azure.com/dataCollectionRules/<dcr-id>/streams/<stream>?api-version=2023-01-01` | `Authorization: "Bearer <aad-token>"` | Azure AD OAuth2 bearer token | Yes (custom tables) | 1MB per call | Requires Data Collection Endpoint + Rule; fields map to custom table columns |
 | **AWS CloudWatch** | Requires intermediary (Fluent Bit/Firehose HTTP endpoint) | `Authorization: "Bearer <token>"` or custom | Varies by intermediary | **No** — needs `PutLogEvents` API format | N/A | Cannot POST directly; use a Firehose HTTP endpoint or Fluent Bit as intermediary |
 | **Google Cloud Logging** | Requires intermediary (Fluent Bit/custom) | `Authorization: "Bearer <token>"` | OAuth2 bearer token | **No** — needs `entries.write` format | N/A | Cannot POST directly; use Fluent Bit or a custom HTTP bridge |
@@ -278,20 +277,6 @@ config:
 ```
 
 > **Note:** The Bearer token is a short-lived Azure AD OAuth2 token. For production use, consider placing an auth proxy (e.g., Azure API Management) in front that handles token refresh, or use Fluent Bit with the Azure Monitor output plugin.
-
-#### Grafana Loki Integration
-
-[Grafana Loki's HTTP push API](https://grafana.com/docs/loki/latest/reference/loki-http-api/#push-log-entries-to-loki) uses a different payload format (`{"streams": [...]}`) than what `http_logging` produces. For Loki, use a log shipper (Promtail, Alloy, or Fluentd) as an intermediary that accepts the JSON array from `http_logging` and transforms it into Loki's expected format. Use `custom_headers` for multi-tenant setups:
-
-```yaml
-plugin_name: http_logging
-config:
-  endpoint_url: "http://promtail.internal:3500/api/v1/push"
-  custom_headers:
-    X-Scope-OrgID: "tenant-1"
-  batch_size: 100
-  flush_interval_ms: 2000
-```
 
 #### AWS CloudWatch Logs Integration
 
