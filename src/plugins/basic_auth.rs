@@ -46,8 +46,9 @@ pub struct BasicAuth {
 
 impl BasicAuth {
     pub fn new(_config: &Value) -> Self {
-        let (hmac_secret, is_default) = match std::env::var("FERRUM_BASIC_AUTH_HMAC_SECRET")
-            .ok()
+        use crate::config::conf_file::resolve_ferrum_var;
+
+        let (hmac_secret, is_default) = match resolve_ferrum_var("FERRUM_BASIC_AUTH_HMAC_SECRET")
             .filter(|s| !s.is_empty())
         {
             Some(s) => (s.into_bytes(), false),

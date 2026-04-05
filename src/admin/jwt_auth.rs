@@ -155,16 +155,21 @@ impl std::fmt::Display for JwtError {
 
 impl std::error::Error for JwtError {}
 
-/// Create JWT manager from environment variables
+/// Create JWT manager from environment variables and `ferrum.conf`.
+///
+/// Uses `resolve_ferrum_var()` so that `ferrum.conf` values are respected
+/// when the corresponding environment variable is not set.
 pub fn create_jwt_manager_from_env() -> Result<JwtManager, JwtError> {
-    let secret = std::env::var("FERRUM_ADMIN_JWT_SECRET")
-        .map_err(|_| JwtError::VerificationFailed("FERRUM_ADMIN_JWT_SECRET not set".to_string()))?;
+    use crate::config::conf_file::resolve_ferrum_var;
+
+    let secret = resolve_ferrum_var("FERRUM_ADMIN_JWT_SECRET").ok_or_else(|| {
+        JwtError::VerificationFailed("FERRUM_ADMIN_JWT_SECRET not set".to_string())
+    })?;
 
     let issuer =
-        std::env::var("FERRUM_ADMIN_JWT_ISSUER").unwrap_or_else(|_| "ferrum-edge".to_string());
+        resolve_ferrum_var("FERRUM_ADMIN_JWT_ISSUER").unwrap_or_else(|| "ferrum-edge".to_string());
 
-    let max_ttl = std::env::var("FERRUM_ADMIN_JWT_MAX_TTL")
-        .ok()
+    let max_ttl = resolve_ferrum_var("FERRUM_ADMIN_JWT_MAX_TTL")
         .and_then(|s| s.parse().ok())
         .unwrap_or(3600);
 

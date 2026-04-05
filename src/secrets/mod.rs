@@ -56,8 +56,7 @@ const DEFAULT_SECRET_FETCH_TIMEOUT_SECS: u64 = 30;
     feature = "secrets-azure"
 ))]
 fn secret_fetch_timeout() -> std::time::Duration {
-    let secs = std::env::var("FERRUM_SECRET_FETCH_TIMEOUT_SECONDS")
-        .ok()
+    let secs = crate::config::conf_file::resolve_ferrum_var("FERRUM_SECRET_FETCH_TIMEOUT_SECONDS")
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(DEFAULT_SECRET_FETCH_TIMEOUT_SECS);
     std::time::Duration::from_secs(secs)

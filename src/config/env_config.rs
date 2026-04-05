@@ -172,6 +172,17 @@ pub struct EnvConfig {
 
     // Admin JWT
     pub admin_jwt_secret: Option<String>,
+    /// JWT issuer claim (iss) for Admin API tokens. Tokens with a different issuer
+    /// are rejected during verification. Default: "ferrum-edge".
+    /// Note: Also resolved via `resolve_ferrum_var()` in `jwt_auth.rs` for use sites
+    /// that don't have `EnvConfig` in scope (e.g., `create_jwt_manager_from_env()`).
+    #[allow(dead_code)]
+    pub admin_jwt_issuer: String,
+    /// Maximum TTL in seconds for Admin API JWT tokens. Tokens requesting a longer
+    /// lifetime via the /auth endpoint are capped to this value. Default: 3600.
+    /// Note: Also resolved via `resolve_ferrum_var()` in `jwt_auth.rs`.
+    #[allow(dead_code)]
+    pub admin_jwt_max_ttl: u64,
 
     // Database
     pub db_type: Option<String>,
@@ -456,6 +467,15 @@ pub struct EnvConfig {
     /// is not from a trusted proxy, falls back to the X-Forwarded-For walk.
     pub real_ip_header: Option<String>,
 
+    /// HMAC-SHA256 server secret for the basic_auth plugin. Password hashes
+    /// prefixed with "hmac_sha256:" are verified using this key (~1μs vs ~100ms
+    /// for bcrypt). Must be set to a unique, random value in production.
+    /// If unset, an insecure default is used and a warning is logged at startup.
+    /// Note: Also resolved via `resolve_ferrum_var()` in `basic_auth.rs` and
+    /// `admin/mod.rs` for use sites that don't have `EnvConfig` in scope.
+    #[allow(dead_code)]
+    pub basic_auth_hmac_secret: Option<String>,
+
     /// Threshold in milliseconds for logging slow plugin outbound HTTP calls.
     /// When a plugin HTTP request (e.g. http_logging, JWKS fetch,
     /// OIDC discovery, OTLP export) exceeds this duration, a warning is logged.
@@ -544,6 +564,8 @@ impl Default for EnvConfig {
             admin_tls_key_path: None,
             admin_bind_address: "0.0.0.0".into(),
             admin_jwt_secret: None,
+            admin_jwt_issuer: "ferrum-edge".into(),
+            admin_jwt_max_ttl: 3600,
             db_type: None,
             db_url: None,
             db_poll_interval: 30,
@@ -639,6 +661,7 @@ impl Default for EnvConfig {
             via_pseudonym: "ferrum-edge".into(),
             add_forwarded_header: false,
             real_ip_header: None,
+            basic_auth_hmac_secret: None,
             plugin_http_slow_threshold_ms: 1000,
             plugin_http_max_retries: 0,
             plugin_http_retry_delay_ms: 100,
@@ -702,6 +725,8 @@ impl EnvConfig {
             admin_tls_key_path: resolve_var(conf, "FERRUM_ADMIN_TLS_KEY_PATH"),
             admin_bind_address: resolve_var_or(conf, "FERRUM_ADMIN_BIND_ADDRESS", "0.0.0.0"),
             admin_jwt_secret: resolve_var(conf, "FERRUM_ADMIN_JWT_SECRET"),
+            admin_jwt_issuer: resolve_var_or(conf, "FERRUM_ADMIN_JWT_ISSUER", "ferrum-edge"),
+            admin_jwt_max_ttl: resolve_u64(conf, "FERRUM_ADMIN_JWT_MAX_TTL", 3600),
             db_type: resolve_var(conf, "FERRUM_DB_TYPE"),
             db_url: resolve_var(conf, "FERRUM_DB_URL"),
             db_poll_interval: resolve_u64(conf, "FERRUM_DB_POLL_INTERVAL", 30),
@@ -956,6 +981,8 @@ impl EnvConfig {
             // to_lowercase() allocation when looking up this header in ctx.headers
             // (which stores hyper's already-lowercased header names).
             real_ip_header: resolve_var(conf, "FERRUM_REAL_IP_HEADER").map(|h| h.to_lowercase()),
+
+            basic_auth_hmac_secret: resolve_var(conf, "FERRUM_BASIC_AUTH_HMAC_SECRET"),
 
             plugin_http_slow_threshold_ms: resolve_u64(
                 conf,

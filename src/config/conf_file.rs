@@ -7,7 +7,30 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::OnceLock;
 use tracing::info;
+
+/// Lazily-loaded, cached conf file. Loaded once on first access via `OnceLock`,
+/// shared across all callers for the lifetime of the process. This enables code
+/// that runs outside `EnvConfig` (e.g., tracing init in `main()`, secret
+/// resolution, plugin constructors) to respect `ferrum.conf` values without
+/// re-parsing the file each time.
+static CONF_FILE_CACHE: OnceLock<ConfFile> = OnceLock::new();
+
+/// Resolve a single `FERRUM_*` variable from the environment or `ferrum.conf`.
+///
+/// Precedence: **env var > conf file**. Returns `None` if unset in both.
+///
+/// This is the public entry point for code that needs conf-file-aware variable
+/// resolution but does not have access to an `EnvConfig` instance (e.g., early
+/// startup in `main()`, secret resolution, plugin constructors, JWT auth).
+pub fn resolve_ferrum_var(key: &str) -> Option<String> {
+    if let Ok(val) = std::env::var(key) {
+        return Some(val);
+    }
+    let conf = CONF_FILE_CACHE.get_or_init(|| ConfFile::load().unwrap_or_default());
+    conf.get(key).map(|v| v.to_string())
+}
 
 /// Default path for the ferrum.conf configuration file.
 pub const DEFAULT_CONF_PATH: &str = "./ferrum.conf";

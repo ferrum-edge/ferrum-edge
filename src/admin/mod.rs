@@ -3494,8 +3494,7 @@ fn hash_basic_auth_password(password: &str) -> Result<String, String> {
     use sha2::Sha256;
     type HmacSha256 = Hmac<Sha256>;
 
-    let secret = std::env::var("FERRUM_BASIC_AUTH_HMAC_SECRET")
-        .ok()
+    let secret = crate::config::conf_file::resolve_ferrum_var("FERRUM_BASIC_AUTH_HMAC_SECRET")
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| crate::plugins::basic_auth::DEFAULT_HMAC_SECRET.to_string());
 
