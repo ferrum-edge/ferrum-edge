@@ -218,6 +218,7 @@ async fn test_all_plugins_available() {
         "ai_prompt_shield",
         "ws_message_size_limiting",
         "ws_frame_logging",
+        "ws_logging",
         "ws_rate_limiting",
         "udp_rate_limiting",
         "serverless_function",
@@ -243,6 +244,7 @@ async fn test_plugin_creation_all_plugins() {
         // Some plugins now require specific config fields
         let config = match plugin_name {
             "http_logging" => json!({"endpoint_url": "http://localhost:9200/logs"}),
+            "ws_logging" => json!({"endpoint_url": "ws://localhost:9300/logs"}),
             "otel_tracing" => json!({"endpoint": "http://localhost:4318/v1/traces"}),
             "jwks_auth" => {
                 json!({"providers": [{"jwks_uri": "https://example.com/.well-known/jwks.json"}]})

@@ -1,6 +1,6 @@
 # Plugin Reference
 
-Ferrum Edge includes 43 built-in plugins organized into lifecycle phases. Each plugin executes at a specific priority (lower number = runs first).
+Ferrum Edge includes 44 built-in plugins organized into lifecycle phases. Each plugin executes at a specific priority (lower number = runs first).
 
 For execution order, protocol support matrix, and design rationale, see [plugin_execution_order.md](plugin_execution_order.md).
 
@@ -357,6 +357,36 @@ The `global_tags` config maps directly to DogStatsD tag format (`|#key:value,key
 1. Point `host` at your Datadog Agent or DogStatsD server
 2. Set `global_tags` with environment and service metadata
 3. Metrics appear in Datadog with full tag filtering
+
+### `ws_logging`
+
+Sends transaction summaries as JSON to an external WebSocket endpoint. Like `http_logging`, entries are buffered and sent in batches (as a JSON array text messages) to reduce per-message overhead. The WebSocket connection is maintained persistently with automatic reconnection on failure.
+
+**Priority:** 9175
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `endpoint_url` | String | `""` | WebSocket URL to send transaction logs to |
+| `batch_size` | Integer | `50` | Number of entries to buffer before sending a batch |
+| `flush_interval_ms` | Integer | `1000` | Max milliseconds before flushing a partial batch (min: 100) |
+| `max_retries` | Integer | `3` | Retry attempts on failed batch delivery |
+| `retry_delay_ms` | Integer | `1000` | Delay in milliseconds between retry attempts |
+| `reconnect_delay_ms` | Integer | `5000` | Delay in milliseconds before reconnecting after connection failure |
+| `buffer_capacity` | Integer | `10000` | Channel capacity — new entries are dropped when full |
+
+Batches are flushed when `batch_size` is reached **or** `flush_interval_ms` elapses, whichever comes first. Each batch is sent as a single JSON array text message over the WebSocket connection.
+
+`endpoint_url` must be a valid `ws://` or `wss://` URL with a hostname. Malformed or non-WebSocket URLs reject plugin creation at config load time.
+
+```yaml
+plugin_name: ws_logging
+config:
+  endpoint_url: "wss://logging-service.example.com/ws/ingest"
+  batch_size: 50
+  flush_interval_ms: 1000
+```
+
+**Connection lifecycle:** The plugin establishes a persistent WebSocket connection on the first batch flush. If the connection drops, the plugin automatically reconnects on the next send attempt. Failed batches are retried up to `max_retries` times with `retry_delay_ms` between attempts. After exhausting retries, the batch is discarded and a warning is logged.
 
 ### Transaction Summary Reference
 
@@ -1613,7 +1643,7 @@ Duplicates live proxy traffic to a secondary destination for shadow testing, val
 **Priority:** 3075
 **Protocols:** HTTP, gRPC
 
-Mirror response metadata (status code, response size, latency) is logged as a separate `TransactionSummary` entry with `mirror: true`, flowing through all logging plugins (stdout, http_logging, prometheus, transaction_debugger). The mirror request uses the proxy's `backend_read_timeout_ms` and the gateway's shared DNS cache and connection pool.
+Mirror response metadata (status code, response size, latency) is logged as a separate `TransactionSummary` entry with `mirror: true`, flowing through all logging plugins (stdout, http_logging, ws_logging, prometheus, transaction_debugger). The mirror request uses the proxy's `backend_read_timeout_ms` and the gateway's shared DNS cache and connection pool.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
