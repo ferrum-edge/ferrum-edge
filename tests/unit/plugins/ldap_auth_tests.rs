@@ -445,9 +445,9 @@ fn test_full_ad_config() {
 }
 
 #[test]
-fn test_both_bind_modes_prefers_direct_bind() {
-    // When both bind_dn_template and search config are provided,
-    // direct bind is used (bind_dn_template takes precedence)
+fn test_both_bind_modes_accepted() {
+    // Config is valid when both bind_dn_template and search config are provided.
+    // At runtime, direct bind takes precedence (see authenticate_user logic).
     let result = LdapAuth::new(
         &json!({
             "ldap_url": "ldap://ldap.example.com:389",
