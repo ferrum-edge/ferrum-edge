@@ -207,7 +207,9 @@ Both plain UDP and DTLS frontend paths support per-datagram hooks.
 
 ## Priority Bands
 
-Within each lifecycle phase, plugins are sorted by **priority** (lower number runs first). Priority is intrinsic to each plugin — it is not user-configurable. Plugins at the same priority have no guaranteed relative order.
+Within each lifecycle phase, plugins are sorted by **priority** (lower number runs first). Each plugin has a built-in priority constant, but this can be overridden per plugin-config via the `priority_override` field (0–10000). When two plugins share the same effective priority, their relative order is stable (based on config order) but not explicitly controllable — use `priority_override` to guarantee ordering.
+
+Multiple instances of the same plugin type are supported on a single proxy (e.g., two `http_logging` instances for different log destinations). When merging global and proxy-scoped plugins, a proxy-scoped plugin replaces only the **global** plugin of the same name — other proxy-scoped instances of the same type are preserved. See [Plugin Scope](plugins.md#global-vs-proxy-scoped-merging) for the full merging rules and examples.
 
 Priority bands are spaced with gaps so future plugins can slot in without renumbering:
 

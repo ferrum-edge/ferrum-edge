@@ -248,7 +248,7 @@ All string fields reject ASCII control characters (null bytes, escape sequences,
 
 - **Uniqueness**: Proxy IDs, consumer IDs, upstream IDs, plugin_config IDs, proxy names, upstream names, consumer usernames, consumer custom_ids, and consumer credentials are validated for uniqueness
 - **Referential integrity**: Proxy `upstream_id` must reference an existing upstream
-- **Plugin uniqueness**: Each proxy can have at most one plugin of each type
+- **Plugin multiplicity**: A proxy may have multiple instances of the same plugin type (e.g., two `http_logging` for different destinations). Use `priority_override` to control execution order when needed
 - **Host/path uniqueness**: No two proxies can share overlapping host + listen_path combinations
 - **Stream proxy rules**: TCP/UDP proxies require `listen_port`; HTTP proxies must not set it. In database mode, `listen_port` is also validated against gateway reserved ports (proxy/admin/gRPC) and checked for OS-level availability. In CP mode, local port checks are skipped since proxies run on remote DP nodes
 

@@ -882,6 +882,13 @@ pub struct PluginConfig {
     pub proxy_id: Option<String>,
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Optional execution priority override. When set, replaces the plugin's
+    /// built-in priority constant. Lower values execute first. Useful when
+    /// multiple instances of the same plugin type are attached to a proxy
+    /// (e.g., two `http_logging` instances for different log destinations)
+    /// and you need to control their relative execution order.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority_override: Option<u16>,
     #[serde(default = "Utc::now")]
     pub created_at: DateTime<Utc>,
     #[serde(default = "Utc::now")]
@@ -1317,42 +1324,6 @@ impl GatewayConfig {
                         "Proxy '{}' references non-existent plugin_config '{}'",
                         proxy.id, assoc.plugin_config_id
                     )),
-                }
-            }
-        }
-
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(errors)
-        }
-    }
-
-    /// Validate that each proxy has at most one plugin of each type.
-    ///
-    /// If a proxy has two plugin configs with the same `plugin_name`, the
-    /// PluginCache silently uses last-one-wins. This validation catches
-    /// that misconfiguration at load time.
-    pub fn validate_unique_plugins_per_proxy(&self) -> Result<(), Vec<String>> {
-        let plugin_name_by_id: HashMap<&str, &str> = self
-            .plugin_configs
-            .iter()
-            .map(|pc| (pc.id.as_str(), pc.plugin_name.as_str()))
-            .collect();
-
-        let mut errors = Vec::new();
-
-        for proxy in &self.proxies {
-            let mut seen_names: HashMap<&str, &str> = HashMap::new();
-            for assoc in &proxy.plugins {
-                if let Some(&plugin_name) = plugin_name_by_id.get(assoc.plugin_config_id.as_str())
-                    && let Some(existing_config_id) =
-                        seen_names.insert(plugin_name, &assoc.plugin_config_id)
-                {
-                    errors.push(format!(
-                        "Proxy '{}' has duplicate plugin '{}' (config IDs '{}' and '{}')",
-                        proxy.id, plugin_name, existing_config_id, assoc.plugin_config_id
-                    ));
                 }
             }
         }
@@ -2507,6 +2478,16 @@ impl PluginConfig {
         // Config JSON nesting depth
         if json_depth(&self.config) > 10 {
             errors.push("config JSON nesting depth must not exceed 10".to_string());
+        }
+
+        // Priority override range (0–10000 keeps plugins within sane ordering bands)
+        if let Some(p) = self.priority_override
+            && p > 10000
+        {
+            errors.push(format!(
+                "priority_override must be between 0 and 10000 (got {})",
+                p
+            ));
         }
 
         if errors.is_empty() {

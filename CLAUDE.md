@@ -196,7 +196,7 @@ src/
 | `Proxy` | A route + backend target | listen_path, hosts, backend_host/port/protocol, plugins, TLS/DNS/timeout overrides, pool_*, circuit_breaker, retry, response_body_mode, allowed_ws_origins, udp_max_response_amplification_factor |
 | `Consumer` | An authenticated client identity | username, custom_id, credentials (HashMap), acl_groups (Vec), tags |
 | `Upstream` | A load-balanced target group | targets (host/port/weight/path), algorithm, health_checks |
-| `PluginConfig` | Plugin instance configuration | name, enabled, config (serde_json::Value) |
+| `PluginConfig` | Plugin instance configuration | name, enabled, config (serde_json::Value), priority_override (Option<u16>) |
 | `ServiceDiscoveryConfig` | Dynamic upstream target discovery | provider (dns_sd/kubernetes/consul), poll_interval_seconds, provider-specific settings |
 
 **Hostname normalization**: All hostnames are normalized to ASCII-lowercase at the admission layer via `normalize_fields()` — this includes `Proxy.hosts`, `Proxy.backend_host`, and `UpstreamTarget.host`. Normalization runs at every entry point: admin API (create/update/batch/restore), file loader, DB loader (full and incremental), DP gRPC client, and config backup restore. Downstream consumers (DNS cache, connection pool keys, health check keys, LB keys) rely on this invariant and do NOT re-lowercase. Do not add per-lookup lowercasing in those paths — it is unnecessary and adds hot-path overhead.
@@ -280,7 +280,9 @@ TCP/UDP stream proxies bind dedicated ports via `listen_port`. Port conflicts ar
 
 ### Plugin System
 
-Plugins execute in priority order (lower number = runs first). The lifecycle phases are:
+Plugins execute in priority order (lower number = runs first). Multiple instances of the same plugin type are supported on a single proxy (e.g., two `http_logging` instances for Splunk and Datadog). Each instance has its own `id`, `config`, and optional `priority_override` to control relative execution order. When a proxy-scoped plugin has the same `plugin_name` as a global plugin, the global instance is replaced — but multiple proxy-scoped instances of the same type coexist.
+
+The lifecycle phases are:
 
 1. `on_request_received` — OTel tracing (25), correlation ID (50), CORS preflight (100), request termination (125), IP restriction (150), bot detection (200), SSE validation (250), gRPC-Web translation (260), gRPC method router (275)
 2. `authenticate` — mTLS auth (950), JWKS auth (1000), JWT auth (1100), key auth (1200), basic auth (1300), HMAC auth (1400)
@@ -305,7 +307,7 @@ Plugins execute in priority order (lower number = runs first). The lifecycle pha
 
 **HTTP logging custom headers**: The `http_logging` plugin supports a `custom_headers` config field (JSON object of header name → value pairs) that are sent with every batch POST request. This enables integration with services that require non-standard authentication headers (e.g., `DD-API-KEY` for Datadog, `Api-Key` for New Relic, `X-Sumo-Category` for Sumo Logic). See `docs/plugins.md` for the full service integration quick reference table covering Splunk, Datadog, New Relic, Sumo Logic, Elastic, Loki, Azure Monitor, AWS CloudWatch, Google Cloud Logging, Logtail, Axiom, and Mezmo.
 
-Plugin priority constants are defined in `src/plugins/mod.rs` (e.g., `priority::CORS = 100`, `priority::REQUEST_TERMINATION = 125`, `priority::TCP_CONNECTION_THROTTLE = 2050`, `priority::RATE_LIMITING = 2900`, `priority::RESPONSE_SIZE_LIMITING = 3490`, `priority::COMPRESSION = 4050`).
+Plugin priority constants are defined in `src/plugins/mod.rs` (e.g., `priority::CORS = 100`, `priority::REQUEST_TERMINATION = 125`, `priority::TCP_CONNECTION_THROTTLE = 2050`, `priority::RATE_LIMITING = 2900`, `priority::RESPONSE_SIZE_LIMITING = 3490`, `priority::COMPRESSION = 4050`). Per-instance `priority_override` (on `PluginConfig`) can override these built-in constants via the `PriorityOverridePlugin` wrapper in `plugin_cache.rs`.
 
 ### DNS Cache (`src/dns/mod.rs`)
 
@@ -575,7 +577,7 @@ Custom plugins that need their own database tables can declare migrations via a 
 - **Incremental Polling**: Database mode polls for changes at `FERRUM_DB_POLL_INTERVAL_SECONDS` (default 30s) using a two-phase incremental strategy:
   1. **Startup**: Full `SELECT *` on all 4 tables to build the initial config and seed the poller's known ID sets. The `loaded_at` timestamp is captured **before** queries execute so the safety margin covers the full load duration.
   2. **Subsequent polls**: `load_incremental_config()` uses indexed `SELECT * FROM X WHERE updated_at > ?` queries (4 tables) to fetch only changed rows, plus lightweight `SELECT id FROM X` queries (4 tables) to detect deletions by diffing against the known ID set. A 1-second safety margin on the timestamp prevents missing boundary writes.
-  3. **Validation**: Incremental results are validated (field-level constraints, hosts, regex listen_paths, unique listen_paths, stream proxies, stream proxy gateway port conflicts, upstream references, plugin references, unique plugins per proxy) before being applied — same as the full-load path. Invalid incremental configs are rejected and the previous valid config remains in effect.
+  3. **Validation**: Incremental results are validated (field-level constraints, hosts, regex listen_paths, unique listen_paths, stream proxies, stream proxy gateway port conflicts, upstream references, plugin references) before being applied — same as the full-load path. Invalid incremental configs are rejected and the previous valid config remains in effect.
   4. **Consistency**: The poller's known ID sets are only updated **after** `apply_incremental()` succeeds. If validation rejects the config, known IDs stay unchanged so the next poll re-fetches the same changes.
   5. **Fallback**: If the incremental poll fails for any reason, the loop automatically falls back to a full `load_full_config()` + `update_config()` cycle and re-seeds the known IDs.
   - The `updated_at` columns are indexed (`idx_proxies_updated_at`, `idx_consumers_updated_at`, `idx_plugin_configs_updated_at`, `idx_upstreams_updated_at`) so incremental queries use index scans, not full table scans.

@@ -23,8 +23,30 @@ Custom plugins are auto-discovered from the `custom_plugins/` directory at build
 
 ## Scope
 
-- **Global** plugins apply to all proxies
-- **Proxy-scoped** plugins apply only to a specific proxy and override globals of the same plugin type
+- **Global** plugins apply to all proxies automatically
+- **Proxy-scoped** plugins apply only to a specific proxy
+- A proxy may have **multiple instances** of the same plugin type (e.g., two `http_logging` configs shipping to different destinations). Each instance has its own `id`, `config`, and optional `priority_override` to control execution order
+
+### Global vs Proxy-Scoped Merging
+
+Each proxy's effective plugin list is built by merging global and proxy-scoped plugins:
+
+1. Start with all enabled **global** plugins
+2. For each **proxy-scoped** plugin attached to the proxy, remove any global plugin with the same `plugin_name` (the proxy-scoped instance replaces it)
+3. Multiple proxy-scoped instances of the same `plugin_name` all coexist — only the global is replaced
+4. Sort by effective priority (built-in priority or `priority_override`)
+
+**Examples:**
+
+| Global plugins | Proxy-scoped plugins | Effective list for proxy |
+|---|---|---|
+| `http_logging` (g1) | *(none)* | g1 |
+| `http_logging` (g1) | `http_logging` (ps1) | ps1 (replaces g1) |
+| `http_logging` (g1) | `http_logging` (ps1), `http_logging` (ps2) | ps1, ps2 (g1 replaced, both scoped kept) |
+| *(none)* | `http_logging` (ps1), `http_logging` (ps2) | ps1, ps2 |
+| `http_logging` (g1), `cors` (g2) | `http_logging` (ps1) | ps1, g2 (only same-name global replaced) |
+
+Use `priority_override` to control the relative execution order of instances that share the same built-in priority. Without it, instances at the same priority execute in a stable but implicit order based on config iteration
 
 ## Multi-Authentication Mode
 

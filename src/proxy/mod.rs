@@ -1815,12 +1815,6 @@ impl ProxyState {
             }
             return false;
         }
-        if let Err(errors) = new_config.validate_unique_plugins_per_proxy() {
-            for msg in &errors {
-                error!("Incremental config rejected: {}", msg);
-            }
-            return false;
-        }
         let reserved_ports = self.env_config.reserved_gateway_ports();
         if let Err(errors) = new_config.validate_stream_proxy_port_conflicts(&reserved_ports) {
             if matches!(

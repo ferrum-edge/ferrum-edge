@@ -608,84 +608,135 @@ fn test_upstream_references_none_ok() {
     assert!(config.validate_upstream_references().is_ok());
 }
 
-// ---- Plugin name uniqueness per proxy tests ----
+// ---- priority_override validation tests ----
 
 #[test]
-fn test_unique_plugins_per_proxy_valid() {
-    let mut config = empty_config();
-    config.plugin_configs = vec![
-        PluginConfig {
-            id: "pc1".into(),
-            plugin_name: "rate_limiting".into(),
-            config: serde_json::json!({}),
-            scope: ferrum_edge::config::types::PluginScope::Proxy,
-            proxy_id: Some("p1".into()),
-            enabled: true,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-        },
-        PluginConfig {
-            id: "pc2".into(),
-            plugin_name: "key_auth".into(),
-            config: serde_json::json!({}),
-            scope: ferrum_edge::config::types::PluginScope::Proxy,
-            proxy_id: Some("p1".into()),
-            enabled: true,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-        },
-    ];
-    let mut p1 = make_proxy("p1", "/api");
-    p1.plugins = vec![
-        PluginAssociation {
-            plugin_config_id: "pc1".into(),
-        },
-        PluginAssociation {
-            plugin_config_id: "pc2".into(),
-        },
-    ];
-    config.proxies = vec![p1];
-    assert!(config.validate_unique_plugins_per_proxy().is_ok());
+fn test_plugin_config_priority_override_valid() {
+    let pc = PluginConfig {
+        id: "pc1".into(),
+        plugin_name: "rate_limiting".into(),
+        config: serde_json::json!({}),
+        scope: PluginScope::Global,
+        proxy_id: None,
+        enabled: true,
+        priority_override: Some(5000),
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+    assert!(pc.validate_fields().is_ok());
 }
 
 #[test]
-fn test_unique_plugins_per_proxy_duplicate() {
-    let mut config = empty_config();
-    config.plugin_configs = vec![
-        PluginConfig {
-            id: "pc1".into(),
-            plugin_name: "rate_limiting".into(),
-            config: serde_json::json!({"window_seconds": 60}),
-            scope: ferrum_edge::config::types::PluginScope::Proxy,
-            proxy_id: Some("p1".into()),
-            enabled: true,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-        },
-        PluginConfig {
-            id: "pc2".into(),
-            plugin_name: "rate_limiting".into(),
-            config: serde_json::json!({"window_seconds": 120}),
-            scope: ferrum_edge::config::types::PluginScope::Proxy,
-            proxy_id: Some("p1".into()),
-            enabled: true,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-        },
-    ];
-    let mut p1 = make_proxy("p1", "/api");
-    p1.plugins = vec![
-        PluginAssociation {
-            plugin_config_id: "pc1".into(),
-        },
-        PluginAssociation {
-            plugin_config_id: "pc2".into(),
-        },
-    ];
-    config.proxies = vec![p1];
-    let err = config.validate_unique_plugins_per_proxy().unwrap_err();
-    assert_eq!(err.len(), 1);
-    assert!(err[0].contains("duplicate plugin 'rate_limiting'"));
+fn test_plugin_config_priority_override_none_valid() {
+    let pc = PluginConfig {
+        id: "pc1".into(),
+        plugin_name: "rate_limiting".into(),
+        config: serde_json::json!({}),
+        scope: PluginScope::Global,
+        proxy_id: None,
+        enabled: true,
+        priority_override: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+    assert!(pc.validate_fields().is_ok());
+}
+
+#[test]
+fn test_plugin_config_priority_override_too_high() {
+    let pc = PluginConfig {
+        id: "pc1".into(),
+        plugin_name: "rate_limiting".into(),
+        config: serde_json::json!({}),
+        scope: PluginScope::Global,
+        proxy_id: None,
+        enabled: true,
+        priority_override: Some(10001),
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+    let err = pc.validate_fields().unwrap_err();
+    assert!(err[0].contains("priority_override must be between 0 and 10000"));
+}
+
+#[test]
+fn test_plugin_config_priority_override_boundary() {
+    let pc = PluginConfig {
+        id: "pc1".into(),
+        plugin_name: "rate_limiting".into(),
+        config: serde_json::json!({}),
+        scope: PluginScope::Global,
+        proxy_id: None,
+        enabled: true,
+        priority_override: Some(10000),
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+    assert!(pc.validate_fields().is_ok());
+}
+
+#[test]
+fn test_plugin_config_priority_override_zero() {
+    let pc = PluginConfig {
+        id: "pc1".into(),
+        plugin_name: "rate_limiting".into(),
+        config: serde_json::json!({}),
+        scope: PluginScope::Global,
+        proxy_id: None,
+        enabled: true,
+        priority_override: Some(0),
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+    assert!(pc.validate_fields().is_ok());
+}
+
+#[test]
+fn test_plugin_config_priority_override_serde_roundtrip() {
+    let pc = PluginConfig {
+        id: "pc1".into(),
+        plugin_name: "cors".into(),
+        config: serde_json::json!({}),
+        scope: PluginScope::Global,
+        proxy_id: None,
+        enabled: true,
+        priority_override: Some(42),
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+    let json = serde_json::to_string(&pc).unwrap();
+    assert!(json.contains("\"priority_override\":42"));
+
+    let deserialized: PluginConfig = serde_json::from_str(&json).unwrap();
+    assert_eq!(deserialized.priority_override, Some(42));
+}
+
+#[test]
+fn test_plugin_config_priority_override_absent_in_json() {
+    // When priority_override is absent from JSON, it defaults to None
+    let json = r#"{
+        "id": "pc1",
+        "plugin_name": "cors",
+        "config": {},
+        "scope": "global",
+        "enabled": true
+    }"#;
+    let pc: PluginConfig = serde_json::from_str(json).unwrap();
+    assert_eq!(pc.priority_override, None);
+}
+
+#[test]
+fn test_plugin_config_priority_override_null_in_json() {
+    let json = r#"{
+        "id": "pc1",
+        "plugin_name": "cors",
+        "config": {},
+        "scope": "global",
+        "enabled": true,
+        "priority_override": null
+    }"#;
+    let pc: PluginConfig = serde_json::from_str(json).unwrap();
+    assert_eq!(pc.priority_override, None);
 }
 
 #[test]
@@ -698,6 +749,7 @@ fn test_validate_plugin_references_rejects_global_plugin_association() {
         scope: PluginScope::Global,
         proxy_id: None,
         enabled: true,
+        priority_override: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }];
@@ -724,6 +776,7 @@ fn test_validate_plugin_references_rejects_wrong_proxy_target() {
         scope: PluginScope::Proxy,
         proxy_id: Some("other-proxy".into()),
         enabled: true,
+        priority_override: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }];

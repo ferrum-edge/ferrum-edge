@@ -34,7 +34,6 @@ use tracing::{debug, error, info, warn};
 
 struct PluginConfigRef {
     id: String,
-    plugin_name: String,
     scope: PluginScope,
     proxy_id: Option<String>,
 }
@@ -444,13 +443,6 @@ impl DatabaseStore {
                 error!("{}", msg);
             }
             anyhow::bail!("Database has invalid plugin reference(s)");
-        }
-
-        if let Err(errors) = config.validate_unique_plugins_per_proxy() {
-            for msg in &errors {
-                error!("{}", msg);
-            }
-            anyhow::bail!("Database has duplicate plugins per proxy");
         }
 
         self.check_slow_query("load_full_config", start);
@@ -909,7 +901,7 @@ impl DatabaseStore {
             PluginScope::Global => "global",
         };
         sqlx::query(
-            &self.q("INSERT INTO plugin_configs (id, plugin_name, config, scope, proxy_id, enabled, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+            &self.q("INSERT INTO plugin_configs (id, plugin_name, config, scope, proxy_id, enabled, priority_override, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
         )
         .bind(&pc.id)
         .bind(&pc.plugin_name)
@@ -917,6 +909,7 @@ impl DatabaseStore {
         .bind(scope_str)
         .bind(&pc.proxy_id)
         .bind(if pc.enabled { 1i32 } else { 0 })
+        .bind(pc.priority_override.map(|v| v as i32))
         .bind(pc.created_at.to_rfc3339())
         .bind(pc.updated_at.to_rfc3339())
         .execute(&self.pool())
@@ -934,13 +927,14 @@ impl DatabaseStore {
             PluginScope::Global => "global",
         };
         sqlx::query(
-            &self.q("UPDATE plugin_configs SET plugin_name=?, config=?, scope=?, proxy_id=?, enabled=?, updated_at=? WHERE id=?")
+            &self.q("UPDATE plugin_configs SET plugin_name=?, config=?, scope=?, proxy_id=?, enabled=?, priority_override=?, updated_at=? WHERE id=?")
         )
         .bind(&pc.plugin_name)
         .bind(&config_json)
         .bind(scope_str)
         .bind(&pc.proxy_id)
         .bind(if pc.enabled { 1i32 } else { 0 })
+        .bind(pc.priority_override.map(|v| v as i32))
         .bind(Utc::now().to_rfc3339())
         .bind(&pc.id)
         .execute(&self.pool())
@@ -1506,8 +1500,6 @@ impl DatabaseStore {
         }
 
         let plugin_refs = self.load_plugin_config_refs(&requested_ids).await?;
-        let mut seen_names: std::collections::HashMap<String, String> =
-            std::collections::HashMap::new();
 
         for assoc in associations {
             match plugin_refs.get(assoc.plugin_config_id.as_str()) {
@@ -1525,15 +1517,6 @@ impl DatabaseStore {
                             proxy_id,
                             plugin.id,
                             plugin.proxy_id.as_deref().unwrap_or("<none>")
-                        ));
-                        continue;
-                    }
-                    if let Some(existing_config_id) =
-                        seen_names.insert(plugin.plugin_name.clone(), plugin.id.clone())
-                    {
-                        errors.push(format!(
-                            "Proxy '{}' has duplicate plugin '{}' (config IDs '{}' and '{}')",
-                            proxy_id, plugin.plugin_name, existing_config_id, plugin.id
                         ));
                     }
                 }
@@ -1802,7 +1785,7 @@ impl DatabaseStore {
             .collect::<Vec<_>>()
             .join(", ");
         let sql = self.q(&format!(
-            "SELECT id, plugin_name, scope, proxy_id FROM plugin_configs WHERE id IN ({})",
+            "SELECT id, scope, proxy_id FROM plugin_configs WHERE id IN ({})",
             placeholders
         ));
 
@@ -1823,7 +1806,6 @@ impl DatabaseStore {
                 id.clone(),
                 PluginConfigRef {
                     id,
-                    plugin_name: row.try_get("plugin_name")?,
                     scope,
                     proxy_id: row.try_get("proxy_id").ok(),
                 },
@@ -2124,7 +2106,7 @@ impl DatabaseStore {
         configs: &[PluginConfig],
     ) -> Result<usize, anyhow::Error> {
         let mut tx = self.pool().begin().await?;
-        let sql = self.q("INSERT INTO plugin_configs (id, plugin_name, config, scope, proxy_id, enabled, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
+        let sql = self.q("INSERT INTO plugin_configs (id, plugin_name, config, scope, proxy_id, enabled, priority_override, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)");
 
         for pc in configs {
             let config_json = serde_json::to_string(&pc.config)?;
@@ -2139,6 +2121,7 @@ impl DatabaseStore {
                 .bind(scope_str)
                 .bind(&pc.proxy_id)
                 .bind(if pc.enabled { 1i32 } else { 0 })
+                .bind(pc.priority_override.map(|v| v as i32))
                 .bind(pc.created_at.to_rfc3339())
                 .bind(pc.updated_at.to_rfc3339())
                 .execute(&mut *tx)
@@ -2868,6 +2851,11 @@ fn row_to_plugin_config(row: &AnyRow) -> Result<PluginConfig, anyhow::Error> {
         },
         proxy_id: row.try_get("proxy_id").ok(),
         enabled: row.try_get::<i32, _>("enabled").unwrap_or(1) != 0,
+        priority_override: row
+            .try_get::<Option<i32>, _>("priority_override")
+            .ok()
+            .flatten()
+            .map(|v| v as u16),
         created_at: parse_datetime_column(row, "created_at"),
         updated_at: parse_datetime_column(row, "updated_at"),
     })

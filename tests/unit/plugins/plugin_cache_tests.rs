@@ -86,6 +86,7 @@ fn make_plugin_config(
         scope,
         proxy_id: proxy_id.map(|s| s.to_string()),
         enabled,
+        priority_override: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }
@@ -314,6 +315,7 @@ fn test_request_body_buffering_upper_bound_is_config_sensitive() {
                 scope: PluginScope::Proxy,
                 proxy_id: Some("graphql-empty".to_string()),
                 enabled: true,
+                priority_override: None,
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
             },
@@ -324,6 +326,7 @@ fn test_request_body_buffering_upper_bound_is_config_sensitive() {
                 scope: PluginScope::Proxy,
                 proxy_id: Some("graphql-guarded".to_string()),
                 enabled: true,
+                priority_override: None,
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
             },
@@ -334,6 +337,7 @@ fn test_request_body_buffering_upper_bound_is_config_sensitive() {
                 scope: PluginScope::Proxy,
                 proxy_id: Some("response-only".to_string()),
                 enabled: true,
+                priority_override: None,
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
             },
@@ -344,6 +348,7 @@ fn test_request_body_buffering_upper_bound_is_config_sensitive() {
                 scope: PluginScope::Proxy,
                 proxy_id: Some("request-xml".to_string()),
                 enabled: true,
+                priority_override: None,
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
             },
@@ -450,6 +455,7 @@ async fn test_cors_preflight_runs_before_request_termination() {
                 scope: PluginScope::Proxy,
                 proxy_id: Some("p1".to_string()),
                 enabled: true,
+                priority_override: None,
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
             },
@@ -460,6 +466,7 @@ async fn test_cors_preflight_runs_before_request_termination() {
                 scope: PluginScope::Proxy,
                 proxy_id: Some("p1".to_string()),
                 enabled: true,
+                priority_override: None,
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
             },
@@ -546,6 +553,7 @@ async fn test_rate_limiter_state_persists_across_calls() {
             scope: PluginScope::Global,
             proxy_id: None,
             enabled: true,
+            priority_override: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }],
@@ -695,6 +703,7 @@ fn test_apply_delta_rejects_invalid_security_plugin() {
                 scope: PluginScope::Proxy,
                 proxy_id: Some("p1".to_string()),
                 enabled: true,
+                priority_override: None,
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
             },
@@ -763,6 +772,7 @@ fn make_plugin_config_with_json(
         scope,
         proxy_id: proxy_id.map(|s| s.to_string()),
         enabled: true,
+        priority_override: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }
@@ -1304,4 +1314,227 @@ fn test_plugin_cache_rebuild_adds_ws_frame_hooks_flag() {
         cache.requires_ws_frame_hooks("p1"),
         "requires_ws_frame_hooks must be TRUE after rebuild adds ws_frame_logging"
     );
+}
+
+// ---- Multi-instance same-type plugins ----
+
+fn make_plugin_config_with_priority(
+    id: &str,
+    plugin_name: &str,
+    scope: PluginScope,
+    proxy_id: Option<&str>,
+    enabled: bool,
+    priority_override: Option<u16>,
+) -> PluginConfig {
+    let config = match plugin_name {
+        "access_control" => json!({"allowed_consumers": ["testuser"]}),
+        "tcp_connection_throttle" => json!({"max_connections_per_key": 10}),
+        "ip_restriction" => json!({"allow": ["0.0.0.0/0"]}),
+        _ => json!({}),
+    };
+    PluginConfig {
+        id: id.to_string(),
+        plugin_name: plugin_name.to_string(),
+        config,
+        scope,
+        proxy_id: proxy_id.map(|s| s.to_string()),
+        enabled,
+        priority_override,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    }
+}
+
+#[test]
+fn test_multiple_same_type_proxy_plugins_both_present() {
+    // Two proxy-scoped stdout_logging plugins on the same proxy — both should be present
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["ps1", "ps2"])],
+        vec![
+            make_plugin_config(
+                "ps1",
+                "stdout_logging",
+                PluginScope::Proxy,
+                Some("p1"),
+                true,
+            ),
+            make_plugin_config(
+                "ps2",
+                "stdout_logging",
+                PluginScope::Proxy,
+                Some("p1"),
+                true,
+            ),
+        ],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+    let plugins = cache.get_plugins("p1");
+
+    // Both instances should be present
+    assert_eq!(plugins.len(), 2);
+    assert_eq!(plugins[0].name(), "stdout_logging");
+    assert_eq!(plugins[1].name(), "stdout_logging");
+}
+
+#[test]
+fn test_proxy_scoped_plugin_removes_only_global_of_same_name() {
+    // A global stdout_logging and two proxy-scoped stdout_logging instances.
+    // The global should be replaced but both proxy-scoped should remain.
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["ps1", "ps2"])],
+        vec![
+            make_plugin_config("g1", "stdout_logging", PluginScope::Global, None, true),
+            make_plugin_config(
+                "ps1",
+                "stdout_logging",
+                PluginScope::Proxy,
+                Some("p1"),
+                true,
+            ),
+            make_plugin_config(
+                "ps2",
+                "stdout_logging",
+                PluginScope::Proxy,
+                Some("p1"),
+                true,
+            ),
+        ],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+    let plugins = cache.get_plugins("p1");
+
+    // Global is removed, both proxy-scoped remain = 2
+    assert_eq!(plugins.len(), 2);
+    assert!(plugins.iter().all(|p| p.name() == "stdout_logging"));
+}
+
+#[test]
+fn test_proxy_without_scoped_keeps_global() {
+    // Proxy p2 has no proxy-scoped plugins, so it should keep the global
+    let config = make_config(
+        vec![
+            make_proxy("p1", "/api", vec!["ps1"]),
+            make_proxy("p2", "/web", vec![]),
+        ],
+        vec![
+            make_plugin_config("g1", "stdout_logging", PluginScope::Global, None, true),
+            make_plugin_config(
+                "ps1",
+                "stdout_logging",
+                PluginScope::Proxy,
+                Some("p1"),
+                true,
+            ),
+        ],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+
+    // p1: proxy-scoped replaces global = 1
+    assert_eq!(cache.get_plugins("p1").len(), 1);
+    // p2: keeps global = 1
+    assert_eq!(cache.get_plugins("p2").len(), 1);
+}
+
+#[test]
+fn test_priority_override_changes_sort_order() {
+    // Two stdout_logging instances with priority overrides that reverse their order
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["ps1", "ps2"])],
+        vec![
+            make_plugin_config_with_priority(
+                "ps1",
+                "stdout_logging",
+                PluginScope::Proxy,
+                Some("p1"),
+                true,
+                Some(9200), // higher = runs later
+            ),
+            make_plugin_config_with_priority(
+                "ps2",
+                "stdout_logging",
+                PluginScope::Proxy,
+                Some("p1"),
+                true,
+                Some(9000), // lower = runs first
+            ),
+        ],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+    let plugins = cache.get_plugins("p1");
+
+    assert_eq!(plugins.len(), 2);
+    // ps2 (priority 9000) should come first, ps1 (priority 9200) second
+    assert_eq!(plugins[0].priority(), 9000);
+    assert_eq!(plugins[1].priority(), 9200);
+}
+
+#[test]
+fn test_priority_override_applied_correctly() {
+    // A single plugin with priority_override should report the overridden value
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["ps1"])],
+        vec![make_plugin_config_with_priority(
+            "ps1",
+            "stdout_logging",
+            PluginScope::Proxy,
+            Some("p1"),
+            true,
+            Some(100),
+        )],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+    let plugins = cache.get_plugins("p1");
+
+    assert_eq!(plugins.len(), 1);
+    assert_eq!(plugins[0].priority(), 100);
+    assert_eq!(plugins[0].name(), "stdout_logging");
+}
+
+#[test]
+fn test_multiple_same_type_with_different_plugins_mixed() {
+    // Two stdout_logging + one cors on the same proxy — all three should be present
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["ps1", "ps2", "ps3"])],
+        vec![
+            make_plugin_config(
+                "ps1",
+                "stdout_logging",
+                PluginScope::Proxy,
+                Some("p1"),
+                true,
+            ),
+            make_plugin_config(
+                "ps2",
+                "stdout_logging",
+                PluginScope::Proxy,
+                Some("p1"),
+                true,
+            ),
+            make_plugin_config("ps3", "cors", PluginScope::Proxy, Some("p1"), true),
+        ],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+    let plugins = cache.get_plugins("p1");
+
+    assert_eq!(plugins.len(), 3);
+    let names: Vec<&str> = plugins.iter().map(|p| p.name()).collect();
+    assert_eq!(names.iter().filter(|&&n| n == "stdout_logging").count(), 2);
+    assert_eq!(names.iter().filter(|&&n| n == "cors").count(), 1);
+}
+
+#[test]
+fn test_multiple_global_same_type_plugins() {
+    // Two global stdout_logging plugins — both should be present on all proxies
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec![])],
+        vec![
+            make_plugin_config("g1", "stdout_logging", PluginScope::Global, None, true),
+            make_plugin_config("g2", "stdout_logging", PluginScope::Global, None, true),
+        ],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+    let plugins = cache.get_plugins("p1");
+
+    assert_eq!(plugins.len(), 2);
+    assert!(plugins.iter().all(|p| p.name() == "stdout_logging"));
 }

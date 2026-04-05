@@ -215,6 +215,7 @@ impl V001InitialSchema {
                 scope VARCHAR(50) NOT NULL DEFAULT 'global',
                 proxy_id VARCHAR(255),
                 enabled INTEGER NOT NULL DEFAULT 1,
+                priority_override INTEGER DEFAULT NULL,
                 created_at VARCHAR(50) NOT NULL,
                 updated_at VARCHAR(50) NOT NULL,
                 CONSTRAINT fk_plugin_configs_proxy FOREIGN KEY (proxy_id) REFERENCES proxies(id) ON DELETE CASCADE
@@ -229,6 +230,7 @@ impl V001InitialSchema {
                 scope TEXT NOT NULL DEFAULT 'global',
                 proxy_id TEXT REFERENCES proxies(id) ON DELETE CASCADE,
                 enabled INTEGER NOT NULL DEFAULT 1,
+                priority_override INTEGER DEFAULT NULL,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             )

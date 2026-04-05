@@ -140,6 +140,7 @@ fn create_test_gateway_config() -> GatewayConfig {
             scope: PluginScope::Global,
             enabled: true,
             proxy_id: None,
+            priority_override: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }],
@@ -824,6 +825,7 @@ fn create_pagination_test_config() -> GatewayConfig {
             scope: PluginScope::Global,
             enabled: true,
             proxy_id: None,
+            priority_override: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         });

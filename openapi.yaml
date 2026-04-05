@@ -1540,6 +1540,16 @@ components:
         enabled:
           type: boolean
           default: true
+        priority_override:
+          type: [integer, "null"]
+          minimum: 0
+          maximum: 10000
+          description: >-
+            Optional execution priority override. When set, replaces the plugin's
+            built-in priority constant. Lower values execute first. Useful when
+            multiple instances of the same plugin type are attached to a proxy
+            (e.g., two http_logging instances shipping to Splunk and Datadog).
+            When null (default), the plugin uses its built-in priority.
         created_at:
           type: [string, "null"]
           format: date-time

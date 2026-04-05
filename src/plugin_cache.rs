@@ -24,7 +24,176 @@ use tracing::{error, warn};
 use crate::config::types::PluginConfig;
 use crate::plugins::{Plugin, PluginHttpClient, ProxyProtocol, create_plugin_with_http_client};
 
-/// Try to create a plugin, logging validation errors.
+// ---------------------------------------------------------------------------
+// PriorityOverridePlugin — wraps any plugin with a user-specified priority
+// ---------------------------------------------------------------------------
+
+use crate::plugins::{
+    PluginResult, RequestContext, StreamConnectionContext, StreamTransactionSummary,
+    TransactionSummary, UdpDatagramContext, UdpDatagramVerdict, WebSocketFrameDirection,
+};
+use async_trait::async_trait;
+
+/// Thin wrapper that overrides a plugin's built-in priority with a
+/// user-configured value from `PluginConfig.priority_override`.
+struct PriorityOverridePlugin {
+    inner: Arc<dyn Plugin>,
+    priority: u16,
+}
+
+#[async_trait]
+impl Plugin for PriorityOverridePlugin {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+    fn priority(&self) -> u16 {
+        self.priority
+    }
+    async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult {
+        self.inner.on_request_received(ctx).await
+    }
+    async fn authenticate(
+        &self,
+        ctx: &mut RequestContext,
+        consumer_index: &crate::consumer_index::ConsumerIndex,
+    ) -> PluginResult {
+        self.inner.authenticate(ctx, consumer_index).await
+    }
+    async fn authorize(&self, ctx: &mut RequestContext) -> PluginResult {
+        self.inner.authorize(ctx).await
+    }
+    fn modifies_request_headers(&self) -> bool {
+        self.inner.modifies_request_headers()
+    }
+    fn modifies_request_body(&self) -> bool {
+        self.inner.modifies_request_body()
+    }
+    fn requires_request_body_before_before_proxy(&self) -> bool {
+        self.inner.requires_request_body_before_before_proxy()
+    }
+    fn requires_request_body_buffering(&self) -> bool {
+        self.inner.requires_request_body_buffering()
+    }
+    async fn before_proxy(
+        &self,
+        ctx: &mut RequestContext,
+        headers: &mut std::collections::HashMap<String, String>,
+    ) -> PluginResult {
+        self.inner.before_proxy(ctx, headers).await
+    }
+    fn should_buffer_request_body(&self, ctx: &RequestContext) -> bool {
+        self.inner.should_buffer_request_body(ctx)
+    }
+    async fn after_proxy(
+        &self,
+        ctx: &mut RequestContext,
+        response_status: u16,
+        response_headers: &mut std::collections::HashMap<String, String>,
+    ) -> PluginResult {
+        self.inner
+            .after_proxy(ctx, response_status, response_headers)
+            .await
+    }
+    fn applies_after_proxy_on_reject(&self) -> bool {
+        self.inner.applies_after_proxy_on_reject()
+    }
+    fn requires_response_body_buffering(&self) -> bool {
+        self.inner.requires_response_body_buffering()
+    }
+    async fn on_response_body(
+        &self,
+        ctx: &mut RequestContext,
+        response_status: u16,
+        response_headers: &std::collections::HashMap<String, String>,
+        body: &[u8],
+    ) -> PluginResult {
+        self.inner
+            .on_response_body(ctx, response_status, response_headers, body)
+            .await
+    }
+    async fn transform_request_body(
+        &self,
+        body: &[u8],
+        content_type: Option<&str>,
+        request_headers: &std::collections::HashMap<String, String>,
+    ) -> Option<Vec<u8>> {
+        self.inner
+            .transform_request_body(body, content_type, request_headers)
+            .await
+    }
+    async fn on_final_request_body(
+        &self,
+        headers: &std::collections::HashMap<String, String>,
+        body: &[u8],
+    ) -> PluginResult {
+        self.inner.on_final_request_body(headers, body).await
+    }
+    async fn transform_response_body(
+        &self,
+        body: &[u8],
+        content_type: Option<&str>,
+        response_headers: &std::collections::HashMap<String, String>,
+    ) -> Option<Vec<u8>> {
+        self.inner
+            .transform_response_body(body, content_type, response_headers)
+            .await
+    }
+    async fn on_final_response_body(
+        &self,
+        ctx: &mut RequestContext,
+        response_status: u16,
+        response_headers: &std::collections::HashMap<String, String>,
+        body: &[u8],
+    ) -> PluginResult {
+        self.inner
+            .on_final_response_body(ctx, response_status, response_headers, body)
+            .await
+    }
+    async fn log(&self, summary: &TransactionSummary) {
+        self.inner.log(summary).await;
+    }
+    fn is_auth_plugin(&self) -> bool {
+        self.inner.is_auth_plugin()
+    }
+    fn warmup_hostnames(&self) -> Vec<String> {
+        self.inner.warmup_hostnames()
+    }
+    fn supported_protocols(&self) -> &'static [ProxyProtocol] {
+        self.inner.supported_protocols()
+    }
+    fn tracked_keys_count(&self) -> Option<usize> {
+        self.inner.tracked_keys_count()
+    }
+    async fn on_stream_connect(&self, ctx: &mut StreamConnectionContext) -> PluginResult {
+        self.inner.on_stream_connect(ctx).await
+    }
+    async fn on_stream_disconnect(&self, summary: &StreamTransactionSummary) {
+        self.inner.on_stream_disconnect(summary).await;
+    }
+    fn requires_ws_frame_hooks(&self) -> bool {
+        self.inner.requires_ws_frame_hooks()
+    }
+    async fn on_ws_frame(
+        &self,
+        proxy_id: &str,
+        connection_id: u64,
+        direction: WebSocketFrameDirection,
+        message: &tokio_tungstenite::tungstenite::Message,
+    ) -> Option<tokio_tungstenite::tungstenite::Message> {
+        self.inner
+            .on_ws_frame(proxy_id, connection_id, direction, message)
+            .await
+    }
+    fn requires_udp_datagram_hooks(&self) -> bool {
+        self.inner.requires_udp_datagram_hooks()
+    }
+    async fn on_udp_datagram(&self, ctx: &UdpDatagramContext) -> UdpDatagramVerdict {
+        self.inner.on_udp_datagram(ctx).await
+    }
+}
+
+/// Try to create a plugin, logging validation errors. Applies
+/// `priority_override` from the plugin config when set.
 ///
 /// For security-critical plugins (auth, access_control, ip_restriction),
 /// validation errors are propagated as `Err` so the gateway can refuse to start.
@@ -34,7 +203,16 @@ fn try_create_plugin(
     http_client: &PluginHttpClient,
 ) -> Result<Option<Arc<dyn Plugin>>, String> {
     match create_plugin_with_http_client(&pc.plugin_name, &pc.config, http_client.clone()) {
-        Ok(Some(plugin)) => Ok(Some(plugin)),
+        Ok(Some(plugin)) => {
+            if let Some(priority) = pc.priority_override {
+                Ok(Some(Arc::new(PriorityOverridePlugin {
+                    inner: plugin,
+                    priority,
+                })))
+            } else {
+                Ok(Some(plugin))
+            }
+        }
         Ok(None) => {
             warn!(
                 "Unknown plugin '{}' (plugin_config_id={}), skipping",
@@ -317,6 +495,10 @@ impl PluginCache {
             }
 
             let mut merged: Vec<Arc<dyn Plugin>> = new_globals.as_ref().clone();
+            let global_ptrs: HashSet<usize> = merged
+                .iter()
+                .map(|p| Arc::as_ptr(p) as *const () as usize)
+                .collect();
 
             if let Some(scoped_configs) = proxy_scoped_configs.get(proxy.id.as_str()) {
                 let proxy_plugin_ids: HashSet<&str> = proxy
@@ -329,7 +511,12 @@ impl PluginCache {
                     if proxy_plugin_ids.contains(pc.id.as_str()) {
                         match try_create_plugin(pc, &self.http_client) {
                             Ok(Some(plugin)) => {
-                                merged.retain(|p| p.name() != plugin.name());
+                                // Remove only GLOBAL plugins of the same name
+                                merged.retain(|p| {
+                                    p.name() != plugin.name()
+                                        || !global_ptrs
+                                            .contains(&(Arc::as_ptr(p) as *const () as usize))
+                                });
                                 merged.push(plugin);
                             }
                             Ok(None) => {}
@@ -649,6 +836,13 @@ impl PluginCache {
         for proxy in &config.proxies {
             // Start with global plugins
             let mut merged = global_plugins.clone(); // Clones Arcs, not instances
+            // Track which Arc pointers came from the global list so we can
+            // selectively remove only globals when a proxy-scoped plugin of
+            // the same name is added (preserving other proxy-scoped instances).
+            let global_ptrs: HashSet<usize> = merged
+                .iter()
+                .map(|p| Arc::as_ptr(p) as *const () as usize)
+                .collect();
 
             // Only look at plugin configs indexed for this proxy (O(plugins_per_proxy))
             if let Some(scoped_configs) = proxy_scoped_configs.get(proxy.id.as_str()) {
@@ -662,8 +856,14 @@ impl PluginCache {
                     if proxy_plugin_ids.contains(pc.id.as_str()) {
                         match try_create_plugin(pc, http_client) {
                             Ok(Some(plugin)) => {
-                                // Remove any global plugin of the same name
-                                merged.retain(|p| p.name() != plugin.name());
+                                // Remove only GLOBAL plugins of the same name —
+                                // other proxy-scoped instances are preserved,
+                                // allowing multiple instances of the same plugin type.
+                                merged.retain(|p| {
+                                    p.name() != plugin.name()
+                                        || !global_ptrs
+                                            .contains(&(Arc::as_ptr(p) as *const () as usize))
+                                });
                                 merged.push(plugin);
                             }
                             Ok(None) => {}

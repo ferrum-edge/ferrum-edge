@@ -240,17 +240,6 @@ pub fn load_config_from_file(
         );
     }
 
-    // Validate plugin name uniqueness per proxy.
-    if let Err(errors) = config.validate_unique_plugins_per_proxy() {
-        for msg in &errors {
-            error!("{}", msg);
-        }
-        anyhow::bail!(
-            "Configuration validation failed: {} duplicate plugin(s) per proxy found",
-            errors.len()
-        );
-    }
-
     // Validate stream proxy (TCP/UDP) configuration
     if let Err(errors) = config.validate_stream_proxies() {
         for msg in &errors {

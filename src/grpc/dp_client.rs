@@ -297,13 +297,6 @@ pub async fn connect_and_subscribe_with_startup_ready(
                             error!("Ignoring config update with invalid plugin references");
                             continue;
                         }
-                        if let Err(errors) = config.validate_unique_plugins_per_proxy() {
-                            for msg in &errors {
-                                error!("CP config rejected — {}", msg);
-                            }
-                            error!("Ignoring config update with duplicate proxy plugins");
-                            continue;
-                        }
                         proxy_state.update_config(config);
                         if !initial_snapshot_applied {
                             proxy_state

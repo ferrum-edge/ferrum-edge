@@ -105,6 +105,7 @@ fn make_plugin_config(id: &str) -> PluginConfig {
         scope: PluginScope::Global,
         proxy_id: None,
         enabled: true,
+        priority_override: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }

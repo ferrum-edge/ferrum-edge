@@ -2792,8 +2792,6 @@ async fn handle_batch_create(
         }
 
         let mut unresolved = Vec::new();
-        let mut seen_plugin_names: std::collections::HashMap<String, String> =
-            std::collections::HashMap::new();
 
         for assoc in &proxy.plugins {
             match batch_plugin_configs.get(assoc.plugin_config_id.as_str()) {
@@ -2811,15 +2809,6 @@ async fn handle_batch_create(
                             proxy.id,
                             plugin_config.id,
                             plugin_config.proxy_id.as_deref().unwrap_or("<none>")
-                        ));
-                        continue;
-                    }
-                    if let Some(existing_id) = seen_plugin_names
-                        .insert(plugin_config.plugin_name.clone(), plugin_config.id.clone())
-                    {
-                        validation_errors.push(format!(
-                            "Proxy '{}' has duplicate plugin '{}' (config IDs '{}' and '{}')",
-                            proxy.id, plugin_config.plugin_name, existing_id, plugin_config.id
                         ));
                     }
                 }
@@ -3275,10 +3264,6 @@ async fn handle_restore(
         if let Err(errs) = temp_config.validate_plugin_references() {
             validation_errors.extend(errs);
         }
-        if let Err(errs) = temp_config.validate_unique_plugins_per_proxy() {
-            validation_errors.extend(errs);
-        }
-
         if !validation_errors.is_empty() {
             return Ok(json_response(
                 StatusCode::BAD_REQUEST,

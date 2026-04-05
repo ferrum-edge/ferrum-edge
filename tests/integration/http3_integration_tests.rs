@@ -783,6 +783,7 @@ async fn test_http3_streaming_decision_logic() {
             config: serde_json::json!({}),
             scope: PluginScope::Proxy,
             proxy_id: Some("h3-body-plugin".to_string()),
+            priority_override: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         }],
