@@ -97,14 +97,14 @@ fn hmac_auth_header(username: &str, algorithm: Option<&str>, signature: &str) ->
 
 #[tokio::test]
 async fn test_hmac_auth_plugin_creation() {
-    let plugin = HmacAuth::new(&json!({}));
+    let plugin = HmacAuth::new(&json!({})).unwrap();
     assert_eq!(plugin.name(), "hmac_auth");
     assert!(plugin.is_auth_plugin());
 }
 
 #[tokio::test]
 async fn test_hmac_auth_custom_clock_skew() {
-    let plugin = HmacAuth::new(&json!({"clock_skew_seconds": 600}));
+    let plugin = HmacAuth::new(&json!({"clock_skew_seconds": 600})).unwrap();
     assert_eq!(plugin.name(), "hmac_auth");
 }
 
@@ -112,7 +112,7 @@ async fn test_hmac_auth_custom_clock_skew() {
 
 #[tokio::test]
 async fn test_valid_hmac_sha256() {
-    let plugin = HmacAuth::new(&json!({}));
+    let plugin = HmacAuth::new(&json!({})).unwrap();
     let consumer = create_hmac_consumer();
     let consumer_index = ConsumerIndex::new(&[consumer]);
 
@@ -142,7 +142,7 @@ async fn test_valid_hmac_sha256() {
 
 #[tokio::test]
 async fn test_valid_hmac_sha512() {
-    let plugin = HmacAuth::new(&json!({}));
+    let plugin = HmacAuth::new(&json!({})).unwrap();
     let consumer = create_hmac_consumer();
     let consumer_index = ConsumerIndex::new(&[consumer]);
 
@@ -172,7 +172,7 @@ async fn test_valid_hmac_sha512() {
 
 #[tokio::test]
 async fn test_missing_authorization_header() {
-    let plugin = HmacAuth::new(&json!({}));
+    let plugin = HmacAuth::new(&json!({})).unwrap();
     let consumer_index = ConsumerIndex::new(&[create_hmac_consumer()]);
 
     let mut ctx = make_ctx("GET", "/test");
@@ -187,7 +187,7 @@ async fn test_missing_authorization_header() {
 
 #[tokio::test]
 async fn test_invalid_auth_format_bearer() {
-    let plugin = HmacAuth::new(&json!({}));
+    let plugin = HmacAuth::new(&json!({})).unwrap();
     let consumer_index = ConsumerIndex::new(&[create_hmac_consumer()]);
 
     let mut ctx = make_ctx("GET", "/test");
@@ -201,7 +201,7 @@ async fn test_invalid_auth_format_bearer() {
 
 #[tokio::test]
 async fn test_invalid_auth_format_basic() {
-    let plugin = HmacAuth::new(&json!({}));
+    let plugin = HmacAuth::new(&json!({})).unwrap();
     let consumer_index = ConsumerIndex::new(&[create_hmac_consumer()]);
 
     let mut ctx = make_ctx("GET", "/test");
@@ -219,7 +219,7 @@ async fn test_invalid_auth_format_basic() {
 
 #[tokio::test]
 async fn test_missing_username() {
-    let plugin = HmacAuth::new(&json!({}));
+    let plugin = HmacAuth::new(&json!({})).unwrap();
     let consumer_index = ConsumerIndex::new(&[create_hmac_consumer()]);
 
     let mut ctx = make_ctx("GET", "/test");
@@ -237,7 +237,7 @@ async fn test_missing_username() {
 
 #[tokio::test]
 async fn test_missing_signature() {
-    let plugin = HmacAuth::new(&json!({}));
+    let plugin = HmacAuth::new(&json!({})).unwrap();
     let consumer_index = ConsumerIndex::new(&[create_hmac_consumer()]);
 
     let mut ctx = make_ctx("GET", "/test");
@@ -256,7 +256,7 @@ async fn test_missing_signature() {
 
 #[tokio::test]
 async fn test_missing_date_header() {
-    let plugin = HmacAuth::new(&json!({}));
+    let plugin = HmacAuth::new(&json!({})).unwrap();
     let consumer = create_hmac_consumer();
     let consumer_index = ConsumerIndex::new(&[consumer]);
 
@@ -282,7 +282,7 @@ async fn test_missing_date_header() {
 #[tokio::test]
 async fn test_expired_date_header() {
     // Use a very tight clock skew of 1 second
-    let plugin = HmacAuth::new(&json!({"clock_skew_seconds": 1}));
+    let plugin = HmacAuth::new(&json!({"clock_skew_seconds": 1})).unwrap();
     let consumer = create_hmac_consumer();
     let consumer_index = ConsumerIndex::new(&[consumer]);
 
@@ -306,7 +306,7 @@ async fn test_expired_date_header() {
 
 #[tokio::test]
 async fn test_unparseable_date_header() {
-    let plugin = HmacAuth::new(&json!({}));
+    let plugin = HmacAuth::new(&json!({})).unwrap();
     let consumer = create_hmac_consumer();
     let consumer_index = ConsumerIndex::new(&[consumer]);
 
@@ -331,7 +331,7 @@ async fn test_unparseable_date_header() {
 
 #[tokio::test]
 async fn test_unknown_consumer() {
-    let plugin = HmacAuth::new(&json!({}));
+    let plugin = HmacAuth::new(&json!({})).unwrap();
     let consumer_index = ConsumerIndex::new(&[create_hmac_consumer()]);
 
     let method = "GET";
@@ -353,7 +353,7 @@ async fn test_unknown_consumer() {
 
 #[tokio::test]
 async fn test_empty_consumer_index() {
-    let plugin = HmacAuth::new(&json!({}));
+    let plugin = HmacAuth::new(&json!({})).unwrap();
     let consumer_index = ConsumerIndex::new(&[]);
 
     let method = "GET";
@@ -377,7 +377,7 @@ async fn test_empty_consumer_index() {
 
 #[tokio::test]
 async fn test_consumer_without_hmac_credentials() {
-    let plugin = HmacAuth::new(&json!({}));
+    let plugin = HmacAuth::new(&json!({})).unwrap();
     let consumer = create_consumer_without_hmac_creds();
     let consumer_index = ConsumerIndex::new(&[consumer]);
 
@@ -402,7 +402,7 @@ async fn test_consumer_without_hmac_credentials() {
 
 #[tokio::test]
 async fn test_invalid_signature() {
-    let plugin = HmacAuth::new(&json!({}));
+    let plugin = HmacAuth::new(&json!({})).unwrap();
     let consumer = create_hmac_consumer();
     let consumer_index = ConsumerIndex::new(&[consumer]);
 
@@ -428,7 +428,7 @@ async fn test_invalid_signature() {
 
 #[tokio::test]
 async fn test_signature_wrong_secret() {
-    let plugin = HmacAuth::new(&json!({}));
+    let plugin = HmacAuth::new(&json!({})).unwrap();
     let consumer = create_hmac_consumer();
     let consumer_index = ConsumerIndex::new(&[consumer]);
 
@@ -452,7 +452,7 @@ async fn test_signature_wrong_secret() {
 
 #[tokio::test]
 async fn test_signature_wrong_method() {
-    let plugin = HmacAuth::new(&json!({}));
+    let plugin = HmacAuth::new(&json!({})).unwrap();
     let consumer = create_hmac_consumer();
     let consumer_index = ConsumerIndex::new(&[consumer]);
 
@@ -476,7 +476,7 @@ async fn test_signature_wrong_method() {
 
 #[tokio::test]
 async fn test_signature_wrong_path() {
-    let plugin = HmacAuth::new(&json!({}));
+    let plugin = HmacAuth::new(&json!({})).unwrap();
     let consumer = create_hmac_consumer();
     let consumer_index = ConsumerIndex::new(&[consumer]);
 
@@ -502,7 +502,7 @@ async fn test_signature_wrong_path() {
 
 #[tokio::test]
 async fn test_default_algorithm_is_sha256() {
-    let plugin = HmacAuth::new(&json!({}));
+    let plugin = HmacAuth::new(&json!({})).unwrap();
     let consumer = create_hmac_consumer();
     let consumer_index = ConsumerIndex::new(&[consumer]);
 
@@ -534,7 +534,7 @@ async fn test_default_algorithm_is_sha256() {
 
 #[tokio::test]
 async fn test_case_insensitive_hmac_prefix() {
-    let plugin = HmacAuth::new(&json!({}));
+    let plugin = HmacAuth::new(&json!({})).unwrap();
     let consumer = create_hmac_consumer();
     let consumer_index = ConsumerIndex::new(&[consumer]);
 
@@ -563,7 +563,7 @@ async fn test_case_insensitive_hmac_prefix() {
 
 #[tokio::test]
 async fn test_rfc3339_date_format() {
-    let plugin = HmacAuth::new(&json!({}));
+    let plugin = HmacAuth::new(&json!({})).unwrap();
     let consumer = create_hmac_consumer();
     let consumer_index = ConsumerIndex::new(&[consumer]);
 
@@ -588,7 +588,7 @@ async fn test_rfc3339_date_format() {
 
 #[tokio::test]
 async fn test_algorithm_name_is_case_insensitive() {
-    let plugin = HmacAuth::new(&json!({}));
+    let plugin = HmacAuth::new(&json!({})).unwrap();
     let consumer = create_hmac_consumer();
     let consumer_index = ConsumerIndex::new(&[consumer]);
 
@@ -611,7 +611,7 @@ async fn test_algorithm_name_is_case_insensitive() {
 
 #[tokio::test]
 async fn test_unknown_algorithm_rejected() {
-    let plugin = HmacAuth::new(&json!({}));
+    let plugin = HmacAuth::new(&json!({})).unwrap();
     let consumer = create_hmac_consumer();
     let consumer_index = ConsumerIndex::new(&[consumer]);
 
@@ -634,7 +634,7 @@ async fn test_unknown_algorithm_rejected() {
 
 #[tokio::test]
 async fn test_sha512_with_default_algorithm_fails() {
-    let plugin = HmacAuth::new(&json!({}));
+    let plugin = HmacAuth::new(&json!({})).unwrap();
     let consumer = create_hmac_consumer();
     let consumer_index = ConsumerIndex::new(&[consumer]);
 
@@ -659,7 +659,7 @@ async fn test_sha512_with_default_algorithm_fails() {
 
 #[tokio::test]
 async fn test_consumer_set_on_successful_auth() {
-    let plugin = HmacAuth::new(&json!({}));
+    let plugin = HmacAuth::new(&json!({})).unwrap();
     let consumer = create_hmac_consumer();
     let consumer_index = ConsumerIndex::new(&[consumer]);
 

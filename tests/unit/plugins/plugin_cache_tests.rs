@@ -8,6 +8,47 @@ use ferrum_edge::config::types::{
 use ferrum_edge::plugins::{PluginResult, ProxyProtocol, RequestContext};
 use serde_json::json;
 
+/// Returns the minimal valid config for a given plugin name so that `create_plugin` succeeds.
+fn minimal_plugin_config(plugin_name: &str) -> serde_json::Value {
+    match plugin_name {
+        "access_control" => json!({"allowed_consumers": ["testuser"]}),
+        "tcp_connection_throttle" => json!({"max_connections_per_key": 10}),
+        "ip_restriction" => json!({"allow": ["0.0.0.0/0"]}),
+        "rate_limiting" => json!({"window_seconds": 60, "max_requests": 100}),
+        "request_transformer" => {
+            json!({"rules": [{"operation": "add", "target": "header", "key": "x-test", "value": "1"}]})
+        }
+        "response_transformer" => {
+            json!({"rules": [{"operation": "add", "key": "x-test", "value": "1"}]})
+        }
+        "request_size_limiting" => json!({"max_bytes": 1048576}),
+        "response_size_limiting" => json!({"max_bytes": 1048576}),
+        "ws_message_size_limiting" => json!({"max_frame_bytes": 65536}),
+        "ws_rate_limiting" => json!({"frames_per_second": 100}),
+        "body_validator" => json!({"required_fields": ["name"]}),
+        "graphql" => json!({"max_depth": 100}),
+        "grpc_method_router" => json!({"allow_methods": ["test.Svc/Method"]}),
+        "ai_rate_limiter" => json!({"token_limit": 100000}),
+        "cors" => json!({"origins": ["*"]}),
+        "response_caching" => json!({"ttl_seconds": 60}),
+        "http_logging" => json!({"endpoint_url": "http://localhost:9200/logs"}),
+        "tcp_logging" => json!({"host": "localhost", "port": 5140}),
+        "ws_logging" => json!({"endpoint_url": "ws://localhost:9300/logs"}),
+        "otel_tracing" => json!({"endpoint": "http://localhost:4318/v1/traces"}),
+        "jwks_auth" => {
+            json!({"providers": [{"jwks_uri": "https://example.com/.well-known/jwks.json"}]})
+        }
+        "udp_rate_limiting" => json!({"datagrams_per_second": 1000}),
+        "serverless_function" => {
+            json!({"provider": "azure_functions", "function_url": "https://example.com/func"})
+        }
+        "request_mirror" => json!({"mirror_host": "mirror.local"}),
+        "udp_logging" => json!({"host": "127.0.0.1", "port": 9514}),
+        "kafka_logging" => json!({"broker_list": "localhost:9092", "topic": "test-logs"}),
+        _ => json!({}),
+    }
+}
+
 fn make_proxy(id: &str, listen_path: &str, plugin_ids: Vec<&str>) -> Proxy {
     Proxy {
         id: id.to_string(),
@@ -73,12 +114,7 @@ fn make_plugin_config(
     enabled: bool,
 ) -> PluginConfig {
     // Some plugins now require non-empty config to be created successfully.
-    let config = match plugin_name {
-        "access_control" => json!({"allowed_consumers": ["testuser"]}),
-        "tcp_connection_throttle" => json!({"max_connections_per_key": 10}),
-        "ip_restriction" => json!({"allow": ["0.0.0.0/0"]}),
-        _ => json!({}),
-    };
+    let config = minimal_plugin_config(plugin_name);
     PluginConfig {
         id: id.to_string(),
         plugin_name: plugin_name.to_string(),
@@ -1012,19 +1048,7 @@ async fn test_requires_ws_frame_hooks_defaults_false_for_all_plugins() {
         if WS_FRAME_PLUGINS.contains(&name) {
             continue; // These intentionally return true
         }
-        let config = match name {
-            "access_control" => serde_json::json!({"allowed_consumers": ["testuser"]}),
-            "tcp_connection_throttle" => serde_json::json!({"max_connections_per_key": 10}),
-            "ip_restriction" => serde_json::json!({"allow": ["0.0.0.0/0"]}),
-            "cors" => serde_json::json!({"origins": ["*"]}),
-            "response_caching" => serde_json::json!({"ttl_seconds": 60}),
-            "http_logging" => serde_json::json!({"endpoint": "http://localhost:9999/log"}),
-            "jwks_auth" => {
-                serde_json::json!({"providers": [{"issuer": "https://example.com", "jwks_uri": "https://example.com/.well-known/jwks.json"}]})
-            }
-            "otel_tracing" => serde_json::json!({"endpoint": "http://localhost:4317"}),
-            _ => serde_json::json!({}),
-        };
+        let config = minimal_plugin_config(name);
         if let Ok(Some(plugin)) = create_plugin(name, &config) {
             assert!(
                 !plugin.requires_ws_frame_hooks(),
@@ -1326,12 +1350,7 @@ fn make_plugin_config_with_priority(
     enabled: bool,
     priority_override: Option<u16>,
 ) -> PluginConfig {
-    let config = match plugin_name {
-        "access_control" => json!({"allowed_consumers": ["testuser"]}),
-        "tcp_connection_throttle" => json!({"max_connections_per_key": 10}),
-        "ip_restriction" => json!({"allow": ["0.0.0.0/0"]}),
-        _ => json!({}),
-    };
+    let config = minimal_plugin_config(plugin_name);
     PluginConfig {
         id: id.to_string(),
         plugin_name: plugin_name.to_string(),

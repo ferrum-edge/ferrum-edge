@@ -29,20 +29,21 @@ pub struct ResponseSizeLimiting {
 }
 
 impl ResponseSizeLimiting {
-    pub fn new(config: &Value) -> Self {
+    pub fn new(config: &Value) -> Result<Self, String> {
         let max_bytes = config["max_bytes"].as_u64().unwrap_or(0);
         let require_buffered_check = config["require_buffered_check"].as_bool().unwrap_or(false);
 
         if max_bytes == 0 {
-            tracing::warn!(
-                "response_size_limiting: 'max_bytes' not configured or zero — plugin will have no effect"
+            return Err(
+                "response_size_limiting: 'max_bytes' is required and must be greater than zero"
+                    .to_string(),
             );
         }
 
-        Self {
+        Ok(Self {
             max_bytes,
             require_buffered_check,
-        }
+        })
     }
 }
 

@@ -17,27 +17,24 @@ fn make_ctx() -> RequestContext {
 
 #[tokio::test]
 async fn test_creation_defaults() {
-    let plugin = ResponseSizeLimiting::new(&json!({"max_bytes": 1024}));
+    let plugin = ResponseSizeLimiting::new(&json!({"max_bytes": 1024})).unwrap();
     assert_eq!(plugin.name(), "response_size_limiting");
     assert_eq!(plugin.priority(), 3490);
 }
 
 #[tokio::test]
-async fn test_zero_max_bytes_has_no_effect() {
-    let plugin = ResponseSizeLimiting::new(&json!({}));
-    let mut ctx = make_ctx();
-    let mut headers = HashMap::new();
-    headers.insert("content-length".to_string(), "999999999".to_string());
-
-    let result = plugin.after_proxy(&mut ctx, 200, &mut headers).await;
-    assert!(matches!(result, PluginResult::Continue));
+async fn test_zero_max_bytes_returns_error() {
+    let result = ResponseSizeLimiting::new(&json!({}));
+    assert!(result.is_err());
+    let err = result.err().unwrap();
+    assert!(err.contains("max_bytes"));
 }
 
 // === Content-Length fast path (after_proxy) ===
 
 #[tokio::test]
 async fn test_content_length_under_limit_passes() {
-    let plugin = ResponseSizeLimiting::new(&json!({"max_bytes": 1024}));
+    let plugin = ResponseSizeLimiting::new(&json!({"max_bytes": 1024})).unwrap();
     let mut ctx = make_ctx();
     let mut headers = HashMap::new();
     headers.insert("content-length".to_string(), "512".to_string());
@@ -48,7 +45,7 @@ async fn test_content_length_under_limit_passes() {
 
 #[tokio::test]
 async fn test_content_length_at_limit_passes() {
-    let plugin = ResponseSizeLimiting::new(&json!({"max_bytes": 1024}));
+    let plugin = ResponseSizeLimiting::new(&json!({"max_bytes": 1024})).unwrap();
     let mut ctx = make_ctx();
     let mut headers = HashMap::new();
     headers.insert("content-length".to_string(), "1024".to_string());
@@ -59,7 +56,7 @@ async fn test_content_length_at_limit_passes() {
 
 #[tokio::test]
 async fn test_content_length_over_limit_rejects_502() {
-    let plugin = ResponseSizeLimiting::new(&json!({"max_bytes": 1024}));
+    let plugin = ResponseSizeLimiting::new(&json!({"max_bytes": 1024})).unwrap();
     let mut ctx = make_ctx();
     let mut headers = HashMap::new();
     headers.insert("content-length".to_string(), "1025".to_string());
@@ -78,7 +75,7 @@ async fn test_content_length_over_limit_rejects_502() {
 
 #[tokio::test]
 async fn test_no_content_length_header_passes() {
-    let plugin = ResponseSizeLimiting::new(&json!({"max_bytes": 1024}));
+    let plugin = ResponseSizeLimiting::new(&json!({"max_bytes": 1024})).unwrap();
     let mut ctx = make_ctx();
     let mut headers = HashMap::new();
 
@@ -88,7 +85,7 @@ async fn test_no_content_length_header_passes() {
 
 #[tokio::test]
 async fn test_invalid_content_length_passes() {
-    let plugin = ResponseSizeLimiting::new(&json!({"max_bytes": 1024}));
+    let plugin = ResponseSizeLimiting::new(&json!({"max_bytes": 1024})).unwrap();
     let mut ctx = make_ctx();
     let mut headers = HashMap::new();
     headers.insert("content-length".to_string(), "bad".to_string());
@@ -102,7 +99,8 @@ async fn test_invalid_content_length_passes() {
 #[tokio::test]
 async fn test_buffered_body_under_limit_passes() {
     let plugin =
-        ResponseSizeLimiting::new(&json!({"max_bytes": 100, "require_buffered_check": true}));
+        ResponseSizeLimiting::new(&json!({"max_bytes": 100, "require_buffered_check": true}))
+            .unwrap();
     let mut ctx = make_ctx();
     let headers = HashMap::new();
     let body = b"short";
@@ -116,7 +114,8 @@ async fn test_buffered_body_under_limit_passes() {
 #[tokio::test]
 async fn test_buffered_body_over_limit_rejects() {
     let plugin =
-        ResponseSizeLimiting::new(&json!({"max_bytes": 10, "require_buffered_check": true}));
+        ResponseSizeLimiting::new(&json!({"max_bytes": 10, "require_buffered_check": true}))
+            .unwrap();
     let mut ctx = make_ctx();
     let headers = HashMap::new();
     let body = b"this response body is definitely longer than ten bytes";
@@ -137,7 +136,7 @@ async fn test_buffered_body_over_limit_rejects() {
 
 #[tokio::test]
 async fn test_buffered_body_at_limit_passes() {
-    let plugin = ResponseSizeLimiting::new(&json!({"max_bytes": 5}));
+    let plugin = ResponseSizeLimiting::new(&json!({"max_bytes": 5})).unwrap();
     let mut ctx = make_ctx();
     let headers = HashMap::new();
     let body = b"12345";
@@ -153,28 +152,29 @@ async fn test_buffered_body_at_limit_passes() {
 #[tokio::test]
 async fn test_requires_buffering_when_configured() {
     let plugin =
-        ResponseSizeLimiting::new(&json!({"max_bytes": 1024, "require_buffered_check": true}));
+        ResponseSizeLimiting::new(&json!({"max_bytes": 1024, "require_buffered_check": true}))
+            .unwrap();
     assert!(plugin.requires_response_body_buffering());
 }
 
 #[tokio::test]
 async fn test_no_buffering_by_default() {
-    let plugin = ResponseSizeLimiting::new(&json!({"max_bytes": 1024}));
+    let plugin = ResponseSizeLimiting::new(&json!({"max_bytes": 1024})).unwrap();
     assert!(!plugin.requires_response_body_buffering());
 }
 
 #[tokio::test]
-async fn test_no_buffering_when_max_bytes_zero() {
-    let plugin =
+async fn test_max_bytes_zero_returns_error() {
+    let result =
         ResponseSizeLimiting::new(&json!({"max_bytes": 0, "require_buffered_check": true}));
-    assert!(!plugin.requires_response_body_buffering());
+    assert!(result.is_err());
 }
 
 // === Protocol support ===
 
 #[tokio::test]
 async fn test_supports_http_and_grpc() {
-    let plugin = ResponseSizeLimiting::new(&json!({"max_bytes": 1024}));
+    let plugin = ResponseSizeLimiting::new(&json!({"max_bytes": 1024})).unwrap();
     let protocols = plugin.supported_protocols();
     assert!(protocols.contains(&ferrum_edge::plugins::ProxyProtocol::Http));
     assert!(protocols.contains(&ferrum_edge::plugins::ProxyProtocol::Grpc));
@@ -185,7 +185,7 @@ async fn test_supports_http_and_grpc() {
 
 #[tokio::test]
 async fn test_rejection_body_is_valid_json() {
-    let plugin = ResponseSizeLimiting::new(&json!({"max_bytes": 10}));
+    let plugin = ResponseSizeLimiting::new(&json!({"max_bytes": 10})).unwrap();
     let mut ctx = make_ctx();
     let mut headers = HashMap::new();
     headers.insert("content-length".to_string(), "100".to_string());
@@ -204,7 +204,7 @@ async fn test_rejection_body_is_valid_json() {
 
 #[tokio::test]
 async fn test_large_content_length_rejects() {
-    let plugin = ResponseSizeLimiting::new(&json!({"max_bytes": 1048576})); // 1 MiB
+    let plugin = ResponseSizeLimiting::new(&json!({"max_bytes": 1048576})).unwrap(); // 1 MiB
     let mut ctx = make_ctx();
     let mut headers = HashMap::new();
     headers.insert("content-length".to_string(), "10485760".to_string()); // 10 MiB

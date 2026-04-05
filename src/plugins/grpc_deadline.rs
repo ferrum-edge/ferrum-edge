@@ -28,15 +28,15 @@ pub struct GrpcDeadline {
 }
 
 impl GrpcDeadline {
-    pub fn new(config: &Value) -> Self {
-        Self {
+    pub fn new(config: &Value) -> Result<Self, String> {
+        Ok(Self {
             max_deadline_ms: config["max_deadline_ms"].as_u64(),
             default_deadline_ms: config["default_deadline_ms"].as_u64(),
             subtract_gateway_processing: config["subtract_gateway_processing"]
                 .as_bool()
                 .unwrap_or(false),
             reject_no_deadline: config["reject_no_deadline"].as_bool().unwrap_or(false),
-        }
+        })
     }
 }
 

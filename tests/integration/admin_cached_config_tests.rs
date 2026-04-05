@@ -1155,7 +1155,7 @@ async fn test_batch_create_plugin_configs() {
     let plugin_batch = json!({
         "plugin_configs": [
             {"id": "pc1", "plugin_name": "key_auth", "scope": "proxy", "proxy_id": "bp1", "enabled": true, "config": {"key_location": "header:X-API-Key"}},
-            {"id": "pc2", "plugin_name": "rate_limiting", "scope": "global", "enabled": true, "config": {"rate": 100, "per": "second"}}
+            {"id": "pc2", "plugin_name": "rate_limiting", "scope": "global", "enabled": true, "config": {"window_seconds": 60, "max_requests": 100}}
         ]
     });
 
@@ -1271,7 +1271,7 @@ async fn test_backup_returns_full_config() {
             {"id": "bp1", "listen_path": "/backup1", "backend_protocol": "http", "backend_host": "localhost", "backend_port": 8080, "strip_listen_path": true, "upstream_id": "bu1"}
         ],
         "plugin_configs": [
-            {"id": "bpc1", "plugin_name": "rate_limiting", "scope": "global", "enabled": true, "config": {"rate": 100, "per": "second"}}
+            {"id": "bpc1", "plugin_name": "rate_limiting", "scope": "global", "enabled": true, "config": {"window_seconds": 60, "max_requests": 100}}
         ]
     });
     let (status, _) = admin_post(&base_url, "/batch", &token, &seed).await;
@@ -1333,7 +1333,7 @@ async fn test_backup_resource_filter() {
             {"id": "fp1", "listen_path": "/filter", "backend_protocol": "http", "backend_host": "localhost", "backend_port": 8080, "strip_listen_path": true}
         ],
         "plugin_configs": [
-            {"id": "fpc1", "plugin_name": "rate_limiting", "scope": "global", "enabled": true, "config": {"rate": 100, "per": "second"}}
+            {"id": "fpc1", "plugin_name": "rate_limiting", "scope": "global", "enabled": true, "config": {"window_seconds": 60, "max_requests": 100}}
         ]
     });
     let (status, _) = admin_post(&base_url, "/batch", &token, &seed).await;
@@ -1438,7 +1438,7 @@ async fn test_backup_then_restore_roundtrip() {
             {"id": "rt_p1", "listen_path": "/roundtrip", "backend_protocol": "http", "backend_host": "localhost", "backend_port": 8080, "strip_listen_path": true}
         ],
         "plugin_configs": [
-            {"id": "rt_pc1", "plugin_name": "rate_limiting", "scope": "global", "enabled": true, "config": {"rate": 50, "per": "second"}}
+            {"id": "rt_pc1", "plugin_name": "rate_limiting", "scope": "global", "enabled": true, "config": {"window_seconds": 60, "max_requests": 100}}
         ]
     });
     let (status, _) = admin_post(&base_url, "/batch", &token, &seed).await;

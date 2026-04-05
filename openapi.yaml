@@ -2731,6 +2731,77 @@ components:
           default: 10000
           description: Channel capacity — new entries are dropped when full
 
+    KafkaLoggingConfig:
+      type: object
+      description: "Plugin: kafka_logging — Produces transaction summaries as JSON messages to an Apache Kafka topic. Uses an async channel to decouple the proxy hot path from Kafka I/O, with librdkafka handling batching, compression, and delivery retries."
+      required:
+        - broker_list
+        - topic
+      properties:
+        broker_list:
+          type: string
+          description: Comma-separated Kafka broker addresses (e.g., broker1:9092,broker2:9092)
+        topic:
+          type: string
+          description: Kafka topic to produce messages to
+        key_field:
+          type: string
+          enum: [client_ip, proxy_id, none]
+          default: client_ip
+          description: "Partition key field: client_ip (groups by client), proxy_id (groups by route), none (round-robin)"
+        buffer_capacity:
+          type: integer
+          default: 10000
+          minimum: 1
+          description: "Channel capacity — new entries are dropped when full. Each entry is ~1-2 KB, so 10,000 entries may use ~10-20 MB"
+        compression:
+          type: string
+          enum: [none, gzip, snappy, lz4, zstd]
+          default: lz4
+          description: Kafka message compression algorithm
+        flush_timeout_seconds:
+          type: integer
+          default: 5
+          minimum: 1
+          description: Seconds to wait for librdkafka to flush pending messages during graceful shutdown
+        acks:
+          type: string
+          enum: ["0", "1", "all", "-1"]
+          description: "Delivery acknowledgment level: 0 (fire-and-forget), 1 (leader ack), all/-1 (full ISR ack)"
+        message_timeout_ms:
+          type: integer
+          description: Timeout for message delivery in milliseconds
+        security_protocol:
+          type: string
+          enum: [plaintext, ssl, sasl_plaintext, sasl_ssl]
+          description: Kafka security protocol
+        sasl_mechanism:
+          type: string
+          description: SASL mechanism (e.g., PLAIN, SCRAM-SHA-256, SCRAM-SHA-512)
+        sasl_username:
+          type: string
+          description: SASL username
+        sasl_password:
+          type: string
+          description: SASL password
+        ssl_ca_location:
+          type: string
+          description: Path to CA certificate for broker TLS verification. Falls back to FERRUM_TLS_CA_BUNDLE_PATH
+        ssl_no_verify:
+          type: boolean
+          description: Skip broker TLS certificate verification. Falls back to FERRUM_TLS_NO_VERIFY
+        ssl_certificate_location:
+          type: string
+          description: Path to client certificate for mTLS
+        ssl_key_location:
+          type: string
+          description: Path to client private key for mTLS
+        producer_config:
+          type: object
+          additionalProperties:
+            type: string
+          description: "Escape hatch: arbitrary librdkafka producer properties as key-value pairs"
+
     WsLoggingConfig:
       type: object
       description: "Plugin: ws_logging — Sends transaction logs to a WebSocket endpoint in batches."

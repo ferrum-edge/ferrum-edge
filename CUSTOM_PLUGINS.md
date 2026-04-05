@@ -81,7 +81,7 @@ on_stream_disconnect()          ── fire-and-forget (logging, metrics)
 
 Create a new `.rs` file in the `custom_plugins/` directory at the project root. The file name becomes the plugin name (e.g., `my_header_injector.rs` → plugin name `my_header_injector`).
 
-Each plugin file must export a `create_plugin` factory function:
+Each plugin file must export a `create_plugin` factory function that returns `Result`:
 
 ```rust
 // custom_plugins/my_header_injector.rs
@@ -99,8 +99,10 @@ pub struct MyHeaderInjector {
 }
 
 impl MyHeaderInjector {
-    pub fn new(config: &Value) -> Self {
-        Self {
+    // Constructor MUST return Result<Self, String>.
+    // Return Err for invalid or missing required config values.
+    pub fn new(config: &Value) -> Result<Self, String> {
+        Ok(Self {
             header_name: config["header_name"]
                 .as_str()
                 .unwrap_or("X-My-Header")
@@ -109,7 +111,7 @@ impl MyHeaderInjector {
                 .as_str()
                 .unwrap_or("hello")
                 .to_string(),
-        }
+        })
     }
 }
 
@@ -130,13 +132,30 @@ impl Plugin for MyHeaderInjector {
 }
 
 /// Required factory function — the build script calls this automatically.
+/// Must return Result so invalid configs are rejected at admission time
+/// (admin API returns 400, file mode fails startup, DB mode logs warnings).
 pub fn create_plugin(
     config: &Value,
     _http_client: PluginHttpClient,
-) -> Option<Arc<dyn Plugin>> {
-    Some(Arc::new(MyHeaderInjector::new(config)))
+) -> Result<Option<Arc<dyn Plugin>>, String> {
+    Ok(Some(Arc::new(MyHeaderInjector::new(config)?)))
 }
 ```
+
+### Config Validation Rules
+
+Your `new()` constructor must validate the plugin config and return `Err(String)` when:
+
+- **Required fields are missing** — if the plugin cannot function without a field, return an error (don't silently default to a no-op).
+- **Values are invalid** — reject malformed regexes, unknown enum variants, out-of-range numbers, unparseable URLs.
+- **The plugin would have no effect** — e.g., a rate limiter with no rate windows, a size limiter with `max_bytes=0`, a transformer with no rules.
+
+Sensible defaults for optional fields (e.g., `limit_by` defaulting to `"ip"`) are fine — only return `Err` for fields where there is no safe default.
+
+This validation is enforced at three levels:
+1. **Admin API** — `create_plugin()` is called at create/update time; errors return HTTP 400.
+2. **File mode** — each enabled plugin is instantiated at startup; errors are fatal.
+3. **Database mode** — each enabled plugin is instantiated at load time; errors are warned.
 
 ### 2. Build
 

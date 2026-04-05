@@ -14,7 +14,12 @@ fn make_ctx() -> RequestContext {
 
 #[tokio::test]
 async fn test_request_transformer_creation() {
-    let plugin = RequestTransformer::new(&json!({}));
+    let plugin = RequestTransformer::new(&json!({
+        "rules": [
+            {"operation": "add", "target": "header", "key": "X-Test", "value": "test"}
+        ]
+    }))
+    .unwrap();
     assert_eq!(plugin.name(), "request_transformer");
 }
 
@@ -24,7 +29,8 @@ async fn test_request_transformer_add_header() {
         "rules": [
             {"operation": "add", "target": "header", "key": "X-Custom", "value": "custom-value"}
         ]
-    }));
+    }))
+    .unwrap();
 
     let mut ctx = make_ctx();
     let mut headers: HashMap<String, String> = HashMap::new();
@@ -43,7 +49,8 @@ async fn test_request_transformer_remove_header() {
         "rules": [
             {"operation": "remove", "target": "header", "key": "X-Remove-Me"}
         ]
-    }));
+    }))
+    .unwrap();
 
     let mut ctx = make_ctx();
     let mut headers: HashMap<String, String> = HashMap::new();
@@ -65,7 +72,8 @@ async fn test_request_transformer_update_header() {
         "rules": [
             {"operation": "update", "target": "header", "key": "X-Existing", "value": "new-value"}
         ]
-    }));
+    }))
+    .unwrap();
 
     let mut ctx = make_ctx();
     let mut headers: HashMap<String, String> = HashMap::new();
@@ -85,7 +93,8 @@ async fn test_request_transformer_add_query_param() {
         "rules": [
             {"operation": "add", "target": "query", "key": "version", "value": "v2"}
         ]
-    }));
+    }))
+    .unwrap();
 
     let mut ctx = make_ctx();
     let mut headers: HashMap<String, String> = HashMap::new();
@@ -104,7 +113,8 @@ async fn test_request_transformer_remove_query_param() {
         "rules": [
             {"operation": "remove", "target": "query", "key": "secret"}
         ]
-    }));
+    }))
+    .unwrap();
 
     let mut ctx = make_ctx();
     ctx.query_params
@@ -128,7 +138,8 @@ async fn test_request_transformer_update_query_param() {
         "rules": [
             {"operation": "update", "target": "query", "key": "page", "value": "2"}
         ]
-    }));
+    }))
+    .unwrap();
 
     let mut ctx = make_ctx();
     ctx.query_params.insert("page".to_string(), "1".to_string());
@@ -151,7 +162,8 @@ async fn test_request_transformer_multiple_rules() {
             {"operation": "add", "target": "query", "key": "added_param", "value": "true"},
             {"operation": "remove", "target": "query", "key": "removed_param"}
         ]
-    }));
+    }))
+    .unwrap();
 
     let mut ctx = make_ctx();
     ctx.query_params
@@ -172,32 +184,16 @@ async fn test_request_transformer_multiple_rules() {
 
 #[tokio::test]
 async fn test_request_transformer_empty_rules() {
-    let plugin = RequestTransformer::new(&json!({"rules": []}));
-
-    let mut ctx = make_ctx();
-    let mut headers: HashMap<String, String> = HashMap::new();
-    headers.insert("x-existing".to_string(), "untouched".to_string());
-
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
-    assert!(matches!(
-        result,
-        ferrum_edge::plugins::PluginResult::Continue
-    ));
-    assert_eq!(headers.get("x-existing").unwrap(), "untouched");
+    let result = RequestTransformer::new(&json!({"rules": []}));
+    let err = result.err().expect("expected error for empty rules");
+    assert!(err.contains("no 'rules' configured"), "got: {err}");
 }
 
 #[tokio::test]
 async fn test_request_transformer_no_config() {
-    let plugin = RequestTransformer::new(&json!({}));
-
-    let mut ctx = make_ctx();
-    let mut headers: HashMap<String, String> = HashMap::new();
-
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
-    assert!(matches!(
-        result,
-        ferrum_edge::plugins::PluginResult::Continue
-    ));
+    let result = RequestTransformer::new(&json!({}));
+    let err = result.err().expect("expected error for no config");
+    assert!(err.contains("no 'rules' configured"), "got: {err}");
 }
 
 #[tokio::test]
@@ -206,7 +202,8 @@ async fn test_request_transformer_add_without_value_ignored() {
         "rules": [
             {"operation": "add", "target": "header", "key": "X-NoValue"}
         ]
-    }));
+    }))
+    .unwrap();
 
     let mut ctx = make_ctx();
     let mut headers: HashMap<String, String> = HashMap::new();
@@ -226,7 +223,8 @@ async fn test_request_transformer_unknown_operation_ignored() {
         "rules": [
             {"operation": "delete", "target": "header", "key": "X-Test", "value": "val"}
         ]
-    }));
+    }))
+    .unwrap();
 
     let mut ctx = make_ctx();
     let mut headers: HashMap<String, String> = HashMap::new();
@@ -245,7 +243,8 @@ async fn test_request_transformer_body_rules_not_applied_in_before_proxy() {
         "rules": [
             {"operation": "add", "target": "body", "key": "field", "value": "val"}
         ]
-    }));
+    }))
+    .unwrap();
 
     let mut ctx = make_ctx();
     let mut headers: HashMap<String, String> = HashMap::new();
@@ -265,7 +264,8 @@ async fn test_request_transformer_unknown_target_ignored() {
         "rules": [
             {"operation": "add", "target": "cookie", "key": "field", "value": "val"}
         ]
-    }));
+    }))
+    .unwrap();
 
     let mut ctx = make_ctx();
     let mut headers: HashMap<String, String> = HashMap::new();
@@ -283,7 +283,7 @@ async fn test_request_transformer_rename_header() {
         "rules": [
             {"operation": "rename", "target": "header", "key": "X-Old-Name", "new_key": "X-New-Name"}
         ]
-    }));
+    })).unwrap();
 
     let mut ctx = make_ctx();
     let mut headers: HashMap<String, String> = HashMap::new();
@@ -304,7 +304,7 @@ async fn test_request_transformer_rename_header_nonexistent() {
         "rules": [
             {"operation": "rename", "target": "header", "key": "X-Does-Not-Exist", "new_key": "X-New-Name"}
         ]
-    }));
+    })).unwrap();
 
     let mut ctx = make_ctx();
     let mut headers: HashMap<String, String> = HashMap::new();
@@ -324,7 +324,8 @@ async fn test_request_transformer_rename_query_param() {
         "rules": [
             {"operation": "rename", "target": "query", "key": "old_key", "new_key": "new_key"}
         ]
-    }));
+    }))
+    .unwrap();
 
     let mut ctx = make_ctx();
     ctx.query_params
@@ -346,7 +347,8 @@ async fn test_request_transformer_rename_query_param_nonexistent() {
         "rules": [
             {"operation": "rename", "target": "query", "key": "missing_key", "new_key": "new_key"}
         ]
-    }));
+    }))
+    .unwrap();
 
     let mut ctx = make_ctx();
     let mut headers: HashMap<String, String> = HashMap::new();
@@ -366,7 +368,8 @@ async fn test_request_transformer_rename_without_new_key_ignored() {
         "rules": [
             {"operation": "rename", "target": "header", "key": "X-Old-Name"}
         ]
-    }));
+    }))
+    .unwrap();
 
     let mut ctx = make_ctx();
     let mut headers: HashMap<String, String> = HashMap::new();
@@ -387,7 +390,8 @@ async fn test_request_transformer_header_key_pre_lowercased() {
         "rules": [
             {"operation": "add", "target": "header", "key": "X-UPPER-CASE", "value": "lowered"}
         ]
-    }));
+    }))
+    .unwrap();
 
     let mut ctx = make_ctx();
     let mut headers: HashMap<String, String> = HashMap::new();
@@ -410,7 +414,8 @@ async fn test_request_transformer_body_add_field() {
         "rules": [
             {"operation": "add", "target": "body", "key": "version", "value": "v2"}
         ]
-    }));
+    }))
+    .unwrap();
 
     assert!(plugin.modifies_request_body());
 
@@ -429,7 +434,8 @@ async fn test_request_transformer_body_add_nested_field() {
         "rules": [
             {"operation": "add", "target": "body", "key": "user.role", "value": "admin"}
         ]
-    }));
+    }))
+    .unwrap();
 
     let body = br#"{"user":{"name":"Alice"}}"#;
     let result = plugin
@@ -446,7 +452,8 @@ async fn test_request_transformer_body_add_does_not_overwrite() {
         "rules": [
             {"operation": "add", "target": "body", "key": "name", "value": "Bob"}
         ]
-    }));
+    }))
+    .unwrap();
 
     let body = br#"{"name":"Alice"}"#;
     let result = plugin
@@ -462,7 +469,8 @@ async fn test_request_transformer_body_update_field() {
         "rules": [
             {"operation": "update", "target": "body", "key": "status", "value": "active"}
         ]
-    }));
+    }))
+    .unwrap();
 
     let body = br#"{"status":"pending"}"#;
     let result = plugin
@@ -478,7 +486,8 @@ async fn test_request_transformer_body_update_nested_field() {
         "rules": [
             {"operation": "update", "target": "body", "key": "user.address.city", "value": "NYC"}
         ]
-    }));
+    }))
+    .unwrap();
 
     let body = br#"{"user":{"address":{"city":"LA","zip":"90001"}}}"#;
     let result = plugin
@@ -495,7 +504,8 @@ async fn test_request_transformer_body_remove_field() {
         "rules": [
             {"operation": "remove", "target": "body", "key": "internal_id"}
         ]
-    }));
+    }))
+    .unwrap();
 
     let body = br#"{"name":"Alice","internal_id":"secret123"}"#;
     let result = plugin
@@ -512,7 +522,8 @@ async fn test_request_transformer_body_remove_nested_field() {
         "rules": [
             {"operation": "remove", "target": "body", "key": "user.password"}
         ]
-    }));
+    }))
+    .unwrap();
 
     let body = br#"{"user":{"name":"Alice","password":"secret"}}"#;
     let result = plugin
@@ -529,7 +540,8 @@ async fn test_request_transformer_body_rename_field() {
         "rules": [
             {"operation": "rename", "target": "body", "key": "first_name", "new_key": "given_name"}
         ]
-    }));
+    }))
+    .unwrap();
 
     let body = br#"{"first_name":"Alice","age":30}"#;
     let result = plugin
@@ -547,7 +559,7 @@ async fn test_request_transformer_body_rename_nested_field() {
         "rules": [
             {"operation": "rename", "target": "body", "key": "user.old_field", "new_key": "user.new_field"}
         ]
-    }));
+    })).unwrap();
 
     let body = br#"{"user":{"old_field":"data","other":"keep"}}"#;
     let result = plugin
@@ -565,7 +577,7 @@ async fn test_request_transformer_body_rename_across_nesting_levels() {
         "rules": [
             {"operation": "rename", "target": "body", "key": "nested.deep.value", "new_key": "flat_value"}
         ]
-    }));
+    })).unwrap();
 
     let body = br#"{"nested":{"deep":{"value":"found"}}}"#;
     let result = plugin
@@ -585,7 +597,8 @@ async fn test_request_transformer_body_multiple_rules() {
             {"operation": "add", "target": "body", "key": "version", "value": "2"},
             {"operation": "update", "target": "body", "key": "status", "value": "processed"}
         ]
-    }));
+    }))
+    .unwrap();
 
     let body = br#"{"old_name":"Alice","secret":"hidden","status":"pending"}"#;
     let result = plugin
@@ -607,7 +620,8 @@ async fn test_request_transformer_body_mixed_header_and_body_rules() {
             {"operation": "rename", "target": "body", "key": "old_field", "new_key": "new_field"},
             {"operation": "remove", "target": "query", "key": "debug"}
         ]
-    }));
+    }))
+    .unwrap();
 
     assert!(plugin.modifies_request_body());
 
@@ -639,7 +653,8 @@ async fn test_request_transformer_body_non_json_content_type_skipped() {
         "rules": [
             {"operation": "add", "target": "body", "key": "field", "value": "val"}
         ]
-    }));
+    }))
+    .unwrap();
 
     let body = b"<xml>not json</xml>";
     let result = plugin
@@ -654,7 +669,8 @@ async fn test_request_transformer_body_invalid_json_skipped() {
         "rules": [
             {"operation": "add", "target": "body", "key": "field", "value": "val"}
         ]
-    }));
+    }))
+    .unwrap();
 
     let body = b"this is not json";
     let result = plugin
@@ -669,7 +685,8 @@ async fn test_request_transformer_body_empty_body_skipped() {
         "rules": [
             {"operation": "add", "target": "body", "key": "field", "value": "val"}
         ]
-    }));
+    }))
+    .unwrap();
 
     let result = plugin
         .transform_request_body(b"", Some("application/json"), &HashMap::new())
@@ -683,7 +700,8 @@ async fn test_request_transformer_body_no_body_rules_returns_false() {
         "rules": [
             {"operation": "add", "target": "header", "key": "X-Custom", "value": "val"}
         ]
-    }));
+    }))
+    .unwrap();
 
     assert!(!plugin.modifies_request_body());
 }
@@ -694,7 +712,8 @@ async fn test_request_transformer_body_deeply_nested_three_levels() {
         "rules": [
             {"operation": "update", "target": "body", "key": "a.b.c.d", "value": "deep_value"}
         ]
-    }));
+    }))
+    .unwrap();
 
     let body = br#"{"a":{"b":{"c":{"d":"old"}}}}"#;
     let result = plugin
@@ -710,7 +729,8 @@ async fn test_request_transformer_body_add_creates_intermediate_objects() {
         "rules": [
             {"operation": "add", "target": "body", "key": "new.nested.field", "value": "created"}
         ]
-    }));
+    }))
+    .unwrap();
 
     let body = br#"{"existing":"keep"}"#;
     let result = plugin
@@ -727,7 +747,8 @@ async fn test_request_transformer_body_numeric_value() {
         "rules": [
             {"operation": "add", "target": "body", "key": "count", "value": "42"}
         ]
-    }));
+    }))
+    .unwrap();
 
     let body = br#"{}"#;
     let result = plugin
@@ -744,7 +765,8 @@ async fn test_request_transformer_body_boolean_value() {
         "rules": [
             {"operation": "add", "target": "body", "key": "active", "value": "true"}
         ]
-    }));
+    }))
+    .unwrap();
 
     let body = br#"{}"#;
     let result = plugin
@@ -760,7 +782,8 @@ async fn test_request_transformer_body_rename_nonexistent_is_noop() {
         "rules": [
             {"operation": "rename", "target": "body", "key": "missing", "new_key": "present"}
         ]
-    }));
+    }))
+    .unwrap();
 
     let body = br#"{"name":"Alice"}"#;
     let result = plugin

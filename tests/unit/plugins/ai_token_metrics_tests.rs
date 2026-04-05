@@ -24,7 +24,7 @@ fn assert_continue(result: PluginResult) {
 
 #[tokio::test]
 async fn test_plugin_name_and_priority() {
-    let plugin = AiTokenMetrics::new(&json!({}));
+    let plugin = AiTokenMetrics::new(&json!({})).unwrap();
     assert_eq!(plugin.name(), "ai_token_metrics");
     assert_eq!(plugin.priority(), 4100);
     assert!(plugin.requires_response_body_buffering());
@@ -34,7 +34,7 @@ async fn test_plugin_name_and_priority() {
 
 #[tokio::test]
 async fn test_openai_format() {
-    let plugin = AiTokenMetrics::new(&json!({}));
+    let plugin = AiTokenMetrics::new(&json!({})).unwrap();
     let mut ctx = create_test_context();
     let headers = json_headers();
     let body = serde_json::to_vec(&json!({
@@ -63,7 +63,7 @@ async fn test_openai_format() {
 
 #[tokio::test]
 async fn test_anthropic_format() {
-    let plugin = AiTokenMetrics::new(&json!({}));
+    let plugin = AiTokenMetrics::new(&json!({})).unwrap();
     let mut ctx = create_test_context();
     let headers = json_headers();
     let body = serde_json::to_vec(&json!({
@@ -94,7 +94,7 @@ async fn test_anthropic_format() {
 
 #[tokio::test]
 async fn test_google_format() {
-    let plugin = AiTokenMetrics::new(&json!({}));
+    let plugin = AiTokenMetrics::new(&json!({})).unwrap();
     let mut ctx = create_test_context();
     let headers = json_headers();
     let body = serde_json::to_vec(&json!({
@@ -123,7 +123,7 @@ async fn test_google_format() {
 
 #[tokio::test]
 async fn test_cohere_format() {
-    let plugin = AiTokenMetrics::new(&json!({}));
+    let plugin = AiTokenMetrics::new(&json!({})).unwrap();
     let mut ctx = create_test_context();
     let headers = json_headers();
     let body = serde_json::to_vec(&json!({
@@ -153,7 +153,7 @@ async fn test_cohere_format() {
 
 #[tokio::test]
 async fn test_bedrock_format() {
-    let plugin = AiTokenMetrics::new(&json!({}));
+    let plugin = AiTokenMetrics::new(&json!({})).unwrap();
     let mut ctx = create_test_context();
     let headers = json_headers();
     let body = serde_json::to_vec(&json!({
@@ -180,7 +180,7 @@ async fn test_bedrock_format() {
 
 #[tokio::test]
 async fn test_explicit_provider_openai() {
-    let plugin = AiTokenMetrics::new(&json!({"provider": "openai"}));
+    let plugin = AiTokenMetrics::new(&json!({"provider": "openai"})).unwrap();
     let mut ctx = create_test_context();
     let headers = json_headers();
     let body = serde_json::to_vec(&json!({
@@ -198,7 +198,7 @@ async fn test_explicit_provider_openai() {
 
 #[tokio::test]
 async fn test_explicit_provider_is_case_insensitive() {
-    let plugin = AiTokenMetrics::new(&json!({"provider": " OpenAI "}));
+    let plugin = AiTokenMetrics::new(&json!({"provider": " OpenAI "})).unwrap();
     let mut ctx = create_test_context();
     let headers = json_headers();
     let body = serde_json::to_vec(&json!({
@@ -216,7 +216,7 @@ async fn test_explicit_provider_is_case_insensitive() {
 
 #[tokio::test]
 async fn test_explicit_provider_mistral() {
-    let plugin = AiTokenMetrics::new(&json!({"provider": "mistral"}));
+    let plugin = AiTokenMetrics::new(&json!({"provider": "mistral"})).unwrap();
     let mut ctx = create_test_context();
     let headers = json_headers();
     let body = serde_json::to_vec(&json!({
@@ -235,7 +235,7 @@ async fn test_explicit_provider_mistral() {
 
 #[tokio::test]
 async fn test_custom_prefix() {
-    let plugin = AiTokenMetrics::new(&json!({"metadata_prefix": "llm"}));
+    let plugin = AiTokenMetrics::new(&json!({"metadata_prefix": "llm"})).unwrap();
     let mut ctx = create_test_context();
     let headers = json_headers();
     let body = serde_json::to_vec(&json!({
@@ -258,7 +258,8 @@ async fn test_cost_calculation() {
     let plugin = AiTokenMetrics::new(&json!({
         "cost_per_prompt_token": 0.00001,
         "cost_per_completion_token": 0.00003
-    }));
+    }))
+    .unwrap();
     let mut ctx = create_test_context();
     let headers = json_headers();
     let body = serde_json::to_vec(&json!({
@@ -278,7 +279,8 @@ async fn test_cost_calculation_prompt_only() {
     // Embedding models only have input cost
     let plugin = AiTokenMetrics::new(&json!({
         "cost_per_prompt_token": 0.0001
-    }));
+    }))
+    .unwrap();
     let mut ctx = create_test_context();
     let headers = json_headers();
     let body = serde_json::to_vec(&json!({
@@ -295,7 +297,7 @@ async fn test_cost_calculation_prompt_only() {
 
 #[tokio::test]
 async fn test_cost_not_calculated_when_no_rates() {
-    let plugin = AiTokenMetrics::new(&json!({}));
+    let plugin = AiTokenMetrics::new(&json!({})).unwrap();
     let mut ctx = create_test_context();
     let headers = json_headers();
     let body = serde_json::to_vec(&json!({
@@ -313,7 +315,7 @@ async fn test_cost_not_calculated_when_no_rates() {
 
 #[tokio::test]
 async fn test_include_model_false() {
-    let plugin = AiTokenMetrics::new(&json!({"include_model": false}));
+    let plugin = AiTokenMetrics::new(&json!({"include_model": false})).unwrap();
     let mut ctx = create_test_context();
     let headers = json_headers();
     let body = serde_json::to_vec(&json!({
@@ -333,7 +335,7 @@ async fn test_include_model_false() {
 
 #[tokio::test]
 async fn test_include_token_details_false() {
-    let plugin = AiTokenMetrics::new(&json!({"include_token_details": false}));
+    let plugin = AiTokenMetrics::new(&json!({"include_token_details": false})).unwrap();
     let mut ctx = create_test_context();
     let headers = json_headers();
     let body = serde_json::to_vec(&json!({
@@ -353,7 +355,7 @@ async fn test_include_token_details_false() {
 
 #[tokio::test]
 async fn test_non_json_content_type() {
-    let plugin = AiTokenMetrics::new(&json!({}));
+    let plugin = AiTokenMetrics::new(&json!({})).unwrap();
     let mut ctx = create_test_context();
     let mut headers = HashMap::new();
     headers.insert("content-type".to_string(), "text/html".to_string());
@@ -367,7 +369,7 @@ async fn test_non_json_content_type() {
 
 #[tokio::test]
 async fn test_empty_body() {
-    let plugin = AiTokenMetrics::new(&json!({}));
+    let plugin = AiTokenMetrics::new(&json!({})).unwrap();
     let mut ctx = create_test_context();
     let headers = json_headers();
 
@@ -378,7 +380,7 @@ async fn test_empty_body() {
 
 #[tokio::test]
 async fn test_malformed_json() {
-    let plugin = AiTokenMetrics::new(&json!({}));
+    let plugin = AiTokenMetrics::new(&json!({})).unwrap();
     let mut ctx = create_test_context();
     let headers = json_headers();
 
@@ -391,7 +393,7 @@ async fn test_malformed_json() {
 
 #[tokio::test]
 async fn test_missing_usage_fields() {
-    let plugin = AiTokenMetrics::new(&json!({}));
+    let plugin = AiTokenMetrics::new(&json!({})).unwrap();
     let mut ctx = create_test_context();
     let headers = json_headers();
     let body = serde_json::to_vec(&json!({"id": "chatcmpl-123"})).unwrap();
@@ -406,7 +408,7 @@ async fn test_missing_usage_fields() {
 
 #[tokio::test]
 async fn test_zero_tokens() {
-    let plugin = AiTokenMetrics::new(&json!({}));
+    let plugin = AiTokenMetrics::new(&json!({})).unwrap();
     let mut ctx = create_test_context();
     let headers = json_headers();
     let body = serde_json::to_vec(&json!({
@@ -424,7 +426,7 @@ async fn test_zero_tokens() {
 
 #[tokio::test]
 async fn test_unknown_configured_provider() {
-    let plugin = AiTokenMetrics::new(&json!({"provider": "unknown_provider"}));
+    let plugin = AiTokenMetrics::new(&json!({"provider": "unknown_provider"})).unwrap();
     let mut ctx = create_test_context();
     let headers = json_headers();
     let body = serde_json::to_vec(&json!({
@@ -442,7 +444,7 @@ async fn test_unknown_configured_provider() {
 #[tokio::test]
 async fn test_bedrock_computed_total() {
     // Bedrock without explicit totalTokens — should compute from input + output
-    let plugin = AiTokenMetrics::new(&json!({}));
+    let plugin = AiTokenMetrics::new(&json!({})).unwrap();
     let mut ctx = create_test_context();
     let headers = json_headers();
     let body = serde_json::to_vec(&json!({

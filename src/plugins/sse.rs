@@ -86,7 +86,7 @@ pub struct SsePlugin {
 }
 
 impl SsePlugin {
-    pub fn new(config: &Value) -> Self {
+    pub fn new(config: &Value) -> Result<Self, String> {
         let require_accept_header = config["require_accept_header"].as_bool().unwrap_or(true);
         let require_get_method = config["require_get_method"].as_bool().unwrap_or(true);
         let strip_accept_encoding = config["strip_accept_encoding"].as_bool().unwrap_or(true);
@@ -96,7 +96,7 @@ impl SsePlugin {
         let force_sse_content_type = config["force_sse_content_type"].as_bool().unwrap_or(false);
         let wrap_non_sse_responses = config["wrap_non_sse_responses"].as_bool().unwrap_or(false);
 
-        Self {
+        Ok(Self {
             require_accept_header,
             require_get_method,
             strip_accept_encoding,
@@ -105,7 +105,7 @@ impl SsePlugin {
             retry_ms,
             force_sse_content_type,
             wrap_non_sse_responses,
-        }
+        })
     }
 
     /// Returns true if the `Accept` header includes `text/event-stream`.

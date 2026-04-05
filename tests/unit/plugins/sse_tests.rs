@@ -4,7 +4,7 @@ use serde_json::json;
 use std::collections::HashMap;
 
 fn make_plugin(config: serde_json::Value) -> SsePlugin {
-    SsePlugin::new(&config)
+    SsePlugin::new(&config).unwrap()
 }
 
 fn make_sse_ctx() -> RequestContext {

@@ -16,7 +16,7 @@ pub struct CorrelationId {
 }
 
 impl CorrelationId {
-    pub fn new(config: &Value) -> Self {
+    pub fn new(config: &Value) -> Result<Self, String> {
         let header_name = config["header_name"]
             .as_str()
             .unwrap_or("x-request-id")
@@ -24,10 +24,10 @@ impl CorrelationId {
 
         let echo_downstream = config["echo_downstream"].as_bool().unwrap_or(true);
 
-        Self {
+        Ok(Self {
             header_name,
             echo_downstream,
-        }
+        })
     }
 }
 

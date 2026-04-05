@@ -109,7 +109,7 @@ pub struct GraphqlPlugin {
 }
 
 impl GraphqlPlugin {
-    pub fn new(config: &Value) -> Self {
+    pub fn new(config: &Value) -> Result<Self, String> {
         let max_depth = config["max_depth"].as_u64().map(|v| v as u32);
         let max_complexity = config["max_complexity"].as_u64().map(|v| v as u32);
         let max_aliases = config["max_aliases"].as_u64().map(|v| v as u32);
@@ -160,13 +160,14 @@ impl GraphqlPlugin {
             || !operation_rate_limits.is_empty();
 
         if !has_any_config {
-            warn!(
+            return Err(
                 "graphql: no protection rules configured — set 'max_depth', 'max_complexity', \
                  'max_aliases', 'introspection_allowed', 'type_rate_limits', or 'operation_rate_limits'"
+                    .to_string(),
             );
         }
 
-        Self {
+        Ok(Self {
             max_depth,
             max_complexity,
             max_aliases,
@@ -176,7 +177,7 @@ impl GraphqlPlugin {
             operation_rate_limits,
             state: Arc::new(DashMap::new()),
             has_any_config,
-        }
+        })
     }
 
     /// Evict entries with no recent activity to bound memory.

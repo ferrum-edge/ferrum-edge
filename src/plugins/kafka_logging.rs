@@ -73,6 +73,8 @@ impl KafkaLogging {
 
         let buffer_capacity = config["buffer_capacity"].as_u64().unwrap_or(10000).max(1) as usize;
 
+        let flush_timeout_seconds = config["flush_timeout_seconds"].as_u64().unwrap_or(5).max(1);
+
         let key_field = match config["key_field"].as_str().unwrap_or("client_ip") {
             "proxy_id" => KeyField::ProxyId,
             "none" => KeyField::None,
@@ -87,17 +89,16 @@ impl KafkaLogging {
             kafka_config.set("message.timeout.ms", v.to_string());
         }
 
-        if let Some(compression) = config["compression"].as_str() {
-            match compression {
-                "none" | "gzip" | "snappy" | "lz4" | "zstd" => {
-                    kafka_config.set("compression.type", compression);
-                }
-                other => {
-                    return Err(format!(
-                        "kafka_logging: unsupported compression '{other}' \
-                         (use none/gzip/snappy/lz4/zstd)"
-                    ));
-                }
+        let compression = config["compression"].as_str().unwrap_or("lz4");
+        match compression {
+            "none" | "gzip" | "snappy" | "lz4" | "zstd" => {
+                kafka_config.set("compression.type", compression);
+            }
+            other => {
+                return Err(format!(
+                    "kafka_logging: unsupported compression '{other}' \
+                     (use none/gzip/snappy/lz4/zstd)"
+                ));
             }
         }
 
@@ -185,7 +186,13 @@ impl KafkaLogging {
             .collect();
 
         let (sender, receiver) = mpsc::channel(buffer_capacity);
-        tokio::spawn(produce_loop(receiver, producer, topic, key_field));
+        tokio::spawn(produce_loop(
+            receiver,
+            producer,
+            topic,
+            key_field,
+            flush_timeout_seconds,
+        ));
 
         Ok(Self {
             sender,
@@ -244,6 +251,7 @@ async fn produce_loop(
     producer: ThreadedProducer<DefaultProducerContext>,
     topic: String,
     key_field: KeyField,
+    flush_timeout_seconds: u64,
 ) {
     while let Some(entry) = receiver.recv().await {
         let payload = match serde_json::to_string(&entry) {
@@ -278,5 +286,5 @@ async fn produce_loop(
     }
 
     // Channel closed — flush any remaining messages in librdkafka's buffer.
-    let _ = producer.flush(Duration::from_secs(5));
+    let _ = producer.flush(Duration::from_secs(flush_timeout_seconds));
 }

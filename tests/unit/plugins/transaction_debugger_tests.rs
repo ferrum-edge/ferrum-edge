@@ -21,7 +21,7 @@ fn make_ctx() -> RequestContext {
 
 #[tokio::test]
 async fn test_transaction_debugger_creation() {
-    let plugin = TransactionDebugger::new(&json!({}));
+    let plugin = TransactionDebugger::new(&json!({})).unwrap();
     assert_eq!(plugin.name(), "transaction_debugger");
 }
 
@@ -30,13 +30,14 @@ async fn test_transaction_debugger_creation_with_config() {
     let plugin = TransactionDebugger::new(&json!({
         "log_request_body": true,
         "log_response_body": true
-    }));
+    }))
+    .unwrap();
     assert_eq!(plugin.name(), "transaction_debugger");
 }
 
 #[tokio::test]
 async fn test_transaction_debugger_on_request_received() {
-    let plugin = TransactionDebugger::new(&json!({}));
+    let plugin = TransactionDebugger::new(&json!({})).unwrap();
     let mut ctx = make_ctx();
 
     let result = plugin.on_request_received(&mut ctx).await;
@@ -48,7 +49,7 @@ async fn test_transaction_debugger_on_request_received() {
 
 #[tokio::test]
 async fn test_transaction_debugger_on_request_received_with_body_logging() {
-    let plugin = TransactionDebugger::new(&json!({"log_request_body": true}));
+    let plugin = TransactionDebugger::new(&json!({"log_request_body": true})).unwrap();
     let mut ctx = make_ctx();
 
     let result = plugin.on_request_received(&mut ctx).await;
@@ -60,7 +61,7 @@ async fn test_transaction_debugger_on_request_received_with_body_logging() {
 
 #[tokio::test]
 async fn test_transaction_debugger_after_proxy() {
-    let plugin = TransactionDebugger::new(&json!({}));
+    let plugin = TransactionDebugger::new(&json!({})).unwrap();
     let mut ctx = make_ctx();
     let mut response_headers: HashMap<String, String> = HashMap::new();
     response_headers.insert("content-type".to_string(), "application/json".to_string());
@@ -76,7 +77,7 @@ async fn test_transaction_debugger_after_proxy() {
 
 #[tokio::test]
 async fn test_transaction_debugger_after_proxy_with_body_logging() {
-    let plugin = TransactionDebugger::new(&json!({"log_response_body": true}));
+    let plugin = TransactionDebugger::new(&json!({"log_response_body": true})).unwrap();
     let mut ctx = make_ctx();
     let mut response_headers: HashMap<String, String> = HashMap::new();
 
@@ -91,7 +92,7 @@ async fn test_transaction_debugger_after_proxy_with_body_logging() {
 
 #[tokio::test]
 async fn test_transaction_debugger_log() {
-    let plugin = TransactionDebugger::new(&json!({}));
+    let plugin = TransactionDebugger::new(&json!({})).unwrap();
     let summary = create_test_transaction_summary();
 
     // Verify log phase completes and plugin is operational after logging
@@ -110,7 +111,8 @@ async fn test_transaction_debugger_full_lifecycle() {
     let plugin = TransactionDebugger::new(&json!({
         "log_request_body": true,
         "log_response_body": true
-    }));
+    }))
+    .unwrap();
 
     let mut ctx = make_ctx();
     let consumer_index = ferrum_edge::ConsumerIndex::new(&[]);
@@ -183,7 +185,7 @@ fn make_ctx_with_sensitive_headers() -> RequestContext {
 async fn test_transaction_debugger_redacts_sensitive_request_headers() {
     // The plugin should not leak sensitive headers in its debug output.
     // We verify the plugin processes requests with sensitive headers without error.
-    let plugin = TransactionDebugger::new(&json!({}));
+    let plugin = TransactionDebugger::new(&json!({})).unwrap();
     let mut ctx = make_ctx_with_sensitive_headers();
 
     let result = plugin.on_request_received(&mut ctx).await;
@@ -200,7 +202,7 @@ async fn test_transaction_debugger_redacts_sensitive_request_headers() {
 
 #[tokio::test]
 async fn test_transaction_debugger_redacts_sensitive_response_headers() {
-    let plugin = TransactionDebugger::new(&json!({}));
+    let plugin = TransactionDebugger::new(&json!({})).unwrap();
     let mut ctx = make_ctx();
     let mut response_headers: HashMap<String, String> = HashMap::new();
     response_headers.insert("set-cookie".to_string(), "session=secret".to_string());
@@ -228,7 +230,8 @@ async fn test_transaction_debugger_redacts_sensitive_response_headers() {
 async fn test_transaction_debugger_custom_redacted_headers() {
     let plugin = TransactionDebugger::new(&json!({
         "redacted_headers": ["x-custom-secret", "x-internal-token"]
-    }));
+    }))
+    .unwrap();
     let mut ctx = RequestContext::new(
         "10.0.0.1".to_string(),
         "GET".to_string(),
@@ -250,7 +253,7 @@ async fn test_transaction_debugger_custom_redacted_headers() {
 
 #[tokio::test]
 async fn test_transaction_debugger_default_body_logging_disabled() {
-    let plugin = TransactionDebugger::new(&json!({}));
+    let plugin = TransactionDebugger::new(&json!({})).unwrap();
     let mut ctx = make_ctx();
 
     // Should work fine with body logging disabled

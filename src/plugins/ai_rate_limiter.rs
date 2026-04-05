@@ -94,11 +94,10 @@ pub struct AiRateLimiter {
 }
 
 impl AiRateLimiter {
-    pub fn new(config: &Value, http_client: PluginHttpClient) -> Self {
-        let token_limit = config["token_limit"].as_u64().unwrap_or_else(|| {
-            tracing::warn!("ai_rate_limiter: 'token_limit' not configured, defaulting to 100000");
-            100_000
-        });
+    pub fn new(config: &Value, http_client: PluginHttpClient) -> Result<Self, String> {
+        let token_limit = config["token_limit"].as_u64().ok_or_else(|| {
+            "ai_rate_limiter: 'token_limit' is required (positive integer)".to_string()
+        })?;
         let window_seconds = config["window_seconds"].as_u64().unwrap_or(60);
         let count_mode = config["count_mode"]
             .as_str()
@@ -134,7 +133,7 @@ impl AiRateLimiter {
                 ))
             });
 
-        Self {
+        Ok(Self {
             token_limit,
             window_seconds,
             count_mode,
@@ -143,7 +142,7 @@ impl AiRateLimiter {
             provider,
             state: Arc::new(DashMap::new()),
             redis_client,
-        }
+        })
     }
 
     /// Build the rate limit key from the request context.

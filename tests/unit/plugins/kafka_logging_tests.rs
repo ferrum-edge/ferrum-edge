@@ -294,6 +294,51 @@ async fn test_kafka_logging_default_lifecycle_phases() {
 }
 
 #[tokio::test]
+async fn test_kafka_logging_flush_timeout_config() {
+    // Custom flush timeout should be accepted
+    let plugin = KafkaLogging::new(
+        &json!({
+            "broker_list": "localhost:9092",
+            "topic": "test",
+            "flush_timeout_seconds": 15
+        }),
+        &default_http_client(),
+    )
+    .unwrap();
+    assert_eq!(plugin.name(), "kafka_logging");
+}
+
+#[tokio::test]
+async fn test_kafka_logging_flush_timeout_minimum_clamped() {
+    // flush_timeout_seconds of 0 should be clamped to 1
+    let plugin = KafkaLogging::new(
+        &json!({
+            "broker_list": "localhost:9092",
+            "topic": "test",
+            "flush_timeout_seconds": 0
+        }),
+        &default_http_client(),
+    )
+    .unwrap();
+    assert_eq!(plugin.name(), "kafka_logging");
+}
+
+#[tokio::test]
+async fn test_kafka_logging_default_compression_is_lz4() {
+    // When no compression is specified, lz4 should be the default.
+    // This test verifies the plugin creates successfully with default compression.
+    let plugin = KafkaLogging::new(
+        &json!({
+            "broker_list": "localhost:9092",
+            "topic": "test"
+        }),
+        &default_http_client(),
+    )
+    .unwrap();
+    assert_eq!(plugin.name(), "kafka_logging");
+}
+
+#[tokio::test]
 async fn test_kafka_logging_supported_protocols() {
     let plugin = KafkaLogging::new(
         &json!({

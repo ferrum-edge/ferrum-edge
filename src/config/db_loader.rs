@@ -445,6 +445,17 @@ impl DatabaseStore {
             anyhow::bail!("Database has invalid plugin reference(s)");
         }
 
+        // Validate each plugin config by instantiating the plugin.
+        // Warn-only since data already exists in the database.
+        for pc in &config.plugin_configs {
+            if !pc.enabled {
+                continue;
+            }
+            if let Err(err) = crate::plugins::validate_plugin_config(&pc.plugin_name, &pc.config) {
+                warn!("Plugin '{}' (id={}): {}", pc.plugin_name, pc.id, err);
+            }
+        }
+
         self.check_slow_query("load_full_config", start);
         Ok(config)
     }

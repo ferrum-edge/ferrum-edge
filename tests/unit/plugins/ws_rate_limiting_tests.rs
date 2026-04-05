@@ -10,14 +10,14 @@ use tokio_tungstenite::tungstenite::protocol::Message;
 
 #[test]
 fn test_creation_defaults() {
-    let plugin = WsRateLimiting::new(&json!({}), PluginHttpClient::default());
+    let plugin = WsRateLimiting::new(&json!({}), PluginHttpClient::default()).unwrap();
     assert_eq!(plugin.name(), "ws_rate_limiting");
     assert_eq!(plugin.priority(), 2910);
 }
 
 #[test]
 fn test_supported_protocols_websocket_only() {
-    let plugin = WsRateLimiting::new(&json!({}), PluginHttpClient::default());
+    let plugin = WsRateLimiting::new(&json!({}), PluginHttpClient::default()).unwrap();
     let protocols = plugin.supported_protocols();
     assert_eq!(protocols, WS_ONLY_PROTOCOLS);
     assert!(protocols.contains(&ProxyProtocol::WebSocket));
@@ -29,7 +29,7 @@ fn test_supported_protocols_websocket_only() {
 
 #[test]
 fn test_requires_ws_frame_hooks() {
-    let plugin = WsRateLimiting::new(&json!({}), PluginHttpClient::default());
+    let plugin = WsRateLimiting::new(&json!({}), PluginHttpClient::default()).unwrap();
     assert!(plugin.requires_ws_frame_hooks());
 }
 
@@ -38,7 +38,8 @@ fn test_tracked_keys_count_starts_at_zero() {
     let plugin = WsRateLimiting::new(
         &json!({"frames_per_second": 10}),
         PluginHttpClient::default(),
-    );
+    )
+    .unwrap();
     assert_eq!(plugin.tracked_keys_count(), Some(0));
 }
 
@@ -49,7 +50,8 @@ async fn test_frames_within_limit_pass() {
     let plugin = WsRateLimiting::new(
         &json!({"frames_per_second": 5}),
         PluginHttpClient::default(),
-    );
+    )
+    .unwrap();
     let msg = Message::Text("hello".into());
 
     for _ in 0..5 {
@@ -72,7 +74,8 @@ async fn test_frames_exceeding_limit_return_close_1008() {
     let plugin = WsRateLimiting::new(
         &json!({"frames_per_second": 3}),
         PluginHttpClient::default(),
-    );
+    )
+    .unwrap();
     let msg = Message::Text("hello".into());
 
     // Use up all 3 tokens
@@ -117,7 +120,8 @@ async fn test_per_connection_isolation() {
     let plugin = WsRateLimiting::new(
         &json!({"frames_per_second": 2}),
         PluginHttpClient::default(),
-    );
+    )
+    .unwrap();
     let msg = Message::Text("hello".into());
 
     // Connection 1: drain tokens
@@ -165,7 +169,8 @@ async fn test_burst_size_larger_than_fps() {
     let plugin = WsRateLimiting::new(
         &json!({"frames_per_second": 5, "burst_size": 10}),
         PluginHttpClient::default(),
-    );
+    )
+    .unwrap();
     let msg = Message::Text("hello".into());
 
     // Should allow 10 frames (burst_size) before limiting
@@ -200,7 +205,8 @@ async fn test_token_refill_over_time() {
     let plugin = WsRateLimiting::new(
         &json!({"frames_per_second": 10}),
         PluginHttpClient::default(),
-    );
+    )
+    .unwrap();
     let msg = Message::Text("hello".into());
 
     // Drain all 10 tokens
@@ -249,7 +255,8 @@ async fn test_both_directions_share_bucket() {
     let plugin = WsRateLimiting::new(
         &json!({"frames_per_second": 4}),
         PluginHttpClient::default(),
-    );
+    )
+    .unwrap();
     let msg = Message::Text("hello".into());
 
     // 2 frames client->backend
@@ -300,7 +307,8 @@ async fn test_custom_close_reason() {
     let plugin = WsRateLimiting::new(
         &json!({"frames_per_second": 1, "close_reason": "Too many messages"}),
         PluginHttpClient::default(),
-    );
+    )
+    .unwrap();
     let msg = Message::Text("hello".into());
 
     // Use up the token
@@ -337,7 +345,8 @@ async fn test_tracked_keys_count_increments() {
     let plugin = WsRateLimiting::new(
         &json!({"frames_per_second": 100}),
         PluginHttpClient::default(),
-    );
+    )
+    .unwrap();
     let msg = Message::Text("hello".into());
 
     assert_eq!(plugin.tracked_keys_count(), Some(0));
@@ -383,7 +392,8 @@ async fn test_binary_frames_rate_limited() {
     let plugin = WsRateLimiting::new(
         &json!({"frames_per_second": 2}),
         PluginHttpClient::default(),
-    );
+    )
+    .unwrap();
 
     // Mix text and binary — all count against the same bucket
     plugin
@@ -422,7 +432,8 @@ async fn test_connection_id_is_key_not_proxy_id() {
     let plugin = WsRateLimiting::new(
         &json!({"frames_per_second": 2}),
         PluginHttpClient::default(),
-    );
+    )
+    .unwrap();
     let msg = Message::Text("hello".into());
 
     // Same connection_id, different proxy_ids — same bucket
@@ -445,24 +456,13 @@ async fn test_connection_id_is_key_not_proxy_id() {
 // === Zero FPS config ===
 
 #[tokio::test]
-async fn test_zero_fps_rejects_all_frames() {
-    let plugin = WsRateLimiting::new(
+async fn test_zero_fps_returns_error() {
+    let result = WsRateLimiting::new(
         &json!({"frames_per_second": 0}),
         PluginHttpClient::default(),
     );
-    let msg = Message::Text("hello".into());
-
-    // With 0 FPS, burst_size defaults to 0, so bucket capacity is 0 — all frames rejected
-    let result = plugin
-        .on_ws_frame(
-            "test-proxy",
-            1,
-            WebSocketFrameDirection::ClientToBackend,
-            &msg,
-        )
-        .await;
-    assert!(result.is_some(), "Zero FPS should reject all frames");
-    assert!(matches!(result.unwrap(), Message::Close(Some(_))));
+    assert!(result.is_err());
+    assert!(result.err().unwrap().contains("frames_per_second"));
 }
 
 #[tokio::test]
@@ -470,7 +470,8 @@ async fn test_zero_burst_size_rejects_all_frames() {
     let plugin = WsRateLimiting::new(
         &json!({"frames_per_second": 100, "burst_size": 0}),
         PluginHttpClient::default(),
-    );
+    )
+    .unwrap();
     let msg = Message::Text("hello".into());
 
     // burst_size=0 means capacity=0 — bucket starts empty
@@ -495,7 +496,8 @@ async fn test_stale_entries_evicted_on_capacity_trigger() {
     let plugin = WsRateLimiting::new(
         &json!({"frames_per_second": 1000}),
         PluginHttpClient::default(),
-    );
+    )
+    .unwrap();
     let msg = Message::Text("hello".into());
 
     // Create 3 connections
@@ -542,27 +544,13 @@ async fn test_stale_entries_evicted_on_capacity_trigger() {
 }
 
 #[tokio::test]
-async fn test_zero_fps_buckets_evicted_as_stale() {
-    // Ensure zero-rate buckets are considered inactive (not leaked forever)
-    let plugin = WsRateLimiting::new(
+async fn test_zero_fps_buckets_returns_error() {
+    // Zero FPS is now rejected at construction time
+    let result = WsRateLimiting::new(
         &json!({"frames_per_second": 0}),
         PluginHttpClient::default(),
     );
-    let msg = Message::Text("hello".into());
-
-    // Create a connection — it will be rejected immediately
-    plugin
-        .on_ws_frame(
-            "test-proxy",
-            1,
-            WebSocketFrameDirection::ClientToBackend,
-            &msg,
-        )
-        .await;
-    assert_eq!(plugin.tracked_keys_count(), Some(1));
-
-    // The bucket has refill_rate=0, capacity=0.
-    // is_active() should return false for zero-rate buckets (we guard against div-by-zero).
+    assert!(result.is_err());
 }
 
 // === Connection ID edge cases ===
@@ -572,7 +560,8 @@ async fn test_connection_id_zero_works() {
     let plugin = WsRateLimiting::new(
         &json!({"frames_per_second": 10}),
         PluginHttpClient::default(),
-    );
+    )
+    .unwrap();
     let msg = Message::Text("hello".into());
 
     let result = plugin
@@ -592,7 +581,8 @@ async fn test_connection_id_max_works() {
     let plugin = WsRateLimiting::new(
         &json!({"frames_per_second": 10}),
         PluginHttpClient::default(),
-    );
+    )
+    .unwrap();
     let msg = Message::Text("hello".into());
 
     let result = plugin

@@ -115,7 +115,7 @@ pub struct WsRateLimiting {
 }
 
 impl WsRateLimiting {
-    pub fn new(config: &Value, http_client: PluginHttpClient) -> Self {
+    pub fn new(config: &Value, http_client: PluginHttpClient) -> Result<Self, String> {
         let frames_per_second = config["frames_per_second"].as_u64().unwrap_or(100) as f64;
 
         let burst_size = config["burst_size"]
@@ -124,8 +124,8 @@ impl WsRateLimiting {
             .unwrap_or(frames_per_second);
 
         if frames_per_second == 0.0 {
-            tracing::warn!(
-                "ws_rate_limiting: 'frames_per_second' is zero — all frames will be rejected"
+            return Err(
+                "ws_rate_limiting: 'frames_per_second' must be greater than zero".to_string(),
             );
         }
 
@@ -152,7 +152,7 @@ impl WsRateLimiting {
                 ))
             });
 
-        Self {
+        Ok(Self {
             frames_per_second,
             burst_size,
             close_reason,
@@ -160,7 +160,7 @@ impl WsRateLimiting {
             frame_counter: std::sync::atomic::AtomicU64::new(0),
             redis_client,
             redis_instance_id: Uuid::new_v4().simple().to_string(),
-        }
+        })
     }
 
     fn redis_connection_scope_key(&self, proxy_id: &str, connection_id: u64) -> String {
@@ -306,8 +306,10 @@ mod tests {
 
     #[test]
     fn test_redis_connection_scope_key_is_namespaced_per_instance() {
-        let plugin_a = WsRateLimiting::new(&serde_json::json!({}), PluginHttpClient::default());
-        let plugin_b = WsRateLimiting::new(&serde_json::json!({}), PluginHttpClient::default());
+        let plugin_a =
+            WsRateLimiting::new(&serde_json::json!({}), PluginHttpClient::default()).unwrap();
+        let plugin_b =
+            WsRateLimiting::new(&serde_json::json!({}), PluginHttpClient::default()).unwrap();
 
         let key_a = plugin_a.redis_connection_scope_key("proxy-a", 7);
         let key_b = plugin_b.redis_connection_scope_key("proxy-a", 7);

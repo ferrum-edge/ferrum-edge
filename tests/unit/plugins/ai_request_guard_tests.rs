@@ -22,7 +22,7 @@ fn make_post_ctx(body: &serde_json::Value) -> ferrum_edge::plugins::RequestConte
 
 #[tokio::test]
 async fn test_plugin_name_and_priority() {
-    let plugin = AiRequestGuard::new(&json!({}));
+    let plugin = AiRequestGuard::new(&json!({})).unwrap();
     assert_eq!(plugin.name(), "ai_request_guard");
     assert_eq!(plugin.priority(), 2975);
     assert!(!plugin.requires_response_body_buffering());
@@ -31,7 +31,7 @@ async fn test_plugin_name_and_priority() {
 
 #[test]
 fn test_request_buffering_only_for_matching_json_requests() {
-    let plugin = AiRequestGuard::new(&json!({"max_messages": 2}));
+    let plugin = AiRequestGuard::new(&json!({"max_messages": 2})).unwrap();
     assert!(plugin.requires_request_body_buffering());
 
     let post_ctx = make_post_ctx(&json!({"messages": []}));
@@ -52,7 +52,7 @@ fn test_request_buffering_only_for_matching_json_requests() {
 
 #[tokio::test]
 async fn test_blocked_model_rejected() {
-    let plugin = AiRequestGuard::new(&json!({"blocked_models": ["o3", "gpt-4"]}));
+    let plugin = AiRequestGuard::new(&json!({"blocked_models": ["o3", "gpt-4"]})).unwrap();
     let mut ctx = make_post_ctx(&json!({"model": "o3", "messages": []}));
     let mut headers = HashMap::new();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
@@ -61,7 +61,7 @@ async fn test_blocked_model_rejected() {
 
 #[tokio::test]
 async fn test_non_blocked_model_passes() {
-    let plugin = AiRequestGuard::new(&json!({"blocked_models": ["o3"]}));
+    let plugin = AiRequestGuard::new(&json!({"blocked_models": ["o3"]})).unwrap();
     let mut ctx = make_post_ctx(&json!({"model": "gpt-4o-mini", "messages": []}));
     let mut headers = HashMap::new();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
@@ -72,7 +72,8 @@ async fn test_non_blocked_model_passes() {
 
 #[tokio::test]
 async fn test_allowed_model_passes() {
-    let plugin = AiRequestGuard::new(&json!({"allowed_models": ["gpt-4o-mini", "gpt-4o"]}));
+    let plugin =
+        AiRequestGuard::new(&json!({"allowed_models": ["gpt-4o-mini", "gpt-4o"]})).unwrap();
     let mut ctx = make_post_ctx(&json!({"model": "gpt-4o-mini", "messages": []}));
     let mut headers = HashMap::new();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
@@ -81,7 +82,7 @@ async fn test_allowed_model_passes() {
 
 #[tokio::test]
 async fn test_unlisted_model_rejected() {
-    let plugin = AiRequestGuard::new(&json!({"allowed_models": ["gpt-4o-mini"]}));
+    let plugin = AiRequestGuard::new(&json!({"allowed_models": ["gpt-4o-mini"]})).unwrap();
     let mut ctx = make_post_ctx(&json!({"model": "gpt-4", "messages": []}));
     let mut headers = HashMap::new();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
@@ -93,7 +94,8 @@ async fn test_blocked_takes_precedence_over_allowed() {
     let plugin = AiRequestGuard::new(&json!({
         "allowed_models": ["gpt-4"],
         "blocked_models": ["gpt-4"]
-    }));
+    }))
+    .unwrap();
     let mut ctx = make_post_ctx(&json!({"model": "gpt-4", "messages": []}));
     let mut headers = HashMap::new();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
@@ -102,7 +104,7 @@ async fn test_blocked_takes_precedence_over_allowed() {
 
 #[tokio::test]
 async fn test_case_insensitive_model_matching() {
-    let plugin = AiRequestGuard::new(&json!({"blocked_models": ["GPT-4"]}));
+    let plugin = AiRequestGuard::new(&json!({"blocked_models": ["GPT-4"]})).unwrap();
     let mut ctx = make_post_ctx(&json!({"model": "gpt-4", "messages": []}));
     let mut headers = HashMap::new();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
@@ -113,7 +115,7 @@ async fn test_case_insensitive_model_matching() {
 
 #[tokio::test]
 async fn test_max_tokens_reject_over_limit() {
-    let plugin = AiRequestGuard::new(&json!({"max_tokens_limit": 1000}));
+    let plugin = AiRequestGuard::new(&json!({"max_tokens_limit": 1000})).unwrap();
     let mut ctx = make_post_ctx(&json!({"model": "gpt-4", "max_tokens": 5000}));
     let mut headers = HashMap::new();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
@@ -122,7 +124,7 @@ async fn test_max_tokens_reject_over_limit() {
 
 #[tokio::test]
 async fn test_max_tokens_reject_under_limit() {
-    let plugin = AiRequestGuard::new(&json!({"max_tokens_limit": 1000}));
+    let plugin = AiRequestGuard::new(&json!({"max_tokens_limit": 1000})).unwrap();
     let mut ctx = make_post_ctx(&json!({"model": "gpt-4", "max_tokens": 500}));
     let mut headers = HashMap::new();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
@@ -134,7 +136,8 @@ async fn test_max_tokens_clamp_mode() {
     let plugin = AiRequestGuard::new(&json!({
         "max_tokens_limit": 1000,
         "enforce_max_tokens": "clamp"
-    }));
+    }))
+    .unwrap();
     assert!(plugin.modifies_request_body());
 
     // In clamp mode, before_proxy should NOT reject
@@ -158,7 +161,8 @@ async fn test_max_output_tokens_clamped() {
     let plugin = AiRequestGuard::new(&json!({
         "max_tokens_limit": 500,
         "enforce_max_tokens": "clamp"
-    }));
+    }))
+    .unwrap();
     let body =
         serde_json::to_vec(&json!({"model": "claude-3", "max_output_tokens": 2000})).unwrap();
     let result = plugin
@@ -171,7 +175,7 @@ async fn test_max_output_tokens_clamped() {
 
 #[tokio::test]
 async fn test_default_max_tokens_injected() {
-    let plugin = AiRequestGuard::new(&json!({"default_max_tokens": 4096}));
+    let plugin = AiRequestGuard::new(&json!({"default_max_tokens": 4096})).unwrap();
     assert!(plugin.modifies_request_body());
 
     let body = serde_json::to_vec(&json!({"model": "gpt-4", "messages": []})).unwrap();
@@ -185,7 +189,7 @@ async fn test_default_max_tokens_injected() {
 
 #[tokio::test]
 async fn test_default_max_tokens_not_injected_when_present() {
-    let plugin = AiRequestGuard::new(&json!({"default_max_tokens": 4096}));
+    let plugin = AiRequestGuard::new(&json!({"default_max_tokens": 4096})).unwrap();
     let body = serde_json::to_vec(&json!({"model": "gpt-4", "max_tokens": 100})).unwrap();
     let result = plugin
         .transform_request_body(&body, Some("application/json"), &HashMap::new())
@@ -198,7 +202,7 @@ async fn test_default_max_tokens_not_injected_when_present() {
 
 #[tokio::test]
 async fn test_max_messages_exceeded() {
-    let plugin = AiRequestGuard::new(&json!({"max_messages": 2}));
+    let plugin = AiRequestGuard::new(&json!({"max_messages": 2})).unwrap();
     let mut ctx = make_post_ctx(&json!({
         "model": "gpt-4",
         "messages": [
@@ -214,7 +218,7 @@ async fn test_max_messages_exceeded() {
 
 #[tokio::test]
 async fn test_max_messages_within_limit() {
-    let plugin = AiRequestGuard::new(&json!({"max_messages": 5}));
+    let plugin = AiRequestGuard::new(&json!({"max_messages": 5})).unwrap();
     let mut ctx = make_post_ctx(&json!({
         "model": "gpt-4",
         "messages": [{"role": "user", "content": "hello"}]
@@ -228,7 +232,7 @@ async fn test_max_messages_within_limit() {
 
 #[tokio::test]
 async fn test_max_prompt_characters_exceeded() {
-    let plugin = AiRequestGuard::new(&json!({"max_prompt_characters": 10}));
+    let plugin = AiRequestGuard::new(&json!({"max_prompt_characters": 10})).unwrap();
     let mut ctx = make_post_ctx(&json!({
         "model": "gpt-4",
         "messages": [{"role": "user", "content": "this is a long prompt that exceeds the limit"}]
@@ -240,7 +244,7 @@ async fn test_max_prompt_characters_exceeded() {
 
 #[tokio::test]
 async fn test_multimodal_content_character_counting() {
-    let plugin = AiRequestGuard::new(&json!({"max_prompt_characters": 10}));
+    let plugin = AiRequestGuard::new(&json!({"max_prompt_characters": 10})).unwrap();
     let mut ctx = make_post_ctx(&json!({
         "model": "gpt-4",
         "messages": [{
@@ -262,7 +266,7 @@ async fn test_multimodal_content_character_counting() {
 
 #[tokio::test]
 async fn test_temperature_out_of_range() {
-    let plugin = AiRequestGuard::new(&json!({"temperature_range": [0.0, 1.0]}));
+    let plugin = AiRequestGuard::new(&json!({"temperature_range": [0.0, 1.0]})).unwrap();
     let mut ctx = make_post_ctx(&json!({"model": "gpt-4", "temperature": 1.5}));
     let mut headers = HashMap::new();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
@@ -271,7 +275,7 @@ async fn test_temperature_out_of_range() {
 
 #[tokio::test]
 async fn test_temperature_in_range() {
-    let plugin = AiRequestGuard::new(&json!({"temperature_range": [0.0, 2.0]}));
+    let plugin = AiRequestGuard::new(&json!({"temperature_range": [0.0, 2.0]})).unwrap();
     let mut ctx = make_post_ctx(&json!({"model": "gpt-4", "temperature": 0.7}));
     let mut headers = HashMap::new();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
@@ -282,7 +286,7 @@ async fn test_temperature_in_range() {
 
 #[tokio::test]
 async fn test_block_system_prompts() {
-    let plugin = AiRequestGuard::new(&json!({"block_system_prompts": true}));
+    let plugin = AiRequestGuard::new(&json!({"block_system_prompts": true})).unwrap();
     let mut ctx = make_post_ctx(&json!({
         "model": "gpt-4",
         "messages": [
@@ -297,7 +301,7 @@ async fn test_block_system_prompts() {
 
 #[tokio::test]
 async fn test_no_system_prompts_passes() {
-    let plugin = AiRequestGuard::new(&json!({"block_system_prompts": true}));
+    let plugin = AiRequestGuard::new(&json!({"block_system_prompts": true})).unwrap();
     let mut ctx = make_post_ctx(&json!({
         "model": "gpt-4",
         "messages": [{"role": "user", "content": "Hello"}]
@@ -311,7 +315,7 @@ async fn test_no_system_prompts_passes() {
 
 #[tokio::test]
 async fn test_require_user_field_missing() {
-    let plugin = AiRequestGuard::new(&json!({"require_user_field": true}));
+    let plugin = AiRequestGuard::new(&json!({"require_user_field": true})).unwrap();
     let mut ctx = make_post_ctx(&json!({"model": "gpt-4", "messages": []}));
     let mut headers = HashMap::new();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
@@ -320,7 +324,7 @@ async fn test_require_user_field_missing() {
 
 #[tokio::test]
 async fn test_require_user_field_present() {
-    let plugin = AiRequestGuard::new(&json!({"require_user_field": true}));
+    let plugin = AiRequestGuard::new(&json!({"require_user_field": true})).unwrap();
     let mut ctx = make_post_ctx(&json!({"model": "gpt-4", "messages": [], "user": "user-123"}));
     let mut headers = HashMap::new();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
@@ -331,7 +335,7 @@ async fn test_require_user_field_present() {
 
 #[tokio::test]
 async fn test_non_post_passes() {
-    let plugin = AiRequestGuard::new(&json!({"blocked_models": ["gpt-4"]}));
+    let plugin = AiRequestGuard::new(&json!({"blocked_models": ["gpt-4"]})).unwrap();
     let mut ctx = create_test_context();
     ctx.method = "GET".to_string();
     let mut headers = HashMap::new();
@@ -341,7 +345,7 @@ async fn test_non_post_passes() {
 
 #[tokio::test]
 async fn test_non_json_content_type_passes() {
-    let plugin = AiRequestGuard::new(&json!({"blocked_models": ["gpt-4"]}));
+    let plugin = AiRequestGuard::new(&json!({"blocked_models": ["gpt-4"]})).unwrap();
     let mut ctx = create_test_context();
     ctx.method = "POST".to_string();
     ctx.headers
@@ -353,7 +357,7 @@ async fn test_non_json_content_type_passes() {
 
 #[tokio::test]
 async fn test_empty_body_passes() {
-    let plugin = AiRequestGuard::new(&json!({"blocked_models": ["gpt-4"]}));
+    let plugin = AiRequestGuard::new(&json!({"blocked_models": ["gpt-4"]})).unwrap();
     let mut ctx = create_test_context();
     ctx.method = "POST".to_string();
     ctx.headers
@@ -365,7 +369,7 @@ async fn test_empty_body_passes() {
 
 #[tokio::test]
 async fn test_malformed_json_passes() {
-    let plugin = AiRequestGuard::new(&json!({"blocked_models": ["gpt-4"]}));
+    let plugin = AiRequestGuard::new(&json!({"blocked_models": ["gpt-4"]})).unwrap();
     let mut ctx = create_test_context();
     ctx.method = "POST".to_string();
     ctx.headers
@@ -381,7 +385,7 @@ async fn test_malformed_json_passes() {
 
 #[tokio::test]
 async fn test_required_metadata_fields_present() {
-    let plugin = AiRequestGuard::new(&json!({"required_metadata_fields": ["stream"]}));
+    let plugin = AiRequestGuard::new(&json!({"required_metadata_fields": ["stream"]})).unwrap();
     let mut ctx = make_post_ctx(&json!({"model": "gpt-4", "messages": [], "stream": true}));
     let mut headers = HashMap::new();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
@@ -390,7 +394,7 @@ async fn test_required_metadata_fields_present() {
 
 #[tokio::test]
 async fn test_required_metadata_fields_missing() {
-    let plugin = AiRequestGuard::new(&json!({"required_metadata_fields": ["stream"]}));
+    let plugin = AiRequestGuard::new(&json!({"required_metadata_fields": ["stream"]})).unwrap();
     let mut ctx = make_post_ctx(&json!({"model": "gpt-4", "messages": []}));
     let mut headers = HashMap::new();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;

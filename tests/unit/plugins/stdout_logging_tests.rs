@@ -8,14 +8,14 @@ use super::plugin_utils::{create_test_context, create_test_transaction_summary};
 #[tokio::test]
 async fn test_stdout_logging_plugin_creation() {
     let config = json!({});
-    let plugin = StdoutLogging::new(&config);
+    let plugin = StdoutLogging::new(&config).unwrap();
     assert_eq!(plugin.name(), "stdout_logging");
 }
 
 #[tokio::test]
 async fn test_stdout_logging_plugin_lifecycle() {
     let config = json!({});
-    let plugin = StdoutLogging::new(&config);
+    let plugin = StdoutLogging::new(&config).unwrap();
     let mut ctx = create_test_context();
 
     // Test all lifecycle phases
@@ -40,7 +40,7 @@ async fn test_stdout_logging_plugin_lifecycle() {
 #[tokio::test]
 async fn test_stdout_logging_plugin_logging() {
     let config = json!({});
-    let plugin = StdoutLogging::new(&config);
+    let plugin = StdoutLogging::new(&config).unwrap();
 
     let summary = create_test_transaction_summary();
 
@@ -54,7 +54,7 @@ async fn test_stdout_logging_plugin_with_config() {
         "log_level": "info",
         "include_metadata": true
     });
-    let plugin = StdoutLogging::new(&config);
+    let plugin = StdoutLogging::new(&config).unwrap();
     assert_eq!(plugin.name(), "stdout_logging");
 
     let mut ctx = create_test_context();

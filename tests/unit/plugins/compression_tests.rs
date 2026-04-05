@@ -4,7 +4,7 @@ use serde_json::json;
 use std::collections::HashMap;
 
 fn make_plugin(config: serde_json::Value) -> CompressionPlugin {
-    CompressionPlugin::new(&config)
+    CompressionPlugin::new(&config).unwrap()
 }
 
 fn make_ctx(accept_encoding: Option<&str>) -> RequestContext {

@@ -30,7 +30,7 @@ pub struct ResponseTransformer {
 }
 
 impl ResponseTransformer {
-    pub fn new(config: &Value) -> Self {
+    pub fn new(config: &Value) -> Result<Self, String> {
         let rules: Vec<TransformRule> = config["rules"]
             .as_array()
             .map(|arr| {
@@ -62,12 +62,13 @@ impl ResponseTransformer {
         let body_rules = body_transform::parse_body_rules(config);
 
         if rules.is_empty() && body_rules.is_empty() {
-            tracing::warn!(
+            return Err(
                 "response_transformer: no 'rules' configured — plugin will have no effect"
+                    .to_string(),
             );
         }
 
-        Self { rules, body_rules }
+        Ok(Self { rules, body_rules })
     }
 }
 
