@@ -294,6 +294,27 @@ fn paginate_response(items: &Value, pagination: &PaginationParams) -> Value {
     })
 }
 
+/// Build pagination envelope from database-paginated results.
+/// When pagination params are present, wraps items with metadata.
+/// Otherwise returns a plain array for backward compatibility.
+fn paginate_db_response<T: Serialize>(
+    items: &[T],
+    total: i64,
+    pagination: &PaginationParams,
+) -> Value {
+    if !pagination.is_paginated {
+        return json!(items);
+    }
+    json!({
+        "data": items,
+        "pagination": {
+            "offset": pagination.offset,
+            "limit": pagination.limit,
+            "total": total
+        }
+    })
+}
+
 /// Handle an admin API request.
 pub async fn handle_admin_request(
     req: Request<Incoming>,
@@ -511,11 +532,14 @@ async fn handle_list_proxies(
     state: &AdminState,
     pagination: &PaginationParams,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
-    // Try database first, fall back to cached config for resilience
+    // Try database-level pagination first, fall back to cached config for resilience
     if let Some(ref db) = state.db {
-        match db.load_full_config().await {
-            Ok(config) => {
-                let body = paginate_response(&json!(config.proxies), pagination);
+        match db
+            .list_proxies_paginated(pagination.limit as i64, pagination.offset as i64)
+            .await
+        {
+            Ok(result) => {
+                let body = paginate_db_response(&result.items, result.total, pagination);
                 return Ok(json_response(StatusCode::OK, &body));
             }
             Err(e) => {
@@ -1163,16 +1187,19 @@ async fn handle_list_consumers(
     state: &AdminState,
     pagination: &PaginationParams,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
-    // Try database first, fall back to cached config for resilience
+    // Try database-level pagination first, fall back to cached config for resilience
     if let Some(ref db) = state.db {
-        match db.load_full_config().await {
-            Ok(config) => {
-                let redacted: Vec<_> = config
-                    .consumers
+        match db
+            .list_consumers_paginated(pagination.limit as i64, pagination.offset as i64)
+            .await
+        {
+            Ok(result) => {
+                let redacted: Vec<_> = result
+                    .items
                     .iter()
                     .map(redact_consumer_credentials)
                     .collect();
-                let body = paginate_response(&json!(redacted), pagination);
+                let body = paginate_db_response(&redacted, result.total, pagination);
                 return Ok(json_response(StatusCode::OK, &body));
             }
             Err(e) => {
@@ -1768,11 +1795,14 @@ async fn handle_list_plugin_configs(
     state: &AdminState,
     pagination: &PaginationParams,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
-    // Try database first, fall back to cached config for resilience
+    // Try database-level pagination first, fall back to cached config for resilience
     if let Some(ref db) = state.db {
-        match db.load_full_config().await {
-            Ok(config) => {
-                let body = paginate_response(&json!(config.plugin_configs), pagination);
+        match db
+            .list_plugin_configs_paginated(pagination.limit as i64, pagination.offset as i64)
+            .await
+        {
+            Ok(result) => {
+                let body = paginate_db_response(&result.items, result.total, pagination);
                 return Ok(json_response(StatusCode::OK, &body));
             }
             Err(e) => {
@@ -2080,11 +2110,14 @@ async fn handle_list_upstreams(
     state: &AdminState,
     pagination: &PaginationParams,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
-    // Try database first, fall back to cached config for resilience
+    // Try database-level pagination first, fall back to cached config for resilience
     if let Some(ref db) = state.db {
-        match db.load_full_config().await {
-            Ok(config) => {
-                let body = paginate_response(&json!(config.upstreams), pagination);
+        match db
+            .list_upstreams_paginated(pagination.limit as i64, pagination.offset as i64)
+            .await
+        {
+            Ok(result) => {
+                let body = paginate_db_response(&result.items, result.total, pagination);
                 return Ok(json_response(StatusCode::OK, &body));
             }
             Err(e) => {

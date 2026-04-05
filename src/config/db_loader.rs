@@ -73,6 +73,12 @@ impl IncrementalResult {
     }
 }
 
+/// Result of a paginated database query.
+pub struct PaginatedResult<T> {
+    pub items: Vec<T>,
+    pub total: i64,
+}
+
 /// Database connection pool tuning parameters.
 ///
 /// These are exposed via `FERRUM_DB_POOL_*` environment variables and applied
@@ -515,11 +521,10 @@ impl DatabaseStore {
 
     async fn load_proxies(&self) -> Result<Vec<Proxy>, anyhow::Error> {
         let start = Instant::now();
-        let rows: Vec<AnyRow> = sqlx::query("SELECT * FROM proxies")
-            .fetch_all(&self.rpool())
-            .await?;
 
-        // Batch-load all proxy_plugins in one query (eliminates N+1)
+        // Batch-load all proxy_plugins in one query (eliminates N+1).
+        // This table is lightweight (two TEXT columns, no JSON) so a single
+        // unbounded fetch is fine even at scale.
         let assoc_rows: Vec<AnyRow> =
             match sqlx::query("SELECT proxy_id, plugin_config_id FROM proxy_plugins")
                 .fetch_all(&self.rpool())
@@ -558,11 +563,27 @@ impl DatabaseStore {
                 .push(PluginAssociation { plugin_config_id });
         }
 
+        // Load proxies in chunks to avoid unbounded SELECT * at scale.
         let mut proxies = Vec::new();
-        for row in rows {
-            let id: String = row.try_get("id")?;
-            let plugins = plugins_by_proxy.remove(&id).unwrap_or_default();
-            proxies.push(row_to_proxy(&row, id, plugins)?);
+        let mut offset: i64 = 0;
+
+        loop {
+            let rows: Vec<AnyRow> =
+                sqlx::query(&self.q("SELECT * FROM proxies ORDER BY id LIMIT ? OFFSET ?"))
+                    .bind(Self::FULL_LOAD_PAGE_SIZE)
+                    .bind(offset)
+                    .fetch_all(&self.rpool())
+                    .await?;
+            let fetched = rows.len();
+            for row in rows {
+                let id: String = row.try_get("id")?;
+                let plugins = plugins_by_proxy.remove(&id).unwrap_or_default();
+                proxies.push(row_to_proxy(&row, id, plugins)?);
+            }
+            if (fetched as i64) < Self::FULL_LOAD_PAGE_SIZE {
+                break;
+            }
+            offset += Self::FULL_LOAD_PAGE_SIZE;
         }
 
         self.check_slow_query("load_proxies", start);
@@ -571,13 +592,24 @@ impl DatabaseStore {
 
     async fn load_consumers(&self) -> Result<Vec<Consumer>, anyhow::Error> {
         let start = Instant::now();
-        let rows: Vec<AnyRow> = sqlx::query("SELECT * FROM consumers")
-            .fetch_all(&self.rpool())
-            .await?;
-
         let mut consumers = Vec::new();
-        for row in rows {
-            consumers.push(row_to_consumer(&row)?);
+        let mut offset: i64 = 0;
+
+        loop {
+            let rows: Vec<AnyRow> =
+                sqlx::query(&self.q("SELECT * FROM consumers ORDER BY id LIMIT ? OFFSET ?"))
+                    .bind(Self::FULL_LOAD_PAGE_SIZE)
+                    .bind(offset)
+                    .fetch_all(&self.rpool())
+                    .await?;
+            let fetched = rows.len();
+            for row in rows {
+                consumers.push(row_to_consumer(&row)?);
+            }
+            if (fetched as i64) < Self::FULL_LOAD_PAGE_SIZE {
+                break;
+            }
+            offset += Self::FULL_LOAD_PAGE_SIZE;
         }
 
         self.check_slow_query("load_consumers", start);
@@ -586,13 +618,24 @@ impl DatabaseStore {
 
     async fn load_plugin_configs(&self) -> Result<Vec<PluginConfig>, anyhow::Error> {
         let start = Instant::now();
-        let rows: Vec<AnyRow> = sqlx::query("SELECT * FROM plugin_configs")
-            .fetch_all(&self.rpool())
-            .await?;
-
         let mut configs = Vec::new();
-        for row in rows {
-            configs.push(row_to_plugin_config(&row)?);
+        let mut offset: i64 = 0;
+
+        loop {
+            let rows: Vec<AnyRow> =
+                sqlx::query(&self.q("SELECT * FROM plugin_configs ORDER BY id LIMIT ? OFFSET ?"))
+                    .bind(Self::FULL_LOAD_PAGE_SIZE)
+                    .bind(offset)
+                    .fetch_all(&self.rpool())
+                    .await?;
+            let fetched = rows.len();
+            for row in rows {
+                configs.push(row_to_plugin_config(&row)?);
+            }
+            if (fetched as i64) < Self::FULL_LOAD_PAGE_SIZE {
+                break;
+            }
+            offset += Self::FULL_LOAD_PAGE_SIZE;
         }
 
         self.check_slow_query("load_plugin_configs", start);
@@ -1051,17 +1094,202 @@ impl DatabaseStore {
 
     async fn load_upstreams(&self) -> Result<Vec<Upstream>, anyhow::Error> {
         let start = Instant::now();
-        let rows: Vec<AnyRow> = sqlx::query("SELECT * FROM upstreams")
-            .fetch_all(&self.rpool())
+        let mut upstreams = Vec::new();
+        let mut offset: i64 = 0;
+
+        loop {
+            let rows: Vec<AnyRow> =
+                sqlx::query(&self.q("SELECT * FROM upstreams ORDER BY id LIMIT ? OFFSET ?"))
+                    .bind(Self::FULL_LOAD_PAGE_SIZE)
+                    .bind(offset)
+                    .fetch_all(&self.rpool())
+                    .await?;
+            let fetched = rows.len();
+            for row in rows {
+                upstreams.push(row_to_upstream(&row)?);
+            }
+            if (fetched as i64) < Self::FULL_LOAD_PAGE_SIZE {
+                break;
+            }
+            offset += Self::FULL_LOAD_PAGE_SIZE;
+        }
+
+        self.check_slow_query("load_upstreams", start);
+        Ok(upstreams)
+    }
+
+    // ---- Paginated list queries for Admin API ----
+
+    /// List proxies with database-level LIMIT/OFFSET pagination.
+    pub async fn list_proxies_paginated(
+        &self,
+        limit: i64,
+        offset: i64,
+    ) -> Result<PaginatedResult<Proxy>, anyhow::Error> {
+        let start = Instant::now();
+
+        let count_row = sqlx::query("SELECT COUNT(*) AS cnt FROM proxies")
+            .fetch_one(&self.rpool())
             .await?;
+        let total: i64 = count_row.try_get("cnt")?;
+
+        let rows: Vec<AnyRow> =
+            sqlx::query(&self.q("SELECT * FROM proxies ORDER BY id LIMIT ? OFFSET ?"))
+                .bind(limit)
+                .bind(offset)
+                .fetch_all(&self.rpool())
+                .await?;
+
+        // Batch-load proxy_plugins for only the proxies in this page
+        let proxy_ids: Vec<String> = rows
+            .iter()
+            .filter_map(|r| r.try_get::<String, _>("id").ok())
+            .collect();
+
+        let mut plugins_by_proxy: std::collections::HashMap<String, Vec<PluginAssociation>> =
+            std::collections::HashMap::new();
+        if !proxy_ids.is_empty() {
+            let placeholders = std::iter::repeat_n("?", proxy_ids.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = self.q(&format!(
+                "SELECT proxy_id, plugin_config_id FROM proxy_plugins WHERE proxy_id IN ({})",
+                placeholders
+            ));
+            let mut query = sqlx::query(&sql);
+            for id in &proxy_ids {
+                query = query.bind(id);
+            }
+            match query.fetch_all(&self.rpool()).await {
+                Ok(assoc_rows) => {
+                    for r in &assoc_rows {
+                        if let (Ok(pid), Ok(pcid)) = (
+                            r.try_get::<String, _>("proxy_id"),
+                            r.try_get::<String, _>("plugin_config_id"),
+                        ) {
+                            plugins_by_proxy
+                                .entry(pid)
+                                .or_default()
+                                .push(PluginAssociation {
+                                    plugin_config_id: pcid,
+                                });
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to load proxy_plugins for paginated list: {}", e);
+                }
+            }
+        }
+
+        let mut proxies = Vec::new();
+        for row in rows {
+            let id: String = row.try_get("id")?;
+            let plugins = plugins_by_proxy.remove(&id).unwrap_or_default();
+            proxies.push(row_to_proxy(&row, id, plugins)?);
+        }
+
+        self.check_slow_query("list_proxies_paginated", start);
+        Ok(PaginatedResult {
+            items: proxies,
+            total,
+        })
+    }
+
+    /// List consumers with database-level LIMIT/OFFSET pagination.
+    pub async fn list_consumers_paginated(
+        &self,
+        limit: i64,
+        offset: i64,
+    ) -> Result<PaginatedResult<Consumer>, anyhow::Error> {
+        let start = Instant::now();
+
+        let count_row = sqlx::query("SELECT COUNT(*) AS cnt FROM consumers")
+            .fetch_one(&self.rpool())
+            .await?;
+        let total: i64 = count_row.try_get("cnt")?;
+
+        let rows: Vec<AnyRow> =
+            sqlx::query(&self.q("SELECT * FROM consumers ORDER BY id LIMIT ? OFFSET ?"))
+                .bind(limit)
+                .bind(offset)
+                .fetch_all(&self.rpool())
+                .await?;
+
+        let mut consumers = Vec::new();
+        for row in rows {
+            consumers.push(row_to_consumer(&row)?);
+        }
+
+        self.check_slow_query("list_consumers_paginated", start);
+        Ok(PaginatedResult {
+            items: consumers,
+            total,
+        })
+    }
+
+    /// List plugin configs with database-level LIMIT/OFFSET pagination.
+    pub async fn list_plugin_configs_paginated(
+        &self,
+        limit: i64,
+        offset: i64,
+    ) -> Result<PaginatedResult<PluginConfig>, anyhow::Error> {
+        let start = Instant::now();
+
+        let count_row = sqlx::query("SELECT COUNT(*) AS cnt FROM plugin_configs")
+            .fetch_one(&self.rpool())
+            .await?;
+        let total: i64 = count_row.try_get("cnt")?;
+
+        let rows: Vec<AnyRow> =
+            sqlx::query(&self.q("SELECT * FROM plugin_configs ORDER BY id LIMIT ? OFFSET ?"))
+                .bind(limit)
+                .bind(offset)
+                .fetch_all(&self.rpool())
+                .await?;
+
+        let mut configs = Vec::new();
+        for row in rows {
+            configs.push(row_to_plugin_config(&row)?);
+        }
+
+        self.check_slow_query("list_plugin_configs_paginated", start);
+        Ok(PaginatedResult {
+            items: configs,
+            total,
+        })
+    }
+
+    /// List upstreams with database-level LIMIT/OFFSET pagination.
+    pub async fn list_upstreams_paginated(
+        &self,
+        limit: i64,
+        offset: i64,
+    ) -> Result<PaginatedResult<Upstream>, anyhow::Error> {
+        let start = Instant::now();
+
+        let count_row = sqlx::query("SELECT COUNT(*) AS cnt FROM upstreams")
+            .fetch_one(&self.rpool())
+            .await?;
+        let total: i64 = count_row.try_get("cnt")?;
+
+        let rows: Vec<AnyRow> =
+            sqlx::query(&self.q("SELECT * FROM upstreams ORDER BY id LIMIT ? OFFSET ?"))
+                .bind(limit)
+                .bind(offset)
+                .fetch_all(&self.rpool())
+                .await?;
 
         let mut upstreams = Vec::new();
         for row in rows {
             upstreams.push(row_to_upstream(&row)?);
         }
 
-        self.check_slow_query("load_upstreams", start);
-        Ok(upstreams)
+        self.check_slow_query("list_upstreams_paginated", start);
+        Ok(PaginatedResult {
+            items: upstreams,
+            total,
+        })
     }
 
     pub async fn create_upstream(&self, upstream: &Upstream) -> Result<(), anyhow::Error> {
@@ -1902,6 +2130,12 @@ impl DatabaseStore {
     /// Maximum records per database transaction for batch operations.
     /// Keeps transaction WAL/redo log size manageable and reduces lock hold time.
     const BATCH_CHUNK_SIZE: usize = 1000;
+
+    /// Maximum rows fetched per query during full config loading.
+    /// Prevents unbounded `SELECT *` from hitting statement timeouts or causing
+    /// memory spikes at scale (100k+ rows). Raw `AnyRow` buffers are freed
+    /// between chunks, so peak memory is proportional to chunk size, not table size.
+    const FULL_LOAD_PAGE_SIZE: i64 = 5000;
 
     /// Batch-create multiple proxies, chunked into transactions of
     /// [`BATCH_CHUNK_SIZE`] for large-scale imports.
