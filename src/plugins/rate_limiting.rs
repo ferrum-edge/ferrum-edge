@@ -223,7 +223,7 @@ pub struct RateLimiting {
 }
 
 impl RateLimiting {
-    pub fn new(config: &Value, http_client: PluginHttpClient) -> Self {
+    pub fn new(config: &Value, http_client: PluginHttpClient) -> Result<Self, String> {
         let limit_by = config["limit_by"].as_str().unwrap_or("ip").to_string();
         let expose_headers = config["expose_headers"].as_bool().unwrap_or(false);
 
@@ -259,8 +259,9 @@ impl RateLimiting {
         };
 
         if window_specs.is_empty() {
-            tracing::warn!(
+            return Err(
                 "rate_limiting: no rate limit windows configured — set 'window_seconds'+'max_requests', or 'requests_per_second'/'requests_per_minute'/'requests_per_hour'"
+                    .to_string(),
             );
         }
 
@@ -282,13 +283,13 @@ impl RateLimiting {
                 ))
             });
 
-        Self {
+        Ok(Self {
             limit_by,
             expose_headers,
             window_specs,
             state: Arc::new(DashMap::new()),
             redis_client,
-        }
+        })
     }
 
     /// Evict entries whose rate windows have had no recent activity.

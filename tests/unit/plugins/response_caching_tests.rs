@@ -39,11 +39,11 @@ fn make_ctx_with_query(method: &str, path: &str, query: &[(&str, &str)]) -> Requ
 }
 
 fn default_plugin() -> ResponseCaching {
-    ResponseCaching::new(&json!({}))
+    ResponseCaching::new(&json!({})).unwrap()
 }
 
 fn plugin_with_config(config: serde_json::Value) -> ResponseCaching {
-    ResponseCaching::new(&config)
+    ResponseCaching::new(&config).unwrap()
 }
 
 fn expect_reject(result: PluginResult) -> (u16, Vec<u8>, HashMap<String, String>) {

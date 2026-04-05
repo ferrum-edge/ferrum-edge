@@ -539,12 +539,32 @@ Each test runs a gateway with protocol-specific config (`configs/*.yaml`) and a 
 ### Adding a New Plugin
 
 1. Create `src/plugins/my_plugin.rs` implementing the `Plugin` trait
-2. Add a priority constant in `src/plugins/mod.rs` (`priority::MY_PLUGIN = N`)
-3. Override `supported_protocols()` to declare which protocols the plugin supports (default is HTTP-only). Use the predefined constants: `ALL_PROTOCOLS`, `HTTP_FAMILY_PROTOCOLS`, `HTTP_GRPC_PROTOCOLS`, `HTTP_FAMILY_AND_TCP_PROTOCOLS`, `HTTP_FAMILY_AND_STREAM_PROTOCOLS`, `HTTP_ONLY_PROTOCOLS`, `GRPC_ONLY_PROTOCOLS`, `TCP_ONLY_PROTOCOLS`, or `UDP_ONLY_PROTOCOLS`
-4. Register in the plugin registry (`create_plugin()` match arm in `mod.rs`)
-5. Add unit tests in `tests/unit/plugins/my_plugin_tests.rs`
-6. Add the module to `tests/unit/plugins/mod.rs`
-7. Update `FEATURES.md`, `README.md`, and `docs/plugin_execution_order.md` (protocol matrix)
+2. **Constructor must return `Result<Self, String>`** — every plugin's `new()` must validate its config and return `Err` with a clear message if the config is invalid. See the "Plugin Config Validation" section below for rules.
+3. Add a priority constant in `src/plugins/mod.rs` (`priority::MY_PLUGIN = N`)
+4. Override `supported_protocols()` to declare which protocols the plugin supports (default is HTTP-only). Use the predefined constants: `ALL_PROTOCOLS`, `HTTP_FAMILY_PROTOCOLS`, `HTTP_GRPC_PROTOCOLS`, `HTTP_FAMILY_AND_TCP_PROTOCOLS`, `HTTP_FAMILY_AND_STREAM_PROTOCOLS`, `HTTP_ONLY_PROTOCOLS`, `GRPC_ONLY_PROTOCOLS`, `TCP_ONLY_PROTOCOLS`, or `UDP_ONLY_PROTOCOLS`
+5. Register in the plugin registry (`create_plugin_with_http_client()` match arm in `mod.rs`) — use `?` on the `new()` call (e.g., `Ok(Some(Arc::new(my_plugin::MyPlugin::new(config)?)))`)
+6. Add the plugin name to `available_plugins()` in `mod.rs`
+7. Add unit tests in `tests/unit/plugins/my_plugin_tests.rs` — include tests for both valid configs (`.unwrap()`) and invalid configs (`.is_err()` / `.err().unwrap()`)
+8. Add the module to `tests/unit/plugins/mod.rs`
+9. Update `FEATURES.md`, `README.md`, and `docs/plugin_execution_order.md` (protocol matrix)
+
+### Plugin Config Validation
+
+All plugin constructors **must** return `Result<Self, String>`. Config validation is enforced at three levels:
+
+1. **Admin API** — `validate_plugin_config_definition()` instantiates the plugin via `create_plugin()` at create/update time. Invalid configs are rejected with HTTP 400.
+2. **File mode** — `file_loader.rs` calls `plugins::validate_plugin_config()` for each enabled plugin at startup. Invalid configs **fail startup**.
+3. **Database mode** — `db_loader.rs` calls `plugins::validate_plugin_config()` for each enabled plugin at load time. Invalid configs are **warned** (data already exists in DB).
+
+**Validation rules for `new()` constructors:**
+
+- **Return `Err` when the plugin would have no effect** — if the config is missing required fields that make the plugin a no-op (e.g., rate limiter with no rate windows, size limiter with `max_bytes=0`, transformer with no rules), return an error. Do not silently default to a no-op.
+- **Return `Err` for invalid values** — reject malformed regexes, unknown enum variants, out-of-range numbers, and other parse failures. Do not silently skip or default.
+- **Sensible defaults are fine** — optional fields with reasonable defaults (e.g., `limit_by` defaulting to `"ip"`) should use `.unwrap_or()` without an error. Only require explicit config for fields where there is no safe default.
+- **Never `warn!()` for something that should be an `Err`** — if you would have logged a warning saying "plugin will have no effect", that should be an `Err` instead.
+- **Use `Ok(Self { ... })` for the success path** — wrap the struct construction in `Ok()`.
+
+**The shared validation entry point** is `plugins::validate_plugin_config(name, config) -> Result<(), String>` which wraps `create_plugin()`. File/DB loaders call this; the admin API calls `validate_plugin_config_definition()` which does the same thing plus scope checks.
 
 ### Adding a Custom Plugin with Database Migrations
 

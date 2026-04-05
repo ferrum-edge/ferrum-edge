@@ -54,7 +54,7 @@ pub struct CorsPlugin {
 }
 
 impl CorsPlugin {
-    pub fn new(config: &Value) -> Self {
+    pub fn new(config: &Value) -> Result<Self, String> {
         let allowed_origins = Self::parse_origins(config);
 
         let allowed_methods = Self::parse_string_array(
@@ -90,7 +90,7 @@ impl CorsPlugin {
             allow_credentials = false;
         }
 
-        Self {
+        Ok(Self {
             allowed_origins,
             allowed_methods,
             allowed_headers,
@@ -98,7 +98,7 @@ impl CorsPlugin {
             allow_credentials,
             max_age,
             preflight_continue,
-        }
+        })
     }
 
     /// Parse the `allowed_origins` config field.

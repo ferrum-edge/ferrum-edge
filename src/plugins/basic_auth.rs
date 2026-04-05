@@ -45,7 +45,7 @@ pub struct BasicAuth {
 }
 
 impl BasicAuth {
-    pub fn new(_config: &Value) -> Self {
+    pub fn new(_config: &Value) -> Result<Self, String> {
         use crate::config::conf_file::resolve_ferrum_var;
 
         let (hmac_secret, is_default) = match resolve_ferrum_var("FERRUM_BASIC_AUTH_HMAC_SECRET")
@@ -65,7 +65,7 @@ impl BasicAuth {
             debug!("basic_auth: HMAC-SHA256 configured with custom secret");
         }
 
-        Self { hmac_secret }
+        Ok(Self { hmac_secret })
     }
 
     /// Verify a password against a stored hash.

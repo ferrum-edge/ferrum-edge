@@ -29,7 +29,7 @@ fn ai_request(content: &str) -> serde_json::Value {
 
 #[tokio::test]
 async fn test_plugin_name_and_priority() {
-    let plugin = AiPromptShield::new(&json!({}));
+    let plugin = AiPromptShield::new(&json!({})).unwrap();
     assert_eq!(plugin.name(), "ai_prompt_shield");
     assert_eq!(plugin.priority(), 2925);
     assert!(!plugin.requires_response_body_buffering());
@@ -41,7 +41,8 @@ fn test_request_buffering_only_for_matching_json_requests() {
     let plugin = AiPromptShield::new(&json!({
         "action": "warn",
         "patterns": ["ssn"]
-    }));
+    }))
+    .unwrap();
     assert!(plugin.requires_request_body_buffering());
 
     let post_ctx = make_post_ctx(&ai_request("My SSN is 123-45-6789"));
@@ -59,21 +60,21 @@ fn test_request_buffering_only_for_matching_json_requests() {
 }
 
 #[test]
-fn test_invalid_pattern_config_does_not_force_request_buffering() {
-    let plugin = AiPromptShield::new(&json!({
+fn test_invalid_custom_regex_returns_error() {
+    let result = AiPromptShield::new(&json!({
         "patterns": [],
         "custom_patterns": [
             {"name": "bad", "regex": "[invalid("}
         ]
     }));
-    assert!(!plugin.requires_request_body_buffering());
+    assert!(result.is_err());
 }
 
 // ─── SSN detection ──────────────────────────────────────────────────────
 
 #[tokio::test]
 async fn test_ssn_detected_rejected() {
-    let plugin = AiPromptShield::new(&json!({"patterns": ["ssn"]}));
+    let plugin = AiPromptShield::new(&json!({"patterns": ["ssn"]})).unwrap();
     let mut ctx = make_post_ctx(&ai_request("My SSN is 123-45-6789"));
     let mut headers = HashMap::new();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
@@ -82,7 +83,7 @@ async fn test_ssn_detected_rejected() {
 
 #[tokio::test]
 async fn test_ssn_no_separators() {
-    let plugin = AiPromptShield::new(&json!({"patterns": ["ssn"]}));
+    let plugin = AiPromptShield::new(&json!({"patterns": ["ssn"]})).unwrap();
     let mut ctx = make_post_ctx(&ai_request("SSN: 123456789"));
     let mut headers = HashMap::new();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
@@ -93,7 +94,7 @@ async fn test_ssn_no_separators() {
 
 #[tokio::test]
 async fn test_credit_card_detected() {
-    let plugin = AiPromptShield::new(&json!({"patterns": ["credit_card"]}));
+    let plugin = AiPromptShield::new(&json!({"patterns": ["credit_card"]})).unwrap();
     let mut ctx = make_post_ctx(&ai_request("My card is 4111-1111-1111-1111"));
     let mut headers = HashMap::new();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
@@ -104,7 +105,7 @@ async fn test_credit_card_detected() {
 
 #[tokio::test]
 async fn test_email_detected() {
-    let plugin = AiPromptShield::new(&json!({"patterns": ["email"]}));
+    let plugin = AiPromptShield::new(&json!({"patterns": ["email"]})).unwrap();
     let mut ctx = make_post_ctx(&ai_request("Contact me at john@example.com"));
     let mut headers = HashMap::new();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
@@ -115,7 +116,7 @@ async fn test_email_detected() {
 
 #[tokio::test]
 async fn test_aws_key_detected() {
-    let plugin = AiPromptShield::new(&json!({"patterns": ["aws_key"]}));
+    let plugin = AiPromptShield::new(&json!({"patterns": ["aws_key"]})).unwrap();
     let mut ctx = make_post_ctx(&ai_request("Key: AKIAIOSFODNN7EXAMPLE"));
     let mut headers = HashMap::new();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
@@ -126,7 +127,7 @@ async fn test_aws_key_detected() {
 
 #[tokio::test]
 async fn test_api_key_detected() {
-    let plugin = AiPromptShield::new(&json!({"patterns": ["api_key"]}));
+    let plugin = AiPromptShield::new(&json!({"patterns": ["api_key"]})).unwrap();
     let mut ctx = make_post_ctx(&ai_request("Use sk_liveabcdefghijklmnopqrstuvwxyz"));
     let mut headers = HashMap::new();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
@@ -137,7 +138,7 @@ async fn test_api_key_detected() {
 
 #[tokio::test]
 async fn test_iban_detected() {
-    let plugin = AiPromptShield::new(&json!({"patterns": ["iban"]}));
+    let plugin = AiPromptShield::new(&json!({"patterns": ["iban"]})).unwrap();
     let mut ctx = make_post_ctx(&ai_request("My IBAN is GB29NWBK60161331926819"));
     let mut headers = HashMap::new();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
@@ -148,7 +149,7 @@ async fn test_iban_detected() {
 
 #[tokio::test]
 async fn test_ip_address_detected() {
-    let plugin = AiPromptShield::new(&json!({"patterns": ["ip_address"]}));
+    let plugin = AiPromptShield::new(&json!({"patterns": ["ip_address"]})).unwrap();
     let mut ctx = make_post_ctx(&ai_request("Connect to server 10.20.30.40 now"));
     let mut headers = HashMap::new();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
@@ -159,7 +160,8 @@ async fn test_ip_address_detected() {
 
 #[tokio::test]
 async fn test_no_pii_passes() {
-    let plugin = AiPromptShield::new(&json!({"patterns": ["ssn", "credit_card", "email"]}));
+    let plugin =
+        AiPromptShield::new(&json!({"patterns": ["ssn", "credit_card", "email"]})).unwrap();
     let mut ctx = make_post_ctx(&ai_request("Hello, how are you doing today?"));
     let mut headers = HashMap::new();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
@@ -171,7 +173,7 @@ async fn test_no_pii_passes() {
 #[tokio::test]
 async fn test_only_configured_patterns_checked() {
     // Only SSN enabled — email should pass
-    let plugin = AiPromptShield::new(&json!({"patterns": ["ssn"]}));
+    let plugin = AiPromptShield::new(&json!({"patterns": ["ssn"]})).unwrap();
     let mut ctx = make_post_ctx(&ai_request("Contact john@example.com for details"));
     let mut headers = HashMap::new();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
@@ -185,7 +187,8 @@ async fn test_redact_mode_ssn() {
     let plugin = AiPromptShield::new(&json!({
         "action": "redact",
         "patterns": ["ssn"]
-    }));
+    }))
+    .unwrap();
     assert!(plugin.modifies_request_body());
 
     // before_proxy should continue (not reject)
@@ -212,7 +215,8 @@ async fn test_redact_multiple_types() {
     let plugin = AiPromptShield::new(&json!({
         "action": "redact",
         "patterns": ["ssn", "email"]
-    }));
+    }))
+    .unwrap();
 
     let body =
         serde_json::to_vec(&ai_request("SSN: 123-45-6789, email: test@example.com")).unwrap();
@@ -233,7 +237,8 @@ async fn test_warn_mode() {
     let plugin = AiPromptShield::new(&json!({
         "action": "warn",
         "patterns": ["ssn"]
-    }));
+    }))
+    .unwrap();
     assert!(!plugin.modifies_request_body());
 
     let mut ctx = make_post_ctx(&ai_request("My SSN is 123-45-6789"));
@@ -252,26 +257,26 @@ async fn test_custom_pattern() {
         "custom_patterns": [
             {"name": "internal_id", "regex": "ACCT-\\d{8}"}
         ]
-    }));
+    }))
+    .unwrap();
     let mut ctx = make_post_ctx(&ai_request("Account ACCT-12345678 is active"));
     let mut headers = HashMap::new();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_reject(result, Some(400));
 }
 
-#[tokio::test]
-async fn test_invalid_custom_regex_skipped() {
-    // Invalid regex should be skipped, not crash
-    let plugin = AiPromptShield::new(&json!({
+#[test]
+fn test_invalid_custom_regex_rejected_at_construction() {
+    // Invalid regex should cause new() to return an error
+    let result = AiPromptShield::new(&json!({
         "patterns": [],
         "custom_patterns": [
             {"name": "bad", "regex": "[invalid("}
         ]
     }));
-    let mut ctx = make_post_ctx(&ai_request("Hello"));
-    let mut headers = HashMap::new();
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
-    assert_continue(result);
+    assert!(result.is_err());
+    let err = result.err().unwrap();
+    assert!(err.contains("failed to compile custom pattern"));
 }
 
 // ─── Exclude roles ──────────────────────────────────────────────────────
@@ -281,7 +286,8 @@ async fn test_exclude_roles() {
     let plugin = AiPromptShield::new(&json!({
         "patterns": ["ssn"],
         "exclude_roles": ["system"]
-    }));
+    }))
+    .unwrap();
     let mut ctx = make_post_ctx(&json!({
         "model": "gpt-4",
         "messages": [
@@ -302,7 +308,8 @@ async fn test_scan_all_mode() {
     let plugin = AiPromptShield::new(&json!({
         "patterns": ["ssn"],
         "scan_fields": "all"
-    }));
+    }))
+    .unwrap();
     let mut ctx = make_post_ctx(&json!({
         "model": "gpt-4",
         "system_instruction": "SSN: 123-45-6789",
@@ -320,7 +327,8 @@ async fn test_scan_content_only_mode() {
     let plugin = AiPromptShield::new(&json!({
         "patterns": ["ssn"],
         "scan_fields": "content"
-    }));
+    }))
+    .unwrap();
     let mut ctx = make_post_ctx(&json!({
         "model": "gpt-4",
         "system_instruction": "SSN: 123-45-6789",
@@ -340,7 +348,8 @@ async fn test_max_scan_bytes_exceeded() {
     let plugin = AiPromptShield::new(&json!({
         "patterns": ["ssn"],
         "max_scan_bytes": 10
-    }));
+    }))
+    .unwrap();
     let mut ctx = make_post_ctx(&ai_request("My SSN is 123-45-6789"));
     let mut headers = HashMap::new();
     // Body is larger than 10 bytes — should skip scanning
@@ -352,7 +361,7 @@ async fn test_max_scan_bytes_exceeded() {
 
 #[tokio::test]
 async fn test_multimodal_content_scanned() {
-    let plugin = AiPromptShield::new(&json!({"patterns": ["ssn"]}));
+    let plugin = AiPromptShield::new(&json!({"patterns": ["ssn"]})).unwrap();
     let mut ctx = make_post_ctx(&json!({
         "model": "gpt-4",
         "messages": [{
@@ -376,7 +385,8 @@ async fn test_custom_redaction_placeholder() {
         "action": "redact",
         "patterns": ["ssn"],
         "redaction_placeholder": "***{type}***"
-    }));
+    }))
+    .unwrap();
 
     let body = serde_json::to_vec(&ai_request("SSN: 123-45-6789")).unwrap();
     let result = plugin
@@ -392,7 +402,7 @@ async fn test_custom_redaction_placeholder() {
 
 #[tokio::test]
 async fn test_non_post_passes() {
-    let plugin = AiPromptShield::new(&json!({"patterns": ["ssn"]}));
+    let plugin = AiPromptShield::new(&json!({"patterns": ["ssn"]})).unwrap();
     let mut ctx = create_test_context();
     ctx.method = "GET".to_string();
     let mut headers = HashMap::new();
@@ -402,7 +412,7 @@ async fn test_non_post_passes() {
 
 #[tokio::test]
 async fn test_non_json_content_type_passes() {
-    let plugin = AiPromptShield::new(&json!({"patterns": ["ssn"]}));
+    let plugin = AiPromptShield::new(&json!({"patterns": ["ssn"]})).unwrap();
     let mut ctx = create_test_context();
     ctx.method = "POST".to_string();
     ctx.headers
@@ -416,7 +426,7 @@ async fn test_non_json_content_type_passes() {
 
 #[tokio::test]
 async fn test_empty_body_passes() {
-    let plugin = AiPromptShield::new(&json!({"patterns": ["ssn"]}));
+    let plugin = AiPromptShield::new(&json!({"patterns": ["ssn"]})).unwrap();
     let mut ctx = create_test_context();
     ctx.method = "POST".to_string();
     ctx.headers
@@ -430,7 +440,7 @@ async fn test_empty_body_passes() {
 
 #[tokio::test]
 async fn test_pii_in_any_message_detected() {
-    let plugin = AiPromptShield::new(&json!({"patterns": ["ssn"]}));
+    let plugin = AiPromptShield::new(&json!({"patterns": ["ssn"]})).unwrap();
     let mut ctx = make_post_ctx(&json!({
         "model": "gpt-4",
         "messages": [
@@ -451,7 +461,8 @@ async fn test_redaction_preserves_json_structure() {
     let plugin = AiPromptShield::new(&json!({
         "action": "redact",
         "patterns": ["ssn"]
-    }));
+    }))
+    .unwrap();
 
     let body = serde_json::to_vec(&json!({
         "model": "gpt-4",
@@ -488,7 +499,7 @@ async fn test_redaction_preserves_json_structure() {
 
 #[tokio::test]
 async fn test_rejection_body_format() {
-    let plugin = AiPromptShield::new(&json!({"patterns": ["ssn", "email"]}));
+    let plugin = AiPromptShield::new(&json!({"patterns": ["ssn", "email"]})).unwrap();
     let mut ctx = make_post_ctx(&ai_request("SSN: 123-45-6789, email: a@b.com"));
     let mut headers = HashMap::new();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;

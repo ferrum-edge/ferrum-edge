@@ -46,13 +46,13 @@ fn create_basic_auth_consumer() -> ferrum_edge::config::types::Consumer {
 
 #[tokio::test]
 async fn test_basic_auth_plugin_creation() {
-    let plugin = BasicAuth::new(&json!({}));
+    let plugin = BasicAuth::new(&json!({})).unwrap();
     assert_eq!(plugin.name(), "basic_auth");
 }
 
 #[tokio::test]
 async fn test_basic_auth_successful() {
-    let plugin = BasicAuth::new(&json!({}));
+    let plugin = BasicAuth::new(&json!({})).unwrap();
     let consumer = create_basic_auth_consumer();
     let consumer_index = ConsumerIndex::new(&[consumer]);
 
@@ -72,7 +72,7 @@ async fn test_basic_auth_successful() {
 
 #[tokio::test]
 async fn test_basic_auth_wrong_password() {
-    let plugin = BasicAuth::new(&json!({}));
+    let plugin = BasicAuth::new(&json!({})).unwrap();
     let consumer = create_basic_auth_consumer();
     let consumer_index = ConsumerIndex::new(&[consumer]);
 
@@ -89,7 +89,7 @@ async fn test_basic_auth_wrong_password() {
 
 #[tokio::test]
 async fn test_basic_auth_wrong_username() {
-    let plugin = BasicAuth::new(&json!({}));
+    let plugin = BasicAuth::new(&json!({})).unwrap();
     let consumer = create_basic_auth_consumer();
     let consumer_index = ConsumerIndex::new(&[consumer]);
 
@@ -106,7 +106,7 @@ async fn test_basic_auth_wrong_username() {
 
 #[tokio::test]
 async fn test_basic_auth_missing_header() {
-    let plugin = BasicAuth::new(&json!({}));
+    let plugin = BasicAuth::new(&json!({})).unwrap();
     let consumer_index = ConsumerIndex::new(&[create_basic_auth_consumer()]);
 
     let mut ctx = make_ctx();
@@ -117,7 +117,7 @@ async fn test_basic_auth_missing_header() {
 
 #[tokio::test]
 async fn test_basic_auth_invalid_scheme() {
-    let plugin = BasicAuth::new(&json!({}));
+    let plugin = BasicAuth::new(&json!({})).unwrap();
     let consumer_index = ConsumerIndex::new(&[create_basic_auth_consumer()]);
 
     let mut ctx = make_ctx();
@@ -130,7 +130,7 @@ async fn test_basic_auth_invalid_scheme() {
 
 #[tokio::test]
 async fn test_basic_auth_invalid_base64() {
-    let plugin = BasicAuth::new(&json!({}));
+    let plugin = BasicAuth::new(&json!({})).unwrap();
     let consumer_index = ConsumerIndex::new(&[create_basic_auth_consumer()]);
 
     let mut ctx = make_ctx();
@@ -145,7 +145,7 @@ async fn test_basic_auth_invalid_base64() {
 
 #[tokio::test]
 async fn test_basic_auth_missing_colon_separator() {
-    let plugin = BasicAuth::new(&json!({}));
+    let plugin = BasicAuth::new(&json!({})).unwrap();
     let consumer_index = ConsumerIndex::new(&[create_basic_auth_consumer()]);
 
     let mut ctx = make_ctx();
@@ -160,7 +160,7 @@ async fn test_basic_auth_missing_colon_separator() {
 
 #[tokio::test]
 async fn test_basic_auth_case_insensitive_scheme() {
-    let plugin = BasicAuth::new(&json!({}));
+    let plugin = BasicAuth::new(&json!({})).unwrap();
     let consumer = create_basic_auth_consumer();
     let consumer_index = ConsumerIndex::new(&[consumer]);
 
@@ -179,7 +179,7 @@ async fn test_basic_auth_case_insensitive_scheme() {
 
 #[tokio::test]
 async fn test_basic_auth_uppercase_scheme() {
-    let plugin = BasicAuth::new(&json!({}));
+    let plugin = BasicAuth::new(&json!({})).unwrap();
     let consumer = create_basic_auth_consumer();
     let consumer_index = ConsumerIndex::new(&[consumer]);
 
@@ -197,7 +197,7 @@ async fn test_basic_auth_uppercase_scheme() {
 
 #[tokio::test]
 async fn test_basic_auth_empty_consumers() {
-    let plugin = BasicAuth::new(&json!({}));
+    let plugin = BasicAuth::new(&json!({})).unwrap();
     let consumer_index = ConsumerIndex::new(&[]);
 
     let mut ctx = make_ctx();
@@ -212,7 +212,7 @@ async fn test_basic_auth_empty_consumers() {
 
 #[tokio::test]
 async fn test_basic_auth_password_with_colon() {
-    let plugin = BasicAuth::new(&json!({}));
+    let plugin = BasicAuth::new(&json!({})).unwrap();
     // Password containing colons should work because splitn(2, ':') is used
     let consumer = create_basic_auth_consumer();
     let consumer_index = ConsumerIndex::new(&[consumer]);
@@ -234,7 +234,7 @@ async fn test_basic_auth_password_with_colon() {
 #[tokio::test]
 async fn test_basic_auth_bcrypt_fallback() {
     // Verify bcrypt hash verification works (the default path when HMAC is not configured)
-    let plugin = BasicAuth::new(&json!({}));
+    let plugin = BasicAuth::new(&json!({})).unwrap();
 
     // Create a consumer with a known bcrypt hash for "mypassword"
     let hash = bcrypt::hash("mypassword", 4).unwrap(); // cost=4 for fast tests

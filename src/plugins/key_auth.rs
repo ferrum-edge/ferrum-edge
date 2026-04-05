@@ -23,13 +23,13 @@ pub struct KeyAuth {
 }
 
 impl KeyAuth {
-    pub fn new(config: &Value) -> Self {
-        Self {
+    pub fn new(config: &Value) -> Result<Self, String> {
+        Ok(Self {
             key_location: config["key_location"]
                 .as_str()
                 .unwrap_or("header:X-API-Key")
                 .to_string(),
-        }
+        })
     }
 
     fn extract_key(&self, ctx: &RequestContext) -> Option<String> {

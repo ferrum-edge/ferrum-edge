@@ -13,8 +13,8 @@ use super::{Plugin, TransactionSummary};
 pub struct StdoutLogging;
 
 impl StdoutLogging {
-    pub fn new(_config: &Value) -> Self {
-        Self
+    pub fn new(_config: &Value) -> Result<Self, String> {
+        Ok(Self)
     }
 }
 

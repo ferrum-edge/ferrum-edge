@@ -77,7 +77,7 @@ pub struct GrpcWebPlugin {
 }
 
 impl GrpcWebPlugin {
-    pub fn new(config: &Value) -> Self {
+    pub fn new(config: &Value) -> Result<Self, String> {
         let expose_headers = config["expose_headers"]
             .as_array()
             .map(|arr| {
@@ -87,7 +87,7 @@ impl GrpcWebPlugin {
             })
             .unwrap_or_default();
 
-        Self { expose_headers }
+        Ok(Self { expose_headers })
     }
 }
 

@@ -39,7 +39,7 @@ pub struct TransactionDebugger {
 }
 
 impl TransactionDebugger {
-    pub fn new(config: &Value) -> Self {
+    pub fn new(config: &Value) -> Result<Self, String> {
         let extra_redacted_headers = config["redacted_headers"]
             .as_array()
             .map(|arr| {
@@ -49,11 +49,11 @@ impl TransactionDebugger {
             })
             .unwrap_or_default();
 
-        Self {
+        Ok(Self {
             log_request_body: config["log_request_body"].as_bool().unwrap_or(false),
             log_response_body: config["log_response_body"].as_bool().unwrap_or(false),
             extra_redacted_headers,
-        }
+        })
     }
 
     /// Returns true if the given header name should be redacted.

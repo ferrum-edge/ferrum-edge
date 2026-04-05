@@ -33,12 +33,13 @@ pub struct WsMessageSizeLimiting {
 impl WsMessageSizeLimiting {
     const MAX_CLOSE_REASON_BYTES: usize = 123;
 
-    pub fn new(config: &Value) -> Self {
+    pub fn new(config: &Value) -> Result<Self, String> {
         let max_frame_bytes = config["max_frame_bytes"].as_u64().unwrap_or(0) as usize;
 
         if max_frame_bytes == 0 {
-            tracing::warn!(
-                "ws_message_size_limiting: 'max_frame_bytes' not configured or zero — plugin will have no effect"
+            return Err(
+                "ws_message_size_limiting: 'max_frame_bytes' is required and must be greater than zero"
+                    .to_string(),
             );
         }
 
@@ -57,10 +58,10 @@ impl WsMessageSizeLimiting {
             ));
         }
 
-        Self {
+        Ok(Self {
             max_frame_bytes,
             close_reason,
-        }
+        })
     }
 
     fn truncate_utf8_boundary(value: &str, max_bytes: usize) -> usize {

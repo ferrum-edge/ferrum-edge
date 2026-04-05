@@ -371,10 +371,10 @@ pub struct PrometheusMetrics {
 }
 
 impl PrometheusMetrics {
-    pub fn new(_config: &Value) -> Self {
-        Self {
+    pub fn new(_config: &Value) -> Result<Self, String> {
+        Ok(Self {
             registry: global_registry(),
-        }
+        })
     }
 }
 

@@ -139,7 +139,7 @@ async fn test_mtls_auth_success_by_subject_cn() {
     let consumer = create_mtls_consumer("c1", "alice", "client.example.com");
     let index = ConsumerIndex::new(&[consumer]);
 
-    let plugin = MtlsAuth::new(&json!({"cert_field": "subject_cn"}));
+    let plugin = MtlsAuth::new(&json!({"cert_field": "subject_cn"})).unwrap();
     let mut ctx = create_ctx_with_cert(cert_der);
 
     let result = plugin.authenticate(&mut ctx, &index).await;
@@ -154,7 +154,7 @@ async fn test_mtls_auth_success_by_subject_ou() {
     let consumer = create_mtls_consumer("c1", "alice", "Engineering");
     let index = ConsumerIndex::new(&[consumer]);
 
-    let plugin = MtlsAuth::new(&json!({"cert_field": "subject_ou"}));
+    let plugin = MtlsAuth::new(&json!({"cert_field": "subject_ou"})).unwrap();
     let mut ctx = create_ctx_with_cert(cert_der);
 
     let result = plugin.authenticate(&mut ctx, &index).await;
@@ -168,7 +168,7 @@ async fn test_mtls_auth_success_by_san_dns() {
     let consumer = create_mtls_consumer("c1", "alice", "api.example.com");
     let index = ConsumerIndex::new(&[consumer]);
 
-    let plugin = MtlsAuth::new(&json!({"cert_field": "san_dns"}));
+    let plugin = MtlsAuth::new(&json!({"cert_field": "san_dns"})).unwrap();
     let mut ctx = create_ctx_with_cert(cert_der);
 
     let result = plugin.authenticate(&mut ctx, &index).await;
@@ -183,7 +183,7 @@ async fn test_mtls_auth_success_by_subject_o() {
     let consumer = create_mtls_consumer("c1", "alice", "Test Org");
     let index = ConsumerIndex::new(&[consumer]);
 
-    let plugin = MtlsAuth::new(&json!({"cert_field": "subject_o"}));
+    let plugin = MtlsAuth::new(&json!({"cert_field": "subject_o"})).unwrap();
     let mut ctx = create_ctx_with_cert(cert_der);
 
     let result = plugin.authenticate(&mut ctx, &index).await;
@@ -204,7 +204,7 @@ async fn test_mtls_auth_success_by_fingerprint() {
     let consumer = create_mtls_consumer("c1", "alice", &fingerprint);
     let index = ConsumerIndex::new(&[consumer]);
 
-    let plugin = MtlsAuth::new(&json!({"cert_field": "fingerprint_sha256"}));
+    let plugin = MtlsAuth::new(&json!({"cert_field": "fingerprint_sha256"})).unwrap();
     let mut ctx = create_ctx_with_cert(cert_der);
 
     let result = plugin.authenticate(&mut ctx, &index).await;
@@ -224,7 +224,7 @@ async fn test_mtls_auth_success_by_serial() {
     let consumer = create_mtls_consumer("c1", "alice", &serial_hex);
     let index = ConsumerIndex::new(&[consumer]);
 
-    let plugin = MtlsAuth::new(&json!({"cert_field": "serial"}));
+    let plugin = MtlsAuth::new(&json!({"cert_field": "serial"})).unwrap();
     let mut ctx = create_ctx_with_cert(cert_der);
 
     let result = plugin.authenticate(&mut ctx, &index).await;
@@ -239,7 +239,7 @@ async fn test_mtls_auth_rejects_no_cert() {
     let consumer = create_mtls_consumer("c1", "alice", "client.example.com");
     let index = ConsumerIndex::new(&[consumer]);
 
-    let plugin = MtlsAuth::new(&json!({"cert_field": "subject_cn"}));
+    let plugin = MtlsAuth::new(&json!({"cert_field": "subject_cn"})).unwrap();
     let mut ctx = RequestContext::new(
         "127.0.0.1".to_string(),
         "GET".to_string(),
@@ -257,7 +257,7 @@ async fn test_mtls_auth_rejects_unknown_identity() {
     let consumer = create_mtls_consumer("c1", "alice", "client.example.com");
     let index = ConsumerIndex::new(&[consumer]);
 
-    let plugin = MtlsAuth::new(&json!({"cert_field": "subject_cn"}));
+    let plugin = MtlsAuth::new(&json!({"cert_field": "subject_cn"})).unwrap();
     let mut ctx = create_ctx_with_cert(cert_der);
 
     let result = plugin.authenticate(&mut ctx, &index).await;
@@ -270,7 +270,7 @@ async fn test_mtls_auth_rejects_invalid_cert_der() {
     let consumer = create_mtls_consumer("c1", "alice", "client.example.com");
     let index = ConsumerIndex::new(&[consumer]);
 
-    let plugin = MtlsAuth::new(&json!({"cert_field": "subject_cn"}));
+    let plugin = MtlsAuth::new(&json!({"cert_field": "subject_cn"})).unwrap();
     let mut ctx = create_ctx_with_cert(vec![0, 1, 2, 3]); // garbage bytes
 
     let result = plugin.authenticate(&mut ctx, &index).await;
@@ -284,7 +284,7 @@ async fn test_mtls_auth_rejects_missing_ou_field() {
     let consumer = create_mtls_consumer("c1", "alice", "SomeOU");
     let index = ConsumerIndex::new(&[consumer]);
 
-    let plugin = MtlsAuth::new(&json!({"cert_field": "subject_ou"}));
+    let plugin = MtlsAuth::new(&json!({"cert_field": "subject_ou"})).unwrap();
     let mut ctx = create_ctx_with_cert(cert_der);
 
     let result = plugin.authenticate(&mut ctx, &index).await;
@@ -298,7 +298,7 @@ async fn test_mtls_auth_rejects_missing_san_dns() {
     let consumer = create_mtls_consumer("c1", "alice", "api.example.com");
     let index = ConsumerIndex::new(&[consumer]);
 
-    let plugin = MtlsAuth::new(&json!({"cert_field": "san_dns"}));
+    let plugin = MtlsAuth::new(&json!({"cert_field": "san_dns"})).unwrap();
     let mut ctx = create_ctx_with_cert(cert_der);
 
     let result = plugin.authenticate(&mut ctx, &index).await;
@@ -318,7 +318,8 @@ async fn test_mtls_auth_allowed_issuers_cn_match() {
     let plugin = MtlsAuth::new(&json!({
         "cert_field": "subject_cn",
         "allowed_issuers": [{"cn": "Internal CA"}]
-    }));
+    }))
+    .unwrap();
     let mut ctx = create_ctx_with_cert(client_der);
 
     let result = plugin.authenticate(&mut ctx, &index).await;
@@ -336,7 +337,8 @@ async fn test_mtls_auth_allowed_issuers_rejects_wrong_ca() {
     let plugin = MtlsAuth::new(&json!({
         "cert_field": "subject_cn",
         "allowed_issuers": [{"cn": "External Partner CA"}]
-    }));
+    }))
+    .unwrap();
     let mut ctx = create_ctx_with_cert(client_der);
 
     let result = plugin.authenticate(&mut ctx, &index).await;
@@ -358,7 +360,8 @@ async fn test_mtls_auth_allowed_issuers_multiple_filters_or_logic() {
             {"cn": "Internal CA"},
             {"cn": "Partner CA"}
         ]
-    }));
+    }))
+    .unwrap();
     let mut ctx = create_ctx_with_cert(client_der);
 
     let result = plugin.authenticate(&mut ctx, &index).await;
@@ -377,7 +380,8 @@ async fn test_mtls_auth_allowed_issuers_multi_field_and_logic() {
     let plugin = MtlsAuth::new(&json!({
         "cert_field": "subject_cn",
         "allowed_issuers": [{"cn": "Internal CA", "o": "My Corp"}]
-    }));
+    }))
+    .unwrap();
     let mut ctx = create_ctx_with_cert(client_der);
 
     let result = plugin.authenticate(&mut ctx, &index).await;
@@ -396,7 +400,8 @@ async fn test_mtls_auth_allowed_issuers_multi_field_rejects_partial_match() {
     let plugin = MtlsAuth::new(&json!({
         "cert_field": "subject_cn",
         "allowed_issuers": [{"cn": "Internal CA", "o": "Other Corp"}]
-    }));
+    }))
+    .unwrap();
     let mut ctx = create_ctx_with_cert(client_der);
 
     let result = plugin.authenticate(&mut ctx, &index).await;
@@ -413,7 +418,8 @@ async fn test_mtls_auth_issuer_rejection_body_is_valid_json_with_control_chars()
     let plugin = MtlsAuth::new(&json!({
         "cert_field": "subject_cn",
         "allowed_issuers": [{"cn": "External CA"}]
-    }));
+    }))
+    .unwrap();
     let mut ctx = create_ctx_with_cert(client_der);
 
     match plugin.authenticate(&mut ctx, &index).await {
@@ -443,7 +449,8 @@ async fn test_mtls_auth_allowed_issuers_with_ou() {
     let plugin = MtlsAuth::new(&json!({
         "cert_field": "subject_cn",
         "allowed_issuers": [{"ou": "Engineering"}]
-    }));
+    }))
+    .unwrap();
     let mut ctx = create_ctx_with_cert(client_der);
 
     let result = plugin.authenticate(&mut ctx, &index).await;
@@ -470,7 +477,8 @@ async fn test_mtls_auth_ca_fingerprint_match() {
     let plugin = MtlsAuth::new(&json!({
         "cert_field": "subject_cn",
         "allowed_ca_fingerprints_sha256": [ca_fingerprint]
-    }));
+    }))
+    .unwrap();
     // Client cert + CA cert in chain
     let mut ctx = create_ctx_with_cert_and_chain(client_der, vec![ca_der]);
 
@@ -489,7 +497,7 @@ async fn test_mtls_auth_ca_fingerprint_rejects_wrong_fingerprint() {
     let plugin = MtlsAuth::new(&json!({
         "cert_field": "subject_cn",
         "allowed_ca_fingerprints_sha256": ["0000000000000000000000000000000000000000000000000000000000000000"]
-    }));
+    })).unwrap();
     let mut ctx = create_ctx_with_cert_and_chain(client_der, vec![ca_der]);
 
     let result = plugin.authenticate(&mut ctx, &index).await;
@@ -507,7 +515,8 @@ async fn test_mtls_auth_ca_fingerprint_rejects_no_chain() {
     let plugin = MtlsAuth::new(&json!({
         "cert_field": "subject_cn",
         "allowed_ca_fingerprints_sha256": ["abcd1234"]
-    }));
+    }))
+    .unwrap();
     let mut ctx = create_ctx_with_cert(client_der);
 
     let result = plugin.authenticate(&mut ctx, &index).await;
@@ -532,7 +541,8 @@ async fn test_mtls_auth_both_issuer_and_fingerprint_must_pass() {
         "cert_field": "subject_cn",
         "allowed_issuers": [{"cn": "Internal CA"}],
         "allowed_ca_fingerprints_sha256": [ca_fingerprint]
-    }));
+    }))
+    .unwrap();
     let mut ctx = create_ctx_with_cert_and_chain(client_der, vec![ca_der]);
 
     let result = plugin.authenticate(&mut ctx, &index).await;
@@ -552,7 +562,7 @@ async fn test_mtls_auth_issuer_pass_fingerprint_fail_rejects() {
         "cert_field": "subject_cn",
         "allowed_issuers": [{"cn": "Internal CA"}],
         "allowed_ca_fingerprints_sha256": ["0000000000000000000000000000000000000000000000000000000000000000"]
-    }));
+    })).unwrap();
     let mut ctx = create_ctx_with_cert_and_chain(client_der, vec![ca_der]);
 
     let result = plugin.authenticate(&mut ctx, &index).await;
@@ -576,7 +586,8 @@ async fn test_mtls_auth_ca_fingerprint_case_insensitive() {
     let plugin = MtlsAuth::new(&json!({
         "cert_field": "subject_cn",
         "allowed_ca_fingerprints_sha256": [ca_fingerprint]
-    }));
+    }))
+    .unwrap();
     let mut ctx = create_ctx_with_cert_and_chain(client_der, vec![ca_der]);
 
     let result = plugin.authenticate(&mut ctx, &index).await;
@@ -593,7 +604,7 @@ async fn test_mtls_auth_no_issuer_constraints_allows_any_ca() {
     let index = ConsumerIndex::new(&[consumer]);
 
     // No allowed_issuers or fingerprints — should work like before
-    let plugin = MtlsAuth::new(&json!({"cert_field": "subject_cn"}));
+    let plugin = MtlsAuth::new(&json!({"cert_field": "subject_cn"})).unwrap();
     let mut ctx = create_ctx_with_cert(client_der);
 
     let result = plugin.authenticate(&mut ctx, &index).await;
@@ -613,7 +624,8 @@ async fn test_mtls_auth_self_signed_cert_issuer_is_self() {
     let plugin = MtlsAuth::new(&json!({
         "cert_field": "subject_cn",
         "allowed_issuers": [{"cn": "client.example.com"}]
-    }));
+    }))
+    .unwrap();
     let mut ctx = create_ctx_with_cert(cert_der);
 
     let result = plugin.authenticate(&mut ctx, &index).await;
@@ -625,25 +637,25 @@ async fn test_mtls_auth_self_signed_cert_issuer_is_self() {
 
 #[test]
 fn test_mtls_auth_is_auth_plugin() {
-    let plugin = MtlsAuth::new(&json!({}));
+    let plugin = MtlsAuth::new(&json!({})).unwrap();
     assert!(plugin.is_auth_plugin());
 }
 
 #[test]
 fn test_mtls_auth_name() {
-    let plugin = MtlsAuth::new(&json!({}));
+    let plugin = MtlsAuth::new(&json!({})).unwrap();
     assert_eq!(plugin.name(), "mtls_auth");
 }
 
 #[test]
 fn test_mtls_auth_priority() {
-    let plugin = MtlsAuth::new(&json!({}));
+    let plugin = MtlsAuth::new(&json!({})).unwrap();
     assert_eq!(plugin.priority(), ferrum_edge::plugins::priority::MTLS_AUTH);
 }
 
 #[test]
 fn test_mtls_auth_supported_protocols() {
-    let plugin = MtlsAuth::new(&json!({}));
+    let plugin = MtlsAuth::new(&json!({})).unwrap();
     let protocols = plugin.supported_protocols();
     assert!(protocols.contains(&ferrum_edge::plugins::ProxyProtocol::Http));
     assert!(protocols.contains(&ferrum_edge::plugins::ProxyProtocol::Grpc));
@@ -656,7 +668,7 @@ fn test_mtls_auth_supported_protocols() {
 #[test]
 fn test_mtls_auth_default_cert_field_is_subject_cn() {
     // When no cert_field is specified, defaults to subject_cn
-    let plugin = MtlsAuth::new(&json!({}));
+    let plugin = MtlsAuth::new(&json!({})).unwrap();
     assert_eq!(plugin.name(), "mtls_auth"); // just verify it creates successfully
 }
 
@@ -744,7 +756,7 @@ async fn test_mtls_auth_does_not_overwrite_existing_consumer() {
     let consumer2 = create_mtls_consumer("c2", "bob", "other.example.com");
     let index = ConsumerIndex::new(&[consumer1, consumer2.clone()]);
 
-    let plugin = MtlsAuth::new(&json!({"cert_field": "subject_cn"}));
+    let plugin = MtlsAuth::new(&json!({"cert_field": "subject_cn"})).unwrap();
     let mut ctx = create_ctx_with_cert(cert_der);
     // Pre-set a different consumer (e.g., from a previous auth plugin)
     ctx.identified_consumer = Some(consumer2);
@@ -759,7 +771,7 @@ async fn test_mtls_auth_does_not_overwrite_existing_consumer() {
 async fn test_mtls_auth_stream_connect_identifies_consumer() {
     let cert_der = create_test_cert("client.example.com", None, None);
     let consumer = create_mtls_consumer("c1", "alice", "client.example.com");
-    let plugin = MtlsAuth::new(&json!({"cert_field": "subject_cn"}));
+    let plugin = MtlsAuth::new(&json!({"cert_field": "subject_cn"})).unwrap();
     let mut ctx = create_stream_ctx_with_cert(cert_der, vec![consumer]);
 
     let result = plugin.on_stream_connect(&mut ctx).await;
@@ -812,7 +824,7 @@ fn create_udp_stream_ctx_no_cert(consumers: Vec<Consumer>) -> StreamConnectionCo
 async fn test_mtls_auth_dtls_stream_connect_identifies_consumer() {
     let cert_der = create_test_cert("dtls-client.example.com", None, None);
     let consumer = create_mtls_consumer("c1", "bob", "dtls-client.example.com");
-    let plugin = MtlsAuth::new(&json!({"cert_field": "subject_cn"}));
+    let plugin = MtlsAuth::new(&json!({"cert_field": "subject_cn"})).unwrap();
     let mut ctx = create_udp_stream_ctx_with_cert(cert_der, vec![consumer]);
 
     let result = plugin.on_stream_connect(&mut ctx).await;
@@ -823,7 +835,7 @@ async fn test_mtls_auth_dtls_stream_connect_identifies_consumer() {
 #[tokio::test]
 async fn test_mtls_auth_dtls_stream_connect_rejects_no_cert() {
     let consumer = create_mtls_consumer("c1", "bob", "dtls-client.example.com");
-    let plugin = MtlsAuth::new(&json!({"cert_field": "subject_cn"}));
+    let plugin = MtlsAuth::new(&json!({"cert_field": "subject_cn"})).unwrap();
     let mut ctx = create_udp_stream_ctx_no_cert(vec![consumer]);
 
     let result = plugin.on_stream_connect(&mut ctx).await;
@@ -834,7 +846,7 @@ async fn test_mtls_auth_dtls_stream_connect_rejects_no_cert() {
 async fn test_mtls_auth_dtls_stream_connect_rejects_unknown_consumer() {
     let cert_der = create_test_cert("unknown-dtls.example.com", None, None);
     let consumer = create_mtls_consumer("c1", "bob", "dtls-client.example.com");
-    let plugin = MtlsAuth::new(&json!({"cert_field": "subject_cn"}));
+    let plugin = MtlsAuth::new(&json!({"cert_field": "subject_cn"})).unwrap();
     let mut ctx = create_udp_stream_ctx_with_cert(cert_der, vec![consumer]);
 
     let result = plugin.on_stream_connect(&mut ctx).await;
@@ -851,7 +863,8 @@ async fn test_mtls_auth_dtls_with_issuer_verification() {
         "issuer_verification": {
             "issuer_cn": "Test CA"
         }
-    }));
+    }))
+    .unwrap();
     let mut ctx = StreamConnectionContext {
         client_ip: "127.0.0.1".to_string(),
         proxy_id: "udp-proxy".to_string(),
@@ -873,7 +886,7 @@ async fn test_mtls_auth_dtls_with_issuer_verification() {
 
 #[tokio::test]
 async fn test_mtls_auth_supports_udp_protocol() {
-    let plugin = MtlsAuth::new(&json!({"cert_field": "subject_cn"}));
+    let plugin = MtlsAuth::new(&json!({"cert_field": "subject_cn"})).unwrap();
     let protocols = plugin.supported_protocols();
     assert!(
         protocols.contains(&ferrum_edge::plugins::ProxyProtocol::Udp),

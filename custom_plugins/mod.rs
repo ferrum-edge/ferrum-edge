@@ -12,10 +12,14 @@
 //! pub fn create_plugin(
 //!     config: &serde_json::Value,
 //!     http_client: crate::plugins::PluginHttpClient,
-//! ) -> Option<std::sync::Arc<dyn crate::plugins::Plugin>> {
-//!     Some(std::sync::Arc::new(MyPlugin::new(config)))
+//! ) -> Result<Option<std::sync::Arc<dyn crate::plugins::Plugin>>, String> {
+//!     Ok(Some(std::sync::Arc::new(MyPlugin::new(config)?)))
 //! }
 //! ```
+//!
+//! The `new()` constructor must return `Result<Self, String>` and validate the
+//! plugin config — return `Err` for missing required fields, invalid values, or
+//! configs that would make the plugin a no-op.
 //!
 //! The file name (without `.rs`) becomes the plugin name used in
 //! gateway configuration. For example, `my_rate_limiter.rs` registers

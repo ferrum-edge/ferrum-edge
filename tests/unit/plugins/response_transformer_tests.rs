@@ -14,7 +14,12 @@ fn make_ctx() -> RequestContext {
 
 #[tokio::test]
 async fn test_response_transformer_creation() {
-    let plugin = ResponseTransformer::new(&json!({}));
+    let plugin = ResponseTransformer::new(&json!({
+        "rules": [
+            {"operation": "add", "key": "X-Test", "value": "test"}
+        ]
+    }))
+    .unwrap();
     assert_eq!(plugin.name(), "response_transformer");
 }
 
@@ -24,7 +29,8 @@ async fn test_response_transformer_add_header() {
         "rules": [
             {"operation": "add", "key": "X-Response-Id", "value": "abc-123"}
         ]
-    }));
+    }))
+    .unwrap();
 
     let mut ctx = make_ctx();
     let mut headers: HashMap<String, String> = HashMap::new();
@@ -43,7 +49,8 @@ async fn test_response_transformer_remove_header() {
         "rules": [
             {"operation": "remove", "key": "X-Internal"}
         ]
-    }));
+    }))
+    .unwrap();
 
     let mut ctx = make_ctx();
     let mut headers: HashMap<String, String> = HashMap::new();
@@ -65,7 +72,8 @@ async fn test_response_transformer_update_header() {
         "rules": [
             {"operation": "update", "key": "Server", "value": "Ferrum Edge"}
         ]
-    }));
+    }))
+    .unwrap();
 
     let mut ctx = make_ctx();
     let mut headers: HashMap<String, String> = HashMap::new();
@@ -87,7 +95,8 @@ async fn test_response_transformer_multiple_rules() {
             {"operation": "remove", "key": "X-Powered-By"},
             {"operation": "update", "key": "Server", "value": "Ferrum"}
         ]
-    }));
+    }))
+    .unwrap();
 
     let mut ctx = make_ctx();
     let mut headers: HashMap<String, String> = HashMap::new();
@@ -106,32 +115,16 @@ async fn test_response_transformer_multiple_rules() {
 
 #[tokio::test]
 async fn test_response_transformer_empty_rules() {
-    let plugin = ResponseTransformer::new(&json!({"rules": []}));
-
-    let mut ctx = make_ctx();
-    let mut headers: HashMap<String, String> = HashMap::new();
-    headers.insert("x-existing".to_string(), "unchanged".to_string());
-
-    let result = plugin.after_proxy(&mut ctx, 200, &mut headers).await;
-    assert!(matches!(
-        result,
-        ferrum_edge::plugins::PluginResult::Continue
-    ));
-    assert_eq!(headers.get("x-existing").unwrap(), "unchanged");
+    let result = ResponseTransformer::new(&json!({"rules": []}));
+    let err = result.err().expect("expected error for empty rules");
+    assert!(err.contains("no 'rules' configured"), "got: {err}");
 }
 
 #[tokio::test]
 async fn test_response_transformer_no_config() {
-    let plugin = ResponseTransformer::new(&json!({}));
-
-    let mut ctx = make_ctx();
-    let mut headers: HashMap<String, String> = HashMap::new();
-
-    let result = plugin.after_proxy(&mut ctx, 500, &mut headers).await;
-    assert!(matches!(
-        result,
-        ferrum_edge::plugins::PluginResult::Continue
-    ));
+    let result = ResponseTransformer::new(&json!({}));
+    let err = result.err().expect("expected error for no config");
+    assert!(err.contains("no 'rules' configured"), "got: {err}");
 }
 
 #[tokio::test]
@@ -140,7 +133,8 @@ async fn test_response_transformer_add_without_value_ignored() {
         "rules": [
             {"operation": "add", "key": "X-NoValue"}
         ]
-    }));
+    }))
+    .unwrap();
 
     let mut ctx = make_ctx();
     let mut headers: HashMap<String, String> = HashMap::new();
@@ -159,7 +153,8 @@ async fn test_response_transformer_unknown_operation_ignored() {
         "rules": [
             {"operation": "prepend", "key": "X-Test", "value": "val"}
         ]
-    }));
+    }))
+    .unwrap();
 
     let mut ctx = make_ctx();
     let mut headers: HashMap<String, String> = HashMap::new();
@@ -177,7 +172,8 @@ async fn test_response_transformer_handles_various_status_codes() {
         "rules": [
             {"operation": "add", "key": "X-Processed", "value": "true"}
         ]
-    }));
+    }))
+    .unwrap();
 
     for status in [200, 201, 301, 400, 404, 500, 503] {
         let mut ctx = make_ctx();
@@ -198,7 +194,8 @@ async fn test_response_transformer_rename_header() {
         "rules": [
             {"operation": "rename", "key": "x-old", "new_key": "x-new"}
         ]
-    }));
+    }))
+    .unwrap();
 
     let mut ctx = make_ctx();
     let mut headers: HashMap<String, String> = HashMap::new();
@@ -219,7 +216,8 @@ async fn test_response_transformer_rename_header_nonexistent() {
         "rules": [
             {"operation": "rename", "key": "x-missing", "new_key": "x-new"}
         ]
-    }));
+    }))
+    .unwrap();
 
     let mut ctx = make_ctx();
     let mut headers: HashMap<String, String> = HashMap::new();
@@ -239,7 +237,8 @@ async fn test_response_transformer_rename_without_new_key_ignored() {
         "rules": [
             {"operation": "rename", "key": "x-old"}
         ]
-    }));
+    }))
+    .unwrap();
 
     let mut ctx = make_ctx();
     let mut headers: HashMap<String, String> = HashMap::new();
@@ -260,7 +259,8 @@ async fn test_response_transformer_header_key_pre_lowercased() {
         "rules": [
             {"operation": "add", "key": "X-UPPER", "value": "lowered"}
         ]
-    }));
+    }))
+    .unwrap();
 
     let mut ctx = make_ctx();
     let mut headers: HashMap<String, String> = HashMap::new();
@@ -283,7 +283,8 @@ async fn test_response_transformer_body_rename_field() {
         "rules": [
             {"operation": "rename", "target": "body", "key": "old_name", "new_key": "new_name"}
         ]
-    }));
+    }))
+    .unwrap();
 
     assert!(plugin.requires_response_body_buffering());
 
@@ -303,7 +304,7 @@ async fn test_response_transformer_body_rename_nested_field() {
         "rules": [
             {"operation": "rename", "target": "body", "key": "data.old_field", "new_key": "data.new_field"}
         ]
-    }));
+    })).unwrap();
 
     let body = br#"{"data":{"old_field":"value","other":"keep"}}"#;
     let result = plugin
@@ -321,7 +322,8 @@ async fn test_response_transformer_body_remove_field() {
         "rules": [
             {"operation": "remove", "target": "body", "key": "internal.debug_info"}
         ]
-    }));
+    }))
+    .unwrap();
 
     let body = br#"{"data":"public","internal":{"debug_info":"secret","id":"keep"}}"#;
     let result = plugin
@@ -339,7 +341,8 @@ async fn test_response_transformer_body_add_field() {
         "rules": [
             {"operation": "add", "target": "body", "key": "gateway_version", "value": "1.0"}
         ]
-    }));
+    }))
+    .unwrap();
 
     let body = br#"{"data":"response"}"#;
     let result = plugin
@@ -356,7 +359,8 @@ async fn test_response_transformer_body_update_field() {
         "rules": [
             {"operation": "update", "target": "body", "key": "status", "value": "processed"}
         ]
-    }));
+    }))
+    .unwrap();
 
     let body = br#"{"status":"pending","data":"result"}"#;
     let result = plugin
@@ -375,7 +379,8 @@ async fn test_response_transformer_body_multiple_rules() {
             {"operation": "remove", "target": "body", "key": "internal_trace_id"},
             {"operation": "add", "target": "body", "key": "api_version", "value": "v2"}
         ]
-    }));
+    }))
+    .unwrap();
 
     let body = br#"{"resp_data":"payload","internal_trace_id":"abc123"}"#;
     let result = plugin
@@ -395,7 +400,8 @@ async fn test_response_transformer_body_mixed_header_and_body_rules() {
             {"operation": "add", "key": "X-Processed", "value": "true"},
             {"operation": "rename", "target": "body", "key": "old_field", "new_key": "new_field"}
         ]
-    }));
+    }))
+    .unwrap();
 
     assert!(plugin.requires_response_body_buffering());
 
@@ -424,7 +430,8 @@ async fn test_response_transformer_body_non_json_skipped() {
         "rules": [
             {"operation": "add", "target": "body", "key": "field", "value": "val"}
         ]
-    }));
+    }))
+    .unwrap();
 
     let body = b"<xml>not json</xml>";
     let result = plugin
@@ -439,7 +446,8 @@ async fn test_response_transformer_no_body_rules_no_buffering() {
         "rules": [
             {"operation": "add", "key": "X-Header", "value": "yes"}
         ]
-    }));
+    }))
+    .unwrap();
 
     // No body rules → no buffering required
     assert!(!plugin.requires_response_body_buffering());
@@ -451,7 +459,8 @@ async fn test_response_transformer_body_deeply_nested() {
         "rules": [
             {"operation": "rename", "target": "body", "key": "a.b.c.old", "new_key": "a.b.c.new"}
         ]
-    }));
+    }))
+    .unwrap();
 
     let body = br#"{"a":{"b":{"c":{"old":"deep_value","keep":"yes"}}}}"#;
     let result = plugin
@@ -469,7 +478,8 @@ async fn test_response_transformer_body_vnd_json_content_type() {
         "rules": [
             {"operation": "add", "target": "body", "key": "processed", "value": "true"}
         ]
-    }));
+    }))
+    .unwrap();
 
     let body = br#"{"data":"value"}"#;
     let result = plugin

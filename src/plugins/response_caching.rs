@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
-use tracing::{debug, warn};
+use tracing::debug;
 
 use super::{Plugin, PluginResult, RequestContext};
 
@@ -184,19 +184,22 @@ pub struct ResponseCaching {
 }
 
 impl ResponseCaching {
-    pub fn new(config: &Value) -> Self {
+    pub fn new(config: &Value) -> Result<Self, String> {
         let config = ResponseCachingConfig::from_json(config);
 
         if config.cacheable_methods.is_empty() {
-            warn!("response_caching: no cacheable_methods configured — plugin will cache nothing");
+            return Err(
+                "response_caching: no cacheable_methods configured — plugin will cache nothing"
+                    .to_string(),
+            );
         }
 
-        Self {
+        Ok(Self {
             config,
             cache: Arc::new(DashMap::new()),
             vary_index: Arc::new(DashMap::new()),
             total_size: Arc::new(AtomicUsize::new(0)),
-        }
+        })
     }
 
     fn build_base_cache_key(&self, ctx: &RequestContext) -> String {

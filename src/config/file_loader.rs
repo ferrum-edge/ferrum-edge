@@ -240,6 +240,33 @@ pub fn load_config_from_file(
         );
     }
 
+    // Validate each plugin config by instantiating the plugin.
+    // This catches invalid config values (missing required fields, bad types, etc.)
+    // at startup rather than at request time.
+    {
+        let mut plugin_errors = Vec::new();
+        for pc in &config.plugin_configs {
+            if !pc.enabled {
+                continue;
+            }
+            if let Err(err) = crate::plugins::validate_plugin_config(&pc.plugin_name, &pc.config) {
+                plugin_errors.push(format!(
+                    "Plugin '{}' (id={}): {}",
+                    pc.plugin_name, pc.id, err
+                ));
+            }
+        }
+        if !plugin_errors.is_empty() {
+            for msg in &plugin_errors {
+                error!("{}", msg);
+            }
+            anyhow::bail!(
+                "Configuration validation failed: {} plugin config error(s) found",
+                plugin_errors.len()
+            );
+        }
+    }
+
     // Validate stream proxy (TCP/UDP) configuration
     if let Err(errors) = config.validate_stream_proxies() {
         for msg in &errors {

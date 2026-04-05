@@ -95,7 +95,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     writeln!(
         registry,
-        ") -> Option<std::sync::Arc<dyn crate::plugins::Plugin>> {{"
+        ") -> Result<Option<std::sync::Arc<dyn crate::plugins::Plugin>>, String> {{"
     )?;
     writeln!(registry, "    match name {{")?;
     for name in &plugin_names {
@@ -105,7 +105,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             name, name
         )?;
     }
-    writeln!(registry, "        _ => None,")?;
+    writeln!(registry, "        _ => Ok(None),")?;
     writeln!(registry, "    }}")?;
     writeln!(registry, "}}")?;
     writeln!(registry)?;

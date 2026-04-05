@@ -19,7 +19,7 @@ pub struct BotDetection {
 }
 
 impl BotDetection {
-    pub fn new(config: &Value) -> Self {
+    pub fn new(config: &Value) -> Result<Self, String> {
         let blocked_patterns = config["blocked_patterns"]
             .as_array()
             .map(|arr| {
@@ -46,12 +46,12 @@ impl BotDetection {
 
         let allow_missing_user_agent = config["allow_missing_user_agent"].as_bool().unwrap_or(true);
 
-        Self {
+        Ok(Self {
             blocked_patterns,
             allow_list,
             custom_response_code,
             allow_missing_user_agent,
-        }
+        })
     }
 }
 

@@ -40,7 +40,10 @@ async fn test_all_protocol_plugins() {
     // Plugins that support ALL protocols (protocol-agnostic)
     let plugins = vec![
         ("ip_restriction", json!({"allow": ["10.0.0.0/8"]})),
-        ("rate_limiting", json!({"per_second": 100})),
+        (
+            "rate_limiting",
+            json!({"window_seconds": 60, "max_requests": 100}),
+        ),
         ("stdout_logging", json!({})),
         ("prometheus_metrics", json!({})),
         ("correlation_id", json!({})),
@@ -161,9 +164,15 @@ fn test_http_family_and_stream_plugins() {
 fn test_http_grpc_plugins() {
     // Plugins that support HTTP and gRPC only (modify headers/body)
     let plugins = vec![
-        ("request_transformer", json!({})),
-        ("response_transformer", json!({})),
-        ("body_validator", json!({"schema": {}})),
+        (
+            "request_transformer",
+            json!({"rules": [{"operation": "add", "target": "header", "key": "x-test", "value": "1"}]}),
+        ),
+        (
+            "response_transformer",
+            json!({"rules": [{"operation": "add", "key": "x-test", "value": "1"}]}),
+        ),
+        ("body_validator", json!({"required_fields": ["name"]})),
     ];
 
     for (name, config) in plugins {
@@ -207,7 +216,10 @@ fn test_stream_compatible_plugins_support_tcp_udp() {
     // Verify that stream-compatible plugins support both TCP and UDP
     let stream_plugins = vec![
         ("ip_restriction", json!({"allow": ["10.0.0.0/8"]})),
-        ("rate_limiting", json!({"per_second": 100})),
+        (
+            "rate_limiting",
+            json!({"window_seconds": 60, "max_requests": 100}),
+        ),
         ("stdout_logging", json!({})),
         ("prometheus_metrics", json!({})),
         ("correlation_id", json!({})),
@@ -685,7 +697,7 @@ fn test_http_only_plugins_complete_coverage() {
     // response_caching and graphql missing from the base test
     let plugins = vec![
         ("response_caching", json!({"ttl_seconds": 60})),
-        ("graphql", json!({"schema": "type Query { hello: String }"})),
+        ("graphql", json!({"max_depth": 100})),
     ];
 
     for (name, config) in plugins {
