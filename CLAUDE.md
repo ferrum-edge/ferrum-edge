@@ -666,6 +666,8 @@ Reduce per-request allocations in plugin lookup
 | `FERRUM_DB_POOL_ACQUIRE_TIMEOUT_SECONDS` | `30` | Max seconds to wait for a pool connection before error |
 | `FERRUM_DB_POOL_IDLE_TIMEOUT_SECONDS` | `600` | Max seconds a connection can sit idle before eviction |
 | `FERRUM_DB_POOL_MAX_LIFETIME_SECONDS` | `300` | Max lifetime of a connection (forces DNS re-resolution) |
+| `FERRUM_DB_POOL_CONNECT_TIMEOUT_SECONDS` | `10` | Max seconds to wait for a new TCP connection to the database. 0 = disabled |
+| `FERRUM_DB_POOL_STATEMENT_TIMEOUT_SECONDS` | `30` | Max execution time per SQL statement (PG/MySQL only). 0 = disabled |
 | `FERRUM_DB_SLOW_QUERY_THRESHOLD_MS` | (none) | Threshold (ms) for warning-level logs on slow DB queries |
 | `FERRUM_CP_GRPC_LISTEN_ADDR` | `0.0.0.0:50051` | CP gRPC server listen address |
 | `FERRUM_CP_GRPC_TLS_CERT_PATH` | (none) | PEM cert for CP gRPC TLS |

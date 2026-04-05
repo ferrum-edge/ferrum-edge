@@ -44,6 +44,8 @@ pub async fn run(
         acquire_timeout_seconds: env_config.db_pool_acquire_timeout_seconds,
         idle_timeout_seconds: env_config.db_pool_idle_timeout_seconds,
         max_lifetime_seconds: env_config.db_pool_max_lifetime_seconds,
+        connect_timeout_seconds: env_config.db_pool_connect_timeout_seconds,
+        statement_timeout_seconds: env_config.db_pool_statement_timeout_seconds,
     };
     let mut db = DatabaseStore::connect_with_failover(
         env_config.db_type.as_deref().unwrap_or("sqlite"),

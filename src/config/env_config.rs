@@ -250,6 +250,16 @@ pub struct EnvConfig {
     /// prevents stale server-side state. Defence-in-depth alongside the
     /// explicit DnsCache-based reconnect.
     pub db_pool_max_lifetime_seconds: u64,
+    /// Maximum time (seconds) to wait for a new TCP connection to the database.
+    /// Default: 10. Separate from `acquire_timeout_seconds` (which covers
+    /// waiting for a pool slot + connecting). 0 = disabled (falls back to OS
+    /// TCP timeout, which can be 60–120s).
+    pub db_pool_connect_timeout_seconds: u64,
+    /// Maximum execution time (seconds) for any single SQL statement. Default:
+    /// 30. Set via `SET statement_timeout` (PostgreSQL) or `SET SESSION
+    /// max_execution_time` (MySQL) on every new connection. 0 = disabled.
+    /// Ignored for SQLite (not supported).
+    pub db_pool_statement_timeout_seconds: u64,
 
     // CP/DP
     pub cp_grpc_listen_addr: Option<String>,
@@ -588,6 +598,8 @@ impl Default for EnvConfig {
             db_pool_acquire_timeout_seconds: 30,
             db_pool_idle_timeout_seconds: 600,
             db_pool_max_lifetime_seconds: 300,
+            db_pool_connect_timeout_seconds: 10,
+            db_pool_statement_timeout_seconds: 30,
             cp_grpc_listen_addr: None,
             cp_grpc_jwt_secret: None,
             dp_cp_grpc_url: None,
@@ -779,6 +791,16 @@ impl EnvConfig {
                 conf,
                 "FERRUM_DB_POOL_MAX_LIFETIME_SECONDS",
                 300,
+            ),
+            db_pool_connect_timeout_seconds: resolve_u64(
+                conf,
+                "FERRUM_DB_POOL_CONNECT_TIMEOUT_SECONDS",
+                10,
+            ),
+            db_pool_statement_timeout_seconds: resolve_u64(
+                conf,
+                "FERRUM_DB_POOL_STATEMENT_TIMEOUT_SECONDS",
+                30,
             ),
 
             cp_grpc_listen_addr: resolve_var(conf, "FERRUM_CP_GRPC_LISTEN_ADDR"),

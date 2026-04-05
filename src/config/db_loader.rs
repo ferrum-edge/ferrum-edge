@@ -84,6 +84,17 @@ pub struct DbPoolConfig {
     pub acquire_timeout_seconds: u64,
     pub idle_timeout_seconds: u64,
     pub max_lifetime_seconds: u64,
+    /// Maximum time (seconds) to wait for a new TCP connection to the database
+    /// server. Default: 10. Applies per connection attempt — separate from
+    /// `acquire_timeout_seconds` which covers the full pool checkout (wait +
+    /// connect). 0 = no explicit timeout (falls back to OS TCP timeout).
+    pub connect_timeout_seconds: u64,
+    /// Maximum execution time (seconds) for any single SQL statement. Default:
+    /// 30. Set via `SET statement_timeout` (PostgreSQL) or
+    /// `SET SESSION max_execution_time` (MySQL) on every new connection.
+    /// Prevents runaway queries from holding connections indefinitely.
+    /// 0 = disabled (no per-statement timeout). Ignored for SQLite.
+    pub statement_timeout_seconds: u64,
 }
 
 impl Default for DbPoolConfig {
@@ -94,6 +105,8 @@ impl Default for DbPoolConfig {
             acquire_timeout_seconds: 30,
             idle_timeout_seconds: 600,
             max_lifetime_seconds: 300,
+            connect_timeout_seconds: 10,
+            statement_timeout_seconds: 30,
         }
     }
 }
@@ -182,11 +195,16 @@ impl DatabaseStore {
     /// Used by all pool creation paths (initial connect, reconnect, read replica)
     /// to ensure consistent tuning from `FERRUM_DB_POOL_*` env vars.
     fn build_pool_options(&self) -> AnyPoolOptions {
-        Self::build_pool_options_from_config(&self.pool_config, self.db_type == "sqlite")
+        Self::build_pool_options_from_config(&self.pool_config, &self.db_type)
     }
 
     /// Build `AnyPoolOptions` from a given pool configuration.
-    fn build_pool_options_from_config(config: &DbPoolConfig, is_sqlite: bool) -> AnyPoolOptions {
+    fn build_pool_options_from_config(config: &DbPoolConfig, db_type: &str) -> AnyPoolOptions {
+        let is_sqlite = db_type == "sqlite";
+        let is_postgres = db_type == "postgres";
+        let is_mysql = db_type == "mysql";
+        let statement_timeout_seconds = config.statement_timeout_seconds;
+
         AnyPoolOptions::new()
             .max_connections(config.max_connections)
             .min_connections(config.min_connections)
@@ -204,9 +222,41 @@ impl DatabaseStore {
                     if is_sqlite {
                         conn.execute("PRAGMA foreign_keys = ON").await?;
                     }
+                    // Set per-statement timeout on network databases to prevent
+                    // runaway queries from holding connections indefinitely.
+                    if statement_timeout_seconds > 0 {
+                        if is_postgres {
+                            // PostgreSQL statement_timeout is in milliseconds
+                            let sql = format!(
+                                "SET statement_timeout = '{}'",
+                                statement_timeout_seconds * 1000
+                            );
+                            conn.execute(sql.as_str()).await?;
+                        } else if is_mysql {
+                            // MySQL max_execution_time is in milliseconds
+                            let sql = format!(
+                                "SET SESSION max_execution_time = {}",
+                                statement_timeout_seconds * 1000
+                            );
+                            conn.execute(sql.as_str()).await?;
+                        }
+                    }
                     Ok(())
                 })
             })
+    }
+
+    /// Append `connect_timeout` to a database URL for PostgreSQL and MySQL.
+    ///
+    /// This sets the driver-level TCP connect timeout — separate from
+    /// `acquire_timeout` which covers waiting for a pool slot + connecting.
+    /// SQLite is local I/O so connect timeout is not applicable.
+    fn append_connect_timeout(url: &str, db_type: &str, timeout_seconds: u64) -> String {
+        if timeout_seconds == 0 || db_type == "sqlite" {
+            return url.to_string();
+        }
+        let separator = if url.contains('?') { '&' } else { '?' };
+        format!("{}{}connect_timeout={}", url, separator, timeout_seconds)
     }
 
     /// Connect to the database with optional TLS configuration and run migrations.
@@ -225,7 +275,7 @@ impl DatabaseStore {
         sqlx::any::install_default_drivers();
 
         // Construct TLS-aware connection URL
-        let final_url = if tls_enabled && (db_type == "postgres" || db_type == "mysql") {
+        let mut final_url = if tls_enabled && (db_type == "postgres" || db_type == "mysql") {
             Self::build_tls_connection_url(
                 db_url,
                 db_type,
@@ -238,8 +288,11 @@ impl DatabaseStore {
             db_url.to_string()
         };
 
-        let is_sqlite = db_type == "sqlite";
-        let pool = Self::build_pool_options_from_config(&pool_config, is_sqlite)
+        // Append driver-level connect timeout to the URL
+        final_url =
+            Self::append_connect_timeout(&final_url, db_type, pool_config.connect_timeout_seconds);
+
+        let pool = Self::build_pool_options_from_config(&pool_config, db_type)
             .connect(&final_url)
             .await?;
 
@@ -2268,18 +2321,25 @@ impl DatabaseStore {
     ) -> Result<(), anyhow::Error> {
         sqlx::any::install_default_drivers();
 
-        let final_url = if tls_enabled && (self.db_type == "postgres" || self.db_type == "mysql") {
-            Self::build_tls_connection_url(
-                db_url,
-                &self.db_type,
-                tls_ca_cert_path,
-                tls_client_cert_path,
-                tls_client_key_path,
-                tls_insecure,
-            )?
-        } else {
-            db_url.to_string()
-        };
+        let mut final_url =
+            if tls_enabled && (self.db_type == "postgres" || self.db_type == "mysql") {
+                Self::build_tls_connection_url(
+                    db_url,
+                    &self.db_type,
+                    tls_ca_cert_path,
+                    tls_client_cert_path,
+                    tls_client_key_path,
+                    tls_insecure,
+                )?
+            } else {
+                db_url.to_string()
+            };
+
+        final_url = Self::append_connect_timeout(
+            &final_url,
+            &self.db_type,
+            self.pool_config.connect_timeout_seconds,
+        );
 
         let new_pool = self.build_pool_options().connect(&final_url).await?;
 
@@ -2423,18 +2483,25 @@ impl DatabaseStore {
     ) -> Result<(), anyhow::Error> {
         sqlx::any::install_default_drivers();
 
-        let final_url = if tls_enabled && (self.db_type == "postgres" || self.db_type == "mysql") {
-            Self::build_tls_connection_url(
-                replica_url,
-                &self.db_type,
-                tls_ca_cert_path,
-                tls_client_cert_path,
-                tls_client_key_path,
-                tls_insecure,
-            )?
-        } else {
-            replica_url.to_string()
-        };
+        let mut final_url =
+            if tls_enabled && (self.db_type == "postgres" || self.db_type == "mysql") {
+                Self::build_tls_connection_url(
+                    replica_url,
+                    &self.db_type,
+                    tls_ca_cert_path,
+                    tls_client_cert_path,
+                    tls_client_key_path,
+                    tls_insecure,
+                )?
+            } else {
+                replica_url.to_string()
+            };
+
+        final_url = Self::append_connect_timeout(
+            &final_url,
+            &self.db_type,
+            self.pool_config.connect_timeout_seconds,
+        );
 
         let pool = self.build_pool_options().connect(&final_url).await?;
 
@@ -2480,18 +2547,25 @@ impl DatabaseStore {
 
         sqlx::any::install_default_drivers();
 
-        let final_url = if tls_enabled && (self.db_type == "postgres" || self.db_type == "mysql") {
-            Self::build_tls_connection_url(
-                replica_url,
-                &self.db_type,
-                tls_ca_cert_path,
-                tls_client_cert_path,
-                tls_client_key_path,
-                tls_insecure,
-            )?
-        } else {
-            replica_url.to_string()
-        };
+        let mut final_url =
+            if tls_enabled && (self.db_type == "postgres" || self.db_type == "mysql") {
+                Self::build_tls_connection_url(
+                    replica_url,
+                    &self.db_type,
+                    tls_ca_cert_path,
+                    tls_client_cert_path,
+                    tls_client_key_path,
+                    tls_insecure,
+                )?
+            } else {
+                replica_url.to_string()
+            };
+
+        final_url = Self::append_connect_timeout(
+            &final_url,
+            &self.db_type,
+            self.pool_config.connect_timeout_seconds,
+        );
 
         let new_pool = self.build_pool_options().connect(&final_url).await?;
 
@@ -2966,4 +3040,62 @@ fn parse_datetime_column(row: &AnyRow, column: &str) -> chrono::DateTime<Utc> {
             );
             Utc::now()
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_append_connect_timeout_postgres_no_existing_params() {
+        let url = "postgres://user:pass@localhost/mydb";
+        let result = DatabaseStore::append_connect_timeout(url, "postgres", 10);
+        assert_eq!(
+            result,
+            "postgres://user:pass@localhost/mydb?connect_timeout=10"
+        );
+    }
+
+    #[test]
+    fn test_append_connect_timeout_postgres_with_existing_params() {
+        let url = "postgres://user:pass@localhost/mydb?sslmode=require";
+        let result = DatabaseStore::append_connect_timeout(url, "postgres", 15);
+        assert_eq!(
+            result,
+            "postgres://user:pass@localhost/mydb?sslmode=require&connect_timeout=15"
+        );
+    }
+
+    #[test]
+    fn test_append_connect_timeout_mysql() {
+        let url = "mysql://user:pass@localhost/mydb";
+        let result = DatabaseStore::append_connect_timeout(url, "mysql", 5);
+        assert_eq!(result, "mysql://user:pass@localhost/mydb?connect_timeout=5");
+    }
+
+    #[test]
+    fn test_append_connect_timeout_sqlite_skipped() {
+        let url = "sqlite://mydb.sqlite";
+        let result = DatabaseStore::append_connect_timeout(url, "sqlite", 10);
+        assert_eq!(result, "sqlite://mydb.sqlite");
+    }
+
+    #[test]
+    fn test_append_connect_timeout_zero_disabled() {
+        let url = "postgres://user:pass@localhost/mydb";
+        let result = DatabaseStore::append_connect_timeout(url, "postgres", 0);
+        assert_eq!(result, "postgres://user:pass@localhost/mydb");
+    }
+
+    #[test]
+    fn test_db_pool_config_default() {
+        let config = DbPoolConfig::default();
+        assert_eq!(config.max_connections, 10);
+        assert_eq!(config.min_connections, 1);
+        assert_eq!(config.acquire_timeout_seconds, 30);
+        assert_eq!(config.idle_timeout_seconds, 600);
+        assert_eq!(config.max_lifetime_seconds, 300);
+        assert_eq!(config.connect_timeout_seconds, 10);
+        assert_eq!(config.statement_timeout_seconds, 30);
+    }
 }

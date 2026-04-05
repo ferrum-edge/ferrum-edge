@@ -2040,6 +2040,8 @@ fn test_env_config_db_pool_defaults() {
             remove_var("FERRUM_DB_POOL_ACQUIRE_TIMEOUT_SECONDS");
             remove_var("FERRUM_DB_POOL_IDLE_TIMEOUT_SECONDS");
             remove_var("FERRUM_DB_POOL_MAX_LIFETIME_SECONDS");
+            remove_var("FERRUM_DB_POOL_CONNECT_TIMEOUT_SECONDS");
+            remove_var("FERRUM_DB_POOL_STATEMENT_TIMEOUT_SECONDS");
 
             let config = EnvConfig::from_env().unwrap();
             assert_eq!(config.db_pool_max_connections, 10);
@@ -2047,6 +2049,8 @@ fn test_env_config_db_pool_defaults() {
             assert_eq!(config.db_pool_acquire_timeout_seconds, 30);
             assert_eq!(config.db_pool_idle_timeout_seconds, 600);
             assert_eq!(config.db_pool_max_lifetime_seconds, 300);
+            assert_eq!(config.db_pool_connect_timeout_seconds, 10);
+            assert_eq!(config.db_pool_statement_timeout_seconds, 30);
         },
     );
 }
@@ -2064,6 +2068,8 @@ fn test_env_config_db_pool_custom_values() {
             ("FERRUM_DB_POOL_ACQUIRE_TIMEOUT_SECONDS", "60"),
             ("FERRUM_DB_POOL_IDLE_TIMEOUT_SECONDS", "1200"),
             ("FERRUM_DB_POOL_MAX_LIFETIME_SECONDS", "600"),
+            ("FERRUM_DB_POOL_CONNECT_TIMEOUT_SECONDS", "15"),
+            ("FERRUM_DB_POOL_STATEMENT_TIMEOUT_SECONDS", "60"),
         ],
         || {
             let config = EnvConfig::from_env().unwrap();
@@ -2072,6 +2078,8 @@ fn test_env_config_db_pool_custom_values() {
             assert_eq!(config.db_pool_acquire_timeout_seconds, 60);
             assert_eq!(config.db_pool_idle_timeout_seconds, 1200);
             assert_eq!(config.db_pool_max_lifetime_seconds, 600);
+            assert_eq!(config.db_pool_connect_timeout_seconds, 15);
+            assert_eq!(config.db_pool_statement_timeout_seconds, 60);
         },
     );
 }
