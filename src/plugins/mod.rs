@@ -1,4 +1,4 @@
-//! Plugin system — 41 built-in plugins with a trait-based architecture.
+//! Plugin system — 42 built-in plugins with a trait-based architecture.
 //!
 //! Plugins execute in priority order (lower number = runs first) through
 //! lifecycle phases: `on_request_received` → `authenticate` → `authorize` →
@@ -54,6 +54,7 @@ pub mod transaction_debugger;
 pub mod udp_rate_limiting;
 pub mod utils;
 pub mod ws_frame_logging;
+pub mod ws_logging;
 pub mod ws_message_size_limiting;
 pub mod ws_rate_limiting;
 
@@ -537,7 +538,7 @@ pub struct StreamTransactionSummary {
 /// | AuthZ     | 2000–2999   | Authorization and admission control       | access_control (2000), tcp_connection_throttle (2050), request_size_limiting (2800), graphql (2850), rate_limiting (2900), ai_prompt_shield (2925), body_validator (2950), ai_request_guard (2975) |
 /// | Transform | 3000–3999   | Request shaping and response buffering    | request_transformer (3000), grpc_deadline (3050), request_mirror (3075), response_size_limiting (3490), response_caching (3500) |
 /// | Response  | 4000–4999   | Response transformation and AI accounting | response_transformer (4000), ai_token_metrics (4100), ai_rate_limiter (4200) |
-/// | Logging   | 9000–9999   | Observability and frame logging           | stdout_logging (9000), ws_frame_logging (9050), http_logging (9100), transaction_debugger (9200), prometheus_metrics (9300) |
+/// | Logging   | 9000–9999   | Observability and frame logging           | stdout_logging (9000), ws_frame_logging (9050), http_logging (9100), ws_logging (9150), transaction_debugger (9200), prometheus_metrics (9300) |
 #[allow(dead_code)]
 pub mod priority {
     pub const OTEL_TRACING: u16 = 25;
@@ -579,6 +580,7 @@ pub mod priority {
     pub const PROMETHEUS_METRICS: u16 = 9300;
     pub const WS_MESSAGE_SIZE_LIMITING: u16 = 2810;
     pub const WS_RATE_LIMITING: u16 = 2910;
+    pub const WS_LOGGING: u16 = 9150;
     pub const WS_FRAME_LOGGING: u16 = 9050;
     pub const UDP_RATE_LIMITING: u16 = 2910;
     /// Default priority for unknown/custom plugins — runs after transforms, before logging.
@@ -934,6 +936,7 @@ pub fn create_plugin_with_http_client(
             config,
             http_client,
         )?))),
+        "ws_logging" => Ok(Some(Arc::new(ws_logging::WsLogging::new(config)?))),
         "transaction_debugger" => Ok(Some(Arc::new(
             transaction_debugger::TransactionDebugger::new(config),
         ))),
@@ -1059,6 +1062,7 @@ pub fn available_plugins() -> Vec<&'static str> {
     let mut plugins = vec![
         "stdout_logging",
         "http_logging",
+        "ws_logging",
         "transaction_debugger",
         "jwks_auth",
         "jwt_auth",
