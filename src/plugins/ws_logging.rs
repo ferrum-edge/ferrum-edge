@@ -9,15 +9,23 @@
 //!
 //! Supports both HTTP and stream (TCP/UDP) transaction summaries via the
 //! `LogEntry` union type.
+//!
+//! **TLS**: For `wss://` endpoints, the plugin builds a `rustls::ClientConfig`
+//! that follows the gateway's CA trust chain:
+//! - Custom CA (`FERRUM_TLS_CA_BUNDLE_PATH`) → sole trust anchor (webpki roots excluded)
+//! - No CA configured → webpki/system roots as default fallback
+//! - `FERRUM_TLS_NO_VERIFY` → skip server certificate verification
 
 use async_trait::async_trait;
 use futures_util::SinkExt;
 use serde_json::Value;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::time::Duration;
 use tracing::warn;
 use url::Url;
 
+use super::utils::PluginHttpClient;
 use super::{Plugin, StreamTransactionSummary, TransactionSummary};
 
 /// Union type for log entries sent through the batched channel.
@@ -30,6 +38,7 @@ enum LogEntry {
 
 struct WsConfig {
     endpoint_url: String,
+    connector: Option<tokio_tungstenite::Connector>,
     batch_size: usize,
     flush_interval: Duration,
     max_retries: u32,
@@ -43,7 +52,7 @@ pub struct WsLogging {
 }
 
 impl WsLogging {
-    pub fn new(config: &Value) -> Result<Self, String> {
+    pub fn new(config: &Value, http_client: PluginHttpClient) -> Result<Self, String> {
         let endpoint_url = config["endpoint_url"]
             .as_str()
             .filter(|s| !s.is_empty())
@@ -68,6 +77,13 @@ impl WsLogging {
             );
         }
 
+        // Build TLS connector for wss:// using gateway CA/verify settings.
+        let connector = if parsed_url.scheme() == "wss" {
+            Some(build_tls_connector(&http_client)?)
+        } else {
+            None
+        };
+
         let batch_size = config["batch_size"].as_u64().unwrap_or(50).max(1) as usize;
         let flush_interval_ms = config["flush_interval_ms"]
             .as_u64()
@@ -77,6 +93,7 @@ impl WsLogging {
 
         let ws_config = WsConfig {
             endpoint_url,
+            connector,
             batch_size,
             flush_interval: Duration::from_millis(flush_interval_ms),
             max_retries: config["max_retries"].as_u64().unwrap_or(3) as u32,
@@ -96,6 +113,51 @@ impl WsLogging {
             endpoint_hostname,
         })
     }
+}
+
+/// Build a `tokio_tungstenite::Connector::Rustls` that follows the gateway's
+/// CA trust chain: custom CA → sole anchor, no CA → webpki roots, no-verify →
+/// skip verification entirely.
+fn build_tls_connector(
+    http_client: &PluginHttpClient,
+) -> Result<tokio_tungstenite::Connector, String> {
+    let tls_no_verify = http_client.tls_no_verify();
+    let ca_bundle_path = http_client.tls_ca_bundle_path();
+
+    // Build root certificate store following the gateway's CA trust chain:
+    // - Custom CA configured → empty store + only that CA (CA exclusivity)
+    // - No CA configured → webpki roots as default fallback
+    let mut root_store = if ca_bundle_path.is_some() {
+        rustls::RootCertStore::empty()
+    } else {
+        rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned())
+    };
+
+    if let Some(ca_path) = ca_bundle_path {
+        let ca_pem = std::fs::read(ca_path)
+            .map_err(|e| format!("ws_logging: failed to read CA bundle '{ca_path}': {e}"))?;
+        let mut cursor = std::io::Cursor::new(ca_pem);
+        for cert in rustls_pemfile::certs(&mut cursor).flatten() {
+            root_store
+                .add(cert)
+                .map_err(|e| format!("ws_logging: failed to add CA certificate: {e}"))?;
+        }
+    }
+
+    let mut client_config = rustls::ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+
+    if tls_no_verify {
+        warn!("WebSocket logging TLS certificate verification DISABLED (FERRUM_TLS_NO_VERIFY)");
+        client_config
+            .dangerous()
+            .set_certificate_verifier(Arc::new(crate::tls::NoVerifier));
+    }
+
+    Ok(tokio_tungstenite::Connector::Rustls(Arc::new(
+        client_config,
+    )))
 }
 
 #[async_trait]
@@ -153,14 +215,7 @@ async fn flush_loop(mut receiver: mpsc::Receiver<LogEntry>, cfg: WsConfig) {
     timer.tick().await;
 
     // Lazily connect — the first flush attempt will establish the connection.
-    let mut ws_sink: Option<
-        futures_util::stream::SplitSink<
-            tokio_tungstenite::WebSocketStream<
-                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-            >,
-            tokio_tungstenite::tungstenite::protocol::Message,
-        >,
-    > = None;
+    let mut ws_sink: Option<WsSink> = None;
 
     loop {
         tokio::select! {
@@ -264,10 +319,21 @@ async fn send_batch(
 }
 
 /// Establish a new WebSocket connection to the configured endpoint.
+///
+/// Uses `connect_async_tls_with_config` with the pre-built TLS connector
+/// so that `wss://` connections respect the gateway's CA trust chain and
+/// `FERRUM_TLS_NO_VERIFY` setting.
 async fn connect(cfg: &WsConfig) -> Option<WsSink> {
     use futures_util::StreamExt;
 
-    match tokio_tungstenite::connect_async(&cfg.endpoint_url).await {
+    match tokio_tungstenite::connect_async_tls_with_config(
+        &cfg.endpoint_url,
+        None,
+        false,
+        cfg.connector.clone(),
+    )
+    .await
+    {
         Ok((stream, _response)) => {
             let (sink, _read) = stream.split();
             Some(sink)

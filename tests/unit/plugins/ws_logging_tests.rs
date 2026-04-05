@@ -1,31 +1,46 @@
 //! Tests for ws_logging plugin
 
-use ferrum_edge::plugins::{Plugin, PluginResult, ws_logging::WsLogging};
+use ferrum_edge::plugins::{Plugin, PluginHttpClient, PluginResult, ws_logging::WsLogging};
 use serde_json::json;
 
 use super::plugin_utils::{create_test_context, create_test_transaction_summary};
 
+fn default_client() -> PluginHttpClient {
+    PluginHttpClient::default()
+}
+
 #[tokio::test]
 async fn test_ws_logging_plugin_creation() {
-    let plugin = WsLogging::new(&json!({
-        "endpoint_url": "ws://localhost:9300/logs"
-    }))
+    let plugin = WsLogging::new(
+        &json!({
+            "endpoint_url": "ws://localhost:9300/logs"
+        }),
+        default_client(),
+    )
     .unwrap();
     assert_eq!(plugin.name(), "ws_logging");
 }
 
 #[tokio::test]
 async fn test_ws_logging_plugin_creation_wss() {
-    let plugin = WsLogging::new(&json!({
-        "endpoint_url": "wss://localhost:9300/logs"
-    }))
+    // wss:// triggers rustls ClientConfig construction, which requires
+    // a crypto provider to be installed (normally done in main.rs).
+    let _ = rustls::crypto::CryptoProvider::install_default(
+        rustls::crypto::ring::default_provider(),
+    );
+    let plugin = WsLogging::new(
+        &json!({
+            "endpoint_url": "wss://localhost:9300/logs"
+        }),
+        default_client(),
+    )
     .unwrap();
     assert_eq!(plugin.name(), "ws_logging");
 }
 
 #[tokio::test]
 async fn test_ws_logging_plugin_creation_empty_config() {
-    let result = WsLogging::new(&json!({}));
+    let result = WsLogging::new(&json!({}), default_client());
     match result {
         Err(e) => assert!(
             e.contains("endpoint_url"),
@@ -38,9 +53,12 @@ async fn test_ws_logging_plugin_creation_empty_config() {
 
 #[tokio::test]
 async fn test_ws_logging_rejects_malformed_endpoint_url() {
-    let result = WsLogging::new(&json!({
-        "endpoint_url": "not a valid url"
-    }));
+    let result = WsLogging::new(
+        &json!({
+            "endpoint_url": "not a valid url"
+        }),
+        default_client(),
+    );
     match result {
         Err(e) => assert!(e.contains("invalid 'endpoint_url'")),
         Ok(_) => panic!("Expected malformed endpoint_url to be rejected"),
@@ -49,9 +67,12 @@ async fn test_ws_logging_rejects_malformed_endpoint_url() {
 
 #[tokio::test]
 async fn test_ws_logging_rejects_non_ws_scheme() {
-    let result = WsLogging::new(&json!({
-        "endpoint_url": "http://127.0.0.1:9000/logs"
-    }));
+    let result = WsLogging::new(
+        &json!({
+            "endpoint_url": "http://127.0.0.1:9000/logs"
+        }),
+        default_client(),
+    );
     match result {
         Err(e) => assert!(e.contains("ws:// or wss://")),
         Ok(_) => panic!("Expected non-ws endpoint_url to be rejected"),
@@ -60,9 +81,12 @@ async fn test_ws_logging_rejects_non_ws_scheme() {
 
 #[tokio::test]
 async fn test_ws_logging_rejects_tcp_scheme() {
-    let result = WsLogging::new(&json!({
-        "endpoint_url": "tcp://127.0.0.1:9000/logs"
-    }));
+    let result = WsLogging::new(
+        &json!({
+            "endpoint_url": "tcp://127.0.0.1:9000/logs"
+        }),
+        default_client(),
+    );
     match result {
         Err(e) => assert!(e.contains("ws:// or wss://")),
         Ok(_) => panic!("Expected tcp scheme to be rejected"),
@@ -71,20 +95,26 @@ async fn test_ws_logging_rejects_tcp_scheme() {
 
 #[tokio::test]
 async fn test_ws_logging_rejects_missing_hostname() {
-    let result = WsLogging::new(&json!({
-        "endpoint_url": "ws://"
-    }));
+    let result = WsLogging::new(
+        &json!({
+            "endpoint_url": "ws://"
+        }),
+        default_client(),
+    );
     assert!(result.is_err());
 }
 
 #[tokio::test]
 async fn test_ws_logging_log_does_not_panic() {
-    let plugin = WsLogging::new(&json!({
-        "endpoint_url": "ws://127.0.0.1:1/unreachable",
-        "batch_size": 1,
-        "flush_interval_ms": 100,
-        "max_retries": 0
-    }))
+    let plugin = WsLogging::new(
+        &json!({
+            "endpoint_url": "ws://127.0.0.1:1/unreachable",
+            "batch_size": 1,
+            "flush_interval_ms": 100,
+            "max_retries": 0
+        }),
+        default_client(),
+    )
     .unwrap();
     let summary = create_test_transaction_summary();
 
@@ -94,13 +124,16 @@ async fn test_ws_logging_log_does_not_panic() {
 
 #[tokio::test]
 async fn test_ws_logging_unreachable_endpoint_does_not_panic() {
-    let plugin = WsLogging::new(&json!({
-        "endpoint_url": "ws://127.0.0.1:1/unreachable",
-        "batch_size": 1,
-        "flush_interval_ms": 100,
-        "max_retries": 0,
-        "reconnect_delay_ms": 100
-    }))
+    let plugin = WsLogging::new(
+        &json!({
+            "endpoint_url": "ws://127.0.0.1:1/unreachable",
+            "batch_size": 1,
+            "flush_interval_ms": 100,
+            "max_retries": 0,
+            "reconnect_delay_ms": 100
+        }),
+        default_client(),
+    )
     .unwrap();
     let summary = create_test_transaction_summary();
 
@@ -112,9 +145,12 @@ async fn test_ws_logging_unreachable_endpoint_does_not_panic() {
 
 #[tokio::test]
 async fn test_ws_logging_default_lifecycle_phases() {
-    let plugin = WsLogging::new(&json!({
-        "endpoint_url": "ws://127.0.0.1:1/unreachable"
-    }))
+    let plugin = WsLogging::new(
+        &json!({
+            "endpoint_url": "ws://127.0.0.1:1/unreachable"
+        }),
+        default_client(),
+    )
     .unwrap();
 
     let mut ctx = create_test_context();
@@ -139,37 +175,46 @@ async fn test_ws_logging_default_lifecycle_phases() {
 
 #[tokio::test]
 async fn test_ws_logging_batch_config_defaults() {
-    let plugin = WsLogging::new(&json!({
-        "endpoint_url": "ws://localhost:9300/logs"
-    }))
+    let plugin = WsLogging::new(
+        &json!({
+            "endpoint_url": "ws://localhost:9300/logs"
+        }),
+        default_client(),
+    )
     .unwrap();
     assert_eq!(plugin.name(), "ws_logging");
 }
 
 #[tokio::test]
 async fn test_ws_logging_custom_batch_config() {
-    let plugin = WsLogging::new(&json!({
-        "endpoint_url": "ws://localhost:9300/logs",
-        "batch_size": 100,
-        "flush_interval_ms": 5000,
-        "max_retries": 5,
-        "retry_delay_ms": 2000,
-        "reconnect_delay_ms": 10000,
-        "buffer_capacity": 50000
-    }))
+    let plugin = WsLogging::new(
+        &json!({
+            "endpoint_url": "ws://localhost:9300/logs",
+            "batch_size": 100,
+            "flush_interval_ms": 5000,
+            "max_retries": 5,
+            "retry_delay_ms": 2000,
+            "reconnect_delay_ms": 10000,
+            "buffer_capacity": 50000
+        }),
+        default_client(),
+    )
     .unwrap();
     assert_eq!(plugin.name(), "ws_logging");
 }
 
 #[tokio::test]
 async fn test_ws_logging_buffer_accepts_multiple_entries() {
-    let plugin = WsLogging::new(&json!({
-        "endpoint_url": "ws://127.0.0.1:1/unreachable",
-        "batch_size": 50,
-        "flush_interval_ms": 10000,
-        "max_retries": 0,
-        "buffer_capacity": 1000
-    }))
+    let plugin = WsLogging::new(
+        &json!({
+            "endpoint_url": "ws://127.0.0.1:1/unreachable",
+            "batch_size": 50,
+            "flush_interval_ms": 10000,
+            "max_retries": 0,
+            "buffer_capacity": 1000
+        }),
+        default_client(),
+    )
     .unwrap();
 
     let summary = create_test_transaction_summary();
@@ -181,13 +226,16 @@ async fn test_ws_logging_buffer_accepts_multiple_entries() {
 
 #[tokio::test]
 async fn test_ws_logging_buffer_full_drops_gracefully() {
-    let plugin = WsLogging::new(&json!({
-        "endpoint_url": "ws://127.0.0.1:1/unreachable",
-        "batch_size": 1000,
-        "flush_interval_ms": 60000,
-        "max_retries": 0,
-        "buffer_capacity": 5
-    }))
+    let plugin = WsLogging::new(
+        &json!({
+            "endpoint_url": "ws://127.0.0.1:1/unreachable",
+            "batch_size": 1000,
+            "flush_interval_ms": 60000,
+            "max_retries": 0,
+            "buffer_capacity": 5
+        }),
+        default_client(),
+    )
     .unwrap();
 
     let summary = create_test_transaction_summary();

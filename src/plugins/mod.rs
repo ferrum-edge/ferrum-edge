@@ -944,7 +944,10 @@ pub fn create_plugin_with_http_client(
             config,
             http_client,
         )?))),
-        "ws_logging" => Ok(Some(Arc::new(ws_logging::WsLogging::new(config)?))),
+        "ws_logging" => Ok(Some(Arc::new(ws_logging::WsLogging::new(
+            config,
+            http_client,
+        )?))),
         "loki_logging" => Ok(Some(Arc::new(loki_logging::LokiLogging::new(
             config,
             http_client,
