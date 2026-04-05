@@ -1158,6 +1158,63 @@ credentials:
     secret: "shared-secret"
 ```
 
+### ldap_auth
+
+Authenticates requests by extracting HTTP Basic credentials and validating them against an LDAP directory. Supports direct bind (faster, no service account) or search-then-bind (more flexible), with optional Active Directory / LDAP group filtering.
+
+**Priority:** 1250
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `ldap_url` | string | (required) | LDAP server URL (`ldap://` or `ldaps://`) |
+| `bind_dn_template` | string | (none) | Direct bind DN template with `{username}` placeholder (e.g., `uid={username},ou=users,dc=example,dc=com`) |
+| `search_base_dn` | string | (none) | Base DN for search-then-bind user search |
+| `search_filter` | string | (none) | LDAP search filter with `{username}` placeholder (e.g., `(&(objectClass=user)(sAMAccountName={username}))`) |
+| `service_account_dn` | string | (none) | DN for the service account used in search-then-bind |
+| `service_account_password` | string | (none) | Password for the service account |
+| `group_base_dn` | string | (none) | Base DN for group membership search (required when `required_groups` is set) |
+| `group_filter` | string | auto | Group search filter with `{user_dn}` and `{username}` placeholders. Default checks `member`, `uniqueMember`, and `memberUid` attributes |
+| `required_groups` | string[] | `[]` | List of LDAP/AD group names the user must belong to (OR logic — at least one must match) |
+| `group_attribute` | string | `cn` | Attribute containing the group name for matching against `required_groups` |
+| `starttls` | bool | `false` | Use STARTTLS to upgrade `ldap://` connections to TLS (cannot be used with `ldaps://`) |
+| `connect_timeout_seconds` | u64 | `5` | LDAP connection and operation timeout |
+| `cache_ttl_seconds` | u64 | `0` | How long to cache successful auth results (0 = disabled). Cache is keyed by username + password hash |
+| `consumer_mapping` | bool | `true` | Whether to look up a matching gateway Consumer via `consumer_index.find_by_identity()` |
+
+**Authentication modes** (must configure one):
+
+1. **Direct bind** — set `bind_dn_template` with `{username}` placeholder. Fastest option, no service account needed.
+2. **Search-then-bind** — set `search_base_dn`, `search_filter`, `service_account_dn`, and `service_account_password`. The service account searches for the user's DN, then the plugin binds as the user.
+
+**Example — Direct bind:**
+```yaml
+plugins:
+  - name: ldap_auth
+    config:
+      ldap_url: "ldap://ldap.example.com:389"
+      bind_dn_template: "uid={username},ou=users,dc=example,dc=com"
+```
+
+**Example — AD search-then-bind with group filtering:**
+```yaml
+plugins:
+  - name: ldap_auth
+    config:
+      ldap_url: "ldaps://dc.contoso.com:636"
+      search_base_dn: "OU=Users,DC=contoso,DC=com"
+      search_filter: "(&(objectClass=user)(sAMAccountName={username}))"
+      service_account_dn: "CN=svc-proxy,OU=ServiceAccounts,DC=contoso,DC=com"
+      service_account_password: "S3cret!"
+      group_base_dn: "OU=Groups,DC=contoso,DC=com"
+      group_filter: "(&(objectClass=group)(member={user_dn}))"
+      required_groups:
+        - "Proxy Users"
+        - "Domain Admins"
+      cache_ttl_seconds: 300
+```
+
+The plugin sets `ctx.authenticated_identity` to the LDAP username. When `consumer_mapping` is enabled (default), it also attempts to find a matching gateway Consumer for ACL and rate-limiting integration.
+
 ---
 
 ## Authorization Plugins

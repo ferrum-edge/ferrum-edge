@@ -27,6 +27,7 @@ mod jwt_auth_plugin_tests;
 #[cfg(feature = "kafka")]
 mod kafka_logging_tests;
 mod key_auth_tests;
+mod ldap_auth_tests;
 mod loki_logging_tests;
 mod mtls_auth_tests;
 mod otel_tracing_tests;

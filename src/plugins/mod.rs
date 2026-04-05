@@ -37,6 +37,7 @@ pub mod jwt_auth;
 #[cfg(feature = "kafka")]
 pub mod kafka_logging;
 pub mod key_auth;
+pub mod ldap_auth;
 pub mod loki_logging;
 pub mod mtls_auth;
 pub mod otel_tracing;
@@ -541,7 +542,7 @@ pub struct StreamTransactionSummary {
 /// | Band      | Range       | Purpose                                   | Plugins |
 /// |-----------|-------------|-------------------------------------------|---------|
 /// | Early     | 0–949       | Pre-routing, tracing, and preflight       | otel_tracing (25), correlation_id (50), cors (100), request_termination (125), ip_restriction (150), bot_detection (200), sse (250), grpc_web (260), grpc_method_router (275) |
-/// | AuthN     | 950–1999    | Authentication / identity verification    | mtls_auth (950), jwks_auth (1000), jwt_auth (1100), key_auth (1200), basic_auth (1300), hmac_auth (1400) |
+/// | AuthN     | 950–1999    | Authentication / identity verification    | mtls_auth (950), jwks_auth (1000), jwt_auth (1100), key_auth (1200), ldap_auth (1250), basic_auth (1300), hmac_auth (1400) |
 /// | AuthZ     | 2000–2999   | Authorization and admission control       | access_control (2000), tcp_connection_throttle (2050), request_size_limiting (2800), graphql (2850), rate_limiting (2900), ai_prompt_shield (2925), body_validator (2950), ai_request_guard (2975) |
 /// | Transform | 3000–3999   | Request shaping and response buffering    | request_transformer (3000), serverless_function (3025), response_mock (3030), grpc_deadline (3050), request_mirror (3075), response_size_limiting (3490), response_caching (3500) |
 /// | Response  | 4000–4999   | Response transformation and AI accounting | response_transformer (4000), ai_token_metrics (4100), ai_rate_limiter (4200) |
@@ -561,6 +562,7 @@ pub mod priority {
     pub const JWKS_AUTH: u16 = 1000;
     pub const JWT_AUTH: u16 = 1100;
     pub const KEY_AUTH: u16 = 1200;
+    pub const LDAP_AUTH: u16 = 1250;
     pub const BASIC_AUTH: u16 = 1300;
     pub const HMAC_AUTH: u16 = 1400;
     pub const ACCESS_CONTROL: u16 = 2000;
@@ -986,6 +988,10 @@ pub fn create_plugin_with_http_client(
         "jwt_auth" => Ok(Some(Arc::new(jwt_auth::JwtAuth::new(config)?))),
         "key_auth" => Ok(Some(Arc::new(key_auth::KeyAuth::new(config)?))),
         "basic_auth" => Ok(Some(Arc::new(basic_auth::BasicAuth::new(config)?))),
+        "ldap_auth" => Ok(Some(Arc::new(ldap_auth::LdapAuth::new(
+            config,
+            http_client,
+        )?))),
         "hmac_auth" => Ok(Some(Arc::new(hmac_auth::HmacAuth::new(config)?))),
         "mtls_auth" => Ok(Some(Arc::new(mtls_auth::MtlsAuth::new(config)?))),
         "compression" => Ok(Some(Arc::new(compression::CompressionPlugin::new(config)?))),
@@ -1102,6 +1108,7 @@ pub fn is_security_plugin(name: &str) -> bool {
         name,
         "key_auth"
             | "basic_auth"
+            | "ldap_auth"
             | "jwt_auth"
             | "hmac_auth"
             | "jwks_auth"
@@ -1124,6 +1131,7 @@ pub fn available_plugins() -> Vec<&'static str> {
         "jwt_auth",
         "key_auth",
         "basic_auth",
+        "ldap_auth",
         "hmac_auth",
         "mtls_auth",
         "cors",

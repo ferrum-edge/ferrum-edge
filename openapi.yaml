@@ -3087,6 +3087,65 @@ components:
       description: "Plugin: basic_auth — HTTP Basic credentials (HMAC-SHA256 or bcrypt)."
       properties: {}
 
+    LdapAuthConfig:
+      type: object
+      description: "Plugin: ldap_auth — LDAP directory authentication with optional AD group filtering."
+      required:
+        - ldap_url
+      properties:
+        ldap_url:
+          type: string
+          description: "LDAP server URL (ldap:// or ldaps://)"
+          example: "ldap://ldap.example.com:389"
+        bind_dn_template:
+          type: string
+          description: "Direct bind DN template with {username} placeholder"
+          example: "uid={username},ou=users,dc=example,dc=com"
+        search_base_dn:
+          type: string
+          description: "Base DN for search-then-bind user search"
+        search_filter:
+          type: string
+          description: "LDAP search filter with {username} placeholder"
+          example: "(&(objectClass=user)(sAMAccountName={username}))"
+        service_account_dn:
+          type: string
+          description: "DN for the service account used in search-then-bind"
+        service_account_password:
+          type: string
+          description: "Password for the service account"
+        group_base_dn:
+          type: string
+          description: "Base DN for group membership search"
+        group_filter:
+          type: string
+          description: "Group search filter with {user_dn} and {username} placeholders"
+        required_groups:
+          type: array
+          items:
+            type: string
+          description: "LDAP/AD group names the user must belong to (OR logic)"
+        group_attribute:
+          type: string
+          default: "cn"
+          description: "Attribute containing the group name"
+        starttls:
+          type: boolean
+          default: false
+          description: "Use STARTTLS to upgrade ldap:// connections"
+        connect_timeout_seconds:
+          type: integer
+          default: 5
+          description: "LDAP connection and operation timeout in seconds"
+        cache_ttl_seconds:
+          type: integer
+          default: 0
+          description: "Cache TTL for successful auth results (0 = disabled)"
+        consumer_mapping:
+          type: boolean
+          default: true
+          description: "Whether to map LDAP user to a gateway Consumer"
+
     HmacAuthConfig:
       type: object
       description: "Plugin: hmac_auth — HMAC signature verification."

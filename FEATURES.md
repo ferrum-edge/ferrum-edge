@@ -70,6 +70,7 @@ Ferrum supports dynamic upstream target discovery through three providers, confi
 - **Basic Auth** — bcrypt or HMAC-SHA256 password verification
 - **HMAC** — request signature verification
 - **JWKS Auth** — multi-provider JWKS JWT validation with claim-based authorization
+- **LDAP Auth** — LDAP directory authentication via direct bind or search-then-bind with optional AD group filtering
 
 ### Authorization & Security Plugins
 

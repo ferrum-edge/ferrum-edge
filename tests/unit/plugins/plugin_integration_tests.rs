@@ -191,6 +191,7 @@ async fn test_all_plugins_available() {
         "jwt_auth",
         "key_auth",
         "basic_auth",
+        "ldap_auth",
         "hmac_auth",
         "mtls_auth",
         "cors",
@@ -282,6 +283,10 @@ async fn test_plugin_creation_all_plugins() {
             "graphql" => json!({"max_depth": 100}),
             "grpc_method_router" => json!({"allow_methods": ["test.Svc/Method"]}),
             "ai_rate_limiter" => json!({"token_limit": 100000}),
+            "ldap_auth" => json!({
+                "ldap_url": "ldap://ldap.example.com:389",
+                "bind_dn_template": "uid={username},ou=users,dc=example,dc=com"
+            }),
             "cors" => json!({"origins": ["*"]}),
             "response_caching" => json!({"ttl_seconds": 60}),
             _ => json!({}),
