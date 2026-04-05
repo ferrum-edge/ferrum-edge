@@ -20,6 +20,8 @@ mod grpc_web_tests;
 mod hmac_auth_tests;
 mod http_logging_tests;
 mod ip_restriction_tests;
+#[cfg(feature = "kafka")]
+mod kafka_logging_tests;
 mod jwks_auth_tests;
 mod jwks_cache_tests;
 mod jwks_store_tests;

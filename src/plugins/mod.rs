@@ -1,4 +1,4 @@
-//! Plugin system — 46 built-in plugins with a trait-based architecture.
+//! Plugin system — 47 built-in plugins with a trait-based architecture.
 //!
 //! Plugins execute in priority order (lower number = runs first) through
 //! lifecycle phases: `on_request_received` → `authenticate` → `authorize` →
@@ -32,6 +32,8 @@ pub mod grpc_web;
 pub mod hmac_auth;
 pub mod http_logging;
 pub mod ip_restriction;
+#[cfg(feature = "kafka")]
+pub mod kafka_logging;
 pub mod jwks_auth;
 pub mod jwt_auth;
 pub mod key_auth;
@@ -542,7 +544,7 @@ pub struct StreamTransactionSummary {
 /// | AuthZ     | 2000–2999   | Authorization and admission control       | access_control (2000), tcp_connection_throttle (2050), request_size_limiting (2800), graphql (2850), rate_limiting (2900), ai_prompt_shield (2925), body_validator (2950), ai_request_guard (2975) |
 /// | Transform | 3000–3999   | Request shaping and response buffering    | request_transformer (3000), grpc_deadline (3050), request_mirror (3075), response_size_limiting (3490), response_caching (3500) |
 /// | Response  | 4000–4999   | Response transformation and AI accounting | response_transformer (4000), ai_token_metrics (4100), ai_rate_limiter (4200) |
-/// | Logging   | 9000–9999   | Observability and frame logging           | stdout_logging (9000), ws_frame_logging (9050), statsd_logging (9075), http_logging (9100), loki_logging (9150), ws_logging (9175), transaction_debugger (9200), prometheus_metrics (9300) |
+/// | Logging   | 9000–9999   | Observability and frame logging           | stdout_logging (9000), ws_frame_logging (9050), statsd_logging (9075), http_logging (9100), kafka_logging (9150), loki_logging (9150), ws_logging (9175), transaction_debugger (9200), prometheus_metrics (9300) |
 #[allow(dead_code)]
 pub mod priority {
     pub const OTEL_TRACING: u16 = 25;
@@ -582,6 +584,7 @@ pub mod priority {
     pub const STATSD_LOGGING: u16 = 9075;
     pub const HTTP_LOGGING: u16 = 9100;
     pub const TCP_LOGGING: u16 = 9125;
+    pub const KAFKA_LOGGING: u16 = 9150;
     pub const LOKI_LOGGING: u16 = 9150;
     pub const UDP_LOGGING: u16 = 9150;
     pub const TRANSACTION_DEBUGGER: u16 = 9200;
@@ -961,6 +964,13 @@ pub fn create_plugin_with_http_client(
             http_client,
         )?))),
         "udp_logging" => Ok(Some(Arc::new(udp_logging::UdpLogging::new(config)?))),
+        #[cfg(feature = "kafka")]
+        "kafka_logging" => Ok(Some(Arc::new(kafka_logging::KafkaLogging::new(config)?))),
+        #[cfg(not(feature = "kafka"))]
+        "kafka_logging" => Err(
+            "kafka_logging: requires the 'kafka' cargo feature to be enabled at compile time"
+                .to_string(),
+        ),
         "transaction_debugger" => Ok(Some(Arc::new(
             transaction_debugger::TransactionDebugger::new(config),
         ))),
@@ -1087,6 +1097,7 @@ pub fn available_plugins() -> Vec<&'static str> {
         "stdout_logging",
         "http_logging",
         "tcp_logging",
+        "kafka_logging",
         "ws_logging",
         "transaction_debugger",
         "jwks_auth",
