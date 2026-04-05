@@ -2584,7 +2584,14 @@ components:
           description: URL to POST transaction logs to
         authorization_header:
           type: string
-          description: Authorization header value for the logging endpoint
+          description: "DEPRECATED: Use custom_headers instead. Sets the Authorization header. If custom_headers also includes Authorization, custom_headers takes precedence."
+        custom_headers:
+          type: object
+          additionalProperties:
+            type: string
+          description: "Key-value pairs of custom HTTP headers to include on every batch request. Use this for service-specific auth (e.g., DD-API-KEY for Datadog, Api-Key for New Relic) or metadata headers."
+          example:
+            DD-API-KEY: your-datadog-api-key
         batch_size:
           type: integer
           default: 50

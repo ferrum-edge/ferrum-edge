@@ -303,6 +303,8 @@ Plugins execute in priority order (lower number = runs first). The lifecycle pha
 
 **External identity support**: `ctx.authenticated_identity` (set by JWKS/OIDC) is treated as a first-class principal across rate-limit keys, cache keys, log summaries, and backend identity-header injection on all protocol paths (HTTP, HTTP/3, gRPC, WebSocket).
 
+**HTTP logging custom headers**: The `http_logging` plugin supports a `custom_headers` config field (JSON object of header name → value pairs) that are sent with every batch POST request. This enables integration with services that require non-standard authentication headers (e.g., `DD-API-KEY` for Datadog, `Api-Key` for New Relic, `X-Sumo-Category` for Sumo Logic). The legacy `authorization_header` field is still accepted for backward compatibility but is deprecated — if both `authorization_header` and `custom_headers` contain an `Authorization` key, `custom_headers` takes precedence. See `docs/plugins.md` for the full service integration quick reference table covering Splunk, Datadog, New Relic, Sumo Logic, Elastic, Loki, Azure Monitor, AWS CloudWatch, Google Cloud Logging, Logtail, Axiom, and Mezmo.
+
 Plugin priority constants are defined in `src/plugins/mod.rs` (e.g., `priority::CORS = 100`, `priority::REQUEST_TERMINATION = 125`, `priority::TCP_CONNECTION_THROTTLE = 2050`, `priority::RATE_LIMITING = 2900`, `priority::RESPONSE_SIZE_LIMITING = 3490`, `priority::COMPRESSION = 4050`).
 
 ### DNS Cache (`src/dns/mod.rs`)

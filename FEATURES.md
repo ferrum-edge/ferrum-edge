@@ -122,7 +122,7 @@ Ferrum supports dynamic upstream target discovery through three providers, confi
 ### Observability Plugins
 
 - **Stdout Logging** — JSON transaction summaries
-- **HTTP Logging** — batched delivery to external endpoints with retry
+- **HTTP Logging** — batched delivery to external endpoints with retry and custom headers (Datadog, Splunk, New Relic, Sumo Logic, Axiom, Logtail, Elastic, Azure Monitor, and more)
 - **Transaction Debugger** — verbose request/response diagnostics via `tracing::debug` with header redaction (development only)
 - **Correlation ID** — UUID generation and propagation
 - **Prometheus Metrics** — exposition format endpoint

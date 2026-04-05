@@ -66,7 +66,8 @@ Sends transaction summaries as JSON to an external HTTP endpoint. Entries are bu
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `endpoint_url` | String | `""` | URL to POST transaction logs to |
-| `authorization_header` | String | *(none)* | Authorization header value for the logging endpoint |
+| `custom_headers` | Object | *(none)* | Key-value pairs of custom HTTP headers to include on every batch request |
+| `authorization_header` | String | *(none)* | **Deprecated** — use `custom_headers` instead. Sets the Authorization header |
 | `batch_size` | Integer | `50` | Number of entries to buffer before sending a batch |
 | `flush_interval_ms` | Integer | `1000` | Max milliseconds before flushing a partial batch (min: 100) |
 | `max_retries` | Integer | `3` | Retry attempts on failed batch delivery |
@@ -77,14 +78,38 @@ Batches are flushed when `batch_size` is reached **or** `flush_interval_ms` elap
 
 `endpoint_url` must be a valid `http://` or `https://` URL with a hostname. Malformed or non-HTTP URLs reject plugin creation at config load time instead of failing later in the background flush task.
 
+`custom_headers` accepts a JSON object of header name → value pairs. All headers are sent with every batch POST request. This supports services that require non-standard authentication headers (e.g., `DD-API-KEY` for Datadog, `Api-Key` for New Relic, `X-Sumo-Category` for Sumo Logic). If both `authorization_header` and `custom_headers` contain an `Authorization` key, `custom_headers` takes precedence.
+
 ```yaml
 plugin_name: http_logging
 config:
   endpoint_url: "https://logging-service.example.com/ingest"
-  authorization_header: "Bearer log-token-123"
+  custom_headers:
+    Authorization: "Bearer log-token-123"
   batch_size: 50
   flush_interval_ms: 1000
 ```
+
+#### Service Integration Quick Reference
+
+The table below summarizes how to configure `http_logging` for popular log ingestion services. All services receive the same JSON array of `TransactionSummary` / `StreamTransactionSummary` objects.
+
+| Service | Endpoint URL | Required `custom_headers` | Auth Mechanism | Accepts JSON Arrays | Batch Limits | Notes |
+|---------|-------------|--------------------------|----------------|--------------------|--------------|----|
+| **Splunk HEC** | `https://<host>:8088/services/collector/raw` | `Authorization: "Splunk <token>"` | Token in Authorization header | Yes (raw endpoint) | 1MB default | Must use `/raw` endpoint, not `/event` |
+| **Datadog** | `https://http-intake.logs.datadoghq.com/api/v2/logs` | `DD-API-KEY: "<key>"` | Dedicated API key header | Yes | 1000 entries / 5MB | Regional endpoints: `.datadoghq.eu` (EU), `.us3.datadoghq.com` (US3), `.us5.datadoghq.com` (US5), `.ap1.datadoghq.com` (AP1) |
+| **New Relic** | `https://log-api.newrelic.com/log/v1` | `Api-Key: "<license-key>"` | Dedicated API key header | Yes | 1MB compressed | EU: `log-api.eu.newrelic.com` |
+| **Sumo Logic** | `https://<endpoint>.sumologic.com/receiver/v1/http/<token>` | `X-Sumo-Category`, `X-Sumo-Name`, `X-Sumo-Host` (optional metadata) | Token embedded in URL | Yes | 1MB default | No auth header needed — token is in the URL path |
+| **Elastic / OpenSearch** | `https://<host>:9200/<index>/_bulk` | `Authorization: "Basic <b64>"` or `Authorization: "Bearer <token>"` | Standard Authorization header | Yes (bulk API) | 100MB default | Consider using `_bulk` with NDJSON adapter or direct index API |
+| **Grafana Loki** | Requires intermediary (Promtail/Alloy/Fluentd) | `X-Scope-OrgID: "<tenant>"` (multi-tenant) | Varies by setup | **No** — needs `{"streams": [...]}` format | 4MB default | Cannot ingest raw JSON arrays directly; use a log shipper as intermediary |
+| **Azure Monitor** | `https://<dce>.ingest.monitor.azure.com/dataCollectionRules/<dcr-id>/streams/<stream>?api-version=2023-01-01` | `Authorization: "Bearer <aad-token>"` | Azure AD OAuth2 bearer token | Yes (custom tables) | 1MB per call | Requires Data Collection Endpoint + Rule; fields map to custom table columns |
+| **AWS CloudWatch** | Requires intermediary (Fluent Bit/Firehose HTTP endpoint) | `Authorization: "Bearer <token>"` or custom | Varies by intermediary | **No** — needs `PutLogEvents` API format | N/A | Cannot POST directly; use a Firehose HTTP endpoint or Fluent Bit as intermediary |
+| **Google Cloud Logging** | Requires intermediary (Fluent Bit/custom) | `Authorization: "Bearer <token>"` | OAuth2 bearer token | **No** — needs `entries.write` format | N/A | Cannot POST directly; use Fluent Bit or a custom HTTP bridge |
+| **Logtail / Better Stack** | `https://in.logs.betterstack.com` | `Authorization: "Bearer <source-token>"` | Standard Authorization header | Yes | 10MB | Fields auto-parsed from JSON |
+| **Axiom** | `https://api.axiom.co/v1/datasets/<dataset>/ingest` | `Authorization: "Bearer <api-token>"` | Standard Authorization header | Yes | 10MB | Fields auto-parsed; supports `Content-Type: application/json` |
+| **Mezmo (LogDNA)** | `https://logs.mezmo.com/logs/ingest?hostname=<host>&apikey=<key>` | *(none — key in query string)* | API key in URL query parameter | Yes (lines API) | 10MB | Hostname is a required query parameter |
+
+> **TLS verification:** If any service uses an internal CA, set `FERRUM_TLS_CA_BUNDLE_PATH` to your CA bundle so the plugin's HTTP client can verify the endpoint's certificate.
 
 #### Splunk HEC Integration
 
@@ -103,13 +128,14 @@ The `http_logging` plugin works with [Splunk HTTP Event Collector (HEC)](https:/
    - **Index**: choose your target index
    - **Enable indexer acknowledgement**: optional, for guaranteed delivery
 
-4. **Configure the plugin** — point `endpoint_url` at the raw HEC endpoint and set the `authorization_header` to `Splunk <your-token>`:
+4. **Configure the plugin** — point `endpoint_url` at the raw HEC endpoint and set the Splunk auth token via `custom_headers`:
 
 ```yaml
 plugin_name: http_logging
 config:
   endpoint_url: "https://splunk.example.com:8088/services/collector/raw"
-  authorization_header: "Splunk cf2fa345-1b2c-3d4e-5f6a-7b8c9d0e1f2a"
+  custom_headers:
+    Authorization: "Splunk cf2fa345-1b2c-3d4e-5f6a-7b8c9d0e1f2a"
   batch_size: 100
   flush_interval_ms: 2000
 ```
@@ -124,7 +150,151 @@ sourcetype="ferrum_edge_logs" response_status_code>=500
 
 > **Note:** If you use the standard HEC endpoint (`/services/collector/event`) instead of `/services/collector/raw`, Splunk expects each event wrapped in `{"event": ...}` — which `http_logging` does not produce. Always use the `/raw` endpoint.
 
-> **TLS verification:** If your Splunk instance uses an internal CA, set `FERRUM_TLS_CA_BUNDLE_PATH` to your CA bundle so the plugin's HTTP client can verify the HEC endpoint's certificate.
+#### Datadog Integration
+
+[Datadog's HTTP log intake API](https://docs.datadoghq.com/api/latest/logs/) accepts JSON arrays directly. Authenticate with the `DD-API-KEY` header.
+
+```yaml
+plugin_name: http_logging
+config:
+  endpoint_url: "https://http-intake.logs.datadoghq.com/api/v2/logs"
+  custom_headers:
+    DD-API-KEY: "your-datadog-api-key"
+  batch_size: 100
+  flush_interval_ms: 2000
+```
+
+Datadog will ingest all `TransactionSummary` fields as log attributes. Set up a [log pipeline](https://docs.datadoghq.com/logs/log_configuration/pipelines/) to remap fields (e.g., `response_status_code` → `http.status_code`) for Datadog's standard attributes.
+
+#### New Relic Integration
+
+[New Relic's Log API](https://docs.newrelic.com/docs/logs/log-api/introduction-log-api/) accepts JSON arrays. Authenticate with the `Api-Key` header.
+
+```yaml
+plugin_name: http_logging
+config:
+  endpoint_url: "https://log-api.newrelic.com/log/v1"
+  custom_headers:
+    Api-Key: "your-new-relic-license-key"
+  batch_size: 100
+  flush_interval_ms: 2000
+```
+
+Use `log-api.eu.newrelic.com` for EU accounts. New Relic will parse the JSON fields automatically.
+
+#### Sumo Logic Integration
+
+[Sumo Logic's HTTP Source](https://help.sumologic.com/docs/send-data/hosted-collectors/http-source/logs-metrics/) uses URL-based authentication (the collector URL contains the token). Use `custom_headers` for source metadata.
+
+```yaml
+plugin_name: http_logging
+config:
+  endpoint_url: "https://endpoint1.collection.us1.sumologic.com/receiver/v1/http/YOUR_TOKEN"
+  custom_headers:
+    X-Sumo-Category: "ferrum-edge/proxy"
+    X-Sumo-Name: "ferrum-edge-gateway"
+    X-Sumo-Host: "gateway-prod-01"
+  batch_size: 100
+  flush_interval_ms: 2000
+```
+
+#### Logtail / Better Stack Integration
+
+[Logtail (Better Stack)](https://betterstack.com/docs/logs/logging-start/) accepts JSON arrays with Bearer token authentication.
+
+```yaml
+plugin_name: http_logging
+config:
+  endpoint_url: "https://in.logs.betterstack.com"
+  custom_headers:
+    Authorization: "Bearer your-source-token"
+  batch_size: 100
+  flush_interval_ms: 2000
+```
+
+#### Axiom Integration
+
+[Axiom's ingest API](https://axiom.co/docs/send-data/ingest) accepts JSON arrays with Bearer token authentication.
+
+```yaml
+plugin_name: http_logging
+config:
+  endpoint_url: "https://api.axiom.co/v1/datasets/your-dataset/ingest"
+  custom_headers:
+    Authorization: "Bearer your-api-token"
+  batch_size: 100
+  flush_interval_ms: 2000
+```
+
+#### Elastic / OpenSearch Integration
+
+For direct index ingestion, use the `_doc` endpoint with Basic or Bearer auth:
+
+```yaml
+plugin_name: http_logging
+config:
+  endpoint_url: "https://elasticsearch.example.com:9200/ferrum-logs/_doc"
+  custom_headers:
+    Authorization: "Basic dXNlcjpwYXNzd29yZA=="
+  batch_size: 100
+  flush_interval_ms: 2000
+```
+
+> **Note:** The `_doc` endpoint accepts single documents. For bulk ingestion, use a log shipper (Logstash, Fluent Bit) as an intermediary that transforms the JSON array into Elasticsearch's NDJSON bulk format.
+
+#### Azure Monitor Integration
+
+[Azure Monitor's log ingestion API](https://learn.microsoft.com/en-us/azure/azure-monitor/logs/logs-ingestion-api-overview) accepts JSON arrays via a Data Collection Endpoint (DCE) and Data Collection Rule (DCR).
+
+```yaml
+plugin_name: http_logging
+config:
+  endpoint_url: "https://your-dce.eastus-1.ingest.monitor.azure.com/dataCollectionRules/dcr-abc123/streams/Custom-FerrumLogs_CL?api-version=2023-01-01"
+  custom_headers:
+    Authorization: "Bearer your-aad-oauth2-token"
+  batch_size: 100
+  flush_interval_ms: 2000
+```
+
+> **Note:** The Bearer token is a short-lived Azure AD OAuth2 token. For production use, consider placing an auth proxy (e.g., Azure API Management) in front that handles token refresh, or use Fluent Bit with the Azure Monitor output plugin.
+
+#### Grafana Loki Integration
+
+[Grafana Loki's HTTP push API](https://grafana.com/docs/loki/latest/reference/loki-http-api/#push-log-entries-to-loki) uses a different payload format (`{"streams": [...]}`) than what `http_logging` produces. For Loki, use a log shipper (Promtail, Alloy, or Fluentd) as an intermediary that accepts the JSON array from `http_logging` and transforms it into Loki's expected format. Use `custom_headers` for multi-tenant setups:
+
+```yaml
+plugin_name: http_logging
+config:
+  endpoint_url: "http://promtail.internal:3500/api/v1/push"
+  custom_headers:
+    X-Scope-OrgID: "tenant-1"
+  batch_size: 100
+  flush_interval_ms: 2000
+```
+
+#### AWS CloudWatch Logs Integration
+
+CloudWatch Logs does not have an HTTP JSON intake API. Use [Fluent Bit](https://docs.fluentbit.io/manual/pipeline/outputs/cloudwatch) or an [Amazon Kinesis Data Firehose HTTP endpoint](https://docs.aws.amazon.com/firehose/latest/dev/create-destination.html#create-destination-http) as an intermediary:
+
+```yaml
+plugin_name: http_logging
+config:
+  endpoint_url: "http://fluent-bit.internal:8888/ferrum"
+  batch_size: 100
+  flush_interval_ms: 2000
+```
+
+#### Google Cloud Logging Integration
+
+Cloud Logging does not have a direct HTTP JSON intake API. Use [Fluent Bit with the stackdriver output](https://docs.fluentbit.io/manual/pipeline/outputs/stackdriver) or a custom Cloud Function/Cloud Run bridge:
+
+```yaml
+plugin_name: http_logging
+config:
+  endpoint_url: "http://fluent-bit.internal:8888/ferrum"
+  batch_size: 100
+  flush_interval_ms: 2000
+```
 
 ### Transaction Summary Reference
 
