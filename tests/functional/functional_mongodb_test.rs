@@ -13,10 +13,10 @@
 //!      - Docker: `docker run -d --name mongo-test -p 27017:27017 mongo:7`
 //!   2. For TLS/mTLS tests: TLS-enabled MongoDB with certs
 //!      - Run `tests/scripts/setup_mongo_tls.sh` (if available) or configure manually
-//!   3. Build with MongoDB support: `cargo build --features mongodb`
+//!   3. Build the gateway: `cargo build`
 //!
 //! Run with:
-//!   cargo test --test functional_tests --features mongodb functional_mongodb -- --ignored --nocapture
+//!   cargo test --test functional_tests functional_mongodb -- --ignored --nocapture
 
 use chrono::Utc;
 use jsonwebtoken::{EncodingKey, Header, encode};
@@ -218,7 +218,7 @@ fn find_binary() -> Result<&'static str, Box<dyn std::error::Error>> {
     } else if std::path::Path::new("./target/release/ferrum-edge").exists() {
         Ok("./target/release/ferrum-edge")
     } else {
-        Err("ferrum-edge binary not found. Run `cargo build --features mongodb` first.".into())
+        Err("ferrum-edge binary not found. Run `cargo build` first.".into())
     }
 }
 

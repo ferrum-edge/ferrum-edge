@@ -181,9 +181,11 @@ mod inner {
                 anyhow::anyhow!("Failed to read MongoDB client key '{}': {}", key_path, e)
             })?;
 
-            // Write combined PEM to a temp file. Use a deterministic path so
-            // reconnect calls reuse the same file instead of leaking temp files.
-            let combined_path = std::env::temp_dir().join("ferrum-mongo-client.pem");
+            // Write combined PEM to a temp file. Use a PID-scoped deterministic path
+            // so reconnect calls reuse the same file (no temp file leak) while multiple
+            // gateway instances on the same host don't collide.
+            let combined_path = std::env::temp_dir()
+                .join(format!("ferrum-mongo-client-{}.pem", std::process::id()));
             let combined = format!("{}\n{}", cert_data.trim(), key_data.trim());
             std::fs::write(&combined_path, combined).map_err(|e| {
                 anyhow::anyhow!(
