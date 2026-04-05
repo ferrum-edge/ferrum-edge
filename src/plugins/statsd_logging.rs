@@ -275,8 +275,13 @@ async fn flush_loop(mut receiver: mpsc::Receiver<MetricEntry>, cfg: StatsdConfig
         }
     };
 
-    // Bind an ephemeral UDP socket for sending.
-    let socket = match UdpSocket::bind("0.0.0.0:0").await {
+    // Bind an ephemeral UDP socket matching the resolved address family.
+    let bind_addr = if addr.is_ipv6() {
+        "[::]:0"
+    } else {
+        "0.0.0.0:0"
+    };
+    let socket = match UdpSocket::bind(bind_addr).await {
         Ok(s) => s,
         Err(e) => {
             warn!("statsd_logging: failed to bind UDP socket: {e} — metrics will be lost");
