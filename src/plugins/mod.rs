@@ -32,10 +32,10 @@ pub mod grpc_web;
 pub mod hmac_auth;
 pub mod http_logging;
 pub mod ip_restriction;
-#[cfg(feature = "kafka")]
-pub mod kafka_logging;
 pub mod jwks_auth;
 pub mod jwt_auth;
+#[cfg(feature = "kafka")]
+pub mod kafka_logging;
 pub mod key_auth;
 pub mod loki_logging;
 pub mod mtls_auth;

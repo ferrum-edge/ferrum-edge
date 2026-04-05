@@ -37,10 +37,7 @@ async fn test_kafka_logging_empty_broker_list() {
 async fn test_kafka_logging_missing_topic() {
     let result = KafkaLogging::new(&json!({"broker_list": "localhost:9092"}));
     match result {
-        Err(e) => assert!(
-            e.contains("topic"),
-            "Expected error about topic, got: {e}"
-        ),
+        Err(e) => assert!(e.contains("topic"), "Expected error about topic, got: {e}"),
         Ok(_) => panic!("Expected Err when creating kafka_logging without topic"),
     }
 }
@@ -59,7 +56,10 @@ async fn test_kafka_logging_invalid_compression() {
         "compression": "bzip2"
     }));
     match result {
-        Err(e) => assert!(e.contains("compression"), "Expected compression error, got: {e}"),
+        Err(e) => assert!(
+            e.contains("compression"),
+            "Expected compression error, got: {e}"
+        ),
         Ok(_) => panic!("Expected Err for unsupported compression type"),
     }
 }
