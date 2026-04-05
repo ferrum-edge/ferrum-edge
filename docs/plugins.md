@@ -975,7 +975,11 @@ the `/metrics` endpoint; this plugin only records request and stream metrics.
 
 **Priority:** 9300
 
-This plugin has no plugin-specific configuration.
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `render_cache_ttl_seconds` | Integer | `5` | How long the cached `/metrics` response is served before rebuilding |
+| `stale_entry_ttl_seconds` | Integer | `3600` | How long idle metric entries live before eviction (prevents unbounded memory growth from deleted/recreated proxies) |
+| `cache_invalidation_min_age_ms` | Integer | `500` | Minimum age (ms) of the render cache before `record()` will invalidate it. Under extreme load this prevents an allocation per request — the render TTL is the real freshness guarantee |
 
 ### `otel_tracing`
 

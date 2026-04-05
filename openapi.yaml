@@ -2912,10 +2912,18 @@ components:
       type: object
       description: "Plugin: prometheus_metrics — Exports gateway metrics in Prometheus format."
       properties:
-        path:
-          type: string
-          default: /metrics
-          description: Metrics endpoint path
+        render_cache_ttl_seconds:
+          type: integer
+          default: 5
+          description: How long the cached /metrics response is served before rebuilding (seconds)
+        stale_entry_ttl_seconds:
+          type: integer
+          default: 3600
+          description: How long idle metric entries live before eviction (seconds). Prevents unbounded memory growth from deleted/recreated proxies
+        cache_invalidation_min_age_ms:
+          type: integer
+          default: 500
+          description: Minimum age (ms) of the render cache before record() will invalidate it. Under extreme load this prevents an allocation per request
 
     OtelTracingConfig:
       type: object

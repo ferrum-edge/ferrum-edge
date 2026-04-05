@@ -7,7 +7,7 @@ The Ferrum Edge Admin API exposes a comprehensive runtime metrics endpoint that 
 | Endpoint | Method | Auth | Cache | Description |
 |----------|--------|------|-------|-------------|
 | `/admin/metrics` | GET | JWT required | 5-second TTL | Comprehensive runtime metrics (JSON) |
-| `/metrics` | GET | None | None | Prometheus exposition format (plugin-based) |
+| `/metrics` | GET | None | 5-second TTL (configurable via `render_cache_ttl_seconds`) | Prometheus exposition format (plugin-based) |
 | `/health` | GET | None | None | Health check (DB connectivity, config status) |
 
 ### Metrics vs Prometheus vs Health
