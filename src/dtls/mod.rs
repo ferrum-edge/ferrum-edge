@@ -788,7 +788,7 @@ impl DtlsServer {
 ///
 /// Supports ECDSA P-256 and P-384 private keys. Ed25519 is NOT supported
 /// by dimpl for DTLS signatures (unlike the previous webrtc-dtls library).
-fn load_dtls_certificate(
+pub fn load_dtls_certificate(
     cert_path: &str,
     key_path: &str,
 ) -> Result<DtlsCertificate, anyhow::Error> {
@@ -814,7 +814,7 @@ fn load_dtls_certificate(
 }
 
 /// Load a rustls root store from a PEM file.
-fn load_root_store_from_pem(pem_path: &str) -> Result<rustls::RootCertStore, anyhow::Error> {
+pub fn load_root_store_from_pem(pem_path: &str) -> Result<rustls::RootCertStore, anyhow::Error> {
     let pem_data = std::fs::read(pem_path)
         .map_err(|e| anyhow::anyhow!("Failed to read PEM file {}: {}", pem_path, e))?;
     let certs: Vec<_> = rustls_pemfile::certs(&mut &pem_data[..])
@@ -852,6 +852,12 @@ fn generate_ephemeral_cert() -> Result<DtlsCertificate, anyhow::Error> {
 /// Generate a self-signed DTLS certificate for testing.
 #[allow(dead_code)]
 pub fn generate_self_signed_cert() -> Result<DtlsCertificate, anyhow::Error> {
+    generate_ephemeral_cert()
+}
+
+/// Generate an ephemeral self-signed certificate for DTLS clients that don't
+/// need client authentication.
+pub fn generate_ephemeral_cert_public() -> Result<DtlsCertificate, anyhow::Error> {
     generate_ephemeral_cert()
 }
 

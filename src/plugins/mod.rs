@@ -1,4 +1,4 @@
-//! Plugin system — 45 built-in plugins with a trait-based architecture.
+//! Plugin system — 46 built-in plugins with a trait-based architecture.
 //!
 //! Plugins execute in priority order (lower number = runs first) through
 //! lifecycle phases: `on_request_received` → `authenticate` → `authorize` →
@@ -54,6 +54,7 @@ pub mod stdout_logging;
 pub mod tcp_connection_throttle;
 pub mod tcp_logging;
 pub mod transaction_debugger;
+pub mod udp_logging;
 pub mod udp_rate_limiting;
 pub mod utils;
 pub mod ws_frame_logging;
@@ -582,6 +583,7 @@ pub mod priority {
     pub const HTTP_LOGGING: u16 = 9100;
     pub const TCP_LOGGING: u16 = 9125;
     pub const LOKI_LOGGING: u16 = 9150;
+    pub const UDP_LOGGING: u16 = 9150;
     pub const TRANSACTION_DEBUGGER: u16 = 9200;
     pub const PROMETHEUS_METRICS: u16 = 9300;
     pub const WS_MESSAGE_SIZE_LIMITING: u16 = 2810;
@@ -958,6 +960,7 @@ pub fn create_plugin_with_http_client(
             config,
             http_client,
         )?))),
+        "udp_logging" => Ok(Some(Arc::new(udp_logging::UdpLogging::new(config)?))),
         "transaction_debugger" => Ok(Some(Arc::new(
             transaction_debugger::TransactionDebugger::new(config),
         ))),
@@ -1121,6 +1124,7 @@ pub fn available_plugins() -> Vec<&'static str> {
         "ws_frame_logging",
         "ws_rate_limiting",
         "udp_rate_limiting",
+        "udp_logging",
         "request_mirror",
     ];
     plugins.extend(crate::custom_plugins::custom_plugin_names());

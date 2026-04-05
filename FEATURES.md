@@ -55,7 +55,7 @@ Ferrum supports dynamic upstream target discovery through three providers, confi
 
 ## Plugin System
 
-- 45 built-in plugins with lifecycle hooks (request received, authenticate, authorize, before proxy, after proxy, on final request/response body, on response body, on WebSocket frame, on UDP datagram, log)
+- 46 built-in plugins with lifecycle hooks (request received, authenticate, authorize, before proxy, after proxy, on final request/response body, on response body, on WebSocket frame, on UDP datagram, log)
 - Priority-ordered execution with protocol-aware filtering (HTTP, gRPC, WebSocket, TCP, UDP)
 - Global and per-proxy scoping with same-type override semantics
 - Multi-authentication mode with first-match consumer identification
@@ -124,6 +124,7 @@ Ferrum supports dynamic upstream target discovery through three providers, confi
 - **Stdout Logging** — JSON transaction summaries
 - **HTTP Logging** — batched delivery to external endpoints with retry and custom headers (Datadog, Splunk, New Relic, Sumo Logic, Axiom, Logtail, Elastic, Azure Monitor, and more)
 - **Loki Logging** — batched delivery to Grafana Loki with label-based stream grouping, gzip compression, and multi-tenant support
+- **UDP Logging** — batched delivery to external UDP/DTLS endpoints with optional DTLS encryption and client certificate support
 - **Transaction Debugger** — verbose request/response diagnostics via `tracing::debug` with header redaction (development only)
 - **Correlation ID** — UUID generation and propagation
 - **Prometheus Metrics** — exposition format endpoint

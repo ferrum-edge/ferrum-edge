@@ -50,6 +50,7 @@ mod tcp_connection_throttle_tests;
 mod tcp_logging_tests;
 mod transaction_debugger_tests;
 mod transaction_summary_tests;
+mod udp_logging_tests;
 mod udp_rate_limiting_tests;
 mod ws_frame_logging_tests;
 mod ws_logging_tests;
