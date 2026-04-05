@@ -25,9 +25,8 @@ async fn test_ws_logging_plugin_creation() {
 async fn test_ws_logging_plugin_creation_wss() {
     // wss:// triggers rustls ClientConfig construction, which requires
     // a crypto provider to be installed (normally done in main.rs).
-    let _ = rustls::crypto::CryptoProvider::install_default(
-        rustls::crypto::ring::default_provider(),
-    );
+    let _ =
+        rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
     let plugin = WsLogging::new(
         &json!({
             "endpoint_url": "wss://localhost:9300/logs"
