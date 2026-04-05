@@ -736,6 +736,7 @@ paths:
                 - ws_logging
                 - ws_rate_limiting
                 - udp_rate_limiting
+                - udp_logging
         "401":
           $ref: "#/components/responses/Unauthorized"
 
@@ -2663,6 +2664,60 @@ components:
           default: 5000
           minimum: 100
           description: TCP connection timeout in milliseconds
+
+    UdpLoggingConfig:
+      type: object
+      description: "Plugin: udp_logging — Sends transaction logs to a UDP/DTLS endpoint in batches."
+      required:
+        - host
+        - port
+      properties:
+        host:
+          type: string
+          description: UDP endpoint hostname or IP address
+        port:
+          type: integer
+          minimum: 1
+          maximum: 65535
+          description: UDP endpoint port
+        dtls:
+          type: boolean
+          default: false
+          description: Enable DTLS encryption for log datagrams
+        dtls_cert_path:
+          type: string
+          description: PEM client certificate for DTLS mutual TLS
+        dtls_key_path:
+          type: string
+          description: PEM private key for DTLS mutual TLS (must be paired with dtls_cert_path)
+        dtls_ca_cert_path:
+          type: string
+          description: PEM CA certificate for verifying the DTLS server
+        dtls_no_verify:
+          type: boolean
+          default: false
+          description: Skip DTLS server certificate verification (testing only)
+        batch_size:
+          type: integer
+          default: 10
+          description: Number of entries to buffer before sending a batch
+        flush_interval_ms:
+          type: integer
+          default: 1000
+          minimum: 100
+          description: Max milliseconds before flushing a partial batch
+        max_retries:
+          type: integer
+          default: 1
+          description: Retry attempts on failed batch delivery
+        retry_delay_ms:
+          type: integer
+          default: 500
+          description: Delay in milliseconds between retry attempts
+        buffer_capacity:
+          type: integer
+          default: 10000
+          description: Channel capacity — new entries are dropped when full
 
     WsLoggingConfig:
       type: object

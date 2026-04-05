@@ -1,6 +1,6 @@
 # Plugin Reference
 
-Ferrum Edge includes 45 built-in plugins organized into lifecycle phases. Each plugin executes at a specific priority (lower number = runs first).
+Ferrum Edge includes 46 built-in plugins organized into lifecycle phases. Each plugin executes at a specific priority (lower number = runs first).
 
 For execution order, protocol support matrix, and design rationale, see [plugin_execution_order.md](plugin_execution_order.md).
 
@@ -437,9 +437,58 @@ input {
 
 For TLS, add `ssl_enable => true` with your certificate configuration to the Logstash TCP input.
 
+### `udp_logging`
+
+Sends transaction summaries as JSON to an external UDP endpoint. Entries are buffered and sent in batches (as a JSON array) in a single UDP datagram. Supports both plain UDP and DTLS-encrypted transport.
+
+**Priority:** 9150
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `host` | String | *(required)* | UDP endpoint hostname or IP address |
+| `port` | Integer | *(required)* | UDP endpoint port (1–65535) |
+| `dtls` | Boolean | `false` | Enable DTLS encryption for log datagrams |
+| `dtls_cert_path` | String | *(none)* | PEM client certificate for DTLS mutual TLS |
+| `dtls_key_path` | String | *(none)* | PEM private key for DTLS mutual TLS (must be paired with `dtls_cert_path`) |
+| `dtls_ca_cert_path` | String | *(none)* | PEM CA certificate for verifying the DTLS server |
+| `dtls_no_verify` | Boolean | `false` | Skip DTLS server certificate verification (testing only) |
+| `batch_size` | Integer | `10` | Number of entries to buffer before sending a batch |
+| `flush_interval_ms` | Integer | `1000` | Max milliseconds before flushing a partial batch (min: 100) |
+| `max_retries` | Integer | `1` | Retry attempts on failed batch delivery |
+| `retry_delay_ms` | Integer | `500` | Delay in milliseconds between retry attempts |
+| `buffer_capacity` | Integer | `10000` | Channel capacity — new entries are dropped when full |
+
+Batches are flushed when `batch_size` is reached **or** `flush_interval_ms` elapses, whichever comes first. Each batch is serialized as a JSON array and sent as a single UDP datagram.
+
+**Datagram size:** Operators should size `batch_size` to keep serialized payloads under the network MTU (typically ~1400 bytes for DTLS, ~1472 bytes for plain UDP over Ethernet). Oversized datagrams may be fragmented or dropped by the network.
+
+```yaml
+plugin_name: udp_logging
+config:
+  host: "syslog.example.com"
+  port: 9514
+  batch_size: 5
+  flush_interval_ms: 1000
+```
+
+#### DTLS Configuration
+
+For encrypted log shipping, enable DTLS. An ephemeral self-signed certificate is used by default when no client certificate is provided:
+
+```yaml
+plugin_name: udp_logging
+config:
+  host: "secure-log-collector.example.com"
+  port: 9515
+  dtls: true
+  dtls_cert_path: "/etc/ferrum/certs/log-client.pem"
+  dtls_key_path: "/etc/ferrum/certs/log-client-key.pem"
+  dtls_ca_cert_path: "/etc/ferrum/certs/log-server-ca.pem"
+```
+
 ### Transaction Summary Reference
 
-All logging plugins (`stdout_logging`, `http_logging`, `tcp_logging`, `statsd_logging`, `loki_logging`) emit metrics from the same transaction structures. HTTP-family protocols (HTTP/1.1, HTTP/2, HTTP/3, gRPC, WebSocket) use `TransactionSummary`. Stream protocols (TCP, UDP, DTLS) use `StreamTransactionSummary`.
+All logging plugins (`stdout_logging`, `http_logging`, `tcp_logging`, `udp_logging`, `statsd_logging`, `loki_logging`) emit metrics from the same transaction structures. HTTP-family protocols (HTTP/1.1, HTTP/2, HTTP/3, gRPC, WebSocket) use `TransactionSummary`. Stream protocols (TCP, UDP, DTLS) use `StreamTransactionSummary`.
 
 #### TransactionSummary Fields (HTTP / gRPC / WebSocket)
 
