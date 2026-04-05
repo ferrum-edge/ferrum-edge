@@ -5,8 +5,8 @@
 //! X.509 certificate signature verification, optional SAML assertion
 //! validation, timestamp freshness checks, and nonce replay protection.
 //!
-//! Runs in `before_proxy` with request body buffering. Priority 2100 places
-//! it after access_control but before body-level validators.
+//! Runs in `before_proxy` with request body buffering. Priority 1500 places
+//! it in the AuthN band after HMAC auth.
 
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
