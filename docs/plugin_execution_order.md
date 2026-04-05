@@ -268,11 +268,12 @@ Given all built-in plugins enabled, the execution order is:
 | 39 | `statsd_logging` | 9075 | log, on_stream_disconnect |
 | 40 | `http_logging` | 9100 | log, on_stream_disconnect |
 | 41 | `tcp_logging` | 9125 | log, on_stream_disconnect |
-| 42 | `loki_logging` | 9150 | log, on_stream_disconnect |
-| 43 | `udp_logging` | 9150 | log, on_stream_disconnect |
-| 44 | `ws_logging` | 9175 | log, on_stream_disconnect |
-| 45 | `transaction_debugger` | 9200 | on_request_received, after_proxy, log, on_stream_disconnect |
-| 46 | `prometheus_metrics` | 9300 | log, on_stream_disconnect |
+| 42 | `kafka_logging` | 9150 | log, on_stream_disconnect |
+| 43 | `loki_logging` | 9150 | log, on_stream_disconnect |
+| 44 | `udp_logging` | 9150 | log, on_stream_disconnect |
+| 45 | `ws_logging` | 9175 | log, on_stream_disconnect |
+| 46 | `transaction_debugger` | 9200 | on_request_received, after_proxy, log, on_stream_disconnect |
+| 47 | `prometheus_metrics` | 9300 | log, on_stream_disconnect |
 
 ## Why This Order Matters
 
@@ -464,6 +465,7 @@ TLS/DTLS are transport-layer concerns, not separate protocols. A plugin that sup
 | `correlation_id` | ✓ | ✓ | ✓ | ✓ | ✓ | ID assignment is protocol-agnostic |
 | `http_logging` | ✓ | ✓ | ✓ | ✓ | ✓ | Observability applies everywhere |
 | `tcp_logging` | ✓ | ✓ | ✓ | ✓ | ✓ | Observability applies everywhere |
+| `kafka_logging` | ✓ | ✓ | ✓ | ✓ | ✓ | Observability applies everywhere |
 | `udp_logging` | ✓ | ✓ | ✓ | ✓ | ✓ | Observability applies everywhere |
 | `ws_logging` | ✓ | ✓ | ✓ | ✓ | ✓ | Observability applies everywhere |
 | `transaction_debugger` | ✓ | ✓ | ✓ | ✓ | ✓ | Observability applies everywhere |

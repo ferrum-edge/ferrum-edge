@@ -696,6 +696,7 @@ paths:
                 - statsd_logging
                 - http_logging
                 - tcp_logging
+                - kafka_logging
                 - ws_logging
                 - transaction_debugger
                 - jwks_auth

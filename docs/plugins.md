@@ -1,6 +1,6 @@
 # Plugin Reference
 
-Ferrum Edge includes 46 built-in plugins organized into lifecycle phases. Each plugin executes at a specific priority (lower number = runs first).
+Ferrum Edge includes 47 built-in plugins organized into lifecycle phases. Each plugin executes at a specific priority (lower number = runs first).
 
 For execution order, protocol support matrix, and design rationale, see [plugin_execution_order.md](plugin_execution_order.md).
 
@@ -14,7 +14,7 @@ For execution order, protocol support matrix, and design rationale, see [plugin_
 6. **`on_response_body`** — Processes the raw buffered backend body before transforms (AI token metrics, AI rate limiter)
 7. **`transform_response_body`** — Rewrites the buffered response body (Response Transformer body rules)
 8. **`on_final_response_body`** — Validates or stores the final client-visible buffered body (Body Validator, Response Size Limiting, Response Caching)
-9. **`log`** — Logs the transaction summary (Stdout/HTTP Logging)
+9. **`log`** — Logs the transaction summary (Stdout/HTTP/Kafka Logging)
 10. **`on_ws_frame`** — Per-frame WebSocket hooks (Size Limiting, Rate Limiting, Frame Logging)
 
 ## Custom Plugins
@@ -488,7 +488,7 @@ config:
 
 ### Transaction Summary Reference
 
-All logging plugins (`stdout_logging`, `http_logging`, `tcp_logging`, `udp_logging`, `statsd_logging`, `loki_logging`) emit metrics from the same transaction structures. HTTP-family protocols (HTTP/1.1, HTTP/2, HTTP/3, gRPC, WebSocket) use `TransactionSummary`. Stream protocols (TCP, UDP, DTLS) use `StreamTransactionSummary`.
+All logging plugins (`stdout_logging`, `http_logging`, `tcp_logging`, `udp_logging`, `kafka_logging`, `statsd_logging`, `loki_logging`) emit metrics from the same transaction structures. HTTP-family protocols (HTTP/1.1, HTTP/2, HTTP/3, gRPC, WebSocket) use `TransactionSummary`. Stream protocols (TCP, UDP, DTLS) use `StreamTransactionSummary`.
 
 #### TransactionSummary Fields (HTTP / gRPC / WebSocket)
 

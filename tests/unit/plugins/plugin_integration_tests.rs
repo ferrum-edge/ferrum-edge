@@ -225,6 +225,7 @@ async fn test_all_plugins_available() {
         "udp_logging",
         "serverless_function",
         "request_mirror",
+        "kafka_logging",
     ]
     .into_iter()
     .collect();
@@ -261,6 +262,9 @@ async fn test_plugin_creation_all_plugins() {
             }
             "request_mirror" => json!({"mirror_host": "mirror.local"}),
             "udp_logging" => json!({"host": "127.0.0.1", "port": 9514}),
+            "kafka_logging" => {
+                json!({"broker_list": "localhost:9092", "topic": "test-logs"})
+            }
             _ => json!({}),
         };
         let plugin = create_plugin(plugin_name, &config);

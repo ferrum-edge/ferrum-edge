@@ -24,6 +24,8 @@ mod jwks_auth_tests;
 mod jwks_cache_tests;
 mod jwks_store_tests;
 mod jwt_auth_plugin_tests;
+#[cfg(feature = "kafka")]
+mod kafka_logging_tests;
 mod key_auth_tests;
 mod loki_logging_tests;
 mod mtls_auth_tests;

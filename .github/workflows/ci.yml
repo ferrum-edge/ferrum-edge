@@ -57,10 +57,10 @@ jobs:
         with:
           shared-key: "ci-test"
 
-      - name: Install protoc
+      - name: Install protoc and libcurl headers
         run: |
           sudo apt-get update
-          sudo apt-get install -y protobuf-compiler
+          sudo apt-get install -y protobuf-compiler libcurl4-openssl-dev
 
       - name: Run unit tests
         run: cargo test --test unit_tests --all-features
@@ -122,10 +122,10 @@ jobs:
         with:
           shared-key: "ci-lint"
 
-      - name: Install protoc
+      - name: Install protoc and libcurl headers
         run: |
           sudo apt-get update
-          sudo apt-get install -y protobuf-compiler
+          sudo apt-get install -y protobuf-compiler libcurl4-openssl-dev
 
       - name: Run clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
@@ -161,10 +161,10 @@ jobs:
         with:
           shared-key: "ci-perf"
 
-      - name: Install protoc and wrk
+      - name: Install protoc, wrk, and libcurl headers
         run: |
           sudo apt-get update
-          sudo apt-get install -y protobuf-compiler wrk
+          sudo apt-get install -y protobuf-compiler wrk libcurl4-openssl-dev
 
       - name: Restore performance baseline cache
         id: perf-cache
