@@ -1,6 +1,6 @@
 # Plugin Reference
 
-Ferrum Edge includes 44 built-in plugins organized into lifecycle phases. Each plugin executes at a specific priority (lower number = runs first).
+Ferrum Edge includes 45 built-in plugins organized into lifecycle phases. Each plugin executes at a specific priority (lower number = runs first).
 
 For execution order, protocol support matrix, and design rationale, see [plugin_execution_order.md](plugin_execution_order.md).
 
@@ -388,9 +388,58 @@ config:
 
 **Connection lifecycle:** The plugin establishes a persistent WebSocket connection on the first batch flush. If the connection drops, the plugin automatically reconnects on the next send attempt. Failed batches are retried up to `max_retries` times with `retry_delay_ms` between attempts. After exhausting retries, the batch is discarded and a warning is logged.
 
+### `tcp_logging`
+
+Sends transaction summaries as newline-delimited JSON (NDJSON) over a persistent TCP or TCP+TLS connection. Entries are buffered and flushed in batches, with automatic reconnection on failure. Ideal for shipping logs to Logstash, Fluentd, Vector, rsyslog, or any TCP-based log collector.
+
+**Priority:** 9125
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `host` | String | *(required)* | Hostname or IP of the TCP log receiver |
+| `port` | Integer | *(required)* | Port of the TCP log receiver (1–65535) |
+| `tls` | Boolean | `false` | Enable TLS encryption for the connection |
+| `tls_server_name` | String | *(none)* | SNI server name override for TLS (defaults to `host`) |
+| `batch_size` | Integer | `50` | Number of entries to buffer before sending a batch |
+| `flush_interval_ms` | Integer | `1000` | Max milliseconds before flushing a partial batch (min: 100) |
+| `max_retries` | Integer | `3` | Retry attempts on failed batch delivery |
+| `retry_delay_ms` | Integer | `1000` | Delay in milliseconds between retry attempts |
+| `buffer_capacity` | Integer | `10000` | Channel capacity — new entries are dropped when full |
+| `connect_timeout_ms` | Integer | `5000` | TCP connection timeout in milliseconds (min: 100) |
+
+Batches are flushed when `batch_size` is reached **or** `flush_interval_ms` elapses, whichever comes first. Each entry is serialized as a single JSON line followed by a newline (`\n`), making the output compatible with NDJSON/JSON Lines consumers.
+
+The TCP connection is persistent — it is reused across batches and automatically re-established on write failure or disconnect. TLS uses the gateway's global CA bundle (`FERRUM_TLS_CA_BUNDLE_PATH`) and skip-verify setting (`FERRUM_TLS_NO_VERIFY`).
+
+```yaml
+plugin_name: tcp_logging
+config:
+  host: "logstash.example.com"
+  port: 5140
+  tls: true
+  tls_server_name: "logstash.internal"
+  batch_size: 100
+  flush_interval_ms: 2000
+```
+
+#### Logstash Integration
+
+Configure a Logstash TCP input with JSON codec:
+
+```
+input {
+  tcp {
+    port => 5140
+    codec => json_lines
+  }
+}
+```
+
+For TLS, add `ssl_enable => true` with your certificate configuration to the Logstash TCP input.
+
 ### Transaction Summary Reference
 
-Both `stdout_logging`, `http_logging`, and `statsd_logging` emit metrics from the same transaction structures. HTTP-family protocols (HTTP/1.1, HTTP/2, HTTP/3, gRPC, WebSocket) use `TransactionSummary`. Stream protocols (TCP, UDP, DTLS) use `StreamTransactionSummary`. HTTP-family protocols (HTTP/1.1, HTTP/2, HTTP/3, gRPC, WebSocket) use `TransactionSummary`. Stream protocols (TCP, UDP, DTLS) use `StreamTransactionSummary`.
+All logging plugins (`stdout_logging`, `http_logging`, `tcp_logging`, `statsd_logging`, `loki_logging`) emit metrics from the same transaction structures. HTTP-family protocols (HTTP/1.1, HTTP/2, HTTP/3, gRPC, WebSocket) use `TransactionSummary`. Stream protocols (TCP, UDP, DTLS) use `StreamTransactionSummary`.
 
 #### TransactionSummary Fields (HTTP / gRPC / WebSocket)
 

@@ -185,6 +185,7 @@ async fn test_all_plugins_available() {
     let expected_builtins: BTreeSet<_> = [
         "stdout_logging",
         "http_logging",
+        "tcp_logging",
         "transaction_debugger",
         "jwks_auth",
         "jwt_auth",
@@ -244,6 +245,7 @@ async fn test_plugin_creation_all_plugins() {
         // Some plugins now require specific config fields
         let config = match plugin_name {
             "http_logging" => json!({"endpoint_url": "http://localhost:9200/logs"}),
+            "tcp_logging" => json!({"host": "localhost", "port": 5140}),
             "ws_logging" => json!({"endpoint_url": "ws://localhost:9300/logs"}),
             "otel_tracing" => json!({"endpoint": "http://localhost:4318/v1/traces"}),
             "jwks_auth" => {

@@ -347,7 +347,7 @@ Extensible plugin architecture for authentication, authorization, and transforma
 - **Rate Limiting**: `rate_limiting`
 - **Transformation**: `request_transformer`, `response_transformer`, `request_termination`, `body_validator`, `graphql`
 - **Caching**: `response_caching`
-- **Observability**: `stdout_logging`, `http_logging`, `loki_logging`, `transaction_debugger`, `correlation_id`, `prometheus_metrics`, `otel_tracing`
+- **Observability**: `stdout_logging`, `http_logging`, `tcp_logging`, `loki_logging`, `transaction_debugger`, `correlation_id`, `prometheus_metrics`, `otel_tracing`
 
 **Plugin Lifecycle**:
 1. **Request Phase**: Authentication → Authorization → Rate Limiting

@@ -91,7 +91,7 @@ On startup, Ferrum Edge resolves all configured hostnames asynchronously before 
 
 - **Proxy backend hostnames** (`backend_host` on each proxy)
 - **Upstream target hostnames** (`host` on each upstream target, when [load balancing](load_balancing.md) is configured)
-- **Plugin endpoint hostnames** — extracted from plugin configurations (e.g., `http_logging` endpoint URLs, `jwks_auth` JWKS URIs)
+- **Plugin endpoint hostnames** — extracted from plugin configurations (e.g., `http_logging` endpoint URLs, `tcp_logging` host, `jwks_auth` JWKS URIs)
 
 Hostnames are **deduplicated** before resolution — if multiple proxies or plugins share the same hostname, only one DNS lookup is performed. Warmup remains parallel, but concurrency is bounded by `FERRUM_DNS_WARMUP_CONCURRENCY` to avoid unbounded task bursts on very large configs. This ensures no cold-cache DNS lookups on the first request, whether the proxy uses a single backend, a load-balanced upstream pool, or a plugin with an outbound endpoint.
 
@@ -103,7 +103,7 @@ All outbound HTTP clients (proxy traffic, health check probes, plugin outbound c
 
 - **No DNS in the hot path**: Hostname resolution is always served from the in-memory cache, never from the network.
 - **Per-proxy `dns_override`**: When a proxy has a static `dns_override` IP, it is applied as a `resolve()` hint on the HTTP client, taking priority over the DNS cache for that specific hostname.
-- **Unified caching**: Proxy backends, upstream targets, health check probes, and plugin outbound calls (http_logging, jwks_auth, etc.) all share the same DNS cache, benefiting from warmup and background refresh.
+- **Unified caching**: Proxy backends, upstream targets, health check probes, and plugin outbound calls (http_logging, tcp_logging, jwks_auth, etc.) all share the same DNS cache, benefiting from warmup and background refresh.
 
 Plugins declare their endpoint hostnames by implementing the `warmup_hostnames()` method on the `Plugin` trait. This allows the warmup phase to pre-resolve plugin endpoints alongside backend hostnames.
 

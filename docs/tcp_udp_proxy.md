@@ -310,6 +310,7 @@ Each plugin declares which protocols it supports via `supported_protocols()`. On
 | `correlation_id` | `on_stream_connect` | Assign request ID to connection metadata |
 | `stdout_logging` | `on_stream_disconnect` | Log connection summary as JSON |
 | `http_logging` | `on_stream_disconnect` | Send connection summary to HTTP endpoint |
+| `tcp_logging` | `on_stream_disconnect` | Send connection summary to TCP/TLS endpoint |
 | `transaction_debugger` | `on_stream_disconnect` | Log detailed connection debug info |
 | `prometheus_metrics` | `on_stream_disconnect` | Record connection metrics |
 | `otel_tracing` | `on_stream_disconnect` | Emit trace span for connection |

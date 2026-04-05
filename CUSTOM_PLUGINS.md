@@ -266,7 +266,7 @@ Plugins execute in priority order (lowest number first) within each lifecycle ph
 | Response Validation | 3400–3599 | Response size limits, caching | response_size_limiting (3490), response_caching (3500) |
 | Response Transform | 4000–4299 | Modify response, metrics | response_transformer (4000), ai_token_metrics (4100), ai_rate_limiter (4200) |
 | **Custom Default** | **5000** | **Default for custom plugins** | — |
-| Logging | 9000–9999 | Observability, metrics | stdout_logging (9000), ws_frame_logging (9050), http_logging (9100), loki_logging (9150), transaction_debugger (9200), prometheus (9300) |
+| Logging | 9000–9999 | Observability, metrics | stdout_logging (9000), ws_frame_logging (9050), statsd_logging (9075), http_logging (9100), tcp_logging (9125), loki_logging (9150), ws_logging (9175), transaction_debugger (9200), prometheus (9300) |
 
 To set a priority, override the `priority()` method:
 

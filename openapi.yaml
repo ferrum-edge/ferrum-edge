@@ -695,6 +695,7 @@ paths:
                 - stdout_logging
                 - statsd_logging
                 - http_logging
+                - tcp_logging
                 - ws_logging
                 - transaction_debugger
                 - jwks_auth
@@ -2614,13 +2615,28 @@ components:
           default: 10000
           description: Channel capacity — new entries are dropped when full
 
-    WsLoggingConfig:
+    TcpLoggingConfig:
       type: object
-      description: "Plugin: ws_logging — Sends transaction logs to a WebSocket endpoint in batches."
+      description: "Plugin: tcp_logging — Sends transaction logs as NDJSON over a persistent TCP or TCP+TLS connection."
+      required:
+        - host
+        - port
       properties:
-        endpoint_url:
+        host:
           type: string
-          description: WebSocket URL (ws:// or wss://) to send transaction logs to
+          description: Hostname or IP of the TCP log receiver
+        port:
+          type: integer
+          minimum: 1
+          maximum: 65535
+          description: Port of the TCP log receiver
+        tls:
+          type: boolean
+          default: false
+          description: Enable TLS encryption for the connection
+        tls_server_name:
+          type: string
+          description: SNI server name override for TLS (defaults to host)
         batch_size:
           type: integer
           default: 50
@@ -2638,10 +2654,44 @@ components:
           type: integer
           default: 1000
           description: Delay in milliseconds between retry attempts
+        buffer_capacity:
+          type: integer
+          default: 10000
+          description: Channel capacity — new entries are dropped when full
+        connect_timeout_ms:
+          type: integer
+          default: 5000
+          minimum: 100
+          description: TCP connection timeout in milliseconds
+
+    WsLoggingConfig:
+      type: object
+      description: "Plugin: ws_logging — Sends transaction logs to a WebSocket endpoint in batches."
+      properties:
+        endpoint_url:
+          type: string
+          description: WebSocket URL (ws:// or wss://) to send transaction logs to
         reconnect_delay_ms:
           type: integer
           default: 5000
           description: Delay in milliseconds before reconnecting after connection failure
+        batch_size:
+          type: integer
+          default: 50
+          description: Number of entries to buffer before sending a batch
+        flush_interval_ms:
+          type: integer
+          default: 1000
+          minimum: 100
+          description: Max milliseconds before flushing a partial batch
+        max_retries:
+          type: integer
+          default: 3
+          description: Retry attempts on failed batch delivery
+        retry_delay_ms:
+          type: integer
+          default: 1000
+          description: Delay in milliseconds between retry attempts
         buffer_capacity:
           type: integer
           default: 10000

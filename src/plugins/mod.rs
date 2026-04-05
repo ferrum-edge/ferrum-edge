@@ -1,4 +1,4 @@
-//! Plugin system — 44 built-in plugins with a trait-based architecture.
+//! Plugin system — 45 built-in plugins with a trait-based architecture.
 //!
 //! Plugins execute in priority order (lower number = runs first) through
 //! lifecycle phases: `on_request_received` → `authenticate` → `authorize` →
@@ -52,6 +52,7 @@ pub mod sse;
 pub mod statsd_logging;
 pub mod stdout_logging;
 pub mod tcp_connection_throttle;
+pub mod tcp_logging;
 pub mod transaction_debugger;
 pub mod udp_rate_limiting;
 pub mod utils;
@@ -579,6 +580,7 @@ pub mod priority {
     pub const STDOUT_LOGGING: u16 = 9000;
     pub const STATSD_LOGGING: u16 = 9075;
     pub const HTTP_LOGGING: u16 = 9100;
+    pub const TCP_LOGGING: u16 = 9125;
     pub const LOKI_LOGGING: u16 = 9150;
     pub const TRANSACTION_DEBUGGER: u16 = 9200;
     pub const PROMETHEUS_METRICS: u16 = 9300;
@@ -942,6 +944,10 @@ pub fn create_plugin_with_http_client(
         )?))),
         "http_logging" => Ok(Some(Arc::new(http_logging::HttpLogging::new(
             config,
+            http_client.clone(),
+        )?))),
+        "tcp_logging" => Ok(Some(Arc::new(tcp_logging::TcpLogging::new(
+            config,
             http_client,
         )?))),
         "ws_logging" => Ok(Some(Arc::new(ws_logging::WsLogging::new(
@@ -1077,6 +1083,7 @@ pub fn available_plugins() -> Vec<&'static str> {
     let mut plugins = vec![
         "stdout_logging",
         "http_logging",
+        "tcp_logging",
         "ws_logging",
         "transaction_debugger",
         "jwks_auth",

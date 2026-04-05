@@ -109,6 +109,7 @@ Body-aware `before_proxy` plugins such as `graphql`, request-side `body_validato
 | `stdout_logging` | | ✓ | JSON access log for stream connections |
 | `statsd_logging` | | ✓ | Sends stream connection metrics to StatsD over UDP |
 | `http_logging` | | ✓ | Sends stream connection logs to webhook endpoint |
+| `tcp_logging` | | ✓ | Sends stream connection logs to TCP/TLS endpoint |
 | `ws_logging` | | ✓ | Sends stream connection logs to WebSocket endpoint |
 | `prometheus_metrics` | | ✓ | Records `ferrum_stream_connections_total` counter and `ferrum_stream_duration_ms` histogram |
 | `transaction_debugger` | | ✓ | Prints debug info for stream connections |
@@ -217,7 +218,7 @@ Priority bands are spaced with gaps so future plugins can slot in without renumb
 | **Transform** | 3000–3999 | Request shaping and response buffering decisions | `request_transformer` (3000), `serverless_function` (3025), `grpc_deadline` (3050), `request_mirror` (3075), `response_size_limiting` (3490), `response_caching` (3500) |
 | **Response** | 4000–4999 | Response transformation, compression, and AI accounting | `response_transformer` (4000), `compression` (4050), `ai_token_metrics` (4100), `ai_rate_limiter` (4200) |
 | **Custom** | 5000 | Default for unrecognized/custom plugins | _(future plugins)_ |
-| **Logging** | 9000–9999 | Observability and frame logging | `stdout_logging` (9000), `ws_frame_logging` (9050), `statsd_logging` (9075), `http_logging` (9100), `loki_logging` (9150), `ws_logging` (9175), `transaction_debugger` (9200), `prometheus_metrics` (9300) |
+| **Logging** | 9000–9999 | Observability and frame logging | `stdout_logging` (9000), `ws_frame_logging` (9050), `statsd_logging` (9075), `http_logging` (9100), `tcp_logging` (9125), `loki_logging` (9150), `ws_logging` (9175), `transaction_debugger` (9200), `prometheus_metrics` (9300) |
 
 ## Complete Execution Order
 
@@ -265,10 +266,11 @@ Given all built-in plugins enabled, the execution order is:
 | 38 | `ws_frame_logging` | 9050 | on_ws_frame |
 | 39 | `statsd_logging` | 9075 | log, on_stream_disconnect |
 | 40 | `http_logging` | 9100 | log, on_stream_disconnect |
-| 41 | `loki_logging` | 9150 | log, on_stream_disconnect |
-| 42 | `ws_logging` | 9175 | log, on_stream_disconnect |
-| 43 | `transaction_debugger` | 9200 | on_request_received, after_proxy, log, on_stream_disconnect |
-| 44 | `prometheus_metrics` | 9300 | log, on_stream_disconnect |
+| 41 | `tcp_logging` | 9125 | log, on_stream_disconnect |
+| 42 | `loki_logging` | 9150 | log, on_stream_disconnect |
+| 43 | `ws_logging` | 9175 | log, on_stream_disconnect |
+| 44 | `transaction_debugger` | 9200 | on_request_received, after_proxy, log, on_stream_disconnect |
+| 45 | `prometheus_metrics` | 9300 | log, on_stream_disconnect |
 
 ## Why This Order Matters
 
@@ -333,7 +335,7 @@ The `compression` plugin runs at priority 4050 — after `response_transformer` 
 
 ### Logging runs last (9000+)
 
-Logging plugins run in phase 7 (`log`) which is fire-and-forget after the response is sent to the client. They are outside the hot path and do not affect request latency. Their relative ordering within the logging band (9000–9200) does not impact behavior.
+Logging plugins run in phase 7 (`log`) which is fire-and-forget after the response is sent to the client. They are outside the hot path and do not affect request latency. Their relative ordering within the logging band (9000–9300) does not impact behavior.
 
 All logging plugins receive the `TransactionSummary` struct which includes an `error_class` field for failed transactions. This field classifies gateway-level errors (e.g., `ConnectionTimeout`, `TlsError`, `DnsLookupError`) to help operators quickly identify root causes. See [docs/error_classification.md](error_classification.md) for the full list of error classes and debugging guidance.
 
@@ -459,6 +461,7 @@ TLS/DTLS are transport-layer concerns, not separate protocols. A plugin that sup
 | `statsd_logging` | ✓ | ✓ | ✓ | ✓ | ✓ | Observability applies everywhere |
 | `correlation_id` | ✓ | ✓ | ✓ | ✓ | ✓ | ID assignment is protocol-agnostic |
 | `http_logging` | ✓ | ✓ | ✓ | ✓ | ✓ | Observability applies everywhere |
+| `tcp_logging` | ✓ | ✓ | ✓ | ✓ | ✓ | Observability applies everywhere |
 | `ws_logging` | ✓ | ✓ | ✓ | ✓ | ✓ | Observability applies everywhere |
 | `transaction_debugger` | ✓ | ✓ | ✓ | ✓ | ✓ | Observability applies everywhere |
 | `prometheus_metrics` | ✓ | ✓ | ✓ | ✓ | ✓ | Metrics for all protocols |

@@ -8,7 +8,7 @@ When a backend request fails (connection error, timeout, TLS failure, etc.), the
 
 1. **Runs only on the error path** — successful requests never execute the classification logic, so there is zero hot-path overhead.
 2. **Is set in `BackendResponse`** — the proxy core classifies the error immediately when the backend call fails.
-3. **Flows to `TransactionSummary`** — all logging plugins (stdout, HTTP, Prometheus, OTel, transaction debugger) receive the `error_class` field automatically.
+3. **Flows to `TransactionSummary`** — all logging plugins (stdout, HTTP, TCP, Prometheus, OTel, transaction debugger) receive the `error_class` field automatically.
 4. **Is omitted when `None`** — successful transactions produce no extra JSON field (`#[serde(skip_serializing_if = "Option::is_none")]`).
 
 ## Error Classes

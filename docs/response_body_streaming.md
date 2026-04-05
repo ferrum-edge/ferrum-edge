@@ -116,6 +116,7 @@ All built-in plugins work with streaming mode because they only modify response 
 | `cors` | No (headers only) | No |
 | `stdout_logging` | No | No |
 | `http_logging` | No | No |
+| `tcp_logging` | No | No |
 | `transaction_debugger` | No | No |
 
 ## Interaction with Retry Logic
