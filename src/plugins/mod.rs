@@ -942,7 +942,7 @@ pub fn create_plugin_with_http_client(
     http_client: PluginHttpClient,
 ) -> Result<Option<Arc<dyn Plugin>>, String> {
     match name {
-        "stdout_logging" => Ok(Some(Arc::new(stdout_logging::StdoutLogging::new(config)))),
+        "stdout_logging" => Ok(Some(Arc::new(stdout_logging::StdoutLogging::new(config)?))),
         "statsd_logging" => Ok(Some(Arc::new(statsd_logging::StatsdLogging::new(
             config,
             http_client.clone(),
@@ -975,103 +975,117 @@ pub fn create_plugin_with_http_client(
                 .to_string(),
         ),
         "transaction_debugger" => Ok(Some(Arc::new(
-            transaction_debugger::TransactionDebugger::new(config),
+            transaction_debugger::TransactionDebugger::new(config)?,
         ))),
         "jwks_auth" => Ok(Some(Arc::new(jwks_auth::JwksAuth::new(
             config,
             http_client.clone(),
         )?))),
-        "jwt_auth" => Ok(Some(Arc::new(jwt_auth::JwtAuth::new(config)))),
-        "key_auth" => Ok(Some(Arc::new(key_auth::KeyAuth::new(config)))),
-        "basic_auth" => Ok(Some(Arc::new(basic_auth::BasicAuth::new(config)))),
-        "hmac_auth" => Ok(Some(Arc::new(hmac_auth::HmacAuth::new(config)))),
-        "mtls_auth" => Ok(Some(Arc::new(mtls_auth::MtlsAuth::new(config)))),
-        "compression" => Ok(Some(Arc::new(compression::CompressionPlugin::new(config)))),
-        "cors" => Ok(Some(Arc::new(cors::CorsPlugin::new(config)))),
+        "jwt_auth" => Ok(Some(Arc::new(jwt_auth::JwtAuth::new(config)?))),
+        "key_auth" => Ok(Some(Arc::new(key_auth::KeyAuth::new(config)?))),
+        "basic_auth" => Ok(Some(Arc::new(basic_auth::BasicAuth::new(config)?))),
+        "hmac_auth" => Ok(Some(Arc::new(hmac_auth::HmacAuth::new(config)?))),
+        "mtls_auth" => Ok(Some(Arc::new(mtls_auth::MtlsAuth::new(config)?))),
+        "compression" => Ok(Some(Arc::new(compression::CompressionPlugin::new(config)?))),
+        "cors" => Ok(Some(Arc::new(cors::CorsPlugin::new(config)?))),
         "access_control" => Ok(Some(Arc::new(access_control::AccessControl::new(config)?))),
         "tcp_connection_throttle" => Ok(Some(Arc::new(
             tcp_connection_throttle::TcpConnectionThrottle::new(config)?,
         ))),
         "ip_restriction" => Ok(Some(Arc::new(ip_restriction::IpRestriction::new(config)?))),
-        "bot_detection" => Ok(Some(Arc::new(bot_detection::BotDetection::new(config)))),
-        "correlation_id" => Ok(Some(Arc::new(correlation_id::CorrelationId::new(config)))),
+        "bot_detection" => Ok(Some(Arc::new(bot_detection::BotDetection::new(config)?))),
+        "correlation_id" => Ok(Some(Arc::new(correlation_id::CorrelationId::new(config)?))),
         "request_transformer" => Ok(Some(Arc::new(
-            request_transformer::RequestTransformer::new(config),
+            request_transformer::RequestTransformer::new(config)?,
         ))),
         "response_transformer" => Ok(Some(Arc::new(
-            response_transformer::ResponseTransformer::new(config),
+            response_transformer::ResponseTransformer::new(config)?,
         ))),
-        "sse" => Ok(Some(Arc::new(sse::SsePlugin::new(config)))),
-        "graphql" => Ok(Some(Arc::new(graphql::GraphqlPlugin::new(config)))),
+        "sse" => Ok(Some(Arc::new(sse::SsePlugin::new(config)?))),
+        "graphql" => Ok(Some(Arc::new(graphql::GraphqlPlugin::new(config)?))),
         "grpc_method_router" => Ok(Some(Arc::new(grpc_method_router::GrpcMethodRouter::new(
             config,
-        )))),
-        "grpc_deadline" => Ok(Some(Arc::new(grpc_deadline::GrpcDeadline::new(config)))),
-        "grpc_web" => Ok(Some(Arc::new(grpc_web::GrpcWebPlugin::new(config)))),
+        )?))),
+        "grpc_deadline" => Ok(Some(Arc::new(grpc_deadline::GrpcDeadline::new(config)?))),
+        "grpc_web" => Ok(Some(Arc::new(grpc_web::GrpcWebPlugin::new(config)?))),
         "rate_limiting" => Ok(Some(Arc::new(rate_limiting::RateLimiting::new(
             config,
             http_client.clone(),
-        )))),
+        )?))),
         "request_mirror" => Ok(Some(Arc::new(request_mirror::RequestMirror::new(
             config,
             http_client.clone(),
         )?))),
         "request_size_limiting" => Ok(Some(Arc::new(
-            request_size_limiting::RequestSizeLimiting::new(config),
+            request_size_limiting::RequestSizeLimiting::new(config)?,
         ))),
         "response_size_limiting" => Ok(Some(Arc::new(
-            response_size_limiting::ResponseSizeLimiting::new(config),
+            response_size_limiting::ResponseSizeLimiting::new(config)?,
         ))),
-        "body_validator" => Ok(Some(Arc::new(body_validator::BodyValidator::new(config)))),
+        "body_validator" => Ok(Some(Arc::new(body_validator::BodyValidator::new(config)?))),
         "request_termination" => Ok(Some(Arc::new(
-            request_termination::RequestTermination::new(config),
+            request_termination::RequestTermination::new(config)?,
         ))),
         "response_caching" => Ok(Some(Arc::new(response_caching::ResponseCaching::new(
             config,
-        )))),
+        )?))),
         "serverless_function" => Ok(Some(Arc::new(
             serverless_function::ServerlessFunction::new(config, http_client)?,
         ))),
         "prometheus_metrics" => Ok(Some(Arc::new(prometheus_metrics::PrometheusMetrics::new(
             config,
-        )))),
+        )?))),
         "otel_tracing" => Ok(Some(Arc::new(
             otel_tracing::OtelTracing::new_with_http_client(config, http_client)?,
         ))),
         "ai_token_metrics" => Ok(Some(Arc::new(ai_token_metrics::AiTokenMetrics::new(
             config,
-        )))),
+        )?))),
         "ai_request_guard" => Ok(Some(Arc::new(ai_request_guard::AiRequestGuard::new(
             config,
-        )))),
+        )?))),
         "ai_rate_limiter" => Ok(Some(Arc::new(ai_rate_limiter::AiRateLimiter::new(
             config,
             http_client.clone(),
-        )))),
+        )?))),
         "ai_prompt_shield" => Ok(Some(Arc::new(ai_prompt_shield::AiPromptShield::new(
             config,
-        )))),
+        )?))),
         "ws_message_size_limiting" => Ok(Some(Arc::new(
-            ws_message_size_limiting::WsMessageSizeLimiting::new(config),
+            ws_message_size_limiting::WsMessageSizeLimiting::new(config)?,
         ))),
         "ws_frame_logging" => Ok(Some(Arc::new(ws_frame_logging::WsFrameLogging::new(
             config,
-        )))),
+        )?))),
         "ws_rate_limiting" => Ok(Some(Arc::new(ws_rate_limiting::WsRateLimiting::new(
             config,
             http_client.clone(),
-        )))),
+        )?))),
         "udp_rate_limiting" => Ok(Some(Arc::new(udp_rate_limiting::UdpRateLimiting::new(
             config,
         )?))),
         _ => {
             // Fall through to custom plugins registry
-            let result = crate::custom_plugins::create_custom_plugin(name, config, http_client);
+            let result = crate::custom_plugins::create_custom_plugin(name, config, http_client)?;
             if result.is_none() {
                 tracing::warn!("Unknown plugin: {}", name);
             }
             Ok(result)
         }
+    }
+}
+
+/// Validate a plugin configuration by attempting to instantiate the plugin.
+///
+/// This is a lightweight validation entry point for use by file_loader and db_loader.
+/// The plugin instance is created and immediately dropped — only the config validation
+/// side effects of the plugin's `new()` constructor matter.
+///
+/// Returns `Ok(())` if the config is valid, `Err(msg)` if validation fails.
+pub fn validate_plugin_config(name: &str, config: &Value) -> Result<(), String> {
+    match create_plugin(name, config)? {
+        Some(_) => Ok(()),
+        None => Err(format!("Unknown plugin name '{}'", name)),
     }
 }
 

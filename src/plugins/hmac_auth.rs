@@ -30,10 +30,10 @@ pub struct HmacAuth {
 }
 
 impl HmacAuth {
-    pub fn new(config: &Value) -> Self {
+    pub fn new(config: &Value) -> Result<Self, String> {
         let clock_skew_seconds = config["clock_skew_seconds"].as_u64().unwrap_or(300);
 
-        Self { clock_skew_seconds }
+        Ok(Self { clock_skew_seconds })
     }
 
     fn compute_hmac(secret: &[u8], data: &[u8], algorithm: &str) -> Option<Vec<u8>> {

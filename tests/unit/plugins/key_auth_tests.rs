@@ -13,14 +13,14 @@ async fn test_key_auth_plugin_creation() {
     let config = json!({
         "key_location": "header:X-API-Key"
     });
-    let plugin = KeyAuth::new(&config);
+    let plugin = KeyAuth::new(&config).unwrap();
     assert_eq!(plugin.name(), "key_auth");
 }
 
 #[tokio::test]
 async fn test_key_auth_plugin_default_config() {
     let config = json!({});
-    let plugin = KeyAuth::new(&config);
+    let plugin = KeyAuth::new(&config).unwrap();
     assert_eq!(plugin.name(), "key_auth");
 }
 
@@ -29,7 +29,7 @@ async fn test_key_auth_plugin_successful_auth() {
     let config = json!({
         "key_location": "header:X-API-Key"
     });
-    let plugin = KeyAuth::new(&config);
+    let plugin = KeyAuth::new(&config).unwrap();
 
     let consumer = create_test_consumer();
     let consumer_index = ConsumerIndex::new(&[consumer]);
@@ -50,7 +50,7 @@ async fn test_key_auth_plugin_missing_key() {
     let config = json!({
         "key_location": "header:X-API-Key"
     });
-    let plugin = KeyAuth::new(&config);
+    let plugin = KeyAuth::new(&config).unwrap();
 
     let consumer = create_test_consumer();
     let consumer_index = ConsumerIndex::new(&[consumer]);
@@ -68,7 +68,7 @@ async fn test_key_auth_plugin_invalid_key() {
     let config = json!({
         "key_location": "header:X-API-Key"
     });
-    let plugin = KeyAuth::new(&config);
+    let plugin = KeyAuth::new(&config).unwrap();
 
     let consumer = create_test_consumer();
     let consumer_index = ConsumerIndex::new(&[consumer]);
@@ -88,7 +88,7 @@ async fn test_key_auth_plugin_query_parameter() {
     let config = json!({
         "key_location": "query:api_key"
     });
-    let plugin = KeyAuth::new(&config);
+    let plugin = KeyAuth::new(&config).unwrap();
 
     let consumer = create_test_consumer();
     let consumer_index = ConsumerIndex::new(&[consumer]);
@@ -112,7 +112,7 @@ async fn test_key_auth_empty_key_in_header_is_rejected() {
     let config = json!({
         "key_location": "header:X-API-Key"
     });
-    let plugin = KeyAuth::new(&config);
+    let plugin = KeyAuth::new(&config).unwrap();
 
     let consumer = create_test_consumer();
     let consumer_index = ConsumerIndex::new(&[consumer]);
@@ -130,7 +130,7 @@ async fn test_key_auth_whitespace_key_is_rejected() {
     let config = json!({
         "key_location": "header:X-API-Key"
     });
-    let plugin = KeyAuth::new(&config);
+    let plugin = KeyAuth::new(&config).unwrap();
 
     let consumer = create_test_consumer();
     let consumer_index = ConsumerIndex::new(&[consumer]);
@@ -149,7 +149,7 @@ async fn test_key_auth_case_insensitive_header_lookup() {
     let config = json!({
         "key_location": "header:X-API-Key"
     });
-    let plugin = KeyAuth::new(&config);
+    let plugin = KeyAuth::new(&config).unwrap();
 
     let consumer = create_test_consumer();
     let consumer_index = ConsumerIndex::new(&[consumer]);
@@ -171,7 +171,7 @@ async fn test_key_auth_missing_query_param() {
     let config = json!({
         "key_location": "query:apikey"
     });
-    let plugin = KeyAuth::new(&config);
+    let plugin = KeyAuth::new(&config).unwrap();
 
     let consumer = create_test_consumer();
     let consumer_index = ConsumerIndex::new(&[consumer]);
@@ -191,7 +191,7 @@ async fn test_key_auth_custom_header_name() {
     let config = json!({
         "key_location": "header:Authorization-Token"
     });
-    let plugin = KeyAuth::new(&config);
+    let plugin = KeyAuth::new(&config).unwrap();
 
     let consumer = create_test_consumer();
     let consumer_index = ConsumerIndex::new(&[consumer]);
@@ -212,7 +212,7 @@ async fn test_key_auth_multiple_consumers_correct_match() {
     let config = json!({
         "key_location": "header:X-API-Key"
     });
-    let plugin = KeyAuth::new(&config);
+    let plugin = KeyAuth::new(&config).unwrap();
 
     // Create two consumers with different keys
     let mut consumer1 = create_test_consumer();
@@ -262,7 +262,7 @@ async fn test_key_auth_fallback_default_header() {
     let config = json!({
         "key_location": "cookie:token"
     });
-    let plugin = KeyAuth::new(&config);
+    let plugin = KeyAuth::new(&config).unwrap();
 
     let consumer = create_test_consumer();
     let consumer_index = ConsumerIndex::new(&[consumer]);

@@ -41,7 +41,7 @@ fn make_cors_ctx(method: &str, origin: &str) -> RequestContext {
 
 #[tokio::test]
 async fn test_cors_plugin_creation_defaults() {
-    let plugin = CorsPlugin::new(&json!({}));
+    let plugin = CorsPlugin::new(&json!({})).unwrap();
     assert_eq!(plugin.name(), "cors");
 }
 
@@ -50,7 +50,8 @@ async fn test_cors_plugin_credentials_wildcard_conflict() {
     // allow_credentials with wildcard origins should disable credentials
     let plugin = CorsPlugin::new(&json!({
         "allow_credentials": true
-    }));
+    }))
+    .unwrap();
 
     // Verify via preflight: should NOT include access-control-allow-credentials
     let mut ctx = make_preflight_ctx("https://example.com", "GET");
@@ -73,7 +74,8 @@ async fn test_cors_plugin_credentials_with_specific_origins() {
     let plugin = CorsPlugin::new(&json!({
         "allowed_origins": ["https://app.example.com"],
         "allow_credentials": true
-    }));
+    }))
+    .unwrap();
 
     let mut ctx = make_preflight_ctx("https://app.example.com", "GET");
     let result = plugin.on_request_received(&mut ctx).await;
@@ -98,7 +100,8 @@ async fn test_cors_plugin_credentials_with_specific_origins() {
 async fn test_preflight_with_allowed_origin() {
     let plugin = CorsPlugin::new(&json!({
         "allowed_origins": ["https://example.com"]
-    }));
+    }))
+    .unwrap();
 
     let mut ctx = make_preflight_ctx("https://example.com", "GET");
     let result = plugin.on_request_received(&mut ctx).await;
@@ -123,7 +126,8 @@ async fn test_preflight_with_allowed_origin() {
 async fn test_preflight_with_disallowed_origin() {
     let plugin = CorsPlugin::new(&json!({
         "allowed_origins": ["https://example.com"]
-    }));
+    }))
+    .unwrap();
 
     let mut ctx = make_preflight_ctx("https://evil.com", "GET");
     let result = plugin.on_request_received(&mut ctx).await;
@@ -144,7 +148,7 @@ async fn test_preflight_with_disallowed_origin() {
 
 #[tokio::test]
 async fn test_preflight_with_wildcard_origins() {
-    let plugin = CorsPlugin::new(&json!({}));
+    let plugin = CorsPlugin::new(&json!({})).unwrap();
 
     let mut ctx = make_preflight_ctx("https://anything.example.com", "POST");
     let result = plugin.on_request_received(&mut ctx).await;
@@ -161,7 +165,8 @@ async fn test_preflight_includes_methods_and_headers() {
     let plugin = CorsPlugin::new(&json!({
         "allowed_methods": ["GET", "POST"],
         "allowed_headers": ["Authorization", "Content-Type"]
-    }));
+    }))
+    .unwrap();
 
     let mut ctx = make_preflight_ctx("https://example.com", "GET");
     let result = plugin.on_request_received(&mut ctx).await;
@@ -184,7 +189,8 @@ async fn test_preflight_includes_methods_and_headers() {
 async fn test_preflight_includes_max_age() {
     let plugin = CorsPlugin::new(&json!({
         "max_age": 3600
-    }));
+    }))
+    .unwrap();
 
     let mut ctx = make_preflight_ctx("https://example.com", "GET");
     let result = plugin.on_request_received(&mut ctx).await;
@@ -200,7 +206,8 @@ async fn test_preflight_includes_max_age() {
 async fn test_preflight_continue_passes_through() {
     let plugin = CorsPlugin::new(&json!({
         "preflight_continue": true
-    }));
+    }))
+    .unwrap();
 
     let mut ctx = make_preflight_ctx("https://example.com", "GET");
     let result = plugin.on_request_received(&mut ctx).await;
@@ -219,7 +226,8 @@ async fn test_preflight_continue_passes_through() {
 async fn test_preflight_disallowed_method() {
     let plugin = CorsPlugin::new(&json!({
         "allowed_methods": ["GET", "POST"]
-    }));
+    }))
+    .unwrap();
 
     let mut ctx = make_preflight_ctx("https://example.com", "DELETE");
     let result = plugin.on_request_received(&mut ctx).await;
@@ -242,7 +250,7 @@ async fn test_preflight_disallowed_method() {
 
 #[tokio::test]
 async fn test_non_options_with_origin_passes_through() {
-    let plugin = CorsPlugin::new(&json!({}));
+    let plugin = CorsPlugin::new(&json!({})).unwrap();
 
     let mut ctx = make_cors_ctx("GET", "https://example.com");
     let result = plugin.on_request_received(&mut ctx).await;
@@ -257,7 +265,8 @@ async fn test_non_options_with_origin_passes_through() {
 async fn test_non_preflight_disallowed_origin_returns_403() {
     let plugin = CorsPlugin::new(&json!({
         "allowed_origins": ["https://example.com"]
-    }));
+    }))
+    .unwrap();
 
     let mut ctx = make_cors_ctx("GET", "https://evil.com");
     let result = plugin.on_request_received(&mut ctx).await;
@@ -276,7 +285,8 @@ async fn test_non_preflight_disallowed_origin_returns_403() {
 async fn test_options_without_request_method_header_disallowed_origin_returns_403() {
     let plugin = CorsPlugin::new(&json!({
         "allowed_origins": ["https://example.com"]
-    }));
+    }))
+    .unwrap();
 
     // OPTIONS with Origin but WITHOUT Access-Control-Request-Method = not a preflight
     // Disallowed origin should still get rejected
@@ -302,7 +312,7 @@ async fn test_options_without_request_method_header_disallowed_origin_returns_40
 
 #[tokio::test]
 async fn test_options_without_request_method_header_allowed_origin_passes_through() {
-    let plugin = CorsPlugin::new(&json!({}));
+    let plugin = CorsPlugin::new(&json!({})).unwrap();
 
     // OPTIONS with Origin but WITHOUT Access-Control-Request-Method = not a preflight
     // Allowed origin should pass through
@@ -327,7 +337,8 @@ async fn test_options_without_request_method_header_allowed_origin_passes_throug
 async fn test_actual_cors_request_adds_headers() {
     let plugin = CorsPlugin::new(&json!({
         "allowed_origins": ["https://example.com"]
-    }));
+    }))
+    .unwrap();
 
     // Simulate on_request_received setting metadata
     let mut ctx = make_cors_ctx("GET", "https://example.com");
@@ -350,7 +361,8 @@ async fn test_actual_cors_request_with_credentials() {
     let plugin = CorsPlugin::new(&json!({
         "allowed_origins": ["https://example.com"],
         "allow_credentials": true
-    }));
+    }))
+    .unwrap();
 
     let mut ctx = make_cors_ctx("GET", "https://example.com");
     let _ = plugin.on_request_received(&mut ctx).await;
@@ -371,7 +383,8 @@ async fn test_actual_cors_request_with_credentials() {
 async fn test_actual_cors_request_with_exposed_headers() {
     let plugin = CorsPlugin::new(&json!({
         "exposed_headers": ["X-Request-ID", "X-RateLimit-Remaining"]
-    }));
+    }))
+    .unwrap();
 
     let mut ctx = make_cors_ctx("GET", "https://example.com");
     let _ = plugin.on_request_received(&mut ctx).await;
@@ -390,7 +403,7 @@ async fn test_actual_cors_request_with_exposed_headers() {
 
 #[tokio::test]
 async fn test_non_cors_request_no_headers_added() {
-    let plugin = CorsPlugin::new(&json!({}));
+    let plugin = CorsPlugin::new(&json!({})).unwrap();
 
     // No Origin header
     let mut ctx = make_ctx();
@@ -412,7 +425,8 @@ async fn test_non_cors_request_no_headers_added() {
 async fn test_vary_header_set_for_specific_origins() {
     let plugin = CorsPlugin::new(&json!({
         "allowed_origins": ["https://example.com"]
-    }));
+    }))
+    .unwrap();
 
     let mut ctx = make_cors_ctx("GET", "https://example.com");
     let _ = plugin.on_request_received(&mut ctx).await;
@@ -426,7 +440,7 @@ async fn test_vary_header_set_for_specific_origins() {
 
 #[tokio::test]
 async fn test_vary_header_set_for_wildcard() {
-    let plugin = CorsPlugin::new(&json!({}));
+    let plugin = CorsPlugin::new(&json!({})).unwrap();
 
     let mut ctx = make_cors_ctx("GET", "https://example.com");
     let _ = plugin.on_request_received(&mut ctx).await;
@@ -444,7 +458,8 @@ async fn test_vary_header_set_for_wildcard() {
 async fn test_empty_origin_header_returns_403() {
     let plugin = CorsPlugin::new(&json!({
         "allowed_origins": ["https://example.com"]
-    }));
+    }))
+    .unwrap();
 
     let mut ctx = make_cors_ctx("GET", "");
     let result = plugin.on_request_received(&mut ctx).await;
@@ -463,7 +478,8 @@ async fn test_empty_origin_header_returns_403() {
 async fn test_case_sensitivity_of_origins() {
     let plugin = CorsPlugin::new(&json!({
         "allowed_origins": ["https://example.com"]
-    }));
+    }))
+    .unwrap();
 
     // Origins are compared case-insensitively — mismatched case should be allowed
     let mut ctx = make_cors_ctx("GET", "https://Example.com");
@@ -482,7 +498,8 @@ async fn test_case_sensitivity_of_origins() {
 async fn test_multiple_origins_in_config() {
     let plugin = CorsPlugin::new(&json!({
         "allowed_origins": ["https://app.example.com", "https://admin.example.com"]
-    }));
+    }))
+    .unwrap();
 
     // First origin — allowed
     let mut ctx1 = make_cors_ctx("GET", "https://app.example.com");
@@ -522,7 +539,8 @@ async fn test_multiple_origins_in_config() {
 async fn test_wildcard_subdomain_origin_matches() {
     let plugin = CorsPlugin::new(&json!({
         "allowed_origins": ["*.company.com"]
-    }));
+    }))
+    .unwrap();
 
     let mut ctx = make_cors_ctx("GET", "https://app.company.com");
     let result = plugin.on_request_received(&mut ctx).await;
@@ -540,7 +558,8 @@ async fn test_wildcard_subdomain_origin_matches() {
 async fn test_wildcard_subdomain_deep_subdomain_matches() {
     let plugin = CorsPlugin::new(&json!({
         "allowed_origins": ["*.company.com"]
-    }));
+    }))
+    .unwrap();
 
     let mut ctx = make_cors_ctx("GET", "https://deep.sub.company.com");
     let result = plugin.on_request_received(&mut ctx).await;
@@ -554,7 +573,8 @@ async fn test_wildcard_subdomain_deep_subdomain_matches() {
 async fn test_wildcard_subdomain_rejects_non_match() {
     let plugin = CorsPlugin::new(&json!({
         "allowed_origins": ["*.company.com"]
-    }));
+    }))
+    .unwrap();
 
     let mut ctx = make_cors_ctx("GET", "https://evil.com");
     let result = plugin.on_request_received(&mut ctx).await;
@@ -573,7 +593,8 @@ async fn test_wildcard_subdomain_rejects_non_match() {
 async fn test_wildcard_subdomain_does_not_match_bare_domain() {
     let plugin = CorsPlugin::new(&json!({
         "allowed_origins": ["*.company.com"]
-    }));
+    }))
+    .unwrap();
 
     // "company.com" has no subdomain prefix, so it should NOT match "*.company.com"
     let mut ctx = make_cors_ctx("GET", "https://company.com");
@@ -593,7 +614,8 @@ async fn test_wildcard_subdomain_does_not_match_bare_domain() {
 async fn test_wildcard_subdomain_case_insensitive() {
     let plugin = CorsPlugin::new(&json!({
         "allowed_origins": ["*.Company.Com"]
-    }));
+    }))
+    .unwrap();
 
     let mut ctx = make_cors_ctx("GET", "https://APP.COMPANY.COM");
     let result = plugin.on_request_received(&mut ctx).await;
@@ -607,7 +629,8 @@ async fn test_wildcard_subdomain_case_insensitive() {
 async fn test_mixed_exact_and_wildcard_origins() {
     let plugin = CorsPlugin::new(&json!({
         "allowed_origins": ["https://exact.com", "*.company.com"]
-    }));
+    }))
+    .unwrap();
 
     // Exact match
     let mut ctx1 = make_cors_ctx("GET", "https://exact.com");
@@ -645,7 +668,8 @@ async fn test_star_in_list_with_other_origins_becomes_wildcard() {
     // If "*" appears anywhere in the list, treat the whole config as Wildcard
     let plugin = CorsPlugin::new(&json!({
         "allowed_origins": ["*", "https://specific.com"]
-    }));
+    }))
+    .unwrap();
 
     let mut ctx = make_cors_ctx("GET", "https://anything.example.com");
     let result = plugin.on_request_received(&mut ctx).await;
@@ -659,7 +683,8 @@ async fn test_star_in_list_with_other_origins_becomes_wildcard() {
 async fn test_wildcard_subdomain_preflight() {
     let plugin = CorsPlugin::new(&json!({
         "allowed_origins": ["*.company.com"]
-    }));
+    }))
+    .unwrap();
 
     let mut ctx = make_preflight_ctx("https://app.company.com", "POST");
     let result = plugin.on_request_received(&mut ctx).await;
@@ -684,7 +709,8 @@ async fn test_wildcard_subdomain_preflight() {
 async fn test_wildcard_subdomain_reflects_origin_in_response() {
     let plugin = CorsPlugin::new(&json!({
         "allowed_origins": ["*.company.com"]
-    }));
+    }))
+    .unwrap();
 
     let mut ctx = make_cors_ctx("GET", "https://app.company.com");
     let _ = plugin.on_request_received(&mut ctx).await;
@@ -704,7 +730,8 @@ async fn test_wildcard_subdomain_reflects_origin_in_response() {
 async fn test_wildcard_subdomain_with_port() {
     let plugin = CorsPlugin::new(&json!({
         "allowed_origins": ["*.company.com"]
-    }));
+    }))
+    .unwrap();
 
     let mut ctx = make_cors_ctx("GET", "https://app.company.com:8443");
     let result = plugin.on_request_received(&mut ctx).await;

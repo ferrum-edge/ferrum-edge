@@ -29,16 +29,17 @@ pub struct RequestSizeLimiting {
 }
 
 impl RequestSizeLimiting {
-    pub fn new(config: &Value) -> Self {
+    pub fn new(config: &Value) -> Result<Self, String> {
         let max_bytes = config["max_bytes"].as_u64().unwrap_or(0);
 
         if max_bytes == 0 {
-            tracing::warn!(
-                "request_size_limiting: 'max_bytes' not configured or zero — plugin will have no effect"
+            return Err(
+                "request_size_limiting: 'max_bytes' is required and must be greater than zero"
+                    .to_string(),
             );
         }
 
-        Self { max_bytes }
+        Ok(Self { max_bytes })
     }
 }
 

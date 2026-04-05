@@ -29,7 +29,8 @@ fn openai_response(prompt: u64, completion: u64) -> Vec<u8> {
 
 #[tokio::test]
 async fn test_plugin_name_and_priority() {
-    let plugin = AiRateLimiter::new(&json!({"token_limit": 1000}), PluginHttpClient::default());
+    let plugin =
+        AiRateLimiter::new(&json!({"token_limit": 1000}), PluginHttpClient::default()).unwrap();
     assert_eq!(plugin.name(), "ai_rate_limiter");
     assert_eq!(plugin.priority(), 4200);
     assert!(plugin.requires_response_body_buffering());
@@ -42,7 +43,8 @@ async fn test_first_request_passes() {
     let plugin = AiRateLimiter::new(
         &json!({"token_limit": 1000, "window_seconds": 60}),
         PluginHttpClient::default(),
-    );
+    )
+    .unwrap();
     let mut ctx = create_test_context();
     let mut headers = HashMap::new();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
@@ -59,7 +61,8 @@ async fn test_provider_is_case_insensitive() {
             "provider": " OpenAI "
         }),
         PluginHttpClient::default(),
-    );
+    )
+    .unwrap();
     let resp_headers = json_headers();
 
     let mut ctx = create_test_context();
@@ -88,7 +91,8 @@ async fn test_token_accumulation_and_limit() {
             "limit_by": "ip"
         }),
         PluginHttpClient::default(),
-    );
+    )
+    .unwrap();
 
     // First request passes
     let mut ctx = create_test_context();
@@ -131,7 +135,8 @@ async fn test_sliding_window_eviction() {
             "limit_by": "ip"
         }),
         PluginHttpClient::default(),
-    );
+    )
+    .unwrap();
 
     // Use up the limit
     let mut ctx = create_test_context();
@@ -172,7 +177,8 @@ async fn test_different_consumers_independent() {
             "limit_by": "consumer"
         }),
         PluginHttpClient::default(),
-    );
+    )
+    .unwrap();
     let resp_headers = json_headers();
 
     // Consumer A uses 150 tokens
@@ -214,7 +220,8 @@ async fn test_count_mode_prompt_tokens() {
             "limit_by": "ip"
         }),
         PluginHttpClient::default(),
-    );
+    )
+    .unwrap();
     let resp_headers = json_headers();
 
     let mut ctx = create_test_context();
@@ -243,7 +250,8 @@ async fn test_count_mode_completion_tokens() {
             "limit_by": "ip"
         }),
         PluginHttpClient::default(),
-    );
+    )
+    .unwrap();
     let resp_headers = json_headers();
 
     let mut ctx = create_test_context();
@@ -273,7 +281,8 @@ async fn test_anthropic_format() {
             "limit_by": "ip"
         }),
         PluginHttpClient::default(),
-    );
+    )
+    .unwrap();
     let resp_headers = json_headers();
 
     let mut ctx = create_test_context();
@@ -306,7 +315,8 @@ async fn test_google_format() {
             "limit_by": "ip"
         }),
         PluginHttpClient::default(),
-    );
+    )
+    .unwrap();
     let resp_headers = json_headers();
 
     let mut ctx = create_test_context();
@@ -345,7 +355,8 @@ async fn test_non_json_response_not_counted() {
             "limit_by": "ip"
         }),
         PluginHttpClient::default(),
-    );
+    )
+    .unwrap();
 
     let mut ctx = create_test_context();
     let mut headers = HashMap::new();
@@ -372,7 +383,8 @@ async fn test_non_2xx_response_not_counted() {
             "limit_by": "ip"
         }),
         PluginHttpClient::default(),
-    );
+    )
+    .unwrap();
     let resp_headers = json_headers();
 
     let mut ctx = create_test_context();
@@ -400,7 +412,8 @@ async fn test_empty_body_not_counted() {
             "limit_by": "ip"
         }),
         PluginHttpClient::default(),
-    );
+    )
+    .unwrap();
     let resp_headers = json_headers();
 
     let mut ctx = create_test_context();
@@ -424,7 +437,8 @@ async fn test_zero_tokens_counted_but_no_usage() {
             "limit_by": "ip"
         }),
         PluginHttpClient::default(),
-    );
+    )
+    .unwrap();
     let resp_headers = json_headers();
 
     let mut ctx = create_test_context();
@@ -454,7 +468,8 @@ async fn test_expose_headers() {
             "expose_headers": true
         }),
         PluginHttpClient::default(),
-    );
+    )
+    .unwrap();
 
     let mut ctx = create_test_context();
     let mut headers = HashMap::new();
@@ -486,7 +501,8 @@ async fn test_expose_headers_on_rejection() {
             "expose_headers": true
         }),
         PluginHttpClient::default(),
-    );
+    )
+    .unwrap();
     let resp_headers = json_headers();
 
     // Record 100 tokens
@@ -525,7 +541,8 @@ async fn test_consumer_fallback_to_ip() {
             "limit_by": "consumer"
         }),
         PluginHttpClient::default(),
-    );
+    )
+    .unwrap();
     let resp_headers = json_headers();
 
     // No consumer set — should use IP as key
@@ -565,7 +582,8 @@ async fn test_reads_tokens_from_ai_token_metrics_metadata() {
             "limit_by": "ip"
         }),
         PluginHttpClient::default(),
-    );
+    )
+    .unwrap();
     let resp_headers = json_headers();
 
     let mut ctx = create_test_context();

@@ -65,7 +65,7 @@ fn make_stream_summary(proxy_id: &str, protocol: &str) -> StreamTransactionSumma
 #[tokio::test]
 async fn test_prometheus_plugin_creation() {
     let config = json!({});
-    let plugin = PrometheusMetrics::new(&config);
+    let plugin = PrometheusMetrics::new(&config).unwrap();
     assert_eq!(plugin.name(), "prometheus_metrics");
     assert_eq!(plugin.priority(), 9300);
 }
@@ -308,7 +308,7 @@ async fn test_histogram_multiple_observations() {
 async fn test_plugin_log_hook_records_metrics() {
     // Use a fresh registry via the plugin's log hook
     let config = json!({});
-    let plugin = PrometheusMetrics::new(&config);
+    let plugin = PrometheusMetrics::new(&config).unwrap();
 
     let summary = make_summary("log-hook-test", "DELETE", 204, 15.0, 10.0);
     plugin.log(&summary).await;

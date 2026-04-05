@@ -50,11 +50,11 @@ pub struct ExampleAuditPlugin {
 }
 
 impl ExampleAuditPlugin {
-    pub fn new(config: &Value) -> Self {
-        Self {
+    pub fn new(config: &Value) -> Result<Self, String> {
+        Ok(Self {
             log_request_headers: config["log_request_headers"].as_bool().unwrap_or(false),
             retention_days: config["retention_days"].as_u64().unwrap_or(90),
-        }
+        })
     }
 }
 
@@ -105,8 +105,12 @@ impl Plugin for ExampleAuditPlugin {
 }
 
 /// Factory function — called automatically by the build-script-generated registry.
-pub fn create_plugin(config: &Value, _http_client: PluginHttpClient) -> Option<Arc<dyn Plugin>> {
-    Some(Arc::new(ExampleAuditPlugin::new(config)))
+/// Must return `Result` so invalid configs are rejected at admission time.
+pub fn create_plugin(
+    config: &Value,
+    _http_client: PluginHttpClient,
+) -> Result<Option<Arc<dyn Plugin>>, String> {
+    Ok(Some(Arc::new(ExampleAuditPlugin::new(config)?)))
 }
 
 /// Database migrations for this plugin.

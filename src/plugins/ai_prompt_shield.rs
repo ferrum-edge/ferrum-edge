@@ -69,7 +69,7 @@ fn builtin_pattern(name: &str) -> Option<&'static str> {
 }
 
 impl AiPromptShield {
-    pub fn new(config: &Value) -> Self {
+    pub fn new(config: &Value) -> Result<Self, String> {
         let action = match config["action"].as_str().unwrap_or("reject") {
             "redact" => ShieldAction::Redact,
             "warn" => ShieldAction::Warn,
@@ -155,26 +155,26 @@ impl AiPromptShield {
                 match Regex::new(regex_str) {
                     Ok(regex) => patterns.push(PiiPattern { name, regex }),
                     Err(e) => {
-                        tracing::warn!(
+                        return Err(format!(
                             "ai_prompt_shield: failed to compile custom pattern '{}': {}",
-                            name,
-                            e,
-                        );
+                            name, e,
+                        ));
                     }
                 }
             }
         }
 
         if patterns.is_empty() {
-            tracing::warn!(
+            return Err(
                 "ai_prompt_shield: no valid patterns configured — plugin will have no effect"
+                    .to_string(),
             );
         }
 
         let needs_body_transform = action == ShieldAction::Redact;
         let requires_request_body = !patterns.is_empty();
 
-        Self {
+        Ok(Self {
             action,
             patterns,
             scan_mode,
@@ -183,7 +183,7 @@ impl AiPromptShield {
             max_scan_bytes,
             needs_body_transform,
             requires_request_body,
-        }
+        })
     }
 
     /// Extract text segments to scan from the request body.

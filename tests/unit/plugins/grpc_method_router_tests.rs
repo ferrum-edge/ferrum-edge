@@ -35,7 +35,7 @@ fn test_in_available_plugins() {
 
 #[test]
 fn test_supported_protocols() {
-    let config = json!({});
+    let config = json!({"deny_methods": ["/pkg.Svc/Blocked"]});
     let plugin = create_plugin("grpc_method_router", &config)
         .unwrap()
         .unwrap();
@@ -48,7 +48,7 @@ fn test_supported_protocols() {
 
 #[tokio::test]
 async fn test_metadata_populated_on_valid_path() {
-    let config = json!({});
+    let config = json!({"deny_methods": ["/blocked.Svc/Blocked"]});
     let plugin = create_plugin("grpc_method_router", &config)
         .unwrap()
         .unwrap();
@@ -70,7 +70,7 @@ async fn test_metadata_populated_on_valid_path() {
 
 #[tokio::test]
 async fn test_metadata_populated_simple_service() {
-    let config = json!({});
+    let config = json!({"deny_methods": ["/blocked.Svc/Blocked"]});
     let plugin = create_plugin("grpc_method_router", &config)
         .unwrap()
         .unwrap();
@@ -85,7 +85,7 @@ async fn test_metadata_populated_simple_service() {
 
 #[tokio::test]
 async fn test_invalid_path_no_metadata() {
-    let config = json!({});
+    let config = json!({"deny_methods": ["/blocked.Svc/Blocked"]});
     let plugin = create_plugin("grpc_method_router", &config)
         .unwrap()
         .unwrap();
@@ -100,7 +100,7 @@ async fn test_invalid_path_no_metadata() {
 
 #[tokio::test]
 async fn test_empty_path_no_metadata() {
-    let config = json!({});
+    let config = json!({"deny_methods": ["/blocked.Svc/Blocked"]});
     let plugin = create_plugin("grpc_method_router", &config)
         .unwrap()
         .unwrap();
@@ -114,7 +114,7 @@ async fn test_empty_path_no_metadata() {
 
 #[tokio::test]
 async fn test_path_with_extra_slashes_no_metadata() {
-    let config = json!({});
+    let config = json!({"deny_methods": ["/blocked.Svc/Blocked"]});
     let plugin = create_plugin("grpc_method_router", &config)
         .unwrap()
         .unwrap();
@@ -450,27 +450,20 @@ async fn test_tracked_keys_count() {
     assert_eq!(plugin.tracked_keys_count(), Some(1));
 }
 
-// ── Empty config passes everything ──
+// ── Empty config returns error ──
 
-#[tokio::test]
-async fn test_empty_config_passes_everything() {
-    let config = json!({});
-    let plugin = create_plugin("grpc_method_router", &config)
-        .unwrap()
-        .unwrap();
-
-    let mut ctx = create_grpc_context("/any.Service/AnyMethod");
-    let _ = plugin.on_request_received(&mut ctx).await;
-    let mut headers = HashMap::new();
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
-    assert_continue(result);
+#[test]
+fn test_empty_config_returns_error() {
+    let result = create_plugin("grpc_method_router", &json!({}));
+    let err = result.err().expect("Empty config should return Err");
+    assert!(err.contains("no rules configured"), "got: {err}");
 }
 
 // ── Path edge cases ──
 
 #[tokio::test]
 async fn test_path_without_leading_slash() {
-    let config = json!({});
+    let config = json!({"deny_methods": ["/blocked.Svc/Blocked"]});
     let plugin = create_plugin("grpc_method_router", &config)
         .unwrap()
         .unwrap();
@@ -485,7 +478,7 @@ async fn test_path_without_leading_slash() {
 
 #[tokio::test]
 async fn test_path_with_empty_method() {
-    let config = json!({});
+    let config = json!({"deny_methods": ["/blocked.Svc/Blocked"]});
     let plugin = create_plugin("grpc_method_router", &config)
         .unwrap()
         .unwrap();
@@ -500,7 +493,7 @@ async fn test_path_with_empty_method() {
 
 #[tokio::test]
 async fn test_path_with_empty_service() {
-    let config = json!({});
+    let config = json!({"deny_methods": ["/blocked.Svc/Blocked"]});
     let plugin = create_plugin("grpc_method_router", &config)
         .unwrap()
         .unwrap();

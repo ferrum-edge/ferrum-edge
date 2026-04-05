@@ -80,7 +80,7 @@ pub struct BodyValidator {
 }
 
 impl BodyValidator {
-    pub fn new(config: &Value) -> Self {
+    pub fn new(config: &Value) -> Result<Self, String> {
         let json_schema = config.get("json_schema").cloned();
 
         let required_fields: Vec<String> = config["required_fields"]
@@ -189,8 +189,9 @@ impl BodyValidator {
         let has_response_validation = has_json_xml_response || has_protobuf_response_validation;
 
         if !has_request_validation && !has_response_validation {
-            warn!(
+            return Err(
                 "body_validator: no validation rules configured — set 'json_schema', 'required_fields', 'validate_xml', 'required_xml_elements' (request), their 'response_*' equivalents, or 'protobuf_descriptor_path' with message types"
+                    .to_string(),
             );
         }
 
@@ -204,7 +205,7 @@ impl BodyValidator {
             collect_patterns(schema, &mut response_compiled_patterns);
         }
 
-        Self {
+        Ok(Self {
             json_schema,
             required_fields,
             validate_xml,
@@ -226,7 +227,7 @@ impl BodyValidator {
             has_response_validation,
             has_protobuf_request_validation,
             has_protobuf_response_validation,
-        }
+        })
     }
 
     fn validate_json_body(

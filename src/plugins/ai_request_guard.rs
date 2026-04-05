@@ -41,7 +41,7 @@ pub struct AiRequestGuard {
 }
 
 impl AiRequestGuard {
-    pub fn new(config: &Value) -> Self {
+    pub fn new(config: &Value) -> Result<Self, String> {
         let max_tokens_limit = config["max_tokens_limit"].as_u64();
         let enforce_max_tokens =
             if config["enforce_max_tokens"].as_str().unwrap_or("reject") == "clamp" {
@@ -109,7 +109,7 @@ impl AiRequestGuard {
             || block_system_prompts
             || !required_metadata_fields.is_empty();
 
-        Self {
+        Ok(Self {
             max_tokens_limit,
             enforce_max_tokens,
             default_max_tokens,
@@ -123,7 +123,7 @@ impl AiRequestGuard {
             required_metadata_fields,
             needs_body_transform,
             requires_request_body,
-        }
+        })
     }
 
     /// Validate the request body JSON. Returns Err with a rejection tuple on failure.

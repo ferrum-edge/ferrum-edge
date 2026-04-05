@@ -63,7 +63,7 @@ pub struct AiTokenMetrics {
 }
 
 impl AiTokenMetrics {
-    pub fn new(config: &Value) -> Self {
+    pub fn new(config: &Value) -> Result<Self, String> {
         let provider = config["provider"]
             .as_str()
             .map(str::trim)
@@ -79,14 +79,14 @@ impl AiTokenMetrics {
         let cost_per_prompt_token = config["cost_per_prompt_token"].as_f64();
         let cost_per_completion_token = config["cost_per_completion_token"].as_f64();
 
-        Self {
+        Ok(Self {
             provider,
             include_model,
             include_token_details,
             metadata_prefix,
             cost_per_prompt_token,
             cost_per_completion_token,
-        }
+        })
     }
 
     /// Auto-detect the provider from the JSON response structure.

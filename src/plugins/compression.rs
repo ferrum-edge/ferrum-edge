@@ -83,7 +83,7 @@ pub struct CompressionPlugin {
 }
 
 impl CompressionPlugin {
-    pub fn new(config: &Value) -> Self {
+    pub fn new(config: &Value) -> Result<Self, String> {
         let algorithms = config["algorithms"]
             .as_array()
             .map(|arr| {
@@ -137,10 +137,13 @@ impl CompressionPlugin {
             .unwrap_or(4);
 
         if algorithms.is_empty() {
-            warn!("compression: no algorithms configured — plugin will have no effect");
+            return Err(
+                "compression: no valid algorithms configured — plugin will have no effect"
+                    .to_string(),
+            );
         }
 
-        Self {
+        Ok(Self {
             config: CompressionConfig {
                 algorithms,
                 min_content_length,
@@ -152,7 +155,7 @@ impl CompressionPlugin {
                 gzip_level,
                 brotli_quality,
             },
-        }
+        })
     }
 
     /// Parse `Accept-Encoding` and select the best algorithm from our configured set.

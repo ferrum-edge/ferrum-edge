@@ -183,7 +183,7 @@ pub struct MtlsAuth {
 }
 
 impl MtlsAuth {
-    pub fn new(config: &Value) -> Self {
+    pub fn new(config: &Value) -> Result<Self, String> {
         let cert_field = config["cert_field"]
             .as_str()
             .and_then(CertField::from_str)
@@ -203,11 +203,11 @@ impl MtlsAuth {
             })
             .unwrap_or_default();
 
-        Self {
+        Ok(Self {
             cert_field,
             allowed_issuers,
             allowed_ca_fingerprints_sha256,
-        }
+        })
     }
 
     /// Returns true if any issuer/CA filtering is configured.

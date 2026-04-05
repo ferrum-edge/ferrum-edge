@@ -21,8 +21,8 @@ pub struct ExamplePlugin {
 }
 
 impl ExamplePlugin {
-    pub fn new(config: &Value) -> Self {
-        Self {
+    pub fn new(config: &Value) -> Result<Self, String> {
+        Ok(Self {
             // Read configuration from the plugin's JSON config.
             // In the gateway config, this would look like:
             //   { "plugin_name": "example_plugin", "config": { "header_value": "my-gateway" } }
@@ -30,7 +30,7 @@ impl ExamplePlugin {
                 .as_str()
                 .unwrap_or("ferrum-custom")
                 .to_string(),
-        }
+        })
     }
 }
 
@@ -120,10 +120,11 @@ impl Plugin for ExamplePlugin {
 
 /// Factory function — called automatically by the build-script-generated registry.
 /// The function name `create_plugin` and signature are the convention that every
-/// custom plugin file must follow.
+/// custom plugin file must follow. Must return `Result` so invalid configs are
+/// rejected at admission time (admin API, file mode startup, DB mode warnings).
 pub fn create_plugin(
     config: &Value,
     _http_client: PluginHttpClient,
-) -> Option<Arc<dyn Plugin>> {
-    Some(Arc::new(ExamplePlugin::new(config)))
+) -> Result<Option<Arc<dyn Plugin>>, String> {
+    Ok(Some(Arc::new(ExamplePlugin::new(config)?)))
 }

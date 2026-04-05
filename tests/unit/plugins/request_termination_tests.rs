@@ -22,7 +22,7 @@ fn make_ctx_with_header(method: &str, path: &str, header: &str, value: &str) -> 
 
 #[tokio::test]
 async fn test_creation_defaults() {
-    let plugin = RequestTermination::new(&json!({}));
+    let plugin = RequestTermination::new(&json!({})).unwrap();
     assert_eq!(plugin.name(), "request_termination");
     assert_eq!(
         plugin.priority(),
@@ -34,7 +34,7 @@ async fn test_creation_defaults() {
 
 #[tokio::test]
 async fn test_always_trigger_rejects() {
-    let plugin = RequestTermination::new(&json!({}));
+    let plugin = RequestTermination::new(&json!({})).unwrap();
     let mut ctx = make_ctx("GET", "/anything");
 
     let result = plugin.on_request_received(&mut ctx).await;
@@ -56,7 +56,8 @@ async fn test_always_trigger_rejects() {
 async fn test_custom_status_code() {
     let plugin = RequestTermination::new(&json!({
         "status_code": 418
-    }));
+    }))
+    .unwrap();
     let mut ctx = make_ctx("GET", "/");
 
     match plugin.on_request_received(&mut ctx).await {
@@ -74,7 +75,8 @@ async fn test_custom_status_code() {
 async fn test_invalid_status_code_falls_back_to_503() {
     let plugin = RequestTermination::new(&json!({
         "status_code": 999
-    }));
+    }))
+    .unwrap();
     let mut ctx = make_ctx("GET", "/");
 
     match plugin.on_request_received(&mut ctx).await {
@@ -89,7 +91,8 @@ async fn test_invalid_status_code_falls_back_to_503() {
 async fn test_status_code_zero_falls_back_to_503() {
     let plugin = RequestTermination::new(&json!({
         "status_code": 0
-    }));
+    }))
+    .unwrap();
     let mut ctx = make_ctx("GET", "/");
 
     match plugin.on_request_received(&mut ctx).await {
@@ -107,7 +110,8 @@ async fn test_custom_body() {
     let plugin = RequestTermination::new(&json!({
         "body": "Custom maintenance page",
         "content_type": "text/plain"
-    }));
+    }))
+    .unwrap();
     let mut ctx = make_ctx("GET", "/");
 
     match plugin.on_request_received(&mut ctx).await {
@@ -122,7 +126,8 @@ async fn test_custom_body() {
 async fn test_custom_message_in_json() {
     let plugin = RequestTermination::new(&json!({
         "message": "Under maintenance"
-    }));
+    }))
+    .unwrap();
     let mut ctx = make_ctx("GET", "/");
 
     match plugin.on_request_received(&mut ctx).await {
@@ -142,7 +147,8 @@ async fn test_custom_message_in_json() {
 async fn test_json_escaping_in_message() {
     let plugin = RequestTermination::new(&json!({
         "message": "Error: \"invalid\" request\\path"
-    }));
+    }))
+    .unwrap();
     let mut ctx = make_ctx("GET", "/");
 
     match plugin.on_request_received(&mut ctx).await {
@@ -160,7 +166,8 @@ async fn test_xml_response_body() {
     let plugin = RequestTermination::new(&json!({
         "content_type": "application/xml",
         "message": "Service down"
-    }));
+    }))
+    .unwrap();
     let mut ctx = make_ctx("GET", "/");
 
     match plugin.on_request_received(&mut ctx).await {
@@ -179,7 +186,8 @@ async fn test_xml_escaping() {
     let plugin = RequestTermination::new(&json!({
         "content_type": "text/xml",
         "message": "Error <b>bad</b> & \"quoted\""
-    }));
+    }))
+    .unwrap();
     let mut ctx = make_ctx("GET", "/");
 
     match plugin.on_request_received(&mut ctx).await {
@@ -197,7 +205,8 @@ async fn test_plain_text_response() {
     let plugin = RequestTermination::new(&json!({
         "content_type": "text/plain",
         "message": "Maintenance"
-    }));
+    }))
+    .unwrap();
     let mut ctx = make_ctx("GET", "/");
 
     match plugin.on_request_received(&mut ctx).await {
@@ -214,7 +223,8 @@ async fn test_plain_text_response() {
 async fn test_path_prefix_trigger_matches() {
     let plugin = RequestTermination::new(&json!({
         "trigger": { "path_prefix": "/admin" }
-    }));
+    }))
+    .unwrap();
 
     let mut ctx = make_ctx("GET", "/admin/settings");
     assert!(matches!(
@@ -227,7 +237,8 @@ async fn test_path_prefix_trigger_matches() {
 async fn test_path_prefix_trigger_no_match() {
     let plugin = RequestTermination::new(&json!({
         "trigger": { "path_prefix": "/admin" }
-    }));
+    }))
+    .unwrap();
 
     let mut ctx = make_ctx("GET", "/api/users");
     assert!(matches!(
@@ -240,7 +251,8 @@ async fn test_path_prefix_trigger_no_match() {
 async fn test_path_prefix_exact_match() {
     let plugin = RequestTermination::new(&json!({
         "trigger": { "path_prefix": "/maintenance" }
-    }));
+    }))
+    .unwrap();
 
     let mut ctx = make_ctx("GET", "/maintenance");
     assert!(matches!(
@@ -258,7 +270,8 @@ async fn test_header_trigger_matches() {
             "header": "X-Debug",
             "header_value": "true"
         }
-    }));
+    }))
+    .unwrap();
 
     let mut ctx = make_ctx_with_header("GET", "/", "x-debug", "true");
     assert!(matches!(
@@ -274,7 +287,8 @@ async fn test_header_trigger_value_mismatch() {
             "header": "X-Debug",
             "header_value": "true"
         }
-    }));
+    }))
+    .unwrap();
 
     let mut ctx = make_ctx_with_header("GET", "/", "x-debug", "false");
     assert!(matches!(
@@ -290,7 +304,8 @@ async fn test_header_trigger_missing_header() {
             "header": "X-Debug",
             "header_value": "true"
         }
-    }));
+    }))
+    .unwrap();
 
     let mut ctx = make_ctx("GET", "/");
     assert!(matches!(
@@ -306,7 +321,8 @@ async fn test_header_trigger_any_value() {
         "trigger": {
             "header": "X-Maintenance"
         }
-    }));
+    }))
+    .unwrap();
 
     let mut ctx = make_ctx_with_header("GET", "/", "x-maintenance", "anything");
     assert!(matches!(
@@ -320,7 +336,7 @@ async fn test_header_trigger_any_value() {
 #[tokio::test]
 async fn test_boundary_status_codes() {
     // Minimum valid status code
-    let plugin = RequestTermination::new(&json!({ "status_code": 100 }));
+    let plugin = RequestTermination::new(&json!({ "status_code": 100 })).unwrap();
     let mut ctx = make_ctx("GET", "/");
     match plugin.on_request_received(&mut ctx).await {
         PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 100),
@@ -328,7 +344,7 @@ async fn test_boundary_status_codes() {
     }
 
     // Maximum valid status code
-    let plugin = RequestTermination::new(&json!({ "status_code": 599 }));
+    let plugin = RequestTermination::new(&json!({ "status_code": 599 })).unwrap();
     let mut ctx = make_ctx("GET", "/");
     match plugin.on_request_received(&mut ctx).await {
         PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 599),
@@ -338,7 +354,7 @@ async fn test_boundary_status_codes() {
 
 #[tokio::test]
 async fn test_empty_message_uses_default() {
-    let plugin = RequestTermination::new(&json!({}));
+    let plugin = RequestTermination::new(&json!({})).unwrap();
     let mut ctx = make_ctx("GET", "/");
 
     match plugin.on_request_received(&mut ctx).await {

@@ -27,7 +27,7 @@ pub struct RequestTermination {
 }
 
 impl RequestTermination {
-    pub fn new(config: &Value) -> Self {
+    pub fn new(config: &Value) -> Result<Self, String> {
         let status_code = config["status_code"]
             .as_u64()
             .map(|c| c as u16)
@@ -55,13 +55,13 @@ impl RequestTermination {
             Trigger::Always
         };
 
-        Self {
+        Ok(Self {
             status_code,
             content_type,
             body,
             trigger,
             message,
-        }
+        })
     }
 
     fn build_response_body(&self) -> String {

@@ -80,7 +80,7 @@ pub struct GrpcMethodRouter {
 }
 
 impl GrpcMethodRouter {
-    pub fn new(config: &Value) -> Self {
+    pub fn new(config: &Value) -> Result<Self, String> {
         // Normalize method paths: strip leading '/' for consistent matching.
         // Users can configure either "/pkg.Svc/Method" or "pkg.Svc/Method".
         let allow_methods = config["allow_methods"].as_array().map(|arr| {
@@ -129,19 +129,20 @@ impl GrpcMethodRouter {
             allow_methods.is_some() || !deny_methods.is_empty() || !method_rate_limits.is_empty();
 
         if !has_any_config {
-            warn!(
+            return Err(
                 "grpc_method_router: no rules configured — set 'allow_methods', 'deny_methods', \
                  or 'method_rate_limits'"
+                    .to_string(),
             );
         }
 
-        Self {
+        Ok(Self {
             allow_methods,
             deny_methods,
             method_rate_limits,
             limit_by,
             state: Arc::new(DashMap::new()),
-        }
+        })
     }
 
     /// Evict entries with no recent activity to bound memory.

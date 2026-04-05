@@ -18,20 +18,20 @@ fn make_ctx() -> RequestContext {
 
 #[test]
 fn test_plugin_name() {
-    let plugin = CorrelationId::new(&json!({}));
+    let plugin = CorrelationId::new(&json!({})).unwrap();
     assert_eq!(plugin.name(), "correlation_id");
 }
 
 #[test]
 fn test_plugin_priority() {
-    let plugin = CorrelationId::new(&json!({}));
+    let plugin = CorrelationId::new(&json!({})).unwrap();
     assert_eq!(plugin.priority(), priority::CORRELATION_ID);
     assert_eq!(plugin.priority(), 50);
 }
 
 #[test]
 fn test_modifies_request_headers() {
-    let plugin = CorrelationId::new(&json!({}));
+    let plugin = CorrelationId::new(&json!({})).unwrap();
     assert!(plugin.modifies_request_headers());
 }
 
@@ -41,7 +41,7 @@ fn test_modifies_request_headers() {
 async fn test_default_config_uses_x_request_id_header() {
     // Default header_name should be "x-request-id" — verify by running the plugin
     // and checking that it inserts the correlation ID into the correct header
-    let plugin = CorrelationId::new(&json!({}));
+    let plugin = CorrelationId::new(&json!({})).unwrap();
     let mut ctx = make_ctx();
 
     let result = plugin.on_request_received(&mut ctx).await;
@@ -63,7 +63,7 @@ async fn test_default_config_uses_x_request_id_header() {
 
 #[tokio::test]
 async fn test_default_config_echo_downstream_enabled() {
-    let plugin = CorrelationId::new(&json!({}));
+    let plugin = CorrelationId::new(&json!({})).unwrap();
     let mut ctx = make_ctx();
 
     // Generate correlation ID
@@ -87,7 +87,7 @@ async fn test_default_config_echo_downstream_enabled() {
 
 #[tokio::test]
 async fn test_generates_uuid_when_no_correlation_id_present() {
-    let plugin = CorrelationId::new(&json!({}));
+    let plugin = CorrelationId::new(&json!({})).unwrap();
     let mut ctx = make_ctx();
 
     let result = plugin.on_request_received(&mut ctx).await;
@@ -108,7 +108,7 @@ async fn test_generates_uuid_when_no_correlation_id_present() {
 
 #[tokio::test]
 async fn test_generated_uuid_stored_in_metadata() {
-    let plugin = CorrelationId::new(&json!({}));
+    let plugin = CorrelationId::new(&json!({})).unwrap();
     let mut ctx = make_ctx();
 
     plugin.on_request_received(&mut ctx).await;
@@ -128,7 +128,7 @@ async fn test_generated_uuid_stored_in_metadata() {
 
 #[tokio::test]
 async fn test_preserves_existing_correlation_id() {
-    let plugin = CorrelationId::new(&json!({}));
+    let plugin = CorrelationId::new(&json!({})).unwrap();
     let mut ctx = make_ctx();
     ctx.headers
         .insert("x-request-id".to_string(), "my-custom-id-123".to_string());
@@ -150,7 +150,7 @@ async fn test_preserves_existing_correlation_id() {
 
 #[tokio::test]
 async fn test_preserves_existing_id_at_max_length() {
-    let plugin = CorrelationId::new(&json!({}));
+    let plugin = CorrelationId::new(&json!({})).unwrap();
     let mut ctx = make_ctx();
     let id_256_chars: String = "a".repeat(256);
     ctx.headers
@@ -170,7 +170,7 @@ async fn test_preserves_existing_id_at_max_length() {
 
 #[tokio::test]
 async fn test_replaces_oversized_correlation_id() {
-    let plugin = CorrelationId::new(&json!({}));
+    let plugin = CorrelationId::new(&json!({})).unwrap();
     let mut ctx = make_ctx();
     let oversized_id: String = "x".repeat(257);
     ctx.headers
@@ -190,7 +190,7 @@ async fn test_replaces_oversized_correlation_id() {
 
 #[tokio::test]
 async fn test_oversized_id_metadata_matches_replaced_header() {
-    let plugin = CorrelationId::new(&json!({}));
+    let plugin = CorrelationId::new(&json!({})).unwrap();
     let mut ctx = make_ctx();
     let oversized_id: String = "z".repeat(500);
     ctx.headers.insert("x-request-id".to_string(), oversized_id);
@@ -211,7 +211,8 @@ async fn test_oversized_id_metadata_matches_replaced_header() {
 async fn test_custom_header_name() {
     let plugin = CorrelationId::new(&json!({
         "header_name": "X-Correlation-ID"
-    }));
+    }))
+    .unwrap();
     let mut ctx = make_ctx();
 
     let result = plugin.on_request_received(&mut ctx).await;
@@ -232,7 +233,8 @@ async fn test_custom_header_name() {
 async fn test_custom_header_preserves_existing_value() {
     let plugin = CorrelationId::new(&json!({
         "header_name": "X-Trace-ID"
-    }));
+    }))
+    .unwrap();
     let mut ctx = make_ctx();
     ctx.headers
         .insert("x-trace-id".to_string(), "trace-abc-456".to_string());
@@ -250,7 +252,8 @@ async fn test_custom_header_preserves_existing_value() {
 async fn test_custom_header_echo_downstream() {
     let plugin = CorrelationId::new(&json!({
         "header_name": "X-My-Trace"
-    }));
+    }))
+    .unwrap();
     let mut ctx = make_ctx();
 
     plugin.on_request_received(&mut ctx).await;
@@ -276,7 +279,8 @@ async fn test_custom_header_echo_downstream() {
 async fn test_echo_downstream_enabled_adds_header_to_response() {
     let plugin = CorrelationId::new(&json!({
         "echo_downstream": true
-    }));
+    }))
+    .unwrap();
     let mut ctx = make_ctx();
 
     plugin.on_request_received(&mut ctx).await;
@@ -300,7 +304,8 @@ async fn test_echo_downstream_enabled_adds_header_to_response() {
 async fn test_echo_downstream_preserves_original_id() {
     let plugin = CorrelationId::new(&json!({
         "echo_downstream": true
-    }));
+    }))
+    .unwrap();
     let mut ctx = make_ctx();
     ctx.headers
         .insert("x-request-id".to_string(), "original-id-789".to_string());
@@ -325,7 +330,8 @@ async fn test_echo_downstream_preserves_original_id() {
 async fn test_echo_downstream_disabled_no_header_in_response() {
     let plugin = CorrelationId::new(&json!({
         "echo_downstream": false
-    }));
+    }))
+    .unwrap();
     let mut ctx = make_ctx();
 
     plugin.on_request_received(&mut ctx).await;
@@ -346,7 +352,8 @@ async fn test_echo_downstream_disabled_no_header_in_response() {
 async fn test_echo_downstream_disabled_still_stores_metadata() {
     let plugin = CorrelationId::new(&json!({
         "echo_downstream": false
-    }));
+    }))
+    .unwrap();
     let mut ctx = make_ctx();
 
     plugin.on_request_received(&mut ctx).await;
@@ -361,7 +368,7 @@ async fn test_echo_downstream_disabled_still_stores_metadata() {
 
 #[tokio::test]
 async fn test_metadata_request_id_set_for_downstream_plugins() {
-    let plugin = CorrelationId::new(&json!({}));
+    let plugin = CorrelationId::new(&json!({})).unwrap();
     let mut ctx = make_ctx();
 
     plugin.on_request_received(&mut ctx).await;
@@ -378,7 +385,7 @@ async fn test_metadata_request_id_set_for_downstream_plugins() {
 
 #[tokio::test]
 async fn test_before_proxy_propagates_correlation_id_to_outgoing_headers() {
-    let plugin = CorrelationId::new(&json!({}));
+    let plugin = CorrelationId::new(&json!({})).unwrap();
     let mut ctx = make_ctx();
 
     plugin.on_request_received(&mut ctx).await;
@@ -399,7 +406,8 @@ async fn test_before_proxy_propagates_correlation_id_to_outgoing_headers() {
 async fn test_before_proxy_uses_custom_header_name() {
     let plugin = CorrelationId::new(&json!({
         "header_name": "X-Req-Trace"
-    }));
+    }))
+    .unwrap();
     let mut ctx = make_ctx();
 
     plugin.on_request_received(&mut ctx).await;
@@ -417,7 +425,7 @@ async fn test_before_proxy_uses_custom_header_name() {
 
 #[tokio::test]
 async fn test_each_request_generates_unique_id() {
-    let plugin = CorrelationId::new(&json!({}));
+    let plugin = CorrelationId::new(&json!({})).unwrap();
 
     let mut ctx1 = make_ctx();
     let mut ctx2 = make_ctx();
@@ -438,7 +446,8 @@ async fn test_full_lifecycle_generate_propagate_echo() {
     let plugin = CorrelationId::new(&json!({
         "header_name": "X-Req-ID",
         "echo_downstream": true
-    }));
+    }))
+    .unwrap();
     let mut ctx = make_ctx();
 
     // Step 1: on_request_received generates ID

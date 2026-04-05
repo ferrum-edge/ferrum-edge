@@ -43,9 +43,11 @@ fn test_graphql_plugin_creation() {
 }
 
 #[test]
-fn test_graphql_empty_config_does_not_force_request_buffering() {
-    let plugin = create_plugin("graphql", &json!({})).unwrap().unwrap();
-    assert!(!plugin.requires_request_body_buffering());
+fn test_graphql_empty_config_returns_error() {
+    let result = create_plugin("graphql", &json!({}));
+    assert!(result.is_err(), "Empty config should return Err");
+    let err = result.err().unwrap();
+    assert!(err.contains("no protection rules configured"));
 }
 
 #[test]
@@ -169,7 +171,8 @@ async fn test_alias_exceeds_limit() {
 
 #[tokio::test]
 async fn test_introspection_allowed_by_default() {
-    let config = json!({});
+    // Use a minimal valid config so the plugin instantiates; introspection_allowed defaults to true
+    let config = json!({"max_depth": 10});
     let plugin = create_plugin("graphql", &config).unwrap().unwrap();
 
     let query = "{ __schema { types { name } } }";
@@ -486,16 +489,12 @@ async fn test_metadata_populated() {
 
 // ── Edge cases ──
 
-#[tokio::test]
-async fn test_empty_config_passes_everything() {
-    let config = json!({});
-    let plugin = create_plugin("graphql", &config).unwrap().unwrap();
-
-    let query = "{ deeply { nested { query { that { goes { very { deep } } } } } } }";
-    let mut ctx = create_graphql_context(query, None);
-    let mut headers = HashMap::new();
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
-    assert_continue(result);
+#[test]
+fn test_empty_config_returns_error_on_creation() {
+    let result = create_plugin("graphql", &json!({}));
+    assert!(result.is_err(), "Empty config should return Err");
+    let err = result.err().unwrap();
+    assert!(err.contains("no protection rules configured"));
 }
 
 #[tokio::test]

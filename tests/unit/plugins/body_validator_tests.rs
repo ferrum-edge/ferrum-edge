@@ -23,6 +23,7 @@ fn xml_plugin() -> BodyValidator {
     BodyValidator::new(&json!({
         "validate_xml": true
     }))
+    .unwrap()
 }
 
 fn xml_plugin_with_required(elements: Vec<&str>) -> BodyValidator {
@@ -30,24 +31,26 @@ fn xml_plugin_with_required(elements: Vec<&str>) -> BodyValidator {
         "validate_xml": true,
         "required_xml_elements": elements
     }))
+    .unwrap()
 }
 
 #[test]
 fn test_request_vs_response_buffering_flags_are_config_sensitive() {
-    let request_plugin = BodyValidator::new(&json!({"validate_xml": true}));
+    let request_plugin = BodyValidator::new(&json!({"validate_xml": true})).unwrap();
     assert!(request_plugin.requires_request_body_buffering());
     assert!(!request_plugin.requires_response_body_buffering());
 
     let response_only = BodyValidator::new(&json!({
         "response_required_fields": ["id"]
-    }));
+    }))
+    .unwrap();
     assert!(!response_only.requires_request_body_buffering());
     assert!(response_only.requires_response_body_buffering());
 }
 
 #[test]
 fn test_request_body_buffering_only_for_matching_request_methods_and_types() {
-    let plugin = BodyValidator::new(&json!({"validate_xml": true}));
+    let plugin = BodyValidator::new(&json!({"validate_xml": true})).unwrap();
 
     let xml_ctx = make_xml_ctx("<root/>");
     assert!(plugin.should_buffer_request_body(&xml_ctx));
@@ -67,7 +70,7 @@ fn test_request_body_buffering_only_for_matching_request_methods_and_types() {
 #[test]
 fn test_trait_object_dispatches_request_body_buffering_hooks() {
     let plugin: std::sync::Arc<dyn Plugin> =
-        std::sync::Arc::new(BodyValidator::new(&json!({"required_fields": ["name"]})));
+        std::sync::Arc::new(BodyValidator::new(&json!({"required_fields": ["name"]})).unwrap());
     let mut ctx = RequestContext::new(
         "127.0.0.1".to_string(),
         "POST".to_string(),
@@ -333,6 +336,7 @@ fn json_schema_plugin(schema: serde_json::Value) -> BodyValidator {
     BodyValidator::new(&serde_json::json!({
         "json_schema": schema
     }))
+    .unwrap()
 }
 
 // ─── Type validation ──────────────────────────────────────────────────
@@ -897,6 +901,7 @@ fn response_schema_plugin(schema: serde_json::Value) -> BodyValidator {
     BodyValidator::new(&serde_json::json!({
         "response_json_schema": schema
     }))
+    .unwrap()
 }
 
 // ─── requires_response_body_buffering ─────────────────────────────────
@@ -911,7 +916,8 @@ fn test_response_buffering_required_when_response_schema_configured() {
 fn test_response_buffering_required_when_response_required_fields() {
     let plugin = BodyValidator::new(&serde_json::json!({
         "response_required_fields": ["id"]
-    }));
+    }))
+    .unwrap();
     assert!(plugin.requires_response_body_buffering());
 }
 
@@ -919,7 +925,8 @@ fn test_response_buffering_required_when_response_required_fields() {
 fn test_response_buffering_not_required_when_only_request_validation() {
     let plugin = BodyValidator::new(&serde_json::json!({
         "json_schema": {"type": "object"}
-    }));
+    }))
+    .unwrap();
     assert!(!plugin.requires_response_body_buffering());
 }
 
@@ -1022,7 +1029,8 @@ async fn test_response_json_non_matching_content_type_skipped() {
 async fn test_response_required_fields_valid() {
     let plugin = BodyValidator::new(&serde_json::json!({
         "response_required_fields": ["status", "data"]
-    }));
+    }))
+    .unwrap();
     let mut ctx = make_response_ctx();
     let headers = response_json_headers();
     let body = br#"{"status": "ok", "data": []}"#;
@@ -1037,7 +1045,8 @@ async fn test_response_required_fields_valid() {
 async fn test_response_required_fields_missing() {
     let plugin = BodyValidator::new(&serde_json::json!({
         "response_required_fields": ["status", "data"]
-    }));
+    }))
+    .unwrap();
     let mut ctx = make_response_ctx();
     let headers = response_json_headers();
     let body = br#"{"status": "ok"}"#;
@@ -1055,7 +1064,8 @@ async fn test_response_required_fields_missing() {
 async fn test_response_xml_valid() {
     let plugin = BodyValidator::new(&serde_json::json!({
         "response_validate_xml": true
-    }));
+    }))
+    .unwrap();
     let mut ctx = make_response_ctx();
     let headers = response_xml_headers();
     let body = b"<root><item>text</item></root>";
@@ -1070,7 +1080,8 @@ async fn test_response_xml_valid() {
 async fn test_response_xml_invalid() {
     let plugin = BodyValidator::new(&serde_json::json!({
         "response_validate_xml": true
-    }));
+    }))
+    .unwrap();
     let mut ctx = make_response_ctx();
     let headers = response_xml_headers();
     let body = b"<root><item></root>";
@@ -1087,7 +1098,8 @@ async fn test_response_xml_required_elements() {
     let plugin = BodyValidator::new(&serde_json::json!({
         "response_validate_xml": true,
         "response_required_xml_elements": ["result"]
-    }));
+    }))
+    .unwrap();
     let mut ctx = make_response_ctx();
     let headers = response_xml_headers();
     let body = b"<root><data>text</data></root>";
@@ -1106,7 +1118,8 @@ async fn test_both_request_and_response_validation() {
     let plugin = BodyValidator::new(&serde_json::json!({
         "json_schema": {"type": "object", "required": ["action"]},
         "response_json_schema": {"type": "object", "required": ["result"]}
-    }));
+    }))
+    .unwrap();
 
     // Request validation still works
     let mut req_ctx = make_json_ctx(r#"{"action": "create"}"#);
@@ -1190,7 +1203,8 @@ async fn test_response_no_validation_skips() {
     // Only request validation configured — response body should pass through
     let plugin = BodyValidator::new(&serde_json::json!({
         "json_schema": {"type": "object"}
-    }));
+    }))
+    .unwrap();
     let mut ctx = make_response_ctx();
     let headers = response_json_headers();
     let body = b"totally invalid json!!!";
@@ -1254,6 +1268,7 @@ fn protobuf_plugin() -> BodyValidator {
         "protobuf_request_type": "test.HelloRequest",
         "protobuf_response_type": "test.HelloResponse"
     }))
+    .unwrap()
 }
 
 fn protobuf_plugin_with_method_messages() -> BodyValidator {
@@ -1266,6 +1281,7 @@ fn protobuf_plugin_with_method_messages() -> BodyValidator {
             }
         }
     }))
+    .unwrap()
 }
 
 fn protobuf_plugin_reject_unknown() -> BodyValidator {
@@ -1274,6 +1290,7 @@ fn protobuf_plugin_reject_unknown() -> BodyValidator {
         "protobuf_request_type": "test.HelloRequest",
         "protobuf_reject_unknown_fields": true
     }))
+    .unwrap()
 }
 
 // ─── Config and Buffering Flags ─��───────────────────────────────────
@@ -1290,7 +1307,8 @@ fn test_protobuf_request_only_config() {
     let plugin = BodyValidator::new(&serde_json::json!({
         "protobuf_descriptor_path": test_descriptor_path(),
         "protobuf_request_type": "test.HelloRequest"
-    }));
+    }))
+    .unwrap();
     assert!(plugin.requires_request_body_buffering());
     assert!(!plugin.requires_response_body_buffering());
 }
@@ -1300,7 +1318,8 @@ fn test_protobuf_response_only_config() {
     let plugin = BodyValidator::new(&serde_json::json!({
         "protobuf_descriptor_path": test_descriptor_path(),
         "protobuf_response_type": "test.HelloResponse"
-    }));
+    }))
+    .unwrap();
     assert!(!plugin.requires_request_body_buffering());
     assert!(plugin.requires_response_body_buffering());
 }
@@ -1340,7 +1359,8 @@ fn test_protobuf_does_not_buffer_non_matching_content_types() {
         "protobuf_descriptor_path": test_descriptor_path(),
         "protobuf_request_type": "test.HelloRequest",
         "content_types": ["application/grpc"]
-    }));
+    }))
+    .unwrap();
     let mut ctx = RequestContext::new(
         "127.0.0.1".to_string(),
         "POST".to_string(),
@@ -1642,22 +1662,28 @@ async fn test_protobuf_invalid_response() {
 
 #[test]
 fn test_protobuf_invalid_descriptor_path_degrades_gracefully() {
-    let plugin = BodyValidator::new(&serde_json::json!({
+    let result = BodyValidator::new(&serde_json::json!({
         "protobuf_descriptor_path": "/nonexistent/path/descriptor.bin",
         "protobuf_request_type": "test.HelloRequest"
     }));
-    // Plugin should still be created, but without protobuf validation
-    assert!(!plugin.requires_request_body_buffering());
+    // Invalid descriptor path yields no valid rules, so plugin creation fails
+    let err = result
+        .err()
+        .expect("expected error for invalid descriptor path");
+    assert!(err.contains("no validation rules configured"), "got: {err}");
 }
 
 #[test]
 fn test_protobuf_invalid_message_type_degrades_gracefully() {
-    let plugin = BodyValidator::new(&serde_json::json!({
+    let result = BodyValidator::new(&serde_json::json!({
         "protobuf_descriptor_path": test_descriptor_path(),
         "protobuf_request_type": "nonexistent.MessageType"
     }));
-    // Plugin created but no valid descriptor — no request buffering needed
-    assert!(!plugin.requires_request_body_buffering());
+    // Invalid message type yields no valid descriptor, so plugin creation fails
+    let err = result
+        .err()
+        .expect("expected error for invalid message type");
+    assert!(err.contains("no validation rules configured"), "got: {err}");
 }
 
 // ─── gRPC before_proxy is skipped (uses on_final_request_body instead) ──

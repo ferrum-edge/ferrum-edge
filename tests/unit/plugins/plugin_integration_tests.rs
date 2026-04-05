@@ -265,6 +265,23 @@ async fn test_plugin_creation_all_plugins() {
             "kafka_logging" => {
                 json!({"broker_list": "localhost:9092", "topic": "test-logs"})
             }
+            "rate_limiting" => json!({"window_seconds": 60, "max_requests": 100}),
+            "request_transformer" => {
+                json!({"rules": [{"operation": "add", "target": "header", "key": "x-test", "value": "1"}]})
+            }
+            "response_transformer" => {
+                json!({"rules": [{"operation": "add", "key": "x-test", "value": "1"}]})
+            }
+            "request_size_limiting" => json!({"max_bytes": 1048576}),
+            "response_size_limiting" => json!({"max_bytes": 1048576}),
+            "ws_message_size_limiting" => json!({"max_frame_bytes": 65536}),
+            "ws_rate_limiting" => json!({"frames_per_second": 100}),
+            "body_validator" => json!({"required_fields": ["name"]}),
+            "graphql" => json!({"max_depth": 100}),
+            "grpc_method_router" => json!({"allow_methods": ["test.Svc/Method"]}),
+            "ai_rate_limiter" => json!({"token_limit": 100000}),
+            "cors" => json!({"origins": ["*"]}),
+            "response_caching" => json!({"ttl_seconds": 60}),
             _ => json!({}),
         };
         let plugin = create_plugin(plugin_name, &config);
@@ -327,16 +344,14 @@ async fn test_plugin_configuration_validation() {
     // Test that plugins handle missing config gracefully
     let empty_config = json!({});
 
-    // Note: access_control and ip_restriction are excluded because they now
-    // require at least one rule in config and intentionally reject empty config.
+    // Note: access_control, ip_restriction, rate_limiting, request_transformer,
+    // and response_transformer are excluded because they now require specific
+    // config fields and intentionally reject empty config.
     let plugin_names = vec![
         "stdout_logging",
         "transaction_debugger",
         "key_auth",
         "basic_auth",
-        "rate_limiting",
-        "request_transformer",
-        "response_transformer",
     ];
 
     for plugin_name in plugin_names {
@@ -386,16 +401,13 @@ async fn test_plugin_complex_configurations() {
         (
             "request_transformer",
             json!({
-                "add_headers": {
-                    "X-Request-ID": "{{request_id}}",
-                    "X-Timestamp": "{{timestamp}}",
-                    "X-Forwarded-For": "{{client_ip}}"
-                },
-                "remove_headers": ["X-Internal", "X-Debug"],
-                "set_query_params": {
-                    "version": "v2",
-                    "format": "json"
-                }
+                "rules": [
+                    {"operation": "add", "target": "header", "key": "X-Request-ID", "value": "{{request_id}}"},
+                    {"operation": "add", "target": "header", "key": "X-Timestamp", "value": "{{timestamp}}"},
+                    {"operation": "add", "target": "header", "key": "X-Forwarded-For", "value": "{{client_ip}}"},
+                    {"operation": "remove", "target": "header", "key": "X-Internal"},
+                    {"operation": "remove", "target": "header", "key": "X-Debug"}
+                ]
             }),
         ),
     ];

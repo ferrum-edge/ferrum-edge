@@ -40,7 +40,7 @@ pub struct WsFrameLogging {
 }
 
 impl WsFrameLogging {
-    pub fn new(config: &Value) -> Self {
+    pub fn new(config: &Value) -> Result<Self, String> {
         let log_level = match config["log_level"].as_str().unwrap_or("info") {
             "trace" => LogLevel::Trace,
             "debug" => LogLevel::Debug,
@@ -57,12 +57,12 @@ impl WsFrameLogging {
 
         let log_ping_pong = config["log_ping_pong"].as_bool().unwrap_or(false);
 
-        Self {
+        Ok(Self {
             log_level,
             include_payload_preview,
             payload_preview_bytes,
             log_ping_pong,
-        }
+        })
     }
 
     fn frame_type_label(message: &Message) -> &'static str {

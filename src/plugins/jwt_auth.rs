@@ -37,8 +37,8 @@ pub struct JwtAuth {
 }
 
 impl JwtAuth {
-    pub fn new(config: &Value) -> Self {
-        Self {
+    pub fn new(config: &Value) -> Result<Self, String> {
+        Ok(Self {
             token_lookup: config["token_lookup"]
                 .as_str()
                 .unwrap_or("header:Authorization")
@@ -47,7 +47,7 @@ impl JwtAuth {
                 .as_str()
                 .unwrap_or("sub")
                 .to_string(),
-        }
+        })
     }
 
     fn extract_token(&self, ctx: &RequestContext) -> Option<String> {
