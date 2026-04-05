@@ -1,23 +1,31 @@
 //! Tests for kafka_logging plugin
 
+use ferrum_edge::plugins::utils::http_client::PluginHttpClient;
 use ferrum_edge::plugins::{Plugin, kafka_logging::KafkaLogging};
 use serde_json::json;
 
 use super::plugin_utils::create_test_transaction_summary;
 
+fn default_http_client() -> PluginHttpClient {
+    PluginHttpClient::default()
+}
+
 #[tokio::test]
 async fn test_kafka_logging_plugin_creation() {
-    let plugin = KafkaLogging::new(&json!({
-        "broker_list": "localhost:9092",
-        "topic": "test-access-logs"
-    }))
+    let plugin = KafkaLogging::new(
+        &json!({
+            "broker_list": "localhost:9092",
+            "topic": "test-access-logs"
+        }),
+        &default_http_client(),
+    )
     .unwrap();
     assert_eq!(plugin.name(), "kafka_logging");
 }
 
 #[tokio::test]
 async fn test_kafka_logging_missing_broker_list() {
-    let result = KafkaLogging::new(&json!({"topic": "test"}));
+    let result = KafkaLogging::new(&json!({"topic": "test"}), &default_http_client());
     match result {
         Err(e) => assert!(
             e.contains("broker_list"),
@@ -29,13 +37,19 @@ async fn test_kafka_logging_missing_broker_list() {
 
 #[tokio::test]
 async fn test_kafka_logging_empty_broker_list() {
-    let result = KafkaLogging::new(&json!({"broker_list": "", "topic": "test"}));
+    let result = KafkaLogging::new(
+        &json!({"broker_list": "", "topic": "test"}),
+        &default_http_client(),
+    );
     assert!(result.is_err());
 }
 
 #[tokio::test]
 async fn test_kafka_logging_missing_topic() {
-    let result = KafkaLogging::new(&json!({"broker_list": "localhost:9092"}));
+    let result = KafkaLogging::new(
+        &json!({"broker_list": "localhost:9092"}),
+        &default_http_client(),
+    );
     match result {
         Err(e) => assert!(e.contains("topic"), "Expected error about topic, got: {e}"),
         Ok(_) => panic!("Expected Err when creating kafka_logging without topic"),
@@ -44,17 +58,23 @@ async fn test_kafka_logging_missing_topic() {
 
 #[tokio::test]
 async fn test_kafka_logging_empty_topic() {
-    let result = KafkaLogging::new(&json!({"broker_list": "localhost:9092", "topic": ""}));
+    let result = KafkaLogging::new(
+        &json!({"broker_list": "localhost:9092", "topic": ""}),
+        &default_http_client(),
+    );
     assert!(result.is_err());
 }
 
 #[tokio::test]
 async fn test_kafka_logging_invalid_compression() {
-    let result = KafkaLogging::new(&json!({
-        "broker_list": "localhost:9092",
-        "topic": "test",
-        "compression": "bzip2"
-    }));
+    let result = KafkaLogging::new(
+        &json!({
+            "broker_list": "localhost:9092",
+            "topic": "test",
+            "compression": "bzip2"
+        }),
+        &default_http_client(),
+    );
     match result {
         Err(e) => assert!(
             e.contains("compression"),
@@ -67,22 +87,28 @@ async fn test_kafka_logging_invalid_compression() {
 #[tokio::test]
 async fn test_kafka_logging_valid_compression_types() {
     for comp in &["none", "gzip", "snappy", "lz4", "zstd"] {
-        let result = KafkaLogging::new(&json!({
-            "broker_list": "localhost:9092",
-            "topic": "test",
-            "compression": comp
-        }));
+        let result = KafkaLogging::new(
+            &json!({
+                "broker_list": "localhost:9092",
+                "topic": "test",
+                "compression": comp
+            }),
+            &default_http_client(),
+        );
         assert!(result.is_ok(), "Compression '{comp}' should be accepted");
     }
 }
 
 #[tokio::test]
 async fn test_kafka_logging_invalid_acks() {
-    let result = KafkaLogging::new(&json!({
-        "broker_list": "localhost:9092",
-        "topic": "test",
-        "acks": "2"
-    }));
+    let result = KafkaLogging::new(
+        &json!({
+            "broker_list": "localhost:9092",
+            "topic": "test",
+            "acks": "2"
+        }),
+        &default_http_client(),
+    );
     match result {
         Err(e) => assert!(e.contains("acks"), "Expected acks error, got: {e}"),
         Ok(_) => panic!("Expected Err for unsupported acks value"),
@@ -92,11 +118,14 @@ async fn test_kafka_logging_invalid_acks() {
 #[tokio::test]
 async fn test_kafka_logging_valid_acks() {
     for acks in &["0", "1", "all", "-1"] {
-        let result = KafkaLogging::new(&json!({
-            "broker_list": "localhost:9092",
-            "topic": "test",
-            "acks": acks
-        }));
+        let result = KafkaLogging::new(
+            &json!({
+                "broker_list": "localhost:9092",
+                "topic": "test",
+                "acks": acks
+            }),
+            &default_http_client(),
+        );
         assert!(result.is_ok(), "Acks '{acks}' should be accepted");
     }
 }
@@ -104,10 +133,13 @@ async fn test_kafka_logging_valid_acks() {
 #[tokio::test]
 async fn test_kafka_logging_log_does_not_panic() {
     // Even with an unreachable broker, log() should accept entries
-    let plugin = KafkaLogging::new(&json!({
-        "broker_list": "localhost:19092",
-        "topic": "test-logs"
-    }))
+    let plugin = KafkaLogging::new(
+        &json!({
+            "broker_list": "localhost:19092",
+            "topic": "test-logs"
+        }),
+        &default_http_client(),
+    )
     .unwrap();
     let summary = create_test_transaction_summary();
     plugin.log(&summary).await;
@@ -115,10 +147,13 @@ async fn test_kafka_logging_log_does_not_panic() {
 
 #[tokio::test]
 async fn test_kafka_logging_multiple_brokers() {
-    let plugin = KafkaLogging::new(&json!({
-        "broker_list": "broker1:9092,broker2:9092,broker3:9092",
-        "topic": "test-logs"
-    }))
+    let plugin = KafkaLogging::new(
+        &json!({
+            "broker_list": "broker1:9092,broker2:9092,broker3:9092",
+            "topic": "test-logs"
+        }),
+        &default_http_client(),
+    )
     .unwrap();
     assert_eq!(plugin.name(), "kafka_logging");
     assert_eq!(plugin.warmup_hostnames().len(), 3);
@@ -126,10 +161,13 @@ async fn test_kafka_logging_multiple_brokers() {
 
 #[tokio::test]
 async fn test_kafka_logging_warmup_skips_ip_addresses() {
-    let plugin = KafkaLogging::new(&json!({
-        "broker_list": "broker1:9092,127.0.0.1:9092,[::1]:9092",
-        "topic": "test-logs"
-    }))
+    let plugin = KafkaLogging::new(
+        &json!({
+            "broker_list": "broker1:9092,127.0.0.1:9092,[::1]:9092",
+            "topic": "test-logs"
+        }),
+        &default_http_client(),
+    )
     .unwrap();
     // Only broker1 is a hostname; 127.0.0.1 and ::1 are IPs
     assert_eq!(plugin.warmup_hostnames(), vec!["broker1".to_string()]);
@@ -137,39 +175,48 @@ async fn test_kafka_logging_warmup_skips_ip_addresses() {
 
 #[tokio::test]
 async fn test_kafka_logging_with_security_config() {
-    let plugin = KafkaLogging::new(&json!({
-        "broker_list": "localhost:9092",
-        "topic": "test",
-        "security_protocol": "sasl_plaintext",
-        "sasl_mechanism": "PLAIN",
-        "sasl_username": "admin",
-        "sasl_password": "secret"
-    }))
+    let plugin = KafkaLogging::new(
+        &json!({
+            "broker_list": "localhost:9092",
+            "topic": "test",
+            "security_protocol": "sasl_plaintext",
+            "sasl_mechanism": "PLAIN",
+            "sasl_username": "admin",
+            "sasl_password": "secret"
+        }),
+        &default_http_client(),
+    )
     .unwrap();
     assert_eq!(plugin.name(), "kafka_logging");
 }
 
 #[tokio::test]
 async fn test_kafka_logging_with_producer_config() {
-    let plugin = KafkaLogging::new(&json!({
-        "broker_list": "localhost:9092",
-        "topic": "test",
-        "producer_config": {
-            "linger.ms": "50",
-            "batch.num.messages": "1000"
-        }
-    }))
+    let plugin = KafkaLogging::new(
+        &json!({
+            "broker_list": "localhost:9092",
+            "topic": "test",
+            "producer_config": {
+                "linger.ms": "50",
+                "batch.num.messages": "1000"
+            }
+        }),
+        &default_http_client(),
+    )
     .unwrap();
     assert_eq!(plugin.name(), "kafka_logging");
 }
 
 #[tokio::test]
 async fn test_kafka_logging_buffer_full_drops_gracefully() {
-    let plugin = KafkaLogging::new(&json!({
-        "broker_list": "localhost:19092",
-        "topic": "test",
-        "buffer_capacity": 5
-    }))
+    let plugin = KafkaLogging::new(
+        &json!({
+            "broker_list": "localhost:19092",
+            "topic": "test",
+            "buffer_capacity": 5
+        }),
+        &default_http_client(),
+    )
     .unwrap();
 
     let summary = create_test_transaction_summary();
@@ -183,11 +230,14 @@ async fn test_kafka_logging_buffer_full_drops_gracefully() {
 #[tokio::test]
 async fn test_kafka_logging_key_field_options() {
     for key_field in &["client_ip", "proxy_id", "none"] {
-        let plugin = KafkaLogging::new(&json!({
-            "broker_list": "localhost:9092",
-            "topic": "test",
-            "key_field": key_field
-        }))
+        let plugin = KafkaLogging::new(
+            &json!({
+                "broker_list": "localhost:9092",
+                "topic": "test",
+                "key_field": key_field
+            }),
+            &default_http_client(),
+        )
         .unwrap();
         assert_eq!(plugin.name(), "kafka_logging");
     }
@@ -195,10 +245,13 @@ async fn test_kafka_logging_key_field_options() {
 
 #[tokio::test]
 async fn test_kafka_logging_default_lifecycle_phases() {
-    let plugin = KafkaLogging::new(&json!({
-        "broker_list": "localhost:9092",
-        "topic": "test"
-    }))
+    let plugin = KafkaLogging::new(
+        &json!({
+            "broker_list": "localhost:9092",
+            "topic": "test"
+        }),
+        &default_http_client(),
+    )
     .unwrap();
 
     let mut ctx = ferrum_edge::plugins::RequestContext::new(
@@ -242,10 +295,13 @@ async fn test_kafka_logging_default_lifecycle_phases() {
 
 #[tokio::test]
 async fn test_kafka_logging_supported_protocols() {
-    let plugin = KafkaLogging::new(&json!({
-        "broker_list": "localhost:9092",
-        "topic": "test"
-    }))
+    let plugin = KafkaLogging::new(
+        &json!({
+            "broker_list": "localhost:9092",
+            "topic": "test"
+        }),
+        &default_http_client(),
+    )
     .unwrap();
 
     // Should support all protocols (HTTP, gRPC, WebSocket, TCP, UDP)

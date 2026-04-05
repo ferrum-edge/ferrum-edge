@@ -17,6 +17,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::warn;
 
+use super::utils::http_client::PluginHttpClient;
 use super::{Plugin, StreamTransactionSummary, TransactionSummary};
 
 /// Union type for log entries sent through the channel.
@@ -55,7 +56,7 @@ pub struct KafkaLogging {
 }
 
 impl KafkaLogging {
-    pub fn new(config: &Value) -> Result<Self, String> {
+    pub fn new(config: &Value, http_client: &PluginHttpClient) -> Result<Self, String> {
         let broker_list = config["broker_list"]
             .as_str()
             .filter(|s| !s.is_empty())
@@ -129,10 +130,24 @@ impl KafkaLogging {
             kafka_config.set("sasl.password", password);
         }
 
-        // SSL / TLS.
+        // SSL / TLS — plugin-level fields override gateway defaults.
+        //
+        // CA trust: plugin `ssl_ca_location` > gateway `FERRUM_TLS_CA_BUNDLE_PATH`.
+        // When neither is set, librdkafka uses system CA roots.
         if let Some(ca) = config["ssl_ca_location"].as_str() {
             kafka_config.set("ssl.ca.location", ca);
+        } else if let Some(gateway_ca) = http_client.tls_ca_bundle_path() {
+            kafka_config.set("ssl.ca.location", gateway_ca);
         }
+
+        // Verification: plugin `ssl_no_verify` > gateway `FERRUM_TLS_NO_VERIFY`.
+        let ssl_no_verify = config["ssl_no_verify"]
+            .as_bool()
+            .unwrap_or(http_client.tls_no_verify());
+        if ssl_no_verify {
+            kafka_config.set("enable.ssl.certificate.verification", "false");
+        }
+
         if let Some(cert) = config["ssl_certificate_location"].as_str() {
             kafka_config.set("ssl.certificate.location", cert);
         }

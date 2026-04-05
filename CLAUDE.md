@@ -429,7 +429,16 @@ tests/
 
 See `docs/backend_mtls.md` and `docs/frontend_tls.md` for full details.
 
-**When adding new protocol paths**: Must follow the same CA trust chain (proxy CA -> global CA -> webpki roots) with CA exclusivity (custom CA = sole trust anchor, no webpki mixing). For reqwest paths use `.tls_built_in_root_certs(false)` when adding a custom CA. For rustls paths use `RootCertStore::empty()` when a custom CA is present. Must validate cert paths at config load time. Must hard-error on cert load failure with no silent fallback.
+**Non-rustls TLS paths** — some plugins use external libraries with their own TLS stacks:
+
+| Plugin | TLS Library | Gateway Integration |
+|--------|-------------|-------------------|
+| `kafka_logging` | librdkafka/OpenSSL | `FERRUM_TLS_CA_BUNDLE_PATH` → `ssl.ca.location`, `FERRUM_TLS_NO_VERIFY` → `enable.ssl.certificate.verification=false`. Plugin-level fields override. CRL not applied (use `producer_config` → `ssl.crl.location`). |
+| `redis` (rate limiting) | rustls via redis crate | `FERRUM_TLS_CA_BUNDLE_PATH` and `FERRUM_TLS_NO_VERIFY` applied via `PluginHttpClient` accessors. |
+
+These paths use the gateway's global TLS settings as defaults but cannot follow the full CA trust chain (proxy-specific CA, CA exclusivity, CRL) because TLS is managed by the external library rather than rustls.
+
+**When adding new protocol paths**: Must follow the same CA trust chain (proxy CA -> global CA -> webpki roots) with CA exclusivity (custom CA = sole trust anchor, no webpki mixing). For reqwest paths use `.tls_built_in_root_certs(false)` when adding a custom CA. For rustls paths use `RootCertStore::empty()` when a custom CA is present. For non-rustls paths (external libraries like librdkafka), integrate `FERRUM_TLS_CA_BUNDLE_PATH` and `FERRUM_TLS_NO_VERIFY` as defaults via `PluginHttpClient` accessors. Must validate cert paths at config load time. Must hard-error on cert load failure with no silent fallback.
 
 ### Performance Rules
 

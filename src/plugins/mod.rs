@@ -965,7 +965,10 @@ pub fn create_plugin_with_http_client(
         )?))),
         "udp_logging" => Ok(Some(Arc::new(udp_logging::UdpLogging::new(config)?))),
         #[cfg(feature = "kafka")]
-        "kafka_logging" => Ok(Some(Arc::new(kafka_logging::KafkaLogging::new(config)?))),
+        "kafka_logging" => Ok(Some(Arc::new(kafka_logging::KafkaLogging::new(
+            config,
+            &http_client,
+        )?))),
         #[cfg(not(feature = "kafka"))]
         "kafka_logging" => Err(
             "kafka_logging: requires the 'kafka' cargo feature to be enabled at compile time"

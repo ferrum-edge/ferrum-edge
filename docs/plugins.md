@@ -486,6 +486,82 @@ config:
   dtls_ca_cert_path: "/etc/ferrum/certs/log-server-ca.pem"
 ```
 
+### `kafka_logging`
+
+Produces transaction summaries as JSON messages to an Apache Kafka topic. Uses an async mpsc channel to decouple the proxy hot path from Kafka I/O, with librdkafka's `ThreadedProducer` handling batching, compression, delivery retries, and partition assignment.
+
+**Priority:** 9150
+
+**Requires:** The `kafka` cargo feature (`--features kafka` or `--all-features`). Without it, plugin creation returns an error at runtime.
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `broker_list` | String | *(required)* | Comma-separated Kafka broker addresses (e.g., `broker1:9092,broker2:9092`) |
+| `topic` | String | *(required)* | Kafka topic to produce messages to |
+| `key_field` | String | `"client_ip"` | Partition key field: `client_ip`, `proxy_id`, or `none` (round-robin) |
+| `buffer_capacity` | Integer | `10000` | Channel capacity — new entries are dropped when full |
+| `compression` | String | *(none)* | Compression: `none`, `gzip`, `snappy`, `lz4`, `zstd` |
+| `acks` | String | *(librdkafka default)* | Delivery acknowledgment: `0`, `1`, `all` (or `-1`) |
+| `message_timeout_ms` | Integer | *(librdkafka default)* | Timeout for message delivery in milliseconds |
+| `security_protocol` | String | *(none)* | Protocol: `plaintext`, `ssl`, `sasl_plaintext`, `sasl_ssl` |
+| `sasl_mechanism` | String | *(none)* | SASL mechanism (e.g., `PLAIN`, `SCRAM-SHA-256`, `SCRAM-SHA-512`) |
+| `sasl_username` | String | *(none)* | SASL username |
+| `sasl_password` | String | *(none)* | SASL password |
+| `ssl_ca_location` | String | *(gateway default)* | Path to CA certificate for broker TLS verification. Falls back to `FERRUM_TLS_CA_BUNDLE_PATH` |
+| `ssl_no_verify` | Boolean | *(gateway default)* | Skip broker TLS certificate verification. Falls back to `FERRUM_TLS_NO_VERIFY` |
+| `ssl_certificate_location` | String | *(none)* | Path to client certificate for mTLS |
+| `ssl_key_location` | String | *(none)* | Path to client private key for mTLS |
+| `producer_config` | Object | *(none)* | Escape hatch: arbitrary librdkafka producer properties as key-value pairs |
+
+#### Gateway TLS Integration
+
+Kafka uses its own binary protocol over TCP/TLS (not HTTP), so TLS is handled by librdkafka (OpenSSL) rather than the gateway's rustls stack. However, the plugin integrates with the gateway's TLS settings as defaults:
+
+- **`FERRUM_TLS_CA_BUNDLE_PATH`** is applied as `ssl.ca.location` when `ssl_ca_location` is not set in the plugin config
+- **`FERRUM_TLS_NO_VERIFY`** is applied as `enable.ssl.certificate.verification=false` when `ssl_no_verify` is not set in the plugin config
+- Plugin-level fields always override the gateway defaults
+
+This means operators who have already configured `FERRUM_TLS_CA_BUNDLE_PATH` for internal CAs do not need to duplicate the CA path in the kafka_logging plugin config.
+
+**Note:** `FERRUM_TLS_CRL_FILE_PATH` is **not** applied to Kafka connections — librdkafka manages CRL checking independently via its own `ssl.crl.location` property (configurable via `producer_config`).
+
+```yaml
+plugin_name: kafka_logging
+config:
+  broker_list: "broker1:9092,broker2:9092,broker3:9092"
+  topic: "access-logs"
+  compression: "lz4"
+  acks: "1"
+  key_field: "client_ip"
+```
+
+#### Kafka with SASL/SSL Authentication
+
+```yaml
+plugin_name: kafka_logging
+config:
+  broker_list: "kafka.example.com:9093"
+  topic: "access-logs"
+  security_protocol: "sasl_ssl"
+  sasl_mechanism: "SCRAM-SHA-256"
+  sasl_username: "ferrum-edge"
+  sasl_password: "secret"
+  ssl_ca_location: "/etc/ferrum/certs/kafka-ca.pem"
+```
+
+#### Advanced librdkafka Tuning
+
+```yaml
+plugin_name: kafka_logging
+config:
+  broker_list: "broker1:9092"
+  topic: "access-logs"
+  producer_config:
+    linger.ms: "50"
+    batch.num.messages: "1000"
+    queue.buffering.max.kbytes: "1048576"
+```
+
 ### Transaction Summary Reference
 
 All logging plugins (`stdout_logging`, `http_logging`, `tcp_logging`, `udp_logging`, `kafka_logging`, `statsd_logging`, `loki_logging`) emit metrics from the same transaction structures. HTTP-family protocols (HTTP/1.1, HTTP/2, HTTP/3, gRPC, WebSocket) use `TransactionSummary`. Stream protocols (TCP, UDP, DTLS) use `StreamTransactionSummary`.
