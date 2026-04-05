@@ -43,6 +43,41 @@ async fn run_db_migrations(env_config: &EnvConfig, dry_run: bool) -> Result<(), 
 
     info!("Connecting to database (type={})...", db_type);
 
+    // MongoDB: index creation via MongoStore::run_migrations()
+    #[cfg(feature = "mongodb")]
+    if db_type == "mongodb" {
+        if dry_run {
+            println!("MongoDB dry run: indexes would be created/verified on collections");
+            println!("  proxies: name (unique), updated_at, upstream_id, listen_port");
+            println!("  consumers: username (unique), custom_id (unique sparse), updated_at");
+            println!("  plugin_configs: proxy_id, updated_at");
+            println!("  upstreams: name (unique), updated_at");
+            return Ok(());
+        }
+        let store = crate::config::mongo_store::MongoStore::connect(
+            &effective_url,
+            &env_config.mongo_database,
+            env_config.mongo_app_name.as_deref(),
+            env_config.mongo_replica_set.as_deref(),
+            env_config.mongo_auth_mechanism.as_deref(),
+            env_config.mongo_server_selection_timeout_seconds,
+            env_config.mongo_connect_timeout_seconds,
+        )
+        .await?;
+        use crate::config::db_backend::DatabaseBackend;
+        store.run_migrations().await?;
+        println!("MongoDB indexes ensured successfully.");
+        return Ok(());
+    }
+    #[cfg(not(feature = "mongodb"))]
+    if db_type == "mongodb" {
+        return Err(anyhow::anyhow!(
+            "FERRUM_DB_TYPE=mongodb requires the 'mongodb' feature. \
+             Rebuild with: cargo build --features mongodb"
+        ));
+    }
+
+    // SQL databases: run schema migrations
     // Connect without running migrations automatically
     sqlx::any::install_default_drivers();
 
@@ -125,6 +160,14 @@ async fn show_db_status(env_config: &EnvConfig) -> Result<(), anyhow::Error> {
     let db_type = env_config.db_type.as_deref().unwrap_or("sqlite");
 
     info!("Connecting to database (type={})...", db_type);
+
+    // MongoDB: no SQL migration tracking — indexes are idempotent
+    if db_type == "mongodb" {
+        println!("=== Ferrum Edge Migration Status (MongoDB) ===\n");
+        println!("MongoDB uses idempotent index creation instead of versioned migrations.");
+        println!("Run 'FERRUM_MIGRATE_ACTION=up' to ensure all indexes exist.");
+        return Ok(());
+    }
 
     sqlx::any::install_default_drivers();
 

@@ -130,6 +130,7 @@ fn resolve_bool(conf: &ConfFile, key: &str, default: bool) -> bool {
 
 /// All environment-driven configuration.
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // Some fields are only used with optional features (e.g. mongodb)
 pub struct EnvConfig {
     pub mode: OperatingMode,
     pub log_level: String,
@@ -260,6 +261,22 @@ pub struct EnvConfig {
     /// max_execution_time` (MySQL) on every new connection. 0 = disabled.
     /// Ignored for SQLite (not supported).
     pub db_pool_statement_timeout_seconds: u64,
+
+    // MongoDB-specific settings (when FERRUM_DB_TYPE=mongodb).
+    // These fields are read by `mongo_store::MongoStore::connect()` when the
+    // `mongodb` feature is enabled and `FERRUM_DB_TYPE=mongodb`.
+    /// MongoDB database name to use. Default: "ferrum".
+    pub mongo_database: String,
+    /// MongoDB application name for server-side connection tracking.
+    pub mongo_app_name: Option<String>,
+    /// MongoDB replica set name. Required for change streams and transactions.
+    pub mongo_replica_set: Option<String>,
+    /// MongoDB auth mechanism override (e.g. "SCRAM-SHA-256", "MONGODB-X509").
+    pub mongo_auth_mechanism: Option<String>,
+    /// MongoDB server selection timeout in seconds. Default: 30.
+    pub mongo_server_selection_timeout_seconds: u64,
+    /// MongoDB connection timeout in seconds. Default: 10.
+    pub mongo_connect_timeout_seconds: u64,
 
     // CP/DP
     pub cp_grpc_listen_addr: Option<String>,
@@ -600,6 +617,12 @@ impl Default for EnvConfig {
             db_pool_max_lifetime_seconds: 300,
             db_pool_connect_timeout_seconds: 10,
             db_pool_statement_timeout_seconds: 30,
+            mongo_database: "ferrum".to_string(),
+            mongo_app_name: None,
+            mongo_replica_set: None,
+            mongo_auth_mechanism: None,
+            mongo_server_selection_timeout_seconds: 30,
+            mongo_connect_timeout_seconds: 10,
             cp_grpc_listen_addr: None,
             cp_grpc_jwt_secret: None,
             dp_cp_grpc_url: None,
@@ -801,6 +824,23 @@ impl EnvConfig {
                 conf,
                 "FERRUM_DB_POOL_STATEMENT_TIMEOUT_SECONDS",
                 30,
+            ),
+
+            // MongoDB-specific
+            mongo_database: resolve_var(conf, "FERRUM_MONGO_DATABASE")
+                .unwrap_or_else(|| "ferrum".to_string()),
+            mongo_app_name: resolve_var(conf, "FERRUM_MONGO_APP_NAME"),
+            mongo_replica_set: resolve_var(conf, "FERRUM_MONGO_REPLICA_SET"),
+            mongo_auth_mechanism: resolve_var(conf, "FERRUM_MONGO_AUTH_MECHANISM"),
+            mongo_server_selection_timeout_seconds: resolve_u64(
+                conf,
+                "FERRUM_MONGO_SERVER_SELECTION_TIMEOUT_SECONDS",
+                30,
+            ),
+            mongo_connect_timeout_seconds: resolve_u64(
+                conf,
+                "FERRUM_MONGO_CONNECT_TIMEOUT_SECONDS",
+                10,
             ),
 
             cp_grpc_listen_addr: resolve_var(conf, "FERRUM_CP_GRPC_LISTEN_ADDR"),

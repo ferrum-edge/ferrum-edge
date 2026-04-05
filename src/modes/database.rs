@@ -26,6 +26,7 @@ use crate::admin::jwt_auth::create_jwt_manager_from_env;
 use crate::admin::{self, AdminState};
 use crate::config::EnvConfig;
 use crate::config::config_backup::load_config_backup;
+use crate::config::db_backend::{self, DatabaseBackend};
 use crate::config::db_loader::{DatabaseStore, DbPoolConfig};
 use crate::dns::{DnsCache, DnsConfig};
 use crate::proxy::{self, ProxyState};
@@ -40,53 +41,90 @@ pub async fn run(
         .effective_db_url()
         .unwrap_or_else(|| "sqlite://ferrum.db".to_string());
     let failover_urls = env_config.effective_db_failover_urls();
-    let pool_config = DbPoolConfig {
-        max_connections: env_config.db_pool_max_connections,
-        min_connections: env_config.db_pool_min_connections,
-        acquire_timeout_seconds: env_config.db_pool_acquire_timeout_seconds,
-        idle_timeout_seconds: env_config.db_pool_idle_timeout_seconds,
-        max_lifetime_seconds: env_config.db_pool_max_lifetime_seconds,
-        connect_timeout_seconds: env_config.db_pool_connect_timeout_seconds,
-        statement_timeout_seconds: env_config.db_pool_statement_timeout_seconds,
-    };
-    let mut db = DatabaseStore::connect_with_failover(
-        env_config.db_type.as_deref().unwrap_or("sqlite"),
-        &effective_url,
-        &failover_urls,
-        env_config.db_tls_enabled,
-        env_config.db_tls_ca_cert_path.as_deref(),
-        env_config.db_tls_client_cert_path.as_deref(),
-        env_config.db_tls_client_key_path.as_deref(),
-        env_config.db_tls_insecure,
-        pool_config,
-    )
-    .await?;
+    let db_type = env_config.db_type.as_deref().unwrap_or("sqlite");
 
-    db.set_slow_query_threshold(env_config.db_slow_query_threshold_ms);
-    db.set_cert_expiry_warning_days(env_config.tls_cert_expiry_warning_days);
-    db.set_backend_allow_ips(env_config.backend_allow_ips.clone());
-
-    // Connect read replica for config polling (reduces primary load)
     let effective_replica_url = env_config.effective_db_read_replica_url();
-    if let Some(ref replica_url) = effective_replica_url {
-        match db
-            .connect_read_replica(
-                replica_url,
+
+    // Build the database backend — SQL (sqlx) or MongoDB depending on FERRUM_DB_TYPE
+    let db: Box<dyn DatabaseBackend> = match db_type {
+        #[cfg(feature = "mongodb")]
+        "mongodb" => {
+            let mut store = crate::config::mongo_store::MongoStore::connect_with_failover(
+                &effective_url,
+                &env_config.mongo_database,
+                env_config.mongo_app_name.as_deref(),
+                env_config.mongo_replica_set.as_deref(),
+                env_config.mongo_auth_mechanism.as_deref(),
+                env_config.mongo_server_selection_timeout_seconds,
+                env_config.mongo_connect_timeout_seconds,
+                &failover_urls,
+            )
+            .await?;
+            store.set_slow_query_threshold(env_config.db_slow_query_threshold_ms);
+            store.set_cert_expiry_warning_days(env_config.tls_cert_expiry_warning_days);
+            store.set_backend_allow_ips(env_config.backend_allow_ips.clone());
+            store.run_migrations().await?;
+            Box::new(store)
+        }
+        #[cfg(not(feature = "mongodb"))]
+        "mongodb" => {
+            return Err(anyhow::anyhow!(
+                "FERRUM_DB_TYPE=mongodb requires the 'mongodb' feature. \
+                 Rebuild with: cargo build --features mongodb"
+            ));
+        }
+        _ => {
+            // SQL backends (postgres, mysql, sqlite)
+            let pool_config = DbPoolConfig {
+                max_connections: env_config.db_pool_max_connections,
+                min_connections: env_config.db_pool_min_connections,
+                acquire_timeout_seconds: env_config.db_pool_acquire_timeout_seconds,
+                idle_timeout_seconds: env_config.db_pool_idle_timeout_seconds,
+                max_lifetime_seconds: env_config.db_pool_max_lifetime_seconds,
+                connect_timeout_seconds: env_config.db_pool_connect_timeout_seconds,
+                statement_timeout_seconds: env_config.db_pool_statement_timeout_seconds,
+            };
+            let mut store = DatabaseStore::connect_with_failover(
+                db_type,
+                &effective_url,
+                &failover_urls,
                 env_config.db_tls_enabled,
                 env_config.db_tls_ca_cert_path.as_deref(),
                 env_config.db_tls_client_cert_path.as_deref(),
                 env_config.db_tls_client_key_path.as_deref(),
                 env_config.db_tls_insecure,
+                pool_config,
             )
-            .await
-        {
-            Ok(()) => info!("Read replica connected for config polling"),
-            Err(e) => warn!(
-                "Read replica connection failed, polling will use primary: {}",
-                e
-            ),
+            .await?;
+            store.set_slow_query_threshold(env_config.db_slow_query_threshold_ms);
+            store.set_cert_expiry_warning_days(env_config.tls_cert_expiry_warning_days);
+            store.set_backend_allow_ips(env_config.backend_allow_ips.clone());
+
+            // Connect read replica for config polling (reduces primary load)
+            if let Some(ref replica_url) = effective_replica_url {
+                match store
+                    .connect_read_replica(
+                        replica_url,
+                        env_config.db_tls_enabled,
+                        env_config.db_tls_ca_cert_path.as_deref(),
+                        env_config.db_tls_client_cert_path.as_deref(),
+                        env_config.db_tls_client_key_path.as_deref(),
+                        env_config.db_tls_insecure,
+                    )
+                    .await
+                {
+                    Ok(()) => info!("Read replica connected for config polling"),
+                    Err(e) => warn!(
+                        "Read replica connection failed, polling will use primary: {}",
+                        e
+                    ),
+                }
+            }
+            Box::new(store)
         }
-    }
+    };
+    // Convert to Arc for sharing across tasks
+    let db: Arc<dyn DatabaseBackend> = Arc::from(db);
 
     // Load initial config from database, falling back to backup file if configured
     let backup_path = env_config.db_config_backup_path.clone();
@@ -219,7 +257,6 @@ pub async fn run(
 
     // Start service discovery background tasks
     proxy_state.start_service_discovery(Some(shutdown_tx.subscribe()));
-    let db = Arc::new(db);
 
     // Load TLS configuration if provided
     let tls_config = if let (Some(cert_path), Some(key_path)) = (
@@ -519,10 +556,10 @@ pub async fn run(
     // DNS re-resolution for the database FQDN: if the URL contains a hostname
     // (not an IP literal), resolve it via DnsCache on each poll cycle and
     // reconnect the pool when the IPs change.
-    let db_hostname = DatabaseStore::extract_db_hostname(&effective_url);
+    let db_hostname = db_backend::extract_db_hostname(&effective_url);
     let replica_hostname = effective_replica_url
         .as_deref()
-        .and_then(DatabaseStore::extract_db_hostname);
+        .and_then(db_backend::extract_db_hostname);
     let dns_cache_for_poll = dns_cache.clone();
     let db_url_for_reconnect = effective_url.clone();
     let replica_url_for_reconnect = effective_replica_url.clone();
@@ -548,7 +585,7 @@ pub async fn run(
             mut known_consumer_ids,
             mut known_plugin_config_ids,
             mut known_upstream_ids,
-        ) = DatabaseStore::extract_known_ids(&initial_config);
+        ) = db_backend::extract_known_ids(&initial_config);
         let mut last_poll_at: Option<DateTime<Utc>> = Some(initial_config.loaded_at);
 
         loop {
@@ -671,7 +708,7 @@ pub async fn run(
                                 match db_poll.load_full_config().await {
                                     Ok(new_config) => {
                                         db_available_poll.store(true, Ordering::Relaxed);
-                                        let (p, c, pc, u) = DatabaseStore::extract_known_ids(&new_config);
+                                        let (p, c, pc, u) = db_backend::extract_known_ids(&new_config);
                                         known_proxy_ids = p;
                                         known_consumer_ids = c;
                                         known_plugin_config_ids = pc;
@@ -697,7 +734,7 @@ pub async fn run(
                                                 match db_poll.load_full_config().await {
                                                     Ok(new_config) => {
                                                         db_available_poll.store(true, Ordering::Relaxed);
-                                                        let (p, c, pc, u) = DatabaseStore::extract_known_ids(&new_config);
+                                                        let (p, c, pc, u) = db_backend::extract_known_ids(&new_config);
                                                         known_proxy_ids = p;
                                                         known_consumer_ids = c;
                                                         known_plugin_config_ids = pc;
@@ -733,7 +770,7 @@ pub async fn run(
                         match db_poll.load_full_config().await {
                             Ok(new_config) => {
                                 db_available_poll.store(true, Ordering::Relaxed);
-                                let (p, c, pc, u) = DatabaseStore::extract_known_ids(&new_config);
+                                let (p, c, pc, u) = db_backend::extract_known_ids(&new_config);
                                 known_proxy_ids = p;
                                 known_consumer_ids = c;
                                 known_plugin_config_ids = pc;

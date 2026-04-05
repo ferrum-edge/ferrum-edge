@@ -5,6 +5,7 @@ mod config_backup_tests;
 mod config_file_loader_tests;
 mod config_migration_tests;
 mod config_types_tests;
+mod db_backend_tests;
 mod db_dns_tests;
 mod env_config_tests;
 mod field_validation_tests;
