@@ -6,16 +6,23 @@
 //! path from socket I/O: the `log()` hook enqueues the entry (non-blocking),
 //! and a background task formats and sends metrics in batches.
 //!
+//! Hostname resolution uses the gateway's shared `DnsCache` (pre-warmed via
+//! `warmup_hostnames()`) with TTL, stale-while-revalidate, and background
+//! refresh — consistent with all other gateway components.
+//!
 //! Supports all proxy protocols (HTTP, gRPC, WebSocket, TCP, UDP).
 
 use async_trait::async_trait;
 use serde_json::Value;
+use std::net::{IpAddr, SocketAddr};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::time::Duration;
 use tracing::warn;
 
+use super::utils::PluginHttpClient;
 use super::{Plugin, StreamTransactionSummary, TransactionSummary};
+use crate::dns::DnsCache;
 
 /// Union type for entries sent through the channel.
 #[derive(Clone)]
@@ -25,9 +32,8 @@ enum MetricEntry {
 }
 
 struct StatsdConfig {
-    /// Host:port string — resolved to a SocketAddr in the background task
-    /// to support both IP addresses and hostnames (with DNS warmup).
-    addr_str: String,
+    hostname: String,
+    port: u16,
     prefix: String,
     global_tags: String,
     flush_interval: Duration,
@@ -40,7 +46,7 @@ pub struct StatsdLogging {
 }
 
 impl StatsdLogging {
-    pub fn new(config: &Value) -> Result<Self, String> {
+    pub fn new(config: &Value, http_client: PluginHttpClient) -> Result<Self, String> {
         let host = config["host"]
             .as_str()
             .filter(|s| !s.is_empty())
@@ -55,8 +61,6 @@ impl StatsdLogging {
                 "statsd_logging: 'port' must be between 1 and 65535 (got {port})"
             ));
         }
-
-        let addr_str = format!("{host}:{port}");
 
         let prefix = config["prefix"].as_str().unwrap_or("ferrum").to_string();
 
@@ -84,19 +88,23 @@ impl StatsdLogging {
         let max_batch_lines = config["max_batch_lines"].as_u64().unwrap_or(50).max(1) as usize;
 
         let statsd_config = StatsdConfig {
-            addr_str,
+            hostname: host.clone(),
+            port: port as u16,
             prefix,
             global_tags,
             flush_interval: Duration::from_millis(flush_interval_ms),
             max_batch_lines,
         };
 
-        let hostname = host.clone();
+        let dns_cache = http_client.dns_cache().cloned();
 
         let (sender, receiver) = mpsc::channel(buffer_capacity);
-        tokio::spawn(flush_loop(receiver, statsd_config));
+        tokio::spawn(flush_loop(receiver, statsd_config, dns_cache));
 
-        Ok(Self { sender, hostname })
+        Ok(Self {
+            sender,
+            hostname: host,
+        })
     }
 }
 
@@ -251,24 +259,47 @@ fn format_stream_metrics(
     );
 }
 
-async fn flush_loop(mut receiver: mpsc::Receiver<MetricEntry>, cfg: StatsdConfig) {
-    // Resolve the host:port to a SocketAddr (supports both IPs and hostnames).
-    let addr = match tokio::net::lookup_host(&cfg.addr_str).await {
-        Ok(mut addrs) => match addrs.next() {
-            Some(addr) => addr,
-            None => {
+/// Resolve the StatsD hostname to an IP address. Uses the gateway's DNS cache
+/// when available (pre-warmed, TTL-aware, stale-while-revalidate). Falls back
+/// to `tokio::net::lookup_host` when no cache is present (tests / fallback).
+async fn resolve_host(
+    hostname: &str,
+    port: u16,
+    dns_cache: &Option<DnsCache>,
+) -> Option<SocketAddr> {
+    if let Some(cache) = dns_cache {
+        match cache.resolve(hostname, None, None).await {
+            Ok(ip) => return Some(SocketAddr::new(ip, port)),
+            Err(e) => {
                 warn!(
-                    "statsd_logging: DNS lookup for '{}' returned no addresses — metrics will be lost",
-                    cfg.addr_str
+                    "statsd_logging: DNS cache resolution failed for '{hostname}': {e} — falling back to system DNS"
                 );
-                while receiver.recv().await.is_some() {}
-                return;
             }
-        },
+        }
+    }
+
+    // Fallback: direct lookup (tests or when DNS cache is unavailable).
+    let addr_str = format!("{hostname}:{port}");
+    match tokio::net::lookup_host(&addr_str).await {
+        Ok(mut addrs) => addrs.next(),
         Err(e) => {
+            warn!("statsd_logging: failed to resolve '{addr_str}': {e}");
+            None
+        }
+    }
+}
+
+async fn flush_loop(
+    mut receiver: mpsc::Receiver<MetricEntry>,
+    cfg: StatsdConfig,
+    dns_cache: Option<DnsCache>,
+) {
+    let addr = match resolve_host(&cfg.hostname, cfg.port, &dns_cache).await {
+        Some(addr) => addr,
+        None => {
             warn!(
-                "statsd_logging: failed to resolve '{}': {e} — metrics will be lost",
-                cfg.addr_str
+                "statsd_logging: could not resolve '{}:{}' — metrics will be lost",
+                cfg.hostname, cfg.port
             );
             while receiver.recv().await.is_some() {}
             return;
@@ -276,7 +307,7 @@ async fn flush_loop(mut receiver: mpsc::Receiver<MetricEntry>, cfg: StatsdConfig
     };
 
     // Bind an ephemeral UDP socket matching the resolved address family.
-    let bind_addr = if addr.is_ipv6() {
+    let bind_addr = if addr.ip() == IpAddr::from([0u8; 16]) || addr.is_ipv6() {
         "[::]:0"
     } else {
         "0.0.0.0:0"

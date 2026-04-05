@@ -1,12 +1,16 @@
 //! Tests for statsd_logging plugin
 
 use ferrum_edge::plugins::{
-    Plugin, PluginResult, StreamTransactionSummary, statsd_logging::StatsdLogging,
+    Plugin, PluginHttpClient, PluginResult, StreamTransactionSummary, statsd_logging::StatsdLogging,
 };
 use serde_json::json;
 use std::collections::HashMap;
 
 use super::plugin_utils::{create_test_context, create_test_transaction_summary};
+
+fn default_client() -> PluginHttpClient {
+    PluginHttpClient::default()
+}
 
 fn make_stream_summary() -> StreamTransactionSummary {
     StreamTransactionSummary {
@@ -30,17 +34,20 @@ fn make_stream_summary() -> StreamTransactionSummary {
 
 #[tokio::test]
 async fn test_statsd_logging_plugin_creation() {
-    let plugin = StatsdLogging::new(&json!({
-        "host": "127.0.0.1",
-        "port": 8125
-    }))
+    let plugin = StatsdLogging::new(
+        &json!({
+            "host": "127.0.0.1",
+            "port": 8125
+        }),
+        default_client(),
+    )
     .unwrap();
     assert_eq!(plugin.name(), "statsd_logging");
 }
 
 #[tokio::test]
 async fn test_statsd_logging_missing_host() {
-    let result = StatsdLogging::new(&json!({}));
+    let result = StatsdLogging::new(&json!({}), default_client());
     match result {
         Err(e) => assert!(e.contains("host"), "Expected error about host, got: {e}"),
         Ok(_) => panic!("Expected Err when creating statsd_logging without host"),
@@ -49,7 +56,7 @@ async fn test_statsd_logging_missing_host() {
 
 #[tokio::test]
 async fn test_statsd_logging_empty_host() {
-    let result = StatsdLogging::new(&json!({"host": ""}));
+    let result = StatsdLogging::new(&json!({"host": ""}), default_client());
     match result {
         Err(e) => assert!(e.contains("host")),
         Ok(_) => panic!("Expected Err for empty host"),
@@ -58,7 +65,7 @@ async fn test_statsd_logging_empty_host() {
 
 #[tokio::test]
 async fn test_statsd_logging_invalid_port_zero() {
-    let result = StatsdLogging::new(&json!({"host": "127.0.0.1", "port": 0}));
+    let result = StatsdLogging::new(&json!({"host": "127.0.0.1", "port": 0}), default_client());
     match result {
         Err(e) => assert!(e.contains("port")),
         Ok(_) => panic!("Expected Err for port 0"),
@@ -67,7 +74,10 @@ async fn test_statsd_logging_invalid_port_zero() {
 
 #[tokio::test]
 async fn test_statsd_logging_invalid_port_too_high() {
-    let result = StatsdLogging::new(&json!({"host": "127.0.0.1", "port": 99999}));
+    let result = StatsdLogging::new(
+        &json!({"host": "127.0.0.1", "port": 99999}),
+        default_client(),
+    );
     match result {
         Err(e) => assert!(e.contains("port")),
         Ok(_) => panic!("Expected Err for port > 65535"),
@@ -77,39 +87,48 @@ async fn test_statsd_logging_invalid_port_too_high() {
 #[tokio::test]
 async fn test_statsd_logging_default_port() {
     // port defaults to 8125 when not specified
-    let plugin = StatsdLogging::new(&json!({"host": "127.0.0.1"})).unwrap();
+    let plugin = StatsdLogging::new(&json!({"host": "127.0.0.1"}), default_client()).unwrap();
     assert_eq!(plugin.name(), "statsd_logging");
 }
 
 #[tokio::test]
 async fn test_statsd_logging_custom_prefix() {
-    let plugin = StatsdLogging::new(&json!({
-        "host": "127.0.0.1",
-        "prefix": "myapp.gateway"
-    }))
+    let plugin = StatsdLogging::new(
+        &json!({
+            "host": "127.0.0.1",
+            "prefix": "myapp.gateway"
+        }),
+        default_client(),
+    )
     .unwrap();
     assert_eq!(plugin.name(), "statsd_logging");
 }
 
 #[tokio::test]
 async fn test_statsd_logging_with_global_tags() {
-    let plugin = StatsdLogging::new(&json!({
-        "host": "127.0.0.1",
-        "global_tags": {
-            "env": "prod",
-            "region": "us-east-1"
-        }
-    }))
+    let plugin = StatsdLogging::new(
+        &json!({
+            "host": "127.0.0.1",
+            "global_tags": {
+                "env": "prod",
+                "region": "us-east-1"
+            }
+        }),
+        default_client(),
+    )
     .unwrap();
     assert_eq!(plugin.name(), "statsd_logging");
 }
 
 #[tokio::test]
 async fn test_statsd_logging_log_does_not_panic() {
-    let plugin = StatsdLogging::new(&json!({
-        "host": "127.0.0.1",
-        "port": 1
-    }))
+    let plugin = StatsdLogging::new(
+        &json!({
+            "host": "127.0.0.1",
+            "port": 1
+        }),
+        default_client(),
+    )
     .unwrap();
     let summary = create_test_transaction_summary();
 
@@ -121,10 +140,13 @@ async fn test_statsd_logging_log_does_not_panic() {
 
 #[tokio::test]
 async fn test_statsd_logging_stream_disconnect_does_not_panic() {
-    let plugin = StatsdLogging::new(&json!({
-        "host": "127.0.0.1",
-        "port": 1
-    }))
+    let plugin = StatsdLogging::new(
+        &json!({
+            "host": "127.0.0.1",
+            "port": 1
+        }),
+        default_client(),
+    )
     .unwrap();
     let summary = make_stream_summary();
 
@@ -136,7 +158,7 @@ async fn test_statsd_logging_stream_disconnect_does_not_panic() {
 
 #[tokio::test]
 async fn test_statsd_logging_default_lifecycle_phases() {
-    let plugin = StatsdLogging::new(&json!({"host": "127.0.0.1"})).unwrap();
+    let plugin = StatsdLogging::new(&json!({"host": "127.0.0.1"}), default_client()).unwrap();
 
     let mut ctx = create_test_context();
     let consumer_index = ferrum_edge::ConsumerIndex::new(&[]);
@@ -160,13 +182,16 @@ async fn test_statsd_logging_default_lifecycle_phases() {
 
 #[tokio::test]
 async fn test_statsd_logging_buffer_full_drops_gracefully() {
-    let plugin = StatsdLogging::new(&json!({
-        "host": "127.0.0.1",
-        "port": 1,
-        "buffer_capacity": 5,
-        "max_batch_lines": 1000,
-        "flush_interval_ms": 60000
-    }))
+    let plugin = StatsdLogging::new(
+        &json!({
+            "host": "127.0.0.1",
+            "port": 1,
+            "buffer_capacity": 5,
+            "max_batch_lines": 1000,
+            "flush_interval_ms": 60000
+        }),
+        default_client(),
+    )
     .unwrap();
 
     let summary = create_test_transaction_summary();
@@ -179,24 +204,30 @@ async fn test_statsd_logging_buffer_full_drops_gracefully() {
 
 #[tokio::test]
 async fn test_statsd_logging_accepts_all_config_options() {
-    let plugin = StatsdLogging::new(&json!({
-        "host": "127.0.0.1",
-        "port": 9125,
-        "prefix": "gateway.edge",
-        "global_tags": {"env": "staging", "dc": "us-west-2"},
-        "flush_interval_ms": 1000,
-        "buffer_capacity": 50000,
-        "max_batch_lines": 100
-    }))
+    let plugin = StatsdLogging::new(
+        &json!({
+            "host": "127.0.0.1",
+            "port": 9125,
+            "prefix": "gateway.edge",
+            "global_tags": {"env": "staging", "dc": "us-west-2"},
+            "flush_interval_ms": 1000,
+            "buffer_capacity": 50000,
+            "max_batch_lines": 100
+        }),
+        default_client(),
+    )
     .unwrap();
     assert_eq!(plugin.name(), "statsd_logging");
 }
 
 #[tokio::test]
 async fn test_statsd_logging_warmup_hostnames() {
-    let plugin = StatsdLogging::new(&json!({
-        "host": "statsd.internal.example.com"
-    }))
+    let plugin = StatsdLogging::new(
+        &json!({
+            "host": "statsd.internal.example.com"
+        }),
+        default_client(),
+    )
     .unwrap();
     let hosts = plugin.warmup_hostnames();
     assert_eq!(hosts, vec!["statsd.internal.example.com".to_string()]);

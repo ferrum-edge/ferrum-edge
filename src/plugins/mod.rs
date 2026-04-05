@@ -932,7 +932,10 @@ pub fn create_plugin_with_http_client(
 ) -> Result<Option<Arc<dyn Plugin>>, String> {
     match name {
         "stdout_logging" => Ok(Some(Arc::new(stdout_logging::StdoutLogging::new(config)))),
-        "statsd_logging" => Ok(Some(Arc::new(statsd_logging::StatsdLogging::new(config)?))),
+        "statsd_logging" => Ok(Some(Arc::new(statsd_logging::StatsdLogging::new(
+            config,
+            http_client.clone(),
+        )?))),
         "http_logging" => Ok(Some(Arc::new(http_logging::HttpLogging::new(
             config,
             http_client,
