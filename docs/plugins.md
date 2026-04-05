@@ -521,8 +521,9 @@ Produces transaction summaries as JSON messages to an Apache Kafka topic. Uses a
 | `broker_list` | String | *(required)* | Comma-separated Kafka broker addresses (e.g., `broker1:9092,broker2:9092`) |
 | `topic` | String | *(required)* | Kafka topic to produce messages to |
 | `key_field` | String | `"client_ip"` | Partition key field: `client_ip`, `proxy_id`, or `none` (round-robin) |
-| `buffer_capacity` | Integer | `10000` | Channel capacity — new entries are dropped when full |
-| `compression` | String | *(none)* | Compression: `none`, `gzip`, `snappy`, `lz4`, `zstd` |
+| `buffer_capacity` | Integer | `10000` | Channel capacity — new entries are dropped when full. Each entry is a serialized JSON `TransactionSummary` (~1-2 KB), so the default 10,000 entries may use ~10-20 MB of memory |
+| `compression` | String | `"lz4"` | Compression: `none`, `gzip`, `snappy`, `lz4`, `zstd` |
+| `flush_timeout_seconds` | Integer | `5` | Seconds to wait for librdkafka to flush pending messages during graceful shutdown |
 | `acks` | String | *(librdkafka default)* | Delivery acknowledgment: `0`, `1`, `all` (or `-1`) |
 | `message_timeout_ms` | Integer | *(librdkafka default)* | Timeout for message delivery in milliseconds |
 | `security_protocol` | String | *(none)* | Protocol: `plaintext`, `ssl`, `sasl_plaintext`, `sasl_ssl` |
