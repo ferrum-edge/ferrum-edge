@@ -1,4 +1,4 @@
-//! Plugin system — 48 built-in plugins with a trait-based architecture.
+//! Plugin system — 49 built-in plugins with a trait-based architecture.
 //!
 //! Plugins execute in priority order (lower number = runs first) through
 //! lifecycle phases: `on_request_received` → `authenticate` → `authorize` →
@@ -52,6 +52,7 @@ pub mod response_mock;
 pub mod response_size_limiting;
 pub mod response_transformer;
 pub mod serverless_function;
+pub mod soap_ws_security;
 pub mod sse;
 pub mod statsd_logging;
 pub mod stdout_logging;
@@ -542,7 +543,7 @@ pub struct StreamTransactionSummary {
 /// | Band      | Range       | Purpose                                   | Plugins |
 /// |-----------|-------------|-------------------------------------------|---------|
 /// | Early     | 0–949       | Pre-routing, tracing, and preflight       | otel_tracing (25), correlation_id (50), cors (100), request_termination (125), ip_restriction (150), bot_detection (200), sse (250), grpc_web (260), grpc_method_router (275) |
-/// | AuthN     | 950–1999    | Authentication / identity verification    | mtls_auth (950), jwks_auth (1000), jwt_auth (1100), key_auth (1200), ldap_auth (1250), basic_auth (1300), hmac_auth (1400) |
+/// | AuthN     | 950–1999    | Authentication / identity verification    | mtls_auth (950), jwks_auth (1000), jwt_auth (1100), key_auth (1200), ldap_auth (1250), basic_auth (1300), hmac_auth (1400), soap_ws_security (1500) |
 /// | AuthZ     | 2000–2999   | Authorization and admission control       | access_control (2000), tcp_connection_throttle (2050), request_size_limiting (2800), graphql (2850), rate_limiting (2900), ai_prompt_shield (2925), body_validator (2950), ai_request_guard (2975) |
 /// | Transform | 3000–3999   | Request shaping and response buffering    | request_transformer (3000), serverless_function (3025), response_mock (3030), grpc_deadline (3050), request_mirror (3075), response_size_limiting (3490), response_caching (3500) |
 /// | Response  | 4000–4999   | Response transformation and AI accounting | response_transformer (4000), ai_token_metrics (4100), ai_rate_limiter (4200) |
@@ -565,6 +566,7 @@ pub mod priority {
     pub const LDAP_AUTH: u16 = 1250;
     pub const BASIC_AUTH: u16 = 1300;
     pub const HMAC_AUTH: u16 = 1400;
+    pub const SOAP_WS_SECURITY: u16 = 1500;
     pub const ACCESS_CONTROL: u16 = 2000;
     pub const TCP_CONNECTION_THROTTLE: u16 = 2050;
     pub const REQUEST_SIZE_LIMITING: u16 = 2800;
@@ -1031,6 +1033,9 @@ pub fn create_plugin_with_http_client(
             response_size_limiting::ResponseSizeLimiting::new(config)?,
         ))),
         "body_validator" => Ok(Some(Arc::new(body_validator::BodyValidator::new(config)?))),
+        "soap_ws_security" => Ok(Some(Arc::new(soap_ws_security::SoapWsSecurity::new(
+            config,
+        )?))),
         "request_termination" => Ok(Some(Arc::new(
             request_termination::RequestTermination::new(config)?,
         ))),
@@ -1166,6 +1171,7 @@ pub fn available_plugins() -> Vec<&'static str> {
         "udp_rate_limiting",
         "udp_logging",
         "request_mirror",
+        "soap_ws_security",
     ];
     plugins.extend(crate::custom_plugins::custom_plugin_names());
     plugins

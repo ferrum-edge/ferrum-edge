@@ -228,6 +228,7 @@ async fn test_all_plugins_available() {
         "response_mock",
         "request_mirror",
         "kafka_logging",
+        "soap_ws_security",
     ]
     .into_iter()
     .collect();

@@ -1215,6 +1215,139 @@ plugins:
 
 The plugin sets `ctx.authenticated_identity` to the LDAP username. When `consumer_mapping` is enabled (default), it also attempts to find a matching gateway Consumer for ACL and rate-limiting integration.
 
+### `soap_ws_security`
+
+Validates WS-Security headers in SOAP XML envelopes. Supports UsernameToken authentication (PasswordText and PasswordDigest), X.509 certificate signature verification, optional SAML assertion validation, timestamp freshness checks, and nonce replay protection.
+
+The plugin buffers request bodies with SOAP content types (`text/xml`, `application/soap+xml`, `application/xml`) and parses the `wsse:Security` header from the SOAP envelope. Non-SOAP requests pass through untouched.
+
+**Priority:** 1500
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `reject_missing_security_header` | bool | `true` | Reject SOAP requests that lack a WS-Security header |
+| `timestamp.require` | bool | `true` | Require a `wsu:Timestamp` element in the Security header |
+| `timestamp.max_age_seconds` | u64 | `300` | Maximum age of the `Created` timestamp before rejection |
+| `timestamp.require_expires` | bool | `false` | Require an `Expires` element in the Timestamp |
+| `timestamp.clock_skew_seconds` | u64 | `300` | Clock skew tolerance for timestamp validation |
+| `username_token.enabled` | bool | `false` | Enable UsernameToken authentication |
+| `username_token.password_type` | String | `PasswordDigest` | `PasswordText` or `PasswordDigest` |
+| `username_token.credentials` | Object[] | `[]` | Array of `{username, password}` credential pairs |
+| `x509_signature.enabled` | bool | `false` | Enable X.509 signature verification |
+| `x509_signature.trusted_certs` | String[] | `[]` | PEM file paths of trusted signing certificates |
+| `x509_signature.allowed_algorithms` | String[] | `["rsa-sha256"]` | Allowed signature algorithms (`rsa-sha256`, `rsa-sha1`) |
+| `x509_signature.require_signed_timestamp` | bool | `true` | Require the Timestamp to be included in the signature |
+| `saml.enabled` | bool | `false` | Enable SAML assertion validation |
+| `saml.trusted_issuers` | String[] | `[]` | Trusted SAML Issuer values |
+| `saml.audience` | String | *(none)* | Expected SAML Audience value |
+| `saml.clock_skew_seconds` | u64 | `300` | Clock skew tolerance for SAML condition timestamps |
+| `nonce.cache_ttl_seconds` | u64 | `300` | How long to remember nonces for replay detection |
+| `nonce.max_cache_size` | u64 | `10000` | Maximum nonce cache entries before eviction sweep |
+
+At least one security feature must be enabled (`timestamp.require`, `username_token`, `x509_signature`, or `saml`).
+
+#### UsernameToken — PasswordDigest
+
+The PasswordDigest mode computes `Base64(SHA-1(nonce + created + password))` per the WS-Security UsernameToken Profile 1.0 specification. The SOAP request must include `wsse:Nonce` and `wsu:Created` elements alongside the password. Each nonce is tracked for replay protection.
+
+```yaml
+plugin_name: soap_ws_security
+config:
+  username_token:
+    enabled: true
+    password_type: PasswordDigest
+    credentials:
+      - username: "service-account"
+        password: "shared-secret"
+  timestamp:
+    require: true
+    max_age_seconds: 300
+```
+
+#### UsernameToken — PasswordText
+
+PasswordText mode compares the password directly (no hashing). Only use over TLS.
+
+```yaml
+plugin_name: soap_ws_security
+config:
+  username_token:
+    enabled: true
+    password_type: PasswordText
+    credentials:
+      - username: "admin"
+        password: "admin-password"
+  timestamp:
+    require: false
+```
+
+#### X.509 Signature Verification
+
+Verifies XMLDSig signatures using trusted X.509 certificates. The signing certificate must be present as a `wsse:BinarySecurityToken` or inline `ds:X509Certificate` in the Signature's `KeyInfo`. The certificate is matched against the configured trusted certs by SHA-256 fingerprint.
+
+```yaml
+plugin_name: soap_ws_security
+config:
+  x509_signature:
+    enabled: true
+    trusted_certs:
+      - /etc/ferrum/certs/partner-signing.pem
+    allowed_algorithms:
+      - rsa-sha256
+    require_signed_timestamp: true
+  timestamp:
+    require: true
+```
+
+#### SAML Assertion Validation
+
+Validates SAML 2.0 assertions embedded in the WS-Security header. Checks issuer trust, `NotBefore`/`NotOnOrAfter` conditions, and optional audience restriction.
+
+```yaml
+plugin_name: soap_ws_security
+config:
+  saml:
+    enabled: true
+    trusted_issuers:
+      - "https://idp.example.com"
+    audience: "https://api.example.com"
+    clock_skew_seconds: 300
+  timestamp:
+    require: true
+```
+
+#### Combined Configuration
+
+Multiple security features can be enabled together. All enabled checks must pass.
+
+```yaml
+plugin_name: soap_ws_security
+config:
+  timestamp:
+    require: true
+    max_age_seconds: 300
+    require_expires: true
+  username_token:
+    enabled: true
+    password_type: PasswordDigest
+    credentials:
+      - username: "service-a"
+        password: "secret-a"
+  x509_signature:
+    enabled: true
+    trusted_certs:
+      - /etc/ferrum/certs/signing-ca.pem
+    require_signed_timestamp: true
+  nonce:
+    cache_ttl_seconds: 600
+    max_cache_size: 50000
+  reject_missing_security_header: true
+```
+
+**Metadata:** On successful UsernameToken authentication, the plugin sets `ctx.metadata["soap_ws_username"]` to the authenticated username, available to downstream plugins and logging.
+
+**Namespace prefix agnostic:** The plugin matches XML elements by local name, so it works regardless of namespace prefix conventions (`wsse:`, `WSSE:`, `sec:`, `soap:`, `s:`, etc.).
+
 ---
 
 ## Authorization Plugins

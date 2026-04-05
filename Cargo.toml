@@ -30,6 +30,7 @@ http-body-util = "0.1"
 http = "1"
 
 # TLS
+ring = "0.17"
 rustls = { version = "0.23", features = ["ring", "std"] }
 tokio-rustls = "0.26"
 rustls-pemfile = "2"
