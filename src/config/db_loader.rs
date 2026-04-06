@@ -3387,10 +3387,13 @@ fn row_to_consumer(row: &AnyRow) -> Result<Consumer, anyhow::Error> {
     });
 
     let acl_groups_str: String = row.try_get("acl_groups").unwrap_or_else(|_| "[]".into());
-    let acl_groups: Vec<String> = serde_json::from_str(&acl_groups_str).unwrap_or_else(|e| {
-        warn!("Failed to parse acl_groups JSON for consumer: {}", e);
-        Vec::new()
-    });
+    let acl_groups: Vec<String> = serde_json::from_str(&acl_groups_str).map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to parse acl_groups JSON for consumer: {} (raw: {})",
+            e,
+            acl_groups_str
+        )
+    })?;
 
     Ok(Consumer {
         id: row.try_get("id")?,

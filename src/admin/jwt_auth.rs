@@ -162,9 +162,13 @@ impl std::error::Error for JwtError {}
 pub fn create_jwt_manager_from_env() -> Result<JwtManager, JwtError> {
     use crate::config::conf_file::resolve_ferrum_var;
 
-    let secret = resolve_ferrum_var("FERRUM_ADMIN_JWT_SECRET").ok_or_else(|| {
-        JwtError::VerificationFailed("FERRUM_ADMIN_JWT_SECRET not set".to_string())
-    })?;
+    let secret = resolve_ferrum_var("FERRUM_ADMIN_JWT_SECRET")
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            JwtError::VerificationFailed(
+                "FERRUM_ADMIN_JWT_SECRET must be set and non-empty".to_string(),
+            )
+        })?;
 
     let issuer =
         resolve_ferrum_var("FERRUM_ADMIN_JWT_ISSUER").unwrap_or_else(|| "ferrum-edge".to_string());

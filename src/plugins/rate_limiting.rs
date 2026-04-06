@@ -229,6 +229,9 @@ impl RateLimiting {
 
         let window_specs = if let Some(window_seconds) = config["window_seconds"].as_u64() {
             let max_requests = config["max_requests"].as_u64().unwrap_or(10);
+            if max_requests == 0 {
+                return Err("rate_limiting: 'max_requests' must be greater than zero".to_string());
+            }
             // Use the exact window duration — no conversion or precision loss
             vec![WindowSpec {
                 limit: max_requests,
@@ -238,18 +241,35 @@ impl RateLimiting {
             // Use the explicit rate limits if provided
             let mut specs = Vec::new();
             if let Some(limit) = config["requests_per_second"].as_u64() {
+                if limit == 0 {
+                    return Err(
+                        "rate_limiting: 'requests_per_second' must be greater than zero"
+                            .to_string(),
+                    );
+                }
                 specs.push(WindowSpec {
                     limit,
                     duration: Duration::from_secs(1),
                 });
             }
             if let Some(limit) = config["requests_per_minute"].as_u64() {
+                if limit == 0 {
+                    return Err(
+                        "rate_limiting: 'requests_per_minute' must be greater than zero"
+                            .to_string(),
+                    );
+                }
                 specs.push(WindowSpec {
                     limit,
                     duration: Duration::from_secs(60),
                 });
             }
             if let Some(limit) = config["requests_per_hour"].as_u64() {
+                if limit == 0 {
+                    return Err(
+                        "rate_limiting: 'requests_per_hour' must be greater than zero".to_string(),
+                    );
+                }
                 specs.push(WindowSpec {
                     limit,
                     duration: Duration::from_secs(3600),

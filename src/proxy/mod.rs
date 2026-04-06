@@ -47,6 +47,7 @@ use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode, upgrade::OnUpgrade, upgrade::Upgraded};
 use hyper_util::rt::TokioIo;
+use percent_encoding::percent_decode_str;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -1648,7 +1649,10 @@ impl ProxyState {
     /// loading and diffing the full config on every poll cycle.
     ///
     /// Returns `true` if changes were applied.
-    pub fn apply_incremental(&self, result: crate::config::db_loader::IncrementalResult) -> bool {
+    pub async fn apply_incremental(
+        &self,
+        result: crate::config::db_loader::IncrementalResult,
+    ) -> bool {
         if result.is_empty() {
             return false;
         }
@@ -1939,18 +1943,15 @@ impl ProxyState {
             .any(|p| p.backend_protocol.is_stream_proxy())
             || removed_had_stream;
         if stream_proxies_changed {
-            let slm = self.stream_listener_manager.clone();
-            tokio::spawn(async move {
-                let failures = slm.reconcile().await;
-                for (proxy_id, port, err) in &failures {
-                    tracing::error!(
-                        proxy_id = %proxy_id,
-                        port = port,
-                        "Stream listener failed to bind on incremental config update: {}",
-                        err
-                    );
-                }
-            });
+            let failures = self.stream_listener_manager.reconcile().await;
+            for (proxy_id, port, err) in &failures {
+                tracing::error!(
+                    proxy_id = %proxy_id,
+                    port = port,
+                    "Stream listener failed to bind on incremental config update: {}",
+                    err
+                );
+            }
         }
 
         info!(
@@ -3713,9 +3714,9 @@ pub async fn handle_proxy_request(
         }
     }
 
-    // Validate query parameter count
+    // Validate query parameter count (skip empty segments from consecutive '&')
     if state.max_query_params > 0 && !query_string.is_empty() {
-        let param_count = query_string.split('&').count();
+        let param_count = query_string.split('&').filter(|s| !s.is_empty()).count();
         if param_count > state.max_query_params {
             record_request(&state, 400);
             return Ok(build_response(
@@ -3819,12 +3820,23 @@ pub async fn handle_proxy_request(
         None
     };
 
-    // Parse query params (skip when empty — most requests have no query string)
+    // Parse query params (skip when empty — most requests have no query string).
+    // Keys and values are percent-decoded so plugins see human-readable strings.
+    // Parameters without '=' (e.g., `?flag`) are stored with an empty-string value.
     if !query_string.is_empty() {
         for pair in query_string.split('&') {
-            if let Some((k, v)) = pair.split_once('=') {
-                ctx.query_params.insert(k.to_string(), v.to_string());
+            if pair.is_empty() {
+                continue;
             }
+            let (k, v) = if let Some((k, v)) = pair.split_once('=') {
+                (k, v)
+            } else {
+                (pair, "")
+            };
+            let decoded_k = percent_decode_str(k).decode_utf8_lossy();
+            let decoded_v = percent_decode_str(v).decode_utf8_lossy();
+            ctx.query_params
+                .insert(decoded_k.into_owned(), decoded_v.into_owned());
         }
     }
 

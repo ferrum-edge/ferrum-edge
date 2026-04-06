@@ -320,7 +320,7 @@ pub async fn connect_and_subscribe_with_startup_ready(
                 // DELTA — apply incremental changes only
                 match serde_json::from_str::<IncrementalResult>(&update.config_json) {
                     Ok(result) => {
-                        if proxy_state.apply_incremental(result) {
+                        if proxy_state.apply_incremental(result).await {
                             info!("Incremental config delta applied from CP");
                         }
                     }

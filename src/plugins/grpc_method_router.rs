@@ -113,6 +113,12 @@ impl GrpcMethodRouter {
                     spec["max_requests"].as_u64(),
                     spec["window_seconds"].as_u64(),
                 ) {
+                    if max_requests == 0 {
+                        return Err(format!(
+                            "grpc_method_router: method_rate_limits['{}']: 'max_requests' must be greater than zero",
+                            method
+                        ));
+                    }
                     let normalized = method.strip_prefix('/').unwrap_or(method).to_string();
                     method_rate_limits.insert(
                         normalized,

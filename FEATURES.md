@@ -56,7 +56,7 @@ Ferrum supports dynamic upstream target discovery through three providers, confi
 
 ## Plugin System
 
-- 49 built-in plugins with lifecycle hooks (request received, authenticate, authorize, before proxy, after proxy, on final request/response body, on response body, on WebSocket frame, on UDP datagram, log)
+- 50 built-in plugins with lifecycle hooks (request received, authenticate, authorize, before proxy, after proxy, on final request/response body, on response body, on WebSocket frame, on UDP datagram, log)
 - Priority-ordered execution with protocol-aware filtering (HTTP, gRPC, WebSocket, TCP, UDP)
 - Multiple instances of the same plugin type per proxy (e.g., two `http_logging` for Splunk and Datadog) with optional `priority_override` for execution order control
 - Global and per-proxy scoping — proxy-scoped plugins replace global plugins of the same name

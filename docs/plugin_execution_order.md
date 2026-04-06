@@ -193,7 +193,7 @@ Session Established (on_stream_connect already ran)
 
 | # | Plugin | Priority | Behavior |
 |---|--------|----------|----------|
-| 1 | `udp_rate_limiting` | 2910 | Per-client-IP datagram and byte rate limiting |
+| 1 | `udp_rate_limiting` | 2915 | Per-client-IP datagram and byte rate limiting |
 
 ### Silent Drop Semantics
 
@@ -217,11 +217,11 @@ Priority bands are spaced with gaps so future plugins can slot in without renumb
 |------|---------------|---------|---------|
 | **Early** | 0–949 | Tracing, IDs, preflight, and request short-circuiting before auth | `otel_tracing` (25), `correlation_id` (50), `cors` (100), `request_termination` (125), `ip_restriction` (150), `bot_detection` (200), `sse` (250), `grpc_web` (260), `grpc_method_router` (275) |
 | **AuthN** | 950–1999 | Authentication / identity verification | `mtls_auth` (950), `jwks_auth` (1000), `jwt_auth` (1100), `key_auth` (1200), `ldap_auth` (1250), `basic_auth` (1300), `hmac_auth` (1400), `soap_ws_security` (1500) |
-| **Admission** | 2000–2999 | Authorization, validation, and request admission control | `access_control` (2000), `tcp_connection_throttle` (2050), `request_size_limiting` (2800), `ws_message_size_limiting` (2810), `graphql` (2850), `rate_limiting` (2900), `ws_rate_limiting` (2910), `udp_rate_limiting` (2910), `ai_prompt_shield` (2925), `body_validator` (2950), `ai_request_guard` (2975) |
+| **Admission** | 2000–2999 | Authorization, validation, and request admission control | `access_control` (2000), `tcp_connection_throttle` (2050), `request_size_limiting` (2800), `ws_message_size_limiting` (2810), `graphql` (2850), `rate_limiting` (2900), `ws_rate_limiting` (2910), `udp_rate_limiting` (2915), `ai_prompt_shield` (2925), `body_validator` (2950), `ai_request_guard` (2975) |
 | **Transform** | 3000–3999 | Request shaping and response buffering decisions | `request_transformer` (3000), `serverless_function` (3025), `response_mock` (3030), `grpc_deadline` (3050), `request_mirror` (3075), `response_size_limiting` (3490), `response_caching` (3500) |
 | **Response** | 4000–4999 | Response transformation, compression, and AI accounting | `response_transformer` (4000), `compression` (4050), `ai_token_metrics` (4100), `ai_rate_limiter` (4200) |
 | **Custom** | 5000 | Default for unrecognized/custom plugins | _(future plugins)_ |
-| **Logging** | 9000–9999 | Observability and frame logging | `stdout_logging` (9000), `ws_frame_logging` (9050), `statsd_logging` (9075), `http_logging` (9100), `tcp_logging` (9125), `loki_logging` (9150), `udp_logging` (9150), `ws_logging` (9175), `transaction_debugger` (9200), `prometheus_metrics` (9300) |
+| **Logging** | 9000–9999 | Observability and frame logging | `stdout_logging` (9000), `ws_frame_logging` (9050), `statsd_logging` (9075), `http_logging` (9100), `tcp_logging` (9125), `loki_logging` (9155), `udp_logging` (9160), `ws_logging` (9175), `transaction_debugger` (9200), `prometheus_metrics` (9300) |
 
 ## Complete Execution Order
 
@@ -253,7 +253,7 @@ Given all built-in plugins enabled, the execution order is:
 | 22 | `graphql` | 2850 | before_proxy |
 | 23 | `rate_limiting` | 2900 | on_request_received (IP mode), authorize (consumer mode), on_stream_connect |
 | 24 | `ws_rate_limiting` | 2910 | on_ws_frame |
-| 25 | `udp_rate_limiting` | 2910 | on_udp_datagram |
+| 25 | `udp_rate_limiting` | 2915 | on_udp_datagram |
 | 26 | `ai_prompt_shield` | 2925 | before_proxy, transform_request_body |
 | 27 | `body_validator` | 2950 | before_proxy, on_final_request_body, on_final_response_body |
 | 28 | `ai_request_guard` | 2975 | before_proxy, transform_request_body |
@@ -274,8 +274,8 @@ Given all built-in plugins enabled, the execution order is:
 | 43 | `http_logging` | 9100 | log, on_stream_disconnect |
 | 44 | `tcp_logging` | 9125 | log, on_stream_disconnect |
 | 45 | `kafka_logging` | 9150 | log, on_stream_disconnect |
-| 46 | `loki_logging` | 9150 | log, on_stream_disconnect |
-| 47 | `udp_logging` | 9150 | log, on_stream_disconnect |
+| 46 | `loki_logging` | 9155 | log, on_stream_disconnect |
+| 47 | `udp_logging` | 9160 | log, on_stream_disconnect |
 | 48 | `ws_logging` | 9175 | log, on_stream_disconnect |
 | 49 | `transaction_debugger` | 9200 | on_request_received, after_proxy, log, on_stream_disconnect |
 | 50 | `prometheus_metrics` | 9300 | log, on_stream_disconnect |

@@ -1,6 +1,6 @@
 # Plugin Reference
 
-Ferrum Edge includes 48 built-in plugins organized into lifecycle phases. Each plugin executes at a specific priority (lower number = runs first).
+Ferrum Edge includes 50 built-in plugins organized into lifecycle phases. Each plugin executes at a specific priority (lower number = runs first).
 
 For execution order, protocol support matrix, and design rationale, see [plugin_execution_order.md](plugin_execution_order.md).
 
@@ -448,7 +448,7 @@ For TLS, add `ssl_enable => true` with your certificate configuration to the Log
 
 Sends transaction summaries as JSON to an external UDP endpoint. Entries are buffered and sent in batches (as a JSON array) in a single UDP datagram. Supports both plain UDP and DTLS-encrypted transport.
 
-**Priority:** 9150
+**Priority:** 9160
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
@@ -907,7 +907,7 @@ UDP sessions are logged when the session is cleaned up after idle timeout.
 
 ### `loki_logging`
 
-**Priority**: 9150
+**Priority**: 9155
 **Phases**: `log`, `on_stream_disconnect`
 **Protocols**: All (HTTP, gRPC, WebSocket, TCP, UDP)
 

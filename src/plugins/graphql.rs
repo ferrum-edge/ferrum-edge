@@ -123,6 +123,12 @@ impl GraphqlPlugin {
                     spec["max_requests"].as_u64(),
                     spec["window_seconds"].as_u64(),
                 ) {
+                    if max_requests == 0 {
+                        return Err(format!(
+                            "graphql: type_rate_limits['{}']: 'max_requests' must be greater than zero",
+                            op_type
+                        ));
+                    }
                     type_rate_limits.insert(
                         op_type.to_lowercase(),
                         RateSpec {
@@ -141,6 +147,12 @@ impl GraphqlPlugin {
                     spec["max_requests"].as_u64(),
                     spec["window_seconds"].as_u64(),
                 ) {
+                    if max_requests == 0 {
+                        return Err(format!(
+                            "graphql: operation_rate_limits['{}']: 'max_requests' must be greater than zero",
+                            op_name
+                        ));
+                    }
                     operation_rate_limits.insert(
                         op_name.clone(),
                         RateSpec {
