@@ -32,6 +32,7 @@ fn make_ctx(proxy_id: &str, ip: &str, consumer: Option<&str>) -> StreamConnectio
         metadata: HashMap::new(),
         tls_client_cert_der: None,
         tls_client_cert_chain_der: None,
+        sni_hostname: None,
     }
 }
 
@@ -51,6 +52,7 @@ fn make_summary(metadata: HashMap<String, String>) -> StreamTransactionSummary {
         error_class: None,
         timestamp_connected: "2026-04-02T00:00:00Z".to_string(),
         timestamp_disconnected: "2026-04-02T00:00:01Z".to_string(),
+        sni_hostname: None,
         metadata,
     }
 }

@@ -810,6 +810,13 @@ pub struct Proxy {
     /// For UDP: uses the DTLS certificate for DTLS termination (ECDSA P-256 or Ed25519).
     #[serde(default)]
     pub frontend_tls: bool,
+    /// When true, forward encrypted client bytes directly to the backend without
+    /// terminating TLS (TCP) or DTLS (UDP). The proxy peeks at the TLS/DTLS
+    /// ClientHello to extract SNI for routing and logging but never decrypts
+    /// application data. Only valid for stream proxies (tcp, tcp_tls, udp, dtls).
+    /// Mutually exclusive with `frontend_tls`.
+    #[serde(default)]
+    pub passthrough: bool,
     /// UDP session idle timeout in seconds. After this duration of inactivity,
     /// the UDP session mapping is removed. Default: 60 seconds.
     #[serde(default = "default_udp_idle_timeout")]
@@ -1416,11 +1423,15 @@ impl GatewayConfig {
     /// Validate stream proxy (TCP/UDP) configuration.
     ///
     /// - Stream proxies must have a `listen_port` in range 1024-65535.
-    /// - `listen_port` must be unique across all stream proxies.
+    /// - `listen_port` must be unique across all stream proxies, **unless** all
+    ///   proxies sharing the port have `passthrough: true` (SNI-based routing).
     /// - HTTP proxies must not set `listen_port`.
+    /// - Passthrough proxies sharing a port must have non-overlapping `hosts`
+    ///   and at most one may have empty `hosts` (catch-all/default).
     pub fn validate_stream_proxies(&self) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
-        let mut seen_ports: HashMap<u16, &str> = HashMap::new();
+        // Map port -> list of proxy IDs that use it
+        let mut port_proxies: HashMap<u16, Vec<&str>> = HashMap::new();
 
         for proxy in &self.proxies {
             if proxy.backend_protocol.is_stream_proxy() {
@@ -1438,12 +1449,7 @@ impl GatewayConfig {
                         ));
                     }
                     Some(port) => {
-                        if let Some(existing_id) = seen_ports.insert(port, &proxy.id) {
-                            errors.push(format!(
-                                "Duplicate listen_port {} in proxy '{}' (conflicts with '{}')",
-                                port, proxy.id, existing_id
-                            ));
-                        }
+                        port_proxies.entry(port).or_default().push(&proxy.id);
                     }
                 }
             } else if proxy.listen_port.is_some() {
@@ -1451,6 +1457,60 @@ impl GatewayConfig {
                     "HTTP proxy '{}' (protocol {}) must not set listen_port",
                     proxy.id, proxy.backend_protocol
                 ));
+            }
+        }
+
+        // Validate port sharing rules
+        for (port, proxy_ids) in &port_proxies {
+            if proxy_ids.len() <= 1 {
+                continue; // No conflict for single-proxy ports
+            }
+
+            // All proxies sharing a port must have passthrough: true
+            let proxies_on_port: Vec<&Proxy> = proxy_ids
+                .iter()
+                .filter_map(|id| self.proxies.iter().find(|p| p.id == *id))
+                .collect();
+
+            let all_passthrough = proxies_on_port.iter().all(|p| p.passthrough);
+            if !all_passthrough {
+                let non_pt: Vec<&str> = proxies_on_port
+                    .iter()
+                    .filter(|p| !p.passthrough)
+                    .map(|p| p.id.as_str())
+                    .collect();
+                errors.push(format!(
+                    "Duplicate listen_port {} — all proxies sharing a port must have passthrough: true, \
+                     but {} do not",
+                    port,
+                    non_pt.join(", ")
+                ));
+                continue;
+            }
+
+            // At most one proxy per port may have empty hosts (catch-all)
+            let catch_all_count = proxies_on_port
+                .iter()
+                .filter(|p| p.hosts.is_empty())
+                .count();
+            if catch_all_count > 1 {
+                errors.push(format!(
+                    "Passthrough port {} has {} proxies with empty hosts — at most one catch-all is allowed",
+                    port, catch_all_count
+                ));
+            }
+
+            // Check for host overlap between every pair
+            for (i, a) in proxies_on_port.iter().enumerate() {
+                for b in &proxies_on_port[i + 1..] {
+                    if hosts_overlap(&a.hosts, &b.hosts) {
+                        errors.push(format!(
+                            "Passthrough proxies '{}' and '{}' on port {} have overlapping hosts — \
+                             each SNI hostname must route to exactly one proxy",
+                            a.id, b.id, port
+                        ));
+                    }
+                }
             }
         }
 
@@ -1757,6 +1817,21 @@ impl Proxy {
         let mut errors = Vec::new();
         let is_stream_proxy = self.backend_protocol.is_stream_proxy();
 
+        // Passthrough mode validation
+        if self.passthrough {
+            if !is_stream_proxy {
+                errors.push(
+                    "passthrough is only supported for stream proxies (tcp, tcp_tls, udp, dtls)"
+                        .to_string(),
+                );
+            }
+            if self.frontend_tls {
+                errors.push(
+                    "passthrough and frontend_tls are mutually exclusive — passthrough forwards raw encrypted bytes without terminating TLS/DTLS".to_string(),
+                );
+            }
+        }
+
         // Name
         if let Some(ref name) = self.name
             && let Err(e) = validate_string_field("name", name, MAX_NAME_LENGTH)
@@ -1978,6 +2053,27 @@ impl Proxy {
                 errors.push(format!(
                     "backend_tls_verify_server_cert cannot be set to false when backend_protocol is '{protocol}' — there is no TLS to verify on plaintext protocols"
                 ));
+            }
+        }
+
+        // Reject backend TLS fields in passthrough mode — the proxy does not
+        // originate its own TLS to the backend; the client's encrypted stream
+        // passes through directly.
+        if self.passthrough {
+            if self.backend_tls_client_cert_path.is_some() {
+                errors.push(
+                    "backend_tls_client_cert_path cannot be set when passthrough is true — the proxy does not originate backend TLS in passthrough mode".to_string(),
+                );
+            }
+            if self.backend_tls_client_key_path.is_some() {
+                errors.push(
+                    "backend_tls_client_key_path cannot be set when passthrough is true — the proxy does not originate backend TLS in passthrough mode".to_string(),
+                );
+            }
+            if self.backend_tls_server_ca_cert_path.is_some() {
+                errors.push(
+                    "backend_tls_server_ca_cert_path cannot be set when passthrough is true — the proxy does not originate backend TLS in passthrough mode".to_string(),
+                );
             }
         }
 

@@ -151,8 +151,9 @@ src/
 │   ├── client_ip.rs           # Client IP resolution (trusted proxies, XFF)
 │   ├── grpc_proxy.rs          # gRPC reverse proxy with HTTP/2 trailer support
 │   ├── http2_pool.rs          # HTTP/2 direct connection pool (hyper H2, sharded senders)
-│   ├── tcp_proxy.rs           # Raw TCP stream proxy with TLS termination/origination
-│   ├── udp_proxy.rs           # UDP datagram proxy with per-client session tracking, DTLS frontend/backend
+│   ├── sni.rs                 # SNI extraction from TLS/DTLS ClientHello (used by passthrough mode)
+│   ├── tcp_proxy.rs           # Raw TCP stream proxy with TLS termination/origination/passthrough
+│   ├── udp_proxy.rs           # UDP datagram proxy with per-client session tracking, DTLS frontend/backend/passthrough
 │   └── stream_listener.rs     # Stream listener lifecycle manager (reconcile on config reload, port pre-bind check)
 ├── plugins/                   # Plugin system (49 plugins, including 4 AI/LLM, 1 serverless, 1 response mock, 1 compression, 1 SSE, 3 gRPC, 3 WS frame, 1 WS logging, 1 UDP datagram, 1 Loki logging, 1 UDP logging, 1 Kafka logging, and 1 SOAP WS-Security plugin)
 │   ├── mod.rs                 # Plugin trait, registry, priority constants, lifecycle
@@ -193,7 +194,7 @@ src/
 | Type | Description | Key Fields |
 |------|-------------|------------|
 | `GatewayConfig` | Top-level config container | proxies, consumers, upstreams, plugins |
-| `Proxy` | A route + backend target | listen_path, hosts, backend_host/port/protocol, plugins, TLS/DNS/timeout overrides, pool_*, circuit_breaker, retry, response_body_mode, allowed_ws_origins, udp_max_response_amplification_factor |
+| `Proxy` | A route + backend target | listen_path, hosts, backend_host/port/protocol, plugins, TLS/DNS/timeout overrides, pool_*, circuit_breaker, retry, response_body_mode, allowed_ws_origins, udp_max_response_amplification_factor, passthrough |
 | `Consumer` | An authenticated client identity | username, custom_id, credentials (HashMap), acl_groups (Vec), tags |
 | `Upstream` | A load-balanced target group | targets (host/port/weight/path), algorithm, health_checks |
 | `PluginConfig` | Plugin instance configuration | name, enabled, config (serde_json::Value), priority_override (Option<u16>) |
@@ -252,6 +253,23 @@ The gateway validates protocol-level constraints before routing to block smuggli
 - HTTP/2 stream abuse detection (`max_pending_accept_reset_streams`, `max_local_error_reset_streams`)
 - HTTP/3 QUIC packet format, TLS 1.3 handshake, stream state transitions
 - WebSocket frame format, masking, close frame validation (tokio-tungstenite)
+
+### TLS/DTLS Passthrough Mode
+
+When `passthrough: true` is set on a stream proxy, the gateway forwards encrypted client bytes directly to the backend without terminating TLS (TCP) or DTLS (UDP). The proxy peeks at the TLS/DTLS ClientHello to extract SNI for logging but never decrypts application data.
+
+**Implementation details:**
+- **TCP passthrough** (`src/proxy/tcp_proxy.rs`): Uses `TcpStream::peek()` to read the ClientHello without consuming bytes, then `bidirectional_copy` forwards the entire encrypted stream to the backend as plain TCP.
+- **UDP passthrough** (`src/proxy/udp_proxy.rs`): Parses the first DTLS ClientHello datagram for SNI, then creates a plain UDP backend socket (skips DTLS origination). All datagrams pass through unmodified.
+- **SNI extraction** (`src/proxy/sni.rs`): Hand-written TLS/DTLS ClientHello parser that extracts the server_name extension (type 0x0000) per RFC 6066 §3. Handles both TLS 1.2/1.3 and DTLS 1.2 ClientHello formats. SNI hostnames are normalized to lowercase.
+- **Stream listener** (`src/proxy/stream_listener.rs`): When `passthrough` is true, frontend TLS/DTLS config is skipped — the listener accepts raw TCP/UDP connections.
+
+**Validation rules** (in `Proxy::validate_fields_inner()`):
+- `passthrough` only valid on stream proxies (`is_stream_proxy()`)
+- Mutually exclusive with `frontend_tls` (can't terminate and pass through simultaneously)
+- Backend TLS fields (`backend_tls_client_cert_path`, `backend_tls_client_key_path`, `backend_tls_server_ca_cert_path`) are rejected — the proxy doesn't originate backend TLS in passthrough mode
+
+**Logging:** `StreamConnectionContext.sni_hostname` and `StreamTransactionSummary.sni_hostname` carry the extracted SNI to connection-lifecycle plugins (`on_stream_connect`, `on_stream_disconnect`).
 
 ### Stream Proxy Port Validation
 

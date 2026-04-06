@@ -48,6 +48,7 @@ fn make_stream_proxy(id: &str, protocol: BackendProtocol, port: u16) -> Proxy {
         response_body_mode: Default::default(),
         listen_port: Some(port),
         frontend_tls: false,
+        passthrough: false,
         udp_idle_timeout_seconds: 60,
         tcp_idle_timeout_seconds: Some(300),
         allowed_methods: None,
@@ -100,6 +101,7 @@ fn make_http_proxy(id: &str, listen_path: &str) -> Proxy {
         response_body_mode: Default::default(),
         listen_port: None,
         frontend_tls: false,
+        passthrough: false,
         udp_idle_timeout_seconds: 60,
         tcp_idle_timeout_seconds: Some(300),
         allowed_methods: None,
@@ -538,4 +540,198 @@ fn test_active_health_check_udp_probe_payload() {
     let hc: ActiveHealthCheck = serde_json::from_str(json).unwrap();
     assert_eq!(hc.probe_type, HealthProbeType::Udp);
     assert_eq!(hc.udp_probe_payload, Some("deadbeef".to_string()));
+}
+
+// --- Passthrough mode tests ---
+
+#[test]
+fn test_passthrough_default_false() {
+    let yaml = r#"
+id: "tcp-pass-1"
+listen_path: ""
+backend_protocol: tcp
+backend_host: "db.example.com"
+backend_port: 5432
+listen_port: 15432
+"#;
+    let proxy: Proxy = serde_yaml::from_str(yaml).unwrap();
+    assert!(!proxy.passthrough);
+}
+
+#[test]
+fn test_passthrough_valid_tcp() {
+    let mut proxy = make_stream_proxy("tcp-pass", BackendProtocol::Tcp, 15432);
+    proxy.passthrough = true;
+    proxy.frontend_tls = false;
+    assert!(proxy.validate_fields().is_ok());
+}
+
+#[test]
+fn test_passthrough_valid_udp() {
+    let mut proxy = make_stream_proxy("udp-pass", BackendProtocol::Udp, 10053);
+    proxy.passthrough = true;
+    proxy.frontend_tls = false;
+    assert!(proxy.validate_fields().is_ok());
+}
+
+#[test]
+fn test_passthrough_rejected_on_http_proxy() {
+    let mut proxy = make_http_proxy("http-pass", "/api");
+    proxy.passthrough = true;
+    let result = proxy.validate_fields();
+    assert!(result.is_err());
+    let errors = result.unwrap_err();
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("passthrough is only supported for stream proxies"))
+    );
+}
+
+#[test]
+fn test_passthrough_and_frontend_tls_mutually_exclusive() {
+    let mut proxy = make_stream_proxy("tcp-both", BackendProtocol::Tcp, 15432);
+    proxy.passthrough = true;
+    proxy.frontend_tls = true;
+    let result = proxy.validate_fields();
+    assert!(result.is_err());
+    let errors = result.unwrap_err();
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("passthrough and frontend_tls are mutually exclusive"))
+    );
+}
+
+#[test]
+fn test_passthrough_rejects_backend_tls_fields() {
+    let mut proxy = make_stream_proxy("tcp-pass-tls", BackendProtocol::TcpTls, 15432);
+    proxy.passthrough = true;
+    proxy.backend_tls_client_cert_path = Some("/tmp/cert.pem".to_string());
+    proxy.backend_tls_client_key_path = Some("/tmp/key.pem".to_string());
+    let result = proxy.validate_fields();
+    assert!(result.is_err());
+    let errors = result.unwrap_err();
+    assert!(errors.iter().any(|e| {
+        e.contains("backend_tls_client_cert_path cannot be set when passthrough is true")
+    }));
+}
+
+#[test]
+fn test_passthrough_yaml_deserialization() {
+    let yaml = r#"
+id: "tcp-pass-yaml"
+listen_path: ""
+backend_protocol: tcp
+backend_host: "db.internal"
+backend_port: 5432
+listen_port: 15432
+passthrough: true
+"#;
+    let proxy: Proxy = serde_yaml::from_str(yaml).unwrap();
+    assert!(proxy.passthrough);
+    assert!(!proxy.frontend_tls);
+    assert_eq!(proxy.backend_protocol, BackendProtocol::Tcp);
+}
+
+// --- SNI-based port sharing tests ---
+
+#[test]
+fn test_passthrough_port_sharing_allowed() {
+    let mut p1 = make_stream_proxy("pt-a", BackendProtocol::Tcp, 8444);
+    p1.passthrough = true;
+    p1.hosts = vec!["a.example.com".to_string()];
+
+    let mut p2 = make_stream_proxy("pt-b", BackendProtocol::Tcp, 8444);
+    p2.passthrough = true;
+    p2.hosts = vec!["b.example.com".to_string()];
+
+    let config = test_config(vec![p1, p2]);
+    assert!(config.validate_stream_proxies().is_ok());
+}
+
+#[test]
+fn test_passthrough_port_sharing_with_catchall() {
+    let mut p1 = make_stream_proxy("pt-specific", BackendProtocol::Tcp, 8444);
+    p1.passthrough = true;
+    p1.hosts = vec!["specific.example.com".to_string()];
+
+    let mut p2 = make_stream_proxy("pt-catchall", BackendProtocol::Tcp, 8444);
+    p2.passthrough = true;
+    p2.hosts = vec![]; // catch-all
+
+    let config = test_config(vec![p1, p2]);
+    // Catch-all overlaps with everything — rejected
+    let result = config.validate_stream_proxies();
+    assert!(result.is_err());
+    let errors = result.unwrap_err();
+    assert!(errors.iter().any(|e| e.contains("overlapping hosts")));
+}
+
+#[test]
+fn test_passthrough_port_sharing_rejected_for_non_passthrough() {
+    let mut p1 = make_stream_proxy("pt", BackendProtocol::Tcp, 8444);
+    p1.passthrough = true;
+    p1.hosts = vec!["a.example.com".to_string()];
+
+    let p2 = make_stream_proxy("non-pt", BackendProtocol::Tcp, 8444);
+    // p2.passthrough is false by default
+
+    let config = test_config(vec![p1, p2]);
+    let result = config.validate_stream_proxies();
+    assert!(result.is_err());
+    let errors = result.unwrap_err();
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("all proxies sharing a port must have passthrough: true"))
+    );
+}
+
+#[test]
+fn test_passthrough_port_sharing_overlapping_hosts_rejected() {
+    let mut p1 = make_stream_proxy("pt-a", BackendProtocol::Tcp, 8444);
+    p1.passthrough = true;
+    p1.hosts = vec!["shared.example.com".to_string()];
+
+    let mut p2 = make_stream_proxy("pt-b", BackendProtocol::Tcp, 8444);
+    p2.passthrough = true;
+    p2.hosts = vec!["shared.example.com".to_string()]; // overlaps with p1
+
+    let config = test_config(vec![p1, p2]);
+    let result = config.validate_stream_proxies();
+    assert!(result.is_err());
+    let errors = result.unwrap_err();
+    assert!(errors.iter().any(|e| e.contains("overlapping hosts")));
+}
+
+#[test]
+fn test_passthrough_port_sharing_wildcard_hosts() {
+    let mut p1 = make_stream_proxy("pt-wild", BackendProtocol::Tcp, 8444);
+    p1.passthrough = true;
+    p1.hosts = vec!["*.example.com".to_string()];
+
+    let mut p2 = make_stream_proxy("pt-other", BackendProtocol::Tcp, 8444);
+    p2.passthrough = true;
+    p2.hosts = vec!["other.org".to_string()];
+
+    let config = test_config(vec![p1, p2]);
+    assert!(config.validate_stream_proxies().is_ok());
+}
+
+#[test]
+fn test_passthrough_port_sharing_two_catchalls_rejected() {
+    let mut p1 = make_stream_proxy("pt-a", BackendProtocol::Tcp, 8444);
+    p1.passthrough = true;
+    p1.hosts = vec![];
+
+    let mut p2 = make_stream_proxy("pt-b", BackendProtocol::Tcp, 8444);
+    p2.passthrough = true;
+    p2.hosts = vec![];
+
+    let config = test_config(vec![p1, p2]);
+    let result = config.validate_stream_proxies();
+    assert!(result.is_err());
+    let errors = result.unwrap_err();
+    assert!(errors.iter().any(|e| e.contains("at most one catch-all")));
 }

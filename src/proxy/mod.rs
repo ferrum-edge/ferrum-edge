@@ -34,6 +34,7 @@ pub mod body;
 pub mod client_ip;
 pub mod grpc_proxy;
 pub mod http2_pool;
+pub mod sni;
 pub mod stream_listener;
 pub mod tcp_proxy;
 pub mod udp_proxy;

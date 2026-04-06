@@ -493,6 +493,10 @@ pub struct StreamConnectionContext {
     /// DER-encoded CA/intermediate certificates from the client's certificate chain.
     /// Contains all certificates after the peer cert (index 1+) sent during the handshake.
     pub tls_client_cert_chain_der: Option<Arc<Vec<Vec<u8>>>>,
+    /// SNI hostname extracted from the TLS/DTLS ClientHello during passthrough mode.
+    /// Populated only for proxies with `passthrough: true`. Available to plugins for
+    /// logging, routing, or access control without requiring TLS termination.
+    pub sni_hostname: Option<String>,
 }
 
 impl StreamConnectionContext {
@@ -527,6 +531,9 @@ pub struct StreamTransactionSummary {
     pub error_class: Option<crate::retry::ErrorClass>,
     pub timestamp_connected: String,
     pub timestamp_disconnected: String,
+    /// SNI hostname extracted from the TLS/DTLS ClientHello during passthrough mode.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sni_hostname: Option<String>,
     /// Plugin-injected metadata (e.g., correlation ID, trace ID) carried
     /// from `on_stream_connect` to `on_stream_disconnect`.
     #[serde(skip_serializing_if = "HashMap::is_empty")]

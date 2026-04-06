@@ -103,6 +103,77 @@ All combinations of frontend and backend encryption are supported:
 | `dtls` | Plain UDP | DTLS |
 | `dtls` + `frontend_tls: true` | DTLS | DTLS (full e2e) |
 
+### TLS/DTLS Passthrough Mode
+
+Set `passthrough: true` to forward encrypted client bytes directly to the backend without terminating TLS or DTLS. The gateway peeks at the TLS/DTLS ClientHello to extract the SNI hostname for logging and metrics, but never decrypts application data.
+
+| Configuration | Client → Gateway | Gateway → Backend |
+|---------------|------------------|-------------------|
+| `tcp` + `passthrough: true` | TLS (untouched) | TLS (forwarded as-is) |
+| `udp` + `passthrough: true` | DTLS (untouched) | DTLS (forwarded as-is) |
+
+**Use cases:**
+- End-to-end encryption where the proxy must not see plaintext (zero-trust, compliance)
+- Performance — skip two TLS handshakes (termination + re-origination)
+- Protocol-agnostic proxying of any TLS-wrapped protocol
+
+```yaml
+proxies:
+  - id: "tls-passthrough"
+    listen_port: 8444
+    backend_protocol: tcp
+    passthrough: true              # Forward raw encrypted bytes
+    backend_host: "backend.internal"
+    backend_port: 443
+```
+
+**SNI-based routing:** Multiple passthrough proxies can share the same `listen_port` to route to different backends based on the SNI hostname. Each proxy's `hosts` field defines which hostnames it handles (exact match and wildcards like `*.example.com`). One proxy per port may have empty `hosts` as a catch-all/default.
+
+```yaml
+proxies:
+  # Route TLS traffic for api.example.com to the API backend
+  - id: "tls-api"
+    listen_port: 8444
+    backend_protocol: tcp
+    passthrough: true
+    hosts: ["api.example.com"]
+    backend_host: "api-backend.internal"
+    backend_port: 443
+
+  # Route TLS traffic for *.db.example.com to the database backend
+  - id: "tls-db"
+    listen_port: 8444
+    backend_protocol: tcp
+    passthrough: true
+    hosts: ["*.db.example.com"]
+    backend_host: "db-backend.internal"
+    backend_port: 5432
+
+  # Catch-all: any other SNI goes to the default backend
+  - id: "tls-default"
+    listen_port: 8444
+    backend_protocol: tcp
+    passthrough: true
+    hosts: []
+    backend_host: "default-backend.internal"
+    backend_port: 443
+```
+
+**Constraints:**
+- `passthrough` and `frontend_tls` are mutually exclusive
+- Only valid on stream proxies (`tcp`, `tcp_tls`, `udp`, `dtls`)
+- Backend TLS fields (`backend_tls_client_cert_path`, etc.) cannot be set — the proxy does not originate its own TLS
+- Plugins that require decrypted content cannot run; connection-level plugins (IP restriction, rate limiting, logging, throttle) still operate normally
+- SNI hostname is available in `StreamConnectionContext.sni_hostname` and `StreamTransactionSummary.sni_hostname` for logging plugins
+- When sharing a port, all proxies must have `passthrough: true`, hosts must not overlap, and at most one catch-all (empty `hosts`) is allowed
+
+**What's available in passthrough logs:**
+- Client IP/port, backend IP/port
+- SNI hostname (from ClientHello)
+- Bytes transferred (both directions)
+- Connection duration, timestamps
+- Connection success/failure
+
 ### Frontend TLS Termination (TCP)
 
 Set `frontend_tls: true` to accept TLS connections from clients. The gateway uses its configured TLS certificates (same as HTTPS) to terminate the connection, then forwards plaintext to the backend.

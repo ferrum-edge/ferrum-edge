@@ -9,8 +9,9 @@ A comprehensive feature list for Ferrum Edge.
 - **HTTP/3** (QUIC) on the same port as HTTPS with streaming responses (backpressure-aware adaptive coalescing), configurable idle timeout, max streams, QUIC flow-control windows, and per-backend connection pooling
 - **WebSocket** (`ws`/`wss`) with transparent upgrade handling (HTTP/1.1 Upgrade and HTTP/2 Extended CONNECT per RFC 8441)
 - **gRPC** (`grpc`/`grpcs`) with HTTP/2 trailer support and full plugin compatibility
-- **TCP** stream proxying with TLS termination, origination, and configurable idle timeout
-- **UDP** datagram proxying with DTLS support (frontend termination + backend origination)
+- **TCP** stream proxying with TLS termination, origination, passthrough, and configurable idle timeout
+- **UDP** datagram proxying with DTLS support (frontend termination, backend origination, passthrough)
+- **TLS/DTLS passthrough** — forward encrypted bytes without termination, with SNI extraction for logging
 
 ## Operating Modes
 

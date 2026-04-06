@@ -30,6 +30,7 @@ struct ListenerHandle {
     listen_port: u16,
     protocol: BackendProtocol,
     frontend_tls: bool,
+    passthrough: bool,
     started: Arc<AtomicBool>,
 }
 
@@ -154,39 +155,103 @@ impl StreamListenerManager {
         let mut listeners = self.listeners.lock().await;
 
         // Collect all desired stream proxies from config
-        let desired: std::collections::HashMap<String, (u16, BackendProtocol, bool)> =
+        let desired: std::collections::HashMap<String, (u16, BackendProtocol, bool, bool)> =
             current_config
                 .proxies
                 .iter()
                 .filter(|p| p.backend_protocol.is_stream_proxy())
                 .filter_map(|p| {
-                    p.listen_port
-                        .map(|port| (p.id.clone(), (port, p.backend_protocol, p.frontend_tls)))
+                    p.listen_port.map(|port| {
+                        (
+                            p.id.clone(),
+                            (port, p.backend_protocol, p.frontend_tls, p.passthrough),
+                        )
+                    })
                 })
                 .collect();
 
-        // Stop listeners for removed proxies or changed port/protocol
+        // Detect passthrough port groups: multiple passthrough proxies sharing a port.
+        // These get a single shared listener keyed by "__sni_{port}" instead of individual
+        // proxy_id keys. The listener dispatches connections based on SNI.
+        let mut passthrough_groups: std::collections::HashMap<u16, Vec<String>> =
+            std::collections::HashMap::new();
+        for (proxy_id, (port, _protocol, _frontend_tls, passthrough)) in &desired {
+            if *passthrough {
+                passthrough_groups
+                    .entry(*port)
+                    .or_default()
+                    .push(proxy_id.clone());
+            }
+        }
+        // Only ports with 2+ passthrough proxies are SNI-routed groups
+        passthrough_groups.retain(|_, ids| ids.len() > 1);
+        // Sort IDs for stable comparison on reconcile
+        for ids in passthrough_groups.values_mut() {
+            ids.sort();
+        }
+
+        // Build the effective desired map: individual proxies + SNI group entries.
+        // Proxies in a group are replaced by a single "__sni_{port}" entry.
+        let grouped_proxy_ids: std::collections::HashSet<&str> = passthrough_groups
+            .values()
+            .flat_map(|ids| ids.iter().map(|s| s.as_str()))
+            .collect();
+
+        #[allow(clippy::type_complexity)]
+        let mut effective_desired: std::collections::HashMap<
+            String,
+            (u16, BackendProtocol, bool, bool, Option<Vec<String>>),
+        > = std::collections::HashMap::new();
+
+        for (proxy_id, (port, protocol, frontend_tls, passthrough)) in &desired {
+            if grouped_proxy_ids.contains(proxy_id.as_str()) {
+                continue; // Handled as part of a group below
+            }
+            effective_desired.insert(
+                proxy_id.clone(),
+                (*port, *protocol, *frontend_tls, *passthrough, None),
+            );
+        }
+        for (port, ids) in &passthrough_groups {
+            let key = format!("__sni_{}", port);
+            // Use the first proxy's protocol for the listener
+            if let Some((_, protocol, frontend_tls, passthrough)) = desired.get(&ids[0]) {
+                effective_desired.insert(
+                    key,
+                    (
+                        *port,
+                        *protocol,
+                        *frontend_tls,
+                        *passthrough,
+                        Some(ids.clone()),
+                    ),
+                );
+            }
+        }
+
+        // Stop listeners for removed proxies or changed config
         let mut to_remove = Vec::new();
-        for (proxy_id, handle) in listeners.iter() {
-            match desired.get(proxy_id) {
+        for (key, handle) in listeners.iter() {
+            match effective_desired.get(key) {
                 None => {
-                    to_remove.push(proxy_id.clone());
+                    to_remove.push(key.clone());
                 }
-                Some((port, protocol, frontend_tls)) => {
+                Some((port, protocol, frontend_tls, passthrough, _)) => {
                     if handle.listen_port != *port
                         || handle.protocol != *protocol
                         || handle.frontend_tls != *frontend_tls
+                        || handle.passthrough != *passthrough
                     {
-                        to_remove.push(proxy_id.clone());
+                        to_remove.push(key.clone());
                     }
                 }
             }
         }
 
-        for proxy_id in &to_remove {
-            if let Some(handle) = listeners.remove(proxy_id) {
+        for key in &to_remove {
+            if let Some(handle) = listeners.remove(key) {
                 info!(
-                    proxy_id = %proxy_id,
+                    listener_key = %key,
                     port = handle.listen_port,
                     protocol = %handle.protocol,
                     "Stopping stream listener"
@@ -195,16 +260,19 @@ impl StreamListenerManager {
             }
         }
 
-        // Start listeners for new or restarted proxies
-        for (proxy_id, (port, protocol, frontend_tls)) in &desired {
-            if listeners.contains_key(proxy_id) {
+        // Start listeners for new or restarted entries
+        for (key, (port, protocol, frontend_tls, passthrough, sni_ids)) in &effective_desired {
+            if listeners.contains_key(key) {
                 continue;
             }
+            // Resolve the proxy_id to use (first in group or the individual proxy_id)
+            let proxy_id = sni_ids.as_ref().and_then(|ids| ids.first()).unwrap_or(key);
 
             // Skip frontend_tls proxies when the required encryption config is not yet loaded.
             // For TCP: needs rustls ServerConfig. For UDP: needs DTLS cert/key paths.
             // The mode will call reconcile() again after setting the config.
-            if *frontend_tls {
+            // Passthrough proxies never terminate TLS, so they skip this check entirely.
+            if *frontend_tls && !*passthrough {
                 if protocol.is_udp() {
                     if self.frontend_dtls_cert_key.load().is_none() {
                         info!(
@@ -262,7 +330,8 @@ impl StreamListenerManager {
             let join_handle = if protocol.is_udp() {
                 let started_for_listener = started.clone();
                 // UDP or DTLS listener
-                let frontend_dtls_config = if *frontend_tls {
+                // Passthrough proxies forward raw encrypted datagrams — no DTLS termination.
+                let frontend_dtls_config = if *frontend_tls && !*passthrough {
                     let paths = self.frontend_dtls_cert_key.load();
                     match paths.as_ref() {
                         Some((cert_path, key_path)) => {
@@ -298,6 +367,7 @@ impl StreamListenerManager {
                 let consumer_index = self.consumer_index.clone();
                 let plugin_cache = self.plugin_cache.clone();
                 let crls = self.crls.clone();
+                let sni_ids = sni_ids.clone();
                 tokio::spawn(async move {
                     if let Err(e) = super::udp_proxy::start_udp_listener(UdpListenerConfig {
                         port: port_val,
@@ -317,6 +387,7 @@ impl StreamListenerManager {
                         circuit_breaker_cache: cb_cache,
                         crls,
                         started: started_for_listener,
+                        sni_proxy_ids: sni_ids,
                     })
                     .await
                     {
@@ -331,7 +402,8 @@ impl StreamListenerManager {
             } else {
                 let started_for_listener = started.clone();
                 // TCP or TcpTls listener
-                let tls_config = if *frontend_tls {
+                // Passthrough proxies forward raw encrypted bytes — no TLS termination.
+                let tls_config = if *frontend_tls && !*passthrough {
                     self.frontend_tls_config.load().as_ref().clone()
                 } else {
                     None
@@ -343,6 +415,7 @@ impl StreamListenerManager {
                 let tls_policy = self.tls_policy.clone();
                 let crls = self.crls.clone();
                 let tls_ca_bundle_path = self.tls_ca_bundle_path.clone();
+                let sni_ids = sni_ids.clone();
                 tokio::spawn(async move {
                     if let Err(e) = super::tcp_proxy::start_tcp_listener(TcpListenerConfig {
                         port: port_val,
@@ -363,6 +436,7 @@ impl StreamListenerManager {
                         tls_policy,
                         crls,
                         started: started_for_listener,
+                        sni_proxy_ids: sni_ids,
                     })
                     .await
                     {
@@ -377,6 +451,7 @@ impl StreamListenerManager {
             };
 
             info!(
+                listener_key = %key,
                 proxy_id = %proxy_id,
                 port = port,
                 protocol = %protocol,
@@ -384,13 +459,14 @@ impl StreamListenerManager {
             );
 
             listeners.insert(
-                proxy_id.clone(),
+                key.clone(),
                 ListenerHandle {
                     shutdown_tx,
                     _join_handle: join_handle,
                     listen_port: *port,
                     protocol: *protocol,
                     frontend_tls: *frontend_tls,
+                    passthrough: *passthrough,
                     started,
                 },
             );
@@ -406,13 +482,20 @@ impl StreamListenerManager {
 
         loop {
             let current_config = self.config.load();
-            let desired: Vec<(String, u16, BackendProtocol, bool)> = current_config
+            let desired: Vec<(String, u16, BackendProtocol, bool, bool)> = current_config
                 .proxies
                 .iter()
                 .filter(|p| p.backend_protocol.is_stream_proxy())
                 .filter_map(|p| {
-                    p.listen_port
-                        .map(|port| (p.id.clone(), port, p.backend_protocol, p.frontend_tls))
+                    p.listen_port.map(|port| {
+                        (
+                            p.id.clone(),
+                            port,
+                            p.backend_protocol,
+                            p.frontend_tls,
+                            p.passthrough,
+                        )
+                    })
                 })
                 .collect();
 
@@ -420,12 +503,28 @@ impl StreamListenerManager {
                 return Ok(());
             }
 
+            // Detect SNI port groups to map proxy_ids to their listener key
+            let mut pt_port_count: std::collections::HashMap<u16, usize> =
+                std::collections::HashMap::new();
+            for (_, port, _, _, passthrough) in &desired {
+                if *passthrough {
+                    *pt_port_count.entry(*port).or_default() += 1;
+                }
+            }
+
             let all_started = {
                 let listeners = self.listeners.lock().await;
                 desired
                     .iter()
-                    .all(|(proxy_id, port, protocol, frontend_tls)| {
-                        listeners.get(proxy_id).is_some_and(|handle| {
+                    .all(|(proxy_id, port, protocol, frontend_tls, passthrough)| {
+                        // For SNI groups, the listener key is "__sni_{port}" not the proxy_id
+                        let key =
+                            if *passthrough && pt_port_count.get(port).copied().unwrap_or(0) > 1 {
+                                format!("__sni_{}", port)
+                            } else {
+                                proxy_id.clone()
+                            };
+                        listeners.get(&key).is_some_and(|handle| {
                             handle.listen_port == *port
                                 && handle.protocol == *protocol
                                 && handle.frontend_tls == *frontend_tls

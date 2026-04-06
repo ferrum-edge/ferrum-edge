@@ -276,6 +276,7 @@ async fn test_ip_restriction_stream_connect_allowed() {
         metadata: HashMap::new(),
         tls_client_cert_der: None,
         tls_client_cert_chain_der: None,
+        sni_hostname: None,
     };
 
     let result = plugin.on_stream_connect(&mut ctx).await;
@@ -302,6 +303,7 @@ async fn test_ip_restriction_stream_connect_denied() {
         metadata: HashMap::new(),
         tls_client_cert_der: None,
         tls_client_cert_chain_der: None,
+        sni_hostname: None,
     };
 
     let result = plugin.on_stream_connect(&mut ctx).await;
@@ -329,6 +331,7 @@ fn make_stream_ctx() -> StreamConnectionContext {
         metadata: HashMap::new(),
         tls_client_cert_der: None,
         tls_client_cert_chain_der: None,
+        sni_hostname: None,
     }
 }
 
@@ -348,6 +351,7 @@ fn make_stream_summary() -> StreamTransactionSummary {
         error_class: None,
         timestamp_connected: "2026-03-29T12:00:00Z".to_string(),
         timestamp_disconnected: "2026-03-29T12:00:01.5Z".to_string(),
+        sni_hostname: None,
         metadata: HashMap::new(),
     }
 }

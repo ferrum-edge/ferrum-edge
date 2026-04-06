@@ -1324,6 +1324,15 @@ components:
             For TCP: uses the gateway's TLS certificate.
             For UDP: uses DTLS with ECDSA P-256 or Ed25519 certificates
             (configured via FERRUM_DTLS_CERT_PATH/FERRUM_DTLS_KEY_PATH env vars).
+        passthrough:
+          type: boolean
+          default: false
+          description: |
+            Forward encrypted client bytes directly to the backend without
+            terminating TLS (TCP) or DTLS (UDP). The proxy peeks at the
+            ClientHello to extract SNI for logging but does not decrypt traffic.
+            Only valid for stream proxies (tcp, tcp_tls, udp, dtls).
+            Mutually exclusive with frontend_tls.
         tcp_idle_timeout_seconds:
           type: integer
           format: uint64

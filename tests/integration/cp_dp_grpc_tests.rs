@@ -88,6 +88,7 @@ fn create_test_proxy(id: &str, listen_path: &str) -> Proxy {
         response_body_mode: Default::default(),
         listen_port: None,
         frontend_tls: false,
+        passthrough: false,
         udp_idle_timeout_seconds: 60,
         tcp_idle_timeout_seconds: Some(300),
         allowed_methods: None,

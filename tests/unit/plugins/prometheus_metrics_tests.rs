@@ -59,6 +59,7 @@ fn make_stream_summary(proxy_id: &str, protocol: &str) -> StreamTransactionSumma
         error_class: None,
         timestamp_connected: "2025-01-01T00:00:00Z".to_string(),
         timestamp_disconnected: "2025-01-01T00:00:01Z".to_string(),
+        sni_hostname: None,
         metadata: HashMap::new(),
     }
 }

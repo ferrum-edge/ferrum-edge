@@ -143,6 +143,10 @@ pub struct TcpListenerConfig {
     pub crls: crate::tls::CrlList,
     /// Flipped once the listener successfully binds and can accept traffic.
     pub started: Arc<AtomicBool>,
+    /// When set, this listener serves multiple passthrough proxies sharing the port.
+    /// SNI from the ClientHello selects which proxy to route to.
+    /// When `None`, uses the single `proxy_id` (existing behavior).
+    pub sni_proxy_ids: Option<Vec<String>>,
 }
 
 /// Start a TCP proxy listener on the given port.
@@ -172,6 +176,7 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
         tls_policy,
         crls,
         started,
+        sni_proxy_ids,
     } = cfg;
     let addr = SocketAddr::new(bind_addr, port);
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -253,6 +258,7 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
                 let plugins = plugins.clone();
                 let proxy_name = proxy_name.clone();
                 let cb_cache = circuit_breaker_cache.clone();
+                let sni_proxy_ids = sni_proxy_ids.clone();
 
                 tokio::spawn(async move {
                     let connected_at = chrono::Utc::now();
@@ -271,6 +277,7 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
                         metadata: std::collections::HashMap::new(),
                         tls_client_cert_der: None,
                         tls_client_cert_chain_der: None,
+                        sni_hostname: None,
                     };
 
                     let result = handle_tcp_connection(
@@ -286,6 +293,7 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
                         &cb_cache,
                         &plugins,
                         &mut stream_ctx,
+                        sni_proxy_ids.as_deref(),
                     )
                     .await;
 
@@ -339,6 +347,7 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
                             error_class,
                             timestamp_connected: connected_at.to_rfc3339(),
                             timestamp_disconnected: disconnected_at.to_rfc3339(),
+                            sni_hostname: stream_ctx.sni_hostname.clone(),
                             metadata: stream_ctx.metadata,
                         };
                         for plugin in plugins.iter() {
@@ -371,6 +380,8 @@ struct TcpConnParams {
     retry: Option<crate::config::types::RetryConfig>,
     /// Upstream ID for load-balanced target selection on retry.
     upstream_id: Option<String>,
+    /// When true, forward encrypted client bytes directly without TLS termination.
+    passthrough: bool,
 }
 
 /// Lightweight snapshot of the proxy fields needed per TCP connection.
@@ -420,6 +431,7 @@ async fn handle_tcp_connection(
     circuit_breaker_cache: &CircuitBreakerCache,
     plugins: &[Arc<dyn crate::plugins::Plugin>],
     stream_ctx: &mut StreamConnectionContext,
+    sni_proxy_ids: Option<&[String]>,
 ) -> TcpConnectionResult {
     let start = Instant::now();
     let _ = client_stream.set_nodelay(true);
@@ -447,6 +459,7 @@ async fn handle_tcp_connection(
         &mut backend_info,
         plugins,
         stream_ctx,
+        sni_proxy_ids,
     )
     .await;
 
@@ -474,7 +487,39 @@ async fn handle_tcp_connection_inner(
     backend_info: &mut TcpBackendInfo,
     plugins: &[Arc<dyn crate::plugins::Plugin>],
     stream_ctx: &mut StreamConnectionContext,
+    sni_proxy_ids: Option<&[String]>,
 ) -> Result<TcpConnectionSuccess, anyhow::Error> {
+    // --- SNI-based proxy resolution for shared passthrough ports ---
+    // When multiple passthrough proxies share a listen_port, we must peek at
+    // the ClientHello to extract SNI before looking up the proxy config.
+    let _resolved_proxy_id: Option<String>;
+    let proxy_id = if let Some(sni_ids) = sni_proxy_ids {
+        let sni = super::sni::extract_sni_from_tcp_stream(&client_stream).await;
+        stream_ctx.sni_hostname = sni.clone();
+
+        let current_config = config.load();
+        let matched = super::sni::resolve_proxy_by_sni(sni.as_deref(), sni_ids, &current_config)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "No matching passthrough proxy for SNI {:?} on port {}",
+                    sni,
+                    stream_ctx.listen_port
+                )
+            })?;
+        _resolved_proxy_id = Some(matched.to_string());
+        // Update stream_ctx to reflect the resolved proxy
+        stream_ctx.proxy_id = matched.to_string();
+        stream_ctx.proxy_name = current_config
+            .proxies
+            .iter()
+            .find(|p| p.id == matched)
+            .and_then(|p| p.name.clone());
+        _resolved_proxy_id.as_deref().unwrap_or(proxy_id)
+    } else {
+        _resolved_proxy_id = None;
+        proxy_id
+    };
+
     // Look up the proxy config and extract only the fields we need.
     // The ArcSwap guard (and full Proxy) is dropped before any async work.
     let (params, cb_info) = {
@@ -513,10 +558,92 @@ async fn handle_tcp_connection_inner(
                 .unwrap_or(global_tcp_idle_timeout),
             retry: proxy.retry.clone(),
             upstream_id: proxy.upstream_id.clone(),
+            passthrough: proxy.passthrough,
         };
 
         (params, cb_info)
     };
+
+    // ----- Passthrough mode: forward encrypted bytes without TLS termination -----
+    if params.passthrough {
+        // Peek at the ClientHello to extract SNI for logging/routing.
+        // Skip if already extracted during SNI-based proxy resolution above.
+        if stream_ctx.sni_hostname.is_none() {
+            stream_ctx.sni_hostname = super::sni::extract_sni_from_tcp_stream(&client_stream).await;
+        }
+
+        // Run on_stream_connect plugins (they see SNI but not decrypted data).
+        if !plugins.is_empty() {
+            for plugin in plugins {
+                if let PluginResult::Reject { .. } = plugin.on_stream_connect(stream_ctx).await {
+                    debug!(
+                        proxy_id = %proxy_id,
+                        client = %remote_addr.ip(),
+                        sni = ?stream_ctx.sni_hostname,
+                        "TCP passthrough connection rejected by plugin"
+                    );
+                    return Err(anyhow::anyhow!("Connection rejected by plugin"));
+                }
+            }
+        }
+
+        let connect_timeout = Duration::from_millis(params.backend_connect_timeout_ms);
+        let idle_timeout = if params.tcp_idle_timeout_seconds > 0 {
+            Some(Duration::from_secs(params.tcp_idle_timeout_seconds))
+        } else {
+            None
+        };
+
+        // Resolve backend IP via DNS
+        let resolved_ip = dns_cache
+            .resolve(
+                &params.backend_host,
+                params.dns_override.as_deref(),
+                params.dns_cache_ttl_seconds,
+            )
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!("DNS resolution failed for {}: {}", params.backend_host, e)
+            })?;
+        let addr = SocketAddr::new(resolved_ip, params.backend_port);
+        backend_info.backend_resolved_ip = Some(resolved_ip.to_string());
+
+        // Connect plain TCP to backend (no TLS origination — the client's encrypted
+        // stream passes through directly to the backend which terminates TLS).
+        let backend_stream = connect_backend_plain(addr, connect_timeout)
+            .await
+            .inspect_err(|_| {
+                if let Some(ref cb_config) = cb_info.cb_config {
+                    let cb = circuit_breaker_cache.get_or_create(
+                        proxy_id,
+                        cb_info.cb_target_key.as_deref(),
+                        cb_config,
+                    );
+                    cb.record_failure(502, true);
+                }
+            })?;
+
+        let copy_result = bidirectional_copy(client_stream, backend_stream, idle_timeout).await;
+
+        // Record circuit breaker outcome.
+        if let Some(ref cb_config) = cb_info.cb_config {
+            let cb = circuit_breaker_cache.get_or_create(
+                proxy_id,
+                cb_info.cb_target_key.as_deref(),
+                cb_config,
+            );
+            match &copy_result {
+                Ok(_) => cb.record_success(),
+                Err(_) => cb.record_failure(502, true),
+            }
+        }
+
+        return copy_result.map(|(bytes_in, bytes_out)| TcpConnectionSuccess {
+            bytes_in,
+            bytes_out,
+            duration: start.elapsed(),
+        });
+    }
 
     let is_backend_tls = params.backend_protocol == BackendProtocol::TcpTls;
     let connect_timeout = Duration::from_millis(params.backend_connect_timeout_ms);

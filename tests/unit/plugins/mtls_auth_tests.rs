@@ -128,6 +128,7 @@ fn create_stream_ctx_with_cert(
         metadata: HashMap::new(),
         tls_client_cert_der: Some(Arc::new(cert_der)),
         tls_client_cert_chain_der: None,
+        sni_hostname: None,
     }
 }
 
@@ -801,6 +802,7 @@ fn create_udp_stream_ctx_with_cert(
         metadata: HashMap::new(),
         tls_client_cert_der: Some(Arc::new(cert_der)),
         tls_client_cert_chain_der: None,
+        sni_hostname: None,
     }
 }
 
@@ -817,6 +819,7 @@ fn create_udp_stream_ctx_no_cert(consumers: Vec<Consumer>) -> StreamConnectionCo
         metadata: HashMap::new(),
         tls_client_cert_der: None,
         tls_client_cert_chain_der: None,
+        sni_hostname: None,
     }
 }
 
@@ -877,6 +880,7 @@ async fn test_mtls_auth_dtls_with_issuer_verification() {
         metadata: HashMap::new(),
         tls_client_cert_der: Some(Arc::new(client_der)),
         tls_client_cert_chain_der: Some(Arc::new(vec![ca_der])),
+        sni_hostname: None,
     };
 
     let result = plugin.on_stream_connect(&mut ctx).await;

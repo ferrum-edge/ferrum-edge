@@ -23,6 +23,7 @@ fn create_stream_context(
         metadata: HashMap::new(),
         tls_client_cert_der: None,
         tls_client_cert_chain_der: None,
+        sni_hostname: None,
     }
 }
 
