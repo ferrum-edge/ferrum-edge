@@ -1,6 +1,6 @@
 # Database TLS Configuration
 
-Ferrum Edge supports TLS-encrypted connections to PostgreSQL and MySQL databases. SQLite is an embedded database with no network layer, so TLS does not apply.
+Ferrum Edge supports TLS-encrypted connections to PostgreSQL, MySQL, and MongoDB databases. SQLite is an embedded database with no network layer, so TLS does not apply.
 
 ## Quick Reference
 
@@ -8,6 +8,7 @@ Ferrum Edge supports TLS-encrypted connections to PostgreSQL and MySQL databases
 |------------|-------------|---------------------------------------------------------|----------------------|
 | PostgreSQL | Yes         | `disable`, `prefer`, `require`, `verify-ca`, `verify-full` | Yes                  |
 | MySQL      | Yes         | `disable`, `prefer`, `require`, `verify-ca`, `verify-full` | Yes                  |
+| MongoDB    | Yes         | Via `FERRUM_DB_TLS_*` env vars or connection string options | Yes                  |
 | SQLite     | N/A         | All SSL settings silently ignored                       | N/A                  |
 
 ## Configuration Approaches
@@ -239,6 +240,82 @@ docker run -d \
   -e FERRUM_ADMIN_JWT_SECRET=your-secret \
   -v $(pwd)/certs:/certs:ro \
   ferrum-edge
+```
+
+## MongoDB
+
+MongoDB TLS is configured through the `FERRUM_DB_TLS_*` environment variables (same as PostgreSQL/MySQL) or directly via connection string options. The `FERRUM_DB_TLS_*` approach is recommended for consistency with SQL backends.
+
+### Using FERRUM_DB_TLS_* Environment Variables (Recommended)
+
+```bash
+export FERRUM_MODE=database
+export FERRUM_DB_TYPE=mongodb
+export FERRUM_DB_URL="mongodb://user:pass@mongo.example.com:27017/ferrum?authSource=admin"
+export FERRUM_MONGO_DATABASE=ferrum
+
+# Enable TLS with CA verification
+export FERRUM_DB_TLS_ENABLED=true
+export FERRUM_DB_TLS_CA_CERT_PATH=/path/to/ca.pem
+
+# Client certificate authentication (mTLS)
+export FERRUM_DB_TLS_CLIENT_CERT_PATH=/path/to/client.crt
+export FERRUM_DB_TLS_CLIENT_KEY_PATH=/path/to/client.key
+
+# Skip server cert verification (testing only)
+# export FERRUM_DB_TLS_INSECURE=true
+```
+
+**Note:** MongoDB requires client cert + key in a single PEM file. When separate `FERRUM_DB_TLS_CLIENT_CERT_PATH` and `FERRUM_DB_TLS_CLIENT_KEY_PATH` are provided, the gateway automatically combines them into a temporary PEM file at startup.
+
+### Using Connection String Options
+
+TLS can also be configured directly in the MongoDB connection string. Connection string options take precedence over `FERRUM_DB_TLS_*` environment variables.
+
+```bash
+# TLS with CA verification
+export FERRUM_DB_URL="mongodb://user:pass@mongo.example.com:27017/ferrum?tls=true&tlsCAFile=/path/to/ca.pem"
+
+# mTLS (client cert auth) — cert+key must be in a single combined PEM file
+export FERRUM_DB_URL="mongodb://user:pass@mongo.example.com:27017/ferrum?tls=true&tlsCAFile=/path/to/ca.pem&tlsCertificateKeyFile=/path/to/client-combined.pem"
+
+# Skip cert validation (testing only)
+export FERRUM_DB_URL="mongodb://user:pass@mongo.example.com:27017/ferrum?tlsAllowInvalidCertificates=true"
+
+# MongoDB Atlas (SRV DNS with automatic TLS)
+export FERRUM_DB_URL="mongodb+srv://user:pass@cluster0.abc123.mongodb.net/ferrum"
+```
+
+### MONGODB-X509 Authentication
+
+For X.509 certificate-based authentication (no password), use the `FERRUM_MONGO_AUTH_MECHANISM` env var:
+
+```bash
+export FERRUM_DB_TYPE=mongodb
+export FERRUM_DB_URL="mongodb://mongo.example.com:27017/ferrum"
+export FERRUM_MONGO_AUTH_MECHANISM=MONGODB-X509
+export FERRUM_DB_TLS_ENABLED=true
+export FERRUM_DB_TLS_CA_CERT_PATH=/path/to/ca.pem
+export FERRUM_DB_TLS_CLIENT_CERT_PATH=/path/to/client.crt
+export FERRUM_DB_TLS_CLIENT_KEY_PATH=/path/to/client.key
+```
+
+### Docker Example
+
+```bash
+docker run -d --name ferrum-edge \
+  -p 8000:8000 -p 9000:9000 \
+  -e FERRUM_MODE=database \
+  -e FERRUM_DB_TYPE=mongodb \
+  -e FERRUM_DB_URL="mongodb://mongo:27017/ferrum" \
+  -e FERRUM_MONGO_DATABASE=ferrum \
+  -e FERRUM_DB_TLS_ENABLED=true \
+  -e FERRUM_DB_TLS_CA_CERT_PATH=/certs/ca.pem \
+  -e FERRUM_DB_TLS_CLIENT_CERT_PATH=/certs/client.crt \
+  -e FERRUM_DB_TLS_CLIENT_KEY_PATH=/certs/client.key \
+  -e FERRUM_ADMIN_JWT_SECRET="dev-secret" \
+  -v /path/to/certs:/certs:ro \
+  ghcr.io/quicklaunchweb/ferrum-edge:latest
 ```
 
 ## SQLite

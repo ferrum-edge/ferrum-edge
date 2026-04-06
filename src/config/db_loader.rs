@@ -23,6 +23,7 @@ use crate::config::types::{
     RetryConfig, ServiceDiscoveryConfig, Upstream, UpstreamTarget,
 };
 use arc_swap::ArcSwap;
+use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
 use sqlx::Executor;
 use sqlx::Row;
@@ -32,51 +33,17 @@ use std::sync::Arc;
 use std::time::Instant;
 use tracing::{debug, error, info, warn};
 
+// Re-export trait types so existing `use crate::config::db_loader::{IncrementalResult, ...}` works.
+#[allow(unused_imports)]
+pub use crate::config::db_backend::{
+    DatabaseBackend, IncrementalResult, PaginatedResult, extract_db_hostname, extract_known_ids,
+    redact_url,
+};
+
 struct PluginConfigRef {
     id: String,
     scope: PluginScope,
     proxy_id: Option<String>,
-}
-
-/// Result of an incremental config poll.
-///
-/// Contains only the resources that changed since the last poll, plus IDs of
-/// resources that were deleted. The polling loop uses this to apply surgical
-/// updates without loading the entire database.
-///
-/// Serializable for CP-to-DP gRPC delta broadcasts.
-#[derive(serde::Serialize, serde::Deserialize)]
-pub struct IncrementalResult {
-    pub added_or_modified_proxies: Vec<Proxy>,
-    pub removed_proxy_ids: Vec<String>,
-    pub added_or_modified_consumers: Vec<Consumer>,
-    pub removed_consumer_ids: Vec<String>,
-    pub added_or_modified_plugin_configs: Vec<PluginConfig>,
-    pub removed_plugin_config_ids: Vec<String>,
-    pub added_or_modified_upstreams: Vec<Upstream>,
-    pub removed_upstream_ids: Vec<String>,
-    /// Timestamp to use as `since` for the next incremental poll.
-    pub poll_timestamp: DateTime<Utc>,
-}
-
-impl IncrementalResult {
-    /// True when nothing changed — skip all cache work.
-    pub fn is_empty(&self) -> bool {
-        self.added_or_modified_proxies.is_empty()
-            && self.removed_proxy_ids.is_empty()
-            && self.added_or_modified_consumers.is_empty()
-            && self.removed_consumer_ids.is_empty()
-            && self.added_or_modified_plugin_configs.is_empty()
-            && self.removed_plugin_config_ids.is_empty()
-            && self.added_or_modified_upstreams.is_empty()
-            && self.removed_upstream_ids.is_empty()
-    }
-}
-
-/// Result of a paginated database query.
-pub struct PaginatedResult<T> {
-    pub items: Vec<T>,
-    pub total: i64,
 }
 
 /// Database connection pool tuning parameters.
@@ -165,22 +132,8 @@ impl DatabaseStore {
         result
     }
 
-    /// Set the slow query threshold (in milliseconds). When set, any database
-    /// query that exceeds this duration is logged at warn level with the
-    /// operation name and elapsed time.
-    pub fn set_slow_query_threshold(&mut self, threshold_ms: Option<u64>) {
-        self.slow_query_threshold_ms = threshold_ms;
-    }
-
-    /// Set the certificate expiry warning threshold (days before expiration).
-    pub fn set_cert_expiry_warning_days(&mut self, days: u64) {
-        self.cert_expiry_warning_days = days;
-    }
-
-    /// Set the backend IP allowlist policy for SSRF protection.
-    pub fn set_backend_allow_ips(&mut self, policy: crate::config::BackendAllowIps) {
-        self.backend_allow_ips = policy;
-    }
+    // set_slow_query_threshold, set_cert_expiry_warning_days, and
+    // set_backend_allow_ips are implemented via the DatabaseBackend trait.
 
     /// Log a warning if the elapsed time since `start` exceeds the configured
     /// slow query threshold. No-op when the threshold is disabled.
@@ -2108,6 +2061,9 @@ impl DatabaseStore {
     }
 
     /// Extract known IDs from a full config (used to seed the incremental poller).
+    ///
+    /// Delegates to [`crate::config::db_backend::extract_known_ids`].
+    #[allow(dead_code)]
     pub fn extract_known_ids(
         config: &GatewayConfig,
     ) -> (
@@ -2116,15 +2072,7 @@ impl DatabaseStore {
         HashSet<String>,
         HashSet<String>,
     ) {
-        let proxy_ids: HashSet<String> = config.proxies.iter().map(|p| p.id.clone()).collect();
-        let consumer_ids: HashSet<String> = config.consumers.iter().map(|c| c.id.clone()).collect();
-        let plugin_config_ids: HashSet<String> = config
-            .plugin_configs
-            .iter()
-            .map(|pc| pc.id.clone())
-            .collect();
-        let upstream_ids: HashSet<String> = config.upstreams.iter().map(|u| u.id.clone()).collect();
-        (proxy_ids, consumer_ids, plugin_config_ids, upstream_ids)
+        crate::config::db_backend::extract_known_ids(config)
     }
 
     /// Maximum records per database transaction for batch operations.
@@ -2535,7 +2483,8 @@ impl DatabaseStore {
         (**self.pool.load()).clone()
     }
 
-    pub fn db_type(&self) -> &str {
+    #[allow(dead_code)]
+    pub fn db_type_str(&self) -> &str {
         &self.db_type
     }
 
@@ -2595,28 +2544,10 @@ impl DatabaseStore {
 
     /// Extract the hostname from a database URL, if it contains one.
     ///
-    /// Returns `None` for SQLite URLs (file-based, no network host) or
-    /// if the host portion is already an IP address literal.
+    /// Delegates to [`crate::config::db_backend::extract_db_hostname`].
+    #[allow(dead_code)]
     pub fn extract_db_hostname(db_url: &str) -> Option<String> {
-        let parsed = url::Url::parse(db_url).ok()?;
-
-        // Skip SQLite (no network host)
-        let scheme = parsed.scheme().to_lowercase();
-        if scheme.contains("sqlite") {
-            return None;
-        }
-
-        let host = parsed.host_str()?;
-
-        // For non-special URL schemes (postgres://, mysql://) the `url` crate
-        // treats IP literals as Domain. Strip brackets from IPv6 and check
-        // whether the host parses as an IP address.
-        let bare = host.trim_start_matches('[').trim_end_matches(']');
-        if bare.parse::<std::net::IpAddr>().is_ok() {
-            return None;
-        }
-
-        Some(host.to_string())
+        crate::config::db_backend::extract_db_hostname(db_url)
     }
 
     /// Connect to the primary database, trying failover URLs if the primary fails.
@@ -2881,25 +2812,352 @@ impl DatabaseStore {
     }
 
     /// Redact credentials from a database URL for safe logging.
+    ///
+    /// Delegates to [`crate::config::db_backend::redact_url`].
     pub fn redact_url(url: &str) -> String {
-        match url::Url::parse(url) {
-            Ok(mut parsed) => {
-                if parsed.password().is_some() {
-                    let _ = parsed.set_password(Some("***"));
-                }
-                if !parsed.username().is_empty() {
-                    let _ = parsed.set_username("***");
-                }
-                parsed.to_string()
-            }
-            Err(_) => "<invalid-url>".to_string(),
-        }
+        crate::config::db_backend::redact_url(url)
     }
 
     /// Returns true if a read replica pool is configured.
     #[allow(dead_code)] // Public API for tests and future consumers
-    pub fn has_read_replica(&self) -> bool {
+    pub fn has_read_replica_pool(&self) -> bool {
         self.read_replica_pool.is_some()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DatabaseBackend trait implementation for sqlx-backed DatabaseStore
+// ---------------------------------------------------------------------------
+
+#[async_trait]
+impl DatabaseBackend for DatabaseStore {
+    async fn health_check(&self) -> Result<(), anyhow::Error> {
+        sqlx::query("SELECT 1").fetch_one(&self.pool()).await?;
+        Ok(())
+    }
+
+    fn db_type(&self) -> &str {
+        &self.db_type
+    }
+
+    fn has_read_replica(&self) -> bool {
+        self.has_read_replica_pool()
+    }
+
+    fn set_slow_query_threshold(&mut self, threshold_ms: Option<u64>) {
+        self.slow_query_threshold_ms = threshold_ms;
+    }
+
+    fn set_cert_expiry_warning_days(&mut self, days: u64) {
+        self.cert_expiry_warning_days = days;
+    }
+
+    fn set_backend_allow_ips(&mut self, policy: crate::config::BackendAllowIps) {
+        self.backend_allow_ips = policy;
+    }
+
+    async fn load_full_config(&self) -> Result<GatewayConfig, anyhow::Error> {
+        DatabaseStore::load_full_config(self).await
+    }
+
+    async fn load_incremental_config(
+        &self,
+        since: DateTime<Utc>,
+        known_proxy_ids: &HashSet<String>,
+        known_consumer_ids: &HashSet<String>,
+        known_plugin_config_ids: &HashSet<String>,
+        known_upstream_ids: &HashSet<String>,
+    ) -> Result<IncrementalResult, anyhow::Error> {
+        DatabaseStore::load_incremental_config(
+            self,
+            since,
+            known_proxy_ids,
+            known_consumer_ids,
+            known_plugin_config_ids,
+            known_upstream_ids,
+        )
+        .await
+    }
+
+    async fn create_proxy(&self, proxy: &Proxy) -> Result<(), anyhow::Error> {
+        DatabaseStore::create_proxy(self, proxy).await
+    }
+
+    async fn update_proxy(&self, proxy: &Proxy) -> Result<(), anyhow::Error> {
+        DatabaseStore::update_proxy(self, proxy).await
+    }
+
+    async fn delete_proxy(&self, id: &str) -> Result<bool, anyhow::Error> {
+        DatabaseStore::delete_proxy(self, id).await
+    }
+
+    async fn get_proxy(&self, id: &str) -> Result<Option<Proxy>, anyhow::Error> {
+        DatabaseStore::get_proxy(self, id).await
+    }
+
+    async fn check_proxy_exists(&self, proxy_id: &str) -> Result<bool, anyhow::Error> {
+        DatabaseStore::check_proxy_exists(self, proxy_id).await
+    }
+
+    async fn list_proxies_paginated(
+        &self,
+        limit: i64,
+        offset: i64,
+    ) -> Result<PaginatedResult<Proxy>, anyhow::Error> {
+        DatabaseStore::list_proxies_paginated(self, limit, offset).await
+    }
+
+    async fn create_consumer(&self, consumer: &Consumer) -> Result<(), anyhow::Error> {
+        DatabaseStore::create_consumer(self, consumer).await
+    }
+
+    async fn update_consumer(&self, consumer: &Consumer) -> Result<(), anyhow::Error> {
+        DatabaseStore::update_consumer(self, consumer).await
+    }
+
+    async fn delete_consumer(&self, id: &str) -> Result<bool, anyhow::Error> {
+        DatabaseStore::delete_consumer(self, id).await
+    }
+
+    async fn get_consumer(&self, id: &str) -> Result<Option<Consumer>, anyhow::Error> {
+        DatabaseStore::get_consumer(self, id).await
+    }
+
+    async fn list_consumers_paginated(
+        &self,
+        limit: i64,
+        offset: i64,
+    ) -> Result<PaginatedResult<Consumer>, anyhow::Error> {
+        DatabaseStore::list_consumers_paginated(self, limit, offset).await
+    }
+
+    async fn create_plugin_config(&self, pc: &PluginConfig) -> Result<(), anyhow::Error> {
+        DatabaseStore::create_plugin_config(self, pc).await
+    }
+
+    async fn update_plugin_config(&self, pc: &PluginConfig) -> Result<(), anyhow::Error> {
+        DatabaseStore::update_plugin_config(self, pc).await
+    }
+
+    async fn delete_plugin_config(&self, id: &str) -> Result<bool, anyhow::Error> {
+        DatabaseStore::delete_plugin_config(self, id).await
+    }
+
+    async fn get_plugin_config(&self, id: &str) -> Result<Option<PluginConfig>, anyhow::Error> {
+        DatabaseStore::get_plugin_config(self, id).await
+    }
+
+    async fn list_plugin_configs_paginated(
+        &self,
+        limit: i64,
+        offset: i64,
+    ) -> Result<PaginatedResult<PluginConfig>, anyhow::Error> {
+        DatabaseStore::list_plugin_configs_paginated(self, limit, offset).await
+    }
+
+    async fn create_upstream(&self, upstream: &Upstream) -> Result<(), anyhow::Error> {
+        DatabaseStore::create_upstream(self, upstream).await
+    }
+
+    async fn update_upstream(&self, upstream: &Upstream) -> Result<(), anyhow::Error> {
+        DatabaseStore::update_upstream(self, upstream).await
+    }
+
+    async fn delete_upstream(&self, id: &str) -> Result<bool, anyhow::Error> {
+        DatabaseStore::delete_upstream(self, id).await
+    }
+
+    async fn get_upstream(&self, id: &str) -> Result<Option<Upstream>, anyhow::Error> {
+        DatabaseStore::get_upstream(self, id).await
+    }
+
+    async fn cleanup_orphaned_upstream(&self, upstream_id: &str) -> Result<(), anyhow::Error> {
+        DatabaseStore::cleanup_orphaned_upstream(self, upstream_id).await
+    }
+
+    async fn list_upstreams_paginated(
+        &self,
+        limit: i64,
+        offset: i64,
+    ) -> Result<PaginatedResult<Upstream>, anyhow::Error> {
+        DatabaseStore::list_upstreams_paginated(self, limit, offset).await
+    }
+
+    async fn check_listen_path_unique(
+        &self,
+        listen_path: &str,
+        hosts: &[String],
+        exclude_proxy_id: Option<&str>,
+    ) -> Result<bool, anyhow::Error> {
+        DatabaseStore::check_listen_path_unique(self, listen_path, hosts, exclude_proxy_id).await
+    }
+
+    async fn check_proxy_name_unique(
+        &self,
+        name: &str,
+        exclude_proxy_id: Option<&str>,
+    ) -> Result<bool, anyhow::Error> {
+        DatabaseStore::check_proxy_name_unique(self, name, exclude_proxy_id).await
+    }
+
+    async fn check_upstream_name_unique(
+        &self,
+        name: &str,
+        exclude_upstream_id: Option<&str>,
+    ) -> Result<bool, anyhow::Error> {
+        DatabaseStore::check_upstream_name_unique(self, name, exclude_upstream_id).await
+    }
+
+    async fn check_consumer_identity_unique(
+        &self,
+        username: &str,
+        custom_id: Option<&str>,
+        exclude_consumer_id: Option<&str>,
+    ) -> Result<Option<String>, anyhow::Error> {
+        DatabaseStore::check_consumer_identity_unique(
+            self,
+            username,
+            custom_id,
+            exclude_consumer_id,
+        )
+        .await
+    }
+
+    async fn check_keyauth_key_unique(
+        &self,
+        key: &str,
+        exclude_consumer_id: Option<&str>,
+    ) -> Result<bool, anyhow::Error> {
+        DatabaseStore::check_keyauth_key_unique(self, key, exclude_consumer_id).await
+    }
+
+    async fn check_mtls_identity_unique(
+        &self,
+        identity: &str,
+        exclude_consumer_id: Option<&str>,
+    ) -> Result<bool, anyhow::Error> {
+        DatabaseStore::check_mtls_identity_unique(self, identity, exclude_consumer_id).await
+    }
+
+    async fn check_listen_port_unique(
+        &self,
+        port: u16,
+        exclude_proxy_id: Option<&str>,
+    ) -> Result<bool, anyhow::Error> {
+        DatabaseStore::check_listen_port_unique(self, port, exclude_proxy_id).await
+    }
+
+    async fn check_upstream_exists(&self, upstream_id: &str) -> Result<bool, anyhow::Error> {
+        DatabaseStore::check_upstream_exists(self, upstream_id).await
+    }
+
+    async fn validate_proxy_plugin_associations(
+        &self,
+        proxy_id: &str,
+        plugins: &[crate::config::types::PluginAssociation],
+    ) -> Result<Vec<String>, anyhow::Error> {
+        DatabaseStore::validate_proxy_plugin_associations(self, proxy_id, plugins).await
+    }
+
+    async fn batch_create_proxies(&self, proxies: &[Proxy]) -> Result<usize, anyhow::Error> {
+        DatabaseStore::batch_create_proxies(self, proxies).await
+    }
+
+    async fn batch_create_proxies_without_plugins(
+        &self,
+        proxies: &[Proxy],
+    ) -> Result<usize, anyhow::Error> {
+        DatabaseStore::batch_create_proxies_without_plugins(self, proxies).await
+    }
+
+    async fn batch_attach_proxy_plugins(&self, proxies: &[Proxy]) -> Result<(), anyhow::Error> {
+        DatabaseStore::batch_attach_proxy_plugins(self, proxies).await
+    }
+
+    async fn batch_create_consumers(&self, consumers: &[Consumer]) -> Result<usize, anyhow::Error> {
+        DatabaseStore::batch_create_consumers(self, consumers).await
+    }
+
+    async fn batch_create_plugin_configs(
+        &self,
+        configs: &[PluginConfig],
+    ) -> Result<usize, anyhow::Error> {
+        DatabaseStore::batch_create_plugin_configs(self, configs).await
+    }
+
+    async fn batch_create_upstreams(&self, upstreams: &[Upstream]) -> Result<usize, anyhow::Error> {
+        DatabaseStore::batch_create_upstreams(self, upstreams).await
+    }
+
+    async fn delete_all_resources(&self) -> Result<(), anyhow::Error> {
+        DatabaseStore::delete_all_resources(self).await
+    }
+
+    async fn reconnect(
+        &self,
+        db_url: &str,
+        tls_enabled: bool,
+        tls_ca_cert_path: Option<&str>,
+        tls_client_cert_path: Option<&str>,
+        tls_client_key_path: Option<&str>,
+        tls_insecure: bool,
+    ) -> Result<(), anyhow::Error> {
+        DatabaseStore::reconnect(
+            self,
+            db_url,
+            tls_enabled,
+            tls_ca_cert_path,
+            tls_client_cert_path,
+            tls_client_key_path,
+            tls_insecure,
+        )
+        .await
+    }
+
+    async fn reconnect_read_replica(
+        &self,
+        replica_url: &str,
+        tls_enabled: bool,
+        tls_ca_cert_path: Option<&str>,
+        tls_client_cert_path: Option<&str>,
+        tls_client_key_path: Option<&str>,
+        tls_insecure: bool,
+    ) -> Result<(), anyhow::Error> {
+        DatabaseStore::reconnect_read_replica(
+            self,
+            replica_url,
+            tls_enabled,
+            tls_ca_cert_path,
+            tls_client_cert_path,
+            tls_client_key_path,
+            tls_insecure,
+        )
+        .await
+    }
+
+    async fn try_failover_reconnect(
+        &self,
+        primary_url: &str,
+        tls_enabled: bool,
+        tls_ca_cert_path: Option<&str>,
+        tls_client_cert_path: Option<&str>,
+        tls_client_key_path: Option<&str>,
+        tls_insecure: bool,
+    ) -> Result<String, anyhow::Error> {
+        DatabaseStore::try_failover_reconnect(
+            self,
+            primary_url,
+            tls_enabled,
+            tls_ca_cert_path,
+            tls_client_cert_path,
+            tls_client_key_path,
+            tls_insecure,
+        )
+        .await
+    }
+
+    async fn run_migrations(&self) -> Result<(), anyhow::Error> {
+        DatabaseStore::run_migrations(self).await
     }
 }
 

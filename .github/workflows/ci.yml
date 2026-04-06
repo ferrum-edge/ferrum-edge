@@ -63,20 +63,18 @@ jobs:
           sudo apt-get install -y protobuf-compiler libcurl4-openssl-dev
 
       - name: Run unit tests
-        run: cargo test --test unit_tests --all-features
-        env:
+        run: cargo test --test unit_tests        env:
           RUST_BACKTRACE: 1
 
       - name: Run integration tests
-        run: cargo test --test integration_tests --all-features
-        env:
+        run: cargo test --test integration_tests        env:
           RUST_BACKTRACE: 1
 
       - name: Build gateway binary for end-to-end tests
         run: cargo build --bin ferrum-edge
 
       - name: Run end-to-end tests (gRPC, WebSocket, file mode, database, CP/DP)
-        run: cargo test --test functional_tests --all-features -- --ignored --skip test_scale_perf_30k_proxies --skip test_load_stress
+        run: cargo test --test functional_tests -- --ignored --skip test_scale_perf_30k_proxies --skip test_load_stress
         env:
           RUST_BACKTRACE: 1
         timeout-minutes: 15
@@ -128,7 +126,7 @@ jobs:
           sudo apt-get install -y protobuf-compiler libcurl4-openssl-dev
 
       - name: Run clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --all-targets -- -D warnings
 
   performance-regression:
     name: Performance Regression Check

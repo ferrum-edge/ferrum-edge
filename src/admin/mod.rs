@@ -23,7 +23,7 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::admin::jwt_auth::{JwtError, JwtManager};
-use crate::config::db_loader::DatabaseStore;
+use crate::config::db_backend::DatabaseBackend;
 use crate::config::types::{
     Consumer, GatewayConfig, PluginConfig, PluginScope, Proxy, Upstream, validate_resource_id,
 };
@@ -35,7 +35,7 @@ use serde::{Deserialize, Serialize};
 /// Admin API state.
 #[derive(Clone)]
 pub struct AdminState {
-    pub db: Option<Arc<DatabaseStore>>,
+    pub db: Option<Arc<dyn DatabaseBackend>>,
     pub jwt_manager: JwtManager,
     pub proxy_state: Option<ProxyState>,
     /// In-memory cached config for resilient reads when DB is unavailable.
@@ -335,8 +335,8 @@ pub async fn handle_admin_request(
 
         // Check database connectivity if available
         if let Some(db) = &state.db {
-            match sqlx::query("SELECT 1").fetch_one(&db.pool()).await {
-                Ok(_) => {
+            match db.health_check().await {
+                Ok(()) => {
                     health_status["database"] = json!({
                         "status": "connected",
                         "type": db.db_type()

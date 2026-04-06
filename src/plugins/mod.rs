@@ -34,7 +34,6 @@ pub mod http_logging;
 pub mod ip_restriction;
 pub mod jwks_auth;
 pub mod jwt_auth;
-#[cfg(feature = "kafka")]
 pub mod kafka_logging;
 pub mod key_auth;
 pub mod ldap_auth;
@@ -970,16 +969,10 @@ pub fn create_plugin_with_http_client(
             http_client,
         )?))),
         "udp_logging" => Ok(Some(Arc::new(udp_logging::UdpLogging::new(config)?))),
-        #[cfg(feature = "kafka")]
         "kafka_logging" => Ok(Some(Arc::new(kafka_logging::KafkaLogging::new(
             config,
             &http_client,
         )?))),
-        #[cfg(not(feature = "kafka"))]
-        "kafka_logging" => Err(
-            "kafka_logging: requires the 'kafka' cargo feature to be enabled at compile time"
-                .to_string(),
-        ),
         "transaction_debugger" => Ok(Some(Arc::new(
             transaction_debugger::TransactionDebugger::new(config)?,
         ))),

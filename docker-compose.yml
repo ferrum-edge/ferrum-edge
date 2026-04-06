@@ -91,6 +91,62 @@ services:
       - postgres
 
   # ============================================================================
+  # MongoDB Database (for use with database mode)
+  # ============================================================================
+  # Requires building with: cargo build --features mongodb
+  mongodb:
+    image: mongo:7-jammy
+    container_name: ferrum-mongodb
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ferrum
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_PASSWORD:-dev-password-change-in-production}
+      MONGO_INITDB_DATABASE: ferrum
+    volumes:
+      - mongodb_data:/data/db
+    networks:
+      - ferrum-network
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ============================================================================
+  # Single-Node Database Mode with MongoDB
+  # ============================================================================
+  ferrum-mongodb:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ferrum-mongodb
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    ports:
+      - "8002:8000"     # HTTP proxy
+      - "8445:8443"     # HTTPS proxy
+      - "9002:9000"     # Admin API HTTP
+      - "9445:9443"     # Admin API HTTPS
+    environment:
+      FERRUM_MODE: database
+      FERRUM_DB_TYPE: mongodb
+      FERRUM_DB_URL: mongodb://ferrum:${MONGO_PASSWORD:-dev-password-change-in-production}@mongodb:27017/ferrum?authSource=admin
+      FERRUM_MONGO_DATABASE: ferrum
+      FERRUM_ADMIN_JWT_SECRET: ${FERRUM_ADMIN_JWT_SECRET:-dev-secret-key-change-in-production}
+      FERRUM_LOG_LEVEL: info
+      FERRUM_DB_POLL_INTERVAL: 30
+    networks:
+      - ferrum-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    profiles:
+      - mongodb
+
+  # ============================================================================
   # Control Plane Mode
   # ============================================================================
   # Centralized configuration authority for distributed deployments
@@ -196,3 +252,4 @@ networks:
 volumes:
   ferrum_data:
   postgres_data:
+  mongodb_data:

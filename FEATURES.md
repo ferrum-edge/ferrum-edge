@@ -14,7 +14,7 @@ A comprehensive feature list for Ferrum Edge.
 
 ## Operating Modes
 
-- **Database** — single-instance with PostgreSQL, MySQL, or SQLite backend
+- **Database** — single-instance with PostgreSQL, MySQL, SQLite, or MongoDB backend
 - **File** — single-instance with YAML/JSON config, SIGHUP reload (Unix only; restart required on other platforms)
 - **Control Plane (CP)** — centralized config authority, gRPC distribution to DPs
 - **Data Plane (DP)** — horizontally scalable traffic processing nodes
@@ -60,7 +60,7 @@ Ferrum supports dynamic upstream target discovery through three providers, confi
 - Multiple instances of the same plugin type per proxy (e.g., two `http_logging` for Splunk and Datadog) with optional `priority_override` for execution order control
 - Global and per-proxy scoping — proxy-scoped plugins replace global plugins of the same name
 - Multi-authentication mode with first-match consumer identification
-- Custom plugin database migrations — plugins declare migrations via `plugin_migrations()`, auto-discovered at build time, tracked separately in `_ferrum_plugin_migrations` with per-plugin version scoping. Supports cross-database SQL (PostgreSQL/MySQL/SQLite overrides)
+- Custom plugin database migrations — plugins declare migrations via `plugin_migrations()`, auto-discovered at build time, tracked separately in `_ferrum_plugin_migrations` with per-plugin version scoping. Supports cross-database SQL (PostgreSQL/MySQL/SQLite overrides). MongoDB uses idempotent index creation instead of SQL migrations
 
 ### Authentication Plugins
 
@@ -162,7 +162,7 @@ Ferrum supports dynamic upstream target discovery through three providers, confi
 - CP/DP gRPC channel TLS and mTLS (one-way TLS or mutual certificate verification)
 - DTLS 1.2/1.3 frontend termination and backend origination (ECDSA P-256/P-384)
 - Configurable cipher suites, key exchange groups, and protocol versions
-- Database TLS/SSL with PostgreSQL and MySQL support
+- Database TLS/SSL with PostgreSQL, MySQL, and MongoDB support (mTLS client cert auth for all three)
 - Protocol-level request validation (anti-smuggling, desync prevention):
   - HTTP/1.x: Content-Length + Transfer-Encoding conflict rejection
   - All versions: Multiple Content-Length with mismatched values rejection

@@ -2283,3 +2283,98 @@ fn test_db_slow_query_threshold_invalid_falls_back_to_none() {
         },
     );
 }
+
+// ---------------------------------------------------------------------------
+// MongoDB configuration tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_mongo_database_defaults_to_ferrum() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.mongo_database, "ferrum");
+        },
+    );
+}
+
+#[test]
+fn test_mongo_database_custom_value() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_MONGO_DATABASE", "my_gateway"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.mongo_database, "my_gateway");
+        },
+    );
+}
+
+#[test]
+fn test_mongo_app_name_optional() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_MONGO_APP_NAME", "my-edge-proxy"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.mongo_app_name, Some("my-edge-proxy".to_string()));
+        },
+    );
+}
+
+#[test]
+fn test_mongo_replica_set_optional() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_MONGO_REPLICA_SET", "rs0"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.mongo_replica_set, Some("rs0".to_string()));
+        },
+    );
+}
+
+#[test]
+fn test_mongo_timeouts_custom_values() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_MONGO_SERVER_SELECTION_TIMEOUT_SECONDS", "60"),
+            ("FERRUM_MONGO_CONNECT_TIMEOUT_SECONDS", "5"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.mongo_server_selection_timeout_seconds, 60);
+            assert_eq!(config.mongo_connect_timeout_seconds, 5);
+        },
+    );
+}
+
+#[test]
+fn test_mongo_timeouts_default_values() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.mongo_server_selection_timeout_seconds, 30);
+            assert_eq!(config.mongo_connect_timeout_seconds, 10);
+        },
+    );
+}

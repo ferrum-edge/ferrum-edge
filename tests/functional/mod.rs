@@ -12,6 +12,7 @@ mod functional_grpc_test;
 mod functional_load_balancer_test;
 mod functional_load_stress_test;
 mod functional_logging_test;
+mod functional_mongodb_test;
 mod functional_mtls_test;
 mod functional_plugin_test;
 mod functional_redis_rate_limiting_test;

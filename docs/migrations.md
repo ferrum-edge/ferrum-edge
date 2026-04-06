@@ -47,12 +47,14 @@ If you're upgrading from a version of Ferrum Edge that predates the migration sy
 
 ### Cross-Database Support
 
-Migrations work across all supported databases:
+SQL migrations work across all supported SQL databases:
 - **SQLite** (default)
 - **PostgreSQL**
 - **MySQL**
 
-Each migration is a Rust function that can dispatch different SQL based on the database type when needed, ensuring DDL compatibility across all three backends.
+Each migration is a Rust function that can dispatch different SQL based on the database type when needed, ensuring DDL compatibility across all three SQL backends.
+
+**MongoDB** does not use SQL migrations. When `FERRUM_DB_TYPE=mongodb`, the migration runner creates indexes instead (idempotent `createIndex` operations). See the [MongoDB Migrations](#mongodb-migrations) section below.
 
 ### Checksum Validation
 
@@ -60,7 +62,7 @@ Each migration has a compile-time checksum. When the gateway starts, it compares
 
 ## Custom Plugin Migrations
 
-Custom plugins can declare their own database migrations that run alongside core gateway migrations. This allows plugins to create and manage private tables without modifying any core source files.
+Custom plugins can declare their own database migrations that run alongside core gateway migrations. This allows plugins to create and manage private tables without modifying any core source files. **Note:** The custom plugin migration system is SQL-only. For MongoDB, see [MongoDB Custom Plugin Storage](#mongodb-custom-plugin-storage) below.
 
 ### How It Works
 
@@ -343,3 +345,42 @@ If a migration fails partway through:
 4. Re-run the migration — it will skip already-applied migrations and retry the failed one
 
 For config files, restore from the `.backup.*` file that was created before the migration started.
+
+## MongoDB Migrations
+
+MongoDB does not use SQL migrations. Instead, `MongoStore::run_migrations()` creates indexes using idempotent `createIndex` operations. Running the same migration multiple times is safe — `createIndex` is a no-op if the index already exists.
+
+### What Gets Created
+
+| Collection | Indexes |
+|-----------|---------|
+| `proxies` | `name` (unique), `updated_at`, `upstream_id`, `listen_port` |
+| `consumers` | `username` (unique), `custom_id` (unique sparse), `updated_at` |
+| `plugin_configs` | `proxy_id`, `updated_at` |
+| `upstreams` | `name` (unique), `updated_at` |
+
+### Running MongoDB Migrations
+
+```bash
+FERRUM_MODE=migrate \
+  FERRUM_MIGRATE_ACTION=up \
+  FERRUM_DB_TYPE=mongodb \
+  FERRUM_DB_URL="mongodb://localhost:27017/ferrum" \
+  FERRUM_MONGO_DATABASE=ferrum \
+  ferrum-edge
+```
+
+### Schema Differences from SQL
+
+- **No junction tables**: SQL uses `proxy_plugins` to associate proxies with plugins. MongoDB embeds plugin associations directly in proxy documents.
+- **No migration tracking table**: SQL tracks applied migrations in `_ferrum_migrations`. MongoDB indexes are idempotent and don't need tracking.
+- **Automatic field propagation**: New fields added to domain types (`Proxy`, `Consumer`, etc.) are automatically persisted to MongoDB via serde BSON serialization — no ALTER TABLE equivalent needed.
+
+### MongoDB Custom Plugin Storage
+
+The `CustomPluginMigration` system (using SQL `CREATE TABLE` statements) is **SQL-only**. When `FERRUM_DB_TYPE=mongodb`, custom plugin SQL migrations are skipped.
+
+Custom plugins that need MongoDB-specific collections or indexes should:
+1. Create collections/indexes in their `create_plugin()` initialization function
+2. Use the MongoDB driver's `createIndex` (idempotent) to ensure indexes exist
+3. Prefix collection names with the plugin name to avoid collisions (e.g., `my_plugin_audit_log`)
