@@ -391,7 +391,7 @@ impl ConnectionPool {
     ///
     /// Uses the same key format as `create_pool_key()` so warmup targets are
     /// deduplicated identically to runtime pool entries.
-    pub(crate) fn pool_key_for_warmup(&self, proxy: &Proxy) -> String {
+    pub fn pool_key_for_warmup(&self, proxy: &Proxy) -> String {
         self.create_pool_key(proxy)
     }
 

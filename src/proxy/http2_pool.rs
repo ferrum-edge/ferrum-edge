@@ -117,13 +117,13 @@ impl Http2ConnectionPool {
     }
 
     /// Expose the base pool key for warmup deduplication (without shard suffix).
-    pub(crate) fn pool_key_for_warmup(proxy: &Proxy) -> String {
+    pub fn pool_key_for_warmup(proxy: &Proxy) -> String {
         Self::pool_key(proxy)
     }
 
     /// Build a shard key by appending the shard index to a pre-allocated buffer.
     /// Reuses the same buffer across calls to minimize allocations.
-    fn write_shard_key(buf: &mut String, base_key: &str, shard: usize) {
+    pub fn write_shard_key(buf: &mut String, base_key: &str, shard: usize) {
         buf.clear();
         buf.push_str(base_key);
         buf.push('#');

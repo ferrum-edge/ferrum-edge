@@ -80,7 +80,7 @@ impl Http3ConnectionPool {
 
     /// Pool key — includes TLS-differentiating fields (CA, mTLS, verify).
     /// Uses `|` as delimiter to avoid ambiguity with `:` in IPv6 addresses.
-    fn pool_key(proxy: &Proxy, index: usize) -> String {
+    pub fn pool_key(proxy: &Proxy, index: usize) -> String {
         let mut key = String::with_capacity(128);
         Self::write_pool_key(&mut key, proxy, index);
         key
@@ -110,7 +110,7 @@ impl Http3ConnectionPool {
         );
     }
 
-    fn pool_key_for_target(host: &str, port: u16, index: usize) -> String {
+    pub fn pool_key_for_target(host: &str, port: u16, index: usize) -> String {
         // Target keys are used by the retry path where host:port come from
         // upstream targets. TLS config is inherited from the proxy that
         // originated the request, but all requests through this path share
