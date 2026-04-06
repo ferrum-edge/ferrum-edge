@@ -56,6 +56,7 @@ fn create_ca_signed_cert(
     let ca_key = rcgen::KeyPair::generate().unwrap();
     let ca_cert = ca_params.self_signed(&ca_key).unwrap();
     let ca_der = ca_cert.der().to_vec();
+    let ca_issuer = rcgen::Issuer::new(ca_params, ca_key);
 
     // Build client cert signed by CA
     let mut client_params = rcgen::CertificateParams::default();
@@ -65,9 +66,7 @@ fn create_ca_signed_cert(
     client_params.distinguished_name = client_dn;
 
     let client_key = rcgen::KeyPair::generate().unwrap();
-    let client_cert = client_params
-        .signed_by(&client_key, &ca_cert, &ca_key)
-        .unwrap();
+    let client_cert = client_params.signed_by(&client_key, &ca_issuer).unwrap();
     let client_der = client_cert.der().to_vec();
 
     (ca_der, client_der)

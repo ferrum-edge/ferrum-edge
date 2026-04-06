@@ -1,15 +1,14 @@
 //! Integration tests for the dimpl-based DTLS module.
 
 use ferrum_edge::config::types::Proxy;
-use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair, KeyUsagePurpose};
+use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair, KeyUsagePurpose};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 
 struct GeneratedCa {
     cert_pem: String,
-    cert: rcgen::Certificate,
-    key_pair: KeyPair,
+    issuer: Issuer<'static, KeyPair>,
 }
 
 struct GeneratedCert {
@@ -27,10 +26,10 @@ fn generate_ca(cn: &str) -> GeneratedCa {
     params.key_usages.push(KeyUsagePurpose::KeyCertSign);
     params.key_usages.push(KeyUsagePurpose::CrlSign);
     let cert = params.self_signed(&key_pair).expect("self-sign CA");
+    let cert_pem = cert.pem();
     GeneratedCa {
-        cert_pem: cert.pem(),
-        cert,
-        key_pair,
+        cert_pem,
+        issuer: Issuer::new(params, key_pair),
     }
 }
 
@@ -42,9 +41,7 @@ fn generate_signed_cert(ca: &GeneratedCa, cn: &str, sans: &[&str]) -> GeneratedC
     params
         .distinguished_name
         .push(rcgen::DnType::CommonName, cn);
-    let cert = params
-        .signed_by(&key_pair, &ca.cert, &ca.key_pair)
-        .expect("sign leaf");
+    let cert = params.signed_by(&key_pair, &ca.issuer).expect("sign leaf");
     GeneratedCert {
         cert_pem: cert.pem(),
         key_pem: key_pair.serialize_pem(),

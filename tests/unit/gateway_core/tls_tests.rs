@@ -8,7 +8,7 @@ use ferrum_edge::tls::{
     self, TlsPolicy, backend_client_config_builder, build_server_verifier_with_crls,
     check_cert_expiry, check_cert_expiry_for_validation, load_crls,
 };
-use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair, KeyUsagePurpose};
+use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair, KeyUsagePurpose};
 use std::sync::Once;
 use tempfile::TempDir;
 
@@ -30,7 +30,7 @@ fn generate_self_signed_cert(sans: &[&str]) -> (String, String) {
     (cert.pem(), key_pair.serialize_pem())
 }
 
-fn generate_ca() -> (rcgen::Certificate, KeyPair, String, String) {
+fn generate_ca() -> (Issuer<'static, KeyPair>, String, String) {
     let key_pair = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
     let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
     params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
@@ -42,21 +42,17 @@ fn generate_ca() -> (rcgen::Certificate, KeyPair, String, String) {
     let cert = params.self_signed(&key_pair).unwrap();
     let cert_pem = cert.pem();
     let key_pem = key_pair.serialize_pem();
-    (cert, key_pair, cert_pem, key_pem)
+    (Issuer::new(params, key_pair), cert_pem, key_pem)
 }
 
-fn generate_signed_cert(
-    ca_cert: &rcgen::Certificate,
-    ca_key: &KeyPair,
-    sans: &[&str],
-) -> (String, String) {
+fn generate_signed_cert(ca_issuer: &Issuer<'static, KeyPair>, sans: &[&str]) -> (String, String) {
     let key_pair = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
     let san_strings: Vec<String> = sans.iter().map(|s| s.to_string()).collect();
     let mut params = CertificateParams::new(san_strings).unwrap();
     params
         .distinguished_name
         .push(rcgen::DnType::CommonName, "Test Leaf");
-    let cert = params.signed_by(&key_pair, ca_cert, ca_key).unwrap();
+    let cert = params.signed_by(&key_pair, ca_issuer).unwrap();
     (cert.pem(), key_pair.serialize_pem())
 }
 
@@ -488,8 +484,8 @@ fn test_load_tls_config_basic_no_client_auth() {
 fn test_load_tls_config_with_client_auth_ca() {
     ensure_crypto_provider();
     let dir = TempDir::new().unwrap();
-    let (ca_cert, ca_key, ca_pem, _) = generate_ca();
-    let (cert_pem, key_pem) = generate_signed_cert(&ca_cert, &ca_key, &["localhost"]);
+    let (ca_issuer, ca_pem, _) = generate_ca();
+    let (cert_pem, key_pem) = generate_signed_cert(&ca_issuer, &["localhost"]);
     let cert_path = write_pem(&dir, "cert.pem", &cert_pem);
     let key_path = write_pem(&dir, "key.pem", &key_pem);
     let ca_path = write_pem(&dir, "ca.pem", &ca_pem);

@@ -152,7 +152,7 @@ wiremock = "0.6"
 # Functional testing dependencies
 rand = "0.10"
 futures = "0.3"
-rcgen = "0.13"
+rcgen = "0.14"
 time = "0.3"
 # Simple HTTP server dependencies
 tokio = { version = "1", features = ["net", "io-util", "time", "rt"] }

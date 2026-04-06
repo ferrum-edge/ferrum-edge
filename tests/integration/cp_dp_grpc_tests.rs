@@ -619,6 +619,8 @@ fn generate_test_ca_and_server_cert() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
     let mut ca_params = rcgen::CertificateParams::new(vec!["Ferrum Test CA".to_string()]).unwrap();
     ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
     let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+    let ca_pem = ca_cert.pem();
+    let ca_issuer = rcgen::Issuer::new(ca_params, ca_key);
 
     // Generate server key pair and cert signed by the CA
     let server_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
@@ -628,12 +630,10 @@ fn generate_test_ca_and_server_cert() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
         .push(rcgen::SanType::IpAddress(std::net::IpAddr::V4(
             std::net::Ipv4Addr::new(127, 0, 0, 1),
         )));
-    let server_cert = server_params
-        .signed_by(&server_key, &ca_cert, &ca_key)
-        .unwrap();
+    let server_cert = server_params.signed_by(&server_key, &ca_issuer).unwrap();
 
     (
-        ca_cert.pem().into_bytes(),
+        ca_pem.into_bytes(),
         server_cert.pem().into_bytes(),
         server_key.serialize_pem().into_bytes(),
     )
@@ -739,6 +739,7 @@ async fn test_dp_connects_to_cp_with_mtls() {
     ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
     let ca_cert = ca_params.self_signed(&ca_key).unwrap();
     let ca_pem = ca_cert.pem().into_bytes();
+    let ca_issuer = rcgen::Issuer::new(ca_params, ca_key);
 
     // Generate server cert signed by CA
     let server_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
@@ -748,18 +749,14 @@ async fn test_dp_connects_to_cp_with_mtls() {
         .push(rcgen::SanType::IpAddress(std::net::IpAddr::V4(
             std::net::Ipv4Addr::new(127, 0, 0, 1),
         )));
-    let server_cert = server_params
-        .signed_by(&server_key, &ca_cert, &ca_key)
-        .unwrap();
+    let server_cert = server_params.signed_by(&server_key, &ca_issuer).unwrap();
     let server_cert_pem = server_cert.pem().into_bytes();
     let server_key_pem = server_key.serialize_pem().into_bytes();
 
     // Generate client cert signed by the same CA
     let client_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
     let client_params = rcgen::CertificateParams::new(vec!["dp-client".to_string()]).unwrap();
-    let client_cert = client_params
-        .signed_by(&client_key, &ca_cert, &ca_key)
-        .unwrap();
+    let client_cert = client_params.signed_by(&client_key, &ca_issuer).unwrap();
     let client_cert_pem = client_cert.pem().into_bytes();
     let client_key_pem = client_key.serialize_pem().into_bytes();
 
