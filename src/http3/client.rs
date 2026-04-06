@@ -81,19 +81,33 @@ impl Http3ConnectionPool {
     /// Pool key — includes TLS-differentiating fields (CA, mTLS, verify).
     /// Uses `|` as delimiter to avoid ambiguity with `:` in IPv6 addresses.
     fn pool_key(proxy: &Proxy, index: usize) -> String {
-        let ca = proxy
-            .backend_tls_server_ca_cert_path
-            .as_deref()
-            .unwrap_or_default();
-        let mtls_cert = proxy
-            .backend_tls_client_cert_path
-            .as_deref()
-            .unwrap_or_default();
-        let verify = proxy.backend_tls_verify_server_cert;
-        format!(
+        let mut key = String::with_capacity(128);
+        Self::write_pool_key(&mut key, proxy, index);
+        key
+    }
+
+    /// Write pool key into the provided buffer, avoiding intermediate
+    /// `format!()` allocations. Called from both the allocating `pool_key()`
+    /// (cold path) and the thread-local buffer lookup (hot path).
+    fn write_pool_key(buf: &mut String, proxy: &Proxy, index: usize) {
+        use std::fmt::Write;
+        buf.clear();
+        let _ = write!(
+            buf,
             "{}|{}|{}|{}|{}|{}",
-            proxy.backend_host, proxy.backend_port, index, ca, mtls_cert, verify as u8,
-        )
+            proxy.backend_host,
+            proxy.backend_port,
+            index,
+            proxy
+                .backend_tls_server_ca_cert_path
+                .as_deref()
+                .unwrap_or_default(),
+            proxy
+                .backend_tls_client_cert_path
+                .as_deref()
+                .unwrap_or_default(),
+            proxy.backend_tls_verify_server_cert as u8,
+        );
     }
 
     fn pool_key_for_target(host: &str, port: u16, index: usize) -> String {
@@ -102,7 +116,10 @@ impl Http3ConnectionPool {
         // originated the request, but all requests through this path share
         // the same proxy TLS settings, so host|port|index is sufficient
         // for uniqueness within a single retry sequence.
-        format!("{}|{}|{}", host, port, index)
+        let mut key = String::with_capacity(64);
+        use std::fmt::Write;
+        let _ = write!(key, "{}|{}|{}", host, port, index);
+        key
     }
 
     /// Pre-establish a QUIC connection and cache it in the pool (shard 0 only).
@@ -183,6 +200,39 @@ impl Http3ConnectionPool {
             .unwrap_or(self.connections_per_backend)
             .max(1);
         let start = self.conn_counter.fetch_add(1, Ordering::Relaxed) as usize % conns_per_backend;
+
+        // Fast path: use a thread-local buffer for pool key lookup to avoid
+        // allocating a String on every request. On cache hit + successful
+        // request, we return without any String allocation.
+        thread_local! {
+            static KEY_BUF: std::cell::RefCell<String> = std::cell::RefCell::new(String::with_capacity(128));
+        }
+        let cached = KEY_BUF.with(|buf| {
+            let mut buf = buf.borrow_mut();
+            Self::write_pool_key(&mut buf, proxy, start);
+            if let Some(entry) = self.entries.get(&*buf) {
+                entry
+                    .last_used_epoch_ms
+                    .store(now_epoch_ms(), Ordering::Relaxed);
+                let sr = entry.send_request.clone();
+                drop(entry);
+                return Some(sr);
+            }
+            None
+        });
+        if let Some(mut sr) = cached {
+            match Self::do_request(&mut sr, proxy, method, backend_url, headers, body.clone()).await
+            {
+                Ok(result) => return Ok(result),
+                Err(_) => {
+                    // Cached connection failed — fall through to the full
+                    // retry/reconnect path below which allocates pool keys.
+                }
+            }
+        }
+
+        // Slow path: allocate pool key String for cache miss, error recovery,
+        // and new connection creation.
         let key = Self::pool_key(proxy, start);
 
         // Try cached connection on the selected index first

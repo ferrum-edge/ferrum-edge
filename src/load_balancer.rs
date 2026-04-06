@@ -75,7 +75,10 @@ const LATENCY_UNSET: u64 = u64::MAX;
 /// healthy targets or a degraded-mode fallback (all targets were unhealthy).
 #[derive(Debug, Clone)]
 pub struct TargetSelection {
-    pub target: UpstreamTarget,
+    /// The selected upstream target, wrapped in `Arc` so that load balancer
+    /// selection is a cheap pointer bump instead of cloning the full struct
+    /// (host String + port + weight + tags HashMap + path Option) per request.
+    pub target: Arc<UpstreamTarget>,
     /// True when all targets were marked unhealthy and this selection is a
     /// best-effort fallback. Callers should propagate this as an
     /// `X-Gateway-Upstream-Status: degraded` response header so clients
@@ -252,7 +255,7 @@ impl LoadBalancerCache {
         ctx_key: &str,
         exclude: &UpstreamTarget,
         unhealthy: Option<&DashMap<String, u64>>,
-    ) -> Option<UpstreamTarget> {
+    ) -> Option<Arc<UpstreamTarget>> {
         let balancers = self.balancers.load();
         let balancer = balancers.get(upstream_id)?;
         balancer.select_excluding(ctx_key, exclude, unhealthy)
@@ -349,7 +352,7 @@ pub fn target_key(target: &UpstreamTarget) -> String {
 
 /// Per-upstream load balancer with algorithm-specific state.
 pub struct LoadBalancer {
-    targets: Vec<UpstreamTarget>,
+    targets: Vec<Arc<UpstreamTarget>>,
     /// Pre-computed "host:port" keys for each target, avoiding format!() per request.
     target_keys: Vec<String>,
     algorithm: LoadBalancerAlgorithm,
@@ -414,7 +417,7 @@ impl LoadBalancer {
         let hash_on_strategy = HashOnStrategy::parse(hash_on.as_deref());
 
         Self {
-            targets: targets.to_vec(),
+            targets: targets.iter().cloned().map(Arc::new).collect(),
             target_keys,
             algorithm,
             rr_counter: AtomicU64::new(0),
@@ -543,7 +546,7 @@ impl LoadBalancer {
     fn healthy_targets(
         &self,
         unhealthy: Option<&DashMap<String, u64>>,
-    ) -> Vec<(usize, &UpstreamTarget)> {
+    ) -> Vec<(usize, &Arc<UpstreamTarget>)> {
         self.targets
             .iter()
             .enumerate()
@@ -577,7 +580,7 @@ impl LoadBalancer {
         let target = match self.algorithm {
             LoadBalancerAlgorithm::RoundRobin => {
                 let idx = self.rr_counter.fetch_add(1, Ordering::Relaxed) as usize;
-                Some(healthy[idx % healthy.len()].1.clone())
+                Some(Arc::clone(healthy[idx % healthy.len()].1))
             }
             LoadBalancerAlgorithm::WeightedRoundRobin => self.select_wrr(&healthy),
             LoadBalancerAlgorithm::LeastConnections => self.select_least_connections(&healthy),
@@ -590,7 +593,7 @@ impl LoadBalancer {
                 let mut hasher = DefaultHasher::new();
                 idx.hash(&mut hasher);
                 let hash = hasher.finish() as usize;
-                Some(healthy[hash % healthy.len()].1.clone())
+                Some(Arc::clone(healthy[hash % healthy.len()].1))
             }
         };
 
@@ -600,29 +603,33 @@ impl LoadBalancer {
         })
     }
 
-    fn select_from_all(&self, ctx_key: &str) -> Option<UpstreamTarget> {
+    fn select_from_all(&self, ctx_key: &str) -> Option<Arc<UpstreamTarget>> {
         if self.targets.is_empty() {
             return None;
         }
         match self.algorithm {
             LoadBalancerAlgorithm::RoundRobin | LoadBalancerAlgorithm::Random => {
                 let idx = self.rr_counter.fetch_add(1, Ordering::Relaxed) as usize;
-                Some(self.targets[idx % self.targets.len()].clone())
+                Some(Arc::clone(&self.targets[idx % self.targets.len()]))
             }
             LoadBalancerAlgorithm::WeightedRoundRobin => {
-                let all: Vec<(usize, &UpstreamTarget)> = self.targets.iter().enumerate().collect();
+                let all: Vec<(usize, &Arc<UpstreamTarget>)> =
+                    self.targets.iter().enumerate().collect();
                 self.select_wrr(&all)
             }
             LoadBalancerAlgorithm::LeastConnections => {
-                let all: Vec<(usize, &UpstreamTarget)> = self.targets.iter().enumerate().collect();
+                let all: Vec<(usize, &Arc<UpstreamTarget>)> =
+                    self.targets.iter().enumerate().collect();
                 self.select_least_connections(&all)
             }
             LoadBalancerAlgorithm::LeastLatency => {
-                let all: Vec<(usize, &UpstreamTarget)> = self.targets.iter().enumerate().collect();
+                let all: Vec<(usize, &Arc<UpstreamTarget>)> =
+                    self.targets.iter().enumerate().collect();
                 self.select_least_latency(&all)
             }
             LoadBalancerAlgorithm::ConsistentHashing => {
-                let all: Vec<(usize, &UpstreamTarget)> = self.targets.iter().enumerate().collect();
+                let all: Vec<(usize, &Arc<UpstreamTarget>)> =
+                    self.targets.iter().enumerate().collect();
                 self.select_consistent_hash(ctx_key, &all)
             }
         }
@@ -633,7 +640,7 @@ impl LoadBalancer {
         ctx_key: &str,
         exclude: &UpstreamTarget,
         unhealthy: Option<&DashMap<String, u64>>,
-    ) -> Option<UpstreamTarget> {
+    ) -> Option<Arc<UpstreamTarget>> {
         // Find the exclude target's index via linear scan (avoids host.clone() allocation)
         let exclude_idx = self
             .targets
@@ -641,7 +648,7 @@ impl LoadBalancer {
             .position(|t| t.host == exclude.host && t.port == exclude.port);
 
         // Build healthy targets excluding the specified target
-        let healthy: Vec<(usize, &UpstreamTarget)> = self
+        let healthy: Vec<(usize, &Arc<UpstreamTarget>)> = self
             .targets
             .iter()
             .enumerate()
@@ -660,7 +667,7 @@ impl LoadBalancer {
 
         if healthy.is_empty() {
             // If no other healthy targets, try any target except excluded
-            let fallback: Vec<(usize, &UpstreamTarget)> = self
+            let fallback: Vec<(usize, &Arc<UpstreamTarget>)> = self
                 .targets
                 .iter()
                 .enumerate()
@@ -670,13 +677,13 @@ impl LoadBalancer {
                 return None;
             }
             let idx = self.rr_counter.fetch_add(1, Ordering::Relaxed) as usize;
-            return Some(fallback[idx % fallback.len()].1.clone());
+            return Some(Arc::clone(fallback[idx % fallback.len()].1));
         }
 
         match self.algorithm {
             LoadBalancerAlgorithm::RoundRobin | LoadBalancerAlgorithm::Random => {
                 let idx = self.rr_counter.fetch_add(1, Ordering::Relaxed) as usize;
-                Some(healthy[idx % healthy.len()].1.clone())
+                Some(Arc::clone(healthy[idx % healthy.len()].1))
             }
             LoadBalancerAlgorithm::WeightedRoundRobin => self.select_wrr(&healthy),
             LoadBalancerAlgorithm::LeastConnections => self.select_least_connections(&healthy),
@@ -691,7 +698,10 @@ impl LoadBalancer {
     ///
     /// Uses a mutex to prevent weight drift under concurrent access.
     /// The critical section is sub-microsecond (only integer arithmetic).
-    fn select_wrr(&self, candidates: &[(usize, &UpstreamTarget)]) -> Option<UpstreamTarget> {
+    fn select_wrr(
+        &self,
+        candidates: &[(usize, &Arc<UpstreamTarget>)],
+    ) -> Option<Arc<UpstreamTarget>> {
         if candidates.is_empty() {
             return None;
         }
@@ -700,7 +710,7 @@ impl LoadBalancer {
         if total_weight == 0 {
             // All weights zero, fall back to simple round-robin
             let idx = self.rr_counter.fetch_add(1, Ordering::Relaxed) as usize;
-            return Some(candidates[idx % candidates.len()].1.clone());
+            return Some(Arc::clone(candidates[idx % candidates.len()].1));
         }
 
         let mut weights = self.wrr_state.lock().unwrap_or_else(|e| e.into_inner());
@@ -722,14 +732,14 @@ impl LoadBalancer {
         let (orig_idx, _) = candidates[best_idx];
         weights[orig_idx] -= total_weight;
 
-        Some(candidates[best_idx].1.clone())
+        Some(Arc::clone(candidates[best_idx].1))
     }
 
     /// Select target with least active connections.
     fn select_least_connections(
         &self,
-        candidates: &[(usize, &UpstreamTarget)],
-    ) -> Option<UpstreamTarget> {
+        candidates: &[(usize, &Arc<UpstreamTarget>)],
+    ) -> Option<Arc<UpstreamTarget>> {
         if candidates.is_empty() {
             return None;
         }
@@ -750,7 +760,7 @@ impl LoadBalancer {
             }
         }
 
-        Some(best.1.clone())
+        Some(Arc::clone(best.1))
     }
 
     /// Select the target with the lowest latency EWMA.
@@ -775,8 +785,8 @@ impl LoadBalancer {
     /// falls back to round-robin.
     fn select_least_latency(
         &self,
-        candidates: &[(usize, &UpstreamTarget)],
-    ) -> Option<UpstreamTarget> {
+        candidates: &[(usize, &Arc<UpstreamTarget>)],
+    ) -> Option<Arc<UpstreamTarget>> {
         if candidates.is_empty() {
             return None;
         }
@@ -804,7 +814,7 @@ impl LoadBalancer {
         // below the warm-up threshold (fresh startup).
         if warmed_count == 0 || (!any_has_data) {
             let idx = self.rr_counter.fetch_add(1, Ordering::Relaxed) as usize;
-            return Some(candidates[idx % candidates.len()].1.clone());
+            return Some(Arc::clone(candidates[idx % candidates.len()].1));
         }
 
         // If all candidates are warmed up, pure latency-based selection.
@@ -865,10 +875,10 @@ impl LoadBalancer {
         // If all targets have no data, fall back to round-robin
         if best_latency == LATENCY_UNSET {
             let idx = self.rr_counter.fetch_add(1, Ordering::Relaxed) as usize;
-            return Some(candidates[idx % candidates.len()].1.clone());
+            return Some(Arc::clone(candidates[idx % candidates.len()].1));
         }
 
-        Some(best.1.clone())
+        Some(Arc::clone(best.1))
     }
 
     /// Consistent hash: find the target on the hash ring closest to the hash of ctx_key.
@@ -876,8 +886,8 @@ impl LoadBalancer {
     fn select_consistent_hash(
         &self,
         ctx_key: &str,
-        candidates: &[(usize, &UpstreamTarget)],
-    ) -> Option<UpstreamTarget> {
+        candidates: &[(usize, &Arc<UpstreamTarget>)],
+    ) -> Option<Arc<UpstreamTarget>> {
         if candidates.is_empty() {
             return None;
         }
@@ -897,11 +907,11 @@ impl LoadBalancer {
             let ring_idx = (pos + i) % self.hash_ring.len();
             let target_idx = self.hash_ring[ring_idx].1;
             if candidates.iter().any(|&(ci, _)| ci == target_idx) {
-                return Some(self.targets[target_idx].clone());
+                return Some(Arc::clone(&self.targets[target_idx]));
             }
         }
 
         // Fallback: return first candidate
-        Some(candidates[0].1.clone())
+        Some(Arc::clone(candidates[0].1))
     }
 }

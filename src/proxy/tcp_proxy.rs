@@ -961,7 +961,7 @@ fn try_next_target(
         tags: std::collections::HashMap::new(),
     };
     let next = lb_cache.select_next_target(upstream_id, current_host, &exclude, None)?;
-    Some((next.host, next.port))
+    Some((next.host.clone(), next.port))
 }
 
 /// Connect to a plain TCP backend with the given connect timeout.
