@@ -1311,6 +1311,398 @@ mod inner {
     fn diff_removed(known: &HashSet<String>, current: &HashSet<String>) -> Vec<String> {
         known.difference(current).cloned().collect()
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::collections::HashSet;
+
+        // -------------------------------------------------------------------
+        // diff_removed tests
+        // -------------------------------------------------------------------
+
+        #[test]
+        fn diff_removed_empty_sets() {
+            let known = HashSet::new();
+            let current = HashSet::new();
+            let removed = diff_removed(&known, &current);
+            assert!(removed.is_empty(), "no removals when both sets are empty");
+        }
+
+        #[test]
+        fn diff_removed_no_deletions() {
+            let known: HashSet<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
+            let current: HashSet<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
+            let removed = diff_removed(&known, &current);
+            assert!(removed.is_empty(), "no removals when sets are identical");
+        }
+
+        #[test]
+        fn diff_removed_all_deleted() {
+            let known: HashSet<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
+            let current = HashSet::new();
+            let mut removed = diff_removed(&known, &current);
+            removed.sort();
+            assert_eq!(removed, vec!["a", "b", "c"]);
+        }
+
+        #[test]
+        fn diff_removed_partial_deletion() {
+            let known: HashSet<String> =
+                ["a", "b", "c", "d"].iter().map(|s| s.to_string()).collect();
+            let current: HashSet<String> = ["a", "c"].iter().map(|s| s.to_string()).collect();
+            let mut removed = diff_removed(&known, &current);
+            removed.sort();
+            assert_eq!(removed, vec!["b", "d"]);
+        }
+
+        #[test]
+        fn diff_removed_current_has_new_ids() {
+            // New IDs in current that are not in known should NOT appear in removed
+            let known: HashSet<String> = ["a", "b"].iter().map(|s| s.to_string()).collect();
+            let current: HashSet<String> =
+                ["a", "b", "c", "d"].iter().map(|s| s.to_string()).collect();
+            let removed = diff_removed(&known, &current);
+            assert!(
+                removed.is_empty(),
+                "additions in current should not appear as removals"
+            );
+        }
+
+        #[test]
+        fn diff_removed_single_deletion() {
+            let known: HashSet<String> = ["proxy-1", "proxy-2", "proxy-3"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+            let current: HashSet<String> = ["proxy-1", "proxy-3"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+            let removed = diff_removed(&known, &current);
+            assert_eq!(removed, vec!["proxy-2"]);
+        }
+
+        #[test]
+        fn diff_removed_known_empty_current_has_ids() {
+            let known = HashSet::new();
+            let current: HashSet<String> = ["a", "b"].iter().map(|s| s.to_string()).collect();
+            let removed = diff_removed(&known, &current);
+            assert!(removed.is_empty(), "nothing to remove when known is empty");
+        }
+
+        // -------------------------------------------------------------------
+        // BSON round-trip serialization tests
+        // -------------------------------------------------------------------
+
+        #[test]
+        fn proxy_bson_round_trip() {
+            let now = chrono::Utc::now();
+            let proxy = Proxy {
+                id: "test-proxy".to_string(),
+                name: Some("My Proxy".to_string()),
+                hosts: vec!["example.com".to_string()],
+                listen_path: "/api".to_string(),
+                backend_protocol: crate::config::types::BackendProtocol::Https,
+                backend_host: "backend.internal".to_string(),
+                backend_port: 8443,
+                backend_path: Some("/v2".to_string()),
+                strip_listen_path: true,
+                preserve_host_header: false,
+                backend_connect_timeout_ms: 5000,
+                backend_read_timeout_ms: 30000,
+                backend_write_timeout_ms: 30000,
+                backend_tls_client_cert_path: None,
+                backend_tls_client_key_path: None,
+                backend_tls_verify_server_cert: true,
+                backend_tls_server_ca_cert_path: None,
+                dns_override: None,
+                dns_cache_ttl_seconds: None,
+                auth_mode: crate::config::types::AuthMode::Single,
+                plugins: vec![],
+                pool_idle_timeout_seconds: None,
+                pool_enable_http_keep_alive: None,
+                pool_enable_http2: None,
+                pool_tcp_keepalive_seconds: None,
+                pool_http2_keep_alive_interval_seconds: None,
+                pool_http2_keep_alive_timeout_seconds: None,
+                pool_http2_initial_stream_window_size: None,
+                pool_http2_initial_connection_window_size: None,
+                pool_http2_adaptive_window: None,
+                pool_http2_max_frame_size: None,
+                pool_http2_max_concurrent_streams: None,
+                pool_http3_connections_per_backend: None,
+                upstream_id: None,
+                circuit_breaker: None,
+                retry: None,
+                response_body_mode: crate::config::types::ResponseBodyMode::default(),
+                listen_port: None,
+                frontend_tls: false,
+                passthrough: false,
+                udp_idle_timeout_seconds: 60,
+                tcp_idle_timeout_seconds: Some(300),
+                allowed_methods: None,
+                allowed_ws_origins: vec![],
+                udp_max_response_amplification_factor: None,
+                created_at: now,
+                updated_at: now,
+            };
+
+            let doc = proxy_to_doc(&proxy).expect("proxy_to_doc should succeed");
+            // Verify _id was set
+            assert_eq!(doc.get_str("_id").unwrap(), "test-proxy");
+
+            let restored = doc_to_proxy(doc).expect("doc_to_proxy should succeed");
+            assert_eq!(restored.id, proxy.id);
+            assert_eq!(restored.name, proxy.name);
+            assert_eq!(restored.hosts, proxy.hosts);
+            assert_eq!(restored.listen_path, proxy.listen_path);
+            assert_eq!(restored.backend_host, proxy.backend_host);
+            assert_eq!(restored.backend_port, proxy.backend_port);
+            assert_eq!(restored.backend_path, proxy.backend_path);
+            assert_eq!(restored.strip_listen_path, proxy.strip_listen_path);
+        }
+
+        #[test]
+        fn consumer_bson_round_trip() {
+            let now = chrono::Utc::now();
+            let consumer = Consumer {
+                id: "consumer-1".to_string(),
+                username: "alice".to_string(),
+                custom_id: Some("ext-alice".to_string()),
+                credentials: std::collections::HashMap::new(),
+                acl_groups: vec!["group-a".to_string(), "group-b".to_string()],
+                created_at: now,
+                updated_at: now,
+            };
+
+            let doc = consumer_to_doc(&consumer).expect("consumer_to_doc should succeed");
+            assert_eq!(doc.get_str("_id").unwrap(), "consumer-1");
+
+            let restored = doc_to_consumer(doc).expect("doc_to_consumer should succeed");
+            assert_eq!(restored.id, consumer.id);
+            assert_eq!(restored.username, consumer.username);
+            assert_eq!(restored.custom_id, consumer.custom_id);
+            assert_eq!(restored.acl_groups, consumer.acl_groups);
+        }
+
+        #[test]
+        fn plugin_config_bson_round_trip() {
+            let now = chrono::Utc::now();
+            let pc = PluginConfig {
+                id: "plugin-1".to_string(),
+                plugin_name: "rate_limiting".to_string(),
+                enabled: true,
+                config: serde_json::json!({"window_seconds": 60, "max_requests": 100}),
+                scope: crate::config::types::PluginScope::Proxy,
+                proxy_id: Some("proxy-1".to_string()),
+                priority_override: Some(500),
+                created_at: now,
+                updated_at: now,
+            };
+
+            let doc = plugin_config_to_doc(&pc).expect("plugin_config_to_doc should succeed");
+            assert_eq!(doc.get_str("_id").unwrap(), "plugin-1");
+
+            let restored = doc_to_plugin_config(doc).expect("doc_to_plugin_config should succeed");
+            assert_eq!(restored.id, pc.id);
+            assert_eq!(restored.plugin_name, pc.plugin_name);
+            assert_eq!(restored.enabled, pc.enabled);
+            assert_eq!(restored.proxy_id, pc.proxy_id);
+            assert_eq!(restored.priority_override, pc.priority_override);
+        }
+
+        #[test]
+        fn upstream_bson_round_trip() {
+            let now = chrono::Utc::now();
+            let upstream = Upstream {
+                id: "upstream-1".to_string(),
+                name: Some("my-upstream".to_string()),
+                algorithm: crate::config::types::LoadBalancerAlgorithm::RoundRobin,
+                targets: vec![crate::config::types::UpstreamTarget {
+                    host: "target1.example.com".to_string(),
+                    port: 8080,
+                    weight: 100,
+                    tags: std::collections::HashMap::new(),
+                    path: None,
+                }],
+                health_checks: None,
+                hash_on: None,
+                hash_on_cookie_config: None,
+                service_discovery: None,
+                created_at: now,
+                updated_at: now,
+            };
+
+            let doc = upstream_to_doc(&upstream).expect("upstream_to_doc should succeed");
+            assert_eq!(doc.get_str("_id").unwrap(), "upstream-1");
+
+            let restored = doc_to_upstream(doc).expect("doc_to_upstream should succeed");
+            assert_eq!(restored.id, upstream.id);
+            assert_eq!(restored.name, upstream.name);
+            assert_eq!(restored.targets.len(), 1);
+            assert_eq!(restored.targets[0].host, "target1.example.com");
+            assert_eq!(restored.targets[0].port, 8080);
+            assert_eq!(restored.targets[0].weight, 100);
+        }
+
+        #[test]
+        fn proxy_to_doc_sets_id_field() {
+            let now = chrono::Utc::now();
+            let proxy = Proxy {
+                id: "unique-id-123".to_string(),
+                name: None,
+                hosts: vec![],
+                listen_path: "/".to_string(),
+                backend_protocol: crate::config::types::BackendProtocol::Http,
+                backend_host: "localhost".to_string(),
+                backend_port: 80,
+                backend_path: None,
+                strip_listen_path: true,
+                preserve_host_header: false,
+                backend_connect_timeout_ms: 5000,
+                backend_read_timeout_ms: 30000,
+                backend_write_timeout_ms: 30000,
+                backend_tls_client_cert_path: None,
+                backend_tls_client_key_path: None,
+                backend_tls_verify_server_cert: true,
+                backend_tls_server_ca_cert_path: None,
+                dns_override: None,
+                dns_cache_ttl_seconds: None,
+                auth_mode: crate::config::types::AuthMode::Single,
+                plugins: vec![],
+                pool_idle_timeout_seconds: None,
+                pool_enable_http_keep_alive: None,
+                pool_enable_http2: None,
+                pool_tcp_keepalive_seconds: None,
+                pool_http2_keep_alive_interval_seconds: None,
+                pool_http2_keep_alive_timeout_seconds: None,
+                pool_http2_initial_stream_window_size: None,
+                pool_http2_initial_connection_window_size: None,
+                pool_http2_adaptive_window: None,
+                pool_http2_max_frame_size: None,
+                pool_http2_max_concurrent_streams: None,
+                pool_http3_connections_per_backend: None,
+                upstream_id: None,
+                circuit_breaker: None,
+                retry: None,
+                response_body_mode: crate::config::types::ResponseBodyMode::default(),
+                listen_port: None,
+                frontend_tls: false,
+                passthrough: false,
+                udp_idle_timeout_seconds: 60,
+                tcp_idle_timeout_seconds: Some(300),
+                allowed_methods: None,
+                allowed_ws_origins: vec![],
+                udp_max_response_amplification_factor: None,
+                created_at: now,
+                updated_at: now,
+            };
+            let doc = proxy_to_doc(&proxy).unwrap();
+            // The _id should be set to the proxy id
+            assert_eq!(doc.get_str("_id").unwrap(), "unique-id-123");
+            // The original id field should also be present (BSON serialization includes it)
+            assert_eq!(doc.get_str("id").unwrap(), "unique-id-123");
+        }
+
+        #[test]
+        fn consumer_with_credentials_round_trip() {
+            let now = chrono::Utc::now();
+            let mut credentials = std::collections::HashMap::new();
+            credentials.insert(
+                "key_auth".to_string(),
+                serde_json::json!({"key": "my-api-key-123"}),
+            );
+            credentials.insert(
+                "basic_auth".to_string(),
+                serde_json::json!({"username": "alice", "password_hash": "abc123"}),
+            );
+
+            let consumer = Consumer {
+                id: "consumer-with-creds".to_string(),
+                username: "alice".to_string(),
+                custom_id: None,
+                credentials,
+                acl_groups: vec![],
+                created_at: now,
+                updated_at: now,
+            };
+
+            let doc = consumer_to_doc(&consumer).unwrap();
+            let restored = doc_to_consumer(doc).unwrap();
+            assert_eq!(restored.credentials.len(), 2);
+            assert!(restored.credentials.contains_key("key_auth"));
+            assert!(restored.credentials.contains_key("basic_auth"));
+        }
+
+        #[test]
+        fn proxy_with_plugin_associations_round_trip() {
+            let now = chrono::Utc::now();
+            let proxy = Proxy {
+                id: "proxy-with-plugins".to_string(),
+                name: None,
+                hosts: vec![],
+                listen_path: "/test".to_string(),
+                backend_protocol: crate::config::types::BackendProtocol::Http,
+                backend_host: "backend.local".to_string(),
+                backend_port: 8080,
+                backend_path: None,
+                strip_listen_path: true,
+                preserve_host_header: false,
+                backend_connect_timeout_ms: 5000,
+                backend_read_timeout_ms: 30000,
+                backend_write_timeout_ms: 30000,
+                backend_tls_client_cert_path: None,
+                backend_tls_client_key_path: None,
+                backend_tls_verify_server_cert: true,
+                backend_tls_server_ca_cert_path: None,
+                dns_override: None,
+                dns_cache_ttl_seconds: None,
+                auth_mode: crate::config::types::AuthMode::Single,
+                plugins: vec![
+                    PluginAssociation {
+                        plugin_config_id: "plugin-a".to_string(),
+                    },
+                    PluginAssociation {
+                        plugin_config_id: "plugin-b".to_string(),
+                    },
+                ],
+                pool_idle_timeout_seconds: None,
+                pool_enable_http_keep_alive: None,
+                pool_enable_http2: None,
+                pool_tcp_keepalive_seconds: None,
+                pool_http2_keep_alive_interval_seconds: None,
+                pool_http2_keep_alive_timeout_seconds: None,
+                pool_http2_initial_stream_window_size: None,
+                pool_http2_initial_connection_window_size: None,
+                pool_http2_adaptive_window: None,
+                pool_http2_max_frame_size: None,
+                pool_http2_max_concurrent_streams: None,
+                pool_http3_connections_per_backend: None,
+                upstream_id: Some("my-upstream".to_string()),
+                circuit_breaker: None,
+                retry: None,
+                response_body_mode: crate::config::types::ResponseBodyMode::default(),
+                listen_port: None,
+                frontend_tls: false,
+                passthrough: false,
+                udp_idle_timeout_seconds: 60,
+                tcp_idle_timeout_seconds: Some(300),
+                allowed_methods: None,
+                allowed_ws_origins: vec![],
+                udp_max_response_amplification_factor: None,
+                created_at: now,
+                updated_at: now,
+            };
+
+            let doc = proxy_to_doc(&proxy).unwrap();
+            let restored = doc_to_proxy(doc).unwrap();
+            assert_eq!(restored.plugins.len(), 2);
+            assert_eq!(restored.plugins[0].plugin_config_id, "plugin-a");
+            assert_eq!(restored.plugins[1].plugin_config_id, "plugin-b");
+            assert_eq!(restored.upstream_id, Some("my-upstream".to_string()));
+        }
+    }
 }
 
 pub use inner::MongoStore;

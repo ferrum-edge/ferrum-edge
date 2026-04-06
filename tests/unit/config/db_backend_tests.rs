@@ -1,4 +1,7 @@
-use ferrum_edge::config::db_backend::{extract_db_hostname, extract_known_ids, redact_url};
+use chrono::Utc;
+use ferrum_edge::config::db_backend::{
+    IncrementalResult, extract_db_hostname, extract_known_ids, redact_url,
+};
 use ferrum_edge::config::types::GatewayConfig;
 
 // ---------------------------------------------------------------------------
@@ -134,4 +137,135 @@ fn extract_hostname_postgres_url_via_free_fn() {
 #[test]
 fn extract_hostname_sqlite_returns_none_via_free_fn() {
     assert_eq!(extract_db_hostname("sqlite://ferrum.db"), None);
+}
+
+// ---------------------------------------------------------------------------
+// IncrementalResult::is_empty — incremental polling empty detection
+// ---------------------------------------------------------------------------
+
+#[test]
+fn incremental_result_is_empty_when_default() {
+    let result = IncrementalResult {
+        added_or_modified_proxies: vec![],
+        removed_proxy_ids: vec![],
+        added_or_modified_consumers: vec![],
+        removed_consumer_ids: vec![],
+        added_or_modified_plugin_configs: vec![],
+        removed_plugin_config_ids: vec![],
+        added_or_modified_upstreams: vec![],
+        removed_upstream_ids: vec![],
+        poll_timestamp: Utc::now(),
+    };
+    assert!(result.is_empty());
+}
+
+#[test]
+fn incremental_result_not_empty_with_added_proxy() {
+    let proxy: ferrum_edge::config::types::Proxy = serde_json::from_value(serde_json::json!({
+        "id": "p1",
+        "listen_path": "/api",
+        "backend_protocol": "http",
+        "backend_host": "localhost",
+        "backend_port": 8080
+    }))
+    .unwrap();
+    let result = IncrementalResult {
+        added_or_modified_proxies: vec![proxy],
+        removed_proxy_ids: vec![],
+        added_or_modified_consumers: vec![],
+        removed_consumer_ids: vec![],
+        added_or_modified_plugin_configs: vec![],
+        removed_plugin_config_ids: vec![],
+        added_or_modified_upstreams: vec![],
+        removed_upstream_ids: vec![],
+        poll_timestamp: Utc::now(),
+    };
+    assert!(!result.is_empty());
+}
+
+#[test]
+fn incremental_result_not_empty_with_removed_proxy_id() {
+    let result = IncrementalResult {
+        added_or_modified_proxies: vec![],
+        removed_proxy_ids: vec!["p1".to_string()],
+        added_or_modified_consumers: vec![],
+        removed_consumer_ids: vec![],
+        added_or_modified_plugin_configs: vec![],
+        removed_plugin_config_ids: vec![],
+        added_or_modified_upstreams: vec![],
+        removed_upstream_ids: vec![],
+        poll_timestamp: Utc::now(),
+    };
+    assert!(!result.is_empty());
+}
+
+#[test]
+fn incremental_result_not_empty_with_removed_consumer() {
+    let result = IncrementalResult {
+        added_or_modified_proxies: vec![],
+        removed_proxy_ids: vec![],
+        added_or_modified_consumers: vec![],
+        removed_consumer_ids: vec!["c1".to_string()],
+        added_or_modified_plugin_configs: vec![],
+        removed_plugin_config_ids: vec![],
+        added_or_modified_upstreams: vec![],
+        removed_upstream_ids: vec![],
+        poll_timestamp: Utc::now(),
+    };
+    assert!(!result.is_empty());
+}
+
+#[test]
+fn incremental_result_not_empty_with_removed_plugin_config() {
+    let result = IncrementalResult {
+        added_or_modified_proxies: vec![],
+        removed_proxy_ids: vec![],
+        added_or_modified_consumers: vec![],
+        removed_consumer_ids: vec![],
+        added_or_modified_plugin_configs: vec![],
+        removed_plugin_config_ids: vec!["pc1".to_string()],
+        added_or_modified_upstreams: vec![],
+        removed_upstream_ids: vec![],
+        poll_timestamp: Utc::now(),
+    };
+    assert!(!result.is_empty());
+}
+
+#[test]
+fn incremental_result_not_empty_with_removed_upstream() {
+    let result = IncrementalResult {
+        added_or_modified_proxies: vec![],
+        removed_proxy_ids: vec![],
+        added_or_modified_consumers: vec![],
+        removed_consumer_ids: vec![],
+        added_or_modified_plugin_configs: vec![],
+        removed_plugin_config_ids: vec![],
+        added_or_modified_upstreams: vec![],
+        removed_upstream_ids: vec!["u1".to_string()],
+        poll_timestamp: Utc::now(),
+    };
+    assert!(!result.is_empty());
+}
+
+#[test]
+fn incremental_result_not_empty_with_added_consumer() {
+    let consumer: ferrum_edge::config::types::Consumer =
+        serde_json::from_value(serde_json::json!({
+            "id": "c1",
+            "username": "alice",
+            "credentials": {}
+        }))
+        .unwrap();
+    let result = IncrementalResult {
+        added_or_modified_proxies: vec![],
+        removed_proxy_ids: vec![],
+        added_or_modified_consumers: vec![consumer],
+        removed_consumer_ids: vec![],
+        added_or_modified_plugin_configs: vec![],
+        removed_plugin_config_ids: vec![],
+        added_or_modified_upstreams: vec![],
+        removed_upstream_ids: vec![],
+        poll_timestamp: Utc::now(),
+    };
+    assert!(!result.is_empty());
 }

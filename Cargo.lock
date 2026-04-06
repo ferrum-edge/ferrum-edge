@@ -1788,6 +1788,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tikv-jemallocator",
+ "time",
  "tokio",
  "tokio-rustls 0.26.4",
  "tokio-stream",
