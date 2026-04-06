@@ -18,6 +18,12 @@ fn make_post_ctx(body: &serde_json::Value) -> ferrum_edge::plugins::RequestConte
     ctx
 }
 
+fn make_post_headers() -> HashMap<String, String> {
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+    headers
+}
+
 // ─── Plugin basics ──────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -54,7 +60,7 @@ fn test_request_buffering_only_for_matching_json_requests() {
 async fn test_blocked_model_rejected() {
     let plugin = AiRequestGuard::new(&json!({"blocked_models": ["o3", "gpt-4"]})).unwrap();
     let mut ctx = make_post_ctx(&json!({"model": "o3", "messages": []}));
-    let mut headers = HashMap::new();
+    let mut headers = make_post_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_reject(result, Some(400));
 }
@@ -63,7 +69,7 @@ async fn test_blocked_model_rejected() {
 async fn test_non_blocked_model_passes() {
     let plugin = AiRequestGuard::new(&json!({"blocked_models": ["o3"]})).unwrap();
     let mut ctx = make_post_ctx(&json!({"model": "gpt-4o-mini", "messages": []}));
-    let mut headers = HashMap::new();
+    let mut headers = make_post_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_continue(result);
 }
@@ -75,7 +81,7 @@ async fn test_allowed_model_passes() {
     let plugin =
         AiRequestGuard::new(&json!({"allowed_models": ["gpt-4o-mini", "gpt-4o"]})).unwrap();
     let mut ctx = make_post_ctx(&json!({"model": "gpt-4o-mini", "messages": []}));
-    let mut headers = HashMap::new();
+    let mut headers = make_post_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_continue(result);
 }
@@ -84,7 +90,7 @@ async fn test_allowed_model_passes() {
 async fn test_unlisted_model_rejected() {
     let plugin = AiRequestGuard::new(&json!({"allowed_models": ["gpt-4o-mini"]})).unwrap();
     let mut ctx = make_post_ctx(&json!({"model": "gpt-4", "messages": []}));
-    let mut headers = HashMap::new();
+    let mut headers = make_post_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_reject(result, Some(400));
 }
@@ -97,7 +103,7 @@ async fn test_blocked_takes_precedence_over_allowed() {
     }))
     .unwrap();
     let mut ctx = make_post_ctx(&json!({"model": "gpt-4", "messages": []}));
-    let mut headers = HashMap::new();
+    let mut headers = make_post_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_reject(result, Some(400));
 }
@@ -106,7 +112,7 @@ async fn test_blocked_takes_precedence_over_allowed() {
 async fn test_case_insensitive_model_matching() {
     let plugin = AiRequestGuard::new(&json!({"blocked_models": ["GPT-4"]})).unwrap();
     let mut ctx = make_post_ctx(&json!({"model": "gpt-4", "messages": []}));
-    let mut headers = HashMap::new();
+    let mut headers = make_post_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_reject(result, Some(400));
 }
@@ -117,7 +123,7 @@ async fn test_case_insensitive_model_matching() {
 async fn test_max_tokens_reject_over_limit() {
     let plugin = AiRequestGuard::new(&json!({"max_tokens_limit": 1000})).unwrap();
     let mut ctx = make_post_ctx(&json!({"model": "gpt-4", "max_tokens": 5000}));
-    let mut headers = HashMap::new();
+    let mut headers = make_post_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_reject(result, Some(400));
 }
@@ -126,7 +132,7 @@ async fn test_max_tokens_reject_over_limit() {
 async fn test_max_tokens_reject_under_limit() {
     let plugin = AiRequestGuard::new(&json!({"max_tokens_limit": 1000})).unwrap();
     let mut ctx = make_post_ctx(&json!({"model": "gpt-4", "max_tokens": 500}));
-    let mut headers = HashMap::new();
+    let mut headers = make_post_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_continue(result);
 }
@@ -142,7 +148,7 @@ async fn test_max_tokens_clamp_mode() {
 
     // In clamp mode, before_proxy should NOT reject
     let mut ctx = make_post_ctx(&json!({"model": "gpt-4", "max_tokens": 5000}));
-    let mut headers = HashMap::new();
+    let mut headers = make_post_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_continue(result);
 
@@ -211,7 +217,7 @@ async fn test_max_messages_exceeded() {
             {"role": "user", "content": "c"}
         ]
     }));
-    let mut headers = HashMap::new();
+    let mut headers = make_post_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_reject(result, Some(400));
 }
@@ -223,7 +229,7 @@ async fn test_max_messages_within_limit() {
         "model": "gpt-4",
         "messages": [{"role": "user", "content": "hello"}]
     }));
-    let mut headers = HashMap::new();
+    let mut headers = make_post_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_continue(result);
 }
@@ -237,7 +243,7 @@ async fn test_max_prompt_characters_exceeded() {
         "model": "gpt-4",
         "messages": [{"role": "user", "content": "this is a long prompt that exceeds the limit"}]
     }));
-    let mut headers = HashMap::new();
+    let mut headers = make_post_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_reject(result, Some(400));
 }
@@ -256,7 +262,7 @@ async fn test_multimodal_content_character_counting() {
             ]
         }]
     }));
-    let mut headers = HashMap::new();
+    let mut headers = make_post_headers();
     // "hello" (5) + "world!" (6) = 11 > 10
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_reject(result, Some(400));
@@ -268,7 +274,7 @@ async fn test_multimodal_content_character_counting() {
 async fn test_temperature_out_of_range() {
     let plugin = AiRequestGuard::new(&json!({"temperature_range": [0.0, 1.0]})).unwrap();
     let mut ctx = make_post_ctx(&json!({"model": "gpt-4", "temperature": 1.5}));
-    let mut headers = HashMap::new();
+    let mut headers = make_post_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_reject(result, Some(400));
 }
@@ -277,7 +283,7 @@ async fn test_temperature_out_of_range() {
 async fn test_temperature_in_range() {
     let plugin = AiRequestGuard::new(&json!({"temperature_range": [0.0, 2.0]})).unwrap();
     let mut ctx = make_post_ctx(&json!({"model": "gpt-4", "temperature": 0.7}));
-    let mut headers = HashMap::new();
+    let mut headers = make_post_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_continue(result);
 }
@@ -294,7 +300,7 @@ async fn test_block_system_prompts() {
             {"role": "user", "content": "Hello"}
         ]
     }));
-    let mut headers = HashMap::new();
+    let mut headers = make_post_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_reject(result, Some(400));
 }
@@ -306,7 +312,7 @@ async fn test_no_system_prompts_passes() {
         "model": "gpt-4",
         "messages": [{"role": "user", "content": "Hello"}]
     }));
-    let mut headers = HashMap::new();
+    let mut headers = make_post_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_continue(result);
 }
@@ -317,7 +323,7 @@ async fn test_no_system_prompts_passes() {
 async fn test_require_user_field_missing() {
     let plugin = AiRequestGuard::new(&json!({"require_user_field": true})).unwrap();
     let mut ctx = make_post_ctx(&json!({"model": "gpt-4", "messages": []}));
-    let mut headers = HashMap::new();
+    let mut headers = make_post_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_reject(result, Some(400));
 }
@@ -326,7 +332,7 @@ async fn test_require_user_field_missing() {
 async fn test_require_user_field_present() {
     let plugin = AiRequestGuard::new(&json!({"require_user_field": true})).unwrap();
     let mut ctx = make_post_ctx(&json!({"model": "gpt-4", "messages": [], "user": "user-123"}));
-    let mut headers = HashMap::new();
+    let mut headers = make_post_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_continue(result);
 }
@@ -338,7 +344,7 @@ async fn test_non_post_passes() {
     let plugin = AiRequestGuard::new(&json!({"blocked_models": ["gpt-4"]})).unwrap();
     let mut ctx = create_test_context();
     ctx.method = "GET".to_string();
-    let mut headers = HashMap::new();
+    let mut headers = make_post_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_continue(result);
 }
@@ -351,6 +357,7 @@ async fn test_non_json_content_type_passes() {
     ctx.headers
         .insert("content-type".to_string(), "text/plain".to_string());
     let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "text/plain".to_string());
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_continue(result);
 }
@@ -362,7 +369,7 @@ async fn test_empty_body_passes() {
     ctx.method = "POST".to_string();
     ctx.headers
         .insert("content-type".to_string(), "application/json".to_string());
-    let mut headers = HashMap::new();
+    let mut headers = make_post_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_continue(result);
 }
@@ -376,7 +383,7 @@ async fn test_malformed_json_passes() {
         .insert("content-type".to_string(), "application/json".to_string());
     ctx.metadata
         .insert("request_body".to_string(), "not valid json{{{".to_string());
-    let mut headers = HashMap::new();
+    let mut headers = make_post_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_continue(result);
 }
@@ -387,7 +394,7 @@ async fn test_malformed_json_passes() {
 async fn test_required_metadata_fields_present() {
     let plugin = AiRequestGuard::new(&json!({"required_metadata_fields": ["stream"]})).unwrap();
     let mut ctx = make_post_ctx(&json!({"model": "gpt-4", "messages": [], "stream": true}));
-    let mut headers = HashMap::new();
+    let mut headers = make_post_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_continue(result);
 }
@@ -396,7 +403,7 @@ async fn test_required_metadata_fields_present() {
 async fn test_required_metadata_fields_missing() {
     let plugin = AiRequestGuard::new(&json!({"required_metadata_fields": ["stream"]})).unwrap();
     let mut ctx = make_post_ctx(&json!({"model": "gpt-4", "messages": []}));
-    let mut headers = HashMap::new();
+    let mut headers = make_post_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_reject(result, Some(400));
 }

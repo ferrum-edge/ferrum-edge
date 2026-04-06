@@ -776,10 +776,12 @@ impl Plugin for SoapWsSecurity {
     async fn before_proxy(
         &self,
         ctx: &mut RequestContext,
-        _headers: &mut HashMap<String, String>,
+        headers: &mut HashMap<String, String>,
     ) -> PluginResult {
         // Only process SOAP content types
-        let content_type = match ctx.headers.get("content-type") {
+        // Read from `headers` param (not `ctx.headers`) because the handler may
+        // temporarily move headers out of ctx when no plugin modifies them.
+        let content_type = match headers.get("content-type") {
             Some(ct) if Self::is_soap_content_type(ct) => ct.clone(),
             _ => return PluginResult::Continue,
         };

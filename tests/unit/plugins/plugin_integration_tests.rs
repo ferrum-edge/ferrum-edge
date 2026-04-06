@@ -194,6 +194,7 @@ async fn test_all_plugins_available() {
         "ldap_auth",
         "hmac_auth",
         "mtls_auth",
+        "compression",
         "cors",
         "access_control",
         "tcp_connection_throttle",

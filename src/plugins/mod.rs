@@ -1132,6 +1132,7 @@ pub fn available_plugins() -> Vec<&'static str> {
         "ldap_auth",
         "hmac_auth",
         "mtls_auth",
+        "compression",
         "cors",
         "access_control",
         "tcp_connection_throttle",

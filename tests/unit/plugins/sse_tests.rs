@@ -274,6 +274,7 @@ async fn test_original_accept_saved_in_metadata() {
     let plugin = make_plugin(json!({}));
     let mut ctx = make_sse_ctx();
     let mut headers = HashMap::new();
+    headers.insert("accept".to_string(), "text/event-stream".to_string());
 
     plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_eq!(
@@ -548,6 +549,7 @@ async fn test_full_sse_lifecycle() {
 
     // Phase 2: shape request for backend.
     let mut backend_headers = HashMap::new();
+    backend_headers.insert("accept".to_string(), "text/event-stream".to_string());
     backend_headers.insert("accept-encoding".to_string(), "gzip, br".to_string());
     let result = plugin.before_proxy(&mut ctx, &mut backend_headers).await;
     assert_continue(&result);

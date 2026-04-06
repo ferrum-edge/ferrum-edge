@@ -18,6 +18,12 @@ fn make_post_ctx(body: &serde_json::Value) -> ferrum_edge::plugins::RequestConte
     ctx
 }
 
+fn make_post_headers() -> HashMap<String, String> {
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+    headers
+}
+
 fn ai_request(content: &str) -> serde_json::Value {
     json!({
         "model": "gpt-4",
@@ -76,7 +82,7 @@ fn test_invalid_custom_regex_returns_error() {
 async fn test_ssn_detected_rejected() {
     let plugin = AiPromptShield::new(&json!({"patterns": ["ssn"]})).unwrap();
     let mut ctx = make_post_ctx(&ai_request("My SSN is 123-45-6789"));
-    let mut headers = HashMap::new();
+    let mut headers = make_post_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_reject(result, Some(400));
 }
@@ -85,7 +91,7 @@ async fn test_ssn_detected_rejected() {
 async fn test_ssn_no_separators() {
     let plugin = AiPromptShield::new(&json!({"patterns": ["ssn"]})).unwrap();
     let mut ctx = make_post_ctx(&ai_request("SSN: 123456789"));
-    let mut headers = HashMap::new();
+    let mut headers = make_post_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_reject(result, Some(400));
 }
@@ -96,7 +102,7 @@ async fn test_ssn_no_separators() {
 async fn test_credit_card_detected() {
     let plugin = AiPromptShield::new(&json!({"patterns": ["credit_card"]})).unwrap();
     let mut ctx = make_post_ctx(&ai_request("My card is 4111-1111-1111-1111"));
-    let mut headers = HashMap::new();
+    let mut headers = make_post_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_reject(result, Some(400));
 }
@@ -107,7 +113,7 @@ async fn test_credit_card_detected() {
 async fn test_email_detected() {
     let plugin = AiPromptShield::new(&json!({"patterns": ["email"]})).unwrap();
     let mut ctx = make_post_ctx(&ai_request("Contact me at john@example.com"));
-    let mut headers = HashMap::new();
+    let mut headers = make_post_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_reject(result, Some(400));
 }
@@ -118,7 +124,7 @@ async fn test_email_detected() {
 async fn test_aws_key_detected() {
     let plugin = AiPromptShield::new(&json!({"patterns": ["aws_key"]})).unwrap();
     let mut ctx = make_post_ctx(&ai_request("Key: AKIAIOSFODNN7EXAMPLE"));
-    let mut headers = HashMap::new();
+    let mut headers = make_post_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_reject(result, Some(400));
 }
@@ -129,7 +135,7 @@ async fn test_aws_key_detected() {
 async fn test_api_key_detected() {
     let plugin = AiPromptShield::new(&json!({"patterns": ["api_key"]})).unwrap();
     let mut ctx = make_post_ctx(&ai_request("Use sk_liveabcdefghijklmnopqrstuvwxyz"));
-    let mut headers = HashMap::new();
+    let mut headers = make_post_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_reject(result, Some(400));
 }
@@ -140,7 +146,7 @@ async fn test_api_key_detected() {
 async fn test_iban_detected() {
     let plugin = AiPromptShield::new(&json!({"patterns": ["iban"]})).unwrap();
     let mut ctx = make_post_ctx(&ai_request("My IBAN is GB29NWBK60161331926819"));
-    let mut headers = HashMap::new();
+    let mut headers = make_post_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_reject(result, Some(400));
 }
@@ -151,7 +157,7 @@ async fn test_iban_detected() {
 async fn test_ip_address_detected() {
     let plugin = AiPromptShield::new(&json!({"patterns": ["ip_address"]})).unwrap();
     let mut ctx = make_post_ctx(&ai_request("Connect to server 10.20.30.40 now"));
-    let mut headers = HashMap::new();
+    let mut headers = make_post_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_reject(result, Some(400));
 }
@@ -163,7 +169,7 @@ async fn test_no_pii_passes() {
     let plugin =
         AiPromptShield::new(&json!({"patterns": ["ssn", "credit_card", "email"]})).unwrap();
     let mut ctx = make_post_ctx(&ai_request("Hello, how are you doing today?"));
-    let mut headers = HashMap::new();
+    let mut headers = make_post_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_continue(result);
 }
@@ -175,7 +181,7 @@ async fn test_only_configured_patterns_checked() {
     // Only SSN enabled — email should pass
     let plugin = AiPromptShield::new(&json!({"patterns": ["ssn"]})).unwrap();
     let mut ctx = make_post_ctx(&ai_request("Contact john@example.com for details"));
-    let mut headers = HashMap::new();
+    let mut headers = make_post_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_continue(result);
 }
@@ -193,7 +199,7 @@ async fn test_redact_mode_ssn() {
 
     // before_proxy should continue (not reject)
     let mut ctx = make_post_ctx(&ai_request("My SSN is 123-45-6789"));
-    let mut headers = HashMap::new();
+    let mut headers = make_post_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_continue(result);
     assert!(ctx.metadata.contains_key("ai_shield_redacted"));
@@ -242,7 +248,7 @@ async fn test_warn_mode() {
     assert!(!plugin.modifies_request_body());
 
     let mut ctx = make_post_ctx(&ai_request("My SSN is 123-45-6789"));
-    let mut headers = HashMap::new();
+    let mut headers = make_post_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_continue(result);
     assert_eq!(ctx.metadata.get("ai_shield_warnings").unwrap(), "ssn");
@@ -260,7 +266,7 @@ async fn test_custom_pattern() {
     }))
     .unwrap();
     let mut ctx = make_post_ctx(&ai_request("Account ACCT-12345678 is active"));
-    let mut headers = HashMap::new();
+    let mut headers = make_post_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_reject(result, Some(400));
 }
@@ -295,7 +301,7 @@ async fn test_exclude_roles() {
             {"role": "user", "content": "What is a SSN?"}
         ]
     }));
-    let mut headers = HashMap::new();
+    let mut headers = make_post_headers();
     // System message has SSN but is excluded from scanning
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_continue(result);
@@ -315,7 +321,7 @@ async fn test_scan_all_mode() {
         "system_instruction": "SSN: 123-45-6789",
         "messages": [{"role": "user", "content": "Hello"}]
     }));
-    let mut headers = HashMap::new();
+    let mut headers = make_post_headers();
     // SSN is in system_instruction, not in message content.
     // With "all" mode, the entire body is scanned.
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
@@ -334,7 +340,7 @@ async fn test_scan_content_only_mode() {
         "system_instruction": "SSN: 123-45-6789",
         "messages": [{"role": "user", "content": "Hello"}]
     }));
-    let mut headers = HashMap::new();
+    let mut headers = make_post_headers();
     // SSN is in system_instruction, not in message content.
     // With "content" mode, only message content is scanned.
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
@@ -351,7 +357,7 @@ async fn test_max_scan_bytes_exceeded() {
     }))
     .unwrap();
     let mut ctx = make_post_ctx(&ai_request("My SSN is 123-45-6789"));
-    let mut headers = HashMap::new();
+    let mut headers = make_post_headers();
     // Body is larger than 10 bytes — should skip scanning
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_continue(result);
@@ -372,7 +378,7 @@ async fn test_multimodal_content_scanned() {
             ]
         }]
     }));
-    let mut headers = HashMap::new();
+    let mut headers = make_post_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_reject(result, Some(400));
 }
@@ -405,7 +411,7 @@ async fn test_non_post_passes() {
     let plugin = AiPromptShield::new(&json!({"patterns": ["ssn"]})).unwrap();
     let mut ctx = create_test_context();
     ctx.method = "GET".to_string();
-    let mut headers = HashMap::new();
+    let mut headers = make_post_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_continue(result);
 }
@@ -420,6 +426,7 @@ async fn test_non_json_content_type_passes() {
     ctx.metadata
         .insert("request_body".to_string(), "SSN: 123-45-6789".to_string());
     let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "text/plain".to_string());
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_continue(result);
 }
@@ -431,7 +438,7 @@ async fn test_empty_body_passes() {
     ctx.method = "POST".to_string();
     ctx.headers
         .insert("content-type".to_string(), "application/json".to_string());
-    let mut headers = HashMap::new();
+    let mut headers = make_post_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_continue(result);
 }
@@ -449,7 +456,7 @@ async fn test_pii_in_any_message_detected() {
             {"role": "user", "content": "My SSN is 123-45-6789"}
         ]
     }));
-    let mut headers = HashMap::new();
+    let mut headers = make_post_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_reject(result, Some(400));
 }
@@ -501,7 +508,7 @@ async fn test_redaction_preserves_json_structure() {
 async fn test_rejection_body_format() {
     let plugin = AiPromptShield::new(&json!({"patterns": ["ssn", "email"]})).unwrap();
     let mut ctx = make_post_ctx(&ai_request("SSN: 123-45-6789, email: a@b.com"));
-    let mut headers = HashMap::new();
+    let mut headers = make_post_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     match result {
         PluginResult::Reject {

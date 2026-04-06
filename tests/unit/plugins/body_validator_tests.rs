@@ -19,6 +19,18 @@ fn make_xml_ctx(body: &str) -> RequestContext {
     ctx
 }
 
+fn make_xml_headers() -> HashMap<String, String> {
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/xml".to_string());
+    headers
+}
+
+fn make_json_headers() -> HashMap<String, String> {
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+    headers
+}
+
 fn xml_plugin() -> BodyValidator {
     BodyValidator::new(&json!({
         "validate_xml": true
@@ -90,7 +102,7 @@ fn test_trait_object_dispatches_request_body_buffering_hooks() {
 async fn test_xml_simple_valid() {
     let plugin = xml_plugin();
     let mut ctx = make_xml_ctx("<root><item>text</item></root>");
-    let mut headers = HashMap::new();
+    let mut headers = make_xml_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_continue(result);
 }
@@ -99,7 +111,7 @@ async fn test_xml_simple_valid() {
 async fn test_xml_self_closing_tag() {
     let plugin = xml_plugin();
     let mut ctx = make_xml_ctx("<root><br/></root>");
-    let mut headers = HashMap::new();
+    let mut headers = make_xml_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_continue(result);
 }
@@ -108,7 +120,7 @@ async fn test_xml_self_closing_tag() {
 async fn test_xml_unbalanced_tags_rejected() {
     let plugin = xml_plugin();
     let mut ctx = make_xml_ctx("<root><item></root>");
-    let mut headers = HashMap::new();
+    let mut headers = make_xml_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_reject(result, Some(400));
 }
@@ -119,7 +131,7 @@ async fn test_xml_unbalanced_tags_rejected() {
 async fn test_xml_cdata_with_fake_tags() {
     let plugin = xml_plugin();
     let mut ctx = make_xml_ctx("<root><![CDATA[This contains <fake> tags and </closing>]]></root>");
-    let mut headers = HashMap::new();
+    let mut headers = make_xml_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_continue(result);
 }
@@ -128,7 +140,7 @@ async fn test_xml_cdata_with_fake_tags() {
 async fn test_xml_cdata_empty() {
     let plugin = xml_plugin();
     let mut ctx = make_xml_ctx("<root><![CDATA[]]></root>");
-    let mut headers = HashMap::new();
+    let mut headers = make_xml_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_continue(result);
 }
@@ -137,7 +149,7 @@ async fn test_xml_cdata_empty() {
 async fn test_xml_cdata_with_special_chars() {
     let plugin = xml_plugin();
     let mut ctx = make_xml_ctx("<root><![CDATA[<>&\"' special chars]]></root>");
-    let mut headers = HashMap::new();
+    let mut headers = make_xml_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_continue(result);
 }
@@ -148,7 +160,7 @@ async fn test_xml_multiple_cdata_sections() {
     let body =
         "<root><a><![CDATA[first <section>]]></a><b><![CDATA[second </section>]]></b></root>";
     let mut ctx = make_xml_ctx(body);
-    let mut headers = HashMap::new();
+    let mut headers = make_xml_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_continue(result);
 }
@@ -159,7 +171,7 @@ async fn test_xml_multiple_cdata_sections() {
 async fn test_xml_comment_with_fake_tags() {
     let plugin = xml_plugin();
     let mut ctx = make_xml_ctx("<root><!-- comment with <fake> tags --></root>");
-    let mut headers = HashMap::new();
+    let mut headers = make_xml_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_continue(result);
 }
@@ -169,7 +181,7 @@ async fn test_xml_comment_between_elements() {
     let plugin = xml_plugin();
     let body = "<root><a>text</a><!-- between --><b>more</b></root>";
     let mut ctx = make_xml_ctx(body);
-    let mut headers = HashMap::new();
+    let mut headers = make_xml_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_continue(result);
 }
@@ -178,7 +190,7 @@ async fn test_xml_comment_between_elements() {
 async fn test_xml_comment_empty() {
     let plugin = xml_plugin();
     let mut ctx = make_xml_ctx("<root><!----></root>");
-    let mut headers = HashMap::new();
+    let mut headers = make_xml_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_continue(result);
 }
@@ -189,7 +201,7 @@ async fn test_xml_comment_empty() {
 async fn test_xml_processing_instruction() {
     let plugin = xml_plugin();
     let mut ctx = make_xml_ctx("<?xml version=\"1.0\"?>\n<root>content</root>");
-    let mut headers = HashMap::new();
+    let mut headers = make_xml_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_continue(result);
 }
@@ -199,7 +211,7 @@ async fn test_xml_processing_instruction_with_encoding() {
     let plugin = xml_plugin();
     let body = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<root><item>text</item></root>";
     let mut ctx = make_xml_ctx(body);
-    let mut headers = HashMap::new();
+    let mut headers = make_xml_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_continue(result);
 }
@@ -211,7 +223,7 @@ async fn test_xml_doctype_declaration() {
     let plugin = xml_plugin();
     let body = "<!DOCTYPE root>\n<root>content</root>";
     let mut ctx = make_xml_ctx(body);
-    let mut headers = HashMap::new();
+    let mut headers = make_xml_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_continue(result);
 }
@@ -229,7 +241,7 @@ async fn test_xml_mixed_cdata_and_comments() {
   <other>text</other>
 </root>"#;
     let mut ctx = make_xml_ctx(body);
-    let mut headers = HashMap::new();
+    let mut headers = make_xml_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_continue(result);
 }
@@ -249,7 +261,7 @@ async fn test_xml_all_constructs() {
   </nested>
 </root>"#;
     let mut ctx = make_xml_ctx(body);
-    let mut headers = HashMap::new();
+    let mut headers = make_xml_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_continue(result);
 }
@@ -261,7 +273,7 @@ async fn test_xml_required_element_with_cdata() {
     let plugin = xml_plugin_with_required(vec!["item"]);
     let body = "<root><item><![CDATA[content <here>]]></item></root>";
     let mut ctx = make_xml_ctx(body);
-    let mut headers = HashMap::new();
+    let mut headers = make_xml_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_continue(result);
 }
@@ -271,7 +283,7 @@ async fn test_xml_required_element_missing() {
     let plugin = xml_plugin_with_required(vec!["missing"]);
     let body = "<root><item>content</item></root>";
     let mut ctx = make_xml_ctx(body);
-    let mut headers = HashMap::new();
+    let mut headers = make_xml_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_reject(result, Some(400));
 }
@@ -282,7 +294,7 @@ async fn test_xml_required_element_missing() {
 async fn test_xml_empty_body_rejected() {
     let plugin = xml_plugin();
     let mut ctx = make_xml_ctx("");
-    let mut headers = HashMap::new();
+    let mut headers = make_xml_headers();
     // Empty body is skipped (returns Continue) because the body.is_empty() check
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_continue(result);
@@ -292,7 +304,7 @@ async fn test_xml_empty_body_rejected() {
 async fn test_xml_not_starting_with_angle_bracket() {
     let plugin = xml_plugin();
     let mut ctx = make_xml_ctx("not xml at all");
-    let mut headers = HashMap::new();
+    let mut headers = make_xml_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_reject(result, Some(400));
 }
@@ -309,7 +321,7 @@ async fn test_xml_get_request_skipped() {
         .insert("content-type".to_string(), "application/xml".to_string());
     ctx.metadata
         .insert("request_body".to_string(), "not valid xml".to_string());
-    let mut headers = HashMap::new();
+    let mut headers = make_xml_headers();
     // GET requests are skipped
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_continue(result);
@@ -345,7 +357,7 @@ fn json_schema_plugin(schema: serde_json::Value) -> BodyValidator {
 async fn test_json_schema_type_object_valid() {
     let plugin = json_schema_plugin(serde_json::json!({"type": "object"}));
     let mut ctx = make_json_ctx(r#"{"key": "value"}"#);
-    let mut headers = HashMap::new();
+    let mut headers = make_json_headers();
     assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
 }
 
@@ -353,7 +365,7 @@ async fn test_json_schema_type_object_valid() {
 async fn test_json_schema_type_object_invalid() {
     let plugin = json_schema_plugin(serde_json::json!({"type": "object"}));
     let mut ctx = make_json_ctx(r#"[1, 2, 3]"#);
-    let mut headers = HashMap::new();
+    let mut headers = make_json_headers();
     assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
 }
 
@@ -361,7 +373,7 @@ async fn test_json_schema_type_object_invalid() {
 async fn test_json_schema_type_string_valid() {
     let plugin = json_schema_plugin(serde_json::json!({"type": "string"}));
     let mut ctx = make_json_ctx(r#""hello""#);
-    let mut headers = HashMap::new();
+    let mut headers = make_json_headers();
     assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
 }
 
@@ -369,7 +381,7 @@ async fn test_json_schema_type_string_valid() {
 async fn test_json_schema_type_integer_valid() {
     let plugin = json_schema_plugin(serde_json::json!({"type": "integer"}));
     let mut ctx = make_json_ctx("42");
-    let mut headers = HashMap::new();
+    let mut headers = make_json_headers();
     assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
 }
 
@@ -377,7 +389,7 @@ async fn test_json_schema_type_integer_valid() {
 async fn test_json_schema_type_integer_rejects_float() {
     let plugin = json_schema_plugin(serde_json::json!({"type": "integer"}));
     let mut ctx = make_json_ctx("3.14");
-    let mut headers = HashMap::new();
+    let mut headers = make_json_headers();
     assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
 }
 
@@ -387,7 +399,7 @@ async fn test_json_schema_type_integer_rejects_float() {
 async fn test_json_schema_min_length_valid() {
     let plugin = json_schema_plugin(serde_json::json!({"type": "string", "minLength": 3}));
     let mut ctx = make_json_ctx(r#""hello""#);
-    let mut headers = HashMap::new();
+    let mut headers = make_json_headers();
     assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
 }
 
@@ -395,7 +407,7 @@ async fn test_json_schema_min_length_valid() {
 async fn test_json_schema_min_length_invalid() {
     let plugin = json_schema_plugin(serde_json::json!({"type": "string", "minLength": 10}));
     let mut ctx = make_json_ctx(r#""hi""#);
-    let mut headers = HashMap::new();
+    let mut headers = make_json_headers();
     assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
 }
 
@@ -403,7 +415,7 @@ async fn test_json_schema_min_length_invalid() {
 async fn test_json_schema_max_length_valid() {
     let plugin = json_schema_plugin(serde_json::json!({"type": "string", "maxLength": 5}));
     let mut ctx = make_json_ctx(r#""hello""#);
-    let mut headers = HashMap::new();
+    let mut headers = make_json_headers();
     assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
 }
 
@@ -411,7 +423,7 @@ async fn test_json_schema_max_length_valid() {
 async fn test_json_schema_max_length_invalid() {
     let plugin = json_schema_plugin(serde_json::json!({"type": "string", "maxLength": 3}));
     let mut ctx = make_json_ctx(r#""hello""#);
-    let mut headers = HashMap::new();
+    let mut headers = make_json_headers();
     assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
 }
 
@@ -419,7 +431,7 @@ async fn test_json_schema_max_length_invalid() {
 async fn test_json_schema_pattern_valid() {
     let plugin = json_schema_plugin(serde_json::json!({"type": "string", "pattern": "^[a-z]+$"}));
     let mut ctx = make_json_ctx(r#""hello""#);
-    let mut headers = HashMap::new();
+    let mut headers = make_json_headers();
     assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
 }
 
@@ -427,7 +439,7 @@ async fn test_json_schema_pattern_valid() {
 async fn test_json_schema_pattern_invalid() {
     let plugin = json_schema_plugin(serde_json::json!({"type": "string", "pattern": "^[a-z]+$"}));
     let mut ctx = make_json_ctx(r#""Hello123""#);
-    let mut headers = HashMap::new();
+    let mut headers = make_json_headers();
     assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
 }
 
@@ -437,7 +449,7 @@ async fn test_json_schema_pattern_invalid() {
 async fn test_json_schema_minimum_valid() {
     let plugin = json_schema_plugin(serde_json::json!({"type": "number", "minimum": 0}));
     let mut ctx = make_json_ctx("5");
-    let mut headers = HashMap::new();
+    let mut headers = make_json_headers();
     assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
 }
 
@@ -445,7 +457,7 @@ async fn test_json_schema_minimum_valid() {
 async fn test_json_schema_minimum_invalid() {
     let plugin = json_schema_plugin(serde_json::json!({"type": "number", "minimum": 10}));
     let mut ctx = make_json_ctx("5");
-    let mut headers = HashMap::new();
+    let mut headers = make_json_headers();
     assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
 }
 
@@ -453,7 +465,7 @@ async fn test_json_schema_minimum_invalid() {
 async fn test_json_schema_maximum_valid() {
     let plugin = json_schema_plugin(serde_json::json!({"type": "number", "maximum": 100}));
     let mut ctx = make_json_ctx("50");
-    let mut headers = HashMap::new();
+    let mut headers = make_json_headers();
     assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
 }
 
@@ -461,7 +473,7 @@ async fn test_json_schema_maximum_valid() {
 async fn test_json_schema_maximum_invalid() {
     let plugin = json_schema_plugin(serde_json::json!({"type": "number", "maximum": 10}));
     let mut ctx = make_json_ctx("50");
-    let mut headers = HashMap::new();
+    let mut headers = make_json_headers();
     assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
 }
 
@@ -469,7 +481,7 @@ async fn test_json_schema_maximum_invalid() {
 async fn test_json_schema_exclusive_minimum() {
     let plugin = json_schema_plugin(serde_json::json!({"type": "number", "exclusiveMinimum": 5}));
     let mut ctx = make_json_ctx("5");
-    let mut headers = HashMap::new();
+    let mut headers = make_json_headers();
     assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
 }
 
@@ -477,7 +489,7 @@ async fn test_json_schema_exclusive_minimum() {
 async fn test_json_schema_exclusive_maximum() {
     let plugin = json_schema_plugin(serde_json::json!({"type": "number", "exclusiveMaximum": 10}));
     let mut ctx = make_json_ctx("10");
-    let mut headers = HashMap::new();
+    let mut headers = make_json_headers();
     assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
 }
 
@@ -487,7 +499,7 @@ async fn test_json_schema_exclusive_maximum() {
 async fn test_json_schema_enum_valid() {
     let plugin = json_schema_plugin(serde_json::json!({"enum": ["red", "green", "blue"]}));
     let mut ctx = make_json_ctx(r#""green""#);
-    let mut headers = HashMap::new();
+    let mut headers = make_json_headers();
     assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
 }
 
@@ -495,7 +507,7 @@ async fn test_json_schema_enum_valid() {
 async fn test_json_schema_enum_invalid() {
     let plugin = json_schema_plugin(serde_json::json!({"enum": ["red", "green", "blue"]}));
     let mut ctx = make_json_ctx(r#""yellow""#);
-    let mut headers = HashMap::new();
+    let mut headers = make_json_headers();
     assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
 }
 
@@ -508,7 +520,7 @@ async fn test_json_schema_array_items_valid() {
         "items": {"type": "integer"}
     }));
     let mut ctx = make_json_ctx("[1, 2, 3]");
-    let mut headers = HashMap::new();
+    let mut headers = make_json_headers();
     assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
 }
 
@@ -519,7 +531,7 @@ async fn test_json_schema_array_items_invalid() {
         "items": {"type": "integer"}
     }));
     let mut ctx = make_json_ctx(r#"[1, "two", 3]"#);
-    let mut headers = HashMap::new();
+    let mut headers = make_json_headers();
     assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
 }
 
@@ -527,7 +539,7 @@ async fn test_json_schema_array_items_invalid() {
 async fn test_json_schema_min_items_valid() {
     let plugin = json_schema_plugin(serde_json::json!({"type": "array", "minItems": 2}));
     let mut ctx = make_json_ctx("[1, 2, 3]");
-    let mut headers = HashMap::new();
+    let mut headers = make_json_headers();
     assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
 }
 
@@ -535,7 +547,7 @@ async fn test_json_schema_min_items_valid() {
 async fn test_json_schema_min_items_invalid() {
     let plugin = json_schema_plugin(serde_json::json!({"type": "array", "minItems": 5}));
     let mut ctx = make_json_ctx("[1, 2]");
-    let mut headers = HashMap::new();
+    let mut headers = make_json_headers();
     assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
 }
 
@@ -543,7 +555,7 @@ async fn test_json_schema_min_items_invalid() {
 async fn test_json_schema_max_items_valid() {
     let plugin = json_schema_plugin(serde_json::json!({"type": "array", "maxItems": 3}));
     let mut ctx = make_json_ctx("[1, 2]");
-    let mut headers = HashMap::new();
+    let mut headers = make_json_headers();
     assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
 }
 
@@ -551,7 +563,7 @@ async fn test_json_schema_max_items_valid() {
 async fn test_json_schema_max_items_invalid() {
     let plugin = json_schema_plugin(serde_json::json!({"type": "array", "maxItems": 2}));
     let mut ctx = make_json_ctx("[1, 2, 3, 4]");
-    let mut headers = HashMap::new();
+    let mut headers = make_json_headers();
     assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
 }
 
@@ -559,7 +571,7 @@ async fn test_json_schema_max_items_invalid() {
 async fn test_json_schema_unique_items_valid() {
     let plugin = json_schema_plugin(serde_json::json!({"type": "array", "uniqueItems": true}));
     let mut ctx = make_json_ctx("[1, 2, 3]");
-    let mut headers = HashMap::new();
+    let mut headers = make_json_headers();
     assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
 }
 
@@ -567,7 +579,7 @@ async fn test_json_schema_unique_items_valid() {
 async fn test_json_schema_unique_items_invalid() {
     let plugin = json_schema_plugin(serde_json::json!({"type": "array", "uniqueItems": true}));
     let mut ctx = make_json_ctx("[1, 2, 2, 3]");
-    let mut headers = HashMap::new();
+    let mut headers = make_json_headers();
     assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
 }
 
@@ -581,7 +593,7 @@ async fn test_json_schema_additional_properties_false() {
         "additionalProperties": false
     }));
     let mut ctx = make_json_ctx(r#"{"name": "test", "extra": 123}"#);
-    let mut headers = HashMap::new();
+    let mut headers = make_json_headers();
     assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
 }
 
@@ -593,7 +605,7 @@ async fn test_json_schema_additional_properties_false_valid() {
         "additionalProperties": false
     }));
     let mut ctx = make_json_ctx(r#"{"name": "test"}"#);
-    let mut headers = HashMap::new();
+    let mut headers = make_json_headers();
     assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
 }
 
@@ -608,7 +620,7 @@ async fn test_json_schema_required_and_properties() {
         }
     }));
     let mut ctx = make_json_ctx(r#"{"name": "Alice", "age": 30}"#);
-    let mut headers = HashMap::new();
+    let mut headers = make_json_headers();
     assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
 }
 
@@ -619,7 +631,7 @@ async fn test_json_schema_required_missing() {
         "required": ["name", "age"]
     }));
     let mut ctx = make_json_ctx(r#"{"name": "Alice"}"#);
-    let mut headers = HashMap::new();
+    let mut headers = make_json_headers();
     assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
 }
 
@@ -639,7 +651,7 @@ async fn test_json_schema_nested_property_validation() {
         }
     }));
     let mut ctx = make_json_ctx(r#"{"address": {"city": "NYC", "zip": "10001"}}"#);
-    let mut headers = HashMap::new();
+    let mut headers = make_json_headers();
     assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
 }
 
@@ -657,7 +669,7 @@ async fn test_json_schema_nested_property_invalid_zip() {
         }
     }));
     let mut ctx = make_json_ctx(r#"{"address": {"zip": "abc"}}"#);
-    let mut headers = HashMap::new();
+    let mut headers = make_json_headers();
     assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
 }
 
@@ -672,7 +684,7 @@ async fn test_json_schema_all_of_valid() {
         ]
     }));
     let mut ctx = make_json_ctx(r#"{"name": "Alice", "age": 30}"#);
-    let mut headers = HashMap::new();
+    let mut headers = make_json_headers();
     assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
 }
 
@@ -685,7 +697,7 @@ async fn test_json_schema_all_of_invalid() {
         ]
     }));
     let mut ctx = make_json_ctx(r#"{"name": "Alice"}"#);
-    let mut headers = HashMap::new();
+    let mut headers = make_json_headers();
     assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
 }
 
@@ -698,7 +710,7 @@ async fn test_json_schema_any_of_valid() {
         ]
     }));
     let mut ctx = make_json_ctx(r#""hello""#);
-    let mut headers = HashMap::new();
+    let mut headers = make_json_headers();
     assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
 }
 
@@ -711,7 +723,7 @@ async fn test_json_schema_any_of_invalid() {
         ]
     }));
     let mut ctx = make_json_ctx("true");
-    let mut headers = HashMap::new();
+    let mut headers = make_json_headers();
     assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
 }
 
@@ -724,7 +736,7 @@ async fn test_json_schema_one_of_valid() {
         ]
     }));
     let mut ctx = make_json_ctx("42");
-    let mut headers = HashMap::new();
+    let mut headers = make_json_headers();
     assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
 }
 
@@ -738,7 +750,7 @@ async fn test_json_schema_one_of_multiple_match_invalid() {
     }));
     // integer 42 matches both "number" and "integer" type schemas
     let mut ctx = make_json_ctx("42");
-    let mut headers = HashMap::new();
+    let mut headers = make_json_headers();
     assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
 }
 
@@ -748,7 +760,7 @@ async fn test_json_schema_not_valid() {
         "not": {"type": "string"}
     }));
     let mut ctx = make_json_ctx("42");
-    let mut headers = HashMap::new();
+    let mut headers = make_json_headers();
     assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
 }
 
@@ -758,7 +770,7 @@ async fn test_json_schema_not_invalid() {
         "not": {"type": "string"}
     }));
     let mut ctx = make_json_ctx(r#""hello""#);
-    let mut headers = HashMap::new();
+    let mut headers = make_json_headers();
     assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
 }
 
@@ -768,7 +780,7 @@ async fn test_json_schema_not_invalid() {
 async fn test_json_schema_format_email_valid() {
     let plugin = json_schema_plugin(serde_json::json!({"type": "string", "format": "email"}));
     let mut ctx = make_json_ctx(r#""user@example.com""#);
-    let mut headers = HashMap::new();
+    let mut headers = make_json_headers();
     assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
 }
 
@@ -776,7 +788,7 @@ async fn test_json_schema_format_email_valid() {
 async fn test_json_schema_format_email_invalid() {
     let plugin = json_schema_plugin(serde_json::json!({"type": "string", "format": "email"}));
     let mut ctx = make_json_ctx(r#""not-an-email""#);
-    let mut headers = HashMap::new();
+    let mut headers = make_json_headers();
     assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
 }
 
@@ -784,7 +796,7 @@ async fn test_json_schema_format_email_invalid() {
 async fn test_json_schema_format_ipv4_valid() {
     let plugin = json_schema_plugin(serde_json::json!({"type": "string", "format": "ipv4"}));
     let mut ctx = make_json_ctx(r#""192.168.1.1""#);
-    let mut headers = HashMap::new();
+    let mut headers = make_json_headers();
     assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
 }
 
@@ -792,7 +804,7 @@ async fn test_json_schema_format_ipv4_valid() {
 async fn test_json_schema_format_ipv4_invalid() {
     let plugin = json_schema_plugin(serde_json::json!({"type": "string", "format": "ipv4"}));
     let mut ctx = make_json_ctx(r#""999.999.999.999""#);
-    let mut headers = HashMap::new();
+    let mut headers = make_json_headers();
     assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
 }
 
@@ -800,7 +812,7 @@ async fn test_json_schema_format_ipv4_invalid() {
 async fn test_json_schema_format_uuid_valid() {
     let plugin = json_schema_plugin(serde_json::json!({"type": "string", "format": "uuid"}));
     let mut ctx = make_json_ctx(r#""550e8400-e29b-41d4-a716-446655440000""#);
-    let mut headers = HashMap::new();
+    let mut headers = make_json_headers();
     assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
 }
 
@@ -808,7 +820,7 @@ async fn test_json_schema_format_uuid_valid() {
 async fn test_json_schema_format_datetime_valid() {
     let plugin = json_schema_plugin(serde_json::json!({"type": "string", "format": "date-time"}));
     let mut ctx = make_json_ctx(r#""2024-01-15T10:30:00Z""#);
-    let mut headers = HashMap::new();
+    let mut headers = make_json_headers();
     assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
 }
 
@@ -845,7 +857,7 @@ async fn test_json_schema_complex_api_payload() {
     let mut ctx = make_json_ctx(
         r#"{"method": "POST", "params": {"url": "/api/data", "timeout": 5000, "headers": [{"name": "X-Custom", "value": "test"}]}}"#,
     );
-    let mut headers = HashMap::new();
+    let mut headers = make_json_headers();
     assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
 }
 
@@ -861,12 +873,12 @@ async fn test_json_schema_pattern_pre_compiled_reuse() {
 
     // First request: matching pattern
     let mut ctx1 = make_json_ctx(r#""ABC-1234""#);
-    let mut headers1 = HashMap::new();
+    let mut headers1 = make_json_headers();
     assert_continue(plugin.before_proxy(&mut ctx1, &mut headers1).await);
 
     // Second request: non-matching pattern (implicitly exercises the same pre-compiled regex)
     let mut ctx2 = make_json_ctx(r#""invalid""#);
-    let mut headers2 = HashMap::new();
+    let mut headers2 = make_json_headers();
     assert_reject(
         plugin.before_proxy(&mut ctx2, &mut headers2).await,
         Some(400),
@@ -1123,12 +1135,12 @@ async fn test_both_request_and_response_validation() {
 
     // Request validation still works
     let mut req_ctx = make_json_ctx(r#"{"action": "create"}"#);
-    let mut req_headers = HashMap::new();
+    let mut req_headers = make_json_headers();
     assert_continue(plugin.before_proxy(&mut req_ctx, &mut req_headers).await);
 
     // Request with missing field is rejected (400)
     let mut bad_req_ctx = make_json_ctx(r#"{"other": "value"}"#);
-    let mut bad_req_headers = HashMap::new();
+    let mut bad_req_headers = make_json_headers();
     assert_reject(
         plugin
             .before_proxy(&mut bad_req_ctx, &mut bad_req_headers)

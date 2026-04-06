@@ -768,7 +768,6 @@ impl Plugin for ServerlessFunction {
         if self.mode == InvocationMode::Terminate {
             let is_grpc = headers
                 .get("content-type")
-                .or_else(|| ctx.headers.get("content-type"))
                 .is_some_and(|ct| ct.starts_with("application/grpc"));
             if is_grpc {
                 warn!(

@@ -233,7 +233,12 @@ impl ResponseCaching {
         )
     }
 
-    fn build_cache_key(&self, ctx: &RequestContext, vary_headers: &[String]) -> String {
+    fn build_cache_key(
+        &self,
+        ctx: &RequestContext,
+        vary_headers: &[String],
+        request_headers: &HashMap<String, String>,
+    ) -> String {
         let base_key = self.build_base_cache_key(ctx);
         if vary_headers.is_empty() {
             return base_key;
@@ -242,8 +247,7 @@ impl ResponseCaching {
         let vary_part = vary_headers
             .iter()
             .map(|header| {
-                let value = ctx
-                    .headers
+                let value = request_headers
                     .get(header.as_str())
                     .map(String::as_str)
                     .unwrap_or("");
@@ -292,15 +296,19 @@ impl ResponseCaching {
         Some(vary_headers)
     }
 
-    fn is_fresh_conditional_hit(&self, ctx: &RequestContext, entry: &CacheEntry) -> bool {
-        if let Some(if_none_match) = ctx.headers.get("if-none-match") {
+    fn is_fresh_conditional_hit(
+        &self,
+        request_headers: &HashMap<String, String>,
+        entry: &CacheEntry,
+    ) -> bool {
+        if let Some(if_none_match) = request_headers.get("if-none-match") {
             return entry
                 .headers
                 .get("etag")
                 .is_some_and(|etag| if_none_match_matches(if_none_match, etag));
         }
 
-        if let Some(if_modified_since) = ctx.headers.get("if-modified-since") {
+        if let Some(if_modified_since) = request_headers.get("if-modified-since") {
             return entry
                 .headers
                 .get("last-modified")
@@ -507,7 +515,7 @@ impl Plugin for ResponseCaching {
     async fn before_proxy(
         &self,
         ctx: &mut RequestContext,
-        _headers: &mut HashMap<String, String>,
+        headers: &mut HashMap<String, String>,
     ) -> PluginResult {
         if !self.is_cacheable_method(&ctx.method) {
             if self.config.invalidate_on_unsafe_methods {
@@ -523,7 +531,7 @@ impl Plugin for ResponseCaching {
             .insert(CACHE_BASE_KEY.to_string(), base_key.clone());
 
         if self.config.respect_no_cache
-            && let Some(cc) = ctx.headers.get("cache-control")
+            && let Some(cc) = headers.get("cache-control")
         {
             let directives = parse_cache_control(cc);
             if directives.no_cache || directives.no_store {
@@ -534,7 +542,7 @@ impl Plugin for ResponseCaching {
         }
 
         let vary_headers = self.cache_lookup_vary_headers(&base_key);
-        let cache_key = self.build_cache_key(ctx, &vary_headers);
+        let cache_key = self.build_cache_key(ctx, &vary_headers, headers);
 
         if let Some(entry) = self.cache.get(&cache_key) {
             if entry.is_expired() {
@@ -546,7 +554,7 @@ impl Plugin for ResponseCaching {
             } else {
                 debug!(cache_key = %cache_key, "response_caching: cache HIT");
 
-                if self.is_fresh_conditional_hit(ctx, &entry) {
+                if self.is_fresh_conditional_hit(headers, &entry) {
                     ctx.metadata
                         .insert(CACHE_STATUS.to_string(), "REVALIDATED".to_string());
                     return PluginResult::RejectBinary {
@@ -647,7 +655,7 @@ impl Plugin for ResponseCaching {
                 return PluginResult::Continue;
             }
         };
-        let cache_key = self.build_cache_key(ctx, &vary_headers);
+        let cache_key = self.build_cache_key(ctx, &vary_headers, &ctx.headers);
 
         if body.len() > self.config.max_entry_size_bytes {
             debug!(

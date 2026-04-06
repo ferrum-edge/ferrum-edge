@@ -13,5 +13,6 @@ mod retry_tests;
 mod router_cache_tests;
 mod service_discovery_tests;
 mod stream_health_check_tests;
+mod stream_listener_tests;
 mod websocket_auth_tests;
 mod websocket_connection_limit_tests;
