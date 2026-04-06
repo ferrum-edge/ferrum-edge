@@ -52,7 +52,7 @@ bcrypt = "0.19"
 argon2 = "0.5"
 
 # LDAP
-ldap3 = "0.11"
+ldap3 = "0.12"
 native-tls = "0.2"
 
 # WebSocket
