@@ -205,7 +205,9 @@ impl super::Plugin for SsePlugin {
         headers: &mut HashMap<String, String>,
     ) -> PluginResult {
         // Save original Accept for the response phase.
-        if let Some(accept) = ctx.headers.get("accept") {
+        // Read from `headers` param — ctx.headers may be empty when the handler
+        // uses the zero-clone fast path (std::mem::take).
+        if let Some(accept) = headers.get("accept") {
             ctx.metadata
                 .insert("sse:original_accept".to_string(), accept.clone());
         }

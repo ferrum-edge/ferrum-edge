@@ -352,7 +352,6 @@ impl Plugin for AiPromptShield {
         // Check content-type
         let content_type = headers
             .get("content-type")
-            .or_else(|| ctx.headers.get("content-type"))
             .map(|s| s.as_str())
             .unwrap_or("");
         if !content_type.contains("json") {

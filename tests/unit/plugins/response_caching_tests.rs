@@ -307,6 +307,7 @@ async fn test_client_no_cache_bypasses() {
     ctx.headers
         .insert("cache-control".to_string(), "no-cache".to_string());
     let mut headers = HashMap::new();
+    headers.insert("cache-control".to_string(), "no-cache".to_string());
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(matches!(result, PluginResult::Continue));
     assert_eq!(ctx.metadata.get("cache_status").unwrap(), "BYPASS");
@@ -463,6 +464,7 @@ async fn test_vary_by_headers() {
         .insert("accept".to_string(), "application/json".to_string());
     ctx.matched_proxy = Some(std::sync::Arc::new(create_test_proxy()));
     let mut headers = HashMap::new();
+    headers.insert("accept".to_string(), "application/json".to_string());
     plugin.before_proxy(&mut ctx, &mut headers).await;
     let mut resp_headers = HashMap::new();
     resp_headers.insert("content-type".to_string(), "application/json".to_string());
@@ -477,6 +479,7 @@ async fn test_vary_by_headers() {
         .insert("accept".to_string(), "application/xml".to_string());
     ctx2.matched_proxy = Some(std::sync::Arc::new(create_test_proxy()));
     let mut headers2 = HashMap::new();
+    headers2.insert("accept".to_string(), "application/xml".to_string());
     plugin.before_proxy(&mut ctx2, &mut headers2).await;
     let mut resp_headers2 = HashMap::new();
     resp_headers2.insert("content-type".to_string(), "application/xml".to_string());
@@ -491,6 +494,7 @@ async fn test_vary_by_headers() {
         .headers
         .insert("accept".to_string(), "application/json".to_string());
     let mut h = HashMap::new();
+    h.insert("accept".to_string(), "application/json".to_string());
     let (_, body, _) = expect_reject(plugin.before_proxy(&mut ctx_json, &mut h).await);
     assert_eq!(body, b"{\"json\":true}");
 
@@ -500,6 +504,7 @@ async fn test_vary_by_headers() {
         .headers
         .insert("accept".to_string(), "application/xml".to_string());
     let mut h2 = HashMap::new();
+    h2.insert("accept".to_string(), "application/xml".to_string());
     let (_, body, _) = expect_reject(plugin.before_proxy(&mut ctx_xml, &mut h2).await);
     assert_eq!(body, b"<xml/>");
 }
@@ -513,6 +518,7 @@ async fn test_backend_vary_accept_encoding_caches_binary_variant() {
     ctx.headers
         .insert("accept-encoding".to_string(), "gzip".to_string());
     let mut headers = HashMap::new();
+    headers.insert("accept-encoding".to_string(), "gzip".to_string());
     plugin.before_proxy(&mut ctx, &mut headers).await;
 
     let mut response_headers = HashMap::new();
@@ -530,6 +536,7 @@ async fn test_backend_vary_accept_encoding_caches_binary_variant() {
         .headers
         .insert("accept-encoding".to_string(), "gzip".to_string());
     let mut gzip_headers = HashMap::new();
+    gzip_headers.insert("accept-encoding".to_string(), "gzip".to_string());
     let (status_code, body, headers) =
         expect_reject(plugin.before_proxy(&mut gzip_ctx, &mut gzip_headers).await);
     assert_eq!(status_code, 200);
@@ -588,6 +595,7 @@ async fn test_if_none_match_returns_304_from_cache() {
     ctx.headers
         .insert("if-none-match".to_string(), r#""abc123""#.to_string());
     let mut headers = HashMap::new();
+    headers.insert("if-none-match".to_string(), r#""abc123""#.to_string());
     let (status_code, body, headers) =
         expect_reject(plugin.before_proxy(&mut ctx, &mut headers).await);
     assert_eq!(status_code, 304);

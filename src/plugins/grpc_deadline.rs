@@ -120,8 +120,7 @@ impl Plugin for GrpcDeadline {
         ctx: &mut RequestContext,
         headers: &mut HashMap<String, String>,
     ) -> PluginResult {
-        let existing_timeout = ctx.headers.get("grpc-timeout");
-        let existing_timeout = headers.get("grpc-timeout").or(existing_timeout).cloned();
+        let existing_timeout = headers.get("grpc-timeout").cloned();
 
         let mut deadline_ms: Option<u64> = match &existing_timeout {
             Some(val) => match parse_grpc_timeout(val) {

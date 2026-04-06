@@ -346,7 +346,9 @@ impl Plugin for CompressionPlugin {
         headers: &mut HashMap<String, String>,
     ) -> PluginResult {
         // Save original Accept-Encoding before we potentially strip it.
-        if let Some(ae) = ctx.headers.get("accept-encoding") {
+        // Read from `headers` param — ctx.headers may be empty when the handler
+        // uses the zero-clone fast path (std::mem::take).
+        if let Some(ae) = headers.get("accept-encoding") {
             ctx.metadata
                 .insert("compression:accept_encoding".to_string(), ae.clone());
         }

@@ -549,6 +549,8 @@ Each test runs a gateway with protocol-specific config (`configs/*.yaml`) and a 
 8. Add the module to `tests/unit/plugins/mod.rs`
 9. Update `FEATURES.md`, `README.md`, and `docs/plugin_execution_order.md` (protocol matrix)
 
+**CRITICAL: `before_proxy` header parameter**: In `before_proxy(&self, ctx: &mut RequestContext, headers: &mut HashMap<String, String>)`, always read request headers from the `headers` parameter, **never from `ctx.headers`**. When no plugin in the chain modifies request headers (`modifies_request_headers() == false`), the handler moves headers out of `ctx.headers` via `std::mem::take()` as a zero-clone optimization (see `src/proxy/mod.rs` ~line 4168). During `before_proxy` execution, `ctx.headers` is an empty HashMap in this fast path. The `headers` parameter always contains the actual request headers regardless of which optimization path the handler takes. This applies to reading headers directly (`headers.get("content-type")`) and to any helper methods called from `before_proxy` — pass the `headers` parameter through rather than accessing `ctx.headers` in the helper. Other phases (`on_request_received`, `authenticate`, `authorize`) are not affected — only `before_proxy` uses this optimization.
+
 ### Plugin Config Validation
 
 All plugin constructors **must** return `Result<Self, String>`. Config validation is enforced at three levels:

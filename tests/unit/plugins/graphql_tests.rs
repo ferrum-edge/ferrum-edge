@@ -28,6 +28,12 @@ fn create_graphql_context(query: &str, operation_name: Option<&str>) -> RequestC
     ctx
 }
 
+fn make_graphql_headers() -> HashMap<String, String> {
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+    headers
+}
+
 // ── Plugin creation ──
 
 #[test]
@@ -85,7 +91,7 @@ async fn test_depth_within_limit() {
 
     let query = "{ user { name email } }";
     let mut ctx = create_graphql_context(query, None);
-    let mut headers = HashMap::new();
+    let mut headers = make_graphql_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_continue(result);
 }
@@ -97,7 +103,7 @@ async fn test_depth_exceeds_limit() {
 
     let query = "{ user { posts { comments { author { name } } } } }";
     let mut ctx = create_graphql_context(query, None);
-    let mut headers = HashMap::new();
+    let mut headers = make_graphql_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_reject(result, Some(400));
 }
@@ -110,7 +116,7 @@ async fn test_depth_at_exact_limit() {
     // Depth of 3: { user { posts { title } } }
     let query = "{ user { posts { title } } }";
     let mut ctx = create_graphql_context(query, None);
-    let mut headers = HashMap::new();
+    let mut headers = make_graphql_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_continue(result);
 }
@@ -124,7 +130,7 @@ async fn test_complexity_within_limit() {
 
     let query = "{ user { name email } }";
     let mut ctx = create_graphql_context(query, None);
-    let mut headers = HashMap::new();
+    let mut headers = make_graphql_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_continue(result);
 }
@@ -136,7 +142,7 @@ async fn test_complexity_exceeds_limit() {
 
     let query = "{ user { name email age phone address } }";
     let mut ctx = create_graphql_context(query, None);
-    let mut headers = HashMap::new();
+    let mut headers = make_graphql_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_reject(result, Some(400));
 }
@@ -150,7 +156,7 @@ async fn test_alias_within_limit() {
 
     let query = "{ first: user(id: 1) { name } second: user(id: 2) { name } }";
     let mut ctx = create_graphql_context(query, None);
-    let mut headers = HashMap::new();
+    let mut headers = make_graphql_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_continue(result);
 }
@@ -162,7 +168,7 @@ async fn test_alias_exceeds_limit() {
 
     let query = "{ a: user(id: 1) { name } b: user(id: 2) { name } c: user(id: 3) { name } }";
     let mut ctx = create_graphql_context(query, None);
-    let mut headers = HashMap::new();
+    let mut headers = make_graphql_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_reject(result, Some(400));
 }
@@ -177,7 +183,7 @@ async fn test_introspection_allowed_by_default() {
 
     let query = "{ __schema { types { name } } }";
     let mut ctx = create_graphql_context(query, None);
-    let mut headers = HashMap::new();
+    let mut headers = make_graphql_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_continue(result);
 }
@@ -189,7 +195,7 @@ async fn test_introspection_blocked() {
 
     let query = "{ __schema { types { name } } }";
     let mut ctx = create_graphql_context(query, None);
-    let mut headers = HashMap::new();
+    let mut headers = make_graphql_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_reject(result, Some(403));
 }
@@ -201,7 +207,7 @@ async fn test_introspection_type_blocked() {
 
     let query = r#"{ __type(name: "User") { fields { name } } }"#;
     let mut ctx = create_graphql_context(query, None);
-    let mut headers = HashMap::new();
+    let mut headers = make_graphql_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_reject(result, Some(403));
 }
@@ -215,7 +221,7 @@ async fn test_mutation_detected() {
 
     let query = "mutation CreateUser { createUser(name: \"test\") { id } }";
     let mut ctx = create_graphql_context(query, None);
-    let mut headers = HashMap::new();
+    let mut headers = make_graphql_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_continue(result);
     assert_eq!(
@@ -235,7 +241,7 @@ async fn test_subscription_detected() {
 
     let query = "subscription OnMessage { messageAdded { content } }";
     let mut ctx = create_graphql_context(query, None);
-    let mut headers = HashMap::new();
+    let mut headers = make_graphql_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_continue(result);
     assert_eq!(
@@ -251,7 +257,7 @@ async fn test_shorthand_query() {
 
     let query = "{ user { name } }";
     let mut ctx = create_graphql_context(query, None);
-    let mut headers = HashMap::new();
+    let mut headers = make_graphql_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_continue(result);
     assert_eq!(ctx.metadata.get("graphql_operation_type").unwrap(), "query");
@@ -264,7 +270,7 @@ async fn test_operation_name_from_body() {
 
     let query = "query GetUser { user { name } }";
     let mut ctx = create_graphql_context(query, Some("GetUser"));
-    let mut headers = HashMap::new();
+    let mut headers = make_graphql_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_continue(result);
     assert_eq!(
@@ -289,14 +295,14 @@ async fn test_type_rate_limiting() {
     // First two should pass
     for _ in 0..2 {
         let mut ctx = create_graphql_context(query, None);
-        let mut headers = HashMap::new();
+        let mut headers = make_graphql_headers();
         let result = plugin.before_proxy(&mut ctx, &mut headers).await;
         assert_continue(result);
     }
 
     // Third should be rate limited
     let mut ctx = create_graphql_context(query, None);
-    let mut headers = HashMap::new();
+    let mut headers = make_graphql_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_reject(result, Some(429));
 }
@@ -313,18 +319,18 @@ async fn test_query_type_not_limited_when_mutation_limited() {
     // Exhaust mutation limit
     let mutation = "mutation { deleteUser(id: 1) { id } }";
     let mut ctx = create_graphql_context(mutation, None);
-    let mut headers = HashMap::new();
+    let mut headers = make_graphql_headers();
     let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
 
     let mut ctx = create_graphql_context(mutation, None);
-    let mut headers = HashMap::new();
+    let mut headers = make_graphql_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_reject(result, Some(429));
 
     // Queries should still work
     let query = "{ user { name } }";
     let mut ctx = create_graphql_context(query, None);
-    let mut headers = HashMap::new();
+    let mut headers = make_graphql_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_continue(result);
 }
@@ -344,13 +350,13 @@ async fn test_named_operation_rate_limiting() {
 
     // First request passes
     let mut ctx = create_graphql_context(query, Some("GetUser"));
-    let mut headers = HashMap::new();
+    let mut headers = make_graphql_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_continue(result);
 
     // Second is rate limited
     let mut ctx = create_graphql_context(query, Some("GetUser"));
-    let mut headers = HashMap::new();
+    let mut headers = make_graphql_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_reject(result, Some(429));
 }
@@ -369,21 +375,21 @@ async fn test_consumer_rate_limiting_uses_authenticated_identity_fallback() {
     let mut ctx = create_graphql_context(query, None);
     ctx.identified_consumer = None;
     ctx.authenticated_identity = Some("oidc-user-a".to_string());
-    let mut headers = HashMap::new();
+    let mut headers = make_graphql_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_continue(result);
 
     let mut ctx = create_graphql_context(query, None);
     ctx.identified_consumer = None;
     ctx.authenticated_identity = Some("oidc-user-a".to_string());
-    let mut headers = HashMap::new();
+    let mut headers = make_graphql_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_reject(result, Some(429));
 
     let mut ctx = create_graphql_context(query, None);
     ctx.identified_consumer = None;
     ctx.authenticated_identity = Some("oidc-user-b".to_string());
-    let mut headers = HashMap::new();
+    let mut headers = make_graphql_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_continue(result);
 }
@@ -412,6 +418,7 @@ async fn test_non_json_passes_through() {
     ctx.headers
         .insert("content-type".to_string(), "text/plain".to_string());
     let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "text/plain".to_string());
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_continue(result);
 }
@@ -429,7 +436,7 @@ async fn test_no_query_field_passes_through() {
         "request_body".to_string(),
         r#"{"data": "not graphql"}"#.to_string(),
     );
-    let mut headers = HashMap::new();
+    let mut headers = make_graphql_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_continue(result);
 }
@@ -448,7 +455,7 @@ async fn test_comments_ignored_in_depth() {
         }
     }"#;
     let mut ctx = create_graphql_context(query, None);
-    let mut headers = HashMap::new();
+    let mut headers = make_graphql_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_continue(result);
 }
@@ -460,7 +467,7 @@ async fn test_string_braces_not_counted() {
 
     let query = r#"{ user(filter: "{ nested: { deep } }") { name } }"#;
     let mut ctx = create_graphql_context(query, None);
-    let mut headers = HashMap::new();
+    let mut headers = make_graphql_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_continue(result);
 }
@@ -474,7 +481,7 @@ async fn test_metadata_populated() {
 
     let query = "query GetUser { user { name email } }";
     let mut ctx = create_graphql_context(query, Some("GetUser"));
-    let mut headers = HashMap::new();
+    let mut headers = make_graphql_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_continue(result);
 
@@ -508,14 +515,14 @@ async fn test_combined_depth_and_complexity() {
     // Within both limits
     let query = "{ user { name email } }";
     let mut ctx = create_graphql_context(query, None);
-    let mut headers = HashMap::new();
+    let mut headers = make_graphql_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_continue(result);
 
     // Exceeds depth but not complexity
     let query = "{ a { b { c { d { e } } } } }";
     let mut ctx = create_graphql_context(query, None);
-    let mut headers = HashMap::new();
+    let mut headers = make_graphql_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_reject(result, Some(400));
 }
@@ -529,7 +536,7 @@ async fn test_rejection_uses_graphql_error_format() {
 
     let query = "{ user { posts { comments { text } } } }";
     let mut ctx = create_graphql_context(query, None);
-    let mut headers = HashMap::new();
+    let mut headers = make_graphql_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
 
     match result {
