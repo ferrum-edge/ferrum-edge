@@ -365,7 +365,7 @@ MongoDB does not use SQL migrations. Instead, `MongoStore::run_migrations()` cre
 FERRUM_MODE=migrate \
   FERRUM_MIGRATE_ACTION=up \
   FERRUM_DB_TYPE=mongodb \
-  FERRUM_DB_URL="mongodb://localhost:27017/ferrum" \
+  FERRUM_DB_URL="mongodb://localhost:27017" \
   FERRUM_MONGO_DATABASE=ferrum \
   ferrum-edge
 ```

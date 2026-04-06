@@ -307,7 +307,7 @@ docker run -d --name ferrum-edge \
   -p 8000:8000 -p 9000:9000 \
   -e FERRUM_MODE=database \
   -e FERRUM_DB_TYPE=mongodb \
-  -e FERRUM_DB_URL="mongodb://mongo:27017/ferrum" \
+  -e FERRUM_DB_URL="mongodb://user:pass@mongo:27017/?authSource=admin" \
   -e FERRUM_MONGO_DATABASE=ferrum \
   -e FERRUM_DB_TLS_ENABLED=true \
   -e FERRUM_DB_TLS_CA_CERT_PATH=/certs/ca.pem \
@@ -317,6 +317,8 @@ docker run -d --name ferrum-edge \
   -v /path/to/certs:/certs:ro \
   ghcr.io/quicklaunchweb/ferrum-edge:latest
 ```
+
+**Note on MongoDB URL path vs `FERRUM_MONGO_DATABASE`:** The database name in the URL path (e.g., `mongodb://host/mydb`) is the **auth database** — where MongoDB looks up credentials. `FERRUM_MONGO_DATABASE` controls which database the gateway stores config in. For authenticated connections, use `?authSource=admin` (or your auth DB) and set `FERRUM_MONGO_DATABASE` separately. For no-auth dev setups, the URL path is ignored.
 
 ## SQLite
 

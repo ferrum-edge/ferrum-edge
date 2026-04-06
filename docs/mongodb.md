@@ -21,12 +21,28 @@ docker run -d --name mongo -p 27017:27017 mongo:7
 # Start Ferrum Edge
 FERRUM_MODE=database \
 FERRUM_DB_TYPE=mongodb \
-FERRUM_DB_URL="mongodb://localhost:27017/ferrum" \
+FERRUM_DB_URL="mongodb://localhost:27017" \
 FERRUM_MONGO_DATABASE=ferrum \
 FERRUM_ADMIN_JWT_SECRET="change-me-in-production" \
 FERRUM_LOG_LEVEL=info \
 cargo run --release
 ```
+
+## URL Path vs FERRUM_MONGO_DATABASE
+
+The database name in the MongoDB URL path (e.g., `mongodb://host:27017/mydb`) is the **auth database** — where MongoDB looks up user credentials. `FERRUM_MONGO_DATABASE` controls which database the gateway stores its config collections in. These are independent:
+
+```bash
+# Authenticate against "admin" DB, store config in "ferrum" DB
+FERRUM_DB_URL="mongodb://user:pass@host:27017/?authSource=admin"
+FERRUM_MONGO_DATABASE=ferrum
+
+# No authentication (dev) — URL path is ignored, config goes to "ferrum"
+FERRUM_DB_URL="mongodb://localhost:27017"
+FERRUM_MONGO_DATABASE=ferrum
+```
+
+For production with authentication, always use `?authSource=admin` (or your auth DB) explicitly rather than putting the database name in the URL path.
 
 ## Configuration Reference
 
@@ -136,8 +152,8 @@ The driver resolves SRV records to discover all replica set members. No addition
 `FERRUM_DB_FAILOVER_URLS` still works with MongoDB for standalone (non-replica-set) deployments where you have independent MongoDB instances:
 
 ```bash
-FERRUM_DB_URL="mongodb://primary-mongo:27017/ferrum"
-FERRUM_DB_FAILOVER_URLS="mongodb://backup-mongo:27017/ferrum"
+FERRUM_DB_URL="mongodb://primary-mongo:27017"
+FERRUM_DB_FAILOVER_URLS="mongodb://backup-mongo:27017"
 ```
 
 For replica sets, prefer listing all members in the primary URL instead of using `FERRUM_DB_FAILOVER_URLS`.
@@ -311,7 +327,7 @@ MongoDB uses **indexes** instead of SQL table migrations. Indexes are created au
 ```bash
 FERRUM_MODE=migrate FERRUM_MIGRATE_ACTION=up \
   FERRUM_DB_TYPE=mongodb \
-  FERRUM_DB_URL="mongodb://localhost:27017/ferrum" \
+  FERRUM_DB_URL="mongodb://localhost:27017" \
   FERRUM_MONGO_DATABASE=ferrum \
   ferrum-edge
 ```

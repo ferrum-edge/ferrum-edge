@@ -130,7 +130,7 @@ services:
     environment:
       FERRUM_MODE: database
       FERRUM_DB_TYPE: mongodb
-      FERRUM_DB_URL: mongodb://ferrum:${MONGO_PASSWORD:-dev-password-change-in-production}@mongodb:27017/ferrum?authSource=admin
+      FERRUM_DB_URL: mongodb://ferrum:${MONGO_PASSWORD:-dev-password-change-in-production}@mongodb:27017/?authSource=admin
       FERRUM_MONGO_DATABASE: ferrum
       FERRUM_ADMIN_JWT_SECRET: ${FERRUM_ADMIN_JWT_SECRET:-dev-secret-key-change-in-production}
       FERRUM_LOG_LEVEL: info
