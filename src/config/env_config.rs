@@ -555,6 +555,17 @@ pub struct EnvConfig {
     /// TCP listen backlog size for proxy listeners. Default: 2048.
     /// Higher values absorb connection bursts without SYN drops.
     pub tcp_listen_backlog: u32,
+    /// Number of parallel accept() loops per proxy listener port. Each loop binds
+    /// its own socket to the same address via SO_REUSEPORT, giving the kernel
+    /// separate accept queues to distribute SYN processing across — eliminating
+    /// the single socket lock bottleneck at high connection rates (50K+ new
+    /// conn/sec). This is orthogonal to `FERRUM_WORKER_THREADS` which controls
+    /// the tokio runtime thread pool for all async work; `accept_threads`
+    /// specifically parallelizes connection intake at the kernel level.
+    /// Default: 0 (auto-detect = available CPU cores). Set to 1 to disable
+    /// multi-listener. Only effective on Unix with SO_REUSEPORT (Linux 3.9+,
+    /// macOS, BSDs).
+    pub accept_threads: usize,
     /// Server-side HTTP/2 max concurrent streams per inbound connection.
     /// Limits how many requests a single HTTP/2 client can multiplex.
     /// Default: 1000 (nginx=128, envoy=100, unlimited by spec).
@@ -710,6 +721,7 @@ impl Default for EnvConfig {
             max_connections: 100_000,
             max_concurrent_requests_per_ip: 0,
             tcp_listen_backlog: 2048,
+            accept_threads: 0,
             server_http2_max_concurrent_streams: 1000,
             server_http2_max_pending_accept_reset_streams: 64,
             server_http2_max_local_error_reset_streams: 256,
@@ -1083,6 +1095,19 @@ impl EnvConfig {
                 .and_then(|v| v.parse().ok())
                 .map(|v: u32| v.max(128))
                 .unwrap_or(2048),
+            accept_threads: {
+                let raw = resolve_var(conf, "FERRUM_ACCEPT_THREADS")
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0usize);
+                if raw == 0 {
+                    // Auto-detect: use available CPU cores
+                    std::thread::available_parallelism()
+                        .map(|p| p.get())
+                        .unwrap_or(1)
+                } else {
+                    raw
+                }
+            },
             server_http2_max_concurrent_streams: resolve_var(
                 conf,
                 "FERRUM_SERVER_HTTP2_MAX_CONCURRENT_STREAMS",

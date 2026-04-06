@@ -31,12 +31,12 @@ Ferrum Edge provides built-in load balancing to distribute traffic across multip
 The load balancing architecture consists of:
 
 1. **Upstreams** — Named groups of backend targets with a load balancing algorithm.
-2. **Targets** — Individual backend servers within an upstream, each with a host, port, optional weight, and optional path override.
+2. **Targets** — Individual backend servers within an upstream, each with a host, port, optional weight, and optional path override. Stored internally as `Arc<UpstreamTarget>` so that per-request target selection is a cheap pointer bump (~5ns atomic increment) instead of cloning the full struct.
 3. **Health Checks** — Active (periodic probes) and passive (response monitoring) checks that automatically exclude unhealthy targets.
 4. **Retry Logic** — Automatic retries to alternative targets when a request fails.
 5. **Circuit Breaker** — Prevents cascading failures by temporarily stopping requests to failing backends.
 
-Load balancers are rebuilt atomically on configuration changes (file reload via SIGHUP, database polling, or control plane push) — no requests are dropped during reconfiguration.
+Load balancers are rebuilt atomically on configuration changes (file reload via SIGHUP, database polling, or control plane push) — no requests are dropped during reconfiguration. `TargetSelection.target` is `Arc<UpstreamTarget>`, so callers access fields via auto-deref without cloning.
 
 ### DNS Integration
 

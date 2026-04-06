@@ -140,7 +140,8 @@ Ferrum supports dynamic upstream target discovery through three providers, confi
 
 ## Connection Pooling
 
-- Lock-free connection reuse with per-proxy pool keys
+- Lock-free connection reuse with per-proxy pool keys (thread-local key buffers for zero-allocation cache hits)
+- **Arc-wrapped upstream targets** — load balancer selections are cheap pointer bumps, not struct clones
 - Global defaults with per-proxy overrides (max idle, idle timeout, keep-alive, HTTP/2)
 - HTTP/2 multiplexing via ALPN negotiation
 - TCP and HTTP/2 keep-alive with configurable intervals
@@ -149,7 +150,7 @@ Ferrum supports dynamic upstream target discovery through three providers, confi
 ## High-Concurrency & Runtime Tuning
 
 - **jemalloc** memory allocator (Linux/macOS) for reduced fragmentation at scale
-- **SO_REUSEPORT** for kernel-level connection distribution across CPU cores
+- **Multi-listener SO_REUSEPORT** — N parallel accept loops per proxy port (auto-detects CPU cores via `FERRUM_ACCEPT_THREADS`), giving the kernel separate accept queues to eliminate single-socket lock bottleneck at high connection rates
 - Configurable TCP listen backlog (default 2048) for burst absorption
 - Connection limit semaphore (default 100k) with graceful queuing under overload
 - Server-side HTTP/2 `max_concurrent_streams` (default 1000) to bound per-connection resource usage

@@ -155,6 +155,7 @@ Ferrum Edge is configured through environment variables, with an optional `ferru
 | `FERRUM_LOG_BUFFER_CAPACITY` | No | `128000` | Max buffered log lines in the non-blocking writer channel |
 | `FERRUM_PROXY_HTTP_PORT` | No | `8000` | HTTP proxy port |
 | `FERRUM_PROXY_HTTPS_PORT` | No | `8443` | HTTPS proxy port |
+| `FERRUM_ACCEPT_THREADS` | No | `0` (auto-detect) | Parallel accept loops via SO_REUSEPORT (0 = CPU cores) |
 | `FERRUM_ADMIN_HTTP_PORT` | No | `9000` | Admin API HTTP port |
 | `FERRUM_ADMIN_JWT_SECRET` | DB/CP | — | HS256 secret for Admin API |
 | `FERRUM_DB_TYPE` | DB/CP | — | `postgres`, `mysql`, `sqlite`, `mongodb` |

@@ -76,9 +76,10 @@ All four jobs must pass for a PR to merge.
 ### Core Design Principles
 
 1. **Lock-free hot path**: All request-path reads use `ArcSwap::load()` or `DashMap` sharded locks. No `Mutex`/`RwLock` on the proxy path.
-2. **Pre-computed indexes**: RouterCache, PluginCache, ConsumerIndex, and LoadBalancerCache are rebuilt on config reload, not per-request.
-3. **Atomic config reload**: Config changes are loaded in background, validated, then swapped atomically via `ArcSwap`. Requests in-flight see old or new config — never partial.
-4. **Resilience**: If the config source (DB/file/gRPC) is unavailable, the gateway continues serving with cached config.
+2. **Zero-allocation hot path**: Connection pool keys use thread-local buffers (no `String` allocation on cache hits). Load balancer selections return `Arc<UpstreamTarget>` (pointer bump, not struct clone). Response header collection avoids allocating key strings for existing headers. Status code counters are pre-populated so the hot path uses DashMap read locks, not write locks.
+3. **Pre-computed indexes**: RouterCache, PluginCache, ConsumerIndex, and LoadBalancerCache are rebuilt on config reload, not per-request.
+4. **Atomic config reload**: Config changes are loaded in background, validated, then swapped atomically via `ArcSwap`. Requests in-flight see old or new config — never partial.
+5. **Resilience**: If the config source (DB/file/gRPC) is unavailable, the gateway continues serving with cached config.
 
 ### Startup Sequence
 
@@ -164,11 +165,11 @@ src/
 ├── grpc/                      # CP/DP gRPC communication
 │   ├── cp_server.rs           # Control Plane gRPC server (ConfigSync service, broadcast channel)
 │   └── dp_client.rs           # Data Plane gRPC client (subscribe + exponential backoff reconnect)
-├── load_balancer.rs           # Load balancing algorithms + per-upstream cache
+├── load_balancer.rs           # Load balancing algorithms + per-upstream cache (Arc<UpstreamTarget> for zero-cost selection)
 ├── health_check.rs            # Active (HTTP/TCP/UDP probes) + passive health checking
 ├── circuit_breaker.rs         # Three-state circuit breaker (connection errors vs status code failures tracked independently via trip_on_connection_errors)
 ├── retry.rs                   # Retry logic with fixed/exponential backoff
-├── connection_pool.rs         # HTTP client connection pooling with mTLS
+├── connection_pool.rs         # HTTP client connection pooling with mTLS (thread-local pool keys for zero-alloc cache hits)
 ├── router_cache.rs            # Pre-sorted route table with host+path routing, LPM path cache, and full-path-anchored regex routes
 ├── plugin_cache.rs            # Plugin config cache (O(1) lookup by proxy_id)
 ├── consumer_index.rs          # Consumer lookup index (O(1) by credential type)
@@ -466,7 +467,8 @@ These paths use the gateway's global TLS settings as defaults but cannot follow 
 - **No allocations per-request when avoidable** — use pre-computed indexes (RouterCache, PluginCache, ConsumerIndex) instead of filtering/searching at request time. Static headers like Alt-Svc are pre-computed in `ProxyState` at startup.
 - **No locks on the hot path** — use `ArcSwap::load()` for config reads, `DashMap` for concurrent maps. Never introduce `Mutex`/`RwLock` on the proxy path.
 - **Pre-compute at config reload time** — when config changes, rebuild indexes, hash rings, lookup tables, and plugin metadata flags (e.g., `requires_response_body_buffering`). The request path should only do lookups.
-- **Avoid `format!()` in hot loops** — pre-compute string keys at build time. Response headers like Alt-Svc are pre-formatted once, not per-request.
+- **Avoid `format!()` in hot loops** — pre-compute string keys at build time. Response headers like Alt-Svc are pre-formatted once, not per-request. Connection pool keys use `write!()` into thread-local `String` buffers to avoid heap allocation on cache hits.
+- **Use `Arc` for shared read-only data returned per-request** — `LoadBalancer` stores `Vec<Arc<UpstreamTarget>>` so that target selection returns a cheap `Arc::clone()` instead of cloning the full struct. Apply the same pattern when adding new data that is created at config-reload time and returned by reference on the hot path.
 - **Use streaming responses by default** — only buffer when a plugin explicitly requires it. The buffering requirement is pre-computed per-proxy in `PluginCache` for O(1) lookup at request time.
 - **Skip plugin phases when no plugins are configured** — guard plugin iteration loops with `plugins.is_empty()` to avoid iterator setup and async machinery overhead on the hot path.
 - **Always use the shared DNS cache for `reqwest::Client`** — every `reqwest::Client::builder()` call must include `.dns_resolver(Arc::new(DnsCacheResolver::new(dns_cache.clone())))`. This ensures all HTTP clients (connection pool, health probes, fallback clients, plugin HTTP clients) share the gateway's pre-warmed DNS cache with TTL, stale-while-revalidate, and background refresh. Never create a `reqwest::Client` that falls back to system DNS resolution in production code paths.
@@ -521,6 +523,10 @@ These are hard-won findings from profiling. Violating them causes measurable reg
 - **Skip clones on streaming path** — when `stream_response=true` (no retries possible), move `method`/`headers`/`body_bytes` instead of cloning. Body clone for a 10KB payload = 10KB allocation wasted.
 - **Conditional retry prep** — only build retry `HeaderMap` from `proxy_headers` when `proxy.retry.is_some()`. The common fast path (no retries) should do zero work. This was a +15% throughput fix for gRPC.
 - **Pre-allocate body `Vec` from `content-length`** — parse the header to size the buffer, avoiding repeated reallocations during frame/chunk collection.
+- **Thread-local pool key buffers** — connection pool key generation uses `thread_local!` `String` buffers reused across requests on the same tokio worker. The DashMap lookup happens while borrowing the buffer, so cache hits (99%+ of requests) allocate zero heap memory. Only the cold path (first request per unique proxy config) allocates a `String` for DashMap insertion. Applied to reqwest (`connection_pool.rs`) and HTTP/3 (`http3/client.rs`) pools.
+- **`Arc<UpstreamTarget>` in load balancer** — `LoadBalancer.targets` stores `Vec<Arc<UpstreamTarget>>` and `TargetSelection.target` is `Arc<UpstreamTarget>`. Every LB selection is a single atomic increment (~5ns) instead of cloning the full struct (String host + HashMap tags + Option path, ~200-500ns). All 7 selection algorithms (round-robin, WRR, least-connections, least-latency, consistent-hashing, random, fallback) return `Arc::clone()`.
+- **Response header `get_mut()` pattern** — `collect_response_headers()` and `collect_hyper_response_headers()` use `get_mut(k.as_str())` to check for existing headers before allocating the key `String`. For multi-valued headers (common with `set-cookie`), this avoids allocating a key that already exists in the map. The `set-cookie` vs comma separator is determined via zero-cost `HeaderName` comparison before any allocation.
+- **Pre-populated status code DashMap** — Common HTTP status codes (200, 201, 204, 301, 302, 304, 400, 401, 403, 404, 405, 408, 429, 500, 502, 503, 504) are inserted into `ProxyState.status_counts` at construction. The hot path uses `DashMap::get()` (shared read lock) for virtually all requests instead of `entry()` (write lock).
 
 **Protocol-specific gotchas:**
 - **Don't replace reqwest with H3 pool for HTTP/3 frontend→backend**: Tested and reverted. QUIC has higher per-request overhead than TCP/H2 for small payloads (~10x regression). reqwest's HTTP/2 pooling is highly optimized and auto-negotiates the best protocol via ALPN.
@@ -744,6 +750,7 @@ Reduce per-request allocations in plugin lookup
 | `FERRUM_BLOCKING_THREADS` | `512` | Tokio max blocking threads |
 | `FERRUM_MAX_CONNECTIONS` | `100000` | Max concurrent proxy connections (semaphore-bounded; 0 = unlimited) |
 | `FERRUM_TCP_LISTEN_BACKLOG` | `2048` | TCP listen backlog size (min 128) |
+| `FERRUM_ACCEPT_THREADS` | `0` (auto-detect) | Parallel accept() loops per proxy listener port via SO_REUSEPORT. `0` = CPU cores. `1` = single listener. Parallelizes kernel-level connection intake independently of `FERRUM_WORKER_THREADS` |
 | `FERRUM_SERVER_HTTP2_MAX_CONCURRENT_STREAMS` | `1000` | Server-side HTTP/2 max concurrent streams per inbound connection |
 | `FERRUM_SERVER_HTTP2_MAX_PENDING_ACCEPT_RESET_STREAMS` | `64` | Server-side HTTP/2 pending reset-stream threshold before GOAWAY |
 | `FERRUM_SERVER_HTTP2_MAX_LOCAL_ERROR_RESET_STREAMS` | `256` | Server-side HTTP/2 local reset-stream threshold before GOAWAY |

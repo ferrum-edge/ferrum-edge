@@ -87,6 +87,12 @@ pub use self::body::ProxyBody;
 use self::grpc_proxy::{GrpcConnectionPool, GrpcProxyError, GrpcResponseKind};
 use self::http2_pool::Http2ConnectionPool;
 
+/// Static empty HashMap used by rejection responses to avoid allocating a new
+/// HashMap on every error path. ~20+ rejection sites in the proxy handler pass
+/// `&HashMap::new()` — this eliminates those per-rejection allocations.
+static EMPTY_HEADERS: std::sync::LazyLock<HashMap<String, String>> =
+    std::sync::LazyLock::new(HashMap::new);
+
 /// Boxed future type for pool warmup tasks.
 /// Returns `Ok(description)` on success or `Err(message)` on failure.
 type WarmupTask =
@@ -584,15 +590,19 @@ impl Drop for PerIpRequestGuard {
 
 /// Build RFC 7239 Forwarded header value.
 /// IPv6 addresses are quoted per RFC 7239 §6.
+/// Writes directly into a single pre-allocated buffer to avoid intermediate
+/// `format!()` String allocations.
 pub fn build_forwarded_value(client_ip: &str, proto: &str, host: Option<&str>) -> String {
-    // Quote IPv6 addresses: for="[2001:db8::1]"
-    let for_part = if client_ip.contains(':') {
-        format!("for=\"[{}]\"", client_ip)
-    } else {
-        format!("for={}", client_ip)
-    };
     let mut val = String::with_capacity(64);
-    val.push_str(&for_part);
+    // Quote IPv6 addresses: for="[2001:db8::1]"
+    if client_ip.contains(':') {
+        val.push_str("for=\"[");
+        val.push_str(client_ip);
+        val.push_str("]\"");
+    } else {
+        val.push_str("for=");
+        val.push_str(client_ip);
+    }
     val.push_str(";proto=");
     val.push_str(proto);
     if let Some(h) = host {
@@ -915,7 +925,19 @@ impl ProxyState {
             circuit_breaker_cache,
             service_discovery_manager,
             request_count: Arc::new(AtomicU64::new(0)),
-            status_counts: Arc::new(dashmap::DashMap::new()),
+            status_counts: {
+                // Pre-populate common HTTP status codes so the hot path uses
+                // DashMap::get() (shared read lock) instead of entry() (write lock).
+                // After warmup, virtually all requests hit the fast read path.
+                let map = dashmap::DashMap::with_capacity(16);
+                for code in [
+                    200u16, 201, 204, 301, 302, 304, 400, 401, 403, 404, 405, 408, 429, 500, 502,
+                    503, 504,
+                ] {
+                    map.insert(code, AtomicU64::new(0));
+                }
+                Arc::new(map)
+            },
             grpc_pool,
             http2_pool,
             h3_pool,
@@ -2110,7 +2132,7 @@ async fn handle_websocket_request_authenticated(
     ctx: RequestContext,
     plugins: Arc<Vec<Arc<dyn Plugin>>>,
     plugin_execution_ns: u64,
-    upstream_target: Option<UpstreamTarget>,
+    upstream_target: Option<Arc<UpstreamTarget>>,
     lb_hash_key: String,
     sticky_cookie_needed: bool,
     start_time: Instant,
@@ -3020,15 +3042,10 @@ pub async fn start_proxy_listener_with_tls(
     start_proxy_listener_with_tls_and_signal(addr, state, shutdown, tls_config, None).await
 }
 
-/// Start the proxy listener with an optional startup signal sent after bind.
-pub async fn start_proxy_listener_with_tls_and_signal(
-    addr: SocketAddr,
-    state: ProxyState,
-    shutdown: tokio::sync::watch::Receiver<bool>,
-    tls_config: Option<Arc<rustls::ServerConfig>>,
-    started_tx: Option<tokio::sync::oneshot::Sender<()>>,
-) -> Result<(), anyhow::Error> {
-    // Use socket2 for fine-grained socket options before binding.
+/// Create a bound TCP socket with SO_REUSEADDR and SO_REUSEPORT enabled.
+/// Used by the multi-listener accept architecture where N sockets are bound
+/// to the same address, each with its own accept loop.
+fn create_proxy_socket(addr: SocketAddr, backlog: i32) -> Result<TcpListener, anyhow::Error> {
     let socket = socket2::Socket::new(
         if addr.is_ipv6() {
             socket2::Domain::IPV6
@@ -3050,20 +3067,33 @@ pub async fn start_proxy_listener_with_tls_and_signal(
 
     socket.set_nonblocking(true)?;
     socket.bind(&addr.into())?;
-
-    // Increased backlog to absorb connection bursts (default 2048 vs OS default of 128).
-    let backlog = state.env_config.tcp_listen_backlog as i32;
     socket.listen(backlog)?;
 
-    let listener = TcpListener::from_std(socket.into())?;
-    info!("Proxy listener started on {} (backlog={})", addr, backlog);
-    if let Some(started_tx) = started_tx {
-        let _ = started_tx.send(());
-    }
+    Ok(TcpListener::from_std(socket.into())?)
+}
 
-    // Optional connection limit. When max_connections > 0, a semaphore bounds
-    // the number of concurrent connections to prevent resource exhaustion
-    // (file descriptors, memory) under extreme load.
+/// Start the proxy listener with an optional startup signal sent after bind.
+///
+/// When `FERRUM_ACCEPT_THREADS > 1`, spawns N parallel accept loops each with
+/// its own socket bound to the same address via SO_REUSEPORT. The kernel
+/// distributes incoming connections across the N sockets, eliminating the
+/// single-thread accept() bottleneck at high connection rates (50k+ conn/sec).
+/// All N loops share the same connection semaphore for global limit enforcement.
+pub async fn start_proxy_listener_with_tls_and_signal(
+    addr: SocketAddr,
+    state: ProxyState,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+    tls_config: Option<Arc<rustls::ServerConfig>>,
+    started_tx: Option<tokio::sync::oneshot::Sender<()>>,
+) -> Result<(), anyhow::Error> {
+    let backlog = state.env_config.tcp_listen_backlog as i32;
+    let accept_threads = state.env_config.accept_threads.max(1);
+
+    // Create the first listener — this one validates that the port is available.
+    let first_listener = create_proxy_socket(addr, backlog)?;
+
+    // Optional connection limit. Shared across all accept threads so the global
+    // max_connections limit is enforced regardless of which thread accepted.
     let conn_semaphore: Option<Arc<tokio::sync::Semaphore>> =
         if state.env_config.max_connections > 0 {
             info!(
@@ -3077,8 +3107,79 @@ pub async fn start_proxy_listener_with_tls_and_signal(
             None
         };
 
-    let mut shutdown_rx = shutdown;
+    if accept_threads > 1 {
+        // Multi-listener mode: spawn N-1 additional accept loops, each with its
+        // own socket bound to the same address via SO_REUSEPORT. The kernel
+        // distributes connections across all N sockets.
+        let mut handles = Vec::with_capacity(accept_threads);
 
+        // Spawn additional listeners (threads 1..N-1)
+        for i in 1..accept_threads {
+            let listener = create_proxy_socket(addr, backlog)?;
+            let state = state.clone();
+            let tls_config = tls_config.clone();
+            let semaphore = conn_semaphore.clone();
+            let shutdown_rx = shutdown.clone();
+
+            handles.push(tokio::spawn(async move {
+                run_accept_loop(listener, state, tls_config, semaphore, shutdown_rx, i).await;
+            }));
+        }
+
+        info!(
+            "Proxy listener started on {} (backlog={}, accept_threads={})",
+            addr, backlog, accept_threads
+        );
+        if let Some(started_tx) = started_tx {
+            let _ = started_tx.send(());
+        }
+
+        // Run thread 0 on the current task (avoids an extra spawn)
+        run_accept_loop(
+            first_listener,
+            state,
+            tls_config,
+            conn_semaphore,
+            shutdown,
+            0,
+        )
+        .await;
+
+        // When the first loop exits (shutdown), wait for others to finish
+        for handle in handles {
+            let _ = handle.await;
+        }
+    } else {
+        // Single-listener mode (FERRUM_ACCEPT_THREADS=1) — no extra spawns
+        info!("Proxy listener started on {} (backlog={})", addr, backlog);
+        if let Some(started_tx) = started_tx {
+            let _ = started_tx.send(());
+        }
+
+        run_accept_loop(
+            first_listener,
+            state,
+            tls_config,
+            conn_semaphore,
+            shutdown,
+            0,
+        )
+        .await;
+    }
+
+    Ok(())
+}
+
+/// Accept loop that runs on a single listener socket. Multiple instances can
+/// run concurrently on the same address when SO_REUSEPORT is enabled.
+async fn run_accept_loop(
+    listener: TcpListener,
+    state: ProxyState,
+    tls_config: Option<Arc<rustls::ServerConfig>>,
+    conn_semaphore: Option<Arc<tokio::sync::Semaphore>>,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    _thread_id: usize,
+) {
     loop {
         tokio::select! {
             result = listener.accept() => {
@@ -3119,7 +3220,7 @@ pub async fn start_proxy_listener_with_tls_and_signal(
             }
             _ = shutdown_rx.changed() => {
                 info!("Proxy listener shutting down");
-                return Ok(());
+                return;
             }
         }
     }
@@ -3714,7 +3815,9 @@ pub async fn handle_proxy_request(
         }
     }
 
-    // Validate query parameter count (skip empty segments from consecutive '&')
+    // Validate query parameter count (skip empty segments from consecutive '&').
+    // Uses split + filter instead of a raw byte-scan to correctly handle edge
+    // cases like "&&" producing empty segments that shouldn't count as params.
     if state.max_query_params > 0 && !query_string.is_empty() {
         let param_count = query_string.split('&').filter(|s| !s.is_empty()).count();
         if param_count > state.max_query_params {
@@ -3753,40 +3856,42 @@ pub async fn handle_proxy_request(
     // Resolve real client IP using trusted proxy configuration.
     // Parse the socket IP once and reuse the parsed value to avoid redundant
     // parsing across the real-IP-header check and the XFF walk.
+    // When no resolution changes the IP, we skip the allocation entirely —
+    // ctx.client_ip was already set to socket_ip by RequestContext::new().
     if !state.trusted_proxies.is_empty() {
         let socket_addr: Option<std::net::IpAddr> = socket_ip.parse().ok();
-        let resolved = if let Some(ref real_ip_header) = state.env_config.real_ip_header {
+        if let Some(ref real_ip_header) = state.env_config.real_ip_header {
             // real_ip_header is pre-lowercased at config load time — no allocation needed
             let header_val = ctx.headers.get(real_ip_header.as_str());
             if let Some(val) = header_val {
                 // Validate the direct connection is from a trusted proxy before
                 // trusting this header
                 if socket_addr.is_some_and(|ip| state.trusted_proxies.contains(&ip)) {
-                    val.trim().to_string()
-                } else {
-                    socket_ip.to_string()
+                    let trimmed = val.trim();
+                    // Only allocate if the resolved IP differs from socket_ip
+                    if trimmed != socket_ip {
+                        ctx.client_ip = trimmed.to_owned();
+                    }
                 }
+                // else: untrusted proxy, keep socket_ip (already set in ctx)
             } else if let Some(ref addr) = socket_addr {
-                client_ip::resolve_client_ip_parsed(
+                ctx.client_ip = client_ip::resolve_client_ip_parsed(
                     &socket_ip,
                     addr,
                     ctx.headers.get("x-forwarded-for").map(|s| s.as_str()),
                     &state.trusted_proxies,
-                )
-            } else {
-                socket_ip.to_string()
+                );
             }
+            // else: no header + unparseable socket_ip, keep socket_ip (already set in ctx)
         } else if let Some(ref addr) = socket_addr {
-            client_ip::resolve_client_ip_parsed(
+            ctx.client_ip = client_ip::resolve_client_ip_parsed(
                 &socket_ip,
                 addr,
                 ctx.headers.get("x-forwarded-for").map(|s| s.as_str()),
                 &state.trusted_proxies,
-            )
-        } else {
-            socket_ip.to_string()
-        };
-        ctx.client_ip = resolved;
+            );
+        }
+        // else: unparseable socket_ip with no real_ip_header, keep socket_ip (already set in ctx)
     }
 
     // Per-IP concurrent request limiting. The guard auto-decrements on drop,
@@ -3876,7 +3981,7 @@ pub async fn handle_proxy_request(
             let reject = normalize_reject_response(
                 StatusCode::NOT_FOUND,
                 br#"{"error":"Not Found"}"#,
-                &HashMap::new(),
+                &EMPTY_HEADERS,
                 request_uses_grpc_content_type,
             );
             record_status(&state, reject.http_status.as_u16());
@@ -3934,7 +4039,7 @@ pub async fn handle_proxy_request(
         let reject = normalize_reject_response(
             StatusCode::BAD_REQUEST,
             br#"{"error":"gRPC requires POST method"}"#,
-            &HashMap::new(),
+            &EMPTY_HEADERS,
             true,
         );
         record_status(&state, reject.http_status.as_u16());
@@ -5104,7 +5209,7 @@ pub async fn handle_proxy_request(
             &method,
             proxy_headers,
             client_request_body,
-            upstream_target.as_ref(),
+            upstream_target.as_deref(),
             &plugins,
             should_stream,
             requires_request_body_buffering,
@@ -5173,7 +5278,7 @@ pub async fn handle_proxy_request(
                     &current_url,
                     &method,
                     proxy_headers,
-                    current_target.as_ref(),
+                    current_target.as_deref(),
                     retained_body.as_deref(),
                     &ctx.client_ip,
                     is_tls,
@@ -5186,7 +5291,7 @@ pub async fn handle_proxy_request(
                     &current_url,
                     &method,
                     proxy_headers,
-                    current_target.as_ref(),
+                    current_target.as_deref(),
                     retained_body.as_deref(),
                     should_stream && is_last_attempt,
                     &ctx.client_ip,
@@ -5204,7 +5309,7 @@ pub async fn handle_proxy_request(
             &method,
             proxy_headers,
             client_request_body,
-            upstream_target.as_ref(),
+            upstream_target.as_deref(),
             &plugins,
             should_stream,
             requires_request_body_buffering,
@@ -6586,23 +6691,19 @@ fn collect_response_headers(
     target.reserve(source.keys_len());
     for (k, v) in source {
         if let Ok(vs) = v.to_str() {
-            let key = k.as_str().to_string();
-            if k == "set-cookie" {
-                target
-                    .entry(key)
-                    .and_modify(|existing: &mut String| {
-                        existing.push('\n');
-                        existing.push_str(vs);
-                    })
-                    .or_insert_with(|| vs.to_string());
-            } else {
-                target
-                    .entry(key)
-                    .and_modify(|existing: &mut String| {
-                        existing.push_str(", ");
-                        existing.push_str(vs);
-                    })
-                    .or_insert_with(|| vs.to_string());
+            // Determine multi-value separator before allocating the key String.
+            // HeaderName comparison is zero-cost (pointer/length check on
+            // pre-interned names), saving a String allocation when the header
+            // already exists in the target map.
+            let sep = if k == "set-cookie" { "\n" } else { ", " };
+            match target.get_mut(k.as_str()) {
+                Some(existing) => {
+                    existing.push_str(sep);
+                    existing.push_str(vs);
+                }
+                None => {
+                    target.insert(k.as_str().to_owned(), vs.to_owned());
+                }
             }
         }
     }
@@ -6617,23 +6718,15 @@ fn collect_hyper_response_headers(source: &hyper::HeaderMap, target: &mut HashMa
     target.reserve(source.keys_len());
     for (k, v) in source {
         if let Ok(vs) = v.to_str() {
-            let key = k.as_str().to_string();
-            if k == "set-cookie" {
-                target
-                    .entry(key)
-                    .and_modify(|existing: &mut String| {
-                        existing.push('\n');
-                        existing.push_str(vs);
-                    })
-                    .or_insert_with(|| vs.to_string());
-            } else {
-                target
-                    .entry(key)
-                    .and_modify(|existing: &mut String| {
-                        existing.push_str(", ");
-                        existing.push_str(vs);
-                    })
-                    .or_insert_with(|| vs.to_string());
+            let sep = if k == "set-cookie" { "\n" } else { ", " };
+            match target.get_mut(k.as_str()) {
+                Some(existing) => {
+                    existing.push_str(sep);
+                    existing.push_str(vs);
+                }
+                None => {
+                    target.insert(k.as_str().to_owned(), vs.to_owned());
+                }
             }
         }
     }
