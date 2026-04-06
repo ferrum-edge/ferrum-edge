@@ -29,6 +29,36 @@ use uuid::Uuid;
 const DEFAULT_MONGO_URL: &str = "mongodb://localhost:27017/ferrum_test";
 const DEFAULT_MONGO_DATABASE: &str = "ferrum_test";
 
+/// Check if MongoDB is reachable at the expected address.
+/// Returns false if MongoDB is down — tests will be skipped gracefully.
+async fn mongodb_is_available(url: &str) -> bool {
+    // Extract host:port from the MongoDB URL (mongodb://host:port/db)
+    let host_port = url
+        .strip_prefix("mongodb://")
+        .or_else(|| url.strip_prefix("mongodb+srv://"))
+        .and_then(|s| s.split('/').next())
+        .and_then(|s| {
+            // Strip credentials if present (user:pass@host:port)
+            if s.contains('@') {
+                s.split('@').next_back()
+            } else {
+                Some(s)
+            }
+        })
+        .unwrap_or("localhost:27017");
+
+    match tokio::net::TcpStream::connect(host_port).await {
+        Ok(_) => true,
+        Err(_) => {
+            eprintln!(
+                "MongoDB not available at {} — skipping MongoDB functional tests",
+                host_port
+            );
+            false
+        }
+    }
+}
+
 /// Default certificate directory for TLS tests.
 const DEFAULT_CERT_DIR: &str = "/tmp/ferrum-mongo-tls-certs";
 
@@ -503,6 +533,10 @@ async fn test_mongodb_plaintext_full_lifecycle() {
     let mongo_url =
         std::env::var("FERRUM_TEST_MONGO_URL").unwrap_or_else(|_| DEFAULT_MONGO_URL.to_string());
 
+    if !mongodb_is_available(&mongo_url).await {
+        return;
+    }
+
     // Start echo backend
     let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -552,6 +586,10 @@ async fn test_mongodb_tls_connection() {
         return;
     }
 
+    if !mongodb_is_available(&mongo_url).await {
+        return;
+    }
+
     let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("Bind backend");
@@ -589,6 +627,10 @@ async fn test_mongodb_mtls_connection() {
             "SKIP: mTLS client certs not found at {}. Run setup_mongo_tls.sh first.",
             cert_dir
         );
+        return;
+    }
+
+    if !mongodb_is_available(&mongo_url).await {
         return;
     }
 
