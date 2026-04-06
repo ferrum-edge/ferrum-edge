@@ -1,0 +1,42 @@
+---
+name: Security Vulnerability
+description: Report a security vulnerability (private disclosure preferred)
+title: "[SECURITY] "
+labels: ["security"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ## ⚠️ Important Notice
+        
+        **For security vulnerabilities, we strongly encourage private disclosure via email to security@ferrum-edge.io instead of opening a public issue.**
+        
+        This allows us to:
+        - Assess and fix the vulnerability before public disclosure
+        - Coordinate a responsible disclosure timeline
+        - Protect users who may be affected
+        
+        See [SECURITY.md](SECURITY.md) for our full security policy.
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: Description of the vulnerability (for low-risk issues only)
+      placeholder: Describe the security issue...
+  - type: textarea
+    id: impact
+    attributes:
+      label: Potential Impact
+      description: What security impact could this have?
+      placeholder: e.g., "Could allow unauthorized admin access"
+  - type: checkboxes
+    id: disclosure
+    attributes:
+      label: Disclosure Preference
+      options:
+        - label: This is a low-risk issue suitable for public discussion
+          required: false
+  - type: markdown
+    attributes:
+      value: |
+        For any non-trivial security issue, please email **security@ferrum-edge.io** instead.

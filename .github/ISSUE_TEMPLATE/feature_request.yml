@@ -1,0 +1,78 @@
+---
+name: Feature Request
+description: Suggest an idea for Ferrum Edge
+title: "[FEATURE] "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to suggest a new feature!
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem Statement
+      description: Is your feature request related to a problem? Please describe
+      placeholder: A clear and concise description of what the problem is
+    validations:
+      required: true
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed Solution
+      description: Describe the solution you'd like
+      placeholder: A clear and concise description of what you want to happen
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives Considered
+      description: Describe any alternative solutions or features you've considered
+      placeholder: Other approaches that could solve the problem...
+  - type: textarea
+    id: usecase
+    attributes:
+      label: Use Case
+      description: Describe your specific use case
+      placeholder: |
+        - Who would benefit from this feature?
+        - What is the context/scenario?
+        - Why is this important?
+    validations:
+      required: true
+  - type: dropdown
+    id: scope
+    attributes:
+      label: Scope
+      description: Which area does this feature relate to?
+      options:
+        - Core Proxy
+        - Plugin System
+        - Admin API
+        - Configuration
+        - Performance
+        - Security
+        - Protocol (HTTP/1, HTTP/2, HTTP/3)
+        - Protocol (WebSocket)
+        - Protocol (gRPC)
+        - Protocol (TCP/UDP)
+        - Documentation
+        - Other
+    validations:
+      required: true
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checklist
+      options:
+        - label: I have searched existing issues to ensure this is not a duplicate
+          required: true
+        - label: I have checked the documentation and this feature is not already implemented
+          required: true
+  - type: textarea
+    id: additional
+    attributes:
+      label: Additional Context
+      description: Any other context or screenshots about the feature request
+      placeholder: Add any other context here...
