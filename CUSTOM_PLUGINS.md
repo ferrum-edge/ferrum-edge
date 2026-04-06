@@ -207,7 +207,7 @@ Every plugin implements the `Plugin` trait from `src/plugins/mod.rs`. All method
 | `on_request_received(&mut ctx)` | Pre-routing | Yes | IP filtering, request validation, early termination |
 | `authenticate(&mut ctx, &consumer_index)` | Authentication | Yes | Verify identity (JWT, API key, custom tokens) |
 | `authorize(&mut ctx)` | Authorization | Yes | Check permissions, enforce rate limits |
-| `before_proxy(&mut ctx, &mut headers)` | Pre-backend | Yes | Transform request headers, add tracing IDs |
+| `before_proxy(&mut ctx, &mut headers)` | Pre-backend | Yes | Transform request headers, add tracing IDs. **Read request headers from `headers`, not `ctx.headers`** (see note below) |
 | `transform_request_body(&body, content_type)` | Pre-backend (buffered) | No | Rewrite request body before sending to backend |
 | `on_final_request_body(&headers, &body)` | Pre-backend (post-transform) | Yes | Validate the final request body after all transforms |
 | `after_proxy(&mut ctx, status, &mut headers)` | Post-backend | Yes | Transform response headers, reject responses |
@@ -218,6 +218,8 @@ Every plugin implements the `Plugin` trait from `src/plugins/mod.rs`. All method
 | `on_ws_frame(proxy_id, connection_id, direction, &message)` | WebSocket frame | Close* | Inspect/transform per-frame WebSocket traffic |
 
 \*`on_ws_frame` cannot return `PluginResult::Reject`. Instead, return `Some(Message::Close(...))` to close the connection in both directions. Return `None` for passthrough, or `Some(transformed_message)` to replace the frame.
+
+**`before_proxy` header parameter**: In `before_proxy`, always read request headers from the `headers` parameter, **not** from `ctx.headers`. The proxy handler avoids cloning the headers HashMap when no plugin modifies them — it moves headers out of `ctx.headers` into the `headers` parameter via `std::mem::take()`, leaving `ctx.headers` empty during the call. After `before_proxy` completes, headers are moved back. This means `ctx.headers.get("content-type")` returns `None` inside `before_proxy`, while `headers.get("content-type")` returns the actual value. If your plugin calls helper methods that need request headers, pass the `headers` parameter through rather than reading `ctx.headers` in the helper. This only affects `before_proxy` — other phases like `authenticate` and `on_request_received` can safely read `ctx.headers`.
 
 ### Lifecycle Hooks — TCP/UDP Streams
 
