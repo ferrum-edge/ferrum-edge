@@ -120,7 +120,7 @@ jobs:
           echo "Cutoff date: $CUTOFF_DATE"
           
           # Get closed PRs older than threshold that weren't merged
-          STALE_PRS=$(gh pr list --state closed --json headRefName,number,closedAt,mergedAt --jq 'map(select(.mergedAt == null and .closedAt < '"$CUTOFF_DATE"')) | .[].headRefName')
+          STALE_PRS=$(gh pr list --state closed --json headRefName,number,closedAt,mergedAt --jq "map(select(.mergedAt == null and .closedAt < \"$CUTOFF_DATE\")) | .[].headRefName")
           
           DELETED_COUNT=0
           
