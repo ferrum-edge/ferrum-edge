@@ -484,6 +484,7 @@ async fn test_terminate_mode_rejects_grpc_requests() {
     ctx.headers
         .insert("content-type".to_string(), "application/grpc".to_string());
     let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/grpc".to_string());
 
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     match result {
@@ -516,6 +517,7 @@ async fn test_pre_proxy_mode_allows_grpc_requests() {
     ctx.headers
         .insert("content-type".to_string(), "application/grpc".to_string());
     let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/grpc".to_string());
 
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     // Should NOT get the gRPC rejection — should proceed to invoke (and fail with continue)

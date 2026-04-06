@@ -1052,7 +1052,6 @@ impl Plugin for BodyValidator {
         // Check content type
         let content_type = headers
             .get("content-type")
-            .or_else(|| ctx.headers.get("content-type"))
             .cloned()
             .unwrap_or_default()
             .to_lowercase();

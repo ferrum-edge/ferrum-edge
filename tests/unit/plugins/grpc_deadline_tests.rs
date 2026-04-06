@@ -60,6 +60,7 @@ async fn test_parse_hours() {
 
     let mut ctx = create_grpc_context_with_timeout(Some("2H"));
     let mut headers = HashMap::new();
+    headers.insert("grpc-timeout".to_string(), "2H".to_string());
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_continue(result);
 
@@ -78,6 +79,7 @@ async fn test_parse_minutes() {
 
     let mut ctx = create_grpc_context_with_timeout(Some("5M"));
     let mut headers = HashMap::new();
+    headers.insert("grpc-timeout".to_string(), "5M".to_string());
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_continue(result);
 
@@ -94,6 +96,7 @@ async fn test_parse_seconds() {
 
     let mut ctx = create_grpc_context_with_timeout(Some("30S"));
     let mut headers = HashMap::new();
+    headers.insert("grpc-timeout".to_string(), "30S".to_string());
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_continue(result);
 
@@ -110,6 +113,7 @@ async fn test_parse_milliseconds() {
 
     let mut ctx = create_grpc_context_with_timeout(Some("5000m"));
     let mut headers = HashMap::new();
+    headers.insert("grpc-timeout".to_string(), "5000m".to_string());
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_continue(result);
 
@@ -127,6 +131,7 @@ async fn test_parse_microseconds() {
 
     let mut ctx = create_grpc_context_with_timeout(Some("5000000u"));
     let mut headers = HashMap::new();
+    headers.insert("grpc-timeout".to_string(), "5000000u".to_string());
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_continue(result);
 
@@ -144,6 +149,7 @@ async fn test_parse_nanoseconds() {
 
     let mut ctx = create_grpc_context_with_timeout(Some("1000000000n"));
     let mut headers = HashMap::new();
+    headers.insert("grpc-timeout".to_string(), "1000000000n".to_string());
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_continue(result);
 
@@ -183,6 +189,7 @@ async fn test_default_deadline_not_used_when_present() {
 
     let mut ctx = create_grpc_context_with_timeout(Some("10000m"));
     let mut headers = HashMap::new();
+    headers.insert("grpc-timeout".to_string(), "10000m".to_string());
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_continue(result);
 
@@ -202,6 +209,7 @@ async fn test_max_deadline_caps_high_timeout() {
 
     let mut ctx = create_grpc_context_with_timeout(Some("60S")); // 60,000 ms
     let mut headers = HashMap::new();
+    headers.insert("grpc-timeout".to_string(), "60S".to_string());
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_continue(result);
 
@@ -220,6 +228,7 @@ async fn test_max_deadline_does_not_increase_low_timeout() {
 
     let mut ctx = create_grpc_context_with_timeout(Some("5000m")); // 5,000 ms
     let mut headers = HashMap::new();
+    headers.insert("grpc-timeout".to_string(), "5000m".to_string());
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_continue(result);
 
@@ -253,6 +262,7 @@ async fn test_reject_no_deadline_allows_present() {
 
     let mut ctx = create_grpc_context_with_timeout(Some("5000m"));
     let mut headers = HashMap::new();
+    headers.insert("grpc-timeout".to_string(), "5000m".to_string());
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_continue(result);
 }
@@ -341,6 +351,7 @@ async fn test_empty_config_passes_through() {
 
     let mut ctx = create_grpc_context_with_timeout(Some("5000m"));
     let mut headers = HashMap::new();
+    headers.insert("grpc-timeout".to_string(), "5000m".to_string());
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_continue(result);
 
@@ -355,6 +366,7 @@ async fn test_modified_timeout_header_takes_precedence_over_original_request() {
 
     let mut ctx = create_grpc_context_with_timeout(Some("60S"));
     let mut headers = HashMap::new();
+    headers.insert("grpc-timeout".to_string(), "60S".to_string());
     headers.insert("grpc-timeout".to_string(), "5000m".to_string());
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_continue(result);
@@ -389,6 +401,7 @@ async fn test_invalid_timeout_treated_as_missing() {
 
     let mut ctx = create_grpc_context_with_timeout(Some("invalid"));
     let mut headers = HashMap::new();
+    headers.insert("grpc-timeout".to_string(), "invalid".to_string());
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_continue(result);
 
@@ -452,6 +465,7 @@ async fn test_empty_string_timeout_treated_as_missing() {
 
     let mut ctx = create_grpc_context_with_timeout(Some(""));
     let mut headers = HashMap::new();
+    headers.insert("grpc-timeout".to_string(), "".to_string());
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_continue(result);
 
@@ -472,6 +486,7 @@ async fn test_very_large_hour_timeout_saturates() {
     // u64::MAX / 3600 would overflow without saturating_mul
     let mut ctx = create_grpc_context_with_timeout(Some("999999999H"));
     let mut headers = HashMap::new();
+    headers.insert("grpc-timeout".to_string(), "999999999H".to_string());
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_continue(result);
 
@@ -493,6 +508,7 @@ async fn test_subtract_after_max_cap() {
     // Client sends 60s, capped to 5s, then processing time subtracted
     let mut ctx = create_grpc_context_with_timeout(Some("60S"));
     let mut headers = HashMap::new();
+    headers.insert("grpc-timeout".to_string(), "60S".to_string());
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_continue(result);
 
@@ -517,6 +533,7 @@ async fn test_multi_char_unit_rejected() {
     // "ms" is not a valid gRPC timeout unit — only single-char units
     let mut ctx = create_grpc_context_with_timeout(Some("5000ms"));
     let mut headers = HashMap::new();
+    headers.insert("grpc-timeout".to_string(), "5000ms".to_string());
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_continue(result);
 
@@ -537,6 +554,7 @@ async fn test_original_and_adjusted_metadata() {
 
     let mut ctx = create_grpc_context_with_timeout(Some("30S")); // 30,000 ms
     let mut headers = HashMap::new();
+    headers.insert("grpc-timeout".to_string(), "30S".to_string());
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_continue(result);
 

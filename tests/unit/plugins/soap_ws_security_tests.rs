@@ -18,15 +18,24 @@ fn make_ctx_with_soap_body(body: &str) -> RequestContext {
     ctx
 }
 
+fn soap_headers() -> HashMap<String, String> {
+    let mut h = HashMap::new();
+    h.insert("content-type".to_string(), "text/xml".to_string());
+    h
+}
+
+fn non_soap_headers() -> HashMap<String, String> {
+    let mut h = HashMap::new();
+    h.insert("content-type".to_string(), "application/json".to_string());
+    h
+}
+
 fn make_ctx_non_soap() -> RequestContext {
-    let mut ctx = RequestContext::new(
+    RequestContext::new(
         "127.0.0.1".to_string(),
         "POST".to_string(),
         "/api".to_string(),
-    );
-    ctx.headers
-        .insert("content-type".to_string(), "application/json".to_string());
-    ctx
+    )
 }
 
 fn timestamp_only_config() -> serde_json::Value {
@@ -218,7 +227,7 @@ fn test_valid_username_token_config() {
 async fn test_non_soap_content_type_passes_through() {
     let plugin = SoapWsSecurity::new(&timestamp_only_config()).unwrap();
     let mut ctx = make_ctx_non_soap();
-    let mut headers = HashMap::new();
+    let mut headers = non_soap_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(matches!(result, PluginResult::Continue));
 }
@@ -245,12 +254,12 @@ async fn test_application_soap_xml_is_processed() {
         "POST".to_string(),
         "/ws".to_string(),
     );
-    ctx.headers.insert(
+    ctx.metadata.insert("request_body".to_string(), body);
+    let mut headers = HashMap::new();
+    headers.insert(
         "content-type".to_string(),
         "application/soap+xml; charset=utf-8".to_string(),
     );
-    ctx.metadata.insert("request_body".to_string(), body);
-    let mut headers = HashMap::new();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(matches!(result, PluginResult::Continue));
 }
@@ -265,7 +274,7 @@ async fn test_missing_security_header_rejects() {
       <soap:Body><Test/></soap:Body>
     </soap:Envelope>"#;
     let mut ctx = make_ctx_with_soap_body(body);
-    let mut headers = HashMap::new();
+    let mut headers = soap_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(is_reject(&result));
     assert_eq!(reject_status(&result), 401);
@@ -284,7 +293,7 @@ async fn test_missing_security_header_allowed_when_not_required() {
       <soap:Body><Test/></soap:Body>
     </soap:Envelope>"#;
     let mut ctx = make_ctx_with_soap_body(body);
-    let mut headers = HashMap::new();
+    let mut headers = soap_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(matches!(result, PluginResult::Continue));
 }
@@ -296,7 +305,7 @@ async fn test_valid_timestamp_passes() {
     let plugin = SoapWsSecurity::new(&timestamp_only_config()).unwrap();
     let body = wrap_soap(&fresh_timestamp());
     let mut ctx = make_ctx_with_soap_body(&body);
-    let mut headers = HashMap::new();
+    let mut headers = soap_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(matches!(result, PluginResult::Continue));
 }
@@ -306,7 +315,7 @@ async fn test_missing_timestamp_rejects() {
     let plugin = SoapWsSecurity::new(&timestamp_only_config()).unwrap();
     let body = wrap_soap("<!-- no timestamp -->");
     let mut ctx = make_ctx_with_soap_body(&body);
-    let mut headers = HashMap::new();
+    let mut headers = soap_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(is_reject(&result));
     assert!(reject_body(&result).contains("missing Timestamp"));
@@ -325,7 +334,7 @@ async fn test_expired_timestamp_rejects() {
     );
     let body = wrap_soap(&ts);
     let mut ctx = make_ctx_with_soap_body(&body);
-    let mut headers = HashMap::new();
+    let mut headers = soap_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(is_reject(&result));
     assert!(reject_body(&result).contains("too old"));
@@ -353,7 +362,7 @@ async fn test_future_timestamp_rejects() {
     );
     let body = wrap_soap(&ts);
     let mut ctx = make_ctx_with_soap_body(&body);
-    let mut headers = HashMap::new();
+    let mut headers = soap_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(is_reject(&result));
     assert!(reject_body(&result).contains("in the future"));
@@ -382,7 +391,7 @@ async fn test_timestamp_expires_past_rejects() {
     );
     let body = wrap_soap(&ts);
     let mut ctx = make_ctx_with_soap_body(&body);
-    let mut headers = HashMap::new();
+    let mut headers = soap_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(is_reject(&result));
     assert!(reject_body(&result).contains("expired"));
@@ -408,7 +417,7 @@ async fn test_timestamp_require_expires_missing_rejects() {
     );
     let body = wrap_soap(&ts);
     let mut ctx = make_ctx_with_soap_body(&body);
-    let mut headers = HashMap::new();
+    let mut headers = soap_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(is_reject(&result));
     assert!(reject_body(&result).contains("missing required Expires"));
@@ -425,7 +434,7 @@ async fn test_username_token_password_text_valid() {
     </wsse:UsernameToken>"#;
     let body = wrap_soap(ut);
     let mut ctx = make_ctx_with_soap_body(&body);
-    let mut headers = HashMap::new();
+    let mut headers = soap_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(matches!(result, PluginResult::Continue));
     assert_eq!(ctx.metadata.get("soap_ws_username").unwrap(), "alice");
@@ -440,7 +449,7 @@ async fn test_username_token_wrong_password_rejects() {
     </wsse:UsernameToken>"#;
     let body = wrap_soap(ut);
     let mut ctx = make_ctx_with_soap_body(&body);
-    let mut headers = HashMap::new();
+    let mut headers = soap_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(is_reject(&result));
     assert_eq!(reject_status(&result), 401);
@@ -456,7 +465,7 @@ async fn test_username_token_unknown_user_rejects() {
     </wsse:UsernameToken>"#;
     let body = wrap_soap(ut);
     let mut ctx = make_ctx_with_soap_body(&body);
-    let mut headers = HashMap::new();
+    let mut headers = soap_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(is_reject(&result));
     assert!(reject_body(&result).contains("unknown username"));
@@ -470,7 +479,7 @@ async fn test_username_token_missing_password_rejects() {
     </wsse:UsernameToken>"#;
     let body = wrap_soap(ut);
     let mut ctx = make_ctx_with_soap_body(&body);
-    let mut headers = HashMap::new();
+    let mut headers = soap_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(is_reject(&result));
     assert!(reject_body(&result).contains("missing Password"));
@@ -484,7 +493,7 @@ async fn test_username_token_missing_username_rejects() {
     </wsse:UsernameToken>"#;
     let body = wrap_soap(ut);
     let mut ctx = make_ctx_with_soap_body(&body);
-    let mut headers = HashMap::new();
+    let mut headers = soap_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(is_reject(&result));
     assert!(reject_body(&result).contains("missing Username"));
@@ -523,7 +532,7 @@ async fn test_password_digest_valid() {
     );
     let body = wrap_soap(&ut);
     let mut ctx = make_ctx_with_soap_body(&body);
-    let mut headers = HashMap::new();
+    let mut headers = soap_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(
         matches!(result, PluginResult::Continue),
@@ -564,7 +573,7 @@ async fn test_password_digest_wrong_password_rejects() {
     );
     let body = wrap_soap(&ut);
     let mut ctx = make_ctx_with_soap_body(&body);
-    let mut headers = HashMap::new();
+    let mut headers = soap_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(is_reject(&result));
     assert!(reject_body(&result).contains("PasswordDigest verification failed"));
@@ -580,7 +589,7 @@ async fn test_password_digest_missing_nonce_rejects() {
     </wsse:UsernameToken>"#;
     let body = wrap_soap(ut);
     let mut ctx = make_ctx_with_soap_body(&body);
-    let mut headers = HashMap::new();
+    let mut headers = soap_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(is_reject(&result));
     assert!(reject_body(&result).contains("requires Nonce"));
@@ -620,13 +629,13 @@ async fn test_nonce_replay_detected() {
 
     // First request succeeds
     let mut ctx = make_ctx_with_soap_body(&body);
-    let mut headers = HashMap::new();
+    let mut headers = soap_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(matches!(result, PluginResult::Continue));
 
     // Second request with same nonce is replay
     let mut ctx2 = make_ctx_with_soap_body(&body);
-    let mut headers2 = HashMap::new();
+    let mut headers2 = soap_headers();
     let result2 = plugin.before_proxy(&mut ctx2, &mut headers2).await;
     assert!(is_reject(&result2));
     assert!(reject_body(&result2).contains("nonce replay"));
@@ -665,7 +674,7 @@ async fn test_saml_valid_assertion() {
     );
     let body = wrap_soap(&assertion);
     let mut ctx = make_ctx_with_soap_body(&body);
-    let mut headers = HashMap::new();
+    let mut headers = soap_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(matches!(result, PluginResult::Continue));
 }
@@ -687,7 +696,7 @@ async fn test_saml_untrusted_issuer_rejects() {
     </saml:Assertion>"#;
     let body = wrap_soap(assertion);
     let mut ctx = make_ctx_with_soap_body(&body);
-    let mut headers = HashMap::new();
+    let mut headers = soap_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(is_reject(&result));
     assert!(reject_body(&result).contains("not trusted"));
@@ -713,7 +722,7 @@ async fn test_saml_expired_assertion_rejects() {
     </saml:Assertion>"#;
     let body = wrap_soap(assertion);
     let mut ctx = make_ctx_with_soap_body(&body);
-    let mut headers = HashMap::new();
+    let mut headers = soap_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(is_reject(&result));
     assert!(reject_body(&result).contains("expired"));
@@ -743,7 +752,7 @@ async fn test_saml_not_yet_valid_rejects() {
     );
     let body = wrap_soap(&assertion);
     let mut ctx = make_ctx_with_soap_body(&body);
-    let mut headers = HashMap::new();
+    let mut headers = soap_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(is_reject(&result));
     assert!(reject_body(&result).contains("not yet valid"));
@@ -780,7 +789,7 @@ async fn test_saml_wrong_audience_rejects() {
     );
     let body = wrap_soap(&assertion);
     let mut ctx = make_ctx_with_soap_body(&body);
-    let mut headers = HashMap::new();
+    let mut headers = soap_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(is_reject(&result));
     assert!(reject_body(&result).contains("Audience"));
@@ -799,7 +808,7 @@ async fn test_saml_missing_assertion_rejects() {
     let plugin = SoapWsSecurity::new(&config).unwrap();
     let body = wrap_soap("<!-- no assertion -->");
     let mut ctx = make_ctx_with_soap_body(&body);
-    let mut headers = HashMap::new();
+    let mut headers = soap_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(is_reject(&result));
     assert!(reject_body(&result).contains("missing SAML Assertion"));
@@ -853,7 +862,7 @@ fn test_should_not_buffer_non_soap() {
 async fn test_non_envelope_soap_body_rejects() {
     let plugin = SoapWsSecurity::new(&timestamp_only_config()).unwrap();
     let mut ctx = make_ctx_with_soap_body("<notasoap>hello</notasoap>");
-    let mut headers = HashMap::new();
+    let mut headers = soap_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(is_reject(&result));
     assert!(reject_body(&result).contains("not a SOAP envelope"));
@@ -905,7 +914,7 @@ async fn test_handles_different_namespace_prefixes() {
         expires
     );
     let mut ctx = make_ctx_with_soap_body(&body);
-    let mut headers = HashMap::new();
+    let mut headers = soap_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(matches!(result, PluginResult::Continue));
 }
@@ -914,7 +923,7 @@ async fn test_handles_different_namespace_prefixes() {
 async fn test_empty_body_rejects() {
     let plugin = SoapWsSecurity::new(&timestamp_only_config()).unwrap();
     let mut ctx = make_ctx_with_soap_body("");
-    let mut headers = HashMap::new();
+    let mut headers = soap_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(is_reject(&result));
 }
