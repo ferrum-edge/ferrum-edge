@@ -63,11 +63,13 @@ jobs:
           sudo apt-get install -y protobuf-compiler libcurl4-openssl-dev
 
       - name: Run unit tests
-        run: cargo test --test unit_tests        env:
+        run: cargo test --test unit_tests
+        env:
           RUST_BACKTRACE: 1
 
       - name: Run integration tests
-        run: cargo test --test integration_tests        env:
+        run: cargo test --test integration_tests
+        env:
           RUST_BACKTRACE: 1
 
       - name: Build gateway binary for end-to-end tests
