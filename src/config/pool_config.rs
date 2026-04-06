@@ -150,13 +150,13 @@ impl PoolConfig {
         if let Ok(val) = env::var("FERRUM_POOL_HTTP2_INITIAL_STREAM_WINDOW_SIZE")
             && let Ok(parsed) = val.parse::<u32>()
         {
-            config.http2_initial_stream_window_size = parsed.max(65_535);
+            config.http2_initial_stream_window_size = parsed.clamp(65_535, 128 * 1024 * 1024);
         }
 
         if let Ok(val) = env::var("FERRUM_POOL_HTTP2_INITIAL_CONNECTION_WINDOW_SIZE")
             && let Ok(parsed) = val.parse::<u32>()
         {
-            config.http2_initial_connection_window_size = parsed.max(65_535);
+            config.http2_initial_connection_window_size = parsed.clamp(65_535, 128 * 1024 * 1024);
         }
 
         if let Ok(val) = env::var("FERRUM_POOL_HTTP2_ADAPTIVE_WINDOW") {

@@ -98,7 +98,13 @@ impl AiRateLimiter {
         let token_limit = config["token_limit"].as_u64().ok_or_else(|| {
             "ai_rate_limiter: 'token_limit' is required (positive integer)".to_string()
         })?;
+        if token_limit == 0 {
+            return Err("ai_rate_limiter: 'token_limit' must be greater than zero".to_string());
+        }
         let window_seconds = config["window_seconds"].as_u64().unwrap_or(60);
+        if window_seconds == 0 {
+            return Err("ai_rate_limiter: 'window_seconds' must be greater than zero".to_string());
+        }
         let count_mode = config["count_mode"]
             .as_str()
             .unwrap_or("total_tokens")

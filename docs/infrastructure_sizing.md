@@ -275,8 +275,11 @@ These settings control the gateway's ability to handle high connection concurren
 |----------|---------|-------------|
 | `FERRUM_WORKER_THREADS` | CPU cores (auto-detected) | Tokio async worker threads |
 | `FERRUM_BLOCKING_THREADS` | `512` (tokio default) | Max threads for blocking operations |
+| `FERRUM_ACCEPT_THREADS` | `0` (auto-detect = CPU cores) | Parallel accept() loops per proxy listener port via SO_REUSEPORT |
 
 **`FERRUM_WORKER_THREADS`** — The number of OS threads running the async event loop. Auto-detected from available CPU cores, matching nginx's `worker_processes auto` behavior. You rarely need to change this — but if the gateway shares a machine with other CPU-intensive services, you may want to pin it lower to avoid contention.
+
+**`FERRUM_ACCEPT_THREADS`** — The number of parallel accept() loops per proxy listener port. Each loop binds its own socket to the same address via SO_REUSEPORT, giving the kernel separate accept queues to distribute SYN processing across. This is **orthogonal** to `FERRUM_WORKER_THREADS` — worker threads control the tokio runtime thread pool for all async work (request handling, plugin execution, backend calls), while accept threads specifically parallelize **connection intake** at the kernel level. Even with 32 worker threads, a single listener socket has one accept queue with one kernel-level socket lock. Under high connection rates (50K+ new connections/sec), that lock becomes the bottleneck. Multiple SO_REUSEPORT sockets eliminate it. The default of `0` auto-detects available CPU cores. Set to `1` to disable multi-listener. Only effective on Unix systems with SO_REUSEPORT support (Linux 3.9+, macOS, BSDs).
 
 **`FERRUM_BLOCKING_THREADS`** — The upper bound on threads for blocking I/O (file reads, DNS fallback, etc.). The proxy hot path is fully async, so these threads are rarely used. The tokio default of 512 is generous and safe to leave unchanged.
 

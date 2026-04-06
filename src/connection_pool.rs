@@ -107,23 +107,36 @@ impl ConnectionPool {
     /// lookups are served from the warmed cache — never hitting DNS on the
     /// hot request path.
     pub async fn get_client(&self, proxy: &Proxy) -> Result<reqwest::Client> {
-        // Get effective configuration (global defaults + proxy overrides)
-        let config = self.global_config.for_proxy(proxy);
-
-        let pool_key = self.create_pool_key(proxy);
-
-        // Try to get existing client from pool
-        if let Some(entry) = self.pools.get(&pool_key) {
-            // Update last used time (atomic, no lock needed)
-            entry
-                .last_used_epoch_ms
-                .store(now_epoch_ms(), Ordering::Relaxed);
-            return Ok(entry.client.clone());
+        // Write pool key into a thread-local buffer to avoid allocating a new
+        // String on every request. The buffer is cleared and reused across calls
+        // within the same tokio worker thread — only one `get_client` runs at a
+        // time per thread, so there's no aliasing concern.
+        thread_local! {
+            static KEY_BUF: std::cell::RefCell<String> = std::cell::RefCell::new(String::with_capacity(128));
         }
 
-        // Create new client with effective configuration.
-        // reqwest::Client has its own internal connection pool, so we only need
-        // one Client per unique pool key. Always cache it for reuse.
+        // Build the key in the thread-local buffer and do the DashMap lookup
+        // while still borrowing it, avoiding a String allocation on cache hits.
+        let cached = KEY_BUF.with(|buf| {
+            let mut buf = buf.borrow_mut();
+            self.write_pool_key(&mut buf, proxy);
+            if let Some(entry) = self.pools.get(&*buf) {
+                entry
+                    .last_used_epoch_ms
+                    .store(now_epoch_ms(), Ordering::Relaxed);
+                return Some(entry.client.clone());
+            }
+            None
+        });
+
+        if let Some(client) = cached {
+            return Ok(client);
+        }
+
+        // Cache miss — need to create a new client. Allocate the key String
+        // only on this cold path (first request per unique proxy config).
+        let config = self.global_config.for_proxy(proxy);
+        let pool_key = self.create_pool_key(proxy);
         let client = self.create_client(proxy, &config).await?;
 
         let entry = PoolEntry {
@@ -319,6 +332,18 @@ impl ConnectionPool {
     /// appear in IP addresses or port numbers) to prevent key collisions
     /// from fields containing `:` (e.g., IPv6 addresses, file paths).
     fn create_pool_key(&self, proxy: &Proxy) -> String {
+        let mut key = String::with_capacity(128);
+        self.write_pool_key(&mut key, proxy);
+        key
+    }
+
+    /// Write the pool key into the provided buffer, avoiding intermediate
+    /// `format!()` allocations on the hot path. Uses `write!()` which writes
+    /// directly into the String's existing capacity.
+    fn write_pool_key(&self, buf: &mut String, proxy: &Proxy) {
+        use std::fmt::Write;
+        buf.clear();
+
         // When the proxy uses an upstream for load balancing, key by upstream_id
         // instead of backend_host:port. The upstream defines the actual targets;
         // backend_host:port is ignored for routing. reqwest internally pools
@@ -327,41 +352,39 @@ impl ConnectionPool {
         //
         // Prefix with "u=" or "d=" to prevent namespace collisions (e.g., a
         // backend_host of "upstream" with port matching an upstream_id).
-        let destination = if let Some(ref upstream_id) = proxy.upstream_id {
-            format!("u={}", upstream_id)
+        if let Some(ref upstream_id) = proxy.upstream_id {
+            let _ = write!(buf, "u={}|", upstream_id);
         } else {
-            format!("d={}:{}", proxy.backend_host, proxy.backend_port)
-        };
-        // Include per-proxy CA cert path — proxies with different CAs need
-        // separate clients since add_root_certificate is set at build time.
-        let ca_str = proxy
-            .backend_tls_server_ca_cert_path
-            .as_deref()
-            .unwrap_or_default();
-        let override_str = proxy.dns_override.as_deref().unwrap_or_default();
-        // Include mTLS client cert path — proxies presenting different client
-        // identities need separate clients since reqwest::Identity is set at
-        // build time.
-        let mtls_cert = proxy
-            .backend_tls_client_cert_path
-            .as_deref()
-            .or(self
-                .global_mtls_config
+            let _ = write!(buf, "d={}:{}|", proxy.backend_host, proxy.backend_port);
+        }
+        let _ = write!(buf, "{}|", proxy.backend_protocol as u8);
+        // Include per-proxy DNS override, CA cert path, mTLS client cert path,
+        // and verify flag. These affect connection identity — see doc comment
+        // on create_pool_key for the full rationale.
+        buf.push_str(proxy.dns_override.as_deref().unwrap_or_default());
+        buf.push('|');
+        buf.push_str(
+            proxy
+                .backend_tls_server_ca_cert_path
+                .as_deref()
+                .unwrap_or_default(),
+        );
+        buf.push('|');
+        buf.push_str(
+            proxy
                 .backend_tls_client_cert_path
-                .as_deref())
-            .unwrap_or_default();
+                .as_deref()
+                .or(self
+                    .global_mtls_config
+                    .backend_tls_client_cert_path
+                    .as_deref())
+                .unwrap_or_default(),
+        );
+        buf.push('|');
         // Include verify flag — a proxy with verification disabled must not
         // share a client with one that requires verification.
         let verify = proxy.backend_tls_verify_server_cert && !self.global_mtls_config.tls_no_verify;
-        format!(
-            "{}|{}|{}|{}|{}|{}",
-            destination,
-            proxy.backend_protocol as u8,
-            override_str,
-            ca_str,
-            mtls_cert,
-            verify as u8,
-        )
+        buf.push(if verify { '1' } else { '0' });
     }
 
     /// Expose the pool key for warmup deduplication.

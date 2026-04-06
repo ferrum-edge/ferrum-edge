@@ -9,7 +9,7 @@ Ferrum Edge is a lightweight, extensible edge proxy designed for modern microser
 **Key highlights:**
 
 - **Multi-protocol**: HTTP/1.1, HTTP/2, HTTP/3 (QUIC), WebSocket, gRPC, raw TCP/UDP with TLS/DTLS
-- **48 built-in plugins**: Authentication, authorization, rate limiting, compression, SSE stream handling, transformation, response mocking, serverless functions, AI/LLM-specific plugins, and observability
+- **50 built-in plugins**: Authentication, authorization, rate limiting, compression, SSE stream handling, transformation, response mocking, serverless functions, AI/LLM-specific plugins, and observability
 - **Four operating modes**: Database, File, Control Plane, Data Plane
 - **Lock-free hot path**: All request-path reads use `ArcSwap` or `DashMap` — no mutexes on the proxy path
 - **Zero-downtime config reloads**: Atomic config swap via DB polling, SIGHUP, or CP push
@@ -155,6 +155,7 @@ Ferrum Edge is configured through environment variables, with an optional `ferru
 | `FERRUM_LOG_BUFFER_CAPACITY` | No | `128000` | Max buffered log lines in the non-blocking writer channel |
 | `FERRUM_PROXY_HTTP_PORT` | No | `8000` | HTTP proxy port |
 | `FERRUM_PROXY_HTTPS_PORT` | No | `8443` | HTTPS proxy port |
+| `FERRUM_ACCEPT_THREADS` | No | `0` (auto-detect) | Parallel accept loops via SO_REUSEPORT (0 = CPU cores) |
 | `FERRUM_ADMIN_HTTP_PORT` | No | `9000` | Admin API HTTP port |
 | `FERRUM_ADMIN_JWT_SECRET` | DB/CP | — | HS256 secret for Admin API |
 | `FERRUM_DB_TYPE` | DB/CP | — | `postgres`, `mysql`, `sqlite`, `mongodb` |
@@ -230,10 +231,10 @@ Plugins execute in a defined pipeline with priority ordering (lower = runs first
 | **Tracing** (25) | `otel_tracing` |
 | **Early** (50-275) | `correlation_id` (50), `cors` (100), `request_termination` (125), `ip_restriction` (150), `bot_detection` (200), `grpc_method_router` (275) |
 | **Authentication** (950-1500) | `mtls_auth` (950), `jwks_auth` (1000), `jwt_auth` (1100), `key_auth` (1200), `ldap_auth` (1250), `basic_auth` (1300), `hmac_auth` (1400), `soap_ws_security` (1500) |
-| **Admission** (2000-2999) | `access_control` (2000), `tcp_connection_throttle` (2050), `request_size_limiting` (2800), `ws_message_size_limiting` (2810), `graphql` (2850), `rate_limiting` (2900), `ws_rate_limiting` (2910), `udp_rate_limiting` (2910), `ai_prompt_shield` (2925), `body_validator` (2950), `ai_request_guard` (2975) |
+| **Admission** (2000-2999) | `access_control` (2000), `tcp_connection_throttle` (2050), `request_size_limiting` (2800), `ws_message_size_limiting` (2810), `graphql` (2850), `rate_limiting` (2900), `ws_rate_limiting` (2910), `udp_rate_limiting` (2915), `ai_prompt_shield` (2925), `body_validator` (2950), `ai_request_guard` (2975) |
 | **Transform** (3000-3999) | `request_transformer` (3000), `serverless_function` (3025), `grpc_deadline` (3050), `response_size_limiting` (3490), `response_caching` (3500) |
 | **Response** (4000-4999) | `response_transformer` (4000), `ai_token_metrics` (4100), `ai_rate_limiter` (4200) |
-| **Logging** (9000-9999) | `stdout_logging` (9000), `ws_frame_logging` (9050), `statsd_logging` (9075), `http_logging` (9100), `tcp_logging` (9125), `loki_logging` (9150), `udp_logging` (9150), `ws_logging` (9175), `transaction_debugger` (9200), `prometheus_metrics` (9300) |
+| **Logging** (9000-9999) | `stdout_logging` (9000), `ws_frame_logging` (9050), `statsd_logging` (9075), `http_logging` (9100), `tcp_logging` (9125), `loki_logging` (9155), `udp_logging` (9160), `ws_logging` (9175), `transaction_debugger` (9200), `prometheus_metrics` (9300) |
 
 Plugins are protocol-aware — the gateway automatically skips plugins that don't apply to the current protocol (e.g., CORS is never invoked on TCP streams).
 

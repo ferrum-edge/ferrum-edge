@@ -1,6 +1,6 @@
 # Connection Pooling
 
-Ferrum Edge includes enterprise-grade connection pooling that significantly improves performance by reusing HTTP/HTTPS/WebSocket connections.
+Ferrum Edge includes enterprise-grade connection pooling that significantly improves performance by reusing HTTP/HTTPS/WebSocket connections. Pool key generation uses thread-local `String` buffers so that cache hits (99%+ of requests) incur zero heap allocation — only the cold path (first request per unique proxy config) allocates for DashMap insertion.
 
 ## Hybrid Configuration
 

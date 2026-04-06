@@ -122,13 +122,9 @@ async fn test_rate_limiting_plugin_zero_limit() {
         "max_requests": 0,
         "limit_by": "ip"
     });
-    let plugin = RateLimiting::new(&config, PluginHttpClient::default()).unwrap();
-
-    let mut ctx = create_test_context();
-
-    // With zero limit, all requests should be rejected
-    let result = plugin.on_request_received(&mut ctx).await;
-    assert_reject(result, Some(429));
+    let result = RateLimiting::new(&config, PluginHttpClient::default());
+    assert!(result.is_err());
+    assert!(result.err().unwrap().contains("must be greater than zero"));
 }
 
 #[tokio::test]
@@ -438,16 +434,14 @@ async fn test_rate_limiting_high_tps_limit() {
 
 #[tokio::test]
 async fn test_rate_limiting_tps_zero_limit() {
-    // Zero TPS should reject everything
+    // Zero TPS should be rejected at construction time
     let config = json!({
         "requests_per_second": 0,
         "limit_by": "ip"
     });
-    let plugin = RateLimiting::new(&config, PluginHttpClient::default()).unwrap();
-
-    let mut ctx = create_test_context();
-    let result = plugin.on_request_received(&mut ctx).await;
-    assert_reject(result, Some(429));
+    let result = RateLimiting::new(&config, PluginHttpClient::default());
+    assert!(result.is_err());
+    assert!(result.err().unwrap().contains("must be greater than zero"));
 }
 
 #[tokio::test]

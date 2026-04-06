@@ -739,6 +739,10 @@ paths:
                 - ws_rate_limiting
                 - udp_rate_limiting
                 - udp_logging
+                - loki_logging
+                - ldap_auth
+                - serverless_function
+                - soap_ws_security
         "401":
           $ref: "#/components/responses/Unauthorized"
 

@@ -1,4 +1,4 @@
-//! Plugin system — 49 built-in plugins with a trait-based architecture.
+//! Plugin system — 50 built-in plugins with a trait-based architecture.
 //!
 //! Plugins execute in priority order (lower number = runs first) through
 //! lifecycle phases: `on_request_received` → `authenticate` → `authorize` →
@@ -553,7 +553,7 @@ pub struct StreamTransactionSummary {
 /// | AuthZ     | 2000–2999   | Authorization and admission control       | access_control (2000), tcp_connection_throttle (2050), request_size_limiting (2800), graphql (2850), rate_limiting (2900), ai_prompt_shield (2925), body_validator (2950), ai_request_guard (2975) |
 /// | Transform | 3000–3999   | Request shaping and response buffering    | request_transformer (3000), serverless_function (3025), response_mock (3030), grpc_deadline (3050), request_mirror (3075), response_size_limiting (3490), response_caching (3500) |
 /// | Response  | 4000–4999   | Response transformation and AI accounting | response_transformer (4000), ai_token_metrics (4100), ai_rate_limiter (4200) |
-/// | Logging   | 9000–9999   | Observability and frame logging           | stdout_logging (9000), ws_frame_logging (9050), statsd_logging (9075), http_logging (9100), kafka_logging (9150), loki_logging (9150), ws_logging (9175), transaction_debugger (9200), prometheus_metrics (9300) |
+/// | Logging   | 9000–9999   | Observability and frame logging           | stdout_logging (9000), ws_frame_logging (9050), statsd_logging (9075), http_logging (9100), tcp_logging (9125), kafka_logging (9150), loki_logging (9155), udp_logging (9160), ws_logging (9175), transaction_debugger (9200), prometheus_metrics (9300) |
 #[allow(dead_code)]
 pub mod priority {
     pub const OTEL_TRACING: u16 = 25;
@@ -597,15 +597,15 @@ pub mod priority {
     pub const HTTP_LOGGING: u16 = 9100;
     pub const TCP_LOGGING: u16 = 9125;
     pub const KAFKA_LOGGING: u16 = 9150;
-    pub const LOKI_LOGGING: u16 = 9150;
-    pub const UDP_LOGGING: u16 = 9150;
+    pub const LOKI_LOGGING: u16 = 9155;
+    pub const UDP_LOGGING: u16 = 9160;
     pub const TRANSACTION_DEBUGGER: u16 = 9200;
     pub const PROMETHEUS_METRICS: u16 = 9300;
     pub const WS_MESSAGE_SIZE_LIMITING: u16 = 2810;
     pub const WS_RATE_LIMITING: u16 = 2910;
     pub const WS_LOGGING: u16 = 9175;
     pub const WS_FRAME_LOGGING: u16 = 9050;
-    pub const UDP_RATE_LIMITING: u16 = 2910;
+    pub const UDP_RATE_LIMITING: u16 = 2915;
     /// Default priority for unknown/custom plugins — runs after transforms, before logging.
     pub const DEFAULT: u16 = 5000;
 }
@@ -1171,6 +1171,9 @@ pub fn available_plugins() -> Vec<&'static str> {
         "ws_rate_limiting",
         "udp_rate_limiting",
         "udp_logging",
+        "statsd_logging",
+        "loki_logging",
+        "sse",
         "request_mirror",
         "soap_ws_security",
     ];

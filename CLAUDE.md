@@ -4,7 +4,7 @@ This file provides context for Claude Code when working on the Ferrum Edge codeb
 
 ## Project Overview
 
-Ferrum Edge is a high-performance edge proxy built in Rust. It supports HTTP/1.1, HTTP/2, HTTP/3 (QUIC), WebSocket, gRPC, and raw TCP/UDP stream proxying with a plugin architecture (49 built-in plugins including 4 AI/LLM-specific plugins, 1 serverless function plugin, 1 response mock plugin, 1 compression plugin, 1 SSE stream handler plugin, 3 gRPC-specific plugins, 3 WebSocket frame-level plugins, 1 WebSocket logging plugin, 1 UDP datagram-level plugin, 1 Loki logging plugin, 1 UDP logging plugin, 1 Kafka logging plugin, and 1 SOAP WS-Security plugin), four operating modes, and load balancing with health checks.
+Ferrum Edge is a high-performance edge proxy built in Rust. It supports HTTP/1.1, HTTP/2, HTTP/3 (QUIC), WebSocket, gRPC, and raw TCP/UDP stream proxying with a plugin architecture (50 built-in plugins including 4 AI/LLM-specific plugins, 1 serverless function plugin, 1 response mock plugin, 1 compression plugin, 1 SSE stream handler plugin, 3 gRPC-specific plugins, 3 WebSocket frame-level plugins, 1 WebSocket logging plugin, 1 UDP datagram-level plugin, 1 Loki logging plugin, 1 UDP logging plugin, 1 Kafka logging plugin, and 1 SOAP WS-Security plugin), four operating modes, and load balancing with health checks.
 
 - **Language**: Rust (edition 2024)
 - **Async runtime**: tokio + hyper 1.0
@@ -76,9 +76,10 @@ All four jobs must pass for a PR to merge.
 ### Core Design Principles
 
 1. **Lock-free hot path**: All request-path reads use `ArcSwap::load()` or `DashMap` sharded locks. No `Mutex`/`RwLock` on the proxy path.
-2. **Pre-computed indexes**: RouterCache, PluginCache, ConsumerIndex, and LoadBalancerCache are rebuilt on config reload, not per-request.
-3. **Atomic config reload**: Config changes are loaded in background, validated, then swapped atomically via `ArcSwap`. Requests in-flight see old or new config — never partial.
-4. **Resilience**: If the config source (DB/file/gRPC) is unavailable, the gateway continues serving with cached config.
+2. **Zero-allocation hot path**: Connection pool keys use thread-local buffers (no `String` allocation on cache hits). Load balancer selections return `Arc<UpstreamTarget>` (pointer bump, not struct clone). Response header collection avoids allocating key strings for existing headers. Status code counters are pre-populated so the hot path uses DashMap read locks, not write locks.
+3. **Pre-computed indexes**: RouterCache, PluginCache, ConsumerIndex, and LoadBalancerCache are rebuilt on config reload, not per-request.
+4. **Atomic config reload**: Config changes are loaded in background, validated, then swapped atomically via `ArcSwap`. Requests in-flight see old or new config — never partial.
+5. **Resilience**: If the config source (DB/file/gRPC) is unavailable, the gateway continues serving with cached config.
 
 ### Startup Sequence
 
@@ -155,7 +156,7 @@ src/
 │   ├── tcp_proxy.rs           # Raw TCP stream proxy with TLS termination/origination/passthrough
 │   ├── udp_proxy.rs           # UDP datagram proxy with per-client session tracking, DTLS frontend/backend/passthrough
 │   └── stream_listener.rs     # Stream listener lifecycle manager (reconcile on config reload, port pre-bind check)
-├── plugins/                   # Plugin system (49 plugins, including 4 AI/LLM, 1 serverless, 1 response mock, 1 compression, 1 SSE, 3 gRPC, 3 WS frame, 1 WS logging, 1 UDP datagram, 1 Loki logging, 1 UDP logging, 1 Kafka logging, and 1 SOAP WS-Security plugin)
+├── plugins/                   # Plugin system (50 plugins, including 4 AI/LLM, 1 serverless, 1 response mock, 1 compression, 1 SSE, 3 gRPC, 3 WS frame, 1 WS logging, 1 UDP datagram, 1 Loki logging, 1 UDP logging, 1 Kafka logging, and 1 SOAP WS-Security plugin)
 │   ├── mod.rs                 # Plugin trait, registry, priority constants, lifecycle
 │   ├── [plugin_name].rs       # Individual plugin implementations
 │   └── utils/                 # Shared plugin infrastructure
@@ -164,11 +165,11 @@ src/
 ├── grpc/                      # CP/DP gRPC communication
 │   ├── cp_server.rs           # Control Plane gRPC server (ConfigSync service, broadcast channel)
 │   └── dp_client.rs           # Data Plane gRPC client (subscribe + exponential backoff reconnect)
-├── load_balancer.rs           # Load balancing algorithms + per-upstream cache
+├── load_balancer.rs           # Load balancing algorithms + per-upstream cache (Arc<UpstreamTarget> for zero-cost selection)
 ├── health_check.rs            # Active (HTTP/TCP/UDP probes) + passive health checking
 ├── circuit_breaker.rs         # Three-state circuit breaker (connection errors vs status code failures tracked independently via trip_on_connection_errors)
 ├── retry.rs                   # Retry logic with fixed/exponential backoff
-├── connection_pool.rs         # HTTP client connection pooling with mTLS
+├── connection_pool.rs         # HTTP client connection pooling with mTLS (thread-local pool keys for zero-alloc cache hits)
 ├── router_cache.rs            # Pre-sorted route table with host+path routing, LPM path cache, and full-path-anchored regex routes
 ├── plugin_cache.rs            # Plugin config cache (O(1) lookup by proxy_id)
 ├── consumer_index.rs          # Consumer lookup index (O(1) by credential type)
@@ -310,10 +311,10 @@ The lifecycle phases are:
 6. `after_proxy` — SSE response headers (250), Response size limiting (3490), response caching (3500), response transformer (4000), compression (4050), CORS headers (100). Rejects are now enforced on the response path across HTTP, HTTP/3, and gRPC
 7. `on_final_response_body` — Post-transform response body hooks. Response size limiting, response caching, and response-side body validator operate on the final client-visible body (after response_transformer), not the raw backend body
 8. `on_response_body` — AI token metrics (4100), AI rate limiter (4200)
-9. `log` — Stdout logging (9000), StatsD logging (9075), HTTP logging (9100), TCP logging (9125), Kafka logging (9150), Loki logging (9150), UDP logging (9150), WebSocket logging (9175), transaction debugger (9200, `tracing::debug` on `transaction_debug` target), Prometheus (9300), OTel tracing (25)
+9. `log` — Stdout logging (9000), StatsD logging (9075), HTTP logging (9100), TCP logging (9125), Kafka logging (9150), Loki logging (9155), UDP logging (9160), WebSocket logging (9175), transaction debugger (9200, `tracing::debug` on `transaction_debug` target), Prometheus (9300), OTel tracing (25)
 10. `on_ws_frame` — WebSocket frame-level hooks: ws_message_size_limiting (2810), ws_rate_limiting (2910), ws_frame_logging (9050)
 11. `on_stream_connect` / `on_stream_disconnect` — TCP/UDP stream lifecycle hooks for auth (mTLS), authz (ACL), throttling (tcp_connection_throttle), rate limiting, logging, metrics, and tracing plugins. For TCP+TLS proxies, `on_stream_connect` runs after the frontend TLS handshake so client cert data is available. For UDP+DTLS proxies, `on_stream_connect` runs after the DTLS handshake completes, with client certificate DER bytes available in `StreamConnectionContext` for mTLS authentication
-12. `on_udp_datagram` — Per-datagram UDP hooks fired in both directions (client→backend and backend→client). `UdpDatagramContext.direction` distinguishes the two. udp_rate_limiting (2910) uses this for datagram/byte rate limiting. Zero overhead when no plugin opts in via `requires_udp_datagram_hooks()`. Backend→client hooks run before each response datagram is relayed to the client, enabling response-side rate limiting and filtering
+12. `on_udp_datagram` — Per-datagram UDP hooks fired in both directions (client→backend and backend→client). `UdpDatagramContext.direction` distinguishes the two. udp_rate_limiting (2915) uses this for datagram/byte rate limiting. Zero overhead when no plugin opts in via `requires_udp_datagram_hooks()`. Backend→client hooks run before each response datagram is relayed to the client, enabling response-side rate limiting and filtering
 
 **Multi-auth**: `AuthMode::Multi` recognizes both `ctx.identified_consumer` (consumer-backed auth) and `ctx.authenticated_identity` (external JWKS/OIDC identity) as successful authentication. First-success-wins semantics apply.
 
@@ -466,7 +467,8 @@ These paths use the gateway's global TLS settings as defaults but cannot follow 
 - **No allocations per-request when avoidable** — use pre-computed indexes (RouterCache, PluginCache, ConsumerIndex) instead of filtering/searching at request time. Static headers like Alt-Svc are pre-computed in `ProxyState` at startup.
 - **No locks on the hot path** — use `ArcSwap::load()` for config reads, `DashMap` for concurrent maps. Never introduce `Mutex`/`RwLock` on the proxy path.
 - **Pre-compute at config reload time** — when config changes, rebuild indexes, hash rings, lookup tables, and plugin metadata flags (e.g., `requires_response_body_buffering`). The request path should only do lookups.
-- **Avoid `format!()` in hot loops** — pre-compute string keys at build time. Response headers like Alt-Svc are pre-formatted once, not per-request.
+- **Avoid `format!()` in hot loops** — pre-compute string keys at build time. Response headers like Alt-Svc are pre-formatted once, not per-request. Connection pool keys use `write!()` into thread-local `String` buffers to avoid heap allocation on cache hits.
+- **Use `Arc` for shared read-only data returned per-request** — `LoadBalancer` stores `Vec<Arc<UpstreamTarget>>` so that target selection returns a cheap `Arc::clone()` instead of cloning the full struct. Apply the same pattern when adding new data that is created at config-reload time and returned by reference on the hot path.
 - **Use streaming responses by default** — only buffer when a plugin explicitly requires it. The buffering requirement is pre-computed per-proxy in `PluginCache` for O(1) lookup at request time.
 - **Skip plugin phases when no plugins are configured** — guard plugin iteration loops with `plugins.is_empty()` to avoid iterator setup and async machinery overhead on the hot path.
 - **Always use the shared DNS cache for `reqwest::Client`** — every `reqwest::Client::builder()` call must include `.dns_resolver(Arc::new(DnsCacheResolver::new(dns_cache.clone())))`. This ensures all HTTP clients (connection pool, health probes, fallback clients, plugin HTTP clients) share the gateway's pre-warmed DNS cache with TTL, stale-while-revalidate, and background refresh. Never create a `reqwest::Client` that falls back to system DNS resolution in production code paths.
@@ -521,6 +523,10 @@ These are hard-won findings from profiling. Violating them causes measurable reg
 - **Skip clones on streaming path** — when `stream_response=true` (no retries possible), move `method`/`headers`/`body_bytes` instead of cloning. Body clone for a 10KB payload = 10KB allocation wasted.
 - **Conditional retry prep** — only build retry `HeaderMap` from `proxy_headers` when `proxy.retry.is_some()`. The common fast path (no retries) should do zero work. This was a +15% throughput fix for gRPC.
 - **Pre-allocate body `Vec` from `content-length`** — parse the header to size the buffer, avoiding repeated reallocations during frame/chunk collection.
+- **Thread-local pool key buffers** — connection pool key generation uses `thread_local!` `String` buffers reused across requests on the same tokio worker. The DashMap lookup happens while borrowing the buffer, so cache hits (99%+ of requests) allocate zero heap memory. Only the cold path (first request per unique proxy config) allocates a `String` for DashMap insertion. Applied to reqwest (`connection_pool.rs`) and HTTP/3 (`http3/client.rs`) pools.
+- **`Arc<UpstreamTarget>` in load balancer** — `LoadBalancer.targets` stores `Vec<Arc<UpstreamTarget>>` and `TargetSelection.target` is `Arc<UpstreamTarget>`. Every LB selection is a single atomic increment (~5ns) instead of cloning the full struct (String host + HashMap tags + Option path, ~200-500ns). All 7 selection algorithms (round-robin, WRR, least-connections, least-latency, consistent-hashing, random, fallback) return `Arc::clone()`.
+- **Response header `get_mut()` pattern** — `collect_response_headers()` and `collect_hyper_response_headers()` use `get_mut(k.as_str())` to check for existing headers before allocating the key `String`. For multi-valued headers (common with `set-cookie`), this avoids allocating a key that already exists in the map. The `set-cookie` vs comma separator is determined via zero-cost `HeaderName` comparison before any allocation.
+- **Pre-populated status code DashMap** — Common HTTP status codes (200, 201, 204, 301, 302, 304, 400, 401, 403, 404, 405, 408, 429, 500, 502, 503, 504) are inserted into `ProxyState.status_counts` at construction. The hot path uses `DashMap::get()` (shared read lock) for virtually all requests instead of `entry()` (write lock).
 
 **Protocol-specific gotchas:**
 - **Don't replace reqwest with H3 pool for HTTP/3 frontend→backend**: Tested and reverted. QUIC has higher per-request overhead than TCP/H2 for small payloads (~10x regression). reqwest's HTTP/2 pooling is highly optimized and auto-negotiates the best protocol via ALPN.
@@ -744,6 +750,7 @@ Reduce per-request allocations in plugin lookup
 | `FERRUM_BLOCKING_THREADS` | `512` | Tokio max blocking threads |
 | `FERRUM_MAX_CONNECTIONS` | `100000` | Max concurrent proxy connections (semaphore-bounded; 0 = unlimited) |
 | `FERRUM_TCP_LISTEN_BACKLOG` | `2048` | TCP listen backlog size (min 128) |
+| `FERRUM_ACCEPT_THREADS` | `0` (auto-detect) | Parallel accept() loops per proxy listener port via SO_REUSEPORT. `0` = CPU cores. `1` = single listener. Parallelizes kernel-level connection intake independently of `FERRUM_WORKER_THREADS` |
 | `FERRUM_SERVER_HTTP2_MAX_CONCURRENT_STREAMS` | `1000` | Server-side HTTP/2 max concurrent streams per inbound connection |
 | `FERRUM_SERVER_HTTP2_MAX_PENDING_ACCEPT_RESET_STREAMS` | `64` | Server-side HTTP/2 pending reset-stream threshold before GOAWAY |
 | `FERRUM_SERVER_HTTP2_MAX_LOCAL_ERROR_RESET_STREAMS` | `256` | Server-side HTTP/2 local reset-stream threshold before GOAWAY |

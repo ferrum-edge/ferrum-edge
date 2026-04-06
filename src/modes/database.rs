@@ -683,7 +683,7 @@ pub async fn run(
                                 let added_upstream_ids: Vec<String> = result.added_or_modified_upstreams.iter().map(|u| u.id.clone()).collect();
                                 let removed_upstream_ids = result.removed_upstream_ids.clone();
 
-                                if proxy_state_poll.apply_incremental(result) {
+                                if proxy_state_poll.apply_incremental(result).await {
                                     // Update known IDs only after successful apply to keep them
                                     // in sync with actual proxy state. If apply is rejected
                                     // (e.g. security plugin validation), known_ids stay unchanged
