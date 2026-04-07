@@ -56,8 +56,8 @@ After all 10 batches, a summary table is printed comparing RPS and latency perce
 ## How to Run
 
 ```bash
-# Build the gateway binary first
-cargo build
+# Build the gateway binary first (release mode required for meaningful perf numbers)
+cargo build --release
 
 # SQLite variant (no external dependencies)
 cargo test --test functional_tests test_scale_perf_30k_proxies \
@@ -112,26 +112,26 @@ The test uses the `POST /batch` endpoint introduced to improve admin write throu
 
 (Numbers above are from a real run -- actual results depend on hardware.)
 
-## Baseline Results (SQLite, debug build, Apple Silicon)
+## Baseline Results (SQLite, release build, Apple Silicon)
 
-Results from a real run on a MacBook (2026-03-30), showing proxy hot-path performance as config scales from 3k to 30k. The echo backend uses hyper with HTTP/1.1 keep-alive, and the test runtime uses `multi_thread` flavor for realistic async throughput.
+Results from a real run on a MacBook, showing proxy hot-path performance as config scales from 3k to 30k. Always use `cargo build --release` for meaningful performance numbers — debug builds have significant overhead from disabled optimizations and extra bounds checking. The echo backend uses hyper with HTTP/1.1 keep-alive, and the test runtime uses `multi_thread` flavor for realistic async throughput.
 
 | Proxies | RPS | Avg(ms) | P50(ms) | P95(ms) | P99(ms) | Max(ms) | % Baseline |
 |---------|------|---------|---------|---------|---------|---------|------------|
-| 3,000 | 21,490 | 2.3 | 2.0 | 3.9 | 6.4 | 143.0 | 100% |
-| 6,000 | 22,458 | 2.2 | 2.0 | 3.6 | 5.1 | 94.1 | 105% |
-| 9,000 | 22,713 | 2.2 | 2.0 | 3.6 | 6.1 | 101.5 | 106% |
-| 12,000 | 20,966 | 2.4 | 2.2 | 3.7 | 5.5 | 81.9 | 98% |
-| 15,000 | 17,262 | 2.9 | 2.6 | 4.8 | 8.1 | 247.7 | 80% |
-| 18,000 | 17,690 | 2.8 | 2.6 | 4.6 | 6.8 | 99.3 | 82% |
-| 21,000 | 16,722 | 3.0 | 2.8 | 4.8 | 6.5 | 90.8 | 78% |
-| 24,000 | 15,396 | 3.2 | 3.0 | 5.3 | 7.2 | 97.5 | 72% |
-| 27,000 | 13,127 | 3.8 | 3.5 | 6.3 | 8.6 | 102.5 | 61% |
-| 30,000 | 13,715 | 3.6 | 3.4 | 6.1 | 8.0 | 98.3 | 64% |
+| 3,000 | 49,236 | 1.0 | 1.0 | 1.5 | 2.0 | 24.9 | 100% |
+| 6,000 | 48,788 | 1.0 | 1.0 | 1.5 | 2.1 | 85.0 | 99% |
+| 9,000 | 48,892 | 1.0 | 1.0 | 1.5 | 2.1 | 16.6 | 99% |
+| 12,000 | 48,448 | 1.0 | 1.0 | 1.5 | 2.1 | 24.0 | 98% |
+| 15,000 | 47,562 | 1.0 | 1.0 | 1.6 | 2.3 | 34.0 | 97% |
+| 18,000 | 47,324 | 1.0 | 1.0 | 1.6 | 2.2 | 52.0 | 96% |
+| 21,000 | 46,656 | 1.1 | 1.0 | 1.6 | 2.3 | 32.0 | 95% |
+| 24,000 | 45,612 | 1.1 | 1.0 | 1.7 | 2.4 | 25.6 | 93% |
+| 27,000 | 44,363 | 1.1 | 1.0 | 1.7 | 2.5 | 26.2 | 90% |
+| 30,000 | 42,434 | 1.2 | 1.1 | 1.9 | 2.8 | 113.2 | 86% |
 
-**36.2% throughput degradation** from 3k to 30k proxies, 100% success rate, zero failures. ~21k RPS baseline with 2ms P50 latency on a debug build.
+**13.8% throughput degradation** from 3k to 30k proxies, 100% success rate, zero failures. ~49k RPS baseline with 1.0ms P50 latency on a release build.
 
-Batch API creation speed: ~3,000-5,300 resources/s (vs ~5-116/s with individual API calls).
+Batch API creation speed: ~3,200-3,900 resources/s (vs ~5-116/s with individual API calls).
 
 ## Interpreting Results
 

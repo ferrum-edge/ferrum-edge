@@ -89,16 +89,21 @@ impl ScalePerfHarness {
         // Start echo backend
         start_echo_backend(backend_port).await?;
 
-        // Build gateway
-        let build_status = Command::new("cargo").args(["build"]).status()?;
+        // Build gateway (release mode for meaningful perf numbers)
+        let build_status = Command::new("cargo")
+            .args(["build", "--release"])
+            .status()?;
         if !build_status.success() {
             return Err("Failed to build ferrum-edge".into());
         }
 
-        let binary_path = if std::path::Path::new("./target/debug/ferrum-edge").exists() {
+        let binary_path = if std::path::Path::new("./target/release/ferrum-edge").exists() {
+            "./target/release/ferrum-edge"
+        } else if std::path::Path::new("./target/debug/ferrum-edge").exists() {
+            eprintln!("WARNING: Using debug build — performance numbers will not be meaningful. Run `cargo build --release` first.");
             "./target/debug/ferrum-edge"
         } else {
-            "./target/release/ferrum-edge"
+            return Err("ferrum-edge binary not found. Run `cargo build --release` first.".into());
         };
 
         // Run migrations first for postgres
