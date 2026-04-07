@@ -32,7 +32,7 @@ RUN touch src/main.rs && cargo build --release
 FROM debian:bookworm-slim
 
 # Install runtime dependencies
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     libssl3 \
     curl \
@@ -67,8 +67,7 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
 # Add labels
 LABEL org.opencontainers.image.title="Ferrum Edge" \
       org.opencontainers.image.description="High-performance edge proxy built in Rust" \
-      org.opencontainers.image.version="0.1.0" \
-      org.opencontainers.image.source="https://github.com/your-org/ferrum-edge"
+      org.opencontainers.image.source="https://github.com/ferrum-edge/ferrum-edge"
 
 # Run the gateway
 ENTRYPOINT ["/app/ferrum-edge"]

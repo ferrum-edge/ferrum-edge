@@ -333,122 +333,304 @@ jobs:
             echo "Performance tests did not produce results." >> $GITHUB_STEP_SUMMARY
           fi
 
-  # TODO: Enable build-release and docker-build jobs when the project is mature
-  # build-release:
-  #   name: Build Release
-  #   needs: [test, lint]
-  #   if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-  #   runs-on: ${{ matrix.os }}
-  #   strategy:
-  #     matrix:
-  #       include:
-  #         - os: ubuntu-latest
-  #           target: x86_64-unknown-linux-gnu
-  #           artifact_name: ferrum-edge
-  #           asset_name: ferrum-edge-linux-x86_64
-  #
-  #         - os: macos-latest
-  #           target: x86_64-apple-darwin
-  #           artifact_name: ferrum-edge
-  #           asset_name: ferrum-edge-macos-x86_64
-  #
-  #         - os: macos-latest
-  #           target: aarch64-apple-darwin
-  #           artifact_name: ferrum-edge
-  #           asset_name: ferrum-edge-macos-aarch64
-  #
-  #   steps:
-  #     - uses: actions/checkout@v6
-  #
-  #     - name: Install Rust
-  #       uses: dtolnay/rust-toolchain@stable
-  #       with:
-  #         toolchain: stable
-  #         targets: ${{ matrix.target }}
-  #
-  #     - name: Install protoc (Ubuntu)
-  #       if: runner.os == 'Linux'
-  #       run: |
-  #         sudo apt-get update
-  #         sudo apt-get install -y protobuf-compiler
-  #
-  #     - name: Install protoc (macOS)
-  #       if: runner.os == 'macOS'
-  #       run: brew install protobuf
-  #
-  #     - name: Cache cargo registry
-  #       uses: actions/cache@v5
-  #       with:
-  #         path: ~/.cargo/registry
-  #         key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
-  #
-  #     - name: Cache cargo build
-  #       uses: actions/cache@v5
-  #       with:
-  #         path: target
-  #         key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
-  #
-  #     - name: Build release binary
-  #       run: cargo build --release --target ${{ matrix.target }}
-  #
-  #     - name: Create asset directory
-  #       run: mkdir -p release-assets
-  #
-  #     - name: Copy binary to release assets
-  #       if: runner.os != 'macOS'
-  #       run: cp target/${{ matrix.target }}/release/${{ matrix.artifact_name }} release-assets/${{ matrix.asset_name }}
-  #
-  #     - name: Copy binary to release assets (macOS)
-  #       if: runner.os == 'macOS'
-  #       run: cp target/${{ matrix.target }}/release/${{ matrix.artifact_name }} release-assets/${{ matrix.asset_name }}
-  #
-  #     - name: Upload release artifacts
-  #       uses: actions/upload-artifact@v7
-  #       with:
-  #         name: ${{ matrix.asset_name }}
-  #         path: release-assets/${{ matrix.asset_name }}
-  #
-  # docker-build:
-  #   name: Build and Push Docker Image
-  #   needs: [test, lint]
-  #   runs-on: ubuntu-latest
-  #   if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-  #   env:
-  #     HAS_DOCKER_CREDS: ${{ secrets.DOCKER_USERNAME != '' && secrets.DOCKER_PASSWORD != '' }}
-  #   steps:
-  #     - uses: actions/checkout@v6
-  #
-  #     - name: Set up Docker Buildx
-  #       uses: docker/setup-buildx-action@v2
-  #
-  #     - name: Log in to Docker Hub
-  #       if: env.HAS_DOCKER_CREDS == 'true'
-  #       uses: docker/login-action@v2
-  #       with:
-  #         username: ${{ secrets.DOCKER_USERNAME }}
-  #         password: ${{ secrets.DOCKER_PASSWORD }}
-  #
-  #     - name: Build and push Docker image
-  #       if: env.HAS_DOCKER_CREDS == 'true'
-  #       uses: docker/build-push-action@v4
-  #       with:
-  #         context: .
-  #         push: true
-  #         tags: |
-  #           ${{ secrets.DOCKER_USERNAME }}/ferrum-edge:latest
-  #           ${{ secrets.DOCKER_USERNAME }}/ferrum-edge:${{ github.sha }}
-  #         cache-from: type=gha
-  #         cache-to: type=gha,mode=max
-  #
-  #     - name: Build Docker image (no push)
-  #       if: env.HAS_DOCKER_CREDS != 'true'
-  #       uses: docker/build-push-action@v4
-  #       with:
-  #         context: .
-  #         push: false
-  #         tags: ferrum-edge:latest
-  #         cache-from: type=gha
-  #         cache-to: type=gha,mode=max
+  # ── Build & Release (main branch only) ──────────────────────────────────
+
+  build-binaries:
+    name: Build (${{ matrix.asset_name }})
+    needs: [test, lint]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact_name: ferrum-edge
+            asset_name: ferrum-edge-linux-x86_64
+
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            artifact_name: ferrum-edge
+            asset_name: ferrum-edge-linux-aarch64
+
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            artifact_name: ferrum-edge
+            asset_name: ferrum-edge-macos-x86_64
+
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact_name: ferrum-edge
+            asset_name: ferrum-edge-macos-aarch64
+
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact_name: ferrum-edge.exe
+            asset_name: ferrum-edge-windows-x86_64.exe
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+        continue-on-error: true
+
+      - name: Configure sccache
+        shell: bash
+        run: |
+          if command -v sccache &> /dev/null && sccache --start-server 2>/dev/null; then
+            echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
+            echo "SCCACHE_GHA_ENABLED=true" >> $GITHUB_ENV
+          fi
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "build-${{ matrix.target }}"
+
+      - name: Install protoc (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - name: Install protoc (macOS)
+        if: runner.os == 'macOS'
+        run: brew install protobuf
+
+      - name: Install protoc and NASM (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install protoc nasm -y
+          echo "C:\Program Files\NASM" | Out-File -Append -FilePath $env:GITHUB_PATH -Encoding utf8
+
+      - name: Install cross (Linux ARM64)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: cargo install cross
+
+      - name: Build release binary (cross)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: cross build --release --target ${{ matrix.target }}
+        env:
+          RUSTC_WRAPPER: ""
+
+      - name: Build release binary (cargo)
+        if: matrix.target != 'aarch64-unknown-linux-gnu'
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Prepare release assets
+        shell: bash
+        run: |
+          mkdir -p release-assets
+          cp "target/${{ matrix.target }}/release/${{ matrix.artifact_name }}" "release-assets/${{ matrix.asset_name }}"
+          cd release-assets
+          if command -v sha256sum &> /dev/null; then
+            sha256sum "${{ matrix.asset_name }}" > "${{ matrix.asset_name }}.sha256"
+          else
+            shasum -a 256 "${{ matrix.asset_name }}" > "${{ matrix.asset_name }}.sha256"
+          fi
+          cat "${{ matrix.asset_name }}.sha256"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: binary-${{ matrix.target }}
+          path: release-assets/
+
+  latest-release:
+    name: Update Latest Release
+    needs: build-binaries
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Download all binary artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: downloaded-artifacts
+          pattern: binary-*
+
+      - name: Prepare release assets
+        run: |
+          mkdir -p release-assets
+          find downloaded-artifacts -type f -exec cp {} release-assets/ \;
+          echo "Release assets:"
+          ls -la release-assets/
+
+      - name: Create or update latest release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Delete existing latest release and tag
+          gh release delete latest --yes --cleanup-tag 2>/dev/null || true
+
+          # Build release notes
+          cat > notes.md << 'NOTES'
+          ## Latest Development Build
+
+          Auto-built from the latest commit on `main` (${{ github.sha }}).
+
+          For stable releases, download a versioned tag (e.g., `v1.0.0`).
+
+          ### Binaries
+
+          | Platform | Binary |
+          |----------|--------|
+          | Linux x86_64 | `ferrum-edge-linux-x86_64` |
+          | Linux ARM64 | `ferrum-edge-linux-aarch64` |
+          | macOS x86_64 | `ferrum-edge-macos-x86_64` |
+          | macOS ARM64 (Apple Silicon) | `ferrum-edge-macos-aarch64` |
+          | Windows x86_64 | `ferrum-edge-windows-x86_64.exe` |
+
+          ### Docker
+
+          ```bash
+          docker pull ferrumedge/ferrum-edge:latest
+          docker pull ghcr.io/ferrum-edge/ferrum-edge:latest
+          ```
+
+          ### Checksums
+
+          ```
+          NOTES
+          cat release-assets/*.sha256 >> notes.md
+          echo '```' >> notes.md
+
+          # Create the release
+          gh release create latest \
+            --title "Latest Build ($(date -u +%Y-%m-%d))" \
+            --notes-file notes.md \
+            --prerelease \
+            --target "${{ github.sha }}" \
+            release-assets/*
+
+  docker:
+    name: Docker (${{ matrix.platform }})
+    needs: build-binaries
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            binary_target: x86_64-unknown-linux-gnu
+            binary_asset: ferrum-edge-linux-x86_64
+            arch_dir: amd64
+          - platform: linux/arm64
+            binary_target: aarch64-unknown-linux-gnu
+            binary_asset: ferrum-edge-linux-aarch64
+            arch_dir: arm64
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Download Linux binary
+        uses: actions/download-artifact@v8
+        with:
+          name: binary-${{ matrix.binary_target }}
+          path: downloaded-artifacts
+
+      - name: Prepare Docker context
+        run: |
+          mkdir -p docker-context/bin/${{ matrix.arch_dir }}
+          cp downloaded-artifacts/${{ matrix.binary_asset }} docker-context/bin/${{ matrix.arch_dir }}/ferrum-edge
+          cp Dockerfile.release docker-context/Dockerfile
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push per-platform digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: docker-context
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,"name=ferrumedge/ferrum-edge,ghcr.io/${{ github.repository }}",push-by-digest=true,name-canonical=true,push=true
+
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v7
+        with:
+          name: docker-digest-${{ matrix.arch_dir }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+
+  docker-manifest:
+    name: Docker Manifest
+    needs: docker
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v8
+        with:
+          path: /tmp/digests
+          pattern: docker-digest-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Create and push multi-arch manifest (Docker Hub)
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create \
+            -t ferrumedge/ferrum-edge:latest \
+            -t ferrumedge/ferrum-edge:main-${{ github.sha }} \
+            $(printf 'ferrumedge/ferrum-edge@sha256:%s ' *)
+
+      - name: Create and push multi-arch manifest (GHCR)
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create \
+            -t ghcr.io/${{ github.repository }}:latest \
+            -t ghcr.io/${{ github.repository }}:main-${{ github.sha }} \
+            $(printf 'ghcr.io/${{ github.repository }}@sha256:%s ' *)
 
   cleanup-merged-branch:
     name: Cleanup Merged PR Branch
@@ -463,29 +645,29 @@ jobs:
           # Extract PR number from merge commit message (e.g., "Merge pull request #123 from owner/branch")
           COMMIT_MSG="${{ github.event.head_commit.message }}"
           PR_NUMBER=$(echo "$COMMIT_MSG" | grep -oP 'Merge pull request #\K[0-9]+' || true)
-          
+
           if [[ -z "$PR_NUMBER" ]]; then
             echo "Not a PR merge commit, skipping branch cleanup"
             exit 0
           fi
-          
+
           echo "Found PR #$PR_NUMBER, fetching branch info..."
-          
+
           # Get the branch name from the PR
           BRANCH_NAME=$(gh pr view "$PR_NUMBER" --json headRefName -q '.headRefName' 2>/dev/null || true)
-          
+
           if [[ -z "$BRANCH_NAME" ]]; then
             echo "Could not determine branch name for PR #$PR_NUMBER"
             exit 0
           fi
-          
+
           # Skip protected branches
           if [[ "$BRANCH_NAME" == "main" ]] || [[ "$BRANCH_NAME" == "master" ]] || [[ "$BRANCH_NAME" == "develop" ]] || [[ "$BRANCH_NAME" == release/* ]]; then
             echo " Skipping protected branch: $BRANCH_NAME"
             exit 0
           fi
-          
+
           echo " Deleting merged branch: $BRANCH_NAME"
           gh api repos/${{ github.repository }}/git/refs/heads/$BRANCH_NAME -X DELETE || echo "Branch already deleted or not found"
-          
+
           echo " Branch cleanup complete"

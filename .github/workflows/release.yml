@@ -10,9 +10,10 @@ env:
 
 jobs:
   build-release-binaries:
-    name: Build Release Binaries
+    name: Build (${{ matrix.asset_name }})
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
@@ -35,6 +36,11 @@ jobs:
             artifact_name: ferrum-edge
             asset_name: ferrum-edge-macos-aarch64
 
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact_name: ferrum-edge.exe
+            asset_name: ferrum-edge-windows-x86_64.exe
+
     steps:
       - uses: actions/checkout@v6
 
@@ -49,13 +55,11 @@ jobs:
         continue-on-error: true
 
       - name: Configure sccache
+        shell: bash
         run: |
           if command -v sccache &> /dev/null && sccache --start-server 2>/dev/null; then
             echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
             echo "SCCACHE_GHA_ENABLED=true" >> $GITHUB_ENV
-            echo "sccache enabled"
-          else
-            echo "sccache unavailable, building without cache"
           fi
 
       - name: Cache Rust dependencies
@@ -63,7 +67,7 @@ jobs:
         with:
           shared-key: "release-${{ matrix.target }}"
 
-      - name: Install protoc (Ubuntu)
+      - name: Install protoc (Linux)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
@@ -73,6 +77,13 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install protobuf
 
+      - name: Install protoc and NASM (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install protoc nasm -y
+          echo "C:\Program Files\NASM" | Out-File -Append -FilePath $env:GITHUB_PATH -Encoding utf8
+
       - name: Install cross (for Linux ARM)
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: cargo install cross
@@ -81,7 +92,6 @@ jobs:
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: cross build --release --target ${{ matrix.target }}
         env:
-          # cross manages its own container, sccache doesn't work inside it
           RUSTC_WRAPPER: ""
 
       - name: Build release binary (cargo)
@@ -89,16 +99,23 @@ jobs:
         run: cargo build --release --target ${{ matrix.target }}
 
       - name: Create release assets directory
+        shell: bash
         run: mkdir -p release-assets
 
       - name: Copy binary
-        run: cp target/${{ matrix.target }}/release/${{ matrix.artifact_name }} release-assets/${{ matrix.asset_name }}
+        shell: bash
+        run: cp "target/${{ matrix.target }}/release/${{ matrix.artifact_name }}" "release-assets/${{ matrix.asset_name }}"
 
       - name: Generate SHA256 checksum
+        shell: bash
         run: |
           cd release-assets
-          sha256sum ${{ matrix.asset_name }} > ${{ matrix.asset_name }}.sha256
-          cat ${{ matrix.asset_name }}.sha256
+          if command -v sha256sum &> /dev/null; then
+            sha256sum "${{ matrix.asset_name }}" > "${{ matrix.asset_name }}.sha256"
+          else
+            shasum -a 256 "${{ matrix.asset_name }}" > "${{ matrix.asset_name }}.sha256"
+          fi
+          cat "${{ matrix.asset_name }}.sha256"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v7
@@ -110,6 +127,8 @@ jobs:
     name: Create GitHub Release
     needs: build-release-binaries
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v6
 
@@ -117,6 +136,7 @@ jobs:
         uses: actions/download-artifact@v8
         with:
           path: downloaded-artifacts
+          pattern: release-binaries-*
 
       - name: Prepare release assets
         run: |
@@ -131,42 +151,51 @@ jobs:
           TAG_NAME="${TAG#refs/tags/}"
           echo "TAG_NAME=$TAG_NAME" >> $GITHUB_OUTPUT
 
-          # Create release notes with checksums
-          cat > RELEASE_NOTES.md << EOF
+          cat > RELEASE_NOTES.md << NOTES
           # Release $TAG_NAME
 
           ## Binaries
 
-          This release includes pre-built binaries for multiple platforms:
+          Pre-built binaries for all supported platforms:
 
-          - \`ferrum-edge-linux-x86_64\` - Linux x86_64
-          - \`ferrum-edge-linux-aarch64\` - Linux ARM64
-          - \`ferrum-edge-macos-x86_64\` - macOS x86_64
-          - \`ferrum-edge-macos-aarch64\` - macOS ARM64 (Apple Silicon)
+          | Platform | Binary |
+          |----------|--------|
+          | Linux x86_64 | \`ferrum-edge-linux-x86_64\` |
+          | Linux ARM64 | \`ferrum-edge-linux-aarch64\` |
+          | macOS x86_64 | \`ferrum-edge-macos-x86_64\` |
+          | macOS ARM64 (Apple Silicon) | \`ferrum-edge-macos-aarch64\` |
+          | Windows x86_64 | \`ferrum-edge-windows-x86_64.exe\` |
+
+          ## Docker
+
+          \`\`\`bash
+          docker pull ferrumedge/ferrum-edge:$TAG_NAME
+          docker pull ghcr.io/ferrum-edge/ferrum-edge:$TAG_NAME
+          \`\`\`
 
           ## Checksums
 
-          Verify the integrity of downloaded binaries using SHA256 checksums:
+          Verify the integrity of downloaded binaries:
 
           \`\`\`
-          EOF
+          NOTES
 
           cat release-assets/*.sha256 >> RELEASE_NOTES.md
 
-          cat >> RELEASE_NOTES.md << EOF
-          \`\`\`
+          cat >> RELEASE_NOTES.md << 'NOTES'
+          ```
 
           ## Usage
 
-          Download the appropriate binary for your platform and make it executable:
+          Download the binary for your platform and make it executable:
 
-          \`\`\`bash
+          ```bash
           chmod +x ferrum-edge-linux-x86_64
-          ./ferrum-edge-linux-x86_64
-          \`\`\`
+          FERRUM_MODE=file FERRUM_FILE_CONFIG_PATH=config.yaml ./ferrum-edge-linux-x86_64
+          ```
 
-          See [README.md](../README.md) for configuration and usage instructions.
-          EOF
+          See [README.md](https://github.com/ferrum-edge/ferrum-edge/blob/main/README.md) for configuration and usage instructions.
+          NOTES
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
@@ -178,3 +207,134 @@ jobs:
           prerelease: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  docker:
+    name: Docker (${{ matrix.platform }})
+    needs: build-release-binaries
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            binary_target: x86_64-unknown-linux-gnu
+            binary_asset: ferrum-edge-linux-x86_64
+            arch_dir: amd64
+          - platform: linux/arm64
+            binary_target: aarch64-unknown-linux-gnu
+            binary_asset: ferrum-edge-linux-aarch64
+            arch_dir: arm64
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Download Linux binary
+        uses: actions/download-artifact@v8
+        with:
+          name: release-binaries-${{ matrix.binary_target }}
+          path: downloaded-artifacts
+
+      - name: Prepare Docker context
+        run: |
+          mkdir -p docker-context/bin/${{ matrix.arch_dir }}
+          cp downloaded-artifacts/${{ matrix.binary_asset }} docker-context/bin/${{ matrix.arch_dir }}/ferrum-edge
+          cp Dockerfile.release docker-context/Dockerfile
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push per-platform digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: docker-context
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,"name=ferrumedge/ferrum-edge,ghcr.io/${{ github.repository }}",push-by-digest=true,name-canonical=true,push=true
+
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v7
+        with:
+          name: docker-digest-${{ matrix.arch_dir }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+
+  docker-manifest:
+    name: Docker Manifest
+    needs: docker
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Extract version tag
+        id: version
+        run: |
+          TAG="${{ github.ref }}"
+          TAG_NAME="${TAG#refs/tags/}"
+          VERSION="${TAG_NAME#v}"
+          MAJOR_MINOR="${VERSION%.*}"
+          echo "TAG_NAME=$TAG_NAME" >> $GITHUB_OUTPUT
+          echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
+          echo "MAJOR_MINOR=$MAJOR_MINOR" >> $GITHUB_OUTPUT
+
+      - name: Download digests
+        uses: actions/download-artifact@v8
+        with:
+          path: /tmp/digests
+          pattern: docker-digest-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Create and push multi-arch manifest (Docker Hub)
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create \
+            -t ferrumedge/ferrum-edge:${{ steps.version.outputs.TAG_NAME }} \
+            -t ferrumedge/ferrum-edge:${{ steps.version.outputs.VERSION }} \
+            -t ferrumedge/ferrum-edge:${{ steps.version.outputs.MAJOR_MINOR }} \
+            $(printf 'ferrumedge/ferrum-edge@sha256:%s ' *)
+
+      - name: Create and push multi-arch manifest (GHCR)
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create \
+            -t ghcr.io/${{ github.repository }}:${{ steps.version.outputs.TAG_NAME }} \
+            -t ghcr.io/${{ github.repository }}:${{ steps.version.outputs.VERSION }} \
+            -t ghcr.io/${{ github.repository }}:${{ steps.version.outputs.MAJOR_MINOR }} \
+            $(printf 'ghcr.io/${{ github.repository }}@sha256:%s ' *)

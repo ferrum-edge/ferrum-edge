@@ -61,6 +61,29 @@ The CI workflow (`.github/workflows/ci.yml`) runs on push to `main` and PRs targ
 
 All four jobs must pass for a PR to merge.
 
+On push to `main` only (after tests + lint pass), additional jobs run:
+
+5. **Build Binaries** — release builds for 5 targets: Linux x86_64, Linux ARM64 (via `cross`), macOS x86_64, macOS ARM64, Windows x86_64
+6. **Latest Release** — overwrites a `latest` prerelease GitHub Release with all binaries and SHA256 checksums
+7. **Docker** — builds per-platform images from pre-built binaries using `Dockerfile.release`, then creates a multi-arch manifest (linux/amd64 + linux/arm64) pushed to both Docker Hub (`ferrumedge/ferrum-edge:latest`) and GHCR (`ghcr.io/ferrum-edge/ferrum-edge:latest`)
+
+### Release Pipeline (GitHub Actions)
+
+The release workflow (`.github/workflows/release.yml`) runs on tag pushes matching `v*` (e.g., `v0.9.0`):
+
+1. **Build Release Binaries** — same 5 targets as CI
+2. **Create GitHub Release** — versioned, non-prerelease GitHub Release with binaries and checksums
+3. **Docker** — multi-arch Docker images tagged with version variants (`v0.9.0`, `0.9.0`, `0.9`) pushed to Docker Hub and GHCR
+
+### Required GitHub Actions Secrets
+
+| Secret | Purpose |
+|--------|---------|
+| `DOCKERHUB_USERNAME` | Docker Hub username (e.g., `ferrumedge`) |
+| `DOCKERHUB_TOKEN` | Docker Hub access token (Account Settings > Security > Access Tokens, Read & Write) |
+
+GHCR uses the built-in `GITHUB_TOKEN` — no additional secret needed. Ensure repo **Settings > Actions > General > Workflow permissions** is set to **Read and write permissions**.
+
 ## Architecture
 
 ### Operating Modes (`FERRUM_MODE` env var)
@@ -806,10 +829,13 @@ See `src/config/env_config.rs` for the full list of 90+ environment variables.
 
 ## Docker
 
-- **Dockerfile**: Multi-stage build (rust:latest builder + debian:bookworm-slim runtime)
+- **Dockerfile**: Multi-stage build (rust:latest builder + debian:bookworm-slim runtime) — for local `docker build .`
+- **Dockerfile.release**: Minimal runtime image using pre-built binaries with `TARGETARCH` for multi-arch CI builds — used by CI/CD workflows only
 - **Exposed ports**: 8000, 8443 (proxy), 9000, 9443 (admin), 50051 (gRPC)
 - **Health check**: `curl -f http://localhost:9000/health`
 - **docker-compose.yml**: Profiles for `sqlite`, `postgres`, and `cp-dp` deployments
+- **Docker Hub**: `ferrumedge/ferrum-edge` — `:latest` (main), `:v0.9.0` / `:0.9.0` / `:0.9` (tagged releases)
+- **GHCR**: `ghcr.io/ferrum-edge/ferrum-edge` — same tag scheme as Docker Hub
 
 ## Cargo Profiles
 
