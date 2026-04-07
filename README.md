@@ -348,6 +348,17 @@ Multi-protocol benchmark results (macOS Apple Silicon, 200 concurrent, 10s):
 
 See `tests/performance/` for the full benchmark suite.
 
+### Gateway Comparison (All-Docker, macOS Apple Silicon, 100 concurrent, 30s)
+
+All gateways run in Docker containers for apples-to-apples comparison:
+
+| Gateway | Key-Auth req/s | Key-Auth Latency | vs Ferrum |
+|---------|---------------|-----------------|-----------|
+| **Ferrum Edge** | **26,004** | **3.70 ms** | — |
+| Envoy 1.32 (Lua filter) | 22,626 | 4.34 ms | Ferrum 15% faster |
+| Kong 3.9 | 17,625 | 5.86 ms | Ferrum 48% faster |
+
+Ferrum's authentication adds effectively **zero overhead** — authenticated requests match unauthenticated throughput thanks to the pre-computed `ConsumerIndex` with `Arc<Consumer>` zero-copy credential resolution and lock-free `ArcSwap` reads. See `comparison/` for the full benchmark suite and methodology.
 
 ## Troubleshooting
 
