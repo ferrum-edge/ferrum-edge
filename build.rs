@@ -150,6 +150,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &registry,
     )?;
 
+    // Expose the build target triple so the CLI can print it at runtime.
+    println!(
+        "cargo:rustc-env=TARGET={}",
+        env::var("TARGET").unwrap_or_default()
+    );
+
     // Re-run build script when custom_plugins/ changes
     println!("cargo:rerun-if-changed=custom_plugins/");
     println!("cargo:rerun-if-env-changed=FERRUM_CUSTOM_PLUGINS");

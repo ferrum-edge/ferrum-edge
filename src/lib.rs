@@ -10,6 +10,7 @@ pub const FERRUM_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub mod admin;
 pub mod circuit_breaker;
+pub mod cli;
 pub mod config;
 pub mod config_delta;
 pub mod connection_pool;

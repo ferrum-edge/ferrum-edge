@@ -8,6 +8,7 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 mod admin;
 mod circuit_breaker;
+mod cli;
 mod config;
 mod config_delta;
 mod connection_pool;
@@ -31,6 +32,7 @@ mod service_discovery;
 mod startup;
 mod tls;
 
+use clap::Parser;
 use config::{EnvConfig, OperatingMode};
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
@@ -41,18 +43,52 @@ pub const FERRUM_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Entry point for the Ferrum Edge gateway binary.
 ///
 /// Startup sequence:
-/// 1. Install rustls crypto provider (ring backend)
-/// 2. Initialize structured JSON logging
-/// 3. Resolve external secrets (Vault, AWS, Azure, GCP, env, file) using a
+/// 1. Parse CLI arguments (if any — no args falls through to legacy env-var mode)
+/// 2. Install rustls crypto provider (ring backend)
+/// 3. Initialize structured JSON logging
+/// 4. Resolve external secrets (Vault, AWS, Azure, GCP, env, file) using a
 ///    single-threaded runtime — env var mutations are unsafe with multiple threads
-/// 4. Parse environment configuration (`EnvConfig::from_env()`)
-/// 5. Build the multi-threaded tokio runtime with configured worker/blocking threads
-/// 6. Dispatch to the appropriate operating mode (database, file, cp, dp, migrate)
+/// 5. Parse environment configuration (`EnvConfig::from_env()`)
+/// 6. Build the multi-threaded tokio runtime with configured worker/blocking threads
+/// 7. Dispatch to the appropriate operating mode (database, file, cp, dp, migrate)
 ///    — each mode then loads TLS certs (frontend, admin, DTLS, gRPC) and validates
 ///    per-proxy backend TLS paths before starting listeners
-/// 7. Wait for SIGINT/SIGTERM for graceful shutdown
+/// 8. Wait for SIGINT/SIGTERM for graceful shutdown
 fn main() {
-    // Initialize rustls crypto provider
+    // ── CLI parsing ─────────────────────────────────────────────────────
+    // Parse before anything else so `--settings`/`--spec`/`--mode` env var
+    // overrides are in place before `CONF_FILE_CACHE` OnceLock is triggered
+    // by `resolve_ferrum_var()` during logging init (line ~95 below).
+    let cli = cli::Cli::parse();
+
+    // Handle early-exit subcommands that don't need the startup pipeline.
+    match &cli.command {
+        Some(cli::Command::Version(args)) => {
+            cli::execute_version(args);
+            return;
+        }
+        Some(cli::Command::Reload(args)) => {
+            match cli::execute_reload(args) {
+                Ok(()) => {}
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+            return;
+        }
+        _ => {}
+    }
+
+    // Apply CLI overrides before anything reads config (OnceLock ordering).
+    match &cli.command {
+        Some(cli::Command::Run(args)) => cli::apply_run_overrides(args),
+        Some(cli::Command::Validate(args)) => cli::apply_validate_overrides(args),
+        _ => {} // No subcommand: legacy env-var-only mode.
+    }
+
+    // ── Crypto provider ─────────────────────────────────────────────────
+    // Initialize rustls crypto provider (needed by validate for TLS cert checks)
     if rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider())
         .is_err()
     {
@@ -84,6 +120,19 @@ fn main() {
         .json()
         .with_writer(non_blocking)
         .init();
+
+    // Handle validate subcommand: load config, validate, exit.
+    // Runs after crypto + logging init so TLS cert checks and tracing work,
+    // but before secret resolution and the multi-threaded runtime.
+    if matches!(&cli.command, Some(cli::Command::Validate(_))) {
+        match cli::execute_validate() {
+            Ok(()) => return,
+            Err(e) => {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        }
+    }
 
     info!("Ferrum Edge v{} starting...", env!("CARGO_PKG_VERSION"));
 

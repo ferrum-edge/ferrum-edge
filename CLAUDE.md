@@ -8,10 +8,34 @@ Ferrum Edge is a high-performance edge proxy built in Rust. It supports HTTP/1.1
 
 - **Language**: Rust (edition 2024)
 - **Async runtime**: tokio + hyper 1.0
-- **Binary**: `ferrum-edge` (single binary, mode selected via env var)
+- **Binary**: `ferrum-edge` (single binary, CLI subcommands + env var config)
 - **License**: PolyForm Noncommercial 1.0.0 (dual-licensed with paid commercial option)
 
 ## Quick Reference — Commands
+
+### CLI Subcommands
+
+```bash
+ferrum-edge run [OPTIONS]                # Start gateway in foreground
+ferrum-edge validate [OPTIONS]           # Validate config without starting
+ferrum-edge reload [--pid PID]           # Send SIGHUP to running instance (Unix)
+ferrum-edge version [--json]             # Print version info
+ferrum-edge                              # No args = legacy env-var-only mode
+```
+
+**`run` options**: `-s/--settings <PATH>` (ferrum.conf), `-c/--spec <PATH>` (resources YAML/JSON), `-m/--mode <MODE>`, `-v/--verbose` (repeatable).
+
+**`validate` options**: `-s/--settings <PATH>`, `-c/--spec <PATH>`.
+
+**Precedence**: CLI flag > env var > conf file > smart path defaults > hardcoded defaults.
+
+**Smart defaults**: When `--settings`/`--spec` are omitted and env vars are unset, the CLI searches `./ferrum.conf`, `./config/ferrum.conf`, `/etc/ferrum/ferrum.conf` for settings and `./resources.yaml`, `./resources.json`, `./config/resources.yaml`, `./config/resources.json`, `/etc/ferrum/config.yaml`, `/etc/ferrum/config.json` for spec.
+
+**Mode inference**: When `--spec` is provided and no mode is configured, `FERRUM_MODE=file` is set automatically.
+
+**Backwards compatibility**: `ferrum-edge` with no args skips CLI parsing entirely and runs the existing env-var-only startup path. All Docker/systemd/CI deployments continue unchanged.
+
+**Implementation**: `src/cli.rs` defines clap derive structs. `apply_run_overrides()` / `apply_validate_overrides()` translate CLI flags into env vars via `unsafe { std::env::set_var() }` before the `CONF_FILE_CACHE` OnceLock is triggered. This ordering is critical — see the comment in `main.rs`.
 
 ### Build
 
@@ -86,13 +110,15 @@ All four jobs must pass for a PR to merge.
 ### Startup Sequence
 
 1. **jemalloc** — Global allocator on non-Windows (reduces fragmentation under high concurrency)
-2. **rustls crypto provider** — Install ring as the TLS backend (must be first)
-3. **Logging** — JSON structured logging via `tracing-subscriber` with a non-blocking stdout writer (`tracing-appender`). Buffer capacity is tunable via `FERRUM_LOG_BUFFER_CAPACITY`
-4. **Secret resolution** — Single-threaded tokio runtime resolves `FERRUM_*_SECRET_*` env vars from Vault/AWS/Azure/GCP/file backends. Uses single-threaded runtime because `std::env::set_var` is unsafe with concurrent threads
-5. **EnvConfig parsing** — 90+ env vars parsed into `EnvConfig` (now includes resolved secrets)
-6. **Multi-threaded runtime** — tokio `new_multi_thread()` with configurable worker/blocking threads
-7. **Mode dispatch** — Runs the selected operating mode (database/file/cp/dp/migrate)
-8. **Signal handling** — SIGINT/SIGTERM trigger graceful shutdown via `watch::channel`
+2. **CLI parsing** — clap parses subcommands and flags. Early-exit commands (`version`, `reload`) return immediately. `run`/`validate` apply env var overrides via `apply_run_overrides()`/`apply_validate_overrides()`. No subcommand = legacy env-var-only mode (skips CLI overrides). **Must run before step 4** because the `CONF_FILE_CACHE` OnceLock captures `FERRUM_CONF_PATH` on first access
+3. **rustls crypto provider** — Install ring as the TLS backend (must be first)
+4. **Logging** — JSON structured logging via `tracing-subscriber` with a non-blocking stdout writer (`tracing-appender`). Buffer capacity is tunable via `FERRUM_LOG_BUFFER_CAPACITY`
+5. **Validate exit** — If `validate` subcommand, loads config, validates, prints result, and exits (skips steps 6-9)
+6. **Secret resolution** — Single-threaded tokio runtime resolves `FERRUM_*_SECRET_*` env vars from Vault/AWS/Azure/GCP/file backends. Uses single-threaded runtime because `std::env::set_var` is unsafe with concurrent threads
+7. **EnvConfig parsing** — 90+ env vars parsed into `EnvConfig` (now includes resolved secrets)
+8. **Multi-threaded runtime** — tokio `new_multi_thread()` with configurable worker/blocking threads
+9. **Mode dispatch** — Runs the selected operating mode (database/file/cp/dp/migrate)
+10. **Signal handling** — SIGINT/SIGTERM trigger graceful shutdown via `watch::channel`
 
 Within each mode (database/file/dp), after config is loaded:
 
@@ -127,6 +153,7 @@ Backends are grouped so a single client is created per provider type (avoids rep
 ```
 src/
 ├── main.rs                    # CLI parsing, mode dispatch, signal handling
+├── cli.rs                     # CLI subcommand definitions (clap derive), path resolution, env var injection
 ├── lib.rs                     # Public API re-exports
 ├── admin/                     # Admin REST API (CRUD for proxies, consumers, upstreams, plugins)
 │   ├── mod.rs                 # Routes, handlers, listener setup

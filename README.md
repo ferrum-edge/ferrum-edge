@@ -71,11 +71,23 @@ See [docs/docker.md](docs/docker.md) for Docker Compose examples and production 
 ### File Mode (quickest start)
 
 ```bash
+# Using the CLI (recommended)
+ferrum-edge run --spec tests/config.yaml -v
+
+# Using environment variables (legacy, still fully supported)
 FERRUM_MODE=file \
 FERRUM_FILE_CONFIG_PATH=tests/config.yaml \
 FERRUM_LOG_LEVEL=info \
 cargo run --release
 ```
+
+With smart defaults, if `./ferrum.conf` and `./resources.yaml` exist in the current directory:
+
+```bash
+ferrum-edge run
+```
+
+See [docs/cli.md](docs/cli.md) for the full CLI reference.
 
 ### Database Mode (SQLite)
 

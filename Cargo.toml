@@ -88,6 +88,9 @@ prost-reflect = "0.16"
 brotli = "8"
 flate2 = "1"
 
+# CLI
+clap = { version = "4", features = ["derive"] }
+
 # Memory allocator — jemalloc reduces fragmentation and improves throughput
 # under high concurrency (50k+ connections). Not available on Windows.
 [target.'cfg(not(windows))'.dependencies]

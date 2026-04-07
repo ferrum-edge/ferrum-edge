@@ -194,6 +194,15 @@ Ferrum supports dynamic upstream target discovery through three providers, confi
 - Per-proxy TTL overrides and static hostname overrides
 - Shared resolver for all outbound HTTP clients including plugins
 
+## CLI
+
+- Four subcommands: `run` (foreground gateway), `validate` (config check), `reload` (SIGHUP), `version`
+- Smart path defaults — `ferrum-edge run` works zero-config when `./ferrum.conf` and `./resources.yaml` exist
+- Mode inference — `--spec` auto-sets file mode when no mode is configured
+- Full backwards compatibility — no-args invocation uses legacy env-var-only startup
+- Configuration precedence: CLI flag > env var > conf file > smart defaults > hardcoded defaults
+- See [docs/cli.md](docs/cli.md) for the full reference
+
 ## Configuration & Admin
 
 - Admin REST API with JWT authentication and read-only mode
