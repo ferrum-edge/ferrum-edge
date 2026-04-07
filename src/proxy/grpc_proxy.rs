@@ -398,9 +398,16 @@ impl GrpcConnectionPool {
 
     /// Set TCP keepalive on a stream to detect dead backend connections.
     fn set_tcp_keepalive(stream: &TcpStream, keepalive_seconds: u64) {
+        #[cfg(unix)]
         use std::os::fd::AsFd;
-        let fd = stream.as_fd();
-        let socket = socket2::SockRef::from(&fd);
+        #[cfg(windows)]
+        use std::os::windows::io::AsSocket;
+
+        #[cfg(unix)]
+        let borrowed = stream.as_fd();
+        #[cfg(windows)]
+        let borrowed = stream.as_socket();
+        let socket = socket2::SockRef::from(&borrowed);
         let keepalive =
             socket2::TcpKeepalive::new().with_time(Duration::from_secs(keepalive_seconds));
         if let Err(e) = socket.set_tcp_keepalive(&keepalive) {

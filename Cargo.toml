@@ -91,10 +91,7 @@ flate2 = "1"
 # CLI
 clap = { version = "4", features = ["derive"] }
 
-# Memory allocator — jemalloc reduces fragmentation and improves throughput
-# under high concurrency (50k+ connections). Not available on Windows.
-[target.'cfg(not(windows))'.dependencies]
-tikv-jemallocator = "0.6"
+# Crypto
 sha2 = "0.11.0"
 hmac = "0.13.0"
 hex = "0.4"
@@ -120,6 +117,11 @@ mongodb = "3"
 
 # DTLS 1.2/1.3 (secure UDP) — Sans-IO state machine
 dimpl = { version = "0.5.0", features = ["aws-lc-rs", "rcgen"] }
+
+# Memory allocator — jemalloc reduces fragmentation and improves throughput
+# under high concurrency (50k+ connections). Not available on Windows.
+[target.'cfg(not(windows))'.dependencies]
+tikv-jemallocator = "0.6"
 
 # ── Build profiles ─────────────────────────────────────────────────────────
 # Dev: optimise for fast compile-edit-run cycles

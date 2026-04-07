@@ -1820,11 +1820,18 @@ fn is_client_disconnect_error(err: &str) -> bool {
 
 /// Set TCP keepalive on a stream to detect dead connections.
 fn set_tcp_keepalive(stream: &tokio::net::TcpStream) {
+    #[cfg(unix)]
     use std::os::fd::AsFd;
+    #[cfg(windows)]
+    use std::os::windows::io::AsSocket;
+
     // Disable Nagle's algorithm for lower latency on small responses
     let _ = stream.set_nodelay(true);
-    let fd = stream.as_fd();
-    let socket = socket2::SockRef::from(&fd);
+    #[cfg(unix)]
+    let borrowed = stream.as_fd();
+    #[cfg(windows)]
+    let borrowed = stream.as_socket();
+    let socket = socket2::SockRef::from(&borrowed);
     let keepalive = socket2::TcpKeepalive::new().with_time(std::time::Duration::from_secs(60));
     if let Err(e) = socket.set_tcp_keepalive(&keepalive) {
         debug!("Failed to set TCP keepalive: {}", e);
