@@ -26,6 +26,24 @@ use crate::config::db_loader::IncrementalResult;
 use crate::config::types::GatewayConfig;
 use crate::proxy::ProxyState;
 
+/// Newtype for the shared CP/DP gRPC JWT secret (`FERRUM_CP_DP_GRPC_JWT_SECRET`).
+///
+/// This wrapper exists so the compiler catches callers who accidentally pass a
+/// pre-signed JWT token where a shared secret is now expected. Before this change
+/// both were `String`, so the old code compiled silently with the wrong value.
+#[derive(Clone, Debug)]
+pub struct GrpcJwtSecret(pub String);
+
+impl GrpcJwtSecret {
+    pub fn new(secret: String) -> Self {
+        Self(secret)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 /// TLS configuration for the DP gRPC client.
 #[derive(Clone, Default)]
 pub struct DpGrpcTlsConfig {
@@ -70,7 +88,7 @@ pub fn generate_dp_jwt(secret: &str, node_id: &str) -> Result<String, anyhow::Er
 #[allow(dead_code)] // Used by tests and library callers; binary startup uses the startup-aware variant.
 pub async fn start_dp_client_with_shutdown(
     cp_url: String,
-    jwt_secret: String,
+    jwt_secret: GrpcJwtSecret,
     proxy_state: ProxyState,
     shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
     tls_config: Option<DpGrpcTlsConfig>,
@@ -89,7 +107,7 @@ pub async fn start_dp_client_with_shutdown(
 /// Connect to the Control Plane with an optional startup readiness flag.
 pub async fn start_dp_client_with_shutdown_and_startup_ready(
     cp_url: String,
-    jwt_secret: String,
+    jwt_secret: GrpcJwtSecret,
     proxy_state: ProxyState,
     shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
     tls_config: Option<DpGrpcTlsConfig>,
@@ -178,7 +196,7 @@ pub async fn start_dp_client_with_shutdown_and_startup_ready(
 #[allow(dead_code)] // Used by tests and library callers; binary startup uses the startup-aware variant.
 pub async fn connect_and_subscribe(
     cp_url: &str,
-    jwt_secret: &str,
+    jwt_secret: &GrpcJwtSecret,
     node_id: &str,
     proxy_state: &ProxyState,
     tls_config: Option<&DpGrpcTlsConfig>,
@@ -197,7 +215,7 @@ pub async fn connect_and_subscribe(
 /// Connect to CP and optionally flip startup readiness after the first applied snapshot.
 pub async fn connect_and_subscribe_with_startup_ready(
     cp_url: &str,
-    jwt_secret: &str,
+    jwt_secret: &GrpcJwtSecret,
     node_id: &str,
     proxy_state: &ProxyState,
     tls_config: Option<&DpGrpcTlsConfig>,
@@ -231,7 +249,7 @@ pub async fn connect_and_subscribe_with_startup_ready(
     let channel = endpoint.connect().await?;
 
     // Mint a fresh short-lived JWT for this connection attempt.
-    let auth_token = generate_dp_jwt(jwt_secret, node_id)?;
+    let auth_token = generate_dp_jwt(jwt_secret.as_str(), node_id)?;
     info!(
         "Generated fresh DP JWT (TTL={}s) for CP authentication",
         DP_JWT_TTL_SECONDS

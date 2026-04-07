@@ -271,7 +271,7 @@ async fn test_cp_dp_grpc_config_sync() {
     let cp_url = format!("http://{}", addr);
     let ps = dp_proxy_state.clone();
     let url_clone = cp_url.clone();
-    let secret = GRPC_JWT_SECRET.to_string();
+    let secret = dp_client::GrpcJwtSecret::new(GRPC_JWT_SECRET.to_string());
 
     let client_handle = tokio::spawn(async move {
         let _ =

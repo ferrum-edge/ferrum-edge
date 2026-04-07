@@ -74,10 +74,11 @@ pub async fn run(
         .dp_cp_grpc_url
         .clone()
         .ok_or_else(|| anyhow::anyhow!("FERRUM_DP_CP_GRPC_URL is required in dp mode"))?;
-    let jwt_secret = env_config
-        .cp_dp_grpc_jwt_secret
-        .clone()
-        .ok_or_else(|| anyhow::anyhow!("FERRUM_CP_DP_GRPC_JWT_SECRET is required in dp mode"))?;
+    let jwt_secret = crate::grpc::dp_client::GrpcJwtSecret::new(
+        env_config.cp_dp_grpc_jwt_secret.clone().ok_or_else(|| {
+            anyhow::anyhow!("FERRUM_CP_DP_GRPC_JWT_SECRET is required in dp mode")
+        })?,
+    );
 
     // Build DP gRPC TLS config if any TLS settings are provided
     let dp_grpc_tls = {
