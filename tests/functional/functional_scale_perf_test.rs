@@ -100,7 +100,9 @@ impl ScalePerfHarness {
         let binary_path = if std::path::Path::new("./target/release/ferrum-edge").exists() {
             "./target/release/ferrum-edge"
         } else if std::path::Path::new("./target/debug/ferrum-edge").exists() {
-            eprintln!("WARNING: Using debug build — performance numbers will not be meaningful. Run `cargo build --release` first.");
+            eprintln!(
+                "WARNING: Using debug build — performance numbers will not be meaningful. Run `cargo build --release` first."
+            );
             "./target/debug/ferrum-edge"
         } else {
             return Err("ferrum-edge binary not found. Run `cargo build --release` first.".into());
