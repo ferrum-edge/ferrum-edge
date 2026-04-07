@@ -7,7 +7,7 @@ proxies:
     name: "Health Check Proxy (E2E TLS)"
     listen_path: "/health"
     backend_protocol: https
-    backend_host: "127.0.0.1"
+    backend_host: "BACKEND_HOST"
     backend_port: 3443
     strip_listen_path: false
     preserve_host_header: false
@@ -22,7 +22,7 @@ proxies:
     name: "Users API Proxy (E2E TLS)"
     listen_path: "/api/users"
     backend_protocol: https
-    backend_host: "127.0.0.1"
+    backend_host: "BACKEND_HOST"
     backend_port: 3443
     strip_listen_path: false
     preserve_host_header: false

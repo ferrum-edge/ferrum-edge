@@ -190,7 +190,7 @@ impl Plugin for BasicAuth {
         {
             if ctx.identified_consumer.is_none() {
                 debug!("basic_auth: identified consumer '{}'", consumer.username);
-                ctx.identified_consumer = Some((*consumer).clone());
+                ctx.identified_consumer = Some(consumer);
             }
             return PluginResult::Continue;
         }

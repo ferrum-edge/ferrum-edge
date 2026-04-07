@@ -179,7 +179,7 @@ impl Plugin for JwtAuth {
             Ok(_) => {
                 if ctx.identified_consumer.is_none() {
                     debug!("jwt_auth: identified consumer '{}'", consumer.username);
-                    ctx.identified_consumer = Some((*consumer).clone());
+                    ctx.identified_consumer = Some(consumer);
                 }
                 PluginResult::Continue
             }

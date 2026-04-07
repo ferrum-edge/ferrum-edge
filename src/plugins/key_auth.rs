@@ -18,30 +18,50 @@ use crate::consumer_index::ConsumerIndex;
 use super::{Plugin, PluginResult, RequestContext};
 
 pub struct KeyAuth {
-    /// Where to extract the API key from: "header:<name>" or "query:<name>".
-    key_location: String,
+    /// Pre-lowercased header name for header-based key extraction.
+    /// Avoids a per-request `to_lowercase()` allocation.
+    header_name_lower: Option<String>,
+    /// Original (non-lowered) header name for case-sensitive fallback lookup.
+    header_name_original: Option<String>,
+    /// Query parameter name for query-based key extraction.
+    query_param_name: Option<String>,
 }
 
 impl KeyAuth {
     pub fn new(config: &Value) -> Result<Self, String> {
+        let key_location = config["key_location"]
+            .as_str()
+            .unwrap_or("header:X-API-Key")
+            .to_string();
+
+        let (header_name_lower, header_name_original, query_param_name) =
+            if let Some(name) = key_location.strip_prefix("header:") {
+                (Some(name.to_lowercase()), Some(name.to_string()), None)
+            } else if let Some(name) = key_location.strip_prefix("query:") {
+                (None, None, Some(name.to_string()))
+            } else {
+                (None, None, None)
+            };
+
         Ok(Self {
-            key_location: config["key_location"]
-                .as_str()
-                .unwrap_or("header:X-API-Key")
-                .to_string(),
+            header_name_lower,
+            header_name_original,
+            query_param_name,
         })
     }
 
     fn extract_key(&self, ctx: &RequestContext) -> Option<String> {
-        if self.key_location.starts_with("header:") {
-            let header_name = &self.key_location["header:".len()..];
+        if let Some(ref lower) = self.header_name_lower {
             ctx.headers
-                .get(&header_name.to_lowercase())
-                .or_else(|| ctx.headers.get(header_name))
+                .get(lower.as_str())
+                .or_else(|| {
+                    self.header_name_original
+                        .as_ref()
+                        .and_then(|orig| ctx.headers.get(orig.as_str()))
+                })
                 .cloned()
-        } else if self.key_location.starts_with("query:") {
-            let param_name = &self.key_location["query:".len()..];
-            ctx.query_params.get(param_name).cloned()
+        } else if let Some(ref param) = self.query_param_name {
+            ctx.query_params.get(param.as_str()).cloned()
         } else {
             ctx.headers
                 .get("x-api-key")
@@ -89,7 +109,7 @@ impl Plugin for KeyAuth {
         if let Some(consumer) = consumer_index.find_by_api_key(&api_key) {
             if ctx.identified_consumer.is_none() {
                 debug!("key_auth: identified consumer '{}'", consumer.username);
-                ctx.identified_consumer = Some((*consumer).clone());
+                ctx.identified_consumer = Some(consumer);
             }
             return PluginResult::Continue;
         }

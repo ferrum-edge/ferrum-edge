@@ -9,7 +9,7 @@ use std::sync::Arc;
 use super::plugin_utils::{assert_continue, assert_reject, create_test_context};
 
 fn create_stream_context(
-    consumer: Option<Consumer>,
+    consumer: Option<Arc<Consumer>>,
 ) -> ferrum_edge::plugins::StreamConnectionContext {
     ferrum_edge::plugins::StreamConnectionContext {
         client_ip: "127.0.0.1".to_string(),
@@ -227,7 +227,7 @@ async fn test_access_control_stream_connect_allowed_consumer() {
     }))
     .unwrap();
 
-    let mut ctx = create_stream_context(Some(Consumer {
+    let mut ctx = create_stream_context(Some(Arc::new(Consumer {
         id: "consumer-1".to_string(),
         username: "stream-user".to_string(),
         custom_id: None,
@@ -235,7 +235,7 @@ async fn test_access_control_stream_connect_allowed_consumer() {
         acl_groups: Vec::new(),
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
-    }));
+    })));
 
     let result = plugin.on_stream_connect(&mut ctx).await;
     assert_continue(result);
@@ -292,10 +292,10 @@ async fn test_access_control_allowed_group_allows_consumer() {
     .unwrap();
 
     let mut ctx = create_test_context();
-    ctx.identified_consumer = Some(make_consumer_with_groups(
+    ctx.identified_consumer = Some(Arc::new(make_consumer_with_groups(
         "alice",
         vec!["engineering", "backend"],
-    ));
+    )));
     let result = plugin.authorize(&mut ctx).await;
     assert_continue(result);
 }
@@ -308,7 +308,10 @@ async fn test_access_control_allowed_group_rejects_consumer_not_in_group() {
     .unwrap();
 
     let mut ctx = create_test_context();
-    ctx.identified_consumer = Some(make_consumer_with_groups("bob", vec!["marketing"]));
+    ctx.identified_consumer = Some(Arc::new(make_consumer_with_groups(
+        "bob",
+        vec!["marketing"],
+    )));
     let result = plugin.authorize(&mut ctx).await;
     assert_reject(result, Some(403));
 }
@@ -321,7 +324,7 @@ async fn test_access_control_allowed_group_rejects_consumer_with_no_groups() {
     .unwrap();
 
     let mut ctx = create_test_context();
-    ctx.identified_consumer = Some(make_consumer_with_groups("bob", vec![]));
+    ctx.identified_consumer = Some(Arc::new(make_consumer_with_groups("bob", vec![])));
     let result = plugin.authorize(&mut ctx).await;
     assert_reject(result, Some(403));
 }
@@ -334,10 +337,10 @@ async fn test_access_control_disallowed_group_rejects_consumer() {
     .unwrap();
 
     let mut ctx = create_test_context();
-    ctx.identified_consumer = Some(make_consumer_with_groups(
+    ctx.identified_consumer = Some(Arc::new(make_consumer_with_groups(
         "alice",
         vec!["engineering", "banned"],
-    ));
+    )));
     let result = plugin.authorize(&mut ctx).await;
     assert_reject(result, Some(403));
 }
@@ -350,7 +353,10 @@ async fn test_access_control_disallowed_group_allows_consumer_not_in_group() {
     .unwrap();
 
     let mut ctx = create_test_context();
-    ctx.identified_consumer = Some(make_consumer_with_groups("alice", vec!["engineering"]));
+    ctx.identified_consumer = Some(Arc::new(make_consumer_with_groups(
+        "alice",
+        vec!["engineering"],
+    )));
     let result = plugin.authorize(&mut ctx).await;
     assert_continue(result);
 }
@@ -364,7 +370,10 @@ async fn test_access_control_group_deny_takes_precedence_over_group_allow() {
     .unwrap();
 
     let mut ctx = create_test_context();
-    ctx.identified_consumer = Some(make_consumer_with_groups("alice", vec!["engineering"]));
+    ctx.identified_consumer = Some(Arc::new(make_consumer_with_groups(
+        "alice",
+        vec!["engineering"],
+    )));
     let result = plugin.authorize(&mut ctx).await;
     assert_reject(result, Some(403));
 }
@@ -380,7 +389,7 @@ async fn test_access_control_consumer_username_allow_with_group_deny() {
     .unwrap();
 
     let mut ctx = create_test_context();
-    ctx.identified_consumer = Some(make_consumer_with_groups("alice", vec!["banned"]));
+    ctx.identified_consumer = Some(Arc::new(make_consumer_with_groups("alice", vec!["banned"])));
     let result = plugin.authorize(&mut ctx).await;
     assert_reject(result, Some(403));
 }
@@ -396,7 +405,10 @@ async fn test_access_control_group_allow_bypasses_consumer_allow_list() {
     .unwrap();
 
     let mut ctx = create_test_context();
-    ctx.identified_consumer = Some(make_consumer_with_groups("alice", vec!["engineering"]));
+    ctx.identified_consumer = Some(Arc::new(make_consumer_with_groups(
+        "alice",
+        vec!["engineering"],
+    )));
     let result = plugin.authorize(&mut ctx).await;
     assert_continue(result);
 }
@@ -411,7 +423,10 @@ async fn test_access_control_consumer_allow_bypasses_group_allow_list() {
     .unwrap();
 
     let mut ctx = create_test_context();
-    ctx.identified_consumer = Some(make_consumer_with_groups("admin", vec!["marketing"]));
+    ctx.identified_consumer = Some(Arc::new(make_consumer_with_groups(
+        "admin",
+        vec!["marketing"],
+    )));
     let result = plugin.authorize(&mut ctx).await;
     assert_continue(result);
 }
@@ -425,7 +440,10 @@ async fn test_access_control_neither_consumer_nor_group_in_allow_lists() {
     .unwrap();
 
     let mut ctx = create_test_context();
-    ctx.identified_consumer = Some(make_consumer_with_groups("bob", vec!["marketing"]));
+    ctx.identified_consumer = Some(Arc::new(make_consumer_with_groups(
+        "bob",
+        vec!["marketing"],
+    )));
     let result = plugin.authorize(&mut ctx).await;
     assert_reject(result, Some(403));
 }
@@ -440,7 +458,10 @@ async fn test_access_control_consumer_username_deny_with_group_allow() {
     .unwrap();
 
     let mut ctx = create_test_context();
-    ctx.identified_consumer = Some(make_consumer_with_groups("alice", vec!["engineering"]));
+    ctx.identified_consumer = Some(Arc::new(make_consumer_with_groups(
+        "alice",
+        vec!["engineering"],
+    )));
     let result = plugin.authorize(&mut ctx).await;
     assert_reject(result, Some(403));
 }
@@ -453,10 +474,10 @@ async fn test_access_control_multiple_groups_any_match_allows() {
     .unwrap();
 
     let mut ctx = create_test_context();
-    ctx.identified_consumer = Some(make_consumer_with_groups(
+    ctx.identified_consumer = Some(Arc::new(make_consumer_with_groups(
         "alice",
         vec!["engineering", "sre"],
-    ));
+    )));
     let result = plugin.authorize(&mut ctx).await;
     assert_continue(result);
 }
@@ -468,10 +489,10 @@ async fn test_access_control_stream_connect_allowed_group() {
     }))
     .unwrap();
 
-    let mut ctx = create_stream_context(Some(make_consumer_with_groups(
+    let mut ctx = create_stream_context(Some(Arc::new(make_consumer_with_groups(
         "stream-user",
         vec!["db-access"],
-    )));
+    ))));
     let result = plugin.on_stream_connect(&mut ctx).await;
     assert_continue(result);
 }
@@ -483,10 +504,10 @@ async fn test_access_control_stream_connect_disallowed_group() {
     }))
     .unwrap();
 
-    let mut ctx = create_stream_context(Some(make_consumer_with_groups(
+    let mut ctx = create_stream_context(Some(Arc::new(make_consumer_with_groups(
         "stream-user",
         vec!["restricted"],
-    )));
+    ))));
     let result = plugin.on_stream_connect(&mut ctx).await;
     assert_reject(result, Some(403));
 }

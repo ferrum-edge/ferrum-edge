@@ -404,7 +404,7 @@ impl Plugin for JwksAuth {
                         "jwks_auth: identified consumer '{}' via claim '{}'='{}'",
                         consumer.username, effective_identity_claim, id
                     );
-                    ctx.identified_consumer = Some((*consumer).clone());
+                    ctx.identified_consumer = Some(consumer);
                 }
             } else {
                 debug!(

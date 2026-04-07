@@ -397,7 +397,7 @@ async fn test_rate_limiting_stream_connect_consumer_mode_uses_consumer_identity(
 
     let mut ctx1 = make_stream_ctx();
     ctx1.client_ip = "10.0.0.1".to_string();
-    ctx1.identified_consumer = Some(test_consumer("alice"));
+    ctx1.identified_consumer = Some(Arc::new(test_consumer("alice")));
     assert!(matches!(
         plugin.on_stream_connect(&mut ctx1).await,
         PluginResult::Continue
@@ -405,7 +405,7 @@ async fn test_rate_limiting_stream_connect_consumer_mode_uses_consumer_identity(
 
     let mut ctx2 = make_stream_ctx();
     ctx2.client_ip = "10.0.0.2".to_string();
-    ctx2.identified_consumer = Some(test_consumer("alice"));
+    ctx2.identified_consumer = Some(Arc::new(test_consumer("alice")));
     assert!(matches!(
         plugin.on_stream_connect(&mut ctx2).await,
         PluginResult::Reject {
@@ -416,7 +416,7 @@ async fn test_rate_limiting_stream_connect_consumer_mode_uses_consumer_identity(
 
     let mut ctx3 = make_stream_ctx();
     ctx3.client_ip = "10.0.0.3".to_string();
-    ctx3.identified_consumer = Some(test_consumer("bob"));
+    ctx3.identified_consumer = Some(Arc::new(test_consumer("bob")));
     assert!(matches!(
         plugin.on_stream_connect(&mut ctx3).await,
         PluginResult::Continue

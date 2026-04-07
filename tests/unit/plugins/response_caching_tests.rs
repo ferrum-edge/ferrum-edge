@@ -7,6 +7,7 @@ use ferrum_edge::plugins::response_caching::ResponseCaching;
 use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext};
 use serde_json::json;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 fn make_consumer(id: &str, username: &str) -> Consumer {
     Consumer {
@@ -711,7 +712,7 @@ async fn test_consumer_keyed_caching() {
 
     // Cache response for user A
     let mut ctx_a = make_ctx("GET", "/api/data");
-    ctx_a.identified_consumer = Some(make_consumer("a", "alice"));
+    ctx_a.identified_consumer = Some(Arc::new(make_consumer("a", "alice")));
     let mut h = HashMap::new();
     plugin.before_proxy(&mut ctx_a, &mut h).await;
     let mut rh = HashMap::new();
@@ -722,14 +723,14 @@ async fn test_consumer_keyed_caching() {
 
     // User B should get a MISS (different consumer = different cache key)
     let mut ctx_b = make_ctx("GET", "/api/data");
-    ctx_b.identified_consumer = Some(make_consumer("b", "bob"));
+    ctx_b.identified_consumer = Some(Arc::new(make_consumer("b", "bob")));
     let mut h2 = HashMap::new();
     let result = plugin.before_proxy(&mut ctx_b, &mut h2).await;
     assert!(matches!(result, PluginResult::Continue));
 
     // User A should get a HIT
     let mut ctx_a2 = make_ctx("GET", "/api/data");
-    ctx_a2.identified_consumer = Some(make_consumer("a", "alice"));
+    ctx_a2.identified_consumer = Some(Arc::new(make_consumer("a", "alice")));
     let mut h3 = HashMap::new();
     let (_, body, _) = expect_reject(plugin.before_proxy(&mut ctx_a2, &mut h3).await);
     assert_eq!(body, b"alice-data");

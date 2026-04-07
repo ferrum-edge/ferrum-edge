@@ -53,7 +53,7 @@ pub fn create_test_context() -> RequestContext {
         .insert("User-Agent".to_string(), "test-agent".to_string());
 
     // Set a test consumer so access control plugin doesn't reject
-    ctx.identified_consumer = Some(create_test_consumer());
+    ctx.identified_consumer = Some(std::sync::Arc::new(create_test_consumer()));
     ctx
 }
 

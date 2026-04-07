@@ -354,7 +354,7 @@ impl MtlsAuth {
         cert_der: &[u8],
         chain_der: Option<&[Vec<u8>]>,
         consumer_index: &ConsumerIndex,
-    ) -> Result<crate::config::types::Consumer, PluginResult> {
+    ) -> Result<std::sync::Arc<crate::config::types::Consumer>, PluginResult> {
         // Parse the certificate once for both issuer verification and identity extraction.
         let (_, parsed_cert) = match X509Certificate::from_der(cert_der) {
             Ok(result) => result,
@@ -392,7 +392,7 @@ impl MtlsAuth {
         };
 
         match consumer_index.find_by_mtls_identity(&identity) {
-            Some(consumer) => Ok((*consumer).clone()),
+            Some(consumer) => Ok(consumer),
             None => Err(PluginResult::Reject {
                 status_code: 401,
                 body: r#"{"error":"No consumer found for client certificate"}"#.into(),

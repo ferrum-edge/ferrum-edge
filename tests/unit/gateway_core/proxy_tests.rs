@@ -315,7 +315,7 @@ fn test_request_context_effective_identity_prefers_consumer_then_external_identi
     ctx.authenticated_identity = Some("external-user".to_string());
     assert_eq!(ctx.effective_identity(), Some("external-user"));
 
-    ctx.identified_consumer = Some(Consumer {
+    ctx.identified_consumer = Some(Arc::new(Consumer {
         id: "consumer-1".to_string(),
         username: "mapped-consumer".to_string(),
         custom_id: None,
@@ -323,7 +323,7 @@ fn test_request_context_effective_identity_prefers_consumer_then_external_identi
         acl_groups: Vec::new(),
         created_at: Utc::now(),
         updated_at: Utc::now(),
-    });
+    }));
     assert_eq!(ctx.effective_identity(), Some("mapped-consumer"));
 }
 
@@ -342,7 +342,7 @@ fn test_request_context_backend_consumer_username_prefers_consumer_then_header_t
     ctx.authenticated_identity_header = Some("user@example.com".to_string());
     assert_eq!(ctx.backend_consumer_username(), Some("user@example.com"));
 
-    ctx.identified_consumer = Some(Consumer {
+    ctx.identified_consumer = Some(Arc::new(Consumer {
         id: "consumer-1".to_string(),
         username: "mapped-consumer".to_string(),
         custom_id: Some("custom-123".to_string()),
@@ -350,7 +350,7 @@ fn test_request_context_backend_consumer_username_prefers_consumer_then_header_t
         acl_groups: Vec::new(),
         created_at: Utc::now(),
         updated_at: Utc::now(),
-    });
+    }));
     assert_eq!(ctx.backend_consumer_username(), Some("mapped-consumer"));
     assert_eq!(ctx.backend_consumer_custom_id(), Some("custom-123"));
 }

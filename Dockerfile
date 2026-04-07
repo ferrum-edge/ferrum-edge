@@ -3,10 +3,15 @@
 FROM rust:latest AS builder
 
 # Install build dependencies
+# clang/libclang-dev: required by bindgen (used by zstd-sys)
+# cmake: required by some native C dependencies
 RUN apt-get update && apt-get install -y \
     pkg-config \
     libssl-dev \
     protobuf-compiler \
+    clang \
+    libclang-dev \
+    cmake \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
@@ -16,6 +21,7 @@ WORKDIR /build
 # expensive dependency download + compile step across source changes.
 COPY Cargo.toml Cargo.lock build.rs ./
 COPY proto ./proto
+COPY custom_plugins ./custom_plugins
 
 # Create a dummy main.rs to build dependencies only
 RUN mkdir src && \
@@ -28,8 +34,8 @@ COPY src ./src
 # Touch main.rs so cargo knows it changed (not the dummy)
 RUN touch src/main.rs && cargo build --release
 
-# Stage 2: Runtime
-FROM debian:bookworm-slim
+# Stage 2: Runtime — must match builder's glibc version (rust:latest = trixie)
+FROM debian:trixie-slim
 
 # Install runtime dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \

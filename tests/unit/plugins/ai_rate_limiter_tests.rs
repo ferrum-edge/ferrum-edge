@@ -5,6 +5,7 @@ use ferrum_edge::plugins::{
 };
 use serde_json::json;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use super::plugin_utils::{assert_continue, assert_reject, create_test_context};
 
@@ -183,7 +184,7 @@ async fn test_different_consumers_independent() {
 
     // Consumer A uses 150 tokens
     let mut ctx_a = create_test_context();
-    ctx_a.identified_consumer = Some(super::plugin_utils::create_test_consumer());
+    ctx_a.identified_consumer = Some(Arc::new(super::plugin_utils::create_test_consumer()));
     let mut headers_a = HashMap::new();
     plugin.before_proxy(&mut ctx_a, &mut headers_a).await;
     let body = openai_response(100, 50);

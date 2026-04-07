@@ -27,7 +27,7 @@ fn make_ctx(proxy_id: &str, ip: &str, consumer: Option<&str>) -> StreamConnectio
         listen_port: 5432,
         backend_protocol: BackendProtocol::Tcp,
         consumer_index: Arc::new(ferrum_edge::ConsumerIndex::new(&[])),
-        identified_consumer: consumer.map(make_consumer),
+        identified_consumer: consumer.map(|c| Arc::new(make_consumer(c))),
         authenticated_identity: None,
         metadata: HashMap::new(),
         tls_client_cert_der: None,

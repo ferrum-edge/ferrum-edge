@@ -688,7 +688,7 @@ impl LdapAuth {
                 "ldap_auth: mapped LDAP user '{}' to consumer '{}'",
                 username, consumer.username
             );
-            ctx.identified_consumer = Some((*consumer).clone());
+            ctx.identified_consumer = Some(consumer);
         }
     }
 }

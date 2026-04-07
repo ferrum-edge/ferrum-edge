@@ -1,12 +1,15 @@
 #!/bin/bash
 
 # ===========================================================================
-# API Gateway Comparison Benchmark
+# API Gateway Comparison Benchmark (All-Docker)
 # Ferrum Edge vs Pingora vs Kong vs Tyk vs KrakenD vs Envoy
 #
-# Runs each gateway sequentially (one at a time) against the same backend
-# echo server, testing both HTTP and HTTPS (TLS termination), then generates
-# a comparison report with throughput, latency, and error rate analysis.
+# ALL gateways run inside Docker containers for apples-to-apples comparison.
+# The Docker overhead is shared equally across all platforms, eliminating
+# the unfair advantage that native binaries had over Docker-gated gateways.
+#
+# The backend echo server runs natively on the host (it is the shared
+# constant — not a gateway being benchmarked).
 #
 # Usage:
 #   ./comparison/run_comparison.sh
@@ -21,6 +24,7 @@
 #   ENVOY_VERSION=1.32-latest  Envoy Docker image tag
 #   SKIP_GATEWAYS=tyk       Comma-separated gateways to skip (ferrum,pingora,kong,tyk,krakend,envoy)
 #   WARMUP_DURATION=5s      Warm-up duration before measured test
+#   SKIP_BUILD=false        Skip Docker image builds (use cached images)
 # ===========================================================================
 
 set -euo pipefail
@@ -51,6 +55,7 @@ TYK_VERSION=${TYK_VERSION:-v5.7}
 KRAKEND_VERSION=${KRAKEND_VERSION:-2.13}
 ENVOY_VERSION=${ENVOY_VERSION:-1.32-latest}
 SKIP_GATEWAYS=${SKIP_GATEWAYS:-}
+SKIP_BUILD=${SKIP_BUILD:-false}
 
 RESULTS_DIR="$COMP_DIR/results"
 CERTS_DIR="$PROJECT_ROOT/tests/certs"
@@ -59,21 +64,20 @@ LUA_SCRIPT="$COMP_DIR/lua/comparison_test.lua"
 LUA_SCRIPT_KEY_AUTH="$COMP_DIR/lua/comparison_test_key_auth.lua"
 
 # Docker container names (prefixed for easy cleanup)
+FERRUM_CONTAINER="ferrum-bench-ferrum"
+PINGORA_CONTAINER="ferrum-bench-pingora"
 KONG_CONTAINER="ferrum-bench-kong"
 TYK_CONTAINER="ferrum-bench-tyk"
 KRAKEND_CONTAINER="ferrum-bench-krakend"
 ENVOY_CONTAINER="ferrum-bench-envoy"
 REDIS_CONTAINER="ferrum-bench-redis"
 
-# PIDs to track
-BACKEND_PID=""
-FERRUM_PID=""
-PINGORA_PID=""
-KONG_PID=""
+# Docker image names for locally-built images
+FERRUM_IMAGE="ferrum-bench:local"
+PINGORA_IMAGE="pingora-bench:local"
 
-# Pingora bench proxy binary path
-PINGORA_PROXY_DIR="$COMP_DIR/configs/pingora"
-PINGORA_BINARY="$PINGORA_PROXY_DIR/target/release/pingora-bench-proxy"
+# PIDs to track (backend only — gateways are Docker containers)
+BACKEND_PID=""
 
 # Detect platform for Docker networking
 # macOS Docker Desktop does not support --network host; use port mapping instead
@@ -83,18 +87,6 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
 else
     BACKEND_HOST="127.0.0.1"
     DOCKER_USE_HOST_NETWORK=true
-fi
-
-# Detect whether Kong is installed natively (preferred over Docker for fair benchmarking)
-KONG_NATIVE=false
-if command -v kong &>/dev/null; then
-    KONG_NATIVE=true
-fi
-
-# Detect whether Envoy is installed natively (preferred over Docker for fair benchmarking)
-ENVOY_NATIVE=false
-if command -v envoy &>/dev/null; then
-    ENVOY_NATIVE=true
 fi
 
 # ===========================================================================
@@ -148,6 +140,37 @@ kill_port() {
     lsof -ti:"$1" 2>/dev/null | xargs kill -9 2>/dev/null || true
 }
 
+# Docker run helper — handles network mode per platform
+docker_run_gateway() {
+    local container_name="$1"
+    shift
+    local ports=()
+    local extra_args=()
+
+    # Parse port arguments (before --)
+    while [[ "$1" != "--" ]]; do
+        ports+=("$1")
+        shift
+    done
+    shift  # consume --
+
+    # Remaining args are the docker run arguments
+    extra_args=("$@")
+
+    local network_args=()
+    if [[ "$DOCKER_USE_HOST_NETWORK" == "true" ]]; then
+        network_args+=(--network host)
+    else
+        for p in "${ports[@]}"; do
+            network_args+=(-p "$p:$p")
+        done
+    fi
+
+    docker run -d --name "$container_name" \
+        "${network_args[@]}" \
+        "${extra_args[@]}" > /dev/null
+}
+
 # ===========================================================================
 # Cleanup (always runs on exit)
 # ===========================================================================
@@ -160,42 +183,25 @@ cleanup() {
         kill "$BACKEND_PID" 2>/dev/null || true
         log_ok "Backend server stopped"
     fi
-    if [[ -n "$FERRUM_PID" ]]; then
-        kill "$FERRUM_PID" 2>/dev/null || true
-        log_ok "Ferrum gateway stopped"
-    fi
-    if [[ -n "$PINGORA_PID" ]]; then
-        kill "$PINGORA_PID" 2>/dev/null || true
-        log_ok "Pingora proxy stopped"
-    fi
-    if [[ "$KONG_PID" == "native" ]]; then
-        KONG_PREFIX="/tmp/kong-bench" kong stop 2>/dev/null || true
-    fi
-    if [[ -n "$ENVOY_NATIVE_PID" ]]; then
-        kill "$ENVOY_NATIVE_PID" 2>/dev/null || true
-        log_ok "Envoy proxy stopped"
-    fi
 
-    docker rm -f "$KONG_CONTAINER" 2>/dev/null || true
-    docker rm -f "$TYK_CONTAINER" 2>/dev/null || true
-    docker rm -f "$KRAKEND_CONTAINER" 2>/dev/null || true
-    docker rm -f "$ENVOY_CONTAINER" 2>/dev/null || true
-    docker rm -f "$REDIS_CONTAINER" 2>/dev/null || true
+    # Remove all Docker containers
+    for c in "$FERRUM_CONTAINER" "$PINGORA_CONTAINER" "$KONG_CONTAINER" \
+             "$TYK_CONTAINER" "$KRAKEND_CONTAINER" "$ENVOY_CONTAINER" "$REDIS_CONTAINER"; do
+        docker rm -f "$c" 2>/dev/null || true
+    done
 
     # Clean up Docker network and temporary config files
     docker network rm "$TYK_NETWORK" 2>/dev/null || true
-    rm -f "$COMP_DIR/configs/.kong_runtime.yaml" 2>/dev/null || true
-    rm -f "$COMP_DIR/configs/.kong_runtime_e2e_tls.yaml" 2>/dev/null || true
+    rm -f "$COMP_DIR/configs/.ferrum_runtime"*.yaml 2>/dev/null || true
+    rm -f "$COMP_DIR/configs/.kong_runtime"*.yaml 2>/dev/null || true
+    rm -f "$COMP_DIR/configs/.kong_runtime_key_auth.yaml" 2>/dev/null || true
     rm -rf "$COMP_DIR/configs/.tyk_runtime_apps" 2>/dev/null || true
     rm -rf "$COMP_DIR/configs/.tyk_runtime_apps_e2e_tls" 2>/dev/null || true
+    rm -rf "$COMP_DIR/configs/.tyk_runtime_apps_key_auth" 2>/dev/null || true
     rm -rf "$COMP_DIR/configs/.tyk_runtime" 2>/dev/null || true
-    rm -f "$COMP_DIR/configs/.krakend_runtime_http.json" 2>/dev/null || true
-    rm -f "$COMP_DIR/configs/.krakend_runtime_https.json" 2>/dev/null || true
-    rm -f "$COMP_DIR/configs/.krakend_runtime_e2e_tls.json" 2>/dev/null || true
-    rm -f "$COMP_DIR/configs/.envoy_runtime_http.yaml" 2>/dev/null || true
-    rm -f "$COMP_DIR/configs/.envoy_runtime_https.yaml" 2>/dev/null || true
-    rm -f "$COMP_DIR/configs/.envoy_runtime_e2e_tls.yaml" 2>/dev/null || true
-    rm -f "$COMP_DIR/configs/.envoy_runtime_key_auth.yaml" 2>/dev/null || true
+    rm -f "$COMP_DIR/configs/.krakend_runtime"*.json 2>/dev/null || true
+    rm -f "$COMP_DIR/configs/.envoy_runtime"*.yaml 2>/dev/null || true
+    rm -f "$COMP_DIR/lua/.tyk_key_auth_runtime.lua" 2>/dev/null || true
 
     kill_port "$BACKEND_PORT"
     kill_port "$BACKEND_HTTPS_PORT"
@@ -209,31 +215,11 @@ trap cleanup EXIT
 # Dependency checks
 # ===========================================================================
 
-needs_docker() {
-    # Docker is needed for Tyk (always), KrakenD (always), Envoy (always), and Kong (unless native)
-    if ! should_skip "tyk"; then
-        return 0
-    fi
-    if ! should_skip "krakend"; then
-        return 0
-    fi
-    if ! should_skip "envoy" && [[ "$ENVOY_NATIVE" != "true" ]]; then
-        return 0
-    fi
-    if ! should_skip "kong" && [[ "$KONG_NATIVE" != "true" ]]; then
-        return 0
-    fi
-    return 1
-}
-
 check_dependencies() {
     log_header "Checking dependencies"
 
     local missing=0
-    local required_cmds=(wrk python3 cargo curl)
-    if needs_docker; then
-        required_cmds+=(docker)
-    fi
+    local required_cmds=(wrk python3 cargo curl docker)
 
     for cmd in "${required_cmds[@]}"; do
         if command -v "$cmd" &>/dev/null; then
@@ -252,27 +238,19 @@ check_dependencies() {
         exit 1
     fi
 
-    # Check Docker daemon is running (only if needed)
-    if needs_docker; then
-        if ! docker info &>/dev/null; then
-            log_err "Docker daemon is not running. Start Docker and try again."
-            exit 1
-        fi
-        log_ok "Docker daemon"
-    else
-        log_info "Docker not required (Kong and Tyk skipped)"
+    # Check Docker daemon is running
+    if ! docker info &>/dev/null; then
+        log_err "Docker daemon is not running. Start Docker and try again."
+        exit 1
     fi
+    log_ok "Docker daemon"
 }
 
 # ===========================================================================
-# Docker image pull (do this upfront so it doesn't affect timing)
+# Docker image pull + local builds
 # ===========================================================================
 
 pull_images() {
-    if ! needs_docker; then
-        return
-    fi
-
     log_header "Pulling Docker images"
 
     if ! should_skip "kong"; then
@@ -298,7 +276,7 @@ pull_images() {
         }
     fi
 
-    if ! should_skip "envoy" && [[ "$ENVOY_NATIVE" != "true" ]]; then
+    if ! should_skip "envoy"; then
         log_info "Pulling envoyproxy/envoy:v${ENVOY_VERSION}..."
         docker pull "envoyproxy/envoy:v${ENVOY_VERSION}" --quiet || {
             log_warn "Failed to pull Envoy image. Will try to use cached version."
@@ -306,37 +284,35 @@ pull_images() {
     fi
 }
 
-# ===========================================================================
-# Build Ferrum + backend
-# ===========================================================================
+build_images() {
+    log_header "Building Docker images"
 
-build_project() {
-    log_header "Building Ferrum Edge and backend server"
-
-    log_info "Building gateway (release)..."
-    cd "$PROJECT_ROOT"
-    cargo build --release --bin ferrum-edge 2>&1 | tail -1
-
+    # Build backend server (runs natively — shared constant)
     log_info "Building backend server (release)..."
     cd "$PERF_DIR"
     cargo build --release --bin backend_server 2>&1 | tail -1
+    log_ok "Backend server built"
 
-    if ! should_skip "pingora"; then
-        log_info "Building Pingora bench proxy (release)..."
-        cd "$PINGORA_PROXY_DIR"
-        cargo build --release 2>&1 | tail -1
-        if [[ -f "$PINGORA_BINARY" ]]; then
-            log_ok "Pingora bench proxy built"
-        else
-            log_warn "Pingora bench proxy build failed — will skip Pingora tests"
-        fi
+    if [[ "$SKIP_BUILD" == "true" ]]; then
+        log_info "SKIP_BUILD=true — using cached Docker images"
+        return
     fi
 
-    log_ok "Build completed"
+    if ! should_skip "ferrum"; then
+        log_info "Building Ferrum Edge Docker image..."
+        docker build -t "$FERRUM_IMAGE" -f "$COMP_DIR/Dockerfile.ferrum-bench" "$PROJECT_ROOT" 2>&1 | tail -5
+        log_ok "Ferrum image built: $FERRUM_IMAGE"
+    fi
+
+    if ! should_skip "pingora"; then
+        log_info "Building Pingora bench proxy Docker image..."
+        docker build -t "$PINGORA_IMAGE" -f "$COMP_DIR/Dockerfile.pingora-bench" "$COMP_DIR/configs/pingora" 2>&1 | tail -5
+        log_ok "Pingora image built: $PINGORA_IMAGE"
+    fi
 }
 
 # ===========================================================================
-# Backend server
+# Backend server (runs natively — shared constant, not benchmarked)
 # ===========================================================================
 
 start_backend() {
@@ -430,81 +406,101 @@ run_wrk_key_auth() {
 }
 
 # ===========================================================================
-# Ferrum Edge
+# Ferrum Edge (Docker)
 # ===========================================================================
 
+prepare_ferrum_config() {
+    sed "s/BACKEND_HOST/$BACKEND_HOST/g" \
+        "$COMP_DIR/configs/ferrum_comparison.yaml" > "$COMP_DIR/configs/.ferrum_runtime.yaml"
+    sed "s/BACKEND_HOST/$BACKEND_HOST/g" \
+        "$COMP_DIR/configs/ferrum_comparison_e2e_tls.yaml" > "$COMP_DIR/configs/.ferrum_runtime_e2e_tls.yaml"
+    sed "s/BACKEND_HOST/$BACKEND_HOST/g" \
+        "$COMP_DIR/configs/ferrum_comparison_key_auth.yaml" > "$COMP_DIR/configs/.ferrum_runtime_key_auth.yaml"
+}
+
 start_ferrum_http() {
-    log_info "Starting Ferrum Edge (HTTP) on port $GATEWAY_HTTP_PORT..."
+    log_info "Starting Ferrum Edge Docker (HTTP) on port $GATEWAY_HTTP_PORT..."
+    docker rm -f "$FERRUM_CONTAINER" 2>/dev/null || true
     kill_port "$GATEWAY_HTTP_PORT"
-    cd "$PROJECT_ROOT"
-    FERRUM_MODE=file \
-    FERRUM_FILE_CONFIG_PATH="$COMP_DIR/configs/ferrum_comparison.yaml" \
-    FERRUM_PROXY_HTTP_PORT="$GATEWAY_HTTP_PORT" \
-    FERRUM_POOL_MAX_IDLE_PER_HOST=200 \
-    FERRUM_POOL_IDLE_TIMEOUT_SECONDS=120 \
-    FERRUM_POOL_ENABLE_HTTP_KEEP_ALIVE=true \
-    FERRUM_POOL_ENABLE_HTTP2=false \
-    FERRUM_LOG_LEVEL=warn \
-    ./target/release/ferrum-edge > "$RESULTS_DIR/ferrum_http.log" 2>&1 &
-    FERRUM_PID=$!
-    wait_for_http "http://127.0.0.1:$GATEWAY_HTTP_PORT/health" "Ferrum (HTTP)"
+
+    docker_run_gateway "$FERRUM_CONTAINER" "$GATEWAY_HTTP_PORT" -- \
+        -v "$COMP_DIR/configs/.ferrum_runtime.yaml:/etc/ferrum/config.yaml:ro" \
+        -e FERRUM_MODE=file \
+        -e FERRUM_FILE_CONFIG_PATH=/etc/ferrum/config.yaml \
+        -e FERRUM_PROXY_HTTP_PORT="$GATEWAY_HTTP_PORT" \
+        -e FERRUM_POOL_MAX_IDLE_PER_HOST=200 \
+        -e FERRUM_POOL_IDLE_TIMEOUT_SECONDS=120 \
+        -e FERRUM_POOL_ENABLE_HTTP_KEEP_ALIVE=true \
+        -e FERRUM_POOL_ENABLE_HTTP2=false \
+        -e FERRUM_LOG_LEVEL=warn \
+        "$FERRUM_IMAGE"
+
+    wait_for_http "http://127.0.0.1:$GATEWAY_HTTP_PORT/health" "Ferrum Docker (HTTP)"
 }
 
 start_ferrum_https() {
-    log_info "Starting Ferrum Edge (HTTPS) on port $GATEWAY_HTTPS_PORT..."
+    log_info "Starting Ferrum Edge Docker (HTTPS) on port $GATEWAY_HTTPS_PORT..."
+    docker rm -f "$FERRUM_CONTAINER" 2>/dev/null || true
     kill_port "$GATEWAY_HTTP_PORT"
     kill_port "$GATEWAY_HTTPS_PORT"
-    cd "$PROJECT_ROOT"
-    FERRUM_MODE=file \
-    FERRUM_FILE_CONFIG_PATH="$COMP_DIR/configs/ferrum_comparison.yaml" \
-    FERRUM_PROXY_HTTP_PORT="$GATEWAY_HTTP_PORT" \
-    FERRUM_PROXY_HTTPS_PORT="$GATEWAY_HTTPS_PORT" \
-    FERRUM_FRONTEND_TLS_CERT_PATH="$CERTS_DIR/server.crt" \
-    FERRUM_FRONTEND_TLS_KEY_PATH="$CERTS_DIR/server.key" \
-    FERRUM_POOL_MAX_IDLE_PER_HOST=200 \
-    FERRUM_POOL_IDLE_TIMEOUT_SECONDS=120 \
-    FERRUM_POOL_ENABLE_HTTP_KEEP_ALIVE=true \
-    FERRUM_POOL_ENABLE_HTTP2=false \
-    FERRUM_LOG_LEVEL=warn \
-    ./target/release/ferrum-edge > "$RESULTS_DIR/ferrum_https.log" 2>&1 &
-    FERRUM_PID=$!
-    wait_for_http "https://127.0.0.1:$GATEWAY_HTTPS_PORT/health" "Ferrum (HTTPS)" 15
+
+    docker_run_gateway "$FERRUM_CONTAINER" "$GATEWAY_HTTP_PORT" "$GATEWAY_HTTPS_PORT" -- \
+        -v "$COMP_DIR/configs/.ferrum_runtime.yaml:/etc/ferrum/config.yaml:ro" \
+        -v "$CERTS_DIR/server.crt:/etc/ferrum/tls/server.crt:ro" \
+        -v "$CERTS_DIR/server.key:/etc/ferrum/tls/server.key:ro" \
+        -e FERRUM_MODE=file \
+        -e FERRUM_FILE_CONFIG_PATH=/etc/ferrum/config.yaml \
+        -e FERRUM_PROXY_HTTP_PORT="$GATEWAY_HTTP_PORT" \
+        -e FERRUM_PROXY_HTTPS_PORT="$GATEWAY_HTTPS_PORT" \
+        -e FERRUM_FRONTEND_TLS_CERT_PATH=/etc/ferrum/tls/server.crt \
+        -e FERRUM_FRONTEND_TLS_KEY_PATH=/etc/ferrum/tls/server.key \
+        -e FERRUM_POOL_MAX_IDLE_PER_HOST=200 \
+        -e FERRUM_POOL_IDLE_TIMEOUT_SECONDS=120 \
+        -e FERRUM_POOL_ENABLE_HTTP_KEEP_ALIVE=true \
+        -e FERRUM_POOL_ENABLE_HTTP2=false \
+        -e FERRUM_LOG_LEVEL=warn \
+        "$FERRUM_IMAGE"
+
+    wait_for_http "https://127.0.0.1:$GATEWAY_HTTPS_PORT/health" "Ferrum Docker (HTTPS)" 15
+}
+
+start_ferrum_e2e_tls() {
+    log_info "Starting Ferrum Edge Docker (E2E TLS) on port $GATEWAY_HTTPS_PORT..."
+    docker rm -f "$FERRUM_CONTAINER" 2>/dev/null || true
+    kill_port "$GATEWAY_HTTP_PORT"
+    kill_port "$GATEWAY_HTTPS_PORT"
+
+    docker_run_gateway "$FERRUM_CONTAINER" "$GATEWAY_HTTP_PORT" "$GATEWAY_HTTPS_PORT" -- \
+        -v "$COMP_DIR/configs/.ferrum_runtime_e2e_tls.yaml:/etc/ferrum/config.yaml:ro" \
+        -v "$CERTS_DIR/server.crt:/etc/ferrum/tls/server.crt:ro" \
+        -v "$CERTS_DIR/server.key:/etc/ferrum/tls/server.key:ro" \
+        -e FERRUM_MODE=file \
+        -e FERRUM_FILE_CONFIG_PATH=/etc/ferrum/config.yaml \
+        -e FERRUM_PROXY_HTTP_PORT="$GATEWAY_HTTP_PORT" \
+        -e FERRUM_PROXY_HTTPS_PORT="$GATEWAY_HTTPS_PORT" \
+        -e FERRUM_FRONTEND_TLS_CERT_PATH=/etc/ferrum/tls/server.crt \
+        -e FERRUM_FRONTEND_TLS_KEY_PATH=/etc/ferrum/tls/server.key \
+        -e FERRUM_POOL_MAX_IDLE_PER_HOST=200 \
+        -e FERRUM_POOL_IDLE_TIMEOUT_SECONDS=120 \
+        -e FERRUM_POOL_ENABLE_HTTP_KEEP_ALIVE=true \
+        -e FERRUM_POOL_ENABLE_HTTP2=false \
+        -e FERRUM_LOG_LEVEL=warn \
+        "$FERRUM_IMAGE"
+
+    wait_for_http "https://127.0.0.1:$GATEWAY_HTTPS_PORT/health" "Ferrum Docker (E2E TLS)" 15
 }
 
 stop_ferrum() {
-    if [[ -n "$FERRUM_PID" ]]; then
-        kill "$FERRUM_PID" 2>/dev/null || true
-        wait "$FERRUM_PID" 2>/dev/null || true
-        FERRUM_PID=""
-    fi
+    docker rm -f "$FERRUM_CONTAINER" 2>/dev/null || true
     kill_port "$GATEWAY_HTTP_PORT"
     kill_port "$GATEWAY_HTTPS_PORT"
     sleep 1
 }
 
-start_ferrum_e2e_tls() {
-    log_info "Starting Ferrum Edge (E2E TLS) on port $GATEWAY_HTTPS_PORT..."
-    kill_port "$GATEWAY_HTTP_PORT"
-    kill_port "$GATEWAY_HTTPS_PORT"
-    cd "$PROJECT_ROOT"
-    FERRUM_MODE=file \
-    FERRUM_FILE_CONFIG_PATH="$COMP_DIR/configs/ferrum_comparison_e2e_tls.yaml" \
-    FERRUM_PROXY_HTTP_PORT="$GATEWAY_HTTP_PORT" \
-    FERRUM_PROXY_HTTPS_PORT="$GATEWAY_HTTPS_PORT" \
-    FERRUM_FRONTEND_TLS_CERT_PATH="$CERTS_DIR/server.crt" \
-    FERRUM_FRONTEND_TLS_KEY_PATH="$CERTS_DIR/server.key" \
-    FERRUM_POOL_MAX_IDLE_PER_HOST=200 \
-    FERRUM_POOL_IDLE_TIMEOUT_SECONDS=120 \
-    FERRUM_POOL_ENABLE_HTTP_KEEP_ALIVE=true \
-    FERRUM_POOL_ENABLE_HTTP2=false \
-    FERRUM_LOG_LEVEL=warn \
-    ./target/release/ferrum-edge > "$RESULTS_DIR/ferrum_e2e_tls.log" 2>&1 &
-    FERRUM_PID=$!
-    wait_for_http "https://127.0.0.1:$GATEWAY_HTTPS_PORT/health" "Ferrum (E2E TLS)" 15
-}
-
 test_ferrum() {
-    log_header "Testing Ferrum Edge"
+    log_header "Testing Ferrum Edge (Docker)"
+
+    prepare_ferrum_config
 
     # HTTP tests
     start_ferrum_http
@@ -526,69 +522,73 @@ test_ferrum() {
 }
 
 # ===========================================================================
-# Pingora (Cloudflare) — native Rust proxy framework
+# Pingora (Cloudflare) — Docker
 # ===========================================================================
 
 start_pingora_http() {
-    log_info "Starting Pingora bench proxy (HTTP) on port $GATEWAY_HTTP_PORT..."
+    log_info "Starting Pingora Docker (HTTP) on port $GATEWAY_HTTP_PORT..."
+    docker rm -f "$PINGORA_CONTAINER" 2>/dev/null || true
     kill_port "$GATEWAY_HTTP_PORT"
-    PINGORA_HTTP_PORT="$GATEWAY_HTTP_PORT" \
-    PINGORA_BACKEND_HOST=127.0.0.1 \
-    PINGORA_BACKEND_PORT="$BACKEND_PORT" \
-    "$PINGORA_BINARY" > "$RESULTS_DIR/pingora_http.log" 2>&1 &
-    PINGORA_PID=$!
-    wait_for_http "http://127.0.0.1:$GATEWAY_HTTP_PORT/health" "Pingora (HTTP)"
+
+    docker_run_gateway "$PINGORA_CONTAINER" "$GATEWAY_HTTP_PORT" -- \
+        -e PINGORA_HTTP_PORT="$GATEWAY_HTTP_PORT" \
+        -e PINGORA_BACKEND_HOST="$BACKEND_HOST" \
+        -e PINGORA_BACKEND_PORT="$BACKEND_PORT" \
+        "$PINGORA_IMAGE"
+
+    wait_for_http "http://127.0.0.1:$GATEWAY_HTTP_PORT/health" "Pingora Docker (HTTP)"
 }
 
 start_pingora_https() {
-    log_info "Starting Pingora bench proxy (HTTPS) on ports $GATEWAY_HTTP_PORT + $GATEWAY_HTTPS_PORT..."
+    log_info "Starting Pingora Docker (HTTPS) on ports $GATEWAY_HTTP_PORT + $GATEWAY_HTTPS_PORT..."
+    docker rm -f "$PINGORA_CONTAINER" 2>/dev/null || true
     kill_port "$GATEWAY_HTTP_PORT"
     kill_port "$GATEWAY_HTTPS_PORT"
-    PINGORA_HTTP_PORT="$GATEWAY_HTTP_PORT" \
-    PINGORA_HTTPS_PORT="$GATEWAY_HTTPS_PORT" \
-    PINGORA_BACKEND_HOST=127.0.0.1 \
-    PINGORA_BACKEND_PORT="$BACKEND_PORT" \
-    PINGORA_TLS_CERT="$CERTS_DIR/server.crt" \
-    PINGORA_TLS_KEY="$CERTS_DIR/server.key" \
-    "$PINGORA_BINARY" > "$RESULTS_DIR/pingora_https.log" 2>&1 &
-    PINGORA_PID=$!
-    wait_for_http "https://127.0.0.1:$GATEWAY_HTTPS_PORT/health" "Pingora (HTTPS)" 15
+
+    docker_run_gateway "$PINGORA_CONTAINER" "$GATEWAY_HTTP_PORT" "$GATEWAY_HTTPS_PORT" -- \
+        -v "$CERTS_DIR/server.crt:/etc/pingora/tls/server.crt:ro" \
+        -v "$CERTS_DIR/server.key:/etc/pingora/tls/server.key:ro" \
+        -e PINGORA_HTTP_PORT="$GATEWAY_HTTP_PORT" \
+        -e PINGORA_HTTPS_PORT="$GATEWAY_HTTPS_PORT" \
+        -e PINGORA_BACKEND_HOST="$BACKEND_HOST" \
+        -e PINGORA_BACKEND_PORT="$BACKEND_PORT" \
+        -e PINGORA_TLS_CERT=/etc/pingora/tls/server.crt \
+        -e PINGORA_TLS_KEY=/etc/pingora/tls/server.key \
+        "$PINGORA_IMAGE"
+
+    wait_for_http "https://127.0.0.1:$GATEWAY_HTTPS_PORT/health" "Pingora Docker (HTTPS)" 15
 }
 
 start_pingora_e2e_tls() {
-    log_info "Starting Pingora bench proxy (E2E TLS) on port $GATEWAY_HTTPS_PORT..."
+    log_info "Starting Pingora Docker (E2E TLS) on port $GATEWAY_HTTPS_PORT..."
+    docker rm -f "$PINGORA_CONTAINER" 2>/dev/null || true
     kill_port "$GATEWAY_HTTP_PORT"
     kill_port "$GATEWAY_HTTPS_PORT"
-    PINGORA_HTTP_PORT="$GATEWAY_HTTP_PORT" \
-    PINGORA_HTTPS_PORT="$GATEWAY_HTTPS_PORT" \
-    PINGORA_BACKEND_HOST=127.0.0.1 \
-    PINGORA_BACKEND_PORT="$BACKEND_HTTPS_PORT" \
-    PINGORA_BACKEND_TLS=true \
-    PINGORA_TLS_CERT="$CERTS_DIR/server.crt" \
-    PINGORA_TLS_KEY="$CERTS_DIR/server.key" \
-    "$PINGORA_BINARY" > "$RESULTS_DIR/pingora_e2e_tls.log" 2>&1 &
-    PINGORA_PID=$!
-    wait_for_http "https://127.0.0.1:$GATEWAY_HTTPS_PORT/health" "Pingora (E2E TLS)" 15
+
+    docker_run_gateway "$PINGORA_CONTAINER" "$GATEWAY_HTTP_PORT" "$GATEWAY_HTTPS_PORT" -- \
+        -v "$CERTS_DIR/server.crt:/etc/pingora/tls/server.crt:ro" \
+        -v "$CERTS_DIR/server.key:/etc/pingora/tls/server.key:ro" \
+        -e PINGORA_HTTP_PORT="$GATEWAY_HTTP_PORT" \
+        -e PINGORA_HTTPS_PORT="$GATEWAY_HTTPS_PORT" \
+        -e PINGORA_BACKEND_HOST="$BACKEND_HOST" \
+        -e PINGORA_BACKEND_PORT="$BACKEND_HTTPS_PORT" \
+        -e PINGORA_BACKEND_TLS=true \
+        -e PINGORA_TLS_CERT=/etc/pingora/tls/server.crt \
+        -e PINGORA_TLS_KEY=/etc/pingora/tls/server.key \
+        "$PINGORA_IMAGE"
+
+    wait_for_http "https://127.0.0.1:$GATEWAY_HTTPS_PORT/health" "Pingora Docker (E2E TLS)" 15
 }
 
 stop_pingora() {
-    if [[ -n "$PINGORA_PID" ]]; then
-        kill "$PINGORA_PID" 2>/dev/null || true
-        wait "$PINGORA_PID" 2>/dev/null || true
-        PINGORA_PID=""
-    fi
+    docker rm -f "$PINGORA_CONTAINER" 2>/dev/null || true
     kill_port "$GATEWAY_HTTP_PORT"
     kill_port "$GATEWAY_HTTPS_PORT"
     sleep 1
 }
 
 test_pingora() {
-    if [[ ! -f "$PINGORA_BINARY" ]]; then
-        log_warn "Pingora bench proxy not built — skipping Pingora tests"
-        return
-    fi
-
-    log_header "Testing Pingora (Cloudflare)"
+    log_header "Testing Pingora (Docker)"
 
     # HTTP tests
     start_pingora_http
@@ -616,113 +616,22 @@ test_pingora() {
 }
 
 # ===========================================================================
-# Kong Gateway
+# Kong Gateway (Docker)
 # ===========================================================================
 
 prepare_kong_config() {
-    # For Docker: replace BACKEND_HOST placeholder
-    # For native: always use 127.0.0.1 (backend is on localhost)
-    local host
-    if [[ "$KONG_NATIVE" == "true" ]]; then
-        host="127.0.0.1"
-    else
-        host="$BACKEND_HOST"
-    fi
-    sed "s/BACKEND_HOST/$host/g" \
+    sed "s/BACKEND_HOST/$BACKEND_HOST/g" \
         "$COMP_DIR/configs/kong.yaml" > "$COMP_DIR/configs/.kong_runtime.yaml"
-    sed "s/BACKEND_HOST/$host/g" \
+    sed "s/BACKEND_HOST/$BACKEND_HOST/g" \
         "$COMP_DIR/configs/kong_e2e_tls.yaml" > "$COMP_DIR/configs/.kong_runtime_e2e_tls.yaml"
 }
 
-# --- Kong Native ---
-
-start_kong_native_http() {
-    log_info "Starting Kong Gateway native (HTTP) on port $GATEWAY_HTTP_PORT..."
-    kill_port "$GATEWAY_HTTP_PORT"
-
-    KONG_DATABASE=off \
-    KONG_DECLARATIVE_CONFIG="$COMP_DIR/configs/.kong_runtime.yaml" \
-    KONG_PROXY_LISTEN="0.0.0.0:$GATEWAY_HTTP_PORT" \
-    KONG_ADMIN_LISTEN="off" \
-    KONG_PROXY_ACCESS_LOG=/dev/null \
-    KONG_PROXY_ERROR_LOG=/dev/stderr \
-    KONG_LOG_LEVEL=warn \
-    KONG_PREFIX="/tmp/kong-bench" \
-    KONG_UPSTREAM_KEEPALIVE_POOL_SIZE=128 \
-    kong start > "$RESULTS_DIR/kong_http.log" 2>&1
-
-    KONG_PID="native"
-    wait_for_http "http://127.0.0.1:$GATEWAY_HTTP_PORT/health" "Kong native (HTTP)" 20
-}
-
-start_kong_native_https() {
-    log_info "Starting Kong Gateway native (HTTPS) on port $GATEWAY_HTTPS_PORT..."
-    kill_port "$GATEWAY_HTTP_PORT"
-    kill_port "$GATEWAY_HTTPS_PORT"
-
-    KONG_DATABASE=off \
-    KONG_DECLARATIVE_CONFIG="$COMP_DIR/configs/.kong_runtime.yaml" \
-    KONG_PROXY_LISTEN="0.0.0.0:$GATEWAY_HTTP_PORT, 0.0.0.0:$GATEWAY_HTTPS_PORT ssl" \
-    KONG_SSL_CERT="$CERTS_DIR/server.crt" \
-    KONG_SSL_CERT_KEY="$CERTS_DIR/server.key" \
-    KONG_ADMIN_LISTEN="off" \
-    KONG_PROXY_ACCESS_LOG=/dev/null \
-    KONG_PROXY_ERROR_LOG=/dev/stderr \
-    KONG_LOG_LEVEL=warn \
-    KONG_PREFIX="/tmp/kong-bench" \
-    KONG_UPSTREAM_KEEPALIVE_POOL_SIZE=128 \
-    kong start > "$RESULTS_DIR/kong_https.log" 2>&1
-
-    KONG_PID="native"
-    wait_for_http "https://127.0.0.1:$GATEWAY_HTTPS_PORT/health" "Kong native (HTTPS)" 20
-}
-
-start_kong_native_e2e_tls() {
-    log_info "Starting Kong Gateway native (E2E TLS) on port $GATEWAY_HTTPS_PORT..."
-    kill_port "$GATEWAY_HTTP_PORT"
-    kill_port "$GATEWAY_HTTPS_PORT"
-
-    KONG_DATABASE=off \
-    KONG_DECLARATIVE_CONFIG="$COMP_DIR/configs/.kong_runtime_e2e_tls.yaml" \
-    KONG_PROXY_LISTEN="0.0.0.0:$GATEWAY_HTTP_PORT, 0.0.0.0:$GATEWAY_HTTPS_PORT ssl" \
-    KONG_SSL_CERT="$CERTS_DIR/server.crt" \
-    KONG_SSL_CERT_KEY="$CERTS_DIR/server.key" \
-    KONG_ADMIN_LISTEN="off" \
-    KONG_PROXY_ACCESS_LOG=/dev/null \
-    KONG_PROXY_ERROR_LOG=/dev/stderr \
-    KONG_LOG_LEVEL=warn \
-    KONG_PREFIX="/tmp/kong-bench" \
-    KONG_UPSTREAM_KEEPALIVE_POOL_SIZE=128 \
-    kong start > "$RESULTS_DIR/kong_e2e_tls.log" 2>&1
-
-    KONG_PID="native"
-    wait_for_http "https://127.0.0.1:$GATEWAY_HTTPS_PORT/health" "Kong native (E2E TLS)" 20
-}
-
-stop_kong_native() {
-    KONG_PREFIX="/tmp/kong-bench" kong stop 2>/dev/null || true
-    KONG_PID=""
-    kill_port "$GATEWAY_HTTP_PORT"
-    kill_port "$GATEWAY_HTTPS_PORT"
-    sleep 1
-}
-
-# --- Kong Docker ---
-
-start_kong_docker_http() {
+start_kong_http() {
     log_info "Starting Kong Gateway Docker (HTTP) on port $GATEWAY_HTTP_PORT..."
     docker rm -f "$KONG_CONTAINER" 2>/dev/null || true
     kill_port "$GATEWAY_HTTP_PORT"
 
-    local network_args=()
-    if [[ "$DOCKER_USE_HOST_NETWORK" == "true" ]]; then
-        network_args+=(--network host)
-    else
-        network_args+=(-p "$GATEWAY_HTTP_PORT:$GATEWAY_HTTP_PORT")
-    fi
-
-    docker run -d --name "$KONG_CONTAINER" \
-        "${network_args[@]}" \
+    docker_run_gateway "$KONG_CONTAINER" "$GATEWAY_HTTP_PORT" -- \
         -v "$COMP_DIR/configs/.kong_runtime.yaml:/etc/kong/kong.yml:ro" \
         -e KONG_DATABASE=off \
         -e KONG_DECLARATIVE_CONFIG=/etc/kong/kong.yml \
@@ -732,26 +641,18 @@ start_kong_docker_http() {
         -e KONG_PROXY_ERROR_LOG=/dev/stderr \
         -e KONG_LOG_LEVEL=warn \
         -e KONG_UPSTREAM_KEEPALIVE_POOL_SIZE=128 \
-        "kong/kong-gateway:${KONG_VERSION}" > /dev/null
+        "kong/kong-gateway:${KONG_VERSION}"
 
     wait_for_http "http://127.0.0.1:$GATEWAY_HTTP_PORT/health" "Kong Docker (HTTP)" 20
 }
 
-start_kong_docker_https() {
+start_kong_https() {
     log_info "Starting Kong Gateway Docker (HTTPS) on port $GATEWAY_HTTPS_PORT..."
     docker rm -f "$KONG_CONTAINER" 2>/dev/null || true
     kill_port "$GATEWAY_HTTP_PORT"
     kill_port "$GATEWAY_HTTPS_PORT"
 
-    local network_args=()
-    if [[ "$DOCKER_USE_HOST_NETWORK" == "true" ]]; then
-        network_args+=(--network host)
-    else
-        network_args+=(-p "$GATEWAY_HTTP_PORT:$GATEWAY_HTTP_PORT" -p "$GATEWAY_HTTPS_PORT:$GATEWAY_HTTPS_PORT")
-    fi
-
-    docker run -d --name "$KONG_CONTAINER" \
-        "${network_args[@]}" \
+    docker_run_gateway "$KONG_CONTAINER" "$GATEWAY_HTTP_PORT" "$GATEWAY_HTTPS_PORT" -- \
         -v "$COMP_DIR/configs/.kong_runtime.yaml:/etc/kong/kong.yml:ro" \
         -v "$CERTS_DIR/server.crt:/etc/kong/ssl/server.crt:ro" \
         -v "$CERTS_DIR/server.key:/etc/kong/ssl/server.key:ro" \
@@ -765,26 +666,18 @@ start_kong_docker_https() {
         -e KONG_PROXY_ERROR_LOG=/dev/stderr \
         -e KONG_LOG_LEVEL=warn \
         -e KONG_UPSTREAM_KEEPALIVE_POOL_SIZE=128 \
-        "kong/kong-gateway:${KONG_VERSION}" > /dev/null
+        "kong/kong-gateway:${KONG_VERSION}"
 
     wait_for_http "https://127.0.0.1:$GATEWAY_HTTPS_PORT/health" "Kong Docker (HTTPS)" 20
 }
 
-start_kong_docker_e2e_tls() {
+start_kong_e2e_tls() {
     log_info "Starting Kong Gateway Docker (E2E TLS) on port $GATEWAY_HTTPS_PORT..."
     docker rm -f "$KONG_CONTAINER" 2>/dev/null || true
     kill_port "$GATEWAY_HTTP_PORT"
     kill_port "$GATEWAY_HTTPS_PORT"
 
-    local network_args=()
-    if [[ "$DOCKER_USE_HOST_NETWORK" == "true" ]]; then
-        network_args+=(--network host)
-    else
-        network_args+=(-p "$GATEWAY_HTTP_PORT:$GATEWAY_HTTP_PORT" -p "$GATEWAY_HTTPS_PORT:$GATEWAY_HTTPS_PORT")
-    fi
-
-    docker run -d --name "$KONG_CONTAINER" \
-        "${network_args[@]}" \
+    docker_run_gateway "$KONG_CONTAINER" "$GATEWAY_HTTP_PORT" "$GATEWAY_HTTPS_PORT" -- \
         -v "$COMP_DIR/configs/.kong_runtime_e2e_tls.yaml:/etc/kong/kong.yml:ro" \
         -v "$CERTS_DIR/server.crt:/etc/kong/ssl/server.crt:ro" \
         -v "$CERTS_DIR/server.key:/etc/kong/ssl/server.key:ro" \
@@ -798,78 +691,44 @@ start_kong_docker_e2e_tls() {
         -e KONG_PROXY_ERROR_LOG=/dev/stderr \
         -e KONG_LOG_LEVEL=warn \
         -e KONG_UPSTREAM_KEEPALIVE_POOL_SIZE=128 \
-        "kong/kong-gateway:${KONG_VERSION}" > /dev/null
+        "kong/kong-gateway:${KONG_VERSION}"
 
     wait_for_http "https://127.0.0.1:$GATEWAY_HTTPS_PORT/health" "Kong Docker (E2E TLS)" 20
 }
 
-stop_kong_docker() {
+stop_kong() {
     docker rm -f "$KONG_CONTAINER" 2>/dev/null || true
     kill_port "$GATEWAY_HTTP_PORT"
     kill_port "$GATEWAY_HTTPS_PORT"
     sleep 1
 }
 
-# --- Kong dispatch ---
-
-stop_kong() {
-    if [[ "$KONG_NATIVE" == "true" ]]; then
-        stop_kong_native
-    else
-        stop_kong_docker
-    fi
-}
-
 test_kong() {
-    if [[ "$KONG_NATIVE" == "true" ]]; then
-        log_header "Testing Kong Gateway (native, $(kong version 2>/dev/null || echo 'unknown'))"
-    else
-        log_header "Testing Kong Gateway (Docker ${KONG_VERSION})"
-    fi
+    log_header "Testing Kong Gateway (Docker ${KONG_VERSION})"
 
     prepare_kong_config
 
-    if [[ "$KONG_NATIVE" == "true" ]]; then
-        # HTTP tests
-        start_kong_native_http
-        run_wrk "kong" "http" "/health" "$GATEWAY_HTTP_PORT"
-        run_wrk "kong" "http" "/api/users" "$GATEWAY_HTTP_PORT"
-        stop_kong_native
+    # HTTP tests
+    start_kong_http
+    run_wrk "kong" "http" "/health" "$GATEWAY_HTTP_PORT"
+    run_wrk "kong" "http" "/api/users" "$GATEWAY_HTTP_PORT"
+    stop_kong
 
-        # HTTPS tests (TLS termination — plaintext backend)
-        start_kong_native_https
-        run_wrk "kong" "https" "/health" "$GATEWAY_HTTPS_PORT"
-        run_wrk "kong" "https" "/api/users" "$GATEWAY_HTTPS_PORT"
-        stop_kong_native
+    # HTTPS tests (TLS termination — plaintext backend)
+    start_kong_https
+    run_wrk "kong" "https" "/health" "$GATEWAY_HTTPS_PORT"
+    run_wrk "kong" "https" "/api/users" "$GATEWAY_HTTPS_PORT"
+    stop_kong
 
-        # E2E TLS tests (TLS on both sides)
-        start_kong_native_e2e_tls
-        run_wrk "kong" "e2e_tls" "/health" "$GATEWAY_HTTPS_PORT"
-        run_wrk "kong" "e2e_tls" "/api/users" "$GATEWAY_HTTPS_PORT"
-        stop_kong_native
-    else
-        # HTTP tests
-        start_kong_docker_http
-        run_wrk "kong" "http" "/health" "$GATEWAY_HTTP_PORT"
-        run_wrk "kong" "http" "/api/users" "$GATEWAY_HTTP_PORT"
-        stop_kong_docker
-
-        # HTTPS tests (TLS termination — plaintext backend)
-        start_kong_docker_https
-        run_wrk "kong" "https" "/health" "$GATEWAY_HTTPS_PORT"
-        run_wrk "kong" "https" "/api/users" "$GATEWAY_HTTPS_PORT"
-        stop_kong_docker
-
-        # E2E TLS tests (TLS on both sides)
-        start_kong_docker_e2e_tls
-        run_wrk "kong" "e2e_tls" "/health" "$GATEWAY_HTTPS_PORT"
-        run_wrk "kong" "e2e_tls" "/api/users" "$GATEWAY_HTTPS_PORT"
-        stop_kong_docker
-    fi
+    # E2E TLS tests (TLS on both sides)
+    start_kong_e2e_tls
+    run_wrk "kong" "e2e_tls" "/health" "$GATEWAY_HTTPS_PORT"
+    run_wrk "kong" "e2e_tls" "/api/users" "$GATEWAY_HTTPS_PORT"
+    stop_kong
 }
 
 # ===========================================================================
-# Tyk Gateway
+# Tyk Gateway (Docker)
 # ===========================================================================
 
 prepare_tyk_config() {
@@ -1001,7 +860,7 @@ stop_tyk() {
 }
 
 test_tyk() {
-    log_header "Testing Tyk Gateway (${TYK_VERSION})"
+    log_header "Testing Tyk Gateway (Docker ${TYK_VERSION})"
 
     prepare_tyk_config
     start_redis
@@ -1027,11 +886,10 @@ test_tyk() {
 }
 
 # ===========================================================================
-# KrakenD Gateway
+# KrakenD Gateway (Docker)
 # ===========================================================================
 
 prepare_krakend_config() {
-    # Replace BACKEND_HOST placeholder in KrakenD config files
     sed "s/BACKEND_HOST/$BACKEND_HOST/g" \
         "$COMP_DIR/configs/krakend/krakend_http.json" > "$COMP_DIR/configs/.krakend_runtime_http.json"
     sed "s/BACKEND_HOST/$BACKEND_HOST/g" \
@@ -1045,18 +903,10 @@ start_krakend_http() {
     docker rm -f "$KRAKEND_CONTAINER" 2>/dev/null || true
     kill_port "$GATEWAY_HTTP_PORT"
 
-    local network_args=()
-    if [[ "$DOCKER_USE_HOST_NETWORK" == "true" ]]; then
-        network_args+=(--network host)
-    else
-        network_args+=(-p "$GATEWAY_HTTP_PORT:$GATEWAY_HTTP_PORT")
-    fi
-
-    docker run -d --name "$KRAKEND_CONTAINER" \
-        "${network_args[@]}" \
+    docker_run_gateway "$KRAKEND_CONTAINER" "$GATEWAY_HTTP_PORT" -- \
         -v "$COMP_DIR/configs/.krakend_runtime_http.json:/etc/krakend/krakend.json:ro" \
         "krakend:${KRAKEND_VERSION}" \
-        run -c /etc/krakend/krakend.json > /dev/null
+        run -c /etc/krakend/krakend.json
 
     wait_for_http "http://127.0.0.1:$GATEWAY_HTTP_PORT/health" "KrakenD (HTTP)" 20
 }
@@ -1067,20 +917,12 @@ start_krakend_https() {
     kill_port "$GATEWAY_HTTP_PORT"
     kill_port "$GATEWAY_HTTPS_PORT"
 
-    local network_args=()
-    if [[ "$DOCKER_USE_HOST_NETWORK" == "true" ]]; then
-        network_args+=(--network host)
-    else
-        network_args+=(-p "$GATEWAY_HTTPS_PORT:$GATEWAY_HTTPS_PORT")
-    fi
-
-    docker run -d --name "$KRAKEND_CONTAINER" \
-        "${network_args[@]}" \
+    docker_run_gateway "$KRAKEND_CONTAINER" "$GATEWAY_HTTPS_PORT" -- \
         -v "$COMP_DIR/configs/.krakend_runtime_https.json:/etc/krakend/krakend.json:ro" \
         -v "$CERTS_DIR/server.crt:/etc/krakend/tls/server.crt:ro" \
         -v "$CERTS_DIR/server.key:/etc/krakend/tls/server.key:ro" \
         "krakend:${KRAKEND_VERSION}" \
-        run -c /etc/krakend/krakend.json > /dev/null
+        run -c /etc/krakend/krakend.json
 
     wait_for_http "https://127.0.0.1:$GATEWAY_HTTPS_PORT/health" "KrakenD (HTTPS)" 20
 }
@@ -1091,20 +933,12 @@ start_krakend_e2e_tls() {
     kill_port "$GATEWAY_HTTP_PORT"
     kill_port "$GATEWAY_HTTPS_PORT"
 
-    local network_args=()
-    if [[ "$DOCKER_USE_HOST_NETWORK" == "true" ]]; then
-        network_args+=(--network host)
-    else
-        network_args+=(-p "$GATEWAY_HTTPS_PORT:$GATEWAY_HTTPS_PORT")
-    fi
-
-    docker run -d --name "$KRAKEND_CONTAINER" \
-        "${network_args[@]}" \
+    docker_run_gateway "$KRAKEND_CONTAINER" "$GATEWAY_HTTPS_PORT" -- \
         -v "$COMP_DIR/configs/.krakend_runtime_e2e_tls.json:/etc/krakend/krakend.json:ro" \
         -v "$CERTS_DIR/server.crt:/etc/krakend/tls/server.crt:ro" \
         -v "$CERTS_DIR/server.key:/etc/krakend/tls/server.key:ro" \
         "krakend:${KRAKEND_VERSION}" \
-        run -c /etc/krakend/krakend.json > /dev/null
+        run -c /etc/krakend/krakend.json
 
     wait_for_http "https://127.0.0.1:$GATEWAY_HTTPS_PORT/health" "KrakenD (E2E TLS)" 20
 }
@@ -1117,7 +951,7 @@ stop_krakend() {
 }
 
 test_krakend() {
-    log_header "Testing KrakenD Gateway (${KRAKEND_VERSION})"
+    log_header "Testing KrakenD Gateway (Docker ${KRAKEND_VERSION})"
 
     prepare_krakend_config
 
@@ -1141,220 +975,91 @@ test_krakend() {
 }
 
 # ===========================================================================
-# Envoy Proxy
+# Envoy Proxy (Docker)
 # ===========================================================================
 
 prepare_envoy_config() {
-    # For Docker: replace BACKEND_HOST placeholder
-    # For native: always use 127.0.0.1 (backend is on localhost)
-    local host
-    if [[ "$ENVOY_NATIVE" == "true" ]]; then
-        host="127.0.0.1"
-    else
-        host="$BACKEND_HOST"
-    fi
-    sed "s/BACKEND_HOST/$host/g" \
+    sed "s/BACKEND_HOST/$BACKEND_HOST/g" \
         "$COMP_DIR/configs/envoy/envoy_http.yaml" > "$COMP_DIR/configs/.envoy_runtime_http.yaml"
-    sed "s/BACKEND_HOST/$host/g" \
+    sed "s/BACKEND_HOST/$BACKEND_HOST/g" \
+        "$COMP_DIR/configs/envoy/envoy_https.yaml" > "$COMP_DIR/configs/.envoy_runtime_https.yaml"
+    sed "s/BACKEND_HOST/$BACKEND_HOST/g" \
+        "$COMP_DIR/configs/envoy/envoy_e2e_tls.yaml" > "$COMP_DIR/configs/.envoy_runtime_e2e_tls.yaml"
+    sed "s/BACKEND_HOST/$BACKEND_HOST/g" \
         "$COMP_DIR/configs/envoy/envoy_key_auth.yaml" > "$COMP_DIR/configs/.envoy_runtime_key_auth.yaml"
-    # For native: rewrite TLS cert paths to local filesystem
-    if [[ "$ENVOY_NATIVE" == "true" ]]; then
-        sed "s/BACKEND_HOST/$host/g; s|/etc/envoy/tls/server.crt|$CERTS_DIR/server.crt|g; s|/etc/envoy/tls/server.key|$CERTS_DIR/server.key|g" \
-            "$COMP_DIR/configs/envoy/envoy_https.yaml" > "$COMP_DIR/configs/.envoy_runtime_https.yaml"
-        sed "s/BACKEND_HOST/$host/g; s|/etc/envoy/tls/server.crt|$CERTS_DIR/server.crt|g; s|/etc/envoy/tls/server.key|$CERTS_DIR/server.key|g" \
-            "$COMP_DIR/configs/envoy/envoy_e2e_tls.yaml" > "$COMP_DIR/configs/.envoy_runtime_e2e_tls.yaml"
-    else
-        sed "s/BACKEND_HOST/$host/g" \
-            "$COMP_DIR/configs/envoy/envoy_https.yaml" > "$COMP_DIR/configs/.envoy_runtime_https.yaml"
-        sed "s/BACKEND_HOST/$host/g" \
-            "$COMP_DIR/configs/envoy/envoy_e2e_tls.yaml" > "$COMP_DIR/configs/.envoy_runtime_e2e_tls.yaml"
-    fi
 }
 
-# --- Envoy Native ---
-
-ENVOY_NATIVE_PID=""
-
-start_envoy_native_http() {
-    log_info "Starting Envoy Proxy native (HTTP) on port $GATEWAY_HTTP_PORT..."
-    kill_port "$GATEWAY_HTTP_PORT"
-    kill_port 9901  # Envoy admin port
-
-    envoy -c "$COMP_DIR/configs/.envoy_runtime_http.yaml" --log-level warning \
-        > "$RESULTS_DIR/envoy_http.log" 2>&1 &
-    ENVOY_NATIVE_PID=$!
-
-    wait_for_http "http://127.0.0.1:$GATEWAY_HTTP_PORT/health" "Envoy native (HTTP)" 20
-}
-
-start_envoy_native_https() {
-    log_info "Starting Envoy Proxy native (HTTPS) on port $GATEWAY_HTTPS_PORT..."
-    kill_port "$GATEWAY_HTTP_PORT"
-    kill_port "$GATEWAY_HTTPS_PORT"
-    kill_port 9901
-
-    envoy -c "$COMP_DIR/configs/.envoy_runtime_https.yaml" --log-level warning \
-        > "$RESULTS_DIR/envoy_https.log" 2>&1 &
-    ENVOY_NATIVE_PID=$!
-
-    wait_for_http "https://127.0.0.1:$GATEWAY_HTTPS_PORT/health" "Envoy native (HTTPS)" 20
-}
-
-start_envoy_native_e2e_tls() {
-    log_info "Starting Envoy Proxy native (E2E TLS) on port $GATEWAY_HTTPS_PORT..."
-    kill_port "$GATEWAY_HTTP_PORT"
-    kill_port "$GATEWAY_HTTPS_PORT"
-    kill_port 9901
-
-    envoy -c "$COMP_DIR/configs/.envoy_runtime_e2e_tls.yaml" --log-level warning \
-        > "$RESULTS_DIR/envoy_e2e_tls.log" 2>&1 &
-    ENVOY_NATIVE_PID=$!
-
-    wait_for_http "https://127.0.0.1:$GATEWAY_HTTPS_PORT/health" "Envoy native (E2E TLS)" 20
-}
-
-stop_envoy_native() {
-    if [[ -n "$ENVOY_NATIVE_PID" ]]; then
-        kill "$ENVOY_NATIVE_PID" 2>/dev/null || true
-        ENVOY_NATIVE_PID=""
-    fi
-    kill_port "$GATEWAY_HTTP_PORT"
-    kill_port "$GATEWAY_HTTPS_PORT"
-    kill_port 9901
-    sleep 1
-}
-
-# --- Envoy Docker ---
-
-start_envoy_docker_http() {
+start_envoy_http() {
     log_info "Starting Envoy Proxy Docker (HTTP) on port $GATEWAY_HTTP_PORT..."
     docker rm -f "$ENVOY_CONTAINER" 2>/dev/null || true
     kill_port "$GATEWAY_HTTP_PORT"
 
-    local network_args=()
-    if [[ "$DOCKER_USE_HOST_NETWORK" == "true" ]]; then
-        network_args+=(--network host)
-    else
-        network_args+=(-p "$GATEWAY_HTTP_PORT:$GATEWAY_HTTP_PORT")
-    fi
-
-    docker run -d --name "$ENVOY_CONTAINER" \
-        "${network_args[@]}" \
+    docker_run_gateway "$ENVOY_CONTAINER" "$GATEWAY_HTTP_PORT" -- \
         -v "$COMP_DIR/configs/.envoy_runtime_http.yaml:/etc/envoy/envoy.yaml:ro" \
-        "envoyproxy/envoy:v${ENVOY_VERSION}" > /dev/null
+        "envoyproxy/envoy:v${ENVOY_VERSION}"
 
     wait_for_http "http://127.0.0.1:$GATEWAY_HTTP_PORT/health" "Envoy Docker (HTTP)" 20
 }
 
-start_envoy_docker_https() {
+start_envoy_https() {
     log_info "Starting Envoy Proxy Docker (HTTPS) on port $GATEWAY_HTTPS_PORT..."
     docker rm -f "$ENVOY_CONTAINER" 2>/dev/null || true
     kill_port "$GATEWAY_HTTP_PORT"
     kill_port "$GATEWAY_HTTPS_PORT"
 
-    local network_args=()
-    if [[ "$DOCKER_USE_HOST_NETWORK" == "true" ]]; then
-        network_args+=(--network host)
-    else
-        network_args+=(-p "$GATEWAY_HTTPS_PORT:$GATEWAY_HTTPS_PORT")
-    fi
-
-    docker run -d --name "$ENVOY_CONTAINER" \
-        "${network_args[@]}" \
+    docker_run_gateway "$ENVOY_CONTAINER" "$GATEWAY_HTTPS_PORT" -- \
         -v "$COMP_DIR/configs/.envoy_runtime_https.yaml:/etc/envoy/envoy.yaml:ro" \
         -v "$CERTS_DIR/server.crt:/etc/envoy/tls/server.crt:ro" \
         -v "$CERTS_DIR/server.key:/etc/envoy/tls/server.key:ro" \
-        "envoyproxy/envoy:v${ENVOY_VERSION}" > /dev/null
+        "envoyproxy/envoy:v${ENVOY_VERSION}"
 
     wait_for_http "https://127.0.0.1:$GATEWAY_HTTPS_PORT/health" "Envoy Docker (HTTPS)" 20
 }
 
-start_envoy_docker_e2e_tls() {
+start_envoy_e2e_tls() {
     log_info "Starting Envoy Proxy Docker (E2E TLS) on port $GATEWAY_HTTPS_PORT..."
     docker rm -f "$ENVOY_CONTAINER" 2>/dev/null || true
     kill_port "$GATEWAY_HTTP_PORT"
     kill_port "$GATEWAY_HTTPS_PORT"
 
-    local network_args=()
-    if [[ "$DOCKER_USE_HOST_NETWORK" == "true" ]]; then
-        network_args+=(--network host)
-    else
-        network_args+=(-p "$GATEWAY_HTTPS_PORT:$GATEWAY_HTTPS_PORT")
-    fi
-
-    docker run -d --name "$ENVOY_CONTAINER" \
-        "${network_args[@]}" \
+    docker_run_gateway "$ENVOY_CONTAINER" "$GATEWAY_HTTPS_PORT" -- \
         -v "$COMP_DIR/configs/.envoy_runtime_e2e_tls.yaml:/etc/envoy/envoy.yaml:ro" \
         -v "$CERTS_DIR/server.crt:/etc/envoy/tls/server.crt:ro" \
         -v "$CERTS_DIR/server.key:/etc/envoy/tls/server.key:ro" \
-        "envoyproxy/envoy:v${ENVOY_VERSION}" > /dev/null
+        "envoyproxy/envoy:v${ENVOY_VERSION}"
 
     wait_for_http "https://127.0.0.1:$GATEWAY_HTTPS_PORT/health" "Envoy Docker (E2E TLS)" 20
 }
 
-stop_envoy_docker() {
+stop_envoy() {
     docker rm -f "$ENVOY_CONTAINER" 2>/dev/null || true
     kill_port "$GATEWAY_HTTP_PORT"
     kill_port "$GATEWAY_HTTPS_PORT"
     sleep 1
 }
 
-# --- Envoy dispatch ---
-
-stop_envoy() {
-    if [[ "$ENVOY_NATIVE" == "true" ]]; then
-        stop_envoy_native
-    else
-        stop_envoy_docker
-    fi
-}
-
 test_envoy() {
-    if [[ "$ENVOY_NATIVE" == "true" ]]; then
-        log_header "Testing Envoy Proxy (native, $(envoy --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo 'unknown'))"
-    else
-        log_header "Testing Envoy Proxy (Docker ${ENVOY_VERSION})"
-    fi
+    log_header "Testing Envoy Proxy (Docker ${ENVOY_VERSION})"
 
     prepare_envoy_config
 
-    if [[ "$ENVOY_NATIVE" == "true" ]]; then
-        # HTTP tests
-        start_envoy_native_http
-        run_wrk "envoy" "http" "/health" "$GATEWAY_HTTP_PORT"
-        run_wrk "envoy" "http" "/api/users" "$GATEWAY_HTTP_PORT"
-        stop_envoy_native
+    # HTTP tests
+    start_envoy_http
+    run_wrk "envoy" "http" "/health" "$GATEWAY_HTTP_PORT"
+    run_wrk "envoy" "http" "/api/users" "$GATEWAY_HTTP_PORT"
+    stop_envoy
 
-        # HTTPS tests (TLS termination — plaintext backend)
-        start_envoy_native_https
-        run_wrk "envoy" "https" "/health" "$GATEWAY_HTTPS_PORT"
-        run_wrk "envoy" "https" "/api/users" "$GATEWAY_HTTPS_PORT"
-        stop_envoy_native
+    # HTTPS tests (TLS termination — plaintext backend)
+    start_envoy_https
+    run_wrk "envoy" "https" "/health" "$GATEWAY_HTTPS_PORT"
+    run_wrk "envoy" "https" "/api/users" "$GATEWAY_HTTPS_PORT"
+    stop_envoy
 
-        # E2E TLS tests (TLS on both sides)
-        start_envoy_native_e2e_tls
-        run_wrk "envoy" "e2e_tls" "/health" "$GATEWAY_HTTPS_PORT"
-        run_wrk "envoy" "e2e_tls" "/api/users" "$GATEWAY_HTTPS_PORT"
-        stop_envoy_native
-    else
-        # HTTP tests
-        start_envoy_docker_http
-        run_wrk "envoy" "http" "/health" "$GATEWAY_HTTP_PORT"
-        run_wrk "envoy" "http" "/api/users" "$GATEWAY_HTTP_PORT"
-        stop_envoy_docker
-
-        # HTTPS tests (TLS termination — plaintext backend)
-        start_envoy_docker_https
-        run_wrk "envoy" "https" "/health" "$GATEWAY_HTTPS_PORT"
-        run_wrk "envoy" "https" "/api/users" "$GATEWAY_HTTPS_PORT"
-        stop_envoy_docker
-
-        # E2E TLS tests (TLS on both sides)
-        start_envoy_docker_e2e_tls
-        run_wrk "envoy" "e2e_tls" "/health" "$GATEWAY_HTTPS_PORT"
-        run_wrk "envoy" "e2e_tls" "/api/users" "$GATEWAY_HTTPS_PORT"
-        stop_envoy_docker
-    fi
+    # E2E TLS tests (TLS on both sides)
+    start_envoy_e2e_tls
+    run_wrk "envoy" "e2e_tls" "/health" "$GATEWAY_HTTPS_PORT"
+    run_wrk "envoy" "e2e_tls" "/api/users" "$GATEWAY_HTTPS_PORT"
+    stop_envoy
 }
 
 # ===========================================================================
@@ -1363,13 +1068,7 @@ test_envoy() {
 # ===========================================================================
 
 prepare_kong_key_auth_config() {
-    local host
-    if [[ "$KONG_NATIVE" == "true" ]]; then
-        host="127.0.0.1"
-    else
-        host="$BACKEND_HOST"
-    fi
-    sed "s/BACKEND_HOST/$host/g" \
+    sed "s/BACKEND_HOST/$BACKEND_HOST/g" \
         "$COMP_DIR/configs/kong_key_auth.yaml" > "$COMP_DIR/configs/.kong_runtime_key_auth.yaml"
 }
 
@@ -1381,79 +1080,49 @@ prepare_tyk_key_auth_config() {
 }
 
 test_ferrum_key_auth() {
-    log_info "Starting Ferrum Edge (Key Auth HTTP) on port $GATEWAY_HTTP_PORT..."
+    log_info "Starting Ferrum Edge Docker (Key Auth HTTP) on port $GATEWAY_HTTP_PORT..."
+    docker rm -f "$FERRUM_CONTAINER" 2>/dev/null || true
     kill_port "$GATEWAY_HTTP_PORT"
-    cd "$PROJECT_ROOT"
-    FERRUM_MODE=file \
-    FERRUM_FILE_CONFIG_PATH="$COMP_DIR/configs/ferrum_comparison_key_auth.yaml" \
-    FERRUM_PROXY_HTTP_PORT="$GATEWAY_HTTP_PORT" \
-    FERRUM_POOL_MAX_IDLE_PER_HOST=200 \
-    FERRUM_POOL_IDLE_TIMEOUT_SECONDS=120 \
-    FERRUM_POOL_ENABLE_HTTP_KEEP_ALIVE=true \
-    FERRUM_POOL_ENABLE_HTTP2=false \
-    FERRUM_LOG_LEVEL=warn \
-    ./target/release/ferrum-edge > "$RESULTS_DIR/ferrum_key_auth.log" 2>&1 &
-    FERRUM_PID=$!
-    wait_for_http "http://127.0.0.1:$GATEWAY_HTTP_PORT/health" "Ferrum (Key Auth)"
 
+    docker_run_gateway "$FERRUM_CONTAINER" "$GATEWAY_HTTP_PORT" -- \
+        -v "$COMP_DIR/configs/.ferrum_runtime_key_auth.yaml:/etc/ferrum/config.yaml:ro" \
+        -e FERRUM_MODE=file \
+        -e FERRUM_FILE_CONFIG_PATH=/etc/ferrum/config.yaml \
+        -e FERRUM_PROXY_HTTP_PORT="$GATEWAY_HTTP_PORT" \
+        -e FERRUM_POOL_MAX_IDLE_PER_HOST=200 \
+        -e FERRUM_POOL_IDLE_TIMEOUT_SECONDS=120 \
+        -e FERRUM_POOL_ENABLE_HTTP_KEEP_ALIVE=true \
+        -e FERRUM_POOL_ENABLE_HTTP2=false \
+        -e FERRUM_LOG_LEVEL=warn \
+        "$FERRUM_IMAGE"
+
+    wait_for_http "http://127.0.0.1:$GATEWAY_HTTP_PORT/health" "Ferrum Docker (Key Auth)"
     run_wrk_key_auth "ferrum" "$GATEWAY_HTTP_PORT"
-
-    kill "$FERRUM_PID" 2>/dev/null || true
-    wait "$FERRUM_PID" 2>/dev/null || true
-    kill_port "$GATEWAY_HTTP_PORT"
-    sleep 1
+    stop_ferrum
 }
 
 test_kong_key_auth() {
     prepare_kong_key_auth_config
 
-    if [[ "$KONG_NATIVE" == "true" ]]; then
-        log_info "Starting Kong Gateway native (Key Auth HTTP) on port $GATEWAY_HTTP_PORT..."
-        kill_port "$GATEWAY_HTTP_PORT"
+    log_info "Starting Kong Gateway Docker (Key Auth HTTP) on port $GATEWAY_HTTP_PORT..."
+    docker rm -f "$KONG_CONTAINER" 2>/dev/null || true
+    kill_port "$GATEWAY_HTTP_PORT"
 
-        KONG_DATABASE=off \
-        KONG_DECLARATIVE_CONFIG="$COMP_DIR/configs/.kong_runtime_key_auth.yaml" \
-        KONG_PROXY_LISTEN="0.0.0.0:$GATEWAY_HTTP_PORT" \
-        KONG_ADMIN_LISTEN="off" \
-        KONG_PROXY_ACCESS_LOG=/dev/null \
-        KONG_PROXY_ERROR_LOG=/dev/stderr \
-        KONG_LOG_LEVEL=warn \
-        KONG_PREFIX="/tmp/kong-bench" \
-        KONG_UPSTREAM_KEEPALIVE_POOL_SIZE=128 \
-        kong start > "$RESULTS_DIR/kong_key_auth.log" 2>&1
+    docker_run_gateway "$KONG_CONTAINER" "$GATEWAY_HTTP_PORT" -- \
+        -v "$COMP_DIR/configs/.kong_runtime_key_auth.yaml:/etc/kong/kong.yml:ro" \
+        -e KONG_DATABASE=off \
+        -e KONG_DECLARATIVE_CONFIG=/etc/kong/kong.yml \
+        -e KONG_PROXY_LISTEN="0.0.0.0:$GATEWAY_HTTP_PORT" \
+        -e KONG_ADMIN_LISTEN="off" \
+        -e KONG_PROXY_ACCESS_LOG=/dev/null \
+        -e KONG_PROXY_ERROR_LOG=/dev/stderr \
+        -e KONG_LOG_LEVEL=warn \
+        -e KONG_UPSTREAM_KEEPALIVE_POOL_SIZE=128 \
+        "kong/kong-gateway:${KONG_VERSION}"
 
-        wait_for_http "http://127.0.0.1:$GATEWAY_HTTP_PORT/health" "Kong native (Key Auth)" 20
-        run_wrk_key_auth "kong" "$GATEWAY_HTTP_PORT"
-        stop_kong_native
-    else
-        log_info "Starting Kong Gateway Docker (Key Auth HTTP) on port $GATEWAY_HTTP_PORT..."
-        docker rm -f "$KONG_CONTAINER" 2>/dev/null || true
-        kill_port "$GATEWAY_HTTP_PORT"
-
-        local network_args=()
-        if [[ "$DOCKER_USE_HOST_NETWORK" == "true" ]]; then
-            network_args+=(--network host)
-        else
-            network_args+=(-p "$GATEWAY_HTTP_PORT:$GATEWAY_HTTP_PORT")
-        fi
-
-        docker run -d --name "$KONG_CONTAINER" \
-            "${network_args[@]}" \
-            -v "$COMP_DIR/configs/.kong_runtime_key_auth.yaml:/etc/kong/kong.yml:ro" \
-            -e KONG_DATABASE=off \
-            -e KONG_DECLARATIVE_CONFIG=/etc/kong/kong.yml \
-            -e KONG_PROXY_LISTEN="0.0.0.0:$GATEWAY_HTTP_PORT" \
-            -e KONG_ADMIN_LISTEN="off" \
-            -e KONG_PROXY_ACCESS_LOG=/dev/null \
-            -e KONG_PROXY_ERROR_LOG=/dev/stderr \
-            -e KONG_LOG_LEVEL=warn \
-            -e KONG_UPSTREAM_KEEPALIVE_POOL_SIZE=128 \
-            "kong/kong-gateway:${KONG_VERSION}" > /dev/null
-
-        wait_for_http "http://127.0.0.1:$GATEWAY_HTTP_PORT/health" "Kong Docker (Key Auth)" 20
-        run_wrk_key_auth "kong" "$GATEWAY_HTTP_PORT"
-        stop_kong_docker
-    fi
+    wait_for_http "http://127.0.0.1:$GATEWAY_HTTP_PORT/health" "Kong Docker (Key Auth)" 20
+    run_wrk_key_auth "kong" "$GATEWAY_HTTP_PORT"
+    stop_kong
 }
 
 test_tyk_key_auth() {
@@ -1536,39 +1205,17 @@ test_tyk_key_auth() {
 test_envoy_key_auth() {
     prepare_envoy_config
 
-    if [[ "$ENVOY_NATIVE" == "true" ]]; then
-        log_info "Starting Envoy Proxy native (Key Auth HTTP) on port $GATEWAY_HTTP_PORT..."
-        kill_port "$GATEWAY_HTTP_PORT"
-        kill_port 9901
+    log_info "Starting Envoy Proxy Docker (Key Auth HTTP) on port $GATEWAY_HTTP_PORT..."
+    docker rm -f "$ENVOY_CONTAINER" 2>/dev/null || true
+    kill_port "$GATEWAY_HTTP_PORT"
 
-        envoy -c "$COMP_DIR/configs/.envoy_runtime_key_auth.yaml" --log-level warning \
-            > "$RESULTS_DIR/envoy_key_auth.log" 2>&1 &
-        ENVOY_NATIVE_PID=$!
+    docker_run_gateway "$ENVOY_CONTAINER" "$GATEWAY_HTTP_PORT" -- \
+        -v "$COMP_DIR/configs/.envoy_runtime_key_auth.yaml:/etc/envoy/envoy.yaml:ro" \
+        "envoyproxy/envoy:v${ENVOY_VERSION}"
 
-        wait_for_http "http://127.0.0.1:$GATEWAY_HTTP_PORT/health" "Envoy native (Key Auth)" 20
-        run_wrk_key_auth "envoy" "$GATEWAY_HTTP_PORT"
-        stop_envoy_native
-    else
-        log_info "Starting Envoy Proxy Docker (Key Auth HTTP) on port $GATEWAY_HTTP_PORT..."
-        docker rm -f "$ENVOY_CONTAINER" 2>/dev/null || true
-        kill_port "$GATEWAY_HTTP_PORT"
-
-        local network_args=()
-        if [[ "$DOCKER_USE_HOST_NETWORK" == "true" ]]; then
-            network_args+=(--network host)
-        else
-            network_args+=(-p "$GATEWAY_HTTP_PORT:$GATEWAY_HTTP_PORT")
-        fi
-
-        docker run -d --name "$ENVOY_CONTAINER" \
-            "${network_args[@]}" \
-            -v "$COMP_DIR/configs/.envoy_runtime_key_auth.yaml:/etc/envoy/envoy.yaml:ro" \
-            "envoyproxy/envoy:v${ENVOY_VERSION}" > /dev/null
-
-        wait_for_http "http://127.0.0.1:$GATEWAY_HTTP_PORT/health" "Envoy Docker (Key Auth)" 20
-        run_wrk_key_auth "envoy" "$GATEWAY_HTTP_PORT"
-        stop_envoy_docker
-    fi
+    wait_for_http "http://127.0.0.1:$GATEWAY_HTTP_PORT/health" "Envoy Docker (Key Auth)" 20
+    run_wrk_key_auth "envoy" "$GATEWAY_HTTP_PORT"
+    stop_envoy
 }
 
 test_key_auth() {
@@ -1615,37 +1262,20 @@ test_baseline() {
 # ===========================================================================
 
 write_metadata() {
-    local kong_info
-    if [[ "$KONG_NATIVE" == "true" ]]; then
-        kong_info="native ($(kong version 2>/dev/null || echo 'unknown'))"
-    else
-        kong_info="Docker ${KONG_VERSION}"
-    fi
-
-    local envoy_info
-    if [[ "$ENVOY_NATIVE" == "true" ]]; then
-        envoy_info="native ($(envoy --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo 'unknown'))"
-    else
-        envoy_info="Docker ${ENVOY_VERSION}"
-    fi
-
-    local pingora_info="native (source build)"
-    if [[ ! -f "$PINGORA_BINARY" ]]; then
-        pingora_info="skipped (not built)"
-    fi
-
     cat > "$RESULTS_DIR/meta.json" <<METAEOF
 {
     "duration": "$WRK_DURATION",
     "threads": "$WRK_THREADS",
     "connections": "$WRK_CONNECTIONS",
-    "pingora_version": "$pingora_info",
-    "kong_version": "$kong_info",
+    "execution_mode": "all-docker",
+    "ferrum_version": "Docker (local build)",
+    "pingora_version": "Docker (local build, pingora 0.8)",
+    "kong_version": "Docker ${KONG_VERSION}",
     "tyk_version": "Docker ${TYK_VERSION}",
     "krakend_version": "Docker ${KRAKEND_VERSION}",
-    "envoy_version": "$envoy_info",
-    "kong_native": $KONG_NATIVE,
-    "envoy_native": $ENVOY_NATIVE,
+    "envoy_version": "Docker ${ENVOY_VERSION}",
+    "kong_native": false,
+    "envoy_native": false,
     "os": "$(uname -s) $(uname -r) $(uname -m)",
     "date": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 }
@@ -1666,27 +1296,20 @@ generate_report() {
 main() {
     echo -e "${BOLD}"
     echo "  ╔══════════════════════════════════════════════════════════════════════╗"
-    echo "  ║              API Gateway Comparison Benchmark Suite              ║"
+    echo "  ║      API Gateway Comparison Benchmark Suite (All-Docker)          ║"
     echo "  ║   Ferrum vs Pingora vs Kong vs Tyk vs KrakenD vs Envoy          ║"
     echo "  ╚══════════════════════════════════════════════════════════════════════╝"
     echo -e "${NC}"
     echo "  Duration: ${WRK_DURATION}  Threads: ${WRK_THREADS}  Connections: ${WRK_CONNECTIONS}"
-    local kong_label="Docker ${KONG_VERSION}"
-    if [[ "$KONG_NATIVE" == "true" ]]; then
-        kong_label="native ($(kong version 2>/dev/null || echo '?'))"
-    fi
-    local envoy_label="Docker ${ENVOY_VERSION}"
-    if [[ "$ENVOY_NATIVE" == "true" ]]; then
-        envoy_label="native ($(envoy --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo '?'))"
-    fi
-    echo "  Kong: ${kong_label}  Tyk: Docker ${TYK_VERSION}  KrakenD: Docker ${KRAKEND_VERSION}  Envoy: ${envoy_label}"
+    echo "  Mode: ALL gateways in Docker (apples-to-apples)"
+    echo "  Kong: Docker ${KONG_VERSION}  Tyk: Docker ${TYK_VERSION}  KrakenD: Docker ${KRAKEND_VERSION}  Envoy: Docker ${ENVOY_VERSION}"
     if [[ -n "$SKIP_GATEWAYS" ]]; then
         echo -e "  ${YELLOW}Skipping: ${SKIP_GATEWAYS}${NC}"
     fi
 
     check_dependencies
     pull_images
-    build_project
+    build_images
 
     mkdir -p "$RESULTS_DIR"
 
@@ -1717,7 +1340,7 @@ main() {
         test_envoy
     fi
 
-    # Key-Auth tests (HTTP only, Ferrum + Kong + Tyk; KrakenD key-auth requires Enterprise)
+    # Key-Auth tests (HTTP only, Ferrum + Kong + Tyk + Envoy; KrakenD key-auth requires Enterprise)
     test_key_auth
 
     generate_report

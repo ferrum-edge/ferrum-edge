@@ -198,7 +198,7 @@ pub struct RequestContext {
     pub headers: HashMap<String, String>,
     pub query_params: HashMap<String, String>,
     pub matched_proxy: Option<Arc<Proxy>>,
-    pub identified_consumer: Option<Consumer>,
+    pub identified_consumer: Option<Arc<Consumer>>,
     /// Identity string set by external auth plugins (e.g., `jwks_auth`) when no
     /// matching `Consumer` exists in the gateway. Used as the rate-limit key and
     /// for `consumer_username` in transaction logs.
@@ -481,7 +481,7 @@ pub struct StreamConnectionContext {
     /// Pre-built consumer index shared across stream connections.
     pub consumer_index: Arc<ConsumerIndex>,
     /// Gateway Consumer identified for this stream connection, if any.
-    pub identified_consumer: Option<Consumer>,
+    pub identified_consumer: Option<Arc<Consumer>>,
     /// Identity string set by external stream auth plugins when no gateway
     /// Consumer was mapped. Mirrors `RequestContext::authenticated_identity`.
     pub authenticated_identity: Option<String>,

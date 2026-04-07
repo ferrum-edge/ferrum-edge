@@ -197,7 +197,7 @@ impl Plugin for AccessControl {
     async fn authorize(&self, ctx: &mut RequestContext) -> PluginResult {
         self.authorize_identity(
             &ctx.client_ip,
-            ctx.identified_consumer.as_ref(),
+            ctx.identified_consumer.as_deref(),
             ctx.authenticated_identity.as_deref(),
         )
     }
@@ -205,7 +205,7 @@ impl Plugin for AccessControl {
     async fn on_stream_connect(&self, ctx: &mut StreamConnectionContext) -> PluginResult {
         self.authorize_identity(
             &ctx.client_ip,
-            ctx.identified_consumer.as_ref(),
+            ctx.identified_consumer.as_deref(),
             ctx.authenticated_identity.as_deref(),
         )
     }

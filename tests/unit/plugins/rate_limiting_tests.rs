@@ -3,6 +3,7 @@
 use ferrum_edge::plugins::{Plugin, PluginHttpClient, PluginResult, rate_limiting::RateLimiting};
 use serde_json::json;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use super::plugin_utils::{
     assert_continue, assert_reject, create_test_consumer, create_test_context,
@@ -32,13 +33,13 @@ async fn test_rate_limiting_plugin_consumer_limiting() {
 
     // In consumer mode, on_request_received should pass through (no-op)
     let mut ctx = create_test_context();
-    ctx.identified_consumer = Some(consumer.clone());
+    ctx.identified_consumer = Some(Arc::new(consumer.clone()));
     let result = plugin.on_request_received(&mut ctx).await;
     assert_continue(result);
 
     // Consumer-based limiting happens in authorize phase (after auth identifies consumer)
     let mut ctx = create_test_context();
-    ctx.identified_consumer = Some(consumer.clone());
+    ctx.identified_consumer = Some(Arc::new(consumer.clone()));
     let result = plugin.authorize(&mut ctx).await;
     assert_continue(result);
 
@@ -46,7 +47,7 @@ async fn test_rate_limiting_plugin_consumer_limiting() {
     let mut rejected_count = 0;
     for _i in 0..6 {
         let mut ctx_test = create_test_context();
-        ctx_test.identified_consumer = Some(consumer.clone());
+        ctx_test.identified_consumer = Some(Arc::new(consumer.clone()));
         let result = plugin.authorize(&mut ctx_test).await;
         if matches!(result, PluginResult::Reject { .. }) {
             rejected_count += 1;
@@ -181,7 +182,7 @@ async fn test_rate_limiting_consumer_mode_on_request_received_is_noop() {
 
     // on_request_received should pass through in consumer mode
     let mut ctx = create_test_context();
-    ctx.identified_consumer = Some(consumer.clone());
+    ctx.identified_consumer = Some(Arc::new(consumer.clone()));
     let result = plugin.on_request_received(&mut ctx).await;
     assert_continue(result);
 
@@ -191,7 +192,7 @@ async fn test_rate_limiting_consumer_mode_on_request_received_is_noop() {
 
     // Second authorize should be rejected (limit=1, already used)
     let mut ctx2 = create_test_context();
-    ctx2.identified_consumer = Some(consumer.clone());
+    ctx2.identified_consumer = Some(Arc::new(consumer.clone()));
     let result = plugin.authorize(&mut ctx2).await;
     assert_reject(result, Some(429));
 }
@@ -717,7 +718,7 @@ async fn test_expose_headers_consumer_identity() {
 
     let consumer = create_test_consumer();
     let mut ctx = create_test_context();
-    ctx.identified_consumer = Some(consumer);
+    ctx.identified_consumer = Some(Arc::new(consumer));
 
     let result = plugin.authorize(&mut ctx).await;
     assert_continue(result);

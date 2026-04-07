@@ -759,7 +759,7 @@ async fn test_mtls_auth_does_not_overwrite_existing_consumer() {
     let plugin = MtlsAuth::new(&json!({"cert_field": "subject_cn"})).unwrap();
     let mut ctx = create_ctx_with_cert(cert_der);
     // Pre-set a different consumer (e.g., from a previous auth plugin)
-    ctx.identified_consumer = Some(consumer2);
+    ctx.identified_consumer = Some(Arc::new(consumer2));
 
     let result = plugin.authenticate(&mut ctx, &index).await;
     assert_continue(result);
