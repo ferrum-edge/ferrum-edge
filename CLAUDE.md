@@ -48,6 +48,8 @@ cargo fmt                                                   # Auto-format
 
 **CI enforces both clippy (zero warnings with `-D warnings`) and `cargo fmt --check`. Always run these before pushing.**
 
+**MANDATORY: Before every `git commit`, run `cargo fmt --all` and then `cargo fmt --all -- --check` to verify zero diffs. CI will reject unformatted code. This is the #1 cause of CI failures — never skip it.**
+
 ### CI Pipeline (GitHub Actions)
 
 The CI workflow (`.github/workflows/ci.yml`) runs on push to `main` and PRs targeting `main`:
@@ -406,8 +408,10 @@ tests/
 
 ### Before Every Commit
 
+**CRITICAL: Steps 1-2 are non-negotiable. Run them before every single `git commit`, no exceptions.**
+
 1. `cargo fmt --all` — format all code
-2. `cargo fmt --all -- --check` — **verify** no formatting diffs remain (CI enforces this)
+2. `cargo fmt --all -- --check` — **verify** no formatting diffs remain (CI rejects unformatted code immediately)
 3. `cargo clippy --all-targets -- -D warnings` — zero warnings
 4. `cargo test --test unit_tests` — all unit tests pass
 5. `cargo test --test integration_tests` — integration tests pass
