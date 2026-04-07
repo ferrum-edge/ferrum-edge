@@ -689,3 +689,101 @@ async fn test_full_roundtrip_text() {
     assert_eq!(&decoded_response[..8], &grpc_frame[..]);
     assert_eq!(decoded_response[8], 0x80); // trailer flag
 }
+
+// ── Internal helper tests (moved from src/plugins/grpc_web.rs) ───────────────
+
+#[test]
+fn test_is_grpc_web_content_type() {
+    use ferrum_edge::_test_support::is_grpc_web_content_type;
+    assert!(is_grpc_web_content_type("application/grpc-web"));
+    assert!(is_grpc_web_content_type("application/grpc-web+proto"));
+    assert!(is_grpc_web_content_type("application/grpc-web-text"));
+    assert!(is_grpc_web_content_type("application/grpc-web-text+proto"));
+    assert!(is_grpc_web_content_type("  Application/gRPC-Web  "));
+    assert!(!is_grpc_web_content_type("application/grpc"));
+    assert!(!is_grpc_web_content_type("application/json"));
+}
+
+#[test]
+fn test_is_grpc_web_text() {
+    use ferrum_edge::_test_support::is_grpc_web_text;
+    assert!(is_grpc_web_text("application/grpc-web-text"));
+    assert!(is_grpc_web_text("application/grpc-web-text+proto"));
+    assert!(!is_grpc_web_text("application/grpc-web"));
+    assert!(!is_grpc_web_text("application/grpc-web+proto"));
+}
+
+#[test]
+fn test_response_content_type() {
+    use ferrum_edge::_test_support::response_content_type;
+    assert_eq!(
+        response_content_type("application/grpc-web"),
+        "application/grpc-web"
+    );
+    assert_eq!(
+        response_content_type("application/grpc-web+proto"),
+        "application/grpc-web+proto"
+    );
+    assert_eq!(
+        response_content_type("application/grpc-web-text"),
+        "application/grpc-web-text"
+    );
+    assert_eq!(
+        response_content_type("application/grpc-web-text+proto"),
+        "application/grpc-web-text+proto"
+    );
+}
+
+#[test]
+fn test_build_trailer_frame() {
+    use ferrum_edge::_test_support::{GRPC_FRAME_TRAILER, build_trailer_frame};
+    let mut headers = HashMap::new();
+    headers.insert("grpc-status".to_string(), "0".to_string());
+    headers.insert("grpc-message".to_string(), "OK".to_string());
+    headers.insert("content-type".to_string(), "application/grpc".to_string());
+
+    let frame = build_trailer_frame(&headers);
+
+    assert_eq!(frame[0], GRPC_FRAME_TRAILER);
+    let len = u32::from_be_bytes([frame[1], frame[2], frame[3], frame[4]]) as usize;
+    assert_eq!(frame.len(), 5 + len);
+    let trailer_str = String::from_utf8_lossy(&frame[5..]);
+    assert!(trailer_str.contains("grpc-status: 0"));
+    assert!(trailer_str.contains("grpc-message: OK"));
+    assert!(!trailer_str.contains("content-type"));
+}
+
+#[test]
+fn test_build_trailer_frame_default_status() {
+    use ferrum_edge::_test_support::{GRPC_FRAME_TRAILER, build_trailer_frame};
+    let headers = HashMap::new();
+    let frame = build_trailer_frame(&headers);
+    assert_eq!(frame[0], GRPC_FRAME_TRAILER);
+    let trailer_str = String::from_utf8_lossy(&frame[5..]);
+    assert!(trailer_str.contains("grpc-status: 0"));
+}
+
+#[test]
+fn test_parse_grpc_frames() {
+    use ferrum_edge::_test_support::{GRPC_FRAME_DATA, GRPC_FRAME_TRAILER, parse_grpc_frames};
+    let mut data = vec![0x00];
+    data.extend_from_slice(&5u32.to_be_bytes());
+    data.extend_from_slice(b"hello");
+    data.push(0x80);
+    data.extend_from_slice(&3u32.to_be_bytes());
+    data.extend_from_slice(b"bye");
+
+    let frames = parse_grpc_frames(&data);
+    assert_eq!(frames.len(), 2);
+    assert_eq!(frames[0].0, GRPC_FRAME_DATA);
+    assert_eq!(frames[0].1, b"hello");
+    assert_eq!(frames[1].0, GRPC_FRAME_TRAILER);
+    assert_eq!(frames[1].1, b"bye");
+}
+
+#[test]
+fn test_parse_grpc_frames_truncated() {
+    use ferrum_edge::_test_support::parse_grpc_frames;
+    let data = vec![0x00, 0x00, 0x00, 0x00, 0x05, b'h', b'e'];
+    assert!(parse_grpc_frames(&data).is_empty());
+}

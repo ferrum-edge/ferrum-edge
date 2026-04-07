@@ -387,11 +387,20 @@ tests/
 └── performance/               # wrk-based load tests with baseline comparison
 ```
 
-**Test conventions**:
-- Unit tests: inline `#[cfg(test)]` modules for private functions, `tests/unit/` for public API
-- Integration tests: test component interactions with real network I/O
-- Functional tests: marked `#[ignore]` — start real gateway binary, test full request flow
-- **Functional test subprocess rule**: When spawning the gateway binary in functional tests, use `Stdio::null()` for stdout/stderr unless the test explicitly reads the output (e.g., `functional_logging_test.rs`). Using `Stdio::piped()` without reading causes a pipe buffer deadlock — the OS buffer fills up from debug logs and the gateway blocks on writes, hanging the test.
+**Test placement rules** — follow these exactly; do not place tests in the wrong location:
+
+| What to test | Where to put it | Why |
+|---|---|---|
+| Private functions / private structs | `#[cfg(test)] mod tests` **inline** in the source file | Rust visibility: `tests/` is a separate crate and cannot see non-`pub` items |
+| Public API of a module | `tests/unit/<category>/<module>_tests.rs` | Keeps source files focused; runs as part of `cargo test --test unit_tests` |
+| Component interactions (real I/O) | `tests/integration/` | Separate from unit; may need network/TLS setup |
+| Full gateway binary (E2E) | `tests/functional/` with `#[ignore]` | Requires `cargo build --bin ferrum-edge` first |
+
+**Adding a new test file** to `tests/unit/`: create the file and add `mod <name>;` to the relevant `tests/unit/<category>/mod.rs`.
+
+**Inline `#[cfg(test)]` blocks are correct and intentional** for any test that calls a private function — do not move them to `tests/unit/` and do not make functions `pub` just to enable external testing.
+
+**Functional test subprocess rule**: Use `Stdio::null()` for the gateway's stdout/stderr unless the test explicitly reads the output. `Stdio::piped()` without reading causes a pipe-buffer deadlock (OS buffer fills from debug logs → gateway blocks on writes → test hangs).
 
 ## Development Guidelines
 

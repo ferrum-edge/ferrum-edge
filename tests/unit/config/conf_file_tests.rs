@@ -241,3 +241,66 @@ FERRUM_DB_SSL_MODE = verify-full
         assert_eq!(config.db_ssl_mode.as_deref(), Some("verify-full"));
     });
 }
+
+// ── Parser unit tests (moved from src/config/conf_file.rs) ──────────────────
+
+#[test]
+fn test_parse_basic() {
+    let conf = ConfFile::parse("FERRUM_MODE = file\nFERRUM_LOG_LEVEL = debug\n").unwrap();
+    assert_eq!(conf.get("FERRUM_MODE"), Some("file"));
+    assert_eq!(conf.get("FERRUM_LOG_LEVEL"), Some("debug"));
+}
+
+#[test]
+fn test_parse_comments_and_empty_lines() {
+    let input = "# This is a comment\n\nFERRUM_MODE = file\n  # Another comment\n";
+    let conf = ConfFile::parse(input).unwrap();
+    assert_eq!(conf.get("FERRUM_MODE"), Some("file"));
+    // Only the one non-comment, non-empty line should be parsed
+    assert!(conf.get("# This is a comment").is_none());
+    assert!(conf.get("# Another comment").is_none());
+}
+
+#[test]
+fn test_parse_quoted_values() {
+    let input = "KEY1 = \"hello world\"\nKEY2 = 'single quoted'\n";
+    let conf = ConfFile::parse(input).unwrap();
+    assert_eq!(conf.get("KEY1"), Some("hello world"));
+    assert_eq!(conf.get("KEY2"), Some("single quoted"));
+}
+
+#[test]
+fn test_parse_no_spaces() {
+    let conf = ConfFile::parse("KEY=value").unwrap();
+    assert_eq!(conf.get("KEY"), Some("value"));
+}
+
+#[test]
+fn test_parse_inline_comments() {
+    let conf = ConfFile::parse("KEY = value # this is a comment").unwrap();
+    assert_eq!(conf.get("KEY"), Some("value"));
+}
+
+#[test]
+fn test_parse_empty_value() {
+    let conf = ConfFile::parse("KEY =").unwrap();
+    assert_eq!(conf.get("KEY"), Some(""));
+}
+
+#[test]
+fn test_parse_invalid_line() {
+    let result = ConfFile::parse("no_equals_sign");
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_empty_file() {
+    let conf = ConfFile::parse("").unwrap();
+    assert!(conf.is_empty());
+}
+
+#[test]
+fn test_comments_only() {
+    let conf = ConfFile::parse("# just comments\n# nothing else\n").unwrap();
+    assert!(conf.is_empty());
+}

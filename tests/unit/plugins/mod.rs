@@ -35,6 +35,7 @@ mod plugin_http_client_tests;
 mod plugin_integration_tests;
 mod prometheus_metrics_tests;
 mod rate_limiting_tests;
+mod redis_rate_limiter_tests;
 mod rejection_logging_tests;
 mod request_mirror_tests;
 mod request_size_limiting_tests;

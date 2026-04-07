@@ -61,9 +61,9 @@ const META_GRPC_WEB_ORIGINAL_CT: &str = "grpc_web_original_ct";
 const HEADER_GRPC_WEB_MODE: &str = "x-grpc-web-mode";
 
 /// gRPC frame flag: data frame.
-const GRPC_FRAME_DATA: u8 = 0x00;
+pub(crate) const GRPC_FRAME_DATA: u8 = 0x00;
 /// gRPC frame flag: trailer frame (used in gRPC-Web to embed trailers in body).
-const GRPC_FRAME_TRAILER: u8 = 0x80;
+pub(crate) const GRPC_FRAME_TRAILER: u8 = 0x80;
 
 /// Returns a header map with `content-type: application/grpc` for gRPC error responses.
 fn grpc_content_type_header() -> HashMap<String, String> {
@@ -92,13 +92,13 @@ impl GrpcWebPlugin {
 }
 
 /// Check if a content-type indicates a gRPC-Web request.
-fn is_grpc_web_content_type(ct: &str) -> bool {
+pub(crate) fn is_grpc_web_content_type(ct: &str) -> bool {
     let ct_lower = ct.trim().to_lowercase();
     ct_lower.starts_with("application/grpc-web")
 }
 
 /// Check if a gRPC-Web content-type uses text (base64) encoding.
-fn is_grpc_web_text(ct: &str) -> bool {
+pub(crate) fn is_grpc_web_text(ct: &str) -> bool {
     let ct_lower = ct.trim().to_lowercase();
     ct_lower.starts_with("application/grpc-web-text")
 }
@@ -109,7 +109,7 @@ fn is_grpc_web_text(ct: &str) -> bool {
 /// - 1 byte: 0x80 (trailer flag)
 /// - 4 bytes: big-endian u32 length of trailer payload
 /// - N bytes: trailer payload (HTTP header encoding: `key: value\r\n`)
-fn build_trailer_frame(response_headers: &HashMap<String, String>) -> Vec<u8> {
+pub(crate) fn build_trailer_frame(response_headers: &HashMap<String, String>) -> Vec<u8> {
     let mut trailer_payload = Vec::new();
     for (key, value) in response_headers {
         // Include grpc-* trailers and any custom trailing metadata
@@ -138,8 +138,8 @@ fn build_trailer_frame(response_headers: &HashMap<String, String>) -> Vec<u8> {
 ///
 /// Returns a list of (flag, payload) tuples. Used to separate data frames
 /// from trailer frames in gRPC-Web responses.
-#[cfg(test)]
-fn parse_grpc_frames(data: &[u8]) -> Vec<(u8, Vec<u8>)> {
+#[allow(dead_code)]
+pub(crate) fn parse_grpc_frames(data: &[u8]) -> Vec<(u8, Vec<u8>)> {
     let mut frames = Vec::new();
     let mut pos = 0;
     while pos + 5 <= data.len() {
@@ -159,7 +159,7 @@ fn parse_grpc_frames(data: &[u8]) -> Vec<(u8, Vec<u8>)> {
 /// Map an original gRPC-Web content-type to the response content-type.
 ///
 /// Preserves the +proto suffix if present.
-fn response_content_type(original_ct: &str) -> &'static str {
+pub(crate) fn response_content_type(original_ct: &str) -> &'static str {
     let ct_lower = original_ct.trim().to_lowercase();
     if ct_lower.starts_with("application/grpc-web-text") {
         if ct_lower.contains("+proto") {
@@ -445,108 +445,5 @@ impl Plugin for GrpcWebPlugin {
             );
             Some(output)
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_is_grpc_web_content_type() {
-        assert!(is_grpc_web_content_type("application/grpc-web"));
-        assert!(is_grpc_web_content_type("application/grpc-web+proto"));
-        assert!(is_grpc_web_content_type("application/grpc-web-text"));
-        assert!(is_grpc_web_content_type("application/grpc-web-text+proto"));
-        assert!(is_grpc_web_content_type("  Application/gRPC-Web  "));
-        assert!(!is_grpc_web_content_type("application/grpc"));
-        assert!(!is_grpc_web_content_type("application/json"));
-    }
-
-    #[test]
-    fn test_is_grpc_web_text() {
-        assert!(is_grpc_web_text("application/grpc-web-text"));
-        assert!(is_grpc_web_text("application/grpc-web-text+proto"));
-        assert!(!is_grpc_web_text("application/grpc-web"));
-        assert!(!is_grpc_web_text("application/grpc-web+proto"));
-    }
-
-    #[test]
-    fn test_response_content_type() {
-        assert_eq!(
-            response_content_type("application/grpc-web"),
-            "application/grpc-web"
-        );
-        assert_eq!(
-            response_content_type("application/grpc-web+proto"),
-            "application/grpc-web+proto"
-        );
-        assert_eq!(
-            response_content_type("application/grpc-web-text"),
-            "application/grpc-web-text"
-        );
-        assert_eq!(
-            response_content_type("application/grpc-web-text+proto"),
-            "application/grpc-web-text+proto"
-        );
-    }
-
-    #[test]
-    fn test_build_trailer_frame() {
-        let mut headers = HashMap::new();
-        headers.insert("grpc-status".to_string(), "0".to_string());
-        headers.insert("grpc-message".to_string(), "OK".to_string());
-        headers.insert("content-type".to_string(), "application/grpc".to_string());
-
-        let frame = build_trailer_frame(&headers);
-
-        // Verify frame structure
-        assert_eq!(frame[0], GRPC_FRAME_TRAILER);
-        let len = u32::from_be_bytes([frame[1], frame[2], frame[3], frame[4]]) as usize;
-        assert_eq!(frame.len(), 5 + len);
-
-        // Verify trailer content contains grpc headers but not content-type
-        let trailer_str = String::from_utf8_lossy(&frame[5..]);
-        assert!(trailer_str.contains("grpc-status: 0"));
-        assert!(trailer_str.contains("grpc-message: OK"));
-        assert!(!trailer_str.contains("content-type"));
-    }
-
-    #[test]
-    fn test_build_trailer_frame_default_status() {
-        let headers = HashMap::new();
-        let frame = build_trailer_frame(&headers);
-
-        assert_eq!(frame[0], GRPC_FRAME_TRAILER);
-        let trailer_str = String::from_utf8_lossy(&frame[5..]);
-        assert!(trailer_str.contains("grpc-status: 0"));
-    }
-
-    #[test]
-    fn test_parse_grpc_frames() {
-        // Build a test frame: flag=0x00, length=5, payload="hello"
-        let mut data = vec![0x00];
-        data.extend_from_slice(&5u32.to_be_bytes());
-        data.extend_from_slice(b"hello");
-
-        // Add a trailer frame: flag=0x80, length=3, payload="bye"
-        data.push(0x80);
-        data.extend_from_slice(&3u32.to_be_bytes());
-        data.extend_from_slice(b"bye");
-
-        let frames = parse_grpc_frames(&data);
-        assert_eq!(frames.len(), 2);
-        assert_eq!(frames[0].0, GRPC_FRAME_DATA);
-        assert_eq!(frames[0].1, b"hello");
-        assert_eq!(frames[1].0, GRPC_FRAME_TRAILER);
-        assert_eq!(frames[1].1, b"bye");
-    }
-
-    #[test]
-    fn test_parse_grpc_frames_truncated() {
-        // Truncated frame — should stop parsing
-        let data = vec![0x00, 0x00, 0x00, 0x00, 0x05, b'h', b'e'];
-        let frames = parse_grpc_frames(&data);
-        assert!(frames.is_empty());
     }
 }

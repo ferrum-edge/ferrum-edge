@@ -210,7 +210,7 @@ impl DatabaseStore {
     /// This sets the driver-level TCP connect timeout — separate from
     /// `acquire_timeout` which covers waiting for a pool slot + connecting.
     /// SQLite is local I/O so connect timeout is not applicable.
-    fn append_connect_timeout(url: &str, db_type: &str, timeout_seconds: u64) -> String {
+    pub(crate) fn append_connect_timeout(url: &str, db_type: &str, timeout_seconds: u64) -> String {
         if timeout_seconds == 0 || db_type == "sqlite" {
             return url.to_string();
         }
@@ -3165,11 +3165,11 @@ impl DatabaseBackend for DatabaseStore {
 }
 
 /// IDs in `known` that are not in `current` (i.e., deleted resources).
-fn diff_removed(known: &HashSet<String>, current: &HashSet<String>) -> Vec<String> {
+pub(crate) fn diff_removed(known: &HashSet<String>, current: &HashSet<String>) -> Vec<String> {
     known.difference(current).cloned().collect()
 }
 
-fn parse_protocol(s: &str) -> BackendProtocol {
+pub(crate) fn parse_protocol(s: &str) -> BackendProtocol {
     match s.to_lowercase().as_str() {
         "https" => BackendProtocol::Https,
         "ws" => BackendProtocol::Ws,
@@ -3185,7 +3185,7 @@ fn parse_protocol(s: &str) -> BackendProtocol {
     }
 }
 
-fn parse_auth_mode(s: &str) -> AuthMode {
+pub(crate) fn parse_auth_mode(s: &str) -> AuthMode {
     match s.to_lowercase().as_str() {
         "multi" => AuthMode::Multi,
         _ => AuthMode::Single,
@@ -3539,181 +3539,4 @@ fn parse_datetime_column(row: &AnyRow, column: &str) -> chrono::DateTime<Utc> {
             );
             Utc::now()
         })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_append_connect_timeout_postgres_no_existing_params() {
-        let url = "postgres://user:pass@localhost/mydb";
-        let result = DatabaseStore::append_connect_timeout(url, "postgres", 10);
-        assert_eq!(
-            result,
-            "postgres://user:pass@localhost/mydb?connect_timeout=10"
-        );
-    }
-
-    #[test]
-    fn test_append_connect_timeout_postgres_with_existing_params() {
-        let url = "postgres://user:pass@localhost/mydb?sslmode=require";
-        let result = DatabaseStore::append_connect_timeout(url, "postgres", 15);
-        assert_eq!(
-            result,
-            "postgres://user:pass@localhost/mydb?sslmode=require&connect_timeout=15"
-        );
-    }
-
-    #[test]
-    fn test_append_connect_timeout_mysql() {
-        let url = "mysql://user:pass@localhost/mydb";
-        let result = DatabaseStore::append_connect_timeout(url, "mysql", 5);
-        assert_eq!(result, "mysql://user:pass@localhost/mydb?connect_timeout=5");
-    }
-
-    #[test]
-    fn test_append_connect_timeout_sqlite_skipped() {
-        let url = "sqlite://mydb.sqlite";
-        let result = DatabaseStore::append_connect_timeout(url, "sqlite", 10);
-        assert_eq!(result, "sqlite://mydb.sqlite");
-    }
-
-    #[test]
-    fn test_append_connect_timeout_zero_disabled() {
-        let url = "postgres://user:pass@localhost/mydb";
-        let result = DatabaseStore::append_connect_timeout(url, "postgres", 0);
-        assert_eq!(result, "postgres://user:pass@localhost/mydb");
-    }
-
-    #[test]
-    fn test_db_pool_config_default() {
-        let config = DbPoolConfig::default();
-        assert_eq!(config.max_connections, 10);
-        assert_eq!(config.min_connections, 1);
-        assert_eq!(config.acquire_timeout_seconds, 30);
-        assert_eq!(config.idle_timeout_seconds, 600);
-        assert_eq!(config.max_lifetime_seconds, 300);
-        assert_eq!(config.connect_timeout_seconds, 10);
-        assert_eq!(config.statement_timeout_seconds, 30);
-    }
-
-    // -----------------------------------------------------------------------
-    // diff_removed — deletion detection for incremental polling
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_diff_removed_empty_sets() {
-        let known = HashSet::new();
-        let current = HashSet::new();
-        let removed = diff_removed(&known, &current);
-        assert!(removed.is_empty());
-    }
-
-    #[test]
-    fn test_diff_removed_no_deletions() {
-        let known: HashSet<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
-        let current: HashSet<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
-        let removed = diff_removed(&known, &current);
-        assert!(removed.is_empty());
-    }
-
-    #[test]
-    fn test_diff_removed_all_deleted() {
-        let known: HashSet<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
-        let current = HashSet::new();
-        let mut removed = diff_removed(&known, &current);
-        removed.sort();
-        assert_eq!(removed, vec!["a", "b", "c"]);
-    }
-
-    #[test]
-    fn test_diff_removed_partial_deletion() {
-        let known: HashSet<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
-        let current: HashSet<String> = ["a", "c"].iter().map(|s| s.to_string()).collect();
-        let removed = diff_removed(&known, &current);
-        assert_eq!(removed, vec!["b"]);
-    }
-
-    #[test]
-    fn test_diff_removed_current_has_new_ids() {
-        // New IDs in current that are not in known should not appear in removed
-        let known: HashSet<String> = ["a", "b"].iter().map(|s| s.to_string()).collect();
-        let current: HashSet<String> = ["a", "b", "d", "e"].iter().map(|s| s.to_string()).collect();
-        let removed = diff_removed(&known, &current);
-        assert!(removed.is_empty());
-    }
-
-    #[test]
-    fn test_diff_removed_known_empty_current_has_items() {
-        let known = HashSet::new();
-        let current: HashSet<String> = ["x", "y"].iter().map(|s| s.to_string()).collect();
-        let removed = diff_removed(&known, &current);
-        assert!(removed.is_empty());
-    }
-
-    #[test]
-    fn test_diff_removed_mixed_additions_and_deletions() {
-        let known: HashSet<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
-        let current: HashSet<String> = ["b", "d", "e"].iter().map(|s| s.to_string()).collect();
-        let mut removed = diff_removed(&known, &current);
-        removed.sort();
-        assert_eq!(removed, vec!["a", "c"]);
-    }
-
-    // -----------------------------------------------------------------------
-    // parse_protocol — backend protocol string parsing
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_parse_protocol_known_values() {
-        assert!(matches!(parse_protocol("http"), BackendProtocol::Http));
-        assert!(matches!(parse_protocol("https"), BackendProtocol::Https));
-        assert!(matches!(parse_protocol("ws"), BackendProtocol::Ws));
-        assert!(matches!(parse_protocol("wss"), BackendProtocol::Wss));
-        assert!(matches!(parse_protocol("grpc"), BackendProtocol::Grpc));
-        assert!(matches!(parse_protocol("grpcs"), BackendProtocol::Grpcs));
-        assert!(matches!(parse_protocol("h3"), BackendProtocol::H3));
-        assert!(matches!(parse_protocol("tcp"), BackendProtocol::Tcp));
-        assert!(matches!(parse_protocol("tcp_tls"), BackendProtocol::TcpTls));
-        assert!(matches!(parse_protocol("udp"), BackendProtocol::Udp));
-        assert!(matches!(parse_protocol("dtls"), BackendProtocol::Dtls));
-    }
-
-    #[test]
-    fn test_parse_protocol_case_insensitive() {
-        assert!(matches!(parse_protocol("HTTPS"), BackendProtocol::Https));
-        assert!(matches!(parse_protocol("Grpc"), BackendProtocol::Grpc));
-        assert!(matches!(parse_protocol("H3"), BackendProtocol::H3));
-        assert!(matches!(parse_protocol("TCP_TLS"), BackendProtocol::TcpTls));
-    }
-
-    #[test]
-    fn test_parse_protocol_unknown_defaults_to_http() {
-        assert!(matches!(parse_protocol("ftp"), BackendProtocol::Http));
-        assert!(matches!(parse_protocol(""), BackendProtocol::Http));
-        assert!(matches!(parse_protocol("nonsense"), BackendProtocol::Http));
-    }
-
-    // -----------------------------------------------------------------------
-    // parse_auth_mode — auth mode string parsing
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_parse_auth_mode_known_values() {
-        assert!(matches!(parse_auth_mode("single"), AuthMode::Single));
-        assert!(matches!(parse_auth_mode("multi"), AuthMode::Multi));
-    }
-
-    #[test]
-    fn test_parse_auth_mode_case_insensitive() {
-        assert!(matches!(parse_auth_mode("MULTI"), AuthMode::Multi));
-        assert!(matches!(parse_auth_mode("Single"), AuthMode::Single));
-    }
-
-    #[test]
-    fn test_parse_auth_mode_unknown_defaults_to_single() {
-        assert!(matches!(parse_auth_mode("unknown"), AuthMode::Single));
-        assert!(matches!(parse_auth_mode(""), AuthMode::Single));
-    }
 }

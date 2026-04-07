@@ -163,7 +163,7 @@ impl WsRateLimiting {
         })
     }
 
-    fn redis_connection_scope_key(&self, proxy_id: &str, connection_id: u64) -> String {
+    pub(crate) fn redis_connection_scope_key(&self, proxy_id: &str, connection_id: u64) -> String {
         format!("{}:{}:{}", self.redis_instance_id, proxy_id, connection_id)
     }
 
@@ -297,25 +297,5 @@ impl Plugin for WsRateLimiting {
         }
 
         None
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_redis_connection_scope_key_is_namespaced_per_instance() {
-        let plugin_a =
-            WsRateLimiting::new(&serde_json::json!({}), PluginHttpClient::default()).unwrap();
-        let plugin_b =
-            WsRateLimiting::new(&serde_json::json!({}), PluginHttpClient::default()).unwrap();
-
-        let key_a = plugin_a.redis_connection_scope_key("proxy-a", 7);
-        let key_b = plugin_b.redis_connection_scope_key("proxy-a", 7);
-
-        assert_ne!(key_a, key_b);
-        assert!(key_a.ends_with(":proxy-a:7"));
-        assert!(key_b.ends_with(":proxy-a:7"));
     }
 }

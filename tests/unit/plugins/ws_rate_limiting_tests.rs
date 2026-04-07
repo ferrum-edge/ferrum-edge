@@ -596,3 +596,12 @@ async fn test_connection_id_max_works() {
     assert!(result.is_none(), "Connection ID u64::MAX should work");
     assert_eq!(plugin.tracked_keys_count(), Some(1));
 }
+
+#[test]
+fn test_redis_connection_scope_key_is_namespaced_per_instance() {
+    let key_a = ferrum_edge::_test_support::ws_rate_limiter_scope_key("proxy-a", 7);
+    let key_b = ferrum_edge::_test_support::ws_rate_limiter_scope_key("proxy-a", 7);
+    assert_ne!(key_a, key_b);
+    assert!(key_a.ends_with(":proxy-a:7"));
+    assert!(key_b.ends_with(":proxy-a:7"));
+}

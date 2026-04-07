@@ -182,7 +182,7 @@ fn parse_reqwest_method(method: &str) -> Result<reqwest::Method, ()> {
 /// Request-body plugins require buffering and transformation before forwarding,
 /// which the direct H2 path does not implement. Those requests must stay on the
 /// reqwest path so the final backend body matches the plugin output.
-fn can_use_direct_http2_pool(
+pub(crate) fn can_use_direct_http2_pool(
     enable_http2: bool,
     retain_request_body: bool,
     requires_request_body_buffering: bool,
@@ -200,7 +200,7 @@ enum RequestBodyBufferError {
     ClientDisconnected(String),
 }
 
-fn request_may_have_body(method: &str, headers: &HashMap<String, String>) -> bool {
+pub(crate) fn request_may_have_body(method: &str, headers: &HashMap<String, String>) -> bool {
     !matches!(method, "GET" | "HEAD" | "OPTIONS")
         || headers.contains_key("content-length")
         || headers.contains_key("transfer-encoding")
@@ -254,292 +254,6 @@ pub(crate) fn store_request_body_metadata(ctx: &mut RequestContext, body: &[u8])
             .insert("request_body".to_string(), body_str.to_string());
     } else {
         ctx.metadata.remove("request_body");
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{
-        apply_request_body_plugins, can_use_direct_http2_pool, extract_grpc_reject_message,
-        insert_grpc_error_metadata, map_http_reject_status_to_grpc_status,
-        normalize_reject_response, request_may_have_body, run_authentication_phase,
-    };
-    use crate::config::types::{AuthMode, Consumer};
-    use crate::consumer_index::ConsumerIndex;
-    use crate::plugins::{Plugin, PluginResult, RequestContext};
-    use crate::proxy::grpc_proxy;
-    use async_trait::async_trait;
-    use chrono::Utc;
-    use hyper::StatusCode;
-    use std::collections::HashMap;
-    use std::sync::Arc;
-
-    struct ExternalIdentityAuth;
-
-    #[async_trait]
-    impl Plugin for ExternalIdentityAuth {
-        fn name(&self) -> &str {
-            "external_identity_auth"
-        }
-
-        fn is_auth_plugin(&self) -> bool {
-            true
-        }
-
-        async fn authenticate(
-            &self,
-            ctx: &mut RequestContext,
-            _consumer_index: &ConsumerIndex,
-        ) -> PluginResult {
-            ctx.authenticated_identity = Some("external-user".to_string());
-            ctx.authenticated_identity_header = Some("external@example.com".to_string());
-            PluginResult::Continue
-        }
-    }
-
-    struct RejectingAuth;
-
-    #[async_trait]
-    impl Plugin for RejectingAuth {
-        fn name(&self) -> &str {
-            "rejecting_auth"
-        }
-
-        fn is_auth_plugin(&self) -> bool {
-            true
-        }
-
-        async fn authenticate(
-            &self,
-            _ctx: &mut RequestContext,
-            _consumer_index: &ConsumerIndex,
-        ) -> PluginResult {
-            PluginResult::Reject {
-                status_code: 401,
-                body: r#"{"error":"Missing credentials"}"#.to_string(),
-                headers: HashMap::new(),
-            }
-        }
-    }
-
-    struct BodySuffixPlugin {
-        suffix: &'static str,
-    }
-
-    #[async_trait]
-    impl Plugin for BodySuffixPlugin {
-        fn name(&self) -> &str {
-            "body_suffix"
-        }
-
-        fn modifies_request_body(&self) -> bool {
-            true
-        }
-
-        async fn transform_request_body(
-            &self,
-            body: &[u8],
-            _content_type: Option<&str>,
-            _request_headers: &HashMap<String, String>,
-        ) -> Option<Vec<u8>> {
-            let mut transformed = body.to_vec();
-            transformed.extend_from_slice(self.suffix.as_bytes());
-            Some(transformed)
-        }
-    }
-
-    #[tokio::test]
-    async fn test_multi_auth_accepts_external_identity_without_consumer() {
-        let external_identity: Arc<dyn Plugin> = Arc::new(ExternalIdentityAuth);
-        let rejecting: Arc<dyn Plugin> = Arc::new(RejectingAuth);
-        let auth_plugins = vec![&external_identity, &rejecting];
-        let consumer_index = ConsumerIndex::new(&[]);
-        let mut ctx = RequestContext::new(
-            "127.0.0.1".to_string(),
-            "GET".to_string(),
-            "/jwks".to_string(),
-        );
-
-        let result =
-            run_authentication_phase(AuthMode::Multi, &auth_plugins, &mut ctx, &consumer_index)
-                .await;
-
-        assert!(
-            result.is_none(),
-            "multi-auth should stop after external auth success"
-        );
-        assert_eq!(ctx.authenticated_identity.as_deref(), Some("external-user"));
-        assert!(ctx.identified_consumer.is_none());
-    }
-
-    #[test]
-    fn test_request_context_effective_identity_prefers_consumer_then_external_identity() {
-        let mut ctx = RequestContext::new(
-            "127.0.0.1".to_string(),
-            "GET".to_string(),
-            "/jwks".to_string(),
-        );
-        assert_eq!(ctx.effective_identity(), None);
-
-        ctx.authenticated_identity = Some("external-user".to_string());
-        assert_eq!(ctx.effective_identity(), Some("external-user"));
-
-        ctx.identified_consumer = Some(Consumer {
-            id: "consumer-1".to_string(),
-            username: "mapped-consumer".to_string(),
-            custom_id: None,
-            credentials: HashMap::new(),
-            acl_groups: Vec::new(),
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-        });
-        assert_eq!(ctx.effective_identity(), Some("mapped-consumer"));
-    }
-
-    #[test]
-    fn test_request_context_backend_consumer_username_prefers_consumer_then_header_then_identity() {
-        let mut ctx = RequestContext::new(
-            "127.0.0.1".to_string(),
-            "GET".to_string(),
-            "/jwks".to_string(),
-        );
-        assert_eq!(ctx.backend_consumer_username(), None);
-
-        ctx.authenticated_identity = Some("external-user".to_string());
-        assert_eq!(ctx.backend_consumer_username(), Some("external-user"));
-
-        ctx.authenticated_identity_header = Some("user@example.com".to_string());
-        assert_eq!(ctx.backend_consumer_username(), Some("user@example.com"));
-
-        ctx.identified_consumer = Some(Consumer {
-            id: "consumer-1".to_string(),
-            username: "mapped-consumer".to_string(),
-            custom_id: Some("custom-123".to_string()),
-            credentials: HashMap::new(),
-            acl_groups: Vec::new(),
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-        });
-        assert_eq!(ctx.backend_consumer_username(), Some("mapped-consumer"));
-        assert_eq!(ctx.backend_consumer_custom_id(), Some("custom-123"));
-    }
-
-    #[test]
-    fn test_map_http_reject_status_to_grpc_status_uses_semantic_codes() {
-        assert_eq!(
-            map_http_reject_status_to_grpc_status(StatusCode::UNAUTHORIZED),
-            grpc_proxy::grpc_status::UNAUTHENTICATED
-        );
-        assert_eq!(
-            map_http_reject_status_to_grpc_status(StatusCode::FORBIDDEN),
-            grpc_proxy::grpc_status::PERMISSION_DENIED
-        );
-        assert_eq!(
-            map_http_reject_status_to_grpc_status(StatusCode::TOO_MANY_REQUESTS),
-            grpc_proxy::grpc_status::RESOURCE_EXHAUSTED
-        );
-        assert_eq!(
-            map_http_reject_status_to_grpc_status(StatusCode::BAD_GATEWAY),
-            grpc_proxy::grpc_status::UNAVAILABLE
-        );
-    }
-
-    #[test]
-    fn test_extract_grpc_reject_message_prefers_json_error_fields() {
-        let body = br#"{"error":"Rate limit exceeded","details":"retry later"}"#;
-        assert_eq!(
-            extract_grpc_reject_message(body).as_deref(),
-            Some("Rate limit exceeded")
-        );
-    }
-
-    #[test]
-    fn test_normalize_reject_response_converts_grpc_requests_to_trailers_only_errors() {
-        let mut headers = HashMap::new();
-        headers.insert("x-ratelimit-limit".to_string(), "5".to_string());
-
-        let normalized = normalize_reject_response(
-            StatusCode::TOO_MANY_REQUESTS,
-            br#"{"error":"Rate limit exceeded"}"#,
-            &headers,
-            true,
-        );
-
-        assert_eq!(normalized.http_status, StatusCode::OK);
-        assert!(normalized.body.is_empty());
-        assert_eq!(
-            normalized.grpc_status,
-            Some(grpc_proxy::grpc_status::RESOURCE_EXHAUSTED)
-        );
-        assert_eq!(
-            normalized.grpc_message.as_deref(),
-            Some("Rate limit exceeded")
-        );
-        assert_eq!(
-            normalized.headers.get("content-type").map(|s| s.as_str()),
-            Some("application/grpc")
-        );
-        assert_eq!(
-            normalized.headers.get("grpc-status").map(|s| s.as_str()),
-            Some("8")
-        );
-        assert_eq!(
-            normalized
-                .headers
-                .get("x-ratelimit-limit")
-                .map(|s| s.as_str()),
-            Some("5")
-        );
-    }
-
-    #[test]
-    fn test_insert_grpc_error_metadata_sanitizes_message() {
-        let mut metadata = HashMap::new();
-        insert_grpc_error_metadata(
-            &mut metadata,
-            grpc_proxy::grpc_status::UNAVAILABLE,
-            "backend unavailable\nretry later",
-        );
-
-        assert_eq!(
-            metadata.get("grpc_status").map(|value| value.as_str()),
-            Some("14")
-        );
-        assert_eq!(
-            metadata.get("grpc_message").map(|value| value.as_str()),
-            Some("backend unavailable retry later")
-        );
-    }
-
-    #[test]
-    fn test_direct_http2_pool_requires_http2_without_retries_or_request_buffering() {
-        assert!(can_use_direct_http2_pool(true, false, false));
-        assert!(!can_use_direct_http2_pool(false, false, false));
-        assert!(!can_use_direct_http2_pool(true, true, false));
-        assert!(!can_use_direct_http2_pool(true, false, true));
-    }
-
-    #[test]
-    fn test_request_may_have_body_uses_method_and_body_headers() {
-        let no_headers = HashMap::new();
-        assert!(!request_may_have_body("GET", &no_headers));
-        assert!(request_may_have_body("POST", &no_headers));
-        assert!(request_may_have_body(
-            "GET",
-            &HashMap::from([("content-length".to_string(), "0".to_string())])
-        ));
-    }
-
-    #[tokio::test]
-    async fn test_apply_request_body_plugins_preserves_plugin_order() {
-        let first: Arc<dyn Plugin> = Arc::new(BodySuffixPlugin { suffix: "-first" });
-        let second: Arc<dyn Plugin> = Arc::new(BodySuffixPlugin { suffix: "-second" });
-        let plugins = vec![first, second];
-        let headers = HashMap::from([("content-type".to_string(), "application/json".to_string())]);
-
-        let transformed = apply_request_body_plugins(&plugins, &headers, b"body".to_vec()).await;
-
-        assert_eq!(transformed, b"body-first-second");
     }
 }
 
@@ -612,7 +326,7 @@ pub fn build_forwarded_value(client_ip: &str, proto: &str, host: Option<&str>) -
     val
 }
 
-async fn apply_request_body_plugins(
+pub(crate) async fn apply_request_body_plugins(
     plugins: &[Arc<dyn Plugin>],
     headers: &HashMap<String, String>,
     body_bytes: Vec<u8>,
@@ -3475,12 +3189,12 @@ pub(crate) async fn run_after_proxy_hooks(
     None
 }
 
-struct NormalizedRejectResponse {
-    http_status: StatusCode,
-    headers: HashMap<String, String>,
-    body: Vec<u8>,
-    grpc_status: Option<u32>,
-    grpc_message: Option<String>,
+pub(crate) struct NormalizedRejectResponse {
+    pub(crate) http_status: StatusCode,
+    pub(crate) headers: HashMap<String, String>,
+    pub(crate) body: Vec<u8>,
+    pub(crate) grpc_status: Option<u32>,
+    pub(crate) grpc_message: Option<String>,
 }
 
 fn grpc_status_reason(status: u32) -> &'static str {
@@ -3509,7 +3223,7 @@ fn sanitize_grpc_message(message: &str) -> String {
         .to_string()
 }
 
-fn extract_grpc_reject_message(body: &[u8]) -> Option<String> {
+pub(crate) fn extract_grpc_reject_message(body: &[u8]) -> Option<String> {
     let body = std::str::from_utf8(body).ok()?;
     let trimmed = body.trim();
     if trimmed.is_empty() {
@@ -3531,7 +3245,7 @@ fn extract_grpc_reject_message(body: &[u8]) -> Option<String> {
     (!sanitized.is_empty()).then_some(sanitized)
 }
 
-fn map_http_reject_status_to_grpc_status(status: StatusCode) -> u32 {
+pub(crate) fn map_http_reject_status_to_grpc_status(status: StatusCode) -> u32 {
     match status {
         StatusCode::BAD_REQUEST => grpc_proxy::grpc_status::INVALID_ARGUMENT,
         StatusCode::METHOD_NOT_ALLOWED => grpc_proxy::grpc_status::UNIMPLEMENTED,
@@ -3554,7 +3268,7 @@ fn map_http_reject_status_to_grpc_status(status: StatusCode) -> u32 {
     }
 }
 
-fn normalize_reject_response(
+pub(crate) fn normalize_reject_response(
     status: StatusCode,
     body: &[u8],
     headers: &HashMap<String, String>,
@@ -3610,7 +3324,7 @@ fn normalize_reject_response(
     }
 }
 
-fn insert_grpc_error_metadata(
+pub(crate) fn insert_grpc_error_metadata(
     metadata: &mut HashMap<String, String>,
     grpc_status: u32,
     grpc_message: &str,
