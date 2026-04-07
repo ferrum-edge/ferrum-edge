@@ -60,6 +60,7 @@ fn create_test_admin_state(config: &TestConfig) -> AdminState {
         admin_allowed_cidrs: std::sync::Arc::new(
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
+        cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
     }
 }
 

@@ -18,6 +18,7 @@ use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 use tokio::net::TcpListener;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
@@ -31,6 +32,17 @@ use crate::plugins;
 use crate::proxy::ProxyState;
 use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
+
+/// Cached result of the database health check to avoid hitting the DB on every
+/// `/health` request. The result is reused for `DB_HEALTH_CACHE_TTL` seconds.
+#[derive(Clone)]
+pub struct CachedDbHealthResult {
+    connected: bool,
+    checked_at: Instant,
+}
+
+/// Duration for which a DB health check result is reused.
+const DB_HEALTH_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// Admin API state.
 #[derive(Clone)]
@@ -59,6 +71,9 @@ pub struct AdminState {
     /// Parsed admin API IP allowlist. When non-empty, only connections from
     /// matching IPs are accepted. Checked at the TCP level before any processing.
     pub admin_allowed_cidrs: Arc<crate::proxy::client_ip::TrustedProxies>,
+    /// Cached DB health check result to avoid hitting the database on every
+    /// `/health` request. Shared across clones via `Arc<ArcSwap<_>>`.
+    pub cached_db_health: Arc<ArcSwap<Option<CachedDbHealthResult>>>,
 }
 
 impl AdminState {
@@ -333,22 +348,58 @@ pub async fn handle_admin_request(
             "mode": state.mode
         });
 
-        // Check database connectivity if available
+        // Check database connectivity if available (cached for 15s)
         if let Some(db) = &state.db {
-            match db.health_check().await {
-                Ok(()) => {
-                    health_status["database"] = json!({
-                        "status": "connected",
-                        "type": db.db_type()
-                    });
+            let cached = state.cached_db_health.load();
+            let db_connected = if let Some(ref entry) = **cached {
+                if entry.checked_at.elapsed() < DB_HEALTH_CACHE_TTL {
+                    // Cache hit — reuse the previous result
+                    entry.connected
+                } else {
+                    // Cache expired — re-check
+                    let connected = match db.health_check().await {
+                        Ok(()) => true,
+                        Err(e) => {
+                            warn!("Health check database query failed: {}", e);
+                            false
+                        }
+                    };
+                    state
+                        .cached_db_health
+                        .store(Arc::new(Some(CachedDbHealthResult {
+                            connected,
+                            checked_at: Instant::now(),
+                        })));
+                    connected
                 }
-                Err(e) => {
-                    warn!("Health check database query failed: {}", e);
-                    health_status["status"] = json!("degraded");
-                    health_status["database"] = json!({
-                        "status": "disconnected"
-                    });
-                }
+            } else {
+                // No cached result yet — first call
+                let connected = match db.health_check().await {
+                    Ok(()) => true,
+                    Err(e) => {
+                        warn!("Health check database query failed: {}", e);
+                        false
+                    }
+                };
+                state
+                    .cached_db_health
+                    .store(Arc::new(Some(CachedDbHealthResult {
+                        connected,
+                        checked_at: Instant::now(),
+                    })));
+                connected
+            };
+
+            if db_connected {
+                health_status["database"] = json!({
+                    "status": "connected",
+                    "type": db.db_type()
+                });
+            } else {
+                health_status["status"] = json!("degraded");
+                health_status["database"] = json!({
+                    "status": "disconnected"
+                });
             }
         }
 
@@ -2396,7 +2447,7 @@ async fn handle_delete_upstream(
 // ---- Metrics ----
 
 use std::sync::OnceLock;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// Process-global cache for the metrics JSON response.
 /// Uses a static to avoid adding a field to AdminState (which has 30+ construction sites).

@@ -176,6 +176,7 @@ pub async fn run(
         reserved_ports: reserved_ports.clone(),
         stream_proxy_bind_address: env_config.stream_proxy_bind_address.clone(),
         admin_allowed_cidrs: admin_allowed_cidrs.clone(),
+        cached_db_health: Arc::new(arc_swap::ArcSwap::new(Arc::new(None))),
     };
     let admin_shutdown = shutdown_tx.subscribe();
 
@@ -210,6 +211,7 @@ pub async fn run(
             reserved_ports: reserved_ports.clone(),
             stream_proxy_bind_address: env_config.stream_proxy_bind_address.clone(),
             admin_allowed_cidrs: admin_allowed_cidrs.clone(),
+            cached_db_health: Arc::new(arc_swap::ArcSwap::new(Arc::new(None))),
         };
         let admin_https_shutdown = shutdown_tx.subscribe();
 
