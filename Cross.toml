@@ -4,9 +4,9 @@ pre-build = [
     "dpkg --add-architecture $CROSS_DEB_ARCH",
     "apt-get update && apt-get install --assume-yes perl make libcurl4-openssl-dev:$CROSS_DEB_ARCH cmake software-properties-common wget gnupg",
     "wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | apt-key add -",
-    "add-apt-repository 'deb http://apt.llvm.org/xenial/ llvm-toolchain-xenial-14 main'",
-    "apt-get update && apt-get install --assume-yes clang-14 libclang-14-dev"
+    "add-apt-repository 'deb http://apt.llvm.org/xenial/ llvm-toolchain-xenial-6.0 main'",
+    "apt-get update && apt-get install --assume-yes clang-6.0 libclang-6.0-dev"
 ]
 
 [target.aarch64-unknown-linux-gnu.env]
-passthrough = ["LIBCLANG_PATH=/usr/lib/llvm-14/lib"]
+passthrough = ["LIBCLANG_PATH=/usr/lib/llvm-6.0/lib"]
