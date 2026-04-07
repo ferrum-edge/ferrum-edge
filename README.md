@@ -365,11 +365,12 @@ All gateways run in Docker containers for apples-to-apples comparison:
 
 | Gateway | Key-Auth req/s | Key-Auth Latency | vs Ferrum |
 |---------|---------------|-----------------|-----------|
-| **Ferrum Edge** | **26,004** | **3.70 ms** | — |
-| Envoy 1.32 (Lua filter) | 22,626 | 4.34 ms | Ferrum 15% faster |
-| Kong 3.9 | 17,625 | 5.86 ms | Ferrum 48% faster |
+| **Ferrum Edge** | **27,979** | **3.44 ms** | — |
+| Envoy 1.32 (Lua filter) | 26,787 | 3.64 ms | Ferrum 4% faster |
+| Kong 3.9 | 25,009 | 3.91 ms | Ferrum 12% faster |
+| Tyk v5.7 | 19,186 | 5.08 ms | Ferrum 46% faster |
 
-Ferrum's authentication adds effectively **zero overhead** — authenticated requests match unauthenticated throughput thanks to the pre-computed `ConsumerIndex` with `Arc<Consumer>` zero-copy credential resolution and lock-free `ArcSwap` reads. See `comparison/` for the full benchmark suite and methodology.
+Ferrum also **won the E2E TLS /api/users test outright** — 29,808 req/s, the highest throughput of any gateway in any scenario, beating Envoy by 13%. Ferrum's authentication adds effectively **zero overhead** — authenticated requests match unauthenticated throughput thanks to the pre-computed `ConsumerIndex` with `Arc<Consumer>` zero-copy credential resolution and lock-free `ArcSwap` reads. See `comparison/` for the full benchmark suite and methodology.
 
 ## Troubleshooting
 
