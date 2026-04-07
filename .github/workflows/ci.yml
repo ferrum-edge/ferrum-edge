@@ -337,12 +337,11 @@ jobs:
             echo "Performance tests did not produce results." >> $GITHUB_STEP_SUMMARY
           fi
 
-  # ── Build & Release (main branch only) ──────────────────────────────────
+  # ── Cross-platform builds (PRs + main) & Release (main only) ──────────
 
   build-binaries:
     name: Build (${{ matrix.asset_name }})
     needs: [test, lint]
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -452,6 +451,7 @@ jobs:
   latest-release:
     name: Update Latest Release
     needs: build-binaries
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -521,6 +521,7 @@ jobs:
   docker:
     name: Docker (${{ matrix.platform }})
     needs: build-binaries
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -592,6 +593,7 @@ jobs:
   docker-manifest:
     name: Docker Manifest
     needs: docker
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
       contents: read

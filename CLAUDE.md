@@ -85,9 +85,10 @@ The CI workflow (`.github/workflows/ci.yml`) runs on push to `main` and PRs targ
 
 All four jobs must pass for a PR to merge.
 
-On push to `main` only (after tests + lint pass), additional jobs run:
+5. **Build Binaries** (depends on tests + lint) — release builds for 5 targets: Linux x86_64, Linux ARM64 (via `cross`), macOS x86_64, macOS ARM64, Windows x86_64. Runs on both PRs and main pushes to catch cross-platform build failures before merge.
 
-5. **Build Binaries** — release builds for 5 targets: Linux x86_64, Linux ARM64 (via `cross`), macOS x86_64, macOS ARM64, Windows x86_64
+On push to `main` only (after build binaries pass), additional jobs run:
+
 6. **Latest Release** — overwrites a `latest` prerelease GitHub Release with all binaries and SHA256 checksums
 7. **Docker** — builds per-platform images from pre-built binaries using `Dockerfile.release`, then creates a multi-arch manifest (linux/amd64 + linux/arm64) pushed to both Docker Hub (`ferrumedge/ferrum-edge:latest`) and GHCR (`ghcr.io/ferrum-edge/ferrum-edge:latest`)
 
