@@ -59,14 +59,14 @@ Ferrum Edge MUST operate in one of three distinct modes, determined by the `FERR
         *   **Database Integration:** Connects to the database (`FERRUM_DB_TYPE`, `FERRUM_DB_URL`). Relies on the database schema to enforce `Proxy.listen_path` uniqueness.
         *   **Listeners:** Activates and listens *only* on the Admin API network interfaces (HTTP/HTTPS) *and* a dedicated gRPC server interface (`FERRUM_CP_GRPC_LISTEN_ADDR`). Proxy Traffic listeners remain inactive.
         *   **gRPC Server:** Implements a `tonic` gRPC server providing services for Data Plane nodes to subscribe to configuration updates.
-        *   **gRPC Security:** Mandates that connecting Data Plane nodes authenticate using an HS256 JWT. The JWT MUST be provided in the gRPC request metadata. The CP MUST verify this JWT using the secret key provided via `FERRUM_CP_GRPC_JWT_SECRET`. Unauthenticated connection attempts MUST be rejected.
+        *   **gRPC Security:** Mandates that connecting Data Plane nodes authenticate using an HS256 JWT. The JWT MUST be provided in the gRPC request metadata. The CP MUST verify this JWT using the shared secret provided via `FERRUM_CP_DP_GRPC_JWT_SECRET`. Unauthenticated connection attempts MUST be rejected.
         *   **Configuration Distribution:** Reads the active configuration from the database. Transmits the full initial configuration to newly connected, authenticated Data Plane nodes. Subsequently, pushes configuration updates (delta updates are preferred for efficiency if feasible, otherwise full configuration snapshots) to all subscribed Data Plane nodes via the established gRPC streams.
         *   **Resilience:** Caches the configuration read from the database. If the database connection is temporarily lost, the CP node MUST continue serving the last known valid configuration to connecting/reconnecting Data Plane nodes. Log appropriate warnings. Admin API operations requiring database writes MUST fail gracefully during the outage.
     *   **3.3.2. Data Plane (DP) Node (`FERRUM_MODE=dp`)**
         *   **Functionality:** Responsible solely for processing end-user proxy traffic according to the configuration received from a Control Plane. It does **NOT** connect to the database and does **NOT** expose an Admin API.
         *   **Listeners:** Activates and listens *only* on the Proxy Traffic network interfaces (HTTP/HTTPS). Admin API and gRPC server listeners remain inactive.
         *   **Control Plane Connection:** Establishes a persistent gRPC client connection to the Control Plane server's address, specified by `FERRUM_DP_CP_GRPC_URL`.
-        *   **gRPC Security:** Authenticates itself to the Control Plane during the initial connection phase by sending a pre-configured HS256 JWT (provided via `FERRUM_DP_GRPC_AUTH_TOKEN`) in the gRPC request metadata.
+        *   **gRPC Security:** Authenticates itself to the Control Plane during each connection attempt by generating a short-lived HS256 JWT (59-minute TTL) from the shared secret provided via `FERRUM_CP_DP_GRPC_JWT_SECRET` and sending it in the gRPC request metadata.
         *   **Configuration Management:** Receives the initial configuration and subsequent updates from the Control Plane over the gRPC stream. The received configuration (assumed valid and containing unique `listen_path` values by the CP) is stored entirely in the DP node's memory and dictates its proxying behavior.
         *   **Resilience:** If the gRPC connection to the Control Plane is lost, the DP node **MUST** continue operating and serving proxy traffic using its last known valid configuration cache. It MUST implement a strategy to periodically attempt reconnection to the Control Plane. Log appropriate warnings regarding the connection status.
 
@@ -99,8 +99,7 @@ All operational parameters MUST be configurable via environment variables.
     *   `FERRUM_ADMIN_HTTP_PORT`, `FERRUM_ADMIN_HTTPS_PORT`, `FERRUM_ADMIN_TLS_CERT_PATH`, `FERRUM_ADMIN_TLS_KEY_PATH`
 *   **Admin & CP/DP Security:**
     *   `FERRUM_ADMIN_JWT_SECRET`: (HS256 secret string) - **Required** in Database & CP modes.
-    *   `FERRUM_CP_GRPC_JWT_SECRET`: (HS256 secret string) - **Required** in CP mode.
-    *   `FERRUM_DP_GRPC_AUTH_TOKEN`: (HS256 JWT string) - **Required** in DP mode.
+    *   `FERRUM_CP_DP_GRPC_JWT_SECRET`: (HS256 secret string) - **Required** in CP and DP modes. Shared secret for gRPC authentication — DP generates short-lived JWTs, CP validates them.
 *   **Database (Database & CP Modes):**
     *   `FERRUM_DB_TYPE`: (`postgres`, `mysql`, `sqlite`, `mongodb`) - **Required**.
     *   `FERRUM_DB_URL`: (Connection string) - **Required**.

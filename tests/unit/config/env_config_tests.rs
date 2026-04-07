@@ -168,7 +168,7 @@ fn test_env_config_dp_mode_missing_grpc_url() {
     with_env_vars(
         &[
             ("FERRUM_MODE", "dp"),
-            ("FERRUM_DP_GRPC_AUTH_TOKEN", "token"),
+            ("FERRUM_CP_DP_GRPC_JWT_SECRET", "secret"),
         ],
         || {
             remove_var("FERRUM_DP_CP_GRPC_URL");
@@ -180,17 +180,17 @@ fn test_env_config_dp_mode_missing_grpc_url() {
 }
 
 #[test]
-fn test_env_config_dp_mode_missing_auth_token() {
+fn test_env_config_dp_mode_missing_jwt_secret() {
     with_env_vars(
         &[
             ("FERRUM_MODE", "dp"),
             ("FERRUM_DP_CP_GRPC_URL", "http://cp:50051"),
         ],
         || {
-            remove_var("FERRUM_DP_GRPC_AUTH_TOKEN");
+            remove_var("FERRUM_CP_DP_GRPC_JWT_SECRET");
             let result = EnvConfig::from_env();
             assert!(result.is_err());
-            assert!(result.unwrap_err().contains("FERRUM_DP_GRPC_AUTH_TOKEN"));
+            assert!(result.unwrap_err().contains("FERRUM_CP_DP_GRPC_JWT_SECRET"));
         },
     );
 }
@@ -203,7 +203,7 @@ fn test_env_config_cp_mode_missing_grpc_listen() {
             ("FERRUM_ADMIN_JWT_SECRET", "secret"),
             ("FERRUM_DB_TYPE", "sqlite"),
             ("FERRUM_DB_URL", "sqlite::memory:"),
-            ("FERRUM_CP_GRPC_JWT_SECRET", "grpc-secret"),
+            ("FERRUM_CP_DP_GRPC_JWT_SECRET", "grpc-secret"),
         ],
         || {
             remove_var("FERRUM_CP_GRPC_LISTEN_ADDR");
@@ -225,10 +225,10 @@ fn test_env_config_cp_mode_missing_grpc_jwt_secret() {
             ("FERRUM_CP_GRPC_LISTEN_ADDR", "0.0.0.0:50051"),
         ],
         || {
-            remove_var("FERRUM_CP_GRPC_JWT_SECRET");
+            remove_var("FERRUM_CP_DP_GRPC_JWT_SECRET");
             let result = EnvConfig::from_env();
             assert!(result.is_err());
-            assert!(result.unwrap_err().contains("FERRUM_CP_GRPC_JWT_SECRET"));
+            assert!(result.unwrap_err().contains("FERRUM_CP_DP_GRPC_JWT_SECRET"));
         },
     );
 }
@@ -460,7 +460,7 @@ fn test_env_config_dp_mode_valid() {
         &[
             ("FERRUM_MODE", "dp"),
             ("FERRUM_DP_CP_GRPC_URL", "http://control-plane:50051"),
-            ("FERRUM_DP_GRPC_AUTH_TOKEN", "my-token"),
+            ("FERRUM_CP_DP_GRPC_JWT_SECRET", "my-secret"),
         ],
         || {
             let config = EnvConfig::from_env().unwrap();
@@ -469,7 +469,7 @@ fn test_env_config_dp_mode_valid() {
                 config.dp_cp_grpc_url,
                 Some("http://control-plane:50051".to_string())
             );
-            assert_eq!(config.dp_grpc_auth_token, Some("my-token".to_string()));
+            assert_eq!(config.cp_dp_grpc_jwt_secret, Some("my-secret".to_string()));
         },
     );
 }
@@ -483,7 +483,7 @@ fn test_env_config_cp_mode_valid() {
             ("FERRUM_DB_TYPE", "postgres"),
             ("FERRUM_DB_URL", "postgres://localhost/ferrum"),
             ("FERRUM_CP_GRPC_LISTEN_ADDR", "0.0.0.0:50051"),
-            ("FERRUM_CP_GRPC_JWT_SECRET", "grpc-secret"),
+            ("FERRUM_CP_DP_GRPC_JWT_SECRET", "grpc-secret"),
         ],
         || {
             let config = EnvConfig::from_env().unwrap();
@@ -492,7 +492,10 @@ fn test_env_config_cp_mode_valid() {
                 config.cp_grpc_listen_addr,
                 Some("0.0.0.0:50051".to_string())
             );
-            assert_eq!(config.cp_grpc_jwt_secret, Some("grpc-secret".to_string()));
+            assert_eq!(
+                config.cp_dp_grpc_jwt_secret,
+                Some("grpc-secret".to_string())
+            );
         },
     );
 }

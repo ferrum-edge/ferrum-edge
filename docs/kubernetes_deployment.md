@@ -310,11 +310,11 @@ env:
         key: admin-jwt-secret
   - name: FERRUM_CP_GRPC_LISTEN_ADDR
     value: 0.0.0.0:50051
-  - name: FERRUM_CP_GRPC_JWT_SECRET
+  - name: FERRUM_CP_DP_GRPC_JWT_SECRET
     valueFrom:
       secretKeyRef:
         name: ferrum-edge-secrets
-        key: cp-grpc-jwt-secret
+        key: cp-dp-grpc-jwt-secret
 ```
 
 Control Plane service example:
@@ -350,11 +350,11 @@ env:
     value: dp
   - name: FERRUM_DP_CP_GRPC_URL
     value: http://ferrum-edge-cp:50051
-  - name: FERRUM_DP_GRPC_AUTH_TOKEN
+  - name: FERRUM_CP_DP_GRPC_JWT_SECRET
     valueFrom:
       secretKeyRef:
         name: ferrum-edge-secrets
-        key: dp-grpc-auth-token
+        key: cp-dp-grpc-jwt-secret
   - name: FERRUM_ADMIN_JWT_SECRET
     valueFrom:
       secretKeyRef:

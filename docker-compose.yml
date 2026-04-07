@@ -169,7 +169,7 @@ services:
       FERRUM_DB_URL: postgres://ferrum:${POSTGRES_PASSWORD:-dev-password-change-in-production}@postgres:5432/ferrum
       FERRUM_ADMIN_JWT_SECRET: ${FERRUM_ADMIN_JWT_SECRET:-dev-secret-key-change-in-production}
       FERRUM_CP_GRPC_LISTEN_ADDR: 0.0.0.0:50051
-      FERRUM_CP_GRPC_JWT_SECRET: ${FERRUM_CP_GRPC_JWT_SECRET:-dev-grpc-secret-change-in-production}
+      FERRUM_CP_DP_GRPC_JWT_SECRET: ${FERRUM_CP_DP_GRPC_JWT_SECRET:-dev-grpc-secret-change-in-production}
       FERRUM_LOG_LEVEL: info
     networks:
       - ferrum-network
@@ -201,7 +201,7 @@ services:
     environment:
       FERRUM_MODE: dp
       FERRUM_DP_CP_GRPC_URL: http://ferrum-cp:50051
-      FERRUM_DP_GRPC_AUTH_TOKEN: ${FERRUM_DP_GRPC_AUTH_TOKEN:-dev-dp-token}
+      FERRUM_CP_DP_GRPC_JWT_SECRET: ${FERRUM_CP_DP_GRPC_JWT_SECRET:-dev-grpc-secret-change-in-production}
       FERRUM_LOG_LEVEL: info
     networks:
       - ferrum-network
@@ -232,7 +232,7 @@ services:
     environment:
       FERRUM_MODE: dp
       FERRUM_DP_CP_GRPC_URL: http://ferrum-cp:50051
-      FERRUM_DP_GRPC_AUTH_TOKEN: ${FERRUM_DP_GRPC_AUTH_TOKEN:-dev-dp-token}
+      FERRUM_CP_DP_GRPC_JWT_SECRET: ${FERRUM_CP_DP_GRPC_JWT_SECRET:-dev-grpc-secret-change-in-production}
       FERRUM_LOG_LEVEL: info
     networks:
       - ferrum-network

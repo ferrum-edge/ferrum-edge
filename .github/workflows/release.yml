@@ -269,6 +269,7 @@ jobs:
           context: docker-context
           platforms: ${{ matrix.platform }}
           outputs: type=image,"name=ferrumedge/ferrum-edge,ghcr.io/${{ github.repository }}",push-by-digest=true,name-canonical=true,push=true
+          provenance: false
 
       - name: Export digest
         run: |

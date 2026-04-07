@@ -172,8 +172,7 @@ Multi-node architecture with separate Control Plane and Data Planes:
 # Set environment variables
 export POSTGRES_PASSWORD="secure-password"
 export FERRUM_ADMIN_JWT_SECRET="jwt-secret-key"
-export FERRUM_CP_GRPC_JWT_SECRET="grpc-secret-key"
-export FERRUM_DP_GRPC_AUTH_TOKEN="dp-auth-token"
+export FERRUM_CP_DP_GRPC_JWT_SECRET="grpc-shared-secret"
 
 # Start all services
 docker-compose --profile cp-dp up
@@ -255,11 +254,11 @@ FERRUM_DB_POLL_INTERVAL=30
 
 # Control Plane (for cp mode)
 FERRUM_CP_GRPC_LISTEN_ADDR=0.0.0.0:50051
-FERRUM_CP_GRPC_JWT_SECRET=grpc-secret
+FERRUM_CP_DP_GRPC_JWT_SECRET=grpc-secret
 
 # Data Plane (for dp mode)
 FERRUM_DP_CP_GRPC_URL=http://cp:50051
-FERRUM_DP_GRPC_AUTH_TOKEN=jwt-token
+FERRUM_CP_DP_GRPC_JWT_SECRET=grpc-secret
 ```
 
 ### Setting Variables in Docker

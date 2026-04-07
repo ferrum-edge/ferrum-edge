@@ -9,6 +9,8 @@
 //!
 //! SNI is extracted from the CP URL so TLS certificate validation works
 //! correctly even when connecting via IP address with a hostname-based cert.
+use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
+use serde_json::json;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -39,18 +41,43 @@ pub struct DpGrpcTlsConfig {
     pub no_verify: bool,
 }
 
+/// JWT token lifetime for DP-generated tokens (59 minutes, under the 1-hour ceiling).
+const DP_JWT_TTL_SECONDS: i64 = 3540;
+
+/// Generate a short-lived HS256 JWT for authenticating the DP to the CP.
+///
+/// The token is signed with the shared `FERRUM_CP_DP_GRPC_JWT_SECRET` and
+/// includes `sub`, `iat`, `exp`, and `role` claims. A fresh token is minted
+/// on each gRPC connection attempt so that tokens captured from the wire
+/// are only valid for ~59 minutes.
+pub fn generate_dp_jwt(secret: &str, node_id: &str) -> Result<String, anyhow::Error> {
+    let now = chrono::Utc::now().timestamp();
+    let claims = json!({
+        "sub": node_id,
+        "iat": now,
+        "exp": now + DP_JWT_TTL_SECONDS,
+        "role": "data_plane",
+    });
+    let token = encode(
+        &Header::new(Algorithm::HS256),
+        &claims,
+        &EncodingKey::from_secret(secret.as_bytes()),
+    )?;
+    Ok(token)
+}
+
 /// Connect to the Control Plane with an optional shutdown signal.
 #[allow(dead_code)] // Used by tests and library callers; binary startup uses the startup-aware variant.
 pub async fn start_dp_client_with_shutdown(
     cp_url: String,
-    auth_token: String,
+    jwt_secret: String,
     proxy_state: ProxyState,
     shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
     tls_config: Option<DpGrpcTlsConfig>,
 ) {
     start_dp_client_with_shutdown_and_startup_ready(
         cp_url,
-        auth_token,
+        jwt_secret,
         proxy_state,
         shutdown_rx,
         tls_config,
@@ -62,7 +89,7 @@ pub async fn start_dp_client_with_shutdown(
 /// Connect to the Control Plane with an optional startup readiness flag.
 pub async fn start_dp_client_with_shutdown_and_startup_ready(
     cp_url: String,
-    auth_token: String,
+    jwt_secret: String,
     proxy_state: ProxyState,
     shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
     tls_config: Option<DpGrpcTlsConfig>,
@@ -87,7 +114,7 @@ pub async fn start_dp_client_with_shutdown_and_startup_ready(
 
         match connect_and_subscribe_with_startup_ready(
             &cp_url,
-            &auth_token,
+            &jwt_secret,
             &node_id,
             &proxy_state,
             tls_config.as_ref(),
@@ -151,14 +178,14 @@ pub async fn start_dp_client_with_shutdown_and_startup_ready(
 #[allow(dead_code)] // Used by tests and library callers; binary startup uses the startup-aware variant.
 pub async fn connect_and_subscribe(
     cp_url: &str,
-    auth_token: &str,
+    jwt_secret: &str,
     node_id: &str,
     proxy_state: &ProxyState,
     tls_config: Option<&DpGrpcTlsConfig>,
 ) -> Result<(), anyhow::Error> {
     connect_and_subscribe_with_startup_ready(
         cp_url,
-        auth_token,
+        jwt_secret,
         node_id,
         proxy_state,
         tls_config,
@@ -170,7 +197,7 @@ pub async fn connect_and_subscribe(
 /// Connect to CP and optionally flip startup readiness after the first applied snapshot.
 pub async fn connect_and_subscribe_with_startup_ready(
     cp_url: &str,
-    auth_token: &str,
+    jwt_secret: &str,
     node_id: &str,
     proxy_state: &ProxyState,
     tls_config: Option<&DpGrpcTlsConfig>,
@@ -203,6 +230,12 @@ pub async fn connect_and_subscribe_with_startup_ready(
 
     let channel = endpoint.connect().await?;
 
+    // Mint a fresh short-lived JWT for this connection attempt.
+    let auth_token = generate_dp_jwt(jwt_secret, node_id)?;
+    info!(
+        "Generated fresh DP JWT (TTL={}s) for CP authentication",
+        DP_JWT_TTL_SECONDS
+    );
     let token: MetadataValue<_> = format!("Bearer {}", auth_token).parse()?;
 
     #[allow(clippy::result_large_err)]

@@ -90,9 +90,8 @@ See [mongodb.md](mongodb.md) for the full deployment guide including read prefer
 | Variable | Required | Default | Description |
 |---|---|---|---|
 | `FERRUM_CP_GRPC_LISTEN_ADDR` | CP mode | — | gRPC listen address (e.g., `0.0.0.0:50051`) |
-| `FERRUM_CP_GRPC_JWT_SECRET` | CP mode | — | HS256 secret for DP node authentication |
+| `FERRUM_CP_DP_GRPC_JWT_SECRET` | CP & DP modes | — | Shared JWT secret for CP/DP gRPC auth (DP generates short-lived JWTs, CP validates) |
 | `FERRUM_DP_CP_GRPC_URL` | DP mode | — | Control Plane gRPC URL |
-| `FERRUM_DP_GRPC_AUTH_TOKEN` | DP mode | — | Pre-signed HS256 JWT for CP authentication |
 
 See [cp_dp_mode.md](cp_dp_mode.md) for CP/DP TLS environment variables (`FERRUM_CP_GRPC_TLS_*`, `FERRUM_DP_GRPC_TLS_*`).
 

@@ -108,7 +108,7 @@ cargo run --release
 # Data Plane - Admin API is always read-only
 FERRUM_MODE=dp \
 FERRUM_DP_CP_GRPC_URL="http://control-plane:50051" \
-FERRUM_DP_GRPC_AUTH_TOKEN="<signed-jwt-token>" \
+FERRUM_CP_DP_GRPC_JWT_SECRET="grpc-shared-secret" \
 cargo run --release
 ```
 

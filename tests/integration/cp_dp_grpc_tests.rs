@@ -10,8 +10,6 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use chrono::Utc;
-use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
-use serde_json::json;
 use tokio::time::timeout;
 use tonic::transport::server::ServerTlsConfig;
 use tonic::transport::{Certificate, Identity, Server};
@@ -28,22 +26,8 @@ use ferrum_edge::proxy::ProxyState;
 
 const TEST_JWT_SECRET: &str = "test-grpc-secret-key";
 
-/// Create a JWT token signed with the test secret.
-fn create_test_token() -> String {
-    let now = chrono::Utc::now().timestamp();
-    let claims = json!({
-        "sub": "dp-node",
-        "iat": now,
-        "exp": now + 3600,
-        "role": "data_plane",
-    });
-    encode(
-        &Header::new(Algorithm::HS256),
-        &claims,
-        &EncodingKey::from_secret(TEST_JWT_SECRET.as_bytes()),
-    )
-    .expect("Failed to create test JWT token")
-}
+// DP now generates its own JWT from the shared secret via dp_client::generate_dp_jwt().
+// Tests pass TEST_JWT_SECRET directly to connect_and_subscribe().
 
 /// Create a test Proxy entry.
 fn create_test_proxy(id: &str, listen_path: &str) -> Proxy {
@@ -148,9 +132,8 @@ fn create_test_env_config() -> ferrum_edge::config::EnvConfig {
         db_failover_urls: Vec::new(),
         db_read_replica_url: None,
         cp_grpc_listen_addr: None,
-        cp_grpc_jwt_secret: None,
+        cp_dp_grpc_jwt_secret: None,
         dp_cp_grpc_url: None,
-        dp_grpc_auth_token: None,
         cp_grpc_tls_cert_path: None,
         cp_grpc_tls_key_path: None,
         cp_grpc_tls_client_ca_path: None,
@@ -281,14 +264,13 @@ async fn test_dp_receives_initial_config_from_cp() {
     let proxy_state = create_test_proxy_state();
     assert_eq!(proxy_state.config.load().proxies.len(), 0);
 
-    // Connect to CP and receive initial config
+    // Connect to CP and receive initial config (DP generates JWT from shared secret)
     let cp_url = format!("http://127.0.0.1:{}", addr.port());
-    let token = create_test_token();
     let node_id = "test-node-1";
 
     let result = timeout(
         Duration::from_secs(5),
-        dp_client::connect_and_subscribe(&cp_url, &token, node_id, &proxy_state, None),
+        dp_client::connect_and_subscribe(&cp_url, TEST_JWT_SECRET, node_id, &proxy_state, None),
     )
     .await;
 
@@ -326,12 +308,11 @@ async fn test_dp_receives_config_updates() {
     // Create DP proxy state (starts empty)
     let proxy_state = create_test_proxy_state();
 
-    // Spawn the DP client in the background
+    // Spawn the DP client in the background (DP generates JWT from shared secret)
     let cp_url = format!("http://127.0.0.1:{}", addr.port());
-    let token = create_test_token();
     let ps = proxy_state.clone();
     let client_handle = tokio::spawn(async move {
-        dp_client::connect_and_subscribe(&cp_url, &token, "test-node-2", &ps, None).await
+        dp_client::connect_and_subscribe(&cp_url, TEST_JWT_SECRET, "test-node-2", &ps, None).await
     });
 
     // Wait for initial config to arrive
@@ -381,22 +362,19 @@ async fn test_dp_rejects_invalid_token() {
     let cp_config = create_test_config(1);
     let (addr, _update_tx, _server_handle) = start_test_cp_server(cp_config).await;
 
-    // Create a token signed with the WRONG secret
-    let now = chrono::Utc::now().timestamp();
-    let wrong_claims = json!({"sub": "attacker", "iat": now, "exp": now + 3600});
-    let wrong_token = encode(
-        &Header::new(Algorithm::HS256),
-        &wrong_claims,
-        &EncodingKey::from_secret(b"wrong-secret-key"),
-    )
-    .unwrap();
-
+    // DP uses a WRONG secret — the JWT it generates won't verify on the CP
     let proxy_state = create_test_proxy_state();
     let cp_url = format!("http://127.0.0.1:{}", addr.port());
 
     let result = timeout(
         Duration::from_secs(5),
-        dp_client::connect_and_subscribe(&cp_url, &wrong_token, "bad-node", &proxy_state, None),
+        dp_client::connect_and_subscribe(
+            &cp_url,
+            "wrong-secret-key",
+            "bad-node",
+            &proxy_state,
+            None,
+        ),
     )
     .await;
 
@@ -424,59 +402,10 @@ async fn test_dp_rejects_invalid_token() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn test_dp_rejects_token_missing_required_claims() {
-    // Start CP server
-    let cp_config = create_test_config(1);
-    let (addr, _update_tx, _server_handle) = start_test_cp_server(cp_config).await;
-
-    // Create a token with correct secret but missing required claims (no sub, no iat)
-    let now = chrono::Utc::now().timestamp();
-    let minimal_claims = json!({"exp": now + 3600, "role": "data_plane"});
-    let token_no_sub = encode(
-        &Header::new(Algorithm::HS256),
-        &minimal_claims,
-        &EncodingKey::from_secret(TEST_JWT_SECRET.as_bytes()),
-    )
-    .unwrap();
-
-    let proxy_state = create_test_proxy_state();
-    let cp_url = format!("http://127.0.0.1:{}", addr.port());
-
-    let result = timeout(
-        Duration::from_secs(5),
-        dp_client::connect_and_subscribe(
-            &cp_url,
-            &token_no_sub,
-            "missing-claims-node",
-            &proxy_state,
-            None,
-        ),
-    )
-    .await;
-
-    match result {
-        Ok(Err(e)) => {
-            let err_msg = format!("{}", e);
-            assert!(
-                err_msg.contains("Unauthenticated")
-                    || err_msg.contains("unauthenticated")
-                    || err_msg.contains("token")
-                    || err_msg.contains("claim"),
-                "Expected authentication error for missing claims, got: {}",
-                err_msg
-            );
-        }
-        Ok(Ok(())) => panic!("Should have rejected token missing required claims"),
-        Err(_) => panic!("Should have responded before timeout"),
-    }
-
-    assert_eq!(
-        proxy_state.config.load().proxies.len(),
-        0,
-        "Config should remain empty after auth failure"
-    );
-}
+// NOTE: The old test_dp_rejects_token_missing_required_claims test was removed because
+// the DP now generates its own JWTs with all required claims via generate_dp_jwt().
+// The CP's verify_jwt_metadata() still validates required claims (exp, iat, sub) as
+// defense-in-depth, and the wrong-secret test above covers the auth failure path.
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_dp_handles_malformed_config() {
@@ -486,12 +415,11 @@ async fn test_dp_handles_malformed_config() {
 
     let proxy_state = create_test_proxy_state();
     let cp_url = format!("http://127.0.0.1:{}", addr.port());
-    let token = create_test_token();
-
-    // Spawn DP client
+    // Spawn DP client (DP generates JWT from shared secret)
     let ps = proxy_state.clone();
     let client_handle = tokio::spawn(async move {
-        dp_client::connect_and_subscribe(&cp_url, &token, "test-node-malformed", &ps, None).await
+        dp_client::connect_and_subscribe(&cp_url, TEST_JWT_SECRET, "test-node-malformed", &ps, None)
+            .await
     });
 
     // Wait for initial config
@@ -559,14 +487,19 @@ async fn test_dp_preserves_config_after_cp_shutdown() {
 
     let proxy_state = create_test_proxy_state();
     let cp_url = format!("http://127.0.0.1:{}", addr.port());
-    let token = create_test_token();
 
     // Use start_dp_client_with_shutdown which has auto-reconnect logic
     let ps = proxy_state.clone();
     let url_clone = cp_url.clone();
-    let token_clone = token.clone();
     let client_handle = tokio::spawn(async move {
-        dp_client::start_dp_client_with_shutdown(url_clone, token_clone, ps, None, None).await;
+        dp_client::start_dp_client_with_shutdown(
+            url_clone,
+            TEST_JWT_SECRET.to_string(),
+            ps,
+            None,
+            None,
+        )
+        .await;
     });
 
     // Wait for initial config
@@ -691,7 +624,6 @@ async fn test_dp_connects_to_cp_with_tls() {
     // Create DP with TLS config (CA cert to verify server)
     let proxy_state = create_test_proxy_state();
     let cp_url = format!("https://127.0.0.1:{}", addr.port());
-    let token = create_test_token();
 
     let tls_config = DpGrpcTlsConfig {
         ca_cert_pem: Some(ca_pem),
@@ -704,7 +636,7 @@ async fn test_dp_connects_to_cp_with_tls() {
         Duration::from_secs(5),
         dp_client::connect_and_subscribe(
             &cp_url,
-            &token,
+            TEST_JWT_SECRET,
             "tls-node-1",
             &proxy_state,
             Some(&tls_config),
@@ -773,7 +705,6 @@ async fn test_dp_connects_to_cp_with_mtls() {
     // Create DP with mTLS config (CA cert + client cert/key)
     let proxy_state = create_test_proxy_state();
     let cp_url = format!("https://127.0.0.1:{}", addr.port());
-    let token = create_test_token();
 
     let tls_config = DpGrpcTlsConfig {
         ca_cert_pem: Some(ca_pem),
@@ -786,7 +717,7 @@ async fn test_dp_connects_to_cp_with_mtls() {
         Duration::from_secs(5),
         dp_client::connect_and_subscribe(
             &cp_url,
-            &token,
+            TEST_JWT_SECRET,
             "mtls-node-1",
             &proxy_state,
             Some(&tls_config),
@@ -831,7 +762,6 @@ async fn test_dp_rejects_untrusted_cp_server_cert() {
     // DP trusts the WRONG CA — should fail to connect
     let proxy_state = create_test_proxy_state();
     let cp_url = format!("https://127.0.0.1:{}", addr.port());
-    let token = create_test_token();
 
     let tls_config = DpGrpcTlsConfig {
         ca_cert_pem: Some(different_ca_pem),
@@ -844,7 +774,7 @@ async fn test_dp_rejects_untrusted_cp_server_cert() {
         Duration::from_secs(5),
         dp_client::connect_and_subscribe(
             &cp_url,
-            &token,
+            TEST_JWT_SECRET,
             "untrusted-node",
             &proxy_state,
             Some(&tls_config),
@@ -877,12 +807,10 @@ async fn test_dp_applies_delta_update_adding_proxy() {
 
     let proxy_state = create_test_proxy_state();
     let cp_url = format!("http://127.0.0.1:{}", addr.port());
-    let token = create_test_token();
-
-    // Spawn DP client
+    // Spawn DP client (DP generates JWT from shared secret)
     let ps = proxy_state.clone();
     let client_handle = tokio::spawn(async move {
-        dp_client::connect_and_subscribe(&cp_url, &token, "delta-node-1", &ps, None).await
+        dp_client::connect_and_subscribe(&cp_url, TEST_JWT_SECRET, "delta-node-1", &ps, None).await
     });
 
     // Wait for initial full snapshot
@@ -948,11 +876,10 @@ async fn test_dp_applies_delta_update_removing_proxy() {
 
     let proxy_state = create_test_proxy_state();
     let cp_url = format!("http://127.0.0.1:{}", addr.port());
-    let token = create_test_token();
 
     let ps = proxy_state.clone();
     let client_handle = tokio::spawn(async move {
-        dp_client::connect_and_subscribe(&cp_url, &token, "delta-node-2", &ps, None).await
+        dp_client::connect_and_subscribe(&cp_url, TEST_JWT_SECRET, "delta-node-2", &ps, None).await
     });
 
     // Wait for initial snapshot
@@ -1017,11 +944,10 @@ async fn test_dp_applies_delta_then_full_snapshot() {
 
     let proxy_state = create_test_proxy_state();
     let cp_url = format!("http://127.0.0.1:{}", addr.port());
-    let token = create_test_token();
 
     let ps = proxy_state.clone();
     let client_handle = tokio::spawn(async move {
-        dp_client::connect_and_subscribe(&cp_url, &token, "delta-node-3", &ps, None).await
+        dp_client::connect_and_subscribe(&cp_url, TEST_JWT_SECRET, "delta-node-3", &ps, None).await
     });
 
     // Wait for initial snapshot (2 proxies)
@@ -1095,11 +1021,10 @@ async fn test_dp_ignores_malformed_delta() {
 
     let proxy_state = create_test_proxy_state();
     let cp_url = format!("http://127.0.0.1:{}", addr.port());
-    let token = create_test_token();
 
     let ps = proxy_state.clone();
     let client_handle = tokio::spawn(async move {
-        dp_client::connect_and_subscribe(&cp_url, &token, "delta-node-4", &ps, None).await
+        dp_client::connect_and_subscribe(&cp_url, TEST_JWT_SECRET, "delta-node-4", &ps, None).await
     });
 
     // Wait for initial snapshot
@@ -1206,11 +1131,11 @@ async fn test_dp_applies_delta_modifying_proxy() {
 
     let proxy_state = create_test_proxy_state();
     let cp_url = format!("http://127.0.0.1:{}", addr.port());
-    let token = create_test_token();
 
     let ps = proxy_state.clone();
     let client_handle = tokio::spawn(async move {
-        dp_client::connect_and_subscribe(&cp_url, &token, "delta-mod-node", &ps, None).await
+        dp_client::connect_and_subscribe(&cp_url, TEST_JWT_SECRET, "delta-mod-node", &ps, None)
+            .await
     });
 
     // Wait for initial snapshot (2 proxies)
@@ -1285,11 +1210,11 @@ async fn test_dp_applies_delta_with_mixed_operations() {
 
     let proxy_state = create_test_proxy_state();
     let cp_url = format!("http://127.0.0.1:{}", addr.port());
-    let token = create_test_token();
 
     let ps = proxy_state.clone();
     let client_handle = tokio::spawn(async move {
-        dp_client::connect_and_subscribe(&cp_url, &token, "delta-mixed-node", &ps, None).await
+        dp_client::connect_and_subscribe(&cp_url, TEST_JWT_SECRET, "delta-mixed-node", &ps, None)
+            .await
     });
 
     // Wait for initial snapshot (3 proxies)
@@ -1383,9 +1308,9 @@ async fn test_cp_rejects_dp_with_version_mismatch() {
     // Give the server a moment to start
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    let token = create_test_token();
+    let generated_token = dp_client::generate_dp_jwt(TEST_JWT_SECRET, "test-dp").unwrap();
     let token_meta: tonic::metadata::MetadataValue<_> =
-        format!("Bearer {}", token).parse().unwrap();
+        format!("Bearer {}", generated_token).parse().unwrap();
     let channel = tonic::transport::Channel::from_shared(format!("http://{}", bound_addr))
         .unwrap()
         .connect()
@@ -1464,9 +1389,9 @@ async fn test_cp_rejects_dp_with_empty_version() {
 
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    let token = create_test_token();
+    let generated_token = dp_client::generate_dp_jwt(TEST_JWT_SECRET, "test-dp").unwrap();
     let token_meta: tonic::metadata::MetadataValue<_> =
-        format!("Bearer {}", token).parse().unwrap();
+        format!("Bearer {}", generated_token).parse().unwrap();
     let channel = tonic::transport::Channel::from_shared(format!("http://{}", bound_addr))
         .unwrap()
         .connect()
@@ -1547,11 +1472,11 @@ async fn test_dp_applies_delta_adding_upstream() {
 
     let proxy_state = create_test_proxy_state();
     let cp_url = format!("http://127.0.0.1:{}", addr.port());
-    let token = create_test_token();
 
     let ps = proxy_state.clone();
     let client_handle = tokio::spawn(async move {
-        dp_client::connect_and_subscribe(&cp_url, &token, "upstream-add-node", &ps, None).await
+        dp_client::connect_and_subscribe(&cp_url, TEST_JWT_SECRET, "upstream-add-node", &ps, None)
+            .await
     });
 
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -1600,11 +1525,11 @@ async fn test_dp_applies_delta_removing_upstream() {
 
     let proxy_state = create_test_proxy_state();
     let cp_url = format!("http://127.0.0.1:{}", addr.port());
-    let token = create_test_token();
 
     let ps = proxy_state.clone();
     let client_handle = tokio::spawn(async move {
-        dp_client::connect_and_subscribe(&cp_url, &token, "upstream-rm-node", &ps, None).await
+        dp_client::connect_and_subscribe(&cp_url, TEST_JWT_SECRET, "upstream-rm-node", &ps, None)
+            .await
     });
 
     let applied = timeout(Duration::from_secs(5), async {
@@ -1658,11 +1583,11 @@ async fn test_dp_applies_delta_modifying_upstream_targets() {
 
     let proxy_state = create_test_proxy_state();
     let cp_url = format!("http://127.0.0.1:{}", addr.port());
-    let token = create_test_token();
 
     let ps = proxy_state.clone();
     let client_handle = tokio::spawn(async move {
-        dp_client::connect_and_subscribe(&cp_url, &token, "upstream-mod-node", &ps, None).await
+        dp_client::connect_and_subscribe(&cp_url, TEST_JWT_SECRET, "upstream-mod-node", &ps, None)
+            .await
     });
 
     let applied = timeout(Duration::from_secs(5), async {
@@ -1721,11 +1646,11 @@ async fn test_dp_applies_delta_adding_consumer() {
 
     let proxy_state = create_test_proxy_state();
     let cp_url = format!("http://127.0.0.1:{}", addr.port());
-    let token = create_test_token();
 
     let ps = proxy_state.clone();
     let client_handle = tokio::spawn(async move {
-        dp_client::connect_and_subscribe(&cp_url, &token, "consumer-add-node", &ps, None).await
+        dp_client::connect_and_subscribe(&cp_url, TEST_JWT_SECRET, "consumer-add-node", &ps, None)
+            .await
     });
 
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -1777,11 +1702,11 @@ async fn test_dp_applies_delta_removing_consumer() {
 
     let proxy_state = create_test_proxy_state();
     let cp_url = format!("http://127.0.0.1:{}", addr.port());
-    let token = create_test_token();
 
     let ps = proxy_state.clone();
     let client_handle = tokio::spawn(async move {
-        dp_client::connect_and_subscribe(&cp_url, &token, "consumer-rm-node", &ps, None).await
+        dp_client::connect_and_subscribe(&cp_url, TEST_JWT_SECRET, "consumer-rm-node", &ps, None)
+            .await
     });
 
     let applied = timeout(Duration::from_secs(5), async {
@@ -1838,16 +1763,16 @@ async fn test_cp_broadcasts_delta_to_multiple_dps() {
 
     let ps1 = proxy_state_1.clone();
     let url1 = cp_url.clone();
-    let token1 = create_test_token();
+
     let dp_handle_1 = tokio::spawn(async move {
-        dp_client::connect_and_subscribe(&url1, &token1, "multi-dp-1", &ps1, None).await
+        dp_client::connect_and_subscribe(&url1, TEST_JWT_SECRET, "multi-dp-1", &ps1, None).await
     });
 
     let ps2 = proxy_state_2.clone();
     let url2 = cp_url.clone();
-    let token2 = create_test_token();
+
     let dp_handle_2 = tokio::spawn(async move {
-        dp_client::connect_and_subscribe(&url2, &token2, "multi-dp-2", &ps2, None).await
+        dp_client::connect_and_subscribe(&url2, TEST_JWT_SECRET, "multi-dp-2", &ps2, None).await
     });
 
     // Wait for both DPs to receive initial config
@@ -1920,11 +1845,11 @@ async fn test_dp_applies_delta_with_all_entity_types() {
 
     let proxy_state = create_test_proxy_state();
     let cp_url = format!("http://127.0.0.1:{}", addr.port());
-    let token = create_test_token();
 
     let ps = proxy_state.clone();
     let client_handle = tokio::spawn(async move {
-        dp_client::connect_and_subscribe(&cp_url, &token, "mixed-delta-node", &ps, None).await
+        dp_client::connect_and_subscribe(&cp_url, TEST_JWT_SECRET, "mixed-delta-node", &ps, None)
+            .await
     });
 
     let ready = timeout(Duration::from_secs(5), async {

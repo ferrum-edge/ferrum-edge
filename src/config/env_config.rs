@@ -280,9 +280,8 @@ pub struct EnvConfig {
 
     // CP/DP
     pub cp_grpc_listen_addr: Option<String>,
-    pub cp_grpc_jwt_secret: Option<String>,
+    pub cp_dp_grpc_jwt_secret: Option<String>,
     pub dp_cp_grpc_url: Option<String>,
-    pub dp_grpc_auth_token: Option<String>,
 
     // CP gRPC TLS (server-side)
     /// Path to PEM certificate for the CP gRPC server. When set (with key),
@@ -643,9 +642,8 @@ impl Default for EnvConfig {
             mongo_server_selection_timeout_seconds: 30,
             mongo_connect_timeout_seconds: 10,
             cp_grpc_listen_addr: None,
-            cp_grpc_jwt_secret: None,
+            cp_dp_grpc_jwt_secret: None,
             dp_cp_grpc_url: None,
-            dp_grpc_auth_token: None,
             cp_grpc_tls_cert_path: None,
             cp_grpc_tls_key_path: None,
             cp_grpc_tls_client_ca_path: None,
@@ -865,9 +863,8 @@ impl EnvConfig {
             ),
 
             cp_grpc_listen_addr: resolve_var(conf, "FERRUM_CP_GRPC_LISTEN_ADDR"),
-            cp_grpc_jwt_secret: resolve_var(conf, "FERRUM_CP_GRPC_JWT_SECRET"),
+            cp_dp_grpc_jwt_secret: resolve_var(conf, "FERRUM_CP_DP_GRPC_JWT_SECRET"),
             dp_cp_grpc_url: resolve_var(conf, "FERRUM_DP_CP_GRPC_URL"),
-            dp_grpc_auth_token: resolve_var(conf, "FERRUM_DP_GRPC_AUTH_TOKEN"),
 
             // CP gRPC TLS
             cp_grpc_tls_cert_path: resolve_var(conf, "FERRUM_CP_GRPC_TLS_CERT_PATH"),
@@ -1438,8 +1435,8 @@ impl EnvConfig {
                 if self.dp_cp_grpc_url.is_none() {
                     return Err("FERRUM_DP_CP_GRPC_URL is required in dp mode".into());
                 }
-                if self.dp_grpc_auth_token.is_none() {
-                    return Err("FERRUM_DP_GRPC_AUTH_TOKEN is required in dp mode".into());
+                if self.cp_dp_grpc_jwt_secret.is_none() {
+                    return Err("FERRUM_CP_DP_GRPC_JWT_SECRET is required in dp mode".into());
                 }
             }
             OperatingMode::Migrate => {
@@ -1507,8 +1504,8 @@ impl EnvConfig {
             if self.cp_grpc_listen_addr.is_none() {
                 return Err("FERRUM_CP_GRPC_LISTEN_ADDR is required in cp mode".into());
             }
-            if self.cp_grpc_jwt_secret.is_none() {
-                return Err("FERRUM_CP_GRPC_JWT_SECRET is required in cp mode".into());
+            if self.cp_dp_grpc_jwt_secret.is_none() {
+                return Err("FERRUM_CP_DP_GRPC_JWT_SECRET is required in cp mode".into());
             }
         }
 

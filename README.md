@@ -141,13 +141,13 @@ FERRUM_DB_TYPE=sqlite \
 FERRUM_DB_URL="sqlite://ferrum.db?mode=rwc" \
 FERRUM_ADMIN_JWT_SECRET="admin-secret" \
 FERRUM_CP_GRPC_LISTEN_ADDR="0.0.0.0:50051" \
-FERRUM_CP_GRPC_JWT_SECRET="grpc-secret" \
+FERRUM_CP_DP_GRPC_JWT_SECRET="grpc-secret" \
 cargo run --release
 
 # Data Plane
 FERRUM_MODE=dp \
 FERRUM_DP_CP_GRPC_URL="http://localhost:50051" \
-FERRUM_DP_GRPC_AUTH_TOKEN="<HS256-JWT-signed-with-grpc-secret>" \
+FERRUM_CP_DP_GRPC_JWT_SECRET="grpc-secret" \
 cargo run --release
 ```
 
@@ -387,7 +387,7 @@ Ferrum also **won the E2E TLS /api/users test outright** — 29,808 req/s, the h
 | `502 Bad Gateway` | Backend unreachable — check `X-Gateway-Error` header for details |
 | `504 Gateway Timeout` | Increase `backend_read_timeout_ms` |
 | `429 Too Many Requests` | Rate limit exceeded — check plugin config |
-| DP not receiving config | Verify `FERRUM_DP_GRPC_AUTH_TOKEN` JWT is signed with `FERRUM_CP_GRPC_JWT_SECRET` |
+| DP not receiving config | Verify `FERRUM_CP_DP_GRPC_JWT_SECRET` matches on both CP and DP |
 
 ## Documentation
 
