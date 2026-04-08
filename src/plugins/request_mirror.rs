@@ -206,6 +206,10 @@ impl Plugin for RequestMirror {
         self.mirror_request_body
     }
 
+    fn needs_request_body_bytes(&self) -> bool {
+        self.mirror_request_body
+    }
+
     fn warmup_hostnames(&self) -> Vec<String> {
         vec![self.mirror_hostname.clone()]
     }

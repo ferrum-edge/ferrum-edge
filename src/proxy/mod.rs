@@ -244,7 +244,11 @@ async fn buffer_request_body_for_before_proxy(
     Ok(ClientRequestBody::Buffered(body_bytes))
 }
 
-pub(crate) fn store_request_body_metadata(ctx: &mut RequestContext, body: &[u8]) {
+pub(crate) fn store_request_body_metadata(
+    ctx: &mut RequestContext,
+    body: &[u8],
+    needs_body_bytes: bool,
+) {
     ctx.metadata.insert(
         "request_body_size_bytes".to_string(),
         body.len().to_string(),
@@ -255,9 +259,13 @@ pub(crate) fn store_request_body_metadata(ctx: &mut RequestContext, body: &[u8])
     } else {
         ctx.metadata.remove("request_body");
     }
-    // Store binary-safe copy for plugins that need raw bytes (e.g., request_mirror
-    // with gRPC protobuf bodies that are not valid UTF-8).
-    ctx.request_body_bytes = Some(bytes::Bytes::copy_from_slice(body));
+    // Only allocate a binary copy when a plugin explicitly needs raw bytes
+    // (e.g., request_mirror with gRPC protobuf). This avoids a per-request
+    // Bytes::copy_from_slice for the common case where plugins only read
+    // the UTF-8 metadata string.
+    if needs_body_bytes {
+        ctx.request_body_bytes = Some(bytes::Bytes::copy_from_slice(body));
+    }
 }
 
 /// Parse an HTTP method string into a `hyper::Method`.
@@ -3920,6 +3928,10 @@ pub async fn handle_proxy_request(
             plugin.requires_request_body_before_before_proxy()
                 && plugin.should_buffer_request_body(&ctx)
         });
+    let needs_body_bytes = requires_request_body_before_before_proxy
+        && plugins
+            .iter()
+            .any(|plugin| plugin.needs_request_body_bytes());
 
     if requires_request_body_before_before_proxy {
         client_request_body = match client_request_body {
@@ -3934,7 +3946,7 @@ pub async fn handle_proxy_request(
                 {
                     Ok(buffered) => {
                         if let ClientRequestBody::Buffered(body) = &buffered {
-                            store_request_body_metadata(&mut ctx, body);
+                            store_request_body_metadata(&mut ctx, body, needs_body_bytes);
                         }
                         buffered
                     }

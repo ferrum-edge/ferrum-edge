@@ -680,6 +680,17 @@ pub trait Plugin: Send + Sync {
         false
     }
 
+    /// Returns `true` if this plugin needs binary-safe access to the raw
+    /// request body bytes via `ctx.request_body_bytes`.
+    ///
+    /// Most plugins read the body from `ctx.metadata["request_body"]` which
+    /// is UTF-8 only. This flag gates a `Bytes::copy_from_slice` allocation
+    /// that would otherwise run on every buffered request. Only override
+    /// this for plugins that handle non-UTF-8 payloads (e.g., gRPC protobuf).
+    fn needs_request_body_bytes(&self) -> bool {
+        false
+    }
+
     /// Returns `true` if this plugin may require the request body to be
     /// buffered instead of streamed for at least some requests.
     ///
