@@ -8,6 +8,7 @@
 #     --payload-size <n>   Payload bytes for echo tests (default: 64)
 #     --json               Output JSON results
 #     --skip-build         Skip build entirely (use existing binaries)
+#     --envoy              Compare Ferrum Edge against Envoy (requires envoy in PATH)
 
 set -e
 
@@ -20,6 +21,8 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 CYAN='\033[0;36m'
+MAGENTA='\033[0;35m'
+BOLD='\033[1m'
 NC='\033[0m'
 
 # Defaults
@@ -30,6 +33,7 @@ CONCURRENCY=100
 PAYLOAD_SIZE=64
 JSON_FLAG=""
 SKIP_BUILD=false
+ENVOY_MODE=false
 
 # Parse options
 while [[ $# -gt 0 ]]; do
@@ -39,6 +43,7 @@ while [[ $# -gt 0 ]]; do
         --payload-size) PAYLOAD_SIZE="$2"; shift 2 ;;
         --json) JSON_FLAG="--json"; shift ;;
         --skip-build) SKIP_BUILD=true; shift ;;
+        --envoy) ENVOY_MODE=true; shift ;;
         *) shift ;;
     esac
 done
@@ -46,21 +51,26 @@ done
 # Ports
 GATEWAY_HTTP_PORT=8000
 GATEWAY_HTTPS_PORT=8443
+ENVOY_ADMIN_PORT=15000
 
 # Track PIDs for cleanup
 BACKEND_PID=""
 GATEWAY_PID=""
+ENVOY_PID=""
+RESULTS_DIR=""
 
 cleanup() {
     echo -e "\n${YELLOW}Cleaning up...${NC}"
     [ -n "$GATEWAY_PID" ] && kill "$GATEWAY_PID" 2>/dev/null || true
     [ -n "$BACKEND_PID" ] && kill "$BACKEND_PID" 2>/dev/null || true
+    [ -n "$ENVOY_PID" ] && kill "$ENVOY_PID" 2>/dev/null || true
     # Kill processes on known ports
     for port in 3001 3002 3003 3004 3005 3006 3010 3443 3444 3445 50052 \
-                $GATEWAY_HTTP_PORT $GATEWAY_HTTPS_PORT 5000 5001 5003 5004; do
+                $GATEWAY_HTTP_PORT $GATEWAY_HTTPS_PORT 5000 5001 5003 5004 5010 $ENVOY_ADMIN_PORT; do
         lsof -ti:"$port" 2>/dev/null | xargs kill -9 2>/dev/null || true
     done
     rm -rf "$SCRIPT_DIR/certs" 2>/dev/null || true
+    [ -n "$RESULTS_DIR" ] && rm -rf "$RESULTS_DIR" 2>/dev/null || true
     echo -e "${GREEN}Cleanup complete${NC}"
 }
 trap cleanup EXIT
@@ -227,6 +237,73 @@ stop_gateway() {
     sleep 1
 }
 
+# ── Envoy lifecycle ──────────────────────────────────────────────────────────
+
+check_envoy() {
+    if ! command -v envoy &> /dev/null; then
+        echo -e "${RED}Error: envoy not found in PATH${NC}"
+        echo -e "Install Envoy:"
+        echo -e "  macOS:  brew install envoy"
+        echo -e "  Linux:  see https://www.envoyproxy.io/docs/envoy/latest/start/install"
+        exit 1
+    fi
+    local version
+    version=$(envoy --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+    echo -e "${GREEN}Found Envoy: v${version}${NC}"
+}
+
+# Prepare envoy config with real cert paths (sed CERT_PATH/KEY_PATH placeholders)
+prepare_envoy_config() {
+    local src_config="$1"
+    local cert_dir="$SCRIPT_DIR/certs"
+    local runtime_config="$RESULTS_DIR/envoy_runtime_$(basename "$src_config")"
+
+    sed -e "s|CERT_PATH|${cert_dir}/cert.pem|g" \
+        -e "s|KEY_PATH|${cert_dir}/key.pem|g" \
+        "$src_config" > "$runtime_config"
+
+    echo "$runtime_config"
+}
+
+start_envoy() {
+    local config_file="$1"
+    echo -e "  ${YELLOW}Starting Envoy [$(basename "$config_file")]...${NC}"
+
+    # Prepare config with real cert paths
+    local runtime_config
+    runtime_config=$(prepare_envoy_config "$config_file")
+
+    # Use all available CPU cores (matches ferrum-edge tokio default)
+    local num_cpus
+    num_cpus=$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)
+
+    cd "$SCRIPT_DIR"
+    envoy -c "$runtime_config" --concurrency "$num_cpus" -l error --disable-hot-restart \
+        > "$SCRIPT_DIR/envoy.log" 2>&1 &
+    ENVOY_PID=$!
+
+    # Wait for Envoy admin to be ready
+    for i in $(seq 1 15); do
+        if curl -sf "http://127.0.0.1:$ENVOY_ADMIN_PORT/ready" > /dev/null 2>&1; then
+            echo -e "  ${GREEN}Envoy started (PID: $ENVOY_PID)${NC}"
+            return
+        fi
+        sleep 1
+    done
+    echo -e "  ${RED}Envoy failed to start${NC}"
+    tail -30 "$SCRIPT_DIR/envoy.log"
+    exit 1
+}
+
+stop_envoy() {
+    [ -n "$ENVOY_PID" ] && kill "$ENVOY_PID" 2>/dev/null || true
+    ENVOY_PID=""
+    for port in $GATEWAY_HTTP_PORT $GATEWAY_HTTPS_PORT 5010 5001 5003 $ENVOY_ADMIN_PORT; do
+        lsof -ti:"$port" 2>/dev/null | xargs kill -9 2>/dev/null || true
+    done
+    sleep 1
+}
+
 # Run bench
 run_bench() {
     local label="$1"
@@ -251,7 +328,32 @@ run_bench() {
     echo ""
 }
 
-# ── Protocol test functions ───────────────────────────────────────────────────
+# Run bench and capture JSON result to a file (used in --envoy mode)
+run_bench_capture() {
+    local result_file="$1"
+    local label="$2"
+    local proto="$3"
+    local target="$4"
+    shift 4
+    local extra_args="$@"
+
+    echo -e "    ${CYAN}$label (${DURATION}s, ${CONCURRENCY}c)${NC}"
+
+    "$SCRIPT_DIR/target/release/proto_bench" "$proto" \
+        --target "$target" \
+        --duration "$DURATION" \
+        --concurrency "$CONCURRENCY" \
+        --payload-size "$PAYLOAD_SIZE" \
+        $extra_args --json > "$RESULTS_DIR/$result_file" 2>/dev/null
+
+    # Show a quick summary inline
+    local rps errors
+    rps=$(python3 -c "import json; d=json.load(open('$RESULTS_DIR/$result_file')); print(f\"{d['rps']:,.0f}\")" 2>/dev/null || echo "?")
+    errors=$(python3 -c "import json; d=json.load(open('$RESULTS_DIR/$result_file')); print(d['total_errors'])" 2>/dev/null || echo "?")
+    echo -e "      RPS: ${GREEN}${rps}${NC}  Errors: ${errors}"
+}
+
+# ── Protocol test functions (standard mode) ──────────────────────────────────
 
 test_http1() {
     start_gateway "$SCRIPT_DIR/configs/http1_perf.yaml"
@@ -323,13 +425,280 @@ test_udp_dtls() {
     run_bench "UDP+DTLS (direct backend)" udp "127.0.0.1:3006" --tls
 }
 
+# ── Envoy comparison mode ────────────────────────────────────────────────────
+
+# Protocols supported by both Ferrum Edge and Envoy
+ENVOY_SUPPORTED="http1 http1-tls ws grpc tcp tcp-tls udp"
+# Protocols only Ferrum Edge supports or where the bench client is incompatible
+# http2: hyper's raw h2 client gets ConnectionReset from Envoy (known h2c compat issue);
+#         gRPC already covers HTTP/2 semantics via tonic which works fine with Envoy
+ENVOY_UNSUPPORTED="http2 http3 udp-dtls"
+
+envoy_compare_protocol() {
+    local p="$1"
+    local bench_proto bench_target direct_target bench_extra=""
+    local ferrum_config ferrum_extra="" envoy_config
+
+    case "$p" in
+        http1)
+            bench_proto=http1
+            bench_target="http://127.0.0.1:$GATEWAY_HTTP_PORT/api/users"
+            direct_target="http://127.0.0.1:3001/api/users"
+            ferrum_config="$SCRIPT_DIR/configs/http1_perf.yaml"
+            envoy_config="$SCRIPT_DIR/configs/envoy/http1.yaml"
+            ;;
+        http1-tls)
+            bench_proto=http1
+            bench_target="https://127.0.0.1:$GATEWAY_HTTPS_PORT/api/users"
+            direct_target="http://127.0.0.1:3001/api/users"
+            ferrum_config="$SCRIPT_DIR/configs/http1_tls_perf.yaml"
+            envoy_config="$SCRIPT_DIR/configs/envoy/http1_tls.yaml"
+            ;;
+        ws)
+            bench_proto=ws
+            bench_target="ws://127.0.0.1:$GATEWAY_HTTP_PORT/ws"
+            direct_target="ws://127.0.0.1:3003"
+            ferrum_config="$SCRIPT_DIR/configs/ws_perf.yaml"
+            envoy_config="$SCRIPT_DIR/configs/envoy/ws.yaml"
+            ;;
+        grpc)
+            bench_proto=grpc
+            bench_target="http://127.0.0.1:$GATEWAY_HTTP_PORT"
+            direct_target="http://127.0.0.1:50052"
+            ferrum_config="$SCRIPT_DIR/configs/grpc_perf.yaml"
+            envoy_config="$SCRIPT_DIR/configs/envoy/grpc.yaml"
+            ;;
+        tcp)
+            bench_proto=tcp
+            bench_target="127.0.0.1:5010"
+            direct_target="127.0.0.1:3004"
+            ferrum_config="$SCRIPT_DIR/configs/tcp_perf.yaml"
+            envoy_config="$SCRIPT_DIR/configs/envoy/tcp.yaml"
+            ;;
+        tcp-tls)
+            bench_proto=tcp
+            bench_target="127.0.0.1:5001"
+            direct_target="127.0.0.1:3444"
+            ferrum_config="$SCRIPT_DIR/configs/tcp_tls_perf.yaml"
+            envoy_config="$SCRIPT_DIR/configs/envoy/tcp_tls.yaml"
+            bench_extra="--tls"
+            ;;
+        udp)
+            bench_proto=udp
+            bench_target="127.0.0.1:5003"
+            direct_target="127.0.0.1:3005"
+            ferrum_config="$SCRIPT_DIR/configs/udp_perf.yaml"
+            envoy_config="$SCRIPT_DIR/configs/envoy/udp.yaml"
+            ;;
+        *)
+            echo -e "  ${RED}Unknown protocol for envoy comparison: $p${NC}"
+            return 1
+            ;;
+    esac
+
+    echo -e "\n${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${BLUE}  ${BOLD}$p${NC}"
+    echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+
+    # Ferrum Edge
+    echo -e "\n  ${MAGENTA}▸ Ferrum Edge${NC}"
+    start_gateway "$ferrum_config" "$ferrum_extra"
+    sleep 1
+    run_bench_capture "ferrum_${p}.json" "Ferrum → $bench_target" "$bench_proto" "$bench_target" $bench_extra
+    stop_gateway
+
+    # Envoy
+    echo -e "  ${MAGENTA}▸ Envoy${NC}"
+    start_envoy "$envoy_config"
+    sleep 1
+    run_bench_capture "envoy_${p}.json" "Envoy  → $bench_target" "$bench_proto" "$bench_target" $bench_extra
+    stop_envoy
+
+    # Direct backend baseline
+    echo -e "  ${MAGENTA}▸ Direct backend${NC}"
+    run_bench_capture "direct_${p}.json" "Direct → $direct_target" "$bench_proto" "$direct_target" $bench_extra
+}
+
+print_comparison_table() {
+    local protocols=("$@")
+
+    python3 - "$RESULTS_DIR" "${protocols[@]}" <<'PYEOF'
+import json, sys, os
+
+results_dir = sys.argv[1]
+protocols = sys.argv[2:]
+
+def load(prefix, proto):
+    path = os.path.join(results_dir, f"{prefix}_{proto}.json")
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+def fmt_rps(v):
+    if v is None: return "N/A"
+    return f"{v:,.0f}"
+
+def fmt_us(us):
+    if us is None: return "N/A"
+    if us >= 1_000_000: return f"{us/1_000_000:.2f}s"
+    if us >= 1000: return f"{us/1000:.2f}ms"
+    return f"{us}\u03bcs"
+
+def fmt_pct(v):
+    if v is None: return "N/A"
+    sign = "+" if v > 0 else ""
+    return f"{sign}{v:.1f}%"
+
+# ── Through Gateway ──
+
+first = None
+for p in protocols:
+    first = load("ferrum", p) or load("envoy", p)
+    if first: break
+
+print()
+print("\033[1m" + "=" * 105 + "\033[0m")
+print("\033[1m  Ferrum Edge vs Envoy \u2014 Through-Gateway Comparison\033[0m")
+if first:
+    print(f"  Duration: {first.get('duration_secs','')}s | Concurrency: {first.get('concurrency','')} | Payload: 64 bytes")
+print("\033[1m" + "=" * 105 + "\033[0m")
+print()
+
+hdr = f"| {'Protocol':<14} | {'Ferrum RPS':>12} | {'Envoy RPS':>12} | {'\u0394 RPS':>8} | {'Winner':>7} | {'Ferrum P50':>11} | {'Envoy P50':>11} | {'Ferrum P99':>11} | {'Envoy P99':>11} | {'Ferrum Avg':>11} | {'Envoy Avg':>11} |"
+sep = f"|{'-'*16}|{'-'*14}|{'-'*14}|{'-'*10}|{'-'*9}|{'-'*13}|{'-'*13}|{'-'*13}|{'-'*13}|{'-'*13}|{'-'*13}|"
+
+print(hdr)
+print(sep)
+
+for p in protocols:
+    f = load("ferrum", p)
+    e = load("envoy", p)
+    if not f or not e:
+        continue
+
+    f_rps = f["rps"]
+    e_rps = e["rps"]
+    delta = ((f_rps - e_rps) / e_rps * 100) if e_rps > 0 else 0
+    if abs(delta) < 2:
+        winner = "~tie"
+    elif f_rps > e_rps:
+        winner = "\033[32mFerrum\033[0m"
+        winner_plain = "Ferrum"
+    else:
+        winner = "\033[33mEnvoy\033[0m"
+        winner_plain = "Envoy"
+
+    # Determine winner string width for alignment
+    if abs(delta) < 2:
+        w = winner
+        w_pad = 7 - len("~tie")
+    elif f_rps > e_rps:
+        w = winner
+        w_pad = 7 - len("Ferrum")
+    else:
+        w = winner
+        w_pad = 7 - len("Envoy")
+
+    print(f"| {p:<14} | {fmt_rps(f_rps):>12} | {fmt_rps(e_rps):>12} | {fmt_pct(delta):>8} | {w}{' '*w_pad} | {fmt_us(f.get('p50_us')):>11} | {fmt_us(e.get('p50_us')):>11} | {fmt_us(f.get('p99_us')):>11} | {fmt_us(e.get('p99_us')):>11} | {fmt_us(f.get('latency_avg_us')):>11} | {fmt_us(e.get('latency_avg_us')):>11} |")
+
+# ── Direct Backend ──
+
+print()
+print("\033[1m" + "=" * 70 + "\033[0m")
+print("\033[1m  Direct Backend (baseline \u2014 no gateway overhead)\033[0m")
+print("\033[1m" + "=" * 70 + "\033[0m")
+print()
+
+hdr2 = f"| {'Protocol':<14} | {'RPS':>12} | {'Avg Latency':>12} | {'P50':>9} | {'P99':>9} | {'Max':>9} |"
+sep2 = f"|{'-'*16}|{'-'*14}|{'-'*14}|{'-'*11}|{'-'*11}|{'-'*11}|"
+
+print(hdr2)
+print(sep2)
+
+for p in protocols:
+    d = load("direct", p)
+    if not d:
+        continue
+    print(f"| {p:<14} | {fmt_rps(d['rps']):>12} | {fmt_us(d.get('latency_avg_us')):>12} | {fmt_us(d.get('p50_us')):>9} | {fmt_us(d.get('p99_us')):>9} | {fmt_us(d.get('latency_max_us')):>9} |")
+
+# ── Gateway Overhead ──
+
+print()
+print("\033[1m" + "=" * 70 + "\033[0m")
+print("\033[1m  Gateway Overhead vs Direct Backend\033[0m")
+print("\033[1m" + "=" * 70 + "\033[0m")
+print()
+
+hdr3 = f"| {'Protocol':<14} | {'Direct RPS':>12} | {'Ferrum RPS':>12} | {'Ferrum OH':>10} | {'Envoy RPS':>12} | {'Envoy OH':>10} |"
+sep3 = f"|{'-'*16}|{'-'*14}|{'-'*14}|{'-'*12}|{'-'*14}|{'-'*12}|"
+
+print(hdr3)
+print(sep3)
+
+for p in protocols:
+    f = load("ferrum", p)
+    e = load("envoy", p)
+    d = load("direct", p)
+    if not f or not e or not d:
+        continue
+
+    d_rps = d["rps"]
+    f_oh = ((d_rps - f["rps"]) / d_rps * 100) if d_rps > 0 else 0
+    e_oh = ((d_rps - e["rps"]) / d_rps * 100) if d_rps > 0 else 0
+
+    print(f"| {p:<14} | {fmt_rps(d_rps):>12} | {fmt_rps(f['rps']):>12} | {'~'+str(int(f_oh))+'%':>10} | {fmt_rps(e['rps']):>12} | {'~'+str(int(e_oh))+'%':>10} |")
+
+print()
+PYEOF
+}
+
+run_envoy_comparison() {
+    local -a protos
+
+    case "$PROTOCOL" in
+        all)
+            protos=(http1 http1-tls ws grpc tcp tcp-tls udp)
+            echo -e "${YELLOW}Note: HTTP/2, HTTP/3, and UDP+DTLS are skipped for Envoy comparison${NC}"
+            echo -e "${YELLOW}  HTTP/2: hyper h2c client incompatible with Envoy on macOS (gRPC covers HTTP/2 semantics)${NC}"
+            echo -e "${YELLOW}  HTTP/3, UDP+DTLS: no standard Envoy equivalent${NC}"
+            ;;
+        http2|http3|udp-dtls)
+            echo -e "${RED}$PROTOCOL is not supported by standard Envoy — cannot compare${NC}"
+            echo -e "Envoy-supported protocols: ${ENVOY_SUPPORTED}"
+            exit 1
+            ;;
+        *)
+            # Check if protocol is envoy-supported
+            if echo "$ENVOY_SUPPORTED" | grep -qw "$PROTOCOL"; then
+                protos=("$PROTOCOL")
+            else
+                echo -e "${RED}Unknown protocol: $PROTOCOL${NC}"
+                exit 1
+            fi
+            ;;
+    esac
+
+    RESULTS_DIR=$(mktemp -d)
+
+    for p in "${protos[@]}"; do
+        envoy_compare_protocol "$p"
+    done
+
+    echo -e "\n\n"
+    print_comparison_table "${protos[@]}"
+}
+
 # Kill stale processes from prior crashed runs before starting.
 # Without this, leftover listeners on test ports cause "Connection refused"
 # or "Address already in use" failures when the backend/gateway try to bind.
 kill_stale_processes() {
     local stale=false
     for port in 3001 3002 3003 3004 3005 3006 3010 3443 3444 3445 50052 \
-                $GATEWAY_HTTP_PORT $GATEWAY_HTTPS_PORT 5000 5001 5003 5004 5010; do
+                $GATEWAY_HTTP_PORT $GATEWAY_HTTPS_PORT 5000 5001 5003 5004 5010 $ENVOY_ADMIN_PORT; do
         if lsof -ti:"$port" > /dev/null 2>&1; then
             stale=true
             break
@@ -338,7 +707,7 @@ kill_stale_processes() {
     if $stale; then
         echo -e "${YELLOW}Killing stale processes from prior run...${NC}"
         for port in 3001 3002 3003 3004 3005 3006 3010 3443 3444 3445 50052 \
-                    $GATEWAY_HTTP_PORT $GATEWAY_HTTPS_PORT 5000 5001 5003 5004 5010; do
+                    $GATEWAY_HTTP_PORT $GATEWAY_HTTPS_PORT 5000 5001 5003 5004 5010 $ENVOY_ADMIN_PORT; do
             lsof -ti:"$port" 2>/dev/null | xargs kill -9 2>/dev/null || true
         done
         sleep 1
@@ -348,45 +717,63 @@ kill_stale_processes() {
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-echo -e "${BLUE}╔══════════════════════════════════════════╗${NC}"
-echo -e "${BLUE}║  Ferrum Edge Multi-Protocol Perf Test ║${NC}"
-echo -e "${BLUE}╚══════════════════════════════════════════╝${NC}"
-echo ""
+if $ENVOY_MODE; then
+    echo -e "${BLUE}╔══════════════════════════════════════════════╗${NC}"
+    echo -e "${BLUE}║  Ferrum Edge vs Envoy — Perf Comparison    ║${NC}"
+    echo -e "${BLUE}╚══════════════════════════════════════════════╝${NC}"
+    echo ""
 
-kill_stale_processes
-build
-start_backend
+    check_envoy
+    kill_stale_processes
+    build
+    start_backend
 
-case "$PROTOCOL" in
-    http1)     test_http1 ;;
-    http1-tls) test_http1_tls ;;
-    http2)     test_http2 ;;
-    http3)     test_http3 ;;
-    ws)        test_ws ;;
-    grpc)      test_grpc ;;
-    tcp)       test_tcp ;;
-    tcp-tls)   test_tcp_tls ;;
-    udp)       test_udp ;;
-    udp-dtls)  test_udp_dtls ;;
-    all)
-        test_http1;   stop_gateway
-        test_http1_tls; stop_gateway
-        test_http2;   stop_gateway
-        test_http3;   stop_gateway
-        test_ws;      stop_gateway
-        test_grpc;    stop_gateway
-        test_tcp;     stop_gateway
-        test_tcp_tls; stop_gateway
-        test_udp;     stop_gateway
-        test_udp_dtls
-        ;;
-    *)
-        echo -e "${RED}Unknown protocol: $PROTOCOL${NC}"
-        echo "Usage: $0 <http1|http1-tls|http2|http3|ws|grpc|tcp|tcp-tls|udp|udp-dtls|all> [options]"
-        exit 1
-        ;;
-esac
+    run_envoy_comparison
 
-echo -e "\n${GREEN}═══════════════════════════════════════${NC}"
-echo -e "${GREEN}  All tests completed successfully!${NC}"
-echo -e "${GREEN}═══════════════════════════════════════${NC}"
+    echo -e "\n${GREEN}═══════════════════════════════════════${NC}"
+    echo -e "${GREEN}  Comparison completed successfully!${NC}"
+    echo -e "${GREEN}═══════════════════════════════════════${NC}"
+else
+    echo -e "${BLUE}╔══════════════════════════════════════════╗${NC}"
+    echo -e "${BLUE}║  Ferrum Edge Multi-Protocol Perf Test ║${NC}"
+    echo -e "${BLUE}╚══════════════════════════════════════════╝${NC}"
+    echo ""
+
+    kill_stale_processes
+    build
+    start_backend
+
+    case "$PROTOCOL" in
+        http1)     test_http1 ;;
+        http1-tls) test_http1_tls ;;
+        http2)     test_http2 ;;
+        http3)     test_http3 ;;
+        ws)        test_ws ;;
+        grpc)      test_grpc ;;
+        tcp)       test_tcp ;;
+        tcp-tls)   test_tcp_tls ;;
+        udp)       test_udp ;;
+        udp-dtls)  test_udp_dtls ;;
+        all)
+            test_http1;   stop_gateway
+            test_http1_tls; stop_gateway
+            test_http2;   stop_gateway
+            test_http3;   stop_gateway
+            test_ws;      stop_gateway
+            test_grpc;    stop_gateway
+            test_tcp;     stop_gateway
+            test_tcp_tls; stop_gateway
+            test_udp;     stop_gateway
+            test_udp_dtls
+            ;;
+        *)
+            echo -e "${RED}Unknown protocol: $PROTOCOL${NC}"
+            echo "Usage: $0 <http1|http1-tls|http2|http3|ws|grpc|tcp|tcp-tls|udp|udp-dtls|all> [options]"
+            exit 1
+            ;;
+    esac
+
+    echo -e "\n${GREEN}═══════════════════════════════════════${NC}"
+    echo -e "${GREEN}  All tests completed successfully!${NC}"
+    echo -e "${GREEN}═══════════════════════════════════════${NC}"
+fi

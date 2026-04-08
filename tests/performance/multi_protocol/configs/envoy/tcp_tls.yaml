@@ -1,0 +1,41 @@
+# Envoy TCP+TLS proxy config (equivalent to ferrum tcp_tls_perf.yaml)
+# Listener on 5001 with TLS termination → plain TCP backend on 3004
+admin:
+  address:
+    socket_address: { address: 127.0.0.1, port_value: 15000 }
+
+static_resources:
+  listeners:
+    - name: tcp_tls_listener
+      address:
+        socket_address: { address: 127.0.0.1, port_value: 5001 }
+      filter_chains:
+        - transport_socket:
+            name: envoy.transport_sockets.tls
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+              common_tls_context:
+                tls_certificates:
+                  - certificate_chain: { filename: CERT_PATH }
+                    private_key: { filename: KEY_PATH }
+          filters:
+            - name: envoy.filters.network.tcp_proxy
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+                stat_prefix: tcp_tls_stats
+                cluster: backend_tcp
+                idle_timeout: 300s
+                access_log: []
+
+  clusters:
+    - name: backend_tcp
+      connect_timeout: 5s
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: backend_tcp
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: 127.0.0.1, port_value: 3004 }

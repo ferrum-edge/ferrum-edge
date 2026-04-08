@@ -1,0 +1,46 @@
+# Envoy UDP proxy config (equivalent to ferrum udp_perf.yaml)
+# Listener on 5003, UDP datagram forwarding → backend echo on 3005
+admin:
+  address:
+    socket_address: { address: 127.0.0.1, port_value: 15000 }
+
+static_resources:
+  listeners:
+    - name: udp_listener
+      address:
+        socket_address:
+          address: 127.0.0.1
+          port_value: 5003
+          protocol: UDP
+      udp_listener_config:
+        downstream_socket_config:
+          prefer_gro: true
+      listener_filters:
+        - name: envoy.filters.udp_listener.udp_proxy
+          typed_config:
+            "@type": type.googleapis.com/envoy.extensions.filters.udp.udp_proxy.v3.UdpProxyConfig
+            stat_prefix: udp_stats
+            matcher:
+              on_no_match:
+                action:
+                  name: route
+                  typed_config:
+                    "@type": type.googleapis.com/envoy.extensions.filters.udp.udp_proxy.v3.Route
+                    cluster: backend_udp
+            idle_timeout: 30s
+
+  clusters:
+    - name: backend_udp
+      connect_timeout: 5s
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: backend_udp
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: 127.0.0.1
+                      port_value: 3005
+                      protocol: UDP
