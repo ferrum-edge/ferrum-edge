@@ -1,0 +1,17 @@
+syntax = "proto3";
+
+package bench;
+
+service BenchService {
+  rpc UnaryEcho (EchoRequest) returns (EchoResponse);
+  rpc ServerStream (EchoRequest) returns (stream EchoResponse);
+}
+
+message EchoRequest {
+  bytes payload = 1;
+}
+
+message EchoResponse {
+  bytes payload = 1;
+  int64 timestamp_us = 2;
+}

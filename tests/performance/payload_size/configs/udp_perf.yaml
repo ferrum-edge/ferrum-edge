@@ -1,0 +1,30 @@
+---
+# UDP proxy performance test config
+proxies:
+  - id: "udp-echo"
+    name: "UDP Echo Proxy"
+    listen_path: ""
+    listen_port: 5003
+    backend_protocol: udp
+    backend_host: "127.0.0.1"
+    backend_port: 4005
+    udp_idle_timeout_seconds: 30
+    auth_mode: single
+    plugins: []
+
+  - id: "udp-health"
+    name: "Health Check"
+    listen_path: "/health"
+    backend_protocol: http
+    backend_host: "127.0.0.1"
+    backend_port: 4010
+    strip_listen_path: false
+    preserve_host_header: false
+    backend_connect_timeout_ms: 1000
+    backend_read_timeout_ms: 5000
+    backend_write_timeout_ms: 5000
+    auth_mode: single
+    plugins: []
+
+consumers: []
+plugin_configs: []

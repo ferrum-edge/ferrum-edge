@@ -1,0 +1,32 @@
+---
+# TCP proxy performance test config
+proxies:
+  - id: "tcp-echo"
+    name: "TCP Echo Proxy"
+    listen_path: ""
+    listen_port: 5010
+    backend_protocol: tcp
+    backend_host: "127.0.0.1"
+    backend_port: 4004
+    backend_connect_timeout_ms: 5000
+    backend_read_timeout_ms: 30000
+    backend_write_timeout_ms: 30000
+    auth_mode: single
+    plugins: []
+
+  - id: "tcp-health"
+    name: "Health Check"
+    listen_path: "/health"
+    backend_protocol: http
+    backend_host: "127.0.0.1"
+    backend_port: 4010
+    strip_listen_path: false
+    preserve_host_header: false
+    backend_connect_timeout_ms: 1000
+    backend_read_timeout_ms: 5000
+    backend_write_timeout_ms: 5000
+    auth_mode: single
+    plugins: []
+
+consumers: []
+plugin_configs: []

@@ -1,0 +1,66 @@
+[package]
+name = "payload-size-perf"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "payload_backend"
+path = "payload_backend.rs"
+
+[[bin]]
+name = "payload_bench"
+path = "payload_bench.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# HTTP
+hyper = { version = "1", features = ["full"] }
+hyper-util = { version = "0.1", features = ["full"] }
+http-body-util = "0.1"
+http = "1"
+
+# TLS
+rustls = { version = "0.23", features = ["ring", "std"] }
+tokio-rustls = "0.26"
+rustls-pemfile = "2"
+rcgen = "0.13"
+
+# WebSocket
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+futures-util = { version = "0.3", features = ["sink"] }
+
+# gRPC
+tonic = { version = "0.14.5", features = ["tls-ring", "tls-webpki-roots"] }
+tonic-prost = "0.14.5"
+prost = "0.14.3"
+
+# HTTP/3 / QUIC
+quinn = "0.11.9"
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
+
+# DTLS 1.2/1.3
+dimpl = { version = "0.5.0", features = ["aws-lc-rs", "rcgen"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Metrics
+hdrhistogram = "7"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Streaming
+tokio-stream = "0.1"
+
+# Other
+bytes = "1"
+anyhow = "1"
+rand = "0.8"
+
+[build-dependencies]
+tonic-prost-build = "0.14.5"
