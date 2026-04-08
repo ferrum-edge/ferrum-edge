@@ -7,7 +7,7 @@
 //! broadcasts a `FULL_SNAPSHOT` to all DPs.
 //!
 //! The admin API is read/write (same as database mode). The CP validates
-//! DP client JWT tokens using `FERRUM_CP_GRPC_JWT_SECRET` and enforces
+//! DP client JWT tokens using `FERRUM_CP_DP_GRPC_JWT_SECRET` and enforces
 //! `major.minor` version compatibility between CP and DP.
 
 use arc_swap::ArcSwap;
@@ -126,11 +126,11 @@ pub async fn run(
 
     let config_arc = Arc::new(ArcSwap::new(Arc::new(config)));
 
-    let grpc_secret = match env_config.cp_grpc_jwt_secret.clone() {
+    let grpc_secret = match env_config.cp_dp_grpc_jwt_secret.clone() {
         Some(secret) if !secret.is_empty() => secret,
         _ => {
             return Err(anyhow::anyhow!(
-                "FERRUM_CP_GRPC_JWT_SECRET must be set and non-empty in control plane mode. \
+                "FERRUM_CP_DP_GRPC_JWT_SECRET must be set and non-empty in control plane mode. \
                  Without it, any client can forge valid gRPC authentication tokens."
             ));
         }

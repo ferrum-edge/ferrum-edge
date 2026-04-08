@@ -26,8 +26,6 @@ use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::grpc::cp_server::CpGrpcServer;
 use ferrum_edge::grpc::dp_client;
 use ferrum_edge::proxy::ProxyState;
-use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
-use serde_json::json;
 use tokio::time::sleep;
 use tonic::transport::Server;
 
@@ -68,9 +66,8 @@ fn create_test_env_config() -> EnvConfig {
         db_failover_urls: Vec::new(),
         db_read_replica_url: None,
         cp_grpc_listen_addr: Some("127.0.0.1:50054".into()),
-        cp_grpc_jwt_secret: Some(GRPC_JWT_SECRET.into()),
+        cp_dp_grpc_jwt_secret: Some(GRPC_JWT_SECRET.into()),
         dp_cp_grpc_url: None,
-        dp_grpc_auth_token: None,
         cp_grpc_tls_cert_path: None,
         cp_grpc_tls_key_path: None,
         cp_grpc_tls_client_ca_path: None,
@@ -195,22 +192,7 @@ fn create_test_proxy(id: &str, listen_path: &str, backend_port: u16) -> Proxy {
     }
 }
 
-/// Create a JWT token for gRPC authentication
-fn create_grpc_token() -> String {
-    let now = Utc::now().timestamp();
-    let claims = json!({
-        "sub": "dp-node",
-        "role": "data_plane",
-        "iat": now,
-        "exp": now + 3600,
-    });
-    encode(
-        &Header::new(Algorithm::HS256),
-        &claims,
-        &EncodingKey::from_secret(GRPC_JWT_SECRET.as_bytes()),
-    )
-    .expect("Failed to create gRPC JWT token")
-}
+// DP now generates its own JWT from the shared secret via dp_client::generate_dp_jwt()
 
 /// Create a ProxyState for DP testing
 fn create_proxy_state() -> ProxyState {
@@ -284,18 +266,16 @@ async fn test_cp_dp_grpc_config_sync() {
         "DP should start with empty config"
     );
 
-    // Connect DP to CP
+    // Connect DP to CP (DP generates its own JWT from the shared secret)
     println!("DP connecting to CP at {}...", addr);
     let cp_url = format!("http://{}", addr);
-    let token = create_grpc_token();
     let ps = dp_proxy_state.clone();
     let url_clone = cp_url.clone();
-    let token_clone = token.clone();
+    let secret = dp_client::GrpcJwtSecret::new(GRPC_JWT_SECRET.to_string());
 
     let client_handle = tokio::spawn(async move {
         let _ =
-            dp_client::connect_and_subscribe(&url_clone, &token_clone, "test-dp-node", &ps, None)
-                .await;
+            dp_client::connect_and_subscribe(&url_clone, &secret, "test-dp-node", &ps, None).await;
     });
 
     // Wait for initial config to be received by DP

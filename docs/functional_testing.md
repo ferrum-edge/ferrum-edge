@@ -138,7 +138,7 @@ FERRUM_ADMIN_JWT_SECRET=<secret-key>
 FERRUM_DB_TYPE=sqlite  # or postgres, mysql
 FERRUM_DB_URL=sqlite://ferrum.db
 FERRUM_CP_GRPC_LISTEN_ADDR=0.0.0.0:50051
-FERRUM_CP_GRPC_JWT_SECRET=<secret-key>
+FERRUM_CP_DP_GRPC_JWT_SECRET=<secret-key>
 ```
 
 ### Data Plane (DP)
@@ -155,7 +155,7 @@ When FERRUM_MODE=dp:
 ```bash
 FERRUM_MODE=dp
 FERRUM_DP_CP_GRPC_URL=http://cp-host:50051
-FERRUM_DP_GRPC_AUTH_TOKEN=<jwt-token>
+FERRUM_CP_DP_GRPC_JWT_SECRET=<secret-key>
 FERRUM_ADMIN_JWT_SECRET=<secret-key>
 ```
 
@@ -212,7 +212,7 @@ FERRUM_ADMIN_JWT_SECRET=test-secret \
 FERRUM_DB_TYPE=sqlite \
 FERRUM_DB_URL=sqlite://./test-ferrum.db \
 FERRUM_CP_GRPC_LISTEN_ADDR=127.0.0.1:50051 \
-FERRUM_CP_GRPC_JWT_SECRET=test-grpc-secret \
+FERRUM_CP_DP_GRPC_JWT_SECRET=test-grpc-secret \
 FERRUM_ADMIN_HTTP_PORT=9000 \
 FERRUM_LOG_LEVEL=debug \
 cargo run --bin ferrum-edge
@@ -249,29 +249,18 @@ curl -X POST http://localhost:9000/proxies \
   }'
 ```
 
-5. Create a JWT token for DP gRPC connection:
-```bash
-# Example payload:
-{
-  "sub": "dp-node",
-  "role": "data_plane",
-  "iat": 1704067200
-}
-# Sign with FERRUM_CP_GRPC_JWT_SECRET: "test-grpc-secret"
-```
-
-6. Start DP in another terminal:
+5. Start DP in another terminal (the DP automatically generates short-lived JWTs from the shared secret):
 ```bash
 FERRUM_MODE=dp \
 FERRUM_DP_CP_GRPC_URL=http://127.0.0.1:50051 \
-FERRUM_DP_GRPC_AUTH_TOKEN=<jwt-token> \
+FERRUM_CP_DP_GRPC_JWT_SECRET=test-grpc-secret \
 FERRUM_ADMIN_JWT_SECRET=test-secret \
 FERRUM_PROXY_HTTP_PORT=8000 \
 FERRUM_LOG_LEVEL=debug \
 cargo run --bin ferrum-edge
 ```
 
-7. Test proxy traffic:
+6. Test proxy traffic:
 ```bash
 curl http://localhost:8000/test/get
 ```
@@ -293,7 +282,7 @@ Then start CP/DP modes normally. The database connection will use TLS.
 
 ### DP Not Receiving Config
 - Verify CP is running and gRPC server is listening on FERRUM_CP_GRPC_LISTEN_ADDR
-- Check that FERRUM_DP_GRPC_AUTH_TOKEN is valid (signed with FERRUM_CP_GRPC_JWT_SECRET)
+- Check that FERRUM_CP_DP_GRPC_JWT_SECRET matches on both CP and DP
 - Check logs for JWT validation errors
 
 ### Admin API Endpoints Failing
@@ -321,7 +310,7 @@ Then start CP/DP modes normally. The database connection will use TLS.
 
 ## Security Best Practices
 
-1. **JWT Secrets**: Use strong, random secrets for FERRUM_ADMIN_JWT_SECRET and FERRUM_CP_GRPC_JWT_SECRET
+1. **JWT Secrets**: Use strong, random secrets for FERRUM_ADMIN_JWT_SECRET and FERRUM_CP_DP_GRPC_JWT_SECRET
 2. **TLS Database**: Always use TLS in production for remote databases
 3. **Admin API**: Restrict network access to CP Admin API port
 4. **Certificate Validation**: Avoid FERRUM_DB_TLS_INSECURE=true in production

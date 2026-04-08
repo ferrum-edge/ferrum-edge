@@ -74,10 +74,11 @@ pub async fn run(
         .dp_cp_grpc_url
         .clone()
         .ok_or_else(|| anyhow::anyhow!("FERRUM_DP_CP_GRPC_URL is required in dp mode"))?;
-    let auth_token = env_config
-        .dp_grpc_auth_token
-        .clone()
-        .ok_or_else(|| anyhow::anyhow!("FERRUM_DP_GRPC_AUTH_TOKEN is required in dp mode"))?;
+    let jwt_secret = crate::grpc::dp_client::GrpcJwtSecret::new(
+        env_config.cp_dp_grpc_jwt_secret.clone().ok_or_else(|| {
+            anyhow::anyhow!("FERRUM_CP_DP_GRPC_JWT_SECRET is required in dp mode")
+        })?,
+    );
 
     // Build DP gRPC TLS config if any TLS settings are provided
     let dp_grpc_tls = {
@@ -446,7 +447,7 @@ pub async fn run(
     let dp_client_handle = tokio::spawn(async move {
         crate::grpc::dp_client::start_dp_client_with_shutdown_and_startup_ready(
             cp_url,
-            auth_token,
+            jwt_secret,
             dp_proxy_state,
             Some(dp_shutdown),
             dp_grpc_tls,
