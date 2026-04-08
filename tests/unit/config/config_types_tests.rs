@@ -583,6 +583,40 @@ fn test_validate_fields_array_credentials_exceeds_max_per_type() {
     assert!(err.iter().any(|e| e.contains("must not exceed")));
 }
 
+#[test]
+fn test_validate_fields_array_rejects_non_object_elements() {
+    let mut c = make_consumer("c1", "alice");
+    // Array of strings instead of objects — should be rejected
+    c.credentials.insert(
+        "keyauth".into(),
+        serde_json::json!(["rotated-key", "another-key"]),
+    );
+    let err = c.validate_fields().unwrap_err();
+    assert!(err.iter().any(|e| e.contains("must be a JSON object")));
+}
+
+#[test]
+fn test_validate_fields_array_rejects_empty_array() {
+    let mut c = make_consumer("c1", "alice");
+    c.credentials
+        .insert("keyauth".into(), serde_json::json!([]));
+    let err = c.validate_fields().unwrap_err();
+    assert!(err.iter().any(|e| e.contains("must not be empty")));
+}
+
+#[test]
+fn test_validate_fields_rejects_non_object_credential_value() {
+    let mut c = make_consumer("c1", "alice");
+    // Plain string instead of object or array
+    c.credentials
+        .insert("keyauth".into(), serde_json::json!("just-a-string"));
+    let err = c.validate_fields().unwrap_err();
+    assert!(
+        err.iter()
+            .any(|e| e.contains("must be a JSON object or array"))
+    );
+}
+
 // ---- Consumer identity uniqueness tests ----
 
 #[test]

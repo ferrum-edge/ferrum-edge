@@ -1688,6 +1688,18 @@ pub fn hosts_overlap(a: &[String], b: &[String]) -> bool {
 
 /// Check if a string contains ASCII control characters (excluding common whitespace).
 /// Rejects null bytes, backspace, escape, etc. that could cause log injection.
+/// Human-readable JSON value type name for error messages.
+fn elem_type_name(v: &serde_json::Value) -> &'static str {
+    match v {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+}
+
 fn contains_control_chars(s: &str) -> bool {
     s.bytes()
         .any(|b| b < 0x20 && b != b'\t' && b != b'\n' && b != b'\r')
@@ -2344,7 +2356,10 @@ impl Consumer {
             if let Err(e) = validate_string_field("credential type", cred_type, 64) {
                 errors.push(e);
             }
-            // Collect objects to validate: either a single object or array elements
+            // Collect objects to validate: either a single object or array elements.
+            // Non-object elements in arrays are rejected — they would be silently
+            // ignored at runtime by credential_entries(), leaving the consumer with
+            // fewer usable credentials than the operator intended.
             let objects: Vec<&serde_json::Map<String, serde_json::Value>> =
                 if let Some(arr) = cred_value.as_array() {
                     let limit = max_credentials_per_type();
@@ -2356,10 +2371,30 @@ impl Consumer {
                             arr.len()
                         ));
                     }
+                    if arr.is_empty() {
+                        errors.push(format!(
+                            "credentials.{} array must not be empty — remove the key instead",
+                            cred_type
+                        ));
+                    }
+                    for (i, elem) in arr.iter().enumerate() {
+                        if !elem.is_object() {
+                            errors.push(format!(
+                                "credentials.{}[{}] must be a JSON object, got {}",
+                                cred_type,
+                                i,
+                                elem_type_name(elem)
+                            ));
+                        }
+                    }
                     arr.iter().filter_map(|v| v.as_object()).collect()
                 } else if let Some(obj) = cred_value.as_object() {
                     vec![obj]
                 } else {
+                    errors.push(format!(
+                        "credentials.{} must be a JSON object or array of objects",
+                        cred_type
+                    ));
                     vec![]
                 };
             for (idx, obj) in objects.iter().enumerate() {

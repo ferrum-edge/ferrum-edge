@@ -1550,10 +1550,18 @@ components:
           type: object
           default: {}
           additionalProperties:
-            type: object
+            oneOf:
+              - type: object
+                description: Single credential entry
+              - type: array
+                items:
+                  type: object
+                minItems: 1
+                description: Multiple credential entries for zero-downtime rotation
           description: |
             Map of credential type to credential payload. Each type maps to either
             a single JSON object or an array of objects (for zero-downtime rotation).
+            Array elements must be JSON objects — non-object elements are rejected.
             Credential values that serve as lookup keys must be unique across all
             consumers and across all entries within arrays. Max entries per type is
             controlled by `FERRUM_MAX_CREDENTIALS_PER_TYPE` (default: 2).
