@@ -20,6 +20,12 @@ cd tests/performance/multi_protocol
 
 # JSON output (for CI / scripting)
 ./run_protocol_test.sh tcp --json
+
+# Compare Ferrum Edge vs Envoy (requires envoy in PATH)
+./run_protocol_test.sh all --envoy
+
+# Compare a single protocol against Envoy
+./run_protocol_test.sh http2 --envoy --duration 30 --concurrency 200
 ```
 
 ## Supported Protocols
@@ -218,19 +224,115 @@ Results from a local run on macOS (Apple Silicon), 10s duration, 200 concurrent 
 > `3.8%` (`64,278` -> `66,734` requests/sec at `10s`, `200` concurrency).
 > Ferrum now defaults this knob to `1ms` via `FERRUM_GRPC_POOL_READY_WAIT_MS`.
 
+## Envoy Comparison Mode
+
+The `--envoy` flag runs each protocol benchmark through both Ferrum Edge and Envoy (native binary), using the **same backend, same load generator, same ports** — a true apples-to-apples comparison.
+
+```bash
+# Compare all supported protocols
+./run_protocol_test.sh all --envoy --duration 30 --concurrency 200
+
+# Compare a single protocol
+./run_protocol_test.sh grpc --envoy
+```
+
+### How It Works
+
+For each protocol, the runner:
+
+1. Starts Ferrum Edge with its config, runs `proto_bench`, captures JSON results, stops Ferrum
+2. Starts Envoy with an equivalent config, runs `proto_bench`, captures JSON results, stops Envoy
+3. Runs the direct-backend baseline (same for both)
+4. After all protocols, prints a comparison table
+
+Both gateways run natively (no Docker), bind the same ports (sequentially), and connect to the same `proto_backend` echo server.
+
+### Envoy-Compared Protocols
+
+| Protocol | Envoy Config | Notes |
+|----------|-------------|-------|
+| HTTP/1.1 | `configs/envoy/http1.yaml` | `http_connection_manager` with `codec_type: HTTP1` |
+| HTTP/1.1+TLS | `configs/envoy/http1_tls.yaml` | Downstream TLS termination, plain HTTP to backend |
+| WebSocket | `configs/envoy/ws.yaml` | `upgrade_configs: websocket` on HCM |
+| gRPC | `configs/envoy/grpc.yaml` | h2c (cleartext HTTP/2) on both sides |
+| TCP | `configs/envoy/tcp.yaml` | `tcp_proxy` network filter |
+| TCP+TLS | `configs/envoy/tcp_tls.yaml` | Downstream TLS + `tcp_proxy` |
+| UDP | `configs/envoy/udp.yaml` | `udp_proxy` listener filter with matcher-based routing |
+
+**Skipped protocols:**
+- **HTTP/2** — hyper's raw h2c client gets `ConnectionReset` from Envoy on macOS (known h2c compatibility issue); gRPC already covers HTTP/2 semantics via tonic which works fine
+- **HTTP/3 (QUIC)** — Envoy's QUIC support requires a special build with BoringSSL
+- **UDP+DTLS** — No native Envoy DTLS termination
+
+### Envoy Tuning
+
+Envoy configs are tuned to match Ferrum Edge where applicable:
+
+- HTTP/2 flow control: 8 MiB stream window, 32 MiB connection window, 1000 max concurrent streams
+- Access logging disabled (`access_log: []`)
+- Log level: `error` (`-l error`)
+- Worker threads: auto (`--concurrency auto`, matches CPU cores)
+- Admin interface on port 15000 (not benchmarked)
+
+### Sample Comparison Output
+
+Results from a local run on macOS (Apple Silicon M4 Max), 10s duration, 200 concurrent connections, 64-byte payload, Envoy 1.37.1.
+
+```
+=========================================================================================================
+  Ferrum Edge vs Envoy — Through-Gateway Comparison
+  Duration: 10s | Concurrency: 200 | Payload: 64 bytes
+=========================================================================================================
+
+| Protocol       |   Ferrum RPS |    Envoy RPS |    Δ RPS |  Winner |  Ferrum P50 |   Envoy P50 |  Ferrum P99 |   Envoy P99 |  Ferrum Avg |   Envoy Avg |
+|----------------|--------------|--------------|----------|---------|-------------|-------------|-------------|-------------|-------------|-------------|
+| http1          |       98,349 |       89,238 |   +10.2% |  Ferrum |      1.89ms |      1.55ms |      4.06ms |     16.48ms |      2.03ms |      2.24ms |
+| http1-tls      |       89,973 |       81,584 |   +10.3% |  Ferrum |      2.06ms |      1.72ms |      4.54ms |     13.24ms |      2.22ms |      2.45ms |
+| ws             |      102,200 |      106,593 |    -4.1% |  Envoy  |      1.88ms |      1.42ms |      3.32ms |      7.77ms |      1.95ms |      1.87ms |
+| grpc           |       33,554 |       63,122 |   -46.8% |  Envoy  |      4.97ms |      2.18ms |     11.89ms |     48.00ms |      5.95ms |      3.16ms |
+| tcp            |      107,439 |      105,222 |    +2.1% |  Ferrum |      1.82ms |      1.50ms |      2.85ms |     11.46ms |      1.86ms |      1.90ms |
+| tcp-tls        |      105,433 |      105,461 |    -0.0% |   ~tie  |      1.85ms |      1.42ms |      3.27ms |      9.45ms |      1.89ms |      1.89ms |
+| udp            |       81,170 |      126,355 |   -35.8% |  Envoy  |      2.47ms |      1.36ms |      3.02ms |      2.79ms |      2.46ms |      1.58ms |
+
+======================================================================
+  Gateway Overhead vs Direct Backend
+======================================================================
+
+| Protocol       |   Direct RPS |   Ferrum RPS |  Ferrum OH |    Envoy RPS |   Envoy OH |
+|----------------|--------------|--------------|------------|--------------|------------|
+| http1          |      200,684 |       98,349 |       ~50% |       89,238 |       ~55% |
+| http1-tls      |      208,192 |       89,973 |       ~56% |       81,584 |       ~60% |
+| ws             |      208,887 |      102,200 |       ~51% |      106,593 |       ~48% |
+| grpc           |      189,130 |       33,554 |       ~82% |       63,122 |       ~66% |
+| tcp            |      210,367 |      107,439 |       ~48% |      105,222 |       ~49% |
+| tcp-tls        |      207,864 |      105,433 |       ~49% |      105,461 |       ~49% |
+| udp            |      259,017 |       81,170 |       ~68% |      126,355 |       ~51% |
+```
+
+> **Key findings:** Ferrum Edge wins on HTTP/1.1 (+10%), HTTP/1.1+TLS (+10%), and TCP (+2%) with
+> significantly better P99 tail latencies (2-4x lower across HTTP and TCP protocols). Envoy wins on
+> gRPC throughput (+47% RPS) and UDP throughput (+36% RPS). WebSocket and TCP+TLS are effectively
+> tied. Despite lower gRPC RPS, Ferrum's P99 latency is 4x better (11.89ms vs 48ms).
+
+> **Note:** Benchmark numbers vary between runs. Focus on relative comparisons rather than absolute numbers.
+
 ## Prerequisites
 
 - **Rust toolchain** (cargo, rustc)
 - **protoc** (protobuf compiler) for gRPC support
+- **Envoy** (optional, for `--envoy` comparison mode)
 - The following ports must be free: 3001-3006, 3010, 3443-3445, 5001, 5003-5004, 5010, 8000, 8443, 50052
+- Port 15000 must also be free when using `--envoy` (Envoy admin)
 
-Install protoc:
+Install dependencies:
 ```bash
 # macOS
 brew install protobuf
+brew install envoy   # optional, for --envoy mode
 
 # Ubuntu/Debian
 sudo apt-get install protobuf-compiler
+# See https://www.envoyproxy.io/docs/envoy/latest/start/install for Envoy
 ```
 
 ## Adding a New Protocol Test
@@ -239,3 +341,4 @@ sudo apt-get install protobuf-compiler
 2. Add a load generator subcommand in `proto_bench.rs`
 3. Create a gateway config in `configs/<protocol>_perf.yaml`
 4. Add `test_<protocol>()` and `stop_gateway` call in `run_protocol_test.sh`
+5. (Optional) Add an Envoy config in `configs/envoy/<protocol>.yaml` and register in `envoy_compare_protocol()`
