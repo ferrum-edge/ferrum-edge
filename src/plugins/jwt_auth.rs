@@ -149,48 +149,43 @@ impl Plugin for JwtAuth {
             }
         };
 
-        // Get the consumer's JWT secret and verify the signature
-        let secret = match consumer
-            .credentials
-            .get("jwt")
-            .and_then(|c| c.get("secret"))
-            .and_then(|s| s.as_str())
-        {
-            Some(s) => s,
-            None => {
-                debug!(
-                    "jwt_auth: consumer '{}' has no JWT secret configured",
-                    consumer.username
-                );
-                return PluginResult::Reject {
-                    status_code: 401,
-                    body: r#"{"error":"Invalid JWT token"}"#.into(),
-                    headers: HashMap::new(),
-                };
-            }
-        };
+        // Try all JWT secrets for this consumer (supports multiple credentials
+        // per type for zero-downtime rotation). First successful decode wins.
+        let jwt_entries = consumer.credential_entries("jwt");
+        if jwt_entries.is_empty() {
+            debug!(
+                "jwt_auth: consumer '{}' has no JWT secret configured",
+                consumer.username
+            );
+            return PluginResult::Reject {
+                status_code: 401,
+                body: r#"{"error":"Invalid JWT token"}"#.into(),
+                headers: HashMap::new(),
+            };
+        }
 
-        let key = DecodingKey::from_secret(secret.as_bytes());
         let mut validation = Validation::new(Algorithm::HS256);
         validation.validate_exp = true;
         validation.required_spec_claims.clear();
 
-        match decode::<serde_json::Value>(&token, &key, &validation) {
-            Ok(_) => {
-                if ctx.identified_consumer.is_none() {
-                    debug!("jwt_auth: identified consumer '{}'", consumer.username);
-                    ctx.identified_consumer = Some(consumer);
-                }
-                PluginResult::Continue
-            }
-            Err(e) => {
-                debug!("jwt_auth: signature verification failed: {}", e);
-                PluginResult::Reject {
-                    status_code: 401,
-                    body: r#"{"error":"Invalid JWT token"}"#.into(),
-                    headers: HashMap::new(),
+        for jwt_cred in &jwt_entries {
+            if let Some(secret) = jwt_cred.get("secret").and_then(|s| s.as_str()) {
+                let key = DecodingKey::from_secret(secret.as_bytes());
+                if decode::<serde_json::Value>(&token, &key, &validation).is_ok() {
+                    if ctx.identified_consumer.is_none() {
+                        debug!("jwt_auth: identified consumer '{}'", consumer.username);
+                        ctx.identified_consumer = Some(consumer);
+                    }
+                    return PluginResult::Continue;
                 }
             }
+        }
+
+        debug!("jwt_auth: signature verification failed for all secrets");
+        PluginResult::Reject {
+            status_code: 401,
+            body: r#"{"error":"Invalid JWT token"}"#.into(),
+            headers: HashMap::new(),
         }
     }
 }

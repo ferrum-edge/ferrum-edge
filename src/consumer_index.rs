@@ -119,21 +119,21 @@ impl ConsumerIndex {
                 if !ids_to_remove.contains(consumer.id.as_str()) {
                     continue;
                 }
-                // Collect old keyauth credential key
-                if let Some(key_creds) = consumer.credentials.get("keyauth")
-                    && let Some(key) = key_creds.get("key").and_then(|s| s.as_str())
-                {
-                    old_keyauth_keys.push(key.to_string());
+                // Collect old keyauth credential keys (supports array)
+                for key_creds in consumer.credential_entries("keyauth") {
+                    if let Some(key) = key_creds.get("key").and_then(|s| s.as_str()) {
+                        old_keyauth_keys.push(key.to_string());
+                    }
                 }
                 // Collect old basicauth username
-                if consumer.credentials.contains_key("basicauth") {
+                if consumer.has_credential("basicauth") {
                     old_basic_keys.push(consumer.username.clone());
                 }
-                // Collect old mtls_auth identity
-                if let Some(mtls_creds) = consumer.credentials.get("mtls_auth")
-                    && let Some(id) = mtls_creds.get("identity").and_then(|s| s.as_str())
-                {
-                    old_mtls_keys.push(id.to_string());
+                // Collect old mtls_auth identities (supports array)
+                for mtls_creds in consumer.credential_entries("mtls_auth") {
+                    if let Some(id) = mtls_creds.get("identity").and_then(|s| s.as_str()) {
+                        old_mtls_keys.push(id.to_string());
+                    }
                 }
                 // Collect old identity keys (username, id, custom_id)
                 old_identity_keys.push(consumer.username.clone());
@@ -184,21 +184,22 @@ impl ConsumerIndex {
 
             all.push(Arc::clone(&arc_consumer));
 
-            if let Some(key_creds) = consumer.credentials.get("keyauth")
-                && let Some(key) = key_creds.get("key").and_then(|s| s.as_str())
-            {
-                keyauth.insert(key.to_string(), Arc::clone(&arc_consumer));
+            // Index all keyauth keys (supports array)
+            for key_creds in consumer.credential_entries("keyauth") {
+                if let Some(key) = key_creds.get("key").and_then(|s| s.as_str()) {
+                    keyauth.insert(key.to_string(), Arc::clone(&arc_consumer));
+                }
             }
 
             // Index by username only if consumer has basic_auth credentials
-            if consumer.credentials.contains_key("basicauth") {
+            if consumer.has_credential("basicauth") {
                 basic.insert(consumer.username.clone(), Arc::clone(&arc_consumer));
             }
-            // Index by mTLS identity if consumer has mtls_auth credentials
-            if let Some(mtls_creds) = consumer.credentials.get("mtls_auth")
-                && let Some(id) = mtls_creds.get("identity").and_then(|s| s.as_str())
-            {
-                mtls.insert(id.to_string(), Arc::clone(&arc_consumer));
+            // Index all mTLS identities (supports array)
+            for mtls_creds in consumer.credential_entries("mtls_auth") {
+                if let Some(id) = mtls_creds.get("identity").and_then(|s| s.as_str()) {
+                    mtls.insert(id.to_string(), Arc::clone(&arc_consumer));
+                }
             }
             identity.insert(consumer.username.clone(), Arc::clone(&arc_consumer));
             identity.insert(consumer.id.clone(), Arc::clone(&arc_consumer));
@@ -256,21 +257,21 @@ impl ConsumerIndex {
             let arc_consumer = Arc::new(consumer.clone());
             all.push(Arc::clone(&arc_consumer));
 
-            // Index by API key (keyauth credential)
-            if let Some(key_creds) = consumer.credentials.get("keyauth")
-                && let Some(key) = key_creds.get("key").and_then(|s| s.as_str())
-            {
-                let prev = keyauth.insert(key.to_string(), Arc::clone(&arc_consumer));
-                if let Some(existing) = prev {
-                    warn!(
-                        "Credential collision: keyauth key '{}' for consumer '{}' overwrites consumer '{}'",
-                        key, consumer.id, existing.id
-                    );
+            // Index by API key (keyauth credentials — supports single object or array)
+            for key_creds in consumer.credential_entries("keyauth") {
+                if let Some(key) = key_creds.get("key").and_then(|s| s.as_str()) {
+                    let prev = keyauth.insert(key.to_string(), Arc::clone(&arc_consumer));
+                    if let Some(existing) = prev {
+                        warn!(
+                            "Credential collision: keyauth key '{}' for consumer '{}' overwrites consumer '{}'",
+                            key, consumer.id, existing.id
+                        );
+                    }
                 }
             }
 
             // Index by username only if consumer has basic_auth credentials
-            if consumer.credentials.contains_key("basicauth") {
+            if consumer.has_credential("basicauth") {
                 let prev = basic.insert(consumer.username.clone(), Arc::clone(&arc_consumer));
                 if let Some(existing) = prev {
                     warn!(
@@ -280,16 +281,16 @@ impl ConsumerIndex {
                 }
             }
 
-            // Index by mTLS identity (mtls_auth credential)
-            if let Some(mtls_creds) = consumer.credentials.get("mtls_auth")
-                && let Some(id) = mtls_creds.get("identity").and_then(|s| s.as_str())
-            {
-                let prev = mtls.insert(id.to_string(), Arc::clone(&arc_consumer));
-                if let Some(existing) = prev {
-                    warn!(
-                        "Credential collision: mtls_auth identity '{}' for consumer '{}' overwrites consumer '{}'",
-                        id, consumer.id, existing.id
-                    );
+            // Index by mTLS identity (mtls_auth credentials — supports single object or array)
+            for mtls_creds in consumer.credential_entries("mtls_auth") {
+                if let Some(id) = mtls_creds.get("identity").and_then(|s| s.as_str()) {
+                    let prev = mtls.insert(id.to_string(), Arc::clone(&arc_consumer));
+                    if let Some(existing) = prev {
+                        warn!(
+                            "Credential collision: mtls_auth identity '{}' for consumer '{}' overwrites consumer '{}'",
+                            id, consumer.id, existing.id
+                        );
+                    }
                 }
             }
 

@@ -964,8 +964,13 @@ mod inner {
             key: &str,
             exclude_consumer_id: Option<&str>,
         ) -> Result<bool, anyhow::Error> {
-            // key_auth credentials are stored in credentials.key_auth.key
-            let mut filter = doc! { "credentials.key_auth.key": key };
+            // Supports both single-object and array formats for keyauth credentials
+            let mut filter = doc! {
+                "$or": [
+                    { "credentials.keyauth.key": key },
+                    { "credentials.keyauth": { "$elemMatch": { "key": key } } }
+                ]
+            };
             if let Some(id) = exclude_consumer_id {
                 filter.insert("_id", doc! { "$ne": id });
             }
@@ -978,7 +983,13 @@ mod inner {
             identity: &str,
             exclude_consumer_id: Option<&str>,
         ) -> Result<bool, anyhow::Error> {
-            let mut filter = doc! { "credentials.mtls.subject": identity };
+            // Supports both single-object and array formats for mtls_auth credentials
+            let mut filter = doc! {
+                "$or": [
+                    { "credentials.mtls_auth.identity": identity },
+                    { "credentials.mtls_auth": { "$elemMatch": { "identity": identity } } }
+                ]
+            };
             if let Some(id) = exclude_consumer_id {
                 filter.insert("_id", doc! { "$ne": id });
             }

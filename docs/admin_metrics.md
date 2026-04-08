@@ -280,14 +280,14 @@ The router cache stores `(host, path) → proxy` lookups in bounded DashMaps for
 
 ### `consumer_index`
 
-Pre-built hash map indexes for O(1) credential lookup during authentication. The counts show how many credentials are indexed per authentication type.
+Pre-built hash map indexes for O(1) credential lookup during authentication. The counts show how many credential entries are indexed per authentication type. When consumers use multi-credential arrays for rotation, these counts reflect total entries (e.g., a consumer with two API keys contributes 2 to `key_auth_credentials`).
 
 | Field | Type | Description |
 |-------|------|-------------|
 | `total_consumers` | integer | Total consumers loaded |
-| `key_auth_credentials` | integer | API key credentials indexed (for `key_auth` plugin) |
+| `key_auth_credentials` | integer | API key credential entries indexed (for `key_auth` plugin). May exceed `total_consumers` when consumers have multiple keys for rotation |
 | `basic_auth_credentials` | integer | Username credentials indexed (for `basic_auth` plugin) |
-| `mtls_credentials` | integer | mTLS identity credentials indexed (for `mtls_auth` plugin) |
+| `mtls_credentials` | integer | mTLS identity credential entries indexed (for `mtls_auth` plugin). May exceed `total_consumers` when consumers have multiple identities for rotation |
 
 Note: JWT and OAuth2 consumers are looked up via the identity index (by username, ID, or custom_id) rather than a dedicated credential index, so they don't appear as a separate count here.
 

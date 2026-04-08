@@ -683,3 +683,92 @@ async fn test_consumer_set_on_successful_auth() {
     assert_eq!(identified.id, "hmac-consumer");
     assert_eq!(identified.username, "hmacuser");
 }
+
+// ---- Multi-credential rotation tests ----
+
+fn create_hmac_consumer_with_secrets(secrets: &[&str]) -> Consumer {
+    let mut credentials = HashMap::new();
+    let arr: Vec<Value> = secrets.iter().map(|s| json!({"secret": s})).collect();
+    credentials.insert("hmac_auth".to_string(), Value::Array(arr));
+
+    Consumer {
+        id: "hmac-consumer".to_string(),
+        username: "hmacuser".to_string(),
+        custom_id: None,
+        credentials,
+        acl_groups: Vec::new(),
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    }
+}
+
+#[tokio::test]
+async fn test_hmac_multi_secret_old_secret_still_works() {
+    let plugin = HmacAuth::new(&json!({})).unwrap();
+    let consumer = create_hmac_consumer_with_secrets(&["old-secret", "new-secret"]);
+    let consumer_index = ConsumerIndex::new(&[consumer]);
+
+    let date = current_date();
+    let sig = sign_sha256("old-secret", "GET", "/api", &date);
+    let mut ctx = make_ctx("GET", "/api");
+    ctx.headers.insert(
+        "authorization".to_string(),
+        format!(
+            "hmac username=\"hmacuser\", algorithm=\"hmac-sha256\", signature=\"{}\"",
+            sig
+        ),
+    );
+    ctx.headers.insert("date".to_string(), date);
+    ctx.identified_consumer = None;
+
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
+    assert_continue(result);
+    assert_eq!(ctx.identified_consumer.unwrap().username, "hmacuser");
+}
+
+#[tokio::test]
+async fn test_hmac_multi_secret_new_secret_works() {
+    let plugin = HmacAuth::new(&json!({})).unwrap();
+    let consumer = create_hmac_consumer_with_secrets(&["old-secret", "new-secret"]);
+    let consumer_index = ConsumerIndex::new(&[consumer]);
+
+    let date = current_date();
+    let sig = sign_sha256("new-secret", "GET", "/api", &date);
+    let mut ctx = make_ctx("GET", "/api");
+    ctx.headers.insert(
+        "authorization".to_string(),
+        format!(
+            "hmac username=\"hmacuser\", algorithm=\"hmac-sha256\", signature=\"{}\"",
+            sig
+        ),
+    );
+    ctx.headers.insert("date".to_string(), date);
+    ctx.identified_consumer = None;
+
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
+    assert_continue(result);
+    assert_eq!(ctx.identified_consumer.unwrap().username, "hmacuser");
+}
+
+#[tokio::test]
+async fn test_hmac_multi_secret_wrong_secret_rejected() {
+    let plugin = HmacAuth::new(&json!({})).unwrap();
+    let consumer = create_hmac_consumer_with_secrets(&["secret-a", "secret-b"]);
+    let consumer_index = ConsumerIndex::new(&[consumer]);
+
+    let date = current_date();
+    let sig = sign_sha256("wrong-secret", "GET", "/api", &date);
+    let mut ctx = make_ctx("GET", "/api");
+    ctx.headers.insert(
+        "authorization".to_string(),
+        format!(
+            "hmac username=\"hmacuser\", algorithm=\"hmac-sha256\", signature=\"{}\"",
+            sig
+        ),
+    );
+    ctx.headers.insert("date".to_string(), date);
+    ctx.identified_consumer = None;
+
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
+    assert_reject(result, Some(401));
+}

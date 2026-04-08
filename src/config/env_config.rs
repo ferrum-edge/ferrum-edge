@@ -327,6 +327,8 @@ pub struct EnvConfig {
     pub max_grpc_recv_size_bytes: usize,
     /// Maximum WebSocket frame size in bytes. Applied to both client and backend connections.
     pub max_websocket_frame_size_bytes: usize,
+    /// Maximum number of credential entries per type per consumer (for zero-downtime rotation).
+    pub max_credentials_per_type: usize,
     /// HTTP/1.1 header read timeout in seconds. Protects against slowloris attacks
     /// by closing connections that take too long to send complete request headers.
     /// 0 = disabled (no timeout). Default: 10 seconds.
@@ -661,6 +663,7 @@ impl Default for EnvConfig {
             max_query_params: 100,
             max_grpc_recv_size_bytes: 4_194_304,
             max_websocket_frame_size_bytes: 16_777_216,
+            max_credentials_per_type: 2,
             http_header_read_timeout_seconds: 10,
             dns_cache_ttl_seconds: 300,
             dns_overrides: HashMap::new(),
@@ -911,6 +914,7 @@ impl EnvConfig {
                 "FERRUM_MAX_WEBSOCKET_FRAME_SIZE_BYTES",
                 16_777_216,
             ),
+            max_credentials_per_type: resolve_usize(conf, "FERRUM_MAX_CREDENTIALS_PER_TYPE", 2),
             http_header_read_timeout_seconds: resolve_u64(
                 conf,
                 "FERRUM_HTTP_HEADER_READ_TIMEOUT_SECONDS",

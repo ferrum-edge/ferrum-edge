@@ -282,3 +282,86 @@ async fn test_basic_auth_bcrypt_fallback() {
     let result2 = plugin.authenticate(&mut ctx2, &consumer_index).await;
     assert_reject(result2, Some(401));
 }
+
+// ---- Multi-credential rotation tests ----
+
+fn create_basic_auth_consumer_with_two_passwords() -> ferrum_edge::config::types::Consumer {
+    use chrono::Utc;
+    use serde_json::Value;
+    use std::collections::HashMap;
+
+    let hash_old = bcrypt::hash("old-password", 4).unwrap();
+    let hash_new = bcrypt::hash("new-password", 4).unwrap();
+
+    let mut credentials = HashMap::new();
+    credentials.insert(
+        "basicauth".to_string(),
+        Value::Array(vec![
+            json!({"password_hash": hash_old}),
+            json!({"password_hash": hash_new}),
+        ]),
+    );
+
+    ferrum_edge::config::types::Consumer {
+        id: "basic-consumer".to_string(),
+        username: "testuser".to_string(),
+        custom_id: None,
+        credentials,
+        acl_groups: Vec::new(),
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    }
+}
+
+#[tokio::test]
+async fn test_basic_auth_multi_password_old_password_works() {
+    let plugin = BasicAuth::new(&json!({})).unwrap();
+    let consumer = create_basic_auth_consumer_with_two_passwords();
+    let consumer_index = ConsumerIndex::new(&[consumer]);
+
+    let mut ctx = make_ctx();
+    ctx.headers.insert(
+        "authorization".to_string(),
+        basic_header("testuser", "old-password"),
+    );
+    ctx.identified_consumer = None;
+
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
+    assert_continue(result);
+    assert_eq!(ctx.identified_consumer.unwrap().username, "testuser");
+}
+
+#[tokio::test]
+async fn test_basic_auth_multi_password_new_password_works() {
+    let plugin = BasicAuth::new(&json!({})).unwrap();
+    let consumer = create_basic_auth_consumer_with_two_passwords();
+    let consumer_index = ConsumerIndex::new(&[consumer]);
+
+    let mut ctx = make_ctx();
+    ctx.headers.insert(
+        "authorization".to_string(),
+        basic_header("testuser", "new-password"),
+    );
+    ctx.identified_consumer = None;
+
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
+    assert_continue(result);
+    assert_eq!(ctx.identified_consumer.unwrap().username, "testuser");
+}
+
+#[tokio::test]
+async fn test_basic_auth_multi_password_wrong_password_rejected() {
+    let plugin = BasicAuth::new(&json!({})).unwrap();
+    let consumer = create_basic_auth_consumer_with_two_passwords();
+    let consumer_index = ConsumerIndex::new(&[consumer]);
+
+    let mut ctx = make_ctx();
+    ctx.headers.insert(
+        "authorization".to_string(),
+        basic_header("testuser", "wrong-password"),
+    );
+    ctx.identified_consumer = None;
+
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
+    assert_reject(result, Some(401));
+}

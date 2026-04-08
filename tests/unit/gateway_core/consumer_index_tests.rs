@@ -273,3 +273,115 @@ fn test_apply_delta_simultaneous_add_remove_modify() {
     assert!(index.find_by_api_key("key-c").is_some()); // unchanged
     assert!(index.find_by_api_key("key-d").is_some()); // added
 }
+
+// ---- Multi-credential (array format) tests ----
+
+fn make_consumer_with_array_keys(id: &str, username: &str, keys: &[&str]) -> Consumer {
+    let mut credentials = HashMap::new();
+    let arr: Vec<Value> = keys
+        .iter()
+        .map(|k| {
+            let mut m = Map::new();
+            m.insert("key".to_string(), Value::String(k.to_string()));
+            Value::Object(m)
+        })
+        .collect();
+    credentials.insert("keyauth".to_string(), Value::Array(arr));
+
+    Consumer {
+        id: id.to_string(),
+        username: username.to_string(),
+        custom_id: None,
+        credentials,
+        acl_groups: Vec::new(),
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    }
+}
+
+#[test]
+fn test_find_by_api_key_with_array_credentials() {
+    let c = make_consumer_with_array_keys("c1", "alice", &["key-old", "key-new"]);
+    let index = ConsumerIndex::new(&[c]);
+
+    // Both keys should resolve to the same consumer
+    let found_old = index.find_by_api_key("key-old").unwrap();
+    let found_new = index.find_by_api_key("key-new").unwrap();
+    assert_eq!(found_old.id, "c1");
+    assert_eq!(found_new.id, "c1");
+    // Non-existent key
+    assert!(index.find_by_api_key("key-other").is_none());
+}
+
+#[test]
+fn test_apply_delta_with_array_credentials() {
+    let c1 = make_consumer_with_array_keys("c1", "alice", &["key-a1", "key-a2"]);
+    let c2 = make_consumer("c2", "bob", Some("key-b"), None);
+    let index = ConsumerIndex::new(&[c1, c2]);
+
+    // Modify c1: rotate keys (remove key-a1, keep key-a2, add key-a3)
+    let c1_modified = make_consumer_with_array_keys("c1", "alice", &["key-a2", "key-a3"]);
+    index.apply_delta(&[], &[], &[c1_modified]);
+
+    assert!(index.find_by_api_key("key-a1").is_none()); // old key removed
+    assert!(index.find_by_api_key("key-a2").is_some()); // kept
+    assert!(index.find_by_api_key("key-a3").is_some()); // new key
+    assert!(index.find_by_api_key("key-b").is_some()); // other consumer unaffected
+}
+
+#[test]
+fn test_apply_delta_remove_consumer_with_array_credentials() {
+    let c1 = make_consumer_with_array_keys("c1", "alice", &["key-a1", "key-a2"]);
+    let index = ConsumerIndex::new(&[c1]);
+
+    index.apply_delta(&[], &["c1".to_string()], &[]);
+
+    assert!(index.find_by_api_key("key-a1").is_none());
+    assert!(index.find_by_api_key("key-a2").is_none());
+    assert_eq!(index.consumer_count(), 0);
+}
+
+#[test]
+fn test_mixed_single_and_array_credentials() {
+    // c1 uses array format, c2 uses single-object format
+    let c1 = make_consumer_with_array_keys("c1", "alice", &["key-a1", "key-a2"]);
+    let c2 = make_consumer("c2", "bob", Some("key-b"), None);
+    let index = ConsumerIndex::new(&[c1, c2]);
+
+    assert_eq!(index.find_by_api_key("key-a1").unwrap().id, "c1");
+    assert_eq!(index.find_by_api_key("key-a2").unwrap().id, "c1");
+    assert_eq!(index.find_by_api_key("key-b").unwrap().id, "c2");
+}
+
+fn make_consumer_with_array_mtls(id: &str, username: &str, identities: &[&str]) -> Consumer {
+    let mut credentials = HashMap::new();
+    let arr: Vec<Value> = identities
+        .iter()
+        .map(|i| {
+            let mut m = Map::new();
+            m.insert("identity".to_string(), Value::String(i.to_string()));
+            Value::Object(m)
+        })
+        .collect();
+    credentials.insert("mtls_auth".to_string(), Value::Array(arr));
+
+    Consumer {
+        id: id.to_string(),
+        username: username.to_string(),
+        custom_id: None,
+        credentials,
+        acl_groups: Vec::new(),
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    }
+}
+
+#[test]
+fn test_find_by_mtls_identity_with_array_credentials() {
+    let c = make_consumer_with_array_mtls("c1", "alice", &["CN=old", "CN=new"]);
+    let index = ConsumerIndex::new(&[c]);
+
+    assert_eq!(index.find_by_mtls_identity("CN=old").unwrap().id, "c1");
+    assert_eq!(index.find_by_mtls_identity("CN=new").unwrap().id, "c1");
+    assert!(index.find_by_mtls_identity("CN=other").is_none());
+}

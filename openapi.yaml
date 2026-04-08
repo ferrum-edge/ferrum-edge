@@ -628,11 +628,11 @@ paths:
 
     put:
       operationId: updateConsumerCredentials
-      summary: Set or update a credential
+      summary: Replace all credentials of a type
       description: |
-        Sets a credential on the consumer. For `basicauth`, a plaintext
-        `password` field is automatically bcrypt-hashed and stored as
-        `password_hash`.
+        Replaces the entire credential value for the given type. Accepts a single
+        JSON object or an array of objects. For `basicauth`, plaintext `password`
+        fields are automatically hashed and stored as `password_hash`.
       tags: [Consumers]
       requestBody:
         required: true
@@ -661,13 +661,88 @@ paths:
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
 
+    post:
+      operationId: appendConsumerCredential
+      summary: Append a credential entry for rotation
+      description: |
+        Appends a new credential entry to the given type, enabling zero-downtime
+        credential rotation. If the existing credential is a single object, it is
+        converted to an array. Max entries per type is controlled by
+        `FERRUM_MAX_CREDENTIALS_PER_TYPE` (default: 2). For `basicauth`, plaintext
+        `password` fields are automatically hashed.
+      tags: [Consumers]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              description: Single credential entry to append (must be a JSON object)
+      responses:
+        "200":
+          description: Credential appended — returns full consumer object
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Consumer"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
     delete:
       operationId: deleteConsumerCredentials
-      summary: Remove a credential
+      summary: Remove all credentials of a type
       tags: [Consumers]
       responses:
         "204":
           description: Credential removed
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /consumers/{consumer_id}/credentials/{cred_type}/{index}:
+    parameters:
+      - $ref: "#/components/parameters/ConsumerId"
+      - name: cred_type
+        in: path
+        required: true
+        schema:
+          type: string
+        description: Credential type (e.g. `keyauth`, `jwt`, `basicauth`).
+      - name: index
+        in: path
+        required: true
+        schema:
+          type: integer
+          minimum: 0
+        description: Zero-based index of the credential entry to remove.
+    delete:
+      operationId: deleteConsumerCredentialByIndex
+      summary: Remove a specific credential entry by index
+      description: |
+        Removes a single credential entry at the given index. When the array has
+        one remaining element after removal, it is collapsed back to a single
+        object. When a single-object credential exists, only index 0 is valid.
+      tags: [Consumers]
+      responses:
+        "200":
+          description: Credential entry removed — returns full consumer object
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Consumer"
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "404":
@@ -1475,19 +1550,30 @@ components:
           type: object
           default: {}
           additionalProperties:
-            type: object
+            oneOf:
+              - type: object
+                description: Single credential entry
+              - type: array
+                items:
+                  type: object
+                minItems: 1
+                description: Multiple credential entries for zero-downtime rotation
           description: |
-            Map of credential type to credential payload. Credential values that
-            serve as lookup keys must be unique across all consumers.
+            Map of credential type to credential payload. Each type maps to either
+            a single JSON object or an array of objects (for zero-downtime rotation).
+            Array elements must be JSON objects — non-object elements are rejected.
+            Credential values that serve as lookup keys must be unique across all
+            consumers and across all entries within arrays. Max entries per type is
+            controlled by `FERRUM_MAX_CREDENTIALS_PER_TYPE` (default: 2).
 
             | Type | Fields | Uniqueness |
             |------|--------|------------|
-            | `keyauth` | `key` | `key` must be globally unique |
+            | `keyauth` | `key` | Each `key` must be globally unique |
             | `basicauth` | `password` or `password_hash` (bcrypt/HMAC) | Indexed by consumer `username` (unique) |
-            | `mtls_auth` | `identity` | `identity` must be globally unique |
-            | `jwt_auth` | (identity from JWT claim) | Looked up by `username`, `id`, or `custom_id` |
+            | `mtls_auth` | `identity` | Each `identity` must be globally unique |
+            | `jwt` | `secret` | Looked up by `username`, `id`, or `custom_id`; all secrets tried |
             | `jwks_auth` | (identity from JWT claim) | Looked up by `username`, `id`, or `custom_id` (optional — consumer-less flow supported) |
-            | `hmac_auth` | `secret` | Looked up by username in Authorization header |
+            | `hmac_auth` | `secret` | Looked up by username in Authorization header; all secrets tried |
         acl_groups:
           type: array
           items:

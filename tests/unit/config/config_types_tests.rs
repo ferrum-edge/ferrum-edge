@@ -450,6 +450,173 @@ fn test_unique_consumer_credentials_mtls_different_identities_ok() {
     assert!(config.validate_unique_consumer_credentials().is_ok());
 }
 
+// ---- Multi-credential (array format) tests ----
+
+#[test]
+fn test_credential_entries_single_object() {
+    let mut c = make_consumer("c1", "alice");
+    c.credentials
+        .insert("keyauth".into(), serde_json::json!({"key": "abc"}));
+    let entries = c.credential_entries("keyauth");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].get("key").unwrap().as_str().unwrap(), "abc");
+}
+
+#[test]
+fn test_credential_entries_array() {
+    let mut c = make_consumer("c1", "alice");
+    c.credentials.insert(
+        "keyauth".into(),
+        serde_json::json!([{"key": "abc"}, {"key": "def"}]),
+    );
+    let entries = c.credential_entries("keyauth");
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0].get("key").unwrap().as_str().unwrap(), "abc");
+    assert_eq!(entries[1].get("key").unwrap().as_str().unwrap(), "def");
+}
+
+#[test]
+fn test_credential_entries_empty() {
+    let c = make_consumer("c1", "alice");
+    let entries = c.credential_entries("keyauth");
+    assert!(entries.is_empty());
+}
+
+#[test]
+fn test_credential_entries_filters_non_objects_in_array() {
+    let mut c = make_consumer("c1", "alice");
+    c.credentials.insert(
+        "keyauth".into(),
+        serde_json::json!([{"key": "abc"}, "not-an-object", 42]),
+    );
+    let entries = c.credential_entries("keyauth");
+    assert_eq!(entries.len(), 1);
+}
+
+#[test]
+fn test_has_credential_single_object() {
+    let mut c = make_consumer("c1", "alice");
+    c.credentials
+        .insert("keyauth".into(), serde_json::json!({"key": "abc"}));
+    assert!(c.has_credential("keyauth"));
+    assert!(!c.has_credential("jwt"));
+}
+
+#[test]
+fn test_has_credential_array() {
+    let mut c = make_consumer("c1", "alice");
+    c.credentials.insert(
+        "keyauth".into(),
+        serde_json::json!([{"key": "abc"}, {"key": "def"}]),
+    );
+    assert!(c.has_credential("keyauth"));
+}
+
+#[test]
+fn test_unique_credentials_array_duplicate_keyauth_across_consumers() {
+    let mut c1 = make_consumer("c1", "alice");
+    c1.credentials.insert(
+        "keyauth".into(),
+        serde_json::json!([{"key": "key-aaa"}, {"key": "key-bbb"}]),
+    );
+    let mut c2 = make_consumer("c2", "bob");
+    c2.credentials
+        .insert("keyauth".into(), serde_json::json!({"key": "key-bbb"}));
+    let mut config = empty_config();
+    config.consumers = vec![c1, c2];
+    let err = config.validate_unique_consumer_credentials().unwrap_err();
+    assert_eq!(err.len(), 1);
+    assert!(err[0].contains("Duplicate keyauth API key"));
+}
+
+#[test]
+fn test_unique_credentials_array_no_duplicate() {
+    let mut c1 = make_consumer("c1", "alice");
+    c1.credentials.insert(
+        "keyauth".into(),
+        serde_json::json!([{"key": "key-aaa"}, {"key": "key-bbb"}]),
+    );
+    let mut c2 = make_consumer("c2", "bob");
+    c2.credentials
+        .insert("keyauth".into(), serde_json::json!({"key": "key-ccc"}));
+    let mut config = empty_config();
+    config.consumers = vec![c1, c2];
+    assert!(config.validate_unique_consumer_credentials().is_ok());
+}
+
+#[test]
+fn test_unique_credentials_array_duplicate_mtls_across_consumers() {
+    let mut c1 = make_consumer("c1", "alice");
+    c1.credentials.insert(
+        "mtls_auth".into(),
+        serde_json::json!([{"identity": "CN=a"}, {"identity": "CN=b"}]),
+    );
+    let mut c2 = make_consumer("c2", "bob");
+    c2.credentials
+        .insert("mtls_auth".into(), serde_json::json!({"identity": "CN=b"}));
+    let mut config = empty_config();
+    config.consumers = vec![c1, c2];
+    let err = config.validate_unique_consumer_credentials().unwrap_err();
+    assert_eq!(err.len(), 1);
+    assert!(err[0].contains("Duplicate mtls_auth identity"));
+}
+
+#[test]
+fn test_validate_fields_array_credentials_within_limit() {
+    let mut c = make_consumer("c1", "alice");
+    c.credentials.insert(
+        "keyauth".into(),
+        serde_json::json!([{"key": "k1"}, {"key": "k2"}]),
+    );
+    assert!(c.validate_fields().is_ok());
+}
+
+#[test]
+fn test_validate_fields_array_credentials_exceeds_max_per_type() {
+    let mut c = make_consumer("c1", "alice");
+    let entries: Vec<serde_json::Value> = (0..10)
+        .map(|i| serde_json::json!({"key": format!("key-{}", i)}))
+        .collect();
+    c.credentials
+        .insert("keyauth".into(), serde_json::Value::Array(entries));
+    let err = c.validate_fields().unwrap_err();
+    assert!(err.iter().any(|e| e.contains("must not exceed")));
+}
+
+#[test]
+fn test_validate_fields_array_rejects_non_object_elements() {
+    let mut c = make_consumer("c1", "alice");
+    // Array of strings instead of objects — should be rejected
+    c.credentials.insert(
+        "keyauth".into(),
+        serde_json::json!(["rotated-key", "another-key"]),
+    );
+    let err = c.validate_fields().unwrap_err();
+    assert!(err.iter().any(|e| e.contains("must be a JSON object")));
+}
+
+#[test]
+fn test_validate_fields_array_rejects_empty_array() {
+    let mut c = make_consumer("c1", "alice");
+    c.credentials
+        .insert("keyauth".into(), serde_json::json!([]));
+    let err = c.validate_fields().unwrap_err();
+    assert!(err.iter().any(|e| e.contains("must not be empty")));
+}
+
+#[test]
+fn test_validate_fields_rejects_non_object_credential_value() {
+    let mut c = make_consumer("c1", "alice");
+    // Plain string instead of object or array
+    c.credentials
+        .insert("keyauth".into(), serde_json::json!("just-a-string"));
+    let err = c.validate_fields().unwrap_err();
+    assert!(
+        err.iter()
+            .any(|e| e.contains("must be a JSON object or array"))
+    );
+}
+
 // ---- Consumer identity uniqueness tests ----
 
 #[test]

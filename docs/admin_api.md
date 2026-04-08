@@ -99,16 +99,33 @@ curl -X POST -H "Authorization: Bearer $TOKEN" \
   -d '{"username": "alice", "credentials": {"keyauth": {"key": "my-key"}}}' \
   http://localhost:9000/consumers
 
-# Update consumer credentials
+# Replace all credentials of a type (PUT replaces entirely)
 curl -X PUT -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"key": "new-api-key"}' \
   http://localhost:9000/consumers/{consumer_id}/credentials/keyauth
 
-# Delete a credential type
+# Append a credential for zero-downtime rotation (POST adds to array)
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"key": "rotated-api-key"}' \
+  http://localhost:9000/consumers/{consumer_id}/credentials/keyauth
+
+# Delete a specific credential by index (0-based)
+curl -X DELETE -H "Authorization: Bearer $TOKEN" \
+  http://localhost:9000/consumers/{consumer_id}/credentials/keyauth/0
+
+# Delete all credentials of a type
 curl -X DELETE -H "Authorization: Bearer $TOKEN" \
   http://localhost:9000/consumers/{consumer_id}/credentials/keyauth
 ```
+
+Credential rotation workflow:
+1. `POST .../credentials/keyauth` with the new key — both old and new are now active
+2. Roll out the new key to all clients
+3. `DELETE .../credentials/keyauth/0` to remove the old key
+
+Max credentials per type is controlled by `FERRUM_MAX_CREDENTIALS_PER_TYPE` (default: 2).
 
 ## Plugin Configs
 

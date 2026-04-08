@@ -286,6 +286,10 @@ consumers:
     credentials:
       keyauth:
         key: "alice-api-key"
+      # Array format for zero-downtime credential rotation:
+      # keyauth:
+      #   - key: "alice-current-key"
+      #   - key: "alice-rotated-key"
 
 plugin_configs:
   - id: "log-plugin"
