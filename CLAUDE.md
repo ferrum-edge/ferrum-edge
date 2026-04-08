@@ -894,8 +894,8 @@ See `src/config/env_config.rs` for the full list of 90+ environment variables.
 
 ## Docker
 
-- **Dockerfile**: Multi-stage build (rust:latest builder + debian:bookworm-slim runtime) — for local `docker build .`
-- **Dockerfile.release**: Minimal runtime image using pre-built binaries with `TARGETARCH` for multi-arch CI builds — used by CI/CD workflows only
+- **Dockerfile**: Multi-stage build (rust:latest builder + debian:trixie-slim runtime) — for local `docker build .`
+- **Dockerfile.release**: Minimal runtime image (debian:trixie-slim) using pre-built binaries with `TARGETARCH` for multi-arch CI builds — used by CI/CD workflows only
 - **Exposed ports**: 8000, 8443 (proxy), 9000, 9443 (admin), 50051 (gRPC)
 - **Health check**: `curl -f http://localhost:9000/health`
 - **docker-compose.yml**: Profiles for `sqlite`, `postgres`, and `cp-dp` deployments

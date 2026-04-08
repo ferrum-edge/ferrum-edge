@@ -1,6 +1,6 @@
 # Minimal runtime image for pre-built binaries (used by CI/CD)
 # For local builds from source, use: docker build -f Dockerfile .
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 
 ARG TARGETARCH
 

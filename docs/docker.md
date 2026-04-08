@@ -35,7 +35,7 @@ docker build -t myregistry.azurecr.io/ferrum-edge:latest .
 The Dockerfile uses a **multi-stage build** for optimal size:
 
 1. **Builder Stage**: Compiles the Rust binary with all build dependencies
-2. **Runtime Stage**: Minimal Debian bookworm-slim image with only runtime dependencies
+2. **Runtime Stage**: Minimal Debian trixie-slim image with only runtime dependencies
 
 **Image Features**:
 - Non-root user execution (UID 1000)
