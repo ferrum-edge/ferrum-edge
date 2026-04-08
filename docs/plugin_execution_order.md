@@ -215,7 +215,7 @@ Priority bands are spaced with gaps so future plugins can slot in without renumb
 
 | Band | Priority Range | Purpose | Plugins |
 |------|---------------|---------|---------|
-| **Early** | 0–949 | Tracing, IDs, preflight, and request short-circuiting before auth | `otel_tracing` (25), `correlation_id` (50), `cors` (100), `request_termination` (125), `ip_restriction` (150), `bot_detection` (200), `sse` (250), `grpc_web` (260), `grpc_method_router` (275) |
+| **Early** | 0–949 | Tracing, IDs, preflight, and request short-circuiting before auth | `otel_tracing` (25), `correlation_id` (50), `cors` (100), `request_termination` (125), `ip_restriction` (150), `bot_detection` (200), `spec_expose` (210), `sse` (250), `grpc_web` (260), `grpc_method_router` (275) |
 | **AuthN** | 950–1999 | Authentication / identity verification | `mtls_auth` (950), `jwks_auth` (1000), `jwt_auth` (1100), `key_auth` (1200), `ldap_auth` (1250), `basic_auth` (1300), `hmac_auth` (1400), `soap_ws_security` (1500) |
 | **Admission** | 2000–2999 | Authorization, validation, and request admission control | `access_control` (2000), `tcp_connection_throttle` (2050), `request_size_limiting` (2800), `ws_message_size_limiting` (2810), `graphql` (2850), `rate_limiting` (2900), `ws_rate_limiting` (2910), `udp_rate_limiting` (2915), `ai_prompt_shield` (2925), `body_validator` (2950), `ai_request_guard` (2975) |
 | **Transform** | 3000–3999 | Request shaping and response buffering decisions | `request_transformer` (3000), `serverless_function` (3025), `response_mock` (3030), `grpc_deadline` (3050), `request_mirror` (3075), `response_size_limiting` (3490), `response_caching` (3500) |
@@ -235,50 +235,51 @@ Given all built-in plugins enabled, the execution order is:
 | 4 | `request_termination` | 125 | on_request_received |
 | 5 | `ip_restriction` | 150 | on_request_received, on_stream_connect |
 | 6 | `bot_detection` | 200 | on_request_received |
-| 7 | `sse` | 250 | on_request_received, before_proxy, after_proxy, transform_response_body |
-| 8 | `grpc_web` | 260 | on_request_received, before_proxy, transform_request_body, after_proxy, transform_response_body |
-| 9 | `grpc_method_router` | 275 | on_request_received, before_proxy |
-| 10 | `mtls_auth` | 950 | authenticate, on_stream_connect |
-| 11 | `jwks_auth` | 1000 | authenticate |
-| 12 | `jwt_auth` | 1100 | authenticate |
-| 13 | `key_auth` | 1200 | authenticate |
-| 14 | `ldap_auth` | 1250 | authenticate |
-| 15 | `basic_auth` | 1300 | authenticate |
-| 16 | `hmac_auth` | 1400 | authenticate |
-| 17 | `soap_ws_security` | 1500 | before_proxy |
-| 18 | `access_control` | 2000 | authorize, on_stream_connect |
-| 19 | `tcp_connection_throttle` | 2050 | on_stream_connect, on_stream_disconnect |
-| 20 | `request_size_limiting` | 2800 | on_request_received, before_proxy, on_final_request_body |
-| 21 | `ws_message_size_limiting` | 2810 | on_ws_frame |
-| 22 | `graphql` | 2850 | before_proxy |
-| 23 | `rate_limiting` | 2900 | on_request_received (IP mode), authorize (consumer mode), on_stream_connect |
-| 24 | `ws_rate_limiting` | 2910 | on_ws_frame |
-| 25 | `udp_rate_limiting` | 2915 | on_udp_datagram |
-| 26 | `ai_prompt_shield` | 2925 | before_proxy, transform_request_body |
-| 27 | `body_validator` | 2950 | before_proxy, on_final_request_body, on_final_response_body |
-| 28 | `ai_request_guard` | 2975 | before_proxy, transform_request_body |
-| 29 | `request_transformer` | 3000 | before_proxy, transform_request_body |
-| 30 | `serverless_function` | 3025 | before_proxy |
-| 31 | `response_mock` | 3030 | before_proxy |
-| 32 | `grpc_deadline` | 3050 | before_proxy |
-| 33 | `request_mirror` | 3075 | before_proxy |
-| 34 | `response_size_limiting` | 3490 | after_proxy, on_final_response_body |
-| 35 | `response_caching` | 3500 | before_proxy, after_proxy, on_final_response_body |
-| 36 | `response_transformer` | 4000 | after_proxy, transform_response_body |
-| 37 | `compression` | 4050 | before_proxy, after_proxy, transform_request_body, transform_response_body |
-| 38 | `ai_token_metrics` | 4100 | on_response_body |
-| 39 | `ai_rate_limiter` | 4200 | before_proxy, after_proxy, on_response_body |
-| 40 | `stdout_logging` | 9000 | log, on_stream_disconnect |
-| 41 | `ws_frame_logging` | 9050 | on_ws_frame |
-| 42 | `statsd_logging` | 9075 | log, on_stream_disconnect |
-| 43 | `http_logging` | 9100 | log, on_stream_disconnect |
-| 44 | `tcp_logging` | 9125 | log, on_stream_disconnect |
-| 45 | `kafka_logging` | 9150 | log, on_stream_disconnect |
-| 46 | `loki_logging` | 9155 | log, on_stream_disconnect |
-| 47 | `udp_logging` | 9160 | log, on_stream_disconnect |
-| 48 | `ws_logging` | 9175 | log, on_stream_disconnect |
-| 49 | `transaction_debugger` | 9200 | on_request_received, after_proxy, log, on_stream_disconnect |
-| 50 | `prometheus_metrics` | 9300 | log, on_stream_disconnect |
+| 7 | `spec_expose` | 210 | on_request_received |
+| 8 | `sse` | 250 | on_request_received, before_proxy, after_proxy, transform_response_body |
+| 9 | `grpc_web` | 260 | on_request_received, before_proxy, transform_request_body, after_proxy, transform_response_body |
+| 10 | `grpc_method_router` | 275 | on_request_received, before_proxy |
+| 11 | `mtls_auth` | 950 | authenticate, on_stream_connect |
+| 12 | `jwks_auth` | 1000 | authenticate |
+| 13 | `jwt_auth` | 1100 | authenticate |
+| 14 | `key_auth` | 1200 | authenticate |
+| 15 | `ldap_auth` | 1250 | authenticate |
+| 16 | `basic_auth` | 1300 | authenticate |
+| 17 | `hmac_auth` | 1400 | authenticate |
+| 18 | `soap_ws_security` | 1500 | before_proxy |
+| 19 | `access_control` | 2000 | authorize, on_stream_connect |
+| 20 | `tcp_connection_throttle` | 2050 | on_stream_connect, on_stream_disconnect |
+| 21 | `request_size_limiting` | 2800 | on_request_received, before_proxy, on_final_request_body |
+| 22 | `ws_message_size_limiting` | 2810 | on_ws_frame |
+| 23 | `graphql` | 2850 | before_proxy |
+| 24 | `rate_limiting` | 2900 | on_request_received (IP mode), authorize (consumer mode), on_stream_connect |
+| 25 | `ws_rate_limiting` | 2910 | on_ws_frame |
+| 26 | `udp_rate_limiting` | 2915 | on_udp_datagram |
+| 27 | `ai_prompt_shield` | 2925 | before_proxy, transform_request_body |
+| 28 | `body_validator` | 2950 | before_proxy, on_final_request_body, on_final_response_body |
+| 29 | `ai_request_guard` | 2975 | before_proxy, transform_request_body |
+| 30 | `request_transformer` | 3000 | before_proxy, transform_request_body |
+| 31 | `serverless_function` | 3025 | before_proxy |
+| 32 | `response_mock` | 3030 | before_proxy |
+| 33 | `grpc_deadline` | 3050 | before_proxy |
+| 34 | `request_mirror` | 3075 | before_proxy |
+| 35 | `response_size_limiting` | 3490 | after_proxy, on_final_response_body |
+| 36 | `response_caching` | 3500 | before_proxy, after_proxy, on_final_response_body |
+| 37 | `response_transformer` | 4000 | after_proxy, transform_response_body |
+| 38 | `compression` | 4050 | before_proxy, after_proxy, transform_request_body, transform_response_body |
+| 39 | `ai_token_metrics` | 4100 | on_response_body |
+| 40 | `ai_rate_limiter` | 4200 | before_proxy, after_proxy, on_response_body |
+| 41 | `stdout_logging` | 9000 | log, on_stream_disconnect |
+| 42 | `ws_frame_logging` | 9050 | on_ws_frame |
+| 43 | `statsd_logging` | 9075 | log, on_stream_disconnect |
+| 44 | `http_logging` | 9100 | log, on_stream_disconnect |
+| 45 | `tcp_logging` | 9125 | log, on_stream_disconnect |
+| 46 | `kafka_logging` | 9150 | log, on_stream_disconnect |
+| 47 | `loki_logging` | 9155 | log, on_stream_disconnect |
+| 48 | `udp_logging` | 9160 | log, on_stream_disconnect |
+| 49 | `ws_logging` | 9175 | log, on_stream_disconnect |
+| 50 | `transaction_debugger` | 9200 | on_request_received, after_proxy, log, on_stream_disconnect |
+| 51 | `prometheus_metrics` | 9300 | log, on_stream_disconnect |
 
 ## Why This Order Matters
 
@@ -303,6 +304,10 @@ Browser preflight (`OPTIONS`) requests must be answered before authentication. I
 ### Request termination runs immediately after CORS (priority 125)
 
 `request_termination` still short-circuits before authentication, but it now sits behind CORS so maintenance and mock responses do not break browser preflight. That keeps browser clients functional while preserving the low-cost fast path for intentionally terminated requests.
+
+### Spec expose runs after IP restriction and bot detection (priority 210)
+
+`spec_expose` intercepts `GET {listen_path}/specz` requests and returns the API specification document without proxying. It runs at priority 210 — after IP restriction (150) and bot detection (200) so blocked IPs and bots cannot access spec endpoints, but before all authentication plugins (950+). This makes the `/specz` endpoint unauthenticated by design, allowing legitimate API consumers to discover contracts without credentials while still enforcing network-level security policies.
 
 ### Authentication before authorization (1000s before 2000s)
 
@@ -456,6 +461,7 @@ TLS/DTLS are transport-layer concerns, not separate protocols. A plugin that sup
 | `serverless_function` | ✓ | ✓ | | | | Invokes cloud functions (AWS Lambda, Azure Functions, GCP Cloud Functions) |
 | `response_mock` | ✓ | ✓ | | | | Returns mock responses for API testing before backends are ready |
 | `body_validator` | ✓ | ✓ | | | | Validates request and response bodies |
+| `spec_expose` | ✓ | | | | | HTTP-only; requires prefix listen_path |
 | `request_termination` | ✓ | ✓ | ✓ | | | Returns HTTP error response |
 | `response_size_limiting` | ✓ | ✓ | | | | Enforces per-proxy response body size limits |
 | `response_transformer` | ✓ | ✓ | | | | Modifies HTTP response headers/body |

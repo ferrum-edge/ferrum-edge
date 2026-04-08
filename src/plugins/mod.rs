@@ -1,4 +1,4 @@
-//! Plugin system — 50 built-in plugins with a trait-based architecture.
+//! Plugin system — 51 built-in plugins with a trait-based architecture.
 //!
 //! Plugins execute in priority order (lower number = runs first) through
 //! lifecycle phases: `on_request_received` → `authenticate` → `authorize` →
@@ -52,6 +52,7 @@ pub mod response_size_limiting;
 pub mod response_transformer;
 pub mod serverless_function;
 pub mod soap_ws_security;
+pub mod spec_expose;
 pub mod sse;
 pub mod statsd_logging;
 pub mod stdout_logging;
@@ -562,6 +563,7 @@ pub mod priority {
     pub const CORS: u16 = 100;
     pub const IP_RESTRICTION: u16 = 150;
     pub const BOT_DETECTION: u16 = 200;
+    pub const SPEC_EXPOSE: u16 = 210;
     pub const SSE: u16 = 250;
     pub const GRPC_WEB: u16 = 260;
     pub const GRPC_METHOD_ROUTER: u16 = 275;
@@ -1078,6 +1080,10 @@ pub fn create_plugin_with_http_client(
         "udp_rate_limiting" => Ok(Some(Arc::new(udp_rate_limiting::UdpRateLimiting::new(
             config,
         )?))),
+        "spec_expose" => Ok(Some(Arc::new(spec_expose::SpecExpose::new(
+            config,
+            http_client,
+        )?))),
         _ => {
             // Fall through to custom plugins registry
             let result = crate::custom_plugins::create_custom_plugin(name, config, http_client)?;
@@ -1176,6 +1182,7 @@ pub fn available_plugins() -> Vec<&'static str> {
         "sse",
         "request_mirror",
         "soap_ws_security",
+        "spec_expose",
     ];
     plugins.extend(crate::custom_plugins::custom_plugin_names());
     plugins

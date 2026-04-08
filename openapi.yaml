@@ -743,6 +743,7 @@ paths:
                 - ldap_auth
                 - serverless_function
                 - soap_ws_security
+                - spec_expose
         "401":
           $ref: "#/components/responses/Unauthorized"
 
@@ -3663,6 +3664,22 @@ components:
         passthrough_on_no_match:
           type: boolean
           description: "If true, unmatched requests continue to the backend. If false (default), returns 404."
+
+    SpecExposeConfig:
+      type: object
+      description: "Plugin: spec_expose — Exposes API specification documents (OpenAPI, WSDL, WADL) on a /specz sub-path. Unauthenticated. Only works with prefix-based listen_path proxies (HTTP only)."
+      required:
+        - spec_url
+      properties:
+        spec_url:
+          type: string
+          description: Full URL to fetch the API specification document (e.g., https://internal-service/docs/openapi.yaml)
+        content_type:
+          type: string
+          description: "Override the response Content-Type. When omitted, the upstream response's Content-Type is passed through."
+        tls_no_verify:
+          type: boolean
+          description: "Skip TLS certificate verification when fetching the spec. Defaults to the gateway's FERRUM_TLS_NO_VERIFY setting."
 
     ResponseCachingConfig:
       type: object

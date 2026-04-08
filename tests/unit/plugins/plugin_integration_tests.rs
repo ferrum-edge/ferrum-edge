@@ -233,6 +233,7 @@ async fn test_all_plugins_available() {
         "request_mirror",
         "kafka_logging",
         "soap_ws_security",
+        "spec_expose",
     ]
     .into_iter()
     .collect();
@@ -297,6 +298,7 @@ async fn test_plugin_creation_all_plugins() {
             }),
             "cors" => json!({"origins": ["*"]}),
             "response_caching" => json!({"ttl_seconds": 60}),
+            "spec_expose" => json!({"spec_url": "https://example.com/openapi.yaml"}),
             _ => json!({}),
         };
         let plugin = create_plugin(plugin_name, &config);

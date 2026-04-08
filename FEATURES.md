@@ -56,7 +56,7 @@ Ferrum supports dynamic upstream target discovery through three providers, confi
 
 ## Plugin System
 
-- 50 built-in plugins with lifecycle hooks (request received, authenticate, authorize, before proxy, after proxy, on final request/response body, on response body, on WebSocket frame, on UDP datagram, log)
+- 51 built-in plugins with lifecycle hooks (request received, authenticate, authorize, before proxy, after proxy, on final request/response body, on response body, on WebSocket frame, on UDP datagram, log)
 - Priority-ordered execution with protocol-aware filtering (HTTP, gRPC, WebSocket, TCP, UDP)
 - Multiple instances of the same plugin type per proxy (e.g., two `http_logging` for Splunk and Datadog) with optional `priority_override` for execution order control
 - Global and per-proxy scoping — proxy-scoped plugins replace global plugins of the same name
@@ -114,6 +114,10 @@ Ferrum supports dynamic upstream target discovery through three providers, confi
 ### Response Mock Plugin
 
 - **Response Mock** — returns configurable mock responses without proxying to the backend. Mock rule paths are relative to the proxy's `listen_path`, so rules are scoped to the proxy they're configured on. Supports matching by HTTP method and path pattern (exact or regex with `~` prefix), configurable status codes, headers, body, and optional latency simulation via `delay_ms`. When `passthrough_on_no_match` is true, unmatched requests continue to the real backend. Useful for early API testing, contract testing, and local development
+
+### Spec Expose Plugin
+
+- **Spec Expose** — exposes API specification documents (OpenAPI, Swagger, WSDL, WADL) on a `/specz` sub-path of each proxy's listen path. Fetches the spec from a configured upstream URL and returns it to the caller with the upstream's `Content-Type` preserved. The `/specz` endpoint is unauthenticated — the plugin short-circuits before authentication runs, so consumers can discover API contracts without credentials. Supports per-plugin TLS verification skip for internal endpoints with self-signed certificates. Only works with prefix-based `listen_path` proxies. Inspired by [kong-spec-expose](https://github.com/Optum/kong-spec-expose)
 
 ### SSE Plugin
 

@@ -47,6 +47,7 @@ mod response_size_limiting_tests;
 mod response_transformer_tests;
 mod serverless_function_tests;
 mod soap_ws_security_tests;
+mod spec_expose_tests;
 mod sse_tests;
 mod statsd_logging_tests;
 mod stdout_logging_tests;

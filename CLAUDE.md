@@ -4,7 +4,7 @@ This file provides context for Claude Code when working on the Ferrum Edge codeb
 
 ## Project Overview
 
-Ferrum Edge is a high-performance edge proxy built in Rust. It supports HTTP/1.1, HTTP/2, HTTP/3 (QUIC), WebSocket, gRPC, and raw TCP/UDP stream proxying with a plugin architecture (50 built-in plugins including 4 AI/LLM-specific plugins, 1 serverless function plugin, 1 response mock plugin, 1 compression plugin, 1 SSE stream handler plugin, 3 gRPC-specific plugins, 3 WebSocket frame-level plugins, 1 WebSocket logging plugin, 1 UDP datagram-level plugin, 1 Loki logging plugin, 1 UDP logging plugin, 1 Kafka logging plugin, and 1 SOAP WS-Security plugin), four operating modes, and load balancing with health checks.
+Ferrum Edge is a high-performance edge proxy built in Rust. It supports HTTP/1.1, HTTP/2, HTTP/3 (QUIC), WebSocket, gRPC, and raw TCP/UDP stream proxying with a plugin architecture (51 built-in plugins including 4 AI/LLM-specific plugins, 1 serverless function plugin, 1 response mock plugin, 1 spec expose plugin, 1 compression plugin, 1 SSE stream handler plugin, 3 gRPC-specific plugins, 3 WebSocket frame-level plugins, 1 WebSocket logging plugin, 1 UDP datagram-level plugin, 1 Loki logging plugin, 1 UDP logging plugin, 1 Kafka logging plugin, and 1 SOAP WS-Security plugin), four operating modes, and load balancing with health checks.
 
 - **Language**: Rust (edition 2024)
 - **Async runtime**: tokio + hyper 1.0
@@ -211,7 +211,7 @@ src/
 │   ├── tcp_proxy.rs           # Raw TCP stream proxy with TLS termination/origination/passthrough
 │   ├── udp_proxy.rs           # UDP datagram proxy with per-client session tracking, DTLS frontend/backend/passthrough
 │   └── stream_listener.rs     # Stream listener lifecycle manager (reconcile on config reload, port pre-bind check)
-├── plugins/                   # Plugin system (50 plugins, including 4 AI/LLM, 1 serverless, 1 response mock, 1 compression, 1 SSE, 3 gRPC, 3 WS frame, 1 WS logging, 1 UDP datagram, 1 Loki logging, 1 UDP logging, 1 Kafka logging, and 1 SOAP WS-Security plugin)
+├── plugins/                   # Plugin system (51 plugins, including 4 AI/LLM, 1 serverless, 1 response mock, 1 spec expose, 1 compression, 1 SSE, 3 gRPC, 3 WS frame, 1 WS logging, 1 UDP datagram, 1 Loki logging, 1 UDP logging, 1 Kafka logging, and 1 SOAP WS-Security plugin)
 │   ├── mod.rs                 # Plugin trait, registry, priority constants, lifecycle
 │   ├── [plugin_name].rs       # Individual plugin implementations
 │   └── utils/                 # Shared plugin infrastructure
@@ -364,7 +364,7 @@ Plugins execute in priority order (lower number = runs first). Multiple instance
 
 The lifecycle phases are:
 
-1. `on_request_received` — OTel tracing (25), correlation ID (50), CORS preflight (100), request termination (125), IP restriction (150), bot detection (200), SSE validation (250), gRPC-Web translation (260), gRPC method router (275)
+1. `on_request_received` — OTel tracing (25), correlation ID (50), CORS preflight (100), request termination (125), IP restriction (150), bot detection (200), spec expose (210), SSE validation (250), gRPC-Web translation (260), gRPC method router (275)
 2. `authenticate` — mTLS auth (950), JWKS auth (1000), JWT auth (1100), key auth (1200), basic auth (1300), HMAC auth (1400)
 3. `authorize` — Access control / ACL (2000), TCP connection throttle (2050). Supports consumer username and ACL group allow/deny lists, plus `allow_authenticated_identity` for external JWKS/OIDC identities without consumer mapping
 4. `before_proxy` — SSE request shaping (250), SOAP WS-Security (1500), Request size limiting (2800), GraphQL (2850), rate limiting (2900), AI prompt shield (2925), body validator (2950), AI request guard (2975), request transformer (3000), serverless function (3025), response mock (3030), gRPC deadline (3050), compression (4050)

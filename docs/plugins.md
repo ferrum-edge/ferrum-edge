@@ -1,6 +1,6 @@
 # Plugin Reference
 
-Ferrum Edge includes 50 built-in plugins organized into lifecycle phases. Each plugin executes at a specific priority (lower number = runs first).
+Ferrum Edge includes 51 built-in plugins organized into lifecycle phases. Each plugin executes at a specific priority (lower number = runs first).
 
 For execution order, protocol support matrix, and design rationale, see [plugin_execution_order.md](plugin_execution_order.md).
 
@@ -1656,6 +1656,41 @@ config:
 ```
 
 Rules are evaluated in order — first match wins. Regex paths use the same `~` prefix and auto-anchoring as `listen_path` patterns. A request to exactly the listen_path (e.g., `/api/v1` with no trailing path) is matched as `/`. When `passthrough_on_no_match` is `false` (default), requests that don't match any rule receive a `404` with `{"error":"no mock rule matched"}`. When `true`, unmatched requests continue to the real backend — useful for mocking only some endpoints while the rest hit the backend.
+
+### `spec_expose`
+
+Exposes API specification documents (OpenAPI, Swagger, WSDL, WADL) on a `/specz` sub-path of each proxy's listen path. When a `GET` request arrives at `{listen_path}/specz`, the plugin fetches the specification from the configured upstream URL and returns it to the caller. The `/specz` endpoint is **unauthenticated** — the plugin short-circuits in the `on_request_received` phase before authentication runs, so consumers can discover API contracts without credentials.
+
+Useful for providing a common, discoverable pattern for API specifications across enterprise-wide APIs.
+
+**Priority:** 210 | **Phase:** `on_request_received` | **Protocols:** HTTP only
+
+**Only works with prefix-based `listen_path` proxies.** Regex listen paths (`~` prefix) are skipped — the plugin continues without intercepting. Host-only or port-only routing is not supported.
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `spec_url` | String | _(required)_ | Full URL to fetch the API specification document (e.g., `https://internal-service/docs/openapi.yaml`) |
+| `content_type` | String | _(upstream)_ | Override the response `Content-Type`. When omitted, the upstream response's `Content-Type` is passed through (so YAML specs return as YAML, JSON as JSON, etc.) |
+| `tls_no_verify` | bool | `FERRUM_TLS_NO_VERIFY` | Skip TLS certificate verification when fetching the spec. Defaults to the gateway's global `FERRUM_TLS_NO_VERIFY` setting. Useful for internal endpoints with self-signed certificates |
+
+```yaml
+# Example: Expose an OpenAPI spec for an API behind /my/api/v1
+# GET https://gateway.com/my/api/v1/specz → fetches and returns the spec
+config:
+  spec_url: "https://internal-service.corp.net/docs/openapi.yaml"
+```
+
+```yaml
+# Example: Override content-type and skip TLS verification
+config:
+  spec_url: "https://10.0.1.50:8443/api/swagger.json"
+  content_type: "application/json"
+  tls_no_verify: true
+```
+
+**Error handling:** If the upstream spec URL is unreachable or returns a non-2xx status, the plugin returns a `502` JSON error response with details. The `spec_url` hostname is pre-warmed via DNS at startup alongside other backend hostnames.
+
+**Interaction with other plugins:** The plugin runs at priority 210 — after CORS (100), IP restriction (150), and bot detection (200), but before all authentication plugins (950+). This means blocked IPs and bots cannot access `/specz`, CORS preflight responses work correctly for browser-based spec consumers, and all authentication and authorization plugins are skipped for `/specz` requests.
 
 ---
 
