@@ -208,20 +208,22 @@ impl Plugin for UdpRateLimiting {
         let state = entry.value();
 
         // Check if we've moved to a new window — reset counters via CAS.
-        let stored_epoch = state.window_epoch.load(Ordering::Relaxed);
+        // Uses Acquire on load and Release on CAS success + stores so that
+        // the zeroed counters are visible to all threads before they increment.
+        let stored_epoch = state.window_epoch.load(Ordering::Acquire);
         if current_epoch > stored_epoch
             && state
                 .window_epoch
                 .compare_exchange(
                     stored_epoch,
                     current_epoch,
-                    Ordering::Relaxed,
+                    Ordering::Release,
                     Ordering::Relaxed,
                 )
                 .is_ok()
         {
-            state.count.store(0, Ordering::Relaxed);
-            state.bytes.store(0, Ordering::Relaxed);
+            state.count.store(0, Ordering::Release);
+            state.bytes.store(0, Ordering::Release);
         }
 
         // Update last-check time for staleness tracking.
@@ -229,11 +231,12 @@ impl Plugin for UdpRateLimiting {
             *last = Instant::now();
         }
 
-        // Increment counters.
-        let new_count = state.count.fetch_add(1, Ordering::Relaxed) + 1;
+        // Increment counters. Acquire ordering ensures we see the most
+        // recent counter reset before adding.
+        let new_count = state.count.fetch_add(1, Ordering::AcqRel) + 1;
         let new_bytes = state
             .bytes
-            .fetch_add(ctx.datagram_size as u64, Ordering::Relaxed)
+            .fetch_add(ctx.datagram_size as u64, Ordering::AcqRel)
             + ctx.datagram_size as u64;
 
         // Check limits.

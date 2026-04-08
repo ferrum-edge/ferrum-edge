@@ -417,10 +417,19 @@ impl SoapWsSecurity {
 
     // ── Nonce replay protection ─────────────────────────────────────────
 
-    fn check_nonce_replay(&self, nonce: &str) -> Result<(), String> {
+    /// Check if a nonce has been seen before within the TTL window.
+    /// Inserts the nonce into the cache if not a replay.
+    pub fn check_nonce_replay(&self, nonce: &str) -> Result<(), String> {
         // Evict expired entries if cache is at capacity
         if self.nonce_cache.len() >= self.max_nonce_cache_size {
             self.evict_expired_nonces();
+        }
+
+        // Hard cap: if still at capacity after evicting expired entries,
+        // evict oldest entries to prevent unbounded memory growth under
+        // floods of unique fresh nonces.
+        if self.nonce_cache.len() >= self.max_nonce_cache_size {
+            self.evict_oldest_nonces();
         }
 
         let now = Instant::now();
@@ -445,6 +454,21 @@ impl SoapWsSecurity {
         let ttl_secs = self.nonce_cache_ttl_seconds;
         self.nonce_cache
             .retain(|_, entry| now.duration_since(entry.inserted_at).as_secs() < ttl_secs);
+    }
+
+    /// Evict oldest entries when the cache is full and no expired entries remain.
+    /// Removes 10% of entries (by insertion time) to amortize the eviction cost.
+    fn evict_oldest_nonces(&self) {
+        let to_remove = (self.max_nonce_cache_size / 10).max(1);
+        let mut entries: Vec<(String, Instant)> = self
+            .nonce_cache
+            .iter()
+            .map(|entry| (entry.key().clone(), entry.value().inserted_at))
+            .collect();
+        entries.sort_by_key(|(_, inserted_at)| *inserted_at);
+        for (key, _) in entries.into_iter().take(to_remove) {
+            self.nonce_cache.remove(&key);
+        }
     }
 
     // ── X.509 signature verification ────────────────────────────────────

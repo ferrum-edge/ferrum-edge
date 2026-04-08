@@ -161,28 +161,59 @@ impl JwksAuth {
                 let store = get_or_create_jwks_store(uri, &http_client, refresh_interval);
                 jwks_store_slot.store(Arc::new(Some(store)));
             } else if let Some(ref disc_url) = discovery_url {
-                // OIDC discovery — resolve jwks_uri asynchronously
+                // OIDC discovery — resolve jwks_uri asynchronously with
+                // indefinite retries. The background task keeps trying with
+                // exponential backoff (2s → 4s → … → 5min cap) until discovery
+                // succeeds. Once resolved, the JwksKeyStore's own background
+                // refresh task takes over for periodic key rotation.
+                //
+                // This ensures a prolonged IdP outage during gateway startup
+                // does not permanently disable the provider — it self-heals
+                // as soon as the IdP comes back.
+                //
+                // Auth behavior while discovery is pending: tokens destined
+                // for this provider are rejected with 401 (fail closed).
                 let slot = jwks_store_slot.clone();
                 let client = http_client.clone();
                 let url = disc_url.clone();
                 let interval = refresh_interval;
                 tokio::spawn(async move {
-                    match discover_jwks_uri(&client, &url).await {
-                        Ok(uri) => {
-                            info!("jwks_auth OIDC discovery: resolved jwks_uri={}", uri);
-                            let store = get_or_create_jwks_store(&uri, &client, interval);
-                            // Eagerly fetch keys before making the store visible
-                            if let Err(e) = store.fetch_keys().await {
-                                warn!("jwks_auth OIDC: initial JWKS fetch failed: {}", e);
-                            }
-                            slot.store(Arc::new(Some(store)));
-                        }
-                        Err(e) => {
+                    const INITIAL_BACKOFF_SECS: u64 = 2;
+                    const MAX_BACKOFF_SECS: u64 = 300;
+
+                    let mut attempt: u32 = 0;
+                    loop {
+                        if attempt > 0 {
+                            let backoff_secs = INITIAL_BACKOFF_SECS
+                                .saturating_mul(1u64 << (attempt - 1).min(7))
+                                .min(MAX_BACKOFF_SECS);
+                            let backoff = Duration::from_secs(backoff_secs);
                             warn!(
-                                "jwks_auth OIDC discovery failed: {} — provider will be unavailable",
-                                e
+                                "jwks_auth OIDC discovery attempt {} failed — retrying in {:?}",
+                                attempt, backoff
                             );
+                            tokio::time::sleep(backoff).await;
                         }
+                        match discover_jwks_uri(&client, &url).await {
+                            Ok(uri) => {
+                                info!("jwks_auth OIDC discovery: resolved jwks_uri={}", uri);
+                                let store = get_or_create_jwks_store(&uri, &client, interval);
+                                if let Err(e) = store.fetch_keys().await {
+                                    warn!("jwks_auth OIDC: initial JWKS fetch failed: {}", e);
+                                }
+                                slot.store(Arc::new(Some(store)));
+                                return;
+                            }
+                            Err(e) => {
+                                if attempt == 0 {
+                                    warn!(
+                                        "jwks_auth OIDC discovery failed: {} — will keep retrying in background",
+                                        e
+                                    );
+                                }
+                            }
+                        }
+                        attempt = attempt.saturating_add(1);
                     }
                 });
             }

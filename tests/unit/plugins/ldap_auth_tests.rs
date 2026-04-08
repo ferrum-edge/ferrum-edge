@@ -474,3 +474,63 @@ fn test_ldap_auth_in_available_plugins() {
     let plugins = ferrum_edge::plugins::available_plugins();
     assert!(plugins.contains(&"ldap_auth"));
 }
+
+// ─── LDAP escaping tests ─────────────────────────────────────────────────
+
+use ferrum_edge::plugins::ldap_auth::{escape_dn_value, escape_filter_value};
+
+// ── DN escaping (RFC 4514) ──────────────────────────────────────────
+
+#[test]
+fn test_dn_escape_plain_username() {
+    assert_eq!(escape_dn_value("alice"), "alice");
+}
+
+#[test]
+fn test_dn_escape_special_chars() {
+    assert_eq!(escape_dn_value("a,b+c\"d"), "a\\,b\\+c\\\"d");
+}
+
+#[test]
+fn test_dn_escape_backslash_angle_semi() {
+    assert_eq!(escape_dn_value("a\\b<c>d;e"), "a\\\\b\\<c\\>d\\;e");
+}
+
+#[test]
+fn test_dn_escape_leading_space() {
+    assert_eq!(escape_dn_value(" alice"), "\\ alice");
+}
+
+#[test]
+fn test_dn_escape_trailing_space() {
+    assert_eq!(escape_dn_value("alice "), "alice\\ ");
+}
+
+#[test]
+fn test_dn_escape_leading_hash() {
+    assert_eq!(escape_dn_value("#alice"), "\\#alice");
+}
+
+// ── Filter escaping (RFC 4515) ──────────────────────────────────────
+
+#[test]
+fn test_filter_escape_plain_username() {
+    assert_eq!(escape_filter_value("alice"), "alice");
+}
+
+#[test]
+fn test_filter_escape_special_chars() {
+    assert_eq!(escape_filter_value("a*b(c)d\\e"), "a\\2ab\\28c\\29d\\5ce");
+}
+
+#[test]
+fn test_filter_escape_nul() {
+    assert_eq!(escape_filter_value("a\0b"), "a\\00b");
+}
+
+#[test]
+fn test_filter_escape_injection_attempt() {
+    // Attacker tries: username = "admin)(objectClass=*"
+    let escaped = escape_filter_value("admin)(objectClass=*");
+    assert_eq!(escaped, "admin\\29\\28objectClass=\\2a");
+}

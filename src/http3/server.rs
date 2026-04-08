@@ -726,6 +726,10 @@ async fn handle_h3_request(
             plugin.requires_request_body_before_before_proxy()
                 && plugin.should_buffer_request_body(&ctx)
         });
+    let h3_needs_body_bytes = needs_request_body_before_before_proxy
+        && plugins
+            .iter()
+            .any(|plugin| plugin.needs_request_body_bytes());
 
     let mut prebuffered_body_data = if needs_request_body_before_before_proxy {
         let mut body_data = Vec::new();
@@ -745,7 +749,7 @@ async fn handle_h3_request(
             }
             body_data.extend_from_slice(bytes);
         }
-        crate::proxy::store_request_body_metadata(&mut ctx, &body_data);
+        crate::proxy::store_request_body_metadata(&mut ctx, &body_data, h3_needs_body_bytes);
         Some(body_data)
     } else {
         None

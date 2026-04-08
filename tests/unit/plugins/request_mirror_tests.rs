@@ -452,3 +452,72 @@ async fn test_mirror_captures_proxy_context() {
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     plugin_utils::assert_continue(result);
 }
+
+// === Binary body preservation ===
+
+#[tokio::test]
+async fn test_mirror_uses_binary_body_bytes_over_metadata() {
+    let plugin = RequestMirror::new(
+        &json!({
+            "mirror_host": "mirror.local",
+            "mirror_request_body": true,
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = make_ctx_with_proxy();
+
+    // Simulate non-UTF-8 body (e.g., gRPC protobuf):
+    // request_body metadata is absent (not valid UTF-8), but request_body_bytes is set
+    let binary_body: Vec<u8> = vec![0x00, 0x01, 0xFF, 0xFE, 0x80, 0x90];
+    ctx.request_body_bytes = Some(bytes::Bytes::from(binary_body.clone()));
+    // Ensure the UTF-8 metadata key is NOT set (simulates store_request_body_metadata
+    // with non-UTF-8 data)
+    ctx.metadata.remove("request_body");
+
+    let mut headers: HashMap<String, String> = HashMap::new();
+
+    // The plugin should read from request_body_bytes (binary-safe) rather than
+    // the missing metadata key. This fires the mirror task — we verify it doesn't
+    // panic and completes without error.
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    plugin_utils::assert_continue(result);
+
+    // Mirror result receiver should be set (mirror was dispatched)
+    assert!(
+        ctx.mirror_result_rx.is_some(),
+        "Mirror should be dispatched even with binary body"
+    );
+}
+
+#[tokio::test]
+async fn test_mirror_falls_back_to_metadata_when_no_body_bytes() {
+    let plugin = RequestMirror::new(
+        &json!({
+            "mirror_host": "mirror.local",
+            "mirror_request_body": true,
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = make_ctx_with_proxy();
+
+    // Only the UTF-8 metadata key is set (legacy/normal path)
+    ctx.metadata.insert(
+        "request_body".to_string(),
+        r#"{"hello":"world"}"#.to_string(),
+    );
+    ctx.request_body_bytes = None;
+
+    let mut headers: HashMap<String, String> = HashMap::new();
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    plugin_utils::assert_continue(result);
+
+    assert!(
+        ctx.mirror_result_rx.is_some(),
+        "Mirror should be dispatched using metadata fallback"
+    );
+}

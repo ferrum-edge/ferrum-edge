@@ -1202,6 +1202,8 @@ plugins:
 
 The plugin sets `ctx.authenticated_identity` to the LDAP username. When `consumer_mapping` is enabled (default), it also attempts to find a matching gateway Consumer for ACL and rate-limiting integration.
 
+**Input escaping:** Usernames are automatically escaped before interpolation into LDAP queries — DN values are escaped per RFC 4514 and filter values per RFC 4515. This prevents LDAP injection attacks from usernames containing special characters like `*`, `(`, `)`, `\`, `,`, or `=`.
+
 ### `soap_ws_security`
 
 Validates WS-Security headers in SOAP XML envelopes. Supports UsernameToken authentication (PasswordText and PasswordDigest), X.509 certificate signature verification, optional SAML assertion validation, timestamp freshness checks, and nonce replay protection.
@@ -1949,6 +1951,7 @@ Behavior:
 - Backend `Vary` is honored automatically. If the origin returns `Vary: Accept-Encoding`, compressed and uncompressed representations are cached separately.
 - Conditional requests are served from cache. Matching `If-None-Match` or `If-Modified-Since` requests return `304 Not Modified` directly from the edge cache when a fresh cached validator exists.
 - Responses with `Authorization` on the request are not shared-cached unless the backend explicitly allows it via `Cache-Control: public`, `must-revalidate`, or `s-maxage`, or you partition the key with `cache_key_include_consumer: true`.
+- **Responses containing `Set-Cookie` headers are never cached.** Set-Cookie headers are per-client and replaying them from a shared cache would leak session cookies to other users (RFC 7234 §8).
 - The plugin stores arbitrary response bytes, so binary responses and backend-compressed payloads can be cached safely.
 
 Compression note:
@@ -2101,6 +2104,8 @@ Mirror response metadata (status code, response size, latency) is logged as a se
 | `mirror_path` | String | _(none)_ | Override the request path for the mirror. When unset, uses the original request path |
 | `percentage` | Float | `100.0` | Percentage of requests to mirror (0.0–100.0) |
 | `mirror_request_body` | Boolean | `true` | Whether to include the request body in the mirror request |
+
+When `mirror_request_body` is enabled, the plugin preserves binary payloads (including gRPC protobuf) using a binary-safe body store. Non-UTF-8 request bodies are mirrored correctly.
 
 ```yaml
 plugin_name: request_mirror

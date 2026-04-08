@@ -631,6 +631,14 @@ impl Plugin for ResponseCaching {
             return PluginResult::Continue;
         }
 
+        // Never cache responses with Set-Cookie headers. These are
+        // per-client and replaying them from a shared cache would leak
+        // session cookies to other users (RFC 7234 §8).
+        if response_headers.contains_key("set-cookie") {
+            debug!("response_caching: skipping cache — response contains Set-Cookie header");
+            return PluginResult::Continue;
+        }
+
         if !self.shared_cache_allows_authorized_response(ctx, directives) {
             return PluginResult::Continue;
         }

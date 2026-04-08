@@ -927,3 +927,49 @@ async fn test_empty_body_rejects() {
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(is_reject(&result));
 }
+
+// ── Nonce cache cap enforcement tests ───────────────────────────────────────
+
+#[test]
+fn test_nonce_cache_enforces_max_size_by_evicting_oldest() {
+    let max_size: usize = 20;
+    let plugin = SoapWsSecurity::new(&json!({
+        "timestamp": { "require": true },
+        "nonce": { "max_cache_size": max_size, "ttl_seconds": 300 },
+        "reject_missing_security_header": false
+    }))
+    .unwrap();
+
+    // Insert nonces well past the cap
+    for i in 0..(max_size + 50) {
+        let nonce = format!("nonce-{}", i);
+        let _ = plugin.check_nonce_replay(&nonce);
+    }
+
+    // The oldest nonces should have been evicted to enforce the cap.
+    // Verify by checking that the first nonce is no longer tracked as a replay.
+    assert!(
+        plugin.check_nonce_replay("nonce-0").is_ok(),
+        "nonce-0 should have been evicted by cap enforcement"
+    );
+
+    // But recent nonces should still be detected as replays
+    let last_nonce = format!("nonce-{}", max_size + 49);
+    assert!(
+        plugin.check_nonce_replay(&last_nonce).is_err(),
+        "most recent nonce should still be in cache"
+    );
+}
+
+#[test]
+fn test_nonce_replay_detected_via_direct_api() {
+    let plugin = SoapWsSecurity::new(&json!({
+        "timestamp": { "require": true },
+        "nonce": { "max_cache_size": 100, "ttl_seconds": 300 },
+        "reject_missing_security_header": false
+    }))
+    .unwrap();
+
+    assert!(plugin.check_nonce_replay("unique-nonce").is_ok());
+    assert!(plugin.check_nonce_replay("unique-nonce").is_err());
+}
