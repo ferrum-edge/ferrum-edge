@@ -255,6 +255,9 @@ pub(crate) fn store_request_body_metadata(ctx: &mut RequestContext, body: &[u8])
     } else {
         ctx.metadata.remove("request_body");
     }
+    // Store binary-safe copy for plugins that need raw bytes (e.g., request_mirror
+    // with gRPC protobuf bodies that are not valid UTF-8).
+    ctx.request_body_bytes = Some(bytes::Bytes::copy_from_slice(body));
 }
 
 /// Parse an HTTP method string into a `hyper::Method`.

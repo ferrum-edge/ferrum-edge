@@ -1020,3 +1020,65 @@ async fn test_total_size_limit_uses_saturating_add() {
     );
     assert_eq!(ctx.metadata.get("cache_status").unwrap(), "MISS");
 }
+
+// === Set-Cookie safety ===
+
+#[tokio::test]
+async fn test_set_cookie_response_not_cached() {
+    let plugin = default_plugin();
+
+    // Cache a response that contains Set-Cookie
+    let mut response_headers = HashMap::new();
+    response_headers.insert("content-type".to_string(), "application/json".to_string());
+    response_headers.insert(
+        "set-cookie".to_string(),
+        "session=abc123; Path=/; HttpOnly".to_string(),
+    );
+
+    cache_response(
+        &plugin,
+        "GET",
+        "/api/login",
+        200,
+        &response_headers,
+        b"user-specific-data",
+    )
+    .await;
+
+    // Second request should be a MISS — Set-Cookie responses must not be cached
+    let mut ctx = make_ctx("GET", "/api/login");
+    let mut headers = HashMap::new();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "Response with Set-Cookie header must not be cached"
+    );
+    assert_eq!(ctx.metadata.get("cache_status").unwrap(), "MISS");
+}
+
+#[tokio::test]
+async fn test_response_without_set_cookie_still_cached() {
+    let plugin = default_plugin();
+
+    let mut response_headers = HashMap::new();
+    response_headers.insert("content-type".to_string(), "application/json".to_string());
+
+    cache_response(
+        &plugin,
+        "GET",
+        "/api/public",
+        200,
+        &response_headers,
+        b"public-data",
+    )
+    .await;
+
+    // Second request should be a HIT — no Set-Cookie, normal caching
+    let mut ctx = make_ctx("GET", "/api/public");
+    let mut headers = HashMap::new();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(
+        is_reject(&result),
+        "Response without Set-Cookie should be cached normally"
+    );
+}

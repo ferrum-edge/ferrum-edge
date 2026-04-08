@@ -225,6 +225,11 @@ pub struct RequestContext {
     /// Set by the plugin in `before_proxy`; collected before building
     /// `TransactionSummary` so all logging plugins receive mirror results.
     pub mirror_result_rx: Option<tokio::sync::watch::Receiver<Option<MirrorResponseMeta>>>,
+    /// Binary-safe request body bytes, populated when a plugin requires the
+    /// body before `before_proxy` (e.g., `request_mirror`). Unlike the
+    /// `"request_body"` metadata key (UTF-8 only), this preserves non-UTF-8
+    /// payloads such as gRPC protobuf.
+    pub request_body_bytes: Option<bytes::Bytes>,
 }
 
 impl RequestContext {
@@ -245,6 +250,7 @@ impl RequestContext {
             tls_client_cert_chain_der: None,
             plugin_http_call_ns: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             mirror_result_rx: None,
+            request_body_bytes: None,
         }
     }
 

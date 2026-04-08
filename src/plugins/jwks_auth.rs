@@ -161,29 +161,47 @@ impl JwksAuth {
                 let store = get_or_create_jwks_store(uri, &http_client, refresh_interval);
                 jwks_store_slot.store(Arc::new(Some(store)));
             } else if let Some(ref disc_url) = discovery_url {
-                // OIDC discovery — resolve jwks_uri asynchronously
+                // OIDC discovery — resolve jwks_uri asynchronously with retries.
+                // Transient failures (network blip, IdP restart) should not
+                // permanently disable the provider.
                 let slot = jwks_store_slot.clone();
                 let client = http_client.clone();
                 let url = disc_url.clone();
                 let interval = refresh_interval;
                 tokio::spawn(async move {
-                    match discover_jwks_uri(&client, &url).await {
-                        Ok(uri) => {
-                            info!("jwks_auth OIDC discovery: resolved jwks_uri={}", uri);
-                            let store = get_or_create_jwks_store(&uri, &client, interval);
-                            // Eagerly fetch keys before making the store visible
-                            if let Err(e) = store.fetch_keys().await {
-                                warn!("jwks_auth OIDC: initial JWKS fetch failed: {}", e);
-                            }
-                            slot.store(Arc::new(Some(store)));
-                        }
-                        Err(e) => {
+                    const MAX_RETRIES: u32 = 5;
+                    const INITIAL_BACKOFF_SECS: u64 = 2;
+
+                    let mut last_err = String::new();
+                    for attempt in 0..=MAX_RETRIES {
+                        if attempt > 0 {
+                            let backoff =
+                                Duration::from_secs(INITIAL_BACKOFF_SECS << (attempt - 1).min(4));
                             warn!(
-                                "jwks_auth OIDC discovery failed: {} — provider will be unavailable",
-                                e
+                                "jwks_auth OIDC discovery attempt {}/{} failed: {} — retrying in {:?}",
+                                attempt, MAX_RETRIES, last_err, backoff
                             );
+                            tokio::time::sleep(backoff).await;
+                        }
+                        match discover_jwks_uri(&client, &url).await {
+                            Ok(uri) => {
+                                info!("jwks_auth OIDC discovery: resolved jwks_uri={}", uri);
+                                let store = get_or_create_jwks_store(&uri, &client, interval);
+                                if let Err(e) = store.fetch_keys().await {
+                                    warn!("jwks_auth OIDC: initial JWKS fetch failed: {}", e);
+                                }
+                                slot.store(Arc::new(Some(store)));
+                                return;
+                            }
+                            Err(e) => {
+                                last_err = e;
+                            }
                         }
                     }
+                    warn!(
+                        "jwks_auth OIDC discovery failed after {} retries: {} — provider will be unavailable until gateway restart",
+                        MAX_RETRIES, last_err
+                    );
                 });
             }
 

@@ -423,6 +423,13 @@ impl SoapWsSecurity {
             self.evict_expired_nonces();
         }
 
+        // Hard cap: if still at capacity after evicting expired entries,
+        // evict oldest entries to prevent unbounded memory growth under
+        // floods of unique fresh nonces.
+        if self.nonce_cache.len() >= self.max_nonce_cache_size {
+            self.evict_oldest_nonces();
+        }
+
         let now = Instant::now();
 
         // Check if nonce was already seen
@@ -445,6 +452,21 @@ impl SoapWsSecurity {
         let ttl_secs = self.nonce_cache_ttl_seconds;
         self.nonce_cache
             .retain(|_, entry| now.duration_since(entry.inserted_at).as_secs() < ttl_secs);
+    }
+
+    /// Evict oldest entries when the cache is full and no expired entries remain.
+    /// Removes 10% of entries (by insertion time) to amortize the eviction cost.
+    fn evict_oldest_nonces(&self) {
+        let to_remove = (self.max_nonce_cache_size / 10).max(1);
+        let mut entries: Vec<(String, Instant)> = self
+            .nonce_cache
+            .iter()
+            .map(|entry| (entry.key().clone(), entry.value().inserted_at))
+            .collect();
+        entries.sort_by_key(|(_, inserted_at)| *inserted_at);
+        for (key, _) in entries.into_iter().take(to_remove) {
+            self.nonce_cache.remove(&key);
+        }
     }
 
     // ── X.509 signature verification ────────────────────────────────────
@@ -1178,4 +1200,65 @@ fn escape_xml_chars(s: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&apos;")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_nonce_only_plugin(max_size: usize) -> SoapWsSecurity {
+        SoapWsSecurity {
+            require_timestamp: false,
+            timestamp_max_age_seconds: 300,
+            timestamp_require_expires: false,
+            clock_skew_seconds: 300,
+            username_token_enabled: false,
+            password_type: PasswordType::PasswordText,
+            credentials: Vec::new(),
+            x509_enabled: false,
+            trusted_certs: Vec::new(),
+            allowed_signature_algorithms: Vec::new(),
+            require_signed_timestamp: false,
+            saml_enabled: false,
+            saml_trusted_issuers: Vec::new(),
+            saml_audience: None,
+            saml_clock_skew_seconds: 300,
+            nonce_cache: Arc::new(DashMap::new()),
+            nonce_cache_ttl_seconds: 300,
+            max_nonce_cache_size: max_size,
+            reject_missing_security_header: false,
+        }
+    }
+
+    #[test]
+    fn test_nonce_cache_enforces_max_size() {
+        let max = 20;
+        let plugin = make_nonce_only_plugin(max);
+
+        // Fill past max with unique nonces
+        for i in 0..(max + 50) {
+            let nonce = format!("nonce-{}", i);
+            let _ = plugin.check_nonce_replay(&nonce);
+        }
+
+        // After each insert the cap is enforced, so the cache should never
+        // exceed max_size + 1 (the newly inserted entry).
+        assert!(
+            plugin.nonce_cache.len() <= max + 1,
+            "nonce cache size {} exceeds cap {}",
+            plugin.nonce_cache.len(),
+            max + 1
+        );
+    }
+
+    #[test]
+    fn test_nonce_replay_still_detected_after_eviction() {
+        let plugin = make_nonce_only_plugin(100);
+
+        // Insert a nonce
+        assert!(plugin.check_nonce_replay("unique-nonce").is_ok());
+
+        // Same nonce should be rejected (replay)
+        assert!(plugin.check_nonce_replay("unique-nonce").is_err());
+    }
 }

@@ -229,11 +229,18 @@ impl Plugin for RequestMirror {
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
 
-        // Capture request body if configured and available
+        // Capture request body if configured and available.
+        // Uses the binary-safe `request_body_bytes` field (preserves non-UTF-8
+        // payloads like gRPC protobuf), falling back to the UTF-8 metadata key.
         let body_bytes: Option<Vec<u8>> = if self.mirror_request_body {
-            ctx.metadata
-                .get("request_body")
-                .map(|b| b.as_bytes().to_vec())
+            ctx.request_body_bytes
+                .as_ref()
+                .map(|b| b.to_vec())
+                .or_else(|| {
+                    ctx.metadata
+                        .get("request_body")
+                        .map(|b| b.as_bytes().to_vec())
+                })
         } else {
             None
         };

@@ -320,8 +320,8 @@ impl LdapAuth {
         let mut ldap = self.connect().await?;
 
         let user_dn = if let Some(ref template) = self.bind_dn_template {
-            // Direct bind: substitute username into template
-            let dn = template.replace("{username}", username);
+            // Direct bind: substitute DN-escaped username into template (RFC 4514)
+            let dn = template.replace("{username}", &escape_dn_value(username));
             ldap.simple_bind(&dn, password)
                 .await
                 .map_err(|e| format!("ldap_auth: bind failed: {e}"))?
@@ -344,7 +344,7 @@ impl LdapAuth {
                 .search_filter
                 .as_deref()
                 .unwrap_or_default()
-                .replace("{username}", username);
+                .replace("{username}", &escape_filter_value(username));
 
             let (rs, _result) = ldap
                 .search(search_base, Scope::Subtree, &filter, vec!["dn"])
@@ -387,15 +387,19 @@ impl LdapAuth {
 
         let group_base = self.group_base_dn.as_deref().unwrap_or_default();
 
-        // Default filter checks both `member` (AD/static groups) and `memberUid` (posixGroup)
-        let default_filter =
-            format!("(|(member={user_dn})(uniqueMember={user_dn})(memberUid={username}))");
+        // Default filter checks both `member` (AD/static groups) and `memberUid` (posixGroup).
+        // DN values in filters must be filter-escaped (RFC 4515), not DN-escaped.
+        let escaped_user_dn = escape_filter_value(user_dn);
+        let escaped_username = escape_filter_value(username);
+        let default_filter = format!(
+            "(|(member={escaped_user_dn})(uniqueMember={escaped_user_dn})(memberUid={escaped_username}))"
+        );
         let filter = self
             .group_filter
             .as_ref()
             .map(|f| {
-                f.replace("{user_dn}", user_dn)
-                    .replace("{username}", username)
+                f.replace("{user_dn}", &escaped_user_dn)
+                    .replace("{username}", &escaped_username)
             })
             .unwrap_or(default_filter);
 
@@ -508,6 +512,42 @@ fn build_ldap_tls_connector(
     builder
         .build()
         .map_err(|e| format!("ldap_auth: failed to build TLS connector: {e}"))
+}
+
+/// Escape a string for use in an LDAP DN value (RFC 4514 §2.4).
+///
+/// Characters that have special meaning in a DN — `,`, `+`, `"`, `\`, `<`, `>`, `;`
+/// — are backslash-escaped. Leading/trailing spaces and a leading `#` are also escaped.
+fn escape_dn_value(input: &str) -> String {
+    let mut out = String::with_capacity(input.len() + 8);
+    for (i, ch) in input.chars().enumerate() {
+        let needs_escape = matches!(ch, ',' | '+' | '"' | '\\' | '<' | '>' | ';')
+            || (i == 0 && (ch == ' ' || ch == '#'))
+            || (i == input.len() - 1 && ch == ' ');
+        if needs_escape {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// Escape a string for use in an LDAP search filter value (RFC 4515 §3).
+///
+/// The five characters `*`, `(`, `)`, `\`, and NUL are hex-escaped as `\xx`.
+fn escape_filter_value(input: &str) -> String {
+    let mut out = String::with_capacity(input.len() + 8);
+    for byte in input.bytes() {
+        match byte {
+            b'*' => out.push_str("\\2a"),
+            b'(' => out.push_str("\\28"),
+            b')' => out.push_str("\\29"),
+            b'\\' => out.push_str("\\5c"),
+            0x00 => out.push_str("\\00"),
+            _ => out.push(byte as char),
+        }
+    }
+    out
 }
 
 /// Extract the CN value from a distinguished name.
@@ -690,5 +730,67 @@ impl LdapAuth {
             );
             ctx.identified_consumer = Some(consumer);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── DN escaping (RFC 4514) ──────────────────────────────────────────
+
+    #[test]
+    fn test_dn_escape_plain_username() {
+        assert_eq!(escape_dn_value("alice"), "alice");
+    }
+
+    #[test]
+    fn test_dn_escape_special_chars() {
+        assert_eq!(escape_dn_value("a,b+c\"d"), "a\\,b\\+c\\\"d");
+    }
+
+    #[test]
+    fn test_dn_escape_backslash_angle_semi() {
+        assert_eq!(escape_dn_value("a\\b<c>d;e"), "a\\\\b\\<c\\>d\\;e");
+    }
+
+    #[test]
+    fn test_dn_escape_leading_space() {
+        assert_eq!(escape_dn_value(" alice"), "\\ alice");
+    }
+
+    #[test]
+    fn test_dn_escape_trailing_space() {
+        assert_eq!(escape_dn_value("alice "), "alice\\ ");
+    }
+
+    #[test]
+    fn test_dn_escape_leading_hash() {
+        assert_eq!(escape_dn_value("#alice"), "\\#alice");
+    }
+
+    // ── Filter escaping (RFC 4515) ──────────────────────────────────────
+
+    #[test]
+    fn test_filter_escape_plain_username() {
+        assert_eq!(escape_filter_value("alice"), "alice");
+    }
+
+    #[test]
+    fn test_filter_escape_special_chars() {
+        assert_eq!(escape_filter_value("a*b(c)d\\e"), "a\\2ab\\28c\\29d\\5ce");
+    }
+
+    #[test]
+    fn test_filter_escape_nul() {
+        assert_eq!(escape_filter_value("a\0b"), "a\\00b");
+    }
+
+    #[test]
+    fn test_filter_escape_injection_attempt() {
+        // Attacker tries: username = "admin)(objectClass=*"
+        let escaped = escape_filter_value("admin)(objectClass=*");
+        assert_eq!(escaped, "admin\\29\\28objectClass=\\2a");
+        // When substituted: (&(uid=admin\29\28objectClass=\2a)) — safe
     }
 }
