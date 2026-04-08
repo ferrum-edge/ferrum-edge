@@ -1661,7 +1661,7 @@ Rules are evaluated in order — first match wins. Regex paths use the same `~` 
 
 Exposes API specification documents (OpenAPI, Swagger, WSDL, WADL) on a `/specz` sub-path of each proxy's listen path. When a `GET` request arrives at `{listen_path}/specz`, the plugin fetches the specification from the configured upstream URL and returns it to the caller. The `/specz` endpoint is **unauthenticated** — the plugin short-circuits in the `on_request_received` phase before authentication runs, so consumers can discover API contracts without credentials.
 
-Inspired by [kong-spec-expose](https://github.com/Optum/kong-spec-expose). Useful for providing a common, discoverable pattern for API specifications across enterprise-wide APIs.
+Useful for providing a common, discoverable pattern for API specifications across enterprise-wide APIs.
 
 **Priority:** 210 | **Phase:** `on_request_received` | **Protocols:** HTTP only
 
