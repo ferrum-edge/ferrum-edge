@@ -49,6 +49,17 @@ pub const MAX_PLUGIN_CONFIG_SIZE: usize = 1_048_576; // 1 MiB
 pub const MAX_CREDENTIALS_SIZE: usize = 65_536; // 64 KiB
 /// Maximum length for individual credential string values (API keys, secrets, identities).
 pub const MAX_CREDENTIAL_VALUE_LENGTH: usize = 4096;
+/// Default maximum number of credential entries per type (for zero-downtime rotation).
+/// Overridable at runtime via `FERRUM_MAX_CREDENTIALS_PER_TYPE` env var / conf file.
+pub const DEFAULT_MAX_CREDENTIALS_PER_TYPE: usize = 2;
+
+/// Resolve the runtime max credentials per type from env var / conf file, falling
+/// back to `DEFAULT_MAX_CREDENTIALS_PER_TYPE` if unset or unparsable.
+pub fn max_credentials_per_type() -> usize {
+    crate::config::conf_file::resolve_ferrum_var("FERRUM_MAX_CREDENTIALS_PER_TYPE")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_MAX_CREDENTIALS_PER_TYPE)
+}
 /// Maximum number of ACL groups per consumer.
 pub const MAX_ACL_GROUPS_PER_CONSUMER: usize = 500;
 /// Maximum length for an ACL group name.
@@ -1140,19 +1151,21 @@ impl GatewayConfig {
         let mut duplicates = Vec::new();
 
         for consumer in &self.consumers {
-            if let Some(key_creds) = consumer.credentials.get("keyauth")
-                && let Some(key) = key_creds.get("key").and_then(|s| s.as_str())
-                && let Some(existing_id) = seen_keyauth.insert(key, &consumer.id)
-            {
-                // Do NOT include the API key value in the error message for security
-                duplicates.push(format!(
-                    "Duplicate keyauth API key in consumer '{}' (conflicts with consumer '{}')",
-                    consumer.id, existing_id
-                ));
+            // Check all keyauth entries (supports both single object and array)
+            for entry in consumer.credential_entries("keyauth") {
+                if let Some(key) = entry.get("key").and_then(|s| s.as_str())
+                    && let Some(existing_id) = seen_keyauth.insert(key, &consumer.id)
+                {
+                    // Do NOT include the API key value in the error message for security
+                    duplicates.push(format!(
+                        "Duplicate keyauth API key in consumer '{}' (conflicts with consumer '{}')",
+                        consumer.id, existing_id
+                    ));
+                }
             }
 
             // basicauth consumers are indexed by username — duplicates cause silent overwrite
-            if consumer.credentials.contains_key("basicauth")
+            if consumer.has_credential("basicauth")
                 && let Some(existing_id) = seen_basicauth.insert(&consumer.username, &consumer.id)
             {
                 duplicates.push(format!(
@@ -1161,15 +1174,16 @@ impl GatewayConfig {
                 ));
             }
 
-            // mTLS consumers are indexed by identity — duplicates cause silent overwrite
-            if let Some(mtls_creds) = consumer.credentials.get("mtls_auth")
-                && let Some(identity) = mtls_creds.get("identity").and_then(|s| s.as_str())
-                && let Some(existing_id) = seen_mtls.insert(identity, &consumer.id)
-            {
-                duplicates.push(format!(
-                    "Duplicate mtls_auth identity '{}' in consumer '{}' (conflicts with consumer '{}')",
-                    identity, consumer.id, existing_id
-                ));
+            // Check all mTLS entries (supports both single object and array)
+            for entry in consumer.credential_entries("mtls_auth") {
+                if let Some(identity) = entry.get("identity").and_then(|s| s.as_str())
+                    && let Some(existing_id) = seen_mtls.insert(identity, &consumer.id)
+                {
+                    duplicates.push(format!(
+                        "Duplicate mtls_auth identity '{}' in consumer '{}' (conflicts with consumer '{}')",
+                        identity, consumer.id, existing_id
+                    ));
+                }
             }
         }
 
@@ -2243,6 +2257,31 @@ impl Proxy {
 }
 
 impl Consumer {
+    /// Returns all credential entries for a given type, normalizing both
+    /// single-object and array-of-objects formats for backward compatibility.
+    ///
+    /// - `{"keyauth": {"key": "abc"}}` → `vec![&{"key": "abc"}]`
+    /// - `{"keyauth": [{"key": "abc"}, {"key": "def"}]}` → `vec![&{"key": "abc"}, &{"key": "def"}]`
+    ///
+    /// Called on cold paths (index build) and semi-hot paths (after O(1) consumer
+    /// lookup, iterating 1-2 entries). Non-object array elements are filtered out.
+    pub fn credential_entries(&self, cred_type: &str) -> Vec<&serde_json::Value> {
+        match self.credentials.get(cred_type) {
+            Some(serde_json::Value::Array(arr)) => arr.iter().filter(|v| v.is_object()).collect(),
+            Some(val) if val.is_object() => vec![val],
+            _ => vec![],
+        }
+    }
+
+    /// Returns true if the consumer has any credentials of the given type.
+    pub fn has_credential(&self, cred_type: &str) -> bool {
+        match self.credentials.get(cred_type) {
+            Some(serde_json::Value::Array(arr)) => arr.iter().any(|v| v.is_object()),
+            Some(val) => val.is_object(),
+            None => false,
+        }
+    }
+
     /// Normalize consumer fields to their canonical in-memory form.
     pub fn normalize_fields(&mut self) {
         if self
@@ -2300,18 +2339,41 @@ impl Consumer {
             ));
         }
 
-        // Validate individual credential values
+        // Validate individual credential values (supports both single object and array formats)
         for (cred_type, cred_value) in &self.credentials {
             if let Err(e) = validate_string_field("credential type", cred_type, 64) {
                 errors.push(e);
             }
-            if let Some(obj) = cred_value.as_object() {
-                for (key, val) in obj {
+            // Collect objects to validate: either a single object or array elements
+            let objects: Vec<&serde_json::Map<String, serde_json::Value>> =
+                if let Some(arr) = cred_value.as_array() {
+                    let limit = max_credentials_per_type();
+                    if arr.len() > limit {
+                        errors.push(format!(
+                            "credentials.{} array must not exceed {} entries (got {})",
+                            cred_type,
+                            limit,
+                            arr.len()
+                        ));
+                    }
+                    arr.iter().filter_map(|v| v.as_object()).collect()
+                } else if let Some(obj) = cred_value.as_object() {
+                    vec![obj]
+                } else {
+                    vec![]
+                };
+            for (idx, obj) in objects.iter().enumerate() {
+                let prefix = if cred_value.is_array() {
+                    format!("credentials.{}[{}]", cred_type, idx)
+                } else {
+                    format!("credentials.{}", cred_type)
+                };
+                for (key, val) in *obj {
                     if let Some(s) = val.as_str() {
                         if s.len() > MAX_CREDENTIAL_VALUE_LENGTH {
                             errors.push(format!(
-                                "credentials.{}.{} must not exceed {} characters (got {})",
-                                cred_type,
+                                "{}.{} must not exceed {} characters (got {})",
+                                prefix,
                                 key,
                                 MAX_CREDENTIAL_VALUE_LENGTH,
                                 s.len()
@@ -2319,8 +2381,8 @@ impl Consumer {
                         }
                         if contains_control_chars(s) {
                             errors.push(format!(
-                                "credentials.{}.{} must not contain control characters",
-                                cred_type, key
+                                "{}.{} must not contain control characters",
+                                prefix, key
                             ));
                         }
                     }

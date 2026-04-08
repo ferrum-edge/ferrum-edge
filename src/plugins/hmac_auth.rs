@@ -210,60 +210,42 @@ impl Plugin for HmacAuth {
             }
         };
 
-        // Get HMAC secret from consumer credentials
-        let secret = match consumer.credentials.get("hmac_auth") {
-            Some(cred) => match cred.get("secret").and_then(|s| s.as_str()) {
-                Some(s) => s.to_string(),
-                None => {
-                    return PluginResult::Reject {
-                        status_code: 401,
-                        body: r#"{"error":"Invalid credentials"}"#.to_string(),
-                        headers: HashMap::new(),
-                    };
-                }
-            },
-            None => {
-                return PluginResult::Reject {
-                    status_code: 401,
-                    body: r#"{"error":"Invalid credentials"}"#.to_string(),
-                    headers: HashMap::new(),
-                };
-            }
-        };
-
-        // Build the signing string: METHOD\nPATH\nDATE
-        let signing_string = format!("{}\n{}\n{}", ctx.method, ctx.path, date);
-
-        // Compute expected signature using the requested algorithm
-        let expected_mac =
-            match Self::compute_hmac(secret.as_bytes(), signing_string.as_bytes(), &algorithm) {
-                Some(mac) => mac,
-                None => {
-                    warn!("hmac_auth: failed to create HMAC for user '{}'", username);
-                    return PluginResult::Reject {
-                        status_code: 401,
-                        body: r#"{"error":"Invalid credentials"}"#.to_string(),
-                        headers: HashMap::new(),
-                    };
-                }
-            };
-        let expected_sig = base64::engine::general_purpose::STANDARD.encode(&expected_mac);
-
-        // Constant-time comparison to prevent timing attacks
-        if !Self::constant_time_eq(signature.as_bytes(), expected_sig.as_bytes()) {
-            debug!("hmac_auth: signature mismatch for user '{}'", username);
+        // Try all HMAC secrets for this consumer (supports multiple credentials
+        // per type for zero-downtime rotation). First matching signature wins.
+        let hmac_entries = consumer.credential_entries("hmac_auth");
+        if hmac_entries.is_empty() {
             return PluginResult::Reject {
                 status_code: 401,
-                body: r#"{"error":"Invalid signature"}"#.to_string(),
+                body: r#"{"error":"Invalid credentials"}"#.to_string(),
                 headers: HashMap::new(),
             };
         }
 
-        // Authentication successful
-        if ctx.identified_consumer.is_none() {
-            debug!("hmac_auth: identified consumer '{}'", consumer.username);
-            ctx.identified_consumer = Some(consumer);
+        // Build the signing string: METHOD\nPATH\nDATE
+        let signing_string = format!("{}\n{}\n{}", ctx.method, ctx.path, date);
+
+        for hmac_cred in &hmac_entries {
+            if let Some(secret) = hmac_cred.get("secret").and_then(|s| s.as_str())
+                && let Some(expected_mac) =
+                    Self::compute_hmac(secret.as_bytes(), signing_string.as_bytes(), &algorithm)
+            {
+                let expected_sig = base64::engine::general_purpose::STANDARD.encode(&expected_mac);
+                // Constant-time comparison to prevent timing attacks
+                if Self::constant_time_eq(signature.as_bytes(), expected_sig.as_bytes()) {
+                    if ctx.identified_consumer.is_none() {
+                        debug!("hmac_auth: identified consumer '{}'", consumer.username);
+                        ctx.identified_consumer = Some(consumer);
+                    }
+                    return PluginResult::Continue;
+                }
+            }
         }
-        PluginResult::Continue
+
+        debug!("hmac_auth: signature mismatch for user '{}'", username);
+        PluginResult::Reject {
+            status_code: 401,
+            body: r#"{"error":"Invalid signature"}"#.to_string(),
+            headers: HashMap::new(),
+        }
     }
 }

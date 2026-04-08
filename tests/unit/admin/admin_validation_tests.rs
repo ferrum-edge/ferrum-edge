@@ -158,3 +158,67 @@ fn test_redact_empty_credentials() {
     let redacted = ferrum_edge::admin::redact_consumer_credentials(&consumer);
     assert!(redacted.credentials.is_empty());
 }
+
+// ---- Multi-credential array redaction tests ----
+
+#[test]
+fn test_redact_array_jwt_secrets() {
+    let mut credentials = std::collections::HashMap::new();
+    credentials.insert(
+        "jwt".to_string(),
+        json!([
+            {"secret": "old-secret", "algorithm": "HS256"},
+            {"secret": "new-secret", "algorithm": "HS256"}
+        ]),
+    );
+    let consumer = make_consumer(credentials);
+
+    let redacted = ferrum_edge::admin::redact_consumer_credentials(&consumer);
+    let jwt = redacted.credentials.get("jwt").unwrap();
+    let arr = jwt.as_array().unwrap();
+    assert_eq!(arr.len(), 2);
+    assert_eq!(arr[0]["secret"], "[REDACTED]");
+    assert_eq!(arr[0]["algorithm"], "HS256");
+    assert_eq!(arr[1]["secret"], "[REDACTED]");
+    assert_eq!(arr[1]["algorithm"], "HS256");
+}
+
+#[test]
+fn test_redact_array_basicauth_passwords() {
+    let mut credentials = std::collections::HashMap::new();
+    credentials.insert(
+        "basicauth".to_string(),
+        json!([
+            {"password_hash": "hash-old"},
+            {"password_hash": "hash-new"}
+        ]),
+    );
+    let consumer = make_consumer(credentials);
+
+    let redacted = ferrum_edge::admin::redact_consumer_credentials(&consumer);
+    let basic = redacted.credentials.get("basicauth").unwrap();
+    let arr = basic.as_array().unwrap();
+    assert_eq!(arr.len(), 2);
+    assert_eq!(arr[0]["password_hash"], "[REDACTED]");
+    assert_eq!(arr[1]["password_hash"], "[REDACTED]");
+}
+
+#[test]
+fn test_redact_array_hmac_secrets() {
+    let mut credentials = std::collections::HashMap::new();
+    credentials.insert(
+        "hmac_auth".to_string(),
+        json!([
+            {"secret": "secret-1"},
+            {"secret": "secret-2"}
+        ]),
+    );
+    let consumer = make_consumer(credentials);
+
+    let redacted = ferrum_edge::admin::redact_consumer_credentials(&consumer);
+    let hmac = redacted.credentials.get("hmac_auth").unwrap();
+    let arr = hmac.as_array().unwrap();
+    assert_eq!(arr.len(), 2);
+    assert_eq!(arr[0]["secret"], "[REDACTED]");
+    assert_eq!(arr[1]["secret"], "[REDACTED]");
+}

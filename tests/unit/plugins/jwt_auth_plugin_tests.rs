@@ -4,6 +4,11 @@ use ferrum_edge::ConsumerIndex;
 use ferrum_edge::plugins::{Plugin, RequestContext, jwt_auth::JwtAuth};
 use serde_json::json;
 
+use chrono::Utc;
+use ferrum_edge::config::types::Consumer;
+use serde_json::Value;
+use std::collections::HashMap;
+
 use super::plugin_utils::{assert_continue, assert_reject, create_test_consumer};
 
 fn make_ctx() -> RequestContext {
@@ -251,6 +256,71 @@ async fn test_jwt_auth_malformed_token() {
     let mut ctx = make_ctx();
     ctx.headers
         .insert("authorization".to_string(), "Bearer not.a.jwt".to_string());
+
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
+    assert_reject(result, Some(401));
+}
+
+// ---- Multi-credential rotation tests ----
+
+fn make_consumer_with_jwt_secrets(secrets: &[&str]) -> Consumer {
+    let mut credentials = HashMap::new();
+    let arr: Vec<Value> = secrets.iter().map(|s| json!({"secret": s})).collect();
+    credentials.insert("jwt".to_string(), Value::Array(arr));
+
+    Consumer {
+        id: "test-consumer".to_string(),
+        username: "testuser".to_string(),
+        custom_id: Some("custom-123".to_string()),
+        credentials,
+        acl_groups: Vec::new(),
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    }
+}
+
+#[tokio::test]
+async fn test_jwt_auth_multi_secret_old_secret_still_works() {
+    let plugin = JwtAuth::new(&json!({})).unwrap();
+    let consumer = make_consumer_with_jwt_secrets(&["old-secret", "new-secret"]);
+    let consumer_index = ConsumerIndex::new(&[consumer]);
+
+    let token = create_jwt_token(&json!({"sub": "testuser"}), "old-secret");
+    let mut ctx = make_ctx();
+    ctx.headers
+        .insert("authorization".to_string(), format!("Bearer {}", token));
+
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
+    assert_continue(result);
+    assert_eq!(ctx.identified_consumer.unwrap().username, "testuser");
+}
+
+#[tokio::test]
+async fn test_jwt_auth_multi_secret_new_secret_works() {
+    let plugin = JwtAuth::new(&json!({})).unwrap();
+    let consumer = make_consumer_with_jwt_secrets(&["old-secret", "new-secret"]);
+    let consumer_index = ConsumerIndex::new(&[consumer]);
+
+    let token = create_jwt_token(&json!({"sub": "testuser"}), "new-secret");
+    let mut ctx = make_ctx();
+    ctx.headers
+        .insert("authorization".to_string(), format!("Bearer {}", token));
+
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
+    assert_continue(result);
+    assert_eq!(ctx.identified_consumer.unwrap().username, "testuser");
+}
+
+#[tokio::test]
+async fn test_jwt_auth_multi_secret_wrong_secret_rejected() {
+    let plugin = JwtAuth::new(&json!({})).unwrap();
+    let consumer = make_consumer_with_jwt_secrets(&["secret-a", "secret-b"]);
+    let consumer_index = ConsumerIndex::new(&[consumer]);
+
+    let token = create_jwt_token(&json!({"sub": "testuser"}), "wrong-secret");
+    let mut ctx = make_ctx();
+    ctx.headers
+        .insert("authorization".to_string(), format!("Bearer {}", token));
 
     let result = plugin.authenticate(&mut ctx, &consumer_index).await;
     assert_reject(result, Some(401));

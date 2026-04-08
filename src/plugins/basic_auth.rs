@@ -182,17 +182,20 @@ impl Plugin for BasicAuth {
         let username = parts[0];
         let password = parts[1];
 
-        // O(1) lookup by username via ConsumerIndex
-        if let Some(consumer) = consumer_index.find_by_username(username)
-            && let Some(basic_creds) = consumer.credentials.get("basicauth")
-            && let Some(stored_hash) = basic_creds.get("password_hash").and_then(|s| s.as_str())
-            && self.verify_password(password, stored_hash)
-        {
-            if ctx.identified_consumer.is_none() {
-                debug!("basic_auth: identified consumer '{}'", consumer.username);
-                ctx.identified_consumer = Some(consumer);
+        // O(1) lookup by username via ConsumerIndex, then try all password hashes
+        // (supports multiple credentials per type for zero-downtime rotation)
+        if let Some(consumer) = consumer_index.find_by_username(username) {
+            for basic_creds in consumer.credential_entries("basicauth") {
+                if let Some(stored_hash) = basic_creds.get("password_hash").and_then(|s| s.as_str())
+                    && self.verify_password(password, stored_hash)
+                {
+                    if ctx.identified_consumer.is_none() {
+                        debug!("basic_auth: identified consumer '{}'", consumer.username);
+                        ctx.identified_consumer = Some(consumer);
+                    }
+                    return PluginResult::Continue;
+                }
             }
-            return PluginResult::Continue;
         }
 
         PluginResult::Reject {

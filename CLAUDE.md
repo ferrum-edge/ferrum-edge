@@ -227,7 +227,7 @@ src/
 ├── connection_pool.rs         # HTTP client connection pooling with mTLS (thread-local pool keys for zero-alloc cache hits)
 ├── router_cache.rs            # Pre-sorted route table with host+path routing, LPM path cache, and full-path-anchored regex routes
 ├── plugin_cache.rs            # Plugin config cache (O(1) lookup by proxy_id)
-├── consumer_index.rs          # Consumer lookup index (O(1) by credential type)
+├── consumer_index.rs          # Consumer lookup index (O(1) by credential type, multi-credential aware)
 ├── config_delta.rs            # Incremental config updates for CP/DP
 ├── dtls/                      # DTLS support (frontend termination, backend origination, cert helpers)
 ├── dns/                       # DNS resolution with caching, stale-while-revalidate, background refresh
@@ -251,7 +251,7 @@ src/
 |------|-------------|------------|
 | `GatewayConfig` | Top-level config container | proxies, consumers, upstreams, plugins |
 | `Proxy` | A route + backend target | listen_path, hosts, backend_host/port/protocol, plugins, TLS/DNS/timeout overrides, pool_*, circuit_breaker, retry, response_body_mode, allowed_ws_origins, udp_max_response_amplification_factor, passthrough |
-| `Consumer` | An authenticated client identity | username, custom_id, credentials (HashMap), acl_groups (Vec), tags |
+| `Consumer` | An authenticated client identity | username, custom_id, credentials (HashMap — each type maps to a single JSON object or an array of objects for multi-credential rotation), acl_groups (Vec), tags |
 | `Upstream` | A load-balanced target group | targets (host/port/weight/path), algorithm, health_checks |
 | `PluginConfig` | Plugin instance configuration | name, enabled, config (serde_json::Value), priority_override (Option<u16>) |
 | `ServiceDiscoveryConfig` | Dynamic upstream target discovery | provider (dns_sd/kubernetes/consul), poll_interval_seconds, provider-specific settings |
@@ -378,6 +378,8 @@ The lifecycle phases are:
 12. `on_udp_datagram` — Per-datagram UDP hooks fired in both directions (client→backend and backend→client). `UdpDatagramContext.direction` distinguishes the two. udp_rate_limiting (2915) uses this for datagram/byte rate limiting. Zero overhead when no plugin opts in via `requires_udp_datagram_hooks()`. Backend→client hooks run before each response datagram is relayed to the client, enabling response-side rate limiting and filtering
 
 **Multi-auth**: `AuthMode::Multi` recognizes both `ctx.identified_consumer` (consumer-backed auth) and `ctx.authenticated_identity` (external JWKS/OIDC identity) as successful authentication. First-success-wins semantics apply.
+
+**Multi-credential rotation**: Each credential type in a consumer's `credentials` HashMap can be either a single JSON object (backward compatible) or an array of objects. This enables zero-downtime credential rotation — e.g., two API keys or two JWT secrets active simultaneously. The helper `Consumer::credential_entries(cred_type)` normalizes both formats. For index-based lookups (keyauth, mtls_auth), all entries are inserted into the ConsumerIndex HashMap — hot-path lookup remains O(1). For secret-based verification (jwt, basicauth, hmac_auth), the plugin iterates entries after the O(1) consumer lookup (typically 1-2 entries). The max entries per type is configurable via `FERRUM_MAX_CREDENTIALS_PER_TYPE` (default 2). Admin API provides `POST /consumers/:id/credentials/:type` (append) and `DELETE /consumers/:id/credentials/:type/:index` (remove by index) for credential lifecycle management.
 
 **gRPC rejection normalization**: Plugin rejects for `application/grpc` requests are converted to trailers-only gRPC errors (`HTTP 200` + `grpc-status` / `grpc-message`) rather than raw HTTP error responses. This includes pre-proxy rejects, response-path rejects, route misses, and method filtering.
 
@@ -873,6 +875,7 @@ Reduce per-request allocations in plugin lookup
 | `FERRUM_MAX_QUERY_PARAMS` | `100` | Max number of query parameters allowed. `0` = unlimited |
 | `FERRUM_MAX_GRPC_RECV_SIZE_BYTES` | `4194304` | Max total received gRPC payload size in bytes (4 MiB). `0` = unlimited |
 | `FERRUM_MAX_WEBSOCKET_FRAME_SIZE_BYTES` | `16777216` | Max WebSocket frame size in bytes (16 MiB). Also sets max message size to 4x frame size |
+| `FERRUM_MAX_CREDENTIALS_PER_TYPE` | `2` | Max credential entries per type per consumer. Enables zero-downtime rotation by allowing multiple active credentials simultaneously |
 | `FERRUM_HTTP_HEADER_READ_TIMEOUT_SECONDS` | `10` | HTTP/1.1 header read timeout in seconds. Protects against slowloris attacks. `0` = disabled |
 | `FERRUM_BACKEND_ALLOW_IPS` | `both` | Backend IP allowlist policy: `private` (only RFC 1918/loopback/link-local/CGNAT), `public` (only non-private), `both` (no restriction) |
 | `FERRUM_MAX_CONCURRENT_REQUESTS_PER_IP` | `0` | Max concurrent proxy requests per resolved client IP. `0` = disabled. Uses trusted proxy XFF resolution |

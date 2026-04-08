@@ -1010,11 +1010,15 @@ Authenticates requests using the client's TLS/DTLS certificate, matching a confi
 
 **Supported `cert_field` values:** `subject_cn`, `subject_ou`, `subject_o`, `san_dns`, `san_email`, `fingerprint_sha256`, `serial`
 
-**Consumer credential** (`mtls_auth`):
+**Consumer credential** (`mtls_auth`) — single or array for rotation:
 ```yaml
 credentials:
   mtls_auth:
     identity: "client.example.com"
+  # Array format for zero-downtime rotation:
+  # mtls_auth:
+  #   - identity: "old-cert-cn.example.com"
+  #   - identity: "new-cert-cn.example.com"
 ```
 
 **Issuer Filtering:**
@@ -1075,11 +1079,15 @@ Authenticates requests using HS256 JWT Bearer tokens matched against consumer cr
 | `token_lookup` | String | `header:Authorization` | Where to find the token (`header:<name>` or `query:<name>`) |
 | `consumer_claim_field` | String | `sub` | JWT claim identifying the consumer |
 
-**Consumer credential** (`jwt`):
+**Consumer credential** (`jwt`) — single or array for rotation:
 ```yaml
 credentials:
   jwt:
     secret: "consumer-specific-hs256-secret"
+  # Array format for zero-downtime rotation:
+  # jwt:
+  #   - secret: "old-secret"
+  #   - secret: "new-secret"
 ```
 
 ### `key_auth`
@@ -1092,11 +1100,15 @@ Authenticates requests using an API key matched against consumer credentials.
 |---|---|---|---|
 | `key_location` | String | `header:X-API-Key` | Where to find the key (`header:<name>` or `query:<name>`) |
 
-**Consumer credential** (`keyauth`):
+**Consumer credential** (`keyauth`) — single or array for rotation:
 ```yaml
 credentials:
   keyauth:
     key: "the-api-key-value"
+  # Array format for zero-downtime rotation:
+  # keyauth:
+  #   - key: "old-api-key"
+  #   - key: "new-api-key"
 ```
 
 ### `basic_auth`
@@ -1109,12 +1121,16 @@ Authenticates using HTTP Basic credentials. Supports two hash formats:
 
 **Config**: None required.
 
-**Consumer credential** (`basicauth`):
+**Consumer credential** (`basicauth`) — single or array for rotation:
 ```yaml
 credentials:
   basicauth:
     password_hash: "hmac_sha256:ab3f..." # HMAC-SHA256 (preferred)
     # or: "$2b$12$..."                   # bcrypt (legacy)
+  # Array format for zero-downtime rotation:
+  # basicauth:
+  #   - password_hash: "hmac_sha256:old..."
+  #   - password_hash: "hmac_sha256:new..."
 ```
 
 ### `hmac_auth`
@@ -1138,11 +1154,15 @@ hmac username="<username>", algorithm="hmac-sha256", signature="<base64>"
 - Unknown algorithms are rejected
 - Requests must include a valid `Date` header (RFC 2822 or RFC 3339) within the configured skew window
 
-**Consumer credential** (`hmac_auth`):
+**Consumer credential** (`hmac_auth`) — single or array for rotation:
 ```yaml
 credentials:
   hmac_auth:
     secret: "shared-secret"
+  # Array format for zero-downtime rotation:
+  # hmac_auth:
+  #   - secret: "old-secret"
+  #   - secret: "new-secret"
 ```
 
 ### ldap_auth

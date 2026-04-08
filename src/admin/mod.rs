@@ -26,7 +26,8 @@ use uuid::Uuid;
 use crate::admin::jwt_auth::{JwtError, JwtManager};
 use crate::config::db_backend::DatabaseBackend;
 use crate::config::types::{
-    Consumer, GatewayConfig, PluginConfig, PluginScope, Proxy, Upstream, validate_resource_id,
+    Consumer, GatewayConfig, PluginConfig, PluginScope, Proxy, Upstream, max_credentials_per_type,
+    validate_resource_id,
 };
 use crate::plugins;
 use crate::proxy::ProxyState;
@@ -532,6 +533,12 @@ pub async fn handle_admin_request(
         // Consumer credentials
         (Method::PUT, ["consumers", consumer_id, "credentials", cred_type]) => {
             handle_update_credentials(&state, consumer_id, cred_type, &body_bytes).await
+        }
+        (Method::POST, ["consumers", consumer_id, "credentials", cred_type]) => {
+            handle_append_credential(&state, consumer_id, cred_type, &body_bytes).await
+        }
+        (Method::DELETE, ["consumers", consumer_id, "credentials", cred_type, index]) => {
+            handle_delete_credential_by_index(&state, consumer_id, cred_type, index).await
         }
         (Method::DELETE, ["consumers", consumer_id, "credentials", cred_type]) => {
             handle_delete_credentials(&state, consumer_id, cred_type).await
@@ -1371,44 +1378,44 @@ async fn handle_create_consumer(
         ));
     }
 
-    // Check keyauth API key uniqueness (if present in credentials)
-    if let Some(key_creds) = consumer.credentials.get("keyauth")
-        && let Some(key) = key_creds.get("key").and_then(|s| s.as_str())
-    {
-        match db.check_keyauth_key_unique(key, None).await {
-            Ok(true) => {}
-            Ok(false) => {
-                return Ok(json_response(
-                    StatusCode::CONFLICT,
-                    &json!({"error": "A consumer with this API key already exists"}),
-                ));
-            }
-            Err(e) => {
-                return Ok(json_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    &db_error_response(&e),
-                ));
+    // Check keyauth API key uniqueness for all entries (supports arrays)
+    for key_creds in consumer.credential_entries("keyauth") {
+        if let Some(key) = key_creds.get("key").and_then(|s| s.as_str()) {
+            match db.check_keyauth_key_unique(key, None).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    return Ok(json_response(
+                        StatusCode::CONFLICT,
+                        &json!({"error": "A consumer with this API key already exists"}),
+                    ));
+                }
+                Err(e) => {
+                    return Ok(json_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        &db_error_response(&e),
+                    ));
+                }
             }
         }
     }
 
-    // Check mTLS identity uniqueness (stored in JSON, no DB constraint)
-    if let Some(mtls_creds) = consumer.credentials.get("mtls_auth")
-        && let Some(identity) = mtls_creds.get("identity").and_then(|s| s.as_str())
-    {
-        match db.check_mtls_identity_unique(identity, None).await {
-            Ok(true) => {}
-            Ok(false) => {
-                return Ok(json_response(
-                    StatusCode::CONFLICT,
-                    &json!({"error": "A consumer with this mTLS identity already exists"}),
-                ));
-            }
-            Err(e) => {
-                return Ok(json_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    &db_error_response(&e),
-                ));
+    // Check mTLS identity uniqueness for all entries (supports arrays)
+    for mtls_creds in consumer.credential_entries("mtls_auth") {
+        if let Some(identity) = mtls_creds.get("identity").and_then(|s| s.as_str()) {
+            match db.check_mtls_identity_unique(identity, None).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    return Ok(json_response(
+                        StatusCode::CONFLICT,
+                        &json!({"error": "A consumer with this mTLS identity already exists"}),
+                    ));
+                }
+                Err(e) => {
+                    return Ok(json_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        &db_error_response(&e),
+                    ));
+                }
             }
         }
     }
@@ -1543,44 +1550,44 @@ async fn handle_update_consumer(
         }
     }
 
-    // Check keyauth API key uniqueness excluding self (if present)
-    if let Some(key_creds) = consumer.credentials.get("keyauth")
-        && let Some(key) = key_creds.get("key").and_then(|s| s.as_str())
-    {
-        match db.check_keyauth_key_unique(key, Some(id)).await {
-            Ok(true) => {}
-            Ok(false) => {
-                return Ok(json_response(
-                    StatusCode::CONFLICT,
-                    &json!({"error": "A consumer with this API key already exists"}),
-                ));
-            }
-            Err(e) => {
-                return Ok(json_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    &db_error_response(&e),
-                ));
+    // Check keyauth API key uniqueness excluding self for all entries (supports arrays)
+    for key_creds in consumer.credential_entries("keyauth") {
+        if let Some(key) = key_creds.get("key").and_then(|s| s.as_str()) {
+            match db.check_keyauth_key_unique(key, Some(id)).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    return Ok(json_response(
+                        StatusCode::CONFLICT,
+                        &json!({"error": "A consumer with this API key already exists"}),
+                    ));
+                }
+                Err(e) => {
+                    return Ok(json_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        &db_error_response(&e),
+                    ));
+                }
             }
         }
     }
 
-    // Check mTLS identity uniqueness excluding self (stored in JSON, no DB constraint)
-    if let Some(mtls_creds) = consumer.credentials.get("mtls_auth")
-        && let Some(identity) = mtls_creds.get("identity").and_then(|s| s.as_str())
-    {
-        match db.check_mtls_identity_unique(identity, Some(id)).await {
-            Ok(true) => {}
-            Ok(false) => {
-                return Ok(json_response(
-                    StatusCode::CONFLICT,
-                    &json!({"error": "A consumer with this mTLS identity already exists"}),
-                ));
-            }
-            Err(e) => {
-                return Ok(json_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    &db_error_response(&e),
-                ));
+    // Check mTLS identity uniqueness excluding self for all entries (supports arrays)
+    for mtls_creds in consumer.credential_entries("mtls_auth") {
+        if let Some(identity) = mtls_creds.get("identity").and_then(|s| s.as_str()) {
+            match db.check_mtls_identity_unique(identity, Some(id)).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    return Ok(json_response(
+                        StatusCode::CONFLICT,
+                        &json!({"error": "A consumer with this mTLS identity already exists"}),
+                    ));
+                }
+                Err(e) => {
+                    return Ok(json_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        &db_error_response(&e),
+                    ));
+                }
             }
         }
     }
@@ -1682,65 +1689,69 @@ async fn handle_update_credentials(
     match db.get_consumer(consumer_id).await {
         Ok(Some(mut consumer)) => {
             let mut hashed_cred = cred_value.clone();
-            // Hash password if basicauth
+            // Hash password if basicauth (supports both single object and array)
             if cred_type == "basicauth"
-                && let Some(pass) = hashed_cred.get("password").and_then(|p| p.as_str())
+                && let Err(e) = hash_credential_passwords(&mut hashed_cred)
             {
-                let hash = match hash_basic_auth_password(pass) {
-                    Ok(h) => h,
-                    Err(e) => {
-                        return Ok(json_response(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            &json!({"error": e}),
-                        ));
-                    }
+                return Ok(json_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &json!({"error": e}),
+                ));
+            }
+            // Check keyauth API key uniqueness for all entries before updating
+            if cred_type == "keyauth" {
+                let entries: Vec<&serde_json::Value> = match &hashed_cred {
+                    serde_json::Value::Array(arr) => arr.iter().filter(|v| v.is_object()).collect(),
+                    val if val.is_object() => vec![val],
+                    _ => vec![],
                 };
-                hashed_cred["password_hash"] = json!(hash);
-                // Remove plaintext
-                if let Some(obj) = hashed_cred.as_object_mut() {
-                    obj.remove("password");
-                }
-            }
-            // Check keyauth API key uniqueness before updating
-            if cred_type == "keyauth"
-                && let Some(key) = hashed_cred.get("key").and_then(|k| k.as_str())
-            {
-                match db.check_keyauth_key_unique(key, Some(consumer_id)).await {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        return Ok(json_response(
-                            StatusCode::CONFLICT,
-                            &json!({"error": "A consumer with this API key already exists"}),
-                        ));
-                    }
-                    Err(e) => {
-                        return Ok(json_response(
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            &db_error_response(&e),
-                        ));
+                for entry in entries {
+                    if let Some(key) = entry.get("key").and_then(|k| k.as_str()) {
+                        match db.check_keyauth_key_unique(key, Some(consumer_id)).await {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                return Ok(json_response(
+                                    StatusCode::CONFLICT,
+                                    &json!({"error": "A consumer with this API key already exists"}),
+                                ));
+                            }
+                            Err(e) => {
+                                return Ok(json_response(
+                                    StatusCode::SERVICE_UNAVAILABLE,
+                                    &db_error_response(&e),
+                                ));
+                            }
+                        }
                     }
                 }
             }
-            // Check mTLS identity uniqueness before updating (no DB constraint)
-            if cred_type == "mtls_auth"
-                && let Some(identity) = hashed_cred.get("identity").and_then(|i| i.as_str())
-            {
-                match db
-                    .check_mtls_identity_unique(identity, Some(consumer_id))
-                    .await
-                {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        return Ok(json_response(
-                            StatusCode::CONFLICT,
-                            &json!({"error": "A consumer with this mTLS identity already exists"}),
-                        ));
-                    }
-                    Err(e) => {
-                        return Ok(json_response(
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            &db_error_response(&e),
-                        ));
+            // Check mTLS identity uniqueness for all entries before updating
+            if cred_type == "mtls_auth" {
+                let entries: Vec<&serde_json::Value> = match &hashed_cred {
+                    serde_json::Value::Array(arr) => arr.iter().filter(|v| v.is_object()).collect(),
+                    val if val.is_object() => vec![val],
+                    _ => vec![],
+                };
+                for entry in entries {
+                    if let Some(identity) = entry.get("identity").and_then(|i| i.as_str()) {
+                        match db
+                            .check_mtls_identity_unique(identity, Some(consumer_id))
+                            .await
+                        {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                return Ok(json_response(
+                                    StatusCode::CONFLICT,
+                                    &json!({"error": "A consumer with this mTLS identity already exists"}),
+                                ));
+                            }
+                            Err(e) => {
+                                return Ok(json_response(
+                                    StatusCode::SERVICE_UNAVAILABLE,
+                                    &db_error_response(&e),
+                                ));
+                            }
+                        }
                     }
                 }
             }
@@ -1816,6 +1827,293 @@ async fn handle_delete_credentials(
             consumer.updated_at = Utc::now();
             match db.update_consumer(&consumer).await {
                 Ok(_) => Ok(json_response(StatusCode::NO_CONTENT, &json!({}))),
+                Err(e) => Ok(json_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &json!({"error": format!("{}", e)}),
+                )),
+            }
+        }
+        Ok(None) => Ok(json_response(
+            StatusCode::NOT_FOUND,
+            &json!({"error": "Consumer not found"}),
+        )),
+        Err(e) => Ok(json_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &json!({"error": format!("{}", e)}),
+        )),
+    }
+}
+
+/// POST /consumers/:id/credentials/:type — Append a credential entry for zero-downtime rotation.
+///
+/// Converts existing single-object credential to an array if needed, then appends the new entry.
+async fn handle_append_credential(
+    state: &AdminState,
+    consumer_id: &str,
+    cred_type: &str,
+    body: &[u8],
+) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    if let Some(resp) = state.check_write_allowed() {
+        return Ok(resp);
+    }
+
+    if !ALLOWED_CREDENTIAL_TYPES.contains(&cred_type) {
+        return Ok(json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"error": format!(
+                "Unknown credential type '{}'. Allowed types: {:?}",
+                cred_type, ALLOWED_CREDENTIAL_TYPES
+            )}),
+        ));
+    }
+
+    let db = match &state.db {
+        Some(db) => db,
+        None => {
+            return Ok(json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &json!({"error": "No database"}),
+            ));
+        }
+    };
+
+    let mut new_cred: Value = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(e) => {
+            return Ok(json_response(
+                StatusCode::BAD_REQUEST,
+                &json!({"error": format!("Invalid body: {}", e)}),
+            ));
+        }
+    };
+
+    if !new_cred.is_object() {
+        return Ok(json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"error": "Credential entry must be a JSON object"}),
+        ));
+    }
+
+    match db.get_consumer(consumer_id).await {
+        Ok(Some(mut consumer)) => {
+            // Hash password if basicauth
+            if cred_type == "basicauth"
+                && let Err(e) = hash_credential_passwords(&mut new_cred)
+            {
+                return Ok(json_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &json!({"error": e}),
+                ));
+            }
+
+            // Check uniqueness for the new entry
+            if cred_type == "keyauth"
+                && let Some(key) = new_cred.get("key").and_then(|k| k.as_str())
+            {
+                match db.check_keyauth_key_unique(key, Some(consumer_id)).await {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        return Ok(json_response(
+                            StatusCode::CONFLICT,
+                            &json!({"error": "A consumer with this API key already exists"}),
+                        ));
+                    }
+                    Err(e) => {
+                        return Ok(json_response(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            &db_error_response(&e),
+                        ));
+                    }
+                }
+            }
+            if cred_type == "mtls_auth"
+                && let Some(identity) = new_cred.get("identity").and_then(|i| i.as_str())
+            {
+                match db
+                    .check_mtls_identity_unique(identity, Some(consumer_id))
+                    .await
+                {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        return Ok(json_response(
+                            StatusCode::CONFLICT,
+                            &json!({"error": "A consumer with this mTLS identity already exists"}),
+                        ));
+                    }
+                    Err(e) => {
+                        return Ok(json_response(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            &db_error_response(&e),
+                        ));
+                    }
+                }
+            }
+
+            // Build the new credential array
+            let new_value = match consumer.credentials.get(cred_type) {
+                Some(Value::Array(arr)) => {
+                    let mut new_arr = arr.clone();
+                    new_arr.push(new_cred);
+                    Value::Array(new_arr)
+                }
+                Some(existing) if existing.is_object() => {
+                    Value::Array(vec![existing.clone(), new_cred])
+                }
+                _ => {
+                    // No existing credential — store as single object for backward compat
+                    new_cred
+                }
+            };
+
+            // Check max entries per type
+            let limit = max_credentials_per_type();
+            if let Value::Array(ref arr) = new_value
+                && arr.len() > limit
+            {
+                return Ok(json_response(
+                    StatusCode::BAD_REQUEST,
+                    &json!({"error": format!(
+                        "Cannot exceed {} credentials per type (currently {})",
+                        limit, arr.len()
+                    )}),
+                ));
+            }
+
+            consumer
+                .credentials
+                .insert(cred_type.to_string(), new_value);
+
+            if let Err(field_errors) = consumer.validate_fields() {
+                return Ok(json_response(
+                    StatusCode::BAD_REQUEST,
+                    &json!({"error": format!("Invalid credential fields: {}", field_errors.join("; "))}),
+                ));
+            }
+
+            consumer.updated_at = Utc::now();
+            match db.update_consumer(&consumer).await {
+                Ok(_) => Ok(json_response(
+                    StatusCode::OK,
+                    &json!(redact_consumer_credentials(&consumer)),
+                )),
+                Err(e) => Ok(json_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &json!({"error": format!("{}", e)}),
+                )),
+            }
+        }
+        Ok(None) => Ok(json_response(
+            StatusCode::NOT_FOUND,
+            &json!({"error": "Consumer not found"}),
+        )),
+        Err(e) => Ok(json_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &json!({"error": format!("{}", e)}),
+        )),
+    }
+}
+
+/// DELETE /consumers/:id/credentials/:type/:index — Remove a specific credential entry by index.
+///
+/// When the array has one remaining element after removal, it is collapsed back to a single object.
+async fn handle_delete_credential_by_index(
+    state: &AdminState,
+    consumer_id: &str,
+    cred_type: &str,
+    index_str: &str,
+) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    if let Some(resp) = state.check_write_allowed() {
+        return Ok(resp);
+    }
+
+    if !ALLOWED_CREDENTIAL_TYPES.contains(&cred_type) {
+        return Ok(json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"error": format!(
+                "Unknown credential type '{}'. Allowed types: {:?}",
+                cred_type, ALLOWED_CREDENTIAL_TYPES
+            )}),
+        ));
+    }
+
+    let index: usize = match index_str.parse() {
+        Ok(i) => i,
+        Err(_) => {
+            return Ok(json_response(
+                StatusCode::BAD_REQUEST,
+                &json!({"error": "Invalid credential index — must be a non-negative integer"}),
+            ));
+        }
+    };
+
+    let db = match &state.db {
+        Some(db) => db,
+        None => {
+            return Ok(json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &json!({"error": "No database"}),
+            ));
+        }
+    };
+
+    match db.get_consumer(consumer_id).await {
+        Ok(Some(mut consumer)) => {
+            let cred_value = match consumer.credentials.get_mut(cred_type) {
+                Some(v) => v,
+                None => {
+                    return Ok(json_response(
+                        StatusCode::NOT_FOUND,
+                        &json!({"error": format!("No '{}' credentials found", cred_type)}),
+                    ));
+                }
+            };
+
+            match cred_value {
+                Value::Array(arr) => {
+                    if index >= arr.len() {
+                        return Ok(json_response(
+                            StatusCode::NOT_FOUND,
+                            &json!({"error": format!(
+                                "Credential index {} out of range (have {} entries)",
+                                index, arr.len()
+                            )}),
+                        ));
+                    }
+                    arr.remove(index);
+                    // Collapse single-element array back to a plain object
+                    if arr.len() == 1 {
+                        let single = arr.remove(0);
+                        consumer.credentials.insert(cred_type.to_string(), single);
+                    } else if arr.is_empty() {
+                        consumer.credentials.remove(cred_type);
+                    }
+                }
+                Value::Object(_) => {
+                    if index != 0 {
+                        return Ok(json_response(
+                            StatusCode::NOT_FOUND,
+                            &json!({"error": format!(
+                                "Credential index {} out of range (have 1 entry)",
+                                index
+                            )}),
+                        ));
+                    }
+                    consumer.credentials.remove(cred_type);
+                }
+                _ => {
+                    return Ok(json_response(
+                        StatusCode::NOT_FOUND,
+                        &json!({"error": format!("No '{}' credentials found", cred_type)}),
+                    ));
+                }
+            }
+
+            consumer.updated_at = Utc::now();
+            match db.update_consumer(&consumer).await {
+                Ok(_) => Ok(json_response(
+                    StatusCode::OK,
+                    &json!(redact_consumer_credentials(&consumer)),
+                )),
                 Err(e) => Ok(json_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     &json!({"error": format!("{}", e)}),
@@ -3523,44 +3821,75 @@ fn is_unique_constraint_violation(error_msg: &str) -> bool {
 /// for safe inclusion in API responses.
 pub fn redact_consumer_credentials(consumer: &Consumer) -> Consumer {
     let mut redacted = consumer.clone();
-    // Redact basicauth password hash
-    if let Some(basic) = redacted.credentials.get_mut("basicauth")
-        && let Some(obj) = basic.as_object_mut()
-        && obj.contains_key("password_hash")
-    {
-        obj.insert("password_hash".to_string(), json!("[REDACTED]"));
+
+    /// Redact a secret field in a credential value, handling both single-object
+    /// and array-of-objects formats.
+    fn redact_field(cred_value: &mut serde_json::Value, field: &str) {
+        match cred_value {
+            serde_json::Value::Array(arr) => {
+                for entry in arr.iter_mut() {
+                    if let Some(obj) = entry.as_object_mut()
+                        && obj.contains_key(field)
+                    {
+                        obj.insert(field.to_string(), json!("[REDACTED]"));
+                    }
+                }
+            }
+            serde_json::Value::Object(obj) => {
+                if obj.contains_key(field) {
+                    obj.insert(field.to_string(), json!("[REDACTED]"));
+                }
+            }
+            _ => {}
+        }
     }
-    // Redact HMAC auth secret
-    if let Some(hmac) = redacted.credentials.get_mut("hmac_auth")
-        && let Some(obj) = hmac.as_object_mut()
-        && obj.contains_key("secret")
-    {
-        obj.insert("secret".to_string(), json!("[REDACTED]"));
+
+    if let Some(basic) = redacted.credentials.get_mut("basicauth") {
+        redact_field(basic, "password_hash");
     }
-    // Redact JWT auth secret
-    if let Some(jwt) = redacted.credentials.get_mut("jwt")
-        && let Some(obj) = jwt.as_object_mut()
-        && obj.contains_key("secret")
-    {
-        obj.insert("secret".to_string(), json!("[REDACTED]"));
+    if let Some(hmac) = redacted.credentials.get_mut("hmac_auth") {
+        redact_field(hmac, "secret");
+    }
+    if let Some(jwt) = redacted.credentials.get_mut("jwt") {
+        redact_field(jwt, "secret");
     }
     redacted
 }
 
 fn hash_consumer_secrets(consumer: &mut Consumer) -> Result<(), String> {
-    // Hash basicauth passwords
-    if let Some(basic) = consumer.credentials.get_mut("basicauth")
-        && let Some(pass) = basic.get("password").and_then(|p| p.as_str())
-    {
-        let hash = hash_basic_auth_password(pass).map_err(|e| {
-            format!(
-                "Failed to hash password for consumer {}: {}",
-                consumer.id, e
-            )
-        })?;
-        basic["password_hash"] = json!(hash);
-        if let Some(obj) = basic.as_object_mut() {
-            obj.remove("password");
+    // Hash basicauth passwords — supports both single-object and array formats
+    if let Some(basic) = consumer.credentials.get_mut("basicauth") {
+        match basic {
+            serde_json::Value::Array(arr) => {
+                for entry in arr.iter_mut() {
+                    if let Some(pass) = entry.get("password").and_then(|p| p.as_str()) {
+                        let hash = hash_basic_auth_password(pass).map_err(|e| {
+                            format!(
+                                "Failed to hash password for consumer {}: {}",
+                                consumer.id, e
+                            )
+                        })?;
+                        entry["password_hash"] = json!(hash);
+                        if let Some(obj) = entry.as_object_mut() {
+                            obj.remove("password");
+                        }
+                    }
+                }
+            }
+            _ => {
+                if let Some(pass) = basic.get("password").and_then(|p| p.as_str()) {
+                    let hash = hash_basic_auth_password(pass).map_err(|e| {
+                        format!(
+                            "Failed to hash password for consumer {}: {}",
+                            consumer.id, e
+                        )
+                    })?;
+                    basic["password_hash"] = json!(hash);
+                    if let Some(obj) = basic.as_object_mut() {
+                        obj.remove("password");
+                    }
+                }
+            }
         }
     }
     Ok(())
@@ -3584,6 +3913,34 @@ fn hash_basic_auth_password(password: &str) -> Result<String, String> {
     mac.update(password.as_bytes());
     let hash = hex::encode(mac.finalize().into_bytes());
     Ok(format!("hmac_sha256:{}", hash))
+}
+
+/// Hash passwords in a basicauth credential value (single object or array).
+/// Used by `handle_update_credentials()` where the credential type is already known.
+fn hash_credential_passwords(cred: &mut serde_json::Value) -> Result<(), String> {
+    match cred {
+        serde_json::Value::Array(arr) => {
+            for entry in arr.iter_mut() {
+                if let Some(pass) = entry.get("password").and_then(|p| p.as_str()) {
+                    let hash = hash_basic_auth_password(pass)?;
+                    entry["password_hash"] = json!(hash);
+                    if let Some(obj) = entry.as_object_mut() {
+                        obj.remove("password");
+                    }
+                }
+            }
+        }
+        _ => {
+            if let Some(pass) = cred.get("password").and_then(|p| p.as_str()) {
+                let hash = hash_basic_auth_password(pass)?;
+                cred["password_hash"] = json!(hash);
+                if let Some(obj) = cred.as_object_mut() {
+                    obj.remove("password");
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Best-effort OS-level port availability check.
