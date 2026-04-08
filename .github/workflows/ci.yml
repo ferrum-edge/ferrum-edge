@@ -649,9 +649,11 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # Extract PR number from merge commit message (e.g., "Merge pull request #123 from owner/branch")
+          # Extract PR number from merge commit or squash merge message
+          # Merge commit format: "Merge pull request #123 from owner/branch"
+          # Squash merge format: "Some title (#123)"
           COMMIT_MSG="${{ github.event.head_commit.message }}"
-          PR_NUMBER=$(echo "$COMMIT_MSG" | grep -oP 'Merge pull request #\K[0-9]+' || true)
+          PR_NUMBER=$(echo "$COMMIT_MSG" | grep -oP 'Merge pull request #\K[0-9]+' || echo "$COMMIT_MSG" | head -1 | grep -oP '\(#\K[0-9]+(?=\))' || true)
 
           if [[ -z "$PR_NUMBER" ]]; then
             echo "Not a PR merge commit, skipping branch cleanup"
