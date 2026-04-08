@@ -10,7 +10,6 @@
 //! Only compatible with prefix-based `listen_path` proxies (not regex, not
 //! host-only or port-only routing) and HTTP protocol types.
 //!
-//! Inspired by <https://github.com/Optum/kong-spec-expose>.
 //!
 //! # Configuration
 //!
