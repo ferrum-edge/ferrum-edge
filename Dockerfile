@@ -42,7 +42,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     libssl3 \
     curl \
-    && apt-get purge -y --auto-remove tar libgd3 \
+    && apt-get purge -y --auto-remove libgd3 \
     && rm -rf /var/lib/apt/lists/* \
     && rm -rf /var/log/dpkg.log /var/log/apt \
               /usr/share/doc /usr/share/man /usr/share/info \
