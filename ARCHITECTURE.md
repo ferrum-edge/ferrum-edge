@@ -611,7 +611,7 @@ The project uses comprehensive testing at multiple levels:
 
 ```bash
 # Clone and build
-git clone https://github.com/QuickLaunchWeb/ferrum-edge.git
+git clone https://github.com/ferrum-edge/ferrum-edge.git
 cd ferrum-edge
 cargo build
 

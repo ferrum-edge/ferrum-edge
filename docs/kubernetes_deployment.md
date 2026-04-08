@@ -131,7 +131,7 @@ spec:
       terminationGracePeriodSeconds: 30
       containers:
         - name: ferrum-edge
-          image: ghcr.io/quicklaunchweb/ferrum-edge:latest
+          image: ghcr.io/ferrum-edge/ferrum-edge:latest
           imagePullPolicy: IfNotPresent
           env:
             - name: FERRUM_MODE

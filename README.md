@@ -39,7 +39,7 @@ See [docs/cp_dp_mode.md](docs/cp_dp_mode.md) for distributed deployment details.
 ### From Source
 
 ```bash
-git clone https://github.com/QuickLaunchWeb/ferrum-edge.git
+git clone https://github.com/ferrum-edge/ferrum-edge.git
 cd ferrum-edge
 cargo build --release
 
@@ -50,11 +50,11 @@ ferrum-edge version
 
 ### Pre-built Binaries
 
-Download from [GitHub Releases](https://github.com/QuickLaunchWeb/ferrum-edge/releases) for Linux x86_64/ARM64 and macOS x86_64/ARM64.
+Download from [GitHub Releases](https://github.com/ferrum-edge/ferrum-edge/releases) for Linux x86_64/ARM64 and macOS x86_64/ARM64.
 
 ```bash
 # Example: Linux x86_64
-curl -LO https://github.com/QuickLaunchWeb/ferrum-edge/releases/latest/download/ferrum-edge-x86_64-unknown-linux-gnu.tar.gz
+curl -LO https://github.com/ferrum-edge/ferrum-edge/releases/latest/download/ferrum-edge-x86_64-unknown-linux-gnu.tar.gz
 tar xzf ferrum-edge-x86_64-unknown-linux-gnu.tar.gz
 sudo mv ferrum-edge /usr/local/bin/
 ferrum-edge version
@@ -63,7 +63,7 @@ ferrum-edge version
 ### Docker
 
 ```bash
-docker pull ghcr.io/quicklaunchweb/ferrum-edge:latest
+docker pull ghcr.io/ferrum-edge/ferrum-edge:latest
 
 docker run -d --name ferrum-edge \
   -p 8000:8000 -p 9000:9000 \
@@ -72,7 +72,7 @@ docker run -d --name ferrum-edge \
   -e FERRUM_DB_URL="sqlite:////data/ferrum.db?mode=rwc" \
   -e FERRUM_ADMIN_JWT_SECRET="dev-secret" \
   -v ferrum_data:/data \
-  ghcr.io/quicklaunchweb/ferrum-edge:latest
+  ghcr.io/ferrum-edge/ferrum-edge:latest
 ```
 
 See [docs/docker.md](docs/docker.md) for Docker Compose examples and production deployment.

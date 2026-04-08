@@ -204,7 +204,7 @@ Closes #123
 
 ## Questions?
 
-- **General questions**: Open a [GitHub Discussion](https://github.com/QuickLaunchWeb/ferrum-edge/discussions)
+- **General questions**: Open a [GitHub Discussion](https://github.com/ferrum-edge/ferrum-edge/discussions)
 - **Bug reports**: Open an issue with the bug template
 - **Feature requests**: Open an issue with the feature request template
 

@@ -291,7 +291,7 @@ spec:
     spec:
       containers:
         - name: ferrum-edge
-          image: ghcr.io/quicklaunchweb/ferrum-edge:latest
+          image: ghcr.io/ferrum-edge/ferrum-edge:latest
           ports:
             - containerPort: 8000  # Proxy
             - containerPort: 9000  # Admin API
