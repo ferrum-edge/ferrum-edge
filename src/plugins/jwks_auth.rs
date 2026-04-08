@@ -163,7 +163,7 @@ impl JwksAuth {
             } else if let Some(ref disc_url) = discovery_url {
                 // OIDC discovery — resolve jwks_uri asynchronously with
                 // indefinite retries. The background task keeps trying with
-                // exponential backoff (2s → 4s → … → 60s cap) until discovery
+                // exponential backoff (2s → 4s → … → 5min cap) until discovery
                 // succeeds. Once resolved, the JwksKeyStore's own background
                 // refresh task takes over for periodic key rotation.
                 //
@@ -179,13 +179,13 @@ impl JwksAuth {
                 let interval = refresh_interval;
                 tokio::spawn(async move {
                     const INITIAL_BACKOFF_SECS: u64 = 2;
-                    const MAX_BACKOFF_SECS: u64 = 60;
+                    const MAX_BACKOFF_SECS: u64 = 300;
 
                     let mut attempt: u32 = 0;
                     loop {
                         if attempt > 0 {
                             let backoff_secs = INITIAL_BACKOFF_SECS
-                                .saturating_mul(1u64 << (attempt - 1).min(5))
+                                .saturating_mul(1u64 << (attempt - 1).min(7))
                                 .min(MAX_BACKOFF_SECS);
                             let backoff = Duration::from_secs(backoff_secs);
                             warn!(
