@@ -63,13 +63,12 @@
 
 use async_trait::async_trait;
 use chrono::Utc;
-use hmac::{Hmac, KeyInit, Mac};
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use tracing::{debug, info, warn};
 use url::Url;
 
+use super::utils::aws_sigv4;
 use super::{Plugin, PluginHttpClient, PluginResult, RequestContext};
 
 /// Cloud provider for the serverless function.
@@ -256,7 +255,7 @@ impl ServerlessFunction {
                 );
                 if let Some(ref q) = qualifier {
                     url.push_str("?Qualifier=");
-                    url.push_str(&uri_encode(q, true));
+                    url.push_str(&aws_sigv4::uri_encode(q, true));
                 }
 
                 let aws_cfg = AwsLambdaConfig {
@@ -546,52 +545,8 @@ fn validate_function_url(url: &str) -> Result<(), String> {
 }
 
 // ---------------------------------------------------------------------------
-// AWS SigV4 request signing
+// AWS SigV4 request signing — delegates to shared utils::aws_sigv4 module
 // ---------------------------------------------------------------------------
-
-type HmacSha256 = Hmac<Sha256>;
-
-/// URI-encode a string per AWS SigV4 rules.
-/// When `encode_slash` is false, forward slashes are preserved (for URI paths).
-fn uri_encode(input: &str, encode_slash: bool) -> String {
-    let mut result = String::with_capacity(input.len() * 2);
-    for byte in input.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                result.push(byte as char);
-            }
-            b'/' if !encode_slash => {
-                result.push('/');
-            }
-            _ => {
-                result.push_str(&format!("%{:02X}", byte));
-            }
-        }
-    }
-    result
-}
-
-/// SHA-256 hash of data, returned as lowercase hex.
-fn sha256_hex(data: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(data);
-    hex::encode(hasher.finalize())
-}
-
-/// HMAC-SHA256 keyed hash.
-fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
-    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC-SHA256 accepts any key length");
-    mac.update(data);
-    mac.finalize().into_bytes().to_vec()
-}
-
-/// Derive the SigV4 signing key: HMAC(HMAC(HMAC(HMAC("AWS4"+secret, date), region), service), "aws4_request")
-fn derive_signing_key(secret: &str, date_stamp: &str, region: &str, service: &str) -> Vec<u8> {
-    let k_date = hmac_sha256(format!("AWS4{}", secret).as_bytes(), date_stamp.as_bytes());
-    let k_region = hmac_sha256(&k_date, region.as_bytes());
-    let k_service = hmac_sha256(&k_region, service.as_bytes());
-    hmac_sha256(&k_service, b"aws4_request")
-}
 
 /// Sign an AWS Lambda Invoke API request using SigV4.
 /// Returns the headers that must be added to the request.
@@ -601,80 +556,21 @@ fn sign_aws_request(
     payload: &[u8],
     now: &chrono::DateTime<Utc>,
 ) -> Vec<(String, String)> {
-    let service = "lambda";
-    let date_stamp = now.format("%Y%m%d").to_string();
-    let amz_date = now.format("%Y%m%dT%H%M%SZ").to_string();
-
-    let parsed_url = match Url::parse(url_str) {
-        Ok(u) => u,
-        Err(_) => return Vec::new(),
+    let config = aws_sigv4::AwsSigV4Config {
+        region: aws.region.clone(),
+        access_key_id: aws.access_key_id.clone(),
+        secret_access_key: aws.secret_access_key.clone(),
+        session_token: aws.session_token.clone(),
     };
-
-    let host = match parsed_url.host_str() {
-        Some(h) => h.to_string(),
-        None => return Vec::new(),
-    };
-
-    let canonical_uri = uri_encode(parsed_url.path(), false);
-    let canonical_querystring = parsed_url.query().unwrap_or("");
-
-    let payload_hash = sha256_hex(payload);
-
-    // Canonical headers (must be sorted alphabetically by header name).
-    // When a session token is present, x-amz-security-token is included.
-    let (canonical_headers, signed_headers) = if aws.session_token.is_some() {
-        (
-            format!(
-                "content-type:application/json\nhost:{}\nx-amz-content-sha256:{}\nx-amz-date:{}\nx-amz-security-token:{}\n",
-                host,
-                payload_hash,
-                amz_date,
-                aws.session_token.as_deref().unwrap_or_default()
-            ),
-            "content-type;host;x-amz-content-sha256;x-amz-date;x-amz-security-token",
-        )
-    } else {
-        (
-            format!(
-                "content-type:application/json\nhost:{}\nx-amz-content-sha256:{}\nx-amz-date:{}\n",
-                host, payload_hash, amz_date
-            ),
-            "content-type;host;x-amz-content-sha256;x-amz-date",
-        )
-    };
-
-    let canonical_request = format!(
-        "POST\n{}\n{}\n{}\n{}\n{}",
-        canonical_uri, canonical_querystring, canonical_headers, signed_headers, payload_hash
-    );
-
-    let credential_scope = format!("{}/{}/{}/aws4_request", date_stamp, aws.region, service);
-    let string_to_sign = format!(
-        "AWS4-HMAC-SHA256\n{}\n{}\n{}",
-        amz_date,
-        credential_scope,
-        sha256_hex(canonical_request.as_bytes())
-    );
-
-    let signing_key = derive_signing_key(&aws.secret_access_key, &date_stamp, &aws.region, service);
-    let signature = hex::encode(hmac_sha256(&signing_key, string_to_sign.as_bytes()));
-
-    let authorization = format!(
-        "AWS4-HMAC-SHA256 Credential={}/{}, SignedHeaders={}, Signature={}",
-        aws.access_key_id, credential_scope, signed_headers, signature
-    );
-
-    let mut headers = vec![
-        ("authorization".to_string(), authorization),
-        ("x-amz-date".to_string(), amz_date),
-        ("x-amz-content-sha256".to_string(), payload_hash),
-    ];
-
-    if let Some(ref token) = aws.session_token {
-        headers.push(("x-amz-security-token".to_string(), token.clone()));
-    }
-
-    headers
+    aws_sigv4::sign_request(
+        &config,
+        "lambda",
+        "POST",
+        url_str,
+        "application/json",
+        payload,
+        now,
+    )
 }
 
 /// Test helpers — exposed for unit tests.
@@ -692,7 +588,7 @@ pub mod test_helpers {
         payload: &[u8],
         now: &chrono::DateTime<Utc>,
     ) -> Vec<(String, String)> {
-        let cfg = AwsLambdaConfig {
+        let config = aws_sigv4::AwsSigV4Config {
             region: aws_config["region"]
                 .as_str()
                 .unwrap_or_default()
@@ -709,13 +605,16 @@ pub mod test_helpers {
                 .as_str()
                 .filter(|s| !s.is_empty())
                 .map(String::from),
-            function_name: aws_config["function_name"]
-                .as_str()
-                .unwrap_or_default()
-                .to_string(),
-            qualifier: None,
         };
-        sign_aws_request(&cfg, url, payload, now)
+        aws_sigv4::sign_request(
+            &config,
+            "lambda",
+            "POST",
+            url,
+            "application/json",
+            payload,
+            now,
+        )
     }
 }
 

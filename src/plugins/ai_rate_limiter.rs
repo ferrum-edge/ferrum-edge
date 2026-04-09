@@ -407,6 +407,10 @@ impl Plugin for AiRateLimiter {
         true
     }
 
+    fn applies_after_proxy_on_reject(&self) -> bool {
+        true
+    }
+
     async fn before_proxy(
         &self,
         ctx: &mut RequestContext,
@@ -540,6 +544,26 @@ impl Plugin for AiRateLimiter {
         _response_status: u16,
         response_headers: &mut HashMap<String, String>,
     ) -> PluginResult {
+        // When ai_federation short-circuits via RejectBinary, on_response_body
+        // never fires. Record token usage here on the rejection path instead.
+        // The ai_federation_provider key distinguishes federation responses from
+        // normal proxy responses, preventing double-counting.
+        if ctx.metadata.contains_key("ai_federation_provider")
+            && let Some(tokens) = self.read_tokens_from_metadata(&ctx.metadata)
+        {
+            let key = self.rate_key(ctx);
+            if self.redis_client.is_some() && self.record_usage_redis(&key, tokens).await {
+                // recorded in redis
+            } else {
+                let window_duration = Duration::from_secs(self.window_seconds.max(1));
+                let mut entry = self
+                    .state
+                    .entry(key)
+                    .or_insert_with(|| TokenWindow::new(self.token_limit, window_duration));
+                entry.record_usage(tokens);
+            }
+        }
+
         if !self.expose_headers {
             return PluginResult::Continue;
         }

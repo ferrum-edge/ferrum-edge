@@ -234,6 +234,7 @@ async fn test_all_plugins_available() {
         "kafka_logging",
         "soap_ws_security",
         "spec_expose",
+        "ai_federation",
     ]
     .into_iter()
     .collect();
@@ -292,6 +293,9 @@ async fn test_plugin_creation_all_plugins() {
             "graphql" => json!({"max_depth": 100}),
             "grpc_method_router" => json!({"allow_methods": ["test.Svc/Method"]}),
             "ai_rate_limiter" => json!({"token_limit": 100000}),
+            "ai_federation" => {
+                json!({"providers": [{"name": "test", "provider_type": "openai", "api_key": "sk-test"}]})
+            }
             "ldap_auth" => json!({
                 "ldap_url": "ldap://ldap.example.com:389",
                 "bind_dn_template": "uid={username},ou=users,dc=example,dc=com"
