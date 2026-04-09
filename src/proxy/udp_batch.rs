@@ -179,10 +179,12 @@ fn sockaddr_storage_to_std(addr: &libc::sockaddr_storage) -> std::io::Result<Soc
         }
         libc::AF_INET6 => {
             let a = unsafe { &*(addr as *const _ as *const libc::sockaddr_in6) };
-            Ok(SocketAddr::new(
-                std::net::IpAddr::V6(std::net::Ipv6Addr::from(a.sin6_addr.s6_addr)),
+            Ok(SocketAddr::V6(std::net::SocketAddrV6::new(
+                std::net::Ipv6Addr::from(a.sin6_addr.s6_addr),
                 u16::from_be(a.sin6_port),
-            ))
+                a.sin6_flowinfo,
+                a.sin6_scope_id,
+            )))
         }
         family => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
