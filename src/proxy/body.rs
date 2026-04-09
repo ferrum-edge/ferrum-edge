@@ -9,6 +9,7 @@ use bytes::Bytes;
 use http_body::Frame;
 use http_body_util::{Full, StreamBody};
 use hyper::body::Incoming;
+use pin_project_lite::pin_project;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -236,6 +237,60 @@ impl http_body::Body for ProxyBody {
     }
 }
 
+// -- SyncBody wrapper ---------------------------------------------------------
+
+pin_project! {
+    /// Wraps a `Send` body to also implement `Sync`, enabling use with
+    /// `reqwest::Body::wrap()` which requires `Send + Sync + 'static`.
+    ///
+    /// # Safety
+    /// Bodies are only polled from a single tokio task (`poll_frame` takes
+    /// `Pin<&mut Self>`). The `&self` methods (`is_end_stream`, `size_hint`)
+    /// only read immutable state. There are no concurrent mutable accesses
+    /// from different threads.
+    pub struct SyncBody<B> {
+        #[pin]
+        inner: B,
+    }
+}
+
+// SAFETY: See doc comment on `SyncBody`. The body is only ever mutated
+// through `Pin<&mut Self>` (poll_frame) from a single task. The immutable
+// accessors (is_end_stream, size_hint) are safe to call concurrently.
+unsafe impl<B: Send> Sync for SyncBody<B> {}
+
+impl<B> SyncBody<B> {
+    pub fn new(inner: B) -> Self {
+        Self { inner }
+    }
+}
+
+impl<B> http_body::Body for SyncBody<B>
+where
+    B: http_body::Body<Data = Bytes>,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    type Data = Bytes;
+    type Error = B::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        self.project().inner.poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+// -- SizeLimitedIncoming ------------------------------------------------------
+
 /// A size-limited stream adapter over hyper's `Incoming` body.
 ///
 /// Wraps `Incoming` and counts bytes as they flow through. If the
@@ -265,14 +320,14 @@ impl SizeLimitedIncoming {
 
     /// Convert this size-limited body into a `reqwest::Body` for streaming
     /// to the backend without collecting the full body into memory.
+    ///
+    /// Uses `reqwest::Body::wrap()` instead of `wrap_stream()` to preserve
+    /// the `size_hint()` from the underlying `Incoming` body. When the client
+    /// sends `Content-Length`, this enables reqwest to forward a length-delimited
+    /// body instead of chunked Transfer-Encoding — avoiding per-chunk framing
+    /// overhead and enabling single-buffer receive on the backend.
     pub fn into_reqwest_body(self) -> reqwest::Body {
-        use futures_util::TryStreamExt;
-
-        // Convert the Body into a stream of data frames, filtering out
-        // non-data frames (trailers, etc.)
-        let stream = http_body_util::BodyStream::new(self)
-            .try_filter_map(|frame| async move { Ok(frame.into_data().ok()) });
-        reqwest::Body::wrap_stream(stream)
+        reqwest::Body::wrap(SyncBody::new(self))
     }
 }
 

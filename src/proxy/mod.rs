@@ -6094,11 +6094,10 @@ async fn proxy_to_backend(
                     );
                     req_builder = req_builder.body(limited.into_reqwest_body());
                 } else {
-                    // No size limit — stream body directly via wrap_stream
-                    use futures_util::TryStreamExt;
-                    let stream = http_body_util::BodyStream::new(incoming)
-                        .try_filter_map(|frame| async move { Ok(frame.into_data().ok()) });
-                    req_builder = req_builder.body(reqwest::Body::wrap_stream(stream));
+                    // No size limit — stream body directly, preserving size_hint
+                    // for Content-Length forwarding (avoids chunked encoding overhead)
+                    req_builder =
+                        req_builder.body(reqwest::Body::wrap(body::SyncBody::new(incoming)));
                 }
             }
             ClientRequestBody::Streaming(original_req) => {
