@@ -255,6 +255,14 @@ pub async fn run(
     // Start service discovery background tasks
     proxy_state.start_service_discovery(Some(shutdown_tx.subscribe()));
 
+    // Start overload monitor background task
+    let overload_handle = crate::overload::start_monitor(
+        proxy_state.overload.clone(),
+        env_config.overload_config(),
+        env_config.max_connections,
+        shutdown_tx.subscribe(),
+    );
+
     // Load TLS configuration if provided
     let tls_config = if let (Some(cert_path), Some(key_path)) = (
         &env_config.frontend_tls_cert_path,
@@ -804,11 +812,19 @@ pub async fn run(
         handle.await?;
     }
 
+    // Graceful connection drain: wait for in-flight requests to complete.
+    let drain_seconds = env_config.shutdown_drain_seconds;
+    if drain_seconds > 0 {
+        crate::overload::wait_for_drain(&proxy_state.overload, Duration::from_secs(drain_seconds))
+            .await;
+    }
+
     // Wait for background tasks to drain cleanly, with a timeout to prevent
     // hanging if a task is stuck (e.g., blocked on a DB query or DNS lookup).
     let bg_drain = async {
         let _ = dns_handle.await;
         let _ = db_poll_handle.await;
+        let _ = overload_handle.await;
     };
     if tokio::time::timeout(Duration::from_secs(5), bg_drain)
         .await

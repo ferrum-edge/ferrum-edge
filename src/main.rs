@@ -23,6 +23,7 @@ mod health_check;
 mod http3;
 mod load_balancer;
 mod modes;
+mod overload;
 mod plugin_cache;
 mod plugins;
 mod proxy;

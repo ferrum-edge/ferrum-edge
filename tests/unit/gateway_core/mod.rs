@@ -8,6 +8,7 @@ mod grpc_proxy_tests;
 mod health_check_tests;
 mod http3_config_tests;
 mod load_balancer_tests;
+mod overload_tests;
 mod pool_key_tests;
 mod protocol_validation_tests;
 mod proxy_body_tests;

@@ -215,8 +215,17 @@ pub async fn start_http3_listener_with_signal(
             incoming = endpoint.accept() => {
                 match incoming {
                     Some(connecting) => {
+                        // Reject under critical overload
+                        if state.overload.reject_new_connections.load(
+                            std::sync::atomic::Ordering::Relaxed,
+                        ) {
+                            connecting.refuse();
+                            continue;
+                        }
                         let state = state.clone();
                         tokio::spawn(async move {
+                            let _conn_guard =
+                                crate::overload::ConnectionGuard::new(&state.overload);
                             if let Err(e) = handle_h3_connection(connecting, state).await {
                                 debug!("HTTP/3 connection error: {}", e);
                             }

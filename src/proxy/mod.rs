@@ -499,6 +499,9 @@ pub struct ProxyState {
     /// Certificate Revocation Lists for backend TLS verification.
     /// Loaded once at startup from `FERRUM_TLS_CRL_FILE_PATH` and shared via Arc.
     pub crls: crate::tls::CrlList,
+    /// Overload state for progressive load shedding and graceful drain tracking.
+    /// Shared across all accept loops and the background monitor.
+    pub overload: Arc<crate::overload::OverloadState>,
     /// Adaptive buffer size and batch limit tracker for TCP/WS tunnel/UDP.
     /// Tracks EWMA of bytes per connection and datagrams per batch cycle per proxy.
     pub adaptive_buffer: Arc<crate::adaptive_buffer::AdaptiveBufferTracker>,
@@ -724,6 +727,7 @@ impl ProxyState {
             ws_connection_counter: Arc::new(AtomicU64::new(0)),
             tls_policy: tls_policy_arc,
             crls,
+            overload: Arc::new(crate::overload::OverloadState::new()),
             adaptive_buffer,
         })
     }
@@ -3046,11 +3050,27 @@ async fn run_accept_loop(
             result = listener.accept() => {
                 match result {
                     Ok((stream, remote_addr)) => {
+                        // Overload check: reject new connections under critical
+                        // pressure. Checked after accept (inside the select!) so
+                        // shutdown_rx is always observed even during sustained
+                        // overload. Single atomic load (~1ns).
+                        if state
+                            .overload
+                            .reject_new_connections
+                            .load(std::sync::atomic::Ordering::Relaxed)
+                        {
+                            drop(stream); // TCP RST
+                            continue;
+                        }
                         let state = state.clone();
                         let tls_config = tls_config.clone();
                         let semaphore = conn_semaphore.clone();
 
                         tokio::spawn(async move {
+                            // Track this connection for graceful drain.
+                            // The guard decrements the counter on drop (all exit paths).
+                            let _conn_guard = crate::overload::ConnectionGuard::new(&state.overload);
+
                             // Acquire connection permit if limit is configured.
                             // The permit is held for the connection lifetime and
                             // released automatically when _permit drops.
@@ -5545,6 +5565,22 @@ pub async fn handle_proxy_request(
     // Advertise HTTP/3 availability via pre-computed Alt-Svc header
     if let Some(ref alt_svc) = state.alt_svc_header {
         resp_builder = resp_builder.header("alt-svc", alt_svc.as_str());
+    }
+
+    // During shutdown drain or overload pressure, tell HTTP/1.1 clients to
+    // close after this response instead of reusing the connection. This
+    // naturally frees connection slots for new clients (overload) or allows
+    // the process to exit cleanly (drain). Single atomic load, ~1ns.
+    if state
+        .overload
+        .draining
+        .load(std::sync::atomic::Ordering::Relaxed)
+        || state
+            .overload
+            .disable_keepalive
+            .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        resp_builder = resp_builder.header("connection", "close");
     }
 
     // Via header on response path (RFC 9110 §7.6.3)
