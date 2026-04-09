@@ -861,6 +861,7 @@ Reduce per-request allocations in plugin lookup
 | `FERRUM_TCP_IDLE_TIMEOUT_SECONDS` | `300` | Default TCP idle timeout (5 min). Per-proxy `tcp_idle_timeout_seconds` overrides. 0 = disabled |
 | `FERRUM_UDP_MAX_SESSIONS` | `10000` | Maximum concurrent UDP sessions per proxy |
 | `FERRUM_UDP_CLEANUP_INTERVAL_SECONDS` | `10` | UDP session cleanup sweep interval |
+| `FERRUM_UDP_RECV_BATCH_LIMIT` | `6000` | Max datagrams drained per recv wakeup before yielding. Higher = better burst throughput, lower = better fairness |
 | `FERRUM_WORKER_THREADS` | (CPU cores) | Tokio worker threads (maps to `runtime::Builder::worker_threads`) |
 | `FERRUM_BLOCKING_THREADS` | `512` | Tokio max blocking threads |
 | `FERRUM_MAX_CONNECTIONS` | `100000` | Max concurrent proxy connections (semaphore-bounded; 0 = unlimited) |
@@ -875,6 +876,7 @@ Reduce per-request allocations in plugin lookup
 | `FERRUM_MAX_QUERY_PARAMS` | `100` | Max number of query parameters allowed. `0` = unlimited |
 | `FERRUM_MAX_GRPC_RECV_SIZE_BYTES` | `4194304` | Max total received gRPC payload size in bytes (4 MiB). `0` = unlimited |
 | `FERRUM_MAX_WEBSOCKET_FRAME_SIZE_BYTES` | `16777216` | Max WebSocket frame size in bytes (16 MiB). Also sets max message size to 4x frame size |
+| `FERRUM_WEBSOCKET_WRITE_BUFFER_SIZE` | `131072` | WebSocket write buffer size in bytes (128 KB). Controls data buffered before flushing to transport. Increase to 4194304 for workloads with large WS frames (1 MB+). Only applies when frame-level plugins are active |
 | `FERRUM_MAX_CREDENTIALS_PER_TYPE` | `2` | Max credential entries per type per consumer. Enables zero-downtime rotation by allowing multiple active credentials simultaneously |
 | `FERRUM_HTTP_HEADER_READ_TIMEOUT_SECONDS` | `10` | HTTP/1.1 header read timeout in seconds. Protects against slowloris attacks. `0` = disabled |
 | `FERRUM_BACKEND_ALLOW_IPS` | `both` | Backend IP allowlist policy: `private` (only RFC 1918/loopback/link-local/CGNAT), `public` (only non-private), `both` (no restriction) |

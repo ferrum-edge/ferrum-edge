@@ -471,6 +471,7 @@ pub struct ProxyState {
     pub max_query_params: usize,
     pub max_grpc_recv_size_bytes: usize,
     pub max_websocket_frame_size_bytes: usize,
+    pub websocket_write_buffer_size: usize,
     /// Parsed trusted proxy CIDRs for X-Forwarded-For client IP resolution.
     /// Pre-parsed from `env_config.trusted_proxies` to avoid re-parsing on every request.
     pub trusted_proxies: Arc<client_ip::TrustedProxies>,
@@ -530,6 +531,7 @@ impl ProxyState {
         let max_query_params = env_config.max_query_params;
         let max_grpc_recv_size_bytes = env_config.max_grpc_recv_size_bytes;
         let max_websocket_frame_size_bytes = env_config.max_websocket_frame_size_bytes;
+        let websocket_write_buffer_size = env_config.websocket_write_buffer_size;
         let max_concurrent_requests_per_ip = env_config.max_concurrent_requests_per_ip;
         let trusted_proxies = Arc::new(client_ip::TrustedProxies::parse(
             &env_config.trusted_proxies,
@@ -642,6 +644,7 @@ impl ProxyState {
             env_config_arc.tcp_idle_timeout_seconds,
             env_config_arc.udp_max_sessions,
             env_config_arc.udp_cleanup_interval_seconds,
+            env_config_arc.udp_recv_batch_limit,
             tls_policy_arc.clone(),
             crls.clone(),
         ));
@@ -689,6 +692,7 @@ impl ProxyState {
             max_query_params,
             max_grpc_recv_size_bytes,
             max_websocket_frame_size_bytes,
+            websocket_write_buffer_size,
             trusted_proxies,
             websocket_conn_limit,
             per_ip_request_counts: if max_concurrent_requests_per_ip > 0 {
@@ -1973,6 +1977,7 @@ async fn handle_websocket_request_authenticated(
             state.tls_policy.as_deref(),
             &state.crls,
             state.max_websocket_frame_size_bytes,
+            state.websocket_write_buffer_size,
         )
         .await
         {
@@ -2256,6 +2261,7 @@ async fn handle_websocket_request_authenticated(
     let proxy_id = proxy.id.clone();
     let ws_conn_id = state.ws_connection_counter.fetch_add(1, Ordering::Relaxed);
     let max_ws_frame = state.max_websocket_frame_size_bytes;
+    let ws_write_buf = state.websocket_write_buffer_size;
     tokio::spawn(async move {
         match on_upgrade.await {
             Ok(upgraded) => {
@@ -2267,6 +2273,7 @@ async fn handle_websocket_request_authenticated(
                     ws_frame_plugins,
                     ws_connection_permit,
                     max_ws_frame,
+                    ws_write_buf,
                 )
                 .await
                 {
@@ -2497,6 +2504,7 @@ fn build_websocket_tls_connector(
 
 /// Connect to backend WebSocket server before sending 101 to client.
 /// Returns the connected backend stream, or an error if the backend is unreachable.
+#[allow(clippy::too_many_arguments)]
 async fn connect_websocket_backend(
     backend_url: &str,
     proxy: &Proxy,
@@ -2505,6 +2513,7 @@ async fn connect_websocket_backend(
     tls_policy: Option<&TlsPolicy>,
     crls: &crate::tls::CrlList,
     max_websocket_frame_size_bytes: usize,
+    websocket_write_buffer_size: usize,
 ) -> Result<
     WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
     Box<dyn std::error::Error + Send + Sync>,
@@ -2512,8 +2521,7 @@ async fn connect_websocket_backend(
     let mut ws_config = WebSocketConfig::default();
     ws_config.max_frame_size = Some(max_websocket_frame_size_bytes);
     ws_config.max_message_size = Some(max_websocket_frame_size_bytes.saturating_mul(4));
-    // 4 MiB write buffer reduces syscalls for large frames (default 128 KB = ~70 writes per 9 MB frame)
-    ws_config.write_buffer_size = 4 * 1024 * 1024;
+    ws_config.write_buffer_size = websocket_write_buffer_size;
 
     let mut ws_request = backend_url.into_client_request()?;
     for (name, value) in client_headers {
@@ -2561,6 +2569,7 @@ async fn connect_websocket_backend(
 /// `ws_frame_plugins` — plugins that opted into per-frame hooks by returning `true`
 /// from `requires_ws_frame_hooks()`. Pass an empty `Vec` for zero-overhead forwarding
 /// when no plugin on this proxy needs frame inspection.
+#[allow(clippy::too_many_arguments)]
 async fn run_websocket_proxy(
     upgraded: Upgraded,
     backend_ws_stream: WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
@@ -2569,6 +2578,7 @@ async fn run_websocket_proxy(
     ws_frame_plugins: Vec<Arc<dyn Plugin>>,
     _ws_connection_permit: Option<tokio::sync::OwnedSemaphorePermit>,
     max_websocket_frame_size_bytes: usize,
+    websocket_write_buffer_size: usize,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // When no plugins need frame-level hooks, bypass WebSocket frame parsing
     // entirely and do raw TCP bidirectional copy (same approach as Envoy after
@@ -2589,8 +2599,7 @@ async fn run_websocket_proxy(
     let mut ws_config = WebSocketConfig::default();
     ws_config.max_frame_size = Some(max_websocket_frame_size_bytes);
     ws_config.max_message_size = Some(max_websocket_frame_size_bytes.saturating_mul(4));
-    // 4 MiB write buffer reduces syscalls for large frames (default 128 KB = ~70 writes per 9 MB frame)
-    ws_config.write_buffer_size = 4 * 1024 * 1024;
+    ws_config.write_buffer_size = websocket_write_buffer_size;
 
     let ws_stream = WebSocketStream::from_raw_socket(
         TokioIo::new(upgraded),

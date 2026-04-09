@@ -37,9 +37,9 @@ use crate::plugins::{
 const MAX_UDP_DATAGRAM_SIZE: usize = 65535;
 
 /// Maximum datagrams to drain per recv wakeup via `try_recv_from` before yielding
-/// back to the async runtime. Keeps the event loop responsive while amortising
-/// wakeup overhead under burst traffic.
-const RECV_BATCH_LIMIT: usize = 6000;
+/// back to the async runtime. Configurable via `FERRUM_UDP_RECV_BATCH_LIMIT`.
+/// Default: 6000 (matches Envoy's MAX_NUM_PACKETS_PER_EVENT_LOOP).
+static RECV_BATCH_LIMIT: AtomicU64 = AtomicU64::new(6000);
 
 /// Metrics for a single UDP proxy listener.
 #[derive(Default)]
@@ -205,6 +205,9 @@ pub struct UdpListenerConfig {
     /// When set, this listener serves multiple passthrough proxies sharing the port.
     /// SNI from the DTLS ClientHello selects which proxy to route to.
     pub sni_proxy_ids: Option<Vec<String>>,
+    /// Maximum datagrams to drain per recv wakeup before yielding to the async
+    /// runtime. Higher values improve throughput under burst traffic. Default: 6000.
+    pub recv_batch_limit: usize,
 }
 
 /// Start a UDP proxy listener on the given port.
@@ -235,6 +238,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
         crls,
         started,
         sni_proxy_ids,
+        recv_batch_limit,
     } = cfg;
 
     if let Some(dtls_config) = frontend_dtls_config {
@@ -258,6 +262,9 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
         )
         .await;
     }
+
+    // Set the module-level batch limit from config (idempotent across listeners).
+    RECV_BATCH_LIMIT.store(recv_batch_limit as u64, Ordering::Relaxed);
 
     let addr = SocketAddr::new(bind_addr, port);
     let frontend_socket = Arc::new(UdpSocket::bind(addr).await?);
@@ -361,7 +368,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                 }
 
                 // Drain additional pending datagrams without yielding to the runtime.
-                for _ in 0..RECV_BATCH_LIMIT {
+                for _ in 0..recv_batch_limit {
                     match frontend_socket.try_recv_from(&mut buf) {
                         Ok((len2, addr2)) => {
                             batch_dgrams_in += 1;
@@ -1807,7 +1814,8 @@ async fn create_session(
                 let Some(ref sock) = backend_socket else {
                     break;
                 };
-                for _ in 0..RECV_BATCH_LIMIT {
+                let batch_limit = RECV_BATCH_LIMIT.load(Ordering::Relaxed) as usize;
+                for _ in 0..batch_limit {
                     match sock.try_recv(&mut buf) {
                         Ok(len2) => {
                             // Amplification check on batched response datagram
