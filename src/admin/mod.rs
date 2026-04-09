@@ -459,6 +459,26 @@ pub async fn handle_admin_request(
         return Ok(json_response(StatusCode::OK, &health_status));
     }
 
+    // Overload status (unauthenticated — for load balancer / monitoring probes)
+    if path == "/overload" && method == Method::GET {
+        if let Some(ref proxy_state) = state.proxy_state {
+            let snapshot = proxy_state.overload.snapshot();
+            let status = match snapshot.level {
+                crate::overload::OverloadLevel::Normal => StatusCode::OK,
+                crate::overload::OverloadLevel::Pressure => StatusCode::OK,
+                crate::overload::OverloadLevel::Critical => StatusCode::SERVICE_UNAVAILABLE,
+            };
+            return Ok(json_response(
+                status,
+                &serde_json::to_value(&snapshot).unwrap_or_default(),
+            ));
+        }
+        return Ok(json_response(
+            StatusCode::OK,
+            &json!({"level": "normal", "message": "No proxy state available"}),
+        ));
+    }
+
     // Prometheus metrics endpoint (unauthenticated for scraping)
     if path == "/metrics" && method == Method::GET {
         let registry = crate::plugins::prometheus_metrics::global_registry();

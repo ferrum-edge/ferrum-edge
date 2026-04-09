@@ -466,6 +466,7 @@ async fn test_http3_proxy_state_creation() {
         ws_connection_counter: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         tls_policy: None,
         crls: std::sync::Arc::new(Vec::new()),
+        overload: std::sync::Arc::new(ferrum_edge::overload::OverloadState::new()),
     };
 
     // Verify proxy state is created successfully
@@ -660,6 +661,7 @@ async fn test_http3_full_integration() {
         ws_connection_counter: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         tls_policy: None,
         crls: std::sync::Arc::new(Vec::new()),
+        overload: std::sync::Arc::new(ferrum_edge::overload::OverloadState::new()),
     };
 
     // Verify proxy state is created successfully

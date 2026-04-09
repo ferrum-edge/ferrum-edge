@@ -69,6 +69,14 @@ pub async fn run(
     // tasks are reconciled when CP pushes config via update_config)
     proxy_state.start_service_discovery(Some(shutdown_tx.subscribe()));
 
+    // Start overload monitor background task
+    let overload_handle = crate::overload::start_monitor(
+        proxy_state.overload.clone(),
+        env_config.overload_config(),
+        env_config.max_connections,
+        shutdown_tx.subscribe(),
+    );
+
     // Spawn the DP gRPC client to connect to CP and receive config updates
     let cp_url = env_config
         .dp_cp_grpc_url
@@ -463,11 +471,19 @@ pub async fn run(
         handle.await?;
     }
 
+    // Graceful connection drain: wait for in-flight requests to complete.
+    let drain_seconds = env_config.shutdown_drain_seconds;
+    if drain_seconds > 0 {
+        crate::overload::wait_for_drain(&proxy_state.overload, Duration::from_secs(drain_seconds))
+            .await;
+    }
+
     // Wait for background tasks to drain cleanly, with a timeout to prevent
     // hanging if a task is stuck (e.g., blocked on a gRPC stream read).
     let bg_drain = async {
         let _ = dns_handle.await;
         let _ = dp_client_handle.await;
+        let _ = overload_handle.await;
     };
     if tokio::time::timeout(Duration::from_secs(5), bg_drain)
         .await

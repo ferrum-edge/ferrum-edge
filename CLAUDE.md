@@ -159,6 +159,40 @@ Within each mode (database/file/dp), after config is loaded:
 16. **Stream listener bind** — `initial_reconcile_stream_listeners()` binds TCP/UDP stream proxy ports. In database/file modes, bind failure is fatal (gateway exits). In DP mode, bind failures are logged as errors but non-fatal — the DP continues serving HTTP traffic and retries when the CP pushes corrected config.
 17. **DNS warmup** — All backend hostnames (proxy backends, upstream targets, plugin endpoints) are resolved concurrently before accepting traffic.
 18. **Connection pool warmup** — When `FERRUM_POOL_WARMUP_ENABLED=true` (default), pre-establishes backend connections for HTTP-family pools (reqwest, gRPC, HTTP/2 direct, HTTP/3) after DNS warmup. TCP/UDP stream proxies are skipped (no persistent pools). Upstream targets are expanded so each target gets a warmed connection. Failures are logged as warnings but never block startup.
+19. **Overload monitor** — Background task started in all proxy-serving modes (database/file/dp). Monitors FD usage, active connection count, and event loop latency at `FERRUM_OVERLOAD_CHECK_INTERVAL_MS` intervals (default: 1s). Sets atomic action flags (`disable_keepalive`, `reject_new_connections`) when thresholds are breached. See `src/overload.rs`.
+
+### Graceful Shutdown & Connection Draining
+
+On SIGTERM/SIGINT the gateway performs a graceful drain:
+
+1. **Accept loops exit** — all listeners stop accepting new connections
+2. **Drain phase** — `OverloadState.draining` is set to `true`, causing `Connection: close` on all HTTP/1.1 responses. The gateway waits up to `FERRUM_SHUTDOWN_DRAIN_SECONDS` (default: 30) for the `active_connections` counter (maintained by `ConnectionGuard` RAII) to reach zero.
+3. **Background cleanup** — DNS refresh, config polling, overload monitor get 5s timeout
+4. **Exit** — process exits cleanly
+
+**Connection tracking**: Every accepted connection (HTTP/1.1, H2, H3, gRPC) creates a `ConnectionGuard` in the accept loop that increments `OverloadState.active_connections` on creation and decrements on drop. When the last guard drops during drain, `Notify::notify_one()` wakes the drain waiter. Cost: one `AtomicU64::fetch_add(Relaxed)` per connection (~5ns).
+
+**`FERRUM_SHUTDOWN_DRAIN_SECONDS=0`** disables draining — the gateway exits immediately after accept loops close, matching pre-drain behavior.
+
+### Overload Manager
+
+The overload manager (`src/overload.rs`) provides progressive load shedding based on resource pressure signals. It is always enabled.
+
+**Resource monitors** (run in a single background tokio task):
+- **File descriptors**: `count_open_fds()` / `get_fd_limit()` — prevents EMFILE cliff
+- **Connections**: `OverloadState.active_connections` / `FERRUM_MAX_CONNECTIONS`
+- **Event loop latency**: `tokio::task::yield_now()` scheduling delay — detects thread starvation
+
+**Progressive actions** (each signal triggers independently):
+
+| Threshold | Action | Hot Path Cost |
+|-----------|--------|---------------|
+| FD ≥ 80% or Conn ≥ 85% | `disable_keepalive` → `Connection: close` on responses | 1 `AtomicBool::load(Relaxed)` per response |
+| FD ≥ 95% or Conn ≥ 95% or Loop ≥ 500ms | `reject_new_connections` → accept+drop (HTTP) / refuse (H3) | 1 `AtomicBool::load(Relaxed)` per accept |
+
+**Admin endpoint**: `GET /overload` (unauthenticated) returns JSON with pressure ratios and active actions. Returns 503 when `level` is `critical`.
+
+**State transitions are logged**: `warn` when entering overload, `info` when recovering. No log spam — only logs on transitions.
 
 ### External Secret Resolution
 
@@ -221,6 +255,7 @@ src/
 ├── grpc/                      # CP/DP gRPC communication
 │   ├── cp_server.rs           # Control Plane gRPC server (ConfigSync service, broadcast channel)
 │   └── dp_client.rs           # Data Plane gRPC client (subscribe + exponential backoff reconnect)
+├── overload.rs                # Overload manager: resource monitors, progressive load shedding, graceful drain
 ├── load_balancer.rs           # Load balancing algorithms + per-upstream cache (Arc<UpstreamTarget> for zero-cost selection) + HealthContext for dual-map health filtering
 ├── health_check.rs            # Active (shared per-upstream probes) + passive (isolated per-proxy) health checking with two-level index
 ├── circuit_breaker.rs         # Three-state circuit breaker (connection errors vs status code failures tracked independently via trip_on_connection_errors)
@@ -890,6 +925,14 @@ Reduce per-request allocations in plugin lookup
 | `FERRUM_ADD_VIA_HEADER` | `true` | Add Via header (RFC 9110 §7.6.3) on request and response paths |
 | `FERRUM_VIA_PSEUDONYM` | `ferrum-edge` | Pseudonym in the Via header (e.g., `1.1 ferrum-edge`) |
 | `FERRUM_ADD_FORWARDED_HEADER` | `false` | Add Forwarded header (RFC 7239) alongside X-Forwarded-* headers |
+| `FERRUM_OVERLOAD_CHECK_INTERVAL_MS` | `1000` | Overload monitor check interval in milliseconds (min: 100) |
+| `FERRUM_OVERLOAD_FD_PRESSURE_THRESHOLD` | `0.80` | FD usage ratio to disable keepalive (0.0-1.0) |
+| `FERRUM_OVERLOAD_FD_CRITICAL_THRESHOLD` | `0.95` | FD usage ratio to reject new connections (0.0-1.0) |
+| `FERRUM_OVERLOAD_CONN_PRESSURE_THRESHOLD` | `0.85` | Connection usage ratio to disable keepalive (0.0-1.0) |
+| `FERRUM_OVERLOAD_CONN_CRITICAL_THRESHOLD` | `0.95` | Connection usage ratio to reject new connections (0.0-1.0) |
+| `FERRUM_OVERLOAD_LOOP_WARN_US` | `10000` | Event loop latency (μs) for warning log |
+| `FERRUM_OVERLOAD_LOOP_CRITICAL_US` | `500000` | Event loop latency (μs) to reject new connections |
+| `FERRUM_SHUTDOWN_DRAIN_SECONDS` | `30` | Seconds to wait for in-flight connections to drain on shutdown. `0` = immediate |
 
 See `src/config/env_config.rs` for the full list of 90+ environment variables.
 

@@ -618,6 +618,30 @@ pub struct EnvConfig {
     /// Default: 20_000. Set to 0 to disable the dedicated WebSocket cap and
     /// rely only on the global connection limit.
     pub websocket_max_connections: usize,
+
+    // ── Overload management ──────────────────────────────────────────────
+    /// How often the overload monitor checks resource pressure in milliseconds.
+    /// Default: 1000 (1 second).
+    pub overload_check_interval_ms: u64,
+    /// FD usage ratio above which keepalive is disabled. Default: 0.80 (80%).
+    pub overload_fd_pressure_threshold: f64,
+    /// FD usage ratio above which new connections are rejected. Default: 0.95 (95%).
+    pub overload_fd_critical_threshold: f64,
+    /// Connection semaphore usage ratio above which keepalive is disabled. Default: 0.85 (85%).
+    pub overload_conn_pressure_threshold: f64,
+    /// Connection semaphore usage ratio above which new connections are rejected. Default: 0.95 (95%).
+    pub overload_conn_critical_threshold: f64,
+    /// Event loop latency in microseconds above which a warning is logged. Default: 10000 (10ms).
+    pub overload_loop_warn_us: u64,
+    /// Event loop latency in microseconds above which new connections are rejected. Default: 500000 (500ms).
+    pub overload_loop_critical_us: u64,
+
+    // ── Graceful shutdown ────────────────────────────────────────────────
+    /// Seconds to wait for in-flight connections to drain on shutdown.
+    /// During the drain period, the gateway stops accepting new connections,
+    /// sets `Connection: close` on responses, and waits for existing requests
+    /// to complete. Default: 30. Set to 0 to skip draining (immediate shutdown).
+    pub shutdown_drain_seconds: u64,
 }
 
 impl Default for EnvConfig {
@@ -767,6 +791,14 @@ impl Default for EnvConfig {
             server_http2_max_pending_accept_reset_streams: 64,
             server_http2_max_local_error_reset_streams: 256,
             websocket_max_connections: 20_000,
+            overload_check_interval_ms: 1000,
+            overload_fd_pressure_threshold: 0.80,
+            overload_fd_critical_threshold: 0.95,
+            overload_conn_pressure_threshold: 0.85,
+            overload_conn_critical_threshold: 0.95,
+            overload_loop_warn_us: 10_000,
+            overload_loop_critical_us: 500_000,
+            shutdown_drain_seconds: 30,
         }
     }
 }
@@ -1190,6 +1222,47 @@ impl EnvConfig {
             websocket_max_connections: resolve_var(conf, "FERRUM_WEBSOCKET_MAX_CONNECTIONS")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(20_000),
+            overload_check_interval_ms: resolve_u64(
+                conf,
+                "FERRUM_OVERLOAD_CHECK_INTERVAL_MS",
+                1000,
+            )
+            .max(100), // minimum 100ms to prevent busy-looping
+            overload_fd_pressure_threshold: resolve_var(
+                conf,
+                "FERRUM_OVERLOAD_FD_PRESSURE_THRESHOLD",
+            )
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.80)
+            .clamp(0.0, 1.0),
+            overload_fd_critical_threshold: resolve_var(
+                conf,
+                "FERRUM_OVERLOAD_FD_CRITICAL_THRESHOLD",
+            )
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.95)
+            .clamp(0.0, 1.0),
+            overload_conn_pressure_threshold: resolve_var(
+                conf,
+                "FERRUM_OVERLOAD_CONN_PRESSURE_THRESHOLD",
+            )
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.85)
+            .clamp(0.0, 1.0),
+            overload_conn_critical_threshold: resolve_var(
+                conf,
+                "FERRUM_OVERLOAD_CONN_CRITICAL_THRESHOLD",
+            )
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.95)
+            .clamp(0.0, 1.0),
+            overload_loop_warn_us: resolve_u64(conf, "FERRUM_OVERLOAD_LOOP_WARN_US", 10_000),
+            overload_loop_critical_us: resolve_u64(
+                conf,
+                "FERRUM_OVERLOAD_LOOP_CRITICAL_US",
+                500_000,
+            ),
+            shutdown_drain_seconds: resolve_u64(conf, "FERRUM_SHUTDOWN_DRAIN_SECONDS", 30),
         };
 
         config.validate()?;
@@ -1198,6 +1271,19 @@ impl EnvConfig {
 
     /// Build a `SocketAddr` from the proxy bind address and the given port.
     /// The bind address is validated at config load time, so the parse is safe.
+    /// Build an [`OverloadConfig`] from the parsed env vars.
+    pub fn overload_config(&self) -> crate::overload::OverloadConfig {
+        crate::overload::OverloadConfig {
+            check_interval_ms: self.overload_check_interval_ms,
+            fd_pressure_threshold: self.overload_fd_pressure_threshold,
+            fd_critical_threshold: self.overload_fd_critical_threshold,
+            conn_pressure_threshold: self.overload_conn_pressure_threshold,
+            conn_critical_threshold: self.overload_conn_critical_threshold,
+            loop_warn_us: self.overload_loop_warn_us,
+            loop_critical_us: self.overload_loop_critical_us,
+        }
+    }
+
     pub fn proxy_socket_addr(&self, port: u16) -> std::net::SocketAddr {
         let ip: std::net::IpAddr = self
             .proxy_bind_address
