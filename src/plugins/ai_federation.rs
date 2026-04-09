@@ -385,10 +385,11 @@ impl AiFederation {
 
             let google_project_id = pv["google_project_id"].as_str().map(String::from);
             let google_region = pv["google_region"].as_str().map(String::from);
-            let aws_region = pv
-                .get("aws_region")
-                .and_then(|v| v.as_str())
-                .map(String::from);
+            let aws_region = config_or_env_str(
+                pv,
+                "aws_region",
+                Some(&["AWS_DEFAULT_REGION", "AWS_REGION"]),
+            );
 
             // Validate provider-specific required fields
             validate_provider_config(provider_type, &name, pv)?;
@@ -1498,7 +1499,9 @@ impl Plugin for AiFederation {
         let mut last_status: Option<u16> = None;
         let mut last_body: Option<Vec<u8>> = None;
 
-        for provider in &matching_providers {
+        let provider_count = matching_providers.len();
+        for (idx, provider) in matching_providers.iter().enumerate() {
+            let is_last_provider = idx + 1 == provider_count;
             let resolved_model = Self::resolve_model(provider, &model);
 
             let translated = match translate_request(provider, &openai_body, &resolved_model) {
@@ -1510,7 +1513,7 @@ impl Plugin for AiFederation {
                         "ai_federation: request translation failed"
                     );
                     last_error = Some(e);
-                    if self.fallback_enabled {
+                    if self.fallback_enabled && !is_last_provider {
                         continue;
                     }
                     break;
@@ -1531,7 +1534,10 @@ impl Plugin for AiFederation {
                 .call_provider(provider, &url, extra_headers, &body_bytes)
                 .await;
 
-            if self.should_fallback(&result) {
+            // Only fallback to the next provider if there is one remaining.
+            // On the last provider, fall through to process the response
+            // normally so normalization and token metadata writes still happen.
+            if self.should_fallback(&result) && !is_last_provider {
                 match &result {
                     Err(e) => {
                         warn!(
