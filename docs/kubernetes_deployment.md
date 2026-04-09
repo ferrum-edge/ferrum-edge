@@ -62,41 +62,37 @@ startupProbe:
 
 ### Strict Readiness
 
-Use this when you want readiness to fail unless the JSON body reports `"status":"ok"`:
+The `httpGet` probe above returns success for any 2xx status from `/health`. The gateway returns 200 with `{"status":"ok"}` when healthy, so `httpGet` is sufficient for most deployments.
+
+> **Note**: The distroless image has no shell or curl. Exec probes using `/bin/sh` and `curl` are not available. Use `httpGet` probes (shown above) or the built-in `ferrum-edge health` subcommand.
+
+If you need to inspect the response body (e.g., verify `"status":"ok"` or check DP config sync), use the `ferrum-edge health` exec probe:
 
 ```yaml
 readinessProbe:
   exec:
-    command:
-      - /bin/sh
-      - -ec
-      - |
-        body="$(curl -fsS http://127.0.0.1:9000/health)"
-        echo "$body" | grep -q '"status":"ok"'
+    command: ["/app/ferrum-edge", "health"]
   initialDelaySeconds: 5
   periodSeconds: 10
 ```
 
 ### Data Plane Readiness After Config Sync
 
-In DP mode, the pod can start before the Control Plane pushes config. If your deployment expects at least one proxy before the pod becomes ready, extend the probe:
+In DP mode, the pod can start before the Control Plane pushes config. The `httpGet` probe on `/health` will succeed once the admin API is listening, even before config is received. For most deployments this is acceptable — the DP returns 404 for unrouted paths until config arrives.
+
+If your deployment requires at least one proxy before the pod becomes ready, use a sidecar or init container with curl to inspect the health response body:
 
 ```yaml
+# Example with an ephemeral debug container or sidecar
 readinessProbe:
-  exec:
-    command:
-      - /bin/sh
-      - -ec
-      - |
-        body="$(curl -fsS http://127.0.0.1:9000/health)"
-        echo "$body" | grep -q '"status":"ok"'
-        echo "$body" | grep -q '"cached_config":{"available":true'
-        echo "$body" | grep -Eq '"proxy_count":[1-9][0-9]*'
+  httpGet:
+    path: /health
+    port: admin-http
+  initialDelaySeconds: 10
+  periodSeconds: 10
 ```
 
-`proxy_count` is reported inside `cached_config`, not as a top-level health field.
-
-If a zero-proxy config is valid in your environment, use a different readiness rule instead of the `proxy_count` check.
+`proxy_count` is reported inside `cached_config` in the `/health` JSON response, not as a top-level field.
 
 If you enable admin TLS and want probes over HTTPS, point the probe at `9443` with `scheme: HTTPS`. Many operators still keep port `9000` private inside the cluster just for probes and operational access.
 
@@ -177,10 +173,10 @@ spec:
               port: admin-http
             initialDelaySeconds: 5
             periodSeconds: 10
-          lifecycle:
-            preStop:
-              exec:
-                command: ["/bin/sh", "-c", "sleep 15"]
+          # Note: preStop with shell-based sleep is not available in distroless.
+          # Use terminationGracePeriodSeconds (set on the pod spec) to allow
+          # in-flight requests to drain before SIGKILL. The gateway handles
+          # SIGTERM gracefully.
           resources:
             requests:
               cpu: 250m

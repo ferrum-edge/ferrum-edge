@@ -34,16 +34,18 @@ docker build -t myregistry.azurecr.io/ferrum-edge:latest .
 
 The Dockerfile uses a **multi-stage build** for optimal size:
 
-1. **Builder Stage**: Compiles the Rust binary with all build dependencies
-2. **Runtime Stage**: Minimal Debian trixie-slim image with only runtime dependencies
+1. **Builder Stage**: Compiles the Rust binary with all build dependencies (rust:latest)
+2. **Runtime Stage**: Google distroless image (`gcr.io/distroless/cc-debian13:nonroot`) — no shell, no package manager, no OS-level CVEs
 
 **Image Features**:
-- Non-root user execution (UID 1000)
-- Health check endpoint
+- **Distroless**: Zero OS packages beyond glibc, libgcc, and ca-certificates. No shell, no curl, no apt — dramatically reduced attack surface
+- Non-root user execution (UID 65532, distroless `nonroot`)
+- Built-in health check via `ferrum-edge health` CLI subcommand
 - Multi-platform support (x86_64, ARM64)
+- OpenSSL is vendored (statically linked) — no runtime `libssl` dependency
 - Comprehensive labels for container metadata
 
-**Approximate Image Size**: ~200MB (varies by platform)
+**Approximate Image Size**: ~30MB (varies by platform)
 
 ## Running with Docker
 
@@ -90,16 +92,18 @@ docker run -v ferrum_data:/data ferrum-edge:latest
 
 ### Health Check
 
-The container includes a built-in health check:
+The container includes a built-in health check using the `ferrum-edge health` CLI subcommand (no curl needed in distroless):
 
 ```bash
 # Check container health
 docker ps
 # Shows health status (healthy/starting/unhealthy)
 
-# Test manually
-docker exec ferrum-edge curl -f http://localhost:9000/health
+# Test from the host
+curl -f http://localhost:9000/health
 ```
+
+> **Note**: The distroless image has no shell or curl. Use `curl` from the host or configure orchestrator-level health checks (e.g., Kubernetes `httpGet` probes).
 
 ## Running with Docker Compose
 
@@ -358,11 +362,11 @@ curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/admin/metrics
 
 **Health Monitoring**:
 ```bash
-# Container health check (automatic)
+# Container health check (automatic via ferrum-edge health subcommand)
 docker ps
 # HEALTHCHECK shows status
 
-# Manual health endpoint
+# Manual health endpoint (from host)
 curl http://localhost:9000/health
 # {"status": "ok"}
 ```
@@ -434,11 +438,11 @@ docker stop --time=30 ferrum-edge
 ```
 
 **In orchestration** (Kubernetes):
+
+> **Note**: The distroless image has no shell. Use a `httpGet` preStop hook or configure `terminationGracePeriodSeconds` instead of a shell-based sleep.
+
 ```yaml
-lifecycle:
-  preStop:
-    exec:
-      command: ["/bin/sh", "-c", "sleep 15"]
+terminationGracePeriodSeconds: 30
 ```
 
 ### 7. Upgrade Strategy
@@ -505,8 +509,8 @@ docker-compose restart ferrum-edge
 # Scale service (for DP mode)
 docker-compose up -d --scale ferrum-dp=5
 
-# Execute command in container
-docker-compose exec ferrum-edge curl http://localhost:9000/health
+# Check health from host
+curl http://localhost:9000/health
 
 # View resource usage
 docker stats
@@ -528,21 +532,26 @@ docker logs ferrum-edge
 
 ### Permission Denied
 
-The container runs as non-root user (UID 1000). Ensure volume permissions:
+The container runs as the distroless `nonroot` user (UID 65532). Ensure volume permissions:
 
 ```bash
-# Fix volume permissions
-docker exec ferrum-edge chown -R 1000:1000 /data
+# Fix volume permissions on the host before starting the container
+sudo chown -R 65532:65532 /path/to/volume
 ```
+
+> **Note**: `docker exec` with shell commands is not available in distroless images (no shell). Fix permissions from the host or use an init container.
 
 ### Health Check Failing
 
 ```bash
-# Debug health endpoint
-docker exec ferrum-edge curl -v http://localhost:9000/health
+# Debug health endpoint (from host — no curl available inside distroless)
+curl -v http://localhost:9000/health
 
-# Check Admin API JWT
-docker exec ferrum-edge curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/health
+# Check Admin API JWT (from host)
+curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/health
+
+# Check Docker health status
+docker inspect --format='{{.State.Health.Status}}' ferrum-edge
 ```
 
 ## See Also

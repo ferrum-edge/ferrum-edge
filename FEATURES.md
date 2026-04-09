@@ -397,6 +397,6 @@ Each individual cloud backend fetch (Vault, AWS, GCP, Azure) has a **30-second t
 ## Deployment
 
 - Single binary, mode selected via environment variable
-- Docker multi-stage build with health check endpoint
+- Docker multi-stage build with distroless runtime (zero OS-level CVEs, ~30MB image)
 - Docker Compose profiles for SQLite, PostgreSQL, and CP/DP topologies
 - CI pipeline: unit tests, functional tests, lint, performance regression
