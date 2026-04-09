@@ -147,6 +147,8 @@ pub struct TcpListenerConfig {
     /// SNI from the ClientHello selects which proxy to route to.
     /// When `None`, uses the single `proxy_id` (existing behavior).
     pub sni_proxy_ids: Option<Vec<String>>,
+    /// Adaptive buffer tracker for dynamic copy buffer sizing.
+    pub adaptive_buffer: Arc<crate::adaptive_buffer::AdaptiveBufferTracker>,
 }
 
 /// Start a TCP proxy listener on the given port.
@@ -177,6 +179,7 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
         crls,
         started,
         sni_proxy_ids,
+        adaptive_buffer,
     } = cfg;
     let addr = SocketAddr::new(bind_addr, port);
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -264,6 +267,7 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
                 let proxy_namespace = proxy_namespace.clone();
                 let cb_cache = circuit_breaker_cache.clone();
                 let sni_proxy_ids = sni_proxy_ids.clone();
+                let adaptive_buf = adaptive_buffer.clone();
 
                 tokio::spawn(async move {
                     let connected_at = chrono::Utc::now();
@@ -299,6 +303,7 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
                         &plugins,
                         &mut stream_ctx,
                         sni_proxy_ids.as_deref(),
+                        &adaptive_buf,
                     )
                     .await;
 
@@ -438,6 +443,7 @@ async fn handle_tcp_connection(
     plugins: &[Arc<dyn crate::plugins::Plugin>],
     stream_ctx: &mut StreamConnectionContext,
     sni_proxy_ids: Option<&[String]>,
+    adaptive_buffer: &crate::adaptive_buffer::AdaptiveBufferTracker,
 ) -> TcpConnectionResult {
     let start = Instant::now();
     let _ = client_stream.set_nodelay(true);
@@ -466,6 +472,7 @@ async fn handle_tcp_connection(
         plugins,
         stream_ctx,
         sni_proxy_ids,
+        adaptive_buffer,
     )
     .await;
 
@@ -494,6 +501,7 @@ async fn handle_tcp_connection_inner(
     plugins: &[Arc<dyn crate::plugins::Plugin>],
     stream_ctx: &mut StreamConnectionContext,
     sni_proxy_ids: Option<&[String]>,
+    adaptive_buffer: &crate::adaptive_buffer::AdaptiveBufferTracker,
 ) -> Result<TcpConnectionSuccess, anyhow::Error> {
     // --- SNI-based proxy resolution for shared passthrough ports ---
     // When multiple passthrough proxies share a listen_port, we must peek at
@@ -629,7 +637,12 @@ async fn handle_tcp_connection_inner(
                 }
             })?;
 
-        let copy_result = bidirectional_copy(client_stream, backend_stream, idle_timeout).await;
+        let buf_size = adaptive_buffer.get_buffer_size(proxy_id);
+        let copy_result =
+            bidirectional_copy(client_stream, backend_stream, idle_timeout, buf_size).await;
+        if let Ok((c2b, b2c)) = &copy_result {
+            adaptive_buffer.record_connection(proxy_id, c2b.saturating_add(*b2c));
+        }
 
         // Record circuit breaker outcome.
         if let Some(ref cb_config) = cb_info.cb_config {
@@ -896,16 +909,31 @@ async fn handle_tcp_connection_inner(
             }
         }
 
+        let buf_size = adaptive_buffer.get_buffer_size(proxy_id);
         match backend_stream {
-            BackendStream::Tls(bs) => bidirectional_copy(tls_stream, bs, idle_timeout).await,
-            BackendStream::Plain(bs) => bidirectional_copy(tls_stream, bs, idle_timeout).await,
+            BackendStream::Tls(bs) => {
+                bidirectional_copy(tls_stream, bs, idle_timeout, buf_size).await
+            }
+            BackendStream::Plain(bs) => {
+                bidirectional_copy(tls_stream, bs, idle_timeout, buf_size).await
+            }
         }
     } else {
+        let buf_size = adaptive_buffer.get_buffer_size(proxy_id);
         match backend_stream {
-            BackendStream::Tls(bs) => bidirectional_copy(client_stream, bs, idle_timeout).await,
-            BackendStream::Plain(bs) => bidirectional_copy(client_stream, bs, idle_timeout).await,
+            BackendStream::Tls(bs) => {
+                bidirectional_copy(client_stream, bs, idle_timeout, buf_size).await
+            }
+            BackendStream::Plain(bs) => {
+                bidirectional_copy(client_stream, bs, idle_timeout, buf_size).await
+            }
         }
     };
+
+    // Record adaptive buffer stats for the TLS/non-passthrough path.
+    if let Ok((c2b, b2c)) = &copy_result {
+        adaptive_buffer.record_connection(proxy_id, c2b.saturating_add(*b2c));
+    }
 
     // Record circuit breaker outcome based on copy result.
     if let Some(ref cb_config) = current_cb_info.cb_config {
@@ -1009,11 +1037,6 @@ async fn connect_backend_tls_cached(
     Ok(tls_stream)
 }
 
-/// Buffer size for bidirectional TCP copy. 64 KiB reduces syscall overhead
-/// compared to the tokio default of 8 KiB, yielding significantly higher
-/// throughput for bulk TCP traffic.
-const TCP_COPY_BUF_SIZE: usize = 64 * 1024;
-
 /// Bidirectional stream copy between client and backend.
 /// Returns (bytes_client_to_backend, bytes_backend_to_client).
 ///
@@ -1024,6 +1047,7 @@ async fn bidirectional_copy<C, B>(
     mut client: C,
     mut backend: B,
     idle_timeout: Option<Duration>,
+    buf_size: usize,
 ) -> Result<(u64, u64), anyhow::Error>
 where
     C: AsyncRead + AsyncWrite + Unpin,
@@ -1038,8 +1062,8 @@ where
             let copy_fut = tokio::io::copy_bidirectional_with_sizes(
                 &mut tracked_client,
                 &mut tracked_backend,
-                TCP_COPY_BUF_SIZE,
-                TCP_COPY_BUF_SIZE,
+                buf_size,
+                buf_size,
             );
             tokio::pin!(copy_fut);
 
@@ -1067,14 +1091,9 @@ where
         }
         _ => {
             // No idle timeout — fast path with zero overhead.
-            tokio::io::copy_bidirectional_with_sizes(
-                &mut client,
-                &mut backend,
-                TCP_COPY_BUF_SIZE,
-                TCP_COPY_BUF_SIZE,
-            )
-            .await
-            .map_err(|e| anyhow::anyhow!("Bidirectional copy error: {}", e))
+            tokio::io::copy_bidirectional_with_sizes(&mut client, &mut backend, buf_size, buf_size)
+                .await
+                .map_err(|e| anyhow::anyhow!("Bidirectional copy error: {}", e))
         }
     }
 }

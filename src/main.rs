@@ -6,6 +6,7 @@
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+mod adaptive_buffer;
 mod admin;
 mod circuit_breaker;
 mod cli;

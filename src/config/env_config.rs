@@ -462,10 +462,22 @@ pub struct EnvConfig {
     pub udp_max_sessions: usize,
     /// UDP session cleanup interval in seconds (default: 10).
     pub udp_cleanup_interval_seconds: u64,
-    /// Maximum datagrams to drain per recv wakeup before yielding to the async
-    /// runtime. Higher values improve throughput under burst traffic at the cost
-    /// of event loop fairness. Default: 6000 (matches Envoy's per-loop limit).
-    pub udp_recv_batch_limit: usize,
+
+    // Adaptive Buffer Sizing
+    /// Enable adaptive buffer sizing for TCP/WebSocket tunnel copy buffers (default: true).
+    pub adaptive_buffer_enabled: bool,
+    /// Enable adaptive UDP batch limit per proxy (default: true).
+    pub adaptive_batch_limit_enabled: bool,
+    /// EWMA smoothing factor (1-999, fixed-point where 1000 = 1.0). Default: 300 (α = 0.3).
+    pub adaptive_buffer_ewma_alpha: u64,
+    /// Minimum buffer size in bytes (floor). Default: 8192 (8 KiB).
+    pub adaptive_buffer_min_size: usize,
+    /// Maximum buffer size in bytes (ceiling). Default: 262144 (256 KiB).
+    pub adaptive_buffer_max_size: usize,
+    /// Default buffer size when no data recorded yet. Default: 65536 (64 KiB).
+    pub adaptive_buffer_default_size: usize,
+    /// Default batch limit when no data recorded yet. Default: 6000.
+    pub adaptive_batch_limit_default: usize,
 
     // TLS Hardening
     /// Minimum TLS version: "1.2" or "1.3" (default: "1.2")
@@ -734,7 +746,13 @@ impl Default for EnvConfig {
             tcp_idle_timeout_seconds: 300,
             udp_max_sessions: 10_000,
             udp_cleanup_interval_seconds: 10,
-            udp_recv_batch_limit: 6_000,
+            adaptive_buffer_enabled: true,
+            adaptive_batch_limit_enabled: true,
+            adaptive_buffer_ewma_alpha: 300,
+            adaptive_buffer_min_size: 8_192,
+            adaptive_buffer_max_size: 262_144,
+            adaptive_buffer_default_size: 65_536,
+            adaptive_batch_limit_default: 6_000,
             tls_min_version: "1.2".into(),
             tls_max_version: "1.3".into(),
             tls_cipher_suites: None,
@@ -1068,7 +1086,35 @@ impl EnvConfig {
                 "FERRUM_UDP_CLEANUP_INTERVAL_SECONDS",
                 10,
             ),
-            udp_recv_batch_limit: resolve_usize(conf, "FERRUM_UDP_RECV_BATCH_LIMIT", 6_000),
+            // Adaptive Buffer Sizing
+            adaptive_buffer_enabled: resolve_bool(conf, "FERRUM_ADAPTIVE_BUFFER_ENABLED", true),
+            adaptive_batch_limit_enabled: resolve_bool(
+                conf,
+                "FERRUM_ADAPTIVE_BATCH_LIMIT_ENABLED",
+                true,
+            ),
+            adaptive_buffer_ewma_alpha: resolve_u64(conf, "FERRUM_ADAPTIVE_BUFFER_EWMA_ALPHA", 300)
+                .clamp(1, 999),
+            adaptive_buffer_min_size: resolve_usize(conf, "FERRUM_ADAPTIVE_BUFFER_MIN_SIZE", 8_192)
+                .clamp(1024, 1_048_576),
+            adaptive_buffer_max_size: resolve_usize(
+                conf,
+                "FERRUM_ADAPTIVE_BUFFER_MAX_SIZE",
+                262_144,
+            )
+            .clamp(1024, 1_048_576),
+            adaptive_buffer_default_size: resolve_usize(
+                conf,
+                "FERRUM_ADAPTIVE_BUFFER_DEFAULT_SIZE",
+                65_536,
+            )
+            .clamp(1024, 1_048_576),
+            adaptive_batch_limit_default: resolve_usize(
+                conf,
+                "FERRUM_ADAPTIVE_BATCH_LIMIT_DEFAULT",
+                6_000,
+            )
+            .max(1),
 
             // TLS Hardening
             tls_min_version: resolve_var_or(conf, "FERRUM_TLS_MIN_VERSION", "1.2"),

@@ -360,6 +360,8 @@ Multi-protocol benchmark results (macOS Apple Silicon, 200 concurrent, 10s, 64-b
 | UDP | 82,042 | 2.46ms | 2.93ms | 276,526 | 682μs | 1.27ms | ~70% |
 | UDP+DTLS | 76,107 | 2.61ms | 3.69ms | 101,839 | 1.96ms | 2.47ms | ~25% |
 
+**Adaptive buffer sizing** (enabled by default) dynamically tunes TCP/WebSocket tunnel copy buffers and UDP batch limits per proxy based on observed traffic patterns. Small-message proxies get smaller buffers (saves memory), bulk transfer proxies get larger buffers (reduces syscalls). See `FERRUM_ADAPTIVE_BUFFER_*` env vars for tuning.
+
 See `tests/performance/` for the full benchmark suite.
 
 ### Gateway Comparison (All-Docker, macOS Apple Silicon, 100 concurrent, 30s)

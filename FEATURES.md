@@ -153,6 +153,15 @@ Ferrum supports dynamic upstream target discovery through three providers, confi
 - TCP and HTTP/2 keep-alive with configurable intervals
 - **Startup pool warmup** — pre-establishes backend connections (reqwest, gRPC, HTTP/2, HTTP/3) after DNS warmup to eliminate first-request cold-start latency (configurable via `FERRUM_POOL_WARMUP_ENABLED`)
 
+## Adaptive Buffer Sizing
+
+- **Per-proxy adaptive copy buffers** — tracks bytes transferred per connection (EWMA) and selects optimal `copy_bidirectional` buffer sizes for TCP proxy and WebSocket tunnel connections. Small-message protocols get 8 KiB buffers (saves memory at scale), bulk transfers get 256 KiB buffers (reduces syscall overhead). Inspired by Envoy's watermark-based memory class bucketing.
+- **Per-proxy adaptive UDP batch limits** — tracks datagrams per recv wakeup cycle (EWMA) and selects per-proxy batch drain limits. Quiet proxies yield faster to the event loop (64 dgrams), burst proxies drain more per cycle (6000 dgrams).
+- Four buffer size tiers (8 KiB, 32 KiB, 64 KiB, 256 KiB) and four batch limit tiers (64, 256, 2000, 6000)
+- Lock-free hot path: DashMap read + AtomicU64 load + three comparisons per lookup
+- Configurable EWMA alpha, min/max buffer bounds, and defaults via `FERRUM_ADAPTIVE_BUFFER_*` env vars
+- Enabled by default; disable with `FERRUM_ADAPTIVE_BUFFER_ENABLED=false` / `FERRUM_ADAPTIVE_BATCH_LIMIT_ENABLED=false`
+
 ## High-Concurrency & Runtime Tuning
 
 - **jemalloc** memory allocator (Linux/macOS) for reduced fragmentation at scale
