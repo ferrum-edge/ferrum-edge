@@ -462,10 +462,6 @@ pub struct EnvConfig {
     pub udp_max_sessions: usize,
     /// UDP session cleanup interval in seconds (default: 10).
     pub udp_cleanup_interval_seconds: u64,
-    /// Maximum datagrams to drain per recv wakeup before yielding to the async
-    /// runtime. Higher values improve throughput under burst traffic at the cost
-    /// of event loop fairness. Default: 6000 (matches Envoy's per-loop limit).
-    pub udp_recv_batch_limit: usize,
 
     // Adaptive Buffer Sizing
     /// Enable adaptive buffer sizing for TCP/WebSocket tunnel copy buffers (default: true).
@@ -750,7 +746,6 @@ impl Default for EnvConfig {
             tcp_idle_timeout_seconds: 300,
             udp_max_sessions: 10_000,
             udp_cleanup_interval_seconds: 10,
-            udp_recv_batch_limit: 6_000,
             adaptive_buffer_enabled: true,
             adaptive_batch_limit_enabled: true,
             adaptive_buffer_ewma_alpha: 300,
@@ -1091,8 +1086,6 @@ impl EnvConfig {
                 "FERRUM_UDP_CLEANUP_INTERVAL_SECONDS",
                 10,
             ),
-            udp_recv_batch_limit: resolve_usize(conf, "FERRUM_UDP_RECV_BATCH_LIMIT", 6_000),
-
             // Adaptive Buffer Sizing
             adaptive_buffer_enabled: resolve_bool(conf, "FERRUM_ADAPTIVE_BUFFER_ENABLED", true),
             adaptive_batch_limit_enabled: resolve_bool(

@@ -406,7 +406,6 @@ async fn test_http3_proxy_state_creation() {
             300,
             10_000,
             10,
-            6_000,
             None,
             std::sync::Arc::new(Vec::new()),
             std::sync::Arc::new(ferrum_edge::adaptive_buffer::AdaptiveBufferTracker::new(
@@ -608,7 +607,6 @@ async fn test_http3_full_integration() {
             300,
             10_000,
             10,
-            6_000,
             None,
             std::sync::Arc::new(Vec::new()),
             std::sync::Arc::new(ferrum_edge::adaptive_buffer::AdaptiveBufferTracker::new(

@@ -659,7 +659,6 @@ impl ProxyState {
             env_config_arc.tcp_idle_timeout_seconds,
             env_config_arc.udp_max_sessions,
             env_config_arc.udp_cleanup_interval_seconds,
-            env_config_arc.udp_recv_batch_limit,
             tls_policy_arc.clone(),
             crls.clone(),
             adaptive_buffer.clone(),

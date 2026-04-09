@@ -36,11 +36,6 @@ use crate::plugins::{
 /// Maximum datagram size for UDP forwarding.
 const MAX_UDP_DATAGRAM_SIZE: usize = 65535;
 
-/// Maximum datagrams to drain per recv wakeup via `try_recv_from` before yielding
-/// back to the async runtime. Configurable via `FERRUM_UDP_RECV_BATCH_LIMIT`.
-/// Default: 6000
-static RECV_BATCH_LIMIT: AtomicU64 = AtomicU64::new(6000);
-
 /// Metrics for a single UDP proxy listener.
 #[derive(Default)]
 pub struct UdpProxyMetrics {
@@ -209,9 +204,6 @@ pub struct UdpListenerConfig {
     /// When set, this listener serves multiple passthrough proxies sharing the port.
     /// SNI from the DTLS ClientHello selects which proxy to route to.
     pub sni_proxy_ids: Option<Vec<String>>,
-    /// Maximum datagrams to drain per recv wakeup before yielding to the async
-    /// runtime. Higher values improve throughput under burst traffic. Default: 6000.
-    pub recv_batch_limit: usize,
     /// Adaptive buffer tracker for dynamic batch limit sizing.
     pub adaptive_buffer: Arc<crate::adaptive_buffer::AdaptiveBufferTracker>,
 }
@@ -244,7 +236,6 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
         crls,
         started,
         sni_proxy_ids,
-        recv_batch_limit,
         adaptive_buffer,
     } = cfg;
 
@@ -269,9 +260,6 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
         )
         .await;
     }
-
-    // Set the module-level batch limit from config (idempotent across listeners).
-    RECV_BATCH_LIMIT.store(recv_batch_limit as u64, Ordering::Relaxed);
 
     let addr = SocketAddr::new(bind_addr, port);
     let frontend_socket = Arc::new(UdpSocket::bind(addr).await?);

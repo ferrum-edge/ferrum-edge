@@ -102,7 +102,6 @@ fn create_manager(config: GatewayConfig) -> StreamListenerManager {
         300,
         10_000,
         10,
-        6_000,
         None,
         Arc::new(Vec::new()),
         Arc::new(ferrum_edge::adaptive_buffer::AdaptiveBufferTracker::new(
@@ -167,7 +166,6 @@ async fn test_reconcile_starts_tcp_listener() {
         300,
         10_000,
         10,
-        6_000,
         None,
         Arc::new(Vec::new()),
         Arc::new(ferrum_edge::adaptive_buffer::AdaptiveBufferTracker::new(
@@ -224,7 +222,6 @@ async fn test_reconcile_starts_udp_listener() {
         300,
         10_000,
         10,
-        6_000,
         None,
         Arc::new(Vec::new()),
         Arc::new(ferrum_edge::adaptive_buffer::AdaptiveBufferTracker::new(
@@ -293,7 +290,6 @@ async fn test_reconcile_detects_port_conflict() {
         300,
         10_000,
         10,
-        6_000,
         None,
         Arc::new(Vec::new()),
         Arc::new(ferrum_edge::adaptive_buffer::AdaptiveBufferTracker::new(
@@ -357,7 +353,6 @@ async fn test_reconcile_defers_tcp_without_tls_config() {
         300,
         10_000,
         10,
-        6_000,
         None,
         Arc::new(Vec::new()),
         Arc::new(ferrum_edge::adaptive_buffer::AdaptiveBufferTracker::new(
@@ -415,7 +410,6 @@ async fn test_reconcile_defers_udp_without_dtls_config() {
         300,
         10_000,
         10,
-        6_000,
         None,
         Arc::new(Vec::new()),
         Arc::new(ferrum_edge::adaptive_buffer::AdaptiveBufferTracker::new(
@@ -476,7 +470,6 @@ async fn test_shutdown_all_releases_ports() {
         300,
         10_000,
         10,
-        6_000,
         None,
         Arc::new(Vec::new()),
         Arc::new(ferrum_edge::adaptive_buffer::AdaptiveBufferTracker::new(
@@ -548,7 +541,6 @@ async fn test_wait_until_started_succeeds_for_tcp() {
         300,
         10_000,
         10,
-        6_000,
         None,
         Arc::new(Vec::new()),
         Arc::new(ferrum_edge::adaptive_buffer::AdaptiveBufferTracker::new(

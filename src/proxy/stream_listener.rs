@@ -69,8 +69,6 @@ pub struct StreamListenerManager {
     udp_max_sessions: usize,
     /// UDP session cleanup interval in seconds.
     udp_cleanup_interval_seconds: u64,
-    /// Maximum datagrams to drain per recv wakeup before yielding.
-    udp_recv_batch_limit: usize,
     /// TLS hardening policy for backend connections (cipher suites, protocol versions).
     tls_policy: Option<Arc<TlsPolicy>>,
     /// Certificate Revocation Lists for backend TLS verification.
@@ -95,7 +93,6 @@ impl StreamListenerManager {
         tcp_idle_timeout_seconds: u64,
         udp_max_sessions: usize,
         udp_cleanup_interval_seconds: u64,
-        udp_recv_batch_limit: usize,
         tls_policy: Option<Arc<TlsPolicy>>,
         crls: crate::tls::CrlList,
         adaptive_buffer: Arc<crate::adaptive_buffer::AdaptiveBufferTracker>,
@@ -117,7 +114,6 @@ impl StreamListenerManager {
             tcp_idle_timeout_seconds,
             udp_max_sessions,
             udp_cleanup_interval_seconds,
-            udp_recv_batch_limit,
             tls_policy,
             crls,
             adaptive_buffer,
@@ -372,7 +368,6 @@ impl StreamListenerManager {
                 let metrics = Arc::new(UdpProxyMetrics::default());
                 let udp_max_sessions = self.udp_max_sessions;
                 let udp_cleanup_interval = self.udp_cleanup_interval_seconds;
-                let udp_recv_batch_limit = self.udp_recv_batch_limit;
                 let consumer_index = self.consumer_index.clone();
                 let plugin_cache = self.plugin_cache.clone();
                 let crls = self.crls.clone();
@@ -398,7 +393,6 @@ impl StreamListenerManager {
                         crls,
                         started: started_for_listener,
                         sni_proxy_ids: sni_ids,
-                        recv_batch_limit: udp_recv_batch_limit,
                         adaptive_buffer: adaptive_buf,
                     })
                     .await
