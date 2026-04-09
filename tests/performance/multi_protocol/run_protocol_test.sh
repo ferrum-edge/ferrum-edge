@@ -197,6 +197,8 @@ start_gateway() {
         # UDP tuning
         FERRUM_UDP_MAX_SESSIONS=10000
         FERRUM_UDP_CLEANUP_INTERVAL_SECONDS=10
+        # WebSocket tunnel mode for raw TCP copy when no frame plugins
+        FERRUM_WEBSOCKET_TUNNEL_MODE=true
     )
     if [ -f "$cert_dir/cert.pem" ]; then
         env_cmd+=(

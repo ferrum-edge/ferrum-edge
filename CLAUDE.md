@@ -877,6 +877,7 @@ Reduce per-request allocations in plugin lookup
 | `FERRUM_MAX_GRPC_RECV_SIZE_BYTES` | `4194304` | Max total received gRPC payload size in bytes (4 MiB). `0` = unlimited |
 | `FERRUM_MAX_WEBSOCKET_FRAME_SIZE_BYTES` | `16777216` | Max WebSocket frame size in bytes (16 MiB). Also sets max message size to 4x frame size |
 | `FERRUM_WEBSOCKET_WRITE_BUFFER_SIZE` | `131072` | WebSocket write buffer size in bytes (128 KB). Controls data buffered before flushing to transport. Increase to 4194304 for workloads with large WS frames (1 MB+). Only applies when frame-level plugins are active |
+| `FERRUM_WEBSOCKET_TUNNEL_MODE` | `false` | When true and no frame-level plugins are configured, bypass WebSocket frame parsing and use raw TCP bidirectional copy. Improves large-payload throughput significantly. Trade-off: `FERRUM_MAX_WEBSOCKET_FRAME_SIZE_BYTES` not enforced (no DoS risk — fixed-size copy buffer) |
 | `FERRUM_MAX_CREDENTIALS_PER_TYPE` | `2` | Max credential entries per type per consumer. Enables zero-downtime rotation by allowing multiple active credentials simultaneously |
 | `FERRUM_HTTP_HEADER_READ_TIMEOUT_SECONDS` | `10` | HTTP/1.1 header read timeout in seconds. Protects against slowloris attacks. `0` = disabled |
 | `FERRUM_BACKEND_ALLOW_IPS` | `both` | Backend IP allowlist policy: `private` (only RFC 1918/loopback/link-local/CGNAT), `public` (only non-private), `both` (no restriction) |

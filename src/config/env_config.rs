@@ -332,8 +332,21 @@ pub struct EnvConfig {
     /// for large WS frames but increase per-connection memory. The default (128 KB)
     /// is optimal for 10KB-100KB payloads. Increase to 4 MB+ for workloads with
     /// large WS frames (1 MB+). Only applies when frame-level plugins are active;
-    /// the zero-overhead tunnel path uses raw copy_bidirectional.
+    /// tunnel mode uses raw copy_bidirectional which bypasses tungstenite entirely.
     pub websocket_write_buffer_size: usize,
+    /// When true AND no frame-level plugins are configured on a proxy, bypass
+    /// WebSocket frame parsing entirely and use raw TCP bidirectional copy after
+    /// the upgrade handshake. This avoids per-frame header parsing, masking
+    /// validation, and opcode dispatch — critical for large frames (9 MB+).
+    ///
+    /// Trade-offs when enabled:
+    /// - `FERRUM_MAX_WEBSOCKET_FRAME_SIZE_BYTES` is NOT enforced (data streams
+    ///   through a fixed-size copy buffer, so no large allocation risk)
+    /// - Server-push protocols that send frames piggybacked with the HTTP 101
+    ///   response may lose the first frame (rare in practice)
+    ///
+    /// Default: false (safe, frame-parsed path for all connections)
+    pub websocket_tunnel_mode: bool,
     /// Maximum number of credential entries per type per consumer (for zero-downtime rotation).
     pub max_credentials_per_type: usize,
     /// HTTP/1.1 header read timeout in seconds. Protects against slowloris attacks
@@ -675,6 +688,7 @@ impl Default for EnvConfig {
             max_grpc_recv_size_bytes: 4_194_304,
             max_websocket_frame_size_bytes: 16_777_216,
             websocket_write_buffer_size: 131_072, // 128 KB
+            websocket_tunnel_mode: false,
             max_credentials_per_type: 2,
             http_header_read_timeout_seconds: 10,
             dns_cache_ttl_seconds: 300,
@@ -932,6 +946,7 @@ impl EnvConfig {
                 "FERRUM_WEBSOCKET_WRITE_BUFFER_SIZE",
                 131_072, // 128 KB — optimal for 10KB-100KB payloads
             ),
+            websocket_tunnel_mode: resolve_bool(conf, "FERRUM_WEBSOCKET_TUNNEL_MODE", false),
             max_credentials_per_type: resolve_usize(conf, "FERRUM_MAX_CREDENTIALS_PER_TYPE", 2),
             http_header_read_timeout_seconds: resolve_u64(
                 conf,

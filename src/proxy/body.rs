@@ -248,7 +248,7 @@ pin_project! {
     /// `Pin<&mut Self>`). The `&self` methods (`is_end_stream`, `size_hint`)
     /// only read immutable state. There are no concurrent mutable accesses
     /// from different threads.
-    pub struct SyncBody<B> {
+    pub(crate) struct SyncBody<B> {
         #[pin]
         inner: B,
     }
@@ -260,7 +260,7 @@ pin_project! {
 unsafe impl<B: Send> Sync for SyncBody<B> {}
 
 impl<B> SyncBody<B> {
-    pub fn new(inner: B) -> Self {
+    pub(crate) fn new(inner: B) -> Self {
         Self { inner }
     }
 }

@@ -109,6 +109,7 @@ See [cp_dp_mode.md](cp_dp_mode.md) for CP/DP TLS environment variables (`FERRUM_
 | `FERRUM_MAX_GRPC_RECV_SIZE_BYTES` | No | `4194304` | Maximum total received gRPC payload size in bytes (0=unlimited) |
 | `FERRUM_MAX_WEBSOCKET_FRAME_SIZE_BYTES` | No | `16777216` | Maximum WebSocket frame size in bytes; max message size = 4x frame size |
 | `FERRUM_WEBSOCKET_WRITE_BUFFER_SIZE` | No | `131072` | WebSocket write buffer size (128 KB). Increase for large WS frames (1 MB+). Only applies when frame-level plugins are active |
+| `FERRUM_WEBSOCKET_TUNNEL_MODE` | No | `false` | When true and no frame-level plugins are configured, bypass WebSocket frame parsing and use raw TCP bidirectional copy. Significantly improves throughput for large payloads (9 MB: 25→110 RPS). Trade-off: `FERRUM_MAX_WEBSOCKET_FRAME_SIZE_BYTES` is not enforced (no DoS risk — data streams through fixed-size copy buffer) |
 
 See [size_limits.md](size_limits.md) for detailed sizing guidance.
 
