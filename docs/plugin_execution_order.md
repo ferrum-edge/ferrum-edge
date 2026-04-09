@@ -217,7 +217,7 @@ Priority bands are spaced with gaps so future plugins can slot in without renumb
 |------|---------------|---------|---------|
 | **Early** | 0–949 | Tracing, IDs, preflight, and request short-circuiting before auth | `otel_tracing` (25), `correlation_id` (50), `cors` (100), `request_termination` (125), `ip_restriction` (150), `bot_detection` (200), `spec_expose` (210), `sse` (250), `grpc_web` (260), `grpc_method_router` (275) |
 | **AuthN** | 950–1999 | Authentication / identity verification | `mtls_auth` (950), `jwks_auth` (1000), `jwt_auth` (1100), `key_auth` (1200), `ldap_auth` (1250), `basic_auth` (1300), `hmac_auth` (1400), `soap_ws_security` (1500) |
-| **Admission** | 2000–2999 | Authorization, validation, and request admission control | `access_control` (2000), `tcp_connection_throttle` (2050), `request_size_limiting` (2800), `ws_message_size_limiting` (2810), `graphql` (2850), `rate_limiting` (2900), `ws_rate_limiting` (2910), `udp_rate_limiting` (2915), `ai_prompt_shield` (2925), `body_validator` (2950), `ai_request_guard` (2975) |
+| **Admission** | 2000–2999 | Authorization, validation, and request admission control | `access_control` (2000), `tcp_connection_throttle` (2050), `request_size_limiting` (2800), `ws_message_size_limiting` (2810), `graphql` (2850), `rate_limiting` (2900), `ws_rate_limiting` (2910), `udp_rate_limiting` (2915), `ai_prompt_shield` (2925), `body_validator` (2950), `ai_request_guard` (2975), `ai_federation` (2985) |
 | **Transform** | 3000–3999 | Request shaping and response buffering decisions | `request_transformer` (3000), `serverless_function` (3025), `response_mock` (3030), `grpc_deadline` (3050), `request_mirror` (3075), `response_size_limiting` (3490), `response_caching` (3500) |
 | **Response** | 4000–4999 | Response transformation, compression, and AI accounting | `response_transformer` (4000), `compression` (4050), `ai_token_metrics` (4100), `ai_rate_limiter` (4200) |
 | **Custom** | 5000 | Default for unrecognized/custom plugins | _(future plugins)_ |
@@ -258,28 +258,29 @@ Given all built-in plugins enabled, the execution order is:
 | 27 | `ai_prompt_shield` | 2925 | before_proxy, transform_request_body |
 | 28 | `body_validator` | 2950 | before_proxy, on_final_request_body, on_final_response_body |
 | 29 | `ai_request_guard` | 2975 | before_proxy, transform_request_body |
-| 30 | `request_transformer` | 3000 | before_proxy, transform_request_body |
-| 31 | `serverless_function` | 3025 | before_proxy |
-| 32 | `response_mock` | 3030 | before_proxy |
-| 33 | `grpc_deadline` | 3050 | before_proxy |
-| 34 | `request_mirror` | 3075 | before_proxy |
-| 35 | `response_size_limiting` | 3490 | after_proxy, on_final_response_body |
-| 36 | `response_caching` | 3500 | before_proxy, after_proxy, on_final_response_body |
-| 37 | `response_transformer` | 4000 | after_proxy, transform_response_body |
-| 38 | `compression` | 4050 | before_proxy, after_proxy, transform_request_body, transform_response_body |
-| 39 | `ai_token_metrics` | 4100 | on_response_body |
-| 40 | `ai_rate_limiter` | 4200 | before_proxy, after_proxy, on_response_body |
-| 41 | `stdout_logging` | 9000 | log, on_stream_disconnect |
-| 42 | `ws_frame_logging` | 9050 | on_ws_frame |
-| 43 | `statsd_logging` | 9075 | log, on_stream_disconnect |
-| 44 | `http_logging` | 9100 | log, on_stream_disconnect |
-| 45 | `tcp_logging` | 9125 | log, on_stream_disconnect |
-| 46 | `kafka_logging` | 9150 | log, on_stream_disconnect |
-| 47 | `loki_logging` | 9155 | log, on_stream_disconnect |
-| 48 | `udp_logging` | 9160 | log, on_stream_disconnect |
-| 49 | `ws_logging` | 9175 | log, on_stream_disconnect |
-| 50 | `transaction_debugger` | 9200 | on_request_received, after_proxy, log, on_stream_disconnect |
-| 51 | `prometheus_metrics` | 9300 | log, on_stream_disconnect |
+| 30 | `ai_federation` | 2985 | before_proxy |
+| 31 | `request_transformer` | 3000 | before_proxy, transform_request_body |
+| 32 | `serverless_function` | 3025 | before_proxy |
+| 33 | `response_mock` | 3030 | before_proxy |
+| 34 | `grpc_deadline` | 3050 | before_proxy |
+| 35 | `request_mirror` | 3075 | before_proxy |
+| 36 | `response_size_limiting` | 3490 | after_proxy, on_final_response_body |
+| 37 | `response_caching` | 3500 | before_proxy, after_proxy, on_final_response_body |
+| 38 | `response_transformer` | 4000 | after_proxy, transform_response_body |
+| 39 | `compression` | 4050 | before_proxy, after_proxy, transform_request_body, transform_response_body |
+| 40 | `ai_token_metrics` | 4100 | on_response_body |
+| 41 | `ai_rate_limiter` | 4200 | before_proxy, after_proxy, on_response_body |
+| 42 | `stdout_logging` | 9000 | log, on_stream_disconnect |
+| 43 | `ws_frame_logging` | 9050 | on_ws_frame |
+| 44 | `statsd_logging` | 9075 | log, on_stream_disconnect |
+| 45 | `http_logging` | 9100 | log, on_stream_disconnect |
+| 46 | `tcp_logging` | 9125 | log, on_stream_disconnect |
+| 47 | `kafka_logging` | 9150 | log, on_stream_disconnect |
+| 48 | `loki_logging` | 9155 | log, on_stream_disconnect |
+| 49 | `udp_logging` | 9160 | log, on_stream_disconnect |
+| 50 | `ws_logging` | 9175 | log, on_stream_disconnect |
+| 51 | `transaction_debugger` | 9200 | on_request_received, after_proxy, log, on_stream_disconnect |
+| 52 | `prometheus_metrics` | 9300 | log, on_stream_disconnect |
 
 ## Why This Order Matters
 
@@ -327,14 +328,15 @@ Rate limiting sits at the end of the AuthZ band (priority 2900) so it can enforc
 
 **Redis mode** (`sync_mode: "redis"`): `rate_limiting` and `ai_rate_limiter` use Redis for coordinated counters across multiple gateway instances. `ws_rate_limiting` also supports Redis, but only to externalize its per-connection counters; because WebSocket connection IDs are process-local, it namespaces keys per gateway instance to avoid cross-instance collisions rather than sharing a portable connection budget across reconnects. When Redis is unavailable, all three plugins automatically fall back to local in-memory state and switch back when connectivity is restored. The Redis backend uses native RESP protocol commands (no Lua scripts), so it works with Redis, Valkey, DragonflyDB, KeyDB, or Garnet.
 
-### AI Plugins: PII shield before guard, metrics before rate limiter (2925–4200)
+### AI Plugins: PII shield → guard → federation → metrics → rate limiter (2925–4200)
 
-The four AI plugins are ordered to compose correctly:
+The five AI plugins are ordered to compose correctly:
 
 1. **`ai_prompt_shield` (2925)** runs first in the pre-proxy flow — PII must be detected/redacted before the request reaches any other validation or the backend. It sits right after `rate_limiting` so brute-force protection applies first.
 2. **`ai_request_guard` (2975)** runs after PII scanning — it validates model names, max_tokens, message counts, and temperature. If the prompt shield already rejected or redacted the request, the guard validates the cleaned version.
-3. **`ai_token_metrics` (4100)** runs after the response comes back from the backend — it parses the LLM response body to extract token usage (prompt, completion, total, model) and writes it to `ctx.metadata`. This metadata flows into `TransactionSummary` for all downstream logging plugins.
-4. **`ai_rate_limiter` (4200)** runs after `ai_token_metrics` — it reads the token count from the response body and accumulates it against the consumer's token budget. On the pre-proxy side, it checks whether the consumer has exceeded their token limit before allowing the request through. The pre-proxy check uses historical accumulation, while the post-proxy hook records new usage.
+3. **`ai_federation` (2985)** runs after the guard — it translates the OpenAI-format request to the matched provider's native format, calls the provider, normalizes the response back to OpenAI format, and returns via `RejectBinary`. Since this short-circuits the proxy, `on_response_body` does not fire. The plugin writes token metadata (`ai_total_tokens`, `ai_prompt_tokens`, `ai_completion_tokens`, `ai_model`, `ai_provider`) directly into `ctx.metadata` using the same keys as `ai_token_metrics`.
+4. **`ai_token_metrics` (4100)** runs after the response comes back from the backend — it parses the LLM response body to extract token usage (prompt, completion, total, model) and writes it to `ctx.metadata`. This metadata flows into `TransactionSummary` for all downstream logging plugins. Note: when `ai_federation` is active, this plugin does not fire because the response comes via `RejectBinary` — `ai_federation` writes the same metadata keys directly.
+5. **`ai_rate_limiter` (4200)** runs after `ai_token_metrics` — it reads the token count from the response body and accumulates it against the consumer's token budget. On the pre-proxy side, it checks whether the consumer has exceeded their token limit before allowing the request through. The pre-proxy check uses historical accumulation, while the post-proxy hook records new usage. When `ai_federation` is active, the rate limiter uses `applies_after_proxy_on_reject()` to record token usage from federation metadata on the rejection path.
 
 ### Transforms after auth (3000+)
 
@@ -468,6 +470,7 @@ TLS/DTLS are transport-layer concerns, not separate protocols. A plugin that sup
 | `compression` | ✓ | | | | | HTTP response compression and request decompression (gzip, brotli) |
 | `ai_prompt_shield` | ✓ | ✓ | | | | Scans JSON request bodies for PII |
 | `ai_request_guard` | ✓ | ✓ | | | | Validates JSON request bodies |
+| `ai_federation` | ✓ | ✓ | | | | Routes to AI providers, normalizes responses |
 | `ai_token_metrics` | ✓ | ✓ | | | | Parses JSON response bodies for token usage |
 | `ai_rate_limiter` | ✓ | ✓ | | | | Parses JSON response bodies for token counts |
 | `ws_message_size_limiting` | | | ✓ | | | Enforces max frame size on WebSocket connections |

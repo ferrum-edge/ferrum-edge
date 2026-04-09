@@ -2141,7 +2141,87 @@ config:
 
 ## AI / LLM Plugins
 
-Four plugins purpose-built for AI/LLM API gateway use cases. They auto-detect the LLM provider from the response JSON structure, supporting **OpenAI** (and compatible), **Anthropic**, **Google Gemini**, **Cohere**, **Mistral**, and **AWS Bedrock**.
+Five plugins purpose-built for AI/LLM API gateway use cases. They auto-detect the LLM provider from the response JSON structure, supporting **OpenAI** (and compatible), **Anthropic**, **Google Gemini**, **Cohere**, **Mistral**, and **AWS Bedrock**.
+
+### `ai_federation`
+
+Universal AI gateway that routes requests in OpenAI Chat Completions format to any of 11 supported AI providers, translating requests to native provider format and normalizing responses back to OpenAI format. Uses the "terminate and respond" pattern — makes its own HTTP call to the matched provider and returns the response directly, bypassing the normal proxy dispatch.
+
+**Priority:** 2985
+
+**Supported providers:**
+- **OpenAI-compatible** (send OpenAI format directly): OpenAI, Mistral, xAI (Grok), DeepSeek, Meta Llama, Hugging Face, Azure OpenAI
+- **Requires translation**: Anthropic (Messages API), Google Gemini, Google Vertex AI (OAuth2), AWS Bedrock (Converse API, SigV4), Cohere v2
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `providers` | Array | _(required)_ | Array of provider configurations (see below) |
+| `fallback_enabled` | Boolean | `true` | Try next provider on failure |
+| `fallback_on_status_codes` | Array | `[429, 500, 502, 503]` | HTTP status codes that trigger fallback |
+| `fallback_on_network_errors` | Boolean | `true` | TCP/TLS failures trigger fallback |
+
+**Provider configuration fields:**
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `name` | String | _(required)_ | Unique provider name for logging |
+| `provider_type` | String | _(required)_ | One of: `openai`, `anthropic`, `google_gemini`, `google_vertex`, `azure_openai`, `aws_bedrock`, `mistral`, `cohere`, `xai`, `deepseek`, `meta_llama`, `hugging_face` |
+| `api_key` | String | _(required for most)_ | API key for authentication |
+| `priority` | Integer | _(index + 1)_ | Lower = tried first |
+| `model_patterns` | Array | `[]` (catch-all) | Glob patterns to match model names (e.g., `["claude-*"]`) |
+| `model_mapping` | Object | `{}` | Map client model names to provider-native names |
+| `default_model` | String | _(none)_ | Default model when no mapping matches |
+| `connect_timeout_seconds` | Integer | `5` | TCP + TLS handshake timeout |
+| `read_timeout_seconds` | Integer | `60` | Full response read timeout |
+| `base_url` | String | _(provider default)_ | Custom endpoint URL (for self-hosted or proxy endpoints) |
+
+**Azure OpenAI additional fields:** `azure_resource`, `azure_deployment`, `azure_api_version` (default `"2024-06-01"`).
+
+**Google Vertex additional fields:** `google_project_id`, `google_region`, `google_service_account_json`.
+
+**AWS Bedrock additional fields:** `aws_region`, `aws_access_key_id`, `aws_secret_access_key`, `aws_session_token`. Credentials fall back to standard AWS environment variables (`AWS_DEFAULT_REGION`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`).
+
+**Example configuration:**
+
+```yaml
+plugins:
+  - name: ai_federation
+    enabled: true
+    config:
+      providers:
+        - name: anthropic-primary
+          provider_type: anthropic
+          api_key: "sk-ant-..."
+          priority: 1
+          model_patterns: ["claude-*"]
+          model_mapping:
+            claude-4-sonnet: "claude-sonnet-4-20250514"
+          default_model: "claude-sonnet-4-20250514"
+          read_timeout_seconds: 90
+        - name: openai-fallback
+          provider_type: openai
+          api_key: "sk-..."
+          priority: 2
+          model_patterns: ["gpt-*", "o1-*", "o3-*"]
+          default_model: "gpt-4o"
+        - name: bedrock
+          provider_type: aws_bedrock
+          aws_region: "us-east-1"
+          priority: 3
+          model_patterns: ["bedrock-*"]
+          model_mapping:
+            bedrock-claude: "anthropic.claude-3-sonnet-20240229-v1:0"
+      fallback_enabled: true
+      fallback_on_status_codes: [429, 500, 502, 503]
+```
+
+**Cross-plugin synergy:** Works with all other AI plugins on the same proxy:
+- `ai_prompt_shield` (2925) scans/redacts PII before federation
+- `ai_request_guard` (2975) validates model, tokens, temperature before federation
+- `ai_federation` (2985) routes to provider, writes token metadata to `ctx.metadata`
+- `ai_rate_limiter` (4200) records token usage from federation metadata via `applies_after_proxy_on_reject`
+
+**Metadata keys written:** `ai_total_tokens`, `ai_prompt_tokens`, `ai_completion_tokens`, `ai_model`, `ai_provider`, `ai_federation_provider` — same keys as `ai_token_metrics` for downstream compatibility.
 
 ### `ai_token_metrics`
 
@@ -2276,16 +2356,14 @@ config:
 
 ### AI Plugin Composition Example
 
-A typical AI gateway proxy combining all four plugins:
+A typical AI gateway proxy combining all five AI plugins with `ai_federation` for multi-provider routing:
 
 ```yaml
-# Proxy config for OpenAI API
+# Proxy config — ai_federation handles provider routing, so backend_host is unused
 listen_path: /v1/chat/completions
 backend_protocol: https
-backend_host: api.openai.com
+backend_host: placeholder.local
 backend_port: 443
-backend_path: /v1/chat/completions
-response_body_mode: buffer
 
 # Plugin configs (applied in priority order automatically)
 plugins:
@@ -2297,14 +2375,29 @@ plugins:
       patterns: [ssn, credit_card, email, api_key]
   - plugin_name: ai_request_guard
     config:
-      allowed_models: [gpt-4o-mini, gpt-4o]
+      allowed_models: [claude-*, gpt-*, gemini-*]
       max_tokens_limit: 4096
       enforce_max_tokens: clamp
       default_max_tokens: 1024
-  - plugin_name: ai_token_metrics
+  - plugin_name: ai_federation
     config:
-      cost_per_prompt_token: 0.00000015
-      cost_per_completion_token: 0.0000006
+      providers:
+        - name: anthropic
+          provider_type: anthropic
+          api_key: "sk-ant-..."
+          priority: 1
+          model_patterns: ["claude-*"]
+        - name: openai
+          provider_type: openai
+          api_key: "sk-..."
+          priority: 2
+          model_patterns: ["gpt-*"]
+        - name: gemini
+          provider_type: google_gemini
+          api_key: "AIza..."
+          priority: 3
+          model_patterns: ["gemini-*"]
+      fallback_enabled: true
   - plugin_name: ai_rate_limiter
     config:
       token_limit: 1000000
@@ -2314,6 +2407,8 @@ plugins:
   - plugin_name: stdout_logging
     config: {}
 ```
+
+> **Note:** When `ai_federation` is active, it short-circuits the proxy via `RejectBinary`, so `ai_token_metrics` does not fire. The federation plugin writes the same metadata keys directly. The `ai_rate_limiter` records token usage via `applies_after_proxy_on_reject` on the rejection path.
 
 ---
 

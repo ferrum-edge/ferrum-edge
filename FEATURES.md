@@ -56,7 +56,7 @@ Ferrum supports dynamic upstream target discovery through three providers, confi
 
 ## Plugin System
 
-- 51 built-in plugins with lifecycle hooks (request received, authenticate, authorize, before proxy, after proxy, on final request/response body, on response body, on WebSocket frame, on UDP datagram, log)
+- 52 built-in plugins with lifecycle hooks (request received, authenticate, authorize, before proxy, after proxy, on final request/response body, on response body, on WebSocket frame, on UDP datagram, log)
 - Priority-ordered execution with protocol-aware filtering (HTTP, gRPC, WebSocket, TCP, UDP)
 - Multiple instances of the same plugin type per proxy (e.g., two `http_logging` for Splunk and Datadog) with optional `priority_override` for execution order control
 - Global and per-proxy scoping — proxy-scoped plugins replace global plugins of the same name
@@ -93,6 +93,7 @@ Ferrum supports dynamic upstream target discovery through three providers, confi
 
 ### AI / LLM Plugins
 
+- **AI Federation** — universal AI gateway that routes requests to any of 11 supported providers (OpenAI, Anthropic, Google Gemini/Vertex, Azure OpenAI, AWS Bedrock, Mistral, Cohere, xAI, DeepSeek, Meta Llama, Hugging Face). Clients send OpenAI Chat Completions format; the plugin translates to native provider format, handles authentication (API key, OAuth2, AWS SigV4), and normalizes responses back to OpenAI format. Supports model-based routing with glob patterns, provider-level model mapping, priority-ordered fallback on configurable status codes and network errors, per-provider connect/read timeouts, and custom base URLs for self-hosted endpoints. Writes token metadata for downstream rate limiting and logging
 - **AI Token Metrics** — extract token usage (prompt, completion, total) from LLM responses (OpenAI, Anthropic, Google, Cohere, Mistral, Bedrock) into transaction metadata for downstream observability
 - **AI Request Guard** — validate and constrain AI requests: model allow/block lists, max_tokens enforcement (reject or clamp), message count limits, prompt length limits, temperature range, system prompt blocking
 - **AI Rate Limiter** — token-aware rate limiting per consumer or IP with sliding window, auto-detecting provider format from responses; supports centralized Redis-backed mode for cross-instance token budget coordination. Compatible with any RESP-protocol server (Redis, Valkey, DragonflyDB, KeyDB, Garnet). TLS uses gateway-level settings

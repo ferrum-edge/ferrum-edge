@@ -2,6 +2,7 @@
 mod plugin_utils;
 
 mod access_control_tests;
+mod ai_federation_tests;
 mod ai_prompt_shield_tests;
 mod ai_rate_limiter_tests;
 mod ai_request_guard_tests;
