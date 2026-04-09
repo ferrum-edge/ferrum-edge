@@ -9,7 +9,7 @@ ARG TARGETARCH
 
 WORKDIR /app
 
-COPY bin/${TARGETARCH}/ferrum-edge /app/ferrum-edge
+COPY --chmod=755 bin/${TARGETARCH}/ferrum-edge /app/ferrum-edge
 
 ENV PATH="/app:${PATH}" \
     FERRUM_MODE=database \

@@ -297,7 +297,7 @@ pub fn execute_validate() -> Result<(), String> {
 /// async runtime or reqwest for this one-shot diagnostic.
 pub fn execute_health(args: &HealthArgs) -> Result<(), String> {
     use std::io::{Read, Write};
-    use std::net::TcpStream;
+    use std::net::{TcpStream, ToSocketAddrs};
     use std::time::Duration;
 
     let port = args.port.unwrap_or_else(|| {
@@ -307,14 +307,14 @@ pub fn execute_health(args: &HealthArgs) -> Result<(), String> {
             .unwrap_or(9000)
     });
 
-    let addr = format!("{}:{}", args.host, port);
-    let mut stream = TcpStream::connect_timeout(
-        &addr
-            .parse()
-            .map_err(|e| format!("Invalid address {}: {}", addr, e))?,
-        Duration::from_secs(5),
-    )
-    .map_err(|e| format!("Cannot connect to {}: {}", addr, e))?;
+    let addr_str = format!("{}:{}", args.host, port);
+    let sock_addr = addr_str
+        .to_socket_addrs()
+        .map_err(|e| format!("Cannot resolve {}: {}", addr_str, e))?
+        .next()
+        .ok_or_else(|| format!("No addresses found for {}", addr_str))?;
+    let mut stream = TcpStream::connect_timeout(&sock_addr, Duration::from_secs(5))
+        .map_err(|e| format!("Cannot connect to {}: {}", addr_str, e))?;
 
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
