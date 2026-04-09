@@ -39,7 +39,7 @@ const MAX_UDP_DATAGRAM_SIZE: usize = 65535;
 /// Maximum datagrams to drain per recv wakeup via `try_recv_from` before yielding
 /// back to the async runtime. Keeps the event loop responsive while amortising
 /// wakeup overhead under burst traffic.
-const RECV_BATCH_LIMIT: usize = 64;
+const RECV_BATCH_LIMIT: usize = 256;
 
 /// Metrics for a single UDP proxy listener.
 #[derive(Default)]

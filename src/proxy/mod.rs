@@ -2512,6 +2512,8 @@ async fn connect_websocket_backend(
     let mut ws_config = WebSocketConfig::default();
     ws_config.max_frame_size = Some(max_websocket_frame_size_bytes);
     ws_config.max_message_size = Some(max_websocket_frame_size_bytes.saturating_mul(4));
+    // 4 MiB write buffer reduces syscalls for large frames (default 128 KB = ~70 writes per 9 MB frame)
+    ws_config.write_buffer_size = 4 * 1024 * 1024;
 
     let mut ws_request = backend_url.into_client_request()?;
     for (name, value) in client_headers {
@@ -2571,6 +2573,8 @@ async fn run_websocket_proxy(
     let mut ws_config = WebSocketConfig::default();
     ws_config.max_frame_size = Some(max_websocket_frame_size_bytes);
     ws_config.max_message_size = Some(max_websocket_frame_size_bytes.saturating_mul(4));
+    // 4 MiB write buffer reduces syscalls for large frames (default 128 KB = ~70 writes per 9 MB frame)
+    ws_config.write_buffer_size = 4 * 1024 * 1024;
 
     let ws_stream = WebSocketStream::from_raw_socket(
         TokioIo::new(upgraded),
