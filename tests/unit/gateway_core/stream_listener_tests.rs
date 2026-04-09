@@ -107,6 +107,7 @@ fn create_manager(config: GatewayConfig) -> StreamListenerManager {
         Arc::new(ferrum_edge::adaptive_buffer::AdaptiveBufferTracker::new(
             true, true, 300, 8192, 262_144, 65_536, 6000,
         )),
+        64,
     )
 }
 
@@ -171,6 +172,7 @@ async fn test_reconcile_starts_tcp_listener() {
         Arc::new(ferrum_edge::adaptive_buffer::AdaptiveBufferTracker::new(
             true, true, 300, 8192, 262_144, 65_536, 6000,
         )),
+        64,
     );
 
     let failures = manager.reconcile().await;
@@ -227,6 +229,7 @@ async fn test_reconcile_starts_udp_listener() {
         Arc::new(ferrum_edge::adaptive_buffer::AdaptiveBufferTracker::new(
             true, true, 300, 8192, 262_144, 65_536, 6000,
         )),
+        64,
     );
 
     let failures = manager.reconcile().await;
@@ -295,6 +298,7 @@ async fn test_reconcile_detects_port_conflict() {
         Arc::new(ferrum_edge::adaptive_buffer::AdaptiveBufferTracker::new(
             true, true, 300, 8192, 262_144, 65_536, 6000,
         )),
+        64,
     );
 
     let failures = manager.reconcile().await;
@@ -358,6 +362,7 @@ async fn test_reconcile_defers_tcp_without_tls_config() {
         Arc::new(ferrum_edge::adaptive_buffer::AdaptiveBufferTracker::new(
             true, true, 300, 8192, 262_144, 65_536, 6000,
         )),
+        64,
     );
 
     let failures = manager.reconcile().await;
@@ -415,6 +420,7 @@ async fn test_reconcile_defers_udp_without_dtls_config() {
         Arc::new(ferrum_edge::adaptive_buffer::AdaptiveBufferTracker::new(
             true, true, 300, 8192, 262_144, 65_536, 6000,
         )),
+        64,
     );
 
     let failures = manager.reconcile().await;
@@ -475,6 +481,7 @@ async fn test_shutdown_all_releases_ports() {
         Arc::new(ferrum_edge::adaptive_buffer::AdaptiveBufferTracker::new(
             true, true, 300, 8192, 262_144, 65_536, 6000,
         )),
+        64,
     );
 
     let failures = manager.reconcile().await;
@@ -546,6 +553,7 @@ async fn test_wait_until_started_succeeds_for_tcp() {
         Arc::new(ferrum_edge::adaptive_buffer::AdaptiveBufferTracker::new(
             true, true, 300, 8192, 262_144, 65_536, 6000,
         )),
+        64,
     );
 
     let failures = manager.reconcile().await;

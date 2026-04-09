@@ -37,6 +37,7 @@ pub mod http2_pool;
 pub mod sni;
 pub mod stream_listener;
 pub mod tcp_proxy;
+pub mod udp_batch;
 pub mod udp_proxy;
 
 use arc_swap::ArcSwap;
@@ -662,6 +663,7 @@ impl ProxyState {
             tls_policy_arc.clone(),
             crls.clone(),
             adaptive_buffer.clone(),
+            env_config_arc.udp_recvmmsg_batch_size,
         ));
 
         Ok(Self {

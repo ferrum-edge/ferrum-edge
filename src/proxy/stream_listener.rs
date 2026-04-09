@@ -75,6 +75,8 @@ pub struct StreamListenerManager {
     crls: crate::tls::CrlList,
     /// Adaptive buffer tracker for dynamic copy buffer and batch limit sizing.
     adaptive_buffer: Arc<crate::adaptive_buffer::AdaptiveBufferTracker>,
+    /// Number of datagrams per `recvmmsg` syscall on Linux.
+    udp_recvmmsg_batch_size: usize,
 }
 
 impl StreamListenerManager {
@@ -96,6 +98,7 @@ impl StreamListenerManager {
         tls_policy: Option<Arc<TlsPolicy>>,
         crls: crate::tls::CrlList,
         adaptive_buffer: Arc<crate::adaptive_buffer::AdaptiveBufferTracker>,
+        udp_recvmmsg_batch_size: usize,
     ) -> Self {
         Self {
             listeners: tokio::sync::Mutex::new(std::collections::HashMap::new()),
@@ -117,6 +120,7 @@ impl StreamListenerManager {
             tls_policy,
             crls,
             adaptive_buffer,
+            udp_recvmmsg_batch_size,
         }
     }
 
@@ -373,6 +377,7 @@ impl StreamListenerManager {
                 let crls = self.crls.clone();
                 let sni_ids = sni_ids.clone();
                 let adaptive_buf = self.adaptive_buffer.clone();
+                let recvmmsg_batch = self.udp_recvmmsg_batch_size;
                 tokio::spawn(async move {
                     if let Err(e) = super::udp_proxy::start_udp_listener(UdpListenerConfig {
                         port: port_val,
@@ -394,6 +399,7 @@ impl StreamListenerManager {
                         started: started_for_listener,
                         sni_proxy_ids: sni_ids,
                         adaptive_buffer: adaptive_buf,
+                        recvmmsg_batch_size: recvmmsg_batch,
                     })
                     .await
                     {

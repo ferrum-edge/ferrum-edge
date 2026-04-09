@@ -411,6 +411,7 @@ async fn test_http3_proxy_state_creation() {
             std::sync::Arc::new(ferrum_edge::adaptive_buffer::AdaptiveBufferTracker::new(
                 true, true, 300, 8192, 262_144, 65_536, 6000,
             )),
+            64,
         ),
     );
     let dns_cache_for_sd = dns_cache.clone();
@@ -612,6 +613,7 @@ async fn test_http3_full_integration() {
             std::sync::Arc::new(ferrum_edge::adaptive_buffer::AdaptiveBufferTracker::new(
                 true, true, 300, 8192, 262_144, 65_536, 6000,
             )),
+            64,
         ),
     );
     let dns_cache_for_sd = dns_cache.clone();

@@ -124,6 +124,10 @@ dimpl = { version = "0.5.0", features = ["aws-lc-rs", "rcgen"] }
 [target.'cfg(not(windows))'.dependencies]
 tikv-jemallocator = "0.6"
 
+# recvmmsg/sendmmsg for batched UDP datagram I/O (Linux only)
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
 # ── Build profiles ─────────────────────────────────────────────────────────
 # Dev: optimise for fast compile-edit-run cycles
 [profile.dev]

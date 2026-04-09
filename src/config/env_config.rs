@@ -462,6 +462,11 @@ pub struct EnvConfig {
     pub udp_max_sessions: usize,
     /// UDP session cleanup interval in seconds (default: 10).
     pub udp_cleanup_interval_seconds: u64,
+    /// Number of datagrams per `recvmmsg` syscall on Linux (default: 64).
+    /// Controls how many datagrams are received in a single kernel crossing.
+    /// Higher values reduce syscall overhead for high-throughput UDP proxies.
+    /// Ignored on non-Linux platforms (falls back to individual `try_recv_from`).
+    pub udp_recvmmsg_batch_size: usize,
 
     // Adaptive Buffer Sizing
     /// Enable adaptive buffer sizing for TCP/WebSocket tunnel copy buffers (default: true).
@@ -746,6 +751,7 @@ impl Default for EnvConfig {
             tcp_idle_timeout_seconds: 300,
             udp_max_sessions: 10_000,
             udp_cleanup_interval_seconds: 10,
+            udp_recvmmsg_batch_size: 64,
             adaptive_buffer_enabled: true,
             adaptive_batch_limit_enabled: true,
             adaptive_buffer_ewma_alpha: 300,
@@ -1086,6 +1092,8 @@ impl EnvConfig {
                 "FERRUM_UDP_CLEANUP_INTERVAL_SECONDS",
                 10,
             ),
+            udp_recvmmsg_batch_size: resolve_usize(conf, "FERRUM_UDP_RECVMMSG_BATCH_SIZE", 64)
+                .clamp(1, 1024),
             // Adaptive Buffer Sizing
             adaptive_buffer_enabled: resolve_bool(conf, "FERRUM_ADAPTIVE_BUFFER_ENABLED", true),
             adaptive_batch_limit_enabled: resolve_bool(

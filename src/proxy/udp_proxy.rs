@@ -206,6 +206,9 @@ pub struct UdpListenerConfig {
     pub sni_proxy_ids: Option<Vec<String>>,
     /// Adaptive buffer tracker for dynamic batch limit sizing.
     pub adaptive_buffer: Arc<crate::adaptive_buffer::AdaptiveBufferTracker>,
+    /// Number of datagrams per `recvmmsg` syscall on Linux (default: 64).
+    /// Ignored on non-Linux platforms.
+    pub recvmmsg_batch_size: usize,
 }
 
 /// Start a UDP proxy listener on the given port.
@@ -237,6 +240,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
         started,
         sni_proxy_ids,
         adaptive_buffer,
+        recvmmsg_batch_size,
     } = cfg;
 
     if let Some(dtls_config) = frontend_dtls_config {
@@ -315,6 +319,12 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
     let mut buf = vec![0u8; MAX_UDP_DATAGRAM_SIZE];
     let mut shutdown_rx = shutdown;
 
+    // Pre-allocate recvmmsg batch buffers (Linux only). On non-Linux, this is a no-op stub.
+    #[cfg(target_os = "linux")]
+    let mut recv_batch = super::udp_batch::RecvMmsgBatch::new(recvmmsg_batch_size);
+    #[cfg(not(target_os = "linux"))]
+    let _ = recvmmsg_batch_size; // suppress unused variable warning
+
     // Hot-path cache: skip DashMap lookup when consecutive datagrams come from the
     // same client address (very common in streaming UDP protocols).
     let mut last_client: Option<(SocketAddr, Arc<UdpSession>)> = None;
@@ -370,46 +380,108 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                 }
 
                 // Drain additional pending datagrams without yielding to the runtime.
+                // On Linux, uses recvmmsg to batch multiple datagrams per syscall.
+                // On other platforms, falls back to individual try_recv_from calls.
                 let batch_limit = adaptive_buffer.get_batch_limit(&proxy_id);
-                for _ in 0..batch_limit {
-                    match frontend_socket.try_recv_from(&mut buf) {
-                        Ok((len2, addr2)) => {
-                            batch_dgrams_in += 1;
-                            batch_bytes_in += len2 as u64;
 
-                            let result = process_datagram(
-                                &buf[..len2],
-                                addr2,
-                                &proxy_id,
-                                &config,
-                                &dns_cache,
-                                &load_balancer_cache,
-                                &frontend_socket,
-                                &sessions,
-                                &metrics,
-                                tls_no_verify,
-                                max_sessions,
-                                &mut last_client,
-                                &mut batch_dgrams_out,
-                                &mut batch_bytes_out,
-                                &plugins,
-                                proxy_name.as_deref(),
-                                &proxy_namespace,
-                                backend_protocol,
-                                port,
-                                &circuit_breaker_cache,
-                                &consumer_index,
-                                has_datagram_plugins,
-                                &crls,
-                                sni_proxy_ids.as_deref(),
-                                &adaptive_buffer,
-                            )
-                            .await;
-                            if let Err(e) = result {
-                                debug!(proxy_id = %proxy_id, client = %addr2, "UDP forward error: {}", e);
+                #[cfg(target_os = "linux")]
+                {
+                    use std::os::fd::AsRawFd;
+                    let fd = frontend_socket.as_raw_fd();
+                    let mut total_drained: usize = 0;
+                    'drain: while total_drained < batch_limit {
+                        let max_this_call =
+                            (batch_limit - total_drained).min(recv_batch.capacity());
+                        match frontend_socket.try_io(tokio::io::Interest::READABLE, || {
+                            recv_batch.recv(fd, max_this_call)
+                        }) {
+                            Ok(n) if n > 0 => {
+                                for i in 0..n {
+                                    let (data, addr2) = recv_batch.datagram(i);
+                                    batch_dgrams_in += 1;
+                                    batch_bytes_in += data.len() as u64;
+
+                                    let result = process_datagram(
+                                        data,
+                                        addr2,
+                                        &proxy_id,
+                                        &config,
+                                        &dns_cache,
+                                        &load_balancer_cache,
+                                        &frontend_socket,
+                                        &sessions,
+                                        &metrics,
+                                        tls_no_verify,
+                                        max_sessions,
+                                        &mut last_client,
+                                        &mut batch_dgrams_out,
+                                        &mut batch_bytes_out,
+                                        &plugins,
+                                        proxy_name.as_deref(),
+                                        &proxy_namespace,
+                                        backend_protocol,
+                                        port,
+                                        &circuit_breaker_cache,
+                                        &consumer_index,
+                                        has_datagram_plugins,
+                                        &crls,
+                                        sni_proxy_ids.as_deref(),
+                                        &adaptive_buffer,
+                                    )
+                                    .await;
+                                    if let Err(e) = result {
+                                        debug!(proxy_id = %proxy_id, client = %addr2, "UDP forward error: {}", e);
+                                    }
+                                }
+                                total_drained += n;
                             }
+                            _ => break 'drain, // WouldBlock or error — socket drained
                         }
-                        Err(_) => break, // WouldBlock — socket drained
+                    }
+                }
+
+                #[cfg(not(target_os = "linux"))]
+                {
+                    for _ in 0..batch_limit {
+                        match frontend_socket.try_recv_from(&mut buf) {
+                            Ok((len2, addr2)) => {
+                                batch_dgrams_in += 1;
+                                batch_bytes_in += len2 as u64;
+
+                                let result = process_datagram(
+                                    &buf[..len2],
+                                    addr2,
+                                    &proxy_id,
+                                    &config,
+                                    &dns_cache,
+                                    &load_balancer_cache,
+                                    &frontend_socket,
+                                    &sessions,
+                                    &metrics,
+                                    tls_no_verify,
+                                    max_sessions,
+                                    &mut last_client,
+                                    &mut batch_dgrams_out,
+                                    &mut batch_bytes_out,
+                                    &plugins,
+                                    proxy_name.as_deref(),
+                                    &proxy_namespace,
+                                    backend_protocol,
+                                    port,
+                                    &circuit_breaker_cache,
+                                    &consumer_index,
+                                    has_datagram_plugins,
+                                    &crls,
+                                    sni_proxy_ids.as_deref(),
+                                    &adaptive_buffer,
+                                )
+                                .await;
+                                if let Err(e) = result {
+                                    debug!(proxy_id = %proxy_id, client = %addr2, "UDP forward error: {}", e);
+                                }
+                            }
+                            Err(_) => break, // WouldBlock — socket drained
+                        }
                     }
                 }
 

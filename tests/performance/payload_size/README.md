@@ -344,7 +344,7 @@ The backend echoes each request body back with the same `Content-Type` header an
 
 2. **HTTP/2 small payloads (10KB)** — Envoy is 72-87% faster than Ferrum at 10KB over HTTP/2. This large gap suggests Ferrum's TLS handshake or H2 connection establishment path has overhead that Envoy amortizes better at high concurrency. Since the bench creates ~10 H2 connections with ~10 streams each, the per-connection setup cost dominates for small payloads. Note the gap closes rapidly as payload size increases and the per-request cost dominates.
 
-3. **UDP small datagrams** — Envoy's UDP proxy is 54-62% faster for 64B-1KB datagrams (narrowed from ~60% before adaptive batch limits). Adaptive batch limiting improved small-datagram RPS by 2-4% (e.g., 64B: 83,456→85,533, 512B: 83,922→87,165) by selecting per-proxy batch limits based on observed traffic patterns. Envoy still wins due to kernel-level GRO (Generic Receive Offload) via `prefer_gro: true`, batching multiple datagrams into a single system call.
+3. **UDP small datagrams** — Envoy's UDP proxy is 54-62% faster for 64B-1KB datagrams (narrowed from ~60% before adaptive batch limits). Adaptive batch limiting improved small-datagram RPS by 2-4% (e.g., 64B: 83,456→85,533, 512B: 83,922→87,165) by selecting per-proxy batch limits based on observed traffic patterns. `recvmmsg(2)` batched recv is now implemented on Linux (`FERRUM_UDP_RECVMMSG_BATCH_SIZE=64`) to match Envoy's GRO approach — receives up to 64 datagrams per syscall instead of individual `recvfrom` calls. Re-benchmark on Linux to measure the actual gap closure.
 
 4. **WebSocket at 5MB-9MB** — Envoy maintains a lead at very large WebSocket frames: 5MB (-4.1%) and 9MB (-15.5%). With tunnel mode enabled (default for perf tests) and adaptive buffer sizing, the 9MB gap narrowed dramatically from the original -385% (25 vs 119 RPS with frame parsing) to -15.5% (103 vs 119 RPS with adaptive 64-256 KiB copy buffers). The remaining gap likely reflects Envoy's kernel-level `writev`/scatter-gather I/O advantage for sustained large writes.
 
@@ -364,12 +364,12 @@ Based on these results, the highest-impact remaining improvements for Ferrum Edg
 
 1. **HTTP/1.1 body forwarding at 100KB-1MB** (8-35% gap) — the `wrap_stream` → `wrap` fix eliminated chunked encoding overhead but reqwest's buffer copying still adds overhead vs Envoy's `writev`. Consider direct hyper H1 client with scatter-gather I/O for the reqwest bypass path
 2. **HTTP/2 small payload connection setup** (72-87% gap at 10KB) — profile the TLS+H2 handshake path for unnecessary overhead
-3. **UDP datagram batching** (60% gap) — investigate `recvmmsg`/`sendmmsg` for kernel-level batching
 
 **Resolved**:
 - ~~WebSocket large frame handling (9MB = -385%)~~ — fixed via `FERRUM_WEBSOCKET_TUNNEL_MODE=true` (raw TCP copy when no frame plugins configured, 25 → ~110 RPS), then further improved via adaptive buffer sizing (EWMA-selected 64-256 KiB copy buffers replacing tokio's 8 KiB default). WebSocket 1MB improved from +20% to **+44.1%** vs Envoy; 100KB flipped from -1.8% to **+8.5%** Ferrum win
 - ~~HTTP/1.1 chunked encoding overhead~~ — fixed via `reqwest::Body::wrap()` preserving `Content-Length` from upstream `size_hint()`. Closed the gap at 50KB (from ~10% to ~4%) and flipped 10KB to a Ferrum win (+4.3%)
 - ~~UDP adaptive batch limits~~ — per-proxy EWMA-based batch limit selection (64→6000 datagrams/cycle) improved small-datagram throughput by 2-4% while allowing quiet proxies to yield faster to the event loop
+- ~~UDP datagram batching (60% gap)~~ — implemented `recvmmsg(2)` batched recv on Linux via `src/proxy/udp_batch.rs`. The frontend recv drain loop now receives up to 64 datagrams per syscall (configurable via `FERRUM_UDP_RECVMMSG_BATCH_SIZE`), reducing kernel crossing overhead from 1-per-datagram to 1-per-batch. Pre-allocated buffers (64 × 65KB ≈ 4MB per listener) avoid hot-path allocation. Reply handlers (backend→client) intentionally skip `recvmmsg` since per-session buffer allocation is prohibitive at scale. On non-Linux, falls back to existing `try_recv_from`. Re-benchmark on Linux to measure the actual gap closure vs Envoy's GRO
 
 ### Content Type Independence
 

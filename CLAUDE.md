@@ -210,6 +210,7 @@ src/
 │   ├── http2_pool.rs          # HTTP/2 direct connection pool (hyper H2, sharded senders)
 │   ├── sni.rs                 # SNI extraction from TLS/DTLS ClientHello (used by passthrough mode)
 │   ├── tcp_proxy.rs           # Raw TCP stream proxy with TLS termination/origination/passthrough
+│   ├── udp_batch.rs           # Batched UDP recv via recvmmsg(2) on Linux (reduces syscall overhead)
 │   ├── udp_proxy.rs           # UDP datagram proxy with per-client session tracking, DTLS frontend/backend/passthrough
 │   └── stream_listener.rs     # Stream listener lifecycle manager (reconcile on config reload, port pre-bind check)
 ├── plugins/                   # Plugin system (52 plugins, including 5 AI/LLM, 1 AI federation, 1 serverless, 1 response mock, 1 spec expose, 1 compression, 1 SSE, 3 gRPC, 3 WS frame, 1 WS logging, 1 UDP datagram, 1 Loki logging, 1 UDP logging, 1 Kafka logging, and 1 SOAP WS-Security plugin)
@@ -648,6 +649,7 @@ These are hard-won findings from profiling. Violating them causes measurable reg
 - **Don't replace reqwest with H3 pool for HTTP/3 frontend→backend**: Tested and reverted. QUIC has higher per-request overhead than TCP/H2 for small payloads (~10x regression). reqwest's HTTP/2 pooling is highly optimized and auto-negotiates the best protocol via ALPN.
 - **gRPC `Proxy.clone()` is expensive**: The full `Proxy` struct has many fields. Avoid cloning it per-request. Extract needed fields into lightweight param structs (see `TcpConnParams` pattern in `tcp_proxy.rs`).
 - **H2 flow control tuning matters**: Default stream window (64KB) is too small for gRPC. The perf configs use 8MiB stream / 32MiB connection windows (`pool_http2_initial_stream_window_size`).
+- **UDP frontend recv uses `recvmmsg` on Linux**: The drain loop after each `recv_from` wakeup uses `recvmmsg(2)` to batch up to 64 datagrams per syscall (configurable via `FERRUM_UDP_RECVMMSG_BATCH_SIZE`). This reduces kernel crossing overhead from 1-per-datagram to 1-per-batch, matching Envoy's GRO-based approach. The `RecvMmsgBatch` in `src/proxy/udp_batch.rs` pre-allocates buffers at listener startup. On non-Linux, falls back to `try_recv_from`. Reply handlers (backend→client) intentionally skip `recvmmsg` — each session has its own backend socket with much lower per-socket throughput, and per-session batch buffer allocation (64 × 65KB = 4MB) would be prohibitive at scale.
 - **QUIC coalescing is critical**: Small QUIC frames kill performance. The H3 streaming path uses an 8-32KB coalescing buffer with time-based flush (2ms) to batch small chunks into larger QUIC frames.
 
 **Resilience features per protocol:**
@@ -865,6 +867,7 @@ Reduce per-request allocations in plugin lookup
 | `FERRUM_TCP_IDLE_TIMEOUT_SECONDS` | `300` | Default TCP idle timeout (5 min). Per-proxy `tcp_idle_timeout_seconds` overrides. 0 = disabled |
 | `FERRUM_UDP_MAX_SESSIONS` | `10000` | Maximum concurrent UDP sessions per proxy |
 | `FERRUM_UDP_CLEANUP_INTERVAL_SECONDS` | `10` | UDP session cleanup sweep interval |
+| `FERRUM_UDP_RECVMMSG_BATCH_SIZE` | `64` | Datagrams per `recvmmsg` syscall on Linux (1-1024). Reduces syscall overhead for high-throughput UDP. Ignored on non-Linux |
 | `FERRUM_UDP_RECV_BATCH_LIMIT` | `6000` | Max datagrams drained per recv wakeup before yielding. Higher = better burst throughput, lower = better fairness |
 | `FERRUM_WORKER_THREADS` | (CPU cores) | Tokio worker threads (maps to `runtime::Builder::worker_threads`) |
 | `FERRUM_BLOCKING_THREADS` | `512` | Tokio max blocking threads |
