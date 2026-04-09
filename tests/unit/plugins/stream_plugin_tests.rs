@@ -26,6 +26,7 @@ fn empty_consumer_index() -> Arc<ferrum_edge::ConsumerIndex> {
 fn test_consumer(username: &str) -> ferrum_edge::config::types::Consumer {
     ferrum_edge::config::types::Consumer {
         id: format!("consumer-{username}"),
+        namespace: ferrum_edge::config::types::default_namespace(),
         username: username.to_string(),
         custom_id: None,
         credentials: HashMap::new(),
@@ -337,6 +338,7 @@ fn make_stream_ctx() -> StreamConnectionContext {
 
 fn make_stream_summary() -> StreamTransactionSummary {
     StreamTransactionSummary {
+        namespace: "ferrum".to_string(),
         proxy_id: "test-proxy".to_string(),
         proxy_name: Some("Test Proxy".to_string()),
         client_ip: "10.1.2.3".to_string(),

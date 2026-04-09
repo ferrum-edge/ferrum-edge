@@ -142,6 +142,7 @@ fn create_test_env_config() -> EnvConfig {
 fn create_test_proxy(id: &str, listen_path: &str, backend_port: u16) -> Proxy {
     Proxy {
         id: id.to_string(),
+        namespace: ferrum_edge::config::types::default_namespace(),
         name: Some(format!("Test Proxy {}", id)),
         hosts: vec![],
         listen_path: listen_path.to_string(),
@@ -225,6 +226,7 @@ async fn test_cp_dp_grpc_config_sync() {
         proxies: vec![create_test_proxy("proxy-func-1", "/api/v1", 3001)],
         consumers: vec![Consumer {
             id: "consumer-1".into(),
+            namespace: ferrum_edge::config::types::default_namespace(),
             username: "test-user".into(),
             custom_id: Some("custom-1".into()),
             credentials: Default::default(),
@@ -235,6 +237,7 @@ async fn test_cp_dp_grpc_config_sync() {
         plugin_configs: vec![],
         upstreams: vec![],
         loaded_at: Utc::now(),
+        known_namespaces: Vec::new(),
     };
 
     // Start CP gRPC server
@@ -274,8 +277,15 @@ async fn test_cp_dp_grpc_config_sync() {
     let secret = dp_client::GrpcJwtSecret::new(GRPC_JWT_SECRET.to_string());
 
     let client_handle = tokio::spawn(async move {
-        let _ =
-            dp_client::connect_and_subscribe(&url_clone, &secret, "test-dp-node", &ps, None).await;
+        let _ = dp_client::connect_and_subscribe(
+            &url_clone,
+            &secret,
+            "test-dp-node",
+            &ps,
+            None,
+            "ferrum",
+        )
+        .await;
     });
 
     // Wait for initial config to be received by DP
@@ -308,6 +318,7 @@ async fn test_cp_dp_grpc_config_sync() {
         plugin_configs: vec![],
         upstreams: vec![],
         loaded_at: Utc::now(),
+        known_namespaces: Vec::new(),
     };
 
     config_arc.store(Arc::new(updated_config.clone()));
@@ -359,7 +370,7 @@ async fn test_database_connection_with_tls_config() {
 
     // Verify we can load config from the database
     let config = db
-        .load_full_config()
+        .load_full_config("ferrum")
         .await
         .expect("Failed to load config from database");
     assert_eq!(
@@ -380,7 +391,7 @@ async fn test_database_connection_with_tls_config() {
     // Test 3: Load config and verify proxy exists
     println!("Test 3: Loading config and verifying proxy...");
     let config = db
-        .load_full_config()
+        .load_full_config("ferrum")
         .await
         .expect("Failed to load config after creation");
     assert_eq!(config.proxies.len(), 1, "Database should have 1 proxy");
@@ -403,7 +414,7 @@ async fn test_database_connection_with_tls_config() {
     .expect("Failed to connect with TLS parameters");
 
     let config = db_with_tls
-        .load_full_config()
+        .load_full_config("ferrum")
         .await
         .expect("Failed to load config with TLS params");
     assert_eq!(
@@ -429,7 +440,7 @@ async fn test_database_connection_with_tls_config() {
     .expect("Failed to connect with TLS insecure");
 
     let config = db_insecure
-        .load_full_config()
+        .load_full_config("ferrum")
         .await
         .expect("Failed to load config with insecure TLS");
     assert_eq!(config.proxies.len(), 1);
@@ -528,4 +539,176 @@ async fn test_grpc_url_construction() {
     }
 
     println!("gRPC URL construction test PASSED");
+}
+
+/// Test that namespace isolation works end-to-end with a shared database.
+///
+/// Creates proxies and consumers in two namespaces ("production" and "staging")
+/// in the same SQLite database, then verifies that `load_full_config` with each
+/// namespace returns only that namespace's resources.
+#[ignore]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_namespace_isolation_in_database() {
+    println!("Starting namespace isolation test...");
+
+    let temp_dir = std::env::temp_dir();
+    let db_path = temp_dir.join(format!("ferrum_test_ns_{}.db", uuid::Uuid::new_v4()));
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.display());
+
+    let db = DatabaseStore::connect_with_tls_config(
+        "sqlite",
+        &db_url,
+        false,
+        None,
+        None,
+        None,
+        false,
+        DbPoolConfig::default(),
+    )
+    .await
+    .expect("Failed to connect to SQLite");
+
+    // Create proxies in "production" namespace
+    let mut prod_proxy = create_test_proxy("prod-proxy-1", "/api/v1", 3001);
+    prod_proxy.namespace = "production".to_string();
+    db.create_proxy(&prod_proxy)
+        .await
+        .expect("Failed to create production proxy");
+
+    let prod_consumer = Consumer {
+        id: "prod-consumer-1".into(),
+        namespace: "production".to_string(),
+        username: "prod-user".into(),
+        custom_id: None,
+        credentials: Default::default(),
+        acl_groups: Vec::new(),
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+    db.create_consumer(&prod_consumer)
+        .await
+        .expect("Failed to create production consumer");
+
+    // Create proxies in "staging" namespace
+    let mut staging_proxy = create_test_proxy("staging-proxy-1", "/api/v1", 3001);
+    staging_proxy.namespace = "staging".to_string();
+    db.create_proxy(&staging_proxy)
+        .await
+        .expect("Failed to create staging proxy");
+
+    let mut staging_proxy2 = create_test_proxy("staging-proxy-2", "/api/v2", 3002);
+    staging_proxy2.namespace = "staging".to_string();
+    db.create_proxy(&staging_proxy2)
+        .await
+        .expect("Failed to create staging proxy 2");
+
+    let staging_consumer = Consumer {
+        id: "staging-consumer-1".into(),
+        namespace: "staging".to_string(),
+        username: "staging-user".into(),
+        custom_id: None,
+        credentials: Default::default(),
+        acl_groups: Vec::new(),
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+    db.create_consumer(&staging_consumer)
+        .await
+        .expect("Failed to create staging consumer");
+
+    // Verify production namespace sees only its resources
+    println!("Test 1: Loading production namespace...");
+    let prod_config = db
+        .load_full_config("production")
+        .await
+        .expect("Failed to load production config");
+    assert_eq!(
+        prod_config.proxies.len(),
+        1,
+        "Production should have 1 proxy"
+    );
+    assert_eq!(prod_config.proxies[0].id, "prod-proxy-1");
+    assert_eq!(prod_config.proxies[0].namespace, "production");
+    assert_eq!(
+        prod_config.consumers.len(),
+        1,
+        "Production should have 1 consumer"
+    );
+    assert_eq!(prod_config.consumers[0].username, "prod-user");
+    println!("Production namespace isolation: PASSED");
+
+    // Verify staging namespace sees only its resources
+    println!("Test 2: Loading staging namespace...");
+    let staging_config = db
+        .load_full_config("staging")
+        .await
+        .expect("Failed to load staging config");
+    assert_eq!(
+        staging_config.proxies.len(),
+        2,
+        "Staging should have 2 proxies"
+    );
+    assert!(
+        staging_config
+            .proxies
+            .iter()
+            .all(|p| p.namespace == "staging")
+    );
+    assert_eq!(
+        staging_config.consumers.len(),
+        1,
+        "Staging should have 1 consumer"
+    );
+    assert_eq!(staging_config.consumers[0].username, "staging-user");
+    println!("Staging namespace isolation: PASSED");
+
+    // Verify default "ferrum" namespace sees nothing (no resources in that namespace)
+    println!("Test 3: Loading default namespace (should be empty)...");
+    let default_config = db
+        .load_full_config("ferrum")
+        .await
+        .expect("Failed to load default config");
+    assert_eq!(
+        default_config.proxies.len(),
+        0,
+        "Default namespace should have 0 proxies"
+    );
+    assert_eq!(
+        default_config.consumers.len(),
+        0,
+        "Default namespace should have 0 consumers"
+    );
+    println!("Default namespace empty: PASSED");
+
+    // Verify same listen_path works across namespaces (both have /api/v1)
+    println!("Test 4: Same listen_path in different namespaces...");
+    assert_eq!(prod_config.proxies[0].listen_path, "/api/v1");
+    assert!(
+        staging_config
+            .proxies
+            .iter()
+            .any(|p| p.listen_path == "/api/v1")
+    );
+    println!("Cross-namespace listen_path reuse: PASSED");
+
+    // Verify list_namespaces returns all namespaces
+    println!("Test 5: list_namespaces returns all namespaces...");
+    let namespaces = db
+        .list_namespaces()
+        .await
+        .expect("Failed to list namespaces");
+    assert!(
+        namespaces.contains(&"production".to_string()),
+        "Should contain production"
+    );
+    assert!(
+        namespaces.contains(&"staging".to_string()),
+        "Should contain staging"
+    );
+    println!("list_namespaces: PASSED (found {:?})", namespaces);
+
+    // Clean up
+    let _ = fs::remove_file(&db_path);
+
+    println!("Namespace isolation test PASSED");
 }

@@ -13,12 +13,16 @@ message SubscribeRequest {
   string node_id = 1;
   // Ferrum Edge binary version of the DP (e.g. "0.9.0")
   string ferrum_version = 2;
+  // Namespace this DP instance loads and proxies
+  string namespace = 3;
 }
 
 message FullConfigRequest {
   string node_id = 1;
   // Ferrum Edge binary version of the DP (e.g. "0.9.0")
   string ferrum_version = 2;
+  // Namespace to load config for
+  string namespace = 3;
 }
 
 message FullConfigResponse {

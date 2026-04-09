@@ -6,6 +6,7 @@ use ferrum_edge::proxy::grpc_proxy;
 fn test_proxy() -> Proxy {
     Proxy {
         id: "grpc-test".into(),
+        namespace: ferrum_edge::config::types::default_namespace(),
         name: Some("gRPC Test Proxy".into()),
         hosts: vec![],
         listen_path: "/grpc".into(),

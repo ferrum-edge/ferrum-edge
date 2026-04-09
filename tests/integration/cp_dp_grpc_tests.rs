@@ -35,6 +35,7 @@ fn test_secret() -> GrpcJwtSecret {
 fn create_test_proxy(id: &str, listen_path: &str) -> Proxy {
     Proxy {
         id: id.to_string(),
+        namespace: ferrum_edge::config::types::default_namespace(),
         name: Some(format!("Test Proxy {}", id)),
         hosts: vec![],
         listen_path: listen_path.to_string(),
@@ -97,6 +98,7 @@ fn create_test_config(proxy_count: usize) -> GatewayConfig {
         plugin_configs: vec![],
         upstreams: vec![],
         loaded_at: Utc::now(),
+        known_namespaces: Vec::new(),
     }
 }
 
@@ -272,7 +274,14 @@ async fn test_dp_receives_initial_config_from_cp() {
 
     let result = timeout(
         Duration::from_secs(5),
-        dp_client::connect_and_subscribe(&cp_url, &test_secret(), node_id, &proxy_state, None),
+        dp_client::connect_and_subscribe(
+            &cp_url,
+            &test_secret(),
+            node_id,
+            &proxy_state,
+            None,
+            "ferrum",
+        ),
     )
     .await;
 
@@ -314,7 +323,15 @@ async fn test_dp_receives_config_updates() {
     let cp_url = format!("http://127.0.0.1:{}", addr.port());
     let ps = proxy_state.clone();
     let client_handle = tokio::spawn(async move {
-        dp_client::connect_and_subscribe(&cp_url, &test_secret(), "test-node-2", &ps, None).await
+        dp_client::connect_and_subscribe(
+            &cp_url,
+            &test_secret(),
+            "test-node-2",
+            &ps,
+            None,
+            "ferrum",
+        )
+        .await
     });
 
     // Wait for initial config to arrive
@@ -376,6 +393,7 @@ async fn test_dp_rejects_invalid_token() {
             "bad-node",
             &proxy_state,
             None,
+            "ferrum",
         ),
     )
     .await;
@@ -450,6 +468,7 @@ async fn test_cp_rejects_token_missing_required_claims() {
     let request = tonic::Request::new(ferrum_edge::grpc::proto::SubscribeRequest {
         node_id: "missing-claims-node".to_string(),
         ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+        namespace: "ferrum".to_string(),
     });
 
     let result = client.subscribe(request).await;
@@ -477,8 +496,15 @@ async fn test_dp_handles_malformed_config() {
     // Spawn DP client (DP generates JWT from shared secret)
     let ps = proxy_state.clone();
     let client_handle = tokio::spawn(async move {
-        dp_client::connect_and_subscribe(&cp_url, &test_secret(), "test-node-malformed", &ps, None)
-            .await
+        dp_client::connect_and_subscribe(
+            &cp_url,
+            &test_secret(),
+            "test-node-malformed",
+            &ps,
+            None,
+            "ferrum",
+        )
+        .await
     });
 
     // Wait for initial config
@@ -551,7 +577,15 @@ async fn test_dp_preserves_config_after_cp_shutdown() {
     let ps = proxy_state.clone();
     let url_clone = cp_url.clone();
     let client_handle = tokio::spawn(async move {
-        dp_client::start_dp_client_with_shutdown(url_clone, test_secret(), ps, None, None).await;
+        dp_client::start_dp_client_with_shutdown(
+            url_clone,
+            test_secret(),
+            ps,
+            None,
+            None,
+            "ferrum".to_string(),
+        )
+        .await;
     });
 
     // Wait for initial config
@@ -692,6 +726,7 @@ async fn test_dp_connects_to_cp_with_tls() {
             "tls-node-1",
             &proxy_state,
             Some(&tls_config),
+            "ferrum",
         ),
     )
     .await;
@@ -773,6 +808,7 @@ async fn test_dp_connects_to_cp_with_mtls() {
             "mtls-node-1",
             &proxy_state,
             Some(&tls_config),
+            "ferrum",
         ),
     )
     .await;
@@ -830,6 +866,7 @@ async fn test_dp_rejects_untrusted_cp_server_cert() {
             "untrusted-node",
             &proxy_state,
             Some(&tls_config),
+            "ferrum",
         ),
     )
     .await;
@@ -862,7 +899,15 @@ async fn test_dp_applies_delta_update_adding_proxy() {
     // Spawn DP client (DP generates JWT from shared secret)
     let ps = proxy_state.clone();
     let client_handle = tokio::spawn(async move {
-        dp_client::connect_and_subscribe(&cp_url, &test_secret(), "delta-node-1", &ps, None).await
+        dp_client::connect_and_subscribe(
+            &cp_url,
+            &test_secret(),
+            "delta-node-1",
+            &ps,
+            None,
+            "ferrum",
+        )
+        .await
     });
 
     // Wait for initial full snapshot
@@ -931,7 +976,15 @@ async fn test_dp_applies_delta_update_removing_proxy() {
 
     let ps = proxy_state.clone();
     let client_handle = tokio::spawn(async move {
-        dp_client::connect_and_subscribe(&cp_url, &test_secret(), "delta-node-2", &ps, None).await
+        dp_client::connect_and_subscribe(
+            &cp_url,
+            &test_secret(),
+            "delta-node-2",
+            &ps,
+            None,
+            "ferrum",
+        )
+        .await
     });
 
     // Wait for initial snapshot
@@ -999,7 +1052,15 @@ async fn test_dp_applies_delta_then_full_snapshot() {
 
     let ps = proxy_state.clone();
     let client_handle = tokio::spawn(async move {
-        dp_client::connect_and_subscribe(&cp_url, &test_secret(), "delta-node-3", &ps, None).await
+        dp_client::connect_and_subscribe(
+            &cp_url,
+            &test_secret(),
+            "delta-node-3",
+            &ps,
+            None,
+            "ferrum",
+        )
+        .await
     });
 
     // Wait for initial snapshot (2 proxies)
@@ -1076,7 +1137,15 @@ async fn test_dp_ignores_malformed_delta() {
 
     let ps = proxy_state.clone();
     let client_handle = tokio::spawn(async move {
-        dp_client::connect_and_subscribe(&cp_url, &test_secret(), "delta-node-4", &ps, None).await
+        dp_client::connect_and_subscribe(
+            &cp_url,
+            &test_secret(),
+            "delta-node-4",
+            &ps,
+            None,
+            "ferrum",
+        )
+        .await
     });
 
     // Wait for initial snapshot
@@ -1186,7 +1255,15 @@ async fn test_dp_applies_delta_modifying_proxy() {
 
     let ps = proxy_state.clone();
     let client_handle = tokio::spawn(async move {
-        dp_client::connect_and_subscribe(&cp_url, &test_secret(), "delta-mod-node", &ps, None).await
+        dp_client::connect_and_subscribe(
+            &cp_url,
+            &test_secret(),
+            "delta-mod-node",
+            &ps,
+            None,
+            "ferrum",
+        )
+        .await
     });
 
     // Wait for initial snapshot (2 proxies)
@@ -1264,8 +1341,15 @@ async fn test_dp_applies_delta_with_mixed_operations() {
 
     let ps = proxy_state.clone();
     let client_handle = tokio::spawn(async move {
-        dp_client::connect_and_subscribe(&cp_url, &test_secret(), "delta-mixed-node", &ps, None)
-            .await
+        dp_client::connect_and_subscribe(
+            &cp_url,
+            &test_secret(),
+            "delta-mixed-node",
+            &ps,
+            None,
+            "ferrum",
+        )
+        .await
     });
 
     // Wait for initial snapshot (3 proxies)
@@ -1382,6 +1466,7 @@ async fn test_cp_rejects_dp_with_version_mismatch() {
     let request = tonic::Request::new(ferrum_edge::grpc::proto::SubscribeRequest {
         node_id: "test-dp".to_string(),
         ferrum_version: "99.99.0".to_string(),
+        namespace: "ferrum".to_string(),
     });
 
     let result = client.subscribe(request).await;
@@ -1398,6 +1483,7 @@ async fn test_cp_rejects_dp_with_version_mismatch() {
     let request = tonic::Request::new(ferrum_edge::grpc::proto::FullConfigRequest {
         node_id: "test-dp".to_string(),
         ferrum_version: "99.99.0".to_string(),
+        namespace: "ferrum".to_string(),
     });
 
     let result = client.get_full_config(request).await;
@@ -1408,6 +1494,7 @@ async fn test_cp_rejects_dp_with_version_mismatch() {
     let request = tonic::Request::new(ferrum_edge::grpc::proto::SubscribeRequest {
         node_id: "test-dp-good".to_string(),
         ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+        namespace: "ferrum".to_string(),
     });
 
     let result = client.subscribe(request).await;
@@ -1463,6 +1550,7 @@ async fn test_cp_rejects_dp_with_empty_version() {
     let request = tonic::Request::new(ferrum_edge::grpc::proto::SubscribeRequest {
         node_id: "old-dp".to_string(),
         ferrum_version: String::new(),
+        namespace: "ferrum".to_string(),
     });
 
     let result = client.subscribe(request).await;
@@ -1483,6 +1571,7 @@ async fn test_cp_rejects_dp_with_empty_version() {
 fn create_test_upstream(id: &str, hosts: &[(&str, u16)]) -> Upstream {
     Upstream {
         id: id.to_string(),
+        namespace: ferrum_edge::config::types::default_namespace(),
         name: Some(format!("upstream-{}", id)),
         targets: hosts
             .iter()
@@ -1507,6 +1596,7 @@ fn create_test_upstream(id: &str, hosts: &[(&str, u16)]) -> Upstream {
 fn create_test_consumer(id: &str, username: &str) -> Consumer {
     Consumer {
         id: id.to_string(),
+        namespace: ferrum_edge::config::types::default_namespace(),
         username: username.to_string(),
         custom_id: None,
         credentials: HashMap::new(),
@@ -1526,8 +1616,15 @@ async fn test_dp_applies_delta_adding_upstream() {
 
     let ps = proxy_state.clone();
     let client_handle = tokio::spawn(async move {
-        dp_client::connect_and_subscribe(&cp_url, &test_secret(), "upstream-add-node", &ps, None)
-            .await
+        dp_client::connect_and_subscribe(
+            &cp_url,
+            &test_secret(),
+            "upstream-add-node",
+            &ps,
+            None,
+            "ferrum",
+        )
+        .await
     });
 
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -1579,8 +1676,15 @@ async fn test_dp_applies_delta_removing_upstream() {
 
     let ps = proxy_state.clone();
     let client_handle = tokio::spawn(async move {
-        dp_client::connect_and_subscribe(&cp_url, &test_secret(), "upstream-rm-node", &ps, None)
-            .await
+        dp_client::connect_and_subscribe(
+            &cp_url,
+            &test_secret(),
+            "upstream-rm-node",
+            &ps,
+            None,
+            "ferrum",
+        )
+        .await
     });
 
     let applied = timeout(Duration::from_secs(5), async {
@@ -1637,8 +1741,15 @@ async fn test_dp_applies_delta_modifying_upstream_targets() {
 
     let ps = proxy_state.clone();
     let client_handle = tokio::spawn(async move {
-        dp_client::connect_and_subscribe(&cp_url, &test_secret(), "upstream-mod-node", &ps, None)
-            .await
+        dp_client::connect_and_subscribe(
+            &cp_url,
+            &test_secret(),
+            "upstream-mod-node",
+            &ps,
+            None,
+            "ferrum",
+        )
+        .await
     });
 
     let applied = timeout(Duration::from_secs(5), async {
@@ -1700,8 +1811,15 @@ async fn test_dp_applies_delta_adding_consumer() {
 
     let ps = proxy_state.clone();
     let client_handle = tokio::spawn(async move {
-        dp_client::connect_and_subscribe(&cp_url, &test_secret(), "consumer-add-node", &ps, None)
-            .await
+        dp_client::connect_and_subscribe(
+            &cp_url,
+            &test_secret(),
+            "consumer-add-node",
+            &ps,
+            None,
+            "ferrum",
+        )
+        .await
     });
 
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -1756,8 +1874,15 @@ async fn test_dp_applies_delta_removing_consumer() {
 
     let ps = proxy_state.clone();
     let client_handle = tokio::spawn(async move {
-        dp_client::connect_and_subscribe(&cp_url, &test_secret(), "consumer-rm-node", &ps, None)
-            .await
+        dp_client::connect_and_subscribe(
+            &cp_url,
+            &test_secret(),
+            "consumer-rm-node",
+            &ps,
+            None,
+            "ferrum",
+        )
+        .await
     });
 
     let applied = timeout(Duration::from_secs(5), async {
@@ -1816,14 +1941,16 @@ async fn test_cp_broadcasts_delta_to_multiple_dps() {
     let url1 = cp_url.clone();
 
     let dp_handle_1 = tokio::spawn(async move {
-        dp_client::connect_and_subscribe(&url1, &test_secret(), "multi-dp-1", &ps1, None).await
+        dp_client::connect_and_subscribe(&url1, &test_secret(), "multi-dp-1", &ps1, None, "ferrum")
+            .await
     });
 
     let ps2 = proxy_state_2.clone();
     let url2 = cp_url.clone();
 
     let dp_handle_2 = tokio::spawn(async move {
-        dp_client::connect_and_subscribe(&url2, &test_secret(), "multi-dp-2", &ps2, None).await
+        dp_client::connect_and_subscribe(&url2, &test_secret(), "multi-dp-2", &ps2, None, "ferrum")
+            .await
     });
 
     // Wait for both DPs to receive initial config
@@ -1899,8 +2026,15 @@ async fn test_dp_applies_delta_with_all_entity_types() {
 
     let ps = proxy_state.clone();
     let client_handle = tokio::spawn(async move {
-        dp_client::connect_and_subscribe(&cp_url, &test_secret(), "mixed-delta-node", &ps, None)
-            .await
+        dp_client::connect_and_subscribe(
+            &cp_url,
+            &test_secret(),
+            "mixed-delta-node",
+            &ps,
+            None,
+            "ferrum",
+        )
+        .await
     });
 
     let ready = timeout(Duration::from_secs(5), async {

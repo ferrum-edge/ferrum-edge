@@ -215,6 +215,7 @@ fn test_load_balancer_cache() {
         version: "1".to_string(),
         upstreams: vec![Upstream {
             id: "us1".into(),
+            namespace: ferrum_edge::config::types::default_namespace(),
             name: Some("test".into()),
             targets: make_targets(2),
             algorithm: LoadBalancerAlgorithm::RoundRobin,
@@ -582,6 +583,7 @@ fn test_least_latency_cache_record_and_select() {
         version: "1".to_string(),
         upstreams: vec![Upstream {
             id: "us1".into(),
+            namespace: ferrum_edge::config::types::default_namespace(),
             name: Some("test".into()),
             targets: targets.clone(),
             algorithm: LoadBalancerAlgorithm::LeastLatency,
@@ -924,6 +926,7 @@ fn test_load_balancer_cache_get_hash_on_strategy() {
         version: "1".to_string(),
         upstreams: vec![Upstream {
             id: "us1".into(),
+            namespace: ferrum_edge::config::types::default_namespace(),
             name: Some("test".into()),
             targets: make_targets(2),
             algorithm: LoadBalancerAlgorithm::ConsistentHashing,
@@ -954,6 +957,7 @@ fn test_load_balancer_cache_get_hash_on_strategy() {
 fn make_upstream(id: &str, targets: Vec<UpstreamTarget>) -> Upstream {
     Upstream {
         id: id.to_string(),
+        namespace: ferrum_edge::config::types::default_namespace(),
         name: Some(format!("upstream-{}", id)),
         targets,
         algorithm: LoadBalancerAlgorithm::RoundRobin,

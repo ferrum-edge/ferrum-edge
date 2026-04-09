@@ -456,13 +456,14 @@ mod inner {
             self.backend_allow_ips = policy;
         }
 
-        async fn load_full_config(&self) -> Result<GatewayConfig, anyhow::Error> {
+        async fn load_full_config(&self, namespace: &str) -> Result<GatewayConfig, anyhow::Error> {
             let start = std::time::Instant::now();
             let loaded_at = Utc::now();
+            let ns_filter = doc! { "namespace": namespace };
 
-            // Load all collections
+            // Load all collections scoped to namespace
             let mut proxies = Vec::new();
-            let mut cursor = self.proxies().find(doc! {}).await?;
+            let mut cursor = self.proxies().find(ns_filter.clone()).await?;
             while cursor.advance().await? {
                 let doc = cursor.deserialize_current()?;
                 match doc_to_proxy(doc) {
@@ -472,7 +473,7 @@ mod inner {
             }
 
             let mut consumers = Vec::new();
-            let mut cursor = self.consumers().find(doc! {}).await?;
+            let mut cursor = self.consumers().find(ns_filter.clone()).await?;
             while cursor.advance().await? {
                 let doc = cursor.deserialize_current()?;
                 match doc_to_consumer(doc) {
@@ -482,7 +483,7 @@ mod inner {
             }
 
             let mut plugin_configs = Vec::new();
-            let mut cursor = self.plugin_configs().find(doc! {}).await?;
+            let mut cursor = self.plugin_configs().find(ns_filter.clone()).await?;
             while cursor.advance().await? {
                 let doc = cursor.deserialize_current()?;
                 match doc_to_plugin_config(doc) {
@@ -492,7 +493,7 @@ mod inner {
             }
 
             let mut upstreams = Vec::new();
-            let mut cursor = self.upstreams().find(doc! {}).await?;
+            let mut cursor = self.upstreams().find(ns_filter).await?;
             while cursor.advance().await? {
                 let doc = cursor.deserialize_current()?;
                 match doc_to_upstream(doc) {
@@ -504,7 +505,8 @@ mod inner {
             self.check_slow_query("load_full_config", start);
 
             info!(
-                "MongoDB loaded config: {} proxies, {} consumers, {} plugins, {} upstreams",
+                "MongoDB loaded config (namespace='{}'): {} proxies, {} consumers, {} plugins, {} upstreams",
+                namespace,
                 proxies.len(),
                 consumers.len(),
                 plugin_configs.len(),
@@ -518,11 +520,13 @@ mod inner {
                 plugin_configs,
                 upstreams,
                 loaded_at,
+                known_namespaces: Vec::new(),
             })
         }
 
         async fn load_incremental_config(
             &self,
+            namespace: &str,
             since: DateTime<Utc>,
             known_proxy_ids: &HashSet<String>,
             known_consumer_ids: &HashSet<String>,
@@ -537,7 +541,7 @@ mod inner {
             // which is lexicographically sortable, so $gt on strings works correctly.
             let since_with_margin = since - chrono::Duration::seconds(1);
             let since_str = since_with_margin.to_rfc3339();
-            let filter = doc! { "updated_at": { "$gt": &since_str } };
+            let filter = doc! { "namespace": namespace, "updated_at": { "$gt": &since_str } };
 
             // Load changed resources
             let mut added_or_modified_proxies = Vec::new();
@@ -576,11 +580,20 @@ mod inner {
                 }
             }
 
-            // Detect deletions by loading current IDs and diffing against known sets
-            let current_proxy_ids = self.load_collection_ids("proxies").await?;
-            let current_consumer_ids = self.load_collection_ids("consumers").await?;
-            let current_plugin_config_ids = self.load_collection_ids("plugin_configs").await?;
-            let current_upstream_ids = self.load_collection_ids("upstreams").await?;
+            // Detect deletions by loading current IDs (scoped to namespace) and diffing against known sets
+            let ns_filter = doc! { "namespace": namespace };
+            let current_proxy_ids = self
+                .load_collection_ids_filtered("proxies", ns_filter.clone())
+                .await?;
+            let current_consumer_ids = self
+                .load_collection_ids_filtered("consumers", ns_filter.clone())
+                .await?;
+            let current_plugin_config_ids = self
+                .load_collection_ids_filtered("plugin_configs", ns_filter.clone())
+                .await?;
+            let current_upstream_ids = self
+                .load_collection_ids_filtered("upstreams", ns_filter)
+                .await?;
 
             let removed_proxy_ids = diff_removed(known_proxy_ids, &current_proxy_ids);
             let removed_consumer_ids = diff_removed(known_consumer_ids, &current_consumer_ids);
@@ -656,17 +669,19 @@ mod inner {
 
         async fn list_proxies_paginated(
             &self,
+            namespace: &str,
             limit: i64,
             offset: i64,
         ) -> Result<PaginatedResult<Proxy>, anyhow::Error> {
             let start = std::time::Instant::now();
-            let total = self.proxies().count_documents(doc! {}).await? as i64;
+            let ns_filter = doc! { "namespace": namespace };
+            let total = self.proxies().count_documents(ns_filter.clone()).await? as i64;
             let options = FindOptions::builder()
                 .sort(doc! { "_id": 1 })
                 .skip(Some(offset as u64))
                 .limit(Some(limit))
                 .build();
-            let mut cursor = self.proxies().find(doc! {}).with_options(options).await?;
+            let mut cursor = self.proxies().find(ns_filter).with_options(options).await?;
             let mut items = Vec::new();
             while cursor.advance().await? {
                 let doc = cursor.deserialize_current()?;
@@ -717,17 +732,23 @@ mod inner {
 
         async fn list_consumers_paginated(
             &self,
+            namespace: &str,
             limit: i64,
             offset: i64,
         ) -> Result<PaginatedResult<Consumer>, anyhow::Error> {
             let start = std::time::Instant::now();
-            let total = self.consumers().count_documents(doc! {}).await? as i64;
+            let ns_filter = doc! { "namespace": namespace };
+            let total = self.consumers().count_documents(ns_filter.clone()).await? as i64;
             let options = FindOptions::builder()
                 .sort(doc! { "_id": 1 })
                 .skip(Some(offset as u64))
                 .limit(Some(limit))
                 .build();
-            let mut cursor = self.consumers().find(doc! {}).with_options(options).await?;
+            let mut cursor = self
+                .consumers()
+                .find(ns_filter)
+                .with_options(options)
+                .await?;
             let mut items = Vec::new();
             while cursor.advance().await? {
                 let doc = cursor.deserialize_current()?;
@@ -778,11 +799,16 @@ mod inner {
 
         async fn list_plugin_configs_paginated(
             &self,
+            namespace: &str,
             limit: i64,
             offset: i64,
         ) -> Result<PaginatedResult<PluginConfig>, anyhow::Error> {
             let start = std::time::Instant::now();
-            let total = self.plugin_configs().count_documents(doc! {}).await? as i64;
+            let ns_filter = doc! { "namespace": namespace };
+            let total = self
+                .plugin_configs()
+                .count_documents(ns_filter.clone())
+                .await? as i64;
             let options = FindOptions::builder()
                 .sort(doc! { "_id": 1 })
                 .skip(Some(offset as u64))
@@ -790,7 +816,7 @@ mod inner {
                 .build();
             let mut cursor = self
                 .plugin_configs()
-                .find(doc! {})
+                .find(ns_filter)
                 .with_options(options)
                 .await?;
             let mut items = Vec::new();
@@ -860,17 +886,23 @@ mod inner {
 
         async fn list_upstreams_paginated(
             &self,
+            namespace: &str,
             limit: i64,
             offset: i64,
         ) -> Result<PaginatedResult<Upstream>, anyhow::Error> {
             let start = std::time::Instant::now();
-            let total = self.upstreams().count_documents(doc! {}).await? as i64;
+            let ns_filter = doc! { "namespace": namespace };
+            let total = self.upstreams().count_documents(ns_filter.clone()).await? as i64;
             let options = FindOptions::builder()
                 .sort(doc! { "_id": 1 })
                 .skip(Some(offset as u64))
                 .limit(Some(limit))
                 .build();
-            let mut cursor = self.upstreams().find(doc! {}).with_options(options).await?;
+            let mut cursor = self
+                .upstreams()
+                .find(ns_filter)
+                .with_options(options)
+                .await?;
             let mut items = Vec::new();
             while cursor.advance().await? {
                 let doc = cursor.deserialize_current()?;
@@ -886,11 +918,12 @@ mod inner {
 
         async fn check_listen_path_unique(
             &self,
+            namespace: &str,
             listen_path: &str,
             hosts: &[String],
             exclude_proxy_id: Option<&str>,
         ) -> Result<bool, anyhow::Error> {
-            let mut filter = doc! { "listen_path": listen_path };
+            let mut filter = doc! { "namespace": namespace, "listen_path": listen_path };
             if let Some(id) = exclude_proxy_id {
                 filter.insert("_id", doc! { "$ne": id });
             }
@@ -910,10 +943,11 @@ mod inner {
 
         async fn check_proxy_name_unique(
             &self,
+            namespace: &str,
             name: &str,
             exclude_proxy_id: Option<&str>,
         ) -> Result<bool, anyhow::Error> {
-            let mut filter = doc! { "name": name };
+            let mut filter = doc! { "namespace": namespace, "name": name };
             if let Some(id) = exclude_proxy_id {
                 filter.insert("_id", doc! { "$ne": id });
             }
@@ -923,10 +957,11 @@ mod inner {
 
         async fn check_upstream_name_unique(
             &self,
+            namespace: &str,
             name: &str,
             exclude_upstream_id: Option<&str>,
         ) -> Result<bool, anyhow::Error> {
-            let mut filter = doc! { "name": name };
+            let mut filter = doc! { "namespace": namespace, "name": name };
             if let Some(id) = exclude_upstream_id {
                 filter.insert("_id", doc! { "$ne": id });
             }
@@ -936,6 +971,7 @@ mod inner {
 
         async fn check_consumer_identity_unique(
             &self,
+            namespace: &str,
             username: &str,
             custom_id: Option<&str>,
             exclude_consumer_id: Option<&str>,
@@ -945,7 +981,7 @@ mod inner {
             if let Some(cid) = custom_id {
                 or_conditions.push(doc! { "custom_id": cid });
             }
-            let mut filter = doc! { "$or": or_conditions };
+            let mut filter = doc! { "namespace": namespace, "$or": or_conditions };
             if let Some(id) = exclude_consumer_id {
                 filter.insert("_id", doc! { "$ne": id });
             }
@@ -961,11 +997,13 @@ mod inner {
 
         async fn check_keyauth_key_unique(
             &self,
+            namespace: &str,
             key: &str,
             exclude_consumer_id: Option<&str>,
         ) -> Result<bool, anyhow::Error> {
             // Supports both single-object and array formats for keyauth credentials
             let mut filter = doc! {
+                "namespace": namespace,
                 "$or": [
                     { "credentials.keyauth.key": key },
                     { "credentials.keyauth": { "$elemMatch": { "key": key } } }
@@ -980,11 +1018,13 @@ mod inner {
 
         async fn check_mtls_identity_unique(
             &self,
+            namespace: &str,
             identity: &str,
             exclude_consumer_id: Option<&str>,
         ) -> Result<bool, anyhow::Error> {
             // Supports both single-object and array formats for mtls_auth credentials
             let mut filter = doc! {
+                "namespace": namespace,
                 "$or": [
                     { "credentials.mtls_auth.identity": identity },
                     { "credentials.mtls_auth": { "$elemMatch": { "identity": identity } } }
@@ -999,10 +1039,11 @@ mod inner {
 
         async fn check_listen_port_unique(
             &self,
+            namespace: &str,
             port: u16,
             exclude_proxy_id: Option<&str>,
         ) -> Result<bool, anyhow::Error> {
-            let mut filter = doc! { "listen_port": port as i32 };
+            let mut filter = doc! { "namespace": namespace, "listen_port": port as i32 };
             if let Some(id) = exclude_proxy_id {
                 filter.insert("_id", doc! { "$ne": id });
             }
@@ -1117,12 +1158,13 @@ mod inner {
             Ok(result.inserted_ids.len())
         }
 
-        async fn delete_all_resources(&self) -> Result<(), anyhow::Error> {
-            self.plugin_configs().delete_many(doc! {}).await?;
-            self.proxies().delete_many(doc! {}).await?;
-            self.consumers().delete_many(doc! {}).await?;
-            self.upstreams().delete_many(doc! {}).await?;
-            info!("All MongoDB resources deleted");
+        async fn delete_all_resources(&self, namespace: &str) -> Result<(), anyhow::Error> {
+            let ns_filter = doc! { "namespace": namespace };
+            self.plugin_configs().delete_many(ns_filter.clone()).await?;
+            self.proxies().delete_many(ns_filter.clone()).await?;
+            self.consumers().delete_many(ns_filter.clone()).await?;
+            self.upstreams().delete_many(ns_filter).await?;
+            info!("All MongoDB resources deleted (namespace='{}')", namespace);
             Ok(())
         }
 
@@ -1220,12 +1262,12 @@ mod inner {
             // MongoDB doesn't use SQL migrations. Instead, ensure indexes exist.
             // createIndex is idempotent — no-op if the index already exists.
 
-            // proxies indexes
+            // proxies indexes — uniqueness scoped to namespace
             self.proxies()
                 .create_index(
                     IndexModel::builder()
-                        .keys(doc! { "name": 1 })
-                        .options(IndexOptions::builder().unique(true).build())
+                        .keys(doc! { "namespace": 1, "name": 1 })
+                        .options(IndexOptions::builder().unique(true).sparse(true).build())
                         .build(),
                 )
                 .await?;
@@ -1242,16 +1284,27 @@ mod inner {
             self.proxies()
                 .create_index(
                     IndexModel::builder()
-                        .keys(doc! { "listen_port": 1 })
+                        .keys(doc! { "namespace": 1, "listen_port": 1 })
+                        .options(IndexOptions::builder().unique(true).sparse(true).build())
+                        .build(),
+                )
+                .await?;
+            self.proxies()
+                .create_index(IndexModel::builder().keys(doc! { "namespace": 1 }).build())
+                .await?;
+            self.proxies()
+                .create_index(
+                    IndexModel::builder()
+                        .keys(doc! { "namespace": 1, "updated_at": 1 })
                         .build(),
                 )
                 .await?;
 
-            // consumers indexes
+            // consumers indexes — uniqueness scoped to namespace
             self.consumers()
                 .create_index(
                     IndexModel::builder()
-                        .keys(doc! { "username": 1 })
+                        .keys(doc! { "namespace": 1, "username": 1 })
                         .options(IndexOptions::builder().unique(true).build())
                         .build(),
                 )
@@ -1259,13 +1312,23 @@ mod inner {
             self.consumers()
                 .create_index(
                     IndexModel::builder()
-                        .keys(doc! { "custom_id": 1 })
+                        .keys(doc! { "namespace": 1, "custom_id": 1 })
                         .options(IndexOptions::builder().unique(true).sparse(true).build())
                         .build(),
                 )
                 .await?;
             self.consumers()
                 .create_index(IndexModel::builder().keys(doc! { "updated_at": 1 }).build())
+                .await?;
+            self.consumers()
+                .create_index(IndexModel::builder().keys(doc! { "namespace": 1 }).build())
+                .await?;
+            self.consumers()
+                .create_index(
+                    IndexModel::builder()
+                        .keys(doc! { "namespace": 1, "updated_at": 1 })
+                        .build(),
+                )
                 .await?;
 
             // plugin_configs indexes
@@ -1275,22 +1338,64 @@ mod inner {
             self.plugin_configs()
                 .create_index(IndexModel::builder().keys(doc! { "updated_at": 1 }).build())
                 .await?;
+            self.plugin_configs()
+                .create_index(IndexModel::builder().keys(doc! { "namespace": 1 }).build())
+                .await?;
+            self.plugin_configs()
+                .create_index(
+                    IndexModel::builder()
+                        .keys(doc! { "namespace": 1, "updated_at": 1 })
+                        .build(),
+                )
+                .await?;
 
-            // upstreams indexes
+            // upstreams indexes — uniqueness scoped to namespace
             self.upstreams()
                 .create_index(
                     IndexModel::builder()
-                        .keys(doc! { "name": 1 })
-                        .options(IndexOptions::builder().unique(true).build())
+                        .keys(doc! { "namespace": 1, "name": 1 })
+                        .options(IndexOptions::builder().unique(true).sparse(true).build())
                         .build(),
                 )
                 .await?;
             self.upstreams()
                 .create_index(IndexModel::builder().keys(doc! { "updated_at": 1 }).build())
                 .await?;
+            self.upstreams()
+                .create_index(IndexModel::builder().keys(doc! { "namespace": 1 }).build())
+                .await?;
+            self.upstreams()
+                .create_index(
+                    IndexModel::builder()
+                        .keys(doc! { "namespace": 1, "updated_at": 1 })
+                        .build(),
+                )
+                .await?;
 
             info!("MongoDB indexes ensured");
             Ok(())
+        }
+
+        async fn list_namespaces(&self) -> Result<Vec<String>, anyhow::Error> {
+            let mut all_namespaces = HashSet::new();
+
+            // Collect distinct namespaces from all 4 collections
+            for ns in self.distinct_namespaces("proxies").await? {
+                all_namespaces.insert(ns);
+            }
+            for ns in self.distinct_namespaces("consumers").await? {
+                all_namespaces.insert(ns);
+            }
+            for ns in self.distinct_namespaces("plugin_configs").await? {
+                all_namespaces.insert(ns);
+            }
+            for ns in self.distinct_namespaces("upstreams").await? {
+                all_namespaces.insert(ns);
+            }
+
+            let mut result: Vec<String> = all_namespaces.into_iter().collect();
+            result.sort();
+            Ok(result)
         }
     }
 
@@ -1300,13 +1405,24 @@ mod inner {
 
     impl MongoStore {
         /// Load all `_id` values from a collection (for deletion detection).
+        #[allow(dead_code)]
         async fn load_collection_ids(
             &self,
             collection_name: &str,
         ) -> Result<HashSet<String>, anyhow::Error> {
+            self.load_collection_ids_filtered(collection_name, doc! {})
+                .await
+        }
+
+        /// Load `_id` values from a collection matching a filter (for namespace-scoped deletion detection).
+        async fn load_collection_ids_filtered(
+            &self,
+            collection_name: &str,
+            filter: Document,
+        ) -> Result<HashSet<String>, anyhow::Error> {
             let collection: Collection<Document> = self.db.collection(collection_name);
             let options = FindOptions::builder().projection(doc! { "_id": 1 }).build();
-            let mut cursor = collection.find(doc! {}).with_options(options).await?;
+            let mut cursor = collection.find(filter).with_options(options).await?;
             let mut ids = HashSet::new();
             while cursor.advance().await? {
                 let doc = cursor.deserialize_current()?;
@@ -1315,6 +1431,22 @@ mod inner {
                 }
             }
             Ok(ids)
+        }
+
+        /// Collect distinct namespace values from a single collection.
+        async fn distinct_namespaces(
+            &self,
+            collection_name: &str,
+        ) -> Result<HashSet<String>, anyhow::Error> {
+            let collection: Collection<Document> = self.db.collection(collection_name);
+            let values = collection.distinct("namespace", doc! {}).await?;
+            let mut namespaces = HashSet::new();
+            for val in values {
+                if let Some(s) = val.as_str() {
+                    namespaces.insert(s.to_string());
+                }
+            }
+            Ok(namespaces)
         }
     }
 
@@ -1411,6 +1543,7 @@ mod inner {
             let now = chrono::Utc::now();
             let proxy = Proxy {
                 id: "test-proxy".to_string(),
+                namespace: crate::config::types::default_namespace(),
                 name: Some("My Proxy".to_string()),
                 hosts: vec!["example.com".to_string()],
                 listen_path: "/api".to_string(),
@@ -1479,6 +1612,7 @@ mod inner {
             let now = chrono::Utc::now();
             let consumer = Consumer {
                 id: "consumer-1".to_string(),
+                namespace: crate::config::types::default_namespace(),
                 username: "alice".to_string(),
                 custom_id: Some("ext-alice".to_string()),
                 credentials: std::collections::HashMap::new(),
@@ -1502,6 +1636,7 @@ mod inner {
             let now = chrono::Utc::now();
             let pc = PluginConfig {
                 id: "plugin-1".to_string(),
+                namespace: crate::config::types::default_namespace(),
                 plugin_name: "rate_limiting".to_string(),
                 enabled: true,
                 config: serde_json::json!({"window_seconds": 60, "max_requests": 100}),
@@ -1528,6 +1663,7 @@ mod inner {
             let now = chrono::Utc::now();
             let upstream = Upstream {
                 id: "upstream-1".to_string(),
+                namespace: crate::config::types::default_namespace(),
                 name: Some("my-upstream".to_string()),
                 algorithm: crate::config::types::LoadBalancerAlgorithm::RoundRobin,
                 targets: vec![crate::config::types::UpstreamTarget {
@@ -1562,6 +1698,7 @@ mod inner {
             let now = chrono::Utc::now();
             let proxy = Proxy {
                 id: "unique-id-123".to_string(),
+                namespace: crate::config::types::default_namespace(),
                 name: None,
                 hosts: vec![],
                 listen_path: "/".to_string(),
@@ -1631,6 +1768,7 @@ mod inner {
 
             let consumer = Consumer {
                 id: "consumer-with-creds".to_string(),
+                namespace: crate::config::types::default_namespace(),
                 username: "alice".to_string(),
                 custom_id: None,
                 credentials,
@@ -1651,6 +1789,7 @@ mod inner {
             let now = chrono::Utc::now();
             let proxy = Proxy {
                 id: "proxy-with-plugins".to_string(),
+                namespace: crate::config::types::default_namespace(),
                 name: None,
                 hosts: vec![],
                 listen_path: "/test".to_string(),

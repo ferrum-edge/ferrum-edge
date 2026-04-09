@@ -51,6 +51,7 @@ impl Default for Http3TestConfig {
 fn create_http3_test_proxy() -> Proxy {
     Proxy {
         id: "http3-test-proxy".to_string(),
+        namespace: ferrum_edge::config::types::default_namespace(),
         name: Some("HTTP/3 Test Proxy".to_string()),
         hosts: vec![],
         listen_path: "/http3-test".to_string(),
@@ -110,6 +111,7 @@ fn create_http3_test_gateway_config() -> GatewayConfig {
         plugin_configs: vec![],
         upstreams: vec![],
         loaded_at: chrono::Utc::now(),
+        known_namespaces: Vec::new(),
     }
 }
 
@@ -694,6 +696,7 @@ async fn test_http3_streaming_decision_logic() {
     // --- Case 1: No plugins, no retry → should stream ---
     let proxy_stream = Proxy {
         id: "h3-stream".to_string(),
+        namespace: ferrum_edge::config::types::default_namespace(),
         name: Some("H3 Streaming".to_string()),
         hosts: vec![],
         listen_path: "/h3-stream".to_string(),
@@ -745,6 +748,7 @@ async fn test_http3_streaming_decision_logic() {
     // --- Case 2: Proxy with retry configured → should buffer ---
     let proxy_buffered = Proxy {
         id: "h3-buffered".to_string(),
+        namespace: ferrum_edge::config::types::default_namespace(),
         name: Some("H3 Buffered".to_string()),
         listen_path: "/h3-buffered".to_string(),
         retry: Some(RetryConfig {
@@ -760,6 +764,7 @@ async fn test_http3_streaming_decision_logic() {
     // --- Case 3: Proxy with ai_token_metrics plugin → should buffer responses ---
     let proxy_with_body_plugin = Proxy {
         id: "h3-body-plugin".to_string(),
+        namespace: ferrum_edge::config::types::default_namespace(),
         name: Some("H3 Body Plugin".to_string()),
         listen_path: "/h3-body-plugin".to_string(),
         retry: None,
@@ -779,6 +784,7 @@ async fn test_http3_streaming_decision_logic() {
         consumers: vec![],
         plugin_configs: vec![ferrum_edge::config::types::PluginConfig {
             id: "ai-token-metrics-cfg".to_string(),
+            namespace: ferrum_edge::config::types::default_namespace(),
             plugin_name: "ai_token_metrics".to_string(),
             enabled: true,
             config: serde_json::json!({}),
@@ -790,6 +796,7 @@ async fn test_http3_streaming_decision_logic() {
         }],
         upstreams: vec![],
         loaded_at: chrono::Utc::now(),
+        known_namespaces: Vec::new(),
     };
 
     let plugin_cache = PluginCache::new(&gc).unwrap();

@@ -52,6 +52,7 @@ fn minimal_plugin_config(plugin_name: &str) -> serde_json::Value {
 fn make_proxy(id: &str, listen_path: &str, plugin_ids: Vec<&str>) -> Proxy {
     Proxy {
         id: id.to_string(),
+        namespace: ferrum_edge::config::types::default_namespace(),
         name: Some(format!("Proxy {}", id)),
         hosts: vec![],
         listen_path: listen_path.to_string(),
@@ -118,6 +119,7 @@ fn make_plugin_config(
     let config = minimal_plugin_config(plugin_name);
     PluginConfig {
         id: id.to_string(),
+        namespace: ferrum_edge::config::types::default_namespace(),
         plugin_name: plugin_name.to_string(),
         config,
         scope,
@@ -137,6 +139,7 @@ fn make_config(proxies: Vec<Proxy>, plugin_configs: Vec<PluginConfig>) -> Gatewa
         plugin_configs,
         upstreams: vec![],
         loaded_at: Utc::now(),
+        known_namespaces: Vec::new(),
     }
 }
 
@@ -347,6 +350,7 @@ fn test_request_body_buffering_upper_bound_is_config_sensitive() {
         vec![
             PluginConfig {
                 id: "graphql-empty-plugin".to_string(),
+                namespace: ferrum_edge::config::types::default_namespace(),
                 plugin_name: "graphql".to_string(),
                 config: json!({}),
                 scope: PluginScope::Proxy,
@@ -358,6 +362,7 @@ fn test_request_body_buffering_upper_bound_is_config_sensitive() {
             },
             PluginConfig {
                 id: "graphql-guarded-plugin".to_string(),
+                namespace: ferrum_edge::config::types::default_namespace(),
                 plugin_name: "graphql".to_string(),
                 config: json!({"max_depth": 4}),
                 scope: PluginScope::Proxy,
@@ -369,6 +374,7 @@ fn test_request_body_buffering_upper_bound_is_config_sensitive() {
             },
             PluginConfig {
                 id: "response-only-plugin".to_string(),
+                namespace: ferrum_edge::config::types::default_namespace(),
                 plugin_name: "body_validator".to_string(),
                 config: json!({"response_required_fields": ["id"]}),
                 scope: PluginScope::Proxy,
@@ -380,6 +386,7 @@ fn test_request_body_buffering_upper_bound_is_config_sensitive() {
             },
             PluginConfig {
                 id: "request-xml-plugin".to_string(),
+                namespace: ferrum_edge::config::types::default_namespace(),
                 plugin_name: "body_validator".to_string(),
                 config: json!({"validate_xml": true}),
                 scope: PluginScope::Proxy,
@@ -487,6 +494,7 @@ async fn test_cors_preflight_runs_before_request_termination() {
         vec![
             PluginConfig {
                 id: "ps1".to_string(),
+                namespace: ferrum_edge::config::types::default_namespace(),
                 plugin_name: "request_termination".to_string(),
                 config: json!({"status_code": 503, "message": "maintenance"}),
                 scope: PluginScope::Proxy,
@@ -498,6 +506,7 @@ async fn test_cors_preflight_runs_before_request_termination() {
             },
             PluginConfig {
                 id: "ps2".to_string(),
+                namespace: ferrum_edge::config::types::default_namespace(),
                 plugin_name: "cors".to_string(),
                 config: json!({"allowed_origins": ["https://app.example.com"]}),
                 scope: PluginScope::Proxy,
@@ -581,6 +590,7 @@ async fn test_rate_limiter_state_persists_across_calls() {
         vec![make_proxy("p1", "/api", vec![])],
         vec![PluginConfig {
             id: "g1".to_string(),
+            namespace: ferrum_edge::config::types::default_namespace(),
             plugin_name: "rate_limiting".to_string(),
             config: json!({
                 "window_seconds": 60,
@@ -735,6 +745,7 @@ fn test_apply_delta_rejects_invalid_security_plugin() {
             ),
             PluginConfig {
                 id: "pc2".to_string(),
+                namespace: ferrum_edge::config::types::default_namespace(),
                 plugin_name: "ip_restriction".to_string(),
                 config: json!({}), // empty — ip_restriction requires allow/deny
                 scope: PluginScope::Proxy,
@@ -804,6 +815,7 @@ fn make_plugin_config_with_json(
 ) -> PluginConfig {
     PluginConfig {
         id: id.to_string(),
+        namespace: ferrum_edge::config::types::default_namespace(),
         plugin_name: plugin_name.to_string(),
         config,
         scope,
@@ -1354,6 +1366,7 @@ fn make_plugin_config_with_priority(
     let config = minimal_plugin_config(plugin_name);
     PluginConfig {
         id: id.to_string(),
+        namespace: ferrum_edge::config::types::default_namespace(),
         plugin_name: plugin_name.to_string(),
         config,
         scope,

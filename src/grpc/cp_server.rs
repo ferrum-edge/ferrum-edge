@@ -201,13 +201,14 @@ impl ConfigSync for CpGrpcServer {
         let inner = request.into_inner();
         let node_id = inner.node_id;
         let dp_version = inner.ferrum_version;
+        let dp_namespace = inner.namespace;
 
         // Reject DPs with incompatible versions before streaming any config.
         Self::check_version_compatibility(&dp_version)?;
 
         info!(
-            "DP node '{}' (v{}) subscribed for config updates",
-            node_id, dp_version
+            "DP node '{}' (v{}) subscribed for config updates (namespace='{}')",
+            node_id, dp_version, dp_namespace
         );
 
         // Send initial full config
@@ -264,8 +265,14 @@ impl ConfigSync for CpGrpcServer {
     ) -> Result<Response<FullConfigResponse>, Status> {
         self.verify_jwt_metadata(request.metadata())?;
 
-        let dp_version = &request.get_ref().ferrum_version;
+        let req = request.get_ref();
+        let dp_version = &req.ferrum_version;
         Self::check_version_compatibility(dp_version)?;
+
+        info!(
+            "DP '{}' (v{}) requested full config (namespace='{}')",
+            req.node_id, dp_version, req.namespace
+        );
 
         let config = self.config.load_full();
         let config_json = serde_json::to_string(config.as_ref()).map_err(|e| {

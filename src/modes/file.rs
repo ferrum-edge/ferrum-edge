@@ -56,6 +56,7 @@ pub async fn run(
         config_path,
         env_config.tls_cert_expiry_warning_days,
         &env_config.backend_allow_ips,
+        &env_config.namespace,
     )?;
     info!(
         "File mode: loaded {} proxies, {} consumers",
@@ -247,6 +248,8 @@ pub async fn run(
     let reload_cert_expiry_warning_days = env_config.tls_cert_expiry_warning_days;
     #[cfg(unix)]
     let reload_backend_allow_ips = env_config.backend_allow_ips.clone();
+    #[cfg(unix)]
+    let reload_namespace = env_config.namespace.clone();
     let mut sighup_shutdown = shutdown_tx.subscribe();
     let sighup_handle = tokio::spawn(async move {
         #[cfg(unix)]
@@ -263,7 +266,7 @@ pub async fn run(
                 tokio::select! {
                     _ = sighup.recv() => {
                         info!("SIGHUP received, reloading configuration...");
-                        match file_loader::reload_config_from_file(&config_path_owned, reload_cert_expiry_warning_days, &reload_backend_allow_ips) {
+                        match file_loader::reload_config_from_file(&config_path_owned, reload_cert_expiry_warning_days, &reload_backend_allow_ips, &reload_namespace) {
                             Ok(new_config) => {
                                 proxy_state_reload.update_config(new_config);
                                 info!("Configuration reloaded successfully");

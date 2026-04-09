@@ -15,6 +15,7 @@ use tempfile::NamedTempFile;
 fn create_test_mtls_proxy() -> Proxy {
     Proxy {
         id: "mtls-test".to_string(),
+        namespace: ferrum_edge::config::types::default_namespace(),
         name: Some("mTLS Test Proxy".to_string()),
         hosts: vec![],
         listen_path: "/mtls-test".to_string(),

@@ -55,6 +55,7 @@ fn make_consumer(
 ) -> ferrum_edge::config::types::Consumer {
     ferrum_edge::config::types::Consumer {
         id: "test-consumer".to_string(),
+        namespace: ferrum_edge::config::types::default_namespace(),
         username: "test-user".to_string(),
         custom_id: None,
         credentials,

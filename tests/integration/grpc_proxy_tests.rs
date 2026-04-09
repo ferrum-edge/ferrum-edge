@@ -29,6 +29,7 @@ use ferrum_edge::proxy::ProxyState;
 fn create_grpc_proxy(id: &str, listen_path: &str, backend_port: u16) -> Proxy {
     Proxy {
         id: id.to_string(),
+        namespace: ferrum_edge::config::types::default_namespace(),
         name: Some(format!("gRPC Test Proxy {}", id)),
         hosts: vec![],
         listen_path: listen_path.to_string(),
@@ -208,6 +209,7 @@ fn create_test_proxy_state(proxies: Vec<Proxy>) -> ProxyState {
         plugin_configs: vec![],
         upstreams: vec![],
         loaded_at: Utc::now(),
+        known_namespaces: Vec::new(),
     };
     ProxyState::new(config, dns_cache, create_test_env_config(), None).unwrap()
 }

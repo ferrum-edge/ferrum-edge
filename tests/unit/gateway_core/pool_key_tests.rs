@@ -19,6 +19,7 @@ fn minimal_proxy() -> Proxy {
     let now = Utc::now();
     Proxy {
         id: "test-proxy".to_string(),
+        namespace: ferrum_edge::config::types::default_namespace(),
         name: None,
         hosts: vec![],
         listen_path: "/test".to_string(),

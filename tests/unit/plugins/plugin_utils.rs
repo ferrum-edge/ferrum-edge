@@ -1,7 +1,7 @@
 //! Common test utilities for plugin tests
 
 use chrono::Utc;
-use ferrum_edge::config::types::{AuthMode, BackendProtocol, Consumer, Proxy};
+use ferrum_edge::config::types::{AuthMode, BackendProtocol, Consumer, Proxy, default_namespace};
 use ferrum_edge::plugins::{PluginResult, RequestContext};
 use serde_json::{Map, Value};
 use std::collections::HashMap;
@@ -29,6 +29,7 @@ pub fn create_test_consumer() -> Consumer {
 
     Consumer {
         id: "test-consumer".to_string(),
+        namespace: default_namespace(),
         username: "testuser".to_string(),
         custom_id: Some("custom-123".to_string()),
         credentials,
@@ -62,6 +63,7 @@ pub fn create_test_context() -> RequestContext {
 pub fn create_test_proxy() -> Proxy {
     Proxy {
         id: "test-proxy".to_string(),
+        namespace: default_namespace(),
         name: Some("Test Proxy".to_string()),
         hosts: vec![],
         listen_path: "/test".to_string(),
@@ -116,6 +118,7 @@ pub fn create_test_proxy() -> Proxy {
 #[allow(dead_code)]
 pub fn create_test_transaction_summary() -> ferrum_edge::plugins::TransactionSummary {
     ferrum_edge::plugins::TransactionSummary {
+        namespace: "ferrum".to_string(),
         timestamp_received: Utc::now().to_rfc3339(),
         client_ip: "127.0.0.1".to_string(),
         consumer_username: Some("testuser".to_string()),

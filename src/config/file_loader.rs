@@ -26,6 +26,7 @@ pub fn load_config_from_file(
     path: &str,
     cert_expiry_warning_days: u64,
     backend_allow_ips: &crate::config::BackendAllowIps,
+    namespace: &str,
 ) -> Result<GatewayConfig, anyhow::Error> {
     let file_path = Path::new(path);
     if !file_path.exists() {
@@ -278,6 +279,52 @@ pub fn load_config_from_file(
         );
     }
 
+    // Capture all distinct namespaces before filtering so `GET /namespaces`
+    // can return the full set even though only one namespace's resources are kept.
+    {
+        let mut ns_set = std::collections::HashSet::new();
+        for p in &config.proxies {
+            ns_set.insert(p.namespace.clone());
+        }
+        for c in &config.consumers {
+            ns_set.insert(c.namespace.clone());
+        }
+        for pc in &config.plugin_configs {
+            ns_set.insert(pc.namespace.clone());
+        }
+        for u in &config.upstreams {
+            ns_set.insert(u.namespace.clone());
+        }
+        let mut known: Vec<String> = ns_set.into_iter().collect();
+        known.sort();
+        config.known_namespaces = known;
+    }
+
+    // Filter resources to only those matching the configured namespace.
+    let pre_filter_counts = (
+        config.proxies.len(),
+        config.consumers.len(),
+        config.plugin_configs.len(),
+        config.upstreams.len(),
+    );
+    config.proxies.retain(|p| p.namespace == namespace);
+    config.consumers.retain(|c| c.namespace == namespace);
+    config.plugin_configs.retain(|pc| pc.namespace == namespace);
+    config.upstreams.retain(|u| u.namespace == namespace);
+
+    let filtered_out = pre_filter_counts.0 - config.proxies.len() + pre_filter_counts.1
+        - config.consumers.len()
+        + pre_filter_counts.2
+        - config.plugin_configs.len()
+        + pre_filter_counts.3
+        - config.upstreams.len();
+    if filtered_out > 0 {
+        info!(
+            "Namespace filter '{}': excluded {} resources from other namespaces",
+            namespace, filtered_out
+        );
+    }
+
     info!(
         "Configuration loaded (version {}): {} proxies, {} consumers, {} plugin configs",
         config.version,
@@ -295,7 +342,8 @@ pub fn reload_config_from_file(
     path: &str,
     cert_expiry_warning_days: u64,
     backend_allow_ips: &crate::config::BackendAllowIps,
+    namespace: &str,
 ) -> Result<GatewayConfig, anyhow::Error> {
     info!("Reloading configuration from file: {}", path);
-    load_config_from_file(path, cert_expiry_warning_days, backend_allow_ips)
+    load_config_from_file(path, cert_expiry_warning_days, backend_allow_ips, namespace)
 }

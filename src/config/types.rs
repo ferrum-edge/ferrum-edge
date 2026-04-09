@@ -393,6 +393,9 @@ pub struct Upstream {
     pub id: String,
     #[serde(default)]
     pub name: Option<String>,
+    /// Namespace this resource belongs to. Defaults to "ferrum".
+    #[serde(default = "default_namespace")]
+    pub namespace: String,
     pub targets: Vec<UpstreamTarget>,
     #[serde(default)]
     pub algorithm: LoadBalancerAlgorithm,
@@ -725,6 +728,11 @@ pub struct Proxy {
     pub id: String,
     #[serde(default)]
     pub name: Option<String>,
+    /// Namespace this resource belongs to. Defaults to "ferrum".
+    /// Used for multi-tenant resource isolation — each gateway instance
+    /// loads only resources matching its configured namespace.
+    #[serde(default = "default_namespace")]
+    pub namespace: String,
     /// Optional list of hostnames this proxy matches on.
     /// Empty means match all hosts (backward compatible catch-all).
     /// Supports exact hostnames and single-level wildcard prefixes (e.g., "*.example.com").
@@ -873,6 +881,9 @@ pub struct PluginAssociation {
 pub struct Consumer {
     pub id: String,
     pub username: String,
+    /// Namespace this resource belongs to. Defaults to "ferrum".
+    #[serde(default = "default_namespace")]
+    pub namespace: String,
     #[serde(default)]
     pub custom_id: Option<String>,
     #[serde(default)]
@@ -893,6 +904,9 @@ pub struct Consumer {
 pub struct PluginConfig {
     pub id: String,
     pub plugin_name: String,
+    /// Namespace this resource belongs to. Defaults to "ferrum".
+    #[serde(default = "default_namespace")]
+    pub namespace: String,
     #[serde(default)]
     pub config: serde_json::Value,
     pub scope: PluginScope,
@@ -927,6 +941,12 @@ pub struct GatewayConfig {
     pub upstreams: Vec<Upstream>,
     #[serde(default = "Utc::now")]
     pub loaded_at: DateTime<Utc>,
+    /// All distinct namespaces discovered at config load time (before namespace
+    /// filtering). Populated by file mode so `GET /namespaces` can return all
+    /// namespaces even though the in-memory config only holds one namespace's
+    /// resources. DB-backed modes use `list_namespaces()` instead.
+    #[serde(default)]
+    pub known_namespaces: Vec<String>,
 }
 
 /// The current config schema version. Increment this when adding config migrations.
@@ -934,6 +954,38 @@ pub const CURRENT_CONFIG_VERSION: &str = "1";
 
 fn default_config_version() -> String {
     "1".to_string()
+}
+
+/// The default namespace for all resources when `FERRUM_NAMESPACE` is unset.
+pub const DEFAULT_NAMESPACE: &str = "ferrum";
+
+/// Maximum length for namespace identifiers.
+pub const MAX_NAMESPACE_LENGTH: usize = 254;
+
+/// Default namespace value for serde deserialization.
+pub fn default_namespace() -> String {
+    DEFAULT_NAMESPACE.to_string()
+}
+
+/// Validate a namespace string. Same rules as resource IDs.
+pub fn validate_namespace(ns: &str) -> Result<(), String> {
+    if ns.is_empty() {
+        return Err("namespace must not be empty".to_string());
+    }
+    if ns.len() > MAX_NAMESPACE_LENGTH {
+        return Err(format!(
+            "namespace must be at most {} characters, got {}",
+            MAX_NAMESPACE_LENGTH,
+            ns.len()
+        ));
+    }
+    if !ID_REGEX.is_match(ns) {
+        return Err(format!(
+            "namespace '{}' is invalid: must start with alphanumeric and contain only alphanumeric, dots, underscores, or hyphens",
+            ns
+        ));
+    }
+    Ok(())
 }
 
 /// Auto-anchor a regex listen_path pattern for full-path matching.

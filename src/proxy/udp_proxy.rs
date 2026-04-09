@@ -78,6 +78,7 @@ struct UdpSession {
 type SessionMap = Arc<DashMap<SocketAddr, Arc<UdpSession>>>;
 
 struct UdpDisconnectContext<'a> {
+    namespace: &'a str,
     proxy_id: &'a str,
     proxy_name: Option<&'a str>,
     client_addr: SocketAddr,
@@ -105,6 +106,7 @@ fn build_udp_stream_summary(context: UdpDisconnectContext<'_>) -> StreamTransact
         .clone();
 
     StreamTransactionSummary {
+        namespace: context.namespace.to_string(),
         proxy_id: context.proxy_id.to_string(),
         proxy_name: context.proxy_name.map(|name| name.to_string()),
         client_ip: context.client_addr.ip().to_string(),
@@ -139,6 +141,7 @@ async fn emit_udp_stream_disconnect(
 }
 
 struct DtlsDisconnectContext<'a> {
+    namespace: &'a str,
     proxy_id: &'a str,
     proxy_name: Option<&'a str>,
     client_addr: SocketAddr,
@@ -157,6 +160,7 @@ struct DtlsDisconnectContext<'a> {
 
 fn build_dtls_stream_summary(context: DtlsDisconnectContext<'_>) -> StreamTransactionSummary {
     StreamTransactionSummary {
+        namespace: context.namespace.to_string(),
         proxy_id: context.proxy_id.to_string(),
         proxy_name: context.proxy_name.map(|name| name.to_string()),
         client_ip: context.client_addr.ip().to_string(),
@@ -270,14 +274,18 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
     // Pre-resolve plugins and proxy metadata for this listener.
     let plugins = plugin_cache.get_plugins_for_protocol(&proxy_id, ProxyProtocol::Udp);
     let has_datagram_plugins = plugins.iter().any(|p| p.requires_udp_datagram_hooks());
-    let (proxy_name, backend_protocol) = {
+    let (proxy_name, proxy_namespace, backend_protocol) = {
         let current = config.load();
         current
             .proxies
             .iter()
             .find(|p| p.id == proxy_id)
-            .map(|p| (p.name.clone(), p.backend_protocol))
-            .unwrap_or((None, BackendProtocol::Udp))
+            .map(|p| (p.name.clone(), p.namespace.clone(), p.backend_protocol))
+            .unwrap_or((
+                None,
+                crate::config::types::default_namespace(),
+                BackendProtocol::Udp,
+            ))
     };
 
     // Look up idle timeout from config
@@ -301,6 +309,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
         cleanup_interval_seconds,
         plugins.clone(),
         proxy_name.clone(),
+        proxy_namespace.clone(),
         backend_protocol,
         port,
     );
@@ -347,6 +356,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                     &mut batch_bytes_out,
                     &plugins,
                     proxy_name.as_deref(),
+                    &proxy_namespace,
                     backend_protocol,
                     port,
                     &circuit_breaker_cache,
@@ -384,6 +394,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                                 &mut batch_bytes_out,
                                 &plugins,
                                 proxy_name.as_deref(),
+                                &proxy_namespace,
                                 backend_protocol,
                                 port,
                                 &circuit_breaker_cache,
@@ -437,6 +448,7 @@ async fn process_datagram(
     batch_bytes_out: &mut u64,
     plugins: &[Arc<dyn Plugin>],
     proxy_name: Option<&str>,
+    proxy_namespace: &str,
     backend_protocol: BackendProtocol,
     listen_port: u16,
     circuit_breaker_cache: &CircuitBreakerCache,
@@ -484,6 +496,7 @@ async fn process_datagram(
                 max_sessions,
                 plugins,
                 proxy_name,
+                proxy_namespace,
                 backend_protocol,
                 listen_port,
                 circuit_breaker_cache,
@@ -508,6 +521,7 @@ async fn process_datagram(
             max_sessions,
             plugins,
             proxy_name,
+            proxy_namespace,
             backend_protocol,
             listen_port,
             circuit_breaker_cache,
@@ -568,6 +582,7 @@ async fn lookup_or_create_session(
     max_sessions: usize,
     plugins: &[Arc<dyn Plugin>],
     proxy_name: Option<&str>,
+    proxy_namespace: &str,
     backend_protocol: BackendProtocol,
     listen_port: u16,
     circuit_breaker_cache: &CircuitBreakerCache,
@@ -604,6 +619,7 @@ async fn lookup_or_create_session(
         tls_no_verify,
         plugins,
         proxy_name,
+        proxy_namespace,
         backend_protocol,
         listen_port,
         circuit_breaker_cache,
@@ -634,6 +650,7 @@ fn spawn_session_cleanup(
     cleanup_interval_seconds: u64,
     plugins: Arc<Vec<Arc<dyn Plugin>>>,
     proxy_name: Option<String>,
+    proxy_namespace: String,
     backend_protocol: BackendProtocol,
     listen_port: u16,
 ) {
@@ -675,6 +692,7 @@ fn spawn_session_cleanup(
                             emit_udp_stream_disconnect(
                                 &plugins,
                                 UdpDisconnectContext {
+                                    namespace: &proxy_namespace,
                                     proxy_id: &proxy_id,
                                     proxy_name: proxy_name.as_deref(),
                                     client_addr: *addr,
@@ -731,14 +749,18 @@ async fn start_dtls_frontend_listener(
     // Pre-resolve plugins and proxy metadata for this listener.
     let plugins = plugin_cache.get_plugins_for_protocol(&proxy_id, ProxyProtocol::Udp);
     let has_datagram_plugins = plugins.iter().any(|p| p.requires_udp_datagram_hooks());
-    let (proxy_name, backend_protocol) = {
+    let (proxy_name, proxy_namespace, backend_protocol) = {
         let current = config.load();
         current
             .proxies
             .iter()
             .find(|p| p.id == proxy_id)
-            .map(|p| (p.name.clone(), p.backend_protocol))
-            .unwrap_or((None, BackendProtocol::Dtls))
+            .map(|p| (p.name.clone(), p.namespace.clone(), p.backend_protocol))
+            .unwrap_or((
+                None,
+                crate::config::types::default_namespace(),
+                BackendProtocol::Dtls,
+            ))
     };
 
     // Spawn the server's recv loop in a background task
@@ -826,6 +848,7 @@ async fn start_dtls_frontend_listener(
                 let handler_metrics = metrics.clone();
                 let handler_plugins = plugins.clone();
                 let handler_proxy_name = proxy_name.clone();
+                let handler_proxy_namespace = proxy_namespace.clone();
                 let handler_metadata = stream_ctx.metadata;
                 let handler_cb_cache = circuit_breaker_cache.clone();
                 let connected_at = chrono::Utc::now();
@@ -870,6 +893,7 @@ async fn start_dtls_frontend_listener(
                     if !handler_plugins.is_empty() {
                         let disconnected_at = chrono::Utc::now();
                         let summary = build_dtls_stream_summary(DtlsDisconnectContext {
+                            namespace: &handler_proxy_namespace,
                             proxy_id: &handler_proxy_id,
                             proxy_name: handler_proxy_name.as_deref(),
                             client_addr,
@@ -1387,6 +1411,7 @@ async fn create_session(
     tls_no_verify: bool,
     plugins: &[Arc<dyn Plugin>],
     proxy_name: Option<&str>,
+    proxy_namespace: &str,
     backend_protocol: BackendProtocol,
     listen_port: u16,
     circuit_breaker_cache: &CircuitBreakerCache,
@@ -1652,6 +1677,7 @@ async fn create_session(
     let reply_dtls = dtls_conn;
     let reply_plugins = plugins.to_vec();
     let reply_proxy_name = proxy_name.map(str::to_string);
+    let reply_proxy_namespace = proxy_namespace.to_string();
     let reply_backend_protocol = backend_protocol;
     let reply_amplification_factor = proxy.udp_max_response_amplification_factor;
     let reply_has_datagram_plugins = plugins.iter().any(|p| p.requires_udp_datagram_hooks());
@@ -1881,6 +1907,7 @@ async fn create_session(
                                     emit_udp_stream_disconnect(
                                         &reply_plugins,
                                         UdpDisconnectContext {
+                                            namespace: &reply_proxy_namespace,
                                             proxy_id: &reply_proxy_id,
                                             proxy_name: reply_proxy_name.as_deref(),
                                             client_addr,
@@ -1935,6 +1962,7 @@ async fn create_session(
             emit_udp_stream_disconnect(
                 &reply_plugins,
                 UdpDisconnectContext {
+                    namespace: &reply_proxy_namespace,
                     proxy_id: &reply_proxy_id,
                     proxy_name: reply_proxy_name.as_deref(),
                     client_addr,
@@ -2050,6 +2078,7 @@ mod tests {
         let metadata = HashMap::from([("request_id".to_string(), "dtls-123".to_string())]);
 
         let summary = build_dtls_stream_summary(DtlsDisconnectContext {
+            namespace: "ferrum",
             proxy_id: "dtls-proxy",
             proxy_name: Some("DTLS Proxy"),
             client_addr,
@@ -2112,6 +2141,7 @@ mod tests {
         let session = make_udp_session();
 
         let summary = build_udp_stream_summary(UdpDisconnectContext {
+            namespace: "ferrum",
             proxy_id: "udp-proxy",
             proxy_name: Some("UDP Proxy"),
             client_addr,
@@ -2170,6 +2200,7 @@ mod tests {
         emit_udp_stream_disconnect(
             &plugins,
             UdpDisconnectContext {
+                namespace: "ferrum",
                 proxy_id: "udp-proxy",
                 proxy_name: Some("UDP Proxy"),
                 client_addr,

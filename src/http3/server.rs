@@ -999,6 +999,7 @@ async fn handle_h3_request(
             .map(|ip| ip.to_string());
 
         let summary = TransactionSummary {
+            namespace: proxy.namespace.clone(),
             timestamp_received: ctx.timestamp_received.to_rfc3339(),
             client_ip: ctx.client_ip.clone(),
             consumer_username: ctx.effective_identity().map(str::to_owned),
@@ -1175,6 +1176,7 @@ async fn handle_h3_request(
             .map(|ip| ip.to_string());
 
         let summary = TransactionSummary {
+            namespace: proxy.namespace.clone(),
             timestamp_received: ctx.timestamp_received.to_rfc3339(),
             client_ip: ctx.client_ip.clone(),
             consumer_username: ctx.effective_identity().map(str::to_owned),

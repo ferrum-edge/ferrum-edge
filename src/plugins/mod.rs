@@ -358,9 +358,18 @@ pub struct MirrorResponseMeta {
     pub mirror_error: Option<String>,
 }
 
+/// Serde skip predicate: true when the namespace is the default (`"ferrum"`).
+fn is_default_namespace(ns: &str) -> bool {
+    ns == crate::config::types::DEFAULT_NAMESPACE
+}
+
 /// Transaction summary for logging plugins.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct TransactionSummary {
+    /// Namespace of the matched proxy. Omitted from serialization when it equals
+    /// the default (`"ferrum"`) to keep log volume down for single-namespace deployments.
+    #[serde(skip_serializing_if = "is_default_namespace")]
+    pub namespace: String,
     pub timestamp_received: String,
     pub client_ip: String,
     pub consumer_username: Option<String>,
@@ -520,6 +529,9 @@ impl StreamConnectionContext {
 /// Transaction summary for stream proxy (TCP/UDP) logging plugins.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct StreamTransactionSummary {
+    /// Namespace of the matched proxy. Omitted when it equals the default (`"ferrum"`).
+    #[serde(skip_serializing_if = "is_default_namespace")]
+    pub namespace: String,
     pub proxy_id: String,
     pub proxy_name: Option<String>,
     pub client_ip: String,

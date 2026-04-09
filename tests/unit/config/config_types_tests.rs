@@ -10,6 +10,7 @@ use std::collections::HashMap;
 fn make_proxy(id: &str, listen_path: &str) -> Proxy {
     Proxy {
         id: id.into(),
+        namespace: ferrum_edge::config::types::default_namespace(),
         name: None,
         hosts: vec![],
         listen_path: listen_path.into(),
@@ -64,6 +65,7 @@ fn make_proxy(id: &str, listen_path: &str) -> Proxy {
 fn make_consumer(id: &str, username: &str) -> Consumer {
     Consumer {
         id: id.into(),
+        namespace: ferrum_edge::config::types::default_namespace(),
         username: username.into(),
         custom_id: None,
         credentials: HashMap::new(),
@@ -77,6 +79,7 @@ fn make_consumer(id: &str, username: &str) -> Consumer {
 fn make_upstream(id: &str) -> Upstream {
     Upstream {
         id: id.into(),
+        namespace: ferrum_edge::config::types::default_namespace(),
         name: None,
         targets: vec![UpstreamTarget {
             host: "localhost".into(),
@@ -104,6 +107,7 @@ fn empty_config() -> GatewayConfig {
         plugin_configs: vec![],
         upstreams: vec![],
         loaded_at: Utc::now(),
+        known_namespaces: Vec::new(),
     }
 }
 
@@ -114,6 +118,7 @@ fn test_unique_listen_paths_valid() {
         proxies: vec![
             Proxy {
                 id: "1".into(),
+                namespace: ferrum_edge::config::types::default_namespace(),
                 name: None,
                 hosts: vec![],
                 listen_path: "/api/v1".into(),
@@ -164,6 +169,7 @@ fn test_unique_listen_paths_valid() {
             },
             Proxy {
                 id: "2".into(),
+                namespace: ferrum_edge::config::types::default_namespace(),
                 name: None,
                 hosts: vec![],
                 listen_path: "/api/v2".into(),
@@ -217,6 +223,7 @@ fn test_unique_listen_paths_valid() {
         plugin_configs: vec![],
         upstreams: vec![],
         loaded_at: Utc::now(),
+        known_namespaces: Vec::new(),
     };
     assert!(config.validate_unique_listen_paths().is_ok());
 }
@@ -228,6 +235,7 @@ fn test_unique_listen_paths_duplicate() {
         proxies: vec![
             Proxy {
                 id: "1".into(),
+                namespace: ferrum_edge::config::types::default_namespace(),
                 name: None,
                 hosts: vec![],
                 listen_path: "/api/v1".into(),
@@ -278,6 +286,7 @@ fn test_unique_listen_paths_duplicate() {
             },
             Proxy {
                 id: "2".into(),
+                namespace: ferrum_edge::config::types::default_namespace(),
                 name: None,
                 hosts: vec![],
                 listen_path: "/api/v1".into(),
@@ -331,6 +340,7 @@ fn test_unique_listen_paths_duplicate() {
         plugin_configs: vec![],
         upstreams: vec![],
         loaded_at: Utc::now(),
+        known_namespaces: Vec::new(),
     };
     assert!(config.validate_unique_listen_paths().is_err());
 }
@@ -786,6 +796,7 @@ fn test_upstream_references_none_ok() {
 fn test_plugin_config_priority_override_valid() {
     let pc = PluginConfig {
         id: "pc1".into(),
+        namespace: ferrum_edge::config::types::default_namespace(),
         plugin_name: "rate_limiting".into(),
         config: serde_json::json!({}),
         scope: PluginScope::Global,
@@ -802,6 +813,7 @@ fn test_plugin_config_priority_override_valid() {
 fn test_plugin_config_priority_override_none_valid() {
     let pc = PluginConfig {
         id: "pc1".into(),
+        namespace: ferrum_edge::config::types::default_namespace(),
         plugin_name: "rate_limiting".into(),
         config: serde_json::json!({}),
         scope: PluginScope::Global,
@@ -818,6 +830,7 @@ fn test_plugin_config_priority_override_none_valid() {
 fn test_plugin_config_priority_override_too_high() {
     let pc = PluginConfig {
         id: "pc1".into(),
+        namespace: ferrum_edge::config::types::default_namespace(),
         plugin_name: "rate_limiting".into(),
         config: serde_json::json!({}),
         scope: PluginScope::Global,
@@ -835,6 +848,7 @@ fn test_plugin_config_priority_override_too_high() {
 fn test_plugin_config_priority_override_boundary() {
     let pc = PluginConfig {
         id: "pc1".into(),
+        namespace: ferrum_edge::config::types::default_namespace(),
         plugin_name: "rate_limiting".into(),
         config: serde_json::json!({}),
         scope: PluginScope::Global,
@@ -851,6 +865,7 @@ fn test_plugin_config_priority_override_boundary() {
 fn test_plugin_config_priority_override_zero() {
     let pc = PluginConfig {
         id: "pc1".into(),
+        namespace: ferrum_edge::config::types::default_namespace(),
         plugin_name: "rate_limiting".into(),
         config: serde_json::json!({}),
         scope: PluginScope::Global,
@@ -867,6 +882,7 @@ fn test_plugin_config_priority_override_zero() {
 fn test_plugin_config_priority_override_serde_roundtrip() {
     let pc = PluginConfig {
         id: "pc1".into(),
+        namespace: ferrum_edge::config::types::default_namespace(),
         plugin_name: "cors".into(),
         config: serde_json::json!({}),
         scope: PluginScope::Global,
@@ -916,6 +932,7 @@ fn test_validate_plugin_references_rejects_global_plugin_association() {
     let mut config = empty_config();
     config.plugin_configs = vec![PluginConfig {
         id: "pc1".into(),
+        namespace: ferrum_edge::config::types::default_namespace(),
         plugin_name: "cors".into(),
         config: serde_json::json!({}),
         scope: PluginScope::Global,
@@ -943,6 +960,7 @@ fn test_validate_plugin_references_rejects_wrong_proxy_target() {
     let mut config = empty_config();
     config.plugin_configs = vec![PluginConfig {
         id: "pc1".into(),
+        namespace: ferrum_edge::config::types::default_namespace(),
         plugin_name: "key_auth".into(),
         config: serde_json::json!({}),
         scope: PluginScope::Proxy,

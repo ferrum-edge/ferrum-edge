@@ -6,6 +6,7 @@ use http_body::Body;
 fn test_proxy() -> Proxy {
     Proxy {
         id: "test".into(),
+        namespace: ferrum_edge::config::types::default_namespace(),
         name: Some("Test Proxy".into()),
         hosts: vec![],
         listen_path: "/api".into(),

@@ -26,6 +26,7 @@ use std::time::Duration;
 fn create_test_proxy() -> Proxy {
     Proxy {
         id: "h2-test".to_string(),
+        namespace: ferrum_edge::config::types::default_namespace(),
         name: None,
         hosts: vec![],
         listen_path: "/h2test".to_string(),

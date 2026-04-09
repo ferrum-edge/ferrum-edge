@@ -125,7 +125,7 @@ pub async fn run(
 
     // Load initial config from database, falling back to backup file if configured
     let backup_path = env_config.db_config_backup_path.clone();
-    let config = match db.load_full_config().await {
+    let config = match db.load_full_config(&env_config.namespace).await {
         Ok(cfg) => {
             info!(
                 "Database mode: loaded {} proxies, {} consumers",
@@ -567,6 +567,7 @@ pub async fn run(
     let db_tls_client_cert = env_config.db_tls_client_cert_path.clone();
     let db_tls_client_key = env_config.db_tls_client_key_path.clone();
     let db_tls_insecure = env_config.db_tls_insecure;
+    let poll_namespace = env_config.namespace.clone();
 
     let db_poll_handle = tokio::spawn(async move {
         let mut interval = tokio::time::interval(poll_interval);
@@ -666,6 +667,7 @@ pub async fn run(
                     if let Some(since) = last_poll_at {
                         // Incremental poll — only fetch changes since last poll
                         match db_poll.load_incremental_config(
+                            &poll_namespace,
                             since,
                             &known_proxy_ids,
                             &known_consumer_ids,
@@ -704,7 +706,7 @@ pub async fn run(
                                     e
                                 );
                                 // Fallback to full config load
-                                match db_poll.load_full_config().await {
+                                match db_poll.load_full_config(&poll_namespace).await {
                                     Ok(new_config) => {
                                         db_available_poll.store(true, Ordering::Relaxed);
                                         let (p, c, pc, u) = db_backend::extract_known_ids(&new_config);
@@ -730,7 +732,7 @@ pub async fn run(
                                         ).await {
                                             Ok(_url) => {
                                                 // Reconnected to a failover DB — try full reload
-                                                match db_poll.load_full_config().await {
+                                                match db_poll.load_full_config(&poll_namespace).await {
                                                     Ok(new_config) => {
                                                         db_available_poll.store(true, Ordering::Relaxed);
                                                         let (p, c, pc, u) = db_backend::extract_known_ids(&new_config);
@@ -766,7 +768,7 @@ pub async fn run(
                         }
                     } else {
                         // First poll — full load to seed state
-                        match db_poll.load_full_config().await {
+                        match db_poll.load_full_config(&poll_namespace).await {
                             Ok(new_config) => {
                                 db_available_poll.store(true, Ordering::Relaxed);
                                 let (p, c, pc, u) = db_backend::extract_known_ids(&new_config);

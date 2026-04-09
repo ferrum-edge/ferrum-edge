@@ -67,6 +67,7 @@ fn generate_test_token(config: &TestConfig) -> String {
 fn create_test_proxy(id: &str, listen_path: &str, host: &str, port: u16) -> Proxy {
     Proxy {
         id: id.to_string(),
+        namespace: ferrum_edge::config::types::default_namespace(),
         name: Some(format!("Test Proxy {}", id)),
         hosts: vec![],
         listen_path: listen_path.to_string(),
@@ -127,6 +128,7 @@ fn create_test_gateway_config() -> GatewayConfig {
         ],
         consumers: vec![Consumer {
             id: "consumer-1".to_string(),
+            namespace: ferrum_edge::config::types::default_namespace(),
             username: "alice".to_string(),
             custom_id: Some("alice-custom".to_string()),
             credentials: HashMap::new(),
@@ -136,6 +138,7 @@ fn create_test_gateway_config() -> GatewayConfig {
         }],
         plugin_configs: vec![PluginConfig {
             id: "plugin-cfg-1".to_string(),
+            namespace: ferrum_edge::config::types::default_namespace(),
             plugin_name: "rate_limiting".to_string(),
             config: json!({"rate": 100}),
             scope: PluginScope::Global,
@@ -147,12 +150,14 @@ fn create_test_gateway_config() -> GatewayConfig {
         }],
         upstreams: vec![],
         loaded_at: Utc::now(),
+        known_namespaces: Vec::new(),
     }
 }
 
 fn create_test_upstream(id: &str, name: &str) -> Upstream {
     Upstream {
         id: id.to_string(),
+        namespace: ferrum_edge::config::types::default_namespace(),
         name: Some(name.to_string()),
         targets: vec![UpstreamTarget {
             host: "10.0.0.1".to_string(),
@@ -828,6 +833,7 @@ fn create_pagination_test_config() -> GatewayConfig {
         ));
         consumers.push(Consumer {
             id: format!("consumer-{}", i),
+            namespace: ferrum_edge::config::types::default_namespace(),
             username: format!("user-{}", i),
             custom_id: None,
             credentials: HashMap::new(),
@@ -837,6 +843,7 @@ fn create_pagination_test_config() -> GatewayConfig {
         });
         plugin_configs.push(PluginConfig {
             id: format!("plugin-cfg-{}", i),
+            namespace: ferrum_edge::config::types::default_namespace(),
             plugin_name: "rate_limiting".to_string(),
             config: json!({"rate": 100}),
             scope: PluginScope::Global,
@@ -854,6 +861,7 @@ fn create_pagination_test_config() -> GatewayConfig {
         plugin_configs,
         upstreams: vec![],
         loaded_at: Utc::now(),
+        known_namespaces: Vec::new(),
     }
 }
 

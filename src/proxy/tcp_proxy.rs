@@ -190,14 +190,18 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
     );
 
     // Pre-capture proxy metadata for plugin context (static for this listener's lifetime).
-    let (proxy_name, backend_protocol) = {
+    let (proxy_name, proxy_namespace, backend_protocol) = {
         let current_config = config.load();
         current_config
             .proxies
             .iter()
             .find(|p| *p.id == *proxy_id)
-            .map(|p| (p.name.clone(), p.backend_protocol))
-            .unwrap_or((None, BackendProtocol::Tcp))
+            .map(|p| (p.name.clone(), p.namespace.clone(), p.backend_protocol))
+            .unwrap_or((
+                None,
+                crate::config::types::default_namespace(),
+                BackendProtocol::Tcp,
+            ))
     };
 
     // Pre-resolve plugins for this proxy's protocol (TCP).
@@ -257,6 +261,7 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
                 let backend_tls = backend_tls_cache.clone();
                 let plugins = plugins.clone();
                 let proxy_name = proxy_name.clone();
+                let proxy_namespace = proxy_namespace.clone();
                 let cb_cache = circuit_breaker_cache.clone();
                 let sni_proxy_ids = sni_proxy_ids.clone();
 
@@ -333,6 +338,7 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
                     // Run on_stream_disconnect plugins (logging, metrics, etc.)
                     if !plugins.is_empty() {
                         let summary = StreamTransactionSummary {
+                            namespace: proxy_namespace,
                             proxy_id: proxy_id.to_string(),
                             proxy_name,
                             client_ip: remote_addr.ip().to_string(),

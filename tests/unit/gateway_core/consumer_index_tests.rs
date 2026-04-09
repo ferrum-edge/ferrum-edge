@@ -29,6 +29,7 @@ fn make_consumer(
 
     Consumer {
         id: id.to_string(),
+        namespace: ferrum_edge::config::types::default_namespace(),
         username: username.to_string(),
         custom_id: custom_id.map(|s| s.to_string()),
         credentials,
@@ -176,6 +177,7 @@ fn test_consumer_with_no_keyauth_credentials() {
 
     let consumer = Consumer {
         id: "c1".to_string(),
+        namespace: ferrum_edge::config::types::default_namespace(),
         username: "nokey".to_string(),
         custom_id: None,
         credentials,
@@ -290,6 +292,7 @@ fn make_consumer_with_array_keys(id: &str, username: &str, keys: &[&str]) -> Con
 
     Consumer {
         id: id.to_string(),
+        namespace: ferrum_edge::config::types::default_namespace(),
         username: username.to_string(),
         custom_id: None,
         credentials,
@@ -367,6 +370,7 @@ fn make_consumer_with_array_mtls(id: &str, username: &str, identities: &[&str]) 
 
     Consumer {
         id: id.to_string(),
+        namespace: ferrum_edge::config::types::default_namespace(),
         username: username.to_string(),
         custom_id: None,
         credentials,

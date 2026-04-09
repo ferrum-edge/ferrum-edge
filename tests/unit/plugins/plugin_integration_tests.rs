@@ -314,6 +314,7 @@ async fn test_plugin_scope_configuration() {
     // Test global plugin config
     let global_config = PluginConfig {
         id: "global-plugin".to_string(),
+        namespace: ferrum_edge::config::types::default_namespace(),
         plugin_name: "stdout_logging".to_string(),
         config: json!({}),
         scope: PluginScope::Global,
@@ -330,6 +331,7 @@ async fn test_plugin_scope_configuration() {
     // Test proxy plugin config
     let proxy_config = PluginConfig {
         id: "proxy-plugin".to_string(),
+        namespace: ferrum_edge::config::types::default_namespace(),
         plugin_name: "jwt_auth".to_string(),
         config: json!({}),
         scope: PluginScope::Proxy,

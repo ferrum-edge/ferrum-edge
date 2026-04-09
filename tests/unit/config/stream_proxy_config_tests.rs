@@ -9,6 +9,7 @@ use ferrum_edge::config::types::{
 fn make_stream_proxy(id: &str, protocol: BackendProtocol, port: u16) -> Proxy {
     Proxy {
         id: id.into(),
+        namespace: ferrum_edge::config::types::default_namespace(),
         name: None,
         hosts: vec![],
         listen_path: String::new(),
@@ -62,6 +63,7 @@ fn make_stream_proxy(id: &str, protocol: BackendProtocol, port: u16) -> Proxy {
 fn make_http_proxy(id: &str, listen_path: &str) -> Proxy {
     Proxy {
         id: id.into(),
+        namespace: ferrum_edge::config::types::default_namespace(),
         name: None,
         hosts: vec![],
         listen_path: listen_path.into(),
@@ -120,6 +122,7 @@ fn test_config(proxies: Vec<Proxy>) -> GatewayConfig {
         plugin_configs: vec![],
         upstreams: vec![],
         loaded_at: Utc::now(),
+        known_namespaces: Vec::new(),
     }
 }
 

@@ -94,7 +94,7 @@ pub trait DatabaseBackend: Send + Sync {
     // -----------------------------------------------------------------------
 
     /// Load the full gateway configuration from the database.
-    async fn load_full_config(&self) -> Result<GatewayConfig, anyhow::Error>;
+    async fn load_full_config(&self, namespace: &str) -> Result<GatewayConfig, anyhow::Error>;
 
     // -----------------------------------------------------------------------
     // Incremental polling
@@ -103,6 +103,7 @@ pub trait DatabaseBackend: Send + Sync {
     /// Load only resources changed since `since`, plus detect deletions.
     async fn load_incremental_config(
         &self,
+        namespace: &str,
         since: DateTime<Utc>,
         known_proxy_ids: &HashSet<String>,
         known_consumer_ids: &HashSet<String>,
@@ -121,6 +122,7 @@ pub trait DatabaseBackend: Send + Sync {
     async fn check_proxy_exists(&self, proxy_id: &str) -> Result<bool, anyhow::Error>;
     async fn list_proxies_paginated(
         &self,
+        namespace: &str,
         limit: i64,
         offset: i64,
     ) -> Result<PaginatedResult<Proxy>, anyhow::Error>;
@@ -135,6 +137,7 @@ pub trait DatabaseBackend: Send + Sync {
     async fn get_consumer(&self, id: &str) -> Result<Option<Consumer>, anyhow::Error>;
     async fn list_consumers_paginated(
         &self,
+        namespace: &str,
         limit: i64,
         offset: i64,
     ) -> Result<PaginatedResult<Consumer>, anyhow::Error>;
@@ -149,6 +152,7 @@ pub trait DatabaseBackend: Send + Sync {
     async fn get_plugin_config(&self, id: &str) -> Result<Option<PluginConfig>, anyhow::Error>;
     async fn list_plugin_configs_paginated(
         &self,
+        namespace: &str,
         limit: i64,
         offset: i64,
     ) -> Result<PaginatedResult<PluginConfig>, anyhow::Error>;
@@ -164,6 +168,7 @@ pub trait DatabaseBackend: Send + Sync {
     async fn cleanup_orphaned_upstream(&self, upstream_id: &str) -> Result<(), anyhow::Error>;
     async fn list_upstreams_paginated(
         &self,
+        namespace: &str,
         limit: i64,
         offset: i64,
     ) -> Result<PaginatedResult<Upstream>, anyhow::Error>;
@@ -174,6 +179,7 @@ pub trait DatabaseBackend: Send + Sync {
 
     async fn check_listen_path_unique(
         &self,
+        namespace: &str,
         listen_path: &str,
         hosts: &[String],
         exclude_proxy_id: Option<&str>,
@@ -181,18 +187,21 @@ pub trait DatabaseBackend: Send + Sync {
 
     async fn check_proxy_name_unique(
         &self,
+        namespace: &str,
         name: &str,
         exclude_proxy_id: Option<&str>,
     ) -> Result<bool, anyhow::Error>;
 
     async fn check_upstream_name_unique(
         &self,
+        namespace: &str,
         name: &str,
         exclude_upstream_id: Option<&str>,
     ) -> Result<bool, anyhow::Error>;
 
     async fn check_consumer_identity_unique(
         &self,
+        namespace: &str,
         username: &str,
         custom_id: Option<&str>,
         exclude_consumer_id: Option<&str>,
@@ -200,18 +209,21 @@ pub trait DatabaseBackend: Send + Sync {
 
     async fn check_keyauth_key_unique(
         &self,
+        namespace: &str,
         key: &str,
         exclude_consumer_id: Option<&str>,
     ) -> Result<bool, anyhow::Error>;
 
     async fn check_mtls_identity_unique(
         &self,
+        namespace: &str,
         identity: &str,
         exclude_consumer_id: Option<&str>,
     ) -> Result<bool, anyhow::Error>;
 
     async fn check_listen_port_unique(
         &self,
+        namespace: &str,
         port: u16,
         exclude_proxy_id: Option<&str>,
     ) -> Result<bool, anyhow::Error>;
@@ -240,7 +252,7 @@ pub trait DatabaseBackend: Send + Sync {
         configs: &[PluginConfig],
     ) -> Result<usize, anyhow::Error>;
     async fn batch_create_upstreams(&self, upstreams: &[Upstream]) -> Result<usize, anyhow::Error>;
-    async fn delete_all_resources(&self) -> Result<(), anyhow::Error>;
+    async fn delete_all_resources(&self, namespace: &str) -> Result<(), anyhow::Error>;
 
     // -----------------------------------------------------------------------
     // Connection lifecycle (called from polling loops)
@@ -281,6 +293,9 @@ pub trait DatabaseBackend: Send + Sync {
 
     /// Run schema migrations (SQL) or ensure indexes/collections exist (MongoDB).
     async fn run_migrations(&self) -> Result<(), anyhow::Error>;
+
+    /// Return all distinct namespaces across all resource tables.
+    async fn list_namespaces(&self) -> Result<Vec<String>, anyhow::Error>;
 }
 
 /// Extract known IDs from a full config (used to seed the incremental poller).

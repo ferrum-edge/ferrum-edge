@@ -17,6 +17,7 @@ fn make_summary(
     backend_ms: f64,
 ) -> TransactionSummary {
     TransactionSummary {
+        namespace: "ferrum".to_string(),
         timestamp_received: "2025-01-01T00:00:00Z".to_string(),
         client_ip: "127.0.0.1".to_string(),
         consumer_username: None,
@@ -45,6 +46,7 @@ fn make_summary(
 
 fn make_stream_summary(proxy_id: &str, protocol: &str) -> StreamTransactionSummary {
     StreamTransactionSummary {
+        namespace: "ferrum".to_string(),
         proxy_id: proxy_id.to_string(),
         proxy_name: Some("Stream Test".to_string()),
         client_ip: "127.0.0.1".to_string(),

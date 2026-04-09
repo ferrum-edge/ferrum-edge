@@ -133,6 +133,9 @@ fn resolve_bool(conf: &ConfFile, key: &str, default: bool) -> bool {
 #[allow(dead_code)] // Some fields are only used with optional features (e.g. mongodb)
 pub struct EnvConfig {
     pub mode: OperatingMode,
+    /// Namespace this gateway instance loads and manages. Resources from other
+    /// namespaces are ignored. Default: "ferrum".
+    pub namespace: String,
     pub log_level: String,
     /// Maximum number of buffered log lines in the non-blocking writer's channel.
     /// When the buffer is full, new log events are dropped (lossy mode) to avoid
@@ -597,6 +600,7 @@ impl Default for EnvConfig {
     fn default() -> Self {
         Self {
             mode: OperatingMode::File,
+            namespace: "ferrum".into(),
             log_level: "error".into(),
             log_buffer_capacity: 128_000,
             enable_streaming_latency_tracking: false,
@@ -760,8 +764,11 @@ impl EnvConfig {
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default();
 
+        let namespace = resolve_var_or(conf, "FERRUM_NAMESPACE", "ferrum");
+
         let config = Self {
             mode: mode.clone(),
+            namespace,
             log_level: resolve_var_or(conf, "FERRUM_LOG_LEVEL", "error"),
             log_buffer_capacity: resolve_usize(conf, "FERRUM_LOG_BUFFER_CAPACITY", 128_000),
             enable_streaming_latency_tracking: resolve_bool(
@@ -1477,6 +1484,10 @@ impl EnvConfig {
                 }
             }
         }
+
+        // Validate namespace
+        crate::config::types::validate_namespace(&self.namespace)
+            .map_err(|e| format!("Invalid FERRUM_NAMESPACE: {}", e))?;
 
         // Validate TLS version settings
         match self.tls_min_version.as_str() {

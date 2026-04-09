@@ -10,6 +10,7 @@ use std::sync::Arc;
 fn make_consumer(username: &str) -> Consumer {
     Consumer {
         id: format!("consumer-{username}"),
+        namespace: ferrum_edge::config::types::default_namespace(),
         username: username.to_string(),
         custom_id: None,
         credentials: HashMap::new(),
@@ -38,6 +39,7 @@ fn make_ctx(proxy_id: &str, ip: &str, consumer: Option<&str>) -> StreamConnectio
 
 fn make_summary(metadata: HashMap<String, String>) -> StreamTransactionSummary {
     StreamTransactionSummary {
+        namespace: "ferrum".to_string(),
         proxy_id: "tcp-proxy".to_string(),
         proxy_name: Some("TCP Proxy".to_string()),
         client_ip: "127.0.0.1".to_string(),

@@ -444,6 +444,7 @@ pub async fn run(
     let dp_proxy_state = proxy_state.clone();
     let dp_shutdown = shutdown_tx.subscribe();
     let dp_startup_ready = startup_ready.clone();
+    let dp_namespace = env_config.namespace.clone();
     let dp_client_handle = tokio::spawn(async move {
         crate::grpc::dp_client::start_dp_client_with_shutdown_and_startup_ready(
             cp_url,
@@ -452,6 +453,7 @@ pub async fn run(
             Some(dp_shutdown),
             dp_grpc_tls,
             Some(dp_startup_ready),
+            dp_namespace,
         )
         .await;
     });

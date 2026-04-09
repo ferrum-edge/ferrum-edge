@@ -331,6 +331,22 @@ fn paginate_db_response<T: Serialize>(
     })
 }
 
+/// Extract namespace from the X-Ferrum-Namespace header, defaulting to "ferrum".
+#[allow(clippy::result_large_err)]
+fn extract_namespace(headers: &hyper::HeaderMap) -> Result<String, Response<Full<Bytes>>> {
+    let ns = headers
+        .get("x-ferrum-namespace")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or(crate::config::types::DEFAULT_NAMESPACE);
+    if let Err(e) = crate::config::types::validate_namespace(ns) {
+        return Err(json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"error": format!("Invalid X-Ferrum-Namespace: {}", e)}),
+        ));
+    }
+    Ok(ns.to_string())
+}
+
 /// Handle an admin API request.
 pub async fn handle_admin_request(
     req: Request<Incoming>,
@@ -488,6 +504,12 @@ pub async fn handle_admin_request(
         }
     }
 
+    // Extract namespace from X-Ferrum-Namespace header (defaults to "ferrum")
+    let namespace = match extract_namespace(req.headers()) {
+        Ok(ns) => ns,
+        Err(resp) => return Ok(resp),
+    };
+
     // Read body with size limit.
     // /restore gets a configurable limit (default 100 MiB) for large-scale
     // backups (30K+ proxies / 90K+ plugins can reach ~80 MB);
@@ -517,62 +539,84 @@ pub async fn handle_admin_request(
 
     match (method, segments.as_slice()) {
         // Proxies CRUD
-        (Method::GET, ["proxies"]) => handle_list_proxies(&state, &pagination).await,
-        (Method::POST, ["proxies"]) => handle_create_proxy(&state, &body_bytes).await,
-        (Method::GET, ["proxies", id]) => handle_get_proxy(&state, id).await,
-        (Method::PUT, ["proxies", id]) => handle_update_proxy(&state, id, &body_bytes).await,
-        (Method::DELETE, ["proxies", id]) => handle_delete_proxy(&state, id).await,
+        (Method::GET, ["proxies"]) => handle_list_proxies(&state, &pagination, &namespace).await,
+        (Method::POST, ["proxies"]) => handle_create_proxy(&state, &body_bytes, &namespace).await,
+        (Method::GET, ["proxies", id]) => handle_get_proxy(&state, id, &namespace).await,
+        (Method::PUT, ["proxies", id]) => {
+            handle_update_proxy(&state, id, &body_bytes, &namespace).await
+        }
+        (Method::DELETE, ["proxies", id]) => handle_delete_proxy(&state, id, &namespace).await,
 
         // Consumers CRUD
-        (Method::GET, ["consumers"]) => handle_list_consumers(&state, &pagination).await,
-        (Method::POST, ["consumers"]) => handle_create_consumer(&state, &body_bytes).await,
-        (Method::GET, ["consumers", id]) => handle_get_consumer(&state, id).await,
-        (Method::PUT, ["consumers", id]) => handle_update_consumer(&state, id, &body_bytes).await,
-        (Method::DELETE, ["consumers", id]) => handle_delete_consumer(&state, id).await,
+        (Method::GET, ["consumers"]) => {
+            handle_list_consumers(&state, &pagination, &namespace).await
+        }
+        (Method::POST, ["consumers"]) => {
+            handle_create_consumer(&state, &body_bytes, &namespace).await
+        }
+        (Method::GET, ["consumers", id]) => handle_get_consumer(&state, id, &namespace).await,
+        (Method::PUT, ["consumers", id]) => {
+            handle_update_consumer(&state, id, &body_bytes, &namespace).await
+        }
+        (Method::DELETE, ["consumers", id]) => handle_delete_consumer(&state, id, &namespace).await,
 
         // Consumer credentials
         (Method::PUT, ["consumers", consumer_id, "credentials", cred_type]) => {
-            handle_update_credentials(&state, consumer_id, cred_type, &body_bytes).await
+            handle_update_credentials(&state, consumer_id, cred_type, &body_bytes, &namespace).await
         }
         (Method::POST, ["consumers", consumer_id, "credentials", cred_type]) => {
-            handle_append_credential(&state, consumer_id, cred_type, &body_bytes).await
+            handle_append_credential(&state, consumer_id, cred_type, &body_bytes, &namespace).await
         }
         (Method::DELETE, ["consumers", consumer_id, "credentials", cred_type, index]) => {
-            handle_delete_credential_by_index(&state, consumer_id, cred_type, index).await
+            handle_delete_credential_by_index(&state, consumer_id, cred_type, index, &namespace)
+                .await
         }
         (Method::DELETE, ["consumers", consumer_id, "credentials", cred_type]) => {
-            handle_delete_credentials(&state, consumer_id, cred_type).await
+            handle_delete_credentials(&state, consumer_id, cred_type, &namespace).await
         }
 
         // Plugins
         (Method::GET, ["plugins"]) => handle_list_plugin_types().await,
         (Method::GET, ["plugins", "config"]) => {
-            handle_list_plugin_configs(&state, &pagination).await
+            handle_list_plugin_configs(&state, &pagination, &namespace).await
         }
         (Method::POST, ["plugins", "config"]) => {
-            handle_create_plugin_config(&state, &body_bytes).await
+            handle_create_plugin_config(&state, &body_bytes, &namespace).await
         }
-        (Method::GET, ["plugins", "config", id]) => handle_get_plugin_config(&state, id).await,
+        (Method::GET, ["plugins", "config", id]) => {
+            handle_get_plugin_config(&state, id, &namespace).await
+        }
         (Method::PUT, ["plugins", "config", id]) => {
-            handle_update_plugin_config(&state, id, &body_bytes).await
+            handle_update_plugin_config(&state, id, &body_bytes, &namespace).await
         }
         (Method::DELETE, ["plugins", "config", id]) => {
-            handle_delete_plugin_config(&state, id).await
+            handle_delete_plugin_config(&state, id, &namespace).await
         }
 
         // Upstreams CRUD
-        (Method::GET, ["upstreams"]) => handle_list_upstreams(&state, &pagination).await,
-        (Method::POST, ["upstreams"]) => handle_create_upstream(&state, &body_bytes).await,
-        (Method::GET, ["upstreams", id]) => handle_get_upstream(&state, id).await,
-        (Method::PUT, ["upstreams", id]) => handle_update_upstream(&state, id, &body_bytes).await,
-        (Method::DELETE, ["upstreams", id]) => handle_delete_upstream(&state, id).await,
+        (Method::GET, ["upstreams"]) => {
+            handle_list_upstreams(&state, &pagination, &namespace).await
+        }
+        (Method::POST, ["upstreams"]) => {
+            handle_create_upstream(&state, &body_bytes, &namespace).await
+        }
+        (Method::GET, ["upstreams", id]) => handle_get_upstream(&state, id, &namespace).await,
+        (Method::PUT, ["upstreams", id]) => {
+            handle_update_upstream(&state, id, &body_bytes, &namespace).await
+        }
+        (Method::DELETE, ["upstreams", id]) => handle_delete_upstream(&state, id, &namespace).await,
 
         // Batch create
-        (Method::POST, ["batch"]) => handle_batch_create(&state, &body_bytes).await,
+        (Method::POST, ["batch"]) => handle_batch_create(&state, &body_bytes, &namespace).await,
 
         // Backup & Restore
-        (Method::GET, ["backup"]) => handle_backup(&state, query.as_deref()).await,
-        (Method::POST, ["restore"]) => handle_restore(&state, &body_bytes, query.as_deref()).await,
+        (Method::GET, ["backup"]) => handle_backup(&state, query.as_deref(), &namespace).await,
+        (Method::POST, ["restore"]) => {
+            handle_restore(&state, &body_bytes, query.as_deref(), &namespace).await
+        }
+
+        // Namespaces
+        (Method::GET, ["namespaces"]) => handle_list_namespaces(&state).await,
 
         // Metrics
         (Method::GET, ["admin", "metrics"]) => handle_metrics(&state).await,
@@ -589,11 +633,12 @@ pub async fn handle_admin_request(
 async fn handle_list_proxies(
     state: &AdminState,
     pagination: &PaginationParams,
+    namespace: &str,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     // Try database-level pagination first, fall back to cached config for resilience
     if let Some(ref db) = state.db {
         match db
-            .list_proxies_paginated(pagination.limit as i64, pagination.offset as i64)
+            .list_proxies_paginated(namespace, pagination.limit as i64, pagination.offset as i64)
             .await
         {
             Ok(result) => {
@@ -611,7 +656,12 @@ async fn handle_list_proxies(
 
     // Fallback: serve from in-memory cached config
     if let Some(config) = state.cached_gateway_config() {
-        let body = paginate_response(&json!(config.proxies), pagination);
+        let filtered: Vec<&Proxy> = config
+            .proxies
+            .iter()
+            .filter(|p| p.namespace == namespace)
+            .collect();
+        let body = paginate_response(&json!(filtered), pagination);
         Ok(json_response_with_stale(StatusCode::OK, &body))
     } else {
         Ok(json_response(
@@ -624,6 +674,7 @@ async fn handle_list_proxies(
 async fn handle_create_proxy(
     state: &AdminState,
     body: &[u8],
+    namespace: &str,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     // Check if admin API is in read-only mode
     if let Some(resp) = state.check_write_allowed() {
@@ -658,6 +709,7 @@ async fn handle_create_proxy(
     }
 
     proxy.normalize_fields();
+    proxy.namespace = namespace.to_string();
 
     // Validate field lengths, numeric ranges, and nested config objects.
     if let Err(field_errors) = proxy.validate_fields() {
@@ -720,7 +772,7 @@ async fn handle_create_proxy(
     // Check host+listen_path uniqueness for HTTP-style routes.
     if !proxy.backend_protocol.is_stream_proxy() {
         match db
-            .check_listen_path_unique(&proxy.listen_path, &proxy.hosts, None)
+            .check_listen_path_unique(namespace, &proxy.listen_path, &proxy.hosts, None)
             .await
         {
             Ok(true) => {}
@@ -741,7 +793,7 @@ async fn handle_create_proxy(
 
     // Check proxy name uniqueness (when present)
     if let Some(ref name) = proxy.name {
-        match db.check_proxy_name_unique(name, None).await {
+        match db.check_proxy_name_unique(namespace, name, None).await {
             Ok(true) => {}
             Ok(false) => {
                 return Ok(json_response(
@@ -824,7 +876,7 @@ async fn handle_create_proxy(
         }
         // Check listen_port uniqueness across all stream proxies
         if let Some(port) = proxy.listen_port {
-            match db.check_listen_port_unique(port, None).await {
+            match db.check_listen_port_unique(namespace, port, None).await {
                 Ok(true) => {}
                 Ok(false) => {
                     return Ok(json_response(
@@ -896,11 +948,20 @@ async fn handle_create_proxy(
 async fn handle_get_proxy(
     state: &AdminState,
     id: &str,
+    namespace: &str,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     // Try database first
     if let Some(ref db) = state.db {
         match db.get_proxy(id).await {
-            Ok(Some(proxy)) => return Ok(json_response(StatusCode::OK, &json!(proxy))),
+            Ok(Some(proxy)) => {
+                if proxy.namespace != namespace {
+                    return Ok(json_response(
+                        StatusCode::NOT_FOUND,
+                        &json!({"error": "Proxy not found"}),
+                    ));
+                }
+                return Ok(json_response(StatusCode::OK, &json!(proxy)));
+            }
             Ok(None) => {
                 return Ok(json_response(
                     StatusCode::NOT_FOUND,
@@ -918,7 +979,11 @@ async fn handle_get_proxy(
 
     // Fallback: search in cached config
     if let Some(config) = state.cached_gateway_config() {
-        match config.proxies.iter().find(|p| p.id == id) {
+        match config
+            .proxies
+            .iter()
+            .find(|p| p.id == id && p.namespace == namespace)
+        {
             Some(proxy) => Ok(json_response_with_stale(StatusCode::OK, &json!(proxy))),
             None => Ok(json_response(
                 StatusCode::NOT_FOUND,
@@ -937,6 +1002,7 @@ async fn handle_update_proxy(
     state: &AdminState,
     id: &str,
     body: &[u8],
+    namespace: &str,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     // Check if admin API is in read-only mode
     if let Some(resp) = state.check_write_allowed() {
@@ -971,6 +1037,7 @@ async fn handle_update_proxy(
     }
 
     proxy.normalize_fields();
+    proxy.namespace = namespace.to_string();
 
     // Validate field lengths, numeric ranges, and nested config objects.
     if let Err(field_errors) = proxy.validate_fields() {
@@ -1008,7 +1075,7 @@ async fn handle_update_proxy(
     // Check host+listen_path uniqueness (excluding self) for HTTP-style routes.
     if !proxy.backend_protocol.is_stream_proxy() {
         match db
-            .check_listen_path_unique(&proxy.listen_path, &proxy.hosts, Some(id))
+            .check_listen_path_unique(namespace, &proxy.listen_path, &proxy.hosts, Some(id))
             .await
         {
             Ok(true) => {}
@@ -1029,7 +1096,7 @@ async fn handle_update_proxy(
 
     // Check proxy name uniqueness excluding self (when present)
     if let Some(ref name) = proxy.name {
-        match db.check_proxy_name_unique(name, Some(id)).await {
+        match db.check_proxy_name_unique(namespace, name, Some(id)).await {
             Ok(true) => {}
             Ok(false) => {
                 return Ok(json_response(
@@ -1112,7 +1179,7 @@ async fn handle_update_proxy(
         }
         // Check listen_port uniqueness across all stream proxies (excluding self)
         if let Some(port) = proxy.listen_port {
-            match db.check_listen_port_unique(port, Some(id)).await {
+            match db.check_listen_port_unique(namespace, port, Some(id)).await {
                 Ok(true) => {}
                 Ok(false) => {
                     return Ok(json_response(
@@ -1210,6 +1277,7 @@ async fn handle_update_proxy(
 async fn handle_delete_proxy(
     state: &AdminState,
     id: &str,
+    namespace: &str,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     // Check if admin API is in read-only mode
     if let Some(resp) = state.check_write_allowed() {
@@ -1225,6 +1293,29 @@ async fn handle_delete_proxy(
             ));
         }
     };
+
+    // Verify the proxy belongs to the requested namespace before deleting
+    match db.get_proxy(id).await {
+        Ok(Some(proxy)) if proxy.namespace != namespace => {
+            return Ok(json_response(
+                StatusCode::NOT_FOUND,
+                &json!({"error": "Proxy not found"}),
+            ));
+        }
+        Ok(None) => {
+            return Ok(json_response(
+                StatusCode::NOT_FOUND,
+                &json!({"error": "Proxy not found"}),
+            ));
+        }
+        Err(e) => {
+            return Ok(json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &json!({"error": format!("{}", e)}),
+            ));
+        }
+        _ => {}
+    }
 
     match db.delete_proxy(id).await {
         Ok(true) => Ok(json_response(StatusCode::NO_CONTENT, &json!({}))),
@@ -1244,11 +1335,12 @@ async fn handle_delete_proxy(
 async fn handle_list_consumers(
     state: &AdminState,
     pagination: &PaginationParams,
+    namespace: &str,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     // Try database-level pagination first, fall back to cached config for resilience
     if let Some(ref db) = state.db {
         match db
-            .list_consumers_paginated(pagination.limit as i64, pagination.offset as i64)
+            .list_consumers_paginated(namespace, pagination.limit as i64, pagination.offset as i64)
             .await
         {
             Ok(result) => {
@@ -1274,6 +1366,7 @@ async fn handle_list_consumers(
         let redacted: Vec<_> = config
             .consumers
             .iter()
+            .filter(|c| c.namespace == namespace)
             .map(redact_consumer_credentials)
             .collect();
         let body = paginate_response(&json!(redacted), pagination);
@@ -1289,6 +1382,7 @@ async fn handle_list_consumers(
 async fn handle_create_consumer(
     state: &AdminState,
     body: &[u8],
+    namespace: &str,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     // Check if admin API is in read-only mode
     if let Some(resp) = state.check_write_allowed() {
@@ -1325,6 +1419,7 @@ async fn handle_create_consumer(
     }
 
     consumer.normalize_fields();
+    consumer.namespace = namespace.to_string();
 
     // Validate field lengths, credential sizes, and control characters
     if let Err(field_errors) = consumer.validate_fields() {
@@ -1355,7 +1450,12 @@ async fn handle_create_consumer(
     }
 
     match db
-        .check_consumer_identity_unique(&consumer.username, consumer.custom_id.as_deref(), None)
+        .check_consumer_identity_unique(
+            namespace,
+            &consumer.username,
+            consumer.custom_id.as_deref(),
+            None,
+        )
         .await
     {
         Ok(Some(msg)) => {
@@ -1381,7 +1481,7 @@ async fn handle_create_consumer(
     // Check keyauth API key uniqueness for all entries (supports arrays)
     for key_creds in consumer.credential_entries("keyauth") {
         if let Some(key) = key_creds.get("key").and_then(|s| s.as_str()) {
-            match db.check_keyauth_key_unique(key, None).await {
+            match db.check_keyauth_key_unique(namespace, key, None).await {
                 Ok(true) => {}
                 Ok(false) => {
                     return Ok(json_response(
@@ -1402,7 +1502,10 @@ async fn handle_create_consumer(
     // Check mTLS identity uniqueness for all entries (supports arrays)
     for mtls_creds in consumer.credential_entries("mtls_auth") {
         if let Some(identity) = mtls_creds.get("identity").and_then(|s| s.as_str()) {
-            match db.check_mtls_identity_unique(identity, None).await {
+            match db
+                .check_mtls_identity_unique(namespace, identity, None)
+                .await
+            {
                 Ok(true) => {}
                 Ok(false) => {
                     return Ok(json_response(
@@ -1440,11 +1543,18 @@ async fn handle_create_consumer(
 async fn handle_get_consumer(
     state: &AdminState,
     id: &str,
+    namespace: &str,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     // Try database first
     if let Some(ref db) = state.db {
         match db.get_consumer(id).await {
             Ok(Some(c)) => {
+                if c.namespace != namespace {
+                    return Ok(json_response(
+                        StatusCode::NOT_FOUND,
+                        &json!({"error": "Consumer not found"}),
+                    ));
+                }
                 return Ok(json_response(
                     StatusCode::OK,
                     &json!(redact_consumer_credentials(&c)),
@@ -1467,7 +1577,11 @@ async fn handle_get_consumer(
 
     // Fallback: search in cached config
     if let Some(config) = state.cached_gateway_config() {
-        match config.consumers.iter().find(|c| c.id == id) {
+        match config
+            .consumers
+            .iter()
+            .find(|c| c.id == id && c.namespace == namespace)
+        {
             Some(consumer) => Ok(json_response_with_stale(
                 StatusCode::OK,
                 &json!(redact_consumer_credentials(consumer)),
@@ -1489,6 +1603,7 @@ async fn handle_update_consumer(
     state: &AdminState,
     id: &str,
     body: &[u8],
+    namespace: &str,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     // Check if admin API is in read-only mode
     if let Some(resp) = state.check_write_allowed() {
@@ -1518,6 +1633,7 @@ async fn handle_update_consumer(
     consumer.id = id.to_string();
     consumer.updated_at = Utc::now();
     consumer.normalize_fields();
+    consumer.namespace = namespace.to_string();
 
     // Validate field lengths, credential sizes, and control characters
     if let Err(field_errors) = consumer.validate_fields() {
@@ -1535,7 +1651,12 @@ async fn handle_update_consumer(
     }
 
     match db
-        .check_consumer_identity_unique(&consumer.username, consumer.custom_id.as_deref(), Some(id))
+        .check_consumer_identity_unique(
+            namespace,
+            &consumer.username,
+            consumer.custom_id.as_deref(),
+            Some(id),
+        )
         .await
     {
         Ok(Some(msg)) => {
@@ -1553,7 +1674,7 @@ async fn handle_update_consumer(
     // Check keyauth API key uniqueness excluding self for all entries (supports arrays)
     for key_creds in consumer.credential_entries("keyauth") {
         if let Some(key) = key_creds.get("key").and_then(|s| s.as_str()) {
-            match db.check_keyauth_key_unique(key, Some(id)).await {
+            match db.check_keyauth_key_unique(namespace, key, Some(id)).await {
                 Ok(true) => {}
                 Ok(false) => {
                     return Ok(json_response(
@@ -1574,7 +1695,10 @@ async fn handle_update_consumer(
     // Check mTLS identity uniqueness excluding self for all entries (supports arrays)
     for mtls_creds in consumer.credential_entries("mtls_auth") {
         if let Some(identity) = mtls_creds.get("identity").and_then(|s| s.as_str()) {
-            match db.check_mtls_identity_unique(identity, Some(id)).await {
+            match db
+                .check_mtls_identity_unique(namespace, identity, Some(id))
+                .await
+            {
                 Ok(true) => {}
                 Ok(false) => {
                     return Ok(json_response(
@@ -1612,6 +1736,7 @@ async fn handle_update_consumer(
 async fn handle_delete_consumer(
     state: &AdminState,
     id: &str,
+    namespace: &str,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     // Check if admin API is in read-only mode
     if let Some(resp) = state.check_write_allowed() {
@@ -1627,6 +1752,29 @@ async fn handle_delete_consumer(
             ));
         }
     };
+
+    // Verify the consumer belongs to the requested namespace before deleting
+    match db.get_consumer(id).await {
+        Ok(Some(c)) if c.namespace != namespace => {
+            return Ok(json_response(
+                StatusCode::NOT_FOUND,
+                &json!({"error": "Consumer not found"}),
+            ));
+        }
+        Ok(None) => {
+            return Ok(json_response(
+                StatusCode::NOT_FOUND,
+                &json!({"error": "Consumer not found"}),
+            ));
+        }
+        Err(e) => {
+            return Ok(json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &json!({"error": format!("{}", e)}),
+            ));
+        }
+        _ => {}
+    }
 
     match db.delete_consumer(id).await {
         Ok(true) => Ok(json_response(StatusCode::NO_CONTENT, &json!({}))),
@@ -1650,6 +1798,7 @@ async fn handle_update_credentials(
     consumer_id: &str,
     cred_type: &str,
     body: &[u8],
+    namespace: &str,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     if let Some(resp) = state.check_write_allowed() {
         return Ok(resp);
@@ -1688,6 +1837,12 @@ async fn handle_update_credentials(
 
     match db.get_consumer(consumer_id).await {
         Ok(Some(mut consumer)) => {
+            if consumer.namespace != namespace {
+                return Ok(json_response(
+                    StatusCode::NOT_FOUND,
+                    &json!({"error": "Consumer not found"}),
+                ));
+            }
             let mut hashed_cred = cred_value.clone();
             // Hash password if basicauth (supports both single object and array)
             if cred_type == "basicauth"
@@ -1707,7 +1862,10 @@ async fn handle_update_credentials(
                 };
                 for entry in entries {
                     if let Some(key) = entry.get("key").and_then(|k| k.as_str()) {
-                        match db.check_keyauth_key_unique(key, Some(consumer_id)).await {
+                        match db
+                            .check_keyauth_key_unique(namespace, key, Some(consumer_id))
+                            .await
+                        {
                             Ok(true) => {}
                             Ok(false) => {
                                 return Ok(json_response(
@@ -1735,7 +1893,7 @@ async fn handle_update_credentials(
                 for entry in entries {
                     if let Some(identity) = entry.get("identity").and_then(|i| i.as_str()) {
                         match db
-                            .check_mtls_identity_unique(identity, Some(consumer_id))
+                            .check_mtls_identity_unique(namespace, identity, Some(consumer_id))
                             .await
                         {
                             Ok(true) => {}
@@ -1795,6 +1953,7 @@ async fn handle_delete_credentials(
     state: &AdminState,
     consumer_id: &str,
     cred_type: &str,
+    namespace: &str,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     if let Some(resp) = state.check_write_allowed() {
         return Ok(resp);
@@ -1823,6 +1982,12 @@ async fn handle_delete_credentials(
 
     match db.get_consumer(consumer_id).await {
         Ok(Some(mut consumer)) => {
+            if consumer.namespace != namespace {
+                return Ok(json_response(
+                    StatusCode::NOT_FOUND,
+                    &json!({"error": "Consumer not found"}),
+                ));
+            }
             consumer.credentials.remove(cred_type);
             consumer.updated_at = Utc::now();
             match db.update_consumer(&consumer).await {
@@ -1852,6 +2017,7 @@ async fn handle_append_credential(
     consumer_id: &str,
     cred_type: &str,
     body: &[u8],
+    namespace: &str,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     if let Some(resp) = state.check_write_allowed() {
         return Ok(resp);
@@ -1896,6 +2062,12 @@ async fn handle_append_credential(
 
     match db.get_consumer(consumer_id).await {
         Ok(Some(mut consumer)) => {
+            if consumer.namespace != namespace {
+                return Ok(json_response(
+                    StatusCode::NOT_FOUND,
+                    &json!({"error": "Consumer not found"}),
+                ));
+            }
             // Hash password if basicauth
             if cred_type == "basicauth"
                 && let Err(e) = hash_credential_passwords(&mut new_cred)
@@ -1910,7 +2082,10 @@ async fn handle_append_credential(
             if cred_type == "keyauth"
                 && let Some(key) = new_cred.get("key").and_then(|k| k.as_str())
             {
-                match db.check_keyauth_key_unique(key, Some(consumer_id)).await {
+                match db
+                    .check_keyauth_key_unique(namespace, key, Some(consumer_id))
+                    .await
+                {
                     Ok(true) => {}
                     Ok(false) => {
                         return Ok(json_response(
@@ -1930,7 +2105,7 @@ async fn handle_append_credential(
                 && let Some(identity) = new_cred.get("identity").and_then(|i| i.as_str())
             {
                 match db
-                    .check_mtls_identity_unique(identity, Some(consumer_id))
+                    .check_mtls_identity_unique(namespace, identity, Some(consumer_id))
                     .await
                 {
                     Ok(true) => {}
@@ -2021,6 +2196,7 @@ async fn handle_delete_credential_by_index(
     consumer_id: &str,
     cred_type: &str,
     index_str: &str,
+    namespace: &str,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     if let Some(resp) = state.check_write_allowed() {
         return Ok(resp);
@@ -2058,6 +2234,12 @@ async fn handle_delete_credential_by_index(
 
     match db.get_consumer(consumer_id).await {
         Ok(Some(mut consumer)) => {
+            if consumer.namespace != namespace {
+                return Ok(json_response(
+                    StatusCode::NOT_FOUND,
+                    &json!({"error": "Consumer not found"}),
+                ));
+            }
             let cred_value = match consumer.credentials.get_mut(cred_type) {
                 Some(v) => v,
                 None => {
@@ -2143,11 +2325,16 @@ async fn handle_list_plugin_types() -> Result<Response<Full<Bytes>>, hyper::Erro
 async fn handle_list_plugin_configs(
     state: &AdminState,
     pagination: &PaginationParams,
+    namespace: &str,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     // Try database-level pagination first, fall back to cached config for resilience
     if let Some(ref db) = state.db {
         match db
-            .list_plugin_configs_paginated(pagination.limit as i64, pagination.offset as i64)
+            .list_plugin_configs_paginated(
+                namespace,
+                pagination.limit as i64,
+                pagination.offset as i64,
+            )
             .await
         {
             Ok(result) => {
@@ -2165,7 +2352,12 @@ async fn handle_list_plugin_configs(
 
     // Fallback: serve from in-memory cached config
     if let Some(config) = state.cached_gateway_config() {
-        let body = paginate_response(&json!(config.plugin_configs), pagination);
+        let filtered: Vec<&PluginConfig> = config
+            .plugin_configs
+            .iter()
+            .filter(|pc| pc.namespace == namespace)
+            .collect();
+        let body = paginate_response(&json!(filtered), pagination);
         Ok(json_response_with_stale(StatusCode::OK, &body))
     } else {
         Ok(json_response(
@@ -2186,6 +2378,7 @@ fn validate_plugin_config_definition(pc: &PluginConfig) -> Result<(), String> {
 async fn handle_create_plugin_config(
     state: &AdminState,
     body: &[u8],
+    namespace: &str,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     // Check if admin API is in read-only mode
     if let Some(resp) = state.check_write_allowed() {
@@ -2213,6 +2406,7 @@ async fn handle_create_plugin_config(
     };
 
     pc.normalize_fields();
+    pc.namespace = namespace.to_string();
 
     if pc.id.is_empty() {
         pc.id = Uuid::new_v4().to_string();
@@ -2298,11 +2492,20 @@ async fn handle_create_plugin_config(
 async fn handle_get_plugin_config(
     state: &AdminState,
     id: &str,
+    namespace: &str,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     // Try database first
     if let Some(ref db) = state.db {
         match db.get_plugin_config(id).await {
-            Ok(Some(pc)) => return Ok(json_response(StatusCode::OK, &json!(pc))),
+            Ok(Some(pc)) => {
+                if pc.namespace != namespace {
+                    return Ok(json_response(
+                        StatusCode::NOT_FOUND,
+                        &json!({"error": "Plugin config not found"}),
+                    ));
+                }
+                return Ok(json_response(StatusCode::OK, &json!(pc)));
+            }
             Ok(None) => {
                 return Ok(json_response(
                     StatusCode::NOT_FOUND,
@@ -2320,7 +2523,11 @@ async fn handle_get_plugin_config(
 
     // Fallback: search in cached config
     if let Some(config) = state.cached_gateway_config() {
-        match config.plugin_configs.iter().find(|pc| pc.id == id) {
+        match config
+            .plugin_configs
+            .iter()
+            .find(|pc| pc.id == id && pc.namespace == namespace)
+        {
             Some(pc) => Ok(json_response_with_stale(StatusCode::OK, &json!(pc))),
             None => Ok(json_response(
                 StatusCode::NOT_FOUND,
@@ -2339,6 +2546,7 @@ async fn handle_update_plugin_config(
     state: &AdminState,
     id: &str,
     body: &[u8],
+    namespace: &str,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     // Check if admin API is in read-only mode
     if let Some(resp) = state.check_write_allowed() {
@@ -2368,6 +2576,7 @@ async fn handle_update_plugin_config(
     pc.id = id.to_string();
     pc.updated_at = Utc::now();
     pc.normalize_fields();
+    pc.namespace = namespace.to_string();
 
     // Validate plugin name is known
     let known_plugins = crate::plugins::available_plugins();
@@ -2424,6 +2633,7 @@ async fn handle_update_plugin_config(
 async fn handle_delete_plugin_config(
     state: &AdminState,
     id: &str,
+    namespace: &str,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     // Check if admin API is in read-only mode
     if let Some(resp) = state.check_write_allowed() {
@@ -2439,6 +2649,29 @@ async fn handle_delete_plugin_config(
             ));
         }
     };
+
+    // Verify the plugin config belongs to the requested namespace before deleting
+    match db.get_plugin_config(id).await {
+        Ok(Some(pc)) if pc.namespace != namespace => {
+            return Ok(json_response(
+                StatusCode::NOT_FOUND,
+                &json!({"error": "Plugin config not found"}),
+            ));
+        }
+        Ok(None) => {
+            return Ok(json_response(
+                StatusCode::NOT_FOUND,
+                &json!({"error": "Plugin config not found"}),
+            ));
+        }
+        Err(e) => {
+            return Ok(json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &json!({"error": format!("{}", e)}),
+            ));
+        }
+        _ => {}
+    }
 
     match db.delete_plugin_config(id).await {
         Ok(true) => Ok(json_response(StatusCode::NO_CONTENT, &json!({}))),
@@ -2458,11 +2691,12 @@ async fn handle_delete_plugin_config(
 async fn handle_list_upstreams(
     state: &AdminState,
     pagination: &PaginationParams,
+    namespace: &str,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     // Try database-level pagination first, fall back to cached config for resilience
     if let Some(ref db) = state.db {
         match db
-            .list_upstreams_paginated(pagination.limit as i64, pagination.offset as i64)
+            .list_upstreams_paginated(namespace, pagination.limit as i64, pagination.offset as i64)
             .await
         {
             Ok(result) => {
@@ -2480,7 +2714,12 @@ async fn handle_list_upstreams(
 
     // Fallback: serve from in-memory cached config
     if let Some(config) = state.cached_gateway_config() {
-        let body = paginate_response(&json!(config.upstreams), pagination);
+        let filtered: Vec<&Upstream> = config
+            .upstreams
+            .iter()
+            .filter(|u| u.namespace == namespace)
+            .collect();
+        let body = paginate_response(&json!(filtered), pagination);
         Ok(json_response_with_stale(StatusCode::OK, &body))
     } else {
         Ok(json_response(
@@ -2493,6 +2732,7 @@ async fn handle_list_upstreams(
 async fn handle_create_upstream(
     state: &AdminState,
     body: &[u8],
+    namespace: &str,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     if let Some(resp) = state.check_write_allowed() {
         return Ok(resp);
@@ -2547,6 +2787,7 @@ async fn handle_create_upstream(
     }
 
     upstream.normalize_fields();
+    upstream.namespace = namespace.to_string();
 
     if upstream.targets.is_empty() && upstream.service_discovery.is_none() {
         return Ok(json_response(
@@ -2565,7 +2806,7 @@ async fn handle_create_upstream(
 
     // Check upstream name uniqueness (when present)
     if let Some(ref name) = upstream.name {
-        match db.check_upstream_name_unique(name, None).await {
+        match db.check_upstream_name_unique(namespace, name, None).await {
             Ok(true) => {}
             Ok(false) => {
                 return Ok(json_response(
@@ -2594,11 +2835,20 @@ async fn handle_create_upstream(
 async fn handle_get_upstream(
     state: &AdminState,
     id: &str,
+    namespace: &str,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     // Try database first
     if let Some(ref db) = state.db {
         match db.get_upstream(id).await {
-            Ok(Some(upstream)) => return Ok(json_response(StatusCode::OK, &json!(upstream))),
+            Ok(Some(upstream)) => {
+                if upstream.namespace != namespace {
+                    return Ok(json_response(
+                        StatusCode::NOT_FOUND,
+                        &json!({"error": "Upstream not found"}),
+                    ));
+                }
+                return Ok(json_response(StatusCode::OK, &json!(upstream)));
+            }
             Ok(None) => {
                 return Ok(json_response(
                     StatusCode::NOT_FOUND,
@@ -2616,7 +2866,11 @@ async fn handle_get_upstream(
 
     // Fallback: search in cached config
     if let Some(config) = state.cached_gateway_config() {
-        match config.upstreams.iter().find(|u| u.id == id) {
+        match config
+            .upstreams
+            .iter()
+            .find(|u| u.id == id && u.namespace == namespace)
+        {
             Some(upstream) => Ok(json_response_with_stale(StatusCode::OK, &json!(upstream))),
             None => Ok(json_response(
                 StatusCode::NOT_FOUND,
@@ -2635,6 +2889,7 @@ async fn handle_update_upstream(
     state: &AdminState,
     id: &str,
     body: &[u8],
+    namespace: &str,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     if let Some(resp) = state.check_write_allowed() {
         return Ok(resp);
@@ -2663,6 +2918,7 @@ async fn handle_update_upstream(
     upstream.id = id.to_string();
     upstream.updated_at = Utc::now();
     upstream.normalize_fields();
+    upstream.namespace = namespace.to_string();
 
     if upstream.targets.is_empty() && upstream.service_discovery.is_none() {
         return Ok(json_response(
@@ -2681,7 +2937,10 @@ async fn handle_update_upstream(
 
     // Check upstream name uniqueness excluding self (when present)
     if let Some(ref name) = upstream.name {
-        match db.check_upstream_name_unique(name, Some(id)).await {
+        match db
+            .check_upstream_name_unique(namespace, name, Some(id))
+            .await
+        {
             Ok(true) => {}
             Ok(false) => {
                 return Ok(json_response(
@@ -2710,6 +2969,7 @@ async fn handle_update_upstream(
 async fn handle_delete_upstream(
     state: &AdminState,
     id: &str,
+    namespace: &str,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     if let Some(resp) = state.check_write_allowed() {
         return Ok(resp);
@@ -2724,6 +2984,29 @@ async fn handle_delete_upstream(
             ));
         }
     };
+
+    // Verify the upstream belongs to the requested namespace before deleting
+    match db.get_upstream(id).await {
+        Ok(Some(u)) if u.namespace != namespace => {
+            return Ok(json_response(
+                StatusCode::NOT_FOUND,
+                &json!({"error": "Upstream not found"}),
+            ));
+        }
+        Ok(None) => {
+            return Ok(json_response(
+                StatusCode::NOT_FOUND,
+                &json!({"error": "Upstream not found"}),
+            ));
+        }
+        Err(e) => {
+            return Ok(json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &json!({"error": format!("{}", e)}),
+            ));
+        }
+        _ => {}
+    }
 
     match db.delete_upstream(id).await {
         Ok(true) => Ok(json_response(StatusCode::NO_CONTENT, &json!({}))),
@@ -2999,6 +3282,7 @@ fn build_metrics(state: &AdminState) -> Value {
 async fn handle_batch_create(
     state: &AdminState,
     body: &[u8],
+    namespace: &str,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     if let Some(resp) = state.check_write_allowed() {
         return Ok(resp);
@@ -3040,6 +3324,7 @@ async fn handle_batch_create(
                 validation_errors.push(format!("Consumer '{}': {}", consumer.id, err));
             }
         }
+        consumer.namespace = namespace.to_string();
         consumer.created_at = now;
         consumer.updated_at = now;
         if let Err(err) = hash_consumer_secrets(consumer) {
@@ -3054,6 +3339,7 @@ async fn handle_batch_create(
             validation_errors.push(format!("Upstream '{}': {}", upstream.id, msg));
         }
         upstream.normalize_fields();
+        upstream.namespace = namespace.to_string();
         if let Err(field_errs) = upstream.validate_fields() {
             for err in field_errs {
                 validation_errors.push(format!("Upstream '{}': {}", upstream.id, err));
@@ -3075,6 +3361,7 @@ async fn handle_batch_create(
             }
         }
         proxy.normalize_fields();
+        proxy.namespace = namespace.to_string();
         if let Err(field_errs) = proxy.validate_fields() {
             for err in field_errs {
                 validation_errors.push(format!("Proxy '{}': {}", proxy.id, err));
@@ -3091,6 +3378,7 @@ async fn handle_batch_create(
             validation_errors.push(format!("PluginConfig '{}': {}", plugin_config.id, msg));
         }
         plugin_config.normalize_fields();
+        plugin_config.namespace = namespace.to_string();
         if !known_plugins.contains(&plugin_config.plugin_name.as_str()) {
             validation_errors.push(format!(
                 "PluginConfig '{}': unknown plugin name '{}'",
@@ -3122,6 +3410,7 @@ async fn handle_batch_create(
         plugin_configs: batch.plugin_configs.clone(),
         upstreams: batch.upstreams.clone(),
         loaded_at: now,
+        known_namespaces: Vec::new(),
     };
 
     if let Err(errs) = batch_config.validate_unique_resource_ids() {
@@ -3372,17 +3661,18 @@ struct BackupCounts {
 async fn handle_backup(
     state: &AdminState,
     query: Option<&str>,
+    namespace: &str,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     let resource_filter = parse_backup_resources(query);
 
     // Try database first, then cached config
     let (config, source) = if let Some(ref db) = state.db {
-        match db.load_full_config().await {
+        match db.load_full_config(namespace).await {
             Ok(config) => (config, "database"),
             Err(e) => {
                 warn!("Backup: database load failed, trying cached config: {}", e);
                 match state.cached_gateway_config() {
-                    Some(c) => ((*c).clone(), "cached"),
+                    Some(c) => (filter_config_by_namespace(&c, namespace), "cached"),
                     None => {
                         return Ok(json_response(
                             StatusCode::SERVICE_UNAVAILABLE,
@@ -3394,7 +3684,7 @@ async fn handle_backup(
         }
     } else {
         match state.cached_gateway_config() {
-            Some(c) => ((*c).clone(), "cached"),
+            Some(c) => (filter_config_by_namespace(&c, namespace), "cached"),
             None => {
                 return Ok(json_response(
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -3547,6 +3837,7 @@ async fn handle_restore(
     state: &AdminState,
     body: &[u8],
     query: Option<&str>,
+    namespace: &str,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     if let Some(resp) = state.check_write_allowed() {
         return Ok(resp);
@@ -3619,8 +3910,22 @@ async fn handle_restore(
             plugin_configs: payload.plugin_configs.clone(),
             upstreams: payload.upstreams.clone(),
             loaded_at: Utc::now(),
+            known_namespaces: Vec::new(),
         };
         temp_config.normalize_fields();
+        // Set namespace on all resources
+        for p in &mut temp_config.proxies {
+            p.namespace = namespace.to_string();
+        }
+        for c in &mut temp_config.consumers {
+            c.namespace = namespace.to_string();
+        }
+        for pc in &mut temp_config.plugin_configs {
+            pc.namespace = namespace.to_string();
+        }
+        for u in &mut temp_config.upstreams {
+            u.namespace = namespace.to_string();
+        }
         let mut validation_errors: Vec<String> = Vec::new();
 
         let cert_expiry_days = state
@@ -3669,8 +3974,8 @@ async fn handle_restore(
         }
     }
 
-    // Phase 3: Delete all existing resources (safe: payload is validated)
-    if let Err(e) = db.delete_all_resources().await {
+    // Phase 3: Delete all existing resources in the namespace (safe: payload is validated)
+    if let Err(e) = db.delete_all_resources(namespace).await {
         error!("Restore: failed to delete existing resources: {}", e);
         return Ok(json_response(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -3688,6 +3993,21 @@ async fn handle_restore(
     let mut created_upstreams = 0usize;
     let mut created_proxies = 0usize;
     let mut created_plugin_configs = 0usize;
+
+    // Set namespace on all payload resources before persisting
+    let mut payload = payload;
+    for p in &mut payload.proxies {
+        p.namespace = namespace.to_string();
+    }
+    for c in &mut payload.consumers {
+        c.namespace = namespace.to_string();
+    }
+    for pc in &mut payload.plugin_configs {
+        pc.namespace = namespace.to_string();
+    }
+    for u in &mut payload.upstreams {
+        u.namespace = namespace.to_string();
+    }
 
     // Consumers first (no dependencies) — hash secrets before persisting
     if !payload.consumers.is_empty() {
@@ -3761,6 +4081,64 @@ async fn handle_restore(
     }
 
     Ok(json_response(StatusCode::OK, &response))
+}
+
+// ---- Namespaces ----
+
+async fn handle_list_namespaces(state: &AdminState) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    if let Some(ref db) = state.db {
+        match db.list_namespaces().await {
+            Ok(namespaces) => Ok(json_response(StatusCode::OK, &json!(namespaces))),
+            Err(e) => Ok(json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &json!({"error": format!("Failed to list namespaces: {}", e)}),
+            )),
+        }
+    } else if let Some(config) = state.cached_gateway_config() {
+        // File mode: return namespaces captured at load time (before namespace filtering)
+        Ok(json_response(
+            StatusCode::OK,
+            &json!(config.known_namespaces),
+        ))
+    } else {
+        Ok(json_response(
+            StatusCode::OK,
+            &json!([crate::config::types::DEFAULT_NAMESPACE]),
+        ))
+    }
+}
+
+/// Filter a GatewayConfig to only include resources matching the given namespace.
+fn filter_config_by_namespace(config: &GatewayConfig, namespace: &str) -> GatewayConfig {
+    GatewayConfig {
+        version: config.version.clone(),
+        proxies: config
+            .proxies
+            .iter()
+            .filter(|p| p.namespace == namespace)
+            .cloned()
+            .collect(),
+        consumers: config
+            .consumers
+            .iter()
+            .filter(|c| c.namespace == namespace)
+            .cloned()
+            .collect(),
+        plugin_configs: config
+            .plugin_configs
+            .iter()
+            .filter(|pc| pc.namespace == namespace)
+            .cloned()
+            .collect(),
+        upstreams: config
+            .upstreams
+            .iter()
+            .filter(|u| u.namespace == namespace)
+            .cloned()
+            .collect(),
+        loaded_at: config.loaded_at,
+        known_namespaces: config.known_namespaces.clone(),
+    }
 }
 
 // ---- Helpers ----

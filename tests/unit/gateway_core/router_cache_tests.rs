@@ -7,6 +7,7 @@ use ferrum_edge::proxy::build_backend_url;
 fn test_proxy(id: &str, listen_path: &str) -> Proxy {
     Proxy {
         id: id.into(),
+        namespace: ferrum_edge::config::types::default_namespace(),
         name: Some(format!("Test {}", id)),
         hosts: vec![],
         listen_path: listen_path.into(),
@@ -65,6 +66,7 @@ fn test_config(proxies: Vec<Proxy>) -> GatewayConfig {
         plugin_configs: vec![],
         upstreams: vec![],
         loaded_at: Utc::now(),
+        known_namespaces: Vec::new(),
     }
 }
 

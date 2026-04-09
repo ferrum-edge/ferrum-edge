@@ -24,6 +24,7 @@ fn make_upstream(
 ) -> Upstream {
     Upstream {
         id: id.to_string(),
+        namespace: default_namespace(),
         name: None,
         targets,
         algorithm: LoadBalancerAlgorithm::RoundRobin,

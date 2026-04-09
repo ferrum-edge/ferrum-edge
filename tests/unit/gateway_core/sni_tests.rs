@@ -110,12 +110,14 @@ fn make_test_config(
         plugin_configs: vec![],
         upstreams: vec![],
         loaded_at: chrono::Utc::now(),
+        known_namespaces: Vec::new(),
     }
 }
 
 fn make_proxy(id: &str, hosts: Vec<&str>) -> ferrum_edge::config::types::Proxy {
     ferrum_edge::config::types::Proxy {
         id: id.to_string(),
+        namespace: ferrum_edge::config::types::default_namespace(),
         name: None,
         hosts: hosts.into_iter().map(String::from).collect(),
         listen_path: String::new(),

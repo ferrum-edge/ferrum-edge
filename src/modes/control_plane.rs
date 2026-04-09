@@ -117,7 +117,7 @@ pub async fn run(
     };
     let db: Arc<dyn DatabaseBackend> = Arc::from(db);
 
-    let config = db.load_full_config().await?;
+    let config = db.load_full_config(&env_config.namespace).await?;
     info!(
         "CP mode: loaded {} proxies, {} consumers",
         config.proxies.len(),
@@ -413,6 +413,7 @@ pub async fn run(
     let db_tls_client_cert = env_config.db_tls_client_cert_path.clone();
     let db_tls_client_key = env_config.db_tls_client_key_path.clone();
     let db_tls_insecure = env_config.db_tls_insecure;
+    let poll_namespace = env_config.namespace.clone();
 
     let db_poll_handle = tokio::spawn(async move {
         let mut interval = tokio::time::interval(poll_interval);
@@ -512,6 +513,7 @@ pub async fn run(
                     if let Some(since) = last_poll_at {
                         // Incremental poll — only fetch changes since last poll
                         match db_poll.load_incremental_config(
+                            &poll_namespace,
                             since,
                             &known_proxy_ids,
                             &known_consumer_ids,
@@ -572,7 +574,7 @@ pub async fn run(
                                     e
                                 );
                                 // Fallback to full config load + full snapshot broadcast
-                                match db_poll.load_full_config().await {
+                                match db_poll.load_full_config(&poll_namespace).await {
                                     Ok(new_config) => {
                                         db_available_poll.store(true, Ordering::Relaxed);
                                         let (p, c, pc, u) = db_backend::extract_known_ids(&new_config);
@@ -597,7 +599,7 @@ pub async fn run(
                                             db_tls_insecure,
                                         ).await {
                                             Ok(_url) => {
-                                                match db_poll.load_full_config().await {
+                                                match db_poll.load_full_config(&poll_namespace).await {
                                                     Ok(new_config) => {
                                                         db_available_poll.store(true, Ordering::Relaxed);
                                                         let (p, c, pc, u) = db_backend::extract_known_ids(&new_config);

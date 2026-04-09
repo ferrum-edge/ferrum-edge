@@ -25,6 +25,7 @@ plugin_configs: []
         file.path().to_str().unwrap(),
         30,
         &ferrum_edge::config::BackendAllowIps::Both,
+        "ferrum",
     )
     .unwrap();
     assert_eq!(config.proxies.len(), 1);
@@ -50,6 +51,7 @@ fn test_load_json_config() {
         file.path().to_str().unwrap(),
         30,
         &ferrum_edge::config::BackendAllowIps::Both,
+        "ferrum",
     )
     .unwrap();
     assert_eq!(config.proxies.len(), 1);
@@ -78,6 +80,7 @@ plugin_configs: []
         file.path().to_str().unwrap(),
         30,
         &ferrum_edge::config::BackendAllowIps::Both,
+        "ferrum",
     );
     assert!(result.is_err());
     let error_msg = result.unwrap_err().to_string();
@@ -160,6 +163,7 @@ plugin_configs:
         file.path().to_str().unwrap(),
         30,
         &ferrum_edge::config::BackendAllowIps::Both,
+        "ferrum",
     )
     .unwrap();
 
@@ -209,6 +213,7 @@ fn test_load_shared_example_config_fixture() {
         "tests/config.yaml",
         30,
         &ferrum_edge::config::BackendAllowIps::Both,
+        "ferrum",
     )
     .unwrap();
 
@@ -264,6 +269,7 @@ plugin_configs: []
             file.path().to_str().unwrap(),
             30,
             &ferrum_edge::config::BackendAllowIps::Both,
+            "ferrum",
         )
         .unwrap();
 
@@ -298,6 +304,7 @@ plugin_configs: []
         file.path().to_str().unwrap(),
         30,
         &ferrum_edge::config::BackendAllowIps::Both,
+        "ferrum",
     )
     .unwrap();
     assert_eq!(config.proxies[0].auth_mode, AuthMode::Single);
@@ -322,6 +329,7 @@ plugin_configs: []
         file.path().to_str().unwrap(),
         30,
         &ferrum_edge::config::BackendAllowIps::Both,
+        "ferrum",
     )
     .unwrap();
     assert_eq!(config.proxies[0].auth_mode, AuthMode::Multi);
@@ -345,6 +353,7 @@ plugin_configs: []
         file.path().to_str().unwrap(),
         30,
         &ferrum_edge::config::BackendAllowIps::Both,
+        "ferrum",
     )
     .unwrap();
     assert_eq!(config.proxies[0].auth_mode, AuthMode::Single);
@@ -372,6 +381,7 @@ plugin_configs: []
         file.path().to_str().unwrap(),
         30,
         &ferrum_edge::config::BackendAllowIps::Both,
+        "ferrum",
     )
     .unwrap();
 
@@ -400,6 +410,7 @@ plugin_configs: []
         file.path().to_str().unwrap(),
         30,
         &ferrum_edge::config::BackendAllowIps::Both,
+        "ferrum",
     )
     .unwrap();
 
@@ -427,6 +438,7 @@ plugin_configs: []
         file.path().to_str().unwrap(),
         30,
         &ferrum_edge::config::BackendAllowIps::Both,
+        "ferrum",
     )
     .unwrap();
 
@@ -461,6 +473,7 @@ plugin_configs: []
         file.path().to_str().unwrap(),
         30,
         &ferrum_edge::config::BackendAllowIps::Both,
+        "ferrum",
     )
     .unwrap();
 
@@ -494,6 +507,7 @@ plugin_configs:
         file.path().to_str().unwrap(),
         30,
         &ferrum_edge::config::BackendAllowIps::Both,
+        "ferrum",
     )
     .unwrap();
 
@@ -527,6 +541,7 @@ plugin_configs:
         file.path().to_str().unwrap(),
         30,
         &ferrum_edge::config::BackendAllowIps::Both,
+        "ferrum",
     )
     .unwrap();
 
@@ -560,6 +575,7 @@ plugin_configs:
         file.path().to_str().unwrap(),
         30,
         &ferrum_edge::config::BackendAllowIps::Both,
+        "ferrum",
     )
     .unwrap();
 
@@ -625,6 +641,7 @@ plugin_configs: []
         file.path().to_str().unwrap(),
         30,
         &ferrum_edge::config::BackendAllowIps::Both,
+        "ferrum",
     )
     .unwrap();
 
@@ -666,6 +683,7 @@ plugin_configs: []
         file.path().to_str().unwrap(),
         30,
         &ferrum_edge::config::BackendAllowIps::Both,
+        "ferrum",
     )
     .unwrap();
 
@@ -699,9 +717,13 @@ plugin_configs: []
     let file_path = file.path().to_str().unwrap();
 
     // Initial load
-    let config1 =
-        reload_config_from_file(file_path, 30, &ferrum_edge::config::BackendAllowIps::Both)
-            .unwrap();
+    let config1 = reload_config_from_file(
+        file_path,
+        30,
+        &ferrum_edge::config::BackendAllowIps::Both,
+        "ferrum",
+    )
+    .unwrap();
     assert_eq!(config1.proxies.len(), 1);
 
     // Modify file and reload
@@ -723,9 +745,13 @@ plugin_configs: []
     write!(file.reopen().unwrap(), "{}", yaml_updated).unwrap();
 
     // Reload should get new config
-    let config2 =
-        reload_config_from_file(file_path, 30, &ferrum_edge::config::BackendAllowIps::Both)
-            .unwrap();
+    let config2 = reload_config_from_file(
+        file_path,
+        30,
+        &ferrum_edge::config::BackendAllowIps::Both,
+        "ferrum",
+    )
+    .unwrap();
     assert_eq!(config2.proxies.len(), 2);
 }
 
@@ -739,6 +765,7 @@ fn test_missing_config_file() {
         "/nonexistent/path/config.yaml",
         30,
         &ferrum_edge::config::BackendAllowIps::Both,
+        "ferrum",
     );
     assert!(result.is_err());
     let error = result.unwrap_err().to_string();
@@ -763,6 +790,7 @@ plugin_configs: []
         file.path().to_str().unwrap(),
         30,
         &ferrum_edge::config::BackendAllowIps::Both,
+        "ferrum",
     );
     assert!(result.is_err());
 }
@@ -782,6 +810,7 @@ fn test_malformed_json() {
         file.path().to_str().unwrap(),
         30,
         &ferrum_edge::config::BackendAllowIps::Both,
+        "ferrum",
     );
     assert!(result.is_err());
 }
@@ -799,6 +828,7 @@ plugin_configs: []
         file.path().to_str().unwrap(),
         30,
         &ferrum_edge::config::BackendAllowIps::Both,
+        "ferrum",
     )
     .unwrap();
 
@@ -829,6 +859,7 @@ plugin_configs: []
         file.path().to_str().unwrap(),
         30,
         &ferrum_edge::config::BackendAllowIps::Both,
+        "ferrum",
     )
     .unwrap();
     assert_eq!(config.proxies.len(), 1);
@@ -853,6 +884,7 @@ fn test_unknown_extension_fallback_to_json() {
         file.path().to_str().unwrap(),
         30,
         &ferrum_edge::config::BackendAllowIps::Both,
+        "ferrum",
     )
     .unwrap();
     assert_eq!(config.proxies.len(), 1);
@@ -904,6 +936,7 @@ plugin_configs:
         file.path().to_str().unwrap(),
         30,
         &ferrum_edge::config::BackendAllowIps::Both,
+        "ferrum",
     )
     .unwrap();
 
@@ -938,6 +971,7 @@ plugin_configs: []
         file.path().to_str().unwrap(),
         30,
         &ferrum_edge::config::BackendAllowIps::Both,
+        "ferrum",
     )
     .unwrap();
 

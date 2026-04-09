@@ -8,6 +8,7 @@ use ferrum_edge::plugins::{StreamTransactionSummary, TransactionSummary};
 /// Build a fully-populated TransactionSummary for testing.
 fn make_full_summary() -> TransactionSummary {
     TransactionSummary {
+        namespace: "ferrum".to_string(),
         timestamp_received: "2026-03-25T12:00:00Z".to_string(),
         client_ip: "10.0.0.1".to_string(),
         consumer_username: Some("alice".to_string()),
@@ -398,6 +399,7 @@ fn test_backend_response_carries_error_class() {
 
 fn make_stream_summary() -> StreamTransactionSummary {
     StreamTransactionSummary {
+        namespace: "ferrum".to_string(),
         proxy_id: "tcp-proxy-1".to_string(),
         proxy_name: Some("TCP Backend".to_string()),
         client_ip: "10.0.0.1".to_string(),

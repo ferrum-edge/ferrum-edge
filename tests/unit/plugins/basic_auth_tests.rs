@@ -35,6 +35,7 @@ fn create_basic_auth_consumer() -> ferrum_edge::config::types::Consumer {
 
     ferrum_edge::config::types::Consumer {
         id: "basic-consumer".to_string(),
+        namespace: ferrum_edge::config::types::default_namespace(),
         username: "testuser".to_string(),
         custom_id: None,
         credentials,
@@ -249,6 +250,7 @@ async fn test_basic_auth_bcrypt_fallback() {
 
     let consumer = ferrum_edge::config::types::Consumer {
         id: "bcrypt-consumer".to_string(),
+        namespace: ferrum_edge::config::types::default_namespace(),
         username: "bcryptuser".to_string(),
         custom_id: None,
         credentials,
@@ -304,6 +306,7 @@ fn create_basic_auth_consumer_with_two_passwords() -> ferrum_edge::config::types
 
     ferrum_edge::config::types::Consumer {
         id: "basic-consumer".to_string(),
+        namespace: ferrum_edge::config::types::default_namespace(),
         username: "testuser".to_string(),
         custom_id: None,
         credentials,

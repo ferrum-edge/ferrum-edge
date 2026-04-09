@@ -16,6 +16,7 @@ use std::collections::HashMap;
 fn make_proxy(id: &str, listen_path: &str) -> Proxy {
     Proxy {
         id: id.into(),
+        namespace: ferrum_edge::config::types::default_namespace(),
         name: None,
         hosts: vec![],
         listen_path: listen_path.into(),
@@ -68,6 +69,7 @@ fn make_proxy(id: &str, listen_path: &str) -> Proxy {
 fn make_consumer(id: &str, username: &str) -> Consumer {
     Consumer {
         id: id.into(),
+        namespace: ferrum_edge::config::types::default_namespace(),
         username: username.into(),
         custom_id: None,
         credentials: HashMap::new(),
@@ -80,6 +82,7 @@ fn make_consumer(id: &str, username: &str) -> Consumer {
 fn make_upstream(id: &str) -> Upstream {
     Upstream {
         id: id.into(),
+        namespace: ferrum_edge::config::types::default_namespace(),
         name: None,
         targets: vec![UpstreamTarget {
             host: "localhost".into(),
@@ -101,6 +104,7 @@ fn make_upstream(id: &str) -> Upstream {
 fn make_plugin_config(id: &str) -> PluginConfig {
     PluginConfig {
         id: id.into(),
+        namespace: ferrum_edge::config::types::default_namespace(),
         plugin_name: "cors".into(),
         config: serde_json::json!({}),
         scope: PluginScope::Global,
@@ -1590,6 +1594,7 @@ fn test_validate_backend_ip_policy_hostname_skipped() {
 fn test_validate_backend_ip_policy_upstream_target_denied() {
     let upstream = Upstream {
         id: "up1".to_string(),
+        namespace: ferrum_edge::config::types::default_namespace(),
         name: Some("test-upstream".to_string()),
         targets: vec![UpstreamTarget {
             host: "169.254.169.254".to_string(),

@@ -2094,6 +2094,7 @@ async fn handle_websocket_request_authenticated(
                         );
                         let ws_err_method = if is_h2_websocket { "CONNECT" } else { "GET" };
                         let summary = TransactionSummary {
+                            namespace: proxy.namespace.clone(),
                             timestamp_received: ctx.timestamp_received.to_rfc3339(),
                             client_ip: ctx.client_ip.clone(),
                             consumer_username: ctx.effective_identity().map(str::to_owned),
@@ -2164,6 +2165,7 @@ async fn handle_websocket_request_authenticated(
 
     let ws_method = if is_h2_websocket { "CONNECT" } else { "GET" };
     let summary = TransactionSummary {
+        namespace: proxy.namespace.clone(),
         timestamp_received: ctx.timestamp_received.to_rfc3339(),
         client_ip: ctx.client_ip.clone(),
         consumer_username: ctx.effective_identity().map(str::to_owned),
@@ -3113,6 +3115,9 @@ pub async fn log_rejected_request(
     metadata.insert("rejection_phase".to_string(), rejection_phase.to_string());
 
     let summary = TransactionSummary {
+        namespace: proxy
+            .map(|p| p.namespace.clone())
+            .unwrap_or_else(crate::config::types::default_namespace),
         timestamp_received: ctx.timestamp_received.to_rfc3339(),
         client_ip: ctx.client_ip.clone(),
         consumer_username: ctx.effective_identity().map(str::to_owned),
@@ -4551,6 +4556,7 @@ pub async fn handle_proxy_request(
                         .map(|ip| ip.to_string());
 
                     let summary = TransactionSummary {
+                        namespace: proxy.namespace.clone(),
                         timestamp_received: ctx.timestamp_received.to_rfc3339(),
                         client_ip: ctx.client_ip.clone(),
                         consumer_username: ctx.effective_identity().map(str::to_owned),
@@ -4762,6 +4768,7 @@ pub async fn handle_proxy_request(
                         .map(|ip| ip.to_string());
 
                     let summary = TransactionSummary {
+                        namespace: proxy.namespace.clone(),
                         timestamp_received: ctx.timestamp_received.to_rfc3339(),
                         client_ip: ctx.client_ip.clone(),
                         consumer_username: ctx.effective_identity().map(str::to_owned),
@@ -4881,6 +4888,9 @@ pub async fn handle_proxy_request(
                         );
                         insert_grpc_error_metadata(&mut metadata, grpc_code, msg);
                         let summary = TransactionSummary {
+                            namespace: proxy_ref
+                                .map(|p| p.namespace.clone())
+                                .unwrap_or_else(crate::config::types::default_namespace),
                             timestamp_received: ctx.timestamp_received.to_rfc3339(),
                             client_ip: ctx.client_ip.clone(),
                             consumer_username: ctx.effective_identity().map(str::to_owned),
@@ -5328,6 +5338,7 @@ pub async fn handle_proxy_request(
     // Log phase — skip TransactionSummary construction when no plugins need it
     if !plugins.is_empty() {
         let summary = TransactionSummary {
+            namespace: proxy.namespace.clone(),
             timestamp_received: ctx.timestamp_received.to_rfc3339(),
             client_ip: ctx.client_ip.clone(),
             consumer_username: ctx.effective_identity().map(str::to_owned),

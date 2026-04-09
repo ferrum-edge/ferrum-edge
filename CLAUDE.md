@@ -250,11 +250,13 @@ src/
 | Type | Description | Key Fields |
 |------|-------------|------------|
 | `GatewayConfig` | Top-level config container | proxies, consumers, upstreams, plugins |
-| `Proxy` | A route + backend target | listen_path, hosts, backend_host/port/protocol, plugins, TLS/DNS/timeout overrides, pool_*, circuit_breaker, retry, response_body_mode, allowed_ws_origins, udp_max_response_amplification_factor, passthrough |
-| `Consumer` | An authenticated client identity | username, custom_id, credentials (HashMap — each type maps to a single JSON object or an array of objects for multi-credential rotation), acl_groups (Vec), tags |
-| `Upstream` | A load-balanced target group | targets (host/port/weight/path), algorithm, health_checks |
-| `PluginConfig` | Plugin instance configuration | name, enabled, config (serde_json::Value), priority_override (Option<u16>) |
+| `Proxy` | A route + backend target | namespace, listen_path, hosts, backend_host/port/protocol, plugins, TLS/DNS/timeout overrides, pool_*, circuit_breaker, retry, response_body_mode, allowed_ws_origins, udp_max_response_amplification_factor, passthrough |
+| `Consumer` | An authenticated client identity | namespace, username, custom_id, credentials (HashMap — each type maps to a single JSON object or an array of objects for multi-credential rotation), acl_groups (Vec), tags |
+| `Upstream` | A load-balanced target group | namespace, targets (host/port/weight/path), algorithm, health_checks |
+| `PluginConfig` | Plugin instance configuration | namespace, name, enabled, config (serde_json::Value), priority_override (Option<u16>) |
 | `ServiceDiscoveryConfig` | Dynamic upstream target discovery | provider (dns_sd/kubernetes/consul), poll_interval_seconds, provider-specific settings |
+
+**Namespace isolation**: Every resource (`Proxy`, `Consumer`, `Upstream`, `PluginConfig`) has a `namespace` field (default `"ferrum"`). The gateway instance's `FERRUM_NAMESPACE` env var controls which namespace it loads and proxies. In database mode, all queries filter by namespace. In file mode, resources are filtered post-deserialization. The Admin API uses an `X-Ferrum-Namespace` header (defaults to `"ferrum"` if omitted) to scope all CRUD operations — this allows a CP to manage resources across all namespaces. `GET /namespaces` returns all distinct namespaces in the config/database. Uniqueness constraints (listen_path, proxy name, consumer identity, upstream name, listen_port) are all scoped per-namespace. Different namespaces run on different gateway instances, so the same `listen_port` can be safely reused across namespaces — the OS-level bind at startup catches real conflicts on the actual machine. In the CP/DP gRPC protocol, the DP sends its namespace in `SubscribeRequest` for observability logging.
 
 **Hostname normalization**: All hostnames are normalized to ASCII-lowercase at the admission layer via `normalize_fields()` — this includes `Proxy.hosts`, `Proxy.backend_host`, and `UpstreamTarget.host`. Normalization runs at every entry point: admin API (create/update/batch/restore), file loader, DB loader (full and incremental), DP gRPC client, and config backup restore. Downstream consumers (DNS cache, connection pool keys, health check keys, LB keys) rely on this invariant and do NOT re-lowercase. Do not add per-lookup lowercasing in those paths — it is unnecessary and adds hot-path overhead.
 
@@ -794,6 +796,7 @@ Reduce per-request allocations in plugin lookup
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `FERRUM_MODE` | (required) | `database`, `file`, `cp`, `dp`, `migrate` |
+| `FERRUM_NAMESPACE` | `ferrum` | Namespace this gateway instance loads and manages. Resources from other namespaces are ignored. Enables multi-tenant resource isolation |
 | `FERRUM_LOG_LEVEL` | `error` | `error`, `warn`, `info`, `debug`, `trace` |
 | `FERRUM_LOG_BUFFER_CAPACITY` | `128000` | Max buffered log lines in the non-blocking writer channel. When full, new events are dropped (lossy) to avoid backpressure |
 | `FERRUM_PROXY_HTTP_PORT` | `8000` | Proxy HTTP listen port |

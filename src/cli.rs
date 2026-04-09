@@ -258,6 +258,7 @@ pub fn execute_validate() -> Result<(), String> {
             config_path,
             env_config.tls_cert_expiry_warning_days,
             &env_config.backend_allow_ips,
+            &env_config.namespace,
         )
         .map_err(|e| format!("Spec validation failed: {}", e))?;
 

@@ -23,6 +23,7 @@ fn create_consumer(username: &str) -> ferrum_edge::config::types::Consumer {
     use chrono::Utc;
     ferrum_edge::config::types::Consumer {
         id: format!("{}-id", username),
+        namespace: ferrum_edge::config::types::default_namespace(),
         username: username.to_string(),
         custom_id: None,
         credentials: HashMap::new(),
@@ -39,6 +40,7 @@ fn create_consumer_with_custom_id(
     use chrono::Utc;
     ferrum_edge::config::types::Consumer {
         id: format!("{}-id", username),
+        namespace: ferrum_edge::config::types::default_namespace(),
         username: username.to_string(),
         custom_id: Some(custom_id.to_string()),
         credentials: HashMap::new(),

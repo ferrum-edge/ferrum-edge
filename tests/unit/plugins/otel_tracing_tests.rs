@@ -28,6 +28,7 @@ fn make_ctx() -> RequestContext {
 
 fn make_summary(metadata: HashMap<String, String>) -> TransactionSummary {
     TransactionSummary {
+        namespace: "ferrum".to_string(),
         timestamp_received: "2026-03-23T12:00:00Z".to_string(),
         client_ip: "10.0.0.1".to_string(),
         consumer_username: None,
@@ -56,6 +57,7 @@ fn make_summary(metadata: HashMap<String, String>) -> TransactionSummary {
 
 fn make_rich_summary(metadata: HashMap<String, String>) -> TransactionSummary {
     TransactionSummary {
+        namespace: "ferrum".to_string(),
         timestamp_received: "2026-03-23T12:00:00Z".to_string(),
         client_ip: "10.0.0.1".to_string(),
         consumer_username: Some("alice".to_string()),

@@ -362,15 +362,15 @@ impl DatabaseStore {
     }
 
     /// Load the full gateway configuration from the database.
-    pub async fn load_full_config(&self) -> Result<GatewayConfig, anyhow::Error> {
+    pub async fn load_full_config(&self, namespace: &str) -> Result<GatewayConfig, anyhow::Error> {
         let start = Instant::now();
         // Capture timestamp before queries so the incremental polling safety
         // margin covers the full load duration.
         let loaded_at = Utc::now();
-        let proxies = self.load_proxies().await?;
-        let consumers = self.load_consumers().await?;
-        let plugin_configs = self.load_plugin_configs().await?;
-        let upstreams = self.load_upstreams().await?;
+        let proxies = self.load_proxies(namespace).await?;
+        let consumers = self.load_consumers(namespace).await?;
+        let plugin_configs = self.load_plugin_configs(namespace).await?;
+        let upstreams = self.load_upstreams(namespace).await?;
 
         let mut config = GatewayConfig {
             version: crate::config::types::CURRENT_CONFIG_VERSION.to_string(),
@@ -379,6 +379,7 @@ impl DatabaseStore {
             plugin_configs,
             upstreams,
             loaded_at,
+            known_namespaces: Vec::new(),
         };
 
         // Normalize canonical in-memory fields before validation.
@@ -472,14 +473,13 @@ impl DatabaseStore {
         Ok(config)
     }
 
-    async fn load_proxies(&self) -> Result<Vec<Proxy>, anyhow::Error> {
+    async fn load_proxies(&self, namespace: &str) -> Result<Vec<Proxy>, anyhow::Error> {
         let start = Instant::now();
 
-        // Batch-load all proxy_plugins in one query (eliminates N+1).
-        // This table is lightweight (two TEXT columns, no JSON) so a single
-        // unbounded fetch is fine even at scale.
+        // Batch-load proxy_plugins for proxies in this namespace (eliminates N+1).
         let assoc_rows: Vec<AnyRow> =
-            match sqlx::query("SELECT proxy_id, plugin_config_id FROM proxy_plugins")
+            match sqlx::query(&self.q("SELECT pp.proxy_id, pp.plugin_config_id FROM proxy_plugins pp INNER JOIN proxies p ON pp.proxy_id = p.id WHERE p.namespace = ?"))
+                .bind(namespace)
                 .fetch_all(&self.rpool())
                 .await
             {
@@ -521,12 +521,14 @@ impl DatabaseStore {
         let mut offset: i64 = 0;
 
         loop {
-            let rows: Vec<AnyRow> =
-                sqlx::query(&self.q("SELECT * FROM proxies ORDER BY id LIMIT ? OFFSET ?"))
-                    .bind(Self::FULL_LOAD_PAGE_SIZE)
-                    .bind(offset)
-                    .fetch_all(&self.rpool())
-                    .await?;
+            let rows: Vec<AnyRow> = sqlx::query(
+                &self.q("SELECT * FROM proxies WHERE namespace = ? ORDER BY id LIMIT ? OFFSET ?"),
+            )
+            .bind(namespace)
+            .bind(Self::FULL_LOAD_PAGE_SIZE)
+            .bind(offset)
+            .fetch_all(&self.rpool())
+            .await?;
             let fetched = rows.len();
             for row in rows {
                 let id: String = row.try_get("id")?;
@@ -543,18 +545,20 @@ impl DatabaseStore {
         Ok(proxies)
     }
 
-    async fn load_consumers(&self) -> Result<Vec<Consumer>, anyhow::Error> {
+    async fn load_consumers(&self, namespace: &str) -> Result<Vec<Consumer>, anyhow::Error> {
         let start = Instant::now();
         let mut consumers = Vec::new();
         let mut offset: i64 = 0;
 
         loop {
-            let rows: Vec<AnyRow> =
-                sqlx::query(&self.q("SELECT * FROM consumers ORDER BY id LIMIT ? OFFSET ?"))
-                    .bind(Self::FULL_LOAD_PAGE_SIZE)
-                    .bind(offset)
-                    .fetch_all(&self.rpool())
-                    .await?;
+            let rows: Vec<AnyRow> = sqlx::query(
+                &self.q("SELECT * FROM consumers WHERE namespace = ? ORDER BY id LIMIT ? OFFSET ?"),
+            )
+            .bind(namespace)
+            .bind(Self::FULL_LOAD_PAGE_SIZE)
+            .bind(offset)
+            .fetch_all(&self.rpool())
+            .await?;
             let fetched = rows.len();
             for row in rows {
                 consumers.push(row_to_consumer(&row)?);
@@ -569,18 +573,23 @@ impl DatabaseStore {
         Ok(consumers)
     }
 
-    async fn load_plugin_configs(&self) -> Result<Vec<PluginConfig>, anyhow::Error> {
+    async fn load_plugin_configs(
+        &self,
+        namespace: &str,
+    ) -> Result<Vec<PluginConfig>, anyhow::Error> {
         let start = Instant::now();
         let mut configs = Vec::new();
         let mut offset: i64 = 0;
 
         loop {
-            let rows: Vec<AnyRow> =
-                sqlx::query(&self.q("SELECT * FROM plugin_configs ORDER BY id LIMIT ? OFFSET ?"))
-                    .bind(Self::FULL_LOAD_PAGE_SIZE)
-                    .bind(offset)
-                    .fetch_all(&self.rpool())
-                    .await?;
+            let rows: Vec<AnyRow> = sqlx::query(&self.q(
+                "SELECT * FROM plugin_configs WHERE namespace = ? ORDER BY id LIMIT ? OFFSET ?",
+            ))
+            .bind(namespace)
+            .bind(Self::FULL_LOAD_PAGE_SIZE)
+            .bind(offset)
+            .fetch_all(&self.rpool())
+            .await?;
             let fetched = rows.len();
             for row in rows {
                 configs.push(row_to_plugin_config(&row)?);
@@ -619,9 +628,10 @@ impl DatabaseStore {
         let hosts_json = serde_json::to_string(&proxy.hosts)?;
 
         sqlx::query(
-            &self.q("INSERT INTO proxies (id, name, hosts, listen_path, backend_protocol, backend_host, backend_port, backend_path, strip_listen_path, preserve_host_header, backend_connect_timeout_ms, backend_read_timeout_ms, backend_write_timeout_ms, backend_tls_client_cert_path, backend_tls_client_key_path, backend_tls_verify_server_cert, backend_tls_server_ca_cert_path, dns_override, dns_cache_ttl_seconds, auth_mode, upstream_id, circuit_breaker, retry, response_body_mode, pool_idle_timeout_seconds, pool_enable_http_keep_alive, pool_enable_http2, pool_tcp_keepalive_seconds, pool_http2_keep_alive_interval_seconds, pool_http2_keep_alive_timeout_seconds, pool_http2_initial_stream_window_size, pool_http2_initial_connection_window_size, pool_http2_adaptive_window, pool_http2_max_frame_size, pool_http2_max_concurrent_streams, pool_http3_connections_per_backend, listen_port, frontend_tls, passthrough, udp_idle_timeout_seconds, tcp_idle_timeout_seconds, allowed_methods, allowed_ws_origins, udp_max_response_amplification_factor, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+            &self.q("INSERT INTO proxies (id, namespace, name, hosts, listen_path, backend_protocol, backend_host, backend_port, backend_path, strip_listen_path, preserve_host_header, backend_connect_timeout_ms, backend_read_timeout_ms, backend_write_timeout_ms, backend_tls_client_cert_path, backend_tls_client_key_path, backend_tls_verify_server_cert, backend_tls_server_ca_cert_path, dns_override, dns_cache_ttl_seconds, auth_mode, upstream_id, circuit_breaker, retry, response_body_mode, pool_idle_timeout_seconds, pool_enable_http_keep_alive, pool_enable_http2, pool_tcp_keepalive_seconds, pool_http2_keep_alive_interval_seconds, pool_http2_keep_alive_timeout_seconds, pool_http2_initial_stream_window_size, pool_http2_initial_connection_window_size, pool_http2_adaptive_window, pool_http2_max_frame_size, pool_http2_max_concurrent_streams, pool_http3_connections_per_backend, listen_port, frontend_tls, passthrough, udp_idle_timeout_seconds, tcp_idle_timeout_seconds, allowed_methods, allowed_ws_origins, udp_max_response_amplification_factor, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
         )
         .bind(&proxy.id)
+        .bind(&proxy.namespace)
         .bind(&proxy.name)
         .bind(&hosts_json)
         .bind(&proxy.listen_path)
@@ -890,9 +900,10 @@ impl DatabaseStore {
         let creds_json = serde_json::to_string(&consumer.credentials)?;
         let acl_groups_json = serde_json::to_string(&consumer.acl_groups)?;
         sqlx::query(
-            &self.q("INSERT INTO consumers (id, username, custom_id, credentials, acl_groups, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)")
+            &self.q("INSERT INTO consumers (id, namespace, username, custom_id, credentials, acl_groups, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
         )
         .bind(&consumer.id)
+        .bind(&consumer.namespace)
         .bind(&consumer.username)
         .bind(&consumer.custom_id)
         .bind(&creds_json)
@@ -963,9 +974,10 @@ impl DatabaseStore {
             PluginScope::Global => "global",
         };
         sqlx::query(
-            &self.q("INSERT INTO plugin_configs (id, plugin_name, config, scope, proxy_id, enabled, priority_override, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
+            &self.q("INSERT INTO plugin_configs (id, namespace, plugin_name, config, scope, proxy_id, enabled, priority_override, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
         )
         .bind(&pc.id)
+        .bind(&pc.namespace)
         .bind(&pc.plugin_name)
         .bind(&config_json)
         .bind(scope_str)
@@ -1047,18 +1059,20 @@ impl DatabaseStore {
 
     // ---- Upstream CRUD ----
 
-    async fn load_upstreams(&self) -> Result<Vec<Upstream>, anyhow::Error> {
+    async fn load_upstreams(&self, namespace: &str) -> Result<Vec<Upstream>, anyhow::Error> {
         let start = Instant::now();
         let mut upstreams = Vec::new();
         let mut offset: i64 = 0;
 
         loop {
-            let rows: Vec<AnyRow> =
-                sqlx::query(&self.q("SELECT * FROM upstreams ORDER BY id LIMIT ? OFFSET ?"))
-                    .bind(Self::FULL_LOAD_PAGE_SIZE)
-                    .bind(offset)
-                    .fetch_all(&self.rpool())
-                    .await?;
+            let rows: Vec<AnyRow> = sqlx::query(
+                &self.q("SELECT * FROM upstreams WHERE namespace = ? ORDER BY id LIMIT ? OFFSET ?"),
+            )
+            .bind(namespace)
+            .bind(Self::FULL_LOAD_PAGE_SIZE)
+            .bind(offset)
+            .fetch_all(&self.rpool())
+            .await?;
             let fetched = rows.len();
             for row in rows {
                 upstreams.push(row_to_upstream(&row)?);
@@ -1078,22 +1092,27 @@ impl DatabaseStore {
     /// List proxies with database-level LIMIT/OFFSET pagination.
     pub async fn list_proxies_paginated(
         &self,
+        namespace: &str,
         limit: i64,
         offset: i64,
     ) -> Result<PaginatedResult<Proxy>, anyhow::Error> {
         let start = Instant::now();
 
-        let count_row = sqlx::query("SELECT COUNT(*) AS cnt FROM proxies")
-            .fetch_one(&self.rpool())
-            .await?;
+        let count_row =
+            sqlx::query(&self.q("SELECT COUNT(*) AS cnt FROM proxies WHERE namespace = ?"))
+                .bind(namespace)
+                .fetch_one(&self.rpool())
+                .await?;
         let total: i64 = count_row.try_get("cnt")?;
 
-        let rows: Vec<AnyRow> =
-            sqlx::query(&self.q("SELECT * FROM proxies ORDER BY id LIMIT ? OFFSET ?"))
-                .bind(limit)
-                .bind(offset)
-                .fetch_all(&self.rpool())
-                .await?;
+        let rows: Vec<AnyRow> = sqlx::query(
+            &self.q("SELECT * FROM proxies WHERE namespace = ? ORDER BY id LIMIT ? OFFSET ?"),
+        )
+        .bind(namespace)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.rpool())
+        .await?;
 
         // Batch-load proxy_plugins for only the proxies in this page
         let proxy_ids: Vec<String> = rows
@@ -1154,22 +1173,27 @@ impl DatabaseStore {
     /// List consumers with database-level LIMIT/OFFSET pagination.
     pub async fn list_consumers_paginated(
         &self,
+        namespace: &str,
         limit: i64,
         offset: i64,
     ) -> Result<PaginatedResult<Consumer>, anyhow::Error> {
         let start = Instant::now();
 
-        let count_row = sqlx::query("SELECT COUNT(*) AS cnt FROM consumers")
-            .fetch_one(&self.rpool())
-            .await?;
+        let count_row =
+            sqlx::query(&self.q("SELECT COUNT(*) AS cnt FROM consumers WHERE namespace = ?"))
+                .bind(namespace)
+                .fetch_one(&self.rpool())
+                .await?;
         let total: i64 = count_row.try_get("cnt")?;
 
-        let rows: Vec<AnyRow> =
-            sqlx::query(&self.q("SELECT * FROM consumers ORDER BY id LIMIT ? OFFSET ?"))
-                .bind(limit)
-                .bind(offset)
-                .fetch_all(&self.rpool())
-                .await?;
+        let rows: Vec<AnyRow> = sqlx::query(
+            &self.q("SELECT * FROM consumers WHERE namespace = ? ORDER BY id LIMIT ? OFFSET ?"),
+        )
+        .bind(namespace)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.rpool())
+        .await?;
 
         let mut consumers = Vec::new();
         for row in rows {
@@ -1186,22 +1210,28 @@ impl DatabaseStore {
     /// List plugin configs with database-level LIMIT/OFFSET pagination.
     pub async fn list_plugin_configs_paginated(
         &self,
+        namespace: &str,
         limit: i64,
         offset: i64,
     ) -> Result<PaginatedResult<PluginConfig>, anyhow::Error> {
         let start = Instant::now();
 
-        let count_row = sqlx::query("SELECT COUNT(*) AS cnt FROM plugin_configs")
-            .fetch_one(&self.rpool())
-            .await?;
+        let count_row =
+            sqlx::query(&self.q("SELECT COUNT(*) AS cnt FROM plugin_configs WHERE namespace = ?"))
+                .bind(namespace)
+                .fetch_one(&self.rpool())
+                .await?;
         let total: i64 = count_row.try_get("cnt")?;
 
-        let rows: Vec<AnyRow> =
-            sqlx::query(&self.q("SELECT * FROM plugin_configs ORDER BY id LIMIT ? OFFSET ?"))
-                .bind(limit)
-                .bind(offset)
-                .fetch_all(&self.rpool())
-                .await?;
+        let rows: Vec<AnyRow> = sqlx::query(
+            &self
+                .q("SELECT * FROM plugin_configs WHERE namespace = ? ORDER BY id LIMIT ? OFFSET ?"),
+        )
+        .bind(namespace)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.rpool())
+        .await?;
 
         let mut configs = Vec::new();
         for row in rows {
@@ -1218,22 +1248,27 @@ impl DatabaseStore {
     /// List upstreams with database-level LIMIT/OFFSET pagination.
     pub async fn list_upstreams_paginated(
         &self,
+        namespace: &str,
         limit: i64,
         offset: i64,
     ) -> Result<PaginatedResult<Upstream>, anyhow::Error> {
         let start = Instant::now();
 
-        let count_row = sqlx::query("SELECT COUNT(*) AS cnt FROM upstreams")
-            .fetch_one(&self.rpool())
-            .await?;
+        let count_row =
+            sqlx::query(&self.q("SELECT COUNT(*) AS cnt FROM upstreams WHERE namespace = ?"))
+                .bind(namespace)
+                .fetch_one(&self.rpool())
+                .await?;
         let total: i64 = count_row.try_get("cnt")?;
 
-        let rows: Vec<AnyRow> =
-            sqlx::query(&self.q("SELECT * FROM upstreams ORDER BY id LIMIT ? OFFSET ?"))
-                .bind(limit)
-                .bind(offset)
-                .fetch_all(&self.rpool())
-                .await?;
+        let rows: Vec<AnyRow> = sqlx::query(
+            &self.q("SELECT * FROM upstreams WHERE namespace = ? ORDER BY id LIMIT ? OFFSET ?"),
+        )
+        .bind(namespace)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.rpool())
+        .await?;
 
         let mut upstreams = Vec::new();
         for row in rows {
@@ -1271,9 +1306,10 @@ impl DatabaseStore {
             .transpose()?;
 
         sqlx::query(
-            &self.q("INSERT INTO upstreams (id, name, targets, algorithm, hash_on, hash_on_cookie_config, health_checks, service_discovery, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+            &self.q("INSERT INTO upstreams (id, namespace, name, targets, algorithm, hash_on, hash_on_cookie_config, health_checks, service_discovery, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
         )
         .bind(&upstream.id)
+        .bind(&upstream.namespace)
         .bind(&upstream.name)
         .bind(&targets_json)
         .bind(algo_str)
@@ -1418,6 +1454,7 @@ impl DatabaseStore {
     /// completely disjoint. Returns `true` if no conflict is found.
     pub async fn check_listen_path_unique(
         &self,
+        namespace: &str,
         listen_path: &str,
         hosts: &[String],
         exclude_id: Option<&str>,
@@ -1425,17 +1462,21 @@ impl DatabaseStore {
         let start = Instant::now();
         let rows: Vec<AnyRow> = if let Some(eid) = exclude_id {
             sqlx::query(&self.q("SELECT id, hosts FROM proxies \
-                 WHERE listen_path = ? \
+                 WHERE namespace = ? \
+                   AND listen_path = ? \
                    AND backend_protocol NOT IN ('tcp', 'tcp_tls', 'udp', 'dtls') \
                    AND id != ?"))
+            .bind(namespace)
             .bind(listen_path)
             .bind(eid)
             .fetch_all(&self.pool())
             .await?
         } else {
             sqlx::query(&self.q("SELECT id, hosts FROM proxies \
-                 WHERE listen_path = ? \
+                 WHERE namespace = ? \
+                   AND listen_path = ? \
                    AND backend_protocol NOT IN ('tcp', 'tcp_tls', 'udp', 'dtls')"))
+            .bind(namespace)
             .bind(listen_path)
             .fetch_all(&self.pool())
             .await?
@@ -1474,18 +1515,23 @@ impl DatabaseStore {
     /// Returns `true` if the name is unique (no conflicts found).
     pub async fn check_proxy_name_unique(
         &self,
+        namespace: &str,
         name: &str,
         exclude_id: Option<&str>,
     ) -> Result<bool, anyhow::Error> {
         let start = Instant::now();
         let rows: Vec<AnyRow> = if let Some(eid) = exclude_id {
-            sqlx::query(&self.q("SELECT id FROM proxies WHERE name = ? AND id != ?"))
-                .bind(name)
-                .bind(eid)
-                .fetch_all(&self.pool())
-                .await?
+            sqlx::query(
+                &self.q("SELECT id FROM proxies WHERE namespace = ? AND name = ? AND id != ?"),
+            )
+            .bind(namespace)
+            .bind(name)
+            .bind(eid)
+            .fetch_all(&self.pool())
+            .await?
         } else {
-            sqlx::query(&self.q("SELECT id FROM proxies WHERE name = ?"))
+            sqlx::query(&self.q("SELECT id FROM proxies WHERE namespace = ? AND name = ?"))
+                .bind(namespace)
                 .bind(name)
                 .fetch_all(&self.pool())
                 .await?
@@ -1498,18 +1544,23 @@ impl DatabaseStore {
     /// Returns `true` if the name is unique (no conflicts found).
     pub async fn check_upstream_name_unique(
         &self,
+        namespace: &str,
         name: &str,
         exclude_id: Option<&str>,
     ) -> Result<bool, anyhow::Error> {
         let start = Instant::now();
         let rows: Vec<AnyRow> = if let Some(eid) = exclude_id {
-            sqlx::query(&self.q("SELECT id FROM upstreams WHERE name = ? AND id != ?"))
-                .bind(name)
-                .bind(eid)
-                .fetch_all(&self.pool())
-                .await?
+            sqlx::query(
+                &self.q("SELECT id FROM upstreams WHERE namespace = ? AND name = ? AND id != ?"),
+            )
+            .bind(namespace)
+            .bind(name)
+            .bind(eid)
+            .fetch_all(&self.pool())
+            .await?
         } else {
-            sqlx::query(&self.q("SELECT id FROM upstreams WHERE name = ?"))
+            sqlx::query(&self.q("SELECT id FROM upstreams WHERE namespace = ? AND name = ?"))
+                .bind(namespace)
                 .bind(name)
                 .fetch_all(&self.pool())
                 .await?
@@ -1522,6 +1573,7 @@ impl DatabaseStore {
     /// with another consumer's username/custom_id namespace.
     pub async fn check_consumer_identity_unique(
         &self,
+        namespace: &str,
         username: &str,
         custom_id: Option<&str>,
         exclude_id: Option<&str>,
@@ -1530,13 +1582,13 @@ impl DatabaseStore {
         let (sql, binds): (String, Vec<&str>) = match custom_id {
             Some(custom_id) => (
                 self.q("SELECT id, username, custom_id FROM consumers \
-                     WHERE (username = ? OR custom_id = ? OR username = ? OR custom_id = ?)"),
-                vec![username, custom_id, custom_id, username],
+                     WHERE namespace = ? AND (username = ? OR custom_id = ? OR username = ? OR custom_id = ?)"),
+                vec![namespace, username, custom_id, custom_id, username],
             ),
             None => (
                 self.q("SELECT id, username, custom_id FROM consumers \
-                     WHERE (username = ? OR custom_id = ?)"),
-                vec![username, username],
+                     WHERE namespace = ? AND (username = ? OR custom_id = ?)"),
+                vec![namespace, username, username],
             ),
         };
 
@@ -1600,13 +1652,16 @@ impl DatabaseStore {
     /// this loads all consumers and checks in application code.
     pub async fn check_keyauth_key_unique(
         &self,
+        namespace: &str,
         api_key: &str,
         exclude_consumer_id: Option<&str>,
     ) -> Result<bool, anyhow::Error> {
         let start = Instant::now();
-        let rows: Vec<AnyRow> = sqlx::query("SELECT id, credentials FROM consumers")
-            .fetch_all(&self.pool())
-            .await?;
+        let rows: Vec<AnyRow> =
+            sqlx::query(&self.q("SELECT id, credentials FROM consumers WHERE namespace = ?"))
+                .bind(namespace)
+                .fetch_all(&self.pool())
+                .await?;
 
         for row in &rows {
             let id: String = row.try_get("id")?;
@@ -1656,13 +1711,16 @@ impl DatabaseStore {
     /// Returns `true` if the identity is unique (safe to insert/update).
     pub async fn check_mtls_identity_unique(
         &self,
+        namespace: &str,
         mtls_identity: &str,
         exclude_consumer_id: Option<&str>,
     ) -> Result<bool, anyhow::Error> {
         let start = Instant::now();
-        let rows: Vec<AnyRow> = sqlx::query("SELECT id, credentials FROM consumers")
-            .fetch_all(&self.pool())
-            .await?;
+        let rows: Vec<AnyRow> =
+            sqlx::query(&self.q("SELECT id, credentials FROM consumers WHERE namespace = ?"))
+                .bind(namespace)
+                .fetch_all(&self.pool())
+                .await?;
 
         for row in &rows {
             let id: String = row.try_get("id")?;
@@ -1707,18 +1765,25 @@ impl DatabaseStore {
     /// Returns `true` if the port is unique (no conflicts found).
     pub async fn check_listen_port_unique(
         &self,
+        namespace: &str,
         port: u16,
         exclude_id: Option<&str>,
     ) -> Result<bool, anyhow::Error> {
         let start = Instant::now();
         let rows: Vec<AnyRow> = if let Some(eid) = exclude_id {
-            sqlx::query(&self.q("SELECT id FROM proxies WHERE listen_port = ? AND id != ?"))
-                .bind(port as i32)
-                .bind(eid)
-                .fetch_all(&self.pool())
-                .await?
+            sqlx::query(
+                &self.q(
+                    "SELECT id FROM proxies WHERE namespace = ? AND listen_port = ? AND id != ?",
+                ),
+            )
+            .bind(namespace)
+            .bind(port as i32)
+            .bind(eid)
+            .fetch_all(&self.pool())
+            .await?
         } else {
-            sqlx::query(&self.q("SELECT id FROM proxies WHERE listen_port = ?"))
+            sqlx::query(&self.q("SELECT id FROM proxies WHERE namespace = ? AND listen_port = ?"))
+                .bind(namespace)
                 .bind(port as i32)
                 .fetch_all(&self.pool())
                 .await?
@@ -1807,6 +1872,7 @@ impl DatabaseStore {
     /// `WHERE updated_at > ?` queries plus 4 lightweight `SELECT id` queries.
     pub async fn load_incremental_config(
         &self,
+        namespace: &str,
         since: DateTime<Utc>,
         known_proxy_ids: &HashSet<String>,
         known_consumer_ids: &HashSet<String>,
@@ -1821,16 +1887,18 @@ impl DatabaseStore {
         let since_str = since_safe.to_rfc3339();
 
         // Fetch changed rows (indexed scan via updated_at index)
-        let changed_proxies = self.load_proxies_since(&since_str).await?;
-        let changed_consumers = self.load_consumers_since(&since_str).await?;
-        let changed_plugin_configs = self.load_plugin_configs_since(&since_str).await?;
-        let changed_upstreams = self.load_upstreams_since(&since_str).await?;
+        let changed_proxies = self.load_proxies_since(namespace, &since_str).await?;
+        let changed_consumers = self.load_consumers_since(namespace, &since_str).await?;
+        let changed_plugin_configs = self
+            .load_plugin_configs_since(namespace, &since_str)
+            .await?;
+        let changed_upstreams = self.load_upstreams_since(namespace, &since_str).await?;
 
         // Fetch current IDs (lightweight — one TEXT column per table)
-        let current_proxy_ids = self.load_table_ids("proxies").await?;
-        let current_consumer_ids = self.load_table_ids("consumers").await?;
-        let current_plugin_config_ids = self.load_table_ids("plugin_configs").await?;
-        let current_upstream_ids = self.load_table_ids("upstreams").await?;
+        let current_proxy_ids = self.load_table_ids(namespace, "proxies").await?;
+        let current_consumer_ids = self.load_table_ids(namespace, "consumers").await?;
+        let current_plugin_config_ids = self.load_table_ids(namespace, "plugin_configs").await?;
+        let current_upstream_ids = self.load_table_ids(namespace, "upstreams").await?;
 
         // Detect deletions: IDs we knew about that no longer exist
         let removed_proxy_ids = diff_removed(known_proxy_ids, &current_proxy_ids);
@@ -1872,12 +1940,18 @@ impl DatabaseStore {
     }
 
     /// Load proxies modified since `since_str` (RFC 3339 timestamp).
-    async fn load_proxies_since(&self, since_str: &str) -> Result<Vec<Proxy>, anyhow::Error> {
+    async fn load_proxies_since(
+        &self,
+        namespace: &str,
+        since_str: &str,
+    ) -> Result<Vec<Proxy>, anyhow::Error> {
         let start = Instant::now();
-        let rows: Vec<AnyRow> = sqlx::query(&self.q("SELECT * FROM proxies WHERE updated_at > ?"))
-            .bind(since_str)
-            .fetch_all(&self.rpool())
-            .await?;
+        let rows: Vec<AnyRow> =
+            sqlx::query(&self.q("SELECT * FROM proxies WHERE namespace = ? AND updated_at > ?"))
+                .bind(namespace)
+                .bind(since_str)
+                .fetch_all(&self.rpool())
+                .await?;
 
         if rows.is_empty() {
             return Ok(Vec::new());
@@ -1970,10 +2044,15 @@ impl DatabaseStore {
     }
 
     /// Load consumers modified since `since_str`.
-    async fn load_consumers_since(&self, since_str: &str) -> Result<Vec<Consumer>, anyhow::Error> {
+    async fn load_consumers_since(
+        &self,
+        namespace: &str,
+        since_str: &str,
+    ) -> Result<Vec<Consumer>, anyhow::Error> {
         let start = Instant::now();
         let rows: Vec<AnyRow> =
-            sqlx::query(&self.q("SELECT * FROM consumers WHERE updated_at > ?"))
+            sqlx::query(&self.q("SELECT * FROM consumers WHERE namespace = ? AND updated_at > ?"))
+                .bind(namespace)
                 .bind(since_str)
                 .fetch_all(&self.rpool())
                 .await?;
@@ -1989,14 +2068,17 @@ impl DatabaseStore {
     /// Load plugin configs modified since `since_str`.
     async fn load_plugin_configs_since(
         &self,
+        namespace: &str,
         since_str: &str,
     ) -> Result<Vec<PluginConfig>, anyhow::Error> {
         let start = Instant::now();
-        let rows: Vec<AnyRow> =
-            sqlx::query(&self.q("SELECT * FROM plugin_configs WHERE updated_at > ?"))
-                .bind(since_str)
-                .fetch_all(&self.rpool())
-                .await?;
+        let rows: Vec<AnyRow> = sqlx::query(
+            &self.q("SELECT * FROM plugin_configs WHERE namespace = ? AND updated_at > ?"),
+        )
+        .bind(namespace)
+        .bind(since_str)
+        .fetch_all(&self.rpool())
+        .await?;
 
         let mut configs = Vec::with_capacity(rows.len());
         for row in rows {
@@ -2007,10 +2089,15 @@ impl DatabaseStore {
     }
 
     /// Load upstreams modified since `since_str`.
-    async fn load_upstreams_since(&self, since_str: &str) -> Result<Vec<Upstream>, anyhow::Error> {
+    async fn load_upstreams_since(
+        &self,
+        namespace: &str,
+        since_str: &str,
+    ) -> Result<Vec<Upstream>, anyhow::Error> {
         let start = Instant::now();
         let rows: Vec<AnyRow> =
-            sqlx::query(&self.q("SELECT * FROM upstreams WHERE updated_at > ?"))
+            sqlx::query(&self.q("SELECT * FROM upstreams WHERE namespace = ? AND updated_at > ?"))
+                .bind(namespace)
                 .bind(since_str)
                 .fetch_all(&self.rpool())
                 .await?;
@@ -2024,11 +2111,18 @@ impl DatabaseStore {
     }
 
     /// Load all IDs from a table (lightweight — one TEXT column, no deserialization).
-    async fn load_table_ids(&self, table: &str) -> Result<HashSet<String>, anyhow::Error> {
+    async fn load_table_ids(
+        &self,
+        namespace: &str,
+        table: &str,
+    ) -> Result<HashSet<String>, anyhow::Error> {
         let start = Instant::now();
         // Table name is a compile-time constant from the caller, not user input.
-        let sql = format!("SELECT id FROM {}", table);
-        let rows: Vec<AnyRow> = sqlx::query(&sql).fetch_all(&self.rpool()).await?;
+        let sql = self.q(&format!("SELECT id FROM {} WHERE namespace = ?", table));
+        let rows: Vec<AnyRow> = sqlx::query(&sql)
+            .bind(namespace)
+            .fetch_all(&self.rpool())
+            .await?;
 
         let mut ids = HashSet::with_capacity(rows.len());
         for row in rows {
@@ -2147,7 +2241,7 @@ impl DatabaseStore {
         attach_plugins: bool,
     ) -> Result<usize, anyhow::Error> {
         let mut tx = self.pool().begin().await?;
-        let insert_sql = self.q("INSERT INTO proxies (id, name, hosts, listen_path, backend_protocol, backend_host, backend_port, backend_path, strip_listen_path, preserve_host_header, backend_connect_timeout_ms, backend_read_timeout_ms, backend_write_timeout_ms, backend_tls_client_cert_path, backend_tls_client_key_path, backend_tls_verify_server_cert, backend_tls_server_ca_cert_path, dns_override, dns_cache_ttl_seconds, auth_mode, upstream_id, circuit_breaker, retry, response_body_mode, pool_idle_timeout_seconds, pool_enable_http_keep_alive, pool_enable_http2, pool_tcp_keepalive_seconds, pool_http2_keep_alive_interval_seconds, pool_http2_keep_alive_timeout_seconds, pool_http2_initial_stream_window_size, pool_http2_initial_connection_window_size, pool_http2_adaptive_window, pool_http2_max_frame_size, pool_http2_max_concurrent_streams, pool_http3_connections_per_backend, listen_port, frontend_tls, passthrough, udp_idle_timeout_seconds, tcp_idle_timeout_seconds, allowed_methods, allowed_ws_origins, udp_max_response_amplification_factor, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+        let insert_sql = self.q("INSERT INTO proxies (id, namespace, name, hosts, listen_path, backend_protocol, backend_host, backend_port, backend_path, strip_listen_path, preserve_host_header, backend_connect_timeout_ms, backend_read_timeout_ms, backend_write_timeout_ms, backend_tls_client_cert_path, backend_tls_client_key_path, backend_tls_verify_server_cert, backend_tls_server_ca_cert_path, dns_override, dns_cache_ttl_seconds, auth_mode, upstream_id, circuit_breaker, retry, response_body_mode, pool_idle_timeout_seconds, pool_enable_http_keep_alive, pool_enable_http2, pool_tcp_keepalive_seconds, pool_http2_keep_alive_interval_seconds, pool_http2_keep_alive_timeout_seconds, pool_http2_initial_stream_window_size, pool_http2_initial_connection_window_size, pool_http2_adaptive_window, pool_http2_max_frame_size, pool_http2_max_concurrent_streams, pool_http3_connections_per_backend, listen_port, frontend_tls, passthrough, udp_idle_timeout_seconds, tcp_idle_timeout_seconds, allowed_methods, allowed_ws_origins, udp_max_response_amplification_factor, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
         let assoc_sql =
             self.q("INSERT INTO proxy_plugins (proxy_id, plugin_config_id) VALUES (?, ?)");
 
@@ -2170,6 +2264,7 @@ impl DatabaseStore {
 
             sqlx::query(&insert_sql)
                 .bind(&proxy.id)
+                .bind(&proxy.namespace)
                 .bind(&proxy.name)
                 .bind(&hosts_json)
                 .bind(&proxy.listen_path)
@@ -2329,13 +2424,14 @@ impl DatabaseStore {
         consumers: &[Consumer],
     ) -> Result<usize, anyhow::Error> {
         let mut tx = self.pool().begin().await?;
-        let sql = self.q("INSERT INTO consumers (id, username, custom_id, credentials, acl_groups, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)");
+        let sql = self.q("INSERT INTO consumers (id, namespace, username, custom_id, credentials, acl_groups, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
 
         for consumer in consumers {
             let creds_json = serde_json::to_string(&consumer.credentials)?;
             let acl_groups_json = serde_json::to_string(&consumer.acl_groups)?;
             sqlx::query(&sql)
                 .bind(&consumer.id)
+                .bind(&consumer.namespace)
                 .bind(&consumer.username)
                 .bind(&consumer.custom_id)
                 .bind(&creds_json)
@@ -2375,7 +2471,7 @@ impl DatabaseStore {
         configs: &[PluginConfig],
     ) -> Result<usize, anyhow::Error> {
         let mut tx = self.pool().begin().await?;
-        let sql = self.q("INSERT INTO plugin_configs (id, plugin_name, config, scope, proxy_id, enabled, priority_override, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)");
+        let sql = self.q("INSERT INTO plugin_configs (id, namespace, plugin_name, config, scope, proxy_id, enabled, priority_override, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
 
         for pc in configs {
             let config_json = serde_json::to_string(&pc.config)?;
@@ -2385,6 +2481,7 @@ impl DatabaseStore {
             };
             sqlx::query(&sql)
                 .bind(&pc.id)
+                .bind(&pc.namespace)
                 .bind(&pc.plugin_name)
                 .bind(&config_json)
                 .bind(scope_str)
@@ -2426,7 +2523,7 @@ impl DatabaseStore {
         upstreams: &[Upstream],
     ) -> Result<usize, anyhow::Error> {
         let mut tx = self.pool().begin().await?;
-        let sql = self.q("INSERT INTO upstreams (id, name, targets, algorithm, hash_on, hash_on_cookie_config, health_checks, service_discovery, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+        let sql = self.q("INSERT INTO upstreams (id, namespace, name, targets, algorithm, hash_on, hash_on_cookie_config, health_checks, service_discovery, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
 
         for upstream in upstreams {
             let targets_json = serde_json::to_string(&upstream.targets)?;
@@ -2449,6 +2546,7 @@ impl DatabaseStore {
                 .transpose()?;
             sqlx::query(&sql)
                 .bind(&upstream.id)
+                .bind(&upstream.namespace)
                 .bind(&upstream.name)
                 .bind(&targets_json)
                 .bind(algo_str)
@@ -2475,21 +2573,28 @@ impl DatabaseStore {
     /// 3. proxies (may reference upstreams)
     /// 4. consumers
     /// 5. upstreams
-    pub async fn delete_all_resources(&self) -> Result<(), anyhow::Error> {
+    pub async fn delete_all_resources(&self, namespace: &str) -> Result<(), anyhow::Error> {
         let start = Instant::now();
         let mut tx = self.pool().begin().await?;
 
-        sqlx::query("DELETE FROM proxy_plugins")
+        sqlx::query(&self.q("DELETE FROM proxy_plugins WHERE proxy_id IN (SELECT id FROM proxies WHERE namespace = ?)"))
+            .bind(namespace)
             .execute(&mut *tx)
             .await?;
-        sqlx::query("DELETE FROM plugin_configs")
+        sqlx::query(&self.q("DELETE FROM plugin_configs WHERE namespace = ?"))
+            .bind(namespace)
             .execute(&mut *tx)
             .await?;
-        sqlx::query("DELETE FROM proxies").execute(&mut *tx).await?;
-        sqlx::query("DELETE FROM consumers")
+        sqlx::query(&self.q("DELETE FROM proxies WHERE namespace = ?"))
+            .bind(namespace)
             .execute(&mut *tx)
             .await?;
-        sqlx::query("DELETE FROM upstreams")
+        sqlx::query(&self.q("DELETE FROM consumers WHERE namespace = ?"))
+            .bind(namespace)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(&self.q("DELETE FROM upstreams WHERE namespace = ?"))
+            .bind(namespace)
             .execute(&mut *tx)
             .await?;
 
@@ -2846,6 +2951,25 @@ impl DatabaseStore {
     pub fn has_read_replica_pool(&self) -> bool {
         self.read_replica_pool.is_some()
     }
+
+    /// Return all distinct namespaces across all resource tables.
+    pub async fn list_namespaces(&self) -> Result<Vec<String>, anyhow::Error> {
+        let start = Instant::now();
+        let sql = "SELECT DISTINCT namespace FROM proxies \
+                   UNION SELECT DISTINCT namespace FROM consumers \
+                   UNION SELECT DISTINCT namespace FROM plugin_configs \
+                   UNION SELECT DISTINCT namespace FROM upstreams \
+                   ORDER BY 1";
+        let rows: Vec<AnyRow> = sqlx::query(sql).fetch_all(&self.rpool()).await?;
+        let mut namespaces = Vec::with_capacity(rows.len());
+        for row in rows {
+            if let Ok(ns) = row.try_get::<String, _>("namespace") {
+                namespaces.push(ns);
+            }
+        }
+        self.check_slow_query("list_namespaces", start);
+        Ok(namespaces)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2879,12 +3003,13 @@ impl DatabaseBackend for DatabaseStore {
         self.backend_allow_ips = policy;
     }
 
-    async fn load_full_config(&self) -> Result<GatewayConfig, anyhow::Error> {
-        DatabaseStore::load_full_config(self).await
+    async fn load_full_config(&self, namespace: &str) -> Result<GatewayConfig, anyhow::Error> {
+        DatabaseStore::load_full_config(self, namespace).await
     }
 
     async fn load_incremental_config(
         &self,
+        namespace: &str,
         since: DateTime<Utc>,
         known_proxy_ids: &HashSet<String>,
         known_consumer_ids: &HashSet<String>,
@@ -2893,6 +3018,7 @@ impl DatabaseBackend for DatabaseStore {
     ) -> Result<IncrementalResult, anyhow::Error> {
         DatabaseStore::load_incremental_config(
             self,
+            namespace,
             since,
             known_proxy_ids,
             known_consumer_ids,
@@ -2924,10 +3050,11 @@ impl DatabaseBackend for DatabaseStore {
 
     async fn list_proxies_paginated(
         &self,
+        namespace: &str,
         limit: i64,
         offset: i64,
     ) -> Result<PaginatedResult<Proxy>, anyhow::Error> {
-        DatabaseStore::list_proxies_paginated(self, limit, offset).await
+        DatabaseStore::list_proxies_paginated(self, namespace, limit, offset).await
     }
 
     async fn create_consumer(&self, consumer: &Consumer) -> Result<(), anyhow::Error> {
@@ -2948,10 +3075,11 @@ impl DatabaseBackend for DatabaseStore {
 
     async fn list_consumers_paginated(
         &self,
+        namespace: &str,
         limit: i64,
         offset: i64,
     ) -> Result<PaginatedResult<Consumer>, anyhow::Error> {
-        DatabaseStore::list_consumers_paginated(self, limit, offset).await
+        DatabaseStore::list_consumers_paginated(self, namespace, limit, offset).await
     }
 
     async fn create_plugin_config(&self, pc: &PluginConfig) -> Result<(), anyhow::Error> {
@@ -2972,10 +3100,11 @@ impl DatabaseBackend for DatabaseStore {
 
     async fn list_plugin_configs_paginated(
         &self,
+        namespace: &str,
         limit: i64,
         offset: i64,
     ) -> Result<PaginatedResult<PluginConfig>, anyhow::Error> {
-        DatabaseStore::list_plugin_configs_paginated(self, limit, offset).await
+        DatabaseStore::list_plugin_configs_paginated(self, namespace, limit, offset).await
     }
 
     async fn create_upstream(&self, upstream: &Upstream) -> Result<(), anyhow::Error> {
@@ -3000,45 +3129,58 @@ impl DatabaseBackend for DatabaseStore {
 
     async fn list_upstreams_paginated(
         &self,
+        namespace: &str,
         limit: i64,
         offset: i64,
     ) -> Result<PaginatedResult<Upstream>, anyhow::Error> {
-        DatabaseStore::list_upstreams_paginated(self, limit, offset).await
+        DatabaseStore::list_upstreams_paginated(self, namespace, limit, offset).await
     }
 
     async fn check_listen_path_unique(
         &self,
+        namespace: &str,
         listen_path: &str,
         hosts: &[String],
         exclude_proxy_id: Option<&str>,
     ) -> Result<bool, anyhow::Error> {
-        DatabaseStore::check_listen_path_unique(self, listen_path, hosts, exclude_proxy_id).await
+        DatabaseStore::check_listen_path_unique(
+            self,
+            namespace,
+            listen_path,
+            hosts,
+            exclude_proxy_id,
+        )
+        .await
     }
 
     async fn check_proxy_name_unique(
         &self,
+        namespace: &str,
         name: &str,
         exclude_proxy_id: Option<&str>,
     ) -> Result<bool, anyhow::Error> {
-        DatabaseStore::check_proxy_name_unique(self, name, exclude_proxy_id).await
+        DatabaseStore::check_proxy_name_unique(self, namespace, name, exclude_proxy_id).await
     }
 
     async fn check_upstream_name_unique(
         &self,
+        namespace: &str,
         name: &str,
         exclude_upstream_id: Option<&str>,
     ) -> Result<bool, anyhow::Error> {
-        DatabaseStore::check_upstream_name_unique(self, name, exclude_upstream_id).await
+        DatabaseStore::check_upstream_name_unique(self, namespace, name, exclude_upstream_id).await
     }
 
     async fn check_consumer_identity_unique(
         &self,
+        namespace: &str,
         username: &str,
         custom_id: Option<&str>,
         exclude_consumer_id: Option<&str>,
     ) -> Result<Option<String>, anyhow::Error> {
         DatabaseStore::check_consumer_identity_unique(
             self,
+            namespace,
             username,
             custom_id,
             exclude_consumer_id,
@@ -3048,26 +3190,30 @@ impl DatabaseBackend for DatabaseStore {
 
     async fn check_keyauth_key_unique(
         &self,
+        namespace: &str,
         key: &str,
         exclude_consumer_id: Option<&str>,
     ) -> Result<bool, anyhow::Error> {
-        DatabaseStore::check_keyauth_key_unique(self, key, exclude_consumer_id).await
+        DatabaseStore::check_keyauth_key_unique(self, namespace, key, exclude_consumer_id).await
     }
 
     async fn check_mtls_identity_unique(
         &self,
+        namespace: &str,
         identity: &str,
         exclude_consumer_id: Option<&str>,
     ) -> Result<bool, anyhow::Error> {
-        DatabaseStore::check_mtls_identity_unique(self, identity, exclude_consumer_id).await
+        DatabaseStore::check_mtls_identity_unique(self, namespace, identity, exclude_consumer_id)
+            .await
     }
 
     async fn check_listen_port_unique(
         &self,
+        namespace: &str,
         port: u16,
         exclude_proxy_id: Option<&str>,
     ) -> Result<bool, anyhow::Error> {
-        DatabaseStore::check_listen_port_unique(self, port, exclude_proxy_id).await
+        DatabaseStore::check_listen_port_unique(self, namespace, port, exclude_proxy_id).await
     }
 
     async fn check_upstream_exists(&self, upstream_id: &str) -> Result<bool, anyhow::Error> {
@@ -3112,8 +3258,8 @@ impl DatabaseBackend for DatabaseStore {
         DatabaseStore::batch_create_upstreams(self, upstreams).await
     }
 
-    async fn delete_all_resources(&self) -> Result<(), anyhow::Error> {
-        DatabaseStore::delete_all_resources(self).await
+    async fn delete_all_resources(&self, namespace: &str) -> Result<(), anyhow::Error> {
+        DatabaseStore::delete_all_resources(self, namespace).await
     }
 
     async fn reconnect(
@@ -3182,6 +3328,10 @@ impl DatabaseBackend for DatabaseStore {
     async fn run_migrations(&self) -> Result<(), anyhow::Error> {
         DatabaseStore::run_migrations(self).await
     }
+
+    async fn list_namespaces(&self) -> Result<Vec<String>, anyhow::Error> {
+        DatabaseStore::list_namespaces(self).await
+    }
 }
 
 /// IDs in `known` that are not in `current` (i.e., deleted resources).
@@ -3249,6 +3399,9 @@ fn row_to_proxy(
 
     Ok(Proxy {
         id,
+        namespace: row
+            .try_get::<String, _>("namespace")
+            .unwrap_or_else(|_| crate::config::types::default_namespace()),
         name: row.try_get("name").ok(),
         hosts,
         listen_path: row.try_get("listen_path")?,
@@ -3417,6 +3570,9 @@ fn row_to_consumer(row: &AnyRow) -> Result<Consumer, anyhow::Error> {
 
     Ok(Consumer {
         id: row.try_get("id")?,
+        namespace: row
+            .try_get::<String, _>("namespace")
+            .unwrap_or_else(|_| crate::config::types::default_namespace()),
         username: row.try_get("username")?,
         custom_id: row.try_get("custom_id").ok(),
         credentials,
@@ -3446,6 +3602,9 @@ fn row_to_plugin_config(row: &AnyRow) -> Result<PluginConfig, anyhow::Error> {
 
     Ok(PluginConfig {
         id: row.try_get("id")?,
+        namespace: row
+            .try_get::<String, _>("namespace")
+            .unwrap_or_else(|_| crate::config::types::default_namespace()),
         plugin_name: row.try_get("plugin_name")?,
         config: config_val,
         scope: if scope_str == "proxy" {
@@ -3523,6 +3682,9 @@ fn row_to_upstream(row: &AnyRow) -> Result<Upstream, anyhow::Error> {
 
     Ok(Upstream {
         id: row.try_get("id")?,
+        namespace: row
+            .try_get::<String, _>("namespace")
+            .unwrap_or_else(|_| crate::config::types::default_namespace()),
         name: row.try_get("name").ok(),
         targets,
         algorithm,

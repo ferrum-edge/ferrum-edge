@@ -22,6 +22,7 @@ use std::time::Duration;
 fn create_stream_proxy(id: &str, protocol: BackendProtocol, port: u16) -> Proxy {
     Proxy {
         id: id.to_string(),
+        namespace: ferrum_edge::config::types::default_namespace(),
         name: None,
         hosts: vec![],
         listen_path: format!("/{}", id),
@@ -114,6 +115,7 @@ fn empty_config() -> GatewayConfig {
         upstreams: vec![],
         plugin_configs: vec![],
         loaded_at: chrono::Utc::now(),
+        known_namespaces: Vec::new(),
     }
 }
 

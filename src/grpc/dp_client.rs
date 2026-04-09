@@ -92,6 +92,7 @@ pub async fn start_dp_client_with_shutdown(
     proxy_state: ProxyState,
     shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
     tls_config: Option<DpGrpcTlsConfig>,
+    namespace: String,
 ) {
     start_dp_client_with_shutdown_and_startup_ready(
         cp_url,
@@ -100,6 +101,7 @@ pub async fn start_dp_client_with_shutdown(
         shutdown_rx,
         tls_config,
         None,
+        namespace,
     )
     .await;
 }
@@ -112,6 +114,7 @@ pub async fn start_dp_client_with_shutdown_and_startup_ready(
     shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
     tls_config: Option<DpGrpcTlsConfig>,
     startup_ready: Option<Arc<AtomicBool>>,
+    namespace: String,
 ) {
     let node_id = uuid::Uuid::new_v4().to_string();
     info!("DP client starting, connecting to CP at {}", cp_url);
@@ -137,6 +140,7 @@ pub async fn start_dp_client_with_shutdown_and_startup_ready(
             &proxy_state,
             tls_config.as_ref(),
             startup_ready.clone(),
+            &namespace,
         )
         .await
         {
@@ -200,6 +204,7 @@ pub async fn connect_and_subscribe(
     node_id: &str,
     proxy_state: &ProxyState,
     tls_config: Option<&DpGrpcTlsConfig>,
+    namespace: &str,
 ) -> Result<(), anyhow::Error> {
     connect_and_subscribe_with_startup_ready(
         cp_url,
@@ -208,6 +213,7 @@ pub async fn connect_and_subscribe(
         proxy_state,
         tls_config,
         None,
+        namespace,
     )
     .await
 }
@@ -220,6 +226,7 @@ pub async fn connect_and_subscribe_with_startup_ready(
     proxy_state: &ProxyState,
     tls_config: Option<&DpGrpcTlsConfig>,
     startup_ready: Option<Arc<AtomicBool>>,
+    namespace: &str,
 ) -> Result<(), anyhow::Error> {
     let mut endpoint =
         Channel::from_shared(cp_url.to_string())?.connect_timeout(Duration::from_secs(10));
@@ -271,6 +278,7 @@ pub async fn connect_and_subscribe_with_startup_ready(
     let request = tonic::Request::new(SubscribeRequest {
         node_id: node_id.to_string(),
         ferrum_version: FERRUM_VERSION.to_string(),
+        namespace: namespace.to_string(),
     });
 
     let mut stream = client.subscribe(request).await?.into_inner();

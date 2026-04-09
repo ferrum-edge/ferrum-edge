@@ -45,7 +45,8 @@ impl V001InitialSchema {
             r#"
             CREATE TABLE IF NOT EXISTS upstreams (
                 id VARCHAR(255) PRIMARY KEY,
-                name VARCHAR(255) UNIQUE,
+                namespace VARCHAR(255) NOT NULL DEFAULT 'ferrum',
+                name VARCHAR(255),
                 targets TEXT NOT NULL,
                 algorithm VARCHAR(50) NOT NULL DEFAULT 'round_robin',
                 hash_on TEXT,
@@ -60,7 +61,8 @@ impl V001InitialSchema {
             r#"
             CREATE TABLE IF NOT EXISTS upstreams (
                 id TEXT PRIMARY KEY,
-                name TEXT UNIQUE,
+                namespace TEXT NOT NULL DEFAULT 'ferrum',
+                name TEXT,
                 targets TEXT NOT NULL DEFAULT '[]',
                 algorithm TEXT NOT NULL DEFAULT 'round_robin',
                 hash_on TEXT,
@@ -77,8 +79,9 @@ impl V001InitialSchema {
             r#"
             CREATE TABLE IF NOT EXISTS consumers (
                 id VARCHAR(255) PRIMARY KEY,
-                username VARCHAR(255) NOT NULL UNIQUE,
-                custom_id VARCHAR(255) UNIQUE,
+                namespace VARCHAR(255) NOT NULL DEFAULT 'ferrum',
+                username VARCHAR(255) NOT NULL,
+                custom_id VARCHAR(255),
                 credentials TEXT NOT NULL,
                 acl_groups VARCHAR(8192) NOT NULL DEFAULT '[]',
                 created_at VARCHAR(50) NOT NULL,
@@ -89,8 +92,9 @@ impl V001InitialSchema {
             r#"
             CREATE TABLE IF NOT EXISTS consumers (
                 id TEXT PRIMARY KEY,
-                username TEXT NOT NULL UNIQUE,
-                custom_id TEXT UNIQUE,
+                namespace TEXT NOT NULL DEFAULT 'ferrum',
+                username TEXT NOT NULL,
+                custom_id TEXT,
                 credentials TEXT NOT NULL DEFAULT '{}',
                 acl_groups TEXT NOT NULL DEFAULT '[]',
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -104,7 +108,8 @@ impl V001InitialSchema {
             r#"
             CREATE TABLE IF NOT EXISTS proxies (
                 id VARCHAR(255) PRIMARY KEY,
-                name VARCHAR(255) UNIQUE,
+                namespace VARCHAR(255) NOT NULL DEFAULT 'ferrum',
+                name VARCHAR(255),
                 hosts TEXT NOT NULL,
                 listen_path VARCHAR(500) NOT NULL,
                 backend_protocol VARCHAR(20) NOT NULL DEFAULT 'http',
@@ -157,7 +162,8 @@ impl V001InitialSchema {
             r#"
             CREATE TABLE IF NOT EXISTS proxies (
                 id TEXT PRIMARY KEY,
-                name TEXT UNIQUE,
+                namespace TEXT NOT NULL DEFAULT 'ferrum',
+                name TEXT,
                 hosts TEXT NOT NULL DEFAULT '[]',
                 listen_path TEXT NOT NULL,
                 backend_protocol TEXT NOT NULL DEFAULT 'http',
@@ -212,6 +218,7 @@ impl V001InitialSchema {
             r#"
             CREATE TABLE IF NOT EXISTS plugin_configs (
                 id VARCHAR(255) PRIMARY KEY,
+                namespace VARCHAR(255) NOT NULL DEFAULT 'ferrum',
                 plugin_name VARCHAR(255) NOT NULL,
                 config TEXT NOT NULL,
                 scope VARCHAR(50) NOT NULL DEFAULT 'global',
@@ -227,6 +234,7 @@ impl V001InitialSchema {
             r#"
             CREATE TABLE IF NOT EXISTS plugin_configs (
                 id TEXT PRIMARY KEY,
+                namespace TEXT NOT NULL DEFAULT 'ferrum',
                 plugin_name TEXT NOT NULL,
                 config TEXT NOT NULL DEFAULT '{}',
                 scope TEXT NOT NULL DEFAULT 'global',
@@ -278,6 +286,16 @@ impl V001InitialSchema {
             "CREATE INDEX IF NOT EXISTS idx_consumers_updated_at ON consumers (updated_at)",
             "CREATE INDEX IF NOT EXISTS idx_plugin_configs_updated_at ON plugin_configs (updated_at)",
             "CREATE INDEX IF NOT EXISTS idx_upstreams_updated_at ON upstreams (updated_at)",
+            // Indexes on namespace columns for namespace-scoped queries
+            "CREATE INDEX IF NOT EXISTS idx_proxies_namespace ON proxies (namespace)",
+            "CREATE INDEX IF NOT EXISTS idx_consumers_namespace ON consumers (namespace)",
+            "CREATE INDEX IF NOT EXISTS idx_plugin_configs_namespace ON plugin_configs (namespace)",
+            "CREATE INDEX IF NOT EXISTS idx_upstreams_namespace ON upstreams (namespace)",
+            // Compound indexes for namespace-scoped incremental polling
+            "CREATE INDEX IF NOT EXISTS idx_proxies_ns_updated ON proxies (namespace, updated_at)",
+            "CREATE INDEX IF NOT EXISTS idx_consumers_ns_updated ON consumers (namespace, updated_at)",
+            "CREATE INDEX IF NOT EXISTS idx_plugin_configs_ns_updated ON plugin_configs (namespace, updated_at)",
+            "CREATE INDEX IF NOT EXISTS idx_upstreams_ns_updated ON upstreams (namespace, updated_at)",
         ];
 
         for idx_sql in indexes {
@@ -299,14 +317,16 @@ impl V001InitialSchema {
             }
         }
 
-        // Unique index on listen_port to prevent duplicate stream proxy ports.
+        // Unique index on (namespace, listen_port) to prevent duplicate stream proxy
+        // ports within the same namespace. Different namespaces run on different
+        // gateway instances so the same port can be safely reused across namespaces.
         // listen_port is NULL for HTTP proxies; only non-NULL values must be unique.
         // PostgreSQL/SQLite support partial indexes. MySQL allows multiple NULLs
-        // in UNIQUE indexes natively, so a plain unique index suffices.
+        // in UNIQUE indexes natively, so a plain composite unique index suffices.
         let unique_listen_port_sql = if is_mysql {
-            "CREATE UNIQUE INDEX idx_proxies_unique_listen_port ON proxies (listen_port)"
+            "CREATE UNIQUE INDEX idx_proxies_unique_listen_port ON proxies (namespace, listen_port)"
         } else {
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_proxies_unique_listen_port ON proxies (listen_port) WHERE listen_port IS NOT NULL"
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_proxies_unique_listen_port ON proxies (namespace, listen_port) WHERE listen_port IS NOT NULL"
         };
         if is_mysql {
             match sqlx::query(unique_listen_port_sql).execute(pool).await {
@@ -320,6 +340,42 @@ impl V001InitialSchema {
             }
         } else {
             sqlx::query(unique_listen_port_sql).execute(pool).await?;
+        }
+
+        // Composite unique indexes for namespace-scoped uniqueness.
+        // These replace the per-column UNIQUE constraints that were removed
+        // from name/username/custom_id when namespace was added.
+        // PostgreSQL/SQLite use partial indexes (WHERE col IS NOT NULL) for
+        // nullable columns. MySQL allows multiple NULLs in UNIQUE indexes
+        // natively, so a plain unique index suffices.
+        if is_mysql {
+            let mysql_unique_indexes = &[
+                "CREATE UNIQUE INDEX idx_proxies_namespace_name ON proxies (namespace, name)",
+                "CREATE UNIQUE INDEX idx_consumers_namespace_username ON consumers (namespace, username)",
+                "CREATE UNIQUE INDEX idx_consumers_namespace_custom_id ON consumers (namespace, custom_id)",
+                "CREATE UNIQUE INDEX idx_upstreams_namespace_name ON upstreams (namespace, name)",
+            ];
+            for idx_sql in mysql_unique_indexes {
+                match sqlx::query(idx_sql).execute(pool).await {
+                    Ok(_) => {}
+                    Err(e) => {
+                        let msg = e.to_string();
+                        if !msg.contains("1061") {
+                            return Err(e.into());
+                        }
+                    }
+                }
+            }
+        } else {
+            let unique_indexes = &[
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_proxies_namespace_name ON proxies (namespace, name) WHERE name IS NOT NULL",
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_consumers_namespace_username ON consumers (namespace, username)",
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_consumers_namespace_custom_id ON consumers (namespace, custom_id) WHERE custom_id IS NOT NULL",
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_upstreams_namespace_name ON upstreams (namespace, name) WHERE name IS NOT NULL",
+            ];
+            for idx_sql in unique_indexes {
+                sqlx::query(idx_sql).execute(pool).await?;
+            }
         }
 
         Ok(())

@@ -8,6 +8,7 @@ use ferrum_edge::config::types::{AuthMode, BackendProtocol, Proxy};
 fn create_test_proxy() -> Proxy {
     Proxy {
         id: "test".to_string(),
+        namespace: ferrum_edge::config::types::default_namespace(),
         name: None,
         hosts: vec![],
         listen_path: "/test".to_string(),

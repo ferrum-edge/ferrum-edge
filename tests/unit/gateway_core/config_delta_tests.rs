@@ -8,6 +8,7 @@ use std::collections::HashMap;
 fn make_proxy(id: &str, listen_path: &str, updated_at: DateTime<Utc>) -> Proxy {
     Proxy {
         id: id.to_string(),
+        namespace: default_namespace(),
         name: None,
         hosts: vec![],
         listen_path: listen_path.to_string(),
@@ -61,6 +62,7 @@ fn make_proxy(id: &str, listen_path: &str, updated_at: DateTime<Utc>) -> Proxy {
 fn make_upstream(id: &str, targets: Vec<UpstreamTarget>, updated_at: DateTime<Utc>) -> Upstream {
     Upstream {
         id: id.to_string(),
+        namespace: default_namespace(),
         name: None,
         targets,
         algorithm: LoadBalancerAlgorithm::default(),
@@ -92,6 +94,7 @@ fn make_plugin_config(
 ) -> PluginConfig {
     PluginConfig {
         id: id.to_string(),
+        namespace: default_namespace(),
         plugin_name: name.to_string(),
         config: serde_json::Value::Object(serde_json::Map::new()),
         scope,
@@ -106,6 +109,7 @@ fn make_plugin_config(
 fn make_consumer(id: &str, username: &str, updated_at: DateTime<Utc>) -> Consumer {
     Consumer {
         id: id.to_string(),
+        namespace: default_namespace(),
         username: username.to_string(),
         custom_id: None,
         credentials: HashMap::new(),
@@ -124,6 +128,7 @@ fn test_empty_delta_when_configs_identical() {
         plugin_configs: vec![],
         upstreams: vec![],
         loaded_at: Utc::now(),
+        known_namespaces: Vec::new(),
     };
     let delta = ConfigDelta::compute(&config, &config);
     assert!(delta.is_empty());

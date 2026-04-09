@@ -6,6 +6,7 @@ use ferrum_edge::router_cache::RouterCache;
 fn test_proxy() -> Proxy {
     Proxy {
         id: "test".into(),
+        namespace: ferrum_edge::config::types::default_namespace(),
         name: Some("Test Proxy".into()),
         hosts: vec![],
         listen_path: "/api/v1".into(),
@@ -161,11 +162,13 @@ fn test_longest_prefix_match() {
             Proxy {
                 listen_path: "/api".into(),
                 id: "short".into(),
+                namespace: ferrum_edge::config::types::default_namespace(),
                 ..test_proxy()
             },
             Proxy {
                 listen_path: "/api/v1".into(),
                 id: "long".into(),
+                namespace: ferrum_edge::config::types::default_namespace(),
                 ..test_proxy()
             },
         ],
@@ -173,6 +176,7 @@ fn test_longest_prefix_match() {
         plugin_configs: vec![],
         upstreams: vec![],
         loaded_at: Utc::now(),
+        known_namespaces: Vec::new(),
     };
     let router = RouterCache::new(&config, 10000);
     let matched = router.find_proxy(None, "/api/v1/users");
@@ -192,6 +196,7 @@ fn test_no_match() {
         plugin_configs: vec![],
         upstreams: vec![],
         loaded_at: Utc::now(),
+        known_namespaces: Vec::new(),
     };
     let router = RouterCache::new(&config, 10000);
     let matched = router.find_proxy(None, "/other/path");
@@ -317,6 +322,7 @@ fn test_request_context_effective_identity_prefers_consumer_then_external_identi
 
     ctx.identified_consumer = Some(Arc::new(Consumer {
         id: "consumer-1".to_string(),
+        namespace: ferrum_edge::config::types::default_namespace(),
         username: "mapped-consumer".to_string(),
         custom_id: None,
         credentials: HashMap::new(),
@@ -344,6 +350,7 @@ fn test_request_context_backend_consumer_username_prefers_consumer_then_header_t
 
     ctx.identified_consumer = Some(Arc::new(Consumer {
         id: "consumer-1".to_string(),
+        namespace: ferrum_edge::config::types::default_namespace(),
         username: "mapped-consumer".to_string(),
         custom_id: Some("custom-123".to_string()),
         credentials: HashMap::new(),
