@@ -415,18 +415,18 @@ jobs:
           choco install protoc nasm -y
           echo "C:\Program Files\NASM" | Out-File -Append -FilePath $env:GITHUB_PATH -Encoding utf8
 
-      - name: Install cross (Linux)
-        if: runner.os == 'Linux'
+      - name: Install cross (Linux ARM64)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: cargo install cross
 
-      - name: Build release binary (cross — Linux)
-        if: runner.os == 'Linux'
+      - name: Build release binary (cross)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: cross build --release --target ${{ matrix.target }}
         env:
           RUSTC_WRAPPER: ""
 
-      - name: Build release binary (cargo — non-Linux)
-        if: runner.os != 'Linux'
+      - name: Build release binary (cargo)
+        if: matrix.target != 'aarch64-unknown-linux-gnu'
         run: cargo build --release --target ${{ matrix.target }}
 
       - name: Prepare release assets

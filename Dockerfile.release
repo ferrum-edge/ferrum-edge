@@ -1,10 +1,9 @@
 # Minimal distroless runtime image for pre-built binaries (used by CI/CD)
 # For local builds from source, use: docker build -f Dockerfile .
 #
-# Requires binaries compiled against glibc <= 2.36 (Debian 12/bookworm).
-# CI achieves this by building Linux binaries with `cross` which uses
-# Ubuntu 20.04-based containers (glibc 2.31).
-FROM gcr.io/distroless/cc-debian12:nonroot
+# Debian 13 (trixie) distroless has glibc 2.40, compatible with binaries
+# built on ubuntu-latest (glibc 2.39) and cross containers (glibc 2.31).
+FROM gcr.io/distroless/cc-debian13:nonroot
 
 ARG TARGETARCH
 

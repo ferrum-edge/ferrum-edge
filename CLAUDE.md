@@ -904,8 +904,8 @@ See `src/config/env_config.rs` for the full list of 90+ environment variables.
 
 ## Docker
 
-- **Dockerfile**: Multi-stage build (rust:1-bookworm builder + distroless runtime) — for local `docker build .`
-- **Dockerfile.release**: Distroless runtime image (`gcr.io/distroless/cc-debian12:nonroot`) using pre-built binaries with `TARGETARCH` for multi-arch CI builds — used by CI/CD workflows only
+- **Dockerfile**: Multi-stage build (rust:latest builder + distroless runtime) — for local `docker build .`
+- **Dockerfile.release**: Distroless runtime image (`gcr.io/distroless/cc-debian13:nonroot`) using pre-built binaries with `TARGETARCH` for multi-arch CI builds — used by CI/CD workflows only
 - **Distroless**: No shell, no package manager, no OS CVEs. OpenSSL is vendored (statically linked) so `libssl` is not needed. CA certificates are included in `distroless/cc`. Runs as UID 65532 (`nonroot`)
 - **Exposed ports**: 8000, 8443 (proxy), 9000, 9443 (admin), 50051 (gRPC)
 - **Health check**: `ferrum-edge health` CLI subcommand (no curl needed in distroless)

@@ -1,6 +1,6 @@
 # Multi-stage build for Ferrum Edge
-# Stage 1: Builder — pinned to bookworm for glibc 2.36 compatibility with distroless
-FROM rust:1-bookworm AS builder
+# Stage 1: Builder — rust:latest uses trixie (Debian 13), matching distroless/cc-debian13 glibc
+FROM rust:latest AS builder
 
 # Install build dependencies
 # clang/libclang-dev: required by bindgen (used by zstd-sys)
@@ -38,7 +38,7 @@ RUN touch src/main.rs && cargo build --release
 # Uses nonroot tag (UID 65532) for least-privilege execution.
 # OpenSSL is vendored (statically linked) so libssl is not needed.
 # ca-certificates are included in distroless/cc.
-FROM gcr.io/distroless/cc-debian12:nonroot
+FROM gcr.io/distroless/cc-debian13:nonroot
 
 WORKDIR /app
 
