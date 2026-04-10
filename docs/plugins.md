@@ -2158,6 +2158,7 @@ For HTTPS-only deployments that disable the HTTP listener, set `gateway_tls: tru
 | `concurrent_clients` | Integer | **(required)** | Number of concurrent virtual clients (1–10,000) |
 | `duration_seconds` | Integer | **(required)** | How long the test runs in seconds (1–3,600) |
 | `ramp` | Boolean | `false` | Gradually start clients over the duration instead of all at once (see ramp example below) |
+| `request_timeout_ms` | Integer | `30000` | Per-request timeout in milliseconds. Prevents workers from hanging on streaming/long-lived responses (SSE, long-poll) |
 | `gateway_port` | Integer | env or 8000/8443 | Local gateway port for synthetic requests. Reads `FERRUM_PROXY_HTTP_PORT` (or `FERRUM_PROXY_HTTPS_PORT` when `gateway_tls` is enabled) |
 | `gateway_tls` | Boolean | `false` | Use HTTPS for local loopback synthetic requests |
 | `gateway_tls_no_verify` | Boolean | `true` when `gateway_tls` on | Skip TLS cert verification for loopback only |

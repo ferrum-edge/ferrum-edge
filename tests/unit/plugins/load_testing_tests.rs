@@ -265,6 +265,31 @@ fn test_duration_over_max_is_error() {
 }
 
 #[test]
+fn test_zero_request_timeout_is_error() {
+    let config = json!({
+        "key": "test",
+        "concurrent_clients": 5,
+        "duration_seconds": 10,
+        "request_timeout_ms": 0
+    });
+    let err = LoadTesting::new(&config, PluginHttpClient::default())
+        .err()
+        .unwrap();
+    assert!(err.contains("greater than 0"), "got: {}", err);
+}
+
+#[test]
+fn test_custom_request_timeout_accepted() {
+    let config = json!({
+        "key": "test",
+        "concurrent_clients": 5,
+        "duration_seconds": 10,
+        "request_timeout_ms": 5000
+    });
+    assert!(LoadTesting::new(&config, PluginHttpClient::default()).is_ok());
+}
+
+#[test]
 fn test_gateway_port_zero_is_error() {
     let config = json!({
         "key": "test",

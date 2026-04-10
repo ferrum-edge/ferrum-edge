@@ -3795,6 +3795,12 @@ components:
           type: boolean
           default: false
           description: When true, clients start gradually over the duration instead of all at once
+        request_timeout_ms:
+          type: integer
+          format: uint64
+          default: 30000
+          minimum: 1
+          description: "Per-request timeout in milliseconds. Prevents workers from hanging on streaming/long-lived responses (SSE, long-poll)"
         gateway_port:
           type: integer
           format: uint16

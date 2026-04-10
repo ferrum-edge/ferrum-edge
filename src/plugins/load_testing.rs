@@ -71,6 +71,7 @@
 //! | `gateway_port` | u16 | `FERRUM_PROXY_HTTP_PORT` (or `FERRUM_PROXY_HTTPS_PORT` when `gateway_tls`) or 8000/8443 | Local gateway port for synthetic requests |
 //! | `gateway_tls` | bool | `false` | Use HTTPS for local loopback synthetic requests |
 //! | `gateway_tls_no_verify` | bool | `true` when `gateway_tls` is enabled | Skip TLS certificate verification for loopback connections (the gateway cert typically won't match `127.0.0.1`) |
+//! | `request_timeout_ms` | u64 | `30000` | Per-request timeout in milliseconds. Prevents workers from hanging on streaming/long-lived responses (SSE, long-poll). Must be > 0 |
 //! | `gateway_addresses` | string[] | (none) | Remote gateway URLs to fan out the trigger to. Each receives the original request WITH the key header so it starts its own local load test |
 
 use async_trait::async_trait;
@@ -136,6 +137,12 @@ impl LoadTesting {
         }
 
         let ramp = config["ramp"].as_bool().unwrap_or(false);
+
+        let request_timeout_ms = config["request_timeout_ms"].as_u64().unwrap_or(30_000);
+        if request_timeout_ms == 0 {
+            return Err("load_testing: 'request_timeout_ms' must be greater than 0".to_string());
+        }
+
         let gateway_tls = config["gateway_tls"].as_bool().unwrap_or(false);
 
         // Default to true when TLS is enabled — the gateway cert won't match 127.0.0.1
@@ -176,8 +183,11 @@ impl LoadTesting {
 
         // Build dedicated reqwest client for load test traffic, with optional
         // TLS no-verify scoped only to this client (not the global gateway).
+        // The timeout prevents workers from hanging on streaming/long-lived
+        // responses (SSE, long-poll) that never complete.
         let load_test_client = reqwest::Client::builder()
             .danger_accept_invalid_certs(gateway_tls_no_verify)
+            .timeout(Duration::from_millis(request_timeout_ms))
             .build()
             .map_err(|e| format!("load_testing: failed to build HTTP client: {}", e))?;
 
