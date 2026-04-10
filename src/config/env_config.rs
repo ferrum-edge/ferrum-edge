@@ -1361,10 +1361,18 @@ impl EnvConfig {
     /// Includes proxy HTTP/HTTPS, admin HTTP/HTTPS, and CP gRPC (when configured).
     pub fn reserved_gateway_ports(&self) -> std::collections::HashSet<u16> {
         let mut ports = std::collections::HashSet::new();
-        ports.insert(self.proxy_http_port);
-        ports.insert(self.proxy_https_port);
-        ports.insert(self.admin_http_port);
-        ports.insert(self.admin_https_port);
+        // Port 0 means "disabled" — skip it so stream proxy validation
+        // doesn't treat 0 as a reserved conflict.
+        for &p in &[
+            self.proxy_http_port,
+            self.proxy_https_port,
+            self.admin_http_port,
+            self.admin_https_port,
+        ] {
+            if p != 0 {
+                ports.insert(p);
+            }
+        }
         // CP gRPC listen address is "host:port" — extract the port if present.
         if let Some(ref addr) = self.cp_grpc_listen_addr
             && let Some(port_str) = addr.rsplit(':').next()

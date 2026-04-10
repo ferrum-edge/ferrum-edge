@@ -20,7 +20,7 @@ ferrum-edge run [OPTIONS]                # Start gateway in foreground
 ferrum-edge validate [OPTIONS]           # Validate config without starting
 ferrum-edge reload [--pid PID]           # Send SIGHUP to running instance (Unix)
 ferrum-edge version [--json]             # Print version info
-ferrum-edge health [-p PORT] [--host H]  # Health check (for distroless Docker HEALTHCHECK)
+ferrum-edge health [-p PORT] [--host H] [--tls] [--tls-no-verify]  # Health check (for distroless Docker HEALTHCHECK)
 ferrum-edge                              # No args = legacy env-var-only mode
 ```
 
@@ -122,6 +122,8 @@ GHCR uses the built-in `GITHUB_TOKEN` — no additional secret needed. Ensure re
 | `dp` | Data Plane | Read-only | Yes | gRPC stream from CP |
 | `migrate` | Schema migration utility | No | No | Runs DB migrations then exits |
 
+**Disabling plaintext listeners (TLS-only operation)**: Setting `FERRUM_PROXY_HTTP_PORT=0` disables the plaintext HTTP proxy listener, `FERRUM_ADMIN_HTTP_PORT=0` disables the plaintext admin HTTP listener, and setting the port to `0` in `FERRUM_CP_GRPC_LISTEN_ADDR` (e.g., `0.0.0.0:0`) disables the gRPC listener. Disabled ports are excluded from `reserved_gateway_ports()` so stream proxy port conflict checks are unaffected. The gateway warns at startup if a plaintext port is disabled but no TLS is configured for that surface (which would leave no listeners active). The `ferrum-edge health` CLI subcommand auto-detects `FERRUM_ADMIN_HTTP_PORT=0` and switches to TLS mode (port 9443), or accepts `--tls` / `--tls-no-verify` flags explicitly.
+
 **Admin JWT secret handling is intentionally per-mode**: Database and CP modes **require** `FERRUM_ADMIN_JWT_SECRET` (hard failure if unset) because their read-write admin API issues tokens via `POST /auth` that must survive restarts and be valid across instances sharing the same secret. File mode has a **read-only** admin API that never issues tokens, so it generates a random secret as a convenience — all externally-crafted tokens are rejected since no one can predict the secret. This asymmetry is by design, not an inconsistency.
 
 **`/health` DB check is intentionally cached (15s TTL)**: The `/health` and `/status` endpoints are unauthenticated (by design — load balancer probes need them). Without caching, each call runs `SELECT 1` (SQL) or `ping` (MongoDB), which an attacker with admin port access could flood to exhaust the DB connection pool (`FERRUM_DB_POOL_MAX_CONNECTIONS`, default 10), starving config polling and admin writes. The `CachedDbHealthResult` in `AdminState` caches the boolean result for 15 seconds via lock-free `ArcSwap`. Do not remove this cache or make `/health` call `db.health_check()` directly on every request.
@@ -155,7 +157,7 @@ Within each mode (database/file/dp), after config is loaded:
 12. **DTLS certs** — Loads `FERRUM_DTLS_CERT_PATH` / `FERRUM_DTLS_KEY_PATH` for UDP proxy frontend DTLS termination (ECDSA P-256 / Ed25519)
 13. **Backend TLS** — Per-proxy `backend_tls_client_cert_path`, `backend_tls_client_key_path`, and `backend_tls_server_ca_cert_path` are validated at config load time (startup and each reload). Invalid paths reject the config — no silent degradation.
 14. **CP/DP gRPC TLS** — CP loads `FERRUM_CP_GRPC_TLS_CERT_PATH` / key / client CA for the gRPC server. DP loads `FERRUM_DP_GRPC_TLS_*` certs for the gRPC client connection to CP.
-15. **Stream proxy port validation** — Validates that stream proxy `listen_port` values do not conflict with gateway reserved ports (`FERRUM_PROXY_HTTP_PORT`, `FERRUM_PROXY_HTTPS_PORT`, `FERRUM_ADMIN_HTTP_PORT`, `FERRUM_ADMIN_HTTPS_PORT`, CP gRPC port). Conflicts are fatal in database/file modes.
+15. **Stream proxy port validation** — Validates that stream proxy `listen_port` values do not conflict with gateway reserved ports (`FERRUM_PROXY_HTTP_PORT`, `FERRUM_PROXY_HTTPS_PORT`, `FERRUM_ADMIN_HTTP_PORT`, `FERRUM_ADMIN_HTTPS_PORT`, CP gRPC port). Ports set to `0` (disabled) are excluded from conflict checks. Conflicts are fatal in database/file modes.
 16. **Stream listener bind** — `initial_reconcile_stream_listeners()` binds TCP/UDP stream proxy ports. In database/file modes, bind failure is fatal (gateway exits). In DP mode, bind failures are logged as errors but non-fatal — the DP continues serving HTTP traffic and retries when the CP pushes corrected config.
 17. **DNS warmup** — All backend hostnames (proxy backends, upstream targets, plugin endpoints) are resolved concurrently before accepting traffic.
 18. **Connection pool warmup** — When `FERRUM_POOL_WARMUP_ENABLED=true` (default), pre-establishes backend connections for HTTP-family pools (reqwest, gRPC, HTTP/2 direct, HTTP/3) after DNS warmup. TCP/UDP stream proxies are skipped (no persistent pools). Upstream targets are expanded so each target gets a warmed connection. Failures are logged as warnings but never block startup.
@@ -837,12 +839,12 @@ Reduce per-request allocations in plugin lookup
 | `FERRUM_NAMESPACE` | `ferrum` | Namespace this gateway instance loads and manages. Resources from other namespaces are ignored. Enables multi-tenant resource isolation |
 | `FERRUM_LOG_LEVEL` | `error` | `error`, `warn`, `info`, `debug`, `trace` |
 | `FERRUM_LOG_BUFFER_CAPACITY` | `128000` | Max buffered log lines in the non-blocking writer channel. When full, new events are dropped (lossy) to avoid backpressure |
-| `FERRUM_PROXY_HTTP_PORT` | `8000` | Proxy HTTP listen port |
+| `FERRUM_PROXY_HTTP_PORT` | `8000` | Proxy HTTP listen port. `0` = disabled (TLS-only) |
 | `FERRUM_PROXY_HTTPS_PORT` | `8443` | Proxy HTTPS listen port |
 | `FERRUM_PROXY_BIND_ADDRESS` | `0.0.0.0` | Bind address for proxy listeners. Set to `::` for dual-stack IPv4+IPv6 |
 | `FERRUM_FRONTEND_TLS_CERT_PATH` | (none) | PEM certificate the gateway presents to incoming clients (HTTPS, WebSocket, gRPC, TCP/TLS) |
 | `FERRUM_FRONTEND_TLS_KEY_PATH` | (none) | PEM private key for the gateway's frontend TLS certificate |
-| `FERRUM_ADMIN_HTTP_PORT` | `9000` | Admin API HTTP port |
+| `FERRUM_ADMIN_HTTP_PORT` | `9000` | Admin API HTTP port. `0` = disabled (TLS-only) |
 | `FERRUM_ADMIN_HTTPS_PORT` | `9443` | Admin API HTTPS port |
 | `FERRUM_ADMIN_BIND_ADDRESS` | `0.0.0.0` | Bind address for admin listeners. Set to `::` for dual-stack IPv4+IPv6 |
 | `FERRUM_ADMIN_JWT_SECRET` | (required for db/cp) | JWT secret for admin API auth |

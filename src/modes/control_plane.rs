@@ -180,15 +180,20 @@ pub async fn run(
     };
     let admin_shutdown = shutdown_tx.subscribe();
 
-    // Admin HTTP listener (always enabled)
-    let admin_http_handle = tokio::spawn(async move {
-        info!("Starting Admin HTTP listener on {}", admin_http_addr);
-        if let Err(e) =
-            admin::start_admin_listener(admin_http_addr, admin_state, admin_shutdown).await
-        {
-            error!("Admin HTTP listener error: {}", e);
-        }
-    });
+    // Admin HTTP listener (disabled when port is 0)
+    let admin_http_handle = if env_config.admin_http_port != 0 {
+        Some(tokio::spawn(async move {
+            info!("Starting Admin HTTP listener on {}", admin_http_addr);
+            if let Err(e) =
+                admin::start_admin_listener(admin_http_addr, admin_state, admin_shutdown).await
+            {
+                error!("Admin HTTP listener error: {}", e);
+            }
+        }))
+    } else {
+        info!("FERRUM_ADMIN_HTTP_PORT=0 — plaintext admin HTTP listener disabled");
+        None
+    };
 
     // Admin HTTPS listener (only if TLS is configured)
     let admin_https_handle = if let (Some(admin_cert_path), Some(admin_key_path)) = (
@@ -265,112 +270,129 @@ pub async fn run(
         info!("Admin TLS not configured - HTTPS listener disabled");
         None
     };
+    if env_config.admin_http_port == 0 && env_config.admin_tls_cert_path.is_none() {
+        warn!(
+            "No admin API listeners are active — FERRUM_ADMIN_HTTP_PORT=0 and no admin TLS configured. The admin API is unreachable."
+        );
+    }
 
-    // gRPC listener (with optional TLS/mTLS)
+    // gRPC listener (with optional TLS/mTLS, disabled when port is 0)
     let grpc_addr: SocketAddr = if let Some(ref addr) = env_config.cp_grpc_listen_addr {
         addr.parse()?
     } else {
         env_config.admin_socket_addr(50051)
     };
 
-    let grpc_tls_config = if let (Some(cert_path), Some(key_path)) = (
-        &env_config.cp_grpc_tls_cert_path,
-        &env_config.cp_grpc_tls_key_path,
-    ) {
-        // Check certificate expiration
-        tls::check_cert_expiry(
-            cert_path,
-            "CP gRPC TLS cert",
-            env_config.tls_cert_expiry_warning_days,
-        )?;
-
-        let cert_pem = std::fs::read(cert_path)
-            .map_err(|e| anyhow::anyhow!("Failed to read CP gRPC TLS cert {}: {}", cert_path, e))?;
-        let key_pem = std::fs::read(key_path)
-            .map_err(|e| anyhow::anyhow!("Failed to read CP gRPC TLS key {}: {}", key_path, e))?;
-
-        let mut tls = ServerTlsConfig::new().identity(Identity::from_pem(&cert_pem, &key_pem));
-
-        if let Some(client_ca_path) = &env_config.cp_grpc_tls_client_ca_path {
+    let grpc_handle = if grpc_addr.port() != 0 {
+        let grpc_tls_config = if let (Some(cert_path), Some(key_path)) = (
+            &env_config.cp_grpc_tls_cert_path,
+            &env_config.cp_grpc_tls_key_path,
+        ) {
+            // Check certificate expiration
             tls::check_cert_expiry(
-                client_ca_path,
-                "CP gRPC client CA",
+                cert_path,
+                "CP gRPC TLS cert",
                 env_config.tls_cert_expiry_warning_days,
             )?;
-            let ca_pem = std::fs::read(client_ca_path).map_err(|e| {
-                anyhow::anyhow!("Failed to read CP gRPC client CA {}: {}", client_ca_path, e)
+
+            let cert_pem = std::fs::read(cert_path).map_err(|e| {
+                anyhow::anyhow!("Failed to read CP gRPC TLS cert {}: {}", cert_path, e)
             })?;
-            tls = tls.client_ca_root(Certificate::from_pem(&ca_pem));
-            info!(
-                "CP gRPC TLS configured with mTLS (server cert: {}, client CA: {})",
-                cert_path, client_ca_path
-            );
+            let key_pem = std::fs::read(key_path).map_err(|e| {
+                anyhow::anyhow!("Failed to read CP gRPC TLS key {}: {}", key_path, e)
+            })?;
+
+            let mut tls = ServerTlsConfig::new().identity(Identity::from_pem(&cert_pem, &key_pem));
+
+            if let Some(client_ca_path) = &env_config.cp_grpc_tls_client_ca_path {
+                tls::check_cert_expiry(
+                    client_ca_path,
+                    "CP gRPC client CA",
+                    env_config.tls_cert_expiry_warning_days,
+                )?;
+                let ca_pem = std::fs::read(client_ca_path).map_err(|e| {
+                    anyhow::anyhow!("Failed to read CP gRPC client CA {}: {}", client_ca_path, e)
+                })?;
+                tls = tls.client_ca_root(Certificate::from_pem(&ca_pem));
+                info!(
+                    "CP gRPC TLS configured with mTLS (server cert: {}, client CA: {})",
+                    cert_path, client_ca_path
+                );
+            } else {
+                info!(
+                    "CP gRPC TLS configured (server cert: {}, no client verification)",
+                    cert_path
+                );
+            }
+            Some(tls)
         } else {
-            info!(
-                "CP gRPC TLS configured (server cert: {}, no client verification)",
-                cert_path
-            );
-        }
-        Some(tls)
+            if env_config.cp_grpc_tls_client_ca_path.is_some() {
+                warn!(
+                    "FERRUM_CP_GRPC_TLS_CLIENT_CA_PATH is set but cert/key are missing — ignoring client CA"
+                );
+            }
+            info!("CP gRPC server running in plaintext mode (no TLS configured)");
+            None
+        };
+
+        let grpc_listener = tokio::net::TcpListener::bind(grpc_addr).await?;
+        info!("CP gRPC server listening on {}", grpc_addr);
+        let grpc_http2_max_concurrent_streams = env_config.server_http2_max_concurrent_streams;
+        let grpc_http2_max_pending_accept_reset_streams =
+            env_config.server_http2_max_pending_accept_reset_streams;
+        let grpc_http2_max_local_error_reset_streams =
+            env_config.server_http2_max_local_error_reset_streams;
+        let (grpc_started_tx, grpc_started_rx) = tokio::sync::oneshot::channel();
+        let mut grpc_shutdown = shutdown_tx.subscribe();
+        let handle = tokio::spawn(async move {
+            let mut builder = Server::builder()
+                .max_concurrent_streams(Some(grpc_http2_max_concurrent_streams))
+                .http2_max_pending_accept_reset_streams(Some(
+                    grpc_http2_max_pending_accept_reset_streams,
+                ))
+                .http2_max_local_error_reset_streams(Some(
+                    grpc_http2_max_local_error_reset_streams,
+                ));
+            if let Some(tls) = grpc_tls_config {
+                builder = match builder.tls_config(tls) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        error!("Failed to configure gRPC TLS: {}", e);
+                        return;
+                    }
+                };
+            }
+            let shutdown_signal = async move {
+                while !*grpc_shutdown.borrow() {
+                    if grpc_shutdown.changed().await.is_err() {
+                        return;
+                    }
+                }
+                info!("CP gRPC server shutting down");
+            };
+            let incoming = TcpListenerStream::new(grpc_listener);
+            let _ = grpc_started_tx.send(());
+            if let Err(e) = builder
+                .add_service(grpc_server.into_service())
+                .serve_with_incoming_shutdown(incoming, shutdown_signal)
+                .await
+            {
+                error!("gRPC server error: {}", e);
+            }
+        });
+
+        wait_for_start_signals(
+            vec![("CP gRPC listener".to_string(), grpc_started_rx)],
+            Duration::from_secs(10),
+        )
+        .await?;
+
+        Some(handle)
     } else {
-        if env_config.cp_grpc_tls_client_ca_path.is_some() {
-            warn!(
-                "FERRUM_CP_GRPC_TLS_CLIENT_CA_PATH is set but cert/key are missing — ignoring client CA"
-            );
-        }
-        info!("CP gRPC server running in plaintext mode (no TLS configured)");
+        info!("CP gRPC listen port is 0 — gRPC listener disabled");
+        drop(grpc_server); // consumed by the gRPC spawn when enabled
         None
     };
-
-    let grpc_listener = tokio::net::TcpListener::bind(grpc_addr).await?;
-    info!("CP gRPC server listening on {}", grpc_addr);
-    let grpc_http2_max_concurrent_streams = env_config.server_http2_max_concurrent_streams;
-    let grpc_http2_max_pending_accept_reset_streams =
-        env_config.server_http2_max_pending_accept_reset_streams;
-    let grpc_http2_max_local_error_reset_streams =
-        env_config.server_http2_max_local_error_reset_streams;
-    let (grpc_started_tx, grpc_started_rx) = tokio::sync::oneshot::channel();
-    let mut grpc_shutdown = shutdown_tx.subscribe();
-    let grpc_handle = tokio::spawn(async move {
-        let mut builder = Server::builder()
-            .max_concurrent_streams(Some(grpc_http2_max_concurrent_streams))
-            .http2_max_pending_accept_reset_streams(Some(
-                grpc_http2_max_pending_accept_reset_streams,
-            ))
-            .http2_max_local_error_reset_streams(Some(grpc_http2_max_local_error_reset_streams));
-        if let Some(tls) = grpc_tls_config {
-            builder = match builder.tls_config(tls) {
-                Ok(b) => b,
-                Err(e) => {
-                    error!("Failed to configure gRPC TLS: {}", e);
-                    return;
-                }
-            };
-        }
-        let shutdown_signal = async move {
-            while !*grpc_shutdown.borrow() {
-                if grpc_shutdown.changed().await.is_err() {
-                    return;
-                }
-            }
-            info!("CP gRPC server shutting down");
-        };
-        let incoming = TcpListenerStream::new(grpc_listener);
-        let _ = grpc_started_tx.send(());
-        if let Err(e) = builder
-            .add_service(grpc_server.into_service())
-            .serve_with_incoming_shutdown(incoming, shutdown_signal)
-            .await
-        {
-            error!("gRPC server error: {}", e);
-        }
-    });
-
-    wait_for_start_signals(
-        vec![("CP gRPC listener".to_string(), grpc_started_rx)],
-        Duration::from_secs(10),
-    )
-    .await?;
     startup_ready.store(true, Ordering::Relaxed);
     info!("Control plane startup complete; /health now reports ready");
 
@@ -643,17 +665,40 @@ pub async fn run(
         }
     });
 
-    // Wait for all listener handles (these exit when the shutdown signal fires)
+    // Wait for any listener handle to exit, or the shutdown signal if all
+    // listeners are disabled (e.g., admin_http=0, no admin TLS, gRPC port=0).
+    let mut wait_shutdown = shutdown_tx.subscribe();
     tokio::select! {
-        _ = admin_http_handle => {}
-        _ = grpc_handle => {}
         _ = async {
-            if let Some(handle) = admin_https_handle {
-                handle.await
+            if let Some(handle) = admin_http_handle {
+                let _ = handle.await;
             } else {
-                std::future::pending().await
+                std::future::pending::<()>().await;
             }
         } => {}
+        _ = async {
+            if let Some(handle) = grpc_handle {
+                let _ = handle.await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        } => {}
+        _ = async {
+            if let Some(handle) = admin_https_handle {
+                let _ = handle.await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        } => {}
+        _ = async {
+            while !*wait_shutdown.borrow() {
+                if wait_shutdown.changed().await.is_err() {
+                    return;
+                }
+            }
+        } => {
+            info!("Shutdown signal received with no active listeners");
+        }
     }
 
     // Wait for background tasks to drain cleanly, with a timeout to prevent

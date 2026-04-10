@@ -163,7 +163,7 @@ For production CP/DP with TLS, see [docs/cp_dp_mode.md](docs/cp_dp_mode.md#trans
 | `9443` | HTTPS | Admin API (TLS) |
 | `50051` | gRPC | Control Plane → Data Plane sync |
 
-All ports are configurable via environment variables (`FERRUM_PROXY_HTTP_PORT`, `FERRUM_PROXY_HTTPS_PORT`, `FERRUM_ADMIN_HTTP_PORT`, `FERRUM_ADMIN_HTTPS_PORT`, `FERRUM_CP_GRPC_LISTEN_ADDR`).
+All ports are configurable via environment variables (`FERRUM_PROXY_HTTP_PORT`, `FERRUM_PROXY_HTTPS_PORT`, `FERRUM_ADMIN_HTTP_PORT`, `FERRUM_ADMIN_HTTPS_PORT`, `FERRUM_CP_GRPC_LISTEN_ADDR`). Set any plaintext port to `0` to disable its listener entirely for TLS-only deployments.
 
 ## Configuration
 
@@ -176,10 +176,10 @@ Ferrum Edge is configured through environment variables, with an optional `ferru
 | `FERRUM_MODE` | **Yes** | — | `database`, `file`, `cp`, `dp`, `migrate` |
 | `FERRUM_LOG_LEVEL` | No | `error` | `error`, `warn`, `info`, `debug`, `trace` |
 | `FERRUM_LOG_BUFFER_CAPACITY` | No | `128000` | Max buffered log lines in the non-blocking writer channel |
-| `FERRUM_PROXY_HTTP_PORT` | No | `8000` | HTTP proxy port |
+| `FERRUM_PROXY_HTTP_PORT` | No | `8000` | HTTP proxy port (`0` = disabled) |
 | `FERRUM_PROXY_HTTPS_PORT` | No | `8443` | HTTPS proxy port |
 | `FERRUM_ACCEPT_THREADS` | No | `0` (auto-detect) | Parallel accept loops via SO_REUSEPORT (0 = CPU cores) |
-| `FERRUM_ADMIN_HTTP_PORT` | No | `9000` | Admin API HTTP port |
+| `FERRUM_ADMIN_HTTP_PORT` | No | `9000` | Admin API HTTP port (`0` = disabled) |
 | `FERRUM_ADMIN_JWT_SECRET` | DB/CP | — | HS256 secret for Admin API |
 | `FERRUM_DB_TYPE` | DB/CP | — | `postgres`, `mysql`, `sqlite`, `mongodb` |
 | `FERRUM_DB_URL` | DB/CP | — | Database connection string |

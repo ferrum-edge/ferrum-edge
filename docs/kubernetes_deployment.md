@@ -94,7 +94,27 @@ readinessProbe:
 
 `proxy_count` is reported inside `cached_config` in the `/health` JSON response, not as a top-level field.
 
-If you enable admin TLS and want probes over HTTPS, point the probe at `9443` with `scheme: HTTPS`. Many operators still keep port `9000` private inside the cluster just for probes and operational access.
+If you enable admin TLS and want probes over HTTPS, point the probe at `9443` with `scheme: HTTPS`:
+
+```yaml
+readinessProbe:
+  httpGet:
+    path: /health
+    port: admin-https
+    scheme: HTTPS
+```
+
+For TLS-only deployments where `FERRUM_ADMIN_HTTP_PORT=0` (plaintext admin disabled), you **must** use either `scheme: HTTPS` probes or the `ferrum-edge health --tls` exec probe:
+
+```yaml
+readinessProbe:
+  exec:
+    command: ["/app/ferrum-edge", "health", "--tls", "--tls-no-verify"]
+  initialDelaySeconds: 5
+  periodSeconds: 10
+```
+
+> **Auto-detection**: When `FERRUM_ADMIN_HTTP_PORT=0` is set in the container environment, `ferrum-edge health` automatically uses TLS + port 9443 without needing the `--tls` flag.
 
 ## Single-Node Database Mode Example
 

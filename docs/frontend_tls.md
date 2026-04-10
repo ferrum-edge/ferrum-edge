@@ -131,16 +131,28 @@ export FERRUM_FRONTEND_TLS_KEY_PATH="./staging.key"
 # Access: http://localhost:8000 AND https://localhost:8443
 ```
 
-**Production:**
+**Production (TLS-only, no plaintext):**
 ```bash
-# HTTPS/mTLS only, block HTTP at firewall
+# Disable all plaintext listeners at the gateway level
+export FERRUM_PROXY_HTTP_PORT=0      # Disable plaintext proxy
+export FERRUM_ADMIN_HTTP_PORT=0      # Disable plaintext admin API
+
+# TLS for proxy traffic
 export FERRUM_FRONTEND_TLS_CERT_PATH="/prod/certs/gateway.crt"
 export FERRUM_FRONTEND_TLS_KEY_PATH="/prod/certs/gateway.key"
 export FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH="/prod/certs/client-ca.pem"
+
+# TLS for admin API
+export FERRUM_ADMIN_TLS_CERT_PATH="/prod/certs/admin.crt"
+export FERRUM_ADMIN_TLS_KEY_PATH="/prod/certs/admin.key"
+
 ./ferrum-edge
-# Access: https://localhost:8443 (mTLS required)
-# Firewall blocks port 8000
+# Proxy: https://localhost:8443 only (mTLS required)
+# Admin: https://localhost:9443 only
+# No plaintext listeners bound — nothing to firewall
 ```
+
+> **Tip**: Setting port to `0` prevents the listener from binding at all, which is more secure than relying on a firewall to block the port. The gateway logs `FERRUM_PROXY_HTTP_PORT=0 — plaintext HTTP proxy listener disabled` and `FERRUM_ADMIN_HTTP_PORT=0 — plaintext admin HTTP listener disabled` at startup to confirm.
 
 ## Use Cases
 
@@ -230,7 +242,17 @@ export FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH="/etc/ssl/certs/admin-client-ca.pe
 # Admin HTTPS/mTLS: https://localhost:9443 (client certs required)
 ```
 
-#### **4. Admin HTTPS with No-Verify (Testing)**
+#### **4. Admin HTTPS Only (No Plaintext)**
+```bash
+export FERRUM_ADMIN_HTTP_PORT=0  # Disable plaintext admin
+export FERRUM_ADMIN_TLS_CERT_PATH="/etc/ssl/certs/admin.crt"
+export FERRUM_ADMIN_TLS_KEY_PATH="/etc/ssl/private/admin.key"
+./ferrum-edge
+# Admin HTTPS only: https://localhost:9443
+# No HTTP listener — plaintext admin requests are impossible
+```
+
+#### **5. Admin HTTPS with No-Verify (Testing)**
 ```bash
 export FERRUM_ADMIN_TLS_CERT_PATH="/etc/ssl/certs/admin.crt"
 export FERRUM_ADMIN_TLS_KEY_PATH="/etc/ssl/private/admin.key"

@@ -173,6 +173,7 @@ Ferrum supports dynamic upstream target discovery through three providers, confi
 
 ## TLS & Security
 
+- Plaintext listener disable — set port to `0` to prevent HTTP proxy, admin HTTP, or gRPC listeners from binding (TLS-only operation)
 - Frontend TLS termination on proxy and admin listeners
 - Frontend mTLS with client certificate verification
 - Backend mTLS with per-proxy certificate configuration

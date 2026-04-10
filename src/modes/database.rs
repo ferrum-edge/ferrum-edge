@@ -338,27 +338,31 @@ pub async fn run(
     let mut handles = Vec::new();
     let mut startup_signals = Vec::new();
 
-    // HTTP listener (always enabled)
-    let http_addr: SocketAddr = env_config.proxy_socket_addr(env_config.proxy_http_port);
-    let http_state = proxy_state.clone();
-    let http_shutdown = shutdown_tx.subscribe();
-    let (http_started_tx, http_started_rx) = tokio::sync::oneshot::channel();
-    let http_handle = tokio::spawn(async move {
-        info!("Starting HTTP proxy listener on {}", http_addr);
-        if let Err(e) = proxy::start_proxy_listener_with_tls_and_signal(
-            http_addr,
-            http_state,
-            http_shutdown,
-            None,
-            Some(http_started_tx),
-        )
-        .await
-        {
-            error!("HTTP proxy listener error: {}", e);
-        }
-    });
-    handles.push(http_handle);
-    startup_signals.push(("HTTP proxy listener".to_string(), http_started_rx));
+    // HTTP listener (disabled when port is 0)
+    if env_config.proxy_http_port != 0 {
+        let http_addr: SocketAddr = env_config.proxy_socket_addr(env_config.proxy_http_port);
+        let http_state = proxy_state.clone();
+        let http_shutdown = shutdown_tx.subscribe();
+        let (http_started_tx, http_started_rx) = tokio::sync::oneshot::channel();
+        let http_handle = tokio::spawn(async move {
+            info!("Starting HTTP proxy listener on {}", http_addr);
+            if let Err(e) = proxy::start_proxy_listener_with_tls_and_signal(
+                http_addr,
+                http_state,
+                http_shutdown,
+                None,
+                Some(http_started_tx),
+            )
+            .await
+            {
+                error!("HTTP proxy listener error: {}", e);
+            }
+        });
+        handles.push(http_handle);
+        startup_signals.push(("HTTP proxy listener".to_string(), http_started_rx));
+    } else {
+        info!("FERRUM_PROXY_HTTP_PORT=0 — plaintext HTTP proxy listener disabled");
+    }
 
     // HTTPS listener (only if TLS is configured)
     if let Some(tls_config) = tls_config.clone() {
@@ -422,6 +426,12 @@ pub async fn run(
         }
     }
 
+    if env_config.proxy_http_port == 0 && tls_config.is_none() {
+        warn!(
+            "No HTTP or HTTPS proxy listeners are active — FERRUM_PROXY_HTTP_PORT=0 and no TLS configured. Only stream proxies (TCP/UDP) will serve traffic."
+        );
+    }
+
     // Start separate listeners for Admin API (HTTP and HTTPS)
     let admin_http_addr: SocketAddr = env_config.admin_socket_addr(env_config.admin_http_port);
     let jwt_manager = create_jwt_manager_from_env()
@@ -450,16 +460,20 @@ pub async fn run(
     };
     let admin_shutdown = shutdown_tx.subscribe();
 
-    // Admin HTTP listener (always enabled)
-    let admin_http_handle = tokio::spawn(async move {
-        info!("Starting Admin HTTP listener on {}", admin_http_addr);
-        if let Err(e) =
-            admin::start_admin_listener(admin_http_addr, admin_state, admin_shutdown).await
-        {
-            error!("Admin HTTP listener error: {}", e);
-        }
-    });
-    handles.push(admin_http_handle);
+    // Admin HTTP listener (disabled when port is 0)
+    if env_config.admin_http_port != 0 {
+        let admin_http_handle = tokio::spawn(async move {
+            info!("Starting Admin HTTP listener on {}", admin_http_addr);
+            if let Err(e) =
+                admin::start_admin_listener(admin_http_addr, admin_state, admin_shutdown).await
+            {
+                error!("Admin HTTP listener error: {}", e);
+            }
+        });
+        handles.push(admin_http_handle);
+    } else {
+        info!("FERRUM_ADMIN_HTTP_PORT=0 — plaintext admin HTTP listener disabled");
+    }
 
     // Admin HTTPS listener (only if TLS is configured)
     if let (Some(admin_cert_path), Some(admin_key_path)) = (
@@ -535,6 +549,11 @@ pub async fn run(
         handles.push(admin_https_handle);
     } else {
         info!("Admin TLS not configured - HTTPS listener disabled");
+    }
+    if env_config.admin_http_port == 0 && env_config.admin_tls_cert_path.is_none() {
+        warn!(
+            "No admin API listeners are active — FERRUM_ADMIN_HTTP_PORT=0 and no admin TLS configured. The admin API is unreachable."
+        );
     }
 
     // Start stream proxy listeners (TCP/UDP) — bind failures are fatal in database mode.
@@ -807,9 +826,20 @@ pub async fn run(
         }
     });
 
-    // Wait for all listeners to complete (these exit when the shutdown signal fires)
-    for handle in handles {
-        handle.await?;
+    // Wait for all listeners to complete (these exit when the shutdown signal fires).
+    // If no listener handles were spawned (e.g., all plaintext ports disabled and no
+    // TLS configured), block on the shutdown signal so stream proxies keep running.
+    if handles.is_empty() {
+        let mut wait_shutdown = shutdown_tx.subscribe();
+        while !*wait_shutdown.borrow() {
+            if wait_shutdown.changed().await.is_err() {
+                break;
+            }
+        }
+    } else {
+        for handle in handles {
+            handle.await?;
+        }
     }
 
     // Graceful connection drain: wait for in-flight requests to complete.

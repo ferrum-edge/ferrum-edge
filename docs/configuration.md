@@ -17,7 +17,7 @@ Ferrum Edge is configured primarily through environment variables. An optional `
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `FERRUM_PROXY_HTTP_PORT` | No | `8000` | HTTP proxy listener port |
+| `FERRUM_PROXY_HTTP_PORT` | No | `8000` | HTTP proxy listener port. Set to `0` to disable the plaintext HTTP listener (TLS-only operation) |
 | `FERRUM_PROXY_HTTPS_PORT` | No | `8443` | HTTPS proxy listener port |
 | `FERRUM_PROXY_BIND_ADDRESS` | No | `0.0.0.0` | Bind address for proxy listeners (HTTP, HTTPS, HTTP/3). Set to `::` for dual-stack IPv4+IPv6 |
 | `FERRUM_FRONTEND_TLS_CERT_PATH` | If HTTPS | — | PEM certificate the gateway presents to incoming clients (HTTPS, WebSocket, gRPC, TCP/TLS) |
@@ -27,7 +27,7 @@ Ferrum Edge is configured primarily through environment variables. An optional `
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `FERRUM_ADMIN_HTTP_PORT` | No | `9000` | Admin API HTTP port |
+| `FERRUM_ADMIN_HTTP_PORT` | No | `9000` | Admin API HTTP port. Set to `0` to disable the plaintext admin HTTP listener (TLS-only operation) |
 | `FERRUM_ADMIN_HTTPS_PORT` | No | `9443` | Admin API HTTPS port |
 | `FERRUM_ADMIN_BIND_ADDRESS` | No | `0.0.0.0` | Bind address for admin listeners (HTTP, HTTPS). Set to `::` for dual-stack IPv4+IPv6 |
 | `FERRUM_ADMIN_TLS_CERT_PATH` | If HTTPS | — | Path to admin TLS certificate |
@@ -336,7 +336,7 @@ proxies:
     backend_tls_verify_server_cert: false
 ```
 
-**Port validation:** Each `listen_port` must be unique across all stream proxies and must not conflict with gateway reserved ports (`FERRUM_PROXY_HTTP_PORT`, `FERRUM_PROXY_HTTPS_PORT`, `FERRUM_ADMIN_HTTP_PORT`, `FERRUM_ADMIN_HTTPS_PORT`, CP gRPC port). In database mode, the Admin API also probes OS-level port availability before accepting the config. See [tcp_udp_proxy.md](tcp_udp_proxy.md) for full documentation including per-mode behavior.
+**Port validation:** Each `listen_port` must be unique across all stream proxies and must not conflict with gateway reserved ports (`FERRUM_PROXY_HTTP_PORT`, `FERRUM_PROXY_HTTPS_PORT`, `FERRUM_ADMIN_HTTP_PORT`, `FERRUM_ADMIN_HTTPS_PORT`, CP gRPC port). Ports set to `0` (disabled) are excluded from conflict checks. In database mode, the Admin API also probes OS-level port availability before accepting the config. See [tcp_udp_proxy.md](tcp_udp_proxy.md) for full documentation including per-mode behavior.
 
 ### Service Discovery
 

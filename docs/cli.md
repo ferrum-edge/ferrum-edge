@@ -29,6 +29,7 @@ Alternative approaches:
 | `run` | Start the gateway in the foreground |
 | `validate` | Validate configuration files without starting the gateway |
 | `reload` | Send a reload signal (SIGHUP) to a running gateway instance (Unix only) |
+| `health` | Check gateway health by connecting to the admin API `/health` endpoint |
 | `version` | Print version information |
 
 When no subcommand is given, Ferrum Edge falls through to the legacy env-var-only mode. Every existing deployment (Docker, systemd, CI) continues to work unchanged.
@@ -163,6 +164,66 @@ ferrum-edge reload --pid 42195
 ### PID Auto-Detection
 
 When `--pid` is omitted, the CLI uses `pgrep -x ferrum-edge` to find the running process. If multiple instances are found, it reports all PIDs and asks you to specify one.
+
+## health
+
+Check gateway health by connecting to the admin API `/health` endpoint. Designed for use as a Docker `HEALTHCHECK` or Kubernetes exec probe in distroless containers (no shell or curl needed).
+
+```
+ferrum-edge health [OPTIONS]
+```
+
+### Options
+
+| Flag | Short | Description |
+|------|-------|-------------|
+| `--port <PORT>` | `-p` | Admin API port (defaults to `FERRUM_ADMIN_HTTP_PORT` / 9000, or `FERRUM_ADMIN_HTTPS_PORT` / 9443 when TLS is used) |
+| `--host <HOST>` | | Admin API host (default: `127.0.0.1`) |
+| `--tls` | | Connect via HTTPS instead of HTTP |
+| `--tls-no-verify` | | Skip TLS certificate verification (for self-signed certs / testing) |
+
+### Auto-Detection
+
+When `FERRUM_ADMIN_HTTP_PORT=0` (plaintext admin disabled), the health command automatically switches to TLS mode and uses port 9443 (or the value of `FERRUM_ADMIN_HTTPS_PORT`). No `--tls` flag is needed in this case.
+
+### Examples
+
+```bash
+# Default — connect to http://127.0.0.1:9000/health
+ferrum-edge health
+
+# Custom port
+ferrum-edge health -p 9001
+
+# TLS-only admin API (explicit)
+ferrum-edge health --tls
+
+# TLS with self-signed cert
+ferrum-edge health --tls --tls-no-verify
+
+# Auto-detected TLS when FERRUM_ADMIN_HTTP_PORT=0
+FERRUM_ADMIN_HTTP_PORT=0 ferrum-edge health
+# → connects to https://127.0.0.1:9443/health automatically
+```
+
+### Docker HEALTHCHECK
+
+```dockerfile
+# Plaintext admin
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+  CMD ["/app/ferrum-edge", "health"]
+
+# TLS-only admin (FERRUM_ADMIN_HTTP_PORT=0)
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+  CMD ["/app/ferrum-edge", "health", "--tls", "--tls-no-verify"]
+```
+
+### Exit Codes
+
+| Code | Meaning |
+|------|---------|
+| `0` | Healthy (HTTP 200 from `/health`) |
+| `1` | Unhealthy (non-200 response, connection refused, timeout) |
 
 ## version
 

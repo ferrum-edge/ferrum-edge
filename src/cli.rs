@@ -85,13 +85,23 @@ pub struct VersionArgs {
 
 #[derive(clap::Args)]
 pub struct HealthArgs {
-    /// Admin API port to check (defaults to FERRUM_ADMIN_HTTP_PORT or 9000).
+    /// Admin API port to check (defaults to FERRUM_ADMIN_HTTP_PORT, or
+    /// FERRUM_ADMIN_HTTPS_PORT when --tls is set, or 9000/9443 respectively).
     #[arg(short = 'p', long = "port")]
     pub port: Option<u16>,
 
     /// Admin API host to connect to.
     #[arg(long, default_value = "127.0.0.1")]
     pub host: String,
+
+    /// Use TLS (HTTPS) to connect to the admin API.
+    /// Required when the plaintext admin HTTP listener is disabled (FERRUM_ADMIN_HTTP_PORT=0).
+    #[arg(long)]
+    pub tls: bool,
+
+    /// Skip TLS certificate verification (for self-signed certs / testing only).
+    #[arg(long)]
+    pub tls_no_verify: bool,
 }
 
 // ── Smart path resolution ───────────────────────────────────────────────────
@@ -295,16 +305,35 @@ pub fn execute_validate() -> Result<(), String> {
 /// Check gateway health by connecting to the admin API /health endpoint.
 /// Uses a raw TCP connection + minimal HTTP/1.1 request to avoid pulling in
 /// async runtime or reqwest for this one-shot diagnostic.
+///
+/// When `--tls` is passed, wraps the TCP socket in a rustls `StreamOwned` for
+/// HTTPS. This is needed when `FERRUM_ADMIN_HTTP_PORT=0` disables plaintext.
 pub fn execute_health(args: &HealthArgs) -> Result<(), String> {
-    use std::io::{Read, Write};
     use std::net::{TcpStream, ToSocketAddrs};
     use std::time::Duration;
 
-    let port = args.port.unwrap_or_else(|| {
-        std::env::var("FERRUM_ADMIN_HTTP_PORT")
+    // Auto-detect TLS when admin HTTP port is explicitly disabled (port=0) and
+    // the user didn't pass --port to override.
+    let auto_tls = args.port.is_none()
+        && !args.tls
+        && std::env::var("FERRUM_ADMIN_HTTP_PORT")
             .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(9000)
+            .and_then(|v| v.parse::<u16>().ok())
+            == Some(0);
+    let use_tls = args.tls || auto_tls;
+
+    let port = args.port.unwrap_or_else(|| {
+        if use_tls {
+            std::env::var("FERRUM_ADMIN_HTTPS_PORT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(9443)
+        } else {
+            std::env::var("FERRUM_ADMIN_HTTP_PORT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(9000)
+        }
     });
 
     let addr_str = format!("{}:{}", args.host, port);
@@ -313,7 +342,7 @@ pub fn execute_health(args: &HealthArgs) -> Result<(), String> {
         .map_err(|e| format!("Cannot resolve {}: {}", addr_str, e))?
         .next()
         .ok_or_else(|| format!("No addresses found for {}", addr_str))?;
-    let mut stream = TcpStream::connect_timeout(&sock_addr, Duration::from_secs(5))
+    let stream = TcpStream::connect_timeout(&sock_addr, Duration::from_secs(5))
         .map_err(|e| format!("Cannot connect to {}: {}", addr_str, e))?;
 
     stream
@@ -324,20 +353,114 @@ pub fn execute_health(args: &HealthArgs) -> Result<(), String> {
         "GET /health HTTP/1.1\r\nHost: {}:{}\r\nConnection: close\r\n\r\n",
         args.host, port
     );
-    stream
-        .write_all(request.as_bytes())
-        .map_err(|e| format!("Failed to send request: {}", e))?;
 
-    let mut response = String::new();
-    stream
-        .read_to_string(&mut response)
-        .map_err(|e| format!("Failed to read response: {}", e))?;
+    let response = if use_tls {
+        health_request_tls(stream, &request, &args.host, args.tls_no_verify)?
+    } else {
+        health_request_plain(stream, &request)?
+    };
 
     if response.contains("200 OK") {
         Ok(())
     } else {
         let status_line = response.lines().next().unwrap_or("(empty response)");
         Err(format!("Unhealthy: {}", status_line))
+    }
+}
+
+/// Send health request over plaintext TCP.
+fn health_request_plain(mut stream: std::net::TcpStream, request: &str) -> Result<String, String> {
+    use std::io::{Read, Write};
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|e| format!("Failed to send request: {}", e))?;
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .map_err(|e| format!("Failed to read response: {}", e))?;
+    Ok(response)
+}
+
+/// Send health request over TLS (rustls).
+fn health_request_tls(
+    stream: std::net::TcpStream,
+    request: &str,
+    host: &str,
+    no_verify: bool,
+) -> Result<String, String> {
+    use std::io::{Read, Write};
+    use std::sync::Arc;
+
+    let mut root_store = rustls::RootCertStore::empty();
+    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
+    let builder = rustls::ClientConfig::builder().with_root_certificates(root_store);
+    let mut tls_config = builder.with_no_client_auth();
+    if no_verify {
+        tls_config
+            .dangerous()
+            .set_certificate_verifier(Arc::new(NoVerifier));
+    }
+
+    let server_name = rustls::pki_types::ServerName::try_from(host.to_string())
+        .map_err(|e| format!("Invalid server name '{}': {}", host, e))?;
+
+    let conn = rustls::ClientConnection::new(Arc::new(tls_config), server_name).map_err(|e| {
+        format!(
+            "TLS handshake failed (use --tls-no-verify for self-signed certs): {}",
+            e,
+        )
+    })?;
+
+    let mut tls_stream = rustls::StreamOwned::new(conn, stream);
+    tls_stream
+        .write_all(request.as_bytes())
+        .map_err(|e| format!("Failed to send TLS request: {}", e))?;
+    let mut response = String::new();
+    tls_stream
+        .read_to_string(&mut response)
+        .map_err(|e| format!("Failed to read TLS response: {}", e))?;
+    Ok(response)
+}
+
+/// Certificate verifier that accepts any certificate (testing / self-signed).
+#[derive(Debug)]
+struct NoVerifier;
+
+impl rustls::client::danger::ServerCertVerifier for NoVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
     }
 }
 

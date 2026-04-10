@@ -107,7 +107,7 @@ The CP/DP architecture is designed so that data source outages are invisible to 
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `FERRUM_MODE` | Yes | Set to `cp` |
-| `FERRUM_CP_GRPC_LISTEN_ADDR` | Yes | gRPC listen address (e.g., `0.0.0.0:50051`) |
+| `FERRUM_CP_GRPC_LISTEN_ADDR` | Yes | gRPC listen address (e.g., `0.0.0.0:50051`). Set port to `0` to disable the gRPC listener |
 | `FERRUM_CP_DP_GRPC_JWT_SECRET` | Yes | Shared JWT secret for CP/DP gRPC auth |
 | `FERRUM_CP_GRPC_TLS_CERT_PATH` | No | PEM certificate for gRPC TLS |
 | `FERRUM_CP_GRPC_TLS_KEY_PATH` | No | PEM private key for gRPC TLS |
@@ -129,7 +129,7 @@ The CP/DP architecture is designed so that data source outages are invisible to 
 | `FERRUM_DP_GRPC_TLS_CLIENT_KEY_PATH` | No | PEM client key for mTLS |
 | `FERRUM_DP_GRPC_TLS_NO_VERIFY` | No | Skip TLS verification (testing only) |
 | `FERRUM_ADMIN_JWT_SECRET` | Yes | JWT secret for the read-only Admin API |
-| `FERRUM_PROXY_HTTP_PORT` | No | HTTP proxy port (default: 8000) |
+| `FERRUM_PROXY_HTTP_PORT` | No | HTTP proxy port (default: 8000). Set to `0` to disable the plaintext HTTP proxy listener |
 | `FERRUM_PROXY_HTTPS_PORT` | No | HTTPS proxy port (default: 8443) |
 
 ## Example Deployment

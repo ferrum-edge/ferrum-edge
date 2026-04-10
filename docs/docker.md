@@ -103,6 +103,13 @@ docker ps
 curl -f http://localhost:9000/health
 ```
 
+When the plaintext admin listener is disabled (`FERRUM_ADMIN_HTTP_PORT=0`), the health command automatically detects this and connects via TLS instead. For self-signed certificates, add `--tls-no-verify`:
+
+```bash
+# TLS-only admin API health check (in Dockerfile or docker-compose)
+HEALTHCHECK CMD ["/app/ferrum-edge", "health", "--tls", "--tls-no-verify"]
+```
+
 > **Note**: The distroless image has no shell or curl. Use `curl` from the host or configure orchestrator-level health checks (e.g., Kubernetes `httpGet` probes).
 
 ## Running with Docker Compose
