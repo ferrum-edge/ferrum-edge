@@ -600,10 +600,9 @@ The project uses comprehensive testing at multiple levels:
 - Test plugin lifecycle and configuration
 
 ### **Performance Testing**
-- `tests/performance/` directory contains wrk-based performance benchmarks
+- `tests/performance/` directory contains CI overhead benchmarks (`ci_overhead_bench.py`)
 - `tests/performance/multi_protocol/` contains multi-protocol benchmark suite (HTTP/1.1, HTTP/2, HTTP/3, gRPC, TCP, UDP, WebSocket)
-- Automated performance regression testing in CI
-- Baseline comparison with `compare_baselines.py`
+- Automated self-relative performance regression testing in CI (gateway vs direct backend overhead ratio)
 
 ## Getting Started for New Developers
 

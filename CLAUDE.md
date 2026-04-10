@@ -82,7 +82,7 @@ The CI workflow (`.github/workflows/ci.yml`) runs on push to `main` and PRs targ
 1. **Format Check** — `cargo fmt --check` (instant, no compilation)
 2. **Tests** (parallel with format check) — unit tests, integration tests, and E2E tests (`--ignored`) in a single job
 3. **Lint** (depends on format check) — clippy with zero warnings
-4. **Performance Regression** (depends on tests) — wrk-based load testing against baseline (built with `ci-release` profile)
+4. **Performance Regression** (depends on tests) — self-relative overhead measurement comparing gateway vs direct backend RPS within the same run (built with `ci-release` profile, no stored baseline needed)
 
 All four jobs must pass for a PR to merge.
 

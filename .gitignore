@@ -3,6 +3,10 @@
 **/target/
 **/*.rs.bk
 
+# Python
+__pycache__/
+*.pyc
+
 # IDE
 .vscode/
 .idea/
@@ -31,11 +35,5 @@ comparison/results/*.txt
 comparison/results/*.html
 comparison/results/*.json
 
-# Performance test artifacts (keep baseline.json and scripts)
+# Performance test artifacts
 tests/performance/ci_results/
-tests/performance/health_results.txt
-tests/performance/users_results.txt
-tests/performance/backend_results.txt
-tests/performance/quick_test.txt
-tests/performance/performance_report.html
-tests/performance/cached_baseline.json
