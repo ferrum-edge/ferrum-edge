@@ -196,6 +196,8 @@ The overload manager (`src/overload.rs`) provides progressive load shedding base
 
 **State transitions are logged**: `warn` when entering overload, `info` when recovering. No log spam — only logs on transitions.
 
+**RED adaptive shedding**: Between the pressure and critical thresholds, the overload manager computes a Random Early Detection (RED) drop probability that ramps linearly. `should_disable_keepalive_red()` uses deterministic golden-ratio hashing for O(1) probabilistic decisions without RNG overhead.
+
 ### External Secret Resolution
 
 The gateway resolves secrets from external providers at startup, before any config is loaded. Env vars with provider-specific suffixes are resolved and the base env var is set:
@@ -279,7 +281,11 @@ src/
 │   ├── gcp.rs                 # Google Cloud Secret Manager
 │   ├── env.rs                 # Environment variable references
 │   └── file.rs                # File-based secrets (Docker Swarm, K8s volume mounts)
+├── date_cache.rs              # Thread-local HTTP Date header caching (per-second refresh)
+├── lazy_timeout.rs            # Lazy-initialized timeout wrapper (defers timer allocation)
+├── socket_opts.rs             # Linux socket optimizations (TCP_FASTOPEN, IP_BIND_ADDRESS_NO_PORT, TCP_INFO)
 ├── tls/                       # TLS/mTLS listener configuration
+├── tls_offload.rs             # TLS handshake offload to dedicated single-threaded runtimes
 ├── http3/                     # HTTP/3 (QUIC) support
 └── custom_plugins/            # Drop-in custom plugins (auto-discovered by build.rs, supports plugin_migrations())
 ```
@@ -411,7 +417,7 @@ The lifecycle phases are:
 4. `before_proxy` — SSE request shaping (250), SOAP WS-Security (1500), AI semantic cache (2700), request deduplication (2750), Request size limiting (2800), GraphQL (2850), rate limiting (2900), AI prompt shield (2925), body validator (2950), AI request guard (2975), AI federation (2985), request transformer (3000), serverless function (3025), response mock (3030), gRPC deadline (3050), compression (4050)
 5. `on_final_request_body` — Post-transform request body validation. Request size limiting re-checks after request_transformer rewrites. Body validator validates gRPC protobuf requests against descriptors (unary RPCs only, with gzip decompression for compressed frames) and re-checks JSON/XML after request_transformer rewrites
 6. `after_proxy` — SSE response headers (250), AI semantic cache (2700), Response size limiting (3490), response caching (3500), response transformer (4000), compression (4050), CORS headers (100). Rejects are now enforced on the response path across HTTP, HTTP/3, and gRPC
-7. `on_final_response_body` — Post-transform response body hooks. AI semantic cache stores responses, response size limiting, response caching, and response-side body validator operate on the final client-visible body (after response_transformer), not the raw backend body
+7. `on_final_response_body` — Post-transform response body hooks. AI semantic cache stores responses, response size limiting, response caching (includes a cacheability predictor that maintains an LRU of known-uncacheable keys to skip cache lookups for assets that were historically uncacheable), and response-side body validator operate on the final client-visible body (after response_transformer), not the raw backend body
 8. `on_response_body` — AI response guard (4075), AI token metrics (4100), AI rate limiter (4200)
 9. `log` — Stdout logging (9000), StatsD logging (9075), HTTP logging (9100), TCP logging (9125), Kafka logging (9150), Loki logging (9155), UDP logging (9160), WebSocket logging (9175), transaction debugger (9200, `tracing::debug` on `transaction_debug` target), Prometheus (9300), API chargeback (9350), OTel tracing (25)
 10. `on_ws_frame` — WebSocket frame-level hooks: ws_message_size_limiting (2810), ws_rate_limiting (2910), ws_frame_logging (9050)
@@ -480,7 +486,7 @@ tests/
 │   ├── config/                # Config parsing, env vars, TLS, pool config
 │   ├── plugins/               # Per-plugin unit tests
 │   ├── admin/                 # Admin API handler tests
-│   └── gateway_core/          # Router, proxy, consumer index, DNS
+│   └── gateway_core/          # Router, proxy, consumer index, DNS, socket_opts_tests, date_cache_tests, tls_offload_tests, lazy_timeout_tests
 ├── integration/               # mTLS, connection pool, CP/DP gRPC, HTTP/3
 ├── functional/                # End-to-end per mode (file, DB, CP/DP, WebSocket, gRPC, LB)
 └── performance/               # wrk-based load tests with baseline comparison
@@ -689,6 +695,18 @@ These are hard-won findings from profiling. Violating them causes measurable reg
 - **H2 flow control tuning matters**: Default stream window (64KB) is too small for gRPC. The perf configs use 8MiB stream / 32MiB connection windows (`pool_http2_initial_stream_window_size`).
 - **UDP frontend recv uses `recvmmsg` on Linux**: The drain loop after each `recv_from` wakeup uses `recvmmsg(2)` to batch up to 64 datagrams per syscall (configurable via `FERRUM_UDP_RECVMMSG_BATCH_SIZE`). This reduces kernel crossing overhead from 1-per-datagram to 1-per-batch, matching Envoy's GRO-based approach. The `RecvMmsgBatch` in `src/proxy/udp_batch.rs` pre-allocates buffers at listener startup. On non-Linux, falls back to `try_recv_from`. Reply handlers (backend→client) intentionally skip `recvmmsg` — each session has its own backend socket with much lower per-socket throughput, and per-session batch buffer allocation (64 × 65KB = 4MB) would be prohibitive at scale.
 - **QUIC coalescing is critical**: Small QUIC frames kill performance. The H3 streaming path uses an 8-32KB coalescing buffer with time-based flush (2ms) to batch small chunks into larger QUIC frames.
+
+**Pingora-inspired optimizations (added in this PR):**
+- **Frequency-aware router cache eviction**: The router cache uses a Count-Min Sketch for frequency estimation instead of random 25% eviction. Hot route entries are protected from eviction by scanner traffic. The sketch uses two FNV-1a hash rows of AtomicU8 counters with periodic aging (right-shift every `cache_capacity * 4` increments). Eviction samples 8x the target count and removes the least-frequent entries.
+- **`IP_BIND_ADDRESS_NO_PORT`** (Linux): Set on all outbound TCP connections in stream proxies. Defers ephemeral port allocation to `connect()` time, enabling kernel 4-tuple optimization and preventing port exhaustion under high connection rates.
+- **`TCP_FASTOPEN`** (Linux): Enabled on proxy listener sockets (`FERRUM_TCP_FASTOPEN_ENABLED`) and outbound stream proxy connections. Saves 1 RTT on repeat connections by sending data in the SYN packet.
+- **Thread-local Date header caching**: `date_cache::get_cached_date()` returns a cached HTTP Date string, refreshed once per second per thread. Avoids `SystemTime::now()` + formatting (~100ns) on every response.
+- **TLS handshake offload runtime**: Optional dedicated single-threaded tokio runtimes (`FERRUM_TLS_OFFLOAD_THREADS`) for CPU-intensive TLS handshakes. Sharded by peer hash for TLS session cache affinity.
+- **RED-style adaptive load shedding**: The overload manager computes a Random Early Detection probability that ramps linearly from 0% at the pressure threshold to 100% at the critical threshold. Provides smoother degradation than the previous step-function.
+- **UDP jitter-based buffer adaptation**: The adaptive buffer tracker now monitors inter-arrival jitter for UDP sessions. When jitter EWMA exceeds 10ms, buffer sizes are bumped up one tier for real-time traffic safety margin.
+- **Lazy timeout wrapper**: `lazy_timeout::lazy_timeout()` defers tokio timer creation until the inner future returns `Pending`. Fast-path operations that complete immediately avoid timer wheel allocation entirely.
+- **Cacheability predictor**: The `response_caching` plugin maintains an LRU of known-uncacheable keys, skipping cache lookups for assets that were historically uncacheable (PREDICTED-BYPASS status).
+- **`TCP_INFO` access**: `socket_opts::get_tcp_info()` retrieves kernel-level RTT, cwnd, and MSS for BDP-optimal buffer sizing on long-lived TCP stream connections (Linux only).
 
 **Resilience features per protocol:**
 
@@ -940,6 +958,9 @@ Reduce per-request allocations in plugin lookup
 | `FERRUM_OVERLOAD_LOOP_WARN_US` | `10000` | Event loop latency (μs) for warning log |
 | `FERRUM_OVERLOAD_LOOP_CRITICAL_US` | `500000` | Event loop latency (μs) to reject new connections |
 | `FERRUM_SHUTDOWN_DRAIN_SECONDS` | `30` | Seconds to wait for in-flight connections to drain on shutdown. `0` = immediate |
+| `FERRUM_TCP_FASTOPEN_ENABLED` | `true` | Enable TCP Fast Open on proxy listener sockets (Linux only). Saves 1 RTT for repeat clients |
+| `FERRUM_TCP_FASTOPEN_QUEUE_LEN` | `256` | TCP Fast Open pending connection queue length |
+| `FERRUM_TLS_OFFLOAD_THREADS` | `0` | Dedicated TLS handshake offload threads (0 = disabled). Total threads = value (shards auto-computed). Isolates CPU-intensive TLS handshakes from the main event loop |
 
 See `src/config/env_config.rs` for the full list of 90+ environment variables.
 

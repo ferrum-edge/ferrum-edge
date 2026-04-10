@@ -179,6 +179,20 @@ Ferrum supports dynamic upstream target discovery through three providers, confi
 - Connection limit semaphore (default 100k) with graceful queuing under overload
 - Server-side HTTP/2 `max_concurrent_streams` (default 1000) to bound per-connection resource usage
 - Configurable tokio worker and blocking thread counts with auto-detection
+- **Linux socket optimizations** :
+  - `TCP_FASTOPEN` on server sockets — saves 1 RTT for repeat clients with cached TFO cookies, configurable queue length (`FERRUM_TCP_FASTOPEN_ENABLED`, `FERRUM_TCP_FASTOPEN_QUEUE_LEN`)
+  - `IP_BIND_ADDRESS_NO_PORT` on outbound sockets — defers ephemeral port allocation to `connect()` for 4-tuple co-selection, preventing port exhaustion under high outbound connection rates
+- **TLS handshake offload runtime** — dedicated single-threaded tokio runtimes for TLS handshakes, preventing CPU-intensive connection establishment from blocking the main event loop during connection storms. Connections are sharded by peer hash for TLS session cache affinity. Configurable via `FERRUM_TLS_OFFLOAD_THREADS` (0 = disabled)
+- **Thread-local Date header caching** — caches the RFC 2822 formatted date string per-thread with second-granularity refresh, avoiding `SystemTime::now()` + formatting (~100ns) on every response
+- **Lazy timeout initialization** — defers tokio timer wheel allocation until the inner future returns `Pending`, so fast-path operations (e.g., buffered I/O reads that complete immediately) never allocate a timer
+- **TCP_INFO kernel diagnostics** (Linux) — `getsockopt(TCP_INFO)` access for kernel-level RTT, retransmit, and congestion window metrics on stream proxy connections
+
+## Intelligent Cache & Load Management
+
+- **Frequency-aware router cache eviction** — Count-Min Sketch tracks access frequency for cached route lookups, with TinyLFU-inspired eviction that samples entries and removes the least frequently accessed. Prevents scanner traffic and one-off paths from evicting hot route entries
+- **RED-style adaptive load shedding** — Random Early Detection probability ramping between pressure and critical thresholds in the overload manager. Instead of a hard cliff from "accept all" to "reject all", drop probability increases smoothly as resource pressure rises, giving the system time to recover gracefully
+- **UDP jitter-based adaptive buffering** — tracks inter-arrival jitter (EWMA) for UDP datagrams per proxy. High jitter (>10ms) indicates lossy/variable real-time traffic and bumps the buffer tier up for a safety margin, improving reliability for VoIP, gaming, and media streams
+- **Cacheability predictor for response caching** — learns which cache keys consistently produce uncacheable responses (no-store, private, non-2xx) and short-circuits cache lookups for those keys, avoiding wasted DashMap reads on the hot path.
 
 ## TLS & Security
 

@@ -16,11 +16,14 @@ mod connection_pool;
 mod consumer_index;
 #[path = "../custom_plugins/mod.rs"]
 mod custom_plugins;
+mod date_cache;
 mod dns;
 mod dtls;
 mod grpc;
 mod health_check;
 mod http3;
+#[allow(dead_code)]
+mod lazy_timeout;
 mod load_balancer;
 mod metrics;
 mod modes;
@@ -32,8 +35,11 @@ mod retry;
 mod router_cache;
 mod secrets;
 mod service_discovery;
+mod socket_opts;
 mod startup;
 mod tls;
+#[allow(dead_code)]
+mod tls_offload;
 
 use clap::Parser;
 use config::{EnvConfig, OperatingMode};

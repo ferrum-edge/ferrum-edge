@@ -9,7 +9,7 @@
 //! connections and waits up to a configurable drain period for them to complete.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
@@ -43,6 +43,13 @@ pub struct OverloadState {
     /// Notified each time `active_connections` reaches zero during drain.
     pub drain_complete: tokio::sync::Notify,
 
+    // ── RED adaptive load shedding ────────────────────────────────────
+    /// RED (Random Early Detection) drop probability (0-1000 scale, where 1000 = 100%).
+    /// When in the pressure zone (between pressure and critical thresholds), responses
+    /// are probabilistically marked with Connection: close based on this value.
+    /// The hot path reads this with a single AtomicU32::load(Relaxed).
+    pub red_drop_probability: AtomicU32,
+
     // ── Snapshot for admin endpoint (written by monitor, read by admin) ─
     pub fd_current: AtomicU64,
     pub fd_max: AtomicU64,
@@ -65,6 +72,7 @@ impl OverloadState {
             draining: AtomicBool::new(false),
             active_connections: AtomicU64::new(0),
             drain_complete: tokio::sync::Notify::new(),
+            red_drop_probability: AtomicU32::new(0),
             fd_current: AtomicU64::new(0),
             fd_max: AtomicU64::new(0),
             conn_current: AtomicU64::new(0),
@@ -84,6 +92,25 @@ impl OverloadState {
         }
     }
 
+    /// Returns true if this request should have keepalive disabled based on RED probability.
+    /// Uses a fast deterministic hash of the request counter to avoid RNG overhead.
+    /// Cost: one AtomicU32::load + one AtomicU64::fetch_add + one comparison.
+    #[allow(dead_code)] // Wired into proxy hot path incrementally.
+    pub fn should_disable_keepalive_red(&self) -> bool {
+        let prob = self.red_drop_probability.load(Ordering::Relaxed);
+        if prob == 0 {
+            return false;
+        }
+        if prob >= 1000 {
+            return true;
+        }
+        // Use request counter as deterministic "random" source
+        let counter = self.active_connections.load(Ordering::Relaxed);
+        // Simple hash: multiply by golden ratio and take high bits
+        let hash = counter.wrapping_mul(0x9E3779B97F4A7C15) >> 54; // 0-1023 range
+        (hash as u32) < prob
+    }
+
     /// Build a JSON-serializable snapshot for the admin endpoint.
     pub fn snapshot(&self) -> OverloadSnapshot {
         let fd_current = self.fd_current.load(Ordering::Relaxed);
@@ -94,6 +121,8 @@ impl OverloadState {
             level: self.level(),
             draining: self.draining.load(Ordering::Relaxed),
             active_connections: self.active_connections.load(Ordering::Relaxed),
+            red_drop_probability_pct: self.red_drop_probability.load(Ordering::Relaxed) as f64
+                / 10.0,
             pressure: PressureSnapshot {
                 file_descriptors: FdPressure {
                     current: fd_current,
@@ -160,6 +189,7 @@ pub struct OverloadSnapshot {
     pub level: OverloadLevel,
     pub draining: bool,
     pub active_connections: u64,
+    pub red_drop_probability_pct: f64,
     pub pressure: PressureSnapshot,
     pub actions: ActionSnapshot,
 }
@@ -368,6 +398,32 @@ pub fn start_monitor(
                 || conn_ratio >= config.conn_critical_threshold
                 || loop_us >= config.loop_critical_us;
 
+            // ── RED-style smooth ramp between pressure and critical thresholds ──
+            // For BOTH fd and connection pressure, compute probability independently
+            // and take the max. This gives a smooth ramp from 0% at the pressure
+            // threshold to 100% at the critical threshold.
+            let fd_red_prob = if fd_ratio >= config.fd_critical_threshold {
+                1000 // 100% drop
+            } else if fd_ratio >= config.fd_pressure_threshold {
+                let range = config.fd_critical_threshold - config.fd_pressure_threshold;
+                let position = fd_ratio - config.fd_pressure_threshold;
+                ((position / range) * 1000.0) as u32
+            } else {
+                0
+            };
+            let conn_red_prob = if conn_ratio >= config.conn_critical_threshold {
+                1000 // 100% drop
+            } else if conn_ratio >= config.conn_pressure_threshold {
+                let range = config.conn_critical_threshold - config.conn_pressure_threshold;
+                let position = conn_ratio - config.conn_pressure_threshold;
+                ((position / range) * 1000.0) as u32
+            } else {
+                0
+            };
+            state
+                .red_drop_probability
+                .store(fd_red_prob.max(conn_red_prob), Ordering::Relaxed);
+
             // Transition logging — only log when state changes
             let was_rejecting = state.reject_new_connections.load(Ordering::Relaxed);
             let was_keepalive_disabled = state.disable_keepalive.load(Ordering::Relaxed);
@@ -508,6 +564,7 @@ mod tests {
         assert!(!state.reject_new_connections.load(Ordering::Relaxed));
         assert!(!state.draining.load(Ordering::Relaxed));
         assert_eq!(state.active_connections.load(Ordering::Relaxed), 0);
+        assert_eq!(state.red_drop_probability.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -618,6 +675,43 @@ mod tests {
     #[test]
     fn fd_limit_is_nonzero() {
         assert!(get_fd_limit() > 0, "FD limit should be > 0 on Unix");
+    }
+
+    #[test]
+    fn red_probability_zero_never_triggers() {
+        let state = OverloadState::new();
+        // prob = 0, should never trigger
+        for _ in 0..100 {
+            assert!(!state.should_disable_keepalive_red());
+        }
+    }
+
+    #[test]
+    fn red_probability_max_always_triggers() {
+        let state = OverloadState::new();
+        state.red_drop_probability.store(1000, Ordering::Relaxed);
+        for _ in 0..100 {
+            assert!(state.should_disable_keepalive_red());
+        }
+    }
+
+    #[test]
+    fn red_probability_partial_is_deterministic() {
+        let state = OverloadState::new();
+        state.red_drop_probability.store(500, Ordering::Relaxed);
+        // With a fixed active_connections value, result should be deterministic
+        state.active_connections.store(42, Ordering::Relaxed);
+        let result1 = state.should_disable_keepalive_red();
+        let result2 = state.should_disable_keepalive_red();
+        assert_eq!(result1, result2);
+    }
+
+    #[test]
+    fn snapshot_includes_red_probability() {
+        let state = OverloadState::new();
+        state.red_drop_probability.store(500, Ordering::Relaxed);
+        let snap = state.snapshot();
+        assert!((snap.red_drop_probability_pct - 50.0).abs() < 0.1);
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]

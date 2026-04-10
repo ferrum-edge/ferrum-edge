@@ -15,7 +15,7 @@ use dashmap::DashMap;
 use regex::{Regex, RegexSet};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use tracing::{debug, warn};
 
 use crate::config::types::{GatewayConfig, Proxy, wildcard_matches};
@@ -129,6 +129,115 @@ struct RegexCacheEntry {
     matched_len: usize,
 }
 
+/// Lightweight Count-Min Sketch for frequency estimation.
+///
+/// Uses two rows of `AtomicU8` counters with FNV-1a hashing (two different seeds)
+/// to estimate access frequency for cache keys. The sketch supports periodic aging
+/// (right-shift all counters by 1) to adapt to changing workloads.
+///
+/// Memory: `2 * width` bytes. With the default width of 8192, that is 16 KiB.
+struct CountMinSketch {
+    row0: Vec<AtomicU8>,
+    row1: Vec<AtomicU8>,
+    width_mask: usize,
+    /// Total increments across all keys, for triggering periodic aging.
+    total_increments: AtomicU64,
+    /// Age (halve all counters) after this many increments.
+    age_threshold: u64,
+}
+
+impl CountMinSketch {
+    /// Create a new sketch with the given width (rounded up to a power of two).
+    /// `age_threshold` controls how often counters are halved (typically `cache_capacity * 4`).
+    fn new(width: usize, age_threshold: u64) -> Self {
+        let width = width.next_power_of_two();
+        let row0: Vec<AtomicU8> = (0..width).map(|_| AtomicU8::new(0)).collect();
+        let row1: Vec<AtomicU8> = (0..width).map(|_| AtomicU8::new(0)).collect();
+        Self {
+            row0,
+            row1,
+            width_mask: width - 1,
+            total_increments: AtomicU64::new(0),
+            age_threshold,
+        }
+    }
+
+    /// Hash a key using FNV-1a with the given seed.
+    #[inline]
+    fn fnv1a(key: &str, seed: u64) -> u64 {
+        // FNV-1a with a seed-mixed offset basis for two independent hash functions
+        let mut hash: u64 = 0xcbf29ce484222325u64 ^ seed;
+        for byte in key.as_bytes() {
+            hash ^= *byte as u64;
+            hash = hash.wrapping_mul(0x100000001b3u64);
+        }
+        hash
+    }
+
+    /// Increment the frequency count for a key and return the estimated count.
+    /// Triggers aging if the total increment count crosses the threshold.
+    #[inline]
+    fn increment(&self, key: &str) -> u8 {
+        let h0 = Self::fnv1a(key, 0) as usize & self.width_mask;
+        let h1 = Self::fnv1a(key, 0x9e3779b97f4a7c15) as usize & self.width_mask;
+
+        // Saturating increment: cap at 255 to avoid wrap-around
+        let v0 = self.row0[h0]
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                if v < 255 { Some(v + 1) } else { None }
+            })
+            .unwrap_or(255);
+        let v1 = self.row1[h1]
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                if v < 255 { Some(v + 1) } else { None }
+            })
+            .unwrap_or(255);
+
+        // Check if we need to age
+        let total = self.total_increments.fetch_add(1, Ordering::Relaxed) + 1;
+        if total.is_multiple_of(self.age_threshold) {
+            self.age();
+        }
+
+        // Return post-increment min (the fetched value is pre-increment, so add 1)
+        let c0 = if v0 < 255 { v0 + 1 } else { 255 };
+        let c1 = if v1 < 255 { v1 + 1 } else { 255 };
+        c0.min(c1)
+    }
+
+    /// Estimate the frequency of a key without incrementing.
+    #[inline]
+    fn estimate(&self, key: &str) -> u8 {
+        let h0 = Self::fnv1a(key, 0) as usize & self.width_mask;
+        let h1 = Self::fnv1a(key, 0x9e3779b97f4a7c15) as usize & self.width_mask;
+        let v0 = self.row0[h0].load(Ordering::Relaxed);
+        let v1 = self.row1[h1].load(Ordering::Relaxed);
+        v0.min(v1)
+    }
+
+    /// Age all counters by right-shifting by 1 (halves all frequencies).
+    /// This prevents long-running hot entries from permanently dominating.
+    fn age(&self) {
+        for cell in &self.row0 {
+            let _ = cell.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| Some(v >> 1));
+        }
+        for cell in &self.row1 {
+            let _ = cell.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| Some(v >> 1));
+        }
+    }
+
+    /// Reset all counters to zero (used on full cache rebuild).
+    fn reset(&self) {
+        for cell in &self.row0 {
+            cell.store(0, Ordering::Relaxed);
+        }
+        for cell in &self.row1 {
+            cell.store(0, Ordering::Relaxed);
+        }
+        self.total_increments.store(0, Ordering::Relaxed);
+    }
+}
+
 /// High-performance router cache with pre-sorted route table and partitioned lookup caches.
 ///
 /// The route table is rebuilt atomically (via ArcSwap) whenever configuration changes,
@@ -152,9 +261,12 @@ pub struct RouterCache {
     regex_cache: DashMap<String, RegexCacheEntry>,
     /// Maximum entries in each cache partition before eviction.
     max_cache_entries: usize,
-    /// Monotonic counters for random-sample eviction per partition.
+    /// Monotonic counters for eviction tracking per partition.
     prefix_eviction_counter: AtomicU64,
     regex_eviction_counter: AtomicU64,
+    /// Frequency sketch shared by both cache partitions.
+    /// Tracks access frequency for frequency-aware eviction (least-frequent-of-sample).
+    frequency_sketch: CountMinSketch,
 }
 
 impl RouterCache {
@@ -165,6 +277,10 @@ impl RouterCache {
     /// Regex routes are compiled at build time, not per-request.
     pub fn new(config: &GatewayConfig, max_cache_entries: usize) -> Self {
         let table = Self::build_route_table(config);
+        // Sketch width: 2x cache capacity, clamped to [1024, 65536], power of two.
+        let sketch_width = (max_cache_entries * 2).clamp(1024, 65536);
+        // Age after cache_capacity * 4 increments to adapt to workload changes.
+        let age_threshold = (max_cache_entries as u64).saturating_mul(4).max(1);
         Self {
             route_table: ArcSwap::new(Arc::new(table)),
             prefix_cache: DashMap::with_capacity(max_cache_entries),
@@ -172,6 +288,7 @@ impl RouterCache {
             max_cache_entries,
             prefix_eviction_counter: AtomicU64::new(0),
             regex_eviction_counter: AtomicU64::new(0),
+            frequency_sketch: CountMinSketch::new(sketch_width, age_threshold),
         }
     }
 
@@ -185,6 +302,7 @@ impl RouterCache {
         self.route_table.store(Arc::new(table));
         self.prefix_cache.clear();
         self.regex_cache.clear();
+        self.frequency_sketch.reset();
         debug!(
             "Router cache rebuilt: {} routes, caches cleared",
             config.proxies.len()
@@ -206,6 +324,8 @@ impl RouterCache {
 
         // Fast path 1: check prefix cache (includes negative entries for total misses)
         if let Some(entry) = self.prefix_cache.get(cache_key.as_str()) {
+            // Record access frequency for this cache key
+            self.frequency_sketch.increment(&cache_key);
             return entry.value().as_ref().map(|proxy| RouteMatch {
                 proxy: Arc::clone(proxy),
                 path_params: Vec::new(),
@@ -215,6 +335,8 @@ impl RouterCache {
 
         // Fast path 2: check regex cache (only contains positive matches)
         if let Some(entry) = self.regex_cache.get(cache_key.as_str()) {
+            // Record access frequency for this cache key
+            self.frequency_sketch.increment(&cache_key);
             let cached = entry.value();
             return Some(RouteMatch {
                 proxy: Arc::clone(&cached.proxy),
@@ -227,7 +349,8 @@ impl RouterCache {
         let table = self.route_table.load();
         let result = Self::search_route_table(&table, host, path);
 
-        // Cache the result in the appropriate partition
+        // Cache the result in the appropriate partition.
+        // Increment sketch on insert so the new entry starts with a frequency of 1.
         match &result {
             Some(route_match)
                 if !route_match.path_params.is_empty() || is_regex_proxy(&route_match.proxy) =>
@@ -236,6 +359,7 @@ impl RouterCache {
                 if self.regex_cache.len() >= self.max_cache_entries {
                     self.evict_regex_sample();
                 }
+                self.frequency_sketch.increment(&cache_key);
                 self.regex_cache.insert(
                     cache_key,
                     RegexCacheEntry {
@@ -250,6 +374,7 @@ impl RouterCache {
                 if self.prefix_cache.len() >= self.max_cache_entries {
                     self.evict_prefix_sample();
                 }
+                self.frequency_sketch.increment(&cache_key);
                 self.prefix_cache
                     .insert(cache_key, Some(Arc::clone(&route_match.proxy)));
             }
@@ -258,6 +383,7 @@ impl RouterCache {
                 if self.prefix_cache.len() >= self.max_cache_entries {
                     self.evict_prefix_sample();
                 }
+                self.frequency_sketch.increment(&cache_key);
                 self.prefix_cache.insert(cache_key, None);
             }
         }
@@ -370,23 +496,38 @@ impl RouterCache {
             + table.catch_all_regex.entries.len()
     }
 
-    /// Evict ~25% of prefix cache entries using counter-based pseudo-random sampling.
+    /// Evict low-frequency entries from the prefix cache using frequency-guided sampling.
+    ///
+    /// Samples up to `8 * target_removals` entries from the DashMap, estimates each
+    /// entry's access frequency via the Count-Min Sketch, and removes the least
+    /// frequent entries. This protects hot cache entries from eviction while keeping
+    /// the eviction cost proportional to the sample size, not the cache size.
     fn evict_prefix_sample(&self) {
-        evict_dashmap_sample(
+        let removed = frequency_aware_evict(
             &self.prefix_cache,
+            &self.frequency_sketch,
             self.max_cache_entries,
-            &self.prefix_eviction_counter,
-            "prefix",
+        );
+        self.prefix_eviction_counter
+            .fetch_add(removed as u64, Ordering::Relaxed);
+        debug!(
+            "Router prefix cache evicted {} entries (was at capacity {})",
+            removed, self.max_cache_entries
         );
     }
 
-    /// Evict ~25% of regex cache entries using counter-based pseudo-random sampling.
+    /// Evict low-frequency entries from the regex cache using frequency-guided sampling.
     fn evict_regex_sample(&self) {
-        evict_dashmap_sample(
+        let removed = frequency_aware_evict(
             &self.regex_cache,
+            &self.frequency_sketch,
             self.max_cache_entries,
-            &self.regex_eviction_counter,
-            "regex",
+        );
+        self.regex_eviction_counter
+            .fetch_add(removed as u64, Ordering::Relaxed);
+        debug!(
+            "Router regex cache evicted {} entries (was at capacity {})",
+            removed, self.max_cache_entries
         );
     }
 
@@ -807,35 +948,54 @@ fn is_regex_proxy(proxy: &Proxy) -> bool {
     proxy.listen_path.starts_with('~')
 }
 
-/// Evict ~25% of entries from a DashMap using counter-based pseudo-random sampling.
-fn evict_dashmap_sample<V>(
+/// Evict entries from a DashMap using frequency-guided sampling.
+///
+/// Samples a bounded number of entries, estimates each entry's access frequency
+/// via the Count-Min Sketch, then removes the least frequent entries from the sample.
+/// This approach is O(sample_size), not O(cache_size), and protects frequently
+/// accessed entries from eviction (similar to Redis LFU and TinyUFO).
+///
+/// Returns the number of entries actually removed.
+fn frequency_aware_evict<V>(
     map: &DashMap<String, V>,
+    sketch: &CountMinSketch,
     max_entries: usize,
-    counter: &AtomicU64,
-    label: &str,
-) {
+) -> usize {
     let target_removals = max_entries / 4;
-    let seed = counter.fetch_add(1, Ordering::Relaxed);
+    if target_removals == 0 {
+        return 0;
+    }
+    let sample_size = target_removals * 8;
+
+    // Collect a sample of (key, frequency) pairs by iterating the DashMap.
+    // DashMap::iter() yields entries in shard order (pseudo-random relative to
+    // insertion order), so taking the first N entries is effectively a random sample.
+    let mut sample: Vec<(String, u8)> = Vec::with_capacity(sample_size);
+    for entry in map.iter() {
+        if sample.len() >= sample_size {
+            break;
+        }
+        let freq = sketch.estimate(entry.key());
+        sample.push((entry.key().clone(), freq));
+    }
+
+    if sample.is_empty() {
+        return 0;
+    }
+
+    // Sort by frequency ascending so the least-frequent entries are first.
+    sample.sort_unstable_by_key(|&(_, freq)| freq);
+
+    // Remove the lowest-frequency entries up to target_removals.
+    let to_remove = sample.len().min(target_removals);
     let mut removed = 0;
-
-    let mut keep_count = 0u64;
-    map.retain(|_, _| {
-        if removed >= target_removals {
-            return true;
-        }
-        keep_count += 1;
-        if (keep_count.wrapping_mul(seed.wrapping_add(7))).is_multiple_of(4) {
+    for (key, _) in &sample[..to_remove] {
+        if map.remove(key).is_some() {
             removed += 1;
-            false
-        } else {
-            true
         }
-    });
+    }
 
-    debug!(
-        "Router {} cache evicted {} entries (was at capacity {})",
-        label, removed, max_entries
-    );
+    removed
 }
 
 /// Build a cache key from host and path with exact-capacity pre-allocation.

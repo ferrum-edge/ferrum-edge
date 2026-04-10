@@ -999,6 +999,10 @@ fn try_next_target(
 }
 
 /// Connect to a plain TCP backend with the given connect timeout.
+///
+/// On Linux, applies `IP_BIND_ADDRESS_NO_PORT` (defers ephemeral port allocation
+/// to connect() for better 4-tuple distribution) and `TCP_FASTOPEN_CONNECT`
+/// (saves 1 RTT on repeat connections) when `tcp_fastopen` is true.
 async fn connect_backend_plain(
     addr: SocketAddr,
     connect_timeout: Duration,
@@ -1008,6 +1012,19 @@ async fn connect_backend_plain(
         .map_err(|_| anyhow::anyhow!("Backend connect timeout to {}", addr))?
         .map_err(|e| anyhow::anyhow!("Backend connect failed to {}: {}", addr, e))?;
     let _ = stream.set_nodelay(true);
+
+    // Apply Linux socket optimizations on the connected socket.
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let fd = stream.as_raw_fd();
+        // IP_BIND_ADDRESS_NO_PORT: defer ephemeral port allocation to connect(),
+        // enabling 4-tuple co-selection to prevent port exhaustion at high rates.
+        let _ = crate::socket_opts::set_ip_bind_address_no_port(fd, true);
+        // TCP_FASTOPEN_CONNECT: send data in SYN on repeat connections (1 RTT saved).
+        let _ = crate::socket_opts::set_tcp_fastopen_client(fd);
+    }
+
     Ok(stream)
 }
 
