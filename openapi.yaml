@@ -100,6 +100,9 @@ paths:
         and monitoring probes.
 
         Returns `503 Service Unavailable` when the overload level is `critical`.
+
+        In control-plane mode (no proxy state), returns a minimal
+        `{"level":"normal","message":"No proxy state available"}` response.
       tags: [Health]
       security: []
       responses:
@@ -108,7 +111,9 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/OverloadSnapshot"
+                oneOf:
+                  - $ref: "#/components/schemas/OverloadSnapshot"
+                  - $ref: "#/components/schemas/OverloadNoProxyState"
         "503":
           description: Overload state is critical — gateway is shedding load
           content:
@@ -2333,7 +2338,20 @@ components:
               type: integer
               description: Present only when `available` is true
 
-    # ── Overload snapshot ─────────────────────────────────────────
+    # ── Overload ──────────────────────────────────────────────────
+    OverloadNoProxyState:
+      type: object
+      description: |
+        Returned in control-plane mode where no proxy state exists.
+      required: [level, message]
+      properties:
+        level:
+          type: string
+          enum: [normal]
+        message:
+          type: string
+          example: No proxy state available
+
     OverloadSnapshot:
       type: object
       required: [level, draining, active_connections, pressure, actions]
