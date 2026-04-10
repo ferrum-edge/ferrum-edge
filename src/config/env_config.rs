@@ -320,6 +320,11 @@ pub struct EnvConfig {
     pub max_header_count: usize,
     pub max_request_body_size_bytes: usize,
     pub max_response_body_size_bytes: usize,
+    /// Threshold (bytes) below which response bodies with a known Content-Length
+    /// are buffered into a single allocation instead of streamed frame-by-frame.
+    /// This reduces async iteration overhead for moderate-sized responses.
+    /// 0 = disabled (always stream). Default: 2 MiB.
+    pub response_buffer_threshold_bytes: usize,
     /// Maximum URL length in bytes (path + query string). 0 = unlimited.
     pub max_url_length_bytes: usize,
     /// Maximum number of query parameters allowed. 0 = unlimited.
@@ -728,6 +733,7 @@ impl Default for EnvConfig {
             max_header_count: 100,
             max_request_body_size_bytes: 10_485_760,
             max_response_body_size_bytes: 10_485_760,
+            response_buffer_threshold_bytes: 2_097_152,
             max_url_length_bytes: 8_192,
             max_query_params: 100,
             max_grpc_recv_size_bytes: 4_194_304,
@@ -991,6 +997,11 @@ impl EnvConfig {
                 conf,
                 "FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES",
                 10_485_760,
+            ),
+            response_buffer_threshold_bytes: resolve_usize(
+                conf,
+                "FERRUM_RESPONSE_BUFFER_THRESHOLD_BYTES",
+                2_097_152,
             ),
             max_url_length_bytes: resolve_usize(conf, "FERRUM_MAX_URL_LENGTH_BYTES", 8_192),
             max_query_params: resolve_usize(conf, "FERRUM_MAX_QUERY_PARAMS", 100),

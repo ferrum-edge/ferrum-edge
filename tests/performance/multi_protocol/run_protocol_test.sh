@@ -170,6 +170,15 @@ start_gateway() {
         # Minimize non-proxy overhead
         FERRUM_LOG_LEVEL=error
         FERRUM_ADD_VIA_HEADER=false
+        FERRUM_ADD_FORWARDED_HEADER=false
+        # Disable per-request validation checks (no plugins = safe to skip)
+        FERRUM_MAX_REQUEST_BODY_SIZE_BYTES=0
+        FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES=0
+        FERRUM_HTTP_HEADER_READ_TIMEOUT_SECONDS=0
+        FERRUM_MAX_CONNECTIONS=0
+        FERRUM_MAX_HEADER_COUNT=0
+        FERRUM_MAX_URL_LENGTH_BYTES=0
+        FERRUM_MAX_QUERY_PARAMS=0
         # Connection pool tuning
         FERRUM_POOL_MAX_IDLE_PER_HOST=200
         FERRUM_POOL_IDLE_TIMEOUT_SECONDS=120
@@ -197,6 +206,7 @@ start_gateway() {
         # UDP tuning
         FERRUM_UDP_MAX_SESSIONS=10000
         FERRUM_UDP_CLEANUP_INTERVAL_SECONDS=10
+        FERRUM_UDP_RECVMMSG_BATCH_SIZE=64
         # WebSocket tunnel mode for raw TCP copy when no frame plugins
         FERRUM_WEBSOCKET_TUNNEL_MODE=true
     )

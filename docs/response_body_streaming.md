@@ -58,10 +58,24 @@ The field is optional. When omitted, it defaults to `stream`.
 When `response_body_mode: stream` is active and no plugin requires buffering, the gateway:
 
 1. Sends the backend request and receives the response status and headers.
-2. Immediately begins forwarding the response to the client **without waiting for the full body**.
-3. Each chunk from the backend is forwarded to the client as it arrives via a `StreamBody` wrapper over `reqwest::Response::bytes_stream()`.
+2. Checks whether the response qualifies for **adaptive buffering** (see below).
+3. If not buffered, begins forwarding the response to the client **without waiting for the full body** via a `CoalescingBody` adapter that batches small backend chunks (typically 8–32 KB) into larger 128 KB frames for efficient forwarding.
 
-This means the client sees the first byte of the response as soon as the backend sends it, rather than waiting for the entire response to be collected.
+This means the client sees the first byte of the response as soon as the backend sends it, rather than waiting for the entire response to be collected — unless adaptive buffering applies.
+
+### Adaptive Response Buffering
+
+When a backend response has a known `Content-Length` in the range **256 KB – 2 MiB** (configurable), the gateway collects the entire body into a single allocation instead of streaming frame-by-frame. This eliminates async iteration overhead for moderate-sized responses while preserving streaming's latency advantage for small bodies (which complete in a few chunks) and memory advantage for large bodies (which would consume too much memory if buffered).
+
+| Env Var | Default | Description |
+|---------|---------|-------------|
+| `FERRUM_RESPONSE_BUFFER_THRESHOLD_BYTES` | `2097152` (2 MiB) | Upper bound for adaptive buffering. Bodies with known Content-Length between 256 KB and this threshold are buffered. `0` = disabled (always stream). |
+
+This optimization **only activates when no plugins require response body buffering** — when plugins need the body, the existing plugin-forced buffering path takes precedence.
+
+### Response Body Coalescing
+
+For responses that stream (either below the adaptive buffer minimum or above the threshold), the gateway uses a `CoalescingBody` adapter that accumulates small backend chunks into 128 KB frames before yielding to hyper's HTTP encoder. This reduces the number of write syscalls by ~8–16× for large responses compared to forwarding each small chunk individually.
 
 ### Decision Flow
 
@@ -75,10 +89,15 @@ response_body_mode = buffer?
                 Response size limit enabled?
                     └─ Yes →
                         Content-Length present?
-                            └─ Yes, within limit → stream
                             └─ Yes, exceeds limit → reject (502)
+                            └─ Yes, within limit →
+                                256 KB ≤ CL ≤ buffer threshold? → buffer (adaptive)
+                                Otherwise → stream (with coalescing)
                             └─ No Content-Length → buffer (can't verify size)
-                    └─ No (unlimited) → stream
+                    └─ No (unlimited) →
+                        Content-Length present, 256 KB ≤ CL ≤ buffer threshold?
+                            └─ Yes → buffer (adaptive)
+                            └─ No → stream (with coalescing)
 ```
 
 ## Plugin Buffering Override
@@ -197,7 +216,9 @@ Helper constructors:
 - `ProxyBody::full(data)` — Create a buffered body from bytes
 - `ProxyBody::from_string(s)` — Create a buffered body from a string
 - `ProxyBody::empty()` — Create an empty body
-- `ProxyBody::streaming(response)` — Create a streaming body with zero tracking overhead
+- `body::coalescing_body(response, content_length)` — Create a streaming body with chunk coalescing (128 KB target). This is the default for reqwest-backed responses
+- `ProxyBody::streaming_h2(response)` — Create a streaming body from a hyper HTTP/2 response (zero-overhead passthrough for the H2 direct pool and gRPC)
+- `ProxyBody::streaming_incoming(body)` — Create a streaming body from a raw hyper `Incoming` body
 - `ProxyBody::streaming_tracked(response, baseline)` — Create a streaming body with completion tracking, returning `(ProxyBody, Arc<StreamingMetrics>)`
 
 ## When to Use Buffer Mode

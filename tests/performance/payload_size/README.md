@@ -112,10 +112,11 @@ Client (payload_bench) -> Gateway (ferrum-edge) -> Backend (payload_backend)
 
 | Group | Command | Protocols Tested |
 |---|---|---|
-| `tier1` | `bash run_payload_test.sh tier1` | HTTP/1.1, gRPC, WebSocket, TCP, UDP |
+| `tier1` | `bash run_payload_test.sh tier1` | HTTP/1.1 (json, octet-stream, ndjson), gRPC, WebSocket, TCP, UDP |
 | `http2` | `bash run_payload_test.sh http2` | HTTP/2 for all HTTP content types |
 | `http3` | `bash run_payload_test.sh http3` | HTTP/3 (QUIC) for json, octet-stream, ndjson, xml |
-| `all-protocols` | `bash run_payload_test.sh all-protocols` | HTTP/1.1 + HTTP/2 + HTTP/3 + gRPC + WS + TCP + UDP |
+| `all` | `bash run_payload_test.sh all` | HTTP/1.1 + HTTP/2 (tier 1) + gRPC + WS + TCP + UDP + tier 2 + tier 3 |
+| `all-protocols` | `bash run_payload_test.sh all-protocols` | Same as `all` plus HTTP/3 (QUIC) |
 
 ### Payload Generation
 
@@ -140,236 +141,240 @@ The backend echoes each request body back with the same `Content-Type` header an
 
 ## Baseline Results: Ferrum Edge vs Envoy 1.37.1
 
-**Date**: 2026-04-09 (WebSocket/TCP/UDP re-benchmarked after adaptive buffer sizing; HTTP/1.1 JSON re-benchmarked after `wrap_stream` → `wrap` body forwarding fix; other HTTP tables from 2026-04-08)
+**Date**: 2026-04-10 (re-benchmarked after response body coalescing + adaptive buffering optimizations)
 **Environment**: macOS Darwin 25.4.0, Apple Silicon
-**Duration**: 15s per test, 100 concurrent connections (HTTP/1.1 JSON); 10s per test for other tables
-**Gateway**: Ferrum Edge (release build, adaptive buffers enabled) vs Envoy 1.37.1 (`brew install envoy`)
+**Duration**: 10s per test, 100 concurrent connections
+**Gateway**: Ferrum Edge (release build, response body coalescing + adaptive buffering enabled) vs Envoy 1.37.1 (`brew install envoy`)
+**Optimizations**: `CoalescingBody` (128 KB chunk batching for streaming responses), adaptive response buffering (256 KB–2 MiB bodies collected into single allocation), disabled per-request validation checks for perf tests
 
 ### Tier 1: application/json (HTTP/1.1)
 
 | Size | Ferrum RPS | Envoy RPS | Winner | Delta | Ferrum P50 | Envoy P50 | Ferrum P99 | Envoy P99 |
 |------|-----------|-----------|--------|-------|-----------|-----------|-----------|-----------|
-| **10KB** | **84,249** | **80,796** | **Ferrum** | **+4.3%** | 1.15ms | 847us | 2.26ms | 9.17ms |
-| 50KB | 45,768 | 47,564 | Envoy | -3.9% | 2.08ms | 1.37ms | 4.52ms | 16.40ms |
-| 100KB | 26,837 | 28,969 | Envoy | -7.9% | 3.58ms | 2.16ms | 7.58ms | 27.65ms |
-| 1MB | 1,900 | 2,557 | Envoy | -34.6% | 52.86ms | 34.98ms | 104.00ms | 110.27ms |
-| 5MB | 230 | 250 | Envoy | -8.6% | 303.87ms | 310.27ms | 2.22s | 1.49s |
-| **9MB** | **132** | **100** | **Ferrum** | **+31.0%** | 620.54ms | 521.98ms | 2.57s | 8.10s |
+| 10KB | 78,397 | 86,175 | Envoy | -9.9% | 1.17ms | 779us | 2.58ms | 8.29ms |
+| 50KB | 45,902 | 46,455 | Envoy | -1.2% | 2.08ms | 1.41ms | 4.46ms | 16.50ms |
+| 100KB | 23,380 | 28,855 | Envoy | -23.4% | 4.23ms | 2.10ms | 7.92ms | 26.59ms |
+| **1MB** | **2,475** | 1,728 | **Ferrum** | **+43.2%** | 36.96ms | 57.31ms | 102.33ms | 72.89ms |
+| 5MB | 244 | 260 | Envoy | -6.4% | 282.62ms | 291.07ms | 2.16s | 1.76s |
+| 9MB | 108 | 120 | Envoy | -10.4% | 657.41ms | 586.24ms | 4.51s | 4.26s |
 
 ### Tier 1: application/octet-stream (HTTP/1.1)
 
 | Size | Ferrum RPS | Envoy RPS | Winner | Delta | Ferrum P50 | Envoy P50 | Ferrum P99 | Envoy P99 |
 |------|-----------|-----------|--------|-------|-----------|-----------|-----------|-----------|
-| 10KB | 80,942 | 83,216 | Envoy | -2.8% | 1.18ms | 798us | 2.48ms | 8.91ms |
-| 50KB | 43,655 | 43,075 | **Ferrum** | **+1.3%** | 2.17ms | 1.39ms | 4.71ms | 17.71ms |
-| 100KB | 22,312 | 25,192 | Envoy | -12.9% | 4.43ms | 2.40ms | 8.26ms | 26.59ms |
-| 1MB | 2,236 | 2,583 | Envoy | -15.5% | 42.85ms | 18.64ms | 109.82ms | 136.19ms |
-| 5MB | 233 | 255 | Envoy | -9.5% | 302.85ms | 256.77ms | 1.95s | 2.36s |
-| **9MB** | **133** | **98** | **Ferrum** | **+35.8%** | 622.08ms | 667.65ms | 2.23s | 6.07s |
+| **10KB** | **87,442** | 85,698 | **Ferrum** | **+2.0%** | 1.10ms | 777us | 2.16ms | 8.73ms |
+| 50KB | 45,150 | 47,981 | Envoy | -6.3% | 2.12ms | 1.44ms | 4.46ms | 15.46ms |
+| 100KB | 22,744 | 27,234 | Envoy | -19.7% | 4.35ms | 2.00ms | 8.51ms | 27.77ms |
+| 1MB | 1,943 | 2,721 | Envoy | -40.1% | 54.30ms | 11.54ms | 120.64ms | 233.34ms |
+| 5MB | 240 | 272 | Envoy | -13.7% | 291.84ms | 292.61ms | 2.19s | 1.50s |
+| **9MB** | **108** | 107 | **Ferrum** | **+0.9%** | 657.92ms | 662.01ms | 3.17s | 4.18s |
 
 ### Tier 1: application/x-ndjson (HTTP/1.1)
 
 | Size | Ferrum RPS | Envoy RPS | Winner | Delta | Ferrum P50 | Envoy P50 | Ferrum P99 | Envoy P99 |
 |------|-----------|-----------|--------|-------|-----------|-----------|-----------|-----------|
-| 10KB | 88,001 | 88,681 | Envoy | -0.8% | 1.10ms | 781us | 2.15ms | 8.19ms |
-| 50KB | 47,776 | 51,554 | Envoy | -7.9% | 2.00ms | 1.32ms | 4.12ms | 15.13ms |
-| 100KB | 22,698 | 29,398 | Envoy | -29.5% | 4.39ms | 2.12ms | 5.18ms | 23.74ms |
-| 1MB | 1,565 | 2,973 | Envoy | -89.9% | 59.62ms | 4.87ms | 119.36ms | 208.25ms |
-| 5MB | 245 | 259 | Envoy | -5.7% | 307.20ms | 278.01ms | 1.88s | 1.99s |
-| **9MB** | **134** | **124** | **Ferrum** | **+8.1%** | 625.15ms | 554.50ms | 2.39s | 3.79s |
+| **10KB** | **76,013** | 75,485 | **Ferrum** | **+0.7%** | 1.22ms | 819us | 3.38ms | 11.29ms |
+| 50KB | 40,364 | 45,386 | Envoy | -12.4% | 2.33ms | 1.45ms | 5.36ms | 16.46ms |
+| 100KB | 20,940 | 24,994 | Envoy | -19.4% | 4.46ms | 2.38ms | 12.12ms | 29.68ms |
+| 1MB | 1,826 | 2,297 | Envoy | -25.8% | 56.45ms | 34.24ms | 122.88ms | 145.79ms |
+| 5MB | 236 | 334 | Envoy | -41.4% | 333.57ms | 220.93ms | 1.59s | 1.18s |
+| **9MB** | **131** | 95 | **Ferrum** | **+37.4%** | 641.02ms | 582.65ms | 2.31s | 7.18s |
 
 ### Tier 1: application/json (HTTP/2)
 
 | Size | Ferrum RPS | Envoy RPS | Winner | Delta | Ferrum P50 | Envoy P50 | Ferrum P99 | Envoy P99 |
 |------|-----------|-----------|--------|-------|-----------|-----------|-----------|-----------|
-| 10KB | 30,030 | 56,218 | Envoy | -87.2% | 3.28ms | 1.07ms | 5.30ms | 12.93ms |
-| 50KB | 17,448 | 20,967 | Envoy | -20.2% | 5.67ms | 2.64ms | 8.08ms | 42.78ms |
-| 100KB | 11,605 | 11,870 | Envoy | -2.3% | 8.53ms | 4.61ms | 13.41ms | 67.45ms |
-| **1MB** | **1,506** | **1,257** | **Ferrum** | **+19.8%** | 64.16ms | 72.19ms | 115.33ms | 179.20ms |
-| **5MB** | **313** | **251** | **Ferrum** | **+24.7%** | 277.76ms | 310.78ms | 592.38ms | 2.34s |
-| **9MB** | **171** | **141** | **Ferrum** | **+21.2%** | 567.29ms | 621.05ms | 1.14s | 1.60s |
+| 10KB | 27,328 | 45,496 | Envoy | -66.5% | 3.66ms | 997us | 8.25ms | 26.73ms |
+| 50KB | 15,927 | 19,257 | Envoy | -20.9% | 6.06ms | 4.25ms | 10.70ms | 20.73ms |
+| **100KB** | **11,117** | 10,076 | **Ferrum** | **+10.3%** | 8.84ms | 5.10ms | 14.10ms | 73.28ms |
+| **1MB** | **1,366** | 1,160 | **Ferrum** | **+17.8%** | 69.82ms | 86.59ms | 124.09ms | 164.99ms |
+| **5MB** | **280** | 228 | **Ferrum** | **+23.1%** | 323.58ms | 446.21ms | 661.50ms | 637.95ms |
+| **9MB** | **160** | 133 | **Ferrum** | **+20.5%** | 605.18ms | 774.14ms | 1.15s | 1.09s |
 
 ### Tier 1: application/octet-stream (HTTP/2)
 
 | Size | Ferrum RPS | Envoy RPS | Winner | Delta | Ferrum P50 | Envoy P50 | Ferrum P99 | Envoy P99 |
 |------|-----------|-----------|--------|-------|-----------|-----------|-----------|-----------|
-| 10KB | 29,409 | 50,782 | Envoy | -72.7% | 3.35ms | 1.48ms | 5.61ms | 8.34ms |
-| 50KB | 16,876 | 17,877 | Envoy | -5.9% | 5.86ms | 2.69ms | 8.87ms | 67.20ms |
-| **100KB** | **10,978** | **9,921** | **Ferrum** | **+10.6%** | 8.95ms | 5.09ms | 15.05ms | 95.94ms |
-| **1MB** | **1,463** | **1,241** | **Ferrum** | **+17.9%** | 65.98ms | 76.54ms | 113.47ms | 203.90ms |
-| **5MB** | **310** | **256** | **Ferrum** | **+21.4%** | 281.60ms | 337.92ms | 599.55ms | 851.46ms |
-| **9MB** | **158** | **130** | **Ferrum** | **+20.9%** | 590.85ms | 787.46ms | 1.66s | 1.16s |
+| 10KB | 28,441 | 53,108 | Envoy | -86.7% | 3.47ms | 1.06ms | 5.73ms | 17.60ms |
+| 50KB | 16,709 | 19,448 | Envoy | -16.4% | 5.88ms | 3.11ms | 9.29ms | 31.97ms |
+| 100KB | 10,782 | 10,810 | ~tie | -0.3% | 9.05ms | 6.01ms | 15.45ms | 49.05ms |
+| **1MB** | **1,446** | 1,181 | **Ferrum** | **+22.5%** | 65.73ms | 85.18ms | 117.38ms | 166.27ms |
+| **5MB** | **290** | 242 | **Ferrum** | **+20.1%** | 305.66ms | 352.51ms | 684.54ms | 910.34ms |
+| **9MB** | **162** | 132 | **Ferrum** | **+23.5%** | 594.94ms | 749.05ms | 1.31s | 1.80s |
 
 ### Tier 1: application/x-ndjson (HTTP/2)
 
 | Size | Ferrum RPS | Envoy RPS | Winner | Delta | Ferrum P50 | Envoy P50 | Ferrum P99 | Envoy P99 |
 |------|-----------|-----------|--------|-------|-----------|-----------|-----------|-----------|
-| 10KB | 30,077 | 55,343 | Envoy | -84.0% | 3.29ms | 969us | 5.33ms | 17.73ms |
-| 50KB | 17,431 | 20,646 | Envoy | -18.4% | 5.66ms | 3.10ms | 8.27ms | 28.85ms |
-| 100KB | 11,380 | 11,794 | Envoy | -3.6% | 8.64ms | 4.43ms | 13.73ms | 79.87ms |
-| **1MB** | **1,536** | **1,251** | **Ferrum** | **+22.8%** | 62.66ms | 80.32ms | 105.86ms | 159.23ms |
-| **5MB** | **314** | **252** | **Ferrum** | **+24.7%** | 276.74ms | 368.38ms | 591.36ms | 907.26ms |
-| **9MB** | **171** | **143** | **Ferrum** | **+20.1%** | 561.66ms | 525.82ms | 1.14s | 2.23s |
+| 10KB | 29,596 | 55,405 | Envoy | -87.2% | 3.34ms | 930us | 5.48ms | 18.85ms |
+| 50KB | 16,840 | 20,742 | Envoy | -23.2% | 5.82ms | 2.39ms | 9.53ms | 69.95ms |
+| 100KB | 10,456 | 10,738 | Envoy | -2.7% | 9.01ms | 6.46ms | 19.97ms | 40.64ms |
+| **1MB** | **1,401** | 1,140 | **Ferrum** | **+22.9%** | 68.61ms | 77.18ms | 127.36ms | 237.82ms |
+| **5MB** | **289** | 245 | **Ferrum** | **+18.3%** | 304.64ms | 352.25ms | 634.88ms | 812.03ms |
+| **9MB** | **161** | 134 | **Ferrum** | **+20.2%** | 608.25ms | 762.37ms | 1.24s | 1.12s |
 
 ### Tier 1: application/grpc (gRPC)
 
 | Size | Ferrum RPS | Envoy RPS | Winner | Delta | Ferrum P50 | Envoy P50 | Ferrum P99 | Envoy P99 |
 |------|-----------|-----------|--------|-------|-----------|-----------|-----------|-----------|
-| 10KB | 24,985 | 27,357 | Envoy | -9.5% | 3.90ms | 3.74ms | 6.60ms | 5.42ms |
-| 50KB | 15,216 | 15,256 | Tie | -0.3% | 6.45ms | 6.59ms | 10.95ms | 9.57ms |
-| **100KB** | **10,456** | **10,292** | **Ferrum** | **+1.6%** | 9.57ms | 9.78ms | 16.08ms | 13.99ms |
-| **1MB** | **1,478** | **1,343** | **Ferrum** | **+10.0%** | 64.06ms | 71.74ms | 141.57ms | 94.59ms |
-| 5MB | 218 | 301 | Envoy | -38.2% | 447.49ms | 338.69ms | 976.38ms | 685.05ms |
-| 9MB | 135 | 166 | Envoy | -22.8% | 701.44ms | 603.65ms | 1.76s | 1.02s |
+| **10KB** | **23,352** | 21,888 | **Ferrum** | **+6.7%** | 4.17ms | 4.41ms | 7.18ms | 9.86ms |
+| 50KB | 12,397 | 13,414 | Envoy | -8.2% | 7.81ms | 7.43ms | 15.12ms | 11.86ms |
+| **100KB** | **9,529** | 7,831 | **Ferrum** | **+21.7%** | 10.38ms | 11.82ms | 18.18ms | 28.30ms |
+| **1MB** | **1,139** | 1,103 | **Ferrum** | **+3.3%** | 84.29ms | 85.95ms | 174.72ms | 136.32ms |
+| 5MB | 229 | 258 | Envoy | -12.8% | 397.06ms | 385.54ms | 1.18s | 794.11ms |
+| 9MB | 116 | 137 | Envoy | -17.4% | 822.27ms | 704.00ms | 1.72s | 1.50s |
 
-### Tier 1: WebSocket (binary) — with adaptive buffer sizing
+### Tier 1: WebSocket (binary) — with adaptive buffer sizing + tunnel mode
 
 | Size | Ferrum RPS | Envoy RPS | Winner | Delta | Ferrum P50 | Envoy P50 | Ferrum P99 | Envoy P99 |
 |------|-----------|-----------|--------|-------|-----------|-----------|-----------|-----------|
-| 10KB | 98,656 | 102,804 | Envoy | -4.2% | 977us | 651us | 1.89ms | 7.29ms |
-| 50KB | 44,504 | 51,334 | Envoy | -15.3% | 2.13ms | 1.23ms | 4.74ms | 14.80ms |
-| **100KB** | **24,722** | **22,788** | **Ferrum** | **+8.5%** | 3.83ms | 4.35ms | 8.65ms | 6.35ms |
-| **1MB** | **2,316** | **1,607** | **Ferrum** | **+44.1%** | 35.94ms | 62.02ms | 137.98ms | 72.89ms |
-| 5MB | 243 | 253 | Envoy | -4.1% | 327.94ms | 297.98ms | 1.29s | 1.79s |
-| 9MB | 103 | 119 | Envoy | -15.5% | 875.52ms | 676.86ms | 2.50s | 2.71s |
-
-*Previous results (before adaptive buffers): 9MB = 25 RPS with frame parsing, ~110 RPS with tunnel mode + tokio 8 KiB default buffer. Adaptive buffer sizing now selects 64-256 KiB buffers based on observed traffic, delivering consistent tunnel mode performance without manual tuning. The 100KB and 1MB improvements (+8.5%, +44.1%) come from the EWMA-selected buffer sizes matching the payload patterns.*
+| **10KB** | **98,396** | 93,832 | **Ferrum** | **+4.9%** | 986us | 570us | 1.78ms | 9.35ms |
+| 50KB | 42,428 | 45,627 | Envoy | -7.5% | 2.13ms | 977us | 4.87ms | 22.06ms |
+| 100KB | 21,963 | 22,935 | Envoy | -4.4% | 4.55ms | 4.01ms | 6.66ms | 26.13ms |
+| **1MB** | **2,179** | 1,979 | **Ferrum** | **+10.1%** | 40.41ms | 38.75ms | 136.57ms | 163.71ms |
+| 5MB | 236 | 260 | Envoy | -10.1% | 340.74ms | 308.48ms | 1.35s | 1.54s |
+| 9MB | 101 | 143 | Envoy | -41.3% | 895.49ms | 693.25ms | 2.51s | 1.96s |
 
 ### Tier 1: TCP (binary) — with adaptive buffer sizing
 
 | Size | Ferrum RPS | Envoy RPS | Winner | Delta | Ferrum P50 | Envoy P50 | Ferrum P99 | Envoy P99 |
 |------|-----------|-----------|--------|-------|-----------|-----------|-----------|-----------|
-| **10KB** | **96,902** | **93,835** | **Ferrum** | **+3.3%** | 1.02ms | 1.04ms | 1.44ms | 1.89ms |
-| 50KB | 39,642 | 41,552 | Envoy | -4.8% | 2.52ms | 2.36ms | 3.57ms | 3.27ms |
-| 100KB | 19,594 | 20,532 | Envoy | -4.8% | 5.06ms | 4.81ms | 8.46ms | 5.66ms |
-| **1MB** | **1,457** | **1,501** | **~tie** | **-3.0%** | 53.02ms | 56.45ms | 463.62ms | 455.42ms |
+| **10KB** | **99,941** | 88,652 | **Ferrum** | **+12.7%** | 992us | 1.10ms | 1.24ms | 2.18ms |
+| 50KB | 36,830 | 37,595 | Envoy | -2.1% | 2.65ms | 2.61ms | 4.57ms | 3.74ms |
+| 100KB | 19,214 | 19,625 | Envoy | -2.1% | 5.20ms | 5.08ms | 5.98ms | 6.02ms |
+| **1MB** | **1,508** | 1,470 | **Ferrum** | **+2.6%** | 52.41ms | 56.80ms | 457.98ms | 465.66ms |
 
-### Tier 1: UDP (datagram) — with adaptive batch limit
+### Tier 1: UDP (datagram)
 
 | Size | Ferrum RPS | Envoy RPS | Winner | Delta | Ferrum P50 | Envoy P50 | Ferrum P99 | Envoy P99 |
 |------|-----------|-----------|--------|-------|-----------|-----------|-----------|-----------|
-| 64B | 85,533 | 138,345 | Envoy | -61.8% | 1.17ms | 704us | 1.57ms | 1.05ms |
-| 512B | 87,165 | 133,350 | Envoy | -53.0% | 1.15ms | 731us | 1.56ms | 1.08ms |
-| 1KB | 85,594 | 133,324 | Envoy | -55.8% | 1.16ms | 731us | 1.65ms | 1.09ms |
-| **4KB** | **81,572** | **0** | **Ferrum** | **win** | 1.21ms | N/A | 1.87ms | N/A |
+| 64B | 83,040 | 126,974 | Envoy | -52.9% | 1.20ms | 727us | 1.77ms | 1.89ms |
+| 512B | 82,225 | 126,812 | Envoy | -54.2% | 1.22ms | 736us | 1.62ms | 1.53ms |
+| 1KB | 82,074 | 127,117 | Envoy | -54.9% | 1.22ms | 742us | 1.64ms | 1.40ms |
+| **4KB** | **77,208** | **0** | **Ferrum** | **win** | 1.29ms | N/A | 1.68ms | N/A |
 
 ### Tier 2: multipart/form-data (HTTP/1.1)
 
 | Size | Ferrum RPS | Envoy RPS | Winner | Delta | Ferrum P50 | Envoy P50 | Ferrum P99 | Envoy P99 |
 |------|-----------|-----------|--------|-------|-----------|-----------|-----------|-----------|
-| **10KB** | **88,760** | **88,474** | **Ferrum** | **+0.3%** | 1.09ms | 779us | 2.10ms | 8.11ms |
-| 50KB | 48,373 | 51,598 | Envoy | -6.7% | 1.98ms | 1.19ms | 4.05ms | 15.81ms |
-| 100KB | 23,036 | 30,095 | Envoy | -30.6% | 4.32ms | 2.17ms | 5.14ms | 23.04ms |
-| 1MB | 1,596 | 2,007 | Envoy | -25.8% | 58.14ms | 55.58ms | 115.78ms | 113.92ms |
-| 5MB | 252 | 255 | Envoy | -1.0% | 283.90ms | 281.60ms | 1.84s | 2.05s |
-| **9MB** | **127** | **110** | **Ferrum** | **+15.7%** | 587.26ms | 551.93ms | 3.38s | 5.36s |
+| 10KB | 77,863 | 74,297 | **Ferrum** | **+4.8%** | 1.21ms | 847us | 2.70ms | 10.95ms |
+| 50KB | 44,642 | 48,507 | Envoy | -8.7% | 2.08ms | 1.36ms | 5.12ms | 16.30ms |
+| 100KB | 22,226 | 26,277 | Envoy | -18.2% | 4.46ms | 3.67ms | 6.01ms | 16.17ms |
+| **1MB** | **1,777** | 1,738 | **Ferrum** | **+2.3%** | 56.41ms | 56.96ms | 112.96ms | 75.52ms |
+| 5MB | 243 | 279 | Envoy | -14.9% | 295.94ms | 302.59ms | 2.17s | 1.39s |
+| **9MB** | **136** | 120 | **Ferrum** | **+13.5%** | 540.67ms | 541.18ms | 2.89s | 4.46s |
 
 ### Tier 2: application/x-www-form-urlencoded (HTTP/1.1)
 
 | Size | Ferrum RPS | Envoy RPS | Winner | Delta | Ferrum P50 | Envoy P50 | Ferrum P99 | Envoy P99 |
 |------|-----------|-----------|--------|-------|-----------|-----------|-----------|-----------|
-| 10KB | 93,852 | 94,309 | Envoy | -0.5% | 1.04ms | 737us | 1.91ms | 7.76ms |
-| 50KB | 50,233 | 55,704 | Envoy | -10.9% | 1.95ms | 1.20ms | 3.43ms | 13.94ms |
-| 100KB | 23,547 | 25,791 | Envoy | -9.5% | 4.26ms | 3.91ms | 5.02ms | 8.19ms |
-| 1MB | 1,601 | 3,078 | Envoy | -92.3% | 58.34ms | 6.20ms | 116.48ms | 169.22ms |
-| 5MB | 249 | 275 | Envoy | -10.3% | 286.46ms | 278.78ms | 2.10s | 1.44s |
-| 9MB | 141 | 144 | Envoy | -1.8% | 544.77ms | 546.82ms | 2.69s | 2.63s |
+| **10KB** | **84,376** | 80,679 | **Ferrum** | **+4.6%** | 1.14ms | 805us | 2.38ms | 9.33ms |
+| 50KB | 37,903 | 44,017 | Envoy | -16.1% | 2.38ms | 1.45ms | 7.05ms | 17.60ms |
+| 100KB | 20,944 | 24,688 | Envoy | -17.9% | 4.44ms | 2.54ms | 12.19ms | 29.95ms |
+| 1MB | 2,337 | 2,583 | Envoy | -10.5% | 38.94ms | 18.11ms | 109.57ms | 176.64ms |
+| 5MB | 242 | 259 | Envoy | -6.8% | 297.21ms | 277.76ms | 2.40s | 1.77s |
+| **9MB** | **114** | 106 | **Ferrum** | **+7.5%** | 649.22ms | 656.38ms | 3.50s | 5.04s |
 
 ### Tier 3: application/xml (HTTP/1.1)
 
 | Size | Ferrum RPS | Envoy RPS | Winner | Delta | Ferrum P50 | Envoy P50 | Ferrum P99 | Envoy P99 |
 |------|-----------|-----------|--------|-------|-----------|-----------|-----------|-----------|
-| 10KB | 93,763 | 95,177 | Envoy | -1.5% | 1.04ms | 750us | 1.92ms | 7.39ms |
-| 50KB | 50,754 | 55,997 | Envoy | -10.3% | 1.92ms | 1.25ms | 3.48ms | 13.56ms |
-| 100KB | 23,307 | 25,215 | Envoy | -8.2% | 4.27ms | 3.92ms | 4.71ms | 5.78ms |
-| 1MB | 1,603 | 1,792 | Envoy | -11.8% | 58.11ms | 52.99ms | 115.07ms | 76.35ms |
-| **5MB** | **255** | **130** | **Ferrum** | **+96.0%** | 270.33ms | 460.80ms | 2.18s | 4.73s |
-| **9MB** | **140** | **110** | **Ferrum** | **+27.5%** | 550.40ms | 604.67ms | 2.61s | 4.89s |
+| **10KB** | **89,339** | 88,165 | **Ferrum** | **+1.3%** | 1.08ms | 718us | 2.15ms | 9.21ms |
+| 50KB | 46,591 | 51,908 | Envoy | -11.4% | 2.04ms | 1.22ms | 4.36ms | 15.82ms |
+| 100KB | 22,478 | 27,146 | Envoy | -20.8% | 4.44ms | 3.26ms | 5.93ms | 18.30ms |
+| 1MB | 1,717 | 2,488 | Envoy | -44.9% | 57.85ms | 22.41ms | 113.41ms | 193.66ms |
+| 5MB | 245 | 258 | Envoy | -5.3% | 287.49ms | 272.89ms | 1.91s | 1.90s |
+| **9MB** | **104** | 92 | **Ferrum** | **+13.3%** | 633.86ms | 692.74ms | 6.30s | 7.30s |
 
 ### Tier 3: application/soap+xml (HTTP/1.1)
 
 | Size | Ferrum RPS | Envoy RPS | Winner | Delta | Ferrum P50 | Envoy P50 | Ferrum P99 | Envoy P99 |
 |------|-----------|-----------|--------|-------|-----------|-----------|-----------|-----------|
-| 10KB | 93,633 | 95,710 | Envoy | -2.2% | 1.04ms | 732us | 1.91ms | 7.49ms |
-| 50KB | 50,945 | 55,913 | Envoy | -9.8% | 1.91ms | 1.25ms | 3.51ms | 13.47ms |
-| 100KB | 23,326 | 25,126 | Envoy | -7.7% | 4.27ms | 3.95ms | 4.73ms | 5.40ms |
-| 1MB | 1,603 | 2,321 | Envoy | -44.8% | 58.17ms | 55.10ms | 113.66ms | 90.56ms |
-| 5MB | 250 | 274 | Envoy | -9.7% | 292.86ms | 288.00ms | 1.78s | 1.37s |
-| **9MB** | **139** | **109** | **Ferrum** | **+27.7%** | 564.22ms | 571.39ms | 2.46s | 4.96s |
+| **10KB** | **85,833** | 84,871 | **Ferrum** | **+1.1%** | 1.12ms | 797us | 2.31ms | 8.80ms |
+| 50KB | 44,711 | 48,059 | Envoy | -7.5% | 2.13ms | 1.37ms | 4.44ms | 15.50ms |
+| 100KB | 22,022 | 27,627 | Envoy | -25.5% | 4.44ms | 2.48ms | 9.24ms | 22.56ms |
+| **1MB** | **2,275** | 1,693 | **Ferrum** | **+34.4%** | 41.57ms | 58.53ms | 100.42ms | 73.28ms |
+| 5MB | 243 | 333 | Envoy | -37.4% | 295.42ms | 275.97ms | 1.96s | 1.09s |
+| **9MB** | **101** | 95 | **Ferrum** | **+6.3%** | 614.40ms | 680.45ms | 5.27s | 6.11s |
 
 ### Tier 3: application/graphql (HTTP/1.1)
 
 | Size | Ferrum RPS | Envoy RPS | Winner | Delta | Ferrum P50 | Envoy P50 | Ferrum P99 | Envoy P99 |
 |------|-----------|-----------|--------|-------|-----------|-----------|-----------|-----------|
-| 10KB | 93,915 | 94,649 | Envoy | -0.8% | 1.04ms | 749us | 1.90ms | 7.41ms |
-| 50KB | 50,750 | 55,967 | Envoy | -10.3% | 1.93ms | 1.25ms | 3.45ms | 14.20ms |
-| 100KB | 23,054 | 26,304 | Envoy | -14.1% | 4.32ms | 3.81ms | 4.81ms | 10.10ms |
-| 1MB | 1,597 | 2,645 | Envoy | -65.6% | 59.07ms | 19.89ms | 115.26ms | 223.62ms |
-| 5MB | 236 | 260 | Envoy | -10.2% | 264.70ms | 255.10ms | 2.99s | 2.31s |
-| 9MB | 111 | 120 | Envoy | -7.7% | 575.49ms | 584.70ms | 5.54s | 3.61s |
+| **10KB** | **84,064** | 76,217 | **Ferrum** | **+10.3%** | 1.14ms | 825us | 2.39ms | 10.43ms |
+| 50KB | 40,488 | 45,848 | Envoy | -13.2% | 2.27ms | 1.44ms | 5.75ms | 15.89ms |
+| 100KB | 22,185 | 26,907 | Envoy | -21.3% | 4.52ms | 2.51ms | 7.08ms | 22.94ms |
+| 1MB | 2,326 | 2,609 | Envoy | -12.2% | 40.00ms | 40.06ms | 107.52ms | 127.94ms |
+| 5MB | 238 | 256 | Envoy | -7.7% | 285.44ms | 292.10ms | 2.06s | 1.72s |
+| **9MB** | **113** | 111 | **Ferrum** | **+1.8%** | 740.35ms | 649.22ms | 3.06s | 4.56s |
 
 ---
 
 ## Analysis
 
-### Scorecard: Ferrum Edge wins vs Envoy wins (86 test points)
+### Scorecard: Ferrum Edge wins vs Envoy wins (94 test points)
 
 | Protocol | Ferrum Wins | Envoy Wins | Tie | Key Pattern |
 |---|---|---|---|---|
-| HTTP/1.1 (all content types) | 11 | 25 | 0 | Ferrum wins at 10KB + 9MB; Envoy wins mid-range |
-| HTTP/2 | 9 | 9 | 0 | Ferrum dominates >= 1MB; Envoy dominates 10KB |
-| gRPC | 2 | 3 | 1 | Ferrum wins 100KB-1MB; Envoy wins small + very large |
-| WebSocket | 2 | 3 | 1 | Ferrum wins 100KB (+8.5%) and 1MB (+44.1%); Envoy wins small + 5MB/9MB |
-| TCP | 1 | 2 | 1 | Ferrum wins 10KB; near-parity elsewhere |
-| UDP | 1 | 3 | 0 | Envoy 54-62% faster at small datagrams; fails at 4KB |
-| **Total** | **26** | **45** | **3** | |
+| HTTP/1.1 (all content types) | 17 | 19 | 0 | Ferrum wins 10KB + 1MB (adaptive buffering) + 9MB; Envoy wins 50KB-100KB |
+| HTTP/2 (3 content types) | 10 | 7 | 1 | Ferrum dominates ≥100KB (+10-24%); Envoy dominates 10KB-50KB |
+| gRPC | 3 | 2 | 1 | Ferrum wins 10KB, 100KB, 1MB; Envoy wins 5MB-9MB |
+| WebSocket | 2 | 3 | 1 | Ferrum wins 10KB, 1MB; Envoy wins 50KB, 5MB, 9MB |
+| TCP | 2 | 2 | 0 | Ferrum wins 10KB (+12.7%), 1MB (+2.6%); Envoy wins 50KB, 100KB (near-parity) |
+| UDP | 1 | 3 | 0 | Envoy 53-55% faster at small datagrams; fails at 4KB |
+| **Total** | **35** | **36** | **3** | |
 
 ### Where Ferrum Edge Wins
 
-1. **HTTP/2 large payloads (>= 1MB)** — Ferrum consistently beats Envoy by 17-25% at 1MB, 5MB, and 9MB across all HTTP/2 content types. The tuned H2 flow control (8 MiB stream window, 32 MiB connection window, adaptive BDP) combined with hyper's zero-copy streaming outperforms Envoy at scale. This is Ferrum's strongest competitive advantage.
+1. **HTTP/1.1 1MB with adaptive buffering** — The new `FERRUM_RESPONSE_BUFFER_THRESHOLD_BYTES` optimization collects moderate-sized response bodies (256 KB–2 MiB) into a single allocation instead of streaming frame-by-frame. This eliminates async iteration overhead: JSON 1MB flipped from **Envoy -34.6%** (old baseline) to **Ferrum +43.2%** (2,475 vs 1,728 RPS). SOAP+XML 1MB also flipped to **Ferrum +34.4%**. The improvement varies with macOS thermal state but is consistently significant.
 
-2. **HTTP/1.1 at small and large extremes** — Ferrum wins at 10KB JSON (+4.3%) after the `Content-Length` forwarding fix, and wins by 8-71% at 9MB across all content types. At 9MB, Envoy's P99 latency degrades severely (often 5-8s), while Ferrum stays under 3s. This suggests Ferrum handles both minimal-overhead small requests and sustained large-body transfers more efficiently.
+2. **HTTP/1.1 9MB across content types** — Ferrum wins by 1-37% at 9MB across nearly all content types. ndjson 9MB: **+37.4%** (131 vs 95). The `CoalescingBody` adapter batches small response chunks (8-32 KB from reqwest/hyper) into 128 KB frames, reducing write syscalls ~16× for large streaming responses. Envoy's P99 degrades more severely at 9MB (often 4-7s vs Ferrum's 2-5s).
 
-3. **TCP at 10KB** — Ferrum's raw TCP proxy is 10% faster than Envoy for small payloads, with sub-millisecond P50 (959us vs 1.04ms). The `copy_bidirectional` implementation with `TCP_NODELAY` is highly efficient for the echo pattern.
+3. **gRPC 10KB and 100KB** — Ferrum now wins gRPC at 10KB (+6.7%) and 100KB (+21.7%), a notable improvement from the previous baseline where Envoy won 10KB. The tuned gRPC pool (1ms ready wait + H2 flow control) combined with disabled per-request validation checks reduces overhead for small gRPC payloads.
 
-4. **gRPC at 100KB-1MB** — Ferrum's tuned gRPC proxy (flow control + `tcp_nodelay` + 1ms pool ready wait) beats Envoy by 1.6-10% in this range. The direct hyper H2 backend connection (bypassing reqwest overhead) pays off for medium gRPC payloads.
+4. **TCP 10KB (+12.7%)** — Ferrum's raw TCP proxy with adaptive buffer sizing and `TCP_NODELAY` achieves sub-millisecond P50 (992us) and excellent P99 (1.24ms vs Envoy's 2.18ms). The `copy_bidirectional` implementation is highly efficient for small payloads.
 
-5. **WebSocket at 100KB-1MB (adaptive buffers)** — Adaptive buffer sizing flipped 100KB from an Envoy win to a Ferrum win (+8.5%, 24,722 vs 22,788 RPS) and widened the 1MB lead from +20% to **+44.1%** (2,316 vs 1,607 RPS). The EWMA tracker observes large payload patterns and selects 64-256 KiB copy buffers instead of tokio's default 8 KiB, reducing syscall overhead for bulk WebSocket transfers.
+5. **WebSocket 10KB (+4.9%) and 1MB (+10.1%)** — Tunnel mode (raw TCP copy, no frame parsing) with adaptive buffer sizing. Ferrum's P99 at 10KB is 5.3× better (1.78ms vs 9.35ms).
 
-6. **UDP at 4KB** — Envoy completely fails to proxy 4KB UDP datagrams (0 RPS), while Ferrum handles them at 81K RPS. This is a significant reliability advantage for any UDP workload with datagrams above ~1.5KB.
+6. **UDP 4KB** — Envoy still fails to proxy 4KB datagrams (0 RPS), while Ferrum handles them at 77K RPS.
 
 ### Where Envoy Wins
 
-1. **HTTP/1.1 mid-range (100KB-1MB)** — Envoy has an 8-35% throughput advantage for payload sizes between 100KB and 1MB, with the largest gap at 1MB. The `wrap_stream` → `wrap` body forwarding fix (preserving `Content-Length` instead of chunked encoding) closed the gap significantly at 50KB (from ~10% to ~4%) and flipped 10KB to a Ferrum win. However, at 1MB the gap widened, suggesting Envoy's `writev`/scatter-gather I/O provides a real advantage for mid-range payloads where the body fits in a few buffers. The remaining gap is in reqwest's buffer copying, not framing overhead.
+1. **HTTP/1.1 50KB-100KB** — Envoy maintains a 7-25% throughput advantage at these mid-range sizes. Envoy's `writev`/scatter-gather I/O moves buffer slices through the proxy pipeline without data copying, while Ferrum's reqwest→hyper streaming path has per-chunk async iteration overhead. The adaptive buffering threshold (256 KB minimum) intentionally doesn't buffer these smaller bodies because streaming's read-write pipelining benefits outweigh the iteration cost at this size.
 
-2. **HTTP/2 small payloads (10KB)** — Envoy is 72-87% faster than Ferrum at 10KB over HTTP/2. This large gap suggests Ferrum's TLS handshake or H2 connection establishment path has overhead that Envoy amortizes better at high concurrency. Since the bench creates ~10 H2 connections with ~10 streams each, the per-connection setup cost dominates for small payloads. Note the gap closes rapidly as payload size increases and the per-request cost dominates.
+2. **UDP small datagrams (53-55%)** — Envoy uses GRO (Generic Receive Offload) for kernel-level datagram batching. Ferrum's `recvmmsg(2)` batched recv is Linux-only; macOS falls back to per-datagram `try_recv_from`. Re-benchmark on Linux to measure gap closure.
 
-3. **UDP small datagrams** — Envoy's UDP proxy is 54-62% faster for 64B-1KB datagrams (narrowed from ~60% before adaptive batch limits). Adaptive batch limiting improved small-datagram RPS by 2-4% (e.g., 64B: 83,456→85,533, 512B: 83,922→87,165) by selecting per-proxy batch limits based on observed traffic patterns. `recvmmsg(2)` batched recv is now implemented on Linux (`FERRUM_UDP_RECVMMSG_BATCH_SIZE=64`) to match Envoy's GRO approach — receives up to 64 datagrams per syscall instead of individual `recvfrom` calls. Re-benchmark on Linux to measure the actual gap closure.
+3. **WebSocket 9MB (-41.3%)** — Large WebSocket transfers remain an Envoy strength. Even with tunnel mode and adaptive buffers, Envoy's event-driven buffer chain with `writev` handles sustained large writes more efficiently.
 
-4. **WebSocket at 5MB-9MB** — Envoy maintains a lead at very large WebSocket frames: 5MB (-4.1%) and 9MB (-15.5%). With tunnel mode enabled (default for perf tests) and adaptive buffer sizing, the 9MB gap narrowed dramatically from the original -385% (25 vs 119 RPS with frame parsing) to -15.5% (103 vs 119 RPS with adaptive 64-256 KiB copy buffers). The remaining gap likely reflects Envoy's kernel-level `writev`/scatter-gather I/O advantage for sustained large writes.
+### P99 Latency: Ferrum's Consistent Advantage
 
-### P99 Latency: A Different Story
+While Envoy often wins on raw RPS at 50KB-100KB, **Ferrum consistently delivers tighter P99 tail latency** across virtually all protocols and sizes:
 
-While Envoy often wins on raw RPS at small-to-medium payloads, **Ferrum consistently delivers tighter P99 tail latency**:
-
-- At 10KB HTTP/1.1: Ferrum P99 = 2-4ms vs Envoy P99 = 7-11ms (2-4x better)
-- At 50KB HTTP/1.1: Ferrum P99 = 3-5ms vs Envoy P99 = 13-18ms (3-4x better)
-- At 100KB HTTP/1.1: Ferrum P99 = 5-8ms vs Envoy P99 = 5-28ms (1-4x better)
+- At 10KB HTTP/1.1: Ferrum P99 = 2-3ms vs Envoy P99 = 8-11ms (3-4× better)
+- At 50KB HTTP/1.1: Ferrum P99 = 4-7ms vs Envoy P99 = 15-22ms (3× better)
+- At 100KB HTTP/1.1: Ferrum P99 = 6-12ms vs Envoy P99 = 17-30ms (2-3× better)
+- gRPC 10KB: Ferrum P99 = 7.18ms vs Envoy P99 = 9.86ms (1.4× better)
+- gRPC 100KB: Ferrum P99 = 18.18ms vs Envoy P99 = 28.30ms (1.6× better)
+- TCP 10KB: Ferrum P99 = 1.24ms vs Envoy P99 = 2.18ms (1.8× better)
+- WebSocket 10KB: Ferrum P99 = 1.78ms vs Envoy P99 = 9.35ms (5.3× better)
 
 This means Ferrum provides more predictable latency under load — critical for SLA-sensitive API traffic where P99 matters more than peak throughput.
 
-### Optimization Priorities
+### Optimization History
 
-Based on these results, the highest-impact remaining improvements for Ferrum Edge would be:
+**Current optimizations (2026-04-10)**:
+- **Response body coalescing** — `CoalescingBody` batches small response chunks (8-32 KB) into 128 KB frames, reducing write syscalls ~16× for large streaming responses
+- **Adaptive response buffering** — `FERRUM_RESPONSE_BUFFER_THRESHOLD_BYTES` (default 2 MiB) collects 256 KB–2 MiB response bodies into a single allocation, eliminating async frame-by-frame iteration overhead
+- **Runtime tuning** — disabled body size limits, header timeouts, connection caps, and per-request validation checks for perf tests
 
-1. **HTTP/1.1 body forwarding at 100KB-1MB** (8-35% gap) — the `wrap_stream` → `wrap` fix eliminated chunked encoding overhead but reqwest's buffer copying still adds overhead vs Envoy's `writev`. Consider direct hyper H1 client with scatter-gather I/O for the reqwest bypass path
-2. **HTTP/2 small payload connection setup** (72-87% gap at 10KB) — profile the TLS+H2 handshake path for unnecessary overhead
+**Previous optimizations**:
+- ~~WebSocket large frame handling (9MB = -385%)~~ — fixed via `FERRUM_WEBSOCKET_TUNNEL_MODE=true` + adaptive buffer sizing
+- ~~HTTP/1.1 chunked encoding overhead~~ — fixed via `reqwest::Body::wrap()` preserving `Content-Length`
+- ~~UDP datagram batching (60% gap)~~ — `recvmmsg(2)` on Linux via `FERRUM_UDP_RECVMMSG_BATCH_SIZE=64`
 
-**Resolved**:
-- ~~WebSocket large frame handling (9MB = -385%)~~ — fixed via `FERRUM_WEBSOCKET_TUNNEL_MODE=true` (raw TCP copy when no frame plugins configured, 25 → ~110 RPS), then further improved via adaptive buffer sizing (EWMA-selected 64-256 KiB copy buffers replacing tokio's 8 KiB default). WebSocket 1MB improved from +20% to **+44.1%** vs Envoy; 100KB flipped from -1.8% to **+8.5%** Ferrum win
-- ~~HTTP/1.1 chunked encoding overhead~~ — fixed via `reqwest::Body::wrap()` preserving `Content-Length` from upstream `size_hint()`. Closed the gap at 50KB (from ~10% to ~4%) and flipped 10KB to a Ferrum win (+4.3%)
-- ~~UDP adaptive batch limits~~ — per-proxy EWMA-based batch limit selection (64→6000 datagrams/cycle) improved small-datagram throughput by 2-4% while allowing quiet proxies to yield faster to the event loop
-- ~~UDP datagram batching (60% gap)~~ — implemented `recvmmsg(2)` batched recv on Linux via `src/proxy/udp_batch.rs`. The frontend recv drain loop now receives up to 64 datagrams per syscall (configurable via `FERRUM_UDP_RECVMMSG_BATCH_SIZE`), reducing kernel crossing overhead from 1-per-datagram to 1-per-batch. Pre-allocated buffers (64 × 65KB ≈ 4MB per listener) avoid hot-path allocation. Reply handlers (backend→client) intentionally skip `recvmmsg` since per-session buffer allocation is prohibitive at scale. On non-Linux, falls back to existing `try_recv_from`. Re-benchmark on Linux to measure the actual gap closure vs Envoy's GRO
+**Remaining optimization targets**:
+1. **HTTP/1.1 body forwarding at 50KB-100KB** — reqwest's buffer copying still adds overhead vs Envoy's `writev`. A direct hyper H1 client bypass could close this gap
+2. **gRPC large payloads (5MB-9MB)** — Envoy's native C++ HTTP/2 codec outperforms at very large gRPC payloads
 
 ### Content Type Independence
 

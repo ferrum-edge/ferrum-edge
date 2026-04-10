@@ -121,7 +121,7 @@ resolve_content_types() {
         tier3) echo "xml soap-xml graphql" ;;
         http2) echo "json:http2 octet-stream:http2 ndjson:http2 xml:http2 soap-xml:http2 graphql:http2 multipart:http2 form-urlencoded:http2" ;;
         http3) echo "json:http3 octet-stream:http3 ndjson:http3 xml:http3" ;;
-        all)   echo "json octet-stream ndjson grpc ws-binary tcp udp multipart form-urlencoded xml soap-xml graphql" ;;
+        all)   echo "json octet-stream ndjson json:http2 octet-stream:http2 ndjson:http2 grpc ws-binary tcp udp multipart form-urlencoded xml soap-xml graphql" ;;
         all-protocols)
             echo "json octet-stream ndjson json:http2 octet-stream:http2 ndjson:http2 json:http3 octet-stream:http3 grpc ws-binary tcp udp multipart form-urlencoded xml soap-xml graphql"
             ;;
@@ -321,6 +321,7 @@ start_gateway() {
     FERRUM_ADMIN_HTTP_PORT=9000 \
     FERRUM_ADMIN_HTTPS_PORT=9443 \
     FERRUM_ADD_VIA_HEADER=false \
+    FERRUM_ADD_FORWARDED_HEADER=false \
     FERRUM_TLS_NO_VERIFY=true \
     FERRUM_POOL_WARMUP_ENABLED=true \
     FERRUM_POOL_MAX_IDLE_PER_HOST=200 \
@@ -345,6 +346,13 @@ start_gateway() {
     FERRUM_UDP_CLEANUP_INTERVAL_SECONDS=10 \
     FERRUM_UDP_RECVMMSG_BATCH_SIZE=64 \
     FERRUM_WEBSOCKET_TUNNEL_MODE=true \
+    FERRUM_MAX_REQUEST_BODY_SIZE_BYTES=0 \
+    FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES=0 \
+    FERRUM_HTTP_HEADER_READ_TIMEOUT_SECONDS=0 \
+    FERRUM_MAX_CONNECTIONS=0 \
+    FERRUM_MAX_HEADER_COUNT=0 \
+    FERRUM_MAX_URL_LENGTH_BYTES=0 \
+    FERRUM_MAX_QUERY_PARAMS=0 \
     FERRUM_FRONTEND_TLS_CERT_PATH="$SCRIPT_DIR/certs/cert.pem" \
     FERRUM_FRONTEND_TLS_KEY_PATH="$SCRIPT_DIR/certs/key.pem" \
         "$GATEWAY_BIN" > /dev/null 2>&1 &

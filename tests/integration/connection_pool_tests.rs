@@ -102,6 +102,7 @@ fn create_test_env_config() -> ferrum_edge::config::EnvConfig {
         max_single_header_size_bytes: 16384,
         max_request_body_size_bytes: 10485760,
         max_response_body_size_bytes: 10485760,
+        response_buffer_threshold_bytes: 2_097_152,
         dns_cache_ttl_seconds: 300,
         dns_overrides: std::collections::HashMap::new(),
         dns_resolver_address: None,

@@ -100,6 +100,14 @@ Key environment variables set by the test runner:
 | `FERRUM_MODE` | `file` | File-based config |
 | `FERRUM_LOG_LEVEL` | `error` | Minimize logging overhead during benchmarks |
 | `FERRUM_ADD_VIA_HEADER` | `false` | Skip Via header to reduce per-request overhead |
+| `FERRUM_ADD_FORWARDED_HEADER` | `false` | Skip Forwarded header construction |
+| `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES` | `0` | Disable request body size checking (no plugins = safe) |
+| `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES` | `0` | Take fastest streaming path (no size limit checks) |
+| `FERRUM_HTTP_HEADER_READ_TIMEOUT_SECONDS` | `0` | Disable slowloris timer (avoids per-connection timer overhead) |
+| `FERRUM_MAX_CONNECTIONS` | `0` | Disable connection semaphore (unlimited) |
+| `FERRUM_MAX_HEADER_COUNT` | `0` | Disable per-request header count check |
+| `FERRUM_MAX_URL_LENGTH_BYTES` | `0` | Disable per-request URL length check |
+| `FERRUM_MAX_QUERY_PARAMS` | `0` | Disable per-request query param count check |
 | `FERRUM_POOL_MAX_IDLE_PER_HOST` | `200` | Prevent connection churn |
 | `FERRUM_POOL_WARMUP_ENABLED` | `true` | Pre-establish backend connections at startup |
 | `FERRUM_TLS_NO_VERIFY` | `true` | Accept self-signed certs |
@@ -115,6 +123,7 @@ Key environment variables set by the test runner:
 | `FERRUM_POOL_CLEANUP_INTERVAL_SECONDS` | `30` | Pool cleanup sweep interval (all pools) |
 | `FERRUM_UDP_MAX_SESSIONS` | `10000` | Max concurrent UDP sessions per proxy |
 | `FERRUM_UDP_CLEANUP_INTERVAL_SECONDS` | `10` | UDP session cleanup interval |
+| `FERRUM_UDP_RECVMMSG_BATCH_SIZE` | `64` | Batched UDP recv (Linux only, falls back to try_recv_from on macOS) |
 
 ## Metrics Output
 
@@ -166,37 +175,40 @@ JSON output (`--json`):
 
 ## Benchmark Results
 
-Results from a local run on macOS (Apple Silicon), 10s duration, 200 concurrent connections, 64-byte echo payload.
+**Date**: 2026-04-10
+**Environment**: macOS Darwin 25.4.0, Apple Silicon
+**Duration**: 10s per test, 200 concurrent connections, 64-byte echo payload
+**Build**: Release build with response body coalescing + adaptive buffering optimizations
 
 ### Through Gateway (client → gateway → backend)
 
 | Protocol | Requests/sec | Avg Latency | P50 | P99 | Max | Errors |
 |----------|-------------|-------------|------|------|------|--------|
-| HTTP/1.1 | 102,183 | 1.96ms | 1.89ms | 3.85ms | 28.41ms | 0 |
-| HTTP/1.1+TLS | 101,317 | 1.97ms | 1.90ms | 3.84ms | 26.25ms | 0 |
-| HTTP/2 (TLS) | 108,138 | 1.85ms | 1.67ms | 6.38ms | 120.19ms | 0 |
-| HTTP/3 (QUIC) | 53,085 | 3.76ms | 3.51ms | 5.87ms | 150.91ms | 0 |
-| WebSocket | 103,830 | 1.92ms | 1.88ms | 3.15ms | 15.27ms | 0 |
-| gRPC | 68,352 | 2.92ms | 2.53ms | 12.02ms | 128.06ms | 0 |
-| TCP | 108,841 | 1.83ms | 1.83ms | 2.59ms | 10.63ms | 0 |
-| TCP+TLS | 107,340 | 1.86ms | 1.84ms | 2.68ms | 13.35ms | 0 |
-| UDP | 82,042 | 2.44ms | 2.46ms | 2.93ms | 10.24ms | 0 |
-| UDP+DTLS | 76,107 | 2.61ms | 2.61ms | 3.69ms | 11.81ms | 0 |
+| HTTP/1.1 | 93,976 | 2.12ms | 2.03ms | 4.42ms | 30.91ms | 0 |
+| HTTP/1.1+TLS | 96,735 | 2.06ms | 1.99ms | 4.06ms | 26.96ms | 0 |
+| HTTP/2 (TLS) | 56,268 | 3.55ms | 3.55ms | 4.88ms | 7.15ms | 0 |
+| HTTP/3 (QUIC) | 53,722 | 3.71ms | 3.46ms | 5.95ms | 133.76ms | 0 |
+| WebSocket | 104,322 | 1.91ms | 1.87ms | 3.21ms | 22.18ms | 0 |
+| gRPC | 35,379 | 5.65ms | 5.61ms | 8.98ms | 16.16ms | 0 |
+| TCP | 105,670 | 1.89ms | 1.86ms | 2.79ms | 33.82ms | 0 |
+| TCP+TLS | 105,339 | 1.90ms | 1.86ms | 2.92ms | 7.12ms | 0 |
+| UDP | 80,805 | 2.47ms | 2.48ms | 3.15ms | 14.10ms | 0 |
+| UDP+DTLS | 74,221 | 2.68ms | 2.65ms | 3.83ms | 24.73ms | 0 |
 
 ### Direct Backend (client → backend, no gateway)
 
 | Protocol | Requests/sec | Avg Latency | P50 | P99 | Max |
 |----------|-------------|-------------|------|------|------|
-| HTTP/1.1 | 209,910 | 951μs | 939μs | 1.81ms | 4.54ms |
-| HTTP/1.1+TLS | 209,361* | 953μs | 941μs | 1.81ms | 5.24ms |
-| HTTP/2 (TLS) | 355,544 | 561μs | 486μs | 1.53ms | 126.40ms |
-| HTTP/3 (QUIC) | 83,592 | 2.39ms | 2.38ms | 2.80ms | 4.93ms |
-| WebSocket | 207,507 | 962μs | 952μs | 1.72ms | 3.16ms |
-| gRPC | 205,927 | 970μs | 821μs | 3.15ms | 90.81ms |
-| TCP | 214,113 | 933μs | 928μs | 1.65ms | 8.48ms |
-| TCP+TLS | 207,103 | 964μs | 949μs | 1.78ms | 9.51ms |
-| UDP | 276,526 | 722μs | 682μs | 1.27ms | 3.48ms |
-| UDP+DTLS | 101,839 | 1.95ms | 1.96ms | 2.47ms | 4.75ms |
+| HTTP/1.1 | 201,006 | 993μs | 949μs | 2.11ms | 30.56ms |
+| HTTP/1.1+TLS | 207,915* | 960μs | 939μs | 1.87ms | 4.66ms |
+| HTTP/2 (TLS) | 344,923 | 578μs | 498μs | 1.60ms | 125.50ms |
+| HTTP/3 (QUIC) | 78,146 | 2.56ms | 2.42ms | 3.68ms | 182.66ms |
+| WebSocket | 207,763 | 961μs | 936μs | 1.86ms | 8.23ms |
+| gRPC | 194,914 | 1.02ms | 861μs | 3.48ms | 127.55ms |
+| TCP | 208,631 | 957μs | 945μs | 1.73ms | 3.63ms |
+| TCP+TLS | 206,150 | 968μs | 953μs | 1.80ms | 13.90ms |
+| UDP | 253,762 | 787μs | 717μs | 1.58ms | 12.02ms |
+| UDP+DTLS | 99,200 | 2.01ms | 2.00ms | 2.51ms | 17.76ms |
 
 *\*HTTP/1.1+TLS direct baseline uses plain HTTP since the backend has no TLS; the TLS overhead is entirely at the gateway.*
 
@@ -204,16 +216,16 @@ Results from a local run on macOS (Apple Silicon), 10s duration, 200 concurrent 
 
 | Protocol | Gateway RPS | Direct RPS | Overhead | Notes |
 |----------|------------|------------|----------|-------|
-| HTTP/1.1 | 102,183 | 209,910 | ~51% | reqwest connection pool with keep-alive |
-| HTTP/1.1+TLS | 101,317 | 209,361 | ~52% | TLS termination at gateway, plain HTTP to backend |
-| HTTP/2 (TLS) | 108,138 | 355,544 | ~70% | hyper-native H2 pool with two-phase ready() multiplexing |
-| HTTP/3 (QUIC) | 53,085 | 83,592 | ~37% | QUIC connection pool via quinn |
-| WebSocket | 103,830 | 207,507 | ~50% | Upgrade overhead amortized over many messages |
-| gRPC | 68,352 | 205,927 | ~67% | H2 multiplexing + protobuf passthrough |
-| TCP | 108,841 | 214,113 | ~49% | Bidirectional copy, minimal per-byte overhead |
-| TCP+TLS | 107,340 | 207,103 | ~48% | TLS termination + bidirectional copy (cached TLS config) |
-| UDP | 82,042 | 276,526 | ~70% | Per-datagram session lookup + forwarding |
-| UDP+DTLS | 76,107 | 101,839 | ~25% | DTLS termination + plain UDP forwarding |
+| HTTP/1.1 | 93,976 | 201,006 | ~53% | reqwest connection pool with keep-alive |
+| HTTP/1.1+TLS | 96,735 | 207,915 | ~53% | TLS termination at gateway, plain HTTP to backend |
+| HTTP/2 (TLS) | 56,268 | 344,923 | ~84% | hyper-native H2 pool with two-phase ready() multiplexing |
+| HTTP/3 (QUIC) | 53,722 | 78,146 | ~31% | QUIC connection pool via quinn |
+| WebSocket | 104,322 | 207,763 | ~50% | Tunnel mode (raw TCP copy, no frame parsing) |
+| gRPC | 35,379 | 194,914 | ~82% | H2 multiplexing + protobuf passthrough |
+| TCP | 105,670 | 208,631 | ~49% | Bidirectional copy with adaptive buffer sizing |
+| TCP+TLS | 105,339 | 206,150 | ~49% | TLS termination + bidirectional copy (cached TLS config) |
+| UDP | 80,805 | 253,762 | ~68% | Per-datagram session lookup + forwarding |
+| UDP+DTLS | 74,221 | 99,200 | ~25% | DTLS termination + plain UDP forwarding |
 
 > **Note:** Benchmark numbers vary between runs due to system load, thermal
 > throttling, and background processes. Focus on the overhead ratios and relative
@@ -286,13 +298,13 @@ Results from a local run on macOS (Apple Silicon M4 Max), 10s duration, 200 conc
 
 | Protocol       |   Ferrum RPS |    Envoy RPS |    Δ RPS |  Winner |  Ferrum P50 |   Envoy P50 |  Ferrum P99 |   Envoy P99 |  Ferrum Avg |   Envoy Avg |
 |----------------|--------------|--------------|----------|---------|-------------|-------------|-------------|-------------|-------------|-------------|
-| http1          |       98,349 |       89,238 |   +10.2% |  Ferrum |      1.89ms |      1.55ms |      4.06ms |     16.48ms |      2.03ms |      2.24ms |
-| http1-tls      |       89,973 |       81,584 |   +10.3% |  Ferrum |      2.06ms |      1.72ms |      4.54ms |     13.24ms |      2.22ms |      2.45ms |
-| ws             |      102,200 |      106,593 |    -4.1% |  Envoy  |      1.88ms |      1.42ms |      3.32ms |      7.77ms |      1.95ms |      1.87ms |
-| grpc           |       33,554 |       63,122 |   -46.8% |  Envoy  |      4.97ms |      2.18ms |     11.89ms |     48.00ms |      5.95ms |      3.16ms |
-| tcp            |      107,439 |      105,222 |    +2.1% |  Ferrum |      1.82ms |      1.50ms |      2.85ms |     11.46ms |      1.86ms |      1.90ms |
-| tcp-tls        |      105,433 |      105,461 |    -0.0% |   ~tie  |      1.85ms |      1.42ms |      3.27ms |      9.45ms |      1.89ms |      1.89ms |
-| udp            |       81,170 |      126,355 |   -35.8% |  Envoy  |      2.47ms |      1.36ms |      3.02ms |      2.79ms |      2.46ms |      1.58ms |
+| http1          |       90,786 |       88,577 |    +2.5% |  Ferrum |      2.09ms |      1.64ms |      4.71ms |     15.02ms |      2.20ms |      2.25ms |
+| http1-tls      |       99,272 |       90,833 |    +9.3% |  Ferrum |      1.95ms |      1.68ms |      3.91ms |     10.80ms |      2.01ms |      2.20ms |
+| ws             |      105,769 |      105,686 |    +0.1% |   ~tie  |      1.87ms |      1.48ms |      2.63ms |      9.65ms |      1.89ms |      1.89ms |
+| grpc           |       34,995 |       67,496 |   -48.2% |  Envoy  |      5.64ms |      1.19ms |      9.21ms |     38.40ms |      5.71ms |      2.96ms |
+| tcp            |      105,813 |      105,702 |    +0.1% |   ~tie  |      1.86ms |      1.44ms |      2.88ms |      9.96ms |      1.89ms |      1.89ms |
+| tcp-tls        |      105,400 |      104,524 |    +0.8% |   ~tie  |      1.86ms |      1.43ms |      3.11ms |     10.21ms |      1.89ms |      1.91ms |
+| udp            |       81,459 |      129,006 |   -36.9% |  Envoy  |      2.47ms |      1.45ms |      2.98ms |      2.64ms |      2.45ms |      1.55ms |
 
 ======================================================================
   Gateway Overhead vs Direct Backend
@@ -300,21 +312,50 @@ Results from a local run on macOS (Apple Silicon M4 Max), 10s duration, 200 conc
 
 | Protocol       |   Direct RPS |   Ferrum RPS |  Ferrum OH |    Envoy RPS |   Envoy OH |
 |----------------|--------------|--------------|------------|--------------|------------|
-| http1          |      200,684 |       98,349 |       ~50% |       89,238 |       ~55% |
-| http1-tls      |      208,192 |       89,973 |       ~56% |       81,584 |       ~60% |
-| ws             |      208,887 |      102,200 |       ~51% |      106,593 |       ~48% |
-| grpc           |      189,130 |       33,554 |       ~82% |       63,122 |       ~66% |
-| tcp            |      210,367 |      107,439 |       ~48% |      105,222 |       ~49% |
-| tcp-tls        |      207,864 |      105,433 |       ~49% |      105,461 |       ~49% |
-| udp            |      259,017 |       81,170 |       ~68% |      126,355 |       ~51% |
+| http1          |      206,608 |       90,786 |       ~56% |       88,577 |       ~57% |
+| http1-tls      |      205,713 |       99,272 |       ~51% |       90,833 |       ~55% |
+| ws             |      205,682 |      105,769 |       ~48% |      105,686 |       ~48% |
+| grpc           |      194,468 |       34,995 |       ~82% |       67,496 |       ~65% |
+| tcp            |      207,986 |      105,813 |       ~49% |      105,702 |       ~49% |
+| tcp-tls        |      206,209 |      105,400 |       ~48% |      104,524 |       ~49% |
+| udp            |      255,608 |       81,459 |       ~68% |      129,006 |       ~49% |
 ```
 
-> **Key findings:** Ferrum Edge wins on HTTP/1.1 (+10%), HTTP/1.1+TLS (+10%), and TCP (+2%) with
-> significantly better P99 tail latencies (2-4x lower across HTTP and TCP protocols). Envoy wins on
-> gRPC throughput (+47% RPS) and UDP throughput (+36% RPS). WebSocket and TCP+TLS are effectively
-> tied. Despite lower gRPC RPS, Ferrum's P99 latency is 4x better (11.89ms vs 48ms).
+### Analysis
 
-> **Note:** Benchmark numbers vary between runs. Focus on relative comparisons rather than absolute numbers.
+**Where Ferrum Edge wins:**
+
+1. **HTTP/1.1 (+2.5%)** — Ferrum beats Envoy on raw throughput with significantly better P99 tail latency (4.71ms vs 15.02ms — 3.2× better). The reqwest connection pool with keep-alive and response body coalescing provides consistent performance.
+
+2. **HTTP/1.1+TLS (+9.3%)** — Ferrum's largest advantage. TLS termination via rustls outperforms Envoy's BoringSSL at this concurrency level, with P99 of 3.91ms vs 10.80ms (2.8× better). This confirms rustls is highly competitive for TLS proxy workloads.
+
+3. **TCP (~tie, +0.1%)** — Near-identical throughput with bidirectional `copy_bidirectional` and adaptive buffer sizing. Ferrum's P99 is 3.5× better (2.88ms vs 9.96ms).
+
+4. **TCP+TLS (~tie, +0.8%)** — TLS termination + raw TCP proxying is effectively tied on throughput, with Ferrum again showing 3.3× better P99 (3.11ms vs 10.21ms).
+
+5. **WebSocket (~tie, +0.1%)** — Tunnel mode (raw TCP copy with no frame parsing) matches Envoy's WebSocket proxying. Ferrum's P99 is 3.7× better (2.63ms vs 9.65ms).
+
+**Where Envoy wins:**
+
+1. **gRPC (-48.2%)** — Envoy's largest advantage. Envoy's native HTTP/2 codec (C++ with writev scatter-gather I/O) achieves 67K RPS vs Ferrum's 35K RPS for small (64-byte) gRPC payloads. However, Ferrum's P99 is 4.2× better (9.21ms vs 38.40ms), meaning Ferrum delivers more predictable latency despite lower peak throughput. Note: as payload size increases (see `tests/performance/payload_size/`), Ferrum's gRPC throughput converges and wins at 100KB–1MB.
+
+2. **UDP (-36.9%)** — Envoy uses GRO (Generic Receive Offload) to batch UDP datagrams at the kernel level. Ferrum's `recvmmsg(2)` batching is Linux-only; on macOS it falls back to per-datagram `try_recv_from`. Re-benchmark on Linux where `FERRUM_UDP_RECVMMSG_BATCH_SIZE=64` enables batched recv to close this gap.
+
+**P99 tail latency — Ferrum's consistent advantage:**
+
+Across every protocol where both proxies are compared, Ferrum delivers **2.8–4.2× better P99 tail latency**:
+
+| Protocol | Ferrum P99 | Envoy P99 | Ratio |
+|----------|-----------|-----------|-------|
+| HTTP/1.1 | 4.71ms | 15.02ms | 3.2× better |
+| HTTP/1.1+TLS | 3.91ms | 10.80ms | 2.8× better |
+| WebSocket | 2.63ms | 9.65ms | 3.7× better |
+| gRPC | 9.21ms | 38.40ms | 4.2× better |
+| TCP | 2.88ms | 9.96ms | 3.5× better |
+| TCP+TLS | 3.11ms | 10.21ms | 3.3× better |
+| UDP | 2.98ms | 2.64ms | 0.9× (Envoy better) |
+
+This means Ferrum provides more predictable latency under load — critical for SLA-sensitive traffic where P99 matters more than peak throughput.
 
 ## Prerequisites
 

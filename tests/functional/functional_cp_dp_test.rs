@@ -79,6 +79,7 @@ fn create_test_env_config() -> EnvConfig {
         max_single_header_size_bytes: 16384,
         max_request_body_size_bytes: 10_485_760,
         max_response_body_size_bytes: 10_485_760,
+        response_buffer_threshold_bytes: 2_097_152,
         dns_cache_ttl_seconds: 300,
         dns_overrides: HashMap::new(),
         dns_resolver_address: None,

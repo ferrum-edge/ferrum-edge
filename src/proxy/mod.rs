@@ -468,6 +468,7 @@ pub struct ProxyState {
     pub max_header_count: usize,
     pub max_request_body_size_bytes: usize,
     pub max_response_body_size_bytes: usize,
+    pub response_buffer_threshold_bytes: usize,
     pub max_url_length_bytes: usize,
     pub max_query_params: usize,
     pub max_grpc_recv_size_bytes: usize,
@@ -535,6 +536,7 @@ impl ProxyState {
         let max_header_count = env_config.max_header_count;
         let max_request_body_size_bytes = env_config.max_request_body_size_bytes;
         let max_response_body_size_bytes = env_config.max_response_body_size_bytes;
+        let response_buffer_threshold_bytes = env_config.response_buffer_threshold_bytes;
         let max_url_length_bytes = env_config.max_url_length_bytes;
         let max_query_params = env_config.max_query_params;
         let max_grpc_recv_size_bytes = env_config.max_grpc_recv_size_bytes;
@@ -709,6 +711,7 @@ impl ProxyState {
             max_header_count,
             max_request_body_size_bytes,
             max_response_body_size_bytes,
+            response_buffer_threshold_bytes,
             max_url_length_bytes,
             max_query_params,
             max_grpc_recv_size_bytes,
@@ -5627,7 +5630,12 @@ pub async fn handle_proxy_request(
 
             tracked_body
         }
-        ResponseBody::Streaming(resp) => ProxyBody::streaming(resp),
+        ResponseBody::Streaming(resp) => {
+            let cl = response_headers
+                .get("content-length")
+                .and_then(|v| v.parse::<u64>().ok());
+            crate::proxy::body::coalescing_body(resp, cl)
+        }
         ResponseBody::StreamingH2(resp) => ProxyBody::streaming_h2(resp),
         ResponseBody::Buffered(data) => ProxyBody::full(Bytes::from(data)),
     };
@@ -5878,13 +5886,54 @@ async fn proxy_to_backend_retry(
             let mut resp_headers = HashMap::new();
             collect_response_headers(response.headers(), &mut resp_headers);
             if stream_response {
-                retry::BackendResponse {
-                    status_code: status,
-                    body: ResponseBody::Streaming(response),
-                    headers: resp_headers,
-                    connection_error: false,
-                    backend_resolved_ip: resolved_ip.clone(),
-                    error_class: None,
+                // Buffer moderate-sized bodies to avoid streaming overhead
+                let content_length = response
+                    .headers()
+                    .get("content-length")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.parse::<usize>().ok());
+                let threshold = state.response_buffer_threshold_bytes;
+                // Only buffer bodies >= 256 KB where async iteration overhead
+                // dominates. Smaller bodies benefit from streaming's read-write
+                // pipelining (first chunk sent to client while second is read).
+                const BUFFER_MIN: usize = 256 * 1024;
+                if threshold > 0
+                    && content_length.is_some_and(|cl| cl >= BUFFER_MIN && cl <= threshold)
+                {
+                    match response.bytes().await {
+                        Ok(b) => retry::BackendResponse {
+                            status_code: status,
+                            body: ResponseBody::Buffered(b.to_vec()),
+                            headers: resp_headers,
+                            connection_error: false,
+                            backend_resolved_ip: resolved_ip.clone(),
+                            error_class: None,
+                        },
+                        Err(e) => {
+                            warn!("Failed to read backend response body: {}", e);
+                            retry::BackendResponse {
+                                status_code: 502,
+                                body: ResponseBody::Buffered(
+                                    r#"{"error":"Backend response body read failed"}"#
+                                        .as_bytes()
+                                        .to_vec(),
+                                ),
+                                headers: HashMap::new(),
+                                connection_error: true,
+                                backend_resolved_ip: resolved_ip.clone(),
+                                error_class: Some(retry::ErrorClass::ConnectionReset),
+                            }
+                        }
+                    }
+                } else {
+                    retry::BackendResponse {
+                        status_code: status,
+                        body: ResponseBody::Streaming(response),
+                        headers: resp_headers,
+                        connection_error: false,
+                        backend_resolved_ip: resolved_ip.clone(),
+                        error_class: None,
+                    }
                 }
             } else {
                 let body = match response.bytes().await {
@@ -6362,7 +6411,37 @@ async fn proxy_to_backend(
                 // When streaming is requested and Content-Length is present and within
                 // limits, we can safely stream. If there's no Content-Length we must
                 // buffer to enforce the size limit.
+                //
+                // Optimization: when the body is under the buffer threshold, collect
+                // it into a single allocation (avoids async frame-by-frame overhead).
                 if stream_response && content_length.is_some() {
+                    let threshold = state.response_buffer_threshold_bytes;
+                    // Only buffer bodies >= 256 KB where async iteration overhead
+                    // dominates. Smaller bodies benefit from streaming's read-write
+                    // pipelining (first chunk sent to client while second is read).
+                    const BUFFER_MIN: usize = 256 * 1024;
+                    if threshold > 0
+                        && content_length.is_some_and(|cl| cl >= BUFFER_MIN && cl <= threshold)
+                    {
+                        let body = match response.bytes().await {
+                            Ok(b) => b.to_vec(),
+                            Err(e) => {
+                                warn!("Failed to read backend response body: {}", e);
+                                Vec::new()
+                            }
+                        };
+                        return (
+                            retry::BackendResponse {
+                                status_code: status,
+                                body: ResponseBody::Buffered(body),
+                                headers: resp_headers,
+                                connection_error: false,
+                                backend_resolved_ip: resolved_ip.clone(),
+                                error_class: None,
+                            },
+                            retained_body,
+                        );
+                    }
                     return (
                         retry::BackendResponse {
                             status_code: status,
@@ -6397,14 +6476,56 @@ async fn proxy_to_backend(
                     },
                 }
             } else if stream_response {
-                // No size limit and streaming requested — pass through directly
-                retry::BackendResponse {
-                    status_code: status,
-                    body: ResponseBody::Streaming(response),
-                    headers: resp_headers,
-                    connection_error: false,
-                    backend_resolved_ip: resolved_ip.clone(),
-                    error_class: None,
+                // No size limit and streaming requested — pass through directly.
+                // Optimization: buffer moderate-sized bodies with known Content-Length
+                // to avoid async frame-by-frame iteration overhead.
+                let content_length = response
+                    .headers()
+                    .get("content-length")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.parse::<usize>().ok());
+                let threshold = state.response_buffer_threshold_bytes;
+                // Only buffer bodies >= 256 KB where async iteration overhead
+                // dominates. Smaller bodies benefit from streaming's read-write
+                // pipelining (first chunk sent to client while second is read).
+                const BUFFER_MIN: usize = 256 * 1024;
+                if threshold > 0
+                    && content_length.is_some_and(|cl| cl >= BUFFER_MIN && cl <= threshold)
+                {
+                    match response.bytes().await {
+                        Ok(b) => retry::BackendResponse {
+                            status_code: status,
+                            body: ResponseBody::Buffered(b.to_vec()),
+                            headers: resp_headers,
+                            connection_error: false,
+                            backend_resolved_ip: resolved_ip.clone(),
+                            error_class: None,
+                        },
+                        Err(e) => {
+                            warn!("Failed to read backend response body: {}", e);
+                            retry::BackendResponse {
+                                status_code: 502,
+                                body: ResponseBody::Buffered(
+                                    r#"{"error":"Backend response body read failed"}"#
+                                        .as_bytes()
+                                        .to_vec(),
+                                ),
+                                headers: HashMap::new(),
+                                connection_error: true,
+                                backend_resolved_ip: resolved_ip.clone(),
+                                error_class: Some(retry::ErrorClass::ConnectionReset),
+                            }
+                        }
+                    }
+                } else {
+                    retry::BackendResponse {
+                        status_code: status,
+                        body: ResponseBody::Streaming(response),
+                        headers: resp_headers,
+                        connection_error: false,
+                        backend_resolved_ip: resolved_ip.clone(),
+                        error_class: None,
+                    }
                 }
             } else {
                 let body = match response.bytes().await {
