@@ -4,8 +4,9 @@ info:
   description: |
     RESTful API for managing the Ferrum Edge configuration at runtime.
 
-    All endpoints except `/health`, `/status`, and `/metrics` require JWT bearer
-    token authentication via the `Authorization: Bearer <token>` header.
+    All endpoints except `/health`, `/status`, `/metrics`, `/charges`, and
+    `/overload` require JWT bearer token authentication via the
+    `Authorization: Bearer <token>` header.
 
     When the primary database is unavailable, read endpoints transparently fall
     back to the most recent cached configuration and include an
@@ -51,6 +52,8 @@ tags:
     description: Bulk resource creation for high-throughput provisioning
   - name: Backup & Restore
     description: Full configuration backup and restore for disaster recovery and migration
+  - name: Namespaces
+    description: Multi-tenant namespace discovery
 
 paths:
   # ── Health ──────────────────────────────────────────────────────────
@@ -84,6 +87,34 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/HealthResponse"
+
+  # ── Overload ────────────────────────────────────────────────────────
+  /overload:
+    get:
+      operationId: getOverload
+      summary: Overload status
+      description: |
+        Returns the gateway's current overload state including resource pressure
+        metrics (file descriptors, connections, event loop latency) and active
+        load-shedding actions. Unauthenticated so it can be used by load balancers
+        and monitoring probes.
+
+        Returns `503 Service Unavailable` when the overload level is `critical`.
+      tags: [Health]
+      security: []
+      responses:
+        "200":
+          description: Overload state (normal or pressure)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OverloadSnapshot"
+        "503":
+          description: Overload state is critical — gateway is shedding load
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OverloadSnapshot"
 
   # ── Metrics ─────────────────────────────────────────────────────────
   /metrics:
@@ -1112,6 +1143,35 @@ paths:
           $ref: "#/components/responses/NotFound"
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
+
+  # ── Namespaces ──────────────────────────────────────────────────────
+  /namespaces:
+    get:
+      operationId: listNamespaces
+      summary: List all namespaces
+      description: |
+        Returns a list of all distinct namespaces present in the configuration.
+        In database mode, queries the database directly. In file mode, returns
+        the namespaces captured at file load time (before namespace filtering).
+      tags: [Namespaces]
+      responses:
+        "200":
+          description: List of namespace strings
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: string
+                example: ["ferrum", "staging", "production"]
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          description: Database query failed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
 
 # ════════════════════════════════════════════════════════════════════════
 components:
@@ -2272,6 +2332,69 @@ components:
             consumer_count:
               type: integer
               description: Present only when `available` is true
+
+    # ── Overload snapshot ─────────────────────────────────────────
+    OverloadSnapshot:
+      type: object
+      required: [level, draining, active_connections, pressure, actions]
+      properties:
+        level:
+          type: string
+          enum: [normal, pressure, critical]
+          description: Current overload severity level
+        draining:
+          type: boolean
+          description: Whether the gateway is draining connections for shutdown
+        active_connections:
+          type: integer
+          format: uint64
+          description: Number of currently active proxy connections
+        pressure:
+          type: object
+          required: [file_descriptors, connections, event_loop_latency_us]
+          properties:
+            file_descriptors:
+              type: object
+              required: [current, max, ratio]
+              properties:
+                current:
+                  type: integer
+                  format: uint64
+                max:
+                  type: integer
+                  format: uint64
+                ratio:
+                  type: number
+                  format: double
+                  description: current / max (0.0–1.0)
+            connections:
+              type: object
+              required: [current, max, ratio]
+              properties:
+                current:
+                  type: integer
+                  format: uint64
+                max:
+                  type: integer
+                  format: uint64
+                ratio:
+                  type: number
+                  format: double
+                  description: current / max (0.0–1.0)
+            event_loop_latency_us:
+              type: integer
+              format: uint64
+              description: Event loop scheduling latency in microseconds
+        actions:
+          type: object
+          required: [disable_keepalive, reject_new_connections]
+          properties:
+            disable_keepalive:
+              type: boolean
+              description: Whether Connection:close is being sent on responses
+            reject_new_connections:
+              type: boolean
+              description: Whether new connections are being refused
 
     # ── Admin metrics ───────────────────────────────────────────────
     AdminMetrics:
