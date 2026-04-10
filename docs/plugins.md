@@ -2184,6 +2184,7 @@ Example with `concurrent_clients: 10, duration_seconds: 30, ramp: true`:
 With `ramp: false` (default), all clients start sending at t=0 simultaneously.
 
 **Caveats:**
+- **HTTP and GraphQL only**: Synthetic requests are plain HTTP via reqwest. gRPC proxies require HTTP/2 with protobuf length-prefixed framing, and WebSocket proxies require an upgrade handshake — neither is supported. GraphQL works because it is standard HTTP POST. TCP/UDP stream proxies are excluded.
 - **Auth forwarding**: Synthetic requests forward the triggering request's headers. For auth schemes with short-lived tokens (HMAC timestamps), tokens may expire during long tests.
 - **Rate limiting**: Synthetic requests pass through rate limiting plugins, which is realistic but may throttle throughput if limits are tight.
 
