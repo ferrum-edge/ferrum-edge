@@ -241,3 +241,46 @@ Returns:
 ```
 
 See [admin_metrics.md](admin_metrics.md) for the full metrics reference.
+
+## Charges
+
+The `/charges` endpoint exposes per-consumer API usage charges tracked by the `api_chargeback` plugin. It is unauthenticated (like `/metrics` and `/health`) to allow Prometheus scraping without credentials.
+
+```bash
+# Prometheus text format (default)
+curl http://localhost:9000/charges
+
+# JSON format
+curl http://localhost:9000/charges?format=json
+```
+
+**Prometheus format** returns two counter families:
+- `ferrum_api_chargeable_calls_total` — call counts with labels `consumer`, `proxy_id`, `proxy_name`, `status_code`
+- `ferrum_api_charges_total` — monetary charges with an additional `currency` label
+
+**JSON format** returns a nested breakdown:
+```json
+{
+  "currency": "USD",
+  "generated_at": "2025-01-15T10:30:00Z",
+  "consumers": {
+    "alice": {
+      "total_charges": 1.50,
+      "total_calls": 150000,
+      "proxies": {
+        "proxy-abc": {
+          "proxy_name": "Payments API",
+          "total_charges": 1.50,
+          "total_calls": 150000,
+          "by_status": {
+            "200": { "calls": 145000, "charges": 1.45 },
+            "201": { "calls": 5000, "charges": 0.05 }
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+**Multi-node deployments**: Each gateway node accumulates charges independently in memory. In CP/DP topologies, scrape `/charges` from every DP node and aggregate externally. See [plugins.md](plugins.md#api_chargeback) for Prometheus scrape configuration examples.

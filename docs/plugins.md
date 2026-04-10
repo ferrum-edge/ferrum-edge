@@ -966,6 +966,73 @@ the `/metrics` endpoint; this plugin only records request and stream metrics.
 | `stale_entry_ttl_seconds` | Integer | `3600` | How long idle metric entries live before eviction (prevents unbounded memory growth from deleted/recreated proxies) |
 | `cache_invalidation_min_age_ms` | Integer | `500` | Minimum age (ms) of the render cache before `record()` will invalidate it. Under extreme load this prevents an allocation per request — the render TTL is the real freshness guarantee |
 
+### `api_chargeback`
+
+Tracks per-consumer API usage charges based on configurable pricing tiers keyed
+by HTTP status code. Charges accumulate in-memory and are exposed via the admin
+`/charges` endpoint in both Prometheus text and JSON formats for external billing
+system integration.
+
+Only requests with an identified consumer (gateway Consumer or external
+authenticated identity) are charged — anonymous traffic is not tracked. Status
+codes not listed in any pricing tier are free (not tracked).
+
+**Priority:** 9350
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `currency` | String | `"USD"` | Currency label included in Prometheus metrics and JSON output. Informational only — the plugin does not perform currency conversion |
+| `pricing_tiers` | Array | _(required)_ | One or more pricing tiers. Each tier maps a set of status codes to a per-call price |
+| `pricing_tiers[].status_codes` | Array\<Integer\> | _(required)_ | HTTP status codes that trigger this tier's charge. A status code must appear in exactly one tier |
+| `pricing_tiers[].price_per_call` | Number | _(required)_ | Charge per API call (e.g. `0.00001`). Must be non-negative |
+| `render_cache_ttl_seconds` | Integer | `5` | How long the cached `/charges` response is served before rebuilding |
+| `stale_entry_ttl_seconds` | Integer | `3600` | How long idle chargeback entries live before eviction |
+| `cache_invalidation_min_age_ms` | Integer | `500` | Minimum age (ms) of the render cache before `record()` will invalidate it |
+
+**Admin endpoint:** `GET /charges` (unauthenticated, like `/metrics`).
+
+| Query Parameter | Description |
+|---|---|
+| _(none)_ | Prometheus text exposition format — two counter families: `ferrum_api_chargeable_calls_total` (call counts) and `ferrum_api_charges_total` (monetary charges) with labels `consumer`, `proxy_id`, `proxy_name`, `status_code`, and `currency` |
+| `?format=json` | JSON format with nested consumer → proxy → status breakdowns and pre-computed totals |
+
+**Multi-node deployments (CP/DP):** Each gateway node (DP) accumulates charges
+independently in memory. In CP/DP topologies, the CP does not proxy traffic and
+therefore has no chargeback data. You must scrape `/charges` from **every DP
+node** and aggregate externally (e.g., via Prometheus federation, Thanos, or a
+custom collector that sums counters across instances). The same applies to
+multi-instance database or file mode deployments behind a load balancer. Charges
+are monotonically increasing counters, so Prometheus `increase()` or `rate()`
+functions work correctly across scrapes. Counters reset to zero on gateway
+restart — Prometheus handles resets natively via `increase()`.
+
+**Example configuration:**
+
+```yaml
+plugins:
+  - name: api_chargeback
+    config:
+      currency: "USD"
+      pricing_tiers:
+        - status_codes: [200, 201, 202, 204]
+          price_per_call: 0.00001
+        - status_codes: [301, 302]
+          price_per_call: 0.000005
+```
+
+**Example Prometheus scrape config** (multi-DP):
+
+```yaml
+scrape_configs:
+  - job_name: ferrum-chargeback
+    static_configs:
+      - targets:
+          - dp-1:9000
+          - dp-2:9000
+          - dp-3:9000
+    metrics_path: /charges
+```
+
 ### `otel_tracing`
 
 W3C Trace Context propagation and OTLP span export. Runs at priority 25 (earliest plugin) to capture accurate request timing.
