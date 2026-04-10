@@ -4,7 +4,7 @@ This file provides context for Claude Code when working on the Ferrum Edge codeb
 
 ## Project Overview
 
-Ferrum Edge is a high-performance edge proxy built in Rust. It supports HTTP/1.1, HTTP/2, HTTP/3 (QUIC), WebSocket, gRPC, and raw TCP/UDP stream proxying with a plugin architecture (53 built-in plugins including 5 AI/LLM-specific plugins, 1 serverless function plugin, 1 response mock plugin, 1 spec expose plugin, 1 compression plugin, 1 SSE stream handler plugin, 3 gRPC-specific plugins, 3 WebSocket frame-level plugins, 1 WebSocket logging plugin, 1 UDP datagram-level plugin, 1 Loki logging plugin, 1 UDP logging plugin, 1 Kafka logging plugin, 1 SOAP WS-Security plugin, and 1 API chargeback plugin), four operating modes, and load balancing with health checks.
+Ferrum Edge is a high-performance edge proxy built in Rust. It supports HTTP/1.1, HTTP/2, HTTP/3 (QUIC), WebSocket, gRPC, and raw TCP/UDP stream proxying with a plugin architecture (54 built-in plugins including 5 AI/LLM-specific plugins, 1 serverless function plugin, 1 response mock plugin, 1 spec expose plugin, 1 compression plugin, 1 SSE stream handler plugin, 3 gRPC-specific plugins, 3 WebSocket frame-level plugins, 1 WebSocket logging plugin, 1 UDP datagram-level plugin, 1 Loki logging plugin, 1 UDP logging plugin, 1 Kafka logging plugin, 1 SOAP WS-Security plugin, 1 load testing plugin, and 1 API chargeback plugin), four operating modes, and load balancing with health checks.
 
 - **Language**: Rust (edition 2024)
 - **Async runtime**: tokio + hyper 1.0
@@ -249,7 +249,7 @@ src/
 │   ├── udp_batch.rs           # Batched UDP recv via recvmmsg(2) on Linux (reduces syscall overhead)
 │   ├── udp_proxy.rs           # UDP datagram proxy with per-client session tracking, DTLS frontend/backend/passthrough
 │   └── stream_listener.rs     # Stream listener lifecycle manager (reconcile on config reload, port pre-bind check)
-├── plugins/                   # Plugin system (53 plugins, including 5 AI/LLM, 1 AI federation, 1 serverless, 1 response mock, 1 spec expose, 1 compression, 1 SSE, 3 gRPC, 3 WS frame, 1 WS logging, 1 UDP datagram, 1 Loki logging, 1 UDP logging, 1 Kafka logging, 1 SOAP WS-Security plugin, and 1 API chargeback plugin)
+├── plugins/                   # Plugin system (54 plugins, including 5 AI/LLM, 1 AI federation, 1 serverless, 1 response mock, 1 spec expose, 1 compression, 1 SSE, 3 gRPC, 3 WS frame, 1 WS logging, 1 UDP datagram, 1 Loki logging, 1 UDP logging, 1 Kafka logging, 1 SOAP WS-Security plugin, 1 load testing plugin, and 1 API chargeback plugin)
 │   ├── mod.rs                 # Plugin trait, registry, priority constants, lifecycle
 │   ├── [plugin_name].rs       # Individual plugin implementations
 │   └── utils/                 # Shared plugin infrastructure

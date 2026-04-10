@@ -56,7 +56,7 @@ Ferrum supports dynamic upstream target discovery through three providers, confi
 
 ## Plugin System
 
-- 53 built-in plugins with lifecycle hooks (request received, authenticate, authorize, before proxy, after proxy, on final request/response body, on response body, on WebSocket frame, on UDP datagram, log)
+- 54 built-in plugins with lifecycle hooks (request received, authenticate, authorize, before proxy, after proxy, on final request/response body, on response body, on WebSocket frame, on UDP datagram, log)
 - Priority-ordered execution with protocol-aware filtering (HTTP, gRPC, WebSocket, TCP, UDP)
 - Multiple instances of the same plugin type per proxy (e.g., two `http_logging` for Splunk and Datadog) with optional `priority_override` for execution order control
 - Global and per-proxy scoping — proxy-scoped plugins replace global plugins of the same name
@@ -132,6 +132,10 @@ Ferrum supports dynamic upstream target discovery through three providers, confi
 - **Compression** — on-the-fly response compression (gzip, brotli) with Accept-Encoding negotiation, content-type filtering, minimum body size threshold, and optional request decompression with zip bomb protection
 - **Response Caching** — cache backend responses with TTL, cache key rules, and conditional caching
 - **Request Termination** — return static responses without proxying
+
+### Load Testing Plugin
+
+- **Load Testing** — on-demand proxy load testing triggered by an `X-Loadtesting-Key` header. Spawns concurrent virtual clients that send requests back through the gateway's own proxy listener, exercising the full pipeline (routing, auth, rate limiting, backend dispatch, logging). Supports gradual client ramp-up, HTTPS loopback with scoped TLS no-verify, and multi-node fan-out via `gateway_addresses` to trigger independent load tests on remote gateway instances
 
 ### Observability Plugins
 

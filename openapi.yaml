@@ -850,6 +850,7 @@ paths:
                 - ai_prompt_shield
                 - sse
                 - request_mirror
+                - load_testing
                 - ws_message_size_limiting
                 - ws_frame_logging
                 - ws_logging
@@ -3809,6 +3810,56 @@ components:
         tls_no_verify:
           type: boolean
           description: "Skip TLS certificate verification when fetching the spec. Defaults to the gateway's FERRUM_TLS_NO_VERIFY setting."
+
+    LoadTestingConfig:
+      type: object
+      description: "Plugin: load_testing — On-demand proxy load testing triggered by X-Loadtesting-Key header. Spawns concurrent clients through the gateway's own proxy listener (HTTP only)."
+      required:
+        - key
+        - concurrent_clients
+        - duration_seconds
+      properties:
+        key:
+          type: string
+          description: Secret value that the X-Loadtesting-Key header must match to trigger the load test
+        concurrent_clients:
+          type: integer
+          format: uint64
+          minimum: 1
+          maximum: 10000
+          description: Number of concurrent virtual clients
+        duration_seconds:
+          type: integer
+          format: uint64
+          minimum: 1
+          maximum: 3600
+          description: How long the test runs in seconds
+        ramp:
+          type: boolean
+          default: false
+          description: When true, clients start gradually over the duration instead of all at once
+        request_timeout_ms:
+          type: integer
+          format: uint64
+          default: 30000
+          minimum: 1
+          description: "Per-request timeout in milliseconds. Prevents workers from hanging on streaming/long-lived responses (SSE, long-poll)"
+        gateway_port:
+          type: integer
+          format: uint16
+          description: "Local gateway port for synthetic requests. Defaults to FERRUM_PROXY_HTTP_PORT (or FERRUM_PROXY_HTTPS_PORT when gateway_tls is enabled) or 8000/8443"
+        gateway_tls:
+          type: boolean
+          default: false
+          description: Use HTTPS for local loopback synthetic requests
+        gateway_tls_no_verify:
+          type: boolean
+          description: "Skip TLS cert verification for loopback connections. Defaults to true when gateway_tls is enabled (gateway cert typically won't match 127.0.0.1)"
+        gateway_addresses:
+          type: array
+          items:
+            type: string
+          description: "Remote gateway URLs to fan out the trigger to. Each receives the original request WITH the key header so it starts its own local load test"
 
     ResponseCachingConfig:
       type: object

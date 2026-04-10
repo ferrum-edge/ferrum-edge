@@ -231,6 +231,7 @@ async fn test_all_plugins_available() {
         "serverless_function",
         "response_mock",
         "request_mirror",
+        "load_testing",
         "kafka_logging",
         "soap_ws_security",
         "spec_expose",
@@ -271,6 +272,9 @@ async fn test_plugin_creation_all_plugins() {
                 json!({"provider": "azure_functions", "function_url": "https://example.com/func"})
             }
             "request_mirror" => json!({"mirror_host": "mirror.local"}),
+            "load_testing" => {
+                json!({"key": "test-key", "concurrent_clients": 5, "duration_seconds": 10})
+            }
             "response_mock" => json!({"rules": [{"path": "/test", "body": "mock"}]}),
             "udp_logging" => json!({"host": "127.0.0.1", "port": 9514}),
             "statsd_logging" => json!({"host": "127.0.0.1", "port": 8125}),
