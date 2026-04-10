@@ -235,8 +235,11 @@ Returns:
   "config_source_status": "online",
   "proxy_count": 5,
   "consumer_count": 10,
-  "requests_per_second_current": 150,
-  "status_codes_last_second": {"200": 145, "404": 3, "429": 2}
+  "total_requests": 523401,
+  "status_codes_total": {"200": 520000, "404": 2891, "429": 510},
+  "requests_per_second": 150,
+  "status_codes_per_second": {"200": 145, "404": 3, "429": 2},
+  "metrics_window_seconds": 30
 }
 ```
 

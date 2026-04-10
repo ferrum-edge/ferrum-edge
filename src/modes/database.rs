@@ -263,6 +263,15 @@ pub async fn run(
         shutdown_tx.subscribe(),
     );
 
+    // Start windowed metrics monitor background task
+    let metrics_handle = crate::metrics::start_metrics_monitor(
+        proxy_state.request_count.clone(),
+        proxy_state.status_counts.clone(),
+        proxy_state.windowed_metrics.clone(),
+        env_config.status_metrics_window_seconds,
+        shutdown_tx.subscribe(),
+    );
+
     // Load TLS configuration if provided
     let tls_config = if let (Some(cert_path), Some(key_path)) = (
         &env_config.frontend_tls_cert_path,
@@ -855,6 +864,7 @@ pub async fn run(
         let _ = dns_handle.await;
         let _ = db_poll_handle.await;
         let _ = overload_handle.await;
+        let _ = metrics_handle.await;
     };
     if tokio::time::timeout(Duration::from_secs(5), bg_drain)
         .await

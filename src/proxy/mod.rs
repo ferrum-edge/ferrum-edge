@@ -488,6 +488,9 @@ pub struct ProxyState {
     pub max_concurrent_requests_per_ip: u64,
     /// Manages TCP/UDP stream proxy listeners (dedicated port per proxy).
     pub stream_listener_manager: Arc<stream_listener::StreamListenerManager>,
+    /// Windowed per-second rate metrics computed by a background task.
+    /// Read by the admin `/status` endpoint; written by `metrics::start_metrics_monitor`.
+    pub windowed_metrics: Arc<crate::metrics::WindowedMetrics>,
     /// Monotonic instant captured at ProxyState creation for uptime calculation.
     pub started_at: Instant,
     /// Monotonic counter for generating unique WebSocket connection IDs.
@@ -705,6 +708,9 @@ impl ProxyState {
             via_header_http2,
             via_header_http3,
             add_forwarded_header,
+            windowed_metrics: Arc::new(crate::metrics::WindowedMetrics::new(
+                env_config_arc.status_metrics_window_seconds,
+            )),
             env_config: env_config_arc,
             max_header_size_bytes,
             max_single_header_size_bytes,

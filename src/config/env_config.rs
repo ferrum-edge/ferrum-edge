@@ -664,6 +664,12 @@ pub struct EnvConfig {
     /// sets `Connection: close` on responses, and waits for existing requests
     /// to complete. Default: 30. Set to 0 to skip draining (immediate shutdown).
     pub shutdown_drain_seconds: u64,
+
+    // ── Admin status metrics ─────────────────────────────────────────────
+    /// Window size in seconds for computing per-second rate metrics on the
+    /// admin `/status` endpoint.  A background task snapshots cumulative
+    /// counters every N seconds and computes average rates.  Minimum: 1.
+    pub status_metrics_window_seconds: u64,
 }
 
 impl Default for EnvConfig {
@@ -829,6 +835,7 @@ impl Default for EnvConfig {
             overload_loop_warn_us: 10_000,
             overload_loop_critical_us: 500_000,
             shutdown_drain_seconds: 30,
+            status_metrics_window_seconds: 30,
         }
     }
 }
@@ -1328,6 +1335,12 @@ impl EnvConfig {
                 500_000,
             ),
             shutdown_drain_seconds: resolve_u64(conf, "FERRUM_SHUTDOWN_DRAIN_SECONDS", 30),
+            status_metrics_window_seconds: resolve_u64(
+                conf,
+                "FERRUM_STATUS_METRICS_WINDOW_SECONDS",
+                30,
+            )
+            .max(1),
         };
 
         config.validate()?;

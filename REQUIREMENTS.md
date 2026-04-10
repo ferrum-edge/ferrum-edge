@@ -248,8 +248,11 @@ Define Rust structs (using `serde` for serialization/deserialization) for the co
         *   `config_source_status`: (`online`, `offline`, `n/a`) - Status of DB or CP connection.
         *   `proxy_count`: Number of loaded proxies.
         *   `consumer_count`: Number of loaded consumers.
-        *   `requests_per_second_current`: Approximate proxy request throughput in the last second.
-        *   `status_codes_last_second`: Map of response status codes to counts observed in the last second (e.g., `{"200": 150, "401": 5, "503": 1}`).
+        *   `total_requests`: Cumulative total of proxy requests processed since startup.
+        *   `status_codes_total`: Cumulative map of response status codes to total counts since startup (e.g., `{"200": 523401, "401": 2891}`).
+        *   `requests_per_second`: Average proxy request throughput per second over the last metrics window (default 30s, configurable via `FERRUM_STATUS_METRICS_WINDOW_SECONDS`).
+        *   `status_codes_per_second`: Average per-second rate of response status codes over the last metrics window (e.g., `{"200": 150, "401": 5, "503": 1}`).
+        *   `metrics_window_seconds`: Window size in seconds used for per-second rate calculations.
     *   `/health` or `/status` (GET, Optional, Unauthenticated): Simple endpoint returning `200 OK` for basic liveness probes.
 
 **9. Plugin System & Available Plugins**

@@ -2459,8 +2459,11 @@ components:
         - mode
         - ferrum_version
         - uptime_seconds
-        - requests_per_second_current
-        - status_codes_last_second
+        - total_requests
+        - status_codes_total
+        - requests_per_second
+        - status_codes_per_second
+        - metrics_window_seconds
         - proxy_count
         - consumer_count
         - upstream_count
@@ -2478,21 +2481,44 @@ components:
           type: integer
           format: int64
           description: Seconds since the gateway process started
-        requests_per_second_current:
+        total_requests:
           type: integer
           format: int64
-          description: Requests processed in the most recent 1-second window
-        status_codes_last_second:
+          description: Total requests processed since the gateway started (cumulative counter)
+        status_codes_total:
           type: object
           additionalProperties:
             type: integer
           description: |
-            Map of HTTP status code (as string key) to count in the last second.
-            Only status codes that were seen appear as keys.
+            Cumulative map of HTTP status code (as string key) to total count
+            since the gateway started. Only status codes that were seen appear
+            as keys.
+          example:
+            "200": 523401
+            "404": 1892
+            "429": 312
+        requests_per_second:
+          type: integer
+          format: int64
+          description: Average requests per second over the last metrics window
+        status_codes_per_second:
+          type: object
+          additionalProperties:
+            type: integer
+          description: |
+            Average per-second rate of each HTTP status code over the last
+            metrics window. Only status codes seen in the window appear as keys.
           example:
             "200": 1105
             "404": 38
             "429": 31
+        metrics_window_seconds:
+          type: integer
+          format: int64
+          description: |
+            Window size in seconds used for per-second rate calculations
+            (requests_per_second, status_codes_per_second). Configured via
+            FERRUM_STATUS_METRICS_WINDOW_SECONDS (default 30).
         config_last_updated_at:
           type: string
           format: date-time

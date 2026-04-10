@@ -22,6 +22,7 @@ mod grpc;
 mod health_check;
 mod http3;
 mod load_balancer;
+mod metrics;
 mod modes;
 mod overload;
 mod plugin_cache;

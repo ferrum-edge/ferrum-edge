@@ -3227,13 +3227,25 @@ fn build_metrics(state: &AdminState) -> Value {
         // Config source
         let config_source_status = if state.db.is_some() { "online" } else { "n/a" };
 
+        // Windowed per-second status code rates
+        let mut sc_per_second = serde_json::Map::new();
+        for entry in ps.windowed_metrics.status_codes_per_second.iter() {
+            sc_per_second.insert(
+                entry.key().to_string(),
+                json!(entry.value().load(Ordering::Relaxed)),
+            );
+        }
+
         json!({
             "gateway": {
                 "mode": state.mode,
                 "ferrum_version": crate::FERRUM_VERSION,
                 "uptime_seconds": uptime_seconds,
-                "requests_per_second_current": rps,
-                "status_codes_last_second": status_codes,
+                "total_requests": rps,
+                "status_codes_total": status_codes,
+                "requests_per_second": ps.windowed_metrics.requests_per_second.load(Ordering::Relaxed),
+                "status_codes_per_second": Value::Object(sc_per_second),
+                "metrics_window_seconds": ps.windowed_metrics.window_seconds,
                 "config_last_updated_at": config.loaded_at.to_rfc3339(),
                 "config_source_status": config_source_status,
                 "proxy_count": config.proxies.len(),
@@ -3295,8 +3307,11 @@ fn build_metrics(state: &AdminState) -> Value {
                 "mode": state.mode,
                 "ferrum_version": crate::FERRUM_VERSION,
                 "uptime_seconds": 0,
-                "requests_per_second_current": 0,
-                "status_codes_last_second": {},
+                "total_requests": 0,
+                "status_codes_total": {},
+                "requests_per_second": 0,
+                "status_codes_per_second": {},
+                "metrics_window_seconds": 0,
                 "config_last_updated_at": null,
                 "config_source_status": "n/a",
                 "proxy_count": 0,

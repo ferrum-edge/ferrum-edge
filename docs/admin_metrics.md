@@ -45,8 +45,23 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   "gateway": {
     "mode": "database",
     "uptime_seconds": 86472,
-    "requests_per_second_current": 1342,
-    "status_codes_last_second": {
+    "total_requests": 2594832,
+    "status_codes_total": {
+      "200": 2135000,
+      "201": 81200,
+      "204": 34800,
+      "301": 29000,
+      "400": 44500,
+      "401": 91000,
+      "403": 23200,
+      "404": 73500,
+      "429": 60000,
+      "500": 11600,
+      "502": 5800,
+      "503": 3870
+    },
+    "requests_per_second": 1342,
+    "status_codes_per_second": {
       "200": 1105,
       "201": 42,
       "204": 18,
@@ -60,6 +75,7 @@ curl -s -H "Authorization: Bearer $TOKEN" \
       "502": 3,
       "503": 2
     },
+    "metrics_window_seconds": 30,
     "config_last_updated_at": "2026-03-29T14:23:07.482Z",
     "config_source_status": "online",
     "proxy_count": 47,
@@ -179,8 +195,11 @@ Top-level gateway info and throughput counters.
 |-------|------|-------------|
 | `mode` | string | Operating mode: `database`, `file`, `cp`, or `dp` |
 | `uptime_seconds` | integer | Seconds since the gateway process started |
-| `requests_per_second_current` | integer | Requests processed in the most recent 1-second window |
-| `status_codes_last_second` | object | Map of HTTP status code (string key) to count. Only codes seen in the window appear |
+| `total_requests` | integer | Total requests processed since the gateway started (cumulative counter) |
+| `status_codes_total` | object | Cumulative map of HTTP status code (string key) to total count since startup |
+| `requests_per_second` | integer | Average requests per second over the last metrics window |
+| `status_codes_per_second` | object | Average per-second rate of each HTTP status code over the last metrics window |
+| `metrics_window_seconds` | integer | Window size in seconds used for per-second rate calculations (configurable via `FERRUM_STATUS_METRICS_WINDOW_SECONDS`, default 30) |
 | `config_last_updated_at` | string (RFC 3339) | Timestamp of the last successful config load/reload. `null` in CP mode without proxy state |
 | `config_source_status` | string | `"online"` when a database is configured and reachable, `"n/a"` for file mode or when no database is used |
 | `proxy_count` | integer | Number of proxy routes in the active config |
@@ -306,9 +325,9 @@ Note: JWT and OAuth2 consumers are looked up via the identity index (by username
 
 ### Key Indicators to Monitor
 
-1. **`gateway.requests_per_second_current`** — Primary throughput gauge. Sudden drops may indicate upstream failures or config issues.
+1. **`gateway.requests_per_second`** — Primary throughput gauge (averaged over `metrics_window_seconds`). Sudden drops may indicate upstream failures or config issues. For precise calculations, use `total_requests` (cumulative counter) and compute your own rate.
 
-2. **`gateway.status_codes_last_second`** — Watch the ratio of 5xx to 2xx. A spike in 429s means rate limiting is actively protecting your backends. A spike in 503s combined with open circuit breakers indicates a backend outage.
+2. **`gateway.status_codes_per_second`** — Watch the ratio of 5xx to 2xx. A spike in 429s means rate limiting is actively protecting your backends. A spike in 503s combined with open circuit breakers indicates a backend outage. Cumulative totals are available in `status_codes_total`.
 
 3. **`circuit_breakers[].state`** — Any circuit breaker in `open` state is actively rejecting traffic. Alert on this.
 

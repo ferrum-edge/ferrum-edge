@@ -24,6 +24,7 @@ pub mod grpc;
 pub mod health_check;
 pub mod http3;
 pub mod load_balancer;
+pub mod metrics;
 pub mod modes;
 pub mod overload;
 pub mod plugin_cache;
