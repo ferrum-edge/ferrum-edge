@@ -595,6 +595,13 @@ impl Plugin for ResponseCaching {
             }
         }
 
+        // Fast-path: skip cache lookup if predicted uncacheable
+        if !self.uncacheable_predictor.is_predicted_cacheable(&base_key) {
+            ctx.metadata
+                .insert(CACHE_STATUS.to_string(), "PREDICTED-BYPASS".to_string());
+            return PluginResult::Continue;
+        }
+
         let vary_headers = self.cache_lookup_vary_headers(&base_key);
         let cache_key = self.build_cache_key(ctx, &vary_headers, headers);
         // Store the full cache key (with Vary dimensions) so on_final_response_body
