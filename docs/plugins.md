@@ -2157,11 +2157,30 @@ For HTTPS-only deployments that disable the HTTP listener, set `gateway_tls: tru
 | `key` | String | **(required)** | Value that `X-Loadtesting-Key` must match to trigger |
 | `concurrent_clients` | Integer | **(required)** | Number of concurrent virtual clients (1–10,000) |
 | `duration_seconds` | Integer | **(required)** | How long the test runs in seconds (1–3,600) |
-| `ramp` | Boolean | `false` | Gradually start clients over the duration instead of all at once |
+| `ramp` | Boolean | `false` | Gradually start clients over the duration instead of all at once (see ramp example below) |
 | `gateway_port` | Integer | env or 8000/8443 | Local gateway port for synthetic requests. Reads `FERRUM_PROXY_HTTP_PORT` (or `FERRUM_PROXY_HTTPS_PORT` when `gateway_tls` is enabled) |
 | `gateway_tls` | Boolean | `false` | Use HTTPS for local loopback synthetic requests |
 | `gateway_tls_no_verify` | Boolean | `true` when `gateway_tls` on | Skip TLS cert verification for loopback only |
 | `gateway_addresses` | Array | _(none)_ | Remote gateway URLs to fan out the trigger to. Each receives the original request WITH the key header |
+
+**Ramp behavior:** When `ramp: true`, all client tasks are spawned immediately but each sleeps a stagger delay before sending requests. The delay for client _i_ is `duration * i / concurrent_clients`. All clients share the same deadline, so later clients get less sending time.
+
+Example with `concurrent_clients: 10, duration_seconds: 30, ramp: true`:
+
+| Client | Delay | Starts at | Sends until | Active time |
+|--------|-------|-----------|-------------|-------------|
+| 0 | 0s | 0s | 30s | 30s |
+| 1 | 3s | 3s | 30s | 27s |
+| 2 | 6s | 6s | 30s | 24s |
+| 3 | 9s | 9s | 30s | 21s |
+| 4 | 12s | 12s | 30s | 18s |
+| 5 | 15s | 15s | 30s | 15s |
+| 6 | 18s | 18s | 30s | 12s |
+| 7 | 21s | 21s | 30s | 9s |
+| 8 | 24s | 24s | 30s | 6s |
+| 9 | 27s | 27s | 30s | 3s |
+
+With `ramp: false` (default), all clients start sending at t=0 simultaneously.
 
 **Caveats:**
 - **Auth forwarding**: Synthetic requests forward the triggering request's headers. For auth schemes with short-lived tokens (HMAC timestamps), tokens may expire during long tests.
