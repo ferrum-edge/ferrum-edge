@@ -495,6 +495,37 @@ pub async fn handle_admin_request(
         return Ok(resp);
     }
 
+    // API chargeback endpoint (unauthenticated for scraping, like /metrics)
+    if path == "/charges" && method == Method::GET {
+        let registry = crate::plugins::api_chargeback::global_registry();
+        // Support ?format=json for JSON output, default to Prometheus text format
+        let query = req.uri().query().unwrap_or("");
+        let use_json = query.contains("format=json");
+        if use_json {
+            let json_output = registry.render_json();
+            let resp = Response::builder()
+                .status(StatusCode::OK)
+                .header("Content-Type", "application/json")
+                .header("X-Content-Type-Options", "nosniff")
+                .header("Cache-Control", "no-store")
+                .body(Full::new(Bytes::from(json_output)))
+                .unwrap_or_else(|_| Response::new(Full::new(Bytes::from("{}"))));
+            return Ok(resp);
+        } else {
+            let prom_output = registry.render_prometheus();
+            let resp = Response::builder()
+                .status(StatusCode::OK)
+                .header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+                .header("X-Content-Type-Options", "nosniff")
+                .header("Cache-Control", "no-store")
+                .body(Full::new(Bytes::from(prom_output)))
+                .unwrap_or_else(|_| {
+                    Response::new(Full::new(Bytes::from("# error rendering charges\n")))
+                });
+            return Ok(resp);
+        }
+    }
+
     // Authenticate
     match state.jwt_manager.verify_request(
         req.headers()

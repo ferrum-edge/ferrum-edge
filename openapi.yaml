@@ -107,6 +107,48 @@ paths:
                 # TYPE ferrum_requests_total counter
                 ferrum_requests_total{proxy_id="my-api",method="GET",status_code="200"} 42
 
+  # ── Charges ────────────────────────────────────────────────────────
+  /charges:
+    get:
+      operationId: getCharges
+      summary: API chargeback data
+      description: |
+        Returns per-consumer API usage charges tracked by the `api_chargeback` plugin.
+        Unauthenticated so it can be scraped by Prometheus without credentials.
+        Default format is Prometheus text exposition; use `?format=json` for JSON.
+
+        **Multi-node deployments**: Each gateway node accumulates charges independently.
+        In CP/DP topologies, scrape every DP node and aggregate externally.
+      tags: [Metrics]
+      security: []
+      parameters:
+        - name: format
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [prometheus, json]
+          description: |
+            Output format. Default is Prometheus text exposition format.
+            Use `json` for a structured JSON breakdown by consumer, proxy, and status code.
+      responses:
+        "200":
+          description: Chargeback data
+          content:
+            text/plain:
+              schema:
+                type: [string, "null"]
+              example: |
+                # HELP ferrum_api_chargeable_calls_total Total chargeable API calls per consumer.
+                # TYPE ferrum_api_chargeable_calls_total counter
+                ferrum_api_chargeable_calls_total{consumer="alice",proxy_id="proxy-1",proxy_name="Payments API",status_code="200"} 150000
+                # HELP ferrum_api_charges_total Total charges accumulated per consumer.
+                # TYPE ferrum_api_charges_total counter
+                ferrum_api_charges_total{consumer="alice",proxy_id="proxy-1",proxy_name="Payments API",status_code="200",currency="USD"} 1.5000000000
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ChargebackResponse"
+
   /admin/metrics:
     get:
       operationId: getAdminMetrics
@@ -819,6 +861,7 @@ paths:
                 - serverless_function
                 - soap_ws_security
                 - spec_expose
+                - api_chargeback
         "401":
           $ref: "#/components/responses/Unauthorized"
 
@@ -4097,6 +4140,86 @@ components:
           type: integer
           default: 1048576
           description: Skip scanning if body exceeds this size
+
+    ApiChargebackConfig:
+      type: object
+      description: "Plugin: api_chargeback — Per-consumer API usage charge tracking with configurable pricing tiers by HTTP status code."
+      required: [pricing_tiers]
+      properties:
+        currency:
+          type: string
+          default: "USD"
+          description: Currency label included in Prometheus metrics and JSON output. Informational only — the plugin does not perform currency conversion.
+        pricing_tiers:
+          type: array
+          minItems: 1
+          items:
+            type: object
+            required: [status_codes, price_per_call]
+            properties:
+              status_codes:
+                type: array
+                minItems: 1
+                items:
+                  type: integer
+                description: HTTP status codes that trigger this tier's charge. A status code must appear in exactly one tier.
+              price_per_call:
+                type: number
+                minimum: 0
+                description: Charge per API call (e.g. 0.00001). Must be non-negative.
+          description: One or more pricing tiers mapping status codes to per-call prices.
+        render_cache_ttl_seconds:
+          type: integer
+          default: 5
+          description: How long the cached /charges response is served before rebuilding.
+        stale_entry_ttl_seconds:
+          type: integer
+          default: 3600
+          description: How long idle chargeback entries live before eviction.
+        cache_invalidation_min_age_ms:
+          type: integer
+          default: 500
+          description: Minimum age (ms) of the render cache before record() will invalidate it.
+
+    ChargebackResponse:
+      type: object
+      description: JSON format response from the /charges endpoint.
+      properties:
+        currency:
+          type: string
+          example: "USD"
+        generated_at:
+          type: string
+          format: date-time
+        consumers:
+          type: object
+          additionalProperties:
+            type: object
+            properties:
+              total_charges:
+                type: number
+              total_calls:
+                type: integer
+              proxies:
+                type: object
+                additionalProperties:
+                  type: object
+                  properties:
+                    proxy_name:
+                      type: string
+                    total_charges:
+                      type: number
+                    total_calls:
+                      type: integer
+                    by_status:
+                      type: object
+                      additionalProperties:
+                        type: object
+                        properties:
+                          calls:
+                            type: integer
+                          charges:
+                            type: number
 
     RateSpec:
       type: object

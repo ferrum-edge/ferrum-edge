@@ -56,7 +56,7 @@ Ferrum supports dynamic upstream target discovery through three providers, confi
 
 ## Plugin System
 
-- 52 built-in plugins with lifecycle hooks (request received, authenticate, authorize, before proxy, after proxy, on final request/response body, on response body, on WebSocket frame, on UDP datagram, log)
+- 53 built-in plugins with lifecycle hooks (request received, authenticate, authorize, before proxy, after proxy, on final request/response body, on response body, on WebSocket frame, on UDP datagram, log)
 - Priority-ordered execution with protocol-aware filtering (HTTP, gRPC, WebSocket, TCP, UDP)
 - Multiple instances of the same plugin type per proxy (e.g., two `http_logging` for Splunk and Datadog) with optional `priority_override` for execution order control
 - Global and per-proxy scoping — proxy-scoped plugins replace global plugins of the same name
@@ -142,6 +142,7 @@ Ferrum supports dynamic upstream target discovery through three providers, confi
 - **Transaction Debugger** — verbose request/response diagnostics via `tracing::debug` with header redaction (development only)
 - **Correlation ID** — UUID generation and propagation
 - **Prometheus Metrics** — exposition format endpoint
+- **API Chargeback** — per-consumer API usage charge tracking with configurable pricing tiers by status code, exposed via `/charges` admin endpoint in Prometheus and JSON formats for external billing integration
 - **OpenTelemetry Tracing** — W3C Trace Context propagation + OTLP/HTTP span export with batching, custom headers, rich semantic attributes, and propagation-only mode
 
 ## Connection Pooling
