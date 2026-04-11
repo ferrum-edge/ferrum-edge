@@ -28,6 +28,70 @@ Custom plugins are auto-discovered from the `custom_plugins/` directory at build
 - **Proxy-group-scoped** plugins (`scope: "proxy_group"`) apply to a subset of proxies that reference the plugin in their `plugins` association list. `proxy_id` must be null. A **single shared plugin instance** is reused across all associated proxies, so stateful plugins (e.g., `rate_limiting`) share counters across the group. When a proxy is deleted, only the association is removed — the proxy-group plugin config survives.
 - A proxy may have **multiple instances** of the same plugin type (e.g., two `http_logging` configs shipping to different destinations). Each instance has its own `id`, `config`, and optional `priority_override` to control execution order
 
+**Example** (file mode YAML):
+
+```yaml
+plugin_configs:
+  # Global — applies to ALL proxies automatically
+  - id: global-logging
+    plugin_name: stdout_logging
+    scope: global
+    config: {}
+
+  # Proxy — applies to exactly ONE proxy
+  - id: frontend-cors
+    plugin_name: cors
+    scope: proxy
+    proxy_id: public-frontend
+    config:
+      origins: ["https://app.example.com"]
+
+  # ProxyGroup — shared across a SUBSET of proxies
+  # One instance, shared rate limit counters across the group
+  - id: internal-rate-limit
+    plugin_name: rate_limiting
+    scope: proxy_group
+    config:
+      window_seconds: 60
+      max_requests: 500
+      limit_by: consumer
+
+  - id: internal-key-auth
+    plugin_name: key_auth
+    scope: proxy_group
+    config:
+      key_names: ["x-api-key"]
+
+proxies:
+  # Both internal proxies share the same auth + rate limit group plugins
+  - id: users-api
+    listen_path: /api/users
+    backend_protocol: http
+    backend_host: users-svc
+    backend_port: 3000
+    plugins:
+      - plugin_config_id: internal-key-auth
+      - plugin_config_id: internal-rate-limit
+
+  - id: orders-api
+    listen_path: /api/orders
+    backend_protocol: http
+    backend_host: orders-svc
+    backend_port: 3001
+    plugins:
+      - plugin_config_id: internal-key-auth
+      - plugin_config_id: internal-rate-limit
+
+  # Public proxy — no group plugins, has its own proxy-scoped CORS
+  - id: public-frontend
+    listen_path: /public
+    backend_protocol: http
+    backend_host: frontend-svc
+    backend_port: 8080
+    plugins:
+      - plugin_config_id: frontend-cors
+```
+
 ### Plugin Scope Merging
 
 Each proxy's effective plugin list is built by merging global, proxy-scoped, and proxy-group-scoped plugins:
