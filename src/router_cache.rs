@@ -983,11 +983,12 @@ fn frequency_aware_evict<V>(
         return 0;
     }
 
-    // Sort by frequency ascending so the least-frequent entries are first.
-    sample.sort_unstable_by_key(|&(_, freq)| freq);
-
-    // Remove the lowest-frequency entries up to target_removals.
+    // Partition so the lowest-frequency entries are in sample[..to_remove].
+    // select_nth_unstable is O(n) average vs O(n log n) for a full sort.
     let to_remove = sample.len().min(target_removals);
+    if to_remove > 0 && to_remove < sample.len() {
+        sample.select_nth_unstable_by_key(to_remove - 1, |&(_, freq)| freq);
+    }
     let mut removed = 0;
     for (key, _) in &sample[..to_remove] {
         if map.remove(key).is_some() {
