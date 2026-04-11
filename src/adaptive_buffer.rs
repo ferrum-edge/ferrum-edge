@@ -63,6 +63,10 @@ const BATCH_TIER_THRESHOLDS: [u64; 3] = [
 
 // ── Per-proxy state ─────────────────────────────────────────────────────────
 
+/// Jitter EWMA threshold (microseconds) above which buffer tier is bumped.
+/// 10ms of inter-arrival jitter indicates lossy/variable real-time traffic.
+const JITTER_BUMP_THRESHOLD_US: u64 = 10_000;
+
 /// Per-proxy EWMA state. All fields are atomic for lock-free concurrent access.
 struct ProxyBufferState {
     /// EWMA of total bytes per connection (both directions summed).
@@ -75,6 +79,8 @@ struct ProxyBufferState {
     dgram_ewma: AtomicU64,
     /// Number of batch cycles recorded.
     dgram_sample_count: AtomicU64,
+    /// EWMA of inter-arrival jitter in microseconds (for UDP real-time traffic).
+    jitter_ewma: AtomicU64,
 }
 
 impl ProxyBufferState {
@@ -84,6 +90,7 @@ impl ProxyBufferState {
             bytes_sample_count: AtomicU64::new(0),
             dgram_ewma: AtomicU64::new(UNSET),
             dgram_sample_count: AtomicU64::new(0),
+            jitter_ewma: AtomicU64::new(UNSET),
         }
     }
 }
@@ -206,7 +213,16 @@ impl AdaptiveBufferTracker {
         if ewma == UNSET {
             return self.default_buffer_size;
         }
-        let tier = select_tier(ewma, &BUFFER_TIER_THRESHOLDS);
+        let mut tier = select_tier(ewma, &BUFFER_TIER_THRESHOLDS);
+        // If jitter EWMA > 10ms, bump up one tier for safety margin.
+        // High jitter indicates lossy/variable real-time traffic that benefits
+        // from larger buffers to absorb burst arrivals.
+        if let Some(entry) = self.state.get(proxy_id) {
+            let jitter_ewma = entry.jitter_ewma.load(Ordering::Relaxed);
+            if jitter_ewma != UNSET && jitter_ewma > JITTER_BUMP_THRESHOLD_US && tier < 3 {
+                tier += 1;
+            }
+        }
         BUFFER_TIER_SIZES[tier].clamp(self.min_buffer_size, self.max_buffer_size)
     }
 
@@ -224,6 +240,23 @@ impl AdaptiveBufferTracker {
             .or_insert_with(ProxyBufferState::new);
         update_ewma(&entry.bytes_ewma, total_bytes, self.alpha_fp);
         entry.bytes_sample_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    // ── Jitter tracking (UDP real-time traffic) ──────────────────────────
+
+    /// Record an inter-arrival jitter measurement for a UDP session.
+    /// Jitter is |actual_interval - expected_interval| in microseconds.
+    /// Used to adapt UDP buffers for real-time traffic (VoIP, gaming).
+    #[allow(dead_code)] // Wired into UDP proxy path incrementally.
+    pub fn record_jitter(&self, proxy_id: &str, jitter_us: u64) {
+        if !self.buffer_enabled {
+            return;
+        }
+        let entry = self
+            .state
+            .entry(proxy_id.to_string())
+            .or_insert_with(ProxyBufferState::new);
+        update_ewma(&entry.jitter_ewma, jitter_us, self.alpha_fp);
     }
 
     // ── Batch limit (UDP) ───────────────────────────────────────────────
@@ -313,5 +346,45 @@ mod tests {
         // α=0.3: new = 0.3 * 200_000 + 0.7 * 100_000 = 60_000 + 70_000 = 130_000
         update_ewma(&val, 200_000, 300);
         assert_eq!(val.load(Ordering::Relaxed), 130_000);
+    }
+
+    #[test]
+    fn test_jitter_bumps_buffer_tier() {
+        let tracker = AdaptiveBufferTracker::new(true, false, 300, 8192, 262_144, 65_536, 64);
+        // Record small bytes so we get tier 0 (8 KiB buffer)
+        tracker.record_connection("p1", 4096);
+        assert_eq!(tracker.get_buffer_size("p1"), 8192);
+
+        // Record high jitter (>10ms) — should bump tier 0 → tier 1
+        tracker.record_jitter("p1", 15_000);
+        assert_eq!(tracker.get_buffer_size("p1"), 32 * 1024);
+    }
+
+    #[test]
+    fn test_jitter_no_bump_when_low() {
+        let tracker = AdaptiveBufferTracker::new(true, false, 300, 8192, 262_144, 65_536, 64);
+        tracker.record_connection("p1", 4096);
+        // Low jitter (5ms) — no bump
+        tracker.record_jitter("p1", 5_000);
+        assert_eq!(tracker.get_buffer_size("p1"), 8192);
+    }
+
+    #[test]
+    fn test_jitter_no_bump_beyond_max_tier() {
+        let tracker = AdaptiveBufferTracker::new(true, false, 300, 8192, 1_048_576, 65_536, 64);
+        // Record huge bytes to get tier 3
+        tracker.record_connection("p1", 10 * 1024 * 1024);
+        let size_before = tracker.get_buffer_size("p1");
+        // High jitter should not bump beyond tier 3
+        tracker.record_jitter("p1", 50_000);
+        assert_eq!(tracker.get_buffer_size("p1"), size_before);
+    }
+
+    #[test]
+    fn test_record_jitter_disabled() {
+        let tracker = AdaptiveBufferTracker::new(false, false, 300, 8192, 262_144, 65_536, 64);
+        tracker.record_jitter("p1", 15_000);
+        // Should not create state entry when disabled
+        assert!(tracker.state.get("p1").is_none());
     }
 }

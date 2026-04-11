@@ -686,6 +686,23 @@ pub struct EnvConfig {
     /// admin `/status` endpoint.  A background task snapshots cumulative
     /// counters every N seconds and computes average rates.  Minimum: 1.
     pub status_metrics_window_seconds: u64,
+
+    // ── TLS handshake offload ───────────────────────────────────────────
+    /// Total dedicated threads for offloading TLS handshakes from the main
+    /// event loop. 0 = disabled (handshakes run on tokio worker threads).
+    /// When enabled, threads are organized into shards for TLS session cache
+    /// affinity. Default: 0 (disabled).
+    pub tls_offload_threads: usize,
+
+    // ── TCP socket optimizations (Linux only) ────────────────────────────
+    /// Enable TCP Fast Open on server (listening) and client (connecting) sockets.
+    /// Saves 1 RTT on repeat connections by allowing data in the SYN packet.
+    /// Requires Linux 4.11+ and `net.ipv4.tcp_fastopen` sysctl bit 0x1 (server)
+    /// or 0x2 (client) enabled. No-op on non-Linux. Default: true.
+    pub tcp_fastopen_enabled: bool,
+    /// TCP Fast Open server queue length — maximum pending TFO connections.
+    /// Only used when `tcp_fastopen_enabled` is true. Default: 256.
+    pub tcp_fastopen_queue_len: u16,
 }
 
 impl Default for EnvConfig {
@@ -855,6 +872,9 @@ impl Default for EnvConfig {
             overload_loop_critical_us: 500_000,
             shutdown_drain_seconds: 30,
             status_metrics_window_seconds: 30,
+            tls_offload_threads: 0,
+            tcp_fastopen_enabled: true,
+            tcp_fastopen_queue_len: 256,
         }
     }
 }
@@ -1371,6 +1391,11 @@ impl EnvConfig {
                 30,
             )
             .max(1),
+            tls_offload_threads: resolve_usize(conf, "FERRUM_TLS_OFFLOAD_THREADS", 0),
+            tcp_fastopen_enabled: resolve_bool(conf, "FERRUM_TCP_FASTOPEN_ENABLED", true),
+            tcp_fastopen_queue_len: resolve_var(conf, "FERRUM_TCP_FASTOPEN_QUEUE_LEN")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(256),
         };
 
         config.validate()?;

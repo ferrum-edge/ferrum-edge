@@ -108,6 +108,7 @@ fn create_manager(config: GatewayConfig) -> StreamListenerManager {
             true, true, 300, 8192, 262_144, 65_536, 6000,
         )),
         64,
+        true,
     )
 }
 
@@ -173,6 +174,7 @@ async fn test_reconcile_starts_tcp_listener() {
             true, true, 300, 8192, 262_144, 65_536, 6000,
         )),
         64,
+        true,
     );
 
     let failures = manager.reconcile().await;
@@ -230,6 +232,7 @@ async fn test_reconcile_starts_udp_listener() {
             true, true, 300, 8192, 262_144, 65_536, 6000,
         )),
         64,
+        true,
     );
 
     let failures = manager.reconcile().await;
@@ -299,6 +302,7 @@ async fn test_reconcile_detects_port_conflict() {
             true, true, 300, 8192, 262_144, 65_536, 6000,
         )),
         64,
+        true,
     );
 
     let failures = manager.reconcile().await;
@@ -363,6 +367,7 @@ async fn test_reconcile_defers_tcp_without_tls_config() {
             true, true, 300, 8192, 262_144, 65_536, 6000,
         )),
         64,
+        true,
     );
 
     let failures = manager.reconcile().await;
@@ -421,6 +426,7 @@ async fn test_reconcile_defers_udp_without_dtls_config() {
             true, true, 300, 8192, 262_144, 65_536, 6000,
         )),
         64,
+        true,
     );
 
     let failures = manager.reconcile().await;
@@ -482,6 +488,7 @@ async fn test_shutdown_all_releases_ports() {
             true, true, 300, 8192, 262_144, 65_536, 6000,
         )),
         64,
+        true,
     );
 
     let failures = manager.reconcile().await;
@@ -554,6 +561,7 @@ async fn test_wait_until_started_succeeds_for_tcp() {
             true, true, 300, 8192, 262_144, 65_536, 6000,
         )),
         64,
+        true,
     );
 
     let failures = manager.reconcile().await;

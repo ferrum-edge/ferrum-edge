@@ -675,6 +675,7 @@ impl ProxyState {
             crls.clone(),
             adaptive_buffer.clone(),
             env_config_arc.udp_recvmmsg_batch_size,
+            env_config_arc.tcp_fastopen_enabled,
         ));
 
         Ok(Self {
@@ -2989,7 +2990,15 @@ pub async fn start_proxy_listener_with_tls(
 /// Create a bound TCP socket with SO_REUSEADDR and SO_REUSEPORT enabled.
 /// Used by the multi-listener accept architecture where N sockets are bound
 /// to the same address, each with its own accept loop.
-fn create_proxy_socket(addr: SocketAddr, backlog: i32) -> Result<TcpListener, anyhow::Error> {
+///
+/// When `tcp_fastopen_queue_len` is `Some(n)`, enables TCP Fast Open on the
+/// listening socket (Linux only), allowing repeat clients with a cached TFO
+/// cookie to send data in the SYN packet (saves 1 RTT).
+fn create_proxy_socket(
+    addr: SocketAddr,
+    backlog: i32,
+    tcp_fastopen_queue_len: Option<u16>,
+) -> Result<TcpListener, anyhow::Error> {
     let socket = socket2::Socket::new(
         if addr.is_ipv6() {
             socket2::Domain::IPV6
@@ -3011,6 +3020,21 @@ fn create_proxy_socket(addr: SocketAddr, backlog: i32) -> Result<TcpListener, an
 
     socket.set_nonblocking(true)?;
     socket.bind(&addr.into())?;
+
+    // TCP_FASTOPEN: enable TFO on the server socket after bind, before listen.
+    // This allows repeat clients to send data in the SYN packet, saving 1 RTT.
+    if let Some(_queue_len) = tcp_fastopen_queue_len {
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            if let Err(e) =
+                crate::socket_opts::set_tcp_fastopen_server(socket.as_raw_fd(), _queue_len as i32)
+            {
+                tracing::warn!("Failed to enable TCP_FASTOPEN on {}: {}", addr, e);
+            }
+        }
+    }
+
     socket.listen(backlog)?;
 
     Ok(TcpListener::from_std(socket.into())?)
@@ -3032,9 +3056,14 @@ pub async fn start_proxy_listener_with_tls_and_signal(
 ) -> Result<(), anyhow::Error> {
     let backlog = state.env_config.tcp_listen_backlog as i32;
     let accept_threads = state.env_config.accept_threads.max(1);
+    let tfo_queue = if state.env_config.tcp_fastopen_enabled {
+        Some(state.env_config.tcp_fastopen_queue_len)
+    } else {
+        None
+    };
 
     // Create the first listener — this one validates that the port is available.
-    let first_listener = create_proxy_socket(addr, backlog)?;
+    let first_listener = create_proxy_socket(addr, backlog, tfo_queue)?;
 
     // Optional connection limit. Shared across all accept threads so the global
     // max_connections limit is enforced regardless of which thread accepted.
@@ -3059,7 +3088,7 @@ pub async fn start_proxy_listener_with_tls_and_signal(
 
         // Spawn additional listeners (threads 1..N-1)
         for i in 1..accept_threads {
-            let listener = create_proxy_socket(addr, backlog)?;
+            let listener = create_proxy_socket(addr, backlog, tfo_queue)?;
             let state = state.clone();
             let tls_config = tls_config.clone();
             let semaphore = conn_semaphore.clone();

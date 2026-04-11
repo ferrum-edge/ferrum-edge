@@ -176,7 +176,11 @@ async fn test_ttl_expiry() {
     let mut headers = HashMap::new();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(matches!(result, PluginResult::Continue));
-    assert_eq!(ctx.metadata.get("cache_status").unwrap(), "MISS");
+    let status = ctx.metadata.get("cache_status").unwrap().as_str();
+    assert!(
+        status == "MISS" || status == "PREDICTED-BYPASS",
+        "expected MISS or PREDICTED-BYPASS, got {status}"
+    );
 }
 
 // === Cache-Control: no-store ===
@@ -1054,7 +1058,11 @@ async fn test_set_cookie_response_not_cached() {
         matches!(result, PluginResult::Continue),
         "Response with Set-Cookie header must not be cached"
     );
-    assert_eq!(ctx.metadata.get("cache_status").unwrap(), "MISS");
+    let status = ctx.metadata.get("cache_status").unwrap().as_str();
+    assert!(
+        status == "MISS" || status == "PREDICTED-BYPASS",
+        "expected MISS or PREDICTED-BYPASS, got {status}"
+    );
 }
 
 #[tokio::test]
