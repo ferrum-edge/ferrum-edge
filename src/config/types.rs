@@ -1813,6 +1813,26 @@ pub fn validate_pem_key_file(field_name: &str, path: &str) -> Result<(), String>
     Ok(())
 }
 
+/// Validate that a MaxMind `.mmdb` database file exists and is readable.
+/// This mirrors the cert file validation pattern — per-mode callers decide
+/// whether a failure is fatal (file mode), a warning (db mode), or a
+/// config-rejection (dp mode).
+pub fn validate_mmdb_file(field_name: &str, path: &str) -> Result<(), String> {
+    let metadata = std::fs::metadata(path).map_err(|e| {
+        format!(
+            "{}: MaxMind database file '{}' not accessible: {}",
+            field_name, path, e
+        )
+    })?;
+    if !metadata.is_file() {
+        return Err(format!(
+            "{}: '{}' exists but is not a regular file",
+            field_name, path
+        ));
+    }
+    Ok(())
+}
+
 /// Validate a u64 field is within a range.
 fn validate_u64_range(field_name: &str, value: u64, min: u64, max: u64) -> Result<(), String> {
     if value < min || value > max {
@@ -3197,6 +3217,35 @@ impl GatewayConfig {
         } else {
             Err(errors)
         }
+    }
+
+    /// Validate file dependencies for plugins that reference external files
+    /// (e.g., geo_restriction `.mmdb` databases).
+    ///
+    /// This is separate from `validate_all_fields_with_ip_policy()` so that
+    /// each mode can handle missing files independently:
+    /// - **File mode**: fatal (bail)
+    /// - **DB mode**: warn (data already in DB)
+    /// - **DP mode**: skip (plugin degrades gracefully with `reader: None`)
+    ///
+    /// Deduplicates paths so each file is checked at most once.
+    pub fn validate_plugin_file_dependencies(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+        let mut validated_paths = std::collections::HashSet::new();
+        for pc in &self.plugin_configs {
+            if !pc.enabled {
+                continue;
+            }
+            if pc.plugin_name == "geo_restriction"
+                && let Some(db_path) = pc.config.get("db_path").and_then(|v| v.as_str())
+                && !db_path.is_empty()
+                && validated_paths.insert(db_path.to_string())
+                && let Err(e) = validate_mmdb_file("geo_restriction.db_path", db_path)
+            {
+                errors.push(format!("PluginConfig '{}': {}", pc.id, e));
+            }
+        }
+        errors
     }
 }
 

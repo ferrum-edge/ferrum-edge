@@ -268,6 +268,21 @@ pub fn load_config_from_file(
         }
     }
 
+    // Validate plugin file dependencies (e.g., geo_restriction .mmdb files).
+    // Fatal in file mode — the gateway should not start with missing files.
+    {
+        let file_dep_errors = config.validate_plugin_file_dependencies();
+        if !file_dep_errors.is_empty() {
+            for msg in &file_dep_errors {
+                error!("{}", msg);
+            }
+            anyhow::bail!(
+                "Configuration validation failed: {} plugin file dependency error(s) found",
+                file_dep_errors.len()
+            );
+        }
+    }
+
     // Validate stream proxy (TCP/UDP) configuration
     if let Err(errors) = config.validate_stream_proxies() {
         for msg in &errors {

@@ -11,7 +11,12 @@
 //!
 //! The `.mmdb` file is memory-mapped via `mmap(2)` at plugin construction time
 //! (`Reader::open_mmap`) for zero-copy lookups on the hot path without loading
-//! the entire database into heap memory.
+//! the entire database into heap memory. If the file is unavailable at construction
+//! time (e.g., on a control plane that doesn't proxy traffic), the plugin degrades
+//! gracefully — lookups fall back to the `on_lookup_failure` policy. File existence
+//! is validated separately by `GatewayConfig::validate_plugin_file_dependencies()`,
+//! which each mode calls independently: fatal in file mode, warn in db mode,
+//! skipped in dp mode (plugin degrades gracefully with `reader: None`).
 
 use async_trait::async_trait;
 use maxminddb::{MaxMindDBError, Mmap, Reader};
@@ -43,7 +48,8 @@ enum LookupFailureAction {
 }
 
 pub struct GeoRestriction {
-    reader: Arc<Reader<Mmap>>,
+    reader: Option<Arc<Reader<Mmap>>>,
+    db_path: String,
     allow_countries: Vec<String>,
     deny_countries: Vec<String>,
     inject_headers: bool,
@@ -56,12 +62,23 @@ impl GeoRestriction {
             "geo_restriction: 'db_path' is required (path to .mmdb file)".to_string()
         })?;
 
-        let reader = Reader::open_mmap(db_path).map_err(|e| {
-            format!(
-                "geo_restriction: failed to open MaxMind database '{}': {}",
-                db_path, e
-            )
-        })?;
+        // Open the MaxMind database file. If the file is missing or unreadable,
+        // log a warning but allow the plugin to be created — the file may exist
+        // on data plane nodes but not on the control plane, or may be deployed
+        // after config is pushed. At request time, a missing reader falls back
+        // to the on_lookup_failure policy.
+        let reader = match Reader::open_mmap(db_path) {
+            Ok(r) => Some(Arc::new(r)),
+            Err(e) => {
+                warn!(
+                    db_path = %db_path,
+                    error = %e,
+                    plugin = "geo_restriction",
+                    "MaxMind database file not available — plugin will use on_lookup_failure policy until file is present"
+                );
+                None
+            }
+        };
 
         let allow_countries: Vec<String> = config["allow_countries"]
             .as_array()
@@ -103,7 +120,8 @@ impl GeoRestriction {
         };
 
         Ok(Self {
-            reader: Arc::new(reader),
+            reader,
+            db_path: db_path.to_string(),
             allow_countries,
             deny_countries,
             inject_headers,
@@ -113,11 +131,15 @@ impl GeoRestriction {
 
     /// Look up the country ISO code for a given IP address string.
     fn lookup_country(&self, ip_str: &str) -> Result<Option<String>, MaxMindDBError> {
+        let reader = self.reader.as_ref().ok_or_else(|| {
+            MaxMindDBError::AddressNotFoundError("MaxMind database not loaded".to_string())
+        })?;
+
         let ip: std::net::IpAddr = ip_str
             .parse()
             .map_err(|e| MaxMindDBError::AddressNotFoundError(format!("invalid IP: {}", e)))?;
 
-        let record: GeoCountryRecord = self.reader.lookup(ip)?;
+        let record: GeoCountryRecord = reader.lookup(ip)?;
 
         // Prefer the direct country, fall back to registered_country
         let iso_code = record
@@ -130,6 +152,29 @@ impl GeoRestriction {
 
     /// Check whether the client IP's country is allowed.
     fn check_ip(&self, client_ip: &str) -> (PluginResult, Option<String>) {
+        if self.reader.is_none() {
+            // Database file not loaded — apply the configured failure policy.
+            warn!(
+                client_ip = %client_ip,
+                db_path = %self.db_path,
+                plugin = "geo_restriction",
+                reason = "db_not_loaded",
+                "MaxMind database not loaded, applying on_lookup_failure policy"
+            );
+            return match self.on_lookup_failure {
+                LookupFailureAction::Allow => (PluginResult::Continue, None),
+                LookupFailureAction::Deny => (
+                    PluginResult::Reject {
+                        status_code: 403,
+                        body: r#"{"error":"Access denied: GeoIP database not available"}"#
+                            .to_string(),
+                        headers: HashMap::new(),
+                    },
+                    None,
+                ),
+            };
+        }
+
         let country = match self.lookup_country(client_ip) {
             Ok(Some(code)) => code,
             Ok(None) | Err(_) => {

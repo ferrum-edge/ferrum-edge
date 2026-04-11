@@ -469,6 +469,12 @@ impl DatabaseStore {
             }
         }
 
+        // Warn on missing plugin file dependencies (e.g., geo_restriction .mmdb).
+        // Warn-only since data already exists in the database.
+        for msg in config.validate_plugin_file_dependencies() {
+            warn!("{}", msg);
+        }
+
         self.check_slow_query("load_full_config", start);
         Ok(config)
     }
