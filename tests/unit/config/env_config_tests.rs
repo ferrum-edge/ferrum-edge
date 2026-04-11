@@ -2381,3 +2381,132 @@ fn test_mongo_timeouts_default_values() {
         },
     );
 }
+
+// ============================================================================
+// Circuit Breaker Cache Max Entries Tests
+// ============================================================================
+
+#[test]
+fn test_env_config_circuit_breaker_cache_max_entries_default() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+        ],
+        || {
+            remove_var("FERRUM_CIRCUIT_BREAKER_CACHE_MAX_ENTRIES");
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(
+                config.circuit_breaker_cache_max_entries, 10_000,
+                "circuit_breaker_cache_max_entries should default to 10000"
+            );
+        },
+    );
+}
+
+#[test]
+fn test_env_config_circuit_breaker_cache_max_entries_custom() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_CIRCUIT_BREAKER_CACHE_MAX_ENTRIES", "500"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.circuit_breaker_cache_max_entries, 500);
+        },
+    );
+}
+
+// ============================================================================
+// Status Counts Max Entries Tests
+// ============================================================================
+
+#[test]
+fn test_env_config_status_counts_max_entries_default() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+        ],
+        || {
+            remove_var("FERRUM_STATUS_COUNTS_MAX_ENTRIES");
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(
+                config.status_counts_max_entries, 200,
+                "status_counts_max_entries should default to 200"
+            );
+        },
+    );
+}
+
+#[test]
+fn test_env_config_status_counts_max_entries_custom() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_STATUS_COUNTS_MAX_ENTRIES", "50"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.status_counts_max_entries, 50);
+        },
+    );
+}
+
+// ============================================================================
+// Status Metrics Window Seconds Tests
+// ============================================================================
+
+#[test]
+fn test_env_config_status_metrics_window_seconds_default() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+        ],
+        || {
+            remove_var("FERRUM_STATUS_METRICS_WINDOW_SECONDS");
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(
+                config.status_metrics_window_seconds, 30,
+                "status_metrics_window_seconds should default to 30"
+            );
+        },
+    );
+}
+
+#[test]
+fn test_env_config_status_metrics_window_seconds_custom() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_STATUS_METRICS_WINDOW_SECONDS", "60"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.status_metrics_window_seconds, 60);
+        },
+    );
+}
+
+#[test]
+fn test_env_config_status_metrics_window_seconds_minimum_clamped() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_STATUS_METRICS_WINDOW_SECONDS", "0"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(
+                config.status_metrics_window_seconds, 1,
+                "status_metrics_window_seconds should be clamped to minimum of 1"
+            );
+        },
+    );
+}

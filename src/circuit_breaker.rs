@@ -265,18 +265,25 @@ pub fn target_key(host: &str, port: u16) -> String {
 /// per-target (`proxy_id::host:port`) for upstream load-balanced targets.
 pub struct CircuitBreakerCache {
     breakers: DashMap<String, Arc<CircuitBreaker>>,
+    max_entries: usize,
 }
 
 impl Default for CircuitBreakerCache {
     fn default() -> Self {
-        Self::new()
+        Self::with_max_entries(10_000)
     }
 }
 
 impl CircuitBreakerCache {
+    #[allow(dead_code)]
     pub fn new() -> Self {
+        Self::with_max_entries(10_000)
+    }
+
+    pub fn with_max_entries(max_entries: usize) -> Self {
         Self {
             breakers: DashMap::new(),
+            max_entries,
         }
     }
 
@@ -296,6 +303,16 @@ impl CircuitBreakerCache {
             && existing.config() == config
         {
             return existing.clone();
+        }
+        // Enforce max entries: if at capacity and this is a genuinely new key,
+        // skip creating a breaker. Existing keys are always replaced (config change).
+        if self.breakers.len() >= self.max_entries && !self.breakers.contains_key(&key) {
+            warn!(
+                "Circuit breaker cache at capacity ({}), skipping new entry for {}",
+                self.max_entries, key
+            );
+            // Return a transient breaker that won't be cached
+            return Arc::new(CircuitBreaker::new(config.clone()));
         }
         let cb = Arc::new(CircuitBreaker::new(config.clone()));
         self.breakers.insert(key, cb.clone());
@@ -343,6 +360,31 @@ impl CircuitBreakerCache {
                 key == id || key.starts_with(&format!("{id}::"))
             })
         });
+    }
+
+    /// Remove circuit breakers for upstream targets that no longer exist.
+    /// This prevents unbounded growth from target churn (e.g., Kubernetes
+    /// pod cycling where old pod IPs accumulate as stale breaker entries).
+    pub fn prune_stale_targets(&self, active_target_keys: &std::collections::HashSet<String>) {
+        self.breakers.retain(|key, _| {
+            // Direct-backend keys (no "::") are managed by prune() via proxy removal
+            if !key.contains("::") {
+                return true;
+            }
+            active_target_keys.contains(key)
+        });
+    }
+
+    /// Current number of entries in the cache.
+    #[allow(dead_code)]
+    pub fn len(&self) -> usize {
+        self.breakers.len()
+    }
+
+    /// Whether the cache is empty.
+    #[allow(dead_code)]
+    pub fn is_empty(&self) -> bool {
+        self.breakers.is_empty()
     }
 }
 

@@ -65,6 +65,9 @@ pub async fn run(
         Some(tls_policy.clone()),
     )?;
 
+    // Start per-IP request counter cleanup (removes stale zero-count entries)
+    proxy_state.start_per_ip_cleanup_task();
+
     // Start service discovery background tasks (initially no-op with empty config;
     // tasks are reconciled when CP pushes config via update_config)
     proxy_state.start_service_discovery(Some(shutdown_tx.subscribe()));

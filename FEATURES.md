@@ -180,6 +180,18 @@ Ferrum supports dynamic upstream target discovery through three providers, confi
 - Server-side HTTP/2 `max_concurrent_streams` (default 1000) to bound per-connection resource usage
 - Configurable tokio worker and blocking thread counts with auto-detection
 
+## Bounded In-Memory Caches
+
+All in-memory caches are bounded to prevent unbounded memory growth under adversarial or high-cardinality traffic:
+
+- **Router cache** — auto-scales with proxy count (`FERRUM_ROUTER_CACHE_MAX_ENTRIES`), separate prefix and regex partitions with negative-lookup caching
+- **DNS cache** — bounded by `FERRUM_DNS_CACHE_MAX_SIZE` (default 10,000 entries) with TTL-based expiration and stale-while-revalidate
+- **Circuit breaker cache** — capped at `FERRUM_CIRCUIT_BREAKER_CACHE_MAX_ENTRIES` (default 10,000) with stale entry pruning on config reload
+- **Status code counters** — capped at `FERRUM_STATUS_COUNTS_MAX_ENTRIES` (default 200) with common codes pre-populated at startup
+- **Per-IP request counters** — periodic cleanup of zero-count entries via `FERRUM_PER_IP_CLEANUP_INTERVAL_SECONDS` (default 60s)
+- **Plugin caches** — response caching, AI semantic cache, request deduplication, SOAP nonce cache, LDAP auth cache, and rate limiting plugins all have configurable `max_entries` or `max_cache_entries` with TTL-based eviction and stale entry cleanup
+- See [docs/cache_management.md](docs/cache_management.md) for the full cache inventory and tuning reference
+
 ## TLS & Security
 
 - Plaintext listener disable — set port to `0` to prevent HTTP proxy, admin HTTP, or gRPC listeners from binding (TLS-only operation)
