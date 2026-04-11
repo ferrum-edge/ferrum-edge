@@ -483,22 +483,12 @@ where
 
 // -- CoalescingH2Body ---------------------------------------------------------
 
-/// Target coalesce size for HTTP/2 `Incoming` body frames (128 KB).
-///
-/// Same rationale as [`COALESCE_TARGET`]: HTTP/2 DATA frames from hyper's
-/// h2 client are often small (16–32 KB per frame due to flow control windows).
-/// Coalescing them into larger chunks before forwarding reduces the number of
-/// h2 DATA frames the server encoder writes, cutting per-frame overhead.
-///
-/// Used for both the HTTP/2 direct pool path and the gRPC streaming path.
-const H2_COALESCE_TARGET: usize = 128 * 1024;
-
 /// A response body adapter that coalesces small HTTP/2 DATA frames from a
 /// hyper `Incoming` body into larger frames for efficient forwarding.
 ///
 /// This is the HTTP/2 equivalent of [`CoalescingBody`] (which wraps reqwest
 /// byte streams). The adapter accumulates small DATA frames until the buffer
-/// reaches [`H2_COALESCE_TARGET`] or the inner body returns `Pending`/`None`,
+/// reaches the coalesce target or the inner body returns `Pending`/`None`,
 /// then yields the accumulated data as a single frame.
 ///
 /// **Trailer-safe**: When a non-data frame (TRAILERS) arrives while the buffer
@@ -516,13 +506,20 @@ pub(crate) struct CoalescingH2Body {
     /// Exact body length from Content-Length (if known). Forwarded via
     /// `size_hint()` so hyper can write a Content-Length response.
     content_length: Option<u64>,
+    /// Coalesce target in bytes. Configurable via `FERRUM_H2_COALESCE_TARGET_BYTES`.
+    coalesce_target: usize,
 }
 
 /// Wraps a hyper `Incoming` body into a coalescing adapter.
 ///
 /// `content_length` should be the value of the backend's Content-Length header
 /// (if present) so the adapter can propagate an exact size hint.
-pub(crate) fn coalescing_h2_body(body: Incoming, content_length: Option<u64>) -> ProxyBody {
+/// `coalesce_target` is the minimum chunk size before yielding (from env config).
+pub(crate) fn coalescing_h2_body(
+    body: Incoming,
+    content_length: Option<u64>,
+    coalesce_target: usize,
+) -> ProxyBody {
     use http_body_util::BodyExt;
 
     let coalescing = CoalescingH2Body {
@@ -531,6 +528,7 @@ pub(crate) fn coalescing_h2_body(body: Incoming, content_length: Option<u64>) ->
         done: false,
         stashed_trailer: None,
         content_length,
+        coalesce_target,
     };
     let mapped = coalescing.map_err(|e| Box::new(e) as ProxyBodyError);
     ProxyBody::Stream(Box::pin(mapped))
@@ -564,13 +562,13 @@ impl http_body::Body for CoalescingH2Body {
             match Pin::new(&mut this.inner).poll_frame(cx) {
                 Poll::Ready(Some(Ok(frame))) => {
                     if let Some(data) = frame.data_ref() {
-                        if this.buffer.is_empty() && data.len() >= H2_COALESCE_TARGET {
+                        if this.buffer.is_empty() && data.len() >= this.coalesce_target {
                             // Fast path: chunk is already large enough, pass through
                             // without copying into the buffer.
                             return Poll::Ready(Some(Ok(frame)));
                         }
                         this.buffer.extend_from_slice(data);
-                        if this.buffer.len() >= H2_COALESCE_TARGET {
+                        if this.buffer.len() >= this.coalesce_target {
                             // Buffer reached target — yield it
                             return Poll::Ready(Some(Ok(Frame::data(
                                 this.buffer.split().freeze(),

@@ -115,6 +115,9 @@ pub struct TcpProxyMetrics {
     pub total_connections: AtomicU64,
     pub bytes_in: AtomicU64,
     pub bytes_out: AtomicU64,
+    /// Bytes transferred via splice(2) zero-copy (Linux only, plaintext paths).
+    /// When non-zero, indicates splice was used instead of userspace copy.
+    pub splice_bytes_transferred: AtomicU64,
 }
 
 /// Configuration for starting a TCP proxy listener.
@@ -317,11 +320,18 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
                         Ok(s) => {
                             metrics.bytes_in.fetch_add(s.bytes_in, Ordering::Relaxed);
                             metrics.bytes_out.fetch_add(s.bytes_out, Ordering::Relaxed);
+                            if s.splice_used {
+                                metrics.splice_bytes_transferred.fetch_add(
+                                    s.bytes_in.saturating_add(s.bytes_out),
+                                    Ordering::Relaxed,
+                                );
+                            }
                             debug!(
                                 proxy_id = %proxy_id,
                                 client = %remote_addr.ip(),
                                 bytes_in = s.bytes_in,
                                 bytes_out = s.bytes_out,
+                                splice = s.splice_used,
                                 duration_ms = s.duration.as_millis() as u64,
                                 "TCP connection completed"
                             );
@@ -427,6 +437,8 @@ struct TcpConnectionSuccess {
     bytes_in: u64,
     bytes_out: u64,
     duration: Duration,
+    /// Whether splice(2) was used for this connection (Linux plaintext paths only).
+    splice_used: bool,
 }
 
 /// Handle a single TCP connection: TLS termination → backend resolution → bidirectional copy.
@@ -680,6 +692,7 @@ async fn handle_tcp_connection_inner(
             bytes_in,
             bytes_out,
             duration: start.elapsed(),
+            splice_used: cfg!(target_os = "linux"),
         });
     }
 
@@ -884,6 +897,7 @@ async fn handle_tcp_connection_inner(
 
     // Apply frontend TLS termination if configured, then start bidirectional copy.
     // From here, no retries — bytes may be exchanged.
+    let mut used_splice = false;
     let copy_result = if let Some(tls_config) = frontend_tls_config {
         let acceptor = tokio_rustls::TlsAcceptor::from(tls_config.clone());
         let tls_stream = match acceptor.accept(client_stream).await {
@@ -947,6 +961,7 @@ async fn handle_tcp_connection_inner(
         let buf_size = adaptive_buffer.get_buffer_size(proxy_id);
         match backend_stream {
             BackendStream::Tls(bs) => {
+                used_splice = false;
                 bidirectional_copy(client_stream, bs, idle_timeout, buf_size).await
             }
             BackendStream::Plain(bs) => {
@@ -954,10 +969,12 @@ async fn handle_tcp_connection_inner(
                 // are raw TCP (no frontend TLS, no backend TLS).
                 #[cfg(target_os = "linux")]
                 {
+                    used_splice = true;
                     bidirectional_splice(client_stream, bs, idle_timeout, buf_size).await
                 }
                 #[cfg(not(target_os = "linux"))]
                 {
+                    used_splice = false;
                     bidirectional_copy(client_stream, bs, idle_timeout, buf_size).await
                 }
             }
@@ -986,6 +1003,7 @@ async fn handle_tcp_connection_inner(
         bytes_in,
         bytes_out,
         duration: start.elapsed(),
+        splice_used: used_splice,
     })
 }
 

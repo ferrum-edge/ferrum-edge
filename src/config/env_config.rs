@@ -325,6 +325,12 @@ pub struct EnvConfig {
     /// This reduces async iteration overhead for moderate-sized responses.
     /// 0 = disabled (always stream). Default: 2 MiB.
     pub response_buffer_threshold_bytes: usize,
+    /// Target chunk size (bytes) for HTTP/2 response body coalescing.
+    /// The `CoalescingH2Body` adapter accumulates small HTTP/2 DATA frames into
+    /// chunks of at least this size before forwarding to the client, reducing
+    /// per-frame overhead on gRPC and HTTP/2 direct pool paths.
+    /// Default: 131072 (128 KiB). Minimum: 16384 (16 KiB). Maximum: 1048576 (1 MiB).
+    pub h2_coalesce_target_bytes: usize,
     /// Maximum URL length in bytes (path + query string). 0 = unlimited.
     pub max_url_length_bytes: usize,
     /// Maximum number of query parameters allowed. 0 = unlimited.
@@ -773,6 +779,7 @@ impl Default for EnvConfig {
             max_request_body_size_bytes: 10_485_760,
             max_response_body_size_bytes: 10_485_760,
             response_buffer_threshold_bytes: 2_097_152,
+            h2_coalesce_target_bytes: 131_072,
             max_url_length_bytes: 8_192,
             max_query_params: 100,
             max_grpc_recv_size_bytes: 4_194_304,
@@ -1049,6 +1056,12 @@ impl EnvConfig {
                 "FERRUM_RESPONSE_BUFFER_THRESHOLD_BYTES",
                 2_097_152,
             ),
+            h2_coalesce_target_bytes: resolve_usize(
+                conf,
+                "FERRUM_H2_COALESCE_TARGET_BYTES",
+                131_072,
+            )
+            .clamp(16_384, 1_048_576),
             max_url_length_bytes: resolve_usize(conf, "FERRUM_MAX_URL_LENGTH_BYTES", 8_192),
             max_query_params: resolve_usize(conf, "FERRUM_MAX_QUERY_PARAMS", 100),
             max_grpc_recv_size_bytes: resolve_usize(
