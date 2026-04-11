@@ -670,8 +670,8 @@ pub struct GrpcResponse {
 /// Streaming gRPC response — headers received, body streams frame-by-frame with trailers.
 ///
 /// The `body` field is an `Incoming` body from hyper. When passed through as
-/// a `ProxyBody::streaming_h2`, hyper's HTTP/2 server automatically forwards
-/// DATA frames and TRAILERS frames to the downstream client as they arrive,
+/// a `CoalescingH2Body`, hyper's HTTP/2 server forwards coalesced DATA frames
+/// and TRAILERS frames to the downstream client as they arrive,
 /// preserving gRPC streaming semantics without buffering the full response.
 pub struct GrpcStreamingResponse {
     pub status: u16,
@@ -927,7 +927,7 @@ pub(crate) async fn proxy_grpc_request_core(
     }
 
     // Streaming mode: return the live Incoming body without buffering.
-    // The caller (mod.rs) wraps it in ProxyBody::streaming_h2 so hyper
+    // The caller (mod.rs) wraps it in CoalescingH2Body so hyper
     // forwards DATA frames and TRAILERS to the downstream client as they arrive.
     if stream_response {
         return Ok(GrpcResponseKind::Streaming(GrpcStreamingResponse {

@@ -115,6 +115,9 @@ pub struct TcpProxyMetrics {
     pub total_connections: AtomicU64,
     pub bytes_in: AtomicU64,
     pub bytes_out: AtomicU64,
+    /// Bytes transferred via splice(2) zero-copy (Linux only, plaintext paths).
+    /// When non-zero, indicates splice was used instead of userspace copy.
+    pub splice_bytes_transferred: AtomicU64,
 }
 
 /// Configuration for starting a TCP proxy listener.
@@ -317,11 +320,18 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
                         Ok(s) => {
                             metrics.bytes_in.fetch_add(s.bytes_in, Ordering::Relaxed);
                             metrics.bytes_out.fetch_add(s.bytes_out, Ordering::Relaxed);
+                            if s.splice_used {
+                                metrics.splice_bytes_transferred.fetch_add(
+                                    s.bytes_in.saturating_add(s.bytes_out),
+                                    Ordering::Relaxed,
+                                );
+                            }
                             debug!(
                                 proxy_id = %proxy_id,
                                 client = %remote_addr.ip(),
                                 bytes_in = s.bytes_in,
                                 bytes_out = s.bytes_out,
+                                splice = s.splice_used,
                                 duration_ms = s.duration.as_millis() as u64,
                                 "TCP connection completed"
                             );
@@ -427,6 +437,8 @@ struct TcpConnectionSuccess {
     bytes_in: u64,
     bytes_out: u64,
     duration: Duration,
+    /// Whether splice(2) was used for this connection (Linux plaintext paths only).
+    splice_used: bool,
 }
 
 /// Handle a single TCP connection: TLS termination → backend resolution → bidirectional copy.
@@ -649,8 +661,16 @@ async fn handle_tcp_connection_inner(
                 })?;
 
         let buf_size = adaptive_buffer.get_buffer_size(proxy_id);
+
+        // On Linux, use splice(2) for zero-copy relay between raw TCP sockets.
+        // Passthrough mode is always plain-to-plain (no TLS termination/origination).
+        #[cfg(target_os = "linux")]
+        let copy_result =
+            bidirectional_splice(client_stream, backend_stream, idle_timeout, buf_size).await;
+        #[cfg(not(target_os = "linux"))]
         let copy_result =
             bidirectional_copy(client_stream, backend_stream, idle_timeout, buf_size).await;
+
         if let Ok((c2b, b2c)) = &copy_result {
             adaptive_buffer.record_connection(proxy_id, c2b.saturating_add(*b2c));
         }
@@ -672,6 +692,7 @@ async fn handle_tcp_connection_inner(
             bytes_in,
             bytes_out,
             duration: start.elapsed(),
+            splice_used: cfg!(target_os = "linux"),
         });
     }
 
@@ -876,6 +897,7 @@ async fn handle_tcp_connection_inner(
 
     // Apply frontend TLS termination if configured, then start bidirectional copy.
     // From here, no retries — bytes may be exchanged.
+    let mut used_splice = false;
     let copy_result = if let Some(tls_config) = frontend_tls_config {
         let acceptor = tokio_rustls::TlsAcceptor::from(tls_config.clone());
         let tls_stream = match acceptor.accept(client_stream).await {
@@ -939,10 +961,22 @@ async fn handle_tcp_connection_inner(
         let buf_size = adaptive_buffer.get_buffer_size(proxy_id);
         match backend_stream {
             BackendStream::Tls(bs) => {
+                used_splice = false;
                 bidirectional_copy(client_stream, bs, idle_timeout, buf_size).await
             }
             BackendStream::Plain(bs) => {
-                bidirectional_copy(client_stream, bs, idle_timeout, buf_size).await
+                // On Linux, use splice(2) for zero-copy relay when both sides
+                // are raw TCP (no frontend TLS, no backend TLS).
+                #[cfg(target_os = "linux")]
+                {
+                    used_splice = true;
+                    bidirectional_splice(client_stream, bs, idle_timeout, buf_size).await
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    used_splice = false;
+                    bidirectional_copy(client_stream, bs, idle_timeout, buf_size).await
+                }
             }
         }
     };
@@ -969,6 +1003,7 @@ async fn handle_tcp_connection_inner(
         bytes_in,
         bytes_out,
         duration: start.elapsed(),
+        splice_used: used_splice,
     })
 }
 
@@ -1132,6 +1167,206 @@ where
             tokio::io::copy_bidirectional_with_sizes(&mut client, &mut backend, buf_size, buf_size)
                 .await
                 .map_err(|e| anyhow::anyhow!("Bidirectional copy error: {}", e))
+        }
+    }
+}
+
+// ── Linux splice(2) zero-copy TCP relay ──────────────────────────────────────
+//
+// On Linux, splice(2) moves data between two file descriptors via a kernel-side
+// pipe buffer without copying to userspace. This eliminates two memory copies
+// per chunk (kernel→user read + user→kernel write) compared to the standard
+// `copy_bidirectional` approach. Inspired by nginx's sendfile and HAProxy's
+// splice-based TCP proxying.
+//
+// Only used when both endpoints are raw `TcpStream` (no TLS wrapping) — splice
+// operates on OS-level file descriptors and cannot see through rustls encryption.
+// Falls back to `bidirectional_copy` on non-Linux and for all TLS paths.
+
+/// Bidirectional zero-copy relay between two raw TCP streams using Linux splice(2).
+///
+/// Creates a kernel pipe for each direction (client→backend, backend→client) and
+/// uses `splice()` to move data through the pipe without userspace copies.
+/// Returns (bytes_client_to_backend, bytes_backend_to_client).
+///
+/// When `idle_timeout` is `Some(d)` and non-zero, the connection is closed
+/// if no data is received on either side for the given duration.
+#[cfg(target_os = "linux")]
+async fn bidirectional_splice(
+    client: TcpStream,
+    backend: TcpStream,
+    idle_timeout: Option<Duration>,
+    pipe_size: usize,
+) -> Result<(u64, u64), anyhow::Error> {
+    use std::os::unix::io::AsRawFd;
+
+    let client_fd = client.as_raw_fd();
+    let backend_fd = backend.as_raw_fd();
+
+    // Create two pipes: one for each direction.
+    let (c2b_pipe_r, c2b_pipe_w) = create_splice_pipe(pipe_size)?;
+    let (b2c_pipe_r, b2c_pipe_w) = create_splice_pipe(pipe_size)?;
+
+    let last_activity = if idle_timeout.is_some_and(|t| !t.is_zero()) {
+        Some(Arc::new(AtomicU64::new(coarse_now_ms())))
+    } else {
+        None
+    };
+
+    let la_c2b = last_activity.clone();
+    let la_b2c = last_activity.clone();
+
+    // Client → Backend direction
+    let c2b = tokio::spawn(async move {
+        splice_one_direction(client_fd, c2b_pipe_w, c2b_pipe_r, backend_fd, la_c2b).await
+    });
+
+    // Backend → Client direction
+    let b2c = tokio::spawn(async move {
+        splice_one_direction(backend_fd, b2c_pipe_w, b2c_pipe_r, client_fd, la_b2c).await
+    });
+
+    if let Some(timeout) = idle_timeout
+        && !timeout.is_zero()
+        && let Some(ref la) = last_activity
+    {
+        let la_check = la.clone();
+        let idle_check = async move {
+            let timeout_ms = timeout.as_millis() as u64;
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                let last = la_check.load(Ordering::Relaxed);
+                if coarse_now_ms().saturating_sub(last) >= timeout_ms {
+                    return;
+                }
+            }
+        };
+
+        tokio::select! {
+            result = async { tokio::try_join!(c2b, b2c) } => {
+                let (c2b_bytes, b2c_bytes) = result
+                    .map_err(|e| anyhow::anyhow!("Splice task panicked: {}", e))?;
+                Ok((c2b_bytes?, b2c_bytes?))
+            }
+            _ = idle_check => {
+                Err(anyhow::anyhow!("TCP idle timeout after {}s", timeout.as_secs()))
+            }
+        }
+    } else {
+        let (c2b_bytes, b2c_bytes) = tokio::try_join!(c2b, b2c)
+            .map_err(|e| anyhow::anyhow!("Splice task panicked: {}", e))?;
+        Ok((c2b_bytes?, b2c_bytes?))
+    }
+}
+
+/// Create a pipe suitable for splice, sized to match the proxy buffer tier.
+#[cfg(target_os = "linux")]
+fn create_splice_pipe(desired_size: usize) -> Result<(i32, i32), anyhow::Error> {
+    let mut fds = [0i32; 2];
+    let ret = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC) };
+    if ret < 0 {
+        return Err(anyhow::anyhow!(
+            "Failed to create splice pipe: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // Try to resize the pipe to match the adaptive buffer tier.
+    // Failures are non-fatal — the kernel default (64 KB on most systems) is fine.
+    unsafe {
+        libc::fcntl(fds[1], libc::F_SETPIPE_SZ, desired_size as libc::c_int);
+    }
+    Ok((fds[0], fds[1]))
+}
+
+/// Splice data in one direction: src_fd → pipe → dst_fd.
+/// Returns total bytes transferred.
+#[cfg(target_os = "linux")]
+async fn splice_one_direction(
+    src_fd: i32,
+    pipe_w: i32,
+    pipe_r: i32,
+    dst_fd: i32,
+    last_activity: Option<Arc<AtomicU64>>,
+) -> Result<u64, anyhow::Error> {
+    // Safety: pipe fds are valid for the lifetime of this function.
+    // We rely on the caller keeping the TcpStream alive (and thus the src_fd/dst_fd).
+    let _pipe_guard = SplicePipeGuard(pipe_r, pipe_w);
+    let mut total: u64 = 0;
+    let splice_flags = libc::SPLICE_F_MOVE | libc::SPLICE_F_NONBLOCK;
+
+    loop {
+        // Phase 1: splice from source fd into write end of pipe
+        let n = unsafe {
+            libc::splice(
+                src_fd,
+                std::ptr::null_mut(),
+                pipe_w,
+                std::ptr::null_mut(),
+                // Use 128 KB per splice call — large enough to amortize syscall
+                // overhead, small enough to avoid holding the pipe buffer too long.
+                128 * 1024,
+                splice_flags,
+            )
+        };
+
+        if n > 0 {
+            if let Some(ref la) = last_activity {
+                la.store(coarse_now_ms(), Ordering::Relaxed);
+            }
+
+            // Phase 2: splice from read end of pipe into destination fd
+            let mut remaining = n as usize;
+            while remaining > 0 {
+                let written = unsafe {
+                    libc::splice(
+                        pipe_r,
+                        std::ptr::null_mut(),
+                        dst_fd,
+                        std::ptr::null_mut(),
+                        remaining,
+                        splice_flags,
+                    )
+                };
+                if written > 0 {
+                    remaining -= written as usize;
+                    total += written as u64;
+                } else if written == 0 {
+                    return Ok(total);
+                } else {
+                    let err = std::io::Error::last_os_error();
+                    if err.kind() == std::io::ErrorKind::WouldBlock {
+                        // Destination not ready — yield and retry
+                        tokio::task::yield_now().await;
+                        continue;
+                    }
+                    return Err(anyhow::anyhow!("splice write error: {}", err));
+                }
+            }
+        } else if n == 0 {
+            // EOF — source closed
+            return Ok(total);
+        } else {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::WouldBlock {
+                // Source not ready — yield and retry
+                tokio::task::yield_now().await;
+                continue;
+            }
+            return Err(anyhow::anyhow!("splice read error: {}", err));
+        }
+    }
+}
+
+/// RAII guard that closes pipe file descriptors on drop.
+#[cfg(target_os = "linux")]
+struct SplicePipeGuard(i32, i32);
+
+#[cfg(target_os = "linux")]
+impl Drop for SplicePipeGuard {
+    fn drop(&mut self) {
+        unsafe {
+            libc::close(self.0);
+            libc::close(self.1);
         }
     }
 }

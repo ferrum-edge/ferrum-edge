@@ -469,6 +469,7 @@ pub struct ProxyState {
     pub max_request_body_size_bytes: usize,
     pub max_response_body_size_bytes: usize,
     pub response_buffer_threshold_bytes: usize,
+    pub h2_coalesce_target_bytes: usize,
     pub max_url_length_bytes: usize,
     pub max_query_params: usize,
     pub max_grpc_recv_size_bytes: usize,
@@ -540,6 +541,7 @@ impl ProxyState {
         let max_request_body_size_bytes = env_config.max_request_body_size_bytes;
         let max_response_body_size_bytes = env_config.max_response_body_size_bytes;
         let response_buffer_threshold_bytes = env_config.response_buffer_threshold_bytes;
+        let h2_coalesce_target_bytes = env_config.h2_coalesce_target_bytes;
         let max_url_length_bytes = env_config.max_url_length_bytes;
         let max_query_params = env_config.max_query_params;
         let max_grpc_recv_size_bytes = env_config.max_grpc_recv_size_bytes;
@@ -721,6 +723,7 @@ impl ProxyState {
             max_request_body_size_bytes,
             max_response_body_size_bytes,
             response_buffer_threshold_bytes,
+            h2_coalesce_target_bytes,
             max_url_length_bytes,
             max_query_params,
             max_grpc_recv_size_bytes,
@@ -4839,14 +4842,23 @@ pub async fn handle_proxy_request(
                     }
                 }
 
-                return Ok(resp_builder
-                    .body(ProxyBody::streaming_incoming(grpc_streaming.body))
-                    .unwrap_or_else(|_| {
-                        grpc_proxy::build_grpc_error_response(
-                            grpc_proxy::grpc_status::UNAVAILABLE,
-                            "Internal gateway error",
-                        )
-                    }));
+                // Coalesce small H2 DATA frames into larger chunks to reduce
+                // per-frame overhead on the gRPC streaming path.
+                let cl = response_headers
+                    .get("content-length")
+                    .and_then(|v| v.parse::<u64>().ok());
+                let body = crate::proxy::body::coalescing_h2_body(
+                    grpc_streaming.body,
+                    cl,
+                    state.h2_coalesce_target_bytes,
+                );
+
+                return Ok(resp_builder.body(body).unwrap_or_else(|_| {
+                    grpc_proxy::build_grpc_error_response(
+                        grpc_proxy::grpc_status::UNAVAILABLE,
+                        "Internal gateway error",
+                    )
+                }));
             }
             Ok(GrpcResponseKind::Buffered(grpc_resp)) => {
                 let mut response_status = grpc_resp.status;
@@ -5740,7 +5752,16 @@ pub async fn handle_proxy_request(
                 .and_then(|v| v.parse::<u64>().ok());
             crate::proxy::body::coalescing_body(resp, cl)
         }
-        ResponseBody::StreamingH2(resp) => ProxyBody::streaming_h2(resp),
+        ResponseBody::StreamingH2(resp) => {
+            let cl = response_headers
+                .get("content-length")
+                .and_then(|v| v.parse::<u64>().ok());
+            crate::proxy::body::coalescing_h2_body(
+                resp.into_body(),
+                cl,
+                state.h2_coalesce_target_bytes,
+            )
+        }
         ResponseBody::Buffered(data) => ProxyBody::full(Bytes::from(data)),
     };
 

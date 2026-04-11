@@ -339,7 +339,7 @@ TCP connections are monitored for idle activity. When no data is transferred in 
 - A background checker polls every 1 second to compare the last activity timestamp against the timeout
 - When the timeout fires, the connection is closed gracefully and logged as a TCP idle timeout
 - Connections with active data flow in either direction are never affected
-- When disabled (0), the fast path uses `copy_bidirectional` with zero overhead
+- When disabled (0), the fast path uses `copy_bidirectional` with zero overhead. On Linux, plaintext TCP connections (no TLS on either side) use `splice(2)` zero-copy relay, eliminating userspace memory copies entirely
 
 ```yaml
 proxies:

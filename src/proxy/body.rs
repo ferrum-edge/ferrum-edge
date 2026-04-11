@@ -145,27 +145,6 @@ impl ProxyBody {
         Self::Full(Full::default())
     }
 
-    /// Create a streaming body from a hyper HTTP/2 response (Incoming body).
-    pub fn streaming_h2(response: hyper::Response<hyper::body::Incoming>) -> Self {
-        use http_body_util::BodyExt;
-
-        let body = response.into_body();
-        let mapped = body.map_err(|e| Box::new(e) as ProxyBodyError);
-        Self::Stream(Box::pin(mapped))
-    }
-
-    /// Create a streaming body directly from a hyper `Incoming` body.
-    ///
-    /// Used when the response headers and body have already been separated,
-    /// e.g. in the gRPC streaming path where status and headers are extracted
-    /// before the body is passed through.
-    pub fn streaming_incoming(body: hyper::body::Incoming) -> Self {
-        use http_body_util::BodyExt;
-
-        let mapped = body.map_err(|e| Box::new(e) as ProxyBodyError);
-        Self::Stream(Box::pin(mapped))
-    }
-
     /// Create a streaming body with lightweight completion tracking.
     ///
     /// Returns the body and a shared `Arc<StreamingMetrics>` that a deferred
@@ -491,6 +470,154 @@ where
 
     fn is_end_stream(&self) -> bool {
         self.done && self.buffer.is_empty()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        if let Some(len) = self.content_length {
+            http_body::SizeHint::with_exact(len)
+        } else {
+            http_body::SizeHint::default()
+        }
+    }
+}
+
+// -- CoalescingH2Body ---------------------------------------------------------
+
+/// A response body adapter that coalesces small HTTP/2 DATA frames from a
+/// hyper `Incoming` body into larger frames for efficient forwarding.
+///
+/// This is the HTTP/2 equivalent of [`CoalescingBody`] (which wraps reqwest
+/// byte streams). The adapter accumulates small DATA frames until the buffer
+/// reaches the coalesce target or the inner body returns `Pending`/`None`,
+/// then yields the accumulated data as a single frame.
+///
+/// **Trailer-safe**: When a non-data frame (TRAILERS) arrives while the buffer
+/// has unflushed data, the adapter stashes the trailer, flushes the buffer on
+/// the current poll, and returns the stashed trailer on the next poll. This
+/// preserves gRPC trailer semantics (grpc-status, grpc-message) without
+/// buffering the entire response.
+pub(crate) struct CoalescingH2Body {
+    inner: Incoming,
+    buffer: BytesMut,
+    done: bool,
+    /// Stashed non-data frame (trailer) that arrived while buffer was non-empty.
+    /// Returned on the next poll_frame call after the buffer is flushed.
+    stashed_trailer: Option<Frame<Bytes>>,
+    /// Exact body length from Content-Length (if known). Forwarded via
+    /// `size_hint()` so hyper can write a Content-Length response.
+    content_length: Option<u64>,
+    /// Coalesce target in bytes. Configurable via `FERRUM_H2_COALESCE_TARGET_BYTES`.
+    coalesce_target: usize,
+}
+
+/// Wraps a hyper `Incoming` body into a coalescing adapter.
+///
+/// `content_length` should be the value of the backend's Content-Length header
+/// (if present) so the adapter can propagate an exact size hint.
+/// `coalesce_target` is the minimum chunk size before yielding (from env config).
+pub(crate) fn coalescing_h2_body(
+    body: Incoming,
+    content_length: Option<u64>,
+    coalesce_target: usize,
+) -> ProxyBody {
+    use http_body_util::BodyExt;
+
+    let coalescing = CoalescingH2Body {
+        inner: body,
+        buffer: BytesMut::new(),
+        done: false,
+        stashed_trailer: None,
+        content_length,
+        coalesce_target,
+    };
+    let mapped = coalescing.map_err(|e| Box::new(e) as ProxyBodyError);
+    ProxyBody::Stream(Box::pin(mapped))
+}
+
+impl http_body::Body for CoalescingH2Body {
+    type Data = Bytes;
+    type Error = hyper::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let this = self.get_mut();
+
+        // Return stashed trailer from a previous poll (buffer was flushed first).
+        if let Some(trailer) = this.stashed_trailer.take() {
+            this.done = true;
+            return Poll::Ready(Some(Ok(trailer)));
+        }
+
+        if this.done {
+            // Flush any remaining buffered data after stream ended
+            if !this.buffer.is_empty() {
+                return Poll::Ready(Some(Ok(Frame::data(this.buffer.split().freeze()))));
+            }
+            return Poll::Ready(None);
+        }
+
+        loop {
+            match Pin::new(&mut this.inner).poll_frame(cx) {
+                Poll::Ready(Some(Ok(frame))) => {
+                    if let Some(data) = frame.data_ref() {
+                        if this.buffer.is_empty() && data.len() >= this.coalesce_target {
+                            // Fast path: chunk is already large enough, pass through
+                            // without copying into the buffer.
+                            return Poll::Ready(Some(Ok(frame)));
+                        }
+                        this.buffer.extend_from_slice(data);
+                        if this.buffer.len() >= this.coalesce_target {
+                            // Buffer reached target — yield it
+                            return Poll::Ready(Some(Ok(Frame::data(
+                                this.buffer.split().freeze(),
+                            ))));
+                        }
+                        // Buffer not full yet — continue polling for more
+                        continue;
+                    }
+                    // Non-data frame (trailers). If buffer has unflushed data,
+                    // stash the trailer and flush the buffer first. The stashed
+                    // trailer is returned on the next poll_frame call.
+                    if !this.buffer.is_empty() {
+                        // Convert the frame to our output type (Bytes) for stashing.
+                        // Trailers don't carry data, so this is just the trailer map.
+                        if let Ok(trailers) = frame.into_trailers() {
+                            this.stashed_trailer = Some(Frame::trailers(trailers));
+                        }
+                        return Poll::Ready(Some(Ok(Frame::data(this.buffer.split().freeze()))));
+                    }
+                    // Buffer is empty — pass through trailer directly
+                    return Poll::Ready(Some(Ok(frame)));
+                }
+                Poll::Ready(Some(Err(e))) => {
+                    this.done = true;
+                    if !this.buffer.is_empty() {
+                        return Poll::Ready(Some(Ok(Frame::data(this.buffer.split().freeze()))));
+                    }
+                    return Poll::Ready(Some(Err(e)));
+                }
+                Poll::Ready(None) => {
+                    this.done = true;
+                    if !this.buffer.is_empty() {
+                        return Poll::Ready(Some(Ok(Frame::data(this.buffer.split().freeze()))));
+                    }
+                    return Poll::Ready(None);
+                }
+                Poll::Pending => {
+                    // Inner body has no more data right now — flush what we have
+                    if !this.buffer.is_empty() {
+                        return Poll::Ready(Some(Ok(Frame::data(this.buffer.split().freeze()))));
+                    }
+                    return Poll::Pending;
+                }
+            }
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.done && self.buffer.is_empty() && self.stashed_trailer.is_none()
     }
 
     fn size_hint(&self) -> http_body::SizeHint {

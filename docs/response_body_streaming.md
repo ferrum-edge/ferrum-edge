@@ -75,7 +75,7 @@ This optimization **only activates when no plugins require response body bufferi
 
 ### Response Body Coalescing
 
-For responses that stream (either below the adaptive buffer minimum or above the threshold), the gateway uses a `CoalescingBody` adapter that accumulates small backend chunks into 128 KB frames before yielding to hyper's HTTP encoder. This reduces the number of write syscalls by ~8–16× for large responses compared to forwarding each small chunk individually.
+For responses that stream (either below the adaptive buffer minimum or above the threshold), the gateway uses coalescing adapters that accumulate small backend chunks into 128 KB frames before yielding to hyper's HTTP encoder. `CoalescingBody` handles reqwest-backed HTTP/1.1 responses, while `CoalescingH2Body` handles hyper HTTP/2 `Incoming` bodies (gRPC streaming and HTTP/2 direct pool paths). This reduces the number of write syscalls by ~8–16× for large responses compared to forwarding each small chunk individually. The H2 adapter is trailer-safe — gRPC trailers are stashed while buffered data is flushed, then returned on the next poll.
 
 ### Decision Flow
 
@@ -216,9 +216,8 @@ Helper constructors:
 - `ProxyBody::full(data)` — Create a buffered body from bytes
 - `ProxyBody::from_string(s)` — Create a buffered body from a string
 - `ProxyBody::empty()` — Create an empty body
-- `body::coalescing_body(response, content_length)` — Create a streaming body with chunk coalescing (128 KB target). This is the default for reqwest-backed responses
-- `ProxyBody::streaming_h2(response)` — Create a streaming body from a hyper HTTP/2 response (zero-overhead passthrough for the H2 direct pool and gRPC)
-- `ProxyBody::streaming_incoming(body)` — Create a streaming body from a raw hyper `Incoming` body
+- `body::coalescing_body(response, content_length)` — Create a streaming body with chunk coalescing (128 KB target). This is the default for reqwest-backed HTTP/1.1 responses
+- `body::coalescing_h2_body(body, content_length)` — Create a streaming body with H2 DATA frame coalescing (128 KB target). Used for the gRPC streaming path and HTTP/2 direct pool. Trailer-safe: stashes gRPC trailers (`grpc-status`, `grpc-message`) while flushing buffered data, then returns them on the next poll
 - `ProxyBody::streaming_tracked(response, baseline)` — Create a streaming body with completion tracking, returning `(ProxyBody, Arc<StreamingMetrics>)`
 
 ## When to Use Buffer Mode

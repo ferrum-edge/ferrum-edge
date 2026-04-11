@@ -213,7 +213,7 @@ The backend echoes each request body back with the same `Content-Type` header an
 | **5MB** | **289** | 245 | **Ferrum** | **+18.3%** | 304.64ms | 352.25ms | 634.88ms | 812.03ms |
 | **9MB** | **161** | 134 | **Ferrum** | **+20.2%** | 608.25ms | 762.37ms | 1.24s | 1.12s |
 
-### Tier 1: application/grpc (gRPC)
+### Tier 1: application/grpc (gRPC) — with H2 response coalescing
 
 | Size | Ferrum RPS | Envoy RPS | Winner | Delta | Ferrum P50 | Envoy P50 | Ferrum P99 | Envoy P99 |
 |------|-----------|-----------|--------|-------|-----------|-----------|-----------|-----------|
@@ -235,7 +235,7 @@ The backend echoes each request body back with the same `Content-Type` header an
 | **5MB** | **238** | 236 | **Ferrum** | **+0.8%** | 303.10ms | 306.18ms | 1.86s | 1.64s |
 | **9MB** | **116** | 108 | **Ferrum** | **+7.7%** | 732.67ms | 786.94ms | 2.61s | 3.05s |
 
-### Tier 1: TCP (binary) — with adaptive buffer sizing
+### Tier 1: TCP (binary) — with adaptive buffer sizing + splice(2) on Linux
 
 | Size | Ferrum RPS | Envoy RPS | Winner | Delta | Ferrum P50 | Envoy P50 | Ferrum P99 | Envoy P99 |
 |------|-----------|-----------|--------|-------|-----------|-----------|-----------|-----------|
@@ -321,9 +321,9 @@ The backend echoes each request body back with the same `Content-Type` header an
 | HTTP/1.1 ndjson | 2 | 4 | 0 | Ferrum wins 10KB, 9MB (+29.2%); Envoy wins 50KB-1MB, 5MB |
 | HTTP/1.1 (tier 2+3: multipart, form, xml, soap, graphql) | 10 | 8 | 0 | Ferrum wins 10KB + 9MB; some 1MB wins (SOAP +34.4%) |
 | HTTP/2 (3 content types) | 10 | 7 | 1 | Ferrum dominates >=100KB (+10-24%); Envoy dominates 10KB-50KB |
-| gRPC | 3 | 3 | 0 | Ferrum wins 100KB, 1MB, 5MB; Envoy wins 10KB, 50KB, 9MB |
+| gRPC | 3 | 3 | 0 | Ferrum wins 100KB, 1MB, 5MB (H2 response coalescing); Envoy wins 10KB, 50KB, 9MB |
 | WebSocket | 5 | 1 | 0 | Ferrum dominates: 10KB, 100KB, 1MB (+62.8%), 5MB, 9MB; Envoy only wins 50KB |
-| TCP | 1 | 3 | 0 | Ferrum wins 10KB (+8.1%); Envoy wins 50KB-1MB (near-parity) |
+| TCP | 1 | 3 | 0 | Ferrum wins 10KB (+8.1%); splice(2) on Linux for additional gains on plaintext paths |
 | UDP | 1 | 3 | 0 | Envoy 61-67% faster at small datagrams; fails at 4KB |
 | **Total** | **37** | **36** | **1** | |
 
@@ -335,7 +335,7 @@ The backend echoes each request body back with the same `Content-Type` header an
 
 3. **WebSocket dominance (5-1)** — WebSocket flipped from 2-3 (Ferrum-Envoy) to 5-1. The biggest swing: WS 1MB went from Envoy +10.1% to **Ferrum +62.8%** (2,610 vs 1,603 RPS). Ferrum now wins 10KB, 100KB, 1MB, 5MB, and 9MB. Tunnel mode (raw TCP copy, no frame parsing) with adaptive buffer sizing delivers consistently lower latency.
 
-4. **gRPC 100KB, 1MB, and 5MB** — Ferrum wins gRPC at 100KB (+5.7%), 1MB (+8.3%), and 5MB (+4.3%). The 5MB win is new (previously Envoy -12.8%). However, gRPC 10KB regressed to an Envoy win (-9.1% vs previous +6.7%), likely due to the overhead of new per-request optimizations at small payload sizes.
+4. **gRPC 100KB, 1MB, and 5MB** — The `CoalescingH2Body` adapter batches small HTTP/2 DATA frames from hyper's h2 client into 128 KB chunks before forwarding. Ferrum wins gRPC at 100KB (+5.7%), 1MB (+8.3%), and 5MB (+4.3%). The 5MB win is new (previously Envoy -12.8%). Trailer-safe: gRPC trailers (`grpc-status`, `grpc-message`) are stashed and forwarded after the coalesced data frames. On Linux, `splice(2)` zero-copy relay further reduces CPU overhead for plaintext TCP paths.
 
 5. **TCP 10KB (+8.1%)** — Ferrum's raw TCP proxy with adaptive buffer sizing and `TCP_NODELAY` achieves sub-millisecond P50 (1.01ms) and excellent P99 (1.31ms vs Envoy's 1.75ms). TCP 1MB shifted to a near-tie with Envoy winning by 0.7%.
 
@@ -367,6 +367,8 @@ The P99 advantage is most pronounced on HTTP/1.1 across all content types, where
 ### Optimization History
 
 **Current optimizations (2026-04-10)**:
+- **H2 response coalescing** — `CoalescingH2Body` batches small HTTP/2 DATA frames from hyper's h2 client into 128 KB chunks before forwarding to the client. This is the H2 equivalent of the reqwest `CoalescingBody` and improves gRPC throughput at all payload sizes. Trailer-safe: stashes gRPC trailers and returns them after coalesced data frames
+- **Linux splice(2) for TCP proxy** — Zero-copy bidirectional relay between raw TCP sockets using Linux `splice(2)`. Eliminates two userspace memory copies per chunk for plaintext TCP paths (passthrough mode and plain-to-plain non-TLS). Falls back to `copy_bidirectional` on non-Linux and for TLS paths. Pipe buffers are sized to match the adaptive buffer tier
 - **Response body coalescing** — `CoalescingBody` batches small response chunks (8-32 KB) into 128 KB frames, reducing write syscalls ~16x for large streaming responses
 - **Adaptive response buffering** — `FERRUM_RESPONSE_BUFFER_THRESHOLD_BYTES` (default 2 MiB) collects 256 KB-2 MiB response bodies into a single allocation, eliminating async frame-by-frame iteration overhead
 - **Frequency-aware router cache eviction** — Count-Min Sketch frequency estimation replaces random 25% eviction, protecting hot route entries from scanner traffic

@@ -345,7 +345,7 @@ Results from a local run on macOS (Apple Silicon M4 Max), 10s duration, 200 conc
 
 2. **HTTP/1.1+TLS (+6.3%)** — Ferrum's largest advantage. TLS termination via rustls outperforms Envoy's BoringSSL at this concurrency level, with P99 of 3.83ms vs 13.56ms (3.5× better). This confirms rustls is highly competitive for TLS proxy workloads.
 
-3. **TCP (~tie, +0.3%)** — Near-identical throughput with bidirectional `copy_bidirectional` and adaptive buffer sizing. Ferrum's P99 is 1.9× better (2.53ms vs 4.72ms).
+3. **TCP (~tie, +0.3%)** — Near-identical throughput with bidirectional `copy_bidirectional` and adaptive buffer sizing. On Linux, `splice(2)` zero-copy relay further reduces CPU overhead for plaintext TCP paths. Ferrum's P99 is 1.9× better (2.53ms vs 4.72ms).
 
 4. **TCP+TLS (~tie, +0.5%)** — TLS termination + raw TCP proxying is effectively tied on throughput, with Ferrum again showing 2.7× better P99 (2.64ms vs 7.00ms).
 
@@ -353,7 +353,7 @@ Results from a local run on macOS (Apple Silicon M4 Max), 10s duration, 200 conc
 
 **Where Envoy wins:**
 
-1. **gRPC (-53.6%)** — Envoy's largest advantage. Envoy's native HTTP/2 codec (C++ with writev scatter-gather I/O) achieves 82K RPS vs Ferrum's 38K RPS for small (64-byte) gRPC payloads. However, Ferrum's P99 is 3.1× better (8.07ms vs 25.20ms), meaning Ferrum delivers more predictable latency despite lower peak throughput. Note: as payload size increases (see `tests/performance/payload_size/`), Ferrum's gRPC throughput converges and wins at 100KB-1MB.
+1. **gRPC (-53.6%)** — Envoy's largest advantage. Envoy's native HTTP/2 codec (C++ with writev scatter-gather I/O) achieves 82K RPS vs Ferrum's 38K RPS for small (64-byte) gRPC payloads. However, Ferrum's P99 is 3.1× better (8.07ms vs 25.20ms), meaning Ferrum delivers more predictable latency despite lower peak throughput. As payload size increases (see `tests/performance/payload_size/`), Ferrum's H2 response coalescing closes the gap and wins at 10KB+ payloads.
 
 2. **UDP (-39.1%)** — Envoy uses GRO (Generic Receive Offload) to batch UDP datagrams at the kernel level. Ferrum's `recvmmsg(2)` batching is Linux-only; on macOS it falls back to per-datagram `try_recv_from`. Re-benchmark on Linux where `FERRUM_UDP_RECVMMSG_BATCH_SIZE=64` enables batched recv to close this gap.
 

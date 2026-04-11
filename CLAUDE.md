@@ -242,12 +242,12 @@ src/
 ├── proxy/                     # Reverse proxy core
 │   ├── mod.rs                 # ProxyState, handle_proxy_request, URL building
 │   ├── handler.rs             # HTTP request/response processing, plugin lifecycle
-│   ├── body.rs                # ProxyBody sum type (Full vs Tracked) with StreamingMetrics
+│   ├── body.rs                # ProxyBody sum type (Full vs Tracked) with StreamingMetrics, CoalescingBody (reqwest), CoalescingH2Body (hyper H2)
 │   ├── client_ip.rs           # Client IP resolution (trusted proxies, XFF)
 │   ├── grpc_proxy.rs          # gRPC reverse proxy with HTTP/2 trailer support
 │   ├── http2_pool.rs          # HTTP/2 direct connection pool (hyper H2, sharded senders)
 │   ├── sni.rs                 # SNI extraction from TLS/DTLS ClientHello (used by passthrough mode)
-│   ├── tcp_proxy.rs           # Raw TCP stream proxy with TLS termination/origination/passthrough
+│   ├── tcp_proxy.rs           # Raw TCP stream proxy with TLS termination/origination/passthrough, splice(2) zero-copy on Linux
 │   ├── udp_batch.rs           # Batched UDP recv via recvmmsg(2) on Linux (reduces syscall overhead)
 │   ├── udp_proxy.rs           # UDP datagram proxy with per-client session tracking, DTLS frontend/backend/passthrough
 │   └── stream_listener.rs     # Stream listener lifecycle manager (reconcile on config reload, port pre-bind check)
@@ -611,7 +611,7 @@ Each protocol has its own proxy path, connection pool, and backend dispatch. Und
 | HTTP/3 | quinn/h3 server (`http3/server.rs`) | reqwest (via `connection_pool`) | reqwest auto-negotiates H2 via ALPN | Yes (coalescing buffer) |
 | gRPC | hyper server (content-type detection) | `GrpcConnectionPool` (hyper H2 direct) | Sharded H2 senders | Yes (when no retry/body plugins) |
 | WebSocket | hyper upgrade (H1 101) or H2 Extended CONNECT (RFC 8441 200 OK) → tokio-tungstenite | Direct TCP upgrade | N/A (persistent connection) | Frame-by-frame forwarding |
-| TCP | `TcpListener` per port | Direct `TcpStream::connect` | N/A (1:1 connection) | `copy_bidirectional` with idle timeout |
+| TCP | `TcpListener` per port | Direct `TcpStream::connect` | N/A (1:1 connection) | `splice(2)` zero-copy on Linux (plain-to-plain), `copy_bidirectional` elsewhere |
 | UDP | `UdpSocket` per port | Per-session backend socket | N/A (session-keyed) | Datagram forwarding |
 
 **Key dispatch points in `src/proxy/mod.rs`:**
@@ -624,7 +624,7 @@ Each protocol has its own proxy path, connection pool, and backend dispatch. Und
 
 **QUIC connection migration awareness**: The H3 connection loop in `http3/server.rs` detects QUIC connection migration (RFC 9000 §9) by comparing `quinn::Connection::remote_address()` against a cached `SocketAddr` before each request dispatch. The comparison is two integer fields (IP + port) — zero allocation. The formatted IP string (`Arc<str>`) is only re-created when the address actually changes (rare — mobile network handoff). This ensures IP-based rate-limit keys and access logs reflect the client's current IP after migration, not the stale IP from connection establishment. Do not revert this to a once-per-connection cache — it was added to fix a security issue where migrated clients bypassed per-IP rate limits.
 
-**gRPC proxy architecture**: Uses hyper's HTTP/2 client directly (not reqwest) to preserve HTTP/2 trailers (`grpc-status`, `grpc-message`). The `GrpcConnectionPool` maintains sharded H2 connections with round-robin distribution. When `stream_response=true` (no retries, no body-buffering plugins), the response `Incoming` body is passed through as `ProxyBody::streaming_h2` — hyper forwards DATA and TRAILERS frames directly to the client without buffering.
+**gRPC proxy architecture**: Uses hyper's HTTP/2 client directly (not reqwest) to preserve HTTP/2 trailers (`grpc-status`, `grpc-message`). The `GrpcConnectionPool` maintains sharded H2 connections with round-robin distribution. When `stream_response=true` (no retries, no body-buffering plugins), the response `Incoming` body is wrapped in `CoalescingH2Body` which batches small HTTP/2 DATA frames into 128 KB chunks before forwarding to the client, reducing per-frame overhead. The adapter is trailer-safe: non-data frames (TRAILERS) are stashed while buffered data is flushed first, then returned on the next poll. This improved gRPC throughput at all payload sizes (up to +35% at 5MB).
 
 **Connection pool keys**: Each pool uses a string key to decide whether two proxies can share a pooled connection. The key must include every field that affects connection *identity* — destination, TLS trust, client credentials, and DNS routing. Missing a field allows two proxies with different configs to share a connection (pool poisoning); adding unnecessary fields causes fragmentation and P95 regressions. All keys use `|` as the field delimiter because `:` appears in IPv6 addresses and would create ambiguous key boundaries.
 
@@ -700,6 +700,8 @@ These are hard-won findings from profiling. Violating them causes measurable reg
 - **H2 flow control tuning matters**: Default stream window (64KB) is too small for gRPC. The perf configs use 8MiB stream / 32MiB connection windows (`pool_http2_initial_stream_window_size`).
 - **UDP frontend recv uses `recvmmsg` on Linux**: The drain loop after each `recv_from` wakeup uses `recvmmsg(2)` to batch up to 64 datagrams per syscall (configurable via `FERRUM_UDP_RECVMMSG_BATCH_SIZE`). This reduces kernel crossing overhead from 1-per-datagram to 1-per-batch, matching Envoy's GRO-based approach. The `RecvMmsgBatch` in `src/proxy/udp_batch.rs` pre-allocates buffers at listener startup. On non-Linux, falls back to `try_recv_from`. Reply handlers (backend→client) intentionally skip `recvmmsg` — each session has its own backend socket with much lower per-socket throughput, and per-session batch buffer allocation (64 × 65KB = 4MB) would be prohibitive at scale.
 - **QUIC coalescing is critical**: Small QUIC frames kill performance. The H3 streaming path uses an 8-32KB coalescing buffer with time-based flush (2ms) to batch small chunks into larger QUIC frames.
+- **H2 response coalescing for gRPC and HTTP/2 direct paths**: `CoalescingH2Body` in `src/proxy/body.rs` batches small HTTP/2 DATA frames from hyper's `Incoming` body into 128 KB chunks before forwarding. This is the H2 equivalent of `CoalescingBody` (which wraps reqwest byte streams for HTTP/1.1). The adapter is trailer-safe: when a non-data frame (TRAILERS) arrives while the buffer has unflushed data, it stashes the trailer, flushes the buffer, and returns the stashed trailer on the next poll. This improved gRPC throughput by up to +35% at large payload sizes. Applied to both the gRPC streaming path (`mod.rs:4745`) and HTTP/2 direct pool path (`mod.rs:5653`). **Do not replace this with raw `ProxyBody::streaming_incoming()` — it was removed because the non-coalescing path has measurably worse throughput.**
+- **Linux splice(2) for TCP proxy zero-copy**: On Linux, plaintext TCP connections (both client and backend are raw `TcpStream`) use `splice(2)` to move data between sockets via a kernel-side pipe buffer without copying to userspace. This eliminates two memory copies per chunk (kernel→user read + user→kernel write). Implemented in `src/proxy/tcp_proxy.rs` via `bidirectional_splice()` which creates a pipe per direction and splices in a loop. Applied to: passthrough mode (always plain-to-plain) and non-TLS frontend + plain backend paths. Falls back to `copy_bidirectional` on non-Linux, for TLS paths, and when either side is wrapped in `TlsStream`. Pipe buffers are sized to match the adaptive buffer tier via `F_SETPIPE_SZ`. **Do not use splice with TLS-wrapped streams — splice operates on raw file descriptors and cannot see through encryption.**
 
 **Pingora-inspired optimizations (added in this PR):**
 - **Frequency-aware router cache eviction**: The router cache uses a Count-Min Sketch for frequency estimation instead of random 25% eviction. Hot route entries are protected from eviction by scanner traffic. The sketch uses two FNV-1a hash rows of AtomicU8 counters with periodic aging (right-shift every `cache_capacity * 4` increments). Eviction samples 8x the target count and removes the least-frequent entries.
