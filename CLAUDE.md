@@ -536,7 +536,7 @@ tests/
 
 **CA exclusivity**: When a custom CA is configured (proxy or global), it is the **sole** trust anchor. Webpki/system roots are not added. This prevents backends with internal CAs from being MITMed via any public CA. Webpki roots are only used as a convenience fallback when no CA is explicitly configured.
 
-**Startup validation**: Per-proxy TLS file paths (`backend_tls_client_cert_path`, `backend_tls_client_key_path`, `backend_tls_server_ca_cert_path`) are validated at config load time. The gateway refuses to start (or rejects the config reload) if configured paths cannot be read or parsed. There is no silent fallback to unauthenticated or unverified connections.
+**Startup validation**: Per-proxy TLS file paths (`backend_tls_client_cert_path`, `backend_tls_client_key_path`, `backend_tls_server_ca_cert_path`) are validated at config load time via `validate_all_fields_with_ip_policy()`. In file mode the gateway refuses to start; in DB mode it warns; in DP mode the config update is rejected but the DP keeps running with cached config. There is no silent fallback to unauthenticated or unverified connections. See "File Dependency Validation (Isolated Tolerance)" in the Plugin Config Validation section for the full per-mode behavior matrix.
 
 **TLS path deduplication**: Multiple proxies sharing the same cert file paths result in each unique file being parsed only once during validation.
 
@@ -748,6 +748,30 @@ All plugin constructors **must** return `Result<Self, String>`. Config validatio
 - **Use `Ok(Self { ... })` for the success path** — wrap the struct construction in `Ok()`.
 
 **The shared validation entry point** is `plugins::validate_plugin_config(name, config) -> Result<(), String>` which wraps `create_plugin()`. File/DB loaders call this; the admin API calls `validate_plugin_config_definition()` which does the same thing plus scope checks.
+
+### File Dependency Validation (Isolated Tolerance)
+
+Some config resources reference external files that must exist on the machine running proxy traffic (e.g., TLS cert/key files on proxies, MaxMind `.mmdb` files on the `geo_restriction` plugin). In CP/DP deployments, these files exist on the **data plane** nodes but not necessarily on the **control plane**. The gateway uses **isolated tolerance** — missing files are validated per-mode so that one bad file never rejects an entire config or crashes the DP:
+
+| Resource | Validation Method | File Mode | DB Mode | CP Admin API | DP Mode |
+|----------|------------------|-----------|---------|-------------|---------|
+| Backend TLS certs (`backend_tls_*_path`) | `validate_all_fields_with_ip_policy()` | Fatal (bail) | Warn | Warn | Reject config, keep old |
+| Plugin `.mmdb` files (`geo_restriction.db_path`) | `validate_plugin_file_dependencies()` | Fatal (bail) | Warn | Skip (constructor tolerates) | Skip (plugin degrades) |
+
+**TLS cert file behavior**: Per-proxy TLS file paths are validated by `validate_fields_with_cache()` inside `validate_all_fields_with_ip_policy()`. File mode bails on errors. DB mode warns. The DP rejects the config update but keeps running with its previous valid config. Frontend TLS cert failures are always fatal (the gateway cannot serve HTTPS without its own cert).
+
+**Plugin file dependency behavior** (`validate_plugin_file_dependencies()`): This is a separate validation step called independently by each mode's loader — it is **not** inside `validate_all_fields_with_ip_policy()`. This separation exists so that the DP can skip the check entirely and let the plugin degrade gracefully instead of rejecting the whole config. File mode calls it and bails. DB mode calls it and warns. DP mode does not call it.
+
+**How plugin graceful degradation works** (using `geo_restriction` as the example):
+1. `GeoRestriction::new()` tries to open the `.mmdb` file via `Reader::open_mmap()`
+2. If the file is missing, the constructor logs a `warn!` and stores `reader: None` — it does **not** return `Err`
+3. At request time, if `reader` is `None`, the plugin applies the configured `on_lookup_failure` policy (default: `allow`)
+4. All other proxies and plugins in the config work normally — only the plugin with the missing file is affected
+
+**When adding new plugins with file dependencies**, follow the same pattern:
+- The plugin constructor must **tolerate** missing files (store `None`, degrade at runtime)
+- Add the file existence check to `GatewayConfig::validate_plugin_file_dependencies()` in `src/config/types.rs`
+- Do **not** add file existence checks to `validate_all_fields_with_ip_policy()` — that method gates the entire config on the DP path
 
 ### Adding a Custom Plugin with Database Migrations
 

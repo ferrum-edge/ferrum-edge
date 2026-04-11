@@ -1508,7 +1508,18 @@ Restricts access based on the geographic location of the client IP address using
 
 `allow_countries` and `deny_countries` are mutually exclusive. At least one must be non-empty.
 
-The `.mmdb` file is memory-mapped at plugin startup for zero-copy lookups on the hot path. A gateway restart is required to pick up a new database file.
+The `.mmdb` file is memory-mapped at plugin startup for zero-copy lookups on the hot path. A gateway restart (or config reload) is required to pick up a new database file.
+
+**CP/DP deployment note:** In control plane / data plane deployments, the `.mmdb` file only needs to exist on the **data plane** nodes where proxy traffic is handled. The control plane accepts `geo_restriction` plugin configs via the admin API without requiring the file locally. If the `.mmdb` file is missing on a data plane node at startup, the plugin degrades gracefully — all GeoIP lookups fall back to the `on_lookup_failure` policy (default: `allow`) until the file is deployed and the config is reloaded. Other proxies and plugins are unaffected.
+
+**Behavior by mode:**
+
+| Mode | Missing `.mmdb` file at startup |
+|------|-------------------------------|
+| **File** | Fatal — gateway refuses to start |
+| **Database** | Warning logged, plugin degrades to `on_lookup_failure` policy |
+| **Control Plane** | Admin API accepts config normally (CP does not proxy traffic) |
+| **Data Plane** | Warning logged, plugin degrades to `on_lookup_failure` policy; all other proxies/plugins work normally |
 
 > **Note:** Ferrum Edge does not ship or bundle any GeoIP database. Operators are responsible for obtaining a MaxMind GeoIP2 or GeoLite2 `.mmdb` file, accepting MaxMind's license terms, and managing updates. GeoLite2 (free) requires a [MaxMind account](https://www.maxmind.com/en/geolite2/signup) and is subject to the [GeoLite2 EULA](https://www.maxmind.com/en/geolite2/eula). MaxMind publishes weekly database updates.
 
