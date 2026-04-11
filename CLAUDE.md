@@ -292,7 +292,7 @@ src/
 | `Proxy` | A route + backend target | namespace, listen_path, hosts, backend_host/port/protocol, plugins, TLS/DNS/timeout overrides, pool_*, circuit_breaker, retry, response_body_mode, allowed_ws_origins, udp_max_response_amplification_factor, passthrough |
 | `Consumer` | An authenticated client identity | namespace, username, custom_id, credentials (HashMap — each type maps to a single JSON object or an array of objects for multi-credential rotation), acl_groups (Vec), tags |
 | `Upstream` | A load-balanced target group | namespace, targets (host/port/weight/path), algorithm, health_checks |
-| `PluginConfig` | Plugin instance configuration | namespace, name, enabled, config (serde_json::Value), priority_override (Option<u16>) |
+| `PluginConfig` | Plugin instance configuration | namespace, name, enabled, config (serde_json::Value), scope (Global/Proxy/ProxyGroup), proxy_id (Option), priority_override (Option<u16>) |
 | `ServiceDiscoveryConfig` | Dynamic upstream target discovery | provider (dns_sd/kubernetes/consul), poll_interval_seconds, provider-specific settings |
 
 **Namespace isolation**: Every resource (`Proxy`, `Consumer`, `Upstream`, `PluginConfig`) has a `namespace` field (default `"ferrum"`). The gateway instance's `FERRUM_NAMESPACE` env var controls which namespace it loads and proxies. In database mode, all queries filter by namespace. In file mode, resources are filtered post-deserialization. The Admin API uses an `X-Ferrum-Namespace` header (defaults to `"ferrum"` if omitted) to scope all CRUD operations — this allows a CP to manage resources across all namespaces. `GET /namespaces` returns all distinct namespaces in the config/database. Uniqueness constraints (listen_path, proxy name, consumer identity, upstream name, listen_port) are all scoped per-namespace. Different namespaces run on different gateway instances, so the same `listen_port` can be safely reused across namespaces — the OS-level bind at startup catches real conflicts on the actual machine. In the CP/DP gRPC protocol, the DP sends its namespace in `SubscribeRequest` for observability logging.
@@ -401,7 +401,12 @@ TCP/UDP stream proxies bind dedicated ports via `listen_port`. Port conflicts ar
 
 ### Plugin System
 
-Plugins execute in priority order (lower number = runs first). Multiple instances of the same plugin type are supported on a single proxy (e.g., two `http_logging` instances for Splunk and Datadog). Each instance has its own `id`, `config`, and optional `priority_override` to control relative execution order. When a proxy-scoped plugin has the same `plugin_name` as a global plugin, the global instance is replaced — but multiple proxy-scoped instances of the same type coexist.
+Plugins execute in priority order (lower number = runs first). Multiple instances of the same plugin type are supported on a single proxy (e.g., two `http_logging` instances for Splunk and Datadog). Each instance has its own `id`, `config`, and optional `priority_override` to control relative execution order. When a proxy-scoped or proxy-group-scoped plugin has the same `plugin_name` as a global plugin, the global instance is replaced — but multiple scoped instances of the same type coexist.
+
+**Plugin scopes**: Three scopes control which proxies a plugin applies to:
+- **Global** (`scope: "global"`) — runs on ALL proxies. `proxy_id` must be `None`.
+- **Proxy** (`scope: "proxy"`) — runs on exactly ONE proxy. `proxy_id` is required and must match the proxy's ID. Each proxy gets its own plugin instance.
+- **ProxyGroup** (`scope: "proxy_group"`) — runs on a SUBSET of proxies that reference it in their `plugins` association list. `proxy_id` must be `None`. A **single shared plugin instance** (`Arc<dyn Plugin>`) is reused across all associated proxies, so stateful plugins (e.g., `rate_limiting`) share counters across the group. The `proxy_plugins` junction table (SQL) / embedded `plugins` array (MongoDB, file) manages associations. When a proxy is deleted or updated, the association is removed — and if no proxies remain associated, the ProxyGroup plugin config is automatically cascade-deleted (orphan cleanup runs in `delete_proxy` and `update_proxy` within the same transaction).
 
 The lifecycle phases are:
 

@@ -714,12 +714,23 @@ pub enum ResponseBodyMode {
     Buffer,
 }
 
-/// Plugin scope (global or per-proxy).
+/// Plugin scope (global, per-proxy, or proxy-group).
+///
+/// - **Global**: Plugin runs on ALL proxies (unless overridden by a proxy-scoped
+///   or proxy-group-scoped plugin of the same name).
+/// - **Proxy**: Plugin runs on exactly ONE proxy. Requires `proxy_id` to be set.
+/// - **ProxyGroup**: Plugin runs on a SUBSET of proxies. The set of proxies is
+///   determined by which proxies include this plugin in their `plugins` association
+///   list. `proxy_id` must be `None`. A single `ProxyGroup` plugin instance is
+///   shared across all associated proxies, so stateful plugins (e.g., rate_limiting)
+///   share counters across the group.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum PluginScope {
     Global,
     Proxy,
+    #[serde(rename = "proxy_group")]
+    ProxyGroup,
 }
 
 /// A proxy resource defines a route from a listen_path to a backend.
@@ -1359,6 +1370,14 @@ impl GatewayConfig {
                         plugin.id
                     )),
                 },
+                PluginScope::ProxyGroup => {
+                    if plugin.proxy_id.is_some() {
+                        errors.push(format!(
+                            "PluginConfig '{}' with scope 'proxy_group' must not have proxy_id (associations are managed via proxy.plugins)",
+                            plugin.id
+                        ));
+                    }
+                }
             }
         }
 
@@ -1373,26 +1392,28 @@ impl GatewayConfig {
                 }
 
                 match plugin_by_id.get(assoc.plugin_config_id.as_str()) {
-                    Some(plugin) => {
-                        if plugin.scope != PluginScope::Proxy {
+                    Some(plugin) => match plugin.scope {
+                        PluginScope::Global => {
                             errors.push(format!(
-                                "Proxy '{}' references plugin_config '{}' with scope '{}' — proxy associations may only reference proxy-scoped plugin configs",
-                                proxy.id,
-                                plugin.id,
-                                match plugin.scope {
-                                    PluginScope::Global => "global",
-                                    PluginScope::Proxy => "proxy",
-                                }
-                            ));
-                        } else if plugin.proxy_id.as_deref() != Some(proxy.id.as_str()) {
-                            errors.push(format!(
-                                "Proxy '{}' references plugin_config '{}' targeted to proxy '{}'",
-                                proxy.id,
-                                plugin.id,
-                                plugin.proxy_id.as_deref().unwrap_or("<none>")
+                                "Proxy '{}' references plugin_config '{}' with scope 'global' — proxy associations may only reference proxy-scoped or proxy_group-scoped plugin configs",
+                                proxy.id, plugin.id,
                             ));
                         }
-                    }
+                        PluginScope::Proxy => {
+                            if plugin.proxy_id.as_deref() != Some(proxy.id.as_str()) {
+                                errors.push(format!(
+                                    "Proxy '{}' references plugin_config '{}' targeted to proxy '{}'",
+                                    proxy.id,
+                                    plugin.id,
+                                    plugin.proxy_id.as_deref().unwrap_or("<none>")
+                                ));
+                            }
+                        }
+                        PluginScope::ProxyGroup => {
+                            // ProxyGroup plugins have no proxy_id — any proxy can
+                            // reference them via its plugins association list.
+                        }
+                    },
                     None => errors.push(format!(
                         "Proxy '{}' references non-existent plugin_config '{}'",
                         proxy.id, assoc.plugin_config_id
@@ -2706,6 +2727,11 @@ impl PluginConfig {
             PluginScope::Global => {
                 if self.proxy_id.is_some() {
                     errors.push("scope 'global' must not have proxy_id".to_string());
+                }
+            }
+            PluginScope::ProxyGroup => {
+                if self.proxy_id.is_some() {
+                    errors.push("scope 'proxy_group' must not have proxy_id (associations are managed via proxy.plugins)".to_string());
                 }
             }
         }

@@ -422,7 +422,7 @@ Each resource in the batch is validated before any database writes. If validatio
 - **Consumers**: Non-empty username, no duplicate usernames or custom_ids within the batch, custom_id normalization (empty string → null)
 - **Proxies**: listen_path format (`/` prefix or `~` regex with compilation check), host entry format validation and lowercase normalization, no duplicate proxy IDs within the batch
 - **Upstreams**: At least one target or service_discovery config, no duplicate names within the batch
-- **Plugin configs**: Known plugin name, scope/proxy_id consistency (proxy scope requires proxy_id, global scope rejects proxy_id), no duplicate plugin config IDs within the batch
+- **Plugin configs**: Known plugin name, scope/proxy_id consistency (proxy scope requires proxy_id, global and proxy_group scopes reject proxy_id), no duplicate plugin config IDs within the batch
 
 **Note**: Within-batch uniqueness is checked, but cross-batch uniqueness (against existing DB records) is enforced by database constraints. Database constraint violations are returned as errors in the response.
 

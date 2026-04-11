@@ -371,6 +371,39 @@ mod inner {
                 }
             }
         }
+
+        /// Delete proxy_group-scoped plugin configs that are no longer referenced
+        /// by any proxy's embedded `plugins` array. Called after proxy deletion or
+        /// update (which may remove associations).
+        async fn cleanup_orphaned_proxy_group_plugins(&self) -> Result<(), anyhow::Error> {
+            // Find all proxy_group-scoped plugin config IDs
+            let mut cursor = self
+                .plugin_configs()
+                .find(doc! { "scope": "proxy_group" })
+                .projection(doc! { "_id": 1 })
+                .await?;
+            let mut group_ids: Vec<String> = Vec::new();
+            while cursor.advance().await? {
+                let doc = cursor.deserialize_current()?;
+                if let Ok(id) = doc.get_str("_id") {
+                    group_ids.push(id.to_string());
+                }
+            }
+
+            for id in &group_ids {
+                // Check if any proxy still references this plugin config
+                let count = self
+                    .proxies()
+                    .count_documents(doc! { "plugins.plugin_config_id": id })
+                    .await?;
+                if count == 0 {
+                    info!("Cascade-deleting orphaned proxy_group plugin config {}", id);
+                    self.plugin_configs().delete_one(doc! { "_id": id }).await?;
+                }
+            }
+
+            Ok(())
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -634,6 +667,8 @@ mod inner {
             self.proxies()
                 .replace_one(doc! { "_id": &proxy.id }, doc)
                 .await?;
+            // Clean up orphaned proxy_group plugin configs (update may remove associations)
+            self.cleanup_orphaned_proxy_group_plugins().await?;
             self.check_slow_query("update_proxy", start);
             Ok(())
         }
@@ -645,6 +680,8 @@ mod inner {
                 .delete_many(doc! { "proxy_id": id })
                 .await?;
             let result = self.proxies().delete_one(doc! { "_id": id }).await?;
+            // Clean up orphaned proxy_group plugin configs (no proxy references them)
+            self.cleanup_orphaned_proxy_group_plugins().await?;
             self.check_slow_query("delete_proxy", start);
             Ok(result.deleted_count > 0)
         }

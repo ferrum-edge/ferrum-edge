@@ -1571,3 +1571,130 @@ fn test_multiple_global_same_type_plugins() {
     assert_eq!(plugins.len(), 2);
     assert!(plugins.iter().all(|p| p.name() == "stdout_logging"));
 }
+
+// ---- ProxyGroup scope tests ----
+
+#[test]
+fn test_proxy_group_plugin_shared_across_multiple_proxies() {
+    let config = make_config(
+        vec![
+            make_proxy("p1", "/api", vec!["group1"]),
+            make_proxy("p2", "/web", vec!["group1"]),
+            make_proxy("p3", "/admin", vec![]), // no association
+        ],
+        vec![make_plugin_config(
+            "group1",
+            "cors",
+            PluginScope::ProxyGroup,
+            None,
+            true,
+        )],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+
+    let p1_plugins = cache.get_plugins("p1");
+    let p2_plugins = cache.get_plugins("p2");
+    let p3_plugins = cache.get_plugins("p3");
+
+    assert_eq!(p1_plugins.len(), 1);
+    assert_eq!(p1_plugins[0].name(), "cors");
+    assert_eq!(p2_plugins.len(), 1);
+    assert_eq!(p2_plugins[0].name(), "cors");
+    // p3 does not reference the group plugin — should have none
+    assert_eq!(p3_plugins.len(), 0);
+}
+
+#[test]
+fn test_proxy_group_plugin_shares_same_arc_instance() {
+    let config = make_config(
+        vec![
+            make_proxy("p1", "/api", vec!["group1"]),
+            make_proxy("p2", "/web", vec!["group1"]),
+        ],
+        vec![make_plugin_config(
+            "group1",
+            "cors",
+            PluginScope::ProxyGroup,
+            None,
+            true,
+        )],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+
+    let p1_plugins = cache.get_plugins("p1");
+    let p2_plugins = cache.get_plugins("p2");
+
+    // Both proxies should share the exact same Arc<dyn Plugin> instance
+    let p1_ptr = std::sync::Arc::as_ptr(&p1_plugins[0]) as *const () as usize;
+    let p2_ptr = std::sync::Arc::as_ptr(&p2_plugins[0]) as *const () as usize;
+    assert_eq!(p1_ptr, p2_ptr, "ProxyGroup plugin instances must be shared");
+}
+
+#[test]
+fn test_proxy_group_plugin_overrides_global_of_same_name() {
+    let config = make_config(
+        vec![
+            make_proxy("p1", "/api", vec!["group1"]),
+            make_proxy("p2", "/web", vec![]), // no group association
+        ],
+        vec![
+            make_plugin_config("g1", "cors", PluginScope::Global, None, true),
+            make_plugin_config("group1", "cors", PluginScope::ProxyGroup, None, true),
+        ],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+
+    let p1_plugins = cache.get_plugins("p1");
+    let p2_plugins = cache.get_plugins("p2");
+
+    // p1 gets the group plugin (replaces global cors)
+    assert_eq!(p1_plugins.len(), 1);
+    assert_eq!(p1_plugins[0].name(), "cors");
+
+    // p2 still gets the global cors
+    assert_eq!(p2_plugins.len(), 1);
+    assert_eq!(p2_plugins[0].name(), "cors");
+
+    // The two should be different instances since one is global, one is group
+    let p1_ptr = std::sync::Arc::as_ptr(&p1_plugins[0]) as *const () as usize;
+    let p2_ptr = std::sync::Arc::as_ptr(&p2_plugins[0]) as *const () as usize;
+    assert_ne!(p1_ptr, p2_ptr);
+}
+
+#[test]
+fn test_proxy_group_with_proxy_scoped_and_global() {
+    // Test that all three scopes work together correctly
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["group1", "ps1"])],
+        vec![
+            make_plugin_config("g1", "stdout_logging", PluginScope::Global, None, true),
+            make_plugin_config("group1", "cors", PluginScope::ProxyGroup, None, true),
+            make_plugin_config("ps1", "rate_limiting", PluginScope::Proxy, Some("p1"), true),
+        ],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+    let plugins = cache.get_plugins("p1");
+
+    assert_eq!(plugins.len(), 3);
+    let names: Vec<&str> = plugins.iter().map(|p| p.name()).collect();
+    assert!(names.contains(&"stdout_logging"));
+    assert!(names.contains(&"cors"));
+    assert!(names.contains(&"rate_limiting"));
+}
+
+#[test]
+fn test_disabled_proxy_group_plugin_excluded() {
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["group1"])],
+        vec![make_plugin_config(
+            "group1",
+            "cors",
+            PluginScope::ProxyGroup,
+            None,
+            false, // disabled
+        )],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+    let plugins = cache.get_plugins("p1");
+    assert_eq!(plugins.len(), 0);
+}

@@ -1744,9 +1744,11 @@ components:
           type: [string, "null"]
           description: >-
             Required when scope is `proxy` — must reference an existing proxy ID.
-            Must be null (or omitted) when scope is `global`. The referenced proxy
-            must exist. When a proxy is deleted, its associated plugin configs are
-            automatically deleted (cascade).
+            Must be null (or omitted) when scope is `global` or `proxy_group`.
+            The referenced proxy must exist. When a proxy is deleted, its
+            proxy-scoped plugin configs are automatically deleted (cascade).
+            Proxy-group-scoped plugins survive proxy deletion — only the
+            association is removed.
         enabled:
           type: boolean
           default: true
@@ -1777,11 +1779,15 @@ components:
 
     PluginScope:
       type: string
-      enum: [global, proxy]
+      enum: [global, proxy, proxy_group]
       description: |
         `global` — plugin applies to all proxies; `proxy_id` must be null.
         `proxy` — plugin applies only to the proxy referenced by `proxy_id`;
         `proxy_id` is required.
+        `proxy_group` — plugin applies to a subset of proxies that reference it
+        in their `plugins` association list; `proxy_id` must be null. A single
+        shared plugin instance is used across all associated proxies, so stateful
+        plugins (e.g., rate_limiting) share counters across the group.
 
     # ── WebSocket Plugin Configs ─────────────────────────────────────
     WsMessageSizeLimitingConfig:

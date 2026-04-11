@@ -238,7 +238,7 @@ The tests cover:
 - **Configuration Loading**: 25+ unit tests for various config scenarios
 - **Supported Protocols**: 6 backend protocols (http, https, ws, wss, grpc, h3)
 - **Authentication**: 2 auth modes (single, multi) with 3 credential types
-- **Scoping**: Global and proxy-specific plugin scoping
+- **Scoping**: Global, proxy-specific, and proxy-group plugin scoping
 - **Timeouts**: Backend connection, read, and write timeouts
 - **TLS**: Client certificates, server verification, CA bundles
 - **DNS**: Override and caching configuration

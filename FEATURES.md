@@ -59,7 +59,7 @@ Ferrum supports dynamic upstream target discovery through three providers, confi
 - 58 built-in plugins with lifecycle hooks (request received, authenticate, authorize, before proxy, after proxy, on final request/response body, on response body, on WebSocket frame, on UDP datagram, log)
 - Priority-ordered execution with protocol-aware filtering (HTTP, gRPC, WebSocket, TCP, UDP)
 - Multiple instances of the same plugin type per proxy (e.g., two `http_logging` for Splunk and Datadog) with optional `priority_override` for execution order control
-- Global and per-proxy scoping — proxy-scoped plugins replace global plugins of the same name
+- Three plugin scopes: **global** (all proxies), **proxy** (single proxy), **proxy_group** (shared across a subset of proxies) — scoped plugins replace global plugins of the same name. Proxy-group plugins share a single instance across all associated proxies, so stateful plugins (e.g., rate_limiting) share counters across the group
 - Multi-authentication mode with first-match consumer identification
 - Multi-credential rotation — consumers can have multiple active credentials of the same type (e.g., two API keys, two JWT secrets) for zero-downtime key rotation, configurable via `FERRUM_MAX_CREDENTIALS_PER_TYPE`
 - Custom plugin database migrations — plugins declare migrations via `plugin_migrations()`, auto-discovered at build time, tracked separately in `_ferrum_plugin_migrations` with per-plugin version scoping. Supports cross-database SQL (PostgreSQL/MySQL/SQLite overrides). MongoDB uses idempotent index creation instead of SQL migrations

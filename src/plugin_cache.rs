@@ -466,6 +466,8 @@ impl PluginCache {
         // Build index of proxy-scoped plugin configs for efficient lookup
         let mut proxy_scoped_configs: HashMap<&str, Vec<&crate::config::types::PluginConfig>> =
             HashMap::new();
+        let mut proxy_group_configs: HashMap<&str, &crate::config::types::PluginConfig> =
+            HashMap::new();
         for pc in &config.plugin_configs {
             if !pc.enabled {
                 continue;
@@ -477,8 +479,13 @@ impl PluginCache {
                     .entry(proxy_id.as_str())
                     .or_default()
                     .push(pc);
+            } else if pc.scope == PluginScope::ProxyGroup {
+                proxy_group_configs.insert(pc.id.as_str(), pc);
             }
         }
+
+        // Shared ProxyGroup plugin instances (created on first reference, reused)
+        let mut group_plugin_instances: HashMap<&str, Arc<dyn Plugin>> = HashMap::new();
 
         // Clone the current map and patch it
         let mut new_map: HashMap<String, Arc<Vec<Arc<dyn Plugin>>>> = current_map.as_ref().clone();
@@ -500,18 +507,49 @@ impl PluginCache {
                 .map(|p| Arc::as_ptr(p) as *const () as usize)
                 .collect();
 
-            if let Some(scoped_configs) = proxy_scoped_configs.get(proxy.id.as_str()) {
-                let proxy_plugin_ids: HashSet<&str> = proxy
-                    .plugins
-                    .iter()
-                    .map(|a| a.plugin_config_id.as_str())
-                    .collect();
+            let proxy_plugin_ids: HashSet<&str> = proxy
+                .plugins
+                .iter()
+                .map(|a| a.plugin_config_id.as_str())
+                .collect();
 
+            if let Some(scoped_configs) = proxy_scoped_configs.get(proxy.id.as_str()) {
                 for pc in scoped_configs {
                     if proxy_plugin_ids.contains(pc.id.as_str()) {
                         match try_create_plugin(pc, &self.http_client) {
                             Ok(Some(plugin)) => {
                                 // Remove only GLOBAL plugins of the same name
+                                merged.retain(|p| {
+                                    p.name() != plugin.name()
+                                        || !global_ptrs
+                                            .contains(&(Arc::as_ptr(p) as *const () as usize))
+                                });
+                                merged.push(plugin);
+                            }
+                            Ok(None) => {}
+                            Err(e) => {
+                                error!("Config reload: {}", e);
+                                security_errors.push(e);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Resolve proxy_group-scoped plugins via the proxy's association list
+            for assoc in &proxy.plugins {
+                if let Some(pc) = proxy_group_configs.get(assoc.plugin_config_id.as_str()) {
+                    if let Some(existing) = group_plugin_instances.get(pc.id.as_str()) {
+                        let plugin = Arc::clone(existing);
+                        merged.retain(|p| {
+                            p.name() != plugin.name()
+                                || !global_ptrs.contains(&(Arc::as_ptr(p) as *const () as usize))
+                        });
+                        merged.push(plugin);
+                    } else {
+                        match try_create_plugin(pc, &self.http_client) {
+                            Ok(Some(plugin)) => {
+                                group_plugin_instances.insert(pc.id.as_str(), Arc::clone(&plugin));
                                 merged.retain(|p| {
                                     p.name() != plugin.name()
                                         || !global_ptrs
@@ -804,6 +842,13 @@ impl PluginCache {
         // Collect all security plugin errors to report before bailing
         let mut security_errors: Vec<String> = Vec::new();
 
+        // Pre-index proxy_group-scoped plugin configs by config ID for shared
+        // instance creation. A single ProxyGroup plugin instance is shared across
+        // all proxies that reference it, so stateful plugins (e.g., rate_limiting)
+        // share counters across the group.
+        let mut proxy_group_configs: HashMap<&str, &crate::config::types::PluginConfig> =
+            HashMap::new();
+
         for pc in &config.plugin_configs {
             if !pc.enabled {
                 continue;
@@ -821,8 +866,14 @@ impl PluginCache {
                     .entry(proxy_id.as_str())
                     .or_default()
                     .push(pc);
+            } else if pc.scope == PluginScope::ProxyGroup {
+                proxy_group_configs.insert(pc.id.as_str(), pc);
             }
         }
+
+        // Lazily create shared ProxyGroup plugin instances (created on first
+        // reference, then Arc-cloned for subsequent proxies in the group).
+        let mut group_plugin_instances: HashMap<&str, Arc<dyn Plugin>> = HashMap::new();
 
         // Step 2: For each proxy, resolve its full plugin list
         // (global + proxy-scoped, with proxy overriding global of same name)
@@ -844,14 +895,15 @@ impl PluginCache {
                 .map(|p| Arc::as_ptr(p) as *const () as usize)
                 .collect();
 
-            // Only look at plugin configs indexed for this proxy (O(plugins_per_proxy))
-            if let Some(scoped_configs) = proxy_scoped_configs.get(proxy.id.as_str()) {
-                let proxy_plugin_ids: std::collections::HashSet<&str> = proxy
-                    .plugins
-                    .iter()
-                    .map(|a| a.plugin_config_id.as_str())
-                    .collect();
+            // Collect which plugin config IDs this proxy explicitly references
+            let proxy_plugin_ids: std::collections::HashSet<&str> = proxy
+                .plugins
+                .iter()
+                .map(|a| a.plugin_config_id.as_str())
+                .collect();
 
+            // Resolve proxy-scoped plugins indexed by proxy_id (O(plugins_per_proxy))
+            if let Some(scoped_configs) = proxy_scoped_configs.get(proxy.id.as_str()) {
                 for pc in scoped_configs {
                     if proxy_plugin_ids.contains(pc.id.as_str()) {
                         match try_create_plugin(pc, http_client) {
@@ -859,6 +911,37 @@ impl PluginCache {
                                 // Remove only GLOBAL plugins of the same name —
                                 // other proxy-scoped instances are preserved,
                                 // allowing multiple instances of the same plugin type.
+                                merged.retain(|p| {
+                                    p.name() != plugin.name()
+                                        || !global_ptrs
+                                            .contains(&(Arc::as_ptr(p) as *const () as usize))
+                                });
+                                merged.push(plugin);
+                            }
+                            Ok(None) => {}
+                            Err(e) => security_errors.push(e),
+                        }
+                    }
+                }
+            }
+
+            // Resolve proxy_group-scoped plugins via the proxy's association list.
+            // Shared Arc instances are reused across all proxies in the group.
+            for assoc in &proxy.plugins {
+                if let Some(pc) = proxy_group_configs.get(assoc.plugin_config_id.as_str()) {
+                    if let Some(existing) = group_plugin_instances.get(pc.id.as_str()) {
+                        // Reuse the shared instance (Arc::clone is ~5ns)
+                        let plugin = Arc::clone(existing);
+                        merged.retain(|p| {
+                            p.name() != plugin.name()
+                                || !global_ptrs.contains(&(Arc::as_ptr(p) as *const () as usize))
+                        });
+                        merged.push(plugin);
+                    } else {
+                        // First proxy to reference this group plugin — create the instance
+                        match try_create_plugin(pc, http_client) {
+                            Ok(Some(plugin)) => {
+                                group_plugin_instances.insert(pc.id.as_str(), Arc::clone(&plugin));
                                 merged.retain(|p| {
                                     p.name() != plugin.name()
                                         || !global_ptrs
