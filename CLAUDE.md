@@ -957,6 +957,9 @@ Reduce per-request allocations in plugin lookup
 | `FERRUM_HTTP_HEADER_READ_TIMEOUT_SECONDS` | `10` | HTTP/1.1 header read timeout in seconds. Protects against slowloris attacks. `0` = disabled |
 | `FERRUM_BACKEND_ALLOW_IPS` | `both` | Backend IP allowlist policy: `private` (only RFC 1918/loopback/link-local/CGNAT), `public` (only non-private), `both` (no restriction) |
 | `FERRUM_MAX_CONCURRENT_REQUESTS_PER_IP` | `0` | Max concurrent proxy requests per resolved client IP. `0` = disabled. Uses trusted proxy XFF resolution |
+| `FERRUM_PER_IP_CLEANUP_INTERVAL_SECONDS` | `60` | Interval in seconds between cleanup sweeps for per-IP request counters. Removes zero-count entries. Only relevant when `FERRUM_MAX_CONCURRENT_REQUESTS_PER_IP > 0` |
+| `FERRUM_CIRCUIT_BREAKER_CACHE_MAX_ENTRIES` | `10000` | Max entries in the circuit breaker cache. Entries are keyed by proxy_id::host:port. Stale entries pruned on config reload. Prevents unbounded growth from target churn |
+| `FERRUM_STATUS_COUNTS_MAX_ENTRIES` | `200` | Max entries in the HTTP status code counters map. Common codes pre-populated at startup. Rare codes create entries up to this cap |
 | `FERRUM_ADMIN_ALLOWED_CIDRS` | (empty) | Comma-separated CIDRs/IPs allowed to connect to admin API. Empty = all allowed |
 | `FERRUM_ADD_VIA_HEADER` | `true` | Add Via header (RFC 9110 §7.6.3) on request and response paths |
 | `FERRUM_VIA_PSEUDONYM` | `ferrum-edge` | Pseudonym in the Via header (e.g., `1.1 ferrum-edge`) |

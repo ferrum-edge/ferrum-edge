@@ -66,6 +66,9 @@ pub struct LdapAuth {
     cache_ttl: Duration,
     /// In-memory cache: key = "username\0sha256(password)" -> expiry instant
     cache: Arc<DashMap<String, Instant>>,
+    /// Maximum entries in the auth result cache. Prevents unbounded growth
+    /// from brute-force attempts with unique credentials. Default: 10000.
+    max_cache_entries: usize,
     /// Whether to try mapping to a gateway Consumer via consumer_index
     consumer_mapping: bool,
     /// Pre-built native-tls connector for LDAP TLS connections.
@@ -217,6 +220,11 @@ impl LdapAuth {
             .and_then(|v| v.as_u64())
             .unwrap_or(0);
 
+        let max_cache_entries = config
+            .get("max_cache_entries")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(10_000) as usize;
+
         let consumer_mapping = config
             .get("consumer_mapping")
             .and_then(|v| v.as_bool())
@@ -249,6 +257,7 @@ impl LdapAuth {
             connect_timeout: Duration::from_secs(connect_timeout_secs),
             cache_ttl: Duration::from_secs(cache_ttl_secs),
             cache: Arc::new(DashMap::new()),
+            max_cache_entries,
             consumer_mapping,
             tls_connector,
             tls_no_verify,
@@ -286,8 +295,21 @@ impl LdapAuth {
         if self.cache_ttl.is_zero() {
             return;
         }
+        // Enforce max size: evict expired entries first, then skip if still at capacity
+        if self.cache.len() >= self.max_cache_entries {
+            self.evict_expired();
+            if self.cache.len() >= self.max_cache_entries {
+                return;
+            }
+        }
         let key = Self::cache_key(username, password);
         self.cache.insert(key, Instant::now() + self.cache_ttl);
+    }
+
+    /// Remove all expired entries from the cache.
+    fn evict_expired(&self) {
+        let now = Instant::now();
+        self.cache.retain(|_, expiry| now < *expiry);
     }
 
     /// Connect to the LDAP server with configured settings.

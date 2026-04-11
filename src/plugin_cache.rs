@@ -22,6 +22,7 @@ use crate::config::types::{GatewayConfig, PluginScope};
 use tracing::{error, warn};
 
 use crate::config::types::PluginConfig;
+use crate::plugins::utils::jwks_cache::retain_active_uris;
 use crate::plugins::{Plugin, PluginHttpClient, ProxyProtocol, create_plugin_with_http_client};
 
 // ---------------------------------------------------------------------------
@@ -190,6 +191,9 @@ impl Plugin for PriorityOverridePlugin {
     async fn on_udp_datagram(&self, ctx: &UdpDatagramContext) -> UdpDatagramVerdict {
         self.inner.on_udp_datagram(ctx).await
     }
+    fn active_jwks_uris(&self) -> Vec<String> {
+        self.inner.active_jwks_uris()
+    }
 }
 
 /// Try to create a plugin, logging validation errors. Applies
@@ -300,6 +304,25 @@ fn build_protocol_maps(
     (proto_map, global_proto_map)
 }
 
+/// Collect all JWKS URIs actively referenced by `jwks_auth` plugin instances
+/// across all proxies and global plugins. Used to clean up stale JWKS cache
+/// entries (and abort their background refresh tasks) on config reload.
+fn collect_active_jwks_uris(
+    proxy_map: &ProxyPluginMap,
+    globals: &[Arc<dyn Plugin>],
+) -> HashSet<String> {
+    let mut uris = HashSet::new();
+    for plugins in proxy_map.values() {
+        for plugin in plugins.iter() {
+            uris.extend(plugin.active_jwks_uris());
+        }
+    }
+    for plugin in globals {
+        uris.extend(plugin.active_jwks_uris());
+    }
+    uris
+}
+
 /// Pre-resolved plugin cache that avoids per-request plugin creation.
 ///
 /// Plugins are created once at config load time and cached per proxy_id.
@@ -399,6 +422,12 @@ impl PluginCache {
             global_needs_ws_frame,
         ) = Self::build_cache(config, &self.http_client)?;
         let (proto_map, global_proto_map) = build_protocol_maps(&proxy_map, &globals);
+
+        // Clean up JWKS cache entries (and their background refresh tasks)
+        // for URIs no longer referenced by any active jwks_auth plugin.
+        let active_uris = collect_active_jwks_uris(&proxy_map, &globals);
+        retain_active_uris(&active_uris);
+
         self.proxy_plugins.store(Arc::new(proxy_map));
         self.global_plugins.store(Arc::new(globals));
         self.requires_buffering.store(Arc::new(buffering_map));
@@ -631,6 +660,11 @@ impl PluginCache {
                 security_errors.len()
             ));
         }
+
+        // Clean up JWKS cache entries (and their background refresh tasks)
+        // for URIs no longer referenced by any active jwks_auth plugin.
+        let active_uris = collect_active_jwks_uris(&new_map, &new_globals);
+        retain_active_uris(&active_uris);
 
         // Atomic swap — readers see old or new, never a partial state
         self.proxy_plugins.store(Arc::new(new_map));

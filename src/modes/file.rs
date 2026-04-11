@@ -146,6 +146,9 @@ pub async fn run(
         proxy_state.warmup_connection_pools().await;
     }
 
+    // Start per-IP request counter cleanup (removes stale zero-count entries)
+    proxy_state.start_per_ip_cleanup_task();
+
     // Start background TTL refresh to keep cache warm (with shutdown)
     let dns_handle =
         dns_cache.start_background_refresh_with_shutdown(Some(shutdown_tx.subscribe()));

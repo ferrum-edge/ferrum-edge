@@ -294,6 +294,36 @@ fn test_active_health_check_grpc_service_name_omitted_gives_none() {
     assert_eq!(config.grpc_service_name, None);
 }
 
+// ── Proxy pruning tests ──────────────────────────────────────────────────
+
+#[test]
+fn test_prune_removed_proxies() {
+    let checker = HealthChecker::new();
+    let target = make_target("backend1", 8080);
+    let config = PassiveHealthCheck {
+        unhealthy_status_codes: vec![500],
+        unhealthy_threshold: 2,
+        unhealthy_window_seconds: 60,
+        healthy_after_seconds: 30,
+    };
+
+    // Insert passive health state for 3 proxies by reporting responses
+    for _ in 0..2 {
+        checker.report_response("proxy1", &target, 500, false, Some(&config));
+        checker.report_response("proxy2", &target, 500, false, Some(&config));
+        checker.report_response("proxy3", &target, 500, false, Some(&config));
+    }
+    assert_eq!(checker.passive_health.len(), 3);
+
+    // Remove proxy1 and proxy3
+    checker.prune_removed_proxies(&["proxy1".to_string(), "proxy3".to_string()]);
+
+    assert_eq!(checker.passive_health.len(), 1);
+    assert!(checker.passive_health.contains_key("proxy2"));
+    assert!(!checker.passive_health.contains_key("proxy1"));
+    assert!(!checker.passive_health.contains_key("proxy3"));
+}
+
 #[tokio::test]
 async fn test_grpc_probe_returns_false_for_nonexistent_host() {
     use ferrum_edge::health_check::grpc_probe_for_test;

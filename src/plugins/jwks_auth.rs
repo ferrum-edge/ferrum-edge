@@ -465,6 +465,17 @@ impl Plugin for JwksAuth {
         }
         hosts
     }
+
+    fn active_jwks_uris(&self) -> Vec<String> {
+        let mut uris = Vec::new();
+        for prov in &self.providers {
+            let guard = prov.jwks_store.load();
+            if let Some(ref store) = **guard {
+                uris.push(store.jwks_uri().to_string());
+            }
+        }
+        uris
+    }
 }
 
 // ---------------------------------------------------------------------------

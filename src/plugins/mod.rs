@@ -968,6 +968,16 @@ pub trait Plugin: Send + Sync {
     async fn on_udp_datagram(&self, _ctx: &UdpDatagramContext) -> UdpDatagramVerdict {
         UdpDatagramVerdict::Forward
     }
+
+    /// Returns the JWKS URIs this plugin is actively using.
+    ///
+    /// Only meaningful for `jwks_auth` — returns the JWKS endpoint URIs from
+    /// its configured providers. Used by the plugin cache to clean up stale
+    /// JWKS cache entries (and their background refresh tasks) when plugins
+    /// are removed from config.
+    fn active_jwks_uris(&self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 /// Create a plugin instance from its name and configuration.

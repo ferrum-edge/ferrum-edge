@@ -22,7 +22,7 @@ use dashmap::DashMap;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fmt::Write;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
@@ -148,6 +148,8 @@ pub struct ChargebackRegistry {
     /// Extra label fragment for namespace isolation. Empty for default namespace,
     /// otherwise `",namespace=\"<ns>\""`. Matches the prometheus_metrics pattern.
     namespace_label: std::sync::RwLock<String>,
+    /// Guards against spawning duplicate background cleanup tasks.
+    cleanup_task_started: AtomicBool,
 }
 
 impl Default for ChargebackRegistry {
@@ -170,6 +172,7 @@ impl ChargebackRegistry {
                 DEFAULT_CACHE_INVALIDATION_MIN_AGE_NANOS,
             ),
             namespace_label: std::sync::RwLock::new(String::new()),
+            cleanup_task_started: AtomicBool::new(false),
         }
     }
 
@@ -195,6 +198,34 @@ impl ChargebackRegistry {
                 ns_label.clear();
             }
         }
+    }
+
+    /// Start a background task that periodically evicts stale entries.
+    /// Uses `compare_exchange` to ensure only one cleanup task runs per registry.
+    /// Guard with `Handle::try_current()` so `new()` works in non-tokio test contexts.
+    pub fn start_cleanup_task(self: &Arc<Self>, interval_seconds: u64) {
+        if interval_seconds == 0 {
+            return;
+        }
+        if tokio::runtime::Handle::try_current().is_err() {
+            return; // No tokio runtime (e.g., unit tests)
+        }
+        if self
+            .cleanup_task_started
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return; // Already started by another plugin instance
+        }
+        let registry = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut timer = tokio::time::interval(std::time::Duration::from_secs(interval_seconds));
+            loop {
+                timer.tick().await;
+                let ttl_nanos = registry.stale_entry_ttl_nanos.load(Ordering::Relaxed);
+                registry.evict_stale(ttl_nanos);
+            }
+        });
     }
 
     /// Record a chargeable API call.
@@ -576,6 +607,12 @@ impl ApiChargeback {
             cache_invalidation_min_age_ms,
             namespace,
         );
+
+        let cleanup_interval_seconds = config
+            .get("cleanup_interval_seconds")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(300);
+        registry.start_cleanup_task(cleanup_interval_seconds);
 
         Ok(Self {
             registry,

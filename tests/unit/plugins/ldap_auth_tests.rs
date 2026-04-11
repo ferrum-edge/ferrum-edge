@@ -462,6 +462,30 @@ fn test_both_bind_modes_accepted() {
     assert!(result.is_ok());
 }
 
+// ─── Cache bounding config tests ─────────────────────────────────────────
+
+#[test]
+fn test_ldap_auth_max_cache_entries_default() {
+    // Create a valid config without max_cache_entries — default is 10000
+    let config = json!({
+        "ldap_url": "ldap://ldap.example.com:389",
+        "bind_dn_template": "uid={username},ou=users,dc=example,dc=com"
+    });
+    let plugin = LdapAuth::new(&config, http_client()).unwrap();
+    assert_eq!(plugin.name(), "ldap_auth");
+}
+
+#[test]
+fn test_ldap_auth_max_cache_entries_custom() {
+    let config = json!({
+        "ldap_url": "ldap://ldap.example.com:389",
+        "bind_dn_template": "uid={username},ou=users,dc=example,dc=com",
+        "max_cache_entries": 500
+    });
+    let plugin = LdapAuth::new(&config, http_client()).unwrap();
+    assert_eq!(plugin.name(), "ldap_auth");
+}
+
 // ─── Security plugin registration test ───────────────────────────────────
 
 #[test]

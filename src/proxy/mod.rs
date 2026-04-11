@@ -622,7 +622,9 @@ impl ProxyState {
         health_checker.start(&config);
         let health_checker = Arc::new(health_checker);
         // Circuit breaker cache
-        let circuit_breaker_cache = Arc::new(CircuitBreakerCache::new());
+        let circuit_breaker_cache = Arc::new(CircuitBreakerCache::with_max_entries(
+            env_config_arc.circuit_breaker_cache_max_entries,
+        ));
         // Service discovery manager (tasks started later via start_service_discovery)
         let service_discovery_manager = Arc::new(ServiceDiscoveryManager::new(
             load_balancer_cache.clone(),
@@ -740,6 +742,25 @@ impl ProxyState {
             overload: Arc::new(crate::overload::OverloadState::new()),
             adaptive_buffer,
         })
+    }
+
+    /// Start a background task that periodically removes stale zero-count
+    /// entries from `per_ip_request_counts`. Normally entries are cleaned via
+    /// the `PerIpRequestGuard` RAII drop, but this sweep catches edge cases
+    /// (e.g., task cancellation without guard drop).
+    pub fn start_per_ip_cleanup_task(&self) {
+        if let Some(ref counts) = self.per_ip_request_counts {
+            let counts = counts.clone();
+            let interval_secs = self.env_config.per_ip_cleanup_interval_seconds.max(1);
+            tokio::spawn(async move {
+                let mut timer =
+                    tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+                loop {
+                    timer.tick().await;
+                    counts.retain(|_, count| count.load(Ordering::Relaxed) > 0);
+                }
+            });
+        }
     }
 
     /// Reconcile stream proxy listeners at startup.
@@ -1330,6 +1351,31 @@ impl ProxyState {
             self.circuit_breaker_cache.prune(&delta.removed_proxy_ids);
         }
 
+        // --- CircuitBreakerCache: prune stale upstream targets ---
+        // Removes breakers for host:port combos no longer in any upstream,
+        // preventing unbounded growth from target churn (e.g., K8s pod cycling).
+        {
+            let mut active_keys = std::collections::HashSet::new();
+            for proxy in &new_config.proxies {
+                if let Some(ref upstream_id) = proxy.upstream_id
+                    && let Some(upstream) =
+                        new_config.upstreams.iter().find(|u| u.id == *upstream_id)
+                {
+                    for target in &upstream.targets {
+                        active_keys
+                            .insert(format!("{}::{}:{}", proxy.id, target.host, target.port));
+                    }
+                }
+            }
+            self.circuit_breaker_cache.prune_stale_targets(&active_keys);
+        }
+
+        // --- HealthChecker: prune passive health state for removed proxies ---
+        if !delta.removed_proxy_ids.is_empty() {
+            self.health_checker
+                .prune_removed_proxies(&delta.removed_proxy_ids);
+        }
+
         // --- DNS warmup for new/modified hostnames ---
         // Collect backend hostnames from added/modified proxies and upstreams
         // so the DNS cache is warm before the first request hits them.
@@ -1697,6 +1743,29 @@ impl ProxyState {
         // --- CircuitBreakerCache ---
         if !delta.removed_proxy_ids.is_empty() {
             self.circuit_breaker_cache.prune(&delta.removed_proxy_ids);
+        }
+
+        // Prune stale upstream targets from circuit breaker cache
+        {
+            let mut active_keys = std::collections::HashSet::new();
+            for proxy in &new_config.proxies {
+                if let Some(ref upstream_id) = proxy.upstream_id
+                    && let Some(upstream) =
+                        new_config.upstreams.iter().find(|u| u.id == *upstream_id)
+                {
+                    for target in &upstream.targets {
+                        active_keys
+                            .insert(format!("{}::{}:{}", proxy.id, target.host, target.port));
+                    }
+                }
+            }
+            self.circuit_breaker_cache.prune_stale_targets(&active_keys);
+        }
+
+        // --- HealthChecker: prune passive health state for removed proxies ---
+        if !delta.removed_proxy_ids.is_empty() {
+            self.health_checker
+                .prune_removed_proxies(&delta.removed_proxy_ids);
         }
 
         // --- DNS warmup for new/modified hostnames ---
@@ -6725,13 +6794,16 @@ fn record_status(state: &ProxyState, status: u16) {
     // fixed set, the entry almost always exists after the first request.
     if let Some(counter) = state.status_counts.get(&status) {
         counter.fetch_add(1, Ordering::Relaxed);
-    } else {
+    } else if state.status_counts.len() < state.env_config.status_counts_max_entries {
+        // Only insert new status codes if under the cap. Prevents unbounded
+        // growth from adversarial backends returning many distinct codes.
         state
             .status_counts
             .entry(status)
             .or_insert_with(|| AtomicU64::new(0))
             .fetch_add(1, Ordering::Relaxed);
     }
+    // else: silently drop — rare status code and map is at capacity
 }
 
 fn record_request(state: &ProxyState, status: u16) {
