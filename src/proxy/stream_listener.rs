@@ -77,6 +77,8 @@ pub struct StreamListenerManager {
     adaptive_buffer: Arc<crate::adaptive_buffer::AdaptiveBufferTracker>,
     /// Number of datagrams per `recvmmsg` syscall on Linux.
     udp_recvmmsg_batch_size: usize,
+    /// Whether TCP Fast Open is enabled for outbound stream proxy connections.
+    tcp_fastopen_enabled: bool,
 }
 
 impl StreamListenerManager {
@@ -99,6 +101,7 @@ impl StreamListenerManager {
         crls: crate::tls::CrlList,
         adaptive_buffer: Arc<crate::adaptive_buffer::AdaptiveBufferTracker>,
         udp_recvmmsg_batch_size: usize,
+        tcp_fastopen_enabled: bool,
     ) -> Self {
         Self {
             listeners: tokio::sync::Mutex::new(std::collections::HashMap::new()),
@@ -121,6 +124,7 @@ impl StreamListenerManager {
             crls,
             adaptive_buffer,
             udp_recvmmsg_batch_size,
+            tcp_fastopen_enabled,
         }
     }
 
@@ -429,6 +433,7 @@ impl StreamListenerManager {
                 let tls_ca_bundle_path = self.tls_ca_bundle_path.clone();
                 let sni_ids = sni_ids.clone();
                 let adaptive_buf = self.adaptive_buffer.clone();
+                let tcp_fastopen = self.tcp_fastopen_enabled;
                 tokio::spawn(async move {
                     if let Err(e) = super::tcp_proxy::start_tcp_listener(TcpListenerConfig {
                         port: port_val,
@@ -451,6 +456,7 @@ impl StreamListenerManager {
                         started: started_for_listener,
                         sni_proxy_ids: sni_ids,
                         adaptive_buffer: adaptive_buf,
+                        tcp_fastopen_enabled: tcp_fastopen,
                     })
                     .await
                     {

@@ -791,6 +791,9 @@ impl DatabaseStore {
             .await?;
         }
 
+        // Clean up orphaned proxy_group plugin configs (no remaining associations)
+        self.cleanup_orphaned_proxy_group_plugins(&mut tx).await?;
+
         tx.commit().await?;
 
         self.check_slow_query("update_proxy", start);
@@ -826,6 +829,9 @@ impl DatabaseStore {
             return Ok(false);
         }
 
+        // Clean up orphaned proxy_group plugin configs (no remaining associations)
+        self.cleanup_orphaned_proxy_group_plugins(&mut tx).await?;
+
         // If the proxy had an upstream, check if it's now orphaned and delete it
         if let Some(ref uid) = upstream_id {
             let ref_rows: Vec<AnyRow> =
@@ -846,6 +852,36 @@ impl DatabaseStore {
 
         self.check_slow_query("delete_proxy", start);
         Ok(true)
+    }
+
+    /// Delete proxy_group-scoped plugin configs that have no remaining proxy
+    /// associations in the proxy_plugins junction table. Called within a
+    /// transaction after proxy deletion or proxy update (which may remove
+    /// associations).
+    async fn cleanup_orphaned_proxy_group_plugins(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+    ) -> Result<(), anyhow::Error> {
+        let orphaned_ids: Vec<String> = sqlx::query(&self.q(
+            "SELECT pc.id FROM plugin_configs pc \
+                 WHERE pc.scope = 'proxy_group' \
+                 AND NOT EXISTS (SELECT 1 FROM proxy_plugins pp WHERE pp.plugin_config_id = pc.id)",
+        ))
+        .fetch_all(&mut **tx)
+        .await?
+        .iter()
+        .filter_map(|row| row.try_get::<String, _>("id").ok())
+        .collect();
+
+        for id in &orphaned_ids {
+            info!("Cascade-deleting orphaned proxy_group plugin config {}", id);
+            sqlx::query(&self.q("DELETE FROM plugin_configs WHERE id = ?"))
+                .bind(id)
+                .execute(&mut **tx)
+                .await?;
+        }
+
+        Ok(())
     }
 
     pub async fn get_proxy(&self, id: &str) -> Result<Option<Proxy>, anyhow::Error> {
@@ -977,6 +1013,7 @@ impl DatabaseStore {
         let config_json = serde_json::to_string(&pc.config)?;
         let scope_str = match pc.scope {
             PluginScope::Proxy => "proxy",
+            PluginScope::ProxyGroup => "proxy_group",
             PluginScope::Global => "global",
         };
         sqlx::query(
@@ -1004,6 +1041,7 @@ impl DatabaseStore {
         let config_json = serde_json::to_string(&pc.config)?;
         let scope_str = match pc.scope {
             PluginScope::Proxy => "proxy",
+            PluginScope::ProxyGroup => "proxy_group",
             PluginScope::Global => "global",
         };
         sqlx::query(
@@ -1841,23 +1879,29 @@ impl DatabaseStore {
 
         for assoc in associations {
             match plugin_refs.get(assoc.plugin_config_id.as_str()) {
-                Some(plugin) => {
-                    if plugin.scope != PluginScope::Proxy {
+                Some(plugin) => match plugin.scope {
+                    PluginScope::Global => {
                         errors.push(format!(
-                            "Proxy '{}' references plugin_config '{}' with scope 'global' — proxy associations may only reference proxy-scoped plugin configs",
+                            "Proxy '{}' references plugin_config '{}' with scope 'global' — proxy associations may only reference proxy-scoped or proxy_group-scoped plugin configs",
                             proxy_id, plugin.id
                         ));
                         continue;
                     }
-                    if plugin.proxy_id.as_deref() != Some(proxy_id) {
-                        errors.push(format!(
-                            "Proxy '{}' references plugin_config '{}' targeted to proxy '{}'",
-                            proxy_id,
-                            plugin.id,
-                            plugin.proxy_id.as_deref().unwrap_or("<none>")
-                        ));
+                    PluginScope::Proxy => {
+                        if plugin.proxy_id.as_deref() != Some(proxy_id) {
+                            errors.push(format!(
+                                "Proxy '{}' references plugin_config '{}' targeted to proxy '{}'",
+                                proxy_id,
+                                plugin.id,
+                                plugin.proxy_id.as_deref().unwrap_or("<none>")
+                            ));
+                        }
                     }
-                }
+                    PluginScope::ProxyGroup => {
+                        // ProxyGroup plugins have no proxy_id — any proxy can
+                        // reference them via its plugins association list.
+                    }
+                },
                 None => errors.push(format!(
                     "Proxy '{}' references non-existent plugin_config '{}'",
                     proxy_id, assoc.plugin_config_id
@@ -2167,6 +2211,7 @@ impl DatabaseStore {
             let id: String = row.try_get("id")?;
             let scope = match row.try_get::<String, _>("scope")?.as_str() {
                 "proxy" => PluginScope::Proxy,
+                "proxy_group" => PluginScope::ProxyGroup,
                 _ => PluginScope::Global,
             };
             plugin_refs.insert(
@@ -2483,6 +2528,7 @@ impl DatabaseStore {
             let config_json = serde_json::to_string(&pc.config)?;
             let scope_str = match pc.scope {
                 PluginScope::Proxy => "proxy",
+                PluginScope::ProxyGroup => "proxy_group",
                 PluginScope::Global => "global",
             };
             sqlx::query(&sql)
@@ -3613,10 +3659,10 @@ fn row_to_plugin_config(row: &AnyRow) -> Result<PluginConfig, anyhow::Error> {
             .unwrap_or_else(|_| crate::config::types::default_namespace()),
         plugin_name: row.try_get("plugin_name")?,
         config: config_val,
-        scope: if scope_str == "proxy" {
-            PluginScope::Proxy
-        } else {
-            PluginScope::Global
+        scope: match scope_str.as_str() {
+            "proxy" => PluginScope::Proxy,
+            "proxy_group" => PluginScope::ProxyGroup,
+            _ => PluginScope::Global,
         },
         proxy_id: row.try_get("proxy_id").ok(),
         enabled: row.try_get::<i32, _>("enabled").unwrap_or(1) != 0,

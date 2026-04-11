@@ -1856,6 +1856,7 @@ dependencies = [
  "http 1.4.0",
  "http-body 1.0.1",
  "http-body-util",
+ "httpdate",
  "hyper 1.9.0",
  "hyper-util",
  "jsonwebtoken",

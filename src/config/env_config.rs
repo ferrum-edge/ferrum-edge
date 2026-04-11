@@ -610,6 +610,22 @@ pub struct EnvConfig {
     /// Uses the same client IP resolution as trusted proxy XFF walk.
     /// Default: 0 (disabled). When exceeded, returns 429 Too Many Requests.
     pub max_concurrent_requests_per_ip: u64,
+    /// Interval in seconds between cleanup sweeps for per-IP request counters.
+    /// Removes entries where the active request count has dropped to zero.
+    /// Only relevant when `max_concurrent_requests_per_ip > 0`. Default: 60.
+    pub per_ip_cleanup_interval_seconds: u64,
+    /// Maximum entries in the circuit breaker cache. Entries are keyed by
+    /// proxy_id::host:port. Stale entries from removed upstream targets are
+    /// pruned during config reload. This cap prevents unbounded growth from
+    /// target churn in dynamic environments (e.g., Kubernetes pod cycling).
+    /// Default: 10000.
+    pub circuit_breaker_cache_max_entries: usize,
+    /// Maximum entries in the HTTP status code counters map. Common codes
+    /// (200, 404, 500, etc.) are pre-populated at startup. Rare/exotic codes
+    /// create entries on first occurrence up to this cap. Prevents unbounded
+    /// growth from adversarial backends returning many distinct status codes.
+    /// Default: 200.
+    pub status_counts_max_entries: usize,
     /// TCP listen backlog size for proxy listeners. Default: 2048.
     /// Higher values absorb connection bursts without SYN drops.
     pub tcp_listen_backlog: u32,
@@ -670,6 +686,23 @@ pub struct EnvConfig {
     /// admin `/status` endpoint.  A background task snapshots cumulative
     /// counters every N seconds and computes average rates.  Minimum: 1.
     pub status_metrics_window_seconds: u64,
+
+    // ── TLS handshake offload ───────────────────────────────────────────
+    /// Total dedicated threads for offloading TLS handshakes from the main
+    /// event loop. 0 = disabled (handshakes run on tokio worker threads).
+    /// When enabled, threads are organized into shards for TLS session cache
+    /// affinity. Default: 0 (disabled).
+    pub tls_offload_threads: usize,
+
+    // ── TCP socket optimizations (Linux only) ────────────────────────────
+    /// Enable TCP Fast Open on server (listening) and client (connecting) sockets.
+    /// Saves 1 RTT on repeat connections by allowing data in the SYN packet.
+    /// Requires Linux 4.11+ and `net.ipv4.tcp_fastopen` sysctl bit 0x1 (server)
+    /// or 0x2 (client) enabled. No-op on non-Linux. Default: true.
+    pub tcp_fastopen_enabled: bool,
+    /// TCP Fast Open server queue length — maximum pending TFO connections.
+    /// Only used when `tcp_fastopen_enabled` is true. Default: 256.
+    pub tcp_fastopen_queue_len: u16,
 }
 
 impl Default for EnvConfig {
@@ -821,6 +854,9 @@ impl Default for EnvConfig {
             blocking_threads: None,
             max_connections: 100_000,
             max_concurrent_requests_per_ip: 0,
+            per_ip_cleanup_interval_seconds: 60,
+            circuit_breaker_cache_max_entries: 10_000,
+            status_counts_max_entries: 200,
             tcp_listen_backlog: 2048,
             accept_threads: 0,
             server_http2_max_concurrent_streams: 1000,
@@ -836,6 +872,9 @@ impl Default for EnvConfig {
             overload_loop_critical_us: 500_000,
             shutdown_drain_seconds: 30,
             status_metrics_window_seconds: 30,
+            tls_offload_threads: 0,
+            tcp_fastopen_enabled: true,
+            tcp_fastopen_queue_len: 256,
         }
     }
 }
@@ -1253,6 +1292,17 @@ impl EnvConfig {
                 "FERRUM_MAX_CONCURRENT_REQUESTS_PER_IP",
                 0,
             ),
+            per_ip_cleanup_interval_seconds: resolve_u64(
+                conf,
+                "FERRUM_PER_IP_CLEANUP_INTERVAL_SECONDS",
+                60,
+            ),
+            circuit_breaker_cache_max_entries: resolve_usize(
+                conf,
+                "FERRUM_CIRCUIT_BREAKER_CACHE_MAX_ENTRIES",
+                10_000,
+            ),
+            status_counts_max_entries: resolve_usize(conf, "FERRUM_STATUS_COUNTS_MAX_ENTRIES", 200),
             tcp_listen_backlog: resolve_var(conf, "FERRUM_TCP_LISTEN_BACKLOG")
                 .and_then(|v| v.parse().ok())
                 .map(|v: u32| v.max(128))
@@ -1341,6 +1391,11 @@ impl EnvConfig {
                 30,
             )
             .max(1),
+            tls_offload_threads: resolve_usize(conf, "FERRUM_TLS_OFFLOAD_THREADS", 0),
+            tcp_fastopen_enabled: resolve_bool(conf, "FERRUM_TCP_FASTOPEN_ENABLED", true),
+            tcp_fastopen_queue_len: resolve_var(conf, "FERRUM_TCP_FASTOPEN_QUEUE_LEN")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(256),
         };
 
         config.validate()?;

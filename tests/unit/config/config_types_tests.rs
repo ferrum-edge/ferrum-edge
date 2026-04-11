@@ -951,7 +951,7 @@ fn test_validate_plugin_references_rejects_global_plugin_association() {
     let errs = config.validate_plugin_references().unwrap_err();
     assert!(
         errs.iter()
-            .any(|e| e.contains("proxy-scoped plugin configs"))
+            .any(|e| e.contains("proxy-scoped or proxy_group-scoped plugin configs"))
     );
 }
 
@@ -981,6 +981,107 @@ fn test_validate_plugin_references_rejects_wrong_proxy_target() {
         errs.iter()
             .any(|e| e.contains("targeted to proxy 'other-proxy'"))
     );
+}
+
+// ---- ProxyGroup validation tests ----
+
+#[test]
+fn test_validate_plugin_references_accepts_proxy_group_association() {
+    let mut config = empty_config();
+    config.plugin_configs = vec![PluginConfig {
+        id: "pg1".into(),
+        namespace: ferrum_edge::config::types::default_namespace(),
+        plugin_name: "cors".into(),
+        config: serde_json::json!({}),
+        scope: PluginScope::ProxyGroup,
+        proxy_id: None,
+        enabled: true,
+        priority_override: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    }];
+    let mut proxy = make_proxy("p1", "/api");
+    proxy.plugins = vec![PluginAssociation {
+        plugin_config_id: "pg1".into(),
+    }];
+    config.proxies = vec![proxy];
+
+    // Should pass validation — proxy_group plugins can be referenced by any proxy
+    assert!(config.validate_plugin_references().is_ok());
+}
+
+#[test]
+fn test_validate_plugin_references_proxy_group_shared_across_proxies() {
+    let mut config = empty_config();
+    config.plugin_configs = vec![PluginConfig {
+        id: "pg1".into(),
+        namespace: ferrum_edge::config::types::default_namespace(),
+        plugin_name: "cors".into(),
+        config: serde_json::json!({}),
+        scope: PluginScope::ProxyGroup,
+        proxy_id: None,
+        enabled: true,
+        priority_override: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    }];
+    let mut proxy1 = make_proxy("p1", "/api");
+    proxy1.plugins = vec![PluginAssociation {
+        plugin_config_id: "pg1".into(),
+    }];
+    let mut proxy2 = make_proxy("p2", "/web");
+    proxy2.plugins = vec![PluginAssociation {
+        plugin_config_id: "pg1".into(),
+    }];
+    config.proxies = vec![proxy1, proxy2];
+
+    // Both proxies can reference the same proxy_group plugin
+    assert!(config.validate_plugin_references().is_ok());
+}
+
+#[test]
+fn test_validate_plugin_references_rejects_proxy_group_with_proxy_id() {
+    let mut config = empty_config();
+    config.plugin_configs = vec![PluginConfig {
+        id: "pg1".into(),
+        namespace: ferrum_edge::config::types::default_namespace(),
+        plugin_name: "cors".into(),
+        config: serde_json::json!({}),
+        scope: PluginScope::ProxyGroup,
+        proxy_id: Some("p1".into()), // Invalid: proxy_group must not have proxy_id
+        enabled: true,
+        priority_override: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    }];
+    config.proxies = vec![make_proxy("p1", "/api")];
+
+    let errs = config.validate_plugin_references().unwrap_err();
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("proxy_group") && e.contains("must not have proxy_id"))
+    );
+}
+
+#[test]
+fn test_plugin_scope_proxy_group_serde_round_trip() {
+    let pc = PluginConfig {
+        id: "pg1".into(),
+        namespace: ferrum_edge::config::types::default_namespace(),
+        plugin_name: "cors".into(),
+        config: serde_json::json!({}),
+        scope: PluginScope::ProxyGroup,
+        proxy_id: None,
+        enabled: true,
+        priority_override: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+    let json = serde_json::to_string(&pc).unwrap();
+    assert!(json.contains("\"proxy_group\""));
+
+    let restored: PluginConfig = serde_json::from_str(&json).unwrap();
+    assert_eq!(restored.scope, PluginScope::ProxyGroup);
 }
 
 // ---- Resource ID validation tests ----

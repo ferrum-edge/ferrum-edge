@@ -697,3 +697,44 @@ fn test_default_config_has_trip_on_connection_errors_true() {
     let config = CircuitBreakerConfig::default();
     assert!(config.trip_on_connection_errors);
 }
+
+// --- Cache bounding tests ---
+
+#[test]
+fn test_circuit_breaker_cache_max_entries_enforced() {
+    let cache = CircuitBreakerCache::with_max_entries(3);
+    let config = default_config();
+
+    // Fill to capacity
+    cache.get_or_create("proxy1", Some("host1:8080"), &config);
+    cache.get_or_create("proxy2", Some("host2:8080"), &config);
+    cache.get_or_create("proxy3", Some("host3:8080"), &config);
+
+    // At capacity — new key returns a transient breaker (not cached)
+    let _cb = cache.get_or_create("proxy4", Some("host4:8080"), &config);
+    assert_eq!(cache.len(), 3); // Still 3, not 4
+
+    // Existing key can still be updated (config change)
+    cache.get_or_create("proxy1", Some("host1:8080"), &config);
+    assert_eq!(cache.len(), 3);
+}
+
+#[test]
+fn test_circuit_breaker_prune_stale_targets() {
+    let cache = CircuitBreakerCache::new();
+    let config = default_config();
+
+    // Create breakers for multiple targets
+    cache.get_or_create("proxy1", Some("10.0.0.1:8080"), &config);
+    cache.get_or_create("proxy1", Some("10.0.0.2:8080"), &config);
+    cache.get_or_create("proxy1", Some("10.0.0.3:8080"), &config);
+    cache.get_or_create("proxy2", None, &config); // direct backend
+
+    // Only keep proxy1::10.0.0.1:8080 — the rest are stale
+    let mut active = std::collections::HashSet::new();
+    active.insert("proxy1::10.0.0.1:8080".to_string());
+    cache.prune_stale_targets(&active);
+
+    // Direct backend key (proxy2, no "::") should be preserved
+    assert_eq!(cache.len(), 2); // proxy1::10.0.0.1:8080 + proxy2
+}

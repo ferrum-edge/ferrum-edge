@@ -32,6 +32,7 @@ const DEFAULT_MAX_TOTAL_SIZE_BYTES: usize = 104_857_600;
 
 const CACHE_BASE_KEY: &str = "cache_base_key";
 const CACHE_STATUS: &str = "cache_status";
+const CACHE_PREDICT_KEY: &str = "cache_predict_key";
 
 /// A cached response entry.
 #[derive(Debug, Clone)]
@@ -176,11 +177,62 @@ impl ResponseCachingConfig {
     }
 }
 
+/// Bounded LRU tracker of keys known to be uncacheable.
+/// Prevents wasted cache lock acquisition for assets that were historically uncacheable.
+struct UncacheablePredictor {
+    /// Keys known to be uncacheable, mapped to the epoch second when recorded.
+    keys: DashMap<String, u64>,
+    /// Maximum entries before oldest are evicted.
+    max_entries: usize,
+}
+
+impl UncacheablePredictor {
+    fn new(max_entries: usize) -> Self {
+        Self {
+            keys: DashMap::with_capacity(max_entries / 4),
+            max_entries,
+        }
+    }
+
+    /// Returns true if this key is predicted to be cacheable (not in the uncacheable set).
+    fn is_predicted_cacheable(&self, key: &str) -> bool {
+        !self.keys.contains_key(key)
+    }
+
+    /// Mark a key as uncacheable. If the map is full, remove ~25% of entries by oldest timestamp.
+    fn mark_uncacheable(&self, key: &str) {
+        if self.keys.len() >= self.max_entries {
+            // Evict oldest 25%
+            let target = self.max_entries / 4;
+            let mut entries: Vec<(String, u64)> = self
+                .keys
+                .iter()
+                .map(|e| (e.key().clone(), *e.value()))
+                .collect();
+            entries.sort_by_key(|(_, ts)| *ts);
+            for (k, _) in entries.into_iter().take(target) {
+                self.keys.remove(&k);
+            }
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        self.keys.insert(key.to_string(), now);
+    }
+
+    /// Remove a key from the uncacheable set (it became cacheable).
+    fn mark_cacheable(&self, key: &str) {
+        self.keys.remove(key);
+    }
+}
+
 pub struct ResponseCaching {
     config: ResponseCachingConfig,
     cache: Arc<DashMap<String, CacheEntry>>,
     vary_index: Arc<DashMap<String, Vec<String>>>,
     total_size: Arc<AtomicUsize>,
+    uncacheable_predictor: UncacheablePredictor,
 }
 
 impl ResponseCaching {
@@ -194,11 +246,13 @@ impl ResponseCaching {
             );
         }
 
+        let predictor_size = config.max_entries / 10; // 10% of cache size
         Ok(Self {
             config,
             cache: Arc::new(DashMap::new()),
             vary_index: Arc::new(DashMap::new()),
             total_size: Arc::new(AtomicUsize::new(0)),
+            uncacheable_predictor: UncacheablePredictor::new(predictor_size.max(100)),
         })
     }
 
@@ -543,6 +597,22 @@ impl Plugin for ResponseCaching {
 
         let vary_headers = self.cache_lookup_vary_headers(&base_key);
         let cache_key = self.build_cache_key(ctx, &vary_headers, headers);
+        // Store the full cache key (with Vary dimensions) so on_final_response_body
+        // can mark the correct variant-specific key in the uncacheable predictor.
+        ctx.metadata
+            .insert(CACHE_PREDICT_KEY.to_string(), cache_key.clone());
+
+        // Fast-path: skip cache lookup if this specific variant is predicted uncacheable.
+        // Uses the full cache_key (including Vary dimensions) so that one uncacheable
+        // variant does not suppress lookups for other variants of the same route.
+        if !self
+            .uncacheable_predictor
+            .is_predicted_cacheable(&cache_key)
+        {
+            ctx.metadata
+                .insert(CACHE_STATUS.to_string(), "PREDICTED-BYPASS".to_string());
+            return PluginResult::Continue;
+        }
 
         if let Some(entry) = self.cache.get(&cache_key) {
             if entry.is_expired() {
@@ -608,12 +678,21 @@ impl Plugin for ResponseCaching {
             Some(base_key) => base_key.clone(),
             None => return PluginResult::Continue,
         };
+        // Use the variant-specific predict key (set during before_proxy) for
+        // predictor marking so that uncacheability of one Vary variant does not
+        // suppress cache lookups for other variants of the same route.
+        let predict_key = ctx
+            .metadata
+            .get(CACHE_PREDICT_KEY)
+            .cloned()
+            .unwrap_or_else(|| base_key.clone());
 
         if !self
             .config
             .cacheable_status_codes
             .contains(&response_status)
         {
+            self.uncacheable_predictor.mark_uncacheable(&predict_key);
             return PluginResult::Continue;
         }
 
@@ -628,6 +707,7 @@ impl Plugin for ResponseCaching {
 
         if directives.no_store || directives.private || directives.no_cache {
             self.invalidate_base_key(&base_key);
+            self.uncacheable_predictor.mark_uncacheable(&predict_key);
             return PluginResult::Continue;
         }
 
@@ -636,10 +716,12 @@ impl Plugin for ResponseCaching {
         // session cookies to other users (RFC 7234 §8).
         if response_headers.contains_key("set-cookie") {
             debug!("response_caching: skipping cache — response contains Set-Cookie header");
+            self.uncacheable_predictor.mark_uncacheable(&predict_key);
             return PluginResult::Continue;
         }
 
         if !self.shared_cache_allows_authorized_response(ctx, directives) {
+            self.uncacheable_predictor.mark_uncacheable(&predict_key);
             return PluginResult::Continue;
         }
 
@@ -653,6 +735,7 @@ impl Plugin for ResponseCaching {
 
         if ttl.is_zero() {
             self.invalidate_base_key(&base_key);
+            self.uncacheable_predictor.mark_uncacheable(&predict_key);
             return PluginResult::Continue;
         }
 
@@ -660,6 +743,7 @@ impl Plugin for ResponseCaching {
             Some(vary_headers) => vary_headers,
             None => {
                 self.invalidate_base_key(&base_key);
+                self.uncacheable_predictor.mark_uncacheable(&predict_key);
                 return PluginResult::Continue;
             }
         };
@@ -701,6 +785,8 @@ impl Plugin for ResponseCaching {
                 .fetch_sub(old.approx_size(), Ordering::Relaxed);
         }
         self.total_size.fetch_add(entry_size, Ordering::Relaxed);
+        // Response was cacheable — remove from predictor if previously marked uncacheable
+        self.uncacheable_predictor.mark_cacheable(&predict_key);
         self.vary_index.insert(base_key, vary_headers);
 
         debug!(

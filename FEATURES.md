@@ -59,7 +59,7 @@ Ferrum supports dynamic upstream target discovery through three providers, confi
 - 58 built-in plugins with lifecycle hooks (request received, authenticate, authorize, before proxy, after proxy, on final request/response body, on response body, on WebSocket frame, on UDP datagram, log)
 - Priority-ordered execution with protocol-aware filtering (HTTP, gRPC, WebSocket, TCP, UDP)
 - Multiple instances of the same plugin type per proxy (e.g., two `http_logging` for Splunk and Datadog) with optional `priority_override` for execution order control
-- Global and per-proxy scoping — proxy-scoped plugins replace global plugins of the same name
+- Three plugin scopes: **global** (all proxies), **proxy** (single proxy), **proxy_group** (shared across a subset of proxies) — scoped plugins replace global plugins of the same name. Proxy-group plugins share a single instance across all associated proxies, so stateful plugins (e.g., rate_limiting) share counters across the group
 - Multi-authentication mode with first-match consumer identification
 - Multi-credential rotation — consumers can have multiple active credentials of the same type (e.g., two API keys, two JWT secrets) for zero-downtime key rotation, configurable via `FERRUM_MAX_CREDENTIALS_PER_TYPE`
 - Custom plugin database migrations — plugins declare migrations via `plugin_migrations()`, auto-discovered at build time, tracked separately in `_ferrum_plugin_migrations` with per-plugin version scoping. Supports cross-database SQL (PostgreSQL/MySQL/SQLite overrides). MongoDB uses idempotent index creation instead of SQL migrations
@@ -179,6 +179,32 @@ Ferrum supports dynamic upstream target discovery through three providers, confi
 - Connection limit semaphore (default 100k) with graceful queuing under overload
 - Server-side HTTP/2 `max_concurrent_streams` (default 1000) to bound per-connection resource usage
 - Configurable tokio worker and blocking thread counts with auto-detection
+- **Linux socket optimizations** :
+  - `TCP_FASTOPEN` on server sockets — saves 1 RTT for repeat clients with cached TFO cookies, configurable queue length (`FERRUM_TCP_FASTOPEN_ENABLED`, `FERRUM_TCP_FASTOPEN_QUEUE_LEN`)
+  - `IP_BIND_ADDRESS_NO_PORT` on outbound sockets — defers ephemeral port allocation to `connect()` for 4-tuple co-selection, preventing port exhaustion under high outbound connection rates
+- **TLS handshake offload runtime** — dedicated single-threaded tokio runtimes for TLS handshakes, preventing CPU-intensive connection establishment from blocking the main event loop during connection storms. Connections are sharded by peer hash for TLS session cache affinity. Configurable via `FERRUM_TLS_OFFLOAD_THREADS` (0 = disabled)
+- **Thread-local Date header caching** — caches the RFC 2822 formatted date string per-thread with second-granularity refresh, avoiding `SystemTime::now()` + formatting (~100ns) on every response
+- **Lazy timeout initialization** — defers tokio timer wheel allocation until the inner future returns `Pending`, so fast-path operations (e.g., buffered I/O reads that complete immediately) never allocate a timer
+- **TCP_INFO kernel diagnostics** (Linux) — `getsockopt(TCP_INFO)` access for kernel-level RTT, retransmit, and congestion window metrics on stream proxy connections
+
+## Intelligent Cache & Load Management
+
+- **Frequency-aware router cache eviction** — Count-Min Sketch tracks access frequency for cached route lookups, with TinyLFU-inspired eviction that samples entries and removes the least frequently accessed. Prevents scanner traffic and one-off paths from evicting hot route entries
+- **RED-style adaptive load shedding** — Random Early Detection probability ramping between pressure and critical thresholds in the overload manager. Instead of a hard cliff from "accept all" to "reject all", drop probability increases smoothly as resource pressure rises, giving the system time to recover gracefully
+- **UDP jitter-based adaptive buffering** — tracks inter-arrival jitter (EWMA) for UDP datagrams per proxy. High jitter (>10ms) indicates lossy/variable real-time traffic and bumps the buffer tier up for a safety margin, improving reliability for VoIP, gaming, and media streams
+- **Cacheability predictor for response caching** — learns which cache keys consistently produce uncacheable responses (no-store, private, non-2xx) and short-circuits cache lookups for those keys, avoiding wasted DashMap reads on the hot path.
+
+## Bounded In-Memory Caches
+
+All in-memory caches are bounded to prevent unbounded memory growth under adversarial or high-cardinality traffic:
+
+- **Router cache** — auto-scales with proxy count (`FERRUM_ROUTER_CACHE_MAX_ENTRIES`), separate prefix and regex partitions with negative-lookup caching
+- **DNS cache** — bounded by `FERRUM_DNS_CACHE_MAX_SIZE` (default 10,000 entries) with TTL-based expiration and stale-while-revalidate
+- **Circuit breaker cache** — capped at `FERRUM_CIRCUIT_BREAKER_CACHE_MAX_ENTRIES` (default 10,000) with stale entry pruning on config reload
+- **Status code counters** — capped at `FERRUM_STATUS_COUNTS_MAX_ENTRIES` (default 200) with common codes pre-populated at startup
+- **Per-IP request counters** — periodic cleanup of zero-count entries via `FERRUM_PER_IP_CLEANUP_INTERVAL_SECONDS` (default 60s)
+- **Plugin caches** — response caching, AI semantic cache, request deduplication, SOAP nonce cache, LDAP auth cache, and rate limiting plugins all have configurable `max_entries` or `max_cache_entries` with TTL-based eviction and stale entry cleanup
+- See [docs/cache_management.md](docs/cache_management.md) for the full cache inventory and tuning reference
 
 ## TLS & Security
 

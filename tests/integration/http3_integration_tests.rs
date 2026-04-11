@@ -413,6 +413,7 @@ async fn test_http3_proxy_state_creation() {
                 true, true, 300, 8192, 262_144, 65_536, 6000,
             )),
             64,
+            true,
         ),
     );
     let dns_cache_for_sd = dns_cache.clone();
@@ -618,6 +619,7 @@ async fn test_http3_full_integration() {
                 true, true, 300, 8192, 262_144, 65_536, 6000,
             )),
             64,
+            true,
         ),
     );
     let dns_cache_for_sd = dns_cache.clone();

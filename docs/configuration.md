@@ -397,7 +397,7 @@ When using Database or CP modes, Ferrum auto-creates the following tables on sta
 
 - **`proxies`** — Proxy route definitions (with `UNIQUE` constraint on `listen_path`)
 - **`consumers`** — API consumer/user definitions
-- **`plugin_configs`** — Plugin configurations (global or per-proxy scoped)
+- **`plugin_configs`** — Plugin configurations (global, per-proxy, or proxy-group scoped)
 - **`proxy_plugins`** — Many-to-many linking proxies to plugin configs
 - **`upstreams`** — Upstream groups for load-balanced backends (targets stored as JSON, with algorithm and health check configuration)
 

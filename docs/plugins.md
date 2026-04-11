@@ -23,25 +23,91 @@ Custom plugins are auto-discovered from the `custom_plugins/` directory at build
 
 ## Scope
 
-- **Global** plugins apply to all proxies automatically
-- **Proxy-scoped** plugins apply only to a specific proxy
+- **Global** plugins (`scope: "global"`) apply to all proxies automatically. `proxy_id` must be null.
+- **Proxy-scoped** plugins (`scope: "proxy"`) apply only to a specific proxy. `proxy_id` is required.
+- **Proxy-group-scoped** plugins (`scope: "proxy_group"`) apply to a subset of proxies that reference the plugin in their `plugins` association list. `proxy_id` must be null. A **single shared plugin instance** is reused across all associated proxies, so stateful plugins (e.g., `rate_limiting`) share counters across the group. When a proxy is deleted, only the association is removed — the proxy-group plugin config survives.
 - A proxy may have **multiple instances** of the same plugin type (e.g., two `http_logging` configs shipping to different destinations). Each instance has its own `id`, `config`, and optional `priority_override` to control execution order
 
-### Global vs Proxy-Scoped Merging
+**Example** (file mode YAML):
 
-Each proxy's effective plugin list is built by merging global and proxy-scoped plugins:
+```yaml
+plugin_configs:
+  # Global — applies to ALL proxies automatically
+  - id: global-logging
+    plugin_name: stdout_logging
+    scope: global
+    config: {}
+
+  # Proxy — applies to exactly ONE proxy
+  - id: frontend-cors
+    plugin_name: cors
+    scope: proxy
+    proxy_id: public-frontend
+    config:
+      origins: ["https://app.example.com"]
+
+  # ProxyGroup — shared across a SUBSET of proxies
+  # One instance, shared rate limit counters across the group
+  - id: internal-rate-limit
+    plugin_name: rate_limiting
+    scope: proxy_group
+    config:
+      window_seconds: 60
+      max_requests: 500
+      limit_by: consumer
+
+  - id: internal-key-auth
+    plugin_name: key_auth
+    scope: proxy_group
+    config:
+      key_names: ["x-api-key"]
+
+proxies:
+  # Both internal proxies share the same auth + rate limit group plugins
+  - id: users-api
+    listen_path: /api/users
+    backend_protocol: http
+    backend_host: users-svc
+    backend_port: 3000
+    plugins:
+      - plugin_config_id: internal-key-auth
+      - plugin_config_id: internal-rate-limit
+
+  - id: orders-api
+    listen_path: /api/orders
+    backend_protocol: http
+    backend_host: orders-svc
+    backend_port: 3001
+    plugins:
+      - plugin_config_id: internal-key-auth
+      - plugin_config_id: internal-rate-limit
+
+  # Public proxy — no group plugins, has its own proxy-scoped CORS
+  - id: public-frontend
+    listen_path: /public
+    backend_protocol: http
+    backend_host: frontend-svc
+    backend_port: 8080
+    plugins:
+      - plugin_config_id: frontend-cors
+```
+
+### Plugin Scope Merging
+
+Each proxy's effective plugin list is built by merging global, proxy-scoped, and proxy-group-scoped plugins:
 
 1. Start with all enabled **global** plugins
-2. For each **proxy-scoped** plugin attached to the proxy, remove any global plugin with the same `plugin_name` (the proxy-scoped instance replaces it)
-3. Multiple proxy-scoped instances of the same `plugin_name` all coexist — only the global is replaced
+2. For each **proxy-scoped** or **proxy-group-scoped** plugin attached to the proxy, remove any global plugin with the same `plugin_name` (the scoped instance replaces it)
+3. Multiple scoped instances of the same `plugin_name` all coexist — only the global is replaced
 4. Sort by effective priority (built-in priority or `priority_override`)
 
 **Examples:**
 
-| Global plugins | Proxy-scoped plugins | Effective list for proxy |
+| Global plugins | Scoped plugins | Effective list for proxy |
 |---|---|---|
 | `http_logging` (g1) | *(none)* | g1 |
-| `http_logging` (g1) | `http_logging` (ps1) | ps1 (replaces g1) |
+| `http_logging` (g1) | `http_logging` (ps1, proxy) | ps1 (replaces g1) |
+| `http_logging` (g1) | `http_logging` (pg1, proxy_group) | pg1 (replaces g1, shared instance) |
 | `http_logging` (g1) | `http_logging` (ps1), `http_logging` (ps2) | ps1, ps2 (g1 replaced, both scoped kept) |
 | *(none)* | `http_logging` (ps1), `http_logging` (ps2) | ps1, ps2 |
 | `http_logging` (g1), `cors` (g2) | `http_logging` (ps1) | ps1, g2 (only same-name global replaced) |

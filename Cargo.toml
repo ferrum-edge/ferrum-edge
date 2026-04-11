@@ -67,6 +67,7 @@ h3-quinn = "0.0.10"
 
 # Time/date
 chrono = { version = "0.4", features = ["serde"] }
+httpdate = "1"
 
 # Other utilities
 regex = "1"

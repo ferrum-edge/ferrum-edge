@@ -149,6 +149,8 @@ pub struct TcpListenerConfig {
     pub sni_proxy_ids: Option<Vec<String>>,
     /// Adaptive buffer tracker for dynamic copy buffer sizing.
     pub adaptive_buffer: Arc<crate::adaptive_buffer::AdaptiveBufferTracker>,
+    /// Whether TCP Fast Open is enabled (from `FERRUM_TCP_FASTOPEN_ENABLED`).
+    pub tcp_fastopen_enabled: bool,
 }
 
 /// Start a TCP proxy listener on the given port.
@@ -180,6 +182,7 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
         started,
         sni_proxy_ids,
         adaptive_buffer,
+        tcp_fastopen_enabled,
     } = cfg;
     let addr = SocketAddr::new(bind_addr, port);
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -304,6 +307,7 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
                         &mut stream_ctx,
                         sni_proxy_ids.as_deref(),
                         &adaptive_buf,
+                        tcp_fastopen_enabled,
                     )
                     .await;
 
@@ -393,6 +397,8 @@ struct TcpConnParams {
     upstream_id: Option<String>,
     /// When true, forward encrypted client bytes directly without TLS termination.
     passthrough: bool,
+    /// Whether TCP Fast Open is enabled (gated on `FERRUM_TCP_FASTOPEN_ENABLED`).
+    tcp_fastopen_enabled: bool,
 }
 
 /// Lightweight snapshot of the proxy fields needed per TCP connection.
@@ -444,6 +450,7 @@ async fn handle_tcp_connection(
     stream_ctx: &mut StreamConnectionContext,
     sni_proxy_ids: Option<&[String]>,
     adaptive_buffer: &crate::adaptive_buffer::AdaptiveBufferTracker,
+    tcp_fastopen: bool,
 ) -> TcpConnectionResult {
     let start = Instant::now();
     let _ = client_stream.set_nodelay(true);
@@ -473,6 +480,7 @@ async fn handle_tcp_connection(
         stream_ctx,
         sni_proxy_ids,
         adaptive_buffer,
+        tcp_fastopen,
     )
     .await;
 
@@ -502,6 +510,7 @@ async fn handle_tcp_connection_inner(
     stream_ctx: &mut StreamConnectionContext,
     sni_proxy_ids: Option<&[String]>,
     adaptive_buffer: &crate::adaptive_buffer::AdaptiveBufferTracker,
+    tcp_fastopen: bool,
 ) -> Result<TcpConnectionSuccess, anyhow::Error> {
     // --- SNI-based proxy resolution for shared passthrough ports ---
     // When multiple passthrough proxies share a listen_port, we must peek at
@@ -573,6 +582,7 @@ async fn handle_tcp_connection_inner(
             retry: proxy.retry.clone(),
             upstream_id: proxy.upstream_id.clone(),
             passthrough: proxy.passthrough,
+            tcp_fastopen_enabled: tcp_fastopen,
         };
 
         (params, cb_info)
@@ -624,18 +634,19 @@ async fn handle_tcp_connection_inner(
 
         // Connect plain TCP to backend (no TLS origination — the client's encrypted
         // stream passes through directly to the backend which terminates TLS).
-        let backend_stream = connect_backend_plain(addr, connect_timeout)
-            .await
-            .inspect_err(|_| {
-                if let Some(ref cb_config) = cb_info.cb_config {
-                    let cb = circuit_breaker_cache.get_or_create(
-                        proxy_id,
-                        cb_info.cb_target_key.as_deref(),
-                        cb_config,
-                    );
-                    cb.record_failure(502, true);
-                }
-            })?;
+        let backend_stream =
+            connect_backend_plain(addr, connect_timeout, params.tcp_fastopen_enabled)
+                .await
+                .inspect_err(|_| {
+                    if let Some(ref cb_config) = cb_info.cb_config {
+                        let cb = circuit_breaker_cache.get_or_create(
+                            proxy_id,
+                            cb_info.cb_target_key.as_deref(),
+                            cb_config,
+                        );
+                        cb.record_failure(502, true);
+                    }
+                })?;
 
         let buf_size = adaptive_buffer.get_buffer_size(proxy_id);
 
@@ -811,11 +822,17 @@ async fn handle_tcp_connection_inner(
 
         // Attempt backend TCP connection (with optional TLS origination)
         let connect_result = if is_backend_tls {
-            connect_backend_tls_cached(addr, &current_host, connect_timeout, cached_backend_tls)
-                .await
-                .map(|s| BackendStream::Tls(Box::new(s)))
+            connect_backend_tls_cached(
+                addr,
+                &current_host,
+                connect_timeout,
+                cached_backend_tls,
+                params.tcp_fastopen_enabled,
+            )
+            .await
+            .map(|s| BackendStream::Tls(Box::new(s)))
         } else {
-            connect_backend_plain(addr, connect_timeout)
+            connect_backend_plain(addr, connect_timeout, params.tcp_fastopen_enabled)
                 .await
                 .map(BackendStream::Plain)
         };
@@ -1016,15 +1033,35 @@ fn try_next_target(
 }
 
 /// Connect to a plain TCP backend with the given connect timeout.
+///
+/// On Linux, applies `IP_BIND_ADDRESS_NO_PORT` (defers ephemeral port allocation
+/// to connect() for better 4-tuple distribution) and `TCP_FASTOPEN_CONNECT`
+/// (saves 1 RTT on repeat connections) when `tcp_fastopen` is true.
 async fn connect_backend_plain(
     addr: SocketAddr,
     connect_timeout: Duration,
+    _tcp_fastopen: bool,
 ) -> Result<TcpStream, anyhow::Error> {
     let stream = tokio::time::timeout(connect_timeout, TcpStream::connect(addr))
         .await
         .map_err(|_| anyhow::anyhow!("Backend connect timeout to {}", addr))?
         .map_err(|e| anyhow::anyhow!("Backend connect failed to {}: {}", addr, e))?;
     let _ = stream.set_nodelay(true);
+
+    // Apply Linux/Unix socket optimizations on the connected socket.
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let fd = stream.as_raw_fd();
+        // IP_BIND_ADDRESS_NO_PORT: defer ephemeral port allocation to connect(),
+        // enabling 4-tuple co-selection to prevent port exhaustion at high rates.
+        let _ = crate::socket_opts::set_ip_bind_address_no_port(fd, true);
+        if _tcp_fastopen {
+            // TCP_FASTOPEN_CONNECT: send data in SYN on repeat connections (1 RTT saved).
+            let _ = crate::socket_opts::set_tcp_fastopen_client(fd);
+        }
+    }
+
     Ok(stream)
 }
 
@@ -1035,8 +1072,9 @@ async fn connect_backend_tls_cached(
     hostname: &str,
     connect_timeout: Duration,
     cached_tls: Option<&CachedBackendTlsConfig>,
+    tcp_fastopen: bool,
 ) -> Result<tokio_rustls::client::TlsStream<TcpStream>, anyhow::Error> {
-    let tcp_stream = connect_backend_plain(addr, connect_timeout).await?;
+    let tcp_stream = connect_backend_plain(addr, connect_timeout, tcp_fastopen).await?;
 
     let tls_config = cached_tls
         .map(|c| c.config.clone())

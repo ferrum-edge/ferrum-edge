@@ -622,7 +622,9 @@ impl ProxyState {
         health_checker.start(&config);
         let health_checker = Arc::new(health_checker);
         // Circuit breaker cache
-        let circuit_breaker_cache = Arc::new(CircuitBreakerCache::new());
+        let circuit_breaker_cache = Arc::new(CircuitBreakerCache::with_max_entries(
+            env_config_arc.circuit_breaker_cache_max_entries,
+        ));
         // Service discovery manager (tasks started later via start_service_discovery)
         let service_discovery_manager = Arc::new(ServiceDiscoveryManager::new(
             load_balancer_cache.clone(),
@@ -673,6 +675,7 @@ impl ProxyState {
             crls.clone(),
             adaptive_buffer.clone(),
             env_config_arc.udp_recvmmsg_batch_size,
+            env_config_arc.tcp_fastopen_enabled,
         ));
 
         Ok(Self {
@@ -740,6 +743,25 @@ impl ProxyState {
             overload: Arc::new(crate::overload::OverloadState::new()),
             adaptive_buffer,
         })
+    }
+
+    /// Start a background task that periodically removes stale zero-count
+    /// entries from `per_ip_request_counts`. Normally entries are cleaned via
+    /// the `PerIpRequestGuard` RAII drop, but this sweep catches edge cases
+    /// (e.g., task cancellation without guard drop).
+    pub fn start_per_ip_cleanup_task(&self) {
+        if let Some(ref counts) = self.per_ip_request_counts {
+            let counts = counts.clone();
+            let interval_secs = self.env_config.per_ip_cleanup_interval_seconds.max(1);
+            tokio::spawn(async move {
+                let mut timer =
+                    tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+                loop {
+                    timer.tick().await;
+                    counts.retain(|_, count| count.load(Ordering::Relaxed) > 0);
+                }
+            });
+        }
     }
 
     /// Reconcile stream proxy listeners at startup.
@@ -1330,6 +1352,31 @@ impl ProxyState {
             self.circuit_breaker_cache.prune(&delta.removed_proxy_ids);
         }
 
+        // --- CircuitBreakerCache: prune stale upstream targets ---
+        // Removes breakers for host:port combos no longer in any upstream,
+        // preventing unbounded growth from target churn (e.g., K8s pod cycling).
+        {
+            let mut active_keys = std::collections::HashSet::new();
+            for proxy in &new_config.proxies {
+                if let Some(ref upstream_id) = proxy.upstream_id
+                    && let Some(upstream) =
+                        new_config.upstreams.iter().find(|u| u.id == *upstream_id)
+                {
+                    for target in &upstream.targets {
+                        active_keys
+                            .insert(format!("{}::{}:{}", proxy.id, target.host, target.port));
+                    }
+                }
+            }
+            self.circuit_breaker_cache.prune_stale_targets(&active_keys);
+        }
+
+        // --- HealthChecker: prune passive health state for removed proxies ---
+        if !delta.removed_proxy_ids.is_empty() {
+            self.health_checker
+                .prune_removed_proxies(&delta.removed_proxy_ids);
+        }
+
         // --- DNS warmup for new/modified hostnames ---
         // Collect backend hostnames from added/modified proxies and upstreams
         // so the DNS cache is warm before the first request hits them.
@@ -1697,6 +1744,29 @@ impl ProxyState {
         // --- CircuitBreakerCache ---
         if !delta.removed_proxy_ids.is_empty() {
             self.circuit_breaker_cache.prune(&delta.removed_proxy_ids);
+        }
+
+        // Prune stale upstream targets from circuit breaker cache
+        {
+            let mut active_keys = std::collections::HashSet::new();
+            for proxy in &new_config.proxies {
+                if let Some(ref upstream_id) = proxy.upstream_id
+                    && let Some(upstream) =
+                        new_config.upstreams.iter().find(|u| u.id == *upstream_id)
+                {
+                    for target in &upstream.targets {
+                        active_keys
+                            .insert(format!("{}::{}:{}", proxy.id, target.host, target.port));
+                    }
+                }
+            }
+            self.circuit_breaker_cache.prune_stale_targets(&active_keys);
+        }
+
+        // --- HealthChecker: prune passive health state for removed proxies ---
+        if !delta.removed_proxy_ids.is_empty() {
+            self.health_checker
+                .prune_removed_proxies(&delta.removed_proxy_ids);
         }
 
         // --- DNS warmup for new/modified hostnames ---
@@ -2920,7 +2990,15 @@ pub async fn start_proxy_listener_with_tls(
 /// Create a bound TCP socket with SO_REUSEADDR and SO_REUSEPORT enabled.
 /// Used by the multi-listener accept architecture where N sockets are bound
 /// to the same address, each with its own accept loop.
-fn create_proxy_socket(addr: SocketAddr, backlog: i32) -> Result<TcpListener, anyhow::Error> {
+///
+/// When `tcp_fastopen_queue_len` is `Some(n)`, enables TCP Fast Open on the
+/// listening socket (Linux only), allowing repeat clients with a cached TFO
+/// cookie to send data in the SYN packet (saves 1 RTT).
+fn create_proxy_socket(
+    addr: SocketAddr,
+    backlog: i32,
+    tcp_fastopen_queue_len: Option<u16>,
+) -> Result<TcpListener, anyhow::Error> {
     let socket = socket2::Socket::new(
         if addr.is_ipv6() {
             socket2::Domain::IPV6
@@ -2942,6 +3020,21 @@ fn create_proxy_socket(addr: SocketAddr, backlog: i32) -> Result<TcpListener, an
 
     socket.set_nonblocking(true)?;
     socket.bind(&addr.into())?;
+
+    // TCP_FASTOPEN: enable TFO on the server socket after bind, before listen.
+    // This allows repeat clients to send data in the SYN packet, saving 1 RTT.
+    if let Some(_queue_len) = tcp_fastopen_queue_len {
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            if let Err(e) =
+                crate::socket_opts::set_tcp_fastopen_server(socket.as_raw_fd(), _queue_len as i32)
+            {
+                tracing::warn!("Failed to enable TCP_FASTOPEN on {}: {}", addr, e);
+            }
+        }
+    }
+
     socket.listen(backlog)?;
 
     Ok(TcpListener::from_std(socket.into())?)
@@ -2963,9 +3056,14 @@ pub async fn start_proxy_listener_with_tls_and_signal(
 ) -> Result<(), anyhow::Error> {
     let backlog = state.env_config.tcp_listen_backlog as i32;
     let accept_threads = state.env_config.accept_threads.max(1);
+    let tfo_queue = if state.env_config.tcp_fastopen_enabled {
+        Some(state.env_config.tcp_fastopen_queue_len)
+    } else {
+        None
+    };
 
     // Create the first listener — this one validates that the port is available.
-    let first_listener = create_proxy_socket(addr, backlog)?;
+    let first_listener = create_proxy_socket(addr, backlog, tfo_queue)?;
 
     // Optional connection limit. Shared across all accept threads so the global
     // max_connections limit is enforced regardless of which thread accepted.
@@ -2990,7 +3088,7 @@ pub async fn start_proxy_listener_with_tls_and_signal(
 
         // Spawn additional listeners (threads 1..N-1)
         for i in 1..accept_threads {
-            let listener = create_proxy_socket(addr, backlog)?;
+            let listener = create_proxy_socket(addr, backlog, tfo_queue)?;
             let state = state.clone();
             let tls_config = tls_config.clone();
             let semaphore = conn_semaphore.clone();
@@ -6735,13 +6833,16 @@ fn record_status(state: &ProxyState, status: u16) {
     // fixed set, the entry almost always exists after the first request.
     if let Some(counter) = state.status_counts.get(&status) {
         counter.fetch_add(1, Ordering::Relaxed);
-    } else {
+    } else if state.status_counts.len() < state.env_config.status_counts_max_entries {
+        // Only insert new status codes if under the cap. Prevents unbounded
+        // growth from adversarial backends returning many distinct codes.
         state
             .status_counts
             .entry(status)
             .or_insert_with(|| AtomicU64::new(0))
             .fetch_add(1, Ordering::Relaxed);
     }
+    // else: silently drop — rare status code and map is at capacity
 }
 
 fn record_request(state: &ProxyState, status: u16) {

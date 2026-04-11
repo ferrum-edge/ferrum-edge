@@ -196,6 +196,8 @@ The overload manager (`src/overload.rs`) provides progressive load shedding base
 
 **State transitions are logged**: `warn` when entering overload, `info` when recovering. No log spam — only logs on transitions.
 
+**RED adaptive shedding**: Between the pressure and critical thresholds, the overload manager computes a Random Early Detection (RED) drop probability that ramps linearly. `should_disable_keepalive_red()` uses deterministic golden-ratio hashing for O(1) probabilistic decisions without RNG overhead.
+
 ### External Secret Resolution
 
 The gateway resolves secrets from external providers at startup, before any config is loaded. Env vars with provider-specific suffixes are resolved and the base env var is set:
@@ -279,7 +281,11 @@ src/
 │   ├── gcp.rs                 # Google Cloud Secret Manager
 │   ├── env.rs                 # Environment variable references
 │   └── file.rs                # File-based secrets (Docker Swarm, K8s volume mounts)
+├── date_cache.rs              # Thread-local HTTP Date header caching (per-second refresh)
+├── lazy_timeout.rs            # Lazy-initialized timeout wrapper (defers timer allocation)
+├── socket_opts.rs             # Linux socket optimizations (TCP_FASTOPEN, IP_BIND_ADDRESS_NO_PORT, TCP_INFO)
 ├── tls/                       # TLS/mTLS listener configuration
+├── tls_offload.rs             # TLS handshake offload to dedicated single-threaded runtimes
 ├── http3/                     # HTTP/3 (QUIC) support
 └── custom_plugins/            # Drop-in custom plugins (auto-discovered by build.rs, supports plugin_migrations())
 ```
@@ -292,7 +298,7 @@ src/
 | `Proxy` | A route + backend target | namespace, listen_path, hosts, backend_host/port/protocol, plugins, TLS/DNS/timeout overrides, pool_*, circuit_breaker, retry, response_body_mode, allowed_ws_origins, udp_max_response_amplification_factor, passthrough |
 | `Consumer` | An authenticated client identity | namespace, username, custom_id, credentials (HashMap — each type maps to a single JSON object or an array of objects for multi-credential rotation), acl_groups (Vec), tags |
 | `Upstream` | A load-balanced target group | namespace, targets (host/port/weight/path), algorithm, health_checks |
-| `PluginConfig` | Plugin instance configuration | namespace, name, enabled, config (serde_json::Value), priority_override (Option<u16>) |
+| `PluginConfig` | Plugin instance configuration | namespace, name, enabled, config (serde_json::Value), scope (Global/Proxy/ProxyGroup), proxy_id (Option), priority_override (Option<u16>) |
 | `ServiceDiscoveryConfig` | Dynamic upstream target discovery | provider (dns_sd/kubernetes/consul), poll_interval_seconds, provider-specific settings |
 
 **Namespace isolation**: Every resource (`Proxy`, `Consumer`, `Upstream`, `PluginConfig`) has a `namespace` field (default `"ferrum"`). The gateway instance's `FERRUM_NAMESPACE` env var controls which namespace it loads and proxies. In database mode, all queries filter by namespace. In file mode, resources are filtered post-deserialization. The Admin API uses an `X-Ferrum-Namespace` header (defaults to `"ferrum"` if omitted) to scope all CRUD operations — this allows a CP to manage resources across all namespaces. `GET /namespaces` returns all distinct namespaces in the config/database. Uniqueness constraints (listen_path, proxy name, consumer identity, upstream name, listen_port) are all scoped per-namespace. Different namespaces run on different gateway instances, so the same `listen_port` can be safely reused across namespaces — the OS-level bind at startup catches real conflicts on the actual machine. In the CP/DP gRPC protocol, the DP sends its namespace in `SubscribeRequest` for observability logging.
@@ -401,7 +407,12 @@ TCP/UDP stream proxies bind dedicated ports via `listen_port`. Port conflicts ar
 
 ### Plugin System
 
-Plugins execute in priority order (lower number = runs first). Multiple instances of the same plugin type are supported on a single proxy (e.g., two `http_logging` instances for Splunk and Datadog). Each instance has its own `id`, `config`, and optional `priority_override` to control relative execution order. When a proxy-scoped plugin has the same `plugin_name` as a global plugin, the global instance is replaced — but multiple proxy-scoped instances of the same type coexist.
+Plugins execute in priority order (lower number = runs first). Multiple instances of the same plugin type are supported on a single proxy (e.g., two `http_logging` instances for Splunk and Datadog). Each instance has its own `id`, `config`, and optional `priority_override` to control relative execution order. When a proxy-scoped or proxy-group-scoped plugin has the same `plugin_name` as a global plugin, the global instance is replaced — but multiple scoped instances of the same type coexist.
+
+**Plugin scopes**: Three scopes control which proxies a plugin applies to:
+- **Global** (`scope: "global"`) — runs on ALL proxies. `proxy_id` must be `None`.
+- **Proxy** (`scope: "proxy"`) — runs on exactly ONE proxy. `proxy_id` is required and must match the proxy's ID. Each proxy gets its own plugin instance.
+- **ProxyGroup** (`scope: "proxy_group"`) — runs on a SUBSET of proxies that reference it in their `plugins` association list. `proxy_id` must be `None`. A **single shared plugin instance** (`Arc<dyn Plugin>`) is reused across all associated proxies, so stateful plugins (e.g., `rate_limiting`) share counters across the group. The `proxy_plugins` junction table (SQL) / embedded `plugins` array (MongoDB, file) manages associations. When a proxy is deleted or updated, the association is removed — and if no proxies remain associated, the ProxyGroup plugin config is automatically cascade-deleted (orphan cleanup runs in `delete_proxy` and `update_proxy` within the same transaction).
 
 The lifecycle phases are:
 
@@ -411,7 +422,7 @@ The lifecycle phases are:
 4. `before_proxy` — SSE request shaping (250), SOAP WS-Security (1500), AI semantic cache (2700), request deduplication (2750), Request size limiting (2800), GraphQL (2850), rate limiting (2900), AI prompt shield (2925), body validator (2950), AI request guard (2975), AI federation (2985), request transformer (3000), serverless function (3025), response mock (3030), gRPC deadline (3050), compression (4050)
 5. `on_final_request_body` — Post-transform request body validation. Request size limiting re-checks after request_transformer rewrites. Body validator validates gRPC protobuf requests against descriptors (unary RPCs only, with gzip decompression for compressed frames) and re-checks JSON/XML after request_transformer rewrites
 6. `after_proxy` — SSE response headers (250), AI semantic cache (2700), Response size limiting (3490), response caching (3500), response transformer (4000), compression (4050), CORS headers (100). Rejects are now enforced on the response path across HTTP, HTTP/3, and gRPC
-7. `on_final_response_body` — Post-transform response body hooks. AI semantic cache stores responses, response size limiting, response caching, and response-side body validator operate on the final client-visible body (after response_transformer), not the raw backend body
+7. `on_final_response_body` — Post-transform response body hooks. AI semantic cache stores responses, response size limiting, response caching (includes a cacheability predictor that maintains an LRU of known-uncacheable keys to skip cache lookups for assets that were historically uncacheable), and response-side body validator operate on the final client-visible body (after response_transformer), not the raw backend body
 8. `on_response_body` — AI response guard (4075), AI token metrics (4100), AI rate limiter (4200)
 9. `log` — Stdout logging (9000), StatsD logging (9075), HTTP logging (9100), TCP logging (9125), Kafka logging (9150), Loki logging (9155), UDP logging (9160), WebSocket logging (9175), transaction debugger (9200, `tracing::debug` on `transaction_debug` target), Prometheus (9300), API chargeback (9350), OTel tracing (25)
 10. `on_ws_frame` — WebSocket frame-level hooks: ws_message_size_limiting (2810), ws_rate_limiting (2910), ws_frame_logging (9050)
@@ -480,7 +491,7 @@ tests/
 │   ├── config/                # Config parsing, env vars, TLS, pool config
 │   ├── plugins/               # Per-plugin unit tests
 │   ├── admin/                 # Admin API handler tests
-│   └── gateway_core/          # Router, proxy, consumer index, DNS
+│   └── gateway_core/          # Router, proxy, consumer index, DNS, socket_opts_tests, date_cache_tests, tls_offload_tests, lazy_timeout_tests
 ├── integration/               # mTLS, connection pool, CP/DP gRPC, HTTP/3
 ├── functional/                # End-to-end per mode (file, DB, CP/DP, WebSocket, gRPC, LB)
 └── performance/               # wrk-based load tests with baseline comparison
@@ -691,6 +702,18 @@ These are hard-won findings from profiling. Violating them causes measurable reg
 - **QUIC coalescing is critical**: Small QUIC frames kill performance. The H3 streaming path uses an 8-32KB coalescing buffer with time-based flush (2ms) to batch small chunks into larger QUIC frames.
 - **H2 response coalescing for gRPC and HTTP/2 direct paths**: `CoalescingH2Body` in `src/proxy/body.rs` batches small HTTP/2 DATA frames from hyper's `Incoming` body into 128 KB chunks before forwarding. This is the H2 equivalent of `CoalescingBody` (which wraps reqwest byte streams for HTTP/1.1). The adapter is trailer-safe: when a non-data frame (TRAILERS) arrives while the buffer has unflushed data, it stashes the trailer, flushes the buffer, and returns the stashed trailer on the next poll. This improved gRPC throughput by up to +35% at large payload sizes. Applied to both the gRPC streaming path (`mod.rs:4745`) and HTTP/2 direct pool path (`mod.rs:5653`). **Do not replace this with raw `ProxyBody::streaming_incoming()` — it was removed because the non-coalescing path has measurably worse throughput.**
 - **Linux splice(2) for TCP proxy zero-copy**: On Linux, plaintext TCP connections (both client and backend are raw `TcpStream`) use `splice(2)` to move data between sockets via a kernel-side pipe buffer without copying to userspace. This eliminates two memory copies per chunk (kernel→user read + user→kernel write). Implemented in `src/proxy/tcp_proxy.rs` via `bidirectional_splice()` which creates a pipe per direction and splices in a loop. Applied to: passthrough mode (always plain-to-plain) and non-TLS frontend + plain backend paths. Falls back to `copy_bidirectional` on non-Linux, for TLS paths, and when either side is wrapped in `TlsStream`. Pipe buffers are sized to match the adaptive buffer tier via `F_SETPIPE_SZ`. **Do not use splice with TLS-wrapped streams — splice operates on raw file descriptors and cannot see through encryption.**
+
+**Pingora-inspired optimizations (added in this PR):**
+- **Frequency-aware router cache eviction**: The router cache uses a Count-Min Sketch for frequency estimation instead of random 25% eviction. Hot route entries are protected from eviction by scanner traffic. The sketch uses two FNV-1a hash rows of AtomicU8 counters with periodic aging (right-shift every `cache_capacity * 4` increments). Eviction samples 8x the target count and removes the least-frequent entries.
+- **`IP_BIND_ADDRESS_NO_PORT`** (Linux): Set on all outbound TCP connections in stream proxies. Defers ephemeral port allocation to `connect()` time, enabling kernel 4-tuple optimization and preventing port exhaustion under high connection rates.
+- **`TCP_FASTOPEN`** (Linux): Enabled on proxy listener sockets (`FERRUM_TCP_FASTOPEN_ENABLED`) and outbound stream proxy connections. Saves 1 RTT on repeat connections by sending data in the SYN packet.
+- **Thread-local Date header caching**: `date_cache::get_cached_date()` returns a cached HTTP Date string, refreshed once per second per thread. Avoids `SystemTime::now()` + formatting (~100ns) on every response.
+- **TLS handshake offload runtime**: Optional dedicated single-threaded tokio runtimes (`FERRUM_TLS_OFFLOAD_THREADS`) for CPU-intensive TLS handshakes. Sharded by peer hash for TLS session cache affinity.
+- **RED-style adaptive load shedding**: The overload manager computes a Random Early Detection probability that ramps linearly from 0% at the pressure threshold to 100% at the critical threshold. Provides smoother degradation than the previous step-function.
+- **UDP jitter-based buffer adaptation**: The adaptive buffer tracker now monitors inter-arrival jitter for UDP sessions. When jitter EWMA exceeds 10ms, buffer sizes are bumped up one tier for real-time traffic safety margin.
+- **Lazy timeout wrapper**: `lazy_timeout::lazy_timeout()` defers tokio timer creation until the inner future returns `Pending`. Fast-path operations that complete immediately avoid timer wheel allocation entirely.
+- **Cacheability predictor**: The `response_caching` plugin maintains an LRU of known-uncacheable keys, skipping cache lookups for assets that were historically uncacheable (PREDICTED-BYPASS status).
+- **`TCP_INFO` access**: `socket_opts::get_tcp_info()` retrieves kernel-level RTT, cwnd, and MSS for BDP-optimal buffer sizing on long-lived TCP stream connections (Linux only).
 
 **Resilience features per protocol:**
 
@@ -954,6 +977,9 @@ Reduce per-request allocations in plugin lookup
 | `FERRUM_HTTP_HEADER_READ_TIMEOUT_SECONDS` | `10` | HTTP/1.1 header read timeout in seconds. Protects against slowloris attacks. `0` = disabled |
 | `FERRUM_BACKEND_ALLOW_IPS` | `both` | Backend IP allowlist policy: `private` (only RFC 1918/loopback/link-local/CGNAT), `public` (only non-private), `both` (no restriction) |
 | `FERRUM_MAX_CONCURRENT_REQUESTS_PER_IP` | `0` | Max concurrent proxy requests per resolved client IP. `0` = disabled. Uses trusted proxy XFF resolution |
+| `FERRUM_PER_IP_CLEANUP_INTERVAL_SECONDS` | `60` | Interval in seconds between cleanup sweeps for per-IP request counters. Removes zero-count entries. Only relevant when `FERRUM_MAX_CONCURRENT_REQUESTS_PER_IP > 0` |
+| `FERRUM_CIRCUIT_BREAKER_CACHE_MAX_ENTRIES` | `10000` | Max entries in the circuit breaker cache. Entries are keyed by proxy_id::host:port. Stale entries pruned on config reload. Prevents unbounded growth from target churn |
+| `FERRUM_STATUS_COUNTS_MAX_ENTRIES` | `200` | Max entries in the HTTP status code counters map. Common codes pre-populated at startup. Rare codes create entries up to this cap |
 | `FERRUM_ADMIN_ALLOWED_CIDRS` | (empty) | Comma-separated CIDRs/IPs allowed to connect to admin API. Empty = all allowed |
 | `FERRUM_ADD_VIA_HEADER` | `true` | Add Via header (RFC 9110 §7.6.3) on request and response paths |
 | `FERRUM_VIA_PSEUDONYM` | `ferrum-edge` | Pseudonym in the Via header (e.g., `1.1 ferrum-edge`) |
@@ -966,6 +992,9 @@ Reduce per-request allocations in plugin lookup
 | `FERRUM_OVERLOAD_LOOP_WARN_US` | `10000` | Event loop latency (μs) for warning log |
 | `FERRUM_OVERLOAD_LOOP_CRITICAL_US` | `500000` | Event loop latency (μs) to reject new connections |
 | `FERRUM_SHUTDOWN_DRAIN_SECONDS` | `30` | Seconds to wait for in-flight connections to drain on shutdown. `0` = immediate |
+| `FERRUM_TCP_FASTOPEN_ENABLED` | `true` | Enable TCP Fast Open on proxy listener sockets (Linux only). Saves 1 RTT for repeat clients |
+| `FERRUM_TCP_FASTOPEN_QUEUE_LEN` | `256` | TCP Fast Open pending connection queue length |
+| `FERRUM_TLS_OFFLOAD_THREADS` | `0` | Dedicated TLS handshake offload threads (0 = disabled). Total threads = value (shards auto-computed). Isolates CPU-intensive TLS handshakes from the main event loop |
 
 See `src/config/env_config.rs` for the full list of 90+ environment variables.
 

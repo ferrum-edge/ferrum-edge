@@ -407,6 +407,16 @@ impl HealthChecker {
         }
     }
 
+    /// Remove passive health state for proxies that have been deleted from
+    /// config. Prevents the outer `passive_health` DashMap from growing
+    /// unboundedly as proxies are added and removed over the gateway's lifetime.
+    /// Called from `ProxyState::update_config()` alongside circuit breaker pruning.
+    pub fn prune_removed_proxies(&self, removed_proxy_ids: &[String]) {
+        for id in removed_proxy_ids {
+            self.passive_health.remove(id);
+        }
+    }
+
     /// Start a background timer that automatically restores passively-marked
     /// unhealthy targets after `healthy_after_seconds`.
     fn start_passive_recovery_timer(

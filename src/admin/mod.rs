@@ -3544,23 +3544,29 @@ async fn handle_batch_create(
 
         for assoc in &proxy.plugins {
             match batch_plugin_configs.get(assoc.plugin_config_id.as_str()) {
-                Some(plugin_config) => {
-                    if plugin_config.scope != PluginScope::Proxy {
+                Some(plugin_config) => match plugin_config.scope {
+                    PluginScope::Global => {
                         validation_errors.push(format!(
-                            "Proxy '{}' references plugin_config '{}' with scope 'global' — proxy associations may only reference proxy-scoped plugin configs",
+                            "Proxy '{}' references plugin_config '{}' with scope 'global' — proxy associations may only reference proxy-scoped or proxy_group-scoped plugin configs",
                             proxy.id, plugin_config.id
                         ));
                         continue;
                     }
-                    if plugin_config.proxy_id.as_deref() != Some(proxy.id.as_str()) {
-                        validation_errors.push(format!(
-                            "Proxy '{}' references plugin_config '{}' targeted to proxy '{}'",
-                            proxy.id,
-                            plugin_config.id,
-                            plugin_config.proxy_id.as_deref().unwrap_or("<none>")
-                        ));
+                    PluginScope::Proxy => {
+                        if plugin_config.proxy_id.as_deref() != Some(proxy.id.as_str()) {
+                            validation_errors.push(format!(
+                                "Proxy '{}' references plugin_config '{}' targeted to proxy '{}'",
+                                proxy.id,
+                                plugin_config.id,
+                                plugin_config.proxy_id.as_deref().unwrap_or("<none>")
+                            ));
+                        }
                     }
-                }
+                    PluginScope::ProxyGroup => {
+                        // ProxyGroup plugins have no proxy_id — any proxy can
+                        // reference them via its plugins association list.
+                    }
+                },
                 None => unresolved.push(assoc.clone()),
             }
         }
