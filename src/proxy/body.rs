@@ -362,6 +362,9 @@ pub(crate) struct CoalescingBody<S> {
     inner: S,
     buffer: BytesMut,
     done: bool,
+    /// Error stashed while flushing buffered data. Returned on the next
+    /// `poll_frame` call after the buffer has been drained.
+    stashed_error: Option<ProxyBodyError>,
     /// Exact body length from Content-Length (if known). Forwarded via
     /// `size_hint()` so hyper writes a Content-Length response instead of
     /// chunked encoding.
@@ -386,6 +389,7 @@ pub(crate) fn coalescing_body(
         inner: stream,
         buffer: BytesMut::new(),
         done: false,
+        stashed_error: None,
         content_length,
     };
     ProxyBody::Stream(Box::pin(body))
@@ -408,6 +412,10 @@ where
             // Flush any remaining buffered data after stream ended
             if !this.buffer.is_empty() {
                 return Poll::Ready(Some(Ok(Frame::data(this.buffer.split().freeze()))));
+            }
+            // Return stashed error (set when an error arrived with buffered data).
+            if let Some(err) = this.stashed_error.take() {
+                return Poll::Ready(Some(Err(err)));
             }
             return Poll::Ready(None);
         }
@@ -438,14 +446,10 @@ where
                     this.done = true;
                     // Flush any buffered data before surfacing the error so
                     // already-received bytes aren't silently dropped. The
-                    // error will be returned on the next poll_frame() call
-                    // (done=true causes the body to end).
+                    // error is stashed and returned on the next poll_frame()
+                    // call after the buffer has been drained.
                     if !this.buffer.is_empty() {
-                        // Store the error for the next poll — we can't return
-                        // both data and error in one frame. Since done=true,
-                        // the next poll will return None (stream end). The
-                        // client sees a truncated body which hyper will detect
-                        // as a content-length mismatch and surface as an error.
+                        this.stashed_error = Some(e);
                         return Poll::Ready(Some(Ok(Frame::data(this.buffer.split().freeze()))));
                     }
                     return Poll::Ready(Some(Err(e)));
@@ -469,7 +473,7 @@ where
     }
 
     fn is_end_stream(&self) -> bool {
-        self.done && self.buffer.is_empty()
+        self.done && self.buffer.is_empty() && self.stashed_error.is_none()
     }
 
     fn size_hint(&self) -> http_body::SizeHint {
@@ -503,6 +507,9 @@ pub(crate) struct CoalescingH2Body {
     /// Stashed non-data frame (trailer) that arrived while buffer was non-empty.
     /// Returned on the next poll_frame call after the buffer is flushed.
     stashed_trailer: Option<Frame<Bytes>>,
+    /// Error stashed while flushing buffered data. Returned on the next
+    /// `poll_frame` call after the buffer has been drained.
+    stashed_error: Option<hyper::Error>,
     /// Exact body length from Content-Length (if known). Forwarded via
     /// `size_hint()` so hyper can write a Content-Length response.
     content_length: Option<u64>,
@@ -527,6 +534,7 @@ pub(crate) fn coalescing_h2_body(
         buffer: BytesMut::new(),
         done: false,
         stashed_trailer: None,
+        stashed_error: None,
         content_length,
         coalesce_target,
     };
@@ -554,6 +562,10 @@ impl http_body::Body for CoalescingH2Body {
             // Flush any remaining buffered data after stream ended
             if !this.buffer.is_empty() {
                 return Poll::Ready(Some(Ok(Frame::data(this.buffer.split().freeze()))));
+            }
+            // Return stashed error (set when an error arrived with buffered data).
+            if let Some(err) = this.stashed_error.take() {
+                return Poll::Ready(Some(Err(err)));
             }
             return Poll::Ready(None);
         }
@@ -593,7 +605,12 @@ impl http_body::Body for CoalescingH2Body {
                 }
                 Poll::Ready(Some(Err(e))) => {
                     this.done = true;
+                    // Flush any buffered data before surfacing the error so
+                    // already-received bytes aren't silently dropped. The
+                    // error is stashed and returned on the next poll_frame()
+                    // call after the buffer has been drained.
                     if !this.buffer.is_empty() {
+                        this.stashed_error = Some(e);
                         return Poll::Ready(Some(Ok(Frame::data(this.buffer.split().freeze()))));
                     }
                     return Poll::Ready(Some(Err(e)));
@@ -617,7 +634,10 @@ impl http_body::Body for CoalescingH2Body {
     }
 
     fn is_end_stream(&self) -> bool {
-        self.done && self.buffer.is_empty() && self.stashed_trailer.is_none()
+        self.done
+            && self.buffer.is_empty()
+            && self.stashed_trailer.is_none()
+            && self.stashed_error.is_none()
     }
 
     fn size_hint(&self) -> http_body::SizeHint {

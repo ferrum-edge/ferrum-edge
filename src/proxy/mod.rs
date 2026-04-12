@@ -151,12 +151,12 @@ fn is_websocket_upgrade(req: &Request<Incoming>) -> bool {
 ///
 /// RFC 6455 §4.1 requires the key to be exactly 16 bytes of random data,
 /// base64-encoded to 24 characters (16 bytes → 22 base64 chars + 2 padding `=`).
-/// We accept any valid base64 that decodes to exactly 16 bytes.
 pub fn is_valid_websocket_key(key: &str) -> bool {
     use base64::Engine;
-    base64::engine::general_purpose::STANDARD
-        .decode(key)
-        .is_ok_and(|bytes| bytes.len() == 16)
+    key.len() == 24
+        && base64::engine::general_purpose::STANDARD
+            .decode(key)
+            .is_ok_and(|bytes| bytes.len() == 16)
 }
 
 /// Parse an HTTP method string into a `reqwest::Method`.
