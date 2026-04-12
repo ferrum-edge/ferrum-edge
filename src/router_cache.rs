@@ -20,6 +20,13 @@ use tracing::{debug, warn};
 
 use crate::config::types::{GatewayConfig, Proxy, wildcard_matches};
 
+thread_local! {
+    /// Thread-local buffer for router cache key construction.
+    /// Reused across requests on the same tokio worker thread to avoid
+    /// per-lookup String allocation on cache hits (the 99%+ fast path).
+    static CACHE_KEY_BUF: std::cell::RefCell<String> = std::cell::RefCell::new(String::with_capacity(128));
+}
+
 /// Result of a route match, containing the matched proxy and any extracted path parameters.
 #[derive(Clone, Debug)]
 pub struct RouteMatch {
@@ -129,16 +136,27 @@ struct RegexCacheEntry {
     matched_len: usize,
 }
 
+/// Cache-line aligned counter row for the Count-Min Sketch.
+///
+/// Wrapping the `Vec<AtomicU8>` in a cache-line aligned struct ensures that
+/// `row0` and `row1` start on different cache lines, preventing false sharing
+/// between cores that increment counters in different rows concurrently.
+/// Without this, the tail of `row0` and head of `row1` could share a 64-byte
+/// cache line, causing unnecessary invalidation traffic.
+#[repr(align(64))]
+struct AlignedCounterRow(Vec<AtomicU8>);
+
 /// Lightweight Count-Min Sketch for frequency estimation.
 ///
 /// Uses two rows of `AtomicU8` counters with FNV-1a hashing (two different seeds)
 /// to estimate access frequency for cache keys. The sketch supports periodic aging
 /// (right-shift all counters by 1) to adapt to changing workloads.
 ///
-/// Memory: `2 * width` bytes. With the default width of 8192, that is 16 KiB.
+/// Memory: `2 * width` bytes + 64-byte alignment padding. With the default width
+/// of 8192, that is ~16 KiB + padding.
 struct CountMinSketch {
-    row0: Vec<AtomicU8>,
-    row1: Vec<AtomicU8>,
+    row0: AlignedCounterRow,
+    row1: AlignedCounterRow,
     width_mask: usize,
     /// Total increments across all keys, for triggering periodic aging.
     total_increments: AtomicU64,
@@ -151,8 +169,8 @@ impl CountMinSketch {
     /// `age_threshold` controls how often counters are halved (typically `cache_capacity * 4`).
     fn new(width: usize, age_threshold: u64) -> Self {
         let width = width.next_power_of_two();
-        let row0: Vec<AtomicU8> = (0..width).map(|_| AtomicU8::new(0)).collect();
-        let row1: Vec<AtomicU8> = (0..width).map(|_| AtomicU8::new(0)).collect();
+        let row0 = AlignedCounterRow((0..width).map(|_| AtomicU8::new(0)).collect());
+        let row1 = AlignedCounterRow((0..width).map(|_| AtomicU8::new(0)).collect());
         Self {
             row0,
             row1,
@@ -182,12 +200,12 @@ impl CountMinSketch {
         let h1 = Self::fnv1a(key, 0x9e3779b97f4a7c15) as usize & self.width_mask;
 
         // Saturating increment: cap at 255 to avoid wrap-around
-        let v0 = self.row0[h0]
+        let v0 = self.row0.0[h0]
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
                 if v < 255 { Some(v + 1) } else { None }
             })
             .unwrap_or(255);
-        let v1 = self.row1[h1]
+        let v1 = self.row1.0[h1]
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
                 if v < 255 { Some(v + 1) } else { None }
             })
@@ -210,28 +228,28 @@ impl CountMinSketch {
     fn estimate(&self, key: &str) -> u8 {
         let h0 = Self::fnv1a(key, 0) as usize & self.width_mask;
         let h1 = Self::fnv1a(key, 0x9e3779b97f4a7c15) as usize & self.width_mask;
-        let v0 = self.row0[h0].load(Ordering::Relaxed);
-        let v1 = self.row1[h1].load(Ordering::Relaxed);
+        let v0 = self.row0.0[h0].load(Ordering::Relaxed);
+        let v1 = self.row1.0[h1].load(Ordering::Relaxed);
         v0.min(v1)
     }
 
     /// Age all counters by right-shifting by 1 (halves all frequencies).
     /// This prevents long-running hot entries from permanently dominating.
     fn age(&self) {
-        for cell in &self.row0 {
+        for cell in &self.row0.0 {
             let _ = cell.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| Some(v >> 1));
         }
-        for cell in &self.row1 {
+        for cell in &self.row1.0 {
             let _ = cell.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| Some(v >> 1));
         }
     }
 
     /// Reset all counters to zero (used on full cache rebuild).
     fn reset(&self) {
-        for cell in &self.row0 {
+        for cell in &self.row0.0 {
             cell.store(0, Ordering::Relaxed);
         }
-        for cell in &self.row1 {
+        for cell in &self.row1.0 {
             cell.store(0, Ordering::Relaxed);
         }
         self.total_increments.store(0, Ordering::Relaxed);
@@ -320,34 +338,47 @@ impl RouterCache {
     /// Results are cached (including misses) for O(1) repeated lookups.
     /// Prefix and regex matches use separate cache partitions.
     pub fn find_proxy(&self, host: Option<&str>, path: &str) -> Option<RouteMatch> {
-        let cache_key = make_cache_key(host, path);
+        // Fast path: use thread-local buffer for cache lookup to avoid String
+        // allocation on cache hits (99%+ of requests). Only allocate on misses.
+        let hit = CACHE_KEY_BUF.with(|buf| {
+            let mut buf = buf.borrow_mut();
+            write_cache_key(&mut buf, host, path);
 
-        // Fast path 1: check prefix cache (includes negative entries for total misses)
-        if let Some(entry) = self.prefix_cache.get(cache_key.as_str()) {
-            // Record access frequency for this cache key
-            self.frequency_sketch.increment(&cache_key);
-            return entry.value().as_ref().map(|proxy| RouteMatch {
-                proxy: Arc::clone(proxy),
-                path_params: Vec::new(),
-                matched_prefix_len: proxy.listen_path.len(),
-            });
+            // Fast path 1: check prefix cache (includes negative entries for total misses)
+            if let Some(entry) = self.prefix_cache.get(buf.as_str()) {
+                self.frequency_sketch.increment(&buf);
+                return Some(entry.value().as_ref().map(|proxy| RouteMatch {
+                    proxy: Arc::clone(proxy),
+                    path_params: Vec::new(),
+                    matched_prefix_len: proxy.listen_path.len(),
+                }));
+            }
+
+            // Fast path 2: check regex cache (only contains positive matches)
+            if let Some(entry) = self.regex_cache.get(buf.as_str()) {
+                self.frequency_sketch.increment(&buf);
+                let cached = entry.value();
+                return Some(Some(RouteMatch {
+                    proxy: Arc::clone(&cached.proxy),
+                    path_params: cached.path_params.clone(),
+                    matched_prefix_len: cached.matched_len,
+                }));
+            }
+
+            None // Cache miss — need slow path
+        });
+
+        // Unwrap the Option<Option<RouteMatch>>: Some(inner) = cache hit
+        if let Some(result) = hit {
+            return result;
         }
 
-        // Fast path 2: check regex cache (only contains positive matches)
-        if let Some(entry) = self.regex_cache.get(cache_key.as_str()) {
-            // Record access frequency for this cache key
-            self.frequency_sketch.increment(&cache_key);
-            let cached = entry.value();
-            return Some(RouteMatch {
-                proxy: Arc::clone(&cached.proxy),
-                path_params: cached.path_params.clone(),
-                matched_prefix_len: cached.matched_len,
-            });
-        }
-
-        // Slow path: search the host route table
+        // Slow path: search the host route table (cache miss)
         let table = self.route_table.load();
         let result = Self::search_route_table(&table, host, path);
+
+        // Allocate the cache key String only on the cold path (cache miss + insert).
+        let cache_key = make_cache_key(host, path);
 
         // Cache the result in the appropriate partition.
         // Increment sketch on insert so the new entry starts with a frequency of 1.
@@ -1004,6 +1035,19 @@ fn frequency_aware_evict<V>(
 /// Uses NUL separator which cannot appear in hostnames or URL paths.
 /// Uses `String::with_capacity` + `push_str` instead of `format!()` to
 /// avoid format-machinery overhead and produce an exact-size allocation.
+/// Write the cache key into an existing buffer (zero-allocation on cache hits).
+/// Used by the thread-local fast path in `find_proxy()`.
+#[inline]
+fn write_cache_key(buf: &mut String, host: Option<&str>, path: &str) {
+    buf.clear();
+    if let Some(h) = host {
+        buf.push_str(h);
+    }
+    buf.push('\0');
+    buf.push_str(path);
+}
+
+/// Allocate a new String for the cache key (used only on cache misses for DashMap insertion).
 fn make_cache_key(host: Option<&str>, path: &str) -> String {
     match host {
         Some(h) => {

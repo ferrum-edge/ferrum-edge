@@ -4354,19 +4354,12 @@ pub async fn handle_proxy_request(
     let proxy_headers: &HashMap<String, String> =
         owned_proxy_headers.as_ref().unwrap_or(&ctx.headers);
 
-    // Resolve the consistent-hashing key for upstream target selection and retries.
-    // Pre-computed here so all code paths (initial select, WS/gRPC/HTTP retries) share the same key.
-    let lb_hash_key = if let Some(upstream_id) = &proxy.upstream_id {
-        let strategy = state.load_balancer_cache.get_hash_on_strategy(upstream_id);
-        let (key, needs_set) = resolve_hash_key(&strategy, &ctx.client_ip, proxy_headers);
-        (key, needs_set)
-    } else {
-        (ctx.client_ip.clone(), false)
-    };
-
-    // Resolve upstream target if load balancing is configured.
-    // Done before protocol dispatch so all protocols (HTTP, gRPC, WebSocket) can use it.
-    let (upstream_target, upstream_is_fallback, sticky_cookie_needed) = if let Some(upstream_id) =
+    // Resolve upstream target and hash key with a single ArcSwap load.
+    // Loads the balancers map once and reuses it for both hash-on strategy
+    // lookup and target selection, saving one atomic operation per request.
+    let (lb_hash_key, upstream_target, upstream_is_fallback, sticky_cookie_needed) = if let Some(
+        upstream_id,
+    ) =
         &proxy.upstream_id
     {
         let proxy_passive = state
@@ -4378,9 +4371,19 @@ pub async fn handle_proxy_request(
             active_unhealthy: &state.health_checker.active_unhealthy_targets,
             proxy_passive: proxy_passive.clone(),
         };
-        match state.load_balancer_cache.select_target(
+
+        // Single ArcSwap load for both strategy + selection
+        let balancers = state.load_balancer_cache.load();
+        let strategy = crate::load_balancer::LoadBalancerCache::get_hash_on_strategy_from(
+            &balancers,
             upstream_id,
-            &lb_hash_key.0,
+        );
+        let (hash_key, needs_set) = resolve_hash_key(&strategy, &ctx.client_ip, proxy_headers);
+
+        match crate::load_balancer::LoadBalancerCache::select_target_from(
+            &balancers,
+            upstream_id,
+            &hash_key,
             Some(&health_ctx),
         ) {
             Some(selection) => {
@@ -4401,15 +4404,20 @@ pub async fn handle_proxy_request(
                         "Upstream target selected"
                     );
                 }
-                (Some(selection.target), selection.is_fallback, lb_hash_key.1)
+                (
+                    (hash_key, needs_set),
+                    Some(selection.target),
+                    selection.is_fallback,
+                    needs_set,
+                )
             }
             None => {
                 warn!(proxy_id = %proxy.id, upstream_id = %upstream_id, "No upstream target available");
-                (None, false, false)
+                ((hash_key, needs_set), None, false, false)
             }
         }
     } else {
-        (None, false, false)
+        ((ctx.client_ip.clone(), false), None, false, false)
     };
 
     // Circuit breaker check — per-target when upstream is configured, per-proxy otherwise

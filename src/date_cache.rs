@@ -31,20 +31,18 @@ thread_local! {
     }) };
 }
 
-/// Get the current HTTP Date header value.
+/// Get the current HTTP Date header value as a fixed-size byte array.
 ///
-/// Returns a cached string that is refreshed at most once per second per thread.
+/// Returns a cached 29-byte array that is refreshed at most once per second per thread.
 /// Cost: one `SystemTime::now()` (~25ns) + one integer comparison + a 29-byte
 /// stack copy on cache hit. Full formatting (~100ns) only runs when the second
 /// rolls over.
 ///
-/// # Example
-/// ```
-/// let date = ferrum_edge::date_cache::get_cached_date();
-/// assert!(date.contains("GMT"));
-/// ```
+/// **Zero allocation**: Returns `[u8; 29]` (Copy) instead of String.
+/// Callers can pass this directly to `HeaderValue::from_bytes()` without allocating.
 #[allow(dead_code)] // Public API for response Date header injection
-pub fn get_cached_date() -> String {
+#[inline]
+pub fn get_cached_date_bytes() -> [u8; HTTP_DATE_LEN] {
     let now = SystemTime::now();
     let epoch_secs = now
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -61,9 +59,24 @@ pub fn get_cached_date() -> String {
             c.epoch_second = epoch_secs;
             cache.set(c);
         }
-        // The HTTP Date format is always valid ASCII, so from_utf8 cannot fail.
-        // Use from_utf8_lossy to avoid unsafe while keeping zero-cost for valid input.
-        String::from_utf8(c.bytes.to_vec())
-            .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
+        c.bytes
     })
+}
+
+/// Get the current HTTP Date header value as a String.
+///
+/// Convenience wrapper around [`get_cached_date_bytes`] for callers that need
+/// a `String`. Prefer `get_cached_date_bytes()` on hot paths to avoid allocation.
+///
+/// # Example
+/// ```
+/// let date = ferrum_edge::date_cache::get_cached_date();
+/// assert!(date.contains("GMT"));
+/// ```
+#[allow(dead_code)] // Public API for response Date header injection
+pub fn get_cached_date() -> String {
+    let bytes = get_cached_date_bytes();
+    // HTTP Date format is always valid ASCII, so from_utf8 cannot fail.
+    String::from_utf8(bytes.to_vec())
+        .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
 }

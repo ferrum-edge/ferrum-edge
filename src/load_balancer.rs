@@ -9,6 +9,18 @@ use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
+
+/// Fibonacci / golden-ratio hash for fast pseudo-random distribution of sequential counters.
+/// Maps sequential u64 inputs to well-distributed outputs across the full u64 range.
+/// Used by the Random load balancer algorithm instead of SipHash (DefaultHasher) for
+/// ~10x faster selection (~1-2ns vs ~15-25ns per call).
+///
+/// Same technique used in `overload.rs` for RED shedding and in the Linux kernel's
+/// hash_long() for hash table slot selection.
+#[inline]
+fn golden_ratio_hash(val: u64) -> u64 {
+    val.wrapping_mul(0x9E3779B97F4A7C15)
+}
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
@@ -277,6 +289,40 @@ impl LoadBalancerCache {
         balancer.select(ctx_key, health)
     }
 
+    /// Load the balancers map once and return a guard for multiple lookups.
+    ///
+    /// Use this when you need both `get_hash_on_strategy()` and `select_target()`
+    /// for the same upstream — saves one `ArcSwap::load()` atomic operation per
+    /// request by loading the balancers map once and reusing the guard.
+    #[inline]
+    pub fn load(&self) -> arc_swap::Guard<Arc<HashMap<String, Arc<LoadBalancer>>>> {
+        self.balancers.load()
+    }
+
+    /// Get the hash-on strategy from a pre-loaded balancers guard.
+    #[inline]
+    pub fn get_hash_on_strategy_from(
+        balancers: &HashMap<String, Arc<LoadBalancer>>,
+        upstream_id: &str,
+    ) -> HashOnStrategy {
+        balancers
+            .get(upstream_id)
+            .map(|b| b.hash_on_strategy.clone())
+            .unwrap_or(HashOnStrategy::Ip)
+    }
+
+    /// Select a target from a pre-loaded balancers guard.
+    #[inline]
+    pub fn select_target_from(
+        balancers: &HashMap<String, Arc<LoadBalancer>>,
+        upstream_id: &str,
+        ctx_key: &str,
+        health: Option<&HealthContext<'_>>,
+    ) -> Option<TargetSelection> {
+        let balancer = balancers.get(upstream_id)?;
+        balancer.select(ctx_key, health)
+    }
+
     /// Select next target, excluding a previously tried target (for retries).
     pub fn select_next_target(
         &self,
@@ -400,6 +446,11 @@ pub struct LoadBalancer {
     /// active_connections, latency_ewma, and find_target_key lookups that are
     /// already scoped to this LoadBalancer instance.
     host_port_keys: Vec<String>,
+    /// O(1) reverse lookup from "host:port" string to index in `targets`/`host_port_keys`.
+    /// Replaces the O(n) linear scan in `find_target_key()`. Keys are the same
+    /// "host:port" format as `host_port_keys`, enabling zero-allocation lookup
+    /// via `write!()` into a thread-local buffer.
+    target_index: HashMap<String, usize>,
     algorithm: LoadBalancerAlgorithm,
     /// Round-robin counter.
     rr_counter: AtomicU64,
@@ -464,10 +515,18 @@ impl LoadBalancer {
 
         let hash_on_strategy = HashOnStrategy::parse(hash_on.as_deref());
 
+        // Pre-compute O(1) reverse index from "host:port" → index for find_target_key()
+        let target_index: HashMap<String, usize> = host_port_keys
+            .iter()
+            .enumerate()
+            .map(|(i, k)| (k.clone(), i))
+            .collect();
+
         Self {
             targets: targets.iter().cloned().map(Arc::new).collect(),
             target_keys,
             host_port_keys,
+            target_index,
             algorithm,
             rr_counter: AtomicU64::new(0),
             wrr_state: std::sync::Mutex::new(wrr_weights),
@@ -578,20 +637,70 @@ impl LoadBalancer {
         }
     }
 
-    /// Find the pre-computed host:port key for a target without allocating.
+    /// Find the pre-computed host:port key for a target via O(1) HashMap lookup.
     /// Returns the internal (non-upstream-scoped) key used for active connections,
     /// latency EWMA, and hash ring lookups within this LoadBalancer instance.
+    ///
+    /// Uses a thread-local buffer to construct the lookup key without allocation.
+    #[inline]
     fn find_target_key(&self, target: &UpstreamTarget) -> Option<&str> {
-        for (i, t) in self.targets.iter().enumerate() {
-            if t.host == target.host && t.port == target.port {
-                return Some(self.host_port_keys[i].as_str());
+        use std::fmt::Write;
+        thread_local! {
+            static TARGET_KEY_BUF: std::cell::RefCell<String> =
+                std::cell::RefCell::new(String::with_capacity(64));
+        }
+        TARGET_KEY_BUF.with(|buf| {
+            let mut buf = buf.borrow_mut();
+            buf.clear();
+            let _ = write!(buf, "{}:{}", target.host, target.port);
+            self.target_index
+                .get(buf.as_str())
+                .map(|&i| self.host_port_keys[i].as_str())
+        })
+    }
+
+    /// Check if a target at the given index is healthy.
+    #[inline]
+    fn is_target_healthy(&self, i: usize, health: &HealthContext<'_>) -> bool {
+        // Active: pre-computed "upstream_id::host:port" key
+        if health.active_unhealthy.contains_key(&self.target_keys[i]) {
+            return false;
+        }
+        // Passive: direct "host:port" lookup in proxy's own map
+        if health
+            .proxy_passive
+            .as_ref()
+            .is_some_and(|ps| ps.unhealthy.contains_key(&self.host_port_keys[i]))
+        {
+            return false;
+        }
+        true
+    }
+
+    /// Check if all targets are healthy (fast O(n) scan without allocation).
+    /// Returns true when no targets are marked unhealthy, allowing `select()`
+    /// to skip the filtered Vec allocation on the common path.
+    #[inline]
+    fn all_targets_healthy(&self, health: Option<&HealthContext<'_>>) -> bool {
+        match health {
+            None => true,
+            Some(h) => {
+                // Fast check: if both health maps are empty, all targets are healthy
+                if h.active_unhealthy.is_empty()
+                    && h.proxy_passive
+                        .as_ref()
+                        .is_none_or(|ps| ps.unhealthy.is_empty())
+                {
+                    return true;
+                }
+                (0..self.targets.len()).all(|i| self.is_target_healthy(i, h))
             }
         }
-        None
     }
 
     /// Collect healthy targets into a Vec for selection by any algorithm.
     ///
+    /// Only called when some targets are actually unhealthy (the uncommon path).
     /// A target is unhealthy if it appears in EITHER:
     /// - The active unhealthy map (upstream-wide probe failure) — checked via
     ///   pre-computed `target_keys` ("upstream_id::host:port"), O(1) DashMap lookup.
@@ -599,29 +708,11 @@ impl LoadBalancer {
     ///   via pre-computed `host_port_keys` ("host:port"), O(1) inner DashMap lookup.
     ///   The outer DashMap lookup (by proxy_id) is done once at the call site and
     ///   the resolved `ProxyHealthState` is passed in via `HealthContext`.
-    fn healthy_targets(
-        &self,
-        health: Option<&HealthContext<'_>>,
-    ) -> Vec<(usize, &Arc<UpstreamTarget>)> {
+    fn healthy_targets(&self, health: &HealthContext<'_>) -> Vec<(usize, &Arc<UpstreamTarget>)> {
         self.targets
             .iter()
             .enumerate()
-            .filter(|(i, _)| {
-                if let Some(h) = health {
-                    // Active: pre-computed "upstream_id::host:port" key
-                    if h.active_unhealthy.contains_key(&self.target_keys[*i]) {
-                        return false;
-                    }
-                    // Passive: direct "host:port" lookup in proxy's own map
-                    if h.proxy_passive
-                        .as_ref()
-                        .is_some_and(|ps| ps.unhealthy.contains_key(&self.host_port_keys[*i]))
-                    {
-                        return false;
-                    }
-                }
-                true
-            })
+            .filter(|(i, _)| self.is_target_healthy(*i, health))
             .collect()
     }
 
@@ -630,12 +721,25 @@ impl LoadBalancer {
         ctx_key: &str,
         health: Option<&HealthContext<'_>>,
     ) -> Option<TargetSelection> {
-        let healthy = self.healthy_targets(health);
+        if self.targets.is_empty() {
+            return None;
+        }
+
+        // Fast path: when all targets are healthy (the common case ~99%+),
+        // skip the filtered Vec allocation and use all targets directly.
+        if self.all_targets_healthy(health) {
+            return self.select_from_all(ctx_key).map(|target| TargetSelection {
+                target,
+                is_fallback: false,
+            });
+        }
+
+        // Slow path: some targets are unhealthy — allocate filtered Vec.
+        // health is guaranteed Some here since all_targets_healthy(None) always returns true.
+        let h = health.unwrap();
+        let healthy = self.healthy_targets(h);
         if healthy.is_empty() {
-            // Fallback: try all targets if everything is unhealthy
-            if self.targets.is_empty() {
-                return None;
-            }
+            // All targets unhealthy — degraded mode fallback
             return self.select_from_all(ctx_key).map(|target| TargetSelection {
                 target,
                 is_fallback: true,
@@ -655,9 +759,7 @@ impl LoadBalancer {
             }
             LoadBalancerAlgorithm::Random => {
                 let idx = self.rr_counter.fetch_add(1, Ordering::Relaxed);
-                let mut hasher = DefaultHasher::new();
-                idx.hash(&mut hasher);
-                let hash = hasher.finish() as usize;
+                let hash = golden_ratio_hash(idx) as usize;
                 Some(Arc::clone(healthy[hash % healthy.len()].1))
             }
         };
@@ -673,9 +775,14 @@ impl LoadBalancer {
             return None;
         }
         match self.algorithm {
-            LoadBalancerAlgorithm::RoundRobin | LoadBalancerAlgorithm::Random => {
+            LoadBalancerAlgorithm::RoundRobin => {
                 let idx = self.rr_counter.fetch_add(1, Ordering::Relaxed) as usize;
                 Some(Arc::clone(&self.targets[idx % self.targets.len()]))
+            }
+            LoadBalancerAlgorithm::Random => {
+                let idx = self.rr_counter.fetch_add(1, Ordering::Relaxed);
+                let hash = golden_ratio_hash(idx) as usize;
+                Some(Arc::clone(&self.targets[hash % self.targets.len()]))
             }
             LoadBalancerAlgorithm::WeightedRoundRobin => {
                 let all: Vec<(usize, &Arc<UpstreamTarget>)> =
@@ -753,9 +860,14 @@ impl LoadBalancer {
         }
 
         match self.algorithm {
-            LoadBalancerAlgorithm::RoundRobin | LoadBalancerAlgorithm::Random => {
+            LoadBalancerAlgorithm::RoundRobin => {
                 let idx = self.rr_counter.fetch_add(1, Ordering::Relaxed) as usize;
                 Some(Arc::clone(healthy[idx % healthy.len()].1))
+            }
+            LoadBalancerAlgorithm::Random => {
+                let idx = self.rr_counter.fetch_add(1, Ordering::Relaxed);
+                let hash = golden_ratio_hash(idx) as usize;
+                Some(Arc::clone(healthy[hash % healthy.len()].1))
             }
             LoadBalancerAlgorithm::WeightedRoundRobin => self.select_wrr(&healthy),
             LoadBalancerAlgorithm::LeastConnections => self.select_least_connections(&healthy),

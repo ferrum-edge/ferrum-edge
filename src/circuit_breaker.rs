@@ -49,6 +49,12 @@ impl CircuitBreaker {
 
     /// Check if a request can proceed. Returns Err if circuit is open.
     pub fn can_execute(&self) -> Result<(), CircuitOpenError> {
+        // Acquire pairs with the Release in record_failure() when transitioning
+        // CLOSED → OPEN, ensuring visibility of last_failure_epoch_ms and
+        // failure_count. Using Relaxed here would risk stale reads on ARM/weak-
+        // memory architectures, allowing requests to leak through after the
+        // circuit opens. The ~5-15ns cost of Acquire is acceptable given that
+        // circuit breaker checks are not the bottleneck at scale.
         let state = self.state.load(Ordering::Acquire);
         match state {
             STATE_CLOSED => Ok(()),
