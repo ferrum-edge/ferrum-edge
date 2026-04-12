@@ -127,6 +127,11 @@ pub async fn start_dp_client_with_shutdown_and_startup_ready(
     namespace: String,
     primary_retry_secs: u64,
 ) {
+    if cp_urls.is_empty() {
+        error!("No CP URLs configured — cannot start DP client");
+        return;
+    }
+
     let node_id = uuid::Uuid::new_v4().to_string();
     let cp_count = cp_urls.len();
 
@@ -183,7 +188,14 @@ pub async fn start_dp_client_with_shutdown_and_startup_ready(
 
         // When connected to a fallback CP and primary_retry_secs > 0,
         // race the stream against a timer to periodically retry the primary.
-        let result = if is_fallback && primary_retry_secs > 0 {
+        // The timer is only armed after startup readiness (initial snapshot applied)
+        // to avoid disconnecting from the fallback before the DP has any config.
+        let should_race_primary = is_fallback
+            && primary_retry_secs > 0
+            && startup_ready
+                .as_ref()
+                .is_none_or(|r| r.load(Ordering::Relaxed));
+        let result = if should_race_primary {
             tokio::select! {
                 res = connect_and_subscribe_with_startup_ready(
                     cp_url,
