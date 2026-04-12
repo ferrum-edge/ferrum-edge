@@ -376,7 +376,6 @@ pub struct EnvConfig {
     pub http_header_read_timeout_seconds: u64,
 
     // DNS
-    pub dns_cache_ttl_seconds: u64,
     pub dns_overrides: HashMap<String, String>,
     /// Comma-separated nameserver addresses (ip[:port], IPv4 or IPv6).
     /// Default: parsed from /etc/resolv.conf
@@ -386,11 +385,16 @@ pub struct EnvConfig {
     /// Order of record types to query (comma-separated, case-insensitive).
     /// Valid values: CACHE, SRV, A, AAAA, CNAME. Default: "CACHE,SRV,A,CNAME"
     pub dns_order: Option<String>,
-    /// Override TTL (seconds) for positive DNS records. Default: use response TTL
-    pub dns_valid_ttl: Option<u64>,
+    /// Global TTL override (seconds) for positive DNS records. When set, ALL
+    /// records use this TTL regardless of their native DNS TTL. Default: None
+    /// (disabled — the cache respects each record's native TTL).
+    pub dns_ttl_override: Option<u64>,
+    /// Minimum TTL floor (seconds) for cached DNS records. Prevents 0-TTL or
+    /// very short TTLs from causing excessive DNS queries. Default: 5
+    pub dns_min_ttl: u64,
     /// Stale data usage time (seconds) during refresh. Default: 3600
     pub dns_stale_ttl: u64,
-    /// TTL (seconds) for errors/empty responses. Default: 1
+    /// TTL (seconds) for errors/empty responses. Default: 5
     pub dns_error_ttl: u64,
     /// Maximum number of entries in the DNS cache. Default: 10000
     pub dns_cache_max_size: usize,
@@ -400,6 +404,9 @@ pub struct EnvConfig {
     pub dns_slow_threshold_ms: Option<u64>,
     /// Percentage of TTL elapsed before background refresh triggers (1-99). Default: 90
     pub dns_refresh_threshold_percent: u8,
+    /// Interval (seconds) for the background task that retries failed DNS lookups.
+    /// Default: 10. Set to 0 to disable.
+    pub dns_failed_retry_interval: u64,
 
     /// Path to a PEM file containing trusted CA certificates for outbound TLS verification.
     /// Used by backend proxy connections, service discovery, and plugin HTTP calls.
@@ -799,18 +806,19 @@ impl Default for EnvConfig {
             websocket_tunnel_mode: false,
             max_credentials_per_type: 2,
             http_header_read_timeout_seconds: 10,
-            dns_cache_ttl_seconds: 300,
             dns_overrides: HashMap::new(),
             dns_resolver_address: None,
             dns_resolver_hosts_file: None,
             dns_order: None,
-            dns_valid_ttl: None,
+            dns_ttl_override: None,
+            dns_min_ttl: 5,
             dns_stale_ttl: 3600,
             dns_error_ttl: 5,
             dns_cache_max_size: 10_000,
             dns_warmup_concurrency: 500,
             dns_slow_threshold_ms: None,
             dns_refresh_threshold_percent: 90,
+            dns_failed_retry_interval: 10,
             tls_ca_bundle_path: None,
             backend_tls_client_cert_path: None,
             backend_tls_client_key_path: None,
@@ -1112,12 +1120,13 @@ impl EnvConfig {
                 10,
             ),
 
-            dns_cache_ttl_seconds: resolve_u64(conf, "FERRUM_DNS_CACHE_TTL_SECONDS", 300),
             dns_overrides,
             dns_resolver_address: resolve_var(conf, "FERRUM_DNS_RESOLVER_ADDRESS"),
             dns_resolver_hosts_file: resolve_var(conf, "FERRUM_DNS_RESOLVER_HOSTS_FILE"),
             dns_order: resolve_var(conf, "FERRUM_DNS_ORDER"),
-            dns_valid_ttl: resolve_var(conf, "FERRUM_DNS_VALID_TTL").and_then(|v| v.parse().ok()),
+            dns_ttl_override: resolve_var(conf, "FERRUM_DNS_TTL_OVERRIDE_SECONDS")
+                .and_then(|v| v.parse().ok()),
+            dns_min_ttl: resolve_u64(conf, "FERRUM_DNS_MIN_TTL_SECONDS", 5),
             dns_stale_ttl: resolve_u64(conf, "FERRUM_DNS_STALE_TTL", 3600),
             dns_error_ttl: resolve_u64(conf, "FERRUM_DNS_ERROR_TTL", 5),
             dns_cache_max_size: resolve_var(conf, "FERRUM_DNS_CACHE_MAX_SIZE")
@@ -1136,6 +1145,11 @@ impl EnvConfig {
             .and_then(|v| v.parse::<u8>().ok())
             .unwrap_or(90)
             .clamp(1, 99),
+            dns_failed_retry_interval: resolve_u64(
+                conf,
+                "FERRUM_DNS_FAILED_RETRY_INTERVAL_SECONDS",
+                10,
+            ),
 
             // Global TLS trust store and mTLS
             tls_ca_bundle_path: resolve_var(conf, "FERRUM_TLS_CA_BUNDLE_PATH"),

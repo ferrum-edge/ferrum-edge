@@ -62,7 +62,7 @@ Caches are divided into two categories: **gateway core caches** (controlled by `
 
 **Env var:** `FERRUM_DNS_CACHE_MAX_SIZE`.
 
-**Cleanup mechanism:** TTL-based expiration (`FERRUM_DNS_CACHE_TTL_SECONDS`), stale-while-revalidate (serves old IP while refreshing in background), and a background refresh task that keeps entries warm.
+**Cleanup mechanism:** TTL-based expiration (each record's native TTL by default, or `FERRUM_DNS_TTL_OVERRIDE_SECONDS` when set), stale-while-revalidate (serves old IP while refreshing in background), a background refresh task that keeps entries warm, and a failed DNS retry task that re-attempts resolution of error-cached entries.
 
 ### Status Code Counters
 
@@ -260,7 +260,9 @@ Caches are divided into two categories: **gateway core caches** (controlled by `
 |----------|---------|-------------|
 | `FERRUM_ROUTER_CACHE_MAX_ENTRIES` | `0` (auto) | Router lookup cache size. `0` = auto-scale as `max(10_000, proxies x 3)` |
 | `FERRUM_DNS_CACHE_MAX_SIZE` | `10000` | Maximum DNS cache entries |
-| `FERRUM_DNS_CACHE_TTL_SECONDS` | `300` | DNS cache entry TTL |
+| `FERRUM_DNS_TTL_OVERRIDE_SECONDS` | Disabled | Global DNS TTL override (native record TTL used by default) |
+| `FERRUM_DNS_MIN_TTL_SECONDS` | `5` | Minimum TTL floor for DNS records |
+| `FERRUM_DNS_FAILED_RETRY_INTERVAL_SECONDS` | `10` | Failed DNS retry interval (`0` = disabled) |
 | `FERRUM_STATUS_COUNTS_MAX_ENTRIES` | `200` | Maximum HTTP status code counter entries |
 | `FERRUM_MAX_CONCURRENT_REQUESTS_PER_IP` | `0` | Per-IP concurrent request limit (`0` = disabled) |
 | `FERRUM_PER_IP_CLEANUP_INTERVAL_SECONDS` | `60` | Cleanup interval for per-IP zero-count entries |

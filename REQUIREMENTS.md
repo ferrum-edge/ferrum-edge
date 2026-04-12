@@ -123,7 +123,9 @@ All operational parameters MUST be configurable via environment variables.
     *   `FERRUM_TRUSTED_PROXIES`: (Comma-separated CIDRs/IPs, e.g., `10.0.0.0/8,172.16.0.0/12`) - Default: empty (XFF headers ignored; socket IP used).
     *   `FERRUM_REAL_IP_HEADER`: (Header name, e.g., `CF-Connecting-IP` or `X-Real-IP`) - Default: none.
 *   **DNS Caching:**
-    *   `FERRUM_DNS_CACHE_TTL_SECONDS`: (Integer seconds) - Default: `300`.
+    *   `FERRUM_DNS_TTL_OVERRIDE_SECONDS`: (Optional integer seconds) - Default: disabled. When set, forces all DNS records to use this fixed TTL. By default, the cache respects each record's native TTL.
+    *   `FERRUM_DNS_MIN_TTL_SECONDS`: (Integer seconds) - Default: `5`. Minimum TTL floor to prevent 0-TTL abuse.
+    *   `FERRUM_DNS_FAILED_RETRY_INTERVAL_SECONDS`: (Integer seconds) - Default: `10`. Background retry interval for failed DNS lookups. `0` = disabled.
     *   `FERRUM_DNS_OVERRIDES`: (JSON string map `{"hostname": "ip_address", ...}`) - Default: `{}`.
 
 **6. Core Proxying Behavior**
@@ -159,7 +161,7 @@ This defines how the gateway processes requests on the Proxy Traffic listeners.
     *   Implement an asynchronous, in-memory cache for resolved IP addresses of backend hostnames defined in `Proxy` resources.
     *   **Startup DNS Warmup:** Immediately after loading the initial configuration upon application startup, the gateway MUST asynchronously initiate DNS lookups for all unique backend hostnames present in the configuration (respecting `dns_override`). The results should populate the DNS cache to minimize latency on initial requests. This warmup process MUST NOT block the gateway from starting its network listeners.
     *   **Startup Connection Pool Warmup:** After DNS warmup completes (when `FERRUM_POOL_WARMUP_ENABLED=true`, the default), the gateway SHOULD pre-establish backend connections for all HTTP-family proxies (reqwest, gRPC, HTTP/2, HTTP/3). This eliminates first-request cold-start latency from TCP/TLS/QUIC handshakes. For upstream-backed proxies, every target in the upstream is warmed. TCP/UDP stream proxies are skipped (no persistent connection pools). Warmup failures are logged as warnings but MUST NOT block startup. Concurrency is bounded by `FERRUM_POOL_WARMUP_CONCURRENCY` (default: 500).
-    *   Cached entries MUST expire based on a TTL, configurable globally via `FERRUM_DNS_CACHE_TTL_SECONDS` and overridable per-proxy via `Proxy.dns_cache_ttl_seconds`. Upon cache miss or expiry, perform a fresh asynchronous DNS lookup.
+    *   Cached entries MUST expire based on each record's native DNS TTL by default. A global TTL override is available via `FERRUM_DNS_TTL_OVERRIDE_SECONDS` (disabled by default). Per-proxy TTL overrides via `Proxy.dns_cache_ttl_seconds` take highest precedence. A minimum TTL floor (`FERRUM_DNS_MIN_TTL_SECONDS`, default 5s) prevents 0-TTL abuse. Upon cache miss or expiry, perform a fresh asynchronous DNS lookup.
     *   Support global static hostname-to-IP mappings provided via `FERRUM_DNS_OVERRIDES`.
     *   Support per-proxy static IP overrides via `Proxy.dns_override`. These overrides take precedence over global overrides and DNS lookups.
 *   **Request Size Limits:** Enforce the maximum allowed request header size (`FERRUM_MAX_HEADER_SIZE_BYTES`) and request body size (`FERRUM_MAX_REQUEST_BODY_SIZE_BYTES`). Requests exceeding these limits MUST be rejected immediately with appropriate HTTP status codes (e.g., 431 Request Header Fields Too Large, 413 Content Too Large).
