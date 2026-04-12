@@ -40,6 +40,31 @@ struct DbOutageTestHarness {
 
 impl DbOutageTestHarness {
     async fn new() -> Result<Self, Box<dyn std::error::Error>> {
+        const MAX_ATTEMPTS: u32 = 3;
+        let mut last_err = String::new();
+        for attempt in 1..=MAX_ATTEMPTS {
+            match Self::try_new().await {
+                Ok(harness) => return Ok(harness),
+                Err(e) => {
+                    last_err = e.to_string();
+                    eprintln!(
+                        "Harness startup attempt {}/{} failed: {}",
+                        attempt, MAX_ATTEMPTS, last_err
+                    );
+                    if attempt < MAX_ATTEMPTS {
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    }
+                }
+            }
+        }
+        Err(format!(
+            "Failed to create harness after {} attempts: {}",
+            MAX_ATTEMPTS, last_err
+        )
+        .into())
+    }
+
+    async fn try_new() -> Result<Self, Box<dyn std::error::Error>> {
         let temp_dir = TempDir::new()?;
         let jwt_secret = "test-db-outage-jwt-secret-12345".to_string();
         let jwt_issuer = "ferrum-edge-db-outage-test".to_string();
@@ -90,7 +115,7 @@ impl DbOutageTestHarness {
         let proxy_base_url = format!("http://127.0.0.1:{}", proxy_port);
         let admin_base_url = format!("http://127.0.0.1:{}", admin_port);
 
-        let harness = Self {
+        let mut harness = Self {
             _temp_dir: temp_dir,
             db_path,
             gateway_process: Some(child),
@@ -102,8 +127,16 @@ impl DbOutageTestHarness {
             proxy_port,
         };
 
-        harness.wait_for_health().await?;
-        Ok(harness)
+        match harness.wait_for_health().await {
+            Ok(()) => Ok(harness),
+            Err(e) => {
+                if let Some(mut child) = harness.gateway_process.take() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+                Err(e)
+            }
+        }
     }
 
     async fn wait_for_health(&self) -> Result<(), Box<dyn std::error::Error>> {

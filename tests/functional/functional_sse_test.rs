@@ -78,36 +78,32 @@ fn start_gateway_file_mode(
 }
 
 /// Wait for the gateway health endpoint to respond.
-async fn wait_for_health(admin_port: u16) -> Result<(), Box<dyn std::error::Error>> {
+/// Returns true if healthy, false if timed out.
+async fn wait_for_health(admin_port: u16) -> bool {
     let health_url = format!("http://127.0.0.1:{}/health", admin_port);
     let deadline = std::time::SystemTime::now() + Duration::from_secs(30);
     loop {
         if std::time::SystemTime::now() >= deadline {
-            return Err("Gateway did not start within 30 seconds".into());
+            return false;
         }
         match reqwest::get(&health_url).await {
-            Ok(r) if r.status().is_success() => return Ok(()),
+            Ok(r) if r.status().is_success() => return true,
             _ => sleep(Duration::from_millis(500)).await,
         }
     }
 }
 
-/// Create a temp config file with the SSE plugin and return (TempDir, config_path, backend_port, proxy_port, admin_port).
-async fn setup_sse_config() -> (TempDir, String, u16, u16, u16) {
-    // Bind to port 0 to get ephemeral ports
+/// Create a temp config file with the SSE plugin and return (TempDir, config_path, backend_port).
+///
+/// Backend port is allocated here (same-process listener, no race).
+/// Proxy and admin ports are allocated by `start_gateway_with_retry()`.
+async fn setup_sse_config() -> (TempDir, String, u16) {
+    // Bind to port 0 to get an ephemeral port for the backend (same-process, safe)
     let backend_listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind backend");
     let backend_port = backend_listener.local_addr().unwrap().port();
     drop(backend_listener);
-
-    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind proxy");
-    let proxy_port = proxy_listener.local_addr().unwrap().port();
-    drop(proxy_listener);
-
-    let admin_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind admin");
-    let admin_port = admin_listener.local_addr().unwrap().port();
-    drop(admin_listener);
 
     let temp_dir = TempDir::new().expect("Failed to create temp directory");
     let config_path = temp_dir.path().join("config.yaml");
@@ -149,9 +145,43 @@ plugin_configs:
         temp_dir,
         config_path.to_string_lossy().to_string(),
         backend_port,
-        proxy_port,
-        admin_port,
     )
+}
+
+/// Start the gateway with retry on port-binding failures.
+///
+/// Allocates fresh ephemeral proxy and admin ports on each attempt to handle
+/// the bind-drop-rebind port race. Returns (child, proxy_port, admin_port).
+async fn start_gateway_with_retry(config_path: &str) -> (std::process::Child, u16, u16) {
+    const MAX_ATTEMPTS: u32 = 3;
+    for attempt in 1..=MAX_ATTEMPTS {
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_port = proxy_listener.local_addr().unwrap().port();
+        drop(proxy_listener);
+
+        let admin_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let admin_port = admin_listener.local_addr().unwrap().port();
+        drop(admin_listener);
+
+        let mut child = start_gateway_file_mode(config_path, proxy_port, admin_port)
+            .expect("Failed to start gateway");
+
+        if wait_for_health(admin_port).await {
+            return (child, proxy_port, admin_port);
+        }
+
+        eprintln!(
+            "Gateway startup attempt {}/{} failed (ports: proxy={}, admin={})",
+            attempt, MAX_ATTEMPTS, proxy_port, admin_port
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+
+        if attempt < MAX_ATTEMPTS {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    }
+    panic!("Gateway did not start after {} attempts", MAX_ATTEMPTS);
 }
 
 // ============================================================================
@@ -161,18 +191,15 @@ plugin_configs:
 #[ignore]
 #[tokio::test]
 async fn test_sse_plugin_rejects_without_accept_header() {
-    let (_temp_dir, config_path, backend_port, proxy_port, admin_port) = setup_sse_config().await;
+    let (_temp_dir, config_path, backend_port) = setup_sse_config().await;
 
     // Start echo server
     let echo_server = tokio::spawn(start_sse_echo_server(backend_port));
     sleep(Duration::from_millis(500)).await;
 
-    // Start gateway
-    let mut gateway_process = start_gateway_file_mode(&config_path, proxy_port, admin_port)
-        .expect("Failed to start gateway");
-    wait_for_health(admin_port)
-        .await
-        .expect("Gateway health check failed");
+    // Start gateway with retry to handle ephemeral port races
+    let (mut gateway_process, proxy_port, _admin_port) =
+        start_gateway_with_retry(&config_path).await;
 
     // Send request WITHOUT Accept: text/event-stream header
     let client = reqwest::Client::new();
@@ -206,18 +233,15 @@ async fn test_sse_plugin_rejects_without_accept_header() {
 #[ignore]
 #[tokio::test]
 async fn test_sse_plugin_allows_valid_sse_request() {
-    let (_temp_dir, config_path, backend_port, proxy_port, admin_port) = setup_sse_config().await;
+    let (_temp_dir, config_path, backend_port) = setup_sse_config().await;
 
     // Start echo server
     let echo_server = tokio::spawn(start_sse_echo_server(backend_port));
     sleep(Duration::from_millis(500)).await;
 
-    // Start gateway
-    let mut gateway_process = start_gateway_file_mode(&config_path, proxy_port, admin_port)
-        .expect("Failed to start gateway");
-    wait_for_health(admin_port)
-        .await
-        .expect("Gateway health check failed");
+    // Start gateway with retry to handle ephemeral port races
+    let (mut gateway_process, proxy_port, _admin_port) =
+        start_gateway_with_retry(&config_path).await;
 
     // Send valid SSE request with Accept: text/event-stream
     let client = reqwest::Client::new();
@@ -262,18 +286,15 @@ async fn test_sse_plugin_allows_valid_sse_request() {
 #[ignore]
 #[tokio::test]
 async fn test_sse_plugin_rejects_post_when_require_get() {
-    let (_temp_dir, config_path, backend_port, proxy_port, admin_port) = setup_sse_config().await;
+    let (_temp_dir, config_path, backend_port) = setup_sse_config().await;
 
     // Start echo server
     let echo_server = tokio::spawn(start_sse_echo_server(backend_port));
     sleep(Duration::from_millis(500)).await;
 
-    // Start gateway
-    let mut gateway_process = start_gateway_file_mode(&config_path, proxy_port, admin_port)
-        .expect("Failed to start gateway");
-    wait_for_health(admin_port)
-        .await
-        .expect("Gateway health check failed");
+    // Start gateway with retry to handle ephemeral port races
+    let (mut gateway_process, proxy_port, _admin_port) =
+        start_gateway_with_retry(&config_path).await;
 
     // Send POST request with proper Accept header - should still be rejected
     let client = reqwest::Client::new();

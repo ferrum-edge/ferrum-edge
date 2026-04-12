@@ -77,8 +77,46 @@ impl DatabaseModeTestHarness {
             .to_string()
     }
 
-    /// Start the gateway binary in database mode
+    /// Start the gateway binary in database mode with retry for ephemeral port races
     async fn start_gateway(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        const MAX_ATTEMPTS: u32 = 3;
+        let mut last_err = String::new();
+        for attempt in 1..=MAX_ATTEMPTS {
+            match self.try_start_gateway().await {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    last_err = e.to_string();
+                    eprintln!(
+                        "Gateway startup attempt {}/{} failed: {}",
+                        attempt, MAX_ATTEMPTS, last_err
+                    );
+                    if attempt < MAX_ATTEMPTS {
+                        // Reallocate ports for the next attempt
+                        let admin_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+                        self.admin_port = admin_listener.local_addr()?.port();
+                        drop(admin_listener);
+
+                        let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+                        self.proxy_port = proxy_listener.local_addr()?.port();
+                        drop(proxy_listener);
+
+                        self.proxy_base_url = format!("http://127.0.0.1:{}", self.proxy_port);
+                        self.admin_base_url = format!("http://127.0.0.1:{}", self.admin_port);
+
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    }
+                }
+            }
+        }
+        Err(format!(
+            "Failed to start gateway after {} attempts: {}",
+            MAX_ATTEMPTS, last_err
+        )
+        .into())
+    }
+
+    /// Single attempt to start the gateway binary in database mode
+    async fn try_start_gateway(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         let db_url = format!("sqlite:{}?mode=rwc", self.db_path());
 
         // Build the gateway binary if not already built
@@ -111,10 +149,17 @@ impl DatabaseModeTestHarness {
 
         self.gateway_process = Some(child);
 
-        // Wait for gateway to be ready
-        self.wait_for_health().await?;
-
-        Ok(())
+        // Wait for gateway to be ready; kill on failure
+        match self.wait_for_health().await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                if let Some(mut child) = self.gateway_process.take() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+                Err(e)
+            }
+        }
     }
 
     /// Poll the health endpoint until gateway is ready (max 30 seconds)

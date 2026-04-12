@@ -65,12 +65,50 @@ impl DbTlsTestHarness {
         })
     }
 
-    /// Start the gateway with TLS-enabled database connection.
-    ///
-    /// Uses the `FERRUM_DB_SSL_*` environment variables (the "native SQL TLS"
-    /// approach) to configure the connection string with proper sslmode and
-    /// certificate paths.
+    /// Start the gateway with TLS-enabled database connection, with retry for ephemeral port races.
     async fn start_gateway(
+        &mut self,
+        db_url: &str,
+        cert_dir: &str,
+        ssl_mode: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        const MAX_ATTEMPTS: u32 = 3;
+        let mut last_err = String::new();
+        for attempt in 1..=MAX_ATTEMPTS {
+            match self.try_start_gateway(db_url, cert_dir, ssl_mode).await {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    last_err = e.to_string();
+                    eprintln!(
+                        "Gateway startup attempt {}/{} failed: {}",
+                        attempt, MAX_ATTEMPTS, last_err
+                    );
+                    if attempt < MAX_ATTEMPTS {
+                        let admin_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+                        self.admin_port = admin_listener.local_addr()?.port();
+                        drop(admin_listener);
+
+                        let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+                        self.proxy_port = proxy_listener.local_addr()?.port();
+                        drop(proxy_listener);
+
+                        self.proxy_base_url = format!("http://127.0.0.1:{}", self.proxy_port);
+                        self.admin_base_url = format!("http://127.0.0.1:{}", self.admin_port);
+
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    }
+                }
+            }
+        }
+        Err(format!(
+            "Failed to start gateway after {} attempts: {}",
+            MAX_ATTEMPTS, last_err
+        )
+        .into())
+    }
+
+    /// Single attempt to start the gateway with TLS-enabled database connection.
+    async fn try_start_gateway(
         &mut self,
         db_url: &str,
         cert_dir: &str,
@@ -106,12 +144,65 @@ impl DbTlsTestHarness {
         let child = cmd.spawn()?;
         self.gateway_process = Some(child);
 
-        self.wait_for_health().await?;
-        Ok(())
+        match self.wait_for_health().await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                if let Some(mut child) = self.gateway_process.take() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+                Err(e)
+            }
+        }
     }
 
-    /// Start the gateway with the legacy TLS approach (FERRUM_DB_TLS_* vars).
+    /// Start the gateway with the legacy TLS approach, with retry for ephemeral port races.
     async fn start_gateway_legacy_tls(
+        &mut self,
+        db_url: &str,
+        cert_dir: &str,
+        insecure: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        const MAX_ATTEMPTS: u32 = 3;
+        let mut last_err = String::new();
+        for attempt in 1..=MAX_ATTEMPTS {
+            match self
+                .try_start_gateway_legacy_tls(db_url, cert_dir, insecure)
+                .await
+            {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    last_err = e.to_string();
+                    eprintln!(
+                        "Gateway startup attempt {}/{} failed: {}",
+                        attempt, MAX_ATTEMPTS, last_err
+                    );
+                    if attempt < MAX_ATTEMPTS {
+                        let admin_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+                        self.admin_port = admin_listener.local_addr()?.port();
+                        drop(admin_listener);
+
+                        let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+                        self.proxy_port = proxy_listener.local_addr()?.port();
+                        drop(proxy_listener);
+
+                        self.proxy_base_url = format!("http://127.0.0.1:{}", self.proxy_port);
+                        self.admin_base_url = format!("http://127.0.0.1:{}", self.admin_port);
+
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    }
+                }
+            }
+        }
+        Err(format!(
+            "Failed to start gateway after {} attempts: {}",
+            MAX_ATTEMPTS, last_err
+        )
+        .into())
+    }
+
+    /// Single attempt to start the gateway with legacy TLS vars.
+    async fn try_start_gateway_legacy_tls(
         &mut self,
         db_url: &str,
         cert_dir: &str,
@@ -147,8 +238,16 @@ impl DbTlsTestHarness {
         let child = cmd.spawn()?;
         self.gateway_process = Some(child);
 
-        self.wait_for_health().await?;
-        Ok(())
+        match self.wait_for_health().await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                if let Some(mut child) = self.gateway_process.take() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+                Err(e)
+            }
+        }
     }
 
     async fn wait_for_health(&self) -> Result<(), Box<dyn std::error::Error>> {

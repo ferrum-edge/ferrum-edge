@@ -105,7 +105,50 @@ impl DbUpstreamTestHarness {
             .to_string()
     }
 
+    /// Reallocate ephemeral ports after a failed startup attempt.
+    async fn reallocate_ports(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let admin_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        self.admin_port = admin_listener.local_addr()?.port();
+        drop(admin_listener);
+
+        let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        self.proxy_port = proxy_listener.local_addr()?.port();
+        drop(proxy_listener);
+
+        self.admin_base_url = format!("http://127.0.0.1:{}", self.admin_port);
+        self.proxy_base_url = format!("http://127.0.0.1:{}", self.proxy_port);
+        Ok(())
+    }
+
+    /// Start the gateway, retrying up to 3 times with fresh ports to handle
+    /// ephemeral port races.
     async fn start_gateway(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        const MAX_ATTEMPTS: u32 = 3;
+        let mut last_err = String::new();
+        for attempt in 1..=MAX_ATTEMPTS {
+            match self.try_start_gateway().await {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    last_err = e.to_string();
+                    eprintln!(
+                        "start_gateway attempt {}/{} failed: {}",
+                        attempt, MAX_ATTEMPTS, last_err
+                    );
+                    if attempt < MAX_ATTEMPTS {
+                        self.reallocate_ports().await?;
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    }
+                }
+            }
+        }
+        Err(format!(
+            "Failed to start gateway after {} attempts: {}",
+            MAX_ATTEMPTS, last_err
+        )
+        .into())
+    }
+
+    async fn try_start_gateway(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         let db_url = format!("sqlite:{}?mode=rwc", self.db_path());
 
         let build_status = Command::new("cargo").args(["build"]).status()?;
@@ -132,8 +175,16 @@ impl DbUpstreamTestHarness {
             .spawn()?;
 
         self.gateway_process = Some(child);
-        self.wait_for_health().await?;
-        Ok(())
+        match self.wait_for_health().await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                if let Some(mut child) = self.gateway_process.take() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+                Err(e)
+            }
+        }
     }
 
     async fn wait_for_health(&self) -> Result<(), Box<dyn std::error::Error>> {

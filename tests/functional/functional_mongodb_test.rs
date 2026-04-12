@@ -98,7 +98,37 @@ impl MongoTestHarness {
     }
 
     /// Start the gateway with plaintext MongoDB connection.
+    /// Retries up to 3 times with fresh ports to handle ephemeral port races.
     async fn start_gateway_plaintext(
+        &mut self,
+        mongo_url: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        const MAX_ATTEMPTS: u32 = 3;
+        let mut last_err = String::new();
+        for attempt in 1..=MAX_ATTEMPTS {
+            match self.try_start_gateway_plaintext(mongo_url).await {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    last_err = e.to_string();
+                    eprintln!(
+                        "start_gateway_plaintext attempt {}/{} failed: {}",
+                        attempt, MAX_ATTEMPTS, last_err
+                    );
+                    if attempt < MAX_ATTEMPTS {
+                        self.reallocate_ports().await?;
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    }
+                }
+            }
+        }
+        Err(format!(
+            "Failed to start gateway (plaintext) after {} attempts: {}",
+            MAX_ATTEMPTS, last_err
+        )
+        .into())
+    }
+
+    async fn try_start_gateway_plaintext(
         &mut self,
         mongo_url: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
@@ -120,12 +150,55 @@ impl MongoTestHarness {
             .spawn()?;
 
         self.gateway_process = Some(child);
-        self.wait_for_health().await?;
-        Ok(())
+        match self.wait_for_health().await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                if let Some(mut child) = self.gateway_process.take() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+                Err(e)
+            }
+        }
     }
 
     /// Start the gateway with TLS-encrypted MongoDB connection.
+    /// Retries up to 3 times with fresh ports to handle ephemeral port races.
     async fn start_gateway_tls(
+        &mut self,
+        mongo_url: &str,
+        cert_dir: &str,
+        insecure: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        const MAX_ATTEMPTS: u32 = 3;
+        let mut last_err = String::new();
+        for attempt in 1..=MAX_ATTEMPTS {
+            match self
+                .try_start_gateway_tls(mongo_url, cert_dir, insecure)
+                .await
+            {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    last_err = e.to_string();
+                    eprintln!(
+                        "start_gateway_tls attempt {}/{} failed: {}",
+                        attempt, MAX_ATTEMPTS, last_err
+                    );
+                    if attempt < MAX_ATTEMPTS {
+                        self.reallocate_ports().await?;
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    }
+                }
+            }
+        }
+        Err(format!(
+            "Failed to start gateway (tls) after {} attempts: {}",
+            MAX_ATTEMPTS, last_err
+        )
+        .into())
+    }
+
+    async fn try_start_gateway_tls(
         &mut self,
         mongo_url: &str,
         cert_dir: &str,
@@ -156,12 +229,51 @@ impl MongoTestHarness {
             .spawn()?;
 
         self.gateway_process = Some(child);
-        self.wait_for_health().await?;
-        Ok(())
+        match self.wait_for_health().await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                if let Some(mut child) = self.gateway_process.take() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+                Err(e)
+            }
+        }
     }
 
     /// Start the gateway with mTLS MongoDB connection (client certificate auth).
+    /// Retries up to 3 times with fresh ports to handle ephemeral port races.
     async fn start_gateway_mtls(
+        &mut self,
+        mongo_url: &str,
+        cert_dir: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        const MAX_ATTEMPTS: u32 = 3;
+        let mut last_err = String::new();
+        for attempt in 1..=MAX_ATTEMPTS {
+            match self.try_start_gateway_mtls(mongo_url, cert_dir).await {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    last_err = e.to_string();
+                    eprintln!(
+                        "start_gateway_mtls attempt {}/{} failed: {}",
+                        attempt, MAX_ATTEMPTS, last_err
+                    );
+                    if attempt < MAX_ATTEMPTS {
+                        self.reallocate_ports().await?;
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    }
+                }
+            }
+        }
+        Err(format!(
+            "Failed to start gateway (mtls) after {} attempts: {}",
+            MAX_ATTEMPTS, last_err
+        )
+        .into())
+    }
+
+    async fn try_start_gateway_mtls(
         &mut self,
         mongo_url: &str,
         cert_dir: &str,
@@ -191,7 +303,30 @@ impl MongoTestHarness {
             .spawn()?;
 
         self.gateway_process = Some(child);
-        self.wait_for_health().await?;
+        match self.wait_for_health().await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                if let Some(mut child) = self.gateway_process.take() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Reallocate ephemeral ports after a failed startup attempt.
+    async fn reallocate_ports(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let admin_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        self.admin_port = admin_listener.local_addr()?.port();
+        drop(admin_listener);
+
+        let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        self.proxy_port = proxy_listener.local_addr()?.port();
+        drop(proxy_listener);
+
+        self.admin_base_url = format!("http://127.0.0.1:{}", self.admin_port);
+        self.proxy_base_url = format!("http://127.0.0.1:{}", self.proxy_port);
         Ok(())
     }
 
