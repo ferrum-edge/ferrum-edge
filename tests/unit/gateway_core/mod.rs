@@ -18,6 +18,7 @@ mod pool_key_tests;
 mod protocol_validation_tests;
 mod proxy_body_tests;
 mod proxy_tests;
+mod request_context_tests;
 mod response_body_mode_tests;
 mod retry_tests;
 mod router_cache_tests;

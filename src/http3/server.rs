@@ -367,8 +367,8 @@ async fn handle_h3_request(
     ctx.tls_client_cert_der = tls_client_cert_der;
     ctx.tls_client_cert_chain_der = tls_client_cert_chain_der;
 
-    // Validate and extract headers with size limits
-    ctx.headers.reserve(req.headers().keys_len());
+    // Validate header sizes without materializing headers into owned Strings.
+    // The raw HeaderMap is stored on ctx for deferred materialization.
     let mut total_header_size: usize = 0;
     for (name, value) in req.headers() {
         let header_size = name.as_str().len() + value.len();
@@ -387,11 +387,6 @@ async fn handle_h3_request(
             return Ok(());
         }
         total_header_size += header_size;
-        if let Ok(v) = value.to_str() {
-            // http::HeaderName stores names in lowercase already (per HTTP/2+3 spec),
-            // so .as_str() returns lowercase — no need for .to_lowercase().
-            ctx.headers.insert(name.as_str().to_owned(), v.to_string());
-        }
     }
     if total_header_size > state.max_header_size_bytes {
         record_request(&state, 431);
@@ -417,6 +412,9 @@ async fn handle_h3_request(
         .await?;
         return Ok(());
     }
+
+    // Store raw headers for deferred materialization.
+    ctx.set_raw_headers(req.headers().clone());
 
     // Validate URL length (path + query string)
     if state.max_url_length_bytes > 0 {
@@ -503,12 +501,14 @@ async fn handle_h3_request(
 
     // Resolve real client IP using trusted proxy configuration.
     // Parse socket IP once upfront to avoid redundant parsing in each branch.
+    // Uses raw_header_get() to read specific headers without materializing the
+    // full HashMap — only 2-3 targeted lookups on the raw HeaderMap.
     if !state.trusted_proxies.is_empty() {
         let socket_addr: std::net::IpAddr = remote_addr.ip();
-        let xff = ctx.headers.get("x-forwarded-for").map(|s| s.as_str());
+        let xff = ctx.raw_header_get("x-forwarded-for");
         let resolved = if let Some(ref real_ip_header) = state.env_config.real_ip_header {
             // real_ip_header is already lowercase from env config parsing
-            let header_val = ctx.headers.get(real_ip_header.as_str());
+            let header_val = ctx.raw_header_get(real_ip_header.as_str());
             if let Some(val) = header_val
                 && state.trusted_proxies.contains(&socket_addr)
             {
@@ -567,23 +567,18 @@ async fn handle_h3_request(
         None
     };
 
-    // Parse query params
-    if !query_string.is_empty() {
-        for pair in query_string.split('&') {
-            if let Some((k, v)) = pair.split_once('=') {
-                ctx.query_params.insert(k.to_string(), v.to_string());
-            }
-        }
-    }
+    // Store raw query string for lazy parsing (deferred until plugins need it).
+    ctx.set_raw_query_string(query_string.clone());
 
     // Extract request host for host-based routing.
     // HTTP/3 uses the :authority pseudo-header (from URI authority).
     // Also check the host header as a fallback. Strip port and lowercase.
+    // Uses raw_header_get() to avoid materializing the full HashMap.
     let request_host: Option<String> = req
         .uri()
         .authority()
         .map(|a| a.as_str())
-        .or_else(|| ctx.headers.get("host").map(|h| h.as_str()))
+        .or_else(|| ctx.raw_header_get("host"))
         .map(|h| {
             let without_port = h.split(':').next().unwrap_or(h);
             // Strip trailing dot from FQDN (e.g., "example.com." → "example.com").
@@ -600,6 +595,9 @@ async fn handle_h3_request(
 
     let proxy = match route_match {
         Some(rm) => {
+            // Materialize headers now — path param injection writes to ctx.headers,
+            // and all subsequent code (plugins, backend dispatch) needs the HashMap.
+            ctx.materialize_headers();
             // Inject regex path parameters into context metadata and headers
             for (name, value) in &rm.path_params {
                 ctx.metadata
@@ -677,6 +675,10 @@ async fn handle_h3_request(
         }
     }
     plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
+
+    // Materialize query params before authentication (raw, no percent-decoding
+    // for HTTP/3 — preserves existing behavior).
+    ctx.materialize_query_params_raw();
 
     // Authentication phase
     let auth_plugins: Vec<&Arc<dyn Plugin>> =

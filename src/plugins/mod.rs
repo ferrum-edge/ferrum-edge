@@ -78,6 +78,8 @@ pub use utils::PluginHttpClient;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use http::HeaderMap;
+use percent_encoding::percent_decode_str;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -198,12 +200,30 @@ pub enum WebSocketFrameDirection {
 }
 
 /// Context passed through the plugin pipeline for a single request.
+///
+/// Headers and query parameters are lazily materialized to avoid per-request
+/// allocations on the hot path. The raw `http::HeaderMap` and query string are
+/// stored at request init time; the `HashMap<String, String>` representations
+/// are only built when a plugin phase actually needs them (via
+/// `materialize_headers()` / `materialize_query_params()`).
 #[derive(Debug, Clone)]
 pub struct RequestContext {
     pub client_ip: String,
     pub method: String,
     pub path: String,
+    /// Raw HTTP headers from the request. Stored at init time and consumed by
+    /// `materialize_headers()`. Core proxy lookups (IP resolution, host
+    /// extraction) read from this directly via `raw_header_get()` to avoid
+    /// eagerly converting every header to an owned `String`.
+    raw_headers: Option<HeaderMap>,
+    /// Materialized headers HashMap. Empty until `materialize_headers()` is
+    /// called. Plugin code and backend dispatch read from this field.
     pub headers: HashMap<String, String>,
+    /// Raw query string stored for lazy parsing. `None` when empty or after
+    /// `materialize_query_params()` has consumed it.
+    raw_query_string: Option<String>,
+    /// Parsed + percent-decoded query parameters. Empty until
+    /// `materialize_query_params()` is called.
     pub query_params: HashMap<String, String>,
     pub matched_proxy: Option<Arc<Proxy>>,
     pub identified_consumer: Option<Arc<Consumer>>,
@@ -246,7 +266,9 @@ impl RequestContext {
             client_ip,
             method,
             path,
+            raw_headers: None,
             headers: HashMap::new(),
+            raw_query_string: None,
             query_params: HashMap::new(),
             matched_proxy: None,
             identified_consumer: None,
@@ -259,6 +281,93 @@ impl RequestContext {
             plugin_http_call_ns: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             mirror_result_rx: None,
             request_body_bytes: None,
+        }
+    }
+
+    // -- Lazy header materialization -----------------------------------------
+
+    /// Store the raw `http::HeaderMap` for deferred materialization. Call this
+    /// once at request init time instead of eagerly converting every header to
+    /// owned `String`s.
+    #[inline]
+    pub fn set_raw_headers(&mut self, headers: HeaderMap) {
+        self.raw_headers = Some(headers);
+    }
+
+    /// Look up a single header from the raw `HeaderMap` without materializing
+    /// the full `HashMap<String, String>`. Returns `None` if the raw headers
+    /// have already been consumed by `materialize_headers()`.
+    #[inline]
+    pub fn raw_header_get(&self, name: &str) -> Option<&str> {
+        self.raw_headers
+            .as_ref()
+            .and_then(|h| h.get(name))
+            .and_then(|v| v.to_str().ok())
+    }
+
+    /// Convert the raw `http::HeaderMap` into `self.headers` (`HashMap<String,
+    /// String>`). This is a one-time operation — subsequent calls are no-ops.
+    /// Non-UTF-8 header values are silently skipped (same as the previous eager
+    /// path).
+    pub fn materialize_headers(&mut self) {
+        if let Some(raw) = self.raw_headers.take() {
+            self.headers.reserve(raw.keys_len());
+            for (name, value) in &raw {
+                if let Ok(v) = value.to_str() {
+                    // http::HeaderName stores names in lowercase already (HTTP/2+3
+                    // spec), and hyper normalizes HTTP/1.1 header names to
+                    // lowercase at parse time. No `to_lowercase()` needed.
+                    self.headers.insert(name.as_str().to_owned(), v.to_owned());
+                }
+            }
+        }
+    }
+
+    // -- Lazy query param materialization ------------------------------------
+
+    /// Store the raw query string for deferred parsing. Call this once at
+    /// request init time instead of eagerly percent-decoding every param.
+    #[inline]
+    pub fn set_raw_query_string(&mut self, qs: String) {
+        if !qs.is_empty() {
+            self.raw_query_string = Some(qs);
+        }
+    }
+
+    /// Parse the raw query string into `self.query_params`. Keys and values are
+    /// percent-decoded so plugins see human-readable strings. Parameters without
+    /// `=` (e.g., `?flag`) are stored with an empty-string value.
+    ///
+    /// This is a one-time operation — subsequent calls are no-ops.
+    pub fn materialize_query_params(&mut self) {
+        if let Some(raw) = self.raw_query_string.take() {
+            for pair in raw.split('&') {
+                if pair.is_empty() {
+                    continue;
+                }
+                let (k, v) = if let Some((k, v)) = pair.split_once('=') {
+                    (k, v)
+                } else {
+                    (pair, "")
+                };
+                let decoded_k = percent_decode_str(k).decode_utf8_lossy();
+                let decoded_v = percent_decode_str(v).decode_utf8_lossy();
+                self.query_params
+                    .insert(decoded_k.into_owned(), decoded_v.into_owned());
+            }
+        }
+    }
+
+    /// Materialize the raw query string into `self.query_params` without
+    /// percent-decoding. Used by HTTP/3 to preserve existing behavior where
+    /// query params are stored as raw strings.
+    pub fn materialize_query_params_raw(&mut self) {
+        if let Some(raw) = self.raw_query_string.take() {
+            for pair in raw.split('&') {
+                if let Some((k, v)) = pair.split_once('=') {
+                    self.query_params.insert(k.to_string(), v.to_string());
+                }
+            }
         }
     }
 

@@ -49,7 +49,6 @@ use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode, upgrade::OnUpgrade, upgrade::Upgraded};
 use hyper_util::rt::TokioIo;
-use percent_encoding::percent_decode_str;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -3744,9 +3743,15 @@ pub async fn handle_proxy_request(
     let mut ctx = RequestContext::new(socket_ip.clone(), method.clone(), path.clone());
     ctx.tls_client_cert_der = tls_client_cert_der;
     ctx.tls_client_cert_chain_der = tls_client_cert_chain_der;
-    ctx.headers.reserve(req.headers().keys_len());
-
-    // Validate and extract headers with size limits
+    // Store raw query string on ctx for lazy parsing. The local `query_string`
+    // is kept for validation + URL building; the ctx copy is consumed by
+    // materialize_query_params() when plugins need the parsed HashMap.
+    ctx.set_raw_query_string(query_string.clone());
+    // Validate header sizes without materializing headers into owned Strings.
+    // The raw HeaderMap is stored on ctx for deferred materialization — the full
+    // HashMap<String, String> is only built when a plugin phase or backend
+    // dispatch actually needs it (saving ~20-60 String allocations per request
+    // on early-reject paths and deferring them past routing on the happy path).
     let mut total_header_size: usize = 0;
     for (name, value) in req.headers() {
         let header_size = name.as_str().len() + value.len();
@@ -3768,12 +3773,6 @@ pub async fn handle_proxy_request(
             ));
         }
         total_header_size += header_size;
-        if let Ok(v) = value.to_str() {
-            // hyper's HeaderName is already lowercase-normalized, so
-            // name.as_str() returns a lowercase &str — skip to_lowercase()
-            // to avoid a per-header String allocation on the hot path.
-            ctx.headers.insert(name.as_str().to_owned(), v.to_owned());
-        }
     }
     if total_header_size > state.max_header_size_bytes {
         record_request(&state, 431);
@@ -3793,6 +3792,11 @@ pub async fn handle_proxy_request(
             ),
         ));
     }
+
+    // Store raw headers for deferred materialization. The clone is a single
+    // contiguous allocation (HeaderMap's internal Vec) — much cheaper than
+    // N individual String allocations from the previous eager conversion.
+    ctx.set_raw_headers(req.headers().clone());
 
     // Validate URL length (path + query string)
     if state.max_url_length_bytes > 0 {
@@ -3875,11 +3879,13 @@ pub async fn handle_proxy_request(
     // parsing across the real-IP-header check and the XFF walk.
     // When no resolution changes the IP, we skip the allocation entirely —
     // ctx.client_ip was already set to socket_ip by RequestContext::new().
+    // Uses raw_header_get() to read specific headers without materializing the
+    // full HashMap — only 2-3 targeted lookups on the raw HeaderMap.
     if !state.trusted_proxies.is_empty() {
         let socket_addr: Option<std::net::IpAddr> = socket_ip.parse().ok();
         if let Some(ref real_ip_header) = state.env_config.real_ip_header {
             // real_ip_header is pre-lowercased at config load time — no allocation needed
-            let header_val = ctx.headers.get(real_ip_header.as_str());
+            let header_val = ctx.raw_header_get(real_ip_header.as_str());
             if let Some(val) = header_val {
                 // Validate the direct connection is from a trusted proxy before
                 // trusting this header
@@ -3895,7 +3901,7 @@ pub async fn handle_proxy_request(
                 ctx.client_ip = client_ip::resolve_client_ip_parsed(
                     &socket_ip,
                     addr,
-                    ctx.headers.get("x-forwarded-for").map(|s| s.as_str()),
+                    ctx.raw_header_get("x-forwarded-for"),
                     &state.trusted_proxies,
                 );
             }
@@ -3904,7 +3910,7 @@ pub async fn handle_proxy_request(
             ctx.client_ip = client_ip::resolve_client_ip_parsed(
                 &socket_ip,
                 addr,
-                ctx.headers.get("x-forwarded-for").map(|s| s.as_str()),
+                ctx.raw_header_get("x-forwarded-for"),
                 &state.trusted_proxies,
             );
         }
@@ -3942,33 +3948,12 @@ pub async fn handle_proxy_request(
         None
     };
 
-    // Parse query params (skip when empty — most requests have no query string).
-    // Keys and values are percent-decoded so plugins see human-readable strings.
-    // Parameters without '=' (e.g., `?flag`) are stored with an empty-string value.
-    if !query_string.is_empty() {
-        for pair in query_string.split('&') {
-            if pair.is_empty() {
-                continue;
-            }
-            let (k, v) = if let Some((k, v)) = pair.split_once('=') {
-                (k, v)
-            } else {
-                (pair, "")
-            };
-            let decoded_k = percent_decode_str(k).decode_utf8_lossy();
-            let decoded_v = percent_decode_str(v).decode_utf8_lossy();
-            ctx.query_params
-                .insert(decoded_k.into_owned(), decoded_v.into_owned());
-        }
-    }
-
     // Extract request host for host-based routing.
     // HTTP/1.1 uses the Host header; HTTP/2 uses the :authority pseudo-header
     // (exposed via req.uri().authority()). Strip port if present and lowercase.
+    // Uses raw_header_get() to avoid materializing the full HashMap.
     let request_host: Option<String> = ctx
-        .headers
-        .get("host")
-        .map(|h| h.as_str())
+        .raw_header_get("host")
         .or_else(|| req.uri().authority().map(|a| a.as_str()))
         .map(|h| {
             let without_port = h.split(':').next().unwrap_or(h);
@@ -3987,6 +3972,11 @@ pub async fn handle_proxy_request(
 
     let (proxy, strip_len) = match route_match {
         Some(rm) => {
+            // Materialize headers now — path param injection writes to ctx.headers,
+            // and all subsequent code (plugins, backend dispatch) needs the HashMap.
+            // Requests that fail routing (404) skip this entirely, saving ~20-60
+            // String allocations.
+            ctx.materialize_headers();
             // Inject regex path parameters into context metadata and headers
             for (name, value) in &rm.path_params {
                 ctx.metadata
@@ -4117,6 +4107,11 @@ pub async fn handle_proxy_request(
         }
         plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
     }
+
+    // Materialize query params before authentication — key_auth and jwt_auth
+    // may read query params for API key / token lookup. Deferred past routing
+    // and on_request_received so plugin-less early rejects skip the work.
+    ctx.materialize_query_params();
 
     // Authentication phase
     let auth_plugins: Vec<&Arc<dyn Plugin>> =
