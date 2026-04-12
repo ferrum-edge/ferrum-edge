@@ -2092,3 +2092,134 @@ async fn test_dp_applies_delta_with_all_entity_types() {
 
     client_handle.abort();
 }
+
+/// Start a CP gRPC server with a custom broadcast channel capacity.
+/// Returns the config ArcSwap so the caller can update the config that
+/// the lag-recovery snapshot reads from.
+async fn start_test_cp_server_with_capacity(
+    config: GatewayConfig,
+    channel_capacity: usize,
+) -> (
+    SocketAddr,
+    tokio::sync::broadcast::Sender<ferrum_edge::grpc::proto::ConfigUpdate>,
+    Arc<ArcSwap<GatewayConfig>>,
+    tokio::task::JoinHandle<()>,
+) {
+    let config_arc = Arc::new(ArcSwap::new(Arc::new(config)));
+    let (server, update_tx) = CpGrpcServer::with_channel_capacity(
+        config_arc.clone(),
+        TEST_JWT_SECRET.to_string(),
+        channel_capacity,
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+
+    let handle = tokio::spawn(async move {
+        Server::builder()
+            .add_service(server.into_service())
+            .serve_with_incoming(incoming)
+            .await
+            .expect("gRPC server failed");
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    (addr, update_tx, config_arc, handle)
+}
+
+/// Verify that when a DP lags behind the broadcast channel capacity, it
+/// receives a full snapshot recovery instead of the missed deltas.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_dp_recovers_from_broadcast_channel_overflow() {
+    // Start CP with a very small channel capacity (2) so it's easy to overflow
+    let initial_config = create_test_config(1);
+    let (addr, update_tx, config_arc, _server_handle) =
+        start_test_cp_server_with_capacity(initial_config, 2).await;
+
+    let proxy_state = create_test_proxy_state();
+    let cp_url = format!("http://127.0.0.1:{}", addr.port());
+
+    // Connect DP and wait for initial config
+    let ps = proxy_state.clone();
+    let client_handle = tokio::spawn(async move {
+        dp_client::connect_and_subscribe(
+            &cp_url,
+            &test_secret(),
+            "overflow-test-node",
+            &ps,
+            None,
+            "ferrum",
+        )
+        .await
+    });
+
+    let received_initial = timeout(Duration::from_secs(5), async {
+        loop {
+            if proxy_state.config.load().proxies.len() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    assert!(
+        received_initial.is_ok(),
+        "DP should receive initial config with 1 proxy"
+    );
+
+    // Update the CP's config to the final state (5 proxies).
+    // When the DP's lag recovery triggers, it reads the *current* config
+    // from this ArcSwap, so it should get 5 proxies.
+    let final_config = create_test_config(5);
+    config_arc.store(Arc::new(final_config.clone()));
+
+    // Flood the broadcast channel with more updates than its capacity (2).
+    // The DP won't be able to keep up, triggering a BroadcastStream::Lagged error
+    // which causes the CP to send a full snapshot recovery.
+    // All flood messages use the same config so the final state is deterministic.
+    for _ in 0..10 {
+        CpGrpcServer::broadcast_update(&update_tx, &final_config);
+    }
+
+    // Wait for the DP to settle — it should have 5 proxies regardless of
+    // whether it got the recovery snapshot or a non-dropped broadcast (both
+    // carry the same 5-proxy config). The key behavior: the DP doesn't crash
+    // and ends up with the correct state.
+    let recovered = timeout(Duration::from_secs(10), async {
+        loop {
+            let cfg = proxy_state.config.load();
+            if cfg.proxies.len() == 5 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+    assert!(
+        recovered.is_ok(),
+        "DP should recover to 5 proxies after broadcast channel overflow. Current: {}",
+        proxy_state.config.load().proxies.len()
+    );
+
+    // Verify the DP can still process normal updates after recovery
+    let post_recovery_config = create_test_config(7);
+    config_arc.store(Arc::new(post_recovery_config.clone()));
+    CpGrpcServer::broadcast_update(&update_tx, &post_recovery_config);
+
+    let post_recovery = timeout(Duration::from_secs(5), async {
+        loop {
+            if proxy_state.config.load().proxies.len() == 7 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    assert!(
+        post_recovery.is_ok(),
+        "DP should process updates normally after overflow recovery"
+    );
+
+    client_handle.abort();
+}

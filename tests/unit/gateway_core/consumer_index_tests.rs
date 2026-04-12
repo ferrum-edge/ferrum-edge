@@ -389,3 +389,138 @@ fn test_find_by_mtls_identity_with_array_credentials() {
     assert_eq!(index.find_by_mtls_identity("CN=new").unwrap().id, "c1");
     assert!(index.find_by_mtls_identity("CN=other").is_none());
 }
+
+// ---- auth_type_counts / credential metrics ----
+
+fn make_consumer_with_jwt(id: &str, username: &str) -> Consumer {
+    let mut credentials = HashMap::new();
+    let mut jwt_creds = Map::new();
+    jwt_creds.insert(
+        "secret".to_string(),
+        Value::String("my-jwt-secret".to_string()),
+    );
+    credentials.insert("jwt".to_string(), Value::Object(jwt_creds));
+
+    Consumer {
+        id: id.to_string(),
+        namespace: ferrum_edge::config::types::default_namespace(),
+        username: username.to_string(),
+        custom_id: None,
+        credentials,
+        acl_groups: Vec::new(),
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    }
+}
+
+fn make_consumer_with_hmac(id: &str, username: &str) -> Consumer {
+    let mut credentials = HashMap::new();
+    let mut hmac_creds = Map::new();
+    hmac_creds.insert(
+        "secret".to_string(),
+        Value::String("hmac-secret".to_string()),
+    );
+    credentials.insert("hmac_auth".to_string(), Value::Object(hmac_creds));
+
+    Consumer {
+        id: id.to_string(),
+        namespace: ferrum_edge::config::types::default_namespace(),
+        username: username.to_string(),
+        custom_id: None,
+        credentials,
+        acl_groups: Vec::new(),
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    }
+}
+
+#[test]
+fn test_auth_type_counts_empty() {
+    let index = ConsumerIndex::new(&[]);
+    let (keyauth, basic, mtls, jwt, hmac, identity, total) = index.auth_type_counts();
+    assert_eq!(keyauth, 0);
+    assert_eq!(basic, 0);
+    assert_eq!(mtls, 0);
+    assert_eq!(jwt, 0);
+    assert_eq!(hmac, 0);
+    assert_eq!(identity, 0);
+    assert_eq!(total, 0);
+}
+
+#[test]
+fn test_auth_type_counts_with_keyauth_and_basic() {
+    let c = make_consumer("c1", "alice", Some("key-1"), None);
+    let index = ConsumerIndex::new(&[c]);
+    let (keyauth, basic, _mtls, _jwt, _hmac, _identity, total) = index.auth_type_counts();
+    assert_eq!(keyauth, 1); // one API key
+    assert_eq!(basic, 1); // make_consumer adds basicauth by default
+    assert_eq!(total, 1);
+}
+
+#[test]
+fn test_auth_type_counts_jwt_credentials() {
+    let c = make_consumer_with_jwt("c1", "alice");
+    let index = ConsumerIndex::new(&[c]);
+    let (_keyauth, _basic, _mtls, jwt, _hmac, _identity, total) = index.auth_type_counts();
+    assert_eq!(jwt, 1);
+    assert_eq!(total, 1);
+}
+
+#[test]
+fn test_auth_type_counts_hmac_credentials() {
+    let c = make_consumer_with_hmac("c1", "alice");
+    let index = ConsumerIndex::new(&[c]);
+    let (_keyauth, _basic, _mtls, _jwt, hmac, _identity, total) = index.auth_type_counts();
+    assert_eq!(hmac, 1);
+    assert_eq!(total, 1);
+}
+
+#[test]
+fn test_auth_type_counts_multiple_jwt_array_credentials() {
+    let mut credentials = HashMap::new();
+    // JWT with array of 2 credential entries (rotation scenario)
+    credentials.insert(
+        "jwt".to_string(),
+        Value::Array(vec![
+            serde_json::json!({"secret": "old-secret"}),
+            serde_json::json!({"secret": "new-secret"}),
+        ]),
+    );
+    let c = Consumer {
+        id: "c1".to_string(),
+        namespace: ferrum_edge::config::types::default_namespace(),
+        username: "alice".to_string(),
+        custom_id: None,
+        credentials,
+        acl_groups: Vec::new(),
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+    let index = ConsumerIndex::new(&[c]);
+    let (_keyauth, _basic, _mtls, jwt, _hmac, _identity, _total) = index.auth_type_counts();
+    assert_eq!(jwt, 2); // 2 credential entries in the array
+}
+
+#[test]
+fn test_auth_type_counts_mixed_consumers() {
+    let c1 = make_consumer("c1", "alice", Some("key-1"), None);
+    let c2 = make_consumer_with_jwt("c2", "bob");
+    let c3 = make_consumer_with_hmac("c3", "charlie");
+    let index = ConsumerIndex::new(&[c1, c2, c3]);
+    let (keyauth, basic, _mtls, jwt, hmac, _identity, total) = index.auth_type_counts();
+    assert_eq!(keyauth, 1);
+    assert_eq!(basic, 1); // only c1 has basicauth
+    assert_eq!(jwt, 1);
+    assert_eq!(hmac, 1);
+    assert_eq!(total, 3);
+}
+
+#[test]
+fn test_auth_type_counts_identity_index_entries() {
+    // Identity index stores username, id, and custom_id for each consumer
+    let c = make_consumer("c1", "alice", None, Some("alice-custom"));
+    let index = ConsumerIndex::new(&[c]);
+    let (_keyauth, _basic, _mtls, _jwt, _hmac, identity, _total) = index.auth_type_counts();
+    // Identity index should have: username="alice", id="c1", custom_id="alice-custom"
+    assert_eq!(identity, 3);
+}

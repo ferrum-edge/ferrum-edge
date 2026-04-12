@@ -244,3 +244,136 @@ impl super::ServiceDiscoverer for ConsulDiscoverer {
         "consul"
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    fn make_discoverer(
+        address: &str,
+        service_name: &str,
+        datacenter: Option<&str>,
+        tag: Option<&str>,
+        healthy_only: bool,
+    ) -> ConsulDiscoverer {
+        ConsulDiscoverer {
+            client: reqwest::Client::new(),
+            address: address.trim_end_matches('/').to_string(),
+            service_name: service_name.to_string(),
+            datacenter: datacenter.map(|s| s.to_string()),
+            tag: tag.map(|s| s.to_string()),
+            healthy_only,
+            token: None,
+            default_weight: 1,
+            last_index: AtomicU64::new(0),
+        }
+    }
+
+    #[test]
+    fn build_url_basic() {
+        let d = make_discoverer("http://consul:8500", "my-api", None, None, false);
+        assert_eq!(d.build_url(), "http://consul:8500/v1/health/service/my-api");
+    }
+
+    #[test]
+    fn build_url_healthy_only() {
+        let d = make_discoverer("http://consul:8500", "my-api", None, None, true);
+        assert_eq!(
+            d.build_url(),
+            "http://consul:8500/v1/health/service/my-api?passing=true"
+        );
+    }
+
+    #[test]
+    fn build_url_with_datacenter_and_tag() {
+        let d = make_discoverer(
+            "http://consul:8500",
+            "my-api",
+            Some("us-east-1"),
+            Some("v2"),
+            true,
+        );
+        let url = d.build_url();
+        assert!(url.contains("passing=true"));
+        assert!(url.contains("dc=us-east-1"));
+        assert!(url.contains("tag=v2"));
+    }
+
+    #[test]
+    fn build_url_encodes_service_name_with_special_chars() {
+        let d = make_discoverer("http://consul:8500", "my service/v2", None, None, false);
+        let url = d.build_url();
+        // Spaces and slashes should be encoded in path
+        assert!(url.contains("my%20service%2Fv2"));
+        assert!(!url.contains("my service"));
+    }
+
+    #[test]
+    fn build_url_encodes_datacenter_with_special_chars() {
+        let d = make_discoverer(
+            "http://consul:8500",
+            "api",
+            Some("dc with spaces"),
+            None,
+            false,
+        );
+        let url = d.build_url();
+        assert!(url.contains("dc=dc%20with%20spaces"));
+    }
+
+    #[test]
+    fn build_url_encodes_tag_with_ampersand() {
+        let d = make_discoverer(
+            "http://consul:8500",
+            "api",
+            None,
+            Some("key=value&other"),
+            false,
+        );
+        let url = d.build_url();
+        assert!(url.contains("tag=key%3Dvalue%26other"));
+    }
+
+    #[test]
+    fn build_url_includes_blocking_query_when_index_set() {
+        let d = make_discoverer("http://consul:8500", "api", None, None, false);
+        d.last_index.store(42, Ordering::Relaxed);
+        let url = d.build_url();
+        assert!(url.contains("index=42"));
+        assert!(url.contains("wait=30s"));
+    }
+
+    #[test]
+    fn build_url_no_blocking_query_when_index_zero() {
+        let d = make_discoverer("http://consul:8500", "api", None, None, false);
+        let url = d.build_url();
+        assert!(!url.contains("index="));
+        assert!(!url.contains("wait="));
+    }
+
+    #[test]
+    fn build_url_trailing_slash_trimmed() {
+        let d = make_discoverer("http://consul:8500/", "api", None, None, false);
+        assert_eq!(d.build_url(), "http://consul:8500/v1/health/service/api");
+    }
+
+    #[test]
+    fn build_url_all_options() {
+        let d = make_discoverer(
+            "http://consul:8500",
+            "my-api",
+            Some("dc1"),
+            Some("prod"),
+            true,
+        );
+        d.last_index.store(99, Ordering::Relaxed);
+        let url = d.build_url();
+        assert!(url.starts_with("http://consul:8500/v1/health/service/my-api?"));
+        assert!(url.contains("passing=true"));
+        assert!(url.contains("dc=dc1"));
+        assert!(url.contains("tag=prod"));
+        assert!(url.contains("index=99"));
+        assert!(url.contains("wait=30s"));
+    }
+}

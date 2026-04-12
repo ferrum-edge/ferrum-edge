@@ -454,3 +454,74 @@ pub async fn resolve_secret(key: &str) -> Result<Option<ResolvedSecret>, String>
         _ => Err(format!("Unknown secret backend '{}' for {}", backend, key)),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn match_suffix_file() {
+        let (base, backend) = match_suffix("FERRUM_DB_URL_FILE").unwrap();
+        assert_eq!(base, "FERRUM_DB_URL");
+        assert_eq!(backend, SecretBackend::File);
+    }
+
+    #[test]
+    fn match_suffix_vault() {
+        let (base, backend) = match_suffix("FERRUM_JWT_SECRET_VAULT").unwrap();
+        assert_eq!(base, "FERRUM_JWT_SECRET");
+        assert_eq!(backend, SecretBackend::Vault);
+    }
+
+    #[test]
+    fn match_suffix_aws() {
+        let (base, backend) = match_suffix("FERRUM_DB_URL_AWS").unwrap();
+        assert_eq!(base, "FERRUM_DB_URL");
+        assert_eq!(backend, SecretBackend::Aws);
+    }
+
+    #[test]
+    fn match_suffix_gcp() {
+        let (base, backend) = match_suffix("FERRUM_DB_URL_GCP").unwrap();
+        assert_eq!(base, "FERRUM_DB_URL");
+        assert_eq!(backend, SecretBackend::Gcp);
+    }
+
+    #[test]
+    fn match_suffix_azure() {
+        let (base, backend) = match_suffix("FERRUM_DB_URL_AZURE").unwrap();
+        assert_eq!(base, "FERRUM_DB_URL");
+        assert_eq!(backend, SecretBackend::Azure);
+    }
+
+    #[test]
+    fn match_suffix_no_match() {
+        assert!(match_suffix("FERRUM_DB_URL").is_none());
+        assert!(match_suffix("FERRUM_DB_URL_ETCD").is_none());
+        assert!(match_suffix("").is_none());
+        assert!(match_suffix("RANDOM_KEY").is_none());
+    }
+
+    #[test]
+    fn match_suffix_bare_suffix_returns_empty_base() {
+        let (base, backend) = match_suffix("_FILE").unwrap();
+        assert_eq!(base, "");
+        assert_eq!(backend, SecretBackend::File);
+    }
+
+    #[test]
+    fn match_suffix_azure_checked_before_file() {
+        // Ensure _AZURE is matched correctly (not confused with other suffixes)
+        let (base, backend) = match_suffix("FERRUM_X_AZURE").unwrap();
+        assert_eq!(base, "FERRUM_X");
+        assert_eq!(backend, SecretBackend::Azure);
+    }
+
+    #[test]
+    fn match_suffix_case_sensitive() {
+        // Lowercase suffixes should NOT match
+        assert!(match_suffix("FERRUM_DB_URL_file").is_none());
+        assert!(match_suffix("FERRUM_DB_URL_vault").is_none());
+        assert!(match_suffix("FERRUM_DB_URL_aws").is_none());
+    }
+}

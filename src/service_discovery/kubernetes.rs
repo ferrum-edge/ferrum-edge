@@ -255,3 +255,132 @@ impl super::ServiceDiscoverer for KubernetesDiscoverer {
         "kubernetes"
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_discoverer(
+        namespace: &str,
+        service_name: &str,
+        port_name: Option<&str>,
+        label_selector: Option<&str>,
+    ) -> KubernetesDiscoverer {
+        KubernetesDiscoverer {
+            client: reqwest::Client::new(),
+            namespace: namespace.to_string(),
+            service_name: service_name.to_string(),
+            port_name: port_name.map(|s| s.to_string()),
+            label_selector: label_selector.map(|s| s.to_string()),
+            default_weight: 1,
+            api_url_override: Some("https://k8s-api:6443".to_string()),
+        }
+    }
+
+    #[test]
+    fn api_url_with_override() {
+        let d = make_discoverer("default", "my-svc", None, None);
+        let url = d.api_url();
+        assert!(url.starts_with(
+            "https://k8s-api:6443/apis/discovery.k8s.io/v1/namespaces/default/endpointslices"
+        ));
+        // The `=` in the label selector value is percent-encoded by QUERY_VALUE_ENCODE
+        assert!(url.contains("labelSelector=kubernetes.io/service-name%3Dmy-svc"));
+    }
+
+    #[test]
+    fn api_url_encodes_namespace_with_special_chars() {
+        let d = make_discoverer("my namespace", "svc", None, None);
+        let url = d.api_url();
+        assert!(url.contains("/namespaces/my%20namespace/"));
+    }
+
+    #[test]
+    fn api_url_includes_extra_label_selector() {
+        let d = make_discoverer("prod", "api", None, Some("env=production"));
+        let url = d.api_url();
+        // Both selectors are comma-joined then encoded as a single query value
+        // The `=` and `,` in selectors get encoded
+        assert!(url.contains("labelSelector="));
+        assert!(url.contains("kubernetes.io/service-name%3Dapi"));
+        assert!(url.contains("env%3Dproduction"));
+    }
+
+    #[test]
+    fn api_url_default_fallback_without_env_vars() {
+        // Without KUBERNETES_SERVICE_HOST/PORT env vars and without override,
+        // should fall back to https://kubernetes.default.svc
+        let d = KubernetesDiscoverer {
+            client: reqwest::Client::new(),
+            namespace: "default".to_string(),
+            service_name: "test".to_string(),
+            port_name: None,
+            label_selector: None,
+            default_weight: 1,
+            api_url_override: None, // No override
+        };
+        let url = d.api_url();
+        // May use env vars if set in the test environment, or fallback
+        // Just verify it produces a valid URL structure
+        assert!(url.contains("/apis/discovery.k8s.io/v1/namespaces/default/endpointslices"));
+    }
+
+    #[test]
+    fn extract_port_with_named_port() {
+        let d = make_discoverer("default", "svc", Some("http"), None);
+        let item = serde_json::json!({
+            "ports": [
+                {"name": "grpc", "port": 9090},
+                {"name": "http", "port": 8080}
+            ]
+        });
+        assert_eq!(d.extract_port(&item), Some(8080));
+    }
+
+    #[test]
+    fn extract_port_with_named_port_not_found() {
+        let d = make_discoverer("default", "svc", Some("metrics"), None);
+        let item = serde_json::json!({
+            "ports": [
+                {"name": "http", "port": 8080}
+            ]
+        });
+        assert_eq!(d.extract_port(&item), None);
+    }
+
+    #[test]
+    fn extract_port_no_name_uses_first() {
+        let d = make_discoverer("default", "svc", None, None);
+        let item = serde_json::json!({
+            "ports": [
+                {"name": "grpc", "port": 9090},
+                {"name": "http", "port": 8080}
+            ]
+        });
+        assert_eq!(d.extract_port(&item), Some(9090)); // First port
+    }
+
+    #[test]
+    fn extract_port_empty_ports_array() {
+        let d = make_discoverer("default", "svc", None, None);
+        let item = serde_json::json!({"ports": []});
+        assert_eq!(d.extract_port(&item), None);
+    }
+
+    #[test]
+    fn extract_port_no_ports_key() {
+        let d = make_discoverer("default", "svc", None, None);
+        let item = serde_json::json!({"endpoints": []});
+        assert_eq!(d.extract_port(&item), None);
+    }
+
+    #[test]
+    fn extract_port_name_without_name_field_in_port() {
+        let d = make_discoverer("default", "svc", Some("http"), None);
+        let item = serde_json::json!({
+            "ports": [{"port": 8080}]  // No "name" field
+        });
+        // Name defaults to "" which != "http", so should return None
+        assert_eq!(d.extract_port(&item), None);
+    }
+}

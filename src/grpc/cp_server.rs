@@ -437,3 +437,49 @@ impl ConfigSync for CpGrpcServer {
         }))
     }
 }
+
+// Version compatibility is tested inline because `check_version_compatibility` is private.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn version_check_same_version_ok() {
+        assert!(CpGrpcServer::check_version_compatibility(FERRUM_VERSION).is_ok());
+    }
+
+    #[test]
+    fn version_check_empty_version_rejected() {
+        let result = CpGrpcServer::check_version_compatibility("");
+        assert!(result.is_err());
+        let status = result.unwrap_err();
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+    }
+
+    #[test]
+    fn version_check_same_major_minor_different_patch_ok() {
+        let parts: Vec<&str> = FERRUM_VERSION.split('.').collect();
+        if parts.len() >= 3 {
+            let patch: u32 = parts[2].parse().unwrap_or(0);
+            let modified = format!("{}.{}.{}", parts[0], parts[1], patch + 1);
+            assert!(CpGrpcServer::check_version_compatibility(&modified).is_ok());
+        }
+    }
+
+    #[test]
+    fn version_check_different_minor_rejected() {
+        let parts: Vec<&str> = FERRUM_VERSION.split('.').collect();
+        if parts.len() >= 2 {
+            let minor: u32 = parts[1].parse().unwrap_or(0);
+            let modified = format!("{}.{}.0", parts[0], minor + 1);
+            let result = CpGrpcServer::check_version_compatibility(&modified);
+            assert!(result.is_err());
+        }
+    }
+
+    #[test]
+    fn version_check_unparseable_version_allowed() {
+        // Single-component version is unparseable (< 2 parts), so it's allowed
+        assert!(CpGrpcServer::check_version_compatibility("1").is_ok());
+    }
+}
