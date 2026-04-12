@@ -296,21 +296,74 @@ struct LoadTestHarness {
 
 impl LoadTestHarness {
     async fn new_sqlite(enable_http2: bool) -> Result<Self, Box<dyn std::error::Error>> {
+        const MAX_ATTEMPTS: u32 = 3;
+        let mut last_err = String::new();
+        for attempt in 1..=MAX_ATTEMPTS {
+            match Self::try_new_sqlite(enable_http2).await {
+                Ok(harness) => return Ok(harness),
+                Err(e) => {
+                    last_err = e.to_string();
+                    eprintln!(
+                        "Harness startup attempt {}/{} failed: {}",
+                        attempt, MAX_ATTEMPTS, last_err
+                    );
+                    if attempt < MAX_ATTEMPTS {
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    }
+                }
+            }
+        }
+        Err(format!(
+            "Failed to create harness after {} attempts: {}",
+            MAX_ATTEMPTS, last_err
+        )
+        .into())
+    }
+
+    async fn try_new_sqlite(enable_http2: bool) -> Result<Self, Box<dyn std::error::Error>> {
         let temp_dir = TempDir::new()?;
         let db_path = temp_dir.path().join("load_test.db");
         let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
-        Self::start(temp_dir, "sqlite", &db_url, "SQLite", enable_http2).await
+        Self::try_start(temp_dir, "sqlite", &db_url, "SQLite", enable_http2).await
     }
 
     async fn new_postgres(
         db_url: &str,
         enable_http2: bool,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let temp_dir = TempDir::new()?;
-        Self::start(temp_dir, "postgres", db_url, "PostgreSQL", enable_http2).await
+        const MAX_ATTEMPTS: u32 = 3;
+        let mut last_err = String::new();
+        for attempt in 1..=MAX_ATTEMPTS {
+            match Self::try_new_postgres(db_url, enable_http2).await {
+                Ok(harness) => return Ok(harness),
+                Err(e) => {
+                    last_err = e.to_string();
+                    eprintln!(
+                        "Harness startup attempt {}/{} failed: {}",
+                        attempt, MAX_ATTEMPTS, last_err
+                    );
+                    if attempt < MAX_ATTEMPTS {
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    }
+                }
+            }
+        }
+        Err(format!(
+            "Failed to create harness after {} attempts: {}",
+            MAX_ATTEMPTS, last_err
+        )
+        .into())
     }
 
-    async fn start(
+    async fn try_new_postgres(
+        db_url: &str,
+        enable_http2: bool,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let temp_dir = TempDir::new()?;
+        Self::try_start(temp_dir, "postgres", db_url, "PostgreSQL", enable_http2).await
+    }
+
+    async fn try_start(
         temp_dir: TempDir,
         db_type: &str,
         db_url: &str,
@@ -413,7 +466,7 @@ impl LoadTestHarness {
         let proxy_base_url = format!("http://127.0.0.1:{}", proxy_port);
         let admin_base_url = format!("http://127.0.0.1:{}", admin_port);
 
-        let harness = Self {
+        let mut harness = Self {
             _temp_dir: temp_dir,
             gateway_process: Some(child),
             proxy_base_url,
@@ -427,8 +480,16 @@ impl LoadTestHarness {
             backend_pool_http2: enable_http2,
         };
 
-        harness.wait_for_health().await?;
-        Ok(harness)
+        match harness.wait_for_health().await {
+            Ok(()) => Ok(harness),
+            Err(e) => {
+                if let Some(mut child) = harness.gateway_process.take() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+                Err(e)
+            }
+        }
     }
 
     async fn wait_for_health(&self) -> Result<(), Box<dyn std::error::Error>> {

@@ -144,14 +144,20 @@ FERRUM_CP_GRPC_LISTEN_ADDR="0.0.0.0:50051" \
 FERRUM_CP_DP_GRPC_JWT_SECRET="grpc-secret" \
 cargo run --release
 
-# Data Plane
+# Data Plane (single CP)
 FERRUM_MODE=dp \
 FERRUM_DP_CP_GRPC_URL="http://localhost:50051" \
 FERRUM_CP_DP_GRPC_JWT_SECRET="grpc-secret" \
 cargo run --release
+
+# Data Plane (multi-CP failover — connects to primary, fails over to secondary)
+FERRUM_MODE=dp \
+FERRUM_DP_CP_GRPC_URLS="https://cp1:50051,https://cp2:50051,https://cp3:50051" \
+FERRUM_CP_DP_GRPC_JWT_SECRET="grpc-secret" \
+cargo run --release
 ```
 
-For production CP/DP with TLS, see [docs/cp_dp_mode.md](docs/cp_dp_mode.md#transport-security-tlsmtls).
+For production CP/DP with TLS, see [docs/cp_dp_mode.md](docs/cp_dp_mode.md#transport-security-tlsmtls). For multi-region high availability, see [docs/multi_region_ha.md](docs/multi_region_ha.md).
 
 ## Default Ports
 

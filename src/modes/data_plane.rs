@@ -91,10 +91,18 @@ pub async fn run(
     );
 
     // Spawn the DP gRPC client to connect to CP and receive config updates
-    let cp_url = env_config
-        .dp_cp_grpc_url
-        .clone()
-        .ok_or_else(|| anyhow::anyhow!("FERRUM_DP_CP_GRPC_URL is required in dp mode"))?;
+    let cp_urls = env_config.resolved_dp_cp_grpc_urls();
+    if cp_urls.is_empty() {
+        return Err(anyhow::anyhow!(
+            "FERRUM_DP_CP_GRPC_URL or FERRUM_DP_CP_GRPC_URLS is required in dp mode"
+        ));
+    }
+    if cp_urls.len() > 1 {
+        info!(
+            "DP mode configured with {} CP URLs for failover",
+            cp_urls.len()
+        );
+    }
     let jwt_secret = crate::grpc::dp_client::GrpcJwtSecret::new(
         env_config.cp_dp_grpc_jwt_secret.clone().ok_or_else(|| {
             anyhow::anyhow!("FERRUM_CP_DP_GRPC_JWT_SECRET is required in dp mode")
@@ -106,7 +114,7 @@ pub async fn run(
         let has_tls = env_config.dp_grpc_tls_ca_cert_path.is_some()
             || env_config.dp_grpc_tls_client_cert_path.is_some()
             || env_config.dp_grpc_tls_no_verify
-            || cp_url.starts_with("https://");
+            || cp_urls.iter().any(|u| u.starts_with("https://"));
 
         if has_tls {
             // Check certificate expiration for DP gRPC certs
@@ -344,7 +352,7 @@ pub async fn run(
     // Create shared CP connection state for the /cluster endpoint
     let cp_connection_state = Arc::new(arc_swap::ArcSwap::new(Arc::new(
         crate::grpc::dp_client::DpCpConnectionState::new_disconnected(
-            env_config.dp_cp_grpc_url.as_deref().unwrap_or(""),
+            cp_urls.first().map(|s| s.as_str()).unwrap_or(""),
         ),
     )));
 
@@ -496,17 +504,18 @@ pub async fn run(
     let dp_shutdown = shutdown_tx.subscribe();
     let dp_startup_ready = startup_ready.clone();
     let dp_namespace = env_config.namespace.clone();
+    let dp_primary_retry_secs = env_config.dp_cp_failover_primary_retry_secs;
     let dp_conn_state = cp_connection_state.clone();
     let dp_client_handle = tokio::spawn(async move {
         crate::grpc::dp_client::start_dp_client_with_shutdown_and_startup_ready(
-            vec![cp_url],
+            cp_urls,
             jwt_secret,
             dp_proxy_state,
             Some(dp_shutdown),
             dp_grpc_tls,
             Some(dp_startup_ready),
             dp_namespace,
-            0, // primary_retry_secs (multi-CP failover not yet wired in env_config)
+            dp_primary_retry_secs,
             Some(dp_conn_state),
         )
         .await;

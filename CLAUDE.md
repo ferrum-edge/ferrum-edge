@@ -119,7 +119,7 @@ GHCR uses the built-in `GITHUB_TOKEN` — no additional secret needed. Ensure re
 | `database` | Single-instance, DB-backed | Read/Write | Yes | PostgreSQL/MySQL/SQLite via polling |
 | `file` | Single-instance, file-backed | Read-only | Yes | YAML/JSON file, SIGHUP reload (Unix only) |
 | `cp` | Control Plane | Read/Write | **No** | Database + gRPC distribution |
-| `dp` | Data Plane | Read-only | Yes | gRPC stream from CP |
+| `dp` | Data Plane | Read-only | Yes | gRPC stream from CP (multi-CP failover via `FERRUM_DP_CP_GRPC_URLS`) |
 | `migrate` | Schema migration utility | No | No | Runs DB migrations then exits |
 
 **Disabling plaintext listeners (TLS-only operation)**: Setting `FERRUM_PROXY_HTTP_PORT=0` disables the plaintext HTTP proxy listener, `FERRUM_ADMIN_HTTP_PORT=0` disables the plaintext admin HTTP listener, and setting the port to `0` in `FERRUM_CP_GRPC_LISTEN_ADDR` (e.g., `0.0.0.0:0`) disables the gRPC listener. Disabled ports are excluded from `reserved_gateway_ports()` so stream proxy port conflict checks are unaffected. The gateway warns at startup if a plaintext port is disabled but no TLS is configured for that surface (which would leave no listeners active). The `ferrum-edge health` CLI subcommand auto-detects `FERRUM_ADMIN_HTTP_PORT=0` and switches to TLS mode (port 9443), or accepts `--tls` / `--tls-no-verify` flags explicitly.
@@ -265,7 +265,7 @@ src/
 │       └── redis_rate_limiter.rs  # Shared Redis client for centralized rate limiting
 ├── grpc/                      # CP/DP gRPC communication
 │   ├── cp_server.rs           # Control Plane gRPC server (ConfigSync service, broadcast channel, DpNodeRegistry)
-│   └── dp_client.rs           # Data Plane gRPC client (subscribe + multi-CP failover + DpCpConnectionState)
+│   └── dp_client.rs           # Data Plane gRPC client (subscribe + multi-CP failover + DpCpConnectionState + exponential backoff reconnect)
 ├── overload.rs                # Overload manager: resource monitors, progressive load shedding, graceful drain
 ├── load_balancer.rs           # Load balancing algorithms + per-upstream cache (Arc<UpstreamTarget> for zero-cost selection) + HealthContext for dual-map health filtering
 ├── health_check.rs            # Active (shared per-upstream probes) + passive (isolated per-proxy) health checking with two-level index
@@ -517,6 +517,83 @@ tests/
 **Inline `#[cfg(test)]` blocks are correct and intentional** for any test that calls a private function — do not move them to `tests/unit/` and do not make functions `pub` just to enable external testing.
 
 **Functional test subprocess rule**: Use `Stdio::null()` for the gateway's stdout/stderr unless the test explicitly reads the output. `Stdio::piped()` without reading causes a pipe-buffer deadlock (OS buffer fills from debug logs → gateway blocks on writes → test hangs).
+
+**Functional test port allocation — MUST use retry pattern**: Functional tests spawn the gateway binary as a subprocess and pass it ephemeral ports. The bind-drop-rebind pattern (bind port 0, get port N, drop listener, spawn gateway with port N) is vulnerable to port races — another parallel test can steal port N between the drop and the gateway bind. The gateway fails silently (stderr is null) and the health check times out.
+
+**All functional tests MUST use one of these two retry patterns:**
+
+*Struct harness pattern* — split `new()` into a retry wrapper + single-attempt method:
+```rust
+impl TestHarness {
+    async fn new() -> Result<Self, Box<dyn std::error::Error>> {
+        const MAX_ATTEMPTS: u32 = 3;
+        let mut last_err = String::new();
+        for attempt in 1..=MAX_ATTEMPTS {
+            match Self::try_new().await {
+                Ok(harness) => return Ok(harness),
+                Err(e) => {
+                    last_err = e.to_string();
+                    eprintln!("Harness startup attempt {}/{} failed: {}", attempt, MAX_ATTEMPTS, last_err);
+                    if attempt < MAX_ATTEMPTS {
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                    }
+                }
+            }
+        }
+        Err(format!("Failed to create harness after {} attempts: {}", MAX_ATTEMPTS, last_err).into())
+    }
+
+    async fn try_new() -> Result<Self, Box<dyn std::error::Error>> {
+        // Allocate fresh ports, temp dir, spawn gateway...
+        // On wait_for_health failure, kill the gateway before returning Err:
+        match harness.wait_for_health().await {
+            Ok(()) => Ok(harness),
+            Err(e) => {
+                if let Some(mut child) = harness.gateway_process.take() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+                Err(e)
+            }
+        }
+    }
+}
+```
+
+*Inline test pattern* — use a `start_gateway_with_retry()` helper:
+```rust
+async fn start_gateway_with_retry(config_path: &str) -> (std::process::Child, u16, u16) {
+    const MAX_ATTEMPTS: u32 = 3;
+    for attempt in 1..=MAX_ATTEMPTS {
+        // Allocate fresh ports each attempt
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_port = proxy_listener.local_addr().unwrap().port();
+        drop(proxy_listener);
+        let admin_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let admin_port = admin_listener.local_addr().unwrap().port();
+        drop(admin_listener);
+
+        let mut child = start_gateway(config_path, proxy_port, admin_port);
+        if wait_for_gateway(admin_port).await {
+            return (child, proxy_port, admin_port);
+        }
+        eprintln!("Gateway startup attempt {}/{} failed", attempt, MAX_ATTEMPTS);
+        let _ = child.kill();
+        let _ = child.wait();
+        if attempt < MAX_ATTEMPTS {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    }
+    panic!("Gateway did not start after {} attempts", MAX_ATTEMPTS);
+}
+```
+
+**Key rules for functional test port allocation:**
+- **Never assume an ephemeral port will still be free** after dropping the listener — always retry.
+- **Kill the gateway process before retrying** — otherwise the zombie holds the old port and leaks FDs.
+- **Each retry must allocate fresh ports AND fresh temp dirs/DBs** — reusing the same SQLite path with a killed gateway can leave a corrupted WAL.
+- **Backend/echo server ports should be held, not dropped** — pass the pre-bound `TcpListener` directly to the echo server task (e.g., `start_echo_server_on(listener)`) instead of dropping it and re-binding by port number. This eliminates the race for same-process listeners.
+- **`wait_for_health`/`wait_for_gateway` should return `bool` or `Result`** — never panic directly. The retry wrapper handles the failure.
 
 ## Development Guidelines
 
@@ -932,7 +1009,9 @@ Reduce per-request allocations in plugin lookup
 | `FERRUM_CP_GRPC_TLS_CLIENT_CA_PATH` | (none) | PEM CA for verifying DP client certs (mTLS) |
 | `FERRUM_CP_DP_GRPC_JWT_SECRET` | (required in cp and dp modes) | Shared JWT secret for CP/DP gRPC auth (required in cp and dp modes) |
 | `FERRUM_CP_BROADCAST_CHANNEL_CAPACITY` | `128` | Broadcast channel capacity for CP-to-DP delta fan-out. DPs that lag behind by more than this many updates receive a full snapshot instead. Increase for high config churn |
-| `FERRUM_DP_CP_GRPC_URL` | (required for dp mode) | CP gRPC URL for DP to connect to (`http://` or `https://`) |
+| `FERRUM_DP_CP_GRPC_URL` | (required for dp mode unless `_URLS` set) | CP gRPC URL for DP to connect to (`http://` or `https://`) |
+| `FERRUM_DP_CP_GRPC_URLS` | (none) | Comma-separated priority-ordered CP URLs for DP failover. Takes precedence over `FERRUM_DP_CP_GRPC_URL` |
+| `FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS` | `300` | How often (seconds) the DP retries the primary CP while connected to a fallback. `0` = disabled |
 | `FERRUM_DP_GRPC_TLS_CA_CERT_PATH` | (none) | PEM CA cert for verifying CP server cert |
 | `FERRUM_DP_GRPC_TLS_CLIENT_CERT_PATH` | (none) | PEM client cert for DP-to-CP mTLS |
 | `FERRUM_DP_GRPC_TLS_CLIENT_KEY_PATH` | (none) | PEM client key for DP-to-CP mTLS |
@@ -1011,7 +1090,7 @@ See `src/config/env_config.rs` for the full list of 90+ environment variables.
 - Service: `ConfigSync` with `Subscribe` (streaming) and `GetFullConfig` (unary)
 - Auth: HS256 JWT in gRPC metadata (`authorization` key)
 - **CP broadcast**: `CpGrpcServer::with_channel_capacity()` creates the tokio broadcast channel. `CpGrpcServer::new()` is a convenience wrapper that defaults to capacity 128 (used by tests). Production code in `control_plane.rs` calls `with_channel_capacity()` passing `env_config.cp_broadcast_channel_capacity`.
-- **DP reconnect**: `start_dp_client_with_shutdown_and_startup_ready()` uses exponential backoff with jitter (1s → 2s → 4s → … → 30s cap, ±25% jitter) to prevent thundering-herd reconnection storms when many DPs restart simultaneously. Backoff resets to 1s on clean stream disconnect (CP graceful shutdown). The single-shot `connect_and_subscribe()` has no retry loop (used by tests and one-off callers).
+- **DP reconnect with multi-CP failover**: `start_dp_client_with_shutdown_and_startup_ready()` accepts a priority-ordered `Vec<String>` of CP URLs. When the primary CP is unreachable, the DP fails over to the next URL with a fresh backoff. After exhausting all URLs, it cycles back to the primary with accumulated backoff. When connected to a fallback CP, a `tokio::select!` races the config stream against a primary-retry timer (`FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS`, default 300s) so the DP proactively returns to the primary when it recovers. Exponential backoff with jitter (1s → 2s → 4s → … → 30s cap, ±25% jitter) prevents thundering-herd reconnection storms. `FERRUM_DP_CP_GRPC_URLS` takes precedence over `FERRUM_DP_CP_GRPC_URL`; when only the single-URL var is set, behavior is identical to before. The single-shot `connect_and_subscribe()` has no retry loop (used by tests and one-off callers).
 
 ## Docker
 

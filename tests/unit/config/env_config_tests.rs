@@ -2510,3 +2510,176 @@ fn test_env_config_status_metrics_window_seconds_minimum_clamped() {
         },
     );
 }
+
+// --- DP CP failover URL tests ---
+
+#[test]
+fn test_resolved_dp_cp_grpc_urls_single_url_only() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "dp"),
+            ("FERRUM_DP_CP_GRPC_URL", "http://cp1:50051"),
+            ("FERRUM_CP_DP_GRPC_JWT_SECRET", "secret"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            let urls = config.resolved_dp_cp_grpc_urls();
+            assert_eq!(urls, vec!["http://cp1:50051"]);
+        },
+    );
+}
+
+#[test]
+fn test_resolved_dp_cp_grpc_urls_multi_urls_only() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "dp"),
+            (
+                "FERRUM_DP_CP_GRPC_URLS",
+                "https://cp1:50051,https://cp2:50051,https://cp3:50051",
+            ),
+            ("FERRUM_CP_DP_GRPC_JWT_SECRET", "secret"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            let urls = config.resolved_dp_cp_grpc_urls();
+            assert_eq!(
+                urls,
+                vec![
+                    "https://cp1:50051",
+                    "https://cp2:50051",
+                    "https://cp3:50051",
+                ]
+            );
+        },
+    );
+}
+
+#[test]
+fn test_resolved_dp_cp_grpc_urls_multi_takes_precedence() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "dp"),
+            ("FERRUM_DP_CP_GRPC_URL", "http://single:50051"),
+            (
+                "FERRUM_DP_CP_GRPC_URLS",
+                "https://cp1:50051,https://cp2:50051",
+            ),
+            ("FERRUM_CP_DP_GRPC_JWT_SECRET", "secret"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            let urls = config.resolved_dp_cp_grpc_urls();
+            assert_eq!(urls, vec!["https://cp1:50051", "https://cp2:50051"]);
+        },
+    );
+}
+
+#[test]
+fn test_resolved_dp_cp_grpc_urls_trims_whitespace() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "dp"),
+            (
+                "FERRUM_DP_CP_GRPC_URLS",
+                " https://cp1:50051 , https://cp2:50051 ",
+            ),
+            ("FERRUM_CP_DP_GRPC_JWT_SECRET", "secret"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(
+                config.dp_cp_grpc_urls,
+                vec!["https://cp1:50051", "https://cp2:50051"]
+            );
+        },
+    );
+}
+
+#[test]
+fn test_resolved_dp_cp_grpc_urls_filters_empty() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "dp"),
+            (
+                "FERRUM_DP_CP_GRPC_URLS",
+                "https://cp1:50051,,https://cp2:50051,",
+            ),
+            ("FERRUM_CP_DP_GRPC_JWT_SECRET", "secret"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(
+                config.dp_cp_grpc_urls,
+                vec!["https://cp1:50051", "https://cp2:50051"]
+            );
+        },
+    );
+}
+
+#[test]
+fn test_dp_mode_validation_accepts_urls_without_url() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "dp"),
+            ("FERRUM_DP_CP_GRPC_URLS", "https://cp1:50051"),
+            ("FERRUM_CP_DP_GRPC_JWT_SECRET", "secret"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert!(config.dp_cp_grpc_url.is_none());
+            assert_eq!(config.resolved_dp_cp_grpc_urls(), vec!["https://cp1:50051"]);
+        },
+    );
+}
+
+#[test]
+fn test_dp_mode_validation_rejects_no_url() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "dp"),
+            ("FERRUM_CP_DP_GRPC_JWT_SECRET", "secret"),
+        ],
+        || {
+            let result = EnvConfig::from_env();
+            assert!(result.is_err());
+            let err = result.unwrap_err();
+            assert!(
+                err.contains("FERRUM_DP_CP_GRPC_URL or FERRUM_DP_CP_GRPC_URLS"),
+                "Error should mention both env vars: {}",
+                err
+            );
+        },
+    );
+}
+
+#[test]
+fn test_dp_cp_failover_primary_retry_secs_default() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "dp"),
+            ("FERRUM_DP_CP_GRPC_URL", "http://cp:50051"),
+            ("FERRUM_CP_DP_GRPC_JWT_SECRET", "secret"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.dp_cp_failover_primary_retry_secs, 300);
+        },
+    );
+}
+
+#[test]
+fn test_dp_cp_failover_primary_retry_secs_custom() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "dp"),
+            ("FERRUM_DP_CP_GRPC_URL", "http://cp:50051"),
+            ("FERRUM_CP_DP_GRPC_JWT_SECRET", "secret"),
+            ("FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS", "60"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.dp_cp_failover_primary_retry_secs, 60);
+        },
+    );
+}

@@ -91,9 +91,11 @@ See [mongodb.md](mongodb.md) for the full deployment guide including read prefer
 |---|---|---|---|
 | `FERRUM_CP_GRPC_LISTEN_ADDR` | CP mode | — | gRPC listen address (e.g., `0.0.0.0:50051`) |
 | `FERRUM_CP_DP_GRPC_JWT_SECRET` | CP & DP modes | — | Shared JWT secret for CP/DP gRPC auth (DP generates short-lived JWTs, CP validates) |
-| `FERRUM_DP_CP_GRPC_URL` | DP mode | — | Control Plane gRPC URL |
+| `FERRUM_DP_CP_GRPC_URL` | DP mode (unless `_URLS` set) | — | Control Plane gRPC URL |
+| `FERRUM_DP_CP_GRPC_URLS` | No | — | Comma-separated priority-ordered CP URLs for DP failover. Takes precedence over single URL |
+| `FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS` | No | `300` | Retry primary CP interval (seconds) when connected to a fallback. `0` = disabled |
 
-See [cp_dp_mode.md](cp_dp_mode.md) for CP/DP TLS environment variables (`FERRUM_CP_GRPC_TLS_*`, `FERRUM_DP_GRPC_TLS_*`).
+See [cp_dp_mode.md](cp_dp_mode.md) for CP/DP TLS environment variables (`FERRUM_CP_GRPC_TLS_*`, `FERRUM_DP_GRPC_TLS_*`) and [multi_region_ha.md](multi_region_ha.md) for multi-region deployment patterns.
 
 ### Size Limits
 

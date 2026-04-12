@@ -18,7 +18,7 @@ A comprehensive feature list for Ferrum Edge.
 - **Database** — single-instance with PostgreSQL, MySQL, SQLite, or MongoDB backend
 - **File** — single-instance with YAML/JSON config, SIGHUP reload (Unix only; restart required on other platforms)
 - **Control Plane (CP)** — centralized config authority, gRPC distribution to DPs
-- **Data Plane (DP)** — horizontally scalable traffic processing nodes
+- **Data Plane (DP)** — horizontally scalable traffic processing nodes with multi-CP failover (`FERRUM_DP_CP_GRPC_URLS`)
 
 ## Routing
 
@@ -271,6 +271,8 @@ All in-memory caches are bounded to prevent unbounded memory growth under advers
 - In-memory config cache survives source outages (DB, file, gRPC)
 - Startup failover with externally provisioned backup config (`FERRUM_DB_CONFIG_BACKUP_PATH`)
 - Multi-URL database failover (`FERRUM_DB_FAILOVER_URLS`) with automatic ordered connection failover. MongoDB replica sets handle failover natively via the connection string
+- DP multi-CP failover (`FERRUM_DP_CP_GRPC_URLS`) — priority-ordered CP list with automatic failover and primary-preference retry
+- Multi-region high availability via shared database cluster — see [docs/multi_region_ha.md](docs/multi_region_ha.md)
 - Read replica support — SQL: `FERRUM_DB_READ_REPLICA_URL` offloads config polling reads. MongoDB: `readPreference=secondaryPreferred` in connection string (driver routes reads to secondaries automatically)
 - Graceful shutdown with active request draining (SIGTERM/SIGINT)
 - Client observability headers (`X-Gateway-Error`, `X-Gateway-Upstream-Status`)

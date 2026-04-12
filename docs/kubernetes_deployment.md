@@ -364,8 +364,14 @@ spec:
 env:
   - name: FERRUM_MODE
     value: dp
+  # Single CP (simple):
   - name: FERRUM_DP_CP_GRPC_URL
     value: http://ferrum-edge-cp:50051
+  # Multi-CP failover (recommended for HA — takes precedence over single URL):
+  # - name: FERRUM_DP_CP_GRPC_URLS
+  #   value: "https://cp-east:50051,https://cp-west:50051,https://cp-central:50051"
+  # - name: FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS
+  #   value: "300"
   - name: FERRUM_CP_DP_GRPC_JWT_SECRET
     valueFrom:
       secretKeyRef:
@@ -377,6 +383,8 @@ env:
         name: ferrum-edge-secrets
         key: admin-jwt-secret
 ```
+
+For multi-region Kubernetes deployments with CP failover across clusters, see [multi_region_ha.md](multi_region_ha.md).
 
 Data Plane proxy service example:
 

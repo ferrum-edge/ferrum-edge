@@ -100,6 +100,44 @@ The CP/DP architecture is designed so that data source outages are invisible to 
 - **Admin API fallback**: Both CP and DP admin API read endpoints fall back to the in-memory cached config when the database is unavailable. Responses served from cache include an `X-Data-Source: cached` header. Write operations require a live database and return `503` if unavailable.
 - **Health visibility**: The `/health` endpoint reports `cached_config` status (available, loaded_at, proxy/consumer counts) so operators can see whether the node is running on cached data.
 
+## DP Multi-CP Failover
+
+Data Planes can be configured with a priority-ordered list of Control Plane URLs for automatic failover. When the primary CP is unreachable, the DP fails over to the next CP in the list.
+
+### How It Works
+
+1. The DP connects to the first (primary) CP URL
+2. If the connection fails, the DP moves to the next URL with a fresh backoff
+3. After exhausting all URLs, the DP loops back to the primary with accumulated backoff
+4. When connected to a fallback CP, the DP periodically retries the primary (configurable via `FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS`, default: 300s)
+5. On clean stream disconnect from a fallback CP, the DP always tries the primary first
+
+### Behavior Summary
+
+| Scenario | Behavior |
+|----------|----------|
+| Primary CP down on startup | Try primary, fail, try secondary immediately (fresh backoff) |
+| Primary CP drops mid-stream | Stream ends → try primary first (clean disconnect) |
+| All CPs exhausted | Cycle back to primary; keep accumulated backoff |
+| Connected to fallback, primary comes back | After retry interval, disconnect from fallback and retry primary |
+| Single URL configured | Identical to current behavior (backward compatible) |
+
+### Configuration
+
+```bash
+# Priority-ordered list of CP URLs (highest priority first)
+FERRUM_DP_CP_GRPC_URLS=https://cp1.example.com:50051,https://cp2.example.com:50051,https://cp3.example.com:50051
+
+# How often to retry the primary while connected to a fallback (default: 300s)
+FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS=300
+```
+
+**TLS config is shared** across all CP URLs — the same `FERRUM_DP_GRPC_TLS_*` settings apply to every CP connection. SNI is extracted per-URL automatically.
+
+**Backward compatible** — `FERRUM_DP_CP_GRPC_URL` (single URL) continues to work. `FERRUM_DP_CP_GRPC_URLS` takes precedence when both are set.
+
+For multi-region high-availability patterns using this feature, see [Multi-Region High Availability](multi_region_ha.md).
+
 ## Environment Variables
 
 ### Control Plane
@@ -122,7 +160,9 @@ The CP/DP architecture is designed so that data source outages are invisible to 
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `FERRUM_MODE` | Yes | Set to `dp` |
-| `FERRUM_DP_CP_GRPC_URL` | Yes | CP gRPC endpoint URL (`http://` or `https://`) |
+| `FERRUM_DP_CP_GRPC_URL` | Yes (unless `_URLS` set) | CP gRPC endpoint URL (`http://` or `https://`) |
+| `FERRUM_DP_CP_GRPC_URLS` | No | Comma-separated priority-ordered CP URLs for failover |
+| `FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS` | No | Retry primary CP interval when on fallback (default: 300) |
 | `FERRUM_CP_DP_GRPC_JWT_SECRET` | Yes | Shared JWT secret for CP/DP gRPC auth (same value as CP) |
 | `FERRUM_DP_GRPC_TLS_CA_CERT_PATH` | No | PEM CA cert for verifying CP server cert |
 | `FERRUM_DP_GRPC_TLS_CLIENT_CERT_PATH` | No | PEM client cert for mTLS |

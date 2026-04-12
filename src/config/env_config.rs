@@ -285,6 +285,13 @@ pub struct EnvConfig {
     pub cp_grpc_listen_addr: Option<String>,
     pub cp_dp_grpc_jwt_secret: Option<String>,
     pub dp_cp_grpc_url: Option<String>,
+    /// Comma-separated, priority-ordered list of CP gRPC URLs for DP failover.
+    /// When set, takes precedence over `dp_cp_grpc_url`. The DP connects to the
+    /// first URL and fails over to subsequent URLs when unreachable.
+    pub dp_cp_grpc_urls: Vec<String>,
+    /// How often (in seconds) the DP retries the primary (first) CP URL while
+    /// connected to a fallback CP. Default: 300 (5 minutes). 0 = disabled.
+    pub dp_cp_failover_primary_retry_secs: u64,
 
     // CP gRPC TLS (server-side)
     /// Path to PEM certificate for the CP gRPC server. When set (with key),
@@ -767,6 +774,8 @@ impl Default for EnvConfig {
             cp_grpc_listen_addr: None,
             cp_dp_grpc_jwt_secret: None,
             dp_cp_grpc_url: None,
+            dp_cp_grpc_urls: Vec::new(),
+            dp_cp_failover_primary_retry_secs: 300,
             cp_grpc_tls_cert_path: None,
             cp_grpc_tls_key_path: None,
             cp_grpc_tls_client_ca_path: None,
@@ -1020,6 +1029,19 @@ impl EnvConfig {
             cp_grpc_listen_addr: resolve_var(conf, "FERRUM_CP_GRPC_LISTEN_ADDR"),
             cp_dp_grpc_jwt_secret: resolve_var(conf, "FERRUM_CP_DP_GRPC_JWT_SECRET"),
             dp_cp_grpc_url: resolve_var(conf, "FERRUM_DP_CP_GRPC_URL"),
+            dp_cp_grpc_urls: resolve_var(conf, "FERRUM_DP_CP_GRPC_URLS")
+                .map(|s| {
+                    s.split(',')
+                        .map(|u| u.trim().to_string())
+                        .filter(|u| !u.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default(),
+            dp_cp_failover_primary_retry_secs: resolve_u64(
+                conf,
+                "FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS",
+                300,
+            ),
 
             // CP gRPC TLS
             cp_grpc_tls_cert_path: resolve_var(conf, "FERRUM_CP_GRPC_TLS_CERT_PATH"),
@@ -1457,6 +1479,20 @@ impl EnvConfig {
         std::net::SocketAddr::new(ip, port)
     }
 
+    /// Returns the resolved list of CP gRPC URLs for DP failover, priority-ordered.
+    ///
+    /// `FERRUM_DP_CP_GRPC_URLS` takes precedence. Falls back to
+    /// `FERRUM_DP_CP_GRPC_URL` as a single-element list.
+    pub fn resolved_dp_cp_grpc_urls(&self) -> Vec<String> {
+        if !self.dp_cp_grpc_urls.is_empty() {
+            self.dp_cp_grpc_urls.clone()
+        } else if let Some(ref url) = self.dp_cp_grpc_url {
+            vec![url.clone()]
+        } else {
+            Vec::new()
+        }
+    }
+
     /// Collect all ports reserved by the gateway's own listeners.
     ///
     /// Stream proxy `listen_port` values must not collide with these ports.
@@ -1727,8 +1763,11 @@ impl EnvConfig {
                 }
             }
             OperatingMode::DataPlane => {
-                if self.dp_cp_grpc_url.is_none() {
-                    return Err("FERRUM_DP_CP_GRPC_URL is required in dp mode".into());
+                if self.dp_cp_grpc_url.is_none() && self.dp_cp_grpc_urls.is_empty() {
+                    return Err(
+                        "FERRUM_DP_CP_GRPC_URL or FERRUM_DP_CP_GRPC_URLS is required in dp mode"
+                            .into(),
+                    );
                 }
                 if self.cp_dp_grpc_jwt_secret.is_none() {
                     return Err("FERRUM_CP_DP_GRPC_JWT_SECRET is required in dp mode".into());

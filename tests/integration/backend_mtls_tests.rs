@@ -113,6 +113,8 @@ fn create_test_env_config_with_mtls(
         cp_grpc_listen_addr: None,
         cp_dp_grpc_jwt_secret: None,
         dp_cp_grpc_url: None,
+        dp_cp_grpc_urls: Vec::new(),
+        dp_cp_failover_primary_retry_secs: 300,
         cp_grpc_tls_cert_path: None,
         cp_grpc_tls_key_path: None,
         cp_grpc_tls_client_ca_path: None,

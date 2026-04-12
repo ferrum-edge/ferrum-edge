@@ -35,6 +35,36 @@ struct AdminTestHarness {
 
 impl AdminTestHarness {
     async fn new() -> Result<Self, Box<dyn std::error::Error>> {
+        // Retry harness creation up to 3 times to handle ephemeral port races.
+        // The bind-drop-rebind pattern (bind port 0, get port N, drop, spawn
+        // gateway with port N) is vulnerable to another process stealing port N
+        // between the drop and the gateway bind. In CI with parallel tests this
+        // happens occasionally. Retrying with fresh ports is the simplest fix.
+        const MAX_ATTEMPTS: u32 = 3;
+        let mut last_err = String::new();
+        for attempt in 1..=MAX_ATTEMPTS {
+            match Self::try_new().await {
+                Ok(harness) => return Ok(harness),
+                Err(e) => {
+                    last_err = e.to_string();
+                    eprintln!(
+                        "Harness startup attempt {}/{} failed: {}",
+                        attempt, MAX_ATTEMPTS, last_err
+                    );
+                    if attempt < MAX_ATTEMPTS {
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                    }
+                }
+            }
+        }
+        Err(format!(
+            "Failed to create harness after {} attempts: {}",
+            MAX_ATTEMPTS, last_err
+        )
+        .into())
+    }
+
+    async fn try_new() -> Result<Self, Box<dyn std::error::Error>> {
         let temp_dir = TempDir::new()?;
         let jwt_secret = "test-admin-ops-jwt-secret-12345".to_string();
         let jwt_issuer = "ferrum-edge-admin-test".to_string();
@@ -85,7 +115,7 @@ impl AdminTestHarness {
 
         let admin_base_url = format!("http://127.0.0.1:{}", admin_port);
 
-        let harness = Self {
+        let mut harness = Self {
             _temp_dir: temp_dir,
             gateway_process: Some(child),
             admin_base_url,
@@ -93,8 +123,18 @@ impl AdminTestHarness {
             jwt_issuer,
         };
 
-        harness.wait_for_health().await?;
-        Ok(harness)
+        match harness.wait_for_health().await {
+            Ok(()) => Ok(harness),
+            Err(e) => {
+                // Kill the gateway process before returning the error so the
+                // retry loop can start fresh with new ports.
+                if let Some(mut child) = harness.gateway_process.take() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+                Err(e)
+            }
+        }
     }
 
     async fn wait_for_health(&self) -> Result<(), Box<dyn std::error::Error>> {

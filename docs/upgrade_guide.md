@@ -242,6 +242,25 @@ FERRUM_MODE=dp \
 
 If a load balancer sits in front of the DP fleet, drain each node before restarting to avoid dropping in-flight requests.
 
+#### Multi-CP Failover Deployments
+
+When DPs are configured with `FERRUM_DP_CP_GRPC_URLS` (multiple CPs), upgrades are smoother:
+
+1. Upgrade CP₁ first (DPs automatically fail over to CP₂ during the restart window)
+2. Upgrade CP₂ (DPs fail back to CP₁ which is already running the new version)
+3. Rolling upgrade DPs as above
+
+This eliminates the read-only window during CP upgrades — DPs always have at least one CP available for config updates.
+
+```bash
+# DP configured for multi-CP failover:
+FERRUM_MODE=dp \
+  FERRUM_DP_CP_GRPC_URLS=https://cp1:50051,https://cp2:50051 \
+  FERRUM_CP_DP_GRPC_JWT_SECRET=grpc-secret \
+  FERRUM_ADMIN_JWT_SECRET=your-secret \
+  ./ferrum-edge-new
+```
+
 #### 5. Rollback Path
 
 - **DP rollback**: Stop the new DP binary, restart the old one. It reconnects to the CP and gets the current config via gRPC. DPs are stateless — rollback is instant.
