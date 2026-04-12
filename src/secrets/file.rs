@@ -102,8 +102,13 @@ mod tests {
 
     #[test]
     fn resolve_ref_returns_path_when_set() {
+        use std::sync::Mutex;
+        static ENV_LOCK: Mutex<()> = Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap();
+
         let key = "FERRUM_TEST_SECRET_FILE_REF_12345";
         let file_key = format!("{}_FILE", key);
+        // SAFETY: We hold a mutex preventing concurrent env access.
         unsafe { std::env::set_var(&file_key, "/run/secrets/db_password") };
         assert_eq!(
             resolve_ref(key),
