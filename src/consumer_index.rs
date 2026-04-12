@@ -1,6 +1,7 @@
 use arc_swap::ArcSwap;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tracing::{error, warn};
 
 use crate::config::types::Consumer;
@@ -19,6 +20,11 @@ pub struct ConsumerIndex {
     mtls_index: ArcSwap<HashMap<String, Arc<Consumer>>>,
     /// Full consumer list for plugins that need iteration (jwt_auth, jwks_auth)
     all_consumers: ArcSwap<Vec<Arc<Consumer>>>,
+    /// Pre-computed credential counts for auth types that share the identity index.
+    /// These count credential entries (not index entries) since jwt/hmac consumers
+    /// are looked up via the shared identity_index but have distinct credential data.
+    jwt_credential_count: AtomicUsize,
+    hmac_credential_count: AtomicUsize,
 }
 
 struct IndexMaps {
@@ -27,6 +33,8 @@ struct IndexMaps {
     identity: HashMap<String, Arc<Consumer>>,
     mtls: HashMap<String, Arc<Consumer>>,
     all: Vec<Arc<Consumer>>,
+    jwt_count: usize,
+    hmac_count: usize,
 }
 
 impl ConsumerIndex {
@@ -39,6 +47,8 @@ impl ConsumerIndex {
             identity_index: ArcSwap::new(Arc::new(maps.identity)),
             mtls_index: ArcSwap::new(Arc::new(maps.mtls)),
             all_consumers: ArcSwap::new(Arc::new(maps.all)),
+            jwt_credential_count: AtomicUsize::new(maps.jwt_count),
+            hmac_credential_count: AtomicUsize::new(maps.hmac_count),
         }
     }
 
@@ -50,6 +60,10 @@ impl ConsumerIndex {
         self.identity_index.store(Arc::new(maps.identity));
         self.mtls_index.store(Arc::new(maps.mtls));
         self.all_consumers.store(Arc::new(maps.all));
+        self.jwt_credential_count
+            .store(maps.jwt_count, Ordering::Relaxed);
+        self.hmac_credential_count
+            .store(maps.hmac_count, Ordering::Relaxed);
     }
 
     /// O(1) lookup by API key (for key_auth plugin). No allocation.
@@ -106,6 +120,11 @@ impl ConsumerIndex {
             .chain(modified.iter().map(|c| c.id.as_str()))
             .collect();
 
+        // Track jwt/hmac credential count delta incrementally instead of
+        // recomputing from the full consumer list (which would be O(n_total)).
+        let mut jwt_delta: isize = 0;
+        let mut hmac_delta: isize = 0;
+
         if !ids_to_remove.is_empty() {
             // Build a reverse index: consumer_id → old credential keys, so we can
             // do O(1) HashMap::remove instead of O(n) retain loops.
@@ -119,6 +138,9 @@ impl ConsumerIndex {
                 if !ids_to_remove.contains(consumer.id.as_str()) {
                     continue;
                 }
+                // Subtract old jwt/hmac counts for removed/modified consumers
+                jwt_delta -= consumer.credential_entries("jwt").len() as isize;
+                hmac_delta -= consumer.credential_entries("hmac_auth").len() as isize;
                 // Collect old keyauth credential keys (supports array)
                 for key_creds in consumer.credential_entries("keyauth") {
                     if let Some(key) = key_creds.get("key").and_then(|s| s.as_str()) {
@@ -184,6 +206,10 @@ impl ConsumerIndex {
 
             all.push(Arc::clone(&arc_consumer));
 
+            // Add new jwt/hmac counts for added/modified consumers
+            jwt_delta += consumer.credential_entries("jwt").len() as isize;
+            hmac_delta += consumer.credential_entries("hmac_auth").len() as isize;
+
             // Index all keyauth keys (supports array)
             for key_creds in consumer.credential_entries("keyauth") {
                 if let Some(key) = key_creds.get("key").and_then(|s| s.as_str()) {
@@ -208,6 +234,12 @@ impl ConsumerIndex {
             }
         }
 
+        // Apply jwt/hmac credential count deltas
+        let jwt_count = (self.jwt_credential_count.load(Ordering::Relaxed) as isize + jwt_delta)
+            .max(0) as usize;
+        let hmac_count = (self.hmac_credential_count.load(Ordering::Relaxed) as isize + hmac_delta)
+            .max(0) as usize;
+
         // Swap all indexes. Store all_consumers last so that a concurrent reader
         // that finds a consumer via a credential index can also find it in the
         // all-consumers list (the new list is a superset of the old for additions).
@@ -219,6 +251,10 @@ impl ConsumerIndex {
         self.identity_index.store(Arc::new(identity));
         self.mtls_index.store(Arc::new(mtls));
         self.all_consumers.store(Arc::new(all));
+        self.jwt_credential_count
+            .store(jwt_count, Ordering::Relaxed);
+        self.hmac_credential_count
+            .store(hmac_count, Ordering::Relaxed);
     }
 
     /// Number of indexed entries (for testing).
@@ -235,12 +271,21 @@ impl ConsumerIndex {
         self.all_consumers.load().len()
     }
 
-    /// Per-auth-type consumer counts for metrics.
-    pub fn auth_type_counts(&self) -> (usize, usize, usize, usize) {
+    /// Per-auth-type credential counts for metrics.
+    ///
+    /// Returns (keyauth, basic, mtls, jwt, hmac, identity, total_consumers).
+    /// - keyauth/basic/mtls: index entry counts (O(1) lookup targets)
+    /// - jwt/hmac: credential entry counts (consumers with those credential types)
+    /// - identity: shared identity index size (serves jwt, jwks, hmac, ldap lookups)
+    /// - total_consumers: total consumer count
+    pub fn auth_type_counts(&self) -> (usize, usize, usize, usize, usize, usize, usize) {
         (
             self.keyauth_index.load().len(),
             self.basic_index.load().len(),
             self.mtls_index.load().len(),
+            self.jwt_credential_count.load(Ordering::Relaxed),
+            self.hmac_credential_count.load(Ordering::Relaxed),
+            self.identity_index.load().len(),
             self.all_consumers.load().len(),
         )
     }
@@ -252,10 +297,16 @@ impl ConsumerIndex {
         // identity has up to 3 entries per consumer (username, id, custom_id)
         let mut identity = HashMap::with_capacity(consumers.len() * 3);
         let mut all = Vec::with_capacity(consumers.len());
+        let mut jwt_count: usize = 0;
+        let mut hmac_count: usize = 0;
 
         for consumer in consumers {
             let arc_consumer = Arc::new(consumer.clone());
             all.push(Arc::clone(&arc_consumer));
+
+            // Count JWT and HMAC credential entries for metrics
+            jwt_count += consumer.credential_entries("jwt").len();
+            hmac_count += consumer.credential_entries("hmac_auth").len();
 
             // Index by API key (keyauth credentials — supports single object or array)
             for key_creds in consumer.credential_entries("keyauth") {
@@ -324,6 +375,8 @@ impl ConsumerIndex {
             identity,
             mtls,
             all,
+            jwt_count,
+            hmac_count,
         }
     }
 }

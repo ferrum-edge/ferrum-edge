@@ -3227,8 +3227,15 @@ fn build_metrics(state: &AdminState) -> Value {
         let dns_cache_size = ps.dns_cache.cache_len();
 
         // Consumer index
-        let (keyauth_count, basic_count, mtls_count, total_consumers) =
-            ps.consumer_index.auth_type_counts();
+        let (
+            keyauth_count,
+            basic_count,
+            mtls_count,
+            jwt_count,
+            hmac_count,
+            identity_count,
+            total_consumers,
+        ) = ps.consumer_index.auth_type_counts();
 
         // Rate limiter keys
         let rate_limiter_keys = ps.plugin_cache.total_rate_limiter_keys();
@@ -3304,6 +3311,9 @@ fn build_metrics(state: &AdminState) -> Value {
                 "key_auth_credentials": keyauth_count,
                 "basic_auth_credentials": basic_count,
                 "mtls_credentials": mtls_count,
+                "jwt_credentials": jwt_count,
+                "hmac_credentials": hmac_count,
+                "identity_credentials": identity_count,
             },
             "rate_limiting": {
                 "tracked_key_count": rate_limiter_keys,
@@ -3333,7 +3343,7 @@ fn build_metrics(state: &AdminState) -> Value {
             "health_check": {"unhealthy_target_count": 0, "unhealthy_targets": []},
             "load_balancers": {"active_connections": {}},
             "caches": {},
-            "consumer_index": {"total_consumers": 0, "key_auth_credentials": 0, "basic_auth_credentials": 0, "mtls_credentials": 0},
+            "consumer_index": {"total_consumers": 0, "key_auth_credentials": 0, "basic_auth_credentials": 0, "mtls_credentials": 0, "jwt_credentials": 0, "hmac_credentials": 0, "identity_credentials": 0},
             "rate_limiting": {"tracked_key_count": 0},
         })
     }

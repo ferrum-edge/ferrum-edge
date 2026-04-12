@@ -177,7 +177,10 @@ curl -s -H "Authorization: Bearer $TOKEN" \
     "total_consumers": 215,
     "key_auth_credentials": 142,
     "basic_auth_credentials": 38,
-    "mtls_credentials": 9
+    "mtls_credentials": 9,
+    "jwt_credentials": 52,
+    "hmac_credentials": 14,
+    "identity_credentials": 645
   },
   "rate_limiting": {
     "tracked_key_count": 4217
@@ -307,8 +310,9 @@ Pre-built hash map indexes for O(1) credential lookup during authentication. The
 | `key_auth_credentials` | integer | API key credential entries indexed (for `key_auth` plugin). May exceed `total_consumers` when consumers have multiple keys for rotation |
 | `basic_auth_credentials` | integer | Username credentials indexed (for `basic_auth` plugin) |
 | `mtls_credentials` | integer | mTLS identity credential entries indexed (for `mtls_auth` plugin). May exceed `total_consumers` when consumers have multiple identities for rotation |
-
-Note: JWT and OAuth2 consumers are looked up via the identity index (by username, ID, or custom_id) rather than a dedicated credential index, so they don't appear as a separate count here.
+| `jwt_credentials` | integer | JWT credential entries across all consumers (for `jwt_auth` plugin). May exceed `total_consumers` when consumers have multiple JWT secrets for rotation |
+| `hmac_credentials` | integer | HMAC credential entries across all consumers (for `hmac_auth` plugin). May exceed `total_consumers` when consumers have multiple HMAC secrets for rotation |
+| `identity_credentials` | integer | Identity index entries shared by `jwt_auth`, `jwks_auth`, `hmac_auth`, and `ldap_auth` plugins. Each consumer contributes up to 3 entries (username, id, custom_id) |
 
 ### `rate_limiting`
 
