@@ -1779,17 +1779,12 @@ components:
           type: string
           writeOnly: true
           description: >-
-            JWT signing secret used to verify token signatures for this
-            consumer. Supports HS256/HS384/HS512 algorithms.
-        algorithm:
-          type: string
-          enum: [HS256, HS384, HS512]
-          default: HS256
-          description: JWT signing algorithm (default HS256).
+            JWT signing secret used to verify token signatures (HS256) for this
+            consumer.
       description: >-
-        JWT credential for the `jwt_auth` plugin. Consumer is looked up by
-        `username`, `id`, or `custom_id` from the JWT claim; then all secrets
-        are tried until one verifies the signature.
+        JWT credential for the `jwt_auth` plugin. Uses HS256 algorithm only.
+        Consumer is looked up by `username`, `id`, or `custom_id` from the JWT
+        claim; then all secrets are tried until one verifies the signature.
 
     HmacAuthCredential:
       type: object
