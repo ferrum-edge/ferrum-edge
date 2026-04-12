@@ -63,7 +63,6 @@ pub enum CachedRecordType {
 /// Configuration for the DNS resolver and cache.
 #[derive(Debug, Clone)]
 pub struct DnsConfig {
-    pub default_ttl_seconds: u64,
     pub global_overrides: HashMap<String, String>,
     /// Comma-separated nameserver addresses (ip[:port], IPv4 or IPv6).
     pub resolver_addresses: Option<String>,
@@ -71,8 +70,13 @@ pub struct DnsConfig {
     pub hosts_file_path: Option<String>,
     /// Comma-separated DNS record type query order (e.g., "CACHE,SRV,A,CNAME").
     pub dns_order: Option<String>,
-    /// Override TTL (seconds) for positive DNS records. None = use response TTL.
-    pub valid_ttl_override: Option<u64>,
+    /// Global TTL override (seconds) for positive DNS records. When set, ALL records
+    /// use this TTL regardless of the DNS response. None = respect the record's native TTL.
+    /// Disabled by default — the cache naturally respects each record's TTL.
+    pub ttl_override_seconds: Option<u64>,
+    /// Minimum TTL (seconds) floor for cached DNS records. Prevents extremely short
+    /// TTLs (including 0) from causing excessive DNS queries. Default: 5.
+    pub min_ttl_seconds: u64,
     /// How long stale data can be served while a background refresh is in progress.
     pub stale_ttl_seconds: u64,
     /// TTL (seconds) for caching DNS errors and empty responses.
@@ -80,13 +84,16 @@ pub struct DnsConfig {
     /// Maximum number of entries in the DNS cache. Entries are evicted when this limit is reached.
     pub max_cache_size: usize,
     /// Percentage of TTL elapsed before background refresh triggers (1-99). Default: 90.
-    /// At 90%, a 300s TTL entry refreshes after 270s (30s remaining).
+    /// At 90%, a 60s TTL entry refreshes after 54s (6s remaining).
     pub refresh_threshold_percent: u8,
     /// Threshold in milliseconds above which DNS resolutions are logged as slow.
     /// None = disabled (no slow resolution warnings). Default: None.
     pub slow_threshold_ms: Option<u64>,
     /// Maximum number of concurrent DNS warmup resolutions. Default: 500.
     pub warmup_concurrency: usize,
+    /// Interval (seconds) for the background task that retries failed DNS lookups.
+    /// Default: 10. Set to 0 to disable the retry task.
+    pub failed_retry_interval_seconds: u64,
     /// Backend IP allowlist policy for SSRF protection.
     pub backend_allow_ips: crate::config::BackendAllowIps,
 }
@@ -94,18 +101,19 @@ pub struct DnsConfig {
 impl Default for DnsConfig {
     fn default() -> Self {
         Self {
-            default_ttl_seconds: 300,
             global_overrides: HashMap::new(),
             resolver_addresses: None,
             hosts_file_path: None,
             dns_order: None,
-            valid_ttl_override: None,
+            ttl_override_seconds: None,
+            min_ttl_seconds: 5,
             stale_ttl_seconds: 3600,
             error_ttl_seconds: 5,
             max_cache_size: 10_000,
             refresh_threshold_percent: 90,
             slow_threshold_ms: None,
             warmup_concurrency: 500,
+            failed_retry_interval_seconds: 10,
             backend_allow_ips: crate::config::BackendAllowIps::Both,
         }
     }
@@ -118,6 +126,10 @@ struct DnsCacheEntry {
     expires_at: Instant,
     /// Deadline after which stale data is no longer served.
     stale_deadline: Instant,
+    /// The total TTL duration that was applied when this entry was inserted.
+    /// Stored so background refresh can compute per-entry refresh thresholds
+    /// (since each record may have a different native TTL).
+    applied_ttl: Duration,
     /// The record type that produced this result (for CACHE ordering).
     record_type_used: Option<CachedRecordType>,
     /// Whether this is a cached error/empty response.
@@ -130,10 +142,14 @@ struct DnsCacheEntry {
 pub struct DnsCache {
     cache: Arc<DashMap<String, DnsCacheEntry>>,
     global_overrides: HashMap<String, String>,
-    default_ttl: Duration,
     resolver: Arc<Resolver<TokioConnectionProvider>>,
     dns_order: Vec<DnsRecordOrder>,
-    valid_ttl_override: Option<Duration>,
+    /// When set, ALL records use this fixed TTL regardless of DNS response.
+    /// None = respect each record's native TTL (default).
+    ttl_override: Option<Duration>,
+    /// Minimum TTL floor — prevents 0-TTL or very short TTLs from causing
+    /// excessive DNS queries. Default: 5s.
+    min_ttl: Duration,
     stale_ttl: Duration,
     error_ttl: Duration,
     max_cache_size: usize,
@@ -150,6 +166,9 @@ pub struct DnsCache {
     backend_allow_ips: crate::config::BackendAllowIps,
     /// Percentage of TTL elapsed before background refresh triggers (1-99).
     refresh_threshold_percent: u8,
+    /// Interval for the background task that retries failed DNS lookups.
+    /// Duration::ZERO disables the retry task.
+    failed_retry_interval: Duration,
 }
 
 impl DnsCache {
@@ -166,10 +185,10 @@ impl DnsCache {
         Self {
             cache: Arc::new(DashMap::new()),
             global_overrides: config.global_overrides,
-            default_ttl: Duration::from_secs(config.default_ttl_seconds),
             resolver: Arc::new(resolver),
             dns_order,
-            valid_ttl_override: config.valid_ttl_override.map(Duration::from_secs),
+            ttl_override: config.ttl_override_seconds.map(Duration::from_secs),
+            min_ttl: Duration::from_secs(config.min_ttl_seconds),
             stale_ttl: Duration::from_secs(config.stale_ttl_seconds),
             error_ttl: Duration::from_secs(config.error_ttl_seconds),
             max_cache_size: config.max_cache_size,
@@ -179,6 +198,7 @@ impl DnsCache {
             warmup_concurrency: config.warmup_concurrency.max(1),
             backend_allow_ips: config.backend_allow_ips,
             refresh_threshold_percent: config.refresh_threshold_percent.clamp(1, 99),
+            failed_retry_interval: Duration::from_secs(config.failed_retry_interval_seconds),
         }
     }
 
@@ -268,15 +288,12 @@ impl DnsCache {
 
         // 4. Perform actual DNS resolution
         match self.timed_resolve(hostname).await {
-            Ok((addrs, record_type)) if !addrs.is_empty() => {
+            Ok((addrs, record_type, native_ttl)) if !addrs.is_empty() => {
                 // Check backend IP policy BEFORE caching to prevent denied IPs
                 // from being served on subsequent requests via the cache.
                 self.check_backend_ip_policy(addrs[0], hostname)?;
 
-                let ttl = per_proxy_ttl
-                    .map(Duration::from_secs)
-                    .or(self.valid_ttl_override)
-                    .unwrap_or(self.default_ttl);
+                let ttl = self.effective_ttl(native_ttl, per_proxy_ttl);
 
                 self.cache.insert(
                     hostname.to_string(),
@@ -284,14 +301,15 @@ impl DnsCache {
                         addresses: addrs.clone(),
                         expires_at: Instant::now() + ttl,
                         stale_deadline: Instant::now() + ttl + self.stale_ttl,
+                        applied_ttl: ttl,
                         record_type_used: record_type,
                         is_error: false,
                     },
                 );
 
                 debug!(
-                    "DNS resolved {} -> {:?} (ttl={:?})",
-                    hostname, addrs[0], ttl
+                    "DNS resolved {} -> {:?} (native_ttl={:?}, effective_ttl={:?})",
+                    hostname, addrs[0], native_ttl, ttl
                 );
                 Ok(addrs[0])
             }
@@ -300,16 +318,14 @@ impl DnsCache {
                 // /etc/hosts, so DNS lookup can fail.  Respect dns_order:
                 // if AAAA appears before A, prefer IPv6 loopback.
                 let addr = self.localhost_addr();
-                let ttl = per_proxy_ttl
-                    .map(Duration::from_secs)
-                    .or(self.valid_ttl_override)
-                    .unwrap_or(self.default_ttl);
+                let ttl = self.effective_ttl(Duration::from_secs(3600), per_proxy_ttl);
                 self.cache.insert(
                     hostname.to_string(),
                     DnsCacheEntry {
                         addresses: vec![addr],
                         expires_at: Instant::now() + ttl,
                         stale_deadline: Instant::now() + ttl + self.stale_ttl,
+                        applied_ttl: ttl,
                         record_type_used: None,
                         is_error: false,
                     },
@@ -381,11 +397,8 @@ impl DnsCache {
 
         // 4. Actual DNS resolution
         match self.timed_resolve(hostname).await {
-            Ok((addrs, record_type)) if !addrs.is_empty() => {
-                let ttl = per_proxy_ttl
-                    .map(Duration::from_secs)
-                    .or(self.valid_ttl_override)
-                    .unwrap_or(self.default_ttl);
+            Ok((addrs, record_type, native_ttl)) if !addrs.is_empty() => {
+                let ttl = self.effective_ttl(native_ttl, per_proxy_ttl);
 
                 self.cache.insert(
                     hostname.to_string(),
@@ -393,6 +406,7 @@ impl DnsCache {
                         addresses: addrs.clone(),
                         expires_at: Instant::now() + ttl,
                         stale_deadline: Instant::now() + ttl + self.stale_ttl,
+                        applied_ttl: ttl,
                         record_type_used: record_type,
                         is_error: false,
                     },
@@ -403,16 +417,14 @@ impl DnsCache {
             Ok(_) | Err(_) if hostname == "localhost" => {
                 let addr = self.localhost_addr();
                 let addrs = vec![addr];
-                let ttl = per_proxy_ttl
-                    .map(Duration::from_secs)
-                    .or(self.valid_ttl_override)
-                    .unwrap_or(self.default_ttl);
+                let ttl = self.effective_ttl(Duration::from_secs(3600), per_proxy_ttl);
                 self.cache.insert(
                     hostname.to_string(),
                     DnsCacheEntry {
                         addresses: addrs.clone(),
                         expires_at: Instant::now() + ttl,
                         stale_deadline: Instant::now() + ttl + self.stale_ttl,
+                        applied_ttl: ttl,
                         record_type_used: None,
                         is_error: false,
                     },
@@ -436,15 +448,12 @@ impl DnsCache {
         hostname: &str,
         per_proxy_ttl: Option<u64>,
     ) -> Result<(), anyhow::Error> {
-        let (addrs, record_type) = self.timed_resolve(hostname).await?;
+        let (addrs, record_type, native_ttl) = self.timed_resolve(hostname).await?;
         if addrs.is_empty() {
             anyhow::bail!("DNS refresh returned no addresses for {}", hostname);
         }
 
-        let ttl = per_proxy_ttl
-            .map(Duration::from_secs)
-            .or(self.valid_ttl_override)
-            .unwrap_or(self.default_ttl);
+        let ttl = self.effective_ttl(native_ttl, per_proxy_ttl);
 
         self.cache.insert(
             hostname.to_string(),
@@ -452,12 +461,16 @@ impl DnsCache {
                 addresses: addrs,
                 expires_at: Instant::now() + ttl,
                 stale_deadline: Instant::now() + ttl + self.stale_ttl,
+                applied_ttl: ttl,
                 record_type_used: record_type,
                 is_error: false,
             },
         );
 
-        debug!("DNS background refresh: {} refreshed", hostname);
+        debug!(
+            "DNS background refresh: {} refreshed (ttl={:?})",
+            hostname, ttl
+        );
         Ok(())
     }
 
@@ -485,6 +498,7 @@ impl DnsCache {
                 addresses: vec![],
                 expires_at: Instant::now() + self.error_ttl,
                 stale_deadline: Instant::now() + self.error_ttl, // no stale serving for errors
+                applied_ttl: self.error_ttl,
                 record_type_used: None,
                 is_error: true,
             },
@@ -502,7 +516,7 @@ impl DnsCache {
     async fn timed_resolve(
         &self,
         hostname: &str,
-    ) -> Result<(Vec<IpAddr>, Option<CachedRecordType>), anyhow::Error> {
+    ) -> Result<(Vec<IpAddr>, Option<CachedRecordType>, Duration), anyhow::Error> {
         let threshold = match self.slow_threshold {
             Some(t) => t,
             None => return self.do_resolve(hostname).await,
@@ -522,14 +536,36 @@ impl DnsCache {
         result
     }
 
+    /// Compute the effective TTL for a cache entry.
+    ///
+    /// Priority order:
+    /// 1. Per-proxy TTL override (highest priority)
+    /// 2. Global TTL override (`FERRUM_DNS_TTL_OVERRIDE_SECONDS`)
+    /// 3. Native record TTL from the DNS response
+    ///
+    /// The result is clamped to `min_ttl` to prevent 0-TTL or very short TTLs
+    /// from causing excessive DNS queries.
+    fn effective_ttl(&self, record_ttl: Duration, per_proxy_ttl: Option<u64>) -> Duration {
+        let base = per_proxy_ttl
+            .map(Duration::from_secs)
+            .or(self.ttl_override)
+            .unwrap_or(record_ttl);
+        base.max(self.min_ttl)
+    }
+
     /// Perform DNS resolution using hickory-resolver with configurable record type ordering.
+    ///
+    /// Returns (addresses, record_type, native_ttl) where native_ttl is the TTL
+    /// from the DNS response's `valid_until()` deadline. When `valid_until` is in
+    /// the past (hickory-resolver clamped it), falls back to `min_ttl`.
     async fn do_resolve(
         &self,
         hostname: &str,
-    ) -> Result<(Vec<IpAddr>, Option<CachedRecordType>), anyhow::Error> {
+    ) -> Result<(Vec<IpAddr>, Option<CachedRecordType>, Duration), anyhow::Error> {
         // Try parsing as IP first — bypass DNS entirely
         if let Ok(addr) = hostname.parse::<IpAddr>() {
-            return Ok((vec![addr], None));
+            // Literal IPs get max TTL — they never change
+            return Ok((vec![addr], None, Duration::from_secs(86400)));
         }
 
         // Determine the cached record type (for CACHE ordering)
@@ -578,6 +614,17 @@ impl DnsCache {
             query_types = vec![CachedRecordType::A, CachedRecordType::Aaaa];
         }
 
+        // Helper: extract the remaining TTL from a lookup's valid_until deadline.
+        // Returns min_ttl if the deadline is already in the past.
+        let extract_ttl = |valid_until: Instant| -> Duration {
+            let now = Instant::now();
+            if valid_until > now {
+                valid_until.duration_since(now)
+            } else {
+                self.min_ttl
+            }
+        };
+
         // Try each record type in order
         for record_type in &query_types {
             match record_type {
@@ -585,7 +632,8 @@ impl DnsCache {
                     Ok(lookup) => {
                         let addrs: Vec<IpAddr> = lookup.iter().map(|a| IpAddr::V4(a.0)).collect();
                         if !addrs.is_empty() {
-                            return Ok((addrs, Some(CachedRecordType::A)));
+                            let native_ttl = extract_ttl(lookup.valid_until());
+                            return Ok((addrs, Some(CachedRecordType::A), native_ttl));
                         }
                     }
                     Err(_) => continue,
@@ -594,7 +642,8 @@ impl DnsCache {
                     Ok(lookup) => {
                         let addrs: Vec<IpAddr> = lookup.iter().map(|a| IpAddr::V6(a.0)).collect();
                         if !addrs.is_empty() {
-                            return Ok((addrs, Some(CachedRecordType::Aaaa)));
+                            let native_ttl = extract_ttl(lookup.valid_until());
+                            return Ok((addrs, Some(CachedRecordType::Aaaa), native_ttl));
                         }
                     }
                     Err(_) => continue,
@@ -602,7 +651,8 @@ impl DnsCache {
                 CachedRecordType::Srv => {
                     match self.resolver.srv_lookup(hostname).await {
                         Ok(srv_lookup) => {
-                            // SRV records point to target hostnames — resolve them to IPs
+                            let srv_ttl = extract_ttl(srv_lookup.as_lookup().valid_until());
+                            // SRV records point to target hostnames -- resolve them to IPs
                             for srv in srv_lookup.iter() {
                                 let target = srv.target().to_string();
                                 // Remove trailing dot if present
@@ -610,7 +660,14 @@ impl DnsCache {
                                 if let Ok(ip_lookup) = self.resolver.lookup_ip(target).await {
                                     let addrs: Vec<IpAddr> = ip_lookup.iter().collect();
                                     if !addrs.is_empty() {
-                                        return Ok((addrs, Some(CachedRecordType::Srv)));
+                                        // Use the shorter of SRV TTL and A/AAAA TTL
+                                        let a_ttl = extract_ttl(ip_lookup.valid_until());
+                                        let native_ttl = srv_ttl.min(a_ttl);
+                                        return Ok((
+                                            addrs,
+                                            Some(CachedRecordType::Srv),
+                                            native_ttl,
+                                        ));
                                     }
                                 }
                             }
@@ -624,7 +681,8 @@ impl DnsCache {
                         Ok(lookup) => {
                             let addrs: Vec<IpAddr> = lookup.iter().collect();
                             if !addrs.is_empty() {
-                                return Ok((addrs, Some(CachedRecordType::Cname)));
+                                let native_ttl = extract_ttl(lookup.valid_until());
+                                return Ok((addrs, Some(CachedRecordType::Cname), native_ttl));
                             }
                         }
                         Err(_) => continue,
@@ -727,9 +785,10 @@ impl DnsCache {
         shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
     ) -> tokio::task::JoinHandle<()> {
         let cache = self.clone();
-        let remaining_fraction = (100 - cache.refresh_threshold_percent as u64).max(1);
-        let check_interval =
-            std::cmp::max(cache.default_ttl.as_secs() * remaining_fraction / 100, 5);
+        // Check interval: scan frequently enough to catch the shortest-lived entries.
+        // With native TTL respect, entries may have wildly different TTLs (e.g., 30s vs 3600s).
+        // We use a fixed 5s scan interval to handle short-TTL records promptly.
+        let check_interval = 5u64;
 
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(check_interval));
@@ -750,42 +809,47 @@ impl DnsCache {
                 // Evict expired entries and enforce max cache size
                 cache.evict_expired();
 
-                // Collect entries nearing expiration (past the configured refresh threshold)
+                // Collect entries nearing expiration (past the configured refresh threshold).
+                // Each entry uses its own applied_ttl for threshold computation since
+                // native DNS TTLs vary per record.
                 let now = Instant::now();
-                let mut to_refresh: Vec<(String, Option<u64>)> = Vec::new();
+                let mut to_refresh: Vec<String> = Vec::new();
                 let refresh_remaining_pct = (100 - cache.refresh_threshold_percent as u32).max(1);
 
                 for entry in cache.cache.iter() {
-                    // Skip error entries
+                    // Skip error entries — those are handled by the failed retry task
                     if entry.is_error {
                         continue;
                     }
 
                     let remaining = entry.expires_at.saturating_duration_since(now);
-                    let total_ttl = cache.valid_ttl_override.unwrap_or(cache.default_ttl);
-                    // Refresh when remaining time drops below the configured threshold
-                    let threshold = total_ttl * refresh_remaining_pct / 100;
+                    // Use this entry's own applied_ttl for threshold computation
+                    let threshold = entry.applied_ttl * refresh_remaining_pct / 100;
                     if remaining < threshold && remaining > Duration::ZERO {
-                        to_refresh.push((entry.key().clone(), None));
+                        to_refresh.push(entry.key().clone());
                     }
                 }
 
                 // Refresh entries in the background
-                for (hostname, _ttl) in to_refresh {
+                for hostname in to_refresh {
                     match cache.timed_resolve(&hostname).await {
-                        Ok((addrs, record_type)) if !addrs.is_empty() => {
-                            let refresh_ttl = cache.valid_ttl_override.unwrap_or(cache.default_ttl);
+                        Ok((addrs, record_type, native_ttl)) if !addrs.is_empty() => {
+                            let refresh_ttl = cache.effective_ttl(native_ttl, None);
                             cache.cache.insert(
                                 hostname.clone(),
                                 DnsCacheEntry {
                                     addresses: addrs,
                                     expires_at: Instant::now() + refresh_ttl,
                                     stale_deadline: Instant::now() + refresh_ttl + cache.stale_ttl,
+                                    applied_ttl: refresh_ttl,
                                     record_type_used: record_type,
                                     is_error: false,
                                 },
                             );
-                            debug!("DNS background refresh: {} refreshed", hostname);
+                            debug!(
+                                "DNS background refresh: {} refreshed (ttl={:?})",
+                                hostname, refresh_ttl
+                            );
                         }
                         Ok(_) => {
                             warn!("DNS background refresh: {} returned no addresses", hostname);
@@ -797,6 +861,115 @@ impl DnsCache {
                 }
             }
         })
+    }
+
+    /// Start a background task that periodically retries resolution for failed
+    /// DNS entries. Failed lookups are cached with a short error TTL, but this
+    /// task proactively re-attempts resolution so that transient DNS outages
+    /// are recovered from without waiting for a request to trigger re-resolution.
+    ///
+    /// Logs at `warn` level for each retry attempt and result.
+    ///
+    /// Returns `None` if the retry interval is zero (disabled).
+    pub fn start_failed_retry_task(
+        &self,
+        shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        if self.failed_retry_interval == Duration::ZERO {
+            debug!("DNS failed retry task disabled (interval=0)");
+            return None;
+        }
+
+        let cache = self.clone();
+        let retry_interval = self.failed_retry_interval;
+
+        Some(tokio::spawn(async move {
+            let mut interval = tokio::time::interval(retry_interval);
+
+            loop {
+                if let Some(ref rx) = shutdown_rx {
+                    tokio::select! {
+                        _ = interval.tick() => {}
+                        _ = wait_for_shutdown(rx.clone()) => {
+                            info!("DNS failed retry task shutting down");
+                            return;
+                        }
+                    }
+                } else {
+                    interval.tick().await;
+                }
+
+                // Collect all error entries whose error TTL has expired
+                // (they're eligible for retry)
+                let now = Instant::now();
+                let mut to_retry: Vec<String> = Vec::new();
+
+                for entry in cache.cache.iter() {
+                    if entry.is_error && entry.expires_at <= now {
+                        to_retry.push(entry.key().clone());
+                    }
+                }
+
+                if to_retry.is_empty() {
+                    continue;
+                }
+
+                debug!(
+                    "DNS failed retry: attempting re-resolution for {} hostname(s)",
+                    to_retry.len()
+                );
+
+                for hostname in to_retry {
+                    warn!(
+                        "DNS failed retry: re-attempting resolution for '{}'",
+                        hostname
+                    );
+
+                    match cache.timed_resolve(&hostname).await {
+                        Ok((addrs, record_type, native_ttl)) if !addrs.is_empty() => {
+                            // Check IP policy before promoting to success
+                            if let Err(e) = cache.check_backend_ip_policy(addrs[0], &hostname) {
+                                warn!(
+                                    "DNS failed retry: '{}' resolved but denied by IP policy: {}",
+                                    hostname, e
+                                );
+                                continue;
+                            }
+
+                            let ttl = cache.effective_ttl(native_ttl, None);
+                            cache.cache.insert(
+                                hostname.clone(),
+                                DnsCacheEntry {
+                                    addresses: addrs.clone(),
+                                    expires_at: Instant::now() + ttl,
+                                    stale_deadline: Instant::now() + ttl + cache.stale_ttl,
+                                    applied_ttl: ttl,
+                                    record_type_used: record_type,
+                                    is_error: false,
+                                },
+                            );
+                            warn!(
+                                "DNS failed retry: '{}' resolved successfully -> {:?} (ttl={:?})",
+                                hostname, addrs[0], ttl
+                            );
+                        }
+                        Ok(_) => {
+                            // Re-cache the error with fresh error TTL
+                            cache.cache_error(&hostname);
+                            warn!(
+                                "DNS failed retry: '{}' still returning no addresses",
+                                hostname
+                            );
+                        }
+                        Err(e) => {
+                            // Re-cache the error with fresh error TTL
+                            cache.cache_error(&hostname);
+                            warn!("DNS failed retry: '{}' still failing: {}", hostname, e);
+                        }
+                    }
+                }
+            }
+        }))
     }
 
     /// Warmup: resolve all hostnames from the config at startup.
@@ -882,9 +1055,10 @@ fn build_resolver(config: &DnsConfig) -> Resolver<TokioConnectionProvider> {
         }
     }
 
-    // Apply TTL overrides
-    if let Some(valid_ttl) = config.valid_ttl_override {
-        let d = Duration::from_secs(valid_ttl);
+    // When a global TTL override is set, clamp hickory's internal cache to match
+    // so the resolver doesn't serve records beyond the override lifetime.
+    if let Some(override_secs) = config.ttl_override_seconds {
+        let d = Duration::from_secs(override_secs);
         resolver_opts.positive_min_ttl = Some(d);
         resolver_opts.positive_max_ttl = Some(d);
     }

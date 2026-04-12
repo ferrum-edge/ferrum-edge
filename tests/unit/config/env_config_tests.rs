@@ -607,33 +607,33 @@ fn test_env_config_dns_order() {
 }
 
 #[test]
-fn test_env_config_dns_valid_ttl() {
+fn test_env_config_dns_ttl_override() {
     with_env_vars(
         &[
             ("FERRUM_MODE", "file"),
             ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
-            ("FERRUM_DNS_VALID_TTL", "120"),
+            ("FERRUM_DNS_TTL_OVERRIDE_SECONDS", "120"),
         ],
         || {
             let config = EnvConfig::from_env().unwrap();
-            assert_eq!(config.dns_valid_ttl, Some(120));
+            assert_eq!(config.dns_ttl_override, Some(120));
         },
     );
 }
 
 #[test]
-fn test_env_config_dns_valid_ttl_not_set() {
+fn test_env_config_dns_ttl_override_not_set() {
     with_env_vars(
         &[
             ("FERRUM_MODE", "file"),
             ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
         ],
         || {
-            remove_var("FERRUM_DNS_VALID_TTL");
+            remove_var("FERRUM_DNS_TTL_OVERRIDE_SECONDS");
             let config = EnvConfig::from_env().unwrap();
             assert!(
-                config.dns_valid_ttl.is_none(),
-                "dns_valid_ttl should be None when not set"
+                config.dns_ttl_override.is_none(),
+                "dns_ttl_override should be None when not set"
             );
         },
     );

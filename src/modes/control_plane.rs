@@ -421,18 +421,19 @@ pub async fn run(
         .as_deref()
         .and_then(db_backend::extract_db_hostname);
     let dns_cache_for_poll = DnsCache::new(DnsConfig {
-        default_ttl_seconds: env_config.dns_cache_ttl_seconds,
         global_overrides: env_config.dns_overrides.clone(),
         resolver_addresses: env_config.dns_resolver_address.clone(),
         hosts_file_path: env_config.dns_resolver_hosts_file.clone(),
         dns_order: env_config.dns_order.clone(),
-        valid_ttl_override: env_config.dns_valid_ttl,
+        ttl_override_seconds: env_config.dns_ttl_override,
+        min_ttl_seconds: env_config.dns_min_ttl,
         stale_ttl_seconds: env_config.dns_stale_ttl,
         error_ttl_seconds: env_config.dns_error_ttl,
         max_cache_size: env_config.dns_cache_max_size,
         warmup_concurrency: env_config.dns_warmup_concurrency,
         slow_threshold_ms: env_config.dns_slow_threshold_ms,
         refresh_threshold_percent: env_config.dns_refresh_threshold_percent,
+        failed_retry_interval_seconds: env_config.dns_failed_retry_interval,
         backend_allow_ips: env_config.backend_allow_ips.clone(),
     });
     let db_url_for_reconnect = effective_url.clone();

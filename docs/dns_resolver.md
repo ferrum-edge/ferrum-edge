@@ -1,6 +1,18 @@
 # DNS Resolver Configuration
 
-Ferrum Edge includes a full-featured DNS resolver built on [hickory-resolver](https://github.com/hickory-dns/hickory-dns), providing configurable nameservers, hosts file support, record type ordering, TTL management, stale-while-revalidate caching, and error caching — all designed to keep DNS resolution off the hot request path.
+Ferrum Edge includes a full-featured DNS resolver built on [hickory-resolver](https://github.com/hickory-dns/hickory-dns), providing configurable nameservers, hosts file support, record type ordering, native TTL respect, stale-while-revalidate caching, error caching, and automatic failed lookup retries — all designed to keep DNS resolution off the hot request path.
+
+## Native TTL Respect
+
+By default, the DNS cache respects each record's **native TTL** from the DNS response. No global TTL override is applied — short-TTL records (e.g., 30s for service discovery) refresh quickly while long-TTL records (e.g., 3600s for stable services) persist longer. A minimum TTL floor (`FERRUM_DNS_MIN_TTL_SECONDS`, default 5s) prevents extremely short TTLs from causing excessive DNS queries.
+
+**TTL priority** (highest to lowest):
+
+1. **Per-proxy TTL** (`dns_cache_ttl_seconds` on the proxy config) — overrides everything for that proxy's backend
+2. **Global TTL override** (`FERRUM_DNS_TTL_OVERRIDE_SECONDS`) — forces a fixed TTL on all records
+3. **Native record TTL** — the TTL from the DNS response itself (default behavior)
+
+The final TTL is always clamped to at least `FERRUM_DNS_MIN_TTL_SECONDS`.
 
 ## Environment Variables
 
@@ -8,7 +20,6 @@ Ferrum Edge includes a full-featured DNS resolver built on [hickory-resolver](ht
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
-| `FERRUM_DNS_CACHE_TTL_SECONDS` | `u64` | `300` | Default TTL (seconds) for cached DNS entries when the response doesn't provide one or `FERRUM_DNS_VALID_TTL` is not set. |
 | `FERRUM_DNS_OVERRIDES` | JSON map | `{}` | Global static hostname-to-IP overrides. Format: `{"host":"ip","host2":"ip2"}`. These bypass DNS entirely. |
 
 ### Resolver Settings
@@ -23,13 +34,15 @@ Ferrum Edge includes a full-featured DNS resolver built on [hickory-resolver](ht
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
-| `FERRUM_DNS_VALID_TTL` | `u64` | Response TTL | Override TTL (seconds) for positive DNS records. When set, all successful lookups use this fixed TTL regardless of the DNS response TTL. |
+| `FERRUM_DNS_TTL_OVERRIDE_SECONDS` | `u64` | Disabled | Global TTL override (seconds) for all positive DNS records. When set, all cached entries use this fixed TTL regardless of the native DNS response TTL. Disabled by default — the cache respects each record's native TTL. |
+| `FERRUM_DNS_MIN_TTL_SECONDS` | `u64` | `5` | Minimum TTL floor (seconds) for cached DNS records. Prevents 0-TTL or very short TTLs from causing excessive DNS queries. Applied after all other TTL computations. |
 | `FERRUM_DNS_STALE_TTL` | `u64` | `3600` | How long (seconds) stale cached data can be served while a background refresh is in progress. See [Stale-While-Revalidate](#stale-while-revalidate). |
 | `FERRUM_DNS_ERROR_TTL` | `u64` | `5` | TTL (seconds) for caching DNS errors and empty responses. Prevents hammering DNS for known-bad hostnames. |
 | `FERRUM_DNS_CACHE_MAX_SIZE` | `usize` | `10000` | Maximum number of entries in the DNS cache. Expired entries are evicted automatically; if the cache still exceeds this limit, oldest entries are removed. |
 | `FERRUM_DNS_WARMUP_CONCURRENCY` | `usize` | `500` | Maximum number of concurrent DNS resolutions during startup/config warmup. Higher values reduce warmup time for large configs but increase burst load on upstream resolvers. |
 | `FERRUM_DNS_SLOW_THRESHOLD_MS` | `u64` | Disabled | Threshold in milliseconds above which DNS resolutions are logged as slow (`warn` level). Useful for diagnosing upstream DNS latency. When unset, no timing overhead is added. |
-| `FERRUM_DNS_REFRESH_THRESHOLD_PERCENT` | `u8` | `90` | Percentage of TTL elapsed before the background refresh task proactively re-resolves an entry (1-99). At 90%, a 300s TTL entry refreshes after 270s. Lower values add safety margin at the cost of more DNS queries. |
+| `FERRUM_DNS_REFRESH_THRESHOLD_PERCENT` | `u8` | `90` | Percentage of TTL elapsed before the background refresh task proactively re-resolves an entry (1-99). At 90%, a 60s-TTL entry refreshes after 54s. Lower values add safety margin at the cost of more DNS queries. |
+| `FERRUM_DNS_FAILED_RETRY_INTERVAL_SECONDS` | `u64` | `10` | Interval (seconds) for the background task that retries failed DNS lookups. Error-cached entries whose error TTL has expired are re-attempted at this interval. Logs at `warn` level for each retry attempt and outcome. Set to `0` to disable. |
 
 ### System-Level DNS Settings
 
@@ -40,7 +53,7 @@ Ferrum Edge respects the following system-level environment variables, as parsed
 | `RES_OPTIONS` | Space-separated resolver options: `rotate` (round-robin nameservers), `ndots:N` (minimum dots before absolute lookup), `timeout:N` (query timeout seconds), `attempts:N` (retry count). |
 | `LOCALDOMAIN` | Space-separated search domains for unqualified hostnames. |
 
-These are automatically applied unless explicitly overridden by `FERRUM_DNS_RESOLVER_ADDRESS` (which replaces nameservers) or `FERRUM_DNS_VALID_TTL` / `FERRUM_DNS_ERROR_TTL` (which override TTL behavior).
+These are automatically applied unless explicitly overridden by `FERRUM_DNS_RESOLVER_ADDRESS` (which replaces nameservers) or `FERRUM_DNS_TTL_OVERRIDE_SECONDS` / `FERRUM_DNS_ERROR_TTL` (which override TTL behavior).
 
 ## DNS Order
 
@@ -70,10 +83,10 @@ When a cached DNS entry expires (past its TTL), Ferrum Edge doesn't block the re
 
 This ensures that DNS resolution almost never blocks the hot request path, even when entries expire.
 
-**Example:** With `FERRUM_DNS_CACHE_TTL_SECONDS=300` and `FERRUM_DNS_STALE_TTL=3600`:
-- For the first 5 minutes: cached result served directly.
-- From 5 minutes to 65 minutes: stale result served while a background refresh runs.
-- After 65 minutes: full re-resolution required.
+**Example:** With a DNS record that has a native 60s TTL and `FERRUM_DNS_STALE_TTL=3600`:
+- For the first 60 seconds: cached result served directly.
+- From 60 seconds to ~60 minutes: stale result served while a background refresh runs.
+- After ~60 minutes: full re-resolution required.
 
 ## Error Caching
 
@@ -82,9 +95,22 @@ When DNS resolution fails (NXDOMAIN, timeout, empty response), the error is cach
 - Flooding DNS servers with repeated queries for non-existent domains.
 - Latency spikes from repeated timeouts on unreachable nameservers.
 
+## Failed DNS Retry Task
+
+A dedicated background task automatically retries DNS lookups that previously failed. It scans the cache for error entries whose error TTL has expired and re-attempts resolution at the interval configured by `FERRUM_DNS_FAILED_RETRY_INTERVAL_SECONDS` (default: every 10 seconds).
+
+- Each retry attempt and outcome is logged at `warn` level, e.g.:
+  - `DNS failed retry: re-attempting resolution for 'db.internal'`
+  - `DNS failed retry: 'db.internal' resolved successfully -> 10.0.0.5 (ttl=30s)`
+  - `DNS failed retry: 'db.internal' still failing: NXDOMAIN`
+- On successful retry, the entry is promoted from error to a healthy cached entry with the record's native TTL.
+- Set `FERRUM_DNS_FAILED_RETRY_INTERVAL_SECONDS=0` to disable this task.
+
 ## Background Refresh
 
-A background task proactively refreshes cache entries before they expire. By default, entries are refreshed when 90% of their TTL has elapsed (configurable via `FERRUM_DNS_REFRESH_THRESHOLD_PERCENT`). This keeps the cache warm and prevents any request from hitting DNS directly. The background task runs every `max(TTL * (100 - threshold%) / 100, 5 seconds)` — for example, with a 300s TTL and 90% threshold, the sweep runs every 30 seconds.
+A background task proactively refreshes cache entries before they expire. By default, entries are refreshed when 90% of their TTL has elapsed (configurable via `FERRUM_DNS_REFRESH_THRESHOLD_PERCENT`). This keeps the cache warm and prevents any request from hitting DNS directly.
+
+Since each record has its own native TTL, the background refresh task uses each entry's individual applied TTL for threshold computation — not a single global value. The scan runs every 5 seconds to handle short-TTL records promptly.
 
 ## DNS Warmup
 
@@ -133,20 +159,28 @@ FERRUM_DNS_RESOLVER_ADDRESS="10.0.0.53:5353"
 FERRUM_DNS_RESOLVER_ADDRESS="[2606:4700:4700::1111]:53"
 ```
 
-### Aggressive Caching
+### Global TTL Override
 
 ```bash
-# 10 minute TTL, 2 hour stale window, 30 second error cache
-FERRUM_DNS_CACHE_TTL_SECONDS=600
+# Force all DNS entries to use 60-second TTL regardless of native record TTL
+FERRUM_DNS_TTL_OVERRIDE_SECONDS=60
+```
+
+### Aggressive Caching with Override
+
+```bash
+# 10 minute TTL override, 2 hour stale window, 30 second error cache
+FERRUM_DNS_TTL_OVERRIDE_SECONDS=600
 FERRUM_DNS_STALE_TTL=7200
 FERRUM_DNS_ERROR_TTL=30
 ```
 
-### Fixed TTL Override
+### Service Discovery (Short TTL)
 
 ```bash
-# Force all DNS entries to use 60-second TTL regardless of response
-FERRUM_DNS_VALID_TTL=60
+# Let native TTLs drive caching (default) with a 1-second minimum floor
+# Short-TTL records from Consul/CoreDNS will refresh quickly
+FERRUM_DNS_MIN_TTL_SECONDS=1
 ```
 
 ### IPv4-Only Resolution
@@ -181,6 +215,16 @@ FERRUM_DNS_REFRESH_THRESHOLD_PERCENT=80
 FERRUM_DNS_REFRESH_THRESHOLD_PERCENT=95
 ```
 
+### Failed DNS Retry Configuration
+
+```bash
+# Retry failed DNS lookups every 5 seconds (more aggressive than default)
+FERRUM_DNS_FAILED_RETRY_INTERVAL_SECONDS=5
+
+# Disable automatic retry of failed DNS lookups
+FERRUM_DNS_FAILED_RETRY_INTERVAL_SECONDS=0
+```
+
 ### System Resolver Options
 
 ```bash
@@ -198,6 +242,6 @@ In addition to global DNS settings, each proxy can override DNS behavior:
 | Proxy Field | Description |
 |-------------|-------------|
 | `dns_override` | Static IP address override for this proxy's backend. Bypasses all DNS resolution. |
-| `dns_cache_ttl_seconds` | Per-proxy TTL override for cache entries. Takes precedence over `FERRUM_DNS_CACHE_TTL_SECONDS`. |
+| `dns_cache_ttl_seconds` | Per-proxy TTL override for cache entries. Takes precedence over both the native record TTL and `FERRUM_DNS_TTL_OVERRIDE_SECONDS`. |
 
 These are configured in the proxy definition (YAML/JSON config file or database).

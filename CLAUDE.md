@@ -456,11 +456,15 @@ Plugin priority constants are defined in `src/plugins/mod.rs` (e.g., `priority::
 All gateway components share a single `DnsCache` instance:
 
 - **Pre-warmed at startup**: Backend hostnames, plugin target hostnames, and upstream targets are resolved before traffic starts flowing
-- **TTL-based expiration**: Cache entries expire based on configurable TTL (default from `FERRUM_DNS_CACHE_TTL_SECONDS`)
+- **Native TTL respect**: By default, cache entries expire based on the DNS record's native TTL from the response. No global TTL override is applied — short-TTL records (e.g., 30s for service discovery) refresh quickly while long-TTL records (e.g., 3600s for stable services) persist longer. A minimum TTL floor (`FERRUM_DNS_MIN_TTL_SECONDS`, default 5s) prevents 0-TTL abuse.
+- **Global TTL override**: `FERRUM_DNS_TTL_OVERRIDE_SECONDS` forces all records to use a fixed TTL regardless of their native TTL. Disabled by default.
+- **Per-proxy TTL override**: `Proxy.dns_cache_ttl_seconds` allows granular TTL control for a specific proxy, overriding both native TTL and the global override.
+- **TTL priority**: per-proxy override > global TTL override > native record TTL. The result is always clamped to `min_ttl`.
 - **Stale-while-revalidate**: Serves the old IP while refreshing in the background, avoiding DNS latency on the hot path
-- **Background refresh**: A dedicated task refreshes entries before they expire (at configurable `FERRUM_DNS_REFRESH_THRESHOLD_PERCENT` of TTL, default 90%), keeping the cache warm
+- **Background refresh**: A dedicated task refreshes entries before they expire (at configurable `FERRUM_DNS_REFRESH_THRESHOLD_PERCENT` of TTL, default 90%), using each entry's own applied TTL for threshold computation (not a single global TTL). Scan interval is 5s to handle short-TTL records promptly.
+- **Failed DNS retry task**: A separate background task (`FERRUM_DNS_FAILED_RETRY_INTERVAL_SECONDS`, default 10s) scans for error-cached entries whose error TTL has expired and re-attempts resolution. Logs at `warn` level for each retry attempt and outcome. Set to 0 to disable.
 - **`DnsCacheResolver`**: Implements `reqwest::dns::Resolve` — plugged into every `reqwest::Client` for automatic cache integration
-- **Custom nameservers**: Supports `FERRUM_DNS_NAMESERVERS` for internal DNS (e.g., Consul DNS, CoreDNS) and DNS-over-TLS via `FERRUM_DNS_TLS_NAMESERVERS`
+- **Custom nameservers**: Supports `FERRUM_DNS_RESOLVER_ADDRESS` for internal DNS (e.g., Consul DNS, CoreDNS)
 - **Record type optimization**: Remembers whether A or AAAA succeeded last for each hostname, querying that type first on refresh
 
 ### Centralized Rate Limiting (Redis)

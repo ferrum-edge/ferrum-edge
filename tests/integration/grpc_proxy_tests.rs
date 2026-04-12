@@ -131,14 +131,15 @@ fn create_test_env_config() -> ferrum_edge::config::EnvConfig {
         max_response_body_size_bytes: 10_485_760,
         response_buffer_threshold_bytes: 2_097_152,
         h2_coalesce_target_bytes: 131_072,
-        dns_cache_ttl_seconds: 300,
+        dns_ttl_override: None,
         dns_overrides: HashMap::new(),
         dns_resolver_address: None,
         dns_resolver_hosts_file: None,
         dns_order: None,
-        dns_valid_ttl: None,
+        dns_min_ttl: 5,
         dns_stale_ttl: 3600,
         dns_error_ttl: 1,
+        dns_failed_retry_interval: 10,
         dns_warmup_concurrency: 500,
         backend_allow_ips: ferrum_edge::config::BackendAllowIps::Both,
         tls_ca_bundle_path: None,
@@ -193,12 +194,12 @@ fn create_test_env_config() -> ferrum_edge::config::EnvConfig {
 /// Create a ProxyState configured with gRPC proxies.
 fn create_test_proxy_state(proxies: Vec<Proxy>) -> ProxyState {
     let dns_cache = DnsCache::new(DnsConfig {
-        default_ttl_seconds: 300,
         global_overrides: HashMap::new(),
         resolver_addresses: None,
         hosts_file_path: None,
         dns_order: None,
-        valid_ttl_override: None,
+        ttl_override_seconds: None,
+        min_ttl_seconds: 5,
         stale_ttl_seconds: 3600,
         error_ttl_seconds: 1,
         max_cache_size: 10_000,
@@ -206,6 +207,7 @@ fn create_test_proxy_state(proxies: Vec<Proxy>) -> ProxyState {
         backend_allow_ips: ferrum_edge::config::BackendAllowIps::Both,
         slow_threshold_ms: None,
         refresh_threshold_percent: 90,
+        failed_retry_interval_seconds: 10,
     });
     let config = GatewayConfig {
         version: "1".to_string(),

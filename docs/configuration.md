@@ -119,17 +119,18 @@ See [size_limits.md](size_limits.md) for detailed sizing guidance.
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `FERRUM_DNS_CACHE_TTL_SECONDS` | No | `300` | Default DNS cache TTL |
+| `FERRUM_DNS_TTL_OVERRIDE_SECONDS` | No | Disabled | Global TTL override — forces all records to use this fixed TTL. Disabled by default (native record TTL is respected) |
+| `FERRUM_DNS_MIN_TTL_SECONDS` | No | `5` | Minimum TTL floor to prevent 0-TTL abuse |
 | `FERRUM_DNS_OVERRIDES` | No | `{}` | JSON map of hostname→IP static overrides |
 | `FERRUM_DNS_RESOLVER_ADDRESS` | No | resolv.conf | Comma-separated nameservers (ip[:port]) |
 | `FERRUM_DNS_RESOLVER_HOSTS_FILE` | No | `/etc/hosts` | Path to custom hosts file |
 | `FERRUM_DNS_ORDER` | No | `CACHE,SRV,A,CNAME` | Record type query order (comma-separated) |
-| `FERRUM_DNS_VALID_TTL` | No | response TTL | Override TTL (seconds) for positive records |
 | `FERRUM_DNS_STALE_TTL` | No | `3600` | Stale data usage time (seconds) during refresh |
 | `FERRUM_DNS_ERROR_TTL` | No | `5` | TTL (seconds) for errors/empty responses |
 | `FERRUM_DNS_WARMUP_CONCURRENCY` | No | `500` | Maximum concurrent DNS warmup resolutions during startup/config reload |
 | `FERRUM_DNS_SLOW_THRESHOLD_MS` | No | Disabled | Log slow DNS resolutions above this threshold (ms) |
 | `FERRUM_DNS_REFRESH_THRESHOLD_PERCENT` | No | `90` | Percentage of TTL elapsed before background refresh (1-99) |
+| `FERRUM_DNS_FAILED_RETRY_INTERVAL_SECONDS` | No | `10` | Interval (seconds) for retrying failed DNS lookups. `0` = disabled |
 
 See [dns_resolver.md](dns_resolver.md) for full configuration reference.
 
