@@ -6889,20 +6889,6 @@ fn record_request(state: &ProxyState, status: u16) {
 /// **except** `Set-Cookie` (RFC 6265) which must be emitted as separate header
 /// lines. We store multiple Set-Cookie values separated by `\n` so they can be
 /// split back into individual headers when building the downstream response.
-/// Response hop-by-hop headers that MUST NOT be forwarded per RFC 9110 §7.6.1.
-/// These are connection-specific headers between adjacent HTTP endpoints — forwarding
-/// them to the client leaks proxy-internal information and can cause protocol confusion.
-const RESPONSE_HOP_BY_HOP_HEADERS: &[&str] = &[
-    "connection",
-    "keep-alive",
-    "proxy-authenticate",
-    "proxy-connection",
-    "te",
-    "trailer",
-    "transfer-encoding",
-    "upgrade",
-];
-
 fn collect_response_headers(
     source: &reqwest::header::HeaderMap,
     target: &mut HashMap<String, String>,
@@ -6910,10 +6896,11 @@ fn collect_response_headers(
     target.reserve(source.keys_len());
     for (k, v) in source {
         // Strip hop-by-hop headers from backend responses per RFC 9110 §7.6.1.
-        // These are connection-specific between the proxy and backend and must
-        // not be forwarded to the client.
-        if RESPONSE_HOP_BY_HOP_HEADERS.iter().any(|&h| k.as_str() == h) {
-            continue;
+        // Uses match (compiler-optimized) instead of linear array scan.
+        match k.as_str() {
+            "connection" | "keep-alive" | "proxy-authenticate" | "proxy-connection" | "te"
+            | "trailer" | "transfer-encoding" | "upgrade" => continue,
+            _ => {}
         }
         if let Ok(vs) = v.to_str() {
             // Determine multi-value separator before allocating the key String.
@@ -6943,8 +6930,10 @@ fn collect_hyper_response_headers(source: &hyper::HeaderMap, target: &mut HashMa
     target.reserve(source.keys_len());
     for (k, v) in source {
         // Strip hop-by-hop headers from backend responses per RFC 9110 §7.6.1.
-        if RESPONSE_HOP_BY_HOP_HEADERS.iter().any(|&h| k.as_str() == h) {
-            continue;
+        match k.as_str() {
+            "connection" | "keep-alive" | "proxy-authenticate" | "proxy-connection" | "te"
+            | "trailer" | "transfer-encoding" | "upgrade" => continue,
+            _ => {}
         }
         if let Ok(vs) = v.to_str() {
             let sep = if k == "set-cookie" { "\n" } else { ", " };
