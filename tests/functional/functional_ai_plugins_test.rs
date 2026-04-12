@@ -19,11 +19,10 @@ use tokio::time::sleep;
 
 /// Start a simple HTTP echo server that reads the full request and echoes
 /// back a JSON response with status 200.
-async fn start_echo_server(port: u16) {
-    let listener = TcpListener::bind(format!("127.0.0.1:{}", port))
-        .await
-        .expect("Failed to bind echo server");
-
+///
+/// Accepts a pre-bound listener to avoid port races (the caller holds the
+/// listener until passing it here, so the port cannot be stolen).
+async fn start_echo_server_on(listener: TcpListener) {
     loop {
         if let Ok((mut stream, _)) = listener.accept().await {
             tokio::spawn(async move {
@@ -70,7 +69,7 @@ fn start_gateway(config_path: &str, proxy_port: u16, admin_port: u16) -> std::pr
 }
 
 /// Wait for the gateway admin health endpoint to respond.
-async fn wait_for_gateway(admin_port: u16) {
+async fn wait_for_gateway(admin_port: u16) -> bool {
     let client = reqwest::Client::new();
     let health_url = format!("http://127.0.0.1:{}/health", admin_port);
 
@@ -78,11 +77,47 @@ async fn wait_for_gateway(admin_port: u16) {
         if let Ok(resp) = client.get(&health_url).send().await
             && resp.status().is_success()
         {
-            return;
+            return true;
         }
         sleep(Duration::from_millis(250)).await;
     }
-    panic!("Gateway did not become healthy within 15 seconds");
+    false
+}
+
+/// Start the gateway with retry on port-binding failures.
+///
+/// Allocates fresh ephemeral proxy and admin ports on each attempt to handle
+/// the bind-drop-rebind port race (another process can steal the port between
+/// the drop and the gateway bind). Returns (child, proxy_port, admin_port).
+async fn start_gateway_with_retry(config_path: &str) -> (std::process::Child, u16, u16) {
+    const MAX_ATTEMPTS: u32 = 3;
+    for attempt in 1..=MAX_ATTEMPTS {
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_port = proxy_listener.local_addr().unwrap().port();
+        drop(proxy_listener);
+
+        let admin_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let admin_port = admin_listener.local_addr().unwrap().port();
+        drop(admin_listener);
+
+        let mut child = start_gateway(config_path, proxy_port, admin_port);
+
+        if wait_for_gateway(admin_port).await {
+            return (child, proxy_port, admin_port);
+        }
+
+        eprintln!(
+            "Gateway startup attempt {}/{} failed (ports: proxy={}, admin={})",
+            attempt, MAX_ATTEMPTS, proxy_port, admin_port
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+
+        if attempt < MAX_ATTEMPTS {
+            sleep(Duration::from_secs(1)).await;
+        }
+    }
+    panic!("Gateway did not start after {} attempts", MAX_ATTEMPTS);
 }
 
 // ============================================================================
@@ -95,19 +130,9 @@ async fn test_ai_prompt_shield_rejects_pii() {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let config_path = temp_dir.path().join("config.yaml");
 
-    // Bind echo server to an ephemeral port
+    // Bind echo server — hold the listener to avoid port races
     let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let backend_port = echo_listener.local_addr().unwrap().port();
-    drop(echo_listener);
-
-    // Bind gateway ports
-    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let proxy_port = proxy_listener.local_addr().unwrap().port();
-    drop(proxy_listener);
-
-    let admin_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let admin_port = admin_listener.local_addr().unwrap().port();
-    drop(admin_listener);
 
     let config_content = format!(
         r#"
@@ -144,11 +169,11 @@ upstreams: []
     f.write_all(config_content.as_bytes()).unwrap();
     drop(f);
 
-    let _echo = tokio::spawn(start_echo_server(backend_port));
-    sleep(Duration::from_millis(300)).await;
+    let _echo = tokio::spawn(start_echo_server_on(echo_listener));
+    sleep(Duration::from_millis(100)).await;
 
-    let mut gw = start_gateway(config_path.to_str().unwrap(), proxy_port, admin_port);
-    wait_for_gateway(admin_port).await;
+    let (mut gw, proxy_port, _admin_port) =
+        start_gateway_with_retry(config_path.to_str().unwrap()).await;
 
     // Send a request with an SSN in the message content
     let client = reqwest::Client::new();
@@ -199,15 +224,6 @@ async fn test_ai_prompt_shield_allows_clean_request() {
 
     let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let backend_port = echo_listener.local_addr().unwrap().port();
-    drop(echo_listener);
-
-    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let proxy_port = proxy_listener.local_addr().unwrap().port();
-    drop(proxy_listener);
-
-    let admin_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let admin_port = admin_listener.local_addr().unwrap().port();
-    drop(admin_listener);
 
     let config_content = format!(
         r#"
@@ -244,11 +260,11 @@ upstreams: []
     f.write_all(config_content.as_bytes()).unwrap();
     drop(f);
 
-    let _echo = tokio::spawn(start_echo_server(backend_port));
-    sleep(Duration::from_millis(300)).await;
+    let _echo = tokio::spawn(start_echo_server_on(echo_listener));
+    sleep(Duration::from_millis(100)).await;
 
-    let mut gw = start_gateway(config_path.to_str().unwrap(), proxy_port, admin_port);
-    wait_for_gateway(admin_port).await;
+    let (mut gw, proxy_port, _admin_port) =
+        start_gateway_with_retry(config_path.to_str().unwrap()).await;
 
     // Send a clean request with no PII
     let client = reqwest::Client::new();
@@ -292,15 +308,6 @@ async fn test_ai_request_guard_rejects_disallowed_model() {
 
     let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let backend_port = echo_listener.local_addr().unwrap().port();
-    drop(echo_listener);
-
-    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let proxy_port = proxy_listener.local_addr().unwrap().port();
-    drop(proxy_listener);
-
-    let admin_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let admin_port = admin_listener.local_addr().unwrap().port();
-    drop(admin_listener);
 
     let config_content = format!(
         r#"
@@ -336,11 +343,11 @@ upstreams: []
     f.write_all(config_content.as_bytes()).unwrap();
     drop(f);
 
-    let _echo = tokio::spawn(start_echo_server(backend_port));
-    sleep(Duration::from_millis(300)).await;
+    let _echo = tokio::spawn(start_echo_server_on(echo_listener));
+    sleep(Duration::from_millis(100)).await;
 
-    let mut gw = start_gateway(config_path.to_str().unwrap(), proxy_port, admin_port);
-    wait_for_gateway(admin_port).await;
+    let (mut gw, proxy_port, _admin_port) =
+        start_gateway_with_retry(config_path.to_str().unwrap()).await;
 
     // Send a request with a disallowed model
     let client = reqwest::Client::new();
@@ -388,15 +395,6 @@ async fn test_ai_request_guard_rejects_excess_tokens() {
 
     let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let backend_port = echo_listener.local_addr().unwrap().port();
-    drop(echo_listener);
-
-    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let proxy_port = proxy_listener.local_addr().unwrap().port();
-    drop(proxy_listener);
-
-    let admin_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let admin_port = admin_listener.local_addr().unwrap().port();
-    drop(admin_listener);
 
     let config_content = format!(
         r#"
@@ -432,11 +430,11 @@ upstreams: []
     f.write_all(config_content.as_bytes()).unwrap();
     drop(f);
 
-    let _echo = tokio::spawn(start_echo_server(backend_port));
-    sleep(Duration::from_millis(300)).await;
+    let _echo = tokio::spawn(start_echo_server_on(echo_listener));
+    sleep(Duration::from_millis(100)).await;
 
-    let mut gw = start_gateway(config_path.to_str().unwrap(), proxy_port, admin_port);
-    wait_for_gateway(admin_port).await;
+    let (mut gw, proxy_port, _admin_port) =
+        start_gateway_with_retry(config_path.to_str().unwrap()).await;
 
     // Send a request with excessive max_tokens
     let client = reqwest::Client::new();
@@ -489,15 +487,6 @@ async fn test_ai_request_guard_allows_valid_request() {
 
     let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let backend_port = echo_listener.local_addr().unwrap().port();
-    drop(echo_listener);
-
-    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let proxy_port = proxy_listener.local_addr().unwrap().port();
-    drop(proxy_listener);
-
-    let admin_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let admin_port = admin_listener.local_addr().unwrap().port();
-    drop(admin_listener);
 
     let config_content = format!(
         r#"
@@ -533,11 +522,11 @@ upstreams: []
     f.write_all(config_content.as_bytes()).unwrap();
     drop(f);
 
-    let _echo = tokio::spawn(start_echo_server(backend_port));
-    sleep(Duration::from_millis(300)).await;
+    let _echo = tokio::spawn(start_echo_server_on(echo_listener));
+    sleep(Duration::from_millis(100)).await;
 
-    let mut gw = start_gateway(config_path.to_str().unwrap(), proxy_port, admin_port);
-    wait_for_gateway(admin_port).await;
+    let (mut gw, proxy_port, _admin_port) =
+        start_gateway_with_retry(config_path.to_str().unwrap()).await;
 
     // Send a valid request: allowed model + tokens within limit
     let client = reqwest::Client::new();
