@@ -1,6 +1,17 @@
-# Ferrum Edge
+<p align="center">
+  <img src="assets/ferrum_edge.png" alt="Ferrum Edge" width="300">
+</p>
 
-A high-performance edge proxy built in Rust
+<h1 align="center">Ferrum Edge</h1>
+
+<p align="center">A high-performance edge proxy built in Rust</p>
+
+<p align="center">
+  <a href="https://github.com/ferrum-edge/ferrum-edge/actions/workflows/ci.yml"><img src="https://github.com/ferrum-edge/ferrum-edge/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI"></a>
+  <a href="https://github.com/ferrum-edge/ferrum-edge/releases/latest"><img src="https://img.shields.io/github/v/release/ferrum-edge/ferrum-edge" alt="Release"></a>
+  <a href="https://github.com/ferrum-edge/ferrum-edge/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-PolyForm%20Noncommercial-blue" alt="License"></a>
+  <a href="https://hub.docker.com/r/ferrumedge/ferrum-edge"><img src="https://img.shields.io/docker/pulls/ferrumedge/ferrum-edge" alt="Docker Pulls"></a>
+</p>
 
 ## Overview
 
