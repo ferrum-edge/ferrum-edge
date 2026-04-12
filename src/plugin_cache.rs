@@ -75,6 +75,9 @@ impl Plugin for PriorityOverridePlugin {
     fn requires_request_body_buffering(&self) -> bool {
         self.inner.requires_request_body_buffering()
     }
+    fn needs_request_body_bytes(&self) -> bool {
+        self.inner.needs_request_body_bytes()
+    }
     async fn before_proxy(
         &self,
         ctx: &mut RequestContext,
@@ -260,6 +263,89 @@ type WsFrameMap = HashMap<String, bool>;
 /// The outer lookup uses `&str` (zero allocation), inner lookup uses `ProxyProtocol` (Copy).
 type ProtocolPluginMap = HashMap<String, HashMap<ProxyProtocol, PluginList>>;
 
+// ---------------------------------------------------------------------------
+// Per-protocol phase data — precomputed at config reload time
+// ---------------------------------------------------------------------------
+
+/// Bitflags for per-protocol plugin capability checks. Avoids per-request
+/// `plugins.iter().any(|p| p.some_flag())` scans on the hot path.
+#[derive(Clone, Copy, Default)]
+pub struct PluginCapabilities(u8);
+
+impl PluginCapabilities {
+    pub const HAS_AUTH_PLUGINS: u8 = 1 << 0;
+    pub const MODIFIES_REQUEST_HEADERS: u8 = 1 << 1;
+    pub const MODIFIES_REQUEST_BODY: u8 = 1 << 2;
+    pub const HAS_BODY_BEFORE_BEFORE_PROXY: u8 = 1 << 3;
+    pub const NEEDS_REQUEST_BODY_BYTES: u8 = 1 << 4;
+
+    #[inline(always)]
+    pub fn has(self, flag: u8) -> bool {
+        self.0 & flag != 0
+    }
+}
+
+/// Pre-computed per-protocol plugin phase data for a single proxy.
+/// Built at config reload time so the hot path does zero filtering or allocation.
+#[derive(Clone)]
+pub struct PluginPhaseData {
+    /// Auth plugins only (pre-filtered from the protocol plugin list).
+    pub auth_plugins: Arc<Vec<Arc<dyn Plugin>>>,
+    /// Capability bitset for fast boolean checks.
+    pub capabilities: PluginCapabilities,
+}
+
+/// Build `PluginPhaseData` from a protocol-filtered plugin list.
+fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
+    let mut caps = 0u8;
+    let mut auth = Vec::new();
+    for p in plugins {
+        if p.is_auth_plugin() {
+            caps |= PluginCapabilities::HAS_AUTH_PLUGINS;
+            auth.push(Arc::clone(p));
+        }
+        if p.modifies_request_headers() {
+            caps |= PluginCapabilities::MODIFIES_REQUEST_HEADERS;
+        }
+        if p.modifies_request_body() {
+            caps |= PluginCapabilities::MODIFIES_REQUEST_BODY;
+        }
+        if p.requires_request_body_before_before_proxy() {
+            caps |= PluginCapabilities::HAS_BODY_BEFORE_BEFORE_PROXY;
+        }
+        if p.needs_request_body_bytes() {
+            caps |= PluginCapabilities::NEEDS_REQUEST_BODY_BYTES;
+        }
+    }
+    PluginPhaseData {
+        auth_plugins: Arc::new(auth),
+        capabilities: PluginCapabilities(caps),
+    }
+}
+
+/// Two-level map: proxy_id → (protocol → PluginPhaseData).
+type PhaseDataMap = HashMap<String, HashMap<ProxyProtocol, PluginPhaseData>>;
+
+/// Build phase data maps from the protocol-filtered plugin maps.
+fn build_phase_data_maps(
+    proto_map: &ProtocolPluginMap,
+    global_proto_map: &HashMap<ProxyProtocol, PluginList>,
+) -> (PhaseDataMap, HashMap<ProxyProtocol, PluginPhaseData>) {
+    let mut phase_map: PhaseDataMap = HashMap::with_capacity(proto_map.len());
+    for (proxy_id, inner) in proto_map {
+        let mut proxy_phases = HashMap::with_capacity(inner.len());
+        for (&proto, plugins) in inner {
+            proxy_phases.insert(proto, build_phase_data(plugins));
+        }
+        phase_map.insert(proxy_id.clone(), proxy_phases);
+    }
+    let mut global_phases = HashMap::with_capacity(global_proto_map.len());
+    for (&proto, plugins) in global_proto_map {
+        global_phases.insert(proto, build_phase_data(plugins));
+    }
+    (phase_map, global_phases)
+}
+
 /// Filter a plugin list to only those supporting a given protocol.
 fn filter_for_protocol(
     plugins: &[Arc<dyn Plugin>],
@@ -359,6 +445,12 @@ pub struct PluginCache {
     requires_ws_frame: ArcSwap<WsFrameMap>,
     /// Whether global-only plugins require per-frame WebSocket hooks (fallback).
     global_requires_ws_frame: ArcSwap<bool>,
+    /// Pre-computed per-protocol phase data: auth plugin lists, reject-hooks lists,
+    /// and capability bitsets. Eliminates per-request `filter().collect()` and
+    /// `iter().any()` scans on the hot path.
+    phase_data: ArcSwap<PhaseDataMap>,
+    /// Per-protocol global phase data fallback.
+    global_phase_data: ArcSwap<HashMap<ProxyProtocol, PluginPhaseData>>,
     /// Shared HTTP client for plugins that make outbound network calls.
     http_client: PluginHttpClient,
 }
@@ -390,6 +482,7 @@ impl PluginCache {
             global_needs_ws_frame,
         ) = Self::build_cache(config, &http_client)?;
         let (proto_map, global_proto_map) = build_protocol_maps(&proxy_map, &globals);
+        let (pd_map, global_pd) = build_phase_data_maps(&proto_map, &global_proto_map);
         Ok(Self {
             proxy_plugins: ArcSwap::new(Arc::new(proxy_map)),
             global_plugins: ArcSwap::new(Arc::new(globals)),
@@ -401,6 +494,8 @@ impl PluginCache {
             global_protocol_plugins: ArcSwap::new(Arc::new(global_proto_map)),
             requires_ws_frame: ArcSwap::new(Arc::new(ws_frame_map)),
             global_requires_ws_frame: ArcSwap::new(Arc::new(global_needs_ws_frame)),
+            phase_data: ArcSwap::new(Arc::new(pd_map)),
+            global_phase_data: ArcSwap::new(Arc::new(global_pd)),
             http_client,
         })
     }
@@ -422,6 +517,7 @@ impl PluginCache {
             global_needs_ws_frame,
         ) = Self::build_cache(config, &self.http_client)?;
         let (proto_map, global_proto_map) = build_protocol_maps(&proxy_map, &globals);
+        let (pd_map, global_pd) = build_phase_data_maps(&proto_map, &global_proto_map);
 
         // Clean up JWKS cache entries (and their background refresh tasks)
         // for URIs no longer referenced by any active jwks_auth plugin.
@@ -443,6 +539,8 @@ impl PluginCache {
         self.requires_ws_frame.store(Arc::new(ws_frame_map));
         self.global_requires_ws_frame
             .store(Arc::new(global_needs_ws_frame));
+        self.phase_data.store(Arc::new(pd_map));
+        self.global_phase_data.store(Arc::new(global_pd));
         Ok(())
     }
 
@@ -666,6 +764,23 @@ impl PluginCache {
         let active_uris = collect_active_jwks_uris(&new_map, &new_globals);
         retain_active_uris(&active_uris);
 
+        // Rebuild phase data for changed proxies
+        let mut new_pd_map: PhaseDataMap = self.phase_data.load().as_ref().clone();
+        for id in removed_proxy_ids {
+            new_pd_map.remove(id);
+        }
+        for proxy in &config.proxies {
+            if proxy_ids_to_rebuild.contains(&proxy.id)
+                && let Some(proto_inner) = new_proto_map.get(&proxy.id)
+            {
+                let mut proxy_phases = HashMap::with_capacity(proto_inner.len());
+                for (&proto, plugins) in proto_inner {
+                    proxy_phases.insert(proto, build_phase_data(plugins));
+                }
+                new_pd_map.insert(proxy.id.clone(), proxy_phases);
+            }
+        }
+
         // Atomic swap — readers see old or new, never a partial state
         self.proxy_plugins.store(Arc::new(new_map));
         self.requires_buffering.store(Arc::new(new_buffering));
@@ -673,6 +788,7 @@ impl PluginCache {
             .store(Arc::new(new_req_buffering));
         self.requires_ws_frame.store(Arc::new(new_ws_frame));
         self.protocol_plugins.store(Arc::new(new_proto_map));
+        self.phase_data.store(Arc::new(new_pd_map));
         if rebuild_globals {
             self.global_plugins.store(Arc::new(new_globals.clone()));
             self.global_requires_buffering.store(Arc::new(
@@ -694,7 +810,13 @@ impl PluginCache {
                 new_global_proto.insert(proto, filter_for_protocol(&new_globals, proto));
             }
             self.global_protocol_plugins
-                .store(Arc::new(new_global_proto));
+                .store(Arc::new(new_global_proto.clone()));
+            // Rebuild global phase data
+            let mut new_global_pd = HashMap::with_capacity(protocols.len());
+            for (&proto, plugins) in &new_global_proto {
+                new_global_pd.insert(proto, build_phase_data(plugins));
+            }
+            self.global_phase_data.store(Arc::new(new_global_pd));
         }
 
         Ok(())
@@ -735,6 +857,41 @@ impl PluginCache {
             Arc::clone(plugins)
         } else {
             Arc::new(Vec::new())
+        }
+    }
+
+    /// Get pre-computed auth plugins for a proxy+protocol. Lock-free O(1) lookup.
+    /// Returns only plugins where `is_auth_plugin() == true`, pre-filtered at
+    /// config reload time — eliminates the per-request `filter().collect()` Vec allocation.
+    pub fn get_auth_plugins(
+        &self,
+        proxy_id: &str,
+        protocol: ProxyProtocol,
+    ) -> Arc<Vec<Arc<dyn Plugin>>> {
+        let map = self.phase_data.load();
+        if let Some(pd) = map.get(proxy_id).and_then(|inner| inner.get(&protocol)) {
+            return Arc::clone(&pd.auth_plugins);
+        }
+        let globals = self.global_phase_data.load();
+        if let Some(pd) = globals.get(&protocol) {
+            Arc::clone(&pd.auth_plugins)
+        } else {
+            Arc::new(Vec::new())
+        }
+    }
+
+    /// Get pre-computed capability bitset for a proxy+protocol. Lock-free O(1) lookup.
+    /// Replaces per-request `plugins.iter().any(|p| p.some_flag())` scans.
+    pub fn get_capabilities(&self, proxy_id: &str, protocol: ProxyProtocol) -> PluginCapabilities {
+        let map = self.phase_data.load();
+        if let Some(pd) = map.get(proxy_id).and_then(|inner| inner.get(&protocol)) {
+            return pd.capabilities;
+        }
+        let globals = self.global_phase_data.load();
+        if let Some(pd) = globals.get(&protocol) {
+            pd.capabilities
+        } else {
+            PluginCapabilities::default()
         }
     }
 

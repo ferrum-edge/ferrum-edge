@@ -74,7 +74,7 @@ use crate::dns::DnsCache;
 use crate::health_check::HealthChecker;
 use crate::http3::client::Http3ConnectionPool;
 use crate::load_balancer::{HashOnStrategy, LoadBalancerCache};
-use crate::plugin_cache::PluginCache;
+use crate::plugin_cache::{PluginCache, PluginCapabilities};
 use crate::plugins::{
     Plugin, PluginResult, ProxyProtocol, RequestContext, TransactionSummary,
     WebSocketFrameDirection, priority as plugin_priority,
@@ -3676,7 +3676,7 @@ pub fn request_is_authenticated(ctx: &RequestContext) -> bool {
 
 pub async fn run_authentication_phase(
     auth_mode: AuthMode,
-    auth_plugins: &[&Arc<dyn Plugin>],
+    auth_plugins: &[Arc<dyn Plugin>],
     ctx: &mut RequestContext,
     consumer_index: &ConsumerIndex,
 ) -> Option<(u16, Vec<u8>, HashMap<String, String>)> {
@@ -4071,6 +4071,11 @@ pub async fn handle_proxy_request(
     let plugins = state
         .plugin_cache
         .get_plugins_for_protocol(&proxy.id, request_protocol);
+    // Pre-computed capability bitset and phase-specific plugin lists — avoids
+    // per-request `iter().filter().collect()` and `iter().any()` scans.
+    let capabilities = state
+        .plugin_cache
+        .get_capabilities(&proxy.id, request_protocol);
     let mut client_request_body = ClientRequestBody::Streaming(Box::new(req));
 
     // Accumulator for total wall-clock time spent inside plugin phase callbacks.
@@ -4118,9 +4123,10 @@ pub async fn handle_proxy_request(
         plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
     }
 
-    // Authentication phase
-    let auth_plugins: Vec<&Arc<dyn Plugin>> =
-        plugins.iter().filter(|p| p.is_auth_plugin()).collect();
+    // Authentication phase (pre-computed auth plugin list — zero allocation)
+    let auth_plugins = state
+        .plugin_cache
+        .get_auth_plugins(&proxy.id, request_protocol);
 
     {
         let auth_phase_start = Instant::now();
@@ -4200,19 +4206,20 @@ pub async fn handle_proxy_request(
     let maybe_requires_request_body_buffering = state
         .plugin_cache
         .requires_request_body_buffering(&proxy.id);
+    // should_buffer_request_body is request-time (takes &RequestContext), so it
+    // must still iterate. But the config-time capability checks use the bitset.
     let requires_request_body_buffering = maybe_requires_request_body_buffering
         && plugins
             .iter()
             .any(|plugin| plugin.should_buffer_request_body(&ctx));
     let requires_request_body_before_before_proxy = requires_request_body_buffering
+        && capabilities.has(PluginCapabilities::HAS_BODY_BEFORE_BEFORE_PROXY)
         && plugins.iter().any(|plugin| {
             plugin.requires_request_body_before_before_proxy()
                 && plugin.should_buffer_request_body(&ctx)
         });
     let needs_body_bytes = requires_request_body_before_before_proxy
-        && plugins
-            .iter()
-            .any(|plugin| plugin.needs_request_body_bytes());
+        && capabilities.has(PluginCapabilities::NEEDS_REQUEST_BODY_BYTES);
 
     if requires_request_body_before_before_proxy {
         client_request_body = match client_request_body {
@@ -4261,8 +4268,7 @@ pub async fn handle_proxy_request(
     // before_proxy hooks — only clone headers if at least one plugin modifies them.
     // When no plugin modifies headers, pass &mut ctx.headers directly to avoid
     // an expensive per-request HashMap clone on the hot path.
-    let needs_header_clone =
-        !plugins.is_empty() && plugins.iter().any(|p| p.modifies_request_headers());
+    let needs_header_clone = capabilities.has(PluginCapabilities::MODIFIES_REQUEST_HEADERS);
     let mut owned_proxy_headers: Option<HashMap<String, String>> = None;
     if needs_header_clone {
         let phase_start = Instant::now();
