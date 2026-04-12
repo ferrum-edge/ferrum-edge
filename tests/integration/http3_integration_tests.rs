@@ -434,6 +434,7 @@ async fn test_http3_proxy_state_creation() {
         http2_pool: Arc::new(ferrum_edge::proxy::http2_pool::Http2ConnectionPool::default()),
         h3_pool: Arc::new(ferrum_edge::http3::client::Http3ConnectionPool::new(
             Arc::new(ferrum_edge::config::EnvConfig::default()),
+            ferrum_edge::dns::DnsCache::new(ferrum_edge::dns::DnsConfig::default()),
         )),
         load_balancer_cache: lb_cache.clone(),
         health_checker: Arc::new(ferrum_edge::health_check::HealthChecker::new()),
@@ -641,6 +642,7 @@ async fn test_http3_full_integration() {
         http2_pool: Arc::new(ferrum_edge::proxy::http2_pool::Http2ConnectionPool::default()),
         h3_pool: Arc::new(ferrum_edge::http3::client::Http3ConnectionPool::new(
             Arc::new(ferrum_edge::config::EnvConfig::default()),
+            ferrum_edge::dns::DnsCache::new(ferrum_edge::dns::DnsConfig::default()),
         )),
         load_balancer_cache: lb_cache.clone(),
         health_checker: Arc::new(ferrum_edge::health_check::HealthChecker::new()),

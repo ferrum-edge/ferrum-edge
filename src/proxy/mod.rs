@@ -30,6 +30,7 @@
 //! - **Streaming by default**: Response bodies are streamed unless a plugin requires buffering
 //! - **Atomic config reload**: `update_config()` and `apply_incremental()` swap config atomically
 
+pub mod backend_dispatch;
 pub mod body;
 pub mod client_ip;
 pub mod grpc_proxy;
@@ -576,7 +577,10 @@ impl ProxyState {
             crls.clone(),
         ));
         let env_config_arc = Arc::new(env_config.clone());
-        let h3_pool = Arc::new(Http3ConnectionPool::new(env_config_arc.clone()));
+        let h3_pool = Arc::new(Http3ConnectionPool::new(
+            env_config_arc.clone(),
+            dns_cache.clone(),
+        ));
         let connection_pool = Arc::new(ConnectionPool::new(
             global_pool_config.clone(),
             env_config,
@@ -4355,104 +4359,41 @@ pub async fn handle_proxy_request(
         owned_proxy_headers.as_ref().unwrap_or(&ctx.headers);
 
     // Resolve upstream target and hash key with a single ArcSwap load.
-    // Loads the balancers map once and reuses it for both hash-on strategy
-    // lookup and target selection, saving one atomic operation per request.
-    let (lb_hash_key, upstream_target, upstream_is_fallback, sticky_cookie_needed) = if let Some(
-        upstream_id,
-    ) =
-        &proxy.upstream_id
-    {
-        let proxy_passive = state
-            .health_checker
-            .passive_health
-            .get(&proxy.id)
-            .map(|r| r.value().clone());
-        let health_ctx = crate::load_balancer::HealthContext {
-            active_unhealthy: &state.health_checker.active_unhealthy_targets,
-            proxy_passive: proxy_passive.clone(),
-        };
-
-        // Single ArcSwap load for both strategy + selection
-        let balancers = state.load_balancer_cache.load();
-        let strategy = crate::load_balancer::LoadBalancerCache::get_hash_on_strategy_from(
-            &balancers,
-            upstream_id,
-        );
-        let (hash_key, needs_set) = resolve_hash_key(&strategy, &ctx.client_ip, proxy_headers);
-
-        match crate::load_balancer::LoadBalancerCache::select_target_from(
-            &balancers,
-            upstream_id,
-            &hash_key,
-            Some(&health_ctx),
-        ) {
-            Some(selection) => {
-                if selection.is_fallback {
-                    warn!(
-                        proxy_id = %proxy.id,
-                        upstream_id = %upstream_id,
-                        target_host = %selection.target.host,
-                        target_port = selection.target.port,
-                        "All upstream targets unhealthy, using fallback target"
-                    );
-                } else {
-                    debug!(
-                        proxy_id = %proxy.id,
-                        upstream_id = %upstream_id,
-                        target_host = %selection.target.host,
-                        target_port = selection.target.port,
-                        "Upstream target selected"
-                    );
-                }
-                (
-                    (hash_key, needs_set),
-                    Some(selection.target),
-                    selection.is_fallback,
-                    needs_set,
-                )
-            }
-            None => {
-                warn!(proxy_id = %proxy.id, upstream_id = %upstream_id, "No upstream target available");
-                ((hash_key, needs_set), None, false, false)
-            }
-        }
-    } else {
-        ((ctx.client_ip.clone(), false), None, false, false)
-    };
+    let selection =
+        backend_dispatch::select_upstream_target(&proxy, &state, &ctx.client_ip, proxy_headers);
+    let lb_hash_key = selection.lb_hash_key;
+    let upstream_target = selection.target;
+    let upstream_is_fallback = selection.is_fallback;
+    let sticky_cookie_needed = selection.sticky_cookie_needed;
 
     // Circuit breaker check — per-target when upstream is configured, per-proxy otherwise
-    let cb_target_key = upstream_target
-        .as_ref()
-        .map(|t| crate::circuit_breaker::target_key(&t.host, t.port));
-    if let Some(cb_config) = &proxy.circuit_breaker
-        && state
-            .circuit_breaker_cache
-            .can_execute(&proxy.id, cb_target_key.as_deref(), cb_config)
-            .is_err()
-    {
-        warn!(proxy_id = %proxy.id, "Request rejected: circuit breaker open");
-        let reject = finalize_reject_response_with_after_proxy_hooks(
-            &plugins,
-            &mut ctx,
-            StatusCode::SERVICE_UNAVAILABLE,
-            br#"{"error":"Service temporarily unavailable (circuit breaker open)"}"#,
-            HashMap::new(),
-            is_grpc_request,
-        )
-        .await;
-        apply_grpc_reject_metadata(&mut ctx, &reject);
-        log_rejected_request(
-            &plugins,
-            &ctx,
-            reject.http_status.as_u16(),
-            start_time,
-            "circuit_breaker_open",
-            plugin_execution_ns,
-        )
-        .await;
-        record_request(&state, reject.http_status.as_u16());
-        return Ok(build_response_from_normalized_reject(reject));
-    }
+    let cb_target_key =
+        match backend_dispatch::check_circuit_breaker(&proxy, &state, upstream_target.as_deref()) {
+            Ok(key) => key,
+            Err(()) => {
+                let reject = finalize_reject_response_with_after_proxy_hooks(
+                    &plugins,
+                    &mut ctx,
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    br#"{"error":"Service temporarily unavailable (circuit breaker open)"}"#,
+                    HashMap::new(),
+                    is_grpc_request,
+                )
+                .await;
+                apply_grpc_reject_metadata(&mut ctx, &reject);
+                log_rejected_request(
+                    &plugins,
+                    &ctx,
+                    reject.http_status.as_u16(),
+                    start_time,
+                    "circuit_breaker_open",
+                    plugin_execution_ns,
+                )
+                .await;
+                record_request(&state, reject.http_status.as_u16());
+                return Ok(build_response_from_normalized_reject(reject));
+            }
+        };
 
     // Check if this is a WebSocket upgrade request and the proxy supports WebSocket
     // This check happens AFTER authentication and authorization plugins have run
@@ -5401,74 +5342,16 @@ pub async fn handle_proxy_request(
         "Backend response received"
     );
 
-    // End connection tracking for least-connections
-    if let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, &upstream_target) {
-        state
-            .load_balancer_cache
-            .record_connection_end(upstream_id, target);
-    }
-
-    // Record backend TTFB for least-latency load balancing (passive path).
-    // Only record when:
-    //   1. No connection error (timeouts/refused don't reflect real latency)
-    //   2. Response is non-5xx (error responses may have artificially low latency
-    //      from fast-failing backends, which would skew the EWMA toward broken targets)
-    //   3. No active health checks configured for this upstream — when active probes
-    //      exist, they provide consistent, controlled RTT measurements and take
-    //      precedence over passive TTFB which includes variable application processing time
-    if !backend_resp.connection_error
-        && response_status < 500
-        && let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, &upstream_target)
-    {
-        let upstream = state.load_balancer_cache.get_upstream(upstream_id);
-        let has_active_hc = upstream
-            .as_ref()
-            .and_then(|u| u.health_checks.as_ref())
-            .and_then(|hc| hc.active.as_ref())
-            .is_some();
-        if !has_active_hc {
-            let latency_us = backend_start.elapsed().as_micros() as u64;
-            state
-                .load_balancer_cache
-                .record_latency(upstream_id, target, latency_us);
-        }
-    }
-
-    // Record circuit breaker result against the final target's breaker.
-    // For retries, intermediate failures were already recorded per-target inside
-    // the retry loop, so this only records the final attempt's outcome.
-    if let Some(cb_config) = &proxy.circuit_breaker {
-        let cb = state.circuit_breaker_cache.get_or_create(
-            &proxy.id,
-            final_cb_target_key.as_deref(),
-            cb_config,
-        );
-        if backend_resp.connection_error {
-            // Connection errors are controlled by trip_on_connection_errors.
-            // When disabled, connection errors are neutral — no state mutation.
-            if cb.config().trip_on_connection_errors {
-                cb.record_failure(response_status, true);
-            }
-        } else if cb.config().failure_status_codes.contains(&response_status) {
-            cb.record_failure(response_status, false);
-        } else {
-            cb.record_success();
-        }
-    }
-
-    // Passive health check reporting (O(1) upstream lookup via index)
-    if let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, &upstream_target)
-        && let Some(upstream) = state.load_balancer_cache.get_upstream(upstream_id)
-        && let Some(hc) = &upstream.health_checks
-    {
-        state.health_checker.report_response(
-            &proxy.id,
-            target,
-            response_status,
-            backend_resp.connection_error,
-            hc.passive.as_ref(),
-        );
-    }
+    // Record outcome across CB, passive health, latency, and connection tracking.
+    backend_dispatch::record_backend_outcome(
+        &state,
+        &proxy,
+        upstream_target.as_deref(),
+        final_cb_target_key.as_deref(),
+        response_status,
+        backend_resp.connection_error,
+        backend_start.elapsed(),
+    );
 
     let backend_elapsed = backend_start.elapsed().as_secs_f64() * 1000.0;
     let backend_ttfb_ms = backend_elapsed;
@@ -6793,48 +6676,6 @@ async fn collect_response_with_limit(
     Ok((body, len))
 }
 
-/// Resolve the consistent-hashing key based on the upstream's `hash_on` strategy.
-///
-/// Returns `(hash_key, needs_cookie_set)`:
-/// - `needs_cookie_set` is true when the strategy is cookie-based and the cookie
-///   was not present in the request (a new sticky session needs to be established).
-fn resolve_hash_key(
-    strategy: &HashOnStrategy,
-    client_ip: &str,
-    headers: &HashMap<String, String>,
-) -> (String, bool) {
-    match strategy {
-        HashOnStrategy::Ip => (client_ip.to_string(), false),
-        HashOnStrategy::Header(name) => {
-            // Header names in ctx.headers are stored as-is from hyper (lowercased)
-            let value = headers.get(name.as_str()).cloned().unwrap_or_default();
-            if value.is_empty() {
-                (client_ip.to_string(), false)
-            } else {
-                (value, false)
-            }
-        }
-        HashOnStrategy::Cookie(name) => {
-            // Parse the Cookie header to find the named cookie
-            if let Some(cookie_header) = headers.get("cookie") {
-                for part in cookie_header.split(';') {
-                    let part = part.trim();
-                    if let Some((k, v)) = part.split_once('=')
-                        && k.trim() == name.as_str()
-                    {
-                        let v = v.trim();
-                        if !v.is_empty() {
-                            return (v.to_string(), false);
-                        }
-                    }
-                }
-            }
-            // Cookie not found — use IP and signal that we need to set the cookie
-            (client_ip.to_string(), true)
-        }
-    }
-}
-
 /// Build a `Set-Cookie` header value for sticky session cookie injection.
 fn build_sticky_cookie_header(
     cookie_name: &str,
@@ -7060,19 +6901,18 @@ pub fn check_protocol_headers(
         }
     }
 
-    // 4. TE header in HTTP/2 must be "trailers" only (RFC 9113 §8.2.2)
+    // 4. TE header in HTTP/2 and HTTP/3 must be "trailers" only
+    // (RFC 9113 §8.2.2 for HTTP/2, RFC 9114 §4.2 for HTTP/3).
     // Iterate all TE header entries and comma-separated tokens within each entry.
     // A request with `te: trailers` plus a second `te: gzip` entry (or a single
     // `te: trailers, gzip` field) must be rejected.
-    if version == hyper::Version::HTTP_2 {
+    if version == hyper::Version::HTTP_2 || version == hyper::Version::HTTP_3 {
         for te_val in headers.get_all("te") {
             if let Ok(te_str) = te_val.to_str() {
                 for token in te_str.split(',') {
                     let trimmed = token.trim();
                     if !trimmed.is_empty() && !trimmed.eq_ignore_ascii_case("trailers") {
-                        return Some(
-                            r#"{"error":"HTTP/2 TE header must be 'trailers' or absent"}"#,
-                        );
+                        return Some(r#"{"error":"TE header must be 'trailers' or absent"}"#);
                     }
                 }
             }

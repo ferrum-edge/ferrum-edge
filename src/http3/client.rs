@@ -8,8 +8,8 @@
 //! stores on every request. On connection failure, a fallback scan checks
 //! other cached connection indices before creating a new connection.
 //!
-//! Note: This pool is used only by the main hyper-based proxy path (`proxy/mod.rs`)
-//! for H3 backend targets. The H3 frontend server uses reqwest instead.
+//! This pool is used by both the main hyper-based proxy path (`proxy/mod.rs`)
+//! for H3 backend targets and the H3 frontend server (`http3/server.rs`).
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -27,6 +27,18 @@ use crate::config::types::Proxy;
 
 /// Type alias for the h3 send request handle.
 type H3SendRequest = h3::client::SendRequest<h3_quinn::OpenStreams, bytes::Bytes>;
+
+/// Type alias for the h3 client request stream (bidirectional).
+type H3RequestStream = h3::client::RequestStream<h3_quinn::BidiStream<bytes::Bytes>, bytes::Bytes>;
+
+/// Result of a streaming HTTP/3 request — headers received, body still in flight.
+///
+/// The caller reads response body chunks via `recv_stream.recv_data()`.
+pub struct H3StreamingResponse {
+    pub status: u16,
+    pub headers: HashMap<String, String>,
+    pub recv_stream: H3RequestStream,
+}
 
 fn now_epoch_ms() -> u64 {
     std::time::SystemTime::now()
@@ -52,6 +64,8 @@ struct H3PoolEntry {
 pub struct Http3ConnectionPool {
     entries: Arc<DashMap<String, H3PoolEntry>>,
     env_config: Arc<crate::config::EnvConfig>,
+    /// Shared DNS cache for backend hostname resolution.
+    dns_cache: crate::dns::DnsCache,
     /// Round-robin counter for distributing streams across backend connections.
     conn_counter: AtomicU64,
     /// Number of QUIC connections to maintain per backend. Multiple connections
@@ -61,11 +75,12 @@ pub struct Http3ConnectionPool {
 }
 
 impl Http3ConnectionPool {
-    pub fn new(env_config: Arc<crate::config::EnvConfig>) -> Self {
+    pub fn new(env_config: Arc<crate::config::EnvConfig>, dns_cache: crate::dns::DnsCache) -> Self {
         let connections_per_backend = env_config.http3_connections_per_backend;
         let pool = Self {
             entries: Arc::new(DashMap::new()),
             env_config,
+            dns_cache,
             conn_counter: AtomicU64::new(0),
             connections_per_backend,
         };
@@ -136,7 +151,8 @@ impl Http3ConnectionPool {
             return Ok(());
         }
         let h3_config = super::config::Http3ServerConfig::from_env_config(&self.env_config);
-        let (endpoint, sr) = Self::create_connection(proxy, tls_config, Some(&h3_config)).await?;
+        let (endpoint, sr) =
+            Self::create_connection(proxy, tls_config, Some(&h3_config), &self.dns_cache).await?;
         self.entries.insert(
             key,
             H3PoolEntry {
@@ -163,8 +179,14 @@ impl Http3ConnectionPool {
             return Ok(());
         }
         let h3_config = super::config::Http3ServerConfig::from_env_config(&self.env_config);
-        let (endpoint, sr) =
-            Self::create_connection_to_target(host, port, tls_config, Some(&h3_config)).await?;
+        let (endpoint, sr) = Self::create_connection_to_target(
+            host,
+            port,
+            tls_config,
+            Some(&h3_config),
+            &self.dns_cache,
+        )
+        .await?;
         self.entries.insert(
             key,
             H3PoolEntry {
@@ -284,7 +306,8 @@ impl Http3ConnectionPool {
         // Create new connection — only now do we need the TLS config
         let tls_config = tls_config_fn()?;
         let h3_config = super::config::Http3ServerConfig::from_env_config(&self.env_config);
-        let (endpoint, sr) = Self::create_connection(proxy, &tls_config, Some(&h3_config)).await?;
+        let (endpoint, sr) =
+            Self::create_connection(proxy, &tls_config, Some(&h3_config), &self.dns_cache).await?;
         let mut sr_for_request = sr.clone();
 
         self.entries.insert(
@@ -390,6 +413,7 @@ impl Http3ConnectionPool {
             target_port,
             &tls_config,
             Some(&h3_config),
+            &self.dns_cache,
         )
         .await?;
         let mut sr_for_request = sr.clone();
@@ -419,6 +443,7 @@ impl Http3ConnectionPool {
         proxy: &Proxy,
         tls_config: &Arc<rustls::ClientConfig>,
         h3_config: Option<&super::config::Http3ServerConfig>,
+        dns_cache: &crate::dns::DnsCache,
     ) -> Result<(quinn::Endpoint, H3SendRequest), anyhow::Error> {
         let quic_client_config = QuicClientConfig::try_from(tls_config.clone()).map_err(|e| {
             anyhow::anyhow!(
@@ -446,16 +471,16 @@ impl Http3ConnectionPool {
 
         let host = &proxy.backend_host;
         let port = proxy.backend_port;
-        let addr = resolve_backend_addr(host, port).await?;
+        let addr = resolve_backend_addr_cached(
+            host,
+            port,
+            dns_cache,
+            proxy.dns_override.as_deref(),
+            proxy.dns_cache_ttl_seconds,
+        )
+        .await?;
 
-        // Bind to the matching address family (IPv4 or IPv6) based on the resolved backend
-        let bind_addr: SocketAddr = if addr.is_ipv6() {
-            "[::]:0".parse()?
-        } else {
-            "0.0.0.0:0".parse()?
-        };
-        let mut endpoint = quinn::Endpoint::client(bind_addr)?;
-        endpoint.set_default_client_config(client_config);
+        let endpoint = create_udp_endpoint(addr, client_config)?;
 
         debug!(
             "HTTP/3 pool: connecting to {}:{} (resolved: {})",
@@ -487,6 +512,7 @@ impl Http3ConnectionPool {
         port: u16,
         tls_config: &Arc<rustls::ClientConfig>,
         h3_config: Option<&super::config::Http3ServerConfig>,
+        dns_cache: &crate::dns::DnsCache,
     ) -> Result<(quinn::Endpoint, H3SendRequest), anyhow::Error> {
         let quic_client_config = QuicClientConfig::try_from(tls_config.clone()).map_err(|e| {
             anyhow::anyhow!(
@@ -512,7 +538,7 @@ impl Http3ConnectionPool {
         let mut client_config = quinn::ClientConfig::new(Arc::new(quic_client_config));
         client_config.transport_config(Arc::new(transport_config));
 
-        let addr = resolve_backend_addr(host, port).await?;
+        let addr = resolve_backend_addr_cached(host, port, dns_cache, None, None).await?;
 
         let bind_addr: SocketAddr = if addr.is_ipv6() {
             "[::]:0".parse()?
@@ -584,8 +610,15 @@ impl Http3ConnectionPool {
         let response = stream.recv_response().await?;
         let status = response.status().as_u16();
 
-        let mut response_headers = HashMap::new();
+        let mut response_headers = HashMap::with_capacity(response.headers().keys_len());
         for (name, value) in response.headers() {
+            // Skip hop-by-hop headers during collection (avoids allocating
+            // String keys that would be immediately removed by the caller).
+            match name.as_str() {
+                "connection" | "keep-alive" | "proxy-authenticate" | "proxy-connection" | "te"
+                | "trailer" | "transfer-encoding" | "upgrade" => continue,
+                _ => {}
+            }
             if let Ok(value_str) = value.to_str() {
                 response_headers.insert(name.as_str().to_string(), value_str.to_string());
             }
@@ -597,6 +630,547 @@ impl Http3ConnectionPool {
         }
 
         Ok((status, response_body, response_headers))
+    }
+
+    /// Execute an HTTP/3 request, returning headers and a stream handle for the
+    /// response body. Unlike `do_request`, this does NOT buffer the body — the
+    /// caller reads chunks via `recv_stream.recv_data()`.
+    async fn do_request_streaming(
+        send_request: &mut H3SendRequest,
+        proxy: &Proxy,
+        method: &str,
+        backend_url: &str,
+        headers: &[(http::header::HeaderName, http::header::HeaderValue)],
+        body: bytes::Bytes,
+    ) -> Result<H3StreamingResponse, anyhow::Error> {
+        let uri: http::Uri = backend_url
+            .parse()
+            .map_err(|e| anyhow::anyhow!("Invalid backend URL: {}", e))?;
+
+        let _host = uri.host().unwrap_or(&proxy.backend_host);
+        let path_and_query = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
+
+        let req_method: http::Method = method
+            .parse()
+            .map_err(|_| anyhow::anyhow!("Invalid HTTP method: {}", method))?;
+
+        let mut req_builder = Request::builder().method(req_method).uri(path_and_query);
+        for (name, value) in headers {
+            match name.as_str() {
+                "connection" | "transfer-encoding" | "keep-alive" | "upgrade" => continue,
+                _ => {
+                    req_builder = req_builder.header(name, value);
+                }
+            }
+        }
+
+        let req = req_builder.body(())?;
+        let mut stream = send_request.send_request(req).await?;
+
+        if !body.is_empty() {
+            stream.send_data(body).await?;
+        }
+        stream.finish().await?;
+
+        let response = stream.recv_response().await?;
+        let status = response.status().as_u16();
+
+        let mut response_headers = HashMap::with_capacity(response.headers().keys_len());
+        for (name, value) in response.headers() {
+            // Skip hop-by-hop headers during collection (avoids allocating
+            // String keys that would be immediately removed by the caller).
+            match name.as_str() {
+                "connection" | "keep-alive" | "proxy-authenticate" | "proxy-connection" | "te"
+                | "trailer" | "transfer-encoding" | "upgrade" => continue,
+                _ => {}
+            }
+            if let Ok(value_str) = value.to_str() {
+                response_headers.insert(name.as_str().to_string(), value_str.to_string());
+            }
+        }
+
+        Ok(H3StreamingResponse {
+            status,
+            headers: response_headers,
+            recv_stream: stream,
+        })
+    }
+
+    /// Execute an HTTP/3 request, streaming the request body from an h3 server
+    /// frontend stream directly to the backend without buffering into `Vec<u8>`.
+    ///
+    /// Returns headers and a stream handle for the response body. Body size
+    /// limits are enforced inline during streaming. This is the zero-copy
+    /// request body path for the H3 frontend when no plugins need body buffering
+    /// and no retries are configured.
+    async fn do_request_streaming_body(
+        send_request: &mut H3SendRequest,
+        proxy: &Proxy,
+        method: &str,
+        backend_url: &str,
+        headers: &[(http::header::HeaderName, http::header::HeaderValue)],
+        frontend_stream: &mut h3::server::RequestStream<
+            h3_quinn::BidiStream<bytes::Bytes>,
+            bytes::Bytes,
+        >,
+        max_request_body_size: usize,
+    ) -> Result<H3StreamingResponse, anyhow::Error> {
+        let uri: http::Uri = backend_url
+            .parse()
+            .map_err(|e| anyhow::anyhow!("Invalid backend URL: {}", e))?;
+
+        let _host = uri.host().unwrap_or(&proxy.backend_host);
+        let path_and_query = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
+
+        let req_method: http::Method = method
+            .parse()
+            .map_err(|_| anyhow::anyhow!("Invalid HTTP method: {}", method))?;
+
+        let mut req_builder = Request::builder().method(req_method).uri(path_and_query);
+        for (name, value) in headers {
+            match name.as_str() {
+                "connection" | "transfer-encoding" | "keep-alive" | "upgrade" => continue,
+                _ => {
+                    req_builder = req_builder.header(name, value);
+                }
+            }
+        }
+
+        let req = req_builder.body(())?;
+        let mut backend_stream = send_request.send_request(req).await?;
+
+        // Stream request body: read chunks from frontend, forward to backend.
+        // Uses Buf::copy_to_bytes() which is zero-copy when the underlying
+        // buffer is already bytes::Bytes (common with h3-quinn).
+        let mut total_sent: usize = 0;
+        while let Some(mut chunk) = frontend_stream.recv_data().await? {
+            let len = chunk.remaining();
+            if max_request_body_size > 0 {
+                total_sent += len;
+                if total_sent > max_request_body_size {
+                    return Err(anyhow::anyhow!("Request body exceeds maximum size"));
+                }
+            }
+            backend_stream.send_data(chunk.copy_to_bytes(len)).await?;
+        }
+        backend_stream.finish().await?;
+
+        let response = backend_stream.recv_response().await?;
+        let status = response.status().as_u16();
+
+        let mut response_headers = HashMap::with_capacity(response.headers().keys_len());
+        for (name, value) in response.headers() {
+            // Skip hop-by-hop headers during collection (avoids allocating
+            // String keys that would be immediately removed by the caller).
+            match name.as_str() {
+                "connection" | "keep-alive" | "proxy-authenticate" | "proxy-connection" | "te"
+                | "trailer" | "transfer-encoding" | "upgrade" => continue,
+                _ => {}
+            }
+            if let Ok(value_str) = value.to_str() {
+                response_headers.insert(name.as_str().to_string(), value_str.to_string());
+            }
+        }
+
+        Ok(H3StreamingResponse {
+            status,
+            headers: response_headers,
+            recv_stream: backend_stream,
+        })
+    }
+
+    /// Send an HTTP/3 request with a streaming request body from the frontend,
+    /// returning headers and a stream handle for the response body.
+    ///
+    /// The request body is read from `frontend_stream.recv_data()` and forwarded
+    /// directly to the backend without buffering. This avoids `Vec<u8>` allocation
+    /// for large request bodies when no plugins need body inspection.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn request_streaming_body(
+        &self,
+        proxy: &Proxy,
+        method: &str,
+        backend_url: &str,
+        headers: &[(http::header::HeaderName, http::header::HeaderValue)],
+        frontend_stream: &mut h3::server::RequestStream<
+            h3_quinn::BidiStream<bytes::Bytes>,
+            bytes::Bytes,
+        >,
+        max_request_body_size: usize,
+        tls_config_fn: impl FnOnce() -> Result<Arc<rustls::ClientConfig>, anyhow::Error>,
+    ) -> Result<H3StreamingResponse, anyhow::Error> {
+        let conns_per_backend = proxy
+            .pool_http3_connections_per_backend
+            .unwrap_or(self.connections_per_backend)
+            .max(1);
+        let start = self.conn_counter.fetch_add(1, Ordering::Relaxed) as usize % conns_per_backend;
+
+        // No thread-local fast path for streaming body — the frontend stream is
+        // consumed during the request, so we can't retry on a different connection
+        // if the first attempt fails mid-body. Go straight to the slow path.
+        let key = Self::pool_key(proxy, start);
+
+        if let Some(entry) = self.entries.get(&key) {
+            entry
+                .last_used_epoch_ms
+                .store(now_epoch_ms(), Ordering::Relaxed);
+            let mut sr = entry.send_request.clone();
+            drop(entry);
+
+            // Single attempt — body is consumed, no retry possible
+            return Self::do_request_streaming_body(
+                &mut sr,
+                proxy,
+                method,
+                backend_url,
+                headers,
+                frontend_stream,
+                max_request_body_size,
+            )
+            .await;
+        }
+
+        // Create new connection
+        let tls_config = tls_config_fn()?;
+        let h3_config = super::config::Http3ServerConfig::from_env_config(&self.env_config);
+        let (endpoint, sr) =
+            Self::create_connection(proxy, &tls_config, Some(&h3_config), &self.dns_cache).await?;
+        let mut sr_for_request = sr.clone();
+
+        self.entries.insert(
+            key,
+            H3PoolEntry {
+                send_request: sr,
+                _endpoint: endpoint,
+                last_used_epoch_ms: Arc::new(AtomicU64::new(now_epoch_ms())),
+            },
+        );
+
+        Self::do_request_streaming_body(
+            &mut sr_for_request,
+            proxy,
+            method,
+            backend_url,
+            headers,
+            frontend_stream,
+            max_request_body_size,
+        )
+        .await
+    }
+
+    /// Send an HTTP/3 request with a streaming request body to an explicit
+    /// host/port target.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn request_with_target_streaming_body(
+        &self,
+        proxy: &Proxy,
+        target_host: &str,
+        target_port: u16,
+        method: &str,
+        backend_url: &str,
+        headers: &[(http::header::HeaderName, http::header::HeaderValue)],
+        frontend_stream: &mut h3::server::RequestStream<
+            h3_quinn::BidiStream<bytes::Bytes>,
+            bytes::Bytes,
+        >,
+        max_request_body_size: usize,
+        tls_config_fn: impl FnOnce() -> Result<Arc<rustls::ClientConfig>, anyhow::Error>,
+    ) -> Result<H3StreamingResponse, anyhow::Error> {
+        let conns_per_backend = proxy
+            .pool_http3_connections_per_backend
+            .unwrap_or(self.connections_per_backend)
+            .max(1);
+        let start = self.conn_counter.fetch_add(1, Ordering::Relaxed) as usize % conns_per_backend;
+        let key = Self::pool_key_for_target(target_host, target_port, start);
+
+        if let Some(entry) = self.entries.get(&key) {
+            entry
+                .last_used_epoch_ms
+                .store(now_epoch_ms(), Ordering::Relaxed);
+            let mut sr = entry.send_request.clone();
+            drop(entry);
+
+            return Self::do_request_streaming_body(
+                &mut sr,
+                proxy,
+                method,
+                backend_url,
+                headers,
+                frontend_stream,
+                max_request_body_size,
+            )
+            .await;
+        }
+
+        let tls_config = tls_config_fn()?;
+        let h3_config = super::config::Http3ServerConfig::from_env_config(&self.env_config);
+        let (endpoint, sr) = Self::create_connection_to_target(
+            target_host,
+            target_port,
+            &tls_config,
+            Some(&h3_config),
+            &self.dns_cache,
+        )
+        .await?;
+        let mut sr_for_request = sr.clone();
+
+        self.entries.insert(
+            key,
+            H3PoolEntry {
+                send_request: sr,
+                _endpoint: endpoint,
+                last_used_epoch_ms: Arc::new(AtomicU64::new(now_epoch_ms())),
+            },
+        );
+
+        Self::do_request_streaming_body(
+            &mut sr_for_request,
+            proxy,
+            method,
+            backend_url,
+            headers,
+            frontend_stream,
+            max_request_body_size,
+        )
+        .await
+    }
+
+    /// Send an HTTP/3 request, returning headers and a stream handle for the
+    /// response body. Same pool key / fallback / reconnect logic as `request()`.
+    pub async fn request_streaming(
+        &self,
+        proxy: &Proxy,
+        method: &str,
+        backend_url: &str,
+        headers: &[(http::header::HeaderName, http::header::HeaderValue)],
+        body: bytes::Bytes,
+        tls_config_fn: impl FnOnce() -> Result<Arc<rustls::ClientConfig>, anyhow::Error>,
+    ) -> Result<H3StreamingResponse, anyhow::Error> {
+        let conns_per_backend = proxy
+            .pool_http3_connections_per_backend
+            .unwrap_or(self.connections_per_backend)
+            .max(1);
+        let start = self.conn_counter.fetch_add(1, Ordering::Relaxed) as usize % conns_per_backend;
+
+        // Fast path: thread-local buffer lookup (zero allocation on cache hit)
+        thread_local! {
+            static KEY_BUF: std::cell::RefCell<String> = std::cell::RefCell::new(String::with_capacity(128));
+        }
+        let cached = KEY_BUF.with(|buf| {
+            let mut buf = buf.borrow_mut();
+            Self::write_pool_key(&mut buf, proxy, start);
+            if let Some(entry) = self.entries.get(&*buf) {
+                entry
+                    .last_used_epoch_ms
+                    .store(now_epoch_ms(), Ordering::Relaxed);
+                let sr = entry.send_request.clone();
+                drop(entry);
+                return Some(sr);
+            }
+            None
+        });
+        if let Some(mut sr) = cached
+            && let Ok(result) = Self::do_request_streaming(
+                &mut sr,
+                proxy,
+                method,
+                backend_url,
+                headers,
+                body.clone(),
+            )
+            .await
+        {
+            return Ok(result);
+        }
+
+        // Slow path: allocate pool key String
+        let key = Self::pool_key(proxy, start);
+
+        if let Some(entry) = self.entries.get(&key) {
+            entry
+                .last_used_epoch_ms
+                .store(now_epoch_ms(), Ordering::Relaxed);
+            let mut sr = entry.send_request.clone();
+            drop(entry);
+
+            match Self::do_request_streaming(
+                &mut sr,
+                proxy,
+                method,
+                backend_url,
+                headers,
+                body.clone(),
+            )
+            .await
+            {
+                Ok(result) => return Ok(result),
+                Err(e) => {
+                    debug!("HTTP/3 cached connection failed, reconnecting: {}", e);
+                    self.entries.remove(&key);
+
+                    for offset in 1..conns_per_backend {
+                        let fallback_index = (start + offset) % conns_per_backend;
+                        let fallback_key = Self::pool_key(proxy, fallback_index);
+                        if let Some(entry) = self.entries.get(&fallback_key) {
+                            entry
+                                .last_used_epoch_ms
+                                .store(now_epoch_ms(), Ordering::Relaxed);
+                            let mut fallback_sr = entry.send_request.clone();
+                            drop(entry);
+                            match Self::do_request_streaming(
+                                &mut fallback_sr,
+                                proxy,
+                                method,
+                                backend_url,
+                                headers,
+                                body.clone(),
+                            )
+                            .await
+                            {
+                                Ok(result) => return Ok(result),
+                                Err(_) => {
+                                    self.entries.remove(&fallback_key);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let tls_config = tls_config_fn()?;
+        let h3_config = super::config::Http3ServerConfig::from_env_config(&self.env_config);
+        let (endpoint, sr) =
+            Self::create_connection(proxy, &tls_config, Some(&h3_config), &self.dns_cache).await?;
+        let mut sr_for_request = sr.clone();
+
+        self.entries.insert(
+            key,
+            H3PoolEntry {
+                send_request: sr,
+                _endpoint: endpoint,
+                last_used_epoch_ms: Arc::new(AtomicU64::new(now_epoch_ms())),
+            },
+        );
+
+        Self::do_request_streaming(
+            &mut sr_for_request,
+            proxy,
+            method,
+            backend_url,
+            headers,
+            body,
+        )
+        .await
+    }
+
+    /// Send an HTTP/3 request to an explicit host/port target, returning headers
+    /// and a stream handle for the response body.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn request_with_target_streaming(
+        &self,
+        proxy: &Proxy,
+        target_host: &str,
+        target_port: u16,
+        method: &str,
+        backend_url: &str,
+        headers: &[(http::header::HeaderName, http::header::HeaderValue)],
+        body: bytes::Bytes,
+        tls_config_fn: impl FnOnce() -> Result<Arc<rustls::ClientConfig>, anyhow::Error>,
+    ) -> Result<H3StreamingResponse, anyhow::Error> {
+        let conns_per_backend = proxy
+            .pool_http3_connections_per_backend
+            .unwrap_or(self.connections_per_backend)
+            .max(1);
+        let start = self.conn_counter.fetch_add(1, Ordering::Relaxed) as usize % conns_per_backend;
+        let key = Self::pool_key_for_target(target_host, target_port, start);
+
+        if let Some(entry) = self.entries.get(&key) {
+            entry
+                .last_used_epoch_ms
+                .store(now_epoch_ms(), Ordering::Relaxed);
+            let mut sr = entry.send_request.clone();
+            drop(entry);
+
+            match Self::do_request_streaming(
+                &mut sr,
+                proxy,
+                method,
+                backend_url,
+                headers,
+                body.clone(),
+            )
+            .await
+            {
+                Ok(result) => return Ok(result),
+                Err(e) => {
+                    debug!(
+                        "HTTP/3 cached connection to {}:{} failed, reconnecting: {}",
+                        target_host, target_port, e
+                    );
+                    self.entries.remove(&key);
+
+                    for offset in 1..conns_per_backend {
+                        let fallback_index = (start + offset) % conns_per_backend;
+                        let fallback_key =
+                            Self::pool_key_for_target(target_host, target_port, fallback_index);
+                        if let Some(entry) = self.entries.get(&fallback_key) {
+                            entry
+                                .last_used_epoch_ms
+                                .store(now_epoch_ms(), Ordering::Relaxed);
+                            let mut fallback_sr = entry.send_request.clone();
+                            drop(entry);
+                            match Self::do_request_streaming(
+                                &mut fallback_sr,
+                                proxy,
+                                method,
+                                backend_url,
+                                headers,
+                                body.clone(),
+                            )
+                            .await
+                            {
+                                Ok(result) => return Ok(result),
+                                Err(_) => {
+                                    self.entries.remove(&fallback_key);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let tls_config = tls_config_fn()?;
+        let h3_config = super::config::Http3ServerConfig::from_env_config(&self.env_config);
+        let (endpoint, sr) = Self::create_connection_to_target(
+            target_host,
+            target_port,
+            &tls_config,
+            Some(&h3_config),
+            &self.dns_cache,
+        )
+        .await?;
+        let mut sr_for_request = sr.clone();
+
+        self.entries.insert(
+            key,
+            H3PoolEntry {
+                send_request: sr,
+                _endpoint: endpoint,
+                last_used_epoch_ms: Arc::new(AtomicU64::new(now_epoch_ms())),
+            },
+        );
+
+        Self::do_request_streaming(
+            &mut sr_for_request,
+            proxy,
+            method,
+            backend_url,
+            headers,
+            body,
+        )
+        .await
     }
 
     /// Background cleanup task that evicts idle connections.
@@ -786,14 +1360,85 @@ impl Http3Client {
     }
 }
 
-/// Resolve a hostname:port to a SocketAddr.
-async fn resolve_backend_addr(host: &str, port: u16) -> Result<SocketAddr, anyhow::Error> {
-    // First try parsing as an IP address directly (no DNS needed)
+/// Create a quinn UDP endpoint with platform-optimal socket options.
+///
+/// On Linux, applies `IP_BIND_ADDRESS_NO_PORT` to defer ephemeral port allocation
+/// to `connect()` time, enabling 4-tuple co-selection that prevents port exhaustion
+/// when proxying to many distinct H3 backends.
+fn create_udp_endpoint(
+    backend_addr: SocketAddr,
+    client_config: quinn::ClientConfig,
+) -> Result<quinn::Endpoint, anyhow::Error> {
+    use socket2::{Domain, Protocol, Socket, Type};
+
+    let domain = if backend_addr.is_ipv6() {
+        Domain::IPV6
+    } else {
+        Domain::IPV4
+    };
+    let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
+
+    // Defer ephemeral port allocation to connect() for better port reuse (Linux only).
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::io::AsRawFd;
+        let _ = crate::socket_opts::set_ip_bind_address_no_port(socket.as_raw_fd(), true);
+    }
+
+    let bind_addr: SocketAddr = if backend_addr.is_ipv6() {
+        "[::]:0".parse()?
+    } else {
+        "0.0.0.0:0".parse()?
+    };
+    socket.bind(&bind_addr.into())?;
+    socket.set_nonblocking(true)?;
+
+    let std_socket: std::net::UdpSocket = socket.into();
+    let runtime =
+        quinn::default_runtime().ok_or_else(|| anyhow::anyhow!("No async runtime found"))?;
+    let mut endpoint = quinn::Endpoint::new(
+        quinn::EndpointConfig::default(),
+        None, // client-only, no server config
+        std_socket,
+        runtime,
+    )?;
+    endpoint.set_default_client_config(client_config);
+    Ok(endpoint)
+}
+
+/// Resolve a hostname:port to a SocketAddr using the shared DNS cache.
+///
+/// Uses the gateway's `DnsCache` exclusively — no fallback to system DNS.
+/// The cache is pre-warmed at startup and refreshes in the background.
+async fn resolve_backend_addr_cached(
+    host: &str,
+    port: u16,
+    dns_cache: &crate::dns::DnsCache,
+    dns_override: Option<&str>,
+    dns_cache_ttl_seconds: Option<u64>,
+) -> Result<SocketAddr, anyhow::Error> {
+    // Fast path: IP literal needs no DNS
     if let Ok(ip) = host.parse::<std::net::IpAddr>() {
         return Ok(SocketAddr::new(ip, port));
     }
 
-    // DNS lookup
+    let ip = dns_cache
+        .resolve(host, dns_override, dns_cache_ttl_seconds)
+        .await
+        .map_err(|e| anyhow::anyhow!("DNS resolution failed for {}:{}: {}", host, port, e))?;
+
+    Ok(SocketAddr::new(ip, port))
+}
+
+/// Resolve a hostname:port to a SocketAddr (system DNS, no cache).
+///
+/// Used only by `Http3Client` (test/integration client). The pool uses
+/// `resolve_backend_addr_cached` instead.
+async fn resolve_backend_addr(host: &str, port: u16) -> Result<SocketAddr, anyhow::Error> {
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return Ok(SocketAddr::new(ip, port));
+    }
+
     let addr = tokio::net::lookup_host(format!("{}:{}", host, port))
         .await
         .map_err(|e| anyhow::anyhow!("DNS resolution failed for {}:{}: {}", host, port, e))?
