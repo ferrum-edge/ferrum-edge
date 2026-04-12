@@ -59,6 +59,8 @@ fn create_test_admin_state(config: &TestConfig, read_only: bool) -> AdminState {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        dp_registry: None,
+        cp_connection_state: None,
     }
 }
 
@@ -182,6 +184,8 @@ async fn test_admin_state_mode_field() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        dp_registry: None,
+        cp_connection_state: None,
     };
     assert_eq!(admin_state_prod.mode, "production");
 }
@@ -217,6 +221,8 @@ async fn test_check_write_allowed_permits_when_db_available() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        dp_registry: None,
+        cp_connection_state: None,
     };
     assert!(
         state.check_write_allowed().is_none(),
@@ -244,6 +250,8 @@ async fn test_check_write_allowed_blocks_when_db_unavailable() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        dp_registry: None,
+        cp_connection_state: None,
     };
     let resp = state.check_write_allowed();
     assert!(
@@ -277,6 +285,8 @@ async fn test_check_write_allowed_blocks_when_read_only() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        dp_registry: None,
+        cp_connection_state: None,
     };
     let resp = state.check_write_allowed();
     assert!(
@@ -309,6 +319,8 @@ async fn test_check_write_allowed_permits_when_no_db_flag() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        dp_registry: None,
+        cp_connection_state: None,
     };
     assert!(
         state.check_write_allowed().is_none(),
@@ -336,6 +348,8 @@ async fn test_db_available_flag_transitions() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        dp_registry: None,
+        cp_connection_state: None,
     };
 
     // Initially available

@@ -136,11 +136,13 @@ pub async fn run(
         }
     };
 
-    // Create gRPC server
-    let (grpc_server, update_tx) = CpGrpcServer::with_channel_capacity(
+    // Create gRPC server with shared DP node registry
+    let dp_registry = Arc::new(crate::grpc::cp_server::DpNodeRegistry::new());
+    let (grpc_server, update_tx) = CpGrpcServer::with_channel_capacity_and_registry(
         config_arc.clone(),
         grpc_secret,
         env_config.cp_broadcast_channel_capacity,
+        dp_registry.clone(),
     );
 
     // Build TLS hardening policy from environment
@@ -177,6 +179,8 @@ pub async fn run(
         stream_proxy_bind_address: env_config.stream_proxy_bind_address.clone(),
         admin_allowed_cidrs: admin_allowed_cidrs.clone(),
         cached_db_health: Arc::new(arc_swap::ArcSwap::new(Arc::new(None))),
+        dp_registry: Some(dp_registry.clone()),
+        cp_connection_state: None,
     };
     let admin_shutdown = shutdown_tx.subscribe();
 
@@ -217,6 +221,8 @@ pub async fn run(
             stream_proxy_bind_address: env_config.stream_proxy_bind_address.clone(),
             admin_allowed_cidrs: admin_allowed_cidrs.clone(),
             cached_db_health: Arc::new(arc_swap::ArcSwap::new(Arc::new(None))),
+            dp_registry: Some(dp_registry.clone()),
+            cp_connection_state: None,
         };
         let admin_https_shutdown = shutdown_tx.subscribe();
 
@@ -437,6 +443,7 @@ pub async fn run(
     let db_tls_client_key = env_config.db_tls_client_key_path.clone();
     let db_tls_insecure = env_config.db_tls_insecure;
     let poll_namespace = env_config.namespace.clone();
+    let dp_registry_poll = dp_registry.clone();
 
     let db_poll_handle = tokio::spawn(async move {
         let mut interval = tokio::time::interval(poll_interval);
@@ -577,7 +584,7 @@ pub async fn run(
                                 // so that a DP calling GetFullConfig immediately after
                                 // receives the new version.
                                 let version = poll_ts.to_rfc3339();
-                                CpGrpcServer::broadcast_delta(&update_tx, &result, &version);
+                                CpGrpcServer::broadcast_delta_with_registry(&update_tx, &result, &version, &dp_registry_poll);
 
                                 // Apply to CP's own in-memory config (for GetFullConfig
                                 // and the Admin API cached_config reads).
@@ -607,7 +614,7 @@ pub async fn run(
                                         known_upstream_ids = u;
                                         last_poll_at = Some(new_config.loaded_at);
                                         config_poll.store(Arc::new(new_config.clone()));
-                                        CpGrpcServer::broadcast_update(&update_tx, &new_config);
+                                        CpGrpcServer::broadcast_update_with_registry(&update_tx, &new_config, &dp_registry_poll);
                                         info!("Configuration reloaded from database (full fallback) and pushed to DPs");
                                     }
                                     Err(e2) => {
@@ -632,7 +639,7 @@ pub async fn run(
                                                         known_upstream_ids = u;
                                                         last_poll_at = Some(new_config.loaded_at);
                                                         config_poll.store(Arc::new(new_config.clone()));
-                                                        CpGrpcServer::broadcast_update(&update_tx, &new_config);
+                                                        CpGrpcServer::broadcast_update_with_registry(&update_tx, &new_config, &dp_registry_poll);
                                                         info!("Configuration reloaded from database (failover) and pushed to DPs");
                                                     }
                                                     Err(e3) => {

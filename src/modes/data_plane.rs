@@ -341,6 +341,13 @@ pub async fn run(
         );
     }
 
+    // Create shared CP connection state for the /cluster endpoint
+    let cp_connection_state = Arc::new(arc_swap::ArcSwap::new(Arc::new(
+        crate::grpc::dp_client::DpCpConnectionState::new_disconnected(
+            env_config.dp_cp_grpc_url.as_deref().unwrap_or(""),
+        ),
+    )));
+
     // Start Admin API listeners (read-only in DP mode)
     let admin_http_addr: SocketAddr = env_config.admin_socket_addr(env_config.admin_http_port);
     let jwt_manager = create_jwt_manager_from_env()
@@ -361,6 +368,8 @@ pub async fn run(
         stream_proxy_bind_address: env_config.stream_proxy_bind_address.clone(),
         admin_allowed_cidrs: admin_allowed_cidrs.clone(),
         cached_db_health: Arc::new(arc_swap::ArcSwap::new(Arc::new(None))),
+        dp_registry: None,
+        cp_connection_state: Some(cp_connection_state.clone()),
     };
     let admin_shutdown = shutdown_tx.subscribe();
 
@@ -401,6 +410,8 @@ pub async fn run(
             stream_proxy_bind_address: env_config.stream_proxy_bind_address.clone(),
             admin_allowed_cidrs: admin_allowed_cidrs.clone(),
             cached_db_health: Arc::new(arc_swap::ArcSwap::new(Arc::new(None))),
+            dp_registry: None,
+            cp_connection_state: Some(cp_connection_state.clone()),
         };
         let admin_https_shutdown = shutdown_tx.subscribe();
 
@@ -485,15 +496,18 @@ pub async fn run(
     let dp_shutdown = shutdown_tx.subscribe();
     let dp_startup_ready = startup_ready.clone();
     let dp_namespace = env_config.namespace.clone();
+    let dp_conn_state = cp_connection_state.clone();
     let dp_client_handle = tokio::spawn(async move {
         crate::grpc::dp_client::start_dp_client_with_shutdown_and_startup_ready(
-            cp_url,
+            vec![cp_url],
             jwt_secret,
             dp_proxy_state,
             Some(dp_shutdown),
             dp_grpc_tls,
             Some(dp_startup_ready),
             dp_namespace,
+            0, // primary_retry_secs (multi-CP failover not yet wired in env_config)
+            Some(dp_conn_state),
         )
         .await;
     });

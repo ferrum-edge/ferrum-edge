@@ -217,6 +217,79 @@ paths:
         "401":
           $ref: "#/components/responses/Unauthorized"
 
+  # ── Cluster Status ───────────────────────────────────────────────────
+  /cluster:
+    get:
+      operationId: getClusterStatus
+      summary: CP/DP cluster connection status
+      description: |
+        Returns live connection state for CP/DP deployments.
+
+        **CP mode**: Lists all currently connected Data Plane nodes with
+        `node_id`, `version`, `namespace`, `status`, `connected_at`, and
+        `last_sync_at`. Disconnected DPs are automatically removed.
+
+        **DP mode**: Shows the connection to the Control Plane — `url`,
+        `status` (online/offline), `is_primary` (primary vs fallback CP),
+        `connected_since`, and `last_config_received_at`.
+
+        **Database/File modes**: Returns an informational message indicating
+        cluster status is only meaningful in CP/DP modes.
+      tags: [Monitoring]
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Cluster connection status
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/ClusterStatusCp"
+                  - $ref: "#/components/schemas/ClusterStatusDp"
+                  - $ref: "#/components/schemas/ClusterStatusOther"
+              examples:
+                cp_mode:
+                  summary: CP mode with two connected DPs
+                  value:
+                    mode: cp
+                    connected_data_planes: 2
+                    data_planes:
+                      - node_id: "abc-123"
+                        version: "0.9.0"
+                        namespace: ferrum
+                        status: online
+                        connected_at: "2025-01-15T10:30:00Z"
+                        last_sync_at: "2025-01-15T10:35:00Z"
+                      - node_id: "def-456"
+                        version: "0.9.0"
+                        namespace: staging
+                        status: online
+                        connected_at: "2025-01-15T10:31:00Z"
+                        last_sync_at: "2025-01-15T10:35:00Z"
+                dp_mode_online:
+                  summary: DP connected to primary CP
+                  value:
+                    mode: dp
+                    control_plane:
+                      url: "http://cp-host:50051"
+                      status: online
+                      is_primary: true
+                      connected_since: "2025-01-15T10:30:00Z"
+                      last_config_received_at: "2025-01-15T10:35:00Z"
+                dp_mode_offline:
+                  summary: DP disconnected from CP
+                  value:
+                    mode: dp
+                    control_plane:
+                      url: "http://cp-host:50051"
+                      status: offline
+                      is_primary: true
+                      connected_since: null
+                      last_config_received_at: "2025-01-15T10:30:00Z"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
   # ── Batch ────────────────────────────────────────────────────────────
   /batch:
     post:
@@ -4705,3 +4778,89 @@ components:
           format: uint64
           minimum: 1
           description: Time window in seconds
+
+    # ── Cluster Status ─────────────────────────────────────────────────
+
+    ClusterStatusCp:
+      type: object
+      required: [mode, connected_data_planes, data_planes]
+      properties:
+        mode:
+          type: string
+          enum: [cp]
+        connected_data_planes:
+          type: integer
+          description: Number of currently connected Data Plane nodes
+        data_planes:
+          type: array
+          items:
+            $ref: "#/components/schemas/ConnectedDpNode"
+
+    ConnectedDpNode:
+      type: object
+      required: [node_id, version, namespace, status, connected_at, last_sync_at]
+      properties:
+        node_id:
+          type: string
+          description: Unique identifier for the DP node (generated on each DP startup)
+        version:
+          type: string
+          description: Ferrum Edge version reported by the DP
+        namespace:
+          type: string
+          description: Namespace the DP is subscribed to
+        status:
+          type: string
+          enum: [online]
+          description: Always "online" — disconnected DPs are removed from the registry
+        connected_at:
+          type: string
+          format: date-time
+          description: When the DP's gRPC stream was established
+        last_sync_at:
+          type: string
+          format: date-time
+          description: When the last config update was broadcast to this DP
+
+    ClusterStatusDp:
+      type: object
+      required: [mode, control_plane]
+      properties:
+        mode:
+          type: string
+          enum: [dp]
+        control_plane:
+          type: object
+          required: [url, status, is_primary]
+          properties:
+            url:
+              type: string
+              description: URL of the CP this DP is connected to (or last attempted)
+            status:
+              type: string
+              enum: [online, offline]
+              description: Whether the gRPC stream to the CP is currently active
+            is_primary:
+              type: boolean
+              description: True when connected to the primary CP, false for a fallback CP
+            connected_since:
+              type: string
+              format: date-time
+              nullable: true
+              description: When the current connection was established (null if offline)
+            last_config_received_at:
+              type: string
+              format: date-time
+              nullable: true
+              description: When the last config update was received (null if none yet)
+
+    ClusterStatusOther:
+      type: object
+      required: [mode, message]
+      properties:
+        mode:
+          type: string
+          description: Current operating mode (database, file, etc.)
+        message:
+          type: string
+          description: Informational message

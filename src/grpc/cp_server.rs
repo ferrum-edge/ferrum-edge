@@ -13,10 +13,14 @@
 //! compatibility — a DP running a different minor version is rejected.
 
 use arc_swap::ArcSwap;
+use chrono::{DateTime, Utc};
+use dashmap::DashMap;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
+use serde::Serialize;
 use serde_json::Value;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use tokio::sync::broadcast;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
@@ -28,11 +32,96 @@ use super::proto::{ConfigUpdate, FullConfigRequest, FullConfigResponse, Subscrib
 use crate::FERRUM_VERSION;
 use crate::config::types::GatewayConfig;
 
+/// Metadata about a connected Data Plane node.
+#[derive(Clone, Serialize)]
+pub struct DpNodeInfo {
+    pub node_id: String,
+    pub version: String,
+    pub namespace: String,
+    pub connected_at: DateTime<Utc>,
+    pub last_update_at: DateTime<Utc>,
+}
+
+/// Registry of connected DP nodes. Shared between the gRPC server and the
+/// admin API so that `GET /cluster` can report live connection state.
+#[derive(Default)]
+pub struct DpNodeRegistry {
+    nodes: DashMap<String, DpNodeInfo>,
+}
+
+impl DpNodeRegistry {
+    pub fn new() -> Self {
+        Self {
+            nodes: DashMap::new(),
+        }
+    }
+
+    pub fn insert(&self, info: DpNodeInfo) {
+        self.nodes.insert(info.node_id.clone(), info);
+    }
+
+    pub fn remove(&self, node_id: &str) {
+        self.nodes.remove(node_id);
+    }
+
+    /// Update `last_update_at` for all connected nodes (called after broadcast).
+    pub fn touch_all(&self) {
+        let now = Utc::now();
+        for mut entry in self.nodes.iter_mut() {
+            entry.last_update_at = now;
+        }
+    }
+
+    /// Return a snapshot of all connected nodes.
+    pub fn snapshot(&self) -> Vec<DpNodeInfo> {
+        self.nodes.iter().map(|e| e.value().clone()).collect()
+    }
+
+    /// Number of connected DPs.
+    #[allow(dead_code)]
+    pub fn len(&self) -> usize {
+        self.nodes.len()
+    }
+
+    /// Whether the registry has no connected DPs.
+    #[allow(dead_code)]
+    pub fn is_empty(&self) -> bool {
+        self.nodes.is_empty()
+    }
+}
+
+/// A stream wrapper that removes the DP node from the registry when the
+/// gRPC stream is dropped (i.e. the DP disconnects).
+struct TrackedStream<S> {
+    inner: Pin<Box<S>>,
+    registry: Arc<DpNodeRegistry>,
+    node_id: String,
+}
+
+impl<S> Drop for TrackedStream<S> {
+    fn drop(&mut self) {
+        self.registry.remove(&self.node_id);
+        info!("DP node '{}' disconnected (stream dropped)", self.node_id);
+    }
+}
+
+impl<S> tokio_stream::Stream for TrackedStream<S>
+where
+    S: tokio_stream::Stream + Unpin,
+{
+    type Item = S::Item;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.inner.as_mut().poll_next(cx)
+    }
+}
+
 /// CP gRPC server state.
 pub struct CpGrpcServer {
     config: Arc<ArcSwap<GatewayConfig>>,
     jwt_secret: String,
     update_tx: broadcast::Sender<ConfigUpdate>,
+    registry: Arc<DpNodeRegistry>,
 }
 
 impl CpGrpcServer {
@@ -53,6 +142,20 @@ impl CpGrpcServer {
         jwt_secret: String,
         channel_capacity: usize,
     ) -> (Self, broadcast::Sender<ConfigUpdate>) {
+        Self::with_channel_capacity_and_registry(
+            config,
+            jwt_secret,
+            channel_capacity,
+            Arc::new(DpNodeRegistry::new()),
+        )
+    }
+
+    pub fn with_channel_capacity_and_registry(
+        config: Arc<ArcSwap<GatewayConfig>>,
+        jwt_secret: String,
+        channel_capacity: usize,
+        registry: Arc<DpNodeRegistry>,
+    ) -> (Self, broadcast::Sender<ConfigUpdate>) {
         let (tx, _) = broadcast::channel(channel_capacity.max(1));
         let tx_clone = tx.clone();
         (
@@ -60,6 +163,7 @@ impl CpGrpcServer {
                 config,
                 jwt_secret,
                 update_tx: tx,
+                registry,
             },
             tx_clone,
         )
@@ -142,6 +246,16 @@ impl CpGrpcServer {
     }
 
     /// Broadcast a full config snapshot to all connected DPs.
+    pub fn broadcast_update_with_registry(
+        tx: &broadcast::Sender<ConfigUpdate>,
+        config: &GatewayConfig,
+        registry: &DpNodeRegistry,
+    ) {
+        Self::broadcast_update(tx, config);
+        registry.touch_all();
+    }
+
+    /// Broadcast a full config snapshot to all connected DPs.
     pub fn broadcast_update(tx: &broadcast::Sender<ConfigUpdate>, config: &GatewayConfig) {
         let config_json = match serde_json::to_string(config) {
             Ok(json) => json,
@@ -158,6 +272,17 @@ impl CpGrpcServer {
             ferrum_version: FERRUM_VERSION.to_string(),
         };
         let _ = tx.send(update);
+    }
+
+    /// Broadcast an incremental delta to all connected DPs (with registry update).
+    pub fn broadcast_delta_with_registry(
+        tx: &broadcast::Sender<ConfigUpdate>,
+        result: &crate::config::db_loader::IncrementalResult,
+        version: &str,
+        registry: &DpNodeRegistry,
+    ) {
+        Self::broadcast_delta(tx, result, version);
+        registry.touch_all();
     }
 
     /// Broadcast an incremental delta to all connected DPs.
@@ -211,6 +336,16 @@ impl ConfigSync for CpGrpcServer {
             node_id, dp_version, dp_namespace
         );
 
+        // Register the DP in the node registry (removed on stream drop).
+        let now = Utc::now();
+        self.registry.insert(DpNodeInfo {
+            node_id: node_id.clone(),
+            version: dp_version.clone(),
+            namespace: dp_namespace.clone(),
+            connected_at: now,
+            last_update_at: now,
+        });
+
         // Send initial full config
         let config = self.config.load_full();
         let config_json = serde_json::to_string(config.as_ref()).map_err(|e| {
@@ -252,11 +387,17 @@ impl ConfigSync for CpGrpcServer {
             }
         });
 
-        // Prepend initial config
+        // Prepend initial config, then wrap in TrackedStream so the DP is
+        // automatically de-registered when the gRPC stream is dropped.
         let initial_stream = tokio_stream::once(Ok(initial));
         let combined = initial_stream.chain(stream);
+        let tracked = TrackedStream {
+            inner: Box::pin(combined),
+            registry: self.registry.clone(),
+            node_id,
+        };
 
-        Ok(Response::new(Box::pin(combined)))
+        Ok(Response::new(Box::pin(tracked)))
     }
 
     async fn get_full_config(

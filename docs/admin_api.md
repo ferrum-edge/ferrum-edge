@@ -11,7 +11,7 @@ See also:
 
 ## Authentication
 
-All endpoints (except `/health` and `/status`) require a valid HS256 JWT in the `Authorization: Bearer <token>` header, verified against `FERRUM_ADMIN_JWT_SECRET`.
+All endpoints (except `/health`, `/status`, `/overload`, `/metrics`, and `/charges`) require a valid HS256 JWT in the `Authorization: Bearer <token>` header, verified against `FERRUM_ADMIN_JWT_SECRET`.
 
 Generate a token:
 ```bash
@@ -220,6 +220,68 @@ curl -X POST -H "Authorization: Bearer $TOKEN" \
 The backup output is directly compatible with `POST /batch` (additive) and `POST /restore` (full replacement). Database inserts are chunked into 1,000-record transactions for large-scale imports.
 
 See [admin_backup_restore.md](admin_backup_restore.md) for details.
+
+## Cluster Status
+
+The `/cluster` endpoint provides live CP/DP connection state. Available in all modes, but most useful in CP and DP modes.
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/cluster
+```
+
+### CP Mode Response
+
+Returns all connected Data Plane nodes:
+
+```json
+{
+  "mode": "cp",
+  "connected_data_planes": 2,
+  "data_planes": [
+    {
+      "node_id": "abc-123",
+      "version": "0.9.0",
+      "namespace": "ferrum",
+      "status": "online",
+      "connected_at": "2025-01-15T10:30:00Z",
+      "last_sync_at": "2025-01-15T10:35:00Z"
+    }
+  ]
+}
+```
+
+- **`status`** is always `online` — disconnected DPs are automatically removed from the registry when their gRPC stream drops.
+- **`last_sync_at`** updates whenever the CP broadcasts a config update (full snapshot or delta) to connected DPs.
+
+### DP Mode Response
+
+Returns the connection status to the Control Plane:
+
+```json
+{
+  "mode": "dp",
+  "control_plane": {
+    "url": "http://cp-host:50051",
+    "status": "online",
+    "is_primary": true,
+    "connected_since": "2025-01-15T10:30:00Z",
+    "last_config_received_at": "2025-01-15T10:35:00Z"
+  }
+}
+```
+
+- **`status`**: `online` when the gRPC stream to the CP is active, `offline` when disconnected (e.g., CP is down, DP is in backoff retry).
+- **`is_primary`**: `true` when connected to the primary (first) CP URL, `false` when connected to a fallback CP (multi-CP failover).
+- **`last_config_received_at`**: Timestamp of the last successfully applied config update (full snapshot or delta) from the CP. `null` if no config has been received yet on the current connection.
+
+### Database/File Mode Response
+
+```json
+{
+  "mode": "database",
+  "message": "Cluster status is only available in cp or dp modes"
+}
+```
 
 ## Metrics
 

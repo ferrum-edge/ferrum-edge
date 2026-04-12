@@ -253,6 +253,8 @@ async fn test_list_proxies_falls_back_to_cached_config() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        dp_registry: None,
+        cp_connection_state: None,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -292,6 +294,8 @@ async fn test_list_consumers_falls_back_to_cached_config() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        dp_registry: None,
+        cp_connection_state: None,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -326,6 +330,8 @@ async fn test_list_plugin_configs_falls_back_to_cached_config() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        dp_registry: None,
+        cp_connection_state: None,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -364,6 +370,8 @@ async fn test_get_proxy_by_id_falls_back_to_cached_config() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        dp_registry: None,
+        cp_connection_state: None,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -397,6 +405,8 @@ async fn test_get_proxy_not_found_in_cache() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        dp_registry: None,
+        cp_connection_state: None,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -428,6 +438,8 @@ async fn test_get_consumer_by_id_falls_back_to_cached_config() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        dp_registry: None,
+        cp_connection_state: None,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -461,6 +473,8 @@ async fn test_get_consumer_not_found_in_cache() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        dp_registry: None,
+        cp_connection_state: None,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -492,6 +506,8 @@ async fn test_get_plugin_config_by_id_falls_back_to_cached_config() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        dp_registry: None,
+        cp_connection_state: None,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -526,6 +542,8 @@ async fn test_get_plugin_config_not_found_in_cache() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        dp_registry: None,
+        cp_connection_state: None,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -557,6 +575,8 @@ async fn test_list_proxies_no_db_no_cache_returns_503() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        dp_registry: None,
+        cp_connection_state: None,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -591,6 +611,8 @@ async fn test_list_consumers_no_db_no_cache_returns_503() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        dp_registry: None,
+        cp_connection_state: None,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -625,6 +647,8 @@ async fn test_get_proxy_no_db_no_cache_returns_503() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        dp_registry: None,
+        cp_connection_state: None,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -663,6 +687,8 @@ async fn test_health_endpoint_shows_cached_config_info() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        dp_registry: None,
+        cp_connection_state: None,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
 
@@ -702,6 +728,8 @@ async fn test_health_endpoint_shows_no_cached_config() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        dp_registry: None,
+        cp_connection_state: None,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
 
@@ -739,6 +767,8 @@ async fn test_health_endpoint_returns_503_until_startup_is_ready() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        dp_registry: None,
+        cp_connection_state: None,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
 
@@ -788,6 +818,8 @@ async fn test_cached_config_reflects_live_updates() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        dp_registry: None,
+        cp_connection_state: None,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -884,6 +916,8 @@ fn create_pagination_admin_state(tc: &TestConfig) -> AdminState {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        dp_registry: None,
+        cp_connection_state: None,
     }
 }
 
@@ -1043,6 +1077,8 @@ async fn create_db_admin_state(tc: &TestConfig) -> (AdminState, tempfile::TempDi
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        dp_registry: None,
+        cp_connection_state: None,
     };
     (state, temp_dir)
 }
@@ -1125,6 +1161,8 @@ async fn create_db_admin_state_with_availability(
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        dp_registry: None,
+        cp_connection_state: None,
     };
     (state, temp_dir)
 }
@@ -1252,6 +1290,8 @@ async fn test_batch_create_read_only_rejected() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        dp_registry: None,
+        cp_connection_state: None,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -1566,6 +1606,8 @@ async fn test_restore_read_only_rejected() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        dp_registry: None,
+        cp_connection_state: None,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -1712,6 +1754,8 @@ async fn test_list_upstreams_falls_back_to_cached_config() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        dp_registry: None,
+        cp_connection_state: None,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -1751,6 +1795,8 @@ async fn test_get_upstream_by_id_falls_back_to_cached_config() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        dp_registry: None,
+        cp_connection_state: None,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -1784,6 +1830,8 @@ async fn test_get_upstream_not_found_in_cache() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        dp_registry: None,
+        cp_connection_state: None,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -1813,6 +1861,8 @@ async fn test_list_upstreams_no_db_no_cache_returns_503() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        dp_registry: None,
+        cp_connection_state: None,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -1847,6 +1897,8 @@ async fn test_get_upstream_no_db_no_cache_returns_503() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        dp_registry: None,
+        cp_connection_state: None,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -2159,6 +2211,8 @@ async fn test_backup_falls_back_to_cached_config_when_no_db() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        dp_registry: None,
+        cp_connection_state: None,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -2197,6 +2251,8 @@ async fn test_backup_no_db_no_cache_returns_503() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        dp_registry: None,
+        cp_connection_state: None,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -2234,6 +2290,8 @@ async fn test_create_proxy_returns_503_when_no_db() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        dp_registry: None,
+        cp_connection_state: None,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -2268,6 +2326,8 @@ async fn test_create_upstream_returns_503_when_no_db() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        dp_registry: None,
+        cp_connection_state: None,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -2348,6 +2408,8 @@ async fn test_cached_config_reflects_upstream_updates() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        dp_registry: None,
+        cp_connection_state: None,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
@@ -2595,6 +2657,8 @@ async fn test_health_endpoint_shows_db_availability() {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        dp_registry: None,
+        cp_connection_state: None,
     };
     let (base_url, _shutdown) = start_test_admin(state).await;
 
@@ -2726,4 +2790,242 @@ async fn test_upstream_duplicate_name_returns_409() {
     });
     let (status, body) = admin_post(&base_url, "/upstreams", &token, &upstream2).await;
     assert_eq!(status, 409, "Duplicate name should return 409: {:?}", body);
+}
+
+// ---- Cluster Status Endpoint Tests ----
+
+#[tokio::test]
+async fn test_cluster_endpoint_requires_auth() {
+    let tc = TestConfig::default();
+    let state = AdminState {
+        db: None,
+        jwt_manager: create_test_jwt_manager(&tc),
+        cached_config: None,
+        proxy_state: None,
+        mode: "cp".to_string(),
+        read_only: true,
+        startup_ready: None,
+        db_available: None,
+        admin_restore_max_body_size_mib: 100,
+        reserved_ports: std::collections::HashSet::new(),
+        stream_proxy_bind_address: "0.0.0.0".to_string(),
+        admin_allowed_cidrs: std::sync::Arc::new(
+            ferrum_edge::proxy::client_ip::TrustedProxies::none(),
+        ),
+        cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        dp_registry: None,
+        cp_connection_state: None,
+    };
+    let (base_url, _shutdown) = start_test_admin(state).await;
+
+    // No auth header -> 401
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(format!("{}/cluster", base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401);
+}
+
+#[tokio::test]
+async fn test_cluster_endpoint_cp_mode_empty_registry() {
+    let tc = TestConfig::default();
+    let registry = std::sync::Arc::new(ferrum_edge::grpc::cp_server::DpNodeRegistry::new());
+    let state = AdminState {
+        db: None,
+        jwt_manager: create_test_jwt_manager(&tc),
+        cached_config: None,
+        proxy_state: None,
+        mode: "cp".to_string(),
+        read_only: true,
+        startup_ready: None,
+        db_available: None,
+        admin_restore_max_body_size_mib: 100,
+        reserved_ports: std::collections::HashSet::new(),
+        stream_proxy_bind_address: "0.0.0.0".to_string(),
+        admin_allowed_cidrs: std::sync::Arc::new(
+            ferrum_edge::proxy::client_ip::TrustedProxies::none(),
+        ),
+        cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        dp_registry: Some(registry),
+        cp_connection_state: None,
+    };
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let (status, body, _) = admin_get(&base_url, "/cluster", &token).await;
+    assert_eq!(status, 200);
+    assert_eq!(body["mode"], "cp");
+    assert_eq!(body["connected_data_planes"], 0);
+    assert!(body["data_planes"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn test_cluster_endpoint_cp_mode_with_connected_dps() {
+    let tc = TestConfig::default();
+    let registry = std::sync::Arc::new(ferrum_edge::grpc::cp_server::DpNodeRegistry::new());
+
+    // Simulate two connected DPs
+    registry.insert(ferrum_edge::grpc::cp_server::DpNodeInfo {
+        node_id: "dp-node-1".to_string(),
+        version: "0.9.0".to_string(),
+        namespace: "ferrum".to_string(),
+        connected_at: Utc::now(),
+        last_update_at: Utc::now(),
+    });
+    registry.insert(ferrum_edge::grpc::cp_server::DpNodeInfo {
+        node_id: "dp-node-2".to_string(),
+        version: "0.9.0".to_string(),
+        namespace: "staging".to_string(),
+        connected_at: Utc::now(),
+        last_update_at: Utc::now(),
+    });
+
+    let state = AdminState {
+        db: None,
+        jwt_manager: create_test_jwt_manager(&tc),
+        cached_config: None,
+        proxy_state: None,
+        mode: "cp".to_string(),
+        read_only: true,
+        startup_ready: None,
+        db_available: None,
+        admin_restore_max_body_size_mib: 100,
+        reserved_ports: std::collections::HashSet::new(),
+        stream_proxy_bind_address: "0.0.0.0".to_string(),
+        admin_allowed_cidrs: std::sync::Arc::new(
+            ferrum_edge::proxy::client_ip::TrustedProxies::none(),
+        ),
+        cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        dp_registry: Some(registry),
+        cp_connection_state: None,
+    };
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let (status, body, _) = admin_get(&base_url, "/cluster", &token).await;
+    assert_eq!(status, 200);
+    assert_eq!(body["mode"], "cp");
+    assert_eq!(body["connected_data_planes"], 2);
+    let dps = body["data_planes"].as_array().unwrap();
+    assert_eq!(dps.len(), 2);
+    // Each DP should have expected fields
+    for dp in dps {
+        assert!(dp["node_id"].is_string());
+        assert_eq!(dp["status"], "online");
+        assert!(dp["connected_at"].is_string());
+        assert!(dp["last_sync_at"].is_string());
+    }
+}
+
+#[tokio::test]
+async fn test_cluster_endpoint_dp_mode_connected() {
+    let tc = TestConfig::default();
+    let now = Utc::now();
+    let conn_state = std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(
+        ferrum_edge::grpc::dp_client::DpCpConnectionState {
+            connected: true,
+            cp_url: "http://cp:50051".to_string(),
+            is_primary: true,
+            last_config_received_at: Some(now),
+            connected_since: Some(now),
+        },
+    )));
+    let state = AdminState {
+        db: None,
+        jwt_manager: create_test_jwt_manager(&tc),
+        cached_config: None,
+        proxy_state: None,
+        mode: "dp".to_string(),
+        read_only: true,
+        startup_ready: None,
+        db_available: None,
+        admin_restore_max_body_size_mib: 100,
+        reserved_ports: std::collections::HashSet::new(),
+        stream_proxy_bind_address: "0.0.0.0".to_string(),
+        admin_allowed_cidrs: std::sync::Arc::new(
+            ferrum_edge::proxy::client_ip::TrustedProxies::none(),
+        ),
+        cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        dp_registry: None,
+        cp_connection_state: Some(conn_state),
+    };
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let (status, body, _) = admin_get(&base_url, "/cluster", &token).await;
+    assert_eq!(status, 200);
+    assert_eq!(body["mode"], "dp");
+    assert_eq!(body["control_plane"]["status"], "online");
+    assert_eq!(body["control_plane"]["url"], "http://cp:50051");
+    assert!(body["control_plane"]["connected_since"].is_string());
+    assert!(body["control_plane"]["last_config_received_at"].is_string());
+}
+
+#[tokio::test]
+async fn test_cluster_endpoint_dp_mode_disconnected() {
+    let tc = TestConfig::default();
+    let conn_state = std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(
+        ferrum_edge::grpc::dp_client::DpCpConnectionState::new_disconnected("http://cp:50051"),
+    )));
+    let state = AdminState {
+        db: None,
+        jwt_manager: create_test_jwt_manager(&tc),
+        cached_config: None,
+        proxy_state: None,
+        mode: "dp".to_string(),
+        read_only: true,
+        startup_ready: None,
+        db_available: None,
+        admin_restore_max_body_size_mib: 100,
+        reserved_ports: std::collections::HashSet::new(),
+        stream_proxy_bind_address: "0.0.0.0".to_string(),
+        admin_allowed_cidrs: std::sync::Arc::new(
+            ferrum_edge::proxy::client_ip::TrustedProxies::none(),
+        ),
+        cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        dp_registry: None,
+        cp_connection_state: Some(conn_state),
+    };
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let (status, body, _) = admin_get(&base_url, "/cluster", &token).await;
+    assert_eq!(status, 200);
+    assert_eq!(body["mode"], "dp");
+    assert_eq!(body["control_plane"]["status"], "offline");
+    assert!(body["control_plane"]["connected_since"].is_null());
+    assert!(body["control_plane"]["last_config_received_at"].is_null());
+}
+
+#[tokio::test]
+async fn test_cluster_endpoint_database_mode() {
+    let tc = TestConfig::default();
+    let state = AdminState {
+        db: None,
+        jwt_manager: create_test_jwt_manager(&tc),
+        cached_config: None,
+        proxy_state: None,
+        mode: "database".to_string(),
+        read_only: true,
+        startup_ready: None,
+        db_available: None,
+        admin_restore_max_body_size_mib: 100,
+        reserved_ports: std::collections::HashSet::new(),
+        stream_proxy_bind_address: "0.0.0.0".to_string(),
+        admin_allowed_cidrs: std::sync::Arc::new(
+            ferrum_edge::proxy::client_ip::TrustedProxies::none(),
+        ),
+        cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        dp_registry: None,
+        cp_connection_state: None,
+    };
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let (status, body, _) = admin_get(&base_url, "/cluster", &token).await;
+    assert_eq!(status, 200);
+    assert_eq!(body["mode"], "database");
+    assert!(body["message"].is_string());
 }

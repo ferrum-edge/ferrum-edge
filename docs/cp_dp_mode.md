@@ -191,6 +191,28 @@ FERRUM_ADMIN_JWT_SECRET=admin-secret-key \
 ./ferrum-edge
 ```
 
+## Cluster Status Monitoring
+
+The `GET /cluster` admin endpoint (JWT-authenticated) provides live CP/DP connection visibility.
+
+### From the CP
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" http://cp-host:9000/cluster
+```
+
+Returns all connected DP nodes with metadata: `node_id`, `version`, `namespace`, `status`, `connected_at`, and `last_sync_at`. Disconnected DPs are automatically removed from the registry — only currently connected nodes appear. The `last_sync_at` timestamp updates on every config broadcast (delta or full snapshot).
+
+### From a DP
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" http://dp-host:9000/cluster
+```
+
+Returns the DP's connection state to its CP: `url` (which CP it is connected to), `status` (`online`/`offline`), `is_primary` (whether this is the primary or a fallback CP), `connected_since`, and `last_config_received_at`. When the DP is disconnected and retrying, `status` is `offline` and `connected_since` is `null`.
+
+See [admin_api.md](admin_api.md#cluster-status) for full response schemas.
+
 ## DP Admin API
 
 The Data Plane exposes a read-only Admin API for monitoring:
@@ -198,4 +220,5 @@ The Data Plane exposes a read-only Admin API for monitoring:
 - Read operations (list proxies, consumers, plugin configs, health checks) are served from the DP's in-memory cached config
 - Responses include `X-Data-Source: cached` header to indicate the data comes from the cache rather than a live database
 - The `/health` endpoint includes `cached_config` details (availability, loaded_at, proxy/consumer counts)
+- `GET /cluster` shows CP connection status including whether the DP is on its primary or fallback CP
 - The admin API always reflects the DP's currently cached config received from the CP

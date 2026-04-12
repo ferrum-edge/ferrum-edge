@@ -29,6 +29,8 @@ use crate::config::types::{
     Consumer, GatewayConfig, PluginConfig, PluginScope, Proxy, Upstream, max_credentials_per_type,
     validate_resource_id,
 };
+use crate::grpc::cp_server::DpNodeRegistry;
+use crate::grpc::dp_client::DpCpConnectionState;
 use crate::plugins;
 use crate::proxy::ProxyState;
 use arc_swap::ArcSwap;
@@ -75,6 +77,10 @@ pub struct AdminState {
     /// Cached DB health check result to avoid hitting the database on every
     /// `/health` request. Shared across clones via `Arc<ArcSwap<_>>`.
     pub cached_db_health: Arc<ArcSwap<Option<CachedDbHealthResult>>>,
+    /// Registry of connected DP nodes (CP mode only).
+    pub dp_registry: Option<Arc<DpNodeRegistry>>,
+    /// Connection state to the CP (DP mode only).
+    pub cp_connection_state: Option<Arc<ArcSwap<DpCpConnectionState>>>,
 }
 
 impl AdminState {
@@ -671,6 +677,9 @@ pub async fn handle_admin_request(
 
         // Metrics
         (Method::GET, ["admin", "metrics"]) => handle_metrics(&state).await,
+
+        // Cluster status (CP/DP connection info)
+        (Method::GET, ["cluster"]) => handle_cluster_status(&state).await,
 
         _ => Ok(json_response(
             StatusCode::NOT_FOUND,
@@ -4420,4 +4429,81 @@ async fn check_port_available(port: u16, bind_address: &str, udp: bool) -> Resul
         }
     }
     Ok(())
+}
+
+// ---- Cluster Status ----
+
+async fn handle_cluster_status(state: &AdminState) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    match state.mode.as_str() {
+        "cp" => {
+            if let Some(ref registry) = state.dp_registry {
+                let nodes = registry.snapshot();
+                let connected_count = nodes.len();
+                let node_details: Vec<serde_json::Value> = nodes
+                    .iter()
+                    .map(|n| {
+                        json!({
+                            "node_id": n.node_id,
+                            "version": n.version,
+                            "namespace": n.namespace,
+                            "status": "online",
+                            "connected_at": n.connected_at.to_rfc3339(),
+                            "last_sync_at": n.last_update_at.to_rfc3339(),
+                        })
+                    })
+                    .collect();
+                Ok(json_response(
+                    StatusCode::OK,
+                    &json!({
+                        "mode": "cp",
+                        "connected_data_planes": connected_count,
+                        "data_planes": node_details,
+                    }),
+                ))
+            } else {
+                Ok(json_response(
+                    StatusCode::OK,
+                    &json!({
+                        "mode": "cp",
+                        "connected_data_planes": 0,
+                        "data_planes": [],
+                    }),
+                ))
+            }
+        }
+        "dp" => {
+            if let Some(ref cs) = state.cp_connection_state {
+                let snap = cs.load();
+                let status = if snap.connected { "online" } else { "offline" };
+                Ok(json_response(
+                    StatusCode::OK,
+                    &json!({
+                        "mode": "dp",
+                        "control_plane": {
+                            "url": snap.cp_url,
+                            "status": status,
+                            "is_primary": snap.is_primary,
+                            "connected_since": snap.connected_since.map(|t| t.to_rfc3339()),
+                            "last_config_received_at": snap.last_config_received_at.map(|t| t.to_rfc3339()),
+                        },
+                    }),
+                ))
+            } else {
+                Ok(json_response(
+                    StatusCode::OK,
+                    &json!({
+                        "mode": "dp",
+                        "control_plane": null,
+                    }),
+                ))
+            }
+        }
+        _ => Ok(json_response(
+            StatusCode::OK,
+            &json!({
+                "mode": state.mode,
+                "message": "Cluster status is only available in cp or dp modes",
+            }),
+        )),
+    }
 }

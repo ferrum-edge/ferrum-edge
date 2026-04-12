@@ -128,6 +128,12 @@ GHCR uses the built-in `GITHUB_TOKEN` — no additional secret needed. Ensure re
 
 **`/health` DB check is intentionally cached (15s TTL)**: The `/health` and `/status` endpoints are unauthenticated (by design — load balancer probes need them). Without caching, each call runs `SELECT 1` (SQL) or `ping` (MongoDB), which an attacker with admin port access could flood to exhaust the DB connection pool (`FERRUM_DB_POOL_MAX_CONNECTIONS`, default 10), starving config polling and admin writes. The `CachedDbHealthResult` in `AdminState` caches the boolean result for 15 seconds via lock-free `ArcSwap`. Do not remove this cache or make `/health` call `db.health_check()` directly on every request.
 
+**`GET /cluster` — CP/DP connection status (authenticated)**: Returns live connection state for CP/DP deployments. In CP mode, reports all connected DP nodes with `node_id`, `version`, `namespace`, `status` (always `online` — disconnected DPs are removed from the registry), `connected_at`, and `last_sync_at`. In DP mode, reports the CP connection: `url`, `status` (`online`/`offline`), `is_primary` (whether connected to primary or fallback CP), `connected_since`, and `last_config_received_at`. In database/file modes, returns an informational message. The endpoint is JWT-authenticated (same as other admin CRUD endpoints).
+
+**CP-side DP node tracking**: `DpNodeRegistry` (`src/grpc/cp_server.rs`) is a `DashMap<node_id, DpNodeInfo>` shared between the gRPC server and admin API. DPs are registered on `Subscribe()` and automatically removed via a `TrackedStream` drop guard when the gRPC stream is dropped (DP disconnects). `last_update_at` is touched on every broadcast (`broadcast_update_with_registry` / `broadcast_delta_with_registry`). The registry is passed to `AdminState.dp_registry` in CP mode.
+
+**DP-side CP connection tracking**: `DpCpConnectionState` (`src/grpc/dp_client.rs`) is an `Arc<ArcSwap<_>>` shared between the DP gRPC client and admin API. It tracks `connected` (bool), `cp_url` (which CP URL is active), `is_primary` (primary vs fallback), `connected_since`, and `last_config_received_at`. State transitions: connected on stream establishment, `last_config_received_at` updated on each applied config, disconnected on stream end/error/primary-retry timer. Passed to `AdminState.cp_connection_state` in DP mode.
+
 ### Core Design Principles
 
 1. **Lock-free hot path**: All request-path reads use `ArcSwap::load()` or `DashMap` sharded locks. No `Mutex`/`RwLock` on the proxy path.
@@ -258,8 +264,8 @@ src/
 │       ├── http_client.rs     # Shared HTTP client for plugin outbound calls
 │       └── redis_rate_limiter.rs  # Shared Redis client for centralized rate limiting
 ├── grpc/                      # CP/DP gRPC communication
-│   ├── cp_server.rs           # Control Plane gRPC server (ConfigSync service, broadcast channel)
-│   └── dp_client.rs           # Data Plane gRPC client (subscribe + exponential backoff reconnect)
+│   ├── cp_server.rs           # Control Plane gRPC server (ConfigSync service, broadcast channel, DpNodeRegistry)
+│   └── dp_client.rs           # Data Plane gRPC client (subscribe + multi-CP failover + DpCpConnectionState)
 ├── overload.rs                # Overload manager: resource monitors, progressive load shedding, graceful drain
 ├── load_balancer.rs           # Load balancing algorithms + per-upstream cache (Arc<UpstreamTarget> for zero-cost selection) + HealthContext for dual-map health filtering
 ├── health_check.rs            # Active (shared per-upstream probes) + passive (isolated per-proxy) health checking with two-level index

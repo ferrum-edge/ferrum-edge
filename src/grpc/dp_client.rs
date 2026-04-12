@@ -7,9 +7,17 @@
 //! - `update_type=0` (FULL_SNAPSHOT): replaces the entire `GatewayConfig`
 //! - `update_type=1` (DELTA): applies incremental changes via `apply_incremental()`
 //!
+//! Multi-CP failover: `cp_urls` is a priority-ordered list. The DP connects to
+//! the first (primary) URL and fails over to subsequent URLs when unreachable.
+//! When connected to a fallback CP and `primary_retry_secs > 0`, the DP
+//! periodically disconnects from the fallback to retry the primary.
+//!
 //! SNI is extracted from the CP URL so TLS certificate validation works
 //! correctly even when connecting via IP address with a hostname-based cert.
+use arc_swap::ArcSwap;
+use chrono::{DateTime, Utc};
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
+use serde::Serialize;
 use serde_json::json;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -25,6 +33,34 @@ use crate::FERRUM_VERSION;
 use crate::config::db_loader::IncrementalResult;
 use crate::config::types::GatewayConfig;
 use crate::proxy::ProxyState;
+
+/// Tracks the DP's connection status to its Control Plane.
+/// Shared between the DP gRPC client and the admin API (`GET /cluster`).
+#[derive(Clone, Serialize)]
+pub struct DpCpConnectionState {
+    /// Whether the gRPC stream to a CP is currently active.
+    pub connected: bool,
+    /// URL of the CP this DP is currently connected to (or last attempted).
+    pub cp_url: String,
+    /// Whether the current CP is the primary (index 0) or a fallback.
+    pub is_primary: bool,
+    /// Timestamp of the last config update received from CP.
+    pub last_config_received_at: Option<DateTime<Utc>>,
+    /// When the current connection was established (None if disconnected).
+    pub connected_since: Option<DateTime<Utc>>,
+}
+
+impl DpCpConnectionState {
+    pub fn new_disconnected(cp_url: &str) -> Self {
+        Self {
+            connected: false,
+            cp_url: cp_url.to_string(),
+            is_primary: true,
+            last_config_received_at: None,
+            connected_since: None,
+        }
+    }
+}
 
 /// Newtype for the shared CP/DP gRPC JWT secret (`FERRUM_CP_DP_GRPC_JWT_SECRET`).
 ///
@@ -85,6 +121,9 @@ pub fn generate_dp_jwt(secret: &str, node_id: &str) -> Result<String, anyhow::Er
 }
 
 /// Connect to the Control Plane with an optional shutdown signal.
+///
+/// Accepts a single CP URL for backward compatibility. For multi-CP failover,
+/// use [`start_dp_client_with_shutdown_and_startup_ready`] with a `Vec`.
 #[allow(dead_code)] // Used by tests and library callers; binary startup uses the startup-aware variant.
 pub async fn start_dp_client_with_shutdown(
     cp_url: String,
@@ -95,35 +134,72 @@ pub async fn start_dp_client_with_shutdown(
     namespace: String,
 ) {
     start_dp_client_with_shutdown_and_startup_ready(
-        cp_url,
+        vec![cp_url],
         jwt_secret,
         proxy_state,
         shutdown_rx,
         tls_config,
         None,
         namespace,
+        0,
+        None,
     )
     .await;
 }
 
-/// Connect to the Control Plane with an optional startup readiness flag.
+/// Connect to Control Plane(s) with multi-CP failover and optional startup readiness.
+///
+/// `cp_urls` is a priority-ordered list of CP gRPC URLs. The DP connects to the
+/// first (primary) URL and fails over to subsequent URLs when unreachable. When
+/// connected to a fallback CP and `primary_retry_secs > 0`, the DP periodically
+/// disconnects from the fallback and retries the primary CP.
+#[allow(clippy::too_many_arguments)]
 pub async fn start_dp_client_with_shutdown_and_startup_ready(
-    cp_url: String,
+    cp_urls: Vec<String>,
     jwt_secret: GrpcJwtSecret,
     proxy_state: ProxyState,
     shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
     tls_config: Option<DpGrpcTlsConfig>,
     startup_ready: Option<Arc<AtomicBool>>,
     namespace: String,
+    primary_retry_secs: u64,
+    connection_state: Option<Arc<ArcSwap<DpCpConnectionState>>>,
 ) {
-    let node_id = uuid::Uuid::new_v4().to_string();
-    info!("DP client starting, connecting to CP at {}", cp_url);
+    if cp_urls.is_empty() {
+        error!("No CP URLs configured — cannot start DP client");
+        return;
+    }
 
-    // Exponential backoff with jitter to prevent thundering-herd reconnection
-    // storms when many DPs restart simultaneously (e.g., Kubernetes rollout).
+    let node_id = uuid::Uuid::new_v4().to_string();
+    let cp_count = cp_urls.len();
+
+    if cp_count > 1 {
+        info!(
+            "DP client starting with {} CP URLs (failover enabled): {}",
+            cp_count,
+            cp_urls
+                .iter()
+                .enumerate()
+                .map(|(i, u)| if i == 0 {
+                    format!("{} (primary)", u)
+                } else {
+                    u.to_string()
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    } else {
+        info!(
+            "DP client starting, connecting to CP at {}",
+            cp_urls.first().map(|s| s.as_str()).unwrap_or("(none)")
+        );
+    }
+
     const BACKOFF_INITIAL_SECS: u64 = 1;
     const BACKOFF_MAX_SECS: u64 = 30;
+    let mut current_cp_index: usize = 0;
     let mut backoff_secs = BACKOFF_INITIAL_SECS;
+    let mut full_cycle_count: u32 = 0;
 
     loop {
         if let Some(ref rx) = shutdown_rx
@@ -133,36 +209,122 @@ pub async fn start_dp_client_with_shutdown_and_startup_ready(
             return;
         }
 
-        match connect_and_subscribe_with_startup_ready(
-            &cp_url,
-            &jwt_secret,
-            &node_id,
-            &proxy_state,
-            tls_config.as_ref(),
-            startup_ready.clone(),
-            &namespace,
-        )
-        .await
-        {
+        let cp_url = &cp_urls[current_cp_index];
+        let is_primary = current_cp_index == 0;
+        let is_fallback = !is_primary && cp_count > 1;
+
+        if is_fallback {
+            info!(
+                "Connecting to fallback CP [{}/{}] at {}",
+                current_cp_index + 1,
+                cp_count,
+                cp_url
+            );
+        } else if cp_count > 1 {
+            info!("Connecting to primary CP at {}", cp_url);
+        }
+
+        // When connected to a fallback CP and primary_retry_secs > 0,
+        // race the stream against a timer to periodically retry the primary.
+        // The timer is only armed after startup readiness (initial snapshot applied)
+        // to avoid disconnecting from the fallback before the DP has any config.
+        let should_race_primary = is_fallback
+            && primary_retry_secs > 0
+            && startup_ready
+                .as_ref()
+                .is_none_or(|r| r.load(Ordering::Relaxed));
+        let result = if should_race_primary {
+            tokio::select! {
+                res = connect_and_subscribe_with_startup_ready(
+                    cp_url,
+                    &jwt_secret,
+                    &node_id,
+                    &proxy_state,
+                    tls_config.as_ref(),
+                    startup_ready.clone(),
+                    &namespace,
+                    connection_state.as_ref(),
+                    is_primary,
+                ) => res,
+                _ = tokio::time::sleep(Duration::from_secs(primary_retry_secs)) => {
+                    info!(
+                        "Primary CP retry interval ({}s) elapsed; disconnecting from \
+                         fallback CP [{}/{}] to retry primary",
+                        primary_retry_secs,
+                        current_cp_index + 1,
+                        cp_count,
+                    );
+                    // Mark disconnected before switching
+                    update_state_disconnected(&connection_state);
+                    current_cp_index = 0;
+                    backoff_secs = BACKOFF_INITIAL_SECS;
+                    continue;
+                }
+            }
+        } else {
+            connect_and_subscribe_with_startup_ready(
+                cp_url,
+                &jwt_secret,
+                &node_id,
+                &proxy_state,
+                tls_config.as_ref(),
+                startup_ready.clone(),
+                &namespace,
+                connection_state.as_ref(),
+                is_primary,
+            )
+            .await
+        };
+
+        match result {
             Ok(_) => {
-                warn!("CP connection stream ended, will reconnect...");
-                // Reset backoff on clean disconnect (stream ended normally)
+                warn!(
+                    "CP [{}/{}] connection stream ended ({}), will reconnect...",
+                    current_cp_index + 1,
+                    cp_count,
+                    cp_url
+                );
+                update_state_disconnected(&connection_state);
+                // On clean disconnect, try primary first if we were on a fallback
+                if is_fallback {
+                    info!("Stream ended on fallback CP; will retry primary CP first");
+                    current_cp_index = 0;
+                }
                 backoff_secs = BACKOFF_INITIAL_SECS;
             }
             Err(e) => {
                 error!(
-                    "CP connection error: {}, will retry in ~{}s",
-                    e, backoff_secs
+                    "CP [{}/{}] connection error ({}): {}",
+                    current_cp_index + 1,
+                    cp_count,
+                    cp_url,
+                    e
                 );
+                update_state_disconnected(&connection_state);
+
+                if cp_count > 1 {
+                    let next_index = (current_cp_index + 1) % cp_count;
+                    if next_index == 0 {
+                        full_cycle_count += 1;
+                        warn!(
+                            "All {} CP URLs exhausted (cycle {}), restarting from primary",
+                            cp_count, full_cycle_count
+                        );
+                        // Keep accumulated backoff when cycling back
+                    } else {
+                        // Fresh start on next CP
+                        backoff_secs = BACKOFF_INITIAL_SECS;
+                    }
+                    current_cp_index = next_index;
+                }
             }
         }
 
         // Apply ±25% jitter to the backoff to desynchronize reconnection attempts.
-        // Work in milliseconds so even a 1s backoff gets ±250ms jitter.
         let base_ms = backoff_secs * 1000;
-        let jitter_range_ms = base_ms / 4; // 25% of base in ms (always ≥250 for 1s+)
+        let jitter_range_ms = base_ms / 4;
         let jitter_ms = if jitter_range_ms > 0 {
-            let full_range = jitter_range_ms * 2; // ±25% window
+            let full_range = jitter_range_ms * 2;
             let nanos = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -174,7 +336,6 @@ pub async fn start_dp_client_with_shutdown_and_startup_ready(
         let sleep_ms = base_ms as i64 + jitter_ms;
         let sleep_duration = Duration::from_millis(sleep_ms.max(100) as u64);
 
-        // Continue serving with cached config; retry connection
         if let Some(ref rx) = shutdown_rx {
             let mut rx_clone = rx.clone();
             tokio::select! {
@@ -192,8 +353,35 @@ pub async fn start_dp_client_with_shutdown_and_startup_ready(
             tokio::time::sleep(sleep_duration).await;
         }
 
-        // Exponential increase capped at BACKOFF_MAX_SECS
         backoff_secs = (backoff_secs * 2).min(BACKOFF_MAX_SECS);
+    }
+}
+
+/// Helper: mark connection state as disconnected, preserving last_config_received_at.
+fn update_state_disconnected(connection_state: &Option<Arc<ArcSwap<DpCpConnectionState>>>) {
+    if let Some(cs) = connection_state {
+        let prev = cs.load();
+        cs.store(Arc::new(DpCpConnectionState {
+            connected: false,
+            cp_url: prev.cp_url.clone(),
+            is_primary: prev.is_primary,
+            last_config_received_at: prev.last_config_received_at,
+            connected_since: None,
+        }));
+    }
+}
+
+/// Helper: update last_config_received_at timestamp on successful config application.
+fn update_state_config_received(connection_state: Option<&Arc<ArcSwap<DpCpConnectionState>>>) {
+    if let Some(cs) = connection_state {
+        let prev = cs.load();
+        cs.store(Arc::new(DpCpConnectionState {
+            connected: true,
+            cp_url: prev.cp_url.clone(),
+            is_primary: prev.is_primary,
+            last_config_received_at: Some(Utc::now()),
+            connected_since: prev.connected_since,
+        }));
     }
 }
 
@@ -214,11 +402,14 @@ pub async fn connect_and_subscribe(
         tls_config,
         None,
         namespace,
+        None,
+        true,
     )
     .await
 }
 
 /// Connect to CP and optionally flip startup readiness after the first applied snapshot.
+#[allow(clippy::too_many_arguments)]
 pub async fn connect_and_subscribe_with_startup_ready(
     cp_url: &str,
     jwt_secret: &GrpcJwtSecret,
@@ -227,6 +418,8 @@ pub async fn connect_and_subscribe_with_startup_ready(
     tls_config: Option<&DpGrpcTlsConfig>,
     startup_ready: Option<Arc<AtomicBool>>,
     namespace: &str,
+    connection_state: Option<&Arc<ArcSwap<DpCpConnectionState>>>,
+    is_primary: bool,
 ) -> Result<(), anyhow::Error> {
     let mut endpoint =
         Channel::from_shared(cp_url.to_string())?.connect_timeout(Duration::from_secs(10));
@@ -283,6 +476,18 @@ pub async fn connect_and_subscribe_with_startup_ready(
 
     let mut stream = client.subscribe(request).await?.into_inner();
     let mut initial_snapshot_applied = startup_ready.is_none();
+
+    // Mark connected
+    if let Some(cs) = connection_state {
+        let now = Utc::now();
+        cs.store(Arc::new(DpCpConnectionState {
+            connected: true,
+            cp_url: cp_url.to_string(),
+            is_primary,
+            last_config_received_at: None,
+            connected_since: Some(now),
+        }));
+    }
 
     while let Some(update) = stream.message().await? {
         info!(
@@ -357,6 +562,7 @@ pub async fn connect_and_subscribe_with_startup_ready(
                             continue;
                         }
                         proxy_state.update_config(config);
+                        update_state_config_received(connection_state);
                         if !initial_snapshot_applied {
                             proxy_state
                                 .stream_listener_manager
@@ -380,6 +586,7 @@ pub async fn connect_and_subscribe_with_startup_ready(
                 match serde_json::from_str::<IncrementalResult>(&update.config_json) {
                     Ok(result) => {
                         if proxy_state.apply_incremental(result).await {
+                            update_state_config_received(connection_state);
                             info!("Incremental config delta applied from CP");
                         }
                     }

@@ -61,6 +61,8 @@ fn create_test_admin_state(config: &TestConfig) -> AdminState {
             ferrum_edge::proxy::client_ip::TrustedProxies::none(),
         ),
         cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        dp_registry: None,
+        cp_connection_state: None,
     }
 }
 

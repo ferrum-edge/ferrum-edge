@@ -348,6 +348,8 @@ pub async fn run(
         stream_proxy_bind_address: env_config.stream_proxy_bind_address.clone(),
         admin_allowed_cidrs: admin_allowed_cidrs.clone(),
         cached_db_health: Arc::new(arc_swap::ArcSwap::new(Arc::new(None))),
+        dp_registry: None,
+        cp_connection_state: None,
     };
 
     let mut handles = Vec::new();
