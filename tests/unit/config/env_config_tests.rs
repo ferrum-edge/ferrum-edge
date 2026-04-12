@@ -134,7 +134,10 @@ fn test_env_config_database_mode_missing_db_type() {
     with_env_vars(
         &[
             ("FERRUM_MODE", "database"),
-            ("FERRUM_ADMIN_JWT_SECRET", "secret"),
+            (
+                "FERRUM_ADMIN_JWT_SECRET",
+                "secret-padding-for-32-characters!!",
+            ),
             ("FERRUM_DB_URL", "sqlite::memory:"),
         ],
         || {
@@ -151,7 +154,10 @@ fn test_env_config_database_mode_missing_db_url() {
     with_env_vars(
         &[
             ("FERRUM_MODE", "database"),
-            ("FERRUM_ADMIN_JWT_SECRET", "secret"),
+            (
+                "FERRUM_ADMIN_JWT_SECRET",
+                "secret-padding-for-32-characters!!",
+            ),
             ("FERRUM_DB_TYPE", "sqlite"),
         ],
         || {
@@ -203,7 +209,10 @@ fn test_env_config_cp_mode_missing_grpc_listen() {
     with_env_vars(
         &[
             ("FERRUM_MODE", "cp"),
-            ("FERRUM_ADMIN_JWT_SECRET", "secret"),
+            (
+                "FERRUM_ADMIN_JWT_SECRET",
+                "secret-padding-for-32-characters!!",
+            ),
             ("FERRUM_DB_TYPE", "sqlite"),
             ("FERRUM_DB_URL", "sqlite::memory:"),
             (
@@ -225,7 +234,10 @@ fn test_env_config_cp_mode_missing_grpc_jwt_secret() {
     with_env_vars(
         &[
             ("FERRUM_MODE", "cp"),
-            ("FERRUM_ADMIN_JWT_SECRET", "secret"),
+            (
+                "FERRUM_ADMIN_JWT_SECRET",
+                "secret-padding-for-32-characters!!",
+            ),
             ("FERRUM_DB_TYPE", "sqlite"),
             ("FERRUM_DB_URL", "sqlite::memory:"),
             ("FERRUM_CP_GRPC_LISTEN_ADDR", "0.0.0.0:50051"),
@@ -446,7 +458,10 @@ fn test_env_config_database_mode_valid() {
     with_env_vars(
         &[
             ("FERRUM_MODE", "database"),
-            ("FERRUM_ADMIN_JWT_SECRET", "my-secret"),
+            (
+                "FERRUM_ADMIN_JWT_SECRET",
+                "my-secret-padding-for-32-chars!!!",
+            ),
             ("FERRUM_DB_TYPE", "sqlite"),
             ("FERRUM_DB_URL", "sqlite::memory:"),
         ],
@@ -455,7 +470,10 @@ fn test_env_config_database_mode_valid() {
             assert_eq!(config.mode, OperatingMode::Database);
             assert_eq!(config.db_type, Some("sqlite".to_string()));
             assert_eq!(config.db_url, Some("sqlite::memory:".to_string()));
-            assert_eq!(config.admin_jwt_secret, Some("my-secret".to_string()));
+            assert_eq!(
+                config.admin_jwt_secret,
+                Some("my-secret-padding-for-32-chars!!!".to_string())
+            );
         },
     );
 }
@@ -491,7 +509,10 @@ fn test_env_config_cp_mode_valid() {
     with_env_vars(
         &[
             ("FERRUM_MODE", "cp"),
-            ("FERRUM_ADMIN_JWT_SECRET", "admin-secret"),
+            (
+                "FERRUM_ADMIN_JWT_SECRET",
+                "admin-secret-padding-32-chars!!!",
+            ),
             ("FERRUM_DB_TYPE", "postgres"),
             ("FERRUM_DB_URL", "postgres://localhost/ferrum"),
             ("FERRUM_CP_GRPC_LISTEN_ADDR", "0.0.0.0:50051"),
@@ -1473,7 +1494,10 @@ fn test_env_config_db_ssl_mode_parsed() {
     with_env_vars(
         &[
             ("FERRUM_MODE", "database"),
-            ("FERRUM_ADMIN_JWT_SECRET", "secret"),
+            (
+                "FERRUM_ADMIN_JWT_SECRET",
+                "secret-padding-for-32-characters!!",
+            ),
             ("FERRUM_DB_TYPE", "postgres"),
             ("FERRUM_DB_URL", "postgres://localhost/ferrum"),
             ("FERRUM_DB_SSL_MODE", "require"),
@@ -1490,7 +1514,10 @@ fn test_effective_db_url_no_ssl_params() {
     with_env_vars(
         &[
             ("FERRUM_MODE", "database"),
-            ("FERRUM_ADMIN_JWT_SECRET", "secret"),
+            (
+                "FERRUM_ADMIN_JWT_SECRET",
+                "secret-padding-for-32-characters!!",
+            ),
             ("FERRUM_DB_TYPE", "postgres"),
             ("FERRUM_DB_URL", "postgres://localhost/ferrum"),
         ],
@@ -1514,7 +1541,10 @@ fn test_effective_db_url_postgres_ssl_mode() {
     with_env_vars(
         &[
             ("FERRUM_MODE", "database"),
-            ("FERRUM_ADMIN_JWT_SECRET", "secret"),
+            (
+                "FERRUM_ADMIN_JWT_SECRET",
+                "secret-padding-for-32-characters!!",
+            ),
             ("FERRUM_DB_TYPE", "postgres"),
             ("FERRUM_DB_URL", "postgres://localhost/ferrum"),
             ("FERRUM_DB_SSL_MODE", "require"),
@@ -1534,7 +1564,10 @@ fn test_effective_db_url_postgres_all_ssl_params() {
     with_env_vars(
         &[
             ("FERRUM_MODE", "database"),
-            ("FERRUM_ADMIN_JWT_SECRET", "secret"),
+            (
+                "FERRUM_ADMIN_JWT_SECRET",
+                "secret-padding-for-32-characters!!",
+            ),
             ("FERRUM_DB_TYPE", "postgres"),
             (
                 "FERRUM_DB_URL",
@@ -1560,7 +1593,10 @@ fn test_effective_db_url_postgres_existing_query_params() {
     with_env_vars(
         &[
             ("FERRUM_MODE", "database"),
-            ("FERRUM_ADMIN_JWT_SECRET", "secret"),
+            (
+                "FERRUM_ADMIN_JWT_SECRET",
+                "secret-padding-for-32-characters!!",
+            ),
             ("FERRUM_DB_TYPE", "postgres"),
             (
                 "FERRUM_DB_URL",
@@ -1583,7 +1619,10 @@ fn test_effective_db_url_mysql_ssl_mode_mapping() {
     with_env_vars(
         &[
             ("FERRUM_MODE", "database"),
-            ("FERRUM_ADMIN_JWT_SECRET", "secret"),
+            (
+                "FERRUM_ADMIN_JWT_SECRET",
+                "secret-padding-for-32-characters!!",
+            ),
             ("FERRUM_DB_TYPE", "mysql"),
             ("FERRUM_DB_URL", "mysql://localhost/ferrum"),
             ("FERRUM_DB_SSL_MODE", "require"),
@@ -1603,7 +1642,10 @@ fn test_effective_db_url_mysql_verify_ca() {
     with_env_vars(
         &[
             ("FERRUM_MODE", "database"),
-            ("FERRUM_ADMIN_JWT_SECRET", "secret"),
+            (
+                "FERRUM_ADMIN_JWT_SECRET",
+                "secret-padding-for-32-characters!!",
+            ),
             ("FERRUM_DB_TYPE", "mysql"),
             ("FERRUM_DB_URL", "mysql://localhost/ferrum"),
             ("FERRUM_DB_SSL_MODE", "verify-ca"),
@@ -1624,7 +1666,10 @@ fn test_effective_db_url_mysql_all_ssl_params() {
     with_env_vars(
         &[
             ("FERRUM_MODE", "database"),
-            ("FERRUM_ADMIN_JWT_SECRET", "secret"),
+            (
+                "FERRUM_ADMIN_JWT_SECRET",
+                "secret-padding-for-32-characters!!",
+            ),
             ("FERRUM_DB_TYPE", "mysql"),
             ("FERRUM_DB_URL", "mysql://user:pass@db.example.com/ferrum"),
             ("FERRUM_DB_SSL_MODE", "verify-full"),
@@ -1647,7 +1692,10 @@ fn test_effective_db_url_sqlite_ignores_ssl() {
     with_env_vars(
         &[
             ("FERRUM_MODE", "database"),
-            ("FERRUM_ADMIN_JWT_SECRET", "secret"),
+            (
+                "FERRUM_ADMIN_JWT_SECRET",
+                "secret-padding-for-32-characters!!",
+            ),
             ("FERRUM_DB_TYPE", "sqlite"),
             ("FERRUM_DB_URL", "sqlite://ferrum.db?mode=rwc"),
             ("FERRUM_DB_SSL_MODE", "require"),
@@ -1668,7 +1716,10 @@ fn test_effective_db_url_root_cert_only() {
     with_env_vars(
         &[
             ("FERRUM_MODE", "database"),
-            ("FERRUM_ADMIN_JWT_SECRET", "secret"),
+            (
+                "FERRUM_ADMIN_JWT_SECRET",
+                "secret-padding-for-32-characters!!",
+            ),
             ("FERRUM_DB_TYPE", "postgres"),
             ("FERRUM_DB_URL", "postgres://localhost/ferrum"),
             ("FERRUM_DB_SSL_ROOT_CERT", "/certs/ca.pem"),
@@ -1821,7 +1872,10 @@ fn test_db_failover_urls_empty_by_default() {
             ("FERRUM_MODE", "database"),
             ("FERRUM_DB_TYPE", "postgres"),
             ("FERRUM_DB_URL", "postgres://localhost/ferrum"),
-            ("FERRUM_ADMIN_JWT_SECRET", "test-secret"),
+            (
+                "FERRUM_ADMIN_JWT_SECRET",
+                "test-secret-padding-for-32-chars!",
+            ),
         ],
         || {
             let config = EnvConfig::from_env().unwrap();
@@ -1838,7 +1892,10 @@ fn test_db_failover_urls_parsed() {
             ("FERRUM_MODE", "database"),
             ("FERRUM_DB_TYPE", "postgres"),
             ("FERRUM_DB_URL", "postgres://primary/ferrum"),
-            ("FERRUM_ADMIN_JWT_SECRET", "test-secret"),
+            (
+                "FERRUM_ADMIN_JWT_SECRET",
+                "test-secret-padding-for-32-chars!",
+            ),
             (
                 "FERRUM_DB_FAILOVER_URLS",
                 "postgres://secondary1/ferrum, postgres://secondary2/ferrum",
@@ -1860,7 +1917,10 @@ fn test_db_failover_urls_filters_empty_entries() {
             ("FERRUM_MODE", "database"),
             ("FERRUM_DB_TYPE", "postgres"),
             ("FERRUM_DB_URL", "postgres://primary/ferrum"),
-            ("FERRUM_ADMIN_JWT_SECRET", "test-secret"),
+            (
+                "FERRUM_ADMIN_JWT_SECRET",
+                "test-secret-padding-for-32-chars!",
+            ),
             ("FERRUM_DB_FAILOVER_URLS", "postgres://secondary/ferrum,,, "),
         ],
         || {
@@ -1878,7 +1938,10 @@ fn test_db_failover_urls_with_ssl_params() {
             ("FERRUM_MODE", "database"),
             ("FERRUM_DB_TYPE", "postgres"),
             ("FERRUM_DB_URL", "postgres://primary/ferrum"),
-            ("FERRUM_ADMIN_JWT_SECRET", "test-secret"),
+            (
+                "FERRUM_ADMIN_JWT_SECRET",
+                "test-secret-padding-for-32-chars!",
+            ),
             ("FERRUM_DB_FAILOVER_URLS", "postgres://secondary/ferrum"),
             ("FERRUM_DB_SSL_MODE", "verify-full"),
         ],
@@ -1902,7 +1965,10 @@ fn test_db_read_replica_url_none_by_default() {
             ("FERRUM_MODE", "database"),
             ("FERRUM_DB_TYPE", "postgres"),
             ("FERRUM_DB_URL", "postgres://localhost/ferrum"),
-            ("FERRUM_ADMIN_JWT_SECRET", "test-secret"),
+            (
+                "FERRUM_ADMIN_JWT_SECRET",
+                "test-secret-padding-for-32-chars!",
+            ),
         ],
         || {
             let config = EnvConfig::from_env().unwrap();
@@ -1919,7 +1985,10 @@ fn test_db_read_replica_url_parsed() {
             ("FERRUM_MODE", "database"),
             ("FERRUM_DB_TYPE", "postgres"),
             ("FERRUM_DB_URL", "postgres://primary/ferrum"),
-            ("FERRUM_ADMIN_JWT_SECRET", "test-secret"),
+            (
+                "FERRUM_ADMIN_JWT_SECRET",
+                "test-secret-padding-for-32-chars!",
+            ),
             ("FERRUM_DB_READ_REPLICA_URL", "postgres://replica/ferrum"),
         ],
         || {
@@ -1943,7 +2012,10 @@ fn test_db_read_replica_url_with_ssl_params() {
             ("FERRUM_MODE", "database"),
             ("FERRUM_DB_TYPE", "postgres"),
             ("FERRUM_DB_URL", "postgres://primary/ferrum"),
-            ("FERRUM_ADMIN_JWT_SECRET", "test-secret"),
+            (
+                "FERRUM_ADMIN_JWT_SECRET",
+                "test-secret-padding-for-32-chars!",
+            ),
             ("FERRUM_DB_READ_REPLICA_URL", "postgres://replica/ferrum"),
             ("FERRUM_DB_SSL_MODE", "require"),
             ("FERRUM_DB_SSL_ROOT_CERT", "/path/to/ca.pem"),
@@ -1964,7 +2036,10 @@ fn test_db_read_replica_url_mysql_ssl_mode_translation() {
             ("FERRUM_MODE", "database"),
             ("FERRUM_DB_TYPE", "mysql"),
             ("FERRUM_DB_URL", "mysql://primary/ferrum"),
-            ("FERRUM_ADMIN_JWT_SECRET", "test-secret"),
+            (
+                "FERRUM_ADMIN_JWT_SECRET",
+                "test-secret-padding-for-32-chars!",
+            ),
             ("FERRUM_DB_READ_REPLICA_URL", "mysql://replica/ferrum"),
             ("FERRUM_DB_SSL_MODE", "verify-full"),
         ],
@@ -1983,7 +2058,10 @@ fn test_db_read_replica_url_sqlite_no_ssl() {
             ("FERRUM_MODE", "database"),
             ("FERRUM_DB_TYPE", "sqlite"),
             ("FERRUM_DB_URL", "sqlite://ferrum.db"),
-            ("FERRUM_ADMIN_JWT_SECRET", "test-secret"),
+            (
+                "FERRUM_ADMIN_JWT_SECRET",
+                "test-secret-padding-for-32-chars!",
+            ),
             ("FERRUM_DB_READ_REPLICA_URL", "sqlite://replica.db"),
             ("FERRUM_DB_SSL_MODE", "require"),
         ],
@@ -2078,7 +2156,10 @@ fn test_env_config_db_pool_custom_values() {
     with_env_vars(
         &[
             ("FERRUM_MODE", "database"),
-            ("FERRUM_ADMIN_JWT_SECRET", "secret"),
+            (
+                "FERRUM_ADMIN_JWT_SECRET",
+                "secret-padding-for-32-characters!!",
+            ),
             ("FERRUM_DB_TYPE", "postgres"),
             ("FERRUM_DB_URL", "postgres://localhost/ferrum"),
             ("FERRUM_DB_POOL_MAX_CONNECTIONS", "50"),

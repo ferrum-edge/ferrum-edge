@@ -223,7 +223,7 @@ fn test_conf_file_database_mode() {
 FERRUM_MODE = database
 FERRUM_DB_TYPE = postgres
 FERRUM_DB_URL = postgres://localhost/ferrum
-FERRUM_ADMIN_JWT_SECRET = secret123
+FERRUM_ADMIN_JWT_SECRET = secret123-padding-for-32-chars!!
 FERRUM_DB_POLL_INTERVAL = 60
 FERRUM_DB_SSL_MODE = verify-full
 ";
@@ -236,7 +236,10 @@ FERRUM_DB_SSL_MODE = verify-full
             config.db_url.as_deref(),
             Some("postgres://localhost/ferrum")
         );
-        assert_eq!(config.admin_jwt_secret.as_deref(), Some("secret123"));
+        assert_eq!(
+            config.admin_jwt_secret.as_deref(),
+            Some("secret123-padding-for-32-chars!!")
+        );
         assert_eq!(config.db_poll_interval, 60);
         assert_eq!(config.db_ssl_mode.as_deref(), Some("verify-full"));
     });
