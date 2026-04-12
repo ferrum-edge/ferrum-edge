@@ -917,10 +917,15 @@ pub(crate) async fn proxy_grpc_request_core(
             }
         })?;
 
-    // Extract response status and headers
+    // Extract response status and headers, stripping hop-by-hop headers per RFC 9110 §7.6.1.
     let status = response.status().as_u16();
     let mut resp_headers = HashMap::with_capacity(response.headers().keys_len());
     for (k, v) in response.headers() {
+        match k.as_str() {
+            "connection" | "keep-alive" | "proxy-authenticate" | "proxy-connection" | "te"
+            | "trailer" | "transfer-encoding" | "upgrade" => continue,
+            _ => {}
+        }
         if let Ok(vs) = v.to_str() {
             resp_headers.insert(k.as_str().to_string(), vs.to_string());
         }

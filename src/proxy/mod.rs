@@ -3848,6 +3848,24 @@ pub async fn handle_proxy_request(
         ));
     }
 
+    // Block CONNECT method to prevent protocol confusion and tunneling attacks.
+    // HTTP/1.1 CONNECT creates TCP tunnels (bypassing proxy controls).
+    // HTTP/2 Extended CONNECT (RFC 8441) is only valid for WebSocket upgrades,
+    // which are handled separately via is_h2_websocket_connect(). Non-WebSocket
+    // CONNECT requests (e.g., :protocol = "h2c", "connect-udp") must be rejected
+    // to prevent clients from using Extended CONNECT to bypass proxy routing.
+    // Note: we enable_connect_protocol() on the h2 server to support WebSocket,
+    // which means h2 will deliver Extended CONNECT requests to us — we must
+    // filter non-WebSocket ones here before routing.
+    if method == "CONNECT" && !is_h2_websocket_connect(&req) {
+        warn!("Rejected non-WebSocket CONNECT request");
+        record_request(&state, 405);
+        return Ok(build_response(
+            StatusCode::METHOD_NOT_ALLOWED,
+            r#"{"error":"CONNECT method is not allowed"}"#,
+        ));
+    }
+
     // Resolve real client IP using trusted proxy configuration.
     // Parse the socket IP once and reuse the parsed value to avoid redundant
     // parsing across the real-IP-header check and the XFF walk.
@@ -3950,7 +3968,11 @@ pub async fn handle_proxy_request(
         .or_else(|| req.uri().authority().map(|a| a.as_str()))
         .map(|h| {
             let without_port = h.split(':').next().unwrap_or(h);
-            without_port.to_lowercase()
+            // Strip trailing dot from FQDN (e.g., "example.com." → "example.com").
+            // DNS treats "example.com." and "example.com" as identical, so routing
+            // must normalize to prevent host-matching bypasses.
+            let normalized = without_port.strip_suffix('.').unwrap_or(without_port);
+            normalized.to_lowercase()
         });
     let request_uses_grpc_content_type = grpc_proxy::is_grpc_request(&req);
 
@@ -6873,6 +6895,13 @@ fn collect_response_headers(
 ) {
     target.reserve(source.keys_len());
     for (k, v) in source {
+        // Strip hop-by-hop headers from backend responses per RFC 9110 §7.6.1.
+        // Uses match (compiler-optimized) instead of linear array scan.
+        match k.as_str() {
+            "connection" | "keep-alive" | "proxy-authenticate" | "proxy-connection" | "te"
+            | "trailer" | "transfer-encoding" | "upgrade" => continue,
+            _ => {}
+        }
         if let Ok(vs) = v.to_str() {
             // Determine multi-value separator before allocating the key String.
             // HeaderName comparison is zero-cost (pointer/length check on
@@ -6900,6 +6929,12 @@ fn collect_response_headers(
 fn collect_hyper_response_headers(source: &hyper::HeaderMap, target: &mut HashMap<String, String>) {
     target.reserve(source.keys_len());
     for (k, v) in source {
+        // Strip hop-by-hop headers from backend responses per RFC 9110 §7.6.1.
+        match k.as_str() {
+            "connection" | "keep-alive" | "proxy-authenticate" | "proxy-connection" | "te"
+            | "trailer" | "transfer-encoding" | "upgrade" => continue,
+            _ => {}
+        }
         if let Ok(vs) = v.to_str() {
             let sep = if k == "set-cookie" { "\n" } else { ", " };
             match target.get_mut(k.as_str()) {
@@ -7411,17 +7446,27 @@ async fn proxy_to_backend_http3(
         None
     };
 
-    // Convert headers to HTTP/3 format
+    // Convert headers to HTTP/3 format, stripping hop-by-hop headers per RFC 7230 §6.1
     let mut http3_headers: Vec<(hyper::header::HeaderName, hyper::header::HeaderValue)> =
         Vec::new();
     for (name, value) in headers {
-        if name == "connection" || name == "content-length" || name == "transfer-encoding" {
-            continue;
-        }
-        if let (Ok(header_name), Ok(header_value)) = (name.parse(), value.parse()) {
-            http3_headers.push((header_name, header_value));
-        } else {
-            debug!("Skipping invalid HTTP/3 header: {}={}", name, value);
+        match name.as_str() {
+            "connection"
+            | "content-length"
+            | "transfer-encoding"
+            | "keep-alive"
+            | "te"
+            | "trailer"
+            | "proxy-authorization"
+            | "proxy-connection"
+            | "upgrade" => continue,
+            _ => {
+                if let (Ok(header_name), Ok(header_value)) = (name.parse(), value.parse()) {
+                    http3_headers.push((header_name, header_value));
+                } else {
+                    debug!("Skipping invalid HTTP/3 header: {}={}", name, value);
+                }
+            }
         }
     }
 

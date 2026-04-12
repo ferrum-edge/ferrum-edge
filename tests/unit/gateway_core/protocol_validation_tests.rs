@@ -642,6 +642,118 @@ fn http10_te_rejected_regardless_of_obfuscation() {
     }
 }
 
+// ============================================================================
+// CONNECT method blocking tests
+// ============================================================================
+
+/// HTTP/1.1 CONNECT requests are not valid WebSocket upgrades and should be
+/// blocked by the CONNECT check in handle_proxy_request.
+#[test]
+fn h2_connect_without_websocket_protocol_is_not_ws() {
+    // An HTTP/2 CONNECT without :protocol = "websocket" is NOT a WS upgrade.
+    // is_h2_websocket_connect checks for method=CONNECT + version=HTTP/2 + protocol extension.
+    let req = hyper::Request::builder()
+        .method(hyper::Method::CONNECT)
+        .version(hyper::Version::HTTP_2)
+        .uri("/")
+        .body(())
+        .unwrap();
+    // No Protocol extension set — should NOT be detected as WebSocket
+    assert!(!is_h2_websocket_connect(&req));
+}
+
+#[test]
+fn h2_connect_with_websocket_protocol_is_ws() {
+    let mut req = hyper::Request::builder()
+        .method(hyper::Method::CONNECT)
+        .version(hyper::Version::HTTP_2)
+        .uri("/")
+        .body(())
+        .unwrap();
+    req.extensions_mut()
+        .insert(hyper::ext::Protocol::from_static("websocket"));
+    assert!(is_h2_websocket_connect(&req));
+}
+
+#[test]
+fn h2_connect_with_non_websocket_protocol_is_not_ws() {
+    // Extended CONNECT with a non-websocket :protocol value (e.g., "h2c", "connect-udp")
+    // should NOT be detected as WebSocket — must be rejected by the proxy.
+    let mut req = hyper::Request::builder()
+        .method(hyper::Method::CONNECT)
+        .version(hyper::Version::HTTP_2)
+        .uri("/")
+        .body(())
+        .unwrap();
+    req.extensions_mut()
+        .insert(hyper::ext::Protocol::from_static("connect-udp"));
+    assert!(!is_h2_websocket_connect(&req));
+}
+
+#[test]
+fn h1_connect_is_not_ws() {
+    // HTTP/1.1 CONNECT is never a WebSocket upgrade
+    let req = hyper::Request::builder()
+        .method(hyper::Method::CONNECT)
+        .version(hyper::Version::HTTP_11)
+        .uri("/")
+        .body(())
+        .unwrap();
+    assert!(!is_h2_websocket_connect(&req));
+}
+
+// ============================================================================
+// Host header trailing dot normalization tests
+// ============================================================================
+
+/// Verify that trailing dots in hostnames are equivalent in DNS and routing.
+/// The proxy normalizes "example.com." to "example.com" before routing.
+/// This test validates the normalization logic used in host extraction.
+#[test]
+fn host_trailing_dot_stripped_for_routing() {
+    let host_with_dot = "example.com.";
+    let normalized = host_with_dot
+        .split(':')
+        .next()
+        .unwrap_or(host_with_dot)
+        .strip_suffix('.')
+        .unwrap_or(host_with_dot)
+        .to_lowercase();
+    assert_eq!(normalized, "example.com");
+}
+
+#[test]
+fn host_without_trailing_dot_unchanged() {
+    let host = "example.com";
+    let normalized = host
+        .split(':')
+        .next()
+        .unwrap_or(host)
+        .strip_suffix('.')
+        .unwrap_or(host)
+        .to_lowercase();
+    assert_eq!(normalized, "example.com");
+}
+
+#[test]
+fn host_with_port_and_trailing_dot_normalized() {
+    let host = "example.com.:8080";
+    let without_port = host.split(':').next().unwrap_or(host);
+    let normalized = without_port
+        .strip_suffix('.')
+        .unwrap_or(without_port)
+        .to_lowercase();
+    assert_eq!(normalized, "example.com");
+}
+
+#[test]
+fn host_single_dot_becomes_empty() {
+    // Edge case: a bare dot (invalid, but shouldn't panic)
+    let host = ".";
+    let normalized = host.strip_suffix('.').unwrap_or(host).to_lowercase();
+    assert_eq!(normalized, "");
+}
+
 /// Verify that hyper's HeaderMap normalizes header names to lowercase,
 /// preventing header name case obfuscation (e.g., "Transfer-Encoding" vs "transfer-encoding").
 #[test]

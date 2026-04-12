@@ -573,7 +573,11 @@ async fn handle_h3_request(
         .or_else(|| ctx.headers.get("host").map(|h| h.as_str()))
         .map(|h| {
             let without_port = h.split(':').next().unwrap_or(h);
-            without_port.to_lowercase()
+            // Strip trailing dot from FQDN (e.g., "example.com." → "example.com").
+            // DNS treats "example.com." and "example.com" as identical, so routing
+            // must normalize to prevent host-matching bypasses.
+            let normalized = without_port.strip_suffix('.').unwrap_or(without_port);
+            normalized.to_lowercase()
         });
 
     // Route: host + longest prefix match via router cache
@@ -1333,6 +1337,7 @@ async fn proxy_to_backend_h3_streaming(
 
     let mut req_builder = client.request(req_method, backend_url);
 
+    // Strip hop-by-hop headers per RFC 7230 §6.1
     for (k, v) in headers {
         match k.as_str() {
             "host" | ":authority" => {
@@ -1342,7 +1347,15 @@ async fn proxy_to_backend_h3_streaming(
                     req_builder = req_builder.header("Host", &proxy.backend_host);
                 }
             }
-            "connection" | "content-length" | "transfer-encoding" => continue,
+            "connection"
+            | "content-length"
+            | "transfer-encoding"
+            | "keep-alive"
+            | "te"
+            | "trailer"
+            | "proxy-authorization"
+            | "proxy-connection"
+            | "upgrade" => continue,
             k if k.starts_with(':') => continue,
             _ => {
                 req_builder = req_builder.header(k, v.as_str());
@@ -1395,6 +1408,12 @@ async fn proxy_to_backend_h3_streaming(
     let response_status = response.status().as_u16();
     let mut response_headers = HashMap::with_capacity(response.headers().keys_len());
     for (k, v) in response.headers() {
+        // Strip hop-by-hop headers from backend responses per RFC 9110 §7.6.1.
+        match k.as_str() {
+            "connection" | "keep-alive" | "proxy-authenticate" | "proxy-connection" | "te"
+            | "trailer" | "transfer-encoding" | "upgrade" => continue,
+            _ => {}
+        }
         if let Ok(vs) = v.to_str() {
             response_headers.insert(k.as_str().to_string(), vs.to_string());
         }
@@ -1616,7 +1635,7 @@ async fn proxy_to_backend_h3(
 
     let mut req_builder = client.request(req_method, backend_url);
 
-    // Forward headers
+    // Forward headers, stripping hop-by-hop headers per RFC 7230 §6.1
     for (k, v) in headers {
         match k.as_str() {
             "host" | ":authority" => {
@@ -1626,7 +1645,15 @@ async fn proxy_to_backend_h3(
                     req_builder = req_builder.header("Host", &proxy.backend_host);
                 }
             }
-            "connection" | "content-length" | "transfer-encoding" => continue,
+            "connection"
+            | "content-length"
+            | "transfer-encoding"
+            | "keep-alive"
+            | "te"
+            | "trailer"
+            | "proxy-authorization"
+            | "proxy-connection"
+            | "upgrade" => continue,
             k if k.starts_with(':') => continue, // Skip HTTP/3 pseudo-headers
             _ => {
                 req_builder = req_builder.header(k, v.as_str());
@@ -1668,6 +1695,12 @@ async fn proxy_to_backend_h3(
             let mut resp_headers =
                 std::collections::HashMap::with_capacity(response.headers().keys_len());
             for (k, v) in response.headers() {
+                // Strip hop-by-hop headers from backend responses per RFC 9110 §7.6.1.
+                match k.as_str() {
+                    "connection" | "keep-alive" | "proxy-authenticate" | "proxy-connection"
+                    | "te" | "trailer" | "transfer-encoding" | "upgrade" => continue,
+                    _ => {}
+                }
                 if let Ok(vs) = v.to_str() {
                     resp_headers.insert(k.as_str().to_string(), vs.to_string());
                 }

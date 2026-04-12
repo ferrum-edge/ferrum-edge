@@ -339,6 +339,8 @@ The gateway validates protocol-level constraints before routing to block smuggli
 | **TE header value** | Any allowed | Only "trailers" | N/A | `{"error":"HTTP/2 TE header must be 'trailers' or absent"}` |
 | **Content-Length non-numeric** | Reject 400 | Reject 400 | Reject 400 | `{"error":"Content-Length header contains invalid non-numeric value"}` |
 | **TRACE method** | Reject 405 | Reject 405 | Reject 405 | `{"error":"TRACE method is not allowed"}` |
+| **CONNECT method** (non-WS) | Reject 405 | Reject 405 | N/A | `{"error":"CONNECT method is not allowed"}` |
+| **Host trailing dot** | Stripped | Stripped | Stripped | `example.com.` → `example.com` for routing |
 | **gRPC non-POST method** | Reject (gRPC error) | Reject (gRPC error) | N/A | gRPC trailers-only error |
 | **WebSocket Sec-WebSocket-Key** | Format validated | N/A | N/A | Treated as non-WS request |
 | **WebSocket Origin** | Per-proxy | N/A | N/A | Reject 403 when `allowed_ws_origins` is set and Origin doesn't match |
@@ -348,6 +350,12 @@ The gateway validates protocol-level constraints before routing to block smuggli
 **Content-Length non-numeric validation**: RFC 9110 §8.6 specifies Content-Length MUST be a non-negative integer (ASCII digits only). Values like `-1`, `1.5`, `0x10`, or `abc` are rejected before routing. This check is integrated into the existing CL conflict detection loop in `check_protocol_headers()`.
 
 **TRACE method blocking**: TRACE is blocked globally before routing to prevent Cross-Site Tracing (XST) attacks, where TRACE echoes request headers (including cookies and auth tokens) in the response body.
+
+**CONNECT method blocking**: Non-WebSocket CONNECT requests are blocked with 405. HTTP/1.1 CONNECT creates TCP tunnels that bypass proxy controls. HTTP/2 Extended CONNECT (RFC 8441) with `:protocol = "websocket"` is the only permitted CONNECT variant — it flows through the normal WebSocket upgrade path. Extended CONNECT with other `:protocol` values (e.g., "connect-udp", "h2c") is rejected because `enable_connect_protocol()` on the h2 server would otherwise accept these requests and forward them as regular HTTP, causing protocol confusion.
+
+**Host header trailing dot normalization**: FQDNs with trailing dots (e.g., `example.com.`) are normalized by stripping the dot before routing. DNS treats `example.com.` and `example.com` as identical, so without normalization an attacker could bypass host-based routing rules.
+
+**Response hop-by-hop header filtering**: Backend response headers listed in RFC 9110 §7.6.1 (`connection`, `keep-alive`, `proxy-authenticate`, `proxy-connection`, `te`, `trailer`, `transfer-encoding`, `upgrade`) are stripped before forwarding to the client. This prevents leaking proxy-internal information and avoids protocol confusion when the backend's hop-by-hop semantics differ from the frontend connection. Applied across all response collection paths: reqwest (`collect_response_headers`), hyper H2 (`collect_hyper_response_headers`), gRPC (`grpc_proxy.rs`), and HTTP/3 (`http3/server.rs` buffered + streaming paths).
 
 **WebSocket Origin validation**: When a proxy's `allowed_ws_origins` is non-empty, WebSocket upgrade requests must include an `Origin` header matching one of the allowed values (case-insensitive). This protects against Cross-Site WebSocket Hijacking (CSWSH) per RFC 6455 §10.2. The check runs after authentication/authorization plugins, before the upgrade handshake.
 
