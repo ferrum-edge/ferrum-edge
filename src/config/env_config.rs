@@ -10,7 +10,7 @@
 //! operators debug "why isn't my conf file change taking effect?" issues.
 
 use super::conf_file::ConfFile;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 
 /// The operating mode of the gateway.
@@ -534,6 +534,12 @@ pub struct EnvConfig {
     /// Expired certificates are rejected at startup/config-load time.
     /// Set to 0 to disable near-expiry warnings. (default: 30)
     pub tls_cert_expiry_warning_days: u64,
+    /// Comma-separated HTTP methods allowed to be sent as TLS 1.3 0-RTT early data.
+    /// When non-empty, the gateway advertises 0-RTT support on HTTPS and HTTP/3
+    /// listeners and enforces that only the listed methods are accepted as early data.
+    /// Default: empty (0-RTT disabled — `max_early_data_size=0`).
+    /// Example: "GET" or "GET,HEAD,OPTIONS"
+    pub tls_early_data_methods: HashSet<String>,
 
     // Stream proxy (TCP/UDP)
     /// Bind address for TCP/UDP stream proxy listeners (default: 0.0.0.0).
@@ -882,6 +888,7 @@ impl Default for EnvConfig {
             tls_curves: None,
             tls_session_cache_size: 4096,
             tls_cert_expiry_warning_days: 30,
+            tls_early_data_methods: HashSet::new(),
             trusted_proxies: String::new(),
             backend_allow_ips: BackendAllowIps::Both,
             add_via_header: true,
@@ -1318,6 +1325,33 @@ impl EnvConfig {
                 "FERRUM_TLS_CERT_EXPIRY_WARNING_DAYS",
                 30,
             ),
+            tls_early_data_methods: {
+                let methods: HashSet<String> = resolve_var(conf, "FERRUM_TLS_EARLY_DATA_METHODS")
+                    .map(|s| {
+                        s.split(',')
+                            .map(|m| m.trim().to_uppercase())
+                            .filter(|m| !m.is_empty())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                for m in &methods {
+                    if m != "GET" {
+                        tracing::warn!(
+                            "FERRUM_TLS_EARLY_DATA_METHODS includes non-GET method '{}' — \
+                             0-RTT early data is replayable, which is dangerous for \
+                             non-idempotent operations",
+                            m
+                        );
+                    }
+                }
+                if !methods.is_empty() {
+                    tracing::info!(
+                        "TLS 1.3 0-RTT early data enabled for methods: {:?}",
+                        methods
+                    );
+                }
+                methods
+            },
 
             // Client IP resolution
             trusted_proxies: resolve_var_or(conf, "FERRUM_TRUSTED_PROXIES", ""),

@@ -2806,3 +2806,90 @@ fn test_dp_cp_failover_primary_retry_secs_custom() {
         },
     );
 }
+
+// ============================================================================
+// TLS 1.3 0-RTT early data methods
+// ============================================================================
+
+#[test]
+fn test_tls_early_data_methods_default_empty() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/tmp/r.yaml"),
+        ],
+        || {
+            remove_var("FERRUM_TLS_EARLY_DATA_METHODS");
+            let config = EnvConfig::from_env().unwrap();
+            assert!(config.tls_early_data_methods.is_empty());
+        },
+    );
+}
+
+#[test]
+fn test_tls_early_data_methods_single() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/tmp/r.yaml"),
+            ("FERRUM_TLS_EARLY_DATA_METHODS", "GET"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.tls_early_data_methods.len(), 1);
+            assert!(config.tls_early_data_methods.contains("GET"));
+        },
+    );
+}
+
+#[test]
+fn test_tls_early_data_methods_multiple_comma_separated() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/tmp/r.yaml"),
+            ("FERRUM_TLS_EARLY_DATA_METHODS", "GET, HEAD, OPTIONS"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.tls_early_data_methods.len(), 3);
+            assert!(config.tls_early_data_methods.contains("GET"));
+            assert!(config.tls_early_data_methods.contains("HEAD"));
+            assert!(config.tls_early_data_methods.contains("OPTIONS"));
+        },
+    );
+}
+
+#[test]
+fn test_tls_early_data_methods_uppercased() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/tmp/r.yaml"),
+            ("FERRUM_TLS_EARLY_DATA_METHODS", "get,head"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.tls_early_data_methods.len(), 2);
+            assert!(config.tls_early_data_methods.contains("GET"));
+            assert!(config.tls_early_data_methods.contains("HEAD"));
+        },
+    );
+}
+
+#[test]
+fn test_tls_early_data_methods_empty_entries_filtered() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/tmp/r.yaml"),
+            ("FERRUM_TLS_EARLY_DATA_METHODS", "GET,,HEAD,"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.tls_early_data_methods.len(), 2);
+            assert!(config.tls_early_data_methods.contains("GET"));
+            assert!(config.tls_early_data_methods.contains("HEAD"));
+        },
+    );
+}

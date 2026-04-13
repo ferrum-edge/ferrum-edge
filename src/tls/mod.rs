@@ -71,6 +71,9 @@ pub struct TlsPolicy {
     pub crypto_provider: Arc<CryptoProvider>,
     pub prefer_server_cipher_order: bool,
     pub session_cache_size: usize,
+    /// Maximum 0-RTT early data size in bytes. 0 = disabled (default).
+    /// When non-zero, the server advertises 0-RTT support in TLS 1.3 session tickets.
+    pub early_data_max_size: u32,
 }
 
 impl TlsPolicy {
@@ -148,11 +151,20 @@ impl TlsPolicy {
             ..base_provider
         };
 
+        // 0-RTT early data: when methods are configured, enable with a 16 KiB limit
+        // (matches typical HTTP request size). 0 = disabled (the secure default).
+        let early_data_max_size = if env_config.tls_early_data_methods.is_empty() {
+            0
+        } else {
+            16_384 // 16 KiB — large enough for typical GET/HEAD requests
+        };
+
         Ok(Self {
             protocol_versions: versions,
             crypto_provider: Arc::new(provider),
             prefer_server_cipher_order: env_config.tls_prefer_server_cipher_order,
             session_cache_size: env_config.tls_session_cache_size,
+            early_data_max_size,
         })
     }
 }
@@ -382,6 +394,12 @@ pub fn load_tls_config_with_client_auth(
     }
     config.session_storage =
         rustls::server::ServerSessionMemoryCache::new(tls_policy.session_cache_size);
+
+    // TLS 1.3 0-RTT early data: explicitly set to 0 (disabled) by default.
+    // When early_data_max_size > 0, the server advertises 0-RTT support in
+    // session tickets, allowing clients to send application data before the
+    // handshake completes on resumed connections.
+    config.max_early_data_size = tls_policy.early_data_max_size;
 
     Ok(Arc::new(config))
 }

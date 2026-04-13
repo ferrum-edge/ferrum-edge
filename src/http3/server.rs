@@ -5,8 +5,10 @@
 //! uses the `Http3ConnectionPool` (h3+quinn) for backend communication.
 //!
 //! QUIC requires TLS 1.3 exclusively (RFC 9001), so the server forces TLS 1.3
-//! and uses a separate ALPN advertisement (`h3`). 0-RTT is disabled for replay
-//! safety, but stateless session ticket resumption is enabled (saves 1 RTT on
+//! and uses a separate ALPN advertisement (`h3`). 0-RTT is controlled by
+//! `FERRUM_TLS_EARLY_DATA_METHODS` — when configured, quinn's `into_0rtt()` is
+//! used to detect early data connections and enforce per-method filtering.
+//! Stateless session ticket resumption is always enabled (saves 1 RTT on
 //! reconnects).
 
 use std::collections::HashMap;
@@ -150,9 +152,12 @@ pub async fn start_http3_listener_with_signal(
     };
 
     server_tls_config.alpn_protocols = vec![b"h3".to_vec()];
-    // 0-RTT is disabled for security: early data is replayable, which is dangerous
-    // for non-idempotent operations proxied through an API gateway.
-    server_tls_config.max_early_data_size = 0;
+    // 0-RTT early data: controlled by FERRUM_TLS_EARLY_DATA_METHODS.
+    // When 0 (default), 0-RTT is disabled — early data is replayable, which is
+    // dangerous for non-idempotent operations proxied through an API gateway.
+    // When non-zero, the gateway accepts 0-RTT and enforces per-method filtering
+    // via quinn's into_0rtt() detection in handle_h3_connection().
+    server_tls_config.max_early_data_size = tls_policy.early_data_max_size;
 
     // Enable TLS 1.3 session resumption for QUIC connections.
     // Stateless tickets allow clients to resume sessions without a full handshake,
@@ -249,7 +254,31 @@ async fn handle_h3_connection(
     connecting: quinn::Incoming,
     state: ProxyState,
 ) -> Result<(), anyhow::Error> {
-    let connection = connecting.await?;
+    let early_data_enabled = !state.early_data_methods.is_empty();
+
+    // When 0-RTT is enabled in the TLS config, attempt to accept early data
+    // via quinn's into_0rtt(). This returns the connection immediately if the
+    // client sent 0-RTT data (before the handshake completes). We track this
+    // per-connection so handle_h3_request can enforce method restrictions.
+    let (connection, is_early_data_conn) = if early_data_enabled {
+        let connecting = connecting.accept()?.into_0rtt();
+        match connecting {
+            Ok((conn, _zero_rtt_accepted)) => {
+                debug!(
+                    "HTTP/3 0-RTT connection accepted from {}",
+                    conn.remote_address()
+                );
+                (conn, true)
+            }
+            Err(connecting) => {
+                // No 0-RTT — fall back to full handshake
+                (connecting.await?, false)
+            }
+        }
+    } else {
+        (connecting.await?, false)
+    };
+
     let remote_addr = connection.remote_address();
     debug!("HTTP/3 connection established from {}", remote_addr);
 
@@ -309,6 +338,7 @@ async fn handle_h3_connection(
                 let cert = client_cert_der.clone();
                 let chain = client_cert_chain_der.clone();
                 let socket_ip = Arc::clone(&socket_ip);
+                let is_early_data = is_early_data_conn;
                 tokio::spawn(async move {
                     match resolver.resolve_request().await {
                         Ok((req, stream)) => {
@@ -320,6 +350,7 @@ async fn handle_h3_connection(
                                 &socket_ip,
                                 cert,
                                 chain,
+                                is_early_data,
                             )
                             .await
                             {
@@ -347,6 +378,7 @@ async fn handle_h3_connection(
 }
 
 /// Handle a single HTTP/3 request stream.
+#[allow(clippy::too_many_arguments)]
 async fn handle_h3_request(
     req: http::Request<()>,
     mut stream: RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
@@ -355,6 +387,7 @@ async fn handle_h3_request(
     socket_ip: &str,
     tls_client_cert_der: Option<Arc<Vec<u8>>>,
     tls_client_cert_chain_der: Option<Arc<Vec<Vec<u8>>>>,
+    is_early_data: bool,
 ) -> Result<(), anyhow::Error> {
     let start_time = std::time::Instant::now();
 
@@ -517,6 +550,27 @@ async fn handle_h3_request(
         .await?;
         return Ok(());
     }
+
+    // Reject disallowed methods on 0-RTT early data connections (RFC 8470).
+    // Early data is replayable, so only operator-configured safe methods are
+    // permitted. Clients receive 425 Too Early and should retry after handshake.
+    if is_early_data && !state.early_data_methods.contains(&method) {
+        warn!(
+            "Rejected HTTP/3 0-RTT request: method {} not in allowed early data methods",
+            method
+        );
+        record_request(&state, 425);
+        send_h3_response(
+            &mut stream,
+            StatusCode::TOO_EARLY,
+            r#"{"error":"Method not allowed in 0-RTT early data"}"#,
+        )
+        .await?;
+        return Ok(());
+    }
+
+    // Set the early data flag on the request context for plugin visibility.
+    ctx.is_early_data = is_early_data;
 
     // Resolve real client IP using trusted proxy configuration.
     // Parse socket IP once upfront to avoid redundant parsing in each branch.

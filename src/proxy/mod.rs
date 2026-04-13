@@ -510,6 +510,11 @@ pub struct ProxyState {
     /// Adaptive buffer size and batch limit tracker for TCP/WS tunnel/UDP.
     /// Tracks EWMA of bytes per connection and datagrams per batch cycle per proxy.
     pub adaptive_buffer: Arc<crate::adaptive_buffer::AdaptiveBufferTracker>,
+    /// HTTP methods allowed as TLS 1.3 0-RTT early data (O(1) lookup).
+    /// Empty = 0-RTT disabled (`max_early_data_size=0`). Non-empty = 0-RTT enabled
+    /// and requests arriving via early data are rejected with 425 Too Early if
+    /// their method is not in this set. Pre-computed at config load time.
+    pub early_data_methods: Arc<std::collections::HashSet<String>>,
 }
 
 impl ProxyState {
@@ -722,6 +727,7 @@ impl ProxyState {
             windowed_metrics: Arc::new(crate::metrics::WindowedMetrics::new(
                 env_config_arc.status_metrics_window_seconds,
             )),
+            early_data_methods: Arc::new(env_config_arc.tls_early_data_methods.clone()),
             env_config: env_config_arc,
             max_header_size_bytes,
             max_single_header_size_bytes,
@@ -3940,6 +3946,41 @@ async fn handle_proxy_request_inner(
             StatusCode::METHOD_NOT_ALLOWED,
             r#"{"error":"CONNECT method is not allowed"}"#,
         ));
+    }
+
+    // TLS 1.3 0-RTT early data enforcement (RFC 8470).
+    // On the HTTPS path, we detect early data via the `Early-Data: 1` header
+    // that upstream proxies/CDNs add per RFC 8470. Direct-client 0-RTT detection
+    // is not possible with the current rustls+tokio-rustls API (the early data
+    // state is consumed during the handshake and not exposed afterwards).
+    // HTTP/3 0-RTT is detected natively via quinn's into_0rtt() in the H3 path.
+    if !state.early_data_methods.is_empty() {
+        // Raw byte comparison avoids UTF-8 validation on the hot path.
+        let is_early_data = req
+            .headers()
+            .get("early-data")
+            .is_some_and(|v| v.as_bytes() == b"1");
+        if is_early_data {
+            ctx.is_early_data = true;
+            if !state.early_data_methods.contains(&method) {
+                let is_grpc = grpc_proxy::is_grpc_request(&req);
+                warn!(
+                    "Rejected 0-RTT request: method {} not in allowed early data methods",
+                    method
+                );
+                record_request(&state, 425);
+                if is_grpc {
+                    return Ok(grpc_proxy::build_grpc_error_response(
+                        grpc_proxy::grpc_status::UNAVAILABLE,
+                        "Method not allowed in 0-RTT early data",
+                    ));
+                }
+                return Ok(build_response(
+                    StatusCode::TOO_EARLY,
+                    r#"{"error":"Method not allowed in 0-RTT early data"}"#,
+                ));
+            }
+        }
     }
 
     // Resolve real client IP using trusted proxy configuration.
