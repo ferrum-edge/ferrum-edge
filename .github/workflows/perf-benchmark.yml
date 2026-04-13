@@ -105,7 +105,7 @@ jobs:
           echo ""
 
           # Parse average steal from the 5 samples
-          AVG_STEAL=$(vmstat 1 6 | tail -n 5 | awk '{sum += $16; n++} END {printf "%.1f", sum/n}')
+          AVG_STEAL=$(vmstat 1 6 | tail -n 5 | awk '{sum += $17; n++} END {printf "%.1f", sum/n}')
           echo "Average CPU steal over 5s: ${AVG_STEAL}%"
           if (( $(echo "$AVG_STEAL > 5.0" | bc -l) )); then
             echo "::warning::CPU steal is ${AVG_STEAL}% — noisy neighbor detected. Benchmark results may be unreliable."
@@ -175,7 +175,7 @@ jobs:
             echo ""
 
             # Quick steal check before each run
-            AVG_STEAL=$(vmstat 1 3 | tail -n 2 | awk '{sum += $16; n++} END {printf "%.1f", sum/n}')
+            AVG_STEAL=$(vmstat 1 3 | tail -n 2 | awk '{sum += $17; n++} END {printf "%.1f", sum/n}')
             echo "Pre-run CPU steal: ${AVG_STEAL}%"
             if (( $(echo "$AVG_STEAL > 5.0" | bc -l) )); then
               echo "::warning::Run ${run}: CPU steal is ${AVG_STEAL}% before starting — noisy neighbor detected"
