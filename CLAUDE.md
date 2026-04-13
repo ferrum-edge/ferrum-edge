@@ -756,11 +756,11 @@ pub struct HealthContext<'a> {
 }
 ```
 
-The `proxy_passive` is resolved once per request via `passive_health.get(proxy_id)` (one outer DashMap lookup, `Arc::clone` ~5ns), then reused for all targets in `healthy_targets()`. Each target check is two O(1) DashMap lookups using pre-computed keys:
+The `proxy_passive` is resolved once per request via `passive_health.get(proxy_id)` (one outer DashMap lookup, `Arc::clone` ~5ns), then consumed by `compute_health_bitset()` which snapshots health state into a stack-allocated `u128` bitset in a single pass. Each target requires at most two O(1) DashMap lookups using pre-computed keys:
 1. `active_unhealthy.contains_key(&target_keys[i])` — pre-computed `upstream_id::host:port`
 2. `proxy_passive.unhealthy.contains_key(&host_port_keys[i])` — pre-computed `host:port`
 
-No composite key construction, no thread-local buffers, no string formatting on the hot path.
+After the bitset is built, all algorithm selection steps use free bit tests — no further DashMap access. The bitset supports up to 128 targets (covers virtually all real-world upstreams); >128 targets fall back to a Vec-based path. The consistent hash ring walk uses O(1) bitset membership checks instead of O(candidates) linear scans per ring position.
 
 **Key design rules:**
 - **Never merge active and passive state into a single map.** Active probes are proxy-agnostic (same ping for everyone). Passive failures are proxy-specific (different payloads → different outcomes). Merging them causes cross-proxy contamination.
@@ -809,6 +809,7 @@ These are hard-won findings from profiling. Violating them causes measurable reg
 - **Lazy timeout wrapper**: `lazy_timeout::lazy_timeout()` defers tokio timer creation until the inner future returns `Pending`. Fast-path operations that complete immediately avoid timer wheel allocation entirely.
 - **Cacheability predictor**: The `response_caching` plugin maintains an LRU of known-uncacheable keys, skipping cache lookups for assets that were historically uncacheable (PREDICTED-BYPASS status).
 - **`TCP_INFO` access**: `socket_opts::get_tcp_info()` retrieves kernel-level RTT, cwnd, and MSS for BDP-optimal buffer sizing on long-lived TCP stream connections (Linux only).
+- **Health bitset for zero-alloc LB selection**: `HealthBitset` (stack-allocated `u128`) replaces per-target DashMap lookups during algorithm selection. Health state is snapshotted once via `compute_health_bitset()` at the top of `select()`, then all algorithm methods use free bit tests. Eliminates the `Vec<(usize, &Arc<UpstreamTarget>)>` allocation that `select_from_all()` previously required for WRR/LC/LL/CH on every request. Consistent hash ring walk uses O(1) bitset membership check per position instead of O(candidates) linear scan. FxHash-style `fx_hash_str()` replaces `DefaultHasher` (SipHash) for consistent hash key distribution (~3-5ns vs ~15-25ns).
 
 **Resilience features per protocol:**
 

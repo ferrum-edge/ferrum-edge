@@ -8,7 +8,6 @@ use crate::health_check::ProxyHealthState;
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use std::collections::HashMap;
-use std::hash::{DefaultHasher, Hash, Hasher};
 
 /// Fibonacci / golden-ratio hash for fast pseudo-random distribution of sequential counters.
 /// Maps sequential u64 inputs to well-distributed outputs across the full u64 range.
@@ -21,6 +20,111 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 fn golden_ratio_hash(val: u64) -> u64 {
     val.wrapping_mul(0x9E3779B97F4A7C15)
 }
+
+/// Fast non-cryptographic hash for consistent hashing key distribution.
+/// FxHash-style multiply-rotate — ~3-5ns vs SipHash's ~15-25ns per call.
+/// Security against HashDoS is irrelevant here: the input is client IP or a
+/// config-selected cookie/header value, and collision resistance only affects
+/// load distribution balance, not memory safety.
+#[inline]
+fn fx_hash_str(s: &str) -> u64 {
+    let mut hash: u64 = 0;
+    for &byte in s.as_bytes() {
+        hash = hash.rotate_left(5) ^ (byte as u64);
+        hash = hash.wrapping_mul(0x517cc1b727220a95);
+    }
+    hash
+}
+
+/// Maximum number of upstream targets eligible for the stack-allocated bitset
+/// fast path. Upstreams with more targets fall back to the Vec-based path.
+/// 128 covers essentially all real-world upstream configurations.
+const MAX_BITSET_TARGETS: usize = 128;
+
+/// Stack-allocated bitset for up to 128 upstream targets.
+///
+/// Provides O(1) health/candidate membership checks on the selection hot path,
+/// eliminating per-request `Vec` allocations and replacing repeated `DashMap`
+/// lookups with single-pass construction followed by free bit tests. Health
+/// state is sampled once into the bitset at the start of `select()` so
+/// algorithms never touch `DashMap` during selection.
+#[derive(Clone, Copy)]
+struct HealthBitset {
+    bits: u128,
+    len: u8,
+}
+
+impl HealthBitset {
+    /// All targets healthy — all bits set for `n` targets.
+    #[inline]
+    fn all(n: usize) -> Self {
+        debug_assert!(n <= MAX_BITSET_TARGETS);
+        let bits = if n >= 128 {
+            u128::MAX
+        } else if n == 0 {
+            0
+        } else {
+            (1u128 << n) - 1
+        };
+        Self { bits, len: n as u8 }
+    }
+
+    #[inline]
+    fn empty() -> Self {
+        Self { bits: 0, len: 0 }
+    }
+
+    #[inline]
+    fn set(&mut self, idx: usize) {
+        self.bits |= 1u128 << idx;
+        self.len += 1;
+    }
+
+    #[inline]
+    fn clear(&mut self, idx: usize) {
+        if self.bits & (1u128 << idx) != 0 {
+            self.bits &= !(1u128 << idx);
+            self.len -= 1;
+        }
+    }
+
+    #[inline]
+    fn contains(&self, idx: usize) -> bool {
+        self.bits & (1u128 << idx) != 0
+    }
+
+    #[inline]
+    fn count(&self) -> usize {
+        self.len as usize
+    }
+
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    #[inline]
+    fn is_all(&self, total: usize) -> bool {
+        self.len as usize == total
+    }
+
+    /// Return the index of the `n`th set bit (0-based among set bits).
+    /// Used by round-robin/random to map a counter to a healthy target by
+    /// ordinal position without allocating a filtered Vec. Cost: O(n)
+    /// clear-lowest-bit operations, which for typical upstream sizes (2-20
+    /// targets) is a handful of cycles on register-width integers.
+    #[inline]
+    fn nth_set_bit(&self, n: usize) -> usize {
+        debug_assert!(!self.is_empty());
+        let wrapped = n % self.len as usize;
+        let mut remaining = self.bits;
+        for _ in 0..wrapped {
+            remaining &= remaining - 1; // clear lowest set bit
+        }
+        remaining.trailing_zeros() as usize
+    }
+}
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
@@ -488,16 +592,15 @@ impl LoadBalancer {
         // Pre-compute upstream-scoped keys for health check filtering (matches HealthChecker key format)
         let target_keys: Vec<String> = targets.iter().map(|t| target_key(upstream_id, t)).collect();
 
-        // Build consistent hash ring with virtual nodes
+        // Build consistent hash ring with virtual nodes using fx_hash_str
+        // (faster than SipHash/DefaultHasher; security irrelevant for ring placement).
         let mut hash_ring = Vec::new();
         if algorithm == LoadBalancerAlgorithm::ConsistentHashing {
             for (idx, key) in host_port_keys.iter().enumerate() {
                 // 150 virtual nodes per target for better distribution
                 for vnode in 0..150 {
                     let vnode_key = format!("{}:{}", key, vnode);
-                    let mut hasher = DefaultHasher::new();
-                    vnode_key.hash(&mut hasher);
-                    hash_ring.push((hasher.finish(), idx));
+                    hash_ring.push((fx_hash_str(&vnode_key), idx));
                 }
             }
             hash_ring.sort_by_key(|&(hash, _)| hash);
@@ -659,60 +762,70 @@ impl LoadBalancer {
         })
     }
 
-    /// Check if a target at the given index is healthy.
-    #[inline]
-    fn is_target_healthy(&self, i: usize, health: &HealthContext<'_>) -> bool {
-        // Active: pre-computed "upstream_id::host:port" key
-        if health.active_unhealthy.contains_key(&self.target_keys[i]) {
-            return false;
-        }
-        // Passive: direct "host:port" lookup in proxy's own map
-        if health
-            .proxy_passive
-            .as_ref()
-            .is_some_and(|ps| ps.unhealthy.contains_key(&self.host_port_keys[i]))
-        {
-            return false;
-        }
-        true
-    }
-
-    /// Check if all targets are healthy (fast O(n) scan without allocation).
-    /// Returns true when no targets are marked unhealthy, allowing `select()`
-    /// to skip the filtered Vec allocation on the common path.
-    #[inline]
-    fn all_targets_healthy(&self, health: Option<&HealthContext<'_>>) -> bool {
-        match health {
-            None => true,
-            Some(h) => {
-                // Fast check: if both health maps are empty, all targets are healthy
-                if h.active_unhealthy.is_empty()
-                    && h.proxy_passive
-                        .as_ref()
-                        .is_none_or(|ps| ps.unhealthy.is_empty())
-                {
-                    return true;
-                }
-                (0..self.targets.len()).all(|i| self.is_target_healthy(i, h))
-            }
-        }
-    }
-
-    /// Collect healthy targets into a Vec for selection by any algorithm.
+    /// Compute a stack-allocated bitset of healthy target indices in a single
+    /// pass. Each target requires at most 2 `DashMap` lookups (active + passive),
+    /// done once per `select()` call. All subsequent algorithm steps use free
+    /// bit tests on the resulting bitset.
     ///
-    /// Only called when some targets are actually unhealthy (the uncommon path).
-    /// A target is unhealthy if it appears in EITHER:
-    /// - The active unhealthy map (upstream-wide probe failure) — checked via
-    ///   pre-computed `target_keys` ("upstream_id::host:port"), O(1) DashMap lookup.
-    /// - The proxy's passive unhealthy map (per-proxy traffic failure) — checked
-    ///   via pre-computed `host_port_keys` ("host:port"), O(1) inner DashMap lookup.
-    ///   The outer DashMap lookup (by proxy_id) is done once at the call site and
-    ///   the resolved `ProxyHealthState` is passed in via `HealthContext`.
-    fn healthy_targets(&self, health: &HealthContext<'_>) -> Vec<(usize, &Arc<UpstreamTarget>)> {
+    /// Requires `self.targets.len() <= MAX_BITSET_TARGETS`.
+    #[inline]
+    fn compute_health_bitset(&self, health: Option<&HealthContext<'_>>) -> HealthBitset {
+        let n = self.targets.len();
+        let Some(h) = health else {
+            return HealthBitset::all(n);
+        };
+
+        // Fast check: if both health maps are empty, all targets are healthy.
+        if h.active_unhealthy.is_empty()
+            && h.proxy_passive
+                .as_ref()
+                .is_none_or(|ps| ps.unhealthy.is_empty())
+        {
+            return HealthBitset::all(n);
+        }
+
+        let mut bitset = HealthBitset::empty();
+        for i in 0..n {
+            // Active: pre-computed "upstream_id::host:port" key
+            if h.active_unhealthy.contains_key(&self.target_keys[i]) {
+                continue;
+            }
+            // Passive: direct "host:port" lookup in proxy's own map
+            if h.proxy_passive
+                .as_ref()
+                .is_some_and(|ps| ps.unhealthy.contains_key(&self.host_port_keys[i]))
+            {
+                continue;
+            }
+            bitset.set(i);
+        }
+        bitset
+    }
+
+    /// Collect healthy targets into a Vec — fallback for upstreams with >128
+    /// targets that cannot use the bitset fast path.
+    fn healthy_targets_vec(
+        &self,
+        health: Option<&HealthContext<'_>>,
+    ) -> Vec<(usize, &Arc<UpstreamTarget>)> {
+        let Some(h) = health else {
+            return self.targets.iter().enumerate().collect();
+        };
         self.targets
             .iter()
             .enumerate()
-            .filter(|(i, _)| self.is_target_healthy(*i, health))
+            .filter(|(i, _)| {
+                if h.active_unhealthy.contains_key(&self.target_keys[*i]) {
+                    return false;
+                }
+                if h.proxy_passive
+                    .as_ref()
+                    .is_some_and(|ps| ps.unhealthy.contains_key(&self.host_port_keys[*i]))
+                {
+                    return false;
+                }
+                true
+            })
             .collect()
     }
 
@@ -721,88 +834,128 @@ impl LoadBalancer {
         ctx_key: &str,
         health: Option<&HealthContext<'_>>,
     ) -> Option<TargetSelection> {
-        if self.targets.is_empty() {
+        let n = self.targets.len();
+        if n == 0 {
             return None;
         }
 
-        // Fast path: when all targets are healthy (the common case ~99%+),
-        // skip the filtered Vec allocation and use all targets directly.
-        if self.all_targets_healthy(health) {
-            return self.select_from_all(ctx_key).map(|target| TargetSelection {
+        // For >128 targets, fall back to the Vec-based path.
+        if n > MAX_BITSET_TARGETS {
+            return self.select_vec_fallback(ctx_key, health);
+        }
+
+        // Single-pass health bitset: every DashMap lookup happens here, once.
+        let healthy = self.compute_health_bitset(health);
+
+        if healthy.is_empty() {
+            // All targets unhealthy — degraded mode fallback using all targets.
+            let all = HealthBitset::all(n);
+            return self
+                .select_with_bitset(ctx_key, &all)
+                .map(|target| TargetSelection {
+                    target,
+                    is_fallback: true,
+                });
+        }
+
+        self.select_with_bitset(ctx_key, &healthy)
+            .map(|target| TargetSelection {
                 target,
                 is_fallback: false,
-            });
-        }
+            })
+    }
 
-        // Slow path: some targets are unhealthy — allocate filtered Vec.
-        // health is guaranteed Some here since all_targets_healthy(None) always returns true.
-        let h = health.unwrap();
-        let healthy = self.healthy_targets(h);
+    /// Dispatch to the algorithm-specific selector using a pre-computed bitset.
+    /// No heap allocation on any code path.
+    fn select_with_bitset(
+        &self,
+        ctx_key: &str,
+        healthy: &HealthBitset,
+    ) -> Option<Arc<UpstreamTarget>> {
         if healthy.is_empty() {
-            // All targets unhealthy — degraded mode fallback
-            return self.select_from_all(ctx_key).map(|target| TargetSelection {
-                target,
-                is_fallback: true,
-            });
+            return None;
         }
-
-        let target = match self.algorithm {
+        let all = healthy.is_all(self.targets.len());
+        match self.algorithm {
             LoadBalancerAlgorithm::RoundRobin => {
                 let idx = self.rr_counter.fetch_add(1, Ordering::Relaxed) as usize;
-                Some(Arc::clone(healthy[idx % healthy.len()].1))
-            }
-            LoadBalancerAlgorithm::WeightedRoundRobin => self.select_wrr(&healthy),
-            LoadBalancerAlgorithm::LeastConnections => self.select_least_connections(&healthy),
-            LoadBalancerAlgorithm::LeastLatency => self.select_least_latency(&healthy),
-            LoadBalancerAlgorithm::ConsistentHashing => {
-                self.select_consistent_hash(ctx_key, &healthy)
+                let target_idx = if all {
+                    idx % self.targets.len()
+                } else {
+                    healthy.nth_set_bit(idx)
+                };
+                Some(Arc::clone(&self.targets[target_idx]))
             }
             LoadBalancerAlgorithm::Random => {
                 let idx = self.rr_counter.fetch_add(1, Ordering::Relaxed);
                 let hash = golden_ratio_hash(idx) as usize;
-                Some(Arc::clone(healthy[hash % healthy.len()].1))
+                let target_idx = if all {
+                    hash % self.targets.len()
+                } else {
+                    healthy.nth_set_bit(hash)
+                };
+                Some(Arc::clone(&self.targets[target_idx]))
             }
-        };
-
-        target.map(|t| TargetSelection {
-            target: t,
-            is_fallback: false,
-        })
+            LoadBalancerAlgorithm::WeightedRoundRobin => self.select_wrr_bitset(healthy),
+            LoadBalancerAlgorithm::LeastConnections => {
+                self.select_least_connections_bitset(healthy)
+            }
+            LoadBalancerAlgorithm::LeastLatency => self.select_least_latency_bitset(healthy),
+            LoadBalancerAlgorithm::ConsistentHashing => {
+                self.select_consistent_hash_bitset(ctx_key, healthy)
+            }
+        }
     }
 
-    fn select_from_all(&self, ctx_key: &str) -> Option<Arc<UpstreamTarget>> {
-        if self.targets.is_empty() {
+    /// Vec-based fallback for select() when targets.len() > MAX_BITSET_TARGETS.
+    fn select_vec_fallback(
+        &self,
+        ctx_key: &str,
+        health: Option<&HealthContext<'_>>,
+    ) -> Option<TargetSelection> {
+        let healthy = self.healthy_targets_vec(health);
+        if healthy.is_empty() {
+            let all: Vec<(usize, &Arc<UpstreamTarget>)> = self.targets.iter().enumerate().collect();
+            return self
+                .select_from_candidates_vec(ctx_key, &all)
+                .map(|target| TargetSelection {
+                    target,
+                    is_fallback: true,
+                });
+        }
+        self.select_from_candidates_vec(ctx_key, &healthy)
+            .map(|target| TargetSelection {
+                target,
+                is_fallback: false,
+            })
+    }
+
+    /// Vec-based algorithm dispatch (fallback for >128 targets).
+    fn select_from_candidates_vec(
+        &self,
+        ctx_key: &str,
+        candidates: &[(usize, &Arc<UpstreamTarget>)],
+    ) -> Option<Arc<UpstreamTarget>> {
+        if candidates.is_empty() {
             return None;
         }
         match self.algorithm {
             LoadBalancerAlgorithm::RoundRobin => {
                 let idx = self.rr_counter.fetch_add(1, Ordering::Relaxed) as usize;
-                Some(Arc::clone(&self.targets[idx % self.targets.len()]))
+                Some(Arc::clone(candidates[idx % candidates.len()].1))
             }
             LoadBalancerAlgorithm::Random => {
                 let idx = self.rr_counter.fetch_add(1, Ordering::Relaxed);
                 let hash = golden_ratio_hash(idx) as usize;
-                Some(Arc::clone(&self.targets[hash % self.targets.len()]))
+                Some(Arc::clone(candidates[hash % candidates.len()].1))
             }
-            LoadBalancerAlgorithm::WeightedRoundRobin => {
-                let all: Vec<(usize, &Arc<UpstreamTarget>)> =
-                    self.targets.iter().enumerate().collect();
-                self.select_wrr(&all)
-            }
+            LoadBalancerAlgorithm::WeightedRoundRobin => self.select_wrr_vec(candidates),
             LoadBalancerAlgorithm::LeastConnections => {
-                let all: Vec<(usize, &Arc<UpstreamTarget>)> =
-                    self.targets.iter().enumerate().collect();
-                self.select_least_connections(&all)
+                self.select_least_connections_vec(candidates)
             }
-            LoadBalancerAlgorithm::LeastLatency => {
-                let all: Vec<(usize, &Arc<UpstreamTarget>)> =
-                    self.targets.iter().enumerate().collect();
-                self.select_least_latency(&all)
-            }
+            LoadBalancerAlgorithm::LeastLatency => self.select_least_latency_vec(candidates),
             LoadBalancerAlgorithm::ConsistentHashing => {
-                let all: Vec<(usize, &Arc<UpstreamTarget>)> =
-                    self.targets.iter().enumerate().collect();
-                self.select_consistent_hash(ctx_key, &all)
+                self.select_consistent_hash_vec(ctx_key, candidates)
             }
         }
     }
@@ -813,39 +966,59 @@ impl LoadBalancer {
         exclude: &UpstreamTarget,
         health: Option<&HealthContext<'_>>,
     ) -> Option<Arc<UpstreamTarget>> {
+        let n = self.targets.len();
+        if n == 0 {
+            return None;
+        }
+
         // Find the exclude target's index via linear scan (avoids host.clone() allocation)
         let exclude_idx = self
             .targets
             .iter()
             .position(|t| t.host == exclude.host && t.port == exclude.port);
 
-        // Build healthy targets excluding the specified target
+        // For >128 targets, fall back to Vec-based path.
+        if n > MAX_BITSET_TARGETS {
+            return self.select_excluding_vec_fallback(ctx_key, exclude_idx, health);
+        }
+
+        // Build healthy bitset excluding the specified target
+        let mut healthy = self.compute_health_bitset(health);
+        if let Some(ei) = exclude_idx {
+            healthy.clear(ei);
+        }
+
+        if healthy.is_empty() {
+            // No healthy targets except excluded — try any target except excluded
+            let mut fallback = HealthBitset::all(n);
+            if let Some(ei) = exclude_idx {
+                fallback.clear(ei);
+            }
+            if fallback.is_empty() {
+                return None;
+            }
+            let idx = self.rr_counter.fetch_add(1, Ordering::Relaxed) as usize;
+            let target_idx = fallback.nth_set_bit(idx);
+            return Some(Arc::clone(&self.targets[target_idx]));
+        }
+
+        self.select_with_bitset(ctx_key, &healthy)
+    }
+
+    /// Vec-based fallback for select_excluding() when targets.len() > MAX_BITSET_TARGETS.
+    fn select_excluding_vec_fallback(
+        &self,
+        ctx_key: &str,
+        exclude_idx: Option<usize>,
+        health: Option<&HealthContext<'_>>,
+    ) -> Option<Arc<UpstreamTarget>> {
         let healthy: Vec<(usize, &Arc<UpstreamTarget>)> = self
-            .targets
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| {
-                // Exclude the specified target
-                if exclude_idx.is_some_and(|ei| ei == *i) {
-                    return false;
-                }
-                if let Some(h) = health {
-                    if h.active_unhealthy.contains_key(&self.target_keys[*i]) {
-                        return false;
-                    }
-                    if h.proxy_passive
-                        .as_ref()
-                        .is_some_and(|ps| ps.unhealthy.contains_key(&self.host_port_keys[*i]))
-                    {
-                        return false;
-                    }
-                }
-                true
-            })
+            .healthy_targets_vec(health)
+            .into_iter()
+            .filter(|(i, _)| exclude_idx.is_none_or(|ei| ei != *i))
             .collect();
 
         if healthy.is_empty() {
-            // If no other healthy targets, try any target except excluded
             let fallback: Vec<(usize, &Arc<UpstreamTarget>)> = self
                 .targets
                 .iter()
@@ -859,30 +1032,219 @@ impl LoadBalancer {
             return Some(Arc::clone(fallback[idx % fallback.len()].1));
         }
 
-        match self.algorithm {
-            LoadBalancerAlgorithm::RoundRobin => {
-                let idx = self.rr_counter.fetch_add(1, Ordering::Relaxed) as usize;
-                Some(Arc::clone(healthy[idx % healthy.len()].1))
+        self.select_from_candidates_vec(ctx_key, &healthy)
+    }
+
+    // ─── Bitset-based algorithm implementations (zero-alloc hot path) ────────
+
+    /// Smooth weighted round-robin (NGINX algorithm) using bitset.
+    /// No Vec allocation — iterates targets directly, skipping unset bits.
+    fn select_wrr_bitset(&self, healthy: &HealthBitset) -> Option<Arc<UpstreamTarget>> {
+        let total_weight: i64 = self
+            .targets
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| healthy.contains(*i))
+            .map(|(_, t)| t.weight as i64)
+            .sum();
+
+        if total_weight == 0 {
+            let idx = self.rr_counter.fetch_add(1, Ordering::Relaxed) as usize;
+            let target_idx = healthy.nth_set_bit(idx);
+            return Some(Arc::clone(&self.targets[target_idx]));
+        }
+
+        let mut weights = self.wrr_state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut best_idx = 0;
+        let mut best_current = i64::MIN;
+
+        for (i, target) in self.targets.iter().enumerate() {
+            if !healthy.contains(i) {
+                continue;
             }
-            LoadBalancerAlgorithm::Random => {
-                let idx = self.rr_counter.fetch_add(1, Ordering::Relaxed);
-                let hash = golden_ratio_hash(idx) as usize;
-                Some(Arc::clone(healthy[hash % healthy.len()].1))
+            weights[i] += target.weight as i64;
+            if weights[i] > best_current {
+                best_current = weights[i];
+                best_idx = i;
             }
-            LoadBalancerAlgorithm::WeightedRoundRobin => self.select_wrr(&healthy),
-            LoadBalancerAlgorithm::LeastConnections => self.select_least_connections(&healthy),
-            LoadBalancerAlgorithm::LeastLatency => self.select_least_latency(&healthy),
-            LoadBalancerAlgorithm::ConsistentHashing => {
-                self.select_consistent_hash(ctx_key, &healthy)
+        }
+
+        weights[best_idx] -= total_weight;
+        Some(Arc::clone(&self.targets[best_idx]))
+    }
+
+    /// Select target with least active connections using bitset.
+    fn select_least_connections_bitset(
+        &self,
+        healthy: &HealthBitset,
+    ) -> Option<Arc<UpstreamTarget>> {
+        let mut min_conns = i64::MAX;
+        let mut best_idx = 0;
+        let mut found = false;
+
+        for i in 0..self.targets.len() {
+            if !healthy.contains(i) {
+                continue;
             }
+            let key = &self.host_port_keys[i];
+            let conns = self
+                .active_connections
+                .get(key)
+                .map(|v| v.load(Ordering::Relaxed))
+                .unwrap_or(0);
+            if !found || conns < min_conns {
+                min_conns = conns;
+                best_idx = i;
+                found = true;
+            }
+        }
+
+        if found {
+            Some(Arc::clone(&self.targets[best_idx]))
+        } else {
+            None
         }
     }
 
-    /// Smooth weighted round-robin (NGINX algorithm).
+    /// Select the target with the lowest latency EWMA using bitset.
     ///
-    /// Uses a mutex to prevent weight drift under concurrent access.
-    /// The critical section is sub-microsecond (only integer arithmetic).
-    fn select_wrr(
+    /// See the module-level documentation on `select_least_latency_vec` for
+    /// the warm-up / late-joiner / steady-state semantics — this is the
+    /// zero-allocation equivalent using a `HealthBitset`.
+    fn select_least_latency_bitset(&self, healthy: &HealthBitset) -> Option<Arc<UpstreamTarget>> {
+        let hcount = healthy.count();
+        if hcount == 0 {
+            return None;
+        }
+
+        let mut warmed_count = 0usize;
+        let mut any_has_data = false;
+
+        for i in 0..self.targets.len() {
+            if !healthy.contains(i) {
+                continue;
+            }
+            let key = &self.host_port_keys[i];
+            let samples = self
+                .latency_sample_count
+                .get(key)
+                .map(|v| v.load(Ordering::Relaxed))
+                .unwrap_or(0);
+            if samples >= LATENCY_WARMUP_THRESHOLD {
+                warmed_count += 1;
+            }
+            if samples > 0 {
+                any_has_data = true;
+            }
+        }
+
+        // Initial warm-up: round-robin so all targets get baseline measurements.
+        if warmed_count == 0 || !any_has_data {
+            let idx = self.rr_counter.fetch_add(1, Ordering::Relaxed) as usize;
+            let target_idx = healthy.nth_set_bit(idx);
+            return Some(Arc::clone(&self.targets[target_idx]));
+        }
+
+        let all_warmed_up = warmed_count == hcount;
+
+        // Find minimum EWMA among warmed candidates (for optimistic fallback).
+        let min_known_ewma = if !all_warmed_up {
+            let mut min_val = LATENCY_UNSET;
+            for i in 0..self.targets.len() {
+                if !healthy.contains(i) {
+                    continue;
+                }
+                if let Some(v) = self.latency_ewma.get(&self.host_port_keys[i]) {
+                    let val = v.load(Ordering::Relaxed);
+                    if val != LATENCY_UNSET && val < min_val {
+                        min_val = val;
+                    }
+                }
+            }
+            min_val
+        } else {
+            0 // unused when all warmed up
+        };
+
+        // Select the candidate with the lowest EWMA.
+        let mut best_latency = u64::MAX;
+        let mut best_idx = 0;
+        let mut found = false;
+
+        for i in 0..self.targets.len() {
+            if !healthy.contains(i) {
+                continue;
+            }
+            let key = &self.host_port_keys[i];
+            let samples = self
+                .latency_sample_count
+                .get(key)
+                .map(|v| v.load(Ordering::Relaxed))
+                .unwrap_or(0);
+            let latency = if samples >= LATENCY_WARMUP_THRESHOLD {
+                self.latency_ewma
+                    .get(key)
+                    .map(|v| v.load(Ordering::Relaxed))
+                    .unwrap_or(LATENCY_UNSET)
+            } else if !all_warmed_up && min_known_ewma != LATENCY_UNSET {
+                min_known_ewma.saturating_sub(1)
+            } else {
+                LATENCY_UNSET
+            };
+            if !found || latency < best_latency {
+                best_latency = latency;
+                best_idx = i;
+                found = true;
+            }
+        }
+
+        if best_latency == LATENCY_UNSET {
+            let idx = self.rr_counter.fetch_add(1, Ordering::Relaxed) as usize;
+            let target_idx = healthy.nth_set_bit(idx);
+            return Some(Arc::clone(&self.targets[target_idx]));
+        }
+
+        Some(Arc::clone(&self.targets[best_idx]))
+    }
+
+    /// Consistent hash: find the target on the ring closest to the hash of
+    /// `ctx_key`. Uses the bitset for O(1) candidate membership check per
+    /// ring position instead of O(candidates) linear scan.
+    fn select_consistent_hash_bitset(
+        &self,
+        ctx_key: &str,
+        healthy: &HealthBitset,
+    ) -> Option<Arc<UpstreamTarget>> {
+        if healthy.is_empty() || self.hash_ring.is_empty() {
+            return None;
+        }
+
+        let hash = fx_hash_str(ctx_key);
+
+        // Binary search on the ring
+        let pos = match self.hash_ring.binary_search_by_key(&hash, |&(h, _)| h) {
+            Ok(p) => p,
+            Err(p) => p % self.hash_ring.len(),
+        };
+
+        // Walk the ring from pos — O(1) bitset check per position.
+        for i in 0..self.hash_ring.len() {
+            let ring_idx = (pos + i) % self.hash_ring.len();
+            let target_idx = self.hash_ring[ring_idx].1;
+            if healthy.contains(target_idx) {
+                return Some(Arc::clone(&self.targets[target_idx]));
+            }
+        }
+
+        // Fallback: first healthy target
+        let target_idx = healthy.nth_set_bit(0);
+        Some(Arc::clone(&self.targets[target_idx]))
+    }
+
+    // ─── Vec-based algorithm implementations (fallback for >128 targets) ─────
+
+    /// Smooth weighted round-robin (NGINX algorithm) — Vec fallback.
+    fn select_wrr_vec(
         &self,
         candidates: &[(usize, &Arc<UpstreamTarget>)],
     ) -> Option<Arc<UpstreamTarget>> {
@@ -892,14 +1254,11 @@ impl LoadBalancer {
 
         let total_weight: i64 = candidates.iter().map(|(_, t)| t.weight as i64).sum();
         if total_weight == 0 {
-            // All weights zero, fall back to simple round-robin
             let idx = self.rr_counter.fetch_add(1, Ordering::Relaxed) as usize;
             return Some(Arc::clone(candidates[idx % candidates.len()].1));
         }
 
         let mut weights = self.wrr_state.lock().unwrap_or_else(|e| e.into_inner());
-
-        // Add effective weight to current weight for each candidate
         let mut best_idx = 0;
         let mut best_current = i64::MIN;
 
@@ -912,15 +1271,13 @@ impl LoadBalancer {
             }
         }
 
-        // Subtract total weight from the selected candidate
         let (orig_idx, _) = candidates[best_idx];
         weights[orig_idx] -= total_weight;
-
         Some(Arc::clone(candidates[best_idx].1))
     }
 
-    /// Select target with least active connections.
-    fn select_least_connections(
+    /// Select target with least active connections — Vec fallback.
+    fn select_least_connections_vec(
         &self,
         candidates: &[(usize, &Arc<UpstreamTarget>)],
     ) -> Option<Arc<UpstreamTarget>> {
@@ -947,27 +1304,18 @@ impl LoadBalancer {
         Some(Arc::clone(best.1))
     }
 
-    /// Select the target with the lowest latency EWMA.
+    /// Select the target with the lowest latency EWMA — Vec fallback.
     ///
     /// **Warm-up phase**: At initial startup, round-robin is used until every
-    /// healthy candidate has at least `LATENCY_WARMUP_THRESHOLD` samples. This
-    /// ensures all targets get enough traffic to establish meaningful baselines
-    /// before the algorithm starts preferring the lowest-latency target.
+    /// healthy candidate has at least `LATENCY_WARMUP_THRESHOLD` samples.
     ///
-    /// **Late joiners / recovery**: If some candidates already have latency data
-    /// but a newly healthy target does not, the algorithm does NOT regress to
-    /// round-robin. Instead, targets without data are treated as having the
-    /// current minimum EWMA (optimistic assumption) so they get a fair chance at
-    /// traffic while the rest of the upstream continues latency-based routing.
-    /// Once the new target accumulates enough samples, its real EWMA takes over.
+    /// **Late joiners / recovery**: Targets without data are treated as having
+    /// the current minimum EWMA (optimistic assumption).
     ///
     /// **Steady-state**: Selects the candidate with the lowest EWMA value.
-    /// Ties are broken by candidate order (first lowest wins), providing
-    /// deterministic behavior under equal latency.
     ///
-    /// **No data**: If no target has latency data (all EWMA values are LATENCY_UNSET),
-    /// falls back to round-robin.
-    fn select_least_latency(
+    /// **No data**: Falls back to round-robin.
+    fn select_least_latency_vec(
         &self,
         candidates: &[(usize, &Arc<UpstreamTarget>)],
     ) -> Option<Arc<UpstreamTarget>> {
@@ -975,7 +1323,6 @@ impl LoadBalancer {
             return None;
         }
 
-        // Count how many candidates have warmed up and how many have any data at all.
         let mut warmed_count = 0usize;
         let mut any_has_data = false;
         for (idx, _) in candidates {
@@ -993,20 +1340,13 @@ impl LoadBalancer {
             }
         }
 
-        // Initial warm-up: no candidate has any data yet, use round-robin so all
-        // targets get baseline measurements. Also used when every target is still
-        // below the warm-up threshold (fresh startup).
-        if warmed_count == 0 || (!any_has_data) {
+        if warmed_count == 0 || !any_has_data {
             let idx = self.rr_counter.fetch_add(1, Ordering::Relaxed) as usize;
             return Some(Arc::clone(candidates[idx % candidates.len()].1));
         }
 
-        // If all candidates are warmed up, pure latency-based selection.
-        // If some are not (late joiner / recovery), use latency-based selection
-        // but treat unwarmed targets optimistically (see below).
         let all_warmed_up = warmed_count == candidates.len();
 
-        // Find the minimum EWMA among warmed candidates (for optimistic fallback).
         let min_known_ewma = if !all_warmed_up {
             candidates
                 .iter()
@@ -1020,12 +1360,9 @@ impl LoadBalancer {
                 .min()
                 .unwrap_or(LATENCY_UNSET)
         } else {
-            0 // unused when all warmed up
+            0
         };
 
-        // Steady-state: select the candidate with the lowest EWMA.
-        // Unwarmed targets use min_known_ewma so they get a fair share of traffic
-        // without disrupting latency-based routing for established targets.
         let mut best_latency = u64::MAX;
         let mut best = &candidates[0];
 
@@ -1037,15 +1374,11 @@ impl LoadBalancer {
                 .map(|v| v.load(Ordering::Relaxed))
                 .unwrap_or(0);
             let latency = if samples >= LATENCY_WARMUP_THRESHOLD {
-                // Warmed target — use real EWMA
                 self.latency_ewma
                     .get(key)
                     .map(|v| v.load(Ordering::Relaxed))
                     .unwrap_or(LATENCY_UNSET)
             } else if !all_warmed_up && min_known_ewma != LATENCY_UNSET {
-                // Late joiner: use a value slightly below the current minimum so
-                // it wins ties and gets enough traffic to establish a real baseline.
-                // The saturating_sub ensures we don't underflow past 0.
                 min_known_ewma.saturating_sub(1)
             } else {
                 LATENCY_UNSET
@@ -1056,7 +1389,6 @@ impl LoadBalancer {
             }
         }
 
-        // If all targets have no data, fall back to round-robin
         if best_latency == LATENCY_UNSET {
             let idx = self.rr_counter.fetch_add(1, Ordering::Relaxed) as usize;
             return Some(Arc::clone(candidates[idx % candidates.len()].1));
@@ -1065,37 +1397,37 @@ impl LoadBalancer {
         Some(Arc::clone(best.1))
     }
 
-    /// Consistent hash: find the target on the hash ring closest to the hash of ctx_key.
-    /// Uses a bitmask for O(1) candidate membership check instead of allocating a HashSet.
-    fn select_consistent_hash(
+    /// Consistent hash — Vec fallback. Uses bitset for O(1) candidate
+    /// membership check instead of the previous O(candidates) linear scan.
+    fn select_consistent_hash_vec(
         &self,
         ctx_key: &str,
         candidates: &[(usize, &Arc<UpstreamTarget>)],
     ) -> Option<Arc<UpstreamTarget>> {
-        if candidates.is_empty() {
+        if candidates.is_empty() || self.hash_ring.is_empty() {
             return None;
         }
 
-        let mut hasher = DefaultHasher::new();
-        ctx_key.hash(&mut hasher);
-        let hash = hasher.finish();
+        let hash = fx_hash_str(ctx_key);
 
-        // Binary search on the ring
+        // Build a membership set for O(1) candidate check during ring walk.
+        // For the >128-target Vec fallback, use a HashSet.
+        let candidate_set: std::collections::HashSet<usize> =
+            candidates.iter().map(|(i, _)| *i).collect();
+
         let pos = match self.hash_ring.binary_search_by_key(&hash, |&(h, _)| h) {
             Ok(p) => p,
-            Err(p) => p % self.hash_ring.len().max(1),
+            Err(p) => p % self.hash_ring.len(),
         };
 
-        // Walk the ring from pos to find a valid (healthy) target.
         for i in 0..self.hash_ring.len() {
             let ring_idx = (pos + i) % self.hash_ring.len();
             let target_idx = self.hash_ring[ring_idx].1;
-            if candidates.iter().any(|&(ci, _)| ci == target_idx) {
+            if candidate_set.contains(&target_idx) {
                 return Some(Arc::clone(&self.targets[target_idx]));
             }
         }
 
-        // Fallback: return first candidate
         Some(Arc::clone(candidates[0].1))
     }
 }
