@@ -292,7 +292,7 @@ impl Plugin for BodySuffixPlugin {
 async fn test_multi_auth_accepts_external_identity_without_consumer() {
     let external: Arc<dyn Plugin> = Arc::new(ExternalIdentityAuth);
     let rejecting: Arc<dyn Plugin> = Arc::new(RejectingAuth);
-    let auth_plugins = vec![&external, &rejecting];
+    let auth_plugins: Vec<Arc<dyn Plugin>> = vec![external, rejecting];
     let consumer_index = ConsumerIndex::new(&[]);
     let mut ctx = RequestContext::new(
         "127.0.0.1".to_string(),
