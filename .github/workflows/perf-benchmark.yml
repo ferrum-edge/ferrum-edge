@@ -4,10 +4,10 @@
 # results to the GitHub Actions step summary.  Triggered manually via
 # workflow_dispatch so it can target any branch or PR.
 #
-# Each run executes the benchmark suite 3 times to identify outliers caused
-# by noisy-neighbor effects on shared GitHub runners.  A pre-benchmark
-# health check logs CPU steal, scheduler jitter, and memory to quantify
-# runner impairment.
+# Each run executes the benchmark suite a configurable number of times
+# (1-3, default 1) to optionally identify outliers caused by noisy-neighbor
+# effects on shared GitHub runners.  A pre-benchmark health check logs CPU
+# steal, scheduler jitter, and memory to quantify runner impairment.
 #
 # Usage:
 #   - Go to Actions → "Multi Protocol Performance Benchmark" → "Run workflow"
@@ -39,6 +39,15 @@ on:
         required: false
         default: "all"
         type: string
+      iterations:
+        description: "Number of benchmark iterations (1-3)"
+        required: false
+        default: "1"
+        type: choice
+        options:
+          - "1"
+          - "2"
+          - "3"
       build_profile:
         description: "Cargo build profile for gateway binary"
         required: false
@@ -177,13 +186,14 @@ jobs:
           cp "tests/performance/multi_protocol/target/${PROFILE_DIR}/proto_backend" tests/performance/multi_protocol/target/release/proto_backend
           cp "tests/performance/multi_protocol/target/${PROFILE_DIR}/proto_bench" tests/performance/multi_protocol/target/release/proto_bench
 
-      - name: Run benchmark suite (3 iterations)
+      - name: Run benchmark suite (${{ inputs.iterations }} iteration(s))
         timeout-minutes: 45
         run: |
-          for run in 1 2 3; do
+          ITERATIONS=${{ inputs.iterations }}
+          for run in $(seq 1 "$ITERATIONS"); do
             echo ""
             echo "============================================"
-            echo "  BENCHMARK RUN ${run}/3"
+            echo "  BENCHMARK RUN ${run}/${ITERATIONS}"
             echo "============================================"
             echo ""
 
@@ -204,20 +214,22 @@ jobs:
               --json 2>&1 | tee /tmp/bench_output_run${run}.txt
 
             echo ""
-            echo "Run ${run}/3 complete."
+            echo "Run ${run}/${ITERATIONS} complete."
           done
 
           echo ""
           echo "============================================"
-          echo "  ALL 3 BENCHMARK RUNS COMPLETE"
+          echo "  ALL ${ITERATIONS} BENCHMARK RUN(S) COMPLETE"
           echo "============================================"
 
       - name: Collect JSON results
         if: always()
+        env:
+          NUM_ITERATIONS: ${{ inputs.iterations }}
         run: |
           mkdir -p benchmark-results
 
-          # Collect results from all 3 runs into separate files and a combined file.
+          # Collect results from all runs into separate files and a combined file.
           # The --json flag makes each proto_bench invocation print pretty-printed
           # multi-line JSON objects interleaved with shell log lines.  Use
           # json.JSONDecoder.raw_decode to extract complete objects from the stream.
@@ -243,8 +255,9 @@ jobs:
                       i = idx + 1
               return blobs
 
+          num_iterations = int(os.environ.get("NUM_ITERATIONS", "1"))
           all_runs = {}
-          for run in range(1, 4):
+          for run in range(1, num_iterations + 1):
               blobs = extract_json_blobs(f"/tmp/bench_output_run{run}.txt")
               all_runs[f"run_{run}"] = blobs
               # Save per-run results
@@ -260,6 +273,8 @@ jobs:
 
       - name: Post benchmark summary
         if: always()
+        env:
+          NUM_ITERATIONS: ${{ inputs.iterations }}
         run: |
           python3 - benchmark-results/results.json <<'PYEOF'
           import json, sys, os, math
@@ -311,11 +326,13 @@ jobs:
 
           lines = []
           lines.append("## Multi Protocol Performance Benchmark Results\n")
+          num_iterations = int(os.environ.get("NUM_ITERATIONS", "1"))
+
           lines.append(f"**Profile:** `${{ inputs.build_profile }}` | "
                        f"**Duration:** ${{ inputs.duration }}s | "
                        f"**Concurrency:** ${{ inputs.concurrency }} | "
                        f"**Protocols:** ${{ inputs.protocols }} | "
-                       f"**Iterations:** 3\n")
+                       f"**Iterations:** {num_iterations}\n")
 
           # Per-run tables
           for run_key in sorted(runs.keys()):
@@ -346,9 +363,9 @@ jobs:
                       f"| {gw.get('total_errors', 0)} |"
                   )
 
-          # Cross-run comparison & outlier detection
+          # Cross-run comparison & outlier detection (only meaningful with 2+ runs)
           # Collect gateway RPS per protocol across runs
-          proto_rps = {}  # proto -> [rps_run1, rps_run2, rps_run3]
+          proto_rps = {}  # proto -> [rps_run1, ...]
           for run_key in sorted(runs.keys()):
               pairs = group_benchmarks(runs[run_key])
               for proto, p in pairs.items():
@@ -357,11 +374,12 @@ jobs:
                       proto_rps[proto] = []
                   proto_rps[proto].append(gw_rps)
 
-          if proto_rps:
+          if proto_rps and num_iterations > 1:
               lines.append("\n### Cross-Run Comparison (Gateway RPS)\n")
-              run_headers = " | ".join(f"Run {i+1}" for i in range(3))
+              run_headers = " | ".join(f"Run {i+1}" for i in range(num_iterations))
+              run_separators = "--------|" * num_iterations
               lines.append(f"| Protocol | {run_headers} | Mean | Stdev | CV% | Outlier? |")
-              lines.append(f"|----------|{'--------|' * 3}------|-------|-----|----------|")
+              lines.append(f"|----------|{run_separators}------|-------|-----|----------|")
 
               for proto in sorted(proto_rps.keys()):
                   vals = proto_rps[proto]
@@ -378,8 +396,8 @@ jobs:
                   outlier = "⚠️ YES" if cv > 15 else "No"
 
                   rps_cells = " | ".join(fmt_rps(v) for v in vals)
-                  # Pad if fewer than 3 runs
-                  while len(vals) < 3:
+                  # Pad if fewer than expected runs
+                  while len(vals) < num_iterations:
                       rps_cells += " | N/A"
                       vals.append(0)
 

@@ -4,10 +4,10 @@
 # results to the GitHub Actions step summary.  Triggered manually via
 # workflow_dispatch so it can target any branch or PR.
 #
-# Each run executes the benchmark suite 3 times to identify outliers caused
-# by noisy-neighbor effects on shared GitHub runners.  A pre-benchmark
-# health check logs CPU steal, scheduler jitter, and memory to quantify
-# runner impairment.
+# Each run executes the benchmark suite a configurable number of times
+# (1-3, default 1) to optionally identify outliers caused by noisy-neighbor
+# effects on shared GitHub runners.  A pre-benchmark health check logs CPU
+# steal, scheduler jitter, and memory to quantify runner impairment.
 #
 # Usage:
 #   - Go to Actions -> "Payload Size Performance Benchmark" -> "Run workflow"
@@ -39,6 +39,15 @@ on:
         required: false
         default: "10kb,50kb,100kb,1mb,5mb,9mb"
         type: string
+      iterations:
+        description: "Number of benchmark iterations (1-3)"
+        required: false
+        default: "1"
+        type: choice
+        options:
+          - "1"
+          - "2"
+          - "3"
       build_profile:
         description: "Cargo build profile for gateway binary"
         required: false
@@ -169,13 +178,14 @@ jobs:
           cp "tests/performance/payload_size/target/${{ inputs.build_profile }}/payload_backend" tests/performance/payload_size/target/release/payload_backend
           cp "tests/performance/payload_size/target/${{ inputs.build_profile }}/payload_bench" tests/performance/payload_size/target/release/payload_bench
 
-      - name: Run payload benchmark suite (3 iterations)
+      - name: Run payload benchmark suite (${{ inputs.iterations }} iteration(s))
         timeout-minutes: 75
         run: |
-          for run in 1 2 3; do
+          ITERATIONS=${{ inputs.iterations }}
+          for run in $(seq 1 "$ITERATIONS"); do
             echo ""
             echo "============================================"
-            echo "  BENCHMARK RUN ${run}/3"
+            echo "  BENCHMARK RUN ${run}/${ITERATIONS}"
             echo "============================================"
             echo ""
 
@@ -198,16 +208,18 @@ jobs:
               2>&1 | tee /tmp/payload_bench_output_run${run}.txt
 
             echo ""
-            echo "Run ${run}/3 complete."
+            echo "Run ${run}/${ITERATIONS} complete."
           done
 
           echo ""
           echo "============================================"
-          echo "  ALL 3 BENCHMARK RUNS COMPLETE"
+          echo "  ALL ${ITERATIONS} BENCHMARK RUN(S) COMPLETE"
           echo "============================================"
 
       - name: Collect JSON results
         if: always()
+        env:
+          NUM_ITERATIONS: ${{ inputs.iterations }}
         run: |
           mkdir -p benchmark-results
 
@@ -257,8 +269,9 @@ jobs:
                       i = idx + 1
               return blobs
 
+          num_iterations = int(os.environ.get("NUM_ITERATIONS", "1"))
           all_runs = {}
-          for run in range(1, 4):
+          for run in range(1, num_iterations + 1):
               # Try structured results first, fall back to raw output parsing
               results = collect_run_results(run)
               if not results:
@@ -276,6 +289,8 @@ jobs:
 
       - name: Post benchmark summary
         if: always()
+        env:
+          NUM_ITERATIONS: ${{ inputs.iterations }}
         run: |
           python3 - benchmark-results/payload_results.json <<'PYEOF'
           import json, sys, os, math
@@ -335,12 +350,14 @@ jobs:
 
           lines = []
           lines.append("## Payload Size Performance Benchmark Results\n")
+          num_iterations = int(os.environ.get("NUM_ITERATIONS", "1"))
+
           lines.append(f"**Profile:** `${{ inputs.build_profile }}` | "
                        f"**Duration:** ${{ inputs.duration }}s | "
                        f"**Concurrency:** ${{ inputs.concurrency }} | "
                        f"**Content Types:** ${{ inputs.content_types }} | "
                        f"**Sizes:** ${{ inputs.sizes }} | "
-                       f"**Iterations:** 3\n")
+                       f"**Iterations:** {num_iterations}\n")
 
           # ── Per-run detail tables ──
           for run_key in sorted(runs.keys()):
@@ -387,7 +404,7 @@ jobs:
           # ── Cross-run comparison: RPS consistency per (content_type, size) ──
           # Collect gateway RPS per key across runs, indexed by run number
           # to keep columns aligned even when a result is missing in one run.
-          NUM_RUNS = 3
+          NUM_RUNS = num_iterations
           key_rps = defaultdict(lambda: [None] * NUM_RUNS)   # (ct, size) -> [rps|None, ...]
           key_throughput = defaultdict(lambda: [None] * NUM_RUNS)
           for run_idx, run_key in enumerate(sorted(runs.keys())[:NUM_RUNS]):
@@ -396,10 +413,12 @@ jobs:
                   key_rps[key][run_idx] = b.get("rps", 0)
                   key_throughput[key][run_idx] = b.get("throughput_mbps", 0)
 
-          if key_rps:
+          if key_rps and NUM_RUNS > 1:
               lines.append("\n### Cross-Run Comparison (RPS Consistency)\n")
-              lines.append("| Content Type | Size | Run 1 | Run 2 | Run 3 | Mean RPS | Stdev | CV% | Mean Throughput | Outlier? |")
-              lines.append("|-------------|------|-------|-------|-------|----------|-------|-----|----------------|----------|")
+              run_headers = " | ".join(f"Run {i+1}" for i in range(NUM_RUNS))
+              run_separators = " | ".join("-------" for _ in range(NUM_RUNS))
+              lines.append(f"| Content Type | Size | {run_headers} | Mean RPS | Stdev | CV% | Mean Throughput | Outlier? |")
+              lines.append(f"|-------------|------|{run_separators}|----------|-------|-----|----------------|----------|")
 
               # Sort by content type, then size
               for key in sorted(key_rps.keys(), key=lambda k: (k[0], size_sort_key(k[1]))):
@@ -445,7 +464,7 @@ jobs:
           # ── Throughput scaling analysis ──
           # Show how throughput scales with payload size per content type
           lines.append("\n### Throughput Scaling Analysis\n")
-          lines.append("> Shows mean throughput (Mbps) across all 3 runs per content type and payload size. "
+          lines.append(f"> Shows mean throughput (Mbps) across all {NUM_RUNS} run(s) per content type and payload size. "
                        "Helps identify where the gateway saturates.\n")
 
           ct_sizes = defaultdict(dict)  # ct -> {size: mean_tp}
