@@ -49,6 +49,9 @@ pub struct OverloadState {
     /// are probabilistically marked with Connection: close based on this value.
     /// The hot path reads this with a single AtomicU32::load(Relaxed).
     pub red_drop_probability: AtomicU32,
+    /// Monotonic request counter used as per-request entropy for RED decisions.
+    /// Incremented by `fetch_add(1, Relaxed)` on each `should_disable_keepalive_red()` call.
+    red_request_counter: AtomicU64,
 
     // ── Snapshot for admin endpoint (written by monitor, read by admin) ─
     pub fd_current: AtomicU64,
@@ -73,6 +76,7 @@ impl OverloadState {
             active_connections: AtomicU64::new(0),
             drain_complete: tokio::sync::Notify::new(),
             red_drop_probability: AtomicU32::new(0),
+            red_request_counter: AtomicU64::new(0),
             fd_current: AtomicU64::new(0),
             fd_max: AtomicU64::new(0),
             conn_current: AtomicU64::new(0),
@@ -92,9 +96,9 @@ impl OverloadState {
         }
     }
 
-    /// Returns true if this request should have keepalive disabled based on RED probability.
-    /// Uses a fast deterministic hash of the request counter to avoid RNG overhead.
-    /// Cost: one AtomicU32::load + one AtomicU64::load + one comparison.
+    /// Returns true if this response should have keepalive disabled based on RED probability.
+    /// Uses a monotonic per-request counter with golden-ratio hashing for uniform distribution.
+    /// Cost: one AtomicU32::load + one AtomicU64::fetch_add(Relaxed) + one multiply + one comparison.
     pub fn should_disable_keepalive_red(&self) -> bool {
         let prob = self.red_drop_probability.load(Ordering::Relaxed);
         if prob == 0 {
@@ -103,10 +107,12 @@ impl OverloadState {
         if prob >= 1000 {
             return true;
         }
-        // Use request counter as deterministic "random" source
-        let counter = self.active_connections.load(Ordering::Relaxed);
-        // Simple hash: multiply by golden ratio and take high bits
-        let hash = counter.wrapping_mul(0x9E3779B97F4A7C15) >> 54; // 0-1023 range
+        // Monotonic counter ensures each call gets a unique input, producing
+        // true per-response probabilistic shedding even when active_connections
+        // is stable.
+        let counter = self.red_request_counter.fetch_add(1, Ordering::Relaxed);
+        // Golden-ratio hash: multiply and take high bits for 0-1023 range
+        let hash = counter.wrapping_mul(0x9E3779B97F4A7C15) >> 54;
         (hash as u32) < prob
     }
 
@@ -695,14 +701,24 @@ mod tests {
     }
 
     #[test]
-    fn red_probability_partial_is_deterministic() {
+    fn red_probability_partial_distributes_across_requests() {
         let state = OverloadState::new();
         state.red_drop_probability.store(500, Ordering::Relaxed);
-        // With a fixed active_connections value, result should be deterministic
-        state.active_connections.store(42, Ordering::Relaxed);
-        let result1 = state.should_disable_keepalive_red();
-        let result2 = state.should_disable_keepalive_red();
-        assert_eq!(result1, result2);
+        // At 50% probability, a run of 1000 calls should produce a mix of
+        // true and false — not all-or-nothing.
+        let mut true_count = 0u32;
+        let total = 1000u32;
+        for _ in 0..total {
+            if state.should_disable_keepalive_red() {
+                true_count += 1;
+            }
+        }
+        // Expect roughly 50% ± generous margin (golden-ratio hash is uniform
+        // but not perfectly so over small windows).
+        assert!(
+            true_count > 200 && true_count < 800,
+            "expected ~50% true, got {true_count}/{total}"
+        );
     }
 
     #[test]
