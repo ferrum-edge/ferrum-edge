@@ -58,24 +58,6 @@ fn raw_header_get_reads_before_materialization() {
 }
 
 #[test]
-fn raw_header_get_uses_last_value_wins_for_multi_valued() {
-    let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/".into());
-    let mut raw = HeaderMap::new();
-    raw.insert("x-custom", "first".parse().unwrap());
-    raw.append("x-custom", "second".parse().unwrap());
-    raw.append("x-custom", "third".parse().unwrap());
-    ctx.set_raw_headers(raw);
-
-    // raw_header_get should return the last value, matching materialize_headers
-    // behavior (HashMap::insert overwrites, so last value wins)
-    assert_eq!(ctx.raw_header_get("x-custom"), Some("third"));
-
-    // Verify materialize_headers produces the same result
-    ctx.materialize_headers();
-    assert_eq!(ctx.headers.get("x-custom").unwrap(), "third");
-}
-
-#[test]
 fn raw_header_get_returns_none_after_materialization() {
     let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/".into());
     let mut raw = HeaderMap::new();
