@@ -317,6 +317,88 @@ async fn test_proxy_grpc_request_from_bytes_error_on_unreachable_backend() {
     );
 }
 
+// --- parse_grpc_timeout_ms tests ---
+
+fn headers_with_grpc_timeout(val: &str) -> hyper::HeaderMap {
+    let mut headers = hyper::HeaderMap::new();
+    headers.insert("grpc-timeout", val.parse().unwrap());
+    headers
+}
+
+#[test]
+fn test_parse_grpc_timeout_seconds() {
+    let headers = headers_with_grpc_timeout("5S");
+    assert_eq!(grpc_proxy::parse_grpc_timeout_ms(&headers), Some(5000));
+}
+
+#[test]
+fn test_parse_grpc_timeout_milliseconds() {
+    let headers = headers_with_grpc_timeout("200m");
+    assert_eq!(grpc_proxy::parse_grpc_timeout_ms(&headers), Some(200));
+}
+
+#[test]
+fn test_parse_grpc_timeout_hours() {
+    let headers = headers_with_grpc_timeout("1H");
+    assert_eq!(grpc_proxy::parse_grpc_timeout_ms(&headers), Some(3_600_000));
+}
+
+#[test]
+fn test_parse_grpc_timeout_minutes() {
+    let headers = headers_with_grpc_timeout("2M");
+    assert_eq!(grpc_proxy::parse_grpc_timeout_ms(&headers), Some(120_000));
+}
+
+#[test]
+fn test_parse_grpc_timeout_microseconds() {
+    let headers = headers_with_grpc_timeout("5000u");
+    assert_eq!(grpc_proxy::parse_grpc_timeout_ms(&headers), Some(5));
+}
+
+#[test]
+fn test_parse_grpc_timeout_nanoseconds() {
+    let headers = headers_with_grpc_timeout("5000000n");
+    assert_eq!(grpc_proxy::parse_grpc_timeout_ms(&headers), Some(5));
+}
+
+#[test]
+fn test_parse_grpc_timeout_sub_millisecond_clamps_to_1() {
+    // 100 microseconds = 0.1ms → clamped to 1ms
+    let headers = headers_with_grpc_timeout("100u");
+    assert_eq!(grpc_proxy::parse_grpc_timeout_ms(&headers), Some(1));
+}
+
+#[test]
+fn test_parse_grpc_timeout_zero_returns_none() {
+    let headers = headers_with_grpc_timeout("0S");
+    assert_eq!(grpc_proxy::parse_grpc_timeout_ms(&headers), None);
+}
+
+#[test]
+fn test_parse_grpc_timeout_missing_header() {
+    let headers = hyper::HeaderMap::new();
+    assert_eq!(grpc_proxy::parse_grpc_timeout_ms(&headers), None);
+}
+
+#[test]
+fn test_parse_grpc_timeout_invalid_unit() {
+    let headers = headers_with_grpc_timeout("5X");
+    assert_eq!(grpc_proxy::parse_grpc_timeout_ms(&headers), None);
+}
+
+#[test]
+fn test_parse_grpc_timeout_invalid_number() {
+    let headers = headers_with_grpc_timeout("abcS");
+    assert_eq!(grpc_proxy::parse_grpc_timeout_ms(&headers), None);
+}
+
+#[test]
+fn test_parse_grpc_timeout_empty_value() {
+    let headers = headers_with_grpc_timeout("");
+    // Empty header value — cannot split unit character
+    assert_eq!(grpc_proxy::parse_grpc_timeout_ms(&headers), None);
+}
+
 // --- GrpcConnectionPool creation ---
 
 #[tokio::test]

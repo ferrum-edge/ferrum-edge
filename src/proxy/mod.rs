@@ -4844,9 +4844,10 @@ pub async fn handle_proxy_request(
                 let mut response_headers: HashMap<String, String> = grpc_resp.headers;
                 let mut response_body = grpc_resp.body;
 
-                // Forward trailers as response headers (gRPC Trailers-Only encoding)
-                for (k, v) in &grpc_resp.trailers {
-                    response_headers.insert(k.clone(), v.clone());
+                // Forward trailers as response headers (gRPC Trailers-Only encoding).
+                // Drain instead of clone to avoid per-trailer String allocations.
+                for (k, v) in grpc_resp.trailers {
+                    response_headers.insert(k, v);
                 }
 
                 // after_proxy hooks
@@ -5932,7 +5933,7 @@ async fn proxy_to_backend_retry(
     match req_builder.send().await {
         Ok(response) => {
             let status = response.status().as_u16();
-            let mut resp_headers = HashMap::new();
+            let mut resp_headers = HashMap::with_capacity(response.headers().keys_len());
             collect_response_headers(response.headers(), &mut resp_headers);
             if stream_response {
                 // Buffer moderate-sized bodies to avoid streaming overhead
@@ -6421,7 +6422,7 @@ async fn proxy_to_backend(
     let response = match req_builder.send().await {
         Ok(response) => {
             let status = response.status().as_u16();
-            let mut resp_headers = HashMap::new();
+            let mut resp_headers = HashMap::with_capacity(response.headers().keys_len());
             collect_response_headers(response.headers(), &mut resp_headers);
 
             // Enforce response body size limit
@@ -7137,7 +7138,7 @@ async fn proxy_to_backend_http2(
 
     // Extract response status and headers
     let status = response.status().as_u16();
-    let mut resp_headers = HashMap::new();
+    let mut resp_headers = HashMap::with_capacity(response.headers().keys_len());
     collect_hyper_response_headers(response.headers(), &mut resp_headers);
 
     if stream_response {

@@ -34,6 +34,7 @@ pub(crate) struct UpstreamSelection {
 ///
 /// When the proxy has no `upstream_id`, returns a no-op selection with the
 /// client IP as the hash key (matching the main proxy path behavior).
+///
 pub(crate) fn select_upstream_target(
     proxy: &Proxy,
     state: &ProxyState,
@@ -42,7 +43,7 @@ pub(crate) fn select_upstream_target(
 ) -> UpstreamSelection {
     let Some(upstream_id) = &proxy.upstream_id else {
         return UpstreamSelection {
-            lb_hash_key: (client_ip.to_string(), false),
+            lb_hash_key: (client_ip.to_owned(), false),
             target: None,
             is_fallback: false,
             sticky_cookie_needed: false,
@@ -216,18 +217,19 @@ pub(crate) fn record_backend_outcome(
 }
 
 /// Resolve the hash key for consistent-hashing or sticky-session load balancing.
+///
 pub(crate) fn resolve_hash_key(
     strategy: &HashOnStrategy,
     client_ip: &str,
     headers: &HashMap<String, String>,
 ) -> (String, bool) {
     match strategy {
-        HashOnStrategy::Ip => (client_ip.to_string(), false),
+        HashOnStrategy::Ip => (client_ip.to_owned(), false),
         HashOnStrategy::Header(name) => {
             // Header names in ctx.headers are stored as-is from hyper (lowercased)
             let value = headers.get(name.as_str()).cloned().unwrap_or_default();
             if value.is_empty() {
-                (client_ip.to_string(), false)
+                (client_ip.to_owned(), false)
             } else {
                 (value, false)
             }
@@ -248,7 +250,7 @@ pub(crate) fn resolve_hash_key(
                 }
             }
             // Cookie not found — use IP and signal that we need to set the cookie
-            (client_ip.to_string(), true)
+            (client_ip.to_owned(), true)
         }
     }
 }
