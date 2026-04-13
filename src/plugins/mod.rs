@@ -258,6 +258,10 @@ pub struct RequestContext {
     /// `"request_body"` metadata key (UTF-8 only), this preserves non-UTF-8
     /// payloads such as gRPC protobuf.
     pub request_body_bytes: Option<bytes::Bytes>,
+    /// Whether this request arrived via TLS 1.3 0-RTT early data.
+    /// Set on HTTP/3 via quinn's `into_0rtt()` detection, and on HTTPS via the
+    /// `Early-Data: 1` header (RFC 8470) from upstream proxies/CDNs.
+    pub is_early_data: bool,
 }
 
 impl RequestContext {
@@ -281,6 +285,7 @@ impl RequestContext {
             plugin_http_call_ns: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             mirror_result_rx: None,
             request_body_bytes: None,
+            is_early_data: false,
         }
     }
 

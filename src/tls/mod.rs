@@ -71,6 +71,9 @@ pub struct TlsPolicy {
     pub crypto_provider: Arc<CryptoProvider>,
     pub prefer_server_cipher_order: bool,
     pub session_cache_size: usize,
+    /// Maximum 0-RTT early data size in bytes. 0 = disabled (default).
+    /// When non-zero, the server advertises 0-RTT support in TLS 1.3 session tickets.
+    pub early_data_max_size: u32,
 }
 
 impl TlsPolicy {
@@ -148,11 +151,20 @@ impl TlsPolicy {
             ..base_provider
         };
 
+        // 0-RTT early data: when methods are configured, enable with a 16 KiB limit
+        // (matches typical HTTP request size). 0 = disabled (the secure default).
+        let early_data_max_size = if env_config.tls_early_data_methods.is_empty() {
+            0
+        } else {
+            16_384 // 16 KiB — large enough for typical GET/HEAD requests
+        };
+
         Ok(Self {
             protocol_versions: versions,
             crypto_provider: Arc::new(provider),
             prefer_server_cipher_order: env_config.tls_prefer_server_cipher_order,
             session_cache_size: env_config.tls_session_cache_size,
+            early_data_max_size,
         })
     }
 }
@@ -383,7 +395,33 @@ pub fn load_tls_config_with_client_auth(
     config.session_storage =
         rustls::server::ServerSessionMemoryCache::new(tls_policy.session_cache_size);
 
+    // TLS 1.3 0-RTT early data: explicitly disabled in this shared function.
+    // This function is used for both proxy frontend and admin HTTPS listeners.
+    // 0-RTT must NOT be enabled on admin listeners (no 425 guard there), so we
+    // always set 0 here. Proxy-specific call sites apply early_data_max_size
+    // via Arc::get_mut() after this returns — see modes/*.rs.
+    config.max_early_data_size = 0;
+
     Ok(Arc::new(config))
+}
+
+/// Enable TLS 1.3 0-RTT early data on a `ServerConfig` returned by
+/// [`load_tls_config_with_client_auth`].
+///
+/// Must be called immediately after `load_tls_config_with_client_auth` while
+/// the `Arc` has a single owner (ref count = 1). Only apply to **proxy
+/// frontend** configs — never to admin listeners (which lack the 425 guard).
+pub fn enable_early_data(config: &mut Arc<ServerConfig>, tls_policy: &TlsPolicy) {
+    if tls_policy.early_data_max_size > 0 {
+        if let Some(cfg) = Arc::get_mut(config) {
+            cfg.max_early_data_size = tls_policy.early_data_max_size;
+        } else {
+            // Should never happen — called right after construction.
+            tracing::warn!(
+                "Could not enable 0-RTT early data: Arc<ServerConfig> has multiple owners"
+            );
+        }
+    }
 }
 
 /// Build a rustls `ClientConfig` builder for backend/outbound connections

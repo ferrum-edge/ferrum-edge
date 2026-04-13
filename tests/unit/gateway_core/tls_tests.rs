@@ -587,3 +587,35 @@ fn test_load_tls_config_empty_ca_bundle_fails() {
         "expected cert validation error, got: {err}"
     );
 }
+
+// ── 0-RTT early data TLS policy tests ─────────────────────────────────────
+
+#[test]
+fn test_tls_policy_early_data_disabled_by_default() {
+    let env = default_env_config();
+    let policy = TlsPolicy::from_env_config(&env).unwrap();
+    assert_eq!(policy.early_data_max_size, 0);
+}
+
+#[test]
+fn test_tls_policy_early_data_enabled_when_methods_set() {
+    let mut env = default_env_config();
+    env.tls_early_data_methods = ["GET".to_string()].into_iter().collect();
+    let policy = TlsPolicy::from_env_config(&env).unwrap();
+    assert!(
+        policy.early_data_max_size > 0,
+        "expected non-zero early_data_max_size"
+    );
+    assert_eq!(policy.early_data_max_size, 16_384);
+}
+
+#[test]
+fn test_tls_policy_early_data_enabled_multiple_methods() {
+    let mut env = default_env_config();
+    env.tls_early_data_methods = ["GET", "HEAD", "OPTIONS"]
+        .into_iter()
+        .map(String::from)
+        .collect();
+    let policy = TlsPolicy::from_env_config(&env).unwrap();
+    assert_eq!(policy.early_data_max_size, 16_384);
+}
