@@ -1,0 +1,506 @@
+# On-demand payload size performance benchmark.
+#
+# Runs the tests/performance/payload_size suite on Linux and posts
+# results to the GitHub Actions step summary.  Triggered manually via
+# workflow_dispatch so it can target any branch or PR.
+#
+# Each run executes the benchmark suite 3 times to identify outliers caused
+# by noisy-neighbor effects on shared GitHub runners.  A pre-benchmark
+# health check logs CPU steal, scheduler jitter, and memory to quantify
+# runner impairment.
+#
+# Usage:
+#   - Go to Actions -> "Payload Size Performance Benchmark" -> "Run workflow"
+#   - Pick the branch (or PR branch) to benchmark
+#   - Optionally adjust duration, concurrency, sizes, and content types
+
+name: Payload Size Performance Benchmark
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: "Test duration per size (seconds)"
+        required: false
+        default: "15"
+        type: string
+      concurrency:
+        description: "Concurrent connections"
+        required: false
+        default: "100"
+        type: string
+      content_types:
+        description: "Content types/tiers to test (json, grpc, tcp, tier1, all, etc.)"
+        required: false
+        default: "tier1"
+        type: string
+      sizes:
+        description: "Comma-separated payload sizes (default: 10kb,50kb,100kb,1mb,5mb,9mb)"
+        required: false
+        default: "10kb,50kb,100kb,1mb,5mb,9mb"
+        type: string
+      build_profile:
+        description: "Cargo build profile for gateway binary"
+        required: false
+        default: "release"
+        type: choice
+        options:
+          - release
+          - max-perf
+          - ci-release
+
+jobs:
+  benchmark:
+    name: Payload Size Benchmark
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+        continue-on-error: true
+
+      - name: Configure sccache
+        run: |
+          if command -v sccache &> /dev/null && sccache --start-server 2>/dev/null; then
+            echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
+            echo "SCCACHE_GHA_ENABLED=true" >> $GITHUB_ENV
+            echo "sccache enabled"
+          else
+            echo "sccache unavailable, building without cache"
+          fi
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "ci-payload-bench"
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler libcurl4-openssl-dev lsof sysstat
+
+      - name: Runner health check (pre-benchmark)
+        run: |
+          echo "=========================================="
+          echo "  RUNNER HEALTH CHECK — PRE-BENCHMARK"
+          echo "=========================================="
+          echo ""
+
+          echo "--- CPU Info ---"
+          nproc
+          lscpu | grep -E 'Model name|CPU\(s\)|Thread|Core|Socket|MHz|Hypervisor|Virtualization'
+          echo ""
+
+          echo "--- CPU Steal / Usage (5-second sample) ---"
+          vmstat 1 6 | tail -n 5
+          echo ""
+
+          AVG_STEAL=$(vmstat 1 6 | tail -n 5 | awk '{sum += $17; n++} END {printf "%.1f", sum/n}')
+          echo "Average CPU steal over 5s: ${AVG_STEAL}%"
+          if (( $(echo "$AVG_STEAL > 5.0" | bc -l) )); then
+            echo "::warning::CPU steal is ${AVG_STEAL}% — noisy neighbor detected. Benchmark results may be unreliable."
+          else
+            echo "CPU steal is low (${AVG_STEAL}%). Runner appears unimpaired."
+          fi
+          echo ""
+
+          echo "--- Memory ---"
+          free -h
+          echo ""
+
+          echo "--- Disk I/O (5-second sample) ---"
+          iostat -x 1 2 2>/dev/null | tail -n 20 || echo "(iostat not available)"
+          echo ""
+
+          echo "--- System Load ---"
+          uptime
+          echo ""
+
+          echo "--- Kernel Scheduler Latency (check for contention) ---"
+          python3 -c "
+          import time
+          samples = []
+          for _ in range(100):
+              t0 = time.monotonic_ns()
+              time.sleep(0.001)  # 1ms sleep
+              elapsed_us = (time.monotonic_ns() - t0) / 1000
+              samples.append(elapsed_us)
+          avg = sum(samples) / len(samples)
+          p99 = sorted(samples)[98]
+          maxv = max(samples)
+          print(f'1ms sleep accuracy: avg={avg:.0f}µs  p99={p99:.0f}µs  max={maxv:.0f}µs')
+          if p99 > 5000:
+              print('WARNING: High scheduler jitter detected — runner may be overloaded')
+          else:
+              print('Scheduler jitter is within normal range')
+          "
+          echo ""
+          echo "=========================================="
+          echo "  HEALTH CHECK COMPLETE"
+          echo "=========================================="
+
+      - name: Build gateway binary
+        run: cargo build --profile ${{ inputs.build_profile }} --bin ferrum-edge
+
+      - name: Build payload benchmark tools
+        run: cd tests/performance/payload_size && cargo build --release
+
+      # The run_payload_test.sh expects the gateway binary at target/release/ferrum-edge.
+      # When using a non-release profile, copy the binary so the script finds it.
+      - name: Stage gateway binary
+        if: inputs.build_profile != 'release'
+        run: |
+          mkdir -p target/release
+          cp "target/${{ inputs.build_profile }}/ferrum-edge" target/release/ferrum-edge
+
+      - name: Run payload benchmark suite (3 iterations)
+        timeout-minutes: 75
+        run: |
+          for run in 1 2 3; do
+            echo ""
+            echo "============================================"
+            echo "  BENCHMARK RUN ${run}/3"
+            echo "============================================"
+            echo ""
+
+            # Quick steal check before each run
+            AVG_STEAL=$(vmstat 1 3 | tail -n 2 | awk '{sum += $17; n++} END {printf "%.1f", sum/n}')
+            echo "Pre-run CPU steal: ${AVG_STEAL}%"
+            if (( $(echo "$AVG_STEAL > 5.0" | bc -l) )); then
+              echo "::warning::Run ${run}: CPU steal is ${AVG_STEAL}% before starting — noisy neighbor detected"
+            fi
+
+            cd ${{ github.workspace }}/tests/performance/payload_size
+            bash run_payload_test.sh \
+              "${{ inputs.content_types }}" \
+              --skip-build \
+              --duration "${{ inputs.duration }}" \
+              --concurrency "${{ inputs.concurrency }}" \
+              --sizes "${{ inputs.sizes }}" \
+              --json \
+              --results-dir "/tmp/payload_results_run${run}" \
+              2>&1 | tee /tmp/payload_bench_output_run${run}.txt
+
+            echo ""
+            echo "Run ${run}/3 complete."
+          done
+
+          echo ""
+          echo "============================================"
+          echo "  ALL 3 BENCHMARK RUNS COMPLETE"
+          echo "============================================"
+
+      - name: Collect JSON results
+        if: always()
+        run: |
+          mkdir -p benchmark-results
+
+          python3 - <<'PYEOF'
+          import json, sys, os, glob
+
+          def collect_run_results(run_num):
+              """Collect all per-test JSON result files from a run's results directory."""
+              results_dir = f"/tmp/payload_results_run{run_num}"
+              results = []
+              if not os.path.isdir(results_dir):
+                  return results
+              for filepath in sorted(glob.glob(os.path.join(results_dir, "*_gateway.json"))):
+                  try:
+                      with open(filepath) as f:
+                          data = json.load(f)
+                      # Extract content_type and size from filename: e.g. json_10kb_gateway.json
+                      basename = os.path.basename(filepath).replace("_gateway.json", "")
+                      parts = basename.rsplit("_", 1)
+                      if len(parts) == 2:
+                          data["content_type"] = parts[0]
+                          data["size_label"] = parts[1]
+                      results.append(data)
+                  except (json.JSONDecodeError, IOError):
+                      continue
+              return results
+
+          def extract_json_from_output(filepath):
+              """Fallback: extract JSON blobs from raw console output."""
+              if not os.path.exists(filepath):
+                  return []
+              raw = open(filepath).read()
+              decoder = json.JSONDecoder()
+              blobs = []
+              i = 0
+              while i < len(raw):
+                  idx = raw.find("{", i)
+                  if idx == -1:
+                      break
+                  try:
+                      obj, end = decoder.raw_decode(raw, idx)
+                      # Only keep objects that look like benchmark results
+                      if "rps" in obj or "throughput_mbps" in obj:
+                          blobs.append(obj)
+                      i = end
+                  except json.JSONDecodeError:
+                      i = idx + 1
+              return blobs
+
+          all_runs = {}
+          for run in range(1, 4):
+              # Try structured results first, fall back to raw output parsing
+              results = collect_run_results(run)
+              if not results:
+                  results = extract_json_from_output(f"/tmp/payload_bench_output_run{run}.txt")
+
+              all_runs[f"run_{run}"] = results
+              with open(f"benchmark-results/payload_results_run{run}.json", "w") as f:
+                  json.dump({"benchmarks": results}, f, indent=2)
+              print(f"Run {run}: collected {len(results)} benchmark results")
+
+          combined = {"runs": all_runs}
+          with open("benchmark-results/payload_results.json", "w") as f:
+              json.dump(combined, f, indent=2)
+          PYEOF
+
+      - name: Post benchmark summary
+        if: always()
+        run: |
+          python3 - benchmark-results/payload_results.json <<'PYEOF'
+          import json, sys, os, math
+          from collections import defaultdict
+
+          summary_file = os.environ.get("GITHUB_STEP_SUMMARY", "/dev/null")
+          results_path = sys.argv[1]
+
+          if not os.path.exists(results_path):
+              with open(summary_file, "a") as f:
+                  f.write("## Payload Size Performance Benchmark\n\nNo results collected.\n")
+              sys.exit(0)
+
+          with open(results_path) as f:
+              data = json.load(f)
+
+          runs = data.get("runs", {})
+          if not runs:
+              with open(summary_file, "a") as f:
+                  f.write("## Payload Size Performance Benchmark\n\nNo benchmark results found.\n")
+              sys.exit(0)
+
+          def fmt_rps(v):
+              if v is None or v == 0:
+                  return "N/A"
+              return f"{v:,.0f}"
+
+          def fmt_us(us):
+              if us is None or us == 0:
+                  return "N/A"
+              us = float(us)
+              if us >= 1_000_000:
+                  return f"{us/1_000_000:.2f}s"
+              if us >= 1000:
+                  return f"{us/1000:.2f}ms"
+              return f"{us:.0f}us"
+
+          def fmt_mbps(v):
+              if v is None or v == 0:
+                  return "N/A"
+              return f"{v:.1f} Mbps"
+
+          def get_key(b):
+              """Generate a grouping key from a benchmark result."""
+              ct = b.get("content_type", b.get("protocol", "unknown"))
+              size = b.get("size_label", b.get("payload_size", "unknown"))
+              return (ct, size)
+
+          # Size ordering for sorting
+          SIZE_ORDER = {
+              "64": 0, "512": 1, "1kb": 2, "4kb": 3,
+              "10kb": 4, "50kb": 5, "100kb": 6, "1mb": 7, "5mb": 8, "9mb": 9
+          }
+
+          def size_sort_key(s):
+              return SIZE_ORDER.get(s.lower(), 99)
+
+          lines = []
+          lines.append("## Payload Size Performance Benchmark Results\n")
+          lines.append(f"**Profile:** `${{ inputs.build_profile }}` | "
+                       f"**Duration:** ${{ inputs.duration }}s | "
+                       f"**Concurrency:** ${{ inputs.concurrency }} | "
+                       f"**Content Types:** ${{ inputs.content_types }} | "
+                       f"**Sizes:** ${{ inputs.sizes }} | "
+                       f"**Iterations:** 3\n")
+
+          # ── Per-run detail tables ──
+          for run_key in sorted(runs.keys()):
+              run_num = run_key.replace("run_", "")
+              benchmarks = runs[run_key]
+              if not benchmarks:
+                  continue
+
+              # Group benchmarks by content type
+              by_ct = defaultdict(list)
+              for b in benchmarks:
+                  ct = b.get("content_type", b.get("protocol", "unknown"))
+                  by_ct[ct].append(b)
+
+              lines.append(f"\n### Run {run_num}\n")
+
+              for ct in sorted(by_ct.keys()):
+                  ct_benchmarks = sorted(by_ct[ct], key=lambda b: size_sort_key(
+                      b.get("size_label", b.get("payload_size", "unknown"))))
+
+                  lines.append(f"\n#### {ct}\n")
+                  lines.append("| Size | RPS | Avg Latency | P50 | P99 | Throughput | Errors |")
+                  lines.append("|------|-----|-------------|-----|-----|------------|--------|")
+
+                  for b in ct_benchmarks:
+                      size = b.get("size_label", b.get("payload_size", "?"))
+                      rps = b.get("rps", 0)
+                      avg_lat = b.get("latency_avg_us", b.get("avg_latency_us", 0))
+                      p50 = b.get("p50_us", 0)
+                      p99 = b.get("p99_us", 0)
+                      tp = b.get("throughput_mbps", 0)
+                      errors = b.get("total_errors", 0)
+
+                      lines.append(
+                          f"| {size} "
+                          f"| {fmt_rps(rps)} "
+                          f"| {fmt_us(avg_lat)} "
+                          f"| {fmt_us(p50)} "
+                          f"| {fmt_us(p99)} "
+                          f"| {fmt_mbps(tp)} "
+                          f"| {errors} |"
+                      )
+
+          # ── Cross-run comparison: RPS consistency per (content_type, size) ──
+          # Collect gateway RPS per key across runs, indexed by run number
+          # to keep columns aligned even when a result is missing in one run.
+          NUM_RUNS = 3
+          key_rps = defaultdict(lambda: [None] * NUM_RUNS)   # (ct, size) -> [rps|None, ...]
+          key_throughput = defaultdict(lambda: [None] * NUM_RUNS)
+          for run_idx, run_key in enumerate(sorted(runs.keys())[:NUM_RUNS]):
+              for b in runs[run_key]:
+                  key = get_key(b)
+                  key_rps[key][run_idx] = b.get("rps", 0)
+                  key_throughput[key][run_idx] = b.get("throughput_mbps", 0)
+
+          if key_rps:
+              lines.append("\n### Cross-Run Comparison (RPS Consistency)\n")
+              lines.append("| Content Type | Size | Run 1 | Run 2 | Run 3 | Mean RPS | Stdev | CV% | Mean Throughput | Outlier? |")
+              lines.append("|-------------|------|-------|-------|-------|----------|-------|-----|----------------|----------|")
+
+              # Sort by content type, then size
+              for key in sorted(key_rps.keys(), key=lambda k: (k[0], size_sort_key(k[1]))):
+                  ct, size = key
+                  raw_vals = key_rps[key]
+                  raw_tp = key_throughput[key]
+
+                  # Only use present (non-None) values for statistics
+                  vals = [v for v in raw_vals if v is not None]
+                  tp_vals = [v for v in raw_tp if v is not None]
+
+                  mean_v = sum(vals) / len(vals) if vals else 0
+                  mean_tp = sum(tp_vals) / len(tp_vals) if tp_vals else 0
+
+                  if len(vals) > 1 and mean_v > 0:
+                      variance = sum((v - mean_v) ** 2 for v in vals) / (len(vals) - 1)
+                      stdev = math.sqrt(variance)
+                      cv = (stdev / mean_v) * 100
+                  else:
+                      stdev = 0
+                      cv = 0
+
+                  outlier = "⚠️ YES" if cv > 15 else "No"
+
+                  rps_cells = " | ".join(fmt_rps(v) if v is not None else "N/A" for v in raw_vals)
+
+                  lines.append(
+                      f"| {ct} "
+                      f"| {size} "
+                      f"| {rps_cells} "
+                      f"| {fmt_rps(mean_v)} "
+                      f"| {fmt_rps(stdev)} "
+                      f"| {cv:.1f}% "
+                      f"| {fmt_mbps(mean_tp)} "
+                      f"| {outlier} |"
+                  )
+
+              lines.append("")
+              lines.append("> **CV% (Coefficient of Variation)**: Measures run-to-run consistency. "
+                           "CV > 15% suggests noisy-neighbor interference or other instability. "
+                           "Results marked as outliers should be interpreted with caution.")
+
+          # ── Throughput scaling analysis ──
+          # Show how throughput scales with payload size per content type
+          lines.append("\n### Throughput Scaling Analysis\n")
+          lines.append("> Shows mean throughput (Mbps) across all 3 runs per content type and payload size. "
+                       "Helps identify where the gateway saturates.\n")
+
+          ct_sizes = defaultdict(dict)  # ct -> {size: mean_tp}
+          ct_rps_means = defaultdict(dict)  # ct -> {size: mean_rps}
+          for key, raw_tp in key_throughput.items():
+              ct, size = key
+              tp_vals = [v for v in raw_tp if v is not None]
+              ct_sizes[ct][size] = sum(tp_vals) / len(tp_vals) if tp_vals else 0
+          for key, raw_rps in key_rps.items():
+              ct, size = key
+              rps_vals = [v for v in raw_rps if v is not None]
+              ct_rps_means[ct][size] = sum(rps_vals) / len(rps_vals) if rps_vals else 0
+
+          for ct in sorted(ct_sizes.keys()):
+              sizes_data = ct_sizes[ct]
+              rps_data = ct_rps_means.get(ct, {})
+              sorted_sizes = sorted(sizes_data.keys(), key=size_sort_key)
+
+              if not sorted_sizes:
+                  continue
+
+              lines.append(f"\n#### {ct}\n")
+              lines.append("| Size | Mean RPS | Mean Throughput | RPS vs Smallest |")
+              lines.append("|------|----------|-----------------|-----------------|")
+
+              baseline_rps = rps_data.get(sorted_sizes[0], 0)
+
+              for size in sorted_sizes:
+                  mean_rps = rps_data.get(size, 0)
+                  mean_tp = sizes_data.get(size, 0)
+
+                  if baseline_rps > 0 and mean_rps > 0:
+                      rps_ratio = f"{(mean_rps / baseline_rps) * 100:.0f}%"
+                  else:
+                      rps_ratio = "N/A"
+
+                  lines.append(
+                      f"| {size} "
+                      f"| {fmt_rps(mean_rps)} "
+                      f"| {fmt_mbps(mean_tp)} "
+                      f"| {rps_ratio} |"
+                  )
+
+          # ── Raw JSON ──
+          lines.append("")
+          lines.append("<details><summary>Raw JSON (all runs)</summary>\n")
+          lines.append("```json")
+          lines.append(json.dumps(data, indent=2))
+          lines.append("```\n")
+          lines.append("</details>")
+
+          with open(summary_file, "a") as f:
+              f.write("\n".join(lines) + "\n")
+
+          # Also print to stdout for the log
+          for line in lines:
+              print(line)
+          PYEOF
+
+      - name: Upload benchmark results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: payload-benchmark-results-${{ github.sha }}
+          path: benchmark-results/
+          retention-days: 90
