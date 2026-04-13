@@ -19,7 +19,7 @@
 //! skipped in dp mode (plugin degrades gracefully with `reader: None`).
 
 use async_trait::async_trait;
-use maxminddb::{MaxMindDBError, Mmap, Reader};
+use maxminddb::{Mmap, Reader};
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -67,7 +67,9 @@ impl GeoRestriction {
         // on data plane nodes but not on the control plane, or may be deployed
         // after config is pushed. At request time, a missing reader falls back
         // to the on_lookup_failure policy.
-        let reader = match Reader::open_mmap(db_path) {
+        // SAFETY: The mmdb file is read-only after construction. The gateway only
+        // opens it once at plugin init and does not modify or truncate it.
+        let reader = match unsafe { Reader::open_mmap(db_path) } {
             Ok(r) => Some(Arc::new(r)),
             Err(e) => {
                 warn!(
@@ -130,24 +132,25 @@ impl GeoRestriction {
     }
 
     /// Look up the country ISO code for a given IP address string.
-    fn lookup_country(&self, ip_str: &str) -> Result<Option<String>, MaxMindDBError> {
-        let reader = self.reader.as_ref().ok_or_else(|| {
-            MaxMindDBError::AddressNotFoundError("MaxMind database not loaded".to_string())
-        })?;
+    fn lookup_country(&self, ip_str: &str) -> Result<Option<String>, String> {
+        let reader = self
+            .reader
+            .as_ref()
+            .ok_or_else(|| "MaxMind database not loaded".to_string())?;
 
-        let ip: std::net::IpAddr = ip_str
-            .parse()
-            .map_err(|e| MaxMindDBError::AddressNotFoundError(format!("invalid IP: {}", e)))?;
+        let ip: std::net::IpAddr = ip_str.parse().map_err(|e| format!("invalid IP: {}", e))?;
 
-        let record: GeoCountryRecord = reader.lookup(ip)?;
+        let result = reader.lookup(ip).map_err(|e| e.to_string())?;
+        let record: Option<GeoCountryRecord> = result.decode().map_err(|e| e.to_string())?;
 
-        // Prefer the direct country, fall back to registered_country
-        let iso_code = record
-            .country
-            .and_then(|c| c.iso_code)
-            .or_else(|| record.registered_country.and_then(|c| c.iso_code));
+        let iso_code = record.and_then(|r| {
+            // Prefer the direct country, fall back to registered_country
+            r.country
+                .and_then(|c| c.iso_code)
+                .or_else(|| r.registered_country.and_then(|c| c.iso_code))
+        });
 
-        Ok(iso_code.map(|s| s.to_ascii_uppercase()))
+        Ok(iso_code.map(|s: String| s.to_ascii_uppercase()))
     }
 
     /// Check whether the client IP's country is allowed.

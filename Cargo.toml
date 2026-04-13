@@ -105,12 +105,12 @@ vaultrs = "0.8"
 aws-config = { version = "1.1", features = ["behavior-version-latest"] }
 aws-sdk-secretsmanager = "1"
 google-cloud-secretmanager-v1 = "1.7"
-azure_security_keyvault_secrets = "0.12"
-azure_identity = "0.33"
-azure_core = "0.33"
+azure_security_keyvault_secrets = "0.13"
+azure_identity = "0.34"
+azure_core = "0.34"
 
 # GeoIP (geo_restriction plugin)
-maxminddb = { version = "0.24", features = ["mmap"] }
+maxminddb = { version = "0.27", features = ["mmap"] }
 
 # Redis (centralized rate limiting across multiple gateway instances)
 redis = { version = "1", features = ["tokio-rustls-comp", "tls-rustls-insecure", "connection-manager"] }
