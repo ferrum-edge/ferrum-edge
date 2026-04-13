@@ -644,6 +644,10 @@ async fn handle_h3_request(
     let plugins = state
         .plugin_cache
         .get_plugins_for_protocol(&proxy.id, ProxyProtocol::Http);
+    // Pre-computed capability bitset — avoids per-request iter().any() scans.
+    let capabilities = state
+        .plugin_cache
+        .get_capabilities(&proxy.id, ProxyProtocol::Http);
 
     let mut plugin_execution_ns: u64 = 0;
 
@@ -678,9 +682,10 @@ async fn handle_h3_request(
     }
     plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
 
-    // Authentication phase
-    let auth_plugins: Vec<&Arc<dyn Plugin>> =
-        plugins.iter().filter(|p| p.is_auth_plugin()).collect();
+    // Authentication phase (pre-computed auth plugin list — zero allocation)
+    let auth_plugins = state
+        .plugin_cache
+        .get_auth_plugins(&proxy.id, ProxyProtocol::Http);
 
     let auth_phase_start = std::time::Instant::now();
     if let Some((status_code, body, mut headers)) = run_authentication_phase(
@@ -748,14 +753,13 @@ async fn handle_h3_request(
             .iter()
             .any(|plugin| plugin.should_buffer_request_body(&ctx));
     let needs_request_body_before_before_proxy = plugin_needs_request_buffering
+        && capabilities.has(crate::plugin_cache::PluginCapabilities::HAS_BODY_BEFORE_BEFORE_PROXY)
         && plugins.iter().any(|plugin| {
             plugin.requires_request_body_before_before_proxy()
                 && plugin.should_buffer_request_body(&ctx)
         });
     let h3_needs_body_bytes = needs_request_body_before_before_proxy
-        && plugins
-            .iter()
-            .any(|plugin| plugin.needs_request_body_bytes());
+        && capabilities.has(crate::plugin_cache::PluginCapabilities::NEEDS_REQUEST_BODY_BYTES);
 
     let mut prebuffered_body_data = if needs_request_body_before_before_proxy {
         let mut body_data = Vec::new();
@@ -784,7 +788,7 @@ async fn handle_h3_request(
     // before_proxy hooks — only clone headers if at least one plugin modifies them.
     // When no plugin modifies headers, use std::mem::take to avoid a per-request HashMap clone.
     let needs_header_clone =
-        !plugins.is_empty() && plugins.iter().any(|p| p.modifies_request_headers());
+        capabilities.has(crate::plugin_cache::PluginCapabilities::MODIFIES_REQUEST_HEADERS);
     let mut owned_proxy_headers: Option<HashMap<String, String>> = None;
     if needs_header_clone {
         let phase_start = std::time::Instant::now();
@@ -1307,7 +1311,7 @@ async fn handle_h3_request(
     // Transform request body via plugins when buffering is active
     let body_data = if needs_request_buffering
         && !body_data.is_empty()
-        && plugins.iter().any(|p| p.modifies_request_body())
+        && capabilities.has(crate::plugin_cache::PluginCapabilities::MODIFIES_REQUEST_BODY)
     {
         let content_type = proxy_headers.get("content-type").map(|s| s.as_str());
         let mut current = body_data;
