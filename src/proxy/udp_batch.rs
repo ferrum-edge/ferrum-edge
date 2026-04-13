@@ -266,11 +266,6 @@ impl SendMmsgBatch {
         true
     }
 
-    /// Number of datagrams currently queued.
-    pub fn len(&self) -> usize {
-        self.count
-    }
-
     /// Whether the batch is empty.
     pub fn is_empty(&self) -> bool {
         self.count == 0
