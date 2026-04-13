@@ -950,6 +950,23 @@ async fn handle_h3_request(
     let backend_start = std::time::Instant::now();
     let sticky_cookie_needed = selection.sticky_cookie_needed;
 
+    // Resolve backend IP once from DNS cache (O(1) cached lookup) before dispatch.
+    // Shared across all response paths for TransactionSummary logging.
+    let effective_host = upstream_target
+        .as_ref()
+        .map(|t| t.host.as_str())
+        .unwrap_or(&proxy.backend_host);
+    let backend_resolved_ip = state
+        .dns_cache
+        .resolve(
+            effective_host,
+            proxy.dns_override.as_deref(),
+            proxy.dns_cache_ttl_seconds,
+        )
+        .await
+        .ok()
+        .map(|ip| ip.to_string());
+
     // Determine if we can stream the request body directly to the backend
     // without buffering into Vec<u8>. Conditions:
     //   1. No plugins need request body inspection/transformation
@@ -1058,7 +1075,7 @@ async fn handle_h3_request(
                     matched_proxy_id: Some(proxy.id.clone()),
                     matched_proxy_name: proxy.name.clone(),
                     backend_target_url: Some(strip_query_params(&backend_url).to_string()),
-                    backend_resolved_ip: None,
+                    backend_resolved_ip: backend_resolved_ip.clone(),
                     response_status_code: 502,
                     latency_total_ms: total_ms,
                     latency_gateway_processing_ms: gateway_processing_ms,
@@ -1152,10 +1169,13 @@ async fn handle_h3_request(
             .map_err(|e| anyhow::anyhow!("Failed to build HTTP/3 streaming response: {}", e))?;
         stream.send_response(resp).await?;
 
-        // Stream response body from backend h3 recv_stream to frontend h3 stream
+        // Stream response body from backend h3 recv_stream to frontend h3 stream.
+        // Uses a pinned Sleep that is reset in-place to avoid allocating a new
+        // timer wheel entry on every select! iteration.
         let mut coalesce_buf = BytesMut::with_capacity(H3_COALESCE_MAX_BYTES);
         let mut total_streamed: usize = 0;
-        let mut flush_deadline = tokio::time::Instant::now() + H3_FLUSH_INTERVAL;
+        let flush_timer = tokio::time::sleep(H3_FLUSH_INTERVAL);
+        tokio::pin!(flush_timer);
         let mut stream_done = false;
 
         loop {
@@ -1185,7 +1205,7 @@ async fn handle_h3_request(
                             if coalesce_buf.len() >= H3_COALESCE_MIN_BYTES {
                                 let data = coalesce_buf.split().freeze();
                                 stream.send_data(data).await?;
-                                flush_deadline = tokio::time::Instant::now() + H3_FLUSH_INTERVAL;
+                                flush_timer.as_mut().reset(tokio::time::Instant::now() + H3_FLUSH_INTERVAL);
                             }
                         }
                         Ok(None) => { stream_done = true; }
@@ -1206,10 +1226,10 @@ async fn handle_h3_request(
                         }
                     }
                 }
-                _ = tokio::time::sleep_until(flush_deadline), if !coalesce_buf.is_empty() && !stream_done => {
+                _ = &mut flush_timer, if !coalesce_buf.is_empty() && !stream_done => {
                     let data = coalesce_buf.split().freeze();
                     stream.send_data(data).await?;
-                    flush_deadline = tokio::time::Instant::now() + H3_FLUSH_INTERVAL;
+                    flush_timer.as_mut().reset(tokio::time::Instant::now() + H3_FLUSH_INTERVAL);
                 }
             }
             if stream_done {
@@ -1243,17 +1263,6 @@ async fn handle_h3_request(
         let gateway_processing_ms = total_ms - backend_total_ms;
         let gateway_overhead_ms = (total_ms - backend_total_ms - plugin_execution_ms).max(0.0);
 
-        let h3_resolved_ip = state
-            .dns_cache
-            .resolve(
-                &proxy.backend_host,
-                proxy.dns_override.as_deref(),
-                proxy.dns_cache_ttl_seconds,
-            )
-            .await
-            .ok()
-            .map(|ip| ip.to_string());
-
         let summary = TransactionSummary {
             namespace: proxy.namespace.clone(),
             timestamp_received: ctx.timestamp_received.to_rfc3339(),
@@ -1264,7 +1273,7 @@ async fn handle_h3_request(
             matched_proxy_id: Some(proxy.id.clone()),
             matched_proxy_name: proxy.name.clone(),
             backend_target_url: Some(strip_query_params(&backend_url).to_string()),
-            backend_resolved_ip: h3_resolved_ip,
+            backend_resolved_ip: backend_resolved_ip.clone(),
             response_status_code: response_status,
             latency_total_ms: total_ms,
             latency_gateway_processing_ms: gateway_processing_ms,
@@ -1420,17 +1429,6 @@ async fn handle_h3_request(
         let gateway_processing_ms = total_ms - backend_total_ms;
         let gateway_overhead_ms = (total_ms - backend_total_ms - plugin_execution_ms).max(0.0);
 
-        let h3_resolved_ip = state
-            .dns_cache
-            .resolve(
-                &proxy.backend_host,
-                proxy.dns_override.as_deref(),
-                proxy.dns_cache_ttl_seconds,
-            )
-            .await
-            .ok()
-            .map(|ip| ip.to_string());
-
         let summary = TransactionSummary {
             namespace: proxy.namespace.clone(),
             timestamp_received: ctx.timestamp_received.to_rfc3339(),
@@ -1441,7 +1439,7 @@ async fn handle_h3_request(
             matched_proxy_id: Some(proxy.id.clone()),
             matched_proxy_name: proxy.name.clone(),
             backend_target_url: Some(strip_query_params(&backend_url).to_string()),
-            backend_resolved_ip: h3_resolved_ip,
+            backend_resolved_ip: backend_resolved_ip.clone(),
             response_status_code: response_status,
             latency_total_ms: total_ms,
             latency_gateway_processing_ms: gateway_processing_ms,
@@ -1750,17 +1748,6 @@ async fn handle_h3_request(
         let gateway_processing_ms = total_ms - backend_total_ms;
         let gateway_overhead_ms = (total_ms - backend_total_ms - plugin_execution_ms).max(0.0);
 
-        let h3_resolved_ip = state
-            .dns_cache
-            .resolve(
-                &proxy.backend_host,
-                proxy.dns_override.as_deref(),
-                proxy.dns_cache_ttl_seconds,
-            )
-            .await
-            .ok()
-            .map(|ip| ip.to_string());
-
         let summary = TransactionSummary {
             namespace: proxy.namespace.clone(),
             timestamp_received: ctx.timestamp_received.to_rfc3339(),
@@ -1771,7 +1758,7 @@ async fn handle_h3_request(
             matched_proxy_id: Some(proxy.id.clone()),
             matched_proxy_name: proxy.name.clone(),
             backend_target_url: Some(strip_query_params(&backend_url).to_string()),
-            backend_resolved_ip: h3_resolved_ip,
+            backend_resolved_ip,
             response_status_code: response_status,
             latency_total_ms: total_ms,
             latency_gateway_processing_ms: gateway_processing_ms,
@@ -1967,7 +1954,9 @@ fn inject_sticky_cookie(
 }
 
 fn classify_h3_error(e: &anyhow::Error) -> crate::retry::ErrorClass {
-    let msg = e.to_string().to_lowercase();
+    // Single allocation: write the error message directly into a lowercase String.
+    let mut msg = e.to_string();
+    msg.make_ascii_lowercase();
     if msg.contains("dns") || msg.contains("resolution") {
         crate::retry::ErrorClass::DnsLookupError
     } else if msg.contains("timed out") || msg.contains("timeout") {
@@ -2136,10 +2125,12 @@ async fn proxy_to_backend_h3_streaming(
     h3_stream.send_response(resp).await?;
 
     // Stream response body chunks from the h3 backend recv_stream with adaptive
-    // coalescing and time-based flushing.
+    // coalescing and time-based flushing. Uses a pinned Sleep to avoid
+    // allocating a new timer wheel entry on every select! iteration.
     let mut coalesce_buf = BytesMut::with_capacity(H3_COALESCE_MAX_BYTES);
     let mut total_streamed: usize = 0;
-    let mut flush_deadline = tokio::time::Instant::now() + H3_FLUSH_INTERVAL;
+    let flush_timer = tokio::time::sleep(H3_FLUSH_INTERVAL);
+    tokio::pin!(flush_timer);
     let mut stream_done = false;
 
     loop {
@@ -2169,7 +2160,7 @@ async fn proxy_to_backend_h3_streaming(
                         if coalesce_buf.len() >= H3_COALESCE_MIN_BYTES {
                             let data = coalesce_buf.split().freeze();
                             h3_stream.send_data(data).await?;
-                            flush_deadline = tokio::time::Instant::now() + H3_FLUSH_INTERVAL;
+                            flush_timer.as_mut().reset(tokio::time::Instant::now() + H3_FLUSH_INTERVAL);
                         }
                     }
                     Ok(None) => {
@@ -2187,10 +2178,10 @@ async fn proxy_to_backend_h3_streaming(
                 }
             }
 
-            _ = tokio::time::sleep_until(flush_deadline), if !coalesce_buf.is_empty() && !stream_done => {
+            _ = &mut flush_timer, if !coalesce_buf.is_empty() && !stream_done => {
                 let data = coalesce_buf.split().freeze();
                 h3_stream.send_data(data).await?;
-                flush_deadline = tokio::time::Instant::now() + H3_FLUSH_INTERVAL;
+                flush_timer.as_mut().reset(tokio::time::Instant::now() + H3_FLUSH_INTERVAL);
             }
         }
 
@@ -2282,15 +2273,14 @@ async fn proxy_to_backend_h3(
                 e
             );
             let h3_error_class = classify_h3_error(&e);
-            let error_text = if h3_error_class == crate::retry::ErrorClass::DnsLookupError {
-                "DNS resolution for backend failed"
+            let error_body: &[u8] = if h3_error_class == crate::retry::ErrorClass::DnsLookupError {
+                br#"{"error":"DNS resolution for backend failed"}"#
             } else {
-                "Backend unavailable"
+                br#"{"error":"Backend unavailable"}"#
             };
-            let error_msg = serde_json::json!({"error": error_text});
             (
                 502,
-                error_msg.to_string().into_bytes(),
+                error_body.to_vec(),
                 HashMap::new(),
                 Some(h3_error_class),
             )
@@ -2310,7 +2300,9 @@ async fn send_h3_response(
         .body(())
         .map_err(|e| anyhow::anyhow!("Failed to build HTTP/3 response: {}", e))?;
     stream.send_response(resp).await?;
-    stream.send_data(Bytes::from(body.to_string())).await?;
+    stream
+        .send_data(Bytes::copy_from_slice(body.as_bytes()))
+        .await?;
     stream.finish().await?;
     Ok(())
 }
@@ -2349,9 +2341,15 @@ fn strip_query_params(url: &str) -> &str {
 fn record_request(state: &ProxyState, status: u16) {
     use std::sync::atomic::{AtomicU64, Ordering};
     state.request_count.fetch_add(1, Ordering::Relaxed);
-    state
-        .status_counts
-        .entry(status)
-        .or_insert_with(|| AtomicU64::new(0))
-        .fetch_add(1, Ordering::Relaxed);
+    // Fast path: try read lock first — common status codes (200, 404, etc.)
+    // are pre-populated at startup. Only fall back to write lock for rare codes.
+    if let Some(counter) = state.status_counts.get(&status) {
+        counter.fetch_add(1, Ordering::Relaxed);
+    } else {
+        state
+            .status_counts
+            .entry(status)
+            .or_insert_with(|| AtomicU64::new(0))
+            .fetch_add(1, Ordering::Relaxed);
+    }
 }
