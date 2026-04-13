@@ -2477,9 +2477,11 @@ fn collect_forwardable_headers(headers: &hyper::HeaderMap) -> Vec<(String, Strin
         .collect()
 }
 
-/// Build a WebSocket backend URL with the proper ws:// or wss:// scheme,
+/// Build a WebSocket backend URL using a specific target host/port,
 /// respecting strip_listen_path, backend_path, and query string.
-/// Build a WebSocket backend URL using a specific target host/port.
+///
+/// Uses a single pre-sized `String` buffer to avoid intermediate allocations
+/// from multiple `format!()` calls (matches `build_backend_url_with_target`).
 fn build_websocket_backend_url_with_target(
     proxy: &Proxy,
     incoming_path: &str,
@@ -2488,6 +2490,8 @@ fn build_websocket_backend_url_with_target(
     port: u16,
     target_path: Option<&str>,
 ) -> String {
+    use std::fmt::Write;
+
     let scheme = match proxy.backend_protocol {
         BackendProtocol::Ws => "ws",
         BackendProtocol::Wss => "wss",
@@ -2501,22 +2505,50 @@ fn build_websocket_backend_url_with_target(
     };
 
     let backend_path = target_path.or(proxy.backend_path.as_deref()).unwrap_or("");
-    let full_path = format!("{}{}", backend_path, remaining_path);
-    let full_path = if full_path.is_empty() {
-        "/".to_string()
-    } else if !full_path.starts_with('/') {
-        format!("/{}", full_path)
+
+    // Both empty means path is just "/"
+    let path_is_root = backend_path.is_empty() && remaining_path.is_empty();
+
+    // Determine if we need to prepend a '/' (when neither segment starts with one)
+    let needs_leading_slash =
+        !path_is_root && !backend_path.starts_with('/') && !remaining_path.starts_with('/');
+
+    // Pre-calculate capacity and build in a single buffer.
+    let path_len = if path_is_root {
+        1
     } else {
-        full_path
+        (if needs_leading_slash { 1 } else { 0 }) + backend_path.len() + remaining_path.len()
     };
+    let capacity = scheme.len()
+        + 3 // "://"
+        + host.len()
+        + 6 // ":PORT" (max 5 digits + colon)
+        + path_len
+        + if query_string.is_empty() {
+            0
+        } else {
+            1 + query_string.len()
+        };
 
-    let base = format!("{}://{}:{}{}", scheme, host, port, full_path);
+    let mut url = String::with_capacity(capacity);
+    let _ = write!(url, "{}://{}:{}", scheme, host, port);
 
-    if query_string.is_empty() {
-        base
+    if path_is_root {
+        url.push('/');
     } else {
-        format!("{}?{}", base, query_string)
+        if needs_leading_slash {
+            url.push('/');
+        }
+        url.push_str(backend_path);
+        url.push_str(remaining_path);
     }
+
+    if !query_string.is_empty() {
+        url.push('?');
+        url.push_str(query_string);
+    }
+
+    url
 }
 
 /// Build a rustls TLS connector for WebSocket backends that respects

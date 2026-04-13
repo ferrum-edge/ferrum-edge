@@ -29,10 +29,19 @@ use crate::config::types::{
 use crate::dns::{DnsCache, DnsCacheResolver};
 use crate::load_balancer::LoadBalancerCache;
 use dashmap::DashMap;
+use std::fmt::Write;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 use tracing::{debug, info, warn};
+
+// Thread-local buffer for formatting "host:port" keys in `report_response()`.
+// Avoids a `String` allocation on every proxied response (hot path).
+// Matches the pattern used in `load_balancer.rs::find_target_key()`.
+thread_local! {
+    static HP_KEY_BUF: std::cell::RefCell<String> =
+        std::cell::RefCell::new(String::with_capacity(64));
+}
 
 /// Wait for a shutdown signal on a watch channel.
 async fn wait_for_shutdown(mut rx: tokio::sync::watch::Receiver<bool>) {
@@ -304,76 +313,89 @@ impl HealthChecker {
         };
 
         let proxy_state = self.get_proxy_state(proxy_id);
-        let hp_key = host_port_key(target);
 
-        // Get or create target health state within this proxy's partition
-        let state = if let Some(existing) = proxy_state.states.get(&hp_key) {
-            existing.clone()
-        } else {
-            proxy_state
-                .states
-                .entry(hp_key.clone())
-                .or_insert_with(|| Arc::new(TargetHealth::new()))
-                .clone()
-        };
+        // Format "host:port" into a thread-local buffer to avoid a String
+        // allocation on every proxied response. DashMap lookups use &str
+        // (zero-alloc hot path); only DashMap inserts (rare cold path) clone.
+        HP_KEY_BUF.with(|buf| {
+            let mut buf = buf.borrow_mut();
+            buf.clear();
+            let _ = write!(buf, "{}:{}", target.host, target.port);
 
-        if connection_error || config.unhealthy_status_codes.contains(&status_code) {
-            state.consecutive_successes.store(0, Ordering::Relaxed);
-            state.consecutive_failures.fetch_add(1, Ordering::Relaxed);
+            // Get or create target health state within this proxy's partition.
+            // Fast path: get() uses a shared read lock (most requests hit this).
+            let state = if let Some(existing) = proxy_state.states.get(buf.as_str()) {
+                existing.clone()
+            } else {
+                // Cold path: first encounter of this target — allocate key for insert.
+                proxy_state
+                    .states
+                    .entry(buf.clone())
+                    .or_insert_with(|| Arc::new(TargetHealth::new()))
+                    .clone()
+            };
 
-            let now_ms = now_epoch_ms();
-            let counter = state.failure_counter.fetch_add(1, Ordering::Relaxed);
-            state.recent_failures.insert(counter, now_ms);
+            if connection_error || config.unhealthy_status_codes.contains(&status_code) {
+                state.consecutive_successes.store(0, Ordering::Relaxed);
+                state.consecutive_failures.fetch_add(1, Ordering::Relaxed);
 
-            // Clean old failures outside the window
-            let window_start = now_ms.saturating_sub(config.unhealthy_window_seconds * 1000);
-            state
-                .recent_failures
-                .retain(|_, &mut ts| ts >= window_start);
+                let now_ms = now_epoch_ms();
+                let counter = state.failure_counter.fetch_add(1, Ordering::Relaxed);
+                state.recent_failures.insert(counter, now_ms);
 
-            // Hard cap: prevent unbounded memory growth
-            if state.recent_failures.len() > MAX_RECENT_FAILURES_PER_TARGET {
-                let excess = state.recent_failures.len() - MAX_RECENT_FAILURES_PER_TARGET;
-                let mut to_remove: Vec<u64> = state
+                // Clean old failures outside the window
+                let window_start =
+                    now_ms.saturating_sub(config.unhealthy_window_seconds * 1000);
+                state
                     .recent_failures
-                    .iter()
-                    .map(|entry| *entry.key())
-                    .collect();
-                to_remove.sort_unstable();
-                for key in to_remove.into_iter().take(excess) {
-                    state.recent_failures.remove(&key);
+                    .retain(|_, &mut ts| ts >= window_start);
+
+                // Hard cap: prevent unbounded memory growth
+                if state.recent_failures.len() > MAX_RECENT_FAILURES_PER_TARGET {
+                    let excess =
+                        state.recent_failures.len() - MAX_RECENT_FAILURES_PER_TARGET;
+                    let mut to_remove: Vec<u64> = state
+                        .recent_failures
+                        .iter()
+                        .map(|entry| *entry.key())
+                        .collect();
+                    to_remove.sort_unstable();
+                    for key in to_remove.into_iter().take(excess) {
+                        state.recent_failures.remove(&key);
+                    }
                 }
-            }
 
-            let failures_in_window = state.recent_failures.len() as u32;
-            if failures_in_window >= config.unhealthy_threshold
-                && !proxy_state.unhealthy.contains_key(&hp_key)
-            {
-                warn!(
-                    "Passive health check: marking target {} as unhealthy for proxy {} ({} failures in {}s window)",
-                    hp_key, proxy_id, failures_in_window, config.unhealthy_window_seconds
-                );
-                proxy_state.unhealthy.insert(hp_key, now_epoch_ms());
-            }
-        } else {
-            let failures = state.consecutive_failures.load(Ordering::Relaxed);
-            state.consecutive_successes.fetch_add(1, Ordering::Relaxed);
-            if failures > 0 {
-                state.consecutive_failures.store(0, Ordering::Relaxed);
-            }
-
-            if proxy_state.unhealthy.contains_key(&hp_key) {
-                let successes = state.consecutive_successes.load(Ordering::Relaxed);
-                if successes >= 1 {
-                    info!(
-                        "Passive health check: marking target {} as healthy again for proxy {}",
-                        hp_key, proxy_id
+                let failures_in_window = state.recent_failures.len() as u32;
+                if failures_in_window >= config.unhealthy_threshold
+                    && !proxy_state.unhealthy.contains_key(buf.as_str())
+                {
+                    warn!(
+                        "Passive health check: marking target {} as unhealthy for proxy {} ({} failures in {}s window)",
+                        buf.as_str(), proxy_id, failures_in_window, config.unhealthy_window_seconds
                     );
-                    proxy_state.unhealthy.remove(&hp_key);
-                    state.recent_failures.clear();
+                    // Cold path: threshold breach — allocate key for insert.
+                    proxy_state.unhealthy.insert(buf.clone(), now_epoch_ms());
+                }
+            } else {
+                let failures = state.consecutive_failures.load(Ordering::Relaxed);
+                state.consecutive_successes.fetch_add(1, Ordering::Relaxed);
+                if failures > 0 {
+                    state.consecutive_failures.store(0, Ordering::Relaxed);
+                }
+
+                if proxy_state.unhealthy.contains_key(buf.as_str()) {
+                    let successes = state.consecutive_successes.load(Ordering::Relaxed);
+                    if successes >= 1 {
+                        info!(
+                            "Passive health check: marking target {} as healthy again for proxy {}",
+                            buf.as_str(), proxy_id
+                        );
+                        proxy_state.unhealthy.remove(buf.as_str());
+                        state.recent_failures.clear();
+                    }
                 }
             }
-        }
+        });
     }
 
     /// Remove health state for targets no longer in the active target list.
