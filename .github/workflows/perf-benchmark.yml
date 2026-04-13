@@ -113,23 +113,29 @@ jobs:
         run: |
           mkdir -p benchmark-results
 
-          # The --json flag makes each proto_bench invocation print a JSON
-          # object.  Collect them from the interleaved output.
+          # The --json flag makes each proto_bench invocation print pretty-printed
+          # multi-line JSON objects interleaved with shell log lines.  Use
+          # json.JSONDecoder.raw_decode to extract complete objects from the stream.
           python3 - /tmp/bench_output.txt benchmark-results/results.json <<'PYEOF'
-          import json, re, sys
+          import json, sys
 
           output_file = sys.argv[2]
           raw = open(sys.argv[1]).read()
 
-          # Each JSON blob is a single line starting with {
+          decoder = json.JSONDecoder()
           blobs = []
-          for line in raw.splitlines():
-              line = line.strip()
-              if line.startswith("{"):
-                  try:
-                      blobs.append(json.loads(line))
-                  except json.JSONDecodeError:
-                      pass
+          i = 0
+          while i < len(raw):
+              # Skip to the next '{' which may start a JSON object
+              idx = raw.find("{", i)
+              if idx == -1:
+                  break
+              try:
+                  obj, end = decoder.raw_decode(raw, idx)
+                  blobs.append(obj)
+                  i = end
+              except json.JSONDecodeError:
+                  i = idx + 1
 
           results = {"benchmarks": blobs}
           with open(output_file, "w") as f:
