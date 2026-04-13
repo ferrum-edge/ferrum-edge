@@ -548,11 +548,11 @@ jobs:
                               if f_rps is not None and r_rps is not None:
                                   if f_rps > r_rps:
                                       ferrum_wins += 1
-                                      pct = ((f_rps - r_rps) / r_rps) * 100
+                                      pct = ((f_rps - r_rps) / r_rps) * 100 if r_rps > 0 else 0
                                       comparisons.append(f"  - {proto.upper()} /{ep}: Ferrum +{pct:.1f}% ({fmt_rps(f_rps)} vs {fmt_rps(r_rps)})")
                                   else:
                                       rival_wins += 1
-                                      pct = ((r_rps - f_rps) / f_rps) * 100
+                                      pct = ((r_rps - f_rps) / f_rps) * 100 if f_rps > 0 else 0
                                       comparisons.append(f"  - {proto.upper()} /{ep}: {GATEWAY_LABELS[rival]} +{pct:.1f}% ({fmt_rps(r_rps)} vs {fmt_rps(f_rps)})")
 
                       # Key-auth comparison
@@ -561,11 +561,11 @@ jobs:
                       if f_ka is not None and r_ka is not None:
                           if f_ka > r_ka:
                               ferrum_wins += 1
-                              pct = ((f_ka - r_ka) / r_ka) * 100
+                              pct = ((f_ka - r_ka) / r_ka) * 100 if r_ka > 0 else 0
                               comparisons.append(f"  - KEY-AUTH: Ferrum +{pct:.1f}% ({fmt_rps(f_ka)} vs {fmt_rps(r_ka)})")
                           else:
                               rival_wins += 1
-                              pct = ((r_ka - f_ka) / f_ka) * 100
+                              pct = ((r_ka - f_ka) / f_ka) * 100 if f_ka > 0 else 0
                               comparisons.append(f"  - KEY-AUTH: {GATEWAY_LABELS[rival]} +{pct:.1f}% ({fmt_rps(r_ka)} vs {fmt_rps(f_ka)})")
 
                       total = ferrum_wins + rival_wins
