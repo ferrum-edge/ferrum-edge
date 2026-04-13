@@ -2509,9 +2509,14 @@ fn build_websocket_backend_url_with_target(
     // Both empty means path is just "/"
     let path_is_root = backend_path.is_empty() && remaining_path.is_empty();
 
-    // Determine if we need to prepend a '/' (when neither segment starts with one)
-    let needs_leading_slash =
-        !path_is_root && !backend_path.starts_with('/') && !remaining_path.starts_with('/');
+    // Determine if we need to prepend a '/'. The first byte of the combined
+    // path is determined by backend_path (if non-empty) or remaining_path.
+    let combined_starts_with_slash = if !backend_path.is_empty() {
+        backend_path.starts_with('/')
+    } else {
+        remaining_path.starts_with('/')
+    };
+    let needs_leading_slash = !path_is_root && !combined_starts_with_slash;
 
     // Pre-calculate capacity and build in a single buffer.
     let path_len = if path_is_root {
