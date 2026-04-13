@@ -22,7 +22,7 @@ on:
       duration:
         description: "Test duration per protocol (seconds)"
         required: false
-        default: "10"
+        default: "5"
         type: string
       concurrency:
         description: "Concurrent connections"
