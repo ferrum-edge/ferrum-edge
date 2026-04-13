@@ -2,9 +2,9 @@
 # HTTP/2 performance test config
 # Gateway listens on HTTP (8000) and HTTPS (8443), proxies to HTTPS backend with HTTP/2 over TLS
 proxies:
-  - id: "h2-users"
-    name: "HTTP/2 Users API"
-    listen_path: "/api/users"
+  - id: "h2-echo"
+    name: "HTTP/2 Echo"
+    listen_path: "/echo"
     backend_protocol: https
     backend_host: "127.0.0.1"
     backend_port: 3443

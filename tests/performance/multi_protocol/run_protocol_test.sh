@@ -30,7 +30,7 @@ PROTOCOL="${1:-all}"
 shift 2>/dev/null || true
 DURATION=30
 CONCURRENCY=100
-PAYLOAD_SIZE=64
+PAYLOAD_SIZE=10240
 JSON_FLAG=""
 SKIP_BUILD=false
 ENVOY_MODE=false
@@ -327,7 +327,7 @@ run_bench() {
     echo -e "\n${CYAN}════════════════════════════════════════${NC}"
     echo -e "${CYAN}  $label${NC}"
     echo -e "${CYAN}  Target: $target${NC}"
-    echo -e "${CYAN}  Duration: ${DURATION}s  Concurrency: $CONCURRENCY${NC}"
+    echo -e "${CYAN}  Duration: ${DURATION}s  Concurrency: $CONCURRENCY  Payload: ${PAYLOAD_SIZE}B${NC}"
     echo -e "${CYAN}════════════════════════════════════════${NC}\n"
 
     "$SCRIPT_DIR/target/release/proto_bench" "$proto" \
@@ -370,29 +370,29 @@ run_bench_capture() {
 test_http1() {
     start_gateway "$SCRIPT_DIR/configs/http1_perf.yaml"
     sleep 1
-    run_bench "HTTP/1.1 (via gateway)" http1 "http://127.0.0.1:$GATEWAY_HTTP_PORT/api/users"
-    run_bench "HTTP/1.1 (direct backend)" http1 "http://127.0.0.1:3001/api/users"
+    run_bench "HTTP/1.1 (via gateway)" http1 "http://127.0.0.1:$GATEWAY_HTTP_PORT/echo"
+    run_bench "HTTP/1.1 (direct backend)" http1 "http://127.0.0.1:3001/echo"
 }
 
 test_http1_tls() {
     start_gateway "$SCRIPT_DIR/configs/http1_tls_perf.yaml"
     sleep 1
-    run_bench "HTTP/1.1+TLS (via gateway)" http1 "https://127.0.0.1:$GATEWAY_HTTPS_PORT/api/users"
-    run_bench "HTTP/1.1+TLS (direct backend - no TLS)" http1 "http://127.0.0.1:3001/api/users"
+    run_bench "HTTP/1.1+TLS (via gateway)" http1 "https://127.0.0.1:$GATEWAY_HTTPS_PORT/echo"
+    run_bench "HTTP/1.1+TLS (direct backend - no TLS)" http1 "http://127.0.0.1:3001/echo"
 }
 
 test_http2() {
     start_gateway "$SCRIPT_DIR/configs/http2_perf.yaml" "FERRUM_POOL_ENABLE_HTTP2=true"
     sleep 1
-    run_bench "HTTP/2 (via gateway)" http2 "https://127.0.0.1:$GATEWAY_HTTPS_PORT/api/users"
-    run_bench "HTTP/2 (direct backend)" http2 "https://127.0.0.1:3443/api/users"
+    run_bench "HTTP/2 (via gateway)" http2 "https://127.0.0.1:$GATEWAY_HTTPS_PORT/echo"
+    run_bench "HTTP/2 (direct backend)" http2 "https://127.0.0.1:3443/echo"
 }
 
 test_http3() {
     start_gateway "$SCRIPT_DIR/configs/http3_perf.yaml" "FERRUM_ENABLE_HTTP3=true"
     sleep 1
-    run_bench "HTTP/3 (via gateway)" http3 "https://127.0.0.1:$GATEWAY_HTTPS_PORT/api/users"
-    run_bench "HTTP/3 (direct backend)" http3 "https://127.0.0.1:3445/api/users"
+    run_bench "HTTP/3 (via gateway)" http3 "https://127.0.0.1:$GATEWAY_HTTPS_PORT/echo"
+    run_bench "HTTP/3 (direct backend)" http3 "https://127.0.0.1:3445/echo"
 }
 
 test_ws() {
@@ -426,15 +426,21 @@ test_tcp_tls() {
 test_udp() {
     start_gateway "$SCRIPT_DIR/configs/udp_perf.yaml"
     sleep 1
+    local SAVED_PAYLOAD=$PAYLOAD_SIZE
+    PAYLOAD_SIZE=2048
     run_bench "UDP (via gateway)" udp "127.0.0.1:5003"
     run_bench "UDP (direct backend)" udp "127.0.0.1:3005"
+    PAYLOAD_SIZE=$SAVED_PAYLOAD
 }
 
 test_udp_dtls() {
     start_gateway "$SCRIPT_DIR/configs/udp_dtls_perf.yaml"
     sleep 1
+    local SAVED_PAYLOAD=$PAYLOAD_SIZE
+    PAYLOAD_SIZE=2048
     run_bench "UDP+DTLS (via gateway)" udp "127.0.0.1:5004" --tls
     run_bench "UDP+DTLS (direct backend)" udp "127.0.0.1:3006" --tls
+    PAYLOAD_SIZE=$SAVED_PAYLOAD
 }
 
 # ── Envoy comparison mode ────────────────────────────────────────────────────
@@ -454,15 +460,15 @@ envoy_compare_protocol() {
     case "$p" in
         http1)
             bench_proto=http1
-            bench_target="http://127.0.0.1:$GATEWAY_HTTP_PORT/api/users"
-            direct_target="http://127.0.0.1:3001/api/users"
+            bench_target="http://127.0.0.1:$GATEWAY_HTTP_PORT/echo"
+            direct_target="http://127.0.0.1:3001/echo"
             ferrum_config="$SCRIPT_DIR/configs/http1_perf.yaml"
             envoy_config="$SCRIPT_DIR/configs/envoy/http1.yaml"
             ;;
         http1-tls)
             bench_proto=http1
-            bench_target="https://127.0.0.1:$GATEWAY_HTTPS_PORT/api/users"
-            direct_target="http://127.0.0.1:3001/api/users"
+            bench_target="https://127.0.0.1:$GATEWAY_HTTPS_PORT/echo"
+            direct_target="http://127.0.0.1:3001/echo"
             ferrum_config="$SCRIPT_DIR/configs/http1_tls_perf.yaml"
             envoy_config="$SCRIPT_DIR/configs/envoy/http1_tls.yaml"
             ;;
@@ -508,6 +514,12 @@ envoy_compare_protocol() {
             ;;
     esac
 
+    # Override payload size for UDP protocols
+    local SAVED_PAYLOAD=$PAYLOAD_SIZE
+    case "$p" in
+        udp|udp-dtls) PAYLOAD_SIZE=2048 ;;
+    esac
+
     echo -e "\n${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     echo -e "${BLUE}  ${BOLD}$p${NC}"
     echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
@@ -529,6 +541,9 @@ envoy_compare_protocol() {
     # Direct backend baseline
     echo -e "  ${MAGENTA}▸ Direct backend${NC}"
     run_bench_capture "direct_${p}.json" "Direct → $direct_target" "$bench_proto" "$direct_target" $bench_extra
+
+    # Restore payload size
+    PAYLOAD_SIZE=$SAVED_PAYLOAD
 }
 
 print_comparison_table() {
@@ -576,7 +591,7 @@ print()
 print("\033[1m" + "=" * 105 + "\033[0m")
 print("\033[1m  Ferrum Edge vs Envoy \u2014 Through-Gateway Comparison\033[0m")
 if first:
-    print(f"  Duration: {first.get('duration_secs','')}s | Concurrency: {first.get('concurrency','')} | Payload: 64 bytes")
+    print(f"  Duration: {first.get('duration_secs','')}s | Concurrency: {first.get('concurrency','')} | Payload: 10 KB (2 KB for UDP)")
 print("\033[1m" + "=" * 105 + "\033[0m")
 print()
 

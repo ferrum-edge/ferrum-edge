@@ -26,8 +26,50 @@ use crate::config::types::Proxy;
 #[allow(dead_code)]
 const DEFAULT_MTU: usize = 1200;
 
-/// Reusable output buffer size for `poll_output()`. Must be >= MTU + record overhead.
-const OUTPUT_BUF_SIZE: usize = 2048;
+/// Default DTLS record overhead: 13-byte header + up to 16-byte auth tag (AES-GCM) +
+/// padding. Observed: 22 bytes for AES-128-GCM. 64 bytes gives conservative headroom
+/// for cipher suite variations and future DTLS versions.
+///
+/// Override: `FERRUM_DTLS_RECORD_OVERHEAD_BYTES` (default: 64).
+const DEFAULT_DTLS_RECORD_OVERHEAD: usize = 64;
+
+/// Default maximum plaintext payload per DTLS record: 2^14 (16,384) bytes per the DTLS
+/// spec (RFC 9147 §4.1). Datagrams exceeding this are dropped with a warning before
+/// reaching dimpl (which would panic on buffer overflow).
+///
+/// Override: `FERRUM_DTLS_MAX_PLAINTEXT_BYTES` (default: 16384).
+const DEFAULT_DTLS_MAX_PLAINTEXT: usize = 16_384;
+
+/// Cached DTLS buffer configuration, initialized from `EnvConfig` at startup.
+struct DtlsBufConfig {
+    /// Max plaintext payload that can be encrypted.
+    max_plaintext: usize,
+    /// Output buffer size = max_plaintext + record_overhead.
+    output_buf_size: usize,
+}
+
+static DTLS_BUF_CONFIG: std::sync::OnceLock<DtlsBufConfig> = std::sync::OnceLock::new();
+
+/// Initialize DTLS buffer configuration from resolved `EnvConfig` values.
+/// Must be called after `EnvConfig` is parsed (before any DTLS connections).
+/// Uses saturating arithmetic to prevent overflow with extreme values.
+pub fn init_dtls_buf_config(max_plaintext: usize, record_overhead: usize) {
+    let _ = DTLS_BUF_CONFIG.set(DtlsBufConfig {
+        max_plaintext,
+        output_buf_size: max_plaintext.saturating_add(record_overhead),
+    });
+}
+
+fn dtls_buf_config() -> &'static DtlsBufConfig {
+    DTLS_BUF_CONFIG.get_or_init(|| {
+        // Fallback if init_dtls_buf_config() was never called (e.g. tests).
+        DtlsBufConfig {
+            max_plaintext: DEFAULT_DTLS_MAX_PLAINTEXT,
+            output_buf_size: DEFAULT_DTLS_MAX_PLAINTEXT
+                .saturating_add(DEFAULT_DTLS_RECORD_OVERHEAD),
+        }
+    })
+}
 
 /// Maximum datagrams to drain per `poll_output` loop before yielding.
 const MAX_OUTPUTS_PER_DRAIN: usize = 64;
@@ -185,7 +227,7 @@ impl DtlsConnection {
         dtls.set_active(true); // client role
 
         // Drive handshake to completion
-        let mut out_buf = vec![0u8; OUTPUT_BUF_SIZE];
+        let mut out_buf = vec![0u8; dtls_buf_config().output_buf_size];
         let mut recv_buf = vec![0u8; 65536];
         let mut next_timeout: Option<Instant> = None;
 
@@ -258,7 +300,7 @@ impl DtlsConnection {
 
         tokio::spawn(async move {
             let mut dtls = dtls;
-            let mut out_buf = vec![0u8; OUTPUT_BUF_SIZE];
+            let mut out_buf = vec![0u8; dtls_buf_config().output_buf_size];
             let mut recv_buf = vec![0u8; 65536];
             let mut next_timeout: Option<Instant> = None;
 
@@ -282,6 +324,14 @@ impl DtlsConnection {
                     }
                     // Application data to send
                     Some(data) = driver_app_rx.recv() => {
+                        if data.len() > dtls_buf_config().max_plaintext {
+                            warn!(
+                                "DTLS dropping oversized datagram ({} bytes, max {})",
+                                data.len(),
+                                dtls_buf_config().max_plaintext,
+                            );
+                            continue;
+                        }
                         if let Err(e) = dtls.send_application_data(&data) {
                             trace!("DTLS send_application_data error: {}", e);
                             break;
@@ -585,7 +635,7 @@ impl DtlsServer {
             // post-ClientHello drain.
             let _ = dtls.handle_timeout(Instant::now());
 
-            let mut out_buf = vec![0u8; OUTPUT_BUF_SIZE];
+            let mut out_buf = vec![0u8; dtls_buf_config().output_buf_size];
             let mut next_timeout: Option<Instant> = None;
             let mut connected = false;
             // Collect client certificate DER bytes emitted via Output::PeerCert
@@ -641,6 +691,15 @@ impl DtlsServer {
                     }
                     // Application data to send back to this client
                     Some(data) = app_in_rx.recv(), if connected => {
+                        if data.len() > dtls_buf_config().max_plaintext {
+                            warn!(
+                                client = %peer_addr,
+                                "DTLS dropping oversized datagram ({} bytes, max {})",
+                                data.len(),
+                                dtls_buf_config().max_plaintext,
+                            );
+                            continue;
+                        }
                         if let Err(e) = dtls.send_application_data(&data) {
                             trace!(client = %peer_addr, "DTLS send error: {}", e);
                             break;

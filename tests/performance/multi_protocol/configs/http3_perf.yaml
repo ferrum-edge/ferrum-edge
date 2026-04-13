@@ -2,9 +2,9 @@
 # HTTP/3 (QUIC) performance test config
 # Gateway listens with HTTP/3 enabled, proxies to HTTP/3 backend
 proxies:
-  - id: "h3-users"
-    name: "HTTP/3 Users API"
-    listen_path: "/api/users"
+  - id: "h3-echo"
+    name: "HTTP/3 Echo"
+    listen_path: "/echo"
     backend_protocol: h3
     backend_host: "127.0.0.1"
     backend_port: 3445

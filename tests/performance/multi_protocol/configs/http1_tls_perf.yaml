@@ -2,9 +2,9 @@
 # HTTP/1.1+TLS performance test config
 # Gateway terminates TLS on HTTPS (8443), proxies to plain HTTP/1.1 backend
 proxies:
-  - id: "h1-tls-users"
-    name: "HTTP/1.1+TLS Users API"
-    listen_path: "/api/users"
+  - id: "h1-tls-echo"
+    name: "HTTP/1.1+TLS Echo"
+    listen_path: "/echo"
     backend_protocol: http
     backend_host: "127.0.0.1"
     backend_port: 3001

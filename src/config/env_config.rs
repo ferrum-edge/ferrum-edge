@@ -551,6 +551,13 @@ pub struct EnvConfig {
     /// DTLS connections using this trust store. Separate from the TLS client CA used
     /// for TCP frontend mTLS (`FERRUM_TLS_CLIENT_CA_CERT_PATH`).
     pub dtls_client_ca_cert_path: Option<String>,
+    /// Maximum plaintext payload bytes per DTLS record. Datagrams exceeding this are
+    /// dropped with a warning. Default: 16384 (2^14, per RFC 9147 §4.1). Increase only
+    /// if your UDP application sends datagrams larger than 16 KB over DTLS.
+    pub dtls_max_plaintext_bytes: usize,
+    /// DTLS record overhead bytes (header + auth tag). Default: 64. The output buffer
+    /// per DTLS session is `dtls_max_plaintext_bytes + dtls_record_overhead_bytes`.
+    pub dtls_record_overhead_bytes: usize,
 
     // Client IP resolution
     /// Comma-separated trusted proxy CIDRs/IPs for X-Forwarded-For resolution.
@@ -831,6 +838,8 @@ impl Default for EnvConfig {
             dtls_cert_path: None,
             dtls_key_path: None,
             dtls_client_ca_cert_path: None,
+            dtls_max_plaintext_bytes: 16_384,
+            dtls_record_overhead_bytes: 64,
             enable_http3: false,
             http3_idle_timeout: 30,
             http3_max_streams: 1000,
@@ -1178,6 +1187,12 @@ impl EnvConfig {
             dtls_cert_path: resolve_var(conf, "FERRUM_DTLS_CERT_PATH"),
             dtls_key_path: resolve_var(conf, "FERRUM_DTLS_KEY_PATH"),
             dtls_client_ca_cert_path: resolve_var(conf, "FERRUM_DTLS_CLIENT_CA_CERT_PATH"),
+            dtls_max_plaintext_bytes: resolve_var(conf, "FERRUM_DTLS_MAX_PLAINTEXT_BYTES")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(16_384),
+            dtls_record_overhead_bytes: resolve_var(conf, "FERRUM_DTLS_RECORD_OVERHEAD_BYTES")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(64),
 
             // HTTP/3 / QUIC
             enable_http3: resolve_bool(conf, "FERRUM_ENABLE_HTTP3", false),

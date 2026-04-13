@@ -204,6 +204,12 @@ fn main() {
         }
     };
 
+    // Initialize DTLS buffer config from resolved EnvConfig before any DTLS sessions.
+    crate::dtls::init_dtls_buf_config(
+        env_config.dtls_max_plaintext_bytes,
+        env_config.dtls_record_overhead_bytes,
+    );
+
     info!("Operating mode: {:?}", env_config.mode);
     info!(
         "Proxy bind address: {}, Admin bind address: {}",
