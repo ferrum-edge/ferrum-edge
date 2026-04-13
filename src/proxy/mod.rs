@@ -3176,26 +3176,33 @@ async fn run_accept_loop(
                             drop(stream); // TCP RST
                             continue;
                         }
+                        // Acquire connection permit before spawning. This avoids
+                        // creating tasks that queue on the semaphore under floods —
+                        // over-limit connections are dropped immediately with zero
+                        // task overhead (no spawn, no state.clone, no scheduler slot).
+                        let conn_permit = if let Some(ref sem) = conn_semaphore {
+                            match sem.clone().try_acquire_owned() {
+                                Ok(permit) => Some(permit),
+                                Err(_) => {
+                                    drop(stream); // TCP RST — at capacity
+                                    continue;
+                                }
+                            }
+                        } else {
+                            None
+                        };
+
                         let state = state.clone();
                         let tls_config = tls_config.clone();
-                        let semaphore = conn_semaphore.clone();
 
                         tokio::spawn(async move {
+                            // Hold the permit for the connection lifetime.
+                            // Released automatically when _conn_permit drops on any exit path.
+                            let _conn_permit = conn_permit;
+
                             // Track this connection for graceful drain.
                             // The guard decrements the counter on drop (all exit paths).
                             let _conn_guard = crate::overload::ConnectionGuard::new(&state.overload);
-
-                            // Acquire connection permit if limit is configured.
-                            // The permit is held for the connection lifetime and
-                            // released automatically when _permit drops.
-                            let _permit = if let Some(ref sem) = semaphore {
-                                match sem.acquire().await {
-                                    Ok(permit) => Some(permit),
-                                    Err(_) => return, // semaphore closed — shutdown
-                                }
-                            } else {
-                                None
-                            };
 
                             let result = if let Some(tls_config) = tls_config {
                                 handle_tls_connection(stream, remote_addr, state, tls_config).await
