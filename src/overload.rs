@@ -33,6 +33,10 @@ pub struct OverloadState {
     pub disable_keepalive: AtomicBool,
     /// When true, new connections are rejected with 503 before routing.
     pub reject_new_connections: AtomicBool,
+    /// When true, new requests/streams are rejected with 503 before processing.
+    /// Independent of `reject_new_connections` — connections track sockets,
+    /// requests track multiplexed H2/H3/gRPC streams.
+    pub reject_new_requests: AtomicBool,
 
     // ── Graceful shutdown drain ────────────────────────────────────────
     /// Set to true when SIGTERM/SIGINT is received to begin the drain phase.
@@ -40,7 +44,12 @@ pub struct OverloadState {
     /// In-flight connection counter. Incremented on accept, decremented on drop
     /// via [`ConnectionGuard`].
     pub active_connections: AtomicU64,
-    /// Notified each time `active_connections` reaches zero during drain.
+    /// In-flight request/stream counter. Incremented on request start, decremented
+    /// on drop via [`RequestGuard`]. Tracks H1 requests, H2/gRPC streams, and H3
+    /// streams independently of connections.
+    pub active_requests: AtomicU64,
+    /// Notified each time `active_connections` or `active_requests` reaches zero
+    /// during drain. The drain waiter re-checks both counters in a loop.
     pub drain_complete: tokio::sync::Notify,
 
     // ── RED adaptive load shedding ────────────────────────────────────
@@ -58,6 +67,8 @@ pub struct OverloadState {
     pub fd_max: AtomicU64,
     pub conn_current: AtomicU64,
     pub conn_max: AtomicU64,
+    pub req_current: AtomicU64,
+    pub req_max: AtomicU64,
     pub loop_latency_us: AtomicU64,
 }
 
@@ -72,8 +83,10 @@ impl OverloadState {
         Self {
             disable_keepalive: AtomicBool::new(false),
             reject_new_connections: AtomicBool::new(false),
+            reject_new_requests: AtomicBool::new(false),
             draining: AtomicBool::new(false),
             active_connections: AtomicU64::new(0),
+            active_requests: AtomicU64::new(0),
             drain_complete: tokio::sync::Notify::new(),
             red_drop_probability: AtomicU32::new(0),
             red_request_counter: AtomicU64::new(0),
@@ -81,13 +94,17 @@ impl OverloadState {
             fd_max: AtomicU64::new(0),
             conn_current: AtomicU64::new(0),
             conn_max: AtomicU64::new(0),
+            req_current: AtomicU64::new(0),
+            req_max: AtomicU64::new(0),
             loop_latency_us: AtomicU64::new(0),
         }
     }
 
     /// Current overload level derived from the action flags.
     pub fn level(&self) -> OverloadLevel {
-        if self.reject_new_connections.load(Ordering::Relaxed) {
+        if self.reject_new_connections.load(Ordering::Relaxed)
+            || self.reject_new_requests.load(Ordering::Relaxed)
+        {
             OverloadLevel::Critical
         } else if self.disable_keepalive.load(Ordering::Relaxed) {
             OverloadLevel::Pressure
@@ -122,10 +139,13 @@ impl OverloadState {
         let fd_max = self.fd_max.load(Ordering::Relaxed);
         let conn_current = self.conn_current.load(Ordering::Relaxed);
         let conn_max = self.conn_max.load(Ordering::Relaxed);
+        let req_current = self.req_current.load(Ordering::Relaxed);
+        let req_max = self.req_max.load(Ordering::Relaxed);
         OverloadSnapshot {
             level: self.level(),
             draining: self.draining.load(Ordering::Relaxed),
             active_connections: self.active_connections.load(Ordering::Relaxed),
+            active_requests: self.active_requests.load(Ordering::Relaxed),
             red_drop_probability_pct: self.red_drop_probability.load(Ordering::Relaxed) as f64
                 / 10.0,
             pressure: PressureSnapshot {
@@ -147,11 +167,21 @@ impl OverloadState {
                         0.0
                     },
                 },
+                requests: ReqPressure {
+                    current: req_current,
+                    max: req_max,
+                    ratio: if req_max > 0 {
+                        req_current as f64 / req_max as f64
+                    } else {
+                        0.0
+                    },
+                },
                 event_loop_latency_us: self.loop_latency_us.load(Ordering::Relaxed),
             },
             actions: ActionSnapshot {
                 disable_keepalive: self.disable_keepalive.load(Ordering::Relaxed),
                 reject_new_connections: self.reject_new_connections.load(Ordering::Relaxed),
+                reject_new_requests: self.reject_new_requests.load(Ordering::Relaxed),
             },
         }
     }
@@ -187,6 +217,36 @@ impl Drop for ConnectionGuard {
     }
 }
 
+/// RAII guard that decrements [`OverloadState::active_requests`] on drop.
+///
+/// Created for every accepted request/stream (H1 requests, H2/gRPC streams,
+/// H3 streams). Cost: one `fetch_add(Relaxed)` on construction, one
+/// `fetch_sub(Relaxed)` on drop (~5ns each, no contention).
+pub struct RequestGuard {
+    state: Arc<OverloadState>,
+}
+
+impl RequestGuard {
+    pub fn new(state: &Arc<OverloadState>) -> Self {
+        state.active_requests.fetch_add(1, Ordering::Relaxed);
+        Self {
+            state: state.clone(),
+        }
+    }
+}
+
+impl Drop for RequestGuard {
+    fn drop(&mut self) {
+        let prev = self.state.active_requests.fetch_sub(1, Ordering::Relaxed);
+        // If this was the last request and we are draining, notify the waiter.
+        // The drain waiter re-checks both active_connections and active_requests,
+        // so spurious wakes from one counter reaching zero are harmless.
+        if prev == 1 && self.state.draining.load(Ordering::Relaxed) {
+            self.state.drain_complete.notify_one();
+        }
+    }
+}
+
 // ── Serializable snapshot types ──────────────────────────────────────────
 
 #[derive(Debug, serde::Serialize)]
@@ -194,6 +254,7 @@ pub struct OverloadSnapshot {
     pub level: OverloadLevel,
     pub draining: bool,
     pub active_connections: u64,
+    pub active_requests: u64,
     pub red_drop_probability_pct: f64,
     pub pressure: PressureSnapshot,
     pub actions: ActionSnapshot,
@@ -203,6 +264,7 @@ pub struct OverloadSnapshot {
 pub struct PressureSnapshot {
     pub file_descriptors: FdPressure,
     pub connections: ConnPressure,
+    pub requests: ReqPressure,
     pub event_loop_latency_us: u64,
 }
 
@@ -221,9 +283,17 @@ pub struct ConnPressure {
 }
 
 #[derive(Debug, serde::Serialize)]
+pub struct ReqPressure {
+    pub current: u64,
+    pub max: u64,
+    pub ratio: f64,
+}
+
+#[derive(Debug, serde::Serialize)]
 pub struct ActionSnapshot {
     pub disable_keepalive: bool,
     pub reject_new_connections: bool,
+    pub reject_new_requests: bool,
 }
 
 // ── Overload manager configuration ──────────────────────────────────────
@@ -241,6 +311,10 @@ pub struct OverloadConfig {
     pub conn_pressure_threshold: f64,
     /// Connection semaphore usage above which new connections are rejected (default: 0.95).
     pub conn_critical_threshold: f64,
+    /// Request usage above which keepalive is disabled (default: 0.85).
+    pub req_pressure_threshold: f64,
+    /// Request usage above which new requests are rejected (default: 0.95).
+    pub req_critical_threshold: f64,
     /// Event loop latency (μs) above which a warning is logged (default: 10_000 = 10ms).
     pub loop_warn_us: u64,
     /// Event loop latency (μs) above which new connections are rejected (default: 500_000 = 500ms).
@@ -255,6 +329,8 @@ impl Default for OverloadConfig {
             fd_critical_threshold: 0.95,
             conn_pressure_threshold: 0.85,
             conn_critical_threshold: 0.95,
+            req_pressure_threshold: 0.85,
+            req_critical_threshold: 0.95,
             loop_warn_us: 10_000,
             loop_critical_us: 500_000,
         }
@@ -343,21 +419,23 @@ pub fn start_monitor(
     state: Arc<OverloadState>,
     config: OverloadConfig,
     max_connections: usize,
+    max_requests: usize,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let interval = Duration::from_millis(config.check_interval_ms);
         let fd_limit = get_fd_limit();
 
-        // Store the FD limit once (doesn't change during runtime)
+        // Store limits once (don't change during runtime)
         state.fd_max.store(fd_limit, Ordering::Relaxed);
         state
             .conn_max
             .store(max_connections as u64, Ordering::Relaxed);
+        state.req_max.store(max_requests as u64, Ordering::Relaxed);
 
         info!(
-            "Overload monitor started (interval={}ms, fd_limit={}, max_conn={})",
-            config.check_interval_ms, fd_limit, max_connections
+            "Overload monitor started (interval={}ms, fd_limit={}, max_conn={}, max_req={})",
+            config.check_interval_ms, fd_limit, max_connections, max_requests
         );
 
         loop {
@@ -390,6 +468,15 @@ pub fn start_monitor(
                 0.0
             };
 
+            // ── Request pressure ──
+            let req_used = state.active_requests.load(Ordering::Relaxed);
+            state.req_current.store(req_used, Ordering::Relaxed);
+            let req_ratio = if max_requests > 0 {
+                req_used as f64 / max_requests as f64
+            } else {
+                0.0 // unlimited — never triggers pressure
+            };
+
             // ── Event loop latency ──
             let loop_latency = measure_event_loop_latency().await;
             let loop_us = loop_latency.as_micros() as u64;
@@ -397,11 +484,17 @@ pub fn start_monitor(
 
             // ── Evaluate thresholds and set action flags ──
             let should_disable_keepalive = fd_ratio >= config.fd_pressure_threshold
-                || conn_ratio >= config.conn_pressure_threshold;
+                || conn_ratio >= config.conn_pressure_threshold
+                || (max_requests > 0 && req_ratio >= config.req_pressure_threshold);
 
             let should_reject = fd_ratio >= config.fd_critical_threshold
                 || conn_ratio >= config.conn_critical_threshold
                 || loop_us >= config.loop_critical_us;
+
+            // Request-level rejection is independent — only triggers when
+            // FERRUM_MAX_REQUESTS is configured (non-zero).
+            let should_reject_requests =
+                max_requests > 0 && req_ratio >= config.req_critical_threshold;
 
             // ── RED-style smooth ramp between pressure and critical thresholds ──
             // For BOTH fd and connection pressure, compute probability independently
@@ -425,12 +518,27 @@ pub fn start_monitor(
             } else {
                 0
             };
-            state
-                .red_drop_probability
-                .store(fd_red_prob.max(conn_red_prob), Ordering::Relaxed);
+            let req_red_prob = if max_requests > 0 {
+                if req_ratio >= config.req_critical_threshold {
+                    1000
+                } else if req_ratio >= config.req_pressure_threshold {
+                    let range = config.req_critical_threshold - config.req_pressure_threshold;
+                    let position = req_ratio - config.req_pressure_threshold;
+                    ((position / range) * 1000.0) as u32
+                } else {
+                    0
+                }
+            } else {
+                0
+            };
+            state.red_drop_probability.store(
+                fd_red_prob.max(conn_red_prob).max(req_red_prob),
+                Ordering::Relaxed,
+            );
 
             // Transition logging — only log when state changes
             let was_rejecting = state.reject_new_connections.load(Ordering::Relaxed);
+            let was_rejecting_requests = state.reject_new_requests.load(Ordering::Relaxed);
             let was_keepalive_disabled = state.disable_keepalive.load(Ordering::Relaxed);
 
             state
@@ -439,6 +547,9 @@ pub fn start_monitor(
             state
                 .reject_new_connections
                 .store(should_reject, Ordering::Relaxed);
+            state
+                .reject_new_requests
+                .store(should_reject_requests, Ordering::Relaxed);
 
             if should_reject && !was_rejecting {
                 warn!(
@@ -450,6 +561,9 @@ pub fn start_monitor(
                     conn_current = conn_used,
                     conn_max = max_connections,
                     conn_pct = format_args!("{:.1}", conn_ratio * 100.0),
+                    req_current = req_used,
+                    req_max = max_requests,
+                    req_pct = format_args!("{:.1}", req_ratio * 100.0),
                     loop_latency_us = loop_us,
                     "Overload CRITICAL: rejecting new connections",
                 );
@@ -463,10 +577,39 @@ pub fn start_monitor(
                     conn_current = conn_used,
                     conn_max = max_connections,
                     conn_pct = format_args!("{:.1}", conn_ratio * 100.0),
+                    req_current = req_used,
+                    req_max = max_requests,
+                    req_pct = format_args!("{:.1}", req_ratio * 100.0),
                     loop_latency_us = loop_us,
                     "Overload recovered: accepting new connections",
                 );
-            } else if should_disable_keepalive && !was_keepalive_disabled {
+            }
+
+            if should_reject_requests && !was_rejecting_requests {
+                warn!(
+                    level = "critical",
+                    action = "reject_requests",
+                    req_current = req_used,
+                    req_max = max_requests,
+                    req_pct = format_args!("{:.1}", req_ratio * 100.0),
+                    conn_current = conn_used,
+                    conn_max = max_connections,
+                    "Overload CRITICAL: rejecting new requests",
+                );
+            } else if !should_reject_requests && was_rejecting_requests {
+                info!(
+                    level = "normal",
+                    action = "accept_requests",
+                    req_current = req_used,
+                    req_max = max_requests,
+                    req_pct = format_args!("{:.1}", req_ratio * 100.0),
+                    conn_current = conn_used,
+                    conn_max = max_connections,
+                    "Overload recovered: accepting new requests",
+                );
+            }
+
+            if should_disable_keepalive && !was_keepalive_disabled {
                 warn!(
                     level = "pressure",
                     action = "disable_keepalive",
@@ -476,6 +619,9 @@ pub fn start_monitor(
                     conn_current = conn_used,
                     conn_max = max_connections,
                     conn_pct = format_args!("{:.1}", conn_ratio * 100.0),
+                    req_current = req_used,
+                    req_max = max_requests,
+                    req_pct = format_args!("{:.1}", req_ratio * 100.0),
                     loop_latency_us = loop_us,
                     "Overload pressure: disabling keepalive",
                 );
@@ -489,6 +635,9 @@ pub fn start_monitor(
                     conn_current = conn_used,
                     conn_max = max_connections,
                     conn_pct = format_args!("{:.1}", conn_ratio * 100.0),
+                    req_current = req_used,
+                    req_max = max_requests,
+                    req_pct = format_args!("{:.1}", req_ratio * 100.0),
                     loop_latency_us = loop_us,
                     "Overload pressure recovered: re-enabling keepalive",
                 );
@@ -506,29 +655,37 @@ pub fn start_monitor(
     })
 }
 
-/// Wait for all in-flight connections to drain, up to the configured timeout.
+/// Wait for all in-flight connections and requests to drain, up to the
+/// configured timeout.
 ///
 /// Called after the accept loops have exited. Returns `true` if all connections
-/// drained within the timeout, `false` if the timeout expired.
+/// and requests drained within the timeout, `false` if the timeout expired.
 pub async fn wait_for_drain(state: &Arc<OverloadState>, timeout: Duration) -> bool {
     state.draining.store(true, Ordering::Relaxed);
 
-    let active = state.active_connections.load(Ordering::Relaxed);
-    if active == 0 {
-        info!(phase = "drain", "No active connections to drain");
+    let active_conns = state.active_connections.load(Ordering::Relaxed);
+    let active_reqs = state.active_requests.load(Ordering::Relaxed);
+    if active_conns == 0 && active_reqs == 0 {
+        info!(
+            phase = "drain",
+            "No active connections or requests to drain"
+        );
         return true;
     }
 
     info!(
         phase = "drain",
-        active_connections = active,
+        active_connections = active_conns,
+        active_requests = active_reqs,
         timeout_seconds = timeout.as_secs(),
-        "Draining active connections",
+        "Draining active connections and requests",
     );
 
     match tokio::time::timeout(timeout, async {
         loop {
-            if state.active_connections.load(Ordering::Relaxed) == 0 {
+            if state.active_connections.load(Ordering::Relaxed) == 0
+                && state.active_requests.load(Ordering::Relaxed) == 0
+            {
                 break;
             }
             state.drain_complete.notified().await;
@@ -540,16 +697,18 @@ pub async fn wait_for_drain(state: &Arc<OverloadState>, timeout: Duration) -> bo
             info!(
                 phase = "drain",
                 result = "complete",
-                "All connections drained successfully"
+                "All connections and requests drained successfully"
             );
             true
         }
         Err(_) => {
-            let remaining = state.active_connections.load(Ordering::Relaxed);
+            let remaining_conns = state.active_connections.load(Ordering::Relaxed);
+            let remaining_reqs = state.active_requests.load(Ordering::Relaxed);
             warn!(
                 phase = "drain",
                 result = "timeout",
-                remaining_connections = remaining,
+                remaining_connections = remaining_conns,
+                remaining_requests = remaining_reqs,
                 "Drain timeout expired — force closing",
             );
             false
@@ -567,8 +726,10 @@ mod tests {
         assert_eq!(state.level(), OverloadLevel::Normal);
         assert!(!state.disable_keepalive.load(Ordering::Relaxed));
         assert!(!state.reject_new_connections.load(Ordering::Relaxed));
+        assert!(!state.reject_new_requests.load(Ordering::Relaxed));
         assert!(!state.draining.load(Ordering::Relaxed));
         assert_eq!(state.active_connections.load(Ordering::Relaxed), 0);
+        assert_eq!(state.active_requests.load(Ordering::Relaxed), 0);
         assert_eq!(state.red_drop_probability.load(Ordering::Relaxed), 0);
     }
 
@@ -583,6 +744,13 @@ mod tests {
     fn overload_level_critical() {
         let state = OverloadState::new();
         state.reject_new_connections.store(true, Ordering::Relaxed);
+        assert_eq!(state.level(), OverloadLevel::Critical);
+    }
+
+    #[test]
+    fn overload_level_critical_from_request_rejection() {
+        let state = OverloadState::new();
+        state.reject_new_requests.store(true, Ordering::Relaxed);
         assert_eq!(state.level(), OverloadLevel::Critical);
     }
 
@@ -626,11 +794,58 @@ mod tests {
             .expect("task panicked");
     }
 
+    #[test]
+    fn request_guard_increments_and_decrements() {
+        let state = Arc::new(OverloadState::new());
+        assert_eq!(state.active_requests.load(Ordering::Relaxed), 0);
+        {
+            let _g1 = RequestGuard::new(&state);
+            assert_eq!(state.active_requests.load(Ordering::Relaxed), 1);
+            {
+                let _g2 = RequestGuard::new(&state);
+                assert_eq!(state.active_requests.load(Ordering::Relaxed), 2);
+            }
+            assert_eq!(state.active_requests.load(Ordering::Relaxed), 1);
+        }
+        assert_eq!(state.active_requests.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn drain_notifies_on_last_request() {
+        let state = Arc::new(OverloadState::new());
+        state.draining.store(true, Ordering::Relaxed);
+
+        let guard = RequestGuard::new(&state);
+        assert_eq!(state.active_requests.load(Ordering::Relaxed), 1);
+
+        let state2 = state.clone();
+        let handle = tokio::spawn(async move {
+            state2.drain_complete.notified().await;
+            assert_eq!(state2.active_requests.load(Ordering::Relaxed), 0);
+        });
+
+        drop(guard);
+
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("timeout")
+            .expect("task panicked");
+    }
+
     #[tokio::test]
     async fn wait_for_drain_returns_immediately_when_empty() {
         let state = Arc::new(OverloadState::new());
         let drained = wait_for_drain(&state, Duration::from_secs(1)).await;
         assert!(drained);
+    }
+
+    #[tokio::test]
+    async fn wait_for_drain_times_out_with_active_requests() {
+        let state = Arc::new(OverloadState::new());
+        let _guard = RequestGuard::new(&state);
+        // Hold the request guard so drain can't complete
+        let drained = wait_for_drain(&state, Duration::from_millis(50)).await;
+        assert!(!drained);
     }
 
     #[tokio::test]
@@ -642,6 +857,32 @@ mod tests {
         assert!(!drained);
     }
 
+    #[tokio::test]
+    async fn drain_waits_for_both_connections_and_requests() {
+        let state = Arc::new(OverloadState::new());
+        let conn_guard = ConnectionGuard::new(&state);
+        let req_guard = RequestGuard::new(&state);
+
+        let state2 = state.clone();
+        let drain_handle =
+            tokio::spawn(async move { wait_for_drain(&state2, Duration::from_secs(5)).await });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Drop requests first — drain should NOT complete (connections still active)
+        drop(req_guard);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!drain_handle.is_finished());
+
+        // Drop connections — now drain should complete
+        drop(conn_guard);
+        let result = tokio::time::timeout(Duration::from_secs(2), drain_handle)
+            .await
+            .expect("timeout")
+            .expect("panic");
+        assert!(result);
+    }
+
     #[test]
     fn snapshot_reflects_state() {
         let state = OverloadState::new();
@@ -649,6 +890,8 @@ mod tests {
         state.fd_max.store(1000, Ordering::Relaxed);
         state.conn_current.store(850, Ordering::Relaxed);
         state.conn_max.store(1000, Ordering::Relaxed);
+        state.req_current.store(5000, Ordering::Relaxed);
+        state.req_max.store(10000, Ordering::Relaxed);
         state.loop_latency_us.store(500, Ordering::Relaxed);
         state.draining.store(true, Ordering::Relaxed);
 
@@ -659,9 +902,13 @@ mod tests {
         assert_eq!(snap.pressure.file_descriptors.max, 1000);
         assert!((snap.pressure.file_descriptors.ratio - 0.8).abs() < 0.001);
         assert_eq!(snap.pressure.connections.current, 850);
+        assert_eq!(snap.pressure.requests.current, 5000);
+        assert_eq!(snap.pressure.requests.max, 10000);
+        assert!((snap.pressure.requests.ratio - 0.5).abs() < 0.001);
         assert_eq!(snap.pressure.event_loop_latency_us, 500);
         assert!(!snap.actions.disable_keepalive);
         assert!(!snap.actions.reject_new_connections);
+        assert!(!snap.actions.reject_new_requests);
     }
 
     #[test]
@@ -672,6 +919,8 @@ mod tests {
         assert!((config.fd_critical_threshold - 0.95).abs() < 0.001);
         assert!((config.conn_pressure_threshold - 0.85).abs() < 0.001);
         assert!((config.conn_critical_threshold - 0.95).abs() < 0.001);
+        assert!((config.req_pressure_threshold - 0.85).abs() < 0.001);
+        assert!((config.req_critical_threshold - 0.95).abs() < 0.001);
         assert_eq!(config.loop_warn_us, 10_000);
         assert_eq!(config.loop_critical_us, 500_000);
     }

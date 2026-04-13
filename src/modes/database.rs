@@ -268,6 +268,7 @@ pub async fn run(
         proxy_state.overload.clone(),
         env_config.overload_config(),
         env_config.max_connections,
+        env_config.max_requests,
         shutdown_tx.subscribe(),
     );
 

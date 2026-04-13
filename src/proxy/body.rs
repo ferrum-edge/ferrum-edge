@@ -20,7 +20,21 @@ use std::time::Instant;
 pub type ProxyBodyError = Box<dyn std::error::Error + Send + Sync>;
 
 /// A response body that is either fully buffered or streamed from the backend.
-pub enum ProxyBody {
+///
+/// Optionally carries a [`RequestGuard`] that keeps the `active_requests`
+/// overload counter incremented for the lifetime of the response body — not
+/// just the handler function scope. This is critical for H2/H3/gRPC streaming
+/// responses where hyper drives the body to completion *after*
+/// `handle_proxy_request` returns.
+pub struct ProxyBody {
+    kind: ProxyBodyKind,
+    /// Dropped when hyper finishes sending the body (or the connection closes),
+    /// decrementing `OverloadState.active_requests`.
+    _request_guard: Option<crate::overload::RequestGuard>,
+}
+
+/// Inner body variant — buffered, streaming, or tracked-streaming.
+enum ProxyBodyKind {
     /// Complete body already in memory.
     Full(Full<Bytes>),
     /// Streaming body passed through without tracking (zero overhead).
@@ -132,7 +146,10 @@ impl http_body::Body for TrackedBody {
 impl ProxyBody {
     /// Create a buffered body from bytes.
     pub fn full(data: impl Into<Bytes>) -> Self {
-        Self::Full(Full::new(data.into()))
+        Self {
+            kind: ProxyBodyKind::Full(Full::new(data.into())),
+            _request_guard: None,
+        }
     }
 
     /// Create a buffered body from a string slice.
@@ -142,7 +159,27 @@ impl ProxyBody {
 
     /// Create an empty body.
     pub fn empty() -> Self {
-        Self::Full(Full::default())
+        Self {
+            kind: ProxyBodyKind::Full(Full::default()),
+            _request_guard: None,
+        }
+    }
+
+    /// Attach a [`RequestGuard`] to this body so the `active_requests`
+    /// counter stays incremented until hyper finishes sending the response.
+    pub fn with_request_guard(mut self, guard: crate::overload::RequestGuard) -> Self {
+        self._request_guard = Some(guard);
+        self
+    }
+
+    /// Create a streaming body (no completion tracking).
+    fn streaming(
+        body: Pin<Box<dyn http_body::Body<Data = Bytes, Error = ProxyBodyError> + Send + 'static>>,
+    ) -> Self {
+        Self {
+            kind: ProxyBodyKind::Stream(body),
+            _request_guard: None,
+        }
     }
 
     /// Create a streaming body with lightweight completion tracking.
@@ -164,7 +201,13 @@ impl ProxyBody {
         });
         let inner = Box::pin(StreamBody::new(stream));
         let tracked = TrackedBody::new(inner, Arc::clone(&metrics));
-        (Self::Tracked(tracked), metrics)
+        (
+            Self {
+                kind: ProxyBodyKind::Tracked(tracked),
+                _request_guard: None,
+            },
+            metrics,
+        )
     }
 }
 
@@ -178,28 +221,28 @@ impl http_body::Body for ProxyBody {
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         // SAFETY: Both `Full<Bytes>` and `Pin<Box<...>>` are `Unpin`, so
         // `get_mut` is safe and we can re-pin the inner value.
-        match self.get_mut() {
-            ProxyBody::Full(body) => Pin::new(body)
+        match &mut self.get_mut().kind {
+            ProxyBodyKind::Full(body) => Pin::new(body)
                 .poll_frame(cx)
                 .map(|opt| opt.map(|result| result.map_err(|never| match never {}))),
-            ProxyBody::Stream(body) => body.as_mut().poll_frame(cx),
-            ProxyBody::Tracked(body) => Pin::new(body).poll_frame(cx),
+            ProxyBodyKind::Stream(body) => body.as_mut().poll_frame(cx),
+            ProxyBodyKind::Tracked(body) => Pin::new(body).poll_frame(cx),
         }
     }
 
     fn is_end_stream(&self) -> bool {
-        match self {
-            ProxyBody::Full(body) => body.is_end_stream(),
-            ProxyBody::Stream(body) => body.is_end_stream(),
-            ProxyBody::Tracked(body) => body.inner.is_end_stream(),
+        match &self.kind {
+            ProxyBodyKind::Full(body) => body.is_end_stream(),
+            ProxyBodyKind::Stream(body) => body.is_end_stream(),
+            ProxyBodyKind::Tracked(body) => body.inner.is_end_stream(),
         }
     }
 
     fn size_hint(&self) -> http_body::SizeHint {
-        match self {
-            ProxyBody::Full(body) => body.size_hint(),
-            ProxyBody::Stream(body) => body.size_hint(),
-            ProxyBody::Tracked(body) => body.inner.size_hint(),
+        match &self.kind {
+            ProxyBodyKind::Full(body) => body.size_hint(),
+            ProxyBodyKind::Stream(body) => body.size_hint(),
+            ProxyBodyKind::Tracked(body) => body.inner.size_hint(),
         }
     }
 }
@@ -392,7 +435,7 @@ pub(crate) fn coalescing_body(
         stashed_error: None,
         content_length,
     };
-    ProxyBody::Stream(Box::pin(body))
+    ProxyBody::streaming(Box::pin(body))
 }
 
 impl<S> http_body::Body for CoalescingBody<S>
@@ -539,7 +582,7 @@ pub(crate) fn coalescing_h2_body(
         coalesce_target,
     };
     let mapped = coalescing.map_err(|e| Box::new(e) as ProxyBodyError);
-    ProxyBody::Stream(Box::pin(mapped))
+    ProxyBody::streaming(Box::pin(mapped))
 }
 
 impl http_body::Body for CoalescingH2Body {

@@ -146,29 +146,20 @@ fn test_proxy_yaml_stream_response_body_mode() {
 #[test]
 fn test_proxy_body_full_from_bytes() {
     let body = ProxyBody::full(bytes::Bytes::from("hello world"));
-    match body {
-        ProxyBody::Full(_) => {} // expected
-        _ => panic!("Expected Full variant"),
-    }
+    // Full body is immediately end-of-stream after polling all frames
+    assert!(!body.is_end_stream()); // has data to yield
 }
 
 #[test]
 fn test_proxy_body_from_string() {
     let body = ProxyBody::from_string("hello");
-    match body {
-        ProxyBody::Full(_) => {} // expected
-        _ => panic!("Expected Full variant"),
-    }
+    assert!(!body.is_end_stream()); // has data to yield
 }
 
 #[test]
 fn test_proxy_body_empty() {
     let body = ProxyBody::empty();
     assert!(body.is_end_stream());
-    match body {
-        ProxyBody::Full(_) => {} // expected
-        _ => panic!("Expected Full variant"),
-    }
 }
 
 // --- Plugin requires_response_body_buffering tests ---

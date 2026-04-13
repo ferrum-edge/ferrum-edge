@@ -3736,6 +3736,63 @@ pub async fn handle_proxy_request(
     tls_client_cert_der: Option<Arc<Vec<u8>>>,
     tls_client_cert_chain_der: Option<Arc<Vec<Vec<u8>>>>,
 ) -> Result<Response<ProxyBody>, hyper::Error> {
+    // Global request admission control. Single atomic load (~1ns) on the fast
+    // path. Rejects with 503 when request pressure exceeds the critical
+    // threshold (FERRUM_MAX_REQUESTS + FERRUM_OVERLOAD_REQ_CRITICAL_THRESHOLD).
+    if state
+        .overload
+        .reject_new_requests
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        let is_grpc = grpc_proxy::is_grpc_request(&req);
+        record_request(&state, 503);
+        if is_grpc {
+            return Ok(grpc_proxy::build_grpc_error_response(
+                grpc_proxy::grpc_status::UNAVAILABLE,
+                "Service overloaded",
+            ));
+        }
+        return Ok(build_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            r#"{"error":"Service overloaded"}"#,
+        ));
+    }
+
+    // Track this request for overload monitoring and graceful drain.
+    // The guard is attached to the response body so it lives as long as hyper
+    // is sending the response — critical for H2/gRPC streaming where the body
+    // outlives this function scope.
+    let request_guard = crate::overload::RequestGuard::new(&state.overload);
+
+    let response = handle_proxy_request_inner(
+        req,
+        state,
+        remote_addr,
+        is_tls,
+        tls_client_cert_der,
+        tls_client_cert_chain_der,
+    )
+    .await;
+
+    // Attach the guard to the response body so active_requests stays incremented
+    // for the full response lifetime (including streaming bodies).
+    response.map(|mut resp| {
+        let body = std::mem::replace(resp.body_mut(), ProxyBody::empty());
+        *resp.body_mut() = body.with_request_guard(request_guard);
+        resp
+    })
+}
+
+/// Inner implementation of [`handle_proxy_request`] — separated so the outer
+/// function can attach the [`RequestGuard`] to the response body.
+async fn handle_proxy_request_inner(
+    req: Request<Incoming>,
+    state: ProxyState,
+    remote_addr: SocketAddr,
+    is_tls: bool,
+    tls_client_cert_der: Option<Arc<Vec<u8>>>,
+    tls_client_cert_chain_der: Option<Arc<Vec<Vec<u8>>>>,
+) -> Result<Response<ProxyBody>, hyper::Error> {
     let start_time = Instant::now();
 
     let method = req.method().as_str().to_owned();

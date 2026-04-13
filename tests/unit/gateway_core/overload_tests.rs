@@ -1,4 +1,6 @@
-use ferrum_edge::overload::{ConnectionGuard, OverloadConfig, OverloadLevel, OverloadState};
+use ferrum_edge::overload::{
+    ConnectionGuard, OverloadConfig, OverloadLevel, OverloadState, RequestGuard,
+};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -12,7 +14,9 @@ fn new_state_is_normal_with_no_active_connections() {
     assert!(!state.draining.load(Ordering::Relaxed));
     assert!(!state.disable_keepalive.load(Ordering::Relaxed));
     assert!(!state.reject_new_connections.load(Ordering::Relaxed));
+    assert!(!state.reject_new_requests.load(Ordering::Relaxed));
     assert_eq!(state.active_connections.load(Ordering::Relaxed), 0);
+    assert_eq!(state.active_requests.load(Ordering::Relaxed), 0);
 }
 
 #[test]
@@ -100,6 +104,72 @@ fn connection_guard_does_not_notify_when_not_draining() {
     assert_eq!(state.active_connections.load(Ordering::Relaxed), 0);
 }
 
+// ── RequestGuard ─────────────────────────────────────────────────────
+
+#[test]
+fn request_guard_tracks_concurrent_requests() {
+    let state = Arc::new(OverloadState::new());
+
+    let g1 = RequestGuard::new(&state);
+    assert_eq!(state.active_requests.load(Ordering::Relaxed), 1);
+
+    let g2 = RequestGuard::new(&state);
+    assert_eq!(state.active_requests.load(Ordering::Relaxed), 2);
+
+    let g3 = RequestGuard::new(&state);
+    assert_eq!(state.active_requests.load(Ordering::Relaxed), 3);
+
+    drop(g2);
+    assert_eq!(state.active_requests.load(Ordering::Relaxed), 2);
+
+    drop(g1);
+    assert_eq!(state.active_requests.load(Ordering::Relaxed), 1);
+
+    drop(g3);
+    assert_eq!(state.active_requests.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
+async fn request_guard_notifies_drain_on_last_drop() {
+    let state = Arc::new(OverloadState::new());
+    state.draining.store(true, Ordering::Relaxed);
+
+    let g1 = RequestGuard::new(&state);
+    let g2 = RequestGuard::new(&state);
+
+    let state2 = state.clone();
+    let waiter = tokio::spawn(async move {
+        state2.drain_complete.notified().await;
+    });
+
+    // Dropping g1 should NOT notify (g2 still alive)
+    drop(g1);
+    assert_eq!(state.active_requests.load(Ordering::Relaxed), 1);
+
+    // Give a brief moment to verify waiter is still pending
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    assert!(!waiter.is_finished());
+
+    // Dropping g2 (last request) SHOULD notify
+    drop(g2);
+    tokio::time::timeout(Duration::from_secs(1), waiter)
+        .await
+        .expect("drain notification timed out")
+        .expect("waiter task panicked");
+}
+
+#[test]
+fn reject_new_requests_sets_critical_level() {
+    let state = OverloadState::new();
+    assert_eq!(state.level(), OverloadLevel::Normal);
+
+    state.reject_new_requests.store(true, Ordering::Relaxed);
+    assert_eq!(state.level(), OverloadLevel::Critical);
+
+    state.reject_new_requests.store(false, Ordering::Relaxed);
+    assert_eq!(state.level(), OverloadLevel::Normal);
+}
+
 // ── Snapshot ──────────────────────────────────────────────────────────
 
 #[test]
@@ -109,6 +179,8 @@ fn snapshot_captures_current_state() {
     state.fd_max.store(1024, Ordering::Relaxed);
     state.conn_current.store(9000, Ordering::Relaxed);
     state.conn_max.store(10000, Ordering::Relaxed);
+    state.req_current.store(5000, Ordering::Relaxed);
+    state.req_max.store(20000, Ordering::Relaxed);
     state.loop_latency_us.store(42, Ordering::Relaxed);
     state.disable_keepalive.store(true, Ordering::Relaxed);
 
@@ -121,18 +193,23 @@ fn snapshot_captures_current_state() {
     assert_eq!(snap.pressure.connections.current, 9000);
     assert_eq!(snap.pressure.connections.max, 10000);
     assert!((snap.pressure.connections.ratio - 0.9).abs() < 0.001);
+    assert_eq!(snap.pressure.requests.current, 5000);
+    assert_eq!(snap.pressure.requests.max, 20000);
+    assert!((snap.pressure.requests.ratio - 0.25).abs() < 0.001);
     assert_eq!(snap.pressure.event_loop_latency_us, 42);
     assert!(snap.actions.disable_keepalive);
     assert!(!snap.actions.reject_new_connections);
+    assert!(!snap.actions.reject_new_requests);
 }
 
 #[test]
 fn snapshot_handles_zero_max_values() {
     let state = OverloadState::new();
-    // fd_max and conn_max are 0 (default) — ratio should be 0.0, not NaN
+    // fd_max, conn_max, and req_max are 0 (default) — ratio should be 0.0, not NaN
     let snap = state.snapshot();
     assert_eq!(snap.pressure.file_descriptors.ratio, 0.0);
     assert_eq!(snap.pressure.connections.ratio, 0.0);
+    assert_eq!(snap.pressure.requests.ratio, 0.0);
 }
 
 #[test]
@@ -140,6 +217,8 @@ fn snapshot_serializes_to_json() {
     let state = OverloadState::new();
     state.fd_current.store(100, Ordering::Relaxed);
     state.fd_max.store(1000, Ordering::Relaxed);
+    state.req_current.store(42, Ordering::Relaxed);
+    state.req_max.store(500, Ordering::Relaxed);
 
     let snap = state.snapshot();
     let json = serde_json::to_value(&snap).expect("snapshot should serialize");
@@ -147,7 +226,11 @@ fn snapshot_serializes_to_json() {
     assert_eq!(json["level"], "normal");
     assert_eq!(json["pressure"]["file_descriptors"]["current"], 100);
     assert_eq!(json["pressure"]["file_descriptors"]["max"], 1000);
+    assert_eq!(json["pressure"]["requests"]["current"], 42);
+    assert_eq!(json["pressure"]["requests"]["max"], 500);
     assert!(json["actions"]["disable_keepalive"].is_boolean());
+    assert!(json["actions"]["reject_new_requests"].is_boolean());
+    assert!(json["active_requests"].is_number());
 }
 
 // ── wait_for_drain ───────────────────────────────────────────────────
@@ -218,9 +301,12 @@ fn env_config_default_overload_values() {
     assert!((config.overload_fd_critical_threshold - 0.95).abs() < f64::EPSILON);
     assert!((config.overload_conn_pressure_threshold - 0.85).abs() < f64::EPSILON);
     assert!((config.overload_conn_critical_threshold - 0.95).abs() < f64::EPSILON);
+    assert!((config.overload_req_pressure_threshold - 0.85).abs() < f64::EPSILON);
+    assert!((config.overload_req_critical_threshold - 0.95).abs() < f64::EPSILON);
     assert_eq!(config.overload_loop_warn_us, 10_000);
     assert_eq!(config.overload_loop_critical_us, 500_000);
     assert_eq!(config.shutdown_drain_seconds, 30);
+    assert_eq!(config.max_requests, 0);
 }
 
 #[test]
@@ -243,6 +329,14 @@ fn env_config_overload_config_conversion() {
     assert_eq!(
         overload.conn_critical_threshold,
         env.overload_conn_critical_threshold
+    );
+    assert_eq!(
+        overload.req_pressure_threshold,
+        env.overload_req_pressure_threshold
+    );
+    assert_eq!(
+        overload.req_critical_threshold,
+        env.overload_req_critical_threshold
     );
     assert_eq!(overload.loop_warn_us, env.overload_loop_warn_us);
     assert_eq!(overload.loop_critical_us, env.overload_loop_critical_us);

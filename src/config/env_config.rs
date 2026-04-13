@@ -635,6 +635,11 @@ pub struct EnvConfig {
     /// Default: 100000. When the limit is reached, new connections queue
     /// until a slot frees up. Set to 0 to disable the limit entirely.
     pub max_connections: usize,
+    /// Maximum concurrent in-flight requests (global, all protocols).
+    /// Tracks HTTP/1.1 requests, HTTP/2 streams, HTTP/3 streams, and gRPC
+    /// requests independently of the connection limit. Default: 0 (unlimited).
+    /// When exceeded, new requests receive 503 Service Unavailable.
+    pub max_requests: usize,
     /// Maximum concurrent proxy requests per resolved client IP.
     /// Uses the same client IP resolution as trusted proxy XFF walk.
     /// Default: 0 (disabled). When exceeded, returns 429 Too Many Requests.
@@ -698,6 +703,12 @@ pub struct EnvConfig {
     pub overload_conn_pressure_threshold: f64,
     /// Connection semaphore usage ratio above which new connections are rejected. Default: 0.95 (95%).
     pub overload_conn_critical_threshold: f64,
+    /// Request usage ratio above which keepalive is disabled. Default: 0.85 (85%).
+    /// Only relevant when `max_requests > 0`.
+    pub overload_req_pressure_threshold: f64,
+    /// Request usage ratio above which new requests are rejected with 503. Default: 0.95 (95%).
+    /// Only relevant when `max_requests > 0`.
+    pub overload_req_critical_threshold: f64,
     /// Event loop latency in microseconds above which a warning is logged. Default: 10000 (10ms).
     pub overload_loop_warn_us: u64,
     /// Event loop latency in microseconds above which new connections are rejected. Default: 500000 (500ms).
@@ -889,6 +900,7 @@ impl Default for EnvConfig {
             worker_threads: None,
             blocking_threads: None,
             max_connections: 100_000,
+            max_requests: 0,
             max_concurrent_requests_per_ip: 0,
             per_ip_cleanup_interval_seconds: 60,
             circuit_breaker_cache_max_entries: 10_000,
@@ -904,6 +916,8 @@ impl Default for EnvConfig {
             overload_fd_critical_threshold: 0.95,
             overload_conn_pressure_threshold: 0.85,
             overload_conn_critical_threshold: 0.95,
+            overload_req_pressure_threshold: 0.85,
+            overload_req_critical_threshold: 0.95,
             overload_loop_warn_us: 10_000,
             overload_loop_critical_us: 500_000,
             shutdown_drain_seconds: 30,
@@ -1361,6 +1375,9 @@ impl EnvConfig {
             max_connections: resolve_var(conf, "FERRUM_MAX_CONNECTIONS")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(100_000),
+            max_requests: resolve_var(conf, "FERRUM_MAX_REQUESTS")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
             max_concurrent_requests_per_ip: resolve_u64(
                 conf,
                 "FERRUM_MAX_CONCURRENT_REQUESTS_PER_IP",
@@ -1452,6 +1469,20 @@ impl EnvConfig {
             .and_then(|v| v.parse::<f64>().ok())
             .unwrap_or(0.95)
             .clamp(0.0, 1.0),
+            overload_req_pressure_threshold: resolve_var(
+                conf,
+                "FERRUM_OVERLOAD_REQ_PRESSURE_THRESHOLD",
+            )
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.85)
+            .clamp(0.0, 1.0),
+            overload_req_critical_threshold: resolve_var(
+                conf,
+                "FERRUM_OVERLOAD_REQ_CRITICAL_THRESHOLD",
+            )
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.95)
+            .clamp(0.0, 1.0),
             overload_loop_warn_us: resolve_u64(conf, "FERRUM_OVERLOAD_LOOP_WARN_US", 10_000),
             overload_loop_critical_us: resolve_u64(
                 conf,
@@ -1486,6 +1517,8 @@ impl EnvConfig {
             fd_critical_threshold: self.overload_fd_critical_threshold,
             conn_pressure_threshold: self.overload_conn_pressure_threshold,
             conn_critical_threshold: self.overload_conn_critical_threshold,
+            req_pressure_threshold: self.overload_req_pressure_threshold,
+            req_critical_threshold: self.overload_req_critical_threshold,
             loop_warn_us: self.overload_loop_warn_us,
             loop_critical_us: self.overload_loop_critical_us,
         }

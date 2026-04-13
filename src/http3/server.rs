@@ -358,6 +358,25 @@ async fn handle_h3_request(
 ) -> Result<(), anyhow::Error> {
     let start_time = std::time::Instant::now();
 
+    // Global request admission control (HTTP/3). Single atomic load (~1ns).
+    if state
+        .overload
+        .reject_new_requests
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        record_request(&state, 503);
+        send_h3_response(
+            &mut stream,
+            http::StatusCode::SERVICE_UNAVAILABLE,
+            r#"{"error":"Service overloaded"}"#,
+        )
+        .await?;
+        return Ok(());
+    }
+
+    // Track this request for overload monitoring and graceful drain.
+    let _request_guard = crate::overload::RequestGuard::new(&state.overload);
+
     let method = req.method().to_string();
     let path = req.uri().path().to_string();
     let query_string = req.uri().query().unwrap_or("").to_string();
