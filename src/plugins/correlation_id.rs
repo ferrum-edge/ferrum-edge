@@ -54,7 +54,7 @@ impl Plugin for CorrelationId {
         ctx: &mut super::StreamConnectionContext,
     ) -> super::PluginResult {
         let id = Uuid::new_v4().to_string();
-        ctx.metadata.insert("request_id".to_string(), id);
+        ctx.insert_metadata("request_id".to_string(), id);
         super::PluginResult::Continue
     }
 

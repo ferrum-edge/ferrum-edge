@@ -19,7 +19,7 @@ fn create_stream_context_with_ip(ip: &str) -> StreamConnectionContext {
         consumer_index: Arc::new(ferrum_edge::ConsumerIndex::new(&[])),
         identified_consumer: None,
         authenticated_identity: None,
-        metadata: std::collections::HashMap::new(),
+        metadata: None,
         tls_client_cert_der: None,
         tls_client_cert_chain_der: None,
         sni_hostname: None,

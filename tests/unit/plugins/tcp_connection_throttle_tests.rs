@@ -30,7 +30,7 @@ fn make_ctx(proxy_id: &str, ip: &str, consumer: Option<&str>) -> StreamConnectio
         consumer_index: Arc::new(ferrum_edge::ConsumerIndex::new(&[])),
         identified_consumer: consumer.map(|c| Arc::new(make_consumer(c))),
         authenticated_identity: None,
-        metadata: HashMap::new(),
+        metadata: None,
         tls_client_cert_der: None,
         tls_client_cert_chain_der: None,
         sni_hostname: None,
@@ -112,7 +112,7 @@ async fn test_tcp_connection_throttle_releases_slot_on_disconnect() {
     ));
 
     plugin
-        .on_stream_disconnect(&make_summary(ctx1.metadata.clone()))
+        .on_stream_disconnect(&make_summary(ctx1.take_metadata()))
         .await;
 
     let mut ctx2 = make_ctx("tcp-proxy", "10.0.0.1", None);

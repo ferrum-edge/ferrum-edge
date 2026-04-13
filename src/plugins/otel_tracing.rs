@@ -208,8 +208,8 @@ impl Plugin for OtelTracing {
         if self.generate_trace_id {
             let trace_id = Uuid::new_v4().as_simple().to_string();
             let span_id = Self::generate_span_id();
-            ctx.metadata.insert("trace_id".to_string(), trace_id);
-            ctx.metadata.insert("span_id".to_string(), span_id);
+            ctx.insert_metadata("trace_id".to_string(), trace_id);
+            ctx.insert_metadata("span_id".to_string(), span_id);
         }
         super::PluginResult::Continue
     }

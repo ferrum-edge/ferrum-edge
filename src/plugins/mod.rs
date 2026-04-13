@@ -627,7 +627,9 @@ pub struct StreamConnectionContext {
     /// Identity string set by external stream auth plugins when no gateway
     /// Consumer was mapped. Mirrors `RequestContext::authenticated_identity`.
     pub authenticated_identity: Option<String>,
-    pub metadata: HashMap<String, String>,
+    /// Plugin metadata. Lazily allocated on first write to avoid a HashMap allocation
+    /// for stream connections that have no metadata-writing plugins configured.
+    pub metadata: Option<HashMap<String, String>>,
     /// DER-encoded client certificate from frontend TLS handshake (first cert in chain).
     /// Populated for TCP/TLS proxies after the TLS handshake completes.
     /// Used by plugins like `tcp_connection_throttle` for consumer-based throttling.
@@ -649,6 +651,18 @@ impl StreamConnectionContext {
             .as_ref()
             .map(|consumer| consumer.username.as_str())
             .or(self.authenticated_identity.as_deref())
+    }
+
+    /// Insert a metadata value, lazily allocating the map on first write.
+    pub fn insert_metadata(&mut self, key: String, value: String) {
+        self.metadata
+            .get_or_insert_with(HashMap::new)
+            .insert(key, value);
+    }
+
+    /// Take the metadata map, returning an empty map if never allocated.
+    pub fn take_metadata(&mut self) -> HashMap<String, String> {
+        self.metadata.take().unwrap_or_default()
     }
 }
 

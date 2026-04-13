@@ -70,7 +70,10 @@ struct UdpSession {
     metadata: std::sync::Mutex<std::collections::HashMap<String, String>>,
 }
 
-type SessionMap = Arc<DashMap<SocketAddr, Arc<UdpSession>>>;
+/// UDP session map using ahash (AES-NI accelerated) for faster per-datagram lookups.
+/// SocketAddr keys are kernel-provided (not attacker-controlled), so cryptographic
+/// hashing is unnecessary — speed wins here.
+type SessionMap = Arc<DashMap<SocketAddr, Arc<UdpSession>, ahash::RandomState>>;
 
 struct UdpDisconnectContext<'a> {
     namespace: &'a str,
@@ -275,7 +278,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
     started.store(true, Ordering::Release);
     info!(proxy_id = %proxy_id, "UDP proxy listener started on {}", addr);
 
-    let sessions: SessionMap = Arc::new(DashMap::new());
+    let sessions: SessionMap = Arc::new(DashMap::with_hasher(ahash::RandomState::default()));
 
     // Pre-resolve plugins and proxy metadata for this listener.
     let plugins = plugin_cache.get_plugins_for_protocol(&proxy_id, ProxyProtocol::Udp);
@@ -910,7 +913,7 @@ async fn start_dtls_frontend_listener(
                     consumer_index: consumer_index.clone(),
                     identified_consumer: None,
                     authenticated_identity: None,
-                    metadata: std::collections::HashMap::new(),
+                    metadata: None,
                     tls_client_cert_der: client_conn.tls_client_cert_der.clone(),
                     tls_client_cert_chain_der: client_conn.tls_client_cert_chain_der.clone(),
                     sni_hostname: None,
@@ -950,7 +953,7 @@ async fn start_dtls_frontend_listener(
                 let handler_plugins = plugins.clone();
                 let handler_proxy_name = proxy_name.clone();
                 let handler_proxy_namespace = proxy_namespace.clone();
-                let handler_metadata = stream_ctx.metadata;
+                let handler_metadata = stream_ctx.take_metadata();
                 let handler_cb_cache = circuit_breaker_cache.clone();
                 let connected_at = chrono::Utc::now();
 
@@ -1570,7 +1573,7 @@ async fn create_session(
         consumer_index: consumer_index.clone(),
         identified_consumer: None,
         authenticated_identity: None,
-        metadata: std::collections::HashMap::new(),
+        metadata: None,
         tls_client_cert_der: None,
         tls_client_cert_chain_der: None,
         sni_hostname,
@@ -1755,7 +1758,7 @@ async fn create_session(
         backend_target: format!("{}:{}", backend_host, backend_port),
         backend_resolved_ip: resolved_ip.to_string(),
         sni_hostname: stream_ctx.sni_hostname.clone(),
-        metadata: std::sync::Mutex::new(stream_ctx.metadata),
+        metadata: std::sync::Mutex::new(stream_ctx.take_metadata()),
     });
 
     sessions.insert(client_addr, session.clone());
@@ -1801,6 +1804,9 @@ async fn create_session(
     tokio::spawn(async move {
         let mut buf = vec![0u8; MAX_UDP_DATAGRAM_SIZE];
         let mut disconnect_error: Option<(String, crate::retry::ErrorClass)> = None;
+        // Pre-allocate sendmmsg batch for batched client replies (Linux only).
+        #[cfg(target_os = "linux")]
+        let mut send_batch = super::udp_batch::SendMmsgBatch::new(64);
         loop {
             // Read from backend — via DTLS (channel-based) or raw UDP (socket-based)
             let (data_slice, data_vec);
@@ -1915,7 +1921,20 @@ async fn create_session(
             let mut batch_bytes_received: u64 = len as u64;
             let now = coarse_epoch_millis();
 
-            if let Err(e) = frontend.send_to(send_data, client_addr).await {
+            // --- sendmmsg path (Linux, plain UDP only) ---
+            // Batch the first datagram and all drain-loop datagrams, then flush
+            // via a single sendmmsg syscall to reduce per-datagram syscall overhead.
+            #[cfg(target_os = "linux")]
+            let send_batched = !is_dtls;
+            #[cfg(not(target_os = "linux"))]
+            let send_batched = false;
+
+            if send_batched {
+                #[cfg(target_os = "linux")]
+                {
+                    send_batch.push(send_data, client_addr);
+                }
+            } else if let Err(e) = frontend.send_to(send_data, client_addr).await {
                 debug!(
                     proxy_id = %reply_proxy_id,
                     client = %client_addr,
@@ -1980,7 +1999,18 @@ async fn create_session(
                             batch_bytes += len2 as u64;
                             batch_bytes_received += len2 as u64;
 
-                            if let Err(e) = frontend.send_to(&buf[..len2], client_addr).await {
+                            if send_batched {
+                                #[cfg(target_os = "linux")]
+                                {
+                                    if !send_batch.push(&buf[..len2], client_addr) {
+                                        // Batch full — flush and push again.
+                                        use std::os::unix::io::AsRawFd;
+                                        let _ = send_batch.flush(frontend.as_raw_fd());
+                                        send_batch.push(&buf[..len2], client_addr);
+                                    }
+                                }
+                            } else if let Err(e) = frontend.send_to(&buf[..len2], client_addr).await
+                            {
                                 debug!(
                                     proxy_id = %reply_proxy_id,
                                     client = %client_addr,
@@ -2032,6 +2062,40 @@ async fn create_session(
                         }
                         Err(_) => break, // WouldBlock — socket drained
                     }
+                }
+            }
+
+            // Flush the sendmmsg batch after draining all pending replies.
+            // Retry if sendmmsg returns a partial send (unsent datagrams remain).
+            #[cfg(target_os = "linux")]
+            if send_batched && !send_batch.is_empty() {
+                use std::os::unix::io::AsRawFd;
+                let fd = frontend.as_raw_fd();
+                loop {
+                    match send_batch.flush(fd) {
+                        Ok(_) if send_batch.is_empty() => break,
+                        Ok(_) => continue, // partial send — retry remaining
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break, // socket full, drop remainder (UDP best-effort)
+                        Err(e) => {
+                            debug!(
+                                proxy_id = %reply_proxy_id,
+                                client = %client_addr,
+                                "UDP sendmmsg to client failed: {}",
+                                e
+                            );
+                            let error_message = e.to_string();
+                            disconnect_error = Some((
+                                error_message.clone(),
+                                crate::retry::classify_boxed_error(
+                                    anyhow::anyhow!(error_message).as_ref(),
+                                ),
+                            ));
+                            break;
+                        }
+                    }
+                }
+                if disconnect_error.is_some() {
+                    break;
                 }
             }
 

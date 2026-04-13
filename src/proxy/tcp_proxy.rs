@@ -303,7 +303,7 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
                         consumer_index,
                         identified_consumer: None,
                         authenticated_identity: None,
-                        metadata: std::collections::HashMap::new(),
+                        metadata: None,
                         tls_client_cert_der: None,
                         tls_client_cert_chain_der: None,
                         sni_hostname: None,
@@ -387,7 +387,7 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
                             timestamp_connected: connected_at.to_rfc3339(),
                             timestamp_disconnected: disconnected_at.to_rfc3339(),
                             sni_hostname: stream_ctx.sni_hostname.clone(),
-                            metadata: stream_ctx.metadata,
+                            metadata: stream_ctx.take_metadata(),
                         };
                         for plugin in plugins.iter() {
                             plugin.on_stream_disconnect(&summary).await;
@@ -1203,6 +1203,11 @@ where
 /// uses `splice()` to move data through the pipe without userspace copies.
 /// Returns (bytes_client_to_backend, bytes_backend_to_client).
 ///
+/// Both directions run within a single task using `tokio::select!` instead of
+/// spawning two separate tasks. This halves task overhead (creation, scheduling,
+/// memory) per TCP connection. When one direction hits EOF, the other gets a brief
+/// grace period to drain remaining data.
+///
 /// When `idle_timeout` is `Some(d)` and non-zero, the connection is closed
 /// if no data is received on either side for the given duration.
 #[cfg(target_os = "linux")]
@@ -1217,9 +1222,11 @@ async fn bidirectional_splice(
     let client_fd = client.as_raw_fd();
     let backend_fd = backend.as_raw_fd();
 
-    // Create two pipes: one for each direction.
+    // Create two pipes: one for each direction. Guards close fds on drop.
     let (c2b_pipe_r, c2b_pipe_w) = create_splice_pipe(pipe_size)?;
+    let _c2b_guard = SplicePipeGuard(c2b_pipe_r, c2b_pipe_w);
     let (b2c_pipe_r, b2c_pipe_w) = create_splice_pipe(pipe_size)?;
+    let _b2c_guard = SplicePipeGuard(b2c_pipe_r, b2c_pipe_w);
 
     let last_activity = if idle_timeout.is_some_and(|t| !t.is_zero()) {
         Some(Arc::new(AtomicU64::new(coarse_now_ms())))
@@ -1230,46 +1237,51 @@ async fn bidirectional_splice(
     let la_c2b = last_activity.clone();
     let la_b2c = last_activity.clone();
 
-    // Client → Backend direction
-    let c2b = tokio::spawn(async move {
-        splice_one_direction(client_fd, c2b_pipe_w, c2b_pipe_r, backend_fd, la_c2b).await
-    });
+    // Pin both direction futures for use with select! — no spawned tasks.
+    let c2b_fut =
+        splice_one_direction_no_guard(client_fd, c2b_pipe_w, c2b_pipe_r, backend_fd, la_c2b);
+    let b2c_fut =
+        splice_one_direction_no_guard(backend_fd, b2c_pipe_w, b2c_pipe_r, client_fd, la_b2c);
+    tokio::pin!(c2b_fut);
+    tokio::pin!(b2c_fut);
 
-    // Backend → Client direction
-    let b2c = tokio::spawn(async move {
-        splice_one_direction(backend_fd, b2c_pipe_w, b2c_pipe_r, client_fd, la_b2c).await
-    });
+    let idle_timeout_active = idle_timeout.is_some_and(|t| !t.is_zero());
 
-    if let Some(timeout) = idle_timeout
-        && !timeout.is_zero()
-        && let Some(ref la) = last_activity
-    {
-        let la_check = la.clone();
-        let idle_check = async move {
-            let timeout_ms = timeout.as_millis() as u64;
-            loop {
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                let last = la_check.load(Ordering::Relaxed);
-                if coarse_now_ms().saturating_sub(last) >= timeout_ms {
-                    return;
-                }
-            }
-        };
-
-        tokio::select! {
-            result = async { tokio::try_join!(c2b, b2c) } => {
-                let (c2b_bytes, b2c_bytes) = result
-                    .map_err(|e| anyhow::anyhow!("Splice task panicked: {}", e))?;
-                Ok((c2b_bytes?, b2c_bytes?))
-            }
-            _ = idle_check => {
-                Err(anyhow::anyhow!("TCP idle timeout after {}s", timeout.as_secs()))
+    // Run both directions concurrently in a single task.
+    // When one finishes (EOF or error), give the other 100ms to drain.
+    loop {
+        if idle_timeout_active {
+            let la = last_activity.as_ref().unwrap();
+            let timeout_ms = idle_timeout.unwrap().as_millis() as u64;
+            let last = la.load(Ordering::Relaxed);
+            if coarse_now_ms().saturating_sub(last) >= timeout_ms {
+                return Err(anyhow::anyhow!(
+                    "TCP idle timeout after {}s",
+                    idle_timeout.unwrap().as_secs()
+                ));
             }
         }
-    } else {
-        let (c2b_bytes, b2c_bytes) = tokio::try_join!(c2b, b2c)
-            .map_err(|e| anyhow::anyhow!("Splice task panicked: {}", e))?;
-        Ok((c2b_bytes?, b2c_bytes?))
+
+        tokio::select! {
+            c2b_result = &mut c2b_fut => {
+                let c2b_bytes = c2b_result?;
+                // Client→Backend done (EOF); wait for Backend→Client to finish
+                // fully — the backend may still be sending response data after
+                // the client closed its write half (half-closed TCP flows).
+                let b2c_bytes = b2c_fut.await.unwrap_or(0);
+                return Ok((c2b_bytes, b2c_bytes));
+            }
+            b2c_result = &mut b2c_fut => {
+                let b2c_bytes = b2c_result?;
+                // Backend→Client done (EOF); wait for Client→Backend to finish.
+                let c2b_bytes = c2b_fut.await.unwrap_or(0);
+                return Ok((c2b_bytes, b2c_bytes));
+            }
+            // Idle timeout check — wake every second.
+            _ = tokio::time::sleep(Duration::from_secs(1)), if idle_timeout_active => {
+                continue; // loop back to check idle timeout at top
+            }
+        }
     }
 }
 
@@ -1293,18 +1305,16 @@ fn create_splice_pipe(desired_size: usize) -> Result<(i32, i32), anyhow::Error> 
 }
 
 /// Splice data in one direction: src_fd → pipe → dst_fd.
-/// Returns total bytes transferred.
+/// Returns total bytes transferred. Pipe fds are managed by the caller's
+/// `SplicePipeGuard` — this function does not close them.
 #[cfg(target_os = "linux")]
-async fn splice_one_direction(
+async fn splice_one_direction_no_guard(
     src_fd: i32,
     pipe_w: i32,
     pipe_r: i32,
     dst_fd: i32,
     last_activity: Option<Arc<AtomicU64>>,
 ) -> Result<u64, anyhow::Error> {
-    // Safety: pipe fds are valid for the lifetime of this function.
-    // We rely on the caller keeping the TcpStream alive (and thus the src_fd/dst_fd).
-    let _pipe_guard = SplicePipeGuard(pipe_r, pipe_w);
     let mut total: u64 = 0;
     let splice_flags = libc::SPLICE_F_MOVE | libc::SPLICE_F_NONBLOCK;
 

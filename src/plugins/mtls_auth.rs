@@ -475,9 +475,7 @@ impl Plugin for MtlsAuth {
                         "mtls_auth: identified stream consumer '{}'",
                         consumer.username
                     );
-                    ctx.metadata
-                        .entry("consumer_username".to_string())
-                        .or_insert_with(|| consumer.username.clone());
+                    ctx.insert_metadata("consumer_username".to_string(), consumer.username.clone());
                     ctx.identified_consumer = Some(consumer);
                 }
                 PluginResult::Continue

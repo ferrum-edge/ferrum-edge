@@ -193,6 +193,194 @@ fn sockaddr_storage_to_std(addr: &libc::sockaddr_storage) -> std::io::Result<Soc
     }
 }
 
+/// Pre-allocated buffers for batched UDP send via `sendmmsg(2)`.
+///
+/// Collects datagrams and their destination addresses, then flushes them all
+/// in a single `sendmmsg` syscall. This reduces syscall overhead on the
+/// backend→client reply path, mirroring the `recvmmsg` optimization on recv.
+///
+/// Only available on Linux. On other platforms, the UDP proxy falls back to
+/// individual `send_to` calls.
+#[cfg(target_os = "linux")]
+pub struct SendMmsgBatch {
+    /// Per-slot datagram buffers (data copied in on push).
+    bufs: Vec<Vec<u8>>,
+    /// Per-slot actual datagram length.
+    lens: Vec<usize>,
+    /// Per-slot destination addresses.
+    dest_addrs: Vec<libc::sockaddr_storage>,
+    /// Per-slot destination address lengths.
+    dest_addr_lens: Vec<libc::socklen_t>,
+    /// Pre-allocated iovec array (one per slot).
+    iovecs: Vec<libc::iovec>,
+    /// Pre-allocated mmsghdr array (one per slot).
+    msgs: Vec<libc::mmsghdr>,
+    /// Maximum datagrams per sendmmsg call.
+    capacity: usize,
+    /// Number of datagrams queued for the next flush.
+    count: usize,
+}
+
+// SAFETY: Same reasoning as RecvMmsgBatch — raw pointers in iovecs/msgs point
+// into Vec buffers owned by the same struct, only dereferenced inside flush()
+// which rebuilds them first. Exclusively owned by a single tokio task.
+#[cfg(target_os = "linux")]
+unsafe impl Send for SendMmsgBatch {}
+
+#[cfg(target_os = "linux")]
+impl SendMmsgBatch {
+    /// Create a new send batch with pre-allocated buffers for `capacity` datagrams.
+    pub fn new(capacity: usize) -> Self {
+        let capacity = capacity.max(1);
+        Self {
+            bufs: (0..capacity).map(|_| vec![0u8; MAX_DGRAM_SIZE]).collect(),
+            lens: vec![0usize; capacity],
+            dest_addrs: vec![unsafe { std::mem::zeroed() }; capacity],
+            dest_addr_lens: vec![0; capacity],
+            iovecs: vec![
+                libc::iovec {
+                    iov_base: std::ptr::null_mut(),
+                    iov_len: 0,
+                };
+                capacity
+            ],
+            msgs: vec![unsafe { std::mem::zeroed() }; capacity],
+            capacity,
+            count: 0,
+        }
+    }
+
+    /// Queue a datagram for batched sending. Returns `false` if the batch is full.
+    pub fn push(&mut self, data: &[u8], dest: SocketAddr) -> bool {
+        if self.count >= self.capacity {
+            return false;
+        }
+        let i = self.count;
+        let len = data.len().min(MAX_DGRAM_SIZE);
+        self.bufs[i][..len].copy_from_slice(&data[..len]);
+        self.lens[i] = len;
+        let (addr, addr_len) = std_to_sockaddr_storage(dest);
+        self.dest_addrs[i] = addr;
+        self.dest_addr_lens[i] = addr_len;
+        self.count += 1;
+        true
+    }
+
+    /// Whether the batch is empty.
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    /// Send all queued datagrams in a single `sendmmsg` syscall.
+    ///
+    /// Returns the number of datagrams successfully sent. On partial send,
+    /// the caller should handle the unsent remainder (or accept the loss for
+    /// UDP best-effort semantics).
+    ///
+    /// Resets the batch count to 0 after the call.
+    pub fn flush(&mut self, fd: std::os::fd::RawFd) -> std::io::Result<usize> {
+        if self.count == 0 {
+            return Ok(0);
+        }
+
+        // Rebuild pointer arrays before the syscall.
+        for i in 0..self.count {
+            self.iovecs[i] = libc::iovec {
+                iov_base: self.bufs[i].as_mut_ptr() as *mut libc::c_void,
+                iov_len: self.lens[i],
+            };
+
+            self.msgs[i] = unsafe { std::mem::zeroed() };
+            self.msgs[i].msg_hdr.msg_name =
+                std::ptr::addr_of_mut!(self.dest_addrs[i]) as *mut libc::c_void;
+            self.msgs[i].msg_hdr.msg_namelen = self.dest_addr_lens[i];
+            self.msgs[i].msg_hdr.msg_iov = std::ptr::addr_of_mut!(self.iovecs[i]);
+            self.msgs[i].msg_hdr.msg_iovlen = 1;
+        }
+
+        let ret = unsafe {
+            libc::sendmmsg(
+                fd,
+                self.msgs.as_mut_ptr(),
+                self.count as libc::c_uint,
+                libc::MSG_DONTWAIT,
+            )
+        };
+
+        if ret < 0 {
+            let err = std::io::Error::last_os_error();
+            self.count = 0;
+            return Err(err);
+        }
+
+        let sent = ret as usize;
+        let remaining = self.count - sent;
+        if remaining > 0 {
+            // Shift unsent datagrams to the front so a retry sends them.
+            for i in 0..remaining {
+                self.bufs.swap(i, sent + i);
+                self.lens[i] = self.lens[sent + i];
+                self.dest_addrs[i] = self.dest_addrs[sent + i];
+                self.dest_addr_lens[i] = self.dest_addr_lens[sent + i];
+            }
+        }
+        self.count = remaining;
+        Ok(sent)
+    }
+}
+
+/// Convert a `std::net::SocketAddr` to `libc::sockaddr_storage` + length.
+#[cfg(target_os = "linux")]
+fn std_to_sockaddr_storage(addr: SocketAddr) -> (libc::sockaddr_storage, libc::socklen_t) {
+    let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    match addr {
+        SocketAddr::V4(v4) => {
+            let sin = libc::sockaddr_in {
+                sin_family: libc::AF_INET as libc::sa_family_t,
+                sin_port: v4.port().to_be(),
+                sin_addr: libc::in_addr {
+                    s_addr: u32::from(*v4.ip()).to_be(),
+                },
+                sin_zero: [0; 8],
+            };
+            // SAFETY: sockaddr_in fits within sockaddr_storage.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    &sin as *const libc::sockaddr_in as *const u8,
+                    &mut storage as *mut libc::sockaddr_storage as *mut u8,
+                    std::mem::size_of::<libc::sockaddr_in>(),
+                );
+            }
+            (
+                storage,
+                std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+            )
+        }
+        SocketAddr::V6(v6) => {
+            let sin6 = libc::sockaddr_in6 {
+                sin6_family: libc::AF_INET6 as libc::sa_family_t,
+                sin6_port: v6.port().to_be(),
+                sin6_flowinfo: v6.flowinfo(),
+                sin6_addr: libc::in6_addr {
+                    s6_addr: v6.ip().octets(),
+                },
+                sin6_scope_id: v6.scope_id(),
+            };
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    &sin6 as *const libc::sockaddr_in6 as *const u8,
+                    &mut storage as *mut libc::sockaddr_storage as *mut u8,
+                    std::mem::size_of::<libc::sockaddr_in6>(),
+                );
+            }
+            (
+                storage,
+                std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+            )
+        }
+    }
+}
+
 /// Stub for non-Linux platforms. Compile-time no-op. The UDP proxy drain loop
 /// is gated with `#[cfg(target_os = "linux")]` and falls back to `try_recv_from`.
 #[cfg(not(target_os = "linux"))]
@@ -202,6 +390,19 @@ pub struct RecvMmsgBatch;
 #[cfg(not(target_os = "linux"))]
 #[allow(dead_code)]
 impl RecvMmsgBatch {
+    pub fn new(_capacity: usize) -> Self {
+        Self
+    }
+}
+
+/// Non-Linux stub for SendMmsgBatch.
+#[cfg(not(target_os = "linux"))]
+#[allow(dead_code)]
+pub struct SendMmsgBatch;
+
+#[cfg(not(target_os = "linux"))]
+#[allow(dead_code)]
+impl SendMmsgBatch {
     pub fn new(_capacity: usize) -> Self {
         Self
     }

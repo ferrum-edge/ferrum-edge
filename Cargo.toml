@@ -73,6 +73,7 @@ httpdate = "1"
 regex = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
 dashmap = "6"
+ahash = "0.8"
 arc-swap = "1"
 bytes = "1"
 thiserror = "2"
@@ -144,10 +145,11 @@ split-debuginfo = "unpacked"
 # Release: optimise for runtime performance
 [profile.release]
 opt-level = 3
-lto = "thin"            # thin LTO: good optimisation without huge link times
-codegen-units = 16      # more parallelism during codegen (trade a tiny bit of perf)
+lto = "fat"             # fat LTO: full cross-crate inlining for maximum hot-path perf
+codegen-units = 1       # single codegen unit for best LLVM optimization
 strip = true            # strip symbols — smaller binary
 incremental = false     # disable incremental for deterministic release builds
+panic = "abort"         # no unwind tables — smaller binary, faster error paths
 
 # CI-specific: fast release builds for testing (not shipping)
 [profile.ci-release]

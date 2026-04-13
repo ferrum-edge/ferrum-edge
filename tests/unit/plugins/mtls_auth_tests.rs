@@ -125,7 +125,7 @@ fn create_stream_ctx_with_cert(
         consumer_index: Arc::new(ConsumerIndex::new(&consumers)),
         identified_consumer: None,
         authenticated_identity: None,
-        metadata: HashMap::new(),
+        metadata: None,
         tls_client_cert_der: Some(Arc::new(cert_der)),
         tls_client_cert_chain_der: None,
         sni_hostname: None,
@@ -779,7 +779,10 @@ async fn test_mtls_auth_stream_connect_identifies_consumer() {
     assert_continue(result);
     assert_eq!(ctx.identified_consumer.as_ref().unwrap().username, "alice");
     assert_eq!(
-        ctx.metadata.get("consumer_username").map(String::as_str),
+        ctx.metadata
+            .as_ref()
+            .and_then(|m| m.get("consumer_username"))
+            .map(String::as_str),
         Some("alice")
     );
 }
@@ -799,7 +802,7 @@ fn create_udp_stream_ctx_with_cert(
         consumer_index: Arc::new(ConsumerIndex::new(&consumers)),
         identified_consumer: None,
         authenticated_identity: None,
-        metadata: HashMap::new(),
+        metadata: None,
         tls_client_cert_der: Some(Arc::new(cert_der)),
         tls_client_cert_chain_der: None,
         sni_hostname: None,
@@ -816,7 +819,7 @@ fn create_udp_stream_ctx_no_cert(consumers: Vec<Consumer>) -> StreamConnectionCo
         consumer_index: Arc::new(ConsumerIndex::new(&consumers)),
         identified_consumer: None,
         authenticated_identity: None,
-        metadata: HashMap::new(),
+        metadata: None,
         tls_client_cert_der: None,
         tls_client_cert_chain_der: None,
         sni_hostname: None,
@@ -877,7 +880,7 @@ async fn test_mtls_auth_dtls_with_issuer_verification() {
         consumer_index: Arc::new(ConsumerIndex::new(&[consumer])),
         identified_consumer: None,
         authenticated_identity: None,
-        metadata: HashMap::new(),
+        metadata: None,
         tls_client_cert_der: Some(Arc::new(client_der)),
         tls_client_cert_chain_der: Some(Arc::new(vec![ca_der])),
         sni_hostname: None,

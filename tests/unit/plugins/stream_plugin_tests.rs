@@ -274,7 +274,7 @@ async fn test_ip_restriction_stream_connect_allowed() {
         consumer_index: empty_consumer_index(),
         identified_consumer: None,
         authenticated_identity: None,
-        metadata: HashMap::new(),
+        metadata: None,
         tls_client_cert_der: None,
         tls_client_cert_chain_der: None,
         sni_hostname: None,
@@ -301,7 +301,7 @@ async fn test_ip_restriction_stream_connect_denied() {
         consumer_index: empty_consumer_index(),
         identified_consumer: None,
         authenticated_identity: None,
-        metadata: HashMap::new(),
+        metadata: None,
         tls_client_cert_der: None,
         tls_client_cert_chain_der: None,
         sni_hostname: None,
@@ -329,7 +329,7 @@ fn make_stream_ctx() -> StreamConnectionContext {
         consumer_index: empty_consumer_index(),
         identified_consumer: None,
         authenticated_identity: None,
-        metadata: HashMap::new(),
+        metadata: None,
         tls_client_cert_der: None,
         tls_client_cert_chain_der: None,
         sni_hostname: None,
@@ -431,12 +431,13 @@ async fn test_correlation_id_stream_connect_assigns_id() {
     let mut ctx = make_stream_ctx();
     let result = plugin.on_stream_connect(&mut ctx).await;
     assert!(matches!(result, PluginResult::Continue));
+    let meta = ctx.metadata.as_ref().expect("metadata should be allocated");
     assert!(
-        ctx.metadata.contains_key("request_id"),
+        meta.contains_key("request_id"),
         "correlation_id should insert request_id into metadata"
     );
     assert!(
-        !ctx.metadata["request_id"].is_empty(),
+        !meta["request_id"].is_empty(),
         "request_id should not be empty"
     );
 }
@@ -451,16 +452,17 @@ async fn test_otel_tracing_stream_connect_assigns_trace_id() {
     let mut ctx = make_stream_ctx();
     let result = plugin.on_stream_connect(&mut ctx).await;
     assert!(matches!(result, PluginResult::Continue));
+    let meta = ctx.metadata.as_ref().expect("metadata should be allocated");
     assert!(
-        ctx.metadata.contains_key("trace_id"),
+        meta.contains_key("trace_id"),
         "otel_tracing should insert trace_id"
     );
     assert!(
-        ctx.metadata.contains_key("span_id"),
+        meta.contains_key("span_id"),
         "otel_tracing should insert span_id"
     );
-    assert!(!ctx.metadata["trace_id"].is_empty());
-    assert!(!ctx.metadata["span_id"].is_empty());
+    assert!(!meta["trace_id"].is_empty());
+    assert!(!meta["span_id"].is_empty());
 }
 
 #[tokio::test]
@@ -498,11 +500,12 @@ async fn test_stream_metadata_flows_from_connect_to_disconnect() {
     let plugin = make_plugin("correlation_id", json!({})).unwrap();
     let mut ctx = make_stream_ctx();
     plugin.on_stream_connect(&mut ctx).await;
-    let request_id = ctx.metadata.get("request_id").cloned().unwrap();
+    let meta = ctx.metadata.as_ref().expect("metadata should be allocated");
+    let request_id = meta.get("request_id").cloned().unwrap();
 
     // Build disconnect summary with the metadata from connect
     let mut summary = make_stream_summary();
-    summary.metadata = ctx.metadata;
+    summary.metadata = ctx.take_metadata();
     assert_eq!(
         summary.metadata.get("request_id").unwrap(),
         &request_id,

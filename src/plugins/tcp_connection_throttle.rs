@@ -148,7 +148,7 @@ impl Plugin for TcpConnectionThrottle {
             };
         }
 
-        ctx.metadata.insert(METADATA_KEY.to_string(), key);
+        ctx.insert_metadata(METADATA_KEY.to_string(), key);
         PluginResult::Continue
     }
 
