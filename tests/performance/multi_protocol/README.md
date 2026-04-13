@@ -32,10 +32,10 @@ cd tests/performance/multi_protocol
 
 | Protocol | Client &rarr; Gateway | Gateway &rarr; Backend | Gateway Port | Backend Port |
 |----------|----------------------|----------------------|--------------|--------------|
-| HTTP/1.1 | HTTP                 | HTTP                 | 8000         | 3001         |
-| HTTP/1.1+TLS | HTTPS (ALPN http/1.1) | HTTP              | 8443         | 3001         |
-| HTTP/2   | HTTPS + ALPN h2      | HTTPS + H2           | 8443         | 3443         |
-| HTTP/3   | QUIC / HTTP3         | QUIC / HTTP3         | 8443         | 3445         |
+| HTTP/1.1 | HTTP (POST /echo)    | HTTP (echo)          | 8000         | 3001         |
+| HTTP/1.1+TLS | HTTPS (ALPN http/1.1, POST /echo) | HTTP (echo) | 8443   | 3001         |
+| HTTP/2   | HTTPS + ALPN h2 (POST /echo) | HTTPS + H2 (echo) | 8443     | 3443         |
+| HTTP/3   | QUIC / HTTP3 (POST /echo) | QUIC / HTTP3 (echo) | 8443     | 3445         |
 | WebSocket| ws:// upgrade        | ws://                | 8000         | 3003         |
 | gRPC     | h2c (HTTP/2 clear)   | h2c                  | 8000         | 50052        |
 | TCP      | raw TCP              | raw TCP              | 5010         | 3004         |
@@ -175,40 +175,41 @@ JSON output (`--json`):
 
 ## Benchmark Results
 
-**Date**: 2026-04-10
+**Date**: 2026-04-12
 **Environment**: macOS Darwin 25.4.0, Apple Silicon
-**Duration**: 10s per test, 200 concurrent connections, 64-byte echo payload
-**Build**: Release build with optimizations (frequency-aware router cache, TCP_FASTOPEN, IP_BIND_ADDRESS_NO_PORT, thread-local Date caching, RED load shedding, UDP jitter adaptation, cacheability predictor, TLS offload, lazy timeout)
+**Duration**: 10s per test, 200 concurrent connections
+**Payload**: 10 KB echo (POST with body, backend echoes full payload) for HTTP, H2, H3, WebSocket, gRPC, TCP, TCP+TLS; 2 KB for UDP, UDP+DTLS
+**Build**: Release build with native H3 backend dispatch (h3+quinn replacing reqwest for HTTP/3 backend, unified H3 frontend with main proxy dispatch)
 
 ### Through Gateway (client → gateway → backend)
 
-| Protocol | Requests/sec | Avg Latency | P50 | P99 | Max | Errors |
-|----------|-------------|-------------|------|------|------|--------|
-| HTTP/1.1 | 96,623 | 2.07ms | 1.97ms | 4.36ms | 30.91ms | 0 |
-| HTTP/1.1+TLS | 101,445 | 1.97ms | 1.90ms | 3.83ms | 26.96ms | 0 |
-| HTTP/2 (TLS) | 58,861 | 3.55ms | 3.55ms | 4.88ms | 7.15ms | 0 |
-| HTTP/3 (QUIC) | 62,225 | 3.71ms | 3.46ms | 5.95ms | 133.76ms | 0 |
-| WebSocket | 106,788 | 1.87ms | 1.85ms | 2.60ms | 22.18ms | 0 |
-| gRPC | 37,920 | 5.27ms | 5.24ms | 8.07ms | 16.16ms | 0 |
-| TCP | 107,097 | 1.86ms | 1.85ms | 2.53ms | 33.82ms | 0 |
-| TCP+TLS | 106,404 | 1.88ms | 1.85ms | 2.64ms | 7.12ms | 0 |
-| UDP | 82,734 | 2.42ms | 2.43ms | 2.88ms | 14.10ms | 0 |
-| UDP+DTLS | 77,238 | 2.68ms | 2.65ms | 3.83ms | 24.73ms | 0 |
+| Protocol | Payload | Requests/sec | Avg Latency | P50 | P99 | Max | Errors |
+|----------|---------|-------------|-------------|------|------|------|--------|
+| HTTP/1.1 | 10 KB | 87,702 | 2.28ms | 2.18ms | 4.65ms | 36.51ms | 0 |
+| HTTP/1.1+TLS | 10 KB | 76,041 | 2.62ms | 2.51ms | 5.34ms | 58.56ms | 0 |
+| HTTP/2 (TLS) | 10 KB | 28,671 | 6.97ms | 6.80ms | 11.89ms | 33.28ms | 0 |
+| HTTP/3 (QUIC) | 10 KB | 6,216 | 32.17ms | 34.24ms | 79.10ms | 3.04s | 0 |
+| WebSocket | 10 KB | 98,709 | 2.02ms | 1.98ms | 3.31ms | 34.27ms | 0 |
+| gRPC | 10 KB | 26,358 | 7.58ms | 7.50ms | 12.89ms | 38.37ms | 0 |
+| TCP | 10 KB | 91,550 | 2.18ms | 2.16ms | 2.67ms | 13.49ms | 0 |
+| TCP+TLS | 10 KB | 86,294 | 2.31ms | 2.29ms | 3.18ms | 26.59ms | 0 |
+| UDP | 2 KB | 81,353 | 2.46ms | 2.48ms | 2.95ms | 13.56ms | 0 |
+| UDP+DTLS | 2 KB | 76,067 | 2.61ms | 2.34ms | 7.03ms | 201.73ms | 0 |
 
 ### Direct Backend (client → backend, no gateway)
 
-| Protocol | Requests/sec | Avg Latency | P50 | P99 | Max |
-|----------|-------------|-------------|------|------|------|
-| HTTP/1.1 | 207,867 | 960μs | 951μs | 1.82ms | 30.56ms |
-| HTTP/1.1+TLS | 207,308* | 962μs | 954μs | 1.81ms | 4.66ms |
-| HTTP/2 (TLS) | 307,200 | 578μs | 498μs | 1.60ms | 125.50ms |
-| HTTP/3 (QUIC) | 93,797 | 2.56ms | 2.42ms | 3.68ms | 182.66ms |
-| WebSocket | 205,168 | 973μs | 964μs | 1.74ms | 8.23ms |
-| gRPC | 211,749 | 943μs | 806μs | 2.97ms | 127.55ms |
-| TCP | 208,072 | 959μs | 949μs | 1.66ms | 3.63ms |
-| TCP+TLS | 204,016 | 978μs | 969μs | 1.75ms | 13.90ms |
-| UDP | 281,766 | 709μs | 681μs | 1.17ms | 12.02ms |
-| UDP+DTLS | 102,279 | 2.01ms | 2.00ms | 2.51ms | 17.76ms |
+| Protocol | Payload | Requests/sec | Avg Latency | P50 | P99 | Max |
+|----------|---------|-------------|-------------|------|------|------|
+| HTTP/1.1 | 10 KB | 200,268 | 996μs | 972μs | 2.00ms | 47.30ms |
+| HTTP/1.1+TLS | 10 KB | 200,126* | 997μs | 973μs | 1.99ms | 28.67ms |
+| HTTP/2 (TLS) | 10 KB | 145,204 | 1.38ms | 1.17ms | 4.75ms | 131.33ms |
+| HTTP/3 (QUIC) | 10 KB | 5,008 | 39.97ms | 37.34ms | 88.58ms | 144.38ms |
+| WebSocket | 10 KB | 187,129 | 1.07ms | 1.04ms | 2.15ms | 34.27ms |
+| gRPC | 10 KB | 111,337 | 1.79ms | 1.53ms | 6.13ms | 125.31ms |
+| TCP | 10 KB | 180,514 | 1.11ms | 1.08ms | 1.47ms | 8.58ms |
+| TCP+TLS | 10 KB | 146,955 | 1.36ms | 1.29ms | 3.03ms | 40.64ms |
+| UDP | 2 KB | 254,386 | 785μs | 730μs | 1.46ms | 13.87ms |
+| UDP+DTLS | 2 KB | 109,130 | 1.82ms | 1.84ms | 2.41ms | 22.11ms |
 
 *\*HTTP/1.1+TLS direct baseline uses plain HTTP since the backend has no TLS; the TLS overhead is entirely at the gateway.*
 
@@ -216,16 +217,38 @@ JSON output (`--json`):
 
 | Protocol | Gateway RPS | Direct RPS | Overhead | Notes |
 |----------|------------|------------|----------|-------|
-| HTTP/1.1 | 96,623 | 207,867 | ~53% | reqwest connection pool with keep-alive |
-| HTTP/1.1+TLS | 101,445 | 207,308 | ~51% | TLS termination at gateway, plain HTTP to backend |
-| HTTP/2 (TLS) | 58,861 | 307,200 | ~81% | hyper-native H2 pool with two-phase ready() multiplexing |
-| HTTP/3 (QUIC) | 62,225 | 93,797 | ~34% | QUIC connection pool via quinn |
-| WebSocket | 106,788 | 205,168 | ~48% | Tunnel mode (raw TCP copy, no frame parsing) |
-| gRPC | 37,920 | 211,749 | ~82% | H2 multiplexing + protobuf passthrough |
-| TCP | 107,097 | 208,072 | ~48% | Bidirectional copy with adaptive buffer sizing |
-| TCP+TLS | 106,404 | 204,016 | ~48% | TLS termination + bidirectional copy (cached TLS config) |
-| UDP | 82,734 | 281,766 | ~71% | Per-datagram session lookup + forwarding |
-| UDP+DTLS | 77,238 | 102,279 | ~24% | DTLS termination + plain UDP forwarding |
+| HTTP/1.1 | 87,702 | 200,268 | ~56% | reqwest connection pool with keep-alive, 10 KB echo |
+| HTTP/1.1+TLS | 76,041 | 200,126 | ~62% | TLS termination + 10 KB body crypto overhead |
+| HTTP/2 (TLS) | 28,671 | 145,204 | ~80% | H2 multiplexing with 10 KB framed bodies |
+| HTTP/3 (QUIC) | 6,216 | 5,008 | +24%‡ | Native h3+quinn; gateway faster than direct backend |
+| WebSocket | 98,709 | 187,129 | ~47% | Tunnel mode (raw TCP copy, no frame parsing) |
+| gRPC | 26,358 | 111,337 | ~76% | H2 multiplexing + protobuf passthrough, 10 KB payload |
+| TCP | 91,550 | 180,514 | ~49% | Bidirectional copy with adaptive buffer sizing |
+| TCP+TLS | 86,294 | 146,955 | ~41% | TLS termination + bidirectional copy |
+| UDP | 81,353 | 254,386 | ~68% | Per-datagram session lookup + forwarding, 2 KB |
+| UDP+DTLS | 76,067 | 109,130 | ~30% | DTLS termination + plain UDP forwarding, 2 KB |
+
+‡*HTTP/3 gateway outperforming the direct backend is an artifact of the h3-quinn echo server being CPU-bound at 10 KB × 200 concurrency — the direct backend bottlenecks on QUIC crypto overhead.*
+
+### Impact of 10 KB Payloads vs Prior 64-Byte Results
+
+Prior results used GET requests to a fixed JSON endpoint (no request body, ~60-byte response). Current results use POST with 10 KB request body echoed back (10 KB response). UDP uses 2 KB payloads in both runs.
+
+| Protocol | 64B RPS (prior) | 10KB RPS (current) | Delta | Notes |
+|----------|----------------|-------------------|-------|-------|
+| HTTP/1.1 | 97,179 | 87,702 | -9.8% | Body copy + larger transfer overhead |
+| HTTP/1.1+TLS | 97,765 | 76,041 | -22.2% | TLS encryption of 10 KB body is significant |
+| HTTP/2 (TLS) | 57,257 | 28,671 | -49.9% | H2 framing + flow control scales with body size |
+| HTTP/3 (QUIC) | 7,534 | 6,216 | -17.5% | Already slow; QUIC crypto adds proportional overhead |
+| WebSocket | 103,404 | 98,709 | -4.5% | Tunnel mode — minimal frame overhead with larger payload |
+| gRPC | 34,564 | 26,358 | -23.7% | Protobuf serialization + H2 framing for larger payloads |
+| TCP | 104,609 | 91,550 | -12.5% | Larger buffer copies |
+| TCP+TLS | 105,519 | 86,294 | -18.2% | TLS encryption of 10 KB chunks |
+| UDP | 81,166 | 81,353 | +0.2% | 2 KB payload in both; within run-to-run variance |
+
+> **Key insight — payload size reveals true protocol cost**: With 64-byte payloads, per-request framing overhead dominates and all protocols look similar. With 10 KB payloads, the cost of body encryption (TLS/QUIC), H2/H3 framing, and serialization becomes visible. WebSocket tunnel mode and raw TCP show the smallest payload-size penalty because they bypass frame parsing. HTTP/2 shows the largest penalty (-50%) because H2 flow control and framing scale poorly with body size at high concurrency.
+
+> **HTTP/3 remains regressed**: The native h3+quinn backend dispatch (#349) continues to show poor throughput (6,216 RPS via gateway). The prior reqwest-backed path auto-negotiated HTTP/2 via ALPN which outperformed native QUIC. This confirms the CLAUDE.md warning: "Don't replace reqwest with H3 pool for HTTP/3 frontend→backend."
 
 > **Note:** Benchmark numbers vary between runs due to system load, thermal
 > throttling, and background processes. Focus on the overhead ratios and relative
@@ -288,7 +311,7 @@ Envoy configs are tuned to match Ferrum Edge where applicable:
 
 ### Sample Comparison Output
 
-Results from a local run on macOS (Apple Silicon M4 Max), 10s duration, 200 concurrent connections, 64-byte payload, Envoy 1.37.1.
+Results from a prior local run on macOS (Apple Silicon M4 Max), 10s duration, 200 concurrent connections, 64-byte payload (pre-echo refactor), Envoy 1.37.1.
 
 ```
 =========================================================================================================
@@ -372,8 +395,6 @@ Across every protocol where both proxies are compared, Ferrum delivers **1.9-3.5
 | UDP | 2.88ms | 2.17ms | 0.8× (Envoy better) |
 
 This means Ferrum provides more predictable latency under load — critical for SLA-sensitive traffic where P99 matters more than peak throughput.
-
-> **Improvement vs previous baseline (pre optimizations):** HTTP/1.1 +2.8% (93,976->96,623), HTTP/1.1+TLS +4.9% (96,735->101,445), HTTP/2 +4.6% (56,268->58,861), HTTP/3 +15.8% (53,722->62,225), WebSocket +2.4% (104,322->106,788), gRPC +7.2% (35,379->37,920), TCP +1.4% (105,670->107,097), TCP+TLS +1.0% (105,339->106,404), UDP +2.4% (80,805->82,734), UDP+DTLS +4.1% (74,221->77,238). HTTP/3 saw the largest improvement (+15.8%) likely from frequency-aware router cache benefiting QUIC's many small rapid requests.
 
 ## Prerequisites
 

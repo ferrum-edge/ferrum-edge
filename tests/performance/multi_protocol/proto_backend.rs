@@ -305,7 +305,28 @@ async fn run_h3_server(addr: SocketAddr, server_config: quinn::ServerConfig) -> 
                     let Ok((req, mut stream)) = resolver.resolve_request().await else {
                         return;
                     };
-                    let (status, body) = match req.uri().path() {
+                    let path = req.uri().path().to_string();
+
+                    if path == "/echo" {
+                        // Collect request body from H3 stream
+                        let mut body_data = Vec::new();
+                        while let Ok(Some(chunk)) = stream.recv_data().await {
+                            use bytes::Buf;
+                            body_data.extend_from_slice(chunk.chunk());
+                        }
+                        let resp = http::Response::builder()
+                            .status(StatusCode::OK)
+                            .body(())
+                            .unwrap();
+                        let _ = stream.send_response(resp).await;
+                        let _ = stream
+                            .send_data(bytes::Bytes::from(body_data))
+                            .await;
+                        let _ = stream.finish().await;
+                        return;
+                    }
+
+                    let (status, body) = match path.as_str() {
                         "/health" => (StatusCode::OK, b"{\"status\":\"healthy\"}" as &[u8]),
                         "/api/users" => (
                             StatusCode::OK,
@@ -384,7 +405,7 @@ async fn run_dtls_echo(addr: SocketAddr, cert_path: &str, key_path: &str) -> any
 
             tokio::spawn(async move {
                 let mut dtls = Dtls::new_auto(config, cert, std::time::Instant::now());
-                let mut out_buf = vec![0u8; 2048];
+                let mut out_buf = vec![0u8; 65536];
                 let mut connected = false;
                 let mut next_timeout: Option<std::time::Instant> = None;
 
@@ -392,10 +413,13 @@ async fn run_dtls_echo(addr: SocketAddr, cert_path: &str, key_path: &str) -> any
                 // handle_packet or dimpl panics in send_server_hello.
                 let _ = dtls.handle_timeout(std::time::Instant::now());
                 // Drain the resulting Timeout output
-                for _ in 0..64 {
-                    if let Output::Timeout(t) = dtls.poll_output(&mut out_buf) {
-                        next_timeout = Some(t);
-                        break;
+                loop {
+                    match dtls.poll_output(&mut out_buf) {
+                        Output::Timeout(t) => {
+                            next_timeout = Some(t);
+                            break;
+                        }
+                        _ => {}
                     }
                 }
 
@@ -427,7 +451,7 @@ async fn run_dtls_echo(addr: SocketAddr, cert_path: &str, key_path: &str) -> any
                     // always the last variant). Handle all known variants to
                     // avoid breaking before the Timeout sentinel.
                     let mut just_connected = false;
-                    for _ in 0..64 {
+                    loop {
                         match dtls.poll_output(&mut out_buf) {
                             Output::Packet(d) => {
                                 let _ = socket.send_to(d, peer).await;
@@ -456,7 +480,7 @@ async fn run_dtls_echo(addr: SocketAddr, cert_path: &str, key_path: &str) -> any
 
                     // After echoing, drain the resulting Packet outputs
                     if connected {
-                        for _ in 0..64 {
+                        loop {
                             match dtls.poll_output(&mut out_buf) {
                                 Output::Packet(d) => {
                                     let _ = socket.send_to(d, peer).await;

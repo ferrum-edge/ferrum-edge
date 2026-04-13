@@ -2,9 +2,9 @@
 # HTTP/1.1 performance test config
 # Gateway listens on HTTP (8000), proxies to HTTP/1.1 backend
 proxies:
-  - id: "h1-users"
-    name: "HTTP/1.1 Users API"
-    listen_path: "/api/users"
+  - id: "h1-echo"
+    name: "HTTP/1.1 Echo"
+    listen_path: "/echo"
     backend_protocol: http
     backend_host: "127.0.0.1"
     backend_port: 3001

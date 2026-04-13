@@ -155,12 +155,14 @@ async fn run_http1(args: &BenchArgs) -> anyhow::Result<()> {
 
     let deadline = Instant::now() + Duration::from_secs(args.duration);
     let protocol_label = if is_tls { "HTTP/1.1+TLS" } else { "HTTP/1.1" };
+    let payload = Bytes::from(vec![0xABu8; args.payload_size]);
 
     let mut handles = Vec::new();
     for _ in 0..args.concurrency {
         let path = path.clone();
         let authority = authority.clone();
         let tls_connector = tls_connector.clone();
+        let payload = payload.clone();
         handles.push(tokio::spawn(async move {
             let mut metrics = BenchMetrics::new();
 
@@ -201,9 +203,9 @@ async fn run_http1(args: &BenchArgs) -> anyhow::Result<()> {
                     send_req = connect_h1(addr, &tls_connector).await?;
                 }
 
-                let req = hyper::Request::get(&path)
+                let req = hyper::Request::post(&path)
                     .header("host", &authority)
-                    .body(http_body_util::Full::new(Bytes::new()))
+                    .body(http_body_util::Full::new(payload.clone()))
                     .unwrap();
                 let start = Instant::now();
                 match send_req.send_request(req).await {
@@ -309,17 +311,20 @@ async fn run_http2(args: &BenchArgs) -> anyhow::Result<()> {
         senders.push(send_req);
     }
 
+    let payload = Bytes::from(vec![0xABu8; args.payload_size]);
+
     // Distribute concurrent tasks across the connection pool.
     // hyper's http2 SendRequest is Clone and supports concurrent streams.
     let mut handles = Vec::new();
     for i in 0..args.concurrency {
         let mut send_req = senders[i as usize % num_conns].clone();
         let path = path.clone();
+        let payload = payload.clone();
         handles.push(tokio::spawn(async move {
             let mut metrics = BenchMetrics::new();
             while Instant::now() < deadline {
-                let req = hyper::Request::get(&path)
-                    .body(http_body_util::Full::new(Bytes::new()))
+                let req = hyper::Request::post(&path)
+                    .body(http_body_util::Full::new(payload.clone()))
                     .unwrap();
                 let start = Instant::now();
                 match send_req.send_request(req).await {
@@ -395,22 +400,30 @@ async fn run_http3(args: &BenchArgs) -> anyhow::Result<()> {
         senders.push(send_req);
     }
 
+    let payload = Bytes::from(vec![0xABu8; args.payload_size]);
+
     // Distribute concurrent tasks across the connection pool
     let mut handles = Vec::new();
     for i in 0..args.concurrency {
         let mut send_req = senders[i as usize % num_conns].clone();
         let full_uri = full_uri.clone();
+        let payload = payload.clone();
         handles.push(tokio::spawn(async move {
             let mut metrics = BenchMetrics::new();
             while Instant::now() < deadline {
                 let req = http::Request::builder()
-                    .method("GET")
+                    .method("POST")
                     .uri(&full_uri)
                     .body(())
                     .unwrap();
                 let start = Instant::now();
                 match send_req.send_request(req).await {
                     Ok(mut stream) => {
+                        if let Err(e) = stream.send_data(payload.clone()).await {
+                            eprintln!("  h3 send_data error: {e}");
+                            metrics.record_error();
+                            break;
+                        }
                         let _ = stream.finish().await;
                         match stream.recv_response().await {
                             Ok(_resp) => {
@@ -628,8 +641,19 @@ async fn run_udp(args: &BenchArgs) -> anyhow::Result<()> {
     let payload = vec![0xABu8; args.payload_size];
     let use_dtls = args.tls;
 
+    // Generate one cert for all DTLS connections (key gen is CPU-intensive)
+    let shared_cert = if use_dtls {
+        Some(
+            dimpl::certificate::generate_self_signed_certificate()
+                .map_err(|e| anyhow::anyhow!("cert gen: {e}"))?,
+        )
+    } else {
+        None
+    };
+
     for _ in 0..args.concurrency {
         let payload = payload.clone();
+        let shared_cert = shared_cert.clone();
         handles.push(tokio::spawn(async move {
             let mut metrics = BenchMetrics::new();
 
@@ -643,14 +667,13 @@ async fn run_udp(args: &BenchArgs) -> anyhow::Result<()> {
                     .await
                     .map_err(|e| anyhow::anyhow!("udp connect: {e}"))?;
 
-                let cert = dimpl::certificate::generate_self_signed_certificate()
-                    .map_err(|e| anyhow::anyhow!("cert gen: {e}"))?;
+                let cert = shared_cert.unwrap();
                 let config = Arc::new(Config::default());
                 let mut dtls = Dtls::new_auto(config, cert, std::time::Instant::now());
                 dtls.set_active(true); // client
 
                 // Drive handshake
-                let mut out_buf = vec![0u8; 2048];
+                let mut out_buf = vec![0u8; 65536];
                 let mut recv_buf = vec![0u8; 65536];
                 let hs_deadline = std::time::Instant::now() + Duration::from_secs(10);
                 let mut next_timeout: Option<std::time::Instant>;
