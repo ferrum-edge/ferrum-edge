@@ -1,0 +1,646 @@
+# On-demand gateway comparison benchmark (all-Docker).
+#
+# Runs the comparison/ suite which benchmarks Ferrum Edge against Pingora,
+# Kong, Tyk, KrakenD, and Envoy — all inside Docker containers for
+# apples-to-apples comparison.
+#
+# Supports 1-3 iterations to detect noisy-neighbor outliers on shared
+# GitHub runners.  Posts a markdown summary with per-run tables and a
+# cross-run analysis comparing gateway offerings.
+#
+# Usage:
+#   - Go to Actions -> "Gateway Comparison Benchmark" -> "Run workflow"
+#   - Pick the branch to benchmark
+#   - Optionally adjust parameters
+
+name: Gateway Comparison Benchmark
+
+on:
+  workflow_dispatch:
+    inputs:
+      iterations:
+        description: "Number of benchmark iterations (1-3)"
+        required: false
+        default: "1"
+        type: choice
+        options:
+          - "1"
+          - "2"
+          - "3"
+      duration:
+        description: "wrk test duration (e.g. 30s)"
+        required: false
+        default: "10s"
+        type: string
+      connections:
+        description: "wrk concurrent connections"
+        required: false
+        default: "100"
+        type: string
+      threads:
+        description: "wrk threads"
+        required: false
+        default: "8"
+        type: string
+      skip_gateways:
+        description: "Comma-separated gateways to skip (ferrum,pingora,kong,tyk,krakend,envoy)"
+        required: false
+        default: ""
+        type: string
+
+jobs:
+  comparison:
+    name: Gateway Comparison
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+        continue-on-error: true
+
+      - name: Configure sccache
+        run: |
+          if command -v sccache &> /dev/null && sccache --start-server 2>/dev/null; then
+            echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
+            echo "SCCACHE_GHA_ENABLED=true" >> $GITHUB_ENV
+            echo "sccache enabled"
+          else
+            echo "sccache unavailable, building without cache"
+          fi
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "ci-comparison-bench"
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler libcurl4-openssl-dev lsof sysstat wrk
+
+      - name: Runner health check (pre-benchmark)
+        run: |
+          echo "=========================================="
+          echo "  RUNNER HEALTH CHECK - PRE-BENCHMARK"
+          echo "=========================================="
+          echo ""
+
+          echo "--- CPU Info ---"
+          nproc
+          lscpu | grep -E 'Model name|CPU\(s\)|Thread|Core|Socket|MHz|Hypervisor|Virtualization'
+          echo ""
+
+          echo "--- CPU Steal / Usage (5-second sample) ---"
+          vmstat 1 6 | tail -n 5
+          echo ""
+
+          AVG_STEAL=$(vmstat 1 6 | tail -n 5 | awk '{sum += $17; n++} END {printf "%.1f", sum/n}')
+          echo "Average CPU steal over 5s: ${AVG_STEAL}%"
+          if (( $(echo "$AVG_STEAL > 5.0" | bc -l) )); then
+            echo "::warning::CPU steal is ${AVG_STEAL}% - noisy neighbor detected. Benchmark results may be unreliable."
+          else
+            echo "CPU steal is low (${AVG_STEAL}%). Runner appears unimpaired."
+          fi
+          echo ""
+
+          echo "--- Memory ---"
+          free -h
+          echo ""
+
+          echo "--- System Load ---"
+          uptime
+          echo ""
+
+          echo "--- Scheduler Latency ---"
+          python3 -c "
+          import time
+          samples = []
+          for _ in range(100):
+              t0 = time.monotonic_ns()
+              time.sleep(0.001)
+              elapsed_us = (time.monotonic_ns() - t0) / 1000
+              samples.append(elapsed_us)
+          avg = sum(samples) / len(samples)
+          p99 = sorted(samples)[98]
+          maxv = max(samples)
+          print(f'1ms sleep accuracy: avg={avg:.0f}us  p99={p99:.0f}us  max={maxv:.0f}us')
+          if p99 > 5000:
+              print('WARNING: High scheduler jitter detected')
+          else:
+              print('Scheduler jitter is within normal range')
+          "
+          echo ""
+          echo "=========================================="
+
+      - name: Run comparison benchmark (${{ inputs.iterations }} iteration(s))
+        timeout-minutes: 90
+        run: |
+          ITERATIONS=${{ inputs.iterations }}
+          echo "Running ${ITERATIONS} iteration(s) of the comparison benchmark suite"
+          echo ""
+
+          for run in $(seq 1 "$ITERATIONS"); do
+            echo ""
+            echo "============================================"
+            echo "  COMPARISON RUN ${run}/${ITERATIONS}"
+            echo "============================================"
+            echo ""
+
+            # Quick steal check before each run
+            AVG_STEAL=$(vmstat 1 3 | tail -n 2 | awk '{sum += $17; n++} END {printf "%.1f", sum/n}')
+            echo "Pre-run CPU steal: ${AVG_STEAL}%"
+            if (( $(echo "$AVG_STEAL > 5.0" | bc -l) )); then
+              echo "::warning::Run ${run}: CPU steal is ${AVG_STEAL}% before starting - noisy neighbor detected"
+            fi
+
+            # Run the comparison suite
+            cd ${{ github.workspace }}
+            WRK_DURATION="${{ inputs.duration }}" \
+            WRK_THREADS="${{ inputs.threads }}" \
+            WRK_CONNECTIONS="${{ inputs.connections }}" \
+            SKIP_GATEWAYS="${{ inputs.skip_gateways }}" \
+            SKIP_BUILD=$( [ "$run" -gt 1 ] && echo "true" || echo "false" ) \
+            bash comparison/run_comparison.sh 2>&1 | tee "/tmp/comparison_output_run${run}.txt"
+
+            # Copy results to a per-run directory
+            mkdir -p "comparison-results/run_${run}"
+            if [ -d "comparison/results" ]; then
+              cp -r comparison/results/* "comparison-results/run_${run}/" 2>/dev/null || true
+            fi
+
+            echo ""
+            echo "Run ${run}/${ITERATIONS} complete."
+          done
+
+          echo ""
+          echo "============================================"
+          echo "  ALL ${ITERATIONS} RUN(S) COMPLETE"
+          echo "============================================"
+
+      - name: Collect and analyze results
+        if: always()
+        run: |
+          python3 - <<'PYEOF'
+          import json, os, re, math, sys
+
+          ITERATIONS = int("${{ inputs.iterations }}")
+
+          def parse_wrk_output(file_path):
+              """Parse wrk output including the machine-parseable comparison block."""
+              with open(file_path, "r") as f:
+                  content = f.read()
+              metrics = {}
+              rps_match = re.search(r"Requests/sec:\s+([\d.]+)", content)
+              if rps_match:
+                  metrics["rps"] = float(rps_match.group(1))
+              transfer_match = re.search(r"Transfer/sec:\s+([\d.]+[KMGT]?B)", content)
+              if transfer_match:
+                  metrics["transfer"] = transfer_match.group(1)
+              latency_match = re.search(r"Latency\s+([\d.]+[munμ]?s)", content)
+              if latency_match:
+                  metrics["latency_avg_str"] = latency_match.group(1)
+              block = re.search(
+                  r"--- Comparison Results ---\n(.*?)--- End Results ---",
+                  content, re.DOTALL,
+              )
+              if block:
+                  for line in block.group(1).strip().splitlines():
+                      key, _, value = line.partition(":")
+                      key = key.strip()
+                      value = value.strip()
+                      try:
+                          metrics[key] = float(value)
+                      except ValueError:
+                          metrics[key] = value
+                  if "latency_mean_us" in metrics:
+                      metrics["latency_avg_ms"] = metrics["latency_mean_us"] / 1000.0
+                  if "latency_p50_us" in metrics:
+                      metrics["latency_p50_ms"] = metrics["latency_p50_us"] / 1000.0
+                  if "latency_p90_us" in metrics:
+                      metrics["latency_p90_ms"] = metrics["latency_p90_us"] / 1000.0
+                  if "latency_p99_us" in metrics:
+                      metrics["latency_p99_ms"] = metrics["latency_p99_us"] / 1000.0
+                  if "latency_p999_us" in metrics:
+                      metrics["latency_p999_ms"] = metrics["latency_p999_us"] / 1000.0
+                  if "errors_status" in metrics:
+                      metrics["error_count"] = int(
+                          metrics.get("errors_status", 0)
+                          + metrics.get("errors_connect", 0)
+                          + metrics.get("errors_read", 0)
+                          + metrics.get("errors_write", 0)
+                          + metrics.get("errors_timeout", 0)
+                      )
+              return metrics
+
+          GATEWAYS = ["baseline", "ferrum", "pingora", "kong", "tyk", "krakend", "envoy"]
+          PROTOCOLS = ["http", "https", "e2e_tls"]
+          ENDPOINTS = ["health", "users"]
+
+          def discover_results(results_dir):
+              data = {}
+              if not os.path.isdir(results_dir):
+                  return data
+              for fname in sorted(os.listdir(results_dir)):
+                  if not fname.endswith("_results.txt"):
+                      continue
+                  stem = fname.replace("_results.txt", "")
+                  for gw in GATEWAYS:
+                      if not stem.startswith(gw + "_"):
+                          continue
+                      rest = stem[len(gw) + 1:]
+                      for ep in ENDPOINTS:
+                          if rest.endswith("_" + ep):
+                              proto = rest[:-(len(ep) + 1)]
+                              if proto in PROTOCOLS:
+                                  data.setdefault(gw, {}).setdefault(proto, {})[ep] = parse_wrk_output(
+                                      os.path.join(results_dir, fname)
+                                  )
+                                  break
+                      break
+              return data
+
+          def discover_key_auth_results(results_dir):
+              data = {}
+              if not os.path.isdir(results_dir):
+                  return data
+              for fname in sorted(os.listdir(results_dir)):
+                  if not fname.endswith("_key_auth_api_users_results.txt"):
+                      continue
+                  gw = fname.replace("_key_auth_api_users_results.txt", "")
+                  if gw in GATEWAYS:
+                      data[gw] = parse_wrk_output(os.path.join(results_dir, fname))
+              return data
+
+          # Collect per-run results
+          all_runs = {}
+          all_key_auth_runs = {}
+          for run in range(1, ITERATIONS + 1):
+              run_dir = f"comparison-results/run_{run}"
+              all_runs[run] = discover_results(run_dir)
+              all_key_auth_runs[run] = discover_key_auth_results(run_dir)
+
+          # Save raw JSON
+          os.makedirs("comparison-results", exist_ok=True)
+          raw = {"iterations": ITERATIONS, "runs": {}}
+          for run in range(1, ITERATIONS + 1):
+              raw["runs"][f"run_{run}"] = {
+                  "proxy_results": {
+                      gw: {
+                          proto: {
+                              ep: all_runs[run].get(gw, {}).get(proto, {}).get(ep, {})
+                              for ep in ENDPOINTS
+                          }
+                          for proto in PROTOCOLS
+                      }
+                      for gw in GATEWAYS
+                      if gw in all_runs[run]
+                  },
+                  "key_auth_results": all_key_auth_runs.get(run, {}),
+              }
+          with open("comparison-results/results.json", "w") as f:
+              json.dump(raw, f, indent=2)
+
+          # ---- Build markdown summary ----
+          def fmt_rps(v):
+              if v is None: return "N/A"
+              return f"{v:,.0f}"
+
+          def fmt_ms(v):
+              if v is None: return "N/A"
+              return f"{v:.2f} ms"
+
+          GATEWAY_LABELS = {
+              "baseline": "Direct Backend",
+              "ferrum": "Ferrum Edge",
+              "pingora": "Pingora",
+              "kong": "Kong",
+              "tyk": "Tyk",
+              "krakend": "KrakenD",
+              "envoy": "Envoy",
+          }
+
+          lines = []
+          lines.append("## Gateway Comparison Benchmark Results\n")
+          lines.append(
+              f"**Duration:** ${{ inputs.duration }} | "
+              f"**Threads:** ${{ inputs.threads }} | "
+              f"**Connections:** ${{ inputs.connections }} | "
+              f"**Iterations:** {ITERATIONS}"
+          )
+          if "${{ inputs.skip_gateways }}":
+              lines.append(f"**Skipped:** ${{ inputs.skip_gateways }}")
+          lines.append("")
+
+          PROTO_LABELS = {"http": "HTTP", "https": "HTTPS (TLS Termination)", "e2e_tls": "E2E TLS"}
+
+          # Per-run tables
+          for run in range(1, ITERATIONS + 1):
+              data = all_runs[run]
+              key_auth = all_key_auth_runs.get(run, {})
+              if not data:
+                  continue
+
+              run_label = f"Run {run}" if ITERATIONS > 1 else "Results"
+              lines.append(f"\n### {run_label}\n")
+
+              for proto in PROTOCOLS:
+                  gws_with_data = [gw for gw in GATEWAYS if gw != "baseline" and proto in data.get(gw, {})]
+                  if not gws_with_data:
+                      continue
+
+                  lines.append(f"\n#### {PROTO_LABELS.get(proto, proto)}\n")
+                  lines.append("| Gateway | Endpoint | RPS | Avg Latency | P50 | P99 | P99.9 | Errors | vs Baseline |")
+                  lines.append("|---------|----------|-----|-------------|-----|-----|-------|--------|-------------|")
+
+                  for ep in ENDPOINTS:
+                      bl_rps = data.get("baseline", {}).get(proto, {}).get(ep, {}).get("rps")
+                      # Find best RPS for highlighting
+                      rps_values = []
+                      for gw in gws_with_data:
+                          m = data[gw].get(proto, {}).get(ep, {})
+                          rps_values.append((gw, m.get("rps")))
+
+                      best_rps_gw = max(rps_values, key=lambda x: x[1] or 0)[0] if rps_values else None
+
+                      for gw in gws_with_data:
+                          m = data[gw].get(proto, {}).get(ep, {})
+                          if not m:
+                              continue
+                          rps = m.get("rps")
+                          overhead = ""
+                          if bl_rps and rps:
+                              pct = ((bl_rps - rps) / bl_rps) * 100
+                              overhead = f"-{pct:.1f}%" if pct > 0 else f"+{abs(pct):.1f}%"
+
+                          marker = " :trophy:" if gw == best_rps_gw else ""
+                          lines.append(
+                              f"| **{GATEWAY_LABELS.get(gw, gw)}**{marker} "
+                              f"| /{ep} "
+                              f"| {fmt_rps(rps)} "
+                              f"| {fmt_ms(m.get('latency_avg_ms'))} "
+                              f"| {fmt_ms(m.get('latency_p50_ms'))} "
+                              f"| {fmt_ms(m.get('latency_p99_ms'))} "
+                              f"| {fmt_ms(m.get('latency_p999_ms'))} "
+                              f"| {m.get('error_count', 0)} "
+                              f"| {overhead} |"
+                          )
+
+              # Key-auth table
+              if key_auth:
+                  lines.append("\n#### Key-Auth (HTTP /api/users-auth)\n")
+                  lines.append("| Gateway | RPS | No-Auth RPS | Auth Overhead | Avg Latency | P50 | P99 | Errors |")
+                  lines.append("|---------|-----|-------------|---------------|-------------|-----|-----|--------|")
+
+                  ka_rps_values = [(gw, key_auth[gw].get("rps")) for gw in GATEWAYS if gw in key_auth]
+                  best_ka_gw = max(ka_rps_values, key=lambda x: x[1] or 0)[0] if ka_rps_values else None
+
+                  for gw in GATEWAYS:
+                      if gw not in key_auth or gw == "baseline":
+                          continue
+                      m = key_auth[gw]
+                      rps = m.get("rps")
+                      no_auth_rps = data.get(gw, {}).get("http", {}).get("users", {}).get("rps")
+                      auth_overhead = ""
+                      if no_auth_rps and rps:
+                          pct = ((no_auth_rps - rps) / no_auth_rps) * 100
+                          auth_overhead = f"-{pct:.1f}%" if pct > 0 else f"+{abs(pct):.1f}%"
+                      marker = " :trophy:" if gw == best_ka_gw else ""
+                      lines.append(
+                          f"| **{GATEWAY_LABELS.get(gw, gw)}**{marker} "
+                          f"| {fmt_rps(rps)} "
+                          f"| {fmt_rps(no_auth_rps)} "
+                          f"| {auth_overhead} "
+                          f"| {fmt_ms(m.get('latency_avg_ms'))} "
+                          f"| {fmt_ms(m.get('latency_p50_ms'))} "
+                          f"| {fmt_ms(m.get('latency_p99_ms'))} "
+                          f"| {m.get('error_count', 0)} |"
+                      )
+
+          # ---- Cross-run comparison (only if multiple iterations) ----
+          if ITERATIONS > 1:
+              lines.append("\n---\n")
+              lines.append("### Cross-Run Consistency (Gateway RPS)\n")
+
+              # Collect per-gateway per-protocol per-endpoint RPS across runs
+              combo_rps = {}  # (gw, proto, ep) -> [rps_run1, ...]
+              for run in range(1, ITERATIONS + 1):
+                  data = all_runs[run]
+                  for gw in GATEWAYS:
+                      if gw == "baseline" or gw not in data:
+                          continue
+                      for proto in PROTOCOLS:
+                          for ep in ENDPOINTS:
+                              rps = data.get(gw, {}).get(proto, {}).get(ep, {}).get("rps")
+                              if rps is not None:
+                                  combo_rps.setdefault((gw, proto, ep), []).append(rps)
+
+              if combo_rps:
+                  run_headers = " | ".join(f"Run {i+1}" for i in range(ITERATIONS))
+                  lines.append(f"| Gateway | Protocol | Endpoint | {run_headers} | Mean | CV% | Outlier? |")
+                  lines.append(f"|---------|----------|----------|{'--------|' * ITERATIONS}------|-----|----------|")
+
+                  for (gw, proto, ep) in sorted(combo_rps.keys()):
+                      vals = combo_rps[(gw, proto, ep)]
+                      mean_v = sum(vals) / len(vals) if vals else 0
+                      if len(vals) > 1 and mean_v > 0:
+                          variance = sum((v - mean_v) ** 2 for v in vals) / (len(vals) - 1)
+                          stdev = math.sqrt(variance)
+                          cv = (stdev / mean_v) * 100
+                      else:
+                          stdev = 0
+                          cv = 0
+
+                      outlier = ":warning: YES" if cv > 15 else "No"
+                      rps_cells = " | ".join(fmt_rps(v) for v in vals)
+                      lines.append(
+                          f"| {GATEWAY_LABELS.get(gw, gw)} "
+                          f"| {proto.upper()} "
+                          f"| /{ep} "
+                          f"| {rps_cells} "
+                          f"| {fmt_rps(mean_v)} "
+                          f"| {cv:.1f}% "
+                          f"| {outlier} |"
+                      )
+
+                  lines.append("")
+                  lines.append("> **CV%**: Coefficient of Variation. CV > 15% suggests noisy-neighbor "
+                               "interference. Results marked as outliers should be interpreted with caution.")
+
+          # ---- Gateway Analysis / Head-to-Head ----
+          lines.append("\n---\n")
+          lines.append("### Gateway Analysis\n")
+
+          # Use last run (or single run) for analysis
+          final_run = ITERATIONS
+          data = all_runs.get(final_run, {})
+          key_auth = all_key_auth_runs.get(final_run, {})
+
+          if data:
+              # Compute win counts: for each (proto, ep), which gateway had highest RPS?
+              wins = {}  # gw -> win count
+              total_scenarios = 0
+              scenario_winners = []  # [(proto, ep, winner_gw, rps)]
+
+              for proto in PROTOCOLS:
+                  for ep in ENDPOINTS:
+                      best_gw = None
+                      best_rps = 0
+                      for gw in GATEWAYS:
+                          if gw == "baseline":
+                              continue
+                          rps = data.get(gw, {}).get(proto, {}).get(ep, {}).get("rps")
+                          if rps is not None and rps > best_rps:
+                              best_rps = rps
+                              best_gw = gw
+                      if best_gw:
+                          wins[best_gw] = wins.get(best_gw, 0) + 1
+                          total_scenarios += 1
+                          scenario_winners.append((proto, ep, best_gw, best_rps))
+
+              # Key-auth scenario
+              if key_auth:
+                  best_ka_gw = None
+                  best_ka_rps = 0
+                  for gw, m in key_auth.items():
+                      if gw == "baseline":
+                          continue
+                      rps = m.get("rps")
+                      if rps is not None and rps > best_ka_rps:
+                          best_ka_rps = rps
+                          best_ka_gw = gw
+                  if best_ka_gw:
+                      wins[best_ka_gw] = wins.get(best_ka_gw, 0) + 1
+                      total_scenarios += 1
+                      scenario_winners.append(("key_auth", "users-auth", best_ka_gw, best_ka_rps))
+
+              lines.append(f"**Scenario Wins** (out of {total_scenarios} test scenarios):\n")
+              lines.append("| Gateway | Wins | Win Rate |")
+              lines.append("|---------|------|----------|")
+              for gw in sorted(wins.keys(), key=lambda g: wins[g], reverse=True):
+                  w = wins[gw]
+                  rate = (w / total_scenarios * 100) if total_scenarios > 0 else 0
+                  lines.append(f"| **{GATEWAY_LABELS.get(gw, gw)}** | {w} | {rate:.0f}% |")
+              lines.append("")
+
+              # Head-to-head: Ferrum vs each gateway
+              lines.append("#### Ferrum Edge Head-to-Head\n")
+              ferrum_data = data.get("ferrum", {})
+              if ferrum_data:
+                  for rival in ["pingora", "kong", "tyk", "krakend", "envoy"]:
+                      rival_data = data.get(rival, {})
+                      if not rival_data:
+                          continue
+                      ferrum_wins = 0
+                      rival_wins = 0
+                      comparisons = []
+                      for proto in PROTOCOLS:
+                          for ep in ENDPOINTS:
+                              f_rps = ferrum_data.get(proto, {}).get(ep, {}).get("rps")
+                              r_rps = rival_data.get(proto, {}).get(ep, {}).get("rps")
+                              if f_rps is not None and r_rps is not None:
+                                  if f_rps > r_rps:
+                                      ferrum_wins += 1
+                                      pct = ((f_rps - r_rps) / r_rps) * 100
+                                      comparisons.append(f"  - {proto.upper()} /{ep}: Ferrum +{pct:.1f}% ({fmt_rps(f_rps)} vs {fmt_rps(r_rps)})")
+                                  else:
+                                      rival_wins += 1
+                                      pct = ((r_rps - f_rps) / f_rps) * 100
+                                      comparisons.append(f"  - {proto.upper()} /{ep}: {GATEWAY_LABELS[rival]} +{pct:.1f}% ({fmt_rps(r_rps)} vs {fmt_rps(f_rps)})")
+
+                      # Key-auth comparison
+                      f_ka = key_auth.get("ferrum", {}).get("rps")
+                      r_ka = key_auth.get(rival, {}).get("rps")
+                      if f_ka is not None and r_ka is not None:
+                          if f_ka > r_ka:
+                              ferrum_wins += 1
+                              pct = ((f_ka - r_ka) / r_ka) * 100
+                              comparisons.append(f"  - KEY-AUTH: Ferrum +{pct:.1f}% ({fmt_rps(f_ka)} vs {fmt_rps(r_ka)})")
+                          else:
+                              rival_wins += 1
+                              pct = ((r_ka - f_ka) / f_ka) * 100
+                              comparisons.append(f"  - KEY-AUTH: {GATEWAY_LABELS[rival]} +{pct:.1f}% ({fmt_rps(r_ka)} vs {fmt_rps(f_ka)})")
+
+                      total = ferrum_wins + rival_wins
+                      lines.append(f"**Ferrum vs {GATEWAY_LABELS[rival]}**: Ferrum wins {ferrum_wins}/{total} scenarios\n")
+                      for c in comparisons:
+                          lines.append(c)
+                      lines.append("")
+
+              # TLS overhead analysis
+              lines.append("#### TLS Overhead Analysis\n")
+              lines.append("| Gateway | HTTP RPS (avg) | HTTPS RPS (avg) | TLS Overhead | E2E TLS RPS (avg) | E2E Overhead |")
+              lines.append("|---------|---------------|-----------------|--------------|-------------------|--------------|")
+
+              for gw in GATEWAYS:
+                  if gw == "baseline" or gw not in data:
+                      continue
+                  http_rps_list = [data[gw].get("http", {}).get(ep, {}).get("rps") for ep in ENDPOINTS]
+                  https_rps_list = [data[gw].get("https", {}).get(ep, {}).get("rps") for ep in ENDPOINTS]
+                  e2e_rps_list = [data[gw].get("e2e_tls", {}).get(ep, {}).get("rps") for ep in ENDPOINTS]
+
+                  http_rps_list = [r for r in http_rps_list if r is not None]
+                  https_rps_list = [r for r in https_rps_list if r is not None]
+                  e2e_rps_list = [r for r in e2e_rps_list if r is not None]
+
+                  http_avg = sum(http_rps_list) / len(http_rps_list) if http_rps_list else None
+                  https_avg = sum(https_rps_list) / len(https_rps_list) if https_rps_list else None
+                  e2e_avg = sum(e2e_rps_list) / len(e2e_rps_list) if e2e_rps_list else None
+
+                  tls_overhead = ""
+                  if http_avg and https_avg:
+                      pct = ((http_avg - https_avg) / http_avg) * 100
+                      tls_overhead = f"-{pct:.1f}%"
+
+                  e2e_overhead = ""
+                  if http_avg and e2e_avg:
+                      pct = ((http_avg - e2e_avg) / http_avg) * 100
+                      e2e_overhead = f"-{pct:.1f}%"
+
+                  lines.append(
+                      f"| **{GATEWAY_LABELS.get(gw, gw)}** "
+                      f"| {fmt_rps(http_avg)} "
+                      f"| {fmt_rps(https_avg)} "
+                      f"| {tls_overhead} "
+                      f"| {fmt_rps(e2e_avg)} "
+                      f"| {e2e_overhead} |"
+                  )
+
+          # Write summary
+          lines.append("")
+          lines.append("<details><summary>Raw JSON (all runs)</summary>\n")
+          lines.append("```json")
+          lines.append(json.dumps(raw, indent=2))
+          lines.append("```\n")
+          lines.append("</details>")
+
+          summary_file = os.environ.get("GITHUB_STEP_SUMMARY", "/dev/null")
+          with open(summary_file, "a") as f:
+              f.write("\n".join(lines) + "\n")
+
+          for line in lines:
+              print(line)
+          PYEOF
+
+      - name: Upload comparison results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: comparison-results-${{ github.sha }}
+          path: comparison-results/
+          retention-days: 90
+
+      - name: Upload HTML reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: comparison-html-reports-${{ github.sha }}
+          path: comparison-results/*/comparison_report.html
+          retention-days: 90
