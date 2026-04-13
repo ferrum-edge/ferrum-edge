@@ -34,9 +34,8 @@ pub(crate) struct UpstreamSelection {
 /// Select an upstream target for the given proxy using load balancing with
 /// health-aware filtering.
 ///
-/// When the proxy has no `upstream_id`, returns a no-op selection with the
-/// client IP as the hash key (matching the main proxy path behavior).
-///
+/// When the proxy has no `upstream_id`, returns a no-op selection with
+/// `lb_hash_key: None` — the key is never read without an upstream.
 pub(crate) fn select_upstream_target(
     proxy: &Proxy,
     state: &ProxyState,
@@ -219,7 +218,6 @@ pub(crate) fn record_backend_outcome(
 }
 
 /// Resolve the hash key for consistent-hashing or sticky-session load balancing.
-///
 pub(crate) fn resolve_hash_key(
     strategy: &HashOnStrategy,
     client_ip: &str,

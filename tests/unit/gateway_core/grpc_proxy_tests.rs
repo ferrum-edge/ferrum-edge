@@ -399,6 +399,13 @@ fn test_parse_grpc_timeout_empty_value() {
     assert_eq!(grpc_proxy::parse_grpc_timeout_ms(&headers), None);
 }
 
+#[test]
+fn test_parse_grpc_timeout_overflow_returns_none() {
+    // Huge hour value overflows u64 in checked_mul — should return None
+    let headers = headers_with_grpc_timeout("999999999999999999H");
+    assert_eq!(grpc_proxy::parse_grpc_timeout_ms(&headers), None);
+}
+
 // --- GrpcConnectionPool creation ---
 
 #[tokio::test]

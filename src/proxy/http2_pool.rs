@@ -142,9 +142,25 @@ impl Http2ConnectionPool {
 
     /// Build a shard key by appending the shard index to a pre-allocated buffer.
     /// Reuses the same buffer across calls to minimize allocations.
+    /// Internally superseded by `write_shard_key_inplace`; kept public for
+    /// external test verification of the shard key format.
+    #[allow(dead_code)]
     pub fn write_shard_key(buf: &mut String, base_key: &str, shard: usize) {
         buf.clear();
         buf.push_str(base_key);
+        buf.push('#');
+        if shard < 10 {
+            buf.push((b'0' + shard as u8) as char);
+        } else {
+            use std::fmt::Write;
+            let _ = write!(buf, "{shard}");
+        }
+    }
+
+    /// Append a shard suffix in-place by truncating to `base_len` first.
+    /// Avoids clearing and rewriting the base key on every shard iteration.
+    fn write_shard_key_inplace(buf: &mut String, base_len: usize, shard: usize) {
+        buf.truncate(base_len);
         buf.push('#');
         if shard < 10 {
             buf.push((b'0' + shard as u8) as char);
@@ -170,32 +186,25 @@ impl Http2ConnectionPool {
         proxy: &Proxy,
         dns_cache: &DnsCache,
     ) -> Result<http2::SendRequest<Incoming>, Http2PoolError> {
-        // Write pool key into a thread-local buffer to avoid allocating a new
-        // String on every request. The buffer is cleared and reused across calls
-        // within the same tokio worker thread.
-        thread_local! {
-            static BASE_KEY_BUF: std::cell::RefCell<String> = std::cell::RefCell::new(String::with_capacity(128));
-        }
-        let (base_key_owned, shard_count, start) = BASE_KEY_BUF.with(|buf| {
-            let mut buf = buf.borrow_mut();
-            Self::write_pool_key(&mut buf, proxy);
-            let sc = self
-                .global_pool_config
-                .for_proxy(proxy)
-                .http2_connections_per_host
-                .max(1);
-            let rr = self
-                .rr_counters
-                .entry(buf.clone())
-                .or_insert_with(|| Arc::new(AtomicUsize::new(0)))
-                .clone();
-            let s = rr.fetch_add(1, Ordering::Relaxed) % sc;
-            (buf.clone(), sc, s)
-        });
-        let base_key: &str = &base_key_owned;
+        let pool_config = self.global_pool_config.for_proxy(proxy);
+        let shard_count = pool_config.http2_connections_per_host.max(1);
 
-        // Reusable buffer for shard key construction (avoids per-shard String allocation)
-        let mut key_buf = String::with_capacity(base_key.len() + 4);
+        // Build the base pool key and resolve the round-robin start shard.
+        // The rr_counters lookup uses get() first (read-only, no allocation).
+        // Only on the first request for a given base key does entry() allocate.
+        let mut key_buf = String::with_capacity(128);
+        Self::write_pool_key(&mut key_buf, proxy);
+        let base_len = key_buf.len();
+
+        let rr = match self.rr_counters.get(&key_buf) {
+            Some(existing) => existing.value().clone(),
+            None => self
+                .rr_counters
+                .entry(key_buf[..base_len].to_owned())
+                .or_insert_with(|| Arc::new(AtomicUsize::new(0)))
+                .clone(),
+        };
+        let start = rr.fetch_add(1, Ordering::Relaxed) % shard_count;
 
         // Two-phase readiness check:
         //
@@ -209,7 +218,7 @@ impl Http2ConnectionPool {
         let mut first_live_key: Option<String> = None;
         for offset in 0..shard_count {
             let shard = (start + offset) % shard_count;
-            Self::write_shard_key(&mut key_buf, base_key, shard);
+            Self::write_shard_key_inplace(&mut key_buf, base_len, shard);
 
             if let Some(entry) = self.entries.get(&key_buf) {
                 if entry.sender.is_closed() {
@@ -261,14 +270,14 @@ impl Http2ConnectionPool {
 
         // No existing shard was ready — create a new connection on the
         // originally selected shard.
-        Self::write_shard_key(&mut key_buf, base_key, start);
+        Self::write_shard_key_inplace(&mut key_buf, base_len, start);
         let sender = match self.create_connection(proxy, dns_cache).await {
             Ok(sender) => sender,
             Err(err) => {
                 // Connection failed — try to find any live shard as fallback
                 for offset in 1..shard_count {
                     let shard = (start + offset) % shard_count;
-                    Self::write_shard_key(&mut key_buf, base_key, shard);
+                    Self::write_shard_key_inplace(&mut key_buf, base_len, shard);
                     if let Some(entry) = self.entries.get(&key_buf) {
                         if !entry.sender.is_closed() {
                             entry
