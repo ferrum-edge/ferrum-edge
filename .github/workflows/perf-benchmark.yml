@@ -159,18 +159,23 @@ jobs:
 
       # The run_protocol_test.sh expects binaries at target/release/.
       # When using a non-release profile, copy binaries so the scripts find them.
+      # Note: Cargo's 'dev' profile outputs to target/debug/, not target/dev/.
       - name: Stage gateway binary
         if: inputs.build_profile != 'release'
         run: |
+          PROFILE_DIR=${{ inputs.build_profile }}
+          if [ "$PROFILE_DIR" = "dev" ]; then PROFILE_DIR=debug; fi
           mkdir -p target/release
-          cp "target/${{ inputs.build_profile }}/ferrum-edge" target/release/ferrum-edge
+          cp "target/${PROFILE_DIR}/ferrum-edge" target/release/ferrum-edge
 
       - name: Stage benchmark binaries
         if: inputs.build_profile != 'release'
         run: |
+          PROFILE_DIR=${{ inputs.build_profile }}
+          if [ "$PROFILE_DIR" = "dev" ]; then PROFILE_DIR=debug; fi
           mkdir -p tests/performance/multi_protocol/target/release
-          cp "tests/performance/multi_protocol/target/${{ inputs.build_profile }}/proto_backend" tests/performance/multi_protocol/target/release/proto_backend
-          cp "tests/performance/multi_protocol/target/${{ inputs.build_profile }}/proto_bench" tests/performance/multi_protocol/target/release/proto_bench
+          cp "tests/performance/multi_protocol/target/${PROFILE_DIR}/proto_backend" tests/performance/multi_protocol/target/release/proto_backend
+          cp "tests/performance/multi_protocol/target/${PROFILE_DIR}/proto_bench" tests/performance/multi_protocol/target/release/proto_bench
 
       - name: Run benchmark suite (3 iterations)
         timeout-minutes: 45
