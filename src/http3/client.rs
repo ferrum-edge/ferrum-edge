@@ -50,8 +50,6 @@ fn now_epoch_ms() -> u64 {
 /// Cached HTTP/3 connection entry.
 struct H3PoolEntry {
     send_request: H3SendRequest,
-    /// Keep the endpoint alive so the UDP socket isn't closed.
-    _endpoint: quinn::Endpoint,
     last_used_epoch_ms: Arc<AtomicU64>,
 }
 
@@ -72,6 +70,11 @@ pub struct Http3ConnectionPool {
     /// distribute frame processing across QUIC driver tasks, preventing a
     /// single-driver CPU bottleneck at high concurrency.
     connections_per_backend: usize,
+    /// Shared QUIC endpoint for IPv4 backends. All IPv4 connections share a
+    /// single UDP socket, reducing FD usage and enabling kernel-level port reuse.
+    ipv4_endpoint: tokio::sync::OnceCell<quinn::Endpoint>,
+    /// Shared QUIC endpoint for IPv6 backends.
+    ipv6_endpoint: tokio::sync::OnceCell<quinn::Endpoint>,
 }
 
 impl Http3ConnectionPool {
@@ -83,9 +86,27 @@ impl Http3ConnectionPool {
             dns_cache,
             conn_counter: AtomicU64::new(0),
             connections_per_backend,
+            ipv4_endpoint: tokio::sync::OnceCell::new(),
+            ipv6_endpoint: tokio::sync::OnceCell::new(),
         };
         pool.start_cleanup_task();
         pool
+    }
+
+    /// Get or lazily create the shared QUIC endpoint for the given address family.
+    ///
+    /// All connections to backends of the same address family share a single UDP
+    /// socket, reducing FD usage from O(connections) to O(1) per address family.
+    async fn get_shared_endpoint(&self, is_ipv6: bool) -> Result<quinn::Endpoint, anyhow::Error> {
+        let cell = if is_ipv6 {
+            &self.ipv6_endpoint
+        } else {
+            &self.ipv4_endpoint
+        };
+        let endpoint = cell
+            .get_or_try_init(|| async { create_shared_quic_endpoint(is_ipv6) })
+            .await?;
+        Ok(endpoint.clone())
     }
 
     /// Number of connections in the pool (for metrics).
@@ -151,13 +172,13 @@ impl Http3ConnectionPool {
             return Ok(());
         }
         let h3_config = super::config::Http3ServerConfig::from_env_config(&self.env_config);
-        let (endpoint, sr) =
-            Self::create_connection(proxy, tls_config, Some(&h3_config), &self.dns_cache).await?;
+        let sr = self
+            .create_connection(proxy, tls_config, Some(&h3_config))
+            .await?;
         self.entries.insert(
             key,
             H3PoolEntry {
                 send_request: sr,
-                _endpoint: endpoint,
                 last_used_epoch_ms: Arc::new(AtomicU64::new(now_epoch_ms())),
             },
         );
@@ -179,19 +200,13 @@ impl Http3ConnectionPool {
             return Ok(());
         }
         let h3_config = super::config::Http3ServerConfig::from_env_config(&self.env_config);
-        let (endpoint, sr) = Self::create_connection_to_target(
-            host,
-            port,
-            tls_config,
-            Some(&h3_config),
-            &self.dns_cache,
-        )
-        .await?;
+        let sr = self
+            .create_connection_to_target(host, port, tls_config, Some(&h3_config))
+            .await?;
         self.entries.insert(
             key,
             H3PoolEntry {
                 send_request: sr,
-                _endpoint: endpoint,
                 last_used_epoch_ms: Arc::new(AtomicU64::new(now_epoch_ms())),
             },
         );
@@ -306,15 +321,15 @@ impl Http3ConnectionPool {
         // Create new connection — only now do we need the TLS config
         let tls_config = tls_config_fn()?;
         let h3_config = super::config::Http3ServerConfig::from_env_config(&self.env_config);
-        let (endpoint, sr) =
-            Self::create_connection(proxy, &tls_config, Some(&h3_config), &self.dns_cache).await?;
+        let sr = self
+            .create_connection(proxy, &tls_config, Some(&h3_config))
+            .await?;
         let mut sr_for_request = sr.clone();
 
         self.entries.insert(
             key,
             H3PoolEntry {
                 send_request: sr,
-                _endpoint: endpoint,
                 last_used_epoch_ms: Arc::new(AtomicU64::new(now_epoch_ms())),
             },
         );
@@ -408,21 +423,15 @@ impl Http3ConnectionPool {
         // Create new connection to the explicit target
         let tls_config = tls_config_fn()?;
         let h3_config = super::config::Http3ServerConfig::from_env_config(&self.env_config);
-        let (endpoint, sr) = Self::create_connection_to_target(
-            target_host,
-            target_port,
-            &tls_config,
-            Some(&h3_config),
-            &self.dns_cache,
-        )
-        .await?;
+        let sr = self
+            .create_connection_to_target(target_host, target_port, &tls_config, Some(&h3_config))
+            .await?;
         let mut sr_for_request = sr.clone();
 
         self.entries.insert(
             key,
             H3PoolEntry {
                 send_request: sr,
-                _endpoint: endpoint,
                 last_used_epoch_ms: Arc::new(AtomicU64::new(now_epoch_ms())),
             },
         );
@@ -438,13 +447,17 @@ impl Http3ConnectionPool {
         .await
     }
 
-    /// Create a new QUIC endpoint + connection + h3 session.
+    /// Create a new QUIC connection + h3 session using a shared endpoint.
+    ///
+    /// Reuses the pool's shared IPv4/IPv6 QUIC endpoint instead of creating
+    /// a new UDP socket per connection, reducing FD usage from O(connections)
+    /// to O(1) per address family.
     async fn create_connection(
+        &self,
         proxy: &Proxy,
         tls_config: &Arc<rustls::ClientConfig>,
         h3_config: Option<&super::config::Http3ServerConfig>,
-        dns_cache: &crate::dns::DnsCache,
-    ) -> Result<(quinn::Endpoint, H3SendRequest), anyhow::Error> {
+    ) -> Result<H3SendRequest, anyhow::Error> {
         let quic_client_config = QuicClientConfig::try_from(tls_config.clone()).map_err(|e| {
             anyhow::anyhow!(
                 "Failed to create QUIC client config (ensure TLS 1.3 cipher suites are available): {}",
@@ -474,13 +487,13 @@ impl Http3ConnectionPool {
         let addr = resolve_backend_addr_cached(
             host,
             port,
-            dns_cache,
+            &self.dns_cache,
             proxy.dns_override.as_deref(),
             proxy.dns_cache_ttl_seconds,
         )
         .await?;
 
-        let endpoint = create_udp_endpoint(addr, client_config)?;
+        let endpoint = self.get_shared_endpoint(addr.is_ipv6()).await?;
 
         debug!(
             "HTTP/3 pool: connecting to {}:{} (resolved: {})",
@@ -488,7 +501,7 @@ impl Http3ConnectionPool {
         );
 
         let connection = endpoint
-            .connect(addr, host)?
+            .connect_with(client_config, addr, host)?
             .await
             .map_err(|e| anyhow::anyhow!("QUIC connection failed: {}", e))?;
 
@@ -500,20 +513,21 @@ impl Http3ConnectionPool {
             debug!("HTTP/3 pool connection driver closed: {}", err);
         });
 
-        Ok((endpoint, send_request))
+        Ok(send_request)
     }
 
-    /// Create a new QUIC endpoint + connection + h3 session to an explicit host/port.
+    /// Create a new QUIC connection + h3 session to an explicit host/port
+    /// using a shared endpoint.
     ///
     /// Used by `request_with_target` for load-balanced retries where the target
     /// differs from `proxy.backend_host`/`proxy.backend_port`.
     async fn create_connection_to_target(
+        &self,
         host: &str,
         port: u16,
         tls_config: &Arc<rustls::ClientConfig>,
         h3_config: Option<&super::config::Http3ServerConfig>,
-        dns_cache: &crate::dns::DnsCache,
-    ) -> Result<(quinn::Endpoint, H3SendRequest), anyhow::Error> {
+    ) -> Result<H3SendRequest, anyhow::Error> {
         let quic_client_config = QuicClientConfig::try_from(tls_config.clone()).map_err(|e| {
             anyhow::anyhow!(
                 "Failed to create QUIC client config (ensure TLS 1.3 cipher suites are available): {}",
@@ -538,15 +552,9 @@ impl Http3ConnectionPool {
         let mut client_config = quinn::ClientConfig::new(Arc::new(quic_client_config));
         client_config.transport_config(Arc::new(transport_config));
 
-        let addr = resolve_backend_addr_cached(host, port, dns_cache, None, None).await?;
+        let addr = resolve_backend_addr_cached(host, port, &self.dns_cache, None, None).await?;
 
-        let bind_addr: SocketAddr = if addr.is_ipv6() {
-            "[::]:0".parse()?
-        } else {
-            "0.0.0.0:0".parse()?
-        };
-        let mut endpoint = quinn::Endpoint::client(bind_addr)?;
-        endpoint.set_default_client_config(client_config);
+        let endpoint = self.get_shared_endpoint(addr.is_ipv6()).await?;
 
         debug!(
             "HTTP/3 pool: connecting to {}:{} (resolved: {})",
@@ -554,7 +562,7 @@ impl Http3ConnectionPool {
         );
 
         let connection = endpoint
-            .connect(addr, host)?
+            .connect_with(client_config, addr, host)?
             .await
             .map_err(|e| anyhow::anyhow!("QUIC connection failed: {}", e))?;
 
@@ -566,7 +574,7 @@ impl Http3ConnectionPool {
             debug!("HTTP/3 pool connection driver closed: {}", err);
         });
 
-        Ok((endpoint, send_request))
+        Ok(send_request)
     }
 
     /// Execute an HTTP/3 request on an existing SendRequest handle.
@@ -846,15 +854,15 @@ impl Http3ConnectionPool {
         // Create new connection
         let tls_config = tls_config_fn()?;
         let h3_config = super::config::Http3ServerConfig::from_env_config(&self.env_config);
-        let (endpoint, sr) =
-            Self::create_connection(proxy, &tls_config, Some(&h3_config), &self.dns_cache).await?;
+        let sr = self
+            .create_connection(proxy, &tls_config, Some(&h3_config))
+            .await?;
         let mut sr_for_request = sr.clone();
 
         self.entries.insert(
             key,
             H3PoolEntry {
                 send_request: sr,
-                _endpoint: endpoint,
                 last_used_epoch_ms: Arc::new(AtomicU64::new(now_epoch_ms())),
             },
         );
@@ -928,21 +936,15 @@ impl Http3ConnectionPool {
 
         let tls_config = tls_config_fn()?;
         let h3_config = super::config::Http3ServerConfig::from_env_config(&self.env_config);
-        let (endpoint, sr) = Self::create_connection_to_target(
-            target_host,
-            target_port,
-            &tls_config,
-            Some(&h3_config),
-            &self.dns_cache,
-        )
-        .await?;
+        let sr = self
+            .create_connection_to_target(target_host, target_port, &tls_config, Some(&h3_config))
+            .await?;
         let mut sr_for_request = sr.clone();
 
         self.entries.insert(
             key,
             H3PoolEntry {
                 send_request: sr,
-                _endpoint: endpoint,
                 last_used_epoch_ms: Arc::new(AtomicU64::new(now_epoch_ms())),
             },
         );
@@ -1064,15 +1066,15 @@ impl Http3ConnectionPool {
 
         let tls_config = tls_config_fn()?;
         let h3_config = super::config::Http3ServerConfig::from_env_config(&self.env_config);
-        let (endpoint, sr) =
-            Self::create_connection(proxy, &tls_config, Some(&h3_config), &self.dns_cache).await?;
+        let sr = self
+            .create_connection(proxy, &tls_config, Some(&h3_config))
+            .await?;
         let mut sr_for_request = sr.clone();
 
         self.entries.insert(
             key,
             H3PoolEntry {
                 send_request: sr,
-                _endpoint: endpoint,
                 last_used_epoch_ms: Arc::new(AtomicU64::new(now_epoch_ms())),
             },
         );
@@ -1167,21 +1169,15 @@ impl Http3ConnectionPool {
 
         let tls_config = tls_config_fn()?;
         let h3_config = super::config::Http3ServerConfig::from_env_config(&self.env_config);
-        let (endpoint, sr) = Self::create_connection_to_target(
-            target_host,
-            target_port,
-            &tls_config,
-            Some(&h3_config),
-            &self.dns_cache,
-        )
-        .await?;
+        let sr = self
+            .create_connection_to_target(target_host, target_port, &tls_config, Some(&h3_config))
+            .await?;
         let mut sr_for_request = sr.clone();
 
         self.entries.insert(
             key,
             H3PoolEntry {
                 send_request: sr,
-                _endpoint: endpoint,
                 last_used_epoch_ms: Arc::new(AtomicU64::new(now_epoch_ms())),
             },
         );
@@ -1384,32 +1380,24 @@ impl Http3Client {
     }
 }
 
-/// Create a quinn UDP endpoint with platform-optimal socket options.
+/// Create a shared QUIC endpoint for one address family (IPv4 or IPv6).
 ///
-/// On Linux, applies `IP_BIND_ADDRESS_NO_PORT` to defer ephemeral port allocation
-/// to `connect()` time, enabling 4-tuple co-selection that prevents port exhaustion
-/// when proxying to many distinct H3 backends.
-fn create_udp_endpoint(
-    backend_addr: SocketAddr,
-    client_config: quinn::ClientConfig,
-) -> Result<quinn::Endpoint, anyhow::Error> {
+/// The endpoint has no default client config — callers use `connect_with()`
+/// to pass per-connection TLS config. On Linux, applies `IP_BIND_ADDRESS_NO_PORT`
+/// to defer ephemeral port allocation to `connect()` time.
+fn create_shared_quic_endpoint(is_ipv6: bool) -> Result<quinn::Endpoint, anyhow::Error> {
     use socket2::{Domain, Protocol, Socket, Type};
 
-    let domain = if backend_addr.is_ipv6() {
-        Domain::IPV6
-    } else {
-        Domain::IPV4
-    };
+    let domain = if is_ipv6 { Domain::IPV6 } else { Domain::IPV4 };
     let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
 
-    // Defer ephemeral port allocation to connect() for better port reuse (Linux only).
     #[cfg(target_os = "linux")]
     {
         use std::os::unix::io::AsRawFd;
         let _ = crate::socket_opts::set_ip_bind_address_no_port(socket.as_raw_fd(), true);
     }
 
-    let bind_addr: SocketAddr = if backend_addr.is_ipv6() {
+    let bind_addr: SocketAddr = if is_ipv6 {
         "[::]:0".parse()?
     } else {
         "0.0.0.0:0".parse()?
@@ -1420,13 +1408,8 @@ fn create_udp_endpoint(
     let std_socket: std::net::UdpSocket = socket.into();
     let runtime =
         quinn::default_runtime().ok_or_else(|| anyhow::anyhow!("No async runtime found"))?;
-    let mut endpoint = quinn::Endpoint::new(
-        quinn::EndpointConfig::default(),
-        None, // client-only, no server config
-        std_socket,
-        runtime,
-    )?;
-    endpoint.set_default_client_config(client_config);
+    let endpoint =
+        quinn::Endpoint::new(quinn::EndpointConfig::default(), None, std_socket, runtime)?;
     Ok(endpoint)
 }
 
