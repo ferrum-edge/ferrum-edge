@@ -258,25 +258,41 @@ async fn handle_h3_connection(
 
     // When 0-RTT is enabled in the TLS config, attempt to accept early data
     // via quinn's into_0rtt(). This returns the connection immediately if the
-    // client sent 0-RTT data (before the handshake completes). We track this
-    // per-connection so handle_h3_request can enforce method restrictions.
-    let (connection, is_early_data_conn) = if early_data_enabled {
+    // client sent 0-RTT data (before the handshake completes).
+    //
+    // IMPORTANT: Only requests arriving BEFORE the TLS handshake completes are
+    // 0-RTT early data. Once ZeroRttAccepted resolves (handshake done), new
+    // requests on the same connection are NOT early data. We use an AtomicBool
+    // that starts true and flips to false when the handshake completes, so each
+    // request checks the current state — not the connection-level flag.
+    let in_early_data = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    let connection = if early_data_enabled {
         let connecting = connecting.accept()?.into_0rtt();
         match connecting {
-            Ok((conn, _zero_rtt_accepted)) => {
+            Ok((conn, zero_rtt_accepted)) => {
                 debug!(
                     "HTTP/3 0-RTT connection accepted from {}",
                     conn.remote_address()
                 );
-                (conn, true)
+                in_early_data.store(true, std::sync::atomic::Ordering::Release);
+                // Spawn a task that waits for the handshake to complete, then
+                // clears the early-data flag. Requests dispatched after this
+                // point will see is_early_data = false.
+                let flag = in_early_data.clone();
+                tokio::spawn(async move {
+                    zero_rtt_accepted.await;
+                    flag.store(false, std::sync::atomic::Ordering::Release);
+                });
+                conn
             }
             Err(connecting) => {
                 // No 0-RTT — fall back to full handshake
-                (connecting.await?, false)
+                connecting.await?
             }
         }
     } else {
-        (connecting.await?, false)
+        connecting.await?
     };
 
     let remote_addr = connection.remote_address();
@@ -338,7 +354,10 @@ async fn handle_h3_connection(
                 let cert = client_cert_der.clone();
                 let chain = client_cert_chain_der.clone();
                 let socket_ip = Arc::clone(&socket_ip);
-                let is_early_data = is_early_data_conn;
+                // Snapshot the early-data flag NOW — before spawning the task.
+                // This captures whether the handshake has completed at the moment
+                // this request stream was accepted. Single atomic load (~1ns).
+                let is_early_data = in_early_data.load(std::sync::atomic::Ordering::Acquire);
                 tokio::spawn(async move {
                     match resolver.resolve_request().await {
                         Ok((req, stream)) => {

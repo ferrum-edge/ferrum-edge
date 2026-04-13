@@ -202,7 +202,9 @@ pub async fn run(
             env_config.tls_cert_expiry_warning_days,
             &crls,
         ) {
-            Ok(config) => {
+            Ok(mut config) => {
+                // Enable 0-RTT on the proxy frontend only (not admin).
+                tls::enable_early_data(&mut config, &tls_policy);
                 if client_ca_bundle_path.is_some() {
                     info!(
                         "TLS configuration loaded with client certificate verification (HTTPS with mTLS available)"
