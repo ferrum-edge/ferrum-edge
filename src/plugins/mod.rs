@@ -297,12 +297,15 @@ impl RequestContext {
     /// Look up a single header from the raw `HeaderMap` without materializing
     /// the full `HashMap<String, String>`. Returns `None` if the raw headers
     /// have already been consumed by `materialize_headers()`.
+    ///
+    /// Uses last-value-wins semantics for multi-valued headers to match the
+    /// behavior of `materialize_headers()` (which inserts all values into a
+    /// `HashMap`, where repeated keys overwrite and the last value survives).
     #[inline]
     pub fn raw_header_get(&self, name: &str) -> Option<&str> {
         self.raw_headers
             .as_ref()
-            .and_then(|h| h.get(name))
-            .and_then(|v| v.to_str().ok())
+            .and_then(|h| h.get_all(name).iter().rev().find_map(|v| v.to_str().ok()))
     }
 
     /// Convert the raw `http::HeaderMap` into `self.headers` (`HashMap<String,
