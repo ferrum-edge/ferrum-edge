@@ -2005,7 +2005,7 @@ async fn handle_websocket_request_authenticated(
     plugins: Arc<Vec<Arc<dyn Plugin>>>,
     plugin_execution_ns: u64,
     upstream_target: Option<Arc<UpstreamTarget>>,
-    lb_hash_key: String,
+    lb_hash_key: Option<String>,
     sticky_cookie_needed: bool,
     start_time: Instant,
     is_h2_websocket: bool,
@@ -2157,9 +2157,10 @@ async fn handle_websocket_request_authenticated(
                     // Try a different target on retry if load balancing is configured
                     if let (Some(upstream_id), Some(prev_target)) =
                         (&proxy.upstream_id, &current_target)
+                        && let Some(ref hash_key) = lb_hash_key
                         && let Some(next) = state.load_balancer_cache.select_next_target(
                             upstream_id,
-                            &lb_hash_key,
+                            hash_key,
                             prev_target,
                             Some(&crate::load_balancer::HealthContext {
                                 active_unhealthy: &state.health_checker.active_unhealthy_targets,
@@ -4455,7 +4456,7 @@ pub async fn handle_proxy_request(
             plugins,
             plugin_execution_ns,
             upstream_target,
-            lb_hash_key.0,
+            lb_hash_key,
             sticky_cookie_needed,
             start_time,
             is_h2_ws,
@@ -4667,9 +4668,10 @@ pub async fn handle_proxy_request(
                 // Try a different target on retry if load balancing is configured
                 if let (Some(upstream_id), Some(prev_target)) =
                     (&proxy.upstream_id, &grpc_current_target)
+                    && let Some(ref hash_key) = lb_hash_key
                     && let Some(next) = state.load_balancer_cache.select_next_target(
                         upstream_id,
-                        &lb_hash_key.0,
+                        hash_key,
                         prev_target,
                         Some(&crate::load_balancer::HealthContext {
                             active_unhealthy: &state.health_checker.active_unhealthy_targets,
@@ -5247,9 +5249,10 @@ pub async fn handle_proxy_request(
 
             // Try a different target on retry if load balancing is configured
             if let (Some(upstream_id), Some(prev_target)) = (&proxy.upstream_id, &current_target)
+                && let Some(ref hash_key) = lb_hash_key
                 && let Some(next) = state.load_balancer_cache.select_next_target(
                     upstream_id,
-                    &lb_hash_key.0,
+                    hash_key,
                     prev_target,
                     Some(&crate::load_balancer::HealthContext {
                         active_unhealthy: &state.health_checker.active_unhealthy_targets,

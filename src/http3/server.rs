@@ -1523,9 +1523,10 @@ async fn handle_h3_request(
                 // Try a different target on retry if load balancing is configured
                 if let (Some(upstream_id), Some(prev_target)) =
                     (&proxy.upstream_id, &current_target)
+                    && let Some(ref hash_key) = lb_hash_key
                     && let Some(next) = state.load_balancer_cache.select_next_target(
                         upstream_id,
-                        &lb_hash_key.0,
+                        hash_key,
                         prev_target,
                         Some(&crate::load_balancer::HealthContext {
                             active_unhealthy: &state.health_checker.active_unhealthy_targets,
