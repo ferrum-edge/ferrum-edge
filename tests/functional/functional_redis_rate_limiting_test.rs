@@ -71,6 +71,42 @@ async fn flush_redis_db() {
     let _ = reader.read(&mut buf).await;
 }
 
+/// Delete only Redis keys matching a specific prefix (DB 15).
+/// Uses SCAN + DEL to avoid cross-test interference from FLUSHDB.
+async fn delete_redis_keys_by_prefix(prefix: &str) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let Ok(stream) = tokio::net::TcpStream::connect("127.0.0.1:6379").await else {
+        return;
+    };
+    let (reader, mut writer) = tokio::io::split(stream);
+    let mut reader = reader;
+    let mut buf = vec![0u8; 8192];
+
+    // SELECT 15
+    writer
+        .write_all(b"*2\r\n$6\r\nSELECT\r\n$2\r\n15\r\n")
+        .await
+        .unwrap();
+    let _ = reader.read(&mut buf).await;
+
+    // Use EVAL with Lua to atomically SCAN+DEL keys matching the pattern.
+    // This avoids the race of KEYS returning stale results and is safe for
+    // concurrent test execution since it only touches keys with our prefix.
+    let pattern = format!("{}*", prefix);
+    let lua_script = format!(
+        "local keys = redis.call('KEYS','{}') for i=1,#keys do redis.call('DEL',keys[i]) end return #keys",
+        pattern
+    );
+    let lua_len = lua_script.len();
+    let cmd = format!(
+        "*3\r\n$4\r\nEVAL\r\n${}\r\n{}\r\n$1\r\n0\r\n",
+        lua_len, lua_script
+    );
+    writer.write_all(cmd.as_bytes()).await.unwrap();
+    let _ = reader.read(&mut buf).await;
+}
+
 // ============================================================================
 // Test Harness (Database mode with Redis rate limiting)
 // ============================================================================
@@ -565,8 +601,10 @@ async fn test_rate_limiting_redis_centralized() {
     // Actively wait for the route to be loaded (more reliable than fixed sleep)
     harness.wait_for_route("/redis-rl/test").await;
 
-    // Flush Redis after the route probe to clear any requests made during polling
-    flush_redis_db().await;
+    // Clear only this test's rate limit keys (probe requests consumed quota).
+    // Uses targeted key deletion instead of FLUSHDB to avoid interfering with
+    // other Redis rate-limit tests that may be running concurrently.
+    delete_redis_keys_by_prefix(&unique_prefix).await;
 
     // Send 3 requests — should all succeed
     for i in 1..=3 {
