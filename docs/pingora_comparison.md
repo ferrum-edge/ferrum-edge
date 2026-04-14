@@ -367,8 +367,8 @@ From Ferrum's comparison suite (`comparison/`), testing pure proxy overhead with
 | Gateway | HTTP /health req/s | HTTPS req/s | E2E TLS req/s | HTTP Latency |
 |---------|-------------------|-------------|---------------|--------------|
 | **Ferrum** (native) | 98,391 | 94,166 | 88,006 | 0.98 ms |
-| **Kong 3.9** (Docker) | 25,588 | 24,461 | 23,444 | 3.77 ms |
-| **Tyk v5.7** (Docker) | 2,563 | 3,450 | 1,931 | 7.00 ms |
+| **Kong 3.14** (Docker) | 25,588 | 24,461 | 23,444 | 3.77 ms |
+| **Tyk v5.12** (Docker) | 2,563 | 3,450 | 1,931 | 7.00 ms |
 
 Ferrum is **3.3x faster than Kong** and **33x faster than Tyk** on raw proxy throughput (even after adjusting for Docker overhead).
 

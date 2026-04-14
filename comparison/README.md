@@ -92,10 +92,10 @@ SKIP_BUILD=true ./comparison/run_comparison.sh
 | `WRK_THREADS` | `8` | wrk thread count |
 | `WRK_CONNECTIONS` | `100` | wrk concurrent connections |
 | `WARMUP_DURATION` | `5s` | Warm-up duration before each test (results discarded) |
-| `KONG_VERSION` | `3.9` | Kong Docker image tag |
-| `TYK_VERSION` | `v5.7` | Tyk Docker image tag |
-| `KRAKEND_VERSION` | `2.13` | KrakenD Docker image tag |
-| `ENVOY_VERSION` | `1.32-latest` | Envoy Docker image tag |
+| `KONG_VERSION` | `3.14` | Kong Docker image tag |
+| `TYK_VERSION` | `v5.12` | Tyk Docker image tag |
+| `KRAKEND_VERSION` | `2.13.2` | KrakenD Docker image tag |
+| `ENVOY_VERSION` | `1.37-latest` | Envoy Docker image tag |
 | `SKIP_GATEWAYS` | _(empty)_ | Comma-separated gateways to skip: `ferrum`, `pingora`, `kong`, `tyk`, `krakend`, `envoy` |
 | `SKIP_BUILD` | `false` | Skip Docker image builds for Ferrum and Pingora (use cached images) |
 
@@ -104,8 +104,8 @@ SKIP_BUILD=true ./comparison/run_comparison.sh
 To re-run benchmarks with newer Kong, Tyk, or KrakenD releases:
 
 ```bash
-# Test against Kong 3.10, Tyk v5.8, KrakenD 2.14, and Envoy 1.33
-KONG_VERSION=3.10 TYK_VERSION=v5.8 KRAKEND_VERSION=2.14 ENVOY_VERSION=1.33-latest ./comparison/run_comparison.sh
+# Test against specific versions
+KONG_VERSION=3.14 TYK_VERSION=v5.12 KRAKEND_VERSION=2.13.2 ENVOY_VERSION=1.37-latest ./comparison/run_comparison.sh
 ```
 
 The script pulls the specified Docker image tags automatically. Results are overwritten in `comparison/results/` — copy or rename the directory if you want to preserve previous runs.
@@ -184,9 +184,9 @@ Each gateway proxies `/api/users-auth` → backend `/api/users` with API key aut
 | Gateway | Key-Auth req/s | Latency |
 |---------|---------------|---------|
 | **Ferrum** (Docker) | **26,756** | **3.61 ms** |
-| **Envoy 1.32** (Docker, Lua) | 26,252 | 3.97 ms |
-| **Kong 3.9** (Docker) | 22,307 | 4.55 ms |
-| **Tyk v5.7** (Docker) | 20,529 | 4.72 ms |
+| **Envoy 1.37** (Docker, Lua) | 26,252 | 3.97 ms |
+| **Kong 3.14** (Docker) | 22,307 | 4.55 ms |
+| **Tyk v5.12** (Docker) | 20,529 | 4.72 ms |
 
 **Key findings:**
 - **Ferrum is the fastest gateway on authenticated requests** — 26,756 req/s, beating Envoy by 2%, Kong by 20%, and Tyk by 30%.
