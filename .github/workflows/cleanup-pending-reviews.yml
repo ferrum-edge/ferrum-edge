@@ -53,6 +53,9 @@ jobs:
             echo ""
             echo "--- Checking run $RUN_ID ---"
 
+            # Get the run's created_at as fallback timestamp (pending_deployments lacks created_at)
+            RUN_CREATED_AT=$(gh api "repos/${{ github.repository }}/actions/runs/$RUN_ID" --jq '.run_started_at // .created_at' 2>/dev/null || echo "")
+
             # Get pending deployments for this run
             PENDING_JSON=$(gh api "repos/${{ github.repository }}/actions/runs/$RUN_ID/pending_deployments" 2>/dev/null || echo "[]")
 
@@ -69,7 +72,12 @@ jobs:
             for i in $(seq 0 $((PENDING_COUNT - 1))); do
               ENV_NAME=$(echo "$PENDING_JSON" | jq -r ".[$i].environment.name")
               ENV_ID=$(echo "$PENDING_JSON" | jq -r ".[$i].environment.id")
-              WAIT_STARTED=$(echo "$PENDING_JSON" | jq -r ".[$i].wait_timer_started_at // .[$i].created_at // empty")
+              WAIT_STARTED=$(echo "$PENDING_JSON" | jq -r ".[$i].wait_timer_started_at // empty")
+              # Fall back to the workflow run's start time when wait_timer_started_at is null
+              # (environments with manual approval only, no wait timer)
+              if [[ -z "$WAIT_STARTED" ]]; then
+                WAIT_STARTED="$RUN_CREATED_AT"
+              fi
 
               if [[ -z "$WAIT_STARTED" || "$WAIT_STARTED" == "null" ]]; then
                 echo "  Environment '$ENV_NAME' (id=$ENV_ID): no timestamp, skipping"
