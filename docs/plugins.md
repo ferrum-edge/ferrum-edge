@@ -6,9 +6,9 @@ For execution order, protocol support matrix, and design rationale, see [plugin_
 
 ## Lifecycle Phases
 
-1. **`on_request_received`** — Called immediately when a request arrives (CORS preflight, rate limiting)
-2. **`authenticate`** — Identifies the consumer (mTLS, JWKS, JWT, API Key, Basic Auth)
-3. **`authorize`** — Checks consumer permissions (Access Control)
+1. **`on_request_received`** — Called immediately when a request arrives (CORS preflight, IP restriction, rate limiting)
+2. **`authenticate`** — Identifies the consumer (mTLS, JWKS, JWT, API Key, LDAP, Basic Auth, HMAC)
+3. **`authorize`** — Checks consumer permissions (Access Control, consumer-mode rate limiting)
 4. **`before_proxy`** — Modifies the request before forwarding (Request Transformer)
 5. **`after_proxy`** — Modifies response headers or can replace the backend response before downstream commit
 6. **`on_response_body`** — Processes the raw buffered backend body before transforms (AI token metrics, AI rate limiter)

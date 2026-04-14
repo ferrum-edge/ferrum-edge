@@ -16,7 +16,7 @@ Request In
              │
              ▼
 ┌─────────────────────────┐
-│ 2. authenticate         │  Identity verification: mTLS, JWKS, JWT, API key, Basic
+│ 2. authenticate         │  Identity verification: mTLS, JWKS, JWT, API key, LDAP, Basic, HMAC
 └────────────┬────────────┘
              │
              ▼
@@ -103,6 +103,7 @@ Body-aware `before_proxy` plugins such as `graphql`, request-side `body_validato
 | `mtls_auth` | ✓ | | Maps the client certificate to a Consumer on TCP+TLS or UDP+DTLS |
 | `access_control` | ✓ | | Applies consumer and group allow/deny rules once a stream Consumer exists |
 | `tcp_connection_throttle` | ✓ | ✓ | Caps active TCP connections per Consumer, else per client IP |
+| `geo_restriction` | ✓ | | Rejects connections from denied countries |
 | `rate_limiting` | ✓ | | Consumer-aware rate limiting when a stream identity exists, else IP-based |
 | `correlation_id` | ✓ | | Assigns a UUID request ID to metadata |
 | `otel_tracing` | ✓ | ✓ | Generates trace/span IDs; emits structured trace log |
@@ -110,6 +111,8 @@ Body-aware `before_proxy` plugins such as `graphql`, request-side `body_validato
 | `statsd_logging` | | ✓ | Sends stream connection metrics to StatsD over UDP |
 | `http_logging` | | ✓ | Sends stream connection logs to webhook endpoint |
 | `tcp_logging` | | ✓ | Sends stream connection logs to TCP/TLS endpoint |
+| `kafka_logging` | | ✓ | Sends stream connection logs to Kafka topic |
+| `loki_logging` | | ✓ | Sends stream connection logs to Grafana Loki |
 | `udp_logging` | | ✓ | Sends stream connection logs to UDP/DTLS endpoint |
 | `ws_logging` | | ✓ | Sends stream connection logs to WebSocket endpoint |
 | `prometheus_metrics` | | ✓ | Records `ferrum_stream_connections_total` counter and `ferrum_stream_duration_ms` histogram |
@@ -221,7 +224,7 @@ Priority bands are spaced with gaps so future plugins can slot in without renumb
 | **Transform** | 3000–3999 | Request shaping and response buffering decisions | `request_transformer` (3000), `serverless_function` (3025), `response_mock` (3030), `grpc_deadline` (3050), `request_mirror` (3075), `load_testing` (3080), `response_size_limiting` (3490), `response_caching` (3500) |
 | **Response** | 4000–4999 | Response transformation, compression, and AI accounting | `response_transformer` (4000), `compression` (4050), `ai_response_guard` (4075), `ai_token_metrics` (4100), `ai_rate_limiter` (4200) |
 | **Custom** | 5000 | Default for unrecognized/custom plugins | _(future plugins)_ |
-| **Logging** | 9000–9999 | Observability and frame logging | `stdout_logging` (9000), `ws_frame_logging` (9050), `statsd_logging` (9075), `http_logging` (9100), `tcp_logging` (9125), `loki_logging` (9155), `udp_logging` (9160), `ws_logging` (9175), `transaction_debugger` (9200), `prometheus_metrics` (9300), `api_chargeback` (9350) |
+| **Logging** | 9000–9999 | Observability and frame logging | `stdout_logging` (9000), `ws_frame_logging` (9050), `statsd_logging` (9075), `http_logging` (9100), `tcp_logging` (9125), `kafka_logging` (9150), `loki_logging` (9155), `udp_logging` (9160), `ws_logging` (9175), `transaction_debugger` (9200), `prometheus_metrics` (9300), `api_chargeback` (9350) |
 
 ## Complete Execution Order
 
@@ -238,7 +241,7 @@ Given all built-in plugins enabled, the execution order is:
 | 7 | `bot_detection` | 200 | on_request_received |
 | 8 | `spec_expose` | 210 | on_request_received |
 | 9 | `sse` | 250 | on_request_received, before_proxy, after_proxy, transform_response_body |
-| 10 | `grpc_web` | 260 | on_request_received, before_proxy, transform_request_body, after_proxy, transform_response_body |
+| 10 | `grpc_web` | 260 | on_request_received, before_proxy, transform_request_body, on_final_request_body, after_proxy, transform_response_body |
 | 11 | `grpc_method_router` | 275 | on_request_received, before_proxy |
 | 12 | `mtls_auth` | 950 | authenticate, on_stream_connect |
 | 13 | `jwks_auth` | 1000 | authenticate |
@@ -255,7 +258,7 @@ Given all built-in plugins enabled, the execution order is:
 | 24 | `request_size_limiting` | 2800 | on_request_received, before_proxy, on_final_request_body |
 | 25 | `ws_message_size_limiting` | 2810 | on_ws_frame |
 | 26 | `graphql` | 2850 | before_proxy |
-| 27 | `rate_limiting` | 2900 | on_request_received (IP mode), authorize (consumer mode), on_stream_connect |
+| 27 | `rate_limiting` | 2900 | on_request_received (IP mode), authorize (consumer mode), before_proxy, after_proxy, on_stream_connect |
 | 28 | `ws_rate_limiting` | 2910 | on_ws_frame |
 | 29 | `udp_rate_limiting` | 2915 | on_udp_datagram |
 | 30 | `ai_prompt_shield` | 2925 | before_proxy, transform_request_body |
