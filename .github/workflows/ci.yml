@@ -402,7 +402,7 @@ jobs:
   latest-release:
     name: Update Latest Release
     needs: [build-binaries]
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: always() && needs.build-binaries.result == 'success' && github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -472,7 +472,7 @@ jobs:
   docker:
     name: Docker (${{ matrix.platform }})
     needs: [build-binaries]
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: always() && needs.build-binaries.result == 'success' && github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -545,7 +545,7 @@ jobs:
   docker-manifest:
     name: Docker Manifest
     needs: docker
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: always() && needs.docker.result == 'success' && github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
       contents: read
