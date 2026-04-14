@@ -1,7 +1,7 @@
 # On-demand gateway comparison benchmark (all-Docker).
 #
-# Runs the comparison/ suite which benchmarks Ferrum Edge against Pingora,
-# Kong, Tyk, KrakenD, and Envoy — all inside Docker containers for
+# Runs the comparison/ suite which benchmarks Ferrum Edge against Kong,
+# Tyk, KrakenD, and Envoy — all inside Docker containers for
 # apples-to-apples comparison.
 #
 # Supports 1-3 iterations to detect noisy-neighbor outliers on shared
@@ -43,7 +43,7 @@ on:
         default: "8"
         type: string
       skip_gateways:
-        description: "Comma-separated gateways to skip (ferrum,pingora,kong,tyk,krakend,envoy)"
+        description: "Comma-separated gateways to skip (ferrum,kong,tyk,krakend,envoy)"
         required: false
         default: ""
         type: string
@@ -240,7 +240,7 @@ jobs:
                       )
               return metrics
 
-          GATEWAYS = ["baseline", "ferrum", "pingora", "kong", "tyk", "krakend", "envoy"]
+          GATEWAYS = ["baseline", "ferrum", "kong", "tyk", "krakend", "envoy"]
           PROTOCOLS = ["http", "https", "e2e_tls"]
           # Must match safe_endpoint names in result filenames (/ replaced with _)
           ENDPOINTS = ["api_echo"]
@@ -322,7 +322,6 @@ jobs:
           GATEWAY_LABELS = {
               "baseline": "Direct Backend",
               "ferrum": "Ferrum Edge",
-              "pingora": "Pingora",
               "kong": "Kong",
               "tyk": "Tyk",
               "krakend": "KrakenD",
@@ -536,7 +535,7 @@ jobs:
               lines.append("#### Ferrum Edge Head-to-Head\n")
               ferrum_data = data.get("ferrum", {})
               if ferrum_data:
-                  for rival in ["pingora", "kong", "tyk", "krakend", "envoy"]:
+                  for rival in ["kong", "tyk", "krakend", "envoy"]:
                       rival_data = data.get(rival, {})
                       if not rival_data:
                           continue

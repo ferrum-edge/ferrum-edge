@@ -2,7 +2,7 @@
 
 # ===========================================================================
 # API Gateway Comparison Benchmark (All-Docker)
-# Ferrum Edge vs Pingora vs Kong vs Tyk vs KrakenD vs Envoy
+# Ferrum Edge vs Kong vs Tyk vs KrakenD vs Envoy
 #
 # ALL gateways run inside Docker containers for apples-to-apples comparison.
 # The Docker overhead is shared equally across all platforms, eliminating
@@ -22,7 +22,7 @@
 #   TYK_VERSION=v5.12       Tyk Docker image tag
 #   KRAKEND_VERSION=2.13.2  KrakenD Docker image tag
 #   ENVOY_VERSION=1.37-latest  Envoy Docker image tag
-#   SKIP_GATEWAYS=tyk       Comma-separated gateways to skip (ferrum,pingora,kong,tyk,krakend,envoy)
+#   SKIP_GATEWAYS=tyk       Comma-separated gateways to skip (ferrum,kong,tyk,krakend,envoy)
 #   WARMUP_DURATION=5s      Warm-up duration before measured test
 #   SKIP_BUILD=false        Skip Docker image builds (use cached images)
 # ===========================================================================
@@ -65,7 +65,6 @@ LUA_SCRIPT_POST_KEY_AUTH="$COMP_DIR/lua/comparison_test_post_key_auth.lua"
 
 # Docker container names (prefixed for easy cleanup)
 FERRUM_CONTAINER="ferrum-bench-ferrum"
-PINGORA_CONTAINER="ferrum-bench-pingora"
 KONG_CONTAINER="ferrum-bench-kong"
 TYK_CONTAINER="ferrum-bench-tyk"
 KRAKEND_CONTAINER="ferrum-bench-krakend"
@@ -74,7 +73,6 @@ REDIS_CONTAINER="ferrum-bench-redis"
 
 # Docker image names for locally-built images
 FERRUM_IMAGE="ferrum-bench:local"
-PINGORA_IMAGE="pingora-bench:local"
 
 # PIDs to track (backend only — gateways are Docker containers)
 BACKEND_PID=""
@@ -191,7 +189,7 @@ cleanup() {
     fi
 
     # Remove all Docker containers
-    for c in "$FERRUM_CONTAINER" "$PINGORA_CONTAINER" "$KONG_CONTAINER" \
+    for c in "$FERRUM_CONTAINER" "$KONG_CONTAINER" \
              "$TYK_CONTAINER" "$KRAKEND_CONTAINER" "$ENVOY_CONTAINER" "$REDIS_CONTAINER"; do
         docker rm -f "$c" 2>/dev/null || true
     done
@@ -310,11 +308,6 @@ build_images() {
         log_ok "Ferrum image built: $FERRUM_IMAGE"
     fi
 
-    if ! should_skip "pingora"; then
-        log_info "Building Pingora bench proxy Docker image..."
-        docker build -t "$PINGORA_IMAGE" -f "$COMP_DIR/Dockerfile.pingora-bench" "$COMP_DIR/configs/pingora" 2>&1 | tail -5
-        log_ok "Pingora image built: $PINGORA_IMAGE"
-    fi
 }
 
 # ===========================================================================
@@ -588,106 +581,6 @@ test_ferrum() {
     else
         log_warn "Ferrum E2E TLS failed to start — skipping"
         stop_ferrum
-    fi
-}
-
-# ===========================================================================
-# Pingora (Cloudflare) — Docker
-# ===========================================================================
-
-start_pingora_http() {
-    log_info "Starting Pingora Docker (HTTP) on port $GATEWAY_HTTP_PORT..."
-    docker rm -f "$PINGORA_CONTAINER" 2>/dev/null || true
-    kill_port "$GATEWAY_HTTP_PORT"
-
-    docker_run_gateway "$PINGORA_CONTAINER" "$GATEWAY_HTTP_PORT" -- \
-        -e PINGORA_HTTP_PORT="$GATEWAY_HTTP_PORT" \
-        -e PINGORA_BACKEND_HOST="$BACKEND_HOST" \
-        -e PINGORA_BACKEND_PORT="$BACKEND_PORT" \
-        "$PINGORA_IMAGE"
-
-    wait_for_http "http://127.0.0.1:$GATEWAY_HTTP_PORT/health" "Pingora Docker (HTTP)" 15 "$PINGORA_CONTAINER"
-}
-
-start_pingora_https() {
-    log_info "Starting Pingora Docker (HTTPS) on ports $GATEWAY_HTTP_PORT + $GATEWAY_HTTPS_PORT..."
-    docker rm -f "$PINGORA_CONTAINER" 2>/dev/null || true
-    kill_port "$GATEWAY_HTTP_PORT"
-    kill_port "$GATEWAY_HTTPS_PORT"
-
-    docker_run_gateway "$PINGORA_CONTAINER" "$GATEWAY_HTTP_PORT" "$GATEWAY_HTTPS_PORT" -- \
-        -v "$CERTS_DIR/server.crt:/etc/pingora/tls/server.crt:ro" \
-        -v "$CERTS_DIR/server.key:/etc/pingora/tls/server.key:ro" \
-        -e PINGORA_HTTP_PORT="$GATEWAY_HTTP_PORT" \
-        -e PINGORA_HTTPS_PORT="$GATEWAY_HTTPS_PORT" \
-        -e PINGORA_BACKEND_HOST="$BACKEND_HOST" \
-        -e PINGORA_BACKEND_PORT="$BACKEND_PORT" \
-        -e PINGORA_TLS_CERT=/etc/pingora/tls/server.crt \
-        -e PINGORA_TLS_KEY=/etc/pingora/tls/server.key \
-        "$PINGORA_IMAGE"
-
-    wait_for_http "https://127.0.0.1:$GATEWAY_HTTPS_PORT/health" "Pingora Docker (HTTPS)" 15 "$PINGORA_CONTAINER"
-}
-
-start_pingora_e2e_tls() {
-    log_info "Starting Pingora Docker (E2E TLS) on port $GATEWAY_HTTPS_PORT..."
-    docker rm -f "$PINGORA_CONTAINER" 2>/dev/null || true
-    kill_port "$GATEWAY_HTTP_PORT"
-    kill_port "$GATEWAY_HTTPS_PORT"
-
-    docker_run_gateway "$PINGORA_CONTAINER" "$GATEWAY_HTTP_PORT" "$GATEWAY_HTTPS_PORT" -- \
-        -v "$CERTS_DIR/server.crt:/etc/pingora/tls/server.crt:ro" \
-        -v "$CERTS_DIR/server.key:/etc/pingora/tls/server.key:ro" \
-        -e PINGORA_HTTP_PORT="$GATEWAY_HTTP_PORT" \
-        -e PINGORA_HTTPS_PORT="$GATEWAY_HTTPS_PORT" \
-        -e PINGORA_BACKEND_HOST="$BACKEND_HOST" \
-        -e PINGORA_BACKEND_PORT="$BACKEND_HTTPS_PORT" \
-        -e PINGORA_BACKEND_TLS=true \
-        -e PINGORA_BACKEND_CA_CERT=/etc/pingora/tls/server.crt \
-        -e PINGORA_TLS_CERT=/etc/pingora/tls/server.crt \
-        -e PINGORA_TLS_KEY=/etc/pingora/tls/server.key \
-        "$PINGORA_IMAGE"
-
-    wait_for_http "https://127.0.0.1:$GATEWAY_HTTPS_PORT/health" "Pingora Docker (E2E TLS)" 15 "$PINGORA_CONTAINER"
-}
-
-stop_pingora() {
-    docker rm -f "$PINGORA_CONTAINER" 2>/dev/null || true
-    kill_port "$GATEWAY_HTTP_PORT"
-    kill_port "$GATEWAY_HTTPS_PORT"
-    sleep 1
-}
-
-test_pingora() {
-    log_header "Testing Pingora (Docker)"
-
-    # HTTP tests
-    if start_pingora_http; then
-        run_wrk_post "pingora" "http" "/api/echo" "$GATEWAY_HTTP_PORT"
-        stop_pingora
-    else
-        log_warn "Pingora HTTP failed to start — skipping"
-        stop_pingora
-    fi
-
-    # HTTPS tests (TLS termination — plaintext backend)
-    if start_pingora_https; then
-        run_wrk_post "pingora" "https" "/api/echo" "$GATEWAY_HTTPS_PORT"
-        stop_pingora
-    else
-        log_warn "Pingora HTTPS failed to start — skipping"
-        stop_pingora
-    fi
-
-    # E2E TLS tests (TLS on both sides)
-    # Pingora's TLS library requires a valid domain (not IP) for upstream SNI,
-    # so E2E TLS to 127.0.0.1 may fail. Skip gracefully if it does.
-    if start_pingora_e2e_tls; then
-        run_wrk_post "pingora" "e2e_tls" "/api/echo" "$GATEWAY_HTTPS_PORT"
-        stop_pingora
-    else
-        log_warn "Pingora E2E TLS failed to start — skipping (known IP-based SNI limitation)"
-        stop_pingora
     fi
 }
 
@@ -1417,7 +1310,6 @@ write_metadata() {
     "connections": "$WRK_CONNECTIONS",
     "execution_mode": "all-docker",
     "ferrum_version": "Docker (local build)",
-    "pingora_version": "Docker (local build, pingora 0.8)",
     "kong_version": "Docker ${KONG_VERSION}",
     "tyk_version": "Docker ${TYK_VERSION}",
     "krakend_version": "Docker ${KRAKEND_VERSION}",
@@ -1445,7 +1337,7 @@ main() {
     echo -e "${BOLD}"
     echo "  ╔══════════════════════════════════════════════════════════════════════╗"
     echo "  ║      API Gateway Comparison Benchmark Suite (All-Docker)          ║"
-    echo "  ║   Ferrum vs Pingora vs Kong vs Tyk vs KrakenD vs Envoy          ║"
+    echo "  ║     Ferrum vs Kong vs Tyk vs KrakenD vs Envoy                 ║"
     echo "  ╚══════════════════════════════════════════════════════════════════════╝"
     echo -e "${NC}"
     echo "  Duration: ${WRK_DURATION}  Threads: ${WRK_THREADS}  Connections: ${WRK_CONNECTIONS}"
@@ -1466,10 +1358,6 @@ main() {
 
     if ! should_skip "ferrum"; then
         test_ferrum
-    fi
-
-    if ! should_skip "pingora"; then
-        test_pingora
     fi
 
     if ! should_skip "kong"; then

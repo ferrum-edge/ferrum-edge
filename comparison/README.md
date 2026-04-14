@@ -1,6 +1,6 @@
 # API Gateway Comparison Benchmarks (All-Docker)
 
-Performance comparison suite that benchmarks **Ferrum Edge** against **Pingora** (Cloudflare), **Kong**, **Tyk**, **KrakenD**, and **Envoy** under identical conditions.
+Performance comparison suite that benchmarks **Ferrum Edge** against **Kong**, **Tyk**, **KrakenD**, and **Envoy** under identical conditions.
 
 **All gateways run inside Docker containers** for apples-to-apples comparison. The Docker overhead is shared equally across all platforms, eliminating the unfair advantage that native binaries previously had over Docker-gated gateways.
 
@@ -8,7 +8,7 @@ Performance comparison suite that benchmarks **Ferrum Edge** against **Pingora**
 
 ## Why All-Docker?
 
-Previous benchmarks ran Ferrum, Pingora, and Envoy as native binaries while Kong, Tyk, and KrakenD ran in Docker. This created an unfair comparison — Docker Desktop on macOS imposes 60-80% throughput reduction (measured via Envoy native vs Docker: 87K vs 17K req/s = 5x gap). By running **every** gateway in Docker:
+Previous benchmarks ran some gateways as native binaries while others ran in Docker. This created an unfair comparison — Docker Desktop on macOS imposes 60-80% throughput reduction (measured via Envoy native vs Docker: 87K vs 17K req/s = 5x gap). By running **every** gateway in Docker:
 
 - **Equal overhead**: All gateways pay the same Docker networking and VM penalty
 - **Relative differences are meaningful**: A 15% gap in Docker reflects a real 15% efficiency difference in the gateway itself, regardless of the absolute numbers
@@ -25,7 +25,7 @@ Each gateway is tested as a reverse proxy with four scenarios:
 | **HTTP (plaintext)** | Client → Gateway (port 8000) → Backend. Measures raw proxy overhead. |
 | **HTTPS (TLS termination)** | Client → Gateway (port 8443, TLS) → Backend (plaintext). Measures TLS handshake and encryption overhead at the gateway. |
 | **E2E TLS (full encryption)** | Client → Gateway (port 8443, TLS) → Backend (TLS, port 3443). Measures full end-to-end encryption where the gateway re-encrypts traffic to the backend. |
-| **Key-Auth (HTTP + authentication)** | Client → Gateway (port 8000, HTTP) → Backend. Each request includes an API key header (`apikey: test-api-key`) validated by the gateway's key-auth plugin. Measures authentication overhead. Ferrum, Kong, Tyk, and Envoy (Pingora has no auth plugin framework; KrakenD key-auth requires Enterprise Edition). Envoy uses an inline Lua filter for API key validation. |
+| **Key-Auth (HTTP + authentication)** | Client → Gateway (port 8000, HTTP) → Backend. Each request includes an API key header (`apikey: test-api-key`) validated by the gateway's key-auth plugin. Measures authentication overhead. Ferrum, Kong, Tyk, and Envoy (KrakenD key-auth requires Enterprise Edition). Envoy uses an inline Lua filter for API key validation. |
 
 Two endpoints are tested per proxy scenario:
 - `/health` — instant backend response, measures pure gateway latency
@@ -35,7 +35,7 @@ A direct backend baseline (no gateway) is run first for both HTTP and HTTPS comp
 
 ### Test Approach
 
-- **All gateways run in Docker** — Ferrum and Pingora are built into Docker images from source; Kong, Tyk, KrakenD, and Envoy use official Docker images
+- **All gateways run in Docker** — Ferrum is built into a Docker image from source; Kong, Tyk, KrakenD, and Envoy use official Docker images
 - Gateways are tested **sequentially** (one at a time) to avoid resource contention
 - Each test gets a **5-second warm-up** (results discarded) before the measured 30-second run
 - The same backend echo server, wrk parameters, and endpoints are used across all gateways
@@ -61,9 +61,9 @@ A direct backend baseline (no gateway) is run first for both HTTP and HTTPS comp
 
 The script will:
 1. Pull Kong, Tyk, KrakenD, and Envoy Docker images
-2. Build Ferrum Edge and Pingora Docker images from source (release mode)
+2. Build Ferrum Edge Docker image from source (release mode)
 3. Build the backend echo server natively (release mode)
-4. Run baseline → Ferrum → Pingora → Kong → Tyk → KrakenD → Envoy tests sequentially
+4. Run baseline → Ferrum → Kong → Tyk → KrakenD → Envoy tests sequentially
 5. Generate an HTML comparison report in `comparison/results/`
 
 Open `comparison/results/comparison_report.html` in a browser to view the results.
@@ -80,7 +80,7 @@ WRK_DURATION=60s WRK_THREADS=12 WRK_CONNECTIONS=200 ./comparison/run_comparison.
 SKIP_GATEWAYS=tyk,krakend ./comparison/run_comparison.sh
 
 # Only test Ferrum vs Envoy
-SKIP_GATEWAYS=pingora,kong,tyk,krakend ./comparison/run_comparison.sh
+SKIP_GATEWAYS=kong,tyk,krakend ./comparison/run_comparison.sh
 
 # Skip Docker image rebuild (use cached images)
 SKIP_BUILD=true ./comparison/run_comparison.sh
@@ -96,8 +96,8 @@ SKIP_BUILD=true ./comparison/run_comparison.sh
 | `TYK_VERSION` | `v5.12` | Tyk Docker image tag |
 | `KRAKEND_VERSION` | `2.13.2` | KrakenD Docker image tag |
 | `ENVOY_VERSION` | `1.37-latest` | Envoy Docker image tag |
-| `SKIP_GATEWAYS` | _(empty)_ | Comma-separated gateways to skip: `ferrum`, `pingora`, `kong`, `tyk`, `krakend`, `envoy` |
-| `SKIP_BUILD` | `false` | Skip Docker image builds for Ferrum and Pingora (use cached images) |
+| `SKIP_GATEWAYS` | _(empty)_ | Comma-separated gateways to skip: `ferrum`, `kong`, `tyk`, `krakend`, `envoy` |
+| `SKIP_BUILD` | `false` | Skip Docker image builds for Ferrum (use cached images) |
 
 ## Swapping Gateway Versions
 
@@ -115,13 +115,12 @@ The script pulls the specified Docker image tags automatically. Results are over
 | Gateway | Image Source | Build |
 |---------|-------------|-------|
 | **Ferrum Edge** | `Dockerfile` (project root) | Built locally from source (release mode, multi-stage) |
-| **Pingora** | `comparison/Dockerfile.pingora-bench` | Built locally from crates.io deps (release mode, multi-stage) |
 | **Kong** | `kong/kong-gateway:${KONG_VERSION}` | Official Docker Hub image |
 | **Tyk** | `tykio/tyk-gateway:${TYK_VERSION}` | Official Docker Hub image |
 | **KrakenD** | `krakend:${KRAKEND_VERSION}` | Official Docker Hub image |
 | **Envoy** | `envoyproxy/envoy:v${ENVOY_VERSION}` | Official Docker Hub image |
 
-Ferrum and Pingora images use multi-stage builds with a Rust builder stage and a slim Debian runtime stage. Dependencies are cached in a separate layer for fast rebuilds when only source code changes.
+The Ferrum image uses a multi-stage build with a Rust builder stage and a slim Debian runtime stage. Dependencies are cached in a separate layer for fast rebuilds when only source code changes.
 
 ## Interpreting Results
 
@@ -145,7 +144,7 @@ Same metrics but with TLS between wrk and the gateway, while the gateway proxies
 Client connects via HTTPS to the gateway, and the gateway re-encrypts traffic to the backend over HTTPS. This is the most secure deployment pattern and measures the full cost of double TLS. Compared against the HTTPS baseline (direct to backend).
 
 ### 5. Key-Auth Performance
-Compares authenticated throughput (API key validation) against the same gateway's unauthenticated performance. Shows the cost of running one authentication plugin in the request path. Pingora is excluded (no plugin framework). Each request includes an `apikey` header; the gateway validates it against a pre-configured consumer before proxying.
+Compares authenticated throughput (API key validation) against the same gateway's unauthenticated performance. Shows the cost of running one authentication plugin in the request path. Each request includes an `apikey` header; the gateway validates it against a pre-configured consumer before proxying.
 
 ### 6. TLS Overhead Comparison
 Per-gateway comparison of HTTP vs HTTPS vs E2E TLS performance. Shows the RPS drop and latency increase each gateway pays for TLS at each stage. A gateway with lower TLS overhead has a more efficient TLS implementation.
@@ -173,13 +172,12 @@ The following results were collected on macOS (Apple Silicon M3 Max) with 8 thre
 | **Kong** | 28,966 | 27,962 | 27,132 | 26,035 | 27,109 | 25,389 |
 | **Tyk** | 24,884 | 24,414 | 24,800 | 23,466 | 22,957 | 21,902 |
 | **KrakenD** | 21,995 | 20,497 | 20,682 | 20,178 | 19,941 | 21,737 |
-| **Pingora** | 6,076 | 5,730 | 6,142 | 6,453 | — | — |
 
-**Ferrum leads or ties in 5 of 6 proxy scenarios.** Ferrum's HTTPS /health (30,975 req/s) is the highest single result, and E2E TLS /api/users (27,902 req/s) beats every other gateway by 10-28% on the most production-representative test (double-TLS with realistic backend latency). Envoy takes HTTPS /api/users by 2% which is likely just networking varience. Pingora E2E TLS is not supported (SNI limitation with IP-based backends).
+**Ferrum leads or ties in 5 of 6 proxy scenarios.** Ferrum's HTTPS /health (30,975 req/s) is the highest single result, and E2E TLS /api/users (27,902 req/s) beats every other gateway by 10-28% on the most production-representative test (double-TLS with realistic backend latency). Envoy takes HTTPS /api/users by 2% which is likely just networking variance.
 
 ### Key-Auth Results (HTTP, /api/users-auth)
 
-Each gateway proxies `/api/users-auth` → backend `/api/users` with API key authentication enabled. A valid API key is sent in the `apikey` header on every request. Pingora is excluded (no auth plugin framework). KrakenD is excluded (key-auth requires Enterprise Edition). Envoy uses an inline Lua filter for API key validation.
+Each gateway proxies `/api/users-auth` → backend `/api/users` with API key authentication enabled. A valid API key is sent in the `apikey` header on every request. KrakenD is excluded (key-auth requires Enterprise Edition). Envoy uses an inline Lua filter for API key validation.
 
 | Gateway | Key-Auth req/s | Latency |
 |---------|---------------|---------|
@@ -233,10 +231,6 @@ On macOS, Docker Desktop runs containers inside a Linux VM with userspace networ
 | **macOS** | port mapping (`-p`) | Significant (VM boundary + userspace networking) |
 
 The macOS overhead is substantial but **shared equally** across all gateways, making relative comparisons valid. For absolute throughput numbers, run on Linux.
-
-## Pingora E2E TLS Limitation
-
-Pingora's TLS library requires a valid DNS hostname for upstream SNI and cannot connect to IP-based backends (127.0.0.1 / host.docker.internal) over TLS. The E2E TLS test is skipped gracefully if Pingora fails to start in this mode. This is a framework limitation, not a configuration issue.
 
 ## Adding a New Gateway
 
