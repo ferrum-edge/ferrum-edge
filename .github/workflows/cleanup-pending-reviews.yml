@@ -121,11 +121,13 @@ jobs:
                   comment: "Auto-rejected by cleanup-pending-reviews workflow (pending > '"$MAX_AGE_MINUTES"' minutes)"
                 }')
 
-                gh api "repos/${{ github.repository }}/actions/runs/$RUN_ID/pending_deployments" \
+                if gh api "repos/${{ github.repository }}/actions/runs/$RUN_ID/pending_deployments" \
                   --method POST \
-                  --input - <<< "$PAYLOAD" > /dev/null
-
-                echo "  Rejected run $RUN_ID"
+                  --input - <<< "$PAYLOAD" > /dev/null 2>&1; then
+                  echo "  Rejected run $RUN_ID"
+                else
+                  echo "  Warning: rejection failed for run $RUN_ID (may have been cancelled or already handled)"
+                fi
               fi
               REJECTED_COUNT=$((REJECTED_COUNT + REJECT_COUNT))
             fi
