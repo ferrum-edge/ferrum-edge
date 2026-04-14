@@ -771,6 +771,11 @@ pub struct GrpcStreamingResponse {
     pub status: u16,
     pub headers: HashMap<String, String>,
     pub body: Incoming,
+    /// Set to `true` if the streaming request body exceeded
+    /// `max_grpc_recv_size_bytes`. The response body consumer should check
+    /// this flag and abort the response if set — the backend received a
+    /// truncated request so the response is likely invalid.
+    pub request_body_exceeded: Option<Arc<AtomicBool>>,
 }
 
 /// Either a fully-buffered or streaming gRPC response.
@@ -982,7 +987,8 @@ pub async fn proxy_grpc_request_streaming(
             GrpcProxyError::BackendUnavailable(format!("Backend request failed: {}", e))
         })?;
 
-    // Check if the request body exceeded the size limit during streaming.
+    // Check if the request body already exceeded the limit before response
+    // headers arrived. If so, fail immediately with a clear error.
     if body_size_exceeded.load(Ordering::Acquire) {
         return Err(GrpcProxyError::ResourceExhausted(format!(
             "gRPC request payload size exceeds maximum of {} bytes",
@@ -990,7 +996,9 @@ pub async fn proxy_grpc_request_streaming(
         )));
     }
 
-    // Always return streaming response — no retries possible when request body was streamed
+    // Return streaming response with the exceeded flag so the response body
+    // consumer can detect late-arriving size violations (bidi/client-streaming
+    // RPCs where request frames continue after response headers arrive).
     let status = response.status().as_u16();
     let mut resp_headers = HashMap::with_capacity(response.headers().keys_len());
     for (k, v) in response.headers() {
@@ -1002,6 +1010,11 @@ pub async fn proxy_grpc_request_streaming(
         status,
         headers: resp_headers,
         body: response.into_body(),
+        request_body_exceeded: if max_grpc_recv_size_bytes > 0 {
+            Some(body_size_exceeded)
+        } else {
+            None
+        },
     }))
 }
 
@@ -1135,6 +1148,7 @@ pub(crate) async fn proxy_grpc_request_core(
             status,
             headers: resp_headers,
             body: response.into_body(),
+            request_body_exceeded: None, // buffered request body — already fully sent
         }));
     }
 
