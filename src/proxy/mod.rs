@@ -6326,10 +6326,10 @@ async fn proxy_to_backend(
             stream_response,
         )
         .await;
-        // For streaming H3 responses, extract headers from the H3StreamingResponse
-        // into the BackendResponse headers map (they arrive in the response struct).
-        if let ResponseBody::StreamingH3(ref h3_resp) = backend_resp.body {
-            backend_resp.headers = h3_resp.headers.clone();
+        // For streaming H3 responses, move headers from the H3StreamingResponse
+        // into the BackendResponse headers map (avoids cloning all key/value strings).
+        if let ResponseBody::StreamingH3(ref mut h3_resp) = backend_resp.body {
+            backend_resp.headers = std::mem::take(&mut h3_resp.headers);
         }
         // Merge resolved_ip into the response (h3 function resolves its own IP
         // but the outer resolved_ip is already computed from DNS cache above)

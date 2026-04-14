@@ -980,12 +980,20 @@ impl http_body::Body for CoalescingH3Body {
             let mut fut = std::pin::pin!(this.recv_stream.recv_data());
             match fut.as_mut().poll(cx) {
                 Poll::Ready(Ok(Some(mut buf))) => {
-                    let data = buf.copy_to_bytes(buf.remaining());
-                    if this.buffer.is_empty() && data.len() >= this.coalesce_target {
-                        // Fast path: chunk already large enough
+                    let len = buf.remaining();
+                    if this.buffer.is_empty() && len >= this.coalesce_target {
+                        // Fast path: chunk already large enough — zero-copy passthrough.
+                        let data = buf.copy_to_bytes(len);
                         return Poll::Ready(Some(Ok(Frame::data(data))));
                     }
-                    this.buffer.extend_from_slice(&data);
+                    // Coalescing path: copy directly from Buf into BytesMut,
+                    // avoiding an intermediate Bytes allocation.
+                    this.buffer.reserve(len);
+                    while buf.has_remaining() {
+                        let chunk = buf.chunk();
+                        this.buffer.extend_from_slice(chunk);
+                        buf.advance(chunk.len());
+                    }
                     if this.buffer.len() >= this.coalesce_target {
                         return Poll::Ready(Some(Ok(Frame::data(this.buffer.split().freeze()))));
                     }
