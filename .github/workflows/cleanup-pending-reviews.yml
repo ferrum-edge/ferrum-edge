@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       dry_run:
-        description: 'Dry run mode (no actual rejection)'
+        description: 'Dry run mode (no actual cancellation)'
         required: false
         default: 'false'
         type: choice
@@ -14,7 +14,7 @@ on:
           - 'true'
           - 'false'
       max_age_minutes:
-        description: 'Reject pending reviews older than this many minutes'
+        description: 'Cancel runs waiting for review longer than this many minutes'
         required: false
         default: '20'
         type: string
@@ -22,14 +22,13 @@ on:
 permissions:
   actions: write
   contents: read
-  deployments: write
 
 jobs:
   cleanup-pending-reviews:
-    name: Auto-reject stale pending reviews
+    name: Cancel stale pending reviews
     runs-on: ubuntu-latest
     steps:
-      - name: Reject stale pending deployment reviews
+      - name: Cancel stale workflow runs waiting for deployment review
         run: |
           DRY_RUN="${{ github.event.inputs.dry_run || 'false' }}"
           MAX_AGE_MINUTES="${{ github.event.inputs.max_age_minutes || '20' }}"
@@ -38,102 +37,61 @@ jobs:
           echo "Max age threshold: $MAX_AGE_MINUTES minutes"
 
           CUTOFF_EPOCH=$(date -d "$MAX_AGE_MINUTES minutes ago" +%s 2>/dev/null || date -v-${MAX_AGE_MINUTES}M +%s)
-          REJECTED_COUNT=0
+          CANCELLED_COUNT=0
           SKIPPED_COUNT=0
 
           # List workflow runs that are waiting for deployment review (paginated)
-          WAITING_RUNS=$(gh api --paginate "repos/${{ github.repository }}/actions/runs?status=waiting&per_page=100" --jq '.workflow_runs[].id')
+          # Fetch id and run_started_at together to avoid per-run API calls
+          WAITING_RUNS=$(gh api --paginate "repos/${{ github.repository }}/actions/runs?status=waiting&per_page=100" \
+            --jq '.workflow_runs[] | "\(.id) \(.run_started_at // .created_at)"')
 
           if [[ -z "$WAITING_RUNS" ]]; then
             echo "No workflow runs waiting for deployment review."
             exit 0
           fi
 
-          for RUN_ID in $WAITING_RUNS; do
+          while IFS=' ' read -r RUN_ID RUN_STARTED; do
             echo ""
-            echo "--- Checking run $RUN_ID ---"
+            echo "--- Checking run $RUN_ID (started $RUN_STARTED) ---"
 
-            # Get the run's created_at as fallback timestamp (pending_deployments lacks created_at)
-            RUN_CREATED_AT=$(gh api "repos/${{ github.repository }}/actions/runs/$RUN_ID" --jq '.run_started_at // .created_at' 2>/dev/null || echo "")
-
-            # Get pending deployments for this run
-            PENDING_JSON=$(gh api "repos/${{ github.repository }}/actions/runs/$RUN_ID/pending_deployments" 2>/dev/null || echo "[]")
-
-            PENDING_COUNT=$(echo "$PENDING_JSON" | jq 'length')
-            if [[ "$PENDING_COUNT" == "0" ]]; then
-              echo "  No pending deployments for run $RUN_ID"
+            if [[ -z "$RUN_STARTED" || "$RUN_STARTED" == "null" ]]; then
+              echo "  No timestamp available, skipping"
+              SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
               continue
             fi
 
-            # Check the wait_timer_started_at for each pending environment
-            ENV_IDS="[]"
-            ALL_STALE=true
+            STARTED_EPOCH=$(date -d "$RUN_STARTED" +%s 2>/dev/null || date -jf "%Y-%m-%dT%H:%M:%SZ" "$RUN_STARTED" +%s 2>/dev/null || echo "0")
 
-            for i in $(seq 0 $((PENDING_COUNT - 1))); do
-              ENV_NAME=$(echo "$PENDING_JSON" | jq -r ".[$i].environment.name")
-              ENV_ID=$(echo "$PENDING_JSON" | jq -r ".[$i].environment.id")
-              WAIT_STARTED=$(echo "$PENDING_JSON" | jq -r ".[$i].wait_timer_started_at // empty")
-              # Fall back to the workflow run's start time when wait_timer_started_at is null
-              # (environments with manual approval only, no wait timer)
-              if [[ -z "$WAIT_STARTED" ]]; then
-                WAIT_STARTED="$RUN_CREATED_AT"
-              fi
+            if [[ "$STARTED_EPOCH" -eq 0 ]]; then
+              echo "  Could not parse timestamp '$RUN_STARTED', skipping"
+              SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
+              continue
+            fi
 
-              if [[ -z "$WAIT_STARTED" || "$WAIT_STARTED" == "null" ]]; then
-                echo "  Environment '$ENV_NAME' (id=$ENV_ID): no timestamp, skipping"
-                ALL_STALE=false
-                SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
-                continue
-              fi
+            AGE_SECONDS=$(($(date +%s) - STARTED_EPOCH))
+            AGE_MINUTES=$((AGE_SECONDS / 60))
 
-              WAIT_EPOCH=$(date -d "$WAIT_STARTED" +%s 2>/dev/null || date -jf "%Y-%m-%dT%H:%M:%SZ" "$WAIT_STARTED" +%s 2>/dev/null || echo "0")
-
-              if [[ "$WAIT_EPOCH" -eq 0 ]]; then
-                echo "  Environment '$ENV_NAME' (id=$ENV_ID): could not parse timestamp '$WAIT_STARTED', skipping"
-                ALL_STALE=false
-                SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
-                continue
-              fi
-
-              AGE_SECONDS=$(($(date +%s) - WAIT_EPOCH))
-              AGE_MINUTES=$((AGE_SECONDS / 60))
-
-              if [[ "$WAIT_EPOCH" -le "$CUTOFF_EPOCH" ]]; then
-                echo "  Environment '$ENV_NAME' (id=$ENV_ID): pending for ${AGE_MINUTES}m (>= ${MAX_AGE_MINUTES}m threshold)"
-                ENV_IDS=$(echo "$ENV_IDS" | jq ". + [$ENV_ID]")
-              else
-                echo "  Environment '$ENV_NAME' (id=$ENV_ID): pending for ${AGE_MINUTES}m (< ${MAX_AGE_MINUTES}m threshold), skipping"
-                ALL_STALE=false
-                SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
-              fi
-            done
-
-            # Reject all stale environments in this run
-            REJECT_COUNT=$(echo "$ENV_IDS" | jq 'length')
-            if [[ "$REJECT_COUNT" -gt 0 ]]; then
+            if [[ "$STARTED_EPOCH" -le "$CUTOFF_EPOCH" ]]; then
+              echo "  Run is ${AGE_MINUTES}m old (>= ${MAX_AGE_MINUTES}m threshold)"
               if [[ "$DRY_RUN" == "true" ]]; then
-                echo "  [DRY RUN] Would reject $REJECT_COUNT environment(s) for run $RUN_ID"
+                echo "  [DRY RUN] Would cancel run $RUN_ID"
               else
-                echo "  Rejecting $REJECT_COUNT environment(s) for run $RUN_ID..."
-                PAYLOAD=$(jq -n --argjson ids "$ENV_IDS" '{
-                  environment_ids: $ids,
-                  state: "rejected",
-                  comment: "Auto-rejected by cleanup-pending-reviews workflow (pending > '"$MAX_AGE_MINUTES"' minutes)"
-                }')
-
-                if gh api "repos/${{ github.repository }}/actions/runs/$RUN_ID/pending_deployments" \
-                  --method POST \
-                  --input - <<< "$PAYLOAD" > /dev/null 2>&1; then
-                  echo "  Rejected run $RUN_ID"
+                echo "  Cancelling run $RUN_ID..."
+                if gh api "repos/${{ github.repository }}/actions/runs/$RUN_ID/cancel" \
+                  --method POST > /dev/null 2>&1; then
+                  echo "  Cancelled run $RUN_ID"
                 else
-                  echo "  Warning: rejection failed for run $RUN_ID (may have been cancelled or already handled)"
+                  echo "  Warning: cancel failed for run $RUN_ID (may have already completed)"
                 fi
               fi
-              REJECTED_COUNT=$((REJECTED_COUNT + REJECT_COUNT))
+              CANCELLED_COUNT=$((CANCELLED_COUNT + 1))
+            else
+              echo "  Run is ${AGE_MINUTES}m old (< ${MAX_AGE_MINUTES}m threshold), skipping"
+              SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
             fi
-          done
+          done <<< "$WAITING_RUNS"
 
           echo ""
-          echo "Summary: $REJECTED_COUNT environment(s) rejected, $SKIPPED_COUNT skipped"
+          echo "Summary: $CANCELLED_COUNT run(s) cancelled, $SKIPPED_COUNT skipped"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
