@@ -10,7 +10,6 @@
     "target_url": "https://BACKEND_HOST:3443",
     "strip_listen_path": false,
     "transport": {
-      "ssl_insecure_skip_verify": true
     }
   },
   "version_data": {

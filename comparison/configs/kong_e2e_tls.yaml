@@ -4,6 +4,9 @@ _format_version: "3.0"
 # Frontend: HTTPS (TLS termination) → Backend: HTTPS (re-encryption)
 #
 # NOTE: BACKEND_HOST is replaced at runtime by run_comparison.sh
+# NOTE: Backend TLS verification uses KONG_LUA_SSL_TRUSTED_CERTIFICATE in
+# run_comparison.sh to trust the self-signed backend CA. Kong 3.14+ forbids
+# service-level tls_verify overrides when the global setting is enabled.
 
 services:
   - name: health-service-e2e
@@ -13,7 +16,6 @@ services:
     connect_timeout: 1000
     read_timeout: 5000
     write_timeout: 5000
-    tls_verify: false
     routes:
       - name: health-route-e2e
         paths:
@@ -31,7 +33,6 @@ services:
     connect_timeout: 1000
     read_timeout: 5000
     write_timeout: 5000
-    tls_verify: false
     routes:
       - name: echo-route-e2e
         paths:

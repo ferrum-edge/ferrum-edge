@@ -17,7 +17,7 @@
     "private_key": "/etc/krakend/tls/server.key"
   },
   "client_tls": {
-    "allow_insecure_connections": true
+    "ca_certs": ["/etc/krakend/tls/server.crt"]
   },
   "endpoints": [
     {
