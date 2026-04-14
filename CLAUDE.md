@@ -79,6 +79,8 @@ cargo fmt                                                   # Auto-format
 
 The CI workflow (`.github/workflows/ci.yml`) runs on push to `main` and PRs targeting `main`:
 
+**On PRs** (full validation):
+
 1. **Format Check** — `cargo fmt --check` (instant, no compilation)
 2. **Tests** (parallel with format check) — unit tests, integration tests, and E2E tests (`--ignored`) in a single job
 3. **Lint** (depends on format check) — clippy with zero warnings
@@ -86,12 +88,13 @@ The CI workflow (`.github/workflows/ci.yml`) runs on push to `main` and PRs targ
 
 All four jobs must pass for a PR to merge.
 
-5. **Build Binaries** (depends on tests + lint) — release builds for 5 targets: Linux x86_64, Linux ARM64 (via `cross`), macOS x86_64, macOS ARM64, Windows x86_64. Runs on both PRs and main pushes to catch cross-platform build failures before merge.
+5. **Build Binaries** (depends on lint) — release builds for 5 targets: Linux x86_64, Linux ARM64 (via `cross`), macOS x86_64, macOS ARM64, Windows x86_64
 
-On push to `main` only (after build binaries pass), additional jobs run:
+**On push to `main`** (build + release only — format, tests, lint, and perf already passed on the PR):
 
-6. **Latest Release** — overwrites a `latest` prerelease GitHub Release with all binaries and SHA256 checksums
-7. **Docker** — builds per-platform images from pre-built binaries using `Dockerfile.release`, then creates a multi-arch manifest (linux/amd64 + linux/arm64) pushed to both Docker Hub (`ferrumedge/ferrum-edge:latest`) and GHCR (`ghcr.io/ferrum-edge/ferrum-edge:latest`)
+1. **Build Binaries** — same 5 targets as PRs (runs immediately, no test/lint gates)
+2. **Latest Release** — overwrites a `latest` prerelease GitHub Release with all binaries and SHA256 checksums
+3. **Docker** — builds per-platform images from pre-built binaries using `Dockerfile.release`, then creates a multi-arch manifest (linux/amd64 + linux/arm64) pushed to both Docker Hub (`ferrumedge/ferrum-edge:latest`) and GHCR (`ghcr.io/ferrum-edge/ferrum-edge:latest`)
 
 ### Release Pipeline (GitHub Actions)
 

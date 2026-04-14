@@ -18,6 +18,7 @@ env:
 jobs:
   fmt:
     name: Format Check
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -33,8 +34,9 @@ jobs:
 
   test:
     name: Tests
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
-    environment: ${{ github.event_name == 'pull_request' && 'ci-tests' || '' }}
+    environment: ci-tests
     services:
       redis:
         image: redis:7-alpine
@@ -116,6 +118,7 @@ jobs:
 
   lint:
     name: Lint
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     needs: [fmt]
     steps:
@@ -156,9 +159,10 @@ jobs:
 
   performance-regression:
     name: Performance Regression Check
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     needs: [test]
-    environment: ${{ github.event_name == 'pull_request' && 'ci-perf' || '' }}
+    environment: ci-perf
     steps:
       - uses: actions/checkout@v6
 
@@ -287,6 +291,7 @@ jobs:
   build-binaries:
     name: Build (${{ matrix.asset_name }})
     needs: [lint]
+    if: always() && (needs.lint.result == 'success' || needs.lint.result == 'skipped')
     environment: ${{ github.event_name == 'pull_request' && 'ci-build' || '' }}
     runs-on: ${{ matrix.os }}
     strategy:
@@ -396,7 +401,7 @@ jobs:
 
   latest-release:
     name: Update Latest Release
-    needs: [build-binaries, test]
+    needs: [build-binaries]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
@@ -466,7 +471,7 @@ jobs:
 
   docker:
     name: Docker (${{ matrix.platform }})
-    needs: [build-binaries, test]
+    needs: [build-binaries]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
