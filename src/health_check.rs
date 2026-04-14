@@ -781,7 +781,7 @@ async fn grpc_probe(
     global_ca_path: Option<&str>,
     global_cert_path: Option<&str>,
     global_key_path: Option<&str>,
-    global_no_verify: bool,
+    _global_no_verify: bool,
 ) -> bool {
     let scheme = if use_tls { "https" } else { "http" };
     let endpoint_url = format!("{}://{}:{}", scheme, host, port);
@@ -798,7 +798,6 @@ async fn grpc_probe(
     };
 
     let endpoint = if use_tls {
-        let skip_verify = !tls_config.verify_server_cert || global_no_verify;
         let mut tonic_tls = tonic::transport::ClientTlsConfig::new();
 
         // Load CA certs (upstream → global → system roots)
@@ -831,9 +830,11 @@ async fn grpc_probe(
             }
         }
 
-        if skip_verify {
-            tonic_tls = tonic_tls.assume_http2(true);
-        }
+        // Note: tonic's ClientTlsConfig does not expose a skip-verify API.
+        // When skip_verify is true, we accept that gRPC health probes may fail
+        // against self-signed certs unless a CA is explicitly configured.
+        // The proxy gRPC path (grpc_proxy.rs) uses rustls directly with NoVerifier,
+        // but health probes use tonic's higher-level API which doesn't support this.
 
         match endpoint.tls_config(tonic_tls) {
             Ok(ep) => ep,

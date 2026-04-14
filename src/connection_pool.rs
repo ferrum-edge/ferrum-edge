@@ -524,11 +524,17 @@ impl ConnectionPool {
                     .unwrap_or_else(|_| rustls::ClientConfig::builder())
             };
 
-        // Build client config with optional mTLS
-        let mut client_config = if let (Some(cert_path), Some(key_path)) = (
-            &proxy.backend_tls_client_cert_path,
-            &proxy.backend_tls_client_key_path,
-        ) {
+        // Build client config with optional mTLS (resolved_tls → global fallback)
+        let cert_path = proxy.resolved_tls.client_cert_path.as_ref().or(self
+            .global_mtls_config
+            .backend_tls_client_cert_path
+            .as_ref());
+        let key_path = proxy
+            .resolved_tls
+            .client_key_path
+            .as_ref()
+            .or(self.global_mtls_config.backend_tls_client_key_path.as_ref());
+        let mut client_config = if let (Some(cert_path), Some(key_path)) = (cert_path, key_path) {
             // mTLS: load client certificate and key
             let cert_file = std::fs::File::open(cert_path).map_err(|e| {
                 anyhow::anyhow!(
