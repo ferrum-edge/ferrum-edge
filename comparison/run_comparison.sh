@@ -766,6 +766,7 @@ start_kong_e2e_tls() {
         -e KONG_PROXY_ERROR_LOG=/dev/stderr \
         -e KONG_LOG_LEVEL=warn \
         -e KONG_UPSTREAM_KEEPALIVE_POOL_SIZE=128 \
+        -e KONG_UPSTREAM_TLS_VERIFY=off \
         "kong/kong-gateway:${KONG_VERSION}"
 
     wait_for_http "https://127.0.0.1:$GATEWAY_HTTPS_PORT/health" "Kong Docker (E2E TLS)" 20 "$KONG_CONTAINER"
