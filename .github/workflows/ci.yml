@@ -292,7 +292,7 @@ jobs:
     name: Build (${{ matrix.asset_name }})
     needs: [lint]
     if: always() && (needs.lint.result == 'success' || (github.event_name == 'push' && needs.lint.result == 'skipped'))
-    environment: ${{ github.event_name == 'pull_request' && 'ci-build' || '' }}
+    environment: ci-build
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
