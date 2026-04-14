@@ -21,7 +21,7 @@ services:
         strip_path: false
         preserve_host: false
 
-  - name: users-service-e2e
+  - name: echo-service-e2e
     host: BACKEND_HOST
     port: 3443
     protocol: https
@@ -30,8 +30,10 @@ services:
     write_timeout: 5000
     tls_verify: false
     routes:
-      - name: users-route-e2e
+      - name: echo-route-e2e
         paths:
-          - /api/users
+          - /api/echo
+        methods:
+          - POST
         strip_path: false
         preserve_host: false

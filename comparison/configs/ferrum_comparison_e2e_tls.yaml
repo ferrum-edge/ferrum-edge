@@ -18,9 +18,9 @@ proxies:
     auth_mode: single
     plugins: []
 
-  - id: "proxy-users"
-    name: "Users API Proxy (E2E TLS)"
-    listen_path: "/api/users"
+  - id: "proxy-echo"
+    name: "Echo API Proxy (E2E TLS)"
+    listen_path: "/api/echo"
     backend_protocol: https
     backend_host: "BACKEND_HOST"
     backend_port: 3443

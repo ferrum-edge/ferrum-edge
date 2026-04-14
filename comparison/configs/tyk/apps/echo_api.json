@@ -1,12 +1,12 @@
 {
-  "name": "Health API",
-  "slug": "health-api",
-  "api_id": "health-api",
+  "name": "Echo API",
+  "slug": "echo-api",
+  "api_id": "echo-api",
   "org_id": "default",
   "use_keyless": true,
   "active": true,
   "proxy": {
-    "listen_path": "/health",
+    "listen_path": "/api/echo",
     "target_url": "http://BACKEND_HOST:3001",
     "strip_listen_path": false
   },

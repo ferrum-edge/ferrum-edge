@@ -1,12 +1,12 @@
 {
-  "name": "Health API (E2E TLS)",
-  "slug": "health-api-e2e",
-  "api_id": "health-api-e2e",
+  "name": "Echo API (E2E TLS)",
+  "slug": "echo-api-e2e",
+  "api_id": "echo-api-e2e",
   "org_id": "default",
   "use_keyless": true,
   "active": true,
   "proxy": {
-    "listen_path": "/health",
+    "listen_path": "/api/echo",
     "target_url": "https://BACKEND_HOST:3443",
     "strip_listen_path": false,
     "transport": {

@@ -5,7 +5,7 @@
 use hyper::body::Bytes;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
-use http_body_util::Full;
+use http_body_util::{BodyExt, Full};
 use hyper_util::rt::TokioIo;
 use rustls::ServerConfig;
 use std::convert::Infallible;
@@ -21,10 +21,11 @@ use tokio_rustls::TlsAcceptor;
 async fn handle_request(req: Request<hyper::body::Incoming>) -> Result<Response<Full<Bytes>>, Infallible> {
     let start_time = Instant::now();
 
-    let (method, uri) = (req.method(), req.uri());
+    let method = req.method().clone();
+    let path = req.uri().path().to_string();
 
     // Simulate different response types based on path
-    let response: Response<Full<Bytes>> = match (method, uri.path()) {
+    let response: Response<Full<Bytes>> = match (&method, path.as_str()) {
         (&Method::GET, "/health") => {
             Response::builder()
                 .status(StatusCode::OK)
@@ -41,9 +42,9 @@ async fn handle_request(req: Request<hyper::body::Incoming>) -> Result<Response<
                 .body(Full::new(Bytes::from(r#"{"users":[{"id":1,"name":"Alice"},{"id":2,"name":"Bob"}]}"#)))
                 .unwrap()
         }
-        (&Method::GET, path) if path.starts_with("/api/users/") => {
+        (&Method::GET, p) if p.starts_with("/api/users/") => {
             // Extract user ID from path
-            let user_id = path.trim_start_matches("/api/users/");
+            let user_id = p.trim_start_matches("/api/users/");
             let response = format!(r#"{{"id":{},"name":"User {}","email":"user{}@example.com"}}"#, user_id, user_id, user_id);
             Response::builder()
                 .status(StatusCode::OK)
@@ -58,6 +59,17 @@ async fn handle_request(req: Request<hyper::body::Incoming>) -> Result<Response<
                 .status(StatusCode::CREATED)
                 .header("Content-Type", "application/json")
                 .body(Full::new(Bytes::from(r#"{"id":3,"name":"New User","created":true}"#)))
+                .unwrap()
+        }
+        (&Method::POST, "/api/echo") => {
+            // Echo the request body back — used for POST payload benchmarks
+            let body_bytes = req.into_body().collect().await
+                .map(|c| c.to_bytes())
+                .unwrap_or_default();
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("Content-Type", "application/json")
+                .body(Full::new(body_bytes))
                 .unwrap()
         }
         (&Method::GET, "/api/data") => {
@@ -163,6 +175,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("   GET  /api/users - List users");
     println!("   GET  /api/users/:id - Get user by ID");
     println!("   POST /api/users - Create user");
+    println!("   POST /api/echo - Echo request body");
     println!("   GET  /api/data - Large dataset");
 
     // Try to load TLS config from well-known cert paths

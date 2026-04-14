@@ -30,13 +30,13 @@
       ]
     },
     {
-      "endpoint": "/api/users",
-      "method": "GET",
+      "endpoint": "/api/echo",
+      "method": "POST",
       "output_encoding": "no-op",
       "backend": [
         {
           "host": ["http://BACKEND_HOST:3001"],
-          "url_pattern": "/api/users",
+          "url_pattern": "/api/echo",
           "encoding": "no-op"
         }
       ]

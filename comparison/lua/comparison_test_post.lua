@@ -1,10 +1,24 @@
--- Unified wrk script for gateway comparison benchmarks
--- Outputs machine-parseable statistics in the done() callback
--- so generate_comparison_report.py can extract consistent metrics
--- across all gateways and test scenarios.
+-- Unified wrk script for gateway comparison benchmarks (POST variant)
+-- Sends a ~10 KB JSON payload to /api/echo and expects it echoed back.
+-- This measures realistic request+response body proxying overhead.
 
-wrk.method = "GET"
-wrk.body = nil
+-- Build a ~10 KB JSON payload once at init time
+local function build_payload()
+    local items = {}
+    for i = 1, 50 do
+        items[#items + 1] = string.format(
+            '{"id":%d,"name":"user_%d","email":"user_%d@example.com","role":"member","active":true,"score":%d,"bio":"Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed do eiusmod tempor incididunt ut labore."}',
+            i, i, i, i * 17
+        )
+    end
+    return '{"items":[' .. table.concat(items, ",") .. ']}'
+end
+
+local payload = build_payload()
+
+wrk.method = "POST"
+wrk.body = payload
+wrk.headers["Content-Type"] = "application/json"
 wrk.headers["Accept"] = "application/json"
 wrk.headers["User-Agent"] = "wrk-gateway-comparison"
 

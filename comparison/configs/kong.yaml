@@ -21,7 +21,7 @@ services:
         strip_path: false
         preserve_host: false
 
-  - name: users-service
+  - name: echo-service
     host: BACKEND_HOST
     port: 3001
     protocol: http
@@ -29,8 +29,10 @@ services:
     read_timeout: 5000
     write_timeout: 5000
     routes:
-      - name: users-route
+      - name: echo-route
         paths:
-          - /api/users
+          - /api/echo
+        methods:
+          - POST
         strip_path: false
         preserve_host: false

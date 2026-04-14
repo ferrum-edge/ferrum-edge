@@ -19,32 +19,20 @@ services:
         strip_path: false
         preserve_host: false
 
-  - name: users-service
+  - name: echo-auth-service
     host: BACKEND_HOST
     port: 3001
     protocol: http
+    path: /api/echo
     connect_timeout: 1000
     read_timeout: 5000
     write_timeout: 5000
     routes:
-      - name: users-route
+      - name: echo-auth-route
         paths:
-          - /api/users
-        strip_path: false
-        preserve_host: false
-
-  - name: users-auth-service
-    host: BACKEND_HOST
-    port: 3001
-    protocol: http
-    path: /api/users
-    connect_timeout: 1000
-    read_timeout: 5000
-    write_timeout: 5000
-    routes:
-      - name: users-auth-route
-        paths:
-          - /api/users-auth
+          - /api/echo-auth
+        methods:
+          - POST
         strip_path: true
         preserve_host: false
         plugins:

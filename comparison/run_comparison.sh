@@ -60,8 +60,8 @@ SKIP_BUILD=${SKIP_BUILD:-false}
 RESULTS_DIR="$COMP_DIR/results"
 CERTS_DIR="$PROJECT_ROOT/tests/certs"
 PERF_DIR="$PROJECT_ROOT/tests/performance"
-LUA_SCRIPT="$COMP_DIR/lua/comparison_test.lua"
-LUA_SCRIPT_KEY_AUTH="$COMP_DIR/lua/comparison_test_key_auth.lua"
+LUA_SCRIPT_POST="$COMP_DIR/lua/comparison_test_post.lua"
+LUA_SCRIPT_POST_KEY_AUTH="$COMP_DIR/lua/comparison_test_post_key_auth.lua"
 
 # Docker container names (prefixed for easy cleanup)
 FERRUM_CONTAINER="ferrum-bench-ferrum"
@@ -331,13 +331,13 @@ start_backend() {
 # wrk test runner
 # ===========================================================================
 
-run_wrk() {
+run_wrk_post() {
     local gateway="$1"
     local protocol="$2"
     local endpoint="$3"
     local port="$4"
     local label="${gateway}/${protocol}${endpoint}"
-    # Sanitize endpoint for filename: /health -> health, /api/users -> api_users
+    # Sanitize endpoint for filename: /api/echo -> api_echo
     local safe_endpoint
     safe_endpoint=$(echo "$endpoint" | sed 's|^/||; s|/|_|g')
     local result_file="${RESULTS_DIR}/${gateway}_${protocol}_${safe_endpoint}_results.txt"
@@ -349,14 +349,14 @@ run_wrk() {
         url="http://127.0.0.1:${port}${endpoint}"
     fi
 
-    echo -e "    ${CYAN}Testing ${label}${NC}  →  ${url}"
+    echo -e "    ${CYAN}Testing ${label} (POST ~10KB)${NC}  →  ${url}"
 
     # Warm-up (results discarded)
-    wrk -t2 -c20 -d"$WARMUP_DURATION" -s "$LUA_SCRIPT" "$url" > /dev/null 2>&1 || true
+    wrk -t2 -c20 -d"$WARMUP_DURATION" -s "$LUA_SCRIPT_POST" "$url" > /dev/null 2>&1 || true
 
     # Measured run
     if ! wrk -t"$WRK_THREADS" -c"$WRK_CONNECTIONS" -d"$WRK_DURATION" \
-        --latency -s "$LUA_SCRIPT" "$url" > "$result_file" 2>&1; then
+        --latency -s "$LUA_SCRIPT_POST" "$url" > "$result_file" 2>&1; then
         log_warn "wrk failed for ${label} — see ${result_file}"
         return 0
     fi
@@ -376,19 +376,19 @@ run_wrk() {
 run_wrk_key_auth() {
     local gateway="$1"
     local port="$2"
-    local label="${gateway}/key_auth/api/users-auth"
-    local safe_endpoint="api_users"
+    local label="${gateway}/key_auth/api/echo-auth"
+    local safe_endpoint="api_echo"
     local result_file="${RESULTS_DIR}/${gateway}_key_auth_${safe_endpoint}_results.txt"
-    local url="http://127.0.0.1:${port}/api/users-auth"
+    local url="http://127.0.0.1:${port}/api/echo-auth"
 
-    echo -e "    ${CYAN}Testing ${label}${NC}  →  ${url}"
+    echo -e "    ${CYAN}Testing ${label} (POST ~10KB)${NC}  →  ${url}"
 
     # Warm-up (results discarded)
-    wrk -t2 -c20 -d"$WARMUP_DURATION" -s "$LUA_SCRIPT_KEY_AUTH" "$url" > /dev/null 2>&1 || true
+    wrk -t2 -c20 -d"$WARMUP_DURATION" -s "$LUA_SCRIPT_POST_KEY_AUTH" "$url" > /dev/null 2>&1 || true
 
     # Measured run
     if ! wrk -t"$WRK_THREADS" -c"$WRK_CONNECTIONS" -d"$WRK_DURATION" \
-        --latency -s "$LUA_SCRIPT_KEY_AUTH" "$url" > "$result_file" 2>&1; then
+        --latency -s "$LUA_SCRIPT_POST_KEY_AUTH" "$url" > "$result_file" 2>&1; then
         log_warn "wrk failed for ${label} — see ${result_file}"
         return 0
     fi
@@ -559,20 +559,17 @@ test_ferrum() {
 
     # HTTP tests
     start_ferrum_http
-    run_wrk "ferrum" "http" "/health" "$GATEWAY_HTTP_PORT"
-    run_wrk "ferrum" "http" "/api/users" "$GATEWAY_HTTP_PORT"
+    run_wrk_post "ferrum" "http" "/api/echo" "$GATEWAY_HTTP_PORT"
     stop_ferrum
 
     # HTTPS tests (TLS termination — plaintext backend)
     start_ferrum_https
-    run_wrk "ferrum" "https" "/health" "$GATEWAY_HTTPS_PORT"
-    run_wrk "ferrum" "https" "/api/users" "$GATEWAY_HTTPS_PORT"
+    run_wrk_post "ferrum" "https" "/api/echo" "$GATEWAY_HTTPS_PORT"
     stop_ferrum
 
     # E2E TLS tests (TLS on both sides)
     start_ferrum_e2e_tls
-    run_wrk "ferrum" "e2e_tls" "/health" "$GATEWAY_HTTPS_PORT"
-    run_wrk "ferrum" "e2e_tls" "/api/users" "$GATEWAY_HTTPS_PORT"
+    run_wrk_post "ferrum" "e2e_tls" "/api/echo" "$GATEWAY_HTTPS_PORT"
     stop_ferrum
 }
 
@@ -647,22 +644,19 @@ test_pingora() {
 
     # HTTP tests
     start_pingora_http
-    run_wrk "pingora" "http" "/health" "$GATEWAY_HTTP_PORT"
-    run_wrk "pingora" "http" "/api/users" "$GATEWAY_HTTP_PORT"
+    run_wrk_post "pingora" "http" "/api/echo" "$GATEWAY_HTTP_PORT"
     stop_pingora
 
     # HTTPS tests (TLS termination — plaintext backend)
     start_pingora_https
-    run_wrk "pingora" "https" "/health" "$GATEWAY_HTTPS_PORT"
-    run_wrk "pingora" "https" "/api/users" "$GATEWAY_HTTPS_PORT"
+    run_wrk_post "pingora" "https" "/api/echo" "$GATEWAY_HTTPS_PORT"
     stop_pingora
 
     # E2E TLS tests (TLS on both sides)
     # Pingora's TLS library requires a valid domain (not IP) for upstream SNI,
     # so E2E TLS to 127.0.0.1 may fail. Skip gracefully if it does.
     if start_pingora_e2e_tls; then
-        run_wrk "pingora" "e2e_tls" "/health" "$GATEWAY_HTTPS_PORT"
-        run_wrk "pingora" "e2e_tls" "/api/users" "$GATEWAY_HTTPS_PORT"
+        run_wrk_post "pingora" "e2e_tls" "/api/echo" "$GATEWAY_HTTPS_PORT"
         stop_pingora
     else
         log_warn "Pingora E2E TLS failed to start — skipping (known IP-based SNI limitation)"
@@ -765,20 +759,17 @@ test_kong() {
 
     # HTTP tests
     start_kong_http
-    run_wrk "kong" "http" "/health" "$GATEWAY_HTTP_PORT"
-    run_wrk "kong" "http" "/api/users" "$GATEWAY_HTTP_PORT"
+    run_wrk_post "kong" "http" "/api/echo" "$GATEWAY_HTTP_PORT"
     stop_kong
 
     # HTTPS tests (TLS termination — plaintext backend)
     start_kong_https
-    run_wrk "kong" "https" "/health" "$GATEWAY_HTTPS_PORT"
-    run_wrk "kong" "https" "/api/users" "$GATEWAY_HTTPS_PORT"
+    run_wrk_post "kong" "https" "/api/echo" "$GATEWAY_HTTPS_PORT"
     stop_kong
 
     # E2E TLS tests (TLS on both sides)
     start_kong_e2e_tls
-    run_wrk "kong" "e2e_tls" "/health" "$GATEWAY_HTTPS_PORT"
-    run_wrk "kong" "e2e_tls" "/api/users" "$GATEWAY_HTTPS_PORT"
+    run_wrk_post "kong" "e2e_tls" "/api/echo" "$GATEWAY_HTTPS_PORT"
     stop_kong
 }
 
@@ -922,20 +913,17 @@ test_tyk() {
 
     # HTTP tests
     start_tyk_http
-    run_wrk "tyk" "http" "/health" "$GATEWAY_HTTP_PORT"
-    run_wrk "tyk" "http" "/api/users" "$GATEWAY_HTTP_PORT"
+    run_wrk_post "tyk" "http" "/api/echo" "$GATEWAY_HTTP_PORT"
     stop_tyk
 
     # HTTPS tests (TLS termination — plaintext backend)
     start_tyk_https
-    run_wrk "tyk" "https" "/health" "$GATEWAY_HTTPS_PORT"
-    run_wrk "tyk" "https" "/api/users" "$GATEWAY_HTTPS_PORT"
+    run_wrk_post "tyk" "https" "/api/echo" "$GATEWAY_HTTPS_PORT"
     stop_tyk
 
     # E2E TLS tests (TLS on both sides)
     start_tyk_e2e_tls
-    run_wrk "tyk" "e2e_tls" "/health" "$GATEWAY_HTTPS_PORT"
-    run_wrk "tyk" "e2e_tls" "/api/users" "$GATEWAY_HTTPS_PORT"
+    run_wrk_post "tyk" "e2e_tls" "/api/echo" "$GATEWAY_HTTPS_PORT"
     stop_tyk
     stop_redis
 }
@@ -1012,20 +1000,17 @@ test_krakend() {
 
     # HTTP tests
     start_krakend_http
-    run_wrk "krakend" "http" "/health" "$GATEWAY_HTTP_PORT"
-    run_wrk "krakend" "http" "/api/users" "$GATEWAY_HTTP_PORT"
+    run_wrk_post "krakend" "http" "/api/echo" "$GATEWAY_HTTP_PORT"
     stop_krakend
 
     # HTTPS tests (TLS termination — plaintext backend)
     start_krakend_https
-    run_wrk "krakend" "https" "/health" "$GATEWAY_HTTPS_PORT"
-    run_wrk "krakend" "https" "/api/users" "$GATEWAY_HTTPS_PORT"
+    run_wrk_post "krakend" "https" "/api/echo" "$GATEWAY_HTTPS_PORT"
     stop_krakend
 
     # E2E TLS tests (TLS on both sides)
     start_krakend_e2e_tls
-    run_wrk "krakend" "e2e_tls" "/health" "$GATEWAY_HTTPS_PORT"
-    run_wrk "krakend" "e2e_tls" "/api/users" "$GATEWAY_HTTPS_PORT"
+    run_wrk_post "krakend" "e2e_tls" "/api/echo" "$GATEWAY_HTTPS_PORT"
     stop_krakend
 }
 
@@ -1100,20 +1085,17 @@ test_envoy() {
 
     # HTTP tests
     start_envoy_http
-    run_wrk "envoy" "http" "/health" "$GATEWAY_HTTP_PORT"
-    run_wrk "envoy" "http" "/api/users" "$GATEWAY_HTTP_PORT"
+    run_wrk_post "envoy" "http" "/api/echo" "$GATEWAY_HTTP_PORT"
     stop_envoy
 
     # HTTPS tests (TLS termination — plaintext backend)
     start_envoy_https
-    run_wrk "envoy" "https" "/health" "$GATEWAY_HTTPS_PORT"
-    run_wrk "envoy" "https" "/api/users" "$GATEWAY_HTTPS_PORT"
+    run_wrk_post "envoy" "https" "/api/echo" "$GATEWAY_HTTPS_PORT"
     stop_envoy
 
     # E2E TLS tests (TLS on both sides)
     start_envoy_e2e_tls
-    run_wrk "envoy" "e2e_tls" "/health" "$GATEWAY_HTTPS_PORT"
-    run_wrk "envoy" "e2e_tls" "/api/users" "$GATEWAY_HTTPS_PORT"
+    run_wrk_post "envoy" "e2e_tls" "/api/echo" "$GATEWAY_HTTPS_PORT"
     stop_envoy
 }
 
@@ -1230,9 +1212,9 @@ test_tyk_key_auth() {
             "alias": "benchuser",
             "expires": 0,
             "access_rights": {
-                "users-auth-api": {
-                    "api_id": "users-auth-api",
-                    "api_name": "Users Auth API",
+                "echo-auth-api": {
+                    "api_id": "echo-auth-api",
+                    "api_name": "Echo Auth API",
                     "versions": ["Default"]
                 }
             }
@@ -1252,12 +1234,12 @@ test_tyk_key_auth() {
 
     # Override the lua script key with the Tyk-generated key
     local tyk_lua="$COMP_DIR/lua/.tyk_key_auth_runtime.lua"
-    sed "s/test-api-key/$tyk_api_key/g" "$LUA_SCRIPT_KEY_AUTH" > "$tyk_lua"
+    sed "s/test-api-key/$tyk_api_key/g" "$LUA_SCRIPT_POST_KEY_AUTH" > "$tyk_lua"
 
     # Run wrk with the Tyk-specific key
-    local label="tyk/key_auth/api/users-auth"
-    local result_file="${RESULTS_DIR}/tyk_key_auth_api_users_results.txt"
-    local url="http://127.0.0.1:${GATEWAY_HTTP_PORT}/api/users-auth"
+    local label="tyk/key_auth/api/echo-auth"
+    local result_file="${RESULTS_DIR}/tyk_key_auth_api_echo_results.txt"
+    local url="http://127.0.0.1:${GATEWAY_HTTP_PORT}/api/echo-auth"
 
     echo -e "    ${CYAN}Testing ${label}${NC}  →  ${url}"
     wrk -t2 -c20 -d"$WARMUP_DURATION" -s "$tyk_lua" "$url" > /dev/null 2>&1 || true
@@ -1323,11 +1305,9 @@ test_key_auth() {
 
 test_baseline() {
     log_header "Testing Direct Backend (Baseline)"
-    run_wrk "baseline" "http" "/health" "$BACKEND_PORT"
-    run_wrk "baseline" "http" "/api/users" "$BACKEND_PORT"
+    run_wrk_post "baseline" "http" "/api/echo" "$BACKEND_PORT"
     # HTTPS baseline (direct to backend HTTPS port, no gateway)
-    run_wrk "baseline" "https" "/health" "$BACKEND_HTTPS_PORT"
-    run_wrk "baseline" "https" "/api/users" "$BACKEND_HTTPS_PORT"
+    run_wrk_post "baseline" "https" "/api/echo" "$BACKEND_HTTPS_PORT"
 }
 
 # ===========================================================================
