@@ -4,9 +4,9 @@ _format_version: "3.0"
 # Frontend: HTTPS (TLS termination) → Backend: HTTPS (re-encryption)
 #
 # NOTE: BACKEND_HOST is replaced at runtime by run_comparison.sh
-# NOTE: Backend TLS verification is disabled globally via KONG_UPSTREAM_TLS_VERIFY=off
-# in run_comparison.sh (self-signed certs). Kong 3.14+ forbids service-level tls_verify
-# overrides when the global setting is enabled.
+# NOTE: Backend TLS verification uses KONG_LUA_SSL_TRUSTED_CERTIFICATE in
+# run_comparison.sh to trust the self-signed backend CA. Kong 3.14+ forbids
+# service-level tls_verify overrides when the global setting is enabled.
 
 services:
   - name: health-service-e2e

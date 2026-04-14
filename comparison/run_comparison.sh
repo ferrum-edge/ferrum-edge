@@ -522,7 +522,7 @@ start_ferrum_e2e_tls() {
         -e FERRUM_PROXY_HTTPS_PORT="$GATEWAY_HTTPS_PORT" \
         -e FERRUM_FRONTEND_TLS_CERT_PATH=/etc/ferrum/tls/server.crt \
         -e FERRUM_FRONTEND_TLS_KEY_PATH=/etc/ferrum/tls/server.key \
-        -e FERRUM_TLS_NO_VERIFY=true \
+        -e FERRUM_TLS_CA_BUNDLE_PATH=/etc/ferrum/tls/server.crt \
         -e FERRUM_LOG_LEVEL=error \
         -e FERRUM_ADD_VIA_HEADER=false \
         -e FERRUM_ADD_FORWARDED_HEADER=false \
@@ -756,17 +756,18 @@ start_kong_e2e_tls() {
         -v "$COMP_DIR/configs/.kong_runtime_e2e_tls.yaml:/etc/kong/kong.yml:ro" \
         -v "$CERTS_DIR/server.crt:/etc/kong/ssl/server.crt:ro" \
         -v "$CERTS_DIR/server.key:/etc/kong/ssl/server.key:ro" \
+        -v "$CERTS_DIR/server.crt:/etc/kong/ssl/upstream-ca.crt:ro" \
         -e KONG_DATABASE=off \
         -e KONG_DECLARATIVE_CONFIG=/etc/kong/kong.yml \
         -e KONG_PROXY_LISTEN="0.0.0.0:$GATEWAY_HTTP_PORT, 0.0.0.0:$GATEWAY_HTTPS_PORT ssl" \
         -e KONG_SSL_CERT=/etc/kong/ssl/server.crt \
         -e KONG_SSL_CERT_KEY=/etc/kong/ssl/server.key \
+        -e KONG_LUA_SSL_TRUSTED_CERTIFICATE=/etc/kong/ssl/upstream-ca.crt \
         -e KONG_ADMIN_LISTEN="off" \
         -e KONG_PROXY_ACCESS_LOG=/dev/null \
         -e KONG_PROXY_ERROR_LOG=/dev/stderr \
         -e KONG_LOG_LEVEL=warn \
         -e KONG_UPSTREAM_KEEPALIVE_POOL_SIZE=128 \
-        -e KONG_UPSTREAM_TLS_VERIFY=off \
         "kong/kong-gateway:${KONG_VERSION}"
 
     wait_for_http "https://127.0.0.1:$GATEWAY_HTTPS_PORT/health" "Kong Docker (E2E TLS)" 20 "$KONG_CONTAINER"
