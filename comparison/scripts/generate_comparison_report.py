@@ -259,7 +259,11 @@ def _cell(val, suffix, idx, best_idx, worst_idx, decimals=2):
 
 
 def _build_table(data, protocol, endpoint, baseline_metrics):
-    """Build an HTML table comparing gateways for one protocol+endpoint combo."""
+    """Build an HTML table comparing gateways for one protocol+endpoint combo.
+
+    The baseline row is included for reference but best/worst coloring only
+    applies to gateway rows.
+    """
     gws = [g for g in GATEWAYS if g != "baseline" and g in data and protocol in data[g] and endpoint in data[g][protocol]]
     if not gws:
         return "<p>No results available.</p>"
@@ -269,7 +273,7 @@ def _build_table(data, protocol, endpoint, baseline_metrics):
         m = data[gw][protocol][endpoint]
         rows_data.append((gw, m))
 
-    # Collect values for coloring
+    # Collect values for coloring (gateway rows only)
     rps_vals = [(m.get("rps"), False) for _, m in rows_data]
     lat_vals = [(m.get("latency_avg_ms"), True) for _, m in rows_data]
     p99_vals = [(m.get("latency_p99_ms"), True) for _, m in rows_data]
@@ -287,6 +291,17 @@ def _build_table(data, protocol, endpoint, baseline_metrics):
 </tr></thead><tbody>\n"""
 
     bl_rps = baseline_metrics.get("rps") if baseline_metrics else None
+
+    # Baseline row first (no coloring, no vs-baseline column)
+    if baseline_metrics and baseline_metrics.get("rps") is not None:
+        bl = baseline_metrics
+        html += f'<tr style="background:#f0f4ff;"><td><strong>{GATEWAY_LABELS.get("baseline", "Direct Backend")}</strong></td>'
+        html += f"<td>{_fmt(bl.get('rps'), '', 0)}</td>"
+        html += f"<td>{_fmt(bl.get('latency_avg_ms'), ' ms')}</td>"
+        html += f"<td>{_fmt(bl.get('latency_p50_ms'), ' ms')}</td>"
+        html += f"<td>{_fmt(bl.get('latency_p99_ms'), ' ms')}</td>"
+        html += f"<td>{_fmt(bl.get('error_count', 0), '', 0)}</td>"
+        html += "<td>&mdash;</td></tr>\n"
 
     for i, (gw, m) in enumerate(rows_data):
         rps = m.get("rps")
@@ -403,6 +418,7 @@ def generate_report(results_dir, output_path, meta=None):
     # Baseline metrics for /api/echo
     bl_echo = data.get("baseline", {}).get("http", {}).get("api_echo", {})
     bl_https_echo = data.get("baseline", {}).get("https", {}).get("api_echo", {})
+    bl_e2e_echo = data.get("baseline", {}).get("e2e_tls", {}).get("api_echo", {})
 
     meta = meta or {}
     GATEWAY_LABELS = _gateway_labels(meta)
@@ -486,7 +502,10 @@ def generate_report(results_dir, output_path, meta=None):
     {_fmt(bl_echo.get('error_count', 0), ' errors', 0)}<br>
     <strong>HTTPS /api/echo (POST ~10KB):</strong> {_fmt(bl_https_echo.get('rps'), ' req/s', 0)} &mdash;
     {_fmt(bl_https_echo.get('latency_avg_ms'), ' ms avg')} &mdash;
-    {_fmt(bl_https_echo.get('error_count', 0), ' errors', 0)}
+    {_fmt(bl_https_echo.get('error_count', 0), ' errors', 0)}<br>
+    <strong>E2E TLS /api/echo (POST ~10KB):</strong> {_fmt(bl_e2e_echo.get('rps'), ' req/s', 0)} &mdash;
+    {_fmt(bl_e2e_echo.get('latency_avg_ms'), ' ms avg')} &mdash;
+    {_fmt(bl_e2e_echo.get('error_count', 0), ' errors', 0)}
   </div>
 </div>
 
@@ -497,13 +516,13 @@ def generate_report(results_dir, output_path, meta=None):
 
 <div class="section">
   <h2>HTTPS Performance (TLS Termination) &mdash; POST ~10KB Echo</h2>
-  {_build_table(data, 'https', 'api_echo', bl_echo)}
+  {_build_table(data, 'https', 'api_echo', bl_https_echo)}
 </div>
 
 <div class="section">
   <h2>End-to-End TLS Performance (Full Encryption) &mdash; POST ~10KB Echo</h2>
   <p>Client &rarr; HTTPS &rarr; Gateway &rarr; HTTPS &rarr; Backend. Both hops are encrypted. This is the most secure deployment pattern.</p>
-  {_build_table(data, 'e2e_tls', 'api_echo', bl_https_echo)}
+  {_build_table(data, 'e2e_tls', 'api_echo', bl_e2e_echo if bl_e2e_echo else bl_https_echo)}
 </div>
 
 {"" if not key_auth_data else f'''<div class="section">

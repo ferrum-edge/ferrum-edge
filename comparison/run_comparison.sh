@@ -1296,6 +1296,8 @@ test_baseline() {
     run_wrk_post "baseline" "http" "/api/echo" "$BACKEND_PORT"
     # HTTPS baseline (direct to backend HTTPS port, no gateway)
     run_wrk_post "baseline" "https" "/api/echo" "$BACKEND_HTTPS_PORT"
+    # E2E TLS baseline (same as HTTPS — direct to backend HTTPS port, no gateway)
+    run_wrk_post "baseline" "e2e_tls" "/api/echo" "$BACKEND_HTTPS_PORT"
 }
 
 # ===========================================================================
