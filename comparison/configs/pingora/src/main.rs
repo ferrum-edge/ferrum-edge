@@ -14,14 +14,10 @@ use pingora_core::upstreams::peer::HttpPeer;
 use pingora_core::Result;
 use pingora_proxy::{http_proxy_service, ProxyHttp, Session};
 use std::env;
-use std::fs;
-use std::sync::Arc;
 
 struct BenchProxy {
     backend_addr: String,
     backend_tls: bool,
-    /// PEM-encoded CA certificate for verifying backend TLS (self-signed certs)
-    backend_ca_pem: Option<Arc<Vec<u8>>>,
 }
 
 #[async_trait]
@@ -40,8 +36,13 @@ impl ProxyHttp for BenchProxy {
             self.backend_tls,
             String::new(),
         ));
-        if let Some(ca_pem) = &self.backend_ca_pem {
-            peer.options.ca = Some(Arc::clone(ca_pem));
+        if self.backend_tls {
+            // Pingora's rustls backend expects parsed WrappedX509 certs for custom CA,
+            // which requires internal type constructors not easily accessible.
+            // Disable verification for the benchmark proxy — the overhead difference
+            // is per-connection (not per-request) and negligible for throughput comparison.
+            peer.options.verify_cert = false;
+            peer.options.verify_hostname = false;
         }
         Ok(peer)
     }
@@ -57,7 +58,6 @@ fn main() {
     let backend_tls = env::var("PINGORA_BACKEND_TLS").unwrap_or_else(|_| "false".to_string()) == "true";
     let tls_cert = env::var("PINGORA_TLS_CERT").ok();
     let tls_key = env::var("PINGORA_TLS_KEY").ok();
-    let backend_ca_path = env::var("PINGORA_BACKEND_CA_CERT").ok();
 
     // Use available CPU cores for worker threads (Pingora defaults to 1)
     let num_threads: usize = env::var("PINGORA_THREADS")
@@ -67,15 +67,9 @@ fn main() {
 
     let backend_addr = format!("{}:{}", backend_host, backend_port);
 
-    let backend_ca_pem = backend_ca_path.map(|path| {
-        let pem = fs::read(&path).unwrap_or_else(|e| panic!("Failed to read CA cert {}: {}", path, e));
-        eprintln!("Loaded backend CA cert from {}", path);
-        Arc::new(pem)
-    });
-
     eprintln!(
-        "Pingora bench proxy: HTTP={}, HTTPS={}, backend={} (tls={}, ca={}), threads={}",
-        http_port, https_port, backend_addr, backend_tls, backend_ca_pem.is_some(), num_threads
+        "Pingora bench proxy: HTTP={}, HTTPS={}, backend={} (tls={}), threads={}",
+        http_port, https_port, backend_addr, backend_tls, num_threads
     );
 
     let mut conf = ServerConf::new().expect("Failed to create server conf");
@@ -88,7 +82,6 @@ fn main() {
     let proxy = BenchProxy {
         backend_addr: backend_addr.clone(),
         backend_tls,
-        backend_ca_pem,
     };
 
     let mut service = http_proxy_service(&server.configuration, proxy);

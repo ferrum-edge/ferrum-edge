@@ -643,7 +643,6 @@ start_pingora_e2e_tls() {
         -e PINGORA_BACKEND_HOST="$BACKEND_HOST" \
         -e PINGORA_BACKEND_PORT="$BACKEND_HTTPS_PORT" \
         -e PINGORA_BACKEND_TLS=true \
-        -e PINGORA_BACKEND_CA_CERT=/etc/pingora/tls/server.crt \
         -e PINGORA_TLS_CERT=/etc/pingora/tls/server.crt \
         -e PINGORA_TLS_KEY=/etc/pingora/tls/server.key \
         "$PINGORA_IMAGE"
