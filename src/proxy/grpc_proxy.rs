@@ -29,7 +29,7 @@ use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::net::TcpStream;
@@ -46,8 +46,16 @@ use crate::tls::{NoVerifier, TlsPolicy};
 pub enum GrpcBody {
     /// Complete body in memory (retries, plugin transforms).
     Buffered(Full<Bytes>),
-    /// Streaming body from the client (no retries, no plugins need body).
-    Streaming(Incoming),
+    /// Streaming body from the client with inline size enforcement.
+    /// When `max_bytes > 0`, tracks accumulated bytes and sets the shared
+    /// `exceeded` flag if the limit is breached. The caller checks the flag
+    /// after `send_request()` completes to return a proper gRPC error.
+    Streaming {
+        incoming: Incoming,
+        bytes_seen: usize,
+        max_bytes: usize,
+        exceeded: Arc<AtomicBool>,
+    },
 }
 
 impl http_body::Body for GrpcBody {
@@ -62,21 +70,44 @@ impl http_body::Body for GrpcBody {
             GrpcBody::Buffered(full) => Pin::new(full)
                 .poll_frame(cx)
                 .map_err(|never| match never {}),
-            GrpcBody::Streaming(incoming) => Pin::new(incoming).poll_frame(cx),
+            GrpcBody::Streaming {
+                incoming,
+                bytes_seen,
+                max_bytes,
+                exceeded,
+            } => match Pin::new(incoming).poll_frame(cx) {
+                Poll::Ready(Some(Ok(frame))) => {
+                    if *max_bytes > 0
+                        && let Some(data) = frame.data_ref()
+                    {
+                        *bytes_seen += data.len();
+                        if *bytes_seen > *max_bytes {
+                            exceeded.store(true, Ordering::Release);
+                            // Signal end-of-stream. The caller detects the
+                            // exceeded flag and returns ResourceExhausted.
+                            return Poll::Ready(None);
+                        }
+                    }
+                    Poll::Ready(Some(Ok(frame)))
+                }
+                other => other,
+            },
         }
     }
 
     fn is_end_stream(&self) -> bool {
         match self {
             GrpcBody::Buffered(full) => full.is_end_stream(),
-            GrpcBody::Streaming(incoming) => incoming.is_end_stream(),
+            GrpcBody::Streaming {
+                incoming, exceeded, ..
+            } => incoming.is_end_stream() || exceeded.load(Ordering::Relaxed),
         }
     }
 
     fn size_hint(&self) -> http_body::SizeHint {
         match self {
             GrpcBody::Buffered(full) => full.size_hint(),
-            GrpcBody::Streaming(incoming) => incoming.size_hint(),
+            GrpcBody::Streaming { incoming, .. } => incoming.size_hint(),
         }
     }
 }
@@ -883,12 +914,9 @@ pub async fn proxy_grpc_request_from_bytes(
 /// are configured. The response is always streamed (since no retries are possible
 /// when the request body has already been consumed).
 ///
-/// Request body size limits (`max_grpc_recv_size_bytes`) are NOT enforced on the
-/// streaming path — HTTP/2 flow control already limits in-flight data, and since
-/// each frame is forwarded immediately to the backend, memory usage is bounded
-/// by the H2 window size (~64KB-8MiB depending on config), not the total body size.
-/// The size limit is a defense against buffering the entire body, which doesn't
-/// apply here.
+/// Request body size limits (`max_grpc_recv_size_bytes`) are enforced inline via
+/// byte counting in `GrpcBody::Streaming`. Each frame's size is accumulated and
+/// the stream errors if the limit is exceeded, causing the H2 connection to reset.
 #[allow(clippy::too_many_arguments)]
 pub async fn proxy_grpc_request_streaming(
     req: Request<Incoming>,
@@ -897,9 +925,16 @@ pub async fn proxy_grpc_request_streaming(
     grpc_pool: &GrpcConnectionPool,
     dns_cache: &DnsCache,
     proxy_headers: &HashMap<String, String>,
+    max_grpc_recv_size_bytes: usize,
 ) -> Result<GrpcResponseKind, GrpcProxyError> {
     let (parts, body) = req.into_parts();
-    let grpc_body = GrpcBody::Streaming(body);
+    let body_size_exceeded = Arc::new(AtomicBool::new(false));
+    let grpc_body = GrpcBody::Streaming {
+        incoming: body,
+        bytes_seen: 0,
+        max_bytes: max_grpc_recv_size_bytes,
+        exceeded: Arc::clone(&body_size_exceeded),
+    };
 
     // Build headers, apply proxy transforms
     let mut headers = parts.headers;
@@ -946,6 +981,14 @@ pub async fn proxy_grpc_request_streaming(
             error!("gRPC backend request failed (streaming body): {}", e);
             GrpcProxyError::BackendUnavailable(format!("Backend request failed: {}", e))
         })?;
+
+    // Check if the request body exceeded the size limit during streaming.
+    if body_size_exceeded.load(Ordering::Acquire) {
+        return Err(GrpcProxyError::ResourceExhausted(format!(
+            "gRPC request payload size exceeds maximum of {} bytes",
+            max_grpc_recv_size_bytes
+        )));
+    }
 
     // Always return streaming response — no retries possible when request body was streamed
     let status = response.status().as_u16();

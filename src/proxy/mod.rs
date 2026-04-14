@@ -4764,6 +4764,7 @@ async fn handle_proxy_request_inner(
                     &state.grpc_pool,
                     &state.dns_cache,
                     proxy_headers,
+                    state.max_grpc_recv_size_bytes,
                 )
                 .await;
                 (result, Bytes::new())
