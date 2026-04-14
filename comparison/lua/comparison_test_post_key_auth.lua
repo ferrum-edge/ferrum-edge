@@ -1,9 +1,24 @@
--- Unified wrk script for gateway comparison benchmarks (key-auth variant)
--- Same as comparison_test.lua but includes an API key header for
+-- Unified wrk script for gateway comparison benchmarks (POST + key-auth variant)
+-- Same as comparison_test_post.lua but includes an API key header for
 -- authenticated endpoint testing.
 
-wrk.method = "GET"
-wrk.body = nil
+-- Build a ~10 KB JSON payload once at init time
+local function build_payload()
+    local items = {}
+    for i = 1, 50 do
+        items[#items + 1] = string.format(
+            '{"id":%d,"name":"user_%d","email":"user_%d@example.com","role":"member","active":true,"score":%d,"bio":"Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed do eiusmod tempor incididunt ut labore."}',
+            i, i, i, i * 17
+        )
+    end
+    return '{"items":[' .. table.concat(items, ",") .. ']}'
+end
+
+local payload = build_payload()
+
+wrk.method = "POST"
+wrk.body = payload
+wrk.headers["Content-Type"] = "application/json"
 wrk.headers["Accept"] = "application/json"
 wrk.headers["User-Agent"] = "wrk-gateway-comparison"
 wrk.headers["apikey"] = "test-api-key"

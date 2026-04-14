@@ -274,9 +274,9 @@ jobs:
               if not os.path.isdir(results_dir):
                   return data
               for fname in sorted(os.listdir(results_dir)):
-                  if not fname.endswith("_key_auth_api_users_results.txt"):
+                  if not fname.endswith("_key_auth_api_echo_results.txt"):
                       continue
-                  gw = fname.replace("_key_auth_api_users_results.txt", "")
+                  gw = fname.replace("_key_auth_api_echo_results.txt", "")
                   if gw in GATEWAYS:
                       data[gw] = parse_wrk_output(os.path.join(results_dir, fname))
               return data
@@ -397,7 +397,7 @@ jobs:
 
               # Key-auth table
               if key_auth:
-                  lines.append("\n#### Key-Auth (HTTP /api/users-auth)\n")
+                  lines.append("\n#### Key-Auth (HTTP POST /api/echo-auth)\n")
                   lines.append("| Gateway | RPS | No-Auth RPS | Auth Overhead | Avg Latency | P50 | P99 | Errors |")
                   lines.append("|---------|-----|-------------|---------------|-------------|-----|-----|--------|")
 
@@ -409,7 +409,7 @@ jobs:
                           continue
                       m = key_auth[gw]
                       rps = m.get("rps")
-                      no_auth_rps = data.get(gw, {}).get("http", {}).get("api_users", {}).get("rps")
+                      no_auth_rps = data.get(gw, {}).get("http", {}).get("api_echo", {}).get("rps")
                       auth_overhead = ""
                       if no_auth_rps and rps:
                           pct = ((no_auth_rps - rps) / no_auth_rps) * 100

@@ -19,14 +19,14 @@ static_resources:
                       domains: ["*"]
                       routes:
                         - match:
-                            prefix: "/api/users-auth"
+                            prefix: "/api/echo-auth"
                           route:
                             cluster: backend_cluster
                             timeout: 5s
                             regex_rewrite:
                               pattern:
-                                regex: "^/api/users-auth(.*)"
-                              substitution: "/api/users\\1"
+                                regex: "^/api/echo-auth(.*)"
+                              substitution: "/api/echo\\1"
                         - match:
                             prefix: "/"
                           route:
@@ -40,7 +40,7 @@ static_resources:
                         inline_string: |
                           function envoy_on_request(request_handle)
                             local path = request_handle:headers():get(":path")
-                            if path and path:sub(1, 15) == "/api/users-auth" then
+                            if path and path:sub(1, 14) == "/api/echo-auth" then
                               local key = request_handle:headers():get("apikey")
                               if key ~= "test-api-key" then
                                 request_handle:respond(

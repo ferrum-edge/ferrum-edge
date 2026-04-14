@@ -163,15 +163,15 @@ def discover_results(results_dir):
 
 
 def discover_key_auth_results(results_dir):
-    """Scan for key-auth result files: {gateway}_key_auth_api_users_results.txt
+    """Scan for key-auth result files: {gateway}_key_auth_api_echo_results.txt
 
     Returns dict[gateway] = metrics
     """
     data = {}
     for fname in sorted(os.listdir(results_dir)):
-        if not fname.endswith("_key_auth_api_users_results.txt"):
+        if not fname.endswith("_key_auth_api_echo_results.txt"):
             continue
-        gw = fname.replace("_key_auth_api_users_results.txt", "")
+        gw = fname.replace("_key_auth_api_echo_results.txt", "")
         if gw in GATEWAYS:
             data[gw] = parse_wrk_output(os.path.join(results_dir, fname))
     return data
@@ -196,8 +196,8 @@ def _build_key_auth_table(key_auth_data, no_auth_data):
         m = key_auth_data[gw]
         rps = m.get("rps")
 
-        # Compare against no-auth HTTP /api/users
-        no_auth_rps = no_auth_data.get(gw, {}).get("http", {}).get("api_users", {}).get("rps")
+        # Compare against no-auth HTTP /api/echo
+        no_auth_rps = no_auth_data.get(gw, {}).get("http", {}).get("api_echo", {}).get("rps")
         overhead = ""
         if no_auth_rps and rps:
             pct = ((no_auth_rps - rps) / no_auth_rps) * 100
@@ -507,8 +507,8 @@ def generate_report(results_dir, output_path, meta=None):
 </div>
 
 {"" if not key_auth_data else f'''<div class="section">
-  <h2>Key-Auth Performance (HTTP, /api/users-auth)</h2>
-  <p>API key authentication enabled. Each request includes an <code>apikey</code> header validated by the gateway before proxying to the backend <code>/api/users</code> endpoint. Compares authenticated throughput against the same gateway&#39;s unauthenticated HTTP /api/users performance.</p>
+  <h2>Key-Auth Performance (HTTP, POST ~10KB /api/echo-auth)</h2>
+  <p>API key authentication enabled. Each request sends a ~10KB JSON POST with an <code>apikey</code> header validated by the gateway before proxying to the backend <code>/api/echo</code> endpoint. Compares authenticated throughput against the same gateway&#39;s unauthenticated HTTP /api/echo performance.</p>
   {_build_key_auth_table(key_auth_data, data)}
 </div>'''}
 

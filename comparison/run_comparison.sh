@@ -61,7 +61,7 @@ RESULTS_DIR="$COMP_DIR/results"
 CERTS_DIR="$PROJECT_ROOT/tests/certs"
 PERF_DIR="$PROJECT_ROOT/tests/performance"
 LUA_SCRIPT_POST="$COMP_DIR/lua/comparison_test_post.lua"
-LUA_SCRIPT_KEY_AUTH="$COMP_DIR/lua/comparison_test_key_auth.lua"
+LUA_SCRIPT_POST_KEY_AUTH="$COMP_DIR/lua/comparison_test_post_key_auth.lua"
 
 # Docker container names (prefixed for easy cleanup)
 FERRUM_CONTAINER="ferrum-bench-ferrum"
@@ -376,19 +376,19 @@ run_wrk_post() {
 run_wrk_key_auth() {
     local gateway="$1"
     local port="$2"
-    local label="${gateway}/key_auth/api/users-auth"
-    local safe_endpoint="api_users"
+    local label="${gateway}/key_auth/api/echo-auth"
+    local safe_endpoint="api_echo"
     local result_file="${RESULTS_DIR}/${gateway}_key_auth_${safe_endpoint}_results.txt"
-    local url="http://127.0.0.1:${port}/api/users-auth"
+    local url="http://127.0.0.1:${port}/api/echo-auth"
 
-    echo -e "    ${CYAN}Testing ${label}${NC}  →  ${url}"
+    echo -e "    ${CYAN}Testing ${label} (POST ~10KB)${NC}  →  ${url}"
 
     # Warm-up (results discarded)
-    wrk -t2 -c20 -d"$WARMUP_DURATION" -s "$LUA_SCRIPT_KEY_AUTH" "$url" > /dev/null 2>&1 || true
+    wrk -t2 -c20 -d"$WARMUP_DURATION" -s "$LUA_SCRIPT_POST_KEY_AUTH" "$url" > /dev/null 2>&1 || true
 
     # Measured run
     if ! wrk -t"$WRK_THREADS" -c"$WRK_CONNECTIONS" -d"$WRK_DURATION" \
-        --latency -s "$LUA_SCRIPT_KEY_AUTH" "$url" > "$result_file" 2>&1; then
+        --latency -s "$LUA_SCRIPT_POST_KEY_AUTH" "$url" > "$result_file" 2>&1; then
         log_warn "wrk failed for ${label} — see ${result_file}"
         return 0
     fi
@@ -1212,9 +1212,9 @@ test_tyk_key_auth() {
             "alias": "benchuser",
             "expires": 0,
             "access_rights": {
-                "users-auth-api": {
-                    "api_id": "users-auth-api",
-                    "api_name": "Users Auth API",
+                "echo-auth-api": {
+                    "api_id": "echo-auth-api",
+                    "api_name": "Echo Auth API",
                     "versions": ["Default"]
                 }
             }
@@ -1234,12 +1234,12 @@ test_tyk_key_auth() {
 
     # Override the lua script key with the Tyk-generated key
     local tyk_lua="$COMP_DIR/lua/.tyk_key_auth_runtime.lua"
-    sed "s/test-api-key/$tyk_api_key/g" "$LUA_SCRIPT_KEY_AUTH" > "$tyk_lua"
+    sed "s/test-api-key/$tyk_api_key/g" "$LUA_SCRIPT_POST_KEY_AUTH" > "$tyk_lua"
 
     # Run wrk with the Tyk-specific key
-    local label="tyk/key_auth/api/users-auth"
-    local result_file="${RESULTS_DIR}/tyk_key_auth_api_users_results.txt"
-    local url="http://127.0.0.1:${GATEWAY_HTTP_PORT}/api/users-auth"
+    local label="tyk/key_auth/api/echo-auth"
+    local result_file="${RESULTS_DIR}/tyk_key_auth_api_echo_results.txt"
+    local url="http://127.0.0.1:${GATEWAY_HTTP_PORT}/api/echo-auth"
 
     echo -e "    ${CYAN}Testing ${label}${NC}  →  ${url}"
     wrk -t2 -c20 -d"$WARMUP_DURATION" -s "$tyk_lua" "$url" > /dev/null 2>&1 || true

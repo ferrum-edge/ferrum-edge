@@ -1,6 +1,6 @@
 ---
 # Ferrum Edge comparison benchmark configuration — key-auth enabled
-# Includes the same two keyless proxies plus one authenticated proxy
+# Includes a health check proxy plus one authenticated echo proxy
 
 proxies:
   - id: "proxy-health"
@@ -18,25 +18,9 @@ proxies:
     auth_mode: single
     plugins: []
 
-  - id: "proxy-users"
-    name: "Users API Proxy"
-    listen_path: "/api/users"
-    backend_protocol: http
-    backend_host: "BACKEND_HOST"
-    backend_port: 3001
-    strip_listen_path: false
-    preserve_host_header: false
-    backend_connect_timeout_ms: 1000
-    backend_read_timeout_ms: 5000
-    backend_write_timeout_ms: 5000
-    backend_tls_verify_server_cert: true
-    auth_mode: single
-    pool_idle_timeout_seconds: 180
-    plugins: []
-
-  - id: "proxy-users-auth"
-    name: "Users API Proxy (Key Auth)"
-    listen_path: "/api/users-auth"
+  - id: "proxy-echo-auth"
+    name: "Echo API Proxy (Key Auth)"
+    listen_path: "/api/echo-auth"
     backend_protocol: http
     backend_host: "BACKEND_HOST"
     backend_port: 3001
@@ -46,7 +30,7 @@ proxies:
     backend_read_timeout_ms: 5000
     backend_write_timeout_ms: 5000
     backend_tls_verify_server_cert: true
-    backend_path: "/api/users"
+    backend_path: "/api/echo"
     auth_mode: single
     pool_idle_timeout_seconds: 180
     plugins:
@@ -66,5 +50,5 @@ plugin_configs:
     config:
       key_location: "header:apikey"
     scope: proxy
-    proxy_id: "proxy-users-auth"
+    proxy_id: "proxy-echo-auth"
     enabled: true
