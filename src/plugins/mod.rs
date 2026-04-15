@@ -912,6 +912,22 @@ pub trait Plugin: Send + Sync {
         false
     }
 
+    /// Returns `true` when the current request's response should be buffered
+    /// for this plugin.
+    ///
+    /// This is the response-side equivalent of `should_buffer_request_body()`:
+    /// a per-request refinement that lets plugins skip buffering when the
+    /// response is clearly irrelevant (e.g., `compression` skipping when
+    /// `Accept-Encoding` is absent, `ai_token_metrics` skipping for non-AI
+    /// content-types).
+    ///
+    /// Only called when `requires_response_body_buffering()` returns `true`
+    /// (the config-time upper bound). Override this for content-type-sensitive
+    /// or header-sensitive response plugins.
+    fn should_buffer_response_body(&self, _ctx: &RequestContext) -> bool {
+        self.requires_response_body_buffering()
+    }
+
     /// Called after the full response body has been received from the backend.
     ///
     /// Only invoked when `requires_response_body_buffering()` returns `true` for

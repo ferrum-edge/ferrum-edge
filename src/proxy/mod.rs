@@ -468,7 +468,7 @@ pub struct ProxyState {
     pub max_header_count: usize,
     pub max_request_body_size_bytes: usize,
     pub max_response_body_size_bytes: usize,
-    pub response_buffer_threshold_bytes: usize,
+    pub response_buffer_cutoff_bytes: usize,
     pub h2_coalesce_target_bytes: usize,
     pub max_url_length_bytes: usize,
     pub max_query_params: usize,
@@ -545,7 +545,7 @@ impl ProxyState {
         let max_header_count = env_config.max_header_count;
         let max_request_body_size_bytes = env_config.max_request_body_size_bytes;
         let max_response_body_size_bytes = env_config.max_response_body_size_bytes;
-        let response_buffer_threshold_bytes = env_config.response_buffer_threshold_bytes;
+        let response_buffer_cutoff_bytes = env_config.response_buffer_cutoff_bytes;
         let h2_coalesce_target_bytes = env_config.h2_coalesce_target_bytes;
         let max_url_length_bytes = env_config.max_url_length_bytes;
         let max_query_params = env_config.max_query_params;
@@ -740,7 +740,7 @@ impl ProxyState {
             max_header_count,
             max_request_body_size_bytes,
             max_response_body_size_bytes,
-            response_buffer_threshold_bytes,
+            response_buffer_cutoff_bytes,
             h2_coalesce_target_bytes,
             max_url_length_bytes,
             max_query_params,
@@ -4743,7 +4743,7 @@ async fn handle_proxy_request_inner(
                 (result, grpc_req_body)
             }
         } else {
-            // Fast path: combined collect+dispatch (no plugin body hooks needed)
+            // Fast path: no plugin body hooks needed
             let request = match client_request_body {
                 ClientRequestBody::Streaming(request) => *request,
                 ClientRequestBody::Buffered(_) => {
@@ -4754,17 +4754,34 @@ async fn handle_proxy_request_inner(
                     ));
                 }
             };
-            grpc_proxy::proxy_grpc_request(
-                request,
-                &proxy,
-                &grpc_backend_url,
-                &state.grpc_pool,
-                &state.dns_cache,
-                proxy_headers,
-                grpc_should_stream,
-                state.max_grpc_recv_size_bytes,
-            )
-            .await
+            if grpc_should_stream {
+                // Streaming fast path: forward request body frame-by-frame
+                // without collecting. No retries possible, no body plugins.
+                let result = grpc_proxy::proxy_grpc_request_streaming(
+                    request,
+                    &proxy,
+                    &grpc_backend_url,
+                    &state.grpc_pool,
+                    &state.dns_cache,
+                    proxy_headers,
+                    state.max_grpc_recv_size_bytes,
+                )
+                .await;
+                (result, Bytes::new())
+            } else {
+                // Buffered path: collect body for potential retries
+                grpc_proxy::proxy_grpc_request(
+                    request,
+                    &proxy,
+                    &grpc_backend_url,
+                    &state.grpc_pool,
+                    &state.dns_cache,
+                    proxy_headers,
+                    grpc_should_stream,
+                    state.max_grpc_recv_size_bytes,
+                )
+                .await
+            }
         };
 
         // Only build retry parts when retries are configured
@@ -4914,6 +4931,26 @@ async fn handle_proxy_request_inner(
                     plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
                 }
 
+                // Check if the streaming request body exceeded the size limit
+                // BEFORE logging — otherwise the transaction summary captures a
+                // success status while we're about to return RESOURCE_EXHAUSTED.
+                let body_exceeded = grpc_streaming
+                    .request_body_exceeded
+                    .as_ref()
+                    .is_some_and(|f| f.load(std::sync::atomic::Ordering::Acquire));
+
+                // Determine the final status for logging and metrics.
+                let final_status = if body_exceeded {
+                    200_u16
+                } else {
+                    grpc_streaming.status
+                };
+                let final_error_class: Option<retry::ErrorClass> = if body_exceeded {
+                    Some(retry::ErrorClass::RequestBodyTooLarge)
+                } else {
+                    None
+                };
+
                 let total_ms = start_time.elapsed().as_secs_f64() * 1000.0;
                 let plugin_execution_ms = plugin_execution_ns as f64 / 1_000_000.0;
                 let plugin_external_io_ms =
@@ -4945,7 +4982,7 @@ async fn handle_proxy_request_inner(
                         matched_proxy_name: proxy.name.clone(),
                         backend_target_url: Some(strip_query_params(&grpc_backend_url).to_string()),
                         backend_resolved_ip: grpc_resolved_ip,
-                        response_status_code: grpc_streaming.status,
+                        response_status_code: final_status,
                         latency_total_ms: total_ms,
                         latency_gateway_processing_ms: gateway_processing_ms,
                         latency_backend_ttfb_ms: backend_total_ms,
@@ -4954,13 +4991,21 @@ async fn handle_proxy_request_inner(
                         latency_plugin_external_io_ms: plugin_external_io_ms,
                         latency_gateway_overhead_ms: gateway_overhead_ms,
                         request_user_agent: ctx.headers.get("user-agent").cloned(),
-                        response_streamed: true,
+                        response_streamed: !body_exceeded,
                         client_disconnected: false,
-                        error_class: None,
+                        error_class: final_error_class,
                         mirror: false,
                         metadata: ctx.metadata.clone(),
                     };
                     crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
+                }
+
+                if body_exceeded {
+                    record_request(&state, 200);
+                    return Ok(grpc_proxy::build_grpc_error_response(
+                        grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
+                        "gRPC request payload size exceeds maximum",
+                    ));
                 }
 
                 record_request(&state, grpc_streaming.status);
@@ -4977,13 +5022,17 @@ async fn handle_proxy_request_inner(
                         resp_builder = resp_builder.header(name, val);
                     }
                 }
+                // For bidi/client-streaming RPCs where the request body is still
+                // sending: GrpcBody::Streaming returns an error when exceeded,
+                // which causes hyper to RST_STREAM the request. The backend then
+                // resets the response stream, and the Incoming response body
+                // naturally propagates the h2 error to the client.
 
                 // Stream H2 DATA frames on the gRPC streaming path.
-                // Fast path: skip coalescing when no size limits or threshold configured.
                 let cl = response_headers
                     .get("content-length")
                     .and_then(|v| v.parse::<u64>().ok());
-                let body = if state.response_buffer_threshold_bytes == 0
+                let body = if state.response_buffer_cutoff_bytes == 0
                     && state.max_response_body_size_bytes == 0
                 {
                     crate::proxy::body::direct_streaming_h2_body(grpc_streaming.body, cl)
@@ -5349,13 +5398,27 @@ async fn handle_proxy_request_inner(
     }
 
     // Determine response body mode: stream by default, buffer when required.
-    // A plugin that needs the full body (e.g., response body transformation)
-    // forces buffering regardless of the proxy configuration.
+    // Two-tier check mirroring request body buffering:
+    //   1. Config-time: does any plugin on this proxy potentially need buffering?
+    //   2. Per-request: does any plugin need buffering for THIS specific request?
+    // This lets plugins skip buffering when the request context makes it
+    // irrelevant (e.g., compression when Accept-Encoding is absent).
     let should_stream = match proxy.response_body_mode {
         ResponseBodyMode::Buffer => false,
-        ResponseBodyMode::Stream => !state
-            .plugin_cache
-            .requires_response_body_buffering(&proxy.id),
+        ResponseBodyMode::Stream => {
+            let maybe_requires = state
+                .plugin_cache
+                .requires_response_body_buffering(&proxy.id);
+            if maybe_requires {
+                // Per-request refinement: check if any plugin actually needs
+                // buffering for this specific request.
+                !plugins
+                    .iter()
+                    .any(|plugin| plugin.should_buffer_response_body(&ctx))
+            } else {
+                true
+            }
+        }
     };
 
     // Determine if we can stream the request body to the backend without
@@ -5533,7 +5596,7 @@ async fn handle_proxy_request_inner(
     // so we mark total as unknown (-1.0) to avoid silently reporting TTFB as total.
     let is_streaming_response = matches!(
         &response_body,
-        ResponseBody::Streaming(_) | ResponseBody::StreamingH2(_)
+        ResponseBody::Streaming(_) | ResponseBody::StreamingH2(_) | ResponseBody::StreamingH3(_)
     );
     let backend_total_ms = if is_streaming_response {
         -1.0
@@ -5805,7 +5868,22 @@ async fn handle_proxy_request_inner(
     // Default (false): streaming responses pass through with zero tracking overhead.
     let body = match response_body {
         ResponseBody::Streaming(resp) if state.env_config.enable_streaming_latency_tracking => {
-            let (tracked_body, metrics) = ProxyBody::streaming_tracked(resp, backend_start);
+            let cl = response_headers
+                .get("content-length")
+                .and_then(|v| v.parse::<u64>().ok());
+            // When size limits are configured and Content-Length is absent, apply
+            // size-limited streaming before latency tracking to prevent unbounded
+            // transfer for chunked/unknown-length responses.
+            let (tracked_body, metrics) = if state.max_response_body_size_bytes > 0 && cl.is_none()
+            {
+                ProxyBody::streaming_tracked_with_size_limit(
+                    resp,
+                    backend_start,
+                    state.max_response_body_size_bytes,
+                )
+            } else {
+                ProxyBody::streaming_tracked(resp, backend_start)
+            };
 
             // Spawn a lightweight deferred task to log the final streaming latency.
             // Wakes once after read_timeout + 5s buffer, reads one atomic, emits one log line.
@@ -5840,11 +5918,18 @@ async fn handle_proxy_request_inner(
                 .get("content-length")
                 .and_then(|v| v.parse::<u64>().ok());
             // Fast path: skip coalescing when no plugins need body buffering,
-            // no size limits apply, and response buffer threshold is disabled.
+            // no size limits apply, and response buffer cutoff is disabled.
             // This eliminates per-frame BytesMut buffering and branch overhead.
-            if state.response_buffer_threshold_bytes == 0 && state.max_response_body_size_bytes == 0
-            {
+            if state.response_buffer_cutoff_bytes == 0 && state.max_response_body_size_bytes == 0 {
                 crate::proxy::body::direct_streaming_body(resp, cl)
+            } else if state.max_response_body_size_bytes > 0 && cl.is_none() {
+                // No Content-Length — enforce size limit while streaming instead
+                // of buffering the entire body into memory.
+                crate::proxy::body::size_limited_streaming_body(
+                    resp,
+                    state.max_response_body_size_bytes,
+                    cl,
+                )
             } else {
                 crate::proxy::body::coalescing_body(resp, cl)
             }
@@ -5853,12 +5938,25 @@ async fn handle_proxy_request_inner(
             let cl = response_headers
                 .get("content-length")
                 .and_then(|v| v.parse::<u64>().ok());
-            if state.response_buffer_threshold_bytes == 0 && state.max_response_body_size_bytes == 0
-            {
+            if state.response_buffer_cutoff_bytes == 0 && state.max_response_body_size_bytes == 0 {
                 crate::proxy::body::direct_streaming_h2_body(resp.into_body(), cl)
             } else {
                 crate::proxy::body::coalescing_h2_body(
                     resp.into_body(),
+                    cl,
+                    state.h2_coalesce_target_bytes,
+                )
+            }
+        }
+        ResponseBody::StreamingH3(h3_resp) => {
+            let cl = response_headers
+                .get("content-length")
+                .and_then(|v| v.parse::<u64>().ok());
+            if state.response_buffer_cutoff_bytes == 0 && state.max_response_body_size_bytes == 0 {
+                crate::proxy::body::direct_streaming_h3_body(h3_resp.recv_stream, cl)
+            } else {
+                crate::proxy::body::coalescing_h3_body(
+                    h3_resp.recv_stream,
                     cl,
                     state.h2_coalesce_target_bytes,
                 )
@@ -6113,19 +6211,19 @@ async fn proxy_to_backend_retry(
             let mut resp_headers = HashMap::with_capacity(response.headers().keys_len());
             collect_response_headers(response.headers(), &mut resp_headers);
             if stream_response {
-                // Buffer moderate-sized bodies to avoid streaming overhead
+                // Buffer small responses eagerly: a single `bytes().await`
+                // allocation is cheaper than the async coalescing adapter for
+                // typical JSON API payloads. Skip buffering for SSE (unbounded
+                // streams) and responses without Content-Length (unknown size).
                 let content_length = response
                     .headers()
                     .get("content-length")
                     .and_then(|v| v.to_str().ok())
                     .and_then(|v| v.parse::<usize>().ok());
-                let threshold = state.response_buffer_threshold_bytes;
-                // Only buffer bodies >= 256 KB where async iteration overhead
-                // dominates. Smaller bodies benefit from streaming's read-write
-                // pipelining (first chunk sent to client while second is read).
-                const BUFFER_MIN: usize = 256 * 1024;
-                if threshold > 0
-                    && content_length.is_some_and(|cl| cl >= BUFFER_MIN && cl <= threshold)
+                let cutoff = state.response_buffer_cutoff_bytes;
+                if cutoff > 0
+                    && content_length.is_some_and(|cl| cl <= cutoff)
+                    && !is_streaming_content_type(&resp_headers)
                 {
                     match response.bytes().await {
                         Ok(b) => retry::BackendResponse {
@@ -6260,10 +6358,9 @@ async fn proxy_to_backend(
         .ok()
         .map(|ip| ip.to_string());
 
-    // Handle HTTP/3 backend requests differently (always buffered — h3 crate
-    // doesn't expose a streaming body API compatible with reqwest::Response)
+    // Handle HTTP/3 backend requests — streaming when possible, buffered for retries.
     if matches!(proxy.backend_protocol, BackendProtocol::H3) {
-        let (backend_resp, body_bytes) = proxy_to_backend_http3(
+        let (mut backend_resp, body_bytes) = proxy_to_backend_http3(
             state,
             proxy,
             backend_url,
@@ -6274,8 +6371,14 @@ async fn proxy_to_backend(
             upstream_target,
             client_ip,
             retain_request_body,
+            stream_response,
         )
         .await;
+        // For streaming H3 responses, move headers from the H3StreamingResponse
+        // into the BackendResponse headers map (avoids cloning all key/value strings).
+        if let ResponseBody::StreamingH3(ref mut h3_resp) = backend_resp.body {
+            backend_resp.headers = std::mem::take(&mut h3_resp.headers);
+        }
         // Merge resolved_ip into the response (h3 function resolves its own IP
         // but the outer resolved_ip is already computed from DNS cache above)
         let resp = retry::BackendResponse {
@@ -6636,19 +6739,13 @@ async fn proxy_to_backend(
                 }
 
                 // When streaming is requested and Content-Length is present and within
-                // limits, we can safely stream. If there's no Content-Length we must
-                // buffer to enforce the size limit.
-                //
-                // Optimization: when the body is under the buffer threshold, collect
-                // it into a single allocation (avoids async frame-by-frame overhead).
+                // limits, we can stream. Buffer small bodies eagerly (cheaper than
+                // async coalescing). Skip buffering for SSE (unbounded streams).
                 if stream_response && content_length.is_some() {
-                    let threshold = state.response_buffer_threshold_bytes;
-                    // Only buffer bodies >= 256 KB where async iteration overhead
-                    // dominates. Smaller bodies benefit from streaming's read-write
-                    // pipelining (first chunk sent to client while second is read).
-                    const BUFFER_MIN: usize = 256 * 1024;
-                    if threshold > 0
-                        && content_length.is_some_and(|cl| cl >= BUFFER_MIN && cl <= threshold)
+                    let cutoff = state.response_buffer_cutoff_bytes;
+                    if cutoff > 0
+                        && content_length.is_some_and(|cl| cl <= cutoff)
+                        && !is_streaming_content_type(&resp_headers)
                     {
                         let body = match response.bytes().await {
                             Ok(b) => b.to_vec(),
@@ -6682,7 +6779,24 @@ async fn proxy_to_backend(
                     );
                 }
 
-                // Buffer: stream-collect with size limit
+                // No Content-Length — stream with coalescing. The response size
+                // limit is still enforced via the `SizeLimitedStreamingResponse`
+                // adapter applied at the response body builder stage.
+                if stream_response {
+                    return (
+                        retry::BackendResponse {
+                            status_code: status,
+                            body: ResponseBody::Streaming(response),
+                            headers: resp_headers,
+                            connection_error: false,
+                            backend_resolved_ip: resolved_ip.clone(),
+                            error_class: None,
+                        },
+                        retained_body,
+                    );
+                }
+
+                // Buffered mode: stream-collect with size limit
                 let max_size = state.max_response_body_size_bytes;
                 match collect_response_with_limit(response, max_size).await {
                     Ok((resp_body, _)) => retry::BackendResponse {
@@ -6703,21 +6817,18 @@ async fn proxy_to_backend(
                     },
                 }
             } else if stream_response {
-                // No size limit and streaming requested — pass through directly.
-                // Optimization: buffer moderate-sized bodies with known Content-Length
-                // to avoid async frame-by-frame iteration overhead.
+                // No size limit — stream directly. Buffer small bodies eagerly
+                // when Content-Length is known and below the cutoff (cheaper than
+                // async coalescing). Skip buffering for SSE (unbounded streams).
                 let content_length = response
                     .headers()
                     .get("content-length")
                     .and_then(|v| v.to_str().ok())
                     .and_then(|v| v.parse::<usize>().ok());
-                let threshold = state.response_buffer_threshold_bytes;
-                // Only buffer bodies >= 256 KB where async iteration overhead
-                // dominates. Smaller bodies benefit from streaming's read-write
-                // pipelining (first chunk sent to client while second is read).
-                const BUFFER_MIN: usize = 256 * 1024;
-                if threshold > 0
-                    && content_length.is_some_and(|cl| cl >= BUFFER_MIN && cl <= threshold)
+                let cutoff = state.response_buffer_cutoff_bytes;
+                if cutoff > 0
+                    && content_length.is_some_and(|cl| cl <= cutoff)
+                    && !is_streaming_content_type(&resp_headers)
                 {
                     match response.bytes().await {
                         Ok(b) => retry::BackendResponse {
@@ -6831,6 +6942,16 @@ async fn proxy_to_backend(
     };
 
     (response, retained_body)
+}
+
+/// Returns `true` for response content types that represent inherently unbounded
+/// or latency-sensitive streams and should never be eagerly buffered regardless
+/// of Content-Length. Currently covers SSE (`text/event-stream`).
+#[inline]
+fn is_streaming_content_type(resp_headers: &HashMap<String, String>) -> bool {
+    resp_headers.get("content-type").is_some_and(|ct| {
+        ct.len() >= 17 && ct.as_bytes()[..17].eq_ignore_ascii_case(b"text/event-stream")
+    })
 }
 
 /// Collect a response body with a size limit, returning Err with error body if exceeded.
@@ -7369,6 +7490,7 @@ async fn proxy_to_backend_http3(
     upstream_target: Option<&UpstreamTarget>,
     client_ip: &str,
     retain_request_body: bool,
+    stream_response: bool,
 ) -> (retry::BackendResponse, Option<Vec<u8>>) {
     debug!(proxy_id = %proxy.id, backend_url = %backend_url, "Proxying request to HTTP/3 backend");
 
@@ -7549,77 +7671,156 @@ async fn proxy_to_backend_http3(
     }
 
     // Make HTTP/3 request via connection pool (reuses QUIC connections).
-    // When an upstream target is specified, use it for target-aware pool keying.
+    // When streaming is enabled, use request_streaming to avoid buffering
+    // the entire response body in memory.
     let connection_pool = state.connection_pool.clone();
     let proxy_clone = proxy.clone();
-    let h3_result = if let Some(target) = upstream_target {
-        let target_host = target.host.clone();
-        let target_port = target.port;
-        state
-            .h3_pool
-            .request_with_target(
-                proxy,
-                &target_host,
-                target_port,
-                method,
-                backend_url,
-                &http3_headers,
-                request_body.into(),
-                move || connection_pool.get_tls_config_for_backend(&proxy_clone),
-            )
-            .await
-    } else {
-        state
-            .h3_pool
-            .request(
-                proxy,
-                method,
-                backend_url,
-                &http3_headers,
-                request_body.into(),
-                move || connection_pool.get_tls_config_for_backend(&proxy_clone),
-            )
-            .await
-    };
+    let body_bytes: bytes::Bytes = request_body.into();
 
-    match h3_result {
-        Ok(response) => {
-            debug!(proxy_id = %proxy.id, status = response.0, "HTTP/3 backend request successful");
-            (
-                retry::BackendResponse {
-                    status_code: response.0,
-                    body: ResponseBody::Buffered(response.1),
-                    headers: response.2,
-                    connection_error: false,
-                    backend_resolved_ip: resolved_ip,
-                    error_class: None,
-                },
-                retained_body,
-            )
+    if stream_response {
+        // Streaming path: return StreamingH3 with the recv_stream still open.
+        // When an upstream target is specified, use target-aware pool keying.
+        let h3_result = if let Some(target) = upstream_target {
+            let target_host = target.host.clone();
+            let target_port = target.port;
+            state
+                .h3_pool
+                .request_with_target_streaming(
+                    proxy,
+                    &target_host,
+                    target_port,
+                    method,
+                    backend_url,
+                    &http3_headers,
+                    body_bytes,
+                    move || connection_pool.get_tls_config_for_backend(&proxy_clone),
+                )
+                .await
+        } else {
+            state
+                .h3_pool
+                .request_streaming(
+                    proxy,
+                    method,
+                    backend_url,
+                    &http3_headers,
+                    body_bytes,
+                    move || connection_pool.get_tls_config_for_backend(&proxy_clone),
+                )
+                .await
+        };
+
+        match h3_result {
+            Ok(response) => {
+                debug!(proxy_id = %proxy.id, status = response.status, "HTTP/3 backend streaming request successful");
+                (
+                    retry::BackendResponse {
+                        status_code: response.status,
+                        body: ResponseBody::StreamingH3(Box::new(response)),
+                        headers: HashMap::new(), // headers extracted by caller from StreamingH3
+                        connection_error: false,
+                        backend_resolved_ip: resolved_ip,
+                        error_class: None,
+                    },
+                    retained_body,
+                )
+            }
+            Err(e) => {
+                let error_str = e.to_string();
+                let (error_kind, is_conn_error, error_class) = classify_h3_error(&error_str);
+                error!(
+                    proxy_id = %proxy.id,
+                    backend_url = %backend_url,
+                    error_kind = error_kind,
+                    error = %e,
+                    "HTTP/3 backend streaming request failed"
+                );
+                (
+                    retry::BackendResponse {
+                        status_code: 502,
+                        body: ResponseBody::Buffered(
+                            r#"{"error":"HTTP/3 backend request failed"}"#.as_bytes().to_vec(),
+                        ),
+                        headers: HashMap::new(),
+                        connection_error: is_conn_error,
+                        backend_resolved_ip: resolved_ip,
+                        error_class: Some(error_class),
+                    },
+                    retained_body,
+                )
+            }
         }
-        Err(e) => {
-            let error_str = e.to_string();
-            let (error_kind, is_conn_error, error_class) = classify_h3_error(&error_str);
-            error!(
-                proxy_id = %proxy.id,
-                backend_url = %backend_url,
-                error_kind = error_kind,
-                error = %e,
-                "HTTP/3 backend request failed"
-            );
-            (
-                retry::BackendResponse {
-                    status_code: 502,
-                    body: ResponseBody::Buffered(
-                        r#"{"error":"HTTP/3 backend request failed"}"#.as_bytes().to_vec(),
-                    ),
-                    headers: HashMap::new(),
-                    connection_error: is_conn_error,
-                    backend_resolved_ip: resolved_ip,
-                    error_class: Some(error_class),
-                },
-                retained_body,
-            )
+    } else {
+        // Buffered path: collect entire response body
+        let h3_result = if let Some(target) = upstream_target {
+            let target_host = target.host.clone();
+            let target_port = target.port;
+            state
+                .h3_pool
+                .request_with_target(
+                    proxy,
+                    &target_host,
+                    target_port,
+                    method,
+                    backend_url,
+                    &http3_headers,
+                    body_bytes,
+                    move || connection_pool.get_tls_config_for_backend(&proxy_clone),
+                )
+                .await
+        } else {
+            state
+                .h3_pool
+                .request(
+                    proxy,
+                    method,
+                    backend_url,
+                    &http3_headers,
+                    body_bytes,
+                    move || connection_pool.get_tls_config_for_backend(&proxy_clone),
+                )
+                .await
+        };
+
+        match h3_result {
+            Ok(response) => {
+                debug!(proxy_id = %proxy.id, status = response.0, "HTTP/3 backend request successful");
+                (
+                    retry::BackendResponse {
+                        status_code: response.0,
+                        body: ResponseBody::Buffered(response.1),
+                        headers: response.2,
+                        connection_error: false,
+                        backend_resolved_ip: resolved_ip,
+                        error_class: None,
+                    },
+                    retained_body,
+                )
+            }
+            Err(e) => {
+                let error_str = e.to_string();
+                let (error_kind, is_conn_error, error_class) = classify_h3_error(&error_str);
+                error!(
+                    proxy_id = %proxy.id,
+                    backend_url = %backend_url,
+                    error_kind = error_kind,
+                    error = %e,
+                    "HTTP/3 backend request failed"
+                );
+                (
+                    retry::BackendResponse {
+                        status_code: 502,
+                        body: ResponseBody::Buffered(
+                            r#"{"error":"HTTP/3 backend request failed"}"#.as_bytes().to_vec(),
+                        ),
+                        headers: HashMap::new(),
+                        connection_error: is_conn_error,
+                        backend_resolved_ip: resolved_ip,
+                        error_class: Some(error_class),
+                    },
+                    retained_body,
+                )
+            }
         }
     }
 }

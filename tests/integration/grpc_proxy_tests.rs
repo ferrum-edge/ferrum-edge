@@ -130,7 +130,7 @@ fn create_test_env_config() -> ferrum_edge::config::EnvConfig {
         max_single_header_size_bytes: 16384,
         max_request_body_size_bytes: 10_485_760,
         max_response_body_size_bytes: 10_485_760,
-        response_buffer_threshold_bytes: 2_097_152,
+        response_buffer_cutoff_bytes: 65_536,
         h2_coalesce_target_bytes: 131_072,
         dns_ttl_override: None,
         dns_overrides: HashMap::new(),

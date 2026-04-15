@@ -209,6 +209,39 @@ impl ProxyBody {
             metrics,
         )
     }
+
+    /// Create a streaming body with both completion tracking and frame-by-frame
+    /// size enforcement. Used when `enable_streaming_latency_tracking=true` AND
+    /// `max_response_body_size_bytes > 0` AND Content-Length is absent.
+    pub fn streaming_tracked_with_size_limit(
+        response: reqwest::Response,
+        baseline: Instant,
+        max_bytes: usize,
+    ) -> (Self, Arc<StreamingMetrics>) {
+        use futures_util::StreamExt;
+
+        let metrics = Arc::new(StreamingMetrics::new(baseline));
+
+        let stream = response.bytes_stream().map(|result| {
+            result
+                .map(Frame::data)
+                .map_err(|e| Box::new(e) as ProxyBodyError)
+        });
+        let limited = SizeLimitedStreamingResponse {
+            inner: stream,
+            max_bytes,
+            bytes_seen: 0,
+        };
+        let inner = Box::pin(StreamBody::new(limited));
+        let tracked = TrackedBody::new(inner, Arc::clone(&metrics));
+        (
+            Self {
+                kind: ProxyBodyKind::Tracked(tracked),
+                _request_guard: None,
+            },
+            metrics,
+        )
+    }
 }
 
 impl http_body::Body for ProxyBody {
@@ -373,6 +406,79 @@ impl http_body::Body for SizeLimitedIncoming {
 
     fn size_hint(&self) -> http_body::SizeHint {
         self.inner.size_hint()
+    }
+}
+
+// -- SizeLimitedStreamingResponse ---------------------------------------------
+
+/// A size-limited streaming adapter over a reqwest response byte stream.
+///
+/// Wraps a reqwest response's `bytes_stream()` and counts bytes as they flow
+/// through. If the accumulated size exceeds `max_bytes`, yields an error frame.
+/// This allows streaming response bodies to the client while still enforcing
+/// `max_response_body_size_bytes` without buffering the entire body into memory.
+///
+/// Used when Content-Length is absent (chunked/unknown size) and a response
+/// size limit is configured. Without this, the entire response would be
+/// buffered via `collect_response_with_limit()` to enforce the limit.
+pub(crate) struct SizeLimitedStreamingResponse<S> {
+    inner: S,
+    max_bytes: usize,
+    bytes_seen: usize,
+}
+
+/// Wraps a reqwest response into a size-limited coalescing body.
+///
+/// Applies both size limiting and chunk coalescing (128 KB target) in a single
+/// adapter chain. The size limiter sits outside the coalescer so the byte count
+/// reflects the actual backend payload, not coalesced chunks.
+pub(crate) fn size_limited_streaming_body(
+    response: reqwest::Response,
+    max_bytes: usize,
+    content_length: Option<u64>,
+) -> ProxyBody {
+    use futures_util::StreamExt;
+
+    let stream = response.bytes_stream().map(|r| {
+        r.map(Frame::data)
+            .map_err(|e| Box::new(e) as ProxyBodyError)
+    });
+    let limited = SizeLimitedStreamingResponse {
+        inner: stream,
+        max_bytes,
+        bytes_seen: 0,
+    };
+    // Wrap in coalescing adapter for efficient frame batching.
+    let coalescing = CoalescingBody {
+        inner: limited,
+        buffer: BytesMut::new(),
+        done: false,
+        stashed_error: None,
+        content_length,
+    };
+    ProxyBody::streaming(Box::pin(coalescing))
+}
+
+impl<S> futures_util::Stream for SizeLimitedStreamingResponse<S>
+where
+    S: futures_util::Stream<Item = Result<Frame<Bytes>, ProxyBodyError>> + Unpin,
+{
+    type Item = Result<Frame<Bytes>, ProxyBodyError>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        match Pin::new(&mut this.inner).poll_next(cx) {
+            Poll::Ready(Some(Ok(frame))) => {
+                if let Some(data) = frame.data_ref() {
+                    this.bytes_seen += data.len();
+                    if this.bytes_seen > this.max_bytes {
+                        return Poll::Ready(Some(Err("response body exceeds maximum size".into())));
+                    }
+                }
+                Poll::Ready(Some(Ok(frame)))
+            }
+            other => other,
+        }
     }
 }
 
@@ -784,6 +890,189 @@ impl http_body::Body for CoalescingH2Body {
             && self.buffer.is_empty()
             && self.stashed_trailer.is_none()
             && self.stashed_error.is_none()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        if let Some(len) = self.content_length {
+            http_body::SizeHint::with_exact(len)
+        } else {
+            http_body::SizeHint::default()
+        }
+    }
+}
+
+// -- CoalescingH3Body ---------------------------------------------------------
+
+/// A response body adapter that reads chunks from an h3 `RequestStream` and
+/// coalesces them into larger frames before yielding.
+///
+/// Follows the same pattern as [`CoalescingH2Body`] — small chunks are buffered
+/// until reaching the coalesce target, large chunks pass through directly.
+/// Unlike H2, h3 `RequestStream` uses an async `recv_data()` method rather
+/// than implementing `http_body::Body`, so this adapter bridges the API gap.
+pub(crate) struct CoalescingH3Body {
+    recv_stream: crate::http3::client::H3RequestStream,
+    buffer: BytesMut,
+    done: bool,
+    /// Error stashed while flushing buffered data. Returned on the next
+    /// `poll_frame` call after the buffer has been drained, preventing
+    /// silent response truncation.
+    stashed_error: Option<ProxyBodyError>,
+    content_length: Option<u64>,
+    coalesce_target: usize,
+}
+
+/// Wraps an h3 `RequestStream` into a coalescing streaming body.
+///
+/// `content_length` should be the value of the backend's Content-Length header
+/// (if present) so the adapter can propagate an exact size hint.
+pub(crate) fn coalescing_h3_body(
+    recv_stream: crate::http3::client::H3RequestStream,
+    content_length: Option<u64>,
+    coalesce_target: usize,
+) -> ProxyBody {
+    let body = CoalescingH3Body {
+        recv_stream,
+        buffer: BytesMut::new(),
+        done: false,
+        stashed_error: None,
+        content_length,
+        coalesce_target,
+    };
+    ProxyBody::streaming(Box::pin(body))
+}
+
+/// Wraps an h3 `RequestStream` into a direct streaming body without coalescing.
+pub(crate) fn direct_streaming_h3_body(
+    recv_stream: crate::http3::client::H3RequestStream,
+    content_length: Option<u64>,
+) -> ProxyBody {
+    let body = DirectH3Body {
+        recv_stream,
+        content_length,
+    };
+    ProxyBody::streaming(Box::pin(body))
+}
+
+/// Zero-overhead streaming body that passes h3 response data directly without
+/// coalescing. Used on the fast path when no plugins need body buffering.
+struct DirectH3Body {
+    recv_stream: crate::http3::client::H3RequestStream,
+    content_length: Option<u64>,
+}
+
+impl http_body::Body for DirectH3Body {
+    type Data = Bytes;
+    type Error = ProxyBodyError;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        use bytes::Buf;
+        let this = self.get_mut();
+        let mut fut = std::pin::pin!(this.recv_stream.recv_data());
+        match fut.as_mut().poll(cx) {
+            Poll::Ready(Ok(Some(mut buf))) => {
+                let data = buf.copy_to_bytes(buf.remaining());
+                Poll::Ready(Some(Ok(Frame::data(data))))
+            }
+            Poll::Ready(Ok(None)) => Poll::Ready(None),
+            Poll::Ready(Err(e)) => Poll::Ready(Some(Err(Box::new(e) as ProxyBodyError))),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        false
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        if let Some(len) = self.content_length {
+            http_body::SizeHint::with_exact(len)
+        } else {
+            http_body::SizeHint::default()
+        }
+    }
+}
+
+impl http_body::Body for CoalescingH3Body {
+    type Data = Bytes;
+    type Error = ProxyBodyError;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        use bytes::Buf;
+        let this = self.get_mut();
+
+        if this.done {
+            // Flush any remaining buffered data after stream ended
+            if !this.buffer.is_empty() {
+                return Poll::Ready(Some(Ok(Frame::data(this.buffer.split().freeze()))));
+            }
+            // Return stashed error (set when an error arrived with buffered data).
+            if let Some(err) = this.stashed_error.take() {
+                return Poll::Ready(Some(Err(err)));
+            }
+            return Poll::Ready(None);
+        }
+
+        loop {
+            let mut fut = std::pin::pin!(this.recv_stream.recv_data());
+            match fut.as_mut().poll(cx) {
+                Poll::Ready(Ok(Some(mut buf))) => {
+                    let len = buf.remaining();
+                    if this.buffer.is_empty() && len >= this.coalesce_target {
+                        // Fast path: chunk already large enough — zero-copy passthrough.
+                        let data = buf.copy_to_bytes(len);
+                        return Poll::Ready(Some(Ok(Frame::data(data))));
+                    }
+                    // Coalescing path: copy directly from Buf into BytesMut,
+                    // avoiding an intermediate Bytes allocation.
+                    this.buffer.reserve(len);
+                    while buf.has_remaining() {
+                        let chunk = buf.chunk();
+                        this.buffer.extend_from_slice(chunk);
+                        buf.advance(chunk.len());
+                    }
+                    if this.buffer.len() >= this.coalesce_target {
+                        return Poll::Ready(Some(Ok(Frame::data(this.buffer.split().freeze()))));
+                    }
+                    continue;
+                }
+                Poll::Ready(Ok(None)) => {
+                    this.done = true;
+                    if !this.buffer.is_empty() {
+                        return Poll::Ready(Some(Ok(Frame::data(this.buffer.split().freeze()))));
+                    }
+                    return Poll::Ready(None);
+                }
+                Poll::Ready(Err(e)) => {
+                    this.done = true;
+                    // Flush any buffered data before surfacing the error so
+                    // already-received bytes aren't silently dropped. The
+                    // error is stashed and returned on the next poll_frame()
+                    // call after the buffer has been drained.
+                    if !this.buffer.is_empty() {
+                        this.stashed_error = Some(Box::new(e) as ProxyBodyError);
+                        return Poll::Ready(Some(Ok(Frame::data(this.buffer.split().freeze()))));
+                    }
+                    return Poll::Ready(Some(Err(Box::new(e) as ProxyBodyError)));
+                }
+                Poll::Pending => {
+                    if !this.buffer.is_empty() {
+                        return Poll::Ready(Some(Ok(Frame::data(this.buffer.split().freeze()))));
+                    }
+                    return Poll::Pending;
+                }
+            }
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.done && self.buffer.is_empty() && self.stashed_error.is_none()
     }
 
     fn size_hint(&self) -> http_body::SizeHint {

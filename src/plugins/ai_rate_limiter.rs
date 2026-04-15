@@ -490,6 +490,12 @@ impl Plugin for AiRateLimiter {
         true
     }
 
+    fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {
+        // Only buffer for POST requests — AI/LLM API calls that contain token
+        // usage in the response body. Method-only check covers multipart uploads.
+        ctx.method == "POST"
+    }
+
     fn applies_after_proxy_on_reject(&self) -> bool {
         true
     }

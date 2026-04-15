@@ -229,6 +229,11 @@ pub enum ResponseBody {
     /// Body from hyper's HTTP/2 client (used by Http2ConnectionPool for
     /// proper H2 stream multiplexing over persistent connections).
     StreamingH2(hyper::Response<hyper::body::Incoming>),
+    /// Body from the HTTP/3 (QUIC) backend via h3's `RequestStream`. The
+    /// response headers have been received; body chunks arrive via
+    /// `recv_data()`. This avoids buffering the entire H3 response when
+    /// streaming to HTTP/1.1 or HTTP/2 frontends.
+    StreamingH3(Box<crate::http3::client::H3StreamingResponse>),
 }
 
 /// Result of a backend request, carrying enough context for the retry
@@ -257,7 +262,9 @@ impl BackendResponse {
     pub fn body_bytes(&self) -> &[u8] {
         match &self.body {
             ResponseBody::Buffered(b) => b,
-            ResponseBody::Streaming(_) | ResponseBody::StreamingH2(_) => &[],
+            ResponseBody::Streaming(_)
+            | ResponseBody::StreamingH2(_)
+            | ResponseBody::StreamingH3(_) => &[],
         }
     }
 
@@ -267,7 +274,9 @@ impl BackendResponse {
     pub fn into_buffered_body(self) -> Vec<u8> {
         match self.body {
             ResponseBody::Buffered(b) => b,
-            ResponseBody::Streaming(_) | ResponseBody::StreamingH2(_) => {
+            ResponseBody::Streaming(_)
+            | ResponseBody::StreamingH2(_)
+            | ResponseBody::StreamingH3(_) => {
                 warn!("attempted to extract buffered body from a streaming response");
                 Vec::new()
             }
