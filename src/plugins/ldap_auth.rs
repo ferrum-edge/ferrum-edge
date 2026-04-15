@@ -379,7 +379,10 @@ impl LdapAuth {
                 return Err("ldap_auth: user not found".to_string());
             }
 
-            let entry = SearchEntry::construct(rs.into_iter().next().unwrap());
+            let entry =
+                SearchEntry::construct(rs.into_iter().next().ok_or_else(|| {
+                    "ldap_auth: user not found after non-empty check".to_string()
+                })?);
             let user_dn = entry.dn;
 
             // Unbind the service account, re-connect and bind as the user

@@ -95,6 +95,64 @@ fn start_gateway(
     Ok(cmd)
 }
 
+/// Wait for the gateway to become ready by probing the proxy port via TCP connect.
+async fn wait_for_gateway(gateway_port: u16) -> Result<(), Box<dyn std::error::Error>> {
+    let deadline = std::time::SystemTime::now() + Duration::from_secs(15);
+    let addr = format!("127.0.0.1:{}", gateway_port);
+
+    loop {
+        if std::time::SystemTime::now() >= deadline {
+            return Err("Gateway did not start within 15 seconds".into());
+        }
+        match tokio::net::TcpStream::connect(&addr).await {
+            Ok(_) => return Ok(()),
+            Err(_) => sleep(Duration::from_millis(300)).await,
+        }
+    }
+}
+
+/// Start the gateway with retry logic to handle ephemeral port races.
+///
+/// Each attempt allocates a fresh gateway port, starts the gateway subprocess,
+/// and waits for it to become healthy. On failure the process is killed and a
+/// new attempt is made with a different port. Panics only after all attempts
+/// are exhausted.
+async fn start_gateway_with_retry(config_path: &str) -> (std::process::Child, u16) {
+    const MAX_ATTEMPTS: u32 = 3;
+    let mut last_err = String::new();
+    for attempt in 1..=MAX_ATTEMPTS {
+        let gateway_port = free_port().await;
+        match start_gateway(config_path, gateway_port) {
+            Ok(mut child) => match wait_for_gateway(gateway_port).await {
+                Ok(()) => return (child, gateway_port),
+                Err(e) => {
+                    last_err = e.to_string();
+                    eprintln!(
+                        "Gateway startup attempt {}/{} failed (port {}): {}",
+                        attempt, MAX_ATTEMPTS, gateway_port, last_err
+                    );
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+            },
+            Err(e) => {
+                last_err = e.to_string();
+                eprintln!(
+                    "Gateway spawn attempt {}/{} failed: {}",
+                    attempt, MAX_ATTEMPTS, last_err
+                );
+            }
+        }
+        if attempt < MAX_ATTEMPTS {
+            sleep(Duration::from_secs(1)).await;
+        }
+    }
+    panic!(
+        "Gateway did not start after {} attempts: {}",
+        MAX_ATTEMPTS, last_err
+    );
+}
+
 fn write_ws_config_with_plugins(
     config_path: &std::path::Path,
     backend_port: u16,
@@ -134,7 +192,6 @@ plugin_configs:
 #[tokio::test]
 async fn test_ws_message_size_limiting_e2e() {
     let backend_port = free_port().await;
-    let gateway_port = free_port().await;
 
     let echo_handle = tokio::spawn(start_ws_echo_server(backend_port));
     sleep(Duration::from_millis(300)).await;
@@ -154,8 +211,7 @@ async fn test_ws_message_size_limiting_e2e() {
         r#"      - plugin_config_id: "ws-size-limit""#,
     );
 
-    let mut gateway = start_gateway(config_path.to_str().unwrap(), gateway_port).unwrap();
-    sleep(Duration::from_secs(3)).await;
+    let (mut gateway, gateway_port) = start_gateway_with_retry(config_path.to_str().unwrap()).await;
 
     // Connect
     let url = format!("ws://127.0.0.1:{}/ws-echo", gateway_port);
@@ -216,7 +272,6 @@ async fn test_ws_message_size_limiting_e2e() {
 #[tokio::test]
 async fn test_ws_frame_logging_e2e() {
     let backend_port = free_port().await;
-    let gateway_port = free_port().await;
 
     let echo_handle = tokio::spawn(start_ws_echo_server(backend_port));
     sleep(Duration::from_millis(300)).await;
@@ -238,8 +293,7 @@ async fn test_ws_frame_logging_e2e() {
         r#"      - plugin_config_id: "ws-logging""#,
     );
 
-    let mut gateway = start_gateway(config_path.to_str().unwrap(), gateway_port).unwrap();
-    sleep(Duration::from_secs(3)).await;
+    let (mut gateway, gateway_port) = start_gateway_with_retry(config_path.to_str().unwrap()).await;
 
     let url = format!("ws://127.0.0.1:{}/ws-echo", gateway_port);
     let (mut ws, _) = tokio_tungstenite::connect_async(&url)
@@ -279,7 +333,6 @@ async fn test_ws_frame_logging_e2e() {
 #[tokio::test]
 async fn test_ws_rate_limiting_e2e() {
     let backend_port = free_port().await;
-    let gateway_port = free_port().await;
 
     let echo_handle = tokio::spawn(start_ws_echo_server(backend_port));
     sleep(Duration::from_millis(300)).await;
@@ -303,8 +356,7 @@ async fn test_ws_rate_limiting_e2e() {
         r#"      - plugin_config_id: "ws-rate-limit""#,
     );
 
-    let mut gateway = start_gateway(config_path.to_str().unwrap(), gateway_port).unwrap();
-    sleep(Duration::from_secs(3)).await;
+    let (mut gateway, gateway_port) = start_gateway_with_retry(config_path.to_str().unwrap()).await;
 
     let url = format!("ws://127.0.0.1:{}/ws-echo", gateway_port);
     let (mut ws, _) = tokio_tungstenite::connect_async(&url)
@@ -388,7 +440,6 @@ async fn test_ws_rate_limiting_e2e() {
 #[tokio::test]
 async fn test_ws_combined_plugins_e2e() {
     let backend_port = free_port().await;
-    let gateway_port = free_port().await;
 
     let echo_handle = tokio::spawn(start_ws_echo_server(backend_port));
     sleep(Duration::from_millis(300)).await;
@@ -425,8 +476,7 @@ async fn test_ws_combined_plugins_e2e() {
       - plugin_config_id: "ws-rate-limit""#,
     );
 
-    let mut gateway = start_gateway(config_path.to_str().unwrap(), gateway_port).unwrap();
-    sleep(Duration::from_secs(3)).await;
+    let (mut gateway, gateway_port) = start_gateway_with_retry(config_path.to_str().unwrap()).await;
 
     let url = format!("ws://127.0.0.1:{}/ws-echo", gateway_port);
     let (mut ws, _) = tokio_tungstenite::connect_async(&url)

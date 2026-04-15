@@ -1059,6 +1059,19 @@ Reduce per-request allocations in plugin lookup
 | `FERRUM_POOL_WARMUP_ENABLED` | `true` | Pre-establish backend connections at startup after DNS warmup. Skipped for TCP/UDP |
 | `FERRUM_POOL_WARMUP_CONCURRENCY` | `500` | Maximum concurrent connection warmup attempts at startup |
 | `FERRUM_POOL_CLEANUP_INTERVAL_SECONDS` | `30` | Cleanup sweep interval for HTTP, gRPC, HTTP/2, HTTP/3 pools |
+| `FERRUM_POOL_MAX_IDLE_PER_HOST` | `64` | Maximum idle connections per backend host (min: 4, max: 1024) |
+| `FERRUM_POOL_IDLE_TIMEOUT_SECONDS` | `90` | Idle connection eviction timeout in seconds |
+| `FERRUM_POOL_ENABLE_HTTP_KEEP_ALIVE` | `true` | Enable HTTP keep-alive for backend connection reuse |
+| `FERRUM_POOL_ENABLE_HTTP2` | `true` | Enable HTTP/2 multiplexing when supported |
+| `FERRUM_POOL_HTTP2_CONNECTIONS_PER_HOST` | CPU cores (2-8) | HTTP/2 connections per backend host |
+| `FERRUM_POOL_TCP_KEEPALIVE_SECONDS` | `60` | TCP keep-alive interval in seconds for backend connections |
+| `FERRUM_POOL_HTTP2_KEEP_ALIVE_INTERVAL_SECONDS` | `30` | HTTP/2 keep-alive ping interval in seconds |
+| `FERRUM_POOL_HTTP2_KEEP_ALIVE_TIMEOUT_SECONDS` | `45` | HTTP/2 keep-alive ping timeout in seconds. Connection closed if no response |
+| `FERRUM_POOL_HTTP2_INITIAL_STREAM_WINDOW_SIZE` | `8388608` | HTTP/2 per-stream flow-control window in bytes (8 MiB). Clamped to 65535..128 MiB |
+| `FERRUM_POOL_HTTP2_INITIAL_CONNECTION_WINDOW_SIZE` | `33554432` | HTTP/2 connection-level flow-control window in bytes (32 MiB). Clamped to 65535..128 MiB |
+| `FERRUM_POOL_HTTP2_ADAPTIVE_WINDOW` | `true` | Enable adaptive flow-control window sizing based on observed throughput |
+| `FERRUM_POOL_HTTP2_MAX_FRAME_SIZE` | `1048576` | Maximum HTTP/2 frame payload in bytes (1 MiB). Clamped to 16384..1 MiB |
+| `FERRUM_POOL_HTTP2_MAX_CONCURRENT_STREAMS` | `1000` | Max concurrent HTTP/2 streams per backend connection |
 | `FERRUM_ROUTER_CACHE_MAX_ENTRIES` | `0` (auto) | Router prefix/negative lookup cache size. 0 = auto-scale as `max(10_000, proxies × 3)`. Set explicit value to cap memory. Min: 1,000, Max: 10,000,000 |
 | `FERRUM_TCP_IDLE_TIMEOUT_SECONDS` | `300` | Default TCP idle timeout (5 min). Per-proxy `tcp_idle_timeout_seconds` overrides. 0 = disabled |
 | `FERRUM_UDP_MAX_SESSIONS` | `10000` | Maximum concurrent UDP sessions per proxy |

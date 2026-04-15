@@ -76,7 +76,7 @@ pub mod _test_support {
         use crate::plugins::utils::http_client::PluginHttpClient;
         use crate::plugins::ws_rate_limiting::WsRateLimiting;
         WsRateLimiting::new(&serde_json::json!({}), PluginHttpClient::default())
-            .unwrap()
+            .expect("WsRateLimiting::new with empty config must succeed")
             .redis_connection_scope_key(proxy_id, connection_id)
     }
 

@@ -321,6 +321,7 @@ async fn send_grpc_request(
 }
 
 /// Wait for the gateway to start by attempting TCP connections.
+/// Returns Ok(()) on success, Err on timeout — does not panic.
 async fn wait_for_gateway(gateway_port: u16) -> Result<(), Box<dyn std::error::Error>> {
     let deadline = std::time::SystemTime::now() + Duration::from_secs(15);
     let addr = format!("127.0.0.1:{}", gateway_port);
@@ -336,6 +337,48 @@ async fn wait_for_gateway(gateway_port: u16) -> Result<(), Box<dyn std::error::E
     }
 }
 
+/// Start the gateway with retry logic to handle ephemeral port races.
+///
+/// Each attempt allocates a fresh gateway port, starts the gateway subprocess,
+/// and waits for it to become healthy. On failure the process is killed and a
+/// new attempt is made with a different port. Panics only after all attempts
+/// are exhausted.
+async fn start_gateway_with_retry(config_path: &str) -> (std::process::Child, u16) {
+    const MAX_ATTEMPTS: u32 = 3;
+    let mut last_err = String::new();
+    for attempt in 1..=MAX_ATTEMPTS {
+        let gateway_port = free_port().await;
+        match start_gateway(config_path, gateway_port) {
+            Ok(mut child) => match wait_for_gateway(gateway_port).await {
+                Ok(()) => return (child, gateway_port),
+                Err(e) => {
+                    last_err = e.to_string();
+                    eprintln!(
+                        "Gateway startup attempt {}/{} failed (port {}): {}",
+                        attempt, MAX_ATTEMPTS, gateway_port, last_err
+                    );
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+            },
+            Err(e) => {
+                last_err = e.to_string();
+                eprintln!(
+                    "Gateway spawn attempt {}/{} failed: {}",
+                    attempt, MAX_ATTEMPTS, last_err
+                );
+            }
+        }
+        if attempt < MAX_ATTEMPTS {
+            sleep(Duration::from_secs(1)).await;
+        }
+    }
+    panic!(
+        "Gateway did not start after {} attempts: {}",
+        MAX_ATTEMPTS, last_err
+    );
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -345,25 +388,18 @@ async fn wait_for_gateway(gateway_port: u16) -> Result<(), Box<dyn std::error::E
 #[ignore]
 #[tokio::test]
 async fn test_grpc_unary_echo_through_gateway() {
-    // Allocate ports
+    // Allocate backend port and start gRPC echo backend (holds the port)
     let backend_port = free_port().await;
-    let gateway_port = free_port().await;
-
-    // Start gRPC echo backend
     let echo_handle = start_grpc_echo_backend(backend_port).await;
     sleep(Duration::from_millis(300)).await;
 
-    // Write config and start gateway
+    // Write config and start gateway with retry logic for port races
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let config_path = temp_dir.path().join("config.yaml");
     write_grpc_config(&config_path, backend_port);
 
     build_gateway().expect("Failed to build gateway");
-    let mut gateway = start_gateway(config_path.to_str().unwrap(), gateway_port)
-        .expect("Failed to start gateway");
-    wait_for_gateway(gateway_port)
-        .await
-        .expect("Gateway did not become healthy");
+    let (mut gateway, gateway_port) = start_gateway_with_retry(config_path.to_str().unwrap()).await;
 
     // Send gRPC request through the gateway
     let gateway_addr = format!("127.0.0.1:{}", gateway_port);
@@ -422,8 +458,6 @@ async fn test_grpc_unary_echo_through_gateway() {
 #[tokio::test]
 async fn test_grpc_error_status_forwarding() {
     let backend_port = free_port().await;
-    let gateway_port = free_port().await;
-
     let echo_handle = start_grpc_echo_backend(backend_port).await;
     sleep(Duration::from_millis(300)).await;
 
@@ -432,11 +466,7 @@ async fn test_grpc_error_status_forwarding() {
     write_grpc_config(&config_path, backend_port);
 
     build_gateway().expect("Failed to build gateway");
-    let mut gateway = start_gateway(config_path.to_str().unwrap(), gateway_port)
-        .expect("Failed to start gateway");
-    wait_for_gateway(gateway_port)
-        .await
-        .expect("Gateway did not become healthy");
+    let (mut gateway, gateway_port) = start_gateway_with_retry(config_path.to_str().unwrap()).await;
 
     let gateway_addr = format!("127.0.0.1:{}", gateway_port);
 
@@ -477,8 +507,6 @@ async fn test_grpc_error_status_forwarding() {
 #[tokio::test]
 async fn test_grpc_metadata_forwarding() {
     let backend_port = free_port().await;
-    let gateway_port = free_port().await;
-
     let echo_handle = start_grpc_echo_backend(backend_port).await;
     sleep(Duration::from_millis(300)).await;
 
@@ -487,11 +515,7 @@ async fn test_grpc_metadata_forwarding() {
     write_grpc_config(&config_path, backend_port);
 
     build_gateway().expect("Failed to build gateway");
-    let mut gateway = start_gateway(config_path.to_str().unwrap(), gateway_port)
-        .expect("Failed to start gateway");
-    wait_for_gateway(gateway_port)
-        .await
-        .expect("Gateway did not become healthy");
+    let (mut gateway, gateway_port) = start_gateway_with_retry(config_path.to_str().unwrap()).await;
 
     let gateway_addr = format!("127.0.0.1:{}", gateway_port);
 
@@ -532,8 +556,6 @@ async fn test_grpc_metadata_forwarding() {
 #[tokio::test]
 async fn test_grpc_backend_unavailable() {
     let backend_port = free_port().await; // For config, but we also need the unavailable proxy
-    let gateway_port = free_port().await;
-
     // Start a real backend for the config (needed for other proxies in config)
     let echo_handle = start_grpc_echo_backend(backend_port).await;
     sleep(Duration::from_millis(300)).await;
@@ -543,11 +565,7 @@ async fn test_grpc_backend_unavailable() {
     write_grpc_config(&config_path, backend_port);
 
     build_gateway().expect("Failed to build gateway");
-    let mut gateway = start_gateway(config_path.to_str().unwrap(), gateway_port)
-        .expect("Failed to start gateway");
-    wait_for_gateway(gateway_port)
-        .await
-        .expect("Gateway did not become healthy");
+    let (mut gateway, gateway_port) = start_gateway_with_retry(config_path.to_str().unwrap()).await;
 
     let gateway_addr = format!("127.0.0.1:{}", gateway_port);
 
@@ -579,8 +597,6 @@ async fn test_grpc_backend_unavailable() {
 #[tokio::test]
 async fn test_grpc_no_strip_listen_path() {
     let backend_port = free_port().await;
-    let gateway_port = free_port().await;
-
     let echo_handle = start_grpc_echo_backend(backend_port).await;
     sleep(Duration::from_millis(300)).await;
 
@@ -589,11 +605,7 @@ async fn test_grpc_no_strip_listen_path() {
     write_grpc_config(&config_path, backend_port);
 
     build_gateway().expect("Failed to build gateway");
-    let mut gateway = start_gateway(config_path.to_str().unwrap(), gateway_port)
-        .expect("Failed to start gateway");
-    wait_for_gateway(gateway_port)
-        .await
-        .expect("Gateway did not become healthy");
+    let (mut gateway, gateway_port) = start_gateway_with_retry(config_path.to_str().unwrap()).await;
 
     let gateway_addr = format!("127.0.0.1:{}", gateway_port);
 
@@ -627,8 +639,6 @@ async fn test_grpc_no_strip_listen_path() {
 #[tokio::test]
 async fn test_grpc_multiple_sequential_calls() {
     let backend_port = free_port().await;
-    let gateway_port = free_port().await;
-
     let echo_handle = start_grpc_echo_backend(backend_port).await;
     sleep(Duration::from_millis(300)).await;
 
@@ -637,11 +647,7 @@ async fn test_grpc_multiple_sequential_calls() {
     write_grpc_config(&config_path, backend_port);
 
     build_gateway().expect("Failed to build gateway");
-    let mut gateway = start_gateway(config_path.to_str().unwrap(), gateway_port)
-        .expect("Failed to start gateway");
-    wait_for_gateway(gateway_port)
-        .await
-        .expect("Gateway did not become healthy");
+    let (mut gateway, gateway_port) = start_gateway_with_retry(config_path.to_str().unwrap()).await;
 
     let gateway_addr = format!("127.0.0.1:{}", gateway_port);
 
@@ -687,8 +693,6 @@ async fn test_grpc_multiple_sequential_calls() {
 #[tokio::test]
 async fn test_grpc_key_auth_rejects_missing_key() {
     let backend_port = free_port().await;
-    let gateway_port = free_port().await;
-
     let echo_handle = start_grpc_echo_backend(backend_port).await;
     sleep(Duration::from_millis(300)).await;
 
@@ -697,11 +701,7 @@ async fn test_grpc_key_auth_rejects_missing_key() {
     write_grpc_auth_config(&config_path, backend_port);
 
     build_gateway().expect("Failed to build gateway");
-    let mut gateway = start_gateway(config_path.to_str().unwrap(), gateway_port)
-        .expect("Failed to start gateway");
-    wait_for_gateway(gateway_port)
-        .await
-        .expect("Gateway did not become healthy");
+    let (mut gateway, gateway_port) = start_gateway_with_retry(config_path.to_str().unwrap()).await;
 
     let gateway_addr = format!("127.0.0.1:{}", gateway_port);
 
@@ -772,8 +772,6 @@ async fn test_grpc_key_auth_rejects_missing_key() {
 #[tokio::test]
 async fn test_grpc_key_auth_accepts_valid_key() {
     let backend_port = free_port().await;
-    let gateway_port = free_port().await;
-
     let echo_handle = start_grpc_echo_backend(backend_port).await;
     sleep(Duration::from_millis(300)).await;
 
@@ -782,11 +780,7 @@ async fn test_grpc_key_auth_accepts_valid_key() {
     write_grpc_auth_config(&config_path, backend_port);
 
     build_gateway().expect("Failed to build gateway");
-    let mut gateway = start_gateway(config_path.to_str().unwrap(), gateway_port)
-        .expect("Failed to start gateway");
-    wait_for_gateway(gateway_port)
-        .await
-        .expect("Gateway did not become healthy");
+    let (mut gateway, gateway_port) = start_gateway_with_retry(config_path.to_str().unwrap()).await;
 
     let gateway_addr = format!("127.0.0.1:{}", gateway_port);
 
@@ -833,8 +827,6 @@ async fn test_grpc_key_auth_accepts_valid_key() {
 #[tokio::test]
 async fn test_grpc_early_rejects_use_grpc_error_shape() {
     let backend_port = free_port().await;
-    let gateway_port = free_port().await;
-
     let echo_handle = start_grpc_echo_backend(backend_port).await;
     sleep(Duration::from_millis(300)).await;
 
@@ -843,11 +835,7 @@ async fn test_grpc_early_rejects_use_grpc_error_shape() {
     write_grpc_method_filter_config(&config_path, backend_port);
 
     build_gateway().expect("Failed to build gateway");
-    let mut gateway = start_gateway(config_path.to_str().unwrap(), gateway_port)
-        .expect("Failed to start gateway");
-    wait_for_gateway(gateway_port)
-        .await
-        .expect("Gateway did not become healthy");
+    let (mut gateway, gateway_port) = start_gateway_with_retry(config_path.to_str().unwrap()).await;
 
     let gateway_addr = format!("127.0.0.1:{}", gateway_port);
 

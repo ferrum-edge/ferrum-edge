@@ -205,6 +205,125 @@ impl rustls::client::danger::ServerCertVerifier for NoVerifier {
     }
 }
 
+/// Wait for the gateway to become ready by probing the proxy port via TCP connect.
+async fn wait_for_gateway(gateway_port: u16) -> Result<(), Box<dyn std::error::Error>> {
+    let deadline = std::time::SystemTime::now() + Duration::from_secs(15);
+    let addr = format!("127.0.0.1:{}", gateway_port);
+
+    loop {
+        if std::time::SystemTime::now() >= deadline {
+            return Err("Gateway did not start within 15 seconds".into());
+        }
+        match tokio::net::TcpStream::connect(&addr).await {
+            Ok(_) => return Ok(()),
+            Err(_) => sleep(Duration::from_millis(300)).await,
+        }
+    }
+}
+
+/// Start the gateway with retry logic to handle ephemeral port races.
+///
+/// Each attempt allocates a fresh gateway port, starts the gateway subprocess,
+/// and waits for it to become healthy. On failure the process is killed and a
+/// new attempt is made with a different port. Panics only after all attempts
+/// are exhausted.
+async fn start_gateway_with_retry(
+    config_path: &str,
+    https_port: Option<u16>,
+    tls_cert_path: Option<&str>,
+    tls_key_path: Option<&str>,
+) -> (std::process::Child, u16) {
+    const MAX_ATTEMPTS: u32 = 3;
+    let mut last_err = String::new();
+    for attempt in 1..=MAX_ATTEMPTS {
+        let gateway_port = free_port().await;
+        match start_gateway(
+            config_path,
+            gateway_port,
+            https_port,
+            tls_cert_path,
+            tls_key_path,
+        ) {
+            Ok(mut child) => match wait_for_gateway(gateway_port).await {
+                Ok(()) => return (child, gateway_port),
+                Err(e) => {
+                    last_err = e.to_string();
+                    eprintln!(
+                        "Gateway startup attempt {}/{} failed (port {}): {}",
+                        attempt, MAX_ATTEMPTS, gateway_port, last_err
+                    );
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+            },
+            Err(e) => {
+                last_err = e.to_string();
+                eprintln!(
+                    "Gateway spawn attempt {}/{} failed: {}",
+                    attempt, MAX_ATTEMPTS, last_err
+                );
+            }
+        }
+        if attempt < MAX_ATTEMPTS {
+            sleep(Duration::from_secs(1)).await;
+        }
+    }
+    panic!(
+        "Gateway did not start after {} attempts: {}",
+        MAX_ATTEMPTS, last_err
+    );
+}
+
+/// Start the gateway with TLS and retry logic for both HTTP and HTTPS port allocation.
+///
+/// Allocates fresh HTTP and HTTPS gateway ports on each attempt.
+async fn start_gateway_tls_with_retry(
+    config_path: &str,
+    tls_cert_path: &str,
+    tls_key_path: &str,
+) -> (std::process::Child, u16, u16) {
+    const MAX_ATTEMPTS: u32 = 3;
+    let mut last_err = String::new();
+    for attempt in 1..=MAX_ATTEMPTS {
+        let gateway_http_port = free_port().await;
+        let gateway_https_port = free_port().await;
+        match start_gateway(
+            config_path,
+            gateway_http_port,
+            Some(gateway_https_port),
+            Some(tls_cert_path),
+            Some(tls_key_path),
+        ) {
+            Ok(mut child) => match wait_for_gateway(gateway_https_port).await {
+                Ok(()) => return (child, gateway_http_port, gateway_https_port),
+                Err(e) => {
+                    last_err = e.to_string();
+                    eprintln!(
+                        "Gateway TLS startup attempt {}/{} failed (ports {}/{}): {}",
+                        attempt, MAX_ATTEMPTS, gateway_http_port, gateway_https_port, last_err
+                    );
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+            },
+            Err(e) => {
+                last_err = e.to_string();
+                eprintln!(
+                    "Gateway TLS spawn attempt {}/{} failed: {}",
+                    attempt, MAX_ATTEMPTS, last_err
+                );
+            }
+        }
+        if attempt < MAX_ATTEMPTS {
+            sleep(Duration::from_secs(1)).await;
+        }
+    }
+    panic!(
+        "Gateway (TLS) did not start after {} attempts: {}",
+        MAX_ATTEMPTS, last_err
+    );
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -215,7 +334,6 @@ impl rustls::client::danger::ServerCertVerifier for NoVerifier {
 async fn test_websocket_plaintext_echo() {
     // Allocate ports
     let backend_port = free_port().await;
-    let gateway_port = free_port().await;
 
     // Start echo backend
     let echo_handle = tokio::spawn(start_ws_echo_server(backend_port));
@@ -227,15 +345,8 @@ async fn test_websocket_plaintext_echo() {
     write_ws_config(&config_path, backend_port);
 
     build_gateway().expect("Failed to build gateway");
-    let mut gateway = start_gateway(
-        config_path.to_str().unwrap(),
-        gateway_port,
-        None,
-        None,
-        None,
-    )
-    .expect("Failed to start gateway");
-    sleep(Duration::from_secs(3)).await;
+    let (mut gateway, gateway_port) =
+        start_gateway_with_retry(config_path.to_str().unwrap(), None, None, None).await;
 
     // Connect WebSocket client through the gateway
     let url = format!("ws://127.0.0.1:{}/ws-echo", gateway_port);
@@ -284,8 +395,6 @@ async fn test_websocket_plaintext_echo() {
 async fn test_websocket_tls_echo() {
     // Allocate ports
     let backend_port = free_port().await;
-    let gateway_http_port = free_port().await;
-    let gateway_https_port = free_port().await;
 
     // Start plaintext echo backend (gateway handles TLS termination)
     let echo_handle = tokio::spawn(start_ws_echo_server(backend_port));
@@ -301,15 +410,8 @@ async fn test_websocket_tls_echo() {
     let key_path = "tests/certs/server.key";
 
     build_gateway().expect("Failed to build gateway");
-    let mut gateway = start_gateway(
-        config_path.to_str().unwrap(),
-        gateway_http_port,
-        Some(gateway_https_port),
-        Some(cert_path),
-        Some(key_path),
-    )
-    .expect("Failed to start gateway");
-    sleep(Duration::from_secs(3)).await;
+    let (mut gateway, _gateway_http_port, gateway_https_port) =
+        start_gateway_tls_with_retry(config_path.to_str().unwrap(), cert_path, key_path).await;
 
     // Connect with TLS (accept self-signed cert)
     let url = format!("wss://localhost:{}/ws-echo", gateway_https_port);
@@ -348,7 +450,6 @@ async fn test_websocket_tls_echo() {
 async fn test_websocket_multiple_messages() {
     // Allocate ports
     let backend_port = free_port().await;
-    let gateway_port = free_port().await;
 
     // Start echo backend
     let echo_handle = tokio::spawn(start_ws_echo_server(backend_port));
@@ -360,15 +461,8 @@ async fn test_websocket_multiple_messages() {
     write_ws_config(&config_path, backend_port);
 
     build_gateway().expect("Failed to build gateway");
-    let mut gateway = start_gateway(
-        config_path.to_str().unwrap(),
-        gateway_port,
-        None,
-        None,
-        None,
-    )
-    .expect("Failed to start gateway");
-    sleep(Duration::from_secs(3)).await;
+    let (mut gateway, gateway_port) =
+        start_gateway_with_retry(config_path.to_str().unwrap(), None, None, None).await;
 
     // Connect
     let url = format!("ws://127.0.0.1:{}/ws-echo", gateway_port);

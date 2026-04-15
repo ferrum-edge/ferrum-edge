@@ -1129,7 +1129,7 @@ paths:
         content:
           application/json:
             schema:
-              $ref: "#/components/schemas/Upstream"
+              $ref: "#/components/schemas/UpstreamCreate"
       responses:
         "201":
           description: Created upstream
@@ -1180,7 +1180,7 @@ paths:
         content:
           application/json:
             schema:
-              $ref: "#/components/schemas/Upstream"
+              $ref: "#/components/schemas/UpstreamCreate"
       responses:
         "200":
           description: Updated upstream
@@ -2183,6 +2183,16 @@ components:
           delay_ms: 100
 
     # ── Upstream / Load Balancing ────────────────────────────────────
+    UpstreamCreate:
+      description: |
+        Request body for creating or updating an upstream. Same schema as
+        Upstream but `id`, `created_at`, and `updated_at` are optional
+        (server-managed).
+      allOf:
+        - $ref: "#/components/schemas/Upstream"
+      required:
+        - targets
+
     Upstream:
       type: object
       required: [id, targets, created_at, updated_at]
@@ -2963,7 +2973,7 @@ components:
         upstreams:
           type: array
           items:
-            $ref: "#/components/schemas/Upstream"
+            $ref: "#/components/schemas/UpstreamCreate"
           description: Upstreams to create
 
     BatchCreateResponse:

@@ -199,6 +199,44 @@ async fn wait_for_gateway(admin_port: u16) -> Result<(), Box<dyn std::error::Err
     Err("Gateway did not become healthy within 15 seconds".into())
 }
 
+async fn start_gateway_with_retry(config_path: &str) -> (std::process::Child, u16, u16) {
+    const MAX_ATTEMPTS: u32 = 3;
+    for attempt in 1..=MAX_ATTEMPTS {
+        let gateway_port = free_port().await;
+        let admin_port = free_port().await;
+
+        let mut child = match start_gateway(config_path, gateway_port, admin_port) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!(
+                    "Gateway spawn attempt {}/{} failed: {}",
+                    attempt, MAX_ATTEMPTS, e
+                );
+                if attempt < MAX_ATTEMPTS {
+                    sleep(Duration::from_secs(1)).await;
+                }
+                continue;
+            }
+        };
+
+        match wait_for_gateway(admin_port).await {
+            Ok(()) => return (child, gateway_port, admin_port),
+            Err(e) => {
+                eprintln!(
+                    "Gateway health check attempt {}/{} failed: {}",
+                    attempt, MAX_ATTEMPTS, e
+                );
+                let _ = child.kill();
+                let _ = child.wait();
+                if attempt < MAX_ATTEMPTS {
+                    sleep(Duration::from_secs(1)).await;
+                }
+            }
+        }
+    }
+    panic!("Gateway did not start after {} attempts", MAX_ATTEMPTS);
+}
+
 // ============================================================================
 // Config writers
 // ============================================================================
@@ -397,8 +435,6 @@ plugin_configs:
 #[tokio::test]
 async fn test_grpc_method_router_allow_list() {
     let backend_port = free_port().await;
-    let gateway_port = free_port().await;
-    let admin_port = free_port().await;
 
     let echo_handle = start_grpc_echo_backend(backend_port).await;
     sleep(Duration::from_millis(300)).await;
@@ -408,11 +444,8 @@ async fn test_grpc_method_router_allow_list() {
     write_method_router_allow_config(&config_path, backend_port);
 
     build_gateway().expect("Failed to build gateway");
-    let mut gateway = start_gateway(config_path.to_str().unwrap(), gateway_port, admin_port)
-        .expect("Failed to start gateway");
-    wait_for_gateway(admin_port)
-        .await
-        .expect("Gateway did not become healthy");
+    let (mut gateway, gateway_port, _admin_port) =
+        start_gateway_with_retry(config_path.to_str().unwrap()).await;
 
     let gateway_addr = format!("127.0.0.1:{}", gateway_port);
 
@@ -463,8 +496,6 @@ async fn test_grpc_method_router_allow_list() {
 #[tokio::test]
 async fn test_grpc_method_router_deny_list() {
     let backend_port = free_port().await;
-    let gateway_port = free_port().await;
-    let admin_port = free_port().await;
 
     let echo_handle = start_grpc_echo_backend(backend_port).await;
     sleep(Duration::from_millis(300)).await;
@@ -474,11 +505,8 @@ async fn test_grpc_method_router_deny_list() {
     write_method_router_deny_config(&config_path, backend_port);
 
     build_gateway().expect("Failed to build gateway");
-    let mut gateway = start_gateway(config_path.to_str().unwrap(), gateway_port, admin_port)
-        .expect("Failed to start gateway");
-    wait_for_gateway(admin_port)
-        .await
-        .expect("Gateway did not become healthy");
+    let (mut gateway, gateway_port, _admin_port) =
+        start_gateway_with_retry(config_path.to_str().unwrap()).await;
 
     let gateway_addr = format!("127.0.0.1:{}", gateway_port);
 
@@ -529,8 +557,6 @@ async fn test_grpc_method_router_deny_list() {
 #[tokio::test]
 async fn test_grpc_method_router_rate_limiting() {
     let backend_port = free_port().await;
-    let gateway_port = free_port().await;
-    let admin_port = free_port().await;
 
     let echo_handle = start_grpc_echo_backend(backend_port).await;
     sleep(Duration::from_millis(300)).await;
@@ -540,11 +566,8 @@ async fn test_grpc_method_router_rate_limiting() {
     write_method_router_ratelimit_config(&config_path, backend_port);
 
     build_gateway().expect("Failed to build gateway");
-    let mut gateway = start_gateway(config_path.to_str().unwrap(), gateway_port, admin_port)
-        .expect("Failed to start gateway");
-    wait_for_gateway(admin_port)
-        .await
-        .expect("Gateway did not become healthy");
+    let (mut gateway, gateway_port, _admin_port) =
+        start_gateway_with_retry(config_path.to_str().unwrap()).await;
 
     let gateway_addr = format!("127.0.0.1:{}", gateway_port);
 
@@ -614,8 +637,6 @@ async fn test_grpc_method_router_rate_limiting() {
 #[tokio::test]
 async fn test_grpc_response_size_limiting_returns_grpc_error() {
     let backend_port = free_port().await;
-    let gateway_port = free_port().await;
-    let admin_port = free_port().await;
 
     let echo_handle = start_grpc_echo_backend(backend_port).await;
     sleep(Duration::from_millis(300)).await;
@@ -625,11 +646,8 @@ async fn test_grpc_response_size_limiting_returns_grpc_error() {
     write_response_size_limit_config(&config_path, backend_port);
 
     build_gateway().expect("Failed to build gateway");
-    let mut gateway = start_gateway(config_path.to_str().unwrap(), gateway_port, admin_port)
-        .expect("Failed to start gateway");
-    wait_for_gateway(admin_port)
-        .await
-        .expect("Gateway did not become healthy");
+    let (mut gateway, gateway_port, _admin_port) =
+        start_gateway_with_retry(config_path.to_str().unwrap()).await;
 
     let gateway_addr = format!("127.0.0.1:{}", gateway_port);
     let (status, headers, body) =
@@ -672,8 +690,6 @@ async fn test_grpc_response_size_limiting_returns_grpc_error() {
 #[tokio::test]
 async fn test_grpc_deadline_default_injection() {
     let backend_port = free_port().await;
-    let gateway_port = free_port().await;
-    let admin_port = free_port().await;
 
     let echo_handle = start_grpc_echo_backend(backend_port).await;
     sleep(Duration::from_millis(300)).await;
@@ -683,11 +699,8 @@ async fn test_grpc_deadline_default_injection() {
     write_deadline_config(&config_path, backend_port, None, Some(5000));
 
     build_gateway().expect("Failed to build gateway");
-    let mut gateway = start_gateway(config_path.to_str().unwrap(), gateway_port, admin_port)
-        .expect("Failed to start gateway");
-    wait_for_gateway(admin_port)
-        .await
-        .expect("Gateway did not become healthy");
+    let (mut gateway, gateway_port, _admin_port) =
+        start_gateway_with_retry(config_path.to_str().unwrap()).await;
 
     let gateway_addr = format!("127.0.0.1:{}", gateway_port);
 
@@ -727,8 +740,6 @@ async fn test_grpc_deadline_default_injection() {
 #[tokio::test]
 async fn test_grpc_deadline_passthrough() {
     let backend_port = free_port().await;
-    let gateway_port = free_port().await;
-    let admin_port = free_port().await;
 
     let echo_handle = start_grpc_echo_backend(backend_port).await;
     sleep(Duration::from_millis(300)).await;
@@ -738,11 +749,8 @@ async fn test_grpc_deadline_passthrough() {
     write_deadline_config(&config_path, backend_port, Some(30000), None);
 
     build_gateway().expect("Failed to build gateway");
-    let mut gateway = start_gateway(config_path.to_str().unwrap(), gateway_port, admin_port)
-        .expect("Failed to start gateway");
-    wait_for_gateway(admin_port)
-        .await
-        .expect("Gateway did not become healthy");
+    let (mut gateway, gateway_port, _admin_port) =
+        start_gateway_with_retry(config_path.to_str().unwrap()).await;
 
     let gateway_addr = format!("127.0.0.1:{}", gateway_port);
 
@@ -776,8 +784,6 @@ async fn test_grpc_deadline_passthrough() {
 #[tokio::test]
 async fn test_grpc_deadline_clamped_to_max() {
     let backend_port = free_port().await;
-    let gateway_port = free_port().await;
-    let admin_port = free_port().await;
 
     let echo_handle = start_grpc_echo_backend(backend_port).await;
     sleep(Duration::from_millis(300)).await;
@@ -788,11 +794,8 @@ async fn test_grpc_deadline_clamped_to_max() {
     write_deadline_config(&config_path, backend_port, Some(5000), None);
 
     build_gateway().expect("Failed to build gateway");
-    let mut gateway = start_gateway(config_path.to_str().unwrap(), gateway_port, admin_port)
-        .expect("Failed to start gateway");
-    wait_for_gateway(admin_port)
-        .await
-        .expect("Gateway did not become healthy");
+    let (mut gateway, gateway_port, _admin_port) =
+        start_gateway_with_retry(config_path.to_str().unwrap()).await;
 
     let gateway_addr = format!("127.0.0.1:{}", gateway_port);
 
@@ -861,8 +864,6 @@ async fn test_grpc_deadline_clamped_to_max() {
 #[tokio::test]
 async fn test_grpc_plugins_skip_non_grpc_requests() {
     let backend_port = free_port().await;
-    let gateway_port = free_port().await;
-    let admin_port = free_port().await;
 
     let echo_handle = start_grpc_echo_backend(backend_port).await;
     sleep(Duration::from_millis(300)).await;
@@ -904,11 +905,8 @@ plugin_configs:
         .expect("Failed to write config");
 
     build_gateway().expect("Failed to build gateway");
-    let mut gateway = start_gateway(config_path.to_str().unwrap(), gateway_port, admin_port)
-        .expect("Failed to start gateway");
-    wait_for_gateway(admin_port)
-        .await
-        .expect("Gateway did not become healthy");
+    let (mut gateway, gateway_port, _admin_port) =
+        start_gateway_with_retry(config_path.to_str().unwrap()).await;
 
     // Send a plain HTTP request (not gRPC) — plugin should skip
     let client = reqwest::Client::new();

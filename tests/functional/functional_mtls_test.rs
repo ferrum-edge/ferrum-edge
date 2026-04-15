@@ -79,11 +79,8 @@ fn write_pem(dir: &TempDir, name: &str, data: &str) -> String {
 // Echo Servers
 // ============================================================================
 
-async fn start_http_echo(port: u16) -> tokio::task::JoinHandle<()> {
+async fn start_http_echo_on(listener: TcpListener) -> tokio::task::JoinHandle<()> {
     let h = tokio::spawn(async move {
-        let listener = TcpListener::bind(format!("127.0.0.1:{}", port))
-            .await
-            .unwrap();
         while let Ok((mut s, _)) = listener.accept().await {
             tokio::spawn(async move {
                 let mut buf = vec![0u8; 4096];
@@ -99,12 +96,12 @@ async fn start_http_echo(port: u16) -> tokio::task::JoinHandle<()> {
             });
         }
     });
-    sleep(Duration::from_millis(200)).await;
+    sleep(Duration::from_millis(100)).await;
     h
 }
 
-async fn start_https_echo(
-    port: u16,
+async fn start_https_echo_on(
+    listener: TcpListener,
     cert_pem: &str,
     key_pem: &str,
     client_ca_pem: Option<&str>,
@@ -148,9 +145,6 @@ async fn start_https_echo(
         // Advertise h2 + http/1.1 so gateway can negotiate
         cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
         let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(cfg));
-        let listener = TcpListener::bind(format!("127.0.0.1:{}", port))
-            .await
-            .unwrap();
         while let Ok((tcp, _)) = listener.accept().await {
             let acc = acceptor.clone();
             tokio::spawn(async move {
@@ -171,15 +165,12 @@ async fn start_https_echo(
             });
         }
     });
-    sleep(Duration::from_millis(200)).await;
+    sleep(Duration::from_millis(100)).await;
     h
 }
 
-async fn start_tcp_echo(port: u16) -> tokio::task::JoinHandle<()> {
+async fn start_tcp_echo_on(listener: TcpListener) -> tokio::task::JoinHandle<()> {
     let h = tokio::spawn(async move {
-        let listener = TcpListener::bind(format!("127.0.0.1:{}", port))
-            .await
-            .unwrap();
         while let Ok((mut s, _)) = listener.accept().await {
             tokio::spawn(async move {
                 let mut buf = vec![0u8; 4096];
@@ -196,7 +187,7 @@ async fn start_tcp_echo(port: u16) -> tokio::task::JoinHandle<()> {
             });
         }
     });
-    sleep(Duration::from_millis(200)).await;
+    sleep(Duration::from_millis(100)).await;
     h
 }
 
@@ -225,6 +216,107 @@ fn start_gw(cfg: &str, http_port: u16, envs: &[(&str, &str)]) -> std::process::C
         cmd.env(k, v);
     }
     cmd.spawn().expect("spawn gateway")
+}
+
+/// Allocate an ephemeral port by binding to port 0 and returning the assigned port.
+async fn alloc_port() -> u16 {
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    l.local_addr().unwrap().port()
+}
+
+/// Wait for the gateway to become healthy by polling the admin HTTP health endpoint.
+/// Returns true if healthy within the timeout, false otherwise.
+async fn wait_for_gateway(admin_http_port: u16) -> bool {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .unwrap();
+    for _ in 0..30 {
+        if let Ok(resp) = client
+            .get(format!("http://127.0.0.1:{}/health", admin_http_port))
+            .send()
+            .await
+            && resp.status().is_success()
+        {
+            return true;
+        }
+        sleep(Duration::from_millis(200)).await;
+    }
+    false
+}
+
+/// Port set returned by the retry wrapper. Fields are Option so tests can
+/// pick up only the ports they need.
+struct GatewayPorts {
+    proxy_http: u16,
+    proxy_https: u16,
+    admin_http: u16,
+    admin_https: u16,
+}
+
+/// Start the gateway with retry logic around ephemeral port allocation.
+///
+/// `build_envs` is called with the allocated ports and must return the extra env
+/// var pairs to pass to `start_gw`. The config path and proxy http port are
+/// handled automatically.
+///
+/// `build_config` is called with the allocated ports and must return the YAML
+/// config string (so backend_port references etc. can be embedded).
+async fn start_gateway_with_retry<F, G>(
+    cfg_path: &std::path::Path,
+    build_config: F,
+    build_envs: G,
+) -> (std::process::Child, GatewayPorts)
+where
+    F: Fn(&GatewayPorts) -> String,
+    G: Fn(&GatewayPorts) -> Vec<(String, String)>,
+{
+    const MAX_ATTEMPTS: u32 = 3;
+    let mut last_err = String::new();
+    for attempt in 1..=MAX_ATTEMPTS {
+        // Allocate fresh ports each attempt
+        let ports = GatewayPorts {
+            proxy_http: alloc_port().await,
+            proxy_https: alloc_port().await,
+            admin_http: alloc_port().await,
+            admin_https: alloc_port().await,
+        };
+
+        // Write config with current ports
+        let config_content = build_config(&ports);
+        write_cfg(cfg_path, &config_content);
+
+        // Build env vec
+        let extra_envs = build_envs(&ports);
+        let env_refs: Vec<(&str, &str)> = extra_envs
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+
+        let mut child = start_gw(cfg_path.to_str().unwrap(), ports.proxy_http, &env_refs);
+
+        if wait_for_gateway(ports.admin_http).await {
+            return (child, ports);
+        }
+
+        last_err = format!(
+            "gateway did not become healthy (proxy_http={}, admin_http={})",
+            ports.proxy_http, ports.admin_http
+        );
+        eprintln!(
+            "Gateway startup attempt {}/{} failed: {}",
+            attempt, MAX_ATTEMPTS, last_err
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+        if attempt < MAX_ATTEMPTS {
+            sleep(Duration::from_secs(1)).await;
+        }
+    }
+    panic!(
+        "Gateway did not start after {} attempts: {}",
+        MAX_ATTEMPTS, last_err
+    );
 }
 
 fn write_cfg(path: &std::path::Path, content: &str) {
@@ -301,15 +393,15 @@ async fn test_frontend_mtls_valid_client_cert() {
     let ca_p = write_pem(&td, "ca.pem", &ca.cert_pem);
     let srv_c = write_pem(&td, "s.crt", &srv.cert_pem);
     let srv_k = write_pem(&td, "s.key", &srv.key_pem);
-    let bp = 19850u16;
-    let hp = 18250u16;
-    let sp = 18251u16;
-    let echo = start_http_echo(bp).await;
+    let be_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bp = be_listener.local_addr().unwrap().port();
+    let echo = start_http_echo_on(be_listener).await;
     let cp = td.path().join("c.yaml");
-    write_cfg(
+    let (mut gw, ports) = start_gateway_with_retry(
         &cp,
-        &format!(
-            r#"
+        |_ports| {
+            format!(
+                r#"
 proxies:
   - id: "t1"
     listen_path: "/api"
@@ -320,23 +412,36 @@ proxies:
 consumers: []
 plugin_configs: []
 "#
-        ),
-    );
-    let mut gw = start_gw(
-        cp.to_str().unwrap(),
-        hp,
-        &[
-            ("FERRUM_PROXY_HTTPS_PORT", &sp.to_string()),
-            ("FERRUM_FRONTEND_TLS_CERT_PATH", &srv_c),
-            ("FERRUM_FRONTEND_TLS_KEY_PATH", &srv_k),
-            ("FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH", &ca_p),
-            ("FERRUM_TLS_NO_VERIFY", "false"),
-        ],
-    );
-    sleep(Duration::from_secs(3)).await;
+            )
+        },
+        |ports| {
+            vec![
+                (
+                    "FERRUM_PROXY_HTTPS_PORT".into(),
+                    ports.proxy_https.to_string(),
+                ),
+                (
+                    "FERRUM_ADMIN_HTTP_PORT".into(),
+                    ports.admin_http.to_string(),
+                ),
+                (
+                    "FERRUM_ADMIN_HTTPS_PORT".into(),
+                    ports.admin_https.to_string(),
+                ),
+                ("FERRUM_FRONTEND_TLS_CERT_PATH".into(), srv_c.clone()),
+                ("FERRUM_FRONTEND_TLS_KEY_PATH".into(), srv_k.clone()),
+                (
+                    "FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH".into(),
+                    ca_p.clone(),
+                ),
+                ("FERRUM_TLS_NO_VERIFY".into(), "false".into()),
+            ]
+        },
+    )
+    .await;
     let c = mtls_client(Some(&cli.cert_pem), Some(&cli.key_pem));
     let r = c
-        .get(format!("https://127.0.0.1:{}/api/test", sp))
+        .get(format!("https://127.0.0.1:{}/api/test", ports.proxy_https))
         .send()
         .await
         .expect("valid client cert should succeed");
@@ -356,15 +461,15 @@ async fn test_frontend_mtls_no_client_cert_rejected() {
     let ca_p = write_pem(&td, "ca.pem", &ca.cert_pem);
     let srv_c = write_pem(&td, "s.crt", &srv.cert_pem);
     let srv_k = write_pem(&td, "s.key", &srv.key_pem);
-    let bp = 19852u16;
-    let hp = 18252u16;
-    let sp = 18253u16;
-    let echo = start_http_echo(bp).await;
+    let be_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bp = be_listener.local_addr().unwrap().port();
+    let echo = start_http_echo_on(be_listener).await;
     let cp = td.path().join("c.yaml");
-    write_cfg(
+    let (mut gw, ports) = start_gateway_with_retry(
         &cp,
-        &format!(
-            r#"
+        |_ports| {
+            format!(
+                r#"
 proxies:
   - id: "t2"
     listen_path: "/api"
@@ -375,23 +480,36 @@ proxies:
 consumers: []
 plugin_configs: []
 "#
-        ),
-    );
-    let mut gw = start_gw(
-        cp.to_str().unwrap(),
-        hp,
-        &[
-            ("FERRUM_PROXY_HTTPS_PORT", &sp.to_string()),
-            ("FERRUM_FRONTEND_TLS_CERT_PATH", &srv_c),
-            ("FERRUM_FRONTEND_TLS_KEY_PATH", &srv_k),
-            ("FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH", &ca_p),
-            ("FERRUM_TLS_NO_VERIFY", "false"),
-        ],
-    );
-    sleep(Duration::from_secs(3)).await;
+            )
+        },
+        |ports| {
+            vec![
+                (
+                    "FERRUM_PROXY_HTTPS_PORT".into(),
+                    ports.proxy_https.to_string(),
+                ),
+                (
+                    "FERRUM_ADMIN_HTTP_PORT".into(),
+                    ports.admin_http.to_string(),
+                ),
+                (
+                    "FERRUM_ADMIN_HTTPS_PORT".into(),
+                    ports.admin_https.to_string(),
+                ),
+                ("FERRUM_FRONTEND_TLS_CERT_PATH".into(), srv_c.clone()),
+                ("FERRUM_FRONTEND_TLS_KEY_PATH".into(), srv_k.clone()),
+                (
+                    "FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH".into(),
+                    ca_p.clone(),
+                ),
+                ("FERRUM_TLS_NO_VERIFY".into(), "false".into()),
+            ]
+        },
+    )
+    .await;
     let c = mtls_client(None, None);
     let r = c
-        .get(format!("https://127.0.0.1:{}/api/test", sp))
+        .get(format!("https://127.0.0.1:{}/api/test", ports.proxy_https))
         .send()
         .await;
     assert!(r.is_err(), "no client cert → rejected");
@@ -412,15 +530,15 @@ async fn test_frontend_mtls_wrong_ca_rejected() {
     let ca_p = write_pem(&td, "ca.pem", &good_ca.cert_pem);
     let srv_c = write_pem(&td, "s.crt", &srv.cert_pem);
     let srv_k = write_pem(&td, "s.key", &srv.key_pem);
-    let bp = 19854u16;
-    let hp = 18254u16;
-    let sp = 18255u16;
-    let echo = start_http_echo(bp).await;
+    let be_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bp = be_listener.local_addr().unwrap().port();
+    let echo = start_http_echo_on(be_listener).await;
     let cp = td.path().join("c.yaml");
-    write_cfg(
+    let (mut gw, ports) = start_gateway_with_retry(
         &cp,
-        &format!(
-            r#"
+        |_ports| {
+            format!(
+                r#"
 proxies:
   - id: "t3"
     listen_path: "/api"
@@ -431,23 +549,36 @@ proxies:
 consumers: []
 plugin_configs: []
 "#
-        ),
-    );
-    let mut gw = start_gw(
-        cp.to_str().unwrap(),
-        hp,
-        &[
-            ("FERRUM_PROXY_HTTPS_PORT", &sp.to_string()),
-            ("FERRUM_FRONTEND_TLS_CERT_PATH", &srv_c),
-            ("FERRUM_FRONTEND_TLS_KEY_PATH", &srv_k),
-            ("FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH", &ca_p),
-            ("FERRUM_TLS_NO_VERIFY", "false"),
-        ],
-    );
-    sleep(Duration::from_secs(3)).await;
+            )
+        },
+        |ports| {
+            vec![
+                (
+                    "FERRUM_PROXY_HTTPS_PORT".into(),
+                    ports.proxy_https.to_string(),
+                ),
+                (
+                    "FERRUM_ADMIN_HTTP_PORT".into(),
+                    ports.admin_http.to_string(),
+                ),
+                (
+                    "FERRUM_ADMIN_HTTPS_PORT".into(),
+                    ports.admin_https.to_string(),
+                ),
+                ("FERRUM_FRONTEND_TLS_CERT_PATH".into(), srv_c.clone()),
+                ("FERRUM_FRONTEND_TLS_KEY_PATH".into(), srv_k.clone()),
+                (
+                    "FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH".into(),
+                    ca_p.clone(),
+                ),
+                ("FERRUM_TLS_NO_VERIFY".into(), "false".into()),
+            ]
+        },
+    )
+    .await;
     let c = mtls_client(Some(&rogue.cert_pem), Some(&rogue.key_pem));
     let r = c
-        .get(format!("https://127.0.0.1:{}/api/test", sp))
+        .get(format!("https://127.0.0.1:{}/api/test", ports.proxy_https))
         .send()
         .await;
     assert!(r.is_err(), "wrong CA cert → rejected");
@@ -464,14 +595,15 @@ async fn test_backend_tls_ca_verification_trusted() {
     let ca = generate_ca("BE-CA");
     let be = generate_signed_cert(&ca, "Backend", &["localhost"]);
     let ca_p = write_pem(&td, "ca.pem", &ca.cert_pem);
-    let bp = 19856u16;
-    let hp = 18256u16;
-    let echo = start_https_echo(bp, &be.cert_pem, &be.key_pem, None).await;
+    let be_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bp = be_listener.local_addr().unwrap().port();
+    let echo = start_https_echo_on(be_listener, &be.cert_pem, &be.key_pem, None).await;
     let cp = td.path().join("c.yaml");
-    write_cfg(
+    let (mut gw, ports) = start_gateway_with_retry(
         &cp,
-        &format!(
-            r#"
+        |_ports| {
+            format!(
+                r#"
 proxies:
   - id: "t4"
     listen_path: "/api"
@@ -486,20 +618,33 @@ proxies:
 consumers: []
 plugin_configs: []
 "#
-        ),
-    );
-    let mut gw = start_gw(
-        cp.to_str().unwrap(),
-        hp,
-        &[("FERRUM_TLS_NO_VERIFY", "false")],
-    );
-    sleep(Duration::from_secs(3)).await;
+            )
+        },
+        |ports| {
+            vec![
+                (
+                    "FERRUM_PROXY_HTTPS_PORT".into(),
+                    ports.proxy_https.to_string(),
+                ),
+                (
+                    "FERRUM_ADMIN_HTTP_PORT".into(),
+                    ports.admin_http.to_string(),
+                ),
+                (
+                    "FERRUM_ADMIN_HTTPS_PORT".into(),
+                    ports.admin_https.to_string(),
+                ),
+                ("FERRUM_TLS_NO_VERIFY".into(), "false".into()),
+            ]
+        },
+    )
+    .await;
     let c = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()
         .unwrap();
     let r = c
-        .get(format!("http://127.0.0.1:{}/api/test", hp))
+        .get(format!("http://127.0.0.1:{}/api/test", ports.proxy_http))
         .send()
         .await
         .expect("trusted backend should succeed");
@@ -518,14 +663,15 @@ async fn test_backend_tls_ca_verification_untrusted() {
     let bad_ca = generate_ca("Bad-BE-CA");
     let be = generate_signed_cert(&bad_ca, "BadBackend", &["localhost"]);
     let ca_p = write_pem(&td, "ca.pem", &good_ca.cert_pem);
-    let bp = 19858u16;
-    let hp = 18258u16;
-    let echo = start_https_echo(bp, &be.cert_pem, &be.key_pem, None).await;
+    let be_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bp = be_listener.local_addr().unwrap().port();
+    let echo = start_https_echo_on(be_listener, &be.cert_pem, &be.key_pem, None).await;
     let cp = td.path().join("c.yaml");
-    write_cfg(
+    let (mut gw, ports) = start_gateway_with_retry(
         &cp,
-        &format!(
-            r#"
+        |_ports| {
+            format!(
+                r#"
 proxies:
   - id: "t5"
     listen_path: "/api"
@@ -540,20 +686,33 @@ proxies:
 consumers: []
 plugin_configs: []
 "#
-        ),
-    );
-    let mut gw = start_gw(
-        cp.to_str().unwrap(),
-        hp,
-        &[("FERRUM_TLS_NO_VERIFY", "false")],
-    );
-    sleep(Duration::from_secs(3)).await;
+            )
+        },
+        |ports| {
+            vec![
+                (
+                    "FERRUM_PROXY_HTTPS_PORT".into(),
+                    ports.proxy_https.to_string(),
+                ),
+                (
+                    "FERRUM_ADMIN_HTTP_PORT".into(),
+                    ports.admin_http.to_string(),
+                ),
+                (
+                    "FERRUM_ADMIN_HTTPS_PORT".into(),
+                    ports.admin_https.to_string(),
+                ),
+                ("FERRUM_TLS_NO_VERIFY".into(), "false".into()),
+            ]
+        },
+    )
+    .await;
     let c = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()
         .unwrap();
     let r = c
-        .get(format!("http://127.0.0.1:{}/api/test", hp))
+        .get(format!("http://127.0.0.1:{}/api/test", ports.proxy_http))
         .send()
         .await
         .expect("should return 502, not hang");
@@ -574,14 +733,16 @@ async fn test_backend_mtls_gateway_presents_client_cert() {
     let ca_p = write_pem(&td, "ca.pem", &ca.cert_pem);
     let gwc_c = write_pem(&td, "gw.crt", &gwc.cert_pem);
     let gwc_k = write_pem(&td, "gw.key", &gwc.key_pem);
-    let bp = 19860u16;
-    let hp = 18260u16;
-    let echo = start_https_echo(bp, &be.cert_pem, &be.key_pem, Some(&ca.cert_pem)).await;
+    let be_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bp = be_listener.local_addr().unwrap().port();
+    let echo =
+        start_https_echo_on(be_listener, &be.cert_pem, &be.key_pem, Some(&ca.cert_pem)).await;
     let cp = td.path().join("c.yaml");
-    write_cfg(
+    let (mut gw, ports) = start_gateway_with_retry(
         &cp,
-        &format!(
-            r#"
+        |_ports| {
+            format!(
+                r#"
 proxies:
   - id: "t6"
     listen_path: "/api"
@@ -598,20 +759,33 @@ proxies:
 consumers: []
 plugin_configs: []
 "#
-        ),
-    );
-    let mut gw = start_gw(
-        cp.to_str().unwrap(),
-        hp,
-        &[("FERRUM_TLS_NO_VERIFY", "false")],
-    );
-    sleep(Duration::from_secs(3)).await;
+            )
+        },
+        |ports| {
+            vec![
+                (
+                    "FERRUM_PROXY_HTTPS_PORT".into(),
+                    ports.proxy_https.to_string(),
+                ),
+                (
+                    "FERRUM_ADMIN_HTTP_PORT".into(),
+                    ports.admin_http.to_string(),
+                ),
+                (
+                    "FERRUM_ADMIN_HTTPS_PORT".into(),
+                    ports.admin_https.to_string(),
+                ),
+                ("FERRUM_TLS_NO_VERIFY".into(), "false".into()),
+            ]
+        },
+    )
+    .await;
     let c = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()
         .unwrap();
     let r = c
-        .get(format!("http://127.0.0.1:{}/api/test", hp))
+        .get(format!("http://127.0.0.1:{}/api/test", ports.proxy_http))
         .send()
         .await
         .expect("gateway with client cert should reach mTLS backend");
@@ -629,14 +803,16 @@ async fn test_backend_mtls_gateway_no_client_cert_rejected() {
     let ca = generate_ca("mTLS-CA2");
     let be = generate_signed_cert(&ca, "mTLS-BE2", &["localhost"]);
     let ca_p = write_pem(&td, "ca.pem", &ca.cert_pem);
-    let bp = 19862u16;
-    let hp = 18262u16;
-    let echo = start_https_echo(bp, &be.cert_pem, &be.key_pem, Some(&ca.cert_pem)).await;
+    let be_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bp = be_listener.local_addr().unwrap().port();
+    let echo =
+        start_https_echo_on(be_listener, &be.cert_pem, &be.key_pem, Some(&ca.cert_pem)).await;
     let cp = td.path().join("c.yaml");
-    write_cfg(
+    let (mut gw, ports) = start_gateway_with_retry(
         &cp,
-        &format!(
-            r#"
+        |_ports| {
+            format!(
+                r#"
 proxies:
   - id: "t7"
     listen_path: "/api"
@@ -651,20 +827,33 @@ proxies:
 consumers: []
 plugin_configs: []
 "#
-        ),
-    );
-    let mut gw = start_gw(
-        cp.to_str().unwrap(),
-        hp,
-        &[("FERRUM_TLS_NO_VERIFY", "false")],
-    );
-    sleep(Duration::from_secs(3)).await;
+            )
+        },
+        |ports| {
+            vec![
+                (
+                    "FERRUM_PROXY_HTTPS_PORT".into(),
+                    ports.proxy_https.to_string(),
+                ),
+                (
+                    "FERRUM_ADMIN_HTTP_PORT".into(),
+                    ports.admin_http.to_string(),
+                ),
+                (
+                    "FERRUM_ADMIN_HTTPS_PORT".into(),
+                    ports.admin_https.to_string(),
+                ),
+                ("FERRUM_TLS_NO_VERIFY".into(), "false".into()),
+            ]
+        },
+    )
+    .await;
     let c = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()
         .unwrap();
     let r = c
-        .get(format!("http://127.0.0.1:{}/api/test", hp))
+        .get(format!("http://127.0.0.1:{}/api/test", ports.proxy_http))
         .send()
         .await
         .expect("should return 502, not hang");
@@ -685,14 +874,16 @@ async fn test_backend_mtls_global_env_vars() {
     let ca_p = write_pem(&td, "ca.pem", &ca.cert_pem);
     let gwc_c = write_pem(&td, "gw.crt", &gwc.cert_pem);
     let gwc_k = write_pem(&td, "gw.key", &gwc.key_pem);
-    let bp = 19864u16;
-    let hp = 18264u16;
-    let echo = start_https_echo(bp, &be.cert_pem, &be.key_pem, Some(&ca.cert_pem)).await;
+    let be_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bp = be_listener.local_addr().unwrap().port();
+    let echo =
+        start_https_echo_on(be_listener, &be.cert_pem, &be.key_pem, Some(&ca.cert_pem)).await;
     let cp = td.path().join("c.yaml");
-    write_cfg(
+    let (mut gw, ports) = start_gateway_with_retry(
         &cp,
-        &format!(
-            r#"
+        |_ports| {
+            format!(
+                r#"
 proxies:
   - id: "t8"
     listen_path: "/api"
@@ -706,25 +897,36 @@ proxies:
 consumers: []
 plugin_configs: []
 "#
-        ),
-    );
-    let mut gw = start_gw(
-        cp.to_str().unwrap(),
-        hp,
-        &[
-            ("FERRUM_TLS_NO_VERIFY", "false"),
-            ("FERRUM_TLS_CA_BUNDLE_PATH", &ca_p),
-            ("FERRUM_BACKEND_TLS_CLIENT_CERT_PATH", &gwc_c),
-            ("FERRUM_BACKEND_TLS_CLIENT_KEY_PATH", &gwc_k),
-        ],
-    );
-    sleep(Duration::from_secs(3)).await;
+            )
+        },
+        |ports| {
+            vec![
+                (
+                    "FERRUM_PROXY_HTTPS_PORT".into(),
+                    ports.proxy_https.to_string(),
+                ),
+                (
+                    "FERRUM_ADMIN_HTTP_PORT".into(),
+                    ports.admin_http.to_string(),
+                ),
+                (
+                    "FERRUM_ADMIN_HTTPS_PORT".into(),
+                    ports.admin_https.to_string(),
+                ),
+                ("FERRUM_TLS_NO_VERIFY".into(), "false".into()),
+                ("FERRUM_TLS_CA_BUNDLE_PATH".into(), ca_p.clone()),
+                ("FERRUM_BACKEND_TLS_CLIENT_CERT_PATH".into(), gwc_c.clone()),
+                ("FERRUM_BACKEND_TLS_CLIENT_KEY_PATH".into(), gwc_k.clone()),
+            ]
+        },
+    )
+    .await;
     let c = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()
         .unwrap();
     let r = c
-        .get(format!("http://127.0.0.1:{}/api/test", hp))
+        .get(format!("http://127.0.0.1:{}/api/test", ports.proxy_http))
         .send()
         .await
         .expect("global mTLS cert should work");
@@ -745,16 +947,15 @@ async fn test_admin_mtls_authorized_client() {
     let ca_p = write_pem(&td, "ca.pem", &ca.cert_pem);
     let ac = write_pem(&td, "a.crt", &adm_srv.cert_pem);
     let ak = write_pem(&td, "a.key", &adm_srv.key_pem);
-    let bp = 19866u16;
-    let hp = 18266u16;
-    let ahp = 18267u16;
-    let asp = 18268u16;
-    let echo = start_http_echo(bp).await;
+    let be_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bp = be_listener.local_addr().unwrap().port();
+    let echo = start_http_echo_on(be_listener).await;
     let cp = td.path().join("c.yaml");
-    write_cfg(
+    let (mut gw, ports) = start_gateway_with_retry(
         &cp,
-        &format!(
-            r#"
+        |_ports| {
+            format!(
+                r#"
 proxies:
   - id: "t9"
     listen_path: "/api"
@@ -765,37 +966,36 @@ proxies:
 consumers: []
 plugin_configs: []
 "#
-        ),
-    );
-    let mut gw = start_gw(
-        cp.to_str().unwrap(),
-        hp,
-        &[
-            ("FERRUM_TLS_NO_VERIFY", "true"),
-            ("FERRUM_ADMIN_HTTP_PORT", &ahp.to_string()),
-            ("FERRUM_ADMIN_HTTPS_PORT", &asp.to_string()),
-            ("FERRUM_ADMIN_TLS_CERT_PATH", &ac),
-            ("FERRUM_ADMIN_TLS_KEY_PATH", &ak),
-            ("FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH", &ca_p),
-        ],
-    );
-    // Wait for admin HTTPS listener, then verify via HTTP health first
-    sleep(Duration::from_secs(3)).await;
-    let plain = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-        .unwrap();
-    let health = plain
-        .get(format!("http://127.0.0.1:{}/health", ahp))
-        .send()
-        .await;
-    assert!(
-        health.is_ok(),
-        "admin HTTP health should be reachable before testing HTTPS"
-    );
+            )
+        },
+        |ports| {
+            vec![
+                (
+                    "FERRUM_PROXY_HTTPS_PORT".into(),
+                    ports.proxy_https.to_string(),
+                ),
+                (
+                    "FERRUM_ADMIN_HTTP_PORT".into(),
+                    ports.admin_http.to_string(),
+                ),
+                (
+                    "FERRUM_ADMIN_HTTPS_PORT".into(),
+                    ports.admin_https.to_string(),
+                ),
+                ("FERRUM_TLS_NO_VERIFY".into(), "true".into()),
+                ("FERRUM_ADMIN_TLS_CERT_PATH".into(), ac.clone()),
+                ("FERRUM_ADMIN_TLS_KEY_PATH".into(), ak.clone()),
+                (
+                    "FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH".into(),
+                    ca_p.clone(),
+                ),
+            ]
+        },
+    )
+    .await;
     let c = mtls_client(Some(&adm_cli.cert_pem), Some(&adm_cli.key_pem));
     let r = c
-        .get(format!("https://127.0.0.1:{}/health", asp))
+        .get(format!("https://127.0.0.1:{}/health", ports.admin_https))
         .send()
         .await
         .expect("admin mTLS with valid cert should succeed");
@@ -815,16 +1015,15 @@ async fn test_admin_mtls_unauthorized_client_rejected() {
     let ca_p = write_pem(&td, "ca.pem", &ca.cert_pem);
     let ac = write_pem(&td, "a.crt", &adm_srv.cert_pem);
     let ak = write_pem(&td, "a.key", &adm_srv.key_pem);
-    let bp = 19868u16;
-    let hp = 18270u16;
-    let ahp = 18271u16;
-    let asp = 18272u16;
-    let echo = start_http_echo(bp).await;
+    let be_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bp = be_listener.local_addr().unwrap().port();
+    let echo = start_http_echo_on(be_listener).await;
     let cp = td.path().join("c.yaml");
-    write_cfg(
+    let (mut gw, ports) = start_gateway_with_retry(
         &cp,
-        &format!(
-            r#"
+        |_ports| {
+            format!(
+                r#"
 proxies:
   - id: "t10"
     listen_path: "/api"
@@ -835,24 +1034,36 @@ proxies:
 consumers: []
 plugin_configs: []
 "#
-        ),
-    );
-    let mut gw = start_gw(
-        cp.to_str().unwrap(),
-        hp,
-        &[
-            ("FERRUM_TLS_NO_VERIFY", "true"),
-            ("FERRUM_ADMIN_HTTP_PORT", &ahp.to_string()),
-            ("FERRUM_ADMIN_HTTPS_PORT", &asp.to_string()),
-            ("FERRUM_ADMIN_TLS_CERT_PATH", &ac),
-            ("FERRUM_ADMIN_TLS_KEY_PATH", &ak),
-            ("FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH", &ca_p),
-        ],
-    );
-    sleep(Duration::from_secs(3)).await;
+            )
+        },
+        |ports| {
+            vec![
+                (
+                    "FERRUM_PROXY_HTTPS_PORT".into(),
+                    ports.proxy_https.to_string(),
+                ),
+                (
+                    "FERRUM_ADMIN_HTTP_PORT".into(),
+                    ports.admin_http.to_string(),
+                ),
+                (
+                    "FERRUM_ADMIN_HTTPS_PORT".into(),
+                    ports.admin_https.to_string(),
+                ),
+                ("FERRUM_TLS_NO_VERIFY".into(), "true".into()),
+                ("FERRUM_ADMIN_TLS_CERT_PATH".into(), ac.clone()),
+                ("FERRUM_ADMIN_TLS_KEY_PATH".into(), ak.clone()),
+                (
+                    "FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH".into(),
+                    ca_p.clone(),
+                ),
+            ]
+        },
+    )
+    .await;
     let c = mtls_client(None, None);
     let r = c
-        .get(format!("https://127.0.0.1:{}/health", asp))
+        .get(format!("https://127.0.0.1:{}/health", ports.admin_https))
         .send()
         .await;
     assert!(r.is_err(), "no client cert → admin rejected");
@@ -872,15 +1083,18 @@ async fn test_tcp_frontend_mtls_valid_client() {
     let ca_p = write_pem(&td, "ca.pem", &ca.cert_pem);
     let sc = write_pem(&td, "s.crt", &srv.cert_pem);
     let sk = write_pem(&td, "s.key", &srv.key_pem);
-    let bp = 19870u16;
-    let pp = 19871u16;
-    let hp = 18274u16;
-    let echo = start_tcp_echo(bp).await;
+    let be_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bp = be_listener.local_addr().unwrap().port();
+    let echo = start_tcp_echo_on(be_listener).await;
     let cp = td.path().join("c.yaml");
-    write_cfg(
+    // For TCP stream proxies, listen_port is allocated per-attempt inside the
+    // retry wrapper via ports.proxy_https (repurposed as the stream listen port).
+    let (mut gw, ports) = start_gateway_with_retry(
         &cp,
-        &format!(
-            r#"
+        |ports| {
+            let pp = ports.proxy_https; // reuse proxy_https slot for stream listen_port
+            format!(
+                r#"
 proxies:
   - id: "t11"
     listen_path: ""
@@ -892,19 +1106,31 @@ proxies:
 consumers: []
 plugin_configs: []
 "#
-        ),
-    );
-    let mut gw = start_gw(
-        cp.to_str().unwrap(),
-        hp,
-        &[
-            ("FERRUM_FRONTEND_TLS_CERT_PATH", &sc),
-            ("FERRUM_FRONTEND_TLS_KEY_PATH", &sk),
-            ("FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH", &ca_p),
-            ("FERRUM_TLS_NO_VERIFY", "false"),
-        ],
-    );
-    sleep(Duration::from_secs(3)).await;
+            )
+        },
+        |ports| {
+            vec![
+                ("FERRUM_PROXY_HTTPS_PORT".into(), "0".into()), // disable HTTPS proxy listener
+                (
+                    "FERRUM_ADMIN_HTTP_PORT".into(),
+                    ports.admin_http.to_string(),
+                ),
+                (
+                    "FERRUM_ADMIN_HTTPS_PORT".into(),
+                    ports.admin_https.to_string(),
+                ),
+                ("FERRUM_FRONTEND_TLS_CERT_PATH".into(), sc.clone()),
+                ("FERRUM_FRONTEND_TLS_KEY_PATH".into(), sk.clone()),
+                (
+                    "FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH".into(),
+                    ca_p.clone(),
+                ),
+                ("FERRUM_TLS_NO_VERIFY".into(), "false".into()),
+            ]
+        },
+    )
+    .await;
+    let pp = ports.proxy_https; // stream listen port
     let chain: Vec<_> = rustls_pemfile::certs(&mut cli.cert_pem.as_bytes())
         .filter_map(|r| r.ok())
         .collect();
@@ -947,15 +1173,16 @@ async fn test_tcp_frontend_mtls_no_client_cert_rejected() {
     let ca_p = write_pem(&td, "ca.pem", &ca.cert_pem);
     let sc = write_pem(&td, "s.crt", &srv.cert_pem);
     let sk = write_pem(&td, "s.key", &srv.key_pem);
-    let bp = 19872u16;
-    let pp = 19873u16;
-    let hp = 18276u16;
-    let echo = start_tcp_echo(bp).await;
+    let be_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bp = be_listener.local_addr().unwrap().port();
+    let echo = start_tcp_echo_on(be_listener).await;
     let cp = td.path().join("c.yaml");
-    write_cfg(
+    let (mut gw, ports) = start_gateway_with_retry(
         &cp,
-        &format!(
-            r#"
+        |ports| {
+            let pp = ports.proxy_https; // reuse proxy_https slot for stream listen_port
+            format!(
+                r#"
 proxies:
   - id: "t12"
     listen_path: ""
@@ -967,19 +1194,31 @@ proxies:
 consumers: []
 plugin_configs: []
 "#
-        ),
-    );
-    let mut gw = start_gw(
-        cp.to_str().unwrap(),
-        hp,
-        &[
-            ("FERRUM_FRONTEND_TLS_CERT_PATH", &sc),
-            ("FERRUM_FRONTEND_TLS_KEY_PATH", &sk),
-            ("FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH", &ca_p),
-            ("FERRUM_TLS_NO_VERIFY", "false"),
-        ],
-    );
-    sleep(Duration::from_secs(3)).await;
+            )
+        },
+        |ports| {
+            vec![
+                ("FERRUM_PROXY_HTTPS_PORT".into(), "0".into()), // disable HTTPS proxy listener
+                (
+                    "FERRUM_ADMIN_HTTP_PORT".into(),
+                    ports.admin_http.to_string(),
+                ),
+                (
+                    "FERRUM_ADMIN_HTTPS_PORT".into(),
+                    ports.admin_https.to_string(),
+                ),
+                ("FERRUM_FRONTEND_TLS_CERT_PATH".into(), sc.clone()),
+                ("FERRUM_FRONTEND_TLS_KEY_PATH".into(), sk.clone()),
+                (
+                    "FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH".into(),
+                    ca_p.clone(),
+                ),
+                ("FERRUM_TLS_NO_VERIFY".into(), "false".into()),
+            ]
+        },
+    )
+    .await;
+    let pp = ports.proxy_https; // stream listen port
     let prov = rustls::crypto::ring::default_provider();
     let tls = rustls::ClientConfig::builder_with_provider(Arc::new(prov))
         .with_safe_default_protocol_versions()
@@ -1019,14 +1258,15 @@ async fn test_backend_tls_global_ca_bundle() {
     let ca = generate_ca("Global-CA");
     let be = generate_signed_cert(&ca, "Global-BE", &["localhost"]);
     let ca_p = write_pem(&td, "ca.pem", &ca.cert_pem);
-    let bp = 19874u16;
-    let hp = 18278u16;
-    let echo = start_https_echo(bp, &be.cert_pem, &be.key_pem, None).await;
+    let be_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bp = be_listener.local_addr().unwrap().port();
+    let echo = start_https_echo_on(be_listener, &be.cert_pem, &be.key_pem, None).await;
     let cp = td.path().join("c.yaml");
-    write_cfg(
+    let (mut gw, ports) = start_gateway_with_retry(
         &cp,
-        &format!(
-            r#"
+        |_ports| {
+            format!(
+                r#"
 proxies:
   - id: "t13"
     listen_path: "/api"
@@ -1040,23 +1280,34 @@ proxies:
 consumers: []
 plugin_configs: []
 "#
-        ),
-    );
-    let mut gw = start_gw(
-        cp.to_str().unwrap(),
-        hp,
-        &[
-            ("FERRUM_TLS_NO_VERIFY", "false"),
-            ("FERRUM_TLS_CA_BUNDLE_PATH", &ca_p),
-        ],
-    );
-    sleep(Duration::from_secs(3)).await;
+            )
+        },
+        |ports| {
+            vec![
+                (
+                    "FERRUM_PROXY_HTTPS_PORT".into(),
+                    ports.proxy_https.to_string(),
+                ),
+                (
+                    "FERRUM_ADMIN_HTTP_PORT".into(),
+                    ports.admin_http.to_string(),
+                ),
+                (
+                    "FERRUM_ADMIN_HTTPS_PORT".into(),
+                    ports.admin_https.to_string(),
+                ),
+                ("FERRUM_TLS_NO_VERIFY".into(), "false".into()),
+                ("FERRUM_TLS_CA_BUNDLE_PATH".into(), ca_p.clone()),
+            ]
+        },
+    )
+    .await;
     let c = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()
         .unwrap();
     let r = c
-        .get(format!("http://127.0.0.1:{}/api/test", hp))
+        .get(format!("http://127.0.0.1:{}/api/test", ports.proxy_http))
         .send()
         .await
         .expect("global CA bundle should work");
