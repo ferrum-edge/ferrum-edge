@@ -299,10 +299,14 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
             let _ = crate::socket_opts::set_so_busy_poll(fd, so_busy_poll_us);
             let _ = crate::socket_opts::set_so_prefer_busy_poll(fd, true);
         }
-        // UDP_GRO: kernel coalesces same-size datagrams into single large buffer (Linux 5.0+).
-        if udp_gro_enabled {
-            let _ = crate::socket_opts::set_udp_gro(fd, true);
-        }
+        // UDP_GRO: kernel coalesces same-size datagrams into a single large buffer (Linux 5.0+).
+        // NOTE: GRO is not yet enabled on the socket because the recvmmsg receive path
+        // does not split coalesced payloads using the GRO cmsg segment size. Enabling GRO
+        // without splitting would forward merged payloads as single datagrams, breaking
+        // protocols that depend on UDP datagram boundaries. The socket_opts infrastructure
+        // (set_udp_gro, extract_gro_segment_size) is ready — wire it in when the recv
+        // path is updated to use recvmsg with cmsg buffers for GRO splitting.
+        let _ = udp_gro_enabled;
     }
 
     // GSO is applied at send time via send_with_gso() — the flag is forwarded to the
