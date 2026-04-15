@@ -424,8 +424,9 @@ impl GrpcConnectionPool {
         let addr = format!("{}:{}", target_host, port);
         let connect_timeout = Duration::from_millis(proxy.backend_connect_timeout_ms);
 
-        // Connect with timeout
-        let tcp = tokio::time::timeout(connect_timeout, TcpStream::connect(&addr))
+        // Connect with timeout, using TcpSocket to set IP_BIND_ADDRESS_NO_PORT
+        // before connect() so the kernel can co-select ephemeral ports.
+        let tcp = tokio::time::timeout(connect_timeout, Self::connect_with_opts(&addr))
             .await
             .map_err(|_| {
                 warn!(
@@ -453,13 +454,6 @@ impl GrpcConnectionPool {
 
         // Disable Nagle for lower latency
         let _ = tcp.set_nodelay(true);
-
-        // Defer ephemeral port allocation to connect() for better 4-tuple distribution.
-        #[cfg(unix)]
-        {
-            use std::os::unix::io::AsRawFd;
-            let _ = crate::socket_opts::set_ip_bind_address_no_port(tcp.as_raw_fd(), true);
-        }
 
         // Apply TCP keepalive using per-proxy pool config
         let pool_config = self.global_pool_config.for_proxy(proxy);
@@ -508,6 +502,30 @@ impl GrpcConnectionPool {
         }
 
         builder
+    }
+
+    /// Connect to a backend address with `IP_BIND_ADDRESS_NO_PORT` set before
+    /// `connect()` so the kernel can co-select ephemeral ports using 4-tuple
+    /// optimization. Falls back to plain `TcpStream::connect` on non-Unix.
+    async fn connect_with_opts(addr: &str) -> std::io::Result<TcpStream> {
+        let sock_addr: std::net::SocketAddr = tokio::net::lookup_host(addr)
+            .await?
+            .next()
+            .ok_or_else(|| std::io::Error::other("DNS returned no addresses"))?;
+
+        let socket = if sock_addr.is_ipv4() {
+            tokio::net::TcpSocket::new_v4()?
+        } else {
+            tokio::net::TcpSocket::new_v6()?
+        };
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            let _ = crate::socket_opts::set_ip_bind_address_no_port(socket.as_raw_fd(), true);
+        }
+
+        socket.connect(sock_addr).await
     }
 
     /// Set TCP keepalive on a stream to detect dead backend connections.
