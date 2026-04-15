@@ -516,7 +516,7 @@ tests/
 │   ├── config/                # Config parsing, env vars, TLS, pool config
 │   ├── plugins/               # Per-plugin unit tests
 │   ├── admin/                 # Admin API handler tests
-│   └── gateway_core/          # Router, proxy, consumer index, DNS, socket_opts_tests, date_cache_tests, tls_offload_tests, lazy_timeout_tests
+│   └── gateway_core/          # Router cache, load balancer, health checks, circuit breaker, overload, proxy body, DNS, TLS, consumer index, protocol validation, socket_opts, date_cache, tls_offload, lazy_timeout
 ├── integration/               # mTLS, connection pool, CP/DP gRPC, HTTP/3
 ├── functional/                # End-to-end per mode (file, DB, CP/DP, WebSocket, gRPC, LB)
 └── performance/               # wrk-based load tests with baseline comparison
@@ -533,7 +533,7 @@ tests/
 
 **Adding a new test file** to `tests/unit/`: create the file and add `mod <name>;` to the relevant `tests/unit/<category>/mod.rs`.
 
-**Inline `#[cfg(test)]` blocks are correct and intentional** for any test that calls a private function — do not move them to `tests/unit/` and do not make functions `pub` just to enable external testing.
+**Inline `#[cfg(test)]` blocks are correct and intentional** for any test that calls a private function — do not move them to `tests/unit/` and do not make functions `pub` just to enable external testing. Source files with inline test modules include: `adaptive_buffer.rs`, `overload.rs`, `load_balancer.rs` (HealthBitset, golden_ratio_hash), `router_cache.rs` (CountMinSketch, frequency_aware_evict), `config/mongo_store.rs`, `grpc/cp_server.rs`, `proxy/udp_proxy.rs`, `secrets/env.rs`, `secrets/file.rs`, `secrets/mod.rs`, `service_discovery/consul.rs`, `service_discovery/kubernetes.rs`.
 
 **Functional test subprocess rule**: Use `Stdio::null()` for the gateway's stdout/stderr unless the test explicitly reads the output. `Stdio::piped()` without reading causes a pipe-buffer deadlock (OS buffer fills from debug logs → gateway blocks on writes → test hangs).
 

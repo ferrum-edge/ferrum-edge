@@ -339,3 +339,178 @@ async fn test_grpc_probe_returns_false_for_nonexistent_host() {
     .await;
     assert!(!result, "probe should return false for a non-existent host");
 }
+
+// ─── Passive Health Window Semantics ────────────────────────────────────────
+
+#[test]
+fn test_passive_window_only_counts_recent_failures() {
+    // With window_seconds=1, failures older than 1s should not count.
+    let checker = HealthChecker::new();
+    let target = make_target("backend1", 8080);
+    let config = PassiveHealthCheck {
+        unhealthy_status_codes: vec![500],
+        unhealthy_threshold: 3,
+        unhealthy_window_seconds: 1, // 1 second window
+        healthy_after_seconds: 30,
+    };
+
+    // Record 2 failures (under threshold)
+    checker.report_response(TEST_PROXY, &target, 500, false, Some(&config));
+    checker.report_response(TEST_PROXY, &target, 500, false, Some(&config));
+    assert!(
+        !is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"),
+        "Should not be unhealthy with only 2 failures"
+    );
+
+    // Sleep past the window
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+
+    // Record 1 more failure — the old 2 should have expired from the window
+    checker.report_response(TEST_PROXY, &target, 500, false, Some(&config));
+    assert!(
+        !is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"),
+        "Old failures outside window should not count toward threshold"
+    );
+}
+
+#[test]
+fn test_passive_window_failures_within_window_accumulate() {
+    let checker = HealthChecker::new();
+    let target = make_target("backend1", 8080);
+    let config = PassiveHealthCheck {
+        unhealthy_status_codes: vec![500],
+        unhealthy_threshold: 3,
+        unhealthy_window_seconds: 60,
+        healthy_after_seconds: 30,
+    };
+
+    // All 3 failures within the 60s window
+    checker.report_response(TEST_PROXY, &target, 500, false, Some(&config));
+    checker.report_response(TEST_PROXY, &target, 500, false, Some(&config));
+    assert!(!is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"));
+
+    checker.report_response(TEST_PROXY, &target, 500, false, Some(&config));
+    assert!(
+        is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"),
+        "Should be unhealthy after 3 failures within window"
+    );
+}
+
+#[test]
+fn test_passive_health_threshold_1_immediate_unhealthy() {
+    let checker = HealthChecker::new();
+    let target = make_target("backend1", 8080);
+    let config = PassiveHealthCheck {
+        unhealthy_status_codes: vec![500, 502],
+        unhealthy_threshold: 1,
+        unhealthy_window_seconds: 60,
+        healthy_after_seconds: 30,
+    };
+
+    checker.report_response(TEST_PROXY, &target, 502, false, Some(&config));
+    assert!(
+        is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"),
+        "Threshold of 1 should mark unhealthy on first failure"
+    );
+}
+
+// ─── Connection Error Tests ─────────────────────────────────────────────────
+
+#[test]
+fn test_connection_error_ignores_status_code_list() {
+    let checker = HealthChecker::new();
+    let target = make_target("backend1", 8080);
+    let config = PassiveHealthCheck {
+        unhealthy_status_codes: vec![500], // Only 500 in the list
+        unhealthy_threshold: 1,
+        unhealthy_window_seconds: 60,
+        healthy_after_seconds: 30,
+    };
+
+    // Status code 200 with connection_error=true should still count as failure
+    checker.report_response(TEST_PROXY, &target, 200, true, Some(&config));
+    assert!(
+        is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"),
+        "Connection errors should trigger failure regardless of status code"
+    );
+}
+
+// ─── Multi-Target Isolation ─────────────────────────────────────────────────
+
+#[test]
+fn test_passive_health_per_target_isolation() {
+    let checker = HealthChecker::new();
+    let target_a = make_target("backend-a", 8080);
+    let _target_b = make_target("backend-b", 8080);
+    let config = PassiveHealthCheck {
+        unhealthy_status_codes: vec![500],
+        unhealthy_threshold: 2,
+        unhealthy_window_seconds: 60,
+        healthy_after_seconds: 30,
+    };
+
+    // Fail target_a only
+    checker.report_response(TEST_PROXY, &target_a, 500, false, Some(&config));
+    checker.report_response(TEST_PROXY, &target_a, 500, false, Some(&config));
+
+    assert!(is_passive_unhealthy(&checker, TEST_PROXY, "backend-a:8080"));
+    assert!(
+        !is_passive_unhealthy(&checker, TEST_PROXY, "backend-b:8080"),
+        "target_b should remain healthy"
+    );
+}
+
+// ─── Recovery Clears Failure History ────────────────────────────────────────
+
+#[test]
+fn test_recovery_clears_failures_then_re_threshold() {
+    let checker = HealthChecker::new();
+    let target = make_target("backend1", 8080);
+    let config = PassiveHealthCheck {
+        unhealthy_status_codes: vec![500],
+        unhealthy_threshold: 3,
+        unhealthy_window_seconds: 60,
+        healthy_after_seconds: 30,
+    };
+
+    // Mark unhealthy
+    for _ in 0..3 {
+        checker.report_response(TEST_PROXY, &target, 500, false, Some(&config));
+    }
+    assert!(is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"));
+
+    // Recover with a success
+    checker.report_response(TEST_PROXY, &target, 200, false, Some(&config));
+    assert!(!is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"));
+
+    // Now it should take a full 3 failures again to mark unhealthy
+    // (failure history was cleared on recovery)
+    checker.report_response(TEST_PROXY, &target, 500, false, Some(&config));
+    checker.report_response(TEST_PROXY, &target, 500, false, Some(&config));
+    assert!(
+        !is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"),
+        "Should need full threshold after recovery"
+    );
+
+    checker.report_response(TEST_PROXY, &target, 500, false, Some(&config));
+    assert!(is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"));
+}
+
+// ─── No Config Means No Tracking ────────────────────────────────────────────
+
+#[test]
+fn test_no_passive_config_is_noop() {
+    let checker = HealthChecker::new();
+    let target = make_target("backend1", 8080);
+
+    // Report with no passive config
+    for _ in 0..100 {
+        checker.report_response(TEST_PROXY, &target, 500, false, None);
+    }
+
+    assert_eq!(
+        checker.passive_health.len(),
+        0,
+        "No passive state should be created without config"
+    );
+}

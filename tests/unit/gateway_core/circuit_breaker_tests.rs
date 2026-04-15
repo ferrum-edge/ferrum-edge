@@ -738,3 +738,179 @@ fn test_circuit_breaker_prune_stale_targets() {
     // Direct backend key (proxy2, no "::") should be preserved
     assert_eq!(cache.len(), 2); // proxy1::10.0.0.1:8080 + proxy2
 }
+
+// ─── Timeout Boundary Tests ─────────────────────────────────────────────────
+
+#[test]
+fn test_timeout_zero_transitions_immediately_to_half_open() {
+    let config = CircuitBreakerConfig {
+        failure_threshold: 1,
+        success_threshold: 1,
+        timeout_seconds: 0, // Immediate transition
+        failure_status_codes: vec![500],
+        half_open_max_requests: 1,
+        trip_on_connection_errors: true,
+    };
+    let cb = CircuitBreaker::new(config);
+
+    cb.record_failure(500, false);
+    assert_eq!(cb.state_name(), "open");
+
+    // With timeout=0, can_execute should immediately transition to half_open
+    assert!(cb.can_execute().is_ok());
+    assert_eq!(cb.state_name(), "half_open");
+}
+
+#[test]
+fn test_timeout_does_not_transition_before_elapsed() {
+    let config = CircuitBreakerConfig {
+        failure_threshold: 1,
+        success_threshold: 1,
+        timeout_seconds: 60, // Long timeout
+        failure_status_codes: vec![500],
+        half_open_max_requests: 1,
+        trip_on_connection_errors: true,
+    };
+    let cb = CircuitBreaker::new(config);
+
+    cb.record_failure(500, false);
+    assert_eq!(cb.state_name(), "open");
+
+    // Should still be open (60s hasn't elapsed)
+    assert!(cb.can_execute().is_err());
+    assert_eq!(cb.state_name(), "open");
+}
+
+// ─── Target Key Format Tests ────────────────────────────────────────────────
+
+#[test]
+fn test_target_key_ipv4() {
+    let key = target_key("10.0.0.1", 8080);
+    assert_eq!(key, "10.0.0.1:8080");
+}
+
+#[test]
+fn test_target_key_ipv6() {
+    // IPv6 addresses contain colons — verify the key format
+    let key = target_key("::1", 8080);
+    assert_eq!(key, "::1:8080");
+}
+
+#[test]
+fn test_target_key_hostname() {
+    let key = target_key("backend.example.com", 443);
+    assert_eq!(key, "backend.example.com:443");
+}
+
+#[test]
+fn test_cache_keys_different_proxies_same_target() {
+    // Verify that different proxies with the same target get different cache keys
+    let cache = CircuitBreakerCache::new();
+    let config = default_config();
+
+    let cb_a = cache.get_or_create("proxy-a", Some("10.0.0.1:8080"), &config);
+    let cb_b = cache.get_or_create("proxy-b", Some("10.0.0.1:8080"), &config);
+
+    // Trip one breaker
+    cb_a.record_failure(500, false);
+    cb_a.record_failure(500, false);
+    cb_a.record_failure(500, false);
+    assert_eq!(cb_a.state_name(), "open");
+
+    // Other proxy's breaker should be unaffected
+    assert_eq!(cb_b.state_name(), "closed");
+}
+
+// ─── Concurrent record_failure + record_success ─────────────────────────────
+
+#[test]
+fn test_concurrent_failure_and_success_recording() {
+    use std::sync::Arc;
+    use std::thread;
+
+    let config = CircuitBreakerConfig {
+        failure_threshold: 100, // High threshold to avoid state change during test
+        success_threshold: 1,
+        timeout_seconds: 60,
+        failure_status_codes: vec![500],
+        half_open_max_requests: 1,
+        trip_on_connection_errors: true,
+    };
+    let cb = Arc::new(CircuitBreaker::new(config));
+
+    let mut handles = vec![];
+
+    // Spawn threads recording failures
+    for _ in 0..10 {
+        let cb = cb.clone();
+        handles.push(thread::spawn(move || {
+            for _ in 0..100 {
+                cb.record_failure(500, false);
+            }
+        }));
+    }
+
+    // Spawn threads recording successes
+    for _ in 0..10 {
+        let cb = cb.clone();
+        handles.push(thread::spawn(move || {
+            for _ in 0..100 {
+                cb.record_success();
+            }
+        }));
+    }
+
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    // Should not panic or be in an inconsistent state
+    let state = cb.state_name();
+    assert!(
+        state == "closed" || state == "open",
+        "State should be valid: {}",
+        state
+    );
+}
+
+// ─── Cache Capacity Tests ───────────────────────────────────────────────────
+
+#[test]
+fn test_cache_max_entries_exceeded_returns_transient_breaker() {
+    let cache = CircuitBreakerCache::with_max_entries(2);
+    let config = default_config();
+
+    // Fill the cache
+    cache.get_or_create("p1", Some("t1"), &config);
+    cache.get_or_create("p2", Some("t2"), &config);
+    assert_eq!(cache.len(), 2);
+
+    // Third entry should still return a breaker (transient) but not grow cache
+    let cb = cache.get_or_create("p3", Some("t3"), &config);
+    assert!(
+        cb.can_execute().is_ok(),
+        "Transient breaker should allow requests"
+    );
+    assert_eq!(cache.len(), 2, "Cache should not grow beyond max");
+}
+
+#[test]
+fn test_cache_config_change_replaces_breaker() {
+    let cache = CircuitBreakerCache::new();
+    let config1 = default_config();
+    let config2 = CircuitBreakerConfig {
+        failure_threshold: 10, // Different threshold
+        ..default_config()
+    };
+
+    // Create with config1
+    let cb1 = cache.get_or_create("proxy1", Some("target1"), &config1);
+    cb1.record_failure(500, false);
+
+    // Get with config2 — should replace the breaker (config changed)
+    let cb2 = cache.get_or_create("proxy1", Some("target1"), &config2);
+
+    // New breaker should be fresh (closed, no failures)
+    assert_eq!(cb2.state_name(), "closed");
+    assert!(cb2.can_execute().is_ok());
+}
