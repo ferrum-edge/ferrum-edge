@@ -342,7 +342,6 @@ fn env_config_overload_config_conversion() {
     assert_eq!(overload.loop_critical_us, env.overload_loop_critical_us);
 }
 
-<<<<<<< HEAD
 // ── Threshold boundary tests ─────────────────────────────────────────
 
 #[test]
