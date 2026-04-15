@@ -1940,35 +1940,15 @@ async fn create_session(
     tokio::spawn(async move {
         let mut buf = vec![0u8; MAX_UDP_DATAGRAM_SIZE];
 
-        // Create a connected UDP socket for this client address (Linux only).
-        // Connected sockets bypass the kernel routing table lookup on send(),
-        // saving ~5-10% CPU for high-frequency reply traffic.
-        #[cfg(target_os = "linux")]
-        let connected_reply_socket: Option<std::sync::Arc<UdpSocket>> =
-            if reply_udp_connected_sockets && !is_dtls {
-                let local_addr = frontend.local_addr().ok();
-                if let Some(local) = local_addr {
-                    match crate::socket_opts::create_connected_udp_socket(local, client_addr) {
-                        Ok(fd) => {
-                            use std::os::unix::io::FromRawFd;
-                            let std_sock = unsafe { std::net::UdpSocket::from_raw_fd(fd) };
-                            std_sock.set_nonblocking(true).ok();
-                            match UdpSocket::from_std(std_sock) {
-                                Ok(s) => Some(std::sync::Arc::new(s)),
-                                Err(_) => None,
-                            }
-                        }
-                        Err(_) => None,
-                    }
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-        #[cfg(not(target_os = "linux"))]
+        // Connected UDP sockets (SO_REUSEADDR+SO_REUSEPORT bound to the listen port)
+        // would steal incoming datagrams via 4-tuple demux, so they cannot be used
+        // safely in the per-session reply path. The sendmmsg and GSO batch paths
+        // provide equivalent syscall reduction for the reply direction.
+        // The FERRUM_UDP_CONNECTED_SOCKETS_ENABLED flag and create_connected_udp_socket()
+        // infrastructure remain available for future use on the listener recv path
+        // where the socket owns its port exclusively.
         let connected_reply_socket: Option<std::sync::Arc<UdpSocket>> = None;
-        let _ = reply_udp_connected_sockets; // used in cfg(linux) block above
+        let _ = reply_udp_connected_sockets;
         let mut disconnect_error: Option<(String, crate::retry::ErrorClass)> = None;
         // Pre-allocate sendmmsg batch for batched client replies (Linux only).
         #[cfg(target_os = "linux")]

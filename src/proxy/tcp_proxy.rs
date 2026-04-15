@@ -1783,7 +1783,34 @@ async fn try_ktls_splice(
         }
     };
 
+    // Pre-flight: probe TCP_ULP installation on the raw fd BEFORE consuming
+    // the TLS stream. If the kernel doesn't support kTLS (ENOPROTOOPT), we
+    // can still fall back with the TLS stream intact.
+    {
+        let (tcp_ref, _) = tls_stream.get_ref();
+        let fd = tcp_ref.as_raw_fd();
+        let ulp_name = b"tls\0";
+        let ret = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::IPPROTO_TCP,
+                libc::TCP_ULP,
+                ulp_name.as_ptr() as *const libc::c_void,
+                ulp_name.len() as libc::socklen_t,
+            )
+        };
+        if ret != 0 {
+            let err = std::io::Error::last_os_error();
+            debug!("kTLS: TCP_ULP probe failed ({}), falling back", err);
+            return Err(KtlsError::Unsupported(tls_stream, backend_stream));
+        }
+        // TCP_ULP installed successfully — kTLS is available on this socket.
+        // Proceed to extract secrets (point of no return after this block).
+    }
+
     // Point of no return: consume the TLS stream to extract secrets.
+    // TCP_ULP is already installed on the underlying fd, so kTLS key
+    // installation should succeed.
     let (tcp_stream, server_conn) = tls_stream.into_inner();
 
     let secrets = match server_conn.dangerous_extract_secrets() {

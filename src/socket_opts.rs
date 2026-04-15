@@ -599,7 +599,11 @@ pub mod ktls {
                 // Kernel doesn't support kTLS — fall back silently.
                 return Ok(false);
             }
-            return Err(err);
+            if err.raw_os_error() == Some(libc::EEXIST) {
+                // TCP_ULP already installed (e.g., by pre-flight probe) — continue.
+            } else {
+                return Err(err);
+            }
         }
 
         let tls_version = match params.tls_version {
@@ -845,9 +849,9 @@ pub mod io_uring_splice {
     /// Returns `Err` with `ErrorKind::Unsupported` if the ring cannot be created,
     /// signaling the caller to fall back to `libc::splice`.
     ///
-    /// `timeout_ms` is checked between splice iterations — if elapsed time since
-    /// `start_ms` exceeds the timeout, returns `ErrorKind::TimedOut`. Pass 0 to
-    /// disable the idle timeout.
+    /// `timeout_ms` is the idle timeout — if no data is transferred for this
+    /// duration, returns `ErrorKind::TimedOut`. The activity timestamp is
+    /// refreshed after each successful splice. Pass 0 to disable.
     pub fn io_uring_splice_loop(
         src_fd: i32,
         pipe_w: i32,
@@ -870,16 +874,20 @@ pub mod io_uring_splice {
         let splice_flags = (libc::SPLICE_F_MOVE | libc::SPLICE_F_NONBLOCK) as u32;
         let mut total: u64 = 0;
         let chunk_size: u32 = 128 * 1024;
+        // Track last activity for idle timeout — refreshed after each successful splice.
+        let mut last_activity_ms = start_ms;
 
         loop {
             // Inline idle timeout check — prevents indefinite blocking on
-            // idle connections (matches the libc splice path behavior).
+            // idle connections. Compares against last_activity_ms which is
+            // refreshed after each successful splice transfer, so active
+            // connections are never timed out.
             if timeout_ms > 0 {
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_millis() as u64;
-                if now.saturating_sub(start_ms) >= timeout_ms {
+                if now.saturating_sub(last_activity_ms) >= timeout_ms {
                     return Err(std::io::Error::from(std::io::ErrorKind::TimedOut));
                 }
             }
@@ -960,6 +968,13 @@ pub mod io_uring_splice {
                 }
                 remaining -= w as u32;
                 total += w as u64;
+                // Refresh idle timeout — active connections should never time out.
+                if timeout_ms > 0 {
+                    last_activity_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64;
+                }
             }
         }
     }
