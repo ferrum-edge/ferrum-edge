@@ -205,7 +205,7 @@ The overload manager (`src/overload.rs`) provides progressive load shedding base
 | FD ≥ 95% or Conn ≥ 95% or Loop ≥ 500ms | `reject_new_connections` → accept+drop (HTTP) / refuse (H3) | 1 `AtomicBool::load(Relaxed)` per accept |
 | Req ≥ 95% | `reject_new_requests` → 503 (HTTP) / gRPC UNAVAILABLE / H3 503 | 1 `AtomicBool::load(Relaxed)` per request |
 
-**Admin endpoint**: `GET /overload` (unauthenticated) returns JSON with pressure ratios and active actions. Returns 503 when `level` is `critical`.
+**Admin endpoint**: `GET /overload` (unauthenticated) returns JSON with pressure ratios, active actions, and a `port_exhaustion_events` counter (monotonic count of EADDRNOTAVAIL errors). Returns 503 when `level` is `critical`.
 
 **State transitions are logged**: `warn` when entering overload, `info` when recovering. No log spam — only logs on transitions.
 
@@ -810,7 +810,7 @@ These are hard-won findings from profiling. Violating them causes measurable reg
 
 **Pingora-inspired optimizations (added in this PR):**
 - **Frequency-aware router cache eviction**: The router cache uses a Count-Min Sketch for frequency estimation instead of random 25% eviction. Hot route entries are protected from eviction by scanner traffic. The sketch uses two FNV-1a hash rows of AtomicU8 counters with periodic aging (right-shift every `cache_capacity * 4` increments). Eviction samples 8x the target count and removes the least-frequent entries.
-- **`IP_BIND_ADDRESS_NO_PORT`** (Linux): Set on all outbound TCP connections in stream proxies. Defers ephemeral port allocation to `connect()` time, enabling kernel 4-tuple optimization and preventing port exhaustion under high connection rates.
+- **`IP_BIND_ADDRESS_NO_PORT`** (Linux): Set on all outbound TCP connections in stream proxies, HTTP/2 direct pool, and gRPC pool (also on HTTP/3 QUIC sockets). Defers ephemeral port allocation to `connect()` time, enabling kernel 4-tuple optimization and preventing port exhaustion under high connection rates. Port exhaustion events (EADDRNOTAVAIL) are detected via `retry::is_port_exhaustion()`, logged at `error` level with remediation guidance, and tracked in `OverloadState.port_exhaustion_events` (exposed via `GET /overload`).
 - **`TCP_FASTOPEN`** (Linux): Enabled on proxy listener sockets (`FERRUM_TCP_FASTOPEN_ENABLED`) and outbound stream proxy connections. Saves 1 RTT on repeat connections by sending data in the SYN packet.
 - **Thread-local Date header caching**: `date_cache::get_cached_date()` returns a cached HTTP Date string, refreshed once per second per thread. Avoids `SystemTime::now()` + formatting (~100ns) on every response.
 - **TLS handshake offload runtime**: Optional dedicated single-threaded tokio runtimes (`FERRUM_TLS_OFFLOAD_THREADS`) for CPU-intensive TLS handshakes. Sharded by peer hash for TLS session cache affinity.
