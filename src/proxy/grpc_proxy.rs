@@ -990,6 +990,17 @@ pub async fn proxy_grpc_request_streaming(
             ))
         })?
         .map_err(|e| {
+            // Check if the failure was caused by the request body exceeding the
+            // size limit. The GrpcBody::Streaming error triggers an h2 stream
+            // reset which surfaces here as a send_request error. Return
+            // ResourceExhausted instead of BackendUnavailable so clients get
+            // the correct gRPC status code.
+            if body_size_exceeded.load(Ordering::Acquire) {
+                return GrpcProxyError::ResourceExhausted(format!(
+                    "gRPC request payload size exceeds maximum of {} bytes",
+                    max_grpc_recv_size_bytes
+                ));
+            }
             error!("gRPC backend request failed (streaming body): {}", e);
             GrpcProxyError::BackendUnavailable(format!("Backend request failed: {}", e))
         })?;
