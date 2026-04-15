@@ -212,7 +212,7 @@ Example output:
 === Ferrum Edge Migration Status ===
 
 Applied migrations:
-  V1: initial_schema (applied: 2025-01-15T10:30:00Z, checksum: v001_initial_schema_a1b2c3d4)
+  V1: initial_schema (applied: 2025-01-15T10:30:00Z, checksum: v001_initial_schema)
 
 Pending migrations: (none — schema is up to date)
 
@@ -354,10 +354,10 @@ MongoDB does not use SQL migrations. Instead, `MongoStore::run_migrations()` cre
 
 | Collection | Indexes |
 |-----------|---------|
-| `proxies` | `name` (unique), `updated_at`, `upstream_id`, `listen_port` |
-| `consumers` | `username` (unique), `custom_id` (unique sparse), `updated_at` |
-| `plugin_configs` | `proxy_id`, `updated_at` |
-| `upstreams` | `name` (unique), `updated_at` |
+| `proxies` | `(namespace, name)` unique sparse, `updated_at`, `upstream_id`, `(namespace, listen_port)` unique sparse, `namespace`, `(namespace, updated_at)` |
+| `consumers` | `(namespace, username)` unique, `(namespace, custom_id)` unique sparse, `updated_at`, `namespace`, `(namespace, updated_at)` |
+| `plugin_configs` | `proxy_id`, `updated_at`, `namespace`, `(namespace, updated_at)`, `(namespace, scope)`, `(namespace, plugin_name)` |
+| `upstreams` | `(namespace, name)` unique sparse, `updated_at`, `namespace`, `(namespace, updated_at)` |
 
 ### Running MongoDB Migrations
 

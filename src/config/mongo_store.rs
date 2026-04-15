@@ -1385,6 +1385,21 @@ mod inner {
                         .build(),
                 )
                 .await?;
+            // Compound indexes for common admin API query patterns (V002)
+            self.plugin_configs()
+                .create_index(
+                    IndexModel::builder()
+                        .keys(doc! { "namespace": 1, "scope": 1 })
+                        .build(),
+                )
+                .await?;
+            self.plugin_configs()
+                .create_index(
+                    IndexModel::builder()
+                        .keys(doc! { "namespace": 1, "plugin_name": 1 })
+                        .build(),
+                )
+                .await?;
 
             // upstreams indexes — uniqueness scoped to namespace
             self.upstreams()

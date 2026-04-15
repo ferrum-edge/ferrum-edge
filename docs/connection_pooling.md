@@ -180,6 +180,44 @@ FERRUM_POOL_WARMUP_ENABLED=false
 
 This may be useful in development or when backends are not yet available at gateway startup time.
 
+## Database Pool Observability
+
+The admin `/status` (and `/health`) endpoint includes database connection pool statistics when the database is connected. This helps operators monitor pool utilization and tune `FERRUM_DB_POOL_*` settings.
+
+```json
+{
+  "database": {
+    "status": "connected",
+    "type": "postgres",
+    "pool": {
+      "size": 10,
+      "idle": 8,
+      "active": 2,
+      "max_connections": 10,
+      "min_connections": 1,
+      "read_replica": {
+        "size": 5,
+        "idle": 5,
+        "active": 0
+      }
+    }
+  }
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `size` | Current number of connections managed by the pool (idle + active) |
+| `idle` | Connections available for checkout |
+| `active` | Connections currently in use |
+| `max_connections` | Configured maximum (`FERRUM_DB_POOL_MAX_CONNECTIONS`) |
+| `min_connections` | Configured minimum idle (`FERRUM_DB_POOL_MIN_CONNECTIONS`) |
+| `read_replica` | Present only when `FERRUM_DB_READ_REPLICA_URL` is configured |
+
+**MongoDB**: Pool stats are not available (the MongoDB driver manages pooling internally). The `pool` field is omitted from the response.
+
+**Tuning guidance**: If `active` consistently equals `max_connections`, increase `FERRUM_DB_POOL_MAX_CONNECTIONS`. If `idle` is consistently high, consider reducing `min_connections` to save resources.
+
 ## Benefits
 
 - **2-3x Higher Throughput**: Connection reuse eliminates setup overhead

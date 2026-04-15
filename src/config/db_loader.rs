@@ -46,6 +46,40 @@ struct PluginConfigRef {
     proxy_id: Option<String>,
 }
 
+/// Identifies a resource table for lightweight `SELECT id` queries.
+///
+/// Used by `load_table_ids()` to eliminate dynamic table-name interpolation
+/// and make SQL injection impossible by construction.
+#[derive(Clone, Copy)]
+enum ResourceTable {
+    Proxies,
+    Consumers,
+    PluginConfigs,
+    Upstreams,
+}
+
+impl ResourceTable {
+    /// Static SQL for loading IDs — no format!() needed.
+    const fn select_ids_sql(self) -> &'static str {
+        match self {
+            Self::Proxies => "SELECT id FROM proxies WHERE namespace = ?",
+            Self::Consumers => "SELECT id FROM consumers WHERE namespace = ?",
+            Self::PluginConfigs => "SELECT id FROM plugin_configs WHERE namespace = ?",
+            Self::Upstreams => "SELECT id FROM upstreams WHERE namespace = ?",
+        }
+    }
+
+    /// Label for slow-query logging.
+    const fn load_ids_label(self) -> &'static str {
+        match self {
+            Self::Proxies => "load_table_ids(proxies)",
+            Self::Consumers => "load_table_ids(consumers)",
+            Self::PluginConfigs => "load_table_ids(plugin_configs)",
+            Self::Upstreams => "load_table_ids(upstreams)",
+        }
+    }
+}
+
 /// Database connection pool tuning parameters.
 ///
 /// These are exposed via `FERRUM_DB_POOL_*` environment variables and applied
@@ -176,10 +210,20 @@ impl DatabaseStore {
             .max_lifetime(std::time::Duration::from_secs(config.max_lifetime_seconds))
             .after_connect(move |conn, _meta| {
                 Box::pin(async move {
-                    // Enable foreign key enforcement on every SQLite connection
-                    // (PRAGMA is per-connection, not persistent across pool connections)
+                    // SQLite per-connection PRAGMAs (not persistent across pool
+                    // connections — must be set on every checkout).
                     if is_sqlite {
                         conn.execute("PRAGMA foreign_keys = ON").await?;
+                        // WAL mode dramatically improves concurrent read/write
+                        // performance. Unlike other PRAGMAs this persists on the
+                        // database file, but setting it per-connection is a harmless
+                        // no-op once applied and ensures it is always enabled even
+                        // after a fresh database creation.
+                        conn.execute("PRAGMA journal_mode = WAL").await?;
+                        // Without busy_timeout, concurrent writes immediately fail
+                        // with SQLITE_BUSY. 5 000 ms gives the WAL writer time to
+                        // finish before returning an error.
+                        conn.execute("PRAGMA busy_timeout = 5000").await?;
                     }
                     // Set per-statement timeout on network databases to prevent
                     // runaway queries from holding connections indefinitely.
@@ -1954,10 +1998,18 @@ impl DatabaseStore {
         let changed_upstreams = self.load_upstreams_since(namespace, &since_str).await?;
 
         // Fetch current IDs (lightweight — one TEXT column per table)
-        let current_proxy_ids = self.load_table_ids(namespace, "proxies").await?;
-        let current_consumer_ids = self.load_table_ids(namespace, "consumers").await?;
-        let current_plugin_config_ids = self.load_table_ids(namespace, "plugin_configs").await?;
-        let current_upstream_ids = self.load_table_ids(namespace, "upstreams").await?;
+        let current_proxy_ids = self
+            .load_table_ids(namespace, ResourceTable::Proxies)
+            .await?;
+        let current_consumer_ids = self
+            .load_table_ids(namespace, ResourceTable::Consumers)
+            .await?;
+        let current_plugin_config_ids = self
+            .load_table_ids(namespace, ResourceTable::PluginConfigs)
+            .await?;
+        let current_upstream_ids = self
+            .load_table_ids(namespace, ResourceTable::Upstreams)
+            .await?;
 
         // Detect deletions: IDs we knew about that no longer exist
         let removed_proxy_ids = diff_removed(known_proxy_ids, &current_proxy_ids);
@@ -2169,15 +2221,16 @@ impl DatabaseStore {
         Ok(upstreams)
     }
 
-    /// Load all IDs from a table (lightweight — one TEXT column, no deserialization).
+    /// Load all IDs from a resource table (lightweight — one TEXT column, no
+    /// deserialization). The table is selected via [`ResourceTable`] to ensure
+    /// only known tables are queried — no dynamic string interpolation.
     async fn load_table_ids(
         &self,
         namespace: &str,
-        table: &str,
+        table: ResourceTable,
     ) -> Result<HashSet<String>, anyhow::Error> {
         let start = Instant::now();
-        // Table name is a compile-time constant from the caller, not user input.
-        let sql = self.q(&format!("SELECT id FROM {} WHERE namespace = ?", table));
+        let sql = self.q(table.select_ids_sql());
         let rows: Vec<AnyRow> = sqlx::query(&sql)
             .bind(namespace)
             .fetch_all(&self.rpool())
@@ -2189,7 +2242,7 @@ impl DatabaseStore {
                 ids.insert(id);
             }
         }
-        self.check_slow_query(&format!("load_table_ids({})", table), start);
+        self.check_slow_query(table.load_ids_label(), start);
         Ok(ids)
     }
 
@@ -3054,6 +3107,30 @@ impl DatabaseBackend for DatabaseStore {
 
     fn has_read_replica(&self) -> bool {
         self.has_read_replica_pool()
+    }
+
+    fn pool_stats(&self) -> Option<crate::config::db_backend::DbPoolStats> {
+        let primary = self.pool.load();
+        let size = primary.size();
+        let idle = primary.num_idle() as u32;
+
+        let replica = self.read_replica_pool.as_ref().map(|rp| {
+            let rp = rp.load();
+            Box::new(crate::config::db_backend::DbPoolStatsInner {
+                size: rp.size(),
+                idle: rp.num_idle() as u32,
+                active: rp.size().saturating_sub(rp.num_idle() as u32),
+            })
+        });
+
+        Some(crate::config::db_backend::DbPoolStats {
+            size,
+            idle,
+            active: size.saturating_sub(idle),
+            max_connections: self.pool_config.max_connections,
+            min_connections: self.pool_config.min_connections,
+            read_replica: replica,
+        })
     }
 
     fn set_slow_query_threshold(&mut self, threshold_ms: Option<u64>) {

@@ -2507,6 +2507,37 @@ components:
             error:
               type: [string, "null"]
               description: Error message when disconnected
+            pool:
+              type: object
+              description: |
+                Connection pool statistics (SQL backends only; absent for MongoDB).
+                Present only when status is `connected`.
+              properties:
+                size:
+                  type: integer
+                  description: Current connections managed by the pool (idle + active)
+                idle:
+                  type: integer
+                  description: Connections available for checkout
+                active:
+                  type: integer
+                  description: Connections currently in use
+                max_connections:
+                  type: integer
+                  description: Configured maximum (FERRUM_DB_POOL_MAX_CONNECTIONS)
+                min_connections:
+                  type: integer
+                  description: Configured minimum idle (FERRUM_DB_POOL_MIN_CONNECTIONS)
+                read_replica:
+                  type: object
+                  description: Read replica pool stats (present only when FERRUM_DB_READ_REPLICA_URL is configured)
+                  properties:
+                    size:
+                      type: integer
+                    idle:
+                      type: integer
+                    active:
+                      type: integer
         cached_config:
           type: object
           required: [available]

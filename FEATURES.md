@@ -15,7 +15,7 @@ A comprehensive feature list for Ferrum Edge.
 
 ## Operating Modes
 
-- **Database** — single-instance with PostgreSQL, MySQL, SQLite, or MongoDB backend
+- **Database** — single-instance with PostgreSQL, MySQL, SQLite (WAL mode, busy timeout), or MongoDB backend
 - **File** — single-instance with YAML/JSON config, SIGHUP reload (Unix only; restart required on other platforms)
 - **Control Plane (CP)** — centralized config authority, gRPC distribution to DPs
 - **Data Plane (DP)** — horizontally scalable traffic processing nodes with multi-CP failover (`FERRUM_DP_CP_GRPC_URLS`)

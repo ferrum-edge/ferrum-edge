@@ -163,7 +163,12 @@ impl V001InitialSchema {
                 udp_max_response_amplification_factor REAL,
                 created_at VARCHAR(50) NOT NULL,
                 updated_at VARCHAR(50) NOT NULL,
-                CONSTRAINT fk_proxies_upstream FOREIGN KEY (upstream_id) REFERENCES upstreams(id) ON DELETE RESTRICT
+                CONSTRAINT fk_proxies_upstream FOREIGN KEY (upstream_id) REFERENCES upstreams(id) ON DELETE RESTRICT,
+                CONSTRAINT chk_proxies_backend_port CHECK (backend_port >= 0 AND backend_port <= 65535),
+                CONSTRAINT chk_proxies_listen_port CHECK (listen_port IS NULL OR (listen_port >= 1 AND listen_port <= 65535)),
+                CONSTRAINT chk_proxies_connect_timeout CHECK (backend_connect_timeout_ms > 0),
+                CONSTRAINT chk_proxies_read_timeout CHECK (backend_read_timeout_ms > 0),
+                CONSTRAINT chk_proxies_write_timeout CHECK (backend_write_timeout_ms > 0)
             )
             "#
         } else {
@@ -216,7 +221,12 @@ impl V001InitialSchema {
                 allowed_ws_origins TEXT,
                 udp_max_response_amplification_factor REAL,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                CHECK (backend_port >= 0 AND backend_port <= 65535),
+                CHECK (listen_port IS NULL OR (listen_port >= 1 AND listen_port <= 65535)),
+                CHECK (backend_connect_timeout_ms > 0),
+                CHECK (backend_read_timeout_ms > 0),
+                CHECK (backend_write_timeout_ms > 0)
             )
             "#
         };
@@ -304,6 +314,9 @@ impl V001InitialSchema {
             "CREATE INDEX IF NOT EXISTS idx_consumers_ns_updated ON consumers (namespace, updated_at)",
             "CREATE INDEX IF NOT EXISTS idx_plugin_configs_ns_updated ON plugin_configs (namespace, updated_at)",
             "CREATE INDEX IF NOT EXISTS idx_upstreams_ns_updated ON upstreams (namespace, updated_at)",
+            // Compound indexes on plugin_configs for common admin API query patterns
+            "CREATE INDEX IF NOT EXISTS idx_plugin_configs_ns_scope ON plugin_configs (namespace, scope)",
+            "CREATE INDEX IF NOT EXISTS idx_plugin_configs_ns_plugin_name ON plugin_configs (namespace, plugin_name)",
         ];
 
         for idx_sql in indexes {
