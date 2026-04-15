@@ -654,6 +654,7 @@ start_kong_e2e_tls() {
         -e KONG_PROXY_LISTEN="0.0.0.0:$GATEWAY_HTTP_PORT, 0.0.0.0:$GATEWAY_HTTPS_PORT ssl" \
         -e KONG_SSL_CERT=/etc/kong/ssl/server.crt \
         -e KONG_SSL_CERT_KEY=/etc/kong/ssl/server.key \
+        -e KONG_TLS_CERTIFICATE_VERIFY=off \
         -e KONG_ADMIN_LISTEN="off" \
         -e KONG_PROXY_ACCESS_LOG=/dev/null \
         -e KONG_PROXY_ERROR_LOG=/dev/stderr \

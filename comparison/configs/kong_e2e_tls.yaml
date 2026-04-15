@@ -4,16 +4,17 @@ _format_version: "3.0"
 # Frontend: HTTPS (TLS termination) → Backend: HTTPS (re-encryption)
 #
 # NOTE: BACKEND_HOST is replaced at runtime by run_comparison.sh
-# NOTE: tls_verify is false because the benchmark measures TLS encryption
-# overhead, not certificate verification. The self-signed test cert causes
-# hostname verification failures in Kong/OpenSSL.
+# NOTE: Backend TLS verification is disabled via KONG_TLS_CERTIFICATE_VERIFY=off
+# in run_comparison.sh because the benchmark measures TLS encryption overhead,
+# not certificate verification. The self-signed test cert causes hostname
+# verification failures in Kong/OpenSSL. Kong 3.14+ forbids service-level
+# tls_verify overrides when the global setting is enabled.
 
 services:
   - name: health-service-e2e
     host: BACKEND_HOST
     port: 3443
     protocol: https
-    tls_verify: false
     connect_timeout: 1000
     read_timeout: 5000
     write_timeout: 5000
@@ -31,7 +32,6 @@ services:
     host: BACKEND_HOST
     port: 3443
     protocol: https
-    tls_verify: false
     connect_timeout: 1000
     read_timeout: 5000
     write_timeout: 5000
