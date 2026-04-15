@@ -368,10 +368,7 @@ pub fn send_with_gso(
     // Fill in the cmsg header and data.
     let cmsg = unsafe { libc::CMSG_FIRSTHDR(&msg) };
     if cmsg.is_null() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "CMSG_FIRSTHDR returned null",
-        ));
+        return Err(std::io::Error::other("CMSG_FIRSTHDR returned null"));
     }
     unsafe {
         (*cmsg).cmsg_level = libc::SOL_UDP;
@@ -699,9 +696,7 @@ pub mod ktls {
     pub fn is_ktls_available() -> bool {
         // Check if the tls module is already loaded by examining /proc/modules.
         if let Ok(modules) = std::fs::read_to_string("/proc/modules") {
-            if modules.lines().any(|l| l.starts_with("tls ")) {
-                return true;
-            }
+            return modules.lines().any(|l| l.starts_with("tls "));
         }
         false
     }
@@ -882,7 +877,7 @@ pub mod io_uring_splice {
 /// `sendto()` destination resolution.
 ///
 /// The connected socket shares the same local port as the parent via `SO_REUSEADDR`
-/// + `SO_REUSEPORT`. The kernel demultiplexes incoming datagrams to the connected
+/// and `SO_REUSEPORT`. The kernel demultiplexes incoming datagrams to the connected
 /// socket (4-tuple match) preferentially over the unconnected listener.
 ///
 /// Returns the connected socket fd, or an error if binding/connecting fails.
