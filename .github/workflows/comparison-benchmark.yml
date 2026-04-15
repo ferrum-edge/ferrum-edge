@@ -352,6 +352,24 @@ jobs:
               run_label = f"Run {run}" if ITERATIONS > 1 else "Results"
               lines.append(f"\n### {run_label}\n")
 
+              # Direct backend baseline summary
+              bl_data = data.get("baseline", {})
+              if bl_data:
+                  lines.append("#### Direct Backend Baseline\n")
+                  for proto in PROTOCOLS:
+                      for ep in ENDPOINTS:
+                          bl_m = bl_data.get(proto, {}).get(ep, {})
+                          if bl_m and bl_m.get("rps") is not None:
+                              proto_label = PROTO_LABELS.get(proto, proto)
+                              lines.append(
+                                  f"- **{proto_label}** {ENDPOINT_LABELS.get(ep, ep)}: "
+                                  f"{fmt_rps(bl_m.get('rps'))} req/s — "
+                                  f"{fmt_ms(bl_m.get('latency_avg_ms'))} avg — "
+                                  f"P99 {fmt_ms(bl_m.get('latency_p99_ms'))} — "
+                                  f"{bl_m.get('error_count', 0)} errors"
+                              )
+                  lines.append("")
+
               for proto in PROTOCOLS:
                   gws_with_data = [gw for gw in GATEWAYS if gw != "baseline" and proto in data.get(gw, {})]
                   if not gws_with_data:
@@ -362,7 +380,23 @@ jobs:
                   lines.append("|---------|----------|-----|-------------|-----|-----|-------|--------|-------------|")
 
                   for ep in ENDPOINTS:
-                      bl_rps = data.get("baseline", {}).get(proto, {}).get(ep, {}).get("rps")
+                      bl_m = data.get("baseline", {}).get(proto, {}).get(ep, {})
+                      bl_rps = bl_m.get("rps") if bl_m else None
+
+                      # Baseline row first
+                      if bl_m and bl_rps is not None:
+                          lines.append(
+                              f"| **{GATEWAY_LABELS.get('baseline', 'Direct Backend')}** "
+                              f"| {ENDPOINT_LABELS.get(ep, ep)} "
+                              f"| {fmt_rps(bl_rps)} "
+                              f"| {fmt_ms(bl_m.get('latency_avg_ms'))} "
+                              f"| {fmt_ms(bl_m.get('latency_p50_ms'))} "
+                              f"| {fmt_ms(bl_m.get('latency_p99_ms'))} "
+                              f"| {fmt_ms(bl_m.get('latency_p999_ms'))} "
+                              f"| {bl_m.get('error_count', 0)} "
+                              f"| — |"
+                          )
+
                       # Find best RPS for highlighting
                       rps_values = []
                       for gw in gws_with_data:

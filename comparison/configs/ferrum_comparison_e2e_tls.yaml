@@ -1,6 +1,12 @@
 ---
 # Ferrum Edge comparison benchmark configuration — end-to-end TLS
 # Frontend: HTTPS (TLS termination) → Backend: HTTPS (re-encryption)
+#
+# backend_tls_verify_server_cert is false because the benchmark measures TLS
+# encryption overhead, not certificate verification.  The self-signed test cert
+# lacks basicConstraints CA:TRUE which causes webpki to reject it as a trust
+# anchor.  All other gateways in this benchmark also skip backend cert
+# verification for E2E TLS.
 
 proxies:
   - id: "proxy-health"
@@ -14,7 +20,7 @@ proxies:
     backend_connect_timeout_ms: 1000
     backend_read_timeout_ms: 5000
     backend_write_timeout_ms: 5000
-    backend_tls_verify_server_cert: true
+    backend_tls_verify_server_cert: false
     auth_mode: single
     plugins: []
 
@@ -29,7 +35,7 @@ proxies:
     backend_connect_timeout_ms: 1000
     backend_read_timeout_ms: 5000
     backend_write_timeout_ms: 5000
-    backend_tls_verify_server_cert: true
+    backend_tls_verify_server_cert: false
     auth_mode: single
     pool_idle_timeout_seconds: 180
     plugins: []
