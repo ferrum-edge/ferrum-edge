@@ -1,0 +1,401 @@
+# On-demand resource scale benchmark.
+#
+# Runs the functional_scale_perf_test against the gateway, progressively
+# adding proxies (with key_auth + access_control plugins and unique consumers)
+# in batches up to 30,000 total.  After each batch a load test measures
+# throughput and latency.  Results are posted to the GitHub Actions step summary
+# with RPS/latency degradation analysis and error breakdown.
+#
+# The test uses the existing Rust functional test harness which handles gateway
+# lifecycle, resource creation via batch admin API, and load generation.
+#
+# Usage:
+#   - Go to Actions -> "Resources Scale Benchmark" -> "Run workflow"
+#   - Pick the branch (or PR branch) to benchmark
+#   - Choose SQLite (default, no deps) or PostgreSQL
+
+name: Resources Scale Benchmark
+
+on:
+  workflow_dispatch:
+    inputs:
+      db_type:
+        description: "Database backend"
+        required: false
+        default: "sqlite"
+        type: choice
+        options:
+          - sqlite
+          - postgres
+
+jobs:
+  scale-benchmark:
+    name: Scale Benchmark (${{ inputs.db_type }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+        continue-on-error: true
+
+      - name: Configure sccache
+        run: |
+          if command -v sccache &> /dev/null && sccache --start-server 2>/dev/null; then
+            echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
+            echo "SCCACHE_GHA_ENABLED=true" >> $GITHUB_ENV
+            echo "sccache enabled"
+          else
+            echo "sccache unavailable, building without cache"
+          fi
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "ci-scale-bench"
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler libcurl4-openssl-dev lsof sysstat
+
+      - name: Runner health check (pre-benchmark)
+        run: |
+          echo "=========================================="
+          echo "  RUNNER HEALTH CHECK — PRE-BENCHMARK"
+          echo "=========================================="
+          echo ""
+
+          echo "--- CPU Info ---"
+          nproc
+          lscpu | grep -E 'Model name|CPU\(s\)|Thread|Core|Socket|MHz|Hypervisor|Virtualization'
+          echo ""
+
+          echo "--- CPU Steal / Usage (5-second sample) ---"
+          vmstat 1 6 | tail -n 5
+          echo ""
+
+          AVG_STEAL=$(vmstat 1 6 | tail -n 5 | awk '{sum += $17; n++} END {printf "%.1f", sum/n}')
+          echo "Average CPU steal over 5s: ${AVG_STEAL}%"
+          if (( $(echo "$AVG_STEAL > 5.0" | bc -l) )); then
+            echo "::warning::CPU steal is ${AVG_STEAL}% — noisy neighbor detected. Benchmark results may be unreliable."
+          else
+            echo "CPU steal is low (${AVG_STEAL}%). Runner appears unimpaired."
+          fi
+          echo ""
+
+          echo "--- Memory ---"
+          free -h
+          echo ""
+
+          echo "--- System Load ---"
+          uptime
+          echo ""
+
+          echo "=========================================="
+          echo "  HEALTH CHECK COMPLETE"
+          echo "=========================================="
+
+      # Pre-build the gateway binary so the test harness's internal
+      # `cargo build --release` is a fast no-op.
+      - name: Build gateway binary
+        run: cargo build --release --bin ferrum-edge
+
+      - name: Run scale benchmark (SQLite)
+        if: inputs.db_type == 'sqlite'
+        timeout-minutes: 90
+        run: |
+          cargo test --test functional_tests \
+            test_scale_perf_30k_proxies \
+            -- --ignored --nocapture 2>&1 | tee /tmp/scale_bench_output.txt
+
+      - name: Start PostgreSQL container
+        if: inputs.db_type == 'postgres'
+        run: |
+          # The Rust test checks for "ferrum-scale-test-pg" by name via `docker inspect`.
+          docker run -d --name ferrum-scale-test-pg \
+            -e POSTGRES_USER=ferrum \
+            -e POSTGRES_PASSWORD=ferrum-scale-test \
+            -e POSTGRES_DB=ferrum_scale \
+            -p 25432:5432 \
+            postgres:16
+
+          # Wait for the container to be ready
+          echo "Waiting for PostgreSQL to be ready..."
+          for i in $(seq 1 30); do
+            if docker exec ferrum-scale-test-pg pg_isready -U ferrum 2>/dev/null; then
+              echo "PostgreSQL container ready"
+              break
+            fi
+            if [ "$i" = "30" ]; then
+              echo "::error::PostgreSQL did not become ready in 30 seconds"
+              exit 1
+            fi
+            sleep 1
+          done
+
+      - name: Run scale benchmark (PostgreSQL)
+        if: inputs.db_type == 'postgres'
+        timeout-minutes: 90
+        run: |
+          cargo test --test functional_tests \
+            test_scale_perf_30k_proxies_postgres \
+            -- --ignored --nocapture 2>&1 | tee /tmp/scale_bench_output.txt
+
+      - name: Parse results and post summary
+        if: always()
+        env:
+          DB_TYPE: ${{ inputs.db_type }}
+        run: |
+          python3 - /tmp/scale_bench_output.txt <<'PYEOF'
+          import sys, os, re, json
+
+          summary_file = os.environ.get("GITHUB_STEP_SUMMARY", "/dev/null")
+          db_type = os.environ.get("DB_TYPE", "sqlite")
+          build_profile = "release"
+
+          output_path = sys.argv[1]
+          if not os.path.exists(output_path):
+              with open(summary_file, "a") as f:
+                  f.write("## Resources Scale Benchmark\n\nNo output captured — test may have failed to start.\n")
+              sys.exit(0)
+
+          raw = open(output_path).read()
+
+          # Parse the box-formatted results from print_perf_result() and the summary table.
+          # Each perf result block looks like:
+          #   │  Proxies:   3000  │  Duration:  30.0s                   │
+          #   │  Total requests:          12345                       │
+          #   │  Successful:              12300                       │
+          #   │  Failed:                     45                       │
+          #   │  RPS:                    1234.5                       │
+          #   │  Avg latency:        1234 µs (  1.2 ms)            │
+          #   │  P50 latency:         987 µs (  1.0 ms)            │
+          #   │  P95 latency:        2345 µs (  2.3 ms)            │
+          #   │  P99 latency:        5678 µs (  5.7 ms)            │
+          #   │  Max latency:       12345 µs ( 12.3 ms)            │
+
+          results = []
+
+          # Strategy: find each "Proxies:" line and extract the following metrics block
+          blocks = raw.split("┌─────────────────────────────────────────────────────────┐")
+          for block in blocks[1:]:  # skip everything before the first block
+              r = {}
+              m = re.search(r'Proxies:\s+([\d,]+)', block)
+              if m:
+                  r['proxies'] = int(m.group(1).replace(',', ''))
+
+              m = re.search(r'Duration:\s+([\d.]+)s', block)
+              if m:
+                  r['duration_secs'] = float(m.group(1))
+
+              m = re.search(r'Total requests:\s+([\d,]+)', block)
+              if m:
+                  r['total_requests'] = int(m.group(1).replace(',', ''))
+
+              m = re.search(r'Successful:\s+([\d,]+)', block)
+              if m:
+                  r['successful'] = int(m.group(1).replace(',', ''))
+
+              m = re.search(r'Failed:\s+([\d,]+)', block)
+              if m:
+                  r['failed'] = int(m.group(1).replace(',', ''))
+
+              m = re.search(r'RPS:\s+([\d.]+)', block)
+              if m:
+                  r['rps'] = float(m.group(1))
+
+              for label, key in [('Avg', 'avg_us'), ('P50', 'p50_us'), ('P95', 'p95_us'), ('P99', 'p99_us'), ('Max', 'max_us')]:
+                  m = re.search(rf'{label} latency:\s+([\d.]+)\s+µs', block)
+                  if m:
+                      r[key] = float(m.group(1))
+
+              if 'proxies' in r and 'rps' in r:
+                  results.append(r)
+
+          # Also try to extract the summary table (has all data in one place)
+          # Format: "   3000     12345.0       1.2       1.0       2.3       5.7      12.3  (100% of baseline)"
+          # But the box-format parsing above is more reliable, so we prefer that.
+
+          # Check for test success/failure
+          test_passed = "test result: ok" in raw
+          test_failed = "test result: FAILED" in raw or "FAILED" in raw.split("\n")[-5:].__repr__()
+
+          # Extract any assertion failures or panics
+          errors = []
+          for line in raw.split("\n"):
+              if "panicked" in line.lower() or "assertion" in line.lower() and "failed" in line.lower():
+                  errors.append(line.strip())
+              if "SUCCESS rate dropped" in line or "WARNING:" in line:
+                  errors.append(line.strip())
+
+          # Build the summary
+          lines = []
+          lines.append("## Resources Scale Benchmark Results\n")
+          lines.append(f"**Database:** `{db_type}` | **Build Profile:** `{build_profile}` | "
+                       f"**Test Status:** {'PASSED' if test_passed else 'FAILED'}\n")
+
+          if not results:
+              lines.append("No benchmark data points were captured from the test output.\n")
+              if errors:
+                  lines.append("### Errors\n")
+                  for e in errors:
+                      lines.append(f"- `{e}`")
+              with open(summary_file, "a") as f:
+                  f.write("\n".join(lines) + "\n")
+              # Print to stdout too
+              print("\n".join(lines))
+              sys.exit(0)
+
+          def fmt_us(us):
+              if us is None:
+                  return "N/A"
+              if us >= 1_000_000:
+                  return f"{us/1_000_000:.2f}s"
+              if us >= 1000:
+                  return f"{us/1000:.2f}ms"
+              return f"{us:.0f}us"
+
+          def fmt_rps(v):
+              return f"{v:,.0f}"
+
+          # Main results table
+          lines.append("### Per-Batch Results\n")
+          lines.append("| Proxies | RPS | Avg Latency | P50 | P95 | P99 | Max | Requests | Errors | Success Rate |")
+          lines.append("|---------|-----|-------------|-----|-----|-----|-----|----------|--------|--------------|")
+
+          baseline_rps = results[0]['rps'] if results else 1.0
+
+          for r in results:
+              total = r.get('total_requests', 0)
+              failed = r.get('failed', 0)
+              success = r.get('successful', 0)
+              success_rate = (success / total * 100) if total > 0 else 0
+              lines.append(
+                  f"| {r['proxies']:,} "
+                  f"| {fmt_rps(r['rps'])} "
+                  f"| {fmt_us(r.get('avg_us'))} "
+                  f"| {fmt_us(r.get('p50_us'))} "
+                  f"| {fmt_us(r.get('p95_us'))} "
+                  f"| {fmt_us(r.get('p99_us'))} "
+                  f"| {fmt_us(r.get('max_us'))} "
+                  f"| {total:,} "
+                  f"| {failed:,} "
+                  f"| {success_rate:.1f}% |"
+              )
+
+          # Degradation analysis
+          if len(results) >= 2:
+              lines.append("\n### Degradation Analysis\n")
+
+              first = results[0]
+              last = results[-1]
+              first_rps = first['rps']
+              last_rps = last['rps']
+
+              rps_degradation = (1.0 - last_rps / first_rps) * 100 if first_rps > 0 else 0
+
+              # RPS degradation
+              if rps_degradation > 0:
+                  severity = "minimal" if rps_degradation < 15 else "moderate" if rps_degradation < 40 else "significant" if rps_degradation < 70 else "severe"
+                  icon = "white_check_mark" if rps_degradation < 15 else "warning" if rps_degradation < 40 else "x"
+                  lines.append(f"**RPS Degradation** ({first['proxies']:,} -> {last['proxies']:,} proxies): "
+                               f"**{rps_degradation:.1f}%** ({severity}) :{icon}:")
+              else:
+                  lines.append(f"**RPS Degradation** ({first['proxies']:,} -> {last['proxies']:,} proxies): "
+                               f"**None** (RPS improved or stable) :white_check_mark:")
+
+              lines.append(f"- Baseline ({first['proxies']:,} proxies): {fmt_rps(first_rps)} RPS")
+              lines.append(f"- Final ({last['proxies']:,} proxies): {fmt_rps(last_rps)} RPS")
+              lines.append("")
+
+              # Latency degradation
+              for label, key in [("Avg", "avg_us"), ("P50", "p50_us"), ("P95", "p95_us"), ("P99", "p99_us")]:
+                  first_val = first.get(key, 0)
+                  last_val = last.get(key, 0)
+                  if first_val > 0:
+                      increase = ((last_val - first_val) / first_val) * 100
+                      lines.append(f"**{label} Latency**: {fmt_us(first_val)} -> {fmt_us(last_val)} "
+                                   f"({'+' if increase > 0 else ''}{increase:.1f}%)")
+
+              lines.append("")
+
+              # Per-step RPS change table
+              lines.append("### Step-by-Step RPS Progression\n")
+              lines.append("| Step | Proxies | RPS | vs Baseline | vs Previous |")
+              lines.append("|------|---------|-----|-------------|-------------|")
+
+              for i, r in enumerate(results):
+                  vs_baseline = (r['rps'] / first_rps * 100) if first_rps > 0 else 0
+                  if i == 0:
+                      vs_prev = "—"
+                  else:
+                      prev_rps = results[i-1]['rps']
+                      change = ((r['rps'] - prev_rps) / prev_rps * 100) if prev_rps > 0 else 0
+                      vs_prev = f"{'+' if change > 0 else ''}{change:.1f}%"
+
+                  lines.append(
+                      f"| {i+1} "
+                      f"| {r['proxies']:,} "
+                      f"| {fmt_rps(r['rps'])} "
+                      f"| {vs_baseline:.0f}% "
+                      f"| {vs_prev} |"
+                  )
+
+          # Error analysis
+          total_errors = sum(r.get('failed', 0) for r in results)
+          if total_errors > 0:
+              lines.append("\n### Error Summary\n")
+              lines.append(f"**Total errors across all batches:** {total_errors:,}\n")
+              for r in results:
+                  if r.get('failed', 0) > 0:
+                      total = r.get('total_requests', 0)
+                      error_rate = (r['failed'] / total * 100) if total > 0 else 0
+                      lines.append(f"- {r['proxies']:,} proxies: {r['failed']:,} errors ({error_rate:.2f}% error rate)")
+
+          if errors:
+              lines.append("\n### Test Warnings/Assertions\n")
+              for e in errors[:20]:  # cap at 20
+                  lines.append(f"- `{e}`")
+
+          # Raw JSON data for programmatic consumption
+          lines.append("\n<details><summary>Raw JSON data</summary>\n")
+          lines.append("```json")
+          json_data = {
+              "db_type": db_type,
+              "build_profile": build_profile,
+              "test_passed": test_passed,
+              "results": results,
+          }
+          lines.append(json.dumps(json_data, indent=2))
+          lines.append("```\n")
+          lines.append("</details>")
+
+          with open(summary_file, "a") as f:
+              f.write("\n".join(lines) + "\n")
+
+          # Print to stdout
+          for line in lines:
+              print(line)
+
+          # Save JSON for artifact upload
+          with open("/tmp/scale_bench_results.json", "w") as f:
+              json.dump(json_data, f, indent=2)
+          PYEOF
+
+      - name: Upload benchmark results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: scale-benchmark-${{ inputs.db_type }}-${{ github.sha }}
+          path: |
+            /tmp/scale_bench_output.txt
+            /tmp/scale_bench_results.json
+          retention-days: 90
