@@ -330,6 +330,14 @@ impl SendMmsgBatch {
 }
 
 /// Convert a `std::net::SocketAddr` to `libc::sockaddr_storage` + length.
+///
+/// Public alias for use by `flush_gso_batch()` in `udp_proxy.rs`.
+#[cfg(target_os = "linux")]
+pub fn std_to_sockaddr_storage_pub(addr: SocketAddr) -> (libc::sockaddr_storage, libc::socklen_t) {
+    std_to_sockaddr_storage(addr)
+}
+
+/// Convert a `std::net::SocketAddr` to `libc::sockaddr_storage` + length.
 #[cfg(target_os = "linux")]
 fn std_to_sockaddr_storage(addr: SocketAddr) -> (libc::sockaddr_storage, libc::socklen_t) {
     let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
@@ -404,6 +412,141 @@ pub struct SendMmsgBatch;
 #[allow(dead_code)]
 impl SendMmsgBatch {
     pub fn new(_capacity: usize) -> Self {
+        Self
+    }
+}
+
+/// GSO batch buffer for sending multiple same-size datagrams in a single `sendmsg()`
+/// with `UDP_SEGMENT` ancillary data (Linux 4.18+).
+///
+/// Concatenates consecutive same-size datagrams into a contiguous buffer and flushes
+/// via `send_with_gso()` or `send_with_gso_connected()`. When a different-size datagram
+/// arrives, the current batch is flushed and a new batch starts. This is complementary
+/// to `SendMmsgBatch` — GSO provides kernel-level segmentation which is more efficient
+/// than `sendmmsg` when datagrams share the same size and destination.
+///
+/// Only available on Linux. On other platforms, the UDP proxy falls back to `SendMmsgBatch`
+/// or individual sends.
+#[cfg(target_os = "linux")]
+pub struct GsoBatchBuf {
+    /// Contiguous buffer holding concatenated same-size datagrams.
+    buf: Vec<u8>,
+    /// Segment size of datagrams currently in the buffer (0 = empty).
+    segment_size: usize,
+    /// Number of datagrams currently in the buffer.
+    count: usize,
+    /// Maximum bytes to accumulate before auto-flushing.
+    /// Kernel GSO limit is typically 64KB (~65535 bytes).
+    max_bytes: usize,
+}
+
+#[cfg(target_os = "linux")]
+impl GsoBatchBuf {
+    /// Create a new GSO batch buffer.
+    ///
+    /// `max_bytes` caps the concatenated buffer size. The kernel GSO path
+    /// has a ~64KB limit per sendmsg, so 65535 is a safe maximum.
+    pub fn new(max_bytes: usize) -> Self {
+        Self {
+            buf: Vec::with_capacity(max_bytes.min(65535)),
+            segment_size: 0,
+            count: 0,
+            max_bytes: max_bytes.min(65535),
+        }
+    }
+
+    /// Whether the buffer is empty.
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    /// Try to append a datagram. Returns `false` if the datagram has a different
+    /// size than the current batch or the buffer would exceed `max_bytes`, meaning
+    /// the caller should flush first and then call `push` again.
+    pub fn push(&mut self, data: &[u8]) -> bool {
+        if data.is_empty() {
+            return true; // skip empty datagrams
+        }
+        if self.count == 0 {
+            // First datagram — set segment size.
+            self.segment_size = data.len();
+            self.buf.clear();
+            self.buf.extend_from_slice(data);
+            self.count = 1;
+            return true;
+        }
+        // Same size check: GSO requires all segments to be the same size
+        // (the last segment may be shorter, but we only batch exact matches
+        // for simplicity and correctness).
+        if data.len() != self.segment_size {
+            return false; // different size — caller should flush first
+        }
+        if self.buf.len() + data.len() > self.max_bytes {
+            return false; // would exceed max — caller should flush first
+        }
+        self.buf.extend_from_slice(data);
+        self.count += 1;
+        true
+    }
+
+    /// Flush the buffer via GSO sendmsg to a specific destination address.
+    ///
+    /// Uses `send_with_gso()` which includes the destination in the msghdr.
+    /// Falls back to nothing on error — caller handles errors.
+    pub fn flush_to(
+        &mut self,
+        fd: std::os::fd::RawFd,
+        dest: &libc::sockaddr_storage,
+        dest_len: libc::socklen_t,
+    ) -> std::io::Result<usize> {
+        if self.count == 0 {
+            return Ok(0);
+        }
+        let result = crate::socket_opts::send_with_gso(
+            fd,
+            &self.buf,
+            self.segment_size as u16,
+            dest,
+            dest_len,
+        );
+        let sent_count = self.count;
+        self.buf.clear();
+        self.count = 0;
+        self.segment_size = 0;
+        result.map(|_| sent_count)
+    }
+
+    /// Flush the buffer via GSO sendmsg on a connected socket (no destination needed).
+    pub fn flush_connected(&mut self, fd: std::os::fd::RawFd) -> std::io::Result<usize> {
+        if self.count == 0 {
+            return Ok(0);
+        }
+        let result =
+            crate::socket_opts::send_with_gso_connected(fd, &self.buf, self.segment_size as u16);
+        let sent_count = self.count;
+        self.buf.clear();
+        self.count = 0;
+        self.segment_size = 0;
+        result.map(|_| sent_count)
+    }
+
+    /// Reset the buffer without sending (e.g., on error fallback).
+    pub fn clear(&mut self) {
+        self.buf.clear();
+        self.count = 0;
+        self.segment_size = 0;
+    }
+}
+
+/// Non-Linux stub for GsoBatchBuf.
+#[cfg(not(target_os = "linux"))]
+#[allow(dead_code)]
+pub struct GsoBatchBuf;
+
+#[cfg(not(target_os = "linux"))]
+#[allow(dead_code)]
+impl GsoBatchBuf {
+    pub fn new(_max_bytes: usize) -> Self {
         Self
     }
 }

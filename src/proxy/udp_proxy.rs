@@ -178,6 +178,24 @@ fn build_dtls_stream_summary(context: DtlsDisconnectContext<'_>) -> StreamTransa
     }
 }
 
+/// Flush a GSO batch buffer using the connected reply socket if available,
+/// falling back to the frontend socket with destination address.
+#[cfg(target_os = "linux")]
+fn flush_gso_batch(
+    gso_batch: &mut super::udp_batch::GsoBatchBuf,
+    frontend: &Arc<UdpSocket>,
+    connected_reply_socket: &Option<std::sync::Arc<UdpSocket>>,
+    client_addr: SocketAddr,
+) -> std::io::Result<usize> {
+    use std::os::unix::io::AsRawFd;
+    if let Some(ref cs) = connected_reply_socket {
+        gso_batch.flush_connected(cs.as_raw_fd())
+    } else {
+        let (dest, dest_len) = super::udp_batch::std_to_sockaddr_storage_pub(client_addr);
+        gso_batch.flush_to(frontend.as_raw_fd(), &dest, dest_len)
+    }
+}
+
 /// Configuration for starting a UDP proxy listener.
 pub struct UdpListenerConfig {
     pub port: u16,
@@ -261,6 +279,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
         udp_connected_sockets_enabled,
     } = cfg;
     // so_busy_poll_us and udp_gro_enabled are used in #[cfg(target_os = "linux")] blocks below.
+    #[cfg(not(target_os = "linux"))]
     let _ = (so_busy_poll_us, udp_gro_enabled);
 
     if let Some(dtls_config) = frontend_dtls_config {
@@ -300,19 +319,20 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
             let _ = crate::socket_opts::set_so_prefer_busy_poll(fd, true);
         }
         // UDP_GRO: kernel coalesces same-size datagrams into a single large buffer (Linux 5.0+).
-        // NOTE: GRO is not yet enabled on the socket because the recvmmsg receive path
-        // does not split coalesced payloads using the GRO cmsg segment size. Enabling GRO
-        // without splitting would forward merged payloads as single datagrams, breaking
-        // protocols that depend on UDP datagram boundaries. The socket_opts infrastructure
-        // (set_udp_gro, extract_gro_segment_size) is ready — wire it in when the recv
-        // path is updated to use recvmsg with cmsg buffers for GRO splitting.
-        let _ = udp_gro_enabled;
+        // The recvmmsg path uses cmsg buffers to extract the GRO segment size and splits
+        // coalesced payloads into individual datagrams before processing.
+        if udp_gro_enabled {
+            if let Err(e) = crate::socket_opts::set_udp_gro(fd, true) {
+                warn!(proxy_id = %proxy_id, "Failed to enable UDP_GRO: {} (falling back to non-GRO)", e);
+            }
+        }
     }
 
-    // GSO is applied at send time via send_with_gso() — the flag is forwarded to the
-    // sendmmsg batch path. Currently the batch path uses sendmmsg (already batched);
-    // GSO provides complementary kernel-level segmentation for even larger batches.
-    let _ = udp_gso_enabled; // reserved for future sendmmsg→GSO migration
+    // GSO is applied at send time in the reply handler — the flag is threaded through
+    // to create_session so the reply handler can use send_with_gso() for batched sending
+    // of same-size datagrams to the client.
+    #[cfg(not(target_os = "linux"))]
+    let _ = udp_gso_enabled;
 
     ensure_coarse_timer_started();
     started.store(true, Ordering::Release);
@@ -430,6 +450,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                     sni_proxy_ids.as_deref(),
                     &adaptive_buffer,
                     udp_connected_sockets_enabled,
+                    udp_gso_enabled,
                 )
                 .await;
                 if let Err(e) = result {
@@ -455,6 +476,59 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                             Ok(n) if n > 0 => {
                                 for i in 0..n {
                                     let (data, addr2) = recv_batch.datagram(i);
+
+                                    // GRO splitting: if the kernel coalesced multiple same-size
+                                    // datagrams into one buffer, split by segment size.
+                                    if let Some(seg_size) = recv_batch.gro_segment_size(i) {
+                                        let seg = seg_size as usize;
+                                        if seg > 0 && data.len() > seg {
+                                            let mut offset = 0;
+                                            while offset < data.len() {
+                                                let end = (offset + seg).min(data.len());
+                                                let chunk = &data[offset..end];
+                                                batch_dgrams_in += 1;
+                                                batch_bytes_in += chunk.len() as u64;
+
+                                                let result = process_datagram(
+                                                    chunk,
+                                                    addr2,
+                                                    &proxy_id,
+                                                    &config,
+                                                    &dns_cache,
+                                                    &load_balancer_cache,
+                                                    &frontend_socket,
+                                                    &sessions,
+                                                    &metrics,
+                                                    tls_no_verify,
+                                                    max_sessions,
+                                                    &mut last_client,
+                                                    &mut batch_dgrams_out,
+                                                    &mut batch_bytes_out,
+                                                    &plugins,
+                                                    proxy_name.as_deref(),
+                                                    &proxy_namespace,
+                                                    backend_protocol,
+                                                    port,
+                                                    &circuit_breaker_cache,
+                                                    &consumer_index,
+                                                    has_datagram_plugins,
+                                                    &crls,
+                                                    sni_proxy_ids.as_deref(),
+                                                    &adaptive_buffer,
+                                                    udp_connected_sockets_enabled,
+                                                    udp_gso_enabled,
+                                                )
+                                                .await;
+                                                if let Err(e) = result {
+                                                    debug!(proxy_id = %proxy_id, client = %addr2, "UDP forward error: {}", e);
+                                                }
+                                                offset = end;
+                                            }
+                                            continue; // already counted per-segment
+                                        }
+                                    }
+
+                                    // Non-GRO path (single datagram).
                                     batch_dgrams_in += 1;
                                     batch_bytes_in += data.len() as u64;
 
@@ -485,6 +559,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                                         sni_proxy_ids.as_deref(),
                                         &adaptive_buffer,
                                         udp_connected_sockets_enabled,
+                                        udp_gso_enabled,
                                     )
                                     .await;
                                     if let Err(e) = result {
@@ -533,6 +608,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                                     sni_proxy_ids.as_deref(),
                                     &adaptive_buffer,
                                     udp_connected_sockets_enabled,
+                                    udp_gso_enabled,
                                 )
                                 .await;
                                 if let Err(e) = result {
@@ -593,6 +669,7 @@ async fn process_datagram(
     sni_proxy_ids: Option<&[String]>,
     adaptive_buffer: &Arc<crate::adaptive_buffer::AdaptiveBufferTracker>,
     udp_connected_sockets_enabled: bool,
+    udp_gso_enabled: bool,
 ) -> Result<(), anyhow::Error> {
     // Run per-datagram plugins (e.g., udp_rate_limiting) before session
     // allocation so dropped datagrams don't consume session slots or trigger
@@ -643,6 +720,7 @@ async fn process_datagram(
                 sni_proxy_ids,
                 adaptive_buffer,
                 udp_connected_sockets_enabled,
+                udp_gso_enabled,
             )
             .await?
         }
@@ -670,6 +748,7 @@ async fn process_datagram(
             sni_proxy_ids,
             adaptive_buffer,
             udp_connected_sockets_enabled,
+            udp_gso_enabled,
         )
         .await?
     };
@@ -733,6 +812,7 @@ async fn lookup_or_create_session(
     sni_proxy_ids: Option<&[String]>,
     adaptive_buffer: &Arc<crate::adaptive_buffer::AdaptiveBufferTracker>,
     udp_connected_sockets_enabled: bool,
+    udp_gso_enabled: bool,
 ) -> Result<Arc<UdpSession>, anyhow::Error> {
     if let Some(existing) = sessions.get(&client_addr) {
         return Ok(existing.value().clone());
@@ -772,6 +852,7 @@ async fn lookup_or_create_session(
         sni_proxy_ids,
         adaptive_buffer,
         udp_connected_sockets_enabled,
+        udp_gso_enabled,
     )
     .await
     {
@@ -1573,6 +1654,7 @@ async fn create_session(
     sni_proxy_ids: Option<&[String]>,
     adaptive_buffer: &Arc<crate::adaptive_buffer::AdaptiveBufferTracker>,
     udp_connected_sockets_enabled: bool,
+    udp_gso_enabled: bool,
 ) -> Result<Arc<UdpSession>, anyhow::Error> {
     // Check if this proxy uses passthrough mode (extract from config once).
     let is_passthrough = {
@@ -1851,6 +1933,10 @@ async fn create_session(
     let reply_listen_port = listen_port;
     let is_dtls = reply_dtls.is_some();
     let reply_udp_connected_sockets = udp_connected_sockets_enabled;
+    #[cfg(target_os = "linux")]
+    let reply_udp_gso = udp_gso_enabled;
+    #[cfg(not(target_os = "linux"))]
+    let _ = udp_gso_enabled;
     tokio::spawn(async move {
         let mut buf = vec![0u8; MAX_UDP_DATAGRAM_SIZE];
 
@@ -1887,6 +1973,13 @@ async fn create_session(
         // Pre-allocate sendmmsg batch for batched client replies (Linux only).
         #[cfg(target_os = "linux")]
         let mut send_batch = super::udp_batch::SendMmsgBatch::new(64);
+        // Pre-allocate GSO batch buffer for concatenating same-size datagrams (Linux only).
+        // GSO is preferred over sendmmsg when available — fewer syscalls for same-size bursts.
+        #[cfg(target_os = "linux")]
+        let mut gso_batch = super::udp_batch::GsoBatchBuf::new(65535);
+        // Track whether GSO send has failed, to avoid retrying on kernels that don't support it.
+        #[cfg(target_os = "linux")]
+        let mut gso_failed = false;
         loop {
             // Read from backend — via DTLS (channel-based) or raw UDP (socket-based)
             let (data_slice, data_vec);
@@ -2001,9 +2094,10 @@ async fn create_session(
             let mut batch_bytes_received: u64 = len as u64;
             let now = coarse_epoch_millis();
 
-            // --- sendmmsg path (Linux, plain UDP only) ---
-            // Batch the first datagram and all drain-loop datagrams, then flush
-            // via a single sendmmsg syscall to reduce per-datagram syscall overhead.
+            // --- Batched send path (Linux, plain UDP only) ---
+            // When GSO is available, concatenate same-size datagrams into a single
+            // sendmsg+UDP_SEGMENT call. Falls back to sendmmsg if GSO is disabled
+            // or has failed on this socket.
             #[cfg(target_os = "linux")]
             let send_batched = !is_dtls;
             #[cfg(not(target_os = "linux"))]
@@ -2012,7 +2106,33 @@ async fn create_session(
             if send_batched {
                 #[cfg(target_os = "linux")]
                 {
-                    send_batch.push(send_data, client_addr);
+                    if reply_udp_gso && !gso_failed {
+                        if !gso_batch.push(send_data) {
+                            // Different size or buffer full — flush current batch, then push new.
+                            let flush_result = flush_gso_batch(
+                                &mut gso_batch,
+                                &frontend,
+                                &connected_reply_socket,
+                                client_addr,
+                            );
+                            if let Err(e) = flush_result {
+                                // GSO failed — fall back to sendmmsg for the rest of this session.
+                                debug!(
+                                    proxy_id = %reply_proxy_id,
+                                    client = %client_addr,
+                                    "GSO send failed ({}), falling back to sendmmsg",
+                                    e
+                                );
+                                gso_failed = true;
+                                gso_batch.clear();
+                                send_batch.push(send_data, client_addr);
+                            } else {
+                                gso_batch.push(send_data);
+                            }
+                        }
+                    } else {
+                        send_batch.push(send_data, client_addr);
+                    }
                 }
             } else {
                 // Use connected socket (send) when available, fallback to send_to.
@@ -2090,7 +2210,30 @@ async fn create_session(
                             if send_batched {
                                 #[cfg(target_os = "linux")]
                                 {
-                                    if !send_batch.push(&buf[..len2], client_addr) {
+                                    if reply_udp_gso && !gso_failed {
+                                        if !gso_batch.push(&buf[..len2]) {
+                                            // Flush current GSO batch, then push the new datagram.
+                                            let flush_result = flush_gso_batch(
+                                                &mut gso_batch,
+                                                &frontend,
+                                                &connected_reply_socket,
+                                                client_addr,
+                                            );
+                                            if let Err(e) = flush_result {
+                                                debug!(
+                                                    proxy_id = %reply_proxy_id,
+                                                    client = %client_addr,
+                                                    "GSO send failed ({}), falling back to sendmmsg",
+                                                    e
+                                                );
+                                                gso_failed = true;
+                                                gso_batch.clear();
+                                                send_batch.push(&buf[..len2], client_addr);
+                                            } else {
+                                                gso_batch.push(&buf[..len2]);
+                                            }
+                                        }
+                                    } else if !send_batch.push(&buf[..len2], client_addr) {
                                         // Batch full — flush and push again.
                                         use std::os::unix::io::AsRawFd;
                                         let _ = send_batch.flush(frontend.as_raw_fd());
@@ -2164,32 +2307,54 @@ async fn create_session(
                 }
             }
 
-            // Flush the sendmmsg batch after draining all pending replies.
-            // Retry if sendmmsg returns a partial send (unsent datagrams remain).
+            // Flush batched sends after draining all pending replies.
             #[cfg(target_os = "linux")]
-            if send_batched && !send_batch.is_empty() {
-                use std::os::unix::io::AsRawFd;
-                let fd = frontend.as_raw_fd();
-                loop {
-                    match send_batch.flush(fd) {
-                        Ok(_) if send_batch.is_empty() => break,
-                        Ok(_) => continue, // partial send — retry remaining
-                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break, // socket full, drop remainder (UDP best-effort)
-                        Err(e) => {
-                            debug!(
-                                proxy_id = %reply_proxy_id,
-                                client = %client_addr,
-                                "UDP sendmmsg to client failed: {}",
-                                e
-                            );
-                            let error_message = e.to_string();
-                            disconnect_error = Some((
-                                error_message.clone(),
-                                crate::retry::classify_boxed_error(
-                                    anyhow::anyhow!(error_message).as_ref(),
-                                ),
-                            ));
-                            break;
+            if send_batched {
+                // Flush GSO batch first (if used).
+                if reply_udp_gso && !gso_failed && !gso_batch.is_empty() {
+                    let flush_result = flush_gso_batch(
+                        &mut gso_batch,
+                        &frontend,
+                        &connected_reply_socket,
+                        client_addr,
+                    );
+                    if let Err(e) = flush_result {
+                        debug!(
+                            proxy_id = %reply_proxy_id,
+                            client = %client_addr,
+                            "GSO flush failed ({}), falling back to sendmmsg",
+                            e
+                        );
+                        gso_failed = true;
+                        gso_batch.clear();
+                        // Note: datagrams in the GSO batch are lost (UDP best-effort).
+                    }
+                }
+                // Flush sendmmsg batch (used when GSO is disabled/failed).
+                if !send_batch.is_empty() {
+                    use std::os::unix::io::AsRawFd;
+                    let fd = frontend.as_raw_fd();
+                    loop {
+                        match send_batch.flush(fd) {
+                            Ok(_) if send_batch.is_empty() => break,
+                            Ok(_) => continue, // partial send — retry remaining
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break, // socket full, drop remainder (UDP best-effort)
+                            Err(e) => {
+                                debug!(
+                                    proxy_id = %reply_proxy_id,
+                                    client = %client_addr,
+                                    "UDP sendmmsg to client failed: {}",
+                                    e
+                                );
+                                let error_message = e.to_string();
+                                disconnect_error = Some((
+                                    error_message.clone(),
+                                    crate::retry::classify_boxed_error(
+                                        anyhow::anyhow!(error_message).as_ref(),
+                                    ),
+                                ));
+                                break;
+                            }
                         }
                     }
                 }

@@ -403,6 +403,71 @@ pub fn send_with_gso(
     ))
 }
 
+/// Send a GSO-segmented buffer on a **connected** UDP socket (Linux 4.18+ only).
+///
+/// Like `send_with_gso()` but omits the destination address (`msg_name = NULL`),
+/// relying on the socket's connected peer address. Used by the reply handler when
+/// a connected UDP socket is available for the client.
+#[cfg(target_os = "linux")]
+pub fn send_with_gso_connected(
+    fd: std::os::unix::io::RawFd,
+    data: &[u8],
+    segment_size: u16,
+) -> std::io::Result<usize> {
+    const UDP_SEGMENT: libc::c_int = 103;
+
+    let iov = libc::iovec {
+        iov_base: data.as_ptr() as *mut libc::c_void,
+        iov_len: data.len(),
+    };
+
+    let cmsg_space = unsafe { libc::CMSG_SPACE(std::mem::size_of::<u16>() as u32) } as usize;
+    let mut cmsg_buf = vec![0u8; cmsg_space];
+
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    // Connected socket -- no destination address needed.
+    msg.msg_name = std::ptr::null_mut();
+    msg.msg_namelen = 0;
+    msg.msg_iov = &iov as *const libc::iovec as *mut libc::iovec;
+    msg.msg_iovlen = 1;
+    msg.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
+    msg.msg_controllen = cmsg_space;
+
+    let cmsg = unsafe { libc::CMSG_FIRSTHDR(&msg) };
+    if cmsg.is_null() {
+        return Err(std::io::Error::other("CMSG_FIRSTHDR returned null"));
+    }
+    unsafe {
+        (*cmsg).cmsg_level = libc::SOL_UDP;
+        (*cmsg).cmsg_type = UDP_SEGMENT;
+        (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<u16>() as u32) as usize;
+        std::ptr::copy_nonoverlapping(
+            &segment_size as *const u16 as *const u8,
+            libc::CMSG_DATA(cmsg),
+            std::mem::size_of::<u16>(),
+        );
+    }
+
+    let ret = unsafe { libc::sendmsg(fd, &msg, libc::MSG_DONTWAIT) };
+    if ret < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(ret as usize)
+}
+
+#[cfg(not(target_os = "linux"))]
+#[allow(dead_code)]
+pub fn send_with_gso_connected(
+    _fd: i32,
+    _data: &[u8],
+    _segment_size: u16,
+) -> std::io::Result<usize> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "UDP GSO not available on this platform",
+    ))
+}
+
 /// Read the GRO segment size from a received GRO-coalesced datagram.
 ///
 /// After `recvmsg()` with `UDP_GRO` enabled, the kernel attaches a

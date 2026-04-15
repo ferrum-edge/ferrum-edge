@@ -198,7 +198,7 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
         adaptive_buffer,
         tcp_fastopen_enabled,
         overload,
-        ktls_enabled: _ktls_enabled,
+        ktls_enabled,
         io_uring_splice_enabled: _io_uring_splice_enabled,
         msg_zerocopy_enabled,
         msg_zerocopy_threshold,
@@ -340,6 +340,7 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
                         tcp_fastopen_enabled,
                         msg_zerocopy_enabled,
                         msg_zerocopy_threshold,
+                        ktls_enabled,
                     )
                     .await;
 
@@ -494,6 +495,7 @@ async fn handle_tcp_connection(
     tcp_fastopen: bool,
     msg_zerocopy_enabled: bool,
     _msg_zerocopy_threshold: usize,
+    ktls_enabled: bool,
 ) -> TcpConnectionResult {
     let start = Instant::now();
     let _ = client_stream.set_nodelay(true);
@@ -532,6 +534,7 @@ async fn handle_tcp_connection(
         adaptive_buffer,
         tcp_fastopen,
         msg_zerocopy_enabled,
+        ktls_enabled,
     )
     .await;
 
@@ -563,6 +566,7 @@ async fn handle_tcp_connection_inner(
     adaptive_buffer: &crate::adaptive_buffer::AdaptiveBufferTracker,
     tcp_fastopen: bool,
     msg_zerocopy_enabled: bool,
+    ktls_enabled: bool,
 ) -> Result<TcpConnectionSuccess, anyhow::Error> {
     // --- SNI-based proxy resolution for shared passthrough ports ---
     // When multiple passthrough proxies share a listen_port, we must peek at
@@ -1013,7 +1017,36 @@ async fn handle_tcp_connection_inner(
                 bidirectional_copy(tls_stream, bs, idle_timeout, buf_size).await
             }
             BackendStream::Plain(bs) => {
-                bidirectional_copy(tls_stream, bs, idle_timeout, buf_size).await
+                // On Linux with kTLS, attempt to install TLS keys into the kernel
+                // so splice(2) can handle encrypted traffic without userspace copies.
+                #[cfg(target_os = "linux")]
+                {
+                    if ktls_enabled {
+                        match try_ktls_splice(tls_stream, bs, idle_timeout, buf_size).await {
+                            Ok(result) => {
+                                used_splice = true;
+                                Ok(result)
+                            }
+                            Err(KtlsError::Unsupported(tls_stream_back, bs_back)) => {
+                                // kTLS not available for this cipher/version — fall back
+                                // to userspace copy with the TLS stream intact.
+                                bidirectional_copy(tls_stream_back, bs_back, idle_timeout, buf_size)
+                                    .await
+                            }
+                            Err(KtlsError::Installed(e)) => {
+                                // kTLS keys were installed but splice failed — connection
+                                // is consumed, propagate the error.
+                                Err(e)
+                            }
+                        }
+                    } else {
+                        bidirectional_copy(tls_stream, bs, idle_timeout, buf_size).await
+                    }
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    bidirectional_copy(tls_stream, bs, idle_timeout, buf_size).await
+                }
             }
         }
     } else {
@@ -1502,4 +1535,177 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for IdleTrackingStream<S> {
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
     }
+}
+
+// ---------------------------------------------------------------------------
+// kTLS support: install TLS session keys into the kernel so splice(2) works
+// on encrypted TCP connections (Linux 4.13+).
+// ---------------------------------------------------------------------------
+
+/// Error type for the kTLS attempt. Distinguishes between pre-install failures
+/// (where the TLS stream is still usable) and post-install failures (where the
+/// connection is consumed and cannot be recovered).
+#[cfg(target_os = "linux")]
+enum KtlsError {
+    /// kTLS could not be installed (unsupported cipher, wrong TLS version, etc.).
+    /// The original streams are returned so the caller can fall back to userspace copy.
+    Unsupported(tokio_rustls::server::TlsStream<TcpStream>, TcpStream),
+    /// kTLS keys were installed into the kernel but the subsequent splice failed.
+    /// The TLS stream has been consumed (into_inner + dangerous_extract_secrets)
+    /// so there is no way to recover — propagate the error.
+    Installed(anyhow::Error),
+}
+
+/// Attempt kTLS-accelerated splice for a frontend-TLS + plain-backend connection.
+///
+/// 1. Check that the negotiated cipher is AES-128-GCM or AES-256-GCM.
+/// 2. Extract TLS session keys via `dangerous_extract_secrets()`.
+/// 3. Install keys into the kernel via `enable_ktls()`.
+/// 4. Use `bidirectional_splice()` for zero-copy relay.
+///
+/// Returns `KtlsError::Unsupported` with the original streams if kTLS cannot
+/// be used, allowing the caller to fall back to userspace `bidirectional_copy`.
+#[cfg(target_os = "linux")]
+async fn try_ktls_splice(
+    tls_stream: tokio_rustls::server::TlsStream<TcpStream>,
+    backend_stream: TcpStream,
+    idle_timeout: Option<Duration>,
+    buf_size: usize,
+) -> Result<(u64, u64), KtlsError> {
+    use std::os::unix::io::AsRawFd;
+
+    // Check cipher suite compatibility before consuming the TLS stream.
+    let cipher_ok = {
+        let (_, server_conn) = tls_stream.get_ref();
+        match server_conn.negotiated_cipher_suite() {
+            Some(suite) => {
+                let name = format!("{:?}", suite.suite());
+                name.contains("AES_128_GCM") || name.contains("AES_256_GCM")
+            }
+            None => false,
+        }
+    };
+
+    if !cipher_ok {
+        debug!("kTLS: unsupported cipher suite, falling back to userspace copy");
+        return Err(KtlsError::Unsupported(tls_stream, backend_stream));
+    }
+
+    // Check TLS version — kTLS supports TLS 1.2 and 1.3.
+    let tls_version = {
+        let (_, server_conn) = tls_stream.get_ref();
+        server_conn.protocol_version()
+    };
+    let tls_ver_u16 = match tls_version {
+        Some(rustls::ProtocolVersion::TLSv1_2) => 0x0303_u16,
+        Some(rustls::ProtocolVersion::TLSv1_3) => 0x0304_u16,
+        _ => {
+            debug!(
+                "kTLS: unsupported TLS version {:?}, falling back",
+                tls_version
+            );
+            return Err(KtlsError::Unsupported(tls_stream, backend_stream));
+        }
+    };
+
+    // Point of no return: consume the TLS stream to extract secrets.
+    let (tcp_stream, server_conn) = tls_stream.into_inner();
+
+    let secrets = match server_conn.dangerous_extract_secrets() {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("kTLS: failed to extract TLS secrets: {}", e);
+            return Err(KtlsError::Installed(anyhow::anyhow!(
+                "kTLS secret extraction failed: {}",
+                e
+            )));
+        }
+    };
+
+    // Map rustls secrets to kTLS parameters.
+    let params = match build_ktls_params(tls_ver_u16, &secrets) {
+        Some(p) => p,
+        None => {
+            warn!("kTLS: cipher not mappable to kTLS params");
+            return Err(KtlsError::Installed(anyhow::anyhow!(
+                "kTLS: unsupported cipher in extracted secrets"
+            )));
+        }
+    };
+
+    // Install kTLS on the raw TCP socket.
+    let fd = tcp_stream.as_raw_fd();
+    match crate::socket_opts::ktls::enable_ktls(fd, &params) {
+        Ok(true) => {
+            debug!("kTLS installed successfully, using splice for TLS connection");
+            bidirectional_splice(tcp_stream, backend_stream, idle_timeout, buf_size)
+                .await
+                .map_err(KtlsError::Installed)
+        }
+        Ok(false) => {
+            // Kernel doesn't support kTLS (ENOPROTOOPT) — but we already consumed
+            // the TLS stream so we cannot recover.
+            warn!("kTLS: kernel returned ENOPROTOOPT after secret extraction");
+            Err(KtlsError::Installed(anyhow::anyhow!(
+                "kTLS not supported by kernel after secret extraction"
+            )))
+        }
+        Err(e) => {
+            warn!("kTLS: setsockopt failed: {}", e);
+            Err(KtlsError::Installed(anyhow::anyhow!(
+                "kTLS setsockopt failed: {}",
+                e
+            )))
+        }
+    }
+}
+
+/// Map rustls `ExtractedSecrets` to `KtlsParams` for the kernel TLS ULP.
+///
+/// Returns `None` if the cipher suite is not AES-128-GCM or AES-256-GCM.
+#[cfg(target_os = "linux")]
+fn build_ktls_params(
+    tls_version: u16,
+    secrets: &rustls::ExtractedSecrets,
+) -> Option<crate::socket_opts::ktls::KtlsParams> {
+    use crate::socket_opts::ktls::{KtlsCipher, KtlsParams};
+    use rustls::ConnectionTrafficSecrets;
+
+    let (tx_seq, ref tx_secrets) = secrets.tx;
+    let (rx_seq, ref rx_secrets) = secrets.rx;
+
+    let (cipher_suite, tx_key, tx_iv, rx_key, rx_iv) = match (tx_secrets, rx_secrets) {
+        (
+            ConnectionTrafficSecrets::Aes128Gcm { key: tk, iv: tiv },
+            ConnectionTrafficSecrets::Aes128Gcm { key: rk, iv: riv },
+        ) => (
+            KtlsCipher::Aes128Gcm,
+            tk.as_ref().to_vec(),
+            tiv.as_ref().to_vec(),
+            rk.as_ref().to_vec(),
+            riv.as_ref().to_vec(),
+        ),
+        (
+            ConnectionTrafficSecrets::Aes256Gcm { key: tk, iv: tiv },
+            ConnectionTrafficSecrets::Aes256Gcm { key: rk, iv: riv },
+        ) => (
+            KtlsCipher::Aes256Gcm,
+            tk.as_ref().to_vec(),
+            tiv.as_ref().to_vec(),
+            rk.as_ref().to_vec(),
+            riv.as_ref().to_vec(),
+        ),
+        _ => return None,
+    };
+
+    Some(KtlsParams {
+        tls_version,
+        cipher_suite,
+        tx_key,
+        tx_iv,
+        tx_seq: tx_seq.to_be_bytes(),
+        rx_key,
+        rx_iv,
+        rx_seq: rx_seq.to_be_bytes(),
+    })
 }
