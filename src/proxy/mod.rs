@@ -695,14 +695,24 @@ impl ProxyState {
             env_config_arc.udp_recvmmsg_batch_size,
             env_config_arc.tcp_fastopen_enabled,
             overload.clone(),
-            env_config_arc.ktls_enabled,
-            env_config_arc.io_uring_splice_enabled,
-            env_config_arc.msg_zerocopy_enabled,
+            env_config_arc
+                .ktls_enabled
+                .resolve(crate::socket_opts::ktls::is_ktls_available),
+            env_config_arc
+                .io_uring_splice_enabled
+                .resolve(crate::socket_opts::io_uring_splice::check_io_uring_available),
+            env_config_arc.msg_zerocopy_enabled.resolve(|| {
+                // MSG_ZEROCOPY is available on Linux 4.14+. On non-Linux it's a no-op.
+                cfg!(target_os = "linux")
+            }),
             env_config_arc.msg_zerocopy_threshold,
             env_config_arc.so_busy_poll_us,
             env_config_arc.udp_gro_enabled,
             env_config_arc.udp_gso_enabled,
-            env_config_arc.udp_connected_sockets_enabled,
+            env_config_arc.udp_connected_sockets_enabled.resolve(|| {
+                // Connected UDP sockets work on all Linux kernels.
+                cfg!(target_os = "linux")
+            }),
         ));
 
         Ok(Self {

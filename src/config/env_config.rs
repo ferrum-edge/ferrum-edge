@@ -128,6 +128,55 @@ fn resolve_bool(conf: &ConfFile, key: &str, default: bool) -> bool {
         .unwrap_or(default)
 }
 
+/// Tri-state toggle: `auto` (detect at runtime), `true` (force on), `false` (force off).
+///
+/// Used for Linux-specific optimizations that can probe the kernel at startup.
+/// When `auto`, the feature is enabled if the kernel supports it and disabled otherwise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutoBool {
+    /// Detect support at runtime and enable if available.
+    Auto,
+    /// Force enabled (fail or warn if unsupported).
+    True,
+    /// Force disabled.
+    False,
+}
+
+impl AutoBool {
+    /// Resolve to a concrete bool using a runtime probe function.
+    ///
+    /// - `Auto` → call `probe()` and use its result
+    /// - `True` → `true` (caller is responsible for handling unsupported case)
+    /// - `False` → `false`
+    pub fn resolve(self, probe: impl FnOnce() -> bool) -> bool {
+        match self {
+            Self::Auto => probe(),
+            Self::True => true,
+            Self::False => false,
+        }
+    }
+}
+
+impl std::fmt::Display for AutoBool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Auto => write!(f, "auto"),
+            Self::True => write!(f, "true"),
+            Self::False => write!(f, "false"),
+        }
+    }
+}
+
+/// Resolve an `AutoBool` configuration value: "auto", "true"/"1", "false"/"0".
+fn resolve_auto_bool(conf: &ConfFile, key: &str, default: AutoBool) -> AutoBool {
+    match resolve_var(conf, key).as_deref() {
+        Some("auto") => AutoBool::Auto,
+        Some("true") | Some("1") => AutoBool::True,
+        Some("false") | Some("0") => AutoBool::False,
+        _ => default,
+    }
+}
+
 /// All environment-driven configuration.
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // Some fields are only used with optional features (e.g. mongodb)
@@ -754,12 +803,16 @@ pub struct EnvConfig {
     /// Enable kTLS (kernel TLS) on TCP proxy TLS paths (Linux 4.13+ only).
     /// After the userspace TLS handshake, installs symmetric keys into the kernel
     /// so splice(2) can work on encrypted connections. Dramatically reduces latency
-    /// and CPU for TLS TCP proxy paths. Default: false (opt-in).
-    pub ktls_enabled: bool,
+    /// and CPU for TLS TCP proxy paths.
+    /// Values: `auto` (detect kernel support), `true` (force on), `false` (force off).
+    /// Default: `auto`.
+    pub ktls_enabled: AutoBool,
     /// Enable io_uring-based splice for TCP proxy zero-copy relay (Linux 5.6+ only).
     /// Uses IORING_OP_SPLICE submission queue entries instead of direct libc splice
-    /// syscalls. Falls back to libc splice if io_uring is unavailable. Default: false.
-    pub io_uring_splice_enabled: bool,
+    /// syscalls. Falls back to libc splice if io_uring is unavailable.
+    /// Values: `auto` (detect kernel support), `true` (force on), `false` (force off).
+    /// Default: `auto`.
+    pub io_uring_splice_enabled: AutoBool,
     /// Enable UDP GRO (Generic Receive Offload) on frontend UDP sockets (Linux 5.0+).
     /// Kernel coalesces multiple same-size UDP datagrams into a single large buffer,
     /// more efficient than recvmmsg. Default: true.
@@ -775,8 +828,9 @@ pub struct EnvConfig {
     /// Enable MSG_ZEROCOPY for large TCP stream proxy sends (Linux 4.14+ only).
     /// Avoids copying data from userspace to kernel socket buffer for sends > threshold.
     /// The threshold gate protects small payloads from completion notification overhead.
-    /// Default: true.
-    pub msg_zerocopy_enabled: bool,
+    /// Values: `auto` (detect kernel support), `true` (force on), `false` (force off).
+    /// Default: `auto`.
+    pub msg_zerocopy_enabled: AutoBool,
     /// Minimum payload size in bytes to use MSG_ZEROCOPY. Smaller payloads use
     /// regular send() because the kernel completion notification overhead (~1-2µs)
     /// exceeds the copy cost. 32 KB is the crossover point from kernel MSG_ZEROCOPY
@@ -784,8 +838,10 @@ pub struct EnvConfig {
     pub msg_zerocopy_threshold: usize,
     /// Enable connected UDP frontend sockets for high-frequency clients (Linux only).
     /// Creates connected UDP sockets per client address to bypass routing table lookup
-    /// on sendto(). Saves 5-10% CPU for concentrated traffic patterns. Default: true.
-    pub udp_connected_sockets_enabled: bool,
+    /// on sendto(). Saves 5-10% CPU for concentrated traffic patterns.
+    /// Values: `auto` (enable on Linux), `true` (force on), `false` (force off).
+    /// Default: `auto`.
+    pub udp_connected_sockets_enabled: AutoBool,
 }
 
 impl Default for EnvConfig {
@@ -969,14 +1025,14 @@ impl Default for EnvConfig {
             tls_offload_threads: 0,
             tcp_fastopen_enabled: true,
             tcp_fastopen_queue_len: 256,
-            ktls_enabled: false,
-            io_uring_splice_enabled: false,
+            ktls_enabled: AutoBool::Auto,
+            io_uring_splice_enabled: AutoBool::Auto,
             udp_gro_enabled: true,
             udp_gso_enabled: true,
             so_busy_poll_us: 0,
-            msg_zerocopy_enabled: true,
+            msg_zerocopy_enabled: AutoBool::Auto,
             msg_zerocopy_threshold: 32_768,
-            udp_connected_sockets_enabled: true,
+            udp_connected_sockets_enabled: AutoBool::Auto,
         }
     }
 }
@@ -1580,19 +1636,27 @@ impl EnvConfig {
             tcp_fastopen_queue_len: resolve_var(conf, "FERRUM_TCP_FASTOPEN_QUEUE_LEN")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(256),
-            ktls_enabled: resolve_bool(conf, "FERRUM_KTLS_ENABLED", false),
-            io_uring_splice_enabled: resolve_bool(conf, "FERRUM_IO_URING_SPLICE_ENABLED", false),
+            ktls_enabled: resolve_auto_bool(conf, "FERRUM_KTLS_ENABLED", AutoBool::Auto),
+            io_uring_splice_enabled: resolve_auto_bool(
+                conf,
+                "FERRUM_IO_URING_SPLICE_ENABLED",
+                AutoBool::Auto,
+            ),
             udp_gro_enabled: resolve_bool(conf, "FERRUM_UDP_GRO_ENABLED", true),
             udp_gso_enabled: resolve_bool(conf, "FERRUM_UDP_GSO_ENABLED", true),
             so_busy_poll_us: resolve_var(conf, "FERRUM_SO_BUSY_POLL_US")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0),
-            msg_zerocopy_enabled: resolve_bool(conf, "FERRUM_MSG_ZEROCOPY_ENABLED", true),
+            msg_zerocopy_enabled: resolve_auto_bool(
+                conf,
+                "FERRUM_MSG_ZEROCOPY_ENABLED",
+                AutoBool::Auto,
+            ),
             msg_zerocopy_threshold: resolve_usize(conf, "FERRUM_MSG_ZEROCOPY_THRESHOLD", 32_768),
-            udp_connected_sockets_enabled: resolve_bool(
+            udp_connected_sockets_enabled: resolve_auto_bool(
                 conf,
                 "FERRUM_UDP_CONNECTED_SOCKETS_ENABLED",
-                true,
+                AutoBool::Auto,
             ),
         };
 
