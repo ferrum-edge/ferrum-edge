@@ -209,6 +209,39 @@ impl ProxyBody {
             metrics,
         )
     }
+
+    /// Create a streaming body with both completion tracking and frame-by-frame
+    /// size enforcement. Used when `enable_streaming_latency_tracking=true` AND
+    /// `max_response_body_size_bytes > 0` AND Content-Length is absent.
+    pub fn streaming_tracked_with_size_limit(
+        response: reqwest::Response,
+        baseline: Instant,
+        max_bytes: usize,
+    ) -> (Self, Arc<StreamingMetrics>) {
+        use futures_util::StreamExt;
+
+        let metrics = Arc::new(StreamingMetrics::new(baseline));
+
+        let stream = response.bytes_stream().map(|result| {
+            result
+                .map(Frame::data)
+                .map_err(|e| Box::new(e) as ProxyBodyError)
+        });
+        let limited = SizeLimitedStreamingResponse {
+            inner: stream,
+            max_bytes,
+            bytes_seen: 0,
+        };
+        let inner = Box::pin(StreamBody::new(limited));
+        let tracked = TrackedBody::new(inner, Arc::clone(&metrics));
+        (
+            Self {
+                kind: ProxyBodyKind::Tracked(tracked),
+                _request_guard: None,
+            },
+            metrics,
+        )
+    }
 }
 
 impl http_body::Body for ProxyBody {

@@ -5853,7 +5853,22 @@ async fn handle_proxy_request_inner(
     // Default (false): streaming responses pass through with zero tracking overhead.
     let body = match response_body {
         ResponseBody::Streaming(resp) if state.env_config.enable_streaming_latency_tracking => {
-            let (tracked_body, metrics) = ProxyBody::streaming_tracked(resp, backend_start);
+            let cl = response_headers
+                .get("content-length")
+                .and_then(|v| v.parse::<u64>().ok());
+            // When size limits are configured and Content-Length is absent, apply
+            // size-limited streaming before latency tracking to prevent unbounded
+            // transfer for chunked/unknown-length responses.
+            let (tracked_body, metrics) = if state.max_response_body_size_bytes > 0 && cl.is_none()
+            {
+                ProxyBody::streaming_tracked_with_size_limit(
+                    resp,
+                    backend_start,
+                    state.max_response_body_size_bytes,
+                )
+            } else {
+                ProxyBody::streaming_tracked(resp, backend_start)
+            };
 
             // Spawn a lightweight deferred task to log the final streaming latency.
             // Wakes once after read_timeout + 5s buffer, reads one atomic, emits one log line.
