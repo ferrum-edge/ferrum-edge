@@ -21,12 +21,8 @@ use tokio::time::sleep;
 // ============================================================================
 
 /// Start a plain TCP echo server that reads data and echoes it back.
-async fn start_tcp_echo_server(port: u16) -> tokio::task::JoinHandle<()> {
-    let handle = tokio::spawn(async move {
-        let listener = TcpListener::bind(format!("127.0.0.1:{}", port))
-            .await
-            .unwrap_or_else(|_| panic!("Failed to bind TCP echo server on port {}", port));
-
+async fn start_tcp_echo_server_on(listener: TcpListener) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
         while let Ok((mut stream, _addr)) = listener.accept().await {
             tokio::spawn(async move {
                 let mut buf = vec![0u8; 4096];
@@ -43,10 +39,7 @@ async fn start_tcp_echo_server(port: u16) -> tokio::task::JoinHandle<()> {
                 }
             });
         }
-    });
-    // Give the server time to bind
-    sleep(Duration::from_millis(200)).await;
-    handle
+    })
 }
 
 // ============================================================================
@@ -54,8 +47,8 @@ async fn start_tcp_echo_server(port: u16) -> tokio::task::JoinHandle<()> {
 // ============================================================================
 
 /// Start a TLS-enabled TCP echo server using the test certs.
-async fn start_tls_echo_server(port: u16) -> tokio::task::JoinHandle<()> {
-    let handle = tokio::spawn(async move {
+async fn start_tls_echo_server_on(listener: TcpListener) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
         let cert_path = std::path::Path::new("tests/certs/server.crt");
         let key_path = std::path::Path::new("tests/certs/server.key");
 
@@ -80,9 +73,6 @@ async fn start_tls_echo_server(port: u16) -> tokio::task::JoinHandle<()> {
             .expect("Failed to build TLS server config");
 
         let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls_config));
-        let listener = TcpListener::bind(format!("127.0.0.1:{}", port))
-            .await
-            .unwrap_or_else(|_| panic!("Failed to bind TLS echo server on port {}", port));
 
         while let Ok((tcp_stream, _addr)) = listener.accept().await {
             let acceptor = acceptor.clone();
@@ -108,9 +98,7 @@ async fn start_tls_echo_server(port: u16) -> tokio::task::JoinHandle<()> {
                 }
             });
         }
-    });
-    sleep(Duration::from_millis(200)).await;
-    handle
+    })
 }
 
 // ============================================================================
@@ -311,11 +299,10 @@ impl rustls::client::danger::ServerCertVerifier for NoVerifier {
 #[ignore]
 #[tokio::test]
 async fn test_tcp_proxy_plain_bidirectional() {
-    // Backend echo server — bind in-process (no port race)
+    // Backend echo server — pass pre-bound listener (no port race)
     let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
-    drop(backend_listener);
-    let echo_server = start_tcp_echo_server(backend_port).await;
+    let echo_server = start_tcp_echo_server_on(backend_listener).await;
 
     let (mut gateway, proxy_port, _admin_port, _dir) = start_gateway_with_retry(
         |proxy_port| {
@@ -385,8 +372,7 @@ async fn test_tcp_proxy_frontend_tls_termination() {
     // Backend echo server — bind in-process (no port race)
     let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
-    drop(backend_listener);
-    let echo_server = start_tcp_echo_server(backend_port).await;
+    let echo_server = start_tcp_echo_server_on(backend_listener).await;
 
     let cert_path = std::fs::canonicalize("tests/certs/server.crt")
         .expect("cert not found")
@@ -462,8 +448,7 @@ async fn test_tcp_proxy_backend_tls_origination() {
     // Backend TLS echo server — bind in-process (no port race)
     let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
-    drop(backend_listener);
-    let echo_server = start_tls_echo_server(backend_port).await;
+    let echo_server = start_tls_echo_server_on(backend_listener).await;
 
     let (mut gateway, proxy_port, _admin_port, _dir) = start_gateway_with_retry(
         |proxy_port| {
@@ -518,8 +503,7 @@ async fn test_tcp_proxy_full_tls() {
     // Backend TLS echo server — bind in-process (no port race)
     let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
-    drop(backend_listener);
-    let echo_server = start_tls_echo_server(backend_port).await;
+    let echo_server = start_tls_echo_server_on(backend_listener).await;
 
     let cert_path = std::fs::canonicalize("tests/certs/server.crt")
         .expect("cert not found")
@@ -597,8 +581,7 @@ async fn test_tcp_proxy_idle_timeout() {
     // Backend echo server — bind in-process (no port race)
     let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
-    drop(backend_listener);
-    let echo_server = start_tcp_echo_server(backend_port).await;
+    let echo_server = start_tcp_echo_server_on(backend_listener).await;
 
     let (mut gateway, proxy_port, _admin_port, _dir) = start_gateway_with_retry(
         |proxy_port| {
