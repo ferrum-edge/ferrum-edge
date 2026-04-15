@@ -1,7 +1,7 @@
 //! Access Control List (ACL) plugin — post-authentication authorization.
 //!
 //! Runs in the `authorize` phase after authentication plugins have identified
-//! the caller. On TCP stream proxies it applies the same checks in
+//! the caller. On TCP and UDP stream proxies it applies the same checks in
 //! `on_stream_connect` after a stream auth plugin has identified the caller.
 //! By default this plugin is consumer-based only:
 //! 1. **Consumer-based**: Allow/deny lists checked by consumer username (O(1) HashSet).
@@ -191,7 +191,7 @@ impl Plugin for AccessControl {
     }
 
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
-        super::HTTP_FAMILY_AND_TCP_PROTOCOLS
+        super::HTTP_FAMILY_AND_STREAM_PROTOCOLS
     }
 
     async fn authorize(&self, ctx: &mut RequestContext) -> PluginResult {

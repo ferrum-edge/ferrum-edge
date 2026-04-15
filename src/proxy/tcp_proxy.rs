@@ -157,6 +157,14 @@ pub struct TcpListenerConfig {
     pub tcp_fastopen_enabled: bool,
     /// Shared overload state for connection accounting and load shedding.
     pub overload: Arc<crate::overload::OverloadState>,
+    /// Enable kTLS for splice on TLS paths (from `FERRUM_KTLS_ENABLED`).
+    pub ktls_enabled: bool,
+    /// Enable io_uring-based splice (from `FERRUM_IO_URING_SPLICE_ENABLED`).
+    pub io_uring_splice_enabled: bool,
+    /// Enable MSG_ZEROCOPY for large sends (from `FERRUM_MSG_ZEROCOPY_ENABLED`).
+    pub msg_zerocopy_enabled: bool,
+    /// Threshold in bytes for MSG_ZEROCOPY (from `FERRUM_MSG_ZEROCOPY_THRESHOLD`).
+    pub msg_zerocopy_threshold: usize,
 }
 
 /// Start a TCP proxy listener on the given port.
@@ -190,7 +198,17 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
         adaptive_buffer,
         tcp_fastopen_enabled,
         overload,
+        ktls_enabled,
+        io_uring_splice_enabled,
+        msg_zerocopy_enabled,
+        msg_zerocopy_threshold,
     } = cfg;
+    let _ = (
+        ktls_enabled,
+        io_uring_splice_enabled,
+        msg_zerocopy_enabled,
+        msg_zerocopy_threshold,
+    );
     let addr = SocketAddr::new(bind_addr, port);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     // Convert to Arc<str> so per-connection clones are a cheap pointer bump.

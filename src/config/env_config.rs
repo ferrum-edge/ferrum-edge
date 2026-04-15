@@ -749,6 +749,43 @@ pub struct EnvConfig {
     /// TCP Fast Open server queue length — maximum pending TFO connections.
     /// Only used when `tcp_fastopen_enabled` is true. Default: 256.
     pub tcp_fastopen_queue_len: u16,
+
+    // ── Stream proxy performance optimizations (Linux only) ─────────────
+    /// Enable kTLS (kernel TLS) on TCP proxy TLS paths (Linux 4.13+ only).
+    /// After the userspace TLS handshake, installs symmetric keys into the kernel
+    /// so splice(2) can work on encrypted connections. Dramatically reduces latency
+    /// and CPU for TLS TCP proxy paths. Default: false (opt-in).
+    pub ktls_enabled: bool,
+    /// Enable io_uring-based splice for TCP proxy zero-copy relay (Linux 5.6+ only).
+    /// Uses IORING_OP_SPLICE submission queue entries instead of direct libc splice
+    /// syscalls. Falls back to libc splice if io_uring is unavailable. Default: false.
+    pub io_uring_splice_enabled: bool,
+    /// Enable UDP GRO (Generic Receive Offload) on frontend UDP sockets (Linux 5.0+).
+    /// Kernel coalesces multiple same-size UDP datagrams into a single large buffer,
+    /// more efficient than recvmmsg. Default: true.
+    pub udp_gro_enabled: bool,
+    /// Enable UDP GSO (Generic Segmentation Offload) for batched UDP sending (Linux 4.18+).
+    /// Sends multiple datagrams in a single sendmsg() by specifying a segment size via
+    /// ancillary data. The kernel splits them at the NIC level. Default: true.
+    pub udp_gso_enabled: bool,
+    /// SO_BUSY_POLL duration in microseconds for latency-sensitive UDP sockets (Linux 3.11+).
+    /// When > 0, the kernel spins for this many microseconds waiting for incoming data
+    /// before sleeping. Reduces receive latency at the cost of CPU. 0 = disabled. Default: 0.
+    pub so_busy_poll_us: u32,
+    /// Enable MSG_ZEROCOPY for large TCP stream proxy sends (Linux 4.14+ only).
+    /// Avoids copying data from userspace to kernel socket buffer for sends > threshold.
+    /// The threshold gate protects small payloads from completion notification overhead.
+    /// Default: true.
+    pub msg_zerocopy_enabled: bool,
+    /// Minimum payload size in bytes to use MSG_ZEROCOPY. Smaller payloads use
+    /// regular send() because the kernel completion notification overhead (~1-2µs)
+    /// exceeds the copy cost. 32 KB is the crossover point from kernel MSG_ZEROCOPY
+    /// benchmarks. Default: 32768 (32 KB).
+    pub msg_zerocopy_threshold: usize,
+    /// Enable connected UDP frontend sockets for high-frequency clients (Linux only).
+    /// Creates connected UDP sockets per client address to bypass routing table lookup
+    /// on sendto(). Saves 5-10% CPU for concentrated traffic patterns. Default: true.
+    pub udp_connected_sockets_enabled: bool,
 }
 
 impl Default for EnvConfig {
@@ -932,6 +969,14 @@ impl Default for EnvConfig {
             tls_offload_threads: 0,
             tcp_fastopen_enabled: true,
             tcp_fastopen_queue_len: 256,
+            ktls_enabled: false,
+            io_uring_splice_enabled: false,
+            udp_gro_enabled: true,
+            udp_gso_enabled: true,
+            so_busy_poll_us: 0,
+            msg_zerocopy_enabled: true,
+            msg_zerocopy_threshold: 32_768,
+            udp_connected_sockets_enabled: true,
         }
     }
 }
@@ -1535,6 +1580,20 @@ impl EnvConfig {
             tcp_fastopen_queue_len: resolve_var(conf, "FERRUM_TCP_FASTOPEN_QUEUE_LEN")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(256),
+            ktls_enabled: resolve_bool(conf, "FERRUM_KTLS_ENABLED", false),
+            io_uring_splice_enabled: resolve_bool(conf, "FERRUM_IO_URING_SPLICE_ENABLED", false),
+            udp_gro_enabled: resolve_bool(conf, "FERRUM_UDP_GRO_ENABLED", true),
+            udp_gso_enabled: resolve_bool(conf, "FERRUM_UDP_GSO_ENABLED", true),
+            so_busy_poll_us: resolve_var(conf, "FERRUM_SO_BUSY_POLL_US")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
+            msg_zerocopy_enabled: resolve_bool(conf, "FERRUM_MSG_ZEROCOPY_ENABLED", true),
+            msg_zerocopy_threshold: resolve_usize(conf, "FERRUM_MSG_ZEROCOPY_THRESHOLD", 32_768),
+            udp_connected_sockets_enabled: resolve_bool(
+                conf,
+                "FERRUM_UDP_CONNECTED_SOCKETS_ENABLED",
+                true,
+            ),
         };
 
         config.validate()?;

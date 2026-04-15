@@ -459,7 +459,7 @@ TLS/DTLS are transport-layer concerns, not separate protocols. A plugin that sup
 | `basic_auth` | ✓ | ✓ | ✓ | | | Requires HTTP headers |
 | `hmac_auth` | ✓ | ✓ | ✓ | | | Requires HTTP headers |
 | `soap_ws_security` | ✓ | | | | | SOAP XML body parsing (text/xml, application/soap+xml) |
-| `access_control` | ✓ | ✓ | ✓ | ✓ | | Needs authenticated identity from an auth plugin; supports consumer username and ACL group allow/deny lists |
+| `access_control` | ✓ | ✓ | ✓ | ✓ | ✓ | Needs authenticated identity from an auth plugin; supports consumer username and ACL group allow/deny lists |
 | `tcp_connection_throttle` | | | | ✓ | | Tracks active TCP connections per Consumer or client IP |
 | `grpc_web` | ✓ | ✓ | | | | Translates gRPC-Web (browser) ↔ native gRPC (HTTP/2) |
 | `grpc_method_router` | | ✓ | | | | gRPC method-level access control and rate limiting |

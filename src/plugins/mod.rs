@@ -125,6 +125,7 @@ pub const HTTP_FAMILY_PROTOCOLS: &[ProxyProtocol] = &[
 pub const HTTP_GRPC_PROTOCOLS: &[ProxyProtocol] = &[ProxyProtocol::Http, ProxyProtocol::Grpc];
 
 /// HTTP-family protocols plus raw TCP streams.
+#[allow(dead_code)]
 pub const HTTP_FAMILY_AND_TCP_PROTOCOLS: &[ProxyProtocol] = &[
     ProxyProtocol::Http,
     ProxyProtocol::Grpc,

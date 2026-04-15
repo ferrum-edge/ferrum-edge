@@ -81,6 +81,22 @@ pub struct StreamListenerManager {
     tcp_fastopen_enabled: bool,
     /// Shared overload state for connection accounting and load shedding.
     overload: Arc<crate::overload::OverloadState>,
+    /// Enable kTLS for splice on TLS paths.
+    ktls_enabled: bool,
+    /// Enable io_uring-based splice.
+    io_uring_splice_enabled: bool,
+    /// Enable MSG_ZEROCOPY for large sends.
+    msg_zerocopy_enabled: bool,
+    /// Threshold in bytes for MSG_ZEROCOPY.
+    msg_zerocopy_threshold: usize,
+    /// SO_BUSY_POLL duration in microseconds for UDP sockets.
+    so_busy_poll_us: u32,
+    /// Enable UDP GRO on frontend sockets.
+    udp_gro_enabled: bool,
+    /// Enable UDP GSO for batched sending.
+    udp_gso_enabled: bool,
+    /// Enable connected UDP sockets for high-frequency clients.
+    udp_connected_sockets_enabled: bool,
 }
 
 impl StreamListenerManager {
@@ -105,6 +121,14 @@ impl StreamListenerManager {
         udp_recvmmsg_batch_size: usize,
         tcp_fastopen_enabled: bool,
         overload: Arc<crate::overload::OverloadState>,
+        ktls_enabled: bool,
+        io_uring_splice_enabled: bool,
+        msg_zerocopy_enabled: bool,
+        msg_zerocopy_threshold: usize,
+        so_busy_poll_us: u32,
+        udp_gro_enabled: bool,
+        udp_gso_enabled: bool,
+        udp_connected_sockets_enabled: bool,
     ) -> Self {
         Self {
             listeners: tokio::sync::Mutex::new(std::collections::HashMap::new()),
@@ -129,6 +153,14 @@ impl StreamListenerManager {
             udp_recvmmsg_batch_size,
             tcp_fastopen_enabled,
             overload,
+            ktls_enabled,
+            io_uring_splice_enabled,
+            msg_zerocopy_enabled,
+            msg_zerocopy_threshold,
+            so_busy_poll_us,
+            udp_gro_enabled,
+            udp_gso_enabled,
+            udp_connected_sockets_enabled,
         }
     }
 
@@ -387,6 +419,10 @@ impl StreamListenerManager {
                 let adaptive_buf = self.adaptive_buffer.clone();
                 let recvmmsg_batch = self.udp_recvmmsg_batch_size;
                 let overload = self.overload.clone();
+                let so_busy_poll_us = self.so_busy_poll_us;
+                let udp_gro_enabled = self.udp_gro_enabled;
+                let udp_gso_enabled = self.udp_gso_enabled;
+                let udp_connected_sockets_enabled = self.udp_connected_sockets_enabled;
                 tokio::spawn(async move {
                     if let Err(e) = super::udp_proxy::start_udp_listener(UdpListenerConfig {
                         port: port_val,
@@ -410,6 +446,10 @@ impl StreamListenerManager {
                         adaptive_buffer: adaptive_buf,
                         recvmmsg_batch_size: recvmmsg_batch,
                         overload,
+                        so_busy_poll_us,
+                        udp_gro_enabled,
+                        udp_gso_enabled,
+                        udp_connected_sockets_enabled,
                     })
                     .await
                     {
@@ -441,6 +481,10 @@ impl StreamListenerManager {
                 let adaptive_buf = self.adaptive_buffer.clone();
                 let tcp_fastopen = self.tcp_fastopen_enabled;
                 let overload = self.overload.clone();
+                let ktls_enabled = self.ktls_enabled;
+                let io_uring_splice_enabled = self.io_uring_splice_enabled;
+                let msg_zerocopy_enabled = self.msg_zerocopy_enabled;
+                let msg_zerocopy_threshold = self.msg_zerocopy_threshold;
                 tokio::spawn(async move {
                     if let Err(e) = super::tcp_proxy::start_tcp_listener(TcpListenerConfig {
                         port: port_val,
@@ -465,6 +509,10 @@ impl StreamListenerManager {
                         adaptive_buffer: adaptive_buf,
                         tcp_fastopen_enabled: tcp_fastopen,
                         overload,
+                        ktls_enabled,
+                        io_uring_splice_enabled,
+                        msg_zerocopy_enabled,
+                        msg_zerocopy_threshold,
                     })
                     .await
                     {

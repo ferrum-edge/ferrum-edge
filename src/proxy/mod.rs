@@ -695,6 +695,14 @@ impl ProxyState {
             env_config_arc.udp_recvmmsg_batch_size,
             env_config_arc.tcp_fastopen_enabled,
             overload.clone(),
+            env_config_arc.ktls_enabled,
+            env_config_arc.io_uring_splice_enabled,
+            env_config_arc.msg_zerocopy_enabled,
+            env_config_arc.msg_zerocopy_threshold,
+            env_config_arc.so_busy_poll_us,
+            env_config_arc.udp_gro_enabled,
+            env_config_arc.udp_gso_enabled,
+            env_config_arc.udp_connected_sockets_enabled,
         ));
 
         Ok(Self {

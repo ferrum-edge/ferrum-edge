@@ -817,7 +817,13 @@ These are hard-won findings from profiling. Violating them causes measurable reg
 - **UDP jitter-based buffer adaptation**: The adaptive buffer tracker now monitors inter-arrival jitter for UDP sessions. When jitter EWMA exceeds 10ms, buffer sizes are bumped up one tier for real-time traffic safety margin.
 - **Lazy timeout wrapper**: `lazy_timeout::lazy_timeout()` defers tokio timer creation until the inner future returns `Pending`. Fast-path operations that complete immediately avoid timer wheel allocation entirely.
 - **Cacheability predictor**: The `response_caching` plugin maintains an LRU of known-uncacheable keys, skipping cache lookups for assets that were historically uncacheable (PREDICTED-BYPASS status).
-- **`TCP_INFO` access**: `socket_opts::get_tcp_info()` retrieves kernel-level RTT, cwnd, and MSS for BDP-optimal buffer sizing on long-lived TCP stream connections (Linux only).
+- **`TCP_INFO` BDP buffer sizing**: `socket_opts::get_tcp_info()` retrieves kernel-level RTT, cwnd, and MSS for BDP-optimal buffer sizing on long-lived TCP stream connections (Linux only). `TcpConnectionInfo::bdp_bytes()` computes the Bandwidth-Delay Product.
+- **kTLS (kernel TLS)**: `socket_opts::ktls::enable_ktls()` installs TLS session keys into the kernel via `setsockopt(SOL_TLS)` after the rustls handshake completes (Linux 4.13+). This enables `splice(2)` on TLS-encrypted TCP proxy paths, eliminating two userspace copies per chunk. Supports AES-128-GCM and AES-256-GCM cipher suites. Gated by `FERRUM_KTLS_ENABLED` (default false).
+- **io_uring splice**: `socket_opts::io_uring_splice` provides infrastructure for io_uring-based splice operations (Linux 5.6+). `check_io_uring_available()` probes the kernel at startup. `splice_with_fallback()` transparently falls back to `libc::splice` when io_uring is unavailable. Gated by `FERRUM_IO_URING_SPLICE_ENABLED`.
+- **UDP GRO/GSO**: `socket_opts::set_udp_gro()` enables kernel-level datagram coalescing on frontend UDP sockets (Linux 5.0+). `socket_opts::send_with_gso()` sends multiple datagrams in a single `sendmsg()` via `UDP_SEGMENT` ancillary data (Linux 4.18+). `extract_gro_segment_size()` reads the GRO cmsg to split coalesced buffers. Enabled by default (`FERRUM_UDP_GRO_ENABLED`, `FERRUM_UDP_GSO_ENABLED`).
+- **`SO_BUSY_POLL`**: `socket_opts::set_so_busy_poll()` and `set_so_prefer_busy_poll()` enable kernel-side busy-polling on UDP sockets for 1-5µs latency reduction (Linux 3.11+/5.11+). Gated by `FERRUM_SO_BUSY_POLL_US` (default 0 = disabled).
+- **`MSG_ZEROCOPY`**: `socket_opts::set_so_zerocopy()` enables zero-copy send on TCP sockets (Linux 4.14+). Avoids userspace→kernel copy for sends above `FERRUM_MSG_ZEROCOPY_THRESHOLD` (default 10 KB). Gated by `FERRUM_MSG_ZEROCOPY_ENABLED`.
+- **Connected UDP frontend sockets**: `socket_opts::create_connected_udp_socket()` creates per-client connected UDP sockets that bypass the kernel routing table lookup on `send()`. Uses `SO_REUSEADDR` + `SO_REUSEPORT` to share the listener port. Saves 5-10% CPU for concentrated traffic patterns. Gated by `FERRUM_UDP_CONNECTED_SOCKETS_ENABLED`.
 - **Health bitset for zero-alloc LB selection**: `HealthBitset` (stack-allocated `u128`) replaces per-target DashMap lookups during algorithm selection. Health state is snapshotted once via `compute_health_bitset()` at the top of `select()`, then all algorithm methods use free bit tests. Eliminates the `Vec<(usize, &Arc<UpstreamTarget>)>` allocation that `select_from_all()` previously required for WRR/LC/LL/CH on every request. Consistent hash ring walk uses O(1) bitset membership check per position instead of O(candidates) linear scan. FxHash-style `fx_hash_str()` replaces `DefaultHasher` (SipHash) for consistent hash key distribution (~3-5ns vs ~15-25ns).
 
 **Resilience features per protocol:**
@@ -1105,6 +1111,14 @@ Reduce per-request allocations in plugin lookup
 | `FERRUM_TCP_FASTOPEN_ENABLED` | `true` | Enable TCP Fast Open on proxy listener sockets (Linux only). Saves 1 RTT for repeat clients |
 | `FERRUM_TCP_FASTOPEN_QUEUE_LEN` | `256` | TCP Fast Open pending connection queue length |
 | `FERRUM_TLS_OFFLOAD_THREADS` | `0` | Dedicated TLS handshake offload threads (0 = disabled). Total threads = value (shards auto-computed). Isolates CPU-intensive TLS handshakes from the main event loop |
+| `FERRUM_KTLS_ENABLED` | `false` | Enable kTLS (kernel TLS) on TCP proxy TLS paths (Linux 4.13+). Installs symmetric keys into kernel after handshake so splice(2) works on encrypted connections |
+| `FERRUM_IO_URING_SPLICE_ENABLED` | `false` | Enable io_uring-based splice for TCP proxy zero-copy relay (Linux 5.6+). Falls back to libc splice if unavailable |
+| `FERRUM_UDP_GRO_ENABLED` | `true` | Enable UDP GRO (Generic Receive Offload) on frontend UDP sockets (Linux 5.0+). Kernel coalesces same-size datagrams |
+| `FERRUM_UDP_GSO_ENABLED` | `true` | Enable UDP GSO (Generic Segmentation Offload) for batched sending (Linux 4.18+). Multiple datagrams in single sendmsg |
+| `FERRUM_SO_BUSY_POLL_US` | `0` | SO_BUSY_POLL duration in microseconds for UDP sockets (Linux 3.11+). Reduces receive latency at cost of CPU. `0` = disabled |
+| `FERRUM_MSG_ZEROCOPY_ENABLED` | `true` | Enable MSG_ZEROCOPY for large TCP stream proxy sends (Linux 4.14+). Avoids data copy for sends above threshold |
+| `FERRUM_MSG_ZEROCOPY_THRESHOLD` | `32768` | Minimum payload size in bytes to use MSG_ZEROCOPY (32 KB crossover point). Smaller payloads use regular send |
+| `FERRUM_UDP_CONNECTED_SOCKETS_ENABLED` | `true` | Connected UDP frontend sockets per client address (Linux). Bypasses routing table lookup on sendto |
 
 See `src/config/env_config.rs` for the full list of 90+ environment variables.
 

@@ -108,7 +108,7 @@ fn test_http_family_plugins() {
 
 #[test]
 fn test_http_family_and_tcp_plugins() {
-    let plugins = vec![("access_control", json!({"allowed_consumers": ["admin"]}))];
+    let plugins: Vec<(&str, serde_json::Value)> = vec![];
 
     for (name, config) in plugins {
         let plugin = make_plugin(name, config);
@@ -135,8 +135,11 @@ fn test_http_family_and_tcp_plugins() {
 
 #[test]
 fn test_http_family_and_stream_plugins() {
-    // mtls_auth supports all stream transports (TCP + UDP/DTLS) for client cert auth
-    let plugins = vec![("mtls_auth", json!({}))];
+    // mtls_auth and access_control support all stream transports (TCP + UDP/DTLS)
+    let plugins = vec![
+        ("mtls_auth", json!({})),
+        ("access_control", json!({"allowed_consumers": ["admin"]})),
+    ];
 
     for (name, config) in plugins {
         let plugin = make_plugin(name, config);
@@ -611,7 +614,8 @@ async fn test_http_family_plugins_complete_coverage() {
 
 #[test]
 fn test_http_family_and_tcp_plugins_complete_coverage() {
-    let plugins = vec![("access_control", json!({"allowed_consumers": ["admin"]}))];
+    // access_control moved to HTTP_FAMILY_AND_STREAM_PROTOCOLS (supports UDP+DTLS now)
+    let plugins: Vec<(&str, serde_json::Value)> = vec![];
 
     for (name, config) in plugins {
         let plugin = make_plugin(name, config);

@@ -214,6 +214,14 @@ pub struct UdpListenerConfig {
     pub recvmmsg_batch_size: usize,
     /// Shared overload state for session accounting and load shedding.
     pub overload: Arc<crate::overload::OverloadState>,
+    /// SO_BUSY_POLL duration in microseconds for low-latency receive.
+    pub so_busy_poll_us: u32,
+    /// Enable UDP GRO on the frontend socket.
+    pub udp_gro_enabled: bool,
+    /// Enable UDP GSO for batched sending.
+    pub udp_gso_enabled: bool,
+    /// Enable connected UDP sockets for high-frequency clients.
+    pub udp_connected_sockets_enabled: bool,
 }
 
 /// Start a UDP proxy listener on the given port.
@@ -247,7 +255,17 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
         adaptive_buffer,
         recvmmsg_batch_size,
         overload,
+        so_busy_poll_us,
+        udp_gro_enabled,
+        udp_gso_enabled,
+        udp_connected_sockets_enabled,
     } = cfg;
+    let _ = (
+        udp_gso_enabled,
+        udp_connected_sockets_enabled,
+        so_busy_poll_us,
+        udp_gro_enabled,
+    );
 
     if let Some(dtls_config) = frontend_dtls_config {
         return start_dtls_frontend_listener(
@@ -274,6 +292,23 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
 
     let addr = SocketAddr::new(bind_addr, port);
     let frontend_socket = Arc::new(UdpSocket::bind(addr).await?);
+
+    // Apply Linux socket optimizations on the frontend UDP socket.
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::io::AsRawFd;
+        let fd = frontend_socket.as_raw_fd();
+        // SO_BUSY_POLL: spin in kernel for low-latency recv (Linux 3.11+).
+        if so_busy_poll_us > 0 {
+            let _ = crate::socket_opts::set_so_busy_poll(fd, so_busy_poll_us);
+            let _ = crate::socket_opts::set_so_prefer_busy_poll(fd, true);
+        }
+        // UDP_GRO: kernel coalesces same-size datagrams into single large buffer (Linux 5.0+).
+        if udp_gro_enabled {
+            let _ = crate::socket_opts::set_udp_gro(fd, true);
+        }
+    }
+
     ensure_coarse_timer_started();
     started.store(true, Ordering::Release);
     info!(proxy_id = %proxy_id, "UDP proxy listener started on {}", addr);

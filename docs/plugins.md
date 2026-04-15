@@ -1504,8 +1504,10 @@ single consumer into access across multiple proxies — assign the consumer to a
 ACL group once and reference the group in each proxy's plugin config instead of
 listing every username individually. Optionally it can also allow externally
 authenticated identities (for example `jwks_auth` users without a mapped
-gateway Consumer). On TCP stream proxies, it uses the consumer already placed
+gateway Consumer). On TCP and UDP stream proxies, it uses the consumer already placed
 in the stream context by an earlier auth plugin such as [`mtls_auth`](#mtls_auth).
+This enables full authentication + authorization pipelines for both TCP+TLS and
+UDP+DTLS streams via certificate-based consumer mapping.
 
 **Priority:** 2000
 

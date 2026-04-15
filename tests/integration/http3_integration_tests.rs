@@ -434,6 +434,14 @@ async fn test_http3_proxy_state_creation() {
             64,
             true,
             Arc::new(ferrum_edge::overload::OverloadState::new()),
+            false,  // ktls_enabled
+            false,  // io_uring_splice_enabled
+            false,  // msg_zerocopy_enabled
+            10_240, // msg_zerocopy_threshold
+            0,      // so_busy_poll_us
+            false,  // udp_gro_enabled (use false in tests to avoid Linux-specific failures)
+            false,  // udp_gso_enabled
+            false,  // udp_connected_sockets_enabled
         ),
     );
     let dns_cache_for_sd = dns_cache.clone();
@@ -644,6 +652,14 @@ async fn test_http3_full_integration() {
             64,
             true,
             Arc::new(ferrum_edge::overload::OverloadState::new()),
+            false,  // ktls_enabled
+            false,  // io_uring_splice_enabled
+            false,  // msg_zerocopy_enabled
+            10_240, // msg_zerocopy_threshold
+            0,      // so_busy_poll_us
+            false,  // udp_gro_enabled (use false in tests to avoid Linux-specific failures)
+            false,  // udp_gso_enabled
+            false,  // udp_connected_sockets_enabled
         ),
     );
     let dns_cache_for_sd = dns_cache.clone();
