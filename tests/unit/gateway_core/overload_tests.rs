@@ -341,3 +341,156 @@ fn env_config_overload_config_conversion() {
     assert_eq!(overload.loop_warn_us, env.overload_loop_warn_us);
     assert_eq!(overload.loop_critical_us, env.overload_loop_critical_us);
 }
+
+// ── Threshold boundary tests ─────────────────────────────────────────
+
+#[test]
+fn red_probability_at_edge_values() {
+    let state = Arc::new(OverloadState::new());
+
+    // prob = 1 (lowest non-zero): should almost never trigger
+    state.red_drop_probability.store(1, Ordering::Relaxed);
+    let mut triggered = 0;
+    for _ in 0..10_000 {
+        if state.should_disable_keepalive_red() {
+            triggered += 1;
+        }
+    }
+    // prob=1 out of 1000 = 0.1%, expect ~10 out of 10000
+    assert!(
+        triggered < 100,
+        "prob=1 should trigger rarely, got {}",
+        triggered
+    );
+
+    // prob = 999 (just below max): should almost always trigger
+    state.red_drop_probability.store(999, Ordering::Relaxed);
+    let mut triggered = 0;
+    for _ in 0..10_000 {
+        if state.should_disable_keepalive_red() {
+            triggered += 1;
+        }
+    }
+    assert!(
+        triggered > 9000,
+        "prob=999 should trigger almost always, got {}",
+        triggered
+    );
+}
+
+#[test]
+fn red_zero_probability_never_triggers() {
+    let state = Arc::new(OverloadState::new());
+    state.red_drop_probability.store(0, Ordering::Relaxed);
+    for _ in 0..1000 {
+        assert!(
+            !state.should_disable_keepalive_red(),
+            "prob=0 should never trigger"
+        );
+    }
+}
+
+#[test]
+fn red_max_probability_always_triggers() {
+    let state = Arc::new(OverloadState::new());
+    state.red_drop_probability.store(1000, Ordering::Relaxed);
+    for _ in 0..1000 {
+        assert!(
+            state.should_disable_keepalive_red(),
+            "prob=1000 should always trigger"
+        );
+    }
+}
+
+#[test]
+fn reject_new_requests_flag_sets_critical() {
+    let state = OverloadState::new();
+    state.reject_new_requests.store(true, Ordering::Relaxed);
+    assert_eq!(state.level(), OverloadLevel::Critical);
+}
+
+#[test]
+fn snapshot_req_ratio_zero_when_max_is_zero() {
+    let state = Arc::new(OverloadState::new());
+    state.req_current.store(100, Ordering::Relaxed);
+    state.req_max.store(0, Ordering::Relaxed);
+
+    let snap = state.snapshot();
+    assert!(
+        (snap.pressure.requests.ratio - 0.0).abs() < f64::EPSILON,
+        "req_ratio should be 0.0 when max is 0, got {}",
+        snap.pressure.requests.ratio
+    );
+}
+
+#[test]
+fn snapshot_ratios_correct() {
+    let state = Arc::new(OverloadState::new());
+    state.fd_current.store(80, Ordering::Relaxed);
+    state.fd_max.store(100, Ordering::Relaxed);
+    state.conn_current.store(85, Ordering::Relaxed);
+    state.conn_max.store(100, Ordering::Relaxed);
+    state.req_current.store(950, Ordering::Relaxed);
+    state.req_max.store(1000, Ordering::Relaxed);
+
+    let snap = state.snapshot();
+    assert!((snap.pressure.file_descriptors.ratio - 0.8).abs() < 0.001);
+    assert!((snap.pressure.connections.ratio - 0.85).abs() < 0.001);
+    assert!((snap.pressure.requests.ratio - 0.95).abs() < 0.001);
+}
+
+// ── Concurrent guard creation during drain ───────────────────────────
+
+#[tokio::test]
+async fn drain_with_concurrent_guard_creation() {
+    let state = Arc::new(OverloadState::new());
+    state.draining.store(true, Ordering::Relaxed);
+
+    // Create a guard, then spawn drain waiter
+    let g1 = ConnectionGuard::new(&state);
+
+    let state2 = state.clone();
+    let handle = tokio::spawn(async move {
+        ferrum_edge::overload::wait_for_drain(&state2, Duration::from_secs(5)).await
+    });
+
+    // Create another guard while drain is waiting
+    let g2 = ConnectionGuard::new(&state);
+    assert_eq!(state.active_connections.load(Ordering::Relaxed), 2);
+
+    // Drop first guard — drain should NOT complete yet
+    drop(g1);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(!handle.is_finished());
+
+    // Drop second guard — drain should complete
+    drop(g2);
+    let result = handle.await.unwrap();
+    assert!(result, "Drain should succeed after all guards drop");
+}
+
+// ── Both connection and request guards must drain ────────────────────
+
+#[tokio::test]
+async fn drain_waits_for_both_connections_and_requests() {
+    let state = Arc::new(OverloadState::new());
+    state.draining.store(true, Ordering::Relaxed);
+
+    let conn_guard = ConnectionGuard::new(&state);
+    let req_guard = RequestGuard::new(&state);
+
+    let state2 = state.clone();
+    let handle = tokio::spawn(async move {
+        ferrum_edge::overload::wait_for_drain(&state2, Duration::from_secs(5)).await
+    });
+
+    // Drop connection guard — request still active
+    drop(conn_guard);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(!handle.is_finished(), "Should still wait for requests");
+
+    // Drop request guard
+    drop(req_guard);
+    let result = handle.await.unwrap();
+    assert!(result, "Drain should complete when both reach zero");
+}

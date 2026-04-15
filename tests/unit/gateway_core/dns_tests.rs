@@ -888,3 +888,117 @@ async fn test_dns_failed_retry_task_shuts_down_cleanly() {
     let result = tokio::time::timeout(std::time::Duration::from_secs(3), handle).await;
     assert!(result.is_ok(), "Failed retry task should shut down cleanly");
 }
+
+// ============================================================================
+// Cache eviction tests
+// ============================================================================
+
+#[tokio::test]
+async fn test_evict_expired_removes_stale_entries() {
+    let config = DnsConfig {
+        // Very short TTL override so entries expire quickly
+        ttl_override_seconds: Some(1),
+        // Very short stale TTL so entries become evictable
+        stale_ttl_seconds: 1,
+        min_ttl_seconds: 1,
+        ..DnsConfig::default()
+    };
+    let cache = DnsCache::new(config);
+
+    // Populate cache with an IP override (direct IP bypass, creates cache entry)
+    let _ = cache.resolve("10.0.0.1", None, None).await;
+    let _ = cache.resolve("10.0.0.2", None, None).await;
+    assert!(cache.cache_len() >= 2);
+
+    // Wait for entries to expire past stale deadline
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+    let before = cache.cache_len();
+    cache.evict_expired();
+
+    assert!(
+        cache.cache_len() < before,
+        "evict_expired should reduce cache size from {} but got {}",
+        before,
+        cache.cache_len()
+    );
+}
+
+#[tokio::test]
+async fn test_evict_expired_on_empty_cache_is_noop() {
+    let config = DnsConfig::default();
+    let cache = DnsCache::new(config);
+
+    assert_eq!(cache.cache_len(), 0);
+    cache.evict_expired();
+    assert_eq!(cache.cache_len(), 0);
+}
+
+#[tokio::test]
+async fn test_max_cache_size_eviction() {
+    let config = DnsConfig {
+        max_cache_size: 5,
+        ..DnsConfig::default()
+    };
+    let cache = DnsCache::new(config);
+
+    // Fill cache with IP addresses (these are direct IP parses, not DNS lookups)
+    for i in 0..10 {
+        let ip = format!("10.0.0.{}", i);
+        let _ = cache.resolve(&ip, None, None).await;
+    }
+
+    // After eviction, cache should be at or below max_cache_size
+    cache.evict_expired();
+    assert!(
+        cache.cache_len() <= 5,
+        "Cache should be bounded by max_cache_size, got {}",
+        cache.cache_len()
+    );
+}
+
+// ============================================================================
+// SRV resolution tests
+// ============================================================================
+
+#[tokio::test]
+async fn test_srv_resolution_nonexistent_service() {
+    let config = DnsConfig::default();
+    let cache = DnsCache::new(config);
+
+    // Use .invalid TLD (RFC 6761 §6.4) — guaranteed to never resolve,
+    // unlike .local which can trigger mDNS in some environments.
+    let result = cache.resolve_srv("_nonexistent._tcp.test.invalid").await;
+    assert!(
+        result.is_err(),
+        "SRV resolution of nonexistent service should fail"
+    );
+}
+
+// ============================================================================
+// Per-proxy TTL override tests
+// ============================================================================
+
+#[tokio::test]
+async fn test_per_proxy_ttl_override_does_not_affect_resolution() {
+    // Per-proxy TTL override is an internal caching parameter — it should not
+    // change the resolved IP, only how long the entry lives in cache.
+    let config = DnsConfig {
+        ttl_override_seconds: Some(300),
+        ..DnsConfig::default()
+    };
+    let cache = DnsCache::new(config);
+
+    // Resolve with a per-proxy TTL override of 1s
+    let result = cache.resolve("127.0.0.1", None, Some(1)).await;
+    assert!(result.is_ok());
+
+    // Wait for the per-proxy TTL to expire (but global 300s TTL would still hold)
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+
+    // Entry should still resolve (still cached; per-proxy TTL affects the
+    // internal expires_at but the entry is served stale-while-revalidate)
+    let result2 = cache.resolve("127.0.0.1", None, Some(1)).await;
+    assert!(result2.is_ok());
+    assert_eq!(result.unwrap(), result2.unwrap());
+}

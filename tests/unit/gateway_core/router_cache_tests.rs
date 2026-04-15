@@ -1387,3 +1387,102 @@ fn test_regex_exact_path_no_remaining() {
     let url = build_backend_url(&rm.proxy, "/status", "", rm.matched_prefix_len);
     assert_eq!(url, "http://regex-backend:3000/");
 }
+
+// ============================================================
+// apply_delta tests
+// ============================================================
+
+#[test]
+fn test_apply_delta_empty_affected_paths_preserves_cache() {
+    let config = test_config(vec![test_proxy("p1", "/api")]);
+    let cache = RouterCache::new(&config, 10_000);
+
+    // Populate cache
+    cache.find_proxy(None, "/api/users");
+    assert!(cache.cache_len() > 0);
+
+    // Empty affected paths should not clear any cache
+    let before = cache.cache_len();
+    cache.apply_delta(&config, &[]);
+    assert_eq!(cache.cache_len(), before);
+}
+
+#[test]
+fn test_apply_delta_prefix_invalidates_affected_entries() {
+    let config = test_config(vec![test_proxy("p1", "/api"), test_proxy("p2", "/web")]);
+    let cache = RouterCache::new(&config, 10_000);
+
+    // Populate cache with entries under both prefixes
+    cache.find_proxy(None, "/api/users");
+    cache.find_proxy(None, "/web/home");
+    assert!(cache.cache_len() >= 2);
+
+    // Delta affects only /api
+    cache.apply_delta(&config, &["/api".to_string()]);
+
+    // /web/home should still be cached and routable
+    let result = cache.find_proxy(None, "/web/home");
+    assert!(result.is_some(), "/web should still route");
+}
+
+#[test]
+fn test_apply_delta_regex_clears_regex_cache() {
+    let config = test_config(vec![
+        test_regex_proxy("p1", r"/api/v[0-9]+/.*"),
+        test_proxy("p2", "/static"),
+    ]);
+    let cache = RouterCache::new(&config, 10_000);
+
+    // Populate both caches
+    cache.find_proxy(None, "/api/v1/users");
+    cache.find_proxy(None, "/static/img.png");
+
+    // Delta affects a regex route
+    cache.apply_delta(&config, &["~/api/v[0-9]+/.*".to_string()]);
+
+    // Regex cache should be cleared
+    assert_eq!(cache.regex_cache_len(), 0, "Regex cache should be cleared");
+    // Prefix cache should be unaffected
+    let result = cache.find_proxy(None, "/static/img.png");
+    assert!(result.is_some(), "/static should still route");
+}
+
+#[test]
+fn test_apply_delta_mixed_prefix_and_regex() {
+    let config = test_config(vec![
+        test_proxy("p1", "/api"),
+        test_regex_proxy("p2", r"/users/[0-9]+"),
+    ]);
+    let cache = RouterCache::new(&config, 10_000);
+
+    cache.find_proxy(None, "/api/test");
+    cache.find_proxy(None, "/users/123");
+
+    // Both a prefix and regex path changed
+    cache.apply_delta(&config, &["/api".to_string(), "~/users/[0-9]+".to_string()]);
+
+    // Regex cache fully cleared, prefix cache surgically invalidated
+    assert_eq!(cache.regex_cache_len(), 0);
+}
+
+// ============================================================
+// cache_stats tests
+// ============================================================
+
+#[test]
+fn test_cache_stats_reports_correct_values() {
+    let config = test_config(vec![test_proxy("p1", "/api")]);
+    let cache = RouterCache::new(&config, 5_000);
+
+    let (prefix, regex, prefix_evictions, regex_evictions, max) = cache.cache_stats();
+    assert_eq!(prefix, 0);
+    assert_eq!(regex, 0);
+    assert_eq!(prefix_evictions, 0);
+    assert_eq!(regex_evictions, 0);
+    assert_eq!(max, 5_000);
+
+    // Populate a prefix cache entry
+    cache.find_proxy(None, "/api/test");
+    let (prefix, _, _, _, _) = cache.cache_stats();
+    assert!(prefix > 0, "Should have prefix cache entries after lookup");
+}
