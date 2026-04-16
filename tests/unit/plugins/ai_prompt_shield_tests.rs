@@ -612,6 +612,70 @@ async fn test_all_mode_uses_structured_redaction_when_messages_present() {
     );
 }
 
+#[tokio::test]
+async fn test_all_mode_redacts_sibling_fields_when_messages_present() {
+    // Regression test: when `scan_mode == All` and `messages` contains
+    // PII, the plugin must still redact PII in sibling fields
+    // (metadata, tool arguments, custom top-level strings). Previously
+    // the either-or split meant the structured redactor ran and the
+    // recursive walker was skipped, leaving sibling PII untouched even
+    // though it was reported as "detected".
+    let plugin = AiPromptShield::new(&json!({
+        "patterns": ["ip_address"],
+        "scan_fields": "all",
+        "action": "redact"
+    }))
+    .unwrap();
+
+    let body = json!({
+        "model": "10.0.0.1",
+        "messages": [
+            {"role": "user", "content": "ping 1.2.3.4"}
+        ],
+        "metadata": {"note": "client 8.8.8.8"},
+        "custom_field": "also see 172.16.0.5"
+    });
+    let body_bytes = serde_json::to_vec(&body).unwrap();
+
+    let transformed = plugin
+        .transform_request_body(&body_bytes, Some("application/json"), &HashMap::new())
+        .await
+        .expect("expected redacted body when match present");
+
+    let v: serde_json::Value = serde_json::from_slice(&transformed).unwrap();
+
+    // Structural key preserved
+    assert_eq!(v["model"], "10.0.0.1", "structural model preserved");
+
+    // Messages content redacted (structured redactor path)
+    assert!(
+        v["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("[REDACTED:ip_address]"),
+        "messages content should be redacted: {}",
+        v["messages"][0]["content"]
+    );
+
+    // Sibling fields redacted (recursive walker path)
+    assert!(
+        v["metadata"]["note"]
+            .as_str()
+            .unwrap()
+            .contains("[REDACTED:ip_address]"),
+        "metadata.note sibling should be redacted: {}",
+        v["metadata"]["note"]
+    );
+    assert!(
+        v["custom_field"]
+            .as_str()
+            .unwrap()
+            .contains("[REDACTED:ip_address]"),
+        "custom_field sibling should be redacted: {}",
+        v["custom_field"]
+    );
+}
+
 // ─── Rejection body format ──────────────────────────────────────────────
 
 #[tokio::test]

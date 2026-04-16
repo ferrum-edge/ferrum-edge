@@ -1815,18 +1815,6 @@ pub mod test_helpers {
             aws_region.as_deref(),
         );
 
-        // Suppress unused warnings for fields that are now consumed only
-        // by `build_url_template`; we keep them in scope so the test still
-        // documents the intended config shape.
-        let _ = (
-            &azure_resource,
-            &azure_deployment,
-            &azure_api_version,
-            &google_project_id,
-            &google_region,
-            &aws_region,
-        );
-
         let provider = ResolvedProvider {
             name: "test".to_string(),
             provider_type: pt,

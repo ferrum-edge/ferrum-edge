@@ -559,3 +559,74 @@ async fn test_all_mode_uses_structured_redaction_when_choices_present() {
         v["choices"][0]["message"]["content"]
     );
 }
+
+#[tokio::test]
+async fn test_all_mode_redacts_sibling_fields_when_choices_present() {
+    // Regression test: when `scan_mode == All` and `choices` contains
+    // PII, the plugin must still redact PII in sibling fields outside
+    // the recognized completion shape. Previously the either-or split
+    // meant the structured redactor ran and the recursive walker was
+    // skipped, leaving sibling PII untouched even though detection
+    // reported it.
+    let plugin = ipv4_redact_plugin();
+
+    let body = serde_json::to_vec(&json!({
+        "id": "10.0.0.1",                 // structural — must be preserved
+        "model": "127.0.0.1",             // structural — must be preserved
+        "choices": [{
+            "message": {"role": "assistant", "content": "Server lives at 8.8.8.8"}
+        }],
+        "metadata": {"trace": "upstream 192.168.1.1 responded"},
+        "extra": "see also 172.16.0.5"
+    }))
+    .unwrap();
+
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+    let mut ctx = super::plugin_utils::create_test_context();
+    ctx.method = "POST".to_string();
+    let _ = plugin
+        .on_response_body(&mut ctx, 200, &headers, &body)
+        .await;
+    let transformed = plugin
+        .transform_response_body(&body, Some("application/json"), &headers)
+        .await
+        .expect("expected transformation when match present");
+
+    let v: serde_json::Value = serde_json::from_slice(&transformed).unwrap();
+
+    // Structural keys preserved
+    assert_eq!(v["id"], "10.0.0.1", "structural id must be preserved");
+    assert_eq!(
+        v["model"], "127.0.0.1",
+        "structural model must be preserved"
+    );
+
+    // Known completion content redacted (structured redactor path)
+    assert!(
+        v["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap()
+            .contains("[REDACTED:pii:ip_address]"),
+        "completion content should be redacted: {}",
+        v["choices"][0]["message"]["content"]
+    );
+
+    // Sibling fields redacted (recursive walker path)
+    assert!(
+        v["metadata"]["trace"]
+            .as_str()
+            .unwrap()
+            .contains("[REDACTED:pii:ip_address]"),
+        "metadata.trace sibling should be redacted: {}",
+        v["metadata"]["trace"]
+    );
+    assert!(
+        v["extra"]
+            .as_str()
+            .unwrap()
+            .contains("[REDACTED:pii:ip_address]"),
+        "extra sibling should be redacted: {}",
+        v["extra"]
+    );
+}

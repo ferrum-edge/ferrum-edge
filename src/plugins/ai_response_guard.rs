@@ -311,7 +311,7 @@ impl AiResponseGuard {
     fn pattern_name(&self, idx: usize) -> Option<&str> {
         let pii_len = self.pii_patterns.len();
         if idx < pii_len {
-            Some(self.pii_patterns[idx].name.as_str())
+            self.pii_patterns.get(idx).map(|p| p.name.as_str())
         } else {
             self.blocked_phrases
                 .get(idx - pii_len)
@@ -700,21 +700,26 @@ impl Plugin for AiResponseGuard {
             if !self.detection_set.is_match(body_str) {
                 return None;
             }
-            // Prefer structured redaction on known content fields first —
-            // this is the safe path that cannot corrupt timestamps, IDs, or
-            // model names. Only fall back to a recursive walk when the body
-            // does not look like a recognized AI response shape.
+            // Run structured redaction first on known completion content
+            // fields (choices[].message.content, content[].text, etc.) so
+            // recognized AI response shapes are handled with the correct
+            // template. Then run the recursive walker to cover any PII in
+            // sibling fields outside the completion shape that the
+            // structured redactor doesn't touch. The recursive walker
+            // honors STRUCTURAL_KEYS so IDs, timestamps, and model names
+            // remain untouched. Running structured first is safe because
+            // its [REDACTED:...] placeholders do not match any PII regex
+            // on the subsequent recursive pass.
             let known_texts = self.extract_completion_texts(&json);
             if !known_texts.is_empty() {
                 self.redact_response_json(&mut json);
-            } else {
-                redact_json_strings(
-                    &mut json,
-                    &self.pii_patterns,
-                    &self.blocked_phrases,
-                    &self.redaction_template,
-                );
             }
+            redact_json_strings(
+                &mut json,
+                &self.pii_patterns,
+                &self.blocked_phrases,
+                &self.redaction_template,
+            );
         } else {
             let texts = self.extract_completion_texts(&json);
             let has_match = !self.detect_matches(&texts).is_empty();

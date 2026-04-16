@@ -503,20 +503,24 @@ impl Plugin for AiPromptShield {
             if !self.detection_set.is_match(body_str) {
                 return None;
             }
-            // Prefer structured redaction on known prompt-content fields
-            // (messages[].content) — this is the safe path that cannot
-            // corrupt model names, IDs, or system parameters. Only fall
-            // back to a recursive walk when the body does not look like a
-            // recognized chat-completion shape.
+            // Run structured redaction first on known prompt-content
+            // fields (messages[].content) so recognized chat-completion
+            // shapes are handled with the correct template. Then run the
+            // recursive walker to cover any PII in sibling fields
+            // (metadata, tool arguments, custom top-level strings) that
+            // the structured redactor doesn't touch. The recursive walker
+            // honors STRUCTURAL_KEYS so model names, IDs, and system
+            // parameters remain untouched. Running structured first is
+            // safe because its [REDACTED:...] placeholders do not match
+            // any PII regex on the subsequent recursive pass.
             let has_known_messages = json
                 .get("messages")
                 .and_then(|m| m.as_array())
                 .is_some_and(|arr| !arr.is_empty());
             if has_known_messages {
                 self.redact_body(&mut json);
-            } else {
-                redact_json_strings(&mut json, &self.patterns, &self.redaction_template);
             }
+            redact_json_strings(&mut json, &self.patterns, &self.redaction_template);
             return serde_json::to_vec(&json).ok();
         }
 

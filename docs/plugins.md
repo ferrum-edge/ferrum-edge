@@ -2428,6 +2428,20 @@ config:
 
 Seven plugins purpose-built for AI/LLM API gateway use cases. They auto-detect the LLM provider from the response JSON structure, supporting **OpenAI** (and compatible), **Anthropic**, **Google Gemini**, **Cohere**, **Mistral**, and **AWS Bedrock**.
 
+### Upgrade notes (breaking config validation changes)
+
+Recent releases tightened config validation for several AI plugins. Operators upgrading should audit existing plugin configs before rolling out — previously-accepted configs that silently degraded to a no-op are now rejected at load time.
+
+- **`ai_request_guard`** now rejects configs with no policies configured. At least one policy field (e.g. `max_prompt_length`, `blocked_patterns`, `required_fields`, `allowed_models`, `blocked_models`, `max_messages`, `max_temperature`, `require_user_field`) must be set.
+- **`ai_prompt_shield`** and **`ai_response_guard`** now reject unknown built-in pattern names and built-in patterns that fail to compile. Previously these were logged as warnings and silently skipped.
+- **`ai_rate_limiter`** now rejects unknown `count_mode` and `limit_by` values. Previously these silently fell back to defaults.
+
+Validation follows the same per-mode tolerance model as other file-dependent config (see the "File Dependency Validation (Isolated Tolerance)" note in `CLAUDE.md`):
+
+- **File mode** — fatal at startup. The gateway refuses to start.
+- **Database mode** — warnings are logged, but the gateway keeps serving with the previous valid config.
+- **DP mode** — the config update from the CP is rejected and the DP continues with its previously applied config.
+
 ### `ai_federation`
 
 Universal AI gateway that routes requests in OpenAI Chat Completions format to any of 11 supported AI providers, translating requests to native provider format and normalizing responses back to OpenAI format. Uses the "terminate and respond" pattern — makes its own HTTP call to the matched provider and returns the response directly, bypassing the normal proxy dispatch.
