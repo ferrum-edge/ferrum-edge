@@ -76,6 +76,8 @@ pub struct LdapAuth {
     tls_connector: Option<native_tls::TlsConnector>,
     /// Whether to skip TLS verification (passed to ldap3 for IP-address handling).
     tls_no_verify: bool,
+    /// Extracted hostname from ldap_url for DNS pre-warming.
+    ldap_hostname: Option<String>,
 }
 
 impl LdapAuth {
@@ -230,6 +232,10 @@ impl LdapAuth {
             .and_then(|v| v.as_bool())
             .unwrap_or(true);
 
+        let ldap_hostname = url::Url::parse(&ldap_url)
+            .ok()
+            .and_then(|u| u.host_str().map(|h| h.to_string()));
+
         // Build TLS connector respecting gateway settings
         let tls_no_verify = http_client.tls_no_verify();
         let needs_tls = ldap_url.starts_with("ldaps://") || starttls;
@@ -261,6 +267,7 @@ impl LdapAuth {
             consumer_mapping,
             tls_connector,
             tls_no_verify,
+            ldap_hostname,
         })
     }
 
@@ -606,6 +613,13 @@ impl Plugin for LdapAuth {
 
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
         super::HTTP_FAMILY_PROTOCOLS
+    }
+
+    fn warmup_hostnames(&self) -> Vec<String> {
+        self.ldap_hostname
+            .as_ref()
+            .map(|h| vec![h.clone()])
+            .unwrap_or_default()
     }
 
     async fn authenticate(
