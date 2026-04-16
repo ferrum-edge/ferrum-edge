@@ -85,8 +85,6 @@ pub struct StreamListenerManager {
     ktls_enabled: bool,
     /// Enable io_uring-based splice.
     io_uring_splice_enabled: bool,
-    /// Enable MSG_ZEROCOPY for large sends.
-    msg_zerocopy_enabled: bool,
     /// SO_BUSY_POLL duration in microseconds for UDP sockets.
     so_busy_poll_us: u32,
     /// Enable UDP GRO on frontend sockets.
@@ -119,7 +117,6 @@ impl StreamListenerManager {
         overload: Arc<crate::overload::OverloadState>,
         ktls_enabled: bool,
         io_uring_splice_enabled: bool,
-        msg_zerocopy_enabled: bool,
         so_busy_poll_us: u32,
         udp_gro_enabled: bool,
         udp_gso_enabled: bool,
@@ -149,7 +146,6 @@ impl StreamListenerManager {
             overload,
             ktls_enabled,
             io_uring_splice_enabled,
-            msg_zerocopy_enabled,
             so_busy_poll_us,
             udp_gro_enabled,
             udp_gso_enabled,
@@ -473,7 +469,6 @@ impl StreamListenerManager {
                 let overload = self.overload.clone();
                 let ktls_enabled = self.ktls_enabled;
                 let io_uring_splice_enabled = self.io_uring_splice_enabled;
-                let msg_zerocopy_enabled = self.msg_zerocopy_enabled;
                 tokio::spawn(async move {
                     if let Err(e) = super::tcp_proxy::start_tcp_listener(TcpListenerConfig {
                         port: port_val,
@@ -500,7 +495,6 @@ impl StreamListenerManager {
                         overload,
                         ktls_enabled,
                         io_uring_splice_enabled,
-                        msg_zerocopy_enabled,
                     })
                     .await
                     {

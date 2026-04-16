@@ -161,8 +161,6 @@ pub struct TcpListenerConfig {
     pub ktls_enabled: bool,
     /// Enable io_uring-based splice (from `FERRUM_IO_URING_SPLICE_ENABLED`).
     pub io_uring_splice_enabled: bool,
-    /// Enable MSG_ZEROCOPY for large sends (from `FERRUM_MSG_ZEROCOPY_ENABLED`).
-    pub msg_zerocopy_enabled: bool,
 }
 
 /// Start a TCP proxy listener on the given port.
@@ -198,7 +196,6 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
         overload,
         ktls_enabled,
         io_uring_splice_enabled,
-        msg_zerocopy_enabled,
     } = cfg;
     let addr = SocketAddr::new(bind_addr, port);
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -335,7 +332,6 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
                         sni_proxy_ids.as_deref(),
                         &adaptive_buf,
                         tcp_fastopen_enabled,
-                        msg_zerocopy_enabled,
                                         ktls_enabled,
                         io_uring_splice_enabled,
                         &overload_for_conn,
@@ -491,20 +487,12 @@ async fn handle_tcp_connection(
     sni_proxy_ids: Option<&[String]>,
     adaptive_buffer: &crate::adaptive_buffer::AdaptiveBufferTracker,
     tcp_fastopen: bool,
-    msg_zerocopy_enabled: bool,
     ktls_enabled: bool,
     io_uring_splice_enabled: bool,
     overload: &crate::overload::OverloadState,
 ) -> TcpConnectionResult {
     let start = Instant::now();
     let _ = client_stream.set_nodelay(true);
-
-    // Apply MSG_ZEROCOPY on the client socket for large sends (Linux 4.14+).
-    #[cfg(target_os = "linux")]
-    if msg_zerocopy_enabled {
-        use std::os::unix::io::AsRawFd;
-        let _ = crate::socket_opts::set_so_zerocopy(client_stream.as_raw_fd(), true);
-    }
 
     // Run the core connection logic, tracking backend info for logging.
     // We use a helper closure so that `?` returns from the closure, not the
@@ -532,7 +520,6 @@ async fn handle_tcp_connection(
         sni_proxy_ids,
         adaptive_buffer,
         tcp_fastopen,
-        msg_zerocopy_enabled,
         ktls_enabled,
         io_uring_splice_enabled,
         overload,
@@ -566,7 +553,6 @@ async fn handle_tcp_connection_inner(
     sni_proxy_ids: Option<&[String]>,
     adaptive_buffer: &crate::adaptive_buffer::AdaptiveBufferTracker,
     tcp_fastopen: bool,
-    msg_zerocopy_enabled: bool,
     ktls_enabled: bool,
     io_uring_splice_enabled: bool,
     overload: &crate::overload::OverloadState,
@@ -708,13 +694,6 @@ async fn handle_tcp_connection_inner(
                 })?;
 
         let buf_size = adaptive_buffer.get_buffer_size(proxy_id);
-
-        // Apply MSG_ZEROCOPY on the backend socket for large sends (Linux 4.14+).
-        #[cfg(target_os = "linux")]
-        if msg_zerocopy_enabled {
-            use std::os::unix::io::AsRawFd;
-            let _ = crate::socket_opts::set_so_zerocopy(backend_stream.as_raw_fd(), true);
-        }
 
         // On Linux, use splice(2) for zero-copy relay between raw TCP sockets.
         // Passthrough mode is always plain-to-plain (no TLS termination/origination).
@@ -954,18 +933,6 @@ async fn handle_tcp_connection_inner(
     };
     let (_backend_socket_addr, backend_stream) = backend_addr;
     let _ = last_connect_err; // consumed by retry loop logging
-
-    // Apply MSG_ZEROCOPY on the backend socket for large sends (Linux 4.14+).
-    #[cfg(target_os = "linux")]
-    if msg_zerocopy_enabled {
-        use std::os::unix::io::AsRawFd;
-        match &backend_stream {
-            BackendStream::Plain(s) => {
-                let _ = crate::socket_opts::set_so_zerocopy(s.as_raw_fd(), true);
-            }
-            BackendStream::Tls(_) => {} // TLS stream wraps the fd; zerocopy on raw fd won't help
-        }
-    }
 
     // Apply frontend TLS termination if configured, then start bidirectional copy.
     // From here, no retries — bytes may be exchanged.

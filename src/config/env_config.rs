@@ -833,12 +833,6 @@ pub struct EnvConfig {
     /// When > 0, the kernel spins for this many microseconds waiting for incoming data
     /// before sleeping. Reduces receive latency at the cost of CPU. 0 = disabled. Default: 0.
     pub so_busy_poll_us: u32,
-    /// Enable MSG_ZEROCOPY for large TCP stream proxy sends (Linux 4.14+ only).
-    /// Avoids copying data from userspace to kernel socket buffer for sends > threshold.
-    /// The threshold gate protects small payloads from completion notification overhead.
-    /// Values: `auto` (detect kernel support), `true` (force on), `false` (force off).
-    /// Default: `auto`.
-    pub msg_zerocopy_enabled: AutoBool,
 }
 
 impl Default for EnvConfig {
@@ -1027,7 +1021,6 @@ impl Default for EnvConfig {
             udp_gro_enabled: AutoBool::Auto,
             udp_gso_enabled: AutoBool::Auto,
             so_busy_poll_us: 0,
-            msg_zerocopy_enabled: AutoBool::Auto,
         }
     }
 }
@@ -1646,11 +1639,6 @@ impl EnvConfig {
             so_busy_poll_us: resolve_var(conf, "FERRUM_SO_BUSY_POLL_US")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0),
-            msg_zerocopy_enabled: resolve_auto_bool(
-                conf,
-                "FERRUM_MSG_ZEROCOPY_ENABLED",
-                AutoBool::Auto,
-            ),
         };
 
         config.validate()?;

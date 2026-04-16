@@ -436,7 +436,6 @@ async fn test_http3_proxy_state_creation() {
             Arc::new(ferrum_edge::overload::OverloadState::new()),
             false, // ktls_enabled
             false, // io_uring_splice_enabled
-            false, // msg_zerocopy_enabled
             0,     // so_busy_poll_us
             false, // udp_gro_enabled (use false in tests to avoid Linux-specific failures)
             false, // udp_gso_enabled
@@ -652,7 +651,6 @@ async fn test_http3_full_integration() {
             Arc::new(ferrum_edge::overload::OverloadState::new()),
             false, // ktls_enabled
             false, // io_uring_splice_enabled
-            false, // msg_zerocopy_enabled
             0,     // so_busy_poll_us
             false, // udp_gro_enabled (use false in tests to avoid Linux-specific failures)
             false, // udp_gso_enabled

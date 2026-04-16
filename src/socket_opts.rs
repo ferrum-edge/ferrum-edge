@@ -3,7 +3,7 @@
 //! Provides `IP_BIND_ADDRESS_NO_PORT` (defers ephemeral port allocation to connect()),
 //! `TCP_FASTOPEN` (saves 1 RTT on repeat connections), `TCP_INFO` access for
 //! kernel-level BDP-optimal buffer sizing, `SO_BUSY_POLL` for low-latency UDP,
-//! `MSG_ZEROCOPY` for large TCP sends, `UDP_GRO`/`UDP_SEGMENT` for kernel-level
+//! `UDP_GRO`/`UDP_SEGMENT` for kernel-level
 //! datagram batching, and `kTLS` for enabling splice(2) on TLS paths.
 //! All functions are no-ops on non-Linux platforms.
 
@@ -251,40 +251,6 @@ pub fn set_so_prefer_busy_poll(fd: std::os::unix::io::RawFd, enable: bool) -> st
 #[cfg(not(target_os = "linux"))]
 #[allow(dead_code)]
 pub fn set_so_prefer_busy_poll(_fd: i32, _enable: bool) -> std::io::Result<()> {
-    Ok(())
-}
-
-// ── MSG_ZEROCOPY (zero-copy send for large payloads) ───────────────────
-
-/// Enable `SO_ZEROCOPY` on a socket (Linux 4.14+ only).
-///
-/// Allows `send(MSG_ZEROCOPY)` to avoid copying data from userspace to
-/// kernel socket buffer. Only beneficial for sends > ~10 KB due to completion
-/// notification overhead.
-///
-/// No-op on non-Linux platforms.
-#[cfg(target_os = "linux")]
-pub fn set_so_zerocopy(fd: std::os::unix::io::RawFd, enable: bool) -> std::io::Result<()> {
-    let val: libc::c_int = if enable { 1 } else { 0 };
-    let ret = unsafe {
-        libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_ZEROCOPY,
-            &val as *const libc::c_int as *const libc::c_void,
-            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        )
-    };
-    if ret != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    debug!("SO_ZEROCOPY enabled on socket");
-    Ok(())
-}
-
-#[cfg(not(target_os = "linux"))]
-#[allow(dead_code)]
-pub fn set_so_zerocopy(_fd: i32, _enable: bool) -> std::io::Result<()> {
     Ok(())
 }
 
@@ -1087,36 +1053,6 @@ pub fn is_udp_gso_available() -> bool {
 #[cfg(not(target_os = "linux"))]
 #[allow(dead_code)]
 pub fn is_udp_gso_available() -> bool {
-    false
-}
-
-/// Check if MSG_ZEROCOPY (SO_ZEROCOPY) is available by probing on a temp socket.
-///
-/// Creates a temporary TCP socket, attempts `setsockopt(SO_ZEROCOPY, 1)`, and
-/// closes it. Returns `true` if the setsockopt succeeds (Linux 4.14+).
-#[cfg(target_os = "linux")]
-pub fn is_msg_zerocopy_available() -> bool {
-    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
-    if fd < 0 {
-        return false;
-    }
-    let val: libc::c_int = 1;
-    let ret = unsafe {
-        libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_ZEROCOPY,
-            &val as *const libc::c_int as *const libc::c_void,
-            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        )
-    };
-    unsafe { libc::close(fd) };
-    ret == 0
-}
-
-#[cfg(not(target_os = "linux"))]
-#[allow(dead_code)]
-pub fn is_msg_zerocopy_available() -> bool {
     false
 }
 
