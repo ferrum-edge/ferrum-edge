@@ -466,6 +466,34 @@ The lifecycle phases are:
 
 Plugin priority constants are defined in `src/plugins/mod.rs` (e.g., `priority::CORS = 100`, `priority::REQUEST_TERMINATION = 125`, `priority::TCP_CONNECTION_THROTTLE = 2050`, `priority::RATE_LIMITING = 2900`, `priority::RESPONSE_SIZE_LIMITING = 3490`, `priority::COMPRESSION = 4050`). Per-instance `priority_override` (on `PluginConfig`) can override these built-in constants via the `PriorityOverridePlugin` wrapper in `plugin_cache.rs`.
 
+### Transaction Summary Fields
+
+All logging plugins receive a shared summary struct for every request/session: `TransactionSummary` for HTTP/gRPC/WebSocket and `StreamTransactionSummary` for TCP/UDP. Both live in `src/plugins/mod.rs`.
+
+**`TransactionSummary` body-streaming fields** (set on the HTTP/gRPC/WebSocket path):
+
+| Field | Type | Meaning |
+|---|---|---|
+| `body_error_class` | `Option<ErrorClass>` | Classified error observed while streaming the response body (e.g., client RST mid-body, backend RST after headers). `None` when the body completed cleanly. Distinct from `error_class`, which covers pre-body failures (connect, TLS, headers). |
+| `body_completed` | `bool` | `true` when the final body frame flushed to the client. `false` if the stream aborted before completion. Always `true` for buffered (non-streaming) responses. |
+| `bytes_streamed_to_client` | `u64` | Actual bytes written to the client socket. May be less than the backend's advertised `Content-Length` when streaming was interrupted — compare with the backend's byte count to detect truncated deliveries. |
+
+A forthcoming `DeferredTransactionLogger` will fire the `log` phase at body-completion (instead of post-header) so `body_error_class`, `body_completed`, and `bytes_streamed_to_client` reflect the full client-visible outcome. Until that lands, body-streaming fields are emitted with their default values for non-final log points.
+
+**`StreamTransactionSummary` disconnect-attribution fields** (set on TCP/UDP paths):
+
+| Field | Type | Meaning |
+|---|---|---|
+| `disconnect_direction` | `Option<Direction>` | Which half of the bidirectional stream errored first: `ClientToBackend`, `BackendToClient`, or `Unknown` (both halves failed simultaneously or the error happened outside the copy loop). |
+| `disconnect_cause` | `Option<DisconnectCause>` | Disambiguates session termination: `IdleTimeout`, `RecvError` (frontend recv failed), `BackendError` (backend recv failed), or `GracefulShutdown`. Before this field existed, log consumers had to infer idle timeouts from `error_class: None` — no longer ambiguous. |
+
+Both new enums live in `src/plugins/mod.rs` and serialize as snake_case (e.g., `"client_to_backend"`, `"idle_timeout"`). Both fields are `Option` so pre-existing logs without attribution data remain valid.
+
+**Backend error classifiers**: Two helpers complement the existing `classify_reqwest_error` / `classify_grpc_proxy_error` / `classify_boxed_error`:
+
+- `classify_http2_pool_error` (`src/proxy/http2_pool.rs`) — maps `Http2PoolError` variants to `ErrorClass` for the HTTP/2 direct pool path.
+- `classify_http3_error` (`src/http3/client.rs`) — walks the error source chain for typed `quinn::ConnectionError` / `ConnectError` / `io::Error` before falling back to string heuristics. The existing `classify_h3_error` in `src/http3/server.rs` now delegates to this shared helper.
+
 ### DNS Cache (`src/dns/mod.rs`)
 
 All gateway components share a single `DnsCache` instance:

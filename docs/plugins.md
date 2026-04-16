@@ -664,10 +664,15 @@ All logging plugins (`stdout_logging`, `http_logging`, `tcp_logging`, `udp_loggi
 | `request_user_agent` | String or null | User-Agent header value |
 | `response_streamed` | bool | Present and `true` when body was streamed (not buffered) |
 | `client_disconnected` | bool | Present and `true` when client disconnected early |
-| `error_class` | String or null | Error classification; omitted from JSON when null |
+| `error_class` | String or null | Error classification for pre-body failures (connect, TLS, headers); omitted from JSON when null |
+| `body_error_class` | String or null | Error classification for failures while streaming the response body (e.g., client RST mid-body, backend RST after headers); omitted when null |
+| `body_completed` | bool | `true` when the final body frame flushed to the client; `false` if streaming aborted before completion. Always `true` for buffered responses |
+| `bytes_streamed_to_client` | u64 | Actual bytes written to the client socket. May be less than the backend's advertised `Content-Length` when streaming was interrupted |
 | `metadata` | Object | Plugin-injected key-value pairs (correlation ID, trace ID, etc.) |
 
-**Notes on conditional fields:** `response_streamed`, `client_disconnected`, `backend_resolved_ip`, and `error_class` are omitted from the JSON output when false/null to keep log entries compact.
+**Notes on conditional fields:** `response_streamed`, `client_disconnected`, `backend_resolved_ip`, `error_class`, and `body_error_class` are omitted from the JSON output when false/null to keep log entries compact.
+
+**`error_class` vs `body_error_class`:** `error_class` covers failures before or during the response header exchange (connect, TLS, DNS, pool, pre-header timeouts). `body_error_class` covers failures observed while streaming the response body after headers were sent. A transaction can have one, the other, both, or neither. A forthcoming `DeferredTransactionLogger` will move the `log` phase to body-completion so `body_error_class`, `body_completed`, and `bytes_streamed_to_client` reflect the full client-visible outcome.
 
 **`error_class` values:** `ConnectionFailed`, `Timeout`, `BadGateway`, `ServiceUnavailable`. Only set when the gateway itself could not communicate with the backend. Normal HTTP error responses from the backend (e.g., 404, 500) do not set `error_class`.
 
@@ -687,6 +692,8 @@ All logging plugins (`stdout_logging`, `http_logging`, `tcp_logging`, `udp_loggi
 | `bytes_received` | u64 | Bytes received from backend |
 | `connection_error` | String or null | Error message if the connection failed |
 | `error_class` | String or null | Error classification; omitted from JSON when null |
+| `disconnect_direction` | String or null | Which half of the stream errored first: `"client_to_backend"`, `"backend_to_client"`, or `"unknown"`. Omitted when null |
+| `disconnect_cause` | String or null | Session termination cause: `"idle_timeout"`, `"recv_error"` (frontend recv failed), `"backend_error"` (backend recv failed), or `"graceful_shutdown"`. Disambiguates idle timeouts from recv errors (previously both presented as `error_class: null`). Omitted when null |
 | `timestamp_connected` | String (RFC 3339) | Connection start time |
 | `timestamp_disconnected` | String (RFC 3339) | Connection end time |
 | `metadata` | Object | Plugin-injected key-value pairs; omitted from JSON when empty |
