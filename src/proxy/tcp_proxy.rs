@@ -1171,111 +1171,43 @@ async fn connect_backend_plain(
     tcp_fastopen: bool,
     overload: &crate::overload::OverloadState,
 ) -> Result<TcpStream, anyhow::Error> {
-    // On Linux, create the socket manually so we can set socket options
-    // BEFORE connect(). tokio's TcpStream::connect() creates+connects in
-    // one shot, which is too late for IP_BIND_ADDRESS_NO_PORT and TFO.
-    #[cfg(target_os = "linux")]
-    let stream = {
-        use std::os::unix::io::FromRawFd;
-        let domain = if addr.is_ipv4() {
-            libc::AF_INET
-        } else {
-            libc::AF_INET6
-        };
-        let fd = unsafe {
-            libc::socket(
-                domain,
-                libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
-                0,
-            )
-        };
-        if fd < 0 {
-            return Err(anyhow::anyhow!(
-                "socket() failed: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-        // Apply options BEFORE connect.
+    // Use TcpSocket to set socket options BEFORE connect(). This is the same
+    // pattern as socket_opts::connect_with_socket_opts() but adds TFO and
+    // port exhaustion detection.
+    let socket = if addr.is_ipv4() {
+        tokio::net::TcpSocket::new_v4()?
+    } else {
+        tokio::net::TcpSocket::new_v6()?
+    };
+
+    // Apply pre-connect options on the raw fd.
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let fd = socket.as_raw_fd();
         let _ = crate::socket_opts::set_ip_bind_address_no_port(fd, true);
         if tcp_fastopen {
             let _ = crate::socket_opts::set_tcp_fastopen_client(fd);
         }
+    }
+    #[cfg(not(unix))]
+    let _ = tcp_fastopen;
 
-        // Convert to std TcpStream, then tokio TcpStream for async connect.
-        let std_stream = unsafe { std::net::TcpStream::from_raw_fd(fd) };
-        std_stream.set_nonblocking(true).ok();
-        let socket2_sock = socket2::Socket::from(std_stream);
-        let sock_addr = socket2::SockAddr::from(addr);
-
-        // Non-blocking connect — returns WouldBlock immediately.
-        match socket2_sock.connect(&sock_addr) {
-            Ok(()) => {}
-            Err(e) if e.raw_os_error() == Some(libc::EINPROGRESS) => {}
-            Err(e) => {
-                if crate::retry::is_port_exhaustion(&e) {
-                    tracing::error!(
-                        "tcp_proxy: PORT EXHAUSTION connecting to backend {}: {} — \
-                         reduce outbound connection rate or increase net.ipv4.ip_local_port_range",
-                        addr,
-                        e
-                    );
-                    overload.record_port_exhaustion();
-                }
-                return Err(anyhow::anyhow!("Backend connect failed to {}: {}", addr, e));
-            }
-        }
-
-        let std_stream: std::net::TcpStream = socket2_sock.into();
-        let tokio_stream = TcpStream::from_std(std_stream)
-            .map_err(|e| anyhow::anyhow!("Failed to convert to tokio TcpStream: {}", e))?;
-
-        // Wait for connect to complete (or timeout).
-        tokio::time::timeout(connect_timeout, tokio_stream.writable())
-            .await
-            .map_err(|_| anyhow::anyhow!("Backend connect timeout to {}", addr))?
-            .map_err(|e| anyhow::anyhow!("Backend connect failed to {}: {}", addr, e))?;
-
-        // Check for connect error (includes port exhaustion on async path).
-        if let Some(err) = tokio_stream.take_error()? {
-            if crate::retry::is_port_exhaustion(&err) {
+    let stream = tokio::time::timeout(connect_timeout, socket.connect(addr))
+        .await
+        .map_err(|_| anyhow::anyhow!("Backend connect timeout to {}", addr))?
+        .map_err(|e| {
+            if crate::retry::is_port_exhaustion(&e) {
                 tracing::error!(
                     "tcp_proxy: PORT EXHAUSTION connecting to backend {}: {} — \
                      reduce outbound connection rate or increase net.ipv4.ip_local_port_range",
                     addr,
-                    err
+                    e
                 );
                 overload.record_port_exhaustion();
             }
-            return Err(anyhow::anyhow!(
-                "Backend connect failed to {}: {}",
-                addr,
-                err
-            ));
-        }
-
-        tokio_stream
-    };
-
-    // Non-Linux: use tokio's built-in connect (no pre-connect options needed).
-    #[cfg(not(target_os = "linux"))]
-    let stream = {
-        let _ = tcp_fastopen;
-        tokio::time::timeout(connect_timeout, TcpStream::connect(addr))
-            .await
-            .map_err(|_| anyhow::anyhow!("Backend connect timeout to {}", addr))?
-            .map_err(|e| {
-                if crate::retry::is_port_exhaustion(&e) {
-                    tracing::error!(
-                        "tcp_proxy: PORT EXHAUSTION connecting to backend {}: {} — \
-                         reduce outbound connection rate or increase net.ipv4.ip_local_port_range",
-                        addr,
-                        e
-                    );
-                    overload.record_port_exhaustion();
-                }
-                anyhow::anyhow!("Backend connect failed to {}: {}", addr, e)
-            })?
-    };
+            anyhow::anyhow!("Backend connect failed to {}: {}", addr, e)
+        })?;
 
     let _ = stream.set_nodelay(true);
     Ok(stream)
