@@ -218,6 +218,17 @@ The admin `/status` (and `/health`) endpoint includes database connection pool s
 
 **Tuning guidance**: If `active` consistently equals `max_connections`, increase `FERRUM_DB_POOL_MAX_CONNECTIONS`. If `idle` is consistently high, consider reducing `min_connections` to save resources.
 
+## Ephemeral Port Optimization
+
+On Linux, all pool outbound TCP connections (HTTP/2 direct pool and gRPC pool) have `IP_BIND_ADDRESS_NO_PORT` set, which defers ephemeral port allocation to `connect()` time. This enables the kernel to co-select the source port as part of the full 4-tuple (src_ip, src_port, dst_ip, dst_port), allowing port reuse across different destinations and reducing ephemeral port pressure under high connection rates.
+
+If the gateway exhausts available ephemeral ports (EADDRNOTAVAIL), the error is classified as `PortExhaustion`, logged at `error` level, and tracked in the `port_exhaustion_events` counter on `GET /overload`. To mitigate:
+
+- Widen the kernel port range: `sysctl net.ipv4.ip_local_port_range="1024 65535"`
+- Enable TIME_WAIT reuse: `sysctl net.ipv4.tcp_tw_reuse=1`
+- Lower `FERRUM_POOL_IDLE_TIMEOUT_SECONDS` (default 90) to free ports faster
+- Lower `FERRUM_POOL_MAX_IDLE_PER_HOST` to reduce idle connection count
+
 ## Benefits
 
 - **2-3x Higher Throughput**: Connection reuse eliminates setup overhead

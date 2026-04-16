@@ -2578,7 +2578,7 @@ components:
 
     OverloadSnapshot:
       type: object
-      required: [level, draining, active_connections, pressure, actions]
+      required: [level, draining, active_connections, active_requests, red_drop_probability_pct, port_exhaustion_events, pressure, actions]
       properties:
         level:
           type: string
@@ -2591,9 +2591,21 @@ components:
           type: integer
           format: uint64
           description: Number of currently active proxy connections
+        active_requests:
+          type: integer
+          format: uint64
+          description: Number of currently in-flight requests/streams (H1 requests, H2/gRPC streams, H3 streams)
+        red_drop_probability_pct:
+          type: number
+          format: double
+          description: RED (Random Early Detection) drop probability percentage (0-100)
+        port_exhaustion_events:
+          type: integer
+          format: uint64
+          description: Monotonic count of EADDRNOTAVAIL errors (ephemeral port exhaustion). Alert when this value increases.
         pressure:
           type: object
-          required: [file_descriptors, connections, event_loop_latency_us]
+          required: [file_descriptors, connections, requests, event_loop_latency_us]
           properties:
             file_descriptors:
               type: object
@@ -2623,13 +2635,27 @@ components:
                   type: number
                   format: double
                   description: current / max (0.0–1.0)
+            requests:
+              type: object
+              required: [current, max, ratio]
+              properties:
+                current:
+                  type: integer
+                  format: uint64
+                max:
+                  type: integer
+                  format: uint64
+                ratio:
+                  type: number
+                  format: double
+                  description: current / max (0.0–1.0). 0.0 when FERRUM_MAX_REQUESTS=0 (unlimited)
             event_loop_latency_us:
               type: integer
               format: uint64
               description: Event loop scheduling latency in microseconds
         actions:
           type: object
-          required: [disable_keepalive, reject_new_connections]
+          required: [disable_keepalive, reject_new_connections, reject_new_requests]
           properties:
             disable_keepalive:
               type: boolean
@@ -2637,6 +2663,9 @@ components:
             reject_new_connections:
               type: boolean
               description: Whether new connections are being refused
+            reject_new_requests:
+              type: boolean
+              description: Whether new requests/streams are being rejected with 503
 
     # ── Admin metrics ───────────────────────────────────────────────
     AdminMetrics:

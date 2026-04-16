@@ -408,39 +408,60 @@ impl GrpcConnectionPool {
         let host = &proxy.backend_host;
         let port = proxy.backend_port;
 
-        // Resolve backend hostname via DNS cache
-        let target_host = match dns_cache
+        // Resolve backend hostname via the shared DNS cache. Errors propagate
+        // — no silent fallback to raw hostname that would bypass the cache.
+        let resolved_ip = dns_cache
             .resolve(
                 host,
                 proxy.dns_override.as_deref(),
                 proxy.dns_cache_ttl_seconds,
             )
             .await
-        {
-            Ok(ip) => ip.to_string(),
-            Err(_) => host.clone(),
-        };
+            .map_err(|e| {
+                GrpcProxyError::BackendUnavailable(format!(
+                    "DNS resolution failed for {}: {}",
+                    host, e
+                ))
+            })?;
 
-        let addr = format!("{}:{}", target_host, port);
+        // Construct SocketAddr from the resolved IpAddr + port directly.
+        // This handles both IPv4 and IPv6 correctly without string formatting
+        // issues (IPv6 addresses from IpAddr::to_string() are unbracketed,
+        // which breaks "ip:port" string parsing).
+        let sock_addr = std::net::SocketAddr::new(resolved_ip, port);
+        let addr = sock_addr.to_string();
         let connect_timeout = Duration::from_millis(proxy.backend_connect_timeout_ms);
 
-        // Connect with timeout
-        let tcp = tokio::time::timeout(connect_timeout, TcpStream::connect(&addr))
-            .await
-            .map_err(|_| {
-                warn!(
-                    "gRPC: connect timeout ({}ms) to backend {}",
-                    proxy.backend_connect_timeout_ms, addr
+        // Connect with timeout, using TcpSocket to set IP_BIND_ADDRESS_NO_PORT
+        // before connect() so the kernel can co-select ephemeral ports.
+        let tcp = tokio::time::timeout(
+            connect_timeout,
+            crate::socket_opts::connect_with_socket_opts(sock_addr),
+        )
+        .await
+        .map_err(|_| {
+            warn!(
+                "gRPC: connect timeout ({}ms) to backend {}",
+                proxy.backend_connect_timeout_ms, addr
+            );
+            GrpcProxyError::BackendTimeout(format!(
+                "Connect timeout after {}ms to {}",
+                proxy.backend_connect_timeout_ms, addr
+            ))
+        })?
+        .map_err(|e| {
+            if crate::retry::is_port_exhaustion(&e) {
+                tracing::error!(
+                    "gRPC: PORT EXHAUSTION connecting to backend {}: {} — \
+                         reduce outbound connection rate or increase net.ipv4.ip_local_port_range",
+                    addr,
+                    e
                 );
-                GrpcProxyError::BackendTimeout(format!(
-                    "Connect timeout after {}ms to {}",
-                    proxy.backend_connect_timeout_ms, addr
-                ))
-            })?
-            .map_err(|e| {
+            } else {
                 warn!("gRPC: failed to connect to backend {}: {}", addr, e);
-                GrpcProxyError::BackendUnavailable(format!("Connection failed: {}", e))
-            })?;
+            }
+            GrpcProxyError::BackendUnavailable(format!("Connection failed: {}", e))
+        })?;
 
         // Disable Nagle for lower latency
         let _ = tcp.set_nodelay(true);

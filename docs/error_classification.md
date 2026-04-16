@@ -27,6 +27,7 @@ When a backend request fails (connection error, timeout, TLS failure, etc.), the
 | `ResponseBodyTooLarge` | `"ResponseBodyTooLarge"` | Backend response body exceeded the configured maximum size | Backend returned unexpectedly large payload, misconfigured size limit |
 | `RequestBodyTooLarge` | `"RequestBodyTooLarge"` | Request body exceeded the configured maximum size | Client sent oversized upload, misconfigured size limit |
 | `ConnectionPoolError` | `"ConnectionPoolError"` | Could not acquire or create an HTTP client from the connection pool | Pool exhaustion (all connections in use), pool configuration too restrictive |
+| `PortExhaustion` | `"PortExhaustion"` | OS returned EADDRNOTAVAIL — all ephemeral ports are consumed | High outbound connection rate, too many TIME_WAIT sockets, `net.ipv4.ip_local_port_range` too narrow |
 | `RequestError` | `"RequestError"` | Catch-all for unclassified request errors | Unexpected error not matching any specific category — check gateway logs for details |
 
 ## Debugging Guide
@@ -39,6 +40,7 @@ These error classes typically indicate problems with the gateway node itself or 
 - **`ConnectionRefused`** — Verify the backend is running and listening on the expected host:port. Check `backend_host` and `backend_port` in the proxy config.
 - **`DnsLookupError`** — Check DNS resolver configuration. Verify the `backend_host` hostname is correct and resolvable. Check `/etc/resolv.conf` or the gateway's DNS settings.
 - **`ConnectionPoolError`** — The gateway may be under heavy load with all pooled connections in use. Consider increasing the global `FERRUM_POOL_MAX_IDLE_PER_HOST` env var or the per-proxy `pool_idle_timeout` setting.
+- **`PortExhaustion`** — The OS has no more ephemeral ports available for outbound connections (EADDRNOTAVAIL). Widen the port range with `sysctl net.ipv4.ip_local_port_range="1024 65535"`, enable `net.ipv4.tcp_tw_reuse=1`, and reduce idle pool timeouts (`FERRUM_POOL_IDLE_TIMEOUT_SECONDS`). Monitor via the `port_exhaustion_events` counter on `GET /overload`.
 
 ### TLS Issues
 
@@ -98,9 +100,9 @@ Error classification is wired into all proxy protocols:
 
 | Protocol | Summary Type | Error Classification | Classifier |
 |---|---|---|---|
-| HTTP/1.1 | `TransactionSummary` | Full (13 error classes) | `classify_reqwest_error()` |
-| HTTP/2 | `TransactionSummary` | Full (13 error classes) | `classify_reqwest_error()` |
-| HTTP/3 (QUIC) | `TransactionSummary` | Full (13 error classes) | `classify_reqwest_error()` |
+| HTTP/1.1 | `TransactionSummary` | Full (14 error classes) | `classify_reqwest_error()` |
+| HTTP/2 | `TransactionSummary` | Full (14 error classes) | `classify_reqwest_error()` |
+| HTTP/3 (QUIC) | `TransactionSummary` | Full (14 error classes) | `classify_reqwest_error()` |
 | gRPC / gRPCs | `TransactionSummary` | Full (via gRPC error mapping) | `classify_grpc_proxy_error()` |
 | WebSocket / WSS | `TransactionSummary` | Full (connection-phase errors) | `classify_boxed_error()` |
 | TCP / TCP+TLS | `StreamTransactionSummary` | Field available (`error_class`) | Classified from `anyhow::Error` context |
@@ -124,6 +126,7 @@ Not all error classes apply to all protocols equally:
 | `ResponseBodyTooLarge` | Yes | — | Yes | — | — |
 | `RequestBodyTooLarge` | Yes | — | — | — | — |
 | `ConnectionPoolError` | Yes | — | — | — | — |
+| `PortExhaustion` | Yes | Yes | Yes | Yes | Yes |
 | `RequestError` | Yes | Yes | Yes | Yes | — |
 
 **Notes:**
@@ -135,7 +138,7 @@ Not all error classes apply to all protocols equally:
 
 Error classification is implemented in `src/retry.rs`:
 
-- `ErrorClass` enum — 13 variants covering the full spectrum of gateway-level failures.
+- `ErrorClass` enum — 14 variants covering the full spectrum of gateway-level failures.
 - `classify_reqwest_error()` — inspects the `reqwest::Error` chain (connect errors, timeout, TLS, DNS, reset, etc.) and returns the appropriate `ErrorClass`. Used by HTTP/1.1, HTTP/2, and HTTP/3 paths.
 - `classify_grpc_proxy_error()` — maps `GrpcProxyError` variants (timeout, unavailable, internal) into `ErrorClass`. Inspects the error message to further distinguish TLS, connection refused, protocol, and DNS errors.
 - `classify_boxed_error()` — inspects generic `Box<dyn Error>` by its Display/Debug representation. Used by the WebSocket path where errors come from `tokio-tungstenite` rather than reqwest.

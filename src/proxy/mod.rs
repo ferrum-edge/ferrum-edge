@@ -5290,6 +5290,9 @@ async fn handle_proxy_request_inner(
             }
             Err(e) => {
                 let grpc_error_class = retry::classify_grpc_proxy_error(&e);
+                if grpc_error_class == retry::ErrorClass::PortExhaustion {
+                    state.overload.record_port_exhaustion();
+                }
                 let (grpc_code, original_msg) = match &e {
                     GrpcProxyError::BackendUnavailable(m) => {
                         (grpc_proxy::grpc_status::UNAVAILABLE, m.as_str())
@@ -6296,6 +6299,9 @@ async fn proxy_to_backend_retry(
                 "Backend retry request failed"
             );
             let error_class = retry::classify_reqwest_error(&e);
+            if error_class == retry::ErrorClass::PortExhaustion {
+                state.overload.record_port_exhaustion();
+            }
             let error_body = if error_class == retry::ErrorClass::DnsLookupError {
                 r#"{"error":"DNS resolution for backend failed"}"#
             } else {
@@ -6925,6 +6931,9 @@ async fn proxy_to_backend(
                 "Backend request failed"
             );
             let error_class = retry::classify_reqwest_error(&e);
+            if error_class == retry::ErrorClass::PortExhaustion {
+                state.overload.record_port_exhaustion();
+            }
             let error_body = if error_class == retry::ErrorClass::DnsLookupError {
                 r#"{"error":"DNS resolution for backend failed"}"#
             } else {
@@ -7275,16 +7284,32 @@ async fn proxy_to_backend_http2(
                 http2_pool::Http2PoolError::BackendUnavailable(m) => m.clone(),
                 http2_pool::Http2PoolError::Internal(m) => m.clone(),
             };
+            // Classify the H2 pool error for accurate error_class reporting.
+            let h2_error_class = if retry::is_port_exhaustion_message(&msg) {
+                state.overload.record_port_exhaustion();
+                retry::ErrorClass::PortExhaustion
+            } else if msg.contains("DNS resolution failed") {
+                retry::ErrorClass::DnsLookupError
+            } else if msg.contains("Connect timeout") {
+                retry::ErrorClass::ConnectionTimeout
+            } else if msg.contains("TLS") || msg.contains("certificate") {
+                retry::ErrorClass::TlsError
+            } else {
+                retry::ErrorClass::ConnectionPoolError
+            };
+            let error_body = if h2_error_class == retry::ErrorClass::DnsLookupError {
+                r#"{"error":"DNS resolution for backend failed"}"#.to_string()
+            } else {
+                format!(r#"{{"error":"Backend unavailable: {}"}}"#, msg)
+            };
             error!(proxy_id = %proxy.id, error = %msg, "HTTP/2 pool connection failed");
             return retry::BackendResponse {
                 status_code: 502,
-                body: ResponseBody::Buffered(
-                    format!(r#"{{"error":"Backend unavailable: {}"}}"#, msg).into_bytes(),
-                ),
+                body: ResponseBody::Buffered(error_body.into_bytes()),
                 headers: HashMap::new(),
                 connection_error: true,
                 backend_resolved_ip: resolved_ip,
-                error_class: Some(retry::ErrorClass::ConnectionPoolError),
+                error_class: Some(h2_error_class),
             };
         }
     };

@@ -494,3 +494,30 @@ async fn drain_waits_for_both_connections_and_requests() {
     let result = handle.await.unwrap();
     assert!(result, "Drain should complete when both reach zero");
 }
+
+// ── Port exhaustion counter ─────────────────────────────────────────
+
+#[test]
+fn port_exhaustion_counter_starts_at_zero() {
+    let state = OverloadState::new();
+    assert_eq!(state.port_exhaustion_events.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn port_exhaustion_counter_increments() {
+    let state = OverloadState::new();
+    state.record_port_exhaustion();
+    state.record_port_exhaustion();
+    assert_eq!(state.port_exhaustion_events.load(Ordering::Relaxed), 2);
+}
+
+#[test]
+fn snapshot_includes_port_exhaustion_events() {
+    let state = OverloadState::new();
+    state.fd_max.store(1024, Ordering::Relaxed);
+    state.record_port_exhaustion();
+    state.record_port_exhaustion();
+    state.record_port_exhaustion();
+    let snap = state.snapshot();
+    assert_eq!(snap.port_exhaustion_events, 3);
+}

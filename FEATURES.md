@@ -181,7 +181,8 @@ Ferrum supports dynamic upstream target discovery through three providers, confi
 - Configurable tokio worker and blocking thread counts with auto-detection
 - **Linux socket optimizations** :
   - `TCP_FASTOPEN` on server sockets — saves 1 RTT for repeat clients with cached TFO cookies, configurable queue length (`FERRUM_TCP_FASTOPEN_ENABLED`, `FERRUM_TCP_FASTOPEN_QUEUE_LEN`)
-  - `IP_BIND_ADDRESS_NO_PORT` on outbound sockets — defers ephemeral port allocation to `connect()` for 4-tuple co-selection, preventing port exhaustion under high outbound connection rates
+  - `IP_BIND_ADDRESS_NO_PORT` on all outbound sockets (HTTP/2 pool, gRPC pool, TCP stream proxy, HTTP/3 QUIC) — defers ephemeral port allocation to `connect()` for 4-tuple co-selection, preventing port exhaustion under high outbound connection rates
+  - **Port exhaustion detection** — EADDRNOTAVAIL errors are classified as `PortExhaustion` across all connection paths, logged at `error` level with remediation guidance, and tracked via a monotonic counter on `GET /overload`
 - **TLS handshake offload runtime** — dedicated single-threaded tokio runtimes for TLS handshakes, preventing CPU-intensive connection establishment from blocking the main event loop during connection storms. Connections are sharded by peer hash for TLS session cache affinity. Configurable via `FERRUM_TLS_OFFLOAD_THREADS` (0 = disabled)
 - **Thread-local Date header caching** — caches the RFC 2822 formatted date string per-thread with second-granularity refresh, avoiding `SystemTime::now()` + formatting (~100ns) on every response
 - **Lazy timeout initialization** — defers tokio timer wheel allocation until the inner future returns `Pending`, so fast-path operations (e.g., buffered I/O reads that complete immediately) never allocate a timer

@@ -347,7 +347,7 @@ For medium and larger workloads, verify these OS-level settings:
 | File descriptor limit (`ulimit -n`) | 65,536+ | Each connection uses a file descriptor |
 | `net.core.somaxconn` | 4,096+ | TCP listen backlog for burst acceptance |
 | `net.ipv4.tcp_tw_reuse` | 1 | Reuse TIME_WAIT sockets for upstream connections |
-| `net.ipv4.ip_local_port_range` | `1024 65535` | Maximize available ephemeral ports |
+| `net.ipv4.ip_local_port_range` | `1024 65535` | Maximize available ephemeral ports. The gateway applies `IP_BIND_ADDRESS_NO_PORT` on outbound sockets to optimize port reuse. Monitor `port_exhaustion_events` on `GET /overload` for exhaustion |
 | `net.core.rmem_max` / `wmem_max` | 16 MB+ | Socket buffer sizes for large payloads |
 
 ## Quick Reference: Sizing Formula

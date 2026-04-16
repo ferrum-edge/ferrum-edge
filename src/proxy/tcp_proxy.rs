@@ -326,6 +326,7 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
                         sni_proxy_ids.as_deref(),
                         &adaptive_buf,
                         tcp_fastopen_enabled,
+                        &overload_for_conn,
                     )
                     .await;
 
@@ -478,6 +479,7 @@ async fn handle_tcp_connection(
     sni_proxy_ids: Option<&[String]>,
     adaptive_buffer: &crate::adaptive_buffer::AdaptiveBufferTracker,
     tcp_fastopen: bool,
+    overload: &crate::overload::OverloadState,
 ) -> TcpConnectionResult {
     let start = Instant::now();
     let _ = client_stream.set_nodelay(true);
@@ -508,6 +510,7 @@ async fn handle_tcp_connection(
         sni_proxy_ids,
         adaptive_buffer,
         tcp_fastopen,
+        overload,
     )
     .await;
 
@@ -538,6 +541,7 @@ async fn handle_tcp_connection_inner(
     sni_proxy_ids: Option<&[String]>,
     adaptive_buffer: &crate::adaptive_buffer::AdaptiveBufferTracker,
     tcp_fastopen: bool,
+    overload: &crate::overload::OverloadState,
 ) -> Result<TcpConnectionSuccess, anyhow::Error> {
     // --- SNI-based proxy resolution for shared passthrough ports ---
     // When multiple passthrough proxies share a listen_port, we must peek at
@@ -662,7 +666,7 @@ async fn handle_tcp_connection_inner(
         // Connect plain TCP to backend (no TLS origination — the client's encrypted
         // stream passes through directly to the backend which terminates TLS).
         let backend_stream =
-            connect_backend_plain(addr, connect_timeout, params.tcp_fastopen_enabled)
+            connect_backend_plain(addr, connect_timeout, params.tcp_fastopen_enabled, overload)
                 .await
                 .inspect_err(|_| {
                     if let Some(ref cb_config) = cb_info.cb_config {
@@ -856,11 +860,12 @@ async fn handle_tcp_connection_inner(
                 connect_timeout,
                 cached_backend_tls,
                 params.tcp_fastopen_enabled,
+                overload,
             )
             .await
             .map(|s| BackendStream::Tls(Box::new(s)))
         } else {
-            connect_backend_plain(addr, connect_timeout, params.tcp_fastopen_enabled)
+            connect_backend_plain(addr, connect_timeout, params.tcp_fastopen_enabled, overload)
                 .await
                 .map(BackendStream::Plain)
         };
@@ -1074,11 +1079,23 @@ async fn connect_backend_plain(
     addr: SocketAddr,
     connect_timeout: Duration,
     _tcp_fastopen: bool,
+    overload: &crate::overload::OverloadState,
 ) -> Result<TcpStream, anyhow::Error> {
     let stream = tokio::time::timeout(connect_timeout, TcpStream::connect(addr))
         .await
         .map_err(|_| anyhow::anyhow!("Backend connect timeout to {}", addr))?
-        .map_err(|e| anyhow::anyhow!("Backend connect failed to {}: {}", addr, e))?;
+        .map_err(|e| {
+            if crate::retry::is_port_exhaustion(&e) {
+                tracing::error!(
+                    "tcp_proxy: PORT EXHAUSTION connecting to backend {}: {} — \
+                     reduce outbound connection rate or increase net.ipv4.ip_local_port_range",
+                    addr,
+                    e
+                );
+                overload.record_port_exhaustion();
+            }
+            anyhow::anyhow!("Backend connect failed to {}: {}", addr, e)
+        })?;
     let _ = stream.set_nodelay(true);
 
     // Apply Linux/Unix socket optimizations on the connected socket.
@@ -1106,8 +1123,9 @@ async fn connect_backend_tls_cached(
     connect_timeout: Duration,
     cached_tls: Option<&CachedBackendTlsConfig>,
     tcp_fastopen: bool,
+    overload: &crate::overload::OverloadState,
 ) -> Result<tokio_rustls::client::TlsStream<TcpStream>, anyhow::Error> {
-    let tcp_stream = connect_backend_plain(addr, connect_timeout, tcp_fastopen).await?;
+    let tcp_stream = connect_backend_plain(addr, connect_timeout, tcp_fastopen, overload).await?;
 
     let tls_config = cached_tls
         .map(|c| c.config.clone())

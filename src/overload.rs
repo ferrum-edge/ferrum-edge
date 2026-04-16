@@ -70,6 +70,11 @@ pub struct OverloadState {
     pub req_current: AtomicU64,
     pub req_max: AtomicU64,
     pub loop_latency_us: AtomicU64,
+
+    // ── Port exhaustion tracking ─────────────────────────────────────
+    /// Monotonic count of EADDRNOTAVAIL errors (ephemeral port exhaustion).
+    /// Incremented from error classification sites; never reset.
+    pub port_exhaustion_events: AtomicU64,
 }
 
 impl Default for OverloadState {
@@ -97,6 +102,7 @@ impl OverloadState {
             req_current: AtomicU64::new(0),
             req_max: AtomicU64::new(0),
             loop_latency_us: AtomicU64::new(0),
+            port_exhaustion_events: AtomicU64::new(0),
         }
     }
 
@@ -133,6 +139,13 @@ impl OverloadState {
         (hash as u32) < prob
     }
 
+    /// Record an ephemeral port exhaustion event (EADDRNOTAVAIL).
+    /// Called from error classification sites when a connect failure is
+    /// identified as port exhaustion.
+    pub fn record_port_exhaustion(&self) {
+        self.port_exhaustion_events.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Build a JSON-serializable snapshot for the admin endpoint.
     pub fn snapshot(&self) -> OverloadSnapshot {
         let fd_current = self.fd_current.load(Ordering::Relaxed);
@@ -148,6 +161,7 @@ impl OverloadState {
             active_requests: self.active_requests.load(Ordering::Relaxed),
             red_drop_probability_pct: self.red_drop_probability.load(Ordering::Relaxed) as f64
                 / 10.0,
+            port_exhaustion_events: self.port_exhaustion_events.load(Ordering::Relaxed),
             pressure: PressureSnapshot {
                 file_descriptors: FdPressure {
                     current: fd_current,
@@ -256,6 +270,7 @@ pub struct OverloadSnapshot {
     pub active_connections: u64,
     pub active_requests: u64,
     pub red_drop_probability_pct: f64,
+    pub port_exhaustion_events: u64,
     pub pressure: PressureSnapshot,
     pub actions: ActionSnapshot,
 }
