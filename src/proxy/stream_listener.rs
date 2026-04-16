@@ -81,6 +81,16 @@ pub struct StreamListenerManager {
     tcp_fastopen_enabled: bool,
     /// Shared overload state for connection accounting and load shedding.
     overload: Arc<crate::overload::OverloadState>,
+    /// Enable kTLS for splice on TLS paths.
+    ktls_enabled: bool,
+    /// Enable io_uring-based splice.
+    io_uring_splice_enabled: bool,
+    /// SO_BUSY_POLL duration in microseconds for UDP sockets.
+    so_busy_poll_us: u32,
+    /// Enable UDP GRO on frontend sockets.
+    udp_gro_enabled: bool,
+    /// Enable UDP GSO for batched sending.
+    udp_gso_enabled: bool,
 }
 
 impl StreamListenerManager {
@@ -105,6 +115,11 @@ impl StreamListenerManager {
         udp_recvmmsg_batch_size: usize,
         tcp_fastopen_enabled: bool,
         overload: Arc<crate::overload::OverloadState>,
+        ktls_enabled: bool,
+        io_uring_splice_enabled: bool,
+        so_busy_poll_us: u32,
+        udp_gro_enabled: bool,
+        udp_gso_enabled: bool,
     ) -> Self {
         Self {
             listeners: tokio::sync::Mutex::new(std::collections::HashMap::new()),
@@ -129,6 +144,11 @@ impl StreamListenerManager {
             udp_recvmmsg_batch_size,
             tcp_fastopen_enabled,
             overload,
+            ktls_enabled,
+            io_uring_splice_enabled,
+            so_busy_poll_us,
+            udp_gro_enabled,
+            udp_gso_enabled,
         }
     }
 
@@ -387,6 +407,9 @@ impl StreamListenerManager {
                 let adaptive_buf = self.adaptive_buffer.clone();
                 let recvmmsg_batch = self.udp_recvmmsg_batch_size;
                 let overload = self.overload.clone();
+                let so_busy_poll_us = self.so_busy_poll_us;
+                let udp_gro_enabled = self.udp_gro_enabled;
+                let udp_gso_enabled = self.udp_gso_enabled;
                 tokio::spawn(async move {
                     if let Err(e) = super::udp_proxy::start_udp_listener(UdpListenerConfig {
                         port: port_val,
@@ -410,6 +433,9 @@ impl StreamListenerManager {
                         adaptive_buffer: adaptive_buf,
                         recvmmsg_batch_size: recvmmsg_batch,
                         overload,
+                        so_busy_poll_us,
+                        udp_gro_enabled,
+                        udp_gso_enabled,
                     })
                     .await
                     {
@@ -441,6 +467,8 @@ impl StreamListenerManager {
                 let adaptive_buf = self.adaptive_buffer.clone();
                 let tcp_fastopen = self.tcp_fastopen_enabled;
                 let overload = self.overload.clone();
+                let ktls_enabled = self.ktls_enabled;
+                let io_uring_splice_enabled = self.io_uring_splice_enabled;
                 tokio::spawn(async move {
                     if let Err(e) = super::tcp_proxy::start_tcp_listener(TcpListenerConfig {
                         port: port_val,
@@ -465,6 +493,8 @@ impl StreamListenerManager {
                         adaptive_buffer: adaptive_buf,
                         tcp_fastopen_enabled: tcp_fastopen,
                         overload,
+                        ktls_enabled,
+                        io_uring_splice_enabled,
                     })
                     .await
                     {

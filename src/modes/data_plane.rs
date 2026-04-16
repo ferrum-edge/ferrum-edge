@@ -205,6 +205,12 @@ pub async fn run(
             Ok(mut config) => {
                 // Enable 0-RTT on the proxy frontend only (not admin).
                 tls::enable_early_data(&mut config, &tls_policy);
+                // Enable kTLS session-secret extraction on the proxy frontend
+                // only (not admin) when kTLS could be used. Rustls gates
+                // `dangerous_extract_secrets()` behind this flag.
+                if env_config.ktls_enabled.could_be_enabled() {
+                    tls::enable_secret_extraction_for_ktls(&mut config);
+                }
                 if client_ca_bundle_path.is_some() {
                     info!(
                         "TLS configuration loaded with client certificate verification (HTTPS with mTLS available)"

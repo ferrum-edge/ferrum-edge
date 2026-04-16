@@ -40,6 +40,12 @@ pub struct RecvMmsgBatch {
     iovecs: Vec<libc::iovec>,
     /// Pre-allocated mmsghdr array (one per slot).
     msgs: Vec<libc::mmsghdr>,
+    /// Per-slot cmsg buffers for GRO segment size metadata (UDP_GRO cmsg).
+    /// Each slot has enough space for one cmsg header + u16 segment size.
+    cmsg_bufs: Vec<Vec<u8>>,
+    /// Per-slot GRO segment size parsed from cmsg after recvmmsg.
+    /// `None` = single datagram (no GRO coalescing), `Some(n)` = coalesced with segment size n.
+    gro_segments: Vec<Option<u16>>,
     /// Maximum datagrams per recvmmsg call.
     capacity: usize,
     /// Number of datagrams received in the last `recv()` call.
@@ -64,6 +70,8 @@ impl RecvMmsgBatch {
     /// arrays. This is a one-time allocation at listener startup.
     pub fn new(capacity: usize) -> Self {
         let capacity = capacity.max(1);
+        // cmsg buffer size: enough for one cmsg header + u16 (GRO segment size).
+        let cmsg_space = unsafe { libc::CMSG_SPACE(std::mem::size_of::<u16>() as u32) } as usize;
         Self {
             bufs: (0..capacity).map(|_| vec![0u8; MAX_DGRAM_SIZE]).collect(),
             result_addrs: vec![SocketAddr::from(([0, 0, 0, 0], 0)); capacity],
@@ -77,6 +85,8 @@ impl RecvMmsgBatch {
                 capacity
             ],
             msgs: vec![unsafe { std::mem::zeroed() }; capacity],
+            cmsg_bufs: (0..capacity).map(|_| vec![0u8; cmsg_space]).collect(),
+            gro_segments: vec![None; capacity],
             capacity,
             count: 0,
         }
@@ -97,6 +107,17 @@ impl RecvMmsgBatch {
             &self.bufs[i][..self.result_lens[i] as usize],
             self.result_addrs[i],
         )
+    }
+
+    /// Returns the GRO segment size for slot `i`, if the kernel coalesced
+    /// multiple datagrams into one buffer via UDP_GRO.
+    ///
+    /// Returns `None` for single (non-coalesced) datagrams.
+    /// When `Some(seg_size)`, the datagram data should be split into
+    /// `seg_size`-byte chunks (the last chunk may be shorter).
+    pub fn gro_segment_size(&self, i: usize) -> Option<u16> {
+        debug_assert!(i < self.count);
+        self.gro_segments[i]
     }
 
     /// Receive up to `max_count` datagrams in a single `recvmmsg` syscall.
@@ -131,6 +152,9 @@ impl RecvMmsgBatch {
                 iov_len: MAX_DGRAM_SIZE,
             };
 
+            // Zero the cmsg buffer for GRO metadata.
+            self.cmsg_bufs[i].fill(0);
+
             self.msgs[i] = unsafe { std::mem::zeroed() };
             self.msgs[i].msg_hdr.msg_name =
                 std::ptr::addr_of_mut!(self.raw_addrs[i]) as *mut libc::c_void;
@@ -138,6 +162,9 @@ impl RecvMmsgBatch {
                 std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
             self.msgs[i].msg_hdr.msg_iov = std::ptr::addr_of_mut!(self.iovecs[i]);
             self.msgs[i].msg_hdr.msg_iovlen = 1;
+            // Attach cmsg buffer for GRO segment size metadata.
+            self.msgs[i].msg_hdr.msg_control = self.cmsg_bufs[i].as_mut_ptr() as *mut libc::c_void;
+            self.msgs[i].msg_hdr.msg_controllen = self.cmsg_bufs[i].len();
         }
 
         // Single syscall to receive up to n datagrams.
@@ -160,6 +187,9 @@ impl RecvMmsgBatch {
         for i in 0..received {
             self.result_lens[i] = self.msgs[i].msg_len;
             self.result_addrs[i] = sockaddr_storage_to_std(&self.raw_addrs[i])?;
+            // Parse GRO cmsg to get segment size (if kernel coalesced datagrams).
+            self.gro_segments[i] =
+                crate::socket_opts::extract_gro_segment_size(&self.msgs[i].msg_hdr);
         }
         self.count = received;
         Ok(received)
@@ -309,6 +339,10 @@ impl SendMmsgBatch {
 
         if ret < 0 {
             let err = std::io::Error::last_os_error();
+            // Clear the batch on error — UDP is best-effort and preserving
+            // stale datagrams would cause reorder/requeue across iterations.
+            // (GsoBatchBuf preserves on error because it has drain_to_sendmmsg
+            // fallback; SendMmsgBatch is the final send path with no fallback.)
             self.count = 0;
             return Err(err);
         }
@@ -330,8 +364,13 @@ impl SendMmsgBatch {
 }
 
 /// Convert a `std::net::SocketAddr` to `libc::sockaddr_storage` + length.
+///
+/// `pub(super)` so `flush_gso_batch()` in `udp_proxy.rs` can call it directly
+/// without a wrapper.
 #[cfg(target_os = "linux")]
-fn std_to_sockaddr_storage(addr: SocketAddr) -> (libc::sockaddr_storage, libc::socklen_t) {
+pub(super) fn std_to_sockaddr_storage(
+    addr: SocketAddr,
+) -> (libc::sockaddr_storage, libc::socklen_t) {
     let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
     match addr {
         SocketAddr::V4(v4) => {
@@ -404,6 +443,163 @@ pub struct SendMmsgBatch;
 #[allow(dead_code)]
 impl SendMmsgBatch {
     pub fn new(_capacity: usize) -> Self {
+        Self
+    }
+}
+
+/// GSO batch buffer for sending multiple same-size datagrams in a single `sendmsg()`
+/// with `UDP_SEGMENT` ancillary data (Linux 4.18+).
+///
+/// Concatenates consecutive same-size datagrams into a contiguous buffer and flushes
+/// via `send_with_gso()`. When a different-size datagram
+/// arrives, the current batch is flushed and a new batch starts. This is complementary
+/// to `SendMmsgBatch` — GSO provides kernel-level segmentation which is more efficient
+/// than `sendmmsg` when datagrams share the same size and destination.
+///
+/// Only available on Linux. On other platforms, the UDP proxy falls back to `SendMmsgBatch`
+/// or individual sends.
+#[cfg(target_os = "linux")]
+pub struct GsoBatchBuf {
+    /// Contiguous buffer holding concatenated same-size datagrams.
+    buf: Vec<u8>,
+    /// Segment size of datagrams currently in the buffer (0 = empty).
+    segment_size: usize,
+    /// Number of datagrams currently in the buffer.
+    count: usize,
+    /// Maximum bytes to accumulate before auto-flushing.
+    /// Kernel GSO limit is typically 64KB (~65535 bytes).
+    max_bytes: usize,
+}
+
+#[cfg(target_os = "linux")]
+#[allow(dead_code)]
+impl GsoBatchBuf {
+    /// Create a new GSO batch buffer.
+    ///
+    /// `max_bytes` caps the concatenated buffer size. The kernel GSO path
+    /// has a ~64KB limit per sendmsg, so 65535 is a safe maximum.
+    pub fn new(max_bytes: usize) -> Self {
+        Self {
+            buf: Vec::with_capacity(max_bytes.min(65535)),
+            segment_size: 0,
+            count: 0,
+            max_bytes: max_bytes.min(65535),
+        }
+    }
+
+    /// Whether the buffer is empty.
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    /// Try to append a datagram. Returns `false` if the datagram has a different
+    /// size than the current batch or the buffer would exceed `max_bytes`, meaning
+    /// the caller should flush first and then call `push` again.
+    pub fn push(&mut self, data: &[u8]) -> bool {
+        if data.is_empty() {
+            return true; // skip empty datagrams
+        }
+        if self.count == 0 {
+            // First datagram — set segment size.
+            self.segment_size = data.len();
+            self.buf.clear();
+            self.buf.extend_from_slice(data);
+            self.count = 1;
+            return true;
+        }
+        // Same size check: GSO requires all segments to be the same size
+        // (the last segment may be shorter, but we only batch exact matches
+        // for simplicity and correctness).
+        if data.len() != self.segment_size {
+            return false; // different size — caller should flush first
+        }
+        if self.buf.len() + data.len() > self.max_bytes {
+            return false; // would exceed max — caller should flush first
+        }
+        self.buf.extend_from_slice(data);
+        self.count += 1;
+        true
+    }
+
+    /// Flush the buffer via GSO sendmsg to a specific destination address.
+    ///
+    /// Uses `send_with_gso()` which includes the destination in the msghdr.
+    /// Falls back to nothing on error — caller handles errors.
+    pub fn flush_to(
+        &mut self,
+        fd: std::os::fd::RawFd,
+        dest: &libc::sockaddr_storage,
+        dest_len: libc::socklen_t,
+    ) -> std::io::Result<usize> {
+        if self.count == 0 {
+            return Ok(0);
+        }
+        let result = crate::socket_opts::send_with_gso(
+            fd,
+            &self.buf,
+            self.segment_size as u16,
+            dest,
+            dest_len,
+        );
+        let sent_count = self.count;
+        // Only clear on success — on failure, the buffer is preserved so
+        // drain_to_sendmmsg() can replay the datagrams through sendmmsg.
+        if result.is_ok() {
+            self.buf.clear();
+            self.count = 0;
+            self.segment_size = 0;
+        }
+        result.map(|_| sent_count)
+    }
+
+    /// Drain buffered datagrams into a `SendMmsgBatch` for fallback sending.
+    ///
+    /// Splits the contiguous GSO buffer back into individual datagrams by
+    /// `segment_size` and pushes each into the sendmmsg batch. If the sendmmsg
+    /// batch fills up, the remaining datagrams stay in the GSO buffer (the
+    /// caller should flush the sendmmsg batch and call drain again).
+    /// Returns the number of datagrams drained.
+    pub fn drain_to_sendmmsg(
+        &mut self,
+        send_batch: &mut SendMmsgBatch,
+        dest: std::net::SocketAddr,
+    ) -> usize {
+        if self.count == 0 || self.segment_size == 0 {
+            return 0;
+        }
+        let mut offset = 0;
+        let mut drained = 0;
+        while offset < self.buf.len() {
+            let end = (offset + self.segment_size).min(self.buf.len());
+            if !send_batch.push(&self.buf[offset..end], dest) {
+                break; // sendmmsg batch full — remaining stays in GSO buffer
+            }
+            offset = end;
+            drained += 1;
+        }
+        if offset >= self.buf.len() {
+            // All datagrams drained — clear the buffer.
+            self.buf.clear();
+            self.count = 0;
+            self.segment_size = 0;
+        } else {
+            // Partial drain — shift remaining data to the front.
+            self.buf.drain(..offset);
+            self.count -= drained;
+        }
+        drained
+    }
+}
+
+/// Non-Linux stub for GsoBatchBuf.
+#[cfg(not(target_os = "linux"))]
+#[allow(dead_code)]
+pub struct GsoBatchBuf;
+
+#[cfg(not(target_os = "linux"))]
+#[allow(dead_code)]
+impl GsoBatchBuf {
+    pub fn new(_max_bytes: usize) -> Self {
         Self
     }
 }

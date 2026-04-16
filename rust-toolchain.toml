@@ -1,0 +1,8 @@
+# Pins the Rust toolchain to `stable` to match CI (`dtolnay/rust-toolchain@stable`).
+# On first cargo/rustup invocation, rustup will auto-install or switch to the
+# latest stable — ensuring local builds use the same clippy/rustc version as CI,
+# preventing lint drift when a new stable adds or tightens lints.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

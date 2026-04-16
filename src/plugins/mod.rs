@@ -124,14 +124,6 @@ pub const HTTP_FAMILY_PROTOCOLS: &[ProxyProtocol] = &[
 /// HTTP + gRPC only (plugins that modify HTTP headers/body but not WebSocket frames).
 pub const HTTP_GRPC_PROTOCOLS: &[ProxyProtocol] = &[ProxyProtocol::Http, ProxyProtocol::Grpc];
 
-/// HTTP-family protocols plus raw TCP streams.
-pub const HTTP_FAMILY_AND_TCP_PROTOCOLS: &[ProxyProtocol] = &[
-    ProxyProtocol::Http,
-    ProxyProtocol::Grpc,
-    ProxyProtocol::WebSocket,
-    ProxyProtocol::Tcp,
-];
-
 /// HTTP family + all stream protocols (TCP + UDP/DTLS). Used by plugins that
 /// authenticate via TLS/DTLS client certificates across all transport types.
 pub const HTTP_FAMILY_AND_STREAM_PROTOCOLS: &[ProxyProtocol] = &[
@@ -172,9 +164,9 @@ pub enum UdpDatagramDirection {
 /// relaying the response to the client).
 #[allow(dead_code)]
 pub struct UdpDatagramContext {
-    pub client_ip: String,
-    pub proxy_id: String,
-    pub proxy_name: Option<String>,
+    pub client_ip: Arc<str>,
+    pub proxy_id: Arc<str>,
+    pub proxy_name: Option<Arc<str>>,
     pub listen_port: u16,
     pub datagram_size: usize,
     pub direction: UdpDatagramDirection,

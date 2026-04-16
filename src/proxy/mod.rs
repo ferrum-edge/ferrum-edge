@@ -693,8 +693,76 @@ impl ProxyState {
             crls.clone(),
             adaptive_buffer.clone(),
             env_config_arc.udp_recvmmsg_batch_size,
-            env_config_arc.tcp_fastopen_enabled,
+            {
+                let v = env_config_arc
+                    .tcp_fastopen_enabled
+                    .resolve(crate::socket_opts::is_tcp_fastopen_available);
+                tracing::info!(enabled = v, config = %env_config_arc.tcp_fastopen_enabled, "TCP_FASTOPEN auto-detection");
+                v
+            },
             overload.clone(),
+            {
+                let v = env_config_arc
+                    .ktls_enabled
+                    .resolve(crate::socket_opts::ktls::is_ktls_available);
+                if v {
+                    tracing::info!("kTLS auto-detection: enabled (full key install probe passed)");
+                } else {
+                    tracing::info!(config = %env_config_arc.ktls_enabled, "kTLS auto-detection: disabled");
+                }
+                v
+            },
+            {
+                let v = env_config_arc
+                    .io_uring_splice_enabled
+                    .resolve(crate::socket_opts::io_uring_splice::check_io_uring_available);
+                if v {
+                    tracing::info!(
+                        "io_uring splice auto-detection: enabled (IORING_OP_SPLICE probe passed)"
+                    );
+                    // Warn if the tokio blocking-thread pool is too small for the
+                    // per-stream pattern: io_uring splice spawns 2 `spawn_blocking`
+                    // tasks per TCP connection (one per direction). With the default
+                    // cap of 512, thousands of concurrent streams will saturate the
+                    // pool and new splices will queue, causing latency spikes. 1024
+                    // is the rule-of-thumb floor; operators with very high connection
+                    // counts should set FERRUM_BLOCKING_THREADS much higher or
+                    // disable io_uring splice entirely.
+                    let effective_blocking_threads = env_config_arc.blocking_threads.unwrap_or(512);
+                    if effective_blocking_threads < 1024 {
+                        tracing::warn!(
+                            blocking_threads = effective_blocking_threads,
+                            "FERRUM_IO_URING_SPLICE_ENABLED=true but FERRUM_BLOCKING_THREADS={} is low; \
+                             each TCP stream consumes 2 blocking threads. \
+                             Recommended: FERRUM_BLOCKING_THREADS >= 1024 for io_uring splice.",
+                            effective_blocking_threads
+                        );
+                    }
+                } else {
+                    tracing::info!(config = %env_config_arc.io_uring_splice_enabled, "io_uring splice auto-detection: disabled");
+                }
+                v
+            },
+            env_config_arc.so_busy_poll_us,
+            {
+                let v = env_config_arc
+                    .udp_gro_enabled
+                    .resolve(crate::socket_opts::is_udp_gro_available);
+                // GRO is probed but not active (recv_from lacks cmsg) — log for completeness.
+                tracing::info!(enabled = v, config = %env_config_arc.udp_gro_enabled, "UDP GRO auto-detection (reserved, not active)");
+                v
+            },
+            {
+                let v = env_config_arc
+                    .udp_gso_enabled
+                    .resolve(crate::socket_opts::is_udp_gso_available);
+                if v {
+                    tracing::info!("UDP GSO auto-detection: enabled (setsockopt probe passed)");
+                } else {
+                    tracing::info!(config = %env_config_arc.udp_gso_enabled, "UDP GSO auto-detection: disabled");
+                }
+                v
+            },
         ));
 
         Ok(Self {
@@ -3126,7 +3194,11 @@ pub async fn start_proxy_listener_with_tls_and_signal(
 ) -> Result<(), anyhow::Error> {
     let backlog = state.env_config.tcp_listen_backlog as i32;
     let accept_threads = state.env_config.accept_threads.max(1);
-    let tfo_queue = if state.env_config.tcp_fastopen_enabled {
+    let tfo_enabled = state
+        .env_config
+        .tcp_fastopen_enabled
+        .resolve(crate::socket_opts::is_tcp_fastopen_available);
+    let tfo_queue = if tfo_enabled {
         Some(state.env_config.tcp_fastopen_queue_len)
     } else {
         None

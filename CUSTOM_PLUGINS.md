@@ -265,7 +265,6 @@ Use these constants in `supported_protocols()` to declare which proxy protocols 
 |----------|-----------|----------|
 | `ALL_PROTOCOLS` | Http, Grpc, WebSocket, Tcp, Udp | Protocol-agnostic plugins (logging, metrics, tracing) |
 | `HTTP_FAMILY_PROTOCOLS` | Http, Grpc, WebSocket | Plugins for all HTTP-based protocols |
-| `HTTP_FAMILY_AND_TCP_PROTOCOLS` | Http, Grpc, WebSocket, Tcp | HTTP family plus raw TCP streams |
 | `HTTP_GRPC_PROTOCOLS` | Http, Grpc | Plugins for HTTP and gRPC only |
 | `HTTP_ONLY_PROTOCOLS` | Http | HTTP-only plugins (default) |
 | `GRPC_ONLY_PROTOCOLS` | Grpc | gRPC-specific plugins |

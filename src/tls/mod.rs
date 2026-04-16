@@ -405,6 +405,28 @@ pub fn load_tls_config_with_client_auth(
     Ok(Arc::new(config))
 }
 
+/// Enable kTLS session-secret extraction on a `ServerConfig` returned by
+/// [`load_tls_config_with_client_auth`].
+///
+/// Rustls refuses to hand out session secrets via `dangerous_extract_secrets()`
+/// unless `ServerConfig::enable_secret_extraction` is set to `true`. Rustls
+/// leaves this off by default because extracting secrets into userspace is a
+/// potential exfiltration footgun; it must ONLY be enabled on ServerConfigs
+/// used by the proxy frontend (never admin), and only when operator has
+/// explicitly opted into kTLS via `FERRUM_KTLS_ENABLED`.
+///
+/// Must be called immediately after `load_tls_config_with_client_auth` while
+/// the `Arc` has a single owner (ref count = 1).
+pub fn enable_secret_extraction_for_ktls(config: &mut Arc<ServerConfig>) {
+    if let Some(cfg) = Arc::get_mut(config) {
+        cfg.enable_secret_extraction = true;
+    } else {
+        tracing::warn!(
+            "Could not enable kTLS secret extraction: Arc<ServerConfig> has multiple owners"
+        );
+    }
+}
+
 /// Enable TLS 1.3 0-RTT early data on a `ServerConfig` returned by
 /// [`load_tls_config_with_client_auth`].
 ///

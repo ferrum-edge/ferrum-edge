@@ -4308,10 +4308,8 @@ pub fn redact_consumer_credentials(consumer: &Consumer) -> Consumer {
                     }
                 }
             }
-            serde_json::Value::Object(obj) => {
-                if obj.contains_key(field) {
-                    obj.insert(field.to_string(), json!("[REDACTED]"));
-                }
+            serde_json::Value::Object(obj) if obj.contains_key(field) => {
+                obj.insert(field.to_string(), json!("[REDACTED]"));
             }
             _ => {}
         }
