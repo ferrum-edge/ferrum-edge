@@ -2471,19 +2471,30 @@ async fn handle_websocket_request_authenticated(
 
     // Collect plugins that opted into per-frame WebSocket hooks.
     // The pre-computed flag avoids iterating the plugin list when no plugin opted in.
-    let ws_frame_plugins: Vec<Arc<dyn Plugin>> =
-        if state.plugin_cache.requires_ws_frame_hooks(&proxy.id) {
-            let all_ws_plugins = state
-                .plugin_cache
-                .get_plugins_for_protocol(&proxy.id, ProxyProtocol::WebSocket);
-            all_ws_plugins
-                .iter()
-                .filter(|p| p.requires_ws_frame_hooks())
-                .cloned()
-                .collect()
-        } else {
-            Vec::new()
-        };
+    let all_ws_plugins = if state.plugin_cache.requires_ws_frame_hooks(&proxy.id) {
+        state
+            .plugin_cache
+            .get_plugins_for_protocol(&proxy.id, ProxyProtocol::WebSocket)
+    } else {
+        // Even when no frame hooks are needed, we still need to check for
+        // disconnect hooks — those live on the same WebSocket protocol list.
+        state
+            .plugin_cache
+            .get_plugins_for_protocol(&proxy.id, ProxyProtocol::WebSocket)
+    };
+    let ws_frame_plugins: Vec<Arc<dyn Plugin>> = all_ws_plugins
+        .iter()
+        .filter(|p| p.requires_ws_frame_hooks())
+        .cloned()
+        .collect();
+    // Collect disconnect-hook plugins separately. These fire exactly once at
+    // session end instead of per-frame, so keeping them in their own list
+    // avoids the per-frame filter cost paid by the frame-hook path.
+    let ws_disconnect_plugins: Vec<Arc<dyn Plugin>> = all_ws_plugins
+        .iter()
+        .filter(|p| p.requires_ws_disconnect_hooks())
+        .cloned()
+        .collect();
 
     // Spawn bidirectional forwarding task (awaits client upgrade, then proxies)
     let proxy_id = proxy.id.clone();
@@ -2492,6 +2503,26 @@ async fn handle_websocket_request_authenticated(
     let ws_write_buf = state.websocket_write_buffer_size;
     let ws_tunnel = state.websocket_tunnel_mode;
     let adaptive_buf = state.adaptive_buffer.clone();
+    // Capture session metadata while the originating RequestContext + proxy are
+    // still in scope. Passed to run_websocket_proxy so it can construct a
+    // WsDisconnectContext at teardown for plugins that opted in to
+    // on_ws_disconnect. Building this here (vs. inside run_websocket_proxy) is
+    // effectively free when ws_disconnect_plugins is empty because the strings
+    // are moved, not cloned, into an owned struct.
+    // WebSocket upgrades arrive on the main HTTP proxy listener; there is no
+    // per-upgrade "listen_port" distinct from the gateway's HTTP/HTTPS ports.
+    // Populate with the plaintext port as a representative value — operators
+    // already know whether their gateway serves on both via env_config.
+    let session_meta = WsSessionMeta {
+        namespace: proxy.namespace.clone(),
+        proxy_name: proxy.name.clone(),
+        client_ip: ctx.client_ip.clone(),
+        backend_target: strip_query_params(&current_backend_url).to_string(),
+        listen_port: state.env_config.proxy_http_port,
+        consumer_username: ctx.effective_identity().map(str::to_owned),
+        metadata: ctx.metadata.clone(),
+        session_start: chrono::Utc::now(),
+    };
     tokio::spawn(async move {
         match on_upgrade.await {
             Ok(upgraded) => {
@@ -2501,6 +2532,8 @@ async fn handle_websocket_request_authenticated(
                     &proxy_id,
                     ws_conn_id,
                     ws_frame_plugins,
+                    ws_disconnect_plugins,
+                    session_meta,
                     ws_connection_permit,
                     max_ws_frame,
                     ws_write_buf,
@@ -2837,10 +2870,32 @@ async fn connect_websocket_backend(
 
 /// Run bidirectional WebSocket proxying between upgraded client and connected backend.
 ///
+/// Session-level metadata captured at WebSocket upgrade time and consumed at
+/// teardown when firing `on_ws_disconnect`. Held as an owned struct (not
+/// references) because the upgrade handler returns before the session ends,
+/// so all fields must outlive the originating request context.
+pub(crate) struct WsSessionMeta {
+    pub namespace: String,
+    pub proxy_name: Option<String>,
+    pub client_ip: String,
+    pub backend_target: String,
+    pub listen_port: u16,
+    pub consumer_username: Option<String>,
+    pub metadata: HashMap<String, String>,
+    pub session_start: chrono::DateTime<chrono::Utc>,
+}
+
 /// `connection_id` — unique per-connection identifier for stateful frame plugins.
 /// `ws_frame_plugins` — plugins that opted into per-frame hooks by returning `true`
 /// from `requires_ws_frame_hooks()`. Pass an empty `Vec` for zero-overhead forwarding
 /// when no plugin on this proxy needs frame inspection.
+/// `ws_disconnect_plugins` — plugins that opted into end-of-session hooks by
+/// returning `true` from `requires_ws_disconnect_hooks()`. Pass an empty `Vec`
+/// to skip disconnect bookkeeping entirely.
+/// `session_meta` — captured at upgrade time; used to populate `WsDisconnectContext`
+/// when the session ends. Cost is paid regardless of whether disconnect plugins
+/// are present (one small allocation per upgrade) because the struct is small
+/// and moving it has zero additional cost.
 /// `websocket_tunnel_mode` — when true and no frame plugins are configured, bypass
 /// WebSocket frame parsing and use raw TCP bidirectional copy for maximum throughput.
 #[allow(clippy::too_many_arguments)]
@@ -2850,6 +2905,8 @@ async fn run_websocket_proxy(
     proxy_id: &str,
     connection_id: u64,
     ws_frame_plugins: Vec<Arc<dyn Plugin>>,
+    ws_disconnect_plugins: Vec<Arc<dyn Plugin>>,
+    session_meta: WsSessionMeta,
     _ws_connection_permit: Option<tokio::sync::OwnedSemaphorePermit>,
     max_websocket_frame_size_bytes: usize,
     websocket_write_buffer_size: usize,
@@ -2932,6 +2989,25 @@ async fn run_websocket_proxy(
     let proxy_id_ctb = proxy_id.to_string();
     let proxy_id_btc = proxy_id.to_string();
 
+    // Per-direction frame counters for the on_ws_disconnect summary. Kept as
+    // plain atomics (not protected by any lock) so the forward tasks can bump
+    // them without coordination. Reads happen exactly once at teardown.
+    let frames_c2b = Arc::new(AtomicU64::new(0));
+    let frames_b2c = Arc::new(AtomicU64::new(0));
+    let frames_c2b_task = frames_c2b.clone();
+    let frames_b2c_task = frames_b2c.clone();
+
+    // First-failure recorder. Whichever forward direction hits an error first
+    // wins the (Direction, ErrorClass) slot via OnceLock::set(); later errors
+    // from the other direction (or from the write-side of the same direction)
+    // are dropped. Both directions still publish their clean-close outcome
+    // through the counter, so "no error + clean close" is distinguishable
+    // from "error observed on one half".
+    let first_failure: Arc<std::sync::OnceLock<(crate::plugins::Direction, retry::ErrorClass)>> =
+        Arc::new(std::sync::OnceLock::new());
+    let first_failure_ctb = first_failure.clone();
+    let first_failure_btc = first_failure.clone();
+
     // Cancellation token for clean bidirectional close when a plugin triggers Close.
     // Each direction checks this token to know if the other side initiated a close.
     let cancel = tokio_util::sync::CancellationToken::new();
@@ -2990,8 +3066,17 @@ async fn run_websocket_proxy(
                             }
                             if let Err(e) = backend_sink.send(outgoing).await {
                                 error!("Failed to send message to backend: {}", e);
+                                // Write-side failure on the c2b path means the
+                                // backend socket errored while we were pushing
+                                // into it — attribute to the c2b direction.
+                                let _ = first_failure_ctb.set((
+                                    crate::plugins::Direction::ClientToBackend,
+                                    retry::classify_boxed_error(&e),
+                                ));
                                 break;
                             }
+                            // Count the frame that successfully reached the backend.
+                            frames_c2b_task.fetch_add(1, Ordering::Relaxed);
                         }
                         Ok(Message::Close(close_frame)) => {
                             debug!("Client sent close frame");
@@ -3008,6 +3093,12 @@ async fn run_websocket_proxy(
                         }
                         Err(e) => {
                             error!("Error receiving from client: {}", e);
+                            // Read-side failure on the c2b path means the client
+                            // dropped / reset the socket.
+                            let _ = first_failure_ctb.set((
+                                crate::plugins::Direction::ClientToBackend,
+                                retry::classify_boxed_error(&e),
+                            ));
                             break;
                         }
                     }
@@ -3069,8 +3160,17 @@ async fn run_websocket_proxy(
                             }
                             if let Err(e) = ws_sink.send(outgoing).await {
                                 error!("Failed to send message to client: {}", e);
+                                // Write-side failure on the b2c path means the
+                                // client dropped/reset while we were pushing
+                                // bytes to it — attribute to b2c direction.
+                                let _ = first_failure_btc.set((
+                                    crate::plugins::Direction::BackendToClient,
+                                    retry::classify_boxed_error(&e),
+                                ));
                                 break;
                             }
+                            // Count the frame that successfully reached the client.
+                            frames_b2c_task.fetch_add(1, Ordering::Relaxed);
                         }
                         Ok(Message::Close(close_frame)) => {
                             debug!("Backend sent close frame");
@@ -3087,6 +3187,12 @@ async fn run_websocket_proxy(
                         }
                         Err(e) => {
                             error!("Error receiving from backend: {}", e);
+                            // Read-side failure on the b2c path means the
+                            // backend closed / reset the socket.
+                            let _ = first_failure_btc.set((
+                                crate::plugins::Direction::BackendToClient,
+                                retry::classify_boxed_error(&e),
+                            ));
                             break;
                         }
                     }
@@ -3103,6 +3209,35 @@ async fn run_websocket_proxy(
         }
         _ = backend_to_client => {
             debug!("Backend to client stream completed first");
+        }
+    }
+
+    // Fire the on_ws_disconnect hook exactly once, after both forward halves
+    // have wound down. When no plugin opted in the list is empty and we skip
+    // the whole block — zero overhead for deployments that don't observe
+    // WebSocket sessions.
+    if !ws_disconnect_plugins.is_empty() {
+        let disconnect_duration_ms = (chrono::Utc::now() - session_meta.session_start)
+            .num_milliseconds()
+            .max(0) as f64;
+        let failure = first_failure.get().cloned();
+        let disconnect_ctx = crate::plugins::WsDisconnectContext {
+            namespace: session_meta.namespace,
+            proxy_id: proxy_id.to_string(),
+            proxy_name: session_meta.proxy_name,
+            client_ip: session_meta.client_ip,
+            backend_target: session_meta.backend_target,
+            listen_port: session_meta.listen_port,
+            duration_ms: disconnect_duration_ms,
+            frames_client_to_backend: frames_c2b.load(Ordering::Relaxed),
+            frames_backend_to_client: frames_b2c.load(Ordering::Relaxed),
+            direction: failure.as_ref().map(|(d, _)| *d),
+            error_class: failure.map(|(_, c)| c),
+            consumer_username: session_meta.consumer_username,
+            metadata: session_meta.metadata,
+        };
+        for plugin in &ws_disconnect_plugins {
+            plugin.on_ws_disconnect(&disconnect_ctx).await;
         }
     }
 
