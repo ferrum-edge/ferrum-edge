@@ -28,6 +28,11 @@ async fn free_port() -> u16 {
 }
 
 /// Start a WebSocket echo server on the given port.
+// The `Message::Ping(data)` arm consumes `data` (a `Bytes`) when forwarding
+// to `Message::Pong(data)`. Collapsing into a match guard is rejected by the
+// borrow checker (E0507) because variables bound in patterns cannot be moved
+// from inside a pattern guard.
+#[allow(clippy::collapsible_match)]
 async fn start_ws_echo_server(port: u16) {
     let listener = TcpListener::bind(format!("127.0.0.1:{}", port))
         .await

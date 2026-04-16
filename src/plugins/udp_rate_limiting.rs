@@ -27,6 +27,7 @@
 use async_trait::async_trait;
 use dashmap::DashMap;
 use serde_json::Value;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 use tracing::warn;
@@ -85,7 +86,7 @@ pub struct UdpRateLimiting {
     bytes_per_window: Option<u64>,
     window_seconds: u64,
     /// Per-client-IP window state.
-    state: DashMap<String, WindowState>,
+    state: DashMap<Arc<str>, WindowState>,
     /// Monotonic datagram counter for periodic eviction.
     check_counter: AtomicU64,
     /// Startup instant used to compute window epochs from Instant::now().
@@ -192,18 +193,18 @@ impl Plugin for UdpRateLimiting {
         let over_capacity = self.maybe_evict();
 
         let current_epoch = self.current_epoch();
-        let key = &ctx.client_ip;
+        let key = Arc::clone(&ctx.client_ip);
 
         // Hard cap: when over capacity, only allow datagrams from already-tracked
         // IPs. New IPs are dropped without inserting state to prevent spoofed-IP
         // floods from causing unbounded memory growth.
-        if over_capacity && !self.state.contains_key(key) {
+        if over_capacity && !self.state.contains_key(&key) {
             return UdpDatagramVerdict::Drop;
         }
 
         let entry = self
             .state
-            .entry(key.clone())
+            .entry(key)
             .or_insert_with(|| WindowState::new(current_epoch));
         let state = entry.value();
 

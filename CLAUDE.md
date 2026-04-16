@@ -77,6 +77,8 @@ cargo fmt                                                   # Auto-format
 
 ### CI Pipeline (GitHub Actions)
 
+**Rust toolchain**: CI always uses the latest stable Rust via `dtolnay/rust-toolchain@stable` — there is no pinned version floor. The repo's `rust-toolchain.toml` mirrors this so local dev stays in lockstep; when a new stable lands, `rustup update stable` locally is required to avoid missing newly-added clippy lints that CI will enforce.
+
 The CI workflow (`.github/workflows/ci.yml`) runs on push to `main` and PRs targeting `main`:
 
 **On PRs** (full validation):
@@ -260,8 +262,8 @@ src/
 │   ├── grpc_proxy.rs          # gRPC reverse proxy with HTTP/2 trailer support
 │   ├── http2_pool.rs          # HTTP/2 direct connection pool (hyper H2, sharded senders)
 │   ├── sni.rs                 # SNI extraction from TLS/DTLS ClientHello (used by passthrough mode)
-│   ├── tcp_proxy.rs           # Raw TCP stream proxy with TLS termination/origination/passthrough, splice(2) zero-copy on Linux
-│   ├── udp_batch.rs           # Batched UDP recv via recvmmsg(2) on Linux (reduces syscall overhead)
+│   ├── tcp_proxy.rs           # Raw TCP stream proxy with TLS termination/origination/passthrough, splice(2) zero-copy on Linux, kTLS-accelerated splice on TLS paths
+│   ├── udp_batch.rs           # Batched UDP recv via recvmmsg(2), batched send via sendmmsg(2) and GSO
 │   ├── udp_proxy.rs           # UDP datagram proxy with per-client session tracking, DTLS frontend/backend/passthrough
 │   └── stream_listener.rs     # Stream listener lifecycle manager (reconcile on config reload, port pre-bind check)
 ├── plugins/                   # Plugin system (58 plugins, including 7 AI/LLM, 1 AI federation, 1 serverless, 1 response mock, 1 spec expose, 1 compression, 1 SSE, 3 gRPC, 3 WS frame, 1 WS logging, 1 UDP datagram, 1 Loki logging, 1 UDP logging, 1 Kafka logging, 1 SOAP WS-Security plugin, 1 load testing plugin, 1 API chargeback plugin, 1 request deduplication plugin, and 1 GeoIP restriction plugin)
@@ -648,6 +650,7 @@ async fn start_gateway_with_retry(config_path: &str) -> (std::process::Child, u1
 
 **CRITICAL: Steps 1-2 are non-negotiable. Run them before every single `git commit`, no exceptions.**
 
+0. `rustup update stable` — ensure local toolchain matches CI. CI runs `dtolnay/rust-toolchain@stable` which always installs the latest stable; when a new stable adds clippy lints, local runs on older toolchains will MISS them and CI will fail. The repo's `rust-toolchain.toml` auto-selects stable, but `rustup update` is still needed to pull the newest point release. Run this at least once a week and any time `cargo clippy` behaves unexpectedly.
 1. `cargo fmt --all` — format all code
 2. `cargo fmt --all -- --check` — **verify** no formatting diffs remain (CI rejects unformatted code immediately)
 3. `cargo clippy --all-targets -- -D warnings` — zero warnings
@@ -743,8 +746,8 @@ Each protocol has its own proxy path, connection pool, and backend dispatch. Und
 | HTTP/3 | quinn/h3 server (`http3/server.rs`) | `Http3ConnectionPool` (quinn/h3 direct) | Per-backend QUIC connections | Yes (streaming via `CoalescingH3Body`, buffered fallback for retries) |
 | gRPC | hyper server (content-type detection) | `GrpcConnectionPool` (hyper H2 direct, `GrpcBody` sum type) | Sharded H2 senders | Yes (request + response streaming when no retry/body plugins) |
 | WebSocket | hyper upgrade (H1 101) or H2 Extended CONNECT (RFC 8441 200 OK) → tokio-tungstenite | Direct TCP upgrade | N/A (persistent connection) | Frame-by-frame forwarding |
-| TCP | `TcpListener` per port | Direct `TcpStream::connect` | N/A (1:1 connection) | `splice(2)` zero-copy on Linux (plain-to-plain), `copy_bidirectional` elsewhere |
-| UDP | `UdpSocket` per port | Per-session backend socket | N/A (session-keyed) | Datagram forwarding |
+| TCP | `TcpListener` per port | Direct `TcpStream::connect` | N/A (1:1 connection) | `splice(2)` zero-copy on Linux (plain-to-plain and kTLS-accelerated TLS paths), `copy_bidirectional` elsewhere |
+| UDP | `UdpSocket` per port | Per-session backend socket | N/A (session-keyed) | GSO-batched send on Linux, per-datagram forwarding elsewhere |
 
 **Key dispatch points in `src/proxy/mod.rs`:**
 - gRPC detection: `is_grpc_request()` checks `content-type: application/grpc` (line ~2530)
@@ -846,7 +849,11 @@ These are hard-won findings from profiling. Violating them causes measurable reg
 - **UDP jitter-based buffer adaptation**: The adaptive buffer tracker now monitors inter-arrival jitter for UDP sessions. When jitter EWMA exceeds 10ms, buffer sizes are bumped up one tier for real-time traffic safety margin.
 - **Lazy timeout wrapper**: `lazy_timeout::lazy_timeout()` defers tokio timer creation until the inner future returns `Pending`. Fast-path operations that complete immediately avoid timer wheel allocation entirely.
 - **Cacheability predictor**: The `response_caching` plugin maintains an LRU of known-uncacheable keys, skipping cache lookups for assets that were historically uncacheable (PREDICTED-BYPASS status).
-- **`TCP_INFO` access**: `socket_opts::get_tcp_info()` retrieves kernel-level RTT, cwnd, and MSS for BDP-optimal buffer sizing on long-lived TCP stream connections (Linux only).
+- **`TCP_INFO` BDP buffer sizing**: `socket_opts::get_tcp_info()` retrieves kernel-level RTT, cwnd, and MSS for BDP-optimal buffer sizing on long-lived TCP stream connections (Linux only). `TcpConnectionInfo::bdp_bytes()` computes the Bandwidth-Delay Product.
+- **kTLS (kernel TLS)**: `socket_opts::ktls::enable_ktls()` installs TLS session keys into the kernel via `setsockopt(SOL_TLS)` after the rustls handshake completes. This enables `splice(2)` on TLS-encrypted TCP proxy paths, eliminating two userspace copies per chunk. Supports AES-128-GCM, AES-256-GCM (Linux 4.13/4.17+), and ChaCha20-Poly1305 (Linux 5.11+). Gated by `FERRUM_KTLS_ENABLED` (default `auto` — probes the full kTLS path including dummy key installation on a loopback socket pair at startup). **Per-cipher probing**: At startup, each of AES-128-GCM, AES-256-GCM, and ChaCha20-Poly1305 is probed independently on its own fresh TCP loopback pair (kernels cannot install a second TLS_TX cipher on a socket that already has one, so each probe needs its own socket). Results are cached via `OnceLock` and exposed through `is_ktls_aes128gcm_available()` / `is_ktls_aes256gcm_available()` / `is_ktls_chacha20_poly1305_available()`. Connections negotiating a cipher whose per-cipher probe failed fall back to userspace copy BEFORE `try_ktls_splice()` consumes the TLS stream — this is critical because a kernel install failure AFTER `into_inner()` + `dangerous_extract_secrets()` would force a hard connection drop with no safe userspace fallback. The TCP proxy's `try_ktls_splice()` function handles the full flow: check per-cipher kernel support + cipher compatibility before consuming the TLS stream, extract secrets via `rustls::ServerConnection::dangerous_extract_secrets()`, install TX/RX keys, then unwrap `TlsStream` to raw `TcpStream` for `bidirectional_splice()`. `KtlsError::Unsupported` returns the original streams intact for graceful fallback to `bidirectional_copy`; `KtlsError::Installed` propagates errors when the TLS stream is already consumed. Session key material (both the intermediate `Vec<u8>` copies in `build_ktls_params` and the kernel-bound `#[repr(C)] TlsCryptoInfo*` structs used with `setsockopt`) is volatile-zeroed on drop via the `zeroize` crate so core dumps or post-free heap reads cannot recover it. **Do not use splice with TLS-wrapped streams without kTLS — splice operates on raw file descriptors and cannot see through encryption.**
+- **io_uring splice**: `socket_opts::io_uring_splice::io_uring_splice_loop()` uses the `io-uring` crate's `IORING_OP_SPLICE` to perform zero-copy relay via io_uring submission queues (Linux 5.6+). Each splice direction gets its own ring (8 entries) and runs on a dedicated blocking thread via `tokio::task::spawn_blocking`. `check_io_uring_available()` probes the kernel at startup by attempting to create a ring. The TCP proxy's `bidirectional_splice_io_uring()` creates pipes, spawns both directions, and joins them. Gated by `FERRUM_IO_URING_SPLICE_ENABLED` (default `auto` — probes io_uring ring creation). When disabled or unavailable, falls back to the existing `bidirectional_splice()` with direct `libc::splice` calls. **Blocking-thread warning**: uses `tokio::spawn_blocking` twice per TCP stream. On deployments with thousands of concurrent TCP streams, `FERRUM_BLOCKING_THREADS` (default 512) must be increased to at least `2 × expected concurrent streams` to avoid blocking-pool saturation. At listener startup, the TCP proxy emits a `warn!` log if `io_uring_splice_enabled && blocking_threads < 1024` so operators notice a dangerous combination.
+- **UDP GRO/GSO**: **GRO is not currently active** — the primary receive path uses tokio's `recv_from()` which doesn't expose GRO cmsg metadata. The infrastructure exists (`socket_opts::set_udp_gro()`, `RecvMmsgBatch` cmsg parsing, `extract_gro_segment_size()`, drain-loop splitting) but cannot be enabled until the receive loop is rewritten to use `recvmmsg` as the primary wakeup mechanism via `AsyncFd`. `FERRUM_UDP_GRO_ENABLED` is accepted but has no effect. **GSO is active**: `socket_opts::send_with_gso()` sends multiple datagrams in a single `sendmsg()` via `UDP_SEGMENT` ancillary data (Linux 4.18+). The reply handler uses `GsoBatchBuf` to concatenate same-size datagrams into a contiguous buffer and flush via GSO, with automatic fallback to `SendMmsgBatch` if GSO fails (`gso_failed` flag). Gated by `FERRUM_UDP_GSO_ENABLED` (default `auto`).
+- **`SO_BUSY_POLL`**: `socket_opts::set_so_busy_poll()` and `set_so_prefer_busy_poll()` enable kernel-side busy-polling on UDP sockets for 1-5µs latency reduction (Linux 3.11+/5.11+). Gated by `FERRUM_SO_BUSY_POLL_US` (default 0 = disabled).
 - **Health bitset for zero-alloc LB selection**: `HealthBitset` (stack-allocated `u128`) replaces per-target DashMap lookups during algorithm selection. Health state is snapshotted once via `compute_health_bitset()` at the top of `select()`, then all algorithm methods use free bit tests. Eliminates the `Vec<(usize, &Arc<UpstreamTarget>)>` allocation that `select_from_all()` previously required for WRR/LC/LL/CH on every request. Consistent hash ring walk uses O(1) bitset membership check per position instead of O(candidates) linear scan. FxHash-style `fx_hash_str()` replaces `DefaultHasher` (SipHash) for consistent hash key distribution (~3-5ns vs ~15-25ns).
 
 **Resilience features per protocol:**
@@ -881,7 +888,7 @@ Each test runs a gateway with protocol-specific config (`configs/*.yaml`) and a 
 1. Create `src/plugins/my_plugin.rs` implementing the `Plugin` trait
 2. **Constructor must return `Result<Self, String>`** — every plugin's `new()` must validate its config and return `Err` with a clear message if the config is invalid. See the "Plugin Config Validation" section below for rules.
 3. Add a priority constant in `src/plugins/mod.rs` (`priority::MY_PLUGIN = N`)
-4. Override `supported_protocols()` to declare which protocols the plugin supports (default is HTTP-only). Use the predefined constants: `ALL_PROTOCOLS`, `HTTP_FAMILY_PROTOCOLS`, `HTTP_GRPC_PROTOCOLS`, `HTTP_FAMILY_AND_TCP_PROTOCOLS`, `HTTP_FAMILY_AND_STREAM_PROTOCOLS`, `HTTP_ONLY_PROTOCOLS`, `GRPC_ONLY_PROTOCOLS`, `TCP_ONLY_PROTOCOLS`, or `UDP_ONLY_PROTOCOLS`
+4. Override `supported_protocols()` to declare which protocols the plugin supports (default is HTTP-only). Use the predefined constants: `ALL_PROTOCOLS`, `HTTP_FAMILY_PROTOCOLS`, `HTTP_GRPC_PROTOCOLS`, `HTTP_FAMILY_AND_STREAM_PROTOCOLS`, `HTTP_ONLY_PROTOCOLS`, `GRPC_ONLY_PROTOCOLS`, `TCP_ONLY_PROTOCOLS`, or `UDP_ONLY_PROTOCOLS`
 5. Register in the plugin registry (`create_plugin_with_http_client()` match arm in `mod.rs`) — use `?` on the `new()` call (e.g., `Ok(Some(Arc::new(my_plugin::MyPlugin::new(config)?)))`)
 6. Add the plugin name to `available_plugins()` in `mod.rs`
 7. Add unit tests in `tests/unit/plugins/my_plugin_tests.rs` — include tests for both valid configs (`.unwrap()`) and invalid configs (`.is_err()` / `.err().unwrap()`)
@@ -1144,9 +1151,14 @@ Reduce per-request allocations in plugin lookup
 | `FERRUM_OVERLOAD_LOOP_WARN_US` | `10000` | Event loop latency (μs) for warning log |
 | `FERRUM_OVERLOAD_LOOP_CRITICAL_US` | `500000` | Event loop latency (μs) to reject new connections |
 | `FERRUM_SHUTDOWN_DRAIN_SECONDS` | `30` | Seconds to wait for in-flight connections to drain on shutdown. `0` = immediate |
-| `FERRUM_TCP_FASTOPEN_ENABLED` | `true` | Enable TCP Fast Open on proxy listener sockets (Linux only). Saves 1 RTT for repeat clients |
+| `FERRUM_TCP_FASTOPEN_ENABLED` | `auto` | Enable TCP Fast Open on proxy listener sockets (Linux only). Saves 1 RTT for repeat clients. Values: `auto` (check sysctl)/`true`/`false` |
 | `FERRUM_TCP_FASTOPEN_QUEUE_LEN` | `256` | TCP Fast Open pending connection queue length |
 | `FERRUM_TLS_OFFLOAD_THREADS` | `0` | Dedicated TLS handshake offload threads (0 = disabled). Total threads = value (shards auto-computed). Isolates CPU-intensive TLS handshakes from the main event loop |
+| `FERRUM_KTLS_ENABLED` | `auto` | Enable kTLS (kernel TLS) on TCP proxy TLS paths (Linux 4.13+). Probes full kTLS path (ULP + key install) on loopback socket pair at startup. Values: `auto`/`true`/`false` |
+| `FERRUM_IO_URING_SPLICE_ENABLED` | `auto` | Enable io_uring-based splice (`IORING_OP_SPLICE`) for TCP proxy zero-copy relay (Linux 5.6+). Each direction gets its own ring on a blocking thread. Falls back to libc splice if unavailable. Values: `auto`/`true`/`false` |
+| `FERRUM_UDP_GRO_ENABLED` | `auto` | Reserved — UDP GRO cannot be enabled because the primary recv path (`recv_from`) doesn't expose GRO cmsg. Infrastructure ready; requires recv loop rewrite to `recvmmsg` via `AsyncFd`. Values: `auto`/`true`/`false` |
+| `FERRUM_UDP_GSO_ENABLED` | `auto` | Enable UDP GSO (Generic Segmentation Offload) for batched sending (Linux 4.18+). Multiple datagrams in single sendmsg. Values: `auto`/`true`/`false` |
+| `FERRUM_SO_BUSY_POLL_US` | `0` | SO_BUSY_POLL duration in microseconds for UDP sockets (Linux 3.11+). Reduces receive latency at cost of CPU. `0` = disabled |
 
 See `src/config/env_config.rs` for the full list of 90+ environment variables.
 

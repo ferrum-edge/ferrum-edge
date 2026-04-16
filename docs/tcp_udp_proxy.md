@@ -339,7 +339,7 @@ TCP connections are monitored for idle activity. When no data is transferred in 
 - A background checker polls every 1 second to compare the last activity timestamp against the timeout
 - When the timeout fires, the connection is closed gracefully and logged as a TCP idle timeout
 - Connections with active data flow in either direction are never affected
-- When disabled (0), the fast path uses `copy_bidirectional` with zero overhead. On Linux, plaintext TCP connections (no TLS on either side) use `splice(2)` zero-copy relay, eliminating userspace memory copies entirely
+- When disabled (0), the fast path uses `copy_bidirectional` with zero overhead. On Linux, plaintext TCP connections (no TLS on either side) use `splice(2)` zero-copy relay, eliminating userspace memory copies entirely. When `FERRUM_KTLS_ENABLED=auto` or `true` and the kernel `tls` module is loaded, frontend-TLS connections with AES-GCM cipher suites also use splice — the kernel handles encrypt/decrypt via kTLS
 
 ```yaml
 proxies:
@@ -389,7 +389,7 @@ Each plugin declares which protocols it supports via `supported_protocols()`. On
 See [docs/plugin_execution_order.md](plugin_execution_order.md) for the full per-plugin protocol matrix.
 
 Notes:
-- `access_control` applies to TCP stream proxies, not plain UDP sessions.
+- `access_control` applies to both TCP and UDP stream proxies. For TCP+TLS and UDP+DTLS, pair with `mtls_auth` for certificate-based consumer identification → ACL group/username authorization.
 - `mtls_auth` applies to both TCP+TLS and UDP+DTLS stream proxies. It only activates when the listener is configured with `frontend_tls: true` and a client certificate is presented during the TLS/DTLS handshake.
 
 ## Environment Variables
@@ -404,6 +404,20 @@ Notes:
 | `FERRUM_UDP_MAX_SESSIONS` | `10000` | Maximum concurrent UDP sessions per proxy |
 | `FERRUM_UDP_CLEANUP_INTERVAL_SECONDS` | `10` | Interval between UDP session cleanup sweeps |
 | `FERRUM_UDP_RECV_BATCH_LIMIT` | `6000` | Max datagrams drained per recv wakeup. Higher values improve burst throughput; lower values improve event loop fairness |
+
+### Linux Performance Tuning
+
+These Linux-specific options auto-detect kernel support at startup when set to `auto` (default). Set to `true` to force enable or `false` to disable.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `FERRUM_KTLS_ENABLED` | `auto` | kTLS: install TLS keys into kernel after handshake so `splice(2)` works on encrypted TCP connections. Supports AES-128-GCM and AES-256-GCM (Linux 4.13/4.17+) and ChaCha20-Poly1305 (Linux 5.11+). **TLS 1.2 only** — TLS 1.3 falls back to userspace because KeyUpdate rekeying is not handled. Probes real TCP loopback pair with full `TCP_ULP` + dummy key install at startup |
+| `FERRUM_IO_URING_SPLICE_ENABLED` | `auto` | io_uring-based splice via `IORING_OP_SPLICE` on dedicated blocking threads (Linux 5.6+). Each direction gets its own ring. Probes ring creation at startup. **Warning:** uses `tokio::spawn_blocking` twice per TCP stream (one per direction). On deployments with thousands of concurrent TCP streams, increase `FERRUM_BLOCKING_THREADS` (default 512) to at least `2 × expected concurrent streams` to avoid blocking-pool saturation. Each blocking thread consumes ~2-4 MB of stack. For very high connection counts the default libc splice path is recommended |
+| `FERRUM_UDP_GRO_ENABLED` | `auto` | Reserved — UDP GRO cannot be enabled (primary recv uses `recv_from` which lacks cmsg). Infrastructure ready; requires recv loop rewrite |
+| `FERRUM_UDP_GSO_ENABLED` | `auto` | UDP Generic Segmentation Offload — batches same-size datagrams into single `sendmsg()` with `UDP_SEGMENT` cmsg (Linux 4.18+). Probes on temp socket. Falls back to `sendmmsg` on failure |
+| `FERRUM_SO_BUSY_POLL_US` | `0` | Kernel busy-poll duration (µs) on UDP sockets. Reduces latency at cost of CPU. `0` = disabled |
+| `FERRUM_TCP_FASTOPEN_ENABLED` | `auto` | TCP Fast Open on listener and outbound sockets. Saves 1 RTT for repeat connections. Checks `/proc/sys/net/ipv4/tcp_fastopen` sysctl |
+| `FERRUM_UDP_RECVMMSG_BATCH_SIZE` | `64` | Datagrams per `recvmmsg` syscall (1-1024). Each slot allocates 65535 bytes |
 
 ## Validation Rules
 

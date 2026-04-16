@@ -128,6 +128,64 @@ fn resolve_bool(conf: &ConfFile, key: &str, default: bool) -> bool {
         .unwrap_or(default)
 }
 
+/// Tri-state toggle: `auto` (detect at runtime), `true` (force on), `false` (force off).
+///
+/// Used for Linux-specific optimizations that can probe the kernel at startup.
+/// When `auto`, the feature is enabled if the kernel supports it and disabled otherwise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutoBool {
+    /// Detect support at runtime and enable if available.
+    Auto,
+    /// Force enabled (fail or warn if unsupported).
+    True,
+    /// Force disabled.
+    False,
+}
+
+impl AutoBool {
+    /// Resolve to a concrete bool using a runtime probe function.
+    ///
+    /// - `Auto` → call `probe()` and use its result
+    /// - `True` → `true` (caller is responsible for handling unsupported case)
+    /// - `False` → `false`
+    pub fn resolve(self, probe: impl FnOnce() -> bool) -> bool {
+        match self {
+            Self::Auto => probe(),
+            Self::True => true,
+            Self::False => false,
+        }
+    }
+
+    /// Returns `true` if the resolved value could POSSIBLY be `true` — i.e.
+    /// every variant except `False`. Used by callers that must commit to a
+    /// side-effect (e.g. setting `ServerConfig::enable_secret_extraction`)
+    /// before the actual probe runs, and would rather over-enable than
+    /// under-enable.
+    pub fn could_be_enabled(self) -> bool {
+        !matches!(self, Self::False)
+    }
+}
+
+impl std::fmt::Display for AutoBool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Auto => write!(f, "auto"),
+            Self::True => write!(f, "true"),
+            Self::False => write!(f, "false"),
+        }
+    }
+}
+
+/// Resolve an `AutoBool` configuration value: "auto", "true"/"1", "false"/"0".
+fn resolve_auto_bool(conf: &ConfFile, key: &str, default: AutoBool) -> AutoBool {
+    match resolve_var(conf, key).as_deref() {
+        Some("auto") => AutoBool::Auto,
+        Some("true") | Some("1") => AutoBool::True,
+        Some("false") | Some("0") => AutoBool::False,
+        _ => default,
+    }
+}
+
 /// All environment-driven configuration.
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // Some fields are only used with optional features (e.g. mongodb)
@@ -746,11 +804,45 @@ pub struct EnvConfig {
     /// Enable TCP Fast Open on server (listening) and client (connecting) sockets.
     /// Saves 1 RTT on repeat connections by allowing data in the SYN packet.
     /// Requires Linux 4.11+ and `net.ipv4.tcp_fastopen` sysctl bit 0x1 (server)
-    /// or 0x2 (client) enabled. No-op on non-Linux. Default: true.
-    pub tcp_fastopen_enabled: bool,
+    /// or 0x2 (client) enabled. No-op on non-Linux.
+    /// Values: `auto` (check sysctl at startup), `true` (force on), `false` (force off).
+    /// Default: `auto`.
+    pub tcp_fastopen_enabled: AutoBool,
     /// TCP Fast Open server queue length — maximum pending TFO connections.
     /// Only used when `tcp_fastopen_enabled` is true. Default: 256.
     pub tcp_fastopen_queue_len: u16,
+
+    // ── Stream proxy performance optimizations (Linux only) ─────────────
+    /// Enable kTLS (kernel TLS) on TCP proxy TLS paths (Linux 4.13+ only).
+    /// After the userspace TLS handshake, installs symmetric keys into the kernel
+    /// so splice(2) can work on encrypted connections. Dramatically reduces latency
+    /// and CPU for TLS TCP proxy paths.
+    /// Values: `auto` (detect kernel support), `true` (force on), `false` (force off).
+    /// Default: `auto` — probes full kTLS path (ULP install + dummy key install) on
+    /// a loopback socket pair at startup. Only enables if the entire path succeeds.
+    pub ktls_enabled: AutoBool,
+    /// Enable io_uring-based splice for TCP proxy zero-copy relay (Linux 5.6+ only).
+    /// Uses IORING_OP_SPLICE submission queue entries instead of direct libc splice
+    /// syscalls. Falls back to libc splice if io_uring is unavailable.
+    /// Values: `auto` (detect kernel support), `true` (force on), `false` (force off).
+    /// Default: `auto`.
+    pub io_uring_splice_enabled: AutoBool,
+    /// Enable UDP GRO (Generic Receive Offload) on frontend UDP sockets (Linux 5.0+).
+    /// Kernel coalesces multiple same-size UDP datagrams into a single large buffer,
+    /// more efficient than recvmmsg.
+    /// Values: `auto` (probe setsockopt on temp socket), `true`, `false`.
+    /// Default: `auto`.
+    pub udp_gro_enabled: AutoBool,
+    /// Enable UDP GSO (Generic Segmentation Offload) for batched UDP sending (Linux 4.18+).
+    /// Sends multiple datagrams in a single sendmsg() by specifying a segment size via
+    /// ancillary data. The kernel splits them at the NIC level.
+    /// Values: `auto` (probe sendmsg with UDP_SEGMENT on temp socket), `true`, `false`.
+    /// Default: `auto`.
+    pub udp_gso_enabled: AutoBool,
+    /// SO_BUSY_POLL duration in microseconds for latency-sensitive UDP sockets (Linux 3.11+).
+    /// When > 0, the kernel spins for this many microseconds waiting for incoming data
+    /// before sleeping. Reduces receive latency at the cost of CPU. 0 = disabled. Default: 0.
+    pub so_busy_poll_us: u32,
 }
 
 impl Default for EnvConfig {
@@ -932,8 +1024,13 @@ impl Default for EnvConfig {
             shutdown_drain_seconds: 30,
             status_metrics_window_seconds: 30,
             tls_offload_threads: 0,
-            tcp_fastopen_enabled: true,
+            tcp_fastopen_enabled: AutoBool::Auto,
             tcp_fastopen_queue_len: 256,
+            ktls_enabled: AutoBool::Auto,
+            io_uring_splice_enabled: AutoBool::Auto,
+            udp_gro_enabled: AutoBool::Auto,
+            udp_gso_enabled: AutoBool::Auto,
+            so_busy_poll_us: 0,
         }
     }
 }
@@ -1533,10 +1630,25 @@ impl EnvConfig {
             )
             .max(1),
             tls_offload_threads: resolve_usize(conf, "FERRUM_TLS_OFFLOAD_THREADS", 0),
-            tcp_fastopen_enabled: resolve_bool(conf, "FERRUM_TCP_FASTOPEN_ENABLED", true),
+            tcp_fastopen_enabled: resolve_auto_bool(
+                conf,
+                "FERRUM_TCP_FASTOPEN_ENABLED",
+                AutoBool::Auto,
+            ),
             tcp_fastopen_queue_len: resolve_var(conf, "FERRUM_TCP_FASTOPEN_QUEUE_LEN")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(256),
+            ktls_enabled: resolve_auto_bool(conf, "FERRUM_KTLS_ENABLED", AutoBool::Auto),
+            io_uring_splice_enabled: resolve_auto_bool(
+                conf,
+                "FERRUM_IO_URING_SPLICE_ENABLED",
+                AutoBool::Auto,
+            ),
+            udp_gro_enabled: resolve_auto_bool(conf, "FERRUM_UDP_GRO_ENABLED", AutoBool::Auto),
+            udp_gso_enabled: resolve_auto_bool(conf, "FERRUM_UDP_GSO_ENABLED", AutoBool::Auto),
+            so_busy_poll_us: resolve_var(conf, "FERRUM_SO_BUSY_POLL_US")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
         };
 
         config.validate()?;

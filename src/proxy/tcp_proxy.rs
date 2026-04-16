@@ -192,6 +192,10 @@ pub struct TcpListenerConfig {
     pub tcp_fastopen_enabled: bool,
     /// Shared overload state for connection accounting and load shedding.
     pub overload: Arc<crate::overload::OverloadState>,
+    /// Enable kTLS for splice on TLS paths (from `FERRUM_KTLS_ENABLED`).
+    pub ktls_enabled: bool,
+    /// Enable io_uring-based splice (from `FERRUM_IO_URING_SPLICE_ENABLED`).
+    pub io_uring_splice_enabled: bool,
 }
 
 /// Start a TCP proxy listener on the given port.
@@ -225,6 +229,8 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
         adaptive_buffer,
         tcp_fastopen_enabled,
         overload,
+        ktls_enabled,
+        io_uring_splice_enabled,
     } = cfg;
     let addr = SocketAddr::new(bind_addr, port);
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -361,6 +367,8 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
                         sni_proxy_ids.as_deref(),
                         &adaptive_buf,
                         tcp_fastopen_enabled,
+                                        ktls_enabled,
+                        io_uring_splice_enabled,
                         &overload_for_conn,
                     )
                     .await;
@@ -555,7 +563,7 @@ struct TcpConnectionSuccess {
 /// Always returns a `TcpConnectionResult` containing backend target info (for logging)
 /// and the connection outcome. Backend info is populated as soon as the target is known,
 /// so even failed connections log which backend was attempted.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, unused_variables)]
 async fn handle_tcp_connection(
     client_stream: TcpStream,
     remote_addr: SocketAddr,
@@ -572,6 +580,8 @@ async fn handle_tcp_connection(
     sni_proxy_ids: Option<&[String]>,
     adaptive_buffer: &crate::adaptive_buffer::AdaptiveBufferTracker,
     tcp_fastopen: bool,
+    ktls_enabled: bool,
+    io_uring_splice_enabled: bool,
     overload: &crate::overload::OverloadState,
 ) -> TcpConnectionResult {
     let start = Instant::now();
@@ -603,6 +613,8 @@ async fn handle_tcp_connection(
         sni_proxy_ids,
         adaptive_buffer,
         tcp_fastopen,
+        ktls_enabled,
+        io_uring_splice_enabled,
         overload,
     )
     .await;
@@ -615,7 +627,7 @@ async fn handle_tcp_connection(
 
 /// Inner implementation of TCP connection handling that can use `?` for early returns
 /// while the caller always receives backend info for logging.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, unused_variables)]
 async fn handle_tcp_connection_inner(
     client_stream: TcpStream,
     remote_addr: SocketAddr,
@@ -634,6 +646,8 @@ async fn handle_tcp_connection_inner(
     sni_proxy_ids: Option<&[String]>,
     adaptive_buffer: &crate::adaptive_buffer::AdaptiveBufferTracker,
     tcp_fastopen: bool,
+    ktls_enabled: bool,
+    io_uring_splice_enabled: bool,
     overload: &crate::overload::OverloadState,
 ) -> Result<TcpConnectionSuccess, anyhow::Error> {
     // --- SNI-based proxy resolution for shared passthrough ports ---
@@ -776,9 +790,14 @@ async fn handle_tcp_connection_inner(
 
         // On Linux, use splice(2) for zero-copy relay between raw TCP sockets.
         // Passthrough mode is always plain-to-plain (no TLS termination/origination).
+        // When io_uring is enabled, use IORING_OP_SPLICE on dedicated blocking threads.
         #[cfg(target_os = "linux")]
-        let copy_result =
-            bidirectional_splice(client_stream, backend_stream, idle_timeout, buf_size).await;
+        let copy_result = if io_uring_splice_enabled {
+            bidirectional_splice_io_uring(client_stream, backend_stream, idle_timeout, buf_size)
+                .await
+        } else {
+            bidirectional_splice(client_stream, backend_stream, idle_timeout, buf_size).await
+        };
         #[cfg(not(target_os = "linux"))]
         let copy_result =
             bidirectional_copy(client_stream, backend_stream, idle_timeout, buf_size).await;
@@ -1072,7 +1091,43 @@ async fn handle_tcp_connection_inner(
                 bidirectional_copy(tls_stream, bs, idle_timeout, buf_size).await
             }
             BackendStream::Plain(bs) => {
-                bidirectional_copy(tls_stream, bs, idle_timeout, buf_size).await
+                // On Linux with kTLS, attempt to install TLS keys into the kernel
+                // so splice(2) can handle encrypted traffic without userspace copies.
+                #[cfg(target_os = "linux")]
+                {
+                    if ktls_enabled {
+                        match try_ktls_splice(tls_stream, bs, idle_timeout, buf_size).await {
+                            Ok(result) => {
+                                used_splice = true;
+                                Ok(result)
+                            }
+                            Err(KtlsError::Unsupported(streams)) => {
+                                // kTLS not available for this cipher/version — fall back
+                                // to userspace copy with the TLS stream intact.
+                                let (tls_stream_back, bs_back) = *streams;
+                                bidirectional_copy(tls_stream_back, bs_back, idle_timeout, buf_size)
+                                    .await
+                            }
+                            Err(KtlsError::Installed(e)) => {
+                                // Unrecoverable: TLS stream was consumed via into_inner()
+                                // + dangerous_extract_secrets(). The raw TcpStream has no
+                                // TLS layer — bidirectional_copy would forward plaintext.
+                                // This path only triggers if SOL_TLS key install fails
+                                // AFTER the pre-flight TCP_ULP probe succeeded (e.g.,
+                                // kernel cipher mismatch or ENOMEM). In practice this is
+                                // extremely rare since we validate cipher/version before
+                                // extracting secrets.
+                                Err(e)
+                            }
+                        }
+                    } else {
+                        bidirectional_copy(tls_stream, bs, idle_timeout, buf_size).await
+                    }
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    bidirectional_copy(tls_stream, bs, idle_timeout, buf_size).await
+                }
             }
         }
     } else {
@@ -1085,10 +1140,16 @@ async fn handle_tcp_connection_inner(
             BackendStream::Plain(bs) => {
                 // On Linux, use splice(2) for zero-copy relay when both sides
                 // are raw TCP (no frontend TLS, no backend TLS).
+                // When io_uring is enabled, use IORING_OP_SPLICE on blocking threads.
                 #[cfg(target_os = "linux")]
                 {
                     used_splice = true;
-                    bidirectional_splice(client_stream, bs, idle_timeout, buf_size).await
+                    if io_uring_splice_enabled {
+                        bidirectional_splice_io_uring(client_stream, bs, idle_timeout, buf_size)
+                            .await
+                    } else {
+                        bidirectional_splice(client_stream, bs, idle_timeout, buf_size).await
+                    }
                 }
                 #[cfg(not(target_os = "linux"))]
                 {
@@ -1175,16 +1236,40 @@ fn try_next_target(
 
 /// Connect to a plain TCP backend with the given connect timeout.
 ///
-/// On Linux, applies `IP_BIND_ADDRESS_NO_PORT` (defers ephemeral port allocation
-/// to connect() for better 4-tuple distribution) and `TCP_FASTOPEN_CONNECT`
-/// (saves 1 RTT on repeat connections) when `tcp_fastopen` is true.
+/// On Linux, applies `IP_BIND_ADDRESS_NO_PORT` and `TCP_FASTOPEN_CONNECT`
+/// BEFORE `connect()` so they take effect on the connection attempt. These
+/// must be set pre-connect: `IP_BIND_ADDRESS_NO_PORT` defers ephemeral port
+/// allocation to `connect()` for 4-tuple co-selection, and `TCP_FASTOPEN_CONNECT`
+/// sends data in the SYN packet.
 async fn connect_backend_plain(
     addr: SocketAddr,
     connect_timeout: Duration,
-    _tcp_fastopen: bool,
+    tcp_fastopen: bool,
     overload: &crate::overload::OverloadState,
 ) -> Result<TcpStream, anyhow::Error> {
-    let stream = tokio::time::timeout(connect_timeout, TcpStream::connect(addr))
+    // Use TcpSocket to set socket options BEFORE connect(). This is the same
+    // pattern as socket_opts::connect_with_socket_opts() but adds TFO and
+    // port exhaustion detection.
+    let socket = if addr.is_ipv4() {
+        tokio::net::TcpSocket::new_v4()?
+    } else {
+        tokio::net::TcpSocket::new_v6()?
+    };
+
+    // Apply pre-connect options on the raw fd.
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let fd = socket.as_raw_fd();
+        let _ = crate::socket_opts::set_ip_bind_address_no_port(fd, true);
+        if tcp_fastopen {
+            let _ = crate::socket_opts::set_tcp_fastopen_client(fd);
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = tcp_fastopen;
+
+    let stream = tokio::time::timeout(connect_timeout, socket.connect(addr))
         .await
         .map_err(|_| anyhow::anyhow!("Backend connect timeout to {}", addr))?
         .map_err(|e| {
@@ -1199,22 +1284,8 @@ async fn connect_backend_plain(
             }
             anyhow::anyhow!("Backend connect failed to {}: {}", addr, e)
         })?;
+
     let _ = stream.set_nodelay(true);
-
-    // Apply Linux/Unix socket optimizations on the connected socket.
-    #[cfg(unix)]
-    {
-        use std::os::unix::io::AsRawFd;
-        let fd = stream.as_raw_fd();
-        // IP_BIND_ADDRESS_NO_PORT: defer ephemeral port allocation to connect(),
-        // enabling 4-tuple co-selection to prevent port exhaustion at high rates.
-        let _ = crate::socket_opts::set_ip_bind_address_no_port(fd, true);
-        if _tcp_fastopen {
-            // TCP_FASTOPEN_CONNECT: send data in SYN on repeat connections (1 RTT saved).
-            let _ = crate::socket_opts::set_tcp_fastopen_client(fd);
-        }
-    }
-
     Ok(stream)
 }
 
@@ -1579,6 +1650,210 @@ async fn bidirectional_splice(
     }
 }
 
+/// Bidirectional zero-copy relay using io_uring `IORING_OP_SPLICE`.
+///
+/// Each direction gets its own io_uring ring (8 entries) and runs on a
+/// dedicated blocking thread via `tokio::task::spawn_blocking`. This avoids
+/// the async yield_now polling loop used by the libc splice path and reduces
+/// per-operation syscall overhead.
+///
+/// Resource management is fully RAII: pipe fds are managed by `SplicePipeGuard`,
+/// and `client`/`backend` streams stay alive on the stack until after the join.
+#[cfg(target_os = "linux")]
+async fn bidirectional_splice_io_uring(
+    client: TcpStream,
+    backend: TcpStream,
+    idle_timeout: Option<Duration>,
+    pipe_size: usize,
+) -> Result<(u64, u64), anyhow::Error> {
+    use std::os::unix::io::AsRawFd;
+
+    let client_fd = client.as_raw_fd();
+    let backend_fd = backend.as_raw_fd();
+
+    // Create pipes with RAII guards — guards close fds on drop, ensuring cleanup
+    // even if spawn_blocking panics or the function returns early.
+    let (c2b_pipe_r, c2b_pipe_w) = create_splice_pipe(pipe_size)?;
+    let _c2b_guard = SplicePipeGuard(c2b_pipe_r, c2b_pipe_w);
+    let (b2c_pipe_r, b2c_pipe_w) = create_splice_pipe(pipe_size)?;
+    let _b2c_guard = SplicePipeGuard(b2c_pipe_r, b2c_pipe_w);
+
+    let timeout_ms = idle_timeout
+        .filter(|t| !t.is_zero())
+        .map(|t| t.as_millis() as u64)
+        .unwrap_or(0);
+
+    // Shared last-activity timestamp across both directions. Activity in either
+    // direction refreshes the timestamp, preventing one-way streams (e.g., downloads)
+    // from timing out on the idle send direction.
+    let shared_activity = Arc::new(AtomicU64::new(coarse_now_ms()));
+    let sa_c2b = shared_activity.clone();
+    let sa_b2c = shared_activity;
+
+    // Each direction runs on its own blocking thread with its own io_uring ring.
+    let c2b_handle = tokio::task::spawn_blocking(move || {
+        io_uring_splice_direction(
+            client_fd, c2b_pipe_w, c2b_pipe_r, backend_fd, timeout_ms, &sa_c2b,
+        )
+    });
+    let b2c_handle = tokio::task::spawn_blocking(move || {
+        io_uring_splice_direction(
+            backend_fd, b2c_pipe_w, b2c_pipe_r, client_fd, timeout_ms, &sa_b2c,
+        )
+    });
+
+    // Wait for both directions. Streams (`client`, `backend`) stay alive on this
+    // stack frame until the function returns. Pipe guards (`_c2b_guard`, `_b2c_guard`)
+    // close pipe fds on drop. All resource cleanup is RAII — no manual close needed.
+    let (c2b_result, b2c_result) = tokio::join!(c2b_handle, b2c_handle);
+
+    let c2b = c2b_result.map_err(|e| anyhow::anyhow!("io_uring splice spawn error: {}", e))??;
+    let b2c = b2c_result.map_err(|e| anyhow::anyhow!("io_uring splice spawn error: {}", e))??;
+    Ok((c2b, b2c))
+    // Drop order (guaranteed by Rust): c2b, b2c returned → _b2c_guard closes pipes →
+    // _c2b_guard closes pipes → backend dropped (fd closed) → client dropped (fd closed).
+    // Blocking threads have already joined, so raw fds are no longer in use.
+}
+
+/// Run the io_uring splice loop for one direction on a blocking thread.
+///
+/// Falls back to libc::splice if io_uring ring creation fails (memlock
+/// pressure, resource limits). The idle timeout is checked inline inside
+/// the io_uring loop to prevent indefinite blocking on idle connections.
+#[cfg(target_os = "linux")]
+fn io_uring_splice_direction(
+    src_fd: i32,
+    pipe_w: i32,
+    pipe_r: i32,
+    dst_fd: i32,
+    timeout_ms: u64,
+    shared_activity: &AtomicU64,
+) -> Result<u64, anyhow::Error> {
+    match crate::socket_opts::io_uring_splice::io_uring_splice_loop(
+        src_fd,
+        pipe_w,
+        pipe_r,
+        dst_fd,
+        shared_activity,
+        timeout_ms,
+    ) {
+        Ok(bytes) => Ok(bytes),
+        Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
+            // io_uring ring creation failed — fall back to libc::splice.
+            // This can happen under memlock pressure even though startup
+            // probing succeeded.
+            tracing::debug!("io_uring ring creation failed, falling back to libc splice");
+            libc_splice_loop(src_fd, pipe_w, pipe_r, dst_fd, timeout_ms, shared_activity)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+            Err(anyhow::anyhow!("TCP idle timeout (io_uring splice)"))
+        }
+        Err(e) => Err(anyhow::anyhow!("io_uring splice error: {}", e)),
+    }
+}
+
+/// Fallback libc::splice loop for when io_uring ring creation fails.
+/// Same logic as `splice_one_direction_no_guard` but synchronous (runs
+/// on a blocking thread).
+#[cfg(target_os = "linux")]
+fn libc_splice_loop(
+    src_fd: i32,
+    pipe_w: i32,
+    pipe_r: i32,
+    dst_fd: i32,
+    timeout_ms: u64,
+    shared_activity: &AtomicU64,
+) -> Result<u64, anyhow::Error> {
+    let splice_flags = libc::SPLICE_F_MOVE | libc::SPLICE_F_NONBLOCK;
+    let mut total: u64 = 0;
+
+    loop {
+        if timeout_ms > 0 {
+            let last = shared_activity.load(Ordering::Relaxed);
+            if coarse_now_ms().saturating_sub(last) >= timeout_ms {
+                return Err(anyhow::anyhow!("TCP idle timeout (libc splice fallback)"));
+            }
+        }
+
+        let n = unsafe {
+            libc::splice(
+                src_fd,
+                std::ptr::null_mut(),
+                pipe_w,
+                std::ptr::null_mut(),
+                128 * 1024,
+                splice_flags,
+            )
+        };
+
+        if n > 0 {
+            let mut remaining = n as usize;
+            while remaining > 0 {
+                let written = unsafe {
+                    libc::splice(
+                        pipe_r,
+                        std::ptr::null_mut(),
+                        dst_fd,
+                        std::ptr::null_mut(),
+                        remaining,
+                        splice_flags,
+                    )
+                };
+                if written > 0 {
+                    remaining -= written as usize;
+                    total += written as u64;
+                    // Refresh shared idle timeout — visible to both directions.
+                    if timeout_ms > 0 {
+                        shared_activity.store(coarse_now_ms(), Ordering::Relaxed);
+                    }
+                } else if written == 0 {
+                    return Ok(total);
+                } else {
+                    let err = std::io::Error::last_os_error();
+                    if err.kind() == std::io::ErrorKind::WouldBlock {
+                        // CRITICAL: This inner-loop WouldBlock branch must recheck
+                        // the idle timeout before sleeping. The `while remaining > 0`
+                        // loop has no timeout check, so if the destination socket
+                        // stops reading while data is buffered in the pipe, this
+                        // branch would spin at 1000 iters/sec forever without
+                        // releasing the blocking thread to the tokio pool.
+                        if timeout_ms > 0 {
+                            let last = shared_activity.load(Ordering::Relaxed);
+                            if coarse_now_ms().saturating_sub(last) >= timeout_ms {
+                                return Err(anyhow::anyhow!(
+                                    "TCP idle timeout (libc splice fallback, write phase)"
+                                ));
+                            }
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                        continue;
+                    }
+                    return Err(anyhow::anyhow!("splice write error: {}", err));
+                }
+            }
+        } else if n == 0 {
+            return Ok(total);
+        } else {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::WouldBlock {
+                // The outer `loop` at the top rechecks the timeout, but add an
+                // inline check here for uniformity with the Phase 2 branch above.
+                if timeout_ms > 0 {
+                    let last = shared_activity.load(Ordering::Relaxed);
+                    if coarse_now_ms().saturating_sub(last) >= timeout_ms {
+                        return Err(anyhow::anyhow!(
+                            "TCP idle timeout (libc splice fallback, read phase)"
+                        ));
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                continue;
+            }
+            return Err(anyhow::anyhow!("splice read error: {}", err));
+        }
+    }
+}
+
 /// Create a pipe suitable for splice, sized to match the proxy buffer tier.
 #[cfg(target_os = "linux")]
 fn create_splice_pipe(desired_size: usize) -> Result<(i32, i32), anyhow::Error> {
@@ -1656,7 +1931,9 @@ async fn splice_one_direction_no_guard(
                 } else {
                     let err = std::io::Error::last_os_error();
                     if err.kind() == std::io::ErrorKind::WouldBlock {
-                        // Destination not ready — yield and retry
+                        // Destination not ready — yield to tokio scheduler and retry.
+                        // yield_now() is correct here (async splice runs on a tokio worker).
+                        // sleep(1ms) would add unnecessary latency per retry.
                         tokio::task::yield_now().await;
                         continue;
                     }
@@ -1669,7 +1946,7 @@ async fn splice_one_direction_no_guard(
         } else {
             let err = std::io::Error::last_os_error();
             if err.kind() == std::io::ErrorKind::WouldBlock {
-                // Source not ready — yield and retry
+                // Source not ready — yield to tokio scheduler and retry.
                 tokio::task::yield_now().await;
                 continue;
             }
@@ -1692,11 +1969,438 @@ impl Drop for SplicePipeGuard {
     }
 }
 
-/// Returns the current time as milliseconds since the Unix epoch.
-/// Used for coarse idle tracking — does not need sub-millisecond precision.
+/// Returns monotonic milliseconds since the process's first call to the shared
+/// clock helper. Used for coarse idle tracking — does not need sub-millisecond
+/// precision, but MUST be monotonic so wall-clock slew or NTP corrections
+/// cannot cause `saturating_sub` to pin the elapsed duration at 0 (which would
+/// disable the idle timeout).
+///
+/// Delegates to `crate::socket_opts::monotonic_now_ms` so the libc splice loop
+/// and the io_uring splice loop share the same clock via the
+/// `shared_last_activity_ms: Arc<AtomicU64>` they both read/write.
+#[inline]
 fn coarse_now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
+    crate::socket_opts::monotonic_now_ms()
+}
+
+// ---------------------------------------------------------------------------
+// kTLS support: install TLS session keys into the kernel so splice(2) works
+// on encrypted TCP connections (Linux 4.13+).
+// ---------------------------------------------------------------------------
+
+/// Error type for the kTLS attempt. Distinguishes between pre-install failures
+/// (where the TLS stream is still usable) and post-install failures (where the
+/// connection is consumed and cannot be recovered).
+#[cfg(target_os = "linux")]
+enum KtlsError {
+    /// kTLS could not be installed (unsupported cipher, wrong TLS version, etc.).
+    /// The original streams are returned so the caller can fall back to userspace copy.
+    Unsupported(Box<(tokio_rustls::server::TlsStream<TcpStream>, TcpStream)>),
+    /// kTLS keys were installed into the kernel but the subsequent splice failed.
+    /// The TLS stream has been consumed (into_inner + dangerous_extract_secrets)
+    /// so there is no way to recover — propagate the error.
+    Installed(anyhow::Error),
+}
+
+/// Attempt kTLS-accelerated splice for a frontend-TLS + plain-backend connection.
+///
+/// 1. Check that the negotiated cipher is AES-128-GCM or AES-256-GCM.
+/// 2. Check that the negotiated TLS version is TLS 1.2 (see below).
+/// 3. Extract TLS session keys via `dangerous_extract_secrets()`.
+/// 4. Install keys into the kernel via `enable_ktls()`.
+/// 5. Use `bidirectional_splice()` for zero-copy relay.
+///
+/// Returns `KtlsError::Unsupported` with the original streams if kTLS cannot
+/// be used, allowing the caller to fall back to userspace `bidirectional_copy`.
+///
+/// **TLS 1.2 ONLY.** TLS 1.3 connections fall back to userspace relay because
+/// this implementation does not handle KeyUpdate — the kernel holds a static
+/// copy of the application traffic secret, and a peer-initiated KeyUpdate
+/// would silently desynchronize decryption mid-stream.
+#[cfg(target_os = "linux")]
+async fn try_ktls_splice(
+    tls_stream: tokio_rustls::server::TlsStream<TcpStream>,
+    backend_stream: TcpStream,
+    idle_timeout: Option<Duration>,
+    buf_size: usize,
+) -> Result<(u64, u64), KtlsError> {
+    use std::os::unix::io::AsRawFd;
+
+    // Check cipher suite compatibility AND per-cipher kernel support before
+    // consuming the TLS stream. Supported ciphers: AES-128-GCM, AES-256-GCM,
+    // and ChaCha20-Poly1305.
+    //
+    // CRITICAL: Each cipher landed in kTLS in a different kernel version
+    // (AES-GCM in 4.13/4.17, ChaCha20-Poly1305 in 5.11+). A blanket
+    // `is_ktls_available()` answer is NOT sufficient: a kernel may accept
+    // the ULP and AES-128 keys while rejecting ChaCha20 keys with
+    // EINVAL/EOPNOTSUPP. If we only checked the cipher suite name and
+    // assumed the kernel supports it, the install would fail AFTER we
+    // have already consumed the TLS stream via `into_inner()` +
+    // `dangerous_extract_secrets()`, forcing a hard connection drop with
+    // no safe fallback to userspace TLS. The per-cipher gate below
+    // prevents this by refusing connections whose kernel probe failed
+    // BEFORE we extract secrets.
+    let cipher_ok = {
+        let (_, server_conn) = tls_stream.get_ref();
+        match server_conn.negotiated_cipher_suite() {
+            Some(suite) => {
+                let name = format!("{:?}", suite.suite());
+                if name.contains("AES_128_GCM") {
+                    crate::socket_opts::ktls::is_ktls_aes128gcm_available()
+                } else if name.contains("AES_256_GCM") {
+                    crate::socket_opts::ktls::is_ktls_aes256gcm_available()
+                } else if name.contains("CHACHA20_POLY1305") {
+                    crate::socket_opts::ktls::is_ktls_chacha20_poly1305_available()
+                } else {
+                    false
+                }
+            }
+            None => false,
+        }
+    };
+
+    if !cipher_ok {
+        debug!(
+            "kTLS: unsupported cipher suite or kernel lacks per-cipher support, \
+             falling back to userspace copy"
+        );
+        return Err(KtlsError::Unsupported(Box::new((
+            tls_stream,
+            backend_stream,
+        ))));
+    }
+
+    // Check TLS version — kTLS is restricted to TLS 1.2 ONLY in this gateway.
+    //
+    // TLS 1.3 is intentionally NOT supported because `dangerous_extract_secrets()`
+    // returns the CURRENT application traffic secret. In TLS 1.3 either peer may
+    // issue a KeyUpdate message at any time (RFC 8446 §4.6.3) to rotate keys.
+    // Because we install keys into the kernel ONCE and then splice the socket
+    // directly (no userspace TLS state machine), a peer-initiated KeyUpdate
+    // would silently desynchronize the kernel from the negotiated peer state
+    // mid-stream, producing decryption failures with no opportunity to rekey
+    // the kernel. For long-lived TCP streams this is a reachable correctness
+    // bug, so we fall back to userspace TLS for TLS 1.3 connections.
+    let tls_version = {
+        let (_, server_conn) = tls_stream.get_ref();
+        server_conn.protocol_version()
+    };
+    let tls_ver_u16 = match tls_version {
+        Some(rustls::ProtocolVersion::TLSv1_2) => 0x0303_u16,
+        Some(rustls::ProtocolVersion::TLSv1_3) => {
+            debug!("kTLS: TLS 1.3 KeyUpdate handling not implemented, falling back to userspace");
+            return Err(KtlsError::Unsupported(Box::new((
+                tls_stream,
+                backend_stream,
+            ))));
+        }
+        _ => {
+            debug!(
+                "kTLS: unsupported TLS version {:?}, falling back",
+                tls_version
+            );
+            return Err(KtlsError::Unsupported(Box::new((
+                tls_stream,
+                backend_stream,
+            ))));
+        }
+    };
+
+    // Pre-flight: probe TCP_ULP installation on the raw fd BEFORE consuming
+    // the TLS stream. If the kernel doesn't support kTLS (ENOPROTOOPT), we
+    // can still fall back with the TLS stream intact.
+    {
+        let (tcp_ref, _) = tls_stream.get_ref();
+        let fd = tcp_ref.as_raw_fd();
+        let ulp_name = b"tls\0";
+        let ret = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::IPPROTO_TCP,
+                libc::TCP_ULP,
+                ulp_name.as_ptr() as *const libc::c_void,
+                ulp_name.len() as libc::socklen_t,
+            )
+        };
+        if ret != 0 {
+            let err = std::io::Error::last_os_error();
+            debug!("kTLS: TCP_ULP probe failed ({}), falling back", err);
+            return Err(KtlsError::Unsupported(Box::new((
+                tls_stream,
+                backend_stream,
+            ))));
+        }
+        // TCP_ULP installed successfully — kTLS is available on this socket.
+        // Proceed to extract secrets (point of no return after this block).
+    }
+
+    // Point of no return: consume the TLS stream to extract secrets.
+    // TCP_ULP is already installed on the underlying fd, so kTLS key
+    // installation should succeed.
+    let (tcp_stream, server_conn) = tls_stream.into_inner();
+
+    let secrets = match server_conn.dangerous_extract_secrets() {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("kTLS: failed to extract TLS secrets: {}", e);
+            return Err(KtlsError::Installed(anyhow::anyhow!(
+                "kTLS secret extraction failed: {}",
+                e
+            )));
+        }
+    };
+
+    // Map rustls secrets to kTLS parameters.
+    let params = match build_ktls_params(tls_ver_u16, &secrets) {
+        Some(p) => p,
+        None => {
+            warn!("kTLS: cipher not mappable to kTLS params");
+            return Err(KtlsError::Installed(anyhow::anyhow!(
+                "kTLS: unsupported cipher in extracted secrets"
+            )));
+        }
+    };
+
+    // Install kTLS on the raw TCP socket.
+    let fd = tcp_stream.as_raw_fd();
+    match crate::socket_opts::ktls::enable_ktls(fd, &params) {
+        Ok(true) => {
+            debug!("kTLS installed successfully, using splice for TLS connection");
+            bidirectional_splice(tcp_stream, backend_stream, idle_timeout, buf_size)
+                .await
+                .map_err(KtlsError::Installed)
+        }
+        Ok(false) => {
+            // Kernel doesn't support kTLS (ENOPROTOOPT) — but we already consumed
+            // the TLS stream so we cannot recover.
+            warn!("kTLS: kernel returned ENOPROTOOPT after secret extraction");
+            Err(KtlsError::Installed(anyhow::anyhow!(
+                "kTLS not supported by kernel after secret extraction"
+            )))
+        }
+        Err(e) => {
+            warn!("kTLS: setsockopt failed: {}", e);
+            Err(KtlsError::Installed(anyhow::anyhow!(
+                "kTLS setsockopt failed: {}",
+                e
+            )))
+        }
+    }
+}
+
+/// Map rustls `ExtractedSecrets` to `KtlsParams` for the kernel TLS ULP.
+///
+/// Returns `None` if the cipher suite is not AES-128-GCM, AES-256-GCM, or
+/// ChaCha20-Poly1305.
+///
+/// Secret material is wrapped in `Zeroizing<Vec<u8>>` so the heap backing
+/// is volatile-zeroed on drop. This applies to the intermediate allocations
+/// in this function (they are `Zeroizing` from the moment they are created)
+/// as well as any downstream storage inside `KtlsParams`.
+#[cfg(target_os = "linux")]
+fn build_ktls_params(
+    tls_version: u16,
+    secrets: &rustls::ExtractedSecrets,
+) -> Option<crate::socket_opts::ktls::KtlsParams> {
+    use crate::socket_opts::ktls::{KtlsCipher, KtlsParams};
+    use rustls::ConnectionTrafficSecrets;
+    use zeroize::Zeroizing;
+
+    let (tx_seq, ref tx_secrets) = secrets.tx;
+    let (rx_seq, ref rx_secrets) = secrets.rx;
+
+    let (cipher_suite, tx_key, tx_iv, rx_key, rx_iv) = match (tx_secrets, rx_secrets) {
+        (
+            ConnectionTrafficSecrets::Aes128Gcm { key: tk, iv: tiv },
+            ConnectionTrafficSecrets::Aes128Gcm { key: rk, iv: riv },
+        ) => (
+            KtlsCipher::Aes128Gcm,
+            Zeroizing::new(tk.as_ref().to_vec()),
+            Zeroizing::new(tiv.as_ref().to_vec()),
+            Zeroizing::new(rk.as_ref().to_vec()),
+            Zeroizing::new(riv.as_ref().to_vec()),
+        ),
+        (
+            ConnectionTrafficSecrets::Aes256Gcm { key: tk, iv: tiv },
+            ConnectionTrafficSecrets::Aes256Gcm { key: rk, iv: riv },
+        ) => (
+            KtlsCipher::Aes256Gcm,
+            Zeroizing::new(tk.as_ref().to_vec()),
+            Zeroizing::new(tiv.as_ref().to_vec()),
+            Zeroizing::new(rk.as_ref().to_vec()),
+            Zeroizing::new(riv.as_ref().to_vec()),
+        ),
+        (
+            ConnectionTrafficSecrets::Chacha20Poly1305 { key: tk, iv: tiv },
+            ConnectionTrafficSecrets::Chacha20Poly1305 { key: rk, iv: riv },
+        ) => (
+            KtlsCipher::Chacha20Poly1305,
+            Zeroizing::new(tk.as_ref().to_vec()),
+            Zeroizing::new(tiv.as_ref().to_vec()),
+            Zeroizing::new(rk.as_ref().to_vec()),
+            Zeroizing::new(riv.as_ref().to_vec()),
+        ),
+        _ => return None,
+    };
+
+    Some(KtlsParams {
+        tls_version,
+        cipher_suite,
+        tx_key,
+        tx_iv,
+        tx_seq: tx_seq.to_be_bytes(),
+        rx_key,
+        rx_iv,
+        rx_seq: rx_seq.to_be_bytes(),
+    })
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod ktls_param_tests {
+    //! Tests for `build_ktls_params` — the rustls-ExtractedSecrets to
+    //! KtlsParams mapping. These run inline because `build_ktls_params`
+    //! is a private function and the rustls types it consumes are not
+    //! re-exported from the gateway crate.
+    //!
+    //! We use `AeadKey::from([u8; 32])` (the only stable public constructor)
+    //! which yields a 32-byte key regardless of the cipher's real key length.
+    //! That is harmless for this unit test since we are exercising the match
+    //! arm selection and byte plumbing, not the kernel install path.
+
+    use super::build_ktls_params;
+    use crate::socket_opts::ktls::KtlsCipher;
+    use rustls::ConnectionTrafficSecrets;
+    use rustls::ExtractedSecrets;
+    use rustls::crypto::cipher::{AeadKey, Iv};
+
+    fn aead_key(byte: u8) -> AeadKey {
+        AeadKey::from([byte; 32])
+    }
+
+    fn iv(byte: u8) -> Iv {
+        Iv::from([byte; 12])
+    }
+
+    #[test]
+    fn aes128_gcm_both_sides_maps_to_aes128() {
+        let secrets = ExtractedSecrets {
+            tx: (
+                0x1122_3344_5566_7788,
+                ConnectionTrafficSecrets::Aes128Gcm {
+                    key: aead_key(0x11),
+                    iv: iv(0x22),
+                },
+            ),
+            rx: (
+                0xdead_beef_0000_0001,
+                ConnectionTrafficSecrets::Aes128Gcm {
+                    key: aead_key(0x33),
+                    iv: iv(0x44),
+                },
+            ),
+        };
+        let params = build_ktls_params(0x0303, &secrets).expect("AES-128 pair must map");
+        assert!(matches!(params.cipher_suite, KtlsCipher::Aes128Gcm));
+        assert_eq!(params.tls_version, 0x0303);
+        assert_eq!(params.tx_seq, 0x1122_3344_5566_7788_u64.to_be_bytes());
+        assert_eq!(params.rx_seq, 0xdead_beef_0000_0001_u64.to_be_bytes());
+        assert_eq!(params.tx_iv.len(), 12);
+        assert_eq!(params.rx_iv.len(), 12);
+    }
+
+    #[test]
+    fn aes256_gcm_both_sides_maps_to_aes256() {
+        let secrets = ExtractedSecrets {
+            tx: (
+                1,
+                ConnectionTrafficSecrets::Aes256Gcm {
+                    key: aead_key(0xaa),
+                    iv: iv(0xbb),
+                },
+            ),
+            rx: (
+                2,
+                ConnectionTrafficSecrets::Aes256Gcm {
+                    key: aead_key(0xcc),
+                    iv: iv(0xdd),
+                },
+            ),
+        };
+        let params = build_ktls_params(0x0303, &secrets).expect("AES-256 pair must map");
+        assert!(matches!(params.cipher_suite, KtlsCipher::Aes256Gcm));
+        assert_eq!(params.tx_seq, 1u64.to_be_bytes());
+        assert_eq!(params.rx_seq, 2u64.to_be_bytes());
+    }
+
+    #[test]
+    fn mismatched_cipher_families_return_none() {
+        let secrets = ExtractedSecrets {
+            tx: (
+                0,
+                ConnectionTrafficSecrets::Aes128Gcm {
+                    key: aead_key(0x11),
+                    iv: iv(0x22),
+                },
+            ),
+            rx: (
+                0,
+                ConnectionTrafficSecrets::Aes256Gcm {
+                    key: aead_key(0x33),
+                    iv: iv(0x44),
+                },
+            ),
+        };
+        assert!(build_ktls_params(0x0303, &secrets).is_none());
+    }
+
+    #[test]
+    fn chacha20_poly1305_both_sides_maps_to_chacha20() {
+        let secrets = ExtractedSecrets {
+            tx: (
+                7,
+                ConnectionTrafficSecrets::Chacha20Poly1305 {
+                    key: aead_key(0x11),
+                    iv: iv(0x22),
+                },
+            ),
+            rx: (
+                8,
+                ConnectionTrafficSecrets::Chacha20Poly1305 {
+                    key: aead_key(0x33),
+                    iv: iv(0x44),
+                },
+            ),
+        };
+        let params = build_ktls_params(0x0304, &secrets).expect("ChaCha20-Poly1305 pair must map");
+        assert!(matches!(params.cipher_suite, KtlsCipher::Chacha20Poly1305));
+        assert_eq!(params.tls_version, 0x0304);
+        assert_eq!(params.tx_seq, 7u64.to_be_bytes());
+        assert_eq!(params.rx_seq, 8u64.to_be_bytes());
+        // ChaCha20-Poly1305 uses the full 12-byte IV directly.
+        assert_eq!(params.tx_iv.len(), 12);
+        assert_eq!(params.rx_iv.len(), 12);
+    }
+
+    #[test]
+    fn chacha20_mixed_with_aes_returns_none() {
+        // TX ChaCha20, RX AES-128 — not a supported mixed pairing.
+        let secrets = ExtractedSecrets {
+            tx: (
+                0,
+                ConnectionTrafficSecrets::Chacha20Poly1305 {
+                    key: aead_key(0x11),
+                    iv: iv(0x22),
+                },
+            ),
+            rx: (
+                0,
+                ConnectionTrafficSecrets::Aes128Gcm {
+                    key: aead_key(0x33),
+                    iv: iv(0x44),
+                },
+            ),
+        };
+        assert!(build_ktls_params(0x0303, &secrets).is_none());
+    }
 }

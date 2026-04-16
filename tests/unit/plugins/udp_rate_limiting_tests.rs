@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use ferrum_edge::plugins::{
     Plugin, ProxyProtocol, UDP_ONLY_PROTOCOLS, UdpDatagramContext, UdpDatagramDirection,
     UdpDatagramVerdict,
@@ -12,9 +14,9 @@ fn make_plugin(
 
 fn make_ctx(client_ip: &str, datagram_size: usize) -> UdpDatagramContext {
     UdpDatagramContext {
-        client_ip: client_ip.to_string(),
-        proxy_id: "proxy-1".to_string(),
-        proxy_name: Some("test-proxy".to_string()),
+        client_ip: Arc::from(client_ip),
+        proxy_id: Arc::from("proxy-1"),
+        proxy_name: Some(Arc::from("test-proxy")),
         listen_port: 5353,
         datagram_size,
         direction: UdpDatagramDirection::ClientToBackend,

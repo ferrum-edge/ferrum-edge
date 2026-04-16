@@ -782,11 +782,11 @@ impl DtlsServer {
                             // Store the certificate DER for plugin access after Connected
                             peer_cert_ders.push(der.to_vec());
                         }
-                        Output::ApplicationData(data) => {
-                            if app_out_tx.send(data.to_vec()).await.is_err() {
-                                // Application receiver dropped
-                                break;
-                            }
+                        Output::ApplicationData(data)
+                            if app_out_tx.send(data.to_vec()).await.is_err() =>
+                        {
+                            // Application receiver dropped
+                            break;
                         }
                         _ => {
                             // KeyingMaterial or future variants — continue draining

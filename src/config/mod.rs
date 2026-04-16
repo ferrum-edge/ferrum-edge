@@ -22,6 +22,8 @@ pub mod mongo_store;
 pub mod pool_config;
 pub mod types;
 
+#[allow(unused_imports)] // AutoBool is used by unit tests but not directly by the binary
+pub use env_config::AutoBool;
 #[allow(unused_imports)] // Used by unit tests
 pub use env_config::is_private_ip;
 pub use env_config::{BackendAllowIps, EnvConfig, OperatingMode, check_backend_ip_allowed};
