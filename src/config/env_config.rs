@@ -839,11 +839,6 @@ pub struct EnvConfig {
     /// Values: `auto` (detect kernel support), `true` (force on), `false` (force off).
     /// Default: `auto`.
     pub msg_zerocopy_enabled: AutoBool,
-    /// Minimum payload size in bytes to use MSG_ZEROCOPY. Smaller payloads use
-    /// regular send() because the kernel completion notification overhead (~1-2µs)
-    /// exceeds the copy cost. 32 KB is the crossover point from kernel MSG_ZEROCOPY
-    /// benchmarks. Default: 32768 (32 KB).
-    pub msg_zerocopy_threshold: usize,
 }
 
 impl Default for EnvConfig {
@@ -1033,7 +1028,6 @@ impl Default for EnvConfig {
             udp_gso_enabled: AutoBool::Auto,
             so_busy_poll_us: 0,
             msg_zerocopy_enabled: AutoBool::Auto,
-            msg_zerocopy_threshold: 32_768,
         }
     }
 }
@@ -1657,7 +1651,6 @@ impl EnvConfig {
                 "FERRUM_MSG_ZEROCOPY_ENABLED",
                 AutoBool::Auto,
             ),
-            msg_zerocopy_threshold: resolve_usize(conf, "FERRUM_MSG_ZEROCOPY_THRESHOLD", 32_768),
         };
 
         config.validate()?;

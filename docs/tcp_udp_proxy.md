@@ -415,7 +415,7 @@ These Linux-specific options auto-detect kernel support at startup when set to `
 | `FERRUM_IO_URING_SPLICE_ENABLED` | `auto` | io_uring-based splice via `IORING_OP_SPLICE` on dedicated blocking threads (Linux 5.6+). Each direction gets its own ring. Probes ring creation at startup |
 | `FERRUM_UDP_GRO_ENABLED` | `auto` | UDP Generic Receive Offload — kernel coalesces same-size datagrams; recv path splits them via GRO cmsg (Linux 5.0+). Probes `setsockopt(UDP_GRO)` on temp socket |
 | `FERRUM_UDP_GSO_ENABLED` | `auto` | UDP Generic Segmentation Offload — batches same-size datagrams into single `sendmsg()` with `UDP_SEGMENT` cmsg (Linux 4.18+). Probes on temp socket. Falls back to `sendmmsg` on failure |
-| `FERRUM_MSG_ZEROCOPY_ENABLED` | `auto` | `SO_ZEROCOPY` on TCP stream proxy sockets for large sends (Linux 4.14+). Threshold: `FERRUM_MSG_ZEROCOPY_THRESHOLD` (default 32768 bytes) |
+| `FERRUM_MSG_ZEROCOPY_ENABLED` | `auto` | `SO_ZEROCOPY` on TCP stream proxy sockets (Linux 4.14+). Kernel handles per-send thresholds internally |
 | `FERRUM_SO_BUSY_POLL_US` | `0` | Kernel busy-poll duration (µs) on UDP sockets. Reduces latency at cost of CPU. `0` = disabled |
 | `FERRUM_TCP_FASTOPEN_ENABLED` | `auto` | TCP Fast Open on listener and outbound sockets. Saves 1 RTT for repeat connections. Checks `/proc/sys/net/ipv4/tcp_fastopen` sysctl |
 | `FERRUM_UDP_RECVMMSG_BATCH_SIZE` | `64` | Datagrams per `recvmmsg` syscall (1-1024). Each slot allocates 65535 bytes |

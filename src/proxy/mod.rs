@@ -707,7 +707,6 @@ impl ProxyState {
                 // MSG_ZEROCOPY is available on Linux 4.14+. On non-Linux it's a no-op.
                 cfg!(target_os = "linux")
             }),
-            env_config_arc.msg_zerocopy_threshold,
             env_config_arc.so_busy_poll_us,
             env_config_arc
                 .udp_gro_enabled

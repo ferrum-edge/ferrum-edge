@@ -111,13 +111,12 @@ fn create_manager(config: GatewayConfig) -> StreamListenerManager {
         64,
         true,
         Arc::new(ferrum_edge::overload::OverloadState::new()),
-        false,  // ktls_enabled
-        false,  // io_uring_splice_enabled
-        false,  // msg_zerocopy_enabled
-        10_240, // msg_zerocopy_threshold
-        0,      // so_busy_poll_us
-        false,  // udp_gro_enabled (use false in tests to avoid Linux-specific failures)
-        false,  // udp_gso_enabled
+        false, // ktls_enabled
+        false, // io_uring_splice_enabled
+        false, // msg_zerocopy_enabled
+        0,     // so_busy_poll_us
+        false, // udp_gro_enabled (use false in tests to avoid Linux-specific failures)
+        false, // udp_gso_enabled
     )
 }
 
@@ -185,13 +184,12 @@ async fn test_reconcile_starts_tcp_listener() {
         64,
         true,
         Arc::new(ferrum_edge::overload::OverloadState::new()),
-        false,  // ktls_enabled
-        false,  // io_uring_splice_enabled
-        false,  // msg_zerocopy_enabled
-        10_240, // msg_zerocopy_threshold
-        0,      // so_busy_poll_us
-        false,  // udp_gro_enabled (use false in tests to avoid Linux-specific failures)
-        false,  // udp_gso_enabled
+        false, // ktls_enabled
+        false, // io_uring_splice_enabled
+        false, // msg_zerocopy_enabled
+        0,     // so_busy_poll_us
+        false, // udp_gro_enabled (use false in tests to avoid Linux-specific failures)
+        false, // udp_gso_enabled
     );
 
     let failures = manager.reconcile().await;
@@ -251,13 +249,12 @@ async fn test_reconcile_starts_udp_listener() {
         64,
         true,
         Arc::new(ferrum_edge::overload::OverloadState::new()),
-        false,  // ktls_enabled
-        false,  // io_uring_splice_enabled
-        false,  // msg_zerocopy_enabled
-        10_240, // msg_zerocopy_threshold
-        0,      // so_busy_poll_us
-        false,  // udp_gro_enabled (use false in tests to avoid Linux-specific failures)
-        false,  // udp_gso_enabled
+        false, // ktls_enabled
+        false, // io_uring_splice_enabled
+        false, // msg_zerocopy_enabled
+        0,     // so_busy_poll_us
+        false, // udp_gro_enabled (use false in tests to avoid Linux-specific failures)
+        false, // udp_gso_enabled
     );
 
     let failures = manager.reconcile().await;
@@ -329,13 +326,12 @@ async fn test_reconcile_detects_port_conflict() {
         64,
         true,
         Arc::new(ferrum_edge::overload::OverloadState::new()),
-        false,  // ktls_enabled
-        false,  // io_uring_splice_enabled
-        false,  // msg_zerocopy_enabled
-        10_240, // msg_zerocopy_threshold
-        0,      // so_busy_poll_us
-        false,  // udp_gro_enabled (use false in tests to avoid Linux-specific failures)
-        false,  // udp_gso_enabled
+        false, // ktls_enabled
+        false, // io_uring_splice_enabled
+        false, // msg_zerocopy_enabled
+        0,     // so_busy_poll_us
+        false, // udp_gro_enabled (use false in tests to avoid Linux-specific failures)
+        false, // udp_gso_enabled
     );
 
     let failures = manager.reconcile().await;
@@ -402,13 +398,12 @@ async fn test_reconcile_defers_tcp_without_tls_config() {
         64,
         true,
         Arc::new(ferrum_edge::overload::OverloadState::new()),
-        false,  // ktls_enabled
-        false,  // io_uring_splice_enabled
-        false,  // msg_zerocopy_enabled
-        10_240, // msg_zerocopy_threshold
-        0,      // so_busy_poll_us
-        false,  // udp_gro_enabled (use false in tests to avoid Linux-specific failures)
-        false,  // udp_gso_enabled
+        false, // ktls_enabled
+        false, // io_uring_splice_enabled
+        false, // msg_zerocopy_enabled
+        0,     // so_busy_poll_us
+        false, // udp_gro_enabled (use false in tests to avoid Linux-specific failures)
+        false, // udp_gso_enabled
     );
 
     let failures = manager.reconcile().await;
@@ -469,13 +464,12 @@ async fn test_reconcile_defers_udp_without_dtls_config() {
         64,
         true,
         Arc::new(ferrum_edge::overload::OverloadState::new()),
-        false,  // ktls_enabled
-        false,  // io_uring_splice_enabled
-        false,  // msg_zerocopy_enabled
-        10_240, // msg_zerocopy_threshold
-        0,      // so_busy_poll_us
-        false,  // udp_gro_enabled (use false in tests to avoid Linux-specific failures)
-        false,  // udp_gso_enabled
+        false, // ktls_enabled
+        false, // io_uring_splice_enabled
+        false, // msg_zerocopy_enabled
+        0,     // so_busy_poll_us
+        false, // udp_gro_enabled (use false in tests to avoid Linux-specific failures)
+        false, // udp_gso_enabled
     );
 
     let failures = manager.reconcile().await;
@@ -539,13 +533,12 @@ async fn test_shutdown_all_releases_ports() {
         64,
         true,
         Arc::new(ferrum_edge::overload::OverloadState::new()),
-        false,  // ktls_enabled
-        false,  // io_uring_splice_enabled
-        false,  // msg_zerocopy_enabled
-        10_240, // msg_zerocopy_threshold
-        0,      // so_busy_poll_us
-        false,  // udp_gro_enabled (use false in tests to avoid Linux-specific failures)
-        false,  // udp_gso_enabled
+        false, // ktls_enabled
+        false, // io_uring_splice_enabled
+        false, // msg_zerocopy_enabled
+        0,     // so_busy_poll_us
+        false, // udp_gro_enabled (use false in tests to avoid Linux-specific failures)
+        false, // udp_gso_enabled
     );
 
     let failures = manager.reconcile().await;
@@ -620,13 +613,12 @@ async fn test_wait_until_started_succeeds_for_tcp() {
         64,
         true,
         Arc::new(ferrum_edge::overload::OverloadState::new()),
-        false,  // ktls_enabled
-        false,  // io_uring_splice_enabled
-        false,  // msg_zerocopy_enabled
-        10_240, // msg_zerocopy_threshold
-        0,      // so_busy_poll_us
-        false,  // udp_gro_enabled (use false in tests to avoid Linux-specific failures)
-        false,  // udp_gso_enabled
+        false, // ktls_enabled
+        false, // io_uring_splice_enabled
+        false, // msg_zerocopy_enabled
+        0,     // so_busy_poll_us
+        false, // udp_gro_enabled (use false in tests to avoid Linux-specific failures)
+        false, // udp_gso_enabled
     );
 
     let failures = manager.reconcile().await;

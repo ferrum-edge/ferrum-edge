@@ -163,8 +163,6 @@ pub struct TcpListenerConfig {
     pub io_uring_splice_enabled: bool,
     /// Enable MSG_ZEROCOPY for large sends (from `FERRUM_MSG_ZEROCOPY_ENABLED`).
     pub msg_zerocopy_enabled: bool,
-    /// Threshold in bytes for MSG_ZEROCOPY (from `FERRUM_MSG_ZEROCOPY_THRESHOLD`).
-    pub msg_zerocopy_threshold: usize,
 }
 
 /// Start a TCP proxy listener on the given port.
@@ -201,7 +199,6 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
         ktls_enabled,
         io_uring_splice_enabled,
         msg_zerocopy_enabled,
-        msg_zerocopy_threshold,
     } = cfg;
     let addr = SocketAddr::new(bind_addr, port);
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -339,8 +336,7 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
                         &adaptive_buf,
                         tcp_fastopen_enabled,
                         msg_zerocopy_enabled,
-                        msg_zerocopy_threshold,
-                        ktls_enabled,
+                                        ktls_enabled,
                         io_uring_splice_enabled,
                         &overload_for_conn,
                     )
@@ -496,7 +492,6 @@ async fn handle_tcp_connection(
     adaptive_buffer: &crate::adaptive_buffer::AdaptiveBufferTracker,
     tcp_fastopen: bool,
     msg_zerocopy_enabled: bool,
-    _msg_zerocopy_threshold: usize,
     ktls_enabled: bool,
     io_uring_splice_enabled: bool,
     overload: &crate::overload::OverloadState,
