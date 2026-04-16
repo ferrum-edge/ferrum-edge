@@ -163,6 +163,8 @@ Sends transaction summaries as JSON to an external HTTP endpoint. Entries are bu
 
 Batches are flushed when `batch_size` is reached **or** `flush_interval_ms` elapses, whichever comes first.
 
+Retries fire on transport errors and 5xx responses. A **4xx response aborts the batch immediately** (retrying a malformed or unauthorized payload just delays the drop) — fix the endpoint URL, authorization header, or field schema rather than waiting through `max_retries × retry_delay_ms`.
+
 `endpoint_url` must be a valid `http://` or `https://` URL with a hostname. Malformed or non-HTTP URLs reject plugin creation at config load time instead of failing later in the background flush task.
 
 `custom_headers` accepts a JSON object of header name → value pairs. All headers are sent with every batch POST request. This supports services that require non-standard authentication headers (e.g., `DD-API-KEY` for Datadog, `Api-Key` for New Relic, `X-Sumo-Category` for Sumo Logic). Use `Authorization` as a key for services that authenticate via the standard Authorization header (e.g., Splunk HEC, Logtail).
@@ -386,6 +388,10 @@ Sends transaction metrics to a StatsD-compatible server (StatsD, Datadog DogStat
 
 Metrics are flushed when `max_batch_lines` is reached **or** `flush_interval_ms` elapses, whichever comes first. Large payloads are automatically split across multiple UDP packets at 1472-byte MTU boundaries.
 
+**DNS handling.** The StatsD endpoint is resolved through the gateway's shared `DnsCache` at startup (pre-warmed via `warmup_hostnames()`) and re-resolved every 60 seconds by the background flush task. If the resolved address changes (DNS flip, service discovery update), the UDP socket is rebound to the new address without a gateway restart.
+
+**Tag sanitization.** Operator-controlled tag values (proxy name/id, HTTP method, protocol) are sanitized before being written to the line protocol: `,` `|` `#` `:` and whitespace are replaced with `_`. Empty values become the literal `none`. This keeps a proxy name containing delimiters from corrupting downstream parsing in StatsD / DogStatsD / Telegraf.
+
 **Metrics emitted per HTTP/gRPC/WebSocket request:**
 
 | Metric | Type | Description |
@@ -535,6 +541,8 @@ Batches are flushed when `batch_size` is reached **or** `flush_interval_ms` elap
 
 **Datagram size:** Operators should size `batch_size` to keep serialized payloads under the network MTU (typically ~1400 bytes for DTLS, ~1472 bytes for plain UDP over Ethernet). Oversized datagrams may be fragmented or dropped by the network.
 
+**DNS handling:** The UDP endpoint is resolved through the gateway's shared `DnsCache` (TTL-aware, stale-while-revalidate, background refresh). For plain UDP, the background flush task re-resolves every 60 seconds and rebinds the socket if the address changes — DNS flips propagate without a restart. DTLS sessions are not re-handshaken mid-session.
+
 ```yaml
 plugin_name: udp_logging
 config:
@@ -571,7 +579,7 @@ Produces transaction summaries as JSON messages to an Apache Kafka topic. Uses a
 |---|---|---|---|
 | `broker_list` | String | *(required)* | Comma-separated Kafka broker addresses (e.g., `broker1:9092,broker2:9092`) |
 | `topic` | String | *(required)* | Kafka topic to produce messages to |
-| `key_field` | String | `"client_ip"` | Partition key field: `client_ip`, `proxy_id`, or `none` (round-robin) |
+| `key_field` | String | `"client_ip"` | Partition key field: `client_ip`, `proxy_id`, or `none` (round-robin). Any other value is rejected at plugin construction time so operator typos surface immediately instead of silently falling back to `client_ip` |
 | `buffer_capacity` | Integer | `10000` | Channel capacity — new entries are dropped when full. Each entry is a serialized JSON `TransactionSummary` (~1-2 KB), so the default 10,000 entries may use ~10-20 MB of memory |
 | `compression` | String | `"lz4"` | Compression: `none`, `gzip`, `snappy`, `lz4`, `zstd` |
 | `flush_timeout_seconds` | Integer | `5` | Seconds to wait for librdkafka to flush pending messages during graceful shutdown |
@@ -678,17 +686,19 @@ All logging plugins (`stdout_logging`, `http_logging`, `tcp_logging`, `udp_loggi
 | `proxy_id` | String | Proxy ID |
 | `proxy_name` | String or null | Proxy name |
 | `client_ip` | String | Client IP |
+| `consumer_username` | String or null | Identified consumer username (gateway Consumer) or external authenticated identity resolved during `on_stream_connect`. Omitted from JSON when null |
 | `backend_target` | String | Backend target (`host:port`); empty if target resolution failed before LB/config lookup |
 | `backend_resolved_ip` | String or null | DNS-resolved backend IP; omitted from JSON when null |
 | `protocol` | String | Protocol string: `tcp`, `tcp_tls`, `udp`, or `dtls` |
 | `listen_port` | u16 | Proxy listen port |
 | `duration_ms` | f64 | Connection/session lifetime in milliseconds |
-| `bytes_sent` | u64 | Bytes sent to backend |
-| `bytes_received` | u64 | Bytes received from backend |
+| `bytes_sent` | u64 | Bytes the gateway **relayed from the client to the backend** (client→backend direction) |
+| `bytes_received` | u64 | Bytes the gateway **relayed from the backend to the client** (backend→client direction) |
 | `connection_error` | String or null | Error message if the connection failed |
 | `error_class` | String or null | Error classification; omitted from JSON when null |
 | `timestamp_connected` | String (RFC 3339) | Connection start time |
 | `timestamp_disconnected` | String (RFC 3339) | Connection end time |
+| `sni_hostname` | String or null | SNI from TLS/DTLS ClientHello when passthrough mode is enabled; omitted from JSON when null |
 | `metadata` | Object | Plugin-injected key-value pairs; omitted from JSON when empty |
 
 #### Example: HTTP/1.1 or HTTP/2 (Buffered Response)
@@ -985,7 +995,7 @@ Ships transaction logs to Grafana Loki via the push API (`POST /loki/api/v1/push
 | `authorization_header` | string | (none) | `Authorization` header value (Bearer/Basic) |
 | `custom_headers` | object | `{}` | Extra HTTP headers (e.g., `X-Scope-OrgID`) |
 | `labels` | object | `{"service":"ferrum-edge"}` | Static labels applied to every log stream |
-| `include_listen_path_label` | bool | `true` | Add `proxy_id` as a label |
+| `include_proxy_id_label` | bool | `true` | Add `proxy_id` as a label. The legacy key `include_listen_path_label` is still accepted for backward compatibility (the label name has always been `proxy_id`); if both are set, `include_proxy_id_label` wins |
 | `include_status_class_label` | bool | `true` | Add `status_class` (2xx/3xx/4xx/5xx) as a label |
 | `gzip` | bool | `true` | Gzip-compress request bodies |
 | `batch_size` | integer | `100` | Max entries per batch |
@@ -993,6 +1003,8 @@ Ships transaction logs to Grafana Loki via the push API (`POST /loki/api/v1/push
 | `buffer_capacity` | integer | `10000` | Channel buffer capacity |
 | `max_retries` | integer | `3` | Retry attempts on failure |
 | `retry_delay_ms` | integer | `1000` | Delay between retries |
+
+Retries fire on transport errors and 5xx responses. A **4xx response aborts the batch immediately** (retrying a malformed or unauthorized payload just delays the drop) — fix the endpoint URL, `authorization_header`, or tenant header rather than waiting through `max_retries × retry_delay_ms`.
 
 ### `transaction_debugger`
 
