@@ -108,6 +108,10 @@ impl DbOutageTestHarness {
             .env("FERRUM_ADMIN_HTTP_PORT", admin_port.to_string())
             .env("FERRUM_LOG_LEVEL", "info")
             .env("FERRUM_TRUSTED_PROXIES", "127.0.0.1")
+            // Short pool acquire timeout so the polling loop's full-reload
+            // fallback fails quickly when the DB is corrupted, rather than
+            // waiting 30s for sqlx's after_connect retry backoff to exhaust.
+            .env("FERRUM_DB_POOL_ACQUIRE_TIMEOUT_SECONDS", "3")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -242,9 +246,10 @@ impl DbOutageTestHarness {
         println!("  DB file restored from backup");
     }
 
-    /// Wait for DB poll to pick up changes (poll interval is 2s, wait 5s for safety)
+    /// Wait for DB poll to pick up changes.
+    /// Budget: poll interval (2s) + pool acquire timeout (3s) + margin = 8s.
     async fn wait_for_poll(&self) {
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        tokio::time::sleep(Duration::from_secs(8)).await;
     }
 }
 
