@@ -856,8 +856,8 @@ pub mod io_uring_splice {
                 -1,
                 io_uring::types::Fd(fds[1]),
                 -1,
+                0, // len: 0 bytes for probe
             )
-            .len(0)
             .build();
             let push_ok = unsafe { ring.submission().push(&sqe).is_ok() };
             let result = if push_ok {
@@ -935,8 +935,8 @@ pub mod io_uring_splice {
                 -1, // no offset for pipes/sockets
                 io_uring::types::Fd(pipe_w),
                 -1,
+                chunk_size,
             )
-            .len(chunk_size)
             .flags(splice_flags)
             .build();
 
@@ -974,8 +974,8 @@ pub mod io_uring_splice {
                     -1,
                     io_uring::types::Fd(dst_fd),
                     -1,
+                    remaining,
                 )
-                .len(remaining)
                 .flags(splice_flags)
                 .build();
 
