@@ -307,3 +307,85 @@ fn test_body_rules_null_target_rejected() {
     let err = parse_body_rules(&config).expect_err("expected error for null target");
     assert!(err.contains("'target' must be a string"), "got: {err}");
 }
+
+// ── rename array-index rejection ──────────────────────────────────────────
+// `rename` on array indices is ambiguous (move? swap? overwrite?) and the
+// forward path combined with `Vec::remove`'s leftward shift silently drops
+// data. These rules are rejected at parse time so users fall back to the
+// well-defined `remove` + `add` composition instead.
+
+#[test]
+fn test_rename_rejects_array_index_in_key() {
+    let config = json!({
+        "rules": [
+            {"operation": "rename", "target": "body", "key": "items.0", "new_key": "items.first"}
+        ]
+    });
+    let err = parse_body_rules(&config).expect_err("expected rejection for array index in key");
+    assert!(err.contains("does not support array indices"), "got: {err}");
+}
+
+#[test]
+fn test_rename_rejects_array_index_in_new_key() {
+    let config = json!({
+        "rules": [
+            {"operation": "rename", "target": "body", "key": "items.first", "new_key": "items.0"}
+        ]
+    });
+    let err = parse_body_rules(&config).expect_err("expected rejection for array index in new_key");
+    assert!(err.contains("does not support array indices"), "got: {err}");
+}
+
+#[test]
+fn test_rename_rejects_array_index_in_both() {
+    let config = json!({
+        "rules": [
+            {"operation": "rename", "target": "body", "key": "items.0", "new_key": "items.1"}
+        ]
+    });
+    let err = parse_body_rules(&config)
+        .expect_err("expected rejection when both sides are array indices");
+    assert!(err.contains("does not support array indices"), "got: {err}");
+}
+
+#[test]
+fn test_rename_allows_escaped_numeric_segment() {
+    // `counts\.0` is a single key literally named `counts.0` — NOT an array
+    // index. The escaped-dot segment must be accepted since there is no
+    // ambiguity: both sides are plain object keys.
+    let config = json!({
+        "rules": [
+            {
+                "operation": "rename",
+                "target": "body",
+                "key": "counts\\.0",
+                "new_key": "counts\\.1"
+            }
+        ]
+    });
+    let rules =
+        parse_body_rules(&config).expect("escaped numeric segments must be accepted for rename");
+    assert_eq!(rules.len(), 1);
+    assert_eq!(rules[0].key, "counts\\.0");
+    assert_eq!(rules[0].new_key.as_deref(), Some("counts\\.1"));
+}
+
+#[test]
+fn test_rename_rejects_deep_array_index() {
+    // Numeric segments anywhere in the path must be rejected — not just the
+    // terminal segment. Here the ambiguous segment is in the middle of the
+    // path.
+    let config = json!({
+        "rules": [
+            {
+                "operation": "rename",
+                "target": "body",
+                "key": "data.items.0.name",
+                "new_key": "data.items.0.label"
+            }
+        ]
+    });
+    let err = parse_body_rules(&config)
+        .expect_err("expected rejection for numeric segment anywhere in the path");
+    assert!(err.contains("does not support array indices"), "got: {err}");
+}

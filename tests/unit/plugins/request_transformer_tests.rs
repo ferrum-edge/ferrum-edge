@@ -352,6 +352,23 @@ async fn test_request_transformer_rename_without_new_key_rejected() {
 }
 
 #[tokio::test]
+async fn test_rename_array_index_rejected_at_construction() {
+    // Rename rules targeting array indices are ambiguous (move? swap?
+    // overwrite?) and previously caused silent data loss when both sides
+    // pointed at the same array. They must be rejected at plugin construction
+    // so the misconfiguration surfaces as an HTTP 400 (admin API) or startup
+    // failure (file mode) instead of corrupting user data at runtime.
+    let err = RequestTransformer::new(&json!({
+        "rules": [
+            {"operation": "rename", "target": "body", "key": "items.0", "new_key": "items.1"}
+        ]
+    }))
+    .err()
+    .expect("expected error for rename with array indices");
+    assert!(err.contains("does not support array indices"), "got: {err}");
+}
+
+#[tokio::test]
 async fn test_request_transformer_header_key_pre_lowercased() {
     let plugin = RequestTransformer::new(&json!({
         "rules": [

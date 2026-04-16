@@ -85,6 +85,13 @@ fn path_segments(path: &str) -> PathSegments<'_> {
     PathSegments::Escaped(segments.into_iter())
 }
 
+/// Returns true if any dot-notation segment of `path` parses as a `usize`
+/// (i.e. looks like an array index). Uses `path_segments` so escaped dots
+/// (`\.`) are honored — a segment like `foo\.0` is one key, not an index.
+fn path_has_numeric_segment(path: &str) -> bool {
+    path_segments(path).any(|seg| seg.as_ref().parse::<usize>().is_ok())
+}
+
 /// Immutable child lookup: works on both objects and arrays (numeric index).
 fn child<'a>(parent: &'a Value, segment: &str) -> Option<&'a Value> {
     match parent {
@@ -522,6 +529,17 @@ pub fn parse_body_rules(config: &Value) -> Result<Vec<BodyRule>, String> {
                 if new_key.is_none() {
                     return Err(format!(
                         "rule[{idx}]: body 'rename' operation requires a 'new_key'"
+                    ));
+                }
+                // Reject array indices in rename paths. Rename semantics on
+                // arrays are inherently ambiguous (move? swap? overwrite?), and
+                // the forward path combined with `Vec::remove`'s leftward shift
+                // silently drops data when both paths target the same array.
+                // Users who need array mutation can compose `remove` + `add`.
+                let new_key_ref = new_key.as_deref().unwrap_or("");
+                if path_has_numeric_segment(&key) || path_has_numeric_segment(new_key_ref) {
+                    return Err(format!(
+                        "rule[{idx}]: body 'rename' does not support array indices in 'key' or 'new_key' (got key='{key}', new_key='{new_key_ref}'); use 'remove' + 'add' instead"
                     ));
                 }
             }
