@@ -81,7 +81,14 @@ impl WsFrameLogging {
             Message::Text(s) => s.len(),
             Message::Binary(b) => b.len(),
             Message::Ping(d) | Message::Pong(d) => d.len(),
-            Message::Close(_) | Message::Frame(_) => 0,
+            // Close frames carry a 2-byte status code (when present) plus an
+            // optional UTF-8 reason. Report the reason length — which is the
+            // operator-visible payload — rather than 0.
+            Message::Close(Some(cf)) => cf.reason.len(),
+            Message::Close(None) => 0,
+            // `Frame` is raw-frame mode (unused by the gateway's WS path but
+            // exposed for plugin flexibility). Use its payload length.
+            Message::Frame(f) => f.payload().len(),
         }
     }
 
@@ -261,5 +268,37 @@ impl Plugin for WsFrameLogging {
 
         // Never transform frames — purely observational
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+    use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+
+    #[test]
+    fn frame_size_close_reports_reason_length() {
+        let cf = CloseFrame {
+            code: CloseCode::Normal,
+            reason: "client went away".into(),
+        };
+        let msg = Message::Close(Some(cf));
+        assert_eq!(WsFrameLogging::frame_size(&msg), "client went away".len());
+    }
+
+    #[test]
+    fn frame_size_close_without_reason_is_zero() {
+        let msg = Message::Close(None);
+        assert_eq!(WsFrameLogging::frame_size(&msg), 0);
+    }
+
+    #[test]
+    fn frame_size_text_and_binary() {
+        let text = Message::Text("abc".into());
+        assert_eq!(WsFrameLogging::frame_size(&text), 3);
+
+        let bin = Message::Binary(vec![1u8, 2, 3, 4, 5].into());
+        assert_eq!(WsFrameLogging::frame_size(&bin), 5);
     }
 }

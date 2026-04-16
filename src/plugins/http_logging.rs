@@ -222,12 +222,20 @@ async fn send_batch(cfg: &BatchConfig, batch: Vec<LogEntry>) {
         match cfg.http_client.execute(req, "http_logging").await {
             Ok(response) if response.status().is_success() => return,
             Ok(response) => {
+                let status = response.status();
                 warn!(
                     "HTTP logging batch failed with status {} (attempt {}/{})",
-                    response.status(),
-                    attempt,
-                    total_attempts,
+                    status, attempt, total_attempts,
                 );
+                // 4xx is a client error — retrying a malformed/unauthorized
+                // payload just delays the drop. Bail immediately.
+                if status.is_client_error() {
+                    warn!(
+                        "HTTP logging batch discarded due to {} response ({} entries lost)",
+                        status, entry_count,
+                    );
+                    return;
+                }
             }
             Err(e) => {
                 warn!(

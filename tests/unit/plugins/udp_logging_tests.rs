@@ -1,25 +1,35 @@
 //! Tests for udp_logging plugin
 
-use ferrum_edge::plugins::{Plugin, udp_logging::UdpLogging};
+use ferrum_edge::plugins::{Plugin, PluginHttpClient, udp_logging::UdpLogging};
 use serde_json::json;
 
 use super::plugin_utils::create_test_transaction_summary;
 
+fn test_client() -> PluginHttpClient {
+    PluginHttpClient::default()
+}
+
 #[tokio::test]
 async fn test_udp_logging_plugin_creation() {
-    let plugin = UdpLogging::new(&json!({
-        "host": "127.0.0.1",
-        "port": 9514
-    }))
+    let plugin = UdpLogging::new(
+        &json!({
+            "host": "127.0.0.1",
+            "port": 9514
+        }),
+        test_client(),
+    )
     .unwrap();
     assert_eq!(plugin.name(), "udp_logging");
 }
 
 #[tokio::test]
 async fn test_udp_logging_missing_host() {
-    let result = UdpLogging::new(&json!({
-        "port": 9514
-    }));
+    let result = UdpLogging::new(
+        &json!({
+            "port": 9514
+        }),
+        test_client(),
+    );
     match result {
         Err(e) => assert!(e.contains("host"), "Expected error about host, got: {}", e),
         Ok(_) => panic!("Expected Err when creating udp_logging without host"),
@@ -28,9 +38,12 @@ async fn test_udp_logging_missing_host() {
 
 #[tokio::test]
 async fn test_udp_logging_missing_port() {
-    let result = UdpLogging::new(&json!({
-        "host": "127.0.0.1"
-    }));
+    let result = UdpLogging::new(
+        &json!({
+            "host": "127.0.0.1"
+        }),
+        test_client(),
+    );
     match result {
         Err(e) => assert!(e.contains("port"), "Expected error about port, got: {}", e),
         Ok(_) => panic!("Expected Err when creating udp_logging without port"),
@@ -39,19 +52,25 @@ async fn test_udp_logging_missing_port() {
 
 #[tokio::test]
 async fn test_udp_logging_empty_host() {
-    let result = UdpLogging::new(&json!({
-        "host": "",
-        "port": 9514
-    }));
+    let result = UdpLogging::new(
+        &json!({
+            "host": "",
+            "port": 9514
+        }),
+        test_client(),
+    );
     assert!(result.is_err());
 }
 
 #[tokio::test]
 async fn test_udp_logging_invalid_port_zero() {
-    let result = UdpLogging::new(&json!({
-        "host": "127.0.0.1",
-        "port": 0
-    }));
+    let result = UdpLogging::new(
+        &json!({
+            "host": "127.0.0.1",
+            "port": 0
+        }),
+        test_client(),
+    );
     match result {
         Err(e) => assert!(
             e.contains("between 1 and 65535"),
@@ -64,10 +83,13 @@ async fn test_udp_logging_invalid_port_zero() {
 
 #[tokio::test]
 async fn test_udp_logging_invalid_port_too_large() {
-    let result = UdpLogging::new(&json!({
-        "host": "127.0.0.1",
-        "port": 70000
-    }));
+    let result = UdpLogging::new(
+        &json!({
+            "host": "127.0.0.1",
+            "port": 70000
+        }),
+        test_client(),
+    );
     match result {
         Err(e) => assert!(
             e.contains("between 1 and 65535"),
@@ -81,11 +103,14 @@ async fn test_udp_logging_invalid_port_too_large() {
 #[tokio::test]
 async fn test_udp_logging_log_does_not_panic() {
     // When the endpoint is unreachable, log() should still accept entries
-    let plugin = UdpLogging::new(&json!({
-        "host": "127.0.0.1",
-        "port": 1,
-        "max_retries": 0
-    }))
+    let plugin = UdpLogging::new(
+        &json!({
+            "host": "127.0.0.1",
+            "port": 1,
+            "max_retries": 0
+        }),
+        test_client(),
+    )
     .unwrap();
     let summary = create_test_transaction_summary();
 
@@ -95,14 +120,17 @@ async fn test_udp_logging_log_does_not_panic() {
 
 #[tokio::test]
 async fn test_udp_logging_buffer_accepts_multiple_entries() {
-    let plugin = UdpLogging::new(&json!({
-        "host": "127.0.0.1",
-        "port": 1,
-        "batch_size": 50,
-        "flush_interval_ms": 10000,
-        "max_retries": 0,
-        "buffer_capacity": 1000
-    }))
+    let plugin = UdpLogging::new(
+        &json!({
+            "host": "127.0.0.1",
+            "port": 1,
+            "batch_size": 50,
+            "flush_interval_ms": 10000,
+            "max_retries": 0,
+            "buffer_capacity": 1000
+        }),
+        test_client(),
+    )
     .unwrap();
 
     let summary = create_test_transaction_summary();
@@ -114,14 +142,17 @@ async fn test_udp_logging_buffer_accepts_multiple_entries() {
 
 #[tokio::test]
 async fn test_udp_logging_buffer_full_drops_gracefully() {
-    let plugin = UdpLogging::new(&json!({
-        "host": "127.0.0.1",
-        "port": 1,
-        "batch_size": 1000,
-        "flush_interval_ms": 60000,
-        "max_retries": 0,
-        "buffer_capacity": 5
-    }))
+    let plugin = UdpLogging::new(
+        &json!({
+            "host": "127.0.0.1",
+            "port": 1,
+            "batch_size": 1000,
+            "flush_interval_ms": 60000,
+            "max_retries": 0,
+            "buffer_capacity": 5
+        }),
+        test_client(),
+    )
     .unwrap();
 
     let summary = create_test_transaction_summary();
@@ -134,10 +165,13 @@ async fn test_udp_logging_buffer_full_drops_gracefully() {
 
 #[tokio::test]
 async fn test_udp_logging_default_lifecycle_phases() {
-    let plugin = UdpLogging::new(&json!({
-        "host": "127.0.0.1",
-        "port": 9514
-    }))
+    let plugin = UdpLogging::new(
+        &json!({
+            "host": "127.0.0.1",
+            "port": 9514
+        }),
+        test_client(),
+    )
     .unwrap();
 
     let mut ctx = ferrum_edge::plugins::RequestContext::new(
@@ -181,25 +215,31 @@ async fn test_udp_logging_default_lifecycle_phases() {
 
 #[tokio::test]
 async fn test_udp_logging_batch_config_defaults() {
-    let plugin = UdpLogging::new(&json!({
-        "host": "127.0.0.1",
-        "port": 9514
-    }))
+    let plugin = UdpLogging::new(
+        &json!({
+            "host": "127.0.0.1",
+            "port": 9514
+        }),
+        test_client(),
+    )
     .unwrap();
     assert_eq!(plugin.name(), "udp_logging");
 }
 
 #[tokio::test]
 async fn test_udp_logging_custom_batch_config() {
-    let plugin = UdpLogging::new(&json!({
-        "host": "127.0.0.1",
-        "port": 9514,
-        "batch_size": 5,
-        "flush_interval_ms": 2000,
-        "max_retries": 3,
-        "retry_delay_ms": 1000,
-        "buffer_capacity": 50000
-    }))
+    let plugin = UdpLogging::new(
+        &json!({
+            "host": "127.0.0.1",
+            "port": 9514,
+            "batch_size": 5,
+            "flush_interval_ms": 2000,
+            "max_retries": 3,
+            "retry_delay_ms": 1000,
+            "buffer_capacity": 50000
+        }),
+        test_client(),
+    )
     .unwrap();
     assert_eq!(plugin.name(), "udp_logging");
 }
@@ -207,12 +247,15 @@ async fn test_udp_logging_custom_batch_config() {
 #[tokio::test]
 async fn test_udp_logging_dtls_cert_key_pairing_required() {
     // cert without key should fail
-    let result = UdpLogging::new(&json!({
-        "host": "127.0.0.1",
-        "port": 9514,
-        "dtls": true,
-        "dtls_cert_path": "/some/cert.pem"
-    }));
+    let result = UdpLogging::new(
+        &json!({
+            "host": "127.0.0.1",
+            "port": 9514,
+            "dtls": true,
+            "dtls_cert_path": "/some/cert.pem"
+        }),
+        test_client(),
+    );
     match result {
         Err(e) => assert!(
             e.contains("together"),
@@ -223,12 +266,15 @@ async fn test_udp_logging_dtls_cert_key_pairing_required() {
     }
 
     // key without cert should fail
-    let result = UdpLogging::new(&json!({
-        "host": "127.0.0.1",
-        "port": 9514,
-        "dtls": true,
-        "dtls_key_path": "/some/key.pem"
-    }));
+    let result = UdpLogging::new(
+        &json!({
+            "host": "127.0.0.1",
+            "port": 9514,
+            "dtls": true,
+            "dtls_key_path": "/some/key.pem"
+        }),
+        test_client(),
+    );
     match result {
         Err(e) => assert!(
             e.contains("together"),
@@ -242,22 +288,28 @@ async fn test_udp_logging_dtls_cert_key_pairing_required() {
 #[tokio::test]
 async fn test_udp_logging_dtls_config_accepted() {
     // DTLS config without certs (ephemeral cert will be used) should be accepted
-    let plugin = UdpLogging::new(&json!({
-        "host": "127.0.0.1",
-        "port": 9514,
-        "dtls": true,
-        "dtls_no_verify": true
-    }))
+    let plugin = UdpLogging::new(
+        &json!({
+            "host": "127.0.0.1",
+            "port": 9514,
+            "dtls": true,
+            "dtls_no_verify": true
+        }),
+        test_client(),
+    )
     .unwrap();
     assert_eq!(plugin.name(), "udp_logging");
 }
 
 #[tokio::test]
 async fn test_udp_logging_warmup_hostnames() {
-    let plugin = UdpLogging::new(&json!({
-        "host": "syslog.example.com",
-        "port": 9514
-    }))
+    let plugin = UdpLogging::new(
+        &json!({
+            "host": "syslog.example.com",
+            "port": 9514
+        }),
+        test_client(),
+    )
     .unwrap();
     let hostnames = plugin.warmup_hostnames();
     assert_eq!(hostnames, vec!["syslog.example.com".to_string()]);
@@ -265,10 +317,13 @@ async fn test_udp_logging_warmup_hostnames() {
 
 #[tokio::test]
 async fn test_udp_logging_supported_protocols() {
-    let plugin = UdpLogging::new(&json!({
-        "host": "127.0.0.1",
-        "port": 9514
-    }))
+    let plugin = UdpLogging::new(
+        &json!({
+            "host": "127.0.0.1",
+            "port": 9514
+        }),
+        test_client(),
+    )
     .unwrap();
     let protocols = plugin.supported_protocols();
     assert_eq!(protocols.len(), 5); // Http, Grpc, WebSocket, Tcp, Udp

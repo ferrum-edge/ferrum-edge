@@ -403,6 +403,7 @@ fn make_stream_summary() -> StreamTransactionSummary {
         proxy_id: "tcp-proxy-1".to_string(),
         proxy_name: Some("TCP Backend".to_string()),
         client_ip: "10.0.0.1".to_string(),
+        consumer_username: None,
         backend_target: "10.0.0.50:5432".to_string(),
         backend_resolved_ip: Some("10.0.0.50".to_string()),
         protocol: "tcp".to_string(),
