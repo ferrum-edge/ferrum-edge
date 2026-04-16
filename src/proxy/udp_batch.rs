@@ -540,9 +540,13 @@ impl GsoBatchBuf {
             dest_len,
         );
         let sent_count = self.count;
-        self.buf.clear();
-        self.count = 0;
-        self.segment_size = 0;
+        // Only clear on success — on failure, the buffer is preserved so
+        // drain_to_sendmmsg() can replay the datagrams through sendmmsg.
+        if result.is_ok() {
+            self.buf.clear();
+            self.count = 0;
+            self.segment_size = 0;
+        }
         result.map(|_| sent_count)
     }
 
@@ -554,13 +558,16 @@ impl GsoBatchBuf {
         let result =
             crate::socket_opts::send_with_gso_connected(fd, &self.buf, self.segment_size as u16);
         let sent_count = self.count;
-        self.buf.clear();
-        self.count = 0;
-        self.segment_size = 0;
+        // Only clear on success — preserve buffer for drain_to_sendmmsg() on failure.
+        if result.is_ok() {
+            self.buf.clear();
+            self.count = 0;
+            self.segment_size = 0;
+        }
         result.map(|_| sent_count)
     }
 
-    /// Reset the buffer without sending (e.g., on error fallback).
+    /// Reset the buffer without sending.
     pub fn clear(&mut self) {
         self.buf.clear();
         self.count = 0;
@@ -570,8 +577,10 @@ impl GsoBatchBuf {
     /// Drain buffered datagrams into a `SendMmsgBatch` for fallback sending.
     ///
     /// Splits the contiguous GSO buffer back into individual datagrams by
-    /// `segment_size` and pushes each into the sendmmsg batch. Returns the
-    /// number of datagrams drained. Clears the GSO buffer after draining.
+    /// `segment_size` and pushes each into the sendmmsg batch. If the sendmmsg
+    /// batch fills up, the remaining datagrams stay in the GSO buffer (the
+    /// caller should flush the sendmmsg batch and call drain again).
+    /// Returns the number of datagrams drained.
     pub fn drain_to_sendmmsg(
         &mut self,
         send_batch: &mut SendMmsgBatch,
@@ -585,14 +594,21 @@ impl GsoBatchBuf {
         while offset < self.buf.len() {
             let end = (offset + self.segment_size).min(self.buf.len());
             if !send_batch.push(&self.buf[offset..end], dest) {
-                break; // sendmmsg batch full — caller will flush it
+                break; // sendmmsg batch full — remaining stays in GSO buffer
             }
             offset = end;
             drained += 1;
         }
-        self.buf.clear();
-        self.count = 0;
-        self.segment_size = 0;
+        if offset >= self.buf.len() {
+            // All datagrams drained — clear the buffer.
+            self.buf.clear();
+            self.count = 0;
+            self.segment_size = 0;
+        } else {
+            // Partial drain — shift remaining data to the front.
+            self.buf.drain(..offset);
+            self.count -= drained;
+        }
         drained
     }
 }

@@ -1474,7 +1474,7 @@ fn io_uring_splice_direction(
             // This can happen under memlock pressure even though startup
             // probing succeeded.
             tracing::debug!("io_uring ring creation failed, falling back to libc splice");
-            libc_splice_loop(src_fd, pipe_w, pipe_r, dst_fd, timeout_ms)
+            libc_splice_loop(src_fd, pipe_w, pipe_r, dst_fd, timeout_ms, shared_activity)
         }
         Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
             Err(anyhow::anyhow!("TCP idle timeout (io_uring splice)"))
@@ -1493,14 +1493,17 @@ fn libc_splice_loop(
     pipe_r: i32,
     dst_fd: i32,
     timeout_ms: u64,
+    shared_activity: &AtomicU64,
 ) -> Result<u64, anyhow::Error> {
-    let mut last_activity_ms = coarse_now_ms();
     let splice_flags = libc::SPLICE_F_MOVE | libc::SPLICE_F_NONBLOCK;
     let mut total: u64 = 0;
 
     loop {
-        if timeout_ms > 0 && coarse_now_ms().saturating_sub(last_activity_ms) >= timeout_ms {
-            return Err(anyhow::anyhow!("TCP idle timeout (libc splice fallback)"));
+        if timeout_ms > 0 {
+            let last = shared_activity.load(Ordering::Relaxed);
+            if coarse_now_ms().saturating_sub(last) >= timeout_ms {
+                return Err(anyhow::anyhow!("TCP idle timeout (libc splice fallback)"));
+            }
         }
 
         let n = unsafe {
@@ -1530,9 +1533,9 @@ fn libc_splice_loop(
                 if written > 0 {
                     remaining -= written as usize;
                     total += written as u64;
-                    // Refresh idle timeout on activity.
+                    // Refresh shared idle timeout — visible to both directions.
                     if timeout_ms > 0 {
-                        last_activity_ms = coarse_now_ms();
+                        shared_activity.store(coarse_now_ms(), Ordering::Relaxed);
                     }
                 } else if written == 0 {
                     return Ok(total);
