@@ -457,3 +457,63 @@ async fn test_bedrock_computed_total() {
         .await;
     assert_eq!(ctx.metadata.get("ai_total_tokens").unwrap(), "150");
 }
+
+// ─── Response status filtering ────────────────────────────────────────
+
+#[tokio::test]
+async fn test_skips_4xx_responses() {
+    // Error responses (4xx) often have non-LLM body shapes — they must
+    // not be parsed for token counts or pollute observability metrics.
+    let plugin = AiTokenMetrics::new(&json!({})).unwrap();
+    let mut ctx = create_test_context();
+    let headers = json_headers();
+    let body = serde_json::to_vec(&json!({
+        "usage": {"prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30}
+    }))
+    .unwrap();
+
+    plugin
+        .on_response_body(&mut ctx, 401, &headers, &body)
+        .await;
+    assert!(
+        !ctx.metadata.contains_key("ai_total_tokens"),
+        "4xx response must not record token metrics"
+    );
+}
+
+#[tokio::test]
+async fn test_skips_5xx_responses() {
+    let plugin = AiTokenMetrics::new(&json!({})).unwrap();
+    let mut ctx = create_test_context();
+    let headers = json_headers();
+    let body = serde_json::to_vec(&json!({
+        "usage": {"prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30}
+    }))
+    .unwrap();
+
+    plugin
+        .on_response_body(&mut ctx, 503, &headers, &body)
+        .await;
+    assert!(
+        !ctx.metadata.contains_key("ai_total_tokens"),
+        "5xx response must not record token metrics"
+    );
+}
+
+#[tokio::test]
+async fn test_processes_2xx_responses() {
+    // Sanity check that the new filter doesn't accidentally drop happy-path
+    // 2xx responses.
+    let plugin = AiTokenMetrics::new(&json!({})).unwrap();
+    let mut ctx = create_test_context();
+    let headers = json_headers();
+    let body = serde_json::to_vec(&json!({
+        "usage": {"prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30}
+    }))
+    .unwrap();
+
+    plugin
+        .on_response_body(&mut ctx, 200, &headers, &body)
+        .await;
+    assert_eq!(ctx.metadata.get("ai_total_tokens").unwrap(), "30");
+}

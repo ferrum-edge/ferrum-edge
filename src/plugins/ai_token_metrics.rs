@@ -513,10 +513,21 @@ impl Plugin for AiTokenMetrics {
     async fn on_response_body(
         &self,
         ctx: &mut RequestContext,
-        _response_status: u16,
+        response_status: u16,
         response_headers: &HashMap<String, String>,
         body: &[u8],
     ) -> PluginResult {
+        // Only record token usage for successful responses. Error bodies
+        // (4xx / 5xx) are typically not LLM-shaped JSON and should not
+        // pollute token metrics or chargeback accounting.
+        if !(200..300).contains(&response_status) {
+            debug!(
+                "ai_token_metrics: skipping non-2xx response (status {})",
+                response_status
+            );
+            return PluginResult::Continue;
+        }
+
         let content_type = response_headers
             .get("content-type")
             .map(|s| s.as_str())

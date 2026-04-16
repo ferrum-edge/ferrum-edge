@@ -444,3 +444,118 @@ fn test_requires_response_body_buffering() {
     let plugin = make_plugin(config);
     assert!(plugin.requires_response_body_buffering());
 }
+
+#[test]
+fn test_unknown_builtin_pii_pattern_is_fatal() {
+    // Unknown built-in names previously logged a warning and silently
+    // dropped detection coverage. They are now fatal so misconfiguration
+    // cannot quietly disable PII protection.
+    let err = AiResponseGuard::new(&json!({
+        "pii_patterns": ["this_is_not_a_real_pii_type"],
+        "action": "reject"
+    }))
+    .err()
+    .unwrap();
+    assert!(err.contains("unknown built-in PII pattern"), "got: {err}");
+}
+
+// ─── ScanMode::All — structural keys are protected from redaction ─────
+
+fn ipv4_redact_plugin() -> AiResponseGuard {
+    // ip_address pattern is broad and will match strings that look like
+    // dotted quads — including timestamps in the form "2024.01.15.10".
+    AiResponseGuard::new(&json!({
+        "pii_patterns": ["ip_address"],
+        "scan_fields": "all",
+        "action": "redact"
+    }))
+    .unwrap()
+}
+
+#[tokio::test]
+async fn test_all_mode_does_not_redact_structural_keys() {
+    // The previous implementation walked every string in the response and
+    // would happily rewrite values under structural keys like `id`,
+    // `model`, `created`, etc. Verify those are now protected even when
+    // the value matches a PII pattern.
+    let plugin = ipv4_redact_plugin();
+
+    // Body has no recognized AI shape (no "choices", "content",
+    // "candidates"), so the recursive walker is exercised.
+    let body = serde_json::to_vec(&json!({
+        "id": "127.0.0.1",        // looks like an IP — must be preserved
+        "model": "10.20.30.40",   // also IP-shaped — must be preserved
+        "details": "user IP was 192.168.1.99 last seen"
+    }))
+    .unwrap();
+
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+    let mut ctx = super::plugin_utils::create_test_context();
+    ctx.method = "POST".to_string();
+
+    // First trigger detection; then call transform_response_body to apply.
+    let _ = plugin
+        .on_response_body(&mut ctx, 200, &headers, &body)
+        .await;
+    let transformed = plugin
+        .transform_response_body(&body, Some("application/json"), &headers)
+        .await
+        .expect("expected redacted body when match present");
+
+    let v: serde_json::Value = serde_json::from_slice(&transformed).unwrap();
+    assert_eq!(v["id"], "127.0.0.1", "structural id must be preserved");
+    assert_eq!(
+        v["model"], "10.20.30.40",
+        "structural model must be preserved"
+    );
+    assert!(
+        v["details"]
+            .as_str()
+            .unwrap()
+            .contains("[REDACTED:pii:ip_address]"),
+        "non-structural strings should still be redacted: {}",
+        v["details"]
+    );
+}
+
+#[tokio::test]
+async fn test_all_mode_uses_structured_redaction_when_choices_present() {
+    // When the body looks like a recognized AI response (has `choices`),
+    // even ScanMode::All should prefer the structured redactor that only
+    // touches choices[].message.content rather than the recursive walker.
+    let plugin = ipv4_redact_plugin();
+
+    let body = serde_json::to_vec(&json!({
+        "id": "10.0.0.1",
+        "model": "127.0.0.1",
+        "choices": [{
+            "message": {"role": "assistant", "content": "Server lives at 8.8.8.8"}
+        }]
+    }))
+    .unwrap();
+
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+    let mut ctx = super::plugin_utils::create_test_context();
+    ctx.method = "POST".to_string();
+    let _ = plugin
+        .on_response_body(&mut ctx, 200, &headers, &body)
+        .await;
+    let transformed = plugin
+        .transform_response_body(&body, Some("application/json"), &headers)
+        .await
+        .expect("expected transformation when match present");
+
+    let v: serde_json::Value = serde_json::from_slice(&transformed).unwrap();
+    assert_eq!(v["id"], "10.0.0.1");
+    assert_eq!(v["model"], "127.0.0.1");
+    assert!(
+        v["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap()
+            .contains("[REDACTED:pii:ip_address]"),
+        "completion content should be redacted: {}",
+        v["choices"][0]["message"]["content"]
+    );
+}

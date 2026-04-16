@@ -7,12 +7,35 @@
 //! IPv4 addresses, and IBAN. Custom regex patterns can be added via config.
 
 use async_trait::async_trait;
-use regex::Regex;
+use regex::{Regex, RegexSet};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tracing::{debug, warn};
 
+use super::utils::json_escape::escape_json_string;
 use super::{Plugin, PluginResult, RequestContext};
+
+/// JSON object keys that are structural metadata (model names, IDs, roles,
+/// etc.) and must never be redacted, even in `ScanMode::All`. Protects
+/// values that may incidentally match PII regexes.
+const STRUCTURAL_KEYS: &[&str] = &[
+    "model",
+    "id",
+    "object",
+    "role",
+    "type",
+    "created",
+    "stream",
+    "temperature",
+    "top_p",
+    "max_tokens",
+    "max_output_tokens",
+    "max_completion_tokens",
+    "user",
+    "name",
+    "tool_call_id",
+    "function_call",
+];
 
 /// Action to take when PII is detected.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,8 +64,11 @@ struct PiiPattern {
 pub struct AiPromptShield {
     action: ShieldAction,
     patterns: Vec<PiiPattern>,
+    /// All patterns compiled into a single DFA for O(text_len) detection
+    /// regardless of pattern count. Indices align with `patterns`.
+    detection_set: RegexSet,
     scan_mode: ScanMode,
-    exclude_roles: Vec<String>,
+    exclude_roles: HashSet<String>,
     redaction_template: String,
     max_scan_bytes: usize,
     /// True when action is Redact — enables transform_request_body.
@@ -82,7 +108,7 @@ impl AiPromptShield {
             ScanMode::Content
         };
 
-        let exclude_roles: Vec<String> = config["exclude_roles"]
+        let exclude_roles: HashSet<String> = config["exclude_roles"]
             .as_array()
             .map(|arr| {
                 arr.iter()
@@ -117,7 +143,9 @@ impl AiPromptShield {
 
         let mut patterns: Vec<PiiPattern> = Vec::new();
 
-        // Add built-in patterns
+        // Add built-in patterns. Compile failures and unknown names are
+        // fatal so the operator gets a clear error instead of silently
+        // losing PII coverage.
         for name in &pattern_names {
             if let Some(regex_str) = builtin_pattern(name) {
                 match Regex::new(regex_str) {
@@ -126,18 +154,17 @@ impl AiPromptShield {
                         regex,
                     }),
                     Err(e) => {
-                        tracing::warn!(
+                        return Err(format!(
                             "ai_prompt_shield: failed to compile built-in pattern '{}': {}",
-                            name,
-                            e,
-                        );
+                            name, e,
+                        ));
                     }
                 }
             } else {
-                tracing::warn!(
-                    "ai_prompt_shield: unknown built-in pattern '{}', skipping",
+                return Err(format!(
+                    "ai_prompt_shield: unknown built-in pattern '{}'",
                     name,
-                );
+                ));
             }
         }
 
@@ -174,9 +201,22 @@ impl AiPromptShield {
         let needs_body_transform = action == ShieldAction::Redact;
         let requires_request_body = !patterns.is_empty();
 
+        // Build a single combined RegexSet for O(text_len) detection.
+        // Each pattern was already validated above (compiled as a Regex), so
+        // RegexSet construction will not fail for pattern syntax — but we
+        // propagate any error defensively.
+        let detection_set =
+            RegexSet::new(patterns.iter().map(|p| p.regex.as_str())).map_err(|e| {
+                format!(
+                    "ai_prompt_shield: failed to build detection RegexSet: {}",
+                    e
+                )
+            })?;
+
         Ok(Self {
             action,
             patterns,
+            detection_set,
             scan_mode,
             exclude_roles,
             redaction_template,
@@ -198,9 +238,9 @@ impl AiPromptShield {
                 let mut texts = Vec::new();
                 if let Some(messages) = json.get("messages").and_then(|v| v.as_array()) {
                     for msg in messages {
-                        // Skip excluded roles
+                        // Skip excluded roles (O(1) HashSet lookup)
                         if let Some(role) = msg.get("role").and_then(|r| r.as_str())
-                            && self.exclude_roles.iter().any(|r| r == role)
+                            && self.exclude_roles.contains(role)
                         {
                             continue;
                         }
@@ -226,37 +266,50 @@ impl AiPromptShield {
     }
 
     /// Detect PII in the given text segments. Returns names of detected pattern types.
+    /// Uses a single `RegexSet` DFA pass per text fragment, O(text_len)
+    /// regardless of pattern count.
     fn detect_pii(&self, texts: &[&str]) -> Vec<String> {
-        let mut detected = Vec::new();
-        for pattern in &self.patterns {
-            for text in texts {
-                if pattern.regex.is_match(text) {
-                    detected.push(pattern.name.clone());
-                    break; // One match per pattern is enough
-                }
+        if self.patterns.is_empty() {
+            return Vec::new();
+        }
+        let mut hit = vec![false; self.patterns.len()];
+        for text in texts {
+            for idx in self.detection_set.matches(text).into_iter() {
+                hit[idx] = true;
             }
         }
-        detected
+        hit.iter()
+            .enumerate()
+            .filter_map(|(idx, &h)| {
+                if h {
+                    self.patterns.get(idx).map(|p| p.name.clone())
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 
     /// Detect PII in a raw string (for "all" scan mode).
+    /// Single `RegexSet` DFA pass — O(text_len).
     fn detect_pii_in_str(&self, text: &str) -> Vec<String> {
-        let mut detected = Vec::new();
-        for pattern in &self.patterns {
-            if pattern.regex.is_match(text) {
-                detected.push(pattern.name.clone());
-            }
+        if self.patterns.is_empty() {
+            return Vec::new();
         }
-        detected
+        self.detection_set
+            .matches(text)
+            .into_iter()
+            .filter_map(|idx| self.patterns.get(idx).map(|p| p.name.clone()))
+            .collect()
     }
 
     /// Apply redaction to message content fields in the JSON body.
     fn redact_body(&self, json: &mut Value) {
         if let Some(messages) = json.get_mut("messages").and_then(|v| v.as_array_mut()) {
             for msg in messages.iter_mut() {
-                // Skip excluded roles
+                // Skip excluded roles (O(1) HashSet lookup)
                 if let Some(role) = msg.get("role").and_then(|r| r.as_str())
-                    && self.exclude_roles.iter().any(|r| r == role)
+                    && self.exclude_roles.contains(role)
                 {
                     continue;
                 }
@@ -298,14 +351,6 @@ impl AiPromptShield {
         }
         result
     }
-}
-
-/// Escape special characters for safe JSON string interpolation.
-fn escape_json_string(s: &str) -> String {
-    s.replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('<', "\\u003c")
-        .replace('>', "\\u003e")
 }
 
 #[async_trait]
@@ -453,20 +498,25 @@ impl Plugin for AiPromptShield {
         let mut json: Value = serde_json::from_slice(body).ok()?;
 
         if self.scan_mode == ScanMode::All {
-            // For "all" mode, redact within all string values in the JSON
+            // Single DFA pass to short-circuit when no pattern matches.
             let body_str = std::str::from_utf8(body).ok()?;
-            let mut has_pii = false;
-            for pattern in &self.patterns {
-                if pattern.regex.is_match(body_str) {
-                    has_pii = true;
-                    break;
-                }
-            }
-            if !has_pii {
+            if !self.detection_set.is_match(body_str) {
                 return None;
             }
-            // Redact string values throughout the JSON
-            redact_json_strings(&mut json, &self.patterns, &self.redaction_template);
+            // Prefer structured redaction on known prompt-content fields
+            // (messages[].content) — this is the safe path that cannot
+            // corrupt model names, IDs, or system parameters. Only fall
+            // back to a recursive walk when the body does not look like a
+            // recognized chat-completion shape.
+            let has_known_messages = json
+                .get("messages")
+                .and_then(|m| m.as_array())
+                .is_some_and(|arr| !arr.is_empty());
+            if has_known_messages {
+                self.redact_body(&mut json);
+            } else {
+                redact_json_strings(&mut json, &self.patterns, &self.redaction_template);
+            }
             return serde_json::to_vec(&json).ok();
         }
 
@@ -482,7 +532,10 @@ impl Plugin for AiPromptShield {
     }
 }
 
-/// Recursively redact PII in all string values within a JSON Value.
+/// Recursively redact PII in all string values within a JSON Value,
+/// skipping fields with structural keys (model name, IDs, roles, parameters)
+/// that should never be rewritten even when their values incidentally match
+/// a PII regex.
 fn redact_json_strings(value: &mut Value, patterns: &[PiiPattern], template: &str) {
     match value {
         Value::String(s) => {
@@ -504,7 +557,10 @@ fn redact_json_strings(value: &mut Value, patterns: &[PiiPattern], template: &st
             }
         }
         Value::Object(map) => {
-            for val in map.values_mut() {
+            for (k, val) in map.iter_mut() {
+                if STRUCTURAL_KEYS.contains(&k.as_str()) {
+                    continue;
+                }
                 redact_json_strings(val, patterns, template);
             }
         }

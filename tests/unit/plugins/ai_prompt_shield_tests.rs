@@ -502,6 +502,116 @@ async fn test_redaction_preserves_json_structure() {
     assert!(!user_content.contains("123-45-6789"));
 }
 
+// ─── Built-in pattern errors ───────────────────────────────────────────
+
+#[test]
+fn test_unknown_builtin_pattern_is_fatal() {
+    // Unknown built-in names previously logged a warning and silently
+    // dropped detection coverage. They are now fatal so misconfiguration
+    // cannot quietly disable PII protection.
+    let err = AiPromptShield::new(&json!({"patterns": ["this_is_not_real"]}))
+        .err()
+        .unwrap();
+    assert!(err.contains("unknown built-in pattern"), "got: {err}");
+}
+
+// ─── RegexSet single-pass detection ────────────────────────────────────
+
+#[tokio::test]
+async fn test_regex_set_detects_multiple_pattern_types_in_one_pass() {
+    // RegexSet must report ALL matching patterns, not just the first.
+    let plugin = AiPromptShield::new(&json!({
+        "patterns": ["ssn", "email", "credit_card"],
+        "action": "reject"
+    }))
+    .unwrap();
+
+    let mut ctx = make_post_ctx(&ai_request(
+        "ssn 123-45-6789, email a@b.com, card 4111-1111-1111-1111",
+    ));
+    let mut headers = make_post_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    match result {
+        PluginResult::Reject { body, .. } => {
+            let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+            let types = parsed["detected_types"].as_array().unwrap();
+            assert_eq!(types.len(), 3, "got types: {types:?}");
+        }
+        other => panic!("expected Reject, got {:?}", other),
+    }
+}
+
+// ─── ScanMode::All — structural keys are protected ─────────────────────
+
+#[tokio::test]
+async fn test_all_mode_does_not_redact_structural_keys() {
+    let plugin = AiPromptShield::new(&json!({
+        "patterns": ["ip_address"],
+        "scan_fields": "all",
+        "action": "redact"
+    }))
+    .unwrap();
+
+    // No `messages` key → recursive walker is exercised.
+    let body = json!({
+        "model": "10.0.0.1",
+        "user": "192.168.1.1",
+        "notes": "client at 8.8.8.8"
+    });
+    let body_bytes = serde_json::to_vec(&body).unwrap();
+
+    let transformed = plugin
+        .transform_request_body(&body_bytes, Some("application/json"), &HashMap::new())
+        .await
+        .expect("expected redacted body when match present");
+
+    let v: serde_json::Value = serde_json::from_slice(&transformed).unwrap();
+    assert_eq!(v["model"], "10.0.0.1", "structural model preserved");
+    assert_eq!(v["user"], "192.168.1.1", "structural user preserved");
+    assert!(
+        v["notes"]
+            .as_str()
+            .unwrap()
+            .contains("[REDACTED:ip_address]"),
+        "non-structural strings still redacted: {}",
+        v["notes"]
+    );
+}
+
+#[tokio::test]
+async fn test_all_mode_uses_structured_redaction_when_messages_present() {
+    let plugin = AiPromptShield::new(&json!({
+        "patterns": ["ip_address"],
+        "scan_fields": "all",
+        "action": "redact"
+    }))
+    .unwrap();
+
+    let body = json!({
+        "model": "10.0.0.1",
+        "messages": [
+            {"role": "user", "content": "ping 1.2.3.4"}
+        ]
+    });
+    let body_bytes = serde_json::to_vec(&body).unwrap();
+
+    let transformed = plugin
+        .transform_request_body(&body_bytes, Some("application/json"), &HashMap::new())
+        .await
+        .expect("expected redacted body when match present");
+
+    let v: serde_json::Value = serde_json::from_slice(&transformed).unwrap();
+    assert_eq!(v["model"], "10.0.0.1");
+    assert!(
+        v["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("[REDACTED:ip_address]"),
+        "got: {}",
+        v["messages"][0]["content"]
+    );
+}
+
 // ─── Rejection body format ──────────────────────────────────────────────
 
 #[tokio::test]
