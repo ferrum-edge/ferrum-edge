@@ -233,8 +233,6 @@ pub struct UdpListenerConfig {
     pub udp_gro_enabled: bool,
     /// Enable UDP GSO for batched sending.
     pub udp_gso_enabled: bool,
-    /// Enable connected UDP sockets for high-frequency clients.
-    pub udp_connected_sockets_enabled: bool,
 }
 
 /// Start a UDP proxy listener on the given port.
@@ -271,7 +269,6 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
         so_busy_poll_us,
         udp_gro_enabled,
         udp_gso_enabled,
-        udp_connected_sockets_enabled,
     } = cfg;
     // so_busy_poll_us and udp_gro_enabled are used in #[cfg(target_os = "linux")] blocks below.
     #[cfg(not(target_os = "linux"))]
@@ -442,7 +439,6 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                     &crls,
                     sni_proxy_ids.as_deref(),
                     &adaptive_buffer,
-                    udp_connected_sockets_enabled,
                     udp_gso_enabled,
                 )
                 .await;
@@ -508,7 +504,6 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                                                     &crls,
                                                     sni_proxy_ids.as_deref(),
                                                     &adaptive_buffer,
-                                                    udp_connected_sockets_enabled,
                                                     udp_gso_enabled,
                                                 )
                                                 .await;
@@ -551,7 +546,6 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                                         &crls,
                                         sni_proxy_ids.as_deref(),
                                         &adaptive_buffer,
-                                        udp_connected_sockets_enabled,
                                         udp_gso_enabled,
                                     )
                                     .await;
@@ -600,7 +594,6 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                                     &crls,
                                     sni_proxy_ids.as_deref(),
                                     &adaptive_buffer,
-                                    udp_connected_sockets_enabled,
                                     udp_gso_enabled,
                                 )
                                 .await;
@@ -661,7 +654,6 @@ async fn process_datagram(
     crls: &crate::tls::CrlList,
     sni_proxy_ids: Option<&[String]>,
     adaptive_buffer: &Arc<crate::adaptive_buffer::AdaptiveBufferTracker>,
-    udp_connected_sockets_enabled: bool,
     udp_gso_enabled: bool,
 ) -> Result<(), anyhow::Error> {
     // Run per-datagram plugins (e.g., udp_rate_limiting) before session
@@ -712,7 +704,6 @@ async fn process_datagram(
                 data,
                 sni_proxy_ids,
                 adaptive_buffer,
-                udp_connected_sockets_enabled,
                 udp_gso_enabled,
             )
             .await?
@@ -740,7 +731,6 @@ async fn process_datagram(
             data,
             sni_proxy_ids,
             adaptive_buffer,
-            udp_connected_sockets_enabled,
             udp_gso_enabled,
         )
         .await?
@@ -804,7 +794,6 @@ async fn lookup_or_create_session(
     initial_data: &[u8],
     sni_proxy_ids: Option<&[String]>,
     adaptive_buffer: &Arc<crate::adaptive_buffer::AdaptiveBufferTracker>,
-    udp_connected_sockets_enabled: bool,
     udp_gso_enabled: bool,
 ) -> Result<Arc<UdpSession>, anyhow::Error> {
     if let Some(existing) = sessions.get(&client_addr) {
@@ -844,7 +833,6 @@ async fn lookup_or_create_session(
         initial_data,
         sni_proxy_ids,
         adaptive_buffer,
-        udp_connected_sockets_enabled,
         udp_gso_enabled,
     )
     .await
@@ -1646,10 +1634,8 @@ async fn create_session(
     initial_data: &[u8],
     sni_proxy_ids: Option<&[String]>,
     adaptive_buffer: &Arc<crate::adaptive_buffer::AdaptiveBufferTracker>,
-    udp_connected_sockets_enabled: bool,
     udp_gso_enabled: bool,
 ) -> Result<Arc<UdpSession>, anyhow::Error> {
-    let _ = udp_connected_sockets_enabled; // reserved for future connected-socket recv path
     // Check if this proxy uses passthrough mode (extract from config once).
     let is_passthrough = {
         let current = config.load();

@@ -715,10 +715,6 @@ impl ProxyState {
             env_config_arc
                 .udp_gso_enabled
                 .resolve(crate::socket_opts::is_udp_gso_available),
-            env_config_arc.udp_connected_sockets_enabled.resolve(|| {
-                // Connected UDP sockets work on all Linux kernels.
-                cfg!(target_os = "linux")
-            }),
         ));
 
         Ok(Self {

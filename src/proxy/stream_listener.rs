@@ -95,8 +95,6 @@ pub struct StreamListenerManager {
     udp_gro_enabled: bool,
     /// Enable UDP GSO for batched sending.
     udp_gso_enabled: bool,
-    /// Enable connected UDP sockets for high-frequency clients.
-    udp_connected_sockets_enabled: bool,
 }
 
 impl StreamListenerManager {
@@ -128,7 +126,6 @@ impl StreamListenerManager {
         so_busy_poll_us: u32,
         udp_gro_enabled: bool,
         udp_gso_enabled: bool,
-        udp_connected_sockets_enabled: bool,
     ) -> Self {
         Self {
             listeners: tokio::sync::Mutex::new(std::collections::HashMap::new()),
@@ -160,7 +157,6 @@ impl StreamListenerManager {
             so_busy_poll_us,
             udp_gro_enabled,
             udp_gso_enabled,
-            udp_connected_sockets_enabled,
         }
     }
 
@@ -422,7 +418,6 @@ impl StreamListenerManager {
                 let so_busy_poll_us = self.so_busy_poll_us;
                 let udp_gro_enabled = self.udp_gro_enabled;
                 let udp_gso_enabled = self.udp_gso_enabled;
-                let udp_connected_sockets_enabled = self.udp_connected_sockets_enabled;
                 tokio::spawn(async move {
                     if let Err(e) = super::udp_proxy::start_udp_listener(UdpListenerConfig {
                         port: port_val,
@@ -449,7 +444,6 @@ impl StreamListenerManager {
                         so_busy_poll_us,
                         udp_gro_enabled,
                         udp_gso_enabled,
-                        udp_connected_sockets_enabled,
                     })
                     .await
                     {

@@ -842,12 +842,6 @@ pub struct EnvConfig {
     /// exceeds the copy cost. 32 KB is the crossover point from kernel MSG_ZEROCOPY
     /// benchmarks. Default: 32768 (32 KB).
     pub msg_zerocopy_threshold: usize,
-    /// Enable connected UDP frontend sockets for high-frequency clients (Linux only).
-    /// Creates connected UDP sockets per client address to bypass routing table lookup
-    /// on sendto(). Saves 5-10% CPU for concentrated traffic patterns.
-    /// Values: `auto` (enable on Linux), `true` (force on), `false` (force off).
-    /// Default: `auto`.
-    pub udp_connected_sockets_enabled: AutoBool,
 }
 
 impl Default for EnvConfig {
@@ -1038,7 +1032,6 @@ impl Default for EnvConfig {
             so_busy_poll_us: 0,
             msg_zerocopy_enabled: AutoBool::Auto,
             msg_zerocopy_threshold: 32_768,
-            udp_connected_sockets_enabled: AutoBool::Auto,
         }
     }
 }
@@ -1663,11 +1656,6 @@ impl EnvConfig {
                 AutoBool::Auto,
             ),
             msg_zerocopy_threshold: resolve_usize(conf, "FERRUM_MSG_ZEROCOPY_THRESHOLD", 32_768),
-            udp_connected_sockets_enabled: resolve_auto_bool(
-                conf,
-                "FERRUM_UDP_CONNECTED_SOCKETS_ENABLED",
-                AutoBool::Auto,
-            ),
         };
 
         config.validate()?;

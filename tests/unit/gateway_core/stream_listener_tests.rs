@@ -118,7 +118,6 @@ fn create_manager(config: GatewayConfig) -> StreamListenerManager {
         0,      // so_busy_poll_us
         false,  // udp_gro_enabled (use false in tests to avoid Linux-specific failures)
         false,  // udp_gso_enabled
-        false,  // udp_connected_sockets_enabled
     )
 }
 
@@ -193,7 +192,6 @@ async fn test_reconcile_starts_tcp_listener() {
         0,      // so_busy_poll_us
         false,  // udp_gro_enabled (use false in tests to avoid Linux-specific failures)
         false,  // udp_gso_enabled
-        false,  // udp_connected_sockets_enabled
     );
 
     let failures = manager.reconcile().await;
@@ -260,7 +258,6 @@ async fn test_reconcile_starts_udp_listener() {
         0,      // so_busy_poll_us
         false,  // udp_gro_enabled (use false in tests to avoid Linux-specific failures)
         false,  // udp_gso_enabled
-        false,  // udp_connected_sockets_enabled
     );
 
     let failures = manager.reconcile().await;
@@ -339,7 +336,6 @@ async fn test_reconcile_detects_port_conflict() {
         0,      // so_busy_poll_us
         false,  // udp_gro_enabled (use false in tests to avoid Linux-specific failures)
         false,  // udp_gso_enabled
-        false,  // udp_connected_sockets_enabled
     );
 
     let failures = manager.reconcile().await;
@@ -413,7 +409,6 @@ async fn test_reconcile_defers_tcp_without_tls_config() {
         0,      // so_busy_poll_us
         false,  // udp_gro_enabled (use false in tests to avoid Linux-specific failures)
         false,  // udp_gso_enabled
-        false,  // udp_connected_sockets_enabled
     );
 
     let failures = manager.reconcile().await;
@@ -481,7 +476,6 @@ async fn test_reconcile_defers_udp_without_dtls_config() {
         0,      // so_busy_poll_us
         false,  // udp_gro_enabled (use false in tests to avoid Linux-specific failures)
         false,  // udp_gso_enabled
-        false,  // udp_connected_sockets_enabled
     );
 
     let failures = manager.reconcile().await;
@@ -552,7 +546,6 @@ async fn test_shutdown_all_releases_ports() {
         0,      // so_busy_poll_us
         false,  // udp_gro_enabled (use false in tests to avoid Linux-specific failures)
         false,  // udp_gso_enabled
-        false,  // udp_connected_sockets_enabled
     );
 
     let failures = manager.reconcile().await;
@@ -634,7 +627,6 @@ async fn test_wait_until_started_succeeds_for_tcp() {
         0,      // so_busy_poll_us
         false,  // udp_gro_enabled (use false in tests to avoid Linux-specific failures)
         false,  // udp_gso_enabled
-        false,  // udp_connected_sockets_enabled
     );
 
     let failures = manager.reconcile().await;

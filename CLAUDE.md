@@ -1117,7 +1117,6 @@ Reduce per-request allocations in plugin lookup
 | `FERRUM_SO_BUSY_POLL_US` | `0` | SO_BUSY_POLL duration in microseconds for UDP sockets (Linux 3.11+). Reduces receive latency at cost of CPU. `0` = disabled |
 | `FERRUM_MSG_ZEROCOPY_ENABLED` | `auto` | Enable MSG_ZEROCOPY for large TCP stream proxy sends (Linux 4.14+). Avoids data copy for sends above threshold. Values: `auto`/`true`/`false` |
 | `FERRUM_MSG_ZEROCOPY_THRESHOLD` | `32768` | Minimum payload size in bytes to use MSG_ZEROCOPY (32 KB crossover point). Smaller payloads use regular send |
-| `FERRUM_UDP_CONNECTED_SOCKETS_ENABLED` | `auto` | Reserved — connected UDP frontend sockets were removed from the reply path (4-tuple demux steals incoming datagrams). The env var and auto-detection remain for future recv-path integration. Values: `auto`/`true`/`false` |
 
 See `src/config/env_config.rs` for the full list of 90+ environment variables.
 
