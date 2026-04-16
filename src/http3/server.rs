@@ -1268,6 +1268,14 @@ async fn handle_h3_request(
         // Stream response body from backend h3 recv_stream to frontend h3 stream.
         // Uses a pinned Sleep that is reset in-place to avoid allocating a new
         // timer wheel entry on every select! iteration.
+        //
+        // `response_metrics` records bytes sent and client-disconnect-class
+        // errors so the end-of-stream `TransactionSummary` below logs accurate
+        // values. We update the atomics inline (no `Arc` clone needed because
+        // the H3 frontend streams synchronously within this scope) but use
+        // the same `StreamingMetrics` type as the H1/H2 paths so log plugins
+        // see a uniform shape across protocols.
+        let response_metrics = crate::proxy::body::StreamingMetrics::new(backend_start);
         let mut coalesce_buf = BytesMut::with_capacity(H3_COALESCE_MAX_BYTES);
         let mut total_streamed: usize = 0;
         let flush_timer = tokio::time::sleep(H3_FLUSH_INTERVAL);
@@ -1280,6 +1288,7 @@ async fn handle_h3_request(
                     match chunk_result {
                         Ok(Some(chunk)) => {
                             let chunk_bytes = chunk.chunk();
+                            response_metrics.record_bytes_sent(chunk_bytes.len() as u64);
                             if state.max_response_body_size_bytes > 0 {
                                 total_streamed += chunk_bytes.len();
                                 if total_streamed > state.max_response_body_size_bytes {
@@ -1300,11 +1309,19 @@ async fn handle_h3_request(
                             coalesce_buf.extend_from_slice(chunk_bytes);
                             if coalesce_buf.len() >= H3_COALESCE_MIN_BYTES {
                                 let data = coalesce_buf.split().freeze();
-                                stream.send_data(data).await?;
+                                if let Err(e) = stream.send_data(data).await {
+                                    if crate::proxy::is_client_disconnect_error(&e.to_string()) {
+                                        response_metrics.mark_client_disconnected();
+                                    }
+                                    return Err(e.into());
+                                }
                                 flush_timer.as_mut().reset(tokio::time::Instant::now() + H3_FLUSH_INTERVAL);
                             }
                         }
-                        Ok(None) => { stream_done = true; }
+                        Ok(None) => {
+                            response_metrics.mark_completed();
+                            stream_done = true;
+                        }
                         Err(e) => {
                             error!("Error reading backend h3 response during streaming: {}", e);
                             if !coalesce_buf.is_empty() {
@@ -1324,14 +1341,24 @@ async fn handle_h3_request(
                 }
                 _ = &mut flush_timer, if !coalesce_buf.is_empty() && !stream_done => {
                     let data = coalesce_buf.split().freeze();
-                    stream.send_data(data).await?;
+                    if let Err(e) = stream.send_data(data).await {
+                        if crate::proxy::is_client_disconnect_error(&e.to_string()) {
+                            response_metrics.mark_client_disconnected();
+                        }
+                        return Err(e.into());
+                    }
                     flush_timer.as_mut().reset(tokio::time::Instant::now() + H3_FLUSH_INTERVAL);
                 }
             }
             if stream_done {
                 if !coalesce_buf.is_empty() {
                     let data = coalesce_buf.split().freeze();
-                    stream.send_data(data).await?;
+                    if let Err(e) = stream.send_data(data).await {
+                        if crate::proxy::is_client_disconnect_error(&e.to_string()) {
+                            response_metrics.mark_client_disconnected();
+                        }
+                        return Err(e.into());
+                    }
                 }
                 stream.finish().await?;
                 break;
@@ -1359,6 +1386,19 @@ async fn handle_h3_request(
         let gateway_processing_ms = total_ms - backend_total_ms;
         let gateway_overhead_ms = (total_ms - backend_total_ms - plugin_execution_ms).max(0.0);
 
+        // End-of-stream metrics — when the last frame landed before the
+        // client disconnected, `last_frame_elapsed_ms()` is the best proxy
+        // we have for `latency_backend_total_ms`. If completion was not
+        // observed, leave it as -1.0 (unknown) to preserve the existing
+        // log semantics.
+        let response_bytes = response_metrics.bytes_sent();
+        let client_disconnected = response_metrics.client_disconnected();
+        let latency_backend_total_ms = if response_metrics.completed() {
+            response_metrics.last_frame_elapsed_ms().unwrap_or(-1.0)
+        } else {
+            -1.0
+        };
+
         let summary = TransactionSummary {
             namespace: proxy.namespace.clone(),
             timestamp_received: ctx.timestamp_received.to_rfc3339(),
@@ -1374,15 +1414,15 @@ async fn handle_h3_request(
             latency_total_ms: total_ms,
             latency_gateway_processing_ms: gateway_processing_ms,
             latency_backend_ttfb_ms: backend_total_ms,
-            latency_backend_total_ms: -1.0, // Streaming — total unknown at log time
+            latency_backend_total_ms,
             latency_plugin_execution_ms: plugin_execution_ms,
             latency_plugin_external_io_ms: plugin_external_io_ms,
             latency_gateway_overhead_ms: gateway_overhead_ms,
             request_user_agent: proxy_headers.get("user-agent").cloned(),
             request_bytes: 0,
-            response_bytes: 0,
+            response_bytes,
             response_streamed: true,
-            client_disconnected: false,
+            client_disconnected,
             error_class: None,
             mirror: false,
             metadata: ctx.metadata.clone(),
@@ -1477,6 +1517,14 @@ async fn handle_h3_request(
         // ===== STREAMING RESPONSE PATH (buffered request body) =====
         // Response body is streamed, but request body was collected because
         // plugins needed it or it was prebuffered.
+        //
+        // `response_metrics` records bytes sent and client-disconnect-class
+        // errors inside `proxy_to_backend_h3_streaming` so the end-of-stream
+        // `TransactionSummary` below can log accurate values instead of
+        // zeros. Owned locally (not `Arc`) because streaming completes
+        // synchronously within this function scope — no deferred task is
+        // needed on the H3 frontend path.
+        let response_metrics = crate::proxy::body::StreamingMetrics::new(backend_start);
         let client_ip_owned = ctx.client_ip.clone();
         let streaming_result = proxy_to_backend_h3_streaming(
             &state,
@@ -1492,6 +1540,7 @@ async fn handle_h3_request(
             &plugins,
             &mut ctx,
             &mut plugin_execution_ns,
+            &response_metrics,
         )
         .await;
 
@@ -1527,6 +1576,17 @@ async fn handle_h3_request(
         let gateway_processing_ms = total_ms - backend_total_ms;
         let gateway_overhead_ms = (total_ms - backend_total_ms - plugin_execution_ms).max(0.0);
 
+        // Read final streaming metrics recorded by
+        // `proxy_to_backend_h3_streaming`. When the last frame landed before
+        // the client disconnected, `last_frame_elapsed_ms()` is the best
+        // proxy we have for `latency_backend_total_ms`; fall back to the
+        // handler-wide `backend_total_ms` when no frame was observed.
+        let response_bytes = response_metrics.bytes_sent();
+        let client_disconnected = response_metrics.client_disconnected();
+        let latency_backend_total_ms = response_metrics
+            .last_frame_elapsed_ms()
+            .unwrap_or(backend_total_ms);
+
         let summary = TransactionSummary {
             namespace: proxy.namespace.clone(),
             timestamp_received: ctx.timestamp_received.to_rfc3339(),
@@ -1542,15 +1602,15 @@ async fn handle_h3_request(
             latency_total_ms: total_ms,
             latency_gateway_processing_ms: gateway_processing_ms,
             latency_backend_ttfb_ms: backend_ttfb_ms,
-            latency_backend_total_ms: backend_total_ms,
+            latency_backend_total_ms,
             latency_plugin_execution_ms: plugin_execution_ms,
             latency_plugin_external_io_ms: plugin_external_io_ms,
             latency_gateway_overhead_ms: gateway_overhead_ms,
             request_user_agent: proxy_headers.get("user-agent").cloned(),
             request_bytes: 0,
-            response_bytes: 0,
+            response_bytes,
             response_streamed: true,
-            client_disconnected: false,
+            client_disconnected,
             error_class: h3_error_class,
             mirror: false,
             metadata: ctx.metadata.clone(),
@@ -2082,6 +2142,12 @@ fn classify_h3_error(e: &anyhow::Error) -> crate::retry::ErrorClass {
 /// Uses the native h3+quinn connection pool instead of reqwest.
 /// Response headers and `after_proxy` hooks are processed before streaming begins.
 /// The response body is forwarded chunk-by-chunk with coalescing for QUIC efficiency.
+///
+/// `response_metrics` is populated inline with bytes sent, last-frame timing, and
+/// client-disconnect-class send errors so the caller can record accurate values in
+/// the end-of-stream `TransactionSummary`. The caller owns the metrics struct so it
+/// can read the final values after this function returns (no `Arc` clone needed —
+/// streaming completes synchronously within this function's scope).
 #[allow(clippy::too_many_arguments)]
 async fn proxy_to_backend_h3_streaming(
     state: &ProxyState,
@@ -2097,6 +2163,7 @@ async fn proxy_to_backend_h3_streaming(
     plugins: &[Arc<dyn Plugin>],
     ctx: &mut RequestContext,
     plugin_execution_ns: &mut u64,
+    response_metrics: &crate::proxy::body::StreamingMetrics,
 ) -> Result<
     (
         u16,
@@ -2242,6 +2309,7 @@ async fn proxy_to_backend_h3_streaming(
                 match chunk_result {
                     Ok(Some(chunk)) => {
                         let chunk_bytes = chunk.chunk();
+                        response_metrics.record_bytes_sent(chunk_bytes.len() as u64);
                         if state.max_response_body_size_bytes > 0 {
                             total_streamed += chunk_bytes.len();
                             if total_streamed > state.max_response_body_size_bytes {
@@ -2262,11 +2330,17 @@ async fn proxy_to_backend_h3_streaming(
 
                         if coalesce_buf.len() >= H3_COALESCE_MIN_BYTES {
                             let data = coalesce_buf.split().freeze();
-                            h3_stream.send_data(data).await?;
+                            if let Err(e) = h3_stream.send_data(data).await {
+                                if crate::proxy::is_client_disconnect_error(&e.to_string()) {
+                                    response_metrics.mark_client_disconnected();
+                                }
+                                return Err(e.into());
+                            }
                             flush_timer.as_mut().reset(tokio::time::Instant::now() + H3_FLUSH_INTERVAL);
                         }
                     }
                     Ok(None) => {
+                        response_metrics.mark_completed();
                         stream_done = true;
                     }
                     Err(e) => {
@@ -2283,7 +2357,12 @@ async fn proxy_to_backend_h3_streaming(
 
             _ = &mut flush_timer, if !coalesce_buf.is_empty() && !stream_done => {
                 let data = coalesce_buf.split().freeze();
-                h3_stream.send_data(data).await?;
+                if let Err(e) = h3_stream.send_data(data).await {
+                    if crate::proxy::is_client_disconnect_error(&e.to_string()) {
+                        response_metrics.mark_client_disconnected();
+                    }
+                    return Err(e.into());
+                }
                 flush_timer.as_mut().reset(tokio::time::Instant::now() + H3_FLUSH_INTERVAL);
             }
         }
@@ -2291,7 +2370,12 @@ async fn proxy_to_backend_h3_streaming(
         if stream_done {
             if !coalesce_buf.is_empty() {
                 let data = coalesce_buf.split().freeze();
-                h3_stream.send_data(data).await?;
+                if let Err(e) = h3_stream.send_data(data).await {
+                    if crate::proxy::is_client_disconnect_error(&e.to_string()) {
+                        response_metrics.mark_client_disconnected();
+                    }
+                    return Err(e.into());
+                }
             }
             h3_stream.finish().await?;
             break;

@@ -2065,6 +2065,99 @@ pub(crate) fn is_client_disconnect_error(err: &str) -> bool {
         || err.contains("connection closed before")
 }
 
+/// Captures everything needed to fire a deferred `log_with_mirror` once a
+/// streaming response completes (or its `read_timeout + 5s` budget elapses).
+/// Bundled so [`spawn_deferred_streaming_log`] accepts a single `Option` and
+/// the three streaming arms don't have to repeat the same 3-field dance.
+struct DeferredStreamLog {
+    plugins: Arc<Vec<Arc<dyn Plugin>>>,
+    ctx: RequestContext,
+    summary: TransactionSummary,
+}
+
+/// Spawns a background task that waits for the streaming response's completion
+/// budget (`read_timeout + 5s`) to elapse, reads the final values from
+/// [`body::StreamingMetrics`], and — when `deferred_log` is `Some` — fires
+/// `log_with_mirror` with the patched end-of-stream fields.
+///
+/// Callers build one shared `Arc<StreamingMetrics>` at body construction time
+/// and hand it to both the body adapter (via the `metrics` constructor param)
+/// and this helper. The deferred task reads through the atomics after the
+/// response has naturally finished or the budget lapses, so it never blocks
+/// the hot path.
+///
+/// When `deferred_log` is `None`, the task still emits the tracing diagnostics
+/// used by operators with `FERRUM_ENABLE_STREAMING_LATENCY_TRACKING=true`.
+/// This is the single behavior shared by reqwest, HTTP/2-direct, and HTTP/3
+/// streaming paths.
+#[allow(clippy::too_many_arguments)]
+fn spawn_deferred_streaming_log(
+    metrics: Arc<body::StreamingMetrics>,
+    proxy_id: String,
+    backend_url: String,
+    read_timeout_ms: u64,
+    start_time: Instant,
+    deferred_log: Option<DeferredStreamLog>,
+) {
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(read_timeout_ms + 5_000)).await;
+        let completed = metrics.completed();
+        let last_frame_ms = metrics.last_frame_elapsed_ms().unwrap_or(-1.0);
+        let bytes_sent = metrics.bytes_sent();
+        let client_disconnected = metrics.client_disconnected();
+
+        // Tracing diagnostics — preserve the pre-existing behavior for
+        // operators using `FERRUM_ENABLE_STREAMING_LATENCY_TRACKING` without
+        // log plugins, and enrich with the new atomics.
+        if completed {
+            debug!(
+                proxy_id = %proxy_id,
+                backend_url = %backend_url,
+                backend_total_ms = last_frame_ms,
+                response_bytes = bytes_sent,
+                "Streaming response completed"
+            );
+        } else {
+            warn!(
+                proxy_id = %proxy_id,
+                backend_url = %backend_url,
+                backend_last_frame_ms = last_frame_ms,
+                response_bytes = bytes_sent,
+                client_disconnected,
+                "Streaming response incomplete (client disconnect or timeout)"
+            );
+        }
+
+        // Fire the deferred log_with_mirror with accurate post-stream values
+        // if a summary was queued above. Re-derive gateway_processing_ms and
+        // gateway_overhead_ms from the updated totals so per-request
+        // attribution remains accurate after the deferred completion window.
+        if let Some(DeferredStreamLog {
+            plugins,
+            ctx,
+            mut summary,
+        }) = deferred_log
+        {
+            summary.response_bytes = bytes_sent;
+            summary.client_disconnected = client_disconnected;
+            summary.latency_backend_total_ms = if completed { last_frame_ms } else { -1.0 };
+            summary.latency_total_ms = start_time.elapsed().as_secs_f64() * 1000.0;
+            let effective_backend_ms = if summary.latency_backend_total_ms >= 0.0 {
+                summary.latency_backend_total_ms
+            } else {
+                summary.latency_backend_ttfb_ms
+            };
+            summary.latency_gateway_processing_ms = summary.latency_total_ms - effective_backend_ms;
+            summary.latency_gateway_overhead_ms = (summary.latency_total_ms
+                - effective_backend_ms
+                - summary.latency_plugin_execution_ms)
+                .max(0.0);
+
+            crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
+        }
+    });
+}
+
 /// Set TCP keepalive on a stream to detect dead connections.
 fn set_tcp_keepalive(stream: &tokio::net::TcpStream) {
     #[cfg(unix)]
@@ -5129,12 +5222,13 @@ async fn handle_proxy_request_inner(
                 let body = if state.response_buffer_cutoff_bytes == 0
                     && state.max_response_body_size_bytes == 0
                 {
-                    crate::proxy::body::direct_streaming_h2_body(grpc_streaming.body, cl)
+                    crate::proxy::body::direct_streaming_h2_body(grpc_streaming.body, cl, None)
                 } else {
                     crate::proxy::body::coalescing_h2_body(
                         grpc_streaming.body,
                         cl,
                         state.h2_coalesce_target_bytes,
+                        None,
                     )
                 };
 
@@ -5838,17 +5932,16 @@ async fn handle_proxy_request_inner(
 
     // Log phase.
     //
-    // For reqwest-streaming responses with log plugins configured, we defer
-    // `log_with_mirror` into a background task that fires after
-    // `read_timeout + 5s`. The deferred task reads the final `StreamingMetrics`
-    // (bytes sent, completion status, client-disconnect flag, last-frame
-    // elapsed) and patches the summary before calling log plugins — so the
-    // log entry reflects the real end-of-stream state rather than TTFB-only
-    // placeholder values.
+    // For streaming responses (reqwest / H2-direct / H3) with log plugins
+    // configured, we defer `log_with_mirror` into a background task that fires
+    // after `read_timeout + 5s`. The deferred task reads the final
+    // `StreamingMetrics` (bytes sent, completion status, client-disconnect
+    // flag, last-frame elapsed) and patches the summary before calling log
+    // plugins — so the log entry reflects the real end-of-stream state rather
+    // than TTFB-only placeholder values.
     //
-    // Buffered responses and H2/H3 streams (which don't yet use the
-    // StreamingMetrics machinery) continue to log synchronously with
-    // whatever values are known at this point.
+    // Buffered responses continue to log synchronously with whatever values
+    // are known at this point.
     //
     // `response_bytes` for buffered responses is populated from the final
     // body `Bytes` length; streaming summaries start at 0 and are patched
@@ -5887,11 +5980,10 @@ async fn handle_proxy_request_inner(
             metadata: ctx.metadata.clone(),
         };
 
-        // Defer only for reqwest-streaming — StreamingH2 and StreamingH3
-        // do not yet carry `StreamingMetrics` (wired in a follow-up commit),
-        // so fall back to a synchronous TTFB-time log for those variants to
-        // preserve existing observability.
-        if matches!(&response_body, ResponseBody::Streaming(_)) {
+        // All streaming variants (reqwest / H2 / H3) carry `StreamingMetrics`
+        // when tracking is active, so defer logging for any streaming response
+        // and log buffered responses synchronously at TTFB-time.
+        if is_streaming_response {
             Some(summary)
         } else {
             crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
@@ -6033,81 +6125,27 @@ async fn handle_proxy_request_inner(
                 ProxyBody::streaming_tracked(resp, backend_start)
             };
 
-            // Capture everything the deferred task needs. We only clone
-            // `plugins` and `ctx` when there is actually a deferred log to
-            // fire — the operator-opt-in tracing path does not need them.
-            let deferred_proxy_id = proxy.id.clone();
-            let deferred_backend_url = strip_query_params(&backend_url).to_string();
-            let read_timeout_ms = proxy.backend_read_timeout_ms;
-            let deferred_start_time = start_time;
-            let deferred_plugins = if will_defer_log {
-                Some(plugins.clone())
+            // We only clone `plugins` and `ctx` when there is actually a
+            // deferred log to fire — the operator-opt-in tracing path does
+            // not need them.
+            let deferred_log = if will_defer_log {
+                deferred_log_summary.map(|summary| DeferredStreamLog {
+                    plugins: plugins.clone(),
+                    ctx: ctx.clone(),
+                    summary,
+                })
             } else {
                 None
             };
-            let deferred_ctx = if will_defer_log {
-                Some(ctx.clone())
-            } else {
-                None
-            };
-            let mut deferred_summary = deferred_log_summary;
 
-            tokio::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_millis(read_timeout_ms + 5_000)).await;
-                let completed = metrics.completed();
-                let last_frame_ms = metrics.last_frame_elapsed_ms().unwrap_or(-1.0);
-                let bytes_sent = metrics.bytes_sent();
-                let client_disconnected = metrics.client_disconnected();
-
-                // Tracing diagnostics — preserve the pre-existing behavior
-                // for operators using `FERRUM_ENABLE_STREAMING_LATENCY_TRACKING`
-                // without log plugins, and enrich with the new atomics.
-                if completed {
-                    debug!(
-                        proxy_id = %deferred_proxy_id,
-                        backend_url = %deferred_backend_url,
-                        backend_total_ms = last_frame_ms,
-                        response_bytes = bytes_sent,
-                        "Streaming response completed"
-                    );
-                } else {
-                    warn!(
-                        proxy_id = %deferred_proxy_id,
-                        backend_url = %deferred_backend_url,
-                        backend_last_frame_ms = last_frame_ms,
-                        response_bytes = bytes_sent,
-                        client_disconnected,
-                        "Streaming response incomplete (client disconnect or timeout)"
-                    );
-                }
-
-                // Fire the deferred log_with_mirror with accurate
-                // post-stream values if a summary was queued above.
-                if let (Some(mut summary), Some(plugins), Some(ctx)) =
-                    (deferred_summary.take(), deferred_plugins, deferred_ctx)
-                {
-                    summary.response_bytes = bytes_sent;
-                    summary.client_disconnected = client_disconnected;
-                    summary.latency_backend_total_ms = if completed { last_frame_ms } else { -1.0 };
-                    summary.latency_total_ms = deferred_start_time.elapsed().as_secs_f64() * 1000.0;
-                    // Re-derive gateway_processing_ms and gateway_overhead_ms
-                    // from the updated totals so per-request attribution
-                    // remains accurate after the deferred completion window.
-                    let effective_backend_ms = if summary.latency_backend_total_ms >= 0.0 {
-                        summary.latency_backend_total_ms
-                    } else {
-                        summary.latency_backend_ttfb_ms
-                    };
-                    summary.latency_gateway_processing_ms =
-                        summary.latency_total_ms - effective_backend_ms;
-                    summary.latency_gateway_overhead_ms = (summary.latency_total_ms
-                        - effective_backend_ms
-                        - summary.latency_plugin_execution_ms)
-                        .max(0.0);
-
-                    crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
-                }
-            });
+            spawn_deferred_streaming_log(
+                metrics,
+                proxy.id.clone(),
+                strip_query_params(&backend_url).to_string(),
+                proxy.backend_read_timeout_ms,
+                start_time,
+                deferred_log,
+            );
 
             tracked_body
         }
@@ -6132,31 +6170,123 @@ async fn handle_proxy_request_inner(
                 crate::proxy::body::coalescing_body(resp, cl)
             }
         }
-        ResponseBody::StreamingH2(resp) => {
+        ResponseBody::StreamingH2(resp)
+            if will_defer_log || state.env_config.enable_streaming_latency_tracking =>
+        {
             let cl = response_headers
                 .get("content-length")
                 .and_then(|v| v.parse::<u64>().ok());
-            if state.response_buffer_cutoff_bytes == 0 && state.max_response_body_size_bytes == 0 {
-                crate::proxy::body::direct_streaming_h2_body(resp.into_body(), cl)
+            let metrics = Arc::new(body::StreamingMetrics::new(backend_start));
+            let tracked_body = if state.response_buffer_cutoff_bytes == 0
+                && state.max_response_body_size_bytes == 0
+            {
+                crate::proxy::body::direct_streaming_h2_body(
+                    resp.into_body(),
+                    cl,
+                    Some(metrics.clone()),
+                )
             } else {
                 crate::proxy::body::coalescing_h2_body(
                     resp.into_body(),
                     cl,
                     state.h2_coalesce_target_bytes,
+                    Some(metrics.clone()),
+                )
+            };
+
+            let deferred_log = if will_defer_log {
+                deferred_log_summary.map(|summary| DeferredStreamLog {
+                    plugins: plugins.clone(),
+                    ctx: ctx.clone(),
+                    summary,
+                })
+            } else {
+                None
+            };
+
+            spawn_deferred_streaming_log(
+                metrics,
+                proxy.id.clone(),
+                strip_query_params(&backend_url).to_string(),
+                proxy.backend_read_timeout_ms,
+                start_time,
+                deferred_log,
+            );
+
+            tracked_body
+        }
+        ResponseBody::StreamingH2(resp) => {
+            let cl = response_headers
+                .get("content-length")
+                .and_then(|v| v.parse::<u64>().ok());
+            if state.response_buffer_cutoff_bytes == 0 && state.max_response_body_size_bytes == 0 {
+                crate::proxy::body::direct_streaming_h2_body(resp.into_body(), cl, None)
+            } else {
+                crate::proxy::body::coalescing_h2_body(
+                    resp.into_body(),
+                    cl,
+                    state.h2_coalesce_target_bytes,
+                    None,
                 )
             }
+        }
+        ResponseBody::StreamingH3(h3_resp)
+            if will_defer_log || state.env_config.enable_streaming_latency_tracking =>
+        {
+            let cl = response_headers
+                .get("content-length")
+                .and_then(|v| v.parse::<u64>().ok());
+            let metrics = Arc::new(body::StreamingMetrics::new(backend_start));
+            let tracked_body = if state.response_buffer_cutoff_bytes == 0
+                && state.max_response_body_size_bytes == 0
+            {
+                crate::proxy::body::direct_streaming_h3_body(
+                    h3_resp.recv_stream,
+                    cl,
+                    Some(metrics.clone()),
+                )
+            } else {
+                crate::proxy::body::coalescing_h3_body(
+                    h3_resp.recv_stream,
+                    cl,
+                    state.h2_coalesce_target_bytes,
+                    Some(metrics.clone()),
+                )
+            };
+
+            let deferred_log = if will_defer_log {
+                deferred_log_summary.map(|summary| DeferredStreamLog {
+                    plugins: plugins.clone(),
+                    ctx: ctx.clone(),
+                    summary,
+                })
+            } else {
+                None
+            };
+
+            spawn_deferred_streaming_log(
+                metrics,
+                proxy.id.clone(),
+                strip_query_params(&backend_url).to_string(),
+                proxy.backend_read_timeout_ms,
+                start_time,
+                deferred_log,
+            );
+
+            tracked_body
         }
         ResponseBody::StreamingH3(h3_resp) => {
             let cl = response_headers
                 .get("content-length")
                 .and_then(|v| v.parse::<u64>().ok());
             if state.response_buffer_cutoff_bytes == 0 && state.max_response_body_size_bytes == 0 {
-                crate::proxy::body::direct_streaming_h3_body(h3_resp.recv_stream, cl)
+                crate::proxy::body::direct_streaming_h3_body(h3_resp.recv_stream, cl, None)
             } else {
                 crate::proxy::body::coalescing_h3_body(
                     h3_resp.recv_stream,
                     cl,
                     state.h2_coalesce_target_bytes,
+                    None,
                 )
             }
         }

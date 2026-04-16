@@ -114,6 +114,27 @@ impl StreamingMetrics {
     pub fn client_disconnected(&self) -> bool {
         self.client_disconnected.load(Ordering::Acquire)
     }
+
+    /// Record that `n` bytes were forwarded to the client and update the
+    /// last-frame timestamp. Used by synchronous streaming loops (H3 frontend)
+    /// that write bytes directly to the transport rather than yielding
+    /// `http_body::Frame` values. One `fetch_add` + one `store` per call.
+    pub fn record_bytes_sent(&self, n: u64) {
+        self.bytes_sent.fetch_add(n, Ordering::Relaxed);
+        let elapsed = self.baseline.elapsed().as_nanos() as u64;
+        self.last_frame_nanos.store(elapsed, Ordering::Release);
+    }
+
+    /// Mark the stream as completed (all frames forwarded). Idempotent.
+    pub fn mark_completed(&self) {
+        self.completed.store(true, Ordering::Release);
+    }
+
+    /// Mark the stream as terminated by a client-disconnect-class error
+    /// (broken pipe, connection reset, early EOF, etc.). Idempotent.
+    pub fn mark_client_disconnected(&self) {
+        self.client_disconnected.store(true, Ordering::Release);
+    }
 }
 
 /// A streaming body wrapper that records completion timing via a shared
@@ -787,6 +808,12 @@ pub(crate) struct CoalescingH2Body {
     content_length: Option<u64>,
     /// Coalesce target in bytes. Configurable via `FERRUM_H2_COALESCE_TARGET_BYTES`.
     coalesce_target: usize,
+    /// Optional streaming metrics shared with a deferred log task. When
+    /// present, the adapter records `bytes_sent` once per inner `Ok(frame)`
+    /// with data (never on buffer drain), `last_frame_nanos`/`completed`
+    /// on inner end-of-stream, and `client_disconnected` on errors
+    /// classified as client-disconnect-class.
+    metrics: Option<Arc<StreamingMetrics>>,
 }
 
 /// Wraps a hyper `Incoming` body into a coalescing adapter.
@@ -794,10 +821,13 @@ pub(crate) struct CoalescingH2Body {
 /// `content_length` should be the value of the backend's Content-Length header
 /// (if present) so the adapter can propagate an exact size hint.
 /// `coalesce_target` is the minimum chunk size before yielding (from env config).
+/// `metrics` is `Some` when the caller will defer the log via a background
+/// task that reads the shared atomics after `read_timeout + buffer`.
 pub(crate) fn coalescing_h2_body(
     body: Incoming,
     content_length: Option<u64>,
     coalesce_target: usize,
+    metrics: Option<Arc<StreamingMetrics>>,
 ) -> ProxyBody {
     use http_body_util::BodyExt;
 
@@ -809,6 +839,7 @@ pub(crate) fn coalescing_h2_body(
         stashed_error: None,
         content_length,
         coalesce_target,
+        metrics,
     };
     let mapped = coalescing.map_err(|e| Box::new(e) as ProxyBodyError);
     ProxyBody::streaming(Box::pin(mapped))
@@ -818,12 +849,19 @@ pub(crate) fn coalescing_h2_body(
 ///
 /// Skips the `CoalescingH2Body` buffering adapter for zero-overhead passthrough.
 /// Use when no plugins require response body buffering and no size limits apply.
-pub(crate) fn direct_streaming_h2_body(body: Incoming, content_length: Option<u64>) -> ProxyBody {
+/// `metrics` is `Some` when the caller will defer the log via a background
+/// task that reads the shared atomics after `read_timeout + buffer`.
+pub(crate) fn direct_streaming_h2_body(
+    body: Incoming,
+    content_length: Option<u64>,
+    metrics: Option<Arc<StreamingMetrics>>,
+) -> ProxyBody {
     use http_body_util::BodyExt;
 
     let direct = DirectH2Body {
         inner: body,
         content_length,
+        metrics,
     };
     let mapped = direct.map_err(|e| Box::new(e) as ProxyBodyError);
     ProxyBody::streaming(Box::pin(mapped))
@@ -835,6 +873,11 @@ pub(crate) fn direct_streaming_h2_body(body: Incoming, content_length: Option<u6
 struct DirectH2Body {
     inner: Incoming,
     content_length: Option<u64>,
+    /// Optional streaming metrics shared with a deferred log task. When
+    /// present, the adapter records `bytes_sent` per DATA frame,
+    /// `last_frame_nanos`/`completed` on end-of-stream, and
+    /// `client_disconnected` on errors classified as client-disconnect-class.
+    metrics: Option<Arc<StreamingMetrics>>,
 }
 
 impl http_body::Body for DirectH2Body {
@@ -845,7 +888,36 @@ impl http_body::Body for DirectH2Body {
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-        Pin::new(&mut self.get_mut().inner).poll_frame(cx)
+        let this = self.get_mut();
+        match Pin::new(&mut this.inner).poll_frame(cx) {
+            Poll::Ready(None) => {
+                if let Some(m) = this.metrics.as_ref() {
+                    let elapsed = m.baseline.elapsed().as_nanos() as u64;
+                    m.last_frame_nanos.store(elapsed, Ordering::Release);
+                    m.completed.store(true, Ordering::Release);
+                }
+                Poll::Ready(None)
+            }
+            Poll::Ready(Some(Ok(frame))) => {
+                if let Some(m) = this.metrics.as_ref() {
+                    let elapsed = m.baseline.elapsed().as_nanos() as u64;
+                    m.last_frame_nanos.store(elapsed, Ordering::Release);
+                    if let Some(data) = frame.data_ref() {
+                        m.bytes_sent.fetch_add(data.len() as u64, Ordering::Relaxed);
+                    }
+                }
+                Poll::Ready(Some(Ok(frame)))
+            }
+            Poll::Ready(Some(Err(e))) => {
+                if let Some(m) = this.metrics.as_ref()
+                    && super::is_client_disconnect_error(&e.to_string())
+                {
+                    m.client_disconnected.store(true, Ordering::Release);
+                }
+                Poll::Ready(Some(Err(e)))
+            }
+            Poll::Pending => Poll::Pending,
+        }
     }
 
     fn is_end_stream(&self) -> bool {
@@ -886,6 +958,13 @@ impl http_body::Body for CoalescingH2Body {
             if let Some(err) = this.stashed_error.take() {
                 return Poll::Ready(Some(Err(err)));
             }
+            // Final end-of-stream — record completion timestamp for the
+            // deferred log task if metrics are attached.
+            if let Some(m) = this.metrics.as_ref() {
+                let elapsed = m.baseline.elapsed().as_nanos() as u64;
+                m.last_frame_nanos.store(elapsed, Ordering::Release);
+                m.completed.store(true, Ordering::Release);
+            }
             return Poll::Ready(None);
         }
 
@@ -893,6 +972,16 @@ impl http_body::Body for CoalescingH2Body {
             match Pin::new(&mut this.inner).poll_frame(cx) {
                 Poll::Ready(Some(Ok(frame))) => {
                     if let Some(data) = frame.data_ref() {
+                        // Count bytes ONCE per inner data frame, here at receipt
+                        // from the backend — never on buffer drain. This avoids
+                        // double-counting when a buffered chunk is later yielded
+                        // on flush (Pending/None/Err). The buffered chunk's
+                        // bytes were already counted when received.
+                        if let Some(m) = this.metrics.as_ref() {
+                            m.bytes_sent.fetch_add(data.len() as u64, Ordering::Relaxed);
+                            let elapsed = m.baseline.elapsed().as_nanos() as u64;
+                            m.last_frame_nanos.store(elapsed, Ordering::Release);
+                        }
                         if this.buffer.is_empty() && data.len() >= this.coalesce_target {
                             // Fast path: chunk is already large enough, pass through
                             // without copying into the buffer.
@@ -908,9 +997,15 @@ impl http_body::Body for CoalescingH2Body {
                         // Buffer not full yet — continue polling for more
                         continue;
                     }
-                    // Non-data frame (trailers). If buffer has unflushed data,
-                    // stash the trailer and flush the buffer first. The stashed
-                    // trailer is returned on the next poll_frame call.
+                    // Non-data frame (trailers). Touch last-frame timestamp but
+                    // do NOT count bytes (trailers carry no payload).
+                    if let Some(m) = this.metrics.as_ref() {
+                        let elapsed = m.baseline.elapsed().as_nanos() as u64;
+                        m.last_frame_nanos.store(elapsed, Ordering::Release);
+                    }
+                    // If buffer has unflushed data, stash the trailer and flush
+                    // the buffer first. The stashed trailer is returned on the
+                    // next poll_frame call.
                     if !this.buffer.is_empty() {
                         // Convert the frame to our output type (Bytes) for stashing.
                         // Trailers don't carry data, so this is just the trailer map.
@@ -924,6 +1019,14 @@ impl http_body::Body for CoalescingH2Body {
                 }
                 Poll::Ready(Some(Err(e))) => {
                     this.done = true;
+                    // Classify the error: client-disconnect-class errors set a
+                    // dedicated flag so the deferred log task can distinguish
+                    // "client bailed" from "backend timeout" in the summary.
+                    if let Some(m) = this.metrics.as_ref()
+                        && super::is_client_disconnect_error(&e.to_string())
+                    {
+                        m.client_disconnected.store(true, Ordering::Release);
+                    }
                     // Flush any buffered data before surfacing the error so
                     // already-received bytes aren't silently dropped. The
                     // error is stashed and returned on the next poll_frame()
@@ -936,6 +1039,15 @@ impl http_body::Body for CoalescingH2Body {
                 }
                 Poll::Ready(None) => {
                     this.done = true;
+                    // Record completion once the inner stream ends cleanly.
+                    // This may be followed by a buffer-flush poll; the second
+                    // invocation (done=true, buffer empty, no stashed err)
+                    // will re-record, which is idempotent for these atomics.
+                    if let Some(m) = this.metrics.as_ref() {
+                        let elapsed = m.baseline.elapsed().as_nanos() as u64;
+                        m.last_frame_nanos.store(elapsed, Ordering::Release);
+                        m.completed.store(true, Ordering::Release);
+                    }
                     if !this.buffer.is_empty() {
                         return Poll::Ready(Some(Ok(Frame::data(this.buffer.split().freeze()))));
                     }
@@ -987,16 +1099,25 @@ pub(crate) struct CoalescingH3Body {
     stashed_error: Option<ProxyBodyError>,
     content_length: Option<u64>,
     coalesce_target: usize,
+    /// Optional streaming metrics shared with a deferred log task. When
+    /// present, the adapter records `bytes_sent` once per inner `Ok(Some)`
+    /// chunk (never on buffer drain), `last_frame_nanos`/`completed` on
+    /// inner end-of-stream, and `client_disconnected` on errors classified
+    /// as client-disconnect-class.
+    metrics: Option<Arc<StreamingMetrics>>,
 }
 
 /// Wraps an h3 `RequestStream` into a coalescing streaming body.
 ///
 /// `content_length` should be the value of the backend's Content-Length header
 /// (if present) so the adapter can propagate an exact size hint.
+/// `metrics` is `Some` when the caller will defer the log via a background
+/// task that reads the shared atomics after `read_timeout + buffer`.
 pub(crate) fn coalescing_h3_body(
     recv_stream: crate::http3::client::H3RequestStream,
     content_length: Option<u64>,
     coalesce_target: usize,
+    metrics: Option<Arc<StreamingMetrics>>,
 ) -> ProxyBody {
     let body = CoalescingH3Body {
         recv_stream,
@@ -1005,18 +1126,24 @@ pub(crate) fn coalescing_h3_body(
         stashed_error: None,
         content_length,
         coalesce_target,
+        metrics,
     };
     ProxyBody::streaming(Box::pin(body))
 }
 
 /// Wraps an h3 `RequestStream` into a direct streaming body without coalescing.
+///
+/// `metrics` is `Some` when the caller will defer the log via a background
+/// task that reads the shared atomics after `read_timeout + buffer`.
 pub(crate) fn direct_streaming_h3_body(
     recv_stream: crate::http3::client::H3RequestStream,
     content_length: Option<u64>,
+    metrics: Option<Arc<StreamingMetrics>>,
 ) -> ProxyBody {
     let body = DirectH3Body {
         recv_stream,
         content_length,
+        metrics,
     };
     ProxyBody::streaming(Box::pin(body))
 }
@@ -1026,6 +1153,11 @@ pub(crate) fn direct_streaming_h3_body(
 struct DirectH3Body {
     recv_stream: crate::http3::client::H3RequestStream,
     content_length: Option<u64>,
+    /// Optional streaming metrics shared with a deferred log task. When
+    /// present, the adapter records `bytes_sent` per DATA chunk,
+    /// `last_frame_nanos`/`completed` on end-of-stream, and
+    /// `client_disconnected` on errors classified as client-disconnect-class.
+    metrics: Option<Arc<StreamingMetrics>>,
 }
 
 impl http_body::Body for DirectH3Body {
@@ -1038,14 +1170,40 @@ impl http_body::Body for DirectH3Body {
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         use bytes::Buf;
         let this = self.get_mut();
-        let mut fut = std::pin::pin!(this.recv_stream.recv_data());
-        match fut.as_mut().poll(cx) {
+        // Poll the recv_data future within a scope so the &mut borrow on
+        // recv_stream ends before we touch this.metrics (field-splitting is
+        // fine in principle, but scoping the future makes intent explicit
+        // and avoids any self-referential borrow surprises).
+        let outcome = {
+            let mut fut = std::pin::pin!(this.recv_stream.recv_data());
+            fut.as_mut().poll(cx)
+        };
+        match outcome {
             Poll::Ready(Ok(Some(mut buf))) => {
                 let data = buf.copy_to_bytes(buf.remaining());
+                if let Some(m) = this.metrics.as_ref() {
+                    m.bytes_sent.fetch_add(data.len() as u64, Ordering::Relaxed);
+                    let elapsed = m.baseline.elapsed().as_nanos() as u64;
+                    m.last_frame_nanos.store(elapsed, Ordering::Release);
+                }
                 Poll::Ready(Some(Ok(Frame::data(data))))
             }
-            Poll::Ready(Ok(None)) => Poll::Ready(None),
-            Poll::Ready(Err(e)) => Poll::Ready(Some(Err(Box::new(e) as ProxyBodyError))),
+            Poll::Ready(Ok(None)) => {
+                if let Some(m) = this.metrics.as_ref() {
+                    let elapsed = m.baseline.elapsed().as_nanos() as u64;
+                    m.last_frame_nanos.store(elapsed, Ordering::Release);
+                    m.completed.store(true, Ordering::Release);
+                }
+                Poll::Ready(None)
+            }
+            Poll::Ready(Err(e)) => {
+                if let Some(m) = this.metrics.as_ref()
+                    && super::is_client_disconnect_error(&e.to_string())
+                {
+                    m.client_disconnected.store(true, Ordering::Release);
+                }
+                Poll::Ready(Some(Err(Box::new(e) as ProxyBodyError)))
+            }
             Poll::Pending => Poll::Pending,
         }
     }
@@ -1083,14 +1241,35 @@ impl http_body::Body for CoalescingH3Body {
             if let Some(err) = this.stashed_error.take() {
                 return Poll::Ready(Some(Err(err)));
             }
+            // Final end-of-stream — record completion timestamp for the
+            // deferred log task if metrics are attached.
+            if let Some(m) = this.metrics.as_ref() {
+                let elapsed = m.baseline.elapsed().as_nanos() as u64;
+                m.last_frame_nanos.store(elapsed, Ordering::Release);
+                m.completed.store(true, Ordering::Release);
+            }
             return Poll::Ready(None);
         }
 
         loop {
-            let mut fut = std::pin::pin!(this.recv_stream.recv_data());
-            match fut.as_mut().poll(cx) {
+            // Poll the recv_data future within a scope so the &mut borrow on
+            // recv_stream ends before we touch this.metrics on inner outcomes.
+            let outcome = {
+                let mut fut = std::pin::pin!(this.recv_stream.recv_data());
+                fut.as_mut().poll(cx)
+            };
+            match outcome {
                 Poll::Ready(Ok(Some(mut buf))) => {
                     let len = buf.remaining();
+                    // Count bytes ONCE per inner chunk, here at receipt from
+                    // the backend — never on buffer drain. This avoids
+                    // double-counting when a buffered chunk is later yielded
+                    // on flush (Pending/None/Err).
+                    if let Some(m) = this.metrics.as_ref() {
+                        m.bytes_sent.fetch_add(len as u64, Ordering::Relaxed);
+                        let elapsed = m.baseline.elapsed().as_nanos() as u64;
+                        m.last_frame_nanos.store(elapsed, Ordering::Release);
+                    }
                     if this.buffer.is_empty() && len >= this.coalesce_target {
                         // Fast path: chunk already large enough — zero-copy passthrough.
                         let data = buf.copy_to_bytes(len);
@@ -1111,6 +1290,13 @@ impl http_body::Body for CoalescingH3Body {
                 }
                 Poll::Ready(Ok(None)) => {
                     this.done = true;
+                    // Record completion; a subsequent buffer-flush poll will
+                    // re-record (idempotent for these atomics).
+                    if let Some(m) = this.metrics.as_ref() {
+                        let elapsed = m.baseline.elapsed().as_nanos() as u64;
+                        m.last_frame_nanos.store(elapsed, Ordering::Release);
+                        m.completed.store(true, Ordering::Release);
+                    }
                     if !this.buffer.is_empty() {
                         return Poll::Ready(Some(Ok(Frame::data(this.buffer.split().freeze()))));
                     }
@@ -1118,6 +1304,13 @@ impl http_body::Body for CoalescingH3Body {
                 }
                 Poll::Ready(Err(e)) => {
                     this.done = true;
+                    // Classify the error so the deferred log task can
+                    // distinguish client disconnect from backend failure.
+                    if let Some(m) = this.metrics.as_ref()
+                        && super::is_client_disconnect_error(&e.to_string())
+                    {
+                        m.client_disconnected.store(true, Ordering::Release);
+                    }
                     // Flush any buffered data before surfacing the error so
                     // already-received bytes aren't silently dropped. The
                     // error is stashed and returned on the next poll_frame()
