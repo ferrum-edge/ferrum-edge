@@ -267,16 +267,25 @@ impl AiSemanticCache {
             self.total_size.fetch_sub(removed_size, Ordering::Relaxed);
         }
 
-        // Enforce max entries by removing oldest
+        // Enforce max entries by removing oldest. Use partial-select
+        // (`select_nth_unstable_by_key`, average O(n)) instead of a full
+        // sort (O(n log n)) — we only need to identify the k oldest, not
+        // sort the entire cache.
         if self.cache.len() > self.max_entries {
             let mut entries_with_time: Vec<(String, Instant)> = self
                 .cache
                 .iter()
                 .map(|entry| (entry.key().clone(), entry.value().inserted_at))
                 .collect();
-            entries_with_time.sort_by_key(|(_, t)| *t);
 
             let to_remove = self.cache.len().saturating_sub(self.max_entries);
+            if to_remove > 0 && to_remove < entries_with_time.len() {
+                // After this call, indices [0..to_remove) hold the
+                // `to_remove` oldest entries (in unspecified order among
+                // themselves), which is all we need for eviction.
+                entries_with_time.select_nth_unstable_by_key(to_remove - 1, |(_, t)| *t);
+            }
+
             for (key, _) in entries_with_time.into_iter().take(to_remove) {
                 if let Some((_, removed)) = self.cache.remove(&key) {
                     self.total_size
@@ -288,18 +297,22 @@ impl AiSemanticCache {
 }
 
 /// Normalize text: lowercase, collapse whitespace to single spaces, trim.
+///
+/// Single-pass: previously called `to_ascii_lowercase()` first (one extra
+/// allocation) then iterated chars to collapse whitespace. The lowercase
+/// step is now folded into the iteration so the function does one pass and
+/// one allocation instead of two.
 fn normalize_text(text: &str) -> String {
-    let lowered = text.to_ascii_lowercase();
-    let mut result = String::with_capacity(lowered.len());
+    let mut result = String::with_capacity(text.len());
     let mut prev_was_space = true; // trim leading
-    for ch in lowered.chars() {
+    for ch in text.chars() {
         if ch.is_whitespace() {
             if !prev_was_space {
                 result.push(' ');
                 prev_was_space = true;
             }
         } else {
-            result.push(ch);
+            result.push(ch.to_ascii_lowercase());
             prev_was_space = false;
         }
     }
@@ -547,5 +560,92 @@ impl Plugin for AiSemanticCache {
 
     fn tracked_keys_count(&self) -> Option<usize> {
         Some(self.cache.len())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Inline tests that need access to private fields (the cache map and
+    //! the gated `cleanup_expired` helper).
+    use super::*;
+    use crate::plugins::PluginHttpClient;
+    use serde_json::json;
+
+    /// Insert a synthetic cache entry directly so tests can populate the
+    /// cache without driving the full request/response lifecycle.
+    fn insert_synthetic(plugin: &AiSemanticCache, key: &str, inserted_at: Instant) {
+        let entry = CacheEntry {
+            status_code: 200,
+            body: Bytes::from_static(b"\x00\x00\x00\x00\x00\x00\x00\x00"),
+            headers: HashMap::new(),
+            inserted_at,
+            approx_size: 8,
+        };
+        plugin
+            .total_size
+            .fetch_add(entry.approx_size, Ordering::Relaxed);
+        plugin.cache.insert(key.to_string(), entry);
+    }
+
+    /// Force cleanup to run regardless of the 30-second cooldown gate by
+    /// resetting the gate before the call.
+    fn force_cleanup(plugin: &AiSemanticCache) {
+        plugin.last_cleanup.store(0, Ordering::Relaxed);
+        plugin.cleanup_expired();
+    }
+
+    #[test]
+    fn eviction_keeps_newest_when_max_entries_exceeded() {
+        // Verifies the partial-select eviction (`select_nth_unstable_by_key`)
+        // preserves oldest-first semantics: when the cache exceeds
+        // `max_entries`, the oldest are evicted and the newest are kept.
+        let plugin = AiSemanticCache::new(
+            &json!({"ttl_seconds": 600, "max_entries": 3}),
+            PluginHttpClient::default(),
+        )
+        .unwrap();
+
+        let now = Instant::now();
+        // Insert oldest → newest. Use 100ms spacing so ordering is well-defined
+        // without needing real wall-clock waits.
+        for (i, name) in ["a", "b", "c", "d", "e"].iter().enumerate() {
+            let ts = now - Duration::from_millis(500 - (i as u64) * 100);
+            insert_synthetic(&plugin, name, ts);
+        }
+        assert_eq!(plugin.cache.len(), 5);
+
+        force_cleanup(&plugin);
+
+        assert!(
+            plugin.cache.len() <= 3,
+            "max_entries=3 must be honored after eviction (got {})",
+            plugin.cache.len()
+        );
+        // The two oldest entries ('a' and 'b') must be evicted.
+        assert!(
+            !plugin.cache.contains_key("a"),
+            "oldest 'a' must be evicted"
+        );
+        assert!(
+            !plugin.cache.contains_key("b"),
+            "second-oldest 'b' must be evicted"
+        );
+        // The newest entries must survive.
+        assert!(
+            plugin.cache.contains_key("e"),
+            "newest 'e' must be retained"
+        );
+    }
+
+    #[test]
+    fn normalize_text_collapses_whitespace_and_lowercases() {
+        // Sanity-check the optimized single-pass normalize_text.
+        assert_eq!(normalize_text("  Hello   World  "), "hello world");
+        assert_eq!(
+            normalize_text("MULTIPLE\nLINES\tof\rtext"),
+            "multiple lines of text"
+        );
+        assert_eq!(normalize_text(""), "");
+        assert_eq!(normalize_text("   "), "");
     }
 }

@@ -322,6 +322,8 @@ async fn test_plugin_creation_all_plugins() {
                 json!({"pricing_tiers": [{"status_codes": [200], "price_per_call": 0.00001}]})
             }
             "ai_response_guard" => json!({"pii_patterns": ["ssn"], "action": "reject"}),
+            // ai_request_guard rejects no-op configs — supply at least one policy.
+            "ai_request_guard" => json!({"max_messages": 100}),
             "request_deduplication" => json!({}),
             _ => json!({}),
         };

@@ -28,11 +28,23 @@ fn make_post_headers() -> HashMap<String, String> {
 
 #[tokio::test]
 async fn test_plugin_name_and_priority() {
-    let plugin = AiRequestGuard::new(&json!({})).unwrap();
+    // Empty config is now rejected (would be a no-op); pass at least one
+    // policy so we can still verify name/priority/buffering metadata.
+    let plugin = AiRequestGuard::new(&json!({"max_messages": 1})).unwrap();
     assert_eq!(plugin.name(), "ai_request_guard");
     assert_eq!(plugin.priority(), 2975);
     assert!(!plugin.requires_response_body_buffering());
-    assert!(!plugin.requires_request_body_buffering());
+    assert!(plugin.requires_request_body_buffering());
+}
+
+#[test]
+fn test_empty_config_rejected() {
+    // No policies configured → plugin would be a no-op → constructor errors.
+    let err = AiRequestGuard::new(&json!({})).err().unwrap();
+    assert!(
+        err.contains("at least one policy must be configured"),
+        "got: {err}"
+    );
 }
 
 #[test]

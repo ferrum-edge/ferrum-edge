@@ -12,12 +12,36 @@
 //! or warn (add metadata/headers but pass through).
 
 use async_trait::async_trait;
-use regex::Regex;
+use regex::{Regex, RegexSet};
 use serde_json::Value;
 use std::collections::HashMap;
 use tracing::{debug, warn};
 
+use super::utils::json_escape::escape_json_string;
 use super::{Plugin, PluginResult, RequestContext};
+
+/// JSON object keys that are structural metadata (IDs, timestamps, model
+/// names, roles, etc.) and must never be redacted, even in `ScanMode::All`.
+/// This protects timestamps and IDs that may incidentally match PII regexes.
+const STRUCTURAL_KEYS: &[&str] = &[
+    "id",
+    "object",
+    "created",
+    "model",
+    "role",
+    "type",
+    "index",
+    "finish_reason",
+    "stop_reason",
+    "logprobs",
+    "system_fingerprint",
+    "usage",
+    "input_tokens",
+    "output_tokens",
+    "prompt_tokens",
+    "completion_tokens",
+    "total_tokens",
+];
 
 /// Action to take when guarded content is detected in the response.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,6 +71,13 @@ pub struct AiResponseGuard {
     action: GuardAction,
     pii_patterns: Vec<ContentPattern>,
     blocked_phrases: Vec<ContentPattern>,
+    /// All patterns (PII + blocked phrases) compiled into a single DFA for
+    /// O(text_len) detection regardless of pattern count. Indices align with
+    /// `pii_patterns ++ blocked_phrases`.
+    detection_set: RegexSet,
+    /// Total count of detection patterns (pii_patterns.len() + blocked_phrases.len()).
+    /// Cached so we can short-circuit when no detection patterns are configured.
+    detection_pattern_count: usize,
     scan_mode: ScanMode,
     max_scan_bytes: usize,
     redaction_template: String,
@@ -120,17 +151,20 @@ impl AiResponseGuard {
                         regex,
                     }),
                     Err(e) => {
-                        warn!(
+                        // Built-in pattern failures are fatal so the operator
+                        // is alerted instead of silently losing detection
+                        // coverage. Symmetric with custom-pattern handling.
+                        return Err(format!(
                             "ai_response_guard: failed to compile built-in PII pattern '{}': {}",
                             name, e,
-                        );
+                        ));
                     }
                 }
             } else {
-                warn!(
-                    "ai_response_guard: unknown built-in PII pattern '{}', skipping",
+                return Err(format!(
+                    "ai_response_guard: unknown built-in PII pattern '{}'",
                     name,
-                );
+                ));
             }
         }
 
@@ -237,10 +271,30 @@ impl AiResponseGuard {
         let needs_body_transform = action == GuardAction::Redact
             && (!pii_patterns.is_empty() || !blocked_phrases.is_empty());
 
+        // Build a single combined RegexSet for O(text_len) detection.
+        // Patterns are already validated above (each compiled successfully
+        // as an individual Regex), so RegexSet construction cannot fail
+        // for syntax — but we still propagate any error defensively.
+        let detection_pattern_count = pii_patterns.len() + blocked_phrases.len();
+        let detection_set = RegexSet::new(
+            pii_patterns
+                .iter()
+                .chain(blocked_phrases.iter())
+                .map(|p| p.regex.as_str()),
+        )
+        .map_err(|e| {
+            format!(
+                "ai_response_guard: failed to build detection RegexSet: {}",
+                e
+            )
+        })?;
+
         Ok(Self {
             action,
             pii_patterns,
             blocked_phrases,
+            detection_set,
+            detection_pattern_count,
             scan_mode,
             max_scan_bytes,
             redaction_template,
@@ -250,6 +304,19 @@ impl AiResponseGuard {
             required_fields,
             max_completion_length,
         })
+    }
+
+    /// Look up the pattern name at the given combined-index position
+    /// (`pii_patterns ++ blocked_phrases`).
+    fn pattern_name(&self, idx: usize) -> Option<&str> {
+        let pii_len = self.pii_patterns.len();
+        if idx < pii_len {
+            self.pii_patterns.get(idx).map(|p| p.name.as_str())
+        } else {
+            self.blocked_phrases
+                .get(idx - pii_len)
+                .map(|p| p.name.as_str())
+        }
     }
 
     /// Extract completion text from LLM response JSON (OpenAI format).
@@ -309,25 +376,37 @@ impl AiResponseGuard {
     }
 
     /// Detect content matches against all patterns. Returns names of detected matches.
+    /// Uses a single `RegexSet` DFA pass per text fragment, O(text_len)
+    /// regardless of pattern count.
     fn detect_matches(&self, texts: &[&str]) -> Vec<String> {
+        if self.detection_pattern_count == 0 {
+            return Vec::new();
+        }
+        let mut hit = vec![false; self.detection_pattern_count];
+        for text in texts {
+            for idx in self.detection_set.matches(text).into_iter() {
+                hit[idx] = true;
+            }
+        }
         let mut detected = Vec::new();
-        for pattern in self.pii_patterns.iter().chain(self.blocked_phrases.iter()) {
-            for text in texts {
-                if pattern.regex.is_match(text) {
-                    detected.push(pattern.name.clone());
-                    break;
-                }
+        for (idx, &h) in hit.iter().enumerate() {
+            if h && let Some(name) = self.pattern_name(idx) {
+                detected.push(name.to_string());
             }
         }
         detected
     }
 
     /// Detect matches in a raw string (for "all" scan mode).
+    /// Single `RegexSet` DFA pass — O(text_len).
     fn detect_matches_in_str(&self, text: &str) -> Vec<String> {
+        if self.detection_pattern_count == 0 {
+            return Vec::new();
+        }
         let mut detected = Vec::new();
-        for pattern in self.pii_patterns.iter().chain(self.blocked_phrases.iter()) {
-            if pattern.regex.is_match(text) {
-                detected.push(pattern.name.clone());
+        for idx in self.detection_set.matches(text).into_iter() {
+            if let Some(name) = self.pattern_name(idx) {
+                detected.push(name.to_string());
             }
         }
         detected
@@ -425,14 +504,6 @@ impl AiResponseGuard {
         }
         None
     }
-}
-
-/// Escape special characters for safe JSON string interpolation.
-fn escape_json_string(s: &str) -> String {
-    s.replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('<', "\\u003c")
-        .replace('>', "\\u003e")
 }
 
 #[async_trait]
@@ -625,13 +696,23 @@ impl Plugin for AiResponseGuard {
 
         if self.scan_mode == ScanMode::All {
             let body_str = std::str::from_utf8(body).ok()?;
-            let has_match = self
-                .pii_patterns
-                .iter()
-                .chain(self.blocked_phrases.iter())
-                .any(|p| p.regex.is_match(body_str));
-            if !has_match {
+            // Single DFA pass to short-circuit when no pattern matches anywhere.
+            if !self.detection_set.is_match(body_str) {
                 return None;
+            }
+            // Run structured redaction first on known completion content
+            // fields (choices[].message.content, content[].text, etc.) so
+            // recognized AI response shapes are handled with the correct
+            // template. Then run the recursive walker to cover any PII in
+            // sibling fields outside the completion shape that the
+            // structured redactor doesn't touch. The recursive walker
+            // honors STRUCTURAL_KEYS so IDs, timestamps, and model names
+            // remain untouched. Running structured first is safe because
+            // its [REDACTED:...] placeholders do not match any PII regex
+            // on the subsequent recursive pass.
+            let known_texts = self.extract_completion_texts(&json);
+            if !known_texts.is_empty() {
+                self.redact_response_json(&mut json);
             }
             redact_json_strings(
                 &mut json,
@@ -652,7 +733,10 @@ impl Plugin for AiResponseGuard {
     }
 }
 
-/// Recursively redact matches in all string values within a JSON Value.
+/// Recursively redact matches in all string values within a JSON Value,
+/// skipping fields with structural keys (IDs, timestamps, model names, etc.)
+/// that should never be rewritten even when their values incidentally match
+/// a PII regex.
 fn redact_json_strings(
     value: &mut Value,
     pii_patterns: &[ContentPattern],
@@ -679,7 +763,10 @@ fn redact_json_strings(
             }
         }
         Value::Object(map) => {
-            for val in map.values_mut() {
+            for (k, val) in map.iter_mut() {
+                if STRUCTURAL_KEYS.contains(&k.as_str()) {
+                    continue;
+                }
                 redact_json_strings(val, pii_patterns, blocked_phrases, template);
             }
         }

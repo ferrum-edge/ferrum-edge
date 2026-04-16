@@ -293,14 +293,109 @@ struct ResolvedProvider {
     default_model: Option<String>,
     connect_timeout: Duration,
     read_timeout: Duration,
-    // Provider-specific URL parameters
+    /// Operator-supplied URL override. Used directly by Anthropic and Cohere
+    /// dispatch paths that build their own URLs without going through
+    /// `url_template`.
     base_url: Option<String>,
-    azure_resource: Option<String>,
-    azure_deployment: Option<String>,
-    azure_api_version: String,
-    google_project_id: Option<String>,
-    google_region: Option<String>,
-    aws_region: Option<String>,
+    /// Pre-computed URL template — built once at config-load time so
+    /// per-request URL construction is one `String` concatenation, not a
+    /// multi-arg `format!()` call. Provider-specific config (azure_*,
+    /// google_*, aws_region, base_url) is consumed when this is built and
+    /// then discarded — we don't need the raw fields at request time.
+    url_template: UrlTemplate,
+}
+
+/// How a provider's request URL is assembled.
+///
+/// Built once at config-load time so the per-request hot path avoids the
+/// `format!()` machinery and only does one `String` allocation.
+#[derive(Debug, Clone)]
+enum UrlTemplate {
+    /// Fully static URL — used when the URL does not depend on the request
+    /// model (Azure with deployment, OpenAI default, generic base_url).
+    Static(Arc<str>),
+    /// Static prefix + per-request `model` + static suffix.
+    /// Used by Gemini, Vertex AI, and Bedrock where the model name is
+    /// embedded in the path.
+    PrefixModelSuffix { prefix: Arc<str>, suffix: Arc<str> },
+}
+
+impl UrlTemplate {
+    /// Render the URL for a specific resolved model.
+    fn render(&self, model: &str) -> String {
+        match self {
+            UrlTemplate::Static(url) => url.to_string(),
+            UrlTemplate::PrefixModelSuffix { prefix, suffix } => {
+                let mut s = String::with_capacity(prefix.len() + model.len() + suffix.len());
+                s.push_str(prefix);
+                s.push_str(model);
+                s.push_str(suffix);
+                s
+            }
+        }
+    }
+}
+
+/// Build the URL template for a provider at config-load time.
+///
+/// The eight-argument shape is intentional: each field comes from a
+/// different optional config key and bundling them into a struct would
+/// just move the same data through an extra layer of plumbing.
+#[allow(clippy::too_many_arguments)]
+fn build_url_template(
+    provider_type: ProviderType,
+    base_url: Option<&str>,
+    azure_resource: Option<&str>,
+    azure_deployment: Option<&str>,
+    azure_api_version: &str,
+    google_region: Option<&str>,
+    google_project_id: Option<&str>,
+    aws_region: Option<&str>,
+) -> UrlTemplate {
+    if let Some(base) = base_url {
+        return UrlTemplate::Static(Arc::from(base));
+    }
+
+    match provider_type {
+        ProviderType::AzureOpenAi => {
+            let resource = azure_resource.unwrap_or("default");
+            let deployment = azure_deployment.unwrap_or("default");
+            let url = format!(
+                "https://{}.openai.azure.com/openai/deployments/{}/chat/completions?api-version={}",
+                resource, deployment, azure_api_version
+            );
+            UrlTemplate::Static(Arc::from(url))
+        }
+
+        ProviderType::GoogleGemini => UrlTemplate::PrefixModelSuffix {
+            prefix: Arc::from("https://generativelanguage.googleapis.com/v1beta/models/"),
+            suffix: Arc::from(":generateContent"),
+        },
+
+        ProviderType::GoogleVertex => {
+            let region = google_region.unwrap_or("us-central1");
+            let project = google_project_id.unwrap_or("default");
+            let prefix = format!(
+                "https://{}-aiplatform.googleapis.com/v1/projects/{}/locations/{}/publishers/google/models/",
+                region, project, region
+            );
+            UrlTemplate::PrefixModelSuffix {
+                prefix: Arc::from(prefix),
+                suffix: Arc::from(":generateContent"),
+            }
+        }
+
+        ProviderType::AwsBedrock => {
+            let region = aws_region.unwrap_or("us-east-1");
+            let prefix = format!("https://bedrock-runtime.{}.amazonaws.com/model/", region);
+            UrlTemplate::PrefixModelSuffix {
+                prefix: Arc::from(prefix),
+                suffix: Arc::from("/converse"),
+            }
+        }
+
+        pt => UrlTemplate::Static(Arc::from(pt.default_base_url())),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -394,6 +489,20 @@ impl AiFederation {
             // Validate provider-specific required fields
             validate_provider_config(provider_type, &name, pv)?;
 
+            // Pre-compute the URL template once so per-request URL building
+            // is a single allocation (concat of pre-built Arc<str> parts)
+            // rather than a multi-arg `format!()` call per request.
+            let url_template = build_url_template(
+                provider_type,
+                base_url.as_deref(),
+                azure_resource.as_deref(),
+                azure_deployment.as_deref(),
+                &azure_api_version,
+                google_region.as_deref(),
+                google_project_id.as_deref(),
+                aws_region.as_deref(),
+            );
+
             providers.push(ResolvedProvider {
                 name,
                 provider_type,
@@ -405,12 +514,7 @@ impl AiFederation {
                 connect_timeout,
                 read_timeout,
                 base_url,
-                azure_resource,
-                azure_deployment,
-                azure_api_version,
-                google_project_id,
-                google_region,
-                aws_region,
+                url_template,
             });
         }
 
@@ -946,48 +1050,14 @@ fn translate_to_cohere(
     Ok((url, headers, body_bytes))
 }
 
-/// Build the provider-specific URL.
+/// Build the provider-specific URL by rendering the pre-computed template.
+///
+/// The template is constructed once per provider at config-load time
+/// (see `build_url_template`), so the only per-request work here is one
+/// `String` allocation that concatenates the cached prefix, the request
+/// model, and the cached suffix.
 fn build_provider_url(provider: &ResolvedProvider, model: &str) -> String {
-    if let Some(ref base) = provider.base_url {
-        return base.clone();
-    }
-
-    match provider.provider_type {
-        ProviderType::AzureOpenAi => {
-            let resource = provider.azure_resource.as_deref().unwrap_or("default");
-            let deployment = provider.azure_deployment.as_deref().unwrap_or("default");
-            format!(
-                "https://{}.openai.azure.com/openai/deployments/{}/chat/completions?api-version={}",
-                resource, deployment, provider.azure_api_version
-            )
-        }
-
-        ProviderType::GoogleGemini => {
-            format!(
-                "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent",
-                model
-            )
-        }
-
-        ProviderType::GoogleVertex => {
-            let region = provider.google_region.as_deref().unwrap_or("us-central1");
-            let project = provider.google_project_id.as_deref().unwrap_or("default");
-            format!(
-                "https://{}-aiplatform.googleapis.com/v1/projects/{}/locations/{}/publishers/google/models/{}:generateContent",
-                region, project, region, model
-            )
-        }
-
-        ProviderType::AwsBedrock => {
-            let region = provider.aws_region.as_deref().unwrap_or("us-east-1");
-            format!(
-                "https://bedrock-runtime.{}.amazonaws.com/model/{}/converse",
-                region, model
-            )
-        }
-
-        pt => pt.default_base_url().to_string(),
-    }
+    provider.url_template.render(model)
 }
 
 // ---------------------------------------------------------------------------
@@ -1719,6 +1789,32 @@ pub mod test_helpers {
         provider_config: &Value,
     ) -> Result<TranslatedRequest, String> {
         let pt = ProviderType::from_str(provider_type)?;
+        let base_url = provider_config["base_url"].as_str().map(String::from);
+        let azure_resource = provider_config["azure_resource"].as_str().map(String::from);
+        let azure_deployment = provider_config["azure_deployment"]
+            .as_str()
+            .map(String::from);
+        let azure_api_version = provider_config["azure_api_version"]
+            .as_str()
+            .unwrap_or("2024-06-01")
+            .to_string();
+        let google_project_id = provider_config["google_project_id"]
+            .as_str()
+            .map(String::from);
+        let google_region = provider_config["google_region"].as_str().map(String::from);
+        let aws_region = provider_config["aws_region"].as_str().map(String::from);
+
+        let url_template = build_url_template(
+            pt,
+            base_url.as_deref(),
+            azure_resource.as_deref(),
+            azure_deployment.as_deref(),
+            &azure_api_version,
+            google_region.as_deref(),
+            google_project_id.as_deref(),
+            aws_region.as_deref(),
+        );
+
         let provider = ResolvedProvider {
             name: "test".to_string(),
             provider_type: pt,
@@ -1731,22 +1827,39 @@ pub mod test_helpers {
             default_model: None,
             connect_timeout: Duration::from_secs(5),
             read_timeout: Duration::from_secs(60),
-            base_url: provider_config["base_url"].as_str().map(String::from),
-            azure_resource: provider_config["azure_resource"].as_str().map(String::from),
-            azure_deployment: provider_config["azure_deployment"]
-                .as_str()
-                .map(String::from),
-            azure_api_version: provider_config["azure_api_version"]
-                .as_str()
-                .unwrap_or("2024-06-01")
-                .to_string(),
-            google_project_id: provider_config["google_project_id"]
-                .as_str()
-                .map(String::from),
-            google_region: provider_config["google_region"].as_str().map(String::from),
-            aws_region: provider_config["aws_region"].as_str().map(String::from),
+            base_url,
+            url_template,
         };
         translate_request(&provider, openai_body, model)
+    }
+
+    /// Expose URL building for tests so we can assert the template logic.
+    pub fn build_provider_url_for_test(
+        provider_type: &str,
+        provider_config: &Value,
+        model: &str,
+    ) -> Result<String, String> {
+        let pt = ProviderType::from_str(provider_type)?;
+        let base_url = provider_config["base_url"].as_str();
+        let azure_resource = provider_config["azure_resource"].as_str();
+        let azure_deployment = provider_config["azure_deployment"].as_str();
+        let azure_api_version = provider_config["azure_api_version"]
+            .as_str()
+            .unwrap_or("2024-06-01");
+        let google_project_id = provider_config["google_project_id"].as_str();
+        let google_region = provider_config["google_region"].as_str();
+        let aws_region = provider_config["aws_region"].as_str();
+        let template = build_url_template(
+            pt,
+            base_url,
+            azure_resource,
+            azure_deployment,
+            azure_api_version,
+            google_region,
+            google_project_id,
+            aws_region,
+        );
+        Ok(template.render(model))
     }
 
     /// Expose response normalization for tests.

@@ -38,6 +38,10 @@ struct TokenWindow {
     entries: VecDeque<(Instant, u64)>,
     window_duration: Duration,
     limit: u64,
+    /// Running sum of `entries[].tokens`. Maintained by `record_usage` and
+    /// `current_usage` so each call is O(amortised stale-evicted) instead
+    /// of O(n) full re-summation per request.
+    total: u64,
 }
 
 impl TokenWindow {
@@ -46,26 +50,32 @@ impl TokenWindow {
             entries: VecDeque::new(),
             window_duration,
             limit,
+            total: 0,
         }
     }
 
     /// Evict stale entries and return current token usage within the window.
+    /// Maintains a running `total` so that the per-call cost is amortised
+    /// O(stale-evicted) instead of O(n) per call.
     fn current_usage(&mut self) -> u64 {
         let now = Instant::now();
         let cutoff = now - self.window_duration;
-        while let Some((ts, _)) = self.entries.front() {
+        while let Some((ts, tokens)) = self.entries.front() {
             if *ts < cutoff {
+                let popped = *tokens;
                 self.entries.pop_front();
+                self.total = self.total.saturating_sub(popped);
             } else {
                 break;
             }
         }
-        self.entries.iter().map(|(_, tokens)| *tokens).sum()
+        self.total
     }
 
     /// Record token usage.
     fn record_usage(&mut self, tokens: u64) {
         self.entries.push_back((Instant::now(), tokens));
+        self.total = self.total.saturating_add(tokens);
     }
 
     /// Tokens remaining before limit is reached.
@@ -111,10 +121,25 @@ impl AiRateLimiter {
             .as_str()
             .unwrap_or("total_tokens")
             .to_string();
+        if !matches!(
+            count_mode.as_str(),
+            "prompt_tokens" | "completion_tokens" | "total_tokens"
+        ) {
+            return Err(format!(
+                "ai_rate_limiter: unknown 'count_mode' value '{}' (expected 'prompt_tokens', 'completion_tokens', or 'total_tokens')",
+                count_mode
+            ));
+        }
         let limit_by = config["limit_by"]
             .as_str()
             .unwrap_or("consumer")
             .to_string();
+        if !matches!(limit_by.as_str(), "consumer" | "ip") {
+            return Err(format!(
+                "ai_rate_limiter: unknown 'limit_by' value '{}' (expected 'consumer' or 'ip')",
+                limit_by
+            ));
+        }
         let expose_headers = config["expose_headers"].as_bool().unwrap_or(false);
         let provider = config["provider"]
             .as_str()
@@ -157,13 +182,23 @@ impl AiRateLimiter {
     }
 
     /// Build the rate limit key from the request context.
+    ///
+    /// Uses `String::push_str` against a pre-sized buffer instead of `format!`
+    /// so the call is a single allocation per request rather than the multi-
+    /// allocation path through the format machinery.
     fn rate_key(&self, ctx: &RequestContext) -> String {
         if self.limit_by == "consumer"
             && let Some(identity) = ctx.effective_identity()
         {
-            return format!("consumer:{}", identity);
+            let mut s = String::with_capacity(identity.len() + 9);
+            s.push_str("consumer:");
+            s.push_str(identity);
+            return s;
         }
-        format!("ip:{}", ctx.client_ip)
+        let mut s = String::with_capacity(ctx.client_ip.len() + 3);
+        s.push_str("ip:");
+        s.push_str(&ctx.client_ip);
+        s
     }
 
     /// Evict stale entries to prevent unbounded memory growth.
@@ -250,7 +285,9 @@ impl AiRateLimiter {
             "prompt_tokens" => prompt.or(Some(0)),
             "completion_tokens" => completion.or(Some(0)),
             _ => total.or_else(|| match (prompt, completion) {
-                (Some(p), Some(c)) => Some(p + c),
+                (Some(p), Some(c)) => Some(p.saturating_add(c)),
+                (Some(p), None) => Some(p),
+                (None, Some(c)) => Some(c),
                 _ => None,
             }),
         }
@@ -332,7 +369,7 @@ impl AiRateLimiter {
             .and_then(|u| u.get("output_tokens"))
             .and_then(|v| v.as_u64());
         let total = match (prompt, completion) {
-            (Some(p), Some(c)) => Some(p + c),
+            (Some(p), Some(c)) => Some(p.saturating_add(c)),
             _ => None,
         };
         (prompt, completion, total)
@@ -361,7 +398,7 @@ impl AiRateLimiter {
             .and_then(|t| t.get("output_tokens"))
             .and_then(|v| v.as_u64());
         let total = match (prompt, completion) {
-            (Some(p), Some(c)) => Some(p + c),
+            (Some(p), Some(c)) => Some(p.saturating_add(c)),
             _ => None,
         };
         (prompt, completion, total)
@@ -444,11 +481,18 @@ impl AiRateLimiter {
             }
         }
 
-        // Compute total if not provided
-        if total_tokens.is_none()
-            && let (Some(p), Some(c)) = (prompt_tokens, completion_tokens)
-        {
-            total_tokens = Some(p + c);
+        // Compute total if not provided. Handle partial state: an SSE stream
+        // that only contained `message_delta` events (no `message_start`) is
+        // still useful — return the completion_tokens we did see rather than
+        // dropping the whole count. Use `saturating_add` to avoid overflow
+        // even though billions of tokens per request is unrealistic.
+        if total_tokens.is_none() {
+            total_tokens = match (prompt_tokens, completion_tokens) {
+                (Some(p), Some(c)) => Some(p.saturating_add(c)),
+                (Some(p), None) => Some(p),
+                (None, Some(c)) => Some(c),
+                (None, None) => None,
+            };
         }
 
         // Return the appropriate count based on count_mode

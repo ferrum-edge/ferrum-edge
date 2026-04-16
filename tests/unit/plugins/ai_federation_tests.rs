@@ -770,6 +770,84 @@ fn test_all_openai_compatible_providers() {
 }
 
 // ---------------------------------------------------------------------------
+// URL template — built once at config-load time and rendered per-request.
+// These tests pin the rendered URLs so the cached-template optimization
+// cannot silently change wire-level behavior.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_url_template_azure_openai_is_static() {
+    let url = test_helpers::build_provider_url_for_test(
+        "azure_openai",
+        &json!({
+            "azure_resource": "myco",
+            "azure_deployment": "prod",
+            "azure_api_version": "2024-06-01"
+        }),
+        "ignored-model-name",
+    )
+    .unwrap();
+    assert_eq!(
+        url,
+        "https://myco.openai.azure.com/openai/deployments/prod/chat/completions?api-version=2024-06-01"
+    );
+}
+
+#[test]
+fn test_url_template_gemini_embeds_model() {
+    let url = test_helpers::build_provider_url_for_test("google_gemini", &json!({}), "gemini-pro")
+        .unwrap();
+    assert_eq!(
+        url,
+        "https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent"
+    );
+}
+
+#[test]
+fn test_url_template_vertex_embeds_region_project_and_model() {
+    let url = test_helpers::build_provider_url_for_test(
+        "google_vertex",
+        &json!({
+            "google_project_id": "my-proj",
+            "google_region": "europe-west1"
+        }),
+        "gemini-1.5-pro",
+    )
+    .unwrap();
+    assert_eq!(
+        url,
+        "https://europe-west1-aiplatform.googleapis.com/v1/projects/my-proj/locations/europe-west1/publishers/google/models/gemini-1.5-pro:generateContent"
+    );
+}
+
+#[test]
+fn test_url_template_bedrock_embeds_region_and_model() {
+    let url = test_helpers::build_provider_url_for_test(
+        "aws_bedrock",
+        &json!({"aws_region": "us-west-2"}),
+        "anthropic.claude-3-sonnet",
+    )
+    .unwrap();
+    assert_eq!(
+        url,
+        "https://bedrock-runtime.us-west-2.amazonaws.com/model/anthropic.claude-3-sonnet/converse"
+    );
+}
+
+#[test]
+fn test_url_template_explicit_base_url_overrides_provider_logic() {
+    // When the operator supplies `base_url`, the template renders that
+    // exact URL regardless of provider type.
+    let url = test_helpers::build_provider_url_for_test(
+        "azure_openai",
+        &json!({"base_url": "https://internal.proxy/v1/chat"}),
+        "anything",
+    )
+    .unwrap();
+    assert_eq!(url, "https://internal.proxy/v1/chat");
+}
+
+// ---------------------------------------------------------------------------
 // Helper
 // ---------------------------------------------------------------------------
 
