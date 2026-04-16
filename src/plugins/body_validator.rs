@@ -907,48 +907,38 @@ fn find_byte(haystack: &[u8], needle: u8) -> Option<usize> {
 /// Validate common string formats (subset of JSON Schema format vocabulary).
 fn validate_format(s: &str, format_name: &str) -> Result<(), String> {
     match format_name {
-        "email" => {
-            // Basic email check: contains exactly one @ with non-empty local and domain parts
+        // Basic email check: contains exactly one @ with non-empty local and domain parts
+        "email"
             if !s.contains('@')
                 || s.starts_with('@')
                 || s.ends_with('@')
-                || s.matches('@').count() != 1
-            {
-                return Err(format!("'{}' is not a valid email format", s));
-            }
+                || s.matches('@').count() != 1 =>
+        {
+            return Err(format!("'{}' is not a valid email format", s));
         }
-        "ipv4" => {
-            if s.parse::<std::net::Ipv4Addr>().is_err() {
-                return Err(format!("'{}' is not a valid IPv4 address", s));
-            }
+        "ipv4" if s.parse::<std::net::Ipv4Addr>().is_err() => {
+            return Err(format!("'{}' is not a valid IPv4 address", s));
         }
-        "ipv6" => {
-            if s.parse::<std::net::Ipv6Addr>().is_err() {
-                return Err(format!("'{}' is not a valid IPv6 address", s));
-            }
+        "ipv6" if s.parse::<std::net::Ipv6Addr>().is_err() => {
+            return Err(format!("'{}' is not a valid IPv6 address", s));
         }
-        "uri" | "uri-reference" => {
-            if !s.contains(':') && !s.starts_with('/') && !s.starts_with('#') {
-                return Err(format!("'{}' is not a valid URI", s));
-            }
+        "uri" | "uri-reference"
+            if !s.contains(':') && !s.starts_with('/') && !s.starts_with('#') =>
+        {
+            return Err(format!("'{}' is not a valid URI", s));
         }
-        "date-time" => {
-            if chrono::DateTime::parse_from_rfc3339(s).is_err() {
-                return Err(format!("'{}' is not a valid RFC 3339 date-time", s));
-            }
+        "date-time" if chrono::DateTime::parse_from_rfc3339(s).is_err() => {
+            return Err(format!("'{}' is not a valid RFC 3339 date-time", s));
         }
-        "date" => {
-            if chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").is_err() {
-                return Err(format!("'{}' is not a valid date (YYYY-MM-DD)", s));
-            }
+        "date" if chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").is_err() => {
+            return Err(format!("'{}' is not a valid date (YYYY-MM-DD)", s));
         }
-        "uuid" => {
-            if uuid::Uuid::parse_str(s).is_err() {
-                return Err(format!("'{}' is not a valid UUID", s));
-            }
+        "uuid" if uuid::Uuid::parse_str(s).is_err() => {
+            return Err(format!("'{}' is not a valid UUID", s));
         }
         _ => {
-            // Unknown format — ignore per JSON Schema spec (formats are advisory)
+            // Other format names, valid values, or unknown formats — no-op.
+            // Per JSON Schema spec, unknown formats are advisory.
         }
     }
     Ok(())

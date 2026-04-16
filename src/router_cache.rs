@@ -724,7 +724,7 @@ impl RouterCache {
         // Sort prefix route lists by listen_path length descending (longest first)
         // and build HashMap indexes for O(path_depth) lookups
         for routes in exact_hosts.values_mut() {
-            routes.sort_by(|a, b| b.listen_path.len().cmp(&a.listen_path.len()));
+            routes.sort_by_key(|b| std::cmp::Reverse(b.listen_path.len()));
         }
         let exact_hosts_indexed: HashMap<String, IndexedPrefixRoutes> = exact_hosts
             .into_iter()
@@ -733,16 +733,16 @@ impl RouterCache {
 
         let mut wildcard_vec: Vec<(String, Vec<RouteEntry>)> = wildcard_hosts.into_iter().collect();
         for (_, routes) in &mut wildcard_vec {
-            routes.sort_by(|a, b| b.listen_path.len().cmp(&a.listen_path.len()));
+            routes.sort_by_key(|b| std::cmp::Reverse(b.listen_path.len()));
         }
         // Sort wildcard patterns by length descending (more-specific wildcards first)
-        wildcard_vec.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+        wildcard_vec.sort_by_key(|b| std::cmp::Reverse(b.0.len()));
         let wildcard_indexed: Vec<(String, IndexedPrefixRoutes)> = wildcard_vec
             .into_iter()
             .map(|(pattern, routes)| (pattern, IndexedPrefixRoutes::from_sorted(routes)))
             .collect();
 
-        catch_all.sort_by(|a, b| b.listen_path.len().cmp(&a.listen_path.len()));
+        catch_all.sort_by_key(|b| std::cmp::Reverse(b.listen_path.len()));
         let catch_all_indexed = IndexedPrefixRoutes::from_sorted(catch_all);
 
         // Build RegexSet indexes for O(1) multi-pattern matching
@@ -754,7 +754,7 @@ impl RouterCache {
         // Sort wildcard regex hosts by pattern length descending (same ordering as prefix)
         let mut wildcard_regex_vec: Vec<(String, Vec<RegexRouteEntry>)> =
             wildcard_hosts_regex.into_iter().collect();
-        wildcard_regex_vec.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+        wildcard_regex_vec.sort_by_key(|b| std::cmp::Reverse(b.0.len()));
         let wildcard_regex_indexed: Vec<(String, IndexedRegexRoutes)> = wildcard_regex_vec
             .into_iter()
             .map(|(pattern, entries)| (pattern, IndexedRegexRoutes::new(entries)))

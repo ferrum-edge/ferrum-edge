@@ -170,11 +170,11 @@ impl CircuitBreaker {
                     }
                 }
             }
-            STATE_CLOSED => {
+            STATE_CLOSED
                 // Reset failure count on success
-                if self.failure_count.load(Ordering::Relaxed) > 0 {
-                    self.failure_count.store(0, Ordering::Relaxed);
-                }
+                if self.failure_count.load(Ordering::Relaxed) > 0 =>
+            {
+                self.failure_count.store(0, Ordering::Relaxed);
             }
             _ => {}
         }
