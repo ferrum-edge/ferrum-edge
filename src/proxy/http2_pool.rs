@@ -351,31 +351,34 @@ impl Http2ConnectionPool {
 
         // Connect with timeout, using TcpSocket to set IP_BIND_ADDRESS_NO_PORT
         // before connect() so the kernel can co-select ephemeral ports.
-        let tcp = tokio::time::timeout(connect_timeout, Self::connect_with_opts(sock_addr))
-            .await
-            .map_err(|_| {
-                warn!(
-                    "http2_pool: connect timeout ({}ms) to backend {}",
-                    proxy.backend_connect_timeout_ms, addr
-                );
-                Http2PoolError::BackendTimeout(format!(
-                    "Connect timeout after {}ms to {}",
-                    proxy.backend_connect_timeout_ms, addr
-                ))
-            })?
-            .map_err(|e| {
-                if crate::retry::is_port_exhaustion(&e) {
-                    tracing::error!(
-                        "http2_pool: PORT EXHAUSTION connecting to backend {}: {} — \
+        let tcp = tokio::time::timeout(
+            connect_timeout,
+            crate::socket_opts::connect_with_socket_opts(sock_addr),
+        )
+        .await
+        .map_err(|_| {
+            warn!(
+                "http2_pool: connect timeout ({}ms) to backend {}",
+                proxy.backend_connect_timeout_ms, addr
+            );
+            Http2PoolError::BackendTimeout(format!(
+                "Connect timeout after {}ms to {}",
+                proxy.backend_connect_timeout_ms, addr
+            ))
+        })?
+        .map_err(|e| {
+            if crate::retry::is_port_exhaustion(&e) {
+                tracing::error!(
+                    "http2_pool: PORT EXHAUSTION connecting to backend {}: {} — \
                          reduce outbound connection rate or increase net.ipv4.ip_local_port_range",
-                        addr,
-                        e
-                    );
-                } else {
-                    warn!("http2_pool: failed to connect to backend {}: {}", addr, e);
-                }
-                Http2PoolError::BackendUnavailable(format!("Connection refused: {}", e))
-            })?;
+                    addr,
+                    e
+                );
+            } else {
+                warn!("http2_pool: failed to connect to backend {}: {}", addr, e);
+            }
+            Http2PoolError::BackendUnavailable(format!("Connection refused: {}", e))
+        })?;
 
         // Disable Nagle for lower latency
         let _ = tcp.set_nodelay(true);
@@ -421,26 +424,6 @@ impl Http2ConnectionPool {
         }
 
         builder
-    }
-
-    /// Connect to a pre-resolved `SocketAddr` with `IP_BIND_ADDRESS_NO_PORT`
-    /// set before `connect()` so the kernel can co-select ephemeral ports
-    /// using 4-tuple optimization. The caller must resolve the hostname via
-    /// the shared DNS cache before calling this — no DNS lookup happens here.
-    async fn connect_with_opts(sock_addr: std::net::SocketAddr) -> std::io::Result<TcpStream> {
-        let socket = if sock_addr.is_ipv4() {
-            tokio::net::TcpSocket::new_v4()?
-        } else {
-            tokio::net::TcpSocket::new_v6()?
-        };
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::io::AsRawFd;
-            let _ = crate::socket_opts::set_ip_bind_address_no_port(socket.as_raw_fd(), true);
-        }
-
-        socket.connect(sock_addr).await
     }
 
     /// Set TCP keepalive on a stream to detect dead backend connections.

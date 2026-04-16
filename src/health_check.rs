@@ -832,7 +832,9 @@ async fn grpc_probe(
         {
             Ok(ch) => ch,
             Err(e) => {
-                if crate::retry::is_port_exhaustion_message(&format!("{}", e)) {
+                let is_exhaustion = crate::retry::is_port_exhaustion(e.as_ref())
+                    || crate::retry::is_port_exhaustion_message(&e.to_string());
+                if is_exhaustion {
                     tracing::error!(
                         "gRPC health probe: PORT EXHAUSTION connecting to {}:{}: {}",
                         host,
@@ -894,7 +896,10 @@ async fn grpc_probe(
         match tokio::time::timeout(timeout, endpoint.connect()).await {
             Ok(Ok(ch)) => ch,
             Ok(Err(e)) => {
-                if crate::retry::is_port_exhaustion_message(&format!("{}", e)) {
+                let err_ref: &(dyn std::error::Error + 'static) = &e;
+                let is_exhaustion = crate::retry::is_port_exhaustion(err_ref)
+                    || crate::retry::is_port_exhaustion_message(&e.to_string());
+                if is_exhaustion {
                     tracing::error!(
                         "gRPC health probe: PORT EXHAUSTION connecting to {}:{}: {}",
                         host,
@@ -918,7 +923,10 @@ async fn grpc_probe(
         match tokio::time::timeout(timeout, endpoint.connect()).await {
             Ok(Ok(ch)) => ch,
             Ok(Err(e)) => {
-                if crate::retry::is_port_exhaustion_message(&format!("{}", e)) {
+                let err_ref: &(dyn std::error::Error + 'static) = &e;
+                let is_exhaustion = crate::retry::is_port_exhaustion(err_ref)
+                    || crate::retry::is_port_exhaustion_message(&e.to_string());
+                if is_exhaustion {
                     tracing::error!(
                         "gRPC health probe: PORT EXHAUSTION connecting to {}:{}: {}",
                         host,

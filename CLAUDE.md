@@ -616,10 +616,6 @@ async fn start_gateway_with_retry(config_path: &str) -> (std::process::Child, u1
 
 ## Development Guidelines
 
-### Implementation Philosophy
-
-**MANDATORY: Always implement the most correct and robust solution.** Never take shortcuts, never opt for the "simplest fix," and never patch symptoms instead of solving root causes. Every change must be designed to be correct by construction — think through all edge cases (IPv4/IPv6, error propagation, shared infrastructure like DNS cache, connection lifecycle, platform differences) before writing code. If a change touches a connection path, verify it works for both address families, uses the shared DNS cache, handles errors with proper classification, and follows established codebase patterns. Never introduce fallback paths that bypass core infrastructure. If a proper implementation requires more code or refactoring, that is the right approach. Multiple rounds of review regressions from "quick fixes" waste far more time than doing it right the first time.
-
 ### Before Every Commit
 
 **CRITICAL: Steps 1-2 are non-negotiable. Run them before every single `git commit`, no exceptions.**
