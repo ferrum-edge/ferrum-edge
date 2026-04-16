@@ -289,6 +289,32 @@ fn test_priority() {
     assert_eq!(plugin.priority(), 1250);
 }
 
+#[test]
+fn test_warmup_hostnames_ldap() {
+    let plugin = LdapAuth::new(
+        &json!({
+            "ldap_url": "ldap://ldap.example.com:389",
+            "bind_dn_template": "uid={username},ou=users,dc=example,dc=com"
+        }),
+        http_client(),
+    )
+    .unwrap();
+    assert_eq!(plugin.warmup_hostnames(), vec!["ldap.example.com"]);
+}
+
+#[test]
+fn test_warmup_hostnames_ldaps() {
+    let plugin = LdapAuth::new(
+        &json!({
+            "ldap_url": "ldaps://secure-ldap.corp.internal:636",
+            "bind_dn_template": "uid={username},ou=users,dc=corp,dc=internal"
+        }),
+        http_client(),
+    )
+    .unwrap();
+    assert_eq!(plugin.warmup_hostnames(), vec!["secure-ldap.corp.internal"]);
+}
+
 // ─── Authenticate credential extraction tests ────────────────────────────
 // These test the credential parsing path without requiring an LDAP server.
 // The LDAP connection will fail, but we can verify header parsing rejects.

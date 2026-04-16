@@ -24,7 +24,10 @@
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
+
+use crate::dns::DnsCacheResolver;
 
 use super::{Plugin, PluginResult, RequestContext};
 
@@ -63,11 +66,16 @@ impl SpecExpose {
 
         // Build a dedicated reqwest client for spec fetching.
         // We use a separate client so we can honour the per-plugin tls_no_verify
-        // setting independently of the shared plugin HTTP client.
+        // setting independently of the shared plugin HTTP client, but we still
+        // wire the gateway's shared DNS cache for consistent resolution + TTL.
         let mut builder = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(30))
             .danger_accept_invalid_certs(tls_no_verify);
+
+        if let Some(dns_cache) = plugin_http_client.dns_cache() {
+            builder = builder.dns_resolver(Arc::new(DnsCacheResolver::new(dns_cache.clone())));
+        }
 
         // Load custom CA bundle when not skipping verification.
         if !tls_no_verify && let Some(ca_path) = plugin_http_client.tls_ca_bundle_path() {
