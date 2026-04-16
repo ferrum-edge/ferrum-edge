@@ -4276,7 +4276,7 @@ fn json_response_with_stale(status: StatusCode, body: &Value) -> Response<Full<B
 /// Avoids leaking database schema details in API responses.
 fn db_error_response(e: &dyn std::fmt::Display) -> Value {
     warn!("Database error in admin API: {}", e);
-    json!({"error": "Database operation failed"})
+    json!({"error": "Database unavailable — operation failed"})
 }
 
 /// Check if a database error message indicates a unique constraint violation.
