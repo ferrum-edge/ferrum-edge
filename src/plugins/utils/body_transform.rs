@@ -16,15 +16,36 @@ use tracing::{debug, warn};
 
 // ── Path parsing ──────────────────────────────────────────────────────────
 
-/// Parse a dot-notation path into segments, honoring `\\.` as a literal dot.
+/// Iterator over dot-notation path segments, honoring `\\.` as a literal dot.
 ///
-/// Fast path (no backslashes): zero owned allocations per segment (`Cow::Borrowed`).
-/// Slow path (contains `\\`): builds owned `String` segments.
-fn parse_path(path: &str) -> Vec<Cow<'_, str>> {
-    if !path.contains('\\') {
-        return path.split('.').map(Cow::Borrowed).collect();
+/// Fast path (no backslashes): zero heap allocation. Segments are borrowed
+/// slices of the input path, yielded lazily by [`std::str::Split`].
+///
+/// Slow path (contains `\\`): one upfront `Vec<String>` allocation for the
+/// parsed segments, then iteration over it.
+enum PathSegments<'a> {
+    Simple(std::str::Split<'a, char>),
+    Escaped(std::vec::IntoIter<String>),
+}
+
+impl<'a> Iterator for PathSegments<'a> {
+    type Item = Cow<'a, str>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            PathSegments::Simple(split) => split.next().map(Cow::Borrowed),
+            PathSegments::Escaped(vec_iter) => vec_iter.next().map(Cow::Owned),
+        }
     }
-    let mut segments: Vec<Cow<'_, str>> = Vec::new();
+}
+
+/// Build a path-segment iterator. Picks the zero-alloc fast path when the
+/// path contains no `\`.
+fn path_segments(path: &str) -> PathSegments<'_> {
+    if !path.contains('\\') {
+        return PathSegments::Simple(path.split('.'));
+    }
+    let mut segments: Vec<String> = Vec::new();
     let mut buf = String::new();
     let mut escape = false;
     for c in path.chars() {
@@ -34,7 +55,7 @@ fn parse_path(path: &str) -> Vec<Cow<'_, str>> {
         } else if c == '\\' {
             escape = true;
         } else if c == '.' {
-            segments.push(Cow::Owned(std::mem::take(&mut buf)));
+            segments.push(std::mem::take(&mut buf));
         } else {
             buf.push(c);
         }
@@ -43,8 +64,8 @@ fn parse_path(path: &str) -> Vec<Cow<'_, str>> {
         // Trailing backslash — treat as literal.
         buf.push('\\');
     }
-    segments.push(Cow::Owned(buf));
-    segments
+    segments.push(buf);
+    PathSegments::Escaped(segments.into_iter())
 }
 
 /// Immutable child lookup: works on both objects and arrays (numeric index).
@@ -78,7 +99,7 @@ fn child_mut<'a>(parent: &'a mut Value, segment: &str) -> Option<&'a mut Value> 
 /// is not an object/array (or index is out of bounds).
 pub fn get_nested_value<'a>(root: &'a Value, path: &str) -> Option<&'a Value> {
     let mut current = root;
-    for segment in parse_path(path) {
+    for segment in path_segments(path) {
         current = child(current, segment.as_ref())?;
     }
     Some(current)
@@ -97,15 +118,21 @@ pub fn set_nested_value(root: &mut Value, path: &str, value: Value) -> bool {
 /// Internal: set_nested_value that returns the value back on failure so the
 /// caller can recover it without an upfront clone.
 fn set_nested_value_inner(root: &mut Value, path: &str, value: Value) -> Result<(), Value> {
-    let segments = parse_path(path);
-    if segments.is_empty() {
+    let mut iter = path_segments(path).peekable();
+    if iter.peek().is_none() {
         return Err(value);
     }
-    let last_idx = segments.len() - 1;
     let mut current = root;
-    for (i, segment) in segments.iter().enumerate() {
+    loop {
+        // `peek` above confirmed at least one segment; subsequent iterations
+        // only reach this line after `peek().is_some()` on the prior check.
+        let segment = match iter.next() {
+            Some(s) => s,
+            None => return Err(value),
+        };
         let seg = segment.as_ref();
-        if i == last_idx {
+        let is_last = iter.peek().is_none();
+        if is_last {
             return match current {
                 Value::Object(map) => {
                     map.insert(seg.to_string(), value);
@@ -136,8 +163,6 @@ fn set_nested_value_inner(root: &mut Value, path: &str, value: Value) -> Result<
             _ => return Err(value),
         };
     }
-    // Unreachable: loop always terminates on `i == last_idx`.
-    Err(value)
 }
 
 /// Remove a value at a dot-notation path.
@@ -145,26 +170,27 @@ fn set_nested_value_inner(root: &mut Value, path: &str, value: Value) -> Result<
 /// Returns the removed value if it existed, `None` otherwise. For arrays,
 /// uses `Vec::remove` which shifts subsequent elements.
 pub fn remove_nested_value(root: &mut Value, path: &str) -> Option<Value> {
-    let segments = parse_path(path);
-    if segments.is_empty() {
-        return None;
-    }
-    let last_idx = segments.len() - 1;
+    let mut iter = path_segments(path).peekable();
+    iter.peek()?;
     let mut current = root;
-    for segment in &segments[..last_idx] {
-        current = child_mut(current, segment.as_ref())?;
-    }
-    let last = segments[last_idx].as_ref();
-    match current {
-        Value::Object(map) => map.remove(last),
-        Value::Array(arr) => last.parse::<usize>().ok().and_then(|i| {
-            if i < arr.len() {
-                Some(arr.remove(i))
-            } else {
-                None
-            }
-        }),
-        _ => None,
+    loop {
+        let segment = iter.next()?;
+        let seg = segment.as_ref();
+        if iter.peek().is_none() {
+            // Terminal: remove at current.
+            return match current {
+                Value::Object(map) => map.remove(seg),
+                Value::Array(arr) => seg.parse::<usize>().ok().and_then(|i| {
+                    if i < arr.len() {
+                        Some(arr.remove(i))
+                    } else {
+                        None
+                    }
+                }),
+                _ => None,
+            };
+        }
+        current = child_mut(current, seg)?;
     }
 }
 
