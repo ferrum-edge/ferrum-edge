@@ -401,7 +401,7 @@ When `passthrough: true` is set on a stream proxy, the gateway forwards encrypte
 - Mutually exclusive with `frontend_tls` (can't terminate and pass through simultaneously)
 - Backend TLS fields (`backend_tls_client_cert_path`, `backend_tls_client_key_path`, `backend_tls_server_ca_cert_path`) are rejected — the proxy doesn't originate backend TLS in passthrough mode
 
-**Logging:** `StreamConnectionContext.sni_hostname` and `StreamTransactionSummary.sni_hostname` carry the extracted SNI to connection-lifecycle plugins (`on_stream_connect`, `on_stream_disconnect`).
+**Logging:** `StreamConnectionContext.sni_hostname` and `StreamTransactionSummary.sni_hostname` carry the extracted SNI to connection-lifecycle plugins (`on_stream_connect`, `on_stream_disconnect`). `StreamTransactionSummary.consumer_username` carries the identified consumer (gateway `Consumer` username, or external `authenticated_identity` set by a stream auth plugin) captured at connect time — populated from `StreamConnectionContext::effective_identity()` in TCP, UDP, and DTLS paths so stream access logs include the principal that the policy plugins resolved.
 
 ### Stream Proxy Port Validation
 

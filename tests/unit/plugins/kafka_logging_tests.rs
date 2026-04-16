@@ -244,6 +244,27 @@ async fn test_kafka_logging_key_field_options() {
 }
 
 #[tokio::test]
+async fn test_kafka_logging_key_field_invalid_rejected() {
+    // A typo (or any unknown value) must be rejected at construction time
+    // instead of silently falling back to the client_ip default.
+    let result = KafkaLogging::new(
+        &json!({
+            "broker_list": "localhost:9092",
+            "topic": "test",
+            "key_field": "proxyID"
+        }),
+        &default_http_client(),
+    );
+    match result {
+        Err(e) => assert!(
+            e.contains("key_field") && e.contains("proxyID"),
+            "Expected error naming the bad key_field value, got: {e}",
+        ),
+        Ok(_) => panic!("Expected Err for invalid key_field value"),
+    }
+}
+
+#[tokio::test]
 async fn test_kafka_logging_default_lifecycle_phases() {
     let plugin = KafkaLogging::new(
         &json!({

@@ -667,13 +667,22 @@ pub struct StreamTransactionSummary {
     pub proxy_id: String,
     pub proxy_name: Option<String>,
     pub client_ip: String,
+    /// Identified consumer username (from gateway Consumer mapping) or external
+    /// authenticated identity (e.g., JWKS subject) set by stream auth plugins.
+    /// `None` when no authentication plugin identified the client.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub consumer_username: Option<String>,
     pub backend_target: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub backend_resolved_ip: Option<String>,
     pub protocol: String,
     pub listen_port: u16,
     pub duration_ms: f64,
+    /// Bytes relayed from the client to the backend
+    /// (gateway-perspective: bytes it sent onward on the client's behalf).
     pub bytes_sent: u64,
+    /// Bytes relayed from the backend to the client
+    /// (gateway-perspective: bytes it received and forwarded back).
     pub bytes_received: u64,
     pub connection_error: Option<String>,
     /// Human-friendly classification of the connection error, if any.
@@ -1171,7 +1180,10 @@ pub fn create_plugin_with_http_client(
             config,
             http_client,
         )?))),
-        "udp_logging" => Ok(Some(Arc::new(udp_logging::UdpLogging::new(config)?))),
+        "udp_logging" => Ok(Some(Arc::new(udp_logging::UdpLogging::new(
+            config,
+            http_client,
+        )?))),
         "kafka_logging" => Ok(Some(Arc::new(kafka_logging::KafkaLogging::new(
             config,
             &http_client,

@@ -17,12 +17,31 @@ use serde_json::Value;
 use std::net::{IpAddr, SocketAddr};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
-use tokio::time::Duration;
+use tokio::time::{Duration, Instant};
 use tracing::warn;
 
 use super::utils::PluginHttpClient;
 use super::{Plugin, StreamTransactionSummary, TransactionSummary};
 use crate::dns::DnsCache;
+
+/// Sanitize a value used in a StatsD tag: strip the delimiters that would break
+/// the line protocol (`,`, `|`, `#`, `:`) and trim surrounding whitespace.
+/// Replaces disallowed chars with `_` so the tag remains parseable.
+fn sanitize_tag_value(input: &str) -> String {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return "none".to_string();
+    }
+    let mut out = String::with_capacity(trimmed.len());
+    for c in trimmed.chars() {
+        match c {
+            ',' | '|' | '#' | ':' | '\n' | '\r' => out.push('_'),
+            c if c.is_whitespace() => out.push('_'),
+            c => out.push(c),
+        }
+    }
+    out
+}
 
 /// Union type for entries sent through the channel.
 #[derive(Clone)]
@@ -165,15 +184,18 @@ fn format_http_metrics(
     global_tags: &str,
     buf: &mut String,
 ) {
-    // Per-request tags: method, status, proxy
-    let method = &summary.http_method;
+    // Per-request tags: method, status, proxy. Operator-controlled values
+    // (proxy name/id) are sanitized so that delimiters in the name don't
+    // corrupt downstream parsing.
+    let method = sanitize_tag_value(&summary.http_method);
     let status = summary.response_status_code;
     let status_class = format!("{}xx", status / 100);
-    let proxy_tag = summary
+    let proxy_raw = summary
         .matched_proxy_name
         .as_deref()
         .or(summary.matched_proxy_id.as_deref())
         .unwrap_or("none");
+    let proxy_tag = sanitize_tag_value(proxy_raw);
 
     let tags = format!(
         "|#method:{method},status:{status},status_class:{status_class},proxy:{proxy_tag}{extra}",
@@ -228,8 +250,9 @@ fn format_stream_metrics(
     global_tags: &str,
     buf: &mut String,
 ) {
-    let protocol = &summary.protocol;
-    let proxy_tag = summary.proxy_name.as_deref().unwrap_or(&summary.proxy_id);
+    let protocol = sanitize_tag_value(&summary.protocol);
+    let proxy_raw = summary.proxy_name.as_deref().unwrap_or(&summary.proxy_id);
+    let proxy_tag = sanitize_tag_value(proxy_raw);
     let has_error = if summary.connection_error.is_some() {
         "true"
     } else {
@@ -300,12 +323,40 @@ async fn resolve_host(
     }
 }
 
+/// Bind a UDP socket whose address family matches the resolved endpoint.
+async fn bind_and_connect(addr: SocketAddr) -> Option<UdpSocket> {
+    let bind_addr = if addr.ip() == IpAddr::from([0u8; 16]) || addr.is_ipv6() {
+        "[::]:0"
+    } else {
+        "0.0.0.0:0"
+    };
+    let socket = match UdpSocket::bind(bind_addr).await {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("statsd_logging: failed to bind UDP socket: {e}");
+            return None;
+        }
+    };
+    if let Err(e) = socket.connect(addr).await {
+        warn!("statsd_logging: failed to connect UDP socket to {addr}: {e}");
+        return None;
+    }
+    Some(socket)
+}
+
+/// How often to re-resolve the StatsD hostname even when sends succeed. DNS is
+/// also re-checked opportunistically on send failures.
+const RE_RESOLVE_INTERVAL: Duration = Duration::from_secs(60);
+
 async fn flush_loop(
     mut receiver: mpsc::Receiver<MetricEntry>,
     cfg: StatsdConfig,
     dns_cache: Option<DnsCache>,
 ) {
-    let addr = match resolve_host(&cfg.hostname, cfg.port, &dns_cache).await {
+    // Initial resolve. If it fails we still drain the channel so producers
+    // don't backpressure the hot path — metrics are dropped until the DNS
+    // situation improves on restart.
+    let mut current_addr = match resolve_host(&cfg.hostname, cfg.port, &dns_cache).await {
         Some(addr) => addr,
         None => {
             warn!(
@@ -316,32 +367,36 @@ async fn flush_loop(
             return;
         }
     };
-
-    // Bind an ephemeral UDP socket matching the resolved address family.
-    let bind_addr = if addr.ip() == IpAddr::from([0u8; 16]) || addr.is_ipv6() {
-        "[::]:0"
-    } else {
-        "0.0.0.0:0"
-    };
-    let socket = match UdpSocket::bind(bind_addr).await {
-        Ok(s) => s,
-        Err(e) => {
-            warn!("statsd_logging: failed to bind UDP socket: {e} — metrics will be lost");
+    let mut socket = match bind_and_connect(current_addr).await {
+        Some(s) => s,
+        None => {
             while receiver.recv().await.is_some() {}
             return;
         }
     };
-    if let Err(e) = socket.connect(addr).await {
-        warn!("statsd_logging: failed to connect UDP socket to {addr}: {e} — metrics will be lost",);
-        while receiver.recv().await.is_some() {}
-        return;
-    }
+    let mut last_resolve = Instant::now();
 
     let mut buffer: Vec<MetricEntry> = Vec::with_capacity(cfg.max_batch_lines);
     let mut timer = tokio::time::interval(cfg.flush_interval);
     timer.tick().await; // consume immediate first tick
 
     loop {
+        // Opportunistic re-resolve. Stale DNS is the main reason StatsD
+        // traffic silently goes into a black hole; 60s is a compromise
+        // between reactivity and resolver load. Always advance the timer
+        // when the interval elapses so a transient DNS failure doesn't pin
+        // the loop into re-resolving on every iteration.
+        if last_resolve.elapsed() >= RE_RESOLVE_INTERVAL {
+            last_resolve = Instant::now();
+            if let Some(new_addr) = resolve_host(&cfg.hostname, cfg.port, &dns_cache).await
+                && new_addr != current_addr
+                && let Some(new_sock) = bind_and_connect(new_addr).await
+            {
+                current_addr = new_addr;
+                socket = new_sock;
+            }
+        }
+
         tokio::select! {
             biased;
 
@@ -422,5 +477,48 @@ async fn send_batch(socket: &UdpSocket, cfg: &StatsdConfig, batch: Vec<MetricEnt
         {
             warn!("statsd_logging: failed to send metrics chunk: {e}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_tag_value_replaces_delimiters() {
+        // StatsD/DogStatsD tag delimiters must not survive in tag values.
+        assert_eq!(sanitize_tag_value("foo,bar"), "foo_bar");
+        assert_eq!(sanitize_tag_value("foo|bar"), "foo_bar");
+        assert_eq!(sanitize_tag_value("foo#bar"), "foo_bar");
+        assert_eq!(sanitize_tag_value("foo:bar"), "foo_bar");
+    }
+
+    #[test]
+    fn sanitize_tag_value_replaces_whitespace_and_newlines() {
+        assert_eq!(sanitize_tag_value("foo bar"), "foo_bar");
+        assert_eq!(sanitize_tag_value("foo\nbar"), "foo_bar");
+        assert_eq!(sanitize_tag_value("foo\r\nbar"), "foo__bar");
+    }
+
+    #[test]
+    fn sanitize_tag_value_preserves_normal_chars() {
+        assert_eq!(sanitize_tag_value("my-proxy_01.abc"), "my-proxy_01.abc");
+    }
+
+    #[test]
+    fn sanitize_tag_value_empty_becomes_none() {
+        assert_eq!(sanitize_tag_value(""), "none");
+        assert_eq!(sanitize_tag_value("   "), "none");
+    }
+
+    #[test]
+    fn sanitize_tag_value_mixed_attack_string() {
+        // The motivating case: an operator-controlled proxy name that
+        // contains several delimiters should be fully neutralized.
+        assert_eq!(
+            sanitize_tag_value("evil,|#:proxy"),
+            "evil____proxy",
+            "delimiter injection must not survive sanitization"
+        );
     }
 }

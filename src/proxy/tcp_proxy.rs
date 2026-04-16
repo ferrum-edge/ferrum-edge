@@ -380,11 +380,13 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
 
                     // Run on_stream_disconnect plugins (logging, metrics, etc.)
                     if !plugins.is_empty() {
+                        let consumer_username = stream_ctx.effective_identity().map(str::to_owned);
                         let summary = StreamTransactionSummary {
                             namespace: proxy_namespace,
                             proxy_id: proxy_id.to_string(),
                             proxy_name,
                             client_ip: remote_addr.ip().to_string(),
+                            consumer_username,
                             backend_target: result.backend.backend_target,
                             backend_resolved_ip: result.backend.backend_resolved_ip,
                             protocol: backend_protocol.to_string(),
