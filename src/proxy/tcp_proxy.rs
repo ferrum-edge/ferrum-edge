@@ -1356,8 +1356,20 @@ where
 ///
 /// Runs the two half-duplex copies concurrently via `tokio::select!` so that
 /// whichever direction fails first is recorded in `first_failure`. Per-direction
-/// byte counts are preserved even when one half errors. After the first half
-/// finishes, the other is given a brief grace period to drain remaining data.
+/// byte counts are preserved even when one half errors.
+///
+/// After Phase 1 (race the two directions) completes, Phase 2 waits for the
+/// remaining direction:
+///
+/// * If Phase 1 ended with a **clean EOF** (one side finished its send without
+///   error), the remaining direction is awaited **unbounded** — this preserves
+///   half-close semantics for request/response protocols (SMTP, IMAP,
+///   HTTP-over-TCP passthrough) where the client finishes sending first and
+///   the backend then takes arbitrary time to respond. The idle timeout still
+///   applies, so a stuck peer cannot wedge the connection indefinitely.
+/// * If Phase 1 ended with an **error** or the **idle timeout** fired, the
+///   remaining direction is awaited with a short 100ms grace window so we
+///   can capture any error it would produce without hanging on a bad peer.
 ///
 /// When `idle_timeout` is `Some(d)` and non-zero, the connection is closed
 /// if no data is received on either side for the given duration.
@@ -1443,32 +1455,105 @@ where
         }
     }
 
-    // Phase 2: let the other half drain briefly so we capture its bytes and
-    // (if it errors first during the grace window) its failure.
+    // Phase 2: drain the remaining direction.
+    //
+    // Two cases:
+    //
+    // * **Clean EOF** (`first_failure.is_none()`): one side finished its send
+    //   without error — most commonly a half-close where the client finished
+    //   sending and the backend is still generating a large/slow response (or
+    //   vice versa). Wait for the remaining direction to complete naturally,
+    //   bounded only by the idle timeout. Capping this at 100ms would truncate
+    //   response bodies on request/response protocols (SMTP, IMAP, HTTP-over-
+    //   TCP passthrough) whenever the peer takes longer than 100ms to respond.
+    //
+    // * **Error or idle timeout** (`first_failure.is_some()`): both halves are
+    //   likely in a bad state. Give the remaining direction a brief grace
+    //   window to capture any error it would produce, then move on. Do not
+    //   block the connection teardown on a stuck peer.
+    let clean_eof = first_failure.is_none();
     if !c2b_done {
-        match tokio::time::timeout(BIDIRECTIONAL_DRAIN_GRACE, &mut c2b_fut).await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                if first_failure.is_none() {
-                    let err: anyhow::Error =
-                        anyhow::anyhow!("Bidirectional copy error (client→backend): {}", e);
-                    first_failure = Some((Direction::ClientToBackend, classify_stream_error(&err)));
+        if clean_eof {
+            // Unbounded wait, still bounded by the idle timeout so a stuck
+            // peer can't wedge the connection indefinitely.
+            loop {
+                tokio::select! {
+                    biased;
+                    result = &mut c2b_fut => {
+                        if let Err(e) = result {
+                            let err: anyhow::Error =
+                                anyhow::anyhow!("Bidirectional copy error (client→backend): {}", e);
+                            first_failure =
+                                Some((Direction::ClientToBackend, classify_stream_error(&err)));
+                        }
+                        break;
+                    }
+                    _ = tokio::time::sleep(Duration::from_secs(1)), if idle_timeout_active => {
+                        if let Some(ref la) = last_activity {
+                            let last = la.load(Ordering::Relaxed);
+                            if coarse_now_ms().saturating_sub(last) >= timeout_ms {
+                                first_failure =
+                                    Some((Direction::Unknown, ErrorClass::ReadWriteTimeout));
+                                break;
+                            }
+                        }
+                    }
                 }
             }
-            Err(_) => { /* grace expired — leave counters as-is */ }
+        } else {
+            match tokio::time::timeout(BIDIRECTIONAL_DRAIN_GRACE, &mut c2b_fut).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    if first_failure.is_none() {
+                        let err: anyhow::Error =
+                            anyhow::anyhow!("Bidirectional copy error (client→backend): {}", e);
+                        first_failure =
+                            Some((Direction::ClientToBackend, classify_stream_error(&err)));
+                    }
+                }
+                Err(_) => { /* grace expired — leave counters as-is */ }
+            }
         }
     }
     if !b2c_done {
-        match tokio::time::timeout(BIDIRECTIONAL_DRAIN_GRACE, &mut b2c_fut).await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                if first_failure.is_none() {
-                    let err: anyhow::Error =
-                        anyhow::anyhow!("Bidirectional copy error (backend→client): {}", e);
-                    first_failure = Some((Direction::BackendToClient, classify_stream_error(&err)));
+        if clean_eof {
+            loop {
+                tokio::select! {
+                    biased;
+                    result = &mut b2c_fut => {
+                        if let Err(e) = result {
+                            let err: anyhow::Error =
+                                anyhow::anyhow!("Bidirectional copy error (backend→client): {}", e);
+                            first_failure =
+                                Some((Direction::BackendToClient, classify_stream_error(&err)));
+                        }
+                        break;
+                    }
+                    _ = tokio::time::sleep(Duration::from_secs(1)), if idle_timeout_active => {
+                        if let Some(ref la) = last_activity {
+                            let last = la.load(Ordering::Relaxed);
+                            if coarse_now_ms().saturating_sub(last) >= timeout_ms {
+                                first_failure =
+                                    Some((Direction::Unknown, ErrorClass::ReadWriteTimeout));
+                                break;
+                            }
+                        }
+                    }
                 }
             }
-            Err(_) => { /* grace expired — leave counters as-is */ }
+        } else {
+            match tokio::time::timeout(BIDIRECTIONAL_DRAIN_GRACE, &mut b2c_fut).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    if first_failure.is_none() {
+                        let err: anyhow::Error =
+                            anyhow::anyhow!("Bidirectional copy error (backend→client): {}", e);
+                        first_failure =
+                            Some((Direction::BackendToClient, classify_stream_error(&err)));
+                    }
+                }
+                Err(_) => { /* grace expired — leave counters as-is */ }
+            }
         }
     }
 

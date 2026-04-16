@@ -165,3 +165,112 @@ async fn test_bidirectional_copy_c2b_bytes_preserved_on_clean_close() {
     assert_eq!(result.bytes_client_to_backend, payload.len() as u64);
     assert_eq!(result.bytes_backend_to_client, 0);
 }
+
+/// Regression: request/response protocols where the client finishes sending
+/// first (half-closes) and the backend then takes significantly longer than
+/// `BIDIRECTIONAL_DRAIN_GRACE` (100ms) to generate the response must not be
+/// truncated. Before the fix, Phase 2 applied a 100ms timeout to the still-
+/// running direction after the first side completed cleanly — this cut off
+/// legitimate slow responses on SMTP, IMAP, and HTTP-over-TCP passthrough.
+/// With the fix, clean EOF on one side transitions to an unbounded wait on
+/// the other (still bounded by the overall idle timeout).
+#[tokio::test]
+async fn test_bidirectional_copy_half_close_delayed_response_not_truncated() {
+    let (client, mut client_peer) = tokio::io::duplex(4096);
+    let (backend, mut backend_peer) = tokio::io::duplex(4096);
+
+    // Client sends a small request, then half-closes its write side.
+    let request = b"REQUEST";
+    tokio::spawn(async move {
+        let _ = client_peer.write_all(request).await;
+        // Half-close write side so the backend sees EOF on its read side.
+        // This corresponds to shutdown(Shutdown::Write) on a real TcpStream.
+        let _ = client_peer.shutdown().await;
+        // Drain whatever the backend sends so the copy doesn't block on
+        // write backpressure.
+        let mut sink = Vec::new();
+        let _ = client_peer.read_to_end(&mut sink).await;
+    });
+
+    // Backend reads the request, delays well past BIDIRECTIONAL_DRAIN_GRACE
+    // (300ms > 100ms), then sends a full response and closes.
+    let response_len: usize = 1024;
+    tokio::spawn(async move {
+        // Drain the request up to EOF (client half-closes).
+        let mut req_buf = vec![0u8; 16];
+        loop {
+            match backend_peer.read(&mut req_buf).await {
+                Ok(0) => break, // peer EOF (client half-closed write)
+                Ok(_) => continue,
+                Err(_) => break,
+            }
+        }
+        // Simulate backend processing time — 300ms is 3x the 100ms grace.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let response = vec![0xAAu8; response_len];
+        let _ = backend_peer.write_all(&response).await;
+        let _ = backend_peer.shutdown().await;
+    });
+
+    // Use a generous idle timeout (5s) so it never fires during the 300ms delay.
+    let result =
+        bidirectional_copy_for_test(client, backend, Some(Duration::from_secs(5)), 8 * 1024).await;
+
+    assert!(
+        result.first_failure.is_none(),
+        "half-close + delayed response should complete cleanly, got {:?}",
+        result.first_failure
+    );
+    // The entire backend response must reach the client — this is the bug
+    // the fix prevents. Without the fix, b2c would be cut off at 100ms.
+    assert_eq!(
+        result.bytes_backend_to_client, response_len as u64,
+        "full backend response must be relayed; got {} of {} bytes",
+        result.bytes_backend_to_client, response_len
+    );
+    assert_eq!(result.bytes_client_to_backend, request.len() as u64);
+}
+
+/// Verify the idle-timeout fallback is still honored during the unbounded
+/// Phase 2 wait. After the client half-closes cleanly, if the backend never
+/// responds, the idle timeout must fire and terminate the connection.
+#[tokio::test]
+async fn test_bidirectional_copy_half_close_idle_timeout_fires_in_phase2() {
+    let (client, mut client_peer) = tokio::io::duplex(4096);
+    let (backend, mut backend_peer) = tokio::io::duplex(4096);
+
+    // Client sends and half-closes immediately.
+    tokio::spawn(async move {
+        let _ = client_peer.write_all(b"PING").await;
+        let _ = client_peer.shutdown().await;
+        let mut sink = Vec::new();
+        let _ = client_peer.read_to_end(&mut sink).await;
+    });
+
+    // Backend reads but NEVER responds — keeps its end open so b2c hangs.
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 16];
+        loop {
+            match backend_peer.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(_) => continue,
+                Err(_) => break,
+            }
+        }
+        // Hold the connection open forever — exit only when the test drops it.
+        std::future::pending::<()>().await;
+    });
+
+    // Very short idle timeout so the test completes quickly.
+    let result =
+        bidirectional_copy_for_test(client, backend, Some(Duration::from_millis(500)), 8 * 1024)
+            .await;
+
+    // Idle timeout must fire — either during Phase 1 or Phase 2.
+    let (dir, class) = result
+        .first_failure
+        .as_ref()
+        .expect("idle timeout on stalled backend must produce first_failure");
+    assert_eq!(*dir, Direction::Unknown);
+    assert_eq!(*class, ErrorClass::ReadWriteTimeout);
+}

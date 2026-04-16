@@ -2100,6 +2100,7 @@ async fn handle_websocket_request_authenticated(
     sticky_cookie_needed: bool,
     start_time: Instant,
     is_h2_websocket: bool,
+    is_tls: bool,
 ) -> Result<Response<ProxyBody>, hyper::Error> {
     info!(
         "WebSocket upgrade request authenticated for proxy: {} from: {}",
@@ -2509,16 +2510,22 @@ async fn handle_websocket_request_authenticated(
     // on_ws_disconnect. Building this here (vs. inside run_websocket_proxy) is
     // effectively free when ws_disconnect_plugins is empty because the strings
     // are moved, not cloned, into an owned struct.
-    // WebSocket upgrades arrive on the main HTTP proxy listener; there is no
-    // per-upgrade "listen_port" distinct from the gateway's HTTP/HTTPS ports.
-    // Populate with the plaintext port as a representative value — operators
-    // already know whether their gateway serves on both via env_config.
+    // WebSocket upgrades arrive on either the plaintext HTTP proxy listener or
+    // the TLS HTTPS/H2 listener. Choose the matching port so disconnect
+    // metadata, logging plugins, and downstream alerts key on the port the
+    // client actually connected to instead of always reporting the plaintext
+    // port (which is misleading — or `0` — on TLS-only deployments).
+    let listen_port = if is_tls {
+        state.env_config.proxy_https_port
+    } else {
+        state.env_config.proxy_http_port
+    };
     let session_meta = WsSessionMeta {
         namespace: proxy.namespace.clone(),
         proxy_name: proxy.name.clone(),
         client_ip: ctx.client_ip.clone(),
         backend_target: strip_query_params(&current_backend_url).to_string(),
-        listen_port: state.env_config.proxy_http_port,
+        listen_port,
         consumer_username: ctx.effective_identity().map(str::to_owned),
         metadata: ctx.metadata.clone(),
         session_start: chrono::Utc::now(),
@@ -4831,6 +4838,7 @@ async fn handle_proxy_request_inner(
             sticky_cookie_needed,
             start_time,
             is_h2_ws,
+            is_tls,
         )
         .await;
     }
