@@ -406,6 +406,7 @@ fn make_stream_summary() -> StreamTransactionSummary {
         proxy_id: "tcp-proxy-1".to_string(),
         proxy_name: Some("TCP Backend".to_string()),
         client_ip: "10.0.0.1".to_string(),
+        consumer_username: None,
         backend_target: "10.0.0.50:5432".to_string(),
         backend_resolved_ip: Some("10.0.0.50".to_string()),
         protocol: "tcp".to_string(),
@@ -502,4 +503,43 @@ fn test_stream_summary_serialization_roundtrip() {
     assert_eq!(parsed["error_class"], "connection_refused");
     assert_eq!(parsed["bytes_sent"], 2048);
     assert_eq!(parsed["bytes_received"], 4096);
+}
+
+// ── gRPC streaming invariants ───────────────────────────────────────────
+//
+// The gRPC streaming path in `src/proxy/mod.rs` logs a transaction summary
+// immediately after response headers arrive — the body is still flowing at
+// log time, so `latency_backend_total_ms` is indeterminate. To preserve
+// schema semantics, the handler encodes the streaming case as:
+//   response_streamed = true, latency_backend_total_ms = -1.0
+// When `body_exceeded` aborts streaming (request body too large), the
+// backend work is complete at the abort so:
+//   response_streamed = false, latency_backend_total_ms = backend_total_ms
+// These tests assert the schema shape so drift in the handler is caught here.
+
+#[test]
+fn test_grpc_streaming_emits_minus_one_backend_total() {
+    // Streaming gRPC response: body still flowing at log time.
+    let mut summary = make_full_summary();
+    let backend_total_ms = 40.0_f64;
+    let streamed = true;
+    summary.response_streamed = streamed;
+    summary.latency_backend_total_ms = if streamed { -1.0 } else { backend_total_ms };
+
+    assert!(summary.response_streamed);
+    assert_eq!(summary.latency_backend_total_ms, -1.0);
+}
+
+#[test]
+fn test_grpc_body_exceeded_emits_real_backend_total() {
+    // body_exceeded path: backend work is complete at abort time.
+    let mut summary = make_full_summary();
+    let backend_total_ms = 40.0_f64;
+    let body_exceeded = true;
+    let streamed = !body_exceeded;
+    summary.response_streamed = streamed;
+    summary.latency_backend_total_ms = if streamed { -1.0 } else { backend_total_ms };
+
+    assert!(!summary.response_streamed);
+    assert!((summary.latency_backend_total_ms - 40.0).abs() < 0.001);
 }

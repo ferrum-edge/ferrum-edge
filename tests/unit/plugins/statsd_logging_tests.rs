@@ -18,6 +18,7 @@ fn make_stream_summary() -> StreamTransactionSummary {
         proxy_id: "tcp-proxy-1".to_string(),
         proxy_name: Some("TCP Test".to_string()),
         client_ip: "127.0.0.1".to_string(),
+        consumer_username: None,
         backend_target: "127.0.0.1:9000".to_string(),
         backend_resolved_ip: None,
         protocol: "tcp".to_string(),

@@ -23,10 +23,15 @@ use async_trait::async_trait;
 use serde_json::Value;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
-use tokio::time::Duration;
+use tokio::time::{Duration, Instant};
 use tracing::warn;
 
+use super::utils::PluginHttpClient;
 use super::{Plugin, StreamTransactionSummary, TransactionSummary};
+use crate::dns::DnsCache;
+
+/// How often to re-resolve the remote UDP endpoint even if sends succeed.
+const RE_RESOLVE_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Union type for log entries sent through the batched channel.
 #[derive(Clone, serde::Serialize)]
@@ -42,7 +47,7 @@ pub struct UdpLogging {
 }
 
 impl UdpLogging {
-    pub fn new(config: &Value) -> Result<Self, String> {
+    pub fn new(config: &Value, http_client: PluginHttpClient) -> Result<Self, String> {
         let host = config["host"]
             .as_str()
             .filter(|s| !s.is_empty())
@@ -96,8 +101,10 @@ impl UdpLogging {
             retry_delay,
         };
 
+        let dns_cache = http_client.dns_cache().cloned();
+
         let (sender, receiver) = mpsc::channel(buffer_capacity);
-        tokio::spawn(flush_loop(receiver, send_config));
+        tokio::spawn(flush_loop(receiver, send_config, dns_cache));
 
         Ok(Self {
             sender,
@@ -184,7 +191,24 @@ impl UdpSender {
     }
 }
 
-async fn resolve_endpoint(host: &str, port: u16) -> Result<SocketAddr, String> {
+/// Resolve the remote UDP endpoint. Prefers the gateway's shared `DnsCache`
+/// (TTL-aware, stale-while-revalidate, background refresh) and falls back to
+/// `tokio::net::lookup_host` when no cache is present (tests / fallback).
+async fn resolve_endpoint(
+    host: &str,
+    port: u16,
+    dns_cache: Option<&DnsCache>,
+) -> Result<SocketAddr, String> {
+    if let Some(cache) = dns_cache {
+        match cache.resolve(host, None, None).await {
+            Ok(ip) => return Ok(SocketAddr::new(ip, port)),
+            Err(e) => {
+                warn!(
+                    "udp_logging: DNS cache resolution failed for '{host}': {e} — falling back to system DNS"
+                );
+            }
+        }
+    }
     use tokio::net::lookup_host;
     let addr_str = format!("{host}:{port}");
     lookup_host(&addr_str)
@@ -194,9 +218,24 @@ async fn resolve_endpoint(host: &str, port: u16) -> Result<SocketAddr, String> {
         .ok_or_else(|| format!("udp_logging: no addresses resolved for {addr_str}"))
 }
 
-async fn create_sender(cfg: &UdpSendConfig) -> Result<UdpSender, String> {
-    let remote_addr = resolve_endpoint(&cfg.host, cfg.port).await?;
+async fn create_sender(
+    cfg: &UdpSendConfig,
+    dns_cache: Option<&DnsCache>,
+) -> Result<(UdpSender, SocketAddr), String> {
+    let remote_addr = resolve_endpoint(&cfg.host, cfg.port, dns_cache).await?;
+    let sender = build_sender_for_addr(cfg, remote_addr).await?;
+    Ok((sender, remote_addr))
+}
 
+/// Bind an ephemeral local UDP socket, connect to `remote_addr`, and (if
+/// configured) complete a DTLS handshake. Extracted from `create_sender` so the
+/// periodic re-resolve path in `flush_loop` can rebuild the sender only when
+/// the resolved address actually changes, reusing the cached `SocketAddr`
+/// without a second DNS lookup.
+async fn build_sender_for_addr(
+    cfg: &UdpSendConfig,
+    remote_addr: SocketAddr,
+) -> Result<UdpSender, String> {
     // Bind to an ephemeral local port — use IPv4 or IPv6 to match the remote
     let bind_addr: SocketAddr = if remote_addr.is_ipv4() {
         "0.0.0.0:0".parse().unwrap()
@@ -262,10 +301,14 @@ async fn create_sender(cfg: &UdpSendConfig) -> Result<UdpSender, String> {
     }
 }
 
-async fn flush_loop(mut receiver: mpsc::Receiver<LogEntry>, cfg: UdpSendConfig) {
+async fn flush_loop(
+    mut receiver: mpsc::Receiver<LogEntry>,
+    cfg: UdpSendConfig,
+    dns_cache: Option<DnsCache>,
+) {
     // Establish the UDP/DTLS connection. On failure, log and drain the channel.
-    let sender = match create_sender(&cfg).await {
-        Ok(s) => s,
+    let (mut sender, mut current_addr) = match create_sender(&cfg, dns_cache.as_ref()).await {
+        Ok(pair) => pair,
         Err(e) => {
             warn!("udp_logging: failed to create sender, logs will be dropped: {e}");
             while receiver.recv().await.is_some() {}
@@ -278,8 +321,32 @@ async fn flush_loop(mut receiver: mpsc::Receiver<LogEntry>, cfg: UdpSendConfig) 
     // The first tick completes immediately — consume it so the first real
     // flush waits for one full interval.
     timer.tick().await;
+    // Periodic DNS re-resolution so a changing A/AAAA record propagates
+    // without requiring a gateway restart. Plain UDP can re-bind cheaply;
+    // DTLS reconnection is expensive, so we skip the re-resolve branch
+    // entirely when DTLS is enabled.
+    let mut last_resolve = Instant::now();
 
     loop {
+        // DTLS reconnection is expensive (full handshake) — skip the entire
+        // re-resolve branch when DTLS is enabled so we don't tear down the
+        // session on every iteration. For plain UDP, only rebuild the sender
+        // when the resolved address has actually changed: a bind + connect
+        // every 60s under stable DNS would rotate the source port and pause
+        // the channel drain while the new socket is created. Always advance
+        // the timer when the interval elapses so transient DNS failures don't
+        // cause tight re-resolve loops.
+        if !cfg.dtls_enabled && last_resolve.elapsed() >= RE_RESOLVE_INTERVAL {
+            last_resolve = Instant::now();
+            if let Ok(new_addr) = resolve_endpoint(&cfg.host, cfg.port, dns_cache.as_ref()).await
+                && new_addr != current_addr
+                && let Ok(new_sender) = build_sender_for_addr(&cfg, new_addr).await
+            {
+                sender = new_sender;
+                current_addr = new_addr;
+            }
+        }
+
         tokio::select! {
             biased;
 

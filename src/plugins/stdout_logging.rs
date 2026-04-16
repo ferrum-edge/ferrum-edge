@@ -7,6 +7,7 @@
 
 use async_trait::async_trait;
 use serde_json::Value;
+use tracing::warn;
 
 use super::{Plugin, TransactionSummary};
 
@@ -33,14 +34,16 @@ impl Plugin for StdoutLogging {
     }
 
     async fn log(&self, summary: &TransactionSummary) {
-        if let Ok(json) = serde_json::to_string(summary) {
-            tracing::info!(target: "access_log", "{}", json);
+        match serde_json::to_string(summary) {
+            Ok(json) => tracing::info!(target: "access_log", "{}", json),
+            Err(e) => warn!("stdout_logging: failed to serialize transaction summary: {e}"),
         }
     }
 
     async fn on_stream_disconnect(&self, summary: &super::StreamTransactionSummary) {
-        if let Ok(json) = serde_json::to_string(summary) {
-            tracing::info!(target: "access_log", "{}", json);
+        match serde_json::to_string(summary) {
+            Ok(json) => tracing::info!(target: "access_log", "{}", json),
+            Err(e) => warn!("stdout_logging: failed to serialize stream summary: {e}"),
         }
     }
 }

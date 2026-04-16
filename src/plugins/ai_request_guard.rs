@@ -10,9 +10,10 @@
 
 use async_trait::async_trait;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tracing::debug;
 
+use super::utils::json_escape::escape_json_string;
 use super::{Plugin, PluginResult, RequestContext};
 
 /// Action to take when max_tokens exceeds the limit.
@@ -26,8 +27,8 @@ pub struct AiRequestGuard {
     max_tokens_limit: Option<u64>,
     enforce_max_tokens: MaxTokensAction,
     default_max_tokens: Option<u64>,
-    allowed_models: Vec<String>,
-    blocked_models: Vec<String>,
+    allowed_models: HashSet<String>,
+    blocked_models: HashSet<String>,
     require_user_field: bool,
     max_messages: Option<u64>,
     max_prompt_characters: Option<u64>,
@@ -51,7 +52,7 @@ impl AiRequestGuard {
             };
         let default_max_tokens = config["default_max_tokens"].as_u64();
 
-        let allowed_models: Vec<String> = config["allowed_models"]
+        let allowed_models: HashSet<String> = config["allowed_models"]
             .as_array()
             .map(|arr| {
                 arr.iter()
@@ -60,7 +61,7 @@ impl AiRequestGuard {
             })
             .unwrap_or_default();
 
-        let blocked_models: Vec<String> = config["blocked_models"]
+        let blocked_models: HashSet<String> = config["blocked_models"]
             .as_array()
             .map(|arr| {
                 arr.iter()
@@ -109,6 +110,16 @@ impl AiRequestGuard {
             || block_system_prompts
             || !required_metadata_fields.is_empty();
 
+        // Reject configs that would make the plugin a no-op: at least one
+        // policy must be configured for the plugin to do anything useful.
+        if !requires_request_body {
+            return Err("ai_request_guard: at least one policy must be configured \
+                 (max_tokens_limit, default_max_tokens, allowed_models, blocked_models, \
+                 require_user_field, max_messages, max_prompt_characters, \
+                 temperature_range, block_system_prompts, or required_metadata_fields)"
+                .to_string());
+        }
+
         Ok(Self {
             max_tokens_limit,
             enforce_max_tokens,
@@ -132,7 +143,8 @@ impl AiRequestGuard {
         if let Some(model) = json.get("model").and_then(|v| v.as_str()) {
             let model_lower = model.to_lowercase();
 
-            if !self.blocked_models.is_empty() && self.blocked_models.contains(&model_lower) {
+            if !self.blocked_models.is_empty() && self.blocked_models.contains(model_lower.as_str())
+            {
                 return Err((
                     "Model not allowed".to_string(),
                     format!(
@@ -142,7 +154,9 @@ impl AiRequestGuard {
                 ));
             }
 
-            if !self.allowed_models.is_empty() && !self.allowed_models.contains(&model_lower) {
+            if !self.allowed_models.is_empty()
+                && !self.allowed_models.contains(model_lower.as_str())
+            {
                 return Err((
                     "Model not allowed".to_string(),
                     format!(
@@ -277,14 +291,6 @@ fn count_message_characters(msg: &Value) -> u64 {
             .sum(),
         _ => 0,
     }
-}
-
-/// Escape special characters for safe JSON string interpolation.
-fn escape_json_string(s: &str) -> String {
-    s.replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('<', "\\u003c")
-        .replace('>', "\\u003e")
 }
 
 #[async_trait]

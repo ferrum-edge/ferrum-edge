@@ -43,6 +43,7 @@ fn make_summary(metadata: HashMap<String, String>) -> StreamTransactionSummary {
         proxy_id: "tcp-proxy".to_string(),
         proxy_name: Some("TCP Proxy".to_string()),
         client_ip: "127.0.0.1".to_string(),
+        consumer_username: None,
         backend_target: "127.0.0.1:5432".to_string(),
         backend_resolved_ip: Some("127.0.0.1".to_string()),
         protocol: "tcp".to_string(),

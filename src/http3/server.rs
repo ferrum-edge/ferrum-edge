@@ -1178,7 +1178,9 @@ async fn handle_h3_request(
                     latency_gateway_overhead_ms: (gateway_processing_ms - plugin_execution_ms)
                         .max(0.0),
                     request_user_agent: proxy_headers.get("user-agent").cloned(),
-                    response_streamed: true,
+                    // Backend connection failed before any streaming began — the 502
+                    // response body is built and sent synchronously below.
+                    response_streamed: false,
                     client_disconnected: false,
                     error_class: Some(h3_error_class),
                     body_error_class: None,

@@ -66,6 +66,9 @@ struct UdpSession {
     backend_resolved_ip: String,
     /// SNI hostname extracted from the first DTLS ClientHello during passthrough mode.
     sni_hostname: Option<String>,
+    /// Identified consumer username (gateway Consumer or external identity) resolved
+    /// during `on_stream_connect`. Carried to `on_stream_disconnect` for logging.
+    consumer_username: Option<String>,
     /// Plugin metadata from on_stream_connect, carried to on_stream_disconnect.
     metadata: std::sync::Mutex<std::collections::HashMap<String, String>>,
 }
@@ -110,6 +113,7 @@ fn build_udp_stream_summary(context: UdpDisconnectContext<'_>) -> StreamTransact
         proxy_id: context.proxy_id.to_string(),
         proxy_name: context.proxy_name.map(|name| name.to_string()),
         client_ip: context.client_addr.ip().to_string(),
+        consumer_username: context.session.consumer_username.clone(),
         backend_target: context.session.backend_target.clone(),
         backend_resolved_ip: Some(context.session.backend_resolved_ip.clone()),
         protocol: context.backend_protocol.to_string(),
@@ -147,6 +151,7 @@ struct DtlsDisconnectContext<'a> {
     proxy_id: &'a str,
     proxy_name: Option<&'a str>,
     client_addr: SocketAddr,
+    consumer_username: Option<String>,
     backend_target: &'a str,
     backend_resolved_ip: Option<&'a str>,
     backend_protocol: BackendProtocol,
@@ -168,6 +173,7 @@ fn build_dtls_stream_summary(context: DtlsDisconnectContext<'_>) -> StreamTransa
         proxy_id: context.proxy_id.to_string(),
         proxy_name: context.proxy_name.map(|name| name.to_string()),
         client_ip: context.client_addr.ip().to_string(),
+        consumer_username: context.consumer_username,
         backend_target: context.backend_target.to_string(),
         backend_resolved_ip: context.backend_resolved_ip.map(str::to_string),
         protocol: context.backend_protocol.to_string(),
@@ -1159,6 +1165,7 @@ async fn start_dtls_frontend_listener(
                 let handler_plugins = plugins.clone();
                 let handler_proxy_name = proxy_name.clone();
                 let handler_proxy_namespace = proxy_namespace.clone();
+                let handler_consumer_username = stream_ctx.effective_identity().map(str::to_owned);
                 let handler_metadata = stream_ctx.take_metadata();
                 let handler_cb_cache = circuit_breaker_cache.clone();
                 let connected_at = chrono::Utc::now();
@@ -1212,6 +1219,7 @@ async fn start_dtls_frontend_listener(
                             proxy_id: &handler_proxy_id,
                             proxy_name: handler_proxy_name.as_deref(),
                             client_addr,
+                            consumer_username: handler_consumer_username.clone(),
                             backend_target: &result.backend.backend_target,
                             backend_resolved_ip: result.backend.backend_resolved_ip.as_deref(),
                             backend_protocol,
@@ -1959,6 +1967,7 @@ async fn create_session(
     }
 
     let now = coarse_epoch_millis();
+    let consumer_username = stream_ctx.effective_identity().map(str::to_owned);
     let session = Arc::new(UdpSession {
         backend_socket: backend_socket.clone(),
         dtls_conn: dtls_conn.clone(),
@@ -1970,6 +1979,7 @@ async fn create_session(
         backend_target: format!("{}:{}", backend_host, backend_port),
         backend_resolved_ip: resolved_ip.to_string(),
         sni_hostname: stream_ctx.sni_hostname.clone(),
+        consumer_username,
         metadata: std::sync::Mutex::new(stream_ctx.take_metadata()),
     });
 
@@ -2517,6 +2527,7 @@ mod tests {
             backend_target: "10.0.0.50:5353".to_string(),
             backend_resolved_ip: "10.0.0.50".to_string(),
             sni_hostname: None,
+            consumer_username: None,
             metadata: std::sync::Mutex::new(HashMap::from([(
                 "request_id".to_string(),
                 "stream-123".to_string(),
@@ -2536,6 +2547,7 @@ mod tests {
             proxy_id: "dtls-proxy",
             proxy_name: Some("DTLS Proxy"),
             client_addr,
+            consumer_username: Some("alice".to_string()),
             backend_target: "10.0.0.60:7443",
             backend_resolved_ip: Some("10.0.0.60"),
             backend_protocol: BackendProtocol::Dtls,
@@ -2554,6 +2566,7 @@ mod tests {
         assert_eq!(summary.proxy_id, "dtls-proxy");
         assert_eq!(summary.proxy_name.as_deref(), Some("DTLS Proxy"));
         assert_eq!(summary.client_ip, "127.0.0.1");
+        assert_eq!(summary.consumer_username.as_deref(), Some("alice"));
         assert_eq!(summary.backend_target, "10.0.0.60:7443");
         assert_eq!(summary.backend_resolved_ip.as_deref(), Some("10.0.0.60"));
         assert_eq!(summary.protocol, "dtls");

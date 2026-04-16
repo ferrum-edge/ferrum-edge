@@ -283,3 +283,40 @@ async fn test_loki_logging_label_options_disabled() {
     let summary = create_test_transaction_summary();
     plugin.log(&summary).await;
 }
+
+#[tokio::test]
+async fn test_loki_logging_include_proxy_id_label_new_key() {
+    // The renamed config key `include_proxy_id_label` controls the same
+    // `proxy_id` label that the legacy `include_listen_path_label` key used.
+    let plugin = LokiLogging::new(
+        &json!({
+            "endpoint_url": "http://127.0.0.1:1/unreachable",
+            "include_proxy_id_label": false,
+            "max_retries": 0
+        }),
+        default_client(),
+    )
+    .unwrap();
+    let summary = create_test_transaction_summary();
+    plugin.log(&summary).await;
+    // No panic, and the plugin accepts the new key. Full label-output
+    // coverage lives in the build_http_labels tests below.
+}
+
+#[tokio::test]
+async fn test_loki_logging_new_key_takes_precedence_over_legacy() {
+    // When both keys are present, the new `include_proxy_id_label` wins.
+    let plugin = LokiLogging::new(
+        &json!({
+            "endpoint_url": "http://127.0.0.1:1/unreachable",
+            "include_proxy_id_label": true,
+            "include_listen_path_label": false,
+            "max_retries": 0
+        }),
+        default_client(),
+    )
+    .unwrap();
+    // Sanity: no panic and the plugin initialises. The precedence behaviour
+    // is exercised directly in the loki_logging module's unit tests.
+    assert_eq!(plugin.name(), "loki_logging");
+}

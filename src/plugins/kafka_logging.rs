@@ -75,10 +75,17 @@ impl KafkaLogging {
 
         let flush_timeout_seconds = config["flush_timeout_seconds"].as_u64().unwrap_or(5).max(1);
 
-        let key_field = match config["key_field"].as_str().unwrap_or("client_ip") {
-            "proxy_id" => KeyField::ProxyId,
-            "none" => KeyField::None,
-            _ => KeyField::ClientIp,
+        let key_field = match config["key_field"].as_str() {
+            None => KeyField::ClientIp,
+            Some("client_ip") => KeyField::ClientIp,
+            Some("proxy_id") => KeyField::ProxyId,
+            Some("none") => KeyField::None,
+            Some(other) => {
+                return Err(format!(
+                    "kafka_logging: unsupported key_field '{other}' \
+                     (use client_ip/proxy_id/none)"
+                ));
+            }
         };
 
         // Build rdkafka ClientConfig — librdkafka handles batching, compression, retries.

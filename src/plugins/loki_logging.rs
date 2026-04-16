@@ -58,8 +58,10 @@ struct LokiBatchConfig {
 struct LabelConfig {
     /// Static labels merged into every entry (e.g., service, env).
     static_labels: BTreeMap<String, String>,
-    /// Whether to add `listen_path` as a label (default true).
-    include_listen_path: bool,
+    /// Whether to add `proxy_id` as a label (default true). Controlled by
+    /// `include_proxy_id_label` (preferred) or the legacy
+    /// `include_listen_path_label` name for backward compatibility.
+    include_proxy_id: bool,
     /// Whether to add status class (2xx/3xx/4xx/5xx) as a label (default true).
     include_status_class: bool,
 }
@@ -118,8 +120,12 @@ impl LokiLogging {
             static_labels.insert("service".to_string(), "ferrum-edge".to_string());
         }
 
-        let include_listen_path = config["include_listen_path_label"]
+        // Prefer the new `include_proxy_id_label` key; fall back to the legacy
+        // `include_listen_path_label` (which also controlled the `proxy_id`
+        // label — the old name was misleading) for backward compatibility.
+        let include_proxy_id = config["include_proxy_id_label"]
             .as_bool()
+            .or_else(|| config["include_listen_path_label"].as_bool())
             .unwrap_or(true);
         let include_status_class = config["include_status_class_label"]
             .as_bool()
@@ -127,7 +133,7 @@ impl LokiLogging {
 
         let label_config = LabelConfig {
             static_labels,
-            include_listen_path,
+            include_proxy_id,
             include_status_class,
         };
 
@@ -170,7 +176,7 @@ impl LokiLogging {
     /// Build labels for an HTTP/gRPC/WebSocket transaction.
     fn build_http_labels(&self, summary: &TransactionSummary) -> BTreeMap<String, String> {
         let mut labels = self.label_config.static_labels.clone();
-        if self.label_config.include_listen_path
+        if self.label_config.include_proxy_id
             && let Some(ref proxy_id) = summary.matched_proxy_id
         {
             labels.insert("proxy_id".to_string(), proxy_id.clone());
@@ -187,7 +193,7 @@ impl LokiLogging {
     /// Build labels for a TCP/UDP stream transaction.
     fn build_stream_labels(&self, summary: &StreamTransactionSummary) -> BTreeMap<String, String> {
         let mut labels = self.label_config.static_labels.clone();
-        if self.label_config.include_listen_path {
+        if self.label_config.include_proxy_id {
             labels.insert("proxy_id".to_string(), summary.proxy_id.clone());
         }
         labels.insert("protocol".to_string(), summary.protocol.clone());
@@ -408,12 +414,26 @@ async fn send_batch(cfg: &LokiBatchConfig, batch: Vec<LokiEntry>) {
         match cfg.http_client.execute(req, "loki_logging").await {
             Ok(response) if response.status().is_success() => return,
             Ok(response) => {
+                let status = response.status();
                 warn!(
                     "Loki logging batch failed with status {} (attempt {}/{})",
-                    response.status(),
-                    attempt,
-                    total_attempts,
+                    status, attempt, total_attempts,
                 );
+                // 4xx is a client error (bad payload, auth) — retrying won't
+                // fix it. Exceptions: 408 (Request Timeout) and 429 (Too Many
+                // Requests) are transient throttling signals (Loki uses 429
+                // for ingestion rate-limits) and should be retried within the
+                // configured budget.
+                if status.is_client_error()
+                    && status != reqwest::StatusCode::REQUEST_TIMEOUT
+                    && status != reqwest::StatusCode::TOO_MANY_REQUESTS
+                {
+                    warn!(
+                        "Loki logging batch discarded due to {} response ({} entries lost)",
+                        status, entry_count,
+                    );
+                    return;
+                }
             }
             Err(e) => {
                 warn!(
@@ -444,4 +464,94 @@ fn gzip_json(value: &Value) -> Result<Vec<u8>, std::io::Error> {
     let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
     encoder.write_all(&json_bytes)?;
     encoder.finish()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::plugins::utils::PluginHttpClient;
+    use serde_json::json;
+
+    fn client() -> PluginHttpClient {
+        PluginHttpClient::default()
+    }
+
+    fn make_summary(status: u16, proxy_id: Option<&str>) -> TransactionSummary {
+        TransactionSummary {
+            namespace: "ferrum".to_string(),
+            timestamp_received: "2026-04-01T00:00:00Z".to_string(),
+            client_ip: "10.0.0.1".to_string(),
+            consumer_username: None,
+            http_method: "GET".to_string(),
+            request_path: "/t".to_string(),
+            matched_proxy_id: proxy_id.map(str::to_owned),
+            matched_proxy_name: None,
+            backend_target_url: None,
+            backend_resolved_ip: None,
+            response_status_code: status,
+            latency_total_ms: 1.0,
+            latency_gateway_processing_ms: 1.0,
+            latency_backend_ttfb_ms: 0.0,
+            latency_backend_total_ms: 0.0,
+            latency_plugin_execution_ms: 0.0,
+            latency_plugin_external_io_ms: 0.0,
+            latency_gateway_overhead_ms: 0.0,
+            request_user_agent: None,
+            response_streamed: false,
+            client_disconnected: false,
+            error_class: None,
+            mirror: false,
+            metadata: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn label_legacy_key_controls_proxy_id_label() {
+        // Backward compat: `include_listen_path_label` (old name) must still
+        // suppress the `proxy_id` label when callers explicitly set it false.
+        let plugin = LokiLogging::new(
+            &json!({
+                "endpoint_url": "http://127.0.0.1:1/loki/api/v1/push",
+                "include_listen_path_label": false,
+                "include_status_class_label": false,
+            }),
+            client(),
+        )
+        .unwrap();
+        let summary = make_summary(200, Some("p-1"));
+        let labels = plugin.build_http_labels(&summary);
+        assert!(!labels.contains_key("proxy_id"));
+        assert!(!labels.contains_key("status_class"));
+    }
+
+    #[test]
+    fn label_new_key_takes_precedence_over_legacy() {
+        // When both keys are set with opposing values, the new
+        // `include_proxy_id_label` wins.
+        let plugin = LokiLogging::new(
+            &json!({
+                "endpoint_url": "http://127.0.0.1:1/loki/api/v1/push",
+                "include_proxy_id_label": true,
+                "include_listen_path_label": false,
+            }),
+            client(),
+        )
+        .unwrap();
+        let summary = make_summary(500, Some("p-2"));
+        let labels = plugin.build_http_labels(&summary);
+        assert_eq!(labels.get("proxy_id").map(String::as_str), Some("p-2"));
+    }
+
+    #[test]
+    fn label_default_includes_proxy_id() {
+        let plugin = LokiLogging::new(
+            &json!({ "endpoint_url": "http://127.0.0.1:1/loki/api/v1/push" }),
+            client(),
+        )
+        .unwrap();
+        let summary = make_summary(200, Some("p-3"));
+        let labels = plugin.build_http_labels(&summary);
+        assert_eq!(labels.get("proxy_id").map(String::as_str), Some("p-3"));
+        assert_eq!(labels.get("status_class").map(String::as_str), Some("2xx"));
+    }
 }

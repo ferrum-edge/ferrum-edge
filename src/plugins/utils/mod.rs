@@ -6,6 +6,7 @@
 pub mod aws_sigv4;
 pub mod body_transform;
 pub mod http_client;
+pub mod json_escape;
 pub mod jwks_cache;
 pub mod jwks_store;
 pub mod redis_rate_limiter;

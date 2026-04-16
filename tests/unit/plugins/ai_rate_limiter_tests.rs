@@ -612,3 +612,139 @@ async fn test_reads_tokens_from_ai_token_metrics_metadata() {
         Some(429),
     );
 }
+
+// ─── Config validation (rejects unknown enum values) ───────────────────
+
+#[test]
+fn test_invalid_count_mode_rejected() {
+    let err = AiRateLimiter::new(
+        &json!({"token_limit": 100, "count_mode": "completion_token"}),
+        PluginHttpClient::default(),
+    )
+    .err()
+    .unwrap();
+    assert!(err.contains("count_mode"), "got: {err}");
+}
+
+#[test]
+fn test_invalid_limit_by_rejected() {
+    let err = AiRateLimiter::new(
+        &json!({"token_limit": 100, "limit_by": "consumr"}),
+        PluginHttpClient::default(),
+    )
+    .err()
+    .unwrap();
+    assert!(err.contains("limit_by"), "got: {err}");
+}
+
+#[test]
+fn test_valid_count_mode_accepted() {
+    for mode in ["prompt_tokens", "completion_tokens", "total_tokens"] {
+        AiRateLimiter::new(
+            &json!({"token_limit": 100, "count_mode": mode}),
+            PluginHttpClient::default(),
+        )
+        .unwrap_or_else(|e| panic!("count_mode '{mode}' should be valid: {e}"));
+    }
+}
+
+#[test]
+fn test_valid_limit_by_accepted() {
+    for value in ["consumer", "ip"] {
+        AiRateLimiter::new(
+            &json!({"token_limit": 100, "limit_by": value}),
+            PluginHttpClient::default(),
+        )
+        .unwrap_or_else(|e| panic!("limit_by '{value}' should be valid: {e}"));
+    }
+}
+
+// ─── Anthropic SSE token merging (partial state) ───────────────────────
+
+#[tokio::test]
+async fn test_anthropic_sse_only_message_delta_records_completion_tokens() {
+    // SSE stream with ONLY a message_delta event (no message_start). The
+    // previous behavior dropped the entire token count because total_tokens
+    // remained None. The fix recovers from partial state by treating the
+    // available count as the total.
+    let plugin = AiRateLimiter::new(
+        &json!({"token_limit": 1000, "window_seconds": 60, "provider": "anthropic"}),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = create_test_context();
+    let mut headers = HashMap::new();
+    let res = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_continue(res);
+
+    let sse = b"data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":750}}\n\n";
+    let mut resp_headers = HashMap::new();
+    resp_headers.insert("content-type".to_string(), "text/event-stream".to_string());
+    plugin
+        .on_response_body(&mut ctx, 200, &resp_headers, sse)
+        .await;
+
+    let mut ctx2 = create_test_context();
+    let mut headers2 = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx2, &mut headers2).await);
+
+    let sse2 = b"data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":300}}\n\n";
+    plugin
+        .on_response_body(&mut ctx2, 200, &resp_headers, sse2)
+        .await;
+
+    // 750 + 300 = 1050 → exceeds 1000 → next request must be rejected.
+    let mut ctx3 = create_test_context();
+    let mut headers3 = HashMap::new();
+    assert_reject(
+        plugin.before_proxy(&mut ctx3, &mut headers3).await,
+        Some(429),
+    );
+}
+
+// ─── TokenWindow running-sum invariant ─────────────────────────────────
+
+#[tokio::test]
+async fn test_window_running_sum_matches_after_eviction() {
+    // Record some tokens, sleep past the window, record more, then verify
+    // the visible "remaining" budget reflects only the unexpired portion.
+    // Verifies the running-sum bookkeeping handles eviction correctly.
+    let plugin = AiRateLimiter::new(
+        &json!({
+            "token_limit": 200,
+            "window_seconds": 1,
+            "expose_headers": true,
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = create_test_context();
+    let mut resp_headers = HashMap::new();
+    resp_headers.insert("content-type".to_string(), "application/json".to_string());
+
+    let body100 = openai_response(50, 50);
+    plugin
+        .on_response_body(&mut ctx, 200, &resp_headers, &body100)
+        .await;
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let body50 = openai_response(20, 30);
+    plugin
+        .on_response_body(&mut ctx, 200, &resp_headers, &body50)
+        .await;
+
+    // Next call should see remaining = 200 - 50 = 150.
+    let mut ctx2 = create_test_context();
+    let mut headers2 = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx2, &mut headers2).await);
+    let remaining = ctx2
+        .metadata
+        .get("ai_ratelimit_remaining")
+        .map(|v| v.parse::<u64>().unwrap_or(0))
+        .unwrap_or(0);
+    assert_eq!(
+        remaining, 150,
+        "expected remaining=150 after expired entry evicted, got {remaining}"
+    );
+}

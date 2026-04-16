@@ -163,6 +163,8 @@ Sends transaction summaries as JSON to an external HTTP endpoint. Entries are bu
 
 Batches are flushed when `batch_size` is reached **or** `flush_interval_ms` elapses, whichever comes first.
 
+Retries fire on transport errors and 5xx responses. A **4xx response other than 408 or 429 aborts the batch immediately** (retrying a malformed or unauthorized payload just delays the drop) — fix the endpoint URL, authorization header, or field schema rather than waiting through `max_retries × retry_delay_ms`. 408 (Request Timeout) and 429 (Too Many Requests) are transient throttling signals and are retried within the configured budget.
+
 `endpoint_url` must be a valid `http://` or `https://` URL with a hostname. Malformed or non-HTTP URLs reject plugin creation at config load time instead of failing later in the background flush task.
 
 `custom_headers` accepts a JSON object of header name → value pairs. All headers are sent with every batch POST request. This supports services that require non-standard authentication headers (e.g., `DD-API-KEY` for Datadog, `Api-Key` for New Relic, `X-Sumo-Category` for Sumo Logic). Use `Authorization` as a key for services that authenticate via the standard Authorization header (e.g., Splunk HEC, Logtail).
@@ -386,6 +388,10 @@ Sends transaction metrics to a StatsD-compatible server (StatsD, Datadog DogStat
 
 Metrics are flushed when `max_batch_lines` is reached **or** `flush_interval_ms` elapses, whichever comes first. Large payloads are automatically split across multiple UDP packets at 1472-byte MTU boundaries.
 
+**DNS handling.** The StatsD endpoint is resolved through the gateway's shared `DnsCache` at startup (pre-warmed via `warmup_hostnames()`) and re-resolved every 60 seconds by the background flush task. If the resolved address changes (DNS flip, service discovery update), the UDP socket is rebound to the new address without a gateway restart.
+
+**Tag sanitization.** Operator-controlled tag values (proxy name/id, HTTP method, protocol) are sanitized before being written to the line protocol: `,` `|` `#` `:` and whitespace are replaced with `_`. Empty values become the literal `none`. This keeps a proxy name containing delimiters from corrupting downstream parsing in StatsD / DogStatsD / Telegraf.
+
 **Metrics emitted per HTTP/gRPC/WebSocket request:**
 
 | Metric | Type | Description |
@@ -535,6 +541,8 @@ Batches are flushed when `batch_size` is reached **or** `flush_interval_ms` elap
 
 **Datagram size:** Operators should size `batch_size` to keep serialized payloads under the network MTU (typically ~1400 bytes for DTLS, ~1472 bytes for plain UDP over Ethernet). Oversized datagrams may be fragmented or dropped by the network.
 
+**DNS handling:** The UDP endpoint is resolved through the gateway's shared `DnsCache` (TTL-aware, stale-while-revalidate, background refresh). For plain UDP, the background flush task re-resolves every 60 seconds and rebinds the socket if the address changes — DNS flips propagate without a restart. DTLS sessions are not re-handshaken mid-session.
+
 ```yaml
 plugin_name: udp_logging
 config:
@@ -571,7 +579,7 @@ Produces transaction summaries as JSON messages to an Apache Kafka topic. Uses a
 |---|---|---|---|
 | `broker_list` | String | *(required)* | Comma-separated Kafka broker addresses (e.g., `broker1:9092,broker2:9092`) |
 | `topic` | String | *(required)* | Kafka topic to produce messages to |
-| `key_field` | String | `"client_ip"` | Partition key field: `client_ip`, `proxy_id`, or `none` (round-robin) |
+| `key_field` | String | `"client_ip"` | Partition key field: `client_ip`, `proxy_id`, or `none` (round-robin). Any other value is rejected at plugin construction time so operator typos surface immediately instead of silently falling back to `client_ip` |
 | `buffer_capacity` | Integer | `10000` | Channel capacity — new entries are dropped when full. Each entry is a serialized JSON `TransactionSummary` (~1-2 KB), so the default 10,000 entries may use ~10-20 MB of memory |
 | `compression` | String | `"lz4"` | Compression: `none`, `gzip`, `snappy`, `lz4`, `zstd` |
 | `flush_timeout_seconds` | Integer | `5` | Seconds to wait for librdkafka to flush pending messages during graceful shutdown |
@@ -683,19 +691,21 @@ All logging plugins (`stdout_logging`, `http_logging`, `tcp_logging`, `udp_loggi
 | `proxy_id` | String | Proxy ID |
 | `proxy_name` | String or null | Proxy name |
 | `client_ip` | String | Client IP |
+| `consumer_username` | String or null | Identified consumer username (gateway Consumer) or external authenticated identity resolved during `on_stream_connect`. Omitted from JSON when null |
 | `backend_target` | String | Backend target (`host:port`); empty if target resolution failed before LB/config lookup |
 | `backend_resolved_ip` | String or null | DNS-resolved backend IP; omitted from JSON when null |
 | `protocol` | String | Protocol string: `tcp`, `tcp_tls`, `udp`, or `dtls` |
 | `listen_port` | u16 | Proxy listen port |
 | `duration_ms` | f64 | Connection/session lifetime in milliseconds |
-| `bytes_sent` | u64 | Bytes sent to backend |
-| `bytes_received` | u64 | Bytes received from backend |
+| `bytes_sent` | u64 | Bytes the gateway **relayed from the client to the backend** (client→backend direction) |
+| `bytes_received` | u64 | Bytes the gateway **relayed from the backend to the client** (backend→client direction) |
 | `connection_error` | String or null | Error message if the connection failed |
 | `error_class` | String or null | Error classification; omitted from JSON when null |
 | `disconnect_direction` | String or null | Which half of the stream errored first: `"client_to_backend"`, `"backend_to_client"`, or `"unknown"`. Omitted when null |
 | `disconnect_cause` | String or null | Session termination cause: `"idle_timeout"`, `"recv_error"` (frontend recv failed), `"backend_error"` (backend recv failed), or `"graceful_shutdown"`. Disambiguates idle timeouts from recv errors (previously both presented as `error_class: null`). Omitted when null |
 | `timestamp_connected` | String (RFC 3339) | Connection start time |
 | `timestamp_disconnected` | String (RFC 3339) | Connection end time |
+| `sni_hostname` | String or null | SNI from TLS/DTLS ClientHello when passthrough mode is enabled; omitted from JSON when null |
 | `metadata` | Object | Plugin-injected key-value pairs; omitted from JSON when empty |
 
 #### Example: HTTP/1.1 or HTTP/2 (Buffered Response)
@@ -992,7 +1002,7 @@ Ships transaction logs to Grafana Loki via the push API (`POST /loki/api/v1/push
 | `authorization_header` | string | (none) | `Authorization` header value (Bearer/Basic) |
 | `custom_headers` | object | `{}` | Extra HTTP headers (e.g., `X-Scope-OrgID`) |
 | `labels` | object | `{"service":"ferrum-edge"}` | Static labels applied to every log stream |
-| `include_listen_path_label` | bool | `true` | Add `proxy_id` as a label |
+| `include_proxy_id_label` | bool | `true` | Add `proxy_id` as a label. The legacy key `include_listen_path_label` is still accepted for backward compatibility (the label name has always been `proxy_id`); if both are set, `include_proxy_id_label` wins |
 | `include_status_class_label` | bool | `true` | Add `status_class` (2xx/3xx/4xx/5xx) as a label |
 | `gzip` | bool | `true` | Gzip-compress request bodies |
 | `batch_size` | integer | `100` | Max entries per batch |
@@ -1000,6 +1010,8 @@ Ships transaction logs to Grafana Loki via the push API (`POST /loki/api/v1/push
 | `buffer_capacity` | integer | `10000` | Channel buffer capacity |
 | `max_retries` | integer | `3` | Retry attempts on failure |
 | `retry_delay_ms` | integer | `1000` | Delay between retries |
+
+Retries fire on transport errors and 5xx responses. A **4xx response other than 408 or 429 aborts the batch immediately** (retrying a malformed or unauthorized payload just delays the drop) — fix the endpoint URL, `authorization_header`, or tenant header rather than waiting through `max_retries × retry_delay_ms`. 408 (Request Timeout) and 429 (Too Many Requests, which Loki uses for ingestion throttling) are transient signals and are retried within the configured budget.
 
 ### `transaction_debugger`
 
@@ -1957,7 +1969,7 @@ Modifies request headers, query parameters, and JSON body fields before proxying
 config:
   rules:
     - operation: add       # add, remove, update, rename
-      target: header       # header, query, body
+      target: header       # header, query, body (default: header)
       key: "X-Custom"
       value: "my-value"
     - operation: rename
@@ -1967,11 +1979,40 @@ config:
     - operation: remove
       target: body
       key: "internal.debug_info"
+    - operation: update
+      target: body
+      key: "items.0.name"         # numeric segment = array index
+      value: "first"
+    - operation: update
+      target: body
+      key: "meta.weird\\.key"     # \. = literal dot in a key
+      value: "escaped"
 ```
 
-Body rules use dot-notation paths for nested JSON. Values are auto-parsed as JSON when possible. Body transformation only applies to `application/json` content types.
-When body rules modify the payload, the gateway recomputes the forwarded `Content-Length` automatically.
-On HTTPS backends, body-transforming requests also bypass the direct backend H2 pool so the buffered plugin output is what reaches the upstream. HTTP/3 backends apply the same transformed buffered body before forwarding.
+**Operations and required fields** — validated at plugin load time; malformed rules reject the plugin config with a 400 (admin API) or fail startup (file mode) / warn (DB mode):
+
+| Operation | Required fields | Notes |
+|-----------|-----------------|-------|
+| `add` | `key`, `value` | No-op if the field already exists (does not overwrite). |
+| `update` | `key`, `value` | Always writes; creates intermediate objects for body paths as needed. |
+| `remove` | `key` | No-op if the field is absent. |
+| `rename` | `key`, `new_key` | `old → new`; if the destination path is unreachable, the value is restored at the old path (no data loss). Array indices (numeric segments) are rejected at plugin load time in `key` or `new_key` — see note below. |
+
+**Valid `target` values:** `header`, `query`, `body`. Omitted `target` defaults to `header`. Unknown targets are rejected at plugin construction. Non-string values for `target`, `operation`, `key`, `value`, or `new_key` are also rejected — the plugin does not silently coerce numbers, booleans, or objects into strings.
+
+**Header value constraints:** header `value` must not contain CR (`\r`) or LF (`\n`) — rejected at plugin load time as defence against header injection.
+
+**Body rules:** use dot-notation paths for nested JSON. Features:
+- **Nested objects** — `user.address.city`.
+- **Array indexing** — numeric segments index into arrays: `items.0.name`. Arrays are not auto-grown; out-of-bounds indices fail silently at request time (the rule is skipped for that request).
+- **Literal dots in keys** — escape with `\.`: `meta.weird\.key` targets a key literally named `weird.key`.
+- **Typed values** — string values that parse as JSON (e.g., `"42"`, `"true"`, `"null"`, `"{\"a\":1}"`) are inserted as the parsed type; otherwise they remain JSON strings. Explicit JSON `null` (`value: null` in YAML/JSON) is preserved — `add` / `update` body rules with `value: null` set the target field to JSON null.
+
+**`rename` does not support array indices in `key` or `new_key`.** Array mutation is ambiguous for rename (move? swap? overwrite?) and would risk data loss — `Vec::remove` shifts elements leftward, so a `rename("items.0" → "items.1")` on `["A","B","C"]` would silently drop `"C"`. Configs with numeric segments in a rename path are rejected at plugin load time. To relocate elements within an array, use `remove` followed by `add`. Escaped numeric segments (`counts\.0` — a literal key named `counts.0`) are still accepted.
+
+Body transformation only applies to `application/json` content types (or any `+json` suffix). When body rules modify the payload, the gateway recomputes the forwarded `Content-Length` automatically. On HTTPS backends, body-transforming requests bypass the direct backend H2 pool so the buffered plugin output is what reaches the upstream. HTTP/3 backends apply the same transformed buffered body before forwarding.
+
+**Hot-path cost:** rules are pre-partitioned at config load into header-only and query-only lists, and header keys are pre-lowercased — so per-request work is proportional to the number of matching rules, not the total. When a proxy's `request_transformer` is configured with only query or body rules, the handler skips the zero-clone header-fast-path gate and does not clone `ctx.headers`.
 
 ### `response_transformer`
 
@@ -1989,9 +2030,18 @@ config:
       target: body
       key: "resp_data"
       new_key: "data"
+    - operation: remove
+      target: body
+      key: "items.0"              # numeric segment removes an array element
 ```
 
 Header rules default to `target: header` (no `target` field required). Body rules require explicit `target: body`.
+
+**Valid targets for `response_transformer` are `header` and `body` ONLY** — unlike `request_transformer`, there is no `query` target (query parameters are part of the request, not the response). Configs specifying `target: query` are rejected at plugin load time.
+
+**Operations and required fields** match `request_transformer` (see the table above). The same validation rules apply: unknown operations, unknown targets (valid here: `header` or `body`), missing `value` on add/update, missing `new_key` on rename, and CR/LF in header values are all rejected at plugin load time. Non-string values for `target`, `operation`, `key`, `value`, or `new_key` are also rejected (no silent coercion).
+
+Body rules support the same dot-notation features as `request_transformer`: nested paths, array indexing, and `\.` escape. Explicit JSON `null` values on `add` / `update` body rules are preserved — setting a field to `null` is a legitimate operation.
 
 ### `compression`
 
@@ -2437,6 +2487,20 @@ config:
 
 Seven plugins purpose-built for AI/LLM API gateway use cases. They auto-detect the LLM provider from the response JSON structure, supporting **OpenAI** (and compatible), **Anthropic**, **Google Gemini**, **Cohere**, **Mistral**, and **AWS Bedrock**.
 
+### Upgrade notes (breaking config validation changes)
+
+Recent releases tightened config validation for several AI plugins. Operators upgrading should audit existing plugin configs before rolling out — previously-accepted configs that silently degraded to a no-op are now rejected at load time.
+
+- **`ai_request_guard`** now rejects configs with no policies configured. At least one policy field (e.g. `max_prompt_length`, `blocked_patterns`, `required_fields`, `allowed_models`, `blocked_models`, `max_messages`, `max_temperature`, `require_user_field`) must be set.
+- **`ai_prompt_shield`** and **`ai_response_guard`** now reject unknown built-in pattern names and built-in patterns that fail to compile. Previously these were logged as warnings and silently skipped.
+- **`ai_rate_limiter`** now rejects unknown `count_mode` and `limit_by` values. Previously these silently fell back to defaults.
+
+Validation follows the same per-mode tolerance model as other file-dependent config (see the "File Dependency Validation (Isolated Tolerance)" note in `CLAUDE.md`):
+
+- **File mode** — fatal at startup. The gateway refuses to start.
+- **Database mode** — warnings are logged, but the gateway keeps serving with the previous valid config.
+- **DP mode** — the config update from the CP is rejected and the DP continues with its previously applied config.
+
 ### `ai_federation`
 
 Universal AI gateway that routes requests in OpenAI Chat Completions format to any of 11 supported AI providers, translating requests to native provider format and normalizing responses back to OpenAI format. Uses the "terminate and respond" pattern — makes its own HTTP call to the matched provider and returns the response directly, bypassing the normal proxy dispatch.
@@ -2519,6 +2583,8 @@ plugins:
 
 **TLS trust chain:** Because this plugin bypasses the normal proxy dispatch and makes outbound HTTP calls via the shared `PluginHttpClient`, it uses **global TLS settings only** — `FERRUM_TLS_CA_BUNDLE_PATH` and `FERRUM_TLS_NO_VERIFY`. Per-proxy backend TLS overrides (`backend_tls_server_ca_cert_path`, `backend_tls_client_cert_path`, `backend_tls_verify_server_cert`) and CRL checking do not apply. For providers behind private endpoints (e.g., Azure Private Link, VPC endpoints), add the internal CA to the global CA bundle PEM file. Note that when `FERRUM_TLS_CA_BUNDLE_PATH` is set, webpki/system roots are excluded (CA exclusivity) — include public root CAs in the bundle if some providers are public and others use internal CAs.
 
+**URL template caching:** Each provider's request URL is pre-computed at config-load time. URLs that are fully static for the provider (Azure OpenAI deployment URL, OpenAI default base URL) are cached as a single `Arc<str>`; URLs that embed the request model (Gemini, Vertex AI, Bedrock) are cached as `prefix + model + suffix` so the per-request hot path performs one `String` concatenation rather than the multi-allocation `format!()` machinery.
+
 ### `ai_semantic_cache`
 
 Caches LLM responses keyed by normalized prompts to reduce redundant API calls and latency. v1 uses exact-match with normalization: prompts are lowercased, whitespace is collapsed, and the result is SHA-256 hashed to produce the cache key. Supports local in-memory (DashMap) and centralized Redis storage backends.
@@ -2550,6 +2616,7 @@ Caches LLM responses keyed by normalized prompts to reduce redundant API calls a
 - **Cache status header**: Responses include an `X-Ai-Cache-Status` header: `HIT` when the response is served from cache, `MISS` when the response is fetched from the backend and stored.
 - **SSE responses**: Server-Sent Events (streaming) responses are not cached because they arrive incrementally and cannot be reliably replayed from a stored buffer.
 - **Redis mode**: When `sync_mode: "redis"`, cache entries are stored in Redis with TTL-based expiration. If Redis becomes unreachable, the plugin falls back to local in-memory storage automatically. Compatible with any RESP-protocol server (Redis, Valkey, DragonflyDB, KeyDB, Garnet). Namespace-aware key prefix prevents cache collisions when gateways with different `FERRUM_NAMESPACE` values share the same Redis cluster.
+- **Eviction (local mode)**: When the cache exceeds `max_entries`, eviction uses partial-select (`select_nth_unstable_by_key`) to identify the oldest entries in O(n) average time instead of a full O(n log n) sort. Oldest-first semantics by `inserted_at` are preserved.
 
 ```yaml
 plugin_name: ai_semantic_cache
@@ -2595,6 +2662,8 @@ Extracts token usage from LLM response bodies and writes it to request metadata 
 
 `provider` is parsed case-insensitively and ignores surrounding whitespace.
 
+**Status filtering**: Only 2xx responses are inspected for token usage. Error responses (4xx, 5xx) are typically not LLM-shaped JSON and would otherwise pollute token metrics and chargeback accounting.
+
 **SSE streaming support:** When the response content-type is `text/event-stream`, the plugin parses `data:` lines from the SSE stream to extract token usage. For OpenAI-compatible providers, usage data is found in the final SSE event (when `stream_options.include_usage: true` is set on the request). For Anthropic streaming, usage is extracted from `message_start` (input tokens) and `message_delta` (output tokens) events. Model name is extracted from the first parseable chunk. Sets `{prefix}_streaming: true` metadata when processing a streaming response.
 
 ```yaml
@@ -2610,6 +2679,8 @@ config:
 Validates and constrains AI/LLM API requests before they reach the backend.
 
 Request buffering is only enabled for matching JSON `POST` requests when at least one guard or transform rule is configured.
+
+At least one policy field (`max_tokens_limit`, `default_max_tokens`, `allowed_models`, `blocked_models`, `require_user_field`, `max_messages`, `max_prompt_characters`, `temperature_range`, `block_system_prompts`, or `required_metadata_fields`) must be configured. The plugin rejects empty configs at construction time so a misconfigured instance never silently passes everything through. Model allow- and block-lists are stored as case-folded `HashSet`s so per-request lookups are O(1).
 
 **Priority:** 2975
 
@@ -2647,8 +2718,8 @@ Rate-limits consumers by LLM token consumption instead of request count. Support
 |---|---|---|---|
 | `token_limit` | Integer | `100000` | Maximum tokens allowed per window |
 | `window_seconds` | Integer | `60` | Sliding window duration in seconds |
-| `count_mode` | String | `"total_tokens"` | What to count: `total_tokens`, `prompt_tokens`, or `completion_tokens` |
-| `limit_by` | String | `"consumer"` | Rate limit key: authenticated identity (`consumer`) or `ip` |
+| `count_mode` | String | `"total_tokens"` | What to count: `total_tokens`, `prompt_tokens`, or `completion_tokens`. Unknown values are rejected at construction time. |
+| `limit_by` | String | `"consumer"` | Rate limit key: authenticated identity (`consumer`) or `ip`. Unknown values are rejected at construction time. |
 | `expose_headers` | Boolean | `false` | Inject `x-ai-ratelimit-*` headers |
 | `provider` | String | `"auto"` | LLM provider format for token extraction |
 | `sync_mode` | String | `local` | `local` (in-memory per instance) or `redis` (centralized) |
@@ -2666,6 +2737,10 @@ Rate-limits consumers by LLM token consumption instead of request count. Support
 `provider` is parsed case-insensitively and ignores surrounding whitespace.
 
 **Centralized mode** (`sync_mode: "redis"`): Token budgets are shared across all gateway instances so consumers cannot exceed limits by spreading requests across data planes. Uses the same two-window weighted approximation and automatic fallback as `rate_limiting`. Compatible with any RESP-protocol server: Redis, Valkey, DragonflyDB, KeyDB, or Garnet. Namespace-aware key prefix prevents collisions when gateways with different `FERRUM_NAMESPACE` values share the same Redis cluster.
+
+**Streaming token accounting**: SSE responses (Anthropic `message_start` / `message_delta`, OpenAI `stream_options.include_usage`) are counted as they arrive. When only a partial token signal is observed (e.g., a `message_delta` carrying `output_tokens` without a preceding `message_start`), the available count is still recorded against the budget — partial information is preferred over dropping the request entirely. Token sums use saturating arithmetic.
+
+**Local-mode performance**: The sliding window keeps a running sum so each `current_usage()` call is amortised O(stale-evicted) rather than O(n) per request.
 
 ```yaml
 plugin_name: ai_rate_limiter
@@ -2697,6 +2772,10 @@ Request buffering is only enabled for matching JSON `POST` requests when the plu
 | `max_scan_bytes` | Integer | `1048576` | Skip scanning if body exceeds this size |
 
 **Built-in patterns**: `ssn`, `credit_card`, `email`, `phone_us`, `api_key`, `aws_key`, `ip_address`, `iban`
+
+Unknown built-in pattern names and built-in patterns that fail to compile are now fatal at construction time (previously they silently dropped detection coverage). All configured patterns are merged into a single `RegexSet` for O(text_len) detection per scan, regardless of pattern count.
+
+In `scan_fields: "all"` mode, the recursive walker skips JSON object keys that hold structural data (`model`, `id`, `role`, `type`, `temperature`, `top_p`, `max_tokens`, etc.) so values that incidentally match a PII regex are not corrupted. When the body has a recognized chat shape (`messages` array), the structured redactor that only touches `messages[].content` is preferred even in `all` mode.
 
 ```yaml
 plugin_name: ai_prompt_shield
@@ -2732,6 +2811,10 @@ Validates and filters LLM response content before it reaches the client. Complem
 At least one of `pii_patterns`, `blocked_phrases`, `blocked_patterns`, `require_json`, `required_fields`, or `max_completion_length` must be configured.
 
 **Built-in PII patterns** (same as `ai_prompt_shield`): `ssn`, `credit_card`, `email`, `phone_us`, `api_key`, `aws_key`, `ip_address`, `iban`
+
+Unknown built-in pattern names and built-in patterns that fail to compile are fatal at construction time (previously they silently dropped detection coverage). All configured patterns are merged into a single `RegexSet` for O(text_len) detection per scan.
+
+In `scan_fields: "all"` mode, the recursive redactor skips JSON object keys that hold structural data (`id`, `model`, `created`, `role`, `type`, `index`, `finish_reason`, `usage`, etc.) so timestamps and identifiers that look like dotted-quad IPs or other PII patterns are not corrupted. When the body has a recognized AI response shape (`choices`, `content`, or `candidates`), the structured redactor that only touches completion fields is preferred.
 
 **Multi-provider support:** Extracts completion text from OpenAI (`choices[].message.content`), Anthropic (`content[].text`), and Google Gemini (`candidates[].content.parts[].text`) response formats.
 
