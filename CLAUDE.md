@@ -77,6 +77,8 @@ cargo fmt                                                   # Auto-format
 
 ### CI Pipeline (GitHub Actions)
 
+**Rust toolchain**: CI always uses the latest stable Rust via `dtolnay/rust-toolchain@stable` — there is no pinned version floor. The repo's `rust-toolchain.toml` mirrors this so local dev stays in lockstep; when a new stable lands, `rustup update stable` locally is required to avoid missing newly-added clippy lints that CI will enforce.
+
 The CI workflow (`.github/workflows/ci.yml`) runs on push to `main` and PRs targeting `main`:
 
 **On PRs** (full validation):
@@ -620,6 +622,7 @@ async fn start_gateway_with_retry(config_path: &str) -> (std::process::Child, u1
 
 **CRITICAL: Steps 1-2 are non-negotiable. Run them before every single `git commit`, no exceptions.**
 
+0. `rustup update stable` — ensure local toolchain matches CI. CI runs `dtolnay/rust-toolchain@stable` which always installs the latest stable; when a new stable adds clippy lints, local runs on older toolchains will MISS them and CI will fail. The repo's `rust-toolchain.toml` auto-selects stable, but `rustup update` is still needed to pull the newest point release. Run this at least once a week and any time `cargo clippy` behaves unexpectedly.
 1. `cargo fmt --all` — format all code
 2. `cargo fmt --all -- --check` — **verify** no formatting diffs remain (CI rejects unformatted code immediately)
 3. `cargo clippy --all-targets -- -D warnings` — zero warnings

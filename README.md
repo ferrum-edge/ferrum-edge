@@ -41,7 +41,7 @@ See [docs/cp_dp_mode.md](docs/cp_dp_mode.md) for distributed deployment details.
 
 ## Prerequisites
 
-- **Rust** toolchain (stable 1.85+)
+- **Rust** toolchain — latest stable (the repo pins `channel = "stable"` via `rust-toolchain.toml`; rustup will auto-install on first `cargo` invocation). CI runs clippy with `-D warnings` against the current stable, so local toolchains MUST be at parity.
 - **protoc** (Protocol Buffers compiler) for gRPC code generation
 - **Database** (optional): PostgreSQL, MySQL, SQLite, or MongoDB (for database and CP modes)
 
