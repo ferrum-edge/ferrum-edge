@@ -1977,7 +1977,7 @@ config:
 | `remove` | `key` | No-op if the field is absent. |
 | `rename` | `key`, `new_key` | `old → new`; if the destination path is unreachable, the value is restored at the old path (no data loss). |
 
-**Valid `target` values:** `header`, `query`, `body`. Omitted `target` defaults to `header`. Unknown targets are rejected at plugin construction.
+**Valid `target` values:** `header`, `query`, `body`. Omitted `target` defaults to `header`. Unknown targets are rejected at plugin construction. Non-string values for `target`, `operation`, `key`, `value`, or `new_key` are also rejected — the plugin does not silently coerce numbers, booleans, or objects into strings.
 
 **Header value constraints:** header `value` must not contain CR (`\r`) or LF (`\n`) — rejected at plugin load time as defence against header injection.
 
@@ -1985,7 +1985,7 @@ config:
 - **Nested objects** — `user.address.city`.
 - **Array indexing** — numeric segments index into arrays: `items.0.name`. Arrays are not auto-grown; out-of-bounds indices fail silently at request time (the rule is skipped for that request).
 - **Literal dots in keys** — escape with `\.`: `meta.weird\.key` targets a key literally named `weird.key`.
-- **Typed values** — string values that parse as JSON (e.g., `"42"`, `"true"`, `"null"`, `"{\"a\":1}"`) are inserted as the parsed type; otherwise they remain JSON strings.
+- **Typed values** — string values that parse as JSON (e.g., `"42"`, `"true"`, `"null"`, `"{\"a\":1}"`) are inserted as the parsed type; otherwise they remain JSON strings. Explicit JSON `null` (`value: null` in YAML/JSON) is preserved — `add` / `update` body rules with `value: null` set the target field to JSON null.
 
 Body transformation only applies to `application/json` content types (or any `+json` suffix). When body rules modify the payload, the gateway recomputes the forwarded `Content-Length` automatically. On HTTPS backends, body-transforming requests bypass the direct backend H2 pool so the buffered plugin output is what reaches the upstream. HTTP/3 backends apply the same transformed buffered body before forwarding.
 
@@ -2014,9 +2014,11 @@ config:
 
 Header rules default to `target: header` (no `target` field required). Body rules require explicit `target: body`.
 
-**Operations and required fields** match `request_transformer` (see the table above). The same validation rules apply: unknown operations, unknown targets (valid here: `header` or `body`), missing `value` on add/update, missing `new_key` on rename, and CR/LF in header values are all rejected at plugin load time.
+**Valid targets for `response_transformer` are `header` and `body` ONLY** — unlike `request_transformer`, there is no `query` target (query parameters are part of the request, not the response). Configs specifying `target: query` are rejected at plugin load time.
 
-Body rules support the same dot-notation features as `request_transformer`: nested paths, array indexing, and `\.` escape.
+**Operations and required fields** match `request_transformer` (see the table above). The same validation rules apply: unknown operations, unknown targets (valid here: `header` or `body`), missing `value` on add/update, missing `new_key` on rename, and CR/LF in header values are all rejected at plugin load time. Non-string values for `target`, `operation`, `key`, `value`, or `new_key` are also rejected (no silent coercion).
+
+Body rules support the same dot-notation features as `request_transformer`: nested paths, array indexing, and `\.` escape. Explicit JSON `null` values on `add` / `update` body rules are preserved — setting a field to `null` is a legitimate operation.
 
 ### `compression`
 

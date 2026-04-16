@@ -88,9 +88,19 @@ impl RequestTransformer {
 
         if let Some(arr) = config["rules"].as_array() {
             for (idx, r) in arr.iter().enumerate() {
-                // Default target = "header" when absent (preserves backward compat
-                // with terse header-only configs).
-                let target = r["target"].as_str().unwrap_or("header");
+                // `target` defaults to "header" when ABSENT (backward compat
+                // for terse header-only configs). If present but not a string,
+                // that is a configuration error — reject rather than silently
+                // coerce.
+                let target = match r.get("target") {
+                    Some(Value::String(s)) => s.as_str(),
+                    Some(Value::Null) | None => "header",
+                    Some(_) => {
+                        return Err(format!(
+                            "request_transformer: rule[{idx}]: 'target' must be a string (expected header/query/body)"
+                        ));
+                    }
+                };
 
                 // Body rules are validated and collected by `parse_body_rules`.
                 if target == "body" {
@@ -103,21 +113,56 @@ impl RequestTransformer {
                     ));
                 }
 
-                let op_str = r["operation"].as_str().ok_or_else(|| {
-                    format!("request_transformer: rule[{idx}]: 'operation' is required")
-                })?;
+                let op_str = match r.get("operation") {
+                    Some(Value::String(s)) => s.as_str(),
+                    None => {
+                        return Err(format!(
+                            "request_transformer: rule[{idx}]: 'operation' is required"
+                        ));
+                    }
+                    Some(_) => {
+                        return Err(format!(
+                            "request_transformer: rule[{idx}]: 'operation' must be a string"
+                        ));
+                    }
+                };
                 let (hop, qop) = parse_op(op_str).ok_or_else(|| {
                     format!(
                         "request_transformer: rule[{idx}]: unknown operation '{op_str}' (expected add/update/remove/rename)"
                     )
                 })?;
 
-                let raw_key = r["key"]
-                    .as_str()
-                    .ok_or_else(|| format!("request_transformer: rule[{idx}]: 'key' is required"))?
-                    .to_string();
-                let value = r["value"].as_str().map(String::from);
-                let raw_new_key = r["new_key"].as_str().map(String::from);
+                let raw_key = match r.get("key") {
+                    Some(Value::String(s)) => s.clone(),
+                    None => {
+                        return Err(format!(
+                            "request_transformer: rule[{idx}]: 'key' is required"
+                        ));
+                    }
+                    Some(_) => {
+                        return Err(format!(
+                            "request_transformer: rule[{idx}]: 'key' must be a string"
+                        ));
+                    }
+                };
+                let value = match r.get("value") {
+                    Some(Value::String(s)) => Some(s.clone()),
+                    Some(Value::Null) | None => None,
+                    Some(_) => {
+                        return Err(format!(
+                            "request_transformer: rule[{idx}]: 'value' must be a string for header/query rules"
+                        ));
+                    }
+                };
+                let raw_new_key = match r.get("new_key") {
+                    Some(Value::String(s)) => Some(s.clone()),
+                    Some(Value::Null) | None => None,
+                    Some(_) => {
+                        return Err(format!(
+                            "request_transformer: rule[{idx}]: 'new_key' must be a string"
+                        ));
+                    }
+                };
 
                 // Per-operation required-field validation.
                 match op_str {

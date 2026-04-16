@@ -525,3 +525,99 @@ async fn test_response_transformer_body_remove_array_element() {
     assert_eq!(parsed["items"].as_array().unwrap().len(), 1);
     assert_eq!(parsed["items"][0]["id"], 2);
 }
+
+// ── Strict type validation for config fields ──────────────────────────────
+
+#[tokio::test]
+async fn test_response_transformer_rejects_non_string_target() {
+    let err = ResponseTransformer::new(&json!({
+        "rules": [
+            {"operation": "add", "target": 0, "key": "X", "value": "v"}
+        ]
+    }))
+    .err()
+    .expect("expected error for non-string target");
+    assert!(err.contains("'target' must be a string"), "got: {err}");
+}
+
+#[tokio::test]
+async fn test_response_transformer_rejects_query_target() {
+    // Unlike request_transformer, response_transformer has no `query` target.
+    let err = ResponseTransformer::new(&json!({
+        "rules": [
+            {"operation": "add", "target": "query", "key": "X", "value": "v"}
+        ]
+    }))
+    .err()
+    .expect("expected error for query target");
+    assert!(err.contains("unknown target"), "got: {err}");
+}
+
+#[tokio::test]
+async fn test_response_transformer_rejects_non_string_operation() {
+    let err = ResponseTransformer::new(&json!({
+        "rules": [
+            {"operation": 42, "target": "header", "key": "X", "value": "v"}
+        ]
+    }))
+    .err()
+    .expect("expected error for non-string operation");
+    assert!(err.contains("'operation' must be a string"), "got: {err}");
+}
+
+#[tokio::test]
+async fn test_response_transformer_rejects_non_string_key() {
+    let err = ResponseTransformer::new(&json!({
+        "rules": [
+            {"operation": "add", "target": "header", "key": 123, "value": "v"}
+        ]
+    }))
+    .err()
+    .expect("expected error for non-string key");
+    assert!(err.contains("'key' must be a string"), "got: {err}");
+}
+
+#[tokio::test]
+async fn test_response_transformer_rejects_non_string_value() {
+    let err = ResponseTransformer::new(&json!({
+        "rules": [
+            {"operation": "add", "target": "header", "key": "X-Count", "value": 42}
+        ]
+    }))
+    .err()
+    .expect("expected error for non-string header value");
+    assert!(err.contains("'value' must be a string"), "got: {err}");
+}
+
+#[tokio::test]
+async fn test_response_transformer_rejects_non_string_new_key() {
+    let err = ResponseTransformer::new(&json!({
+        "rules": [
+            {"operation": "rename", "target": "header", "key": "X-Old", "new_key": 7}
+        ]
+    }))
+    .err()
+    .expect("expected error for non-string new_key");
+    assert!(err.contains("'new_key' must be a string"), "got: {err}");
+}
+
+// ── JSON null value preservation on body rules ───────────────────────────
+
+#[tokio::test]
+async fn test_response_transformer_body_update_null_value() {
+    // Setting a response field to JSON null is a legitimate operation.
+    let plugin = ResponseTransformer::new(&json!({
+        "rules": [
+            {"operation": "update", "target": "body", "key": "error", "value": null}
+        ]
+    }))
+    .unwrap();
+
+    let body = br#"{"error":"timeout"}"#;
+    let out = plugin
+        .transform_response_body(body, Some("application/json"), &HashMap::new())
+        .await
+        .expect("body should be modified");
+    let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert!(parsed["error"].is_null());
+}

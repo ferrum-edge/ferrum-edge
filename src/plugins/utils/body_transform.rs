@@ -194,6 +194,126 @@ pub fn remove_nested_value(root: &mut Value, path: &str) -> Option<Value> {
     }
 }
 
+/// Captures how a value was removed so a failed rename can faithfully undo it.
+///
+/// For object removals, restoration is a plain `map.insert(key, value)` at the
+/// same parent — identical to `set_nested_value_inner(old_path, value)`.
+///
+/// For array removals, restoration MUST use `Vec::insert(idx, value)` to
+/// reverse the leftward shift caused by `Vec::remove(idx)`. Using
+/// `set_nested_value_inner` here would write into whatever element currently
+/// occupies that index (the previously-shifted neighbor), overwriting it and
+/// losing data — the exact bug this enum fixes.
+enum RemovalContext {
+    /// Removed from an object. `old_path` suffices for restoration via
+    /// `set_nested_value_inner`, which performs `map.insert(last_segment, v)`.
+    Object,
+    /// Removed from an array at `parent_path` index `idx`. Restoration must
+    /// call `Vec::insert(idx, v)` on the array at `parent_path` to restore the
+    /// pre-removal ordering.
+    Array { parent_path: String, idx: usize },
+}
+
+/// Remove a value at `path` and return both the removed value AND the parent
+/// context needed to faithfully restore it.
+///
+/// This mirrors [`remove_nested_value`] but records whether the removal came
+/// from an object key or an array index, along with enough information to
+/// reverse the latter.
+fn remove_nested_value_with_context(
+    root: &mut Value,
+    path: &str,
+) -> Option<(Value, RemovalContext)> {
+    // We need to know the parent path (everything up to the final segment) so
+    // that Array rollback can navigate to the same Vec and call insert.
+    // Re-walk using the segment iterator so we correctly handle escaped dots.
+    let segments: Vec<Cow<'_, str>> = path_segments(path).collect();
+    if segments.is_empty() {
+        return None;
+    }
+    let (last_seg, parent_segs) = segments.split_last()?;
+
+    // Navigate to the parent node.
+    let mut current: &mut Value = root;
+    for seg in parent_segs {
+        current = child_mut(current, seg.as_ref())?;
+    }
+
+    // Remove at the terminal, recording the context.
+    match current {
+        Value::Object(map) => {
+            let removed = map.remove(last_seg.as_ref())?;
+            Some((removed, RemovalContext::Object))
+        }
+        Value::Array(arr) => {
+            let idx = last_seg.as_ref().parse::<usize>().ok()?;
+            if idx >= arr.len() {
+                return None;
+            }
+            let removed = arr.remove(idx);
+            // Reconstruct the parent path. For the simple (no-escape) case
+            // this is the common path; escaped segments already have the
+            // backslashes stripped so we rebuild with escape-safe joining.
+            let parent_path = join_segments(parent_segs);
+            Some((removed, RemovalContext::Array { parent_path, idx }))
+        }
+        _ => None,
+    }
+}
+
+/// Re-escape and join segments back into a dot-notation path.
+///
+/// Any literal dots or backslashes inside a segment are escaped so that
+/// subsequent `path_segments()` parses them as a single segment. This is
+/// required for rollback fidelity when a segment contains unusual characters.
+fn join_segments(segments: &[Cow<'_, str>]) -> String {
+    let mut out = String::new();
+    for (i, seg) in segments.iter().enumerate() {
+        if i > 0 {
+            out.push('.');
+        }
+        for c in seg.chars() {
+            if c == '\\' || c == '.' {
+                out.push('\\');
+            }
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Insert a value at an array index inside the `Vec` located at `parent_path`.
+///
+/// Returns `Err(value)` if the parent cannot be reached or is not an array, so
+/// the caller can still recover the value. Used only by the rollback path.
+fn insert_into_array_at(
+    root: &mut Value,
+    parent_path: &str,
+    idx: usize,
+    value: Value,
+) -> Result<(), Value> {
+    // Navigate to parent. An empty parent_path means the array IS the root.
+    let mut current: &mut Value = root;
+    if !parent_path.is_empty() {
+        for seg in path_segments(parent_path) {
+            current = match child_mut(current, seg.as_ref()) {
+                Some(c) => c,
+                None => return Err(value),
+            };
+        }
+    }
+    match current {
+        Value::Array(arr) => {
+            // `idx` came from a successful prior `remove(idx)`, so it is at
+            // most the original length; clamp defensively.
+            let bounded = idx.min(arr.len());
+            arr.insert(bounded, value);
+            Ok(())
+        }
+        _ => Err(value),
+    }
+}
+
 /// Rename a field at a dot-notation path.
 ///
 /// Both `old_path` and `new_path` use dot notation. The value is removed from
@@ -202,20 +322,45 @@ pub fn remove_nested_value(root: &mut Value, path: &str) -> Option<Value> {
 ///
 /// If inserting at `new_path` fails (e.g., the destination traverses a
 /// non-object node), the value is restored at `old_path` so no data is lost.
-/// If restoration itself fails, a warning is logged and the function returns
-/// `false`; this is only possible when `new_path` is a strict prefix of
-/// `old_path` and the intermediate was removed — an API-misuse edge case.
+/// For array sources, restoration uses `Vec::insert(idx, value)` to reverse
+/// the leftward shift caused by `Vec::remove(idx)` — restoring via
+/// `set_nested_value_inner` would overwrite the element that was shifted into
+/// the vacated slot.
+///
+/// If restoration itself fails, it means we could no longer reach the parent
+/// container (only possible when `new_path` is a strict prefix of `old_path`
+/// and the intermediate we depended on was replaced mid-operation — an
+/// API-misuse edge case). We log a warning and return `false`.
 pub fn rename_nested_field(root: &mut Value, old_path: &str, new_path: &str) -> bool {
-    let Some(value) = remove_nested_value(root, old_path) else {
+    let Some((value, ctx)) = remove_nested_value_with_context(root, old_path) else {
         return false;
     };
     match set_nested_value_inner(root, new_path, value) {
         Ok(()) => true,
         Err(recovered) => {
-            // Attempt to restore at the old path. This should succeed because
-            // we just removed from there; only pathological overlap between
-            // old_path and new_path could make it fail.
-            if set_nested_value_inner(root, old_path, recovered).is_err() {
+            // Attempt to restore using the removal context so arrays are
+            // restored with insert (preserving ordering) rather than overwrite.
+            let restore_result = match &ctx {
+                RemovalContext::Object => set_nested_value_inner(root, old_path, recovered),
+                RemovalContext::Array { parent_path, idx } => {
+                    insert_into_array_at(root, parent_path, *idx, recovered)
+                }
+            };
+            // The rollback path reaches this branch only when the failing
+            // `set_nested_value_inner(new_path)` was a no-op: it returns `Err`
+            // at the terminal step (non-object/non-array terminal, out-of-bounds
+            // array index, or empty path) without mutating the tree, or before
+            // the terminal at an intermediate non-object/array-miss (also no
+            // mutation). Since the tree between `remove_nested_value_with_context`
+            // and here is unchanged apart from the original removal, restoration
+            // should always succeed. The `warn!` below exists as a defensive
+            // log for any future refactor that breaks this invariant — if it
+            // ever fires, that is a bug, not a user error.
+            if restore_result.is_err() {
+                debug_assert!(
+                    false,
+                    "body_transform: rename rollback invariant violated for {old_path} -> {new_path}"
+                );
                 warn!(
                     "body_transform: rename rollback failed for {} -> {}; data lost at {}",
                     old_path, new_path, old_path
@@ -268,17 +413,37 @@ pub fn parse_body_rules(config: &Value) -> Result<Vec<BodyRule>, String> {
 
     let mut rules = Vec::new();
     for (idx, r) in arr.iter().enumerate() {
-        // Only validate body rules here; other targets are the caller's concern.
-        let Some(target) = r["target"].as_str() else {
-            continue;
+        // `target` is optional — callers (request_transformer) default missing
+        // target to "header". But if `target` is PRESENT and not a string, it
+        // is a configuration error and must not be silently ignored. Missing
+        // `target` or any non-body string target is skipped here — the caller
+        // owns validation for non-body rules.
+        let target = match r.get("target") {
+            Some(Value::String(s)) => s.as_str(),
+            Some(Value::Null) | None => continue,
+            Some(_) => {
+                return Err(format!(
+                    "rule[{idx}]: 'target' must be a string (expected header/query/body)"
+                ));
+            }
         };
         if target != "body" {
             continue;
         }
 
-        let op_str = r["operation"]
-            .as_str()
-            .ok_or_else(|| format!("rule[{idx}]: 'operation' is required for body rules"))?;
+        let op_str = match r.get("operation") {
+            Some(Value::String(s)) => s.as_str(),
+            None => {
+                return Err(format!(
+                    "rule[{idx}]: 'operation' is required for body rules"
+                ));
+            }
+            Some(_) => {
+                return Err(format!(
+                    "rule[{idx}]: 'operation' must be a string for body rules"
+                ));
+            }
+        };
         let operation = match op_str {
             "add" => BodyOperation::Add,
             "update" => BodyOperation::Update,
@@ -291,24 +456,42 @@ pub fn parse_body_rules(config: &Value) -> Result<Vec<BodyRule>, String> {
             }
         };
 
-        let key = r["key"]
-            .as_str()
-            .ok_or_else(|| format!("rule[{idx}]: 'key' is required for body rules"))?
-            .to_string();
+        let key = match r.get("key") {
+            Some(Value::String(s)) => s.clone(),
+            None => {
+                return Err(format!("rule[{idx}]: 'key' is required for body rules"));
+            }
+            Some(_) => {
+                return Err(format!(
+                    "rule[{idx}]: 'key' must be a string for body rules"
+                ));
+            }
+        };
 
-        // Parse value: try as JSON first (so "42" → Number, "true" → Bool),
-        // fall back to string. Only applies when value is a JSON string.
-        let value = r.get("value").and_then(|v| {
-            if v.is_null() {
-                None
-            } else if let Some(s) = v.as_str() {
-                Some(serde_json::from_str(s).unwrap_or_else(|_| v.clone()))
+        // Parse value:
+        // - Absent key ⇒ None (no value provided).
+        // - Explicit JSON null ⇒ Some(Value::Null). Setting a field to null is
+        //   a legitimate operation and must be preserved.
+        // - String ⇒ parse as JSON first (so "42" → Number, "true" → Bool),
+        //   fall back to a plain JSON string on parse failure.
+        // - Any other JSON value ⇒ used verbatim.
+        let value = r.get("value").map(|v| {
+            if let Some(s) = v.as_str() {
+                serde_json::from_str(s).unwrap_or_else(|_| v.clone())
             } else {
-                Some(v.clone())
+                v.clone()
             }
         });
 
-        let new_key = r["new_key"].as_str().map(String::from);
+        let new_key = match r.get("new_key") {
+            Some(Value::String(s)) => Some(s.clone()),
+            Some(Value::Null) | None => None,
+            Some(_) => {
+                return Err(format!(
+                    "rule[{idx}]: 'new_key' must be a string for body rules"
+                ));
+            }
+        };
 
         // Operation-specific required-field validation.
         match operation {

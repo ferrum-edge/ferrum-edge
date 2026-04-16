@@ -870,3 +870,124 @@ async fn test_request_transformer_body_dot_escape_in_key() {
     let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
     assert_eq!(parsed["weird.key"], "v");
 }
+
+// ── Strict type validation for config fields ──────────────────────────────
+
+#[tokio::test]
+async fn test_request_transformer_rejects_non_string_target() {
+    // A numeric/boolean/object target must fail config load, not silently
+    // coerce to "header".
+    let err = RequestTransformer::new(&json!({
+        "rules": [
+            {"operation": "add", "target": 0, "key": "X", "value": "v"}
+        ]
+    }))
+    .err()
+    .expect("expected error for non-string target");
+    assert!(err.contains("'target' must be a string"), "got: {err}");
+}
+
+#[tokio::test]
+async fn test_request_transformer_rejects_non_string_operation() {
+    let err = RequestTransformer::new(&json!({
+        "rules": [
+            {"operation": 42, "target": "header", "key": "X", "value": "v"}
+        ]
+    }))
+    .err()
+    .expect("expected error for non-string operation");
+    assert!(err.contains("'operation' must be a string"), "got: {err}");
+}
+
+#[tokio::test]
+async fn test_request_transformer_rejects_non_string_key() {
+    let err = RequestTransformer::new(&json!({
+        "rules": [
+            {"operation": "add", "target": "header", "key": 123, "value": "v"}
+        ]
+    }))
+    .err()
+    .expect("expected error for non-string key");
+    assert!(err.contains("'key' must be a string"), "got: {err}");
+}
+
+#[tokio::test]
+async fn test_request_transformer_rejects_non_string_value() {
+    let err = RequestTransformer::new(&json!({
+        "rules": [
+            {"operation": "add", "target": "header", "key": "X-Count", "value": 42}
+        ]
+    }))
+    .err()
+    .expect("expected error for non-string header value");
+    assert!(err.contains("'value' must be a string"), "got: {err}");
+}
+
+#[tokio::test]
+async fn test_request_transformer_rejects_non_string_new_key() {
+    let err = RequestTransformer::new(&json!({
+        "rules": [
+            {"operation": "rename", "target": "header", "key": "X-Old", "new_key": 7}
+        ]
+    }))
+    .err()
+    .expect("expected error for non-string new_key");
+    assert!(err.contains("'new_key' must be a string"), "got: {err}");
+}
+
+// ── JSON null value preservation on body rules ───────────────────────────
+
+#[tokio::test]
+async fn test_request_transformer_body_add_null_value() {
+    // Explicit JSON null is a legitimate value — `value: null` on an `add`
+    // rule must insert a JSON null into the body (not be treated as "missing
+    // value" and reject the config at load time).
+    let plugin = RequestTransformer::new(&json!({
+        "rules": [
+            {"operation": "add", "target": "body", "key": "optional_field", "value": null}
+        ]
+    }))
+    .unwrap();
+
+    let body = br#"{"name":"Alice"}"#;
+    let out = plugin
+        .transform_request_body(body, Some("application/json"), &HashMap::new())
+        .await
+        .expect("body should be modified");
+    let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert!(parsed["optional_field"].is_null());
+    assert_eq!(parsed["name"], "Alice");
+}
+
+#[tokio::test]
+async fn test_request_transformer_body_update_null_value() {
+    // `value: null` on an `update` rule must set the target field to null.
+    let plugin = RequestTransformer::new(&json!({
+        "rules": [
+            {"operation": "update", "target": "body", "key": "status", "value": null}
+        ]
+    }))
+    .unwrap();
+
+    let body = br#"{"status":"active"}"#;
+    let out = plugin
+        .transform_request_body(body, Some("application/json"), &HashMap::new())
+        .await
+        .expect("body should be modified");
+    let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert!(parsed["status"].is_null());
+}
+
+#[tokio::test]
+async fn test_request_transformer_rejects_non_string_body_target() {
+    // Non-string target must be rejected even for what would be body rules,
+    // via the shared `parse_body_rules` validator.
+    let err = RequestTransformer::new(&json!({
+        "rules": [
+            {"operation": "add", "target": true, "key": "f", "value": "v"}
+        ]
+    }))
+    .err()
+    .expect("expected error for non-string target");
+    assert!(err.contains("'target' must be a string"), "got: {err}");
+}

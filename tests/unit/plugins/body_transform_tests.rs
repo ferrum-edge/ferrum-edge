@@ -189,3 +189,61 @@ fn test_rename_nested_field_rollback_on_set_failure() {
     // Alice must still be at user.name after rollback.
     assert_eq!(get_nested_value(&root, "user.name"), Some(&json!("Alice")));
 }
+
+#[test]
+fn test_rename_nested_field_array_rollback_preserves_ordering() {
+    // Regression: `remove_nested_value` calls `Vec::remove(idx)` which shifts
+    // elements leftward. The rollback must use `Vec::insert(idx, value)` to
+    // reverse that shift — restoring via `set_nested_value` would OVERWRITE
+    // the element that got shifted into the vacated slot, losing data.
+    //
+    // Setup: rename items.0 -> count.x. `count` is a number so the set fails,
+    // triggering rollback. Before this fix, A would overwrite B (the
+    // previously-shifted neighbor) and the array would become [A, C] instead
+    // of the original [A, B, C].
+    let mut root = json!({"items": ["A", "B", "C"], "count": 7});
+    assert!(!rename_nested_field(&mut root, "items.0", "count.x"));
+    // The array must be byte-for-byte identical to the pre-rename state.
+    assert_eq!(root["items"], json!(["A", "B", "C"]));
+    assert_eq!(root["count"], json!(7));
+}
+
+#[test]
+fn test_rename_nested_field_array_rollback_middle_index() {
+    // Same regression but removing from the middle of the array to catch
+    // off-by-one bugs in the rollback insert index.
+    let mut root = json!({"nums": [10, 20, 30, 40]});
+    assert!(!rename_nested_field(&mut root, "nums.2", "nums.0.never"));
+    assert_eq!(root["nums"], json!([10, 20, 30, 40]));
+}
+
+#[test]
+fn test_rename_nested_field_object_rollback_preserves_value() {
+    // Explicit coverage of the object-key rollback path (counterpart to the
+    // array rollback above).
+    let mut root = json!({"user": {"name": "Alice"}, "count": 7});
+    assert!(!rename_nested_field(&mut root, "user.name", "count.x"));
+    assert_eq!(root["user"]["name"], json!("Alice"));
+}
+
+#[test]
+fn test_rename_nested_field_prefix_overlap_new_path_is_prefix_of_old() {
+    // Case where new_path is a prefix of old_path. After removing the deepest
+    // leaf, we set the higher-level value, which succeeds by overwriting the
+    // parent object. This must not panic or corrupt the tree.
+    let mut root = json!({"a": {"b": "val"}});
+    // Rename "a.b" -> "a". After removing "a.b", root is {"a": {}}. Then set
+    // "a" = "val" succeeds (overwrites the empty object).
+    assert!(rename_nested_field(&mut root, "a.b", "a"));
+    assert_eq!(root, json!({"a": "val"}));
+}
+
+#[test]
+fn test_rename_nested_field_escaped_dot_in_path() {
+    // Rename a key that contains a literal dot (escaped with backslash). The
+    // rollback logic must correctly re-escape the segment when reconstructing
+    // the parent path for potential array rollback.
+    let mut root = json!({"weird.key": "val"});
+    assert!(rename_nested_field(&mut root, "weird\\.key", "renamed"));
+    assert_eq!(root, json!({"renamed": "val"}));
+}
