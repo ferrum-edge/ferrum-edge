@@ -14,6 +14,7 @@
 use chrono::Utc;
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::json;
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, SystemTime};
@@ -207,10 +208,14 @@ impl DbOutageTestHarness {
         }
         // Overwrite SHM with zeros (same size) to invalidate the WAL index.
         // MUST NOT truncate/resize — the file is memory-mapped and changing
-        // its size triggers SIGBUS.
+        // its size triggers SIGBUS. Use OpenOptions without truncate to write
+        // zeros in-place (std::fs::write uses O_TRUNC internally, which
+        // briefly sets the file to 0 bytes before writing).
         if let Ok(meta) = std::fs::metadata(&shm_path) {
             let zeros = vec![0u8; meta.len() as usize];
-            let _ = std::fs::write(&shm_path, &zeros);
+            if let Ok(mut f) = std::fs::OpenOptions::new().write(true).open(&shm_path) {
+                let _ = f.write_all(&zeros);
+            }
         }
         println!("  DB file corrupted to simulate outage");
     }
