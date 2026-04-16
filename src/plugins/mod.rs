@@ -173,9 +173,9 @@ pub enum UdpDatagramDirection {
 /// relaying the response to the client).
 #[allow(dead_code)]
 pub struct UdpDatagramContext {
-    pub client_ip: String,
-    pub proxy_id: String,
-    pub proxy_name: Option<String>,
+    pub client_ip: Arc<str>,
+    pub proxy_id: Arc<str>,
+    pub proxy_name: Option<Arc<str>>,
     pub listen_port: u16,
     pub datagram_size: usize,
     pub direction: UdpDatagramDirection,

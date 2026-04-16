@@ -661,9 +661,9 @@ async fn process_datagram(
     // backend connection setup.
     if has_datagram_plugins {
         let ctx = UdpDatagramContext {
-            client_ip: client_addr.ip().to_string(),
-            proxy_id: proxy_id.to_string(),
-            proxy_name: proxy_name.map(str::to_string),
+            client_ip: Arc::from(client_addr.ip().to_string()),
+            proxy_id: Arc::from(proxy_id),
+            proxy_name: proxy_name.map(Arc::from),
             listen_port,
             datagram_size: data.len(),
             direction: UdpDatagramDirection::ClientToBackend,
@@ -1425,19 +1425,28 @@ async fn handle_dtls_client_inner(
     let proxy_id_fwd = proxy_id.to_string();
     let bytes_sent_fwd = Arc::clone(&bytes_sent);
     let last_request_size_fwd = Arc::clone(&last_request_size);
-    let dgram_plugins: Vec<Arc<dyn Plugin>> = if has_datagram_plugins {
+    // Pre-compute datagram plugin list once, share between both direction tasks.
+    // Arc<[...]> avoids the per-session filter+collect being done twice.
+    let dgram_plugins: Arc<[Arc<dyn Plugin>]> = if has_datagram_plugins {
         plugins
             .iter()
             .filter(|p| p.requires_udp_datagram_hooks())
             .cloned()
             .collect()
     } else {
-        Vec::new()
+        Arc::from([])
     };
-    let dgram_client_ip = client_addr.ip().to_string();
-    let dgram_proxy_id = proxy_id.to_string();
-    let dgram_proxy_name = proxy_name.map(str::to_string);
+    // Pre-compute context strings as Arc<str> — per-datagram "clone" is a pointer
+    // bump (~5ns) instead of heap allocation + memcpy.
+    let dgram_client_ip: Arc<str> = Arc::from(client_addr.ip().to_string());
+    let dgram_proxy_id: Arc<str> = Arc::from(proxy_id);
+    let dgram_proxy_name: Option<Arc<str>> = proxy_name.map(Arc::from);
     let dgram_listen_port = listen_port;
+    // Clone Arcs for the reverse direction BEFORE the forward spawn moves them.
+    let dgram_plugins_rev = Arc::clone(&dgram_plugins);
+    let dgram_client_ip_rev = Arc::clone(&dgram_client_ip);
+    let dgram_proxy_id_rev = Arc::clone(&dgram_proxy_id);
+    let dgram_proxy_name_rev = dgram_proxy_name.clone();
 
     // Client → Backend
     let client_to_backend = tokio::spawn(async move {
@@ -1457,15 +1466,15 @@ async fn handle_dtls_client_inner(
             // Run per-datagram plugins before forwarding.
             if !dgram_plugins.is_empty() {
                 let ctx = UdpDatagramContext {
-                    client_ip: dgram_client_ip.clone(),
-                    proxy_id: dgram_proxy_id.clone(),
+                    client_ip: Arc::clone(&dgram_client_ip),
+                    proxy_id: Arc::clone(&dgram_proxy_id),
                     proxy_name: dgram_proxy_name.clone(),
                     listen_port: dgram_listen_port,
                     datagram_size: len,
                     direction: UdpDatagramDirection::ClientToBackend,
                 };
                 let mut dropped = false;
-                for plugin in &dgram_plugins {
+                for plugin in dgram_plugins.iter() {
                     if matches!(plugin.on_udp_datagram(&ctx).await, UdpDatagramVerdict::Drop) {
                         dropped = true;
                         break;
@@ -1504,24 +1513,13 @@ async fn handle_dtls_client_inner(
         }
     });
 
-    // Backend → Client
+    // Backend → Client — reuse pre-computed plugin list and context strings
+    // (dgram_*_rev cloned above before the forward spawn moved the originals).
     let metrics_rev = metrics.clone();
-    let proxy_id_rev = proxy_id.to_string();
+    let proxy_id_rev = dgram_proxy_id_rev.to_string();
     let bytes_received_rev = Arc::clone(&bytes_received);
     let amplification_factor_rev = proxy.udp_max_response_amplification_factor;
     let last_request_size_rev = Arc::clone(&last_request_size);
-    let dgram_plugins_rev: Vec<Arc<dyn Plugin>> = if has_datagram_plugins {
-        plugins
-            .iter()
-            .filter(|p| p.requires_udp_datagram_hooks())
-            .cloned()
-            .collect()
-    } else {
-        Vec::new()
-    };
-    let dgram_client_ip_rev = client_addr.ip().to_string();
-    let dgram_proxy_id_rev = proxy_id.to_string();
-    let dgram_proxy_name_rev = proxy_name.map(str::to_string);
 
     let backend_to_client = tokio::spawn(async move {
         let mut buf = vec![0u8; MAX_UDP_DATAGRAM_SIZE];
@@ -1570,7 +1568,7 @@ async fn handle_dtls_client_inner(
                     direction: UdpDatagramDirection::BackendToClient,
                 };
                 let mut drop = false;
-                for plugin in &dgram_plugins_rev {
+                for plugin in dgram_plugins_rev.iter() {
                     if matches!(plugin.on_udp_datagram(&ctx).await, UdpDatagramVerdict::Drop) {
                         drop = true;
                         break;
@@ -1907,9 +1905,9 @@ async fn create_session(
     } else {
         Vec::new()
     };
-    let reply_dgram_client_ip = client_addr.ip().to_string();
-    let reply_dgram_proxy_id = proxy_id.to_string();
-    let reply_dgram_proxy_name2 = proxy_name.map(str::to_string);
+    let reply_dgram_client_ip: Arc<str> = Arc::from(client_addr.ip().to_string());
+    let reply_dgram_proxy_id: Arc<str> = Arc::from(proxy_id);
+    let reply_dgram_proxy_name2: Option<Arc<str>> = proxy_name.map(Arc::from);
     let reply_listen_port = listen_port;
     let is_dtls = reply_dtls.is_some();
     #[cfg(target_os = "linux")]
