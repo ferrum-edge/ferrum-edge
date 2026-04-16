@@ -3868,7 +3868,11 @@ components:
 
     RequestTransformerConfig:
       type: object
-      description: "Plugin: request_transformer — Modifies request headers, query params, and JSON body."
+      description: |
+        Plugin: request_transformer — Modifies request headers, query params,
+        and JSON body. Rules are validated at plugin load time; unknown
+        operations or targets, missing `value` on add/update, missing
+        `new_key` on rename, and CR/LF in header values are rejected.
       properties:
         rules:
           type: array
@@ -3879,23 +3883,40 @@ components:
               operation:
                 type: string
                 enum: [add, remove, update, rename]
+                description: |
+                  add: insert if absent (does not overwrite).
+                  update: write, creating intermediate objects as needed.
+                  remove: delete the field.
+                  rename: move old → new, with rollback if the destination is unreachable.
               target:
                 type: string
                 enum: [header, query, body]
                 default: header
               key:
                 type: string
-                description: Header name, query param, or dot-notation body path
+                description: |
+                  Header name, query param, or dot-notation body path. Body
+                  paths support nested objects ('user.address.city'), array
+                  indexing via numeric segments ('items.0.name'), and
+                  backslash-escaped literal dots ('meta.weird\\.key').
               value:
                 type: string
-                description: Value to set (for add/update operations)
+                description: |
+                  Required for add/update. For body rules, strings that parse
+                  as JSON (e.g., "42", "true", '{"a":1}') are inserted as the
+                  parsed type; otherwise kept as a JSON string. Header values
+                  must not contain CR or LF.
               new_key:
                 type: string
-                description: New key name (for rename operations)
+                description: Required for rename operations.
 
     ResponseTransformerConfig:
       type: object
-      description: "Plugin: response_transformer — Modifies response headers and JSON body."
+      description: |
+        Plugin: response_transformer — Modifies response headers and JSON
+        body. Same validation rules as request_transformer (unknown
+        operations / targets, missing value / new_key, and CR/LF in header
+        values are rejected at plugin load time).
       properties:
         rules:
           type: array
@@ -3912,10 +3933,18 @@ components:
                 default: header
               key:
                 type: string
+                description: |
+                  Header name or dot-notation body path. Body paths support
+                  nested objects, array indexing ('items.0'), and
+                  backslash-escaped literal dots.
               value:
                 type: string
+                description: |
+                  Required for add/update. Header values must not contain CR
+                  or LF.
               new_key:
                 type: string
+                description: Required for rename operations.
 
     CompressionConfig:
       type: object

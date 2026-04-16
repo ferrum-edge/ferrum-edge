@@ -1962,7 +1962,7 @@ Modifies request headers, query parameters, and JSON body fields before proxying
 config:
   rules:
     - operation: add       # add, remove, update, rename
-      target: header       # header, query, body
+      target: header       # header, query, body (default: header)
       key: "X-Custom"
       value: "my-value"
     - operation: rename
@@ -1972,11 +1972,40 @@ config:
     - operation: remove
       target: body
       key: "internal.debug_info"
+    - operation: update
+      target: body
+      key: "items.0.name"         # numeric segment = array index
+      value: "first"
+    - operation: update
+      target: body
+      key: "meta.weird\\.key"     # \. = literal dot in a key
+      value: "escaped"
 ```
 
-Body rules use dot-notation paths for nested JSON. Values are auto-parsed as JSON when possible. Body transformation only applies to `application/json` content types.
-When body rules modify the payload, the gateway recomputes the forwarded `Content-Length` automatically.
-On HTTPS backends, body-transforming requests also bypass the direct backend H2 pool so the buffered plugin output is what reaches the upstream. HTTP/3 backends apply the same transformed buffered body before forwarding.
+**Operations and required fields** — validated at plugin load time; malformed rules reject the plugin config with a 400 (admin API) or fail startup (file mode) / warn (DB mode):
+
+| Operation | Required fields | Notes |
+|-----------|-----------------|-------|
+| `add` | `key`, `value` | No-op if the field already exists (does not overwrite). |
+| `update` | `key`, `value` | Always writes; creates intermediate objects for body paths as needed. |
+| `remove` | `key` | No-op if the field is absent. |
+| `rename` | `key`, `new_key` | `old → new`; if the destination path is unreachable, the value is restored at the old path (no data loss). Array indices (numeric segments) are rejected at plugin load time in `key` or `new_key` — see note below. |
+
+**Valid `target` values:** `header`, `query`, `body`. Omitted `target` defaults to `header`. Unknown targets are rejected at plugin construction. Non-string values for `target`, `operation`, `key`, `value`, or `new_key` are also rejected — the plugin does not silently coerce numbers, booleans, or objects into strings.
+
+**Header value constraints:** header `value` must not contain CR (`\r`) or LF (`\n`) — rejected at plugin load time as defence against header injection.
+
+**Body rules:** use dot-notation paths for nested JSON. Features:
+- **Nested objects** — `user.address.city`.
+- **Array indexing** — numeric segments index into arrays: `items.0.name`. Arrays are not auto-grown; out-of-bounds indices fail silently at request time (the rule is skipped for that request).
+- **Literal dots in keys** — escape with `\.`: `meta.weird\.key` targets a key literally named `weird.key`.
+- **Typed values** — string values that parse as JSON (e.g., `"42"`, `"true"`, `"null"`, `"{\"a\":1}"`) are inserted as the parsed type; otherwise they remain JSON strings. Explicit JSON `null` (`value: null` in YAML/JSON) is preserved — `add` / `update` body rules with `value: null` set the target field to JSON null.
+
+**`rename` does not support array indices in `key` or `new_key`.** Array mutation is ambiguous for rename (move? swap? overwrite?) and would risk data loss — `Vec::remove` shifts elements leftward, so a `rename("items.0" → "items.1")` on `["A","B","C"]` would silently drop `"C"`. Configs with numeric segments in a rename path are rejected at plugin load time. To relocate elements within an array, use `remove` followed by `add`. Escaped numeric segments (`counts\.0` — a literal key named `counts.0`) are still accepted.
+
+Body transformation only applies to `application/json` content types (or any `+json` suffix). When body rules modify the payload, the gateway recomputes the forwarded `Content-Length` automatically. On HTTPS backends, body-transforming requests bypass the direct backend H2 pool so the buffered plugin output is what reaches the upstream. HTTP/3 backends apply the same transformed buffered body before forwarding.
+
+**Hot-path cost:** rules are pre-partitioned at config load into header-only and query-only lists, and header keys are pre-lowercased — so per-request work is proportional to the number of matching rules, not the total. When a proxy's `request_transformer` is configured with only query or body rules, the handler skips the zero-clone header-fast-path gate and does not clone `ctx.headers`.
 
 ### `response_transformer`
 
@@ -1994,9 +2023,18 @@ config:
       target: body
       key: "resp_data"
       new_key: "data"
+    - operation: remove
+      target: body
+      key: "items.0"              # numeric segment removes an array element
 ```
 
 Header rules default to `target: header` (no `target` field required). Body rules require explicit `target: body`.
+
+**Valid targets for `response_transformer` are `header` and `body` ONLY** — unlike `request_transformer`, there is no `query` target (query parameters are part of the request, not the response). Configs specifying `target: query` are rejected at plugin load time.
+
+**Operations and required fields** match `request_transformer` (see the table above). The same validation rules apply: unknown operations, unknown targets (valid here: `header` or `body`), missing `value` on add/update, missing `new_key` on rename, and CR/LF in header values are all rejected at plugin load time. Non-string values for `target`, `operation`, `key`, `value`, or `new_key` are also rejected (no silent coercion).
+
+Body rules support the same dot-notation features as `request_transformer`: nested paths, array indexing, and `\.` escape. Explicit JSON `null` values on `add` / `update` body rules are preserved — setting a field to `null` is a legitimate operation.
 
 ### `compression`
 

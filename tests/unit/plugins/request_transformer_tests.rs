@@ -197,43 +197,27 @@ async fn test_request_transformer_no_config() {
 }
 
 #[tokio::test]
-async fn test_request_transformer_add_without_value_ignored() {
-    let plugin = RequestTransformer::new(&json!({
+async fn test_request_transformer_add_without_value_rejected() {
+    let err = RequestTransformer::new(&json!({
         "rules": [
             {"operation": "add", "target": "header", "key": "X-NoValue"}
         ]
     }))
-    .unwrap();
-
-    let mut ctx = make_ctx();
-    let mut headers: HashMap<String, String> = HashMap::new();
-
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
-    assert!(matches!(
-        result,
-        ferrum_edge::plugins::PluginResult::Continue
-    ));
-    // Should not add header without a value
-    assert!(!headers.contains_key("x-novalue"));
+    .err()
+    .expect("expected error for add without value");
+    assert!(err.contains("requires a 'value'"), "got: {err}");
 }
 
 #[tokio::test]
-async fn test_request_transformer_unknown_operation_ignored() {
-    let plugin = RequestTransformer::new(&json!({
+async fn test_request_transformer_unknown_operation_rejected() {
+    let err = RequestTransformer::new(&json!({
         "rules": [
             {"operation": "delete", "target": "header", "key": "X-Test", "value": "val"}
         ]
     }))
-    .unwrap();
-
-    let mut ctx = make_ctx();
-    let mut headers: HashMap<String, String> = HashMap::new();
-
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
-    assert!(matches!(
-        result,
-        ferrum_edge::plugins::PluginResult::Continue
-    ));
+    .err()
+    .expect("expected error for unknown operation");
+    assert!(err.contains("unknown operation"), "got: {err}");
 }
 
 #[tokio::test]
@@ -259,22 +243,15 @@ async fn test_request_transformer_body_rules_not_applied_in_before_proxy() {
 }
 
 #[tokio::test]
-async fn test_request_transformer_unknown_target_ignored() {
-    let plugin = RequestTransformer::new(&json!({
+async fn test_request_transformer_unknown_target_rejected() {
+    let err = RequestTransformer::new(&json!({
         "rules": [
             {"operation": "add", "target": "cookie", "key": "field", "value": "val"}
         ]
     }))
-    .unwrap();
-
-    let mut ctx = make_ctx();
-    let mut headers: HashMap<String, String> = HashMap::new();
-
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
-    assert!(matches!(
-        result,
-        ferrum_edge::plugins::PluginResult::Continue
-    ));
+    .err()
+    .expect("expected error for unknown target");
+    assert!(err.contains("unknown target"), "got: {err}");
 }
 
 #[tokio::test]
@@ -363,25 +340,32 @@ async fn test_request_transformer_rename_query_param_nonexistent() {
 }
 
 #[tokio::test]
-async fn test_request_transformer_rename_without_new_key_ignored() {
-    let plugin = RequestTransformer::new(&json!({
+async fn test_request_transformer_rename_without_new_key_rejected() {
+    let err = RequestTransformer::new(&json!({
         "rules": [
             {"operation": "rename", "target": "header", "key": "X-Old-Name"}
         ]
     }))
-    .unwrap();
+    .err()
+    .expect("expected error for rename without new_key");
+    assert!(err.contains("requires a 'new_key'"), "got: {err}");
+}
 
-    let mut ctx = make_ctx();
-    let mut headers: HashMap<String, String> = HashMap::new();
-    headers.insert("x-old-name".to_string(), "the-value".to_string());
-
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
-    assert!(matches!(
-        result,
-        ferrum_edge::plugins::PluginResult::Continue
-    ));
-    // Without new_key, the rename is a no-op — old key should remain
-    assert_eq!(headers.get("x-old-name").unwrap(), "the-value");
+#[tokio::test]
+async fn test_rename_array_index_rejected_at_construction() {
+    // Rename rules targeting array indices are ambiguous (move? swap?
+    // overwrite?) and previously caused silent data loss when both sides
+    // pointed at the same array. They must be rejected at plugin construction
+    // so the misconfiguration surfaces as an HTTP 400 (admin API) or startup
+    // failure (file mode) instead of corrupting user data at runtime.
+    let err = RequestTransformer::new(&json!({
+        "rules": [
+            {"operation": "rename", "target": "body", "key": "items.0", "new_key": "items.1"}
+        ]
+    }))
+    .err()
+    .expect("expected error for rename with array indices");
+    assert!(err.contains("does not support array indices"), "got: {err}");
 }
 
 #[tokio::test]
@@ -791,4 +775,252 @@ async fn test_request_transformer_body_rename_nonexistent_is_noop() {
         .await;
     // No field was renamed, so no modification — returns None
     assert!(result.is_none());
+}
+
+// ── New behaviour: config validation & hot-path fast-path ─────────────────
+
+#[tokio::test]
+async fn test_request_transformer_modifies_request_headers_false_for_query_only() {
+    // With only query rules, modifies_request_headers() must be false so the
+    // handler can skip cloning ctx.headers.
+    let plugin = RequestTransformer::new(&json!({
+        "rules": [
+            {"operation": "add", "target": "query", "key": "v", "value": "1"}
+        ]
+    }))
+    .unwrap();
+    assert!(!plugin.modifies_request_headers());
+    assert!(!plugin.modifies_request_body());
+}
+
+#[tokio::test]
+async fn test_request_transformer_modifies_request_headers_false_for_body_only() {
+    let plugin = RequestTransformer::new(&json!({
+        "rules": [
+            {"operation": "add", "target": "body", "key": "v", "value": "1"}
+        ]
+    }))
+    .unwrap();
+    assert!(!plugin.modifies_request_headers());
+    assert!(plugin.modifies_request_body());
+}
+
+#[tokio::test]
+async fn test_request_transformer_modifies_request_headers_true_for_header_rule() {
+    let plugin = RequestTransformer::new(&json!({
+        "rules": [
+            {"operation": "add", "target": "header", "key": "X-A", "value": "1"}
+        ]
+    }))
+    .unwrap();
+    assert!(plugin.modifies_request_headers());
+}
+
+#[tokio::test]
+async fn test_request_transformer_rejects_crlf_in_header_value() {
+    let err = RequestTransformer::new(&json!({
+        "rules": [
+            {"operation": "add", "target": "header", "key": "X-Bad", "value": "ok\r\nX-Inject: evil"}
+        ]
+    }))
+    .err()
+    .expect("expected error for CRLF in header value");
+    assert!(err.contains("CR or LF"), "got: {err}");
+}
+
+#[tokio::test]
+async fn test_request_transformer_rejects_body_rule_without_value() {
+    let err = RequestTransformer::new(&json!({
+        "rules": [
+            {"operation": "add", "target": "body", "key": "field"}
+        ]
+    }))
+    .err()
+    .expect("expected error for body add without value");
+    assert!(err.contains("requires a 'value'"), "got: {err}");
+}
+
+#[tokio::test]
+async fn test_request_transformer_rejects_body_rule_without_new_key() {
+    let err = RequestTransformer::new(&json!({
+        "rules": [
+            {"operation": "rename", "target": "body", "key": "old"}
+        ]
+    }))
+    .err()
+    .expect("expected error for body rename without new_key");
+    assert!(err.contains("requires a 'new_key'"), "got: {err}");
+}
+
+#[tokio::test]
+async fn test_request_transformer_body_array_index() {
+    let plugin = RequestTransformer::new(&json!({
+        "rules": [
+            {"operation": "update", "target": "body", "key": "items.0.name", "value": "updated"}
+        ]
+    }))
+    .unwrap();
+    let body = br#"{"items":[{"name":"a"},{"name":"b"}]}"#;
+    let out = plugin
+        .transform_request_body(body, Some("application/json"), &HashMap::new())
+        .await
+        .unwrap();
+    let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(parsed["items"][0]["name"], "updated");
+    assert_eq!(parsed["items"][1]["name"], "b");
+}
+
+#[tokio::test]
+async fn test_request_transformer_body_dot_escape_in_key() {
+    // Key contains a literal dot — escaped as `\.` in the rule key.
+    let plugin = RequestTransformer::new(&json!({
+        "rules": [
+            {"operation": "update", "target": "body", "key": "weird\\.key", "value": "v"}
+        ]
+    }))
+    .unwrap();
+    let body = br#"{"weird.key":"old"}"#;
+    let out = plugin
+        .transform_request_body(body, Some("application/json"), &HashMap::new())
+        .await
+        .unwrap();
+    let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(parsed["weird.key"], "v");
+}
+
+// ── Strict type validation for config fields ──────────────────────────────
+
+#[tokio::test]
+async fn test_request_transformer_rejects_non_string_target() {
+    // A numeric/boolean/object target must fail config load, not silently
+    // coerce to "header".
+    let err = RequestTransformer::new(&json!({
+        "rules": [
+            {"operation": "add", "target": 0, "key": "X", "value": "v"}
+        ]
+    }))
+    .err()
+    .expect("expected error for non-string target");
+    assert!(err.contains("'target' must be a string"), "got: {err}");
+}
+
+#[tokio::test]
+async fn test_request_transformer_rejects_non_string_operation() {
+    let err = RequestTransformer::new(&json!({
+        "rules": [
+            {"operation": 42, "target": "header", "key": "X", "value": "v"}
+        ]
+    }))
+    .err()
+    .expect("expected error for non-string operation");
+    assert!(err.contains("'operation' must be a string"), "got: {err}");
+}
+
+#[tokio::test]
+async fn test_request_transformer_rejects_non_string_key() {
+    let err = RequestTransformer::new(&json!({
+        "rules": [
+            {"operation": "add", "target": "header", "key": 123, "value": "v"}
+        ]
+    }))
+    .err()
+    .expect("expected error for non-string key");
+    assert!(err.contains("'key' must be a string"), "got: {err}");
+}
+
+#[tokio::test]
+async fn test_request_transformer_rejects_non_string_value() {
+    let err = RequestTransformer::new(&json!({
+        "rules": [
+            {"operation": "add", "target": "header", "key": "X-Count", "value": 42}
+        ]
+    }))
+    .err()
+    .expect("expected error for non-string header value");
+    assert!(err.contains("'value' must be a string"), "got: {err}");
+}
+
+#[tokio::test]
+async fn test_request_transformer_rejects_non_string_new_key() {
+    let err = RequestTransformer::new(&json!({
+        "rules": [
+            {"operation": "rename", "target": "header", "key": "X-Old", "new_key": 7}
+        ]
+    }))
+    .err()
+    .expect("expected error for non-string new_key");
+    assert!(err.contains("'new_key' must be a string"), "got: {err}");
+}
+
+// ── JSON null value preservation on body rules ───────────────────────────
+
+#[tokio::test]
+async fn test_request_transformer_body_add_null_value() {
+    // Explicit JSON null is a legitimate value — `value: null` on an `add`
+    // rule must insert a JSON null into the body (not be treated as "missing
+    // value" and reject the config at load time).
+    let plugin = RequestTransformer::new(&json!({
+        "rules": [
+            {"operation": "add", "target": "body", "key": "optional_field", "value": null}
+        ]
+    }))
+    .unwrap();
+
+    let body = br#"{"name":"Alice"}"#;
+    let out = plugin
+        .transform_request_body(body, Some("application/json"), &HashMap::new())
+        .await
+        .expect("body should be modified");
+    let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert!(parsed["optional_field"].is_null());
+    assert_eq!(parsed["name"], "Alice");
+}
+
+#[tokio::test]
+async fn test_request_transformer_body_update_null_value() {
+    // `value: null` on an `update` rule must set the target field to null.
+    let plugin = RequestTransformer::new(&json!({
+        "rules": [
+            {"operation": "update", "target": "body", "key": "status", "value": null}
+        ]
+    }))
+    .unwrap();
+
+    let body = br#"{"status":"active"}"#;
+    let out = plugin
+        .transform_request_body(body, Some("application/json"), &HashMap::new())
+        .await
+        .expect("body should be modified");
+    let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert!(parsed["status"].is_null());
+}
+
+#[tokio::test]
+async fn test_request_transformer_rejects_non_string_body_target() {
+    // Non-string target must be rejected even for what would be body rules,
+    // via the shared `parse_body_rules` validator.
+    let err = RequestTransformer::new(&json!({
+        "rules": [
+            {"operation": "add", "target": true, "key": "f", "value": "v"}
+        ]
+    }))
+    .err()
+    .expect("expected error for non-string target");
+    assert!(err.contains("'target' must be a string"), "got: {err}");
+}
+
+#[tokio::test]
+async fn test_request_transformer_rejects_null_target() {
+    // Explicit `"target": null` must fail config load. Only a completely
+    // absent `target` field may default to "header" for backward-compat.
+    // Silently coercing null would mask misconfiguration (typos, broken
+    // templating, etc.).
+    let err = RequestTransformer::new(&json!({
+        "rules": [
+            {"operation": "add", "target": null, "key": "X", "value": "v"}
+        ]
+    }))
+    .err()
+    .expect("expected error for null target");
+    assert!(err.contains("'target' must be a string"), "got: {err}");
 }

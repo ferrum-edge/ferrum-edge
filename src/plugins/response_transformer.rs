@@ -1,9 +1,17 @@
-//! Response transformer plugin — modifies response headers and body after proxying.
+//! Response transformer plugin — modifies response headers and body after
+//! proxying.
 //!
-//! Header rules (add/remove/update/rename) execute in `after_proxy`.
-//! Body rules require `requires_response_body_buffering()` = true so the
-//! response body is collected before being forwarded to the client.
-//! Header keys are pre-lowercased at config parse time.
+//! Header rules (add/remove/update/rename) execute in `after_proxy`. Body
+//! rules require `requires_response_body_buffering()` = true so the response
+//! body is collected before being forwarded to the client.
+//!
+//! Rules are validated at construction time:
+//!
+//! - Unknown `operation` / `target` values are rejected (no silent no-ops).
+//! - `add` / `update` require a `value`; `rename` requires a `new_key`.
+//! - Header values with CR/LF characters are rejected (defence against
+//!   header injection via config).
+//! - Header keys are pre-lowercased.
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -13,62 +21,179 @@ use tracing::debug;
 use super::utils::body_transform::{self, BodyRule};
 use super::{Plugin, PluginResult, RequestContext};
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum HeaderOp {
+    Add,
+    Update,
+    Remove,
+    Rename,
+}
+
 #[derive(Debug, Clone)]
-struct TransformRule {
-    operation: String, // add, remove, update, rename
-    /// Pre-lowercased header key (avoids per-request `.to_lowercase()`).
+struct HeaderRule {
+    operation: HeaderOp,
+    /// Pre-lowercased header key.
     key: String,
+    /// Required for add/update.
     value: Option<String>,
-    /// New key for rename operations (pre-lowercased).
+    /// Pre-lowercased new key, required for rename.
     new_key: Option<String>,
 }
 
 pub struct ResponseTransformer {
-    rules: Vec<TransformRule>,
-    /// Pre-parsed body transformation rules (target: "body").
+    header_rules: Vec<HeaderRule>,
     body_rules: Vec<BodyRule>,
+}
+
+fn parse_op(op: &str) -> Option<HeaderOp> {
+    match op {
+        "add" => Some(HeaderOp::Add),
+        "update" => Some(HeaderOp::Update),
+        "remove" => Some(HeaderOp::Remove),
+        "rename" => Some(HeaderOp::Rename),
+        _ => None,
+    }
+}
+
+fn contains_crlf(s: &str) -> bool {
+    s.bytes().any(|b| b == b'\r' || b == b'\n')
 }
 
 impl ResponseTransformer {
     pub fn new(config: &Value) -> Result<Self, String> {
-        let rules: Vec<TransformRule> = config["rules"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|r| {
-                        let operation = r["operation"].as_str()?.to_string();
-                        // Skip body rules — handled separately.
-                        // Response transformer rules default to "header" target
-                        // for backwards compatibility (no target field required).
-                        let target = r["target"].as_str().unwrap_or("header");
-                        if target == "body" {
-                            return None;
+        let mut header_rules: Vec<HeaderRule> = Vec::new();
+
+        if let Some(arr) = config["rules"].as_array() {
+            for (idx, r) in arr.iter().enumerate() {
+                // `target` defaults to "header" only when the field is
+                // ABSENT (backward compat for terse header-only configs).
+                // An explicit `"target": null` — or any non-string value —
+                // is a configuration error. Silently defaulting an explicit
+                // null would mask typos / misconfiguration. Note: `query`
+                // is NOT a valid target for response_transformer; only
+                // `header` and `body` are accepted.
+                let target = match r.get("target") {
+                    Some(Value::String(s)) => s.as_str(),
+                    None => "header",
+                    Some(_) => {
+                        return Err(format!(
+                            "response_transformer: rule[{idx}]: 'target' must be a string (expected header/body)"
+                        ));
+                    }
+                };
+
+                if target == "body" {
+                    // Body rules are validated by `parse_body_rules`.
+                    continue;
+                }
+
+                if target != "header" {
+                    return Err(format!(
+                        "response_transformer: rule[{idx}]: unknown target '{target}' (expected header/body)"
+                    ));
+                }
+
+                let op_str = match r.get("operation") {
+                    Some(Value::String(s)) => s.as_str(),
+                    None => {
+                        return Err(format!(
+                            "response_transformer: rule[{idx}]: 'operation' is required"
+                        ));
+                    }
+                    Some(_) => {
+                        return Err(format!(
+                            "response_transformer: rule[{idx}]: 'operation' must be a string"
+                        ));
+                    }
+                };
+                let operation = parse_op(op_str).ok_or_else(|| {
+                    format!(
+                        "response_transformer: rule[{idx}]: unknown operation '{op_str}' (expected add/update/remove/rename)"
+                    )
+                })?;
+
+                let raw_key = match r.get("key") {
+                    Some(Value::String(s)) => s.clone(),
+                    None => {
+                        return Err(format!(
+                            "response_transformer: rule[{idx}]: 'key' is required"
+                        ));
+                    }
+                    Some(_) => {
+                        return Err(format!(
+                            "response_transformer: rule[{idx}]: 'key' must be a string"
+                        ));
+                    }
+                };
+                let value = match r.get("value") {
+                    Some(Value::String(s)) => Some(s.clone()),
+                    Some(Value::Null) | None => None,
+                    Some(_) => {
+                        return Err(format!(
+                            "response_transformer: rule[{idx}]: 'value' must be a string for header rules"
+                        ));
+                    }
+                };
+                let raw_new_key = match r.get("new_key") {
+                    Some(Value::String(s)) => Some(s.clone()),
+                    Some(Value::Null) | None => None,
+                    Some(_) => {
+                        return Err(format!(
+                            "response_transformer: rule[{idx}]: 'new_key' must be a string"
+                        ));
+                    }
+                };
+
+                // Per-operation required-field validation.
+                match operation {
+                    HeaderOp::Add | HeaderOp::Update => {
+                        if value.is_none() {
+                            return Err(format!(
+                                "response_transformer: rule[{idx}]: '{op_str}' operation requires a 'value'"
+                            ));
                         }
-                        let raw_key = r["key"].as_str()?.to_string();
-                        let value = r["value"].as_str().map(String::from);
-                        let raw_new_key = r["new_key"].as_str().map(String::from);
+                    }
+                    HeaderOp::Rename => {
+                        if raw_new_key.is_none() {
+                            return Err(format!(
+                                "response_transformer: rule[{idx}]: 'rename' operation requires a 'new_key'"
+                            ));
+                        }
+                    }
+                    HeaderOp::Remove => {}
+                }
 
-                        Some(TransformRule {
-                            operation,
-                            key: raw_key.to_lowercase(),
-                            value,
-                            new_key: raw_new_key.map(|k| k.to_lowercase()),
-                        })
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+                if let Some(ref v) = value
+                    && contains_crlf(v)
+                {
+                    return Err(format!(
+                        "response_transformer: rule[{idx}]: header 'value' must not contain CR or LF"
+                    ));
+                }
 
-        let body_rules = body_transform::parse_body_rules(config);
+                header_rules.push(HeaderRule {
+                    operation,
+                    key: raw_key.to_lowercase(),
+                    value,
+                    new_key: raw_new_key.map(|k| k.to_lowercase()),
+                });
+            }
+        }
 
-        if rules.is_empty() && body_rules.is_empty() {
+        let body_rules = body_transform::parse_body_rules(config)
+            .map_err(|e| format!("response_transformer: {e}"))?;
+
+        if header_rules.is_empty() && body_rules.is_empty() {
             return Err(
                 "response_transformer: no 'rules' configured — plugin will have no effect"
                     .to_string(),
             );
         }
 
-        Ok(Self { rules, body_rules })
+        Ok(Self {
+            header_rules,
+            body_rules,
+        })
     }
 }
 
@@ -96,9 +221,9 @@ impl Plugin for ResponseTransformer {
         _response_status: u16,
         response_headers: &mut HashMap<String, String>,
     ) -> PluginResult {
-        for rule in &self.rules {
-            match rule.operation.as_str() {
-                "add" => {
+        for rule in &self.header_rules {
+            match rule.operation {
+                HeaderOp::Add => {
                     if let Some(ref val) = rule.value {
                         response_headers.entry(rule.key.clone()).or_insert_with(|| {
                             debug!("response_transformer: added header {}={}", rule.key, val);
@@ -106,17 +231,17 @@ impl Plugin for ResponseTransformer {
                         });
                     }
                 }
-                "update" => {
+                HeaderOp::Update => {
                     if let Some(ref val) = rule.value {
                         response_headers.insert(rule.key.clone(), val.clone());
                         debug!("response_transformer: set header {}={}", rule.key, val);
                     }
                 }
-                "remove" => {
+                HeaderOp::Remove => {
                     response_headers.remove(&rule.key);
                     debug!("response_transformer: removed header {}", rule.key);
                 }
-                "rename" => {
+                HeaderOp::Rename => {
                     if let Some(ref new_key) = rule.new_key
                         && let Some(val) = response_headers.remove(&rule.key)
                     {
@@ -127,7 +252,6 @@ impl Plugin for ResponseTransformer {
                         response_headers.insert(new_key.clone(), val);
                     }
                 }
-                _ => {}
             }
         }
         PluginResult::Continue
@@ -143,13 +267,11 @@ impl Plugin for ResponseTransformer {
         content_type: Option<&str>,
         _response_headers: &HashMap<String, String>,
     ) -> Option<Vec<u8>> {
-        // Only transform JSON bodies
         if let Some(ct) = content_type
             && !body_transform::is_json_content_type(ct)
         {
             return None;
         }
-
         body_transform::apply_body_rules(body, &self.body_rules)
     }
 }
