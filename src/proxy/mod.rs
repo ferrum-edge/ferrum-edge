@@ -76,7 +76,7 @@ use crate::load_balancer::{HashOnStrategy, LoadBalancerCache};
 use crate::plugin_cache::{PluginCache, PluginCapabilities};
 use crate::plugins::{
     Plugin, PluginResult, ProxyProtocol, RequestContext, TransactionSummary,
-    WebSocketFrameDirection, priority as plugin_priority,
+    WebSocketFrameDirection,
 };
 use crate::retry;
 use crate::retry::ResponseBody;
@@ -2228,15 +2228,13 @@ async fn handle_websocket_request_authenticated(
                 state.request_count.fetch_add(1, Ordering::Relaxed);
                 record_status(&state, 502);
 
-                // Log with error_class for WebSocket backend failures
+                // Log with error_class for WebSocket backend failures.
+                // Dispatch to the full plugin chain — the default `.log()` impl
+                // is a no-op, and plugins outside the logging priority band
+                // (e.g., `otel_tracing` at priority 25) still need the hook so
+                // rejected/error transactions reach tracing sinks.
                 if !plugins.is_empty() {
-                    let logging_plugins: Vec<Arc<dyn Plugin>> = plugins
-                        .iter()
-                        .filter(|p| p.priority() >= plugin_priority::STDOUT_LOGGING)
-                        .cloned()
-                        .collect();
-
-                    if !logging_plugins.is_empty() {
+                    {
                         // Use monotonic Instant rather than wall-clock to avoid NTP skew.
                         let ws_total_ms = start_time.elapsed().as_secs_f64() * 1000.0;
                         let ws_plugin_execution_ms = plugin_execution_ns as f64 / 1_000_000.0;
@@ -2278,7 +2276,7 @@ async fn handle_websocket_request_authenticated(
                             mirror: false,
                             metadata,
                         };
-                        crate::plugins::log_with_mirror(&logging_plugins, &summary, &ctx).await;
+                        crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
                     }
                 }
 
@@ -3401,7 +3399,10 @@ async fn handle_tls_connection(
 /// When a plugin (auth, access control, rate limiting, etc.) rejects a request,
 /// logging plugins (stdout_logging, http_logging, transaction_debugger) must still
 /// execute so that rejected traffic is visible in log sinks like Splunk, stdout, etc.
-/// Only plugins in the Logging priority band (9000+) are invoked here.
+/// Plugins outside the logging priority band (e.g., `otel_tracing` at priority 25)
+/// also implement `log()` and must receive rejected transactions — so we dispatch
+/// to the full plugin chain. The default `.log()` impl is a no-op, so awaiting
+/// plugins that don't override it is cheap.
 pub async fn log_rejected_request(
     plugins: &[Arc<dyn Plugin>],
     ctx: &RequestContext,
@@ -3410,16 +3411,7 @@ pub async fn log_rejected_request(
     rejection_phase: &str,
     plugin_execution_ns: u64,
 ) {
-    // Only invoke logging-band plugins. This is both a short-circuit AND the
-    // dispatch set passed to `log_with_mirror` below — otherwise every plugin
-    // in the chain has its default-empty `.log()` awaited for no reason.
-    let logging_plugins: Vec<Arc<dyn Plugin>> = plugins
-        .iter()
-        .filter(|p| p.priority() >= plugin_priority::STDOUT_LOGGING)
-        .cloned()
-        .collect();
-
-    if logging_plugins.is_empty() {
+    if plugins.is_empty() {
         return;
     }
 
@@ -3465,7 +3457,7 @@ pub async fn log_rejected_request(
         metadata,
     };
 
-    crate::plugins::log_with_mirror(&logging_plugins, &summary, ctx).await;
+    crate::plugins::log_with_mirror(plugins, &summary, ctx).await;
 }
 
 pub(crate) async fn apply_after_proxy_hooks_to_rejection(
@@ -5329,14 +5321,12 @@ async fn handle_proxy_request_inner(
                     ctx.plugin_http_call_ns.load(Ordering::Relaxed) as f64 / 1_000_000.0;
                 let grpc_gateway_overhead_ms =
                     (total_ms - backend_total_ms - grpc_plugin_execution_ms).max(0.0);
+                // Dispatch to the full plugin chain — plugins outside the
+                // logging priority band (e.g., `otel_tracing` at priority 25)
+                // still need the hook so rejected/error transactions reach
+                // tracing sinks. The default `.log()` impl is a no-op.
                 if !plugins.is_empty() {
-                    let logging_plugins: Vec<Arc<dyn Plugin>> = plugins
-                        .iter()
-                        .filter(|p| p.priority() >= plugin_priority::STDOUT_LOGGING)
-                        .cloned()
-                        .collect();
-
-                    if !logging_plugins.is_empty() {
+                    {
                         let proxy_ref = ctx.matched_proxy.as_ref();
                         let mut metadata = ctx.metadata.clone();
                         metadata.insert(
@@ -5375,7 +5365,7 @@ async fn handle_proxy_request_inner(
                             mirror: false,
                             metadata,
                         };
-                        crate::plugins::log_with_mirror(&logging_plugins, &summary, &ctx).await;
+                        crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
                     }
                 }
 
