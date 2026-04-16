@@ -338,9 +338,13 @@ impl SendMmsgBatch {
         };
 
         if ret < 0 {
-            // Preserve the batch on error so the caller can retry or drain.
-            // This is consistent with GsoBatchBuf::flush_to which also preserves.
-            return Err(std::io::Error::last_os_error());
+            let err = std::io::Error::last_os_error();
+            // Clear the batch on error — UDP is best-effort and preserving
+            // stale datagrams would cause reorder/requeue across iterations.
+            // (GsoBatchBuf preserves on error because it has drain_to_sendmmsg
+            // fallback; SendMmsgBatch is the final send path with no fallback.)
+            self.count = 0;
+            return Err(err);
         }
 
         let sent = ret as usize;

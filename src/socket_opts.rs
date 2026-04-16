@@ -796,8 +796,13 @@ pub mod io_uring_splice {
             )
             .build();
             let push_ok = unsafe { ring.submission().push(&sqe).is_ok() };
-            let result = if push_ok {
-                ring.submit_and_wait(1).is_ok()
+            let result = if push_ok && ring.submit_and_wait(1).is_ok() {
+                // Check the CQE result — submit_and_wait succeeding only means
+                // the kernel processed the SQE. The CQE may carry -EINVAL or
+                // -EOPNOTSUPP if the SPLICE opcode is rejected by seccomp/config.
+                ring.completion()
+                    .next()
+                    .is_some_and(|cqe| cqe.result() >= 0)
             } else {
                 false
             };
