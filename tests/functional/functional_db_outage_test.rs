@@ -14,6 +14,7 @@
 use chrono::Utc;
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::json;
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, SystemTime};
@@ -107,6 +108,10 @@ impl DbOutageTestHarness {
             .env("FERRUM_ADMIN_HTTP_PORT", admin_port.to_string())
             .env("FERRUM_LOG_LEVEL", "info")
             .env("FERRUM_TRUSTED_PROXIES", "127.0.0.1")
+            // Short pool acquire timeout so the polling loop's full-reload
+            // fallback fails quickly when the DB is corrupted, rather than
+            // waiting 30s for sqlx's after_connect retry backoff to exhaust.
+            .env("FERRUM_DB_POOL_ACQUIRE_TIMEOUT_SECONDS", "3")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -169,11 +174,21 @@ impl DbOutageTestHarness {
         format!("Bearer {}", token)
     }
 
-    /// Simulate database outage by truncating the SQLite file to zero bytes.
+    /// Simulate database outage by corrupting the SQLite files.
     /// SQLite keeps file descriptors open, so renaming or chmod won't break
-    /// existing pooled connections. Truncating modifies the inode content
-    /// visible through all FDs, causing "database disk image is malformed"
-    /// errors on the next query.
+    /// existing pooled connections. Overwriting file contents modifies the
+    /// inode data visible through all FDs, causing errors on the next query.
+    ///
+    /// WAL mode complications:
+    /// - The SHM file is memory-mapped. Truncating it (changing file size)
+    ///   triggers SIGBUS. Instead, we overwrite it with zeros (same size) to
+    ///   invalidate the WAL index without causing a signal.
+    /// - The main DB is overwritten with garbage (not truncated to 0 bytes)
+    ///   to prevent `?mode=rwc` from treating it as a fresh empty database
+    ///   when the pool creates new connections.
+    /// - Existing connections may have pages in SQLite's page cache. Zeroing
+    ///   the SHM invalidates the WAL index, forcing SQLite to re-read and
+    ///   detect the corruption on the next transaction.
     fn simulate_db_outage(&self) {
         // Back up the DB (and WAL/SHM) before corrupting
         let backup_path = self.db_path.with_extension("db.backup");
@@ -187,16 +202,26 @@ impl DbOutageTestHarness {
             let _ = std::fs::copy(&shm_path, shm_path.with_extension("shm.backup"));
         }
 
-        // Truncate DB to 0 bytes to cause malformed DB errors
-        std::fs::write(&self.db_path, b"").expect("Failed to truncate DB file");
-        // Also truncate WAL
+        // Overwrite DB with garbage bytes — not empty (prevents ?mode=rwc
+        // from auto-creating a fresh valid database on new connections).
+        let garbage = vec![0xFFu8; 4096];
+        std::fs::write(&self.db_path, &garbage).expect("Failed to corrupt DB file");
+        // Overwrite WAL with garbage
         if wal_path.exists() {
-            let _ = std::fs::write(&wal_path, b"");
+            let _ = std::fs::write(&wal_path, &garbage);
         }
-        if shm_path.exists() {
-            let _ = std::fs::write(&shm_path, b"");
+        // Overwrite SHM with zeros (same size) to invalidate the WAL index.
+        // MUST NOT truncate/resize — the file is memory-mapped and changing
+        // its size triggers SIGBUS. Use OpenOptions without truncate to write
+        // zeros in-place (std::fs::write uses O_TRUNC internally, which
+        // briefly sets the file to 0 bytes before writing).
+        if let Ok(meta) = std::fs::metadata(&shm_path) {
+            let zeros = vec![0u8; meta.len() as usize];
+            if let Ok(mut f) = std::fs::OpenOptions::new().write(true).open(&shm_path) {
+                let _ = f.write_all(&zeros);
+            }
         }
-        println!("  DB file truncated to simulate outage");
+        println!("  DB file corrupted to simulate outage");
     }
 
     /// Restore database by copying the backup back
@@ -221,9 +246,10 @@ impl DbOutageTestHarness {
         println!("  DB file restored from backup");
     }
 
-    /// Wait for DB poll to pick up changes (poll interval is 2s, wait 5s for safety)
+    /// Wait for DB poll to pick up changes.
+    /// Budget: poll interval (2s) + pool acquire timeout (3s) + margin = 8s.
     async fn wait_for_poll(&self) {
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        tokio::time::sleep(Duration::from_secs(8)).await;
     }
 }
 

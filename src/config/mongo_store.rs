@@ -499,40 +499,28 @@ mod inner {
             let mut cursor = self.proxies().find(ns_filter.clone()).await?;
             while cursor.advance().await? {
                 let doc = cursor.deserialize_current()?;
-                match doc_to_proxy(doc) {
-                    Ok(p) => proxies.push(p),
-                    Err(e) => warn!("Failed to deserialize proxy document: {}", e),
-                }
+                proxies.push(doc_to_proxy(doc)?);
             }
 
             let mut consumers = Vec::new();
             let mut cursor = self.consumers().find(ns_filter.clone()).await?;
             while cursor.advance().await? {
                 let doc = cursor.deserialize_current()?;
-                match doc_to_consumer(doc) {
-                    Ok(c) => consumers.push(c),
-                    Err(e) => warn!("Failed to deserialize consumer document: {}", e),
-                }
+                consumers.push(doc_to_consumer(doc)?);
             }
 
             let mut plugin_configs = Vec::new();
             let mut cursor = self.plugin_configs().find(ns_filter.clone()).await?;
             while cursor.advance().await? {
                 let doc = cursor.deserialize_current()?;
-                match doc_to_plugin_config(doc) {
-                    Ok(pc) => plugin_configs.push(pc),
-                    Err(e) => warn!("Failed to deserialize plugin_config document: {}", e),
-                }
+                plugin_configs.push(doc_to_plugin_config(doc)?);
             }
 
             let mut upstreams = Vec::new();
             let mut cursor = self.upstreams().find(ns_filter).await?;
             while cursor.advance().await? {
                 let doc = cursor.deserialize_current()?;
-                match doc_to_upstream(doc) {
-                    Ok(u) => upstreams.push(u),
-                    Err(e) => warn!("Failed to deserialize upstream document: {}", e),
-                }
+                upstreams.push(doc_to_upstream(doc)?);
             }
 
             self.check_slow_query("load_full_config", start);
@@ -581,36 +569,28 @@ mod inner {
             let mut cursor = self.proxies().find(filter.clone()).await?;
             while cursor.advance().await? {
                 let doc = cursor.deserialize_current()?;
-                if let Ok(p) = doc_to_proxy(doc) {
-                    added_or_modified_proxies.push(p);
-                }
+                added_or_modified_proxies.push(doc_to_proxy(doc)?);
             }
 
             let mut added_or_modified_consumers = Vec::new();
             let mut cursor = self.consumers().find(filter.clone()).await?;
             while cursor.advance().await? {
                 let doc = cursor.deserialize_current()?;
-                if let Ok(c) = doc_to_consumer(doc) {
-                    added_or_modified_consumers.push(c);
-                }
+                added_or_modified_consumers.push(doc_to_consumer(doc)?);
             }
 
             let mut added_or_modified_plugin_configs = Vec::new();
             let mut cursor = self.plugin_configs().find(filter.clone()).await?;
             while cursor.advance().await? {
                 let doc = cursor.deserialize_current()?;
-                if let Ok(pc) = doc_to_plugin_config(doc) {
-                    added_or_modified_plugin_configs.push(pc);
-                }
+                added_or_modified_plugin_configs.push(doc_to_plugin_config(doc)?);
             }
 
             let mut added_or_modified_upstreams = Vec::new();
             let mut cursor = self.upstreams().find(filter).await?;
             while cursor.advance().await? {
                 let doc = cursor.deserialize_current()?;
-                if let Ok(u) = doc_to_upstream(doc) {
-                    added_or_modified_upstreams.push(u);
-                }
+                added_or_modified_upstreams.push(doc_to_upstream(doc)?);
             }
 
             // Detect deletions by loading current IDs (scoped to namespace) and diffing against known sets
@@ -1382,6 +1362,21 @@ mod inner {
                 .create_index(
                     IndexModel::builder()
                         .keys(doc! { "namespace": 1, "updated_at": 1 })
+                        .build(),
+                )
+                .await?;
+            // Compound indexes for common admin API query patterns (V002)
+            self.plugin_configs()
+                .create_index(
+                    IndexModel::builder()
+                        .keys(doc! { "namespace": 1, "scope": 1 })
+                        .build(),
+                )
+                .await?;
+            self.plugin_configs()
+                .create_index(
+                    IndexModel::builder()
+                        .keys(doc! { "namespace": 1, "plugin_name": 1 })
                         .build(),
                 )
                 .await?;

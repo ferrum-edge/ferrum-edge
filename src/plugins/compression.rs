@@ -340,6 +340,12 @@ impl Plugin for CompressionPlugin {
         !self.config.algorithms.is_empty()
     }
 
+    fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {
+        // Skip response buffering when the client doesn't accept any encoding
+        // we support — there's nothing to compress.
+        !self.config.algorithms.is_empty() && ctx.headers.contains_key("accept-encoding")
+    }
+
     async fn before_proxy(
         &self,
         ctx: &mut RequestContext,

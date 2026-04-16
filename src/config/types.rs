@@ -420,6 +420,7 @@ impl BackendTlsConfig {
 /// An upstream defines a group of backend targets with load balancing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Upstream {
+    #[serde(default)]
     pub id: String,
     #[serde(default)]
     pub name: Option<String>,
@@ -778,6 +779,7 @@ pub enum PluginScope {
 /// A proxy resource defines a route from a listen_path to a backend.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Proxy {
+    #[serde(default)]
     pub id: String,
     #[serde(default)]
     pub name: Option<String>,
@@ -947,6 +949,7 @@ pub struct PluginAssociation {
 /// A consumer resource (API user).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Consumer {
+    #[serde(default)]
     pub id: String,
     pub username: String,
     /// Namespace this resource belongs to. Defaults to "ferrum".
@@ -970,6 +973,7 @@ pub struct Consumer {
 /// A plugin configuration resource.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PluginConfig {
+    #[serde(default)]
     pub id: String,
     pub plugin_name: String,
     /// Namespace this resource belongs to. Defaults to "ferrum".

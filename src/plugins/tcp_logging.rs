@@ -383,7 +383,9 @@ async fn send_batch(
         }
 
         // Write the payload.
-        let w = writer.as_mut().unwrap();
+        let Some(w) = writer.as_mut() else {
+            continue;
+        };
         match w.write_all(&payload).await {
             Ok(()) => match w.flush().await {
                 Ok(()) => return writer,

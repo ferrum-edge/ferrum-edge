@@ -20,14 +20,17 @@
 
 use bytes::Bytes;
 use dashmap::DashMap;
+use http_body::Frame;
 use http_body_util::{BodyExt, Full};
 use hyper::Request;
 use hyper::body::Incoming;
 use hyper::client::conn::http2;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use std::collections::HashMap;
+use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tracing::{debug, error, warn};
@@ -37,9 +40,88 @@ use crate::config::types::{BackendProtocol, Proxy};
 use crate::dns::DnsCache;
 use crate::tls::{NoVerifier, TlsPolicy};
 
+/// Sum type for gRPC request bodies: either pre-buffered or streaming from the
+/// client. This allows a single pool type (`SendRequest<GrpcBody>`) to handle
+/// both buffered (retries, plugins) and streaming (zero-copy fast path) bodies.
+pub enum GrpcBody {
+    /// Complete body in memory (retries, plugin transforms).
+    Buffered(Full<Bytes>),
+    /// Streaming body from the client with inline size enforcement.
+    /// When `max_bytes > 0`, tracks accumulated bytes and sets the shared
+    /// `exceeded` flag if the limit is breached. The caller checks the flag
+    /// after `send_request()` completes to return a proper gRPC error.
+    Streaming {
+        incoming: Incoming,
+        bytes_seen: usize,
+        max_bytes: usize,
+        exceeded: Arc<AtomicBool>,
+    },
+}
+
+impl http_body::Body for GrpcBody {
+    type Data = Bytes;
+    type Error = Box<dyn std::error::Error + Send + Sync>;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        match self.get_mut() {
+            GrpcBody::Buffered(full) => Pin::new(full)
+                .poll_frame(cx)
+                .map_err(|never| match never {}),
+            GrpcBody::Streaming {
+                incoming,
+                bytes_seen,
+                max_bytes,
+                exceeded,
+            } => match Pin::new(incoming).poll_frame(cx) {
+                Poll::Ready(Some(Ok(frame))) => {
+                    if *max_bytes > 0
+                        && let Some(data) = frame.data_ref()
+                    {
+                        *bytes_seen += data.len();
+                        if *bytes_seen > *max_bytes {
+                            exceeded.store(true, Ordering::Release);
+                            // Return an error to RST_STREAM the request,
+                            // preventing the backend from treating a truncated
+                            // prefix as a completed stream.
+                            return Poll::Ready(Some(Err(format!(
+                                "gRPC request payload exceeds maximum of {} bytes",
+                                max_bytes
+                            )
+                            .into())));
+                        }
+                    }
+                    Poll::Ready(Some(Ok(frame)))
+                }
+                Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(Box::new(e)))),
+                Poll::Ready(None) => Poll::Ready(None),
+                Poll::Pending => Poll::Pending,
+            },
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        match self {
+            GrpcBody::Buffered(full) => full.is_end_stream(),
+            GrpcBody::Streaming {
+                incoming, exceeded, ..
+            } => incoming.is_end_stream() || exceeded.load(Ordering::Relaxed),
+        }
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        match self {
+            GrpcBody::Buffered(full) => full.size_hint(),
+            GrpcBody::Streaming { incoming, .. } => incoming.size_hint(),
+        }
+    }
+}
+
 /// Pool entry tracking a sender handle and its last-used timestamp.
 struct GrpcPoolEntry {
-    sender: http2::SendRequest<Full<Bytes>>,
+    sender: http2::SendRequest<GrpcBody>,
     last_used_epoch_ms: Arc<AtomicU64>,
 }
 
@@ -196,7 +278,7 @@ impl GrpcConnectionPool {
         &self,
         proxy: &Proxy,
         dns_cache: &DnsCache,
-    ) -> Result<http2::SendRequest<Full<Bytes>>, GrpcProxyError> {
+    ) -> Result<http2::SendRequest<GrpcBody>, GrpcProxyError> {
         let pool_config = self.global_pool_config.for_proxy(proxy);
         let shard_count = pool_config.http2_connections_per_host.max(1);
 
@@ -322,43 +404,64 @@ impl GrpcConnectionPool {
         &self,
         proxy: &Proxy,
         dns_cache: &DnsCache,
-    ) -> Result<http2::SendRequest<Full<Bytes>>, GrpcProxyError> {
+    ) -> Result<http2::SendRequest<GrpcBody>, GrpcProxyError> {
         let host = &proxy.backend_host;
         let port = proxy.backend_port;
 
-        // Resolve backend hostname via DNS cache
-        let target_host = match dns_cache
+        // Resolve backend hostname via the shared DNS cache. Errors propagate
+        // — no silent fallback to raw hostname that would bypass the cache.
+        let resolved_ip = dns_cache
             .resolve(
                 host,
                 proxy.dns_override.as_deref(),
                 proxy.dns_cache_ttl_seconds,
             )
             .await
-        {
-            Ok(ip) => ip.to_string(),
-            Err(_) => host.clone(),
-        };
+            .map_err(|e| {
+                GrpcProxyError::BackendUnavailable(format!(
+                    "DNS resolution failed for {}: {}",
+                    host, e
+                ))
+            })?;
 
-        let addr = format!("{}:{}", target_host, port);
+        // Construct SocketAddr from the resolved IpAddr + port directly.
+        // This handles both IPv4 and IPv6 correctly without string formatting
+        // issues (IPv6 addresses from IpAddr::to_string() are unbracketed,
+        // which breaks "ip:port" string parsing).
+        let sock_addr = std::net::SocketAddr::new(resolved_ip, port);
+        let addr = sock_addr.to_string();
         let connect_timeout = Duration::from_millis(proxy.backend_connect_timeout_ms);
 
-        // Connect with timeout
-        let tcp = tokio::time::timeout(connect_timeout, TcpStream::connect(&addr))
-            .await
-            .map_err(|_| {
-                warn!(
-                    "gRPC: connect timeout ({}ms) to backend {}",
-                    proxy.backend_connect_timeout_ms, addr
+        // Connect with timeout, using TcpSocket to set IP_BIND_ADDRESS_NO_PORT
+        // before connect() so the kernel can co-select ephemeral ports.
+        let tcp = tokio::time::timeout(
+            connect_timeout,
+            crate::socket_opts::connect_with_socket_opts(sock_addr),
+        )
+        .await
+        .map_err(|_| {
+            warn!(
+                "gRPC: connect timeout ({}ms) to backend {}",
+                proxy.backend_connect_timeout_ms, addr
+            );
+            GrpcProxyError::BackendTimeout(format!(
+                "Connect timeout after {}ms to {}",
+                proxy.backend_connect_timeout_ms, addr
+            ))
+        })?
+        .map_err(|e| {
+            if crate::retry::is_port_exhaustion(&e) {
+                tracing::error!(
+                    "gRPC: PORT EXHAUSTION connecting to backend {}: {} — \
+                         reduce outbound connection rate or increase net.ipv4.ip_local_port_range",
+                    addr,
+                    e
                 );
-                GrpcProxyError::BackendTimeout(format!(
-                    "Connect timeout after {}ms to {}",
-                    proxy.backend_connect_timeout_ms, addr
-                ))
-            })?
-            .map_err(|e| {
+            } else {
                 warn!("gRPC: failed to connect to backend {}: {}", addr, e);
-                GrpcProxyError::BackendUnavailable(format!("Connection failed: {}", e))
-            })?;
+            }
+            GrpcProxyError::BackendUnavailable(format!("Connection failed: {}", e))
+        })?;
 
         // Disable Nagle for lower latency
         let _ = tcp.set_nodelay(true);
@@ -436,7 +539,7 @@ impl GrpcConnectionPool {
         &self,
         tcp: TcpStream,
         pool_config: &PoolConfig,
-    ) -> Result<http2::SendRequest<Full<Bytes>>, GrpcProxyError> {
+    ) -> Result<http2::SendRequest<GrpcBody>, GrpcProxyError> {
         let io = TokioIo::new(tcp);
         let builder = Self::build_h2_builder(pool_config);
 
@@ -461,7 +564,7 @@ impl GrpcConnectionPool {
         host: &str,
         proxy: &Proxy,
         pool_config: &PoolConfig,
-    ) -> Result<http2::SendRequest<Full<Bytes>>, GrpcProxyError> {
+    ) -> Result<http2::SendRequest<GrpcBody>, GrpcProxyError> {
         use rustls::pki_types::ServerName;
         use tokio_rustls::TlsConnector;
 
@@ -696,6 +799,11 @@ pub struct GrpcStreamingResponse {
     pub status: u16,
     pub headers: HashMap<String, String>,
     pub body: Incoming,
+    /// Set to `true` if the streaming request body exceeded
+    /// `max_grpc_recv_size_bytes`. The response body consumer should check
+    /// this flag and abort the response if set — the backend received a
+    /// truncated request so the response is likely invalid.
+    pub request_body_exceeded: Option<Arc<AtomicBool>>,
 }
 
 /// Either a fully-buffered or streaming gRPC response.
@@ -832,6 +940,136 @@ pub async fn proxy_grpc_request_from_bytes(
     .await
 }
 
+/// Proxy a gRPC request by streaming the request body directly to the backend
+/// without collecting it into memory first.
+///
+/// Used on the fast path when no plugins need the request body and no retries
+/// are configured. The response is always streamed (since no retries are possible
+/// when the request body has already been consumed).
+///
+/// Request body size limits (`max_grpc_recv_size_bytes`) are enforced inline via
+/// byte counting in `GrpcBody::Streaming`. Each frame's size is accumulated and
+/// the stream errors if the limit is exceeded, causing the H2 connection to reset.
+#[allow(clippy::too_many_arguments)]
+pub async fn proxy_grpc_request_streaming(
+    req: Request<Incoming>,
+    proxy: &Proxy,
+    backend_url: &str,
+    grpc_pool: &GrpcConnectionPool,
+    dns_cache: &DnsCache,
+    proxy_headers: &HashMap<String, String>,
+    max_grpc_recv_size_bytes: usize,
+) -> Result<GrpcResponseKind, GrpcProxyError> {
+    let (parts, body) = req.into_parts();
+    let body_size_exceeded = Arc::new(AtomicBool::new(false));
+    let grpc_body = GrpcBody::Streaming {
+        incoming: body,
+        bytes_seen: 0,
+        max_bytes: max_grpc_recv_size_bytes,
+        exceeded: Arc::clone(&body_size_exceeded),
+    };
+
+    // Build headers, apply proxy transforms
+    let mut headers = parts.headers;
+    headers.remove("connection");
+    headers.remove("transfer-encoding");
+    for (k, v) in proxy_headers {
+        if let (Ok(name), Ok(val)) = (
+            hyper::header::HeaderName::from_bytes(k.as_bytes()),
+            hyper::header::HeaderValue::from_str(v),
+        ) {
+            headers.insert(name, val);
+        }
+    }
+
+    // For the streaming path, send_request() covers both body upload and
+    // response header wait. Unlike the buffered path (where body sends
+    // instantly so backend_read_timeout_ms ≈ response wait), the streaming
+    // timeout must account for upload time.
+    //
+    // When a gRPC deadline is set: use it directly WITHOUT capping by
+    // backend_read_timeout_ms. The client's deadline covers the entire RPC
+    // lifecycle including upload — capping it would penalize large uploads
+    // that the client explicitly budgeted time for.
+    //
+    // When no gRPC deadline is set: fall back to backend_read_timeout_ms
+    // as a safety net against indefinitely stalled backends. Slow uploads
+    // without deadlines should be bounded.
+    let effective_timeout_ms = match parse_grpc_timeout_ms(&headers) {
+        Some(grpc_ms) => grpc_ms,
+        None => proxy.backend_read_timeout_ms,
+    };
+
+    let uri: hyper::Uri = backend_url
+        .parse()
+        .map_err(|e| GrpcProxyError::Internal(format!("Invalid backend URL: {}", e)))?;
+
+    let mut backend_req = Request::new(grpc_body);
+    *backend_req.method_mut() = parts.method;
+    *backend_req.uri_mut() = uri;
+    *backend_req.headers_mut() = headers;
+
+    let mut sender = grpc_pool.get_sender(proxy, dns_cache).await?;
+    let read_timeout = Duration::from_millis(effective_timeout_ms);
+    let response = tokio::time::timeout(read_timeout, sender.send_request(backend_req))
+        .await
+        .map_err(|_| {
+            warn!(
+                "gRPC: timeout ({}ms) waiting for streaming RPC completion",
+                effective_timeout_ms
+            );
+            GrpcProxyError::BackendTimeout(format!(
+                "gRPC streaming RPC timeout after {}ms",
+                effective_timeout_ms
+            ))
+        })?
+        .map_err(|e| {
+            // Check if the failure was caused by the request body exceeding the
+            // size limit. The GrpcBody::Streaming error triggers an h2 stream
+            // reset which surfaces here as a send_request error. Return
+            // ResourceExhausted instead of BackendUnavailable so clients get
+            // the correct gRPC status code.
+            if body_size_exceeded.load(Ordering::Acquire) {
+                return GrpcProxyError::ResourceExhausted(format!(
+                    "gRPC request payload size exceeds maximum of {} bytes",
+                    max_grpc_recv_size_bytes
+                ));
+            }
+            error!("gRPC backend request failed (streaming body): {}", e);
+            GrpcProxyError::BackendUnavailable(format!("Backend request failed: {}", e))
+        })?;
+
+    // Check if the request body already exceeded the limit before response
+    // headers arrived. If so, fail immediately with a clear error.
+    if body_size_exceeded.load(Ordering::Acquire) {
+        return Err(GrpcProxyError::ResourceExhausted(format!(
+            "gRPC request payload size exceeds maximum of {} bytes",
+            max_grpc_recv_size_bytes
+        )));
+    }
+
+    // Return streaming response with the exceeded flag so the response body
+    // consumer can detect late-arriving size violations (bidi/client-streaming
+    // RPCs where request frames continue after response headers arrive).
+    let status = response.status().as_u16();
+    let mut resp_headers = HashMap::with_capacity(response.headers().keys_len());
+    for (k, v) in response.headers() {
+        if let Ok(vs) = v.to_str() {
+            resp_headers.insert(k.as_str().to_string(), vs.to_string());
+        }
+    }
+    Ok(GrpcResponseKind::Streaming(GrpcStreamingResponse {
+        status,
+        headers: resp_headers,
+        body: response.into_body(),
+        request_body_exceeded: if max_grpc_recv_size_bytes > 0 {
+            Some(body_size_exceeded)
+        } else {
+            None
+        },
+    }))
+}
+
 /// Collect the incoming gRPC request body and split the `Request<Incoming>` into
 /// its constituent parts for separate validation and dispatch.
 ///
@@ -917,7 +1155,7 @@ pub(crate) async fn proxy_grpc_request_core(
         None => proxy.backend_read_timeout_ms,
     };
 
-    let mut backend_req = Request::new(Full::new(body_bytes));
+    let mut backend_req = Request::new(GrpcBody::Buffered(Full::new(body_bytes)));
     *backend_req.method_mut() = method;
     *backend_req.uri_mut() = uri;
     *backend_req.headers_mut() = headers;
@@ -962,6 +1200,7 @@ pub(crate) async fn proxy_grpc_request_core(
             status,
             headers: resp_headers,
             body: response.into_body(),
+            request_body_exceeded: None, // buffered request body — already fully sent
         }));
     }
 

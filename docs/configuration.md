@@ -215,10 +215,19 @@ See [infrastructure_sizing.md](infrastructure_sizing.md) for detailed tuning gui
 | `FERRUM_POOL_WARMUP_ENABLED` | No | `true` | Pre-establish backend connections at startup after DNS warmup. Skipped for TCP/UDP stream proxies |
 | `FERRUM_POOL_WARMUP_CONCURRENCY` | No | `500` | Maximum concurrent connection warmup attempts at startup |
 | `FERRUM_POOL_CLEANUP_INTERVAL_SECONDS` | No | `30` | Cleanup sweep interval for all connection pools |
-| `FERRUM_POOL_MAX_IDLE_PER_HOST` | No | `64` | Maximum idle connections per backend host (reqwest pool) |
+| `FERRUM_POOL_MAX_IDLE_PER_HOST` | No | `64` | Maximum idle connections per backend host (min: 4, max: 1024) |
 | `FERRUM_POOL_IDLE_TIMEOUT_SECONDS` | No | `90` | Seconds before idle connections are closed |
+| `FERRUM_POOL_ENABLE_HTTP_KEEP_ALIVE` | No | `true` | Enable HTTP keep-alive for backend connection reuse |
 | `FERRUM_POOL_ENABLE_HTTP2` | No | `true` | Enable HTTP/2 multiplexing when supported |
+| `FERRUM_POOL_HTTP2_CONNECTIONS_PER_HOST` | No | CPU cores (2-8) | HTTP/2 connections per backend host |
 | `FERRUM_POOL_TCP_KEEPALIVE_SECONDS` | No | `60` | TCP keep-alive interval in seconds |
+| `FERRUM_POOL_HTTP2_KEEP_ALIVE_INTERVAL_SECONDS` | No | `30` | HTTP/2 keep-alive ping interval in seconds |
+| `FERRUM_POOL_HTTP2_KEEP_ALIVE_TIMEOUT_SECONDS` | No | `45` | HTTP/2 keep-alive ping timeout in seconds |
+| `FERRUM_POOL_HTTP2_INITIAL_STREAM_WINDOW_SIZE` | No | `8388608` | HTTP/2 per-stream flow-control window in bytes (8 MiB). Clamped to 65535..128 MiB |
+| `FERRUM_POOL_HTTP2_INITIAL_CONNECTION_WINDOW_SIZE` | No | `33554432` | HTTP/2 connection-level flow-control window in bytes (32 MiB). Clamped to 65535..128 MiB |
+| `FERRUM_POOL_HTTP2_ADAPTIVE_WINDOW` | No | `true` | Enable adaptive flow-control window sizing based on observed throughput |
+| `FERRUM_POOL_HTTP2_MAX_FRAME_SIZE` | No | `1048576` | Maximum HTTP/2 frame payload in bytes (1 MiB). Clamped to 16384..1 MiB |
+| `FERRUM_POOL_HTTP2_MAX_CONCURRENT_STREAMS` | No | `1000` | Max concurrent HTTP/2 streams per backend connection |
 
 See [connection_pooling.md](connection_pooling.md) for the full configuration reference and pool warmup details.
 

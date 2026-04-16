@@ -63,13 +63,15 @@ When `response_body_mode: stream` is active and no plugin requires buffering, th
 
 This means the client sees the first byte of the response as soon as the backend sends it, rather than waiting for the entire response to be collected — unless adaptive buffering applies.
 
-### Adaptive Response Buffering
+### Small Response Buffering
 
-When a backend response has a known `Content-Length` in the range **256 KB – 2 MiB** (configurable), the gateway collects the entire body into a single allocation instead of streaming frame-by-frame. This eliminates async iteration overhead for moderate-sized responses while preserving streaming's latency advantage for small bodies (which complete in a few chunks) and memory advantage for large bodies (which would consume too much memory if buffered).
+When a backend response has a known `Content-Length ≤ 64 KiB` (configurable), the gateway collects the entire body into a single allocation via `response.bytes().await` instead of streaming through the async coalescing adapter. For typical JSON API payloads, this single allocation is cheaper than spinning up `CoalescingBody` with its `BytesMut` buffer and poll loop. Responses without `Content-Length` or with `Content-Length` above the cutoff always stream.
+
+SSE responses (`Content-Type: text/event-stream`) **always stream** regardless of `Content-Length`, since they represent inherently unbounded or latency-sensitive streams.
 
 | Env Var | Default | Description |
 |---------|---------|-------------|
-| `FERRUM_RESPONSE_BUFFER_THRESHOLD_BYTES` | `2097152` (2 MiB) | Upper bound for adaptive buffering. Bodies with known Content-Length between 256 KB and this threshold are buffered. `0` = disabled (always stream). |
+| `FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES` | `65536` (64 KiB) | Responses with known Content-Length ≤ this value are eagerly buffered. `0` = disabled (always stream). |
 
 This optimization **only activates when no plugins require response body buffering** — when plugins need the body, the existing plugin-forced buffering path takes precedence.
 
@@ -83,45 +85,76 @@ For responses that stream (either below the adaptive buffer minimum or above the
 response_body_mode = buffer?
     └─ Yes → buffer entire response
     └─ No (stream) →
-        Any plugin requires buffering?
-            └─ Yes → buffer entire response
+        Config-time: any plugin requires buffering?
+            └─ Yes → per-request: should_buffer_response_body(ctx)?
+                └─ Yes → buffer entire response
+                └─ No (all plugins skip for this request) → stream
             └─ No →
+                Retries configured?
+                    └─ Yes → buffer (all attempts except final)
+                    └─ No → continue
                 Response size limit enabled?
                     └─ Yes →
                         Content-Length present?
                             └─ Yes, exceeds limit → reject (502)
-                            └─ Yes, within limit →
-                                256 KB ≤ CL ≤ buffer threshold? → buffer (adaptive)
-                                Otherwise → stream (with coalescing)
-                            └─ No Content-Length → buffer (can't verify size)
+                            └─ Yes, CL ≤ cutoff & not SSE? → buffer (small response)
+                            └─ Yes, CL > cutoff → stream (with coalescing)
+                            └─ No Content-Length → stream (SizeLimitedStreamingResponse)
                     └─ No (unlimited) →
-                        Content-Length present, 256 KB ≤ CL ≤ buffer threshold?
-                            └─ Yes → buffer (adaptive)
+                        Content-Length present, CL ≤ cutoff & not SSE?
+                            └─ Yes → buffer (small response)
                             └─ No → stream (with coalescing)
 ```
 
 ## Plugin Buffering Override
 
-Plugins can force buffering by implementing `requires_response_body_buffering()` on the `Plugin` trait:
+Response body buffering uses a **two-tier check** mirroring the request-body pattern:
+
+1. **Config-time upper bound** — `requires_response_body_buffering()` is pre-computed in `PluginCache` at config load time. O(1) HashMap lookup per request.
+2. **Per-request refinement** — `should_buffer_response_body(&RequestContext)` lets plugins skip buffering when the request context makes it irrelevant.
 
 ```rust
 impl Plugin for MyPlugin {
     fn name(&self) -> &str { "my_body_plugin" }
 
+    // Config-time: this proxy MAY need response buffering
     fn requires_response_body_buffering(&self) -> bool {
-        true  // Forces response buffering
+        true
+    }
+
+    // Per-request: only buffer for POST+JSON requests (e.g., AI API calls)
+    fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {
+        ctx.method == "POST"
+            && ctx.headers.get("content-type")
+                .is_some_and(|ct| ct.to_ascii_lowercase().contains("json"))
     }
 }
 ```
 
-By default this method returns `false`. When any plugin attached to a proxy returns `true`, the gateway buffers the response regardless of `response_body_mode`.
+The default `should_buffer_response_body()` returns `self.requires_response_body_buffering()` — plugins that don't override it behave as before.
 
-This is **pre-computed at config load time** in `PluginCache` and looked up per-request via O(1) HashMap access, avoiding per-request iteration over the plugin list:
+Built-in plugins with per-request refinement:
+
+| Plugin | Skips buffering when |
+|--------|---------------------|
+| `compression` | `Accept-Encoding` header is absent (nothing to compress) |
+| `ai_token_metrics` | Request is not POST+JSON (not an AI API call) |
+| `ai_rate_limiter` | Request is not POST+JSON |
+| `ai_response_guard` | Request is not POST+JSON |
+
+The decision in code:
 
 ```rust
 let should_stream = match proxy.response_body_mode {
     ResponseBodyMode::Buffer => false,
-    ResponseBodyMode::Stream => !state.plugin_cache.requires_response_body_buffering(&proxy.id),
+    ResponseBodyMode::Stream => {
+        let maybe_requires = state.plugin_cache.requires_response_body_buffering(&proxy.id);
+        if maybe_requires {
+            !plugins.iter().any(|p| p.should_buffer_response_body(&ctx))
+        } else {
+            true
+        }
+    }
 };
 ```
 
@@ -159,13 +192,13 @@ When `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES` is set (non-zero), the gateway enforc
 
 | Scenario | Size Limit | Content-Length | Behavior |
 |----------|-----------|---------------|----------|
-| Stream mode | Enabled | Present, within limit | Stream directly |
-| Stream mode | Enabled | Present, exceeds limit | Reject with 502 |
-| Stream mode | Enabled | Absent | Fall back to buffering (can't verify size upfront) |
+| Stream mode | Enabled | Present, within limit | Stream directly (or buffer if ≤ cutoff) |
+| Stream mode | Enabled | Present, exceeds limit | Reject with 502 (before reading body) |
+| Stream mode | Enabled | Absent | Stream with `SizeLimitedStreamingResponse` — frame-by-frame enforcement |
 | Stream mode | Disabled (0) | Any | Stream directly |
 | Buffer mode | Any | Any | Buffer and check size |
 
-When streaming falls back to buffering due to a missing `Content-Length`, the buffered body is still checked against the size limit during collection.
+When Content-Length is absent, the `SizeLimitedStreamingResponse` adapter in `src/proxy/body.rs` wraps the response byte stream and counts bytes as they flow through. If the accumulated size exceeds the limit, it yields an error. This is the response-side equivalent of `SizeLimitedIncoming` for request bodies — it prevents OOM on large chunked responses that exceed the limit without buffering the entire body into memory.
 
 See [docs/size_limits.md](size_limits.md) for the full size limit enforcement architecture.
 
@@ -177,22 +210,23 @@ Both protocols support streaming. By default, streaming responses use `ProxyBody
 
 ### HTTP/3 (QUIC)
 
-HTTP/3 responses support **streaming** by default, following the same decision logic as HTTP/1.1 and gRPC. When no plugins require response body buffering and retries are not configured, the gateway streams response body chunks from the backend directly to the QUIC client via multiple `send_data()` calls — no full-body buffering.
+HTTP/3 responses support **streaming** across two distinct paths:
 
-The streaming pipeline uses **backpressure-aware adaptive coalescing**:
+**H3 frontend → H3 backend** (in `http3/server.rs`): The H3 server's dedicated proxy path uses `Http3ConnectionPool::request_streaming()` to return a live `RequestStream`, then forwards response chunks directly to the QUIC client via `send_data()` with backpressure-aware adaptive coalescing (8–32 KiB accumulation, 2ms time-based flushing).
 
-1. **Adaptive size threshold** — Chunks are accumulated in a `BytesMut` buffer and flushed at 8–32 KiB boundaries to amortise QUIC per-frame overhead.
-2. **Time-based flushing** — If buffered data hasn't reached the size threshold within 2ms, it is flushed anyway to prevent latency stalls on small or tail responses.
-3. **QUIC backpressure** — `send_data().await` blocks when the QUIC stream or connection flow-control window is exhausted, which naturally pauses upstream reads and prevents unbounded memory growth.
-4. **Zero-copy buffer management** — `BytesMut::split().freeze()` converts the mutable buffer to immutable `Bytes` without reallocation.
+**H1/H2 frontend → H3 backend** (in `proxy/mod.rs`): When `stream_response=true`, the dispatch path uses `Http3ConnectionPool::request_streaming()` and returns `ResponseBody::StreamingH3`. The response body builder wraps the h3 `RequestStream` in `CoalescingH3Body` (configurable coalesce target) or `DirectH3Body` (zero-overhead passthrough), bridging h3's `recv_data()` async API to `http_body::Body` for hyper to forward to the HTTP/1.1 or H2 client. This eliminates the previous full-body buffering that occurred on this cross-protocol path.
 
-When plugins require response body access (e.g., `ai_token_metrics`, `response_transformer`) or retries are configured, HTTP/3 responses fall back to **buffered** mode with full `on_response_body` and `transform_response_body` plugin hook support.
+When plugins require response body access (e.g., `ai_token_metrics`, `response_transformer`) or retries are configured, HTTP/3 responses fall back to **buffered** mode via `Http3ConnectionPool::request()` with full `on_response_body` and `transform_response_body` plugin hook support.
 
 ### gRPC
 
-gRPC responses support **frame-by-frame streaming** when no plugins require response body buffering and retries are not configured. The gateway forwards HTTP/2 DATA frames as they arrive from the backend, and HTTP/2 trailers (`grpc-status`, `grpc-message`) are forwarded automatically via hyper's `Incoming` body framing.
+gRPC supports **full bidirectional streaming** of both request and response bodies when no plugins need body access and no retries are configured.
 
-When plugins require response body access (e.g., `ai_token_metrics`) or retries are configured, gRPC responses fall back to **buffered** mode — the full body and trailers are collected before constructing the response.
+**Request body streaming**: The `GrpcConnectionPool` uses a `GrpcBody` sum type (`Buffered(Full<Bytes>)` | `Streaming(Incoming)`) so the same pool handles both buffered and streaming request bodies. When `proxy_grpc_request_streaming()` is used, the `Incoming` body is wrapped in `GrpcBody::Streaming` and forwarded frame-by-frame — each H2 DATA frame is sent to the backend immediately, with memory bounded by the H2 flow-control window size. When retries or plugins require the body, `proxy_grpc_request()` collects via `BodyExt::collect()` into `GrpcBody::Buffered`.
+
+**Response body streaming**: HTTP/2 DATA frames are forwarded as they arrive from the backend, wrapped in `CoalescingH2Body` for efficient batching. HTTP/2 trailers (`grpc-status`, `grpc-message`) are forwarded automatically via hyper's `Incoming` body framing.
+
+When plugins require response body access (e.g., `ai_token_metrics`) or retries are configured, gRPC falls back to **buffered** mode for both request and response — the full body and trailers are collected before constructing the response.
 
 ### WebSocket
 
@@ -216,8 +250,11 @@ Helper constructors:
 - `ProxyBody::full(data)` — Create a buffered body from bytes
 - `ProxyBody::from_string(s)` — Create a buffered body from a string
 - `ProxyBody::empty()` — Create an empty body
-- `body::coalescing_body(response, content_length)` — Create a streaming body with chunk coalescing (128 KB target). This is the default for reqwest-backed HTTP/1.1 responses
-- `body::coalescing_h2_body(body, content_length)` — Create a streaming body with H2 DATA frame coalescing (128 KB target). Used for the gRPC streaming path and HTTP/2 direct pool. Trailer-safe: stashes gRPC trailers (`grpc-status`, `grpc-message`) while flushing buffered data, then returns them on the next poll
+- `body::coalescing_body(response, content_length)` — Create a streaming body with chunk coalescing (128 KB target). Default for reqwest-backed HTTP/1.1 responses
+- `body::coalescing_h2_body(body, content_length, coalesce_target)` — Create a streaming body with H2 DATA frame coalescing. Used for gRPC streaming and HTTP/2 direct pool. Trailer-safe: stashes gRPC trailers while flushing buffered data
+- `body::coalescing_h3_body(recv_stream, content_length, coalesce_target)` — Create a streaming body that bridges h3's `recv_data()` API to `http_body::Body` with chunk coalescing. Used for H1/H2 frontend → H3 backend streaming via `ResponseBody::StreamingH3`
+- `body::direct_streaming_h3_body(recv_stream, content_length)` — Zero-overhead passthrough for H3 response data. Used when no coalescing/size limits apply
+- `body::size_limited_streaming_body(response, max_bytes, content_length)` — Streaming body with frame-by-frame size enforcement via `SizeLimitedStreamingResponse` + coalescing. Used when `max_response_body_size_bytes > 0` and Content-Length is absent
 - `ProxyBody::streaming_tracked(response, baseline)` — Create a streaming body with completion tracking, returning `(ProxyBody, Arc<StreamingMetrics>)`
 
 ## When to Use Buffer Mode
@@ -225,9 +262,10 @@ Helper constructors:
 Use `response_body_mode: buffer` when:
 
 - A plugin needs to inspect or transform the **response body** (not just headers)
-- You need to guarantee response body size limits are enforced even when backends omit `Content-Length`
 - You are debugging response content with `transaction_debugger` and `log_response_body: true`
 - Your responses are small and the latency difference is negligible
+
+Note: response body size limits are now enforced via `SizeLimitedStreamingResponse` even when Content-Length is absent — explicit buffer mode is no longer required for size enforcement.
 
 Use `response_body_mode: stream` (default) when:
 

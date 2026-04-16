@@ -9,7 +9,6 @@
 //! All tests are marked `#[ignore]` — run with:
 //!   cargo build --bin ferrum-edge && cargo test --test functional_tests -- functional_tcp_proxy --ignored --nocapture
 
-use std::io::Write;
 use std::sync::Arc;
 use std::time::Duration;
 use tempfile::TempDir;
@@ -22,12 +21,8 @@ use tokio::time::sleep;
 // ============================================================================
 
 /// Start a plain TCP echo server that reads data and echoes it back.
-async fn start_tcp_echo_server(port: u16) -> tokio::task::JoinHandle<()> {
-    let handle = tokio::spawn(async move {
-        let listener = TcpListener::bind(format!("127.0.0.1:{}", port))
-            .await
-            .unwrap_or_else(|_| panic!("Failed to bind TCP echo server on port {}", port));
-
+async fn start_tcp_echo_server_on(listener: TcpListener) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
         while let Ok((mut stream, _addr)) = listener.accept().await {
             tokio::spawn(async move {
                 let mut buf = vec![0u8; 4096];
@@ -44,10 +39,7 @@ async fn start_tcp_echo_server(port: u16) -> tokio::task::JoinHandle<()> {
                 }
             });
         }
-    });
-    // Give the server time to bind
-    sleep(Duration::from_millis(200)).await;
-    handle
+    })
 }
 
 // ============================================================================
@@ -55,8 +47,8 @@ async fn start_tcp_echo_server(port: u16) -> tokio::task::JoinHandle<()> {
 // ============================================================================
 
 /// Start a TLS-enabled TCP echo server using the test certs.
-async fn start_tls_echo_server(port: u16) -> tokio::task::JoinHandle<()> {
-    let handle = tokio::spawn(async move {
+async fn start_tls_echo_server_on(listener: TcpListener) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
         let cert_path = std::path::Path::new("tests/certs/server.crt");
         let key_path = std::path::Path::new("tests/certs/server.key");
 
@@ -81,9 +73,6 @@ async fn start_tls_echo_server(port: u16) -> tokio::task::JoinHandle<()> {
             .expect("Failed to build TLS server config");
 
         let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls_config));
-        let listener = TcpListener::bind(format!("127.0.0.1:{}", port))
-            .await
-            .unwrap_or_else(|_| panic!("Failed to bind TLS echo server on port {}", port));
 
         while let Ok((tcp_stream, _addr)) = listener.accept().await {
             let acceptor = acceptor.clone();
@@ -109,9 +98,7 @@ async fn start_tls_echo_server(port: u16) -> tokio::task::JoinHandle<()> {
                 }
             });
         }
-    });
-    sleep(Duration::from_millis(200)).await;
-    handle
+    })
 }
 
 // ============================================================================
@@ -129,6 +116,7 @@ fn gateway_binary_path() -> &'static str {
 fn start_gateway(
     config_path: &str,
     http_port: u16,
+    admin_port: u16,
     tls_cert_path: Option<&str>,
     tls_key_path: Option<&str>,
 ) -> Result<std::process::Child, Box<dyn std::error::Error>> {
@@ -136,6 +124,7 @@ fn start_gateway(
     cmd.env("FERRUM_MODE", "file")
         .env("FERRUM_FILE_CONFIG_PATH", config_path)
         .env("FERRUM_PROXY_HTTP_PORT", http_port.to_string())
+        .env("FERRUM_ADMIN_HTTP_PORT", admin_port.to_string())
         .env("FERRUM_TLS_NO_VERIFY", "true")
         .env("RUST_LOG", "ferrum_edge=debug")
         .stdin(std::process::Stdio::null())
@@ -152,10 +141,93 @@ fn start_gateway(
     Ok(cmd.spawn()?)
 }
 
-fn write_config(path: &std::path::Path, content: &str) {
-    let mut file = std::fs::File::create(path).expect("Failed to create config file");
-    file.write_all(content.as_bytes())
-        .expect("Failed to write config");
+/// Wait for the gateway health endpoint to respond.
+/// Returns true if healthy, false if timed out.
+async fn wait_for_health(admin_port: u16) -> bool {
+    let health_url = format!("http://127.0.0.1:{}/health", admin_port);
+    let deadline = std::time::SystemTime::now() + Duration::from_secs(30);
+    loop {
+        if std::time::SystemTime::now() >= deadline {
+            return false;
+        }
+        match reqwest::get(&health_url).await {
+            Ok(r) if r.status().is_success() => return true,
+            _ => sleep(Duration::from_millis(500)).await,
+        }
+    }
+}
+
+/// Start the gateway with retry on port-binding failures.
+///
+/// Allocates fresh ephemeral proxy listen, HTTP, and admin ports on each attempt
+/// to handle the bind-drop-rebind port race. The `make_config` closure receives
+/// `(proxy_listen_port, config_dir)` and must return the config file content.
+///
+/// Returns (child, proxy_listen_port, admin_port, TempDir).
+async fn start_gateway_with_retry<F>(
+    make_config: F,
+    tls_cert_path: Option<&str>,
+    tls_key_path: Option<&str>,
+) -> (std::process::Child, u16, u16, TempDir)
+where
+    F: Fn(u16) -> String,
+{
+    const MAX_ATTEMPTS: u32 = 3;
+    for attempt in 1..=MAX_ATTEMPTS {
+        // Allocate fresh ephemeral ports each attempt
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_listen_port = proxy_listener.local_addr().unwrap().port();
+        drop(proxy_listener);
+
+        let http_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let http_port = http_listener.local_addr().unwrap().port();
+        drop(http_listener);
+
+        let admin_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let admin_port = admin_listener.local_addr().unwrap().port();
+        drop(admin_listener);
+
+        let dir = TempDir::new().unwrap();
+        let config_path = dir.path().join("config.yaml");
+        let config_content = make_config(proxy_listen_port);
+        std::fs::write(&config_path, &config_content).unwrap();
+
+        let mut child = match start_gateway(
+            config_path.to_str().unwrap(),
+            http_port,
+            admin_port,
+            tls_cert_path,
+            tls_key_path,
+        ) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!(
+                    "Gateway spawn attempt {}/{} failed: {}",
+                    attempt, MAX_ATTEMPTS, e
+                );
+                if attempt < MAX_ATTEMPTS {
+                    sleep(Duration::from_secs(1)).await;
+                }
+                continue;
+            }
+        };
+
+        if wait_for_health(admin_port).await {
+            return (child, proxy_listen_port, admin_port, dir);
+        }
+
+        eprintln!(
+            "Gateway startup attempt {}/{} failed (ports: stream={}, http={}, admin={})",
+            attempt, MAX_ATTEMPTS, proxy_listen_port, http_port, admin_port
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+
+        if attempt < MAX_ATTEMPTS {
+            sleep(Duration::from_secs(1)).await;
+        }
+    }
+    panic!("Gateway did not start after {} attempts", MAX_ATTEMPTS);
 }
 
 /// Build a TLS client connector that trusts self-signed certs (for testing).
@@ -227,18 +299,15 @@ impl rustls::client::danger::ServerCertVerifier for NoVerifier {
 #[ignore]
 #[tokio::test]
 async fn test_tcp_proxy_plain_bidirectional() {
-    let backend_port = 19800u16;
-    let proxy_port = 19801u16;
-    let gateway_http_port = 18200u16;
+    // Backend echo server — pass pre-bound listener (no port race)
+    let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_port = backend_listener.local_addr().unwrap().port();
+    let echo_server = start_tcp_echo_server_on(backend_listener).await;
 
-    let echo_server = start_tcp_echo_server(backend_port).await;
-
-    let temp_dir = TempDir::new().unwrap();
-    let config_path = temp_dir.path().join("config.yaml");
-    write_config(
-        &config_path,
-        &format!(
-            r#"
+    let (mut gateway, proxy_port, _admin_port, _dir) = start_gateway_with_retry(
+        |proxy_port| {
+            format!(
+                r#"
 proxies:
   - id: "tcp-echo"
     listen_path: ""
@@ -250,12 +319,12 @@ proxies:
 consumers: []
 plugin_configs: []
 "#
-        ),
-    );
-
-    let mut gateway = start_gateway(config_path.to_str().unwrap(), gateway_http_port, None, None)
-        .expect("Failed to start gateway");
-    sleep(Duration::from_secs(3)).await;
+            )
+        },
+        None,
+        None,
+    )
+    .await;
 
     // Connect through the TCP proxy
     let mut stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", proxy_port))
@@ -300,18 +369,24 @@ plugin_configs: []
 #[ignore]
 #[tokio::test]
 async fn test_tcp_proxy_frontend_tls_termination() {
-    let backend_port = 19802u16;
-    let proxy_port = 19803u16;
-    let gateway_http_port = 18201u16;
+    // Backend echo server — bind in-process (no port race)
+    let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_port = backend_listener.local_addr().unwrap().port();
+    let echo_server = start_tcp_echo_server_on(backend_listener).await;
 
-    let echo_server = start_tcp_echo_server(backend_port).await;
+    let cert_path = std::fs::canonicalize("tests/certs/server.crt")
+        .expect("cert not found")
+        .to_string_lossy()
+        .to_string();
+    let key_path = std::fs::canonicalize("tests/certs/server.key")
+        .expect("key not found")
+        .to_string_lossy()
+        .to_string();
 
-    let temp_dir = TempDir::new().unwrap();
-    let config_path = temp_dir.path().join("config.yaml");
-    write_config(
-        &config_path,
-        &format!(
-            r#"
+    let (mut gateway, proxy_port, _admin_port, _dir) = start_gateway_with_retry(
+        |proxy_port| {
+            format!(
+                r#"
 proxies:
   - id: "tcp-tls-frontend"
     listen_path: ""
@@ -324,27 +399,12 @@ proxies:
 consumers: []
 plugin_configs: []
 "#
-        ),
-    );
-
-    // Start gateway with TLS cert/key (needed for frontend_tls)
-    let cert_path = std::fs::canonicalize("tests/certs/server.crt")
-        .expect("cert not found")
-        .to_string_lossy()
-        .to_string();
-    let key_path = std::fs::canonicalize("tests/certs/server.key")
-        .expect("key not found")
-        .to_string_lossy()
-        .to_string();
-
-    let mut gateway = start_gateway(
-        config_path.to_str().unwrap(),
-        gateway_http_port,
+            )
+        },
         Some(&cert_path),
         Some(&key_path),
     )
-    .expect("Failed to start gateway");
-    sleep(Duration::from_secs(3)).await;
+    .await;
 
     // Connect through TLS to the TCP proxy
     let tcp_stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", proxy_port))
@@ -385,18 +445,15 @@ plugin_configs: []
 #[ignore]
 #[tokio::test]
 async fn test_tcp_proxy_backend_tls_origination() {
-    let backend_port = 19804u16;
-    let proxy_port = 19805u16;
-    let gateway_http_port = 18202u16;
+    // Backend TLS echo server — bind in-process (no port race)
+    let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_port = backend_listener.local_addr().unwrap().port();
+    let echo_server = start_tls_echo_server_on(backend_listener).await;
 
-    let echo_server = start_tls_echo_server(backend_port).await;
-
-    let temp_dir = TempDir::new().unwrap();
-    let config_path = temp_dir.path().join("config.yaml");
-    write_config(
-        &config_path,
-        &format!(
-            r#"
+    let (mut gateway, proxy_port, _admin_port, _dir) = start_gateway_with_retry(
+        |proxy_port| {
+            format!(
+                r#"
 proxies:
   - id: "tcp-tls-backend"
     listen_path: ""
@@ -409,12 +466,12 @@ proxies:
 consumers: []
 plugin_configs: []
 "#
-        ),
-    );
-
-    let mut gateway = start_gateway(config_path.to_str().unwrap(), gateway_http_port, None, None)
-        .expect("Failed to start gateway");
-    sleep(Duration::from_secs(3)).await;
+            )
+        },
+        None,
+        None,
+    )
+    .await;
 
     // Connect with plain TCP — gateway handles TLS to backend
     let mut stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", proxy_port))
@@ -443,18 +500,24 @@ plugin_configs: []
 #[ignore]
 #[tokio::test]
 async fn test_tcp_proxy_full_tls() {
-    let backend_port = 19806u16;
-    let proxy_port = 19807u16;
-    let gateway_http_port = 18203u16;
+    // Backend TLS echo server — bind in-process (no port race)
+    let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_port = backend_listener.local_addr().unwrap().port();
+    let echo_server = start_tls_echo_server_on(backend_listener).await;
 
-    let echo_server = start_tls_echo_server(backend_port).await;
+    let cert_path = std::fs::canonicalize("tests/certs/server.crt")
+        .expect("cert not found")
+        .to_string_lossy()
+        .to_string();
+    let key_path = std::fs::canonicalize("tests/certs/server.key")
+        .expect("key not found")
+        .to_string_lossy()
+        .to_string();
 
-    let temp_dir = TempDir::new().unwrap();
-    let config_path = temp_dir.path().join("config.yaml");
-    write_config(
-        &config_path,
-        &format!(
-            r#"
+    let (mut gateway, proxy_port, _admin_port, _dir) = start_gateway_with_retry(
+        |proxy_port| {
+            format!(
+                r#"
 proxies:
   - id: "tcp-full-tls"
     listen_path: ""
@@ -468,26 +531,12 @@ proxies:
 consumers: []
 plugin_configs: []
 "#
-        ),
-    );
-
-    let cert_path = std::fs::canonicalize("tests/certs/server.crt")
-        .expect("cert not found")
-        .to_string_lossy()
-        .to_string();
-    let key_path = std::fs::canonicalize("tests/certs/server.key")
-        .expect("key not found")
-        .to_string_lossy()
-        .to_string();
-
-    let mut gateway = start_gateway(
-        config_path.to_str().unwrap(),
-        gateway_http_port,
+            )
+        },
         Some(&cert_path),
         Some(&key_path),
     )
-    .expect("Failed to start gateway");
-    sleep(Duration::from_secs(3)).await;
+    .await;
 
     // Connect through TLS
     let tcp_stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", proxy_port))
@@ -529,18 +578,15 @@ plugin_configs: []
 #[ignore]
 #[tokio::test]
 async fn test_tcp_proxy_idle_timeout() {
-    let backend_port = 19809u16;
-    let proxy_port = 19810u16;
-    let gateway_http_port = 18205u16;
+    // Backend echo server — bind in-process (no port race)
+    let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_port = backend_listener.local_addr().unwrap().port();
+    let echo_server = start_tcp_echo_server_on(backend_listener).await;
 
-    let echo_server = start_tcp_echo_server(backend_port).await;
-
-    let temp_dir = TempDir::new().unwrap();
-    let config_path = temp_dir.path().join("config.yaml");
-    write_config(
-        &config_path,
-        &format!(
-            r#"
+    let (mut gateway, proxy_port, _admin_port, _dir) = start_gateway_with_retry(
+        |proxy_port| {
+            format!(
+                r#"
 proxies:
   - id: "tcp-idle-timeout"
     listen_path: ""
@@ -553,12 +599,12 @@ proxies:
 consumers: []
 plugin_configs: []
 "#
-        ),
-    );
-
-    let mut gateway = start_gateway(config_path.to_str().unwrap(), gateway_http_port, None, None)
-        .expect("Failed to start gateway");
-    sleep(Duration::from_secs(3)).await;
+            )
+        },
+        None,
+        None,
+    )
+    .await;
 
     let mut stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", proxy_port))
         .await
@@ -608,15 +654,10 @@ plugin_configs: []
 #[ignore]
 #[tokio::test]
 async fn test_tcp_proxy_backend_unreachable() {
-    let proxy_port = 19808u16;
-    let gateway_http_port = 18204u16;
-
-    let temp_dir = TempDir::new().unwrap();
-    let config_path = temp_dir.path().join("config.yaml");
-    write_config(
-        &config_path,
-        &format!(
-            r#"
+    let (mut gateway, proxy_port, _admin_port, _dir) = start_gateway_with_retry(
+        |proxy_port| {
+            format!(
+                r#"
 proxies:
   - id: "tcp-unreachable"
     listen_path: ""
@@ -629,12 +670,12 @@ proxies:
 consumers: []
 plugin_configs: []
 "#
-        ),
-    );
-
-    let mut gateway = start_gateway(config_path.to_str().unwrap(), gateway_http_port, None, None)
-        .expect("Failed to start gateway");
-    sleep(Duration::from_secs(3)).await;
+            )
+        },
+        None,
+        None,
+    )
+    .await;
 
     // Connect to proxy — should accept the TCP connection
     let result = tokio::time::timeout(

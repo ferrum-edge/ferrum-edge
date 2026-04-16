@@ -1062,3 +1062,33 @@ pub fn is_udp_gso_available() -> bool {
 pub fn is_udp_gso_available() -> bool {
     false
 }
+
+// ── TCP connect with socket options ────────────────────────────────────────
+
+/// Connect to a pre-resolved `SocketAddr` with `IP_BIND_ADDRESS_NO_PORT` set
+/// before `connect()` so the kernel can co-select ephemeral ports using 4-tuple
+/// optimization.
+///
+/// Creates a `TcpSocket` for the correct address family (v4/v6), applies
+/// `IP_BIND_ADDRESS_NO_PORT` on Linux, then connects. The caller must resolve
+/// the hostname via the shared DNS cache before calling this — no DNS lookup
+/// happens here.
+///
+/// Used by the HTTP/2 direct pool and gRPC pool for outbound backend connections.
+pub async fn connect_with_socket_opts(
+    sock_addr: std::net::SocketAddr,
+) -> std::io::Result<tokio::net::TcpStream> {
+    let socket = if sock_addr.is_ipv4() {
+        tokio::net::TcpSocket::new_v4()?
+    } else {
+        tokio::net::TcpSocket::new_v6()?
+    };
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let _ = set_ip_bind_address_no_port(socket.as_raw_fd(), true);
+    }
+
+    socket.connect(sock_addr).await
+}

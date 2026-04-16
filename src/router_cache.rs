@@ -1065,3 +1065,180 @@ fn make_cache_key(host: Option<&str>, path: &str) -> String {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── CountMinSketch tests ────────────────────────────────────────────
+
+    #[test]
+    fn cms_new_starts_at_zero() {
+        let cms = CountMinSketch::new(64, 1000);
+        assert_eq!(cms.estimate("any-key"), 0);
+        assert_eq!(cms.total_increments.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn cms_increment_returns_post_increment_count() {
+        let cms = CountMinSketch::new(64, 1000);
+        assert_eq!(cms.increment("key-a"), 1);
+        assert_eq!(cms.increment("key-a"), 2);
+        assert_eq!(cms.increment("key-a"), 3);
+    }
+
+    #[test]
+    fn cms_estimate_matches_increment() {
+        let cms = CountMinSketch::new(64, 1000);
+        cms.increment("key-a");
+        cms.increment("key-a");
+        cms.increment("key-a");
+        assert_eq!(cms.estimate("key-a"), 3);
+    }
+
+    #[test]
+    fn cms_different_keys_independent() {
+        let cms = CountMinSketch::new(1024, 100_000);
+        for _ in 0..10 {
+            cms.increment("hot-key");
+        }
+        cms.increment("cold-key");
+
+        assert_eq!(cms.estimate("hot-key"), 10);
+        assert_eq!(cms.estimate("cold-key"), 1);
+    }
+
+    #[test]
+    fn cms_saturates_at_255() {
+        let cms = CountMinSketch::new(64, 100_000);
+        for _ in 0..300 {
+            cms.increment("saturate");
+        }
+        assert_eq!(cms.estimate("saturate"), 255);
+        // Further increments stay at 255
+        assert_eq!(cms.increment("saturate"), 255);
+    }
+
+    #[test]
+    fn cms_age_halves_counters() {
+        let cms = CountMinSketch::new(64, 100_000);
+        for _ in 0..20 {
+            cms.increment("key-a");
+        }
+        assert_eq!(cms.estimate("key-a"), 20);
+
+        cms.age();
+        assert_eq!(cms.estimate("key-a"), 10);
+
+        cms.age();
+        assert_eq!(cms.estimate("key-a"), 5);
+    }
+
+    #[test]
+    fn cms_age_triggered_by_threshold() {
+        // Set age_threshold = 10 so aging happens every 10 increments
+        let cms = CountMinSketch::new(1024, 10);
+        // Increment a single key 10 times — on the 10th, aging triggers
+        for _ in 0..9 {
+            cms.increment("key-a");
+        }
+        assert_eq!(cms.estimate("key-a"), 9);
+
+        // The 10th increment: row goes 9→10, then age() halves it to 5.
+        // increment() returns the PRE-age post-increment value (10).
+        let val = cms.increment("key-a");
+        assert_eq!(val, 10, "Return value is pre-age post-increment");
+
+        // But estimate() now sees the aged value
+        assert_eq!(
+            cms.estimate("key-a"),
+            5,
+            "Post-age estimate should be halved"
+        );
+    }
+
+    #[test]
+    fn cms_reset_clears_all() {
+        let cms = CountMinSketch::new(64, 1000);
+        for _ in 0..50 {
+            cms.increment("key-a");
+        }
+        assert!(cms.estimate("key-a") > 0);
+        assert!(cms.total_increments.load(Ordering::Relaxed) > 0);
+
+        cms.reset();
+        assert_eq!(cms.estimate("key-a"), 0);
+        assert_eq!(cms.total_increments.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn cms_width_rounds_to_power_of_two() {
+        let cms = CountMinSketch::new(100, 1000);
+        // 100 rounds up to 128, so width_mask = 127
+        assert_eq!(cms.width_mask, 127);
+    }
+
+    // ── frequency_aware_evict tests ─────────────────────────────────────
+
+    #[test]
+    fn evict_removes_low_frequency_entries() {
+        let sketch = CountMinSketch::new(1024, 100_000);
+        let map: DashMap<String, ()> = DashMap::new();
+
+        // Insert entries with varying frequencies
+        for i in 0..100 {
+            let key = format!("key-{}", i);
+            map.insert(key.clone(), ());
+            // Keys 0-49 get 1 hit, keys 50-99 get 20 hits
+            if i >= 50 {
+                for _ in 0..20 {
+                    sketch.increment(&key);
+                }
+            } else {
+                sketch.increment(&key);
+            }
+        }
+
+        let removed = frequency_aware_evict(&map, &sketch, 100);
+        assert!(removed > 0, "Should have evicted some entries");
+        assert!(map.len() < 100, "Map should be smaller after eviction");
+
+        // High-frequency keys should be more likely to survive
+        let mut high_freq_surviving = 0;
+        for i in 50..100 {
+            if map.contains_key(&format!("key-{}", i)) {
+                high_freq_surviving += 1;
+            }
+        }
+        let mut low_freq_surviving = 0;
+        for i in 0..50 {
+            if map.contains_key(&format!("key-{}", i)) {
+                low_freq_surviving += 1;
+            }
+        }
+        assert!(
+            high_freq_surviving > low_freq_surviving,
+            "High-freq keys ({}) should survive more than low-freq keys ({})",
+            high_freq_surviving,
+            low_freq_surviving
+        );
+    }
+
+    #[test]
+    fn evict_empty_map_is_noop() {
+        let sketch = CountMinSketch::new(64, 1000);
+        let map: DashMap<String, ()> = DashMap::new();
+        let removed = frequency_aware_evict(&map, &sketch, 100);
+        assert_eq!(removed, 0);
+    }
+
+    #[test]
+    fn evict_very_small_capacity_is_noop() {
+        // target_removals = max_entries / 4 = 3 / 4 = 0
+        let sketch = CountMinSketch::new(64, 1000);
+        let map: DashMap<String, ()> = DashMap::new();
+        map.insert("a".into(), ());
+        let removed = frequency_aware_evict(&map, &sketch, 3);
+        assert_eq!(removed, 0);
+    }
+}

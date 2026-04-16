@@ -29,7 +29,8 @@ use crate::config::types::Proxy;
 type H3SendRequest = h3::client::SendRequest<h3_quinn::OpenStreams, bytes::Bytes>;
 
 /// Type alias for the h3 client request stream (bidirectional).
-type H3RequestStream = h3::client::RequestStream<h3_quinn::BidiStream<bytes::Bytes>, bytes::Bytes>;
+pub type H3RequestStream =
+    h3::client::RequestStream<h3_quinn::BidiStream<bytes::Bytes>, bytes::Bytes>;
 
 /// Result of a streaming HTTP/3 request — headers received, body still in flight.
 ///

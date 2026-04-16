@@ -46,6 +46,8 @@ pub enum ErrorClass {
     RequestBodyTooLarge,
     /// Could not acquire or create an HTTP client from the connection pool.
     ConnectionPoolError,
+    /// All ephemeral ports are exhausted — the OS returned EADDRNOTAVAIL.
+    PortExhaustion,
     /// Catch-all for unclassified request errors.
     RequestError,
 }
@@ -65,9 +67,42 @@ impl std::fmt::Display for ErrorClass {
             Self::ResponseBodyTooLarge => write!(f, "response_body_too_large"),
             Self::RequestBodyTooLarge => write!(f, "request_body_too_large"),
             Self::ConnectionPoolError => write!(f, "connection_pool_error"),
+            Self::PortExhaustion => write!(f, "port_exhaustion"),
             Self::RequestError => write!(f, "request_error"),
         }
     }
+}
+
+/// Returns `true` if the error's root cause is EADDRNOTAVAIL, which indicates
+/// ephemeral port exhaustion.
+///
+/// OS error codes: Linux = 99, macOS/BSD = 49, Windows = 10049 (WSAEADDRNOTAVAIL).
+///
+/// Walks the error source chain because transport libraries (reqwest, hyper)
+/// wrap `io::Error` inside multiple layers.
+pub fn is_port_exhaustion(e: &(dyn std::error::Error + 'static)) -> bool {
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(e);
+    while let Some(err) = current {
+        if let Some(io_err) = err.downcast_ref::<std::io::Error>() {
+            match io_err.raw_os_error() {
+                // EADDRNOTAVAIL: Linux = 99, macOS/BSD = 49, Windows = 10049
+                Some(99) | Some(49) | Some(10049) => return true,
+                _ => {}
+            }
+        }
+        current = err.source();
+    }
+    false
+}
+
+/// Returns `true` if a string representation of an error indicates port
+/// exhaustion (EADDRNOTAVAIL). Used for error types that have already been
+/// stringified (e.g. `GrpcProxyError::BackendUnavailable(String)`).
+pub fn is_port_exhaustion_message(msg: &str) -> bool {
+    msg.contains("address not available")
+        || msg.contains("os error 99")
+        || msg.contains("os error 49")
+        || msg.contains("os error 10049")
 }
 
 /// Classify a gRPC proxy error into an `ErrorClass`.
@@ -85,7 +120,9 @@ pub fn classify_grpc_proxy_error(e: &crate::proxy::grpc_proxy::GrpcProxyError) -
             }
         }
         GrpcProxyError::BackendUnavailable(msg) => {
-            if msg.contains("TLS handshake failed")
+            if is_port_exhaustion_message(msg) {
+                ErrorClass::PortExhaustion
+            } else if msg.contains("TLS handshake failed")
                 || msg.contains("h2 handshake failed")
                 || msg.contains("certificate")
             {
@@ -94,9 +131,7 @@ pub fn classify_grpc_proxy_error(e: &crate::proxy::grpc_proxy::GrpcProxyError) -
                 ErrorClass::ConnectionRefused
             } else if msg.contains("h2c handshake failed") {
                 ErrorClass::ProtocolError
-            } else if msg.contains("Invalid server name")
-                || msg.contains("DNS resolution for backend failed")
-            {
+            } else if msg.contains("Invalid server name") || msg.contains("DNS resolution") {
                 ErrorClass::DnsLookupError
             } else {
                 ErrorClass::ConnectionRefused
@@ -114,6 +149,9 @@ pub fn classify_boxed_error(e: &(dyn std::error::Error + Send + Sync)) -> ErrorC
     let error_str = format!("{}", e);
     let debug_str = format!("{:?}", e);
 
+    if is_port_exhaustion_message(&error_str) || is_port_exhaustion_message(&debug_str) {
+        return ErrorClass::PortExhaustion;
+    }
     if error_str.contains("connect timeout") || error_str.contains("timed out") {
         return ErrorClass::ConnectionTimeout;
     }
@@ -154,6 +192,12 @@ pub fn classify_boxed_error(e: &(dyn std::error::Error + Send + Sync)) -> ErrorC
 /// Classify a `reqwest::Error` into an `ErrorClass` by inspecting its
 /// error chain and message. This is called on the error path only (not hot path).
 pub fn classify_reqwest_error(e: &reqwest::Error) -> ErrorClass {
+    // Check for port exhaustion (EADDRNOTAVAIL) before other classifications.
+    // Walk the source chain since reqwest wraps io::Error in multiple layers.
+    if is_port_exhaustion(e) {
+        return ErrorClass::PortExhaustion;
+    }
+
     // Check the error chain for specific std::io errors
     let error_str = format!("{}", e);
     let source_chain = format!("{:?}", e);
@@ -229,6 +273,11 @@ pub enum ResponseBody {
     /// Body from hyper's HTTP/2 client (used by Http2ConnectionPool for
     /// proper H2 stream multiplexing over persistent connections).
     StreamingH2(hyper::Response<hyper::body::Incoming>),
+    /// Body from the HTTP/3 (QUIC) backend via h3's `RequestStream`. The
+    /// response headers have been received; body chunks arrive via
+    /// `recv_data()`. This avoids buffering the entire H3 response when
+    /// streaming to HTTP/1.1 or HTTP/2 frontends.
+    StreamingH3(Box<crate::http3::client::H3StreamingResponse>),
 }
 
 /// Result of a backend request, carrying enough context for the retry
@@ -257,7 +306,9 @@ impl BackendResponse {
     pub fn body_bytes(&self) -> &[u8] {
         match &self.body {
             ResponseBody::Buffered(b) => b,
-            ResponseBody::Streaming(_) | ResponseBody::StreamingH2(_) => &[],
+            ResponseBody::Streaming(_)
+            | ResponseBody::StreamingH2(_)
+            | ResponseBody::StreamingH3(_) => &[],
         }
     }
 
@@ -267,7 +318,9 @@ impl BackendResponse {
     pub fn into_buffered_body(self) -> Vec<u8> {
         match self.body {
             ResponseBody::Buffered(b) => b,
-            ResponseBody::Streaming(_) | ResponseBody::StreamingH2(_) => {
+            ResponseBody::Streaming(_)
+            | ResponseBody::StreamingH2(_)
+            | ResponseBody::StreamingH3(_) => {
                 warn!("attempted to extract buffered body from a streaming response");
                 Vec::new()
             }

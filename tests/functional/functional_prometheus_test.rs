@@ -73,7 +73,8 @@ fn start_gateway(config_path: &str, proxy_port: u16, admin_port: u16) -> std::pr
 }
 
 /// Wait for the gateway admin health endpoint to respond.
-async fn wait_for_gateway(admin_port: u16) {
+/// Returns true if healthy, false if timed out.
+async fn wait_for_gateway(admin_port: u16) -> bool {
     let client = reqwest::Client::new();
     let health_url = format!("http://127.0.0.1:{}/health", admin_port);
 
@@ -81,11 +82,11 @@ async fn wait_for_gateway(admin_port: u16) {
         if let Ok(resp) = client.get(&health_url).send().await
             && resp.status().is_success()
         {
-            return;
+            return true;
         }
         sleep(Duration::from_millis(250)).await;
     }
-    panic!("Gateway did not become healthy within 15 seconds");
+    false
 }
 
 /// Allocate an ephemeral port by binding to port 0 and returning the assigned port.
@@ -94,6 +95,34 @@ async fn ephemeral_port() -> u16 {
     let port = listener.local_addr().unwrap().port();
     drop(listener);
     port
+}
+
+/// Start the gateway with retry logic for port allocation races.
+/// Allocates fresh gateway/admin ports each attempt.
+async fn start_gateway_with_retry(config_path: &str) -> (std::process::Child, u16, u16) {
+    const MAX_ATTEMPTS: u32 = 3;
+    for attempt in 1..=MAX_ATTEMPTS {
+        let proxy_port = ephemeral_port().await;
+        let admin_port = ephemeral_port().await;
+
+        let mut child = start_gateway(config_path, proxy_port, admin_port);
+
+        if wait_for_gateway(admin_port).await {
+            return (child, proxy_port, admin_port);
+        }
+
+        eprintln!(
+            "Gateway startup attempt {}/{} failed (proxy_port={}, admin_port={})",
+            attempt, MAX_ATTEMPTS, proxy_port, admin_port
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+
+        if attempt < MAX_ATTEMPTS {
+            sleep(Duration::from_secs(1)).await;
+        }
+    }
+    panic!("Gateway did not start after {} attempts", MAX_ATTEMPTS);
 }
 
 // ============================================================================
@@ -115,8 +144,6 @@ async fn test_prometheus_metrics_endpoint_returns_data() {
     let config_path = temp_dir.path().join("config.yaml");
 
     let backend_port = ephemeral_port().await;
-    let proxy_port = ephemeral_port().await;
-    let admin_port = ephemeral_port().await;
 
     let config_content = format!(
         r#"
@@ -155,10 +182,9 @@ plugin_configs:
     tokio::spawn(start_echo_backend(backend_port));
     sleep(Duration::from_millis(500)).await;
 
-    // Start gateway
-    let mut gateway = start_gateway(config_path.to_str().unwrap(), proxy_port, admin_port);
-    sleep(Duration::from_secs(3)).await;
-    wait_for_gateway(admin_port).await;
+    // Start gateway with retry
+    let (mut gateway, proxy_port, admin_port) =
+        start_gateway_with_retry(config_path.to_str().unwrap()).await;
 
     let client = reqwest::Client::new();
 
@@ -231,8 +257,6 @@ async fn test_prometheus_metrics_reflect_traffic() {
     let config_path = temp_dir.path().join("config.yaml");
 
     let backend_port = ephemeral_port().await;
-    let proxy_port = ephemeral_port().await;
-    let admin_port = ephemeral_port().await;
 
     let config_content = format!(
         r#"
@@ -271,10 +295,9 @@ plugin_configs:
     tokio::spawn(start_echo_backend(backend_port));
     sleep(Duration::from_millis(500)).await;
 
-    // Start gateway
-    let mut gateway = start_gateway(config_path.to_str().unwrap(), proxy_port, admin_port);
-    sleep(Duration::from_secs(3)).await;
-    wait_for_gateway(admin_port).await;
+    // Start gateway with retry
+    let (mut gateway, proxy_port, admin_port) =
+        start_gateway_with_retry(config_path.to_str().unwrap()).await;
 
     let client = reqwest::Client::new();
 

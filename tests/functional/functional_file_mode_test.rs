@@ -22,12 +22,8 @@ use tokio::time::sleep;
 // Echo Server Helper
 // ============================================================================
 
-/// Start a simple HTTP echo server on the given port using raw tokio TCP.
-async fn start_echo_server(port: u16) {
-    let listener = TcpListener::bind(format!("127.0.0.1:{}", port))
-        .await
-        .expect("Failed to bind echo server");
-
+/// Start a simple HTTP echo server on a pre-bound listener (avoids port race).
+async fn start_echo_server_on(listener: TcpListener) {
     loop {
         if let Ok((mut stream, _)) = listener.accept().await {
             tokio::spawn(async move {
@@ -47,41 +43,89 @@ async fn start_echo_server(port: u16) {
     }
 }
 
+/// Detect the gateway binary path (debug preferred, fallback to release).
+fn gateway_binary_path() -> &'static str {
+    if std::path::Path::new("./target/debug/ferrum-edge").exists() {
+        "./target/debug/ferrum-edge"
+    } else if std::path::Path::new("./target/release/ferrum-edge").exists() {
+        "./target/release/ferrum-edge"
+    } else {
+        panic!("ferrum-edge binary not found. Run `cargo build --bin ferrum-edge` first.");
+    }
+}
+
 /// Start the Ferrum Edge binary in file mode
 fn start_gateway_in_file_mode(
     config_path: &str,
     http_port: u16,
-) -> Result<std::process::Child, Box<dyn std::error::Error>> {
-    // Build the gateway binary first (debug profile to match `cargo test`)
-    let build_output = std::process::Command::new("cargo")
-        .args(["build", "--bin", "ferrum-edge"])
-        .output()?;
+    admin_port: u16,
+) -> std::process::Child {
+    let binary_path = gateway_binary_path();
 
-    if !build_output.status.success() {
-        eprintln!("Failed to build gateway binary");
-        eprintln!("stderr: {}", String::from_utf8_lossy(&build_output.stderr));
-        return Err("Build failed".into());
-    }
-
-    // Use debug binary (matches default `cargo test` profile), fall back to release
-    let binary_path = if std::path::Path::new("./target/debug/ferrum-edge").exists() {
-        "./target/debug/ferrum-edge"
-    } else {
-        "./target/release/ferrum-edge"
-    };
-
-    // Start the gateway binary
-    let child = std::process::Command::new(binary_path)
+    std::process::Command::new(binary_path)
         .env("FERRUM_MODE", "file")
         .env("FERRUM_FILE_CONFIG_PATH", config_path)
         .env("FERRUM_PROXY_HTTP_PORT", http_port.to_string())
-        .env("RUST_LOG", "ferrum_edge=debug")
+        .env("FERRUM_ADMIN_HTTP_PORT", admin_port.to_string())
+        .env("FERRUM_LOG_LEVEL", "debug")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .spawn()?;
+        .spawn()
+        .expect("Failed to start gateway binary")
+}
 
-    Ok(child)
+/// Wait for the gateway admin health endpoint to respond.
+/// Returns true if healthy, false if timed out.
+async fn wait_for_gateway(admin_port: u16) -> bool {
+    let client = reqwest::Client::new();
+    let health_url = format!("http://127.0.0.1:{}/health", admin_port);
+
+    for _ in 0..60 {
+        if let Ok(resp) = client.get(&health_url).send().await
+            && resp.status().is_success()
+        {
+            return true;
+        }
+        sleep(Duration::from_millis(250)).await;
+    }
+    false
+}
+
+/// Allocate an ephemeral port by binding to port 0 and returning the assigned port.
+async fn ephemeral_port() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    port
+}
+
+/// Start the gateway with retry logic for port allocation races.
+/// Allocates fresh gateway/admin ports each attempt.
+async fn start_gateway_with_retry(config_path: &str) -> (std::process::Child, u16, u16) {
+    const MAX_ATTEMPTS: u32 = 3;
+    for attempt in 1..=MAX_ATTEMPTS {
+        let proxy_port = ephemeral_port().await;
+        let admin_port = ephemeral_port().await;
+
+        let mut child = start_gateway_in_file_mode(config_path, proxy_port, admin_port);
+
+        if wait_for_gateway(admin_port).await {
+            return (child, proxy_port, admin_port);
+        }
+
+        eprintln!(
+            "Gateway startup attempt {}/{} failed (proxy_port={}, admin_port={})",
+            attempt, MAX_ATTEMPTS, proxy_port, admin_port
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+
+        if attempt < MAX_ATTEMPTS {
+            sleep(Duration::from_secs(1)).await;
+        }
+    }
+    panic!("Gateway did not start after {} attempts", MAX_ATTEMPTS);
 }
 
 // ============================================================================
@@ -92,20 +136,28 @@ fn start_gateway_in_file_mode(
 #[tokio::test]
 async fn test_file_mode_basic_request_routing() {
     let temp_dir = TempDir::new().expect("Failed to create temp directory");
-    let config_path = temp_dir.path().join("config.yaml");
 
-    let config_content = r#"
+    // Start echo server on a held listener (no port race for in-process servers)
+    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_port = echo_listener.local_addr().unwrap().port();
+    let echo_server = tokio::spawn(start_echo_server_on(echo_listener));
+    sleep(Duration::from_millis(200)).await;
+
+    let config_path = temp_dir.path().join("config.yaml");
+    let config_content = format!(
+        r#"
 proxies:
   - id: "echo-proxy"
     listen_path: "/echo"
     backend_protocol: http
     backend_host: "127.0.0.1"
-    backend_port: 19990
+    backend_port: {echo_port}
     strip_listen_path: true
 
 consumers: []
 plugin_configs: []
-"#;
+"#
+    );
 
     let mut config_file =
         std::fs::File::create(&config_path).expect("Failed to create config file");
@@ -114,20 +166,14 @@ plugin_configs: []
         .expect("Failed to write config");
     drop(config_file);
 
-    // Start echo server
-    let echo_server = tokio::spawn(start_echo_server(19990));
-    sleep(Duration::from_millis(500)).await;
-
-    // Build and start gateway in file mode on a unique port
-    let gateway_process = start_gateway_in_file_mode(config_path.to_str().unwrap(), 18080);
-
-    // Give gateway time to start
-    sleep(Duration::from_secs(3)).await;
+    // Start gateway with retry
+    let (mut gateway_process, proxy_port, _admin_port) =
+        start_gateway_with_retry(config_path.to_str().unwrap()).await;
 
     // Send a test request through the proxy
     let client = reqwest::Client::new();
     let response = client
-        .get("http://127.0.0.1:18080/echo/test-path")
+        .get(format!("http://127.0.0.1:{}/echo/test-path", proxy_port))
         .send()
         .await;
 
@@ -147,9 +193,8 @@ plugin_configs: []
     }
 
     // Cleanup
-    if let Ok(mut proc) = gateway_process {
-        let _ = proc.kill();
-    }
+    let _ = gateway_process.kill();
+    let _ = gateway_process.wait();
     echo_server.abort();
 }
 
@@ -157,19 +202,27 @@ plugin_configs: []
 #[tokio::test]
 async fn test_file_mode_config_reload_on_sighup() {
     let temp_dir = TempDir::new().expect("Failed to create temp directory");
-    let config_path = temp_dir.path().join("config.yaml");
 
-    let initial_config = r#"
+    // Start echo server on a held listener
+    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_port = echo_listener.local_addr().unwrap().port();
+    let echo_server = tokio::spawn(start_echo_server_on(echo_listener));
+    sleep(Duration::from_millis(200)).await;
+
+    let config_path = temp_dir.path().join("config.yaml");
+    let initial_config = format!(
+        r#"
 proxies:
   - id: "proxy-initial"
     listen_path: "/api/v1"
     backend_protocol: http
     backend_host: "127.0.0.1"
-    backend_port: 19991
+    backend_port: {echo_port}
 
 consumers: []
 plugin_configs: []
-"#;
+"#
+    );
 
     let mut config_file =
         std::fs::File::create(&config_path).expect("Failed to create config file");
@@ -178,39 +231,40 @@ plugin_configs: []
         .expect("Failed to write config");
     drop(config_file);
 
-    // Start echo server
-    let echo_server = tokio::spawn(start_echo_server(19991));
-    sleep(Duration::from_millis(500)).await;
-
-    // Build and start gateway
-    let gateway_process = start_gateway_in_file_mode(config_path.to_str().unwrap(), 18081);
-    sleep(Duration::from_secs(3)).await;
+    // Start gateway with retry
+    let (mut gateway_process, proxy_port, _admin_port) =
+        start_gateway_with_retry(config_path.to_str().unwrap()).await;
 
     // Verify initial proxy exists
     let client = reqwest::Client::new();
-    let response = client.get("http://127.0.0.1:18081/api/v1").send().await;
+    let response = client
+        .get(format!("http://127.0.0.1:{}/api/v1", proxy_port))
+        .send()
+        .await;
     assert!(
         response.is_ok(),
         "Initial proxy should be accessible before reload"
     );
 
     // Update config with new proxy
-    let updated_config = r#"
+    let updated_config = format!(
+        r#"
 proxies:
   - id: "proxy-initial"
     listen_path: "/api/v1"
     backend_protocol: http
     backend_host: "127.0.0.1"
-    backend_port: 19991
+    backend_port: {echo_port}
   - id: "proxy-new"
     listen_path: "/api/v2"
     backend_protocol: http
     backend_host: "127.0.0.1"
-    backend_port: 19991
+    backend_port: {echo_port}
 
 consumers: []
 plugin_configs: []
-"#;
+"#
+    );
 
     let mut config_file =
         std::fs::File::create(&config_path).expect("Failed to create config file");
@@ -221,8 +275,8 @@ plugin_configs: []
 
     // Send SIGHUP to reload config (Unix only)
     #[cfg(unix)]
-    if let Ok(ref proc) = gateway_process {
-        let pid = proc.id();
+    {
+        let pid = gateway_process.id();
         let _ = std::process::Command::new("kill")
             .args(["-HUP", &pid.to_string()])
             .output();
@@ -232,16 +286,18 @@ plugin_configs: []
     sleep(Duration::from_secs(2)).await;
 
     // Verify new proxy exists
-    let response = client.get("http://127.0.0.1:18081/api/v2").send().await;
+    let response = client
+        .get(format!("http://127.0.0.1:{}/api/v2", proxy_port))
+        .send()
+        .await;
     assert!(
         response.is_ok(),
         "New proxy should be accessible after SIGHUP reload"
     );
 
     // Cleanup
-    if let Ok(mut proc) = gateway_process {
-        let _ = proc.kill();
-    }
+    let _ = gateway_process.kill();
+    let _ = gateway_process.wait();
     echo_server.abort();
 }
 
@@ -264,47 +320,52 @@ plugin_configs: []
         .expect("Failed to write config");
     drop(config_file);
 
-    // Start gateway in file mode
-    let gateway_process = start_gateway_in_file_mode(config_path.to_str().unwrap(), 18082);
-    sleep(Duration::from_secs(3)).await;
-
-    // Gateway should start successfully even with empty config
-    assert!(
-        gateway_process.is_ok(),
-        "Gateway should start with empty config"
-    );
+    // Start gateway with retry (verifies it starts successfully with empty config)
+    let (mut gateway_process, _proxy_port, _admin_port) =
+        start_gateway_with_retry(config_path.to_str().unwrap()).await;
 
     // Cleanup
-    if let Ok(mut proc) = gateway_process {
-        let _ = proc.kill();
-    }
+    let _ = gateway_process.kill();
+    let _ = gateway_process.wait();
 }
 
 #[ignore]
 #[tokio::test]
 async fn test_file_mode_multiple_backends() {
     let temp_dir = TempDir::new().expect("Failed to create temp directory");
-    let config_path = temp_dir.path().join("config.yaml");
 
-    let config_content = r#"
+    // Start echo servers on held listeners
+    let echo1_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo1_port = echo1_listener.local_addr().unwrap().port();
+    let echo1 = tokio::spawn(start_echo_server_on(echo1_listener));
+
+    let echo2_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo2_port = echo2_listener.local_addr().unwrap().port();
+    let echo2 = tokio::spawn(start_echo_server_on(echo2_listener));
+    sleep(Duration::from_millis(200)).await;
+
+    let config_path = temp_dir.path().join("config.yaml");
+    let config_content = format!(
+        r#"
 proxies:
   - id: "backend1"
     listen_path: "/api/backend1"
     backend_protocol: http
     backend_host: "127.0.0.1"
-    backend_port: 19992
+    backend_port: {echo1_port}
     strip_listen_path: true
 
   - id: "backend2"
     listen_path: "/api/backend2"
     backend_protocol: http
     backend_host: "127.0.0.1"
-    backend_port: 19993
+    backend_port: {echo2_port}
     strip_listen_path: true
 
 consumers: []
 plugin_configs: []
-"#;
+"#
+    );
 
     let mut config_file =
         std::fs::File::create(&config_path).expect("Failed to create config file");
@@ -313,44 +374,35 @@ plugin_configs: []
         .expect("Failed to write config");
     drop(config_file);
 
-    // Start echo servers on different ports
-    let echo1 = tokio::spawn(start_echo_server(19992));
-    let echo2 = tokio::spawn(start_echo_server(19993));
-    sleep(Duration::from_millis(500)).await;
-
-    // Start gateway
-    let gateway_process = start_gateway_in_file_mode(config_path.to_str().unwrap(), 18083);
-    sleep(Duration::from_secs(3)).await;
+    // Start gateway with retry
+    let (mut gateway_process, proxy_port, _admin_port) =
+        start_gateway_with_retry(config_path.to_str().unwrap()).await;
 
     // Test requests to both backends
     let client = reqwest::Client::new();
 
     let resp1 = client
-        .get("http://127.0.0.1:18083/api/backend1/test")
+        .get(format!("http://127.0.0.1:{}/api/backend1/test", proxy_port))
         .send()
         .await;
     assert!(resp1.is_ok(), "Request to backend1 should succeed");
 
     let resp2 = client
-        .get("http://127.0.0.1:18083/api/backend2/test")
+        .get(format!("http://127.0.0.1:{}/api/backend2/test", proxy_port))
         .send()
         .await;
     assert!(resp2.is_ok(), "Request to backend2 should succeed");
 
     // Cleanup
-    if let Ok(mut proc) = gateway_process {
-        let _ = proc.kill();
-    }
+    let _ = gateway_process.kill();
+    let _ = gateway_process.wait();
     echo1.abort();
     echo2.abort();
 }
 
-/// Start an HTTP server that echoes back request headers as JSON in the response body.
-async fn start_header_echo_server(port: u16) {
-    let listener = TcpListener::bind(format!("127.0.0.1:{}", port))
-        .await
-        .expect("Failed to bind header echo server");
-
+/// Start an HTTP server that echoes back request headers as JSON in the response body
+/// on a pre-bound listener.
+async fn start_header_echo_server_on(listener: TcpListener) {
     loop {
         if let Ok((mut stream, _)) = listener.accept().await {
             tokio::spawn(async move {
@@ -389,16 +441,24 @@ async fn start_header_echo_server(port: u16) {
 #[tokio::test]
 async fn test_file_mode_consumer_identity_headers_forwarded() {
     let temp_dir = TempDir::new().expect("Failed to create temp directory");
+
+    // Start header echo server on a held listener
+    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_port = echo_listener.local_addr().unwrap().port();
+    let echo_server = tokio::spawn(start_header_echo_server_on(echo_listener));
+    sleep(Duration::from_millis(200)).await;
+
     let config_path = temp_dir.path().join("config.yaml");
 
     // Config with key_auth plugin and a consumer
-    let config_content = r#"
+    let config_content = format!(
+        r#"
 proxies:
   - id: "auth-proxy"
     listen_path: "/auth-api"
     backend_protocol: http
     backend_host: "127.0.0.1"
-    backend_port: 19994
+    backend_port: {echo_port}
     strip_listen_path: true
     plugins:
       - plugin_config_id: "key-auth-plugin"
@@ -419,7 +479,8 @@ plugin_configs:
     enabled: true
     config:
       key_location: "header:X-Api-Key"
-"#;
+"#
+    );
 
     let mut config_file =
         std::fs::File::create(&config_path).expect("Failed to create config file");
@@ -428,19 +489,15 @@ plugin_configs:
         .expect("Failed to write config");
     drop(config_file);
 
-    // Start header echo server
-    let echo_server = tokio::spawn(start_header_echo_server(19994));
-    sleep(Duration::from_millis(500)).await;
-
-    // Start gateway
-    let gateway_process = start_gateway_in_file_mode(config_path.to_str().unwrap(), 18084);
-    sleep(Duration::from_secs(3)).await;
+    // Start gateway with retry
+    let (mut gateway_process, proxy_port, _admin_port) =
+        start_gateway_with_retry(config_path.to_str().unwrap()).await;
 
     let client = reqwest::Client::new();
 
     // Test 1: Request without API key should be rejected (401)
     let resp = client
-        .get("http://127.0.0.1:18084/auth-api/test")
+        .get(format!("http://127.0.0.1:{}/auth-api/test", proxy_port))
         .send()
         .await
         .expect("Request should complete");
@@ -452,7 +509,7 @@ plugin_configs:
 
     // Test 2: Request with valid API key should succeed and include consumer headers
     let resp = client
-        .get("http://127.0.0.1:18084/auth-api/test")
+        .get(format!("http://127.0.0.1:{}/auth-api/test", proxy_port))
         .header("X-Api-Key", "my-secret-api-key")
         .send()
         .await
@@ -476,8 +533,7 @@ plugin_configs:
     );
 
     // Cleanup
-    if let Ok(mut proc) = gateway_process {
-        let _ = proc.kill();
-    }
+    let _ = gateway_process.kill();
+    let _ = gateway_process.wait();
     echo_server.abort();
 }

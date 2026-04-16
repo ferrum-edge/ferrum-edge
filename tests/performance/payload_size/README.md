@@ -145,7 +145,7 @@ The backend echoes each request body back with the same `Content-Type` header an
 **Environment**: macOS Darwin 25.4.0, Apple Silicon
 **Duration**: 10s per test, 100 concurrent connections
 **Gateway**: Ferrum Edge (release build, optimizations enabled) vs Envoy 1.37.1 (`brew install envoy`)
-**Optimizations**: `CoalescingBody` (128 KB chunk batching for streaming responses), adaptive response buffering (256 KB–2 MiB bodies collected into single allocation), frequency-aware router cache eviction (Count-Min Sketch), thread-local Date header caching, lazy timeout wrapper, `TCP_FASTOPEN` + `IP_BIND_ADDRESS_NO_PORT` socket opts, RED adaptive load shedding, TLS handshake offload, cacheability predictor, disabled per-request validation checks for perf tests
+**Optimizations**: `CoalescingBody` (128 KB chunk batching for streaming responses), small response buffering (≤ 64 KiB bodies collected into single allocation via `FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES`), frequency-aware router cache eviction (Count-Min Sketch), thread-local Date header caching, lazy timeout wrapper, `TCP_FASTOPEN` + `IP_BIND_ADDRESS_NO_PORT` socket opts, RED adaptive load shedding, TLS handshake offload, cacheability predictor, disabled per-request validation checks for perf tests
 
 ### Tier 1: application/json (HTTP/1.1)
 
@@ -329,7 +329,7 @@ The backend echoes each request body back with the same `Content-Type` header an
 
 ### Where Ferrum Edge Wins
 
-1. **HTTP/1.1 1MB with adaptive buffering** — JSON 1MB improved from **+43.2%** to **+47.5%** (2,635 vs 1,786 RPS) after optimizations (lazy timeouts, Date header caching, frequency-aware cache eviction). SOAP+XML 1MB remains a strong Ferrum win at **+34.4%**. The `FERRUM_RESPONSE_BUFFER_THRESHOLD_BYTES` optimization collects moderate-sized response bodies (256 KB-2 MiB) into a single allocation, eliminating async frame-by-frame iteration overhead.
+1. **HTTP/1.1 1MB with adaptive buffering** — JSON 1MB improved from **+43.2%** to **+47.5%** (2,635 vs 1,786 RPS) after optimizations (lazy timeouts, Date header caching, frequency-aware cache eviction). SOAP+XML 1MB remains a strong Ferrum win at **+34.4%**. The `FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES` optimization eagerly buffers small response bodies (≤ 64 KiB) into a single allocation, eliminating async coalescing adapter overhead for typical JSON API payloads.
 
 2. **HTTP/1.1 9MB across all content types** — Ferrum now wins 9MB across JSON (+20.5%), octet-stream (+16.0%), and ndjson (+29.2%). This is a significant improvement from the previous baseline where Envoy won JSON 9MB. The `CoalescingBody` adapter batches small response chunks into 128 KB frames, reducing write syscalls ~16x for large streaming responses. Envoy's P99 degrades more severely at 9MB (often 4-6s vs Ferrum's 2-3s).
 
@@ -370,7 +370,7 @@ The P99 advantage is most pronounced on HTTP/1.1 across all content types, where
 - **H2 response coalescing** — `CoalescingH2Body` batches small HTTP/2 DATA frames from hyper's h2 client into 128 KB chunks before forwarding to the client. This is the H2 equivalent of the reqwest `CoalescingBody` and improves gRPC throughput at all payload sizes. Trailer-safe: stashes gRPC trailers and returns them after coalesced data frames
 - **Linux splice(2) for TCP proxy** — Zero-copy bidirectional relay between raw TCP sockets using Linux `splice(2)`. Eliminates two userspace memory copies per chunk for plaintext TCP paths (passthrough mode and plain-to-plain non-TLS). Falls back to `copy_bidirectional` on non-Linux and for TLS paths. Pipe buffers are sized to match the adaptive buffer tier
 - **Response body coalescing** — `CoalescingBody` batches small response chunks (8-32 KB) into 128 KB frames, reducing write syscalls ~16x for large streaming responses
-- **Adaptive response buffering** — `FERRUM_RESPONSE_BUFFER_THRESHOLD_BYTES` (default 2 MiB) collects 256 KB-2 MiB response bodies into a single allocation, eliminating async frame-by-frame iteration overhead
+- **Small response buffering** — `FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES` (default 64 KiB) eagerly buffers response bodies with known Content-Length ≤ cutoff into a single allocation, eliminating async coalescing adapter overhead for typical JSON API payloads. SSE responses always stream regardless
 - **Frequency-aware router cache eviction** — Count-Min Sketch frequency estimation replaces random 25% eviction, protecting hot route entries from scanner traffic
 - **Thread-local Date header caching** — `date_cache::get_cached_date()` refreshed once per second per thread, avoids `SystemTime::now()` + formatting on every response
 - **Lazy timeout wrapper** — `lazy_timeout::lazy_timeout()` defers tokio timer allocation until inner future returns `Pending`, eliminating timer overhead on fast-path operations

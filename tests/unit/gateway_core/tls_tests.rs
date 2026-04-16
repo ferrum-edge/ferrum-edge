@@ -619,3 +619,161 @@ fn test_tls_policy_early_data_enabled_multiple_methods() {
     let policy = TlsPolicy::from_env_config(&env).unwrap();
     assert_eq!(policy.early_data_max_size, 16_384);
 }
+
+// ── enable_early_data tests ──────────────────────────────────────────
+
+#[test]
+fn test_enable_early_data_sets_max_size() {
+    ensure_crypto_provider();
+
+    let dir = TempDir::new().unwrap();
+    let (cert_pem, key_pem) = generate_self_signed_cert(&["localhost"]);
+    let cert_path = dir.path().join("cert.pem");
+    let key_path = dir.path().join("key.pem");
+    std::fs::write(&cert_path, &cert_pem).unwrap();
+    std::fs::write(&key_path, &key_pem).unwrap();
+
+    let base_policy = TlsPolicy::from_env_config(&default_env_config()).unwrap();
+
+    let mut config = tls::load_tls_config_with_client_auth(
+        cert_path.to_str().unwrap(),
+        key_path.to_str().unwrap(),
+        None,
+        false,
+        &base_policy,
+        30,
+        &[],
+    )
+    .unwrap();
+
+    let policy = TlsPolicy {
+        early_data_max_size: 16_384,
+        ..base_policy
+    };
+
+    tls::enable_early_data(&mut config, &policy);
+    assert_eq!(
+        config.max_early_data_size, 16_384,
+        "enable_early_data should set max_early_data_size"
+    );
+}
+
+#[test]
+fn test_enable_early_data_zero_is_noop() {
+    ensure_crypto_provider();
+
+    let dir = TempDir::new().unwrap();
+    let (cert_pem, key_pem) = generate_self_signed_cert(&["localhost"]);
+    let cert_path = dir.path().join("cert.pem");
+    let key_path = dir.path().join("key.pem");
+    std::fs::write(&cert_path, &cert_pem).unwrap();
+    std::fs::write(&key_path, &key_pem).unwrap();
+
+    let base_policy = TlsPolicy::from_env_config(&default_env_config()).unwrap();
+
+    let mut config = tls::load_tls_config_with_client_auth(
+        cert_path.to_str().unwrap(),
+        key_path.to_str().unwrap(),
+        None,
+        false,
+        &base_policy,
+        30,
+        &[],
+    )
+    .unwrap();
+
+    let policy = TlsPolicy {
+        early_data_max_size: 0,
+        ..base_policy
+    };
+
+    tls::enable_early_data(&mut config, &policy);
+    assert_eq!(
+        config.max_early_data_size, 0,
+        "early_data_max_size=0 should leave config unchanged"
+    );
+}
+
+// ── NoVerifier tests ─────────────────────────────────────────────────
+
+#[test]
+fn test_no_verifier_accepts_any_cert() {
+    use rustls::client::danger::ServerCertVerifier;
+    use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+    use rustls_pemfile::certs;
+    use std::io::BufReader;
+
+    ensure_crypto_provider();
+
+    let verifier = tls::NoVerifier;
+
+    // Create a dummy certificate (self-signed, doesn't matter — verifier should accept anything)
+    let (cert_pem, _) = generate_self_signed_cert(&["example.com"]);
+    let mut reader = BufReader::new(cert_pem.as_bytes());
+    let cert_der: Vec<CertificateDer<'static>> =
+        certs(&mut reader).filter_map(|r| r.ok()).collect();
+    assert!(!cert_der.is_empty(), "Should parse at least one cert");
+
+    let server_name = ServerName::try_from("example.com").unwrap();
+    let now = UnixTime::now();
+
+    let result = verifier.verify_server_cert(&cert_der[0], &[], &server_name, &[], now);
+    assert!(
+        result.is_ok(),
+        "NoVerifier should accept any certificate: {:?}",
+        result.err()
+    );
+}
+
+#[test]
+fn test_no_verifier_supported_schemes_not_empty() {
+    use rustls::client::danger::ServerCertVerifier;
+
+    ensure_crypto_provider();
+
+    let verifier = tls::NoVerifier;
+    let schemes = verifier.supported_verify_schemes();
+    assert!(
+        !schemes.is_empty(),
+        "NoVerifier should support at least one verify scheme"
+    );
+}
+
+// ── build_client_cert_verifier tests ──────────────────────────────────
+
+#[test]
+fn test_build_client_cert_verifier_with_valid_ca() {
+    ensure_crypto_provider();
+
+    let dir = TempDir::new().unwrap();
+    let (_ca_issuer, ca_pem, _) = generate_ca();
+    let ca_path = dir.path().join("ca.pem");
+    std::fs::write(&ca_path, &ca_pem).unwrap();
+
+    let result = tls::build_client_cert_verifier(ca_path.to_str().unwrap());
+    assert!(
+        result.is_ok(),
+        "Should build verifier with valid CA: {:?}",
+        result.err()
+    );
+}
+
+#[test]
+fn test_build_client_cert_verifier_missing_file() {
+    ensure_crypto_provider();
+
+    let result = tls::build_client_cert_verifier("/nonexistent/path/ca.pem");
+    assert!(result.is_err(), "Missing CA file should fail");
+}
+
+#[test]
+fn test_build_client_cert_verifier_empty_file() {
+    ensure_crypto_provider();
+
+    let dir = TempDir::new().unwrap();
+    let ca_path = dir.path().join("empty_ca.pem");
+    std::fs::write(&ca_path, "").unwrap();
+
+    let result = tls::build_client_cert_verifier(ca_path.to_str().unwrap());
+    assert!(result.is_err(), "Empty CA file should fail");
+}

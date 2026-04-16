@@ -1431,3 +1431,116 @@ impl LoadBalancer {
         Some(Arc::clone(candidates[0].1))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── HealthBitset tests ──────────────────────────────────────────────
+
+    #[test]
+    fn bitset_all_zero_is_empty() {
+        let bs = HealthBitset::all(0);
+        assert!(bs.is_empty());
+        assert_eq!(bs.count(), 0);
+        assert!(bs.is_all(0));
+    }
+
+    #[test]
+    fn bitset_all_sets_correct_bits() {
+        let bs = HealthBitset::all(5);
+        assert_eq!(bs.count(), 5);
+        assert!(bs.is_all(5));
+        for i in 0..5 {
+            assert!(bs.contains(i), "bit {} should be set", i);
+        }
+        assert!(!bs.contains(5));
+    }
+
+    #[test]
+    fn bitset_all_128_is_max() {
+        let bs = HealthBitset::all(128);
+        assert_eq!(bs.count(), 128);
+        assert!(bs.is_all(128));
+        assert!(bs.contains(0));
+        assert!(bs.contains(127));
+    }
+
+    #[test]
+    fn bitset_set_and_clear() {
+        let mut bs = HealthBitset::empty();
+        assert!(bs.is_empty());
+
+        bs.set(0);
+        bs.set(5);
+        bs.set(127);
+        assert_eq!(bs.count(), 3);
+        assert!(bs.contains(0));
+        assert!(bs.contains(5));
+        assert!(bs.contains(127));
+        assert!(!bs.contains(1));
+
+        bs.clear(5);
+        assert_eq!(bs.count(), 2);
+        assert!(!bs.contains(5));
+
+        // Clear already-cleared bit is a no-op
+        bs.clear(5);
+        assert_eq!(bs.count(), 2);
+    }
+
+    #[test]
+    fn bitset_nth_set_bit_basic() {
+        let mut bs = HealthBitset::empty();
+        bs.set(2);
+        bs.set(5);
+        bs.set(10);
+
+        assert_eq!(bs.nth_set_bit(0), 2);
+        assert_eq!(bs.nth_set_bit(1), 5);
+        assert_eq!(bs.nth_set_bit(2), 10);
+        // Wraps around
+        assert_eq!(bs.nth_set_bit(3), 2);
+        assert_eq!(bs.nth_set_bit(6), 2);
+    }
+
+    #[test]
+    fn bitset_nth_set_bit_single() {
+        let mut bs = HealthBitset::empty();
+        bs.set(42);
+        // Any index should return 42 since there's only one set bit
+        for i in 0..10 {
+            assert_eq!(bs.nth_set_bit(i), 42);
+        }
+    }
+
+    #[test]
+    fn bitset_nth_set_bit_large_index() {
+        let bs = HealthBitset::all(3);
+        // Large index wraps: 1000 % 3 = 1
+        assert_eq!(bs.nth_set_bit(1000), 1);
+    }
+
+    #[test]
+    fn bitset_boundary_127() {
+        // Test the boundary just below 128
+        let bs = HealthBitset::all(127);
+        assert_eq!(bs.count(), 127);
+        assert!(bs.contains(126));
+        assert!(!bs.contains(127));
+    }
+
+    // ── Golden ratio hash distribution ──────────────────────────────────
+
+    #[test]
+    fn golden_ratio_hash_distributes() {
+        // Verify golden_ratio_hash produces diverse values
+        let mut seen = std::collections::HashSet::new();
+        for i in 0..100u64 {
+            let h = golden_ratio_hash(i);
+            seen.insert(h);
+        }
+        // All 100 hashes should be unique
+        assert_eq!(seen.len(), 100);
+    }
+}

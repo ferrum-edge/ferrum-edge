@@ -102,12 +102,12 @@ At this scale, use the [Control Plane / Data Plane](cp_dp_mode.md) deployment mo
 
 Ferrum Edge supports two response body modes configured per proxy: **streaming** (default) and **buffered**. The mode significantly affects memory usage.
 
-- **Streaming mode** (default): Response bodies flow through the gateway without being fully buffered in memory. Only the current chunk is held at any time. This is the most memory-efficient option and is suitable for most workloads.
-- **Buffered mode**: The entire response body is collected in memory before forwarding to the client. Required when plugins need to inspect or modify the full response body. HTTP/3 and gRPC proxying always use buffered mode.
+- **Streaming mode** (default): Response bodies flow through the gateway without being fully buffered in memory. Only the current chunk (up to 128 KB coalescing target) is held at any time. Small responses with known `Content-Length ≤ 64 KiB` (configurable via `FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES`) are eagerly buffered into a single allocation since that's cheaper than the async coalescing adapter. SSE responses always stream regardless of size.
+- **Buffered mode**: The entire response body is collected in memory before forwarding to the client. Required when plugins need to inspect or modify the full response body. When `max_response_body_size_bytes > 0` and Content-Length is absent, a `SizeLimitedStreamingResponse` adapter enforces the limit frame-by-frame without full-body buffering.
 
-Plugins that declare `requires_response_body_buffering()` will automatically switch their proxy to buffered mode regardless of the per-proxy setting.
+Plugins that declare `requires_response_body_buffering()` signal a config-time upper bound; the per-request `should_buffer_response_body(&RequestContext)` method lets plugins skip buffering when the request context makes it irrelevant (e.g., `compression` skips when `Accept-Encoding` is absent, AI plugins skip non-POST/non-JSON requests).
 
-Request bodies are always collected (buffered) for size enforcement and forwarding.
+Request bodies are streamed when possible: HTTP request bodies stream when no plugins or retries need the body. gRPC request bodies use a `GrpcBody` sum type — `Streaming(Incoming)` for the fast path (frame-by-frame forwarding) and `Buffered(Full<Bytes>)` when plugins or retries require the collected body.
 
 **Worst-case per-request memory:**
 
@@ -347,7 +347,7 @@ For medium and larger workloads, verify these OS-level settings:
 | File descriptor limit (`ulimit -n`) | 65,536+ | Each connection uses a file descriptor |
 | `net.core.somaxconn` | 4,096+ | TCP listen backlog for burst acceptance |
 | `net.ipv4.tcp_tw_reuse` | 1 | Reuse TIME_WAIT sockets for upstream connections |
-| `net.ipv4.ip_local_port_range` | `1024 65535` | Maximize available ephemeral ports |
+| `net.ipv4.ip_local_port_range` | `1024 65535` | Maximize available ephemeral ports. The gateway applies `IP_BIND_ADDRESS_NO_PORT` on outbound sockets to optimize port reuse. Monitor `port_exhaustion_events` on `GET /overload` for exhaustion |
 | `net.core.rmem_max` / `wmem_max` | 16 MB+ | Socket buffer sizes for large payloads |
 
 ## Quick Reference: Sizing Formula

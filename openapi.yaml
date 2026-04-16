@@ -1129,7 +1129,7 @@ paths:
         content:
           application/json:
             schema:
-              $ref: "#/components/schemas/Upstream"
+              $ref: "#/components/schemas/UpstreamCreate"
       responses:
         "201":
           description: Created upstream
@@ -1180,7 +1180,7 @@ paths:
         content:
           application/json:
             schema:
-              $ref: "#/components/schemas/Upstream"
+              $ref: "#/components/schemas/UpstreamCreate"
       responses:
         "200":
           description: Updated upstream
@@ -1366,13 +1366,10 @@ components:
     Proxy:
       type: object
       required:
-        - id
         - listen_path
         - backend_protocol
         - backend_host
         - backend_port
-        - created_at
-        - updated_at
       properties:
         id:
           type: [string, "null"]
@@ -1700,7 +1697,7 @@ components:
     # ── Consumer ────────────────────────────────────────────────────
     Consumer:
       type: object
-      required: [id, username, created_at, updated_at]
+      required: [username]
       properties:
         id:
           type: [string, "null"]
@@ -1892,7 +1889,7 @@ components:
     # ── Plugin Config ───────────────────────────────────────────────
     PluginConfig:
       type: object
-      required: [id, plugin_name, scope, enabled, created_at, updated_at]
+      required: [plugin_name, scope, enabled]
       properties:
         id:
           type: [string, "null"]
@@ -2183,9 +2180,19 @@ components:
           delay_ms: 100
 
     # ── Upstream / Load Balancing ────────────────────────────────────
+    UpstreamCreate:
+      description: |
+        Request body for creating or updating an upstream. Same schema as
+        Upstream but `id`, `created_at`, and `updated_at` are optional
+        (server-managed).
+      allOf:
+        - $ref: "#/components/schemas/Upstream"
+      required:
+        - targets
+
     Upstream:
       type: object
-      required: [id, targets, created_at, updated_at]
+      required: [targets]
       properties:
         id:
           type: [string, "null"]
@@ -2507,6 +2514,37 @@ components:
             error:
               type: [string, "null"]
               description: Error message when disconnected
+            pool:
+              type: object
+              description: |
+                Connection pool statistics (SQL backends only; absent for MongoDB).
+                Present only when status is `connected`.
+              properties:
+                size:
+                  type: integer
+                  description: Current connections managed by the pool (idle + active)
+                idle:
+                  type: integer
+                  description: Connections available for checkout
+                active:
+                  type: integer
+                  description: Connections currently in use
+                max_connections:
+                  type: integer
+                  description: Configured maximum (FERRUM_DB_POOL_MAX_CONNECTIONS)
+                min_connections:
+                  type: integer
+                  description: Configured minimum idle (FERRUM_DB_POOL_MIN_CONNECTIONS)
+                read_replica:
+                  type: object
+                  description: Read replica pool stats (present only when FERRUM_DB_READ_REPLICA_URL is configured)
+                  properties:
+                    size:
+                      type: integer
+                    idle:
+                      type: integer
+                    active:
+                      type: integer
         cached_config:
           type: object
           required: [available]
@@ -2540,7 +2578,7 @@ components:
 
     OverloadSnapshot:
       type: object
-      required: [level, draining, active_connections, pressure, actions]
+      required: [level, draining, active_connections, active_requests, red_drop_probability_pct, port_exhaustion_events, pressure, actions]
       properties:
         level:
           type: string
@@ -2553,9 +2591,21 @@ components:
           type: integer
           format: uint64
           description: Number of currently active proxy connections
+        active_requests:
+          type: integer
+          format: uint64
+          description: Number of currently in-flight requests/streams (H1 requests, H2/gRPC streams, H3 streams)
+        red_drop_probability_pct:
+          type: number
+          format: double
+          description: RED (Random Early Detection) drop probability percentage (0-100)
+        port_exhaustion_events:
+          type: integer
+          format: uint64
+          description: Monotonic count of EADDRNOTAVAIL errors (ephemeral port exhaustion). Alert when this value increases.
         pressure:
           type: object
-          required: [file_descriptors, connections, event_loop_latency_us]
+          required: [file_descriptors, connections, requests, event_loop_latency_us]
           properties:
             file_descriptors:
               type: object
@@ -2585,13 +2635,27 @@ components:
                   type: number
                   format: double
                   description: current / max (0.0–1.0)
+            requests:
+              type: object
+              required: [current, max, ratio]
+              properties:
+                current:
+                  type: integer
+                  format: uint64
+                max:
+                  type: integer
+                  format: uint64
+                ratio:
+                  type: number
+                  format: double
+                  description: current / max (0.0–1.0). 0.0 when FERRUM_MAX_REQUESTS=0 (unlimited)
             event_loop_latency_us:
               type: integer
               format: uint64
               description: Event loop scheduling latency in microseconds
         actions:
           type: object
-          required: [disable_keepalive, reject_new_connections]
+          required: [disable_keepalive, reject_new_connections, reject_new_requests]
           properties:
             disable_keepalive:
               type: boolean
@@ -2599,6 +2663,9 @@ components:
             reject_new_connections:
               type: boolean
               description: Whether new connections are being refused
+            reject_new_requests:
+              type: boolean
+              description: Whether new requests/streams are being rejected with 503
 
     # ── Admin metrics ───────────────────────────────────────────────
     AdminMetrics:
@@ -2963,7 +3030,7 @@ components:
         upstreams:
           type: array
           items:
-            $ref: "#/components/schemas/Upstream"
+            $ref: "#/components/schemas/UpstreamCreate"
           description: Upstreams to create
 
     BatchCreateResponse:

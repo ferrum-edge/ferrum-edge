@@ -404,19 +404,29 @@ impl Plugin for MyPlugin {
 
 ### Response Body Buffering
 
-If your plugin needs access to the full response body (e.g., for body-level transformation or inspection), override `requires_response_body_buffering()` to return `true`. This forces the gateway to buffer the entire backend response before forwarding it to the client, even when the proxy's `response_body_mode` is set to `stream`.
+If your plugin needs access to the full response body (e.g., for body-level transformation or inspection), override `requires_response_body_buffering()` to return `true`. This is the config-time upper bound — the gateway uses a two-tier check:
+
+1. **Config-time**: `requires_response_body_buffering()` — pre-computed in `PluginCache` at config load time.
+2. **Per-request**: `should_buffer_response_body(&RequestContext)` — lets plugins skip buffering when the request context makes it irrelevant (e.g., non-POST requests on an AI plugin, missing `Accept-Encoding` on compression).
 
 ```rust
 impl Plugin for MyBodyPlugin {
     fn name(&self) -> &str { "my_body_plugin" }
 
     fn requires_response_body_buffering(&self) -> bool {
-        true  // Forces response buffering for this proxy
+        true  // Config-time: this proxy MAY need response buffering
+    }
+
+    fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {
+        // Per-request: only buffer for POST+JSON (skip GET, static assets, etc.)
+        ctx.method == "POST"
+            && ctx.headers.get("content-type")
+                .is_some_and(|ct| ct.to_ascii_lowercase().contains("json"))
     }
 }
 ```
 
-By default, this method returns `false`. When `response_transformer` has body transformation rules configured (`target: "body"`), it automatically returns `true` from this method, forcing buffering so the JSON body can be parsed and rewritten. When only header rules are configured, it returns `false` and works with streaming mode. See [docs/response_body_streaming.md](response_body_streaming.md) for the full streaming architecture.
+By default, `should_buffer_response_body()` returns `self.requires_response_body_buffering()` — plugins that don't override it behave as before. When `response_transformer` has body transformation rules configured (`target: "body"`), it automatically returns `true` from `requires_response_body_buffering()`, forcing buffering so the JSON body can be parsed and rewritten. When only header rules are configured, it returns `false` and works with streaming mode. See [docs/response_body_streaming.md](response_body_streaming.md) for the full streaming architecture.
 
 Add the constant to `src/plugins/mod.rs` in the `priority` module for discoverability:
 

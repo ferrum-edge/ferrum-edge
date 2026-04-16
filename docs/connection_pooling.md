@@ -180,6 +180,55 @@ FERRUM_POOL_WARMUP_ENABLED=false
 
 This may be useful in development or when backends are not yet available at gateway startup time.
 
+## Database Pool Observability
+
+The admin `/status` (and `/health`) endpoint includes database connection pool statistics when the database is connected. This helps operators monitor pool utilization and tune `FERRUM_DB_POOL_*` settings.
+
+```json
+{
+  "database": {
+    "status": "connected",
+    "type": "postgres",
+    "pool": {
+      "size": 10,
+      "idle": 8,
+      "active": 2,
+      "max_connections": 10,
+      "min_connections": 1,
+      "read_replica": {
+        "size": 5,
+        "idle": 5,
+        "active": 0
+      }
+    }
+  }
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `size` | Current number of connections managed by the pool (idle + active) |
+| `idle` | Connections available for checkout |
+| `active` | Connections currently in use |
+| `max_connections` | Configured maximum (`FERRUM_DB_POOL_MAX_CONNECTIONS`) |
+| `min_connections` | Configured minimum idle (`FERRUM_DB_POOL_MIN_CONNECTIONS`) |
+| `read_replica` | Present only when `FERRUM_DB_READ_REPLICA_URL` is configured |
+
+**MongoDB**: Pool stats are not available (the MongoDB driver manages pooling internally). The `pool` field is omitted from the response.
+
+**Tuning guidance**: If `active` consistently equals `max_connections`, increase `FERRUM_DB_POOL_MAX_CONNECTIONS`. If `idle` is consistently high, consider reducing `min_connections` to save resources.
+
+## Ephemeral Port Optimization
+
+On Linux, all pool outbound TCP connections (HTTP/2 direct pool and gRPC pool) have `IP_BIND_ADDRESS_NO_PORT` set, which defers ephemeral port allocation to `connect()` time. This enables the kernel to co-select the source port as part of the full 4-tuple (src_ip, src_port, dst_ip, dst_port), allowing port reuse across different destinations and reducing ephemeral port pressure under high connection rates.
+
+If the gateway exhausts available ephemeral ports (EADDRNOTAVAIL), the error is classified as `PortExhaustion`, logged at `error` level, and tracked in the `port_exhaustion_events` counter on `GET /overload`. To mitigate:
+
+- Widen the kernel port range: `sysctl net.ipv4.ip_local_port_range="1024 65535"`
+- Enable TIME_WAIT reuse: `sysctl net.ipv4.tcp_tw_reuse=1`
+- Lower `FERRUM_POOL_IDLE_TIMEOUT_SECONDS` (default 90) to free ports faster
+- Lower `FERRUM_POOL_MAX_IDLE_PER_HOST` to reduce idle connection count
+
 ## Benefits
 
 - **2-3x Higher Throughput**: Connection reuse eliminates setup overhead

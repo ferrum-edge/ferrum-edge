@@ -414,10 +414,14 @@ pub async fn handle_admin_request(
             };
 
             if db_connected {
-                health_status["database"] = json!({
+                let mut db_info = json!({
                     "status": "connected",
                     "type": db.db_type()
                 });
+                if let Some(stats) = db.pool_stats() {
+                    db_info["pool"] = serde_json::to_value(&stats).unwrap_or_else(|_| json!(null));
+                }
+                health_status["database"] = db_info;
             } else {
                 health_status["status"] = json!("degraded");
                 health_status["database"] = json!({
@@ -4272,7 +4276,7 @@ fn json_response_with_stale(status: StatusCode, body: &Value) -> Response<Full<B
 /// Avoids leaking database schema details in API responses.
 fn db_error_response(e: &dyn std::fmt::Display) -> Value {
     warn!("Database error in admin API: {}", e);
-    json!({"error": "Database operation failed"})
+    json!({"error": "Database unavailable — operation failed"})
 }
 
 /// Check if a database error message indicates a unique constraint violation.

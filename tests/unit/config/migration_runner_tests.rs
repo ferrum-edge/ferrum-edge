@@ -36,7 +36,7 @@ async fn test_migration_runner_fresh_database() {
 async fn test_migration_runner_bootstrap_existing_db() {
     let pool = test_pool().await;
 
-    // Simulate a pre-migration database by creating the core tables directly
+    // Simulate a pre-migration database by creating the proxies table directly
     sqlx::query(
         "CREATE TABLE proxies (id TEXT PRIMARY KEY, name TEXT, listen_path TEXT NOT NULL UNIQUE, backend_protocol TEXT NOT NULL DEFAULT 'http', backend_host TEXT NOT NULL, backend_port INTEGER NOT NULL DEFAULT 80, backend_path TEXT, strip_listen_path INTEGER NOT NULL DEFAULT 1, preserve_host_header INTEGER NOT NULL DEFAULT 0, backend_connect_timeout_ms INTEGER NOT NULL DEFAULT 5000, backend_read_timeout_ms INTEGER NOT NULL DEFAULT 30000, backend_write_timeout_ms INTEGER NOT NULL DEFAULT 30000, backend_tls_client_cert_path TEXT, backend_tls_client_key_path TEXT, backend_tls_verify_server_cert INTEGER NOT NULL DEFAULT 1, backend_tls_server_ca_cert_path TEXT, dns_override TEXT, dns_cache_ttl_seconds INTEGER, auth_mode TEXT NOT NULL DEFAULT 'single', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"
     )

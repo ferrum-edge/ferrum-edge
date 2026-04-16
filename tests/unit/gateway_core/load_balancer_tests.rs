@@ -1141,3 +1141,320 @@ fn test_apply_delta_preserves_unaffected_upstreams() {
     assert!(cache.select_target("u2", "", None).is_some());
     assert!(cache.select_target("u3", "", None).is_some());
 }
+
+// ─── Random Algorithm Tests ─────────────────────────────────────────────────
+
+#[test]
+fn test_random_selects_from_all_targets() {
+    let targets = make_targets(5);
+    let lb = LoadBalancer::new(TEST_UPSTREAM, LoadBalancerAlgorithm::Random, &targets, None);
+
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..500 {
+        let sel = lb.select("", None).unwrap();
+        assert!(!sel.is_fallback);
+        seen.insert(sel.target.host.clone());
+    }
+    // With 500 selections across 5 targets, we should hit all of them
+    assert_eq!(
+        seen.len(),
+        5,
+        "Random should distribute across all targets, got {:?}",
+        seen
+    );
+}
+
+#[test]
+fn test_random_filters_unhealthy() {
+    let targets = make_targets(3);
+    let lb = LoadBalancer::new(TEST_UPSTREAM, LoadBalancerAlgorithm::Random, &targets, None);
+
+    let unhealthy: DashMap<String, u64> = DashMap::new();
+    unhealthy.insert(format!("{}::host0:8080", TEST_UPSTREAM), 0);
+
+    for _ in 0..100 {
+        let sel = lb.select("", Some(&active_health_ctx(&unhealthy))).unwrap();
+        assert_ne!(
+            sel.target.host, "host0",
+            "Unhealthy target should be skipped"
+        );
+    }
+}
+
+#[test]
+fn test_random_all_unhealthy_falls_back() {
+    let targets = make_targets(2);
+    let lb = LoadBalancer::new(TEST_UPSTREAM, LoadBalancerAlgorithm::Random, &targets, None);
+
+    let unhealthy: DashMap<String, u64> = DashMap::new();
+    unhealthy.insert(format!("{}::host0:8080", TEST_UPSTREAM), 0);
+    unhealthy.insert(format!("{}::host1:8080", TEST_UPSTREAM), 0);
+
+    let sel = lb.select("", Some(&active_health_ctx(&unhealthy)));
+    assert!(sel.is_some(), "Should return a fallback target");
+    assert!(sel.unwrap().is_fallback, "Should be marked as fallback");
+}
+
+#[test]
+fn test_random_empty_targets() {
+    let lb = LoadBalancer::new(TEST_UPSTREAM, LoadBalancerAlgorithm::Random, &[], None);
+    assert!(lb.select("", None).is_none());
+}
+
+#[test]
+fn test_random_single_target() {
+    let targets = make_targets(1);
+    let lb = LoadBalancer::new(TEST_UPSTREAM, LoadBalancerAlgorithm::Random, &targets, None);
+
+    for _ in 0..50 {
+        let sel = lb.select("", None).unwrap();
+        assert_eq!(sel.target.host, "host0");
+    }
+}
+
+// ─── WRR Weight=0 Tests ─────────────────────────────────────────────────────
+
+#[test]
+fn test_wrr_all_zero_weights_falls_back_to_round_robin() {
+    let targets = vec![
+        UpstreamTarget {
+            host: "a".into(),
+            port: 8080,
+            weight: 0,
+            tags: HashMap::new(),
+            path: None,
+        },
+        UpstreamTarget {
+            host: "b".into(),
+            port: 8080,
+            weight: 0,
+            tags: HashMap::new(),
+            path: None,
+        },
+    ];
+    let lb = LoadBalancer::new(
+        TEST_UPSTREAM,
+        LoadBalancerAlgorithm::WeightedRoundRobin,
+        &targets,
+        None,
+    );
+
+    let mut counts = HashMap::new();
+    for _ in 0..100 {
+        let sel = lb.select("", None).unwrap();
+        *counts.entry(sel.target.host.clone()).or_insert(0) += 1;
+    }
+
+    // With all-zero weights, should round-robin evenly
+    assert_eq!(counts.len(), 2);
+    assert_eq!(counts.get("a").copied().unwrap_or(0), 50);
+    assert_eq!(counts.get("b").copied().unwrap_or(0), 50);
+}
+
+#[test]
+fn test_wrr_mixed_zero_and_nonzero_weights() {
+    let targets = vec![
+        UpstreamTarget {
+            host: "weighted".into(),
+            port: 8080,
+            weight: 10,
+            tags: HashMap::new(),
+            path: None,
+        },
+        UpstreamTarget {
+            host: "zero".into(),
+            port: 8080,
+            weight: 0,
+            tags: HashMap::new(),
+            path: None,
+        },
+    ];
+    let lb = LoadBalancer::new(
+        TEST_UPSTREAM,
+        LoadBalancerAlgorithm::WeightedRoundRobin,
+        &targets,
+        None,
+    );
+
+    let mut counts = HashMap::new();
+    for _ in 0..100 {
+        let sel = lb.select("", None).unwrap();
+        *counts.entry(sel.target.host.clone()).or_insert(0) += 1;
+    }
+
+    // Weight-0 target should get zero or negligible traffic
+    let weighted_count = counts.get("weighted").copied().unwrap_or(0);
+    assert_eq!(
+        weighted_count,
+        100,
+        "All traffic should go to the weighted target, got weighted={} zero={}",
+        weighted_count,
+        counts.get("zero").copied().unwrap_or(0)
+    );
+}
+
+// ─── select_excluding for Multiple Algorithms ───────────────────────────────
+
+#[test]
+fn test_select_excluding_consistent_hash() {
+    let targets = make_targets(3);
+    let lb = LoadBalancer::new(
+        TEST_UPSTREAM,
+        LoadBalancerAlgorithm::ConsistentHashing,
+        &targets,
+        None,
+    );
+
+    let exclude = targets[0].clone();
+    for _ in 0..50 {
+        let t = lb.select_excluding("user-1", &exclude, None).unwrap();
+        assert_ne!(t.host, "host0", "Excluded target should never be returned");
+    }
+}
+
+#[test]
+fn test_select_excluding_least_connections() {
+    let targets = make_targets(3);
+    let lb = LoadBalancer::new(
+        TEST_UPSTREAM,
+        LoadBalancerAlgorithm::LeastConnections,
+        &targets,
+        None,
+    );
+
+    let exclude = targets[1].clone();
+    for _ in 0..50 {
+        let t = lb.select_excluding("", &exclude, None).unwrap();
+        assert_ne!(t.host, "host1");
+    }
+}
+
+#[test]
+fn test_select_excluding_wrr() {
+    let targets = make_weighted_targets();
+    let lb = LoadBalancer::new(
+        TEST_UPSTREAM,
+        LoadBalancerAlgorithm::WeightedRoundRobin,
+        &targets,
+        None,
+    );
+
+    // Exclude "heavy" — should only return "light"
+    let exclude = targets[0].clone();
+    for _ in 0..20 {
+        let t = lb.select_excluding("", &exclude, None).unwrap();
+        assert_eq!(t.host, "light");
+    }
+}
+
+#[test]
+fn test_select_excluding_random() {
+    let targets = make_targets(3);
+    let lb = LoadBalancer::new(TEST_UPSTREAM, LoadBalancerAlgorithm::Random, &targets, None);
+
+    let exclude = targets[2].clone();
+    for _ in 0..100 {
+        let t = lb.select_excluding("", &exclude, None).unwrap();
+        assert_ne!(t.host, "host2");
+    }
+}
+
+#[test]
+fn test_select_excluding_only_target_returns_none() {
+    let targets = make_targets(1);
+    let lb = LoadBalancer::new(
+        TEST_UPSTREAM,
+        LoadBalancerAlgorithm::RoundRobin,
+        &targets,
+        None,
+    );
+
+    let result = lb.select_excluding("", &targets[0], None);
+    assert!(
+        result.is_none(),
+        "Excluding the only target should return None"
+    );
+}
+
+// ─── Consistent Hashing with Unhealthy Targets ─────────────────────────────
+
+#[test]
+fn test_consistent_hash_with_unhealthy_target() {
+    let targets = make_targets(5);
+    let lb = LoadBalancer::new(
+        TEST_UPSTREAM,
+        LoadBalancerAlgorithm::ConsistentHashing,
+        &targets,
+        None,
+    );
+
+    // Get initial selection for a key
+    let initial = lb.select("test-key", None).unwrap();
+
+    // Mark a different target as unhealthy
+    let unhealthy: DashMap<String, u64> = DashMap::new();
+    let unhealthy_host = if initial.target.host == "host0" {
+        "host1"
+    } else {
+        "host0"
+    };
+    unhealthy.insert(format!("{}::{}:8080", TEST_UPSTREAM, unhealthy_host), 0);
+
+    // Same key should still map to same target (healthy target unchanged)
+    let after = lb
+        .select("test-key", Some(&active_health_ctx(&unhealthy)))
+        .unwrap();
+    assert_eq!(
+        initial.target.host, after.target.host,
+        "Consistent hash should be stable when selected target is still healthy"
+    );
+}
+
+// ─── Passive Health Context Tests ───────────────────────────────────────────
+
+#[test]
+fn test_passive_health_filters_targets() {
+    use ferrum_edge::config::types::PassiveHealthCheck;
+    use ferrum_edge::health_check::HealthChecker;
+
+    let targets = make_targets(3);
+    let lb = LoadBalancer::new(
+        TEST_UPSTREAM,
+        LoadBalancerAlgorithm::RoundRobin,
+        &targets,
+        None,
+    );
+
+    // Use HealthChecker to create passive state via report_response
+    let checker = HealthChecker::new();
+    let config = PassiveHealthCheck {
+        unhealthy_status_codes: vec![500],
+        unhealthy_threshold: 1,
+        unhealthy_window_seconds: 60,
+        healthy_after_seconds: 30,
+    };
+
+    // Mark host1 as passively unhealthy
+    checker.report_response("test-proxy", &targets[1], 500, false, Some(&config));
+
+    let active: DashMap<String, u64> = DashMap::new();
+    let proxy_passive = checker.passive_health.get("test-proxy").map(|e| e.clone());
+
+    let ctx = HealthContext {
+        active_unhealthy: &active,
+        proxy_passive,
+    };
+
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..100 {
+        let sel = lb.select("", Some(&ctx)).unwrap();
+        seen.insert(sel.target.host.clone());
+    }
+
+    assert!(
+        !seen.contains("host1"),
+        "Passively unhealthy target should be filtered"
+    );
+    assert!(seen.contains("host0"));
+    assert!(seen.contains("host2"));
+}

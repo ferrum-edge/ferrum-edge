@@ -46,6 +46,40 @@ struct PluginConfigRef {
     proxy_id: Option<String>,
 }
 
+/// Identifies a resource table for lightweight `SELECT id` queries.
+///
+/// Used by `load_table_ids()` to eliminate dynamic table-name interpolation
+/// and make SQL injection impossible by construction.
+#[derive(Clone, Copy)]
+enum ResourceTable {
+    Proxies,
+    Consumers,
+    PluginConfigs,
+    Upstreams,
+}
+
+impl ResourceTable {
+    /// Static SQL for loading IDs — no format!() needed.
+    const fn select_ids_sql(self) -> &'static str {
+        match self {
+            Self::Proxies => "SELECT id FROM proxies WHERE namespace = ?",
+            Self::Consumers => "SELECT id FROM consumers WHERE namespace = ?",
+            Self::PluginConfigs => "SELECT id FROM plugin_configs WHERE namespace = ?",
+            Self::Upstreams => "SELECT id FROM upstreams WHERE namespace = ?",
+        }
+    }
+
+    /// Label for slow-query logging.
+    const fn load_ids_label(self) -> &'static str {
+        match self {
+            Self::Proxies => "load_table_ids(proxies)",
+            Self::Consumers => "load_table_ids(consumers)",
+            Self::PluginConfigs => "load_table_ids(plugin_configs)",
+            Self::Upstreams => "load_table_ids(upstreams)",
+        }
+    }
+}
+
 /// Database connection pool tuning parameters.
 ///
 /// These are exposed via `FERRUM_DB_POOL_*` environment variables and applied
@@ -176,10 +210,20 @@ impl DatabaseStore {
             .max_lifetime(std::time::Duration::from_secs(config.max_lifetime_seconds))
             .after_connect(move |conn, _meta| {
                 Box::pin(async move {
-                    // Enable foreign key enforcement on every SQLite connection
-                    // (PRAGMA is per-connection, not persistent across pool connections)
+                    // SQLite per-connection PRAGMAs (not persistent across pool
+                    // connections — must be set on every checkout).
                     if is_sqlite {
                         conn.execute("PRAGMA foreign_keys = ON").await?;
+                        // WAL mode dramatically improves concurrent read/write
+                        // performance. Unlike other PRAGMAs this persists on the
+                        // database file, but setting it per-connection is a harmless
+                        // no-op once applied and ensures it is always enabled even
+                        // after a fresh database creation.
+                        conn.execute("PRAGMA journal_mode = WAL").await?;
+                        // Without busy_timeout, concurrent writes immediately fail
+                        // with SQLITE_BUSY. 5 000 ms gives the WAL writer time to
+                        // finish before returning an error.
+                        conn.execute("PRAGMA busy_timeout = 5000").await?;
                     }
                     // Set per-statement timeout on network databases to prevent
                     // runaway queries from holding connections indefinitely.
@@ -1954,10 +1998,18 @@ impl DatabaseStore {
         let changed_upstreams = self.load_upstreams_since(namespace, &since_str).await?;
 
         // Fetch current IDs (lightweight — one TEXT column per table)
-        let current_proxy_ids = self.load_table_ids(namespace, "proxies").await?;
-        let current_consumer_ids = self.load_table_ids(namespace, "consumers").await?;
-        let current_plugin_config_ids = self.load_table_ids(namespace, "plugin_configs").await?;
-        let current_upstream_ids = self.load_table_ids(namespace, "upstreams").await?;
+        let current_proxy_ids = self
+            .load_table_ids(namespace, ResourceTable::Proxies)
+            .await?;
+        let current_consumer_ids = self
+            .load_table_ids(namespace, ResourceTable::Consumers)
+            .await?;
+        let current_plugin_config_ids = self
+            .load_table_ids(namespace, ResourceTable::PluginConfigs)
+            .await?;
+        let current_upstream_ids = self
+            .load_table_ids(namespace, ResourceTable::Upstreams)
+            .await?;
 
         // Detect deletions: IDs we knew about that no longer exist
         let removed_proxy_ids = diff_removed(known_proxy_ids, &current_proxy_ids);
@@ -2169,15 +2221,16 @@ impl DatabaseStore {
         Ok(upstreams)
     }
 
-    /// Load all IDs from a table (lightweight — one TEXT column, no deserialization).
+    /// Load all IDs from a resource table (lightweight — one TEXT column, no
+    /// deserialization). The table is selected via [`ResourceTable`] to ensure
+    /// only known tables are queried — no dynamic string interpolation.
     async fn load_table_ids(
         &self,
         namespace: &str,
-        table: &str,
+        table: ResourceTable,
     ) -> Result<HashSet<String>, anyhow::Error> {
         let start = Instant::now();
-        // Table name is a compile-time constant from the caller, not user input.
-        let sql = self.q(&format!("SELECT id FROM {} WHERE namespace = ?", table));
+        let sql = self.q(table.select_ids_sql());
         let rows: Vec<AnyRow> = sqlx::query(&sql)
             .bind(namespace)
             .fetch_all(&self.rpool())
@@ -2189,7 +2242,7 @@ impl DatabaseStore {
                 ids.insert(id);
             }
         }
-        self.check_slow_query(&format!("load_table_ids({})", table), start);
+        self.check_slow_query(table.load_ids_label(), start);
         Ok(ids)
     }
 
@@ -3056,6 +3109,30 @@ impl DatabaseBackend for DatabaseStore {
         self.has_read_replica_pool()
     }
 
+    fn pool_stats(&self) -> Option<crate::config::db_backend::DbPoolStats> {
+        let primary = self.pool.load();
+        let size = primary.size();
+        let idle = primary.num_idle() as u32;
+
+        let replica = self.read_replica_pool.as_ref().map(|rp| {
+            let rp = rp.load();
+            Box::new(crate::config::db_backend::DbPoolStatsInner {
+                size: rp.size(),
+                idle: rp.num_idle() as u32,
+                active: rp.size().saturating_sub(rp.num_idle() as u32),
+            })
+        });
+
+        Some(crate::config::db_backend::DbPoolStats {
+            size,
+            idle,
+            active: size.saturating_sub(idle),
+            max_connections: self.pool_config.max_connections,
+            min_connections: self.pool_config.min_connections,
+            read_replica: replica,
+        })
+    }
+
     fn set_slow_query_threshold(&mut self, threshold_ms: Option<u64>) {
         self.slow_query_threshold_ms = threshold_ms;
     }
@@ -3433,34 +3510,26 @@ fn row_to_proxy(
     id: String,
     plugins: Vec<PluginAssociation>,
 ) -> Result<Proxy, anyhow::Error> {
-    // Clone id for use in warning messages (the original is moved into the Proxy struct).
+    // Clone id for use in error messages (the original is moved into the Proxy struct).
     let pid = id.clone();
-    let proto_str: String = row.try_get("backend_protocol").unwrap_or_else(|e| {
-        warn!(
-            "Proxy {}: failed to read backend_protocol, defaulting to http: {}",
-            pid, e
-        );
-        "http".into()
-    });
-    let auth_mode_str: String = row.try_get("auth_mode").unwrap_or_else(|e| {
-        warn!(
-            "Proxy {}: failed to read auth_mode, defaulting to single: {}",
-            pid, e
-        );
-        "single".into()
-    });
+    let proto_str: String = row
+        .try_get("backend_protocol")
+        .map_err(|e| anyhow::anyhow!("Proxy {}: failed to read backend_protocol: {}", pid, e))?;
+    let auth_mode_str: String = row
+        .try_get("auth_mode")
+        .map_err(|e| anyhow::anyhow!("Proxy {}: failed to read auth_mode: {}", pid, e))?;
 
-    let hosts: Vec<String> = row
+    let hosts_str: String = row
         .try_get::<String, _>("hosts")
-        .ok()
-        .and_then(|s| match serde_json::from_str(&s) {
-            Ok(v) => Some(v),
-            Err(e) => {
-                warn!("Proxy {}: failed to parse hosts JSON '{}': {}", pid, s, e);
-                None
-            }
-        })
-        .unwrap_or_default();
+        .unwrap_or_else(|_| "[]".into());
+    let hosts: Vec<String> = serde_json::from_str(&hosts_str).map_err(|e| {
+        anyhow::anyhow!(
+            "Proxy {}: failed to parse hosts JSON '{}': {}",
+            pid,
+            hosts_str,
+            e
+        )
+    })?;
 
     Ok(Proxy {
         id,
@@ -3506,25 +3575,20 @@ fn row_to_proxy(
         auth_mode: parse_auth_mode(&auth_mode_str),
         plugins,
         upstream_id: row.try_get::<String, _>("upstream_id").ok(),
-        circuit_breaker: row
-            .try_get::<String, _>("circuit_breaker")
-            .ok()
-            .and_then(|s| {
-                serde_json::from_str::<CircuitBreakerConfig>(&s)
-                    .map_err(|e| {
-                        warn!("Proxy {}: failed to parse circuit_breaker JSON: {}", pid, e);
-                        e
-                    })
-                    .ok()
-            }),
-        retry: row.try_get::<String, _>("retry").ok().and_then(|s| {
-            serde_json::from_str::<RetryConfig>(&s)
-                .map_err(|e| {
-                    warn!("Proxy {}: failed to parse retry JSON: {}", pid, e);
-                    e
-                })
-                .ok()
-        }),
+        circuit_breaker: match row.try_get::<String, _>("circuit_breaker") {
+            Ok(s) => Some(
+                serde_json::from_str::<CircuitBreakerConfig>(&s).map_err(|e| {
+                    anyhow::anyhow!("Proxy {}: failed to parse circuit_breaker JSON: {}", pid, e)
+                })?,
+            ),
+            Err(_) => None,
+        },
+        retry: match row.try_get::<String, _>("retry") {
+            Ok(s) => Some(serde_json::from_str::<RetryConfig>(&s).map_err(|e| {
+                anyhow::anyhow!("Proxy {}: failed to parse retry JSON: {}", pid, e)
+            })?),
+            Err(_) => None,
+        },
         response_body_mode: row
             .try_get::<String, _>("response_body_mode")
             .ok()
@@ -3595,15 +3659,22 @@ fn row_to_proxy(
             .try_get::<i64, _>("tcp_idle_timeout_seconds")
             .ok()
             .map(|v| v.max(0) as u64),
-        allowed_methods: row
-            .try_get::<String, _>("allowed_methods")
-            .ok()
-            .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok()),
-        allowed_ws_origins: row
-            .try_get::<String, _>("allowed_ws_origins")
-            .ok()
-            .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
-            .unwrap_or_default(),
+        allowed_methods: match row.try_get::<String, _>("allowed_methods") {
+            Ok(s) => Some(serde_json::from_str::<Vec<String>>(&s).map_err(|e| {
+                anyhow::anyhow!("Proxy {}: failed to parse allowed_methods JSON: {}", pid, e)
+            })?),
+            Err(_) => None,
+        },
+        allowed_ws_origins: match row.try_get::<String, _>("allowed_ws_origins") {
+            Ok(s) => serde_json::from_str::<Vec<String>>(&s).map_err(|e| {
+                anyhow::anyhow!(
+                    "Proxy {}: failed to parse allowed_ws_origins JSON: {}",
+                    pid,
+                    e
+                )
+            })?,
+            Err(_) => Vec::new(),
+        },
         udp_max_response_amplification_factor: row
             .try_get::<f64, _>("udp_max_response_amplification_factor")
             .ok()
@@ -3616,14 +3687,23 @@ fn row_to_proxy(
 
 /// Parse a consumer row into a Consumer struct.
 fn row_to_consumer(row: &AnyRow) -> Result<Consumer, anyhow::Error> {
-    let creds_str: String = row.try_get("credentials").unwrap_or_else(|e| {
-        warn!("Failed to read credentials column for consumer: {}", e);
-        "{}".into()
-    });
-    let credentials = serde_json::from_str(&creds_str).unwrap_or_else(|e| {
-        warn!("Failed to parse credentials JSON for consumer: {}", e);
-        std::collections::HashMap::new()
-    });
+    let id_preview: String = row
+        .try_get("id")
+        .unwrap_or_else(|_| "<unknown>".to_string());
+    let creds_str: String = row.try_get("credentials").map_err(|e| {
+        anyhow::anyhow!(
+            "Consumer {}: failed to read credentials column: {}",
+            id_preview,
+            e
+        )
+    })?;
+    let credentials = serde_json::from_str(&creds_str).map_err(|e| {
+        anyhow::anyhow!(
+            "Consumer {}: failed to parse credentials JSON: {}",
+            id_preview,
+            e
+        )
+    })?;
 
     let acl_groups_str: String = row.try_get("acl_groups").unwrap_or_else(|_| "[]".into());
     let acl_groups: Vec<String> = serde_json::from_str(&acl_groups_str).map_err(|e| {
@@ -3650,21 +3730,30 @@ fn row_to_consumer(row: &AnyRow) -> Result<Consumer, anyhow::Error> {
 
 /// Parse a plugin_config row into a PluginConfig struct.
 fn row_to_plugin_config(row: &AnyRow) -> Result<PluginConfig, anyhow::Error> {
-    let config_str: String = row.try_get("config").unwrap_or_else(|e| {
-        warn!("Failed to read plugin config column: {}", e);
-        "{}".into()
-    });
-    let config_val = serde_json::from_str(&config_str).unwrap_or_else(|e| {
-        warn!("Failed to parse plugin config JSON: {}", e);
-        serde_json::Value::Null
-    });
-    let scope_str: String = row.try_get("scope").unwrap_or_else(|e| {
-        warn!(
-            "Failed to read plugin scope column, defaulting to global: {}",
+    let id_preview: String = row
+        .try_get("id")
+        .unwrap_or_else(|_| "<unknown>".to_string());
+    let config_str: String = row.try_get("config").map_err(|e| {
+        anyhow::anyhow!(
+            "PluginConfig {}: failed to read config column: {}",
+            id_preview,
             e
-        );
-        "global".into()
-    });
+        )
+    })?;
+    let config_val = serde_json::from_str(&config_str).map_err(|e| {
+        anyhow::anyhow!(
+            "PluginConfig {}: failed to parse config JSON: {}",
+            id_preview,
+            e
+        )
+    })?;
+    let scope_str: String = row.try_get("scope").map_err(|e| {
+        anyhow::anyhow!(
+            "PluginConfig {}: failed to read scope column: {}",
+            id_preview,
+            e
+        )
+    })?;
 
     Ok(PluginConfig {
         id: row.try_get("id")?,
@@ -3692,54 +3781,63 @@ fn row_to_plugin_config(row: &AnyRow) -> Result<PluginConfig, anyhow::Error> {
 
 /// Parse an upstream row into an Upstream struct.
 fn row_to_upstream(row: &AnyRow) -> Result<Upstream, anyhow::Error> {
-    let targets_str: String = row.try_get("targets").unwrap_or_else(|e| {
-        warn!("Failed to read upstream targets column: {}", e);
-        "[]".into()
-    });
-    let targets: Vec<UpstreamTarget> = serde_json::from_str(&targets_str).unwrap_or_else(|e| {
-        warn!("Failed to parse upstream targets JSON: {}", e);
-        Vec::new()
-    });
-
-    let algo_str: String = row.try_get("algorithm").unwrap_or_else(|e| {
-        warn!(
-            "Failed to read upstream algorithm column, defaulting to round_robin: {}",
+    let id_preview: String = row
+        .try_get("id")
+        .unwrap_or_else(|_| "<unknown>".to_string());
+    let targets_str: String = row.try_get("targets").map_err(|e| {
+        anyhow::anyhow!(
+            "Upstream {}: failed to read targets column: {}",
+            id_preview,
             e
-        );
-        "round_robin".into()
-    });
+        )
+    })?;
+    let targets: Vec<UpstreamTarget> = serde_json::from_str(&targets_str).map_err(|e| {
+        anyhow::anyhow!(
+            "Upstream {}: failed to parse targets JSON: {}",
+            id_preview,
+            e
+        )
+    })?;
+
+    let algo_str: String = row.try_get("algorithm").map_err(|e| {
+        anyhow::anyhow!(
+            "Upstream {}: failed to read algorithm column: {}",
+            id_preview,
+            e
+        )
+    })?;
     let algorithm: LoadBalancerAlgorithm =
-        serde_json::from_value(serde_json::Value::String(algo_str.clone())).unwrap_or_else(|e| {
-            warn!(
-                "Failed to parse upstream algorithm '{}', defaulting to round_robin: {}",
-                algo_str, e
-            );
-            LoadBalancerAlgorithm::default()
-        });
+        serde_json::from_value(serde_json::Value::String(algo_str.clone())).map_err(|e| {
+            anyhow::anyhow!(
+                "Upstream {}: failed to parse algorithm '{}': {}",
+                id_preview,
+                algo_str,
+                e
+            )
+        })?;
 
-    let health_checks: Option<HealthCheckConfig> = row
-        .try_get::<String, _>("health_checks")
-        .ok()
-        .and_then(|s| {
-            serde_json::from_str(&s)
-                .map_err(|e| {
-                    warn!("Failed to parse upstream health_checks JSON: {}", e);
-                    e
-                })
-                .ok()
-        });
+    let health_checks: Option<HealthCheckConfig> = match row.try_get::<String, _>("health_checks") {
+        Ok(s) => Some(serde_json::from_str(&s).map_err(|e| {
+            anyhow::anyhow!(
+                "Upstream {}: failed to parse health_checks JSON: {}",
+                id_preview,
+                e
+            )
+        })?),
+        Err(_) => None,
+    };
 
-    let service_discovery: Option<ServiceDiscoveryConfig> = row
-        .try_get::<String, _>("service_discovery")
-        .ok()
-        .and_then(|s| {
-            serde_json::from_str(&s)
-                .map_err(|e| {
-                    warn!("Failed to parse upstream service_discovery JSON: {}", e);
+    let service_discovery: Option<ServiceDiscoveryConfig> =
+        match row.try_get::<String, _>("service_discovery") {
+            Ok(s) => Some(serde_json::from_str(&s).map_err(|e| {
+                anyhow::anyhow!(
+                    "Upstream {}: failed to parse service_discovery JSON: {}",
+                    id_preview,
                     e
-                })
-                .ok()
-        });
+                )
+            })?),
+            Err(_) => None,
+        };
 
     let hash_on_cookie_config: Option<crate::config::types::HashOnCookieConfig> = row
         .try_get::<String, _>("hash_on_cookie_config")

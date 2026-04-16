@@ -55,6 +55,9 @@ FERRUM_OVERLOAD_LOOP_CRITICAL_US=500000       # reject connections (500ms)
   "level": "normal",
   "draining": false,
   "active_connections": 1247,
+  "active_requests": 3891,
+  "red_drop_probability_pct": 0.0,
+  "port_exhaustion_events": 0,
   "pressure": {
     "file_descriptors": {
       "current": 1247,
@@ -66,16 +69,34 @@ FERRUM_OVERLOAD_LOOP_CRITICAL_US=500000       # reject connections (500ms)
       "max": 100000,
       "ratio": 0.012
     },
+    "requests": {
+      "current": 3891,
+      "max": 0,
+      "ratio": 0.0
+    },
     "event_loop_latency_us": 42
   },
   "actions": {
     "disable_keepalive": false,
-    "reject_new_connections": false
+    "reject_new_connections": false,
+    "reject_new_requests": false
   }
 }
 ```
 
 Returns HTTP 503 when `level` is `critical`.
+
+## Port Exhaustion Monitoring
+
+The `port_exhaustion_events` counter in the `/overload` response is a monotonic count of EADDRNOTAVAIL errors (OS error 99 on Linux, 49 on macOS) encountered across all outbound connection paths. This counter never resets and indicates that the gateway ran out of ephemeral ports for outbound connections.
+
+**When this counter increases:**
+- Widen the kernel ephemeral port range: `sysctl net.ipv4.ip_local_port_range="1024 65535"`
+- Enable TIME_WAIT reuse: `sysctl net.ipv4.tcp_tw_reuse=1`
+- Reduce pool idle timeout: `FERRUM_POOL_IDLE_TIMEOUT_SECONDS=30`
+- Reduce max idle connections per host: `FERRUM_POOL_MAX_IDLE_PER_HOST=16`
+
+All port exhaustion events are also logged at `error` level with the message prefix `PORT EXHAUSTION` and include remediation guidance.
 
 ## Platform Support
 

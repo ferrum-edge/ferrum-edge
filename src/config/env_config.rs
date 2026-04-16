@@ -376,11 +376,13 @@ pub struct EnvConfig {
     pub max_header_count: usize,
     pub max_request_body_size_bytes: usize,
     pub max_response_body_size_bytes: usize,
-    /// Threshold (bytes) below which response bodies with a known Content-Length
-    /// are buffered into a single allocation instead of streamed frame-by-frame.
-    /// This reduces async iteration overhead for moderate-sized responses.
-    /// 0 = disabled (always stream). Default: 2 MiB.
-    pub response_buffer_threshold_bytes: usize,
+    /// Cutoff (bytes) below which response bodies with a known Content-Length
+    /// are eagerly buffered into a single allocation instead of streamed
+    /// frame-by-frame. For small JSON API responses the single `bytes().await`
+    /// allocation is cheaper than spinning up the async coalescing adapter.
+    /// SSE (`text/event-stream`) responses always stream regardless of size.
+    /// 0 = disabled (always stream). Default: 65536 (64 KiB).
+    pub response_buffer_cutoff_bytes: usize,
     /// Target chunk size (bytes) for HTTP/2 response body coalescing.
     /// The `CoalescingH2Body` adapter accumulates small HTTP/2 DATA frames into
     /// chunks of at least this size before forwarding to the client, reducing
@@ -913,7 +915,7 @@ impl Default for EnvConfig {
             max_header_count: 100,
             max_request_body_size_bytes: 10_485_760,
             max_response_body_size_bytes: 10_485_760,
-            response_buffer_threshold_bytes: 2_097_152,
+            response_buffer_cutoff_bytes: 65_536,
             h2_coalesce_target_bytes: 131_072,
             max_url_length_bytes: 8_192,
             max_query_params: 100,
@@ -1214,10 +1216,10 @@ impl EnvConfig {
                 "FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES",
                 10_485_760,
             ),
-            response_buffer_threshold_bytes: resolve_usize(
+            response_buffer_cutoff_bytes: resolve_usize(
                 conf,
-                "FERRUM_RESPONSE_BUFFER_THRESHOLD_BYTES",
-                2_097_152,
+                "FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES",
+                65_536,
             ),
             h2_coalesce_target_bytes: resolve_usize(
                 conf,

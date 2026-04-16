@@ -152,6 +152,7 @@ async fn start_flapping_server(port: u16, name: &'static str, fail_count: u32) {
 fn start_gateway_in_file_mode(
     config_path: &str,
     http_port: u16,
+    admin_port: u16,
 ) -> Result<std::process::Child, Box<dyn std::error::Error>> {
     let build_output = std::process::Command::new("cargo")
         .args(["build", "--bin", "ferrum-edge"])
@@ -173,6 +174,7 @@ fn start_gateway_in_file_mode(
         .env("FERRUM_MODE", "file")
         .env("FERRUM_FILE_CONFIG_PATH", config_path)
         .env("FERRUM_PROXY_HTTP_PORT", http_port.to_string())
+        .env("FERRUM_ADMIN_HTTP_PORT", admin_port.to_string())
         .env("RUST_LOG", "ferrum_edge=debug")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -180,6 +182,68 @@ fn start_gateway_in_file_mode(
         .spawn()?;
 
     Ok(child)
+}
+
+/// Poll the admin /health endpoint until the gateway is ready or timeout.
+async fn wait_for_gateway(admin_port: u16) -> bool {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .unwrap();
+
+    for _ in 0..30 {
+        if let Ok(resp) = client
+            .get(format!("http://127.0.0.1:{}/health", admin_port))
+            .send()
+            .await
+            && resp.status().is_success()
+        {
+            return true;
+        }
+        sleep(Duration::from_millis(200)).await;
+    }
+    false
+}
+
+/// Start the gateway with port allocation retry logic.
+/// Allocates fresh proxy and admin ports each attempt.
+/// Returns (child process, proxy_port, admin_port) on success.
+async fn start_gateway_with_retry(config_path: &str) -> (std::process::Child, u16, u16) {
+    const MAX_ATTEMPTS: u32 = 3;
+    for attempt in 1..=MAX_ATTEMPTS {
+        // Allocate fresh ephemeral ports each attempt
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_port = proxy_listener.local_addr().unwrap().port();
+        drop(proxy_listener);
+
+        let admin_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let admin_port = admin_listener.local_addr().unwrap().port();
+        drop(admin_listener);
+
+        match start_gateway_in_file_mode(config_path, proxy_port, admin_port) {
+            Ok(mut child) => {
+                if wait_for_gateway(admin_port).await {
+                    return (child, proxy_port, admin_port);
+                }
+                eprintln!(
+                    "Gateway startup attempt {}/{} failed (health check timeout on admin port {})",
+                    attempt, MAX_ATTEMPTS, admin_port
+                );
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            Err(e) => {
+                eprintln!(
+                    "Gateway startup attempt {}/{} failed to spawn: {}",
+                    attempt, MAX_ATTEMPTS, e
+                );
+            }
+        }
+        if attempt < MAX_ATTEMPTS {
+            sleep(Duration::from_secs(1)).await;
+        }
+    }
+    panic!("Gateway did not start after {} attempts", MAX_ATTEMPTS);
 }
 
 /// Start an HTTP server that identifies itself but delays its response.
@@ -282,8 +346,8 @@ plugin_configs: []
     let s3 = tokio::spawn(start_identifying_server(30003, "server3"));
     sleep(Duration::from_millis(500)).await;
 
-    let gateway = start_gateway_in_file_mode(config_path.to_str().unwrap(), 28080);
-    sleep(Duration::from_secs(3)).await;
+    let (mut gateway, proxy_port, _admin_port) =
+        start_gateway_with_retry(config_path.to_str().unwrap()).await;
 
     let client = reqwest::Client::new();
     let mut counts: HashMap<String, u32> = HashMap::new();
@@ -291,7 +355,7 @@ plugin_configs: []
     // Send 30 requests — should distribute evenly across 3 servers (10 each)
     for i in 0..30 {
         let resp = client
-            .get(format!("http://127.0.0.1:28080/api/test-{}", i))
+            .get(format!("http://127.0.0.1:{}/api/test-{}", proxy_port, i))
             .send()
             .await;
 
@@ -332,9 +396,7 @@ plugin_configs: []
     }
 
     // Cleanup
-    if let Ok(mut proc) = gateway {
-        let _ = proc.kill();
-    }
+    let _ = gateway.kill();
     s1.abort();
     s2.abort();
     s3.abort();
@@ -386,8 +448,8 @@ plugin_configs: []
     let s2 = tokio::spawn(start_identifying_server(30012, "light"));
     sleep(Duration::from_millis(500)).await;
 
-    let gateway = start_gateway_in_file_mode(config_path.to_str().unwrap(), 28081);
-    sleep(Duration::from_secs(3)).await;
+    let (mut gateway, proxy_port, _admin_port) =
+        start_gateway_with_retry(config_path.to_str().unwrap()).await;
 
     let client = reqwest::Client::new();
     let mut counts: HashMap<String, u32> = HashMap::new();
@@ -395,7 +457,7 @@ plugin_configs: []
     // Send 60 requests — heavy should get ~50, light ~10
     for i in 0..60 {
         let resp = client
-            .get(format!("http://127.0.0.1:28081/wrr/test-{}", i))
+            .get(format!("http://127.0.0.1:{}/wrr/test-{}", proxy_port, i))
             .send()
             .await;
 
@@ -434,9 +496,7 @@ plugin_configs: []
     assert_eq!(heavy, 50, "Heavy server should get exactly 50 requests");
     assert_eq!(light, 10, "Light server should get exactly 10 requests");
 
-    if let Ok(mut proc) = gateway {
-        let _ = proc.kill();
-    }
+    let _ = gateway.kill();
     s1.abort();
     s2.abort();
 }
@@ -490,8 +550,8 @@ plugin_configs: []
     let s3 = tokio::spawn(start_identifying_server(30023, "hash-server3"));
     sleep(Duration::from_millis(500)).await;
 
-    let gateway = start_gateway_in_file_mode(config_path.to_str().unwrap(), 28082);
-    sleep(Duration::from_secs(3)).await;
+    let (mut gateway, proxy_port, _admin_port) =
+        start_gateway_with_retry(config_path.to_str().unwrap()).await;
 
     let client = reqwest::Client::new();
 
@@ -499,7 +559,7 @@ plugin_configs: []
     let mut first_server = String::new();
     for i in 0..20 {
         let resp = client
-            .get(format!("http://127.0.0.1:28082/hash/test-{}", i))
+            .get(format!("http://127.0.0.1:{}/hash/test-{}", proxy_port, i))
             .send()
             .await;
 
@@ -522,9 +582,7 @@ plugin_configs: []
         }
     }
 
-    if let Ok(mut proc) = gateway {
-        let _ = proc.kill();
-    }
+    let _ = gateway.kill();
     s1.abort();
     s2.abort();
     s3.abort();
@@ -586,10 +644,11 @@ plugin_configs: []
     let s2 = tokio::spawn(start_status_server(30032, "unhealthy-server", 500));
     sleep(Duration::from_millis(500)).await;
 
-    let gateway = start_gateway_in_file_mode(config_path.to_str().unwrap(), 28083);
+    let (mut gateway, proxy_port, _admin_port) =
+        start_gateway_with_retry(config_path.to_str().unwrap()).await;
 
     // Wait for health checks to run (interval=1s, threshold=2 → needs ~3s)
-    sleep(Duration::from_secs(5)).await;
+    sleep(Duration::from_secs(3)).await;
 
     let client = reqwest::Client::new();
     let mut counts: HashMap<String, u32> = HashMap::new();
@@ -597,7 +656,10 @@ plugin_configs: []
     // After health checks run, all traffic should go to the healthy server
     for i in 0..20 {
         let resp = client
-            .get(format!("http://127.0.0.1:28083/health-test/test-{}", i))
+            .get(format!(
+                "http://127.0.0.1:{}/health-test/test-{}",
+                proxy_port, i
+            ))
             .send()
             .await;
 
@@ -627,9 +689,7 @@ plugin_configs: []
         counts
     );
 
-    if let Ok(mut proc) = gateway {
-        let _ = proc.kill();
-    }
+    let _ = gateway.kill();
     s1.abort();
     s2.abort();
 }
@@ -686,8 +746,8 @@ plugin_configs: []
     let s2 = tokio::spawn(start_status_server(30042, "bad-server", 500));
     sleep(Duration::from_millis(500)).await;
 
-    let gateway = start_gateway_in_file_mode(config_path.to_str().unwrap(), 28084);
-    sleep(Duration::from_secs(3)).await;
+    let (mut gateway, proxy_port, _admin_port) =
+        start_gateway_with_retry(config_path.to_str().unwrap()).await;
 
     let client = reqwest::Client::new();
 
@@ -695,7 +755,10 @@ plugin_configs: []
     // With round-robin across 2 servers, ~half go to bad-server
     for i in 0..10 {
         let _ = client
-            .get(format!("http://127.0.0.1:28084/passive/warmup-{}", i))
+            .get(format!(
+                "http://127.0.0.1:{}/passive/warmup-{}",
+                proxy_port, i
+            ))
             .send()
             .await;
     }
@@ -707,7 +770,10 @@ plugin_configs: []
     let mut counts: HashMap<String, u32> = HashMap::new();
     for i in 0..20 {
         let resp = client
-            .get(format!("http://127.0.0.1:28084/passive/test-{}", i))
+            .get(format!(
+                "http://127.0.0.1:{}/passive/test-{}",
+                proxy_port, i
+            ))
             .send()
             .await;
 
@@ -733,9 +799,7 @@ plugin_configs: []
         good
     );
 
-    if let Ok(mut proc) = gateway {
-        let _ = proc.kill();
-    }
+    let _ = gateway.kill();
     s1.abort();
     s2.abort();
 }
@@ -797,7 +861,8 @@ plugin_configs: []
     let s2 = tokio::spawn(start_flapping_server(30052, "recovering", 4));
     sleep(Duration::from_millis(500)).await;
 
-    let gateway = start_gateway_in_file_mode(config_path.to_str().unwrap(), 28085);
+    let (mut gateway, proxy_port, _admin_port) =
+        start_gateway_with_retry(config_path.to_str().unwrap()).await;
 
     // Wait for health checks: server2 fails first 4 checks, then recovers
     // interval=1s, so after ~6s server2 should have recovered
@@ -809,7 +874,10 @@ plugin_configs: []
     // After recovery, both servers should receive traffic
     for i in 0..20 {
         let resp = client
-            .get(format!("http://127.0.0.1:28085/recovery/test-{}", i))
+            .get(format!(
+                "http://127.0.0.1:{}/recovery/test-{}",
+                proxy_port, i
+            ))
             .send()
             .await;
 
@@ -842,9 +910,7 @@ plugin_configs: []
         "recovering server should get traffic after recovery"
     );
 
-    if let Ok(mut proc) = gateway {
-        let _ = proc.kill();
-    }
+    let _ = gateway.kill();
     s1.abort();
     s2.abort();
 }
@@ -896,8 +962,8 @@ plugin_configs: []
     let s3 = tokio::spawn(start_identifying_server(30063, "target-c"));
     sleep(Duration::from_millis(500)).await;
 
-    let gateway = start_gateway_in_file_mode(config_path.to_str().unwrap(), 28086);
-    sleep(Duration::from_secs(3)).await;
+    let (mut gateway, proxy_port, _admin_port) =
+        start_gateway_with_retry(config_path.to_str().unwrap()).await;
 
     let client = reqwest::Client::new();
 
@@ -905,7 +971,7 @@ plugin_configs: []
     let mut initial_counts: HashMap<String, u32> = HashMap::new();
     for i in 0..10 {
         let resp = client
-            .get(format!("http://127.0.0.1:28086/reload/test-{}", i))
+            .get(format!("http://127.0.0.1:{}/reload/test-{}", proxy_port, i))
             .send()
             .await;
         if let Ok(r) = resp {
@@ -965,8 +1031,8 @@ plugin_configs: []
 
     // Send SIGHUP to reload config
     #[cfg(unix)]
-    if let Ok(ref proc) = gateway {
-        let pid = proc.id();
+    {
+        let pid = gateway.id();
         let _ = std::process::Command::new("kill")
             .args(["-HUP", &pid.to_string()])
             .output();
@@ -978,7 +1044,10 @@ plugin_configs: []
     let mut updated_counts: HashMap<String, u32> = HashMap::new();
     for i in 0..10 {
         let resp = client
-            .get(format!("http://127.0.0.1:28086/reload/updated-{}", i))
+            .get(format!(
+                "http://127.0.0.1:{}/reload/updated-{}",
+                proxy_port, i
+            ))
             .send()
             .await;
         if let Ok(r) = resp {
@@ -1004,9 +1073,7 @@ plugin_configs: []
         "target-b should NOT get traffic after reload"
     );
 
-    if let Ok(mut proc) = gateway {
-        let _ = proc.kill();
-    }
+    let _ = gateway.kill();
     s1.abort();
     s2.abort();
     s3.abort();
@@ -1066,8 +1133,8 @@ plugin_configs: []
     let s2 = tokio::spawn(start_identifying_server(30172, "fallback-server"));
     sleep(Duration::from_millis(500)).await;
 
-    let gateway = start_gateway_in_file_mode(config_path.to_str().unwrap(), 28187);
-    sleep(Duration::from_secs(4)).await;
+    let (mut gateway, proxy_port, _admin_port) =
+        start_gateway_with_retry(config_path.to_str().unwrap()).await;
 
     let client = reqwest::Client::new();
 
@@ -1075,7 +1142,7 @@ plugin_configs: []
     let mut success_count = 0;
     for i in 0..10 {
         let resp = client
-            .get(format!("http://127.0.0.1:28187/retry/test-{}", i))
+            .get(format!("http://127.0.0.1:{}/retry/test-{}", proxy_port, i))
             .send()
             .await;
 
@@ -1100,9 +1167,7 @@ plugin_configs: []
         "Some requests should succeed via retry to fallback-server"
     );
 
-    if let Ok(mut proc) = gateway {
-        let _ = proc.kill();
-    }
+    let _ = gateway.kill();
     s1.abort();
     s2.abort();
 }
@@ -1165,9 +1230,11 @@ plugin_configs: []
     let s2 = tokio::spawn(start_status_server(30082, "server-y", 500));
     sleep(Duration::from_millis(500)).await;
 
-    let gateway = start_gateway_in_file_mode(config_path.to_str().unwrap(), 28088);
+    let (mut gateway, proxy_port, _admin_port) =
+        start_gateway_with_retry(config_path.to_str().unwrap()).await;
+
     // Wait for active health checks to mark both unhealthy
-    sleep(Duration::from_secs(5)).await;
+    sleep(Duration::from_secs(3)).await;
 
     let client = reqwest::Client::new();
 
@@ -1175,7 +1242,10 @@ plugin_configs: []
     let mut response_count = 0;
     for i in 0..10 {
         let resp = client
-            .get(format!("http://127.0.0.1:28088/fallback/test-{}", i))
+            .get(format!(
+                "http://127.0.0.1:{}/fallback/test-{}",
+                proxy_port, i
+            ))
             .send()
             .await;
 
@@ -1196,9 +1266,7 @@ plugin_configs: []
         response_count
     );
 
-    if let Ok(mut proc) = gateway {
-        let _ = proc.kill();
-    }
+    let _ = gateway.kill();
     s1.abort();
     s2.abort();
 }
@@ -1269,8 +1337,8 @@ plugin_configs: []
     let s4 = tokio::spawn(start_identifying_server(30094, "static-2"));
     sleep(Duration::from_millis(500)).await;
 
-    let gateway = start_gateway_in_file_mode(config_path.to_str().unwrap(), 28089);
-    sleep(Duration::from_secs(3)).await;
+    let (mut gateway, proxy_port, _admin_port) =
+        start_gateway_with_retry(config_path.to_str().unwrap()).await;
 
     let client = reqwest::Client::new();
 
@@ -1278,7 +1346,7 @@ plugin_configs: []
     let mut api_servers: HashMap<String, u32> = HashMap::new();
     for i in 0..10 {
         let resp = client
-            .get(format!("http://127.0.0.1:28089/api/test-{}", i))
+            .get(format!("http://127.0.0.1:{}/api/test-{}", proxy_port, i))
             .send()
             .await;
         if let Ok(r) = resp {
@@ -1294,7 +1362,7 @@ plugin_configs: []
     let mut static_servers: HashMap<String, u32> = HashMap::new();
     for i in 0..10 {
         let resp = client
-            .get(format!("http://127.0.0.1:28089/static/test-{}", i))
+            .get(format!("http://127.0.0.1:{}/static/test-{}", proxy_port, i))
             .send()
             .await;
         if let Ok(r) = resp {
@@ -1337,9 +1405,7 @@ plugin_configs: []
         "api-1 should NOT get /static traffic"
     );
 
-    if let Ok(mut proc) = gateway {
-        let _ = proc.kill();
-    }
+    let _ = gateway.kill();
     s1.abort();
     s2.abort();
     s3.abort();
@@ -1395,8 +1461,8 @@ plugin_configs: []
     let s3 = tokio::spawn(start_identifying_server(30103, "weight-1"));
     sleep(Duration::from_millis(500)).await;
 
-    let gateway = start_gateway_in_file_mode(config_path.to_str().unwrap(), 28090);
-    sleep(Duration::from_secs(3)).await;
+    let (mut gateway, proxy_port, _admin_port) =
+        start_gateway_with_retry(config_path.to_str().unwrap()).await;
 
     let client = reqwest::Client::new();
     let mut counts: HashMap<String, u32> = HashMap::new();
@@ -1404,7 +1470,7 @@ plugin_configs: []
     // Send 60 requests: expected ratio 3:2:1 → 30:20:10
     for i in 0..60 {
         let resp = client
-            .get(format!("http://127.0.0.1:28090/wrr3/test-{}", i))
+            .get(format!("http://127.0.0.1:{}/wrr3/test-{}", proxy_port, i))
             .send()
             .await;
 
@@ -1445,9 +1511,7 @@ plugin_configs: []
     assert_eq!(w2, 20, "weight-2 should get 20 requests");
     assert_eq!(w1, 10, "weight-1 should get 10 requests");
 
-    if let Ok(mut proc) = gateway {
-        let _ = proc.kill();
-    }
+    let _ = gateway.kill();
     s1.abort();
     s2.abort();
     s3.abort();
@@ -1515,16 +1579,21 @@ plugin_configs: []
     let s3 = tokio::spawn(start_identifying_server(30113, "combined-ok-2"));
     sleep(Duration::from_millis(500)).await;
 
-    let gateway = start_gateway_in_file_mode(config_path.to_str().unwrap(), 28091);
+    let (mut gateway, proxy_port, _admin_port) =
+        start_gateway_with_retry(config_path.to_str().unwrap()).await;
+
     // Wait for active health checks to detect unhealthy server
-    sleep(Duration::from_secs(5)).await;
+    sleep(Duration::from_secs(3)).await;
 
     let client = reqwest::Client::new();
     let mut counts: HashMap<String, u32> = HashMap::new();
 
     for i in 0..20 {
         let resp = client
-            .get(format!("http://127.0.0.1:28091/combined/test-{}", i))
+            .get(format!(
+                "http://127.0.0.1:{}/combined/test-{}",
+                proxy_port, i
+            ))
             .send()
             .await;
 
@@ -1557,9 +1626,7 @@ plugin_configs: []
         counts
     );
 
-    if let Ok(mut proc) = gateway {
-        let _ = proc.kill();
-    }
+    let _ = gateway.kill();
     s1.abort();
     s2.abort();
     s3.abort();
@@ -1618,8 +1685,8 @@ plugin_configs: []
     let s1 = tokio::spawn(start_identifying_server(30121, "reachable-server"));
     sleep(Duration::from_millis(500)).await;
 
-    let gateway = start_gateway_in_file_mode(config_path.to_str().unwrap(), 28092);
-    sleep(Duration::from_secs(3)).await;
+    let (mut gateway, proxy_port, _admin_port) =
+        start_gateway_with_retry(config_path.to_str().unwrap()).await;
 
     let client = reqwest::Client::new();
 
@@ -1627,7 +1694,10 @@ plugin_configs: []
     let mut success_count = 0;
     for i in 0..10 {
         let resp = client
-            .get(format!("http://127.0.0.1:28092/unreachable/test-{}", i))
+            .get(format!(
+                "http://127.0.0.1:{}/unreachable/test-{}",
+                proxy_port, i
+            ))
             .send()
             .await;
 
@@ -1653,9 +1723,7 @@ plugin_configs: []
         "Some requests should succeed by retrying to the reachable server"
     );
 
-    if let Ok(mut proc) = gateway {
-        let _ = proc.kill();
-    }
+    let _ = gateway.kill();
     s1.abort();
 }
 
@@ -1715,8 +1783,8 @@ plugin_configs: []
     let s3 = tokio::spawn(start_identifying_server(30133, "lb-target-2"));
     sleep(Duration::from_millis(500)).await;
 
-    let gateway = start_gateway_in_file_mode(config_path.to_str().unwrap(), 28093);
-    sleep(Duration::from_secs(3)).await;
+    let (mut gateway, proxy_port, _admin_port) =
+        start_gateway_with_retry(config_path.to_str().unwrap()).await;
 
     let client = reqwest::Client::new();
 
@@ -1724,7 +1792,7 @@ plugin_configs: []
     let mut direct_servers: HashMap<String, u32> = HashMap::new();
     for i in 0..10 {
         let resp = client
-            .get(format!("http://127.0.0.1:28093/direct/test-{}", i))
+            .get(format!("http://127.0.0.1:{}/direct/test-{}", proxy_port, i))
             .send()
             .await;
 
@@ -1765,7 +1833,10 @@ plugin_configs: []
     let mut lb_servers: HashMap<String, u32> = HashMap::new();
     for i in 0..10 {
         let resp = client
-            .get(format!("http://127.0.0.1:28093/balanced/test-{}", i))
+            .get(format!(
+                "http://127.0.0.1:{}/balanced/test-{}",
+                proxy_port, i
+            ))
             .send()
             .await;
 
@@ -1811,9 +1882,7 @@ plugin_configs: []
         "lb-target-2 should get 5 requests"
     );
 
-    if let Ok(mut proc) = gateway {
-        let _ = proc.kill();
-    }
+    let _ = gateway.kill();
     s1.abort();
     s2.abort();
     s3.abort();
@@ -1870,8 +1939,8 @@ plugin_configs: []
     let s3 = tokio::spawn(start_slow_identifying_server(30203, "lc-server3", 200));
     sleep(Duration::from_millis(500)).await;
 
-    let gateway = start_gateway_in_file_mode(config_path.to_str().unwrap(), 28200);
-    sleep(Duration::from_secs(3)).await;
+    let (mut gateway, proxy_port, _admin_port) =
+        start_gateway_with_retry(config_path.to_str().unwrap()).await;
 
     let client = reqwest::Client::new();
 
@@ -1883,10 +1952,11 @@ plugin_configs: []
         let mut handles = Vec::new();
         for i in 0..6 {
             let c = client.clone();
+            let pp = proxy_port;
             let idx = batch * 6 + i;
             handles.push(tokio::spawn(async move {
                 let resp = c
-                    .get(format!("http://127.0.0.1:28200/lc/test-{}", idx))
+                    .get(format!("http://127.0.0.1:{}/lc/test-{}", pp, idx))
                     .send()
                     .await;
                 match resp {
@@ -1935,9 +2005,7 @@ plugin_configs: []
         );
     }
 
-    if let Ok(mut proc) = gateway {
-        let _ = proc.kill();
-    }
+    let _ = gateway.kill();
     s1.abort();
     s2.abort();
     s3.abort();
@@ -1992,8 +2060,8 @@ plugin_configs: []
     let s3 = tokio::spawn(start_identifying_server(30213, "rand-server3"));
     sleep(Duration::from_millis(500)).await;
 
-    let gateway = start_gateway_in_file_mode(config_path.to_str().unwrap(), 28201);
-    sleep(Duration::from_secs(3)).await;
+    let (mut gateway, proxy_port, _admin_port) =
+        start_gateway_with_retry(config_path.to_str().unwrap()).await;
 
     let client = reqwest::Client::new();
     let mut counts: HashMap<String, u32> = HashMap::new();
@@ -2001,7 +2069,7 @@ plugin_configs: []
     // Send 90 requests to get a meaningful distribution sample
     for i in 0..90 {
         let resp = client
-            .get(format!("http://127.0.0.1:28201/rand/test-{}", i))
+            .get(format!("http://127.0.0.1:{}/rand/test-{}", proxy_port, i))
             .send()
             .await;
 
@@ -2043,9 +2111,7 @@ plugin_configs: []
         );
     }
 
-    if let Ok(mut proc) = gateway {
-        let _ = proc.kill();
-    }
+    let _ = gateway.kill();
     s1.abort();
     s2.abort();
     s3.abort();
@@ -2105,9 +2171,11 @@ plugin_configs: []
     let s1 = tokio::spawn(start_identifying_server(30221, "tcp-healthy"));
     sleep(Duration::from_millis(500)).await;
 
-    let gateway = start_gateway_in_file_mode(config_path.to_str().unwrap(), 28202);
+    let (mut gateway, proxy_port, _admin_port) =
+        start_gateway_with_retry(config_path.to_str().unwrap()).await;
+
     // Wait for TCP health checks to detect unreachable target
-    sleep(Duration::from_secs(5)).await;
+    sleep(Duration::from_secs(3)).await;
 
     let client = reqwest::Client::new();
     let mut counts: HashMap<String, u32> = HashMap::new();
@@ -2115,7 +2183,10 @@ plugin_configs: []
     // All traffic should go to tcp-healthy since tcp probe marks 30222 unhealthy
     for i in 0..20 {
         let resp = client
-            .get(format!("http://127.0.0.1:28202/tcp-probe/test-{}", i))
+            .get(format!(
+                "http://127.0.0.1:{}/tcp-probe/test-{}",
+                proxy_port, i
+            ))
             .send()
             .await;
 
@@ -2140,9 +2211,7 @@ plugin_configs: []
         counts
     );
 
-    if let Ok(mut proc) = gateway {
-        let _ = proc.kill();
-    }
+    let _ = gateway.kill();
     s1.abort();
 }
 
@@ -2201,8 +2270,8 @@ plugin_configs: []
     let s2 = tokio::spawn(start_flapping_server(30232, "flapping-server", 10));
     sleep(Duration::from_millis(500)).await;
 
-    let gateway = start_gateway_in_file_mode(config_path.to_str().unwrap(), 28203);
-    sleep(Duration::from_secs(3)).await;
+    let (mut gateway, proxy_port, _admin_port) =
+        start_gateway_with_retry(config_path.to_str().unwrap()).await;
 
     let client = reqwest::Client::new();
 
@@ -2210,8 +2279,8 @@ plugin_configs: []
     for i in 0..10 {
         let _ = client
             .get(format!(
-                "http://127.0.0.1:28203/recovery-timer/warmup-{}",
-                i
+                "http://127.0.0.1:{}/recovery-timer/warmup-{}",
+                proxy_port, i
             ))
             .send()
             .await;
@@ -2223,8 +2292,8 @@ plugin_configs: []
     for i in 0..10 {
         let resp = client
             .get(format!(
-                "http://127.0.0.1:28203/recovery-timer/phase2-{}",
-                i
+                "http://127.0.0.1:{}/recovery-timer/phase2-{}",
+                proxy_port, i
             ))
             .send()
             .await;
@@ -2255,8 +2324,8 @@ plugin_configs: []
     for i in 0..20 {
         let resp = client
             .get(format!(
-                "http://127.0.0.1:28203/recovery-timer/phase4-{}",
-                i
+                "http://127.0.0.1:{}/recovery-timer/phase4-{}",
+                proxy_port, i
             ))
             .send()
             .await;
@@ -2283,9 +2352,7 @@ plugin_configs: []
         "flapping-server should get traffic after recovery timer restores it"
     );
 
-    if let Ok(mut proc) = gateway {
-        let _ = proc.kill();
-    }
+    let _ = gateway.kill();
     s1.abort();
     s2.abort();
 }
@@ -2347,9 +2414,11 @@ plugin_configs: []
     let s2 = tokio::spawn(start_status_server(30242, "maint-server", 503));
     sleep(Duration::from_millis(500)).await;
 
-    let gateway = start_gateway_in_file_mode(config_path.to_str().unwrap(), 28204);
+    let (mut gateway, proxy_port, _admin_port) =
+        start_gateway_with_retry(config_path.to_str().unwrap()).await;
+
     // Wait for health checks to run — both should pass
-    sleep(Duration::from_secs(5)).await;
+    sleep(Duration::from_secs(3)).await;
 
     let client = reqwest::Client::new();
     let mut counts: HashMap<String, u32> = HashMap::new();
@@ -2357,7 +2426,10 @@ plugin_configs: []
     // Both servers should be considered healthy since 503 is in the allowed list
     for i in 0..20 {
         let resp = client
-            .get(format!("http://127.0.0.1:28204/custom-codes/test-{}", i))
+            .get(format!(
+                "http://127.0.0.1:{}/custom-codes/test-{}",
+                proxy_port, i
+            ))
             .send()
             .await;
 
@@ -2390,9 +2462,7 @@ plugin_configs: []
         "maint-server should get traffic (503 is in healthy codes)"
     );
 
-    if let Ok(mut proc) = gateway {
-        let _ = proc.kill();
-    }
+    let _ = gateway.kill();
     s1.abort();
     s2.abort();
 }

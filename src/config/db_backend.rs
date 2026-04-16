@@ -50,6 +50,34 @@ pub struct PaginatedResult<T> {
     pub total: i64,
 }
 
+/// Connection pool statistics for observability.
+///
+/// Exposed via the admin `/status` endpoint to help operators tune pool settings.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DbPoolStats {
+    /// Current number of connections managed by the pool (idle + active).
+    pub size: u32,
+    /// Number of idle connections available for checkout.
+    pub idle: u32,
+    /// Number of connections currently checked out (in-use).
+    pub active: u32,
+    /// Maximum configured connections (`FERRUM_DB_POOL_MAX_CONNECTIONS`).
+    pub max_connections: u32,
+    /// Minimum configured idle connections (`FERRUM_DB_POOL_MIN_CONNECTIONS`).
+    pub min_connections: u32,
+    /// Read replica pool stats, if a replica is configured.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read_replica: Option<Box<DbPoolStatsInner>>,
+}
+
+/// Inner pool stats (used for read replicas to avoid infinite nesting).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DbPoolStatsInner {
+    pub size: u32,
+    pub idle: u32,
+    pub active: u32,
+}
+
 /// Unified database backend trait.
 ///
 /// This trait defines all operations needed by the admin API, operating modes,
@@ -75,6 +103,14 @@ pub trait DatabaseBackend: Send + Sync {
 
     /// Returns true if a read replica is configured.
     fn has_read_replica(&self) -> bool;
+
+    /// Return connection pool statistics for observability.
+    ///
+    /// Returns `None` when the backend does not expose pool internals
+    /// (e.g. MongoDB, whose driver manages pooling internally).
+    fn pool_stats(&self) -> Option<DbPoolStats> {
+        None
+    }
 
     // -----------------------------------------------------------------------
     // Settings (mutable — called once at startup before sharing via Arc)
