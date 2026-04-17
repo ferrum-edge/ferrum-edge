@@ -2988,29 +2988,34 @@ async fn run_websocket_proxy(
         // before switching to raw mode. This prevents data loss for server-push
         // protocols that send immediately after the upgrade handshake.
         use futures_util::StreamExt;
-        let (mut backend_write, mut backend_read) = backend_ws_stream.split();
-        let mut client_io = TokioIo::new(upgraded);
+        let (backend_write, mut backend_read) = backend_ws_stream.split();
+        // Wrap the client-side upgraded transport in a WebSocketStream so we
+        // can re-serialize drained frames with correct framing/masking on the
+        // way to the client. Role::Server — the gateway is the WS server for
+        // the downstream client.
+        let client_io = TokioIo::new(upgraded);
+        let client_ws = WebSocketStream::from_raw_socket(
+            client_io,
+            tokio_tungstenite::tungstenite::protocol::Role::Server,
+            None,
+        )
+        .await;
+        let (mut client_sink, client_read) = client_ws.split();
 
-        // Non-blocking drain: read any already-buffered frames and forward them
-        // as raw WebSocket wire bytes via the tungstenite sink → client path.
-        // In practice this is 0 frames for request-response protocols, 1-2 for
-        // server-push protocols (e.g., stock tickers).
+        // Non-blocking drain: read any already-buffered frames from the
+        // backend and forward them to the client sink. In practice this is 0
+        // frames for request-response protocols, 1-2 for server-push
+        // protocols (e.g., stock tickers).
         while let std::task::Poll::Ready(Some(Ok(msg))) = futures_util::poll!(backend_read.next()) {
-            // Re-serialize the frame and write to client via tungstenite's
-            // framing layer so masking/headers are correct.
-            if let Err(e) = backend_write.send(msg).await {
+            if let Err(e) = client_sink.send(msg).await {
                 warn!(
                     proxy_id = %proxy_id,
-                    "WebSocket tunnel: failed to flush buffered frame: {e}"
+                    "WebSocket tunnel: failed to flush buffered frame to client: {e}"
                 );
-                // The drain both reads from backend (`backend_read`) and
-                // writes via `backend_write` (the backend sink), so the
-                // failing side is genuinely ambiguous: the read observed a
-                // backend frame, but the failed call writes toward the
-                // backend. Use `Unknown` to avoid over-claiming direction in
-                // either direction.
+                // Read succeeded from backend, write failed toward client —
+                // attribute to BackendToClient.
                 let drain_failure = Some((
-                    crate::plugins::Direction::Unknown,
+                    crate::plugins::Direction::BackendToClient,
                     retry::classify_boxed_error(&e),
                 ));
                 fire_ws_tunnel_disconnect_hooks(
@@ -3045,6 +3050,27 @@ async fn run_websocket_proxy(
             }
         };
         let mut backend = backend_ws.into_inner();
+        // Reunite the client stream and extract the raw transport for
+        // copy_bidirectional. Any drained frames have already been flushed to
+        // the sink before we unwrap.
+        let client_ws = match client_read.reunite(client_sink) {
+            Ok(ws) => ws,
+            Err(e) => {
+                let reunite_failure = Some((
+                    crate::plugins::Direction::Unknown,
+                    crate::retry::ErrorClass::RequestError,
+                ));
+                fire_ws_tunnel_disconnect_hooks(
+                    &ws_disconnect_plugins,
+                    proxy_id,
+                    &session_meta,
+                    reunite_failure,
+                )
+                .await;
+                return Err(Box::new(e));
+            }
+        };
+        let mut client_io = client_ws.into_inner();
         let buf_size = adaptive_buffer.get_buffer_size(proxy_id);
         let result = tokio::io::copy_bidirectional_with_sizes(
             &mut client_io,
