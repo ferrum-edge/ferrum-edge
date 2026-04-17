@@ -1203,11 +1203,16 @@ async fn start_dtls_frontend_listener(
                                 "DTLS client session ended: {}",
                                 e
                             );
-                            (
-                                Some(e.to_string()),
-                                Some(crate::retry::classify_boxed_error(e.as_ref())),
-                                Some(crate::plugins::DisconnectCause::RecvError),
-                            )
+                            let error_message = e.to_string();
+                            let err_class = crate::retry::classify_boxed_error(e.as_ref());
+                            // handle_dtls_client_inner can fail on backend-side
+                            // setup (DNS, backend UDP bind, backend DTLS
+                            // handshake) as well as client-side session errors.
+                            // Infer cause from the classified error + message
+                            // prefix so DTLS stream_disconnects metrics don't
+                            // collapse every failure into `recv_error`.
+                            let cause = dtls_disconnect_cause(&err_class, &error_message);
+                            (Some(error_message), Some(err_class), Some(cause))
                         }
                     };
 
@@ -1329,6 +1334,38 @@ async fn handle_dtls_client(
         bytes_sent: bytes_sent.load(Ordering::Relaxed),
         bytes_received: bytes_received.load(Ordering::Relaxed),
         outcome,
+    }
+}
+
+/// Map a DTLS session failure to a `DisconnectCause`. Backend-facing classes
+/// (DNS, connect, port exhaustion, pool) map to `BackendError` so DTLS
+/// stream_disconnects metrics don't collapse every failure into
+/// `recv_error`. TLS is ambiguous so disambiguate by message prefix — the
+/// "Backend DTLS handshake failed" site sets a distinctive wrap, while
+/// generic session/decrypt errors remain client-side (`RecvError`).
+fn dtls_disconnect_cause(
+    class: &crate::retry::ErrorClass,
+    error_message: &str,
+) -> crate::plugins::DisconnectCause {
+    use crate::plugins::DisconnectCause;
+    use crate::retry::ErrorClass;
+    match class {
+        ErrorClass::DnsLookupError
+        | ErrorClass::ConnectionTimeout
+        | ErrorClass::ConnectionRefused
+        | ErrorClass::ConnectionReset
+        | ErrorClass::ConnectionClosed
+        | ErrorClass::PortExhaustion
+        | ErrorClass::ConnectionPoolError
+        | ErrorClass::ProtocolError => DisconnectCause::BackendError,
+        ErrorClass::TlsError => {
+            if error_message.contains("Backend DTLS") {
+                DisconnectCause::BackendError
+            } else {
+                DisconnectCause::RecvError
+            }
+        }
+        _ => DisconnectCause::RecvError,
     }
 }
 
@@ -2326,8 +2363,13 @@ async fn create_session(
                                             disconnect_direction: Some(
                                                 crate::plugins::Direction::BackendToClient,
                                             ),
+                                            // frontend.send_to failure is a
+                                            // client-facing write — the backend
+                                            // is healthy, so label the cause as
+                                            // a client-side (RecvError) event
+                                            // rather than a backend outage.
                                             disconnect_cause: Some(
-                                                crate::plugins::DisconnectCause::BackendError,
+                                                crate::plugins::DisconnectCause::RecvError,
                                             ),
                                         },
                                     )
