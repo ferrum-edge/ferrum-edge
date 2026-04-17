@@ -1779,3 +1779,73 @@ fn test_proxy_allowed_methods_roundtrip_serialization() {
         Some(vec!["GET".to_string(), "HEAD".to_string()])
     );
 }
+
+// ---------------------------------------------------------------------------
+// Namespace validation & cross-namespace uniqueness
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_validate_namespace_accepts_default() {
+    assert!(ferrum_edge::config::types::validate_namespace("ferrum").is_ok());
+}
+
+#[test]
+fn test_validate_namespace_accepts_alnum_and_separators() {
+    for ns in ["prod", "staging-1", "team_alpha", "v0.9", "a1"] {
+        assert!(
+            ferrum_edge::config::types::validate_namespace(ns).is_ok(),
+            "expected {ns} to be valid"
+        );
+    }
+}
+
+#[test]
+fn test_validate_namespace_rejects_empty() {
+    assert!(ferrum_edge::config::types::validate_namespace("").is_err());
+}
+
+#[test]
+fn test_validate_namespace_rejects_bad_chars() {
+    // Whitespace, slashes, and symbols are rejected by `ID_REGEX`.
+    for ns in ["bad ns", "bad/ns", "bad:ns", "bad*ns", "-leadinghyphen"] {
+        assert!(
+            ferrum_edge::config::types::validate_namespace(ns).is_err(),
+            "expected {ns} to be invalid"
+        );
+    }
+}
+
+// The in-memory validators `validate_unique_listen_paths` and
+// `validate_stream_proxies` operate on a GatewayConfig that has ALREADY been
+// filtered to a single namespace (by `FERRUM_NAMESPACE` in file mode, by
+// `WHERE namespace = ?` SQL in DB mode, or by `FERRUM_NAMESPACE` scoping of
+// the CP's own load path). They therefore treat listen_path and listen_port
+// as globally unique — there is no namespace awareness here, and that is by
+// design. Per-namespace uniqueness is enforced at admission time by the
+// admin API (`check_listen_port_unique(namespace, ..)`,
+// `check_proxy_name_unique(..)`, etc. in `src/config/db_backend.rs`) and by
+// UNIQUE indexes on `(namespace, ..)` in `v001_initial_schema.rs`. The
+// functional namespace suite in `tests/functional/functional_namespace_test.rs`
+// covers that admission-layer behavior end-to-end.
+#[test]
+fn test_listen_path_validator_is_single_namespace_post_filter() {
+    // Two proxies with the same listen_path — the validator flags the
+    // conflict regardless of the namespace field on each proxy, confirming
+    // this validator does not do namespace grouping. If you're here because
+    // this test failed, either namespace-aware validation was just added
+    // (update the test to assert cross-namespace Ok) or a regression
+    // silently dropped the conflict detection (fix the validator).
+    let mut a = make_proxy("p-a", "/shared");
+    a.namespace = "prod".to_string();
+    let mut b = make_proxy("p-b", "/shared");
+    b.namespace = "staging".to_string();
+
+    let config = GatewayConfig {
+        proxies: vec![a, b],
+        ..Default::default()
+    };
+    assert!(
+        config.validate_unique_listen_paths().is_err(),
+        "validator currently flags duplicate listen_path globally — see comment"
+    );
+}

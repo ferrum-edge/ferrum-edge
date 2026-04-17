@@ -537,3 +537,171 @@ plugin_configs:
     let _ = gateway_process.wait();
     echo_server.abort();
 }
+
+// ============================================================================
+// Namespace filtering in file mode
+// ============================================================================
+
+/// Start the gateway in file mode with an explicit `FERRUM_NAMESPACE` set.
+fn start_gateway_in_file_mode_with_namespace(
+    config_path: &str,
+    http_port: u16,
+    admin_port: u16,
+    namespace: &str,
+) -> std::process::Child {
+    let binary_path = gateway_binary_path();
+    std::process::Command::new(binary_path)
+        .env("FERRUM_MODE", "file")
+        .env("FERRUM_NAMESPACE", namespace)
+        .env("FERRUM_FILE_CONFIG_PATH", config_path)
+        .env("FERRUM_PROXY_HTTP_PORT", http_port.to_string())
+        .env("FERRUM_ADMIN_HTTP_PORT", admin_port.to_string())
+        .env("FERRUM_LOG_LEVEL", "warn")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("Failed to start gateway binary")
+}
+
+async fn start_gateway_namespace_retry(
+    config_path: &str,
+    namespace: &str,
+) -> (std::process::Child, u16, u16) {
+    const MAX_ATTEMPTS: u32 = 3;
+    for attempt in 1..=MAX_ATTEMPTS {
+        let proxy_port = ephemeral_port().await;
+        let admin_port = ephemeral_port().await;
+
+        let mut child = start_gateway_in_file_mode_with_namespace(
+            config_path,
+            proxy_port,
+            admin_port,
+            namespace,
+        );
+
+        if wait_for_gateway(admin_port).await {
+            return (child, proxy_port, admin_port);
+        }
+
+        eprintln!(
+            "file-mode gateway (ns={namespace}) startup attempt {}/{} failed",
+            attempt, MAX_ATTEMPTS
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+        if attempt < MAX_ATTEMPTS {
+            sleep(Duration::from_secs(1)).await;
+        }
+    }
+    panic!("Gateway (ns={namespace}) did not start after {MAX_ATTEMPTS} attempts");
+}
+
+#[ignore]
+#[tokio::test]
+async fn test_file_mode_namespace_filtering() {
+    let temp_dir = TempDir::new().expect("Failed to create temp directory");
+
+    // One echo server — both namespace proxies point at it; differentiation is
+    // purely via listen_path.
+    let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_port = echo_listener.local_addr().unwrap().port();
+    let echo_server = tokio::spawn(start_echo_server_on(echo_listener));
+    sleep(Duration::from_millis(200)).await;
+
+    // Proxies in two namespaces. `load_config_from_file` captures
+    // `known_namespaces` before filtering, so both appear via /namespaces,
+    // but only the proxies matching FERRUM_NAMESPACE are routable.
+    let config_path = temp_dir.path().join("config.yaml");
+    let config_content = format!(
+        r#"
+proxies:
+  - id: "prod-proxy"
+    namespace: "prod"
+    listen_path: "/prod"
+    backend_protocol: http
+    backend_host: "127.0.0.1"
+    backend_port: {echo_port}
+    strip_listen_path: true
+  - id: "staging-proxy"
+    namespace: "staging"
+    listen_path: "/staging"
+    backend_protocol: http
+    backend_host: "127.0.0.1"
+    backend_port: {echo_port}
+    strip_listen_path: true
+
+consumers: []
+plugin_configs: []
+"#
+    );
+    std::fs::write(&config_path, config_content).expect("write config");
+
+    let http_client = reqwest::Client::new();
+
+    // ---- Run 1: FERRUM_NAMESPACE=prod ----
+    {
+        let (mut gw, proxy_port, _admin_port) =
+            start_gateway_namespace_retry(config_path.to_str().unwrap(), "prod").await;
+
+        // Positive routing: /prod → prod proxy → backend echo.
+        let r = http_client
+            .get(format!("http://127.0.0.1:{proxy_port}/prod"))
+            .send()
+            .await
+            .expect("prod request");
+        assert!(
+            r.status().is_success(),
+            "prod namespace proxy must serve /prod: {}",
+            r.status()
+        );
+
+        // Negative routing: /staging must not resolve when namespace=prod.
+        let r = http_client
+            .get(format!("http://127.0.0.1:{proxy_port}/staging"))
+            .send()
+            .await
+            .expect("staging request");
+        assert_eq!(
+            r.status().as_u16(),
+            404,
+            "staging proxy must be filtered out when FERRUM_NAMESPACE=prod"
+        );
+
+        let _ = gw.kill();
+        let _ = gw.wait();
+    }
+
+    // ---- Run 2: FERRUM_NAMESPACE=staging ----
+    {
+        let (mut gw, proxy_port, _admin_port) =
+            start_gateway_namespace_retry(config_path.to_str().unwrap(), "staging").await;
+
+        let r = http_client
+            .get(format!("http://127.0.0.1:{proxy_port}/staging"))
+            .send()
+            .await
+            .expect("staging request");
+        assert!(
+            r.status().is_success(),
+            "staging namespace proxy must serve /staging: {}",
+            r.status()
+        );
+
+        let r = http_client
+            .get(format!("http://127.0.0.1:{proxy_port}/prod"))
+            .send()
+            .await
+            .expect("prod request");
+        assert_eq!(
+            r.status().as_u16(),
+            404,
+            "prod proxy must be filtered out when FERRUM_NAMESPACE=staging"
+        );
+
+        let _ = gw.kill();
+        let _ = gw.wait();
+    }
+
+    echo_server.abort();
+}

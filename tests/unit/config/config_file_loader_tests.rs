@@ -980,3 +980,154 @@ plugin_configs: []
 
     assert_eq!(config.proxies[0].plugins.len(), 0);
 }
+
+// ============================================================================
+// Namespace filtering happens before cross-resource uniqueness checks
+// ============================================================================
+
+/// Two proxies in different namespaces that share a `listen_path` must load
+/// cleanly — only the active namespace's proxies participate in
+/// `validate_unique_listen_paths`. Prior to moving the namespace filter above
+/// the cross-resource validators in `load_config_from_file`, this would fail
+/// with "Duplicate listen_path" even though both the admin API and the SQL
+/// unique index allow it.
+#[test]
+fn test_load_config_multi_namespace_shared_listen_path() {
+    let yaml = r#"
+proxies:
+  - id: "prod-proxy"
+    namespace: "prod"
+    listen_path: "/api"
+    backend_protocol: http
+    backend_host: "localhost"
+    backend_port: 3001
+  - id: "staging-proxy"
+    namespace: "staging"
+    listen_path: "/api"
+    backend_protocol: http
+    backend_host: "localhost"
+    backend_port: 3002
+consumers: []
+plugin_configs: []
+"#;
+    let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
+    write!(file, "{}", yaml).unwrap();
+
+    let config = load_config_from_file(
+        file.path().to_str().unwrap(),
+        30,
+        &ferrum_edge::config::BackendAllowIps::Both,
+        "prod",
+    )
+    .expect("multi-namespace config with shared listen_path must load");
+    assert_eq!(config.proxies.len(), 1);
+    assert_eq!(config.proxies[0].namespace, "prod");
+    // `known_namespaces` is captured before filtering so /namespaces can
+    // report the full set.
+    assert!(config.known_namespaces.iter().any(|n| n == "prod"));
+    assert!(config.known_namespaces.iter().any(|n| n == "staging"));
+}
+
+/// Same listen_path within a single namespace must still be rejected.
+#[test]
+fn test_load_config_same_namespace_duplicate_listen_path_rejected() {
+    let yaml = r#"
+proxies:
+  - id: "prod-a"
+    namespace: "prod"
+    listen_path: "/api"
+    backend_protocol: http
+    backend_host: "localhost"
+    backend_port: 3001
+  - id: "prod-b"
+    namespace: "prod"
+    listen_path: "/api"
+    backend_protocol: http
+    backend_host: "localhost"
+    backend_port: 3002
+consumers: []
+plugin_configs: []
+"#;
+    let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
+    write!(file, "{}", yaml).unwrap();
+
+    let err = load_config_from_file(
+        file.path().to_str().unwrap(),
+        30,
+        &ferrum_edge::config::BackendAllowIps::Both,
+        "prod",
+    )
+    .expect_err("duplicate listen_path within same namespace must fail");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("listen_path") || msg.contains("Duplicate"),
+        "expected listen_path uniqueness error, got: {msg}"
+    );
+}
+
+/// Stream proxy `listen_port` collision across namespaces must also load
+/// cleanly (same rationale as listen_path).
+#[test]
+fn test_load_config_multi_namespace_shared_listen_port() {
+    let yaml = r#"
+proxies:
+  - id: "prod-tcp"
+    namespace: "prod"
+    listen_path: ""
+    backend_protocol: tcp
+    backend_host: "127.0.0.1"
+    backend_port: 3001
+    listen_port: 15000
+  - id: "staging-tcp"
+    namespace: "staging"
+    listen_path: ""
+    backend_protocol: tcp
+    backend_host: "127.0.0.1"
+    backend_port: 3002
+    listen_port: 15000
+consumers: []
+plugin_configs: []
+"#;
+    let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
+    write!(file, "{}", yaml).unwrap();
+
+    let config = load_config_from_file(
+        file.path().to_str().unwrap(),
+        30,
+        &ferrum_edge::config::BackendAllowIps::Both,
+        "staging",
+    )
+    .expect("multi-namespace stream proxies sharing listen_port must load");
+    assert_eq!(config.proxies.len(), 1);
+    assert_eq!(config.proxies[0].namespace, "staging");
+    assert_eq!(config.proxies[0].listen_port, Some(15000));
+}
+
+/// Consumer username collision is per-namespace.
+#[test]
+fn test_load_config_multi_namespace_shared_consumer_username() {
+    let yaml = r#"
+proxies: []
+consumers:
+  - id: "prod-alice"
+    namespace: "prod"
+    username: "alice"
+  - id: "staging-alice"
+    namespace: "staging"
+    username: "alice"
+plugin_configs: []
+"#;
+    let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
+    write!(file, "{}", yaml).unwrap();
+
+    let config = load_config_from_file(
+        file.path().to_str().unwrap(),
+        30,
+        &ferrum_edge::config::BackendAllowIps::Both,
+        "prod",
+    )
+    .expect("multi-namespace consumers sharing username must load");
+    assert_eq!(config.consumers.len(), 1);
+    assert_eq!(config.consumers[0].username, "alice");
+    assert_eq!(config.consumers[0].namespace, "prod");
+}

@@ -1466,3 +1466,181 @@ plugin_configs:
     let _ = gw2.wait();
     println!("test_rate_limiting_redis_shared_across_instances PASSED");
 }
+
+/// Namespace-based Redis key prefix isolation.
+///
+/// Two gateways share the same Redis server with identical `rate_limiting`
+/// config but different `FERRUM_NAMESPACE` values, and NO explicit
+/// `redis_key_prefix`. The plugin default (`{FERRUM_NAMESPACE}:rate_limiting`)
+/// must give each gateway its own key space so one namespace's traffic does
+/// not count toward the other's rate limit.
+#[tokio::test]
+#[ignore]
+async fn test_rate_limiting_redis_namespace_key_prefix_isolation() {
+    if !redis_is_available().await {
+        return;
+    }
+    flush_redis_db().await;
+
+    // Shared backend.
+    let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_port = backend_listener.local_addr().unwrap().port();
+    drop(backend_listener);
+    let _backend = start_header_echo_backend(backend_port).await.unwrap();
+
+    let temp_dir = TempDir::new().unwrap();
+
+    // Distinct namespaces per run so a reused Redis DB can't leak between
+    // test invocations.
+    let ns_run = Uuid::new_v4().simple().to_string();
+    let ns_a = format!("nsiso-a-{}", ns_run);
+    let ns_b = format!("nsiso-b-{}", ns_run);
+
+    let start_instance = |instance_num: u16, proxy_port: u16, namespace: String| {
+        let config_path = temp_dir
+            .path()
+            .join(format!("ns_iso_config_{}.yaml", instance_num));
+        // No redis_key_prefix → uses plugin default `{namespace}:rate_limiting`.
+        let config = format!(
+            r#"
+proxies:
+  - id: "ns-iso-proxy"
+    namespace: "{namespace}"
+    listen_path: "/ns-iso"
+    backend_protocol: http
+    backend_host: "127.0.0.1"
+    backend_port: {backend_port}
+    strip_listen_path: true
+    plugins:
+      - plugin_config_id: "ns-iso-rl"
+
+consumers: []
+
+plugin_configs:
+  - id: "ns-iso-rl"
+    namespace: "{namespace}"
+    plugin_name: "rate_limiting"
+    scope: "proxy"
+    proxy_id: "ns-iso-proxy"
+    enabled: true
+    config:
+      window_seconds: 60
+      max_requests: 2
+      expose_headers: true
+      sync_mode: "redis"
+      redis_url: "{REDIS_URL}"
+"#
+        );
+        std::fs::write(&config_path, config).expect("write ns_iso config");
+
+        Command::new(gateway_binary_path())
+            .env("FERRUM_MODE", "file")
+            .env("FERRUM_NAMESPACE", &namespace)
+            .env("FERRUM_FILE_CONFIG_PATH", config_path.to_str().unwrap())
+            .env("FERRUM_PROXY_HTTP_PORT", proxy_port.to_string())
+            .env("RUST_LOG", "error")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn gateway")
+    };
+
+    // Ephemeral ports for both gateways.
+    let port_a = {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let p = l.local_addr().unwrap().port();
+        drop(l);
+        p
+    };
+    let port_b = {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let p = l.local_addr().unwrap().port();
+        drop(l);
+        p
+    };
+
+    let mut gw_a = start_instance(1, port_a, ns_a.clone());
+    let mut gw_b = start_instance(2, port_b, ns_b.clone());
+
+    sleep(Duration::from_secs(5)).await;
+
+    let client = reqwest::Client::new();
+
+    // Readiness probe — any HTTP response means the gateway is listening.
+    for port in [port_a, port_b] {
+        let deadline = SystemTime::now() + Duration::from_secs(10);
+        loop {
+            if SystemTime::now() >= deadline {
+                let _ = gw_a.kill();
+                let _ = gw_b.kill();
+                panic!("Gateway on port {} did not start", port);
+            }
+            if client
+                .get(format!("http://127.0.0.1:{}/health-probe", port))
+                .send()
+                .await
+                .is_ok()
+            {
+                break;
+            }
+            sleep(Duration::from_millis(500)).await;
+        }
+    }
+
+    // Burn gateway A's budget (max_requests=2).
+    for i in 1..=2 {
+        let r = client
+            .get(format!("http://127.0.0.1:{}/ns-iso/test", port_a))
+            .send()
+            .await
+            .expect("A req");
+        assert_eq!(r.status().as_u16(), 200, "A request {i} should succeed");
+    }
+    let r = client
+        .get(format!("http://127.0.0.1:{}/ns-iso/test", port_a))
+        .send()
+        .await
+        .expect("A req 3");
+    assert_eq!(
+        r.status().as_u16(),
+        429,
+        "A 3rd request must be rate limited"
+    );
+
+    // Gateway B should be unaffected — its counter lives under a different
+    // Redis prefix (`{ns_b}:rate_limiting:...` vs `{ns_a}:rate_limiting:...`).
+    for i in 1..=2 {
+        let r = client
+            .get(format!("http://127.0.0.1:{}/ns-iso/test", port_b))
+            .send()
+            .await
+            .expect("B req");
+        assert_eq!(
+            r.status().as_u16(),
+            200,
+            "B request {i} must succeed — separate namespace = separate Redis keys"
+        );
+    }
+    let r = client
+        .get(format!("http://127.0.0.1:{}/ns-iso/test", port_b))
+        .send()
+        .await
+        .expect("B req 3");
+    assert_eq!(
+        r.status().as_u16(),
+        429,
+        "B 3rd request must be rate limited on its own counter"
+    );
+
+    // Best-effort cleanup of the keys we created so the shared Redis DB
+    // doesn't accumulate garbage across test runs.
+    delete_redis_keys_by_prefix(&format!("{}:rate_limiting", ns_a)).await;
+    delete_redis_keys_by_prefix(&format!("{}:rate_limiting", ns_b)).await;
+
+    let _ = gw_a.kill();
+    let _ = gw_a.wait();
+    let _ = gw_b.kill();
+    let _ = gw_b.wait();
+    println!("test_rate_limiting_redis_namespace_key_prefix_isolation PASSED");
+}

@@ -163,6 +163,66 @@ pub fn load_config_from_file(
         );
     }
 
+    // Capture all distinct namespaces before filtering so `GET /namespaces`
+    // can return the full set even though only one namespace's resources are kept.
+    {
+        let mut ns_set = std::collections::HashSet::new();
+        for p in &config.proxies {
+            ns_set.insert(p.namespace.clone());
+        }
+        for c in &config.consumers {
+            ns_set.insert(c.namespace.clone());
+        }
+        for pc in &config.plugin_configs {
+            ns_set.insert(pc.namespace.clone());
+        }
+        for u in &config.upstreams {
+            ns_set.insert(u.namespace.clone());
+        }
+        let mut known: Vec<String> = ns_set.into_iter().collect();
+        known.sort();
+        config.known_namespaces = known;
+    }
+
+    // Filter resources to only those matching the configured namespace.
+    //
+    // The filter runs BEFORE cross-resource uniqueness validators
+    // (listen_path, listen_port, consumer identity, upstream/proxy name,
+    // reference-integrity) so that sibling-namespace resources never
+    // participate in those checks. The admin API and SQL unique indexes
+    // treat those fields as `(namespace, value)`-scoped; running the
+    // in-memory validators on a pre-filter multi-namespace view would
+    // spuriously reject configs that are perfectly valid — e.g., two
+    // proxies in different namespaces sharing `listen_path: /api`.
+    //
+    // Field-level validators (`validate_all_fields_*`, `validate_hosts`,
+    // `validate_regex_listen_paths`, `validate_unique_resource_ids`, etc.)
+    // stay above this filter because they enforce properties that should
+    // hold for every namespace in the file, not just the active one.
+    let pre_filter_counts = (
+        config.proxies.len(),
+        config.consumers.len(),
+        config.plugin_configs.len(),
+        config.upstreams.len(),
+    );
+    config.proxies.retain(|p| p.namespace == namespace);
+    config.consumers.retain(|c| c.namespace == namespace);
+    config.plugin_configs.retain(|pc| pc.namespace == namespace);
+    config.upstreams.retain(|u| u.namespace == namespace);
+
+    let filtered_out = pre_filter_counts.0 - config.proxies.len() + pre_filter_counts.1
+        - config.consumers.len()
+        + pre_filter_counts.2
+        - config.plugin_configs.len()
+        + pre_filter_counts.3
+        - config.upstreams.len();
+    if filtered_out > 0 {
+        info!(
+            "Namespace filter '{}': excluded {} resources from other namespaces",
+            namespace, filtered_out
+        );
+    }
+
     // Validate host+listen_path uniqueness
     if let Err(dupes) = config.validate_unique_listen_paths() {
         for msg in &dupes {
@@ -292,52 +352,6 @@ pub fn load_config_from_file(
         anyhow::bail!(
             "Configuration validation failed: {} stream proxy error(s) found",
             errors.len()
-        );
-    }
-
-    // Capture all distinct namespaces before filtering so `GET /namespaces`
-    // can return the full set even though only one namespace's resources are kept.
-    {
-        let mut ns_set = std::collections::HashSet::new();
-        for p in &config.proxies {
-            ns_set.insert(p.namespace.clone());
-        }
-        for c in &config.consumers {
-            ns_set.insert(c.namespace.clone());
-        }
-        for pc in &config.plugin_configs {
-            ns_set.insert(pc.namespace.clone());
-        }
-        for u in &config.upstreams {
-            ns_set.insert(u.namespace.clone());
-        }
-        let mut known: Vec<String> = ns_set.into_iter().collect();
-        known.sort();
-        config.known_namespaces = known;
-    }
-
-    // Filter resources to only those matching the configured namespace.
-    let pre_filter_counts = (
-        config.proxies.len(),
-        config.consumers.len(),
-        config.plugin_configs.len(),
-        config.upstreams.len(),
-    );
-    config.proxies.retain(|p| p.namespace == namespace);
-    config.consumers.retain(|c| c.namespace == namespace);
-    config.plugin_configs.retain(|pc| pc.namespace == namespace);
-    config.upstreams.retain(|u| u.namespace == namespace);
-
-    let filtered_out = pre_filter_counts.0 - config.proxies.len() + pre_filter_counts.1
-        - config.consumers.len()
-        + pre_filter_counts.2
-        - config.plugin_configs.len()
-        + pre_filter_counts.3
-        - config.upstreams.len();
-    if filtered_out > 0 {
-        info!(
-            "Namespace filter '{}': excluded {} resources from other namespaces",
-            namespace, filtered_out
         );
     }
 

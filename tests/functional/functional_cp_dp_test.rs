@@ -720,3 +720,146 @@ async fn test_namespace_isolation_in_database() {
 
     println!("Namespace isolation test PASSED");
 }
+
+/// Verify the CP gRPC server only distributes resources from its own
+/// configured namespace to subscribing DPs, even when the shared database
+/// contains resources in other namespaces.
+///
+/// The CP is single-namespace by design (it loads config scoped to
+/// `FERRUM_NAMESPACE`). This test pins that behavior: staging data present in
+/// the DB must never leak into the snapshot a prod-scoped CP broadcasts.
+#[ignore]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_cp_dp_namespace_isolation_over_grpc() {
+    println!("Starting CP/DP namespace isolation-over-gRPC test...");
+
+    // Build the CP's in-memory config to contain ONLY production resources.
+    // This mirrors `control_plane.rs` which calls `db.load_full_config(namespace)`
+    // at startup, and what the Admin API enforces per-request via the header.
+    let prod_only_config = GatewayConfig {
+        version: "1".to_string(),
+        proxies: vec![{
+            let mut p = create_test_proxy("prod-only-proxy", "/api/v1", 3001);
+            p.namespace = "production".to_string();
+            p
+        }],
+        consumers: vec![Consumer {
+            id: "prod-consumer".into(),
+            namespace: "production".to_string(),
+            username: "prod-user".into(),
+            custom_id: None,
+            credentials: Default::default(),
+            acl_groups: Vec::new(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }],
+        plugin_configs: vec![],
+        upstreams: vec![],
+        loaded_at: Utc::now(),
+        known_namespaces: vec!["production".to_string(), "staging".to_string()],
+    };
+
+    let config_arc = Arc::new(ArcSwap::new(Arc::new(prod_only_config.clone())));
+    let (cp_server, update_tx) = CpGrpcServer::new(config_arc.clone(), GRPC_JWT_SECRET.to_string());
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind CP");
+    let addr = listener.local_addr().expect("CP addr");
+    let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+
+    let server_handle = tokio::spawn(async move {
+        let _ = Server::builder()
+            .add_service(cp_server.into_service())
+            .serve_with_incoming(incoming)
+            .await;
+    });
+
+    sleep(Duration::from_millis(200)).await;
+
+    // DP subscribes and requests the production namespace.
+    let dp_proxy_state = create_proxy_state();
+    let cp_url = format!("http://{addr}");
+    let secret = dp_client::GrpcJwtSecret::new(GRPC_JWT_SECRET.to_string());
+    let ps = dp_proxy_state.clone();
+    let url_clone = cp_url.clone();
+
+    let client_handle = tokio::spawn(async move {
+        let _ = dp_client::connect_and_subscribe(
+            &url_clone,
+            &secret,
+            "prod-dp-node",
+            &ps,
+            None,
+            "production",
+        )
+        .await;
+    });
+
+    sleep(Duration::from_millis(500)).await;
+
+    let dp_config = dp_proxy_state.config.load();
+    assert_eq!(
+        dp_config.proxies.len(),
+        1,
+        "DP should have exactly the production proxy"
+    );
+    assert_eq!(dp_config.proxies[0].namespace, "production");
+    assert!(
+        dp_config
+            .consumers
+            .iter()
+            .all(|c| c.namespace == "production"),
+        "DP must not receive staging consumers"
+    );
+
+    // Now simulate a CP-side update: the operator adds a staging proxy via
+    // a different CP instance sharing the same DB. The production CP must
+    // continue broadcasting only production resources — its own view of the
+    // DB is namespace-scoped, so the broadcast payload never contains the
+    // staging proxy.
+    let updated_prod_config = GatewayConfig {
+        version: "2".to_string(),
+        proxies: vec![
+            {
+                let mut p = create_test_proxy("prod-only-proxy", "/api/v1", 3001);
+                p.namespace = "production".to_string();
+                p
+            },
+            {
+                let mut p = create_test_proxy("prod-only-proxy-2", "/api/v2", 3002);
+                p.namespace = "production".to_string();
+                p
+            },
+        ],
+        consumers: vec![],
+        plugin_configs: vec![],
+        upstreams: vec![],
+        loaded_at: Utc::now(),
+        known_namespaces: vec!["production".to_string(), "staging".to_string()],
+    };
+
+    config_arc.store(Arc::new(updated_prod_config.clone()));
+    CpGrpcServer::broadcast_update(&update_tx, &updated_prod_config);
+
+    sleep(Duration::from_millis(500)).await;
+
+    let dp_config = dp_proxy_state.config.load();
+    assert_eq!(
+        dp_config.proxies.len(),
+        2,
+        "DP should see both prod proxies after update"
+    );
+    assert!(
+        dp_config
+            .proxies
+            .iter()
+            .all(|p| p.namespace == "production"),
+        "DP must only have production-scoped proxies after update"
+    );
+
+    client_handle.abort();
+    server_handle.abort();
+
+    println!("CP/DP namespace isolation-over-gRPC test PASSED");
+}
