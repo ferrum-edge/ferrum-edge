@@ -132,11 +132,19 @@ fn pre_copy_disconnect_cause(
         ErrorClass::DnsLookupError
         | ErrorClass::ConnectionTimeout
         | ErrorClass::ConnectionRefused
-        | ErrorClass::ConnectionReset
-        | ErrorClass::ConnectionClosed
         | ErrorClass::PortExhaustion
         | ErrorClass::ConnectionPoolError
         | ErrorClass::ProtocolError => DisconnectCause::BackendError,
+        // `ConnectionReset` / `ConnectionClosed` can originate on either
+        // side: a frontend TLS handshake abort from a client that resets
+        // mid-handshake surfaces here too. Disambiguate by message.
+        ErrorClass::ConnectionReset | ErrorClass::ConnectionClosed => {
+            if error_message.contains("Frontend TLS handshake failed") {
+                DisconnectCause::RecvError
+            } else {
+                DisconnectCause::BackendError
+            }
+        }
         ErrorClass::TlsError => {
             if error_message.contains("Frontend TLS handshake failed") {
                 DisconnectCause::RecvError

@@ -3461,10 +3461,23 @@ async fn run_websocket_proxy(
         _ = &mut c2b => true,
         _ = &mut b2c => false,
     };
+    // On grace-timeout the remaining half's future is dropped (in-flight
+    // plugin calls cancelled, sockets released). Record that as a failure so
+    // `on_ws_disconnect` surfaces `cause=timeout` instead of looking like a
+    // clean close. The direction tags which half was still running when the
+    // grace expired.
     if client_done {
-        let _ = tokio::time::timeout(WS_DRAIN_GRACE, b2c).await;
-    } else {
-        let _ = tokio::time::timeout(WS_DRAIN_GRACE, c2b).await;
+        if tokio::time::timeout(WS_DRAIN_GRACE, b2c).await.is_err() {
+            let _ = first_failure.set((
+                crate::plugins::Direction::BackendToClient,
+                retry::ErrorClass::ReadWriteTimeout,
+            ));
+        }
+    } else if tokio::time::timeout(WS_DRAIN_GRACE, c2b).await.is_err() {
+        let _ = first_failure.set((
+            crate::plugins::Direction::ClientToBackend,
+            retry::ErrorClass::ReadWriteTimeout,
+        ));
     }
 
     // Fire the on_ws_disconnect hook exactly once, after both forward halves
