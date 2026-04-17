@@ -3740,6 +3740,120 @@ components:
           default: 300
           description: Maximum allowed clock skew in seconds for the Date header replay protection window
 
+    SoapWsSecurityConfig:
+      type: object
+      description: "Plugin: soap_ws_security — Validates WS-Security headers in SOAP envelopes. Supports UsernameToken (PasswordText/PasswordDigest), X.509 signature verification, SAML assertion validation, timestamp freshness, and nonce replay protection. Buffers request bodies with SOAP content types (text/xml, application/soap+xml, application/xml). At least one security feature must be enabled."
+      properties:
+        reject_missing_security_header:
+          type: boolean
+          default: true
+          description: Reject SOAP requests that lack a WS-Security header
+        timestamp:
+          type: object
+          description: WS-Security Timestamp validation
+          properties:
+            require:
+              type: boolean
+              default: true
+              description: Require a wsu:Timestamp element in the Security header
+            max_age_seconds:
+              type: integer
+              format: uint64
+              default: 300
+              description: Maximum age (seconds) of the Created timestamp before rejection
+            require_expires:
+              type: boolean
+              default: false
+              description: Require an Expires element inside the Timestamp
+            clock_skew_seconds:
+              type: integer
+              format: uint64
+              default: 300
+              description: Clock skew tolerance (seconds) for timestamp validation
+        username_token:
+          type: object
+          description: WS-Security UsernameToken authentication
+          properties:
+            enabled:
+              type: boolean
+              default: false
+              description: Enable UsernameToken authentication
+            password_type:
+              type: string
+              enum: [PasswordText, PasswordDigest]
+              default: PasswordDigest
+              description: Password format. PasswordDigest hashes password with nonce+timestamp; PasswordText sends the password directly (TLS only).
+            credentials:
+              type: array
+              items:
+                type: object
+                required: [username, password]
+                properties:
+                  username:
+                    type: string
+                  password:
+                    type: string
+              description: Allowed username/password pairs for UsernameToken authentication
+        x509_signature:
+          type: object
+          description: X.509 certificate signature verification
+          properties:
+            enabled:
+              type: boolean
+              default: false
+              description: Enable X.509 signature verification
+            trusted_certs:
+              type: array
+              items:
+                type: string
+              description: PEM file paths of trusted signing certificates (matched by SHA-256 fingerprint)
+            allowed_algorithms:
+              type: array
+              items:
+                type: string
+                enum: [rsa-sha256, rsa-sha1]
+              default: [rsa-sha256]
+              description: Allowed XMLDSig signature algorithms
+            require_signed_timestamp:
+              type: boolean
+              default: true
+              description: Require the Timestamp to be included in the signature's references
+        saml:
+          type: object
+          description: SAML 2.0 assertion validation
+          properties:
+            enabled:
+              type: boolean
+              default: false
+              description: Enable SAML assertion validation
+            trusted_issuers:
+              type: array
+              items:
+                type: string
+              description: SAML Issuer values to trust
+            audience:
+              type: string
+              description: Expected SAML AudienceRestriction value (optional)
+            clock_skew_seconds:
+              type: integer
+              format: uint64
+              default: 300
+              description: Clock skew tolerance (seconds) for SAML NotBefore / NotOnOrAfter
+        nonce:
+          type: object
+          description: Nonce replay protection cache (PasswordDigest only)
+          properties:
+            cache_ttl_seconds:
+              type: integer
+              format: uint64
+              default: 300
+              description: How long to remember nonces for replay detection (seconds)
+            max_cache_size:
+              type: integer
+              format: uint64
+              default: 10000
+              description: Maximum nonce cache entries before eviction sweep
+
     CorsConfig:
       type: object
       description: "Plugin: cors — Cross-Origin Resource Sharing."
