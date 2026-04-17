@@ -68,7 +68,7 @@ async fn test_bidirectional_copy_client_read_error_marks_client_to_backend() {
 
     let result = bidirectional_copy_for_test(client, backend, None, 8 * 1024).await;
 
-    let (dir, class, _side) = result
+    let (dir, class, _side, _msg) = result
         .first_failure
         .as_ref()
         .expect("first_failure should be set when client read errors");
@@ -83,7 +83,7 @@ async fn test_bidirectional_copy_backend_read_error_marks_backend_to_client() {
 
     let result = bidirectional_copy_for_test(client, backend, None, 8 * 1024).await;
 
-    let (dir, class, _side) = result
+    let (dir, class, _side, _msg) = result
         .first_failure
         .as_ref()
         .expect("first_failure should be set when backend read errors");
@@ -123,7 +123,7 @@ async fn test_bidirectional_copy_preserves_bytes_across_errors() {
 
     let result = bidirectional_copy_for_test(client, backend, None, 8 * 1024).await;
 
-    let (dir, _class, _side) = result
+    let (dir, _class, _side, _msg) = result
         .first_failure
         .as_ref()
         .expect("first_failure should be set — backend read half errored");
@@ -269,7 +269,7 @@ async fn test_bidirectional_copy_half_close_idle_timeout_fires_in_phase2() {
             .await;
 
     // Idle timeout must fire — either during Phase 1 or Phase 2.
-    let (dir, class, _side) = result
+    let (dir, class, _side, _msg) = result
         .first_failure
         .as_ref()
         .expect("idle timeout on stalled backend must produce first_failure");
@@ -420,7 +420,7 @@ async fn test_bidirectional_splice_half_close_idle_timeout_fires_in_phase2() {
     )
     .await;
 
-    let (dir, class, _side) = result
+    let (dir, class, _side, _msg) = result
         .first_failure
         .as_ref()
         .expect("idle timeout on stalled backend (splice path) must produce first_failure");

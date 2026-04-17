@@ -63,15 +63,18 @@ pub fn classify_http3_error(err: &(dyn std::error::Error + 'static)) -> crate::r
             if matches!(io.raw_os_error(), Some(99) | Some(49) | Some(10049)) {
                 return ErrorClass::PortExhaustion;
             }
-            return match io.kind() {
-                std::io::ErrorKind::TimedOut => ErrorClass::ConnectionTimeout,
-                std::io::ErrorKind::ConnectionRefused => ErrorClass::ConnectionRefused,
-                std::io::ErrorKind::ConnectionReset => ErrorClass::ConnectionReset,
+            match io.kind() {
+                std::io::ErrorKind::TimedOut => return ErrorClass::ConnectionTimeout,
+                std::io::ErrorKind::ConnectionRefused => return ErrorClass::ConnectionRefused,
+                std::io::ErrorKind::ConnectionReset => return ErrorClass::ConnectionReset,
                 std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionAborted => {
-                    ErrorClass::ConnectionClosed
+                    return ErrorClass::ConnectionClosed;
                 }
-                _ => ErrorClass::RequestError,
-            };
+                // Generic kinds (Other, etc.) commonly wrap QUIC/H3 typed
+                // errors — keep walking the source chain so typed variants
+                // and string heuristics can still classify them.
+                _ => {}
+            }
         }
         current = node.source();
     }
