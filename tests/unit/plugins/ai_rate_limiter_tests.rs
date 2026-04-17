@@ -748,3 +748,40 @@ async fn test_window_running_sum_matches_after_eviction() {
         "expected remaining=150 after expired entry evicted, got {remaining}"
     );
 }
+
+// ─── tracked_keys_count observability ──────────────────────────────────
+
+#[tokio::test]
+async fn test_tracked_keys_count_grows_with_distinct_keys() {
+    // tracked_keys_count() exposes the local-mode rate-limit DashMap size
+    // for observability (matches rate_limiting and ai_semantic_cache).
+    let plugin = AiRateLimiter::new(
+        &json!({"token_limit": 1000, "window_seconds": 60, "limit_by": "ip"}),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+    assert_eq!(plugin.tracked_keys_count(), Some(0));
+
+    // First IP creates a key.
+    let mut ctx_a = create_test_context();
+    ctx_a.client_ip = "10.0.0.1".to_string();
+    let mut headers_a = HashMap::new();
+    plugin.before_proxy(&mut ctx_a, &mut headers_a).await;
+    assert_eq!(plugin.tracked_keys_count(), Some(1));
+
+    // Second IP creates a second key.
+    let mut ctx_b = create_test_context();
+    ctx_b.client_ip = "10.0.0.2".to_string();
+    let mut headers_b = HashMap::new();
+    plugin.before_proxy(&mut ctx_b, &mut headers_b).await;
+    assert_eq!(plugin.tracked_keys_count(), Some(2));
+
+    // Repeated request from the first IP reuses the existing key.
+    let mut ctx_a_again = create_test_context();
+    ctx_a_again.client_ip = "10.0.0.1".to_string();
+    let mut headers_a_again = HashMap::new();
+    plugin
+        .before_proxy(&mut ctx_a_again, &mut headers_a_again)
+        .await;
+    assert_eq!(plugin.tracked_keys_count(), Some(2));
+}

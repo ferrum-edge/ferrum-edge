@@ -530,6 +530,13 @@ impl Plugin for AiRateLimiter {
             .collect()
     }
 
+    fn tracked_keys_count(&self) -> Option<usize> {
+        // Only the local-mode DashMap is observable here. Redis-backed
+        // counters are stored externally and are reported through Redis
+        // metrics instead.
+        Some(self.state.len())
+    }
+
     fn requires_response_body_buffering(&self) -> bool {
         true
     }
