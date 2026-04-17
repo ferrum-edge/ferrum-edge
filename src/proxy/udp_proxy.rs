@@ -73,7 +73,7 @@ struct UdpSession {
     /// `OnceLock::set`; reads are lock-free atomic loads. Empty when pktinfo
     /// is disabled, unsupported, or the first datagram did not carry a cmsg
     /// (e.g., it came through tokio's cmsg-less `recv_from`).
-    local_addr: std::sync::OnceLock<IpAddr>,
+    local_addr: std::sync::OnceLock<crate::socket_opts::PktinfoLocal>,
     /// Identified consumer username (gateway Consumer or external identity) resolved
     /// during `on_stream_connect`. Carried to `on_stream_disconnect` for logging.
     consumer_username: Option<String>,
@@ -194,22 +194,23 @@ fn build_dtls_stream_summary(context: DtlsDisconnectContext<'_>) -> StreamTransa
 
 /// Flush a GSO batch buffer to the client via the frontend socket.
 ///
-/// When `local_ip` is `Some`, an IP(v6)_PKTINFO cmsg is attached so the kernel
-/// uses it as the reply source (skipping the routing lookup). The `local_ip`
-/// address family must match `client_addr` — mismatched families fall through
-/// to the legacy GSO path without pktinfo.
+/// When `local` is `Some`, an IP(v6)_PKTINFO cmsg is attached so the kernel
+/// uses it as the reply source (skipping the routing lookup). The address
+/// family must match `client_addr` — mismatched families fall through to the
+/// legacy GSO path without pktinfo. The captured `ifindex` is carried through
+/// so scoped IPv6 (link-local) replies egress the correct interface zone.
 #[cfg(target_os = "linux")]
 fn flush_gso_batch(
     gso_batch: &mut super::udp_batch::GsoBatchBuf,
     frontend: &Arc<UdpSocket>,
     client_addr: SocketAddr,
-    local_ip: Option<IpAddr>,
+    local: Option<crate::socket_opts::PktinfoLocal>,
 ) -> std::io::Result<usize> {
     use std::os::unix::io::AsRawFd;
     let (dest, dest_len) = super::udp_batch::std_to_sockaddr_storage(client_addr);
-    let effective_local = match (local_ip, client_addr) {
+    let effective_local = match (local.map(|l| l.ip), client_addr) {
         (Some(IpAddr::V4(_)), SocketAddr::V4(_)) | (Some(IpAddr::V6(_)), SocketAddr::V6(_)) => {
-            local_ip
+            local
         }
         _ => None,
     };
@@ -238,7 +239,7 @@ async fn try_gso_send_or_fallback(
     data: &[u8],
     gso_failed: &mut bool,
     proxy_id: &str,
-    local_ip: Option<IpAddr>,
+    local_ip: Option<crate::socket_opts::PktinfoLocal>,
 ) {
     use std::os::unix::io::AsRawFd;
 
@@ -959,7 +960,7 @@ async fn process_datagram(
     sni_proxy_ids: Option<&[String]>,
     adaptive_buffer: &Arc<crate::adaptive_buffer::AdaptiveBufferTracker>,
     udp_gso_enabled: bool,
-    local_addr: Option<IpAddr>,
+    local_addr: Option<crate::socket_opts::PktinfoLocal>,
 ) -> Result<(), anyhow::Error> {
     // Run per-datagram plugins (e.g., udp_rate_limiting) before session
     // allocation so dropped datagrams don't consume session slots or trigger
@@ -2373,7 +2374,8 @@ async fn create_session(
             // iteration can attach it as IP(v6)_PKTINFO cmsg and skip the
             // routing lookup.
             #[cfg(target_os = "linux")]
-            let session_local_ip: Option<IpAddr> = reply_session.local_addr.get().copied();
+            let session_local_ip: Option<crate::socket_opts::PktinfoLocal> =
+                reply_session.local_addr.get().copied();
 
             if send_batched {
                 #[cfg(target_os = "linux")]

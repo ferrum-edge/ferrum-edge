@@ -498,12 +498,22 @@ pub fn set_ipv6_recvpktinfo(_fd: i32) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Parse an `IP_PKTINFO` or `IPV6_PKTINFO` cmsg and return the local
-/// destination address the client sent to, if any.
+/// Captured local (reply-source) address from an `IP_PKTINFO` / `IPV6_PKTINFO`
+/// cmsg. The interface index is preserved so scoped IPv6 replies (notably
+/// link-local `fe80::/10`) egress the correct interface zone on send; for IPv4
+/// it's informational and safe to leave at 0.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PktinfoLocal {
+    pub ip: std::net::IpAddr,
+    pub ifindex: u32,
+}
+
+/// Parse an `IP_PKTINFO` or `IPV6_PKTINFO` cmsg and return the captured local
+/// address along with its interface index.
 ///
 /// Returns `None` if neither cmsg is present.
 #[cfg(target_os = "linux")]
-pub fn extract_pktinfo_local_addr(msg: &libc::msghdr) -> Option<std::net::IpAddr> {
+pub fn extract_pktinfo_local_addr(msg: &libc::msghdr) -> Option<PktinfoLocal> {
     let mut cmsg = unsafe { libc::CMSG_FIRSTHDR(msg) };
     while !cmsg.is_null() {
         unsafe {
@@ -516,16 +526,20 @@ pub fn extract_pktinfo_local_addr(msg: &libc::msghdr) -> Option<std::net::IpAddr
                 // local host's header dst after routing — for reply-source
                 // selection we want `ipi_spec_dst`.
                 let pi = std::ptr::read_unaligned(data_ptr);
-                return Some(std::net::IpAddr::V4(std::net::Ipv4Addr::from(
-                    u32::from_be(pi.ipi_spec_dst.s_addr),
-                )));
+                return Some(PktinfoLocal {
+                    ip: std::net::IpAddr::V4(std::net::Ipv4Addr::from(u32::from_be(
+                        pi.ipi_spec_dst.s_addr,
+                    ))),
+                    ifindex: pi.ipi_ifindex as u32,
+                });
             }
             if level == libc::IPPROTO_IPV6 && ty == libc::IPV6_PKTINFO {
                 let data_ptr = libc::CMSG_DATA(cmsg) as *const libc::in6_pktinfo;
                 let pi = std::ptr::read_unaligned(data_ptr);
-                return Some(std::net::IpAddr::V6(std::net::Ipv6Addr::from(
-                    pi.ipi6_addr.s6_addr,
-                )));
+                return Some(PktinfoLocal {
+                    ip: std::net::IpAddr::V6(std::net::Ipv6Addr::from(pi.ipi6_addr.s6_addr)),
+                    ifindex: pi.ipi6_ifindex,
+                });
             }
             cmsg = libc::CMSG_NXTHDR(msg, cmsg);
         }
@@ -535,7 +549,7 @@ pub fn extract_pktinfo_local_addr(msg: &libc::msghdr) -> Option<std::net::IpAddr
 
 #[cfg(not(target_os = "linux"))]
 #[allow(dead_code)]
-pub fn extract_pktinfo_local_addr(_msg: &()) -> Option<std::net::IpAddr> {
+pub fn extract_pktinfo_local_addr(_msg: &()) -> Option<PktinfoLocal> {
     None
 }
 
@@ -563,11 +577,13 @@ pub fn recv_cmsg_space() -> usize {
 pub fn send_with_pktinfo(
     fd: std::os::unix::io::RawFd,
     data: &[u8],
-    local_ip: std::net::IpAddr,
+    local: PktinfoLocal,
     dest: &libc::sockaddr_storage,
     dest_len: libc::socklen_t,
     gso_segment_size: Option<u16>,
 ) -> std::io::Result<usize> {
+    let local_ip = local.ip;
+    let ifindex = local.ifindex;
     const UDP_SEGMENT: libc::c_int = 103;
 
     let iov = libc::iovec {
@@ -611,7 +627,7 @@ pub fn send_with_pktinfo(
             (*cmsg).cmsg_len =
                 libc::CMSG_LEN(std::mem::size_of::<libc::in_pktinfo>() as u32) as usize;
             let pi = libc::in_pktinfo {
-                ipi_ifindex: 0,
+                ipi_ifindex: ifindex as libc::c_int,
                 ipi_spec_dst: libc::in_addr {
                     s_addr: u32::from(v4).to_be(),
                 },
@@ -632,7 +648,7 @@ pub fn send_with_pktinfo(
                 ipi6_addr: libc::in6_addr {
                     s6_addr: v6.octets(),
                 },
-                ipi6_ifindex: 0,
+                ipi6_ifindex: ifindex,
             };
             std::ptr::copy_nonoverlapping(
                 &pi as *const libc::in6_pktinfo as *const u8,
@@ -672,7 +688,7 @@ pub fn send_with_pktinfo(
 pub fn send_with_pktinfo(
     _fd: i32,
     _data: &[u8],
-    _local_ip: std::net::IpAddr,
+    _local: PktinfoLocal,
     _dest: &(),
     _dest_len: u32,
     _gso_segment_size: Option<u16>,
@@ -1874,7 +1890,7 @@ mod pktinfo_tests {
             assert_eq!(n, 1);
             let local = batch.local_addr(0);
             assert!(local.is_some(), "pktinfo should yield local addr");
-            assert_eq!(local.unwrap().to_string(), "127.0.0.1");
+            assert_eq!(local.unwrap().ip.to_string(), "127.0.0.1");
         });
     }
 
@@ -1894,7 +1910,10 @@ mod pktinfo_tests {
             let sent = send_with_pktinfo(
                 server.as_raw_fd(),
                 b"pong",
-                std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                PktinfoLocal {
+                    ip: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                    ifindex: 0,
+                },
                 &dest,
                 dest_len,
                 None,
@@ -1926,7 +1945,10 @@ mod pktinfo_tests {
             let sent = send_with_pktinfo(
                 server.as_raw_fd(),
                 buf,
-                std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                PktinfoLocal {
+                    ip: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                    ifindex: 0,
+                },
                 &dest,
                 dest_len,
                 Some(3),

@@ -47,11 +47,11 @@ pub struct RecvMmsgBatch {
     /// Per-slot GRO segment size parsed from cmsg after recvmmsg.
     /// `None` = single datagram (no GRO coalescing), `Some(n)` = coalesced with segment size n.
     gro_segments: Vec<Option<u16>>,
-    /// Per-slot local destination address (from IP(v6)_PKTINFO cmsg). When the
-    /// frontend socket has pktinfo enabled, this carries the address the client
-    /// targeted on a wildcard bind and is reused as the reply source address so
-    /// the kernel can skip the routing-table lookup on send.
-    local_addrs: Vec<Option<std::net::IpAddr>>,
+    /// Per-slot captured local (reply-source) address from IP(v6)_PKTINFO
+    /// cmsg. The interface index is preserved alongside the address so scoped
+    /// IPv6 replies (notably link-local `fe80::/10`) egress the correct
+    /// interface zone on send; for IPv4 it's informational.
+    local_addrs: Vec<Option<crate::socket_opts::PktinfoLocal>>,
     /// Maximum datagrams per recvmmsg call.
     capacity: usize,
     /// Number of datagrams received in the last `recv()` call.
@@ -128,11 +128,11 @@ impl RecvMmsgBatch {
         self.gro_segments[i]
     }
 
-    /// Returns the local destination address for slot `i`, parsed from the
-    /// IP(v6)_PKTINFO cmsg. `None` when pktinfo is disabled or the socket is
-    /// not wildcard-bound. Used as the reply source address on send to skip
-    /// the kernel routing lookup.
-    pub fn local_addr(&self, i: usize) -> Option<std::net::IpAddr> {
+    /// Returns the captured local (reply-source) address + interface index for
+    /// slot `i`, parsed from the IP(v6)_PKTINFO cmsg. `None` when pktinfo is
+    /// disabled or the socket is not wildcard-bound. The ifindex is required
+    /// for scoped IPv6 (link-local) reply correctness.
+    pub fn local_addr(&self, i: usize) -> Option<crate::socket_opts::PktinfoLocal> {
         debug_assert!(i < self.count);
         self.local_addrs[i]
     }
@@ -267,11 +267,13 @@ pub struct SendMmsgBatch {
     iovecs: Vec<libc::iovec>,
     /// Pre-allocated mmsghdr array (one per slot).
     msgs: Vec<libc::mmsghdr>,
-    /// Per-slot optional reply source address (from IP_PKTINFO capture on recv).
-    /// When `Some`, an IP(v6)_PKTINFO cmsg is attached to this slot's msghdr so
-    /// the kernel uses the captured address as the reply source without a
-    /// routing-table lookup. When `None`, the kernel picks a source via routing.
-    local_ips: Vec<Option<std::net::IpAddr>>,
+    /// Per-slot optional reply source address + interface index (from pktinfo
+    /// capture on recv). When `Some`, an IP(v6)_PKTINFO cmsg is attached to
+    /// this slot's msghdr so the kernel uses the captured address (and, for
+    /// IPv6 link-local, the captured interface zone) as the reply source
+    /// without a routing-table lookup. When `None`, the kernel picks a source
+    /// via routing.
+    local_ips: Vec<Option<crate::socket_opts::PktinfoLocal>>,
     /// Per-slot cmsg buffers for the optional IP(v6)_PKTINFO ancillary data.
     /// Sized for the worst case (v6 in6_pktinfo) so a single allocation handles
     /// both families. Empty when no pktinfo is attached.
@@ -316,9 +318,10 @@ impl SendMmsgBatch {
     }
 
     /// Queue a datagram for batched sending, optionally attaching an
-    /// IP(v6)_PKTINFO cmsg with `local_ip` as the reply source address.
+    /// IP(v6)_PKTINFO cmsg with `local` as the reply source address and
+    /// interface index.
     ///
-    /// Returns `false` if the batch is full. When `local_ip` is `Some`, its
+    /// Returns `false` if the batch is full. When `local` is `Some`, its
     /// address family must match `dest` — v4 pktinfo cannot be combined with a
     /// v6 destination and vice versa. Mismatches are skipped silently; the
     /// slot is queued without pktinfo so the kernel picks a source itself.
@@ -326,7 +329,7 @@ impl SendMmsgBatch {
         &mut self,
         data: &[u8],
         dest: SocketAddr,
-        local_ip: Option<std::net::IpAddr>,
+        local: Option<crate::socket_opts::PktinfoLocal>,
     ) -> bool {
         if self.count >= self.capacity {
             return false;
@@ -338,10 +341,10 @@ impl SendMmsgBatch {
         let (addr, addr_len) = std_to_sockaddr_storage(dest);
         self.dest_addrs[i] = addr;
         self.dest_addr_lens[i] = addr_len;
-        // Only honor local_ip when address family matches the destination.
-        self.local_ips[i] = match (local_ip, dest) {
+        // Only honor local when address family matches the destination.
+        self.local_ips[i] = match (local.map(|l| l.ip), dest) {
             (Some(std::net::IpAddr::V4(_)), SocketAddr::V4(_))
-            | (Some(std::net::IpAddr::V6(_)), SocketAddr::V6(_)) => local_ip,
+            | (Some(std::net::IpAddr::V6(_)), SocketAddr::V6(_)) => local,
             _ => None,
         };
         self.count += 1;
@@ -381,7 +384,9 @@ impl SendMmsgBatch {
 
             // Attach IP(v6)_PKTINFO cmsg when a local source address is set.
             // The cmsg_buf is pre-allocated for the v6 worst case and reused.
-            if let Some(local_ip) = self.local_ips[i] {
+            if let Some(local) = self.local_ips[i] {
+                let local_ip = local.ip;
+                let ifindex = local.ifindex;
                 let cmsg_buf = &mut self.cmsg_bufs[i];
                 cmsg_buf.fill(0);
                 let (pktinfo_len, pktinfo_space) = match local_ip {
@@ -412,7 +417,7 @@ impl SendMmsgBatch {
                             (*cmsg).cmsg_type = libc::IP_PKTINFO;
                             (*cmsg).cmsg_len = pktinfo_len;
                             let pi = libc::in_pktinfo {
-                                ipi_ifindex: 0,
+                                ipi_ifindex: ifindex as libc::c_int,
                                 ipi_spec_dst: libc::in_addr {
                                     s_addr: u32::from(v4).to_be(),
                                 },
@@ -432,7 +437,7 @@ impl SendMmsgBatch {
                                 ipi6_addr: libc::in6_addr {
                                     s6_addr: v6.octets(),
                                 },
-                                ipi6_ifindex: 0,
+                                ipi6_ifindex: ifindex,
                             };
                             std::ptr::copy_nonoverlapping(
                                 &pi as *const libc::in6_pktinfo as *const u8,
@@ -650,12 +655,12 @@ impl GsoBatchBuf {
         fd: std::os::fd::RawFd,
         dest: &libc::sockaddr_storage,
         dest_len: libc::socklen_t,
-        local_ip: Option<std::net::IpAddr>,
+        local: Option<crate::socket_opts::PktinfoLocal>,
     ) -> std::io::Result<usize> {
         if self.count == 0 {
             return Ok(0);
         }
-        let result = if let Some(local) = local_ip {
+        let result = if let Some(local) = local {
             crate::socket_opts::send_with_pktinfo(
                 fd,
                 &self.buf,
@@ -695,7 +700,7 @@ impl GsoBatchBuf {
         &mut self,
         send_batch: &mut SendMmsgBatch,
         dest: std::net::SocketAddr,
-        local_ip: Option<std::net::IpAddr>,
+        local: Option<crate::socket_opts::PktinfoLocal>,
     ) -> usize {
         if self.count == 0 || self.segment_size == 0 {
             return 0;
@@ -704,7 +709,7 @@ impl GsoBatchBuf {
         let mut drained = 0;
         while offset < self.buf.len() {
             let end = (offset + self.segment_size).min(self.buf.len());
-            if !send_batch.push_with_local(&self.buf[offset..end], dest, local_ip) {
+            if !send_batch.push_with_local(&self.buf[offset..end], dest, local) {
                 break; // sendmmsg batch full — remaining stays in GSO buffer
             }
             offset = end;
