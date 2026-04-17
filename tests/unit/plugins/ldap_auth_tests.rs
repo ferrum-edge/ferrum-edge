@@ -429,14 +429,14 @@ async fn test_empty_password_rejected_without_contacting_ldap() {
     // and would silently succeed for any username. The plugin must reject
     // empty passwords up front, before they reach the server.
     //
-    // This test points at an unreachable port (port 19 = chargen, virtually
-    // never used). If the plugin were to attempt the bind, the test would
-    // hit the connect timeout and pass anyway — but the test would take
-    // >1s and we'd see no `connect_timeout_seconds` here. Setting no
-    // timeout (default 5s) means the test would hang for 5s on regression.
+    // Point at a guaranteed-closed loopback port rather than a public DNS
+    // name — sandboxed CI runners may have no DNS, and a slow resolver
+    // could make this test flaky even when the short-circuit works. A
+    // closed loopback port gives immediate connection refusal if the
+    // plugin ever regressed and actually attempted a bind.
     let plugin = LdapAuth::new(
         &json!({
-            "ldap_url": "ldap://ldap.example.com:389",
+            "ldap_url": "ldap://127.0.0.1:1",
             "bind_dn_template": "uid={username},ou=users,dc=example,dc=com"
         }),
         http_client(),

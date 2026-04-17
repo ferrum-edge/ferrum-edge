@@ -665,18 +665,26 @@ impl SoapWsSecurity {
             }
         };
 
-        // Check that there's a Reference whose URI attribute exactly matches
-        // `#<timestamp-id>`. A naive substring check would match prefixes —
-        // e.g. searching for `#TS-1` would also accept `URI="#TS-1abc"`,
-        // letting an attacker include an unrelated element in the signature
-        // and claim the timestamp is signed.
-        let ref_uri_dq = format!("URI=\"#{}\"", ts_id);
-        let ref_uri_sq = format!("URI='#{}'", ts_id);
-        if !signed_info.contains(&ref_uri_dq) && !signed_info.contains(&ref_uri_sq) {
-            return Err("WS-Security: Timestamp is not included in the signature".to_string());
+        // Iterate each <Reference> and compare its parsed URI attribute
+        // against `#<timestamp-id>`. A naive substring check on `signed_info`
+        // would accept prefix matches (e.g. `URI="#TS-1abc"` for `TS-1`) and
+        // would also miss valid signatures that use whitespace around `=`
+        // (`URI = "#TS-1"`) or single quotes. Parsing each Reference's URI
+        // via `find_attribute` handles all of these uniformly.
+        let expected = format!("#{}", ts_id);
+        let mut search_from = 0;
+        while let Some((ref_block, next_start)) =
+            find_element_block_from_with_end(signed_info, "Reference", search_from)
+        {
+            search_from = next_start.max(search_from + 1);
+            if let Some(uri) = find_attribute(&ref_block, "URI")
+                && uri == expected
+            {
+                return Ok(());
+            }
         }
 
-        Ok(())
+        Err("WS-Security: Timestamp is not included in the signature".to_string())
     }
 
     fn extract_signing_cert(
