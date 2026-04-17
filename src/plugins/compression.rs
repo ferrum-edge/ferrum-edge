@@ -351,6 +351,13 @@ impl Plugin for CompressionPlugin {
         ctx: &mut RequestContext,
         headers: &mut HashMap<String, String>,
     ) -> PluginResult {
+        // Always drop any client-supplied value of the gateway-internal marker.
+        // Without this, a client could set `x-ferrum-original-content-encoding: gzip`
+        // on a plaintext body and trick `transform_request_body` into attempting
+        // decompression (wasted CPU; with a crafted gzip-bomb payload, bounded by
+        // `max_decompressed_request_size` but still unnecessary work).
+        headers.remove("x-ferrum-original-content-encoding");
+
         // Save original Accept-Encoding before we potentially strip it.
         // Read from `headers` param — ctx.headers may be empty when the handler
         // uses the zero-clone fast path (std::mem::take).
