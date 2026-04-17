@@ -437,13 +437,27 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
             let v4_ok = crate::socket_opts::set_ip_pktinfo(fd).is_ok();
             let v6_ok = crate::socket_opts::set_ipv6_recvpktinfo(fd).is_ok();
             pktinfo_active = v4_ok || v6_ok;
-            if !pktinfo_active {
+            if pktinfo_active {
+                info!(
+                    proxy_id = %proxy_id,
+                    port = port,
+                    v4 = v4_ok,
+                    v6 = v6_ok,
+                    "IP_PKTINFO active on UDP listener; reply path will set source via cmsg (routing lookup skipped) and recv path uses readable()+recvmmsg"
+                );
+            } else {
                 warn!(
                     proxy_id = %proxy_id,
                     port = port,
-                    "IP_PKTINFO setsockopt failed; reply path will use routing lookup"
+                    "IP_PKTINFO setsockopt failed on both v4 and v6; reply path will use routing lookup and recv path remains on recv_from"
                 );
             }
+        } else {
+            debug!(
+                proxy_id = %proxy_id,
+                port = port,
+                "IP_PKTINFO disabled (FERRUM_UDP_PKTINFO_ENABLED=false or auto-probe failed at startup); reply path uses routing lookup"
+            );
         }
         // UDP_GRO cannot be enabled because the primary receive path uses
         // tokio's recv_from() in the select! loop, which doesn't expose cmsg
