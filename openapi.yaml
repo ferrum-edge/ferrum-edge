@@ -3366,6 +3366,31 @@ components:
           default: 10000
           description: Channel capacity — new entries are dropped when full
 
+    UdpRateLimitingConfig:
+      type: object
+      description: >-
+        Plugin: udp_rate_limiting — Rate limits UDP datagrams per client IP using
+        a fixed-window algorithm. Silently drops excess datagrams. At least one of
+        datagrams_per_second or bytes_per_second must be set.
+      anyOf:
+        - required: [datagrams_per_second]
+        - required: [bytes_per_second]
+      properties:
+        datagrams_per_second:
+          type: integer
+          format: uint64
+          description: Maximum datagrams per second per client IP
+        bytes_per_second:
+          type: integer
+          format: uint64
+          description: Maximum bytes per second per client IP
+        window_seconds:
+          type: integer
+          format: uint64
+          default: 1
+          minimum: 1
+          description: Window duration in seconds (limits are scaled proportionally)
+
     KafkaLoggingConfig:
       type: object
       description: "Plugin: kafka_logging — Produces transaction summaries as JSON messages to an Apache Kafka topic. Uses an async channel to decouple the proxy hot path from Kafka I/O, with librdkafka handling batching, compression, and delivery retries."
@@ -3534,12 +3559,8 @@ components:
       properties:
         header_name:
           type: string
-          default: X-Correlation-ID
-          description: Header name for correlation ID
-        generator:
-          type: string
-          default: uuid
-          description: ID generation strategy
+          default: x-request-id
+          description: Header name for correlation ID (lowercased internally)
         echo_downstream:
           type: boolean
           default: true
@@ -3888,10 +3909,15 @@ components:
           format: uint64
           minimum: 1
           description: Maximum active TCP connections allowed for one Consumer/IP key
+        cleanup_interval_seconds:
+          type: integer
+          format: uint64
+          default: 60
+          description: "Background sweep interval in seconds for removing stale zero-count entries. Catches edge cases where connections are dropped without on_stream_disconnect. Set to 0 to disable the sweep (entries are still removed inline by the disconnect path)."
 
     IpRestrictionConfig:
       type: object
-      description: "Plugin: ip_restriction — IP/CIDR access control."
+      description: "Plugin: ip_restriction — IP/CIDR access control. At least one of allow or deny must be set."
       properties:
         allow:
           type: array
@@ -3903,6 +3929,13 @@ components:
           items:
             type: string
           description: Denied IP addresses or CIDR ranges
+        mode:
+          type: string
+          enum: [allow_first, deny_first]
+          default: allow_first
+          description: >-
+            Evaluation order. allow_first checks allow rules before deny rules;
+            deny_first checks deny rules before allow rules.
 
     BotDetectionConfig:
       type: object
@@ -4099,7 +4132,25 @@ components:
 
     RateLimitingConfig:
       type: object
-      description: "Plugin: rate_limiting — Per-IP or per-consumer request rate limiting. On stream proxies, consumer mode uses the identified stream Consumer when available and otherwise falls back to client IP. Supports centralized Redis-backed mode for coordinating rate limits across multiple gateway instances."
+      description: |
+        Plugin: rate_limiting — Per-IP or per-consumer request rate limiting.
+        On stream proxies, consumer mode uses the identified stream Consumer
+        when available and otherwise falls back to client IP. Supports
+        centralized Redis-backed mode for coordinating rate limits across
+        multiple gateway instances.
+
+        Configure rate windows in one of two ways:
+        1. `window_seconds` + `max_requests` — exact custom window (any duration)
+        2. One or more of `requests_per_second`, `requests_per_minute`, `requests_per_hour`
+
+        At least one rate window must be configured (the plugin rejects an
+        empty config). When multiple windows are configured (e.g., per-second
+        AND per-minute), each request must satisfy ALL windows.
+
+        Algorithm selection is automatic: windows ≤ 5 seconds use a token
+        bucket (O(1) memory), windows > 5 seconds use a sliding window with
+        exact request-timestamp tracking (O(n) memory per key, where n =
+        requests in window).
       properties:
         limit_by:
           type: string
@@ -4110,18 +4161,37 @@ components:
           type: boolean
           default: false
           description: Inject x-ratelimit-* headers on requests and responses
+        window_seconds:
+          type: integer
+          format: uint64
+          minimum: 1
+          description: >-
+            Custom window duration in seconds. When set, use max_requests to
+            define the limit for this window. Alternative to the preset
+            requests_per_second/minute/hour fields.
+        max_requests:
+          type: integer
+          format: uint64
+          minimum: 1
+          default: 10
+          description: >-
+            Maximum requests allowed within window_seconds. Only used when
+            window_seconds is set. Must be greater than zero.
         requests_per_second:
           type: integer
           format: uint64
-          description: Max requests per second
+          minimum: 1
+          description: Max requests per second (token bucket algorithm)
         requests_per_minute:
           type: integer
           format: uint64
-          description: Max requests per minute
+          minimum: 1
+          description: Max requests per minute (sliding window algorithm)
         requests_per_hour:
           type: integer
           format: uint64
-          description: Max requests per hour
+          minimum: 1
+          description: Max requests per hour (sliding window algorithm)
         sync_mode:
           type: string
           enum: [local, redis]
@@ -4159,27 +4229,45 @@ components:
 
     RequestSizeLimitingConfig:
       type: object
-      description: "Plugin: request_size_limiting — Per-proxy request body size limits."
+      description: |
+        Plugin: request_size_limiting — Per-proxy request body size limits.
+        Rejects oversized requests with HTTP 413 in three places: an early
+        Content-Length fast path (`on_request_received`), a buffered-body
+        check when another plugin already loaded the body (`before_proxy`),
+        and a final post-transform check before forwarding to the backend
+        (`on_final_request_body`).
+      required:
+        - max_bytes
       properties:
         max_bytes:
           type: integer
           format: uint64
-          default: 0
-          description: Maximum allowed request body size in bytes (0 = disabled)
+          minimum: 1
+          description: "Maximum allowed request body size in bytes. Must be greater than zero — the plugin errors at construction if absent or 0."
 
     ResponseSizeLimitingConfig:
       type: object
-      description: "Plugin: response_size_limiting — Per-proxy response body size limits."
+      description: |
+        Plugin: response_size_limiting — Per-proxy response body size limits.
+        Rejects oversized responses with HTTP 502 either via Content-Length
+        fast path (`after_proxy`) or after final buffering when
+        `require_buffered_check: true` is set (`on_final_response_body`).
+        Without `require_buffered_check`, chunked/streaming responses
+        without Content-Length cannot be enforced by this plugin — the
+        global `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES` limit applies in that
+        case via the gateway's `SizeLimitedStreamingResponse` adapter.
+      required:
+        - max_bytes
       properties:
         max_bytes:
           type: integer
           format: uint64
-          default: 0
-          description: Maximum allowed response body size in bytes (0 = disabled)
+          minimum: 1
+          description: "Maximum allowed response body size in bytes. Must be greater than zero — the plugin errors at construction if absent or 0."
         require_buffered_check:
           type: boolean
           default: false
-          description: Force response body buffering to verify actual size
+          description: "Force response body buffering to verify actual size when Content-Length is absent. Adds memory overhead — only enable when needed."
 
     BodyValidatorConfig:
       type: object
@@ -4265,16 +4353,40 @@ components:
         status_code:
           type: integer
           format: uint16
-          description: HTTP status code to return
+          default: 503
+          description: HTTP status code to return (must be 100-599)
         body:
           type: string
-          description: Response body
+          description: Response body (overrides auto-generated body from message)
         content_type:
           type: string
+          default: application/json
           description: Response Content-Type header
         message:
           type: string
-          description: Error message
+          default: Service unavailable
+          description: Error message used when body is empty
+        trigger:
+          type: object
+          description: >-
+            Optional trigger condition. When omitted, the plugin always terminates.
+            When set, only requests matching the trigger are terminated. Runtime
+            evaluates path_prefix first; otherwise header (with optional
+            header_value) is required — header_value alone is ignored and the
+            plugin falls back to terminating every request.
+          properties:
+            path_prefix:
+              type: string
+              description: Terminate only requests whose path starts with this prefix
+            header:
+              type: string
+              description: Terminate only when this header is present
+            header_value:
+              type: string
+              default: ""
+              description: If set, the header must match this value exactly (empty means presence-only check). Requires `header` to be set.
+          dependentRequired:
+            header_value: [header]
 
     ResponseMockConfig:
       type: object
@@ -4956,7 +5068,12 @@ components:
         ttl_seconds:
           type: integer
           default: 300
+          minimum: 1
           description: Time-to-live in seconds for cached responses
+        inflight_ttl_seconds:
+          type: integer
+          minimum: 1
+          description: "How long an in-flight marker remains valid before being treated as stale and replaced by a fresh request. Must be set at or above the longest backend request that should be protected from concurrent duplicate execution — if set too low, a slow legitimate request still running past this TTL can have a duplicate retry bypass the in-flight lock and re-execute side-effecting operations. Defaults to ttl_seconds."
         max_entries:
           type: integer
           default: 10000

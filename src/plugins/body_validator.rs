@@ -305,22 +305,23 @@ impl BodyValidator {
 
         // --- string constraints ---
         if let Some(s) = data.as_str() {
+            // JSON Schema specifies minLength/maxLength count Unicode code points,
+            // not bytes (RFC 8927 / JSON Schema Validation §6.3).
+            let char_count = s.chars().count() as u64;
             if let Some(min) = schema.get("minLength").and_then(|v| v.as_u64())
-                && (s.len() as u64) < min
+                && char_count < min
             {
                 return Err(format!(
-                    "String length {} is less than minLength {}",
-                    s.len(),
-                    min
+                    "String length {} (code points) is less than minLength {}",
+                    char_count, min
                 ));
             }
             if let Some(max) = schema.get("maxLength").and_then(|v| v.as_u64())
-                && (s.len() as u64) > max
+                && char_count > max
             {
                 return Err(format!(
-                    "String length {} exceeds maxLength {}",
-                    s.len(),
-                    max
+                    "String length {} (code points) exceeds maxLength {}",
+                    char_count, max
                 ));
             }
             if let Some(pattern) = schema.get("pattern").and_then(|v| v.as_str()) {
