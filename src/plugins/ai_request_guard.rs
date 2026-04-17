@@ -74,16 +74,44 @@ impl AiRequestGuard {
         let max_messages = config["max_messages"].as_u64();
         let max_prompt_characters = config["max_prompt_characters"].as_u64();
 
-        let temperature_range = config["temperature_range"].as_array().and_then(|arr| {
-            if arr.len() == 2 {
-                match (arr[0].as_f64(), arr[1].as_f64()) {
-                    (Some(min), Some(max)) => Some((min, max)),
-                    _ => None,
-                }
-            } else {
-                None
+        // Parse temperature_range with strict validation. A misconfigured
+        // `[max, min]` or `[NaN, x]` would silently reject every request or
+        // silently accept all of them (NaN comparisons always return false),
+        // so reject these inputs at construction time rather than producing
+        // a plugin that looks active but behaves incorrectly.
+        let temperature_range = if let Some(arr) = config.get("temperature_range") {
+            let Some(arr) = arr.as_array() else {
+                return Err(
+                    "ai_request_guard: 'temperature_range' must be an array of two numbers"
+                        .to_string(),
+                );
+            };
+            if arr.len() != 2 {
+                return Err(format!(
+                    "ai_request_guard: 'temperature_range' must have exactly 2 elements, got {}",
+                    arr.len()
+                ));
             }
-        });
+            let Some(min) = arr[0].as_f64() else {
+                return Err("ai_request_guard: 'temperature_range[0]' must be a number".to_string());
+            };
+            let Some(max) = arr[1].as_f64() else {
+                return Err("ai_request_guard: 'temperature_range[1]' must be a number".to_string());
+            };
+            if !min.is_finite() || !max.is_finite() {
+                return Err(format!(
+                    "ai_request_guard: 'temperature_range' bounds must be finite, got [{min}, {max}]"
+                ));
+            }
+            if min > max {
+                return Err(format!(
+                    "ai_request_guard: 'temperature_range' min must be <= max, got [{min}, {max}]"
+                ));
+            }
+            Some((min, max))
+        } else {
+            None
+        };
 
         let block_system_prompts = config["block_system_prompts"].as_bool().unwrap_or(false);
 

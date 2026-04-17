@@ -351,3 +351,91 @@ fn test_tracked_keys_count() {
     let plugin = make_plugin(config);
     assert_eq!(plugin.tracked_keys_count(), Some(0));
 }
+
+#[tokio::test]
+async fn test_sensitive_response_headers_not_replayed_on_cache_hit() {
+    // SECURITY: Cached responses must not replay per-response identity
+    // (cookies, auth tokens) or per-request rate-limit/trace headers to a
+    // different consumer. Without this, a cache hit would leak the original
+    // user's session cookie to the next user that asks the same question.
+    let config = json!({"ttl_seconds": 300});
+    let plugin = make_plugin(config);
+
+    let body_json = json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "Hello"}]
+    });
+    let body_str = serde_json::to_string(&body_json).unwrap();
+
+    // First request — cache MISS, store response with a Set-Cookie / Auth header.
+    let mut ctx1 = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/v1/chat/completions".to_string(),
+    );
+    ctx1.metadata
+        .insert("request_body".to_string(), body_str.clone());
+    let mut headers1 = HashMap::new();
+    headers1.insert("content-type".to_string(), "application/json".to_string());
+    let _ = plugin.before_proxy(&mut ctx1, &mut headers1).await;
+
+    let mut response_headers = HashMap::new();
+    response_headers.insert("content-type".to_string(), "application/json".to_string());
+    response_headers.insert(
+        "Set-Cookie".to_string(),
+        "session=user-A-secret".to_string(),
+    );
+    response_headers.insert(
+        "authorization".to_string(),
+        "Bearer user-A-token".to_string(),
+    );
+    response_headers.insert(
+        "X-Request-Id".to_string(),
+        "request-id-from-user-A".to_string(),
+    );
+    response_headers.insert("x-ai-ratelimit-remaining".to_string(), "999".to_string());
+
+    let _ = plugin
+        .on_final_response_body(&mut ctx1, 200, &response_headers, b"Hello back")
+        .await;
+
+    // Second request from a different consumer (different IP) hits the cache.
+    let mut ctx2 = RequestContext::new(
+        "203.0.113.99".to_string(),
+        "POST".to_string(),
+        "/v1/chat/completions".to_string(),
+    );
+    ctx2.metadata
+        .insert("request_body".to_string(), body_str.clone());
+    let mut headers2 = HashMap::new();
+    headers2.insert("content-type".to_string(), "application/json".to_string());
+
+    let result = plugin.before_proxy(&mut ctx2, &mut headers2).await;
+    match result {
+        PluginResult::RejectBinary { headers, .. } => {
+            assert!(
+                !headers.contains_key("Set-Cookie"),
+                "cache MUST NOT replay Set-Cookie to a different consumer"
+            );
+            assert!(
+                !headers.contains_key("authorization"),
+                "cache MUST NOT replay Authorization to a different consumer"
+            );
+            assert!(
+                !headers.contains_key("X-Request-Id"),
+                "cache MUST NOT replay X-Request-Id to a different consumer"
+            );
+            assert!(
+                !headers.contains_key("x-ai-ratelimit-remaining"),
+                "cache MUST NOT replay rate-limit counters from the original request"
+            );
+            // The cache-status indicator and content-type must still be present.
+            assert_eq!(headers.get("x-ai-cache-status").unwrap(), "HIT");
+            assert_eq!(
+                headers.get("content-type").map(String::as_str),
+                Some("application/json")
+            );
+        }
+        _ => panic!("Expected cache HIT (RejectBinary), got {:?}", result),
+    }
+}

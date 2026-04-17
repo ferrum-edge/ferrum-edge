@@ -86,6 +86,24 @@ impl AiTokenMetrics {
         let cost_per_prompt_token = config["cost_per_prompt_token"].as_f64();
         let cost_per_completion_token = config["cost_per_completion_token"].as_f64();
 
+        // Reject negative or non-finite cost rates — they would produce
+        // nonsensical (negative or NaN/Inf) cost metrics that pollute
+        // observability pipelines and chargeback accounting.
+        if let Some(rate) = cost_per_prompt_token
+            && (rate < 0.0 || !rate.is_finite())
+        {
+            return Err(format!(
+                "ai_token_metrics: 'cost_per_prompt_token' must be a non-negative finite number, got {rate}"
+            ));
+        }
+        if let Some(rate) = cost_per_completion_token
+            && (rate < 0.0 || !rate.is_finite())
+        {
+            return Err(format!(
+                "ai_token_metrics: 'cost_per_completion_token' must be a non-negative finite number, got {rate}"
+            ));
+        }
+
         Ok(Self {
             provider,
             include_model,
@@ -178,7 +196,7 @@ impl AiTokenMetrics {
             .and_then(|u| u.get("total_tokens"))
             .and_then(|v| v.as_u64())
             .or_else(|| match (prompt, completion) {
-                (Some(p), Some(c)) => Some(p + c),
+                (Some(p), Some(c)) => Some(p.saturating_add(c)),
                 _ => None,
             });
         let model = json.get("model").and_then(|v| v.as_str()).map(String::from);
@@ -201,7 +219,7 @@ impl AiTokenMetrics {
             .and_then(|u| u.get("output_tokens"))
             .and_then(|v| v.as_u64());
         let total = match (prompt, completion) {
-            (Some(p), Some(c)) => Some(p + c),
+            (Some(p), Some(c)) => Some(p.saturating_add(c)),
             _ => None,
         };
         let model = json.get("model").and_then(|v| v.as_str()).map(String::from);
@@ -227,7 +245,7 @@ impl AiTokenMetrics {
             .and_then(|u| u.get("totalTokenCount"))
             .and_then(|v| v.as_u64())
             .or_else(|| match (prompt, completion) {
-                (Some(p), Some(c)) => Some(p + c),
+                (Some(p), Some(c)) => Some(p.saturating_add(c)),
                 _ => None,
             });
         let model = json
@@ -253,7 +271,7 @@ impl AiTokenMetrics {
             .and_then(|t| t.get("output_tokens"))
             .and_then(|v| v.as_u64());
         let total = match (prompt, completion) {
-            (Some(p), Some(c)) => Some(p + c),
+            (Some(p), Some(c)) => Some(p.saturating_add(c)),
             _ => None,
         };
         let model = json.get("model").and_then(|v| v.as_str()).map(String::from);
@@ -279,7 +297,7 @@ impl AiTokenMetrics {
             .and_then(|u| u.get("totalTokens"))
             .and_then(|v| v.as_u64())
             .or_else(|| match (prompt, completion) {
-                (Some(p), Some(c)) => Some(p + c),
+                (Some(p), Some(c)) => Some(p.saturating_add(c)),
                 _ => None,
             });
 
@@ -375,7 +393,7 @@ impl AiTokenMetrics {
                         u.prompt_tokens = prev.prompt_tokens;
                     }
                     u.total_tokens = match (u.prompt_tokens, u.completion_tokens) {
-                        (Some(p), Some(c)) => Some(p + c),
+                        (Some(p), Some(c)) => Some(p.saturating_add(c)),
                         _ => None,
                     };
                     final_usage = Some(u);

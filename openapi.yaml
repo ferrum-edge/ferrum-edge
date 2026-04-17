@@ -951,6 +951,9 @@ paths:
                 - ai_request_guard
                 - ai_rate_limiter
                 - ai_prompt_shield
+                - ai_response_guard
+                - ai_semantic_cache
+                - ai_federation
                 - sse
                 - request_mirror
                 - load_testing
@@ -5068,6 +5071,116 @@ components:
           type: integer
           default: 0
           description: Maximum allowed character length of completion content. 0 = no limit
+
+    AiFederationConfig:
+      type: object
+      description: "Plugin: ai_federation — Universal AI gateway. Routes OpenAI Chat Completions-format requests to any of 11 supported AI providers (OpenAI, Anthropic, Google Gemini, Google Vertex AI, Azure OpenAI, AWS Bedrock, Mistral, Cohere, xAI, DeepSeek, Meta Llama, Hugging Face), translating requests to native provider formats and normalizing responses back to OpenAI format. Uses 'terminate and respond' pattern: makes its own outbound HTTP call and bypasses normal proxy dispatch. Supports priority-ordered fallback across providers. NOTE: Outbound calls use the shared PluginHttpClient and only honor global TLS settings (FERRUM_TLS_CA_BUNDLE_PATH, FERRUM_TLS_NO_VERIFY) — per-proxy backend TLS overrides do not apply."
+      required: [providers]
+      properties:
+        providers:
+          type: array
+          minItems: 1
+          description: One or more provider definitions. Tried in priority order (lower number = first).
+          items:
+            type: object
+            required: [name, provider_type]
+            properties:
+              name:
+                type: string
+                description: Unique provider name used in logs and metadata (e.g. ai_federation_provider field).
+              provider_type:
+                type: string
+                enum:
+                  - openai
+                  - anthropic
+                  - google_gemini
+                  - google_vertex
+                  - azure_openai
+                  - aws_bedrock
+                  - mistral
+                  - cohere
+                  - xai
+                  - deepseek
+                  - meta_llama
+                  - hugging_face
+                description: AI provider format / wire protocol.
+              priority:
+                type: integer
+                description: "Lower = tried first. Defaults to provider's index + 1."
+              api_key:
+                type: string
+                description: API key for the provider. Required for all providers except aws_bedrock (uses SigV4) and google_vertex (uses service account JWT).
+              model_patterns:
+                type: array
+                items:
+                  type: string
+                default: []
+                description: "Glob patterns to match the request's `model` field (e.g. ['claude-*', 'gpt-4*']). Empty = catch-all."
+              model_mapping:
+                type: object
+                additionalProperties:
+                  type: string
+                default: {}
+                description: "Map client-facing model names to provider-native names (e.g. {claude-4-sonnet: 'claude-sonnet-4-20250514'})."
+              default_model:
+                type: string
+                description: Model to send to the provider when no mapping matches.
+              connect_timeout_seconds:
+                type: integer
+                default: 5
+                description: TCP + TLS handshake timeout for outbound provider calls.
+              read_timeout_seconds:
+                type: integer
+                default: 60
+                description: Full response read timeout for outbound provider calls.
+              base_url:
+                type: string
+                description: Override the provider's default endpoint URL (for self-hosted models, internal proxies, or pinned regional endpoints).
+              azure_resource:
+                type: string
+                description: "Azure OpenAI resource name (the {resource} in {resource}.openai.azure.com). Required for azure_openai."
+              azure_deployment:
+                type: string
+                description: Azure OpenAI deployment name. Required for azure_openai.
+              azure_api_version:
+                type: string
+                default: "2024-06-01"
+                description: Azure OpenAI api-version query parameter.
+              google_project_id:
+                type: string
+                description: Google Cloud project ID. Required for google_vertex.
+              google_region:
+                type: string
+                description: Google Vertex AI region (e.g. us-central1). Required for google_vertex.
+              google_service_account_json:
+                type: string
+                description: Google service account JSON contents (the file body, not the path). Required for google_vertex; used to mint OAuth2 access tokens via JWT bearer flow.
+              aws_region:
+                type: string
+                description: "AWS region for Bedrock (e.g. us-east-1). Required for aws_bedrock unless AWS_DEFAULT_REGION/AWS_REGION env var is set."
+              aws_access_key_id:
+                type: string
+                description: "AWS access key ID for Bedrock SigV4 signing. Falls back to AWS_ACCESS_KEY_ID env var."
+              aws_secret_access_key:
+                type: string
+                description: "AWS secret access key for Bedrock SigV4 signing. Falls back to AWS_SECRET_ACCESS_KEY env var."
+              aws_session_token:
+                type: string
+                description: "Optional AWS STS session token for temporary credentials. Falls back to AWS_SESSION_TOKEN env var."
+        fallback_enabled:
+          type: boolean
+          default: true
+          description: Try the next provider when one fails (network error or matching status code).
+        fallback_on_status_codes:
+          type: array
+          items:
+            type: integer
+          default: [429, 500, 502, 503]
+          description: HTTP status codes from a provider that trigger fallback to the next provider.
+        fallback_on_network_errors:
+          type: boolean
+          default: true
+          description: Trigger fallback when the provider is unreachable (DNS/TCP/TLS failure).
 
     ApiChargebackConfig:
       type: object

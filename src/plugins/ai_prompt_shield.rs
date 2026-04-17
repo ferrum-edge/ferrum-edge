@@ -59,6 +59,10 @@ enum ScanMode {
 struct PiiPattern {
     name: String,
     regex: Regex,
+    /// Pre-rendered redaction placeholder for this pattern, with `{type}`
+    /// already substituted with `name`. Built once at config-load time so
+    /// `redact_text` does not re-render the template per pattern per call.
+    placeholder: String,
 }
 
 pub struct AiPromptShield {
@@ -69,7 +73,6 @@ pub struct AiPromptShield {
     detection_set: RegexSet,
     scan_mode: ScanMode,
     exclude_roles: HashSet<String>,
-    redaction_template: String,
     max_scan_bytes: usize,
     /// True when action is Redact — enables transform_request_body.
     needs_body_transform: bool,
@@ -149,10 +152,14 @@ impl AiPromptShield {
         for name in &pattern_names {
             if let Some(regex_str) = builtin_pattern(name) {
                 match Regex::new(regex_str) {
-                    Ok(regex) => patterns.push(PiiPattern {
-                        name: name.clone(),
-                        regex,
-                    }),
+                    Ok(regex) => {
+                        let placeholder = redaction_template.replace("{type}", name);
+                        patterns.push(PiiPattern {
+                            name: name.clone(),
+                            regex,
+                            placeholder,
+                        });
+                    }
                     Err(e) => {
                         return Err(format!(
                             "ai_prompt_shield: failed to compile built-in pattern '{}': {}",
@@ -180,7 +187,14 @@ impl AiPromptShield {
                     None => continue,
                 };
                 match Regex::new(regex_str) {
-                    Ok(regex) => patterns.push(PiiPattern { name, regex }),
+                    Ok(regex) => {
+                        let placeholder = redaction_template.replace("{type}", &name);
+                        patterns.push(PiiPattern {
+                            name,
+                            regex,
+                            placeholder,
+                        });
+                    }
                     Err(e) => {
                         return Err(format!(
                             "ai_prompt_shield: failed to compile custom pattern '{}': {}",
@@ -219,7 +233,6 @@ impl AiPromptShield {
             detection_set,
             scan_mode,
             exclude_roles,
-            redaction_template,
             max_scan_bytes,
             needs_body_transform,
             requires_request_body,
@@ -340,13 +353,14 @@ impl AiPromptShield {
     }
 
     /// Replace all PII pattern matches in the text with the redaction placeholder.
+    /// Placeholders are pre-rendered at construction time so each call is one
+    /// `replace_all` per pattern, with no template formatting on the hot path.
     fn redact_text(&self, text: &str) -> String {
         let mut result = text.to_string();
         for pattern in &self.patterns {
-            let placeholder = self.redaction_template.replace("{type}", &pattern.name);
             result = pattern
                 .regex
-                .replace_all(&result, placeholder.as_str())
+                .replace_all(&result, pattern.placeholder.as_str())
                 .to_string();
         }
         result
@@ -520,7 +534,7 @@ impl Plugin for AiPromptShield {
             if has_known_messages {
                 self.redact_body(&mut json);
             }
-            redact_json_strings(&mut json, &self.patterns, &self.redaction_template);
+            redact_json_strings(&mut json, &self.patterns);
             return serde_json::to_vec(&json).ok();
         }
 
@@ -540,15 +554,14 @@ impl Plugin for AiPromptShield {
 /// skipping fields with structural keys (model name, IDs, roles, parameters)
 /// that should never be rewritten even when their values incidentally match
 /// a PII regex.
-fn redact_json_strings(value: &mut Value, patterns: &[PiiPattern], template: &str) {
+fn redact_json_strings(value: &mut Value, patterns: &[PiiPattern]) {
     match value {
         Value::String(s) => {
             let mut result = s.clone();
             for pattern in patterns {
-                let placeholder = template.replace("{type}", &pattern.name);
                 result = pattern
                     .regex
-                    .replace_all(&result, placeholder.as_str())
+                    .replace_all(&result, pattern.placeholder.as_str())
                     .to_string();
             }
             if result != *s {
@@ -557,7 +570,7 @@ fn redact_json_strings(value: &mut Value, patterns: &[PiiPattern], template: &st
         }
         Value::Array(arr) => {
             for item in arr.iter_mut() {
-                redact_json_strings(item, patterns, template);
+                redact_json_strings(item, patterns);
             }
         }
         Value::Object(map) => {
@@ -565,7 +578,7 @@ fn redact_json_strings(value: &mut Value, patterns: &[PiiPattern], template: &st
                 if STRUCTURAL_KEYS.contains(&k.as_str()) {
                     continue;
                 }
-                redact_json_strings(val, patterns, template);
+                redact_json_strings(val, patterns);
             }
         }
         _ => {}

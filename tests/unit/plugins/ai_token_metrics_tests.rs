@@ -517,3 +517,53 @@ async fn test_processes_2xx_responses() {
         .await;
     assert_eq!(ctx.metadata.get("ai_total_tokens").unwrap(), "30");
 }
+
+// ─── Cost validation ────────────────────────────────────────────────────
+
+#[test]
+fn test_negative_prompt_cost_rejected() {
+    // Negative cost rates would produce negative cost metrics that pollute
+    // observability and chargeback pipelines.
+    let err = AiTokenMetrics::new(&json!({"cost_per_prompt_token": -0.0001}))
+        .err()
+        .unwrap();
+    assert!(err.contains("cost_per_prompt_token"), "got: {err}");
+    assert!(err.contains("non-negative"), "got: {err}");
+}
+
+#[test]
+fn test_negative_completion_cost_rejected() {
+    let err = AiTokenMetrics::new(&json!({"cost_per_completion_token": -0.001}))
+        .err()
+        .unwrap();
+    assert!(err.contains("cost_per_completion_token"), "got: {err}");
+    assert!(err.contains("non-negative"), "got: {err}");
+}
+
+#[test]
+fn test_nan_cost_handled_safely() {
+    // The serde_json::json!() macro coerces non-finite f64 values to
+    // Value::Null, so a NaN/Inf field is the same as omitting the field.
+    // Verify the constructor accepts that path (treats it as "no cost
+    // tracking") rather than panicking on `.as_f64()`.
+    assert!(
+        AiTokenMetrics::new(&json!({"cost_per_prompt_token": f64::NAN})).is_ok(),
+        "NaN serializes to JSON null and should be treated as 'unset'"
+    );
+    assert!(
+        AiTokenMetrics::new(&json!({"cost_per_completion_token": f64::INFINITY})).is_ok(),
+        "Infinity serializes to JSON null and should be treated as 'unset'"
+    );
+}
+
+#[test]
+fn test_zero_cost_accepted() {
+    // Zero is a valid cost rate (e.g., free-tier accounting).
+    assert!(
+        AiTokenMetrics::new(&json!({
+            "cost_per_prompt_token": 0.0,
+            "cost_per_completion_token": 0.0
+        }))
+        .is_ok()
+    );
+}
