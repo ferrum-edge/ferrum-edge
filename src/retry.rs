@@ -312,6 +312,12 @@ pub fn classify_body_error(e: &(dyn std::error::Error + 'static)) -> (ErrorClass
     // downcasts (e.g. reqwest::Error wrapped in Box<dyn Error>).
     let error_str = format!("{}", e);
     let debug_str = format!("{:?}", e);
+    // Policy-enforced truncation from SizeLimitedStreamingResponse — classify
+    // explicitly so dashboards can distinguish response size-limit enforcement
+    // from generic backend/body errors.
+    if error_str.contains("response body exceeds maximum size") {
+        return (ErrorClass::ResponseBodyTooLarge, false);
+    }
     if error_str.contains("broken pipe")
         || debug_str.contains("BrokenPipe")
         || error_str.contains("connection reset")

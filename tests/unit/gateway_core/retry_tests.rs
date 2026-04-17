@@ -563,6 +563,18 @@ fn test_classify_body_error_string_fallback_protocol_error() {
 }
 
 #[test]
+fn test_classify_body_error_response_size_limit_is_explicit() {
+    // SizeLimitedStreamingResponse emits this literal message when the backend
+    // exceeds max_response_body_size_bytes mid-stream. Must classify as
+    // ResponseBodyTooLarge, not the generic RequestError fallback, so
+    // policy-enforced truncations are distinguishable in metrics.
+    let err: Box<dyn std::error::Error + Send + Sync> = "response body exceeds maximum size".into();
+    let (class, disconnected) = classify_body_error(&*err);
+    assert_eq!(class, ErrorClass::ResponseBodyTooLarge);
+    assert!(!disconnected);
+}
+
+#[test]
 fn test_classify_body_error_walks_source_chain_to_io_error() {
     // Wrap an io::Error in a custom error with a `source()` chain — the
     // classifier should walk the chain and find the BrokenPipe underneath.
