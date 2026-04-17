@@ -439,6 +439,7 @@ async fn test_http3_proxy_state_creation() {
             0,     // so_busy_poll_us
             false, // udp_gro_enabled (use false in tests to avoid Linux-specific failures)
             false, // udp_gso_enabled
+            false, // udp_pktinfo_enabled
         ),
     );
     let dns_cache_for_sd = dns_cache.clone();
@@ -654,6 +655,7 @@ async fn test_http3_full_integration() {
             0,     // so_busy_poll_us
             false, // udp_gro_enabled (use false in tests to avoid Linux-specific failures)
             false, // udp_gso_enabled
+            false, // udp_pktinfo_enabled
         ),
     );
     let dns_cache_for_sd = dns_cache.clone();

@@ -49,7 +49,7 @@ fn push_different_size_datagram_returns_false_without_touching_buffer() {
     assert!(!buf.push(&[9u8; 40]));
     // Buffer must still hold the original 2 datagrams; prove it by draining.
     let mut sendmmsg = SendMmsgBatch::new(8);
-    let drained = buf.drain_to_sendmmsg(&mut sendmmsg, dest());
+    let drained = buf.drain_to_sendmmsg(&mut sendmmsg, dest(), None);
     assert_eq!(drained, 2, "mismatched push must not corrupt prior state");
     assert!(buf.is_empty());
 }
@@ -63,7 +63,7 @@ fn push_over_max_bytes_returns_false_without_touching_buffer() {
     assert!(buf.push(&[2u8; 50]));
     assert!(!buf.push(&[3u8; 50]), "push over max_bytes must refuse");
     let mut sendmmsg = SendMmsgBatch::new(8);
-    let drained = buf.drain_to_sendmmsg(&mut sendmmsg, dest());
+    let drained = buf.drain_to_sendmmsg(&mut sendmmsg, dest(), None);
     assert_eq!(drained, 2);
 }
 
@@ -84,7 +84,7 @@ fn drain_to_sendmmsg_splits_contiguous_buffer_by_segment_size() {
         assert!(buf.push(&[0xaa; 32]));
     }
     let mut sendmmsg = SendMmsgBatch::new(16);
-    let drained = buf.drain_to_sendmmsg(&mut sendmmsg, dest());
+    let drained = buf.drain_to_sendmmsg(&mut sendmmsg, dest(), None);
     assert_eq!(
         drained, 5,
         "5 pushed datagrams must drain to 5 sendmmsg slots"
@@ -172,7 +172,7 @@ fn drain_to_sendmmsg_partial_drain_leaves_residual() {
         assert!(buf.push(&[0xbb; 32]));
     }
     let mut sendmmsg = SendMmsgBatch::new(2);
-    let drained = buf.drain_to_sendmmsg(&mut sendmmsg, dest());
+    let drained = buf.drain_to_sendmmsg(&mut sendmmsg, dest(), None);
     assert_eq!(
         drained, 2,
         "sendmmsg capacity 2 must cause drain to stop after 2 pushes"
@@ -185,7 +185,7 @@ fn drain_to_sendmmsg_partial_drain_leaves_residual() {
     // The second drain (after flushing sendmmsg) should pick up where we left off.
     // Since we aren't flushing a real socket, just reuse a fresh sendmmsg.
     let mut sendmmsg2 = SendMmsgBatch::new(16);
-    let drained2 = buf.drain_to_sendmmsg(&mut sendmmsg2, dest());
+    let drained2 = buf.drain_to_sendmmsg(&mut sendmmsg2, dest(), None);
     assert_eq!(
         drained2, 3,
         "second drain must consume the 3 remaining datagrams"

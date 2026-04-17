@@ -763,6 +763,19 @@ impl ProxyState {
                 }
                 v
             },
+            {
+                let v = env_config_arc
+                    .udp_pktinfo_enabled
+                    .resolve(crate::socket_opts::is_udp_pktinfo_available);
+                if v {
+                    tracing::info!(
+                        "UDP IP_PKTINFO auto-detection: enabled (setsockopt probe passed)"
+                    );
+                } else {
+                    tracing::info!(config = %env_config_arc.udp_pktinfo_enabled, "UDP IP_PKTINFO auto-detection: disabled");
+                }
+                v
+            },
         ));
 
         Ok(Self {

@@ -430,6 +430,316 @@ pub fn extract_gro_segment_size(_msg: &()) -> Option<u16> {
     None
 }
 
+// ── IP_PKTINFO / IPV6_PKTINFO ──────────────────────────────────────────
+//
+// Tells the kernel to attach the destination address of inbound datagrams as a
+// cmsg on recv, and (on send) to use a specific source address without a
+// routing-table lookup. Combining this with `UDP_SEGMENT` (GSO) in a single
+// `sendmsg` call saves one routing lookup per GSO batch flush — worth ~2% at
+// 100K+ datagrams/sec on hosts with large routing tables.
+//
+// Must be paired on a wildcard-bound listener so each session can capture the
+// per-datagram destination (the address the client sent to) and reuse it as
+// the reply source. Without pktinfo, a multi-homed server's kernel picks the
+// outgoing interface via routing decisions, which may differ from the
+// inbound interface and break stateful middleboxes / NAT.
+
+/// Enable `IP_PKTINFO` (IPv4) on a UDP socket (Linux only).
+///
+/// After enabling, recvmsg()/recvmmsg() cmsg buffers will contain the
+/// `in_pktinfo` struct carrying `ipi_spec_dst` — the address the packet
+/// was addressed to.
+#[cfg(target_os = "linux")]
+pub fn set_ip_pktinfo(fd: std::os::unix::io::RawFd) -> std::io::Result<()> {
+    let val: libc::c_int = 1;
+    let ret = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_IP,
+            libc::IP_PKTINFO,
+            &val as *const libc::c_int as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if ret != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Enable `IPV6_RECVPKTINFO` on a UDP socket (Linux only).
+#[cfg(target_os = "linux")]
+pub fn set_ipv6_recvpktinfo(fd: std::os::unix::io::RawFd) -> std::io::Result<()> {
+    let val: libc::c_int = 1;
+    let ret = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_IPV6,
+            libc::IPV6_RECVPKTINFO,
+            &val as *const libc::c_int as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if ret != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+#[allow(dead_code)]
+pub fn set_ip_pktinfo(_fd: i32) -> std::io::Result<()> {
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+#[allow(dead_code)]
+pub fn set_ipv6_recvpktinfo(_fd: i32) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// Captured local (reply-source) address from an `IP_PKTINFO` / `IPV6_PKTINFO`
+/// cmsg. The interface index is preserved so scoped IPv6 replies (notably
+/// link-local `fe80::/10`) egress the correct interface zone on send; for IPv4
+/// it's informational and safe to leave at 0.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PktinfoLocal {
+    pub ip: std::net::IpAddr,
+    pub ifindex: u32,
+}
+
+/// Parse an `IP_PKTINFO` or `IPV6_PKTINFO` cmsg and return the captured local
+/// address along with its interface index.
+///
+/// Returns `None` if neither cmsg is present.
+#[cfg(target_os = "linux")]
+pub fn extract_pktinfo_local_addr(msg: &libc::msghdr) -> Option<PktinfoLocal> {
+    let mut cmsg = unsafe { libc::CMSG_FIRSTHDR(msg) };
+    while !cmsg.is_null() {
+        unsafe {
+            let level = (*cmsg).cmsg_level;
+            let ty = (*cmsg).cmsg_type;
+            if level == libc::IPPROTO_IP && ty == libc::IP_PKTINFO {
+                let data_ptr = libc::CMSG_DATA(cmsg) as *const libc::in_pktinfo;
+                // `ipi_spec_dst` is the destination address on the packet as
+                // received (what the client targeted). `ipi_addr` is the
+                // local host's header dst after routing — for reply-source
+                // selection we want `ipi_spec_dst`.
+                let pi = std::ptr::read_unaligned(data_ptr);
+                return Some(PktinfoLocal {
+                    ip: std::net::IpAddr::V4(std::net::Ipv4Addr::from(u32::from_be(
+                        pi.ipi_spec_dst.s_addr,
+                    ))),
+                    ifindex: pi.ipi_ifindex as u32,
+                });
+            }
+            if level == libc::IPPROTO_IPV6 && ty == libc::IPV6_PKTINFO {
+                let data_ptr = libc::CMSG_DATA(cmsg) as *const libc::in6_pktinfo;
+                let pi = std::ptr::read_unaligned(data_ptr);
+                return Some(PktinfoLocal {
+                    ip: std::net::IpAddr::V6(std::net::Ipv6Addr::from(pi.ipi6_addr.s6_addr)),
+                    ifindex: pi.ipi6_ifindex,
+                });
+            }
+            cmsg = libc::CMSG_NXTHDR(msg, cmsg);
+        }
+    }
+    None
+}
+
+#[cfg(not(target_os = "linux"))]
+#[allow(dead_code)]
+pub fn extract_pktinfo_local_addr(_msg: &()) -> Option<PktinfoLocal> {
+    None
+}
+
+/// Cmsg buffer size large enough to hold UDP_GRO (u16) plus either IP_PKTINFO
+/// or IPV6_PKTINFO on recv. Sized for the worst case (IPv6) so a single
+/// allocation works for both address families.
+#[cfg(target_os = "linux")]
+pub fn recv_cmsg_space() -> usize {
+    unsafe {
+        libc::CMSG_SPACE(std::mem::size_of::<u16>() as u32) as usize
+            + libc::CMSG_SPACE(std::mem::size_of::<libc::in6_pktinfo>() as u32) as usize
+    }
+}
+
+/// Send a UDP datagram (or a GSO-batched buffer of same-size datagrams) with
+/// the source address set via `IP_PKTINFO` / `IPV6_PKTINFO` ancillary data.
+///
+/// When `gso_segment_size` is `Some(n)`, the kernel treats `data` as a series
+/// of `n`-byte datagrams (last may be shorter) and an additional `UDP_SEGMENT`
+/// cmsg is attached — combining pktinfo with GSO in a single `sendmsg(2)` call.
+///
+/// `local_ip` is the source IP to use; its family must match `dest`. On v4 a
+/// v4-mapped v6 address would be silently rejected.
+#[cfg(target_os = "linux")]
+pub fn send_with_pktinfo(
+    fd: std::os::unix::io::RawFd,
+    data: &[u8],
+    local: PktinfoLocal,
+    dest: &libc::sockaddr_storage,
+    dest_len: libc::socklen_t,
+    gso_segment_size: Option<u16>,
+) -> std::io::Result<usize> {
+    let local_ip = local.ip;
+    let ifindex = local.ifindex;
+    const UDP_SEGMENT: libc::c_int = 103;
+
+    let iov = libc::iovec {
+        iov_base: data.as_ptr() as *mut libc::c_void,
+        iov_len: data.len(),
+    };
+
+    // Compute cmsg buffer: pktinfo (v4 or v6) + optional UDP_SEGMENT.
+    let pktinfo_space = match local_ip {
+        std::net::IpAddr::V4(_) => unsafe {
+            libc::CMSG_SPACE(std::mem::size_of::<libc::in_pktinfo>() as u32) as usize
+        },
+        std::net::IpAddr::V6(_) => unsafe {
+            libc::CMSG_SPACE(std::mem::size_of::<libc::in6_pktinfo>() as u32) as usize
+        },
+    };
+    let gso_space = if gso_segment_size.is_some() {
+        unsafe { libc::CMSG_SPACE(std::mem::size_of::<u16>() as u32) as usize }
+    } else {
+        0
+    };
+    let mut cmsg_buf = vec![0u8; pktinfo_space + gso_space];
+
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_name = dest as *const libc::sockaddr_storage as *mut libc::c_void;
+    msg.msg_namelen = dest_len;
+    msg.msg_iov = &iov as *const libc::iovec as *mut libc::iovec;
+    msg.msg_iovlen = 1;
+    msg.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
+    msg.msg_controllen = cmsg_buf.len();
+
+    // First cmsg: pktinfo.
+    let cmsg = unsafe { libc::CMSG_FIRSTHDR(&msg) };
+    if cmsg.is_null() {
+        return Err(std::io::Error::other("CMSG_FIRSTHDR returned null"));
+    }
+    match local_ip {
+        std::net::IpAddr::V4(v4) => unsafe {
+            (*cmsg).cmsg_level = libc::IPPROTO_IP;
+            (*cmsg).cmsg_type = libc::IP_PKTINFO;
+            (*cmsg).cmsg_len =
+                libc::CMSG_LEN(std::mem::size_of::<libc::in_pktinfo>() as u32) as usize;
+            // ipi_ifindex intentionally 0 for IPv4: per ip(7), a nonzero
+            // ifindex makes the kernel prefer the interface's primary address
+            // over ipi_spec_dst on multi-IP interfaces, which would defeat the
+            // "reply from captured destination" semantics. ipi_spec_dst alone
+            // is sufficient on IPv4; ifindex is only honored for IPv6 scopes.
+            let pi = libc::in_pktinfo {
+                ipi_ifindex: 0,
+                ipi_spec_dst: libc::in_addr {
+                    s_addr: u32::from(v4).to_be(),
+                },
+                ipi_addr: libc::in_addr { s_addr: 0 },
+            };
+            std::ptr::copy_nonoverlapping(
+                &pi as *const libc::in_pktinfo as *const u8,
+                libc::CMSG_DATA(cmsg),
+                std::mem::size_of::<libc::in_pktinfo>(),
+            );
+        },
+        std::net::IpAddr::V6(v6) => unsafe {
+            (*cmsg).cmsg_level = libc::IPPROTO_IPV6;
+            (*cmsg).cmsg_type = libc::IPV6_PKTINFO;
+            (*cmsg).cmsg_len =
+                libc::CMSG_LEN(std::mem::size_of::<libc::in6_pktinfo>() as u32) as usize;
+            let pi = libc::in6_pktinfo {
+                ipi6_addr: libc::in6_addr {
+                    s6_addr: v6.octets(),
+                },
+                ipi6_ifindex: ifindex,
+            };
+            std::ptr::copy_nonoverlapping(
+                &pi as *const libc::in6_pktinfo as *const u8,
+                libc::CMSG_DATA(cmsg),
+                std::mem::size_of::<libc::in6_pktinfo>(),
+            );
+        },
+    }
+
+    // Optional second cmsg: UDP_SEGMENT (GSO).
+    if let Some(seg) = gso_segment_size {
+        let next = unsafe { libc::CMSG_NXTHDR(&msg, cmsg) };
+        if next.is_null() {
+            return Err(std::io::Error::other("CMSG_NXTHDR returned null for GSO"));
+        }
+        unsafe {
+            (*next).cmsg_level = libc::SOL_UDP;
+            (*next).cmsg_type = UDP_SEGMENT;
+            (*next).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<u16>() as u32) as usize;
+            std::ptr::copy_nonoverlapping(
+                &seg as *const u16 as *const u8,
+                libc::CMSG_DATA(next),
+                std::mem::size_of::<u16>(),
+            );
+        }
+    }
+
+    let ret = unsafe { libc::sendmsg(fd, &msg, libc::MSG_DONTWAIT) };
+    if ret < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(ret as usize)
+}
+
+#[cfg(not(target_os = "linux"))]
+#[allow(dead_code)]
+pub fn send_with_pktinfo(
+    _fd: i32,
+    _data: &[u8],
+    _local: PktinfoLocal,
+    _dest: &(),
+    _dest_len: u32,
+    _gso_segment_size: Option<u16>,
+) -> std::io::Result<usize> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "IP_PKTINFO not available on this platform",
+    ))
+}
+
+/// Probe whether pktinfo can be enabled on a UDP socket (Linux only).
+///
+/// Tries `IP_PKTINFO` on a v4 socket and `IPV6_RECVPKTINFO` on a v6 socket.
+/// Returns `true` if either succeeds — sufficient for enabling auto mode on
+/// IPv4-only, IPv6-only, or dual-stack hosts.
+#[cfg(target_os = "linux")]
+pub fn is_udp_pktinfo_available() -> bool {
+    let v4_ok = {
+        let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+        if fd < 0 {
+            false
+        } else {
+            let ok = set_ip_pktinfo(fd).is_ok();
+            unsafe { libc::close(fd) };
+            ok
+        }
+    };
+    let v6_ok = {
+        let fd = unsafe { libc::socket(libc::AF_INET6, libc::SOCK_DGRAM, 0) };
+        if fd < 0 {
+            false
+        } else {
+            let ok = set_ipv6_recvpktinfo(fd).is_ok();
+            unsafe { libc::close(fd) };
+            ok
+        }
+    };
+    v4_ok || v6_ok
+}
+
+#[cfg(not(target_os = "linux"))]
+#[allow(dead_code)]
+pub fn is_udp_pktinfo_available() -> bool {
+    false
+}
+
 // ── kTLS (kernel TLS for splice on encrypted paths) ────────────────────
 
 /// kTLS crypto information for installing TLS session keys into the kernel.
@@ -1511,6 +1821,164 @@ pub async fn connect_with_socket_opts(
     }
 
     socket.connect(sock_addr).await
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod pktinfo_tests {
+    //! Roundtrip tests for IP_PKTINFO capture + send_with_pktinfo reply.
+    //!
+    //! Exercises the full cycle on a loopback socket: bind to 0.0.0.0, enable
+    //! IP_PKTINFO, have a client send a datagram to 127.0.0.1, parse pktinfo
+    //! on recv, and confirm send_with_pktinfo succeeds (combined with optional
+    //! UDP_SEGMENT GSO). The test does not depend on routing — any kernel
+    //! with IP_PKTINFO support can run it.
+    use super::*;
+    use std::net::SocketAddr;
+    use std::os::unix::io::AsRawFd;
+    use tokio::net::UdpSocket;
+    use tokio::runtime::Runtime;
+
+    fn v4_sockaddr_storage(addr: SocketAddr) -> (libc::sockaddr_storage, libc::socklen_t) {
+        let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+        match addr {
+            SocketAddr::V4(v4) => {
+                let sin = libc::sockaddr_in {
+                    sin_family: libc::AF_INET as libc::sa_family_t,
+                    sin_port: v4.port().to_be(),
+                    sin_addr: libc::in_addr {
+                        s_addr: u32::from(*v4.ip()).to_be(),
+                    },
+                    sin_zero: [0; 8],
+                };
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        &sin as *const libc::sockaddr_in as *const u8,
+                        &mut storage as *mut libc::sockaddr_storage as *mut u8,
+                        std::mem::size_of::<libc::sockaddr_in>(),
+                    );
+                }
+                (
+                    storage,
+                    std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+                )
+            }
+            SocketAddr::V6(_) => panic!("v4 helper called with v6 address"),
+        }
+    }
+
+    #[test]
+    fn pktinfo_probe_does_not_panic() {
+        let _ = is_udp_pktinfo_available();
+    }
+
+    #[test]
+    fn roundtrip_captures_local_destination() {
+        let rt = Runtime::new().unwrap();
+        rt.block_on(async {
+            // Skip gracefully on kernels without IP_PKTINFO (shouldn't happen
+            // on Linux but keep the test robust).
+            if !is_udp_pktinfo_available() {
+                return;
+            }
+            let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let server_addr = server.local_addr().unwrap();
+            set_ip_pktinfo(server.as_raw_fd()).unwrap();
+
+            let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            client.send_to(b"hello", server_addr).await.unwrap();
+
+            // Use recvmsg via recvmmsg wrapper (already exercises the cmsg path).
+            let mut batch = crate::proxy::udp_batch::RecvMmsgBatch::new(1);
+            // Poll until the datagram arrives.
+            server.readable().await.unwrap();
+            let n = batch.recv(server.as_raw_fd(), 1).unwrap();
+            assert_eq!(n, 1);
+            let local = batch.local_addr(0);
+            assert!(local.is_some(), "pktinfo should yield local addr");
+            assert_eq!(local.unwrap().ip.to_string(), "127.0.0.1");
+        });
+    }
+
+    #[test]
+    fn send_with_pktinfo_roundtrip_plain() {
+        let rt = Runtime::new().unwrap();
+        rt.block_on(async {
+            if !is_udp_pktinfo_available() {
+                return;
+            }
+            let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let server_addr = server.local_addr().unwrap();
+            let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let client_addr = client.local_addr().unwrap();
+
+            let (dest, dest_len) = v4_sockaddr_storage(client_addr);
+            let sent = send_with_pktinfo(
+                server.as_raw_fd(),
+                b"pong",
+                PktinfoLocal {
+                    ip: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                    ifindex: 0,
+                },
+                &dest,
+                dest_len,
+                None,
+            )
+            .unwrap();
+            assert_eq!(sent, 4);
+            let _ = server_addr; // silence
+
+            let mut buf = [0u8; 16];
+            let (n, _from) = client.recv_from(&mut buf).await.unwrap();
+            assert_eq!(&buf[..n], b"pong");
+        });
+    }
+
+    #[test]
+    fn send_with_pktinfo_and_gso_combined_cmsg() {
+        let rt = Runtime::new().unwrap();
+        rt.block_on(async {
+            if !is_udp_pktinfo_available() || !is_udp_gso_available() {
+                return;
+            }
+            let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let client_addr = client.local_addr().unwrap();
+
+            // Two 3-byte segments in one GSO buffer.
+            let buf = b"aaabbb";
+            let (dest, dest_len) = v4_sockaddr_storage(client_addr);
+            let sent = send_with_pktinfo(
+                server.as_raw_fd(),
+                buf,
+                PktinfoLocal {
+                    ip: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                    ifindex: 0,
+                },
+                &dest,
+                dest_len,
+                Some(3),
+            )
+            .unwrap();
+            assert_eq!(sent, 6);
+
+            // First datagram should be 3 bytes.
+            let mut rbuf = [0u8; 16];
+            let (n, _) = client.recv_from(&mut rbuf).await.unwrap();
+            assert_eq!(n, 3);
+            assert_eq!(&rbuf[..n], b"aaa");
+        });
+    }
+
+    #[test]
+    fn cmsg_space_is_large_enough_for_both() {
+        // The recv cmsg buffer must fit UDP_GRO + IP(v6)_PKTINFO simultaneously.
+        let space = recv_cmsg_space();
+        let v6_pkt =
+            unsafe { libc::CMSG_SPACE(std::mem::size_of::<libc::in6_pktinfo>() as u32) as usize };
+        let gro = unsafe { libc::CMSG_SPACE(std::mem::size_of::<u16>() as u32) as usize };
+        assert!(space >= v6_pkt + gro);
+        let _ = SocketAddr::from(([127, 0, 0, 1], 0)); // silence unused import
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]

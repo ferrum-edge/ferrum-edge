@@ -839,6 +839,13 @@ pub struct EnvConfig {
     /// Values: `auto` (probe sendmsg with UDP_SEGMENT on temp socket), `true`, `false`.
     /// Default: `auto`.
     pub udp_gso_enabled: AutoBool,
+    /// Enable IP_PKTINFO / IPV6_PKTINFO on frontend UDP sockets (Linux only).
+    /// Captures the per-datagram local destination address on recv and reuses
+    /// it as the reply source on send, so the kernel skips the routing-table
+    /// lookup. Complements UDP_SEGMENT (GSO) — both cmsgs ride in one sendmsg.
+    /// Values: `auto` (probe setsockopt on temp socket), `true`, `false`.
+    /// Default: `auto`.
+    pub udp_pktinfo_enabled: AutoBool,
     /// SO_BUSY_POLL duration in microseconds for latency-sensitive UDP sockets (Linux 3.11+).
     /// When > 0, the kernel spins for this many microseconds waiting for incoming data
     /// before sleeping. Reduces receive latency at the cost of CPU. 0 = disabled. Default: 0.
@@ -1030,6 +1037,7 @@ impl Default for EnvConfig {
             io_uring_splice_enabled: AutoBool::Auto,
             udp_gro_enabled: AutoBool::Auto,
             udp_gso_enabled: AutoBool::Auto,
+            udp_pktinfo_enabled: AutoBool::Auto,
             so_busy_poll_us: 0,
         }
     }
@@ -1646,6 +1654,11 @@ impl EnvConfig {
             ),
             udp_gro_enabled: resolve_auto_bool(conf, "FERRUM_UDP_GRO_ENABLED", AutoBool::Auto),
             udp_gso_enabled: resolve_auto_bool(conf, "FERRUM_UDP_GSO_ENABLED", AutoBool::Auto),
+            udp_pktinfo_enabled: resolve_auto_bool(
+                conf,
+                "FERRUM_UDP_PKTINFO_ENABLED",
+                AutoBool::Auto,
+            ),
             so_busy_poll_us: resolve_var(conf, "FERRUM_SO_BUSY_POLL_US")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0),
