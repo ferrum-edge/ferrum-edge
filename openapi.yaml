@@ -4945,7 +4945,12 @@ components:
         ttl_seconds:
           type: integer
           default: 300
+          minimum: 1
           description: Time-to-live in seconds for cached responses
+        inflight_ttl_seconds:
+          type: integer
+          minimum: 1
+          description: "How long an in-flight marker remains valid before being treated as stale and replaced by a fresh request. Must be set at or above the longest backend request that should be protected from concurrent duplicate execution — if set too low, a slow legitimate request still running past this TTL can have a duplicate retry bypass the in-flight lock and re-execute side-effecting operations. Defaults to ttl_seconds."
         max_entries:
           type: integer
           default: 10000

@@ -1688,6 +1688,7 @@ Prevents duplicate API calls by tracking idempotency keys. When a request arrive
 |---|---|---|---|
 | `header_name` | String | `"Idempotency-Key"` | Header name to read the idempotency key from (case-insensitive) |
 | `ttl_seconds` | u64 | `300` | Time-to-live for cached responses (must be > 0) |
+| `inflight_ttl_seconds` | u64 | `ttl_seconds` | How long an in-flight marker remains valid before being treated as stale and replaced by a fresh request (must be > 0). Set at or above the longest backend request that should be protected from concurrent duplicate execution — if set too low, a slow legitimate request still running past this TTL can have a duplicate retry bypass the in-flight lock and re-execute side-effecting operations. Defaults to `ttl_seconds` |
 | `max_entries` | u64 | `10000` | Maximum number of cached entries (local mode) |
 | `applicable_methods` | String[] | `["POST", "PUT", "PATCH"]` | HTTP methods to apply deduplication to |
 | `scope_by_consumer` | bool | `true` | Scope keys by authenticated consumer identity |
@@ -1705,6 +1706,7 @@ Prevents duplicate API calls by tracking idempotency keys. When a request arrive
 **Behavior:**
 - On cache hit: returns the cached response with `X-Idempotent-Replayed: true` header
 - Concurrent duplicates: returns `409 Conflict` when a request with the same key is already in-flight
+- Stale in-flight markers (request died after `before_proxy` but before `on_final_response_body` — e.g., backend timeout, downstream plugin reject, dropped connection) are treated as fresh after `inflight_ttl_seconds` so duplicates aren't blocked indefinitely. Tune `inflight_ttl_seconds` to cover your longest legitimate backend request; setting it too low risks duplicate side-effecting executions for slow-but-alive requests
 - GET/HEAD/OPTIONS/DELETE requests are ignored unless explicitly added to `applicable_methods`
 - `scope_by_consumer: true` isolates keys per authenticated identity so different consumers can use the same idempotency key independently
 

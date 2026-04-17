@@ -52,16 +52,18 @@ enum DeduplicationEntry {
     Completed(CachedResponse),
 }
 
-/// How long an `InFlight` marker remains valid before being treated as stale
-/// and replaced by a new request. This caps the duration that a duplicate
-/// request will receive 409 Conflict when the original request has died.
-const INFLIGHT_TTL: Duration = Duration::from_secs(60);
-
 pub struct RequestDeduplication {
     /// Header name to read the idempotency key from.
     header_name: String,
     /// Time-to-live for cached responses.
     ttl: Duration,
+    /// How long an `InFlight` marker remains valid before being treated as
+    /// stale and replaced by a new request. Must be set at or above the
+    /// longest backend request that should be protected from concurrent
+    /// duplicate execution; set too low, slow legitimate requests could have
+    /// duplicate retries bypass the in-flight lock and re-execute side-effecting
+    /// operations. Defaults to `ttl_seconds`.
+    inflight_ttl: Duration,
     /// Maximum number of cached entries (local mode).
     max_entries: usize,
     /// HTTP methods to apply deduplication to.
@@ -90,6 +92,16 @@ impl RequestDeduplication {
             return Err("request_deduplication: ttl_seconds must be greater than 0".to_string());
         }
         let ttl = Duration::from_secs(ttl_seconds);
+
+        let inflight_ttl_seconds = config["inflight_ttl_seconds"]
+            .as_u64()
+            .unwrap_or(ttl_seconds);
+        if inflight_ttl_seconds == 0 {
+            return Err(
+                "request_deduplication: inflight_ttl_seconds must be greater than 0".to_string(),
+            );
+        }
+        let inflight_ttl = Duration::from_secs(inflight_ttl_seconds);
 
         let max_entries = config["max_entries"].as_u64().unwrap_or(10_000) as usize;
 
@@ -127,6 +139,7 @@ impl RequestDeduplication {
         Ok(Self {
             header_name,
             ttl,
+            inflight_ttl,
             max_entries,
             applicable_methods,
             scope_by_consumer,
@@ -233,13 +246,13 @@ impl RequestDeduplication {
             DeduplicationEntry::Completed(cached) => {
                 now.duration_since(cached.inserted_at) < self.ttl
             }
-            // Drop in-flight markers that have exceeded INFLIGHT_TTL — the
+            // Drop in-flight markers that have exceeded inflight_ttl — the
             // originating request must have died (timeout, downstream reject,
             // connection drop) without ever reaching `on_final_response_body`.
             // Without this, duplicate requests would receive 409 Conflict
             // forever (until LRU max-entries eviction).
             DeduplicationEntry::InFlight { started_at } => {
-                now.duration_since(*started_at) < INFLIGHT_TTL
+                now.duration_since(*started_at) < self.inflight_ttl
             }
         });
 
@@ -375,14 +388,14 @@ impl Plugin for RequestDeduplication {
                     self.local_cache.remove(&key);
                 }
                 DeduplicationEntry::InFlight { started_at } => {
-                    // If the in-flight marker has exceeded INFLIGHT_TTL, the
+                    // If the in-flight marker has exceeded inflight_ttl, the
                     // original request must have died without ever reaching
                     // on_final_response_body. Treat as a fresh request and
                     // replace the marker rather than blocking forever.
-                    if now.duration_since(*started_at) >= INFLIGHT_TTL {
+                    if now.duration_since(*started_at) >= self.inflight_ttl {
                         debug!(
                             "request_deduplication: stale in-flight marker for key '{}' (age >= {:?}), treating as fresh request",
-                            idempotency_value, INFLIGHT_TTL
+                            idempotency_value, self.inflight_ttl
                         );
                         drop(entry);
                         // Fall through to insert new InFlight marker below

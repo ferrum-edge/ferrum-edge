@@ -36,6 +36,26 @@ fn test_new_zero_ttl_fails() {
 }
 
 #[test]
+fn test_new_zero_inflight_ttl_fails() {
+    let config = json!({
+        "inflight_ttl_seconds": 0
+    });
+    let result = RequestDeduplication::new(&config, PluginHttpClient::default());
+    assert!(result.is_err());
+    assert!(result.err().unwrap().contains("inflight_ttl_seconds"));
+}
+
+#[test]
+fn test_new_custom_inflight_ttl() {
+    let config = json!({
+        "ttl_seconds": 300,
+        "inflight_ttl_seconds": 1800
+    });
+    let plugin = make_plugin(config);
+    assert_eq!(plugin.name(), "request_deduplication");
+}
+
+#[test]
 fn test_new_empty_methods_fails() {
     let config = json!({
         "applicable_methods": []
