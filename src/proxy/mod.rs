@@ -6253,7 +6253,8 @@ async fn proxy_to_backend_retry(
             | "trailer"
             | "proxy-authorization"
             | "proxy-connection"
-            | "upgrade" => continue,
+            | "upgrade"
+            | "x-ferrum-original-content-encoding" => continue,
             _ => {
                 req_builder = req_builder.header(k.as_str(), v.as_str());
             }
@@ -6611,7 +6612,8 @@ async fn proxy_to_backend(
             | "trailer"
             | "proxy-authorization"
             | "proxy-connection"
-            | "upgrade" => continue,
+            | "upgrade"
+            | "x-ferrum-original-content-encoding" => continue,
             _ => {
                 req_builder = req_builder.header(k.as_str(), v.as_str());
             }
@@ -7462,7 +7464,8 @@ async fn proxy_to_backend_http2(
             | "trailer"
             | "proxy-authorization"
             | "proxy-connection"
-            | "upgrade" => continue,
+            | "upgrade"
+            | "x-ferrum-original-content-encoding" => continue,
             _ => {
                 if let (Ok(name), Ok(val)) = (
                     hyper::header::HeaderName::from_bytes(k.as_bytes()),
@@ -7728,7 +7731,8 @@ async fn proxy_to_backend_http3(
             | "trailer"
             | "proxy-authorization"
             | "proxy-connection"
-            | "upgrade" => continue,
+            | "upgrade"
+            | "x-ferrum-original-content-encoding" => continue,
             _ => {
                 if let (Ok(header_name), Ok(header_value)) = (name.parse(), value.parse()) {
                     http3_headers.push((header_name, header_value));
@@ -8028,7 +8032,8 @@ async fn proxy_to_backend_http3_retry(
             | "trailer"
             | "proxy-authorization"
             | "proxy-connection"
-            | "upgrade" => continue,
+            | "upgrade"
+            | "x-ferrum-original-content-encoding" => continue,
             "host" => {
                 // Use effective upstream host unless preserve_host_header is set
                 let host_value = if proxy.preserve_host_header {

@@ -429,6 +429,38 @@ async fn test_gzip_request_decompression() {
     assert_eq!(decompressed, original);
 }
 
+#[tokio::test]
+async fn test_before_proxy_strips_client_supplied_internal_marker() {
+    // A client must not be able to inject the gateway-internal marker
+    // `x-ferrum-original-content-encoding` to coerce decompression attempts
+    // on plaintext bodies.
+    let plugin = make_plugin(json!({"decompress_request": true}));
+    let mut ctx = make_ctx(None);
+    let mut headers = HashMap::new();
+    headers.insert(
+        "x-ferrum-original-content-encoding".to_string(),
+        "gzip".to_string(),
+    );
+
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    assert!(
+        !headers.contains_key("x-ferrum-original-content-encoding"),
+        "client-supplied internal marker must be stripped"
+    );
+    assert!(
+        !ctx.metadata.contains_key("compression:request_encoding"),
+        "no real content-encoding was present; metadata must not be set"
+    );
+
+    // transform_request_body should NOT attempt decompression on a plaintext
+    // body when only the client-supplied marker was present (now removed).
+    let result = plugin
+        .transform_request_body(b"plaintext body", Some("application/json"), &headers)
+        .await;
+    assert!(result.is_none());
+}
+
 // ────────────────────── Request decompression (brotli) ──────────────────────
 
 #[tokio::test]

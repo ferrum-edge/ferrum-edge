@@ -275,3 +275,43 @@ async fn test_key_auth_fallback_default_header() {
     let result = plugin.authenticate(&mut ctx, &consumer_index).await;
     assert_continue(result);
 }
+
+#[tokio::test]
+async fn test_key_auth_empty_key_does_not_match_any_consumer() {
+    // Defense in depth: even if a consumer was somehow registered with an
+    // empty `key` value, an empty header value must not authenticate as
+    // that consumer. The plugin short-circuits empty/whitespace keys
+    // before consulting the consumer index.
+    use chrono::Utc;
+    use ferrum_edge::config::types::{Consumer, default_namespace};
+    use serde_json::{Map, Value};
+    use std::collections::HashMap;
+
+    let config = json!({"key_location": "header:X-API-Key"});
+    let plugin = KeyAuth::new(&config).unwrap();
+
+    // Build a consumer with empty key (simulates misconfiguration).
+    let mut keyauth = Map::new();
+    keyauth.insert("key".to_string(), Value::String("".to_string()));
+    let mut credentials = HashMap::new();
+    credentials.insert("keyauth".to_string(), Value::Object(keyauth));
+    let consumer = Consumer {
+        id: "empty-key-consumer".to_string(),
+        namespace: default_namespace(),
+        username: "ghost".to_string(),
+        custom_id: None,
+        credentials,
+        acl_groups: Vec::new(),
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+    let consumer_index = ConsumerIndex::new(&[consumer]);
+
+    let mut ctx = create_test_context();
+    ctx.headers.insert("X-API-Key".to_string(), "".to_string());
+    ctx.identified_consumer = None;
+
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
+    assert_reject(result, Some(401));
+    assert!(ctx.identified_consumer.is_none());
+}

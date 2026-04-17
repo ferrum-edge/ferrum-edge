@@ -428,6 +428,29 @@ async fn test_json_schema_max_length_invalid() {
 }
 
 #[tokio::test]
+async fn test_json_schema_min_max_length_counts_code_points_not_bytes() {
+    // "日本語" is 3 code points but 9 UTF-8 bytes. Per JSON Schema §6.3,
+    // minLength/maxLength count characters (code points), not bytes.
+    let plugin =
+        json_schema_plugin(serde_json::json!({"type": "string", "minLength": 3, "maxLength": 3}));
+    let mut ctx = make_json_ctx(r#""日本語""#);
+    let mut headers = make_json_headers();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+
+    // 2 code points fails minLength:3
+    let plugin = json_schema_plugin(serde_json::json!({"type": "string", "minLength": 3}));
+    let mut ctx = make_json_ctx(r#""日本""#);
+    let mut headers = make_json_headers();
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+
+    // 4 code points fails maxLength:3
+    let plugin = json_schema_plugin(serde_json::json!({"type": "string", "maxLength": 3}));
+    let mut ctx = make_json_ctx(r#""日本語x""#);
+    let mut headers = make_json_headers();
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+}
+
+#[tokio::test]
 async fn test_json_schema_pattern_valid() {
     let plugin = json_schema_plugin(serde_json::json!({"type": "string", "pattern": "^[a-z]+$"}));
     let mut ctx = make_json_ctx(r#""hello""#);

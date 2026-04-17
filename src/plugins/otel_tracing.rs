@@ -494,12 +494,25 @@ async fn send_otlp_batch(cfg: &OtlpConfig, batch: Vec<SpanData>) {
         match cfg.http_client.execute(req, "otel_export").await {
             Ok(response) if response.status().is_success() => return,
             Ok(response) => {
+                let status = response.status();
                 warn!(
                     "OTLP export failed with status {} (attempt {}/{})",
-                    response.status(),
-                    attempt,
-                    total_attempts,
+                    status, attempt, total_attempts,
                 );
+                // 4xx is a client error — retrying a malformed/unauthorized
+                // payload just delays the drop. Bail immediately, except for
+                // 408 (Request Timeout) and 429 (Too Many Requests) which are
+                // transient and worth retrying within the configured budget.
+                if status.is_client_error()
+                    && status != reqwest::StatusCode::REQUEST_TIMEOUT
+                    && status != reqwest::StatusCode::TOO_MANY_REQUESTS
+                {
+                    warn!(
+                        "OTLP export batch discarded due to {} response ({} spans lost)",
+                        status, entry_count,
+                    );
+                    return;
+                }
             }
             Err(e) => {
                 warn!(
@@ -710,7 +723,13 @@ fn hex_to_base64(hex: &str) -> String {
 
     let bytes: Vec<u8> = (0..hex.len())
         .step_by(2)
-        .filter_map(|i| u8::from_str_radix(&hex[i..i.min(hex.len()).max(i + 2)], 16).ok())
+        .filter_map(|i| {
+            let end = i + 2;
+            if end > hex.len() {
+                return None;
+            }
+            u8::from_str_radix(&hex[i..end], 16).ok()
+        })
         .collect();
 
     STANDARD.encode(&bytes)

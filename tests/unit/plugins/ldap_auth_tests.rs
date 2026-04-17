@@ -423,6 +423,42 @@ async fn test_empty_username_rejected() {
 }
 
 #[tokio::test]
+async fn test_empty_password_rejected_without_contacting_ldap() {
+    // RFC 4513 §5.1.2: simple bind with empty password is treated as an
+    // unauthenticated bind by many directories (notably Active Directory),
+    // and would silently succeed for any username. The plugin must reject
+    // empty passwords up front, before they reach the server.
+    //
+    // Point at a guaranteed-closed loopback port rather than a public DNS
+    // name — sandboxed CI runners may have no DNS, and a slow resolver
+    // could make this test flaky even when the short-circuit works. A
+    // closed loopback port gives immediate connection refusal if the
+    // plugin ever regressed and actually attempted a bind.
+    let plugin = LdapAuth::new(
+        &json!({
+            "ldap_url": "ldap://127.0.0.1:1",
+            "bind_dn_template": "uid={username},ou=users,dc=example,dc=com"
+        }),
+        http_client(),
+    )
+    .unwrap();
+
+    let mut ctx = make_ctx();
+    ctx.headers
+        .insert("authorization".to_string(), basic_header("alice", ""));
+    let consumer_index = ConsumerIndex::new(&[]);
+
+    // The test should complete quickly (no LDAP roundtrip).
+    let start = std::time::Instant::now();
+    let result = plugin.authenticate(&mut ctx, &consumer_index).await;
+    assert_reject(result, Some(401));
+    assert!(
+        start.elapsed() < std::time::Duration::from_millis(500),
+        "Empty-password rejection must short-circuit before contacting LDAP"
+    );
+}
+
+#[tokio::test]
 async fn test_ldap_connection_failure_returns_401() {
     // This test verifies that when LDAP is unreachable, we get a 401
     let plugin = LdapAuth::new(
