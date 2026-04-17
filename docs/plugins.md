@@ -1333,6 +1333,7 @@ Authenticates requests by extracting HTTP Basic credentials and validating them 
 | `starttls` | bool | `false` | Use STARTTLS to upgrade `ldap://` connections to TLS (cannot be used with `ldaps://`) |
 | `connect_timeout_seconds` | u64 | `5` | LDAP connection and operation timeout |
 | `cache_ttl_seconds` | u64 | `0` | How long to cache successful auth results (0 = disabled). Cache is keyed by username + password hash |
+| `max_cache_entries` | u64 | `10000` | Maximum entries in the auth result cache. Prevents unbounded growth from brute-force attempts with unique credentials |
 | `consumer_mapping` | bool | `true` | Whether to look up a matching gateway Consumer via `consumer_index.find_by_identity()` |
 
 **Authentication modes** (must configure one):

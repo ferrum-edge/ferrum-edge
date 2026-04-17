@@ -3721,6 +3721,10 @@ components:
           type: integer
           default: 0
           description: "Cache TTL for successful auth results (0 = disabled)"
+        max_cache_entries:
+          type: integer
+          default: 10000
+          description: "Maximum entries in the auth result cache. Prevents unbounded growth from brute-force attempts with unique credentials"
         consumer_mapping:
           type: boolean
           default: true
@@ -3728,17 +3732,13 @@ components:
 
     HmacAuthConfig:
       type: object
-      description: "Plugin: hmac_auth — HMAC signature verification."
+      description: "Plugin: hmac_auth — HMAC signature verification. Validates requests signed with a shared secret using HMAC-SHA256 or HMAC-SHA512. The signing string is METHOD\\nPATH\\nDATE. Consumer credentials store the shared secret."
       properties:
-        secret:
-          type: string
-          description: Shared secret for HMAC computation
-        algorithm:
-          type: string
-          description: Hash algorithm (e.g., sha256)
-        header:
-          type: string
-          description: Header containing the HMAC signature
+        clock_skew_seconds:
+          type: integer
+          format: uint64
+          default: 300
+          description: Maximum allowed clock skew in seconds for the Date header replay protection window
 
     CorsConfig:
       type: object
