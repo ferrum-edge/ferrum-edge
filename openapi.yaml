@@ -1973,17 +1973,19 @@ components:
         Configuration for the `ws_message_size_limiting` plugin. Enforces a
         maximum frame payload size on WebSocket connections. Frames exceeding
         the limit trigger a close frame sent to both client and backend.
+      required:
+        - max_frame_bytes
       properties:
         max_frame_bytes:
           type: integer
-          default: 0
+          minimum: 1
           description: >-
-            Maximum frame payload size in bytes. Required for the plugin to
-            take effect — a value of 0 means no limit is enforced.
+            Maximum frame payload size in bytes. Required and must be greater
+            than zero — the gateway rejects plugin creation when missing or 0.
         close_reason:
           type: string
           default: "Message too large"
-          description: Close frame reason text sent when a frame exceeds the limit.
+          description: Close frame reason text sent when a frame exceeds the limit. Truncated to 123 bytes.
 
     WsFrameLoggingConfig:
       type: object
@@ -3467,20 +3469,16 @@ components:
 
     CorrelationIdConfig:
       type: object
-      description: "Plugin: correlation_id — Generates and propagates correlation IDs."
+      description: "Plugin: correlation_id — Generates and propagates correlation IDs (UUIDv4). Accepts the client-provided value when present and ≤256 bytes, otherwise generates a fresh one."
       properties:
         header_name:
           type: string
-          default: X-Correlation-ID
-          description: Header name for correlation ID
-        generator:
-          type: string
-          default: uuid
-          description: ID generation strategy
+          default: x-request-id
+          description: Header name for the correlation ID. Normalized to lowercase at load.
         echo_downstream:
           type: boolean
           default: true
-          description: Include correlation ID in response headers
+          description: Include the correlation ID in response headers sent to the client.
 
     PrometheusMetricsConfig:
       type: object
@@ -4166,27 +4164,51 @@ components:
 
     RequestSizeLimitingConfig:
       type: object
-      description: "Plugin: request_size_limiting — Per-proxy request body size limits."
+      description: |
+        Plugin: request_size_limiting — Per-proxy request body size limits.
+        Rejects oversized requests with HTTP 413 in three places: an early
+        Content-Length fast path (`on_request_received`), a buffered-body
+        check when another plugin already loaded the body (`before_proxy`),
+        and a final post-transform check before forwarding to the backend
+        (`on_final_request_body`).
+      required:
+        - max_bytes
       properties:
         max_bytes:
           type: integer
           format: uint64
-          default: 0
-          description: Maximum allowed request body size in bytes (0 = disabled)
+          minimum: 1
+          description: >-
+            Maximum allowed request body size in bytes. Required and must be
+            greater than zero — the gateway rejects plugin creation when
+            missing or 0.
 
     ResponseSizeLimitingConfig:
       type: object
-      description: "Plugin: response_size_limiting — Per-proxy response body size limits."
+      description: |
+        Plugin: response_size_limiting — Per-proxy response body size limits.
+        Rejects oversized responses with HTTP 502 either via Content-Length
+        fast path (`after_proxy`) or after final buffering when
+        `require_buffered_check: true` is set (`on_final_response_body`).
+        Without `require_buffered_check`, chunked/streaming responses
+        without Content-Length cannot be enforced by this plugin — the
+        global `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES` limit applies in that
+        case via the gateway's `SizeLimitedStreamingResponse` adapter.
+      required:
+        - max_bytes
       properties:
         max_bytes:
           type: integer
           format: uint64
-          default: 0
-          description: Maximum allowed response body size in bytes (0 = disabled)
+          minimum: 1
+          description: >-
+            Maximum allowed response body size in bytes. Required and must be
+            greater than zero — the gateway rejects plugin creation when
+            missing or 0.
         require_buffered_check:
           type: boolean
           default: false
-          description: Force response body buffering to verify actual size
+          description: Force response body buffering so this plugin can enforce the size limit on chunked/streaming responses without Content-Length.
 
     BodyValidatorConfig:
       type: object
@@ -5016,8 +5038,17 @@ components:
           description: Request header name containing the deduplication key
         ttl_seconds:
           type: integer
+          minimum: 1
           default: 300
-          description: Time-to-live in seconds for cached responses
+          description: Time-to-live in seconds for cached completed responses. Must be greater than zero.
+        inflight_ttl_seconds:
+          type: integer
+          minimum: 1
+          description: >-
+            Time-to-live in seconds for in-flight request entries used to
+            coalesce duplicate requests while the first is still being
+            processed. Defaults to `ttl_seconds` when omitted. Must be
+            greater than zero.
         max_entries:
           type: integer
           default: 10000
