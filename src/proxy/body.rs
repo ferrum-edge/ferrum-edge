@@ -351,9 +351,22 @@ impl Drop for ProxyBody {
     fn drop(&mut self) {
         if let Some(logger) = self.logger.take() {
             let bytes = self.bytes_streamed.load(Ordering::Relaxed);
-            logger.fire(crate::proxy::deferred_log::BodyOutcome::client_disconnect(
-                bytes,
-            ));
+            // Hyper may drop a body without a final `Poll::Ready(None)` when
+            // `is_end_stream()` already reports the stream ended (empty/HEAD/
+            // 204 responses, or H2 frames with END_STREAM set). Treat that as
+            // a successful completion so healthy requests don't inflate
+            // client-disconnect metrics.
+            let ended = match &self.kind {
+                ProxyBodyKind::Full(body) => http_body::Body::is_end_stream(body),
+                ProxyBodyKind::Stream(body) => http_body::Body::is_end_stream(body),
+                ProxyBodyKind::Tracked(body) => http_body::Body::is_end_stream(&body.inner),
+            };
+            let outcome = if ended {
+                crate::proxy::deferred_log::BodyOutcome::success(bytes)
+            } else {
+                crate::proxy::deferred_log::BodyOutcome::client_disconnect(bytes)
+            };
+            logger.fire(outcome);
         }
     }
 }
