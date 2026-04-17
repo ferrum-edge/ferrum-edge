@@ -4320,6 +4320,139 @@ components:
             type: string
           description: "Remote gateway URLs to fan out the trigger to. Each receives the original request WITH the key header so it starts its own local load test"
 
+    RequestMirrorConfig:
+      type: object
+      description: |
+        Plugin: request_mirror — Duplicates live proxy traffic to a secondary
+        destination for shadow testing, validation, or migration checks
+        without affecting client responses. Mirrored requests are
+        fire-and-forget: spawned via `tokio::spawn`, the gateway never waits
+        for the mirror response and mirror failures never propagate to the
+        client. Mirror response metadata (status, size, latency) is captured
+        via a `tokio::sync::watch` channel and surfaced through transaction
+        logs.
+      required:
+        - mirror_host
+      properties:
+        mirror_host:
+          type: string
+          description: "Hostname or IP of the mirror target. Normalized to ASCII-lowercase at config load."
+        mirror_port:
+          type: integer
+          format: uint16
+          minimum: 1
+          maximum: 65535
+          description: "Port of the mirror target. Defaults to 80 (http) or 443 (https)."
+        mirror_protocol:
+          type: string
+          enum: [http, https]
+          default: http
+          description: "Transport protocol used for the mirror request."
+        mirror_path:
+          type: string
+          description: "Override path used for the mirror request. When omitted, the original request path is used."
+        percentage:
+          type: number
+          format: double
+          minimum: 0.0
+          maximum: 100.0
+          default: 100.0
+          description: "Percentage of requests to mirror. Granularity is 0.1% (deterministic counter-based sampling, no RNG)."
+        mirror_request_body:
+          type: boolean
+          default: true
+          description: "When true, the request body is forwarded to the mirror target. Binary-safe (preserves gRPC protobuf and other non-UTF-8 payloads). Forces request-body buffering for this proxy."
+
+    ServerlessFunctionConfig:
+      type: object
+      description: |
+        Plugin: serverless_function — Invokes AWS Lambda, Azure Functions, or
+        Google Cloud Functions as middleware in the proxy pipeline. In
+        `pre_proxy` mode the function response can inject request headers and
+        metadata before the backend call. In `terminate` mode the function
+        response is returned directly to the client (HTTP only — gRPC
+        rejection normalization would drop the body, so terminate mode on
+        gRPC requests is rejected with 500). Cloud credential fields fall
+        back to well-known environment variables.
+      required:
+        - provider
+      properties:
+        provider:
+          type: string
+          enum: [aws_lambda, azure_functions, gcp_cloud_functions]
+          description: "Cloud provider for the serverless function."
+        mode:
+          type: string
+          enum: [pre_proxy, terminate]
+          default: pre_proxy
+          description: |
+            pre_proxy: invoke and inject headers/metadata, then continue.
+            terminate: invoke and return response to client (HTTP only).
+        function_url:
+          type: string
+          description: "HTTPS trigger URL. Required for azure_functions and gcp_cloud_functions; ignored for aws_lambda (URL is derived from region + function name)."
+        aws_region:
+          type: string
+          description: "AWS region (aws_lambda only). Falls back to AWS_DEFAULT_REGION, then AWS_REGION env vars."
+        aws_access_key_id:
+          type: string
+          description: "IAM access key (aws_lambda only). Falls back to AWS_ACCESS_KEY_ID env var."
+        aws_secret_access_key:
+          type: string
+          description: "IAM secret key (aws_lambda only). Falls back to AWS_SECRET_ACCESS_KEY env var."
+        aws_function_name:
+          type: string
+          description: "Lambda function name or ARN (aws_lambda only). Falls back to AWS_LAMBDA_FUNCTION_NAME env var."
+        aws_session_token:
+          type: string
+          description: "STS session token (aws_lambda only). Falls back to AWS_SESSION_TOKEN env var."
+        aws_qualifier:
+          type: string
+          description: "Optional version/alias qualifier (e.g., $LATEST, prod)."
+        azure_function_key:
+          type: string
+          description: "Function key for x-functions-key auth (azure_functions only). Falls back to AZURE_FUNCTIONS_KEY env var."
+        gcp_bearer_token:
+          type: string
+          description: "Bearer token for Authorization header (gcp_cloud_functions only). Falls back to GCP_CLOUD_FUNCTIONS_BEARER_TOKEN env var."
+        forward_body:
+          type: boolean
+          default: false
+          description: "Include request body in function payload (forces request-body buffering for JSON POST requests)."
+        forward_headers:
+          type: array
+          items:
+            type: string
+          description: "Header names to forward into the function payload (lowercased at config load)."
+        forward_query_params:
+          type: boolean
+          default: false
+          description: "Include query parameters in function payload."
+        timeout_ms:
+          type: integer
+          format: uint64
+          minimum: 1
+          default: 5000
+          description: "Function invocation timeout in milliseconds. Must be > 0."
+        max_response_body_bytes:
+          type: integer
+          format: uint64
+          minimum: 1
+          default: 10485760
+          description: "Max function response body size (10 MiB default). Must be > 0."
+        on_error:
+          type: string
+          enum: [reject, continue]
+          default: reject
+          description: "reject: return error to client. continue: skip and proxy normally."
+        error_status_code:
+          type: integer
+          format: uint16
+          minimum: 100
+          maximum: 599
+          default: 502
+          description: "HTTP status when rejecting on error. Must be in range 100-599."
+
     ResponseCachingConfig:
       type: object
       description: "Plugin: response_caching — Response body caching (HTTP only)."
