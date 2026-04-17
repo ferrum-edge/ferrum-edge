@@ -1484,6 +1484,13 @@ where
             let _ = writer.shutdown().await;
             return Ok(());
         }
+        // Refresh the idle timestamp before the (potentially blocking) write so
+        // that a backpressured destination — which can park `write_all` longer
+        // than the idle timeout while bytes are genuinely flowing from the
+        // source — does not masquerade as inactivity and trip the watchdog.
+        if let Some(ref la) = last_activity {
+            la.store(coarse_now_ms(), Ordering::Relaxed);
+        }
         if let Err(e) = writer.write_all(&buf[..n]).await {
             return Err((StreamIoSide::Write, e));
         }
