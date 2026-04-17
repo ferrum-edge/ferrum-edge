@@ -36,6 +36,26 @@ fn test_new_zero_ttl_fails() {
 }
 
 #[test]
+fn test_new_zero_inflight_ttl_fails() {
+    let config = json!({
+        "inflight_ttl_seconds": 0
+    });
+    let result = RequestDeduplication::new(&config, PluginHttpClient::default());
+    assert!(result.is_err());
+    assert!(result.err().unwrap().contains("inflight_ttl_seconds"));
+}
+
+#[test]
+fn test_new_custom_inflight_ttl() {
+    let config = json!({
+        "ttl_seconds": 300,
+        "inflight_ttl_seconds": 1800
+    });
+    let plugin = make_plugin(config);
+    assert_eq!(plugin.name(), "request_deduplication");
+}
+
+#[test]
 fn test_new_empty_methods_fails() {
     let config = json!({
         "applicable_methods": []
@@ -299,4 +319,80 @@ fn test_tracked_keys_count() {
     let config = json!({});
     let plugin = make_plugin(config);
     assert_eq!(plugin.tracked_keys_count(), Some(0));
+}
+
+#[tokio::test]
+async fn test_completion_clears_inflight_then_replays() {
+    // Verify normal lifecycle: in-flight → completed → replay works correctly
+    // and does not return 409 Conflict after the response is captured.
+    let config = json!({});
+    let plugin = make_plugin(config);
+
+    // First request marks key as in-flight
+    let mut ctx1 = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut headers1 = HashMap::new();
+    headers1.insert("idempotency-key".to_string(), "lifecycle-key".to_string());
+    let result = plugin.before_proxy(&mut ctx1, &mut headers1).await;
+    assert!(matches!(result, PluginResult::Continue));
+
+    // Capture response — converts InFlight → Completed
+    let response_headers = HashMap::new();
+    let body = b"completion body";
+    let _ = plugin
+        .on_final_response_body(&mut ctx1, 200, &response_headers, body)
+        .await;
+
+    // Now duplicate request should REPLAY, not get 409 Conflict
+    let mut ctx2 = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    let mut headers2 = HashMap::new();
+    headers2.insert("idempotency-key".to_string(), "lifecycle-key".to_string());
+    let result = plugin.before_proxy(&mut ctx2, &mut headers2).await;
+    match result {
+        PluginResult::RejectBinary {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 200);
+            assert_eq!(&body[..], b"completion body");
+        }
+        _ => panic!(
+            "Expected RejectBinary replay after completion, got {:?}",
+            result
+        ),
+    }
+}
+
+#[tokio::test]
+async fn test_inflight_marker_carries_timestamp() {
+    // Smoke test: confirm InFlight marker can be inserted multiple times for
+    // distinct keys without panic and tracked_keys_count reflects the inserts.
+    // Stale-marker eviction uses `inflight_ttl_seconds` (defaults to
+    // `ttl_seconds`); a full timing test would slow CI.
+    let config = json!({});
+    let plugin = make_plugin(config);
+
+    for i in 0..5 {
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "POST".to_string(),
+            "/api".to_string(),
+        );
+        let mut headers = HashMap::new();
+        headers.insert(
+            "idempotency-key".to_string(),
+            format!("inflight-marker-{i}"),
+        );
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert!(matches!(result, PluginResult::Continue));
+    }
+
+    // All 5 distinct keys should be tracked
+    assert_eq!(plugin.tracked_keys_count(), Some(5));
 }

@@ -3852,7 +3852,7 @@ components:
           type: integer
           format: uint64
           default: 60
-          description: Interval in seconds between background cleanup sweeps for zero-count entries. Set to 0 to disable.
+          description: "Background sweep interval in seconds for removing stale zero-count entries. Catches edge cases where connections are dropped without on_stream_disconnect. Set to 0 to disable the sweep (entries are still removed inline by the disconnect path)."
 
     IpRestrictionConfig:
       type: object
@@ -4071,7 +4071,25 @@ components:
 
     RateLimitingConfig:
       type: object
-      description: "Plugin: rate_limiting — Per-IP or per-consumer request rate limiting. On stream proxies, consumer mode uses the identified stream Consumer when available and otherwise falls back to client IP. Supports centralized Redis-backed mode for coordinating rate limits across multiple gateway instances."
+      description: |
+        Plugin: rate_limiting — Per-IP or per-consumer request rate limiting.
+        On stream proxies, consumer mode uses the identified stream Consumer
+        when available and otherwise falls back to client IP. Supports
+        centralized Redis-backed mode for coordinating rate limits across
+        multiple gateway instances.
+
+        Configure rate windows in one of two ways:
+        1. `window_seconds` + `max_requests` — exact custom window (any duration)
+        2. One or more of `requests_per_second`, `requests_per_minute`, `requests_per_hour`
+
+        At least one rate window must be configured (the plugin rejects an
+        empty config). When multiple windows are configured (e.g., per-second
+        AND per-minute), each request must satisfy ALL windows.
+
+        Algorithm selection is automatic: windows ≤ 5 seconds use a token
+        bucket (O(1) memory), windows > 5 seconds use a sliding window with
+        exact request-timestamp tracking (O(n) memory per key, where n =
+        requests in window).
       properties:
         limit_by:
           type: string
@@ -4101,15 +4119,18 @@ components:
         requests_per_second:
           type: integer
           format: uint64
-          description: Max requests per second
+          minimum: 1
+          description: Max requests per second (token bucket algorithm)
         requests_per_minute:
           type: integer
           format: uint64
-          description: Max requests per minute
+          minimum: 1
+          description: Max requests per minute (sliding window algorithm)
         requests_per_hour:
           type: integer
           format: uint64
-          description: Max requests per hour
+          minimum: 1
+          description: Max requests per hour (sliding window algorithm)
         sync_mode:
           type: string
           enum: [local, redis]
@@ -4147,7 +4168,13 @@ components:
 
     RequestSizeLimitingConfig:
       type: object
-      description: "Plugin: request_size_limiting — Per-proxy request body size limits."
+      description: |
+        Plugin: request_size_limiting — Per-proxy request body size limits.
+        Rejects oversized requests with HTTP 413 in three places: an early
+        Content-Length fast path (`on_request_received`), a buffered-body
+        check when another plugin already loaded the body (`before_proxy`),
+        and a final post-transform check before forwarding to the backend
+        (`on_final_request_body`).
       required:
         - max_bytes
       properties:
@@ -4155,11 +4182,19 @@ components:
           type: integer
           format: uint64
           minimum: 1
-          description: Maximum allowed request body size in bytes. Required and must be greater than zero
+          description: "Maximum allowed request body size in bytes. Must be greater than zero — the plugin errors at construction if absent or 0."
 
     ResponseSizeLimitingConfig:
       type: object
-      description: "Plugin: response_size_limiting — Per-proxy response body size limits."
+      description: |
+        Plugin: response_size_limiting — Per-proxy response body size limits.
+        Rejects oversized responses with HTTP 502 either via Content-Length
+        fast path (`after_proxy`) or after final buffering when
+        `require_buffered_check: true` is set (`on_final_response_body`).
+        Without `require_buffered_check`, chunked/streaming responses
+        without Content-Length cannot be enforced by this plugin — the
+        global `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES` limit applies in that
+        case via the gateway's `SizeLimitedStreamingResponse` adapter.
       required:
         - max_bytes
       properties:
@@ -4167,11 +4202,11 @@ components:
           type: integer
           format: uint64
           minimum: 1
-          description: Maximum allowed response body size in bytes. Required and must be greater than zero
+          description: "Maximum allowed response body size in bytes. Must be greater than zero — the plugin errors at construction if absent or 0."
         require_buffered_check:
           type: boolean
           default: false
-          description: Force response body buffering to verify actual size
+          description: "Force response body buffering to verify actual size when Content-Length is absent. Adds memory overhead — only enable when needed."
 
     BodyValidatorConfig:
       type: object
@@ -4972,7 +5007,12 @@ components:
         ttl_seconds:
           type: integer
           default: 300
+          minimum: 1
           description: Time-to-live in seconds for cached responses
+        inflight_ttl_seconds:
+          type: integer
+          minimum: 1
+          description: "How long an in-flight marker remains valid before being treated as stale and replaced by a fresh request. Must be set at or above the longest backend request that should be protected from concurrent duplicate execution — if set too low, a slow legitimate request still running past this TTL can have a duplicate retry bypass the in-flight lock and re-execute side-effecting operations. Defaults to ttl_seconds."
         max_entries:
           type: integer
           default: 10000
