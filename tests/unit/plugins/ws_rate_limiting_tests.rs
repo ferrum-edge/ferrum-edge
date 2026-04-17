@@ -605,3 +605,88 @@ fn test_redis_connection_scope_key_is_namespaced_per_instance() {
     assert!(key_a.ends_with(":proxy-a:7"));
     assert!(key_b.ends_with(":proxy-a:7"));
 }
+
+// === Close-reason length cap (RFC 6455 §5.5 control-frame limit) ===
+
+#[tokio::test]
+async fn test_close_reason_is_truncated_to_websocket_limit() {
+    // Construct a reason longer than 123 bytes (the RFC 6455 control-frame cap
+    // after the 2-byte status code). The plugin must truncate it on a UTF-8
+    // boundary before storing.
+    let long_reason = "rate-".repeat(40); // 200 bytes, all ASCII
+    let plugin = WsRateLimiting::new(
+        &json!({"frames_per_second": 1, "close_reason": long_reason}),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+    let msg = Message::Text("hello".into());
+
+    // Drain the single token so the next frame returns Close
+    plugin
+        .on_ws_frame(
+            "test-proxy",
+            1,
+            WebSocketFrameDirection::ClientToBackend,
+            &msg,
+        )
+        .await;
+    let result = plugin
+        .on_ws_frame(
+            "test-proxy",
+            1,
+            WebSocketFrameDirection::ClientToBackend,
+            &msg,
+        )
+        .await;
+    match result.unwrap() {
+        Message::Close(Some(cf)) => {
+            assert!(
+                cf.reason.as_str().len() <= 123,
+                "close reason must be ≤ 123 bytes, got {}",
+                cf.reason.as_str().len()
+            );
+            assert!(cf.reason.as_str().starts_with("rate-"));
+        }
+        other => panic!("Expected Close frame, got {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn test_close_reason_truncates_on_utf8_boundary() {
+    // 124 bytes total: 122 ASCII + 1 two-byte char (é = 0xC3 0xA9). The cap of
+    // 123 bytes lands inside that final char, so truncation must back up to 122.
+    let mut s = "a".repeat(122);
+    s.push('é');
+    assert_eq!(s.len(), 124);
+
+    let plugin = WsRateLimiting::new(
+        &json!({"frames_per_second": 1, "close_reason": s}),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+    let msg = Message::Text("x".into());
+    plugin
+        .on_ws_frame(
+            "test-proxy",
+            42,
+            WebSocketFrameDirection::ClientToBackend,
+            &msg,
+        )
+        .await;
+    let result = plugin
+        .on_ws_frame(
+            "test-proxy",
+            42,
+            WebSocketFrameDirection::ClientToBackend,
+            &msg,
+        )
+        .await;
+    match result.unwrap() {
+        Message::Close(Some(cf)) => {
+            // Should truncate to 122 bytes (the 'é' would push us to 124, > 123).
+            assert_eq!(cf.reason.as_str().len(), 122);
+            assert!(cf.reason.as_str().chars().all(|c| c == 'a'));
+        }
+        other => panic!("Expected Close frame, got {:?}", other),
+    }
+}

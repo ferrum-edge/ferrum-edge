@@ -115,6 +115,11 @@ pub struct WsRateLimiting {
 }
 
 impl WsRateLimiting {
+    /// RFC 6455 §5.5 control-frame payload limit. The Close frame's payload
+    /// includes a 2-byte status code followed by an optional UTF-8 reason,
+    /// so the reason itself is capped at 123 bytes.
+    const MAX_CLOSE_REASON_BYTES: usize = 123;
+
     pub fn new(config: &Value, http_client: PluginHttpClient) -> Result<Self, String> {
         let frames_per_second = config["frames_per_second"].as_u64().unwrap_or(100) as f64;
 
@@ -129,10 +134,20 @@ impl WsRateLimiting {
             );
         }
 
-        let close_reason = config["close_reason"]
+        let mut close_reason = config["close_reason"]
             .as_str()
             .unwrap_or("Frame rate exceeded")
             .to_string();
+        if close_reason.len() > Self::MAX_CLOSE_REASON_BYTES {
+            tracing::debug!(
+                max_bytes = Self::MAX_CLOSE_REASON_BYTES,
+                "ws_rate_limiting: 'close_reason' exceeds WebSocket control-frame limit — truncating"
+            );
+            close_reason.truncate(Self::truncate_utf8_boundary(
+                &close_reason,
+                Self::MAX_CLOSE_REASON_BYTES,
+            ));
+        }
 
         let dns_cache = http_client.dns_cache().cloned();
         let tls_no_verify = http_client.tls_no_verify();
@@ -168,6 +183,17 @@ impl WsRateLimiting {
 
     pub(crate) fn redis_connection_scope_key(&self, proxy_id: &str, connection_id: u64) -> String {
         format!("{}:{}:{}", self.redis_instance_id, proxy_id, connection_id)
+    }
+
+    /// Truncate `value` at the largest UTF-8 char boundary that is `<= max_bytes`,
+    /// returning the byte length to truncate to. Mirrors the helper in
+    /// `ws_message_size_limiting` so close-frame reasons stay well-formed.
+    fn truncate_utf8_boundary(value: &str, max_bytes: usize) -> usize {
+        let mut end = value.len().min(max_bytes);
+        while end > 0 && !value.is_char_boundary(end) {
+            end -= 1;
+        }
+        end
     }
 
     /// Evict stale entries to prevent unbounded memory growth.
