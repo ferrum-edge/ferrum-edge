@@ -76,7 +76,7 @@ impl Plugin for CapturingDisconnectPlugin {
             frames_c2b: ctx.frames_client_to_backend,
             frames_b2c: ctx.frames_backend_to_client,
             direction: ctx.direction,
-            error_class: ctx.error_class.clone(),
+            error_class: ctx.error_class,
         });
     }
 }

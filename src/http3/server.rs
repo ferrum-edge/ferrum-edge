@@ -1321,7 +1321,7 @@ async fn handle_h3_request(
                                 }
                             }
                             let _ = stream.finish().await;
-                            body_error_class = Some(crate::retry::ErrorClass::ProtocolError);
+                            body_error_class = Some(crate::http3::client::classify_http3_error(&e));
                             break 'outer;
                         }
                     }
@@ -1528,7 +1528,7 @@ async fn handle_h3_request(
         };
 
         let response_status = h3_stream_result.status;
-        let h3_error_class = h3_stream_result.error_class.clone();
+        let h3_error_class = h3_stream_result.error_class;
 
         // Record outcome across CB, passive health, latency, and connection tracking
         crate::proxy::backend_dispatch::record_backend_outcome(
@@ -1627,7 +1627,7 @@ async fn handle_h3_request(
                     body: crate::retry::ResponseBody::Buffered(Vec::new()),
                     headers: HashMap::new(),
                     backend_resolved_ip: None,
-                    error_class: err_class.clone(),
+                    error_class: err_class,
                 },
                 attempt,
             ) {
@@ -2340,7 +2340,9 @@ async fn proxy_to_backend_h3_streaming(
                             }
                         }
                         let _ = h3_stream.finish().await;
-                        body_error_class = Some(crate::retry::ErrorClass::ProtocolError);
+                        let class = crate::http3::client::classify_http3_error(&e);
+                        terminal_error_class = Some(class);
+                        body_error_class = Some(class);
                         break 'outer;
                     }
                 }

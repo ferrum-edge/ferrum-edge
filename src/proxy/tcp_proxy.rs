@@ -539,7 +539,7 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
                             match &s.first_failure {
                                 Some((dir, class, side, message)) => {
                                     let dir = *dir;
-                                    let class = class.clone();
+                                    let class = *class;
                                     let cause =
                                         disconnect_cause_for_failure(dir, &class, *side);
                                     (

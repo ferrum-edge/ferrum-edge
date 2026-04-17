@@ -2076,6 +2076,7 @@ async fn create_session(
             String,
             crate::retry::ErrorClass,
             crate::plugins::DisconnectCause,
+            crate::plugins::Direction,
         )> = None;
         // Pre-allocate sendmmsg batch for batched client replies (Linux only).
         #[cfg(target_os = "linux")]
@@ -2113,6 +2114,7 @@ async fn create_session(
                                 anyhow::anyhow!(error_message).as_ref(),
                             ),
                             crate::plugins::DisconnectCause::BackendError,
+                            crate::plugins::Direction::BackendToClient,
                         ));
                         break;
                     }
@@ -2139,6 +2141,7 @@ async fn create_session(
                                 anyhow::anyhow!(error_message).as_ref(),
                             ),
                             crate::plugins::DisconnectCause::BackendError,
+                            crate::plugins::Direction::BackendToClient,
                         ));
                         break;
                     }
@@ -2244,6 +2247,7 @@ async fn create_session(
                     error_message.clone(),
                     crate::retry::classify_boxed_error(anyhow::anyhow!(error_message).as_ref()),
                     crate::plugins::DisconnectCause::RecvError,
+                    crate::plugins::Direction::BackendToClient,
                 ));
                 break;
             }
@@ -2433,6 +2437,7 @@ async fn create_session(
                                         anyhow::anyhow!(error_message).as_ref(),
                                     ),
                                     crate::plugins::DisconnectCause::RecvError,
+                                    crate::plugins::Direction::BackendToClient,
                                 ));
                                 break;
                             }
@@ -2468,16 +2473,21 @@ async fn create_session(
                 .active_sessions
                 .fetch_sub(1, Ordering::Relaxed);
             let disconnected_ms = coarse_epoch_millis();
-            let (connection_error, error_class, disconnect_cause) = match disconnect_error {
-                Some((message, error_class, cause)) => {
-                    (Some(message), Some(error_class), Some(cause))
-                }
-                None => (
-                    None,
-                    None,
-                    Some(crate::plugins::DisconnectCause::GracefulShutdown),
-                ),
-            };
+            let (connection_error, error_class, disconnect_cause, disconnect_direction) =
+                match disconnect_error {
+                    Some((message, error_class, cause, direction)) => (
+                        Some(message),
+                        Some(error_class),
+                        Some(cause),
+                        Some(direction),
+                    ),
+                    None => (
+                        None,
+                        None,
+                        Some(crate::plugins::DisconnectCause::GracefulShutdown),
+                        None,
+                    ),
+                };
             emit_udp_stream_disconnect(
                 &reply_plugins,
                 UdpDisconnectContext {
@@ -2491,7 +2501,7 @@ async fn create_session(
                     disconnected_ms,
                     connection_error,
                     error_class,
-                    disconnect_direction: None,
+                    disconnect_direction,
                     disconnect_cause,
                 },
             )

@@ -3021,10 +3021,27 @@ async fn run_websocket_proxy(
                 return Ok(());
             }
         }
-        // Reunite the backend stream and extract the raw transport
-        let backend_ws = backend_read
-            .reunite(backend_write)
-            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
+        // Reunite the backend stream and extract the raw transport. If the
+        // halves can't be reunited (should not happen since both came from the
+        // same split), still run the disconnect hook so observers see the
+        // session end instead of silently swallowing it.
+        let backend_ws = match backend_read.reunite(backend_write) {
+            Ok(ws) => ws,
+            Err(e) => {
+                let reunite_failure = Some((
+                    crate::plugins::Direction::Unknown,
+                    crate::retry::ErrorClass::RequestError,
+                ));
+                fire_ws_tunnel_disconnect_hooks(
+                    &ws_disconnect_plugins,
+                    proxy_id,
+                    &session_meta,
+                    reunite_failure,
+                )
+                .await;
+                return Err(Box::new(e));
+            }
+        };
         let mut backend = backend_ws.into_inner();
         let buf_size = adaptive_buffer.get_buffer_size(proxy_id);
         let result = tokio::io::copy_bidirectional_with_sizes(
@@ -6038,7 +6055,7 @@ async fn handle_proxy_request_inner(
     let mut response_body = backend_resp.body;
     let mut response_headers = backend_resp.headers;
     let backend_resolved_ip = backend_resp.backend_resolved_ip;
-    let backend_error_class = backend_resp.error_class.clone();
+    let backend_error_class = backend_resp.error_class;
 
     debug!(
         proxy_id = %proxy.id,
