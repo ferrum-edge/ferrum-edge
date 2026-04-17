@@ -626,8 +626,13 @@ pub fn send_with_pktinfo(
             (*cmsg).cmsg_type = libc::IP_PKTINFO;
             (*cmsg).cmsg_len =
                 libc::CMSG_LEN(std::mem::size_of::<libc::in_pktinfo>() as u32) as usize;
+            // ipi_ifindex intentionally 0 for IPv4: per ip(7), a nonzero
+            // ifindex makes the kernel prefer the interface's primary address
+            // over ipi_spec_dst on multi-IP interfaces, which would defeat the
+            // "reply from captured destination" semantics. ipi_spec_dst alone
+            // is sufficient on IPv4; ifindex is only honored for IPv6 scopes.
             let pi = libc::in_pktinfo {
-                ipi_ifindex: ifindex as libc::c_int,
+                ipi_ifindex: 0,
                 ipi_spec_dst: libc::in_addr {
                     s_addr: u32::from(v4).to_be(),
                 },
