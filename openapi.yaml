@@ -2106,6 +2106,9 @@ components:
         atomic counters. Excess datagrams are silently dropped (standard UDP
         flood mitigation). Operates on both client→backend and backend→client
         datagrams within the same window per client IP.
+      anyOf:
+        - required: [datagrams_per_second]
+        - required: [bytes_per_second]
       properties:
         datagrams_per_second:
           type: integer
@@ -3365,31 +3368,6 @@ components:
           type: integer
           default: 10000
           description: Channel capacity — new entries are dropped when full
-
-    UdpRateLimitingConfig:
-      type: object
-      description: >-
-        Plugin: udp_rate_limiting — Rate limits UDP datagrams per client IP using
-        a fixed-window algorithm. Silently drops excess datagrams. At least one of
-        datagrams_per_second or bytes_per_second must be set.
-      anyOf:
-        - required: [datagrams_per_second]
-        - required: [bytes_per_second]
-      properties:
-        datagrams_per_second:
-          type: integer
-          format: uint64
-          description: Maximum datagrams per second per client IP
-        bytes_per_second:
-          type: integer
-          format: uint64
-          description: Maximum bytes per second per client IP
-        window_seconds:
-          type: integer
-          format: uint64
-          default: 1
-          minimum: 1
-          description: Window duration in seconds (limits are scaled proportionally)
 
     KafkaLoggingConfig:
       type: object
