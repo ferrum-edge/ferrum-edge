@@ -2059,9 +2059,12 @@ async fn bidirectional_splice_io_uring(
     let sa_c2b = shared_activity.clone();
     let sa_b2c = shared_activity;
 
-    // First-failure attribution across the two blocking threads. `OnceLock`'s
-    // first-writer-wins semantics naturally encode "first to fail" — the later
-    // thread's `set()` is silently ignored. `Arc` shares it across threads.
+    // First-failure attribution across the two blocking threads. Each worker
+    // writes into the `OnceLock` at the moment its splice call errors, so the
+    // slot records whichever direction actually failed first in the kernel
+    // rather than a deterministic post-join order. `OnceLock::set()` is
+    // first-writer-wins; later writes from the opposite worker (or the
+    // post-join fallback) are silently ignored.
     let first_failure: Arc<OnceLock<(Direction, ErrorClass, Option<StreamIoSide>)>> =
         Arc::new(OnceLock::new());
     let ff_c2b = first_failure.clone();
@@ -2069,14 +2072,30 @@ async fn bidirectional_splice_io_uring(
 
     // Each direction runs on its own blocking thread with its own io_uring ring.
     let c2b_handle = tokio::task::spawn_blocking(move || {
-        io_uring_splice_direction(
+        let res = io_uring_splice_direction(
             client_fd, c2b_pipe_w, c2b_pipe_r, backend_fd, timeout_ms, &sa_c2b,
-        )
+        );
+        if let Err((side, ref e)) = res {
+            let _ = ff_c2b.set((
+                Direction::ClientToBackend,
+                classify_stream_error(e),
+                Some(side),
+            ));
+        }
+        res
     });
     let b2c_handle = tokio::task::spawn_blocking(move || {
-        io_uring_splice_direction(
+        let res = io_uring_splice_direction(
             backend_fd, b2c_pipe_w, b2c_pipe_r, client_fd, timeout_ms, &sa_b2c,
-        )
+        );
+        if let Err((side, ref e)) = res {
+            let _ = ff_b2c.set((
+                Direction::BackendToClient,
+                classify_stream_error(e),
+                Some(side),
+            ));
+        }
+        res
     });
 
     // Wait for both directions. Streams (`client`, `backend`) stay alive on this
@@ -2086,19 +2105,12 @@ async fn bidirectional_splice_io_uring(
 
     let c2b_bytes = match c2b_result {
         Ok(Ok(n)) => n,
-        Ok(Err((side, e))) => {
-            let _ = ff_c2b.set((
-                Direction::ClientToBackend,
-                classify_stream_error(&e),
-                Some(side),
-            ));
-            0
-        }
+        Ok(Err(_)) => 0, // already recorded from inside the worker
         Err(e) => {
-            // JoinError (task panicked or was cancelled) — side is not meaningful
-            // so leave it None so the caller falls back to the conservative default.
+            // JoinError (task panicked or was cancelled) — side is not
+            // meaningful. Only records if the worker didn't already set it.
             let anyhow_err = anyhow::anyhow!("io_uring splice spawn error: {}", e);
-            let _ = ff_c2b.set((
+            let _ = first_failure.set((
                 Direction::ClientToBackend,
                 classify_stream_error(&anyhow_err),
                 None,
@@ -2108,17 +2120,10 @@ async fn bidirectional_splice_io_uring(
     };
     let b2c_bytes = match b2c_result {
         Ok(Ok(n)) => n,
-        Ok(Err((side, e))) => {
-            let _ = ff_b2c.set((
-                Direction::BackendToClient,
-                classify_stream_error(&e),
-                Some(side),
-            ));
-            0
-        }
+        Ok(Err(_)) => 0,
         Err(e) => {
             let anyhow_err = anyhow::anyhow!("io_uring splice spawn error: {}", e);
-            let _ = ff_b2c.set((
+            let _ = first_failure.set((
                 Direction::BackendToClient,
                 classify_stream_error(&anyhow_err),
                 None,
