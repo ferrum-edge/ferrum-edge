@@ -105,6 +105,18 @@ impl Plugin for KeyAuth {
             }
         };
 
+        // Reject empty / whitespace-only keys before hitting the index. This
+        // prevents a misconfigured consumer (with an empty `key` value) from
+        // accidentally matching every request that sends a blank header, and
+        // gives clients a clearer error than a generic "Invalid API key".
+        if api_key.trim().is_empty() {
+            return PluginResult::Reject {
+                status_code: 401,
+                body: r#"{"error":"Missing API key"}"#.into(),
+                headers: HashMap::new(),
+            };
+        }
+
         // O(1) lookup by API key via ConsumerIndex
         if let Some(consumer) = consumer_index.find_by_api_key(&api_key) {
             if ctx.identified_consumer.is_none() {
