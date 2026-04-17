@@ -3313,6 +3313,9 @@ components:
         Plugin: udp_rate_limiting — Rate limits UDP datagrams per client IP using
         a fixed-window algorithm. Silently drops excess datagrams. At least one of
         datagrams_per_second or bytes_per_second must be set.
+      anyOf:
+        - required: [datagrams_per_second]
+        - required: [bytes_per_second]
       properties:
         datagrams_per_second:
           type: integer
@@ -4271,7 +4274,10 @@ components:
           type: object
           description: >-
             Optional trigger condition. When omitted, the plugin always terminates.
-            When set, only requests matching the trigger are terminated.
+            When set, only requests matching the trigger are terminated. Runtime
+            evaluates path_prefix first; otherwise header (with optional
+            header_value) is required — header_value alone is ignored and the
+            plugin falls back to terminating every request.
           properties:
             path_prefix:
               type: string
@@ -4282,7 +4288,9 @@ components:
             header_value:
               type: string
               default: ""
-              description: If set, the header must match this value exactly (empty means presence-only check)
+              description: If set, the header must match this value exactly (empty means presence-only check). Requires `header` to be set.
+          dependentRequired:
+            header_value: [header]
 
     ResponseMockConfig:
       type: object
