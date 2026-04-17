@@ -104,6 +104,30 @@ pub fn disconnect_cause_for_failure(
     }
 }
 
+/// Map a pre-copy error class (no bytes flowed, direction unknown) to a
+/// `DisconnectCause`. Backend-facing failure classes (DNS lookup, connect,
+/// TLS handshake, port exhaustion, pool errors) map to `BackendError` so
+/// `stream_disconnects` metrics don't misclassify backend outages as client
+/// recv errors. Genuinely client-side failures (e.g., `ClientDisconnect`)
+/// stay `RecvError`. Timeouts during connect become `BackendError`, not
+/// `IdleTimeout`, because idle timeout only applies after the relay starts.
+fn pre_copy_disconnect_cause(class: &ErrorClass) -> crate::plugins::DisconnectCause {
+    use crate::plugins::DisconnectCause;
+    match class {
+        ErrorClass::DnsLookupError
+        | ErrorClass::ConnectionTimeout
+        | ErrorClass::ConnectionRefused
+        | ErrorClass::ConnectionReset
+        | ErrorClass::ConnectionClosed
+        | ErrorClass::TlsError
+        | ErrorClass::PortExhaustion
+        | ErrorClass::ConnectionPoolError
+        | ErrorClass::ProtocolError => DisconnectCause::BackendError,
+        ErrorClass::ClientDisconnect => DisconnectCause::RecvError,
+        _ => DisconnectCause::RecvError,
+    }
+}
+
 /// Crate-visible entry point to `bidirectional_copy` for the `_test_support`
 /// module. Exposed only so external integration/unit tests can exercise the
 /// direction-tracking behavior without the private function being made `pub`.
@@ -523,13 +547,18 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
                             // Pre-copy error (DNS, connect, plugin reject, TLS
                             // handshake). No bytes flowed and direction can't
                             // be attributed to a specific half, so use Unknown.
+                            // Map backend-facing failure classes (DNS/connect/
+                            // TLS/port exhaustion) to `BackendError` so cause-
+                            // based dashboards aren't misattributed to client
+                            // recv errors.
+                            let cause = pre_copy_disconnect_cause(&err_class);
                             (
                                 0,
                                 0,
                                 Some(error_message),
                                 Some(err_class),
                                 Some(Direction::Unknown),
-                                Some(crate::plugins::DisconnectCause::RecvError),
+                                Some(cause),
                             )
                         }
                     };
