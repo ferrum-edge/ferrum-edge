@@ -373,7 +373,8 @@ async fn test_completion_clears_inflight_then_replays() {
 async fn test_inflight_marker_carries_timestamp() {
     // Smoke test: confirm InFlight marker can be inserted multiple times for
     // distinct keys without panic and tracked_keys_count reflects the inserts.
-    // (Stale-marker eviction TTL is 60s — full timing test would slow CI.)
+    // Stale-marker eviction uses `inflight_ttl_seconds` (defaults to
+    // `ttl_seconds`); a full timing test would slow CI.
     let config = json!({});
     let plugin = make_plugin(config);
 
