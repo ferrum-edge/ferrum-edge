@@ -41,21 +41,54 @@ pub struct WsFrameLogging {
 
 impl WsFrameLogging {
     pub fn new(config: &Value) -> Result<Self, String> {
-        let log_level = match config["log_level"].as_str().unwrap_or("info") {
-            "trace" => LogLevel::Trace,
-            "debug" => LogLevel::Debug,
-            _ => LogLevel::Info,
+        // Validate log_level explicitly — unknown values are rejected per the
+        // plugin-validation rules so misspellings (e.g. "info " or "warn") are
+        // caught at config-load time rather than silently downgraded to "info".
+        let log_level = match config.get("log_level") {
+            Some(v) => match v.as_str() {
+                Some("trace") => LogLevel::Trace,
+                Some("debug") => LogLevel::Debug,
+                Some("info") => LogLevel::Info,
+                Some(other) => {
+                    return Err(format!(
+                        "ws_frame_logging: invalid 'log_level' value '{other}' \
+                         (expected 'trace', 'debug', or 'info')"
+                    ));
+                }
+                None => {
+                    return Err(
+                        "ws_frame_logging: 'log_level' must be a string ('trace', 'debug', or 'info')"
+                            .to_string(),
+                    );
+                }
+            },
+            None => LogLevel::Info,
         };
 
-        let include_payload_preview = config["include_payload_preview"].as_bool().unwrap_or(false);
+        let include_payload_preview = match config.get("include_payload_preview") {
+            Some(v) => v.as_bool().ok_or_else(|| {
+                "ws_frame_logging: 'include_payload_preview' must be a boolean".to_string()
+            })?,
+            None => false,
+        };
 
         // Clamp to 64 KiB to prevent OOM from hex_encode on large binary frames
         const MAX_PREVIEW_BYTES: usize = 65_536;
-        let payload_preview_bytes = (config["payload_preview_bytes"].as_u64().unwrap_or(128)
-            as usize)
-            .min(MAX_PREVIEW_BYTES);
+        let payload_preview_bytes = match config.get("payload_preview_bytes") {
+            Some(v) => v.as_u64().ok_or_else(|| {
+                "ws_frame_logging: 'payload_preview_bytes' must be a non-negative integer"
+                    .to_string()
+            })? as usize,
+            None => 128,
+        }
+        .min(MAX_PREVIEW_BYTES);
 
-        let log_ping_pong = config["log_ping_pong"].as_bool().unwrap_or(false);
+        let log_ping_pong = match config.get("log_ping_pong") {
+            Some(v) => v
+                .as_bool()
+                .ok_or_else(|| "ws_frame_logging: 'log_ping_pong' must be a boolean".to_string())?,
+            None => false,
+        };
 
         Ok(Self {
             log_level,

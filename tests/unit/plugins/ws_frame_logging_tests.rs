@@ -14,6 +14,61 @@ fn test_creation_defaults() {
     assert_eq!(plugin.priority(), 9050);
 }
 
+// === Config validation ===
+
+#[test]
+fn test_creation_rejects_unknown_log_level() {
+    let result = WsFrameLogging::new(&json!({"log_level": "warn"}));
+    assert!(result.is_err());
+    let msg = result.err().unwrap();
+    assert!(msg.contains("log_level"), "msg: {msg}");
+    assert!(msg.contains("warn"), "msg: {msg}");
+}
+
+#[test]
+fn test_creation_rejects_uppercase_log_level() {
+    // Per plugin-validation rules, exact-match lowercase only.
+    let result = WsFrameLogging::new(&json!({"log_level": "INFO"}));
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_creation_rejects_non_string_log_level() {
+    let result = WsFrameLogging::new(&json!({"log_level": 1}));
+    assert!(result.is_err());
+    assert!(result.err().unwrap().contains("log_level"));
+}
+
+#[test]
+fn test_creation_accepts_valid_log_levels() {
+    for level in ["trace", "debug", "info"] {
+        WsFrameLogging::new(&json!({"log_level": level})).unwrap_or_else(|e| {
+            panic!("expected '{level}' to be accepted but got: {e}");
+        });
+    }
+}
+
+#[test]
+fn test_creation_rejects_non_bool_include_payload_preview() {
+    let result = WsFrameLogging::new(&json!({"include_payload_preview": "yes"}));
+    assert!(result.is_err());
+    assert!(result.err().unwrap().contains("include_payload_preview"));
+}
+
+#[test]
+fn test_creation_rejects_non_bool_log_ping_pong() {
+    let result = WsFrameLogging::new(&json!({"log_ping_pong": 1}));
+    assert!(result.is_err());
+    assert!(result.err().unwrap().contains("log_ping_pong"));
+}
+
+#[test]
+fn test_creation_rejects_non_integer_payload_preview_bytes() {
+    let result = WsFrameLogging::new(&json!({"payload_preview_bytes": "128"}));
+    assert!(result.is_err());
+    assert!(result.err().unwrap().contains("payload_preview_bytes"));
+}
+
 #[test]
 fn test_supported_protocols_websocket_only() {
     let plugin = WsFrameLogging::new(&json!({})).unwrap();
