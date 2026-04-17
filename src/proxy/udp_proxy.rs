@@ -66,6 +66,14 @@ struct UdpSession {
     backend_resolved_ip: String,
     /// SNI hostname extracted from the first DTLS ClientHello during passthrough mode.
     sni_hostname: Option<String>,
+    /// Local destination IP captured from IP(v6)_PKTINFO cmsg on the first
+    /// inbound datagram that exposes one. Used as the reply source address on
+    /// send so the kernel can skip the routing-table lookup and return traffic
+    /// exits the same interface the client targeted. Written once via
+    /// `OnceLock::set`; reads are lock-free atomic loads. Empty when pktinfo
+    /// is disabled, unsupported, or the first datagram did not carry a cmsg
+    /// (e.g., it came through tokio's cmsg-less `recv_from`).
+    local_addr: std::sync::OnceLock<IpAddr>,
     /// Identified consumer username (gateway Consumer or external identity) resolved
     /// during `on_stream_connect`. Carried to `on_stream_disconnect` for logging.
     consumer_username: Option<String>,
@@ -184,17 +192,28 @@ fn build_dtls_stream_summary(context: DtlsDisconnectContext<'_>) -> StreamTransa
     }
 }
 
-/// Flush a GSO batch buffer using the connected reply socket if available,
-/// falling back to the frontend socket with destination address.
+/// Flush a GSO batch buffer to the client via the frontend socket.
+///
+/// When `local_ip` is `Some`, an IP(v6)_PKTINFO cmsg is attached so the kernel
+/// uses it as the reply source (skipping the routing lookup). The `local_ip`
+/// address family must match `client_addr` — mismatched families fall through
+/// to the legacy GSO path without pktinfo.
 #[cfg(target_os = "linux")]
 fn flush_gso_batch(
     gso_batch: &mut super::udp_batch::GsoBatchBuf,
     frontend: &Arc<UdpSocket>,
     client_addr: SocketAddr,
+    local_ip: Option<IpAddr>,
 ) -> std::io::Result<usize> {
     use std::os::unix::io::AsRawFd;
     let (dest, dest_len) = super::udp_batch::std_to_sockaddr_storage(client_addr);
-    gso_batch.flush_to(frontend.as_raw_fd(), &dest, dest_len)
+    let effective_local = match (local_ip, client_addr) {
+        (Some(IpAddr::V4(_)), SocketAddr::V4(_)) | (Some(IpAddr::V6(_)), SocketAddr::V6(_)) => {
+            local_ip
+        }
+        _ => None,
+    };
+    gso_batch.flush_to(frontend.as_raw_fd(), &dest, dest_len, effective_local)
 }
 
 /// Try to enqueue a datagram into the GSO batch; on batch-full or size-mismatch,
@@ -219,6 +238,7 @@ async fn try_gso_send_or_fallback(
     data: &[u8],
     gso_failed: &mut bool,
     proxy_id: &str,
+    local_ip: Option<IpAddr>,
 ) {
     use std::os::unix::io::AsRawFd;
 
@@ -226,7 +246,7 @@ async fn try_gso_send_or_fallback(
         return;
     }
     // Batch full or size-mismatch — flush current batch and try once more.
-    match flush_gso_batch(gso_batch, frontend, client_addr) {
+    match flush_gso_batch(gso_batch, frontend, client_addr, local_ip) {
         Ok(_) => {
             if !gso_batch.push(data) {
                 // Post-flush push still refused (oversize / >max_bytes). Previously
@@ -254,16 +274,16 @@ async fn try_gso_send_or_fallback(
             // `drain_to_sendmmsg` may partially fill `send_batch`; in that case we
             // flush and keep draining.
             loop {
-                gso_batch.drain_to_sendmmsg(send_batch, client_addr);
+                gso_batch.drain_to_sendmmsg(send_batch, client_addr, local_ip);
                 if gso_batch.is_empty() {
                     break;
                 }
                 let _ = send_batch.flush(frontend.as_raw_fd());
             }
             // Now push the current datagram, flushing once if necessary.
-            if !send_batch.push(data, client_addr) {
+            if !send_batch.push_with_local(data, client_addr, local_ip) {
                 let _ = send_batch.flush(frontend.as_raw_fd());
-                if !send_batch.push(data, client_addr) {
+                if !send_batch.push_with_local(data, client_addr, local_ip) {
                     debug!(
                         proxy_id = %proxy_id,
                         client = %client_addr,
@@ -319,6 +339,11 @@ pub struct UdpListenerConfig {
     pub udp_gro_enabled: bool,
     /// Enable UDP GSO for batched sending.
     pub udp_gso_enabled: bool,
+    /// Enable IP(v6)_PKTINFO on the frontend socket (Linux only). When enabled
+    /// the recv path captures the per-datagram local destination address and
+    /// the reply path attaches it to sendmsg ancillary data, saving one kernel
+    /// routing-table lookup per send.
+    pub udp_pktinfo_enabled: bool,
 }
 
 /// Start a UDP proxy listener on the given port.
@@ -355,10 +380,11 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
         so_busy_poll_us,
         udp_gro_enabled,
         udp_gso_enabled,
+        udp_pktinfo_enabled,
     } = cfg;
     // so_busy_poll_us and udp_gro_enabled are used in #[cfg(target_os = "linux")] blocks below.
     #[cfg(not(target_os = "linux"))]
-    let _ = (so_busy_poll_us, udp_gro_enabled);
+    let _ = (so_busy_poll_us, udp_gro_enabled, udp_pktinfo_enabled);
 
     if let Some(dtls_config) = frontend_dtls_config {
         return start_dtls_frontend_listener(
@@ -388,6 +414,8 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
 
     // Apply Linux socket optimizations on the frontend UDP socket.
     #[cfg(target_os = "linux")]
+    let mut pktinfo_active = false;
+    #[cfg(target_os = "linux")]
     {
         use std::os::unix::io::AsRawFd;
         let fd = frontend_socket.as_raw_fd();
@@ -395,6 +423,26 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
         if so_busy_poll_us > 0 {
             let _ = crate::socket_opts::set_so_busy_poll(fd, so_busy_poll_us);
             let _ = crate::socket_opts::set_so_prefer_busy_poll(fd, true);
+        }
+        // IP(v6)_PKTINFO: capture the per-datagram local destination address on
+        // recv and reuse it as the reply source on send (skips the kernel
+        // routing lookup). Request both v4 and v6 variants so a dual-stack
+        // listener captures pktinfo regardless of the client's family. Logged
+        // as warn on failure but never fatal — replies fall back to routing.
+        if udp_pktinfo_enabled {
+            // Try both v4 and v6 variants — one will succeed for v4 sockets,
+            // the other (or both, for dual-stack `::` binds) for v6. A v4
+            // socket returns ENOPROTOOPT for IPV6_RECVPKTINFO which is fine.
+            let v4_ok = crate::socket_opts::set_ip_pktinfo(fd).is_ok();
+            let v6_ok = crate::socket_opts::set_ipv6_recvpktinfo(fd).is_ok();
+            pktinfo_active = v4_ok || v6_ok;
+            if !pktinfo_active {
+                warn!(
+                    proxy_id = %proxy_id,
+                    port = port,
+                    "IP_PKTINFO setsockopt failed; reply path will use routing lookup"
+                );
+            }
         }
         // UDP_GRO cannot be enabled because the primary receive path uses
         // tokio's recv_from() in the select! loop, which doesn't expose cmsg
@@ -503,6 +551,10 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                 let mut batch_bytes_out: u64 = 0;
 
                 // Process first datagram then drain more with try_recv_from.
+                // Note: the primary `recv_from` path doesn't surface pktinfo
+                // cmsg (tokio API limitation) so `local_addr` is None here —
+                // the session will capture it from the first drain-loop
+                // datagram that does carry pktinfo.
                 let result = process_datagram(
                     &buf[..len],
                     client_addr,
@@ -530,6 +582,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                     sni_proxy_ids.as_deref(),
                     &adaptive_buffer,
                     udp_gso_enabled,
+                    None,
                 )
                 .await;
                 if let Err(e) = result {
@@ -555,6 +608,11 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                             Ok(n) if n > 0 => {
                                 for i in 0..n {
                                     let (data, addr2) = recv_batch.datagram(i);
+                                    let local2 = if pktinfo_active {
+                                        recv_batch.local_addr(i)
+                                    } else {
+                                        None
+                                    };
 
                                     // GRO splitting: if the kernel coalesced multiple same-size
                                     // datagrams into one buffer, split by segment size.
@@ -595,6 +653,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                                                     sni_proxy_ids.as_deref(),
                                                     &adaptive_buffer,
                                                     udp_gso_enabled,
+                                                    local2,
                                                 )
                                                 .await;
                                                 if let Err(e) = result {
@@ -637,6 +696,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                                         sni_proxy_ids.as_deref(),
                                         &adaptive_buffer,
                                         udp_gso_enabled,
+                                        local2,
                                     )
                                     .await;
                                     if let Err(e) = result {
@@ -685,6 +745,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                                     sni_proxy_ids.as_deref(),
                                     &adaptive_buffer,
                                     udp_gso_enabled,
+                                    None,
                                 )
                                 .await;
                                 if let Err(e) = result {
@@ -745,6 +806,7 @@ async fn process_datagram(
     sni_proxy_ids: Option<&[String]>,
     adaptive_buffer: &Arc<crate::adaptive_buffer::AdaptiveBufferTracker>,
     udp_gso_enabled: bool,
+    local_addr: Option<IpAddr>,
 ) -> Result<(), anyhow::Error> {
     // Run per-datagram plugins (e.g., udp_rate_limiting) before session
     // allocation so dropped datagrams don't consume session slots or trigger
@@ -825,6 +887,13 @@ async fn process_datagram(
         )
         .await?
     };
+
+    // Record the per-datagram local (destination) address on the session the
+    // first time the kernel exposes one. `OnceLock::set` is a no-op if already
+    // set, so this is cheap on subsequent datagrams.
+    if let Some(la) = local_addr {
+        let _ = session.local_addr.set(la);
+    }
 
     // Update cache for next datagram.
     *last_client = Some((client_addr, session.clone()));
@@ -1962,6 +2031,7 @@ async fn create_session(
         sni_hostname: stream_ctx.sni_hostname.clone(),
         consumer_username,
         metadata: std::sync::Mutex::new(stream_ctx.take_metadata()),
+        local_addr: std::sync::OnceLock::new(),
     });
 
     sessions.insert(client_addr, session.clone());
@@ -2145,6 +2215,13 @@ async fn create_session(
             #[cfg(not(target_os = "linux"))]
             let send_batched = false;
 
+            // Snapshot the session's captured local (reply-source) address —
+            // cheap lock-free `OnceLock::get()` — so every sendmsg in this
+            // iteration can attach it as IP(v6)_PKTINFO cmsg and skip the
+            // routing lookup.
+            #[cfg(target_os = "linux")]
+            let session_local_ip: Option<IpAddr> = reply_session.local_addr.get().copied();
+
             if send_batched {
                 #[cfg(target_os = "linux")]
                 {
@@ -2157,10 +2234,11 @@ async fn create_session(
                             send_data,
                             &mut gso_failed,
                             &reply_proxy_id,
+                            session_local_ip,
                         )
                         .await;
                     } else {
-                        send_batch.push(send_data, client_addr);
+                        send_batch.push_with_local(send_data, client_addr, session_local_ip);
                     }
                 }
             } else if let Err(e) = frontend.send_to(send_data, client_addr).await {
@@ -2240,13 +2318,22 @@ async fn create_session(
                                             &buf[..len2],
                                             &mut gso_failed,
                                             &reply_proxy_id,
+                                            session_local_ip,
                                         )
                                         .await;
-                                    } else if !send_batch.push(&buf[..len2], client_addr) {
+                                    } else if !send_batch.push_with_local(
+                                        &buf[..len2],
+                                        client_addr,
+                                        session_local_ip,
+                                    ) {
                                         // Batch full — flush and push again.
                                         use std::os::unix::io::AsRawFd;
                                         let _ = send_batch.flush(frontend.as_raw_fd());
-                                        send_batch.push(&buf[..len2], client_addr);
+                                        send_batch.push_with_local(
+                                            &buf[..len2],
+                                            client_addr,
+                                            session_local_ip,
+                                        );
                                     }
                                 }
                             } else if let Err(e) = frontend.send_to(&buf[..len2], client_addr).await
@@ -2307,7 +2394,8 @@ async fn create_session(
             if send_batched {
                 // Flush GSO batch first (if used).
                 if reply_udp_gso && !gso_failed && !gso_batch.is_empty() {
-                    let flush_result = flush_gso_batch(&mut gso_batch, &frontend, client_addr);
+                    let flush_result =
+                        flush_gso_batch(&mut gso_batch, &frontend, client_addr, session_local_ip);
                     if let Err(e) = flush_result {
                         debug!(
                             proxy_id = %reply_proxy_id,
@@ -2318,7 +2406,11 @@ async fn create_session(
                         gso_failed = true;
                         // Replay all buffered datagrams through sendmmsg.
                         loop {
-                            gso_batch.drain_to_sendmmsg(&mut send_batch, client_addr);
+                            gso_batch.drain_to_sendmmsg(
+                                &mut send_batch,
+                                client_addr,
+                                session_local_ip,
+                            );
                             if gso_batch.is_empty() {
                                 break;
                             }
@@ -2497,6 +2589,7 @@ mod tests {
                 "request_id".to_string(),
                 "stream-123".to_string(),
             )])),
+            local_addr: std::sync::OnceLock::new(),
         }
     }
 
