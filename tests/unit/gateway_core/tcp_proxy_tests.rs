@@ -66,7 +66,7 @@ async fn test_bidirectional_copy_client_read_error_marks_client_to_backend() {
     let client = ResetOnReadStream;
     let (backend, _peer) = tokio::io::duplex(1024);
 
-    let result = bidirectional_copy_for_test(client, backend, None, 8 * 1024).await;
+    let result = bidirectional_copy_for_test(client, backend, None, None, 8 * 1024).await;
 
     let (dir, class, _side, _msg) = result
         .first_failure
@@ -81,7 +81,7 @@ async fn test_bidirectional_copy_backend_read_error_marks_backend_to_client() {
     let (client, _peer) = tokio::io::duplex(1024);
     let backend = ResetOnReadStream;
 
-    let result = bidirectional_copy_for_test(client, backend, None, 8 * 1024).await;
+    let result = bidirectional_copy_for_test(client, backend, None, None, 8 * 1024).await;
 
     let (dir, class, _side, _msg) = result
         .first_failure
@@ -99,7 +99,7 @@ async fn test_bidirectional_copy_clean_close_no_failure() {
     drop(client_peer);
     drop(backend_peer);
 
-    let result = bidirectional_copy_for_test(client, backend, None, 8 * 1024).await;
+    let result = bidirectional_copy_for_test(client, backend, None, None, 8 * 1024).await;
 
     assert!(
         result.first_failure.is_none(),
@@ -121,7 +121,7 @@ async fn test_bidirectional_copy_preserves_bytes_across_errors() {
         let _ = client_peer.shutdown().await;
     });
 
-    let result = bidirectional_copy_for_test(client, backend, None, 8 * 1024).await;
+    let result = bidirectional_copy_for_test(client, backend, None, None, 8 * 1024).await;
 
     let (dir, _class, _side, _msg) = result
         .first_failure
@@ -156,8 +156,14 @@ async fn test_bidirectional_copy_c2b_bytes_preserved_on_clean_close() {
         let _ = backend_peer.read_to_end(&mut sink).await;
     });
 
-    let result =
-        bidirectional_copy_for_test(client, backend, Some(Duration::from_secs(5)), 8 * 1024).await;
+    let result = bidirectional_copy_for_test(
+        client,
+        backend,
+        Some(Duration::from_secs(5)),
+        None,
+        8 * 1024,
+    )
+    .await;
 
     assert!(
         result.first_failure.is_none(),
@@ -215,8 +221,14 @@ async fn test_bidirectional_copy_half_close_delayed_response_not_truncated() {
     });
 
     // Use a generous idle timeout (5s) so it never fires during the 300ms delay.
-    let result =
-        bidirectional_copy_for_test(client, backend, Some(Duration::from_secs(5)), 8 * 1024).await;
+    let result = bidirectional_copy_for_test(
+        client,
+        backend,
+        Some(Duration::from_secs(5)),
+        None,
+        8 * 1024,
+    )
+    .await;
 
     assert!(
         result.first_failure.is_none(),
@@ -264,9 +276,14 @@ async fn test_bidirectional_copy_half_close_idle_timeout_fires_in_phase2() {
     });
 
     // Very short idle timeout so the test completes quickly.
-    let result =
-        bidirectional_copy_for_test(client, backend, Some(Duration::from_millis(500)), 8 * 1024)
-            .await;
+    let result = bidirectional_copy_for_test(
+        client,
+        backend,
+        Some(Duration::from_millis(500)),
+        None,
+        8 * 1024,
+    )
+    .await;
 
     // Idle timeout must fire — either during Phase 1 or Phase 2.
     let (dir, class, _side, _msg) = result
@@ -275,6 +292,130 @@ async fn test_bidirectional_copy_half_close_idle_timeout_fires_in_phase2() {
         .expect("idle timeout on stalled backend must produce first_failure");
     assert_eq!(*dir, Direction::Unknown);
     assert_eq!(*class, ErrorClass::ReadWriteTimeout);
+}
+
+/// Regression: when `FERRUM_TCP_IDLE_TIMEOUT_SECONDS=0` the session idle
+/// watchdog is disabled entirely. Without a separate hard cap on Phase 2,
+/// a client half-close followed by a stalled backend would wedge the
+/// relay task forever. `FERRUM_TCP_HALF_CLOSE_MAX_WAIT_SECONDS` is the
+/// safety net — it fires even when the idle timeout is disabled, and
+/// classifies the outcome as `ReadWriteTimeout` → `IdleTimeout` in the
+/// disconnect-cause mapping so operators see a timeout label, not a
+/// generic unknown.
+#[tokio::test]
+async fn test_bidirectional_copy_half_close_hard_cap_fires_with_idle_disabled() {
+    let (client, mut client_peer) = tokio::io::duplex(4096);
+    let (backend, mut backend_peer) = tokio::io::duplex(4096);
+
+    // Client sends a small request, then half-closes cleanly — Phase 2
+    // will be entered because c2b ends in clean EOF.
+    tokio::spawn(async move {
+        let _ = client_peer.write_all(b"REQUEST").await;
+        let _ = client_peer.shutdown().await;
+        // Drain whatever the backend writes so the copy task doesn't
+        // block on write backpressure.
+        let mut sink = Vec::new();
+        let _ = client_peer.read_to_end(&mut sink).await;
+    });
+
+    // Backend stalls forever without responding — b2c never completes.
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 16];
+        loop {
+            match backend_peer.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(_) => continue,
+                Err(_) => break,
+            }
+        }
+        std::future::pending::<()>().await;
+    });
+
+    // Critical: idle timeout is `None` (disabled). Only the hard cap can
+    // terminate Phase 2 here.
+    let start = std::time::Instant::now();
+    let result = bidirectional_copy_for_test(
+        client,
+        backend,
+        None,                             // idle_timeout disabled
+        Some(Duration::from_millis(150)), // hard cap
+        8 * 1024,
+    )
+    .await;
+    let elapsed = start.elapsed();
+
+    // The hard cap must fire and return within a reasonable window of the
+    // cap value. Phase 2 is polled every second for idle/cap checks, so
+    // the cap fires at the next tick after expiry — allow generous upper
+    // bound to account for tokio scheduling.
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "hard cap must fire promptly even with idle disabled; elapsed = {:?}",
+        elapsed
+    );
+
+    let (dir, class, _side, msg) = result
+        .first_failure
+        .as_ref()
+        .expect("hard cap expiration must produce first_failure");
+    assert_eq!(*dir, Direction::Unknown);
+    assert_eq!(*class, ErrorClass::ReadWriteTimeout);
+    assert!(
+        msg.contains("half-close") || msg.contains("idle timeout"),
+        "failure message should reflect a timeout, got: {}",
+        msg
+    );
+
+    // Bytes already relayed through c2b must still be reported.
+    assert_eq!(result.bytes_client_to_backend, b"REQUEST".len() as u64);
+    assert_eq!(result.bytes_backend_to_client, 0);
+}
+
+/// Regression: when BOTH the idle timeout AND the hard cap are disabled
+/// (`None`), the relay preserves the pre-PR behaviour of waiting forever.
+/// This test exercises the clean-EOF branch with a race so the drain
+/// completes naturally — the relay must return as soon as the backend
+/// sends its response and closes, with no artificial cap firing.
+#[tokio::test]
+async fn test_bidirectional_copy_both_disabled_allows_clean_completion() {
+    let (client, mut client_peer) = tokio::io::duplex(4096);
+    let (backend, mut backend_peer) = tokio::io::duplex(4096);
+
+    tokio::spawn(async move {
+        let _ = client_peer.write_all(b"PING").await;
+        let _ = client_peer.shutdown().await;
+        let mut sink = Vec::new();
+        let _ = client_peer.read_to_end(&mut sink).await;
+    });
+
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 32];
+        let _ = backend_peer.read(&mut buf).await;
+        // 50ms processing then respond and close.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let _ = backend_peer.write_all(b"PONG-RESPONSE").await;
+        let _ = backend_peer.shutdown().await;
+    });
+
+    let result = bidirectional_copy_for_test(
+        client,
+        backend,
+        None,     // idle_timeout disabled
+        None,     // hard cap disabled
+        8 * 1024, // buf_size
+    )
+    .await;
+
+    assert!(
+        result.first_failure.is_none(),
+        "both timeouts disabled + clean completion should leave first_failure=None, got {:?}",
+        result.first_failure
+    );
+    assert_eq!(result.bytes_client_to_backend, b"PING".len() as u64);
+    assert_eq!(
+        result.bytes_backend_to_client,
+        b"PONG-RESPONSE".len() as u64
+    );
 }
 
 // ── bidirectional_splice direction tests (Linux only) ────────────────────────
@@ -354,6 +495,7 @@ async fn test_bidirectional_splice_half_close_delayed_response_not_truncated() {
         proxy_client_side,
         proxy_backend_side,
         Some(Duration::from_secs(5)),
+        None,
         64 * 1024,
     )
     .await;
@@ -416,6 +558,7 @@ async fn test_bidirectional_splice_half_close_idle_timeout_fires_in_phase2() {
         proxy_client_side,
         proxy_backend_side,
         Some(Duration::from_millis(500)),
+        None,
         64 * 1024,
     )
     .await;

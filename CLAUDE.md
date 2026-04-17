@@ -1109,6 +1109,7 @@ Reduce per-request allocations in plugin lookup
 | `FERRUM_POOL_HTTP2_MAX_CONCURRENT_STREAMS` | `1000` | Max concurrent HTTP/2 streams per backend connection |
 | `FERRUM_ROUTER_CACHE_MAX_ENTRIES` | `0` (auto) | Router prefix/negative lookup cache size. 0 = auto-scale as `max(10_000, proxies × 3)`. Set explicit value to cap memory. Min: 1,000, Max: 10,000,000 |
 | `FERRUM_TCP_IDLE_TIMEOUT_SECONDS` | `300` | Default TCP idle timeout (5 min). Per-proxy `tcp_idle_timeout_seconds` overrides. 0 = disabled |
+| `FERRUM_TCP_HALF_CLOSE_MAX_WAIT_SECONDS` | `300` | Hard cap (seconds) on Phase 2 of the TCP bidirectional relay — the half-close drain where one direction has already completed cleanly. Applies even when `FERRUM_TCP_IDLE_TIMEOUT_SECONDS=0`, so a stuck peer cannot wedge the relay forever. `0` = disabled |
 | `FERRUM_UDP_MAX_SESSIONS` | `10000` | Maximum concurrent UDP sessions per proxy |
 | `FERRUM_UDP_CLEANUP_INTERVAL_SECONDS` | `10` | UDP session cleanup sweep interval |
 | `FERRUM_UDP_RECVMMSG_BATCH_SIZE` | `64` | Datagrams per `recvmmsg` syscall on Linux (1-1024). Reduces syscall overhead for high-throughput UDP. Ignored on non-Linux |

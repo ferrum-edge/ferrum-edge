@@ -252,6 +252,89 @@ mod tests {
         assert_eq!(counter.load(Ordering::Relaxed), 1);
     }
 
+    /// Stress the `AcqRel` CAS guard that makes `fire()` + Drop single-shot.
+    ///
+    /// For each of `N` loggers, two tokio tasks race:
+    ///
+    /// * Task A: calls `logger.fire(BodyOutcome::success(...))`.
+    /// * Task B: drops its `Arc` clone of the logger, triggering the Drop
+    ///   safety net on the last reference.
+    ///
+    /// The plugin registered on every logger increments a single shared
+    /// counter each time `log()` is invoked. After all tasks join, the
+    /// counter must equal exactly `N` — one `log()` per logger, regardless
+    /// of whether the fire() arm or the Drop arm won the CAS. A value of
+    /// `2*N` would indicate a double-fire (CAS bug); less than `N` would
+    /// indicate a lost fire (e.g. taking the state twice via a non-atomic
+    /// path).
+    ///
+    /// A `tokio::sync::Barrier` gates both tasks until all `2*N` tasks are
+    /// ready, maximising contention on the CAS. The test runs on the
+    /// multi-thread runtime so tasks can execute on different threads.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_fire_and_drop_is_single_shot() {
+        const N: usize = 500;
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let plugins: Arc<Vec<Arc<dyn Plugin>>> =
+            Arc::new(vec![Arc::new(CountingPlugin(counter.clone()))]);
+
+        // Gate all tasks so they launch their CAS race simultaneously.
+        // 2*N tasks per logger (fire + drop) + 1 for the main task's wait.
+        let barrier = Arc::new(tokio::sync::Barrier::new(2 * N));
+
+        let mut handles = Vec::with_capacity(2 * N);
+
+        for _ in 0..N {
+            let ctx = Arc::new(RequestContext::new(
+                "1.2.3.4".to_string(),
+                "GET".to_string(),
+                "/".to_string(),
+            ));
+            let logger = DeferredTransactionLogger::new(fake_summary(), plugins.clone(), ctx);
+
+            // Two Arc clones — one for each task. Dropping the last clone
+            // triggers the Drop safety net.
+            let logger_fire = logger.clone();
+            let logger_drop = logger; // last clone
+
+            let barrier_fire = barrier.clone();
+            let barrier_drop = barrier.clone();
+
+            handles.push(tokio::spawn(async move {
+                barrier_fire.wait().await;
+                logger_fire.fire(BodyOutcome::success(1));
+            }));
+            handles.push(tokio::spawn(async move {
+                barrier_drop.wait().await;
+                drop(logger_drop);
+            }));
+        }
+
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        // The spawned log tasks run on tokio, so give them a moment to
+        // complete. Yielding alone is not enough because `handle.spawn`
+        // inside fire_once defers the log() call.
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+            if counter.load(Ordering::Relaxed) >= N {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        let observed = counter.load(Ordering::Relaxed);
+        assert_eq!(
+            observed, N,
+            "each logger must fire exactly once under concurrent fire/drop; \
+             observed {} of {} expected",
+            observed, N
+        );
+    }
+
     fn fake_summary() -> TransactionSummary {
         TransactionSummary {
             namespace: "ferrum".to_string(),

@@ -688,6 +688,7 @@ impl ProxyState {
             env_config_arc.tls_no_verify,
             env_config_arc.tls_ca_bundle_path.clone(),
             env_config_arc.tcp_idle_timeout_seconds,
+            env_config_arc.tcp_half_close_max_wait_seconds,
             env_config_arc.udp_max_sessions,
             env_config_arc.udp_cleanup_interval_seconds,
             tls_policy_arc.clone(),
@@ -7849,11 +7850,7 @@ async fn proxy_to_backend_http2(
     let mut sender = match state.http2_pool.get_sender(proxy, &state.dns_cache).await {
         Ok(s) => s,
         Err(e) => {
-            let msg = match &e {
-                http2_pool::Http2PoolError::BackendTimeout(m) => m.clone(),
-                http2_pool::Http2PoolError::BackendUnavailable(m) => m.clone(),
-                http2_pool::Http2PoolError::Internal(m) => m.clone(),
-            };
+            let msg = e.message().to_string();
             // Classify the H2 pool error for accurate error_class reporting.
             // Uses the shared classifier so updates to the taxonomy apply uniformly
             // instead of scattering ad-hoc substring checks across call sites.

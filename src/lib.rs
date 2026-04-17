@@ -87,6 +87,7 @@ pub mod _test_support {
         client: C,
         backend: B,
         idle_timeout: Option<std::time::Duration>,
+        half_close_cap: Option<std::time::Duration>,
         buf_size: usize,
     ) -> StreamCopyResult
     where
@@ -97,6 +98,7 @@ pub mod _test_support {
             client,
             backend,
             idle_timeout,
+            half_close_cap,
             buf_size,
         )
         .await
@@ -110,12 +112,14 @@ pub mod _test_support {
         client: tokio::net::TcpStream,
         backend: tokio::net::TcpStream,
         idle_timeout: Option<std::time::Duration>,
+        half_close_cap: Option<std::time::Duration>,
         pipe_size: usize,
     ) -> StreamCopyResult {
         crate::proxy::tcp_proxy::bidirectional_splice_for_test(
             client,
             backend,
             idle_timeout,
+            half_close_cap,
             pipe_size,
         )
         .await

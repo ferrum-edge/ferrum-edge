@@ -43,7 +43,10 @@ pub struct ProxyBody {
     /// client-visible outcome rather than values at header-flush time.
     logger: Option<Arc<crate::proxy::deferred_log::DeferredTransactionLogger>>,
     /// Monotonic byte count streamed to the client. Updated on each
-    /// successful data frame; read when firing the deferred logger.
+    /// successful data frame **only when a deferred logger is attached** —
+    /// the counter has no consumer without a logger, so the hot path skips
+    /// the atomic RMW in that case. Read when firing the deferred logger
+    /// (on success, streaming error, or Drop client-disconnect safety net).
     bytes_streamed: AtomicU64,
 }
 
@@ -299,9 +302,18 @@ impl http_body::Body for ProxyBody {
             ProxyBodyKind::Tracked(body) => Pin::new(body).poll_frame(cx),
         };
 
+        // Fast path: when no deferred logger is attached, the byte counter
+        // has no consumer — skip the atomic fetch_add entirely. The vast
+        // majority of requests do not attach a logger (only streaming
+        // responses via `with_logger` do), so this saves one atomic RMW per
+        // frame on the common path. Error / end-of-stream hooks that fire
+        // the logger still observe the counter, because their `take()` only
+        // succeeds when a logger was attached.
         match &result {
             Poll::Ready(Some(Ok(frame))) => {
-                if let Some(data) = frame.data_ref() {
+                if this.logger.is_some()
+                    && let Some(data) = frame.data_ref()
+                {
                     this.bytes_streamed
                         .fetch_add(data.len() as u64, Ordering::Relaxed);
                 }

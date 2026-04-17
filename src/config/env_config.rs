@@ -543,6 +543,18 @@ pub struct EnvConfig {
     /// Default TCP idle timeout in seconds (default: 300 / 5 min).
     /// Per-proxy `tcp_idle_timeout_seconds` overrides this. Set to 0 to disable.
     pub tcp_idle_timeout_seconds: u64,
+    /// Hard cap on Phase 2 (half-close drain) of the TCP bidirectional relay.
+    ///
+    /// After one side of a TCP proxy stream finishes cleanly (EOF), the other
+    /// direction is awaited so slow-response protocols (SMTP, IMAP,
+    /// HTTP-over-TCP passthrough) are not truncated. Normally the session
+    /// idle timeout bounds this wait, but `FERRUM_TCP_IDLE_TIMEOUT_SECONDS=0`
+    /// disables idle entirely — in that case a stalled peer could wedge the
+    /// Phase 2 future forever.
+    ///
+    /// This cap fires even when the idle timeout is disabled. Default 300
+    /// (5 minutes). Set to `0` to disable.
+    pub tcp_half_close_max_wait_seconds: u64,
 
     // UDP proxy
     /// Maximum concurrent UDP sessions per proxy (default: 10000).
@@ -965,6 +977,7 @@ impl Default for EnvConfig {
             pool_cleanup_interval_seconds: 30,
             router_cache_max_entries: 0, // 0 = auto-scale based on proxy count
             tcp_idle_timeout_seconds: 300,
+            tcp_half_close_max_wait_seconds: 300,
             udp_max_sessions: 10_000,
             udp_cleanup_interval_seconds: 10,
             udp_recvmmsg_batch_size: 64,
@@ -1364,6 +1377,11 @@ impl EnvConfig {
 
             // TCP proxy
             tcp_idle_timeout_seconds: resolve_u64(conf, "FERRUM_TCP_IDLE_TIMEOUT_SECONDS", 300),
+            tcp_half_close_max_wait_seconds: resolve_u64(
+                conf,
+                "FERRUM_TCP_HALF_CLOSE_MAX_WAIT_SECONDS",
+                300,
+            ),
 
             // UDP proxy
             udp_max_sessions: resolve_var(conf, "FERRUM_UDP_MAX_SESSIONS")

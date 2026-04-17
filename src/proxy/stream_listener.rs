@@ -65,6 +65,9 @@ pub struct StreamListenerManager {
     tls_ca_bundle_path: Option<String>,
     /// Global default TCP idle timeout in seconds (per-proxy `tcp_idle_timeout_seconds` overrides).
     tcp_idle_timeout_seconds: u64,
+    /// Hard cap (seconds) on Phase 2 of the TCP bidirectional relay.
+    /// Bounds the half-close drain even when `tcp_idle_timeout_seconds = 0`.
+    tcp_half_close_max_wait_seconds: u64,
     /// Maximum concurrent UDP sessions per proxy.
     udp_max_sessions: usize,
     /// UDP session cleanup interval in seconds.
@@ -107,6 +110,7 @@ impl StreamListenerManager {
         tls_no_verify: bool,
         tls_ca_bundle_path: Option<String>,
         tcp_idle_timeout_seconds: u64,
+        tcp_half_close_max_wait_seconds: u64,
         udp_max_sessions: usize,
         udp_cleanup_interval_seconds: u64,
         tls_policy: Option<Arc<TlsPolicy>>,
@@ -136,6 +140,7 @@ impl StreamListenerManager {
             tls_no_verify,
             tls_ca_bundle_path,
             tcp_idle_timeout_seconds,
+            tcp_half_close_max_wait_seconds,
             udp_max_sessions,
             udp_cleanup_interval_seconds,
             tls_policy,
@@ -460,6 +465,7 @@ impl StreamListenerManager {
                 let consumer_index = self.consumer_index.clone();
                 let plugin_cache = self.plugin_cache.clone();
                 let tcp_idle_timeout = self.tcp_idle_timeout_seconds;
+                let tcp_half_close_max_wait = self.tcp_half_close_max_wait_seconds;
                 let tls_policy = self.tls_policy.clone();
                 let crls = self.crls.clone();
                 let tls_ca_bundle_path = self.tls_ca_bundle_path.clone();
@@ -485,6 +491,7 @@ impl StreamListenerManager {
                         tls_ca_bundle_path,
                         plugin_cache,
                         tcp_idle_timeout_seconds: tcp_idle_timeout,
+                        tcp_half_close_max_wait_seconds: tcp_half_close_max_wait,
                         circuit_breaker_cache: cb_cache,
                         tls_policy,
                         crls,

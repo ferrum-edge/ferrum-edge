@@ -334,11 +334,9 @@ impl Http2ConnectionPool {
                 proxy.dns_cache_ttl_seconds,
             )
             .await
-            .map_err(|e| {
-                Http2PoolError::BackendUnavailable(format!(
-                    "DNS resolution failed for {}: {}",
-                    host, e
-                ))
+            .map_err(|e| Http2PoolError::BackendUnavailable {
+                message: format!("DNS resolution failed for {}: {}", host, e),
+                source: Some(BackendUnavailableSource::Dns),
             })?;
 
         // Construct SocketAddr from the resolved IpAddr + port directly.
@@ -361,10 +359,18 @@ impl Http2ConnectionPool {
                 "http2_pool: connect timeout ({}ms) to backend {}",
                 proxy.backend_connect_timeout_ms, addr
             );
-            Http2PoolError::BackendTimeout(format!(
-                "Connect timeout after {}ms to {}",
-                proxy.backend_connect_timeout_ms, addr
-            ))
+            // Synthesize an io::Error so downstream classification can walk
+            // the typed chain instead of string-matching "timeout".
+            Http2PoolError::BackendTimeout {
+                message: format!(
+                    "Connect timeout after {}ms to {}",
+                    proxy.backend_connect_timeout_ms, addr
+                ),
+                source: Some(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "backend connect timed out",
+                )),
+            }
         })?
         .map_err(|e| {
             if crate::retry::is_port_exhaustion(&e) {
@@ -377,7 +383,13 @@ impl Http2ConnectionPool {
             } else {
                 warn!("http2_pool: failed to connect to backend {}: {}", addr, e);
             }
-            Http2PoolError::BackendUnavailable(format!("Connection refused: {}", e))
+            // Preserve the typed io::Error so classify_http2_pool_error() can
+            // walk the source chain (ErrorKind::ConnectionRefused, raw_os_error
+            // for EADDRNOTAVAIL, etc.) regardless of Display wording.
+            Http2PoolError::BackendUnavailable {
+                message: format!("Connection refused: {}", e),
+                source: Some(BackendUnavailableSource::Io(e)),
+            }
         })?;
 
         // Disable Nagle for lower latency
@@ -471,11 +483,9 @@ impl Http2ConnectionPool {
         };
 
         if let Some(ca_bundle_path) = ca_path {
-            let ca_pem = std::fs::read(ca_bundle_path).map_err(|e| {
-                Http2PoolError::Internal(format!(
-                    "Failed to read CA bundle from {}: {}",
-                    ca_bundle_path, e
-                ))
+            let ca_pem = std::fs::read(ca_bundle_path).map_err(|e| Http2PoolError::Internal {
+                message: format!("Failed to read CA bundle from {}: {}", ca_bundle_path, e),
+                source: Some(InternalSource::Io(e)),
             })?;
             let mut reader = std::io::BufReader::new(&ca_pem[..]);
             let certs = rustls_pemfile::certs(&mut reader);
@@ -504,29 +514,27 @@ impl Http2ConnectionPool {
 
         let tls_config = if let (Some(cert_path), Some(key_path)) = (cert_path, key_path) {
             // Load client cert chain
-            let cert_pem = std::fs::read(cert_path).map_err(|e| {
-                Http2PoolError::Internal(format!(
-                    "Failed to read client cert from {}: {}",
-                    cert_path, e
-                ))
+            let cert_pem = std::fs::read(cert_path).map_err(|e| Http2PoolError::Internal {
+                message: format!("Failed to read client cert from {}: {}", cert_path, e),
+                source: Some(InternalSource::Io(e)),
             })?;
             let certs: Vec<_> = rustls_pemfile::certs(&mut std::io::BufReader::new(&cert_pem[..]))
                 .flatten()
                 .collect();
 
             // Load client private key
-            let key_pem = std::fs::read(key_path).map_err(|e| {
-                Http2PoolError::Internal(format!(
-                    "Failed to read client key from {}: {}",
-                    key_path, e
-                ))
+            let key_pem = std::fs::read(key_path).map_err(|e| Http2PoolError::Internal {
+                message: format!("Failed to read client key from {}: {}", key_path, e),
+                source: Some(InternalSource::Io(e)),
             })?;
             let key = rustls_pemfile::private_key(&mut std::io::BufReader::new(&key_pem[..]))
-                .map_err(|e| {
-                    Http2PoolError::Internal(format!("Failed to parse client key: {}", e))
+                .map_err(|e| Http2PoolError::Internal {
+                    message: format!("Failed to parse client key: {}", e),
+                    source: Some(InternalSource::Io(e)),
                 })?
-                .ok_or_else(|| {
-                    Http2PoolError::Internal(format!("No private key found in {}", key_path))
+                .ok_or_else(|| Http2PoolError::Internal {
+                    message: format!("No private key found in {}", key_path),
+                    source: None,
                 })?;
 
             debug!(
@@ -535,19 +543,32 @@ impl Http2ConnectionPool {
             );
 
             let verifier = crate::tls::build_server_verifier_with_crls(root_store, &self.crls)
-                .map_err(|e| Http2PoolError::Internal(format!("CRL verifier error: {}", e)))?;
+                .map_err(|e| Http2PoolError::Internal {
+                    message: format!("CRL verifier error: {}", e),
+                    source: Some(InternalSource::Message(e.to_string())),
+                })?;
             crate::tls::backend_client_config_builder(self.tls_policy.as_deref())
-                .map_err(|e| Http2PoolError::Internal(format!("TLS policy error: {}", e)))?
+                .map_err(|e| Http2PoolError::Internal {
+                    message: format!("TLS policy error: {}", e),
+                    source: Some(InternalSource::Message(e.to_string())),
+                })?
                 .with_webpki_verifier(verifier)
                 .with_client_auth_cert(certs, key)
-                .map_err(|e| {
-                    Http2PoolError::Internal(format!("Invalid client certificate/key: {}", e))
+                .map_err(|e| Http2PoolError::Internal {
+                    message: format!("Invalid client certificate/key: {}", e),
+                    source: Some(InternalSource::Rustls(e)),
                 })?
         } else {
             let verifier = crate::tls::build_server_verifier_with_crls(root_store, &self.crls)
-                .map_err(|e| Http2PoolError::Internal(format!("CRL verifier error: {}", e)))?;
+                .map_err(|e| Http2PoolError::Internal {
+                    message: format!("CRL verifier error: {}", e),
+                    source: Some(InternalSource::Message(e.to_string())),
+                })?;
             crate::tls::backend_client_config_builder(self.tls_policy.as_deref())
-                .map_err(|e| Http2PoolError::Internal(format!("TLS policy error: {}", e)))?
+                .map_err(|e| Http2PoolError::Internal {
+                    message: format!("TLS policy error: {}", e),
+                    source: Some(InternalSource::Message(e.to_string())),
+                })?
                 .with_webpki_verifier(verifier)
                 .with_no_client_auth()
         };
@@ -567,19 +588,32 @@ impl Http2ConnectionPool {
 
         let connector = TlsConnector::from(Arc::new(tls_config));
         let server_name = ServerName::try_from(host.to_string()).map_err(|e| {
-            Http2PoolError::BackendUnavailable(format!("Invalid server name: {}", e))
+            // Invalid SNI server name is a configuration/DNS problem, not a
+            // transient backend issue — classify as DNS lookup.
+            Http2PoolError::BackendUnavailable {
+                message: format!("Invalid server name: {}", e),
+                source: Some(BackendUnavailableSource::InvalidDnsName),
+            }
         })?;
 
         let tls_stream = connector.connect(server_name, tcp).await.map_err(|e| {
-            Http2PoolError::BackendUnavailable(format!("TLS handshake failed: {}", e))
+            Http2PoolError::BackendUnavailable {
+                message: format!("TLS handshake failed: {}", e),
+                source: Some(BackendUnavailableSource::Tls(e)),
+            }
         })?;
 
         let io = TokioIo::new(tls_stream);
         let builder = Self::build_h2_builder(pool_config);
 
-        let (sender, conn) = builder.handshake(io).await.map_err(|e| {
-            Http2PoolError::BackendUnavailable(format!("h2 handshake failed: {}", e))
-        })?;
+        let (sender, conn) =
+            builder
+                .handshake(io)
+                .await
+                .map_err(|e| Http2PoolError::BackendUnavailable {
+                    message: format!("h2 handshake failed: {}", e),
+                    source: Some(BackendUnavailableSource::Hyper(e)),
+                })?;
 
         // Spawn the connection driver
         tokio::spawn(async move {
@@ -635,29 +669,73 @@ impl Http2ConnectionPool {
 
 /// Classify an `Http2PoolError` into the shared `ErrorClass` taxonomy.
 ///
-/// Previously the H2 direct-pool path produced errors that never made it into
-/// transaction-log `error_class` fields — operators had only the opaque error
-/// string to go on. This helper performs the same pattern-matching strategy as
-/// `classify_boxed_error` for the wrapped message but prefers the variant tag
-/// as the primary signal so classification is stable across minor wording
-/// changes.
+/// Prefers **typed source-chain classification** — walks `std::error::Error::source()`
+/// looking for `io::Error` kinds (ConnectionRefused, ConnectionReset, TimedOut,
+/// BrokenPipe, EADDRNOTAVAIL) and `hyper::Error` variants, mirroring
+/// `classify_http3_error`. Falls back to string heuristics only when no typed
+/// cause is present (e.g., `Internal` variants with a message-only source, or
+/// `BackendUnavailable::Dns` / `InvalidDnsName` markers that don't carry a
+/// concrete error value).
+///
+/// Without this, classification was fragile — swapping `"refused"` for
+/// `"denied"` in a wrapper would have silently changed the `error_class` label.
 pub fn classify_http2_pool_error(err: &Http2PoolError) -> crate::retry::ErrorClass {
     use crate::retry::ErrorClass;
-    let msg = match err {
-        Http2PoolError::BackendUnavailable(m) => m.as_str(),
-        Http2PoolError::BackendTimeout(m) => m.as_str(),
-        Http2PoolError::Internal(m) => m.as_str(),
-    };
-    let lower = msg.to_ascii_lowercase();
+
+    // 1. Walk the typed source chain first — covers io::Error, hyper::Error,
+    //    rustls::Error anywhere in the nested chain.
+    if let Some(cls) = classify_typed_chain(err) {
+        return cls;
+    }
+
+    // 2. Marker variants that intentionally do not carry a concrete error
+    //    value (DNS resolution failed inside the cache, InvalidDnsName parse
+    //    error from rustls ServerName).
     match err {
-        Http2PoolError::BackendTimeout(_) => {
+        Http2PoolError::BackendUnavailable {
+            source: Some(BackendUnavailableSource::Dns),
+            ..
+        } => return ErrorClass::DnsLookupError,
+        Http2PoolError::BackendUnavailable {
+            source: Some(BackendUnavailableSource::InvalidDnsName),
+            ..
+        } => return ErrorClass::DnsLookupError,
+        _ => {}
+    }
+
+    // 3. Internal variants with a Message-only source (no typed cause) — the
+    //    message came from our own error builders (CRL / TLS policy / etc.)
+    //    so it is always ConnectionPoolError territory.
+    if matches!(
+        err,
+        Http2PoolError::Internal {
+            source: Some(InternalSource::Message(_)) | None,
+            ..
+        }
+    ) {
+        return ErrorClass::ConnectionPoolError;
+    }
+
+    // 4. Last-resort string fallback — preserved for completeness so hand-
+    //    crafted tests with bare `BackendUnavailable { source: None }` still
+    //    get a meaningful classification. Production paths always populate
+    //    a source.
+    let message = match err {
+        Http2PoolError::BackendUnavailable { message, .. } => message,
+        Http2PoolError::BackendTimeout { message, .. } => message,
+        Http2PoolError::Internal { message, .. } => message,
+    };
+    let lower = message.to_ascii_lowercase();
+
+    match err {
+        Http2PoolError::BackendTimeout { .. } => {
             if lower.contains("connect") {
                 ErrorClass::ConnectionTimeout
             } else {
                 ErrorClass::ReadWriteTimeout
             }
         }
-        Http2PoolError::BackendUnavailable(_) => {
+        Http2PoolError::BackendUnavailable { .. } => {
             if crate::retry::is_port_exhaustion_message(&lower) {
                 ErrorClass::PortExhaustion
             } else if lower.contains("dns") || lower.contains("resolve") {
@@ -679,14 +757,291 @@ pub fn classify_http2_pool_error(err: &Http2PoolError) -> crate::retry::ErrorCla
                 ErrorClass::ConnectionPoolError
             }
         }
-        Http2PoolError::Internal(_) => ErrorClass::ConnectionPoolError,
+        Http2PoolError::Internal { .. } => ErrorClass::ConnectionPoolError,
     }
 }
 
+/// Walk the error source chain, mapping the first recognisable typed variant
+/// to an `ErrorClass`. Returns `None` when the chain carries no io/hyper/rustls
+/// variant that the taxonomy can pin down.
+fn classify_typed_chain(err: &Http2PoolError) -> Option<crate::retry::ErrorClass> {
+    use crate::retry::ErrorClass;
+
+    // For the BackendTimeout marker we want to return ConnectionTimeout even
+    // if the chain only contains a synthesized TimedOut io::Error — consult
+    // the variant up-front.
+    let timeout_is_connect = matches!(err, Http2PoolError::BackendTimeout { .. });
+
+    // First hop: inspect the immediate `BackendUnavailableSource` so we can
+    // map the `Tls` marker to `TlsError` directly. After that we walk the
+    // generic source chain looking for io/hyper/rustls variants.
+    //
+    // Note: once inside `classify_chain_from` we trust typed io::ErrorKind
+    // signals — so `Tls(io::Error { kind: ConnectionReset, ... })` would
+    // classify as ConnectionReset, which is correct (a TLS session that
+    // died mid-stream on a reset *is* a reset, not a handshake failure).
+    // Only generic `Other` / `InvalidData` wrappers fall through to the
+    // TLS marker override below.
+    match err {
+        Http2PoolError::BackendUnavailable {
+            source: Some(BackendUnavailableSource::Tls(io_err)),
+            ..
+        } => {
+            // Let typed ErrorKind win if set, otherwise fall back to TlsError.
+            if let Some(cls) = classify_io_error(io_err, timeout_is_connect) {
+                return Some(cls);
+            }
+            return Some(ErrorClass::TlsError);
+        }
+        Http2PoolError::BackendUnavailable {
+            source: Some(BackendUnavailableSource::Hyper(hyper_err)),
+            ..
+        } => {
+            if let Some(cls) = classify_hyper_error(hyper_err) {
+                return Some(cls);
+            }
+            // Walk the hyper error's source chain for an inner io::Error.
+            let mut current: Option<&(dyn std::error::Error + 'static)> =
+                std::error::Error::source(hyper_err as &dyn std::error::Error);
+            while let Some(node) = current {
+                if let Some(io_err) = node.downcast_ref::<std::io::Error>()
+                    && let Some(cls) = classify_io_error(io_err, timeout_is_connect)
+                {
+                    return Some(cls);
+                }
+                current = node.source();
+            }
+            return Some(ErrorClass::ProtocolError);
+        }
+        _ => {}
+    }
+
+    // General source-chain walk — handles BackendUnavailable::Io,
+    // BackendTimeout, and any Internal::Io / Internal::Rustls paths.
+    classify_chain_from(
+        std::error::Error::source(err as &dyn std::error::Error),
+        timeout_is_connect,
+    )
+}
+
+/// Walk an `std::error::Error` chain starting at `start`, returning the first
+/// classification we can pin down from a typed node.
+fn classify_chain_from(
+    start: Option<&(dyn std::error::Error + 'static)>,
+    timeout_is_connect: bool,
+) -> Option<crate::retry::ErrorClass> {
+    use crate::retry::ErrorClass;
+    let mut current = start;
+    while let Some(node) = current {
+        if let Some(io_err) = node.downcast_ref::<std::io::Error>()
+            && let Some(cls) = classify_io_error(io_err, timeout_is_connect)
+        {
+            return Some(cls);
+        }
+        if let Some(hyper_err) = node.downcast_ref::<hyper::Error>()
+            && let Some(cls) = classify_hyper_error(hyper_err)
+        {
+            return Some(cls);
+        }
+        if node.downcast_ref::<rustls::Error>().is_some() {
+            return Some(ErrorClass::TlsError);
+        }
+        current = node.source();
+    }
+    None
+}
+
+fn classify_io_error(
+    io_err: &std::io::Error,
+    timeout_is_connect: bool,
+) -> Option<crate::retry::ErrorClass> {
+    use crate::retry::ErrorClass;
+    if matches!(io_err.raw_os_error(), Some(99) | Some(49) | Some(10049)) {
+        return Some(ErrorClass::PortExhaustion);
+    }
+    match io_err.kind() {
+        std::io::ErrorKind::TimedOut => Some(if timeout_is_connect {
+            ErrorClass::ConnectionTimeout
+        } else {
+            ErrorClass::ReadWriteTimeout
+        }),
+        std::io::ErrorKind::ConnectionRefused => Some(ErrorClass::ConnectionRefused),
+        std::io::ErrorKind::ConnectionReset => Some(ErrorClass::ConnectionReset),
+        std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionAborted => {
+            Some(ErrorClass::ConnectionClosed)
+        }
+        // Generic kinds (Other, InvalidData, etc.) commonly wrap
+        // TLS / protocol errors — let the caller keep walking.
+        _ => None,
+    }
+}
+
+fn classify_hyper_error(hyper_err: &hyper::Error) -> Option<crate::retry::ErrorClass> {
+    use crate::retry::ErrorClass;
+    if hyper_err.is_timeout() {
+        return Some(ErrorClass::ReadWriteTimeout);
+    }
+    if hyper_err.is_incomplete_message() {
+        return Some(ErrorClass::ConnectionClosed);
+    }
+    // Generic hyper error — try to detect protocol/GOAWAY in Debug.
+    let debug = format!("{:?}", hyper_err);
+    if debug.contains("GoAway") || debug.contains("goaway") || debug.contains("Protocol") {
+        return Some(ErrorClass::ProtocolError);
+    }
+    None
+}
+
 /// Errors specific to HTTP/2 pool operations.
+///
+/// Each variant carries a human-readable `message` (for logs) and an optional
+/// typed `source` so classification can walk the real error chain instead of
+/// string-matching on the message. `std::error::Error::source()` is implemented
+/// so external consumers (logging, tracing, `anyhow` attach-context) can walk
+/// to the root cause.
 #[derive(Debug)]
 pub enum Http2PoolError {
-    BackendUnavailable(String),
-    BackendTimeout(String),
-    Internal(String),
+    /// The backend is reachable in name only — TCP connect failed, TLS
+    /// handshake failed, DNS didn't resolve, or an h2 handshake produced an
+    /// error. Carries the source so classifiers and logs can dig into the
+    /// original cause.
+    BackendUnavailable {
+        message: String,
+        source: Option<BackendUnavailableSource>,
+    },
+    /// Connection or operation timed out. `source` is populated with an
+    /// `io::Error` whose kind is `TimedOut` so classifiers can detect this
+    /// via `ErrorKind`, not via the string.
+    BackendTimeout {
+        message: String,
+        source: Option<std::io::Error>,
+    },
+    /// Internal pool error — certificate loading, TLS policy build,
+    /// configuration problems. These are almost always config/setup bugs
+    /// rather than transient backend issues; classified as
+    /// `ConnectionPoolError`.
+    Internal {
+        message: String,
+        source: Option<InternalSource>,
+    },
+}
+
+/// Typed source for `Http2PoolError::BackendUnavailable` so classification can
+/// distinguish between IO failures (with an `io::Error` carrying
+/// `ErrorKind::ConnectionRefused`, etc.), TLS handshake failures, hyper-level
+/// framing errors, and DNS/SNI-name parse failures.
+#[derive(Debug)]
+pub enum BackendUnavailableSource {
+    /// TCP connect or socket layer failure. The inner `io::Error` carries the
+    /// typed kind (`ConnectionRefused`, `ConnectionReset`, `TimedOut`, etc.).
+    Io(std::io::Error),
+    /// TLS handshake failure. Many rustls errors arrive as an `io::Error`
+    /// wrapper, but tokio_rustls occasionally surfaces the original
+    /// `rustls::Error` — both get classified as `TlsError`.
+    Tls(std::io::Error),
+    /// HTTP/2 framing/handshake failure from hyper — `is_timeout` or
+    /// `is_incomplete_message` further narrow the class; other wording
+    /// containing `GoAway` / `Protocol` implies `ProtocolError`.
+    Hyper(hyper::Error),
+    /// DNS resolution failed inside the shared cache. The upstream error
+    /// doesn't downcast to anything useful here, so we carry a marker and
+    /// classify as `DnsLookupError`.
+    Dns,
+    /// `rustls::pki_types::ServerName::try_from` rejected the hostname
+    /// (invalid SNI label). Classified as `DnsLookupError` because the
+    /// remediation is a DNS/config change.
+    InvalidDnsName,
+}
+
+impl std::error::Error for BackendUnavailableSource {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(e) | Self::Tls(e) => Some(e),
+            Self::Hyper(e) => Some(e),
+            Self::Dns | Self::InvalidDnsName => None,
+        }
+    }
+}
+
+impl std::fmt::Display for BackendUnavailableSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(e) => write!(f, "{}", e),
+            Self::Tls(e) => write!(f, "{}", e),
+            Self::Hyper(e) => write!(f, "{}", e),
+            Self::Dns => write!(f, "dns resolution failed"),
+            Self::InvalidDnsName => write!(f, "invalid dns name"),
+        }
+    }
+}
+
+/// Typed source for `Http2PoolError::Internal`.
+#[derive(Debug)]
+pub enum InternalSource {
+    /// Filesystem read / PEM parse failure.
+    Io(std::io::Error),
+    /// rustls configuration error (invalid cert chain, bad key, etc.).
+    Rustls(rustls::Error),
+    /// A string-only error from an upstream helper that doesn't expose a
+    /// typed chain. Kept last-resort so we don't pretend we have more
+    /// information than we actually do.
+    Message(String),
+}
+
+impl std::error::Error for InternalSource {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(e) => Some(e),
+            Self::Rustls(e) => Some(e),
+            Self::Message(_) => None,
+        }
+    }
+}
+
+impl std::fmt::Display for InternalSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(e) => write!(f, "{}", e),
+            Self::Rustls(e) => write!(f, "{}", e),
+            Self::Message(m) => write!(f, "{}", m),
+        }
+    }
+}
+
+impl std::fmt::Display for Http2PoolError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BackendUnavailable { message, .. } => write!(f, "{}", message),
+            Self::BackendTimeout { message, .. } => write!(f, "{}", message),
+            Self::Internal { message, .. } => write!(f, "{}", message),
+        }
+    }
+}
+
+impl std::error::Error for Http2PoolError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::BackendUnavailable { source, .. } => source
+                .as_ref()
+                .map(|s| s as &(dyn std::error::Error + 'static)),
+            Self::BackendTimeout { source, .. } => source
+                .as_ref()
+                .map(|s| s as &(dyn std::error::Error + 'static)),
+            Self::Internal { source, .. } => source
+                .as_ref()
+                .map(|s| s as &(dyn std::error::Error + 'static)),
+        }
+    }
+}
+
+impl Http2PoolError {
+    /// Return the human-readable message for this error. Used by consumers
+    /// that need to propagate the message into a response body or log line.
+    pub fn message(&self) -> &str {
+        match self {
+            Self::BackendUnavailable { message, .. } => message,
+            Self::BackendTimeout { message, .. } => message,
+            Self::Internal { message, .. } => message,
+        }
+    }
 }

@@ -196,13 +196,14 @@ pub(crate) async fn bidirectional_copy_for_test<C, B>(
     client: C,
     backend: B,
     idle_timeout: Option<Duration>,
+    half_close_cap: Option<Duration>,
     buf_size: usize,
 ) -> StreamCopyResult
 where
     C: AsyncRead + AsyncWrite + Unpin,
     B: AsyncRead + AsyncWrite + Unpin,
 {
-    bidirectional_copy(client, backend, idle_timeout, buf_size).await
+    bidirectional_copy(client, backend, idle_timeout, half_close_cap, buf_size).await
 }
 
 /// Crate-visible entry point to the Linux `bidirectional_splice` for the
@@ -214,9 +215,10 @@ pub(crate) async fn bidirectional_splice_for_test(
     client: TcpStream,
     backend: TcpStream,
     idle_timeout: Option<Duration>,
+    half_close_cap: Option<Duration>,
     pipe_size: usize,
 ) -> StreamCopyResult {
-    bidirectional_splice(client, backend, idle_timeout, pipe_size).await
+    bidirectional_splice(client, backend, idle_timeout, half_close_cap, pipe_size).await
 }
 
 /// Cached backend TLS configuration to avoid reading certificate files from
@@ -327,6 +329,11 @@ pub struct TcpListenerConfig {
     pub plugin_cache: Arc<PluginCache>,
     /// Global default TCP idle timeout in seconds. Per-proxy `tcp_idle_timeout_seconds` overrides.
     pub tcp_idle_timeout_seconds: u64,
+    /// Hard cap (seconds) on Phase 2 of the TCP bidirectional relay — the
+    /// half-close drain where one direction has already completed cleanly.
+    /// Applies even when the session idle timeout is disabled, so a stuck
+    /// peer cannot wedge the relay task forever. `0` disables the cap.
+    pub tcp_half_close_max_wait_seconds: u64,
     /// Circuit breaker cache shared with HTTP proxies.
     pub circuit_breaker_cache: Arc<CircuitBreakerCache>,
     /// TLS hardening policy for backend connections (cipher suites, protocol versions).
@@ -374,6 +381,7 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
         tls_ca_bundle_path,
         plugin_cache,
         tcp_idle_timeout_seconds: global_tcp_idle_timeout,
+        tcp_half_close_max_wait_seconds,
         circuit_breaker_cache,
         tls_policy,
         crls,
@@ -514,6 +522,7 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
                         frontend_tls.as_ref(),
                         backend_tls.as_deref(),
                         global_tcp_idle_timeout,
+                        tcp_half_close_max_wait_seconds,
                         &cb_cache,
                         &plugins,
                         &mut stream_ctx,
@@ -669,6 +678,10 @@ struct TcpConnParams {
     dns_cache_ttl_seconds: Option<u64>,
     backend_connect_timeout_ms: u64,
     tcp_idle_timeout_seconds: u64,
+    /// Hard cap on Phase 2 (half-close drain). Applies even when the session
+    /// idle timeout is disabled, preventing a stalled peer from wedging the
+    /// drain future forever. `0` disables the cap.
+    tcp_half_close_max_wait_seconds: u64,
     /// Retry config for connection-phase retries (before data transfer).
     retry: Option<crate::config::types::RetryConfig>,
     /// Upstream ID for load-balanced target selection on retry.
@@ -731,6 +744,7 @@ async fn handle_tcp_connection(
     frontend_tls_config: Option<&Arc<rustls::ServerConfig>>,
     cached_backend_tls: Option<&CachedBackendTlsConfig>,
     global_tcp_idle_timeout: u64,
+    tcp_half_close_max_wait_seconds: u64,
     circuit_breaker_cache: &CircuitBreakerCache,
     plugins: &[Arc<dyn crate::plugins::Plugin>],
     stream_ctx: &mut StreamConnectionContext,
@@ -762,6 +776,7 @@ async fn handle_tcp_connection(
         frontend_tls_config,
         cached_backend_tls,
         global_tcp_idle_timeout,
+        tcp_half_close_max_wait_seconds,
         circuit_breaker_cache,
         start,
         &mut backend_info,
@@ -795,6 +810,7 @@ async fn handle_tcp_connection_inner(
     frontend_tls_config: Option<&Arc<rustls::ServerConfig>>,
     cached_backend_tls: Option<&CachedBackendTlsConfig>,
     global_tcp_idle_timeout: u64,
+    tcp_half_close_max_wait_seconds: u64,
     circuit_breaker_cache: &CircuitBreakerCache,
     start: Instant,
     backend_info: &mut TcpBackendInfo,
@@ -874,6 +890,7 @@ async fn handle_tcp_connection_inner(
             tcp_idle_timeout_seconds: proxy
                 .tcp_idle_timeout_seconds
                 .unwrap_or(global_tcp_idle_timeout),
+            tcp_half_close_max_wait_seconds,
             retry: proxy.retry.clone(),
             upstream_id: proxy.upstream_id.clone(),
             passthrough: proxy.passthrough,
@@ -909,6 +926,11 @@ async fn handle_tcp_connection_inner(
         let connect_timeout = Duration::from_millis(params.backend_connect_timeout_ms);
         let idle_timeout = if params.tcp_idle_timeout_seconds > 0 {
             Some(Duration::from_secs(params.tcp_idle_timeout_seconds))
+        } else {
+            None
+        };
+        let half_close_cap = if params.tcp_half_close_max_wait_seconds > 0 {
+            Some(Duration::from_secs(params.tcp_half_close_max_wait_seconds))
         } else {
             None
         };
@@ -950,14 +972,33 @@ async fn handle_tcp_connection_inner(
         // When io_uring is enabled, use IORING_OP_SPLICE on dedicated blocking threads.
         #[cfg(target_os = "linux")]
         let copy_result = if io_uring_splice_enabled {
-            bidirectional_splice_io_uring(client_stream, backend_stream, idle_timeout, buf_size)
-                .await
+            bidirectional_splice_io_uring(
+                client_stream,
+                backend_stream,
+                idle_timeout,
+                half_close_cap,
+                buf_size,
+            )
+            .await
         } else {
-            bidirectional_splice(client_stream, backend_stream, idle_timeout, buf_size).await
+            bidirectional_splice(
+                client_stream,
+                backend_stream,
+                idle_timeout,
+                half_close_cap,
+                buf_size,
+            )
+            .await
         };
         #[cfg(not(target_os = "linux"))]
-        let copy_result =
-            bidirectional_copy(client_stream, backend_stream, idle_timeout, buf_size).await;
+        let copy_result = bidirectional_copy(
+            client_stream,
+            backend_stream,
+            idle_timeout,
+            half_close_cap,
+            buf_size,
+        )
+        .await;
 
         adaptive_buffer.record_connection(
             proxy_id,
@@ -993,6 +1034,11 @@ async fn handle_tcp_connection_inner(
     let connect_timeout = Duration::from_millis(params.backend_connect_timeout_ms);
     let idle_timeout = if params.tcp_idle_timeout_seconds > 0 {
         Some(Duration::from_secs(params.tcp_idle_timeout_seconds))
+    } else {
+        None
+    };
+    let half_close_cap = if params.tcp_half_close_max_wait_seconds > 0 {
+        Some(Duration::from_secs(params.tcp_half_close_max_wait_seconds))
     } else {
         None
     };
@@ -1245,7 +1291,7 @@ async fn handle_tcp_connection_inner(
         let buf_size = adaptive_buffer.get_buffer_size(proxy_id);
         match backend_stream {
             BackendStream::Tls(bs) => {
-                bidirectional_copy(tls_stream, bs, idle_timeout, buf_size).await
+                bidirectional_copy(tls_stream, bs, idle_timeout, half_close_cap, buf_size).await
             }
             BackendStream::Plain(bs) => {
                 // On Linux with kTLS, attempt to install TLS keys into the kernel
@@ -1253,7 +1299,15 @@ async fn handle_tcp_connection_inner(
                 #[cfg(target_os = "linux")]
                 {
                     if ktls_enabled {
-                        match try_ktls_splice(tls_stream, bs, idle_timeout, buf_size).await {
+                        match try_ktls_splice(
+                            tls_stream,
+                            bs,
+                            idle_timeout,
+                            half_close_cap,
+                            buf_size,
+                        )
+                        .await
+                        {
                             Ok(result) => {
                                 used_splice = true;
                                 result
@@ -1262,8 +1316,14 @@ async fn handle_tcp_connection_inner(
                                 // kTLS not available for this cipher/version — fall back
                                 // to userspace copy with the TLS stream intact.
                                 let (tls_stream_back, bs_back) = *streams;
-                                bidirectional_copy(tls_stream_back, bs_back, idle_timeout, buf_size)
-                                    .await
+                                bidirectional_copy(
+                                    tls_stream_back,
+                                    bs_back,
+                                    idle_timeout,
+                                    half_close_cap,
+                                    buf_size,
+                                )
+                                .await
                             }
                             Err(KtlsError::Installed(e)) => {
                                 // Unrecoverable: TLS stream was consumed via into_inner()
@@ -1289,12 +1349,13 @@ async fn handle_tcp_connection_inner(
                             }
                         }
                     } else {
-                        bidirectional_copy(tls_stream, bs, idle_timeout, buf_size).await
+                        bidirectional_copy(tls_stream, bs, idle_timeout, half_close_cap, buf_size)
+                            .await
                     }
                 }
                 #[cfg(not(target_os = "linux"))]
                 {
-                    bidirectional_copy(tls_stream, bs, idle_timeout, buf_size).await
+                    bidirectional_copy(tls_stream, bs, idle_timeout, half_close_cap, buf_size).await
                 }
             }
         }
@@ -1303,7 +1364,7 @@ async fn handle_tcp_connection_inner(
         match backend_stream {
             BackendStream::Tls(bs) => {
                 used_splice = false;
-                bidirectional_copy(client_stream, bs, idle_timeout, buf_size).await
+                bidirectional_copy(client_stream, bs, idle_timeout, half_close_cap, buf_size).await
             }
             BackendStream::Plain(bs) => {
                 // On Linux, use splice(2) for zero-copy relay when both sides
@@ -1313,16 +1374,30 @@ async fn handle_tcp_connection_inner(
                 {
                     used_splice = true;
                     if io_uring_splice_enabled {
-                        bidirectional_splice_io_uring(client_stream, bs, idle_timeout, buf_size)
-                            .await
+                        bidirectional_splice_io_uring(
+                            client_stream,
+                            bs,
+                            idle_timeout,
+                            half_close_cap,
+                            buf_size,
+                        )
+                        .await
                     } else {
-                        bidirectional_splice(client_stream, bs, idle_timeout, buf_size).await
+                        bidirectional_splice(
+                            client_stream,
+                            bs,
+                            idle_timeout,
+                            half_close_cap,
+                            buf_size,
+                        )
+                        .await
                     }
                 }
                 #[cfg(not(target_os = "linux"))]
                 {
                     used_splice = false;
-                    bidirectional_copy(client_stream, bs, idle_timeout, buf_size).await
+                    bidirectional_copy(client_stream, bs, idle_timeout, half_close_cap, buf_size)
+                        .await
                 }
             }
         }
@@ -1560,6 +1635,7 @@ async fn bidirectional_copy<C, B>(
     client: C,
     backend: B,
     idle_timeout: Option<Duration>,
+    half_close_cap: Option<Duration>,
     buf_size: usize,
 ) -> StreamCopyResult
 where
@@ -1660,9 +1736,14 @@ where
     //   without error — most commonly a half-close where the client finished
     //   sending and the backend is still generating a large/slow response (or
     //   vice versa). Wait for the remaining direction to complete naturally,
-    //   bounded only by the idle timeout. Capping this at 100ms would truncate
-    //   response bodies on request/response protocols (SMTP, IMAP, HTTP-over-
-    //   TCP passthrough) whenever the peer takes longer than 100ms to respond.
+    //   bounded by (a) the idle timeout and (b) the half-close hard cap. The
+    //   idle timeout handles "peer went silent"; the hard cap (`half_close_cap`)
+    //   handles the pathological case where idle timeout is disabled
+    //   (`FERRUM_TCP_IDLE_TIMEOUT_SECONDS=0`) and the peer stalls forever.
+    //   Capping at 100ms here would truncate slow-response protocols (SMTP,
+    //   IMAP, HTTP-over-TCP passthrough) — the default 5 min hard cap is
+    //   generous enough for any realistic response, while still preventing
+    //   permanent task leaks.
     //
     // * **Error or idle timeout** (`first_failure.is_some()`): both halves are
     //   likely in a bad state. Give the remaining direction a brief grace
@@ -1671,41 +1752,15 @@ where
     let clean_eof = first_failure.is_none();
     if !c2b_done {
         if clean_eof {
-            // Unbounded wait, still bounded by the idle timeout so a stuck
-            // peer can't wedge the connection indefinitely.
-            loop {
-                tokio::select! {
-                    biased;
-                    result = &mut c2b_fut => {
-                        if let Err((side, e)) = result {
-                            let msg = e.to_string();
-                            let err: anyhow::Error =
-                                anyhow::anyhow!("Bidirectional copy error (client→backend, {:?}): {}", side, e);
-                            first_failure = Some((
-                                Direction::ClientToBackend,
-                                classify_stream_error(&err),
-                                Some(side),
-                                msg,
-                            ));
-                        }
-                        break;
-                    }
-                    _ = tokio::time::sleep(Duration::from_secs(1)), if idle_timeout_active => {
-                        if let Some(ref la) = last_activity {
-                            let last = la.load(Ordering::Relaxed);
-                            if coarse_now_ms().saturating_sub(last) >= timeout_ms {
-                                first_failure = Some((
-                                    Direction::Unknown,
-                                    ErrorClass::ReadWriteTimeout,
-                                    None,
-                                    "idle timeout".to_string(),
-                                ));
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
+            first_failure = drain_half_close_copy(
+                &mut c2b_fut,
+                &last_activity,
+                idle_timeout_active,
+                timeout_ms,
+                half_close_cap,
+                Direction::ClientToBackend,
+            )
+            .await;
         } else {
             match tokio::time::timeout(BIDIRECTIONAL_DRAIN_GRACE, &mut c2b_fut).await {
                 Ok(Ok(())) => {}
@@ -1731,39 +1786,15 @@ where
     }
     if !b2c_done {
         if clean_eof {
-            loop {
-                tokio::select! {
-                    biased;
-                    result = &mut b2c_fut => {
-                        if let Err((side, e)) = result {
-                            let msg = e.to_string();
-                            let err: anyhow::Error =
-                                anyhow::anyhow!("Bidirectional copy error (backend→client, {:?}): {}", side, e);
-                            first_failure = Some((
-                                Direction::BackendToClient,
-                                classify_stream_error(&err),
-                                Some(side),
-                                msg,
-                            ));
-                        }
-                        break;
-                    }
-                    _ = tokio::time::sleep(Duration::from_secs(1)), if idle_timeout_active => {
-                        if let Some(ref la) = last_activity {
-                            let last = la.load(Ordering::Relaxed);
-                            if coarse_now_ms().saturating_sub(last) >= timeout_ms {
-                                first_failure = Some((
-                                    Direction::Unknown,
-                                    ErrorClass::ReadWriteTimeout,
-                                    None,
-                                    "idle timeout".to_string(),
-                                ));
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
+            first_failure = drain_half_close_copy(
+                &mut b2c_fut,
+                &last_activity,
+                idle_timeout_active,
+                timeout_ms,
+                half_close_cap,
+                Direction::BackendToClient,
+            )
+            .await;
         } else {
             match tokio::time::timeout(BIDIRECTIONAL_DRAIN_GRACE, &mut b2c_fut).await {
                 Ok(Ok(())) => {}
@@ -1792,6 +1823,100 @@ where
         bytes_client_to_backend: c2b_bytes.load(Ordering::Relaxed),
         bytes_backend_to_client: b2c_bytes.load(Ordering::Relaxed),
         first_failure,
+    }
+}
+
+/// Drain one direction of the bidirectional copy during the clean-EOF half-close
+/// phase. Returns `Some(first_failure_tuple)` when the drain ends in an error,
+/// an idle timeout, or the half-close hard cap. Returns `None` when the drain
+/// completes cleanly.
+///
+/// Bounds:
+/// * `idle_timeout_active`: if set, fires `ReadWriteTimeout` when the shared
+///   `last_activity` watermark is older than `timeout_ms`.
+/// * `half_close_cap`: if set, fires `ReadWriteTimeout` after this elapsed
+///   wall-clock time in Phase 2 *regardless of idle state*. This is the
+///   safety net that applies even when `idle_timeout_active == false`.
+///
+/// Both bounds emit `Direction::Unknown` / `ReadWriteTimeout` so
+/// `disconnect_cause_for_failure` maps them to `IdleTimeout` — they are
+/// semantically timeouts from the caller's perspective.
+async fn drain_half_close_copy<F>(
+    drain_fut: &mut F,
+    last_activity: &Option<Arc<AtomicU64>>,
+    idle_timeout_active: bool,
+    timeout_ms: u64,
+    half_close_cap: Option<Duration>,
+    direction: Direction,
+) -> Option<(Direction, ErrorClass, Option<StreamIoSide>, String)>
+where
+    F: std::future::Future<Output = Result<(), (StreamIoSide, std::io::Error)>> + Unpin,
+{
+    let phase2_start = Instant::now();
+    loop {
+        tokio::select! {
+            biased;
+            result = &mut *drain_fut => {
+                if let Err((side, e)) = result {
+                    let msg = e.to_string();
+                    let dir_label = match direction {
+                        Direction::ClientToBackend => "client→backend",
+                        Direction::BackendToClient => "backend→client",
+                        Direction::Unknown => "unknown",
+                    };
+                    let err: anyhow::Error = anyhow::anyhow!(
+                        "Bidirectional copy error ({}, {:?}): {}",
+                        dir_label, side, e
+                    );
+                    return Some((direction, classify_stream_error(&err), Some(side), msg));
+                }
+                return None;
+            }
+            _ = tokio::time::sleep(Duration::from_secs(1)), if idle_timeout_active => {
+                if let Some(la) = last_activity.as_ref() {
+                    let last = la.load(Ordering::Relaxed);
+                    if coarse_now_ms().saturating_sub(last) >= timeout_ms {
+                        return Some((
+                            Direction::Unknown,
+                            ErrorClass::ReadWriteTimeout,
+                            None,
+                            "idle timeout".to_string(),
+                        ));
+                    }
+                }
+                if let Some(cap) = half_close_cap
+                    && phase2_start.elapsed() >= cap
+                {
+                    return Some((
+                        Direction::Unknown,
+                        ErrorClass::ReadWriteTimeout,
+                        None,
+                        "tcp half-close max wait exceeded".to_string(),
+                    ));
+                }
+            }
+            // Separate branch so the hard cap fires even when the idle
+            // timeout is disabled. `half_close_cap == None` → this arm is
+            // inert (the `if let Some(cap)` guards `select!`'s condition).
+            _ = sleep_for_cap(half_close_cap), if half_close_cap.is_some() && !idle_timeout_active => {
+                return Some((
+                    Direction::Unknown,
+                    ErrorClass::ReadWriteTimeout,
+                    None,
+                    "tcp half-close max wait exceeded".to_string(),
+                ));
+            }
+        }
+    }
+}
+
+/// Wait the full `half_close_cap` duration or return immediately when `None`.
+/// Used as a safety-net branch in Phase 2's `select!` so the hard cap fires
+/// even when the idle timeout is disabled.
+async fn sleep_for_cap(half_close_cap: Option<Duration>) {
+    match half_close_cap {
+        Some(d) => tokio::time::sleep(d).await,
+        None => std::future::pending::<()>().await,
     }
 }
 
@@ -1836,6 +1961,7 @@ async fn bidirectional_splice(
     client: TcpStream,
     backend: TcpStream,
     idle_timeout: Option<Duration>,
+    half_close_cap: Option<Duration>,
     pipe_size: usize,
 ) -> StreamCopyResult {
     use std::os::unix::io::AsRawFd;
@@ -1978,9 +2104,10 @@ async fn bidirectional_splice(
     //   without error — most commonly a half-close where the client finished
     //   sending and the backend is still generating a large/slow response (or
     //   vice versa). Wait for the remaining direction to complete naturally,
-    //   bounded only by the idle timeout. Capping this at 100ms would truncate
-    //   response bodies on request/response protocols (SMTP, IMAP, HTTP-over-
-    //   TCP passthrough) whenever the peer takes longer than 100ms to respond.
+    //   bounded by the idle timeout AND the half-close hard cap. See
+    //   `bidirectional_copy` for the full rationale — the hard cap matters
+    //   here because `FERRUM_TCP_IDLE_TIMEOUT_SECONDS=0` disables idle
+    //   bookkeeping but the splice task still needs a safety net.
     //
     // * **Error or idle timeout** (`first_failure.is_some()`): both halves are
     //   likely in a bad state. Give the remaining direction a brief grace
@@ -1989,39 +2116,15 @@ async fn bidirectional_splice(
     let clean_eof = first_failure.is_none();
     if !c2b_done {
         if clean_eof {
-            // Unbounded wait, still bounded by the idle timeout so a stuck
-            // peer can't wedge the connection indefinitely.
-            loop {
-                tokio::select! {
-                    biased;
-                    result = &mut c2b_fut => {
-                        if let Err((side, e)) = result {
-                            let msg = e.to_string();
-                            first_failure = Some((
-                                Direction::ClientToBackend,
-                                classify_stream_error(&e),
-                                Some(side),
-                                msg,
-                            ));
-                        }
-                        break;
-                    }
-                    _ = tokio::time::sleep(Duration::from_secs(1)), if idle_timeout_active => {
-                        if let Some(ref la) = last_activity {
-                            let last = la.load(Ordering::Relaxed);
-                            if coarse_now_ms().saturating_sub(last) >= timeout_ms {
-                                first_failure = Some((
-                                    Direction::Unknown,
-                                    ErrorClass::ReadWriteTimeout,
-                                    None,
-                                    "idle timeout".to_string(),
-                                ));
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
+            first_failure = drain_half_close_splice(
+                &mut c2b_fut,
+                &last_activity,
+                idle_timeout_active,
+                timeout_ms,
+                half_close_cap,
+                Direction::ClientToBackend,
+            )
+            .await;
         } else {
             match tokio::time::timeout(BIDIRECTIONAL_DRAIN_GRACE, &mut c2b_fut).await {
                 Ok(Ok(())) => {}
@@ -2042,37 +2145,15 @@ async fn bidirectional_splice(
     }
     if !b2c_done {
         if clean_eof {
-            loop {
-                tokio::select! {
-                    biased;
-                    result = &mut b2c_fut => {
-                        if let Err((side, e)) = result {
-                            let msg = e.to_string();
-                            first_failure = Some((
-                                Direction::BackendToClient,
-                                classify_stream_error(&e),
-                                Some(side),
-                                msg,
-                            ));
-                        }
-                        break;
-                    }
-                    _ = tokio::time::sleep(Duration::from_secs(1)), if idle_timeout_active => {
-                        if let Some(ref la) = last_activity {
-                            let last = la.load(Ordering::Relaxed);
-                            if coarse_now_ms().saturating_sub(last) >= timeout_ms {
-                                first_failure = Some((
-                                    Direction::Unknown,
-                                    ErrorClass::ReadWriteTimeout,
-                                    None,
-                                    "idle timeout".to_string(),
-                                ));
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
+            first_failure = drain_half_close_splice(
+                &mut b2c_fut,
+                &last_activity,
+                idle_timeout_active,
+                timeout_ms,
+                half_close_cap,
+                Direction::BackendToClient,
+            )
+            .await;
         } else {
             match tokio::time::timeout(BIDIRECTIONAL_DRAIN_GRACE, &mut b2c_fut).await {
                 Ok(Ok(())) => {}
@@ -2099,6 +2180,68 @@ async fn bidirectional_splice(
     }
 }
 
+/// Splice-path equivalent of `drain_half_close_copy`. Separate function
+/// because the splice direction future's `Ok` branch returns `anyhow::Error`
+/// rather than `std::io::Error`, and the classifier takes the outer anyhow
+/// value directly.
+#[cfg(target_os = "linux")]
+async fn drain_half_close_splice<F>(
+    drain_fut: &mut F,
+    last_activity: &Option<Arc<AtomicU64>>,
+    idle_timeout_active: bool,
+    timeout_ms: u64,
+    half_close_cap: Option<Duration>,
+    direction: Direction,
+) -> Option<(Direction, ErrorClass, Option<StreamIoSide>, String)>
+where
+    F: std::future::Future<Output = Result<(), (StreamIoSide, anyhow::Error)>> + Unpin,
+{
+    let phase2_start = Instant::now();
+    loop {
+        tokio::select! {
+            biased;
+            result = &mut *drain_fut => {
+                if let Err((side, e)) = result {
+                    let msg = e.to_string();
+                    return Some((direction, classify_stream_error(&e), Some(side), msg));
+                }
+                return None;
+            }
+            _ = tokio::time::sleep(Duration::from_secs(1)), if idle_timeout_active => {
+                if let Some(la) = last_activity.as_ref() {
+                    let last = la.load(Ordering::Relaxed);
+                    if coarse_now_ms().saturating_sub(last) >= timeout_ms {
+                        return Some((
+                            Direction::Unknown,
+                            ErrorClass::ReadWriteTimeout,
+                            None,
+                            "idle timeout".to_string(),
+                        ));
+                    }
+                }
+                if let Some(cap) = half_close_cap
+                    && phase2_start.elapsed() >= cap
+                {
+                    return Some((
+                        Direction::Unknown,
+                        ErrorClass::ReadWriteTimeout,
+                        None,
+                        "tcp half-close max wait exceeded".to_string(),
+                    ));
+                }
+            }
+            _ = sleep_for_cap(half_close_cap), if half_close_cap.is_some() && !idle_timeout_active => {
+                return Some((
+                    Direction::Unknown,
+                    ErrorClass::ReadWriteTimeout,
+                    None,
+                    "tcp half-close max wait exceeded".to_string(),
+                ));
+            }
+        }
+    }
+}
+
 /// Bidirectional zero-copy relay using io_uring `IORING_OP_SPLICE`.
 ///
 /// Each direction gets its own io_uring ring (8 entries) and runs on a
@@ -2113,8 +2256,17 @@ async fn bidirectional_splice_io_uring(
     client: TcpStream,
     backend: TcpStream,
     idle_timeout: Option<Duration>,
+    _half_close_cap: Option<Duration>,
     pipe_size: usize,
 ) -> StreamCopyResult {
+    // Note: `_half_close_cap` is accepted for signature parity with
+    // `bidirectional_splice` / `bidirectional_copy`, but the io_uring path
+    // runs both directions on dedicated blocking threads that don't observe
+    // a Phase 1 / Phase 2 split — the idle timeout inside each worker
+    // (`io_uring_splice_direction`) is the only bound. Adding a hard cap
+    // here would require cross-thread signalling; the io_uring path already
+    // uses `timeout_ms` internally, so in practice operators enabling the
+    // io_uring path should set `FERRUM_TCP_IDLE_TIMEOUT_SECONDS` > 0.
     use std::os::unix::io::AsRawFd;
     use std::sync::OnceLock;
 
@@ -2614,6 +2766,7 @@ async fn try_ktls_splice(
     tls_stream: tokio_rustls::server::TlsStream<TcpStream>,
     backend_stream: TcpStream,
     idle_timeout: Option<Duration>,
+    half_close_cap: Option<Duration>,
     buf_size: usize,
 ) -> Result<StreamCopyResult, KtlsError> {
     use std::os::unix::io::AsRawFd;
@@ -2759,7 +2912,14 @@ async fn try_ktls_splice(
     match crate::socket_opts::ktls::enable_ktls(fd, &params) {
         Ok(true) => {
             debug!("kTLS installed successfully, using splice for TLS connection");
-            Ok(bidirectional_splice(tcp_stream, backend_stream, idle_timeout, buf_size).await)
+            Ok(bidirectional_splice(
+                tcp_stream,
+                backend_stream,
+                idle_timeout,
+                half_close_cap,
+                buf_size,
+            )
+            .await)
         }
         Ok(false) => {
             // Kernel doesn't support kTLS (ENOPROTOOPT) — but we already consumed
