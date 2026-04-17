@@ -150,12 +150,27 @@ fn pre_copy_disconnect_cause(
             }
         }
         ErrorClass::ClientDisconnect => DisconnectCause::RecvError,
-        // Generic `RequestError` at the pre-copy stage overwhelmingly comes
-        // from backend-side failures that didn't match a more specific class
-        // (e.g. `resolve_backend_target` returning "No healthy targets"). Map
-        // it to `BackendError` so cause-based dashboards don't misattribute
-        // backend outages to client recv errors.
-        ErrorClass::RequestError => DisconnectCause::BackendError,
+        // `RequestError` is a catch-all; disambiguate by the error message
+        // so plugin/policy rejections (client-side) don't get reported as
+        // backend outages, while backend resolution failures
+        // (e.g. "No healthy targets") still surface as `BackendError`.
+        ErrorClass::RequestError => {
+            if error_message.contains("rejected by plugin")
+                || error_message.contains("rejected by ACL")
+                || error_message.contains("rejected by policy")
+                || error_message.contains("throttled")
+            {
+                DisconnectCause::RecvError
+            } else if error_message.contains("No healthy targets")
+                || error_message.contains("upstream")
+                || error_message.contains("backend")
+            {
+                DisconnectCause::BackendError
+            } else {
+                // Unknown-side request error — conservative fallback.
+                DisconnectCause::RecvError
+            }
+        }
         _ => DisconnectCause::RecvError,
     }
 }
