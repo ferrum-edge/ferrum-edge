@@ -41,7 +41,7 @@ const MAX_STATE_ENTRIES: usize = 100_000;
 
 /// Minimum interval between eviction sweeps in seconds. Prevents O(n) retain
 /// scans from running on every datagram during high-cardinality floods.
-const EVICTION_COOLDOWN_SECS: f64 = 1.0;
+const EVICTION_COOLDOWN_SECS: u64 = 1;
 
 /// Interval between periodic eviction sweeps (every N datagram checks).
 /// At 10k datagrams/sec, this triggers roughly every 10 seconds.
@@ -52,6 +52,10 @@ const EVICTION_CHECK_INTERVAL: u64 = 100_000;
 /// Uses a fixed-window approach with atomic operations for lock-free
 /// per-datagram checking. Window transitions are handled via CAS on
 /// the `window_epoch` field.
+///
+/// `last_check_secs` is stored as an `AtomicU64` of seconds since `epoch_base`
+/// (the plugin instance's startup `Instant`) so the per-datagram update is
+/// lock-free. CLAUDE.md forbids `Mutex`/`RwLock` on the proxy data path.
 struct WindowState {
     /// Datagram count in the current window.
     count: AtomicU64,
@@ -60,24 +64,27 @@ struct WindowState {
     /// Window epoch (monotonic instant divided by window duration).
     /// When the current epoch exceeds this, the counters are reset.
     window_epoch: AtomicU64,
-    /// Last check time for staleness detection during eviction.
-    last_check: std::sync::Mutex<Instant>,
+    /// Seconds since `UdpRateLimiting::epoch_base` at the most recent datagram.
+    /// Used by eviction to detect idle client IPs without holding any lock.
+    last_check_secs: AtomicU64,
 }
 
 impl WindowState {
-    fn new(epoch: u64) -> Self {
+    fn new(epoch: u64, now_secs: u64) -> Self {
         Self {
             count: AtomicU64::new(0),
             bytes: AtomicU64::new(0),
             window_epoch: AtomicU64::new(epoch),
-            last_check: std::sync::Mutex::new(Instant::now()),
+            last_check_secs: AtomicU64::new(now_secs),
         }
     }
 
     /// Check if this entry has been inactive for longer than the eviction threshold.
-    fn is_stale(&self, now: Instant, max_idle_secs: f64) -> bool {
-        let last = self.last_check.lock().unwrap_or_else(|e| e.into_inner());
-        now.duration_since(*last).as_secs_f64() > max_idle_secs
+    /// `now_secs` and `last_check_secs` are both seconds since `epoch_base`, so
+    /// the comparison stays within the monotonic timeline used for window math.
+    fn is_stale(&self, now_secs: u64, max_idle_secs: u64) -> bool {
+        let last = self.last_check_secs.load(Ordering::Relaxed);
+        now_secs.saturating_sub(last) > max_idle_secs
     }
 }
 
@@ -91,9 +98,11 @@ pub struct UdpRateLimiting {
     check_counter: AtomicU64,
     /// Startup instant used to compute window epochs from Instant::now().
     epoch_base: Instant,
-    /// Last eviction sweep time — prevents O(n) retain from running on every
-    /// datagram during high-cardinality floods.
-    last_eviction: std::sync::Mutex<Instant>,
+    /// Seconds-since-`epoch_base` of the last eviction sweep. Lock-free —
+    /// CLAUDE.md forbids `Mutex` on the data path. Initialised to 0 so the
+    /// first eligible sweep always runs (cooldown gate compares against the
+    /// current `secs_since_base`, which is necessarily ≥ 0).
+    last_eviction_secs: AtomicU64,
 }
 
 impl UdpRateLimiting {
@@ -120,14 +129,14 @@ impl UdpRateLimiting {
             state: DashMap::new(),
             check_counter: AtomicU64::new(0),
             epoch_base: Instant::now(),
-            last_eviction: std::sync::Mutex::new(Instant::now()),
+            last_eviction_secs: AtomicU64::new(0),
         })
     }
 
-    /// Compute the current window epoch as a monotonic counter.
-    fn current_epoch(&self) -> u64 {
-        let elapsed = Instant::now().duration_since(self.epoch_base).as_secs();
-        elapsed / self.window_seconds
+    /// Seconds elapsed since `epoch_base`. Used as the monotonic clock for
+    /// both window-epoch math and last-activity tracking.
+    fn secs_since_base(&self) -> u64 {
+        Instant::now().duration_since(self.epoch_base).as_secs()
     }
 
     /// Evict stale entries to prevent unbounded memory growth.
@@ -144,20 +153,23 @@ impl UdpRateLimiting {
 
         if over_capacity || periodic {
             // Time-gate eviction sweeps to prevent O(n) retain on every datagram
-            // during high-cardinality floods.
-            let should_sweep = self
-                .last_eviction
-                .lock()
-                .ok()
-                .is_some_and(|last| last.elapsed().as_secs_f64() >= EVICTION_COOLDOWN_SECS);
-
-            if should_sweep {
-                let now = Instant::now();
-                let max_idle = (self.window_seconds as f64 * 2.0).max(10.0);
-                self.state.retain(|_, v| !v.is_stale(now, max_idle));
-                if let Ok(mut last) = self.last_eviction.lock() {
-                    *last = now;
-                }
+            // during high-cardinality floods. Lock-free: the cooldown gate is
+            // an `AtomicU64` of seconds-since-`epoch_base`, mirroring the
+            // monotonic clock used by per-IP `last_check_secs`.
+            let now_secs = self.secs_since_base();
+            let last_sweep = self.last_eviction_secs.load(Ordering::Relaxed);
+            // CAS guards against multiple concurrent sweeps — the loser of the
+            // race exits without scanning. Equivalent to the previous
+            // `last_eviction.lock()` mutex but without taking a lock on the
+            // hot path.
+            if now_secs.saturating_sub(last_sweep) >= EVICTION_COOLDOWN_SECS
+                && self
+                    .last_eviction_secs
+                    .compare_exchange(last_sweep, now_secs, Ordering::AcqRel, Ordering::Relaxed)
+                    .is_ok()
+            {
+                let max_idle = (self.window_seconds * 2).max(10);
+                self.state.retain(|_, v| !v.is_stale(now_secs, max_idle));
             }
         }
 
@@ -192,7 +204,11 @@ impl Plugin for UdpRateLimiting {
     async fn on_udp_datagram(&self, ctx: &UdpDatagramContext) -> UdpDatagramVerdict {
         let over_capacity = self.maybe_evict();
 
-        let current_epoch = self.current_epoch();
+        // Sample the monotonic clock once per datagram and reuse it for window
+        // math + last-activity tracking — keeps the call to `Instant::now()`
+        // (a vDSO-backed clock_gettime) to a single hot-path syscall.
+        let now_secs = self.secs_since_base();
+        let current_epoch = now_secs / self.window_seconds;
         let key = Arc::clone(&ctx.client_ip);
 
         // Hard cap: when over capacity, only allow datagrams from already-tracked
@@ -205,7 +221,7 @@ impl Plugin for UdpRateLimiting {
         let entry = self
             .state
             .entry(key)
-            .or_insert_with(|| WindowState::new(current_epoch));
+            .or_insert_with(|| WindowState::new(current_epoch, now_secs));
         let state = entry.value();
 
         // Check if we've moved to a new window — reset counters via CAS.
@@ -227,10 +243,10 @@ impl Plugin for UdpRateLimiting {
             state.bytes.store(0, Ordering::Release);
         }
 
-        // Update last-check time for staleness tracking.
-        if let Ok(mut last) = state.last_check.lock() {
-            *last = Instant::now();
-        }
+        // Lock-free last-activity update: store the seconds-since-`epoch_base`
+        // sampled at the top of this datagram. Eviction reads this with
+        // `Relaxed` ordering — staleness only needs eventual consistency.
+        state.last_check_secs.store(now_secs, Ordering::Relaxed);
 
         // Increment counters. Acquire ordering ensures we see the most
         // recent counter reset before adding.

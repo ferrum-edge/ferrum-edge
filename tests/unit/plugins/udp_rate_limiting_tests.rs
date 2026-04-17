@@ -313,6 +313,36 @@ async fn first_datagram_always_passes_within_count_limit() {
     assert_eq!(plugin.on_udp_datagram(&ctx).await, UdpDatagramVerdict::Drop);
 }
 
+// ── Direction handling ───────────────────────────────────────────────
+
+#[tokio::test]
+async fn both_directions_share_same_per_client_window() {
+    // ctx.direction is intentionally NOT used by udp_rate_limiting — the per-IP
+    // window aggregates client→backend and backend→client traffic. Verify by
+    // alternating directions and confirming the limit still trips.
+    let plugin = make_plugin(json!({"datagrams_per_second": 4}));
+    for _ in 0..2 {
+        let mut ctx = make_ctx("10.0.0.1", 100);
+        ctx.direction = UdpDatagramDirection::ClientToBackend;
+        assert_eq!(
+            plugin.on_udp_datagram(&ctx).await,
+            UdpDatagramVerdict::Forward
+        );
+    }
+    for _ in 0..2 {
+        let mut ctx = make_ctx("10.0.0.1", 100);
+        ctx.direction = UdpDatagramDirection::BackendToClient;
+        assert_eq!(
+            plugin.on_udp_datagram(&ctx).await,
+            UdpDatagramVerdict::Forward
+        );
+    }
+    // 5th datagram (in either direction) crosses the 4/sec cap
+    let mut ctx = make_ctx("10.0.0.1", 100);
+    ctx.direction = UdpDatagramDirection::BackendToClient;
+    assert_eq!(plugin.on_udp_datagram(&ctx).await, UdpDatagramVerdict::Drop);
+}
+
 // ── Default Trait Methods ─────────────────────────────────────────────
 
 #[tokio::test]
