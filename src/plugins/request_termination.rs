@@ -85,11 +85,11 @@ fn render_default_body(content_type: &str, status_code: u16, message: Option<&st
     let msg = message.unwrap_or("Service unavailable");
 
     if content_type.contains("json") {
-        let escaped = json_escape(msg);
-        format!(
-            r#"{{"message":"{}","status_code":{}}}"#,
-            escaped, status_code
-        )
+        // serde_json::to_string produces a fully-spec-compliant JSON string
+        // literal (quoted, with control chars / non-ASCII / backslashes / quotes
+        // all escaped). Infallible for `&str` input.
+        let encoded = serde_json::to_string(msg).unwrap_or_else(|_| "\"\"".to_string());
+        format!(r#"{{"message":{},"status_code":{}}}"#, encoded, status_code)
     } else if content_type.contains("xml") {
         let escaped = xml_escape(msg);
         format!(
@@ -99,23 +99,6 @@ fn render_default_body(content_type: &str, status_code: u16, message: Option<&st
     } else {
         msg.to_string()
     }
-}
-
-/// Minimal JSON string escaping for backslash and double-quote. The default
-/// `message` is operator-controlled, so this protects against accidental
-/// malformed JSON when the message contains those characters. Control chars
-/// are not escaped — the gateway response builder rejects invalid bytes at the
-/// HTTP layer.
-fn json_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for ch in s.chars() {
-        match ch {
-            '\\' => out.push_str("\\\\"),
-            '"' => out.push_str("\\\""),
-            _ => out.push(ch),
-        }
-    }
-    out
 }
 
 /// Minimal XML character-content escaping. `'` (apos) is intentionally not

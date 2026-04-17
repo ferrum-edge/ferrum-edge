@@ -441,6 +441,30 @@ async fn test_pre_rendered_xml_body_well_formed_with_special_chars() {
 }
 
 #[tokio::test]
+async fn test_json_body_escapes_control_chars_and_unicode() {
+    // serde_json::to_string handles newlines, tabs, quotes, backslashes, and
+    // non-ASCII correctly so operator-supplied messages never produce invalid
+    // JSON.
+    let plugin = RequestTermination::new(&json!({
+        "message": "line1\nline2\t\"quoted\"\\back — ünîcödé"
+    }))
+    .unwrap();
+    let mut ctx = make_ctx("GET", "/");
+
+    match plugin.on_request_received(&mut ctx).await {
+        PluginResult::Reject { body, .. } => {
+            let parsed: serde_json::Value =
+                serde_json::from_str(&body).expect("body must be valid JSON");
+            assert_eq!(
+                parsed["message"],
+                "line1\nline2\t\"quoted\"\\back — ünîcödé"
+            );
+        }
+        other => panic!("Expected Reject, got {:?}", other),
+    }
+}
+
+#[tokio::test]
 async fn test_explicit_body_takes_precedence_over_message() {
     let plugin = RequestTermination::new(&json!({
         "body": "literal payload",
