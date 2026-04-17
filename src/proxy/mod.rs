@@ -3398,10 +3398,29 @@ async fn run_websocket_proxy(
     // still running (e.g., client half-closes while the backend is still
     // draining queued frames), truncating `frames_*` counts, shortening
     // `duration_ms`, and losing any terminal failure attribution the second
-    // half would have produced. The end-of-future `cancel.cancel()` in each
-    // branch above guarantees the second half winds down quickly after the
-    // first exits, so `join!` cannot hang on a well-behaved peer.
-    let _ = tokio::join!(client_to_backend, backend_to_client);
+    // half would have produced.
+    //
+    // But an unbounded `join!` can hang indefinitely: each relay loop calls
+    // `on_ws_frame` plugin hooks that aren't wrapped in a cancel-aware
+    // `select!`, so a stalled hook on the still-running half would hold the
+    // upgraded sockets and `_ws_connection_permit` forever and eventually
+    // starve new WebSocket sessions. Race the two halves for first-completion
+    // (the exit branch each one runs calls `cancel()` on the opposite token)
+    // then wait on the remaining half with a bounded drain grace. If the
+    // grace expires the remaining future is dropped — in-flight plugin calls
+    // are cancelled and all captured sockets are released.
+    const WS_DRAIN_GRACE: Duration = Duration::from_secs(30);
+    let mut c2b = Box::pin(client_to_backend);
+    let mut b2c = Box::pin(backend_to_client);
+    let client_done = tokio::select! {
+        _ = &mut c2b => true,
+        _ = &mut b2c => false,
+    };
+    if client_done {
+        let _ = tokio::time::timeout(WS_DRAIN_GRACE, b2c).await;
+    } else {
+        let _ = tokio::time::timeout(WS_DRAIN_GRACE, c2b).await;
+    }
 
     // Fire the on_ws_disconnect hook exactly once, after both forward halves
     // have wound down. When no plugin opted in the list is empty and we skip
