@@ -1972,31 +1972,47 @@ components:
       description: |
         Configuration for the `ws_message_size_limiting` plugin. Enforces a
         maximum frame payload size on WebSocket connections. Frames exceeding
-        the limit trigger a close frame sent to both client and backend.
+        the limit trigger a close frame (RFC 6455 close code 1009 — Message
+        Too Big) sent to both client and backend.
+      required:
+        - max_frame_bytes
       properties:
         max_frame_bytes:
           type: integer
-          default: 0
+          format: uint64
+          minimum: 1
           description: >-
-            Maximum frame payload size in bytes. Required for the plugin to
-            take effect — a value of 0 means no limit is enforced.
+            Maximum frame payload size in bytes. Required and must be greater
+            than zero — the plugin rejects configs with `max_frame_bytes` of 0
+            at config load time. Applied to Text, Binary, Ping, and Pong frames
+            in both directions; Close frames bypass the size check. Note that
+            Ping/Pong are RFC 6455 control frames capped at 125 bytes by the
+            protocol itself, so values below 125 will close the connection on
+            heartbeat traffic.
         close_reason:
           type: string
           default: "Message too large"
-          description: Close frame reason text sent when a frame exceeds the limit.
+          description: >-
+            Close frame reason text sent when a frame exceeds the limit. Truncated
+            to 123 UTF-8 bytes (the WebSocket protocol close-frame reason limit)
+            on a UTF-8 char boundary.
 
     WsFrameLoggingConfig:
       type: object
       description: |
         Configuration for the `ws_frame_logging` plugin. Logs WebSocket frame
-        metadata (direction, opcode, payload size) for each Text, Binary, and
-        Ping frame.
+        metadata (direction, frame type, payload size, optional preview) under
+        the `ws_frame_log` tracing target. Logs Text and Binary frames by
+        default; Ping/Pong are opt-in via `log_ping_pong`. The plugin never
+        transforms or drops frames — it is purely observational.
       properties:
         log_level:
           type: string
           enum: [trace, debug, info]
           default: info
-          description: Tracing level for frame log output.
+          description: >-
+            Tracing level for frame log output. Case-sensitive; unknown values
+            (e.g., `"warn"`, `"INFO"`) are rejected at config load time.
         include_payload_preview:
           type: boolean
           default: false
@@ -2006,8 +2022,9 @@ components:
           default: 128
           maximum: 65536
           description: >-
-            Maximum number of bytes to include in the payload preview. Only
-            applies when `include_payload_preview` is true.
+            Maximum number of bytes to include in the payload preview. Clamped
+            to 65 536 to prevent excessive allocations for binary hex previews.
+            Only applies when `include_payload_preview` is true.
         log_ping_pong:
           type: boolean
           default: false
@@ -2018,22 +2035,34 @@ components:
       description: |
         Configuration for the `ws_rate_limiting` plugin. Enforces per-connection
         frame rate limiting using a token-bucket algorithm. When the bucket is
-        exhausted, the plugin sends a close frame to both client and backend.
-        Supports centralized Redis-backed mode for cross-instance frame rate coordination.
+        exhausted, the plugin sends a WebSocket close frame (RFC 6455 close code
+        1008 — Policy Violation) to both client and backend. Both directions
+        (client→backend and backend→client) consume from the same per-connection
+        bucket. Supports centralized Redis-backed mode for cross-instance
+        coordination of frame counters.
       properties:
         frames_per_second:
           type: integer
+          format: uint64
           default: 100
-          description: Token refill rate per second.
+          minimum: 1
+          description: >-
+            Token refill rate per second. Must be greater than zero — configs
+            with `frames_per_second: 0` are rejected at config load time.
         burst_size:
           type: integer
+          format: uint64
           description: >-
             Maximum burst capacity (tokens). Defaults to the value of
-            `frames_per_second` when not explicitly set.
+            `frames_per_second` when not explicitly set. A value of `0` causes
+            the bucket to start empty and reject every frame.
         close_reason:
           type: string
           default: "Frame rate exceeded"
-          description: Close frame reason text sent when the frame rate is exceeded.
+          description: >-
+            Close-frame reason text sent when the frame rate is exceeded.
+            Truncated on a UTF-8 char boundary to 123 bytes (the RFC 6455 §5.5
+            control-frame payload limit) so the frame stays well-formed.
         sync_mode:
           type: string
           enum: [local, redis]
@@ -2068,6 +2097,38 @@ components:
           type: integer
           default: 5
           description: Health check ping interval when Redis is unavailable
+
+    UdpRateLimitingConfig:
+      type: object
+      description: |
+        Configuration for the `udp_rate_limiting` plugin. Rate limits UDP
+        datagrams per resolved client IP using a fixed-window algorithm with
+        atomic counters. Excess datagrams are silently dropped (standard UDP
+        flood mitigation). Operates on both client→backend and backend→client
+        datagrams within the same window per client IP.
+      properties:
+        datagrams_per_second:
+          type: integer
+          format: uint64
+          description: >-
+            Maximum datagrams per `window_seconds`. At least one of
+            `datagrams_per_second` or `bytes_per_second` is required.
+        bytes_per_second:
+          type: integer
+          format: uint64
+          description: >-
+            Maximum bytes per `window_seconds` (sum of datagram payload sizes).
+            At least one of `datagrams_per_second` or `bytes_per_second` is
+            required.
+        window_seconds:
+          type: integer
+          format: uint64
+          default: 1
+          minimum: 1
+          description: >-
+            Window length in seconds. Defaults to 1 second. The effective
+            per-window cap is `datagrams_per_second × window_seconds` (and
+            similarly for bytes).
 
     # ── Circuit Breaker ─────────────────────────────────────────────
     CircuitBreakerConfig:
@@ -3379,10 +3440,12 @@ components:
     WsLoggingConfig:
       type: object
       description: "Plugin: ws_logging — Sends transaction logs to a WebSocket endpoint in batches."
+      required:
+        - endpoint_url
       properties:
         endpoint_url:
           type: string
-          description: WebSocket URL (ws:// or wss://) to send transaction logs to
+          description: WebSocket URL (ws:// or wss://) to send transaction logs to. Must include a hostname; malformed or non-WebSocket schemes are rejected at config load time.
         reconnect_delay_ms:
           type: integer
           default: 5000

@@ -439,19 +439,21 @@ The `global_tags` config maps directly to DogStatsD tag format (`|#key:value,key
 
 ### `ws_logging`
 
-Sends transaction summaries as JSON to an external WebSocket endpoint. Like `http_logging`, entries are buffered and sent in batches (as a JSON array text messages) to reduce per-message overhead. The WebSocket connection is maintained persistently with automatic reconnection on failure.
+Sends transaction summaries as JSON to an external WebSocket endpoint. Like `http_logging`, entries are buffered and sent in batches (as JSON-array text messages) to reduce per-message overhead. The WebSocket connection is maintained persistently with automatic reconnection on failure. Logs both HTTP/gRPC `TransactionSummary` entries and stream `StreamTransactionSummary` entries (TCP/UDP), so the plugin applies to all proxy protocols.
 
 **Priority:** 9175
 
+**Protocols:** all (HTTP, gRPC, WebSocket, TCP, UDP)
+
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `endpoint_url` | String | `""` | WebSocket URL to send transaction logs to |
-| `batch_size` | Integer | `50` | Number of entries to buffer before sending a batch |
-| `flush_interval_ms` | Integer | `1000` | Max milliseconds before flushing a partial batch (min: 100) |
+| `endpoint_url` | String | *(required)* | WebSocket URL (`ws://` or `wss://`) to send transaction logs to. Must include a hostname. Malformed or non-WebSocket schemes are rejected at config load time. |
+| `batch_size` | Integer | `50` | Number of entries to buffer before sending a batch (minimum 1) |
+| `flush_interval_ms` | Integer | `1000` | Max milliseconds before flushing a partial batch (minimum 100) |
 | `max_retries` | Integer | `3` | Retry attempts on failed batch delivery |
 | `retry_delay_ms` | Integer | `1000` | Delay in milliseconds between retry attempts |
 | `reconnect_delay_ms` | Integer | `5000` | Delay in milliseconds before reconnecting after connection failure |
-| `buffer_capacity` | Integer | `10000` | Channel capacity — new entries are dropped when full |
+| `buffer_capacity` | Integer | `10000` | Channel capacity (minimum 1) — new entries are dropped on the proxy hot path when the in-memory buffer is full, with a warning log |
 
 Batches are flushed when `batch_size` is reached **or** `flush_interval_ms` elapses, whichever comes first. Each batch is sent as a single JSON array text message over the WebSocket connection.
 
@@ -2903,16 +2905,16 @@ WebSocket plugins operate at the frame level via the `on_ws_frame` lifecycle hoo
 
 ### `ws_message_size_limiting`
 
-Enforces maximum frame size for WebSocket connections. Closes the connection with code 1009 (Message Too Big) when a Text, Binary, or Ping frame exceeds the configured limit. Operates in both directions (client-to-backend and backend-to-client).
+Enforces maximum frame size for WebSocket connections. Closes the connection with close code **1009 (Message Too Big)** per RFC 6455 §7.4 when a Text, Binary, or Ping frame exceeds the configured limit. Operates in both directions (client-to-backend and backend-to-client).
 
 **Priority:** 2810
 
+**Protocols:** WebSocket only
+
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `max_frame_bytes` | u64 | `0` | Maximum allowed frame size in bytes (0 = no effect) |
-| `close_reason` | String | `"Message too large"` | Close frame reason text |
-
-`close_reason` is truncated to the WebSocket protocol limit for close-frame reason strings (123 UTF-8 bytes).
+| `max_frame_bytes` | u64 | *(required)* | Maximum allowed frame payload in bytes. Must be greater than 0 — configs with `max_frame_bytes` of 0 (or missing) are rejected at config load time. |
+| `close_reason` | String | `"Message too large"` | Close-frame reason text (truncated to 123 UTF-8 bytes — the RFC 6455 §5.5 control-frame payload limit) |
 
 ```yaml
 plugin_name: ws_message_size_limiting
@@ -2920,17 +2922,21 @@ config:
   max_frame_bytes: 65536
 ```
 
+The plugin opts the WebSocket connection out of `FERRUM_WEBSOCKET_TUNNEL_MODE` raw-copy mode by returning `true` from `requires_ws_frame_hooks()`, so frame inspection always runs when this plugin is configured.
+
 ### `ws_rate_limiting`
 
-Rate limits WebSocket frames per-connection using a token bucket algorithm. Closes the connection with code 1008 (Policy Violation) when the configured frame rate is exceeded.
+Rate limits WebSocket frames per-connection using a token bucket algorithm. Closes the connection with close code **1008 (Policy Violation)** per RFC 6455 §7.4 when the configured frame rate is exceeded. Both client-to-backend and backend-to-client frames count against the same per-connection bucket.
 
 **Priority:** 2910
 
+**Protocols:** WebSocket only
+
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `frames_per_second` | u64 | `100` | Maximum frames per second per connection |
-| `burst_size` | u64 | (= `frames_per_second`) | Token bucket capacity (burst allowance) |
-| `close_reason` | String | `"Frame rate exceeded"` | Close frame reason text |
+| `frames_per_second` | u64 | `100` | Maximum frames per second per connection. Must be greater than zero — `frames_per_second: 0` is rejected at config load time. |
+| `burst_size` | u64 | (= `frames_per_second`) | Token bucket capacity (burst allowance). Setting this to `0` causes the bucket to start empty and reject all frames. |
+| `close_reason` | String | `"Frame rate exceeded"` | Close-frame reason text (truncated to 123 UTF-8 bytes — the RFC 6455 §5.5 control-frame payload limit) |
 | `sync_mode` | String | `local` | `local` (in-memory per instance) or `redis` (centralized) |
 | `redis_url` | String (optional) | — | Redis connection URL (required when `sync_mode: "redis"`) |
 | `redis_tls` | bool | `false` | Enable TLS for Redis connection |
@@ -2943,7 +2949,7 @@ Rate limits WebSocket frames per-connection using a token bucket algorithm. Clos
 
 > **Note:** When `redis_tls` is enabled, CA certificate verification and skip-verify behavior are controlled by the gateway-level `FERRUM_TLS_CA_BUNDLE_PATH` and `FERRUM_TLS_NO_VERIFY` environment variables, not per-plugin settings.
 
-**Redis mode** (`sync_mode: "redis"`): Frame counters are stored in Redis instead of in-memory state. Because WebSocket `connection_id` values are process-local, Redis keys are namespaced per gateway instance to avoid cross-instance collisions; this mode externalizes the counter backend but does not make per-connection limits portable across reconnects to a different instance. Uses 1-second fixed windows with native Redis `INCR`/`EXPIRE` commands. If Redis becomes unreachable, falls back to local in-memory rate limiting automatically. Compatible with any RESP-protocol server: Redis, Valkey, DragonflyDB, KeyDB, or Garnet.
+**Redis mode** (`sync_mode: "redis"`): Frame counters are stored in Redis instead of in-memory state. Because WebSocket `connection_id` values are process-local, the plugin prepends a per-instance UUID to every Redis key (e.g., `{redis_key_prefix}:{instance_uuid}:{proxy_id}:{connection_id}:{window_index}`) so two gateways sharing the same Redis cluster never collide. This mode externalizes the counter backend but does not make per-connection limits portable across reconnects to a different gateway instance. Uses 1-second fixed windows with native Redis `INCR`/`EXPIRE` commands (no Lua). If Redis becomes unreachable the plugin falls back to local in-memory token-bucket rate limiting and a background health check pings Redis every `redis_health_check_interval_seconds` to switch back automatically. Compatible with any RESP-protocol server: Redis, Valkey, DragonflyDB, KeyDB, or Garnet.
 
 ```yaml
 plugin_name: ws_rate_limiting
@@ -2963,7 +2969,7 @@ Logs metadata for every WebSocket frame passing through the proxy. Provides fram
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `log_level` | String | `"info"` | Log level for frame entries: `trace`, `debug`, or `info` |
+| `log_level` | String | `"info"` | Log level for frame entries: `trace`, `debug`, or `info` (case-sensitive — unknown values are rejected at config load time) |
 | `include_payload_preview` | bool | `false` | Include a payload preview in log entries |
 | `payload_preview_bytes` | u64 | `128` | Maximum payload bytes to preview (clamped to 64 KiB) |
 | `log_ping_pong` | bool | `false` | Log Ping and Pong control frames |
@@ -2976,6 +2982,44 @@ config:
   payload_preview_bytes: 256
   log_ping_pong: false
 ```
+
+Frame log entries are emitted to the `ws_frame_log` tracing target with structured fields: `proxy_id`, `connection_id`, `direction` (`client->backend` or `backend->client`), `frame_type` (`text`, `binary`, `ping`, `pong`, `close`, `frame`), `size_bytes`, and (when `include_payload_preview` is true) `preview` (text borrowed from the frame, or hex-encoded for binary). Preview computation is skipped when the configured tracing level is filtered out, so disabling logging at the tracing layer eliminates per-frame allocation.
+
+---
+
+## UDP Plugins
+
+UDP plugins operate at the datagram level via the `on_udp_datagram` lifecycle hook. They fire on every datagram in both directions (client-to-backend and backend-to-client). Use `UdpDatagramContext.direction` to distinguish.
+
+### `udp_rate_limiting`
+
+Rate limits UDP datagrams per resolved client IP using a fixed-window algorithm with atomic counters. Excess datagrams are silently dropped (standard UDP flood mitigation — there is no equivalent of an HTTP 429 response in plain UDP). Both client-to-backend and backend-to-client datagrams count toward the same per-client window.
+
+**Priority:** 2915
+
+**Protocols:** UDP only
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `datagrams_per_second` | u64 (optional) | — | Maximum datagrams per `window_seconds` per client IP |
+| `bytes_per_second` | u64 (optional) | — | Maximum bytes per `window_seconds` per client IP (sum of datagram payload sizes) |
+| `window_seconds` | u64 | `1` | Window length in seconds (minimum 1). The effective per-window cap is `datagrams_per_second × window_seconds` (and similarly for bytes). |
+
+At least one of `datagrams_per_second` or `bytes_per_second` must be set; if both are configured each is enforced independently and the first to trip drops the datagram.
+
+```yaml
+plugin_name: udp_rate_limiting
+config:
+  datagrams_per_second: 1000
+  bytes_per_second: 1048576
+  window_seconds: 1
+```
+
+**Memory protection:** The plugin tracks per-client state in a `DashMap` capped at 100,000 entries. When the cap is exceeded, only datagrams from already-tracked client IPs are forwarded — datagrams from new IPs are dropped without inserting state. This prevents spoofed-source-IP floods from causing unbounded memory growth. Stale entries (idle for `window_seconds × 2`, minimum 10 seconds) are evicted by a periodic sweep gated to once per second; the cooldown gate uses an atomic `compare_exchange` so concurrent sweeps cannot pile up under load.
+
+**Hot-path contract:** Per-datagram bookkeeping is lock-free — counts, byte totals, window epoch, and last-activity timestamps are all `AtomicU64`. The plugin opts in via `requires_udp_datagram_hooks() = true`, so when no UDP plugin is configured on a proxy the datagram forwarding loop pays zero overhead.
+
+**Direction handling:** The plugin examines `ctx.direction` only implicitly — both directions update the same per-client window. This is intentional: the goal is to cap total UDP traffic per client IP, not just inbound. Plugins that need direction-specific behavior should branch on `ctx.direction` themselves.
 
 ---
 
