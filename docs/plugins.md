@@ -1622,6 +1622,8 @@ Enforces request rate limits per time window. Supports limiting by client IP or 
 |---|---|---|---|
 | `limit_by` | String | `ip` | Rate limit key: `ip` or `consumer` |
 | `expose_headers` | bool | `false` | Inject `x-ratelimit-*` headers |
+| `window_seconds` | u64 (optional) | — | Custom window duration in seconds. Use with `max_requests` as an alternative to the preset per-second/minute/hour fields |
+| `max_requests` | u64 | `10` | Maximum requests allowed within `window_seconds`. Only used when `window_seconds` is set. Must be greater than zero |
 | `requests_per_second` | u64 (optional) | — | Max requests per second |
 | `requests_per_minute` | u64 (optional) | — | Max requests per minute |
 | `requests_per_hour` | u64 (optional) | — | Max requests per hour |
@@ -2198,7 +2200,7 @@ Enforces per-proxy request body size limits. Rejects with HTTP 413.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `max_bytes` | u64 | `0` (disabled) | Maximum allowed request body size in bytes |
+| `max_bytes` | u64 | — (required) | Maximum allowed request body size in bytes. Must be greater than zero |
 
 Enforcement happens in three places:
 - `on_request_received` rejects oversized `Content-Length` headers without reading the body.
@@ -2213,7 +2215,7 @@ Enforces per-proxy response body size limits. Rejects with HTTP 502.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `max_bytes` | u64 | `0` (disabled) | Maximum allowed response body size in bytes |
+| `max_bytes` | u64 | — (required) | Maximum allowed response body size in bytes. Must be greater than zero |
 | `require_buffered_check` | bool | `false` | Force response body buffering to verify actual final size when `Content-Length` is absent |
 
 ### `response_caching`
@@ -2909,7 +2911,7 @@ Enforces maximum frame size for WebSocket connections. Closes the connection wit
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `max_frame_bytes` | u64 | `0` | Maximum allowed frame size in bytes (0 = no effect) |
+| `max_frame_bytes` | u64 | — (required) | Maximum allowed frame size in bytes. Must be greater than zero |
 | `close_reason` | String | `"Message too large"` | Close frame reason text |
 
 `close_reason` is truncated to the WebSocket protocol limit for close-frame reason strings (123 UTF-8 bytes).
@@ -2975,6 +2977,28 @@ config:
   include_payload_preview: true
   payload_preview_bytes: 256
   log_ping_pong: false
+```
+
+### `udp_rate_limiting`
+
+Rate limits UDP datagrams per client IP using a fixed-window algorithm with atomic counters. Silently drops excess datagrams (standard UDP behavior). Two independent limits can be configured (either or both).
+
+**Priority:** 2915
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `datagrams_per_second` | u64 (optional) | — | Maximum datagrams per second per client IP |
+| `bytes_per_second` | u64 (optional) | — | Maximum bytes per second per client IP |
+| `window_seconds` | u64 | `1` | Window duration in seconds (limits are scaled proportionally, minimum 1) |
+
+At least one of `datagrams_per_second` or `bytes_per_second` must be set. The plugin constructor rejects configs with neither.
+
+```yaml
+plugin_name: udp_rate_limiting
+config:
+  datagrams_per_second: 1000
+  bytes_per_second: 1048576
+  window_seconds: 1
 ```
 
 ---
