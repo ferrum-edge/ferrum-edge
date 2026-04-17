@@ -3003,14 +3003,14 @@ async fn run_websocket_proxy(
                     proxy_id = %proxy_id,
                     "WebSocket tunnel: failed to flush buffered frame: {e}"
                 );
-                // The drain consumes buffered backend frames that piggybacked
-                // on the 101 upgrade response, so from an observer's point of
-                // view the data is flowing backend→client. A failed flush on
-                // this path aborts the backend→client delivery of those
-                // buffered frames — attribute as `BackendToClient` so
-                // direction-based metrics don't invert.
+                // The drain both reads from backend (`backend_read`) and
+                // writes via `backend_write` (the backend sink), so the
+                // failing side is genuinely ambiguous: the read observed a
+                // backend frame, but the failed call writes toward the
+                // backend. Use `Unknown` to avoid over-claiming direction in
+                // either direction.
                 let drain_failure = Some((
-                    crate::plugins::Direction::BackendToClient,
+                    crate::plugins::Direction::Unknown,
                     retry::classify_boxed_error(&e),
                 ));
                 fire_ws_tunnel_disconnect_hooks(

@@ -150,6 +150,12 @@ fn pre_copy_disconnect_cause(
             }
         }
         ErrorClass::ClientDisconnect => DisconnectCause::RecvError,
+        // Generic `RequestError` at the pre-copy stage overwhelmingly comes
+        // from backend-side failures that didn't match a more specific class
+        // (e.g. `resolve_backend_target` returning "No healthy targets"). Map
+        // it to `BackendError` so cause-based dashboards don't misattribute
+        // backend outages to client recv errors.
+        ErrorClass::RequestError => DisconnectCause::BackendError,
         _ => DisconnectCause::RecvError,
     }
 }
