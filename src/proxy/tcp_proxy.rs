@@ -30,18 +30,78 @@ pub(crate) fn classify_stream_error(error: &anyhow::Error) -> crate::retry::Erro
     crate::retry::classify_boxed_error(error.as_ref())
 }
 
+/// Which end of a half-duplex copy produced the error.
+///
+/// A single direction of the bidirectional relay consists of a read on the
+/// source socket followed by a write to the destination socket. Combining
+/// `StreamIoSide` with `Direction` lets the caller identify whether the
+/// failure came from the client-facing or backend-facing socket, instead of
+/// guessing from direction alone (which is ambiguous — a
+/// `Direction::ClientToBackend` half can fail either because reading from the
+/// client errored OR because writing to the backend errored).
+///
+/// | Direction         | Side  | Facing   |
+/// |-------------------|-------|----------|
+/// | `ClientToBackend` | Read  | Client   |
+/// | `ClientToBackend` | Write | Backend  |
+/// | `BackendToClient` | Read  | Backend  |
+/// | `BackendToClient` | Write | Client   |
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)]
+pub enum StreamIoSide {
+    /// Failure reading from the source socket of this half.
+    Read,
+    /// Failure writing to the destination socket of this half.
+    Write,
+}
+
 /// Outcome of a bidirectional stream copy between the client and backend.
 ///
 /// Preserves per-direction byte counts even when one half errors — callers
 /// use these to record metrics accurately regardless of which side failed.
-/// `first_failure` is `Some((direction, class))` when a half errored before
-/// both halves observed a clean EOF; `None` indicates graceful shutdown.
+/// `first_failure` is `Some((direction, class, side))` when a half errored
+/// before both halves observed a clean EOF; `None` indicates graceful
+/// shutdown. `side` is `Some` when the error could be attributed to the read
+/// or write end of the failing half; `None` for idle-timeout, pipe-creation,
+/// or kTLS-install failures where no specific IO side is responsible.
 #[derive(Debug, Clone)]
 #[doc(hidden)]
 pub struct StreamCopyResult {
     pub bytes_client_to_backend: u64,
     pub bytes_backend_to_client: u64,
-    pub first_failure: Option<(Direction, ErrorClass)>,
+    pub first_failure: Option<(Direction, ErrorClass, Option<StreamIoSide>)>,
+}
+
+/// Combine a failure's direction and IO side into the front-end / back-end
+/// socket that actually errored.
+///
+/// * `Read` side of `ClientToBackend` → reading from the client ⇒ client-facing
+/// * `Write` side of `ClientToBackend` → writing to the backend ⇒ backend-facing
+/// * `Read` side of `BackendToClient` → reading from the backend ⇒ backend-facing
+/// * `Write` side of `BackendToClient` → writing to the client ⇒ client-facing
+///
+/// `None` when the side isn't known (e.g., idle timeout). Callers fall back to
+/// `DisconnectCause::RecvError` in that case.
+#[doc(hidden)]
+pub fn disconnect_cause_for_failure(
+    direction: Direction,
+    class: &ErrorClass,
+    side: Option<StreamIoSide>,
+) -> crate::plugins::DisconnectCause {
+    use crate::plugins::DisconnectCause;
+    // Idle timeout is always unambiguous regardless of direction/side.
+    if matches!(class, ErrorClass::ReadWriteTimeout) {
+        return DisconnectCause::IdleTimeout;
+    }
+    match (direction, side) {
+        (Direction::ClientToBackend, Some(StreamIoSide::Read)) => DisconnectCause::RecvError,
+        (Direction::ClientToBackend, Some(StreamIoSide::Write)) => DisconnectCause::BackendError,
+        (Direction::BackendToClient, Some(StreamIoSide::Read)) => DisconnectCause::BackendError,
+        (Direction::BackendToClient, Some(StreamIoSide::Write)) => DisconnectCause::RecvError,
+        // Side unknown — conservative fallback to RecvError for historical
+        // consistency with pre-attribution log consumers.
+        _ => DisconnectCause::RecvError,
+    }
 }
 
 /// Crate-visible entry point to `bidirectional_copy` for the `_test_support`
@@ -419,25 +479,19 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
                             // set, one half errored before both halves observed
                             // a clean EOF — surface the real direction & class.
                             // Otherwise both halves hit EOF cleanly (graceful).
+                            //
+                            // Combine direction + IO side to pick the correct
+                            // DisconnectCause: a `ClientToBackend` half that
+                            // errored on its *write* end means the backend
+                            // socket failed, not the client — so cause is
+                            // BackendError, not RecvError. See
+                            // `disconnect_cause_for_failure` for the full table.
                             match &s.first_failure {
-                                Some((dir, class)) => {
+                                Some((dir, class, side)) => {
                                     let dir = *dir;
                                     let class = class.clone();
-                                    let cause = match dir {
-                                        Direction::ClientToBackend => {
-                                            crate::plugins::DisconnectCause::RecvError
-                                        }
-                                        Direction::BackendToClient => {
-                                            crate::plugins::DisconnectCause::BackendError
-                                        }
-                                        Direction::Unknown => {
-                                            if class == ErrorClass::ReadWriteTimeout {
-                                                crate::plugins::DisconnectCause::IdleTimeout
-                                            } else {
-                                                crate::plugins::DisconnectCause::RecvError
-                                            }
-                                        }
-                                    };
+                                    let cause =
+                                        disconnect_cause_for_failure(dir, &class, *side);
                                     (
                                         s.bytes_in,
                                         s.bytes_out,
@@ -569,9 +623,11 @@ struct TcpConnectionSuccess {
     duration: Duration,
     /// Whether splice(2) was used for this connection (Linux plaintext paths only).
     splice_used: bool,
-    /// `Some((direction, class))` when the bidirectional copy errored before
-    /// both halves observed a clean EOF. `None` indicates a graceful shutdown.
-    first_failure: Option<(Direction, ErrorClass)>,
+    /// `Some((direction, class, side))` when the bidirectional copy errored
+    /// before both halves observed a clean EOF. `None` indicates a graceful
+    /// shutdown. `side` (when `Some`) tells the caller whether the failing
+    /// half errored on its read or write end.
+    first_failure: Option<(Direction, ErrorClass, Option<StreamIoSide>)>,
 }
 
 /// Handle a single TCP connection: TLS termination → backend resolution → bidirectional copy.
@@ -1141,6 +1197,7 @@ async fn handle_tcp_connection_inner(
                                     first_failure: Some((
                                         Direction::Unknown,
                                         classify_stream_error(&e),
+                                        None,
                                     )),
                                 }
                             }
@@ -1347,29 +1404,37 @@ async fn connect_backend_tls_cached(
 const BIDIRECTIONAL_DRAIN_GRACE: Duration = Duration::from_millis(100);
 
 /// Copy bytes from `reader` into `writer` until EOF, updating `bytes` and
-/// optionally `last_activity` on each read. Returns `Ok(())` on EOF or an
-/// error on the first read/write failure.
+/// optionally `last_activity` on each read. Returns `Ok(())` on EOF or
+/// `Err((side, err))` on the first read/write failure — the `side`
+/// distinguishes whether the error came from reading the source or writing
+/// to the destination, which the caller uses to attribute the failure to
+/// the correct socket (frontend vs backend).
 async fn copy_one_direction<R, W>(
     mut reader: R,
     mut writer: W,
     buf_size: usize,
     bytes: Arc<AtomicU64>,
     last_activity: Option<Arc<AtomicU64>>,
-) -> std::io::Result<()>
+) -> Result<(), (StreamIoSide, std::io::Error)>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
     let mut buf = vec![0u8; buf_size.max(4096)];
     loop {
-        let n = reader.read(&mut buf).await?;
+        let n = match reader.read(&mut buf).await {
+            Ok(n) => n,
+            Err(e) => return Err((StreamIoSide::Read, e)),
+        };
         if n == 0 {
             // Clean EOF — shut down the writer side so the peer observes a
             // half-close. Ignore shutdown errors (peer may already be gone).
             let _ = writer.shutdown().await;
             return Ok(());
         }
-        writer.write_all(&buf[..n]).await?;
+        if let Err(e) = writer.write_all(&buf[..n]).await {
+            return Err((StreamIoSide::Write, e));
+        }
         bytes.fetch_add(n as u64, Ordering::Relaxed);
         if let Some(ref la) = last_activity {
             la.store(coarse_now_ms(), Ordering::Relaxed);
@@ -1433,7 +1498,7 @@ where
     let timeout_ms = idle_timeout.map(|t| t.as_millis() as u64).unwrap_or(0);
 
     // Phase 1: race the two directions (plus optional idle check).
-    let mut first_failure: Option<(Direction, ErrorClass)> = None;
+    let mut first_failure: Option<(Direction, ErrorClass, Option<StreamIoSide>)> = None;
     let mut c2b_done = false;
     let mut b2c_done = false;
 
@@ -1442,24 +1507,30 @@ where
             biased;
             result = &mut c2b_fut, if !c2b_done => {
                 c2b_done = true;
-                if let Err(e) = result {
+                if let Err((side, e)) = result {
                     let err: anyhow::Error =
-                        anyhow::anyhow!("Bidirectional copy error (client→backend): {}", e);
+                        anyhow::anyhow!("Bidirectional copy error (client→backend, {:?}): {}", side, e);
                     if first_failure.is_none() {
-                        first_failure =
-                            Some((Direction::ClientToBackend, classify_stream_error(&err)));
+                        first_failure = Some((
+                            Direction::ClientToBackend,
+                            classify_stream_error(&err),
+                            Some(side),
+                        ));
                     }
                 }
                 break;
             }
             result = &mut b2c_fut, if !b2c_done => {
                 b2c_done = true;
-                if let Err(e) = result {
+                if let Err((side, e)) = result {
                     let err: anyhow::Error =
-                        anyhow::anyhow!("Bidirectional copy error (backend→client): {}", e);
+                        anyhow::anyhow!("Bidirectional copy error (backend→client, {:?}): {}", side, e);
                     if first_failure.is_none() {
-                        first_failure =
-                            Some((Direction::BackendToClient, classify_stream_error(&err)));
+                        first_failure = Some((
+                            Direction::BackendToClient,
+                            classify_stream_error(&err),
+                            Some(side),
+                        ));
                     }
                 }
                 break;
@@ -1472,7 +1543,7 @@ where
                         // neither half produced an error. Use ReadWriteTimeout
                         // class so disconnect_cause downstream is IdleTimeout.
                         first_failure =
-                            Some((Direction::Unknown, ErrorClass::ReadWriteTimeout));
+                            Some((Direction::Unknown, ErrorClass::ReadWriteTimeout, None));
                         break;
                     }
                 }
@@ -1505,11 +1576,14 @@ where
                 tokio::select! {
                     biased;
                     result = &mut c2b_fut => {
-                        if let Err(e) = result {
+                        if let Err((side, e)) = result {
                             let err: anyhow::Error =
-                                anyhow::anyhow!("Bidirectional copy error (client→backend): {}", e);
-                            first_failure =
-                                Some((Direction::ClientToBackend, classify_stream_error(&err)));
+                                anyhow::anyhow!("Bidirectional copy error (client→backend, {:?}): {}", side, e);
+                            first_failure = Some((
+                                Direction::ClientToBackend,
+                                classify_stream_error(&err),
+                                Some(side),
+                            ));
                         }
                         break;
                     }
@@ -1518,7 +1592,7 @@ where
                             let last = la.load(Ordering::Relaxed);
                             if coarse_now_ms().saturating_sub(last) >= timeout_ms {
                                 first_failure =
-                                    Some((Direction::Unknown, ErrorClass::ReadWriteTimeout));
+                                    Some((Direction::Unknown, ErrorClass::ReadWriteTimeout, None));
                                 break;
                             }
                         }
@@ -1528,12 +1602,18 @@ where
         } else {
             match tokio::time::timeout(BIDIRECTIONAL_DRAIN_GRACE, &mut c2b_fut).await {
                 Ok(Ok(())) => {}
-                Ok(Err(e)) => {
+                Ok(Err((side, e))) => {
                     if first_failure.is_none() {
-                        let err: anyhow::Error =
-                            anyhow::anyhow!("Bidirectional copy error (client→backend): {}", e);
-                        first_failure =
-                            Some((Direction::ClientToBackend, classify_stream_error(&err)));
+                        let err: anyhow::Error = anyhow::anyhow!(
+                            "Bidirectional copy error (client→backend, {:?}): {}",
+                            side,
+                            e
+                        );
+                        first_failure = Some((
+                            Direction::ClientToBackend,
+                            classify_stream_error(&err),
+                            Some(side),
+                        ));
                     }
                 }
                 Err(_) => { /* grace expired — leave counters as-is */ }
@@ -1546,11 +1626,14 @@ where
                 tokio::select! {
                     biased;
                     result = &mut b2c_fut => {
-                        if let Err(e) = result {
+                        if let Err((side, e)) = result {
                             let err: anyhow::Error =
-                                anyhow::anyhow!("Bidirectional copy error (backend→client): {}", e);
-                            first_failure =
-                                Some((Direction::BackendToClient, classify_stream_error(&err)));
+                                anyhow::anyhow!("Bidirectional copy error (backend→client, {:?}): {}", side, e);
+                            first_failure = Some((
+                                Direction::BackendToClient,
+                                classify_stream_error(&err),
+                                Some(side),
+                            ));
                         }
                         break;
                     }
@@ -1559,7 +1642,7 @@ where
                             let last = la.load(Ordering::Relaxed);
                             if coarse_now_ms().saturating_sub(last) >= timeout_ms {
                                 first_failure =
-                                    Some((Direction::Unknown, ErrorClass::ReadWriteTimeout));
+                                    Some((Direction::Unknown, ErrorClass::ReadWriteTimeout, None));
                                 break;
                             }
                         }
@@ -1569,12 +1652,18 @@ where
         } else {
             match tokio::time::timeout(BIDIRECTIONAL_DRAIN_GRACE, &mut b2c_fut).await {
                 Ok(Ok(())) => {}
-                Ok(Err(e)) => {
+                Ok(Err((side, e))) => {
                     if first_failure.is_none() {
-                        let err: anyhow::Error =
-                            anyhow::anyhow!("Bidirectional copy error (backend→client): {}", e);
-                        first_failure =
-                            Some((Direction::BackendToClient, classify_stream_error(&err)));
+                        let err: anyhow::Error = anyhow::anyhow!(
+                            "Bidirectional copy error (backend→client, {:?}): {}",
+                            side,
+                            e
+                        );
+                        first_failure = Some((
+                            Direction::BackendToClient,
+                            classify_stream_error(&err),
+                            Some(side),
+                        ));
                     }
                 }
                 Err(_) => { /* grace expired — leave counters as-is */ }
@@ -1644,7 +1733,7 @@ async fn bidirectional_splice(
             return StreamCopyResult {
                 bytes_client_to_backend: 0,
                 bytes_backend_to_client: 0,
-                first_failure: Some((Direction::Unknown, classify_stream_error(&e))),
+                first_failure: Some((Direction::Unknown, classify_stream_error(&e), None)),
             };
         }
     };
@@ -1655,7 +1744,7 @@ async fn bidirectional_splice(
             return StreamCopyResult {
                 bytes_client_to_backend: 0,
                 bytes_backend_to_client: 0,
-                first_failure: Some((Direction::Unknown, classify_stream_error(&e))),
+                first_failure: Some((Direction::Unknown, classify_stream_error(&e), None)),
             };
         }
     };
@@ -1698,7 +1787,7 @@ async fn bidirectional_splice(
     let idle_timeout_active = idle_timeout.is_some_and(|t| !t.is_zero());
     let timeout_ms = idle_timeout.map(|t| t.as_millis() as u64).unwrap_or(0);
 
-    let mut first_failure: Option<(Direction, ErrorClass)> = None;
+    let mut first_failure: Option<(Direction, ErrorClass, Option<StreamIoSide>)> = None;
     let mut c2b_done = false;
     let mut b2c_done = false;
 
@@ -1708,21 +1797,27 @@ async fn bidirectional_splice(
             biased;
             c2b_result = &mut c2b_fut, if !c2b_done => {
                 c2b_done = true;
-                if let Err(e) = c2b_result
+                if let Err((side, e)) = c2b_result
                     && first_failure.is_none()
                 {
-                    first_failure =
-                        Some((Direction::ClientToBackend, classify_stream_error(&e)));
+                    first_failure = Some((
+                        Direction::ClientToBackend,
+                        classify_stream_error(&e),
+                        Some(side),
+                    ));
                 }
                 break;
             }
             b2c_result = &mut b2c_fut, if !b2c_done => {
                 b2c_done = true;
-                if let Err(e) = b2c_result
+                if let Err((side, e)) = b2c_result
                     && first_failure.is_none()
                 {
-                    first_failure =
-                        Some((Direction::BackendToClient, classify_stream_error(&e)));
+                    first_failure = Some((
+                        Direction::BackendToClient,
+                        classify_stream_error(&e),
+                        Some(side),
+                    ));
                 }
                 break;
             }
@@ -1732,7 +1827,7 @@ async fn bidirectional_splice(
                     let last = la.load(Ordering::Relaxed);
                     if coarse_now_ms().saturating_sub(last) >= timeout_ms {
                         first_failure =
-                            Some((Direction::Unknown, ErrorClass::ReadWriteTimeout));
+                            Some((Direction::Unknown, ErrorClass::ReadWriteTimeout, None));
                         break;
                     }
                 }
@@ -1765,9 +1860,12 @@ async fn bidirectional_splice(
                 tokio::select! {
                     biased;
                     result = &mut c2b_fut => {
-                        if let Err(e) = result {
-                            first_failure =
-                                Some((Direction::ClientToBackend, classify_stream_error(&e)));
+                        if let Err((side, e)) = result {
+                            first_failure = Some((
+                                Direction::ClientToBackend,
+                                classify_stream_error(&e),
+                                Some(side),
+                            ));
                         }
                         break;
                     }
@@ -1776,7 +1874,7 @@ async fn bidirectional_splice(
                             let last = la.load(Ordering::Relaxed);
                             if coarse_now_ms().saturating_sub(last) >= timeout_ms {
                                 first_failure =
-                                    Some((Direction::Unknown, ErrorClass::ReadWriteTimeout));
+                                    Some((Direction::Unknown, ErrorClass::ReadWriteTimeout, None));
                                 break;
                             }
                         }
@@ -1786,10 +1884,13 @@ async fn bidirectional_splice(
         } else {
             match tokio::time::timeout(BIDIRECTIONAL_DRAIN_GRACE, &mut c2b_fut).await {
                 Ok(Ok(())) => {}
-                Ok(Err(e)) => {
+                Ok(Err((side, e))) => {
                     if first_failure.is_none() {
-                        first_failure =
-                            Some((Direction::ClientToBackend, classify_stream_error(&e)));
+                        first_failure = Some((
+                            Direction::ClientToBackend,
+                            classify_stream_error(&e),
+                            Some(side),
+                        ));
                     }
                 }
                 Err(_) => { /* grace expired — leave counters as-is */ }
@@ -1802,9 +1903,12 @@ async fn bidirectional_splice(
                 tokio::select! {
                     biased;
                     result = &mut b2c_fut => {
-                        if let Err(e) = result {
-                            first_failure =
-                                Some((Direction::BackendToClient, classify_stream_error(&e)));
+                        if let Err((side, e)) = result {
+                            first_failure = Some((
+                                Direction::BackendToClient,
+                                classify_stream_error(&e),
+                                Some(side),
+                            ));
                         }
                         break;
                     }
@@ -1813,7 +1917,7 @@ async fn bidirectional_splice(
                             let last = la.load(Ordering::Relaxed);
                             if coarse_now_ms().saturating_sub(last) >= timeout_ms {
                                 first_failure =
-                                    Some((Direction::Unknown, ErrorClass::ReadWriteTimeout));
+                                    Some((Direction::Unknown, ErrorClass::ReadWriteTimeout, None));
                                 break;
                             }
                         }
@@ -1823,10 +1927,13 @@ async fn bidirectional_splice(
         } else {
             match tokio::time::timeout(BIDIRECTIONAL_DRAIN_GRACE, &mut b2c_fut).await {
                 Ok(Ok(())) => {}
-                Ok(Err(e)) => {
+                Ok(Err((side, e))) => {
                     if first_failure.is_none() {
-                        first_failure =
-                            Some((Direction::BackendToClient, classify_stream_error(&e)));
+                        first_failure = Some((
+                            Direction::BackendToClient,
+                            classify_stream_error(&e),
+                            Some(side),
+                        ));
                     }
                 }
                 Err(_) => { /* grace expired — leave counters as-is */ }
@@ -1871,7 +1978,7 @@ async fn bidirectional_splice_io_uring(
             return StreamCopyResult {
                 bytes_client_to_backend: 0,
                 bytes_backend_to_client: 0,
-                first_failure: Some((Direction::Unknown, classify_stream_error(&e))),
+                first_failure: Some((Direction::Unknown, classify_stream_error(&e), None)),
             };
         }
     };
@@ -1882,7 +1989,7 @@ async fn bidirectional_splice_io_uring(
             return StreamCopyResult {
                 bytes_client_to_backend: 0,
                 bytes_backend_to_client: 0,
-                first_failure: Some((Direction::Unknown, classify_stream_error(&e))),
+                first_failure: Some((Direction::Unknown, classify_stream_error(&e), None)),
             };
         }
     };
@@ -1903,7 +2010,8 @@ async fn bidirectional_splice_io_uring(
     // First-failure attribution across the two blocking threads. `OnceLock`'s
     // first-writer-wins semantics naturally encode "first to fail" — the later
     // thread's `set()` is silently ignored. `Arc` shares it across threads.
-    let first_failure: Arc<OnceLock<(Direction, ErrorClass)>> = Arc::new(OnceLock::new());
+    let first_failure: Arc<OnceLock<(Direction, ErrorClass, Option<StreamIoSide>)>> =
+        Arc::new(OnceLock::new());
     let ff_c2b = first_failure.clone();
     let ff_b2c = first_failure.clone();
 
@@ -1926,23 +2034,34 @@ async fn bidirectional_splice_io_uring(
 
     let c2b_bytes = match c2b_result {
         Ok(Ok(n)) => n,
-        Ok(Err(e)) => {
-            let _ = ff_c2b.set((Direction::ClientToBackend, classify_stream_error(&e)));
+        Ok(Err((side, e))) => {
+            let _ = ff_c2b.set((
+                Direction::ClientToBackend,
+                classify_stream_error(&e),
+                Some(side),
+            ));
             0
         }
         Err(e) => {
+            // JoinError (task panicked or was cancelled) — side is not meaningful
+            // so leave it None so the caller falls back to the conservative default.
             let anyhow_err = anyhow::anyhow!("io_uring splice spawn error: {}", e);
             let _ = ff_c2b.set((
                 Direction::ClientToBackend,
                 classify_stream_error(&anyhow_err),
+                None,
             ));
             0
         }
     };
     let b2c_bytes = match b2c_result {
         Ok(Ok(n)) => n,
-        Ok(Err(e)) => {
-            let _ = ff_b2c.set((Direction::BackendToClient, classify_stream_error(&e)));
+        Ok(Err((side, e))) => {
+            let _ = ff_b2c.set((
+                Direction::BackendToClient,
+                classify_stream_error(&e),
+                Some(side),
+            ));
             0
         }
         Err(e) => {
@@ -1950,6 +2069,7 @@ async fn bidirectional_splice_io_uring(
             let _ = ff_b2c.set((
                 Direction::BackendToClient,
                 classify_stream_error(&anyhow_err),
+                None,
             ));
             0
         }
@@ -1978,7 +2098,7 @@ fn io_uring_splice_direction(
     dst_fd: i32,
     timeout_ms: u64,
     shared_activity: &AtomicU64,
-) -> Result<u64, anyhow::Error> {
+) -> Result<u64, (StreamIoSide, anyhow::Error)> {
     match crate::socket_opts::io_uring_splice::io_uring_splice_loop(
         src_fd,
         pipe_w,
@@ -1988,23 +2108,33 @@ fn io_uring_splice_direction(
         timeout_ms,
     ) {
         Ok(bytes) => Ok(bytes),
-        Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
+        Err(e) if e.source.kind() == std::io::ErrorKind::Unsupported => {
             // io_uring ring creation failed — fall back to libc::splice.
             // This can happen under memlock pressure even though startup
             // probing succeeded.
             tracing::debug!("io_uring ring creation failed, falling back to libc splice");
             libc_splice_loop(src_fd, pipe_w, pipe_r, dst_fd, timeout_ms, shared_activity)
         }
-        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
-            Err(anyhow::anyhow!("TCP idle timeout (io_uring splice)"))
+        Err(e) => {
+            let side = if e.is_write_side {
+                StreamIoSide::Write
+            } else {
+                StreamIoSide::Read
+            };
+            if e.source.kind() == std::io::ErrorKind::TimedOut {
+                Err((side, anyhow::anyhow!("TCP idle timeout (io_uring splice)")))
+            } else {
+                Err((side, anyhow::anyhow!("io_uring splice error: {}", e.source)))
+            }
         }
-        Err(e) => Err(anyhow::anyhow!("io_uring splice error: {}", e)),
     }
 }
 
 /// Fallback libc::splice loop for when io_uring ring creation fails.
 /// Same logic as `splice_one_direction_no_guard` but synchronous (runs
-/// on a blocking thread).
+/// on a blocking thread). Errors are tagged with the side (Read for the
+/// src_fd → pipe splice, Write for the pipe → dst_fd splice) so the
+/// caller can attribute the failure to the correct socket.
 #[cfg(target_os = "linux")]
 fn libc_splice_loop(
     src_fd: i32,
@@ -2013,7 +2143,7 @@ fn libc_splice_loop(
     dst_fd: i32,
     timeout_ms: u64,
     shared_activity: &AtomicU64,
-) -> Result<u64, anyhow::Error> {
+) -> Result<u64, (StreamIoSide, anyhow::Error)> {
     let splice_flags = libc::SPLICE_F_MOVE | libc::SPLICE_F_NONBLOCK;
     let mut total: u64 = 0;
 
@@ -2021,7 +2151,10 @@ fn libc_splice_loop(
         if timeout_ms > 0 {
             let last = shared_activity.load(Ordering::Relaxed);
             if coarse_now_ms().saturating_sub(last) >= timeout_ms {
-                return Err(anyhow::anyhow!("TCP idle timeout (libc splice fallback)"));
+                return Err((
+                    StreamIoSide::Read,
+                    anyhow::anyhow!("TCP idle timeout (libc splice fallback)"),
+                ));
             }
         }
 
@@ -2070,15 +2203,21 @@ fn libc_splice_loop(
                         if timeout_ms > 0 {
                             let last = shared_activity.load(Ordering::Relaxed);
                             if coarse_now_ms().saturating_sub(last) >= timeout_ms {
-                                return Err(anyhow::anyhow!(
-                                    "TCP idle timeout (libc splice fallback, write phase)"
+                                return Err((
+                                    StreamIoSide::Write,
+                                    anyhow::anyhow!(
+                                        "TCP idle timeout (libc splice fallback, write phase)"
+                                    ),
                                 ));
                             }
                         }
                         std::thread::sleep(std::time::Duration::from_millis(1));
                         continue;
                     }
-                    return Err(anyhow::anyhow!("splice write error: {}", err));
+                    return Err((
+                        StreamIoSide::Write,
+                        anyhow::anyhow!("splice write error: {}", err),
+                    ));
                 }
             }
         } else if n == 0 {
@@ -2091,15 +2230,19 @@ fn libc_splice_loop(
                 if timeout_ms > 0 {
                     let last = shared_activity.load(Ordering::Relaxed);
                     if coarse_now_ms().saturating_sub(last) >= timeout_ms {
-                        return Err(anyhow::anyhow!(
-                            "TCP idle timeout (libc splice fallback, read phase)"
+                        return Err((
+                            StreamIoSide::Read,
+                            anyhow::anyhow!("TCP idle timeout (libc splice fallback, read phase)"),
                         ));
                     }
                 }
                 std::thread::sleep(std::time::Duration::from_millis(1));
                 continue;
             }
-            return Err(anyhow::anyhow!("splice read error: {}", err));
+            return Err((
+                StreamIoSide::Read,
+                anyhow::anyhow!("splice read error: {}", err),
+            ));
         }
     }
 }
@@ -2128,7 +2271,10 @@ fn create_splice_pipe(desired_size: usize) -> Result<(i32, i32), anyhow::Error> 
 /// Bytes transferred are accumulated into `bytes` so the caller can observe
 /// the final count regardless of whether this direction completes cleanly or
 /// errors. Pipe fds are managed by the caller's `SplicePipeGuard` — this
-/// function does not close them.
+/// function does not close them. Errors are tagged with `StreamIoSide::Read`
+/// when the src_fd → pipe splice fails and `StreamIoSide::Write` when the
+/// pipe → dst_fd splice fails, so the caller can attribute the failure to
+/// the correct socket (client-facing vs backend-facing).
 #[cfg(target_os = "linux")]
 async fn splice_one_direction_no_guard(
     src_fd: i32,
@@ -2137,7 +2283,7 @@ async fn splice_one_direction_no_guard(
     dst_fd: i32,
     last_activity: Option<Arc<AtomicU64>>,
     bytes: Arc<AtomicU64>,
-) -> Result<(), anyhow::Error> {
+) -> Result<(), (StreamIoSide, anyhow::Error)> {
     let splice_flags = libc::SPLICE_F_MOVE | libc::SPLICE_F_NONBLOCK;
 
     loop {
@@ -2187,7 +2333,10 @@ async fn splice_one_direction_no_guard(
                         tokio::task::yield_now().await;
                         continue;
                     }
-                    return Err(anyhow::anyhow!("splice write error: {}", err));
+                    return Err((
+                        StreamIoSide::Write,
+                        anyhow::anyhow!("splice write error: {}", err),
+                    ));
                 }
             }
         } else if n == 0 {
@@ -2200,7 +2349,10 @@ async fn splice_one_direction_no_guard(
                 tokio::task::yield_now().await;
                 continue;
             }
-            return Err(anyhow::anyhow!("splice read error: {}", err));
+            return Err((
+                StreamIoSide::Read,
+                anyhow::anyhow!("splice read error: {}", err),
+            ));
         }
     }
 }

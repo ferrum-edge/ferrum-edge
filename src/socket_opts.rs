@@ -1202,14 +1202,43 @@ pub mod io_uring_splice {
         available
     }
 
+    /// Errors from an io_uring splice call tagged with the side of the relay
+    /// that produced them.
+    ///
+    /// `is_write_side = false` — the src_fd → pipe splice failed (read side).
+    /// `is_write_side = true` — the pipe → dst_fd splice failed (write side).
+    /// `is_write_side = false` is also used for out-of-band failures (ring
+    /// creation, idle timeout, submission-queue full) where the side isn't
+    /// meaningful; callers that care should inspect `source.kind()`.
+    #[derive(Debug)]
+    pub struct SpliceError {
+        pub is_write_side: bool,
+        pub source: std::io::Error,
+    }
+
+    impl SpliceError {
+        fn read(source: std::io::Error) -> Self {
+            Self {
+                is_write_side: false,
+                source,
+            }
+        }
+        fn write(source: std::io::Error) -> Self {
+            Self {
+                is_write_side: true,
+                source,
+            }
+        }
+    }
+
     /// Splice data in one direction using io_uring: src_fd → pipe → dst_fd.
     ///
     /// Runs on a blocking thread (called via `tokio::task::spawn_blocking`).
     /// Creates a small io_uring ring (8 entries) and submits IORING_OP_SPLICE
     /// operations for each chunk. Returns total bytes transferred.
     ///
-    /// Returns `Err` with `ErrorKind::Unsupported` if the ring cannot be created,
-    /// signaling the caller to fall back to `libc::splice`.
+    /// Returns `Err` with `source.kind() == ErrorKind::Unsupported` if the ring
+    /// cannot be created, signaling the caller to fall back to `libc::splice`.
     ///
     /// `timeout_ms` is the idle timeout — if no data is transferred on either
     /// direction for this duration, returns `ErrorKind::TimedOut`.
@@ -1223,16 +1252,17 @@ pub mod io_uring_splice {
         dst_fd: i32,
         shared_last_activity_ms: &std::sync::atomic::AtomicU64,
         timeout_ms: u64,
-    ) -> std::io::Result<u64> {
+    ) -> Result<u64, SpliceError> {
         let mut ring = match io_uring::IoUring::new(8) {
             Ok(r) => r,
             Err(_) => {
                 // Ring creation failed (memlock pressure, resource limits).
-                // Signal caller to fall back to libc::splice.
-                return Err(std::io::Error::new(
+                // Signal caller to fall back to libc::splice. Side is N/A but
+                // the caller checks ErrorKind::Unsupported before side.
+                return Err(SpliceError::read(std::io::Error::new(
                     std::io::ErrorKind::Unsupported,
                     "io_uring ring creation failed, falling back to libc splice",
-                ));
+                )));
             }
         };
         let splice_flags = libc::SPLICE_F_MOVE | libc::SPLICE_F_NONBLOCK;
@@ -1254,7 +1284,9 @@ pub mod io_uring_splice {
                 let now = super::monotonic_now_ms();
                 let last = shared_last_activity_ms.load(std::sync::atomic::Ordering::Relaxed);
                 if now.saturating_sub(last) >= timeout_ms {
-                    return Err(std::io::Error::from(std::io::ErrorKind::TimedOut));
+                    return Err(SpliceError::read(std::io::Error::from(
+                        std::io::ErrorKind::TimedOut,
+                    )));
                 }
             }
 
@@ -1272,14 +1304,14 @@ pub mod io_uring_splice {
             unsafe {
                 ring.submission()
                     .push(&sqe)
-                    .map_err(|_| std::io::Error::other("io_uring SQ full"))?;
+                    .map_err(|_| SpliceError::read(std::io::Error::other("io_uring SQ full")))?;
             }
-            ring.submit_and_wait(1)?;
+            ring.submit_and_wait(1).map_err(SpliceError::read)?;
 
             let cqe = ring
                 .completion()
                 .next()
-                .ok_or_else(|| std::io::Error::other("io_uring no CQE"))?;
+                .ok_or_else(|| SpliceError::read(std::io::Error::other("io_uring no CQE")))?;
             let n = cqe.result();
 
             if n == 0 {
@@ -1297,14 +1329,16 @@ pub mod io_uring_splice {
                         let last =
                             shared_last_activity_ms.load(std::sync::atomic::Ordering::Relaxed);
                         if now.saturating_sub(last) >= timeout_ms {
-                            return Err(std::io::Error::from(std::io::ErrorKind::TimedOut));
+                            return Err(SpliceError::read(std::io::Error::from(
+                                std::io::ErrorKind::TimedOut,
+                            )));
                         }
                     }
                     // Back off to avoid tight spin — sleep 1ms then retry.
                     std::thread::sleep(std::time::Duration::from_millis(1));
                     continue;
                 }
-                return Err(err);
+                return Err(SpliceError::read(err));
             }
 
             // Phase 2: splice pipe_r → dst_fd via io_uring
@@ -1321,16 +1355,16 @@ pub mod io_uring_splice {
                 .build();
 
                 unsafe {
-                    ring.submission()
-                        .push(&sqe)
-                        .map_err(|_| std::io::Error::other("io_uring SQ full"))?;
+                    ring.submission().push(&sqe).map_err(|_| {
+                        SpliceError::write(std::io::Error::other("io_uring SQ full"))
+                    })?;
                 }
-                ring.submit_and_wait(1)?;
+                ring.submit_and_wait(1).map_err(SpliceError::write)?;
 
                 let cqe = ring
                     .completion()
                     .next()
-                    .ok_or_else(|| std::io::Error::other("io_uring no CQE"))?;
+                    .ok_or_else(|| SpliceError::write(std::io::Error::other("io_uring no CQE")))?;
                 let w = cqe.result();
 
                 if w == 0 {
@@ -1350,13 +1384,15 @@ pub mod io_uring_splice {
                             let last =
                                 shared_last_activity_ms.load(std::sync::atomic::Ordering::Relaxed);
                             if now.saturating_sub(last) >= timeout_ms {
-                                return Err(std::io::Error::from(std::io::ErrorKind::TimedOut));
+                                return Err(SpliceError::write(std::io::Error::from(
+                                    std::io::ErrorKind::TimedOut,
+                                )));
                             }
                         }
                         std::thread::sleep(std::time::Duration::from_millis(1));
                         continue;
                     }
-                    return Err(err);
+                    return Err(SpliceError::write(err));
                 }
                 remaining -= w as u32;
                 total += w as u64;
@@ -1382,6 +1418,15 @@ pub mod io_uring_splice {
         false
     }
 
+    /// Errors from an io_uring splice call tagged with the side of the relay
+    /// that produced them. `is_write_side = false` for all non-Linux stubs.
+    #[derive(Debug)]
+    #[allow(dead_code)] // Fields are consumed only by the Linux splice path.
+    pub struct SpliceError {
+        pub is_write_side: bool,
+        pub source: std::io::Error,
+    }
+
     #[allow(dead_code)]
     pub fn io_uring_splice_loop(
         _src_fd: i32,
@@ -1390,11 +1435,14 @@ pub mod io_uring_splice {
         _dst_fd: i32,
         _shared_last_activity_ms: &std::sync::atomic::AtomicU64,
         _timeout_ms: u64,
-    ) -> std::io::Result<u64> {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "io_uring not available on this platform",
-        ))
+    ) -> Result<u64, SpliceError> {
+        Err(SpliceError {
+            is_write_side: false,
+            source: std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "io_uring not available on this platform",
+            ),
+        })
     }
 }
 

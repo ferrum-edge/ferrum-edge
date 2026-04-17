@@ -68,7 +68,18 @@ pub mod _test_support {
         crate::proxy::tcp_proxy::classify_stream_error(error)
     }
 
-    pub use crate::proxy::tcp_proxy::StreamCopyResult;
+    pub use crate::proxy::tcp_proxy::{StreamCopyResult, StreamIoSide};
+
+    /// Reach into `tcp_proxy` to exercise the `Direction` + IO-side →
+    /// `DisconnectCause` mapping that the TCP accept loop uses when
+    /// populating stream disconnect metrics.
+    pub fn disconnect_cause_for_failure(
+        direction: crate::plugins::Direction,
+        class: &crate::retry::ErrorClass,
+        side: Option<StreamIoSide>,
+    ) -> crate::plugins::DisconnectCause {
+        crate::proxy::tcp_proxy::disconnect_cause_for_failure(direction, class, side)
+    }
 
     /// Invoke the internal `bidirectional_copy` for unit tests. Generic over
     /// any streams implementing `AsyncRead + AsyncWrite + Unpin`.
@@ -236,5 +247,51 @@ pub mod _test_support {
         grpc_message: &str,
     ) {
         crate::proxy::insert_grpc_error_metadata(metadata, grpc_status, grpc_message)
+    }
+
+    // ── WebSocket tunnel-mode disconnect hook ────────────────────────────────
+    //
+    // Tunnel mode bypasses WebSocket frame parsing and does raw TCP bidirectional
+    // copy. The test-support helpers below expose the internal `WsSessionMeta`
+    // constructor and the `fire_ws_tunnel_disconnect_hooks` entry point so unit
+    // tests can verify that `on_ws_disconnect` still fires in tunnel mode (the
+    // disconnect-observability contract used by ws_frame_logging and
+    // prometheus_metrics).
+    #[allow(clippy::too_many_arguments)]
+    pub fn make_ws_session_meta(
+        namespace: String,
+        proxy_name: Option<String>,
+        client_ip: String,
+        backend_target: String,
+        listen_port: u16,
+        consumer_username: Option<String>,
+        metadata: HashMap<String, String>,
+        session_start: chrono::DateTime<chrono::Utc>,
+    ) -> crate::proxy::WsSessionMeta {
+        crate::proxy::WsSessionMeta {
+            namespace,
+            proxy_name,
+            client_ip,
+            backend_target,
+            listen_port,
+            consumer_username,
+            metadata,
+            session_start,
+        }
+    }
+
+    pub async fn fire_ws_tunnel_disconnect_hooks(
+        ws_disconnect_plugins: &[Arc<dyn Plugin>],
+        proxy_id: &str,
+        session_meta: &crate::proxy::WsSessionMeta,
+        failure: Option<(crate::plugins::Direction, crate::retry::ErrorClass)>,
+    ) {
+        crate::proxy::fire_ws_tunnel_disconnect_hooks(
+            ws_disconnect_plugins,
+            proxy_id,
+            session_meta,
+            failure,
+        )
+        .await
     }
 }

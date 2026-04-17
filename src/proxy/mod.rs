@@ -2878,7 +2878,8 @@ async fn connect_websocket_backend(
 /// teardown when firing `on_ws_disconnect`. Held as an owned struct (not
 /// references) because the upgrade handler returns before the session ends,
 /// so all fields must outlive the originating request context.
-pub(crate) struct WsSessionMeta {
+#[doc(hidden)]
+pub struct WsSessionMeta {
     pub namespace: String,
     pub proxy_name: Option<String>,
     pub client_ip: String,
@@ -2887,6 +2888,52 @@ pub(crate) struct WsSessionMeta {
     pub consumer_username: Option<String>,
     pub metadata: HashMap<String, String>,
     pub session_start: chrono::DateTime<chrono::Utc>,
+}
+
+/// Fire `on_ws_disconnect` for the tunnel-mode path, where raw
+/// `copy_bidirectional` is used instead of frame-level parsing.
+///
+/// Tunnel mode does not track frame counts (all bytes flow as raw TCP), so
+/// `frames_client_to_backend` / `frames_backend_to_client` are reported as
+/// `0`. Direction attribution is best-effort: drain-phase write errors to
+/// the client are attributed to `BackendToClient`; the `copy_bidirectional`
+/// error path has no per-direction attribution and reports
+/// `Direction::Unknown`. Observers that require direction/count fidelity
+/// should disable tunnel mode for the proxy.
+///
+/// The helper takes `ws_disconnect_plugins` by slice and `session_meta` by
+/// reference so the caller keeps ownership for the duration of the call.
+#[doc(hidden)]
+pub async fn fire_ws_tunnel_disconnect_hooks(
+    ws_disconnect_plugins: &[Arc<dyn Plugin>],
+    proxy_id: &str,
+    session_meta: &WsSessionMeta,
+    failure: Option<(crate::plugins::Direction, retry::ErrorClass)>,
+) {
+    if ws_disconnect_plugins.is_empty() {
+        return;
+    }
+    let disconnect_duration_ms = (chrono::Utc::now() - session_meta.session_start)
+        .num_milliseconds()
+        .max(0) as f64;
+    let disconnect_ctx = crate::plugins::WsDisconnectContext {
+        namespace: session_meta.namespace.clone(),
+        proxy_id: proxy_id.to_string(),
+        proxy_name: session_meta.proxy_name.clone(),
+        client_ip: session_meta.client_ip.clone(),
+        backend_target: session_meta.backend_target.clone(),
+        listen_port: session_meta.listen_port,
+        duration_ms: disconnect_duration_ms,
+        frames_client_to_backend: 0,
+        frames_backend_to_client: 0,
+        direction: failure.as_ref().map(|(d, _)| *d),
+        error_class: failure.map(|(_, c)| c),
+        consumer_username: session_meta.consumer_username.clone(),
+        metadata: session_meta.metadata.clone(),
+    };
+    for plugin in ws_disconnect_plugins {
+        plugin.on_ws_disconnect(&disconnect_ctx).await;
+    }
 }
 
 /// `connection_id` — unique per-connection identifier for stateful frame plugins.
@@ -2948,6 +2995,20 @@ async fn run_websocket_proxy(
                     proxy_id = %proxy_id,
                     "WebSocket tunnel: failed to flush buffered frame: {e}"
                 );
+                // Write to client failed — attribute to BackendToClient. Still
+                // run the disconnect hook before returning so observers see
+                // the session teardown event.
+                let drain_failure = Some((
+                    crate::plugins::Direction::BackendToClient,
+                    retry::classify_boxed_error(&e),
+                ));
+                fire_ws_tunnel_disconnect_hooks(
+                    &ws_disconnect_plugins,
+                    proxy_id,
+                    &session_meta,
+                    drain_failure,
+                )
+                .await;
                 return Ok(());
             }
         }
@@ -2964,9 +3025,34 @@ async fn run_websocket_proxy(
             buf_size,
         )
         .await;
-        if let Ok((c2b, b2c)) = &result {
-            adaptive_buffer.record_connection(proxy_id, c2b.saturating_add(*b2c));
-        }
+        let tunnel_failure = match &result {
+            Ok((c2b, b2c)) => {
+                adaptive_buffer.record_connection(proxy_id, c2b.saturating_add(*b2c));
+                None
+            }
+            Err(e) => {
+                // `copy_bidirectional` doesn't report which half failed, so fall
+                // back to `Direction::Unknown`. Observers that rely on direction
+                // attribution should enable frame-level plugins instead of tunnel
+                // mode.
+                let anyhow_err: anyhow::Error =
+                    anyhow::anyhow!("WebSocket tunnel copy error: {}", e);
+                Some((
+                    crate::plugins::Direction::Unknown,
+                    crate::retry::classify_boxed_error(anyhow_err.as_ref()),
+                ))
+            }
+        };
+        // Fire on_ws_disconnect so plugins that opted into disconnect hooks see
+        // the tunnel-mode session teardown. Frame counts are 0 because tunnel
+        // mode does raw TCP bidirectional copy — no frames are parsed.
+        fire_ws_tunnel_disconnect_hooks(
+            &ws_disconnect_plugins,
+            proxy_id,
+            &session_meta,
+            tunnel_failure,
+        )
+        .await;
         return Ok(());
     }
 

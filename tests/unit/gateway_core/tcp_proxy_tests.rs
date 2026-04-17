@@ -1,5 +1,7 @@
-use ferrum_edge::_test_support::{bidirectional_copy_for_test, classify_stream_error};
-use ferrum_edge::plugins::Direction;
+use ferrum_edge::_test_support::{
+    StreamIoSide, bidirectional_copy_for_test, classify_stream_error, disconnect_cause_for_failure,
+};
+use ferrum_edge::plugins::{Direction, DisconnectCause};
 use ferrum_edge::retry::ErrorClass;
 use std::io;
 use std::pin::Pin;
@@ -66,7 +68,7 @@ async fn test_bidirectional_copy_client_read_error_marks_client_to_backend() {
 
     let result = bidirectional_copy_for_test(client, backend, None, 8 * 1024).await;
 
-    let (dir, class) = result
+    let (dir, class, _side) = result
         .first_failure
         .as_ref()
         .expect("first_failure should be set when client read errors");
@@ -81,7 +83,7 @@ async fn test_bidirectional_copy_backend_read_error_marks_backend_to_client() {
 
     let result = bidirectional_copy_for_test(client, backend, None, 8 * 1024).await;
 
-    let (dir, class) = result
+    let (dir, class, _side) = result
         .first_failure
         .as_ref()
         .expect("first_failure should be set when backend read errors");
@@ -121,7 +123,7 @@ async fn test_bidirectional_copy_preserves_bytes_across_errors() {
 
     let result = bidirectional_copy_for_test(client, backend, None, 8 * 1024).await;
 
-    let (dir, _class) = result
+    let (dir, _class, _side) = result
         .first_failure
         .as_ref()
         .expect("first_failure should be set — backend read half errored");
@@ -267,7 +269,7 @@ async fn test_bidirectional_copy_half_close_idle_timeout_fires_in_phase2() {
             .await;
 
     // Idle timeout must fire — either during Phase 1 or Phase 2.
-    let (dir, class) = result
+    let (dir, class, _side) = result
         .first_failure
         .as_ref()
         .expect("idle timeout on stalled backend must produce first_failure");
@@ -418,10 +420,117 @@ async fn test_bidirectional_splice_half_close_idle_timeout_fires_in_phase2() {
     )
     .await;
 
-    let (dir, class) = result
+    let (dir, class, _side) = result
         .first_failure
         .as_ref()
         .expect("idle timeout on stalled backend (splice path) must produce first_failure");
     assert_eq!(*dir, Direction::Unknown);
     assert_eq!(*class, ErrorClass::ReadWriteTimeout);
+}
+
+// ── disconnect_cause_for_failure — Direction + Side → DisconnectCause ────────
+//
+// Codex flagged that the old mapping attributed every `ClientToBackend` failure
+// to `RecvError`, even when the failing syscall was the *write* on the backend
+// socket (e.g., backend RST while client was still sending). These tests lock
+// in the side-aware mapping that replaces the ambiguous direction-only match.
+
+#[test]
+fn test_disconnect_cause_ctb_read_is_recv_error() {
+    // Client → Backend, read side = reading from CLIENT failed = frontend/client side.
+    assert_eq!(
+        disconnect_cause_for_failure(
+            Direction::ClientToBackend,
+            &ErrorClass::ConnectionReset,
+            Some(StreamIoSide::Read),
+        ),
+        DisconnectCause::RecvError,
+    );
+}
+
+#[test]
+fn test_disconnect_cause_ctb_write_is_backend_error() {
+    // Client → Backend, write side = writing to BACKEND failed = backend side.
+    // This is the exact miscategorized case Codex called out: the old code
+    // returned `RecvError` here; the new mapping returns `BackendError`.
+    assert_eq!(
+        disconnect_cause_for_failure(
+            Direction::ClientToBackend,
+            &ErrorClass::ConnectionReset,
+            Some(StreamIoSide::Write),
+        ),
+        DisconnectCause::BackendError,
+    );
+}
+
+#[test]
+fn test_disconnect_cause_btc_read_is_backend_error() {
+    // Backend → Client, read side = reading from BACKEND failed = backend side.
+    assert_eq!(
+        disconnect_cause_for_failure(
+            Direction::BackendToClient,
+            &ErrorClass::ConnectionReset,
+            Some(StreamIoSide::Read),
+        ),
+        DisconnectCause::BackendError,
+    );
+}
+
+#[test]
+fn test_disconnect_cause_btc_write_is_recv_error() {
+    // Backend → Client, write side = writing to CLIENT failed = frontend side.
+    // Old mapping returned `BackendError`; new mapping returns `RecvError`.
+    assert_eq!(
+        disconnect_cause_for_failure(
+            Direction::BackendToClient,
+            &ErrorClass::ConnectionReset,
+            Some(StreamIoSide::Write),
+        ),
+        DisconnectCause::RecvError,
+    );
+}
+
+#[test]
+fn test_disconnect_cause_timeout_beats_direction() {
+    // ReadWriteTimeout is always IdleTimeout regardless of direction/side.
+    for dir in [
+        Direction::ClientToBackend,
+        Direction::BackendToClient,
+        Direction::Unknown,
+    ] {
+        for side in [None, Some(StreamIoSide::Read), Some(StreamIoSide::Write)] {
+            assert_eq!(
+                disconnect_cause_for_failure(dir, &ErrorClass::ReadWriteTimeout, side),
+                DisconnectCause::IdleTimeout,
+                "timeout with dir={:?} side={:?} should map to IdleTimeout",
+                dir,
+                side,
+            );
+        }
+    }
+}
+
+#[test]
+fn test_disconnect_cause_unknown_direction_falls_back_to_recv_error() {
+    // Unknown direction (pipe creation, kTLS install, spawn-join failure) —
+    // conservative fallback is RecvError, matching prior log-consumer convention.
+    assert_eq!(
+        disconnect_cause_for_failure(Direction::Unknown, &ErrorClass::RequestError, None),
+        DisconnectCause::RecvError,
+    );
+}
+
+#[test]
+fn test_disconnect_cause_missing_side_falls_back_to_recv_error() {
+    // Side-less failures (e.g., spawn-join errors attributed to a direction but
+    // without side info) fall back to RecvError rather than mis-assigning to
+    // BackendError.
+    assert_eq!(
+        disconnect_cause_for_failure(
+            Direction::ClientToBackend,
+            &ErrorClass::ConnectionReset,
+            None,
+        ),
+        DisconnectCause::RecvError,
+    );
 }
