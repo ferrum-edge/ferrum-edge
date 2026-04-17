@@ -683,19 +683,34 @@ pub fn send_with_pktinfo(
     ))
 }
 
-/// Probe whether `IP_PKTINFO` can be enabled on a UDP socket (Linux only).
+/// Probe whether pktinfo can be enabled on a UDP socket (Linux only).
 ///
-/// Creates a transient v4 UDP socket, attempts `setsockopt(IP_PKTINFO)`, and
-/// closes it. Returns `true` if the kernel accepted the option.
+/// Tries `IP_PKTINFO` on a v4 socket and `IPV6_RECVPKTINFO` on a v6 socket.
+/// Returns `true` if either succeeds — sufficient for enabling auto mode on
+/// IPv4-only, IPv6-only, or dual-stack hosts.
 #[cfg(target_os = "linux")]
 pub fn is_udp_pktinfo_available() -> bool {
-    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
-    if fd < 0 {
-        return false;
-    }
-    let ok = set_ip_pktinfo(fd).is_ok();
-    unsafe { libc::close(fd) };
-    ok
+    let v4_ok = {
+        let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+        if fd < 0 {
+            false
+        } else {
+            let ok = set_ip_pktinfo(fd).is_ok();
+            unsafe { libc::close(fd) };
+            ok
+        }
+    };
+    let v6_ok = {
+        let fd = unsafe { libc::socket(libc::AF_INET6, libc::SOCK_DGRAM, 0) };
+        if fd < 0 {
+            false
+        } else {
+            let ok = set_ipv6_recvpktinfo(fd).is_ok();
+            unsafe { libc::close(fd) };
+            ok
+        }
+    };
+    v4_ok || v6_ok
 }
 
 #[cfg(not(target_os = "linux"))]

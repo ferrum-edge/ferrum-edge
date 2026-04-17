@@ -315,11 +315,6 @@ impl SendMmsgBatch {
         }
     }
 
-    /// Queue a datagram for batched sending. Returns `false` if the batch is full.
-    pub fn push(&mut self, data: &[u8], dest: SocketAddr) -> bool {
-        self.push_with_local(data, dest, None)
-    }
-
     /// Queue a datagram for batched sending, optionally attaching an
     /// IP(v6)_PKTINFO cmsg with `local_ip` as the reply source address.
     ///
