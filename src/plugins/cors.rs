@@ -187,6 +187,11 @@ impl CorsPlugin {
     }
 
     /// Build the common CORS response headers (used for both preflight and actual).
+    ///
+    /// Note: this returns the headers the plugin wants to ADD/SET on the response.
+    /// Vary is intentionally not included here — see `apply_cors_headers_to_response`
+    /// which merges Vary with any pre-existing value to avoid clobbering backend Vary
+    /// directives (e.g., `Vary: Accept-Encoding` from compression).
     fn build_cors_headers(&self, origin: &str) -> HashMap<String, String> {
         let mut headers = HashMap::new();
 
@@ -202,9 +207,6 @@ impl CorsPlugin {
                 );
             }
         }
-
-        // Always set Vary: Origin for caching correctness
-        headers.insert("vary".to_string(), "Origin".to_string());
 
         if self.allow_credentials {
             headers.insert(
@@ -223,9 +225,40 @@ impl CorsPlugin {
         headers
     }
 
+    /// Merge `Origin` into an existing `Vary` header value (case-insensitive).
+    /// Returns the merged Vary string. Preserves existing tokens (e.g., `Accept-Encoding`)
+    /// to avoid breaking caching layers that depend on them.
+    fn merge_vary_origin(existing: Option<&str>) -> String {
+        match existing {
+            None => "Origin".to_string(),
+            Some(value) => {
+                let trimmed = value.trim();
+                if trimmed.is_empty() {
+                    return "Origin".to_string();
+                }
+                // Per RFC 9110 §12.5.5, Vary: * means "vary on any header" — adding
+                // Origin is redundant. Preserve as-is.
+                if trimmed == "*" {
+                    return "*".to_string();
+                }
+                let already_present = trimmed
+                    .split(',')
+                    .any(|tok| tok.trim().eq_ignore_ascii_case("Origin"));
+                if already_present {
+                    return trimmed.to_string();
+                }
+                format!("{}, Origin", trimmed)
+            }
+        }
+    }
+
     /// Build headers specific to preflight responses (superset of common headers).
     fn build_preflight_headers(&self, origin: &str) -> HashMap<String, String> {
         let mut headers = self.build_cors_headers(origin);
+
+        // Preflight 204 responses have no backend Vary to preserve, so set Origin
+        // directly. The actual-request response path uses merge_vary_origin().
+        headers.insert("vary".to_string(), "Origin".to_string());
 
         headers.insert(
             "access-control-allow-methods".to_string(),
@@ -351,6 +384,13 @@ impl Plugin for CorsPlugin {
         for (k, v) in cors_headers {
             response_headers.insert(k, v);
         }
+
+        // Merge Origin into Vary rather than overwriting it. The backend may have
+        // returned `Vary: Accept-Encoding` (compression), `Vary: Accept-Language`,
+        // etc.; clobbering those would break downstream caches that segment by
+        // those dimensions.
+        let merged = Self::merge_vary_origin(response_headers.get("vary").map(|s| s.as_str()));
+        response_headers.insert("vary".to_string(), merged);
 
         PluginResult::Continue
     }
