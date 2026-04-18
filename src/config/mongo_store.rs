@@ -31,7 +31,7 @@ mod inner {
     };
     use async_trait::async_trait;
     use chrono::{DateTime, Utc};
-    use mongodb::bson::{Document, doc};
+    use mongodb::bson::{Bson, Document, doc};
     use mongodb::options::{ClientOptions, FindOptions, IndexOptions, Tls, TlsOptions};
     use mongodb::{Client, Collection, Database, IndexModel};
     use std::collections::HashSet;
@@ -410,11 +410,44 @@ mod inner {
     // BSON serialization helpers
     // -----------------------------------------------------------------------
 
+    /// Strip explicit `null` values for fields that participate in unique
+    /// + sparse compound indexes.
+    ///
+    /// MongoDB's sparse indexes skip documents where the indexed field is
+    /// **absent**, but they DO index documents where the field is explicitly
+    /// set to `null`. Under `unique: true`, two documents in the same
+    /// namespace with `{listen_port: null}` (or `{name: null}`, etc.) both
+    /// land on the same index entry and the second insert fails with
+    /// `E11000 duplicate key error`.
+    ///
+    /// The domain structs use `Option<T>` without `skip_serializing_if`, so
+    /// `None` serializes to BSON `Null`. Stripping these fields from the
+    /// document before insert restores sparse-index semantics while keeping
+    /// JSON admin-API responses (which read `name`/`listen_port`/`custom_id`
+    /// via serde) unchanged.
+    ///
+    /// Only the fields listed here need stripping. Other `Option` fields
+    /// either participate in non-unique indexes (no conflict) or have no
+    /// index at all.
+    fn strip_null_fields(doc: &mut Document, fields: &[&str]) {
+        for field in fields {
+            if matches!(doc.get(*field), Some(Bson::Null)) {
+                doc.remove(*field);
+            }
+        }
+    }
+
     /// Convert a domain `Proxy` into a BSON `Document` for storage.
     fn proxy_to_doc(proxy: &Proxy) -> Result<Document, anyhow::Error> {
         let mut doc = mongodb::bson::to_document(proxy)?;
         // Use the proxy's id as the MongoDB _id
         doc.insert("_id", proxy.id.as_str());
+        // `name` and `listen_port` both participate in unique+sparse
+        // compound indexes (`{namespace, name}` and
+        // `{namespace, listen_port}`). Two HTTP proxies in the same
+        // namespace both have `listen_port: None` — without stripping,
+        // the second insert would fail with a duplicate-null-key error.
+        strip_null_fields(&mut doc, &["name", "listen_port"]);
         Ok(doc)
     }
 
@@ -428,6 +461,9 @@ mod inner {
     fn consumer_to_doc(consumer: &Consumer) -> Result<Document, anyhow::Error> {
         let mut doc = mongodb::bson::to_document(consumer)?;
         doc.insert("_id", consumer.id.as_str());
+        // `custom_id` participates in the `{namespace, custom_id}` unique+
+        // sparse index. Strip when absent for the same reason as Proxy above.
+        strip_null_fields(&mut doc, &["custom_id"]);
         Ok(doc)
     }
 
@@ -450,6 +486,10 @@ mod inner {
     fn upstream_to_doc(upstream: &Upstream) -> Result<Document, anyhow::Error> {
         let mut doc = mongodb::bson::to_document(upstream)?;
         doc.insert("_id", upstream.id.as_str());
+        // `name` participates in the `{namespace, name}` unique+sparse index.
+        // Upstreams without a name must omit the field so multiple nameless
+        // upstreams in the same namespace don't collide on a shared null key.
+        strip_null_fields(&mut doc, &["name"]);
         Ok(doc)
     }
 
@@ -1279,12 +1319,38 @@ mod inner {
             // MongoDB doesn't use SQL migrations. Instead, ensure indexes exist.
             // createIndex is idempotent — no-op if the index already exists.
 
+            // Drop legacy unique+sparse compound indexes so they can be
+            // recreated as unique+partialFilterExpression below. Older
+            // deployments may have the sparse form from pre-fix versions,
+            // which is buggy: MongoDB compound sparse indexes index a
+            // document whenever ANY compound field is present, treating
+            // the missing companion as an explicit null. That caused
+            // `{namespace, listen_port}` on HTTP proxies (which have no
+            // listen_port) to collide on `{ns, null}` across every HTTP
+            // proxy in the same namespace. `partial_filter_expression`
+            // with a type filter only indexes docs where the sparse field
+            // is actually a string/number, which is what we want.
+            //
+            // `drop_index` errors out when the index does not exist; this
+            // happens on fresh deployments and is expected — ignore.
+            let _ = self.proxies().drop_index("namespace_1_name_1").await;
+            let _ = self.proxies().drop_index("namespace_1_listen_port_1").await;
+            let _ = self.consumers().drop_index("namespace_1_custom_id_1").await;
+            let _ = self.upstreams().drop_index("namespace_1_name_1").await;
+
             // proxies indexes — uniqueness scoped to namespace
             self.proxies()
                 .create_index(
                     IndexModel::builder()
                         .keys(doc! { "namespace": 1, "name": 1 })
-                        .options(IndexOptions::builder().unique(true).sparse(true).build())
+                        .options(
+                            IndexOptions::builder()
+                                .unique(true)
+                                .partial_filter_expression(doc! {
+                                    "name": { "$type": "string" }
+                                })
+                                .build(),
+                        )
                         .build(),
                 )
                 .await?;
@@ -1302,7 +1368,14 @@ mod inner {
                 .create_index(
                     IndexModel::builder()
                         .keys(doc! { "namespace": 1, "listen_port": 1 })
-                        .options(IndexOptions::builder().unique(true).sparse(true).build())
+                        .options(
+                            IndexOptions::builder()
+                                .unique(true)
+                                .partial_filter_expression(doc! {
+                                    "listen_port": { "$type": "number" }
+                                })
+                                .build(),
+                        )
                         .build(),
                 )
                 .await?;
@@ -1330,7 +1403,14 @@ mod inner {
                 .create_index(
                     IndexModel::builder()
                         .keys(doc! { "namespace": 1, "custom_id": 1 })
-                        .options(IndexOptions::builder().unique(true).sparse(true).build())
+                        .options(
+                            IndexOptions::builder()
+                                .unique(true)
+                                .partial_filter_expression(doc! {
+                                    "custom_id": { "$type": "string" }
+                                })
+                                .build(),
+                        )
                         .build(),
                 )
                 .await?;
@@ -1386,7 +1466,14 @@ mod inner {
                 .create_index(
                     IndexModel::builder()
                         .keys(doc! { "namespace": 1, "name": 1 })
-                        .options(IndexOptions::builder().unique(true).sparse(true).build())
+                        .options(
+                            IndexOptions::builder()
+                                .unique(true)
+                                .partial_filter_expression(doc! {
+                                    "name": { "$type": "string" }
+                                })
+                                .build(),
+                        )
                         .build(),
                 )
                 .await?;
@@ -1789,6 +1876,131 @@ mod inner {
             assert_eq!(doc.get_str("_id").unwrap(), "unique-id-123");
             // The original id field should also be present (BSON serialization includes it)
             assert_eq!(doc.get_str("id").unwrap(), "unique-id-123");
+        }
+
+        /// Regression guard for the MongoDB unique+sparse index on
+        /// `{namespace, name}` and `{namespace, listen_port}`. MongoDB treats
+        /// explicit `null` as a valid indexed value, so two HTTP proxies in
+        /// the same namespace (both `name: None`, both `listen_port: None`)
+        /// would collide with `E11000 duplicate key error`. `proxy_to_doc`
+        /// strips these fields so the sparse index actually skips them.
+        #[test]
+        fn proxy_to_doc_strips_null_sparse_index_fields() {
+            let now = chrono::Utc::now();
+            let proxy = Proxy {
+                id: "http-proxy".to_string(),
+                namespace: crate::config::types::default_namespace(),
+                name: None,        // must NOT appear in the document
+                listen_port: None, // must NOT appear in the document
+                hosts: vec![],
+                listen_path: "/".to_string(),
+                backend_protocol: crate::config::types::BackendProtocol::Http,
+                backend_host: "localhost".to_string(),
+                backend_port: 80,
+                backend_path: None,
+                strip_listen_path: true,
+                preserve_host_header: false,
+                backend_connect_timeout_ms: 5000,
+                backend_read_timeout_ms: 30000,
+                backend_write_timeout_ms: 30000,
+                backend_tls_client_cert_path: None,
+                backend_tls_client_key_path: None,
+                backend_tls_verify_server_cert: true,
+                backend_tls_server_ca_cert_path: None,
+                resolved_tls: Default::default(),
+                dns_override: None,
+                dns_cache_ttl_seconds: None,
+                auth_mode: crate::config::types::AuthMode::Single,
+                plugins: vec![],
+                pool_idle_timeout_seconds: None,
+                pool_enable_http_keep_alive: None,
+                pool_enable_http2: None,
+                pool_tcp_keepalive_seconds: None,
+                pool_http2_keep_alive_interval_seconds: None,
+                pool_http2_keep_alive_timeout_seconds: None,
+                pool_http2_initial_stream_window_size: None,
+                pool_http2_initial_connection_window_size: None,
+                pool_http2_adaptive_window: None,
+                pool_http2_max_frame_size: None,
+                pool_http2_max_concurrent_streams: None,
+                pool_http3_connections_per_backend: None,
+                upstream_id: None,
+                circuit_breaker: None,
+                retry: None,
+                response_body_mode: crate::config::types::ResponseBodyMode::default(),
+                frontend_tls: false,
+                passthrough: false,
+                udp_idle_timeout_seconds: 60,
+                tcp_idle_timeout_seconds: Some(300),
+                allowed_methods: None,
+                allowed_ws_origins: vec![],
+                udp_max_response_amplification_factor: None,
+                created_at: now,
+                updated_at: now,
+            };
+            let doc = proxy_to_doc(&proxy).unwrap();
+            assert!(
+                doc.get("name").is_none(),
+                "`name` must be absent (not null) when Proxy.name is None: {:?}",
+                doc.get("name")
+            );
+            assert!(
+                doc.get("listen_port").is_none(),
+                "`listen_port` must be absent (not null) when Proxy.listen_port is None: {:?}",
+                doc.get("listen_port")
+            );
+            // But a present name should survive round-trip.
+            let mut with_name = proxy.clone();
+            with_name.name = Some("my-proxy".to_string());
+            let doc2 = proxy_to_doc(&with_name).unwrap();
+            assert_eq!(doc2.get_str("name").unwrap(), "my-proxy");
+        }
+
+        #[test]
+        fn consumer_to_doc_strips_null_custom_id() {
+            let now = chrono::Utc::now();
+            let consumer = Consumer {
+                id: "c-1".to_string(),
+                namespace: crate::config::types::default_namespace(),
+                username: "alice".to_string(),
+                custom_id: None, // must NOT appear in the document
+                credentials: std::collections::HashMap::new(),
+                acl_groups: vec![],
+                created_at: now,
+                updated_at: now,
+            };
+            let doc = consumer_to_doc(&consumer).unwrap();
+            assert!(
+                doc.get("custom_id").is_none(),
+                "`custom_id` must be absent when Consumer.custom_id is None"
+            );
+        }
+
+        #[test]
+        fn upstream_to_doc_strips_null_name() {
+            let now = chrono::Utc::now();
+            let upstream = Upstream {
+                id: "u-1".to_string(),
+                namespace: crate::config::types::default_namespace(),
+                name: None, // must NOT appear in the document
+                targets: vec![],
+                algorithm: crate::config::types::LoadBalancerAlgorithm::RoundRobin,
+                hash_on: None,
+                hash_on_cookie_config: None,
+                health_checks: None,
+                service_discovery: None,
+                backend_tls_client_cert_path: None,
+                backend_tls_client_key_path: None,
+                backend_tls_verify_server_cert: true,
+                backend_tls_server_ca_cert_path: None,
+                created_at: now,
+                updated_at: now,
+            };
+            let doc = upstream_to_doc(&upstream).unwrap();
+            assert!(
+                doc.get("name").is_none(),
+                "`name` must be absent when Upstream.name is None"
+            );
         }
 
         #[test]

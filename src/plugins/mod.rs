@@ -291,6 +291,26 @@ pub struct RequestContext {
     /// `"request_body"` metadata key (UTF-8 only), this preserves non-UTF-8
     /// payloads such as gRPC protobuf.
     pub request_body_bytes: Option<bytes::Bytes>,
+    /// Shared counter for request body bytes received from the client,
+    /// populated by proxy body handlers and read by the summary builders.
+    ///
+    /// Populated at four points in the request path:
+    /// 1. Buffered-collect sites (`Incoming::collect().await`): written once
+    ///    with the final `body_bytes.len()` after collection completes.
+    /// 2. Streaming forward with size limit (`SizeLimitedIncoming`): written
+    ///    once after the backend request completes, from the cloned counter
+    ///    handle obtained via `SizeLimitedIncoming::bytes_seen_handle()`.
+    /// 3. Streaming forward without size limit (`CountingIncoming` wrapping
+    ///    the `Incoming` body): same handle-capture pattern.
+    /// 4. Prebuffered bodies (populated earlier by plugins like
+    ///    `request_mirror`): copied from the buffered `Bytes::len()`.
+    ///
+    /// Summary builders read this via `load(Ordering::Acquire)` and populate
+    /// `TransactionSummary.request_bytes`. A zero value is skipped at
+    /// serialization time, so empty/GET/HEAD requests do not inflate logs.
+    ///
+    /// Clone-safe via `Arc` — all proxy paths share one counter per request.
+    pub request_bytes_observed: Arc<std::sync::atomic::AtomicU64>,
     /// Whether this request arrived via TLS 1.3 0-RTT early data.
     /// Set on HTTP/3 via quinn's `into_0rtt()` detection, and on HTTPS via the
     /// `Early-Data: 1` header (RFC 8470) from upstream proxies/CDNs.
@@ -318,6 +338,7 @@ impl RequestContext {
             plugin_http_call_ns: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             mirror_result_rx: None,
             request_body_bytes: None,
+            request_bytes_observed: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             is_early_data: false,
         }
     }
@@ -605,9 +626,18 @@ pub struct TransactionSummary {
     pub latency_total_ms: f64,
     pub latency_gateway_processing_ms: f64,
     pub latency_backend_ttfb_ms: f64,
-    /// For buffered responses: actual total backend time (body fully received).
-    /// For streaming responses: -1.0 (body still transferring at log time;
-    /// use `latency_backend_ttfb_ms` for alerting).
+    /// Total backend time from connection start to the final response frame.
+    ///
+    /// Semantics by response type:
+    /// * **Buffered responses**: exact — set synchronously when the body has
+    ///   been fully received, before the summary is logged.
+    /// * **Streaming responses**: re-derived at deferred-log fire time from
+    ///   the real body-completion timestamp. Replaces the `-1.0` sentinel
+    ///   that was written at header-flush time. If the body never completes
+    ///   (client disconnect before the first frame, drop without any poll),
+    ///   the field may remain at the original `-1.0` sentinel — prefer
+    ///   `latency_backend_ttfb_ms` for alerting on streaming outcomes when
+    ///   you need a guaranteed non-sentinel value.
     pub latency_backend_total_ms: f64,
     /// Wall-clock time spent executing all plugin hooks (on_request_received
     /// through after_proxy/on_response_body/transform_response_body/
@@ -625,10 +655,22 @@ pub struct TransactionSummary {
     pub latency_gateway_overhead_ms: f64,
     pub request_user_agent: Option<String>,
     /// True when the response body was streamed (not buffered).
-    /// When true, `latency_backend_total_ms` is -1.0 (unknown at log time).
+    /// When true, `latency_backend_total_ms` is populated at deferred-log
+    /// fire time from the real body-completion timestamp (see that field).
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub response_streamed: bool,
     /// True when the client disconnected before receiving the full response.
+    ///
+    /// Semantics by response type:
+    /// * **Streaming responses**: accurate — set by the deferred-logging path
+    ///   when the response body wrapper (`ProxyBody`) observes a disconnect
+    ///   error frame, or when the wrapper is dropped before reaching
+    ///   end-of-stream (see `deferred_log::DeferredTransactionLogger`).
+    /// * **Buffered responses**: best-effort. Hyper only signals client
+    ///   send failures at the connection-error handler, which fires after
+    ///   the handler function has already constructed and emitted the
+    ///   summary. Consumers should treat `false` on a buffered response
+    ///   as "not known to have disconnected," not as a positive assertion.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub client_disconnected: bool,
     /// Human-friendly classification of the error when the gateway itself
@@ -652,8 +694,49 @@ pub struct TransactionSummary {
     pub body_completed: bool,
     /// Total bytes of response body actually written to the client. May be
     /// less than `Content-Length` if streaming was interrupted.
+    ///
+    /// Streaming-specific. For a unified "body bytes delivered to client"
+    /// field that covers both streaming and buffered responses, prefer
+    /// `response_bytes` — this legacy field is retained so existing log
+    /// dashboards keyed on `bytes_streamed_to_client` continue to work.
     #[serde(skip_serializing_if = "is_zero_u64")]
     pub bytes_streamed_to_client: u64,
+    /// Total bytes of the request body received from the client.
+    ///
+    /// Accuracy by request type:
+    /// * **Buffered requests** (plugins required the body, or retries were
+    ///   configured): exact — populated from the collected body length after
+    ///   `Incoming::collect().await` (optionally via `SizeLimitedIncoming::bytes_seen()`
+    ///   when a size limit is in force).
+    /// * **Streaming requests** (body forwarded frame-by-frame without
+    ///   collection): exact — populated via `CountingIncoming`, which shares
+    ///   an `Arc<AtomicU64>` between the forwarded body and the summary
+    ///   builder so the final byte count is visible once hyper has consumed
+    ///   the body.
+    /// * **Empty / GET / HEAD / size-zero requests**: zero (skipped during
+    ///   serialization via `skip_serializing_if = "is_zero_u64"`).
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub request_bytes: u64,
+    /// Total bytes of the response body delivered to the client (unified
+    /// streaming + buffered counter).
+    ///
+    /// Population sites:
+    /// * **Buffered responses** (`ResponseBody::Buffered`, plugin rejects,
+    ///   gRPC trailers-only error, gRPC buffered-success, H3 buffered path,
+    ///   WS error path): populated synchronously from the final `Bytes::len()`
+    ///   before the summary is logged.
+    /// * **Streaming responses**: populated at deferred-log fire time from
+    ///   the same counter that drives `bytes_streamed_to_client` — on a
+    ///   successful streaming completion these two fields agree. On a
+    ///   client disconnect mid-stream both reflect bytes actually flushed
+    ///   before the disconnect.
+    ///
+    /// Unlike `bytes_streamed_to_client` (which is zero for buffered
+    /// responses), this field is populated uniformly across response types
+    /// and is the preferred field for log consumers that want response size
+    /// without branching on `response_streamed`.
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub response_bytes: u64,
     /// True when this summary represents a mirror (shadow) request, not the
     /// actual client-facing proxy traffic. Logged as a separate entry with the
     /// same schema so existing log queries and dashboards work without changes.
@@ -688,6 +771,11 @@ impl TransactionSummary {
         mirror.body_error_class = None;
         mirror.body_completed = false;
         mirror.bytes_streamed_to_client = 0;
+        // Mirror traffic is fire-and-forget from the client's perspective — body
+        // byte counters from the primary transaction are not meaningful on the
+        // mirror summary. Mirror response size goes into metadata instead.
+        mirror.request_bytes = 0;
+        mirror.response_bytes = 0;
         if let Some(size) = result.mirror_response_size_bytes {
             mirror
                 .metadata

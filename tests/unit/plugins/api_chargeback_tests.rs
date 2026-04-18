@@ -38,6 +38,8 @@ fn make_summary(
         body_error_class: None,
         body_completed: false,
         bytes_streamed_to_client: 0,
+        request_bytes: 0,
+        response_bytes: 0,
         mirror: false,
         metadata: HashMap::new(),
     }

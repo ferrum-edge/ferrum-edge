@@ -47,6 +47,16 @@ pub struct ProxyBody {
     /// the counter has no consumer without a logger, so the hot path skips
     /// the atomic RMW in that case. Read when firing the deferred logger
     /// (on success, streaming error, or Drop client-disconnect safety net).
+    ///
+    /// **Counting invariant**: bytes are counted ONCE per outer frame at this
+    /// `ProxyBody::poll_frame` site, never on inner adapter frames and never
+    /// on buffer drain. If a future change adds metrics to `CoalescingH2Body`,
+    /// `CoalescingH3Body`, `DirectH2Body`, or `DirectH3Body`, those inner
+    /// adapters MUST count bytes only on receipt from the backend (never on
+    /// the flush side of the coalescing buffer). Double-counting on drain
+    /// inflates `bytes_streamed_to_client` / `response_bytes` by the
+    /// coalescing overlap — matches the design rule preserved from the
+    /// original deferred-log investigation.
     bytes_streamed: AtomicU64,
     /// Whether `poll_frame` was ever called. Used by the `Drop` safety net
     /// to distinguish "hyper decided not to stream this body" (HEAD / 204 /
@@ -77,6 +87,22 @@ enum ProxyBodyKind {
 /// Lightweight metrics shared between a streaming response body and a
 /// deferred log task. Only an atomic timestamp and a completion flag —
 /// no strings, no closures, no allocations per frame.
+///
+/// # Atomic ordering discipline
+///
+/// * `last_frame_nanos` — `Release` on every store (from `TrackedBody::poll_frame`
+///   and from `record_bytes_sent`), paired with `Acquire` loads from the
+///   observer (`last_frame_elapsed_ms`). `Release`/`Acquire` establishes
+///   happens-before so any state the writer produced before the store is
+///   visible to a reader that observes the store.
+/// * `completed` — `Release` on the single store (from `mark_completed`,
+///   or `poll_frame` on `Ready(None)`), paired with `Acquire` loads from
+///   the observer (`completed()`). Same rationale as above.
+///
+/// `Relaxed` is intentionally NOT used: the observer typically reads both
+/// `last_frame_nanos` and `completed` in sequence to form a coherent
+/// "completion snapshot," and `Release`/`Acquire` ensures the reader sees
+/// both values as a consistent pair.
 pub struct StreamingMetrics {
     /// Reference `Instant` — stored once at creation. The atomic stores
     /// elapsed nanos relative to this baseline to avoid u64 overflow.
@@ -537,18 +563,86 @@ where
 pub struct SizeLimitedIncoming {
     inner: Incoming,
     max_bytes: usize,
-    bytes_seen: usize,
+    /// Running byte count, atomic so the caller can observe the final value
+    /// after `into_reqwest_body()` has moved `self` into the outbound request.
+    /// Use [`bytes_seen_handle`](Self::bytes_seen_handle) to clone the `Arc`
+    /// before the move; reading the local field afterwards is impossible
+    /// because ownership has already transferred to reqwest's request builder.
+    bytes_seen: Arc<std::sync::atomic::AtomicU64>,
     exceeded: Arc<AtomicBool>,
 }
 
 impl SizeLimitedIncoming {
+    /// Construct with a fresh byte counter. Callers that want to observe
+    /// `bytes_seen` after `into_reqwest_body()` has moved `self` should use
+    /// [`new_with_counter`](Self::new_with_counter) instead and share the
+    /// counter with the summary builder.
+    ///
+    /// Retained as public API; internal callers use `new_with_counter` so
+    /// they can plumb `ctx.request_bytes_observed` directly.
+    #[allow(dead_code)]
     pub fn new(incoming: Incoming, max_bytes: usize, exceeded: Arc<AtomicBool>) -> Self {
+        Self::new_with_counter(
+            incoming,
+            max_bytes,
+            exceeded,
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        )
+    }
+
+    /// Construct with a caller-supplied byte counter.
+    ///
+    /// Typical usage pattern (summary builder needing `request_bytes`):
+    /// ```ignore
+    /// let limited = SizeLimitedIncoming::new_with_counter(
+    ///     body,
+    ///     max_bytes,
+    ///     exceeded,
+    ///     Arc::clone(&ctx.request_bytes_observed),
+    /// );
+    /// req_builder.body(limited.into_reqwest_body());
+    /// // ... request completes; ctx.request_bytes_observed now reflects the
+    /// // total bytes polled out of the client body.
+    /// ```
+    ///
+    /// The counter uses `Release` on stores (in `poll_frame`) and pairs with
+    /// `Acquire` loads by observers. Reading before the final frame has been
+    /// polled returns an in-flight snapshot, not the total — callers that
+    /// need the total must wait for the backend request to complete (which
+    /// implies the body was fully polled).
+    pub fn new_with_counter(
+        incoming: Incoming,
+        max_bytes: usize,
+        exceeded: Arc<AtomicBool>,
+        bytes_seen: Arc<std::sync::atomic::AtomicU64>,
+    ) -> Self {
         Self {
             inner: incoming,
             max_bytes,
-            bytes_seen: 0,
+            bytes_seen,
             exceeded,
         }
+    }
+
+    /// Clone the internal byte counter so the caller can observe `bytes_seen`
+    /// after `into_reqwest_body()` has moved ownership into reqwest.
+    /// Prefer [`new_with_counter`](Self::new_with_counter) when the counter
+    /// should be shared from the start.
+    ///
+    /// Retained as public API for callers that cannot supply their own
+    /// counter up-front.
+    #[allow(dead_code)]
+    pub fn bytes_seen_handle(&self) -> Arc<std::sync::atomic::AtomicU64> {
+        Arc::clone(&self.bytes_seen)
+    }
+
+    /// Current byte count. Equivalent to
+    /// `bytes_seen_handle().load(Ordering::Acquire)` but without cloning
+    /// the `Arc`. Only useful when `self` is still accessible; after
+    /// `into_reqwest_body()` has moved `self`, use the cloned handle.
+    #[allow(dead_code)]
+    pub fn bytes_seen(&self) -> u64 {
+        self.bytes_seen.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Convert this size-limited body into a `reqwest::Body` for streaming
@@ -559,6 +653,11 @@ impl SizeLimitedIncoming {
     /// sends `Content-Length`, this enables reqwest to forward a length-delimited
     /// body instead of chunked Transfer-Encoding — avoiding per-chunk framing
     /// overhead and enabling single-buffer receive on the backend.
+    ///
+    /// **Ownership caveat**: this method consumes `self`, so any caller that
+    /// wants to read `bytes_seen` after the request completes must call
+    /// [`bytes_seen_handle`](Self::bytes_seen_handle) *before* this method
+    /// and hold onto the returned `Arc`.
     pub fn into_reqwest_body(self) -> reqwest::Body {
         reqwest::Body::wrap(SyncBody::new(self))
     }
@@ -576,11 +675,136 @@ impl http_body::Body for SizeLimitedIncoming {
         match Pin::new(&mut this.inner).poll_frame(cx) {
             Poll::Ready(Some(Ok(frame))) => {
                 if let Some(data) = frame.data_ref() {
-                    this.bytes_seen += data.len();
-                    if this.bytes_seen > this.max_bytes {
+                    // Single atomic RMW: fetch_add returns the pre-increment
+                    // value, so we can cheaply derive the post-increment total
+                    // for the threshold check without a separate load. Release
+                    // ordering so `bytes_seen_handle().load(Acquire)` from an
+                    // external observer sees every write.
+                    let data_len = data.len() as u64;
+                    let prev = this
+                        .bytes_seen
+                        .fetch_add(data_len, std::sync::atomic::Ordering::Release);
+                    let total = prev.saturating_add(data_len);
+                    if total > this.max_bytes as u64 {
                         this.exceeded.store(true, Ordering::Release);
                         return Poll::Ready(Some(Err("request body exceeds maximum size".into())));
                     }
+                }
+                Poll::Ready(Some(Ok(frame)))
+            }
+            Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(Box::new(e)))),
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+// -- CountingIncoming ---------------------------------------------------------
+
+/// A body adapter that counts bytes as they pass through, without enforcing
+/// any size limit.
+///
+/// Used on streaming request paths where no size cap applies (or where the
+/// cap is enforced elsewhere) but the summary builder still needs to observe
+/// the total request body size via `TransactionSummary.request_bytes`.
+///
+/// Share the counter via [`bytes_seen_handle`](Self::bytes_seen_handle) before
+/// moving `self` into a downstream body consumer (e.g., reqwest's request
+/// builder). Read the final count once the request has completed — reading
+/// while polling is in flight returns a partial snapshot.
+///
+/// Zero-cost when not observed: `Arc<AtomicU64>` allocation is the only
+/// overhead beyond a single `fetch_add(Relaxed)` per frame. The increments
+/// use `Release` to pair with external `Acquire` loads on the cloned handle.
+pub struct CountingIncoming {
+    inner: Incoming,
+    bytes_seen: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl CountingIncoming {
+    /// Wrap an `Incoming` body with a fresh byte counter. Callers that want
+    /// to observe `bytes_seen` after `into_reqwest_body()` has moved `self`
+    /// should use [`new_with_counter`](Self::new_with_counter) instead.
+    ///
+    /// Retained as public API; internal callers use `new_with_counter` so
+    /// they can plumb `ctx.request_bytes_observed` directly.
+    #[allow(dead_code)]
+    pub fn new(incoming: Incoming) -> Self {
+        Self::new_with_counter(incoming, Arc::new(std::sync::atomic::AtomicU64::new(0)))
+    }
+
+    /// Wrap an `Incoming` body with a caller-supplied shared byte counter.
+    /// Typical usage:
+    /// ```ignore
+    /// let counting = CountingIncoming::new_with_counter(
+    ///     incoming,
+    ///     Arc::clone(&ctx.request_bytes_observed),
+    /// );
+    /// req_builder.body(counting.into_reqwest_body());
+    /// ```
+    pub fn new_with_counter(
+        incoming: Incoming,
+        bytes_seen: Arc<std::sync::atomic::AtomicU64>,
+    ) -> Self {
+        Self {
+            inner: incoming,
+            bytes_seen,
+        }
+    }
+
+    /// Clone the internal byte counter so the caller can observe `bytes_seen`
+    /// after the body has been moved into a downstream consumer. Must be
+    /// captured before the move.
+    ///
+    /// Retained as public API for callers that cannot supply their own
+    /// counter up-front.
+    #[allow(dead_code)]
+    pub fn bytes_seen_handle(&self) -> Arc<std::sync::atomic::AtomicU64> {
+        Arc::clone(&self.bytes_seen)
+    }
+
+    /// Current byte count. See `bytes_seen_handle` caveat.
+    #[allow(dead_code)]
+    pub fn bytes_seen(&self) -> u64 {
+        self.bytes_seen.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Convert into a `reqwest::Body` for streaming to the backend.
+    ///
+    /// **Ownership caveat**: consumes `self`. Capture
+    /// [`bytes_seen_handle`](Self::bytes_seen_handle) first to read the
+    /// final byte count after the request completes.
+    pub fn into_reqwest_body(self) -> reqwest::Body {
+        reqwest::Body::wrap(SyncBody::new(self))
+    }
+}
+
+impl http_body::Body for CountingIncoming {
+    type Data = Bytes;
+    type Error = Box<dyn std::error::Error + Send + Sync>;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let this = self.get_mut();
+        match Pin::new(&mut this.inner).poll_frame(cx) {
+            Poll::Ready(Some(Ok(frame))) => {
+                if let Some(data) = frame.data_ref() {
+                    // Release ordering pairs with Acquire on
+                    // `bytes_seen_handle().load()` from the summary builder
+                    // so the final count is visible across the threads that
+                    // may poll the body vs read the handle.
+                    this.bytes_seen
+                        .fetch_add(data.len() as u64, std::sync::atomic::Ordering::Release);
                 }
                 Poll::Ready(Some(Ok(frame)))
             }
