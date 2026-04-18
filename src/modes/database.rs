@@ -112,13 +112,19 @@ pub async fn run(
                             "All database URLs failed ({}). \
                              FERRUM_DB_CONFIG_BACKUP_PATH is set — bootstrapping \
                              from backup with a lazy pool. Polling will retry \
-                             the primary URL in the background.",
-                            e
+                             primary and {} failover URL(s) in the background.",
+                            e,
+                            failover_urls.len()
                         );
                         bootstrap_from_backup = true;
+                        // Pass `failover_urls` into the offline store so the
+                        // polling loop's `try_failover_reconnect()` probes them
+                        // — a primary that stays down must not prevent
+                        // recovery when a configured failover DB is healthy.
                         DatabaseStore::connect_offline_with_tls_config(
                             db_type,
                             &effective_url,
+                            &failover_urls,
                             env_config.db_tls_enabled,
                             env_config.db_tls_ca_cert_path.as_deref(),
                             env_config.db_tls_client_cert_path.as_deref(),

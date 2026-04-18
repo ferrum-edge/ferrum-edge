@@ -393,6 +393,166 @@ async fn test_db_config_backup_bootstrap() {
 }
 
 // ============================================================================
+// Test 2b: Backup bootstrap recovers via failover URL (no primary ever up)
+// ============================================================================
+
+/// Gateway starts with an unreachable primary and configured failover URLs.
+/// The backup file bootstraps the in-memory config, then the polling loop's
+/// `try_failover_reconnect()` must probe the failover URL — a primary that
+/// stays down must never prevent recovery when a healthy failover is available.
+///
+/// Success criteria:
+/// 1. Gateway starts healthy from backup (same as `test_db_config_backup_bootstrap`).
+/// 2. Within the polling window, `db_available` flips to `true` because the
+///    failover URL connected and deferred migrations ran on it.
+/// 3. Admin writes succeed via the now-connected pool (proves migrations ran —
+///    writes would error with "no such table" if migrations were skipped).
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_db_backup_bootstrap_recovers_via_failover_url() {
+    println!("\n=== DB Backup Bootstrap: recover via failover URL ===\n");
+    ensure_built().expect("Failed to build gateway binary");
+
+    const MAX_ATTEMPTS: u32 = 3;
+    let mut last_err = String::new();
+
+    for attempt in 1..=MAX_ATTEMPTS {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let backup_path: PathBuf = temp_dir.path().join("backup.json");
+        let failover_db_path: PathBuf = temp_dir.path().join("failover.db");
+
+        let admin_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let admin_port = admin_listener.local_addr().unwrap().port();
+        drop(admin_listener);
+        let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_port = proxy_listener.local_addr().unwrap().port();
+        drop(proxy_listener);
+
+        // Minimal backup JSON — we don't need proxy routing to succeed here,
+        // only to prove the gateway started and then recovered via failover.
+        let backup_json = json!({
+            "version": "1",
+            "proxies": [],
+            "consumers": [],
+            "upstreams": [],
+            "plugin_configs": [],
+        });
+        std::fs::write(&backup_path, backup_json.to_string()).expect("write backup");
+
+        // Primary is a non-existent file (mode=ro → sqlx errors instead of
+        // auto-creating). Failover is a writable file that sqlx will create
+        // on demand when the polling loop retries — proving the recovery path
+        // runs migrations on the newly-connected failover DB.
+        let bogus_primary = "sqlite:/nonexistent/recovery-test/bogus.db?mode=ro";
+        let failover_url = format!("sqlite:{}?mode=rwc", failover_db_path.to_string_lossy());
+
+        let jwt_secret = "recovery-test-jwt-secret-ferrum-edge-12345".to_string();
+        let jwt_issuer = "ferrum-edge-recovery-test".to_string();
+
+        let child = Command::new(binary_path())
+            .env("FERRUM_MODE", "database")
+            .env("FERRUM_DB_TYPE", "sqlite")
+            .env("FERRUM_DB_URL", bogus_primary)
+            .env("FERRUM_DB_FAILOVER_URLS", &failover_url)
+            .env(
+                "FERRUM_DB_CONFIG_BACKUP_PATH",
+                backup_path.to_string_lossy().to_string(),
+            )
+            .env("FERRUM_ADMIN_JWT_SECRET", &jwt_secret)
+            .env("FERRUM_ADMIN_JWT_ISSUER", &jwt_issuer)
+            .env("FERRUM_ADMIN_HTTP_PORT", admin_port.to_string())
+            .env("FERRUM_PROXY_HTTP_PORT", proxy_port.to_string())
+            .env("FERRUM_DB_POLL_INTERVAL", "1")
+            .env("FERRUM_DB_POOL_ACQUIRE_TIMEOUT_SECONDS", "3")
+            .env("FERRUM_LOG_LEVEL", "info")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn gateway");
+
+        if !wait_for_health(admin_port).await {
+            last_err = format!("attempt {}: health check did not pass", attempt);
+            eprintln!("  {}", last_err);
+            kill_child(child);
+            if attempt < MAX_ATTEMPTS {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            continue;
+        }
+
+        println!("  Gateway healthy after backup-only bootstrap");
+
+        // Poll `/health` until `admin_writes_enabled=true`. With a 1-second
+        // poll interval and a reachable failover, recovery typically happens
+        // within 3-5 seconds. Give it up to 20 seconds to be safe on slow CI.
+        let client = reqwest::Client::new();
+        let health_url = format!("http://127.0.0.1:{}/health", admin_port);
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let mut recovered = false;
+        while std::time::Instant::now() < deadline {
+            if let Ok(resp) = client.get(&health_url).send().await
+                && let Ok(hjson) = resp.json::<serde_json::Value>().await
+                && hjson["admin_writes_enabled"].as_bool() == Some(true)
+            {
+                recovered = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+
+        if !recovered {
+            last_err = format!("attempt {}: failover reconnect never recovered", attempt);
+            eprintln!("  {}", last_err);
+            kill_child(child);
+            if attempt < MAX_ATTEMPTS {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            continue;
+        }
+        println!("  Health reports admin_writes_enabled=true (recovered via failover)");
+
+        // Sanity check that migrations ran on the failover DB: an admin write
+        // would fail with "no such table" if they had been skipped.
+        let auth = auth_header(&jwt_secret, &jwt_issuer);
+        let create = client
+            .post(format!("http://127.0.0.1:{}/proxies", admin_port))
+            .header("Authorization", &auth)
+            .json(&json!({
+                "id": "recovery-proxy",
+                "listen_path": "/recovered",
+                "backend_protocol": "http",
+                "backend_host": "127.0.0.1",
+                "backend_port": 9999,
+                "strip_listen_path": true,
+            }))
+            .send()
+            .await
+            .expect("create proxy after recovery");
+        assert!(
+            create.status().is_success(),
+            "POST /proxies should succeed after failover recovery (migrations must have run), got {}",
+            create.status()
+        );
+        println!("  Admin writes succeed against failover DB (migrations ran on reconnect)");
+
+        assert!(
+            failover_db_path.exists(),
+            "Failover SQLite file should have been created during recovery"
+        );
+
+        kill_child(child);
+        println!("\n=== DB Backup Bootstrap → Failover Recovery Test PASSED ===\n");
+        return;
+    }
+
+    panic!(
+        "Backup-bootstrap failover recovery did not complete after {} attempts: {}",
+        MAX_ATTEMPTS, last_err
+    );
+}
+
+// ============================================================================
 // Test 3: Read replica happy path
 // ============================================================================
 

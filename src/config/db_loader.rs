@@ -135,6 +135,15 @@ pub struct DatabaseStore {
     slow_query_threshold_ms: Option<u64>,
     cert_expiry_warning_days: u64,
     backend_allow_ips: crate::config::BackendAllowIps,
+    /// Set to `true` when the store was created via
+    /// [`DatabaseStore::connect_offline_with_tls_config`] — the lazy pool
+    /// never ran migrations because the DB was unreachable at startup.
+    /// Cleared once migrations succeed against a recovered DB. `reconnect()`
+    /// checks this flag and runs migrations on the first successful reconnect
+    /// so the polling loop does not loop forever on a missing schema.
+    /// Shared via `Arc<AtomicBool>` so all clones of the store observe the
+    /// same cleared-state after recovery.
+    migrations_pending: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl DatabaseStore {
@@ -308,6 +317,7 @@ impl DatabaseStore {
             slow_query_threshold_ms: None,
             cert_expiry_warning_days: crate::tls::DEFAULT_CERT_EXPIRY_WARNING_DAYS,
             backend_allow_ips: crate::config::BackendAllowIps::Both,
+            migrations_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
 
         store.run_migrations().await?;
@@ -328,10 +338,21 @@ impl DatabaseStore {
     /// connection has failed but a backup config is being loaded from disk:
     /// the gateway serves from cached config while the background polling
     /// loop retries the pool until the DB becomes reachable again.
+    ///
+    /// `failover_urls` is stored on the returned `DatabaseStore` so that the
+    /// polling loop's `try_failover_reconnect()` call can probe each URL in
+    /// order — a primary that stays down should not prevent recovery when a
+    /// configured failover DB is healthy.
+    ///
+    /// The returned store has `migrations_pending=true`. The first successful
+    /// `reconnect()` (primary or failover) will run migrations, because a DB
+    /// that comes back with a fresh or outdated schema must be brought up to
+    /// the expected version before the polling loop can read from it.
     #[allow(clippy::too_many_arguments)]
     pub fn connect_offline_with_tls_config(
         db_type: &str,
         db_url: &str,
+        failover_urls: &[String],
         tls_enabled: bool,
         tls_ca_cert_path: Option<&str>,
         tls_client_cert_path: Option<&str>,
@@ -368,11 +389,12 @@ impl DatabaseStore {
             pool: Arc::new(ArcSwap::from_pointee(pool)),
             read_replica_pool: None,
             db_type: db_type.to_string(),
-            failover_urls: Vec::new(),
+            failover_urls: failover_urls.to_vec(),
             pool_config,
             slow_query_threshold_ms: None,
             cert_expiry_warning_days: crate::tls::DEFAULT_CERT_EXPIRY_WARNING_DAYS,
             backend_allow_ips: crate::config::BackendAllowIps::Both,
+            migrations_pending: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         })
     }
 
@@ -2838,6 +2860,26 @@ impl DatabaseStore {
         tokio::spawn(async move {
             old_pool.close().await;
         });
+
+        // If this store was bootstrapped via `connect_offline_with_tls_config`
+        // (backup-file startup with an unreachable DB), migrations never ran.
+        // Now that the pool is reconnected to a live DB, run them before
+        // returning so the polling loop finds tables at the expected schema.
+        // `run_migrations()` is idempotent — completed migrations are skipped.
+        //
+        // On failure, leave `migrations_pending=true` so the next reconnect
+        // retries. Returning `Err` signals the caller (polling loop) to leave
+        // `db_available=false` until the schema is at expected version.
+        if self
+            .migrations_pending
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            info!("Running deferred migrations after backup-bootstrap recovery");
+            self.run_migrations().await?;
+            self.migrations_pending
+                .store(false, std::sync::atomic::Ordering::Release);
+            info!("Deferred migrations applied — database ready for polling");
+        }
 
         Ok(())
     }
