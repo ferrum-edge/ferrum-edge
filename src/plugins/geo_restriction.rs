@@ -22,7 +22,7 @@ use async_trait::async_trait;
 use maxminddb::{Mmap, Reader};
 use serde::Deserialize;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tracing::warn;
 
@@ -50,8 +50,12 @@ enum LookupFailureAction {
 pub struct GeoRestriction {
     reader: Option<Arc<Reader<Mmap>>>,
     db_path: String,
-    allow_countries: Vec<String>,
-    deny_countries: Vec<String>,
+    /// Allow-list of ISO 3166-1 alpha-2 country codes (uppercase). Empty disables allow-list mode.
+    /// `HashSet` for O(1) membership tests on the hot path.
+    allow_countries: HashSet<String>,
+    /// Deny-list of ISO 3166-1 alpha-2 country codes (uppercase). Empty disables deny-list mode.
+    /// `HashSet` for O(1) membership tests on the hot path.
+    deny_countries: HashSet<String>,
     inject_headers: bool,
     on_lookup_failure: LookupFailureAction,
 }
@@ -82,7 +86,7 @@ impl GeoRestriction {
             }
         };
 
-        let allow_countries: Vec<String> = config["allow_countries"]
+        let allow_countries: HashSet<String> = config["allow_countries"]
             .as_array()
             .map(|arr| {
                 arr.iter()
@@ -91,7 +95,7 @@ impl GeoRestriction {
             })
             .unwrap_or_default();
 
-        let deny_countries: Vec<String> = config["deny_countries"]
+        let deny_countries: HashSet<String> = config["deny_countries"]
             .as_array()
             .map(|arr| {
                 arr.iter()
@@ -259,6 +263,13 @@ impl Plugin for GeoRestriction {
 
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
         super::ALL_PROTOCOLS
+    }
+
+    /// Declares that `before_proxy` may insert `x-geo-country` into outbound headers.
+    /// The proxy uses this hint to take the explicit-clone code path instead of
+    /// the zero-clone optimization, ensuring deterministic header propagation.
+    fn modifies_request_headers(&self) -> bool {
+        self.inject_headers
     }
 
     async fn on_stream_connect(

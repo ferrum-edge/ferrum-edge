@@ -2,6 +2,7 @@ use chrono::Utc;
 use ferrum_edge::config::types::{
     GatewayConfig, PluginConfig, PluginScope, default_namespace, validate_mmdb_file,
 };
+use ferrum_edge::plugins::Plugin;
 use ferrum_edge::plugins::geo_restriction::GeoRestriction;
 use serde_json::json;
 
@@ -169,6 +170,32 @@ fn test_validate_plugin_file_deps_deduplicates_paths() {
         "Same path should only be validated once: {:?}",
         errors
     );
+}
+
+// --- modifies_request_headers capability ---
+
+#[test]
+fn test_modifies_request_headers_true_when_inject_enabled() {
+    // The proxy uses this hint to take the explicit-clone code path; without
+    // it `before_proxy` modifications happen on a soon-to-be-restored buffer
+    // and the resulting behavior is fragile.
+    let config = json!({
+        "db_path": "/nonexistent/path/test.mmdb",
+        "allow_countries": ["US"],
+        "inject_headers": true
+    });
+    let plugin = GeoRestriction::new(&config).unwrap();
+    assert!(plugin.modifies_request_headers());
+}
+
+#[test]
+fn test_modifies_request_headers_false_when_inject_disabled() {
+    let config = json!({
+        "db_path": "/nonexistent/path/test.mmdb",
+        "allow_countries": ["US"]
+    });
+    let plugin = GeoRestriction::new(&config).unwrap();
+    assert!(!plugin.modifies_request_headers());
 }
 
 #[test]

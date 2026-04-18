@@ -364,3 +364,153 @@ async fn test_empty_message_uses_default() {
         _ => panic!("Expected Reject"),
     }
 }
+
+// === Pre-rendered body / hot path correctness ===
+//
+// Bodies are rendered once at construction time. These tests verify that
+// repeated dispatch returns identical, well-formed payloads — i.e. nothing
+// in the hot path mutates shared state.
+
+#[tokio::test]
+async fn test_repeated_calls_return_identical_body() {
+    let plugin = RequestTermination::new(&json!({
+        "message": "Maintenance",
+        "status_code": 503
+    }))
+    .unwrap();
+
+    let mut bodies = Vec::with_capacity(3);
+    for _ in 0..3 {
+        let mut ctx = make_ctx("GET", "/");
+        match plugin.on_request_received(&mut ctx).await {
+            PluginResult::Reject { body, .. } => bodies.push(body),
+            other => panic!("Expected Reject, got {:?}", other),
+        }
+    }
+    assert_eq!(bodies[0], bodies[1]);
+    assert_eq!(bodies[1], bodies[2]);
+}
+
+#[tokio::test]
+async fn test_pre_rendered_json_body_is_parseable() {
+    let plugin = RequestTermination::new(&json!({
+        "message": "Down for maintenance",
+        "status_code": 503
+    }))
+    .unwrap();
+    let mut ctx = make_ctx("GET", "/");
+
+    match plugin.on_request_received(&mut ctx).await {
+        PluginResult::Reject { body, .. } => {
+            let parsed: serde_json::Value =
+                serde_json::from_str(&body).expect("body must be valid JSON");
+            assert_eq!(parsed["message"], "Down for maintenance");
+            assert_eq!(parsed["status_code"], 503);
+        }
+        other => panic!("Expected Reject, got {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn test_pre_rendered_xml_body_well_formed_with_special_chars() {
+    let plugin = RequestTermination::new(&json!({
+        "content_type": "text/xml",
+        "message": "<crash> & burn"
+    }))
+    .unwrap();
+    let mut ctx = make_ctx("GET", "/");
+
+    match plugin.on_request_received(&mut ctx).await {
+        PluginResult::Reject { body, .. } => {
+            // Must escape '<', '>', and '&' so the XML stays well-formed.
+            assert!(
+                body.contains("&lt;crash&gt;"),
+                "expected escaped angle brackets in {}",
+                body
+            );
+            assert!(
+                body.contains("&amp; burn"),
+                "expected escaped ampersand in {}",
+                body
+            );
+            // No raw control characters that would break parsers.
+            assert!(!body.contains('\u{0}'));
+        }
+        other => panic!("Expected Reject, got {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn test_content_type_structured_suffix_json() {
+    // RFC 6838 structured suffix: application/hal+json must render as JSON.
+    let plugin = RequestTermination::new(&json!({
+        "content_type": "application/hal+json; charset=utf-8",
+        "message": "hi"
+    }))
+    .unwrap();
+    let mut ctx = make_ctx("GET", "/");
+    match plugin.on_request_received(&mut ctx).await {
+        PluginResult::Reject { body, .. } => {
+            let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(parsed["message"], "hi");
+        }
+        other => panic!("Expected Reject, got {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn test_content_type_bogus_substring_not_json() {
+    // `application/notjson` must NOT be treated as JSON — falls through to
+    // plain text so a JSON-structured body isn't sent with a non-JSON type.
+    let plugin = RequestTermination::new(&json!({
+        "content_type": "application/notjson",
+        "message": "hi"
+    }))
+    .unwrap();
+    let mut ctx = make_ctx("GET", "/");
+    match plugin.on_request_received(&mut ctx).await {
+        PluginResult::Reject { body, .. } => {
+            assert_eq!(body, "hi");
+        }
+        other => panic!("Expected Reject, got {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn test_json_body_escapes_control_chars_and_unicode() {
+    // serde_json::to_string handles newlines, tabs, quotes, backslashes, and
+    // non-ASCII correctly so operator-supplied messages never produce invalid
+    // JSON.
+    let plugin = RequestTermination::new(&json!({
+        "message": "line1\nline2\t\"quoted\"\\back — ünîcödé"
+    }))
+    .unwrap();
+    let mut ctx = make_ctx("GET", "/");
+
+    match plugin.on_request_received(&mut ctx).await {
+        PluginResult::Reject { body, .. } => {
+            let parsed: serde_json::Value =
+                serde_json::from_str(&body).expect("body must be valid JSON");
+            assert_eq!(
+                parsed["message"],
+                "line1\nline2\t\"quoted\"\\back — ünîcödé"
+            );
+        }
+        other => panic!("Expected Reject, got {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn test_explicit_body_takes_precedence_over_message() {
+    let plugin = RequestTermination::new(&json!({
+        "body": "literal payload",
+        "message": "ignored"
+    }))
+    .unwrap();
+    let mut ctx = make_ctx("GET", "/");
+
+    match plugin.on_request_received(&mut ctx).await {
+        PluginResult::Reject { body, .. } => assert_eq!(body, "literal payload"),
+        other => panic!("Expected Reject, got {:?}", other),
+    }
+}

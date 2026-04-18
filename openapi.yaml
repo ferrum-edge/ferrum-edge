@@ -3536,16 +3536,16 @@ components:
 
     CorrelationIdConfig:
       type: object
-      description: "Plugin: correlation_id — Generates and propagates correlation IDs."
+      description: "Plugin: correlation_id — Generates and propagates correlation IDs (UUIDv4). Accepts the client-provided value when present and ≤256 bytes, otherwise generates a fresh one."
       properties:
         header_name:
           type: string
           default: x-request-id
-          description: Header name for correlation ID (lowercased internally)
+          description: Header name for the correlation ID. Normalized to lowercase at load.
         echo_downstream:
           type: boolean
           default: true
-          description: Include correlation ID in response headers
+          description: Include the correlation ID in response headers sent to the client.
 
     PrometheusMetricsConfig:
       type: object
@@ -3965,34 +3965,53 @@ components:
       type: object
       description: >-
         Plugin: access_control — consumer-based and group-based allow/deny for
-        HTTP-family and TCP stream proxies. Evaluation order: deny (consumer
-        username → group) then allow (consumer username → group). At least one
-        rule must be configured. Use ip_restriction for IP/CIDR rules.
+        HTTP-family and TCP/UDP stream proxies. Evaluation order: deny
+        (consumer username → group) then allow (consumer username → group).
+        Deny always overrides allow. At least one of `allowed_consumers`,
+        `disallowed_consumers`, `allowed_groups`, `disallowed_groups`, or
+        `allow_authenticated_identity=true` must be configured. Use
+        ip_restriction for IP/CIDR rules.
       properties:
         allowed_consumers:
           type: array
           items:
             type: string
-          description: Usernames allowed access (empty = no username-level allow rule)
+          default: []
+          description: >-
+            Consumer usernames that are explicitly allowed. Empty list disables
+            the username allow check (other allow rules still apply).
         disallowed_consumers:
           type: array
           items:
             type: string
-          description: Usernames explicitly denied
+          default: []
+          description: >-
+            Consumer usernames that are explicitly denied. Takes precedence
+            over every allow rule.
         allowed_groups:
           type: array
           items:
             type: string
-          description: ACL group names allowed access — matches against consumer acl_groups
+          default: []
+          description: >-
+            ACL group names that are explicitly allowed. The check matches if
+            any of the consumer's `acl_groups` appears in this list.
         disallowed_groups:
           type: array
           items:
             type: string
-          description: ACL group names explicitly denied — matches against consumer acl_groups
+          default: []
+          description: >-
+            ACL group names that are explicitly denied. If any of the consumer's
+            `acl_groups` appears in this list the request is rejected, even when
+            the username is in `allowed_consumers`.
         allow_authenticated_identity:
           type: boolean
           default: false
-          description: Allow requests with an external authenticated identity even when no Consumer was mapped
+          description: >-
+            Allow requests whose `ctx.authenticated_identity` is set by an
+            external auth plugin (e.g. jwks_auth) even when no gateway Consumer
+            was mapped.
 
     TcpConnectionThrottleConfig:
       type: object
@@ -4008,54 +4027,99 @@ components:
           type: integer
           format: uint64
           default: 60
-          description: "Background sweep interval in seconds for removing stale zero-count entries. Catches edge cases where connections are dropped without on_stream_disconnect. Set to 0 to disable the sweep (entries are still removed inline by the disconnect path)."
+          minimum: 0
+          description: Interval in seconds between background sweeps that remove zero-count entries from the per-key connection counter map. `0` disables the sweep (entries remain in memory until process restart).
 
     IpRestrictionConfig:
       type: object
-      description: "Plugin: ip_restriction — IP/CIDR access control. At least one of allow or deny must be set."
+      description: >-
+        Plugin: ip_restriction — IP/CIDR allow/deny enforcement. Rules are
+        validated and pre-parsed at config load time; invalid IPv4/IPv6
+        addresses or CIDR prefixes reject plugin creation. Supports IPv4 exact
+        and CIDR (`/0`-`/32`) and IPv6 exact and CIDR (`/0`-`/128`); IPv6 zone
+        identifiers (e.g. `%eth0`) on rules or client IPs are stripped before
+        matching. Runs on every protocol — HTTP, gRPC, WebSocket, TCP, UDP.
+        At least one of `allow` or `deny` is required.
       properties:
         allow:
           type: array
           items:
             type: string
-          description: Allowed IP addresses or CIDR ranges
+          default: []
+          description: >-
+            Allowed IP addresses or CIDR ranges (IPv4 or IPv6). Empty list
+            disables allow-list enforcement.
         deny:
           type: array
           items:
             type: string
-          description: Denied IP addresses or CIDR ranges
+          default: []
+          description: >-
+            Denied IP addresses or CIDR ranges (IPv4 or IPv6). Always takes
+            precedence over an `allow` match.
         mode:
           type: string
           enum: [allow_first, deny_first]
           default: allow_first
           description: >-
-            Evaluation order. allow_first checks allow rules before deny rules;
-            deny_first checks deny rules before allow rules.
+            Order of list evaluation for non-overlapping rules. `allow_first`
+            (default) reject when an allow list is configured but the IP is not
+            in it, otherwise check deny. `deny_first` rejects on any deny match
+            first, then enforces the allow list. When the same IP matches both
+            lists, deny always wins regardless of mode.
 
     BotDetectionConfig:
       type: object
-      description: "Plugin: bot_detection — User-Agent pattern blocking."
+      description: >-
+        Plugin: bot_detection — case-insensitive User-Agent substring matching.
+        The allow list is consulted before blocked patterns, so a User-Agent
+        that contains a blocked substring can still pass if it also contains an
+        allow-list entry (useful for permitting GoogleBot while blocking
+        generic `bot` patterns). HTTP-family only.
       properties:
         blocked_patterns:
           type: array
           items:
             type: string
-          description: User-Agent substrings to block
+          default:
+            - curl
+            - wget
+            - python-requests
+            - python-urllib
+            - scrapy
+            - httpclient
+            - java/
+            - libwww-perl
+            - mechanize
+            - php/
+          description: >-
+            User-Agent substrings to reject. Matching is case-insensitive.
+            Specifying this field replaces the defaults entirely — set to
+            `[]` to disable blocking and rely solely on `allow_missing_user_agent`.
         allow_list:
           type: array
           items:
             type: string
           default: []
-          description: User-Agent substrings to always allow
+          description: >-
+            User-Agent substrings that always pass, evaluated before
+            `blocked_patterns`. Matching is case-insensitive.
         allow_missing_user_agent:
           type: boolean
           default: true
-          description: Allow requests with no User-Agent header
+          description: >-
+            When true (default), requests with no User-Agent header pass — this
+            keeps health-check and load-balancer probes working. Set to false
+            to reject them with `custom_response_code`.
         custom_response_code:
           type: integer
           format: uint16
+          minimum: 100
+          maximum: 599
           default: 403
-          description: HTTP status code for blocked requests
+          description: >-
+            HTTP status code returned for rejected requests. Values outside
+            100–599 (or non-numeric values) are silently coerced to 403.
 
     RequestTransformerConfig:
       type: object
@@ -4227,25 +4291,7 @@ components:
 
     RateLimitingConfig:
       type: object
-      description: |
-        Plugin: rate_limiting — Per-IP or per-consumer request rate limiting.
-        On stream proxies, consumer mode uses the identified stream Consumer
-        when available and otherwise falls back to client IP. Supports
-        centralized Redis-backed mode for coordinating rate limits across
-        multiple gateway instances.
-
-        Configure rate windows in one of two ways:
-        1. `window_seconds` + `max_requests` — exact custom window (any duration)
-        2. One or more of `requests_per_second`, `requests_per_minute`, `requests_per_hour`
-
-        At least one rate window must be configured (the plugin rejects an
-        empty config). When multiple windows are configured (e.g., per-second
-        AND per-minute), each request must satisfy ALL windows.
-
-        Algorithm selection is automatic: windows ≤ 5 seconds use a token
-        bucket (O(1) memory), windows > 5 seconds use a sliding window with
-        exact request-timestamp tracking (O(n) memory per key, where n =
-        requests in window).
+      description: "Plugin: rate_limiting — Per-IP or per-consumer request rate limiting. On stream proxies, consumer mode uses the identified stream Consumer when available and otherwise falls back to client IP. Supports centralized Redis-backed mode for coordinating rate limits across multiple gateway instances. At least one of the preset fields (`requests_per_second`/`requests_per_minute`/`requests_per_hour`) or the custom-window pair (`window_seconds` + `max_requests`) must be configured."
       properties:
         limit_by:
           type: string
@@ -4256,37 +4302,31 @@ components:
           type: boolean
           default: false
           description: Inject x-ratelimit-* headers on requests and responses
-        window_seconds:
-          type: integer
-          format: uint64
-          minimum: 1
-          description: >-
-            Custom window duration in seconds. When set, use max_requests to
-            define the limit for this window. Alternative to the preset
-            requests_per_second/minute/hour fields.
-        max_requests:
-          type: integer
-          format: uint64
-          minimum: 1
-          default: 10
-          description: >-
-            Maximum requests allowed within window_seconds. Only used when
-            window_seconds is set. Must be greater than zero.
         requests_per_second:
           type: integer
           format: uint64
           minimum: 1
-          description: Max requests per second (token bucket algorithm)
+          description: Max requests per second
         requests_per_minute:
           type: integer
           format: uint64
           minimum: 1
-          description: Max requests per minute (sliding window algorithm)
+          description: Max requests per minute
         requests_per_hour:
           type: integer
           format: uint64
           minimum: 1
-          description: Max requests per hour (sliding window algorithm)
+          description: Max requests per hour
+        window_seconds:
+          type: integer
+          format: uint64
+          minimum: 1
+          description: Custom rate-limit window length in seconds. Must be paired with `max_requests`. Use instead of the per-second/minute/hour presets when a non-standard window is needed.
+        max_requests:
+          type: integer
+          format: uint64
+          minimum: 1
+          description: Maximum requests permitted within `window_seconds`. Must be paired with `window_seconds`.
         sync_mode:
           type: string
           enum: [local, redis]
@@ -4338,7 +4378,10 @@ components:
           type: integer
           format: uint64
           minimum: 1
-          description: "Maximum allowed request body size in bytes. Must be greater than zero — the plugin errors at construction if absent or 0."
+          description: >-
+            Maximum allowed request body size in bytes. Required and must be
+            greater than zero — the gateway rejects plugin creation when
+            missing or 0.
 
     ResponseSizeLimitingConfig:
       type: object
@@ -4358,11 +4401,14 @@ components:
           type: integer
           format: uint64
           minimum: 1
-          description: "Maximum allowed response body size in bytes. Must be greater than zero — the plugin errors at construction if absent or 0."
+          description: >-
+            Maximum allowed response body size in bytes. Required and must be
+            greater than zero — the gateway rejects plugin creation when
+            missing or 0.
         require_buffered_check:
           type: boolean
           default: false
-          description: "Force response body buffering to verify actual size when Content-Length is absent. Adds memory overhead — only enable when needed."
+          description: Force response body buffering so this plugin can enforce the size limit on chunked/streaming responses without Content-Length.
 
     BodyValidatorConfig:
       type: object
@@ -4443,45 +4489,71 @@ components:
 
     RequestTerminationConfig:
       type: object
-      description: "Plugin: request_termination — Returns a predefined response without proxying."
+      description: >-
+        Plugin: request_termination — Returns a canned response without
+        proxying to the backend. The response body and `content-type` are
+        rendered once at construction time so the request hot path is
+        allocation-light. Useful for maintenance windows, mocking, or
+        path/header-based short-circuiting. Runs after CORS so browser
+        preflight responses are still emitted correctly. HTTP-family only.
       properties:
         status_code:
           type: integer
           format: uint16
+          minimum: 100
+          maximum: 599
           default: 503
-          description: HTTP status code to return (must be 100-599)
-        body:
-          type: string
-          description: Response body (overrides auto-generated body from message)
+          description: >-
+            HTTP status code returned. Values outside 100–599 (or non-numeric
+            values) are coerced to 503.
         content_type:
           type: string
           default: application/json
-          description: Response Content-Type header
+          description: >-
+            `Content-Type` header value. The default-body renderer uses this to
+            choose between JSON, XML, and plain-text formatting (substring
+            match for `json` / `xml`).
+        body:
+          type: string
+          default: ""
+          description: >-
+            Explicit response body. When set (non-empty) it is returned
+            verbatim and `message` is ignored.
         message:
           type: string
           default: Service unavailable
-          description: Error message used when body is empty
+          description: >-
+            Used to build the default body when `body` is empty. Rendered as a
+            JSON `message` field, an XML `<message>` element, or plain text
+            depending on `content_type`. JSON and XML escaping are applied
+            automatically.
         trigger:
           type: object
           description: >-
-            Optional trigger condition. When omitted, the plugin always terminates.
-            When set, only requests matching the trigger are terminated. Runtime
-            evaluates path_prefix first; otherwise header (with optional
-            header_value) is required — header_value alone is ignored and the
-            plugin falls back to terminating every request.
+            Optional trigger condition. Without a trigger every request on the
+            proxy is terminated (maintenance-mode default). When both
+            `path_prefix` and `header` are provided, the plugin uses
+            `path_prefix` and ignores `header` — configure only one at a time
+            for predictable behavior.
           properties:
             path_prefix:
               type: string
-              description: Terminate only requests whose path starts with this prefix
+              description: >-
+                Only terminate when the request path starts with this prefix.
+                Takes precedence over `header` if both are set.
             header:
               type: string
-              description: Terminate only when this header is present
+              description: >-
+                Only terminate when this request header is present. The
+                comparison is case-insensitive on the header name. Ignored
+                when `path_prefix` is also set.
             header_value:
               type: string
               default: ""
-              description: If set, the header must match this value exactly (empty means presence-only check). Requires `header` to be set.
-          dependentRequired:
-            header_value: [header]
+              description: >-
+                Optional exact value for `header`. Empty (default) matches
+                any value, so the trigger fires whenever the header is
+                present.
 
     ResponseMockConfig:
       type: object
@@ -5272,13 +5344,17 @@ components:
           description: Request header name containing the deduplication key
         ttl_seconds:
           type: integer
-          default: 300
           minimum: 1
-          description: Time-to-live in seconds for cached responses
+          default: 300
+          description: Time-to-live in seconds for cached completed responses. Must be greater than zero.
         inflight_ttl_seconds:
           type: integer
           minimum: 1
-          description: "How long an in-flight marker remains valid before being treated as stale and replaced by a fresh request. Must be set at or above the longest backend request that should be protected from concurrent duplicate execution — if set too low, a slow legitimate request still running past this TTL can have a duplicate retry bypass the in-flight lock and re-execute side-effecting operations. Defaults to ttl_seconds."
+          description: >-
+            Time-to-live in seconds for in-flight request entries used to
+            coalesce duplicate requests while the first is still being
+            processed. Defaults to `ttl_seconds` when omitted. Must be
+            greater than zero.
         max_entries:
           type: integer
           default: 10000
@@ -5334,33 +5410,56 @@ components:
 
     GeoRestrictionConfig:
       type: object
-      description: "Plugin: geo_restriction — IP geolocation-based access control using MaxMind GeoIP2/GeoLite2 databases."
+      description: >-
+        Plugin: geo_restriction — country-level access control backed by a
+        MaxMind GeoIP2 / GeoLite2 `.mmdb` file. The database is mmap'd at
+        construction time for zero-copy lookups; the file dependency is
+        validated per-mode (fatal in file mode, warn in db mode, skipped on
+        the data plane so a missing file degrades to `on_lookup_failure`
+        instead of rejecting the whole config). `allow_countries` and
+        `deny_countries` are mutually exclusive; at least one must be
+        non-empty. Runs on every protocol — HTTP, gRPC, WebSocket, TCP, UDP.
       required: [db_path]
       properties:
         db_path:
           type: string
-          description: Path to MaxMind GeoIP2 or GeoLite2 .mmdb database file (required)
+          description: >-
+            Filesystem path to a MaxMind GeoIP2 or GeoLite2 `.mmdb` database.
+            Required.
         allow_countries:
           type: array
           items:
             type: string
           default: []
-          description: "ISO 3166-1 alpha-2 country codes to allow (e.g., [\"US\", \"CA\", \"GB\"]). If non-empty, only these countries are allowed"
+          description: >-
+            ISO 3166-1 alpha-2 country codes (case-insensitive — normalized to
+            uppercase) that are allowed. Mutually exclusive with
+            `deny_countries`. Example: `["US", "CA", "GB"]`.
         deny_countries:
           type: array
           items:
             type: string
           default: []
-          description: "ISO 3166-1 alpha-2 country codes to deny. Evaluated after allow_countries"
+          description: >-
+            ISO 3166-1 alpha-2 country codes (case-insensitive — normalized to
+            uppercase) that are denied. Mutually exclusive with
+            `allow_countries`.
         inject_headers:
           type: boolean
           default: false
-          description: "Inject X-Geo-Country and X-Geo-Country-Name headers into proxied requests"
+          description: >-
+            When true, inject the resolved country code into the proxied
+            request as the `x-geo-country` header (uppercase ISO 3166-1
+            alpha-2). HTTP-family proxies only — ignored on TCP/UDP streams.
         on_lookup_failure:
           type: string
           enum: [allow, deny]
           default: allow
-          description: Action when the IP cannot be resolved to a country
+          description: >-
+            Action when the client IP cannot be resolved to a country. Applies
+            to both genuine MaxMind misses (private IPs, unallocated ranges)
+            and to the data plane fallback path when the `.mmdb` file is
+            missing on disk.
 
     RateSpec:
       type: object

@@ -1525,16 +1525,17 @@ This enables full authentication + authorization pipelines for both TCP+TLS and
 UDP+DTLS streams via certificate-based consumer mapping.
 
 **Priority:** 2000
+**Supported protocols:** HTTP, gRPC, WebSocket, TCP, UDP
 
-| Parameter | Type | Description |
-|---|---|---|
-| `allowed_consumers` | String[] | Usernames allowed access (empty = no username-level allow rule) |
-| `disallowed_consumers` | String[] | Usernames explicitly denied |
-| `allowed_groups` | String[] | ACL group names allowed access — matches against the consumer's `acl_groups` list (empty = no group-level allow rule) |
-| `disallowed_groups` | String[] | ACL group names explicitly denied — matches against the consumer's `acl_groups` list |
-| `allow_authenticated_identity` | bool | Allows requests with `ctx.authenticated_identity` set even when no Consumer was mapped |
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `allowed_consumers` | String[] | `[]` | Consumer usernames explicitly allowed. Empty disables the username allow check. |
+| `disallowed_consumers` | String[] | `[]` | Consumer usernames explicitly denied. Takes precedence over every allow rule. |
+| `allowed_groups` | String[] | `[]` | ACL group names explicitly allowed. Matches if any of the consumer's `acl_groups` appears in this list. |
+| `disallowed_groups` | String[] | `[]` | ACL group names explicitly denied. Rejects even when the username is in `allowed_consumers`. |
+| `allow_authenticated_identity` | bool | `false` | Allows requests with `ctx.authenticated_identity` set even when no Consumer was mapped. |
 
-At least one of the above must be configured (non-empty list or `allow_authenticated_identity: true`).
+At least one of the above must be configured (non-empty list or `allow_authenticated_identity: true`). All checks use `HashSet<String>` for O(1) membership.
 
 **Evaluation order:** deny (consumer username → group) → allow (consumer username → group).
 If both `allowed_consumers` and `allowed_groups` are set, matching _either_ grants access.
@@ -1542,6 +1543,25 @@ Deny always takes precedence — a consumer whose username is in `allowed_consum
 rejected if any of their groups appear in `disallowed_groups`.
 
 Use [`ip_restriction`](#ip_restriction) for IP address or CIDR-based enforcement.
+
+```yaml
+# Consumer-only allow list
+plugin_name: access_control
+config:
+  allowed_consumers: [alice, bob]
+
+# Group-based allow with an explicit deny-list override
+plugin_name: access_control
+config:
+  allowed_groups: [engineering, sre]
+  disallowed_groups: [contractors]
+  disallowed_consumers: [legacy-bot]
+
+# Allow externally-authenticated identities (no gateway Consumer required)
+plugin_name: access_control
+config:
+  allow_authenticated_identity: true
+```
 
 ### `tcp_connection_throttle`
 
@@ -1565,17 +1585,23 @@ This makes plaintext TCP listeners IP-scoped, while TCP+TLS and UDP+DTLS listene
 
 ### `ip_restriction`
 
-Restricts access based on client IP address or CIDR range.
+Restricts access based on client IP address or CIDR range. Runs on every protocol — HTTP, gRPC, WebSocket, TCP, UDP — via both `on_request_received` (HTTP-family) and `on_stream_connect` (TCP/UDP).
 
 **Priority:** 150
 
-| Parameter | Type | Description |
-|---|---|---|
-| `allow` | String[] | Allowed IP addresses or CIDR ranges |
-| `deny` | String[] | Denied IP addresses or CIDR ranges |
-| `mode` | String | `allow_first` (default) or `deny_first` |
+**Supported protocols:** All (HTTP, gRPC, WebSocket, TCP, UDP)
 
-Rules are validated at config load time. Invalid IP/CIDR entries reject plugin creation instead of being silently ignored. When both `allow` and `deny` are configured, `deny` always overrides a matching `allow`; `mode` only controls which list is checked first for non-overlapping entries.
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `allow` | String[] | `[]` | Allowed IP addresses or CIDR ranges (IPv4 or IPv6). Empty disables allow-list enforcement. |
+| `deny` | String[] | `[]` | Denied IP addresses or CIDR ranges (IPv4 or IPv6). Empty disables deny-list enforcement. |
+| `mode` | String | `allow_first` | `allow_first` or `deny_first` — controls list evaluation order for non-overlapping rules. Deny always wins on overlap. |
+
+At least one of `allow` or `deny` must be configured. Empty config or both lists empty rejects plugin creation.
+
+Rules are validated and pre-parsed at config load time into integer bitmasks; invalid IP/CIDR entries reject plugin creation instead of being silently ignored. The hot path is pure integer comparison — no per-request string parsing. Supports IPv4 (`/0`–`/32`) and IPv6 (`/0`–`/128`); IPv6 zone identifiers (e.g. `%eth0`) on rules or client IPs are stripped before matching so a malformed `X-Forwarded-For` entry never silently bypasses a deny rule.
+
+When both `allow` and `deny` are configured, `deny` always overrides a matching `allow`; `mode` only controls which list is checked first for non-overlapping entries.
 
 ### `geo_restriction`
 
@@ -1588,12 +1614,14 @@ Restricts access based on the geographic location of the client IP address using
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `db_path` | String | (required) | Path to MaxMind `.mmdb` file |
-| `allow_countries` | String[] | `[]` | ISO 3166-1 alpha-2 country codes to allow (whitelist mode) |
-| `deny_countries` | String[] | `[]` | ISO 3166-1 alpha-2 country codes to deny (blacklist mode) |
-| `inject_headers` | bool | `false` | Inject `X-Geo-Country` header into upstream requests |
-| `on_lookup_failure` | String | `"allow"` | Action when GeoIP lookup fails: `allow` or `deny` |
+| `allow_countries` | String[] | `[]` | ISO 3166-1 alpha-2 country codes to allow (whitelist mode). Case-insensitive — normalized to uppercase at load. |
+| `deny_countries` | String[] | `[]` | ISO 3166-1 alpha-2 country codes to deny (blacklist mode). Case-insensitive — normalized to uppercase at load. |
+| `inject_headers` | bool | `false` | Inject `x-geo-country` (uppercase ISO code) into the proxied request. HTTP-family proxies only — ignored for TCP/UDP streams. |
+| `on_lookup_failure` | String | `"allow"` | Action when GeoIP lookup fails (private IP, unallocated range, missing `.mmdb` on data plane): `allow` or `deny`. |
 
 `allow_countries` and `deny_countries` are mutually exclusive. At least one must be non-empty.
+
+Country code matches are O(1) — both lists are stored as `HashSet<String>` and compared in uppercase.
 
 The `.mmdb` file is memory-mapped at plugin startup for zero-copy lookups on the hot path. A gateway restart (or config reload) is required to pick up a new database file.
 
@@ -1749,32 +1777,63 @@ See [cors_plugin.md](cors_plugin.md) for detailed configuration and troubleshoot
 
 ### `bot_detection`
 
-Detects and blocks bot traffic based on User-Agent patterns.
+Detects and blocks bot traffic based on case-insensitive User-Agent substring matching. The allow list is consulted before blocked patterns, so a User-Agent containing a blocked substring can still pass when it also matches an allow-list entry.
 
 **Priority:** 200
+**Supported protocols:** HTTP, gRPC, WebSocket
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `blocked_patterns` | String[] | `["curl","wget","python-requests",...]` | User-Agent substrings to block |
-| `allow_list` | String[] | `[]` | User-Agent substrings to always allow |
-| `allow_missing_user_agent` | bool | `true` | Allow requests with no User-Agent header |
-| `custom_response_code` | u16 | `403` | HTTP status code for blocked requests |
+| `blocked_patterns` | String[] | `["curl","wget","python-requests","python-urllib","scrapy","httpclient","java/","libwww-perl","mechanize","php/"]` | User-Agent substrings to reject. Case-insensitive. Setting this field replaces the defaults — pass `[]` to disable substring blocking. |
+| `allow_list` | String[] | `[]` | User-Agent substrings that always pass. Evaluated before `blocked_patterns`. Case-insensitive. |
+| `allow_missing_user_agent` | bool | `true` | Allow requests with no `User-Agent` header. Default keeps health checks and load-balancer probes working. |
+| `custom_response_code` | u16 | `403` | HTTP status code for blocked requests. Values outside 100–599 (or non-numeric) are coerced to 403. |
+
+```yaml
+plugin_name: bot_detection
+config:
+  blocked_patterns: [curl, wget, "python-requests"]
+  allow_list: [googlebot, bingbot, ferrum-internal-monitor]
+  custom_response_code: 429
+```
 
 ### `request_termination`
 
 Returns a predefined response without proxying to the backend. Useful for maintenance mode, mocking, or header/path-based short-circuiting. It runs immediately after CORS so browser preflight requests still receive valid CORS responses, and opted-in header plugins such as CORS can still decorate the rejected response.
 
+The response body and `Content-Type` are rendered **once** at construction time — the request hot path skips `format!()`, JSON/XML escaping, and `String::replace()` chains entirely. Repeated dispatch returns identical, immutable bytes.
+
 **Priority:** 125
+**Supported protocols:** HTTP, gRPC, WebSocket
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `status_code` | u16 | `503` | HTTP status code to return |
-| `body` | String | `""` | Explicit response body. When set, `message` is ignored |
-| `content_type` | String | `application/json` | Response `Content-Type` header |
-| `message` | String | `"Service unavailable"` | Message used to build the default JSON/XML/plain-text body |
-| `trigger.path_prefix` | String | _(none)_ | Only terminate when the request path starts with this prefix |
-| `trigger.header` | String | _(none)_ | Only terminate when this request header is present |
-| `trigger.header_value` | String | `""` | Optional exact value for `trigger.header`; empty means any value |
+| `status_code` | u16 | `503` | HTTP status code to return. Values outside 100–599 are coerced to 503. |
+| `body` | String | `""` | Explicit response body. When set (non-empty) it is returned verbatim and `message` is ignored. |
+| `content_type` | String | `application/json` | Response `Content-Type` header. Substring match for `json` / `xml` decides how `message` is rendered. |
+| `message` | String | `"Service unavailable"` | Builds the default JSON / XML / plain-text body when `body` is empty. JSON and XML special characters are escaped automatically. |
+| `trigger.path_prefix` | String | _(none)_ | Only terminate when the request path starts with this prefix. Mutually exclusive with `trigger.header`. |
+| `trigger.header` | String | _(none)_ | Only terminate when this request header is present. Header name is matched case-insensitively. Mutually exclusive with `trigger.path_prefix`. |
+| `trigger.header_value` | String | `""` | Optional exact value for `trigger.header`. Empty matches any value. |
+
+Without a trigger every request on the proxy is terminated (maintenance-mode default).
+
+```yaml
+# Maintenance window: short-circuit every request with a JSON body
+plugin_name: request_termination
+config:
+  status_code: 503
+  message: Scheduled maintenance — back at 02:00 UTC
+
+# Block /admin during business hours but pass other paths through
+plugin_name: request_termination
+config:
+  status_code: 403
+  content_type: text/plain
+  message: Forbidden
+  trigger:
+    path_prefix: /admin
+```
 
 ---
 
