@@ -167,6 +167,42 @@ pub async fn run(
     // Convert to Arc for sharing across tasks
     let db: Arc<dyn DatabaseBackend> = Arc::from(db);
 
+    // If we used the offline-bootstrap path above, try to apply the deferred
+    // migrations immediately. The DB may have been unreachable only during
+    // the eager connect and become reachable by the time we query here; in
+    // that case we must run the migrations now so `load_full_config` below
+    // sees the expected schema AND the admin API can enable writes right
+    // away. Leaving `bootstrap_from_backup=true` until the first polling
+    // cycle would force `db_available=false` for up to one poll interval
+    // even though the database has already recovered — causing false 503s.
+    //
+    // For non-offline stores this is a no-op (CAS fails, returns Ok(false)).
+    if bootstrap_from_backup {
+        match db.maybe_apply_deferred_migrations().await {
+            Ok(true) => {
+                info!(
+                    "Backup-bootstrapped store: deferred migrations applied at startup — \
+                     database became reachable during boot, admin writes enabled immediately"
+                );
+                bootstrap_from_backup = false;
+            }
+            Ok(false) => {
+                // Flag already cleared — treat as if DB is available.
+                // Shouldn't happen right after offline bootstrap, but
+                // handling it avoids a stale `bootstrap_from_backup=true`
+                // blocking admin writes unnecessarily.
+                bootstrap_from_backup = false;
+            }
+            Err(e) => {
+                warn!(
+                    "Backup bootstrap: database still unreachable at startup migration \
+                     attempt ({}); polling will retry in the background",
+                    e
+                );
+            }
+        }
+    }
+
     // Load initial config from database, falling back to backup file if configured
     let backup_path = env_config.db_config_backup_path.clone();
     let config = match db.load_full_config(&env_config.namespace).await {
@@ -779,7 +815,25 @@ pub async fn run(
                             &known_upstream_ids,
                         ).await {
                             Ok(result) => {
-                                db_available_poll.store(true, Ordering::Relaxed);
+                                // Catch the lazy-pool-connects-directly case:
+                                // if offline bootstrap left `migrations_pending`
+                                // set, the query above succeeded without
+                                // `reconnect()` ever firing. Run deferred
+                                // migrations now before flipping
+                                // `db_available` — otherwise admin writes
+                                // could hit an outdated schema.
+                                // No-op when nothing is pending.
+                                match db_poll.maybe_apply_deferred_migrations().await {
+                                    Ok(_) => db_available_poll.store(true, Ordering::Relaxed),
+                                    Err(e) => {
+                                        warn!(
+                                            "Deferred migrations failed despite successful incremental poll: {}. \
+                                             Admin writes remain blocked until schema is applied.",
+                                            e
+                                        );
+                                        db_available_poll.store(false, Ordering::Relaxed);
+                                    }
+                                }
                                 let poll_ts = result.poll_timestamp;
                                 // Collect ID changes before moving result into apply_incremental
                                 let added_proxy_ids: Vec<String> = result.added_or_modified_proxies.iter().map(|p| p.id.clone()).collect();
@@ -871,10 +925,25 @@ pub async fn run(
                             }
                         }
                     } else {
-                        // First poll — full load to seed state
+                        // First poll — full load to seed state. This path can
+                        // fire when the startup `load_full_config` failed (we
+                        // bootstrapped from backup) but the lazy pool is now
+                        // reaching a live DB. Run deferred migrations if any
+                        // before flipping `db_available` — see comment in the
+                        // incremental-success branch above.
                         match db_poll.load_full_config(&poll_namespace).await {
                             Ok(new_config) => {
-                                db_available_poll.store(true, Ordering::Relaxed);
+                                match db_poll.maybe_apply_deferred_migrations().await {
+                                    Ok(_) => db_available_poll.store(true, Ordering::Relaxed),
+                                    Err(e) => {
+                                        warn!(
+                                            "Deferred migrations failed despite successful full reload: {}. \
+                                             Admin writes remain blocked until schema is applied.",
+                                            e
+                                        );
+                                        db_available_poll.store(false, Ordering::Relaxed);
+                                    }
+                                }
                                 let (p, c, pc, u) = db_backend::extract_known_ids(&new_config);
                                 known_proxy_ids = p;
                                 known_consumer_ids = c;

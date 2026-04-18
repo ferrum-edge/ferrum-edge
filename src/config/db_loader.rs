@@ -481,6 +481,52 @@ impl DatabaseStore {
         Ok(())
     }
 
+    /// If `migrations_pending` is set (only true for offline-bootstrapped
+    /// stores), try to run migrations now. Returns `Ok(true)` if migrations
+    /// were actually executed, `Ok(false)` if nothing was pending.
+    ///
+    /// Uses a CAS from `true → false` so concurrent callers don't run
+    /// migrations twice: whichever caller wins the CAS is the designated
+    /// runner. On failure, the flag is restored so the next caller retries.
+    ///
+    /// This is the canonical entry point for clearing the deferred-migration
+    /// state. Call it:
+    /// - At startup right after offline bootstrap (so the startup path
+    ///   doesn't wait for the first polling tick to catch up).
+    /// - At the end of `reconnect()` (for the failover-reconnect path).
+    /// - On each successful polling-loop query (for the case where the lazy
+    ///   pool happened to connect on the first query and `reconnect()` never
+    ///   fired — otherwise the flag would stay `true` indefinitely).
+    pub async fn maybe_apply_deferred_migrations(&self) -> Result<bool, anyhow::Error> {
+        use std::sync::atomic::Ordering;
+
+        // Only one caller wins the CAS and runs migrations; the rest see
+        // `Ok(false)` and return early. Acquire on success ensures we see
+        // the constructor's write of `true`; Release on the clear ensures
+        // other CPUs observe post-migration state after we complete.
+        if self
+            .migrations_pending
+            .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Ok(false);
+        }
+
+        info!("Applying deferred migrations after backup-bootstrap recovery");
+        match self.run_migrations().await {
+            Ok(()) => {
+                info!("Deferred migrations applied — database ready for polling");
+                Ok(true)
+            }
+            Err(e) => {
+                // Restore the flag so the next caller retries. Without this,
+                // a transient migration failure would silently skip forever.
+                self.migrations_pending.store(true, Ordering::Release);
+                Err(e)
+            }
+        }
+    }
+
     /// Load the full gateway configuration from the database.
     pub async fn load_full_config(&self, namespace: &str) -> Result<GatewayConfig, anyhow::Error> {
         let start = Instant::now();
@@ -2865,21 +2911,10 @@ impl DatabaseStore {
         // (backup-file startup with an unreachable DB), migrations never ran.
         // Now that the pool is reconnected to a live DB, run them before
         // returning so the polling loop finds tables at the expected schema.
-        // `run_migrations()` is idempotent — completed migrations are skipped.
-        //
-        // On failure, leave `migrations_pending=true` so the next reconnect
-        // retries. Returning `Err` signals the caller (polling loop) to leave
-        // `db_available=false` until the schema is at expected version.
-        if self
-            .migrations_pending
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
-            info!("Running deferred migrations after backup-bootstrap recovery");
-            self.run_migrations().await?;
-            self.migrations_pending
-                .store(false, std::sync::atomic::Ordering::Release);
-            info!("Deferred migrations applied — database ready for polling");
-        }
+        // The helper uses a CAS so concurrent callers don't run migrations
+        // twice, and restores the flag on failure so a transient error
+        // doesn't silently skip migrations forever.
+        self.maybe_apply_deferred_migrations().await?;
 
         Ok(())
     }
@@ -3565,6 +3600,10 @@ impl DatabaseBackend for DatabaseStore {
 
     async fn run_migrations(&self) -> Result<(), anyhow::Error> {
         DatabaseStore::run_migrations(self).await
+    }
+
+    async fn maybe_apply_deferred_migrations(&self) -> Result<bool, anyhow::Error> {
+        DatabaseStore::maybe_apply_deferred_migrations(self).await
     }
 
     async fn list_namespaces(&self) -> Result<Vec<String>, anyhow::Error> {

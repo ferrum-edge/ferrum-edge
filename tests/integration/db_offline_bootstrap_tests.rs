@@ -182,3 +182,157 @@ async fn normal_reconnect_does_not_rerun_migrations() {
         .expect("load_full_config still works after reconnect");
     assert!(config.proxies.is_empty());
 }
+
+// ── maybe_apply_deferred_migrations ─────────────────────────────────────────
+
+/// `maybe_apply_deferred_migrations` returns `Ok(true)` the first time it
+/// runs migrations on an offline-bootstrapped store where the lazy pool
+/// points at a now-reachable DB. Subsequent calls return `Ok(false)` —
+/// migrations must not re-run once applied.
+///
+/// This is the primary entry point exercised at startup (after offline
+/// bootstrap) and from the polling loop's success path, so it must return
+/// the right signal to callers that gate `db_available` / `bootstrap_from_backup`
+/// on the outcome.
+#[tokio::test(flavor = "multi_thread")]
+async fn maybe_apply_deferred_migrations_returns_true_only_on_first_apply() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("reachable.db");
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
+
+    // Offline bootstrap against a URL that is immediately reachable — the
+    // lazy pool will connect on the first query. `migrations_pending=true`
+    // so the first `maybe_apply_deferred_migrations` should actually run.
+    let store = DatabaseStore::connect_offline_with_tls_config(
+        "sqlite",
+        &db_url,
+        &[],
+        false,
+        None,
+        None,
+        None,
+        false,
+        fast_fail_pool_config(),
+    )
+    .expect("offline store construction");
+
+    // First call: migrations run, returns Ok(true).
+    let ran = store
+        .maybe_apply_deferred_migrations()
+        .await
+        .expect("first migration attempt should succeed against reachable DB");
+    assert!(
+        ran,
+        "first call on an offline-bootstrapped store must run migrations"
+    );
+
+    // Second call: flag already cleared, returns Ok(false) without re-running.
+    let ran_again = store
+        .maybe_apply_deferred_migrations()
+        .await
+        .expect("second call must be a cheap no-op");
+    assert!(
+        !ran_again,
+        "second call must return false — migrations already applied, CAS fails"
+    );
+
+    // Third call confirms idempotence.
+    let ran_third = store
+        .maybe_apply_deferred_migrations()
+        .await
+        .expect("third call must also be a cheap no-op");
+    assert!(!ran_third);
+
+    // Schema exists now — query succeeds.
+    let config = store
+        .load_full_config("ferrum")
+        .await
+        .expect("schema should be ready after migrations applied");
+    assert!(config.proxies.is_empty());
+}
+
+/// `maybe_apply_deferred_migrations` on a store created by the normal
+/// (eager) connect returns `Ok(false)` immediately — migrations already
+/// ran during construction, nothing is pending.
+///
+/// This guards against a regression where the flag defaulted to `true`
+/// for all stores, causing normal reconnects (DNS changes) to re-run
+/// migrations needlessly.
+#[tokio::test(flavor = "multi_thread")]
+async fn maybe_apply_deferred_migrations_no_op_on_eager_connected_store() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("eager.db");
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
+
+    let store = DatabaseStore::connect_with_tls_config(
+        "sqlite",
+        &db_url,
+        false,
+        None,
+        None,
+        None,
+        false,
+        fast_fail_pool_config(),
+    )
+    .await
+    .expect("eager connect");
+
+    // Flag defaults to false on eager-connect path; helper must no-op.
+    let ran = store
+        .maybe_apply_deferred_migrations()
+        .await
+        .expect("no-op call must not error");
+    assert!(
+        !ran,
+        "eager-connected store has migrations_pending=false; helper must return false"
+    );
+}
+
+/// When an offline-bootstrapped store's lazy pool connects on the first
+/// query *without* any `reconnect()` call (the codex-flagged scenario for
+/// the polling-loop path), `maybe_apply_deferred_migrations` still runs
+/// migrations correctly — proving the polling loop's direct call covers
+/// the "lazy pool works without reconnect" case that `reconnect()` alone
+/// would have missed.
+#[tokio::test(flavor = "multi_thread")]
+async fn lazy_pool_direct_success_is_covered_by_polling_loop_path() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("direct.db");
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
+
+    let store = DatabaseStore::connect_offline_with_tls_config(
+        "sqlite",
+        &db_url,
+        &[],
+        false,
+        None,
+        None,
+        None,
+        false,
+        fast_fail_pool_config(),
+    )
+    .expect("offline store construction");
+
+    // Deliberately do NOT call `reconnect()` — simulate the case where
+    // the lazy pool happens to connect successfully on the first query
+    // because the DB was reachable the whole time.
+    //
+    // The polling loop's success path calls `maybe_apply_deferred_migrations`
+    // directly to cover this exact scenario. Without that call, the flag
+    // would remain `true` forever and a future schema change would never
+    // be applied.
+    let ran = store
+        .maybe_apply_deferred_migrations()
+        .await
+        .expect("direct migration via polling-loop path should succeed");
+    assert!(
+        ran,
+        "polling-loop path must execute migrations even when reconnect never fired"
+    );
+
+    // Query succeeds — schema is now up to date.
+    store
+        .load_full_config("ferrum")
+        .await
+        .expect("queries succeed after direct migration path ran");
+}
