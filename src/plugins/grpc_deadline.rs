@@ -58,18 +58,23 @@ impl GrpcDeadline {
         // Reject configurations where the plugin does no useful work — same policy as
         // other admission/observability plugins (see CLAUDE.md "Plugin Config Validation").
         //
-        // `subtract_gateway_processing` is a *modifier*: it only acts when there is an
-        // inbound deadline to subtract from. On its own — with no max/default deadline
-        // and no reject-on-missing rule — the plugin silently becomes a no-op whenever
-        // clients omit `grpc-timeout`. Require it to be paired with at least one
-        // actionable rule so misconfig cannot hide behind a "modifier-only" config.
-        let has_actionable_rule =
-            max_deadline_ms.is_some() || default_deadline_ms.is_some() || reject_no_deadline;
-        if !has_actionable_rule {
+        // Any of the four fields is a legitimate standalone rule:
+        //   - `max_deadline_ms`: caps incoming deadlines
+        //   - `default_deadline_ms`: injects a deadline when the client omits one
+        //   - `reject_no_deadline`: rejects requests arriving without a deadline
+        //   - `subtract_gateway_processing`: adjusts incoming deadlines by gateway
+        //     processing time (useful on its own when clients already send
+        //     `grpc-timeout`). It is a no-op when the client omits the header, but
+        //     that matches the user's intent — the rule shouldn't fire when there's
+        //     nothing to subtract from.
+        let has_any_rule = max_deadline_ms.is_some()
+            || default_deadline_ms.is_some()
+            || subtract_gateway_processing
+            || reject_no_deadline;
+        if !has_any_rule {
             return Err(
-                "grpc_deadline: no actionable rules configured — set at least one of \
-                 'max_deadline_ms', 'default_deadline_ms', or 'reject_no_deadline' \
-                 ('subtract_gateway_processing' is a modifier and cannot stand alone)"
+                "grpc_deadline: no rules configured — set at least one of 'max_deadline_ms', \
+                 'default_deadline_ms', 'subtract_gateway_processing', or 'reject_no_deadline'"
                     .to_string(),
             );
         }
