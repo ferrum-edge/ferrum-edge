@@ -288,7 +288,15 @@ fn main() {
         };
 
         if let Err(e) = result {
+            // Emit the fatal error on BOTH the tracing pipeline (for log
+            // aggregation) and raw stderr (for operators and process
+            // supervisors). The tracing writer is a non-blocking stdout
+            // appender, so (a) its buffered events can be dropped on exit
+            // and (b) operators who pipe stderr separately (and process
+            // managers that key alerts off stderr) would otherwise see no
+            // context for the non-zero exit code.
             error!("Fatal error: {}", e);
+            eprintln!("Fatal error: {}", e);
             std::process::exit(1);
         }
 
