@@ -116,6 +116,45 @@ async fn test_xml_self_closing_tag() {
     assert_continue(result);
 }
 
+// Regression: self-closing tags with whitespace before `/` (`<br />`,
+// `<input attr="v" />`, `<foo\n/>`) were previously rejected as unbalanced
+// because the `/` detection only looked at the byte immediately before `>`.
+#[tokio::test]
+async fn test_xml_self_closing_with_space_before_slash() {
+    let plugin = xml_plugin();
+    let mut ctx = make_xml_ctx("<root><br /></root>");
+    let mut headers = make_xml_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_continue(result);
+}
+
+#[tokio::test]
+async fn test_xml_self_closing_with_attr_and_whitespace() {
+    let plugin = xml_plugin();
+    let mut ctx = make_xml_ctx(r#"<root><img src="x.png" alt="" /></root>"#);
+    let mut headers = make_xml_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_continue(result);
+}
+
+#[tokio::test]
+async fn test_xml_self_closing_with_newline_before_slash() {
+    let plugin = xml_plugin();
+    let mut ctx = make_xml_ctx("<root><br\n/></root>");
+    let mut headers = make_xml_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_continue(result);
+}
+
+#[tokio::test]
+async fn test_xml_self_closing_with_tab_before_slash() {
+    let plugin = xml_plugin();
+    let mut ctx = make_xml_ctx("<root><br\t/></root>");
+    let mut headers = make_xml_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_continue(result);
+}
+
 #[tokio::test]
 async fn test_xml_unbalanced_tags_rejected() {
     let plugin = xml_plugin();
@@ -423,6 +462,29 @@ async fn test_json_schema_max_length_valid() {
 async fn test_json_schema_max_length_invalid() {
     let plugin = json_schema_plugin(serde_json::json!({"type": "string", "maxLength": 3}));
     let mut ctx = make_json_ctx(r#""hello""#);
+    let mut headers = make_json_headers();
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+}
+
+#[tokio::test]
+async fn test_json_schema_min_max_length_counts_code_points_not_bytes() {
+    // "日本語" is 3 code points but 9 UTF-8 bytes. Per JSON Schema §6.3,
+    // minLength/maxLength count characters (code points), not bytes.
+    let plugin =
+        json_schema_plugin(serde_json::json!({"type": "string", "minLength": 3, "maxLength": 3}));
+    let mut ctx = make_json_ctx(r#""日本語""#);
+    let mut headers = make_json_headers();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+
+    // 2 code points fails minLength:3
+    let plugin = json_schema_plugin(serde_json::json!({"type": "string", "minLength": 3}));
+    let mut ctx = make_json_ctx(r#""日本""#);
+    let mut headers = make_json_headers();
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+
+    // 4 code points fails maxLength:3
+    let plugin = json_schema_plugin(serde_json::json!({"type": "string", "maxLength": 3}));
+    let mut ctx = make_json_ctx(r#""日本語x""#);
     let mut headers = make_json_headers();
     assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
 }
@@ -1594,6 +1656,82 @@ async fn test_protobuf_unknown_method_uses_default_type() {
     headers.insert(":path".to_string(), "/test.Greeter/AnyMethod".to_string());
     // Default type is configured, so validation runs
     assert_continue(plugin.on_final_request_body(&headers, &frame).await);
+}
+
+// Regression: response-side per-method descriptor lookup must use the request
+// path from `ctx.path` (or `grpc_full_method` metadata) — not the response
+// headers, which never carry `:path`. Previously the lookup always failed and
+// silently fell back to the global default, causing per-method
+// `protobuf_method_messages` for response validation to be ignored entirely.
+#[tokio::test]
+async fn test_protobuf_response_per_method_descriptor_resolved_from_ctx_path() {
+    // No global `protobuf_response_type` — only per-method config. With the bug,
+    // this lookup would miss and the response would silently pass without
+    // validation. With the fix, validation runs against the per-method type and
+    // valid responses pass while invalid ones reject.
+    let plugin = protobuf_plugin_with_method_messages();
+    let payload = encode_hello_response("Hi", true);
+    let frame = grpc_frame(&payload);
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/test.Greeter/SayHello".to_string(),
+    );
+    let mut response_headers = HashMap::new();
+    response_headers.insert("content-type".to_string(), "application/grpc".to_string());
+    // Note: no `:path` in response_headers — that's the bug being guarded against.
+    assert_continue(
+        plugin
+            .on_final_response_body(&mut ctx, 200, &response_headers, &frame)
+            .await,
+    );
+}
+
+#[tokio::test]
+async fn test_protobuf_response_per_method_invalid_body_rejected() {
+    let plugin = protobuf_plugin_with_method_messages();
+    // Random bytes that don't decode as HelloResponse
+    let invalid = vec![0xFF, 0xFE, 0xFD, 0xFC, 0xFB, 0xFA];
+    let frame = grpc_frame(&invalid);
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/test.Greeter/SayHello".to_string(),
+    );
+    let mut response_headers = HashMap::new();
+    response_headers.insert("content-type".to_string(), "application/grpc".to_string());
+    assert_reject(
+        plugin
+            .on_final_response_body(&mut ctx, 200, &response_headers, &frame)
+            .await,
+        Some(502),
+    );
+}
+
+#[tokio::test]
+async fn test_protobuf_response_uses_grpc_full_method_metadata_when_present() {
+    // When `grpc_method_router` ran upstream, it stores `grpc_full_method`
+    // (without the leading slash) in metadata. The response validator must
+    // accept that form and prepend the slash to look up the descriptor.
+    let plugin = protobuf_plugin_with_method_messages();
+    let payload = encode_hello_response("Hi", true);
+    let frame = grpc_frame(&payload);
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/some/other/path".to_string(), // ctx.path is misleading
+    );
+    ctx.metadata.insert(
+        "grpc_full_method".to_string(),
+        "test.Greeter/SayHello".to_string(),
+    );
+    let mut response_headers = HashMap::new();
+    response_headers.insert("content-type".to_string(), "application/grpc".to_string());
+    assert_continue(
+        plugin
+            .on_final_response_body(&mut ctx, 200, &response_headers, &frame)
+            .await,
+    );
 }
 
 // ���── Unknown Fields ���────────────────────────────────────────────────

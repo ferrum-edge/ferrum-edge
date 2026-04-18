@@ -403,6 +403,27 @@ When `passthrough: true` is set on a stream proxy, the gateway forwards encrypte
 
 **Logging:** `StreamConnectionContext.sni_hostname` and `StreamTransactionSummary.sni_hostname` carry the extracted SNI to connection-lifecycle plugins (`on_stream_connect`, `on_stream_disconnect`). `StreamTransactionSummary.consumer_username` carries the identified consumer (gateway `Consumer` username, or external `authenticated_identity` set by a stream auth plugin) captured at connect time — populated from `StreamConnectionContext::effective_identity()` in TCP, UDP, and DTLS paths so stream access logs include the principal that the policy plugins resolved.
 
+### TCP Bidirectional-Relay Performance Modes
+
+`bidirectional_copy` in `src/proxy/tcp_proxy.rs` selects one of two code paths based on the timeout configuration. The same gating applies to the Linux `splice(2)` and `io_uring` splice paths — but for those, the "fast path" is the splice syscall itself; the userspace copy path only runs when splice is unavailable (non-Linux, TLS without kTLS, backend is TLS-terminated).
+
+| Mode | Trigger | Implementation | Benefits | Downsides |
+|------|---------|---------------|----------|-----------|
+| **Fast path** | `FERRUM_TCP_IDLE_TIMEOUT_SECONDS=0` **AND** `FERRUM_TCP_HALF_CLOSE_MAX_WAIT_SECONDS=0` (both must be zero) | Delegates to `tokio::io::copy_bidirectional_with_sizes` directly. No `tokio::io::split`. No Phase 1/Phase 2 select loop. Per-direction buffers are managed internally by tokio. | Zero BiLock overhead on reads/writes. No select-loop scheduling. Per-direction byte counts are preserved on clean completion. Best raw TCP throughput. | **No idle watchdog** — stalled sessions persist until the OS TCP keep-alive/timer fires (Linux default ~2 h via `net.ipv4.tcp_keepalive_*`). **No half-close hard cap** — one-sided-close + stalled peer holds the task open. **`disconnect_direction` is always `unknown` on error** because `copy_bidirectional_with_sizes` does not expose which half failed first. `disconnect_cause` is never `IdleTimeout`. |
+| **Direction-tracking path** (default) | Either timeout non-zero | `tokio::io::split` on both sides, two `copy_one_direction` futures, Phase 1 race for first-completion + Phase 2 drain for the remaining half. `last_activity` is refreshed on every read for idle detection. | Idle timeout enforcement. Hard cap enforcement on half-close drain. Per-direction byte counters with first-failure direction attribution (`disconnect_direction` populated in `StreamTransactionSummary` / Prometheus `stream_disconnects`). | One BiLock access per read and per write (~5 ns each). Two `Vec<u8>` buffer allocations per connection (4–64 KB each, one per direction). Phase 1/Phase 2 scheduling adds a few extra `tokio::select!` wakeups per connection. |
+
+**When to pick the fast path:**
+- External L4 load balancer (ELB, NLB, HAProxy TCP, etc.) already enforces per-connection idle timeouts.
+- Throughput-sensitive workloads where the ~5 ns per-syscall BiLock overhead matters (million-req/s TCP passthrough).
+- Dashboards and alerts do not consume `disconnect_direction`; operators rely on `error_class` + clean-close-ratio instead.
+
+**When to stay on direction-tracking (default):**
+- Self-hosted deployments without an upstream L4 LB enforcing timeouts — the idle watchdog is your only defence against session accumulation.
+- Dashboards use `disconnect_direction` to tell "client reset first" from "backend reset first" during incidents.
+- SMTP/IMAP/HTTP-over-TCP passthrough, which needs the half-close drain behaviour to complete slow backend responses after the client half-closes.
+
+**Semantic opt-in**: this is controlled via the existing timeouts rather than a dedicated perf flag because the architectural requirements are entangled — the idle watchdog needs `tokio::io::split` to refresh `last_activity` on each read, and the half-close cap needs the Phase 1/Phase 2 loop. A separate `FERRUM_TCP_DIRECTION_TRACKING=false` variable would either be redundant (equivalent to zeroing both timeouts) or silently no-op (ignored when either timeout is set).
+
 ### Stream Proxy Port Validation
 
 TCP/UDP stream proxies bind dedicated ports via `listen_port`. Port conflicts are detected at multiple levels:
@@ -467,6 +488,34 @@ The lifecycle phases are:
 **Response mock path scoping**: The `response_mock` plugin matches rule paths **relative to the proxy's `listen_path`**, not the full incoming request path. The plugin strips the proxy's prefix listen_path from `ctx.path` before matching rules. For example, proxy with `listen_path: /api/v1` + request to `/api/v1/users` → mock rule path should be `/users`. A request to exactly the listen_path matches as `/`. For root listen_path (`/`) or regex listen_paths (`~` prefix), no stripping occurs and rules match the full path. This ensures mock rules are scoped to the proxy they are configured on.
 
 Plugin priority constants are defined in `src/plugins/mod.rs` (e.g., `priority::CORS = 100`, `priority::REQUEST_TERMINATION = 125`, `priority::TCP_CONNECTION_THROTTLE = 2050`, `priority::RATE_LIMITING = 2900`, `priority::RESPONSE_SIZE_LIMITING = 3490`, `priority::COMPRESSION = 4050`). Per-instance `priority_override` (on `PluginConfig`) can override these built-in constants via the `PriorityOverridePlugin` wrapper in `plugin_cache.rs`.
+
+### Transaction Summary Fields
+
+All logging plugins receive a shared summary struct for every request/session: `TransactionSummary` for HTTP/gRPC/WebSocket and `StreamTransactionSummary` for TCP/UDP. Both live in `src/plugins/mod.rs`.
+
+**`TransactionSummary` body-streaming fields** (set on the HTTP/gRPC/WebSocket path):
+
+| Field | Type | Meaning |
+|---|---|---|
+| `body_error_class` | `Option<ErrorClass>` | Classified error observed while streaming the response body (e.g., client RST mid-body, backend RST after headers). `None` when the body completed cleanly. Distinct from `error_class`, which covers pre-body failures (connect, TLS, headers). |
+| `body_completed` | `bool` | `true` when the final body frame flushed to the client. `false` if the stream aborted before completion. Always `true` for buffered (non-streaming) responses. |
+| `bytes_streamed_to_client` | `u64` | Actual bytes written to the client socket. May be less than the backend's advertised `Content-Length` when streaming was interrupted — compare with the backend's byte count to detect truncated deliveries. |
+
+A forthcoming `DeferredTransactionLogger` will fire the `log` phase at body-completion (instead of post-header) so `body_error_class`, `body_completed`, and `bytes_streamed_to_client` reflect the full client-visible outcome. Until that lands, body-streaming fields are emitted with their default values for non-final log points.
+
+**`StreamTransactionSummary` disconnect-attribution fields** (set on TCP/UDP paths):
+
+| Field | Type | Meaning |
+|---|---|---|
+| `disconnect_direction` | `Option<Direction>` | Which half of the bidirectional stream errored first: `ClientToBackend`, `BackendToClient`, or `Unknown` (both halves failed simultaneously or the error happened outside the copy loop). |
+| `disconnect_cause` | `Option<DisconnectCause>` | Disambiguates session termination: `IdleTimeout`, `RecvError` (frontend recv failed), `BackendError` (backend recv failed), or `GracefulShutdown`. Before this field existed, log consumers had to infer idle timeouts from `error_class: None` — no longer ambiguous. |
+
+Both new enums live in `src/plugins/mod.rs` and serialize as snake_case (e.g., `"client_to_backend"`, `"idle_timeout"`). Both fields are `Option` so pre-existing logs without attribution data remain valid.
+
+**Backend error classifiers**: Two helpers complement the existing `classify_reqwest_error` / `classify_grpc_proxy_error` / `classify_boxed_error`:
+
+- `classify_http2_pool_error` (`src/proxy/http2_pool.rs`) — maps `Http2PoolError` variants to `ErrorClass` for the HTTP/2 direct pool path.
+- `classify_http3_error` (`src/http3/client.rs`) — walks the error source chain for typed `quinn::ConnectionError` / `ConnectError` / `io::Error` before falling back to string heuristics. The existing `classify_h3_error` in `src/http3/server.rs` now delegates to this shared helper.
 
 ### DNS Cache (`src/dns/mod.rs`)
 
@@ -1081,7 +1130,8 @@ Reduce per-request allocations in plugin lookup
 | `FERRUM_POOL_HTTP2_MAX_FRAME_SIZE` | `1048576` | Maximum HTTP/2 frame payload in bytes (1 MiB). Clamped to 16384..1 MiB |
 | `FERRUM_POOL_HTTP2_MAX_CONCURRENT_STREAMS` | `1000` | Max concurrent HTTP/2 streams per backend connection |
 | `FERRUM_ROUTER_CACHE_MAX_ENTRIES` | `0` (auto) | Router prefix/negative lookup cache size. 0 = auto-scale as `max(10_000, proxies × 3)`. Set explicit value to cap memory. Min: 1,000, Max: 10,000,000 |
-| `FERRUM_TCP_IDLE_TIMEOUT_SECONDS` | `300` | Default TCP idle timeout (5 min). Per-proxy `tcp_idle_timeout_seconds` overrides. 0 = disabled |
+| `FERRUM_TCP_IDLE_TIMEOUT_SECONDS` | `300` | Default TCP idle timeout (5 min). Per-proxy `tcp_idle_timeout_seconds` overrides. `0` = disabled. See **TCP bidirectional-relay performance modes** in the TCP section above |
+| `FERRUM_TCP_HALF_CLOSE_MAX_WAIT_SECONDS` | `300` | Hard cap (seconds) on Phase 2 of the TCP bidirectional relay — the half-close drain where one direction has already completed cleanly. Applies even when `FERRUM_TCP_IDLE_TIMEOUT_SECONDS=0`, so a stuck peer cannot wedge the relay forever. `0` = disabled. Combined with `FERRUM_TCP_IDLE_TIMEOUT_SECONDS=0`, selects the zero-overhead fast path (see below) |
 | `FERRUM_UDP_MAX_SESSIONS` | `10000` | Maximum concurrent UDP sessions per proxy |
 | `FERRUM_UDP_CLEANUP_INTERVAL_SECONDS` | `10` | UDP session cleanup sweep interval |
 | `FERRUM_UDP_RECVMMSG_BATCH_SIZE` | `64` | Datagrams per `recvmmsg` syscall on Linux (1-1024). Reduces syscall overhead for high-throughput UDP. Ignored on non-Linux |
@@ -1102,7 +1152,7 @@ Reduce per-request allocations in plugin lookup
 | `FERRUM_MAX_GRPC_RECV_SIZE_BYTES` | `4194304` | Max total received gRPC payload size in bytes (4 MiB). `0` = unlimited |
 | `FERRUM_MAX_WEBSOCKET_FRAME_SIZE_BYTES` | `16777216` | Max WebSocket frame size in bytes (16 MiB). Also sets max message size to 4x frame size |
 | `FERRUM_WEBSOCKET_WRITE_BUFFER_SIZE` | `131072` | WebSocket write buffer size in bytes (128 KB). Controls data buffered before flushing to transport. Increase to 4194304 for workloads with large WS frames (1 MB+). Only applies when frame-level plugins are active |
-| `FERRUM_WEBSOCKET_TUNNEL_MODE` | `false` | When true and no frame-level plugins are configured, bypass WebSocket frame parsing and use raw TCP bidirectional copy. Improves large-payload throughput significantly. Trade-off: `FERRUM_MAX_WEBSOCKET_FRAME_SIZE_BYTES` not enforced (no DoS risk — fixed-size copy buffer) |
+| `FERRUM_WEBSOCKET_TUNNEL_MODE` | `false` | When true and no frame-level plugins are configured, bypass WebSocket frame parsing and use raw TCP bidirectional copy. Improves large-payload throughput significantly. Trade-offs: (1) `FERRUM_MAX_WEBSOCKET_FRAME_SIZE_BYTES` not enforced (no DoS risk — fixed-size copy buffer); (2) **frame-loss risk for server-push protocols** — if the backend writes a WebSocket frame in the same TCP segment as the 101 Switching Protocols response, tungstenite may pull those bytes into its internal read buffer during handshake parsing and `into_inner()` drops them when we unwrap to raw TCP. Disable tunnel mode for stock-ticker / Socket.IO / any protocol where the server sends immediately after upgrade. See the `run_websocket_proxy` tunnel-mode branch in `src/proxy/mod.rs` for the full commentary |
 | `FERRUM_MAX_CREDENTIALS_PER_TYPE` | `2` | Max credential entries per type per consumer. Enables zero-downtime rotation by allowing multiple active credentials simultaneously |
 | `FERRUM_HTTP_HEADER_READ_TIMEOUT_SECONDS` | `10` | HTTP/1.1 header read timeout in seconds. Protects against slowloris attacks. `0` = disabled |
 | `FERRUM_BACKEND_ALLOW_IPS` | `both` | Backend IP allowlist policy: `private` (only RFC 1918/loopback/link-local/CGNAT), `public` (only non-private), `both` (no restriction) |

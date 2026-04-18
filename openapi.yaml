@@ -951,6 +951,9 @@ paths:
                 - ai_request_guard
                 - ai_rate_limiter
                 - ai_prompt_shield
+                - ai_response_guard
+                - ai_semantic_cache
+                - ai_federation
                 - sse
                 - request_mirror
                 - load_testing
@@ -1972,31 +1975,47 @@ components:
       description: |
         Configuration for the `ws_message_size_limiting` plugin. Enforces a
         maximum frame payload size on WebSocket connections. Frames exceeding
-        the limit trigger a close frame sent to both client and backend.
+        the limit trigger a close frame (RFC 6455 close code 1009 — Message
+        Too Big) sent to both client and backend.
+      required:
+        - max_frame_bytes
       properties:
         max_frame_bytes:
           type: integer
-          default: 0
+          format: uint64
+          minimum: 1
           description: >-
-            Maximum frame payload size in bytes. Required for the plugin to
-            take effect — a value of 0 means no limit is enforced.
+            Maximum frame payload size in bytes. Required and must be greater
+            than zero — the plugin rejects configs with `max_frame_bytes` of 0
+            at config load time. Applied to Text, Binary, Ping, and Pong frames
+            in both directions; Close frames bypass the size check. Note that
+            Ping/Pong are RFC 6455 control frames capped at 125 bytes by the
+            protocol itself, so values below 125 will close the connection on
+            heartbeat traffic.
         close_reason:
           type: string
           default: "Message too large"
-          description: Close frame reason text sent when a frame exceeds the limit.
+          description: >-
+            Close frame reason text sent when a frame exceeds the limit. Truncated
+            to 123 UTF-8 bytes (the WebSocket protocol close-frame reason limit)
+            on a UTF-8 char boundary.
 
     WsFrameLoggingConfig:
       type: object
       description: |
         Configuration for the `ws_frame_logging` plugin. Logs WebSocket frame
-        metadata (direction, opcode, payload size) for each Text, Binary, and
-        Ping frame.
+        metadata (direction, frame type, payload size, optional preview) under
+        the `ws_frame_log` tracing target. Logs Text and Binary frames by
+        default; Ping/Pong are opt-in via `log_ping_pong`. The plugin never
+        transforms or drops frames — it is purely observational.
       properties:
         log_level:
           type: string
           enum: [trace, debug, info]
           default: info
-          description: Tracing level for frame log output.
+          description: >-
+            Tracing level for frame log output. Case-sensitive; unknown values
+            (e.g., `"warn"`, `"INFO"`) are rejected at config load time.
         include_payload_preview:
           type: boolean
           default: false
@@ -2006,8 +2025,9 @@ components:
           default: 128
           maximum: 65536
           description: >-
-            Maximum number of bytes to include in the payload preview. Only
-            applies when `include_payload_preview` is true.
+            Maximum number of bytes to include in the payload preview. Clamped
+            to 65 536 to prevent excessive allocations for binary hex previews.
+            Only applies when `include_payload_preview` is true.
         log_ping_pong:
           type: boolean
           default: false
@@ -2018,22 +2038,34 @@ components:
       description: |
         Configuration for the `ws_rate_limiting` plugin. Enforces per-connection
         frame rate limiting using a token-bucket algorithm. When the bucket is
-        exhausted, the plugin sends a close frame to both client and backend.
-        Supports centralized Redis-backed mode for cross-instance frame rate coordination.
+        exhausted, the plugin sends a WebSocket close frame (RFC 6455 close code
+        1008 — Policy Violation) to both client and backend. Both directions
+        (client→backend and backend→client) consume from the same per-connection
+        bucket. Supports centralized Redis-backed mode for cross-instance
+        coordination of frame counters.
       properties:
         frames_per_second:
           type: integer
+          format: uint64
           default: 100
-          description: Token refill rate per second.
+          minimum: 1
+          description: >-
+            Token refill rate per second. Must be greater than zero — configs
+            with `frames_per_second: 0` are rejected at config load time.
         burst_size:
           type: integer
+          format: uint64
           description: >-
             Maximum burst capacity (tokens). Defaults to the value of
-            `frames_per_second` when not explicitly set.
+            `frames_per_second` when not explicitly set. A value of `0` causes
+            the bucket to start empty and reject every frame.
         close_reason:
           type: string
           default: "Frame rate exceeded"
-          description: Close frame reason text sent when the frame rate is exceeded.
+          description: >-
+            Close-frame reason text sent when the frame rate is exceeded.
+            Truncated on a UTF-8 char boundary to 123 bytes (the RFC 6455 §5.5
+            control-frame payload limit) so the frame stays well-formed.
         sync_mode:
           type: string
           enum: [local, redis]
@@ -2068,6 +2100,41 @@ components:
           type: integer
           default: 5
           description: Health check ping interval when Redis is unavailable
+
+    UdpRateLimitingConfig:
+      type: object
+      description: |
+        Configuration for the `udp_rate_limiting` plugin. Rate limits UDP
+        datagrams per resolved client IP using a fixed-window algorithm with
+        atomic counters. Excess datagrams are silently dropped (standard UDP
+        flood mitigation). Operates on both client→backend and backend→client
+        datagrams within the same window per client IP.
+      anyOf:
+        - required: [datagrams_per_second]
+        - required: [bytes_per_second]
+      properties:
+        datagrams_per_second:
+          type: integer
+          format: uint64
+          description: >-
+            Maximum datagrams per `window_seconds`. At least one of
+            `datagrams_per_second` or `bytes_per_second` is required.
+        bytes_per_second:
+          type: integer
+          format: uint64
+          description: >-
+            Maximum bytes per `window_seconds` (sum of datagram payload sizes).
+            At least one of `datagrams_per_second` or `bytes_per_second` is
+            required.
+        window_seconds:
+          type: integer
+          format: uint64
+          default: 1
+          minimum: 1
+          description: >-
+            Window length in seconds. Defaults to 1 second. The effective
+            per-window cap is `datagrams_per_second × window_seconds` (and
+            similarly for bytes).
 
     # ── Circuit Breaker ─────────────────────────────────────────────
     CircuitBreakerConfig:
@@ -3379,10 +3446,12 @@ components:
     WsLoggingConfig:
       type: object
       description: "Plugin: ws_logging — Sends transaction logs to a WebSocket endpoint in batches."
+      required:
+        - endpoint_url
       properties:
         endpoint_url:
           type: string
-          description: WebSocket URL (ws:// or wss://) to send transaction logs to
+          description: WebSocket URL (ws:// or wss://) to send transaction logs to. Must include a hostname; malformed or non-WebSocket schemes are rejected at config load time.
         reconnect_delay_ms:
           type: integer
           default: 5000
@@ -3407,6 +3476,70 @@ components:
         buffer_capacity:
           type: integer
           default: 10000
+          description: Channel capacity — new entries are dropped when full
+
+    LokiLoggingConfig:
+      type: object
+      description: "Plugin: loki_logging — Ships transaction logs to Grafana Loki via the push API in batched, label-grouped streams. Supports gzip compression, multi-tenant headers, and bearer/basic auth."
+      required:
+        - endpoint_url
+      properties:
+        endpoint_url:
+          type: string
+          description: Loki push API URL (e.g. http://loki:3100/loki/api/v1/push). Must be http:// or https://
+        authorization_header:
+          type: string
+          description: Full Authorization header value (e.g. "Bearer <token>" or "Basic <b64>")
+        custom_headers:
+          type: object
+          additionalProperties:
+            type: string
+          description: Extra HTTP headers (e.g. X-Scope-OrgID for multi-tenant Loki)
+        labels:
+          type: object
+          additionalProperties:
+            type: string
+          default:
+            service: ferrum-edge
+          description: Static labels merged into every Loki stream. Keep cardinality low — labels are indexed
+        include_proxy_id_label:
+          type: boolean
+          default: true
+          description: Add the matched proxy_id as a Loki label. Legacy alias `include_listen_path_label` is still accepted for backward compatibility; if both are set, this key wins
+        include_listen_path_label:
+          type: boolean
+          description: "Deprecated alias for include_proxy_id_label (the label name has always been proxy_id). Accepted for backward compatibility"
+          deprecated: true
+        include_status_class_label:
+          type: boolean
+          default: true
+          description: Add status_class (2xx/3xx/4xx/5xx) as a Loki label
+        gzip:
+          type: boolean
+          default: true
+          description: Gzip-compress the request body (Content-Encoding header set automatically)
+        batch_size:
+          type: integer
+          default: 100
+          minimum: 1
+          description: Number of entries to buffer before sending a batch
+        flush_interval_ms:
+          type: integer
+          default: 1000
+          minimum: 100
+          description: Max milliseconds before flushing a partial batch
+        max_retries:
+          type: integer
+          default: 3
+          description: Retry attempts on failed batch delivery. 4xx other than 408/429 aborts immediately
+        retry_delay_ms:
+          type: integer
+          default: 1000
+          description: Delay in milliseconds between retry attempts
+        buffer_capacity:
+          type: integer
+          default: 10000
+          minimum: 1
           description: Channel capacity — new entries are dropped when full
 
     StatsdLoggingConfig:
@@ -3467,20 +3600,16 @@ components:
 
     CorrelationIdConfig:
       type: object
-      description: "Plugin: correlation_id — Generates and propagates correlation IDs."
+      description: "Plugin: correlation_id — Generates a UUID v4 per request when missing, preserves client-supplied IDs (truncating values longer than 256 chars to a fresh UUID), and propagates the value to backends and response headers."
       properties:
         header_name:
           type: string
-          default: X-Correlation-ID
-          description: Header name for correlation ID
-        generator:
-          type: string
-          default: uuid
-          description: ID generation strategy
+          default: x-request-id
+          description: "Header name (lowercased internally). Used for both the inbound preserved value and the outbound/echoed value. Defaults to x-request-id; common alternatives include x-correlation-id, x-trace-id."
         echo_downstream:
           type: boolean
           default: true
-          description: Include correlation ID in response headers
+          description: When true, the resolved correlation ID is added to client response headers (and on rejected responses too)
 
     PrometheusMetricsConfig:
       type: object
@@ -3740,6 +3869,120 @@ components:
           default: 300
           description: Maximum allowed clock skew in seconds for the Date header replay protection window
 
+    SoapWsSecurityConfig:
+      type: object
+      description: "Plugin: soap_ws_security — Validates WS-Security headers in SOAP envelopes. Supports UsernameToken (PasswordText/PasswordDigest), X.509 signature verification, SAML assertion validation, timestamp freshness, and nonce replay protection. Buffers request bodies with SOAP content types (text/xml, application/soap+xml, application/xml). At least one security feature must be enabled."
+      properties:
+        reject_missing_security_header:
+          type: boolean
+          default: true
+          description: Reject SOAP requests that lack a WS-Security header
+        timestamp:
+          type: object
+          description: WS-Security Timestamp validation
+          properties:
+            require:
+              type: boolean
+              default: true
+              description: Require a wsu:Timestamp element in the Security header
+            max_age_seconds:
+              type: integer
+              format: uint64
+              default: 300
+              description: Maximum age (seconds) of the Created timestamp before rejection
+            require_expires:
+              type: boolean
+              default: false
+              description: Require an Expires element inside the Timestamp
+            clock_skew_seconds:
+              type: integer
+              format: uint64
+              default: 300
+              description: Clock skew tolerance (seconds) for timestamp validation
+        username_token:
+          type: object
+          description: WS-Security UsernameToken authentication
+          properties:
+            enabled:
+              type: boolean
+              default: false
+              description: Enable UsernameToken authentication
+            password_type:
+              type: string
+              enum: [PasswordText, PasswordDigest]
+              default: PasswordDigest
+              description: Password format. PasswordDigest hashes password with nonce+timestamp; PasswordText sends the password directly (TLS only).
+            credentials:
+              type: array
+              items:
+                type: object
+                required: [username, password]
+                properties:
+                  username:
+                    type: string
+                  password:
+                    type: string
+              description: Allowed username/password pairs for UsernameToken authentication
+        x509_signature:
+          type: object
+          description: X.509 certificate signature verification
+          properties:
+            enabled:
+              type: boolean
+              default: false
+              description: Enable X.509 signature verification
+            trusted_certs:
+              type: array
+              items:
+                type: string
+              description: PEM file paths of trusted signing certificates (matched by SHA-256 fingerprint)
+            allowed_algorithms:
+              type: array
+              items:
+                type: string
+                enum: [rsa-sha256, rsa-sha1]
+              default: [rsa-sha256]
+              description: Allowed XMLDSig signature algorithms
+            require_signed_timestamp:
+              type: boolean
+              default: true
+              description: Require the Timestamp to be included in the signature's references
+        saml:
+          type: object
+          description: SAML 2.0 assertion validation
+          properties:
+            enabled:
+              type: boolean
+              default: false
+              description: Enable SAML assertion validation
+            trusted_issuers:
+              type: array
+              items:
+                type: string
+              description: SAML Issuer values to trust
+            audience:
+              type: string
+              description: Expected SAML AudienceRestriction value (optional)
+            clock_skew_seconds:
+              type: integer
+              format: uint64
+              default: 300
+              description: Clock skew tolerance (seconds) for SAML NotBefore / NotOnOrAfter
+        nonce:
+          type: object
+          description: Nonce replay protection cache (PasswordDigest only)
+          properties:
+            cache_ttl_seconds:
+              type: integer
+              format: uint64
+              default: 300
+              description: How long to remember nonces for replay detection (seconds)
+            max_cache_size:
+              type: integer
+              format: uint64
+              default: 10000
+              description: Maximum nonce cache entries before eviction sweep
+
     CorsConfig:
       type: object
       description: "Plugin: cors — Cross-Origin Resource Sharing."
@@ -3786,34 +4029,53 @@ components:
       type: object
       description: >-
         Plugin: access_control — consumer-based and group-based allow/deny for
-        HTTP-family and TCP stream proxies. Evaluation order: deny (consumer
-        username → group) then allow (consumer username → group). At least one
-        rule must be configured. Use ip_restriction for IP/CIDR rules.
+        HTTP-family and TCP/UDP stream proxies. Evaluation order: deny
+        (consumer username → group) then allow (consumer username → group).
+        Deny always overrides allow. At least one of `allowed_consumers`,
+        `disallowed_consumers`, `allowed_groups`, `disallowed_groups`, or
+        `allow_authenticated_identity=true` must be configured. Use
+        ip_restriction for IP/CIDR rules.
       properties:
         allowed_consumers:
           type: array
           items:
             type: string
-          description: Usernames allowed access (empty = no username-level allow rule)
+          default: []
+          description: >-
+            Consumer usernames that are explicitly allowed. Empty list disables
+            the username allow check (other allow rules still apply).
         disallowed_consumers:
           type: array
           items:
             type: string
-          description: Usernames explicitly denied
+          default: []
+          description: >-
+            Consumer usernames that are explicitly denied. Takes precedence
+            over every allow rule.
         allowed_groups:
           type: array
           items:
             type: string
-          description: ACL group names allowed access — matches against consumer acl_groups
+          default: []
+          description: >-
+            ACL group names that are explicitly allowed. The check matches if
+            any of the consumer's `acl_groups` appears in this list.
         disallowed_groups:
           type: array
           items:
             type: string
-          description: ACL group names explicitly denied — matches against consumer acl_groups
+          default: []
+          description: >-
+            ACL group names that are explicitly denied. If any of the consumer's
+            `acl_groups` appears in this list the request is rejected, even when
+            the username is in `allowed_consumers`.
         allow_authenticated_identity:
           type: boolean
           default: false
-          description: Allow requests with an external authenticated identity even when no Consumer was mapped
+          description: >-
+            Allow requests whose `ctx.authenticated_identity` is set by an
+            external auth plugin (e.g. jwks_auth) even when no gateway Consumer
+            was mapped.
 
     TcpConnectionThrottleConfig:
       type: object
@@ -3825,46 +4087,103 @@ components:
           format: uint64
           minimum: 1
           description: Maximum active TCP connections allowed for one Consumer/IP key
+        cleanup_interval_seconds:
+          type: integer
+          format: uint64
+          default: 60
+          minimum: 0
+          description: Interval in seconds between background sweeps that remove zero-count entries from the per-key connection counter map. `0` disables the sweep (entries remain in memory until process restart).
 
     IpRestrictionConfig:
       type: object
-      description: "Plugin: ip_restriction — IP/CIDR access control."
+      description: >-
+        Plugin: ip_restriction — IP/CIDR allow/deny enforcement. Rules are
+        validated and pre-parsed at config load time; invalid IPv4/IPv6
+        addresses or CIDR prefixes reject plugin creation. Supports IPv4 exact
+        and CIDR (`/0`-`/32`) and IPv6 exact and CIDR (`/0`-`/128`); IPv6 zone
+        identifiers (e.g. `%eth0`) on rules or client IPs are stripped before
+        matching. Runs on every protocol — HTTP, gRPC, WebSocket, TCP, UDP.
+        At least one of `allow` or `deny` is required.
       properties:
         allow:
           type: array
           items:
             type: string
-          description: Allowed IP addresses or CIDR ranges
+          default: []
+          description: >-
+            Allowed IP addresses or CIDR ranges (IPv4 or IPv6). Empty list
+            disables allow-list enforcement.
         deny:
           type: array
           items:
             type: string
-          description: Denied IP addresses or CIDR ranges
+          default: []
+          description: >-
+            Denied IP addresses or CIDR ranges (IPv4 or IPv6). Always takes
+            precedence over an `allow` match.
+        mode:
+          type: string
+          enum: [allow_first, deny_first]
+          default: allow_first
+          description: >-
+            Order of list evaluation for non-overlapping rules. `allow_first`
+            (default) reject when an allow list is configured but the IP is not
+            in it, otherwise check deny. `deny_first` rejects on any deny match
+            first, then enforces the allow list. When the same IP matches both
+            lists, deny always wins regardless of mode.
 
     BotDetectionConfig:
       type: object
-      description: "Plugin: bot_detection — User-Agent pattern blocking."
+      description: >-
+        Plugin: bot_detection — case-insensitive User-Agent substring matching.
+        The allow list is consulted before blocked patterns, so a User-Agent
+        that contains a blocked substring can still pass if it also contains an
+        allow-list entry (useful for permitting GoogleBot while blocking
+        generic `bot` patterns). HTTP-family only.
       properties:
         blocked_patterns:
           type: array
           items:
             type: string
-          description: User-Agent substrings to block
+          default:
+            - curl
+            - wget
+            - python-requests
+            - python-urllib
+            - scrapy
+            - httpclient
+            - java/
+            - libwww-perl
+            - mechanize
+            - php/
+          description: >-
+            User-Agent substrings to reject. Matching is case-insensitive.
+            Specifying this field replaces the defaults entirely — set to
+            `[]` to disable blocking and rely solely on `allow_missing_user_agent`.
         allow_list:
           type: array
           items:
             type: string
           default: []
-          description: User-Agent substrings to always allow
+          description: >-
+            User-Agent substrings that always pass, evaluated before
+            `blocked_patterns`. Matching is case-insensitive.
         allow_missing_user_agent:
           type: boolean
           default: true
-          description: Allow requests with no User-Agent header
+          description: >-
+            When true (default), requests with no User-Agent header pass — this
+            keeps health-check and load-balancer probes working. Set to false
+            to reject them with `custom_response_code`.
         custom_response_code:
           type: integer
           format: uint16
+          minimum: 100
+          maximum: 599
           default: 403
-          description: HTTP status code for blocked requests
+          description: >-
+            HTTP status code returned for rejected requests. Values outside
+            100–599 (or non-numeric values) are silently coerced to 403.
 
     RequestTransformerConfig:
       type: object
@@ -4036,7 +4355,7 @@ components:
 
     RateLimitingConfig:
       type: object
-      description: "Plugin: rate_limiting — Per-IP or per-consumer request rate limiting. On stream proxies, consumer mode uses the identified stream Consumer when available and otherwise falls back to client IP. Supports centralized Redis-backed mode for coordinating rate limits across multiple gateway instances."
+      description: "Plugin: rate_limiting — Per-IP or per-consumer request rate limiting. On stream proxies, consumer mode uses the identified stream Consumer when available and otherwise falls back to client IP. Supports centralized Redis-backed mode for coordinating rate limits across multiple gateway instances. At least one of the preset fields (`requests_per_second`/`requests_per_minute`/`requests_per_hour`) or the custom-window pair (`window_seconds` + `max_requests`) must be configured."
       properties:
         limit_by:
           type: string
@@ -4050,15 +4369,28 @@ components:
         requests_per_second:
           type: integer
           format: uint64
+          minimum: 1
           description: Max requests per second
         requests_per_minute:
           type: integer
           format: uint64
+          minimum: 1
           description: Max requests per minute
         requests_per_hour:
           type: integer
           format: uint64
+          minimum: 1
           description: Max requests per hour
+        window_seconds:
+          type: integer
+          format: uint64
+          minimum: 1
+          description: Custom rate-limit window length in seconds. Must be paired with `max_requests`. Use instead of the per-second/minute/hour presets when a non-standard window is needed.
+        max_requests:
+          type: integer
+          format: uint64
+          minimum: 1
+          description: Maximum requests permitted within `window_seconds`. Must be paired with `window_seconds`.
         sync_mode:
           type: string
           enum: [local, redis]
@@ -4096,27 +4428,51 @@ components:
 
     RequestSizeLimitingConfig:
       type: object
-      description: "Plugin: request_size_limiting — Per-proxy request body size limits."
+      description: |
+        Plugin: request_size_limiting — Per-proxy request body size limits.
+        Rejects oversized requests with HTTP 413 in three places: an early
+        Content-Length fast path (`on_request_received`), a buffered-body
+        check when another plugin already loaded the body (`before_proxy`),
+        and a final post-transform check before forwarding to the backend
+        (`on_final_request_body`).
+      required:
+        - max_bytes
       properties:
         max_bytes:
           type: integer
           format: uint64
-          default: 0
-          description: Maximum allowed request body size in bytes (0 = disabled)
+          minimum: 1
+          description: >-
+            Maximum allowed request body size in bytes. Required and must be
+            greater than zero — the gateway rejects plugin creation when
+            missing or 0.
 
     ResponseSizeLimitingConfig:
       type: object
-      description: "Plugin: response_size_limiting — Per-proxy response body size limits."
+      description: |
+        Plugin: response_size_limiting — Per-proxy response body size limits.
+        Rejects oversized responses with HTTP 502 either via Content-Length
+        fast path (`after_proxy`) or after final buffering when
+        `require_buffered_check: true` is set (`on_final_response_body`).
+        Without `require_buffered_check`, chunked/streaming responses
+        without Content-Length cannot be enforced by this plugin — the
+        global `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES` limit applies in that
+        case via the gateway's `SizeLimitedStreamingResponse` adapter.
+      required:
+        - max_bytes
       properties:
         max_bytes:
           type: integer
           format: uint64
-          default: 0
-          description: Maximum allowed response body size in bytes (0 = disabled)
+          minimum: 1
+          description: >-
+            Maximum allowed response body size in bytes. Required and must be
+            greater than zero — the gateway rejects plugin creation when
+            missing or 0.
         require_buffered_check:
           type: boolean
           default: false
-          description: Force response body buffering to verify actual size
+          description: Force response body buffering so this plugin can enforce the size limit on chunked/streaming responses without Content-Length.
 
     BodyValidatorConfig:
       type: object
@@ -4197,21 +4553,71 @@ components:
 
     RequestTerminationConfig:
       type: object
-      description: "Plugin: request_termination — Returns a predefined response without proxying."
+      description: >-
+        Plugin: request_termination — Returns a canned response without
+        proxying to the backend. The response body and `content-type` are
+        rendered once at construction time so the request hot path is
+        allocation-light. Useful for maintenance windows, mocking, or
+        path/header-based short-circuiting. Runs after CORS so browser
+        preflight responses are still emitted correctly. HTTP-family only.
       properties:
         status_code:
           type: integer
           format: uint16
-          description: HTTP status code to return
-        body:
-          type: string
-          description: Response body
+          minimum: 100
+          maximum: 599
+          default: 503
+          description: >-
+            HTTP status code returned. Values outside 100–599 (or non-numeric
+            values) are coerced to 503.
         content_type:
           type: string
-          description: Response Content-Type header
+          default: application/json
+          description: >-
+            `Content-Type` header value. The default-body renderer uses this to
+            choose between JSON, XML, and plain-text formatting (substring
+            match for `json` / `xml`).
+        body:
+          type: string
+          default: ""
+          description: >-
+            Explicit response body. When set (non-empty) it is returned
+            verbatim and `message` is ignored.
         message:
           type: string
-          description: Error message
+          default: Service unavailable
+          description: >-
+            Used to build the default body when `body` is empty. Rendered as a
+            JSON `message` field, an XML `<message>` element, or plain text
+            depending on `content_type`. JSON and XML escaping are applied
+            automatically.
+        trigger:
+          type: object
+          description: >-
+            Optional trigger condition. Without a trigger every request on the
+            proxy is terminated (maintenance-mode default). When both
+            `path_prefix` and `header` are provided, the plugin uses
+            `path_prefix` and ignores `header` — configure only one at a time
+            for predictable behavior.
+          properties:
+            path_prefix:
+              type: string
+              description: >-
+                Only terminate when the request path starts with this prefix.
+                Takes precedence over `header` if both are set.
+            header:
+              type: string
+              description: >-
+                Only terminate when this request header is present. The
+                comparison is case-insensitive on the header name. Ignored
+                when `path_prefix` is also set.
+            header_value:
+              type: string
+              default: ""
+              description: >-
+                Optional exact value for `header`. Empty (default) matches
+                any value, so the trigger fires whenever the header is
+                present.
 
     ResponseMockConfig:
       type: object
@@ -4256,19 +4662,24 @@ components:
 
     SpecExposeConfig:
       type: object
-      description: "Plugin: spec_expose — Exposes API specification documents (OpenAPI, WSDL, WADL) on a /specz sub-path. Unauthenticated. Only works with prefix-based listen_path proxies (HTTP only)."
+      description: "Plugin: spec_expose — Exposes API specification documents (OpenAPI, WSDL, WADL) on a /specz sub-path. Unauthenticated. Only works with prefix-based listen_path proxies (HTTP only). Successful upstream fetches are cached in-process for cache_ttl_seconds (default 300s) to avoid hitting the upstream document store on every /specz request; failures are not cached."
       required:
         - spec_url
       properties:
         spec_url:
           type: string
-          description: Full URL to fetch the API specification document (e.g., https://internal-service/docs/openapi.yaml)
+          description: "Full URL (http or https only) to fetch the API specification document (e.g., https://internal-service/docs/openapi.yaml)"
         content_type:
           type: string
           description: "Override the response Content-Type. When omitted, the upstream response's Content-Type is passed through."
         tls_no_verify:
           type: boolean
           description: "Skip TLS certificate verification when fetching the spec. Defaults to the gateway's FERRUM_TLS_NO_VERIFY setting."
+        cache_ttl_seconds:
+          type: integer
+          format: uint64
+          default: 300
+          description: "Time-to-live for the in-process spec body cache (seconds). The first /specz request fetches the spec from spec_url and stores it; subsequent requests within the TTL window return the cached copy without re-fetching. Failed fetches are never cached. Set to 0 to disable caching entirely (every request re-fetches)."
 
     LoadTestingConfig:
       type: object
@@ -4320,23 +4731,206 @@ components:
             type: string
           description: "Remote gateway URLs to fan out the trigger to. Each receives the original request WITH the key header so it starts its own local load test"
 
+    RequestMirrorConfig:
+      type: object
+      description: |
+        Plugin: request_mirror — Duplicates live proxy traffic to a secondary
+        destination for shadow testing, validation, or migration checks
+        without affecting client responses. Mirrored requests are
+        fire-and-forget: spawned via `tokio::spawn`, the gateway never waits
+        for the mirror response and mirror failures never propagate to the
+        client. Mirror response metadata (status, size, latency) is captured
+        via a `tokio::sync::watch` channel and surfaced through transaction
+        logs.
+      required:
+        - mirror_host
+      properties:
+        mirror_host:
+          type: string
+          description: "Hostname or IP of the mirror target. Normalized to ASCII-lowercase at config load."
+        mirror_port:
+          type: integer
+          format: uint16
+          minimum: 1
+          maximum: 65535
+          description: "Port of the mirror target. Defaults to 80 (http) or 443 (https)."
+        mirror_protocol:
+          type: string
+          enum: [http, https]
+          default: http
+          description: "Transport protocol used for the mirror request."
+        mirror_path:
+          type: string
+          description: "Override path used for the mirror request. When omitted, the original request path is used."
+        percentage:
+          type: number
+          format: double
+          minimum: 0.0
+          maximum: 100.0
+          default: 100.0
+          description: "Percentage of requests to mirror. Granularity is 0.1% (deterministic counter-based sampling, no RNG)."
+        mirror_request_body:
+          type: boolean
+          default: true
+          description: "When true, the request body is forwarded to the mirror target. Binary-safe (preserves gRPC protobuf and other non-UTF-8 payloads). Forces request-body buffering for this proxy."
+
+    ServerlessFunctionConfig:
+      type: object
+      description: |
+        Plugin: serverless_function — Invokes AWS Lambda, Azure Functions, or
+        Google Cloud Functions as middleware in the proxy pipeline. In
+        `pre_proxy` mode the function response can inject request headers and
+        metadata before the backend call. In `terminate` mode the function
+        response is returned directly to the client (HTTP only — gRPC
+        rejection normalization would drop the body, so terminate mode on
+        gRPC requests is rejected with 500). Cloud credential fields fall
+        back to well-known environment variables.
+      required:
+        - provider
+      properties:
+        provider:
+          type: string
+          enum: [aws_lambda, azure_functions, gcp_cloud_functions]
+          description: "Cloud provider for the serverless function."
+        mode:
+          type: string
+          enum: [pre_proxy, terminate]
+          default: pre_proxy
+          description: |
+            pre_proxy: invoke and inject headers/metadata, then continue.
+            terminate: invoke and return response to client (HTTP only).
+        function_url:
+          type: string
+          description: "HTTPS trigger URL. Required for azure_functions and gcp_cloud_functions; ignored for aws_lambda (URL is derived from region + function name)."
+        aws_region:
+          type: string
+          description: "AWS region (aws_lambda only). Falls back to AWS_DEFAULT_REGION, then AWS_REGION env vars."
+        aws_access_key_id:
+          type: string
+          description: "IAM access key (aws_lambda only). Falls back to AWS_ACCESS_KEY_ID env var."
+        aws_secret_access_key:
+          type: string
+          description: "IAM secret key (aws_lambda only). Falls back to AWS_SECRET_ACCESS_KEY env var."
+        aws_function_name:
+          type: string
+          description: "Lambda function name or ARN (aws_lambda only). Falls back to AWS_LAMBDA_FUNCTION_NAME env var."
+        aws_session_token:
+          type: string
+          description: "STS session token (aws_lambda only). Falls back to AWS_SESSION_TOKEN env var."
+        aws_qualifier:
+          type: string
+          description: "Optional version/alias qualifier (e.g., $LATEST, prod)."
+        azure_function_key:
+          type: string
+          description: "Function key for x-functions-key auth (azure_functions only). Falls back to AZURE_FUNCTIONS_KEY env var."
+        gcp_bearer_token:
+          type: string
+          description: "Bearer token for Authorization header (gcp_cloud_functions only). Falls back to GCP_CLOUD_FUNCTIONS_BEARER_TOKEN env var."
+        forward_body:
+          type: boolean
+          default: false
+          description: "Include request body in function payload (forces request-body buffering for JSON POST requests)."
+        forward_headers:
+          type: array
+          items:
+            type: string
+          description: "Header names to forward into the function payload (lowercased at config load)."
+        forward_query_params:
+          type: boolean
+          default: false
+          description: "Include query parameters in function payload."
+        timeout_ms:
+          type: integer
+          format: uint64
+          minimum: 1
+          default: 5000
+          description: "Function invocation timeout in milliseconds. Must be > 0."
+        max_response_body_bytes:
+          type: integer
+          format: uint64
+          minimum: 1
+          default: 10485760
+          description: "Max function response body size (10 MiB default). Must be > 0."
+        on_error:
+          type: string
+          enum: [reject, continue]
+          default: reject
+          description: "reject: return error to client. continue: skip and proxy normally."
+        error_status_code:
+          type: integer
+          format: uint16
+          minimum: 100
+          maximum: 599
+          default: 502
+          description: "HTTP status when rejecting on error. Must be in range 100-599."
+
     ResponseCachingConfig:
       type: object
-      description: "Plugin: response_caching — Response body caching (HTTP only)."
+      description: "Plugin: response_caching — In-memory HTTP response caching keyed by matched proxy, method, path, query, optional consumer, and Vary-selected request headers. Honors Cache-Control, ETag/Last-Modified revalidation (304), Vary, and never caches responses with Set-Cookie. Includes an LRU cacheability predictor that suppresses repeat cache lookups for variants known to be uncacheable. HTTP only."
       properties:
         ttl_seconds:
           type: integer
           format: uint64
-          description: Cache entry time-to-live in seconds
+          default: 300
+          description: "Default TTL in seconds when the backend response has no max-age/s-maxage. Backend cache-control directives take precedence when respect_cache_control is true."
         max_entries:
           type: integer
           format: uint64
-          description: Maximum number of cached entries
-        cache_methods:
+          default: 10000
+          description: Maximum number of cached entries before eviction of expired/oldest entries
+        max_entry_size_bytes:
+          type: integer
+          format: uint64
+          default: 1048576
+          description: Maximum size of a single cached response body (1 MiB by default). Larger responses are not cached.
+        max_total_size_bytes:
+          type: integer
+          format: uint64
+          default: 104857600
+          description: Maximum total in-memory cache size across all entries (100 MiB by default)
+        cacheable_methods:
           type: array
           items:
             type: string
-          description: HTTP methods to cache (e.g., GET, HEAD)
+          default: ["GET", "HEAD"]
+          description: HTTP methods eligible for caching (uppercased)
+        cacheable_status_codes:
+          type: array
+          items:
+            type: integer
+            format: uint16
+          default: [200, 301, 404]
+          description: Response status codes eligible for caching
+        respect_cache_control:
+          type: boolean
+          default: true
+          description: "Honor backend Cache-Control directives (no-store, private, no-cache, max-age, s-maxage, must-revalidate, public)"
+        respect_no_cache:
+          type: boolean
+          default: true
+          description: "Bypass cache lookup when the client request sends Cache-Control: no-cache or no-store"
+        vary_by_headers:
+          type: array
+          items:
+            type: string
+          default: []
+          description: "Additional request header names (lowercased) to include in the cache key even when the backend does not send Vary. Merged with any backend Vary response header."
+        cache_key_include_query:
+          type: boolean
+          default: true
+          description: Include sorted query parameters in the cache key
+        cache_key_include_consumer:
+          type: boolean
+          default: false
+          description: Partition the cache by authenticated identity / consumer. Required if you want to share-cache responses for Authorization-bearing requests without relying on Cache-Control public/s-maxage/must-revalidate.
+        add_cache_status_header:
+          type: boolean
+          default: true
+          description: "Add X-Cache-Status (MISS, HIT, BYPASS, REVALIDATED, PREDICTED-BYPASS) to downstream responses"
+        invalidate_on_unsafe_methods:
+          type: boolean
+          default: true
+          description: "Invalidate cached entries for the matched path (and descendants under the same path prefix) on non-cacheable methods (POST, PUT, PATCH, DELETE)"
 
     GraphqlConfig:
       type: object
@@ -4802,6 +5396,116 @@ components:
           default: 0
           description: Maximum allowed character length of completion content. 0 = no limit
 
+    AiFederationConfig:
+      type: object
+      description: "Plugin: ai_federation — Universal AI gateway. Routes OpenAI Chat Completions-format requests to any of 11 supported AI providers (OpenAI, Anthropic, Google Gemini, Google Vertex AI, Azure OpenAI, AWS Bedrock, Mistral, Cohere, xAI, DeepSeek, Meta Llama, Hugging Face), translating requests to native provider formats and normalizing responses back to OpenAI format. Uses 'terminate and respond' pattern: makes its own outbound HTTP call and bypasses normal proxy dispatch. Supports priority-ordered fallback across providers. NOTE: Outbound calls use the shared PluginHttpClient and only honor global TLS settings (FERRUM_TLS_CA_BUNDLE_PATH, FERRUM_TLS_NO_VERIFY) — per-proxy backend TLS overrides do not apply."
+      required: [providers]
+      properties:
+        providers:
+          type: array
+          minItems: 1
+          description: One or more provider definitions. Tried in priority order (lower number = first).
+          items:
+            type: object
+            required: [name, provider_type]
+            properties:
+              name:
+                type: string
+                description: Unique provider name used in logs and metadata (e.g. ai_federation_provider field).
+              provider_type:
+                type: string
+                enum:
+                  - openai
+                  - anthropic
+                  - google_gemini
+                  - google_vertex
+                  - azure_openai
+                  - aws_bedrock
+                  - mistral
+                  - cohere
+                  - xai
+                  - deepseek
+                  - meta_llama
+                  - hugging_face
+                description: AI provider format / wire protocol.
+              priority:
+                type: integer
+                description: "Lower = tried first. Defaults to provider's index + 1."
+              api_key:
+                type: string
+                description: API key for the provider. Required for all providers except aws_bedrock (uses SigV4) and google_vertex (uses service account JWT).
+              model_patterns:
+                type: array
+                items:
+                  type: string
+                default: []
+                description: "Glob patterns to match the request's `model` field (e.g. ['claude-*', 'gpt-4*']). Empty = catch-all."
+              model_mapping:
+                type: object
+                additionalProperties:
+                  type: string
+                default: {}
+                description: "Map client-facing model names to provider-native names (e.g. {claude-4-sonnet: 'claude-sonnet-4-20250514'})."
+              default_model:
+                type: string
+                description: Model to send to the provider when no mapping matches.
+              connect_timeout_seconds:
+                type: integer
+                default: 5
+                description: TCP + TLS handshake timeout for outbound provider calls.
+              read_timeout_seconds:
+                type: integer
+                default: 60
+                description: Full response read timeout for outbound provider calls.
+              base_url:
+                type: string
+                description: Override the provider's default endpoint URL (for self-hosted models, internal proxies, or pinned regional endpoints).
+              azure_resource:
+                type: string
+                description: "Azure OpenAI resource name (the {resource} in {resource}.openai.azure.com). Required for azure_openai."
+              azure_deployment:
+                type: string
+                description: Azure OpenAI deployment name. Required for azure_openai.
+              azure_api_version:
+                type: string
+                default: "2024-06-01"
+                description: Azure OpenAI api-version query parameter.
+              google_project_id:
+                type: string
+                description: Google Cloud project ID. Required for google_vertex.
+              google_region:
+                type: string
+                description: Google Vertex AI region (e.g. us-central1). Required for google_vertex.
+              google_service_account_json:
+                type: string
+                description: Google service account JSON contents (the file body, not the path). Required for google_vertex; used to mint OAuth2 access tokens via JWT bearer flow.
+              aws_region:
+                type: string
+                description: "AWS region for Bedrock (e.g. us-east-1). Required for aws_bedrock unless AWS_DEFAULT_REGION/AWS_REGION env var is set."
+              aws_access_key_id:
+                type: string
+                description: "AWS access key ID for Bedrock SigV4 signing. Falls back to AWS_ACCESS_KEY_ID env var."
+              aws_secret_access_key:
+                type: string
+                description: "AWS secret access key for Bedrock SigV4 signing. Falls back to AWS_SECRET_ACCESS_KEY env var."
+              aws_session_token:
+                type: string
+                description: "Optional AWS STS session token for temporary credentials. Falls back to AWS_SESSION_TOKEN env var."
+        fallback_enabled:
+          type: boolean
+          default: true
+          description: Try the next provider when one fails (network error or matching status code).
+        fallback_on_status_codes:
+          type: array
+          items:
+            type: integer
+          default: [429, 500, 502, 503]
+          description: HTTP status codes from a provider that trigger fallback to the next provider.
+        fallback_on_network_errors:
+          type: boolean
+          default: true
+          description: Trigger fallback when the provider is unreachable (DNS/TCP/TLS failure).
+
     ApiChargebackConfig:
       type: object
       description: "Plugin: api_chargeback — Per-consumer API usage charge tracking with configurable pricing tiers by HTTP status code."
@@ -4841,6 +5545,10 @@ components:
           type: integer
           default: 500
           description: Minimum age (ms) of the render cache before record() will invalidate it.
+        cleanup_interval_seconds:
+          type: integer
+          default: 300
+          description: How often (seconds) the background task evicts entries that have been idle longer than stale_entry_ttl_seconds. Set to 0 to disable.
 
     ChargebackResponse:
       type: object
@@ -4892,8 +5600,17 @@ components:
           description: Request header name containing the deduplication key
         ttl_seconds:
           type: integer
+          minimum: 1
           default: 300
-          description: Time-to-live in seconds for cached responses
+          description: Time-to-live in seconds for cached completed responses. Must be greater than zero.
+        inflight_ttl_seconds:
+          type: integer
+          minimum: 1
+          description: >-
+            Time-to-live in seconds for in-flight request entries used to
+            coalesce duplicate requests while the first is still being
+            processed. Defaults to `ttl_seconds` when omitted. Must be
+            greater than zero.
         max_entries:
           type: integer
           default: 10000
@@ -4949,33 +5666,56 @@ components:
 
     GeoRestrictionConfig:
       type: object
-      description: "Plugin: geo_restriction — IP geolocation-based access control using MaxMind GeoIP2/GeoLite2 databases."
+      description: >-
+        Plugin: geo_restriction — country-level access control backed by a
+        MaxMind GeoIP2 / GeoLite2 `.mmdb` file. The database is mmap'd at
+        construction time for zero-copy lookups; the file dependency is
+        validated per-mode (fatal in file mode, warn in db mode, skipped on
+        the data plane so a missing file degrades to `on_lookup_failure`
+        instead of rejecting the whole config). `allow_countries` and
+        `deny_countries` are mutually exclusive; at least one must be
+        non-empty. Runs on every protocol — HTTP, gRPC, WebSocket, TCP, UDP.
       required: [db_path]
       properties:
         db_path:
           type: string
-          description: Path to MaxMind GeoIP2 or GeoLite2 .mmdb database file (required)
+          description: >-
+            Filesystem path to a MaxMind GeoIP2 or GeoLite2 `.mmdb` database.
+            Required.
         allow_countries:
           type: array
           items:
             type: string
           default: []
-          description: "ISO 3166-1 alpha-2 country codes to allow (e.g., [\"US\", \"CA\", \"GB\"]). If non-empty, only these countries are allowed"
+          description: >-
+            ISO 3166-1 alpha-2 country codes (case-insensitive — normalized to
+            uppercase) that are allowed. Mutually exclusive with
+            `deny_countries`. Example: `["US", "CA", "GB"]`.
         deny_countries:
           type: array
           items:
             type: string
           default: []
-          description: "ISO 3166-1 alpha-2 country codes to deny. Evaluated after allow_countries"
+          description: >-
+            ISO 3166-1 alpha-2 country codes (case-insensitive — normalized to
+            uppercase) that are denied. Mutually exclusive with
+            `allow_countries`.
         inject_headers:
           type: boolean
           default: false
-          description: "Inject X-Geo-Country and X-Geo-Country-Name headers into proxied requests"
+          description: >-
+            When true, inject the resolved country code into the proxied
+            request as the `x-geo-country` header (uppercase ISO 3166-1
+            alpha-2). HTTP-family proxies only — ignored on TCP/UDP streams.
         on_lookup_failure:
           type: string
           enum: [allow, deny]
           default: allow
-          description: Action when the IP cannot be resolved to a country
+          description: >-
+            Action when the client IP cannot be resolved to a country. Applies
+            to both genuine MaxMind misses (private IPs, unallocated ranges)
+            and to the data plane fallback path when the `.mmdb` file is
+            missing on disk.
 
     RateSpec:
       type: object

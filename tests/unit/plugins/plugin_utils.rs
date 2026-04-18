@@ -141,6 +141,9 @@ pub fn create_test_transaction_summary() -> ferrum_edge::plugins::TransactionSum
         response_streamed: false,
         client_disconnected: false,
         error_class: None,
+        body_error_class: None,
+        body_completed: false,
+        bytes_streamed_to_client: 0,
         mirror: false,
         metadata: HashMap::new(),
     }

@@ -41,6 +41,54 @@ fn test_decompress_request_config() {
     assert!(plugin.modifies_request_headers());
 }
 
+#[test]
+fn test_unknown_algorithm_rejected() {
+    let err = CompressionPlugin::new(&json!({"algorithms": ["lz4"]}))
+        .err()
+        .expect("unknown algorithm must be rejected");
+    assert!(err.contains("unknown algorithm"), "got: {}", err);
+}
+
+#[test]
+fn test_unknown_algorithm_in_mixed_array_rejected() {
+    // A typo in one algorithm should fail the whole config (no silent skip).
+    let err = CompressionPlugin::new(&json!({"algorithms": ["gzip", "deflate"]}))
+        .err()
+        .expect("typo'd algorithm must be rejected");
+    assert!(err.contains("unknown algorithm"), "got: {}", err);
+}
+
+#[test]
+fn test_non_string_algorithm_rejected() {
+    let err = CompressionPlugin::new(&json!({"algorithms": [42]}))
+        .err()
+        .expect("non-string algorithm must be rejected");
+    assert!(err.contains("must be a string"), "got: {}", err);
+}
+
+#[test]
+fn test_non_array_algorithms_rejected() {
+    let err = CompressionPlugin::new(&json!({"algorithms": "gzip"}))
+        .err()
+        .expect("non-array algorithms must be rejected");
+    assert!(err.contains("must be an array"), "got: {}", err);
+}
+
+#[test]
+fn test_brotli_alias_accepted() {
+    let plugin = CompressionPlugin::new(&json!({"algorithms": ["brotli"]}))
+        .expect("'brotli' is accepted as an alias for 'br'");
+    assert!(plugin.requires_response_body_buffering());
+}
+
+#[test]
+fn test_empty_algorithms_array_rejected() {
+    let err = CompressionPlugin::new(&json!({"algorithms": []}))
+        .err()
+        .expect("empty algorithms array must be rejected");
+    assert!(err.contains("no valid algorithms"), "got: {}", err);
+}
+
 // ────────────────────── Accept-Encoding negotiation ──────────────────────
 
 #[tokio::test]
@@ -386,10 +434,17 @@ async fn test_brotli_response_compression_roundtrip() {
     assert_eq!(decompressed, original);
 }
 
-// ────────────────────── Response: skip tiny bodies in transform ──────────
+// ────────────────────── Response: tiny body still compressed when committed ───
+//
+// Once `after_proxy` sets `Content-Encoding`, the response is committed to
+// that encoding. Returning an uncompressed body with `Content-Encoding: gzip`
+// would produce a malformed response that every conformant client rejects.
+// `transform_response_body` therefore compresses unconditionally when the
+// header has been set — the size gate runs in `after_proxy` for known-CL
+// responses; tiny chunked bodies are accepted as a small cost for correctness.
 
 #[tokio::test]
-async fn test_skips_compression_for_tiny_body_in_transform() {
+async fn test_compresses_tiny_body_when_committed_in_transform() {
     let plugin = make_plugin(json!({"min_content_length": 256}));
 
     let tiny_body = b"small";
@@ -399,6 +454,39 @@ async fn test_skips_compression_for_tiny_body_in_transform() {
 
     let result = plugin
         .transform_response_body(tiny_body, Some("application/json"), &resp_headers)
+        .await
+        .expect("once Content-Encoding is set, transform must compress regardless of size");
+
+    // Verify the body is actually gzip-compressed (not the original bytes)
+    use flate2::read::GzDecoder;
+    use std::io::Read;
+    let mut decoder = GzDecoder::new(&result[..]);
+    let mut decompressed = Vec::new();
+    decoder
+        .read_to_end(&mut decompressed)
+        .expect("output must be valid gzip");
+    assert_eq!(decompressed, tiny_body);
+}
+
+#[tokio::test]
+async fn test_after_proxy_skips_when_content_length_below_min() {
+    // The size gate lives in `after_proxy` (when Content-Length is known).
+    // When skipped there, no Content-Encoding is set, so transform stays inert.
+    let plugin = make_plugin(json!({"min_content_length": 1000}));
+    let mut ctx = make_ctx(Some("gzip"));
+    let mut headers = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    let mut resp_headers = HashMap::new();
+    resp_headers.insert("content-type".to_string(), "application/json".to_string());
+    resp_headers.insert("content-length".to_string(), "100".to_string());
+
+    plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await;
+    assert!(!resp_headers.contains_key("content-encoding"));
+
+    // With no Content-Encoding committed, transform leaves the body alone.
+    let result = plugin
+        .transform_response_body(b"small body", Some("application/json"), &resp_headers)
         .await;
     assert!(result.is_none());
 }
@@ -427,6 +515,38 @@ async fn test_gzip_request_decompression() {
         .expect("should decompress");
 
     assert_eq!(decompressed, original);
+}
+
+#[tokio::test]
+async fn test_before_proxy_strips_client_supplied_internal_marker() {
+    // A client must not be able to inject the gateway-internal marker
+    // `x-ferrum-original-content-encoding` to coerce decompression attempts
+    // on plaintext bodies.
+    let plugin = make_plugin(json!({"decompress_request": true}));
+    let mut ctx = make_ctx(None);
+    let mut headers = HashMap::new();
+    headers.insert(
+        "x-ferrum-original-content-encoding".to_string(),
+        "gzip".to_string(),
+    );
+
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    assert!(
+        !headers.contains_key("x-ferrum-original-content-encoding"),
+        "client-supplied internal marker must be stripped"
+    );
+    assert!(
+        !ctx.metadata.contains_key("compression:request_encoding"),
+        "no real content-encoding was present; metadata must not be set"
+    );
+
+    // transform_request_body should NOT attempt decompression on a plaintext
+    // body when only the client-supplied marker was present (now removed).
+    let result = plugin
+        .transform_request_body(b"plaintext body", Some("application/json"), &headers)
+        .await;
+    assert!(result.is_none());
 }
 
 // ────────────────────── Request decompression (brotli) ──────────────────────

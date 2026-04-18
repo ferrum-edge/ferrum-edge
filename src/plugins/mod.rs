@@ -191,6 +191,47 @@ pub enum WebSocketFrameDirection {
     BackendToClient,
 }
 
+/// Context passed to `on_ws_disconnect` when a WebSocket session ends.
+///
+/// Mirrors the information made available on `StreamTransactionSummary`
+/// for TCP/UDP streams so logging/metrics plugins have parity across all
+/// three protocols. `direction` identifies which half of the frame relay
+/// terminated first — `None` indicates a clean close initiated by both
+/// peers or an upgrade that never established frame flow.
+///
+/// Populated once per accepted WebSocket upgrade, including H2 Extended
+/// CONNECT (RFC 8441) sessions. The frame relay code should construct
+/// this at session teardown and dispatch it to any plugin whose
+/// `requires_ws_disconnect_hooks()` returns true.
+#[derive(Debug, Clone)]
+pub struct WsDisconnectContext {
+    pub namespace: String,
+    pub proxy_id: String,
+    pub proxy_name: Option<String>,
+    pub client_ip: String,
+    /// Backend target URL (scheme://host:port/path) — matches the
+    /// `backend_target_url` field from the original upgrade request.
+    pub backend_target: String,
+    /// Listener port on the gateway that accepted the upgrade.
+    pub listen_port: u16,
+    /// Total session lifetime in milliseconds (upgrade → close).
+    pub duration_ms: f64,
+    /// Number of frames proxied from client toward backend.
+    pub frames_client_to_backend: u64,
+    /// Number of frames proxied from backend toward client.
+    pub frames_backend_to_client: u64,
+    /// Which direction observed the first terminating error. `None` for
+    /// clean close initiated by either peer.
+    pub direction: Option<Direction>,
+    /// Classification of the terminating error, if any.
+    pub error_class: Option<crate::retry::ErrorClass>,
+    /// Consumer identity associated with the upgrade (copied from
+    /// the originating `RequestContext`).
+    pub consumer_username: Option<String>,
+    /// Correlation ID / tracing metadata inherited from the upgrade request.
+    pub metadata: HashMap<String, String>,
+}
+
 /// Context passed through the plugin pipeline for a single request.
 ///
 /// Headers and query parameters are lazily materialized to avoid per-request
@@ -481,8 +522,69 @@ fn is_default_namespace(ns: &str) -> bool {
     ns == crate::config::types::DEFAULT_NAMESPACE
 }
 
+/// Serde skip predicate: true when the value is zero. Used to keep logs tidy
+/// when new u64 counters are unset for a given transaction.
+fn is_zero_u64(v: &u64) -> bool {
+    *v == 0
+}
+
+/// Which direction of a bidirectional stream experienced a failure first.
+///
+/// Used by TCP/UDP/WebSocket disconnect logging so operators can tell whether
+/// the client or the backend initiated the disconnect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Direction {
+    /// Error originated on the client→backend half of the stream.
+    ClientToBackend,
+    /// Error originated on the backend→client half of the stream.
+    BackendToClient,
+    /// Direction could not be determined (both halves failed simultaneously,
+    /// or the error occurred outside the copy loop).
+    Unknown,
+}
+
+/// Cause of a stream (TCP/UDP) disconnect.
+///
+/// Disambiguates idle-timeout expiry from read/write errors so log consumers
+/// don't have to rely on `error_class: None` as an implicit timeout signal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DisconnectCause {
+    /// Session exceeded the configured idle timeout without traffic.
+    IdleTimeout,
+    /// Frontend (client-side) recv/read returned an error.
+    RecvError,
+    /// Backend recv/read returned an error (e.g., backend closed the socket).
+    BackendError,
+    /// Clean shutdown initiated by either peer (e.g., FIN, graceful close frame).
+    GracefulShutdown,
+}
+
 /// Transaction summary for logging plugins.
-#[derive(Debug, Clone, serde::Serialize)]
+///
+/// Implements [`Default`] so call sites that build partial summaries
+/// (early-return error paths, rejected requests, etc.) can use struct
+/// update syntax — `..TransactionSummary::default()` — instead of
+/// hardcoding every field. Future additions to this struct get an
+/// automatic default value at all update-syntax call sites; old call
+/// sites that enumerate every field still require a manual edit, which
+/// is also fine because it flags the deliberate choice.
+///
+/// Prefer the update syntax when adding new log sites:
+/// ```ignore
+/// TransactionSummary {
+///     namespace: proxy.namespace.clone(),
+///     timestamp_received: ctx.timestamp_received.to_rfc3339(),
+///     client_ip: ctx.client_ip.clone(),
+///     http_method: method,
+///     request_path: path,
+///     response_status_code: status,
+///     error_class: Some(class),
+///     ..TransactionSummary::default()
+/// }
+/// ```
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct TransactionSummary {
     /// Namespace of the matched proxy. Omitted from serialization when it equals
     /// the default (`"ferrum"`) to keep log volume down for single-namespace deployments.
@@ -534,6 +636,24 @@ pub struct TransactionSummary {
     /// and normal HTTP error responses from the backend.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_class: Option<crate::retry::ErrorClass>,
+    /// Classification of an error that occurred while streaming the response
+    /// body to the client (e.g., client RST after headers were sent). `None`
+    /// when the body streamed successfully or when no streaming occurred.
+    ///
+    /// Distinct from `error_class`, which covers errors reaching the backend.
+    /// Populated by the deferred-logging path when the response body wrapper
+    /// returns an error frame or is dropped before completion.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body_error_class: Option<crate::retry::ErrorClass>,
+    /// True when the response body finished streaming all frames successfully.
+    /// False when streaming was interrupted (client disconnect, backend RST,
+    /// body size limit exceeded) or when no streaming occurred.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub body_completed: bool,
+    /// Total bytes of response body actually written to the client. May be
+    /// less than `Content-Length` if streaming was interrupted.
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub bytes_streamed_to_client: u64,
     /// True when this summary represents a mirror (shadow) request, not the
     /// actual client-facing proxy traffic. Logged as a separate entry with the
     /// same schema so existing log queries and dashboards work without changes.
@@ -565,6 +685,9 @@ impl TransactionSummary {
         mirror.response_streamed = false;
         mirror.client_disconnected = false;
         mirror.error_class = None;
+        mirror.body_error_class = None;
+        mirror.body_completed = false;
+        mirror.bytes_streamed_to_client = 0;
         if let Some(size) = result.mirror_response_size_bytes {
             mirror
                 .metadata
@@ -689,6 +812,14 @@ pub struct StreamTransactionSummary {
     /// Mirrors the `ErrorClass` used for HTTP/gRPC transactions.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_class: Option<crate::retry::ErrorClass>,
+    /// Which direction of the bidirectional stream failed first.
+    /// `None` for clean shutdowns or timeouts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disconnect_direction: Option<Direction>,
+    /// Cause of the disconnect (idle timeout vs. recv error vs. graceful shutdown).
+    /// Disambiguates the implicit `error_class: None` timeout convention.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disconnect_cause: Option<DisconnectCause>,
     pub timestamp_connected: String,
     pub timestamp_disconnected: String,
     /// SNI hostname extracted from the TLS/DTLS ClientHello during passthrough mode.
@@ -1108,6 +1239,24 @@ pub trait Plugin: Send + Sync {
     fn requires_udp_datagram_hooks(&self) -> bool {
         false
     }
+
+    /// Returns `true` if this plugin needs notification when a WebSocket
+    /// session ends. Zero overhead when `false` (default) — the relay teardown
+    /// path skips constructing the context and iterating plugins.
+    ///
+    /// Mirrors the opt-in pattern used by `requires_ws_frame_hooks()` and
+    /// `requires_udp_datagram_hooks()` so most deployments pay no cost.
+    fn requires_ws_disconnect_hooks(&self) -> bool {
+        false
+    }
+
+    /// Called when a WebSocket session (H1 upgrade or H2 Extended CONNECT)
+    /// terminates. Receives a summary of the session including directional
+    /// failure classification and per-direction frame counts.
+    ///
+    /// Default no-op. Plugins wanting end-of-session observability should
+    /// override this and set `requires_ws_disconnect_hooks()` to `true`.
+    async fn on_ws_disconnect(&self, _ctx: &WsDisconnectContext) {}
 
     /// Called for each UDP datagram in both directions (client→backend and backend→client).
     ///

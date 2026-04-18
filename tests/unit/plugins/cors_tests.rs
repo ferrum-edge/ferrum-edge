@@ -740,3 +740,92 @@ async fn test_wildcard_subdomain_with_port() {
         "*.company.com should match https://app.company.com:8443"
     );
 }
+
+// ── Vary header merge — preserves backend Vary while adding Origin ───
+//
+// Regression: previously `after_proxy` blindly inserted `Vary: Origin`,
+// clobbering any backend Vary value (e.g., compression's
+// `Vary: Accept-Encoding`). That broke downstream caches.
+
+#[tokio::test]
+async fn test_vary_header_merges_with_existing_backend_vary() {
+    let plugin = CorsPlugin::new(&json!({
+        "allowed_origins": ["https://example.com"]
+    }))
+    .unwrap();
+
+    let mut ctx = make_cors_ctx("GET", "https://example.com");
+    let _ = plugin.on_request_received(&mut ctx).await;
+
+    let mut response_headers: HashMap<String, String> = HashMap::new();
+    response_headers.insert("vary".to_string(), "Accept-Encoding".to_string());
+    let _ = plugin
+        .after_proxy(&mut ctx, 200, &mut response_headers)
+        .await;
+    let vary = response_headers.get("vary").unwrap();
+    assert!(
+        vary.contains("Accept-Encoding"),
+        "merged Vary must preserve backend Accept-Encoding, got: {}",
+        vary
+    );
+    assert!(
+        vary.to_ascii_lowercase().contains("origin"),
+        "merged Vary must include Origin, got: {}",
+        vary
+    );
+}
+
+#[tokio::test]
+async fn test_vary_header_origin_already_present_not_duplicated() {
+    let plugin = CorsPlugin::new(&json!({
+        "allowed_origins": ["https://example.com"]
+    }))
+    .unwrap();
+
+    let mut ctx = make_cors_ctx("GET", "https://example.com");
+    let _ = plugin.on_request_received(&mut ctx).await;
+
+    let mut response_headers: HashMap<String, String> = HashMap::new();
+    response_headers.insert("vary".to_string(), "origin, Accept-Language".to_string());
+    let _ = plugin
+        .after_proxy(&mut ctx, 200, &mut response_headers)
+        .await;
+    let vary = response_headers.get("vary").unwrap();
+    // Case-insensitive match — should not duplicate
+    let origin_count = vary
+        .split(',')
+        .filter(|tok| tok.trim().eq_ignore_ascii_case("Origin"))
+        .count();
+    assert_eq!(
+        origin_count, 1,
+        "Origin already present (case-insensitive) must not be duplicated, got: {}",
+        vary
+    );
+    assert!(
+        vary.contains("Accept-Language"),
+        "other tokens must be preserved"
+    );
+}
+
+#[tokio::test]
+async fn test_vary_header_wildcard_preserved_origin_redundant() {
+    let plugin = CorsPlugin::new(&json!({
+        "allowed_origins": ["https://example.com"]
+    }))
+    .unwrap();
+
+    let mut ctx = make_cors_ctx("GET", "https://example.com");
+    let _ = plugin.on_request_received(&mut ctx).await;
+
+    let mut response_headers: HashMap<String, String> = HashMap::new();
+    // Vary: * means "any header" — adding Origin would be redundant per RFC 9110.
+    response_headers.insert("vary".to_string(), "*".to_string());
+    let _ = plugin
+        .after_proxy(&mut ctx, 200, &mut response_headers)
+        .await;
+    assert_eq!(
+        response_headers.get("vary").unwrap(),
+        "*",
+        "Vary: * must be preserved (Origin would be redundant)"
+    );
+}

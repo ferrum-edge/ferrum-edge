@@ -97,6 +97,8 @@ struct UdpDisconnectContext<'a> {
     disconnected_ms: u64,
     connection_error: Option<String>,
     error_class: Option<crate::retry::ErrorClass>,
+    disconnect_direction: Option<crate::plugins::Direction>,
+    disconnect_cause: Option<crate::plugins::DisconnectCause>,
 }
 
 fn rfc3339_from_epoch_millis(ms: u64) -> String {
@@ -129,6 +131,8 @@ fn build_udp_stream_summary(context: UdpDisconnectContext<'_>) -> StreamTransact
         bytes_received: context.session.bytes_received.load(Ordering::Relaxed),
         connection_error: context.connection_error,
         error_class: context.error_class,
+        disconnect_direction: context.disconnect_direction,
+        disconnect_cause: context.disconnect_cause,
         timestamp_connected: rfc3339_from_epoch_millis(created_ms),
         timestamp_disconnected: rfc3339_from_epoch_millis(context.disconnected_ms),
         sni_hostname: context.session.sni_hostname.clone(),
@@ -166,6 +170,8 @@ struct DtlsDisconnectContext<'a> {
     bytes_received: u64,
     connection_error: Option<String>,
     error_class: Option<crate::retry::ErrorClass>,
+    disconnect_direction: Option<crate::plugins::Direction>,
+    disconnect_cause: Option<crate::plugins::DisconnectCause>,
     metadata: &'a std::collections::HashMap<String, String>,
 }
 
@@ -185,6 +191,8 @@ fn build_dtls_stream_summary(context: DtlsDisconnectContext<'_>) -> StreamTransa
         bytes_received: context.bytes_received,
         connection_error: context.connection_error,
         error_class: context.error_class,
+        disconnect_direction: context.disconnect_direction,
+        disconnect_cause: context.disconnect_cause,
         timestamp_connected: context.connected_at.to_rfc3339(),
         timestamp_disconnected: context.disconnected_at.to_rfc3339(),
         sni_hostname: None,
@@ -1236,6 +1244,10 @@ fn spawn_session_cleanup(
                                     disconnected_ms: now,
                                     connection_error: None,
                                     error_class: None,
+                                    disconnect_direction: None,
+                                    disconnect_cause: Some(
+                                        crate::plugins::DisconnectCause::IdleTimeout,
+                                    ),
                                 },
                             )
                             .await;
@@ -1415,8 +1427,12 @@ async fn start_dtls_frontend_listener(
                         &handler_crls,
                     )
                     .await;
-                    let (err_msg, error_class) = match &result.outcome {
-                        Ok(()) => (None, None),
+                    let (err_msg, error_class, disconnect_cause) = match &result.outcome {
+                        Ok(()) => (
+                            None,
+                            None,
+                            Some(crate::plugins::DisconnectCause::GracefulShutdown),
+                        ),
                         Err(e) => {
                             debug!(
                                 proxy_id = %handler_proxy_id,
@@ -1424,10 +1440,16 @@ async fn start_dtls_frontend_listener(
                                 "DTLS client session ended: {}",
                                 e
                             );
-                            (
-                                Some(e.to_string()),
-                                Some(crate::retry::classify_boxed_error(e.as_ref())),
-                            )
+                            let error_message = e.to_string();
+                            let err_class = crate::retry::classify_boxed_error(e.as_ref());
+                            // handle_dtls_client_inner can fail on backend-side
+                            // setup (DNS, backend UDP bind, backend DTLS
+                            // handshake) as well as client-side session errors.
+                            // Infer cause from the classified error + message
+                            // prefix so DTLS stream_disconnects metrics don't
+                            // collapse every failure into `recv_error`.
+                            let cause = dtls_disconnect_cause(&err_class, &error_message);
+                            (Some(error_message), Some(err_class), Some(cause))
                         }
                     };
 
@@ -1450,6 +1472,8 @@ async fn start_dtls_frontend_listener(
                             bytes_received: result.bytes_received,
                             connection_error: err_msg,
                             error_class,
+                            disconnect_direction: None,
+                            disconnect_cause,
                             metadata: &handler_metadata,
                         });
                         for plugin in handler_plugins.iter() {
@@ -1547,6 +1571,44 @@ async fn handle_dtls_client(
         bytes_sent: bytes_sent.load(Ordering::Relaxed),
         bytes_received: bytes_received.load(Ordering::Relaxed),
         outcome,
+    }
+}
+
+/// Shared error-message prefix. Used at the `anyhow::anyhow!` construction
+/// site AND at the `error_message.contains(...)` check site in
+/// `dtls_disconnect_cause` — keeping this as a constant means a rename of
+/// the prefix is a compile error everywhere rather than a silent drift.
+pub(crate) const STREAM_ERR_BACKEND_DTLS_HANDSHAKE_FAILED: &str = "Backend DTLS handshake failed";
+
+/// Map a DTLS session failure to a `DisconnectCause`. Backend-facing classes
+/// (DNS, connect, port exhaustion, pool) map to `BackendError` so DTLS
+/// stream_disconnects metrics don't collapse every failure into
+/// `recv_error`. TLS is ambiguous so disambiguate by the shared prefix
+/// constant (`STREAM_ERR_BACKEND_DTLS_HANDSHAKE_FAILED`) — generic
+/// session/decrypt errors remain client-side (`RecvError`).
+fn dtls_disconnect_cause(
+    class: &crate::retry::ErrorClass,
+    error_message: &str,
+) -> crate::plugins::DisconnectCause {
+    use crate::plugins::DisconnectCause;
+    use crate::retry::ErrorClass;
+    match class {
+        ErrorClass::DnsLookupError
+        | ErrorClass::ConnectionTimeout
+        | ErrorClass::ConnectionRefused
+        | ErrorClass::ConnectionReset
+        | ErrorClass::ConnectionClosed
+        | ErrorClass::PortExhaustion
+        | ErrorClass::ConnectionPoolError
+        | ErrorClass::ProtocolError => DisconnectCause::BackendError,
+        ErrorClass::TlsError => {
+            if error_message.contains(STREAM_ERR_BACKEND_DTLS_HANDSHAKE_FAILED) {
+                DisconnectCause::BackendError
+            } else {
+                DisconnectCause::RecvError
+            }
+        }
+        _ => DisconnectCause::RecvError,
     }
 }
 
@@ -1686,7 +1748,11 @@ async fn handle_dtls_client_inner(
                     );
                     cb.record_failure(502, true);
                 }
-                return Err(anyhow::anyhow!("Backend DTLS handshake failed: {}", e));
+                return Err(anyhow::anyhow!(
+                    "{}: {}",
+                    STREAM_ERR_BACKEND_DTLS_HANDSHAKE_FAILED,
+                    e
+                ));
             }
         };
         debug!(
@@ -2249,7 +2315,17 @@ async fn create_session(
     tokio::spawn(async move {
         let mut buf = vec![0u8; MAX_UDP_DATAGRAM_SIZE];
 
-        let mut disconnect_error: Option<(String, crate::retry::ErrorClass)> = None;
+        // Third tuple element carries the DisconnectCause so the final
+        // metric-emitting branch preserves client-side vs backend-side
+        // attribution (backend recv failures vs. client send failures both
+        // terminate this task, and mislabeling them skews cause-based
+        // alerting).
+        let mut disconnect_error: Option<(
+            String,
+            crate::retry::ErrorClass,
+            crate::plugins::DisconnectCause,
+            crate::plugins::Direction,
+        )> = None;
         // Pre-allocate sendmmsg batch for batched client replies (Linux only).
         #[cfg(target_os = "linux")]
         let mut send_batch = super::udp_batch::SendMmsgBatch::new(64);
@@ -2285,6 +2361,8 @@ async fn create_session(
                             crate::retry::classify_boxed_error(
                                 anyhow::anyhow!(error_message).as_ref(),
                             ),
+                            crate::plugins::DisconnectCause::BackendError,
+                            crate::plugins::Direction::BackendToClient,
                         ));
                         break;
                     }
@@ -2310,6 +2388,8 @@ async fn create_session(
                             crate::retry::classify_boxed_error(
                                 anyhow::anyhow!(error_message).as_ref(),
                             ),
+                            crate::plugins::DisconnectCause::BackendError,
+                            crate::plugins::Direction::BackendToClient,
                         ));
                         break;
                     }
@@ -2418,9 +2498,13 @@ async fn create_session(
                     e
                 );
                 let error_message = e.to_string();
+                // Client-facing send failure — the backend is healthy, so
+                // attribute the session teardown to the client recv path.
                 disconnect_error = Some((
                     error_message.clone(),
                     crate::retry::classify_boxed_error(anyhow::anyhow!(error_message).as_ref()),
+                    crate::plugins::DisconnectCause::RecvError,
+                    crate::plugins::Direction::BackendToClient,
                 ));
                 break;
             }
@@ -2546,6 +2630,17 @@ async fn create_session(
                                             error_class: Some(crate::retry::classify_boxed_error(
                                                 anyhow::anyhow!(error_message).as_ref(),
                                             )),
+                                            disconnect_direction: Some(
+                                                crate::plugins::Direction::BackendToClient,
+                                            ),
+                                            // frontend.send_to failure is a
+                                            // client-facing write — the backend
+                                            // is healthy, so label the cause as
+                                            // a client-side (RecvError) event
+                                            // rather than a backend outage.
+                                            disconnect_cause: Some(
+                                                crate::plugins::DisconnectCause::RecvError,
+                                            ),
                                         },
                                     )
                                     .await;
@@ -2605,11 +2700,15 @@ async fn create_session(
                                     e
                                 );
                                 let error_message = e.to_string();
+                                // sendmmsg flush targets the frontend socket
+                                // (client), not the backend — client-side.
                                 disconnect_error = Some((
                                     error_message.clone(),
                                     crate::retry::classify_boxed_error(
                                         anyhow::anyhow!(error_message).as_ref(),
                                     ),
+                                    crate::plugins::DisconnectCause::RecvError,
+                                    crate::plugins::Direction::BackendToClient,
                                 ));
                                 break;
                             }
@@ -2645,10 +2744,21 @@ async fn create_session(
                 .active_sessions
                 .fetch_sub(1, Ordering::Relaxed);
             let disconnected_ms = coarse_epoch_millis();
-            let (connection_error, error_class) = match disconnect_error {
-                Some((message, error_class)) => (Some(message), Some(error_class)),
-                None => (None, None),
-            };
+            let (connection_error, error_class, disconnect_cause, disconnect_direction) =
+                match disconnect_error {
+                    Some((message, error_class, cause, direction)) => (
+                        Some(message),
+                        Some(error_class),
+                        Some(cause),
+                        Some(direction),
+                    ),
+                    None => (
+                        None,
+                        None,
+                        Some(crate::plugins::DisconnectCause::GracefulShutdown),
+                        None,
+                    ),
+                };
             emit_udp_stream_disconnect(
                 &reply_plugins,
                 UdpDisconnectContext {
@@ -2662,6 +2772,8 @@ async fn create_session(
                     disconnected_ms,
                     connection_error,
                     error_class,
+                    disconnect_direction,
+                    disconnect_cause,
                 },
             )
             .await;
@@ -2728,8 +2840,9 @@ fn epoch_millis_precise() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        DtlsDisconnectContext, UdpDisconnectContext, UdpSession, build_dtls_stream_summary,
-        build_udp_stream_summary, emit_udp_stream_disconnect,
+        DtlsDisconnectContext, STREAM_ERR_BACKEND_DTLS_HANDSHAKE_FAILED, UdpDisconnectContext,
+        UdpSession, build_dtls_stream_summary, build_udp_stream_summary,
+        emit_udp_stream_disconnect,
     };
     use crate::config::types::BackendProtocol;
     use crate::plugins::{Plugin, StreamTransactionSummary};
@@ -2785,6 +2898,8 @@ mod tests {
             bytes_received: 654,
             connection_error: Some("tls alert".to_string()),
             error_class: Some(crate::retry::ErrorClass::TlsError),
+            disconnect_direction: None,
+            disconnect_cause: Some(crate::plugins::DisconnectCause::RecvError),
             metadata: &metadata,
         });
 
@@ -2845,6 +2960,8 @@ mod tests {
             disconnected_ms: 1_710_000_001_500,
             connection_error: Some("connection reset by peer".to_string()),
             error_class: Some(crate::retry::ErrorClass::ConnectionReset),
+            disconnect_direction: Some(crate::plugins::Direction::BackendToClient),
+            disconnect_cause: Some(crate::plugins::DisconnectCause::BackendError),
         });
 
         assert_eq!(summary.proxy_id, "udp-proxy");
@@ -2902,8 +3019,10 @@ mod tests {
                 backend_protocol: BackendProtocol::Dtls,
                 listen_port: 7443,
                 disconnected_ms: 1_710_000_002_000,
-                connection_error: Some("Backend DTLS handshake failed".to_string()),
+                connection_error: Some(STREAM_ERR_BACKEND_DTLS_HANDSHAKE_FAILED.to_string()),
                 error_class: Some(crate::retry::ErrorClass::TlsError),
+                disconnect_direction: Some(crate::plugins::Direction::BackendToClient),
+                disconnect_cause: Some(crate::plugins::DisconnectCause::BackendError),
             },
         )
         .await;
@@ -2917,7 +3036,7 @@ mod tests {
         assert_eq!(summary.listen_port, 7443);
         assert_eq!(
             summary.connection_error.as_deref(),
-            Some("Backend DTLS handshake failed")
+            Some(STREAM_ERR_BACKEND_DTLS_HANDSHAKE_FAILED)
         );
         assert_eq!(
             summary.error_class,

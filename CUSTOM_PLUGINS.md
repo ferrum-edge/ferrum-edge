@@ -725,6 +725,12 @@ pub struct TransactionSummary {
     pub response_streamed: bool,
     pub client_disconnected: bool,
     pub error_class: Option<ErrorClass>,
+    // Response body streaming attribution (populated for streaming responses).
+    // `error_class` covers pre-body failures (connect, TLS, headers);
+    // `body_error_class` covers failures observed while streaming the body.
+    pub body_error_class: Option<ErrorClass>,
+    pub body_completed: bool,
+    pub bytes_streamed_to_client: u64,
     pub metadata: HashMap<String, String>,
 }
 ```
@@ -747,9 +753,30 @@ pub struct StreamTransactionSummary {
     pub bytes_received: u64,
     pub connection_error: Option<String>,
     pub error_class: Option<ErrorClass>,
+    // Disconnect attribution. `disconnect_cause` disambiguates idle timeouts
+    // from recv errors (before these fields, both presented as `error_class: None`).
+    pub disconnect_direction: Option<Direction>,
+    pub disconnect_cause: Option<DisconnectCause>,
     pub timestamp_connected: String,
     pub timestamp_disconnected: String,
     pub metadata: HashMap<String, String>,     // Carried from on_stream_connect
+}
+```
+
+`Direction` and `DisconnectCause` live in `src/plugins/mod.rs` and serialize as snake_case:
+
+```rust
+pub enum Direction {
+    ClientToBackend,   // serialized as "client_to_backend"
+    BackendToClient,   // serialized as "backend_to_client"
+    Unknown,           // serialized as "unknown"
+}
+
+pub enum DisconnectCause {
+    IdleTimeout,       // serialized as "idle_timeout"
+    RecvError,         // serialized as "recv_error"     (frontend recv failed)
+    BackendError,      // serialized as "backend_error"  (backend recv failed)
+    GracefulShutdown,  // serialized as "graceful_shutdown"
 }
 ```
 

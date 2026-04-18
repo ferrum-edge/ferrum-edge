@@ -512,3 +512,57 @@ fn invalid_deny_cidr_rule_rejects_creation() {
             .contains("invalid deny rule '10.0.0.0/99'"),
     );
 }
+
+// ── IPv6 zone identifier handling ───────────────────────────────────
+// A malformed X-Forwarded-For from an upstream proxy could surface a
+// client IP with a zone suffix (e.g. "fe80::1%eth0"). Stripping the zone
+// before matching prevents these IPs from being treated as `Unknown` and
+// silently bypassing deny rules.
+
+#[tokio::test]
+async fn ipv6_client_ip_with_zone_suffix_matches_deny_rule() {
+    let plugin = IpRestriction::new(&json!({
+        "deny": ["fe80::/10"],
+        "mode": "deny_first"
+    }))
+    .unwrap();
+
+    let mut ctx = create_context_with_ip("fe80::1%eth0");
+    let result = plugin.on_request_received(&mut ctx).await;
+    plugin_utils::assert_reject(result, Some(403));
+}
+
+#[tokio::test]
+async fn ipv6_client_ip_with_zone_suffix_matches_exact_allow_rule() {
+    let plugin = IpRestriction::new(&json!({
+        "allow": ["fe80::1"]
+    }))
+    .unwrap();
+
+    let mut ctx = create_context_with_ip("fe80::1%wlan0");
+    let result = plugin.on_request_received(&mut ctx).await;
+    plugin_utils::assert_continue(result);
+}
+
+#[tokio::test]
+async fn ipv6_rule_with_zone_suffix_is_normalized_to_address() {
+    // Operators should not put zones in rules, but if they do, the suffix is
+    // stripped at parse time so the rule still matches the bare IPv6 address.
+    let plugin = IpRestriction::new(&json!({
+        "allow": ["fe80::1%eth0"]
+    }))
+    .unwrap();
+
+    let mut ctx = create_context_with_ip("fe80::1");
+    let result = plugin.on_request_received(&mut ctx).await;
+    plugin_utils::assert_continue(result);
+}
+
+#[test]
+fn ipv4_too_many_octets_is_rejected() {
+    // Defensive — make sure the optimized parser still catches over-long IPv4.
+    let result = IpRestriction::new(&json!({
+        "allow": ["1.2.3.4.5"]
+    }));
+    assert!(result.is_err());
+}

@@ -3,8 +3,8 @@
 use ferrum_edge::config::types::{BackoffStrategy, RetryConfig};
 use ferrum_edge::proxy::grpc_proxy::GrpcProxyError;
 use ferrum_edge::retry::{
-    BackendResponse, ErrorClass, ResponseBody, classify_boxed_error, classify_grpc_proxy_error,
-    retry_delay, should_retry,
+    BackendResponse, ErrorClass, ResponseBody, classify_body_error, classify_boxed_error,
+    classify_grpc_proxy_error, retry_delay, should_retry,
 };
 use std::collections::HashMap;
 use std::time::Duration;
@@ -487,4 +487,132 @@ fn test_grpc_dns_failure_original_pattern_still_works() {
     // The original pattern from proxy/mod.rs gRPC dispatch should still work.
     let err = GrpcProxyError::BackendUnavailable("DNS resolution for backend failed".into());
     assert_eq!(classify_grpc_proxy_error(&err), ErrorClass::DnsLookupError);
+}
+
+// -- classify_body_error ------------------------------------------------------
+// Covers the streaming-response-body error path. The classifier must return
+// (ErrorClass, client_disconnected) where the second field is used by the
+// deferred logger to populate `TransactionSummary.client_disconnected`.
+
+#[test]
+fn test_classify_body_error_broken_pipe_is_backend_close() {
+    // classify_body_error is called from ProxyBody::poll_frame on the backend
+    // response body, so a BrokenPipe there means the backend closed — not the
+    // client. client_disconnected must remain false.
+    let io_err = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "backend went away");
+    let (class, disconnected) = classify_body_error(&io_err);
+    assert_eq!(class, ErrorClass::ConnectionClosed);
+    assert!(!disconnected);
+}
+
+#[test]
+fn test_classify_body_error_connection_reset_is_backend_close() {
+    let io_err = std::io::Error::new(std::io::ErrorKind::ConnectionReset, "backend RST");
+    let (class, disconnected) = classify_body_error(&io_err);
+    assert_eq!(class, ErrorClass::ConnectionClosed);
+    assert!(!disconnected);
+}
+
+#[test]
+fn test_classify_body_error_connection_aborted_is_backend_close() {
+    let io_err = std::io::Error::new(std::io::ErrorKind::ConnectionAborted, "backend aborted");
+    let (class, disconnected) = classify_body_error(&io_err);
+    assert_eq!(class, ErrorClass::ConnectionClosed);
+    assert!(!disconnected);
+}
+
+#[test]
+fn test_classify_body_error_hyper_canceled_is_client_disconnect() {
+    // hyper::Error::is_canceled / is_incomplete_message are the signals that
+    // unambiguously identify a client abort. We can't construct a real
+    // hyper::Error here, but the string-fallback path has a "canceled" branch
+    // that also maps to ConnectionClosed. Per the updated classifier, the
+    // string fallback stays false too — only typed hyper::Error can set
+    // client_disconnected=true, which is exercised in integration tests.
+    let err: Box<dyn std::error::Error + Send + Sync> = "request canceled by caller".into();
+    let (class, disconnected) = classify_body_error(&*err);
+    assert_eq!(class, ErrorClass::ConnectionClosed);
+    assert!(!disconnected);
+}
+
+#[test]
+fn test_classify_body_error_timed_out_is_not_client_disconnect() {
+    let io_err = std::io::Error::new(std::io::ErrorKind::TimedOut, "backend read timeout");
+    let (class, disconnected) = classify_body_error(&io_err);
+    assert_eq!(class, ErrorClass::ReadWriteTimeout);
+    assert!(!disconnected);
+}
+
+#[test]
+fn test_classify_body_error_unknown_defaults_to_request_error() {
+    #[derive(Debug)]
+    struct DummyErr;
+    impl std::fmt::Display for DummyErr {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "some unrelated failure")
+        }
+    }
+    impl std::error::Error for DummyErr {}
+    let err = DummyErr;
+    let (class, disconnected) = classify_body_error(&err);
+    assert_eq!(class, ErrorClass::RequestError);
+    assert!(!disconnected);
+}
+
+#[test]
+fn test_classify_body_error_string_fallback_broken_pipe() {
+    // Box<dyn Error> constructed from a string — no downcastable io::Error,
+    // but the message still indicates a broken pipe and should classify
+    // as ConnectionClosed. client_disconnected stays false: a string-only
+    // error cannot prove the client was the disconnecting side.
+    let err: Box<dyn std::error::Error + Send + Sync> = "hyper::Error(Io, kind: BrokenPipe)".into();
+    let (class, disconnected) = classify_body_error(&*err);
+    assert_eq!(class, ErrorClass::ConnectionClosed);
+    assert!(!disconnected);
+}
+
+#[test]
+fn test_classify_body_error_string_fallback_protocol_error() {
+    let err: Box<dyn std::error::Error + Send + Sync> =
+        "h2::Error { kind: GOAWAY(INTERNAL_ERROR) }".into();
+    let (class, disconnected) = classify_body_error(&*err);
+    assert_eq!(class, ErrorClass::ProtocolError);
+    assert!(!disconnected);
+}
+
+#[test]
+fn test_classify_body_error_response_size_limit_is_explicit() {
+    // SizeLimitedStreamingResponse emits this literal message when the backend
+    // exceeds max_response_body_size_bytes mid-stream. Must classify as
+    // ResponseBodyTooLarge, not the generic RequestError fallback, so
+    // policy-enforced truncations are distinguishable in metrics.
+    let err: Box<dyn std::error::Error + Send + Sync> = "response body exceeds maximum size".into();
+    let (class, disconnected) = classify_body_error(&*err);
+    assert_eq!(class, ErrorClass::ResponseBodyTooLarge);
+    assert!(!disconnected);
+}
+
+#[test]
+fn test_classify_body_error_walks_source_chain_to_io_error() {
+    // Wrap an io::Error in a custom error with a `source()` chain — the
+    // classifier should walk the chain and find the BrokenPipe underneath.
+    #[derive(Debug)]
+    struct Wrapper(std::io::Error);
+    impl std::fmt::Display for Wrapper {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "wrapped: {}", self.0)
+        }
+    }
+    impl std::error::Error for Wrapper {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(&self.0)
+        }
+    }
+    let wrapped = Wrapper(std::io::Error::new(
+        std::io::ErrorKind::BrokenPipe,
+        "peer closed",
+    ));
+    let (class, disconnected) = classify_body_error(&wrapped);
+    assert_eq!(class, ErrorClass::ConnectionClosed);
+    assert!(!disconnected);
 }

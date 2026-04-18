@@ -182,18 +182,18 @@ async fn test_http2_pool_backend_unavailable() {
         "Expected error connecting to unavailable backend"
     );
     match result.unwrap_err() {
-        Http2PoolError::BackendUnavailable(msg) => {
+        Http2PoolError::BackendUnavailable { message: msg, .. } => {
             assert!(
                 msg.contains("Connection refused") || msg.contains("connect"),
                 "Expected connection refusal message, got: {}",
                 msg
             );
         }
-        Http2PoolError::BackendTimeout(msg) => {
+        Http2PoolError::BackendTimeout { message: msg, .. } => {
             // Also acceptable — some environments timeout instead of refuse on port 1
             assert!(!msg.is_empty());
         }
-        Http2PoolError::Internal(msg) => {
+        Http2PoolError::Internal { message: msg, .. } => {
             panic!(
                 "Expected BackendUnavailable or BackendTimeout, got Internal: {}",
                 msg
@@ -222,18 +222,18 @@ async fn test_http2_pool_backend_timeout() {
     let result = pool.get_sender(&proxy, &dns_cache).await;
     assert!(result.is_err(), "Expected timeout error");
     match result.unwrap_err() {
-        Http2PoolError::BackendTimeout(msg) => {
+        Http2PoolError::BackendTimeout { message: msg, .. } => {
             assert!(
                 msg.contains("timeout") || msg.contains("Timeout"),
                 "Expected timeout message, got: {}",
                 msg
             );
         }
-        Http2PoolError::BackendUnavailable(msg) => {
+        Http2PoolError::BackendUnavailable { message: msg, .. } => {
             // On some systems, non-routable may give a different error
             assert!(!msg.is_empty());
         }
-        Http2PoolError::Internal(msg) => {
+        Http2PoolError::Internal { message: msg, .. } => {
             panic!("Expected BackendTimeout, got Internal: {}", msg);
         }
     }

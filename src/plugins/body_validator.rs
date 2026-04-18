@@ -305,22 +305,23 @@ impl BodyValidator {
 
         // --- string constraints ---
         if let Some(s) = data.as_str() {
+            // JSON Schema specifies minLength/maxLength count Unicode code points,
+            // not bytes (RFC 8927 / JSON Schema Validation §6.3).
+            let char_count = s.chars().count() as u64;
             if let Some(min) = schema.get("minLength").and_then(|v| v.as_u64())
-                && (s.len() as u64) < min
+                && char_count < min
             {
                 return Err(format!(
-                    "String length {} is less than minLength {}",
-                    s.len(),
-                    min
+                    "String length {} (code points) is less than minLength {}",
+                    char_count, min
                 ));
             }
             if let Some(max) = schema.get("maxLength").and_then(|v| v.as_u64())
-                && (s.len() as u64) > max
+                && char_count > max
             {
                 return Err(format!(
-                    "String length {} exceeds maxLength {}",
-                    s.len(),
-                    max
+                    "String length {} (code points) exceeds maxLength {}",
+                    char_count, max
                 ));
             }
             if let Some(pattern) = schema.get("pattern").and_then(|v| v.as_str()) {
@@ -635,11 +636,12 @@ impl BodyValidator {
             // Regular tag: <name ... /> or <name ... >
             match find_byte(&bytes[i + 1..], b'>') {
                 Some(end) => {
-                    // Check if self-closing (ends with />)
+                    // Check if self-closing (ends with />, allowing whitespace between
+                    // attributes and the slash, e.g., <name attr="v" />). Walk
+                    // backward from `>` skipping XML whitespace per W3C XML 1.0 §2.3.
                     let tag_end = i + 1 + end;
-                    if tag_end > 0 && bytes[tag_end - 1] == b'/' {
-                        // Self-closing tag — no depth change
-                    } else {
+                    let self_closing = is_self_closing_tag(bytes, i + 1, tag_end);
+                    if !self_closing {
                         depth += 1;
                     }
                     i = tag_end + 1;
@@ -904,6 +906,30 @@ fn find_byte(haystack: &[u8], needle: u8) -> Option<usize> {
     haystack.iter().position(|&b| b == needle)
 }
 
+/// Returns true if the bytes between `start_inclusive` (first byte after `<`)
+/// and `tag_end_exclusive` (position of the `>`) form a self-closing XML tag
+/// (i.e., end with `/`, optionally followed by XML whitespace before the `>`).
+///
+/// Per W3C XML 1.0 §2.3, XML whitespace is `#x20 | #x9 | #xD | #xA`.
+/// This correctly classifies `<foo/>`, `<foo />`, `<foo attr="v" />`,
+/// `<foo\n/>` as self-closing while keeping plain `<foo>` as opening.
+/// An empty tag `<>` is treated as opening (depth-inc) for backward compatibility.
+fn is_self_closing_tag(bytes: &[u8], start_inclusive: usize, tag_end_exclusive: usize) -> bool {
+    if tag_end_exclusive <= start_inclusive {
+        return false;
+    }
+    let mut probe = tag_end_exclusive;
+    while probe > start_inclusive {
+        probe -= 1;
+        match bytes[probe] {
+            b' ' | b'\t' | b'\r' | b'\n' => continue,
+            b'/' => return true,
+            _ => return false,
+        }
+    }
+    false
+}
+
 /// Validate common string formats (subset of JSON Schema format vocabulary).
 fn validate_format(s: &str, format_name: &str) -> Result<(), String> {
     match format_name {
@@ -1153,7 +1179,7 @@ impl Plugin for BodyValidator {
 
     async fn on_final_response_body(
         &self,
-        _ctx: &mut RequestContext,
+        ctx: &mut RequestContext,
         _response_status: u16,
         response_headers: &HashMap<String, String>,
         body: &[u8],
@@ -1174,13 +1200,25 @@ impl Plugin for BodyValidator {
             if !self.has_protobuf_response_validation || body.is_empty() {
                 return PluginResult::Continue;
             }
-            // For response, use the request path stored in ctx metadata
-            // The response headers may contain :path from the original request
-            let grpc_path = response_headers
-                .get(":path")
-                .map(|s| s.as_str())
-                .unwrap_or("");
-            let descriptor = match self.get_response_descriptor(grpc_path) {
+            // Resolve the gRPC method path from the request, NOT response headers.
+            // Backends never echo `:path` in responses, so reading response_headers
+            // would always miss per-method `protobuf_method_messages` overrides.
+            // Prefer `grpc_full_method` set by `grpc_method_router` when available
+            // (already validated as a well-formed `Service/Method`); otherwise fall
+            // back to `ctx.path` which is the inbound request path including the
+            // leading `/`. Both forms are accepted as keys in the descriptor map.
+            let grpc_path: String = ctx
+                .metadata
+                .get("grpc_full_method")
+                .map(|m| {
+                    if m.starts_with('/') {
+                        m.clone()
+                    } else {
+                        format!("/{}", m)
+                    }
+                })
+                .unwrap_or_else(|| ctx.path.clone());
+            let descriptor = match self.get_response_descriptor(&grpc_path) {
                 Some(d) => d,
                 None => return PluginResult::Continue,
             };

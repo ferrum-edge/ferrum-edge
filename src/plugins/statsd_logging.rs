@@ -241,6 +241,13 @@ fn format_http_metrics(
 
     // Counter: status code bucket
     let _ = writeln!(buf, "{prefix}.request.status.{status_class}:1|c{tags}");
+
+    // Counter: client disconnect (client aborted before receiving the full
+    // response). Only emitted when the flag is set so that every request
+    // doesn't carry a zero-valued counter through the line protocol.
+    if summary.client_disconnected {
+        let _ = writeln!(buf, "{prefix}.request.client_disconnect:1|c{tags}");
+    }
 }
 
 /// Format stream transaction metrics as StatsD line protocol.
@@ -259,8 +266,25 @@ fn format_stream_metrics(
         "false"
     };
 
+    // Bounded-cardinality enum values from DisconnectCause / Direction.
+    // Falls back to "unknown" when the field is None so dashboards can filter
+    // on a consistent value set.
+    let cause_tag = match summary.disconnect_cause {
+        Some(crate::plugins::DisconnectCause::IdleTimeout) => "idle_timeout",
+        Some(crate::plugins::DisconnectCause::RecvError) => "recv_error",
+        Some(crate::plugins::DisconnectCause::BackendError) => "backend_error",
+        Some(crate::plugins::DisconnectCause::GracefulShutdown) => "graceful_shutdown",
+        None => "unknown",
+    };
+    let direction_tag = match summary.disconnect_direction {
+        Some(crate::plugins::Direction::ClientToBackend) => "client_to_backend",
+        Some(crate::plugins::Direction::BackendToClient) => "backend_to_client",
+        Some(crate::plugins::Direction::Unknown) => "unknown",
+        None => "unknown",
+    };
+
     let tags = format!(
-        "|#protocol:{protocol},proxy:{proxy_tag},error:{has_error}{extra}",
+        "|#protocol:{protocol},proxy:{proxy_tag},error:{has_error},cause:{cause_tag},direction:{direction_tag}{extra}",
         extra = if global_tags.is_empty() {
             String::new()
         } else {
@@ -291,6 +315,11 @@ fn format_stream_metrics(
         "{prefix}.stream.bytes_received:{}|g{tags}",
         summary.bytes_received,
     );
+
+    // Counter: stream disconnect, labelled by cause and direction via the
+    // composed `tags` above. Always emitted (including on clean shutdowns)
+    // so dashboards can compute graceful-vs-error ratios directly.
+    let _ = writeln!(buf, "{prefix}.stream.disconnect:1|c{tags}");
 }
 
 /// Resolve the StatsD hostname to an IP address. Uses the gateway's DNS cache

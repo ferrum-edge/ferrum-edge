@@ -30,6 +30,9 @@ fn make_full_summary() -> TransactionSummary {
         response_streamed: false,
         client_disconnected: false,
         error_class: None,
+        body_error_class: None,
+        body_completed: false,
+        bytes_streamed_to_client: 0,
         mirror: false,
         metadata: HashMap::new(),
     }
@@ -413,6 +416,8 @@ fn make_stream_summary() -> StreamTransactionSummary {
         bytes_received: 4096,
         connection_error: None,
         error_class: None,
+        disconnect_direction: None,
+        disconnect_cause: None,
         timestamp_connected: "2026-03-26T12:00:00Z".to_string(),
         timestamp_disconnected: "2026-03-26T12:00:01.5Z".to_string(),
         sni_hostname: None,

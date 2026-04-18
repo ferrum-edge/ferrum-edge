@@ -25,6 +25,108 @@ use tracing::debug;
 
 use crate::config::types::Proxy;
 
+/// Classify an HTTP/3 backend error into the shared `ErrorClass` taxonomy.
+///
+/// Walks the error source chain looking for recognizable `quinn::ConnectionError`
+/// variants, and falls back to string heuristics for `h3::Error` wrappers and
+/// anyhow chains. Without this, H3-specific errors previously landed in the
+/// transaction log with no `error_class` because `classify_boxed_error` only
+/// knew about reqwest/hyper patterns.
+pub fn classify_http3_error(err: &(dyn std::error::Error + 'static)) -> crate::retry::ErrorClass {
+    use crate::retry::ErrorClass;
+
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(node) = current {
+        if let Some(ce) = node.downcast_ref::<quinn::ConnectionError>() {
+            return match ce {
+                quinn::ConnectionError::TimedOut => ErrorClass::ConnectionTimeout,
+                quinn::ConnectionError::Reset => ErrorClass::ConnectionReset,
+                quinn::ConnectionError::ApplicationClosed(_)
+                | quinn::ConnectionError::ConnectionClosed(_)
+                | quinn::ConnectionError::LocallyClosed => ErrorClass::ConnectionClosed,
+                quinn::ConnectionError::VersionMismatch
+                | quinn::ConnectionError::TransportError(_) => ErrorClass::ProtocolError,
+                quinn::ConnectionError::CidsExhausted => ErrorClass::ConnectionPoolError,
+            };
+        }
+        if let Some(ce) = node.downcast_ref::<quinn::ConnectError>() {
+            return match ce {
+                quinn::ConnectError::EndpointStopping
+                | quinn::ConnectError::CidsExhausted
+                | quinn::ConnectError::NoDefaultClientConfig => ErrorClass::ConnectionPoolError,
+                quinn::ConnectError::UnsupportedVersion => ErrorClass::ProtocolError,
+                quinn::ConnectError::InvalidRemoteAddress(_)
+                | quinn::ConnectError::InvalidServerName(_) => ErrorClass::DnsLookupError,
+            };
+        }
+        if let Some(io) = node.downcast_ref::<std::io::Error>() {
+            if matches!(io.raw_os_error(), Some(99) | Some(49) | Some(10049)) {
+                return ErrorClass::PortExhaustion;
+            }
+            match io.kind() {
+                std::io::ErrorKind::TimedOut => return ErrorClass::ConnectionTimeout,
+                std::io::ErrorKind::ConnectionRefused => return ErrorClass::ConnectionRefused,
+                std::io::ErrorKind::ConnectionReset => return ErrorClass::ConnectionReset,
+                std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionAborted => {
+                    return ErrorClass::ConnectionClosed;
+                }
+                // Generic kinds (Other, etc.) commonly wrap QUIC/H3 typed
+                // errors — keep walking the source chain so typed variants
+                // and string heuristics can still classify them.
+                _ => {}
+            }
+        }
+        current = node.source();
+    }
+
+    // Fallback string heuristics for h3::Error and anyhow-wrapped errors that
+    // don't expose a typed chain.
+    let msg = err.to_string().to_ascii_lowercase();
+    if crate::retry::is_port_exhaustion_message(&msg) {
+        ErrorClass::PortExhaustion
+    } else if msg.contains("dns") || msg.contains("resolve") {
+        ErrorClass::DnsLookupError
+    } else if msg.contains("tls") || msg.contains("certificate") || msg.contains("handshake") {
+        ErrorClass::TlsError
+    } else if msg.contains("timed out") || msg.contains("timeout") {
+        if msg.contains("connect") {
+            ErrorClass::ConnectionTimeout
+        } else {
+            ErrorClass::ReadWriteTimeout
+        }
+    } else if msg.contains("refused") {
+        ErrorClass::ConnectionRefused
+    // IMPORTANT: H3/QUIC stream-protocol markers must be checked BEFORE the
+    // generic "reset" / "closed" substrings below. `RESET_STREAM` (an H3
+    // frame that aborts a single stream, not the whole connection) contains
+    // "reset", and `stream_closed` contains "closed" — classifying these as
+    // `ConnectionReset` / `ConnectionClosed` would hide the fact that they
+    // are protocol-level stream errors. Also do NOT use the bare substring
+    // "stream" here — it would match "upstream" (as in "upstream target",
+    // "upstream id") and mislabel load-balancer / backend-selection failures
+    // as protocol errors. Keep the matches anchored to tokens h3/quinn
+    // actually emit.
+    } else if msg.contains("goaway")
+        || msg.contains("protocol")
+        || msg.contains("reset_stream")
+        || msg.contains("stream reset")
+        || msg.contains("stream id")
+        || msg.contains("stream_id")
+        || msg.contains("stream_closed")
+        || msg.contains("stream closed")
+        || msg.contains("h3::")
+        || msg.contains("quic")
+    {
+        ErrorClass::ProtocolError
+    } else if msg.contains("reset") {
+        ErrorClass::ConnectionReset
+    } else if msg.contains("broken pipe") || msg.contains("closed") {
+        ErrorClass::ConnectionClosed
+    } else {
+        ErrorClass::RequestError
+    }
+}
+
 /// Type alias for the h3 send request handle.
 type H3SendRequest = h3::client::SendRequest<h3_quinn::OpenStreams, bytes::Bytes>;
 

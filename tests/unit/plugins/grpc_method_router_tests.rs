@@ -459,6 +459,84 @@ fn test_empty_config_returns_error() {
     assert!(err.contains("no rules configured"), "got: {err}");
 }
 
+// ── Constructor validation: limit_by ──
+
+#[test]
+fn test_unknown_limit_by_rejected() {
+    let result = create_plugin(
+        "grpc_method_router",
+        &json!({
+            "deny_methods": ["/blocked/X"],
+            "limit_by": "user"
+        }),
+    );
+    let err = result.err().expect("unknown limit_by must be rejected");
+    assert!(err.contains("'limit_by' must be one of"), "got: {err}");
+}
+
+#[test]
+fn test_limit_by_consumer_accepted() {
+    let result = create_plugin(
+        "grpc_method_router",
+        &json!({
+            "deny_methods": ["/blocked/X"],
+            "limit_by": "consumer"
+        }),
+    );
+    assert!(result.is_ok());
+}
+
+// ── Constructor validation: rate-limit specs ──
+
+#[test]
+fn test_zero_window_seconds_rejected() {
+    let result = create_plugin(
+        "grpc_method_router",
+        &json!({
+            "method_rate_limits": {
+                "/svc/M": { "max_requests": 5, "window_seconds": 0 }
+            }
+        }),
+    );
+    let err = result.err().expect("window_seconds=0 should be rejected");
+    assert!(
+        err.contains("'window_seconds' must be greater than zero"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn test_missing_max_requests_rejected() {
+    let result = create_plugin(
+        "grpc_method_router",
+        &json!({
+            "method_rate_limits": {
+                "/svc/M": { "window_seconds": 60 }
+            }
+        }),
+    );
+    let err = result
+        .err()
+        .expect("missing max_requests should be rejected, not silently dropped");
+    assert!(err.contains("'max_requests' is required"), "got: {err}");
+}
+
+#[test]
+fn test_missing_window_seconds_rejected() {
+    let result = create_plugin(
+        "grpc_method_router",
+        &json!({
+            "method_rate_limits": {
+                "/svc/M": { "max_requests": 5 }
+            }
+        }),
+    );
+    let err = result
+        .err()
+        .expect("missing window_seconds should be rejected, not silently dropped");
+    assert!(err.contains("'window_seconds' is required"), "got: {err}");
+}
+
 // ── Path edge cases ──
 
 #[tokio::test]

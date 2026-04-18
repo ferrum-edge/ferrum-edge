@@ -18,7 +18,7 @@ use tracing::warn;
 /// transactions without digging through raw error strings.
 ///
 /// Serializes as a lowercase_snake_case string (e.g. `"connection_timeout"`).
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorClass {
     /// TCP connect timed out before a connection was established.
@@ -145,7 +145,38 @@ pub fn classify_grpc_proxy_error(e: &crate::proxy::grpc_proxy::GrpcProxyError) -
 /// Classify a generic boxed error (e.g. from WebSocket connections) into an
 /// `ErrorClass` by inspecting its Display and Debug representations. Called
 /// on the error path only.
-pub fn classify_boxed_error(e: &(dyn std::error::Error + Send + Sync)) -> ErrorClass {
+pub fn classify_boxed_error(e: &(dyn std::error::Error + Send + Sync + 'static)) -> ErrorClass {
+    // Walk the source chain for typed io::Error / hyper::Error first so
+    // classification is stable regardless of Display wording.
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(e);
+    while let Some(err) = current {
+        if let Some(io_err) = err.downcast_ref::<std::io::Error>() {
+            match io_err.kind() {
+                std::io::ErrorKind::TimedOut => return ErrorClass::ReadWriteTimeout,
+                std::io::ErrorKind::ConnectionRefused => return ErrorClass::ConnectionRefused,
+                std::io::ErrorKind::ConnectionReset => return ErrorClass::ConnectionReset,
+                std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionAborted => {
+                    return ErrorClass::ConnectionClosed;
+                }
+                _ => {}
+            }
+            if let Some(raw) = io_err.raw_os_error()
+                && (raw == 99 || raw == 49 || raw == 10049)
+            {
+                return ErrorClass::PortExhaustion;
+            }
+        }
+        if let Some(hyper_err) = err.downcast_ref::<hyper::Error>() {
+            if hyper_err.is_timeout() {
+                return ErrorClass::ReadWriteTimeout;
+            }
+            if hyper_err.is_incomplete_message() {
+                return ErrorClass::ConnectionClosed;
+            }
+        }
+        current = err.source();
+    }
+
     let error_str = format!("{}", e);
     let debug_str = format!("{:?}", e);
 
@@ -261,6 +292,100 @@ pub fn classify_reqwest_error(e: &reqwest::Error) -> ErrorClass {
     }
 
     ErrorClass::RequestError
+}
+
+/// Classify an error that was emitted by a streaming response body wrapper
+/// (i.e. after response headers have been sent to the client).
+///
+/// Returns `(ErrorClass, client_disconnected)` where `client_disconnected`
+/// is `true` only when the error chain specifically identifies the client as
+/// the disconnecting side — i.e. hyper `is_canceled`. `is_incomplete_message`
+/// indicates backend truncation and is classified as `ConnectionClosed` with
+/// `client_disconnected=false`.
+/// Raw IO resets (`BrokenPipe`/`ConnectionReset`/`ConnectionAborted`) are
+/// returned with `client_disconnected=false` because in this classifier's
+/// context (`ProxyBody::poll_frame` reading the backend response body) those
+/// signals identify a backend mid-stream failure, not a client abort.
+///
+/// Walks `source()` chain so wrapped `hyper::Error` and `io::Error`
+/// instances are inspected regardless of how many layers of `Box<dyn Error>`
+/// sit between them and the caller.
+pub fn classify_body_error(e: &(dyn std::error::Error + 'static)) -> (ErrorClass, bool) {
+    // Port exhaustion is extremely unlikely during body streaming, but walk
+    // the chain anyway so we never misclassify it as a generic error.
+    if is_port_exhaustion(e) {
+        return (ErrorClass::PortExhaustion, false);
+    }
+
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(e);
+    while let Some(err) = current {
+        if let Some(io_err) = err.downcast_ref::<std::io::Error>() {
+            match io_err.kind() {
+                std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted => {
+                    // Backend closed mid-stream — not a client disconnect.
+                    return (ErrorClass::ConnectionClosed, false);
+                }
+                std::io::ErrorKind::TimedOut => {
+                    return (ErrorClass::ReadWriteTimeout, false);
+                }
+                _ => {}
+            }
+        }
+        if let Some(hyper_err) = err.downcast_ref::<hyper::Error>() {
+            // `is_canceled` maps to a client-side cancellation (e.g. the client
+            // dropped the request future). `is_incomplete_message` means the
+            // backend truncated the response — not a client disconnect.
+            if hyper_err.is_canceled() {
+                return (ErrorClass::ClientDisconnect, true);
+            }
+            if hyper_err.is_incomplete_message() {
+                return (ErrorClass::ConnectionClosed, false);
+            }
+            if hyper_err.is_timeout() {
+                return (ErrorClass::ReadWriteTimeout, false);
+            }
+            // Fall through to string-based inspection below.
+        }
+        current = err.source();
+    }
+
+    // String fallback for boxed backend errors that don't expose typed
+    // downcasts (e.g. reqwest::Error wrapped in Box<dyn Error>).
+    let error_str = format!("{}", e);
+    let debug_str = format!("{:?}", e);
+    // Policy-enforced truncation from SizeLimitedStreamingResponse — classify
+    // explicitly so dashboards can distinguish response size-limit enforcement
+    // from generic backend/body errors.
+    if error_str.contains("response body exceeds maximum size") {
+        return (ErrorClass::ResponseBodyTooLarge, false);
+    }
+    if error_str.contains("broken pipe")
+        || debug_str.contains("BrokenPipe")
+        || error_str.contains("connection reset")
+        || debug_str.contains("ConnectionReset")
+        || error_str.contains("connection aborted")
+        || debug_str.contains("ConnectionAborted")
+        || error_str.contains("canceled")
+        || error_str.contains("closed before")
+    {
+        // Backend-side close during body streaming — keep client_disconnected
+        // false so backend resets don't inflate client-disconnect metrics.
+        return (ErrorClass::ConnectionClosed, false);
+    }
+    if error_str.contains("timed out") || debug_str.contains("TimedOut") {
+        return (ErrorClass::ReadWriteTimeout, false);
+    }
+    if debug_str.contains("GOAWAY")
+        || debug_str.contains("RESET_STREAM")
+        || debug_str.contains("h2::")
+        || debug_str.contains("h3::")
+    {
+        return (ErrorClass::ProtocolError, false);
+    }
+
+    (ErrorClass::RequestError, false)
 }
 
 /// The response body, either fully buffered or still streaming from the backend.

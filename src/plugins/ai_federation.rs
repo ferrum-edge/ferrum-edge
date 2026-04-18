@@ -1660,7 +1660,28 @@ impl Plugin for AiFederation {
                         "ai_federation: request completed"
                     );
 
-                    let response_bytes = serde_json::to_vec(&normalized).unwrap_or_default();
+                    let response_bytes = match serde_json::to_vec(&normalized) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            // Practically unreachable: `normalized` is built from
+                            // `serde_json::json!()` macros over plain primitives,
+                            // so serialization cannot fail. Returning a 502 with
+                            // a structured error keeps callers from receiving an
+                            // empty-body 200 in the impossible case.
+                            warn!(
+                                provider = %provider.name,
+                                error = %e,
+                                "ai_federation: failed to serialize normalized response"
+                            );
+                            return self.error_response(
+                                502,
+                                &format!(
+                                    "Provider '{}' response serialization failed: {e}",
+                                    provider.name
+                                ),
+                            );
+                        }
+                    };
                     let mut resp_headers = HashMap::new();
                     resp_headers.insert("content-type".to_string(), "application/json".to_string());
 

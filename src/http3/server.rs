@@ -1180,11 +1180,9 @@ async fn handle_h3_request(
                     request_user_agent: proxy_headers.get("user-agent").cloned(),
                     // Backend connection failed before any streaming began — the 502
                     // response body is built and sent synchronously below.
-                    response_streamed: false,
-                    client_disconnected: false,
                     error_class: Some(h3_error_class),
-                    mirror: false,
                     metadata: ctx.metadata.clone(),
+                    ..TransactionSummary::default()
                 };
                 crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
                 record_request(&state, 502);
@@ -1271,8 +1269,12 @@ async fn handle_h3_request(
         let flush_timer = tokio::time::sleep(H3_FLUSH_INTERVAL);
         tokio::pin!(flush_timer);
         let mut stream_done = false;
+        let mut bytes_streamed: u64 = 0;
+        let mut client_disconnected = false;
+        let mut body_completed = false;
+        let mut body_error_class: Option<crate::retry::ErrorClass> = None;
 
-        loop {
+        'outer: loop {
             tokio::select! {
                 chunk_result = h3_resp.recv_stream.recv_data(), if !stream_done => {
                     match chunk_result {
@@ -1285,20 +1287,21 @@ async fn handle_h3_request(
                                         "Backend response exceeded {} byte limit during streaming",
                                         state.max_response_body_size_bytes
                                     );
-                                    stream.finish().await?;
-                                    crate::proxy::backend_dispatch::record_backend_outcome(
-                                        &state, &proxy, upstream_target.as_deref(),
-                                        cb_target_key.as_deref(), response_status, false,
-                                        backend_start.elapsed(),
-                                    );
-                                    record_request(&state, response_status);
-                                    return Ok(());
+                                    let _ = stream.finish().await;
+                                    body_error_class = Some(crate::retry::ErrorClass::ResponseBodyTooLarge);
+                                    break 'outer;
                                 }
                             }
                             coalesce_buf.extend_from_slice(chunk_bytes);
                             if coalesce_buf.len() >= H3_COALESCE_MIN_BYTES {
                                 let data = coalesce_buf.split().freeze();
-                                stream.send_data(data).await?;
+                                let data_len = data.len() as u64;
+                                if stream.send_data(data).await.is_err() {
+                                    client_disconnected = true;
+                                    body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
+                                    break 'outer;
+                                }
+                                bytes_streamed += data_len;
                                 flush_timer.as_mut().reset(tokio::time::Instant::now() + H3_FLUSH_INTERVAL);
                             }
                         }
@@ -1307,31 +1310,47 @@ async fn handle_h3_request(
                             error!("Error reading backend h3 response during streaming: {}", e);
                             if !coalesce_buf.is_empty() {
                                 let data = coalesce_buf.split().freeze();
-                                let _ = stream.send_data(data).await;
+                                let data_len = data.len() as u64;
+                                if stream.send_data(data).await.is_ok() {
+                                    bytes_streamed += data_len;
+                                }
                             }
-                            stream.finish().await?;
-                            crate::proxy::backend_dispatch::record_backend_outcome(
-                                &state, &proxy, upstream_target.as_deref(),
-                                cb_target_key.as_deref(), response_status, false,
-                                backend_start.elapsed(),
-                            );
-                            record_request(&state, response_status);
-                            return Ok(());
+                            let _ = stream.finish().await;
+                            body_error_class = Some(crate::http3::client::classify_http3_error(&e));
+                            break 'outer;
                         }
                     }
                 }
                 _ = &mut flush_timer, if !coalesce_buf.is_empty() && !stream_done => {
                     let data = coalesce_buf.split().freeze();
-                    stream.send_data(data).await?;
+                    let data_len = data.len() as u64;
+                    if stream.send_data(data).await.is_err() {
+                        client_disconnected = true;
+                        body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
+                        break 'outer;
+                    }
+                    bytes_streamed += data_len;
                     flush_timer.as_mut().reset(tokio::time::Instant::now() + H3_FLUSH_INTERVAL);
                 }
             }
             if stream_done {
                 if !coalesce_buf.is_empty() {
                     let data = coalesce_buf.split().freeze();
-                    stream.send_data(data).await?;
+                    let data_len = data.len() as u64;
+                    if stream.send_data(data).await.is_err() {
+                        client_disconnected = true;
+                        body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
+                        break 'outer;
+                    }
+                    bytes_streamed += data_len;
                 }
-                stream.finish().await?;
+                match stream.finish().await {
+                    Ok(_) => body_completed = true,
+                    Err(_) => {
+                        client_disconnected = true;
+                        body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
+                    }
+                }
                 break;
             }
         }
@@ -1378,8 +1397,11 @@ async fn handle_h3_request(
             latency_gateway_overhead_ms: gateway_overhead_ms,
             request_user_agent: proxy_headers.get("user-agent").cloned(),
             response_streamed: true,
-            client_disconnected: false,
+            client_disconnected,
             error_class: None,
+            body_error_class,
+            body_completed,
+            bytes_streamed_to_client: bytes_streamed,
             mirror: false,
             metadata: ctx.metadata.clone(),
         };
@@ -1491,7 +1513,7 @@ async fn handle_h3_request(
         )
         .await;
 
-        let (response_status, _response_headers, h3_error_class) = match streaming_result {
+        let h3_stream_result = match streaming_result {
             Ok(result) => result,
             Err(e) => {
                 // Stream may already have partial data sent — log and return
@@ -1499,6 +1521,9 @@ async fn handle_h3_request(
                 return Err(e);
             }
         };
+
+        let response_status = h3_stream_result.status;
+        let h3_error_class = h3_stream_result.error_class;
 
         // Record outcome across CB, passive health, latency, and connection tracking
         crate::proxy::backend_dispatch::record_backend_outcome(
@@ -1544,8 +1569,11 @@ async fn handle_h3_request(
             latency_gateway_overhead_ms: gateway_overhead_ms,
             request_user_agent: proxy_headers.get("user-agent").cloned(),
             response_streamed: true,
-            client_disconnected: false,
+            client_disconnected: h3_stream_result.client_disconnected,
             error_class: h3_error_class,
+            body_error_class: h3_stream_result.body_error_class,
+            body_completed: h3_stream_result.body_completed,
+            bytes_streamed_to_client: h3_stream_result.bytes_streamed,
             mirror: false,
             metadata: ctx.metadata.clone(),
         };
@@ -1594,7 +1622,7 @@ async fn handle_h3_request(
                     body: crate::retry::ResponseBody::Buffered(Vec::new()),
                     headers: HashMap::new(),
                     backend_resolved_ip: None,
-                    error_class: err_class.clone(),
+                    error_class: err_class,
                 },
                 attempt,
             ) {
@@ -1863,11 +1891,9 @@ async fn handle_h3_request(
             latency_plugin_external_io_ms: plugin_external_io_ms,
             latency_gateway_overhead_ms: gateway_overhead_ms,
             request_user_agent: proxy_headers.get("user-agent").cloned(),
-            response_streamed: false,
-            client_disconnected: false,
             error_class: h3_error_class,
-            mirror: false,
             metadata: ctx.metadata.clone(),
+            ..TransactionSummary::default()
         };
 
         crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
@@ -2049,27 +2075,35 @@ fn inject_sticky_cookie(
 }
 
 fn classify_h3_error(e: &anyhow::Error) -> crate::retry::ErrorClass {
-    // Single allocation: write the error message directly into a lowercase String.
-    let mut msg = e.to_string();
-    msg.make_ascii_lowercase();
-    if msg.contains("dns") || msg.contains("resolution") {
-        crate::retry::ErrorClass::DnsLookupError
-    } else if msg.contains("timed out") || msg.contains("timeout") {
-        crate::retry::ErrorClass::ConnectionTimeout
-    } else if msg.contains("refused") {
-        crate::retry::ErrorClass::ConnectionRefused
-    } else if msg.contains("reset") {
-        crate::retry::ErrorClass::ConnectionReset
-    } else if msg.contains("tls") || msg.contains("certificate") || msg.contains("handshake") {
-        crate::retry::ErrorClass::TlsError
-    } else {
-        crate::retry::ErrorClass::ConnectionClosed
-    }
+    // Delegate to the shared HTTP/3 classifier, which walks the source chain
+    // for typed quinn::ConnectionError / quinn::ConnectError / io::Error
+    // variants before falling back to string heuristics. This gives more
+    // accurate classifications (e.g., distinguishing ApplicationClosed from
+    // a generic "closed" match) than the previous string-only approach.
+    crate::http3::client::classify_http3_error(e.as_ref())
+}
+
+/// Outcome of a streaming H3 proxy operation.
+///
+/// Carries pre-stream fields (status/error_class) and body-streaming outcome
+/// fields so the transaction log at the call site reflects the actual
+/// client-visible result, including mid-stream disconnects and partial byte
+/// counts. Response headers are flushed to the client before this struct is
+/// constructed, so they are intentionally not stored here — the call sites
+/// that need them already hold a local copy via `response_headers`.
+struct H3StreamResult {
+    status: u16,
+    error_class: Option<crate::retry::ErrorClass>,
+    body_completed: bool,
+    bytes_streamed: u64,
+    client_disconnected: bool,
+    body_error_class: Option<crate::retry::ErrorClass>,
 }
 
 /// Streaming proxy path: sends backend response chunks directly to the H3 client
 /// as they arrive, without collecting the full body in memory. Returns the status,
-/// final response headers, and error class after the stream completes.
+/// final response headers, error class, and body-streaming outcome after the
+/// stream completes.
 ///
 /// Uses the native h3+quinn connection pool instead of reqwest.
 /// Response headers and `after_proxy` hooks are processed before streaming begins.
@@ -2089,14 +2123,7 @@ async fn proxy_to_backend_h3_streaming(
     plugins: &[Arc<dyn Plugin>],
     ctx: &mut RequestContext,
     plugin_execution_ns: &mut u64,
-) -> Result<
-    (
-        u16,
-        HashMap<String, String>,
-        Option<crate::retry::ErrorClass>,
-    ),
-    anyhow::Error,
-> {
+) -> Result<H3StreamResult, anyhow::Error> {
     let h3_headers = build_h3_backend_headers(proxy, headers, client_ip, state);
     let body = bytes::Bytes::from(body_bytes);
 
@@ -2134,7 +2161,14 @@ async fn proxy_to_backend_h3_streaming(
                 r#"{"error":"Backend unavailable"}"#
             };
             send_h3_response(h3_stream, StatusCode::BAD_GATEWAY, h3_error_body).await?;
-            return Ok((502, HashMap::new(), Some(h3_error_class)));
+            return Ok(H3StreamResult {
+                status: 502,
+                error_class: Some(h3_error_class),
+                body_completed: false,
+                bytes_streamed: 0,
+                client_disconnected: false,
+                body_error_class: None,
+            });
         }
     };
 
@@ -2172,11 +2206,14 @@ async fn proxy_to_backend_h3_streaming(
             r#"{"error":"Backend response body exceeds maximum size"}"#,
         )
         .await?;
-        return Ok((
-            502,
-            HashMap::new(),
-            Some(crate::retry::ErrorClass::ResponseBodyTooLarge),
-        ));
+        return Ok(H3StreamResult {
+            status: 502,
+            error_class: Some(crate::retry::ErrorClass::ResponseBodyTooLarge),
+            body_completed: false,
+            bytes_streamed: 0,
+            client_disconnected: false,
+            body_error_class: None,
+        });
     }
 
     // after_proxy hooks (run before streaming begins so headers can be modified)
@@ -2217,7 +2254,17 @@ async fn proxy_to_backend_h3_streaming(
     let resp = resp_builder
         .body(())
         .map_err(|e| anyhow::anyhow!("Failed to build HTTP/3 streaming response: {}", e))?;
-    h3_stream.send_response(resp).await?;
+    if h3_stream.send_response(resp).await.is_err() {
+        // Client QUIC stream is already gone — nothing streamed.
+        return Ok(H3StreamResult {
+            status: response_status,
+            error_class: None,
+            body_completed: false,
+            bytes_streamed: 0,
+            client_disconnected: true,
+            body_error_class: Some(crate::retry::ErrorClass::ClientDisconnect),
+        });
+    }
 
     // Stream response body chunks from the h3 backend recv_stream with adaptive
     // coalescing and time-based flushing. Uses a pinned Sleep to avoid
@@ -2227,8 +2274,13 @@ async fn proxy_to_backend_h3_streaming(
     let flush_timer = tokio::time::sleep(H3_FLUSH_INTERVAL);
     tokio::pin!(flush_timer);
     let mut stream_done = false;
+    let mut bytes_streamed: u64 = 0;
+    let mut client_disconnected = false;
+    let mut body_completed = false;
+    let mut body_error_class: Option<crate::retry::ErrorClass> = None;
+    let mut terminal_error_class: Option<crate::retry::ErrorClass> = None;
 
-    loop {
+    'outer: loop {
         tokio::select! {
             chunk_result = h3_resp.recv_stream.recv_data(), if !stream_done => {
                 match chunk_result {
@@ -2241,12 +2293,10 @@ async fn proxy_to_backend_h3_streaming(
                                     "Backend response exceeded {} byte limit during streaming",
                                     state.max_response_body_size_bytes
                                 );
-                                h3_stream.finish().await?;
-                                return Ok((
-                                    response_status,
-                                    response_headers,
-                                    Some(crate::retry::ErrorClass::ResponseBodyTooLarge),
-                                ));
+                                let _ = h3_stream.finish().await;
+                                terminal_error_class = Some(crate::retry::ErrorClass::ResponseBodyTooLarge);
+                                body_error_class = Some(crate::retry::ErrorClass::ResponseBodyTooLarge);
+                                break 'outer;
                             }
                         }
 
@@ -2254,7 +2304,13 @@ async fn proxy_to_backend_h3_streaming(
 
                         if coalesce_buf.len() >= H3_COALESCE_MIN_BYTES {
                             let data = coalesce_buf.split().freeze();
-                            h3_stream.send_data(data).await?;
+                            let data_len = data.len() as u64;
+                            if h3_stream.send_data(data).await.is_err() {
+                                client_disconnected = true;
+                                body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
+                                break 'outer;
+                            }
+                            bytes_streamed += data_len;
                             flush_timer.as_mut().reset(tokio::time::Instant::now() + H3_FLUSH_INTERVAL);
                         }
                     }
@@ -2265,17 +2321,29 @@ async fn proxy_to_backend_h3_streaming(
                         error!("Error reading backend h3 response during streaming: {}", e);
                         if !coalesce_buf.is_empty() {
                             let data = coalesce_buf.split().freeze();
-                            let _ = h3_stream.send_data(data).await;
+                            let data_len = data.len() as u64;
+                            if h3_stream.send_data(data).await.is_ok() {
+                                bytes_streamed += data_len;
+                            }
                         }
-                        h3_stream.finish().await?;
-                        return Ok((response_status, response_headers, None));
+                        let _ = h3_stream.finish().await;
+                        let class = crate::http3::client::classify_http3_error(&e);
+                        terminal_error_class = Some(class);
+                        body_error_class = Some(class);
+                        break 'outer;
                     }
                 }
             }
 
             _ = &mut flush_timer, if !coalesce_buf.is_empty() && !stream_done => {
                 let data = coalesce_buf.split().freeze();
-                h3_stream.send_data(data).await?;
+                let data_len = data.len() as u64;
+                if h3_stream.send_data(data).await.is_err() {
+                    client_disconnected = true;
+                    body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
+                    break 'outer;
+                }
+                bytes_streamed += data_len;
                 flush_timer.as_mut().reset(tokio::time::Instant::now() + H3_FLUSH_INTERVAL);
             }
         }
@@ -2283,14 +2351,33 @@ async fn proxy_to_backend_h3_streaming(
         if stream_done {
             if !coalesce_buf.is_empty() {
                 let data = coalesce_buf.split().freeze();
-                h3_stream.send_data(data).await?;
+                let data_len = data.len() as u64;
+                if h3_stream.send_data(data).await.is_err() {
+                    client_disconnected = true;
+                    body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
+                    break 'outer;
+                }
+                bytes_streamed += data_len;
             }
-            h3_stream.finish().await?;
+            match h3_stream.finish().await {
+                Ok(_) => body_completed = true,
+                Err(_) => {
+                    client_disconnected = true;
+                    body_error_class = Some(crate::retry::ErrorClass::ClientDisconnect);
+                }
+            }
             break;
         }
     }
 
-    Ok((response_status, response_headers, None))
+    Ok(H3StreamResult {
+        status: response_status,
+        error_class: terminal_error_class,
+        body_completed,
+        bytes_streamed,
+        client_disconnected,
+        body_error_class,
+    })
 }
 
 /// Proxy a request to the backend (buffered path — collects full response body).

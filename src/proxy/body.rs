@@ -26,11 +26,39 @@ pub type ProxyBodyError = Box<dyn std::error::Error + Send + Sync>;
 /// just the handler function scope. This is critical for H2/H3/gRPC streaming
 /// responses where hyper drives the body to completion *after*
 /// `handle_proxy_request` returns.
+///
+/// Optionally also carries a [`DeferredTransactionLogger`] that fires
+/// `log_with_mirror` when the body reaches a terminal state — success
+/// (Ready(None)), streaming error (Ready(Some(Err))), or Drop safety net
+/// (client disconnected before completion). `bytes_streamed_to_client` is
+/// tracked via an atomic counter incremented on each data frame.
 pub struct ProxyBody {
     kind: ProxyBodyKind,
     /// Dropped when hyper finishes sending the body (or the connection closes),
     /// decrementing `OverloadState.active_requests`.
     _request_guard: Option<crate::overload::RequestGuard>,
+    /// Deferred logger that fires after body completion, allowing
+    /// `TransactionSummary.body_completed` / `body_error_class` /
+    /// `client_disconnected` / `bytes_streamed_to_client` to reflect the
+    /// client-visible outcome rather than values at header-flush time.
+    logger: Option<Arc<crate::proxy::deferred_log::DeferredTransactionLogger>>,
+    /// Monotonic byte count streamed to the client. Updated on each
+    /// successful data frame **only when a deferred logger is attached** —
+    /// the counter has no consumer without a logger, so the hot path skips
+    /// the atomic RMW in that case. Read when firing the deferred logger
+    /// (on success, streaming error, or Drop client-disconnect safety net).
+    bytes_streamed: AtomicU64,
+    /// Whether `poll_frame` was ever called. Used by the `Drop` safety net
+    /// to distinguish "hyper decided not to stream this body" (HEAD / 204 /
+    /// zero-length responses where hyper drops without polling) from "hyper
+    /// abandoned us mid-stream" (client disconnect). Never polled == success,
+    /// polled-but-not-completed == client_disconnect. `is_end_stream()`
+    /// cannot be used as the success signal because streaming wrappers
+    /// (`DirectH3Body`, partially-polled `CoalescingH3Body`) may report
+    /// `false` even for bodies that will complete successfully on the next
+    /// poll. Cheap — one atomic RMW on the first poll per body, zero cost
+    /// thereafter.
+    polled: AtomicBool,
 }
 
 /// Inner body variant — buffered, streaming, or tracked-streaming.
@@ -149,6 +177,9 @@ impl ProxyBody {
         Self {
             kind: ProxyBodyKind::Full(Full::new(data.into())),
             _request_guard: None,
+            logger: None,
+            bytes_streamed: AtomicU64::new(0),
+            polled: AtomicBool::new(false),
         }
     }
 
@@ -162,6 +193,9 @@ impl ProxyBody {
         Self {
             kind: ProxyBodyKind::Full(Full::default()),
             _request_guard: None,
+            logger: None,
+            bytes_streamed: AtomicU64::new(0),
+            polled: AtomicBool::new(false),
         }
     }
 
@@ -172,13 +206,48 @@ impl ProxyBody {
         self
     }
 
+    /// Attach a [`DeferredTransactionLogger`] to this body so
+    /// `log_with_mirror` fires after the body reaches a terminal state
+    /// (successful completion, streaming error, or client disconnect)
+    /// rather than at the moment response headers are flushed.
+    pub fn with_logger(
+        mut self,
+        logger: Arc<crate::proxy::deferred_log::DeferredTransactionLogger>,
+    ) -> Self {
+        self.logger = Some(logger);
+        self
+    }
+
+    /// Detach the deferred logger so the caller can fire it explicitly with a
+    /// specific outcome. Used on response-builder failure paths where dropping
+    /// the body would otherwise be misclassified as a client disconnect.
+    pub fn take_logger(
+        &mut self,
+    ) -> Option<Arc<crate::proxy::deferred_log::DeferredTransactionLogger>> {
+        self.logger.take()
+    }
+
+    /// Re-attach a deferred logger to an existing body. Pair with
+    /// [`take_logger`] around `http::response::Builder::body()` calls so the
+    /// logger survives the detach/rebuild round-trip on success and fires a
+    /// caller-supplied outcome on failure.
+    pub fn set_logger(
+        &mut self,
+        logger: Arc<crate::proxy::deferred_log::DeferredTransactionLogger>,
+    ) {
+        self.logger = Some(logger);
+    }
+
     /// Create a streaming body (no completion tracking).
-    fn streaming(
+    pub(crate) fn streaming(
         body: Pin<Box<dyn http_body::Body<Data = Bytes, Error = ProxyBodyError> + Send + 'static>>,
     ) -> Self {
         Self {
             kind: ProxyBodyKind::Stream(body),
             _request_guard: None,
+            logger: None,
+            bytes_streamed: AtomicU64::new(0),
+            polled: AtomicBool::new(false),
         }
     }
 
@@ -205,6 +274,9 @@ impl ProxyBody {
             Self {
                 kind: ProxyBodyKind::Tracked(tracked),
                 _request_guard: None,
+                logger: None,
+                bytes_streamed: AtomicU64::new(0),
+                polled: AtomicBool::new(false),
             },
             metrics,
         )
@@ -238,6 +310,9 @@ impl ProxyBody {
             Self {
                 kind: ProxyBodyKind::Tracked(tracked),
                 _request_guard: None,
+                logger: None,
+                bytes_streamed: AtomicU64::new(0),
+                polled: AtomicBool::new(false),
             },
             metrics,
         )
@@ -254,13 +329,60 @@ impl http_body::Body for ProxyBody {
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         // SAFETY: Both `Full<Bytes>` and `Pin<Box<...>>` are `Unpin`, so
         // `get_mut` is safe and we can re-pin the inner value.
-        match &mut self.get_mut().kind {
+        let this = self.get_mut();
+        // Mark "polled at least once" so the Drop safety net can distinguish
+        // an honest client-disconnect (polled but not drained to Ready(None))
+        // from a body hyper never chose to stream (HEAD / 204 / zero-length —
+        // dropped without a single poll). Relaxed is safe: Drop happens-after
+        // the final poll on the same hyper task, so ordering is guaranteed
+        // by the send/await chain even without Acquire/Release.
+        this.polled.store(true, Ordering::Relaxed);
+        let result = match &mut this.kind {
             ProxyBodyKind::Full(body) => Pin::new(body)
                 .poll_frame(cx)
                 .map(|opt| opt.map(|result| result.map_err(|never| match never {}))),
             ProxyBodyKind::Stream(body) => body.as_mut().poll_frame(cx),
             ProxyBodyKind::Tracked(body) => Pin::new(body).poll_frame(cx),
+        };
+
+        // Fast path: when no deferred logger is attached, the byte counter
+        // has no consumer — skip the atomic fetch_add entirely. The vast
+        // majority of requests do not attach a logger (only streaming
+        // responses via `with_logger` do), so this saves one atomic RMW per
+        // frame on the common path. Error / end-of-stream hooks that fire
+        // the logger still observe the counter, because their `take()` only
+        // succeeds when a logger was attached.
+        match &result {
+            Poll::Ready(Some(Ok(frame))) => {
+                if this.logger.is_some()
+                    && let Some(data) = frame.data_ref()
+                {
+                    this.bytes_streamed
+                        .fetch_add(data.len() as u64, Ordering::Relaxed);
+                }
+            }
+            Poll::Ready(Some(Err(e))) => {
+                if let Some(logger) = this.logger.take() {
+                    let bytes = this.bytes_streamed.load(Ordering::Relaxed);
+                    let (class, disconnected) =
+                        crate::retry::classify_body_error(&**e as &dyn std::error::Error);
+                    logger.fire(crate::proxy::deferred_log::BodyOutcome::error(
+                        class,
+                        bytes,
+                        disconnected,
+                    ));
+                }
+            }
+            Poll::Ready(None) => {
+                if let Some(logger) = this.logger.take() {
+                    let bytes = this.bytes_streamed.load(Ordering::Relaxed);
+                    logger.fire(crate::proxy::deferred_log::BodyOutcome::success(bytes));
+                }
+            }
+            Poll::Pending => {}
         }
+
+        result
     }
 
     fn is_end_stream(&self) -> bool {
@@ -276,6 +398,74 @@ impl http_body::Body for ProxyBody {
             ProxyBodyKind::Full(body) => body.size_hint(),
             ProxyBodyKind::Stream(body) => body.size_hint(),
             ProxyBodyKind::Tracked(body) => body.inner.size_hint(),
+        }
+    }
+}
+
+impl Drop for ProxyBody {
+    fn drop(&mut self) {
+        if let Some(logger) = self.logger.take() {
+            let bytes = self.bytes_streamed.load(Ordering::Relaxed);
+
+            // Decide the outcome for a body that was dropped without firing
+            // the logger via the poll_frame terminal branches. Two signals:
+            //
+            // 1. `polled` — was `poll_frame` ever called?
+            //    * **Never polled**: hyper chose not to stream this body
+            //      (HEAD, 204 No Content, 304 Not Modified, or any response
+            //      with a `content-length: 0`/`END_STREAM` known at header
+            //      time). These are successful responses; do NOT mark as
+            //      client_disconnect.
+            //    * **Polled but not drained**: hyper started streaming and
+            //      stopped before we yielded `Ready(None)` or `Ready(Some(Err))`.
+            //      Either the client dropped the connection or hyper aborted
+            //      for another reason we can't observe — treat as client
+            //      disconnect.
+            //
+            // 2. For the never-polled case we also consult `is_end_stream()`
+            //    to cover a subtlety for `Full<Bytes>` bodies: a `Full<Bytes>`
+            //    with non-empty data reports `is_end_stream() == false`
+            //    before its single frame has been yielded. If such a body is
+            //    dropped before any poll, that IS a client disconnect —
+            //    hyper decided not to send data we had prepared. So for the
+            //    never-polled + Full(non-empty) combination we still fire
+            //    client_disconnect. For streaming wrappers (Stream / Tracked)
+            //    `is_end_stream()` is unreliable (notably `DirectH3Body` and
+            //    partially-polled `CoalescingH3Body` always report false), so
+            //    we trust `polled` exclusively and treat never-polled as
+            //    success.
+            let outcome = if self.polled.load(Ordering::Relaxed) {
+                // Polled at least once but never reached Ready(None) or an
+                // error terminal. That's a client disconnect mid-stream.
+                crate::proxy::deferred_log::BodyOutcome::client_disconnect(bytes)
+            } else {
+                match &self.kind {
+                    // Never polled + Full: if Full has prepared data we never
+                    // sent, that's a client disconnect. If Full is empty or
+                    // already yielded, `is_end_stream()` is true and we count
+                    // it as a healthy zero-length response.
+                    ProxyBodyKind::Full(body) => {
+                        if http_body::Body::is_end_stream(body) {
+                            crate::proxy::deferred_log::BodyOutcome::success(bytes)
+                        } else {
+                            crate::proxy::deferred_log::BodyOutcome::client_disconnect(bytes)
+                        }
+                    }
+                    // Never polled + streaming/tracked: hyper decided not to
+                    // stream at all (HEAD / 204 / zero-length). Successful.
+                    // Do NOT consult `is_end_stream()` — H3 wrappers
+                    // (`DirectH3Body`, partially-polled `CoalescingH3Body`)
+                    // always report false here even for successful streams,
+                    // which would flip every HEAD / 204 / zero-length
+                    // streaming response into a false-positive
+                    // client_disconnect — the exact misclassification
+                    // Codex P2 flagged.
+                    ProxyBodyKind::Stream(_) | ProxyBodyKind::Tracked(_) => {
+                        crate::proxy::deferred_log::BodyOutcome::success(bytes)
+                    }
+                }
+            };
+            logger.fire(outcome);
         }
     }
 }

@@ -14,6 +14,52 @@ fn make_ctx() -> RequestContext {
     )
 }
 
+// ── Constructor validation ──────────────────────────────────────────
+
+#[test]
+fn test_constructor_rejects_non_string_header_name() {
+    let err = CorrelationId::new(&json!({ "header_name": 42 }))
+        .err()
+        .expect("integer header_name must be rejected");
+    assert!(err.contains("must be a string"), "got: {err}");
+}
+
+#[test]
+fn test_constructor_rejects_empty_header_name() {
+    let err = CorrelationId::new(&json!({ "header_name": "" }))
+        .err()
+        .expect("empty header_name must be rejected");
+    assert!(err.contains("non-empty string"), "got: {err}");
+}
+
+#[test]
+fn test_constructor_rejects_invalid_header_name_chars() {
+    // Colon is not a valid HTTP token character per RFC 7230 §3.2.6
+    let err = CorrelationId::new(&json!({ "header_name": "x:request-id" }))
+        .err()
+        .expect("colon in header name must be rejected");
+    assert!(err.contains("not permitted"), "got: {err}");
+}
+
+#[test]
+fn test_constructor_rejects_non_bool_echo_downstream() {
+    let err = CorrelationId::new(&json!({ "echo_downstream": "yes" }))
+        .err()
+        .expect("string echo_downstream must be rejected");
+    assert!(err.contains("must be a boolean"), "got: {err}");
+}
+
+#[test]
+fn test_constructor_accepts_null_fields_as_defaults() {
+    // Explicit null is treated the same as omitted — falls back to defaults.
+    let plugin = CorrelationId::new(&json!({
+        "header_name": null,
+        "echo_downstream": null
+    }))
+    .expect("null fields should fall back to defaults");
+    assert_eq!(plugin.name(), "correlation_id");
+}
+
 // ── Plugin identity ─────────────────────────────────────────────────
 
 #[test]

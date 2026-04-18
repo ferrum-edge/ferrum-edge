@@ -53,6 +53,56 @@ pub struct StreamCounterKey {
     pub protocol: Arc<str>,
 }
 
+/// Composite key for the HTTP-family client-disconnect counter.
+///
+/// Populated whenever a `TransactionSummary` is logged with
+/// `client_disconnected == true`. A forthcoming deferred-log path will make
+/// this field meaningful for HTTP/1.1, HTTP/2, HTTP/3, gRPC, and WebSocket
+/// flows; until then the counter will only fire for protocols that already
+/// populate the field (none, at time of introduction), but we wire it now so
+/// that dashboards reading `ferrum_client_disconnects_total` work the moment
+/// the plumbing lands — no registry change needed at that time.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ClientDisconnectKey {
+    pub proxy_id: Arc<str>,
+}
+
+/// Composite key for the stream (TCP/UDP) disconnect counter.
+///
+/// `cause` is the snake_case `DisconnectCause` variant (or `"unknown"` when
+/// `None`). `direction` is the snake_case `Direction` variant (or
+/// `"unknown"` when `None`). Both are bounded-cardinality enums so they are
+/// safe as Prometheus labels.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct StreamDisconnectKey {
+    pub proxy_id: Arc<str>,
+    pub protocol: Arc<str>,
+    pub cause: &'static str,
+    pub direction: &'static str,
+}
+
+/// Map a `DisconnectCause` variant to its snake_case label, reusing static
+/// strings so hot-path label values cost nothing to copy.
+fn disconnect_cause_label(cause: Option<super::DisconnectCause>) -> &'static str {
+    match cause {
+        Some(super::DisconnectCause::IdleTimeout) => "idle_timeout",
+        Some(super::DisconnectCause::RecvError) => "recv_error",
+        Some(super::DisconnectCause::BackendError) => "backend_error",
+        Some(super::DisconnectCause::GracefulShutdown) => "graceful_shutdown",
+        None => "unknown",
+    }
+}
+
+/// Map a `Direction` variant to its snake_case label (static strings).
+fn direction_label(direction: Option<super::Direction>) -> &'static str {
+    match direction {
+        Some(super::Direction::ClientToBackend) => "client_to_backend",
+        Some(super::Direction::BackendToClient) => "backend_to_client",
+        Some(super::Direction::Unknown) => "unknown",
+        None => "unknown",
+    }
+}
+
 /// Atomic counter paired with a last-updated timestamp for stale entry eviction.
 pub struct TimestampedCounter {
     pub value: AtomicU64,
@@ -171,6 +221,14 @@ pub struct MetricsRegistry {
     pub stream_connection_counter: DashMap<StreamCounterKey, TimestampedCounter>,
     /// Stream connection duration histogram by proxy_id
     pub stream_duration_buckets: DashMap<Arc<str>, HistogramBuckets>,
+    /// HTTP-family client disconnect counter keyed by proxy_id. Incremented
+    /// on every `record()` where `client_disconnected == true`.
+    pub client_disconnect_counter: DashMap<ClientDisconnectKey, TimestampedCounter>,
+    /// Stream disconnect counter keyed by (proxy_id, protocol, cause, direction).
+    /// Incremented on every `record_stream()` so operators can distinguish
+    /// idle timeouts from genuine errors and see which side initiated the
+    /// disconnect.
+    pub stream_disconnect_counter: DashMap<StreamDisconnectKey, TimestampedCounter>,
     /// Cached render output with generation timestamp
     render_cache: ArcSwap<Option<(Instant, String)>>,
     /// Configurable render cache TTL in seconds
@@ -204,6 +262,8 @@ impl MetricsRegistry {
             rate_limit_exceeded: AtomicU64::new(0),
             stream_connection_counter: DashMap::new(),
             stream_duration_buckets: DashMap::new(),
+            client_disconnect_counter: DashMap::new(),
+            stream_disconnect_counter: DashMap::new(),
             render_cache: ArcSwap::from_pointee(None),
             render_cache_ttl_secs: AtomicU64::new(DEFAULT_RENDER_CACHE_TTL_SECS),
             stale_entry_ttl_nanos: AtomicU64::new(DEFAULT_STALE_TTL_NANOS),
@@ -254,9 +314,23 @@ impl MetricsRegistry {
             .increment(self.epoch);
 
         self.stream_duration_buckets
-            .entry(proxy_id)
+            .entry(Arc::clone(&proxy_id))
             .or_insert_with(|| HistogramBuckets::new(self.epoch))
             .observe(summary.duration_ms, self.epoch);
+
+        // Always record disconnect cause+direction, even on clean shutdowns,
+        // so operators can compare ratios (e.g., graceful vs. error) without
+        // having to subtract from the connections-total counter.
+        let disconnect_key = StreamDisconnectKey {
+            proxy_id,
+            protocol: Arc::from(summary.protocol.as_str()),
+            cause: disconnect_cause_label(summary.disconnect_cause),
+            direction: direction_label(summary.disconnect_direction),
+        };
+        self.stream_disconnect_counter
+            .entry(disconnect_key)
+            .or_insert_with(|| TimestampedCounter::new(self.epoch))
+            .increment(self.epoch);
 
         self.maybe_invalidate_cache();
     }
@@ -291,9 +365,22 @@ impl MetricsRegistry {
         }
 
         self.gateway_overhead_buckets
-            .entry(proxy_id)
+            .entry(Arc::clone(&proxy_id))
             .or_insert_with(|| HistogramBuckets::new(self.epoch))
             .observe(summary.latency_gateway_overhead_ms, self.epoch);
+
+        // Increment the client-disconnect counter whenever the summary flags
+        // the client as having aborted before receiving the full response.
+        // Today this stays at zero for HTTP-family protocols (the field is
+        // hardcoded false in all literal constructors); once the deferred-log
+        // refactor populates it, this counter starts reporting automatically.
+        if summary.client_disconnected {
+            let key = ClientDisconnectKey { proxy_id };
+            self.client_disconnect_counter
+                .entry(key)
+                .or_insert_with(|| TimestampedCounter::new(self.epoch))
+                .increment(self.epoch);
+        }
 
         self.maybe_invalidate_cache();
     }
@@ -362,6 +449,22 @@ impl MetricsRegistry {
         });
 
         self.stream_duration_buckets.retain(|_, v| {
+            let keep = v.nanos_since_update(self.epoch) < ttl_nanos;
+            if !keep {
+                evicted += 1;
+            }
+            keep
+        });
+
+        self.client_disconnect_counter.retain(|_, v| {
+            let keep = v.nanos_since_update(self.epoch) < ttl_nanos;
+            if !keep {
+                evicted += 1;
+            }
+            keep
+        });
+
+        self.stream_disconnect_counter.retain(|_, v| {
             let keep = v.nanos_since_update(self.epoch) < ttl_nanos;
             if !keep {
                 evicted += 1;
@@ -532,6 +635,46 @@ impl MetricsRegistry {
             }
         }
 
+        // HTTP-family client disconnect counter. Emitted only when non-empty
+        // so the exposition stays tidy for deployments where it never fires.
+        if !self.client_disconnect_counter.is_empty() {
+            output.push_str(
+                "# HELP ferrum_client_disconnects_total Requests where the client disconnected before receiving the full response.\n",
+            );
+            output.push_str("# TYPE ferrum_client_disconnects_total counter\n");
+            for entry in self.client_disconnect_counter.iter() {
+                let key = entry.key();
+                let count = entry.value().value.load(Ordering::Relaxed);
+                let proxy_id = escape_label_value(&key.proxy_id);
+                output.push_str(&format!(
+                    "ferrum_client_disconnects_total{{proxy_id=\"{}\"{}}} {}\n",
+                    proxy_id, ns_label, count
+                ));
+            }
+        }
+
+        // Stream disconnect counter, labelled by cause and direction. Unlike
+        // the connection counter this is always emitted because graceful vs.
+        // error ratios are useful to operators even on well-behaved traffic.
+        if !self.stream_disconnect_counter.is_empty() {
+            output.push_str(
+                "# HELP ferrum_stream_disconnects_total Stream disconnects (TCP/UDP) by cause and direction.\n",
+            );
+            output.push_str("# TYPE ferrum_stream_disconnects_total counter\n");
+            for entry in self.stream_disconnect_counter.iter() {
+                let key = entry.key();
+                let count = entry.value().value.load(Ordering::Relaxed);
+                let proxy_id = escape_label_value(&key.proxy_id);
+                let protocol = escape_label_value(&key.protocol);
+                // cause and direction are &'static str from bounded enums —
+                // no escaping needed (snake_case ASCII only).
+                output.push_str(&format!(
+                    "ferrum_stream_disconnects_total{{proxy_id=\"{}\",protocol=\"{}\",cause=\"{}\",direction=\"{}\"{}}} {}\n",
+                    proxy_id, protocol, key.cause, key.direction, ns_label, count
+                ));
+            }
+        }
+
         output
     }
 }
@@ -601,7 +744,9 @@ impl PrometheusMetrics {
     }
 }
 
-pub const PROMETHEUS_METRICS_PRIORITY: u16 = 9300;
+/// Backwards-compatible alias. Prefer `super::priority::PROMETHEUS_METRICS`.
+#[allow(dead_code)]
+pub const PROMETHEUS_METRICS_PRIORITY: u16 = super::priority::PROMETHEUS_METRICS;
 
 #[async_trait]
 impl Plugin for PrometheusMetrics {
@@ -610,7 +755,7 @@ impl Plugin for PrometheusMetrics {
     }
 
     fn priority(&self) -> u16 {
-        PROMETHEUS_METRICS_PRIORITY
+        super::priority::PROMETHEUS_METRICS
     }
 
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {

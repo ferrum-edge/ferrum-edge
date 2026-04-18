@@ -276,20 +276,33 @@ pub fn ip_matches(client_ip: &str, rule: &str) -> bool {
 // ── IP parsing helpers ──────────────────────────────────────────────
 
 fn parse_ipv4(ip: &str) -> Option<[u8; 4]> {
-    let parts: Vec<&str> = ip.split('.').collect();
-    if parts.len() != 4 {
+    // Allocation-free — iterate without collecting the Vec.
+    let mut parts = ip.split('.');
+    let a: u8 = parts.next()?.parse().ok()?;
+    let b: u8 = parts.next()?.parse().ok()?;
+    let c: u8 = parts.next()?.parse().ok()?;
+    let d: u8 = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        // Too many octets, e.g. "1.2.3.4.5".
         return None;
     }
-    let a: u8 = parts[0].parse().ok()?;
-    let b: u8 = parts[1].parse().ok()?;
-    let c: u8 = parts[2].parse().ok()?;
-    let d: u8 = parts[3].parse().ok()?;
     Some([a, b, c, d])
 }
 
 fn parse_ipv6(ip: &str) -> Option<[u16; 8]> {
-    // Handle :: expansion
+    // Strip surrounding brackets if present (e.g. from URL-style "[::1]").
     let ip = ip.trim_matches('[').trim_matches(']');
+
+    // Strip a zone identifier suffix like "%eth0" — IPv6 zones are interface
+    // scope hints and are not part of the address itself (RFC 6874). They never
+    // exist on canonical `IpAddr::to_string()` output, but a malformed
+    // X-Forwarded-For entry from upstream could contain one. Stripping prevents
+    // unparseable client IPs from silently bypassing matching by being treated
+    // as `Unknown`.
+    let ip = match ip.find('%') {
+        Some(idx) => &ip[..idx],
+        None => ip,
+    };
 
     if ip.contains("::") {
         let parts: Vec<&str> = ip.split("::").collect();

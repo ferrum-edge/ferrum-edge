@@ -53,6 +53,8 @@ fn make_summary(metadata: HashMap<String, String>) -> StreamTransactionSummary {
         bytes_received: 0,
         connection_error: None,
         error_class: None,
+        disconnect_direction: None,
+        disconnect_cause: None,
         timestamp_connected: "2026-04-02T00:00:00Z".to_string(),
         timestamp_disconnected: "2026-04-02T00:00:01Z".to_string(),
         sni_hostname: None,

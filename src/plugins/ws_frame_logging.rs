@@ -22,7 +22,10 @@ use async_trait::async_trait;
 use serde_json::Value;
 use tokio_tungstenite::tungstenite::protocol::Message;
 
-use super::{Plugin, ProxyProtocol, WS_ONLY_PROTOCOLS, WebSocketFrameDirection};
+use super::{
+    Direction, Plugin, ProxyProtocol, WS_ONLY_PROTOCOLS, WebSocketFrameDirection,
+    WsDisconnectContext,
+};
 
 /// Log level for frame logging output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,21 +44,54 @@ pub struct WsFrameLogging {
 
 impl WsFrameLogging {
     pub fn new(config: &Value) -> Result<Self, String> {
-        let log_level = match config["log_level"].as_str().unwrap_or("info") {
-            "trace" => LogLevel::Trace,
-            "debug" => LogLevel::Debug,
-            _ => LogLevel::Info,
+        // Validate log_level explicitly — unknown values are rejected per the
+        // plugin-validation rules so misspellings (e.g. "info " or "warn") are
+        // caught at config-load time rather than silently downgraded to "info".
+        let log_level = match config.get("log_level") {
+            Some(v) => match v.as_str() {
+                Some("trace") => LogLevel::Trace,
+                Some("debug") => LogLevel::Debug,
+                Some("info") => LogLevel::Info,
+                Some(other) => {
+                    return Err(format!(
+                        "ws_frame_logging: invalid 'log_level' value '{other}' \
+                         (expected 'trace', 'debug', or 'info')"
+                    ));
+                }
+                None => {
+                    return Err(
+                        "ws_frame_logging: 'log_level' must be a string ('trace', 'debug', or 'info')"
+                            .to_string(),
+                    );
+                }
+            },
+            None => LogLevel::Info,
         };
 
-        let include_payload_preview = config["include_payload_preview"].as_bool().unwrap_or(false);
+        let include_payload_preview = match config.get("include_payload_preview") {
+            Some(v) => v.as_bool().ok_or_else(|| {
+                "ws_frame_logging: 'include_payload_preview' must be a boolean".to_string()
+            })?,
+            None => false,
+        };
 
         // Clamp to 64 KiB to prevent OOM from hex_encode on large binary frames
         const MAX_PREVIEW_BYTES: usize = 65_536;
-        let payload_preview_bytes = (config["payload_preview_bytes"].as_u64().unwrap_or(128)
-            as usize)
-            .min(MAX_PREVIEW_BYTES);
+        let payload_preview_bytes = match config.get("payload_preview_bytes") {
+            Some(v) => v.as_u64().ok_or_else(|| {
+                "ws_frame_logging: 'payload_preview_bytes' must be a non-negative integer"
+                    .to_string()
+            })? as usize,
+            None => 128,
+        }
+        .min(MAX_PREVIEW_BYTES);
 
-        let log_ping_pong = config["log_ping_pong"].as_bool().unwrap_or(false);
+        let log_ping_pong = match config.get("log_ping_pong") {
+            Some(v) => v
+                .as_bool()
+                .ok_or_else(|| "ws_frame_logging: 'log_ping_pong' must be a boolean".to_string())?,
+            None => false,
+        };
 
         Ok(Self {
             log_level,
@@ -268,6 +304,87 @@ impl Plugin for WsFrameLogging {
 
         // Never transform frames — purely observational
         None
+    }
+
+    fn requires_ws_disconnect_hooks(&self) -> bool {
+        true
+    }
+
+    async fn on_ws_disconnect(&self, ctx: &WsDisconnectContext) {
+        // Match the frame-level log's structure so operators can correlate
+        // the session end with the per-frame stream on the same `ws_frame_log`
+        // target. Direction/error_class/frames are always emitted so even
+        // clean closes produce a final record suitable for session accounting.
+        let direction_label = match ctx.direction {
+            Some(Direction::ClientToBackend) => "client_to_backend",
+            Some(Direction::BackendToClient) => "backend_to_client",
+            Some(Direction::Unknown) => "unknown",
+            None => "none",
+        };
+        let error_class_label = ctx
+            .error_class
+            .as_ref()
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "none".to_string());
+
+        // Pick a tracing macro at the plugin's configured level so that log
+        // targets routed by `ws_frame_log` match the frame output volume.
+        match self.log_level {
+            LogLevel::Trace => tracing::trace!(
+                target: "ws_frame_log",
+                namespace = %ctx.namespace,
+                proxy_id = %ctx.proxy_id,
+                proxy_name = %ctx.proxy_name.as_deref().unwrap_or("-"),
+                client_ip = %ctx.client_ip,
+                backend_target = %ctx.backend_target,
+                listen_port = ctx.listen_port,
+                duration_ms = ctx.duration_ms,
+                frames_c2b = ctx.frames_client_to_backend,
+                frames_b2c = ctx.frames_backend_to_client,
+                direction = direction_label,
+                error_class = %error_class_label,
+                consumer = ctx.consumer_username.as_deref().unwrap_or("-"),
+                correlation_id = ctx.metadata.get("correlation_id").map(String::as_str).unwrap_or("-"),
+                event = "disconnect",
+                "WebSocket session ended"
+            ),
+            LogLevel::Debug => tracing::debug!(
+                target: "ws_frame_log",
+                namespace = %ctx.namespace,
+                proxy_id = %ctx.proxy_id,
+                proxy_name = %ctx.proxy_name.as_deref().unwrap_or("-"),
+                client_ip = %ctx.client_ip,
+                backend_target = %ctx.backend_target,
+                listen_port = ctx.listen_port,
+                duration_ms = ctx.duration_ms,
+                frames_c2b = ctx.frames_client_to_backend,
+                frames_b2c = ctx.frames_backend_to_client,
+                direction = direction_label,
+                error_class = %error_class_label,
+                consumer = ctx.consumer_username.as_deref().unwrap_or("-"),
+                correlation_id = ctx.metadata.get("correlation_id").map(String::as_str).unwrap_or("-"),
+                event = "disconnect",
+                "WebSocket session ended"
+            ),
+            LogLevel::Info => tracing::info!(
+                target: "ws_frame_log",
+                namespace = %ctx.namespace,
+                proxy_id = %ctx.proxy_id,
+                proxy_name = %ctx.proxy_name.as_deref().unwrap_or("-"),
+                client_ip = %ctx.client_ip,
+                backend_target = %ctx.backend_target,
+                listen_port = ctx.listen_port,
+                duration_ms = ctx.duration_ms,
+                frames_c2b = ctx.frames_client_to_backend,
+                frames_b2c = ctx.frames_backend_to_client,
+                direction = direction_label,
+                error_class = %error_class_label,
+                consumer = ctx.consumer_username.as_deref().unwrap_or("-"),
+                correlation_id = ctx.metadata.get("correlation_id").map(String::as_str).unwrap_or("-"),
+                event = "disconnect",
+                "WebSocket session ended"
+            ),
+        }
     }
 }
 

@@ -194,6 +194,12 @@ impl Plugin for PriorityOverridePlugin {
     async fn on_udp_datagram(&self, ctx: &UdpDatagramContext) -> UdpDatagramVerdict {
         self.inner.on_udp_datagram(ctx).await
     }
+    fn requires_ws_disconnect_hooks(&self) -> bool {
+        self.inner.requires_ws_disconnect_hooks()
+    }
+    async fn on_ws_disconnect(&self, ctx: &crate::plugins::WsDisconnectContext) {
+        self.inner.on_ws_disconnect(ctx).await;
+    }
     fn active_jwks_uris(&self) -> Vec<String> {
         self.inner.active_jwks_uris()
     }

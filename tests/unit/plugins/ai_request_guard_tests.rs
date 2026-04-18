@@ -300,6 +300,46 @@ async fn test_temperature_in_range() {
     assert_continue(result);
 }
 
+#[test]
+fn test_temperature_range_rejects_inverted_bounds() {
+    // [max, min] would silently reject every request because the check is
+    // `temp < min || temp > max`. Reject at construction time so the
+    // misconfiguration cannot reach traffic.
+    let err = AiRequestGuard::new(&json!({"temperature_range": [1.0, 0.0]}))
+        .err()
+        .unwrap();
+    assert!(err.contains("min must be <= max"), "got: {err}");
+}
+
+#[test]
+fn test_temperature_range_rejects_wrong_arity() {
+    let err = AiRequestGuard::new(&json!({"temperature_range": [0.0]}))
+        .err()
+        .unwrap();
+    assert!(err.contains("exactly 2 elements"), "got: {err}");
+
+    let err = AiRequestGuard::new(&json!({"temperature_range": [0.0, 1.0, 2.0]}))
+        .err()
+        .unwrap();
+    assert!(err.contains("exactly 2 elements"), "got: {err}");
+}
+
+#[test]
+fn test_temperature_range_rejects_non_array() {
+    let err = AiRequestGuard::new(&json!({"temperature_range": "0,1"}))
+        .err()
+        .unwrap();
+    assert!(err.contains("must be an array"), "got: {err}");
+}
+
+#[test]
+fn test_temperature_range_rejects_non_numeric_bounds() {
+    let err = AiRequestGuard::new(&json!({"temperature_range": ["low", "high"]}))
+        .err()
+        .unwrap();
+    assert!(err.contains("must be a number"), "got: {err}");
+}
+
 // ─── System prompt blocking ─────────────────────────────────────────────
 
 #[tokio::test]

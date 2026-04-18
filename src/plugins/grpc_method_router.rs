@@ -104,30 +104,57 @@ impl GrpcMethodRouter {
             })
             .unwrap_or_default();
 
-        let limit_by = config["limit_by"].as_str().unwrap_or("ip").to_string();
+        // limit_by must be a recognized policy — silently treating "user" as "ip"
+        // would be a security misconfiguration footgun.
+        let limit_by = match config.get("limit_by") {
+            None | Some(Value::Null) => "ip".to_string(),
+            Some(Value::String(s)) => {
+                let lc = s.to_lowercase();
+                if !matches!(lc.as_str(), "ip" | "consumer") {
+                    return Err(format!(
+                        "grpc_method_router: 'limit_by' must be one of 'ip' or 'consumer', got: {s:?}"
+                    ));
+                }
+                lc
+            }
+            Some(other) => {
+                return Err(format!(
+                    "grpc_method_router: 'limit_by' must be a string, got: {other}"
+                ));
+            }
+        };
 
         let mut method_rate_limits = HashMap::new();
         if let Some(obj) = config["method_rate_limits"].as_object() {
             for (method, spec) in obj {
-                if let (Some(max_requests), Some(window_seconds)) = (
-                    spec["max_requests"].as_u64(),
-                    spec["window_seconds"].as_u64(),
-                ) {
-                    if max_requests == 0 {
-                        return Err(format!(
-                            "grpc_method_router: method_rate_limits['{}']: 'max_requests' must be greater than zero",
-                            method
-                        ));
-                    }
-                    let normalized = method.strip_prefix('/').unwrap_or(method).to_string();
-                    method_rate_limits.insert(
-                        normalized,
-                        RateSpec {
-                            max_requests,
-                            window: Duration::from_secs(window_seconds.max(1)),
-                        },
-                    );
+                let max_requests = spec["max_requests"].as_u64().ok_or_else(|| {
+                    format!(
+                        "grpc_method_router: method_rate_limits['{method}']: 'max_requests' is required and must be a positive integer"
+                    )
+                })?;
+                let window_seconds = spec["window_seconds"].as_u64().ok_or_else(|| {
+                    format!(
+                        "grpc_method_router: method_rate_limits['{method}']: 'window_seconds' is required and must be a positive integer"
+                    )
+                })?;
+                if max_requests == 0 {
+                    return Err(format!(
+                        "grpc_method_router: method_rate_limits['{method}']: 'max_requests' must be greater than zero"
+                    ));
                 }
+                if window_seconds == 0 {
+                    return Err(format!(
+                        "grpc_method_router: method_rate_limits['{method}']: 'window_seconds' must be greater than zero"
+                    ));
+                }
+                let normalized = method.strip_prefix('/').unwrap_or(method).to_string();
+                method_rate_limits.insert(
+                    normalized,
+                    RateSpec {
+                        max_requests,
+                        window: Duration::from_secs(window_seconds),
+                    },
+                );
             }
         }
 

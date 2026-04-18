@@ -504,6 +504,70 @@ fn test_empty_config_returns_error_on_creation() {
     assert!(err.contains("no protection rules configured"));
 }
 
+// ── Constructor validation: limit_by ──
+
+#[test]
+fn test_unknown_limit_by_rejected() {
+    let result = create_plugin(
+        "graphql",
+        &json!({
+            "max_depth": 5,
+            "limit_by": "country"
+        }),
+    );
+    let err = result.err().expect("unknown limit_by must be rejected");
+    assert!(err.contains("'limit_by' must be one of"), "got: {err}");
+}
+
+// ── Constructor validation: rate-limit specs ──
+
+#[test]
+fn test_zero_window_seconds_in_type_limit_rejected() {
+    let result = create_plugin(
+        "graphql",
+        &json!({
+            "type_rate_limits": {
+                "query": { "max_requests": 5, "window_seconds": 0 }
+            }
+        }),
+    );
+    let err = result.err().expect("window_seconds=0 must be rejected");
+    assert!(
+        err.contains("'window_seconds' must be greater than zero"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn test_missing_max_requests_in_operation_limit_rejected() {
+    let result = create_plugin(
+        "graphql",
+        &json!({
+            "operation_rate_limits": {
+                "GetUser": { "window_seconds": 60 }
+            }
+        }),
+    );
+    let err = result.err().expect("missing max_requests must be rejected");
+    assert!(err.contains("'max_requests' is required"), "got: {err}");
+}
+
+#[test]
+fn test_missing_window_seconds_in_type_limit_rejected() {
+    let result = create_plugin(
+        "graphql",
+        &json!({
+            "type_rate_limits": {
+                "query": { "max_requests": 5 }
+            }
+        }),
+    );
+    let err = result
+        .err()
+        .expect("missing window_seconds must be rejected");
+    assert!(err.contains("'window_seconds' is required"), "got: {err}");
+}
+
 #[tokio::test]
 async fn test_combined_depth_and_complexity() {
     let config = json!({

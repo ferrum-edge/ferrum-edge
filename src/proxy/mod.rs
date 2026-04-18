@@ -33,6 +33,7 @@
 pub mod backend_dispatch;
 pub mod body;
 pub mod client_ip;
+pub mod deferred_log;
 pub mod grpc_proxy;
 pub mod http2_pool;
 pub mod sni;
@@ -687,6 +688,7 @@ impl ProxyState {
             env_config_arc.tls_no_verify,
             env_config_arc.tls_ca_bundle_path.clone(),
             env_config_arc.tcp_idle_timeout_seconds,
+            env_config_arc.tcp_half_close_max_wait_seconds,
             env_config_arc.udp_max_sessions,
             env_config_arc.udp_cleanup_interval_seconds,
             tls_policy_arc.clone(),
@@ -2113,6 +2115,7 @@ async fn handle_websocket_request_authenticated(
     sticky_cookie_needed: bool,
     start_time: Instant,
     is_h2_websocket: bool,
+    is_tls: bool,
 ) -> Result<Response<ProxyBody>, hyper::Error> {
     info!(
         "WebSocket upgrade request authenticated for proxy: {} from: {}",
@@ -2341,7 +2344,6 @@ async fn handle_websocket_request_authenticated(
                             backend_target_url: Some(
                                 strip_query_params(&current_backend_url).to_string(),
                             ),
-                            backend_resolved_ip: None,
                             response_status_code: 502,
                             latency_total_ms: ws_total_ms,
                             latency_gateway_processing_ms: ws_total_ms,
@@ -2351,11 +2353,9 @@ async fn handle_websocket_request_authenticated(
                             latency_plugin_external_io_ms: ws_plugin_external_io_ms,
                             latency_gateway_overhead_ms: ws_gateway_overhead_ms,
                             request_user_agent: ctx.headers.get("user-agent").cloned(),
-                            response_streamed: false,
-                            client_disconnected: false,
                             error_class: Some(ws_error_class),
-                            mirror: false,
                             metadata,
+                            ..TransactionSummary::default()
                         };
                         crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
                     }
@@ -2418,11 +2418,8 @@ async fn handle_websocket_request_authenticated(
         latency_plugin_external_io_ms: ws_plugin_external_io_ms,
         latency_gateway_overhead_ms: ws_gateway_overhead_ms,
         request_user_agent: ctx.headers.get("user-agent").cloned(),
-        response_streamed: false,
-        client_disconnected: false,
-        error_class: None,
-        mirror: false,
         metadata: ctx.metadata.clone(),
+        ..TransactionSummary::default()
     };
 
     crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
@@ -2474,19 +2471,30 @@ async fn handle_websocket_request_authenticated(
 
     // Collect plugins that opted into per-frame WebSocket hooks.
     // The pre-computed flag avoids iterating the plugin list when no plugin opted in.
-    let ws_frame_plugins: Vec<Arc<dyn Plugin>> =
-        if state.plugin_cache.requires_ws_frame_hooks(&proxy.id) {
-            let all_ws_plugins = state
-                .plugin_cache
-                .get_plugins_for_protocol(&proxy.id, ProxyProtocol::WebSocket);
-            all_ws_plugins
-                .iter()
-                .filter(|p| p.requires_ws_frame_hooks())
-                .cloned()
-                .collect()
-        } else {
-            Vec::new()
-        };
+    let all_ws_plugins = if state.plugin_cache.requires_ws_frame_hooks(&proxy.id) {
+        state
+            .plugin_cache
+            .get_plugins_for_protocol(&proxy.id, ProxyProtocol::WebSocket)
+    } else {
+        // Even when no frame hooks are needed, we still need to check for
+        // disconnect hooks — those live on the same WebSocket protocol list.
+        state
+            .plugin_cache
+            .get_plugins_for_protocol(&proxy.id, ProxyProtocol::WebSocket)
+    };
+    let ws_frame_plugins: Vec<Arc<dyn Plugin>> = all_ws_plugins
+        .iter()
+        .filter(|p| p.requires_ws_frame_hooks())
+        .cloned()
+        .collect();
+    // Collect disconnect-hook plugins separately. These fire exactly once at
+    // session end instead of per-frame, so keeping them in their own list
+    // avoids the per-frame filter cost paid by the frame-hook path.
+    let ws_disconnect_plugins: Vec<Arc<dyn Plugin>> = all_ws_plugins
+        .iter()
+        .filter(|p| p.requires_ws_disconnect_hooks())
+        .cloned()
+        .collect();
 
     // Spawn bidirectional forwarding task (awaits client upgrade, then proxies)
     let proxy_id = proxy.id.clone();
@@ -2495,6 +2503,32 @@ async fn handle_websocket_request_authenticated(
     let ws_write_buf = state.websocket_write_buffer_size;
     let ws_tunnel = state.websocket_tunnel_mode;
     let adaptive_buf = state.adaptive_buffer.clone();
+    // Capture session metadata while the originating RequestContext + proxy are
+    // still in scope. Passed to run_websocket_proxy so it can construct a
+    // WsDisconnectContext at teardown for plugins that opted in to
+    // on_ws_disconnect. Building this here (vs. inside run_websocket_proxy) is
+    // effectively free when ws_disconnect_plugins is empty because the strings
+    // are moved, not cloned, into an owned struct.
+    // WebSocket upgrades arrive on either the plaintext HTTP proxy listener or
+    // the TLS HTTPS/H2 listener. Choose the matching port so disconnect
+    // metadata, logging plugins, and downstream alerts key on the port the
+    // client actually connected to instead of always reporting the plaintext
+    // port (which is misleading — or `0` — on TLS-only deployments).
+    let listen_port = if is_tls {
+        state.env_config.proxy_https_port
+    } else {
+        state.env_config.proxy_http_port
+    };
+    let session_meta = WsSessionMeta {
+        namespace: proxy.namespace.clone(),
+        proxy_name: proxy.name.clone(),
+        client_ip: ctx.client_ip.clone(),
+        backend_target: strip_query_params(&current_backend_url).to_string(),
+        listen_port,
+        consumer_username: ctx.effective_identity().map(str::to_owned),
+        metadata: ctx.metadata.clone(),
+        session_start: chrono::Utc::now(),
+    };
     tokio::spawn(async move {
         match on_upgrade.await {
             Ok(upgraded) => {
@@ -2504,6 +2538,8 @@ async fn handle_websocket_request_authenticated(
                     &proxy_id,
                     ws_conn_id,
                     ws_frame_plugins,
+                    ws_disconnect_plugins,
+                    session_meta,
                     ws_connection_permit,
                     max_ws_frame,
                     ws_write_buf,
@@ -2840,12 +2876,89 @@ async fn connect_websocket_backend(
 
 /// Run bidirectional WebSocket proxying between upgraded client and connected backend.
 ///
+/// Session-level metadata captured at WebSocket upgrade time and consumed at
+/// teardown when firing `on_ws_disconnect`. Held as an owned struct (not
+/// references) because the upgrade handler returns before the session ends,
+/// so all fields must outlive the originating request context.
+#[doc(hidden)]
+pub struct WsSessionMeta {
+    pub namespace: String,
+    pub proxy_name: Option<String>,
+    pub client_ip: String,
+    pub backend_target: String,
+    pub listen_port: u16,
+    pub consumer_username: Option<String>,
+    pub metadata: HashMap<String, String>,
+    pub session_start: chrono::DateTime<chrono::Utc>,
+}
+
+/// Fire `on_ws_disconnect` for the tunnel-mode path, where raw
+/// `copy_bidirectional` is used instead of frame-level parsing.
+///
+/// Tunnel mode does not track frame counts (all bytes flow as raw TCP), so
+/// `frames_client_to_backend` / `frames_backend_to_client` are reported as
+/// `0`. Direction attribution is best-effort: drain-phase write errors to
+/// the client are attributed to `BackendToClient`; the `copy_bidirectional`
+/// error path has no per-direction attribution and reports
+/// `Direction::Unknown`. Observers that require direction/count fidelity
+/// should disable tunnel mode for the proxy.
+///
+/// The helper takes `ws_disconnect_plugins` by slice and `session_meta` by
+/// reference so the caller keeps ownership for the duration of the call.
+#[doc(hidden)]
+pub async fn fire_ws_tunnel_disconnect_hooks(
+    ws_disconnect_plugins: &[Arc<dyn Plugin>],
+    proxy_id: &str,
+    session_meta: &WsSessionMeta,
+    failure: Option<(crate::plugins::Direction, retry::ErrorClass)>,
+) {
+    if ws_disconnect_plugins.is_empty() {
+        return;
+    }
+    let disconnect_duration_ms = (chrono::Utc::now() - session_meta.session_start)
+        .num_milliseconds()
+        .max(0) as f64;
+    let disconnect_ctx = crate::plugins::WsDisconnectContext {
+        namespace: session_meta.namespace.clone(),
+        proxy_id: proxy_id.to_string(),
+        proxy_name: session_meta.proxy_name.clone(),
+        client_ip: session_meta.client_ip.clone(),
+        backend_target: session_meta.backend_target.clone(),
+        listen_port: session_meta.listen_port,
+        duration_ms: disconnect_duration_ms,
+        frames_client_to_backend: 0,
+        frames_backend_to_client: 0,
+        direction: failure.as_ref().map(|(d, _)| *d),
+        error_class: failure.map(|(_, c)| c),
+        consumer_username: session_meta.consumer_username.clone(),
+        metadata: session_meta.metadata.clone(),
+    };
+    for plugin in ws_disconnect_plugins {
+        plugin.on_ws_disconnect(&disconnect_ctx).await;
+    }
+}
+
 /// `connection_id` — unique per-connection identifier for stateful frame plugins.
 /// `ws_frame_plugins` — plugins that opted into per-frame hooks by returning `true`
 /// from `requires_ws_frame_hooks()`. Pass an empty `Vec` for zero-overhead forwarding
 /// when no plugin on this proxy needs frame inspection.
+/// `ws_disconnect_plugins` — plugins that opted into end-of-session hooks by
+/// returning `true` from `requires_ws_disconnect_hooks()`. Pass an empty `Vec`
+/// to skip disconnect bookkeeping entirely.
+/// `session_meta` — captured at upgrade time; used to populate `WsDisconnectContext`
+/// when the session ends. Cost is paid regardless of whether disconnect plugins
+/// are present (one small allocation per upgrade) because the struct is small
+/// and moving it has zero additional cost.
 /// `websocket_tunnel_mode` — when true and no frame plugins are configured, bypass
 /// WebSocket frame parsing and use raw TCP bidirectional copy for maximum throughput.
+///
+/// Polite-close bound used when the cancel branch of each forward loop fires.
+/// The opposite direction has already cancelled, so a plain `.await` on the
+/// polite-Close send could hang indefinitely if the peer socket is dead or
+/// backpressured. A Close control frame is small and completes in microseconds
+/// on a healthy TCP connection, so 100ms is generous for the happy path while
+/// still bounding teardown for pathological peers.
+const WS_CANCEL_CLOSE_TIMEOUT_MS: u64 = 100;
 #[allow(clippy::too_many_arguments)]
 async fn run_websocket_proxy(
     upgraded: Upgraded,
@@ -2853,6 +2966,8 @@ async fn run_websocket_proxy(
     proxy_id: &str,
     connection_id: u64,
     ws_frame_plugins: Vec<Arc<dyn Plugin>>,
+    ws_disconnect_plugins: Vec<Arc<dyn Plugin>>,
+    session_meta: WsSessionMeta,
     _ws_connection_permit: Option<tokio::sync::OwnedSemaphorePermit>,
     max_websocket_frame_size_bytes: usize,
     websocket_write_buffer_size: usize,
@@ -2871,33 +2986,24 @@ async fn run_websocket_proxy(
             connection_id,
             "WebSocket tunnel mode: no frame plugins, using raw bidirectional copy"
         );
-        // Drain any frames the backend sent piggybacked with the 101 response
-        // before switching to raw mode. This prevents data loss for server-push
-        // protocols that send immediately after the upgrade handshake.
-        use futures_util::StreamExt;
-        let (mut backend_write, mut backend_read) = backend_ws_stream.split();
+        // Unwrap both WebSocket wrappers back to their raw transports for
+        // raw bidirectional copy. We intentionally do NOT drain buffered
+        // frames from `backend_ws_stream` here: `poll_next` can partially
+        // consume a fragmented frame into tungstenite's internal read buffer
+        // and return `Pending` before yielding the frame; those bytes would
+        // then be silently discarded by `into_inner()`. By skipping the
+        // drain we keep any pending bytes in the kernel TCP socket buffer
+        // where `copy_bidirectional` forwards them intact.
+        //
+        // Known limitation: if the backend's handshake response coincidentally
+        // carried WebSocket frame bytes in the same TCP segment as the 101
+        // Switching Protocols response, tungstenite may have already pulled
+        // those bytes into its internal read buffer during handshake parsing,
+        // and `into_inner()` will drop them. Deployments where the backend
+        // sends immediately after upgrade should use frame-parsing mode (set
+        // a frame-level plugin or disable `FERRUM_WEBSOCKET_TUNNEL_MODE`).
+        let mut backend = backend_ws_stream.into_inner();
         let mut client_io = TokioIo::new(upgraded);
-
-        // Non-blocking drain: read any already-buffered frames and forward them
-        // as raw WebSocket wire bytes via the tungstenite sink → client path.
-        // In practice this is 0 frames for request-response protocols, 1-2 for
-        // server-push protocols (e.g., stock tickers).
-        while let std::task::Poll::Ready(Some(Ok(msg))) = futures_util::poll!(backend_read.next()) {
-            // Re-serialize the frame and write to client via tungstenite's
-            // framing layer so masking/headers are correct.
-            if let Err(e) = backend_write.send(msg).await {
-                warn!(
-                    proxy_id = %proxy_id,
-                    "WebSocket tunnel: failed to flush buffered frame: {e}"
-                );
-                return Ok(());
-            }
-        }
-        // Reunite the backend stream and extract the raw transport
-        let backend_ws = backend_read
-            .reunite(backend_write)
-            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
-        let mut backend = backend_ws.into_inner();
         let buf_size = adaptive_buffer.get_buffer_size(proxy_id);
         let result = tokio::io::copy_bidirectional_with_sizes(
             &mut client_io,
@@ -2906,9 +3012,34 @@ async fn run_websocket_proxy(
             buf_size,
         )
         .await;
-        if let Ok((c2b, b2c)) = &result {
-            adaptive_buffer.record_connection(proxy_id, c2b.saturating_add(*b2c));
-        }
+        let tunnel_failure = match &result {
+            Ok((c2b, b2c)) => {
+                adaptive_buffer.record_connection(proxy_id, c2b.saturating_add(*b2c));
+                None
+            }
+            Err(e) => {
+                // `copy_bidirectional` doesn't report which half failed, so fall
+                // back to `Direction::Unknown`. Observers that rely on direction
+                // attribution should enable frame-level plugins instead of tunnel
+                // mode.
+                let anyhow_err: anyhow::Error =
+                    anyhow::anyhow!("WebSocket tunnel copy error: {}", e);
+                Some((
+                    crate::plugins::Direction::Unknown,
+                    crate::retry::classify_boxed_error(anyhow_err.as_ref()),
+                ))
+            }
+        };
+        // Fire on_ws_disconnect so plugins that opted into disconnect hooks see
+        // the tunnel-mode session teardown. Frame counts are 0 because tunnel
+        // mode does raw TCP bidirectional copy — no frames are parsed.
+        fire_ws_tunnel_disconnect_hooks(
+            &ws_disconnect_plugins,
+            proxy_id,
+            &session_meta,
+            tunnel_failure,
+        )
+        .await;
         return Ok(());
     }
 
@@ -2935,6 +3066,25 @@ async fn run_websocket_proxy(
     let proxy_id_ctb = proxy_id.to_string();
     let proxy_id_btc = proxy_id.to_string();
 
+    // Per-direction frame counters for the on_ws_disconnect summary. Kept as
+    // plain atomics (not protected by any lock) so the forward tasks can bump
+    // them without coordination. Reads happen exactly once at teardown.
+    let frames_c2b = Arc::new(AtomicU64::new(0));
+    let frames_b2c = Arc::new(AtomicU64::new(0));
+    let frames_c2b_task = frames_c2b.clone();
+    let frames_b2c_task = frames_b2c.clone();
+
+    // First-failure recorder. Whichever forward direction hits an error first
+    // wins the (Direction, ErrorClass) slot via OnceLock::set(); later errors
+    // from the other direction (or from the write-side of the same direction)
+    // are dropped. Both directions still publish their clean-close outcome
+    // through the counter, so "no error + clean close" is distinguishable
+    // from "error observed on one half".
+    let first_failure: Arc<std::sync::OnceLock<(crate::plugins::Direction, retry::ErrorClass)>> =
+        Arc::new(std::sync::OnceLock::new());
+    let first_failure_ctb = first_failure.clone();
+    let first_failure_btc = first_failure.clone();
+
     // Cancellation token for clean bidirectional close when a plugin triggers Close.
     // Each direction checks this token to know if the other side initiated a close.
     let cancel = tokio_util::sync::CancellationToken::new();
@@ -2949,7 +3099,19 @@ async fn run_websocket_proxy(
                 biased;
                 _ = cancel_ctb.cancelled() => {
                     debug!("Client->backend: other direction triggered close");
-                    let _ = backend_sink.send(Message::Close(None)).await;
+                    // Bounded polite-close: the opposite direction has already
+                    // cancelled us, so a plain `.await` on `backend_sink.send()`
+                    // could hang forever if the backend socket is backpressured
+                    // or dead. `lazy_timeout` pays zero cost when the send
+                    // completes synchronously (common for small Close frames on
+                    // healthy TCP) and only registers a timer on Pending.
+                    // Cannot use select+cancel here — cancel is already signaled
+                    // and would skip the Close entirely.
+                    let _ = crate::lazy_timeout::lazy_timeout(
+                        Duration::from_millis(WS_CANCEL_CLOSE_TIMEOUT_MS),
+                        backend_sink.send(Message::Close(None)),
+                    )
+                    .await;
                     break;
                 }
                 msg = ws_stream.next() => {
@@ -2976,10 +3138,17 @@ async fn run_websocket_proxy(
                                 }
                                 current
                             };
-                            // If a plugin transformed the frame into a Close, close both sides
+                            // If a plugin transformed the frame into a Close, close both sides.
+                            // Race cancel in case the opposite direction already exited while we
+                            // were running plugin hooks — keeps teardown prompt without dropping
+                            // the Close on the happy path.
                             if matches!(&outgoing, Message::Close(_)) {
                                 debug!("Plugin triggered close on client->backend frame");
-                                let _ = backend_sink.send(outgoing).await;
+                                tokio::select! {
+                                    biased;
+                                    _ = cancel_ctb.cancelled() => {}
+                                    _ = backend_sink.send(outgoing) => {}
+                                }
                                 cancel_ctb.cancel(); // signal other direction
                                 break;
                             }
@@ -2991,15 +3160,50 @@ async fn run_websocket_proxy(
                                 Message::Ping(_) => trace!("Client -> Backend: Ping"),
                                 _ => {}
                             }
-                            if let Err(e) = backend_sink.send(outgoing).await {
-                                error!("Failed to send message to backend: {}", e);
-                                break;
+                            // Cancel-aware send: if the opposite direction has exited and
+                            // cancelled us while this send is blocked on backend backpressure,
+                            // `select!` breaks us out instead of hanging `tokio::join!` forever.
+                            // Overhead is one atomic load per frame (CancellationToken state
+                            // check); the send future is polled first on wakeup so successful
+                            // sends pay no extra latency. No heap allocation, no timer wheel.
+                            tokio::select! {
+                                biased;
+                                _ = cancel_ctb.cancelled() => {
+                                    debug!("Client->backend: cancel fired mid-send");
+                                    break;
+                                }
+                                res = backend_sink.send(outgoing) => {
+                                    if let Err(e) = res {
+                                        error!("Failed to send message to backend: {}", e);
+                                        // Write-side failure on the c2b path means the
+                                        // backend socket errored while we were pushing
+                                        // into it — attribute to the c2b direction.
+                                        let _ = first_failure_ctb.set((
+                                            crate::plugins::Direction::ClientToBackend,
+                                            retry::classify_boxed_error(&e),
+                                        ));
+                                        break;
+                                    }
+                                    // Count the frame that successfully reached the backend.
+                                    frames_c2b_task.fetch_add(1, Ordering::Relaxed);
+                                }
                             }
                         }
                         Ok(Message::Close(close_frame)) => {
                             debug!("Client sent close frame");
-                            if let Err(e) = backend_sink.send(Message::Close(close_frame)).await {
-                                error!("Failed to send close to backend: {}", e);
+                            // Race cancel in case the opposite direction already exited while
+                            // we were decoding this Close frame. The send future is polled
+                            // first after the cancel check so the happy path does not block.
+                            tokio::select! {
+                                biased;
+                                _ = cancel_ctb.cancelled() => {
+                                    debug!("Client->backend: cancel fired during client-close forward");
+                                }
+                                res = backend_sink.send(Message::Close(close_frame)) => {
+                                    if let Err(e) = res {
+                                        error!("Failed to send close to backend: {}", e);
+                                    }
+                                }
                             }
                             break;
                         }
@@ -3011,6 +3215,12 @@ async fn run_websocket_proxy(
                         }
                         Err(e) => {
                             error!("Error receiving from client: {}", e);
+                            // Read-side failure on the c2b path means the client
+                            // dropped / reset the socket.
+                            let _ = first_failure_ctb.set((
+                                crate::plugins::Direction::ClientToBackend,
+                                retry::classify_boxed_error(&e),
+                            ));
                             break;
                         }
                     }
@@ -3018,6 +3228,13 @@ async fn run_websocket_proxy(
             }
         }
         debug!("Client -> backend forwarding completed");
+        // Signal the opposite direction to wind down so we can finish the
+        // session together. If the other direction already cancelled this
+        // token (plugin-triggered Close path), `cancel()` is idempotent.
+        // Without this, a natural EOF / error / Close-frame exit on c2b
+        // would leave b2c running; the outer coordinator would then have
+        // to drop b2c (old `tokio::select!`) or hang on it indefinitely.
+        cancel_ctb.cancel();
     };
 
     // Forward messages from backend to client
@@ -3028,7 +3245,15 @@ async fn run_websocket_proxy(
                 biased;
                 _ = cancel_btc.cancelled() => {
                     debug!("Backend->client: other direction triggered close");
-                    let _ = ws_sink.send(Message::Close(None)).await;
+                    // Mirror of the c2b cancel branch: bounded polite-close with
+                    // `lazy_timeout` so the client sink cannot hang `tokio::join!`
+                    // forever if the client socket is dead or not reading. See
+                    // `WS_CANCEL_CLOSE_TIMEOUT_MS` for the rationale.
+                    let _ = crate::lazy_timeout::lazy_timeout(
+                        Duration::from_millis(WS_CANCEL_CLOSE_TIMEOUT_MS),
+                        ws_sink.send(Message::Close(None)),
+                    )
+                    .await;
                     break;
                 }
                 msg = backend_stream.next() => {
@@ -3055,10 +3280,16 @@ async fn run_websocket_proxy(
                                 }
                                 current
                             };
-                            // If a plugin transformed the frame into a Close, close both sides
+                            // If a plugin transformed the frame into a Close, close both sides.
+                            // Race cancel — the opposite direction may have already exited while
+                            // we were running plugin hooks.
                             if matches!(&outgoing, Message::Close(_)) {
                                 debug!("Plugin triggered close on backend->client frame");
-                                let _ = ws_sink.send(outgoing).await;
+                                tokio::select! {
+                                    biased;
+                                    _ = cancel_btc.cancelled() => {}
+                                    _ = ws_sink.send(outgoing) => {}
+                                }
                                 cancel_btc.cancel(); // signal other direction
                                 break;
                             }
@@ -3070,15 +3301,47 @@ async fn run_websocket_proxy(
                                 Message::Ping(_) => trace!("Backend -> Client: Ping"),
                                 _ => {}
                             }
-                            if let Err(e) = ws_sink.send(outgoing).await {
-                                error!("Failed to send message to client: {}", e);
-                                break;
+                            // Cancel-aware send (mirror of c2b hot path): prevents
+                            // `tokio::join!` from hanging when c2b has already exited and the
+                            // client socket is backpressured so our `ws_sink.send()` would
+                            // otherwise block indefinitely. One atomic load per frame; send
+                            // polled first so successful frames pay no extra latency.
+                            tokio::select! {
+                                biased;
+                                _ = cancel_btc.cancelled() => {
+                                    debug!("Backend->client: cancel fired mid-send");
+                                    break;
+                                }
+                                res = ws_sink.send(outgoing) => {
+                                    if let Err(e) = res {
+                                        error!("Failed to send message to client: {}", e);
+                                        // Write-side failure on the b2c path means the
+                                        // client dropped/reset while we were pushing
+                                        // bytes to it — attribute to b2c direction.
+                                        let _ = first_failure_btc.set((
+                                            crate::plugins::Direction::BackendToClient,
+                                            retry::classify_boxed_error(&e),
+                                        ));
+                                        break;
+                                    }
+                                    // Count the frame that successfully reached the client.
+                                    frames_b2c_task.fetch_add(1, Ordering::Relaxed);
+                                }
                             }
                         }
                         Ok(Message::Close(close_frame)) => {
                             debug!("Backend sent close frame");
-                            if let Err(e) = ws_sink.send(Message::Close(close_frame)).await {
-                                error!("Failed to send close to client: {}", e);
+                            // Race cancel in case c2b has already exited.
+                            tokio::select! {
+                                biased;
+                                _ = cancel_btc.cancelled() => {
+                                    debug!("Backend->client: cancel fired during backend-close forward");
+                                }
+                                res = ws_sink.send(Message::Close(close_frame)) => {
+                                    if let Err(e) = res {
+                                        error!("Failed to send close to client: {}", e);
+                                    }
+                                }
                             }
                             break;
                         }
@@ -3090,6 +3353,12 @@ async fn run_websocket_proxy(
                         }
                         Err(e) => {
                             error!("Error receiving from backend: {}", e);
+                            // Read-side failure on the b2c path means the
+                            // backend closed / reset the socket.
+                            let _ = first_failure_btc.set((
+                                crate::plugins::Direction::BackendToClient,
+                                retry::classify_boxed_error(&e),
+                            ));
                             break;
                         }
                     }
@@ -3097,15 +3366,79 @@ async fn run_websocket_proxy(
             }
         }
         debug!("Backend -> client forwarding completed");
+        // Mirror of c2b: once b2c exits for any reason, signal c2b to finish
+        // so the outer `tokio::join!` can complete promptly.
+        cancel_btc.cancel();
     };
 
-    // Wait for either direction to complete
-    tokio::select! {
-        _ = client_to_backend => {
-            debug!("Client to backend stream completed first");
+    // Wait for BOTH directions to complete before teardown — not just the
+    // first one. Using `tokio::select!` here would drop whichever half is
+    // still running (e.g., client half-closes while the backend is still
+    // draining queued frames), truncating `frames_*` counts, shortening
+    // `duration_ms`, and losing any terminal failure attribution the second
+    // half would have produced.
+    //
+    // But an unbounded `join!` can hang indefinitely: each relay loop calls
+    // `on_ws_frame` plugin hooks that aren't wrapped in a cancel-aware
+    // `select!`, so a stalled hook on the still-running half would hold the
+    // upgraded sockets and `_ws_connection_permit` forever and eventually
+    // starve new WebSocket sessions. Race the two halves for first-completion
+    // (the exit branch each one runs calls `cancel()` on the opposite token)
+    // then wait on the remaining half with a bounded drain grace. If the
+    // grace expires the remaining future is dropped — in-flight plugin calls
+    // are cancelled and all captured sockets are released.
+    const WS_DRAIN_GRACE: Duration = Duration::from_secs(30);
+    let mut c2b = Box::pin(client_to_backend);
+    let mut b2c = Box::pin(backend_to_client);
+    let client_done = tokio::select! {
+        _ = &mut c2b => true,
+        _ = &mut b2c => false,
+    };
+    // On grace-timeout the remaining half's future is dropped (in-flight
+    // plugin calls cancelled, sockets released). Record that as a failure so
+    // `on_ws_disconnect` surfaces `cause=timeout` instead of looking like a
+    // clean close. The direction tags which half was still running when the
+    // grace expired.
+    if client_done {
+        if tokio::time::timeout(WS_DRAIN_GRACE, b2c).await.is_err() {
+            let _ = first_failure.set((
+                crate::plugins::Direction::BackendToClient,
+                retry::ErrorClass::ReadWriteTimeout,
+            ));
         }
-        _ = backend_to_client => {
-            debug!("Backend to client stream completed first");
+    } else if tokio::time::timeout(WS_DRAIN_GRACE, c2b).await.is_err() {
+        let _ = first_failure.set((
+            crate::plugins::Direction::ClientToBackend,
+            retry::ErrorClass::ReadWriteTimeout,
+        ));
+    }
+
+    // Fire the on_ws_disconnect hook exactly once, after both forward halves
+    // have wound down. When no plugin opted in the list is empty and we skip
+    // the whole block — zero overhead for deployments that don't observe
+    // WebSocket sessions.
+    if !ws_disconnect_plugins.is_empty() {
+        let disconnect_duration_ms = (chrono::Utc::now() - session_meta.session_start)
+            .num_milliseconds()
+            .max(0) as f64;
+        let failure = first_failure.get().cloned();
+        let disconnect_ctx = crate::plugins::WsDisconnectContext {
+            namespace: session_meta.namespace,
+            proxy_id: proxy_id.to_string(),
+            proxy_name: session_meta.proxy_name,
+            client_ip: session_meta.client_ip,
+            backend_target: session_meta.backend_target,
+            listen_port: session_meta.listen_port,
+            duration_ms: disconnect_duration_ms,
+            frames_client_to_backend: frames_c2b.load(Ordering::Relaxed),
+            frames_backend_to_client: frames_b2c.load(Ordering::Relaxed),
+            direction: failure.as_ref().map(|(d, _)| *d),
+            error_class: failure.map(|(_, c)| c),
+            consumer_username: session_meta.consumer_username,
+            metadata: session_meta.metadata,
+        };
+        for plugin in &ws_disconnect_plugins {
+            plugin.on_ws_disconnect(&disconnect_ctx).await;
         }
     }
 
@@ -3510,6 +3843,10 @@ pub async fn log_rejected_request(
     let mut metadata = ctx.metadata.clone();
     metadata.insert("rejection_phase".to_string(), rejection_phase.to_string());
 
+    // Uses `..TransactionSummary::default()` for the boilerplate tail
+    // (body-streaming counters, booleans, `error_class`, `mirror`). Future
+    // additions to `TransactionSummary` get a sane default here without
+    // touching this call site — same pattern new log sites should follow.
     let summary = TransactionSummary {
         namespace: proxy
             .map(|p| p.namespace.clone())
@@ -3525,7 +3862,6 @@ pub async fn log_rejected_request(
             let url = build_backend_url(p, &ctx.path, "", p.listen_path.len());
             strip_query_params(&url).to_string()
         }),
-        backend_resolved_ip: None,
         response_status_code: status_code,
         latency_total_ms: total_ms,
         latency_gateway_processing_ms: total_ms,
@@ -3535,11 +3871,8 @@ pub async fn log_rejected_request(
         latency_plugin_external_io_ms: plugin_external_io_ms,
         latency_gateway_overhead_ms: gateway_overhead_ms,
         request_user_agent: ctx.headers.get("user-agent").cloned(),
-        response_streamed: false,
-        client_disconnected: false,
-        error_class: None,
-        mirror: false,
         metadata,
+        ..TransactionSummary::default()
     };
 
     crate::plugins::log_with_mirror(plugins, &summary, ctx).await;
@@ -4694,6 +5027,7 @@ async fn handle_proxy_request_inner(
             sticky_cookie_needed,
             start_time,
             is_h2_ws,
+            is_tls,
         )
         .await;
     }
@@ -5045,7 +5379,12 @@ async fn handle_proxy_request_inner(
                 let streamed = !body_exceeded;
                 let grpc_backend_total_ms = if streamed { -1.0 } else { backend_total_ms };
 
-                if !plugins.is_empty() {
+                // Build the summary up front so we can either log synchronously
+                // (body_exceeded early-return path) or defer via the streaming
+                // body wrapper (non-exceeded streaming path).
+                let deferred_grpc_logger: Option<
+                    Arc<crate::proxy::deferred_log::DeferredTransactionLogger>,
+                > = if !plugins.is_empty() {
                     let grpc_resolved_ip = state
                         .dns_cache
                         .resolve(
@@ -5078,13 +5417,28 @@ async fn handle_proxy_request_inner(
                         latency_gateway_overhead_ms: gateway_overhead_ms,
                         request_user_agent: ctx.headers.get("user-agent").cloned(),
                         response_streamed: streamed,
-                        client_disconnected: false,
                         error_class: final_error_class,
-                        mirror: false,
                         metadata: ctx.metadata.clone(),
+                        ..TransactionSummary::default()
                     };
-                    crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
-                }
+                    if body_exceeded {
+                        // Request body exceeded the size limit; we're about to
+                        // return a trailers-only RESOURCE_EXHAUSTED error. The
+                        // response body never streams, so log synchronously here.
+                        crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
+                        None
+                    } else {
+                        // Streaming gRPC response: defer so the summary reflects
+                        // mid-body RST, client cancellation, and partial bytes.
+                        Some(crate::proxy::deferred_log::DeferredTransactionLogger::new(
+                            summary,
+                            Arc::clone(&plugins),
+                            Arc::new(ctx.clone()),
+                        ))
+                    }
+                } else {
+                    None
+                };
 
                 if body_exceeded {
                     record_request(&state, 200);
@@ -5129,13 +5483,48 @@ async fn handle_proxy_request_inner(
                         state.h2_coalesce_target_bytes,
                     )
                 };
+                let mut body = if let Some(logger) = deferred_grpc_logger {
+                    body.with_logger(logger)
+                } else {
+                    body
+                };
 
-                return Ok(resp_builder.body(body).unwrap_or_else(|_| {
-                    grpc_proxy::build_grpc_error_response(
-                        grpc_proxy::grpc_status::UNAVAILABLE,
-                        "Internal gateway error",
-                    )
-                }));
+                // Detach the deferred logger before handing the body to
+                // `resp_builder.body(...)`. If the build fails (e.g. plugin/
+                // header mutations left the builder in an error state), the
+                // body is dropped before we can react — which would fire the
+                // logger's Drop safety net as `client_disconnect`, incorrectly
+                // billing a server-side build failure as a client abort and
+                // inflating disconnect/body-error metrics. By taking the
+                // logger first we can fire a specific server-side outcome on
+                // failure and reattach on success. Mirrors the HTTP path's
+                // `take_logger` → reattach-or-fire pattern.
+                let logger = body.take_logger();
+                match resp_builder.body(body) {
+                    Ok(mut resp) => {
+                        if let Some(logger) = logger {
+                            resp.body_mut().set_logger(logger);
+                        }
+                        return Ok(resp);
+                    }
+                    Err(_) => {
+                        if let Some(logger) = logger {
+                            // Classify as `ProtocolError` (not `RequestError`)
+                            // because gRPC errors ride on HTTP/2 and this is
+                            // a framing/build failure on the response stream,
+                            // not a client-initiated request failure.
+                            logger.fire(crate::proxy::deferred_log::BodyOutcome::error(
+                                crate::retry::ErrorClass::ProtocolError,
+                                0,
+                                false,
+                            ));
+                        }
+                        return Ok(grpc_proxy::build_grpc_error_response(
+                            grpc_proxy::grpc_status::UNAVAILABLE,
+                            "Internal gateway error",
+                        ));
+                    }
+                }
             }
             Ok(GrpcResponseKind::Buffered(grpc_resp)) => {
                 let mut response_status = grpc_resp.status;
@@ -5317,11 +5706,8 @@ async fn handle_proxy_request_inner(
                         latency_plugin_external_io_ms: plugin_external_io_ms,
                         latency_gateway_overhead_ms: gateway_overhead_ms,
                         request_user_agent: ctx.headers.get("user-agent").cloned(),
-                        response_streamed: false,
-                        client_disconnected: false,
-                        error_class: None,
-                        mirror: false,
                         metadata: ctx.metadata.clone(),
+                        ..TransactionSummary::default()
                     };
                     crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
                 }
@@ -5434,7 +5820,6 @@ async fn handle_proxy_request_inner(
                                 let url = build_backend_url(p, &ctx.path, "", p.listen_path.len());
                                 strip_query_params(&url).to_string()
                             }),
-                            backend_resolved_ip: None,
                             response_status_code: 200, // gRPC errors use HTTP 200
                             latency_total_ms: total_ms,
                             latency_gateway_processing_ms: total_ms - backend_total_ms,
@@ -5444,11 +5829,9 @@ async fn handle_proxy_request_inner(
                             latency_plugin_external_io_ms: grpc_plugin_external_io_ms,
                             latency_gateway_overhead_ms: grpc_gateway_overhead_ms,
                             request_user_agent: ctx.headers.get("user-agent").cloned(),
-                            response_streamed: false,
-                            client_disconnected: false,
                             error_class: Some(grpc_error_class),
-                            mirror: false,
                             metadata,
+                            ..TransactionSummary::default()
                         };
                         crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
                     }
@@ -5657,7 +6040,7 @@ async fn handle_proxy_request_inner(
     let mut response_body = backend_resp.body;
     let mut response_headers = backend_resp.headers;
     let backend_resolved_ip = backend_resp.backend_resolved_ip;
-    let backend_error_class = backend_resp.error_class.clone();
+    let backend_error_class = backend_resp.error_class;
 
     debug!(
         proxy_id = %proxy.id,
@@ -5824,37 +6207,69 @@ async fn handle_proxy_request_inner(
     let gateway_processing_ms = total_ms - effective_backend_ms;
     let gateway_overhead_ms = (total_ms - effective_backend_ms - plugin_execution_ms).max(0.0);
 
-    // Log phase — skip TransactionSummary construction when no plugins need it
-    if !plugins.is_empty() {
-        let summary = TransactionSummary {
-            namespace: proxy.namespace.clone(),
-            timestamp_received: ctx.timestamp_received.to_rfc3339(),
-            client_ip: ctx.client_ip.clone(),
-            consumer_username: ctx.effective_identity().map(str::to_owned),
-            http_method: method,
-            request_path: path,
-            matched_proxy_id: Some(proxy.id.clone()),
-            matched_proxy_name: proxy.name.clone(),
-            backend_target_url: Some(strip_query_params(&backend_url).to_string()),
-            backend_resolved_ip,
-            response_status_code: response_status,
-            latency_total_ms: total_ms,
-            latency_gateway_processing_ms: gateway_processing_ms,
-            latency_backend_ttfb_ms: backend_ttfb_ms,
-            latency_backend_total_ms: backend_total_ms,
-            latency_plugin_execution_ms: plugin_execution_ms,
-            latency_plugin_external_io_ms: plugin_external_io_ms,
-            latency_gateway_overhead_ms: gateway_overhead_ms,
-            request_user_agent: ctx.headers.get("user-agent").cloned(),
-            response_streamed: is_streaming_response,
-            client_disconnected: false,
-            error_class: backend_error_class,
-            mirror: false,
-            metadata: ctx.metadata.clone(),
-        };
+    // Log phase — skip TransactionSummary construction when no plugins need it.
+    //
+    // For streaming responses (Streaming / StreamingH2 / StreamingH3), defer
+    // the log until the response body reaches a terminal state. At this point
+    // only response headers have been flushed to hyper; the body is still being
+    // polled out. Firing the log synchronously would record
+    // `client_disconnected=false, body_completed=false` even if hyper then
+    // cancels the connection mid-stream. The DeferredTransactionLogger attaches
+    // to the ProxyBody wrapper and fires on success (Ready(None)), streaming
+    // error (Ready(Some(Err))), or the Drop safety net (client disconnected
+    // before completion). See `src/proxy/deferred_log.rs`.
+    //
+    // Note: a plugin reject during after_proxy/on_response_body/on_final_response_body
+    // can replace the originally-streaming body with a Buffered one. We branch on
+    // the *current* `response_body` rather than the captured `is_streaming_response`
+    // (which tracks the original backend behavior for observability).
+    let deferred_logger: Option<Arc<crate::proxy::deferred_log::DeferredTransactionLogger>> =
+        if !plugins.is_empty() {
+            let summary = TransactionSummary {
+                namespace: proxy.namespace.clone(),
+                timestamp_received: ctx.timestamp_received.to_rfc3339(),
+                client_ip: ctx.client_ip.clone(),
+                consumer_username: ctx.effective_identity().map(str::to_owned),
+                http_method: method,
+                request_path: path,
+                matched_proxy_id: Some(proxy.id.clone()),
+                matched_proxy_name: proxy.name.clone(),
+                backend_target_url: Some(strip_query_params(&backend_url).to_string()),
+                backend_resolved_ip,
+                response_status_code: response_status,
+                latency_total_ms: total_ms,
+                latency_gateway_processing_ms: gateway_processing_ms,
+                latency_backend_ttfb_ms: backend_ttfb_ms,
+                latency_backend_total_ms: backend_total_ms,
+                latency_plugin_execution_ms: plugin_execution_ms,
+                latency_plugin_external_io_ms: plugin_external_io_ms,
+                latency_gateway_overhead_ms: gateway_overhead_ms,
+                request_user_agent: ctx.headers.get("user-agent").cloned(),
+                response_streamed: is_streaming_response,
+                error_class: backend_error_class,
+                metadata: ctx.metadata.clone(),
+                ..TransactionSummary::default()
+            };
 
-        crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
-    }
+            let body_will_stream = matches!(
+                &response_body,
+                ResponseBody::Streaming(_)
+                    | ResponseBody::StreamingH2(_)
+                    | ResponseBody::StreamingH3(_)
+            );
+            if body_will_stream {
+                Some(crate::proxy::deferred_log::DeferredTransactionLogger::new(
+                    summary,
+                    Arc::clone(&plugins),
+                    Arc::new(ctx.clone()),
+                ))
+            } else {
+                crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
+                None
+            }
+        } else {
+            None
+        };
 
     // Inject sticky session cookie when cookie-based consistent hashing selected a new session
     if sticky_cookie_needed
@@ -6053,9 +6468,41 @@ async fn handle_proxy_request_inner(
         ResponseBody::Buffered(data) => ProxyBody::full(Bytes::from(data)),
     };
 
-    Ok(resp_builder
-        .body(body)
-        .unwrap_or_else(|_| Response::new(ProxyBody::from_string("Internal Server Error"))))
+    // Attach deferred logger to the body so `log_with_mirror` fires when the
+    // body reaches a terminal state (completion, streaming error, or client
+    // disconnect via the Drop safety net) rather than at header-flush time.
+    // `deferred_logger` is `Some` only for streaming responses with plugins.
+    let mut body = if let Some(logger) = deferred_logger {
+        body.with_logger(logger)
+    } else {
+        body
+    };
+
+    // Detach the logger before handing the body to the builder. `http::Error`
+    // doesn't expose the consumed body, so we can't recover the logger after
+    // a builder failure. Re-attach on success; fire an explicit error outcome
+    // on failure so the dropped body isn't miscounted as a client disconnect.
+    let logger = body.take_logger();
+    match resp_builder.body(body) {
+        Ok(mut resp) => {
+            if let Some(logger) = logger {
+                resp.body_mut().set_logger(logger);
+            }
+            Ok(resp)
+        }
+        Err(_) => {
+            if let Some(logger) = logger {
+                logger.fire(crate::proxy::deferred_log::BodyOutcome::error(
+                    crate::retry::ErrorClass::RequestError,
+                    0,
+                    false,
+                ));
+            }
+            Ok(Response::new(ProxyBody::from_string(
+                "Internal Server Error",
+            )))
+        }
+    }
 }
 
 /// Build the backend URL based on proxy config and path forwarding logic.
@@ -6253,7 +6700,8 @@ async fn proxy_to_backend_retry(
             | "trailer"
             | "proxy-authorization"
             | "proxy-connection"
-            | "upgrade" => continue,
+            | "upgrade"
+            | "x-ferrum-original-content-encoding" => continue,
             _ => {
                 req_builder = req_builder.header(k.as_str(), v.as_str());
             }
@@ -6611,7 +7059,8 @@ async fn proxy_to_backend(
             | "trailer"
             | "proxy-authorization"
             | "proxy-connection"
-            | "upgrade" => continue,
+            | "upgrade"
+            | "x-ferrum-original-content-encoding" => continue,
             _ => {
                 req_builder = req_builder.header(k.as_str(), v.as_str());
             }
@@ -7364,24 +7813,14 @@ async fn proxy_to_backend_http2(
     let mut sender = match state.http2_pool.get_sender(proxy, &state.dns_cache).await {
         Ok(s) => s,
         Err(e) => {
-            let msg = match &e {
-                http2_pool::Http2PoolError::BackendTimeout(m) => m.clone(),
-                http2_pool::Http2PoolError::BackendUnavailable(m) => m.clone(),
-                http2_pool::Http2PoolError::Internal(m) => m.clone(),
-            };
+            let msg = e.message().to_string();
             // Classify the H2 pool error for accurate error_class reporting.
-            let h2_error_class = if retry::is_port_exhaustion_message(&msg) {
+            // Uses the shared classifier so updates to the taxonomy apply uniformly
+            // instead of scattering ad-hoc substring checks across call sites.
+            let h2_error_class = http2_pool::classify_http2_pool_error(&e);
+            if matches!(h2_error_class, retry::ErrorClass::PortExhaustion) {
                 state.overload.record_port_exhaustion();
-                retry::ErrorClass::PortExhaustion
-            } else if msg.contains("DNS resolution failed") {
-                retry::ErrorClass::DnsLookupError
-            } else if msg.contains("Connect timeout") {
-                retry::ErrorClass::ConnectionTimeout
-            } else if msg.contains("TLS") || msg.contains("certificate") {
-                retry::ErrorClass::TlsError
-            } else {
-                retry::ErrorClass::ConnectionPoolError
-            };
+            }
             let error_body = if h2_error_class == retry::ErrorClass::DnsLookupError {
                 r#"{"error":"DNS resolution for backend failed"}"#.to_string()
             } else {
@@ -7462,7 +7901,8 @@ async fn proxy_to_backend_http2(
             | "trailer"
             | "proxy-authorization"
             | "proxy-connection"
-            | "upgrade" => continue,
+            | "upgrade"
+            | "x-ferrum-original-content-encoding" => continue,
             _ => {
                 if let (Ok(name), Ok(val)) = (
                     hyper::header::HeaderName::from_bytes(k.as_bytes()),
@@ -7728,7 +8168,8 @@ async fn proxy_to_backend_http3(
             | "trailer"
             | "proxy-authorization"
             | "proxy-connection"
-            | "upgrade" => continue,
+            | "upgrade"
+            | "x-ferrum-original-content-encoding" => continue,
             _ => {
                 if let (Ok(header_name), Ok(header_value)) = (name.parse(), value.parse()) {
                     http3_headers.push((header_name, header_value));
@@ -8028,7 +8469,8 @@ async fn proxy_to_backend_http3_retry(
             | "trailer"
             | "proxy-authorization"
             | "proxy-connection"
-            | "upgrade" => continue,
+            | "upgrade"
+            | "x-ferrum-original-content-encoding" => continue,
             "host" => {
                 // Use effective upstream host unless preserve_host_header is set
                 let host_value = if proxy.preserve_host_header {

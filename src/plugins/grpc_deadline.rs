@@ -29,13 +29,61 @@ pub struct GrpcDeadline {
 
 impl GrpcDeadline {
     pub fn new(config: &Value) -> Result<Self, String> {
+        let max_deadline_ms = config["max_deadline_ms"].as_u64();
+        let default_deadline_ms = config["default_deadline_ms"].as_u64();
+        let subtract_gateway_processing = config["subtract_gateway_processing"]
+            .as_bool()
+            .unwrap_or(false);
+        let reject_no_deadline = config["reject_no_deadline"].as_bool().unwrap_or(false);
+
+        if let Some(0) = max_deadline_ms {
+            return Err(
+                "grpc_deadline: 'max_deadline_ms' must be greater than zero (configured value would reject every request)"
+                    .to_string(),
+            );
+        }
+        if let Some(0) = default_deadline_ms {
+            return Err(
+                "grpc_deadline: 'default_deadline_ms' must be greater than zero".to_string(),
+            );
+        }
+        if let (Some(default_ms), Some(max_ms)) = (default_deadline_ms, max_deadline_ms)
+            && default_ms > max_ms
+        {
+            return Err(format!(
+                "grpc_deadline: 'default_deadline_ms' ({default_ms}) cannot exceed 'max_deadline_ms' ({max_ms})"
+            ));
+        }
+
+        // Reject configurations where the plugin does no useful work — same policy as
+        // other admission/observability plugins (see CLAUDE.md "Plugin Config Validation").
+        //
+        // Any of the four fields is a legitimate standalone rule:
+        //   - `max_deadline_ms`: caps incoming deadlines
+        //   - `default_deadline_ms`: injects a deadline when the client omits one
+        //   - `reject_no_deadline`: rejects requests arriving without a deadline
+        //   - `subtract_gateway_processing`: adjusts incoming deadlines by gateway
+        //     processing time (useful on its own when clients already send
+        //     `grpc-timeout`). It is a no-op when the client omits the header, but
+        //     that matches the user's intent — the rule shouldn't fire when there's
+        //     nothing to subtract from.
+        let has_any_rule = max_deadline_ms.is_some()
+            || default_deadline_ms.is_some()
+            || subtract_gateway_processing
+            || reject_no_deadline;
+        if !has_any_rule {
+            return Err(
+                "grpc_deadline: no rules configured — set at least one of 'max_deadline_ms', \
+                 'default_deadline_ms', 'subtract_gateway_processing', or 'reject_no_deadline'"
+                    .to_string(),
+            );
+        }
+
         Ok(Self {
-            max_deadline_ms: config["max_deadline_ms"].as_u64(),
-            default_deadline_ms: config["default_deadline_ms"].as_u64(),
-            subtract_gateway_processing: config["subtract_gateway_processing"]
-                .as_bool()
-                .unwrap_or(false),
-            reject_no_deadline: config["reject_no_deadline"].as_bool().unwrap_or(false),
+            max_deadline_ms,
+            default_deadline_ms,
+            subtract_gateway_processing,
+            reject_no_deadline,
         })
     }
 }
@@ -45,19 +93,43 @@ impl GrpcDeadline {
 /// Format: `<digits><unit>` where unit is:
 /// - `H` = hours, `M` = minutes, `S` = seconds
 /// - `m` = milliseconds, `u` = microseconds, `n` = nanoseconds
+///
+/// We use byte-wise parsing rather than `str::split_at(len-1)` so a malformed
+/// non-ASCII value (e.g., a multi-byte UTF-8 sequence) cannot panic on a
+/// char-boundary violation.
+///
+/// Per gRPC spec the digit portion is at most 8 ASCII digits, but we accept
+/// longer digit strings (within u64 range) for backwards compatibility with
+/// clients that violate the spec — the value is later capped by
+/// `max_deadline_ms` if configured.
 fn parse_grpc_timeout(val: &str) -> Option<Duration> {
-    if val.is_empty() {
+    let bytes = val.as_bytes();
+    if bytes.is_empty() {
         return None;
     }
-    let (digits, unit) = val.split_at(val.len() - 1);
+    let unit = bytes[bytes.len() - 1];
+    // Reject multi-byte UTF-8 by requiring the unit byte to be a plain ASCII letter.
+    if !unit.is_ascii_alphabetic() {
+        return None;
+    }
+    let digits = match std::str::from_utf8(&bytes[..bytes.len() - 1]) {
+        Ok(s) => s,
+        Err(_) => return None,
+    };
+    if digits.is_empty() {
+        return None;
+    }
+    if !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
     let value: u64 = digits.parse().ok()?;
     match unit {
-        "H" => Some(Duration::from_secs(value.saturating_mul(3600))),
-        "M" => Some(Duration::from_secs(value.saturating_mul(60))),
-        "S" => Some(Duration::from_secs(value)),
-        "m" => Some(Duration::from_millis(value)),
-        "u" => Some(Duration::from_micros(value)),
-        "n" => Some(Duration::from_nanos(value)),
+        b'H' => Some(Duration::from_secs(value.saturating_mul(3600))),
+        b'M' => Some(Duration::from_secs(value.saturating_mul(60))),
+        b'S' => Some(Duration::from_secs(value)),
+        b'm' => Some(Duration::from_millis(value)),
+        b'u' => Some(Duration::from_micros(value)),
+        b'n' => Some(Duration::from_nanos(value)),
         _ => None,
     }
 }

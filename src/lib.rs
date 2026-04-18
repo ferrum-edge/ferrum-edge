@@ -68,6 +68,63 @@ pub mod _test_support {
         crate::proxy::tcp_proxy::classify_stream_error(error)
     }
 
+    pub use crate::proxy::tcp_proxy::{StreamCopyResult, StreamIoSide};
+
+    /// Reach into `tcp_proxy` to exercise the `Direction` + IO-side →
+    /// `DisconnectCause` mapping that the TCP accept loop uses when
+    /// populating stream disconnect metrics.
+    pub fn disconnect_cause_for_failure(
+        direction: crate::plugins::Direction,
+        class: &crate::retry::ErrorClass,
+        side: Option<StreamIoSide>,
+    ) -> crate::plugins::DisconnectCause {
+        crate::proxy::tcp_proxy::disconnect_cause_for_failure(direction, class, side)
+    }
+
+    /// Invoke the internal `bidirectional_copy` for unit tests. Generic over
+    /// any streams implementing `AsyncRead + AsyncWrite + Unpin`.
+    pub async fn bidirectional_copy_for_test<C, B>(
+        client: C,
+        backend: B,
+        idle_timeout: Option<std::time::Duration>,
+        half_close_cap: Option<std::time::Duration>,
+        buf_size: usize,
+    ) -> StreamCopyResult
+    where
+        C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+        B: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        crate::proxy::tcp_proxy::bidirectional_copy_for_test(
+            client,
+            backend,
+            idle_timeout,
+            half_close_cap,
+            buf_size,
+        )
+        .await
+    }
+
+    /// Invoke the internal `bidirectional_splice` (Linux zero-copy relay) for
+    /// unit tests. Only available on Linux — on other platforms there is no
+    /// splice path to exercise.
+    #[cfg(target_os = "linux")]
+    pub async fn bidirectional_splice_for_test(
+        client: tokio::net::TcpStream,
+        backend: tokio::net::TcpStream,
+        idle_timeout: Option<std::time::Duration>,
+        half_close_cap: Option<std::time::Duration>,
+        pipe_size: usize,
+    ) -> StreamCopyResult {
+        crate::proxy::tcp_proxy::bidirectional_splice_for_test(
+            client,
+            backend,
+            idle_timeout,
+            half_close_cap,
+            pipe_size,
+        )
+        .await
+    }
+
     // ── plugins/ws_rate_limiting ─────────────────────────────────────────────
     /// Create a fresh `WsRateLimiting` instance and return its Redis scope key.
     /// Each call returns a key from a new instance (unique UUID prefix), so two
@@ -194,5 +251,67 @@ pub mod _test_support {
         grpc_message: &str,
     ) {
         crate::proxy::insert_grpc_error_metadata(metadata, grpc_status, grpc_message)
+    }
+
+    // ── WebSocket tunnel-mode disconnect hook ────────────────────────────────
+    //
+    // Tunnel mode bypasses WebSocket frame parsing and does raw TCP bidirectional
+    // copy. The test-support helpers below expose the internal `WsSessionMeta`
+    // constructor and the `fire_ws_tunnel_disconnect_hooks` entry point so unit
+    // tests can verify that `on_ws_disconnect` still fires in tunnel mode (the
+    // disconnect-observability contract used by ws_frame_logging and
+    // prometheus_metrics).
+    #[allow(clippy::too_many_arguments)]
+    pub fn make_ws_session_meta(
+        namespace: String,
+        proxy_name: Option<String>,
+        client_ip: String,
+        backend_target: String,
+        listen_port: u16,
+        consumer_username: Option<String>,
+        metadata: HashMap<String, String>,
+        session_start: chrono::DateTime<chrono::Utc>,
+    ) -> crate::proxy::WsSessionMeta {
+        crate::proxy::WsSessionMeta {
+            namespace,
+            proxy_name,
+            client_ip,
+            backend_target,
+            listen_port,
+            consumer_username,
+            metadata,
+            session_start,
+        }
+    }
+
+    pub async fn fire_ws_tunnel_disconnect_hooks(
+        ws_disconnect_plugins: &[Arc<dyn Plugin>],
+        proxy_id: &str,
+        session_meta: &crate::proxy::WsSessionMeta,
+        failure: Option<(crate::plugins::Direction, crate::retry::ErrorClass)>,
+    ) {
+        crate::proxy::fire_ws_tunnel_disconnect_hooks(
+            ws_disconnect_plugins,
+            proxy_id,
+            session_meta,
+            failure,
+        )
+        .await
+    }
+
+    /// Construct a streaming `ProxyBody` for use in unit/integration tests.
+    /// Delegates to the crate-private `ProxyBody::streaming` constructor,
+    /// keeping that constructor internal while still letting tests exercise
+    /// the streaming-variant `Drop` / `poll_frame` paths.
+    pub fn proxy_body_streaming_for_test(
+        body: std::pin::Pin<
+            Box<
+                dyn http_body::Body<Data = bytes::Bytes, Error = crate::proxy::body::ProxyBodyError>
+                    + Send
+                    + 'static,
+            >,
+        >,
+    ) -> crate::proxy::ProxyBody {
+        crate::proxy::body::ProxyBody::streaming(body)
     }
 }

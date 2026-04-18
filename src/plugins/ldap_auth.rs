@@ -692,6 +692,20 @@ impl Plugin for LdapAuth {
             };
         }
 
+        // RFC 4513 §5.1.2: an LDAP simple bind with an empty password is treated
+        // as an "unauthenticated bind" — many directories (notably Active
+        // Directory) accept it and return success without verifying the user.
+        // This would let any caller authenticate as any username they pass in
+        // the Basic auth header. Reject empty passwords before they reach the
+        // LDAP server.
+        if password.is_empty() {
+            return PluginResult::Reject {
+                status_code: 401,
+                body: r#"{"error":"Password must not be empty"}"#.into(),
+                headers: HashMap::new(),
+            };
+        }
+
         // Check cache first
         if self.check_cache(username, password) {
             debug!("ldap_auth: cache hit for user '{}'", username);

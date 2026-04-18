@@ -10,6 +10,18 @@
 //! Only compatible with prefix-based `listen_path` proxies (not regex, not
 //! host-only or port-only routing) and HTTP protocol types.
 //!
+//! # Caching
+//!
+//! Per CLAUDE.md ("Performance Rules": pre-compute / cache at config-reload
+//! time), the fetched spec body is cached in-process with a TTL so that
+//! `/specz` requests do not re-fetch the upstream document on every call.
+//! The cache is opportunistic: the first request triggers a fetch and stores
+//! the body+content-type; subsequent requests within the TTL serve directly
+//! from memory. On TTL expiry, the next request re-fetches. Failures are not
+//! cached — every failed fetch is retried until a success populates the cache.
+//!
+//! TTL is controlled by `cache_ttl_seconds` (default 300s = 5 min).
+//! Set to 0 to disable caching entirely.
 //!
 //! # Configuration
 //!
@@ -17,24 +29,48 @@
 //! {
 //!   "spec_url": "https://internal-service/docs/openapi.yaml",
 //!   "content_type": "application/yaml",    // optional override
-//!   "tls_no_verify": false                 // optional, skip TLS verification
+//!   "tls_no_verify": false,                // optional, skip TLS verification
+//!   "cache_ttl_seconds": 300               // optional, 0 = disable
 //! }
 //! ```
 
+use arc_swap::ArcSwap;
 use async_trait::async_trait;
+use bytes::Bytes;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+use tokio::sync::Mutex;
 
 use crate::dns::DnsCacheResolver;
 
 use super::{Plugin, PluginResult, RequestContext};
 
+/// Default cache TTL for fetched spec bodies (5 minutes).
+const DEFAULT_CACHE_TTL_SECONDS: u64 = 300;
+
+/// A cached spec response (body + content-type + insertion time).
+#[derive(Clone)]
+struct CachedSpec {
+    body: Bytes,
+    content_type: String,
+    inserted_at: Instant,
+}
+
 /// Spec Expose plugin — serves API spec documents on `{listen_path}/specz`.
 pub struct SpecExpose {
     spec_url: String,
     content_type_override: Option<String>,
+    cache_ttl: Duration,
+    cache: ArcSwap<Option<CachedSpec>>,
+    /// Single-flight lock around the upstream fetch. Concurrent cache-miss
+    /// callers serialize here; whoever acquires first does the upstream fetch
+    /// and populates the cache, and the rest observe the fresh entry via
+    /// `cached_spec()` after the lock releases. Prevents a cold-cache request
+    /// flood from fanning out to the upstream document store (the exact DoS
+    /// the cache was added to prevent).
+    fetch_lock: Mutex<()>,
     http_client: reqwest::Client,
 }
 
@@ -51,18 +87,46 @@ impl SpecExpose {
             })?
             .to_string();
 
-        // Validate URL format
-        url::Url::parse(&spec_url)
+        // Validate URL format and require a fetchable scheme.
+        let parsed = url::Url::parse(&spec_url)
             .map_err(|e| format!("spec_expose: 'spec_url' is not a valid URL: {e}"))?;
+        match parsed.scheme() {
+            "http" | "https" => {}
+            other => {
+                return Err(format!(
+                    "spec_expose: 'spec_url' must use http or https scheme, got '{other}'"
+                ));
+            }
+        }
 
-        let content_type_override = config["content_type"]
-            .as_str()
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string());
+        let content_type_override = match config.get("content_type") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(s)) => {
+                let trimmed = s.trim();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                }
+            }
+            Some(other) => {
+                return Err(format!(
+                    "spec_expose: 'content_type' must be a string, got: {other}"
+                ));
+            }
+        };
 
         let tls_no_verify = config["tls_no_verify"]
             .as_bool()
             .unwrap_or(plugin_http_client.tls_no_verify());
+
+        let cache_ttl_seconds = match config.get("cache_ttl_seconds") {
+            None | Some(Value::Null) => DEFAULT_CACHE_TTL_SECONDS,
+            Some(v) => v.as_u64().ok_or_else(|| {
+                format!("spec_expose: 'cache_ttl_seconds' must be a non-negative integer, got: {v}")
+            })?,
+        };
+        let cache_ttl = Duration::from_secs(cache_ttl_seconds);
 
         // Build a dedicated reqwest client for spec fetching.
         // We use a separate client so we can honour the per-plugin tls_no_verify
@@ -103,6 +167,9 @@ impl SpecExpose {
         Ok(Self {
             spec_url,
             content_type_override,
+            cache_ttl,
+            cache: ArcSwap::from_pointee(None),
+            fetch_lock: Mutex::new(()),
             http_client,
         })
     }
@@ -119,6 +186,104 @@ impl SpecExpose {
         } else {
             false
         }
+    }
+
+    /// Returns a cached spec when present and not expired. Caching is disabled
+    /// (TTL = 0) → always returns None so the next call refetches from origin.
+    fn cached_spec(&self) -> Option<CachedSpec> {
+        if self.cache_ttl.is_zero() {
+            return None;
+        }
+        let snapshot = self.cache.load();
+        let entry = snapshot.as_ref().as_ref()?;
+        if entry.inserted_at.elapsed() < self.cache_ttl {
+            Some(entry.clone())
+        } else {
+            None
+        }
+    }
+
+    /// Fetch the spec from the upstream and cache it on success. Returns the
+    /// fresh spec on success or a [`PluginResult::Reject`] describing the
+    /// upstream failure mode (502). Failures are NOT cached — the next call
+    /// will re-attempt the fetch.
+    async fn fetch_and_cache(&self) -> Result<CachedSpec, PluginResult> {
+        let response = self
+            .http_client
+            .get(&self.spec_url)
+            .send()
+            .await
+            .map_err(|e| {
+                tracing::warn!(
+                    spec_url = %self.spec_url,
+                    error = %e,
+                    "spec_expose: failed to fetch spec document"
+                );
+                let mut headers = HashMap::new();
+                headers.insert("content-type".to_string(), "application/json".to_string());
+                PluginResult::Reject {
+                    status_code: 502,
+                    body: r#"{"error":"Failed to fetch API specification from upstream"}"#
+                        .to_string(),
+                    headers,
+                }
+            })?;
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            tracing::warn!(
+                spec_url = %self.spec_url,
+                upstream_status = status,
+                "spec_expose: upstream returned non-success status"
+            );
+            let mut headers = HashMap::new();
+            headers.insert("content-type".to_string(), "application/json".to_string());
+            return Err(PluginResult::Reject {
+                status_code: 502,
+                body: format!(r#"{{"error":"Upstream spec endpoint returned status {status}"}}"#),
+                headers,
+            });
+        }
+
+        // Determine content-type: plugin override > upstream response > default.
+        // Computed before consuming the response.
+        let content_type = self
+            .content_type_override
+            .clone()
+            .or_else(|| {
+                response
+                    .headers()
+                    .get("content-type")
+                    .and_then(|v| v.to_str().ok())
+                    .map(|s| s.to_string())
+            })
+            .unwrap_or_else(|| "application/octet-stream".to_string());
+
+        let body = response.bytes().await.map_err(|e| {
+            tracing::warn!(
+                spec_url = %self.spec_url,
+                error = %e,
+                "spec_expose: failed to read spec response body"
+            );
+            let mut headers = HashMap::new();
+            headers.insert("content-type".to_string(), "application/json".to_string());
+            PluginResult::Reject {
+                status_code: 502,
+                body: r#"{"error":"Failed to read API specification response body"}"#.to_string(),
+                headers,
+            }
+        })?;
+
+        let entry = CachedSpec {
+            body,
+            content_type,
+            inserted_at: Instant::now(),
+        };
+
+        if !self.cache_ttl.is_zero() {
+            self.cache.store(Arc::new(Some(entry.clone())));
+        }
+        Ok(entry)
     }
 }
 
@@ -166,84 +331,43 @@ impl Plugin for SpecExpose {
             return PluginResult::Continue;
         }
 
-        // Fetch the spec document from the configured URL
-        let response = match self.http_client.get(&self.spec_url).send().await {
-            Ok(resp) => resp,
-            Err(e) => {
-                tracing::warn!(
-                    spec_url = %self.spec_url,
-                    error = %e,
-                    "spec_expose: failed to fetch spec document"
-                );
-                let mut headers = HashMap::new();
-                headers.insert("content-type".to_string(), "application/json".to_string());
-                return PluginResult::Reject {
-                    status_code: 502,
-                    body: format!(
-                        r#"{{"error":"Failed to fetch API specification from upstream","detail":"{}"}}"#,
-                        e.to_string().replace('"', "\\\"")
-                    ),
-                    headers,
-                };
+        // Try the cache first; on miss or expiry, fetch and (when caching is
+        // enabled) serialize through the single-flight lock so a burst of
+        // cold-cache requests does not fan out to the upstream document store.
+        //
+        // When caching is disabled (TTL=0) we bypass the lock entirely — every
+        // request is expected to re-fetch, so serializing them would collapse
+        // throughput into strictly-sequential upstream calls.
+        let entry = if self.cache_ttl.is_zero() {
+            match self.fetch_and_cache().await {
+                Ok(entry) => entry,
+                Err(reject) => return reject,
+            }
+        } else {
+            match self.cached_spec() {
+                Some(entry) => entry,
+                None => {
+                    let _guard = self.fetch_lock.lock().await;
+                    // Re-check the cache after acquiring the lock: another task
+                    // may have populated it while we were waiting.
+                    if let Some(entry) = self.cached_spec() {
+                        entry
+                    } else {
+                        match self.fetch_and_cache().await {
+                            Ok(entry) => entry,
+                            Err(reject) => return reject,
+                        }
+                    }
+                }
             }
         };
 
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            tracing::warn!(
-                spec_url = %self.spec_url,
-                upstream_status = status,
-                "spec_expose: upstream returned non-success status"
-            );
-            let mut headers = HashMap::new();
-            headers.insert("content-type".to_string(), "application/json".to_string());
-            return PluginResult::Reject {
-                status_code: 502,
-                body: format!(r#"{{"error":"Upstream spec endpoint returned status {status}"}}"#),
-                headers,
-            };
-        }
-
-        // Determine content-type: plugin override > upstream response > default
-        let content_type = self
-            .content_type_override
-            .clone()
-            .or_else(|| {
-                response
-                    .headers()
-                    .get("content-type")
-                    .and_then(|v| v.to_str().ok())
-                    .map(|s| s.to_string())
-            })
-            .unwrap_or_else(|| "application/octet-stream".to_string());
-
-        match response.bytes().await {
-            Ok(body) => {
-                let mut headers = HashMap::new();
-                headers.insert("content-type".to_string(), content_type);
-                PluginResult::RejectBinary {
-                    status_code: 200,
-                    body,
-                    headers,
-                }
-            }
-            Err(e) => {
-                tracing::warn!(
-                    spec_url = %self.spec_url,
-                    error = %e,
-                    "spec_expose: failed to read spec response body"
-                );
-                let mut headers = HashMap::new();
-                headers.insert("content-type".to_string(), "application/json".to_string());
-                PluginResult::Reject {
-                    status_code: 502,
-                    body: format!(
-                        r#"{{"error":"Failed to read API specification response body","detail":"{}"}}"#,
-                        e.to_string().replace('"', "\\\"")
-                    ),
-                    headers,
-                }
-            }
+        let mut headers = HashMap::new();
+        headers.insert("content-type".to_string(), entry.content_type);
+        PluginResult::RejectBinary {
+            status_code: 200,
+            body: entry.body,
+            headers,
         }
     }
 }

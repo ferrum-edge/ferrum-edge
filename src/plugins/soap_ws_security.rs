@@ -566,10 +566,20 @@ impl SoapWsSecurity {
         security_block: &str,
         soap_body: &str,
     ) -> Result<(), String> {
-        // Find all Reference elements in SignedInfo
+        // Find all Reference elements in SignedInfo. We must use the variant
+        // that returns the end offset so we can advance past each match —
+        // advancing by 1 byte (or by `ref_block.len().min(1)`, the previous
+        // bug) just re-finds the same Reference and loops forever.
         let mut search_from = 0;
-        while let Some(ref_block) = find_element_block_from(signed_info, "Reference", search_from) {
-            search_from += ref_block.len().min(1);
+        let mut reference_count = 0;
+        while let Some((ref_block, next_start)) =
+            find_element_block_from_with_end(signed_info, "Reference", search_from)
+        {
+            reference_count += 1;
+            // Defensive: ensure the cursor advances even for pathological
+            // inputs (e.g. zero-length match). Without this, a malformed
+            // element could still loop indefinitely.
+            search_from = next_start.max(search_from + 1);
 
             let uri = find_attribute(&ref_block, "URI").unwrap_or_default();
 
@@ -624,6 +634,14 @@ impl SoapWsSecurity {
             }
         }
 
+        // XMLDSig requires SignedInfo to contain at least one Reference.
+        // A signature with zero references would otherwise be considered
+        // valid here even though it signs nothing meaningful — making it
+        // trivial to bypass `require_signed_timestamp`.
+        if reference_count == 0 {
+            return Err("WS-Security: SignedInfo contains no Reference elements".to_string());
+        }
+
         Ok(())
     }
 
@@ -647,13 +665,26 @@ impl SoapWsSecurity {
             }
         };
 
-        // Check that there's a Reference pointing to this Timestamp
-        let ref_uri = format!("#{}", ts_id);
-        if !signed_info.contains(&ref_uri) {
-            return Err("WS-Security: Timestamp is not included in the signature".to_string());
+        // Iterate each <Reference> and compare its parsed URI attribute
+        // against `#<timestamp-id>`. A naive substring check on `signed_info`
+        // would accept prefix matches (e.g. `URI="#TS-1abc"` for `TS-1`) and
+        // would also miss valid signatures that use whitespace around `=`
+        // (`URI = "#TS-1"`) or single quotes. Parsing each Reference's URI
+        // via `find_attribute` handles all of these uniformly.
+        let expected = format!("#{}", ts_id);
+        let mut search_from = 0;
+        while let Some((ref_block, next_start)) =
+            find_element_block_from_with_end(signed_info, "Reference", search_from)
+        {
+            search_from = next_start.max(search_from + 1);
+            if let Some(uri) = find_attribute(&ref_block, "URI")
+                && uri == expected
+            {
+                return Ok(());
+            }
         }
 
-        Ok(())
+        Err("WS-Security: Timestamp is not included in the signature".to_string())
     }
 
     fn extract_signing_cert(
@@ -938,6 +969,22 @@ fn find_element_block(xml: &str, local_name: &str) -> Option<String> {
 
 /// Find an element block by local name, starting from a given byte offset.
 fn find_element_block_from(xml: &str, local_name: &str, start: usize) -> Option<String> {
+    find_element_block_from_with_end(xml, local_name, start).map(|(block, _)| block)
+}
+
+/// Find an element block and also return the absolute end offset (within `xml`)
+/// of the matched block. Callers that iterate over multiple sibling elements
+/// must use this and advance their cursor with the returned end offset —
+/// otherwise they will re-find the same element on the next iteration and
+/// loop forever.
+fn find_element_block_from_with_end(
+    xml: &str,
+    local_name: &str,
+    start: usize,
+) -> Option<(String, usize)> {
+    if start > xml.len() {
+        return None;
+    }
     let search = &xml[start..];
 
     // Match <prefix:localName or <localName
@@ -952,15 +999,17 @@ fn find_element_block_from(xml: &str, local_name: &str, start: usize) -> Option<
     // Check for self-closing tag
     let tag_header_end = after_open.find('>')?;
     if after_open.as_bytes().get(tag_header_end.checked_sub(1)?) == Some(&b'/') {
-        return Some(after_open[..=tag_header_end].to_string());
+        let end = start + tag_start + tag_header_end + 1;
+        return Some((after_open[..=tag_header_end].to_string(), end));
     }
 
     // Find matching closing tag </prefix:localName> or </localName>
     let closing = format!("</{}>", full_tag_name);
     let close_pos = search[tag_start..].find(&closing)?;
-    let end = tag_start + close_pos + closing.len();
+    let end_in_search = tag_start + close_pos + closing.len();
+    let end = start + end_in_search;
 
-    Some(search[tag_start..end].to_string())
+    Some((search[tag_start..end_in_search].to_string(), end))
 }
 
 /// Find the text content of a direct child element by local name.
@@ -1202,4 +1251,65 @@ fn escape_xml_chars(s: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&apos;")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Iterating over multiple `<Reference>` elements with
+    /// `find_element_block_from_with_end` must advance the cursor far enough
+    /// to skip past each match — the previous implementation incremented by
+    /// just 1 byte and looped forever on signed SOAP envelopes.
+    #[test]
+    fn multiple_reference_iteration_terminates_and_finds_each_block() {
+        // Use a `r##"..."##` raw string so the embedded `#` characters in URI
+        // attributes don't terminate the literal early.
+        let signed_info = r##"<SignedInfo>
+            <Reference URI="#alpha"><DigestValue>aGVsbG8=</DigestValue></Reference>
+            <Reference URI="#beta"><DigestValue>d29ybGQ=</DigestValue></Reference>
+            <Reference URI="#gamma"><DigestValue>IQ==</DigestValue></Reference>
+        </SignedInfo>"##;
+
+        let mut search_from = 0;
+        let mut uris = Vec::new();
+        let mut iterations = 0;
+        while let Some((block, next_start)) =
+            find_element_block_from_with_end(signed_info, "Reference", search_from)
+        {
+            iterations += 1;
+            assert!(
+                iterations < 50,
+                "iteration must terminate (regression: infinite loop)"
+            );
+            uris.push(find_attribute(&block, "URI").unwrap_or_default());
+            search_from = next_start.max(search_from + 1);
+        }
+        assert_eq!(uris, vec!["#alpha", "#beta", "#gamma"]);
+    }
+
+    /// The end offset must point past the closing `</Reference>` so the next
+    /// search starts after the just-matched element, not inside it.
+    #[test]
+    fn end_offset_points_past_closing_tag() {
+        let xml = "prefix<Reference URI=\"#a\"></Reference>middle<Reference URI=\"#b\"></Reference>suffix";
+        let (first_block, end1) =
+            find_element_block_from_with_end(xml, "Reference", 0).expect("first match");
+        assert!(first_block.contains("#a"));
+        // The remainder should still contain the second Reference.
+        let remainder = &xml[end1..];
+        assert!(remainder.contains("#b"));
+        assert!(!remainder.contains("#a"));
+    }
+
+    /// Self-closing tags (e.g. `<Reference URI="#x"/>`) also yield a valid
+    /// end offset so subsequent iterations advance past them.
+    #[test]
+    fn self_closing_tag_returns_correct_end() {
+        let xml = "before<Foo/>after";
+        let (block, end) =
+            find_element_block_from_with_end(xml, "Foo", 0).expect("self-closing match");
+        assert_eq!(block, "<Foo/>");
+        assert_eq!(&xml[end..], "after");
+    }
 }

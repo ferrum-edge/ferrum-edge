@@ -214,6 +214,15 @@ impl Plugin for GrpcWebPlugin {
     }
 
     async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult {
+        // Always strip the internal mode marker from inbound headers so a client
+        // cannot spoof it. The plugin re-injects it in `before_proxy` only when
+        // `on_request_received` confirmed a genuine gRPC-Web request via the
+        // content-type. Without this, a client could send a non-gRPC-Web request
+        // with `x-grpc-web-mode: text` and trigger base64-decode of the body in
+        // `transform_request_body`, which the gateway would then forward in
+        // mangled form.
+        ctx.headers.remove(HEADER_GRPC_WEB_MODE);
+
         let content_type = match ctx.headers.get("content-type") {
             Some(ct) => ct.clone(),
             None => return PluginResult::Continue,
@@ -373,7 +382,13 @@ impl Plugin for GrpcWebPlugin {
         // Signal to clients that this is a gRPC-Web response
         response_headers.insert("x-grpc-web".to_string(), "1".to_string());
 
-        // Add CORS-friendly expose headers so browsers can read gRPC metadata
+        // Add CORS-friendly expose headers so browsers can read gRPC metadata.
+        // We MUST set this whether or not the backend already returned an
+        // expose-headers value — gRPC-Web is intrinsically a browser protocol
+        // and grpc-status/grpc-message are unreadable from JavaScript without it.
+        // (Previously this branch was a no-op when the backend didn't emit
+        // access-control-expose-headers, which broke browser clients on backends
+        // that didn't already configure CORS.)
         let mut expose = vec![
             "grpc-status".to_string(),
             "grpc-message".to_string(),
@@ -381,16 +396,24 @@ impl Plugin for GrpcWebPlugin {
         ];
         expose.extend(self.expose_headers.iter().cloned());
 
-        if let Some(existing) = response_headers.get("access-control-expose-headers") {
-            let mut combined = existing.clone();
-            for h in &expose {
-                if !combined.to_lowercase().contains(&h.to_lowercase()) {
-                    combined.push_str(", ");
-                    combined.push_str(h);
+        let combined = match response_headers.get("access-control-expose-headers") {
+            Some(existing) => {
+                let existing_lower = existing.to_lowercase();
+                let mut out = existing.clone();
+                for h in &expose {
+                    if !existing_lower
+                        .split(',')
+                        .any(|tok| tok.trim().eq_ignore_ascii_case(h))
+                    {
+                        out.push_str(", ");
+                        out.push_str(h);
+                    }
                 }
+                out
             }
-            response_headers.insert("access-control-expose-headers".to_string(), combined);
-        }
+            None => expose.join(", "),
+        };
+        response_headers.insert("access-control-expose-headers".to_string(), combined);
 
         debug!(
             plugin = "grpc_web",

@@ -131,10 +131,11 @@ Ferrum supports dynamic upstream target discovery through three providers, confi
 
 ### Transform Plugins
 
-- **Request Transformer** — add, remove, or update headers and query parameters
-- **Response Transformer** — modify response headers
+- **Request Transformer** — add, remove, update, or rename headers, query parameters, and JSON body fields with dot-notation paths and array indexing. Strict config validation (unknown ops/targets, missing values, CR/LF in headers rejected at plugin load). `rename` rolls back on failed destination writes; array-index rename is rejected to prevent silent data loss
+- **Response Transformer** — add, remove, update, or rename response headers and JSON body fields with the same validation and rollback guarantees as `request_transformer`. Header rules also run on gateway-generated rejection responses
 - **Compression** — on-the-fly response compression (gzip, brotli) with Accept-Encoding negotiation, content-type filtering, minimum body size threshold, and optional request decompression with zip bomb protection
 - **Response Caching** — cache backend responses with TTL, cache key rules, and conditional caching
+- **Request Mirror** — duplicate live proxy traffic to a secondary destination for shadow testing, validation, or migration checks. Fire-and-forget — mirror latency never blocks the primary client response. Configurable percentage sampling (0.1% granularity), optional body forwarding (binary-safe for gRPC protobuf), and proxy-aware timeouts. Mirror response metadata flows through transaction logs
 - **Request Termination** — return static responses without proxying
 
 ### Load Testing Plugin

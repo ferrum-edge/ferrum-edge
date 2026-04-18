@@ -114,53 +114,89 @@ impl GraphqlPlugin {
         let max_complexity = config["max_complexity"].as_u64().map(|v| v as u32);
         let max_aliases = config["max_aliases"].as_u64().map(|v| v as u32);
         let introspection_allowed = config["introspection_allowed"].as_bool().unwrap_or(true);
-        let limit_by = config["limit_by"].as_str().unwrap_or("ip").to_string();
+        // limit_by must be a recognized policy — silently treating "user" as "ip"
+        // would be a security misconfiguration footgun.
+        let limit_by = match config.get("limit_by") {
+            None | Some(Value::Null) => "ip".to_string(),
+            Some(Value::String(s)) => {
+                let lc = s.to_lowercase();
+                if !matches!(lc.as_str(), "ip" | "consumer") {
+                    return Err(format!(
+                        "graphql: 'limit_by' must be one of 'ip' or 'consumer', got: {s:?}"
+                    ));
+                }
+                lc
+            }
+            Some(other) => {
+                return Err(format!(
+                    "graphql: 'limit_by' must be a string, got: {other}"
+                ));
+            }
+        };
 
         let mut type_rate_limits = HashMap::new();
         if let Some(obj) = config["type_rate_limits"].as_object() {
             for (op_type, spec) in obj {
-                if let (Some(max_requests), Some(window_seconds)) = (
-                    spec["max_requests"].as_u64(),
-                    spec["window_seconds"].as_u64(),
-                ) {
-                    if max_requests == 0 {
-                        return Err(format!(
-                            "graphql: type_rate_limits['{}']: 'max_requests' must be greater than zero",
-                            op_type
-                        ));
-                    }
-                    type_rate_limits.insert(
-                        op_type.to_lowercase(),
-                        RateSpec {
-                            max_requests,
-                            window: Duration::from_secs(window_seconds.max(1)),
-                        },
-                    );
+                let max_requests = spec["max_requests"].as_u64().ok_or_else(|| {
+                    format!(
+                        "graphql: type_rate_limits['{op_type}']: 'max_requests' is required and must be a positive integer"
+                    )
+                })?;
+                let window_seconds = spec["window_seconds"].as_u64().ok_or_else(|| {
+                    format!(
+                        "graphql: type_rate_limits['{op_type}']: 'window_seconds' is required and must be a positive integer"
+                    )
+                })?;
+                if max_requests == 0 {
+                    return Err(format!(
+                        "graphql: type_rate_limits['{op_type}']: 'max_requests' must be greater than zero"
+                    ));
                 }
+                if window_seconds == 0 {
+                    return Err(format!(
+                        "graphql: type_rate_limits['{op_type}']: 'window_seconds' must be greater than zero"
+                    ));
+                }
+                type_rate_limits.insert(
+                    op_type.to_lowercase(),
+                    RateSpec {
+                        max_requests,
+                        window: Duration::from_secs(window_seconds),
+                    },
+                );
             }
         }
 
         let mut operation_rate_limits = HashMap::new();
         if let Some(obj) = config["operation_rate_limits"].as_object() {
             for (op_name, spec) in obj {
-                if let (Some(max_requests), Some(window_seconds)) = (
-                    spec["max_requests"].as_u64(),
-                    spec["window_seconds"].as_u64(),
-                ) {
-                    if max_requests == 0 {
-                        return Err(format!(
-                            "graphql: operation_rate_limits['{}']: 'max_requests' must be greater than zero",
-                            op_name
-                        ));
-                    }
-                    operation_rate_limits.insert(
-                        op_name.clone(),
-                        RateSpec {
-                            max_requests,
-                            window: Duration::from_secs(window_seconds.max(1)),
-                        },
-                    );
+                let max_requests = spec["max_requests"].as_u64().ok_or_else(|| {
+                    format!(
+                        "graphql: operation_rate_limits['{op_name}']: 'max_requests' is required and must be a positive integer"
+                    )
+                })?;
+                let window_seconds = spec["window_seconds"].as_u64().ok_or_else(|| {
+                    format!(
+                        "graphql: operation_rate_limits['{op_name}']: 'window_seconds' is required and must be a positive integer"
+                    )
+                })?;
+                if max_requests == 0 {
+                    return Err(format!(
+                        "graphql: operation_rate_limits['{op_name}']: 'max_requests' must be greater than zero"
+                    ));
                 }
+                if window_seconds == 0 {
+                    return Err(format!(
+                        "graphql: operation_rate_limits['{op_name}']: 'window_seconds' must be greater than zero"
+                    ));
+                }
+                operation_rate_limits.insert(
+                    op_name.clone(),
+                    RateSpec {
+                        max_requests,
+                        window: Duration::from_secs(window_seconds),
+                    },
+                );
             }
         }
 

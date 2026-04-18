@@ -17,18 +17,66 @@ pub struct CorrelationId {
 
 impl CorrelationId {
     pub fn new(config: &Value) -> Result<Self, String> {
-        let header_name = config["header_name"]
-            .as_str()
-            .unwrap_or("x-request-id")
-            .to_lowercase();
+        // Reject explicit non-string values for `header_name` so a misconfiguration
+        // (e.g., setting an integer) does not silently fall back to the default.
+        let header_name = match config.get("header_name") {
+            None => "x-request-id".to_string(),
+            Some(Value::Null) => "x-request-id".to_string(),
+            Some(Value::String(s)) => {
+                let trimmed = s.trim();
+                if trimmed.is_empty() {
+                    return Err(
+                        "correlation_id: 'header_name' must be a non-empty string".to_string()
+                    );
+                }
+                if !is_valid_http_header_name(trimmed) {
+                    return Err(format!(
+                        "correlation_id: 'header_name' contains characters not permitted in HTTP header names (RFC 7230 token): {trimmed:?}"
+                    ));
+                }
+                trimmed.to_lowercase()
+            }
+            Some(other) => {
+                return Err(format!(
+                    "correlation_id: 'header_name' must be a string, got: {}",
+                    other
+                ));
+            }
+        };
 
-        let echo_downstream = config["echo_downstream"].as_bool().unwrap_or(true);
+        let echo_downstream = match config.get("echo_downstream") {
+            None | Some(Value::Null) => true,
+            Some(Value::Bool(b)) => *b,
+            Some(other) => {
+                return Err(format!(
+                    "correlation_id: 'echo_downstream' must be a boolean, got: {}",
+                    other
+                ));
+            }
+        };
 
         Ok(Self {
             header_name,
             echo_downstream,
         })
     }
+}
+
+/// Validate an HTTP header name per RFC 7230 §3.2.6 token grammar.
+/// A token is one or more printable ASCII characters from the tchar set
+/// (excludes separators like `:`, `(`, `)`, `<`, `>`, `@`, etc.).
+fn is_valid_http_header_name(name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    name.bytes().all(|b| {
+        matches!(b,
+            b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' | b'+' | b'-' | b'.' | b'^' | b'_' | b'`' | b'|' | b'~'
+            | b'0'..=b'9'
+            | b'A'..=b'Z'
+            | b'a'..=b'z'
+        )
+    })
 }
 
 #[async_trait]

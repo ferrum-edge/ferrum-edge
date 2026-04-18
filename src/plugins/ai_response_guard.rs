@@ -56,6 +56,10 @@ enum GuardAction {
 struct ContentPattern {
     name: String,
     regex: Regex,
+    /// Pre-rendered redaction placeholder for this pattern, with `{type}`
+    /// already substituted with `name`. Built once at config-load time so
+    /// `redact_text` does not re-render the template per pattern per call.
+    placeholder: String,
 }
 
 /// How to scan the response body.
@@ -80,11 +84,12 @@ pub struct AiResponseGuard {
     detection_pattern_count: usize,
     scan_mode: ScanMode,
     max_scan_bytes: usize,
-    redaction_template: String,
     /// True when action is Redact — enables transform_response_body.
     needs_body_transform: bool,
-    /// True when the plugin has patterns configured.
-    has_patterns: bool,
+    /// True when the plugin has any active validation rule (patterns, phrases,
+    /// `require_json`, `required_fields`, or `max_completion_length`). Drives
+    /// response-body buffering — when no rule applies, the plugin is a no-op.
+    has_validation_rules: bool,
     /// Optional: require response to be valid JSON.
     require_json: bool,
     /// Optional: required top-level JSON fields.
@@ -146,10 +151,15 @@ impl AiResponseGuard {
         for name in &pii_pattern_names {
             if let Some(regex_str) = builtin_pii_pattern(name) {
                 match Regex::new(regex_str) {
-                    Ok(regex) => pii_patterns.push(ContentPattern {
-                        name: format!("pii:{}", name),
-                        regex,
-                    }),
+                    Ok(regex) => {
+                        let full_name = format!("pii:{}", name);
+                        let placeholder = redaction_template.replace("{type}", &full_name);
+                        pii_patterns.push(ContentPattern {
+                            name: full_name,
+                            regex,
+                            placeholder,
+                        });
+                    }
                     Err(e) => {
                         // Built-in pattern failures are fatal so the operator
                         // is alerted instead of silently losing detection
@@ -180,10 +190,15 @@ impl AiResponseGuard {
                     None => continue,
                 };
                 match Regex::new(regex_str) {
-                    Ok(regex) => pii_patterns.push(ContentPattern {
-                        name: format!("pii:{}", name),
-                        regex,
-                    }),
+                    Ok(regex) => {
+                        let full_name = format!("pii:{}", name);
+                        let placeholder = redaction_template.replace("{type}", &full_name);
+                        pii_patterns.push(ContentPattern {
+                            name: full_name,
+                            regex,
+                            placeholder,
+                        });
+                    }
                     Err(e) => {
                         return Err(format!(
                             "ai_response_guard: failed to compile custom PII pattern '{}': {}",
@@ -205,10 +220,15 @@ impl AiResponseGuard {
                 // Treat as case-insensitive literal match
                 let escaped = regex::escape(phrase_str);
                 match Regex::new(&format!("(?i){}", escaped)) {
-                    Ok(regex) => blocked_phrases.push(ContentPattern {
-                        name: format!("blocked_phrase:{}", phrase_str),
-                        regex,
-                    }),
+                    Ok(regex) => {
+                        let name = format!("blocked_phrase:{}", phrase_str);
+                        let placeholder = redaction_template.replace("{type}", &name);
+                        blocked_phrases.push(ContentPattern {
+                            name,
+                            regex,
+                            placeholder,
+                        });
+                    }
                     Err(e) => {
                         return Err(format!(
                             "ai_response_guard: failed to compile blocked phrase {}: {}",
@@ -231,7 +251,14 @@ impl AiResponseGuard {
                     None => continue,
                 };
                 match Regex::new(regex_str) {
-                    Ok(regex) => blocked_phrases.push(ContentPattern { name, regex }),
+                    Ok(regex) => {
+                        let placeholder = redaction_template.replace("{type}", &name);
+                        blocked_phrases.push(ContentPattern {
+                            name,
+                            regex,
+                            placeholder,
+                        });
+                    }
                     Err(e) => {
                         return Err(format!(
                             "ai_response_guard: failed to compile blocked pattern '{}': {}",
@@ -255,13 +282,13 @@ impl AiResponseGuard {
 
         let max_completion_length = config["max_completion_length"].as_u64().unwrap_or(0) as usize;
 
-        let has_patterns = !pii_patterns.is_empty()
+        let has_validation_rules = !pii_patterns.is_empty()
             || !blocked_phrases.is_empty()
             || require_json
             || !required_fields.is_empty()
             || max_completion_length > 0;
 
-        if !has_patterns {
+        if !has_validation_rules {
             return Err(
                 "ai_response_guard: no patterns, phrases, or validation rules configured — plugin will have no effect"
                     .to_string(),
@@ -297,9 +324,8 @@ impl AiResponseGuard {
             detection_pattern_count,
             scan_mode,
             max_scan_bytes,
-            redaction_template,
             needs_body_transform,
-            has_patterns,
+            has_validation_rules,
             require_json,
             required_fields,
             max_completion_length,
@@ -413,13 +439,14 @@ impl AiResponseGuard {
     }
 
     /// Replace all pattern matches with the redaction placeholder.
+    /// Placeholders are pre-rendered at construction time so each call is one
+    /// `replace_all` per pattern, with no template formatting on the hot path.
     fn redact_text(&self, text: &str) -> String {
         let mut result = text.to_string();
         for pattern in self.pii_patterns.iter().chain(self.blocked_phrases.iter()) {
-            let placeholder = self.redaction_template.replace("{type}", &pattern.name);
             result = pattern
                 .regex
-                .replace_all(&result, placeholder.as_str())
+                .replace_all(&result, pattern.placeholder.as_str())
                 .to_string();
         }
         result
@@ -521,13 +548,13 @@ impl Plugin for AiResponseGuard {
     }
 
     fn requires_response_body_buffering(&self) -> bool {
-        self.has_patterns
+        self.has_validation_rules
     }
 
     fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {
         // Only buffer for POST requests — AI/LLM responses to inspect.
         // Method-only check covers multipart uploads that return JSON responses.
-        self.has_patterns && ctx.method == "POST"
+        self.has_validation_rules && ctx.method == "POST"
     }
 
     async fn on_response_body(
@@ -714,12 +741,7 @@ impl Plugin for AiResponseGuard {
             if !known_texts.is_empty() {
                 self.redact_response_json(&mut json);
             }
-            redact_json_strings(
-                &mut json,
-                &self.pii_patterns,
-                &self.blocked_phrases,
-                &self.redaction_template,
-            );
+            redact_json_strings(&mut json, &self.pii_patterns, &self.blocked_phrases);
         } else {
             let texts = self.extract_completion_texts(&json);
             let has_match = !self.detect_matches(&texts).is_empty();
@@ -741,16 +763,14 @@ fn redact_json_strings(
     value: &mut Value,
     pii_patterns: &[ContentPattern],
     blocked_phrases: &[ContentPattern],
-    template: &str,
 ) {
     match value {
         Value::String(s) => {
             let mut result = s.clone();
             for pattern in pii_patterns.iter().chain(blocked_phrases.iter()) {
-                let placeholder = template.replace("{type}", &pattern.name);
                 result = pattern
                     .regex
-                    .replace_all(&result, placeholder.as_str())
+                    .replace_all(&result, pattern.placeholder.as_str())
                     .to_string();
             }
             if result != *s {
@@ -759,7 +779,7 @@ fn redact_json_strings(
         }
         Value::Array(arr) => {
             for item in arr.iter_mut() {
-                redact_json_strings(item, pii_patterns, blocked_phrases, template);
+                redact_json_strings(item, pii_patterns, blocked_phrases);
             }
         }
         Value::Object(map) => {
@@ -767,7 +787,7 @@ fn redact_json_strings(
                 if STRUCTURAL_KEYS.contains(&k.as_str()) {
                     continue;
                 }
-                redact_json_strings(val, pii_patterns, blocked_phrases, template);
+                redact_json_strings(val, pii_patterns, blocked_phrases);
             }
         }
         _ => {}

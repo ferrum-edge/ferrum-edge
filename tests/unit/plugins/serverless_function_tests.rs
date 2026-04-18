@@ -241,6 +241,97 @@ fn test_zero_timeout_rejects() {
     assert!(err.contains("timeout_ms"));
 }
 
+#[test]
+fn test_unknown_mode_rejects() {
+    let err = expect_err(ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": "https://example.com/func",
+            "mode": "terminat"   // typo
+        }),
+        default_client(),
+    ));
+    assert!(err.contains("unknown mode"), "got: {}", err);
+}
+
+#[test]
+fn test_unknown_on_error_rejects() {
+    let err = expect_err(ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": "https://example.com/func",
+            "on_error": "ignore"  // not a valid action
+        }),
+        default_client(),
+    ));
+    assert!(err.contains("unknown on_error"), "got: {}", err);
+}
+
+#[test]
+fn test_zero_max_response_body_rejects() {
+    let err = expect_err(ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": "https://example.com/func",
+            "max_response_body_bytes": 0
+        }),
+        default_client(),
+    ));
+    assert!(err.contains("max_response_body_bytes"), "got: {}", err);
+}
+
+#[test]
+fn test_error_status_code_below_100_rejects() {
+    let err = expect_err(ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": "https://example.com/func",
+            "error_status_code": 99
+        }),
+        default_client(),
+    ));
+    assert!(err.contains("error_status_code"), "got: {}", err);
+}
+
+#[test]
+fn test_error_status_code_above_599_rejects() {
+    let err = expect_err(ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": "https://example.com/func",
+            "error_status_code": 700
+        }),
+        default_client(),
+    ));
+    assert!(err.contains("error_status_code"), "got: {}", err);
+}
+
+#[test]
+fn test_non_string_mode_rejects() {
+    let err = expect_err(ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": "https://example.com/func",
+            "mode": 42
+        }),
+        default_client(),
+    ));
+    assert!(err.contains("'mode' must be a string"), "got: {}", err);
+}
+
+#[test]
+fn test_non_string_on_error_rejects() {
+    let err = expect_err(ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": "https://example.com/func",
+            "on_error": true
+        }),
+        default_client(),
+    ));
+    assert!(err.contains("'on_error' must be a string"), "got: {}", err);
+}
+
 // ---------------------------------------------------------------------------
 // Valid configurations
 // ---------------------------------------------------------------------------

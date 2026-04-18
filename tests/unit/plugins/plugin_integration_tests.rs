@@ -307,6 +307,7 @@ async fn test_plugin_creation_all_plugins() {
             "body_validator" => json!({"required_fields": ["name"]}),
             "graphql" => json!({"max_depth": 100}),
             "grpc_method_router" => json!({"allow_methods": ["test.Svc/Method"]}),
+            "grpc_deadline" => json!({"max_deadline_ms": 30000}),
             "ai_rate_limiter" => json!({"token_limit": 100000}),
             "ai_federation" => {
                 json!({"providers": [{"name": "test", "provider_type": "openai", "api_key": "sk-test"}]})

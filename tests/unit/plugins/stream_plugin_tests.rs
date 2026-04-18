@@ -327,6 +327,8 @@ fn make_stream_summary() -> StreamTransactionSummary {
         bytes_received: 4096,
         connection_error: None,
         error_class: None,
+        disconnect_direction: None,
+        disconnect_cause: None,
         timestamp_connected: "2026-03-29T12:00:00Z".to_string(),
         timestamp_disconnected: "2026-03-29T12:00:01.5Z".to_string(),
         sni_hostname: None,
