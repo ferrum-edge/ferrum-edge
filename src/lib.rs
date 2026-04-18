@@ -298,4 +298,20 @@ pub mod _test_support {
         )
         .await
     }
+
+    /// Construct a streaming `ProxyBody` for use in unit/integration tests.
+    /// Delegates to the crate-private `ProxyBody::streaming` constructor,
+    /// keeping that constructor internal while still letting tests exercise
+    /// the streaming-variant `Drop` / `poll_frame` paths.
+    pub fn proxy_body_streaming_for_test(
+        body: std::pin::Pin<
+            Box<
+                dyn http_body::Body<Data = bytes::Bytes, Error = crate::proxy::body::ProxyBodyError>
+                    + Send
+                    + 'static,
+            >,
+        >,
+    ) -> crate::proxy::ProxyBody {
+        crate::proxy::body::ProxyBody::streaming(body)
+    }
 }

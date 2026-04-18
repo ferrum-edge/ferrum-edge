@@ -330,3 +330,63 @@ async fn body_dropped_before_polling_fires_client_disconnect() {
     );
     assert!(!got.body_completed);
 }
+
+/// Regression: HEAD / 204 / zero-length responses drop the body without
+/// ever polling it — hyper sees from the response metadata that there's
+/// nothing to stream. Before the fix, the `Drop` safety net checked
+/// `is_end_stream()` on the inner body, which for streaming wrappers
+/// (`DirectH3Body`, partially-polled `CoalescingH3Body`) returns `false`
+/// even for successful zero-length streams. That misclassified every
+/// HEAD / 204 streaming response as `client_disconnected=true`.
+///
+/// After the fix, the Drop path distinguishes "never polled" from
+/// "polled but not drained" via a `polled: AtomicBool` on `ProxyBody`.
+/// Never-polled streaming bodies are treated as success — hyper chose
+/// not to stream them, which is a healthy zero-length response.
+#[tokio::test(flavor = "multi_thread")]
+async fn unpolled_empty_streaming_body_is_not_client_disconnect() {
+    use http_body_util::Empty;
+
+    let (plugin, captured) = CapturingPlugin::new();
+    let plugins: Arc<Vec<Arc<dyn Plugin>>> = Arc::new(vec![Arc::new(plugin)]);
+    let summary = make_summary_with_status(204);
+    let logger = DeferredTransactionLogger::new(summary, plugins, make_ctx());
+
+    // Build a `ProxyBodyKind::Stream`-kind body. The inner body here is
+    // `Empty<Bytes>` with `is_end_stream() == true`, but what this test
+    // exercises is the STRUCTURAL path — when `kind` is `Stream` and the
+    // body is dropped unpolled, the Drop impl MUST treat it as success
+    // regardless of `is_end_stream()`, because streaming wrappers like
+    // `DirectH3Body` and partially-polled `CoalescingH3Body` return
+    // `false` from `is_end_stream()` even for successful zero-length
+    // streams. The pre-fix Drop consulted `is_end_stream()` on the inner
+    // body and flipped H3 wrappers into `client_disconnect`. The post-fix
+    // Drop relies on `polled` (never set here → never-polled → streaming
+    // success).
+    use http_body_util::BodyExt;
+    let inner: Pin<
+        Box<
+            dyn http_body::Body<Data = Bytes, Error = Box<dyn std::error::Error + Send + Sync>>
+                + Send,
+        >,
+    > = Box::pin(
+        Empty::<Bytes>::new()
+            .map_err(|never| -> Box<dyn std::error::Error + Send + Sync> { match never {} }),
+    );
+    let body = ferrum_edge::_test_support::proxy_body_streaming_for_test(inner).with_logger(logger);
+    drop(body);
+
+    let captures = wait_for_captures(&captured, 1).await;
+    assert_eq!(captures.len(), 1);
+    let got = &captures[0];
+    assert!(
+        !got.client_disconnected,
+        "never-polled streaming body is a HEAD/204-style success, not a client disconnect"
+    );
+    assert!(got.body_error_class.is_none(), "no error occurred");
+    assert!(
+        got.body_completed,
+        "Drop path treats never-polled streaming bodies as successful completion"
+    );
+    assert_eq!(got.bytes_streamed_to_client, 0);
+}
