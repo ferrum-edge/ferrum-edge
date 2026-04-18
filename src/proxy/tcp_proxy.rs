@@ -1058,12 +1058,20 @@ async fn handle_tcp_connection_inner(
         )
         .await;
 
-        adaptive_buffer.record_connection(
-            proxy_id,
-            copy_result
-                .bytes_client_to_backend
-                .saturating_add(copy_result.bytes_backend_to_client),
-        );
+        // Only feed SUCCESSFUL relay sizes into the adaptive buffer tracker.
+        // Failed relays (connect error, TLS failure, mid-stream RST) contribute
+        // zero or partial-byte samples that would pull the EWMA down during
+        // outage bursts and hurt buffer sizing after recovery. The circuit
+        // breaker below separately records the success/failure outcome — this
+        // gate only affects buffer-size adaptation.
+        if copy_result.first_failure.is_none() {
+            adaptive_buffer.record_connection(
+                proxy_id,
+                copy_result
+                    .bytes_client_to_backend
+                    .saturating_add(copy_result.bytes_backend_to_client),
+            );
+        }
 
         // Record circuit breaker outcome.
         if let Some(ref cb_config) = cb_info.cb_config {
@@ -1471,12 +1479,18 @@ async fn handle_tcp_connection_inner(
     };
 
     // Record adaptive buffer stats for the TLS/non-passthrough path.
-    adaptive_buffer.record_connection(
-        proxy_id,
-        copy_result
-            .bytes_client_to_backend
-            .saturating_add(copy_result.bytes_backend_to_client),
-    );
+    // Only feed SUCCESSFUL relay sizes into the adaptive buffer tracker — see
+    // the passthrough-path site above for the full rationale. Failed relays
+    // contribute zero/partial-byte samples that would poison the EWMA during
+    // outage bursts.
+    if copy_result.first_failure.is_none() {
+        adaptive_buffer.record_connection(
+            proxy_id,
+            copy_result
+                .bytes_client_to_backend
+                .saturating_add(copy_result.bytes_backend_to_client),
+        );
+    }
 
     // Record circuit breaker outcome based on copy result.
     if let Some(ref cb_config) = current_cb_info.cb_config {
