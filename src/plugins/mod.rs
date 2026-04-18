@@ -562,7 +562,29 @@ pub enum DisconnectCause {
 }
 
 /// Transaction summary for logging plugins.
-#[derive(Debug, Clone, serde::Serialize)]
+///
+/// Implements [`Default`] so call sites that build partial summaries
+/// (early-return error paths, rejected requests, etc.) can use struct
+/// update syntax — `..TransactionSummary::default()` — instead of
+/// hardcoding every field. Future additions to this struct get an
+/// automatic default value at all update-syntax call sites; old call
+/// sites that enumerate every field still require a manual edit, which
+/// is also fine because it flags the deliberate choice.
+///
+/// Prefer the update syntax when adding new log sites:
+/// ```ignore
+/// TransactionSummary {
+///     namespace: proxy.namespace.clone(),
+///     timestamp_received: ctx.timestamp_received.to_rfc3339(),
+///     client_ip: ctx.client_ip.clone(),
+///     http_method: method,
+///     request_path: path,
+///     response_status_code: status,
+///     error_class: Some(class),
+///     ..TransactionSummary::default()
+/// }
+/// ```
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct TransactionSummary {
     /// Namespace of the matched proxy. Omitted from serialization when it equals
     /// the default (`"ferrum"`) to keep log volume down for single-namespace deployments.

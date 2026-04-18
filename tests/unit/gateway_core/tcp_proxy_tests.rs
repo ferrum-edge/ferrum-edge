@@ -60,13 +60,23 @@ impl AsyncWrite for ResetOnReadStream {
 }
 
 // ── bidirectional_copy direction tests ───────────────────────────────────────
+//
+// These tests exercise the **direction-tracking path** (idle_timeout = Some).
+// When BOTH `idle_timeout` and `half_close_cap` are `None`/zero, the relay
+// takes a zero-overhead fast path that delegates to
+// `tokio::io::copy_bidirectional_with_sizes` and cannot report
+// `first_failure` direction (see `bidirectional_copy` docs). These tests
+// are specifically verifying direction attribution, so they opt in via a
+// long idle_timeout that never actually fires.
+const TEST_IDLE_TIMEOUT: Option<Duration> = Some(Duration::from_secs(300));
 
 #[tokio::test]
 async fn test_bidirectional_copy_client_read_error_marks_client_to_backend() {
     let client = ResetOnReadStream;
     let (backend, _peer) = tokio::io::duplex(1024);
 
-    let result = bidirectional_copy_for_test(client, backend, None, None, 8 * 1024).await;
+    let result =
+        bidirectional_copy_for_test(client, backend, TEST_IDLE_TIMEOUT, None, 8 * 1024).await;
 
     let (dir, class, _side, _msg) = result
         .first_failure
@@ -81,7 +91,8 @@ async fn test_bidirectional_copy_backend_read_error_marks_backend_to_client() {
     let (client, _peer) = tokio::io::duplex(1024);
     let backend = ResetOnReadStream;
 
-    let result = bidirectional_copy_for_test(client, backend, None, None, 8 * 1024).await;
+    let result =
+        bidirectional_copy_for_test(client, backend, TEST_IDLE_TIMEOUT, None, 8 * 1024).await;
 
     let (dir, class, _side, _msg) = result
         .first_failure
@@ -99,7 +110,8 @@ async fn test_bidirectional_copy_clean_close_no_failure() {
     drop(client_peer);
     drop(backend_peer);
 
-    let result = bidirectional_copy_for_test(client, backend, None, None, 8 * 1024).await;
+    let result =
+        bidirectional_copy_for_test(client, backend, TEST_IDLE_TIMEOUT, None, 8 * 1024).await;
 
     assert!(
         result.first_failure.is_none(),
@@ -121,7 +133,8 @@ async fn test_bidirectional_copy_preserves_bytes_across_errors() {
         let _ = client_peer.shutdown().await;
     });
 
-    let result = bidirectional_copy_for_test(client, backend, None, None, 8 * 1024).await;
+    let result =
+        bidirectional_copy_for_test(client, backend, TEST_IDLE_TIMEOUT, None, 8 * 1024).await;
 
     let (dir, _class, _side, _msg) = result
         .first_failure
@@ -135,6 +148,35 @@ async fn test_bidirectional_copy_preserves_bytes_across_errors() {
         result.bytes_client_to_backend <= payload.len() as u64,
         "c2b bytes must not exceed payload size, got {}",
         result.bytes_client_to_backend
+    );
+}
+
+/// Regression: verify the fast path is selected when both timeouts are `None`.
+/// Per the documented trade-off, the fast path reports `Direction::Unknown`
+/// on error — this test locks that in so future refactors notice if the
+/// fast path stops being taken (direction would become specific) OR if the
+/// slow path regresses to the fast path's behavior (slow-path tests above
+/// would start seeing `Unknown`).
+#[tokio::test]
+async fn test_bidirectional_copy_fast_path_reports_unknown_direction_on_error() {
+    let client = ResetOnReadStream;
+    let (backend, _peer) = tokio::io::duplex(1024);
+
+    // Both timeouts None = fast-path path via copy_bidirectional_with_sizes.
+    let result = bidirectional_copy_for_test(client, backend, None, None, 8 * 1024).await;
+
+    let (dir, _class, side, _msg) = result
+        .first_failure
+        .as_ref()
+        .expect("fast-path error must still surface first_failure");
+    assert_eq!(
+        *dir,
+        Direction::Unknown,
+        "fast path cannot attribute direction — must report Unknown"
+    );
+    assert!(
+        side.is_none(),
+        "fast path cannot attribute IO side either — must be None"
     );
 }
 

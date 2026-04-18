@@ -2331,7 +2331,6 @@ async fn handle_websocket_request_authenticated(
                             backend_target_url: Some(
                                 strip_query_params(&current_backend_url).to_string(),
                             ),
-                            backend_resolved_ip: None,
                             response_status_code: 502,
                             latency_total_ms: ws_total_ms,
                             latency_gateway_processing_ms: ws_total_ms,
@@ -2341,14 +2340,9 @@ async fn handle_websocket_request_authenticated(
                             latency_plugin_external_io_ms: ws_plugin_external_io_ms,
                             latency_gateway_overhead_ms: ws_gateway_overhead_ms,
                             request_user_agent: ctx.headers.get("user-agent").cloned(),
-                            response_streamed: false,
-                            client_disconnected: false,
                             error_class: Some(ws_error_class),
-                            body_error_class: None,
-                            body_completed: false,
-                            bytes_streamed_to_client: 0,
-                            mirror: false,
                             metadata,
+                            ..TransactionSummary::default()
                         };
                         crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
                     }
@@ -2411,14 +2405,8 @@ async fn handle_websocket_request_authenticated(
         latency_plugin_external_io_ms: ws_plugin_external_io_ms,
         latency_gateway_overhead_ms: ws_gateway_overhead_ms,
         request_user_agent: ctx.headers.get("user-agent").cloned(),
-        response_streamed: false,
-        client_disconnected: false,
-        error_class: None,
-        body_error_class: None,
-        body_completed: false,
-        bytes_streamed_to_client: 0,
-        mirror: false,
         metadata: ctx.metadata.clone(),
+        ..TransactionSummary::default()
     };
 
     crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
@@ -3842,6 +3830,10 @@ pub async fn log_rejected_request(
     let mut metadata = ctx.metadata.clone();
     metadata.insert("rejection_phase".to_string(), rejection_phase.to_string());
 
+    // Uses `..TransactionSummary::default()` for the boilerplate tail
+    // (body-streaming counters, booleans, `error_class`, `mirror`). Future
+    // additions to `TransactionSummary` get a sane default here without
+    // touching this call site — same pattern new log sites should follow.
     let summary = TransactionSummary {
         namespace: proxy
             .map(|p| p.namespace.clone())
@@ -3857,7 +3849,6 @@ pub async fn log_rejected_request(
             let url = build_backend_url(p, &ctx.path, "", p.listen_path.len());
             strip_query_params(&url).to_string()
         }),
-        backend_resolved_ip: None,
         response_status_code: status_code,
         latency_total_ms: total_ms,
         latency_gateway_processing_ms: total_ms,
@@ -3867,14 +3858,8 @@ pub async fn log_rejected_request(
         latency_plugin_external_io_ms: plugin_external_io_ms,
         latency_gateway_overhead_ms: gateway_overhead_ms,
         request_user_agent: ctx.headers.get("user-agent").cloned(),
-        response_streamed: false,
-        client_disconnected: false,
-        error_class: None,
-        body_error_class: None,
-        body_completed: false,
-        bytes_streamed_to_client: 0,
-        mirror: false,
         metadata,
+        ..TransactionSummary::default()
     };
 
     crate::plugins::log_with_mirror(plugins, &summary, ctx).await;
@@ -5419,13 +5404,9 @@ async fn handle_proxy_request_inner(
                         latency_gateway_overhead_ms: gateway_overhead_ms,
                         request_user_agent: ctx.headers.get("user-agent").cloned(),
                         response_streamed: streamed,
-                        client_disconnected: false,
                         error_class: final_error_class,
-                        body_error_class: None,
-                        body_completed: false,
-                        bytes_streamed_to_client: 0,
-                        mirror: false,
                         metadata: ctx.metadata.clone(),
+                        ..TransactionSummary::default()
                     };
                     if body_exceeded {
                         // Request body exceeded the size limit; we're about to
@@ -5682,14 +5663,8 @@ async fn handle_proxy_request_inner(
                         latency_plugin_external_io_ms: plugin_external_io_ms,
                         latency_gateway_overhead_ms: gateway_overhead_ms,
                         request_user_agent: ctx.headers.get("user-agent").cloned(),
-                        response_streamed: false,
-                        client_disconnected: false,
-                        error_class: None,
-                        body_error_class: None,
-                        body_completed: false,
-                        bytes_streamed_to_client: 0,
-                        mirror: false,
                         metadata: ctx.metadata.clone(),
+                        ..TransactionSummary::default()
                     };
                     crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
                 }
@@ -5802,7 +5777,6 @@ async fn handle_proxy_request_inner(
                                 let url = build_backend_url(p, &ctx.path, "", p.listen_path.len());
                                 strip_query_params(&url).to_string()
                             }),
-                            backend_resolved_ip: None,
                             response_status_code: 200, // gRPC errors use HTTP 200
                             latency_total_ms: total_ms,
                             latency_gateway_processing_ms: total_ms - backend_total_ms,
@@ -5812,14 +5786,9 @@ async fn handle_proxy_request_inner(
                             latency_plugin_external_io_ms: grpc_plugin_external_io_ms,
                             latency_gateway_overhead_ms: grpc_gateway_overhead_ms,
                             request_user_agent: ctx.headers.get("user-agent").cloned(),
-                            response_streamed: false,
-                            client_disconnected: false,
                             error_class: Some(grpc_error_class),
-                            body_error_class: None,
-                            body_completed: false,
-                            bytes_streamed_to_client: 0,
-                            mirror: false,
                             metadata,
+                            ..TransactionSummary::default()
                         };
                         crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
                     }
@@ -6234,13 +6203,9 @@ async fn handle_proxy_request_inner(
                 latency_gateway_overhead_ms: gateway_overhead_ms,
                 request_user_agent: ctx.headers.get("user-agent").cloned(),
                 response_streamed: is_streaming_response,
-                client_disconnected: false,
                 error_class: backend_error_class,
-                body_error_class: None,
-                body_completed: false,
-                bytes_streamed_to_client: 0,
-                mirror: false,
                 metadata: ctx.metadata.clone(),
+                ..TransactionSummary::default()
             };
 
             let body_will_stream = matches!(

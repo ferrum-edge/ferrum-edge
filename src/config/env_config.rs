@@ -542,6 +542,9 @@ pub struct EnvConfig {
     // TCP proxy
     /// Default TCP idle timeout in seconds (default: 300 / 5 min).
     /// Per-proxy `tcp_idle_timeout_seconds` overrides this. Set to 0 to disable.
+    ///
+    /// See [`Self::tcp_half_close_max_wait_seconds`] for how this interacts
+    /// with the bidirectional-relay fast path.
     pub tcp_idle_timeout_seconds: u64,
     /// Hard cap on Phase 2 (half-close drain) of the TCP bidirectional relay.
     ///
@@ -554,6 +557,22 @@ pub struct EnvConfig {
     ///
     /// This cap fires even when the idle timeout is disabled. Default 300
     /// (5 minutes). Set to `0` to disable.
+    ///
+    /// # Bidirectional-relay performance modes
+    ///
+    /// When **both** `tcp_idle_timeout_seconds` and
+    /// `tcp_half_close_max_wait_seconds` are `0`, the relay selects a
+    /// **fast path** that delegates to `tokio::io::copy_bidirectional_with_sizes`
+    /// directly. Any other combination selects the **direction-tracking path**:
+    ///
+    /// | Mode | Trigger | Benefits | Downsides |
+    /// |------|---------|----------|-----------|
+    /// | Fast path | both vars == 0 | no `io::split`/BiLock, no Phase 1/2 loop, max TCP throughput, per-direction bytes preserved on clean completion | no idle watchdog (OS TCP timers only), no half-close hard cap, `disconnect_direction` reported as `unknown` on error |
+    /// | Direction-tracking | either var != 0 (default) | idle timeout, half-close cap, per-direction byte counts, first-failure direction attribution in logs/metrics | one BiLock access per read/write, 2× `Vec<u8>` alloc per connection, Phase 1/2 scheduling overhead |
+    ///
+    /// Pick the fast path only when an external L4 load balancer already
+    /// enforces per-connection timeouts and per-direction failure attribution
+    /// is not consumed by your dashboards/alerts.
     pub tcp_half_close_max_wait_seconds: u64,
 
     // UDP proxy

@@ -1337,12 +1337,18 @@ async fn handle_dtls_client(
     }
 }
 
+/// Shared error-message prefix. Used at the `anyhow::anyhow!` construction
+/// site AND at the `error_message.contains(...)` check site in
+/// `dtls_disconnect_cause` — keeping this as a constant means a rename of
+/// the prefix is a compile error everywhere rather than a silent drift.
+pub(crate) const STREAM_ERR_BACKEND_DTLS_HANDSHAKE_FAILED: &str = "Backend DTLS handshake failed";
+
 /// Map a DTLS session failure to a `DisconnectCause`. Backend-facing classes
 /// (DNS, connect, port exhaustion, pool) map to `BackendError` so DTLS
 /// stream_disconnects metrics don't collapse every failure into
-/// `recv_error`. TLS is ambiguous so disambiguate by message prefix — the
-/// "Backend DTLS handshake failed" site sets a distinctive wrap, while
-/// generic session/decrypt errors remain client-side (`RecvError`).
+/// `recv_error`. TLS is ambiguous so disambiguate by the shared prefix
+/// constant (`STREAM_ERR_BACKEND_DTLS_HANDSHAKE_FAILED`) — generic
+/// session/decrypt errors remain client-side (`RecvError`).
 fn dtls_disconnect_cause(
     class: &crate::retry::ErrorClass,
     error_message: &str,
@@ -1359,7 +1365,7 @@ fn dtls_disconnect_cause(
         | ErrorClass::ConnectionPoolError
         | ErrorClass::ProtocolError => DisconnectCause::BackendError,
         ErrorClass::TlsError => {
-            if error_message.contains("Backend DTLS") {
+            if error_message.contains(STREAM_ERR_BACKEND_DTLS_HANDSHAKE_FAILED) {
                 DisconnectCause::BackendError
             } else {
                 DisconnectCause::RecvError
@@ -1505,7 +1511,11 @@ async fn handle_dtls_client_inner(
                     );
                     cb.record_failure(502, true);
                 }
-                return Err(anyhow::anyhow!("Backend DTLS handshake failed: {}", e));
+                return Err(anyhow::anyhow!(
+                    "{}: {}",
+                    STREAM_ERR_BACKEND_DTLS_HANDSHAKE_FAILED,
+                    e
+                ));
             }
         };
         debug!(
@@ -2569,8 +2579,9 @@ fn epoch_millis_precise() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        DtlsDisconnectContext, UdpDisconnectContext, UdpSession, build_dtls_stream_summary,
-        build_udp_stream_summary, emit_udp_stream_disconnect,
+        DtlsDisconnectContext, STREAM_ERR_BACKEND_DTLS_HANDSHAKE_FAILED, UdpDisconnectContext,
+        UdpSession, build_dtls_stream_summary, build_udp_stream_summary,
+        emit_udp_stream_disconnect,
     };
     use crate::config::types::BackendProtocol;
     use crate::plugins::{Plugin, StreamTransactionSummary};
@@ -2746,7 +2757,7 @@ mod tests {
                 backend_protocol: BackendProtocol::Dtls,
                 listen_port: 7443,
                 disconnected_ms: 1_710_000_002_000,
-                connection_error: Some("Backend DTLS handshake failed".to_string()),
+                connection_error: Some(STREAM_ERR_BACKEND_DTLS_HANDSHAKE_FAILED.to_string()),
                 error_class: Some(crate::retry::ErrorClass::TlsError),
                 disconnect_direction: Some(crate::plugins::Direction::BackendToClient),
                 disconnect_cause: Some(crate::plugins::DisconnectCause::BackendError),
@@ -2763,7 +2774,7 @@ mod tests {
         assert_eq!(summary.listen_port, 7443);
         assert_eq!(
             summary.connection_error.as_deref(),
-            Some("Backend DTLS handshake failed")
+            Some(STREAM_ERR_BACKEND_DTLS_HANDSHAKE_FAILED)
         );
         assert_eq!(
             summary.error_class,

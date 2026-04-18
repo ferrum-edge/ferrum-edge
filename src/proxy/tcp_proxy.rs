@@ -30,6 +30,21 @@ pub(crate) fn classify_stream_error(error: &anyhow::Error) -> crate::retry::Erro
     crate::retry::classify_boxed_error(error.as_ref())
 }
 
+// Shared error-message prefixes used at `anyhow::anyhow!` construction sites
+// AND at the `error_message.contains(...)` check sites in
+// `pre_copy_disconnect_cause` / `dtls_disconnect_cause`. Keeping them as
+// constants means a rename at the construction site is a compile error
+// everywhere — the checkers can't silently fall out of sync with the message
+// wording. Do not inline these strings; route any new "wraps a stream error"
+// site through a constant.
+pub(crate) const STREAM_ERR_FRONTEND_TLS_HANDSHAKE_FAILED: &str = "Frontend TLS handshake failed";
+pub(crate) const STREAM_ERR_BACKEND_TLS_HANDSHAKE_FAILED: &str = "Backend TLS handshake failed";
+pub(crate) const STREAM_ERR_REJECTED_BY_PLUGIN: &str = "rejected by plugin";
+pub(crate) const STREAM_ERR_REJECTED_BY_ACL: &str = "rejected by ACL";
+pub(crate) const STREAM_ERR_REJECTED_BY_POLICY: &str = "rejected by policy";
+pub(crate) const STREAM_ERR_THROTTLED: &str = "throttled";
+pub(crate) const STREAM_ERR_NO_HEALTHY_TARGETS: &str = "No healthy targets";
+
 /// Which end of a half-duplex copy produced the error.
 ///
 /// A single direction of the bidirectional relay consists of a read on the
@@ -141,19 +156,19 @@ fn pre_copy_disconnect_cause(
         | ErrorClass::ProtocolError => DisconnectCause::BackendError,
         // `ConnectionReset` / `ConnectionClosed` can originate on either
         // side: a frontend TLS handshake abort from a client that resets
-        // mid-handshake surfaces here too. Disambiguate by message.
+        // mid-handshake surfaces here too. Disambiguate by the message
+        // prefix constant set at the construction site.
         ErrorClass::ConnectionReset | ErrorClass::ConnectionClosed => {
-            if error_message.contains("Frontend TLS handshake failed") {
+            if error_message.contains(STREAM_ERR_FRONTEND_TLS_HANDSHAKE_FAILED) {
                 DisconnectCause::RecvError
             } else {
                 DisconnectCause::BackendError
             }
         }
         ErrorClass::TlsError => {
-            if error_message.contains("Frontend TLS handshake failed") {
+            if error_message.contains(STREAM_ERR_FRONTEND_TLS_HANDSHAKE_FAILED) {
                 DisconnectCause::RecvError
-            } else if error_message.contains("Backend TLS") || error_message.contains("backend TLS")
-            {
+            } else if error_message.contains(STREAM_ERR_BACKEND_TLS_HANDSHAKE_FAILED) {
                 DisconnectCause::BackendError
             } else {
                 // Unknown TLS side — conservative fallback to avoid
@@ -162,18 +177,18 @@ fn pre_copy_disconnect_cause(
             }
         }
         ErrorClass::ClientDisconnect => DisconnectCause::RecvError,
-        // `RequestError` is a catch-all; disambiguate by the error message
+        // `RequestError` is a catch-all; disambiguate via the prefix constants
         // so plugin/policy rejections (client-side) don't get reported as
         // backend outages, while backend resolution failures
-        // (e.g. "No healthy targets") still surface as `BackendError`.
+        // (`STREAM_ERR_NO_HEALTHY_TARGETS`) still surface as `BackendError`.
         ErrorClass::RequestError => {
-            if error_message.contains("rejected by plugin")
-                || error_message.contains("rejected by ACL")
-                || error_message.contains("rejected by policy")
-                || error_message.contains("throttled")
+            if error_message.contains(STREAM_ERR_REJECTED_BY_PLUGIN)
+                || error_message.contains(STREAM_ERR_REJECTED_BY_ACL)
+                || error_message.contains(STREAM_ERR_REJECTED_BY_POLICY)
+                || error_message.contains(STREAM_ERR_THROTTLED)
             {
                 DisconnectCause::RecvError
-            } else if error_message.contains("No healthy targets")
+            } else if error_message.contains(STREAM_ERR_NO_HEALTHY_TARGETS)
                 || error_message.contains("upstream")
                 || error_message.contains("backend")
             {
@@ -922,7 +937,10 @@ async fn handle_tcp_connection_inner(
                         sni = ?stream_ctx.sni_hostname,
                         "TCP passthrough connection rejected by plugin"
                     );
-                    return Err(anyhow::anyhow!("Connection rejected by plugin"));
+                    return Err(anyhow::anyhow!(
+                        "Connection {}",
+                        STREAM_ERR_REJECTED_BY_PLUGIN
+                    ));
                 }
             }
         }
@@ -1057,7 +1075,10 @@ async fn handle_tcp_connection_inner(
                     client = %remote_addr.ip(),
                     "TCP connection rejected by plugin"
                 );
-                return Err(anyhow::anyhow!("Connection rejected by plugin"));
+                return Err(anyhow::anyhow!(
+                    "Connection {}",
+                    STREAM_ERR_REJECTED_BY_PLUGIN
+                ));
             }
         }
     }
@@ -1248,8 +1269,11 @@ async fn handle_tcp_connection_inner(
             Ok(s) => s,
             Err(e) => {
                 // Frontend TLS failures are client-side — do not penalise the backend CB.
+                // Prefix is a shared constant so `pre_copy_disconnect_cause` can
+                // detect "frontend side" without drifting from the wording here.
                 return Err(anyhow::anyhow!(
-                    "Frontend TLS handshake failed from {}: {}",
+                    "{} from {}: {}",
+                    STREAM_ERR_FRONTEND_TLS_HANDSHAKE_FAILED,
                     remote_addr,
                     e
                 ));
@@ -1287,7 +1311,10 @@ async fn handle_tcp_connection_inner(
                         client = %remote_addr.ip(),
                         "TCP/TLS connection rejected by plugin"
                     );
-                    return Err(anyhow::anyhow!("Connection rejected by plugin"));
+                    return Err(anyhow::anyhow!(
+                        "Connection {}",
+                        STREAM_ERR_REJECTED_BY_PLUGIN
+                    ));
                 }
             }
         }
@@ -1446,7 +1473,13 @@ fn resolve_backend_target(
     if let Some(upstream_id) = &proxy.upstream_id {
         let selection = lb_cache
             .select_target(upstream_id, &proxy.id, None)
-            .ok_or_else(|| anyhow::anyhow!("No healthy targets for upstream {}", upstream_id))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "{} for upstream {}",
+                    STREAM_ERR_NO_HEALTHY_TARGETS,
+                    upstream_id
+                )
+            })?;
         Ok((selection.target.host.clone(), selection.target.port))
     } else {
         Ok((proxy.backend_host.clone(), proxy.backend_port))
@@ -1556,10 +1589,19 @@ async fn connect_backend_tls_cached(
     let server_name = rustls::pki_types::ServerName::try_from(hostname.to_string())
         .map_err(|e| anyhow::anyhow!("Invalid server name '{}': {}", hostname, e))?;
 
+    // Prefix is a shared constant so `pre_copy_disconnect_cause` can detect
+    // "backend TLS side" without drifting from the wording here.
     let tls_stream = connector
         .connect(server_name, tcp_stream)
         .await
-        .map_err(|e| anyhow::anyhow!("Backend TLS handshake failed to {}: {}", addr, e))?;
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "{} to {}: {}",
+                STREAM_ERR_BACKEND_TLS_HANDSHAKE_FAILED,
+                addr,
+                e
+            )
+        })?;
 
     Ok(tls_stream)
 }
@@ -1635,9 +1677,19 @@ where
 ///
 /// When `idle_timeout` is `Some(d)` and non-zero, the connection is closed
 /// if no data is received on either side for the given duration.
+///
+/// **Fast path**: When both `idle_timeout` and `half_close_cap` are `None` and
+/// zero, the function delegates to `tokio::io::copy_bidirectional_with_sizes`,
+/// skipping the `tokio::io::split` + Phase 1/Phase 2 machinery. This restores
+/// the historical zero-overhead behaviour for deployments that explicitly
+/// disable all drain bounds (`FERRUM_TCP_IDLE_TIMEOUT_SECONDS=0` +
+/// `FERRUM_TCP_HALF_CLOSE_MAX_WAIT_SECONDS=0`). The trade-off: on error the
+/// fast path loses `first_failure` direction attribution (reports
+/// `Direction::Unknown`) — acceptable because the user opted out of both
+/// observability bounds. Clean completion preserves per-direction byte counts.
 async fn bidirectional_copy<C, B>(
-    client: C,
-    backend: B,
+    mut client: C,
+    mut backend: B,
     idle_timeout: Option<Duration>,
     half_close_cap: Option<Duration>,
     buf_size: usize,
@@ -1646,6 +1698,43 @@ where
     C: AsyncRead + AsyncWrite + Unpin,
     B: AsyncRead + AsyncWrite + Unpin,
 {
+    // Fast path: both drain bounds disabled → use tokio's optimised
+    // bidirectional copy directly. No split (no BiLock overhead), no select
+    // loop. On error we classify with `Direction::Unknown` because
+    // `copy_bidirectional_with_sizes` doesn't report which half failed first.
+    let idle_disabled = idle_timeout.is_none_or(|d| d.is_zero());
+    let cap_disabled = half_close_cap.is_none_or(|d| d.is_zero());
+    if idle_disabled && cap_disabled {
+        return match tokio::io::copy_bidirectional_with_sizes(
+            &mut client,
+            &mut backend,
+            buf_size,
+            buf_size,
+        )
+        .await
+        {
+            Ok((c2b, b2c)) => StreamCopyResult {
+                bytes_client_to_backend: c2b,
+                bytes_backend_to_client: b2c,
+                first_failure: None,
+            },
+            Err(e) => {
+                let msg = e.to_string();
+                let err: anyhow::Error = anyhow::anyhow!("Bidirectional copy error: {}", e);
+                StreamCopyResult {
+                    bytes_client_to_backend: 0,
+                    bytes_backend_to_client: 0,
+                    first_failure: Some((
+                        Direction::Unknown,
+                        classify_stream_error(&err),
+                        None,
+                        msg,
+                    )),
+                }
+            }
+        };
+    }
+
     let c2b_bytes = Arc::new(AtomicU64::new(0));
     let b2c_bytes = Arc::new(AtomicU64::new(0));
 

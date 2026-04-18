@@ -1180,14 +1180,9 @@ async fn handle_h3_request(
                     request_user_agent: proxy_headers.get("user-agent").cloned(),
                     // Backend connection failed before any streaming began — the 502
                     // response body is built and sent synchronously below.
-                    response_streamed: false,
-                    client_disconnected: false,
                     error_class: Some(h3_error_class),
-                    body_error_class: None,
-                    body_completed: false,
-                    bytes_streamed_to_client: 0,
-                    mirror: false,
                     metadata: ctx.metadata.clone(),
+                    ..TransactionSummary::default()
                 };
                 crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
                 record_request(&state, 502);
@@ -1896,14 +1891,9 @@ async fn handle_h3_request(
             latency_plugin_external_io_ms: plugin_external_io_ms,
             latency_gateway_overhead_ms: gateway_overhead_ms,
             request_user_agent: proxy_headers.get("user-agent").cloned(),
-            response_streamed: false,
-            client_disconnected: false,
             error_class: h3_error_class,
-            body_error_class: None,
-            body_completed: false,
-            bytes_streamed_to_client: 0,
-            mirror: false,
             metadata: ctx.metadata.clone(),
+            ..TransactionSummary::default()
         };
 
         crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
@@ -2095,14 +2085,14 @@ fn classify_h3_error(e: &anyhow::Error) -> crate::retry::ErrorClass {
 
 /// Outcome of a streaming H3 proxy operation.
 ///
-/// Carries both pre-stream fields (status/headers/error_class) and
-/// body-streaming outcome fields so the transaction log at the call site
-/// reflects the actual client-visible result, including mid-stream
-/// disconnects and partial byte counts.
+/// Carries pre-stream fields (status/error_class) and body-streaming outcome
+/// fields so the transaction log at the call site reflects the actual
+/// client-visible result, including mid-stream disconnects and partial byte
+/// counts. Response headers are flushed to the client before this struct is
+/// constructed, so they are intentionally not stored here — the call sites
+/// that need them already hold a local copy via `response_headers`.
 struct H3StreamResult {
     status: u16,
-    #[allow(dead_code)]
-    headers: HashMap<String, String>,
     error_class: Option<crate::retry::ErrorClass>,
     body_completed: bool,
     bytes_streamed: u64,
@@ -2173,7 +2163,6 @@ async fn proxy_to_backend_h3_streaming(
             send_h3_response(h3_stream, StatusCode::BAD_GATEWAY, h3_error_body).await?;
             return Ok(H3StreamResult {
                 status: 502,
-                headers: HashMap::new(),
                 error_class: Some(h3_error_class),
                 body_completed: false,
                 bytes_streamed: 0,
@@ -2219,7 +2208,6 @@ async fn proxy_to_backend_h3_streaming(
         .await?;
         return Ok(H3StreamResult {
             status: 502,
-            headers: HashMap::new(),
             error_class: Some(crate::retry::ErrorClass::ResponseBodyTooLarge),
             body_completed: false,
             bytes_streamed: 0,
@@ -2270,7 +2258,6 @@ async fn proxy_to_backend_h3_streaming(
         // Client QUIC stream is already gone — nothing streamed.
         return Ok(H3StreamResult {
             status: response_status,
-            headers: response_headers,
             error_class: None,
             body_completed: false,
             bytes_streamed: 0,
@@ -2385,7 +2372,6 @@ async fn proxy_to_backend_h3_streaming(
 
     Ok(H3StreamResult {
         status: response_status,
-        headers: response_headers,
         error_class: terminal_error_class,
         body_completed,
         bytes_streamed,
