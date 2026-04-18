@@ -331,22 +331,32 @@ impl Plugin for SpecExpose {
             return PluginResult::Continue;
         }
 
-        // Try the cache first; on miss or expiry, fetch and cache with a
-        // single-flight guard so a burst of cold-cache requests does not
-        // fan out to the upstream document store.
-        let entry = match self.cached_spec() {
-            Some(entry) => entry,
-            None => {
-                let _guard = self.fetch_lock.lock().await;
-                // Re-check the cache after acquiring the lock: another task
-                // may have populated it while we were waiting. Skip the check
-                // when caching is disabled (TTL=0) so every request re-fetches.
-                if let Some(entry) = self.cached_spec() {
-                    entry
-                } else {
-                    match self.fetch_and_cache().await {
-                        Ok(entry) => entry,
-                        Err(reject) => return reject,
+        // Try the cache first; on miss or expiry, fetch and (when caching is
+        // enabled) serialize through the single-flight lock so a burst of
+        // cold-cache requests does not fan out to the upstream document store.
+        //
+        // When caching is disabled (TTL=0) we bypass the lock entirely — every
+        // request is expected to re-fetch, so serializing them would collapse
+        // throughput into strictly-sequential upstream calls.
+        let entry = if self.cache_ttl.is_zero() {
+            match self.fetch_and_cache().await {
+                Ok(entry) => entry,
+                Err(reject) => return reject,
+            }
+        } else {
+            match self.cached_spec() {
+                Some(entry) => entry,
+                None => {
+                    let _guard = self.fetch_lock.lock().await;
+                    // Re-check the cache after acquiring the lock: another task
+                    // may have populated it while we were waiting.
+                    if let Some(entry) = self.cached_spec() {
+                        entry
+                    } else {
+                        match self.fetch_and_cache().await {
+                            Ok(entry) => entry,
+                            Err(reject) => return reject,
+                        }
                     }
                 }
             }

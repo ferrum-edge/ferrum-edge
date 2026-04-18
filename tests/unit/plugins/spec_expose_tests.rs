@@ -493,3 +493,71 @@ async fn test_concurrent_cold_cache_fetches_deduplicated() {
     }
     // MockServer drops with .expect(1) — panics if more than one hit.
 }
+
+// Regression for Codex P2: when caching is disabled (TTL=0), the single-flight
+// lock must NOT serialize requests. Every request is expected to re-fetch, so
+// the lock would collapse concurrent throughput into strictly-sequential
+// upstream calls. This test verifies that N concurrent requests fire all N
+// upstream fetches in parallel within a timing budget that proves they did
+// not serialize behind a lock.
+#[tokio::test]
+async fn test_ttl_zero_does_not_serialize_concurrent_fetches() {
+    use std::time::Instant;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+    // Each upstream fetch takes ~150ms. With 6 requests, serialized execution
+    // would take ~900ms. Concurrent execution should finish in ~200ms.
+    Mock::given(method("GET"))
+        .and(path("/openapi.yaml"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/yaml")
+                .set_body_string("openapi: 3.0.0\n")
+                .set_delay(std::time::Duration::from_millis(150)),
+        )
+        // TTL=0 means every request re-fetches — we expect ALL 6 hits.
+        .expect(6)
+        .mount(&mock_server)
+        .await;
+
+    let plugin = Arc::new(
+        SpecExpose::new(
+            &json!({
+                "spec_url": format!("{}/openapi.yaml", mock_server.uri()),
+                "cache_ttl_seconds": 0
+            }),
+            PluginHttpClient::default(),
+        )
+        .unwrap(),
+    );
+
+    let start = Instant::now();
+    let mut handles = Vec::new();
+    for _ in 0..6 {
+        let plugin = plugin.clone();
+        handles.push(tokio::spawn(async move {
+            let mut ctx = make_ctx("GET", "/api/specz", "/api");
+            plugin.on_request_received(&mut ctx).await
+        }));
+    }
+    for h in handles {
+        let result = h.await.unwrap();
+        assert!(matches!(
+            result,
+            PluginResult::RejectBinary {
+                status_code: 200,
+                ..
+            }
+        ));
+    }
+    let elapsed = start.elapsed();
+    // Serialized would be ~900ms. Parallel should be ~150-300ms. Allow a
+    // generous 600ms ceiling to avoid flakiness on slow CI, but anything
+    // >600ms indicates the lock is serializing.
+    assert!(
+        elapsed < std::time::Duration::from_millis(600),
+        "TTL=0 concurrent fetches appear serialized (took {elapsed:?}, expected <600ms)"
+    );
+}
