@@ -45,6 +45,12 @@ pub async fn run(
 
     let effective_replica_url = env_config.effective_db_read_replica_url();
 
+    // Tracks whether the initial connect succeeded. When `true`, the gateway
+    // started via `FERRUM_DB_CONFIG_BACKUP_PATH` because every configured DB
+    // URL was unreachable — polling will retry and flip this back to normal
+    // operation once the database recovers.
+    let mut bootstrap_from_backup = false;
+
     // Build the database backend — SQL (sqlx) or MongoDB depending on FERRUM_DB_TYPE
     let db: Box<dyn DatabaseBackend> = match db_type {
         "mongodb" => {
@@ -81,7 +87,7 @@ pub async fn run(
                 connect_timeout_seconds: env_config.db_pool_connect_timeout_seconds,
                 statement_timeout_seconds: env_config.db_pool_statement_timeout_seconds,
             };
-            let mut store = DatabaseStore::connect_with_failover(
+            let mut store = match DatabaseStore::connect_with_failover(
                 db_type,
                 &effective_url,
                 &failover_urls,
@@ -90,9 +96,47 @@ pub async fn run(
                 env_config.db_tls_client_cert_path.as_deref(),
                 env_config.db_tls_client_key_path.as_deref(),
                 env_config.db_tls_insecure,
-                pool_config,
+                pool_config.clone(),
             )
-            .await?;
+            .await
+            {
+                Ok(s) => s,
+                Err(e) => {
+                    // Every URL failed. If the operator provided
+                    // `FERRUM_DB_CONFIG_BACKUP_PATH`, build a lazy-pool store
+                    // so the gateway can still come up serving from the
+                    // on-disk backup. The polling loop will retry the primary
+                    // URL and flip `db_available` to true when it recovers.
+                    if env_config.db_config_backup_path.is_some() {
+                        warn!(
+                            "All database URLs failed ({}). \
+                             FERRUM_DB_CONFIG_BACKUP_PATH is set — bootstrapping \
+                             from backup with a lazy pool. Polling will retry \
+                             primary and {} failover URL(s) in the background.",
+                            e,
+                            failover_urls.len()
+                        );
+                        bootstrap_from_backup = true;
+                        // Pass `failover_urls` into the offline store so the
+                        // polling loop's `try_failover_reconnect()` probes them
+                        // — a primary that stays down must not prevent
+                        // recovery when a configured failover DB is healthy.
+                        DatabaseStore::connect_offline_with_tls_config(
+                            db_type,
+                            &effective_url,
+                            &failover_urls,
+                            env_config.db_tls_enabled,
+                            env_config.db_tls_ca_cert_path.as_deref(),
+                            env_config.db_tls_client_cert_path.as_deref(),
+                            env_config.db_tls_client_key_path.as_deref(),
+                            env_config.db_tls_insecure,
+                            pool_config,
+                        )?
+                    } else {
+                        return Err(e);
+                    }
+                }
+            };
             store.set_slow_query_threshold(env_config.db_slow_query_threshold_ms);
             store.set_cert_expiry_warning_days(env_config.tls_cert_expiry_warning_days);
             store.set_backend_allow_ips(env_config.backend_allow_ips.clone());
@@ -122,6 +166,42 @@ pub async fn run(
     };
     // Convert to Arc for sharing across tasks
     let db: Arc<dyn DatabaseBackend> = Arc::from(db);
+
+    // If we used the offline-bootstrap path above, try to apply the deferred
+    // migrations immediately. The DB may have been unreachable only during
+    // the eager connect and become reachable by the time we query here; in
+    // that case we must run the migrations now so `load_full_config` below
+    // sees the expected schema AND the admin API can enable writes right
+    // away. Leaving `bootstrap_from_backup=true` until the first polling
+    // cycle would force `db_available=false` for up to one poll interval
+    // even though the database has already recovered — causing false 503s.
+    //
+    // For non-offline stores this is a no-op (CAS fails, returns Ok(false)).
+    if bootstrap_from_backup {
+        match db.maybe_apply_deferred_migrations().await {
+            Ok(true) => {
+                info!(
+                    "Backup-bootstrapped store: deferred migrations applied at startup — \
+                     database became reachable during boot, admin writes enabled immediately"
+                );
+                bootstrap_from_backup = false;
+            }
+            Ok(false) => {
+                // Flag already cleared — treat as if DB is available.
+                // Shouldn't happen right after offline bootstrap, but
+                // handling it avoids a stale `bootstrap_from_backup=true`
+                // blocking admin writes unnecessarily.
+                bootstrap_from_backup = false;
+            }
+            Err(e) => {
+                warn!(
+                    "Backup bootstrap: database still unreachable at startup migration \
+                     attempt ({}); polling will retry in the background",
+                    e
+                );
+            }
+        }
+    }
 
     // Load initial config from database, falling back to backup file if configured
     let backup_path = env_config.db_config_backup_path.clone();
@@ -465,9 +545,12 @@ pub async fn run(
 
     // Shared flag: DB polling loop sets this to false when the database is
     // unreachable, causing the admin API to reject writes early and preserve
-    // the cached config until the DB recovers.
+    // the cached config until the DB recovers. When we bootstrapped from a
+    // backup file because every DB URL was down at startup, initialize to
+    // `false` so `/health` and the admin API report the true state
+    // immediately — before the first polling tick runs.
     let startup_ready = Arc::new(AtomicBool::new(false));
-    let db_available = Arc::new(AtomicBool::new(true));
+    let db_available = Arc::new(AtomicBool::new(!bootstrap_from_backup));
 
     let admin_state = AdminState {
         db: Some(db.clone()),
@@ -732,7 +815,25 @@ pub async fn run(
                             &known_upstream_ids,
                         ).await {
                             Ok(result) => {
-                                db_available_poll.store(true, Ordering::Relaxed);
+                                // Catch the lazy-pool-connects-directly case:
+                                // if offline bootstrap left `migrations_pending`
+                                // set, the query above succeeded without
+                                // `reconnect()` ever firing. Run deferred
+                                // migrations now before flipping
+                                // `db_available` — otherwise admin writes
+                                // could hit an outdated schema.
+                                // No-op when nothing is pending.
+                                match db_poll.maybe_apply_deferred_migrations().await {
+                                    Ok(_) => db_available_poll.store(true, Ordering::Relaxed),
+                                    Err(e) => {
+                                        warn!(
+                                            "Deferred migrations failed despite successful incremental poll: {}. \
+                                             Admin writes remain blocked until schema is applied.",
+                                            e
+                                        );
+                                        db_available_poll.store(false, Ordering::Relaxed);
+                                    }
+                                }
                                 let poll_ts = result.poll_timestamp;
                                 // Collect ID changes before moving result into apply_incremental
                                 let added_proxy_ids: Vec<String> = result.added_or_modified_proxies.iter().map(|p| p.id.clone()).collect();
@@ -824,10 +925,25 @@ pub async fn run(
                             }
                         }
                     } else {
-                        // First poll — full load to seed state
+                        // First poll — full load to seed state. This path can
+                        // fire when the startup `load_full_config` failed (we
+                        // bootstrapped from backup) but the lazy pool is now
+                        // reaching a live DB. Run deferred migrations if any
+                        // before flipping `db_available` — see comment in the
+                        // incremental-success branch above.
                         match db_poll.load_full_config(&poll_namespace).await {
                             Ok(new_config) => {
-                                db_available_poll.store(true, Ordering::Relaxed);
+                                match db_poll.maybe_apply_deferred_migrations().await {
+                                    Ok(_) => db_available_poll.store(true, Ordering::Relaxed),
+                                    Err(e) => {
+                                        warn!(
+                                            "Deferred migrations failed despite successful full reload: {}. \
+                                             Admin writes remain blocked until schema is applied.",
+                                            e
+                                        );
+                                        db_available_poll.store(false, Ordering::Relaxed);
+                                    }
+                                }
                                 let (p, c, pc, u) = db_backend::extract_known_ids(&new_config);
                                 known_proxy_ids = p;
                                 known_consumer_ids = c;

@@ -391,10 +391,19 @@ fn health_request_tls(
     use std::io::{Read, Write};
     use std::sync::Arc;
 
+    // `execute_health` is an early-exit subcommand that returns from `main()`
+    // before the global `CryptoProvider::install_default()` call. Build the
+    // ClientConfig with an explicit provider so we don't depend on (or panic
+    // on) a globally installed one.
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+
     let mut root_store = rustls::RootCertStore::empty();
     root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
-    let builder = rustls::ClientConfig::builder().with_root_certificates(root_store);
+    let builder = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| format!("Failed to build rustls client config: {}", e))?
+        .with_root_certificates(root_store);
     let mut tls_config = builder.with_no_client_auth();
     if no_verify {
         tls_config

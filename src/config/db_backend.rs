@@ -330,6 +330,23 @@ pub trait DatabaseBackend: Send + Sync {
     /// Run schema migrations (SQL) or ensure indexes/collections exist (MongoDB).
     async fn run_migrations(&self) -> Result<(), anyhow::Error>;
 
+    /// If the backend has pending migrations deferred from offline bootstrap,
+    /// try to apply them now. Returns `Ok(true)` if migrations were run, or
+    /// `Ok(false)` if nothing was pending (the normal case). `Err` means the
+    /// database is still unreachable or the migration itself failed; the
+    /// caller should leave the "pending" state unchanged.
+    ///
+    /// Call this anywhere an outcome-agnostic migration check is cheap: at
+    /// startup after offline bootstrap, on each polling-loop success, and
+    /// at the end of `reconnect()`. Implementations must be idempotent —
+    /// concurrent calls should not run migrations twice.
+    ///
+    /// The default implementation is a no-op for backends that don't have
+    /// an offline-bootstrap / lazy-pool concept (e.g., MongoDB).
+    async fn maybe_apply_deferred_migrations(&self) -> Result<bool, anyhow::Error> {
+        Ok(false)
+    }
+
     /// Return all distinct namespaces across all resource tables.
     async fn list_namespaces(&self) -> Result<Vec<String>, anyhow::Error>;
 }

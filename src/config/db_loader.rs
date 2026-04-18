@@ -135,6 +135,15 @@ pub struct DatabaseStore {
     slow_query_threshold_ms: Option<u64>,
     cert_expiry_warning_days: u64,
     backend_allow_ips: crate::config::BackendAllowIps,
+    /// Set to `true` when the store was created via
+    /// [`DatabaseStore::connect_offline_with_tls_config`] — the lazy pool
+    /// never ran migrations because the DB was unreachable at startup.
+    /// Cleared once migrations succeed against a recovered DB. `reconnect()`
+    /// checks this flag and runs migrations on the first successful reconnect
+    /// so the polling loop does not loop forever on a missing schema.
+    /// Shared via `Arc<AtomicBool>` so all clones of the store observe the
+    /// same cleared-state after recovery.
+    migrations_pending: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl DatabaseStore {
@@ -308,6 +317,7 @@ impl DatabaseStore {
             slow_query_threshold_ms: None,
             cert_expiry_warning_days: crate::tls::DEFAULT_CERT_EXPIRY_WARNING_DAYS,
             backend_allow_ips: crate::config::BackendAllowIps::Both,
+            migrations_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
 
         store.run_migrations().await?;
@@ -320,6 +330,72 @@ impl DatabaseStore {
             store.pool_config.min_connections
         );
         Ok(store)
+    }
+
+    /// Construct a `DatabaseStore` with a lazy pool — no TCP connection is
+    /// opened and no migrations run. The first query will trigger connection
+    /// (and may fail). Use this only as a bootstrap fallback when eager
+    /// connection has failed but a backup config is being loaded from disk:
+    /// the gateway serves from cached config while the background polling
+    /// loop retries the pool until the DB becomes reachable again.
+    ///
+    /// `failover_urls` is stored on the returned `DatabaseStore` so that the
+    /// polling loop's `try_failover_reconnect()` call can probe each URL in
+    /// order — a primary that stays down should not prevent recovery when a
+    /// configured failover DB is healthy.
+    ///
+    /// The returned store has `migrations_pending=true`. The first successful
+    /// `reconnect()` (primary or failover) will run migrations, because a DB
+    /// that comes back with a fresh or outdated schema must be brought up to
+    /// the expected version before the polling loop can read from it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn connect_offline_with_tls_config(
+        db_type: &str,
+        db_url: &str,
+        failover_urls: &[String],
+        tls_enabled: bool,
+        tls_ca_cert_path: Option<&str>,
+        tls_client_cert_path: Option<&str>,
+        tls_client_key_path: Option<&str>,
+        tls_insecure: bool,
+        pool_config: DbPoolConfig,
+    ) -> Result<Self, anyhow::Error> {
+        sqlx::any::install_default_drivers();
+
+        let mut final_url = if tls_enabled && (db_type == "postgres" || db_type == "mysql") {
+            Self::build_tls_connection_url(
+                db_url,
+                db_type,
+                tls_ca_cert_path,
+                tls_client_cert_path,
+                tls_client_key_path,
+                tls_insecure,
+            )?
+        } else {
+            db_url.to_string()
+        };
+
+        final_url =
+            Self::append_connect_timeout(&final_url, db_type, pool_config.connect_timeout_seconds);
+
+        // `connect_lazy` does not attempt a connection — the pool is ready to
+        // hand out connections on first query. Migrations are deferred until
+        // the database becomes reachable and the polling loop drives a
+        // successful `reconnect()`.
+        let pool =
+            Self::build_pool_options_from_config(&pool_config, db_type).connect_lazy(&final_url)?;
+
+        Ok(Self {
+            pool: Arc::new(ArcSwap::from_pointee(pool)),
+            read_replica_pool: None,
+            db_type: db_type.to_string(),
+            failover_urls: failover_urls.to_vec(),
+            pool_config,
+            slow_query_threshold_ms: None,
+            cert_expiry_warning_days: crate::tls::DEFAULT_CERT_EXPIRY_WARNING_DAYS,
+            backend_allow_ips: crate::config::BackendAllowIps::Both,
+            migrations_pending: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        })
     }
 
     /// Build a TLS-aware connection URL for Postgres and MySQL.
@@ -403,6 +479,52 @@ impl DatabaseStore {
         }
 
         Ok(())
+    }
+
+    /// If `migrations_pending` is set (only true for offline-bootstrapped
+    /// stores), try to run migrations now. Returns `Ok(true)` if migrations
+    /// were actually executed, `Ok(false)` if nothing was pending.
+    ///
+    /// Uses a CAS from `true → false` so concurrent callers don't run
+    /// migrations twice: whichever caller wins the CAS is the designated
+    /// runner. On failure, the flag is restored so the next caller retries.
+    ///
+    /// This is the canonical entry point for clearing the deferred-migration
+    /// state. Call it:
+    /// - At startup right after offline bootstrap (so the startup path
+    ///   doesn't wait for the first polling tick to catch up).
+    /// - At the end of `reconnect()` (for the failover-reconnect path).
+    /// - On each successful polling-loop query (for the case where the lazy
+    ///   pool happened to connect on the first query and `reconnect()` never
+    ///   fired — otherwise the flag would stay `true` indefinitely).
+    pub async fn maybe_apply_deferred_migrations(&self) -> Result<bool, anyhow::Error> {
+        use std::sync::atomic::Ordering;
+
+        // Only one caller wins the CAS and runs migrations; the rest see
+        // `Ok(false)` and return early. Acquire on success ensures we see
+        // the constructor's write of `true`; Release on the clear ensures
+        // other CPUs observe post-migration state after we complete.
+        if self
+            .migrations_pending
+            .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Ok(false);
+        }
+
+        info!("Applying deferred migrations after backup-bootstrap recovery");
+        match self.run_migrations().await {
+            Ok(()) => {
+                info!("Deferred migrations applied — database ready for polling");
+                Ok(true)
+            }
+            Err(e) => {
+                // Restore the flag so the next caller retries. Without this,
+                // a transient migration failure would silently skip forever.
+                self.migrations_pending.store(true, Ordering::Release);
+                Err(e)
+            }
+        }
     }
 
     /// Load the full gateway configuration from the database.
@@ -2785,6 +2907,15 @@ impl DatabaseStore {
             old_pool.close().await;
         });
 
+        // If this store was bootstrapped via `connect_offline_with_tls_config`
+        // (backup-file startup with an unreachable DB), migrations never ran.
+        // Now that the pool is reconnected to a live DB, run them before
+        // returning so the polling loop finds tables at the expected schema.
+        // The helper uses a CAS so concurrent callers don't run migrations
+        // twice, and restores the flag on failure so a transient error
+        // doesn't silently skip migrations forever.
+        self.maybe_apply_deferred_migrations().await?;
+
         Ok(())
     }
 
@@ -3469,6 +3600,10 @@ impl DatabaseBackend for DatabaseStore {
 
     async fn run_migrations(&self) -> Result<(), anyhow::Error> {
         DatabaseStore::run_migrations(self).await
+    }
+
+    async fn maybe_apply_deferred_migrations(&self) -> Result<bool, anyhow::Error> {
+        DatabaseStore::maybe_apply_deferred_migrations(self).await
     }
 
     async fn list_namespaces(&self) -> Result<Vec<String>, anyhow::Error> {
