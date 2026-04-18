@@ -150,9 +150,23 @@ impl ServerlessFunction {
             }
         };
 
-        let mode = match config["mode"].as_str().unwrap_or("pre_proxy") {
-            "terminate" => InvocationMode::Terminate,
-            _ => InvocationMode::PreProxy,
+        // Strict mode validation. Silently defaulting an unknown value (e.g.
+        // a typo'd "terminat") to `pre_proxy` would mask configuration errors
+        // and silently change semantic intent.
+        let mode = match config.get("mode") {
+            Some(Value::String(s)) => match s.as_str() {
+                "pre_proxy" => InvocationMode::PreProxy,
+                "terminate" => InvocationMode::Terminate,
+                other => {
+                    return Err(format!(
+                        "serverless_function: unknown mode '{other}' (expected 'pre_proxy' or 'terminate')"
+                    ));
+                }
+            },
+            Some(Value::Null) | None => InvocationMode::PreProxy,
+            Some(_) => {
+                return Err("serverless_function: 'mode' must be a string".to_string());
+            }
         };
 
         let forward_body = config["forward_body"].as_bool().unwrap_or(false);
@@ -175,13 +189,36 @@ impl ServerlessFunction {
         let max_response_body_bytes = config["max_response_body_bytes"]
             .as_u64()
             .unwrap_or(10 * 1024 * 1024) as usize;
+        if max_response_body_bytes == 0 {
+            return Err("serverless_function: max_response_body_bytes must be > 0".to_string());
+        }
 
-        let on_error = match config["on_error"].as_str().unwrap_or("reject") {
-            "continue" => ErrorAction::Continue,
-            _ => ErrorAction::Reject,
+        // Strict `on_error` validation — a typo here changes whether a function
+        // failure rejects the request or silently continues, so silent
+        // defaulting is unacceptable.
+        let on_error = match config.get("on_error") {
+            Some(Value::String(s)) => match s.as_str() {
+                "reject" => ErrorAction::Reject,
+                "continue" => ErrorAction::Continue,
+                other => {
+                    return Err(format!(
+                        "serverless_function: unknown on_error '{other}' (expected 'reject' or 'continue')"
+                    ));
+                }
+            },
+            Some(Value::Null) | None => ErrorAction::Reject,
+            Some(_) => {
+                return Err("serverless_function: 'on_error' must be a string".to_string());
+            }
         };
 
-        let error_status_code = config["error_status_code"].as_u64().unwrap_or(502).min(599) as u16;
+        let raw_status = config["error_status_code"].as_u64().unwrap_or(502);
+        if !(100..=599).contains(&raw_status) {
+            return Err(format!(
+                "serverless_function: error_status_code must be in range 100-599 (got {raw_status})"
+            ));
+        }
+        let error_status_code = raw_status as u16;
 
         // Provider-specific config + URL construction.
         // Config fields take precedence; well-known env vars are used as fallback.

@@ -1883,14 +1883,16 @@ Invokes AWS Lambda, Azure Functions, or Google Cloud Functions as middleware in 
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `mode` | String | `"pre_proxy"` | `"pre_proxy"` or `"terminate"` |
+| `mode` | String | `"pre_proxy"` | `"pre_proxy"` or `"terminate"`. Unknown values rejected at plugin load. **Note:** terminate mode is not supported for gRPC requests — gRPC reject normalization would drop the function response body, so the request fails with 500 |
 | `forward_body` | bool | `false` | Include request body in function payload |
-| `forward_headers` | String[] | `[]` | Header names to forward to the function |
+| `forward_headers` | String[] | `[]` | Header names to forward to the function (lowercased at config load) |
 | `forward_query_params` | bool | `false` | Include query parameters in function payload |
-| `timeout_ms` | u64 | `5000` | Function invocation timeout in milliseconds |
-| `max_response_body_bytes` | u64 | `10485760` | Max function response body size (10 MiB) |
-| `on_error` | String | `"reject"` | `"reject"` returns error to client; `"continue"` skips and proxies normally |
-| `error_status_code` | u16 | `502` | HTTP status when rejecting on error |
+| `timeout_ms` | u64 | `5000` | Function invocation timeout in milliseconds. Must be > 0 |
+| `max_response_body_bytes` | u64 | `10485760` | Max function response body size (10 MiB). Must be > 0 |
+| `on_error` | String | `"reject"` | `"reject"` returns error to client; `"continue"` skips and proxies normally. Unknown values rejected at plugin load |
+| `error_status_code` | u16 | `502` | HTTP status when rejecting on error. Must be in range 100-599 |
+
+**Strict config validation:** unknown `provider`, `mode`, or `on_error` values are rejected at plugin construction (no silent defaulting). Non-string values for `mode` / `on_error`, `timeout_ms` of `0`, `max_response_body_bytes` of `0`, and `error_status_code` outside 100-599 are also rejected.
 
 #### Function Request Payload
 
@@ -2127,8 +2129,8 @@ On-the-fly response compression and request decompression. Negotiates the best a
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `algorithms` | String[] | `["gzip", "br"]` | Enabled algorithms in server preference order (used to break q-value ties) |
-| `min_content_length` | u64 | `256` | Skip compression for bodies smaller than this (bytes) |
+| `algorithms` | String[] | `["gzip", "br"]` | Enabled algorithms in server preference order (used to break q-value ties). Accepts `"gzip"`, `"br"`, or `"brotli"` (alias for `"br"`). Unknown values, non-string entries, or non-array configs are rejected at plugin load — typos surface immediately rather than producing a partially-functional plugin. An empty array is also rejected |
+| `min_content_length` | u64 | `256` | Skip compression for bodies smaller than this (bytes). Only enforced when Content-Length is known at `after_proxy` time — chunked / streamed bodies that bypass the size gate are still compressed once `Content-Encoding` is committed (returning uncompressed bytes with a compressed-encoding header would be malformed) |
 | `content_types` | String[] | 10 defaults | Content-type whitelist (see below) |
 | `disable_on_etag` | bool | `false` | Skip compression when the response has an ETag header |
 | `remove_accept_encoding` | bool | `true` | Strip `Accept-Encoding` from the backend request so the backend sends uncompressed |

@@ -579,9 +579,8 @@ fn test_supported_protocols() {
 
 #[tokio::test]
 async fn test_root_listen_path_no_stripping() {
-    // When listen_path is "/", stripping "/" from "/users" leaves "users"
-    // which is wrong — but "/" stripped from "/users" should yield "/users".
-    // The min(len) logic handles this: strip_len=1, remaining="/users".
+    // When listen_path is "/", the special-case path means we use the full
+    // request path: "/users" should match a rule for "/users".
     let plugin = ResponseMock::new(&json!({
         "rules": [{ "path": "/users", "body": "root proxy" }]
     }))
@@ -591,6 +590,53 @@ async fn test_root_listen_path_no_stripping() {
     let mut headers = HashMap::new();
     match plugin.before_proxy(&mut ctx, &mut headers).await {
         PluginResult::Reject { body, .. } => assert_eq!(body, "root proxy"),
+        _ => panic!("Expected Reject"),
+    }
+}
+
+// === UTF-8 boundary safety ===
+//
+// Defensive: ensure the listen_path strip never panics when ctx.path does not
+// actually start with the listen_path (router bug or edge case). Previous
+// byte-indexed slicing could panic mid-codepoint.
+
+#[tokio::test]
+async fn test_strip_handles_path_not_starting_with_listen_path() {
+    let plugin = ResponseMock::new(&json!({
+        "rules": [{ "path": "/café", "body": "matched" }],
+        "passthrough_on_no_match": true
+    }))
+    .unwrap();
+
+    // listen_path = "/api" (4 ASCII bytes), ctx.path = "/café" (6 bytes,
+    // multibyte). The byte-indexed version would slice mid-codepoint at
+    // position 4 (inside é) and panic. The strip_prefix-based code falls
+    // back to the full path.
+    let mut ctx = make_ctx("GET", "/café", "/api");
+    let mut headers = HashMap::new();
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    // The full path "/café" matches the rule "/café"
+    match result {
+        PluginResult::Reject { body, .. } => assert_eq!(body, "matched"),
+        _ => panic!("Expected Reject (mismatched listen_path falls back to full path)"),
+    }
+}
+
+#[tokio::test]
+async fn test_strip_handles_multibyte_listen_path() {
+    let plugin = ResponseMock::new(&json!({
+        "rules": [{ "path": "/users", "body": "ok" }]
+    }))
+    .unwrap();
+
+    // listen_path with multibyte chars, ctx.path correctly prefixed.
+    // strip_prefix correctly yields "/users".
+    let mut ctx = make_ctx("GET", "/café/users", "/café");
+    let mut headers = HashMap::new();
+
+    match plugin.before_proxy(&mut ctx, &mut headers).await {
+        PluginResult::Reject { body, .. } => assert_eq!(body, "ok"),
         _ => panic!("Expected Reject"),
     }
 }

@@ -14,7 +14,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::fmt;
 use std::io::{Read, Write};
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 use super::{Plugin, PluginResult, RequestContext};
 
@@ -84,21 +84,33 @@ pub struct CompressionPlugin {
 
 impl CompressionPlugin {
     pub fn new(config: &Value) -> Result<Self, String> {
-        let algorithms = config["algorithms"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| match v.as_str()? {
-                        "gzip" => Some(Algorithm::Gzip),
-                        "br" | "brotli" => Some(Algorithm::Brotli),
-                        other => {
-                            warn!("compression: unknown algorithm '{}', skipping", other);
-                            None
+        // Parse `algorithms` strictly. Unknown values are rejected (no silent
+        // skip) so configuration typos surface immediately at load time
+        // instead of producing a partially-functional plugin.
+        let algorithms: Vec<Algorithm> = match config.get("algorithms") {
+            Some(Value::Array(arr)) => {
+                let mut algos = Vec::with_capacity(arr.len());
+                for (idx, v) in arr.iter().enumerate() {
+                    match v.as_str() {
+                        Some("gzip") => algos.push(Algorithm::Gzip),
+                        Some("br") | Some("brotli") => algos.push(Algorithm::Brotli),
+                        Some(other) => {
+                            return Err(format!(
+                                "compression: algorithms[{idx}]: unknown algorithm '{other}' (expected 'gzip' or 'br')"
+                            ));
                         }
-                    })
-                    .collect()
-            })
-            .unwrap_or_else(|| vec![Algorithm::Gzip, Algorithm::Brotli]);
+                        None => {
+                            return Err(format!("compression: algorithms[{idx}] must be a string"));
+                        }
+                    }
+                }
+                algos
+            }
+            Some(Value::Null) | None => vec![Algorithm::Gzip, Algorithm::Brotli],
+            Some(_) => {
+                return Err("compression: 'algorithms' must be an array of strings".to_string());
+            }
+        };
 
         let content_types = config["content_types"]
             .as_array()
@@ -513,8 +525,9 @@ impl Plugin for CompressionPlugin {
         _content_type: Option<&str>,
         response_headers: &HashMap<String, String>,
     ) -> Option<Vec<u8>> {
-        // The algorithm decision was made in after_proxy and recorded in
-        // the Content-Encoding response header.
+        // The algorithm decision was made in `after_proxy` and recorded in
+        // the `Content-Encoding` response header. If `after_proxy` did not
+        // commit to an encoding, do nothing.
         let encoding = response_headers.get("content-encoding")?;
 
         let algo = match encoding.as_str() {
@@ -523,10 +536,16 @@ impl Plugin for CompressionPlugin {
             _ => return None,
         };
 
-        // Don't compress tiny bodies — the overhead exceeds savings.
-        if body.len() < self.config.min_content_length {
-            return None;
-        }
+        // CRITICAL: once `after_proxy` set `Content-Encoding`, the response
+        // is committed to that encoding. We MUST NOT short-circuit here on
+        // body size — doing so would leave the client with a body labelled
+        // `Content-Encoding: gzip` that is actually plaintext, which every
+        // conformant client will reject as a decoding error.
+        //
+        // The minimum-length gate runs in `after_proxy` for the known-CL
+        // case. When CL is unknown (chunked / streamed responses), we
+        // accept that the rare tiny chunked body will be compressed needlessly
+        // — far cheaper than serving a malformed response.
 
         match self.compress(algo, body) {
             Ok(compressed) => {
@@ -535,12 +554,26 @@ impl Plugin for CompressionPlugin {
                     body.len(),
                     compressed.len(),
                     encoding,
-                    (1.0 - compressed.len() as f64 / body.len() as f64) * 100.0,
+                    if body.is_empty() {
+                        0.0
+                    } else {
+                        (1.0 - compressed.len() as f64 / body.len() as f64) * 100.0
+                    },
                 );
                 Some(compressed)
             }
             Err(e) => {
-                warn!("compression: response compression failed, sending uncompressed: {e}");
+                // `flate2`/`brotli` writing to a `Vec` is effectively
+                // infallible in practice, so this branch is unreachable in
+                // production. If it ever does fire, the response headers
+                // already commit us to a Content-Encoding that we cannot
+                // honour — the client will see a corrupt body. Log loudly
+                // so operators notice rather than silently downgrading.
+                error!(
+                    "compression: encoder failure for committed Content-Encoding '{}' — \
+                     response will be malformed: {e}",
+                    encoding
+                );
                 None
             }
         }
