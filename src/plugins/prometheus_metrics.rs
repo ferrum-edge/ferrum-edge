@@ -601,7 +601,9 @@ impl PrometheusMetrics {
     }
 }
 
-pub const PROMETHEUS_METRICS_PRIORITY: u16 = 9300;
+/// Backwards-compatible alias. Prefer `super::priority::PROMETHEUS_METRICS`.
+#[allow(dead_code)]
+pub const PROMETHEUS_METRICS_PRIORITY: u16 = super::priority::PROMETHEUS_METRICS;
 
 #[async_trait]
 impl Plugin for PrometheusMetrics {
@@ -610,7 +612,7 @@ impl Plugin for PrometheusMetrics {
     }
 
     fn priority(&self) -> u16 {
-        PROMETHEUS_METRICS_PRIORITY
+        super::priority::PROMETHEUS_METRICS
     }
 
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {

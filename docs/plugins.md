@@ -1070,6 +1070,7 @@ codes not listed in any pricing tier are free (not tracked).
 | `render_cache_ttl_seconds` | Integer | `5` | How long the cached `/charges` response is served before rebuilding |
 | `stale_entry_ttl_seconds` | Integer | `3600` | How long idle chargeback entries live before eviction |
 | `cache_invalidation_min_age_ms` | Integer | `500` | Minimum age (ms) of the render cache before `record()` will invalidate it |
+| `cleanup_interval_seconds` | Integer | `300` | How often (seconds) a background task evicts entries idle longer than `stale_entry_ttl_seconds`. Set to `0` to disable the periodic cleanup task |
 
 **Admin endpoint:** `GET /charges` (unauthenticated, like `/metrics`).
 

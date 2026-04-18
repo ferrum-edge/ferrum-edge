@@ -181,7 +181,9 @@ impl OtelTracing {
     }
 }
 
-pub const OTEL_TRACING_PRIORITY: u16 = 25;
+/// Backwards-compatible alias. Prefer `super::priority::OTEL_TRACING`.
+#[allow(dead_code)]
+pub const OTEL_TRACING_PRIORITY: u16 = super::priority::OTEL_TRACING;
 
 #[async_trait]
 impl Plugin for OtelTracing {
@@ -190,7 +192,7 @@ impl Plugin for OtelTracing {
     }
 
     fn priority(&self) -> u16 {
-        OTEL_TRACING_PRIORITY
+        super::priority::OTEL_TRACING
     }
 
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
@@ -716,7 +718,14 @@ fn otlp_attribute_bool(key: &str, value: bool) -> Value {
     })
 }
 
-/// Convert a hex string to base64-encoded bytes (OTLP format).
+/// Convert a hex string to base64-encoded bytes (OTLP/HTTP JSON encoding).
+///
+/// Per the OpenTelemetry spec, `traceId` (16 bytes / 32 hex chars) and
+/// `spanId` (8 bytes / 16 hex chars) are JSON-encoded as base64-standard
+/// strings. Callers in this module always pass even-length hex (validated
+/// upstream by `parse_traceparent` / produced by `generate_traceparent`),
+/// but the implementation is robust against odd-length input — the trailing
+/// half-byte is dropped rather than panicking on a slice out of bounds.
 fn hex_to_base64(hex: &str) -> String {
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD;
@@ -733,4 +742,47 @@ fn hex_to_base64(hex: &str) -> String {
         .collect();
 
     STANDARD.encode(&bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hex_to_base64_decodes_even_length_input() {
+        // Standard 16-byte trace_id (32 hex chars).
+        let hex = "4bf92f3577b34da6a3ce929d0e0e4736";
+        let encoded = hex_to_base64(hex);
+        // base64.b64encode(bytes.fromhex(...)) == "S/kvNXezTaajzpKdDg5HNg=="
+        assert_eq!(encoded, "S/kvNXezTaajzpKdDg5HNg==");
+    }
+
+    #[test]
+    fn hex_to_base64_decodes_8_byte_span_id() {
+        // Standard 8-byte span_id (16 hex chars).
+        let hex = "00f067aa0ba902b7";
+        let encoded = hex_to_base64(hex);
+        assert_eq!(encoded, "APBnqgupArc=");
+    }
+
+    #[test]
+    fn hex_to_base64_handles_empty_input() {
+        assert_eq!(hex_to_base64(""), "");
+    }
+
+    #[test]
+    fn hex_to_base64_handles_odd_length_without_panic() {
+        // Defensive: odd-length should not panic. The trailing half-byte
+        // is dropped (the final iteration would slice past hex.len() and
+        // is filtered out via the `end > hex.len()` guard).
+        let _ = hex_to_base64("abc");
+        let _ = hex_to_base64("4bf92f3577b34da6a3ce929d0e0e473");
+    }
+
+    #[test]
+    fn hex_to_base64_invalid_chars_filtered() {
+        // Non-hex chars are filtered out via from_str_radix Err.
+        let encoded = hex_to_base64("XX");
+        assert_eq!(encoded, ""); // no valid bytes decoded
+    }
 }

@@ -3478,6 +3478,70 @@ components:
           default: 10000
           description: Channel capacity — new entries are dropped when full
 
+    LokiLoggingConfig:
+      type: object
+      description: "Plugin: loki_logging — Ships transaction logs to Grafana Loki via the push API in batched, label-grouped streams. Supports gzip compression, multi-tenant headers, and bearer/basic auth."
+      required:
+        - endpoint_url
+      properties:
+        endpoint_url:
+          type: string
+          description: Loki push API URL (e.g. http://loki:3100/loki/api/v1/push). Must be http:// or https://
+        authorization_header:
+          type: string
+          description: Full Authorization header value (e.g. "Bearer <token>" or "Basic <b64>")
+        custom_headers:
+          type: object
+          additionalProperties:
+            type: string
+          description: Extra HTTP headers (e.g. X-Scope-OrgID for multi-tenant Loki)
+        labels:
+          type: object
+          additionalProperties:
+            type: string
+          default:
+            service: ferrum-edge
+          description: Static labels merged into every Loki stream. Keep cardinality low — labels are indexed
+        include_proxy_id_label:
+          type: boolean
+          default: true
+          description: Add the matched proxy_id as a Loki label. Legacy alias `include_listen_path_label` is still accepted for backward compatibility; if both are set, this key wins
+        include_listen_path_label:
+          type: boolean
+          description: "Deprecated alias for include_proxy_id_label (the label name has always been proxy_id). Accepted for backward compatibility"
+          deprecated: true
+        include_status_class_label:
+          type: boolean
+          default: true
+          description: Add status_class (2xx/3xx/4xx/5xx) as a Loki label
+        gzip:
+          type: boolean
+          default: true
+          description: Gzip-compress the request body (Content-Encoding header set automatically)
+        batch_size:
+          type: integer
+          default: 100
+          minimum: 1
+          description: Number of entries to buffer before sending a batch
+        flush_interval_ms:
+          type: integer
+          default: 1000
+          minimum: 100
+          description: Max milliseconds before flushing a partial batch
+        max_retries:
+          type: integer
+          default: 3
+          description: Retry attempts on failed batch delivery. 4xx other than 408/429 aborts immediately
+        retry_delay_ms:
+          type: integer
+          default: 1000
+          description: Delay in milliseconds between retry attempts
+        buffer_capacity:
+          type: integer
+          default: 10000
+          minimum: 1
+          description: Channel capacity — new entries are dropped when full
+
     StatsdLoggingConfig:
       type: object
       description: "Plugin: statsd_logging — Sends transaction metrics to a StatsD-compatible server over UDP."
@@ -5426,6 +5490,10 @@ components:
           type: integer
           default: 500
           description: Minimum age (ms) of the render cache before record() will invalidate it.
+        cleanup_interval_seconds:
+          type: integer
+          default: 300
+          description: How often (seconds) the background task evicts entries that have been idle longer than stale_entry_ttl_seconds. Set to 0 to disable.
 
     ChargebackResponse:
       type: object
