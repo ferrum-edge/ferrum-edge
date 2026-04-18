@@ -376,3 +376,50 @@ fn test_h3_fallback_string_port_exhaustion() {
         ErrorClass::PortExhaustion
     );
 }
+
+// Regression: before narrowing, the fallback classifier matched the bare
+// substring "stream" and would mislabel upstream-selection/backend
+// failures (which typically embed "upstream" in the error text) as
+// `ProtocolError`. Keep the `stream`-adjacent matches anchored to
+// tokens h3/quinn actually emit so load-balancer failures don't bleed
+// into H3 protocol-error metrics.
+#[test]
+fn test_h3_fallback_upstream_is_not_protocol_error() {
+    let err: Box<dyn std::error::Error + Send + Sync> =
+        "No healthy targets for upstream some-upstream-id".into();
+    assert_eq!(
+        classify_http3_error(err.as_ref()),
+        ErrorClass::RequestError,
+        "upstream-selection text must not match the 'stream' branch"
+    );
+
+    let err2: Box<dyn std::error::Error + Send + Sync> = "upstream target connection failed".into();
+    assert_eq!(
+        classify_http3_error(err2.as_ref()),
+        ErrorClass::RequestError,
+        "upstream failure must not match the 'stream' branch"
+    );
+}
+
+#[test]
+fn test_h3_fallback_stream_protocol_markers_still_match() {
+    // Verify the narrowed matchers still catch the real H3/QUIC stream-
+    // protocol signals: reset_stream, stream id, stream closed, h3::,
+    // quic — none of which overlap with "upstream".
+    for msg in [
+        "received RESET_STREAM frame",
+        "stream id 42 already in use",
+        "stream_id overflow",
+        "stream_closed by peer",
+        "stream closed with error",
+        "h3::Error: bad frame",
+        "quic transport error",
+    ] {
+        let err: Box<dyn std::error::Error + Send + Sync> = msg.into();
+        assert_eq!(
+            classify_http3_error(err.as_ref()),
+            ErrorClass::ProtocolError,
+            "expected ProtocolError for {msg:?}"
+        );
+    }
+}

@@ -96,12 +96,32 @@ pub fn classify_http3_error(err: &(dyn std::error::Error + 'static)) -> crate::r
         }
     } else if msg.contains("refused") {
         ErrorClass::ConnectionRefused
+    // IMPORTANT: H3/QUIC stream-protocol markers must be checked BEFORE the
+    // generic "reset" / "closed" substrings below. `RESET_STREAM` (an H3
+    // frame that aborts a single stream, not the whole connection) contains
+    // "reset", and `stream_closed` contains "closed" — classifying these as
+    // `ConnectionReset` / `ConnectionClosed` would hide the fact that they
+    // are protocol-level stream errors. Also do NOT use the bare substring
+    // "stream" here — it would match "upstream" (as in "upstream target",
+    // "upstream id") and mislabel load-balancer / backend-selection failures
+    // as protocol errors. Keep the matches anchored to tokens h3/quinn
+    // actually emit.
+    } else if msg.contains("goaway")
+        || msg.contains("protocol")
+        || msg.contains("reset_stream")
+        || msg.contains("stream reset")
+        || msg.contains("stream id")
+        || msg.contains("stream_id")
+        || msg.contains("stream_closed")
+        || msg.contains("stream closed")
+        || msg.contains("h3::")
+        || msg.contains("quic")
+    {
+        ErrorClass::ProtocolError
     } else if msg.contains("reset") {
         ErrorClass::ConnectionReset
     } else if msg.contains("broken pipe") || msg.contains("closed") {
         ErrorClass::ConnectionClosed
-    } else if msg.contains("goaway") || msg.contains("protocol") || msg.contains("stream") {
-        ErrorClass::ProtocolError
     } else {
         ErrorClass::RequestError
     }
