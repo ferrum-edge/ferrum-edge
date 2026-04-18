@@ -947,10 +947,14 @@ mod inner {
                 return Ok(false);
             }
 
-            // `proxy_to_doc` uses `strip_null_fields` so host-only docs omit
-            // `listen_path` entirely. Mongo's equality-to-null matches both a
-            // missing field and a literal null, so `{listen_path: null}` is
-            // the correct filter for the host-only bucket.
+            // Filter on namespace + listen_path bucket (same path for path
+            // proxies, `null` for host-only proxies). Mongo's equality-to-null
+            // matches both a missing field and a literal null. Do NOT try to
+            // match hosts server-side with `$in` — that catches exact-string
+            // overlaps only and misses wildcard-to-exact or wildcard-to-wildcard
+            // overlaps that `hosts_overlap` must recognize. Fetch candidates
+            // and run the full overlap check in Rust (typically ≤ a handful
+            // of rows per bucket).
             let mut filter = match listen_path {
                 Some(path) => doc! { "namespace": namespace, "listen_path": path },
                 None => doc! { "namespace": namespace, "listen_path": null },
@@ -958,21 +962,38 @@ mod inner {
             if let Some(id) = exclude_proxy_id {
                 filter.insert("_id", doc! { "$ne": id });
             }
-            // `Some(path) + empty hosts` is a catch-all for the path — match
-            // anything else in this bucket, regardless of hosts. For non-empty
-            // hosts, match existing rows whose hosts list is empty (catch-all
-            // on the existing row) or shares any host with the candidate.
-            if !hosts.is_empty() {
-                filter.insert(
-                    "$or",
-                    vec![
-                        doc! { "hosts": { "$size": 0 } },
-                        doc! { "hosts": { "$in": hosts } },
-                    ],
-                );
+
+            // `Some(path) + empty hosts` is a catch-all for the path — any
+            // existing proxy in this bucket conflicts regardless of hosts.
+            if listen_path.is_some() && hosts.is_empty() {
+                let count = self.proxies().count_documents(filter).await?;
+                return Ok(count == 0);
             }
-            let count = self.proxies().count_documents(filter).await?;
-            Ok(count == 0)
+
+            // Otherwise iterate candidates and check host overlap in Rust so
+            // wildcard semantics (e.g. `*.example.com` overlapping with
+            // `api.example.com`) are detected correctly.
+            let mut cursor = self
+                .proxies()
+                .find(filter)
+                .projection(doc! { "_id": 1, "hosts": 1 })
+                .await?;
+            while cursor.advance().await? {
+                let doc = cursor.deserialize_current()?;
+                let existing_hosts: Vec<String> = doc
+                    .get_array("hosts")
+                    .ok()
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if crate::config::types::hosts_overlap(hosts, &existing_hosts) {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
         }
 
         async fn check_proxy_name_unique(

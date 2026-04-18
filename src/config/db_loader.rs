@@ -3712,9 +3712,11 @@ fn row_to_proxy(
             .unwrap_or_else(|_| crate::config::types::default_namespace()),
         name: row.try_get("name").ok(),
         hosts,
-        listen_path: row
-            .try_get::<Option<String>, _>("listen_path")
-            .unwrap_or(None),
+        // Propagate decode errors — silently defaulting to None would turn a
+        // malformed listen_path into a host-only proxy and change routing
+        // behavior. `Option<String>` already represents SQL NULL, so `?` is
+        // safe for the expected nullable case and fails fast on real errors.
+        listen_path: row.try_get::<Option<String>, _>("listen_path")?,
         backend_protocol: parse_protocol(&proto_str),
         backend_host: row.try_get("backend_host")?,
         backend_port: row
