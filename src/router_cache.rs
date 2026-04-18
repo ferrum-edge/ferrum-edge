@@ -656,6 +656,12 @@ impl RouterCache {
 
         // For regex route changes, clear the entire regex cache (regex patterns
         // can match arbitrary paths, so surgical invalidation isn't reliable).
+        // For host-only changes, surgically evict regex cache entries whose
+        // host matches the affected pattern. Host-tier precedence can change
+        // regex outcomes (e.g. a cached catch-all regex match for
+        // `api.example.com` must be invalidated when a host-only proxy is
+        // added for that host — the new host-only tier takes precedence once
+        // the prefix + regex tiers for that exact host miss).
         if !regex_patterns.is_empty() {
             let before = self.regex_cache.len();
             self.regex_cache.clear();
@@ -663,6 +669,23 @@ impl RouterCache {
                 debug!(
                     "Router cache: cleared {} regex cache entries due to regex route change",
                     before
+                );
+            }
+        } else if !affected.host_only_hosts.is_empty() {
+            let before = self.regex_cache.len();
+            self.regex_cache.retain(|cached_key, _| {
+                let (cached_host, _) = split_cache_key(cached_key);
+                let host_hit = affected
+                    .host_only_hosts
+                    .iter()
+                    .any(|h| host_matches_for_eviction(h, cached_host));
+                !host_hit
+            });
+            let evicted = before - self.regex_cache.len();
+            if evicted > 0 {
+                debug!(
+                    "Router cache: surgically evicted {} regex cache entries for host-only change",
+                    evicted
                 );
             }
         }

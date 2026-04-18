@@ -1949,7 +1949,7 @@ mod inner {
                 name: None,        // must NOT appear in the document
                 listen_port: None, // must NOT appear in the document
                 hosts: vec![],
-                listen_path: "/".to_string(),
+                listen_path: Some("/".to_string()),
                 backend_protocol: crate::config::types::BackendProtocol::Http,
                 backend_host: "localhost".to_string(),
                 backend_port: 80,

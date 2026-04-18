@@ -1648,3 +1648,57 @@ fn test_host_only_cache_invalidation_on_hosts_change() {
         "cache entries for affected host should be evicted"
     );
 }
+
+#[test]
+fn test_host_only_change_also_evicts_regex_cache_for_host() {
+    use ferrum_edge::config_delta::AffectedRoutes;
+
+    // Phase 1: config has only the catch-all regex proxy.
+    let mut regex_proxy = test_proxy("regex-catchall", "~/users/[0-9]+");
+    regex_proxy.hosts = vec![]; // catch-all
+
+    let config_before = test_config(vec![regex_proxy.clone()]);
+    let cache = RouterCache::new(&config_before, 10_000);
+
+    // Populate a regex cache entry for `a.example.com`. With only the
+    // catch-all regex proxy in the config, a request to
+    // `a.example.com/users/42` falls through to catch-all regex.
+    let matched = cache.find_proxy(Some("a.example.com"), "/users/42");
+    assert!(matched.is_some());
+    assert_eq!(matched.unwrap().proxy.id, "regex-catchall");
+    assert!(
+        cache.regex_cache_len() > 0,
+        "expected regex_cache populated from catch-all regex match"
+    );
+
+    // Phase 2: add a host-only proxy on `a.example.com`. Exact-host tier now
+    // has a host-only fallback, which takes precedence over the catch-all
+    // regex — the previously cached match is stale. apply_delta MUST evict
+    // the regex cache entry so the next lookup re-evaluates. Without this,
+    // requests keep routing to the old catch-all regex proxy until global
+    // regex cache eviction.
+    let mut host_only = test_proxy("host-only", "/placeholder");
+    host_only.listen_path = None;
+    host_only.hosts = vec!["a.example.com".to_string()];
+
+    let config_after = test_config(vec![regex_proxy, host_only]);
+    let affected = AffectedRoutes {
+        listen_paths: Vec::new(),
+        host_only_hosts: vec!["a.example.com".to_string()],
+    };
+    cache.apply_delta(&config_after, &affected);
+    assert_eq!(
+        cache.regex_cache_len(),
+        0,
+        "regex cache entries for affected host must be evicted when host-only routes change"
+    );
+
+    // Re-query — now the host-only proxy wins.
+    let matched = cache.find_proxy(Some("a.example.com"), "/users/42");
+    assert!(matched.is_some());
+    assert_eq!(
+        matched.unwrap().proxy.id,
+        "host-only",
+        "post-delta lookup should route to the new host-only proxy, not the stale regex match"
+    );
+}
