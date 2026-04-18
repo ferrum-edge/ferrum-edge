@@ -18,6 +18,7 @@
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 use crate::plugins::{Plugin, RequestContext, TransactionSummary, log_with_mirror};
 use crate::retry::ErrorClass;
@@ -95,13 +96,31 @@ struct LogState {
     summary: TransactionSummary,
     plugins: Arc<Vec<Arc<dyn Plugin>>>,
     ctx: Arc<RequestContext>,
+    /// Request start instant captured by the handler when it first sees the
+    /// request. Used at fire time to re-derive `latency_total_ms` so
+    /// streaming responses report the wall-clock duration from request
+    /// receipt to body completion, not the snapshot value captured when
+    /// response headers were flushed. `None` on callers that did not
+    /// thread a start time in — in that case the existing
+    /// `latency_total_ms` value (captured at summary construction) is
+    /// preserved.
+    start_time: Option<Instant>,
 }
 
 impl DeferredTransactionLogger {
-    /// Build a new deferred logger. The returned `Arc` is typically cloned
-    /// into the response body wrapper so the body can call `fire` on
-    /// completion or error, and into a fallback holder so a catch-all
-    /// path can fire if the body is never polled.
+    /// Build a new deferred logger without a start-time reference.
+    ///
+    /// When constructed via this method, `fire` preserves the
+    /// `latency_total_ms` / `latency_gateway_processing_ms` /
+    /// `latency_gateway_overhead_ms` values captured at summary construction
+    /// time. Prefer [`new_with_start_time`](Self::new_with_start_time) for
+    /// streaming-response paths so those latencies reflect the real body
+    /// completion time, not the header-flush snapshot.
+    ///
+    /// Retained as public API surface for external callers (tests and future
+    /// non-streaming deferred-log sites). The production HTTP/gRPC streaming
+    /// paths use `new_with_start_time` exclusively.
+    #[allow(dead_code)]
     pub fn new(
         summary: TransactionSummary,
         plugins: Arc<Vec<Arc<dyn Plugin>>>,
@@ -112,6 +131,41 @@ impl DeferredTransactionLogger {
                 summary,
                 plugins,
                 ctx,
+                start_time: None,
+            })),
+            fired: AtomicBool::new(false),
+        })
+    }
+
+    /// Build a new deferred logger with a start-time anchor.
+    ///
+    /// At fire time, `fire_once` re-derives `latency_total_ms` from
+    /// `start_time.elapsed()` so the summary reflects the wall-clock time
+    /// from request receipt to body completion. This closes the
+    /// latency-accuracy gap for streaming responses where the summary was
+    /// built with header-flush-time latencies but log-with-mirror fires
+    /// once the body has actually drained.
+    ///
+    /// Backend TTFB, plugin execution, and plugin external IO latencies are
+    /// preserved as captured (they are defined by events that happen before
+    /// the body streams). Backend total latency is likewise left untouched —
+    /// for streaming responses the body drives that counter, not the deferred
+    /// logger, and -1.0 remains a meaningful "no second observation" signal.
+    ///
+    /// Gateway processing and overhead are re-derived from the updated total
+    /// to keep the four latency fields internally consistent.
+    pub fn new_with_start_time(
+        summary: TransactionSummary,
+        plugins: Arc<Vec<Arc<dyn Plugin>>>,
+        ctx: Arc<RequestContext>,
+        start_time: Instant,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(Some(LogState {
+                summary,
+                plugins,
+                ctx,
+                start_time: Some(start_time),
             })),
             fired: AtomicBool::new(false),
         })
@@ -153,11 +207,41 @@ impl DeferredTransactionLogger {
             mut summary,
             plugins,
             ctx,
+            start_time,
         } = state;
         summary.body_completed = outcome.body_completed;
         summary.body_error_class = outcome.body_error_class;
         summary.bytes_streamed_to_client = outcome.bytes_streamed_to_client;
         summary.client_disconnected = outcome.client_disconnected;
+        // Mirror the streaming byte count into the unified `response_bytes`
+        // field so log consumers see a non-zero value for streaming responses
+        // without branching on `response_streamed`. Buffered responses
+        // populate `response_bytes` synchronously at their respective summary
+        // sites (they never reach the deferred logger).
+        summary.response_bytes = outcome.bytes_streamed_to_client;
+
+        // Re-derive wall-clock latencies so streaming responses report the
+        // real body-completion time instead of the header-flush snapshot.
+        //
+        // Only applied when the caller threaded a start time in via
+        // `new_with_start_time`. The four recomputed fields use the same
+        // formulas as the main handler so consumers see values computed by
+        // identical logic — the only difference is the "now" reference is
+        // body-completion instead of header-flush.
+        if let Some(start) = start_time {
+            let total_ms = start.elapsed().as_secs_f64() * 1000.0;
+            // Backend total for streaming stays as captured — see rustdoc
+            // on `new_with_start_time` for the rationale.
+            let effective_backend_ms = if summary.latency_backend_total_ms >= 0.0 {
+                summary.latency_backend_total_ms
+            } else {
+                summary.latency_backend_ttfb_ms
+            };
+            summary.latency_total_ms = total_ms;
+            summary.latency_gateway_processing_ms = (total_ms - effective_backend_ms).max(0.0);
+            summary.latency_gateway_overhead_ms =
+                (total_ms - effective_backend_ms - summary.latency_plugin_execution_ms).max(0.0);
+        }
 
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
@@ -230,6 +314,128 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
         assert_eq!(counter.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn fire_patches_response_bytes_from_outcome() {
+        // Regression guard for the unified response_bytes field. When
+        // fire() fires with a streaming outcome carrying N bytes, both
+        // `bytes_streamed_to_client` and `response_bytes` should land at N.
+        // Log consumers that want a single "bytes delivered" field rely on
+        // `response_bytes` being populated here.
+        let captured = Arc::new(Mutex::new(None::<TransactionSummary>));
+        let capturer: Arc<dyn Plugin> = Arc::new(CapturingPlugin(captured.clone()));
+        let plugins: Arc<Vec<Arc<dyn Plugin>>> = Arc::new(vec![capturer]);
+        let ctx = Arc::new(RequestContext::new(
+            "1.2.3.4".to_string(),
+            "GET".to_string(),
+            "/".to_string(),
+        ));
+        let logger = DeferredTransactionLogger::new(fake_summary(), plugins, ctx);
+        logger.fire(BodyOutcome::success(12345));
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+
+        let summary = captured.lock().unwrap().clone().expect("log fired");
+        assert_eq!(summary.bytes_streamed_to_client, 12345);
+        assert_eq!(summary.response_bytes, 12345);
+        assert!(summary.body_completed);
+    }
+
+    #[tokio::test]
+    async fn fire_with_start_time_re_derives_latency_total() {
+        // Regression guard for the fire_once latency re-derivation. When
+        // the logger is constructed via `new_with_start_time`, fire should
+        // replace `latency_total_ms` with the wall-clock elapsed from the
+        // captured start (not the stale value in the summary).
+        let captured = Arc::new(Mutex::new(None::<TransactionSummary>));
+        let capturer: Arc<dyn Plugin> = Arc::new(CapturingPlugin(captured.clone()));
+        let plugins: Arc<Vec<Arc<dyn Plugin>>> = Arc::new(vec![capturer]);
+        let ctx = Arc::new(RequestContext::new(
+            "1.2.3.4".to_string(),
+            "GET".to_string(),
+            "/".to_string(),
+        ));
+
+        // Summary captured at "header flush" time has latency_total_ms=1.0,
+        // latency_plugin_execution_ms=0.5, latency_backend_ttfb_ms=0.8.
+        let mut summary = fake_summary();
+        summary.latency_total_ms = 1.0;
+        summary.latency_plugin_execution_ms = 0.5;
+        summary.latency_backend_ttfb_ms = 0.8;
+        summary.latency_backend_total_ms = -1.0; // streaming sentinel
+
+        let start = Instant::now();
+        let logger = DeferredTransactionLogger::new_with_start_time(summary, plugins, ctx, start);
+
+        // Simulate 50ms of body streaming before the logger fires.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        logger.fire(BodyOutcome::success(999));
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+
+        let observed = captured.lock().unwrap().clone().expect("log fired");
+        // latency_total_ms should reflect the ~50ms body-streaming window
+        // plus the ~25ms post-fire flush, well above the original 1.0ms.
+        assert!(
+            observed.latency_total_ms >= 40.0,
+            "expected re-derived total >= 40ms, got {}",
+            observed.latency_total_ms
+        );
+        // Gateway processing and overhead are re-derived consistently and
+        // must be non-negative.
+        assert!(observed.latency_gateway_processing_ms >= 0.0);
+        assert!(observed.latency_gateway_overhead_ms >= 0.0);
+        // Fields unrelated to the re-derivation are preserved.
+        assert_eq!(observed.latency_backend_ttfb_ms, 0.8);
+        assert_eq!(observed.latency_plugin_execution_ms, 0.5);
+    }
+
+    #[tokio::test]
+    async fn fire_without_start_time_preserves_original_latency() {
+        // Regression guard for the non-streaming path. When the logger is
+        // constructed via `new` (no start time), fire must NOT touch the
+        // latency fields — buffered responses have exact latencies baked in
+        // at summary construction time.
+        let captured = Arc::new(Mutex::new(None::<TransactionSummary>));
+        let capturer: Arc<dyn Plugin> = Arc::new(CapturingPlugin(captured.clone()));
+        let plugins: Arc<Vec<Arc<dyn Plugin>>> = Arc::new(vec![capturer]);
+        let ctx = Arc::new(RequestContext::new(
+            "1.2.3.4".to_string(),
+            "GET".to_string(),
+            "/".to_string(),
+        ));
+
+        let mut summary = fake_summary();
+        summary.latency_total_ms = 42.0;
+        summary.latency_backend_total_ms = 37.0;
+        summary.latency_gateway_processing_ms = 5.0;
+        summary.latency_gateway_overhead_ms = 3.0;
+
+        let logger = DeferredTransactionLogger::new(summary, plugins, ctx);
+        logger.fire(BodyOutcome::success(100));
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+
+        let observed = captured.lock().unwrap().clone().expect("log fired");
+        assert_eq!(observed.latency_total_ms, 42.0);
+        assert_eq!(observed.latency_backend_total_ms, 37.0);
+        assert_eq!(observed.latency_gateway_processing_ms, 5.0);
+        assert_eq!(observed.latency_gateway_overhead_ms, 3.0);
+    }
+
+    struct CapturingPlugin(Arc<Mutex<Option<TransactionSummary>>>);
+
+    #[async_trait::async_trait]
+    impl Plugin for CapturingPlugin {
+        fn name(&self) -> &str {
+            "capturing"
+        }
+
+        fn priority(&self) -> u16 {
+            9000
+        }
+
+        async fn log(&self, summary: &TransactionSummary) {
+            *self.0.lock().unwrap() = Some(summary.clone());
+        }
     }
 
     #[tokio::test]

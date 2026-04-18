@@ -43,11 +43,53 @@ mod tls_offload;
 
 use clap::Parser;
 use config::{EnvConfig, OperatingMode};
-use tracing::{error, info};
+use tracing::{Level, Metadata, error, info};
+use tracing_appender::non_blocking::NonBlocking;
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::fmt::MakeWriter;
 
 /// The Ferrum Edge binary version (sourced from Cargo.toml at compile time).
 pub const FERRUM_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Severity-routing `MakeWriter` that splits log events across stdout and
+/// stderr non-blocking appenders:
+///
+/// | Level         | Sink   | Reasoning                                         |
+/// |---------------|--------|---------------------------------------------------|
+/// | `ERROR`       | stderr | Fatal/failure signals — Unix convention, what process supervisors (systemd, Kubernetes liveness), alerting pipelines, and `2>&1`-style scripts key off. |
+/// | `WARN`        | stderr | Non-fatal but operator-noteworthy: matches `cargo`, `gcc`, `make`, and most CLI ecosystems that treat warnings as diagnostic output rather than "primary output". |
+/// | `INFO`        | stdout | Normal operational telemetry — this is what log aggregators (Fluentd/Promtail/Vector) ship; belongs with the bulk of structured-JSON output. |
+/// | `DEBUG`/`TRACE` | stdout | Developer-facing verbose output, gated behind `FERRUM_LOG_LEVEL=debug`/`trace`. Staying on stdout keeps them in the same stream as INFO so developers tailing a container see a contiguous timeline. |
+///
+/// Both sinks are `tracing_appender::non_blocking::NonBlocking`, so the hot
+/// path remains a channel send rather than a blocking I/O write. The
+/// corresponding `WorkerGuard`s are owned by `run_gateway()` so they drop
+/// (and flush buffered events) when it returns — see the ownership
+/// comment on those bindings for the full reasoning.
+struct SeverityWriter {
+    stdout: NonBlocking,
+    stderr: NonBlocking,
+}
+
+impl<'a> MakeWriter<'a> for SeverityWriter {
+    type Writer = NonBlocking;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        // Called when no metadata is available (e.g., some tracing internals).
+        // Default to stdout to match the pre-split behavior.
+        self.stdout.clone()
+    }
+
+    fn make_writer_for(&'a self, meta: &Metadata<'_>) -> Self::Writer {
+        // ERROR and WARN → stderr; INFO/DEBUG/TRACE → stdout.
+        // See the type-level docstring above for the level → sink table
+        // and the rationale for each row.
+        match *meta.level() {
+            Level::ERROR | Level::WARN => self.stderr.clone(),
+            Level::INFO | Level::DEBUG | Level::TRACE => self.stdout.clone(),
+        }
+    }
+}
 
 /// Entry point for the Ferrum Edge gateway binary.
 ///
@@ -115,21 +157,55 @@ fn main() {
         std::process::exit(1);
     }
 
-    // Initialize tracing/logging with a non-blocking writer. The default
-    // tracing-subscriber fmt layer writes synchronously to stdout, acquiring a
-    // mutex lock on every log event. Under high concurrency this creates
-    // contention across tokio worker threads. `tracing_appender::non_blocking`
-    // sends events through a channel to a dedicated writer thread, making the
+    // Initialize tracing/logging with non-blocking writers and run the
+    // rest of startup + the gateway in `run_gateway`. Keeping the tracing
+    // `WorkerGuard`s local to that helper (via its return path) ensures they
+    // drop — and thus flush — on EVERY exit path, including errors. A
+    // `std::process::exit()` inline inside main would bypass the guards'
+    // destructors and silently drop buffered log events, which is exactly
+    // what would make a test captor of stderr see nothing after a fatal
+    // error.
+    let exit_code = run_gateway(&cli);
+    if exit_code != 0 {
+        std::process::exit(exit_code);
+    }
+}
+
+/// Runs logging init, secret resolution, env-config parsing, and the
+/// gateway runtime. Returns the process exit code.
+///
+/// All `tracing_appender::non_blocking::WorkerGuard`s are local here, so
+/// any path out of this function (early return on error or fall-through on
+/// success) runs their `Drop` impls and flushes any buffered events before
+/// `main()` calls `std::process::exit()`. This is the invariant that lets
+/// error-level events actually reach stderr instead of being abandoned in
+/// the non-blocking writer's channel at process termination.
+fn run_gateway(cli: &cli::Cli) -> i32 {
+    // Initialize tracing/logging with non-blocking writers. The default
+    // tracing-subscriber fmt layer writes synchronously, acquiring a mutex
+    // lock on every log event. Under high concurrency this creates contention
+    // across tokio worker threads. `tracing_appender::non_blocking` sends
+    // events through a channel to a dedicated writer thread, making the
     // hot-path log call a fast channel send instead of a blocking I/O write.
-    // The `_guard` must be held until shutdown to keep the writer thread alive
-    // and flush remaining events on drop.
+    //
+    // Two independent appenders are constructed so `SeverityWriter` can
+    // route `ERROR` events to stderr and everything else to stdout. The
+    // `_stdout_guard` / `_stderr_guard` bindings keep each worker thread
+    // alive for the duration of this function; they drop at function
+    // return (including the error-return branches below), which flushes
+    // remaining events to their respective sinks.
     let log_buffer_capacity: usize =
         config::conf_file::resolve_ferrum_var("FERRUM_LOG_BUFFER_CAPACITY")
             .and_then(|v| v.parse().ok())
             .unwrap_or(128_000);
-    let (non_blocking, _guard) = tracing_appender::non_blocking::NonBlockingBuilder::default()
-        .buffered_lines_limit(log_buffer_capacity)
-        .finish(std::io::stdout());
+    let (stdout_writer, _stdout_guard) =
+        tracing_appender::non_blocking::NonBlockingBuilder::default()
+            .buffered_lines_limit(log_buffer_capacity)
+            .finish(std::io::stdout());
+    let (stderr_writer, _stderr_guard) =
+        tracing_appender::non_blocking::NonBlockingBuilder::default()
+            .buffered_lines_limit(log_buffer_capacity)
+            .finish(std::io::stderr());
     let log_level =
         config::conf_file::resolve_ferrum_var("FERRUM_LOG_LEVEL").unwrap_or_else(|| "error".into());
     tracing_subscriber::fmt()
@@ -137,7 +213,10 @@ fn main() {
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&log_level)),
         )
         .json()
-        .with_writer(non_blocking)
+        .with_writer(SeverityWriter {
+            stdout: stdout_writer,
+            stderr: stderr_writer,
+        })
         .init();
 
     // Handle validate subcommand: load config, validate, exit.
@@ -145,10 +224,10 @@ fn main() {
     // but before secret resolution and the multi-threaded runtime.
     if matches!(&cli.command, Some(cli::Command::Validate(_))) {
         match cli::execute_validate() {
-            Ok(()) => return,
+            Ok(()) => return 0,
             Err(e) => {
-                eprintln!("Error: {}", e);
-                std::process::exit(1);
+                error!("Validation error: {}", e);
+                return 1;
             }
         }
     }
@@ -190,7 +269,7 @@ fn main() {
             }
             Err(e) => {
                 error!("Secret resolution error: {}", e);
-                std::process::exit(1);
+                return 1;
             }
         }
     }
@@ -200,7 +279,7 @@ fn main() {
         Ok(c) => c,
         Err(e) => {
             error!("Configuration error: {}", e);
-            std::process::exit(1);
+            return 1;
         }
     };
 
@@ -240,7 +319,7 @@ fn main() {
     }
     let rt = rt_builder.build().expect("Failed to create tokio runtime");
 
-    rt.block_on(async {
+    let gateway_exit_code: i32 = rt.block_on(async {
         // Shutdown signal
         let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
         let shutdown_tx_signal = shutdown_tx.clone();
@@ -287,11 +366,25 @@ fn main() {
             OperatingMode::Migrate => modes::migrate::run(env_config, shutdown_tx).await,
         };
 
-        if let Err(e) = result {
-            error!("Fatal error: {}", e);
-            std::process::exit(1);
+        match result {
+            Ok(()) => {
+                info!("Ferrum Edge shut down cleanly");
+                0
+            }
+            Err(e) => {
+                // `error!` events are routed to stderr by `SeverityWriter`.
+                // The tracing appender's `WorkerGuard`s are held in the
+                // caller (`run_gateway`); returning from this closure +
+                // returning from `run_gateway` drops them in order, which
+                // flushes any buffered events to their respective sinks
+                // before `main` calls `std::process::exit`. Inline
+                // `std::process::exit` would bypass those destructors and
+                // lose the fatal event.
+                error!("Fatal error: {}", e);
+                1
+            }
         }
-
-        info!("Ferrum Edge shut down cleanly");
     });
+
+    gateway_exit_code
 }

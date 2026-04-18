@@ -3848,6 +3848,13 @@ pub async fn log_rejected_request(
     // (body-streaming counters, booleans, `error_class`, `mirror`). Future
     // additions to `TransactionSummary` get a sane default here without
     // touching this call site — same pattern new log sites should follow.
+    // Request bytes: plugin rejects can fire before or after the body has
+    // been observed. If a plugin that buffers the body (e.g. body_validator)
+    // rejected, the counter is populated. For pre-body rejects (auth, rate
+    // limit) the counter is 0, which the serializer correctly omits.
+    let request_bytes = ctx
+        .request_bytes_observed
+        .load(std::sync::atomic::Ordering::Acquire);
     let summary = TransactionSummary {
         namespace: proxy
             .map(|p| p.namespace.clone())
@@ -3874,6 +3881,12 @@ pub async fn log_rejected_request(
         latency_plugin_external_io_ms: plugin_external_io_ms,
         latency_gateway_overhead_ms: gateway_overhead_ms,
         request_user_agent: ctx.headers.get("user-agent").cloned(),
+        request_bytes,
+        // Response body for rejection responses is built by
+        // `reject_result_to_backend_response` / admin reject paths and is
+        // not visible here. The outer caller sends the rejection JSON; it
+        // is typically small and flowing through the main handler's buffered
+        // arm, which populates `response_bytes` separately. Leave 0 here.
         metadata,
         ..TransactionSummary::default()
     };
@@ -4808,6 +4821,14 @@ async fn handle_proxy_request_inner(
                     Ok(buffered) => {
                         if let ClientRequestBody::Buffered(body) = &buffered {
                             store_request_body_metadata(&mut ctx, body, needs_body_bytes);
+                            // Seed request_bytes_observed from the prebuffered
+                            // body so before_proxy rejects (logged via
+                            // `log_rejected_request`) surface the real on-wire
+                            // size instead of 0. `fetch_max` is safe against
+                            // later proxy_to_backend updates — the largest
+                            // observed value always wins.
+                            ctx.request_bytes_observed
+                                .fetch_max(body.len() as u64, std::sync::atomic::Ordering::Release);
                         }
                         buffered
                     }
@@ -5100,6 +5121,15 @@ async fn handle_proxy_request_inner(
             ctx.metadata.insert(
                 "request_body_size_bytes".to_string(),
                 grpc_req_body.len().to_string(),
+            );
+
+            // Mirror pre-transform bytes into the shared request-bytes counter
+            // so `TransactionSummary.request_bytes` is populated on the gRPC
+            // path too. `fetch_max` preserves the first-attempt count across
+            // plugin-driven body rewrites.
+            ctx.request_bytes_observed.fetch_max(
+                grpc_req_body.len() as u64,
+                std::sync::atomic::Ordering::Release,
             );
 
             // Transform request body via plugins (e.g., gRPC-Web base64 decoding)
@@ -5399,6 +5429,15 @@ async fn handle_proxy_request_inner(
                         .ok()
                         .map(|ip| ip.to_string());
 
+                    // Read counters populated earlier in the gRPC body
+                    // handling (request bytes) and by the streaming deferred
+                    // logger (response bytes, patched at fire time). For
+                    // trailers-only error paths the response body is built
+                    // synchronously below and its length is not plumbed here
+                    // — those paths log with `response_bytes: 0` currently.
+                    let request_bytes = ctx
+                        .request_bytes_observed
+                        .load(std::sync::atomic::Ordering::Acquire);
                     let summary = TransactionSummary {
                         namespace: proxy.namespace.clone(),
                         timestamp_received: ctx.timestamp_received.to_rfc3339(),
@@ -5421,6 +5460,7 @@ async fn handle_proxy_request_inner(
                         request_user_agent: ctx.headers.get("user-agent").cloned(),
                         response_streamed: streamed,
                         error_class: final_error_class,
+                        request_bytes,
                         metadata: ctx.metadata.clone(),
                         ..TransactionSummary::default()
                     };
@@ -5433,10 +5473,14 @@ async fn handle_proxy_request_inner(
                     } else {
                         // Streaming gRPC response: defer so the summary reflects
                         // mid-body RST, client cancellation, and partial bytes.
-                        Some(crate::proxy::deferred_log::DeferredTransactionLogger::new(
+                        // Thread `start_time` so the deferred logger can
+                        // re-derive wall-clock latencies at body-completion
+                        // time instead of logging the header-flush snapshot.
+                        Some(crate::proxy::deferred_log::DeferredTransactionLogger::new_with_start_time(
                             summary,
                             Arc::clone(&plugins),
                             Arc::new(ctx.clone()),
+                            start_time,
                         ))
                     }
                 } else {
@@ -5689,6 +5733,13 @@ async fn handle_proxy_request_inner(
                         .ok()
                         .map(|ip| ip.to_string());
 
+                    // gRPC buffered-success path — `response_body` holds the
+                    // full gRPC response frame (protobuf + trailers). Its
+                    // length is the bytes that will flow to the client.
+                    let request_bytes = ctx
+                        .request_bytes_observed
+                        .load(std::sync::atomic::Ordering::Acquire);
+                    let response_bytes = response_body.len() as u64;
                     let summary = TransactionSummary {
                         namespace: proxy.namespace.clone(),
                         timestamp_received: ctx.timestamp_received.to_rfc3339(),
@@ -5709,6 +5760,8 @@ async fn handle_proxy_request_inner(
                         latency_plugin_external_io_ms: plugin_external_io_ms,
                         latency_gateway_overhead_ms: gateway_overhead_ms,
                         request_user_agent: ctx.headers.get("user-agent").cloned(),
+                        request_bytes,
+                        response_bytes,
                         metadata: ctx.metadata.clone(),
                         ..TransactionSummary::default()
                     };
@@ -5808,6 +5861,14 @@ async fn handle_proxy_request_inner(
                             "grpc_backend_error".to_string(),
                         );
                         insert_grpc_error_metadata(&mut metadata, grpc_code, msg);
+                        // gRPC backend-error path. Request bytes were captured
+                        // at the gRPC body collection site above; response is
+                        // a synthetic trailers-only frame (built by
+                        // `build_grpc_error_response` on return), so we don't
+                        // have its size here — leave response_bytes at 0.
+                        let request_bytes = ctx
+                            .request_bytes_observed
+                            .load(std::sync::atomic::Ordering::Acquire);
                         let summary = TransactionSummary {
                             namespace: proxy_ref
                                 .map(|p| p.namespace.clone())
@@ -5834,6 +5895,7 @@ async fn handle_proxy_request_inner(
                             latency_gateway_overhead_ms: grpc_gateway_overhead_ms,
                             request_user_agent: ctx.headers.get("user-agent").cloned(),
                             error_class: Some(grpc_error_class),
+                            request_bytes,
                             metadata,
                             ..TransactionSummary::default()
                         };
@@ -5927,6 +5989,7 @@ async fn handle_proxy_request_inner(
             has_retry,
             &request_client_ip,
             is_tls,
+            &ctx.request_bytes_observed,
         )
         .await;
 
@@ -6035,6 +6098,7 @@ async fn handle_proxy_request_inner(
             false, // no retry — don't retain body
             &request_client_ip,
             is_tls,
+            &ctx.request_bytes_observed,
         )
         .await
         .0;
@@ -6229,6 +6293,22 @@ async fn handle_proxy_request_inner(
     // (which tracks the original backend behavior for observability).
     let deferred_logger: Option<Arc<crate::proxy::deferred_log::DeferredTransactionLogger>> =
         if !plugins.is_empty() {
+            // Request bytes: read the shared counter populated by the body
+            // handlers in `proxy_to_backend` / `proxy_to_backend_http2` /
+            // `proxy_to_backend_http3`. By this point the request has
+            // completed so the counter reflects the total (Acquire pairs with
+            // the Release stores in the body adapters).
+            let request_bytes = ctx
+                .request_bytes_observed
+                .load(std::sync::atomic::Ordering::Acquire);
+            // Response bytes for buffered responses: the ProxyBody::Buffered
+            // arm is built from `Bytes::from(data)`; use the known data length
+            // directly. For streaming responses, `response_bytes` is patched
+            // at deferred-log fire time from `bytes_streamed_to_client`.
+            let response_bytes_buffered = match &response_body {
+                ResponseBody::Buffered(v) => v.len() as u64,
+                _ => 0,
+            };
             let summary = TransactionSummary {
                 namespace: proxy.namespace.clone(),
                 timestamp_received: ctx.timestamp_received.to_rfc3339(),
@@ -6251,6 +6331,8 @@ async fn handle_proxy_request_inner(
                 request_user_agent: ctx.headers.get("user-agent").cloned(),
                 response_streamed: is_streaming_response,
                 error_class: backend_error_class,
+                request_bytes,
+                response_bytes: response_bytes_buffered,
                 metadata: ctx.metadata.clone(),
                 ..TransactionSummary::default()
             };
@@ -6262,11 +6344,17 @@ async fn handle_proxy_request_inner(
                     | ResponseBody::StreamingH3(_)
             );
             if body_will_stream {
-                Some(crate::proxy::deferred_log::DeferredTransactionLogger::new(
-                    summary,
-                    Arc::clone(&plugins),
-                    Arc::new(ctx.clone()),
-                ))
+                // Thread `start_time` so `latency_total_ms` / derived gateway
+                // fields are re-derived at body-completion time — closes the
+                // header-flush snapshot gap for streaming responses.
+                Some(
+                    crate::proxy::deferred_log::DeferredTransactionLogger::new_with_start_time(
+                        summary,
+                        Arc::clone(&plugins),
+                        Arc::new(ctx.clone()),
+                        start_time,
+                    ),
+                )
             } else {
                 crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
                 None
@@ -6873,6 +6961,13 @@ async fn proxy_to_backend(
     retain_request_body: bool,
     client_ip: &str,
     is_tls: bool,
+    // Shared counter for request body bytes observed on the wire. Populated
+    // by the body handling block below via either `fetch_max` (buffered paths)
+    // or frame-by-frame `fetch_add` (streaming paths via SizeLimitedIncoming /
+    // CountingIncoming). Summary builders read the final value via
+    // `ctx.request_bytes_observed.load(Ordering::Acquire)` once the request
+    // has completed.
+    ctx_request_bytes_observed: &Arc<std::sync::atomic::AtomicU64>,
 ) -> (retry::BackendResponse, Option<Vec<u8>>) {
     // When retain_request_body is true (retries configured), the collected
     // body bytes are cloned and returned alongside the response so the
@@ -6915,6 +7010,7 @@ async fn proxy_to_backend(
             client_ip,
             retain_request_body,
             stream_response,
+            ctx_request_bytes_observed,
         )
         .await;
         // For streaming H3 responses, move headers from the H3StreamingResponse
@@ -6978,6 +7074,7 @@ async fn proxy_to_backend(
                     client_ip,
                     is_tls,
                     resolved_ip,
+                    ctx_request_bytes_observed,
                 )
                 .await,
                 None,
@@ -7126,6 +7223,21 @@ async fn proxy_to_backend(
 
         match client_request_body {
             ClientRequestBody::Buffered(body_bytes) => {
+                // Record pre-transform body length (bytes as received from the
+                // client — already buffered by an earlier phase such as
+                // request_mirror prebuffering) BEFORE running plugin transforms
+                // or final-body hooks. Recording here rather than after the
+                // hooks ensures:
+                //   1. Consistency with the Streaming-then-buffered, gRPC, and
+                //      HTTP/3 paths, which all record pre-transform bytes.
+                //   2. Rejections from `run_final_request_body_hooks` still
+                //      surface the original on-wire size in the log summary.
+                // `fetch_max` preserves the largest observed value across
+                // retries where plugin transforms may shrink the body.
+                ctx_request_bytes_observed.fetch_max(
+                    body_bytes.len() as u64,
+                    std::sync::atomic::Ordering::Release,
+                );
                 let body_bytes = apply_request_body_plugins(plugins, headers, body_bytes).await;
                 match run_final_request_body_hooks(plugins, headers, &body_bytes).await {
                     PluginResult::Continue => {}
@@ -7148,23 +7260,34 @@ async fn proxy_to_backend(
                 // Stream the request body directly to the backend without collecting
                 // into memory. Size limit is enforced during streaming via
                 // SizeLimitedIncoming which sets body_size_exceeded on overflow.
+                // Pass `ctx_request_bytes_observed` as the shared counter so the
+                // body adapter writes byte counts directly into the context that
+                // summary builders read — no separate handle-capture needed.
                 let incoming = (*original_req).into_body();
                 if state.max_request_body_size_bytes > 0 {
-                    let limited = body::SizeLimitedIncoming::new(
+                    let limited = body::SizeLimitedIncoming::new_with_counter(
                         incoming,
                         state.max_request_body_size_bytes,
                         Arc::clone(&body_size_exceeded),
+                        Arc::clone(ctx_request_bytes_observed),
                     );
                     req_builder = req_builder.body(limited.into_reqwest_body());
                 } else {
-                    // No size limit — stream body directly, preserving size_hint
-                    // for Content-Length forwarding (avoids chunked encoding overhead)
-                    req_builder =
-                        req_builder.body(reqwest::Body::wrap(body::SyncBody::new(incoming)));
+                    // No size limit — stream body directly. Wrap in
+                    // `CountingIncoming` so we still count bytes forwarded to
+                    // the backend while preserving the size_hint behavior for
+                    // Content-Length forwarding (avoids chunked encoding when
+                    // the client sent a known length).
+                    let counting = body::CountingIncoming::new_with_counter(
+                        incoming,
+                        Arc::clone(ctx_request_bytes_observed),
+                    );
+                    req_builder = req_builder.body(counting.into_reqwest_body());
                 }
             }
             ClientRequestBody::Streaming(original_req) => {
                 // Buffered path: collect body into memory for plugin transformation.
+                // Pre-transform length is recorded below after collect completes.
                 let body_bytes = if state.max_request_body_size_bytes > 0 {
                     let limited = http_body_util::Limited::new(
                         (*original_req).into_body(),
@@ -7218,6 +7341,14 @@ async fn proxy_to_backend(
                         }
                     }
                 };
+
+                // Record pre-transform body length (bytes actually received
+                // from the client) for summary. Use fetch_max so retries that
+                // shrink the body via plugin transforms don't lower the count.
+                ctx_request_bytes_observed.fetch_max(
+                    body_bytes.len() as u64,
+                    std::sync::atomic::Ordering::Release,
+                );
 
                 // Transform request body via plugins (JSON field rename, add, remove, etc.)
                 let body_bytes = apply_request_body_plugins(plugins, headers, body_bytes).await;
@@ -7808,6 +7939,12 @@ async fn proxy_to_backend_http2(
     client_ip: &str,
     is_tls: bool,
     resolved_ip: Option<String>,
+    // Shared counter for request body bytes. The H2 direct pool forwards
+    // the body via hyper without the reqwest adapter layer, so we wrap
+    // the body in `CountingIncoming` (backed by this shared counter) before
+    // building the hyper request. Summary builders read from the same
+    // `ctx.request_bytes_observed` once the response completes.
+    ctx_request_bytes_observed: &Arc<std::sync::atomic::AtomicU64>,
 ) -> retry::BackendResponse {
     debug!(proxy_id = %proxy.id, backend_url = %backend_url, "Proxying request via HTTP/2 pool");
 
@@ -7862,6 +7999,20 @@ async fn proxy_to_backend_http2(
 
     // Build hyper request
     let (mut parts, body) = original_req.into_parts();
+
+    // If the client sent `Content-Length`, seed the shared request-bytes
+    // counter so the summary reflects the declared request size. The H2 direct
+    // pool forwards the body via hyper's `SendRequest`, which expects
+    // `Request<Incoming>`, so we cannot wrap with `CountingIncoming` here
+    // without changing the pool signature. For chunked/unknown-length H2
+    // requests, `request_bytes` remains 0 on this path (accepted scope
+    // limitation documented on the field rustdoc).
+    if let Some(cl) = headers
+        .get("content-length")
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        ctx_request_bytes_observed.fetch_max(cl, std::sync::atomic::Ordering::Release);
+    }
 
     // Set the URI
     parts.uri = uri;
@@ -8045,6 +8196,7 @@ async fn proxy_to_backend_http3(
     client_ip: &str,
     retain_request_body: bool,
     stream_response: bool,
+    ctx_request_bytes_observed: &Arc<std::sync::atomic::AtomicU64>,
 ) -> (retry::BackendResponse, Option<Vec<u8>>) {
     debug!(proxy_id = %proxy.id, backend_url = %backend_url, "Proxying request to HTTP/3 backend");
 
@@ -8065,6 +8217,9 @@ async fn proxy_to_backend_http3(
 
     // Read request body with size limit. HTTP/3 is always buffered — the h3
     // crate requires the full body before sending the request.
+    // The final `request_body.len()` is written into
+    // `ctx_request_bytes_observed` below so summary builders see an accurate
+    // count even though this path is inside a proxy helper function.
     let request_body = match client_request_body {
         ClientRequestBody::Buffered(body) => body,
         ClientRequestBody::Streaming(original_req) => {
@@ -8141,6 +8296,14 @@ async fn proxy_to_backend_http3(
             }
         }
     };
+    // Record pre-transform request body size (bytes received from client).
+    // `fetch_max` preserves the first attempt's count on retries where
+    // plugin transforms may shrink/grow the body.
+    ctx_request_bytes_observed.fetch_max(
+        request_body.len() as u64,
+        std::sync::atomic::Ordering::Release,
+    );
+
     let request_body = apply_request_body_plugins(plugins, headers, request_body).await;
     match run_final_request_body_hooks(plugins, headers, &request_body).await {
         PluginResult::Continue => {}

@@ -1403,6 +1403,18 @@ async fn handle_h3_request(
             body_error_class,
             body_completed,
             bytes_streamed_to_client: bytes_streamed,
+            // Request body was streamed frame-by-frame via the H3 pool
+            // (`request_streaming_body`) — the exact byte count is not
+            // currently surfaced back from the pool. Populating this would
+            // require threading an `Arc<AtomicU64>` through the H3 request
+            // API; deferred to a follow-up. For streaming-request flows,
+            // `request_bytes` may be 0 even when a non-empty body was sent.
+            request_bytes: 0,
+            // Response bytes delivered to the client — tracked by the
+            // streaming loop above as `bytes_streamed`, identical to
+            // `bytes_streamed_to_client`. Populated here for the unified
+            // (buffered+streaming) response-size field.
+            response_bytes: bytes_streamed,
             mirror: false,
             metadata: ctx.metadata.clone(),
         };
@@ -1435,6 +1447,13 @@ async fn handle_h3_request(
             body_data.extend_from_slice(bytes);
         }
     }
+
+    // Capture the on-wire request body length BEFORE plugin transforms run.
+    // The buffered-response summary and the streaming-response `request_bytes`
+    // field both use this value, so `request_bytes` reflects bytes actually
+    // received from the client — consistent with the pre-transform semantics
+    // of the HTTP/1.1, HTTP/2, and gRPC paths.
+    let raw_request_body_bytes = body_data.len() as u64;
 
     // Transform request body via plugins when buffering is active
     let body_data = if needs_request_buffering
@@ -1497,6 +1516,13 @@ async fn handle_h3_request(
         // Response body is streamed, but request body was collected because
         // plugins needed it or it was prebuffered.
         let client_ip_owned = ctx.client_ip.clone();
+        // Use the pre-transform length captured before the plugin
+        // `transform_request_body` loop ran. `body_data` at this point may
+        // have been rewritten by a request-body plugin; logging its current
+        // length would misreport the on-wire size. `raw_request_body_bytes`
+        // is the canonical `request_bytes` value for the H3 buffered-request
+        // path on both the streaming and buffered response branches.
+        let request_body_bytes = raw_request_body_bytes;
         let streaming_result = proxy_to_backend_h3_streaming(
             &state,
             &proxy,
@@ -1575,6 +1601,11 @@ async fn handle_h3_request(
             body_error_class: h3_stream_result.body_error_class,
             body_completed: h3_stream_result.body_completed,
             bytes_streamed_to_client: h3_stream_result.bytes_streamed,
+            request_bytes: request_body_bytes,
+            // `bytes_streamed` from the H3 streaming helper is the final
+            // count of body bytes pushed to the client's h3 stream. Mirror
+            // it into the unified `response_bytes` field.
+            response_bytes: h3_stream_result.bytes_streamed,
             mirror: false,
             metadata: ctx.metadata.clone(),
         };
@@ -1872,6 +1903,12 @@ async fn handle_h3_request(
         let gateway_processing_ms = total_ms - backend_total_ms;
         let gateway_overhead_ms = (total_ms - backend_total_ms - plugin_execution_ms).max(0.0);
 
+        // Request bytes: `raw_request_body_bytes` captured the on-wire size
+        // before plugin `transform_request_body` ran, so the summary reflects
+        // bytes actually received from the client rather than the possibly
+        // rewritten `body_data.len()`. Response bytes: the H3 buffered-response
+        // path has `response_body` in scope — its `Vec<u8>` length is what
+        // will flow to the client.
         let summary = TransactionSummary {
             namespace: proxy.namespace.clone(),
             timestamp_received: ctx.timestamp_received.to_rfc3339(),
@@ -1893,6 +1930,8 @@ async fn handle_h3_request(
             latency_gateway_overhead_ms: gateway_overhead_ms,
             request_user_agent: proxy_headers.get("user-agent").cloned(),
             error_class: h3_error_class,
+            request_bytes: raw_request_body_bytes,
+            response_bytes: response_body.len() as u64,
             metadata: ctx.metadata.clone(),
             ..TransactionSummary::default()
         };
@@ -2092,6 +2131,26 @@ fn classify_h3_error(e: &anyhow::Error) -> crate::retry::ErrorClass {
 /// counts. Response headers are flushed to the client before this struct is
 /// constructed, so they are intentionally not stored here — the call sites
 /// that need them already hold a local copy via `response_headers`.
+///
+/// # Why H3 does not use `DeferredTransactionLogger`
+///
+/// HTTP/1.1, HTTP/2, and gRPC proxies return a `ProxyBody` to hyper and let
+/// hyper drive the body to completion AFTER the handler function has
+/// returned. A deferred-log mechanism (fires when the body reaches a
+/// terminal state) is therefore necessary to capture the real outcome.
+///
+/// The H3 path is different: `proxy_to_backend_h3_streaming` drives the
+/// QUIC send stream to completion synchronously within its own scope (the
+/// `'outer` loop above). By the time the function returns, body_completed /
+/// bytes_streamed / client_disconnected / body_error_class are already
+/// known — the caller just reads them off `H3StreamResult` and populates
+/// the summary synchronously. No deferred logger, no `Arc<StreamingMetrics>`,
+/// no `Drop` safety net.
+///
+/// This means H3 summary sites are the only HTTP-family sites that populate
+/// all outcome fields at the same synchronous point in the code — no
+/// re-derivation of latency fields is needed because the "now" at summary
+/// construction time already coincides with body completion.
 struct H3StreamResult {
     status: u16,
     error_class: Option<crate::retry::ErrorClass>,
