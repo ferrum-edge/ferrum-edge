@@ -9,7 +9,7 @@ use ferrum_edge::consumer_index::ConsumerIndex;
 use ferrum_edge::plugins::{Plugin, PluginHttpClient, RequestContext, ldap_auth::LdapAuth};
 use serde_json::json;
 
-use super::plugin_utils::assert_reject;
+use super::plugin_utils::{assert_continue, assert_reject};
 
 fn http_client() -> PluginHttpClient {
     PluginHttpClient::default()
@@ -334,7 +334,10 @@ async fn test_missing_authorization_header() {
     let consumer_index = ConsumerIndex::new(&[]);
 
     let result = plugin.authenticate(&mut ctx, &consumer_index).await;
-    assert_reject(result, Some(401));
+    assert_continue(result);
+    assert!(ctx.identified_consumer.is_none());
+    assert!(ctx.authenticated_identity.is_none());
+    assert!(ctx.authenticated_identity_header.is_none());
 }
 
 #[tokio::test]

@@ -513,13 +513,15 @@ plugin_configs:
         .await
         .expect("Request failed");
 
-    // The LDAP plugin should reject with 401 (no credentials provided)
-    assert_eq!(
-        response.status().as_u16(),
-        401,
-        "Expected 401 when no credentials are provided, got {}",
+    // Missing credentials should fall through in Phase 3 rather than rejecting.
+    assert!(
+        response.status().is_success(),
+        "Expected success when no credentials are provided, got {}",
         response.status()
     );
+
+    let body: serde_json::Value = response.json().await.expect("response body");
+    assert_eq!(body["status"].as_str(), Some("ok"));
 
     // Cleanup
     let _ = gateway_process.kill();
