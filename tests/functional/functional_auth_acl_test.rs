@@ -10,16 +10,15 @@
 //!
 //! Run with: cargo test --test functional_tests -- --ignored --nocapture functional_auth_acl
 
+use crate::common::TestGateway;
+
 use base64::Engine;
 use chrono::Utc;
 use hmac::{Hmac, KeyInit, Mac};
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::json;
 use sha2::Sha256;
-use std::process::{Child, Command};
-use std::time::{Duration, SystemTime};
-use tempfile::TempDir;
-use uuid::Uuid;
+use std::time::Duration;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -171,171 +170,30 @@ async fn start_jwks_server(
 
 /// Test harness for auth/ACL functional testing
 struct AuthTestHarness {
-    temp_dir: TempDir,
-    gateway_process: Option<Child>,
+    _gw: TestGateway,
     proxy_base_url: String,
     admin_base_url: String,
-    jwt_secret: String,
-    jwt_issuer: String,
-    admin_port: u16,
-    proxy_port: u16,
 }
 
 impl AuthTestHarness {
-    async fn new() -> Result<Self, Box<dyn std::error::Error>> {
-        let temp_dir = TempDir::new()?;
-        let jwt_secret = "test-admin-jwt-secret-key-1234567890".to_string();
-        let jwt_issuer = "ferrum-edge-auth-test".to_string();
-
-        let admin_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-        let admin_port = admin_listener.local_addr()?.port();
-        drop(admin_listener);
-
-        let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-        let proxy_port = proxy_listener.local_addr()?.port();
-        drop(proxy_listener);
-
-        let proxy_base_url = format!("http://127.0.0.1:{}", proxy_port);
-        let admin_base_url = format!("http://127.0.0.1:{}", admin_port);
+    async fn new() -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let gw = TestGateway::builder()
+            .jwt_secret("test-admin-jwt-secret-key-1234567890")
+            .jwt_issuer("ferrum-edge-auth-test")
+            .basic_auth_hmac_secret("test-hmac-server-secret")
+            .log_level("info")
+            .spawn()
+            .await?;
 
         Ok(Self {
-            temp_dir,
-            gateway_process: None,
-            proxy_base_url,
-            admin_base_url,
-            jwt_secret,
-            jwt_issuer,
-            admin_port,
-            proxy_port,
+            proxy_base_url: gw.proxy_base_url.clone(),
+            admin_base_url: gw.admin_base_url.clone(),
+            _gw: gw,
         })
     }
 
-    fn db_path(&self) -> String {
-        self.temp_dir
-            .path()
-            .join("test.db")
-            .to_string_lossy()
-            .to_string()
-    }
-
-    async fn start_gateway(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        const MAX_ATTEMPTS: u32 = 3;
-        let mut last_err = String::new();
-        for attempt in 1..=MAX_ATTEMPTS {
-            match self.try_start_gateway().await {
-                Ok(()) => return Ok(()),
-                Err(e) => {
-                    last_err = e.to_string();
-                    eprintln!(
-                        "Gateway startup attempt {}/{} failed: {}",
-                        attempt, MAX_ATTEMPTS, last_err
-                    );
-                    if attempt < MAX_ATTEMPTS {
-                        let admin_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-                        self.admin_port = admin_listener.local_addr()?.port();
-                        drop(admin_listener);
-
-                        let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-                        self.proxy_port = proxy_listener.local_addr()?.port();
-                        drop(proxy_listener);
-
-                        self.proxy_base_url = format!("http://127.0.0.1:{}", self.proxy_port);
-                        self.admin_base_url = format!("http://127.0.0.1:{}", self.admin_port);
-
-                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                    }
-                }
-            }
-        }
-        Err(format!(
-            "Failed to start gateway after {} attempts: {}",
-            MAX_ATTEMPTS, last_err
-        )
-        .into())
-    }
-
-    async fn try_start_gateway(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        let db_url = format!("sqlite:{}?mode=rwc", self.db_path());
-
-        let build_status = Command::new("cargo").args(["build"]).status()?;
-        if !build_status.success() {
-            return Err("Failed to build ferrum-edge".into());
-        }
-
-        let binary_path = if std::path::Path::new("./target/debug/ferrum-edge").exists() {
-            "./target/debug/ferrum-edge"
-        } else {
-            "./target/release/ferrum-edge"
-        };
-
-        let child = Command::new(binary_path)
-            .env("FERRUM_MODE", "database")
-            .env("FERRUM_ADMIN_JWT_SECRET", &self.jwt_secret)
-            .env("FERRUM_ADMIN_JWT_ISSUER", &self.jwt_issuer)
-            .env("FERRUM_DB_TYPE", "sqlite")
-            .env("FERRUM_DB_URL", &db_url)
-            .env("FERRUM_DB_POLL_INTERVAL", "2")
-            .env("FERRUM_PROXY_HTTP_PORT", self.proxy_port.to_string())
-            .env("FERRUM_ADMIN_HTTP_PORT", self.admin_port.to_string())
-            .env("FERRUM_LOG_LEVEL", "info")
-            .env("FERRUM_BASIC_AUTH_HMAC_SECRET", "test-hmac-server-secret")
-            .spawn()?;
-
-        self.gateway_process = Some(child);
-        match self.wait_for_health().await {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                if let Some(mut child) = self.gateway_process.take() {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                }
-                Err(e)
-            }
-        }
-    }
-
-    async fn wait_for_health(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let health_url = format!("{}/health", self.admin_base_url);
-        let deadline = SystemTime::now() + Duration::from_secs(30);
-
-        loop {
-            if SystemTime::now() >= deadline {
-                return Err("Gateway did not start within 30 seconds".into());
-            }
-            match reqwest::get(&health_url).await {
-                Ok(response) if response.status().is_success() => {
-                    println!("Gateway is ready!");
-                    return Ok(());
-                }
-                _ => {
-                    tokio::time::sleep(Duration::from_millis(500)).await;
-                }
-            }
-        }
-    }
-
     fn generate_admin_token(&self) -> Result<String, Box<dyn std::error::Error>> {
-        let now = Utc::now();
-        let claims = json!({
-            "iss": self.jwt_issuer,
-            "sub": "test-admin",
-            "iat": now.timestamp(),
-            "nbf": now.timestamp(),
-            "exp": (now + chrono::Duration::seconds(3600)).timestamp(),
-            "jti": Uuid::new_v4().to_string()
-        });
-        let header = Header::new(jsonwebtoken::Algorithm::HS256);
-        let key = EncodingKey::from_secret(self.jwt_secret.as_bytes());
-        Ok(encode(&header, &claims, &key)?)
-    }
-}
-
-impl Drop for AuthTestHarness {
-    fn drop(&mut self) {
-        if let Some(mut child) = self.gateway_process.take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
+        Ok(self._gw.admin_token())
     }
 }
 
@@ -533,7 +391,7 @@ fn generate_hmac_signature(method: &str, path: &str, date: &str, secret: &str) -
 #[tokio::test]
 #[ignore]
 async fn test_access_control_allows_jwks_authenticated_identity_when_enabled() {
-    let mut harness = AuthTestHarness::new()
+    let harness = AuthTestHarness::new()
         .await
         .expect("Failed to create test harness");
 
@@ -545,11 +403,6 @@ async fn test_access_control_allows_jwks_authenticated_identity_when_enabled() {
     let _backend = start_echo_backend(backend_port)
         .await
         .expect("Failed to start echo backend");
-
-    harness
-        .start_gateway()
-        .await
-        .expect("Failed to start gateway");
 
     let client = reqwest::Client::new();
     let admin_token = harness
@@ -727,7 +580,7 @@ async fn test_auth_acl_comprehensive() {
     println!("\n=== Starting Auth/ACL Functional Test ===\n");
 
     // --- Setup ---
-    let mut harness = AuthTestHarness::new()
+    let harness = AuthTestHarness::new()
         .await
         .expect("Failed to create test harness");
 
@@ -740,12 +593,6 @@ async fn test_auth_acl_comprehensive() {
     let _backend = start_echo_backend(backend_port)
         .await
         .expect("Failed to start echo backend");
-
-    // Start gateway
-    harness
-        .start_gateway()
-        .await
-        .expect("Failed to start gateway");
 
     let client = reqwest::Client::new();
     let admin_token = harness

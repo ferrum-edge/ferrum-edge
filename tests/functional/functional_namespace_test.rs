@@ -24,15 +24,13 @@
 //! All tests are `#[ignore]` — invoke with `cargo test --test functional_tests
 //! -- --ignored namespace`.
 
+use crate::common::{DbType, TestGateway};
 use serde_json::Value;
-use std::process::{Child, Command, Stdio};
 use std::time::{Duration, SystemTime};
-use tempfile::TempDir;
 
 use super::namespace_helpers::{
-    JWT_ISSUER, JWT_SECRET, admin_request, assert_only_namespace, ephemeral_port,
-    gateway_binary_path, list_len, sample_consumer, sample_proxy, sample_proxy_with_name,
-    sample_stream_proxy, sample_upstream,
+    JWT_ISSUER, JWT_SECRET, admin_request, assert_only_namespace, ephemeral_port, list_len,
+    sample_consumer, sample_proxy, sample_proxy_with_name, sample_stream_proxy, sample_upstream,
 };
 
 // ---------------------------------------------------------------------------
@@ -61,14 +59,15 @@ impl Backend {
 /// Resolve the DB URL for the requested backend. Returns `None` when an
 /// external backend's env var is unset and no default is reachable — the
 /// calling test should skip in that case.
-async fn resolve_db_url(backend: Backend, tmp: &TempDir) -> Option<String> {
+async fn resolve_db(backend: Backend) -> Option<DbType> {
     match backend {
-        Backend::Sqlite => {
-            let path = tmp.path().join("ns_test.db");
-            Some(format!("sqlite:{}?mode=rwc", path.display()))
-        }
-        Backend::Postgres => std::env::var("FERRUM_TEST_POSTGRES_URL").ok(),
-        Backend::Mysql => std::env::var("FERRUM_TEST_MYSQL_URL").ok(),
+        Backend::Sqlite => Some(DbType::Sqlite),
+        Backend::Postgres => std::env::var("FERRUM_TEST_POSTGRES_URL")
+            .ok()
+            .map(DbType::Postgres),
+        Backend::Mysql => std::env::var("FERRUM_TEST_MYSQL_URL")
+            .ok()
+            .map(DbType::MySql),
         Backend::Mongodb => {
             let url = std::env::var("FERRUM_TEST_MONGO_URL")
                 .unwrap_or_else(|_| "mongodb://localhost:27017/ferrum_test".to_string());
@@ -87,7 +86,7 @@ async fn resolve_db_url(backend: Backend, tmp: &TempDir) -> Option<String> {
                 .unwrap_or("localhost:27017")
                 .to_string();
             if tokio::net::TcpStream::connect(&host_port).await.is_ok() {
-                Some(url)
+                Some(DbType::Mongo(url))
             } else {
                 None
             }
@@ -116,8 +115,7 @@ fn mk_id(prefix: &str) -> String {
 // ---------------------------------------------------------------------------
 
 struct NsHarness {
-    _tmp: TempDir,
-    gateway: Option<Child>,
+    _gw: TestGateway,
     admin_base_url: String,
     proxy_base_url: String,
 }
@@ -137,97 +135,53 @@ impl NsHarness {
         const MAX_ATTEMPTS: u32 = 3;
         let mut last_err = String::new();
         for attempt in 1..=MAX_ATTEMPTS {
-            // Fresh tempdir (and fresh SQLite file) per attempt to avoid a
-            // half-initialized DB from a prior failed start.
-            let tmp = TempDir::new().expect("tempdir");
-            let db_url = match resolve_db_url(backend, &tmp).await {
-                Some(u) => u,
+            let db = match resolve_db(backend).await {
+                Some(db) => db,
                 None => return None,
             };
-            reset_backend(backend, &db_url).await;
+            if let Some(db_url) = match &db {
+                DbType::Sqlite => None,
+                DbType::Postgres(url)
+                | DbType::MySql(url)
+                | DbType::Mongo(url)
+                | DbType::Custom { db_url: url, .. } => Some(url.as_str()),
+            } {
+                reset_backend(backend, db_url).await;
+            }
 
-            let admin_port = ephemeral_port().await;
-            let proxy_port = ephemeral_port().await;
-
-            let mut cmd = Command::new(gateway_binary_path());
-            cmd.env("FERRUM_MODE", "database")
-                .env("FERRUM_ADMIN_JWT_SECRET", JWT_SECRET)
-                .env("FERRUM_ADMIN_JWT_ISSUER", JWT_ISSUER)
-                .env("FERRUM_DB_TYPE", backend.db_type())
-                .env("FERRUM_DB_URL", &db_url)
-                .env("FERRUM_DB_POLL_INTERVAL", "1")
-                .env("FERRUM_PROXY_HTTP_PORT", proxy_port.to_string())
-                .env("FERRUM_ADMIN_HTTP_PORT", admin_port.to_string())
-                .env("FERRUM_LOG_LEVEL", "warn")
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null());
-
+            let mut builder = TestGateway::builder()
+                .mode_database(db)
+                .jwt_secret(JWT_SECRET)
+                .jwt_issuer(JWT_ISSUER)
+                .db_poll_interval_seconds(1)
+                // The outer loop resets the backing store between attempts,
+                // so each harness attempt should be a single fresh spawn.
+                .max_attempts(1)
+                .log_level("warn");
             if matches!(backend, Backend::Mongodb) {
-                // Matches the convention in functional_mongodb_test.
-                cmd.env("FERRUM_MONGO_DATABASE", "ferrum_test");
+                builder = builder.env("FERRUM_MONGO_DATABASE", "ferrum_test");
             }
-
             if let Some(ns) = gateway_namespace {
-                cmd.env("FERRUM_NAMESPACE", ns);
+                builder = builder.namespace(ns);
             }
 
-            let child = match cmd.spawn() {
-                Ok(c) => c,
+            let gw = match builder.spawn().await {
+                Ok(gw) => gw,
                 Err(e) => {
                     last_err = format!("spawn: {e}");
+                    eprintln!("namespace harness retry {attempt}/{MAX_ATTEMPTS}: {last_err}");
+                    tokio::time::sleep(Duration::from_secs(1)).await;
                     continue;
                 }
             };
 
-            let admin_base_url = format!("http://127.0.0.1:{admin_port}");
-            let proxy_base_url = format!("http://127.0.0.1:{proxy_port}");
-
-            let mut harness = Self {
-                _tmp: tmp,
-                gateway: Some(child),
-                admin_base_url,
-                proxy_base_url,
-            };
-
-            if harness.wait_for_health().await {
-                return Some(harness);
-            }
-
-            last_err = format!("health timeout (attempt {attempt})");
-            harness.kill_gateway();
-            eprintln!("namespace harness retry {attempt}/{MAX_ATTEMPTS}: {last_err}");
-            tokio::time::sleep(Duration::from_secs(1)).await;
+            return Some(Self {
+                admin_base_url: gw.admin_base_url.clone(),
+                proxy_base_url: gw.proxy_base_url.clone(),
+                _gw: gw,
+            });
         }
         panic!("namespace harness failed to start: {last_err}");
-    }
-
-    async fn wait_for_health(&self) -> bool {
-        let health_url = format!("{}/health", self.admin_base_url);
-        let deadline = SystemTime::now() + Duration::from_secs(30);
-        let client = reqwest::Client::new();
-        while SystemTime::now() < deadline {
-            if let Ok(r) = client.get(&health_url).send().await
-                && r.status().is_success()
-            {
-                return true;
-            }
-            tokio::time::sleep(Duration::from_millis(300)).await;
-        }
-        false
-    }
-
-    fn kill_gateway(&mut self) {
-        if let Some(mut c) = self.gateway.take() {
-            let _ = c.kill();
-            let _ = c.wait();
-        }
-    }
-}
-
-impl Drop for NsHarness {
-    fn drop(&mut self) {
-        self.kill_gateway();
     }
 }
 

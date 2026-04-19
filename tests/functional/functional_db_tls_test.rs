@@ -11,11 +11,12 @@
 //! Run with:
 //!   cargo test --test functional_tests functional_db_tls -- --ignored --nocapture
 
+use crate::common::{DbType, TestGateway};
 use chrono::Utc;
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::json;
-use std::process::{Child, Command};
-use std::time::{Duration, SystemTime};
+use std::process::Command;
+use std::time::Duration;
 use tempfile::TempDir;
 use uuid::Uuid;
 
@@ -28,13 +29,11 @@ const DEFAULT_CERT_DIR: &str = "/tmp/ferrum-db-tls-certs";
 /// plus a local echo backend for proxy routing verification.
 struct DbTlsTestHarness {
     temp_dir: TempDir,
-    gateway_process: Option<Child>,
+    gw: Option<TestGateway>,
     proxy_base_url: String,
     admin_base_url: String,
     jwt_secret: String,
     jwt_issuer: String,
-    admin_port: u16,
-    proxy_port: u16,
     db_type: String,
 }
 
@@ -44,25 +43,39 @@ impl DbTlsTestHarness {
         let jwt_secret = "db-tls-test-secret-key-1234567890".to_string();
         let jwt_issuer = "ferrum-edge-db-tls-test".to_string();
 
-        let admin_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-        let admin_port = admin_listener.local_addr()?.port();
-        drop(admin_listener);
-
-        let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-        let proxy_port = proxy_listener.local_addr()?.port();
-        drop(proxy_listener);
-
         Ok(Self {
             temp_dir,
-            gateway_process: None,
-            proxy_base_url: format!("http://127.0.0.1:{}", proxy_port),
-            admin_base_url: format!("http://127.0.0.1:{}", admin_port),
+            gw: None,
+            proxy_base_url: String::new(),
+            admin_base_url: String::new(),
             jwt_secret,
             jwt_issuer,
-            admin_port,
-            proxy_port,
             db_type: db_type.to_string(),
         })
+    }
+
+    async fn start_gateway_with_envs(
+        &mut self,
+        db_url: &str,
+        extra_env: Vec<(String, String)>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let mut builder = TestGateway::builder()
+            .mode_database(DbType::Custom {
+                db_type: self.db_type.clone(),
+                db_url: db_url.to_string(),
+            })
+            .jwt_secret(&self.jwt_secret)
+            .jwt_issuer(&self.jwt_issuer)
+            .db_poll_interval_seconds(2)
+            .log_level("info");
+        for (key, value) in extra_env {
+            builder = builder.env(key, value);
+        }
+        let gw = builder.spawn().await?;
+        self.proxy_base_url = gw.proxy_base_url.clone();
+        self.admin_base_url = gw.admin_base_url.clone();
+        self.gw = Some(gw);
+        Ok(())
     }
 
     /// Start the gateway with TLS-enabled database connection, with retry for ephemeral port races.
@@ -71,89 +84,14 @@ impl DbTlsTestHarness {
         db_url: &str,
         cert_dir: &str,
         ssl_mode: &str,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        const MAX_ATTEMPTS: u32 = 3;
-        let mut last_err = String::new();
-        for attempt in 1..=MAX_ATTEMPTS {
-            match self.try_start_gateway(db_url, cert_dir, ssl_mode).await {
-                Ok(()) => return Ok(()),
-                Err(e) => {
-                    last_err = e.to_string();
-                    eprintln!(
-                        "Gateway startup attempt {}/{} failed: {}",
-                        attempt, MAX_ATTEMPTS, last_err
-                    );
-                    if attempt < MAX_ATTEMPTS {
-                        let admin_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-                        self.admin_port = admin_listener.local_addr()?.port();
-                        drop(admin_listener);
-
-                        let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-                        self.proxy_port = proxy_listener.local_addr()?.port();
-                        drop(proxy_listener);
-
-                        self.proxy_base_url = format!("http://127.0.0.1:{}", self.proxy_port);
-                        self.admin_base_url = format!("http://127.0.0.1:{}", self.admin_port);
-
-                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                    }
-                }
-            }
-        }
-        Err(format!(
-            "Failed to start gateway after {} attempts: {}",
-            MAX_ATTEMPTS, last_err
-        )
-        .into())
-    }
-
-    /// Single attempt to start the gateway with TLS-enabled database connection.
-    async fn try_start_gateway(
-        &mut self,
-        db_url: &str,
-        cert_dir: &str,
-        ssl_mode: &str,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let binary_path = if std::path::Path::new("./target/debug/ferrum-edge").exists() {
-            "./target/debug/ferrum-edge"
-        } else if std::path::Path::new("./target/release/ferrum-edge").exists() {
-            "./target/release/ferrum-edge"
-        } else {
-            return Err("ferrum-edge binary not found. Run `cargo build` first.".into());
-        };
-
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let ca_cert_path = format!("{}/ca.crt", cert_dir);
-
-        let mut cmd = Command::new(binary_path);
-        cmd.env("FERRUM_MODE", "database")
-            .env("FERRUM_ADMIN_JWT_SECRET", &self.jwt_secret)
-            .env("FERRUM_ADMIN_JWT_ISSUER", &self.jwt_issuer)
-            .env("FERRUM_DB_TYPE", &self.db_type)
-            .env("FERRUM_DB_URL", db_url)
-            .env("FERRUM_DB_POLL_INTERVAL", "2")
-            .env("FERRUM_PROXY_HTTP_PORT", self.proxy_port.to_string())
-            .env("FERRUM_ADMIN_HTTP_PORT", self.admin_port.to_string())
-            .env("FERRUM_LOG_LEVEL", "info");
-
-        // Configure TLS via the native SQL parameter approach
+        let mut extra_env = Vec::new();
         if self.db_type != "sqlite" {
-            cmd.env("FERRUM_DB_SSL_MODE", ssl_mode)
-                .env("FERRUM_DB_SSL_ROOT_CERT", &ca_cert_path);
+            extra_env.push(("FERRUM_DB_SSL_MODE".to_string(), ssl_mode.to_string()));
+            extra_env.push(("FERRUM_DB_SSL_ROOT_CERT".to_string(), ca_cert_path));
         }
-
-        let child = cmd.spawn()?;
-        self.gateway_process = Some(child);
-
-        match self.wait_for_health().await {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                if let Some(mut child) = self.gateway_process.take() {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                }
-                Err(e)
-            }
-        }
+        self.start_gateway_with_envs(db_url, extra_env).await
     }
 
     /// Start the gateway with the legacy TLS approach, with retry for ephemeral port races.
@@ -162,115 +100,20 @@ impl DbTlsTestHarness {
         db_url: &str,
         cert_dir: &str,
         insecure: bool,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        const MAX_ATTEMPTS: u32 = 3;
-        let mut last_err = String::new();
-        for attempt in 1..=MAX_ATTEMPTS {
-            match self
-                .try_start_gateway_legacy_tls(db_url, cert_dir, insecure)
-                .await
-            {
-                Ok(()) => return Ok(()),
-                Err(e) => {
-                    last_err = e.to_string();
-                    eprintln!(
-                        "Gateway startup attempt {}/{} failed: {}",
-                        attempt, MAX_ATTEMPTS, last_err
-                    );
-                    if attempt < MAX_ATTEMPTS {
-                        let admin_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-                        self.admin_port = admin_listener.local_addr()?.port();
-                        drop(admin_listener);
-
-                        let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-                        self.proxy_port = proxy_listener.local_addr()?.port();
-                        drop(proxy_listener);
-
-                        self.proxy_base_url = format!("http://127.0.0.1:{}", self.proxy_port);
-                        self.admin_base_url = format!("http://127.0.0.1:{}", self.admin_port);
-
-                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                    }
-                }
-            }
-        }
-        Err(format!(
-            "Failed to start gateway after {} attempts: {}",
-            MAX_ATTEMPTS, last_err
-        )
-        .into())
-    }
-
-    /// Single attempt to start the gateway with legacy TLS vars.
-    async fn try_start_gateway_legacy_tls(
-        &mut self,
-        db_url: &str,
-        cert_dir: &str,
-        insecure: bool,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let binary_path = if std::path::Path::new("./target/debug/ferrum-edge").exists() {
-            "./target/debug/ferrum-edge"
-        } else if std::path::Path::new("./target/release/ferrum-edge").exists() {
-            "./target/release/ferrum-edge"
-        } else {
-            return Err("ferrum-edge binary not found. Run `cargo build` first.".into());
-        };
-
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let ca_cert_path = format!("{}/ca.crt", cert_dir);
-
-        let mut cmd = Command::new(binary_path);
-        cmd.env("FERRUM_MODE", "database")
-            .env("FERRUM_ADMIN_JWT_SECRET", &self.jwt_secret)
-            .env("FERRUM_ADMIN_JWT_ISSUER", &self.jwt_issuer)
-            .env("FERRUM_DB_TYPE", &self.db_type)
-            .env("FERRUM_DB_URL", db_url)
-            .env("FERRUM_DB_POLL_INTERVAL", "2")
-            .env("FERRUM_PROXY_HTTP_PORT", self.proxy_port.to_string())
-            .env("FERRUM_ADMIN_HTTP_PORT", self.admin_port.to_string())
-            .env("FERRUM_LOG_LEVEL", "info")
-            .env("FERRUM_DB_TLS_ENABLED", "true")
-            .env("FERRUM_DB_TLS_CA_CERT_PATH", &ca_cert_path)
-            .env(
-                "FERRUM_DB_TLS_INSECURE",
-                if insecure { "true" } else { "false" },
-            );
-
-        let child = cmd.spawn()?;
-        self.gateway_process = Some(child);
-
-        match self.wait_for_health().await {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                if let Some(mut child) = self.gateway_process.take() {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                }
-                Err(e)
-            }
-        }
-    }
-
-    async fn wait_for_health(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let health_url = format!("{}/health", self.admin_base_url);
-        let deadline = SystemTime::now() + Duration::from_secs(30);
-
-        loop {
-            if SystemTime::now() >= deadline {
-                return Err(
-                    format!("Gateway ({}) did not start within 30 seconds", self.db_type).into(),
-                );
-            }
-
-            match reqwest::get(&health_url).await {
-                Ok(response) if response.status().is_success() => {
-                    println!("  Gateway ({}) is ready!", self.db_type);
-                    return Ok(());
-                }
-                _ => {
-                    tokio::time::sleep(Duration::from_millis(500)).await;
-                }
-            }
-        }
+        self.start_gateway_with_envs(
+            db_url,
+            vec![
+                ("FERRUM_DB_TLS_ENABLED".to_string(), "true".to_string()),
+                ("FERRUM_DB_TLS_CA_CERT_PATH".to_string(), ca_cert_path),
+                (
+                    "FERRUM_DB_TLS_INSECURE".to_string(),
+                    if insecure { "true" } else { "false" }.to_string(),
+                ),
+            ],
+        )
+        .await
     }
 
     fn generate_token(&self) -> Result<String, Box<dyn std::error::Error>> {
@@ -287,15 +130,6 @@ impl DbTlsTestHarness {
         let header = Header::new(jsonwebtoken::Algorithm::HS256);
         let key = EncodingKey::from_secret(self.jwt_secret.as_bytes());
         Ok(encode(&header, &claims, &key)?)
-    }
-}
-
-impl Drop for DbTlsTestHarness {
-    fn drop(&mut self) {
-        if let Some(mut child) = self.gateway_process.take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
     }
 }
 
@@ -947,31 +781,17 @@ async fn test_sqlite_ignores_tls_settings() {
     let db_url = format!("sqlite:{}?mode=rwc", db_path.display());
 
     // Start with SSL env vars set — they should be ignored for SQLite
-    let binary_path = if std::path::Path::new("./target/debug/ferrum-edge").exists() {
-        "./target/debug/ferrum-edge"
-    } else {
-        "./target/release/ferrum-edge"
-    };
-
-    let child = std::process::Command::new(binary_path)
-        .env("FERRUM_MODE", "database")
-        .env("FERRUM_ADMIN_JWT_SECRET", &harness.jwt_secret)
-        .env("FERRUM_ADMIN_JWT_ISSUER", &harness.jwt_issuer)
-        .env("FERRUM_DB_TYPE", "sqlite")
-        .env("FERRUM_DB_URL", &db_url)
-        .env("FERRUM_DB_POLL_INTERVAL", "2")
-        .env("FERRUM_PROXY_HTTP_PORT", harness.proxy_port.to_string())
-        .env("FERRUM_ADMIN_HTTP_PORT", harness.admin_port.to_string())
-        .env("FERRUM_LOG_LEVEL", "info")
-        // These should be silently ignored for SQLite
-        .env("FERRUM_DB_SSL_MODE", "verify-full")
-        .env("FERRUM_DB_SSL_ROOT_CERT", "/nonexistent/ca.crt")
-        .spawn()
-        .expect("Failed to start gateway");
-
-    harness.gateway_process = Some(child);
     harness
-        .wait_for_health()
+        .start_gateway_with_envs(
+            &db_url,
+            vec![
+                ("FERRUM_DB_SSL_MODE".to_string(), "verify-full".to_string()),
+                (
+                    "FERRUM_DB_SSL_ROOT_CERT".to_string(),
+                    "/nonexistent/ca.crt".to_string(),
+                ),
+            ],
+        )
         .await
         .expect("Gateway should start fine even with SSL vars set for SQLite");
 
