@@ -478,17 +478,20 @@ jobs:
           lines.append(f"**Duration:** {os.environ['DURATION']}s  |  **Concurrency:** {os.environ['CONCURRENCY']}  |  **Iterations:** {iterations}\n")
 
           # Summary scoreboard — count wins per gateway across every scenario.
-          # Only head-to-head scenarios (>=2 contenders) count; a single-gateway
-          # scenario like udp-dtls (Ferrum-only) or a protocol where skips
-          # leave only one gateway is NOT an automatic win — it's unopposed and
-          # would inflate both total wins and win-rate percentages.
-          # Tie-breaking: max() preserves the first encountered value on ties,
-          # so ties deterministically favor the earlier-listed gateway in the
-          # tuple below (ferrum, envoy, kong, tyk, krakend). This is stable
-          # and documented, but readers should be aware when interpreting ties.
+          # Three classes of scenarios are excluded from win counting:
+          #   1. Unopposed (len(contenders) < 2): udp-dtls is Ferrum-only by
+          #      design; or --skip-gateways leaves one contender.
+          #   2. All-failed (max_rps == 0): every contender reported 0 RPS
+          #      (bench crashed, port conflict, gateway wouldn't start).
+          #      Without filtering, max() would deterministically award
+          #      Ferrum (first in tuple order) an undeserved win.
+          #   3. Only the tied winner advances — ties still favor the
+          #      earlier-listed gateway per tuple order (ferrum, envoy, kong,
+          #      tyk, krakend), which is stable and documented.
           wins = {}
           scenarios = 0
           unopposed = 0
+          all_failed = 0
           for proto, buckets in data.items():
               sizes = sorted({s for (_, s) in buckets})
               for s in sizes:
@@ -499,8 +502,13 @@ jobs:
                       if contenders:
                           unopposed += 1
                       continue
-                  winner = max(contenders, key=lambda x: x[1])[0]
-                  wins[winner] = wins.get(winner, 0) + 1
+                  winner_gw, winner_rps = max(contenders, key=lambda x: x[1])
+                  if winner_rps <= 0:
+                      # Every contender failed — do not credit the first-listed
+                      # gateway with a "win" for a failed scenario.
+                      all_failed += 1
+                      continue
+                  wins[winner_gw] = wins.get(winner_gw, 0) + 1
                   scenarios += 1
 
           if scenarios:
@@ -509,6 +517,11 @@ jobs:
                   lines.append(
                       f"_{unopposed} unopposed scenario(s) excluded from win counts "
                       f"(e.g. udp-dtls is Ferrum-only by design — no head-to-head possible)._\n"
+                  )
+              if all_failed:
+                  lines.append(
+                      f"_{all_failed} scenario(s) excluded because every contender reported 0 RPS "
+                      f"(bench or gateway startup failure — inspect per-protocol artifacts)._\n"
                   )
               lines.append("| Gateway | Wins | Win rate |")
               lines.append("|---------|------|----------|")
