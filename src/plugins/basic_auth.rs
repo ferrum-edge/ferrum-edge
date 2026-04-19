@@ -23,6 +23,9 @@ use tracing::{debug, error, warn};
 
 use crate::consumer_index::ConsumerIndex;
 
+use super::utils::auth_flow::{
+    self, AuthMechanism, ExtractedCredential, VerifyOutcome, constant_time_eq,
+};
 use super::{Plugin, PluginResult, RequestContext, strip_auth_scheme};
 
 type HmacSha256 = Hmac<Sha256>;
@@ -92,16 +95,85 @@ impl BasicAuth {
     }
 }
 
-/// Constant-time byte comparison to prevent timing side-channels.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
+#[async_trait]
+impl AuthMechanism for BasicAuth {
+    fn mechanism_name(&self) -> &str {
+        "basic_auth"
     }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
+
+    fn extract(
+        &self,
+        _ctx: &RequestContext,
+        headers: &HashMap<String, String>,
+    ) -> ExtractedCredential {
+        let Some(auth_header) = headers.get("authorization") else {
+            return ExtractedCredential::Missing;
+        };
+
+        let Some(encoded) = strip_auth_scheme(auth_header, "Basic") else {
+            return ExtractedCredential::InvalidFormat(
+                r#"{"error":"Invalid Basic auth format"}"#.into(),
+            );
+        };
+
+        let decoded = match base64::engine::general_purpose::STANDARD.decode(encoded) {
+            Ok(decoded) => decoded,
+            Err(_) => {
+                return ExtractedCredential::InvalidFormat(
+                    r#"{"error":"Invalid base64 in Basic auth"}"#.into(),
+                );
+            }
+        };
+
+        let credential_str = match String::from_utf8(decoded) {
+            Ok(credential_str) => credential_str,
+            Err(_) => {
+                return ExtractedCredential::InvalidFormat(
+                    r#"{"error":"Invalid UTF-8 in Basic auth"}"#.into(),
+                );
+            }
+        };
+
+        let parts: Vec<&str> = credential_str.splitn(2, ':').collect();
+        if parts.len() != 2 {
+            return ExtractedCredential::InvalidFormat(
+                r#"{"error":"Invalid Basic auth format"}"#.into(),
+            );
+        }
+
+        ExtractedCredential::BasicAuth {
+            username: parts[0].to_string(),
+            password: parts[1].to_string(),
+        }
     }
-    diff == 0
+
+    async fn verify(
+        &self,
+        credential: ExtractedCredential,
+        consumer_index: &ConsumerIndex,
+    ) -> VerifyOutcome {
+        let ExtractedCredential::BasicAuth { username, password } = credential else {
+            return VerifyOutcome::NotApplicable;
+        };
+
+        let Some(consumer) = consumer_index.find_by_username(&username) else {
+            return VerifyOutcome::ConsumerNotFound(r#"{"error":"Invalid credentials"}"#.into());
+        };
+
+        for basic_creds in consumer.credential_entries("basicauth") {
+            if let Some(stored_hash) = basic_creds.get("password_hash").and_then(|s| s.as_str())
+                && self.verify_password(&password, stored_hash)
+            {
+                return VerifyOutcome::Success {
+                    consumer: Some(consumer),
+                    external_identity: None,
+                    external_identity_header: None,
+                };
+            }
+        }
+
+        VerifyOutcome::VerificationFailed(r#"{"error":"Invalid credentials"}"#.into())
+    }
 }
 
 #[async_trait]
@@ -127,81 +199,6 @@ impl Plugin for BasicAuth {
         ctx: &mut RequestContext,
         consumer_index: &ConsumerIndex,
     ) -> PluginResult {
-        let auth_header = match ctx.headers.get("authorization") {
-            Some(h) => h.clone(),
-            None => {
-                return PluginResult::Reject {
-                    status_code: 401,
-                    body: r#"{"error":"Missing Authorization header"}"#.into(),
-                    headers: HashMap::new(),
-                };
-            }
-        };
-
-        let encoded = match strip_auth_scheme(&auth_header, "Basic") {
-            Some(encoded) => encoded,
-            None => {
-                return PluginResult::Reject {
-                    status_code: 401,
-                    body: r#"{"error":"Invalid Basic auth format"}"#.into(),
-                    headers: HashMap::new(),
-                };
-            }
-        };
-        let decoded = match base64::engine::general_purpose::STANDARD.decode(encoded) {
-            Ok(d) => d,
-            Err(_) => {
-                return PluginResult::Reject {
-                    status_code: 401,
-                    body: r#"{"error":"Invalid base64 in Basic auth"}"#.into(),
-                    headers: HashMap::new(),
-                };
-            }
-        };
-
-        let credential_str = match String::from_utf8(decoded) {
-            Ok(s) => s,
-            Err(_) => {
-                return PluginResult::Reject {
-                    status_code: 401,
-                    body: r#"{"error":"Invalid UTF-8 in Basic auth"}"#.into(),
-                    headers: HashMap::new(),
-                };
-            }
-        };
-
-        let parts: Vec<&str> = credential_str.splitn(2, ':').collect();
-        if parts.len() != 2 {
-            return PluginResult::Reject {
-                status_code: 401,
-                body: r#"{"error":"Invalid Basic auth format"}"#.into(),
-                headers: HashMap::new(),
-            };
-        }
-
-        let username = parts[0];
-        let password = parts[1];
-
-        // O(1) lookup by username via ConsumerIndex, then try all password hashes
-        // (supports multiple credentials per type for zero-downtime rotation)
-        if let Some(consumer) = consumer_index.find_by_username(username) {
-            for basic_creds in consumer.credential_entries("basicauth") {
-                if let Some(stored_hash) = basic_creds.get("password_hash").and_then(|s| s.as_str())
-                    && self.verify_password(password, stored_hash)
-                {
-                    if ctx.identified_consumer.is_none() {
-                        debug!("basic_auth: identified consumer '{}'", consumer.username);
-                        ctx.identified_consumer = Some(consumer);
-                    }
-                    return PluginResult::Continue;
-                }
-            }
-        }
-
-        PluginResult::Reject {
-            status_code: 401,
-            body: r#"{"error":"Invalid credentials"}"#.into(),
-            headers: HashMap::new(),
-        }
+        auth_flow::run_auth(self, ctx, consumer_index).await
     }
 }
