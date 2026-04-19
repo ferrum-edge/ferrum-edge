@@ -2507,6 +2507,18 @@ impl Proxy {
 }
 
 impl Consumer {
+    /// Normalize a credential value to a list of object entries for backward
+    /// compatibility with both single-object and array-of-objects formats.
+    pub(crate) fn credential_entries_from_value(
+        credential_value: &serde_json::Value,
+    ) -> Vec<&serde_json::Value> {
+        match credential_value {
+            serde_json::Value::Array(arr) => arr.iter().filter(|v| v.is_object()).collect(),
+            val if val.is_object() => vec![val],
+            _ => vec![],
+        }
+    }
+
     /// Returns all credential entries for a given type, normalizing both
     /// single-object and array-of-objects formats for backward compatibility.
     ///
@@ -2517,8 +2529,7 @@ impl Consumer {
     /// lookup, iterating 1-2 entries). Non-object array elements are filtered out.
     pub fn credential_entries(&self, cred_type: &str) -> Vec<&serde_json::Value> {
         match self.credentials.get(cred_type) {
-            Some(serde_json::Value::Array(arr)) => arr.iter().filter(|v| v.is_object()).collect(),
-            Some(val) if val.is_object() => vec![val],
+            Some(credential_value) => Self::credential_entries_from_value(credential_value),
             _ => vec![],
         }
     }

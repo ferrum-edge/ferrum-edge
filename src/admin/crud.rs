@@ -43,6 +43,22 @@ pub(crate) enum AfterValidateError {
     Response(Response<Full<Bytes>>),
 }
 
+/// Validation outcomes that preserve legacy plain-message responses for
+/// resource-specific checks while still supporting the generic field wrapper.
+pub(crate) enum ValidationError {
+    Fields(Vec<String>),
+    Message(String),
+}
+
+impl ValidationError {
+    fn into_messages(self) -> Vec<String> {
+        match self {
+            Self::Fields(errors) => errors,
+            Self::Message(message) => vec![message],
+        }
+    }
+}
+
 #[allow(async_fn_in_trait)]
 pub(crate) trait AdminResource:
     Send + Sync + Serialize + DeserializeOwned + Clone + Sized + 'static
@@ -60,7 +76,7 @@ pub(crate) trait AdminResource:
     fn set_created_at(&mut self, now: DateTime<Utc>);
     fn set_updated_at(&mut self, now: DateTime<Utc>);
     fn normalize(&mut self);
-    fn validate(&self, ctx: &ValidationCtx<'_>) -> Result<(), Vec<String>>;
+    fn validate(&self, ctx: &ValidationCtx<'_>) -> Result<(), ValidationError>;
     fn cached_items(config: &GatewayConfig) -> &[Self];
 
     fn response_body(resource: &Self) -> Value {
@@ -73,12 +89,17 @@ pub(crate) trait AdminResource:
         Ok(())
     }
 
-    fn map_validation_errors(errors: &[String]) -> Response<Full<Bytes>> {
-        validation_error_response::<Self>(errors)
+    fn map_validation_error(error: &ValidationError) -> Response<Full<Bytes>> {
+        match error {
+            ValidationError::Fields(errors) => validation_error_response::<Self>(errors),
+            ValidationError::Message(message) => {
+                super::json_response(StatusCode::BAD_REQUEST, &json!({"error": message}))
+            }
+        }
     }
 
     fn map_after_validate_errors(errors: &[String]) -> Response<Full<Bytes>> {
-        Self::map_validation_errors(errors)
+        validation_error_response::<Self>(errors)
     }
 
     fn map_precheck_db_error(error: &anyhow::Error) -> Response<Full<Bytes>> {
@@ -299,7 +320,9 @@ pub(crate) fn prepare_batch_resource<R: AdminResource>(
 
     resource.normalize();
     resource.set_namespace(namespace.to_string());
-    resource.validate(validation_ctx)?;
+    resource
+        .validate(validation_ctx)
+        .map_err(ValidationError::into_messages)?;
     if let Err(message) = resource.prepare_for_write() {
         return Err(vec![message]);
     }
@@ -377,11 +400,7 @@ pub(crate) async fn check_credential_value_uniqueness(
     cred_value: &Value,
     exclude_consumer_id: Option<&str>,
 ) -> DbResult<Option<String>> {
-    let entries: Vec<&Value> = match cred_value {
-        Value::Array(arr) => arr.iter().filter(|value| value.is_object()).collect(),
-        value if value.is_object() => vec![value],
-        _ => vec![],
-    };
+    let entries = Consumer::credential_entries_from_value(cred_value);
 
     match cred_type {
         "keyauth" => {
@@ -460,13 +479,13 @@ impl AdminResource for Upstream {
         self.normalize_fields();
     }
 
-    fn validate(&self, _ctx: &ValidationCtx<'_>) -> Result<(), Vec<String>> {
+    fn validate(&self, _ctx: &ValidationCtx<'_>) -> Result<(), ValidationError> {
         if self.targets.is_empty() && self.service_discovery.is_none() {
-            return Err(vec![
+            return Err(ValidationError::Message(
                 "At least one target is required (or configure service_discovery)".to_string(),
-            ]);
+            ));
         }
-        self.validate_fields()
+        self.validate_fields().map_err(ValidationError::Fields)
     }
 
     fn cached_items(config: &GatewayConfig) -> &[Self] {
@@ -572,8 +591,8 @@ impl AdminResource for PluginConfig {
         self.normalize_fields();
     }
 
-    fn validate(&self, _ctx: &ValidationCtx<'_>) -> Result<(), Vec<String>> {
-        self.validate_fields()
+    fn validate(&self, _ctx: &ValidationCtx<'_>) -> Result<(), ValidationError> {
+        self.validate_fields().map_err(ValidationError::Fields)
     }
 
     fn cached_items(config: &GatewayConfig) -> &[Self] {
@@ -704,12 +723,15 @@ impl AdminResource for Proxy {
         self.normalize_fields();
     }
 
-    fn validate(&self, _ctx: &ValidationCtx<'_>) -> Result<(), Vec<String>> {
-        self.validate_fields()?;
+    fn validate(&self, _ctx: &ValidationCtx<'_>) -> Result<(), ValidationError> {
+        self.validate_fields().map_err(ValidationError::Fields)?;
 
         for host in &self.hosts {
             if let Err(message) = crate::config::types::validate_host_entry(host) {
-                return Err(vec![format!("Invalid proxy hosts: {}", message)]);
+                return Err(ValidationError::Message(format!(
+                    "Invalid proxy hosts: {}",
+                    message
+                )));
             }
         }
 
@@ -720,31 +742,33 @@ impl AdminResource for Proxy {
         {
             let anchored = crate::config::types::anchor_regex_pattern(pattern);
             if let Err(error) = regex::Regex::new(&anchored) {
-                return Err(vec![format!(
+                return Err(ValidationError::Message(format!(
                     "Invalid proxy listen_path: invalid regex '{}': {}",
                     path, error
-                )]);
+                )));
             }
         }
 
         if self.backend_protocol.is_stream_proxy() {
             match self.listen_port {
                 None => {
-                    return Err(vec![format!(
+                    return Err(ValidationError::Message(format!(
                         "Stream proxy (protocol {}) must have a listen_port",
                         self.backend_protocol
-                    )]);
+                    )));
                 }
                 Some(0) => {
-                    return Err(vec!["listen_port 0 must be >= 1".to_string()]);
+                    return Err(ValidationError::Message(
+                        "listen_port 0 must be >= 1".to_string(),
+                    ));
                 }
                 Some(_) => {}
             }
         } else if self.listen_port.is_some() {
-            return Err(vec![format!(
+            return Err(ValidationError::Message(format!(
                 "HTTP proxy (protocol {}) must not set listen_port",
                 self.backend_protocol
-            )]);
+            )));
         }
 
         Ok(())
@@ -752,20 +776,6 @@ impl AdminResource for Proxy {
 
     fn cached_items(config: &GatewayConfig) -> &[Self] {
         &config.proxies
-    }
-
-    fn map_validation_errors(errors: &[String]) -> Response<Full<Bytes>> {
-        if errors.len() == 1
-            && (errors[0].starts_with("Invalid proxy hosts:")
-                || errors[0].starts_with("Invalid proxy listen_path:")
-                || errors[0].starts_with("Stream proxy (protocol ")
-                || errors[0].starts_with("HTTP proxy (protocol ")
-                || errors[0].starts_with("listen_port "))
-        {
-            return super::json_response(StatusCode::BAD_REQUEST, &json!({"error": errors[0]}));
-        }
-
-        validation_error_response::<Self>(errors)
     }
 
     fn map_after_validate_errors(errors: &[String]) -> Response<Full<Bytes>> {
@@ -987,8 +997,8 @@ impl AdminResource for Consumer {
         self.normalize_fields();
     }
 
-    fn validate(&self, _ctx: &ValidationCtx<'_>) -> Result<(), Vec<String>> {
-        self.validate_fields()
+    fn validate(&self, _ctx: &ValidationCtx<'_>) -> Result<(), ValidationError> {
+        self.validate_fields().map_err(ValidationError::Fields)
     }
 
     fn cached_items(config: &GatewayConfig) -> &[Self] {
@@ -1132,8 +1142,8 @@ async fn handle_write<R: AdminResource>(
     resource.set_namespace(namespace.to_string());
 
     let validation_ctx = ValidationCtx::from_state(state);
-    if let Err(field_errors) = resource.validate(&validation_ctx) {
-        return Ok(R::map_validation_errors(&field_errors));
+    if let Err(validation_error) = resource.validate(&validation_ctx) {
+        return Ok(R::map_validation_error(&validation_error));
     }
 
     if matches!(action, WriteAction::Create) {

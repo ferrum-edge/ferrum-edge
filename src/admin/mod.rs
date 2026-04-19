@@ -1,5 +1,6 @@
 //! Admin API for Ferrum Edge.
 
+mod backup;
 pub(crate) mod crud;
 pub mod jwt_auth;
 
@@ -20,11 +21,11 @@ use std::time::Instant;
 use tokio::net::TcpListener;
 use tracing::{debug, error, info, warn};
 
-use crate::admin::jwt_auth::{JwtError, JwtManager};
-use crate::config::admin_api::{
+use crate::admin::backup::{
     BackupCounts, BackupPayload, RestorePayload, filter_config_by_namespace,
     parse_backup_resources, parse_restore_confirm,
 };
+use crate::admin::jwt_auth::{JwtError, JwtManager};
 use crate::config::db_backend::DatabaseBackend;
 use crate::config::types::{
     Consumer, GatewayConfig, PluginConfig, PluginScope, Proxy, Upstream, max_credentials_per_type,

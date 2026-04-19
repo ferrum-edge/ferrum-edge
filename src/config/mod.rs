@@ -10,7 +10,6 @@
 //! - `migrations` — SQL schema migrations for database mode
 //! - `pool_config` — Connection pool configuration (global defaults + per-proxy overrides)
 
-pub mod admin_api;
 pub mod conf_file;
 pub mod config_backup;
 pub mod config_migration;
