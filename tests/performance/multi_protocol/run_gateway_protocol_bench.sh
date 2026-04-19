@@ -71,15 +71,26 @@ OUTPUT_DIR="$(cd "$OUTPUT_DIR" && pwd)"
 # Returns 0 if the gateway supports the protocol, 1 otherwise.
 supports() {
     local gw="$1" proto="$2"
-    # KrakenD Community Edition does NOT support gRPC proxying or WebSocket
-    # proxying — both are Enterprise-only (see
-    # https://www.krakend.io/docs/enterprise/backends/grpc/ and
-    # https://www.krakend.io/docs/enterprise/websockets/). We ship the CE
-    # image (krakend:2.13.2), so krakend is omitted from both grpcs and wss.
+    # Gateway limitations baked into the matrix:
+    #
+    # - KrakenD Community Edition does NOT support gRPC proxying or WebSocket
+    #   proxying — both are Enterprise-only (see
+    #   https://www.krakend.io/docs/enterprise/backends/grpc/ and
+    #   https://www.krakend.io/docs/enterprise/websockets/). We ship the CE
+    #   image (krakend:2.13.2), so krakend is omitted from grpcs and wss.
+    #
+    # - Kong HTTP/3 is NOT officially configurable via KONG_PROXY_LISTEN —
+    #   Kong's proxy_listen parser documents only ssl/http2/proxy_protocol/
+    #   transparent/deferred/bind/reuseport/backlog suffixes. HTTP/3 requires
+    #   custom KONG_NGINX_HTTP_LISTEN template injection that isn't a
+    #   documented supported path. Rather than test against an experimental
+    #   Kong config that silently fails / 0-RPS, kong is omitted from http3
+    #   until Kong ships first-class HTTP/3 support. http3 therefore runs as
+    #   a ferrum-vs-envoy comparison only.
     case "$gw:$proto" in
         ferrum:*)  return 0 ;;
         envoy:http1-tls|envoy:http2|envoy:http3|envoy:grpcs|envoy:wss|envoy:tcp-tls|envoy:udp) return 0 ;;
-        kong:http1-tls|kong:http2|kong:http3|kong:grpcs|kong:wss|kong:tcp-tls|kong:udp) return 0 ;;
+        kong:http1-tls|kong:http2|kong:grpcs|kong:wss|kong:tcp-tls|kong:udp) return 0 ;;
         tyk:http1-tls|tyk:http2|tyk:grpcs|tyk:wss|tyk:tcp-tls) return 0 ;;
         krakend:http1-tls|krakend:http2) return 0 ;;
         *) return 1 ;;
@@ -314,9 +325,9 @@ start_kong() {
         http2|grpcs)
             proxy_listen_env="0.0.0.0:${GATEWAY_HTTP_PORT}, 0.0.0.0:${GATEWAY_HTTPS_PORT} ssl http2"
             ;;
-        http3)
-            proxy_listen_env="0.0.0.0:${GATEWAY_HTTP_PORT}, 0.0.0.0:${GATEWAY_HTTPS_PORT} ssl http2 http3 quic reuseport"
-            ;;
+        # NB: http3 intentionally absent — see supports() for why Kong HTTP/3
+        # is not in scope. KONG_PROXY_LISTEN does not parse http3/quic flags
+        # and Kong has no documented first-class HTTP/3 config path.
         wss)
             proxy_listen_env="0.0.0.0:${GATEWAY_HTTP_PORT}, 0.0.0.0:${GATEWAY_HTTPS_PORT} ssl"
             ;;
@@ -360,7 +371,6 @@ kong_config_name() {
     case "$PROTOCOL" in
         http1-tls) echo "http1_tls.yaml" ;;
         http2)     echo "http2_tls.yaml" ;;
-        http3)     echo "http3.yaml" ;;
         grpcs)     echo "grpcs.yaml" ;;
         wss)       echo "wss.yaml" ;;
         tcp-tls)   echo "tcp_tls.yaml" ;;

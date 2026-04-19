@@ -11,9 +11,10 @@
 # Gateway × Protocol support (as of 2026-04):
 #   http1-tls : ferrum, envoy, kong, tyk, krakend
 #   http2     : ferrum, envoy, kong, tyk, krakend
-#   http3     : ferrum, envoy, kong                           (Tyk/KrakenD no HTTP/3)
-#   grpcs     : ferrum, envoy, kong, tyk, krakend
-#   wss       : ferrum, envoy, kong, tyk, krakend
+#   http3     : ferrum, envoy                                  (Kong no supported HTTP/3 cfg path;
+#                                                               Tyk/KrakenD no HTTP/3 at all)
+#   grpcs     : ferrum, envoy, kong, tyk                       (KrakenD CE no gRPC)
+#   wss       : ferrum, envoy, kong, tyk                       (KrakenD CE no WS)
 #   tcp-tls   : ferrum, envoy, kong, tyk                       (KrakenD no TCP)
 #   udp       : ferrum, envoy, kong                            (Tyk/KrakenD no UDP)
 #   udp-dtls  : ferrum                                         (only Ferrum; direct backend baseline)
@@ -165,15 +166,19 @@ jobs:
         if: steps.skip_check.outputs.skip != 'true'
         id: gateways
         run: |
-          # KrakenD Community Edition does NOT support gRPC proxying OR
-          # WebSocket proxying — both are Enterprise-only. We ship CE
-          # (krakend:2.13.2), so krakend is omitted from both grpcs and wss.
-          # Docs: /docs/enterprise/backends/grpc/, /docs/enterprise/websockets/
+          # Matrix exclusions:
+          # - KrakenD CE does NOT support gRPC or WebSocket proxying (both are
+          #   Enterprise-only — /docs/enterprise/backends/grpc/ and /websockets/).
+          #   We ship CE (krakend:2.13.2), so krakend is omitted from grpcs + wss.
+          # - Kong does NOT have a documented first-class HTTP/3 config path.
+          #   KONG_PROXY_LISTEN doesn't accept http3/quic suffixes, and HTTP/3
+          #   would require experimental KONG_NGINX_HTTP_LISTEN template
+          #   injection. Omitted from http3 until Kong ships supported config.
           case "${{ matrix.protocol }}" in
             http1-tls|http2) all="ferrum envoy kong tyk krakend" ;;
             wss)      all="ferrum envoy kong tyk" ;;
             grpcs)    all="ferrum envoy kong tyk" ;;
-            http3)    all="ferrum envoy kong" ;;
+            http3)    all="ferrum envoy" ;;
             tcp-tls)  all="ferrum envoy kong tyk" ;;
             udp)      all="ferrum envoy kong" ;;
             udp-dtls) all="ferrum" ;;
