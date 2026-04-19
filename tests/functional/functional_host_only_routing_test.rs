@@ -16,85 +16,38 @@
 //!   cargo build --bin ferrum-edge
 //!   cargo test --test functional_tests -- --ignored functional_host_only_routing --nocapture
 
-use std::time::Duration;
-use tempfile::TempDir;
+use crate::common::TestGateway;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::time::sleep;
+use tokio::task::JoinHandle;
 
-// ---- Identified echo backend ----
+// ============================================================================
+// Plain-text identified backend (these tests check for exact string bodies,
+// which does not match the JSON shape of spawn_http_identifying).
+// Listener owned by the spawned task.
+// ============================================================================
 
-async fn start_identified_echo_server(listener: TcpListener, identifier: String) {
-    loop {
-        if let Ok((mut stream, _)) = listener.accept().await {
-            let body = identifier.clone();
-            tokio::spawn(async move {
-                let mut buf = vec![0u8; 4096];
-                let _n = stream.read(&mut buf).await.unwrap_or(0);
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
-                let _ = stream.write_all(response.as_bytes()).await;
-                let _ = stream.shutdown().await;
-            });
-        }
-    }
-}
-
-async fn spawn_backend(identifier: &str) -> (u16, tokio::task::JoinHandle<()>) {
+async fn spawn_backend(identifier: &'static str) -> (u16, JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    let id = identifier.to_string();
     let handle = tokio::spawn(async move {
-        start_identified_echo_server(listener, id).await;
+        loop {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    let _n = stream.read(&mut buf).await.unwrap_or(0);
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n{}",
+                        identifier.len(),
+                        identifier
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        }
     });
     (port, handle)
-}
-
-// ---- Gateway helpers ----
-
-fn gateway_binary_path() -> &'static str {
-    if std::path::Path::new("./target/debug/ferrum-edge").exists() {
-        "./target/debug/ferrum-edge"
-    } else if std::path::Path::new("./target/release/ferrum-edge").exists() {
-        "./target/release/ferrum-edge"
-    } else {
-        panic!("ferrum-edge binary not found. Run `cargo build --bin ferrum-edge` first.");
-    }
-}
-
-fn start_gateway_in_file_mode(
-    config_path: &str,
-    http_port: u16,
-    admin_port: u16,
-) -> std::process::Child {
-    std::process::Command::new(gateway_binary_path())
-        .env("FERRUM_MODE", "file")
-        .env("FERRUM_FILE_CONFIG_PATH", config_path)
-        .env("FERRUM_PROXY_HTTP_PORT", http_port.to_string())
-        .env("FERRUM_ADMIN_HTTP_PORT", admin_port.to_string())
-        .env("FERRUM_LOG_LEVEL", "warn")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("Failed to start gateway binary")
-}
-
-async fn wait_for_gateway(admin_port: u16) -> bool {
-    let client = reqwest::Client::new();
-    let url = format!("http://127.0.0.1:{}/health", admin_port);
-    for _ in 0..60 {
-        if let Ok(resp) = client.get(&url).send().await
-            && resp.status().is_success()
-        {
-            return true;
-        }
-        sleep(Duration::from_millis(250)).await;
-    }
-    false
 }
 
 async fn ephemeral_port() -> u16 {
@@ -104,31 +57,9 @@ async fn ephemeral_port() -> u16 {
     p
 }
 
-async fn start_gateway_with_retry(config_path: &str) -> (std::process::Child, u16, u16) {
-    const MAX_ATTEMPTS: u32 = 3;
-    for attempt in 1..=MAX_ATTEMPTS {
-        let proxy_port = ephemeral_port().await;
-        let admin_port = ephemeral_port().await;
-        let mut child = start_gateway_in_file_mode(config_path, proxy_port, admin_port);
-        if wait_for_gateway(admin_port).await {
-            return (child, proxy_port, admin_port);
-        }
-        eprintln!(
-            "Gateway startup attempt {}/{} failed (proxy_port={}, admin_port={})",
-            attempt, MAX_ATTEMPTS, proxy_port, admin_port
-        );
-        let _ = child.kill();
-        let _ = child.wait();
-        if attempt < MAX_ATTEMPTS {
-            sleep(Duration::from_secs(1)).await;
-        }
-    }
-    panic!("Gateway did not start after {} attempts", MAX_ATTEMPTS);
-}
-
-async fn get_with_host_header(client: &reqwest::Client, url: &str, host: &str) -> (u16, String) {
+async fn get_with_host_header(client: &reqwest::Client, url: String, host: &str) -> (u16, String) {
     let resp = client
-        .get(url)
+        .get(&url)
         .header("Host", host)
         .send()
         .await
@@ -145,13 +76,9 @@ async fn get_with_host_header(client: &reqwest::Client, url: &str, host: &str) -
 #[ignore]
 #[tokio::test(flavor = "multi_thread")]
 async fn functional_host_only_routing_matches_any_path() {
-    let temp_dir = TempDir::new().expect("temp dir");
-
     let (port_a, _h_a) = spawn_backend("backend-a").await;
-    sleep(Duration::from_millis(200)).await;
 
-    let config = temp_dir.path().join("config.yaml");
-    let yaml = format!(
+    let config = format!(
         r#"
 proxies:
   - id: "host-only-a"
@@ -165,30 +92,29 @@ consumers: []
 plugin_configs: []
 "#
     );
-    std::fs::write(&config, yaml).expect("write config");
 
-    let (mut gw, proxy_port, _admin_port) =
-        start_gateway_with_retry(config.to_str().unwrap()).await;
+    let gw = TestGateway::builder()
+        .mode_file(config)
+        .log_level("warn")
+        .spawn()
+        .await
+        .expect("start gateway");
     let client = reqwest::Client::new();
-    let base = format!("http://127.0.0.1:{proxy_port}");
 
     // Every path under the host hits backend-a
     for path in ["/", "/api", "/api/v1/users", "/nested/deeply/here"] {
         let (status, body) =
-            get_with_host_header(&client, &format!("{base}{path}"), "a.example.com").await;
+            get_with_host_header(&client, gw.proxy_url(path), "a.example.com").await;
         assert_eq!(status, 200, "host-only proxy should serve {}", path);
         assert_eq!(body, "backend-a", "path {} should route to backend-a", path);
     }
 
     // A different host (no match anywhere) returns 404
-    let (status, _) = get_with_host_header(&client, &format!("{base}/api"), "other.host").await;
+    let (status, _) = get_with_host_header(&client, gw.proxy_url("/api"), "other.host").await;
     assert_eq!(
         status, 404,
         "unmatched host should not route to the host-only proxy"
     );
-
-    let _ = gw.kill();
-    let _ = gw.wait();
 }
 
 // ============================================================================
@@ -202,14 +128,10 @@ plugin_configs: []
 #[ignore]
 #[tokio::test(flavor = "multi_thread")]
 async fn functional_host_only_is_fallback_after_path_match() {
-    let temp_dir = TempDir::new().expect("temp dir");
-
     let (port_api, _h_api) = spawn_backend("backend-api").await;
     let (port_fallback, _h_fallback) = spawn_backend("backend-fallback").await;
-    sleep(Duration::from_millis(200)).await;
 
-    let config = temp_dir.path().join("config.yaml");
-    let yaml = format!(
+    let config = format!(
         r#"
 proxies:
   - id: "path-api"
@@ -231,16 +153,18 @@ consumers: []
 plugin_configs: []
 "#
     );
-    std::fs::write(&config, yaml).expect("write config");
 
-    let (mut gw, proxy_port, _admin_port) =
-        start_gateway_with_retry(config.to_str().unwrap()).await;
+    let gw = TestGateway::builder()
+        .mode_file(config)
+        .log_level("warn")
+        .spawn()
+        .await
+        .expect("start gateway");
     let client = reqwest::Client::new();
-    let base = format!("http://127.0.0.1:{proxy_port}");
 
     // /api/* goes to the path-carrying proxy
     let (status, body) =
-        get_with_host_header(&client, &format!("{base}/api/v1"), "shared.example.com").await;
+        get_with_host_header(&client, gw.proxy_url("/api/v1"), "shared.example.com").await;
     assert_eq!(status, 200);
     assert_eq!(
         body, "backend-api",
@@ -249,15 +173,12 @@ plugin_configs: []
 
     // Other paths fall through to host-only
     let (status, body) =
-        get_with_host_header(&client, &format!("{base}/other"), "shared.example.com").await;
+        get_with_host_header(&client, gw.proxy_url("/other"), "shared.example.com").await;
     assert_eq!(status, 200);
     assert_eq!(
         body, "backend-fallback",
         "non-matching path should fall through to host-only fallback"
     );
-
-    let _ = gw.kill();
-    let _ = gw.wait();
 }
 
 // ============================================================================
@@ -267,14 +188,10 @@ plugin_configs: []
 #[ignore]
 #[tokio::test(flavor = "multi_thread")]
 async fn functional_host_only_disjoint_hosts_coexist() {
-    let temp_dir = TempDir::new().expect("temp dir");
-
     let (port_a, _h_a) = spawn_backend("backend-a").await;
     let (port_b, _h_b) = spawn_backend("backend-b").await;
-    sleep(Duration::from_millis(200)).await;
 
-    let config = temp_dir.path().join("config.yaml");
-    let yaml = format!(
+    let config = format!(
         r#"
 proxies:
   - id: "host-only-a"
@@ -295,23 +212,22 @@ consumers: []
 plugin_configs: []
 "#
     );
-    std::fs::write(&config, yaml).expect("write config");
 
-    let (mut gw, proxy_port, _admin_port) =
-        start_gateway_with_retry(config.to_str().unwrap()).await;
+    let gw = TestGateway::builder()
+        .mode_file(config)
+        .log_level("warn")
+        .spawn()
+        .await
+        .expect("start gateway");
     let client = reqwest::Client::new();
-    let base = format!("http://127.0.0.1:{proxy_port}");
 
     let (_, body_a) =
-        get_with_host_header(&client, &format!("{base}/anywhere"), "a.example.com").await;
+        get_with_host_header(&client, gw.proxy_url("/anywhere"), "a.example.com").await;
     assert_eq!(body_a, "backend-a");
 
     let (_, body_b) =
-        get_with_host_header(&client, &format!("{base}/anywhere"), "b.example.com").await;
+        get_with_host_header(&client, gw.proxy_url("/anywhere"), "b.example.com").await;
     assert_eq!(body_b, "backend-b");
-
-    let _ = gw.kill();
-    let _ = gw.wait();
 }
 
 // ============================================================================
@@ -321,61 +237,17 @@ plugin_configs: []
 #[ignore]
 #[tokio::test(flavor = "multi_thread")]
 async fn functional_host_only_admin_rejects_neither_hosts_nor_listen_path() {
-    use jsonwebtoken::{EncodingKey, Header, encode};
     use serde_json::json;
 
-    let temp_dir = TempDir::new().expect("temp dir");
-    let db_path = temp_dir.path().join("admin.db");
-    let jwt_secret = "functional-host-only-admin-secret-012345";
-    let jwt_issuer = "ferrum-edge-host-only-functional";
-
-    let http_port = ephemeral_port().await;
-    let admin_port = ephemeral_port().await;
-
-    let mut child = std::process::Command::new(gateway_binary_path())
-        .env("FERRUM_MODE", "database")
-        .env("FERRUM_ADMIN_JWT_SECRET", jwt_secret)
-        .env("FERRUM_ADMIN_JWT_ISSUER", jwt_issuer)
-        .env("FERRUM_DB_TYPE", "sqlite")
-        .env(
-            "FERRUM_DB_URL",
-            format!("sqlite:{}?mode=rwc", db_path.to_string_lossy()),
-        )
-        .env("FERRUM_PROXY_HTTP_PORT", http_port.to_string())
-        .env("FERRUM_ADMIN_HTTP_PORT", admin_port.to_string())
-        .env("FERRUM_LOG_LEVEL", "warn")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+    let gw = TestGateway::builder()
+        .mode_database_sqlite()
+        .log_level("warn")
         .spawn()
-        .expect("spawn");
+        .await
+        .expect("start gateway");
 
-    if !wait_for_gateway(admin_port).await {
-        let _ = child.kill();
-        let _ = child.wait();
-        panic!("gateway did not start");
-    }
-
-    // Mint an admin JWT
-    let now = chrono::Utc::now();
-    let claims = json!({
-        "iss": jwt_issuer,
-        "sub": "host-only-admin-test",
-        "iat": now.timestamp(),
-        "nbf": now.timestamp(),
-        "exp": (now + chrono::Duration::seconds(3600)).timestamp(),
-        "jti": uuid::Uuid::new_v4().to_string(),
-    });
-    let token = encode(
-        &Header::new(jsonwebtoken::Algorithm::HS256),
-        &claims,
-        &EncodingKey::from_secret(jwt_secret.as_bytes()),
-    )
-    .unwrap();
-    let auth = format!("Bearer {}", token);
-
+    let auth = gw.auth_header();
     let client = reqwest::Client::new();
-    let base = format!("http://127.0.0.1:{}", admin_port);
 
     // 1) Neither hosts nor listen_path → 400
     let body_neither = json!({
@@ -385,7 +257,7 @@ async fn functional_host_only_admin_rejects_neither_hosts_nor_listen_path() {
         "backend_port": 3000,
     });
     let resp = client
-        .post(format!("{base}/proxies"))
+        .post(gw.admin_url("/proxies"))
         .header("Authorization", &auth)
         .json(&body_neither)
         .send()
@@ -407,7 +279,7 @@ async fn functional_host_only_admin_rejects_neither_hosts_nor_listen_path() {
         "listen_port": ephemeral_port().await,
     });
     let resp = client
-        .post(format!("{base}/proxies"))
+        .post(gw.admin_url("/proxies"))
         .header("Authorization", &auth)
         .json(&body_stream_with_path)
         .send()
@@ -428,7 +300,7 @@ async fn functional_host_only_admin_rejects_neither_hosts_nor_listen_path() {
         "backend_port": 3000,
     });
     let resp = client
-        .post(format!("{base}/proxies"))
+        .post(gw.admin_url("/proxies"))
         .header("Authorization", &auth)
         .json(&body_host_only)
         .send()
@@ -449,7 +321,7 @@ async fn functional_host_only_admin_rejects_neither_hosts_nor_listen_path() {
         "backend_port": 3001,
     });
     let resp = client
-        .post(format!("{base}/proxies"))
+        .post(gw.admin_url("/proxies"))
         .header("Authorization", &auth)
         .json(&body_duplicate)
         .send()
@@ -463,7 +335,7 @@ async fn functional_host_only_admin_rejects_neither_hosts_nor_listen_path() {
 
     // 5) GET /proxies returns listen_path=null for the host-only proxy
     let resp = client
-        .get(format!("{base}/proxies/host-only-ok"))
+        .get(gw.admin_url("/proxies/host-only-ok"))
         .header("Authorization", &auth)
         .send()
         .await
@@ -475,7 +347,4 @@ async fn functional_host_only_admin_rejects_neither_hosts_nor_listen_path() {
         "host-only proxy listen_path should serialize as null, got {:?}",
         body["listen_path"]
     );
-
-    let _ = child.kill();
-    let _ = child.wait();
 }
