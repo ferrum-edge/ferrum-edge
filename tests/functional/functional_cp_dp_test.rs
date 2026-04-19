@@ -150,7 +150,7 @@ fn create_test_proxy(id: &str, listen_path: &str, backend_port: u16) -> Proxy {
         namespace: ferrum_edge::config::types::default_namespace(),
         name: Some(format!("Test Proxy {}", id)),
         hosts: vec![],
-        listen_path: listen_path.to_string(),
+        listen_path: Some(listen_path.to_string()),
         backend_protocol: BackendProtocol::Http,
         backend_host: "127.0.0.1".to_string(),
         backend_port,
@@ -690,12 +690,15 @@ async fn test_namespace_isolation_in_database() {
 
     // Verify same listen_path works across namespaces (both have /api/v1)
     println!("Test 4: Same listen_path in different namespaces...");
-    assert_eq!(prod_config.proxies[0].listen_path, "/api/v1");
+    assert_eq!(
+        prod_config.proxies[0].listen_path.as_deref(),
+        Some("/api/v1")
+    );
     assert!(
         staging_config
             .proxies
             .iter()
-            .any(|p| p.listen_path == "/api/v1")
+            .any(|p| p.listen_path.as_deref() == Some("/api/v1"))
     );
     println!("Cross-namespace listen_path reuse: PASSED");
 

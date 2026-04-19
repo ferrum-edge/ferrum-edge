@@ -9,7 +9,7 @@ fn test_proxy() -> Proxy {
         namespace: ferrum_edge::config::types::default_namespace(),
         name: Some("Test Proxy".into()),
         hosts: vec![],
-        listen_path: "/api".into(),
+        listen_path: Some("/api".to_string()),
         backend_protocol: BackendProtocol::Http,
         backend_host: "localhost".into(),
         backend_port: 3000,

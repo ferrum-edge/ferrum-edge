@@ -27,14 +27,17 @@ On a cache miss, the router scans the pre-built route table. Routes are organize
 | **Wildcard host** | Proxy's `hosts` list contains `*.domain.tld` matching the request host | O(wildcard patterns) linear scan |
 | **Catch-all** | Proxy has empty `hosts` (matches any host) | Direct access |
 
-Within **each** host tier, two path matching strategies are tried in order:
+Within **each** host tier, three path matching strategies are tried in order:
 
 | Priority | Match Type | Description |
 |----------|-----------|-------------|
 | **1st** | Prefix | Longest-prefix match against `listen_path` (pre-sorted by length descending) |
 | **2nd** | Regex | First regex pattern match against `listen_path` starting with `~` (in config order) |
+| **3rd** | Host-only fallback | Proxies with `hosts` set AND `listen_path` omitted — match ANY path under the host when the prefix and regex tiers miss |
 
-**Prefix routes always beat regex routes within the same host tier.** This ensures backward compatibility and optimal performance since prefix matching is cheaper than regex evaluation.
+**Prefix routes always beat regex routes within the same host tier**, and both beat the host-only fallback. This ensures backward compatibility and optimal performance since prefix matching is cheaper than regex evaluation, and host-only is only consulted on a double-miss.
+
+**The host-only tier never appears in the catch-all host bucket.** A proxy with `hosts: []` AND no `listen_path` is rejected at config validation — it would mean "match literally every request on every host" and conflicts with every other catch-all route.
 
 ### Step 3: Cache the Result
 
@@ -92,6 +95,50 @@ proxies:
 | `api.example.com` | `/users/42/orders` | `catchall` | Catch-all prefix `/` beats catch-all regex |
 
 Note the last row: the catch-all prefix route `/` matches `/users/42/orders` before the regex route is checked, because **prefix always beats regex within the same host tier**. To use the regex route for this path, either remove the catch-all or assign the regex route to a more specific host tier.
+
+## Host-only Routing
+
+Set `hosts` without a `listen_path` to route **every request on that host** to one backend:
+
+```yaml
+proxies:
+  - id: api-public
+    hosts: ["api.example.com"]
+    backend_host: api-backend
+    backend_port: 8080
+```
+
+Behavior:
+
+- Every request whose Host header matches `api.example.com` routes to `api-backend:8080`, regardless of path.
+- Request path is forwarded **unchanged** (there is no prefix to strip). `strip_listen_path: true` is a silent no-op.
+- `backend_path`, if set, still prepends to the forwarded path.
+- Host-only is the **last** tier within a host group — any exact path or regex match wins first. This lets you pin `/api/v2/*` to one backend and everything else on the same host to a different backend:
+
+```yaml
+proxies:
+  - id: path-pinned
+    hosts: ["api.example.com"]
+    listen_path: "/api/v2"
+    backend_host: v2-service
+    backend_port: 9000
+
+  - id: host-fallback
+    hosts: ["api.example.com"]
+    backend_host: legacy-service
+    backend_port: 8000
+```
+
+| Request | Matched proxy |
+|---|---|
+| `GET api.example.com/api/v2/items` | `path-pinned` |
+| `GET api.example.com/anything-else` | `host-fallback` |
+
+### Validation rules
+
+- HTTP-family proxies MUST set at least one of `hosts` or `listen_path`. A proxy with neither is rejected at admission (400 from the admin API, config load failure in file mode).
+- Stream proxies (`tcp`/`tcp_tls`/`udp`/`dtls`) MUST NOT set `listen_path` — they route on `listen_port` only. A populated `listen_path` is rejected.
+- Two host-only proxies whose `hosts` overlap are rejected (409 from admin API).
 
 ## Regex Path Routing
 

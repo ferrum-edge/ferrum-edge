@@ -18,7 +18,7 @@ fn create_test_mtls_proxy() -> Proxy {
         namespace: ferrum_edge::config::types::default_namespace(),
         name: Some("mTLS Test Proxy".to_string()),
         hosts: vec![],
-        listen_path: "/mtls-test".to_string(),
+        listen_path: Some("/mtls-test".to_string()),
         backend_protocol: BackendProtocol::Https,
         backend_host: "mtls-backend.example.com".to_string(),
         backend_port: 443,

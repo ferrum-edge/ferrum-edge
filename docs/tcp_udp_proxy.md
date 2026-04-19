@@ -23,11 +23,13 @@ Ferrum Edge supports raw TCP and UDP stream proxying alongside its HTTP-based pr
 
 ### YAML (File Mode)
 
+Stream proxies route on `listen_port` — they MUST NOT set `listen_path`. The
+field is forbidden on stream proxies and rejected at validation.
+
 ```yaml
 proxies:
   - id: "postgres-proxy"
     name: "PostgreSQL Proxy"
-    listen_path: ""           # Auto-generated as __tcp:5432
     listen_port: 5432
     backend_protocol: tcp
     backend_host: "db.internal"
@@ -36,7 +38,6 @@ proxies:
 
   - id: "secure-redis"
     name: "Redis TLS Proxy"
-    listen_path: ""
     listen_port: 6380
     backend_protocol: tcp_tls
     backend_host: "redis.internal"
@@ -47,7 +48,6 @@ proxies:
 
   - id: "dns-proxy"
     name: "DNS Proxy"
-    listen_path: ""
     listen_port: 5353
     backend_protocol: udp
     backend_host: "dns.internal"
@@ -57,7 +57,6 @@ proxies:
 
   - id: "secure-iot"
     name: "IoT DTLS Proxy"
-    listen_path: ""
     listen_port: 5684
     backend_protocol: dtls
     backend_host: "iot-backend.internal"

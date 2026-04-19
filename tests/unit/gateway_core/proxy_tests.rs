@@ -9,7 +9,7 @@ fn test_proxy() -> Proxy {
         namespace: ferrum_edge::config::types::default_namespace(),
         name: Some("Test Proxy".into()),
         hosts: vec![],
-        listen_path: "/api/v1".into(),
+        listen_path: Some("/api/v1".to_string()),
         backend_protocol: BackendProtocol::Http,
         backend_host: "backend.example.com".into(),
         backend_port: 3000,
@@ -61,7 +61,12 @@ fn test_proxy() -> Proxy {
 #[test]
 fn test_build_backend_url_strip() {
     let proxy = test_proxy();
-    let url = build_backend_url(&proxy, "/api/v1/users/123", "", proxy.listen_path.len());
+    let url = build_backend_url(
+        &proxy,
+        "/api/v1/users/123",
+        "",
+        proxy.listen_path.as_deref().map(str::len).unwrap_or(0),
+    );
     assert_eq!(url, "http://backend.example.com:3000/users/123");
 }
 
@@ -69,7 +74,12 @@ fn test_build_backend_url_strip() {
 fn test_build_backend_url_no_strip() {
     let mut proxy = test_proxy();
     proxy.strip_listen_path = false;
-    let url = build_backend_url(&proxy, "/api/v1/users/123", "", proxy.listen_path.len());
+    let url = build_backend_url(
+        &proxy,
+        "/api/v1/users/123",
+        "",
+        proxy.listen_path.as_deref().map(str::len).unwrap_or(0),
+    );
     assert_eq!(url, "http://backend.example.com:3000/api/v1/users/123");
 }
 
@@ -77,7 +87,12 @@ fn test_build_backend_url_no_strip() {
 fn test_build_backend_url_with_backend_path() {
     let mut proxy = test_proxy();
     proxy.backend_path = Some("/internal".into());
-    let url = build_backend_url(&proxy, "/api/v1/users", "", proxy.listen_path.len());
+    let url = build_backend_url(
+        &proxy,
+        "/api/v1/users",
+        "",
+        proxy.listen_path.as_deref().map(str::len).unwrap_or(0),
+    );
     assert_eq!(url, "http://backend.example.com:3000/internal/users");
 }
 
@@ -88,7 +103,7 @@ fn test_build_backend_url_with_query() {
         &proxy,
         "/api/v1/search",
         "q=hello&page=1",
-        proxy.listen_path.len(),
+        proxy.listen_path.as_deref().map(str::len).unwrap_or(0),
     );
     assert_eq!(url, "http://backend.example.com:3000/search?q=hello&page=1");
 }
@@ -103,7 +118,7 @@ fn test_build_backend_url_target_path_overrides_backend_path() {
         "",
         "target.example.com",
         9090,
-        proxy.listen_path.len(),
+        proxy.listen_path.as_deref().map(str::len).unwrap_or(0),
         Some("/v2"),
     );
     assert_eq!(url, "http://target.example.com:9090/v2/users");
@@ -119,7 +134,7 @@ fn test_build_backend_url_target_path_none_uses_backend_path() {
         "",
         "target.example.com",
         9090,
-        proxy.listen_path.len(),
+        proxy.listen_path.as_deref().map(str::len).unwrap_or(0),
         None,
     );
     assert_eq!(url, "http://target.example.com:9090/v1/users");
@@ -134,7 +149,7 @@ fn test_build_backend_url_target_path_with_no_backend_path() {
         "",
         "target.example.com",
         9090,
-        proxy.listen_path.len(),
+        proxy.listen_path.as_deref().map(str::len).unwrap_or(0),
         Some("/service"),
     );
     assert_eq!(url, "http://target.example.com:9090/service/users");
@@ -149,7 +164,7 @@ fn test_build_backend_url_target_path_with_query() {
         "q=hello",
         "target.example.com",
         9090,
-        proxy.listen_path.len(),
+        proxy.listen_path.as_deref().map(str::len).unwrap_or(0),
         Some("/svc"),
     );
     assert_eq!(url, "http://target.example.com:9090/svc/search?q=hello");
@@ -161,13 +176,13 @@ fn test_longest_prefix_match() {
         version: "1".to_string(),
         proxies: vec![
             Proxy {
-                listen_path: "/api".into(),
+                listen_path: Some("/api".to_string()),
                 id: "short".into(),
                 namespace: ferrum_edge::config::types::default_namespace(),
                 ..test_proxy()
             },
             Proxy {
-                listen_path: "/api/v1".into(),
+                listen_path: Some("/api/v1".to_string()),
                 id: "long".into(),
                 namespace: ferrum_edge::config::types::default_namespace(),
                 ..test_proxy()
@@ -190,7 +205,7 @@ fn test_no_match() {
     let config = GatewayConfig {
         version: "1".to_string(),
         proxies: vec![Proxy {
-            listen_path: "/api".into(),
+            listen_path: Some("/api".to_string()),
             ..test_proxy()
         }],
         consumers: vec![],

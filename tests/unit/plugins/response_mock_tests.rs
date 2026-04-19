@@ -10,7 +10,7 @@ use super::plugin_utils::create_test_proxy;
 
 fn make_proxy_with_listen_path(listen_path: &str) -> Arc<ferrum_edge::config::types::Proxy> {
     let mut proxy = create_test_proxy();
-    proxy.listen_path = listen_path.to_string();
+    proxy.listen_path = Some(listen_path.to_string());
     Arc::new(proxy)
 }
 

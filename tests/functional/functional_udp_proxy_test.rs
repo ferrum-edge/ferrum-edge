@@ -117,7 +117,6 @@ async fn test_udp_proxy_plain_datagram_forwarding() {
             r#"
 proxies:
   - id: "udp-echo"
-    listen_path: ""
     listen_port: {proxy_port}
     backend_protocol: udp
     backend_host: "127.0.0.1"
@@ -193,7 +192,6 @@ async fn test_udp_proxy_multiple_clients() {
             r#"
 proxies:
   - id: "udp-multi-client"
-    listen_path: ""
     listen_port: {proxy_port}
     backend_protocol: udp
     backend_host: "127.0.0.1"
@@ -265,7 +263,6 @@ async fn test_udp_proxy_session_timeout() {
             r#"
 proxies:
   - id: "udp-timeout"
-    listen_path: ""
     listen_port: {proxy_port}
     backend_protocol: udp
     backend_host: "127.0.0.1"
@@ -342,7 +339,6 @@ async fn test_udp_proxy_large_datagram() {
             r#"
 proxies:
   - id: "udp-large"
-    listen_path: ""
     listen_port: {proxy_port}
     backend_protocol: udp
     backend_host: "127.0.0.1"
@@ -412,7 +408,6 @@ async fn test_udp_proxy_dtls_backend() {
             r#"
 proxies:
   - id: "dtls-proxy"
-    listen_path: ""
     listen_port: {proxy_port}
     backend_protocol: dtls
     backend_host: "127.0.0.1"
@@ -482,7 +477,6 @@ async fn test_udp_proxy_dtls_backend_multiple_clients() {
             r#"
 proxies:
   - id: "dtls-multi"
-    listen_path: ""
     listen_port: {proxy_port}
     backend_protocol: dtls
     backend_host: "127.0.0.1"
@@ -556,7 +550,6 @@ async fn test_udp_proxy_frontend_dtls_termination() {
             r#"
 proxies:
   - id: "frontend-dtls"
-    listen_path: ""
     listen_port: {proxy_port}
     backend_protocol: udp
     backend_host: "127.0.0.1"
@@ -640,7 +633,6 @@ async fn test_udp_proxy_full_dtls_e2e() {
             r#"
 proxies:
   - id: "full-dtls"
-    listen_path: ""
     listen_port: {proxy_port}
     backend_protocol: dtls
     backend_host: "127.0.0.1"

@@ -66,7 +66,7 @@ pub fn create_test_proxy() -> Proxy {
         namespace: default_namespace(),
         name: Some("Test Proxy".to_string()),
         hosts: vec![],
-        listen_path: "/test".to_string(),
+        listen_path: Some("/test".to_string()),
         backend_protocol: BackendProtocol::Http,
         backend_host: "localhost".to_string(),
         backend_port: 3000,

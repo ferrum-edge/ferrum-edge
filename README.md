@@ -307,9 +307,10 @@ Drop-in custom plugins via `custom_plugins/` directory — auto-discovered at bu
 
 - **Longest prefix match** on `listen_path` with unique path enforcement
 - **Host-based routing** with exact and wildcard prefix support (`*.example.com`)
+- **Host-only routing** — omit `listen_path` on HTTP proxies to match any path under the specified hosts
 - **Regex routes** with auto-anchored full-path matching (prefix with `~`)
 - **Method filtering** via `allowed_methods` per-proxy (405 on mismatch)
-- **Path forwarding**: `strip_listen_path` (default: true), optional `backend_path` prefix
+- **Path forwarding**: `strip_listen_path` (default: true; no-op on host-only proxies), optional `backend_path` prefix
 
 See [docs/routing.md](docs/routing.md) for detailed routing behavior.
 

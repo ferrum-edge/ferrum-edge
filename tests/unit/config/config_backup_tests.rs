@@ -32,7 +32,7 @@ fn test_load_config_backup_valid_json() {
     let loaded = loaded.unwrap();
     assert_eq!(loaded.proxies.len(), 1);
     assert_eq!(loaded.proxies[0].id, "proxy-1");
-    assert_eq!(loaded.proxies[0].listen_path, "/api");
+    assert_eq!(loaded.proxies[0].listen_path.as_deref(), Some("/api"));
     assert_eq!(loaded.proxies[0].backend_host, "localhost");
 }
 
@@ -67,13 +67,15 @@ fn test_load_config_backup_empty_config() {
 }
 
 #[test]
-fn test_load_config_backup_preserves_stream_proxy_listen_path() {
+fn test_load_config_backup_stream_proxy_has_no_listen_path() {
+    // Stream proxies route on listen_port and never carry a listen_path.
+    // The loader accepts backups that omit the field entirely — serde(default)
+    // deserializes to None.
     let json = r#"{
         "version": "1",
         "proxies": [{
             "id": "tcp-proxy-1",
             "name": "tcp-test",
-            "listen_path": "/ignored",
             "backend_host": "10.0.0.1",
             "backend_port": 5432,
             "backend_protocol": "tcp",
@@ -87,9 +89,10 @@ fn test_load_config_backup_preserves_stream_proxy_listen_path() {
     let (_tmp, path) = write_tmp_file(json);
     let loaded = load_config_backup(&path).unwrap();
     assert_eq!(
-        loaded.proxies[0].listen_path, "/ignored",
-        "backup loading should preserve the user-facing stream listen_path"
+        loaded.proxies[0].listen_path, None,
+        "stream proxy backups must deserialize to listen_path=None"
     );
+    assert_eq!(loaded.proxies[0].listen_port, Some(9999));
 }
 
 #[test]

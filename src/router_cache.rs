@@ -19,6 +19,7 @@ use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use tracing::{debug, warn};
 
 use crate::config::types::{GatewayConfig, Proxy, wildcard_matches};
+use crate::config_delta::AffectedRoutes;
 
 thread_local! {
     /// Thread-local buffer for router cache key construction.
@@ -106,10 +107,15 @@ impl IndexedRegexRoutes {
 /// Routes are partitioned into three tiers searched in priority order:
 /// 1. Exact host match (HashMap O(1) lookup)
 /// 2. Wildcard host match (linear scan of wildcard patterns — typically very few)
-/// 3. Catch-all (proxies with empty `hosts` — today's behavior)
+/// 3. Catch-all (proxies with empty `hosts`)
 ///
-/// Within each tier, prefix routes are checked first (longest-prefix matching),
-/// then regex routes (first match in config order).
+/// Within each tier the order is:
+/// a. Prefix listen_path routes (longest-prefix matching)
+/// b. Regex listen_path routes (first match in config order)
+/// c. Host-only routes (`listen_path.is_none()`) — fallback catch-all for the host
+///
+/// Host-only routes never exist in the catch-all tier: a proxy with both
+/// `hosts.is_empty()` and `listen_path.is_none()` is rejected at config validation.
 struct HostRouteTable {
     /// Exact host → indexed prefix route entries (longest listen_path first + HashMap index).
     exact_hosts: HashMap<String, IndexedPrefixRoutes>,
@@ -124,8 +130,15 @@ struct HostRouteTable {
     wildcard_hosts_regex: Vec<(String, IndexedRegexRoutes)>,
     /// Catch-all regex routes with RegexSet index.
     catch_all_regex: IndexedRegexRoutes,
+    /// Exact host → host-only proxy (`listen_path.is_none()`). Fallback when
+    /// no prefix or regex route matches the request path under `host`.
+    exact_hosts_host_only: HashMap<String, Arc<Proxy>>,
+    /// Wildcard host → host-only proxy. Sorted by pattern length descending.
+    wildcard_hosts_host_only: Vec<(String, Arc<Proxy>)>,
     /// Pre-computed flag: true if any regex routes exist (skip regex path entirely when false).
     has_regex_routes: bool,
+    /// Pre-computed flag: true if any host-only routes exist (skip host-only path entirely when false).
+    has_host_only_routes: bool,
 }
 
 /// Cached regex match result (stored in regex_cache).
@@ -348,9 +361,12 @@ impl RouterCache {
             if let Some(entry) = self.prefix_cache.get(buf.as_str()) {
                 self.frequency_sketch.increment(&buf);
                 return Some(entry.value().as_ref().map(|proxy| RouteMatch {
+                    // Host-only proxies (listen_path == None) match any path and
+                    // strip nothing; `matched_prefix_len` is 0. Otherwise, use
+                    // the listen_path length as before.
+                    matched_prefix_len: proxy.listen_path.as_deref().map(str::len).unwrap_or(0),
                     proxy: Arc::clone(proxy),
                     path_params: Vec::new(),
-                    matched_prefix_len: proxy.listen_path.len(),
                 }));
             }
 
@@ -424,14 +440,17 @@ impl RouterCache {
 
     /// Search the route table for a matching proxy.
     ///
-    /// Within each host tier: prefix routes first, then regex routes.
+    /// Within each host tier, matching order is:
+    ///   prefix routes → regex routes → host-only fallback.
+    /// Host tiers are searched exact → wildcard → catch-all. Catch-all has no
+    /// host-only tier (validation forbids empty-hosts + no-listen-path).
     fn search_route_table(
         table: &HostRouteTable,
         host: Option<&str>,
         path: &str,
     ) -> Option<RouteMatch> {
         if let Some(host) = host {
-            // 1. Exact host match — prefix then regex
+            // 1. Exact host match — prefix, regex, then host-only
             if let Some(routes) = table.exact_hosts.get(host)
                 && let Some(route_match) = find_prefix_match_indexed(routes, path)
             {
@@ -443,8 +462,17 @@ impl RouterCache {
             {
                 return Some(route_match);
             }
+            if table.has_host_only_routes
+                && let Some(proxy) = table.exact_hosts_host_only.get(host)
+            {
+                return Some(RouteMatch {
+                    proxy: Arc::clone(proxy),
+                    path_params: Vec::new(),
+                    matched_prefix_len: 0,
+                });
+            }
 
-            // 2. Wildcard host match — prefix then regex
+            // 2. Wildcard host match — prefix, regex, then host-only
             for (pattern, routes) in &table.wildcard_hosts {
                 if wildcard_matches(pattern, host)
                     && let Some(route_match) = find_prefix_match_indexed(routes, path)
@@ -461,9 +489,21 @@ impl RouterCache {
                     }
                 }
             }
+            if table.has_host_only_routes {
+                for (pattern, proxy) in &table.wildcard_hosts_host_only {
+                    if wildcard_matches(pattern, host) {
+                        return Some(RouteMatch {
+                            proxy: Arc::clone(proxy),
+                            path_params: Vec::new(),
+                            matched_prefix_len: 0,
+                        });
+                    }
+                }
+            }
         }
 
-        // 3. Catch-all — prefix then regex
+        // 3. Catch-all — prefix then regex (no host-only tier: validation
+        //    forbids empty-hosts + no-listen-path).
         if let Some(route_match) = find_prefix_match_indexed(&table.catch_all, path) {
             return Some(route_match);
         }
@@ -525,6 +565,8 @@ impl RouterCache {
             + exact_regex
             + wildcard_regex
             + table.catch_all_regex.entries.len()
+            + table.exact_hosts_host_only.len()
+            + table.wildcard_hosts_host_only.len()
     }
 
     /// Evict low-frequency entries from the prefix cache using frequency-guided sampling.
@@ -563,37 +605,45 @@ impl RouterCache {
     }
 
     /// Incrementally update the route table and surgically invalidate only
-    /// the path cache entries affected by changed routes.
+    /// the cache entries affected by changed routes.
     ///
     /// The route table itself is rebuilt (cheap O(n log n) sort) because
     /// insertion order matters for longest-prefix matching. But the caches
     /// — which are the expensive things to lose — are preserved for all
-    /// unaffected routes. Only paths related to changed listen_paths are evicted.
-    pub fn apply_delta(&self, config: &GatewayConfig, affected_listen_paths: &[String]) {
+    /// unaffected routes. Only entries related to changed routes are evicted.
+    pub fn apply_delta(&self, config: &GatewayConfig, affected: &AffectedRoutes) {
         // Rebuild the sorted route table (cheap, O(n log n))
         let table = Self::build_route_table(config);
         self.route_table.store(Arc::new(table));
 
-        if affected_listen_paths.is_empty() {
+        if affected.is_empty() {
             return;
         }
 
-        // Separate affected paths into prefix patterns and regex patterns
-        let (regex_patterns, prefix_patterns): (Vec<&String>, Vec<&String>) = affected_listen_paths
+        // Separate affected listen_paths into prefix patterns and regex patterns
+        let (regex_patterns, prefix_patterns): (Vec<&String>, Vec<&String>) = affected
+            .listen_paths
             .iter()
             .partition(|lp| lp.starts_with('~'));
 
         // Surgically invalidate prefix cache entries affected by changed routes.
-        if !prefix_patterns.is_empty() {
+        // Also invalidate any prefix-cache entry whose host matches a
+        // changed host-only proxy — adding or removing a host-only proxy
+        // can change whether a previously-unmatched path falls through to a
+        // host-only fallback, or whether a previously-matched path now has
+        // different precedence.
+        if !prefix_patterns.is_empty() || !affected.host_only_hosts.is_empty() {
             let before = self.prefix_cache.len();
             self.prefix_cache.retain(|cached_key, _| {
-                let cached_path = cached_key
-                    .find('\0')
-                    .map(|i| &cached_key[i + 1..])
-                    .unwrap_or(cached_key.as_str());
-                !prefix_patterns
+                let (cached_host, cached_path) = split_cache_key(cached_key);
+                let path_hit = prefix_patterns
                     .iter()
-                    .any(|lp| cached_path.starts_with(lp.as_str()) || lp.starts_with(cached_path))
+                    .any(|lp| cached_path.starts_with(lp.as_str()) || lp.starts_with(cached_path));
+                let host_hit = affected
+                    .host_only_hosts
+                    .iter()
+                    .any(|h| host_matches_for_eviction(h, cached_host));
+                !(path_hit || host_hit)
             });
             let evicted = before - self.prefix_cache.len();
             if evicted > 0 {
@@ -606,6 +656,12 @@ impl RouterCache {
 
         // For regex route changes, clear the entire regex cache (regex patterns
         // can match arbitrary paths, so surgical invalidation isn't reliable).
+        // For host-only changes, surgically evict regex cache entries whose
+        // host matches the affected pattern. Host-tier precedence can change
+        // regex outcomes (e.g. a cached catch-all regex match for
+        // `api.example.com` must be invalidated when a host-only proxy is
+        // added for that host — the new host-only tier takes precedence once
+        // the prefix + regex tiers for that exact host miss).
         if !regex_patterns.is_empty() {
             let before = self.regex_cache.len();
             self.regex_cache.clear();
@@ -613,6 +669,23 @@ impl RouterCache {
                 debug!(
                     "Router cache: cleared {} regex cache entries due to regex route change",
                     before
+                );
+            }
+        } else if !affected.host_only_hosts.is_empty() {
+            let before = self.regex_cache.len();
+            self.regex_cache.retain(|cached_key, _| {
+                let (cached_host, _) = split_cache_key(cached_key);
+                let host_hit = affected
+                    .host_only_hosts
+                    .iter()
+                    .any(|h| host_matches_for_eviction(h, cached_host));
+                !host_hit
+            });
+            let evicted = before - self.regex_cache.len();
+            if evicted > 0 {
+                debug!(
+                    "Router cache: surgically evicted {} regex cache entries for host-only change",
+                    evicted
                 );
             }
         }
@@ -625,10 +698,11 @@ impl RouterCache {
 
     /// Build a pre-computed host route table from config.
     ///
-    /// Partitions proxies into prefix/regex and by host tier.
+    /// Partitions proxies into prefix / regex / host-only and by host tier.
     /// Prefix routes are sorted by listen_path length descending within each tier
     /// and indexed in a HashMap for O(path_depth) lookup instead of O(n) linear scan.
-    /// Regex patterns are pre-compiled at build time.
+    /// Regex patterns are pre-compiled at build time. Host-only routes (no
+    /// listen_path) are stored as the fallback tier per host.
     fn build_route_table(config: &GatewayConfig) -> HostRouteTable {
         let mut exact_hosts: HashMap<String, Vec<RouteEntry>> = HashMap::new();
         let mut wildcard_hosts: HashMap<String, Vec<RouteEntry>> = HashMap::new();
@@ -636,6 +710,8 @@ impl RouterCache {
         let mut exact_hosts_regex: HashMap<String, Vec<RegexRouteEntry>> = HashMap::new();
         let mut wildcard_hosts_regex: HashMap<String, Vec<RegexRouteEntry>> = HashMap::new();
         let mut catch_all_regex: Vec<RegexRouteEntry> = Vec::new();
+        let mut exact_hosts_host_only: HashMap<String, Arc<Proxy>> = HashMap::new();
+        let mut wildcard_hosts_host_only: HashMap<String, Arc<Proxy>> = HashMap::new();
 
         for proxy in config
             .proxies
@@ -644,9 +720,35 @@ impl RouterCache {
         {
             let arc_proxy = Arc::new(proxy.clone());
 
-            if proxy.listen_path.starts_with('~') {
+            let Some(listen_path) = proxy.listen_path.as_deref() else {
+                // Host-only proxy: matches any path under its hosts.
+                // A proxy with empty hosts AND no listen_path is rejected at
+                // validation, so `proxy.hosts` is guaranteed non-empty here.
+                if proxy.hosts.is_empty() {
+                    warn!(
+                        proxy_id = %proxy.id,
+                        "Host-only proxy with empty hosts should have been rejected at validation; skipping"
+                    );
+                    continue;
+                }
+                for host in &proxy.hosts {
+                    let target = if host.starts_with("*.") {
+                        &mut wildcard_hosts_host_only
+                    } else {
+                        &mut exact_hosts_host_only
+                    };
+                    // `validate_unique_listen_paths` already rejects overlapping
+                    // host-only proxies, so duplicate keys here shouldn't occur;
+                    // if they do, first-wins matches prefix-route semantics.
+                    target
+                        .entry(host.clone())
+                        .or_insert_with(|| Arc::clone(&arc_proxy));
+                }
+                continue;
+            };
+
+            if let Some(pattern_str) = listen_path.strip_prefix('~') {
                 // Regex route: compile the pattern
-                let pattern_str = &proxy.listen_path[1..];
                 // Auto-anchor for full-path matching (^pattern$)
                 let anchored = crate::config::types::anchor_regex_pattern(pattern_str);
                 let compiled = match Regex::new(&anchored) {
@@ -702,13 +804,13 @@ impl RouterCache {
                 // Prefix route (existing behavior)
                 if proxy.hosts.is_empty() {
                     catch_all.push(RouteEntry {
-                        listen_path: proxy.listen_path.clone(),
+                        listen_path: listen_path.to_string(),
                         proxy: Arc::clone(&arc_proxy),
                     });
                 } else {
                     for host in &proxy.hosts {
                         let entry = RouteEntry {
-                            listen_path: proxy.listen_path.clone(),
+                            listen_path: listen_path.to_string(),
                             proxy: Arc::clone(&arc_proxy),
                         };
                         if host.starts_with("*.") {
@@ -766,6 +868,15 @@ impl RouterCache {
             || !wildcard_regex_indexed.is_empty()
             || !catch_all_regex_indexed.is_empty();
 
+        // Sort wildcard host-only entries by pattern length descending so
+        // more-specific wildcards match first (same ordering as wildcard_hosts).
+        let mut wildcard_host_only_vec: Vec<(String, Arc<Proxy>)> =
+            wildcard_hosts_host_only.into_iter().collect();
+        wildcard_host_only_vec.sort_by_key(|(host, _)| std::cmp::Reverse(host.len()));
+
+        let has_host_only_routes =
+            !exact_hosts_host_only.is_empty() || !wildcard_host_only_vec.is_empty();
+
         HostRouteTable {
             exact_hosts: exact_hosts_indexed,
             wildcard_hosts: wildcard_indexed,
@@ -773,7 +884,10 @@ impl RouterCache {
             exact_hosts_regex: exact_hosts_regex_indexed,
             wildcard_hosts_regex: wildcard_regex_indexed,
             catch_all_regex: catch_all_regex_indexed,
+            exact_hosts_host_only,
+            wildcard_hosts_host_only: wildcard_host_only_vec,
             has_regex_routes,
+            has_host_only_routes,
         }
     }
 }
@@ -974,9 +1088,41 @@ fn find_regex_match(routes: &[RegexRouteEntry], path: &str) -> Option<RouteMatch
     None
 }
 
+/// Split a cache key into (host, path) where the two are separated by '\0'.
+/// Host is empty when the original request had no host.
+fn split_cache_key(key: &str) -> (&str, &str) {
+    match key.find('\0') {
+        Some(i) => (&key[..i], &key[i + 1..]),
+        None => ("", key),
+    }
+}
+
+/// Returns true when `cached_host` would have been routed through an
+/// affected host-only pattern. Uses the same matching semantics as the
+/// router (`wildcard_matches`) so eviction never over-matches unrelated
+/// cache entries — e.g. pattern `*.example.com` must not evict
+/// `notexample.com` or the bare `example.com`.
+fn host_matches_for_eviction(affected_host: &str, cached_host: &str) -> bool {
+    if cached_host.is_empty() {
+        return false;
+    }
+    if affected_host.starts_with("*.") {
+        // Wildcard pattern → use the router's wildcard semantics.
+        // `wildcard_matches` requires exactly one label before the suffix
+        // and explicitly rejects the bare base domain.
+        wildcard_matches(affected_host, cached_host)
+    } else {
+        // Exact host → HTTP hostnames are case-insensitive.
+        cached_host.eq_ignore_ascii_case(affected_host)
+    }
+}
+
 /// Check if a proxy uses a regex listen_path.
 fn is_regex_proxy(proxy: &Proxy) -> bool {
-    proxy.listen_path.starts_with('~')
+    proxy
+        .listen_path
+        .as_deref()
+        .is_some_and(|p| p.starts_with('~'))
 }
 
 /// Evict entries from a DashMap using frequency-guided sampling.
@@ -1240,5 +1386,79 @@ mod tests {
         map.insert("a".into(), ());
         let removed = frequency_aware_evict(&map, &sketch, 3);
         assert_eq!(removed, 0);
+    }
+
+    // ── host_matches_for_eviction tests ──────────────────────────────────
+    //
+    // Must mirror the router's `wildcard_matches` semantics exactly so cache
+    // eviction never over-matches unrelated hosts (which would flush valid
+    // cache entries on every host-only add/remove).
+
+    #[test]
+    fn eviction_exact_host_matches_case_insensitively() {
+        assert!(host_matches_for_eviction(
+            "api.example.com",
+            "api.example.com"
+        ));
+        assert!(host_matches_for_eviction(
+            "api.example.com",
+            "API.EXAMPLE.COM"
+        ));
+    }
+
+    #[test]
+    fn eviction_exact_host_does_not_match_different_host() {
+        assert!(!host_matches_for_eviction(
+            "api.example.com",
+            "other.example.com"
+        ));
+        assert!(!host_matches_for_eviction(
+            "api.example.com",
+            "api.example.org"
+        ));
+    }
+
+    #[test]
+    fn eviction_wildcard_matches_single_label_subdomain() {
+        assert!(host_matches_for_eviction(
+            "*.example.com",
+            "api.example.com"
+        ));
+        assert!(host_matches_for_eviction(
+            "*.example.com",
+            "www.example.com"
+        ));
+    }
+
+    #[test]
+    fn eviction_wildcard_does_not_match_base_domain() {
+        // Router's wildcard_matches rejects the bare suffix — eviction must too.
+        assert!(!host_matches_for_eviction("*.example.com", "example.com"));
+    }
+
+    #[test]
+    fn eviction_wildcard_does_not_match_deep_subdomain() {
+        // *.example.com requires exactly one label before the suffix.
+        assert!(!host_matches_for_eviction(
+            "*.example.com",
+            "api.v2.example.com"
+        ));
+    }
+
+    #[test]
+    fn eviction_wildcard_does_not_match_lookalike_suffix() {
+        // Without the dot boundary, `notexample.com` ends with `example.com`
+        // but is NOT a subdomain. Router wouldn't route it here either.
+        assert!(!host_matches_for_eviction(
+            "*.example.com",
+            "notexample.com"
+        ));
+        assert!(!host_matches_for_eviction("*.example.com", "example.org"));
+    }
+
+    #[test]
+    fn eviction_empty_cached_host_never_matches() {
+        assert!(!host_matches_for_eviction("api.example.com", ""));
+        assert!(!host_matches_for_eviction("*.example.com", ""));
     }
 }

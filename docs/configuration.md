@@ -318,11 +318,12 @@ plugin_configs:
 
 Stream proxies use `listen_port` instead of `listen_path` and bind to dedicated ports:
 
+Stream proxies route on `listen_port` and MUST NOT set `listen_path`.
+
 ```yaml
 proxies:
   # TCP proxy with TLS origination to backend
   - id: "postgres-proxy"
-    listen_path: ""
     listen_port: 5432
     backend_protocol: tcp_tls
     backend_host: "db.internal"
@@ -330,7 +331,6 @@ proxies:
 
   # UDP proxy with DTLS encryption to backend
   - id: "iot-proxy"
-    listen_path: ""
     listen_port: 5684
     backend_protocol: dtls
     backend_host: "iot-backend.internal"
@@ -340,7 +340,6 @@ proxies:
 
   # Full DTLS e2e: DTLS client → gateway → DTLS backend
   - id: "secure-iot"
-    listen_path: ""
     listen_port: 5685
     backend_protocol: dtls
     backend_host: "secure-iot.internal"

@@ -73,7 +73,7 @@ fn create_test_proxy(id: &str, listen_path: &str, backend_port: u16) -> Proxy {
         namespace: ferrum_edge::config::types::default_namespace(),
         name: Some(format!("Resilience Proxy {}", id)),
         hosts: vec![],
-        listen_path: listen_path.to_string(),
+        listen_path: Some(listen_path.to_string()),
         backend_protocol: BackendProtocol::Http,
         backend_host: "127.0.0.1".to_string(),
         backend_port,

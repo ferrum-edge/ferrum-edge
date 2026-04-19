@@ -1024,8 +1024,9 @@ async fn handle_h3_request(
         }
     };
 
-    // Build backend URL — target-aware when upstream is configured
-    let strip_len = proxy.listen_path.len();
+    // Build backend URL — target-aware when upstream is configured.
+    // Host-only proxies (listen_path None) have no prefix to strip; use 0.
+    let strip_len = proxy.listen_path.as_deref().map(str::len).unwrap_or(0);
     let backend_url = if let Some(ref target) = upstream_target {
         crate::proxy::build_backend_url_with_target(
             &proxy,

@@ -3,7 +3,6 @@
 proxies:
   - id: "udp-echo"
     name: "UDP Echo Proxy"
-    listen_path: ""
     listen_port: 5003
     backend_protocol: udp
     backend_host: "127.0.0.1"

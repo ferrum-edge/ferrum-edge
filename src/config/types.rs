@@ -776,7 +776,12 @@ pub enum PluginScope {
     ProxyGroup,
 }
 
-/// A proxy resource defines a route from a listen_path to a backend.
+/// A proxy resource defines a route to a backend.
+///
+/// HTTP-family proxies route on `hosts` + `listen_path`. At least one of the two
+/// must be set; if both are empty/absent the config is rejected. Stream-family
+/// proxies (`tcp`/`tcp_tls`/`udp`/`dtls`) route on `listen_port` and MUST NOT
+/// set `listen_path`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Proxy {
     #[serde(default)]
@@ -789,16 +794,32 @@ pub struct Proxy {
     #[serde(default = "default_namespace")]
     pub namespace: String,
     /// Optional list of hostnames this proxy matches on.
-    /// Empty means match all hosts (backward compatible catch-all).
+    /// Empty means match all hosts (catch-all).
     /// Supports exact hostnames and single-level wildcard prefixes (e.g., "*.example.com").
+    /// For HTTP-family proxies, either `hosts` or `listen_path` must be set
+    /// (both may be set together).
     #[serde(default)]
     pub hosts: Vec<String>,
-    pub listen_path: String,
+    /// Path prefix or `~regex` this proxy matches.
+    /// - HTTP-family proxies: required UNLESS `hosts` is non-empty. When both
+    ///   `hosts` is empty and this is `None`, the config is rejected — that
+    ///   would be "match literally everything" and collides with every
+    ///   other catch-all route.
+    /// - When `None` on an HTTP proxy, the proxy matches any path under the
+    ///   specified hosts. `strip_listen_path` is a no-op; `backend_path`
+    ///   (if set) prepends to the forwarded path.
+    /// - Stream-family proxies: MUST be `None`. Stream proxies route on
+    ///   `listen_port`.
+    #[serde(default)]
+    pub listen_path: Option<String>,
     pub backend_protocol: BackendProtocol,
     pub backend_host: String,
     pub backend_port: u16,
     #[serde(default)]
     pub backend_path: Option<String>,
+    /// When true, strip the matched `listen_path` prefix from the forwarded
+    /// request path. No-op when `listen_path` is `None` (host-only proxy) —
+    /// there is no prefix to strip.
     #[serde(default = "default_true")]
     pub strip_listen_path: bool,
     #[serde(default)]
@@ -1081,29 +1102,33 @@ pub fn anchor_regex_pattern(pattern: &str) -> String {
 impl GatewayConfig {
     /// Validate that all proxy (host, listen_path) combinations are unique.
     ///
-    /// Two proxies may share the same `listen_path` if their `hosts` sets are
-    /// completely disjoint. A proxy with empty `hosts` (catch-all) conflicts
-    /// with any other proxy that has the same `listen_path` and also has empty
-    /// hosts. A specific host in one proxy's `hosts` conflicts if another proxy
-    /// with the same `listen_path` lists the same host or is a catch-all.
+    /// HTTP-family proxies can conflict in two ways:
+    /// - Path-carrying proxies share a `listen_path` and have overlapping
+    ///   `hosts` (or both use an empty/catch-all host list).
+    /// - Host-only proxies (`listen_path.is_none()`) share any host with
+    ///   another host-only proxy. Host-only proxies cannot have empty
+    ///   `hosts` — that combination is rejected by `validate_fields_inner`.
+    ///
+    /// Stream proxies are skipped (they route on `listen_port`, not path).
     pub fn validate_unique_listen_paths(&self) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
 
-        // Group proxies by listen_path — only proxies sharing the same path can conflict.
-        // This reduces O(n^2) all-pairs comparison to O(n) grouping + O(k^2) within each
-        // group, where k is the number of proxies sharing a single listen_path (typically 1).
+        // Split proxies into two buckets: those with an explicit listen_path and
+        // host-only proxies. Only proxies in the same bucket AND the same path
+        // (for the path bucket) can conflict.
         let mut by_path: HashMap<&str, Vec<&Proxy>> = HashMap::new();
+        let mut host_only: Vec<&Proxy> = Vec::new();
         for proxy in &self.proxies {
             if proxy.backend_protocol.is_stream_proxy() {
                 continue;
             }
-            by_path
-                .entry(proxy.listen_path.as_str())
-                .or_default()
-                .push(proxy);
+            match proxy.listen_path.as_deref() {
+                Some(path) => by_path.entry(path).or_default().push(proxy),
+                None => host_only.push(proxy),
+            }
         }
 
-        for group in by_path.values() {
+        for (path, group) in &by_path {
             if group.len() < 2 {
                 continue;
             }
@@ -1113,15 +1138,26 @@ impl GatewayConfig {
                         if proxy_a.hosts.is_empty() && proxy_b.hosts.is_empty() {
                             errors.push(format!(
                                 "Duplicate listen_path '{}' found in proxy '{}' (conflicts with '{}')",
-                                proxy_a.listen_path, proxy_b.id, proxy_a.id
+                                path, proxy_b.id, proxy_a.id
                             ));
                         } else {
                             errors.push(format!(
                                 "Overlapping host+listen_path for '{}' in proxy '{}' (conflicts with '{}')",
-                                proxy_a.listen_path, proxy_b.id, proxy_a.id
+                                path, proxy_b.id, proxy_a.id
                             ));
                         }
                     }
+                }
+            }
+        }
+
+        for (i, proxy_a) in host_only.iter().enumerate() {
+            for proxy_b in host_only.iter().skip(i + 1) {
+                if hosts_overlap(&proxy_a.hosts, &proxy_b.hosts) {
+                    errors.push(format!(
+                        "Overlapping host-only proxies '{}' and '{}' — each host can route to at most one host-only proxy",
+                        proxy_b.id, proxy_a.id
+                    ));
                 }
             }
         }
@@ -1166,8 +1202,10 @@ impl GatewayConfig {
             if proxy.backend_protocol.is_stream_proxy() {
                 continue;
             }
-            if proxy.listen_path.starts_with('~') {
-                let pattern = &proxy.listen_path[1..];
+            let Some(path) = proxy.listen_path.as_deref() else {
+                continue;
+            };
+            if let Some(pattern) = path.strip_prefix('~') {
                 if pattern.is_empty() {
                     errors.push(format!(
                         "Proxy '{}': regex listen_path '~' has empty pattern",
@@ -1179,7 +1217,7 @@ impl GatewayConfig {
                 if let Err(e) = Regex::new(&anchored) {
                     errors.push(format!(
                         "Proxy '{}': invalid regex listen_path '{}': {}",
-                        proxy.id, proxy.listen_path, e
+                        proxy.id, path, e
                     ));
                 }
             }
@@ -1737,27 +1775,6 @@ impl GatewayConfig {
             Err(errors)
         }
     }
-
-    /// Normalize stream proxy listen_paths to synthetic values.
-    ///
-    /// TCP/UDP proxies don't use URL path routing. This sets their `listen_path`
-    /// to a synthetic value like `__tcp:5432` or `__udp:5353` so the existing
-    /// UNIQUE constraint and config delta logic works unchanged.
-    #[allow(dead_code)]
-    pub fn normalize_stream_proxy_paths(&mut self) {
-        for proxy in &mut self.proxies {
-            if proxy.backend_protocol.is_stream_proxy()
-                && let Some(port) = proxy.listen_port
-            {
-                let prefix = if proxy.backend_protocol.is_udp() {
-                    "__udp"
-                } else {
-                    "__tcp"
-                };
-                proxy.listen_path = format!("{}:{}", prefix, port);
-            }
-        }
-    }
 }
 
 fn default_true() -> bool {
@@ -2078,25 +2095,52 @@ impl Proxy {
         }
 
         // listen_path
-        if self.listen_path.len() > MAX_LISTEN_PATH_LENGTH {
-            errors.push(format!(
-                "listen_path must not exceed {} characters (got {})",
-                MAX_LISTEN_PATH_LENGTH,
-                self.listen_path.len()
-            ));
-        }
-        if contains_control_chars(&self.listen_path) {
-            errors.push("listen_path must not contain control characters".to_string());
-        }
-        if !is_stream_proxy {
-            if self.listen_path.is_empty() {
-                errors.push("listen_path must be non-empty".to_string());
-            } else if self.listen_path.starts_with('~') {
-                if self.listen_path.len() == 1 {
-                    errors.push("regex listen_path '~' has empty pattern".to_string());
+        //
+        // Contract:
+        // - Stream proxies MUST have `listen_path.is_none()`.
+        // - HTTP-family proxies require `hosts.is_non_empty() || listen_path.is_some()`.
+        // - `listen_path == Some("")` is invalid input (rejected here rather than
+        //   silently normalized to None) — catches mis-written fixtures loudly.
+        if is_stream_proxy {
+            if self.listen_path.is_some() {
+                errors.push(format!(
+                    "Stream proxy '{}' (protocol {}) must not set listen_path — stream proxies route on listen_port",
+                    self.id, self.backend_protocol
+                ));
+            }
+        } else {
+            match self.listen_path.as_deref() {
+                None => {
+                    if self.hosts.is_empty() {
+                        errors.push(
+                            "HTTP proxy requires at least one of `hosts` or `listen_path` — a proxy with neither is a catch-all for every request and collides with every other catch-all".to_string(),
+                        );
+                    }
                 }
-            } else if !self.listen_path.starts_with('/') {
-                errors.push("listen_path must start with '/' or '~' (regex)".to_string());
+                Some(path) => {
+                    if path.len() > MAX_LISTEN_PATH_LENGTH {
+                        errors.push(format!(
+                            "listen_path must not exceed {} characters (got {})",
+                            MAX_LISTEN_PATH_LENGTH,
+                            path.len()
+                        ));
+                    }
+                    if contains_control_chars(path) {
+                        errors.push("listen_path must not contain control characters".to_string());
+                    }
+                    if path.is_empty() {
+                        errors.push(
+                            "listen_path must not be an empty string — omit the field entirely for host-only routing"
+                                .to_string(),
+                        );
+                    } else if let Some(pattern) = path.strip_prefix('~') {
+                        if pattern.is_empty() {
+                            errors.push("regex listen_path '~' has empty pattern".to_string());
+                        }
+                    } else if !path.starts_with('/') {
+                        errors.push("listen_path must start with '/' or '~' (regex)".to_string());
+                    }
+                }
             }
         }
 

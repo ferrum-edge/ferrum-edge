@@ -792,16 +792,17 @@ async fn handle_create_proxy(
             ));
         }
     }
-    if !proxy.backend_protocol.is_stream_proxy() && proxy.listen_path.starts_with('~') {
-        let pattern = &proxy.listen_path[1..];
-        if !pattern.is_empty() {
-            let anchored = crate::config::types::anchor_regex_pattern(pattern);
-            if let Err(e) = regex::Regex::new(&anchored) {
-                return Ok(json_response(
-                    StatusCode::BAD_REQUEST,
-                    &json!({"error": format!("Invalid proxy listen_path: invalid regex '{}': {}", proxy.listen_path, e)}),
-                ));
-            }
+    if !proxy.backend_protocol.is_stream_proxy()
+        && let Some(path) = proxy.listen_path.as_deref()
+        && let Some(pattern) = path.strip_prefix('~')
+        && !pattern.is_empty()
+    {
+        let anchored = crate::config::types::anchor_regex_pattern(pattern);
+        if let Err(e) = regex::Regex::new(&anchored) {
+            return Ok(json_response(
+                StatusCode::BAD_REQUEST,
+                &json!({"error": format!("Invalid proxy listen_path: invalid regex '{}': {}", path, e)}),
+            ));
         }
     }
 
@@ -836,7 +837,7 @@ async fn handle_create_proxy(
     // Check host+listen_path uniqueness for HTTP-style routes.
     if !proxy.backend_protocol.is_stream_proxy() {
         match db
-            .check_listen_path_unique(namespace, &proxy.listen_path, &proxy.hosts, None)
+            .check_listen_path_unique(namespace, proxy.listen_path.as_deref(), &proxy.hosts, None)
             .await
         {
             Ok(true) => {}
@@ -1123,23 +1124,29 @@ async fn handle_update_proxy(
             ));
         }
     }
-    if !proxy.backend_protocol.is_stream_proxy() && proxy.listen_path.starts_with('~') {
-        let pattern = &proxy.listen_path[1..];
-        if !pattern.is_empty() {
-            let anchored = crate::config::types::anchor_regex_pattern(pattern);
-            if let Err(e) = regex::Regex::new(&anchored) {
-                return Ok(json_response(
-                    StatusCode::BAD_REQUEST,
-                    &json!({"error": format!("Invalid proxy listen_path: invalid regex '{}': {}", proxy.listen_path, e)}),
-                ));
-            }
+    if !proxy.backend_protocol.is_stream_proxy()
+        && let Some(path) = proxy.listen_path.as_deref()
+        && let Some(pattern) = path.strip_prefix('~')
+        && !pattern.is_empty()
+    {
+        let anchored = crate::config::types::anchor_regex_pattern(pattern);
+        if let Err(e) = regex::Regex::new(&anchored) {
+            return Ok(json_response(
+                StatusCode::BAD_REQUEST,
+                &json!({"error": format!("Invalid proxy listen_path: invalid regex '{}': {}", path, e)}),
+            ));
         }
     }
 
     // Check host+listen_path uniqueness (excluding self) for HTTP-style routes.
     if !proxy.backend_protocol.is_stream_proxy() {
         match db
-            .check_listen_path_unique(namespace, &proxy.listen_path, &proxy.hosts, Some(id))
+            .check_listen_path_unique(
+                namespace,
+                proxy.listen_path.as_deref(),
+                &proxy.hosts,
+                Some(id),
+            )
             .await
         {
             Ok(true) => {}

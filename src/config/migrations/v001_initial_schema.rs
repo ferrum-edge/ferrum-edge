@@ -119,7 +119,7 @@ impl V001InitialSchema {
                 namespace VARCHAR(255) NOT NULL DEFAULT 'ferrum',
                 name VARCHAR(255),
                 hosts TEXT NOT NULL,
-                listen_path VARCHAR(500) NOT NULL,
+                listen_path VARCHAR(500),
                 backend_protocol VARCHAR(20) NOT NULL DEFAULT 'http',
                 backend_host VARCHAR(255) NOT NULL,
                 backend_port INTEGER NOT NULL DEFAULT 80,
@@ -178,7 +178,7 @@ impl V001InitialSchema {
                 namespace TEXT NOT NULL DEFAULT 'ferrum',
                 name TEXT,
                 hosts TEXT NOT NULL DEFAULT '[]',
-                listen_path TEXT NOT NULL,
+                listen_path TEXT,
                 backend_protocol TEXT NOT NULL DEFAULT 'http',
                 backend_host TEXT NOT NULL,
                 backend_port INTEGER NOT NULL DEFAULT 80,
@@ -362,6 +362,14 @@ impl V001InitialSchema {
         } else {
             sqlx::query(unique_listen_port_sql).execute(pool).await?;
         }
+
+        // Intentionally NO unique index on (namespace, listen_path). Path
+        // uniqueness is host-scoped: two HTTP proxies may share a listen_path
+        // if their `hosts` lists do not overlap (a Kong-style contract). A
+        // plain unique index on `(namespace, listen_path)` would reject valid
+        // host-partitioned routes before the host-overlap check in
+        // `DatabaseBackend::check_listen_path_unique` / `validate_unique_listen_paths`
+        // runs. Uniqueness is enforced at the application layer instead.
 
         // Composite unique indexes for namespace-scoped uniqueness.
         // These replace the per-column UNIQUE constraints that were removed

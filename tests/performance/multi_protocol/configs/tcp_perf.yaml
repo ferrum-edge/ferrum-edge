@@ -3,7 +3,6 @@
 proxies:
   - id: "tcp-echo"
     name: "TCP Echo Proxy"
-    listen_path: ""
     listen_port: 5010
     backend_protocol: tcp
     backend_host: "127.0.0.1"

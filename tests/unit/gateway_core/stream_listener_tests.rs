@@ -25,7 +25,8 @@ fn create_stream_proxy(id: &str, protocol: BackendProtocol, port: u16) -> Proxy 
         namespace: ferrum_edge::config::types::default_namespace(),
         name: None,
         hosts: vec![],
-        listen_path: format!("/{}", id),
+        // Stream proxies must not set listen_path — they route on listen_port.
+        listen_path: None,
         backend_protocol: protocol,
         backend_host: "127.0.0.1".to_string(),
         backend_port: 9999,

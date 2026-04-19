@@ -4,7 +4,6 @@
 proxies:
   - id: "tcp-tls-echo"
     name: "TCP+TLS Echo Proxy"
-    listen_path: ""
     listen_port: 5001
     backend_protocol: tcp
     backend_host: "127.0.0.1"

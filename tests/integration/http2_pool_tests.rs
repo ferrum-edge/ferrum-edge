@@ -29,7 +29,7 @@ fn create_test_proxy() -> Proxy {
         namespace: ferrum_edge::config::types::default_namespace(),
         name: None,
         hosts: vec![],
-        listen_path: "/h2test".to_string(),
+        listen_path: Some("/h2test".to_string()),
         backend_protocol: BackendProtocol::Https,
         backend_host: "localhost".to_string(),
         backend_port: 3000,

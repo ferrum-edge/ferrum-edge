@@ -19,7 +19,7 @@ fn make_proxy(id: &str, listen_path: &str) -> Proxy {
         namespace: ferrum_edge::config::types::default_namespace(),
         name: None,
         hosts: vec![],
-        listen_path: listen_path.into(),
+        listen_path: Some(listen_path.to_string()),
         backend_protocol: BackendProtocol::Http,
         backend_host: "localhost".into(),
         backend_port: 3000,
@@ -173,7 +173,7 @@ fn test_proxy_backend_path_too_long() {
 #[test]
 fn test_proxy_listen_path_too_long() {
     let mut proxy = make_proxy("test", "/api");
-    proxy.listen_path = format!("/{}", "a".repeat(MAX_LISTEN_PATH_LENGTH));
+    proxy.listen_path = Some(format!("/{}", "a".repeat(MAX_LISTEN_PATH_LENGTH)));
     let errs = proxy.validate_fields().unwrap_err();
     assert!(
         errs.iter()
@@ -184,7 +184,7 @@ fn test_proxy_listen_path_too_long() {
 #[test]
 fn test_proxy_listen_path_control_chars() {
     let mut proxy = make_proxy("test", "/api");
-    proxy.listen_path = "/api\x00test".into();
+    proxy.listen_path = Some("/api\x00test".into());
     let errs = proxy.validate_fields().unwrap_err();
     assert!(
         errs.iter()
@@ -203,11 +203,41 @@ fn test_proxy_http_listen_path_must_start_with_slash_or_regex_prefix() {
 }
 
 #[test]
-fn test_stream_proxy_allows_empty_listen_path() {
+fn test_stream_proxy_requires_listen_path_none() {
+    // Stream proxies route on listen_port and must have listen_path == None.
+    // A populated listen_path is now a hard error (breaking change).
+    let mut proxy = make_proxy("test", "/ignored");
+    proxy.backend_protocol = BackendProtocol::Tcp;
+    proxy.listen_port = Some(5432);
+    let errs = proxy.validate_fields().unwrap_err();
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("stream") && e.contains("listen_path")),
+        "Expected error about stream proxy not setting listen_path, got: {:?}",
+        errs
+    );
+
+    // With listen_path = None it validates.
+    proxy.listen_path = None;
+    assert!(
+        proxy.validate_fields().is_ok(),
+        "Stream proxy with listen_path=None and listen_port set should be valid: {:?}",
+        proxy.validate_fields()
+    );
+}
+
+#[test]
+fn test_stream_proxy_rejects_empty_string_listen_path() {
+    // Empty-string listen_path is invalid input — stream proxies must use
+    // None, not "". This catches mis-written fixtures loudly.
     let mut proxy = make_proxy("test", "");
     proxy.backend_protocol = BackendProtocol::Tcp;
     proxy.listen_port = Some(5432);
-    assert!(proxy.validate_fields().is_ok());
+    let result = proxy.validate_fields();
+    assert!(
+        result.is_err(),
+        "Stream proxy with listen_path=Some(\"\") should be rejected"
+    );
 }
 
 #[test]

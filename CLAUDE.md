@@ -310,7 +310,7 @@ src/
 | Type | Description | Key Fields |
 |------|-------------|------------|
 | `GatewayConfig` | Top-level config container | proxies, consumers, upstreams, plugins |
-| `Proxy` | A route + backend target | namespace, listen_path, hosts, backend_host/port/protocol, plugins, TLS/DNS/timeout overrides, pool_*, circuit_breaker, retry, response_body_mode, allowed_ws_origins, udp_max_response_amplification_factor, passthrough |
+| `Proxy` | A route + backend target | namespace, hosts (Vec), listen_path (Option<String>), listen_port (Option<u16>), backend_host/port/protocol, plugins, TLS/DNS/timeout overrides, pool_*, circuit_breaker, retry, response_body_mode, allowed_ws_origins, udp_max_response_amplification_factor, passthrough. HTTP proxies require at least one of `hosts` or `listen_path`. Stream proxies use `listen_port` and MUST have `listen_path = None`. |
 | `Consumer` | An authenticated client identity | namespace, username, custom_id, credentials (HashMap — each type maps to a single JSON object or an array of objects for multi-credential rotation; JWT secrets must be at least 32 characters), acl_groups (Vec), tags |
 | `Upstream` | A load-balanced target group | namespace, targets (host/port/weight/path), algorithm, health_checks |
 | `PluginConfig` | Plugin instance configuration | namespace, name, enabled, config (serde_json::Value), scope (Global/Proxy/ProxyGroup), proxy_id (Option), priority_override (Option<u16>) |
@@ -326,6 +326,7 @@ Routes are matched in priority order within each host tier (exact host → wildc
 
 1. **Prefix routes first** — longest-prefix match via HashMap index (O(path_depth), typically 2-5 lookups)
 2. **Regex routes second** — first match via RegexSet (O(path_length) single DFA pass, independent of pattern count)
+3. **Host-only fallback** — proxies with `listen_path: None` (hosts set, no path) are the per-host catch-all, evaluated only when both prefix and regex tiers miss. Never applies to the catch-all host tier — a proxy with `hosts: []` + `listen_path: None` is rejected at validation (it would mean "match literally every request").
 
 **Prefix route matching uses `IndexedPrefixRoutes`** — a HashMap that maps each `listen_path` to its proxy, built at config-load time. On a cache miss, the router walks the request path backwards through `/` segment boundaries doing O(1) HashMap lookups at each step. This is **O(path_depth)** regardless of how many proxies are configured, replacing the previous O(n) linear scan that degraded throughput by 30-46% as proxy count grew from 50 to 500+. **Do not replace this with a linear scan or any algorithm whose per-request cost scales with total proxy count.** The HashMap index is applied to all three host tiers (exact, wildcard, catch-all). The `IndexedPrefixRoutes` struct in `src/router_cache.rs` bundles the sorted `Vec<RouteEntry>` (for `apply_delta` retain scans) with the `HashMap<String, Arc<Proxy>>` index.
 
@@ -334,6 +335,24 @@ Routes are matched in priority order within each host tier (exact host → wildc
 **Router lookup cache** (`DashMap` in `RouterCache`) caches `(host, path) → proxy` results for O(1) repeated lookups. Cache size is controlled by `FERRUM_ROUTER_CACHE_MAX_ENTRIES` (default: auto-scales as `max(10_000, proxies × 3)`). Both prefix and regex matches have separate cache partitions to prevent high-cardinality regex paths from evicting prefix entries. Negative lookups (no route matched) are also cached to prevent repeated scans from scanner traffic.
 
 **Regex listen_path patterns** (prefixed with `~`) are **auto-anchored for full-path matching**: `^` is prepended and `$` is appended if not already present. This means `~/users/[^/]+` becomes `^/users/[^/]+$` and will only match `/users/42`, not `/users/42/profile`. Operators who need prefix-style regex matching can end their pattern with `.*` (e.g., `~/api/v[0-9]+/.*`). The shared helper `anchor_regex_pattern()` in `src/config/types.rs` is used by the router, validation, and admin endpoints.
+
+### HTTP proxy `hosts` / `listen_path` contract
+
+The Proxy struct routes differently per protocol family. The required-ness of `hosts`/`listen_path`/`listen_port` is enforced at validation time (admin API, file loader, DB loader) and repeated here for contributor reference:
+
+| Protocol family | Routing on | Field rules |
+|---|---|---|
+| HTTP-family (`http`/`https`/`ws`/`wss`/`grpc`/`grpcs`/`h3`) | `hosts` + `listen_path` | At least one of `hosts` or `listen_path` MUST be set. Both may be set together. `listen_port` MUST be `None`. |
+| Stream-family (`tcp`/`tcp_tls`/`udp`/`dtls`) | `listen_port` | `listen_port` MUST be set. `listen_path` MUST be `None` — a populated `listen_path` on a stream proxy is a hard error. |
+
+A host-only HTTP proxy (`hosts: [...]`, no `listen_path`) matches **any path** under the configured hosts — effectively a per-host catch-all. `strip_listen_path: true` is a silent no-op on host-only proxies (there's nothing to strip); `backend_path` still prepends to the forwarded path if set. A proxy with `hosts: []` AND `listen_path: None` is rejected by `validate_fields_inner` — it would mean "match literally every request on every host" and collides with every other catch-all.
+
+**Uniqueness semantics:**
+- Two HTTP proxies with the same `listen_path` conflict iff their `hosts` overlap (empty hosts = catch-all, overlaps with everything).
+- Two host-only HTTP proxies conflict iff their `hosts` overlap.
+- A host-only proxy and a path-carrying proxy on the same host do NOT conflict — they occupy different match tiers (path wins on match, host-only is fallback).
+
+`DatabaseBackend::check_listen_path_unique(namespace, listen_path: Option<&str>, hosts, exclude_id)` implements this for the SQL/Mongo backends. See [db_backend.rs](src/config/db_backend.rs:216) for the full trait docstring. The V001 schema stores `listen_path` as NULLABLE with a partial unique index keyed by `(namespace, listen_path)` where listen_path is non-null.
 
 ### Protocol-Level Request Validation
 
@@ -776,7 +795,7 @@ Each protocol has its own proxy path, connection pool, and backend dispatch. Und
 - H2 pool dispatch: `matches!(proxy.backend_protocol, BackendProtocol::H2)` (line ~3828)
 - Streaming vs buffered: two-tier check — config-time `plugin_cache.requires_response_body_buffering()` then per-request `should_buffer_response_body()`, plus `proxy.retry.is_some()`
 
-**HTTP/3 frontend architecture**: The H3 listener in `http3/server.rs` is a standalone QUIC server that handles its own request lifecycle (plugin phases, auth, route matching). For backend communication, it uses **reqwest** (not the `Http3ConnectionPool`). This is intentional — reqwest auto-negotiates HTTP/2 via ALPN which outperforms QUIC for small payloads due to lower per-request crypto overhead and more mature connection pooling. The `Http3ConnectionPool` in `http3/client.rs` is used by the main hyper-based proxy path (`mod.rs`) for H3 backend targets — when `stream_response=true`, the pool returns an `H3StreamingResponse` with the live `RequestStream` which is wrapped in `CoalescingH3Body` or `DirectH3Body` for efficient frame forwarding to the client. When `stream_response=false` (retries configured), the pool buffers the full response body. The H3 listener enforces its own per-header and total-header size limits (`FERRUM_MAX_SINGLE_HEADER_SIZE_BYTES` / `FERRUM_MAX_HEADER_SIZE_BYTES`) since it does not use hyper's built-in header validation — the host header extracted for routing is a substring of an already-validated header, so separate host-length validation is unnecessary.
+**HTTP/3 frontend architecture**: The H3 listener in `http3/server.rs` is a standalone QUIC server that handles its own request lifecycle (plugin phases, auth, route matching). For backend communication, it uses the native `Http3ConnectionPool` (h3+quinn) — see `proxy_to_backend_h3()` and `proxy_to_backend_h3_streaming()` which unconditionally call `state.h3_pool.request*()`. **The H3 frontend dispatches only to H3 backends — there is no fallback to reqwest/HTTP/2/HTTP/1.1 and `proxy.backend_protocol` is not consulted on the H3 path.** A proxy that accepts H3 client traffic must point at an H3-capable backend. The reverse direction (H1/H2 frontend → H3 backend) is supported and is gated by `matches!(proxy.backend_protocol, BackendProtocol::H3)` in `src/proxy/mod.rs` — both frontends share the same `Http3ConnectionPool` for H3 backend dispatch. When `stream_response=true`, the pool returns an `H3StreamingResponse` with the live `RequestStream` which is wrapped in `CoalescingH3Body` or `DirectH3Body` for efficient frame forwarding to the client. When `stream_response=false` (retries configured), the pool buffers the full response body. The H3 listener enforces its own per-header and total-header size limits (`FERRUM_MAX_SINGLE_HEADER_SIZE_BYTES` / `FERRUM_MAX_HEADER_SIZE_BYTES`) since it does not use hyper's built-in header validation — the host header extracted for routing is a substring of an already-validated header, so separate host-length validation is unnecessary.
 
 **QUIC connection migration awareness**: The H3 connection loop in `http3/server.rs` detects QUIC connection migration (RFC 9000 §9) by comparing `quinn::Connection::remote_address()` against a cached `SocketAddr` before each request dispatch. The comparison is two integer fields (IP + port) — zero allocation. The formatted IP string (`Arc<str>`) is only re-created when the address actually changes (rare — mobile network handoff). This ensures IP-based rate-limit keys and access logs reflect the client's current IP after migration, not the stale IP from connection establishment. Do not revert this to a once-per-connection cache — it was added to fix a security issue where migrated clients bypassed per-IP rate limits.
 

@@ -9,7 +9,7 @@ fn test_proxy() -> Proxy {
         namespace: ferrum_edge::config::types::default_namespace(),
         name: Some("gRPC Test Proxy".into()),
         hosts: vec![],
-        listen_path: "/grpc".into(),
+        listen_path: Some("/grpc".to_string()),
         backend_protocol: BackendProtocol::Grpc,
         backend_host: "grpc-backend.example.com".into(),
         backend_port: 50051,
@@ -111,7 +111,7 @@ fn test_build_backend_url_grpc_uses_http_scheme() {
         &proxy,
         "/grpc/my.Service/MyMethod",
         "",
-        proxy.listen_path.len(),
+        proxy.listen_path.as_deref().map(str::len).unwrap_or(0),
     );
     assert_eq!(
         url,
@@ -127,7 +127,7 @@ fn test_build_backend_url_grpcs_uses_https_scheme() {
         &proxy,
         "/grpc/my.Service/MyMethod",
         "",
-        proxy.listen_path.len(),
+        proxy.listen_path.as_deref().map(str::len).unwrap_or(0),
     );
     assert_eq!(
         url,
@@ -143,7 +143,7 @@ fn test_build_backend_url_grpc_with_backend_path() {
         &proxy,
         "/grpc/my.Service/MyMethod",
         "",
-        proxy.listen_path.len(),
+        proxy.listen_path.as_deref().map(str::len).unwrap_or(0),
     );
     assert_eq!(
         url,
@@ -159,7 +159,7 @@ fn test_build_backend_url_grpc_no_strip() {
         &proxy,
         "/grpc/my.Service/MyMethod",
         "",
-        proxy.listen_path.len(),
+        proxy.listen_path.as_deref().map(str::len).unwrap_or(0),
     );
     assert_eq!(
         url,

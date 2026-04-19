@@ -29,7 +29,7 @@ plugin_configs: []
     )
     .unwrap();
     assert_eq!(config.proxies.len(), 1);
-    assert_eq!(config.proxies[0].listen_path, "/api/v1");
+    assert_eq!(config.proxies[0].listen_path.as_deref(), Some("/api/v1"));
 }
 
 #[test]
@@ -1066,21 +1066,20 @@ plugin_configs: []
 }
 
 /// Stream proxy `listen_port` collision across namespaces must also load
-/// cleanly (same rationale as listen_path).
+/// cleanly (same rationale as listen_path). Stream proxies must NOT set
+/// listen_path — omit the field entirely.
 #[test]
 fn test_load_config_multi_namespace_shared_listen_port() {
     let yaml = r#"
 proxies:
   - id: "prod-tcp"
     namespace: "prod"
-    listen_path: ""
     backend_protocol: tcp
     backend_host: "127.0.0.1"
     backend_port: 3001
     listen_port: 15000
   - id: "staging-tcp"
     namespace: "staging"
-    listen_path: ""
     backend_protocol: tcp
     backend_host: "127.0.0.1"
     backend_port: 3002

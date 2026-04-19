@@ -13,7 +13,7 @@ fn make_proxy(id: &str, listen_path: &str) -> Proxy {
         namespace: ferrum_edge::config::types::default_namespace(),
         name: None,
         hosts: vec![],
-        listen_path: listen_path.into(),
+        listen_path: Some(listen_path.to_string()),
         backend_protocol: BackendProtocol::Http,
         backend_host: "localhost".into(),
         backend_port: 3000,
@@ -126,7 +126,7 @@ fn test_unique_listen_paths_valid() {
                 namespace: ferrum_edge::config::types::default_namespace(),
                 name: None,
                 hosts: vec![],
-                listen_path: "/api/v1".into(),
+                listen_path: Some("/api/v1".to_string()),
                 backend_protocol: BackendProtocol::Http,
                 backend_host: "localhost".into(),
                 backend_port: 3000,
@@ -178,7 +178,7 @@ fn test_unique_listen_paths_valid() {
                 namespace: ferrum_edge::config::types::default_namespace(),
                 name: None,
                 hosts: vec![],
-                listen_path: "/api/v2".into(),
+                listen_path: Some("/api/v2".to_string()),
                 backend_protocol: BackendProtocol::Http,
                 backend_host: "localhost".into(),
                 backend_port: 3001,
@@ -245,7 +245,7 @@ fn test_unique_listen_paths_duplicate() {
                 namespace: ferrum_edge::config::types::default_namespace(),
                 name: None,
                 hosts: vec![],
-                listen_path: "/api/v1".into(),
+                listen_path: Some("/api/v1".to_string()),
                 backend_protocol: BackendProtocol::Http,
                 backend_host: "localhost".into(),
                 backend_port: 3000,
@@ -297,7 +297,7 @@ fn test_unique_listen_paths_duplicate() {
                 namespace: ferrum_edge::config::types::default_namespace(),
                 name: None,
                 hosts: vec![],
-                listen_path: "/api/v1".into(),
+                listen_path: Some("/api/v1".to_string()),
                 backend_protocol: BackendProtocol::Http,
                 backend_host: "localhost".into(),
                 backend_port: 3001,
@@ -1847,5 +1847,108 @@ fn test_listen_path_validator_is_single_namespace_post_filter() {
     assert!(
         config.validate_unique_listen_paths().is_err(),
         "validator currently flags duplicate listen_path globally — see comment"
+    );
+}
+
+// ---- Host-only proxy validation ----
+
+fn make_host_only_proxy(id: &str, hosts: &[&str]) -> Proxy {
+    let mut p = make_proxy(id, "/placeholder");
+    p.listen_path = None;
+    p.hosts = hosts.iter().map(|s| s.to_string()).collect();
+    p
+}
+
+#[test]
+fn test_host_only_proxy_validates() {
+    let p = make_host_only_proxy("ho-1", &["api.example.com"]);
+    assert!(
+        p.validate_fields().is_ok(),
+        "host-only proxy with hosts set should validate"
+    );
+}
+
+#[test]
+fn test_http_proxy_rejects_neither_hosts_nor_listen_path() {
+    let mut p = make_proxy("catch-all", "/placeholder");
+    p.listen_path = None;
+    p.hosts = vec![];
+    let errs = p.validate_fields().unwrap_err();
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("hosts") && e.contains("listen_path")),
+        "expected error about missing hosts AND listen_path, got {:?}",
+        errs
+    );
+}
+
+#[test]
+fn test_http_proxy_rejects_empty_string_listen_path() {
+    // `Some("")` is invalid input — must be None or a non-empty string.
+    let p = make_proxy("empty-path", "");
+    let errs = p.validate_fields().unwrap_err();
+    assert!(
+        errs.iter().any(|e| e.contains("listen_path")),
+        "expected rejection of empty-string listen_path, got {:?}",
+        errs
+    );
+}
+
+#[test]
+fn test_stream_proxy_with_listen_path_is_rejected() {
+    let mut p = make_proxy("stream-with-path", "/nope");
+    p.backend_protocol = BackendProtocol::Tcp;
+    p.listen_port = Some(5432);
+    let errs = p.validate_fields().unwrap_err();
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("listen_path") && e.contains("stream")),
+        "expected stream proxy + listen_path error, got {:?}",
+        errs
+    );
+}
+
+#[test]
+fn test_validate_unique_listen_paths_rejects_overlapping_host_only_proxies() {
+    let a = make_host_only_proxy("a", &["shared.example.com"]);
+    let b = make_host_only_proxy("b", &["shared.example.com"]);
+    let config = GatewayConfig {
+        proxies: vec![a, b],
+        ..Default::default()
+    };
+    assert!(
+        config.validate_unique_listen_paths().is_err(),
+        "two host-only proxies on the same host must conflict"
+    );
+}
+
+#[test]
+fn test_validate_unique_listen_paths_allows_disjoint_host_only_proxies() {
+    let a = make_host_only_proxy("a", &["a.example.com"]);
+    let b = make_host_only_proxy("b", &["b.example.com"]);
+    let config = GatewayConfig {
+        proxies: vec![a, b],
+        ..Default::default()
+    };
+    assert!(
+        config.validate_unique_listen_paths().is_ok(),
+        "host-only proxies on disjoint hosts must not conflict"
+    );
+}
+
+#[test]
+fn test_validate_unique_listen_paths_allows_host_only_alongside_path_proxy_same_host() {
+    // A host-only proxy and a path-carrying proxy on the same host don't
+    // conflict — they occupy different tiers (path first, host-only fallback).
+    let mut path_proxy = make_proxy("path", "/api");
+    path_proxy.hosts = vec!["shared.example.com".to_string()];
+    let host_only = make_host_only_proxy("host-only", &["shared.example.com"]);
+    let config = GatewayConfig {
+        proxies: vec![path_proxy, host_only],
+        ..Default::default()
+    };
+    assert!(
+        config.validate_unique_listen_paths().is_ok(),
+        "host-only + path-carrying proxy on same host is allowed (different tiers)"
     );
 }

@@ -322,12 +322,16 @@ impl Plugin for SpecExpose {
             None => return PluginResult::Continue,
         };
 
-        // Skip regex listen paths (prefixed with ~)
-        if proxy.listen_path.starts_with('~') {
+        // Host-only proxies (listen_path == None) and regex listen_paths
+        // don't expose a deterministic /specz path — skip them.
+        let Some(listen_path) = proxy.listen_path.as_deref() else {
+            return PluginResult::Continue;
+        };
+        if listen_path.starts_with('~') {
             return PluginResult::Continue;
         }
 
-        if !Self::is_specz_request(&ctx.path, &proxy.listen_path) {
+        if !Self::is_specz_request(&ctx.path, listen_path) {
             return PluginResult::Continue;
         }
 

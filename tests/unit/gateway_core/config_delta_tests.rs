@@ -11,7 +11,7 @@ fn make_proxy(id: &str, listen_path: &str, updated_at: DateTime<Utc>) -> Proxy {
         namespace: default_namespace(),
         name: None,
         hosts: vec![],
-        listen_path: listen_path.to_string(),
+        listen_path: Some(listen_path.to_string()),
         backend_protocol: BackendProtocol::Http,
         backend_host: "localhost".to_string(),
         backend_port: 8080,
@@ -184,7 +184,10 @@ fn test_detects_modified_proxy() {
     assert!(delta.added_proxies.is_empty());
     assert!(delta.removed_proxy_ids.is_empty());
     assert_eq!(delta.modified_proxies.len(), 1);
-    assert_eq!(delta.modified_proxies[0].listen_path, "/api/v2");
+    assert_eq!(
+        delta.modified_proxies[0].listen_path.as_deref(),
+        Some("/api/v2")
+    );
 }
 
 #[test]
@@ -227,7 +230,7 @@ fn test_detects_consumer_changes() {
 }
 
 #[test]
-fn test_affected_listen_paths() {
+fn test_affected_routes_paths() {
     let t1 = Utc::now();
     let t2 = t1 + chrono::Duration::seconds(5);
     let old = GatewayConfig {
@@ -246,11 +249,12 @@ fn test_affected_listen_paths() {
         ..Default::default()
     };
     let delta = ConfigDelta::compute(&old, &new);
-    let paths = delta.affected_listen_paths(&old);
-    assert!(paths.contains(&"/api".to_string())); // removed proxy's path
-    assert!(paths.contains(&"/new-path".to_string())); // modified proxy's new path
-    assert!(paths.contains(&"/old-path".to_string())); // modified proxy's old path
-    assert!(paths.contains(&"/added".to_string())); // added proxy's path
+    let affected = delta.affected_routes(&old);
+    assert!(affected.listen_paths.contains(&"/api".to_string())); // removed proxy's path
+    assert!(affected.listen_paths.contains(&"/new-path".to_string())); // modified proxy's new path
+    assert!(affected.listen_paths.contains(&"/old-path".to_string())); // modified proxy's old path
+    assert!(affected.listen_paths.contains(&"/added".to_string())); // added proxy's path
+    assert!(affected.host_only_hosts.is_empty());
 }
 
 // --- Upstream delta tests ---

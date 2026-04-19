@@ -1419,8 +1419,8 @@ impl ProxyState {
         }
 
         // --- RouterCache: rebuild route table, surgically invalidate path cache ---
-        let affected_paths = delta.affected_listen_paths(&old_config);
-        self.router_cache.apply_delta(&new_config, &affected_paths);
+        let affected_routes = delta.affected_routes(&old_config);
+        self.router_cache.apply_delta(&new_config, &affected_routes);
 
         // --- PluginCache: only rebuild plugins for affected proxies ---
         let proxy_ids_to_rebuild = delta.proxy_ids_needing_plugin_rebuild(&new_config);
@@ -1814,8 +1814,8 @@ impl ProxyState {
         let delta = crate::config_delta::ConfigDelta::compute(&old_config, &new_config);
 
         // --- RouterCache ---
-        let affected_paths = delta.affected_listen_paths(&old_config);
-        self.router_cache.apply_delta(&new_config, &affected_paths);
+        let affected_routes = delta.affected_routes(&old_config);
+        self.router_cache.apply_delta(&new_config, &affected_routes);
 
         // --- PluginCache ---
         let proxy_ids_to_rebuild = delta.proxy_ids_needing_plugin_rebuild(&new_config);
@@ -2625,10 +2625,11 @@ fn build_websocket_backend_url_with_target(
         _ => "ws", // fallback, should not happen
     };
 
-    let remaining_path = if proxy.strip_listen_path {
-        incoming_path.strip_prefix(&proxy.listen_path).unwrap_or("")
-    } else {
-        incoming_path
+    // Host-only proxies (listen_path == None) have no prefix to strip —
+    // strip_listen_path is a no-op in that case.
+    let remaining_path = match (proxy.strip_listen_path, proxy.listen_path.as_deref()) {
+        (true, Some(lp)) => incoming_path.strip_prefix(lp).unwrap_or(""),
+        _ => incoming_path,
     };
 
     let backend_path = target_path.or(proxy.backend_path.as_deref()).unwrap_or("");
@@ -3866,7 +3867,9 @@ pub async fn log_rejected_request(
         matched_proxy_id: proxy.map(|p| p.id.clone()),
         matched_proxy_name: proxy.and_then(|p| p.name.clone()),
         backend_target_url: proxy.map(|p| {
-            let url = build_backend_url(p, &ctx.path, "", p.listen_path.len());
+            // Host-only proxies (listen_path None) have no prefix to strip.
+            let strip_len = p.listen_path.as_deref().map(str::len).unwrap_or(0);
+            let url = build_backend_url(p, &ctx.path, "", strip_len);
             strip_query_params(&url).to_string()
         }),
         response_status_code: status_code,
@@ -5878,7 +5881,8 @@ async fn handle_proxy_request_inner(
                             matched_proxy_id: proxy_ref.map(|p| p.id.clone()),
                             matched_proxy_name: proxy_ref.and_then(|p| p.name.clone()),
                             backend_target_url: proxy_ref.map(|p| {
-                                let url = build_backend_url(p, &ctx.path, "", p.listen_path.len());
+                                let strip_len = p.listen_path.as_deref().map(str::len).unwrap_or(0);
+                                let url = build_backend_url(p, &ctx.path, "", strip_len);
                                 strip_query_params(&url).to_string()
                             }),
                             response_status_code: 200, // gRPC errors use HTTP 200
@@ -7095,7 +7099,7 @@ async fn proxy_to_backend(
         Err(e) => {
             error!(
                 proxy_id = %proxy.id,
-                listen_path = %proxy.listen_path,
+                listen_path = ?proxy.listen_path,
                 "Connection pool client creation failed — refusing to proxy without proper TLS configuration: {}",
                 e
             );

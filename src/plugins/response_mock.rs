@@ -183,18 +183,22 @@ impl Plugin for ResponseMock {
         _headers: &mut HashMap<String, String>,
     ) -> PluginResult {
         // Strip the proxy's listen_path prefix so mock rules are relative to
-        // the proxy scope. For regex listen_paths (`~` prefix) there is no
-        // literal prefix to strip, so the full path is used. Root listen_path
-        // (`/`) is also treated as no-strip to avoid turning "/users" into
-        // "users".
+        // the proxy scope. Several cases where no stripping applies:
+        // - Host-only proxies (listen_path == None): no prefix to strip
+        // - Regex listen_paths (`~` prefix): no literal prefix to strip
+        // - Root listen_path (`/`): avoid turning "/users" into "users"
         //
         // Uses `strip_prefix` which is char-boundary-safe — byte-indexed
         // slicing would panic if a listen_path byte-length landed mid-UTF-8
         // codepoint in a non-matching `ctx.path` (unlikely in practice since
         // the router already matched the prefix, but defence-in-depth).
-        let match_path = match ctx.matched_proxy.as_ref() {
-            Some(proxy) if !proxy.listen_path.starts_with('~') && proxy.listen_path != "/" => {
-                match ctx.path.strip_prefix(proxy.listen_path.as_str()) {
+        let match_path = match ctx
+            .matched_proxy
+            .as_ref()
+            .and_then(|p| p.listen_path.as_deref())
+        {
+            Some(listen_path) if !listen_path.starts_with('~') && listen_path != "/" => {
+                match ctx.path.strip_prefix(listen_path) {
                     Some("") => "/",
                     Some(rest) => rest,
                     // Router gave us a mismatched path — fall back to the full

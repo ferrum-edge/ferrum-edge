@@ -1669,46 +1669,85 @@ impl DatabaseStore {
 
     /// Check if a proxy's (hosts, listen_path) combination is unique.
     ///
-    /// Two proxies may share the same `listen_path` if their `hosts` sets are
-    /// completely disjoint. Returns `true` if no conflict is found.
+    /// See `DatabaseBackend::check_listen_path_unique` for the full conflict
+    /// semantics. In short: `Some(path)` candidates are uniqueness-keyed by
+    /// `(namespace, listen_path)` + host overlap; `None` (host-only) candidates
+    /// are uniqueness-keyed by `(namespace, listen_path IS NULL)` + host
+    /// overlap. `None + empty hosts` is rejected by the caller — returned
+    /// `Ok(false)` defensively here.
     pub async fn check_listen_path_unique(
         &self,
         namespace: &str,
-        listen_path: &str,
+        listen_path: Option<&str>,
         hosts: &[String],
         exclude_id: Option<&str>,
     ) -> Result<bool, anyhow::Error> {
+        // Defensive: None + empty hosts has no meaningful uniqueness scope.
+        // validate_fields_inner rejects this at admission time; we still guard
+        // so the DB layer never accepts a "match everything" proxy if a caller
+        // slips past validation.
+        if listen_path.is_none() && hosts.is_empty() {
+            return Ok(false);
+        }
+
         let start = Instant::now();
-        let rows: Vec<AnyRow> = if let Some(eid) = exclude_id {
-            sqlx::query(&self.q("SELECT id, hosts FROM proxies \
-                 WHERE namespace = ? \
-                   AND listen_path = ? \
-                   AND backend_protocol NOT IN ('tcp', 'tcp_tls', 'udp', 'dtls') \
-                   AND id != ?"))
+        let base_filter = "namespace = ? \
+              AND backend_protocol NOT IN ('tcp', 'tcp_tls', 'udp', 'dtls')";
+        let path_filter = if listen_path.is_some() {
+            "listen_path = ?"
+        } else {
+            "listen_path IS NULL"
+        };
+
+        let rows: Vec<AnyRow> = match (exclude_id, listen_path) {
+            (Some(eid), Some(path)) => sqlx::query(&self.q(&format!(
+                "SELECT id, hosts FROM proxies WHERE {base_filter} AND {path_filter} AND id != ?"
+            )))
             .bind(namespace)
-            .bind(listen_path)
+            .bind(path)
             .bind(eid)
             .fetch_all(&self.pool())
-            .await?
-        } else {
-            sqlx::query(&self.q("SELECT id, hosts FROM proxies \
-                 WHERE namespace = ? \
-                   AND listen_path = ? \
-                   AND backend_protocol NOT IN ('tcp', 'tcp_tls', 'udp', 'dtls')"))
+            .await?,
+            (Some(eid), None) => sqlx::query(&self.q(&format!(
+                "SELECT id, hosts FROM proxies WHERE {base_filter} AND {path_filter} AND id != ?"
+            )))
             .bind(namespace)
-            .bind(listen_path)
+            .bind(eid)
             .fetch_all(&self.pool())
-            .await?
+            .await?,
+            (None, Some(path)) => {
+                sqlx::query(&self.q(&format!(
+                    "SELECT id, hosts FROM proxies WHERE {base_filter} AND {path_filter}"
+                )))
+                .bind(namespace)
+                .bind(path)
+                .fetch_all(&self.pool())
+                .await?
+            }
+            (None, None) => {
+                sqlx::query(&self.q(&format!(
+                    "SELECT id, hosts FROM proxies WHERE {base_filter} AND {path_filter}"
+                )))
+                .bind(namespace)
+                .fetch_all(&self.pool())
+                .await?
+            }
         };
 
         self.check_slow_query("check_listen_path_unique", start);
 
-        // No other proxy with this listen_path — unique
+        // No other proxy with this listen_path bucket — unique
         if rows.is_empty() {
             return Ok(true);
         }
 
-        // Check if any existing proxy's hosts overlap with the new hosts
+        // `Some(path) + empty hosts` is a catch-all for the path — any existing
+        // row in this bucket is a conflict regardless of its hosts.
+        if listen_path.is_some() && hosts.is_empty() {
+            return Ok(false);
+        }
+
+        // Otherwise check if any existing proxy's hosts overlap with the new hosts
         for row in &rows {
             let existing_hosts: Vec<String> = row
                 .try_get::<String, _>("hosts")
@@ -3412,7 +3451,7 @@ impl DatabaseBackend for DatabaseStore {
     async fn check_listen_path_unique(
         &self,
         namespace: &str,
-        listen_path: &str,
+        listen_path: Option<&str>,
         hosts: &[String],
         exclude_proxy_id: Option<&str>,
     ) -> Result<bool, anyhow::Error> {
@@ -3673,7 +3712,11 @@ fn row_to_proxy(
             .unwrap_or_else(|_| crate::config::types::default_namespace()),
         name: row.try_get("name").ok(),
         hosts,
-        listen_path: row.try_get("listen_path")?,
+        // Propagate decode errors — silently defaulting to None would turn a
+        // malformed listen_path into a host-only proxy and change routing
+        // behavior. `Option<String>` already represents SQL NULL, so `?` is
+        // safe for the expected nullable case and fails fast on real errors.
+        listen_path: row.try_get::<Option<String>, _>("listen_path")?,
         backend_protocol: parse_protocol(&proto_str),
         backend_host: row.try_get("backend_host")?,
         backend_port: row

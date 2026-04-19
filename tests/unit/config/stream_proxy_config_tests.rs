@@ -12,7 +12,7 @@ fn make_stream_proxy(id: &str, protocol: BackendProtocol, port: u16) -> Proxy {
         namespace: ferrum_edge::config::types::default_namespace(),
         name: None,
         hosts: vec![],
-        listen_path: String::new(),
+        listen_path: None,
         backend_protocol: protocol,
         backend_host: "localhost".into(),
         backend_port: 5432,
@@ -67,7 +67,7 @@ fn make_http_proxy(id: &str, listen_path: &str) -> Proxy {
         namespace: ferrum_edge::config::types::default_namespace(),
         name: None,
         hosts: vec![],
-        listen_path: listen_path.into(),
+        listen_path: Some(listen_path.to_string()),
         backend_protocol: BackendProtocol::Http,
         backend_host: "localhost".into(),
         backend_port: 3000,
@@ -310,58 +310,16 @@ fn test_validate_http_proxy_ignored_for_port_conflicts() {
     );
 }
 
-// --- Normalize stream proxy paths ---
-
-#[test]
-fn test_normalize_stream_proxy_paths_tcp() {
-    let mut config = test_config(vec![make_stream_proxy("tcp1", BackendProtocol::Tcp, 5432)]);
-    config.normalize_stream_proxy_paths();
-    assert_eq!(config.proxies[0].listen_path, "__tcp:5432");
-}
-
-#[test]
-fn test_normalize_stream_proxy_paths_udp() {
-    let mut config = test_config(vec![make_stream_proxy("udp1", BackendProtocol::Udp, 5353)]);
-    config.normalize_stream_proxy_paths();
-    assert_eq!(config.proxies[0].listen_path, "__udp:5353");
-}
-
-#[test]
-fn test_normalize_stream_proxy_paths_dtls() {
-    let mut config = test_config(vec![make_stream_proxy(
-        "dtls1",
-        BackendProtocol::Dtls,
-        4433,
-    )]);
-    config.normalize_stream_proxy_paths();
-    assert_eq!(config.proxies[0].listen_path, "__udp:4433");
-}
-
-#[test]
-fn test_normalize_stream_proxy_paths_tcp_tls() {
-    let mut config = test_config(vec![make_stream_proxy(
-        "tls1",
-        BackendProtocol::TcpTls,
-        5433,
-    )]);
-    config.normalize_stream_proxy_paths();
-    assert_eq!(config.proxies[0].listen_path, "__tcp:5433");
-}
-
-#[test]
-fn test_normalize_does_not_change_http_proxies() {
-    let mut config = test_config(vec![make_http_proxy("http1", "/api/v1")]);
-    config.normalize_stream_proxy_paths();
-    assert_eq!(config.proxies[0].listen_path, "/api/v1");
-}
-
 // --- Proxy struct deserialization with stream fields ---
+//
+// Stream proxies now route on listen_port and must NOT set listen_path. The
+// deserializer no longer requires listen_path to be present (it is Option<_>
+// with serde(default)); stream proxy fixtures simply omit the field entirely.
 
 #[test]
 fn test_tcp_proxy_yaml_deserialization() {
     let yaml = r#"
 id: "tcp-proxy-1"
-listen_path: ""
 backend_protocol: tcp
 backend_host: "db.example.com"
 backend_port: 5432
@@ -371,6 +329,7 @@ udp_idle_timeout_seconds: 30
 "#;
     let proxy: Proxy = serde_yaml::from_str(yaml).unwrap();
     assert_eq!(proxy.backend_protocol, BackendProtocol::Tcp);
+    assert_eq!(proxy.listen_path, None);
     assert_eq!(proxy.listen_port, Some(15432));
     assert!(proxy.frontend_tls);
     assert_eq!(proxy.udp_idle_timeout_seconds, 30);
@@ -380,7 +339,6 @@ udp_idle_timeout_seconds: 30
 fn test_udp_proxy_json_deserialization() {
     let json = r#"{
         "id": "udp-proxy-1",
-        "listen_path": "",
         "backend_protocol": "udp",
         "backend_host": "dns.example.com",
         "backend_port": 53,
@@ -389,6 +347,7 @@ fn test_udp_proxy_json_deserialization() {
     }"#;
     let proxy: Proxy = serde_json::from_str(json).unwrap();
     assert_eq!(proxy.backend_protocol, BackendProtocol::Udp);
+    assert_eq!(proxy.listen_path, None);
     assert_eq!(proxy.listen_port, Some(10053));
     assert_eq!(proxy.udp_idle_timeout_seconds, 120);
     assert!(!proxy.frontend_tls);
@@ -398,12 +357,12 @@ fn test_udp_proxy_json_deserialization() {
 fn test_stream_proxy_defaults() {
     let json = r#"{
         "id": "tcp1",
-        "listen_path": "",
         "backend_protocol": "tcp",
         "backend_host": "localhost",
         "backend_port": 5432
     }"#;
     let proxy: Proxy = serde_json::from_str(json).unwrap();
+    assert_eq!(proxy.listen_path, None);
     assert_eq!(proxy.listen_port, None);
     assert!(!proxy.frontend_tls);
     assert_eq!(proxy.udp_idle_timeout_seconds, 60);
@@ -415,7 +374,6 @@ fn test_stream_proxy_defaults() {
 fn test_tcp_idle_timeout_default_is_none() {
     let json = r#"{
         "id": "tcp1",
-        "listen_path": "",
         "backend_protocol": "tcp",
         "backend_host": "localhost",
         "backend_port": 5432
@@ -428,7 +386,6 @@ fn test_tcp_idle_timeout_default_is_none() {
 fn test_tcp_idle_timeout_explicit_value() {
     let json = r#"{
         "id": "tcp2",
-        "listen_path": "",
         "backend_protocol": "tcp",
         "backend_host": "localhost",
         "backend_port": 5432,
@@ -442,7 +399,6 @@ fn test_tcp_idle_timeout_explicit_value() {
 fn test_tcp_idle_timeout_zero_is_disabled() {
     let json = r#"{
         "id": "tcp3",
-        "listen_path": "",
         "backend_protocol": "tcp",
         "backend_host": "localhost",
         "backend_port": 5432,
@@ -465,7 +421,6 @@ fn test_tcp_idle_timeout_max_is_valid() {
     let json = format!(
         r#"{{
         "id": "tcp4",
-        "listen_path": "",
         "backend_protocol": "tcp",
         "backend_host": "localhost",
         "backend_port": 5432,
@@ -489,7 +444,6 @@ fn test_tcp_idle_timeout_over_max_is_rejected() {
     let json = format!(
         r#"{{
         "id": "tcp5",
-        "listen_path": "",
         "backend_protocol": "tcp",
         "backend_host": "localhost",
         "backend_port": 5432,
@@ -553,7 +507,6 @@ fn test_active_health_check_udp_probe_payload() {
 fn test_passthrough_default_false() {
     let yaml = r#"
 id: "tcp-pass-1"
-listen_path: ""
 backend_protocol: tcp
 backend_host: "db.example.com"
 backend_port: 5432
@@ -626,7 +579,6 @@ fn test_passthrough_rejects_backend_tls_fields() {
 fn test_passthrough_yaml_deserialization() {
     let yaml = r#"
 id: "tcp-pass-yaml"
-listen_path: ""
 backend_protocol: tcp
 backend_host: "db.internal"
 backend_port: 5432

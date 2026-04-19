@@ -128,17 +128,30 @@ pub fn sample_proxy_with_name(id: &str, name: &str, listen_path: &str, backend_p
 
 /// Minimal TCP stream proxy JSON with a `listen_port` (for port-uniqueness tests).
 ///
-/// `listen_path` is required by the deserializer on all proxies (empty-string
-/// default is applied at normalization time for stream proxies). We pass ""
-/// explicitly to satisfy the parser.
+/// Stream proxies route on `listen_port` and must NOT set `listen_path`.
+/// Sending `"listen_path": ""` — or any value — would be rejected by validation.
 pub fn sample_stream_proxy(id: &str, listen_port: u16, backend_port: u16) -> Value {
     json!({
         "id": id,
-        "listen_path": "",
         "backend_protocol": "tcp",
         "backend_host": "127.0.0.1",
         "backend_port": backend_port,
         "listen_port": listen_port,
+    })
+}
+
+/// Minimal host-only HTTP proxy JSON — routes all traffic on the given host.
+/// Produces a body with a `hosts` list and no `listen_path` key. HTTP-family
+/// proxies MUST set at least one of `hosts` or `listen_path`; a host-only
+/// proxy uses `hosts` alone.
+pub fn sample_host_only_proxy(id: &str, host: &str, backend_port: u16) -> Value {
+    json!({
+        "id": id,
+        "hosts": [host],
+        "backend_protocol": "http",
+        "backend_host": "127.0.0.1",
+        "backend_port": backend_port,
+        "strip_listen_path": true,
     })
 }
 

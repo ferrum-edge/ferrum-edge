@@ -91,7 +91,6 @@ async fn ephemeral_port() -> u16 {
 fn sample_stream_proxy(id: &str, listen_port: u16, backend_port: u16) -> serde_json::Value {
     json!({
         "id": id,
-        "listen_path": "",
         "backend_protocol": "tcp",
         "backend_host": "127.0.0.1",
         "backend_port": backend_port,
@@ -607,7 +606,6 @@ async fn functional_stream_listener_reload_remove_and_add() {
             r#"
 proxies:
   - id: "stream-a"
-    listen_path: ""
     listen_port: {stream_port_a}
     backend_protocol: tcp
     backend_host: "127.0.0.1"
@@ -679,7 +677,6 @@ plugin_configs: []
         r#"
 proxies:
   - id: "stream-b"
-    listen_path: ""
     listen_port: {stream_port_b}
     backend_protocol: tcp
     backend_host: "127.0.0.1"

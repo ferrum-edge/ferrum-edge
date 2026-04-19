@@ -15,7 +15,7 @@ info:
 
     The Admin API can be placed in **read-only mode**, in which case all POST,
     PUT, and DELETE operations return `403 Forbidden`.
-  version: 0.1.0
+  version: 0.2.0
   license:
     name: PolyForm Noncommercial 1.0.0
     url: https://polyformproject.org/licenses/noncommercial/1.0.0
@@ -1369,7 +1369,6 @@ components:
     Proxy:
       type: object
       required:
-        - listen_path
         - backend_protocol
         - backend_host
         - backend_port
@@ -1389,12 +1388,32 @@ components:
         listen_path:
           type: [string, "null"]
           description: >-
-            URL path prefix to match incoming requests. Must start with `/` for
-            literal path matching, or `~` for regex matching (e.g., `~^/api/v[0-9]+$`).
-            Regex patterns are compiled at creation time and auto-anchored with `^`
-            and `$` for full-path matching if not already present. To allow sub-path
-            matching, end the pattern with `.*` (e.g., `~/api/v[0-9]+/.*`).
-            The combination of `(hosts, listen_path)` must be unique across all proxies.
+            URL path prefix or `~regex` this proxy matches. Must start with `/`
+            for literal path matching, or `~` for regex matching
+            (e.g., `~^/api/v[0-9]+$`). Regex patterns are compiled at creation
+            time and auto-anchored with `^` and `$` for full-path matching if
+            not already present. To allow sub-path matching, end the pattern
+            with `.*` (e.g., `~/api/v[0-9]+/.*`).
+
+
+            **Required for HTTP-family proxies UNLESS `hosts` is non-empty.** An
+            HTTP proxy with neither `hosts` nor `listen_path` set is rejected —
+            that would route every request on every host and collides with every
+            other catch-all.
+
+
+            **MUST be omitted / null for stream-family proxies** (`tcp`,
+            `tcp_tls`, `udp`, `dtls`). Stream proxies route on `listen_port`.
+
+
+            When `listen_path` is null on an HTTP proxy, the proxy matches any
+            path under the configured `hosts`. `strip_listen_path` is a no-op
+            (nothing to strip); `backend_path` (if set) prepends to the
+            forwarded path.
+
+
+            The combination of `(hosts, listen_path)` must be unique across all
+            HTTP proxies in the same namespace.
           examples:
             - /api/v1
             - /users
@@ -1410,6 +1429,11 @@ components:
             prefixes (`*.example.com`). Entries are normalized to lowercase on
             create/update. Must match the format `[a-z0-9]([a-z0-9.-]*[a-z0-9])?`
             for exact hosts or `*.[a-z0-9]([a-z0-9.-]*[a-z0-9])?` for wildcards.
+
+
+            For HTTP-family proxies, either `hosts` or `listen_path` must be
+            set (both may be set together). A host-only proxy (hosts set, no
+            listen_path) matches any path under the configured hosts.
           examples:
             - ["api.example.com", "*.internal.example.com"]
         backend_protocol:
@@ -1435,7 +1459,10 @@ components:
         strip_listen_path:
           type: boolean
           default: true
-          description: Strip listen_path prefix before forwarding to backend
+          description: >-
+            Strip the matched `listen_path` prefix before forwarding to the
+            backend. No-op when `listen_path` is null (host-only proxies have
+            no prefix to strip).
         preserve_host_header:
           type: boolean
           default: false
@@ -1664,10 +1691,15 @@ components:
       description: |
         Request body for creating or updating a proxy. Same schema as Proxy
         but `id`, `created_at`, and `updated_at` are optional (server-managed).
+
+        **Validation rules** (enforced at admin API + file/DB load time):
+        - HTTP-family proxies: at least one of `hosts` or `listen_path` must
+          be set. A proxy with neither is rejected (400).
+        - Stream-family proxies (`tcp`/`tcp_tls`/`udp`/`dtls`): `listen_path`
+          MUST be null/omitted, and `listen_port` MUST be set.
       allOf:
         - $ref: "#/components/schemas/Proxy"
       required:
-        - listen_path
         - backend_protocol
         - backend_host
         - backend_port
@@ -1678,7 +1710,8 @@ components:
       description: |
         Protocol used to communicate with the backend.
         TCP/UDP protocols (tcp, tcp_tls, udp, dtls) are raw stream proxies
-        that require a `listen_port` instead of `listen_path`.
+        that route on `listen_port` and MUST NOT set `listen_path`.
+        HTTP-family protocols route on `hosts` and/or `listen_path`.
         `dtls` encrypts UDP datagrams to the backend using DTLS 1.2/1.3 (ECDSA P-256/P-384 keys only, version auto-negotiated).
 
     AuthMode:

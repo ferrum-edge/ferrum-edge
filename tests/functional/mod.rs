@@ -17,6 +17,7 @@ mod functional_file_mode_test;
 mod functional_graceful_shutdown_test;
 mod functional_grpc_plugins_test;
 mod functional_grpc_test;
+mod functional_host_only_routing_test;
 mod functional_load_balancer_test;
 mod functional_load_stress_test;
 mod functional_logging_plugins_test;

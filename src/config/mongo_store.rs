@@ -976,26 +976,76 @@ mod inner {
         async fn check_listen_path_unique(
             &self,
             namespace: &str,
-            listen_path: &str,
+            listen_path: Option<&str>,
             hosts: &[String],
             exclude_proxy_id: Option<&str>,
         ) -> Result<bool, anyhow::Error> {
-            let mut filter = doc! { "namespace": namespace, "listen_path": listen_path };
+            // Defensive: `None` listen_path + empty hosts is rejected by
+            // validate_fields_inner. Guard so the DB layer never admits
+            // a "match everything" proxy if a caller slips past validation.
+            if listen_path.is_none() && hosts.is_empty() {
+                return Ok(false);
+            }
+
+            // Filter on namespace + listen_path bucket (same path for path
+            // proxies, `null` for host-only proxies). Mongo's equality-to-null
+            // matches both a missing field and a literal null. Do NOT try to
+            // match hosts server-side with `$in` — that catches exact-string
+            // overlaps only and misses wildcard-to-exact or wildcard-to-wildcard
+            // overlaps that `hosts_overlap` must recognize. Fetch candidates
+            // and run the full overlap check in Rust (typically ≤ a handful
+            // of rows per bucket).
+            //
+            // Exclude stream proxies (tcp/tcp_tls/udp/dtls) from the query —
+            // they also serialize `listen_path` as null, and they commonly
+            // have empty `hosts` (which `hosts_overlap` treats as catch-all).
+            // Without this exclusion, a host-only HTTP create/update can be
+            // falsely rejected whenever any stream proxy exists in the
+            // namespace. Stream proxies have their own uniqueness check
+            // (`check_listen_port_unique`). Matches the sqlx impl.
+            let mut filter = match listen_path {
+                Some(path) => doc! { "namespace": namespace, "listen_path": path },
+                None => doc! { "namespace": namespace, "listen_path": null },
+            };
+            filter.insert(
+                "backend_protocol",
+                doc! { "$nin": ["tcp", "tcp_tls", "udp", "dtls"] },
+            );
             if let Some(id) = exclude_proxy_id {
                 filter.insert("_id", doc! { "$ne": id });
             }
-            // Check for overlapping hosts (empty hosts = catch-all, always conflicts)
-            if !hosts.is_empty() {
-                filter.insert(
-                    "$or",
-                    vec![
-                        doc! { "hosts": { "$size": 0 } },
-                        doc! { "hosts": { "$in": hosts } },
-                    ],
-                );
+
+            // `Some(path) + empty hosts` is a catch-all for the path — any
+            // existing proxy in this bucket conflicts regardless of hosts.
+            if listen_path.is_some() && hosts.is_empty() {
+                let count = self.proxies().count_documents(filter).await?;
+                return Ok(count == 0);
             }
-            let count = self.proxies().count_documents(filter).await?;
-            Ok(count == 0)
+
+            // Otherwise iterate candidates and check host overlap in Rust so
+            // wildcard semantics (e.g. `*.example.com` overlapping with
+            // `api.example.com`) are detected correctly.
+            let mut cursor = self
+                .proxies()
+                .find(filter)
+                .projection(doc! { "_id": 1, "hosts": 1 })
+                .await?;
+            while cursor.advance().await? {
+                let doc = cursor.deserialize_current()?;
+                let existing_hosts: Vec<String> = doc
+                    .get_array("hosts")
+                    .ok()
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if crate::config::types::hosts_overlap(hosts, &existing_hosts) {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
         }
 
         async fn check_proxy_name_unique(
@@ -1379,6 +1429,12 @@ mod inner {
                         .build(),
                 )
                 .await?;
+            // Intentionally NO unique index on (namespace, listen_path). Path
+            // uniqueness is host-scoped: two HTTP proxies may share a
+            // listen_path if their `hosts` lists do not overlap. A plain
+            // unique index would reject valid host-partitioned routes before
+            // the host-overlap check in `check_listen_path_unique` runs.
+            // Uniqueness is enforced at the application layer instead.
             self.proxies()
                 .create_index(IndexModel::builder().keys(doc! { "namespace": 1 }).build())
                 .await?;
@@ -1665,7 +1721,7 @@ mod inner {
                 namespace: crate::config::types::default_namespace(),
                 name: Some("My Proxy".to_string()),
                 hosts: vec!["example.com".to_string()],
-                listen_path: "/api".to_string(),
+                listen_path: Some("/api".to_string()),
                 backend_protocol: crate::config::types::BackendProtocol::Https,
                 backend_host: "backend.internal".to_string(),
                 backend_port: 8443,
@@ -1825,7 +1881,7 @@ mod inner {
                 namespace: crate::config::types::default_namespace(),
                 name: None,
                 hosts: vec![],
-                listen_path: "/".to_string(),
+                listen_path: Some("/".to_string()),
                 backend_protocol: crate::config::types::BackendProtocol::Http,
                 backend_host: "localhost".to_string(),
                 backend_port: 80,
@@ -1893,7 +1949,7 @@ mod inner {
                 name: None,        // must NOT appear in the document
                 listen_port: None, // must NOT appear in the document
                 hosts: vec![],
-                listen_path: "/".to_string(),
+                listen_path: Some("/".to_string()),
                 backend_protocol: crate::config::types::BackendProtocol::Http,
                 backend_host: "localhost".to_string(),
                 backend_port: 80,
@@ -2042,7 +2098,7 @@ mod inner {
                 namespace: crate::config::types::default_namespace(),
                 name: None,
                 hosts: vec![],
-                listen_path: "/test".to_string(),
+                listen_path: Some("/test".to_string()),
                 backend_protocol: crate::config::types::BackendProtocol::Http,
                 backend_host: "backend.local".to_string(),
                 backend_port: 8080,

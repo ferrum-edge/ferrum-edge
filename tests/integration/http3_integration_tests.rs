@@ -54,7 +54,7 @@ fn create_http3_test_proxy() -> Proxy {
         namespace: ferrum_edge::config::types::default_namespace(),
         name: Some("HTTP/3 Test Proxy".to_string()),
         hosts: vec![],
-        listen_path: "/http3-test".to_string(),
+        listen_path: Some("/http3-test".to_string()),
         backend_protocol: BackendProtocol::H3,
         backend_host: "facebook.com".to_string(),
         backend_port: 443,
@@ -383,7 +383,7 @@ async fn test_http3_configuration_loading() {
     // Verify proxy configuration
     let proxy = &gateway_config.proxies[0];
     assert_eq!(proxy.backend_protocol, BackendProtocol::H3);
-    assert_eq!(proxy.listen_path, "/http3-test");
+    assert_eq!(proxy.listen_path.as_deref(), Some("/http3-test"));
     assert_eq!(proxy.backend_host, "facebook.com");
 }
 
@@ -773,7 +773,7 @@ async fn test_http3_streaming_decision_logic() {
         namespace: ferrum_edge::config::types::default_namespace(),
         name: Some("H3 Streaming".to_string()),
         hosts: vec![],
-        listen_path: "/h3-stream".to_string(),
+        listen_path: Some("/h3-stream".to_string()),
         backend_protocol: BackendProtocol::H3,
         backend_host: "localhost".to_string(),
         backend_port: 443,
@@ -825,7 +825,7 @@ async fn test_http3_streaming_decision_logic() {
         id: "h3-buffered".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         name: Some("H3 Buffered".to_string()),
-        listen_path: "/h3-buffered".to_string(),
+        listen_path: Some("/h3-buffered".to_string()),
         retry: Some(RetryConfig {
             max_retries: 3,
             retry_on_connect_failure: true,
@@ -841,7 +841,7 @@ async fn test_http3_streaming_decision_logic() {
         id: "h3-body-plugin".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         name: Some("H3 Body Plugin".to_string()),
-        listen_path: "/h3-body-plugin".to_string(),
+        listen_path: Some("/h3-body-plugin".to_string()),
         retry: None,
         plugins: vec![PluginAssociation {
             plugin_config_id: "ai-token-metrics-cfg".to_string(),

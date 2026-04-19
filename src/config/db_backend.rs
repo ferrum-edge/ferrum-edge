@@ -213,10 +213,24 @@ pub trait DatabaseBackend: Send + Sync {
     // Validation queries
     // -----------------------------------------------------------------------
 
+    /// Returns `true` when the `(listen_path, hosts)` combination does not
+    /// conflict with any existing proxy in `namespace`.
+    ///
+    /// Conflict semantics:
+    /// - `Some(path) + non-empty hosts` — conflict with any existing proxy with
+    ///   the same `listen_path` AND overlapping hosts (empty hosts on the
+    ///   existing row counts as catch-all and overlaps with everything).
+    /// - `Some(path) + empty hosts` — conflict with any existing proxy with the
+    ///   same `listen_path` regardless of hosts.
+    /// - `None + non-empty hosts` (host-only proxy) — conflict with any
+    ///   existing proxy that has `listen_path IS NULL` AND overlapping hosts.
+    /// - `None + empty hosts` — rejected upstream of this call in
+    ///   `validate_fields_inner`. Defensive implementations should return an
+    ///   error or `Ok(false)` here.
     async fn check_listen_path_unique(
         &self,
         namespace: &str,
-        listen_path: &str,
+        listen_path: Option<&str>,
         hosts: &[String],
         exclude_proxy_id: Option<&str>,
     ) -> Result<bool, anyhow::Error>;

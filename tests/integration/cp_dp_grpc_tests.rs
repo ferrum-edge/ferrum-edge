@@ -38,7 +38,7 @@ fn create_test_proxy(id: &str, listen_path: &str) -> Proxy {
         namespace: ferrum_edge::config::types::default_namespace(),
         name: Some(format!("Test Proxy {}", id)),
         hosts: vec![],
-        listen_path: listen_path.to_string(),
+        listen_path: Some(listen_path.to_string()),
         backend_protocol: BackendProtocol::Http,
         backend_host: "localhost".to_string(),
         backend_port: 3000,

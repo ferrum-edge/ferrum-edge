@@ -24,6 +24,7 @@ A comprehensive feature list for Ferrum Edge.
 
 - Longest prefix match on `listen_path` with unique path enforcement
 - Host-based routing with exact and wildcard prefix support (`*.example.com`)
+- **Host-only routing** — HTTP proxies can match purely on `hosts` with no `listen_path`. A host-only proxy serves any path under the configured host. Per-host matching order: exact path → regex path → host-only fallback.
 - Pre-sorted route table with bounded O(1) path cache, rebuilt atomically on config changes
 - Configurable path stripping and backend path prefixing
 - Per-proxy HTTP method filtering (`allowed_methods`) with 405 Method Not Allowed responses
@@ -123,7 +124,7 @@ Ferrum supports dynamic upstream target discovery through three providers, confi
 
 ### Spec Expose Plugin
 
-- **Spec Expose** — exposes API specification documents (OpenAPI, Swagger, WSDL, WADL) on a `/specz` sub-path of each proxy's listen path. Fetches the spec from a configured upstream URL and returns it to the caller with the upstream's `Content-Type` preserved. The `/specz` endpoint is unauthenticated — the plugin short-circuits before authentication runs, so consumers can discover API contracts without credentials. Supports per-plugin TLS verification skip for internal endpoints with self-signed certificates. Only works with prefix-based `listen_path` proxies. Inspired by [kong-spec-expose](https://github.com/Optum/kong-spec-expose)
+- **Spec Expose** — exposes API specification documents (OpenAPI, Swagger, WSDL, WADL) on a `/specz` sub-path of each proxy's listen path. Fetches the spec from a configured upstream URL and returns it to the caller with the upstream's `Content-Type` preserved. The `/specz` endpoint is unauthenticated — the plugin short-circuits before authentication runs, so consumers can discover API contracts without credentials. Supports per-plugin TLS verification skip for internal endpoints with self-signed certificates. Only works with prefix-based `listen_path` proxies.
 
 ### SSE Plugin
 

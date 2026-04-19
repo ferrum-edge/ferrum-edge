@@ -70,7 +70,7 @@ fn create_test_proxy(id: &str, listen_path: &str, host: &str, port: u16) -> Prox
         namespace: ferrum_edge::config::types::default_namespace(),
         name: Some(format!("Test Proxy {}", id)),
         hosts: vec![],
-        listen_path: listen_path.to_string(),
+        listen_path: Some(listen_path.to_string()),
         backend_protocol: BackendProtocol::Http,
         backend_host: host.to_string(),
         backend_port: port,
@@ -2612,7 +2612,6 @@ async fn test_stream_proxy_admin_shape_preserved_across_get_and_backup() {
 
     let proxy = json!({
         "id": "stream-shape-proxy",
-        "listen_path": "",
         "backend_protocol": "tcp",
         "backend_host": "localhost",
         "backend_port": 5432,
@@ -2624,7 +2623,13 @@ async fn test_stream_proxy_admin_shape_preserved_across_get_and_backup() {
 
     let (status, proxy_body, _) = admin_get(&base_url, "/proxies/stream-shape-proxy", &token).await;
     assert_eq!(status, reqwest::StatusCode::OK);
-    assert_eq!(proxy_body["listen_path"], "");
+    // Stream proxies MUST NOT have listen_path set — the admin API serializes
+    // Option<String> None as null.
+    assert!(
+        proxy_body["listen_path"].is_null(),
+        "Stream proxy listen_path should be null, got {:?}",
+        proxy_body["listen_path"]
+    );
 
     let (status, backup, _) = admin_get(&base_url, "/backup", &token).await;
     assert_eq!(status, reqwest::StatusCode::OK);
@@ -2634,7 +2639,11 @@ async fn test_stream_proxy_admin_shape_preserved_across_get_and_backup() {
         .iter()
         .find(|proxy| proxy["id"] == "stream-shape-proxy")
         .unwrap();
-    assert_eq!(proxy_entry["listen_path"], "");
+    assert!(
+        proxy_entry["listen_path"].is_null(),
+        "Backup stream proxy listen_path should be null, got {:?}",
+        proxy_entry["listen_path"]
+    );
 }
 
 // ============================================================================

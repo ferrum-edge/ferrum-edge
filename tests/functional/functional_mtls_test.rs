@@ -1097,7 +1097,6 @@ async fn test_tcp_frontend_mtls_valid_client() {
                 r#"
 proxies:
   - id: "t11"
-    listen_path: ""
     listen_port: {pp}
     backend_protocol: tcp
     backend_host: "127.0.0.1"
@@ -1185,7 +1184,6 @@ async fn test_tcp_frontend_mtls_no_client_cert_rejected() {
                 r#"
 proxies:
   - id: "t12"
-    listen_path: ""
     listen_port: {pp}
     backend_protocol: tcp
     backend_host: "127.0.0.1"
