@@ -592,10 +592,9 @@ async fn main() -> anyhow::Result<()> {
     let (cert_path, key_path) =
         tls_utils::generate_self_signed_certs(&cert_dir).context("generating certs")?;
 
-    let tls_cfg = Arc::new(
-        tls_utils::make_server_tls_config(&cert_path, &key_path)
-            .context("building server TLS config")?,
-    );
+    // Each TLS listener now builds its own ServerConfig with protocol-specific
+    // ALPN (h2-only for 3443, h1-only for 3447, wss for 3446, etc.) so silent
+    // protocol mismatches can't slip through. See make_server_tls_config_*.
     let h3_cfg = tls_utils::make_h3_server_config(&cert_path, &key_path)
         .context("building H3 server config")?;
 
@@ -636,12 +635,26 @@ async fn main() -> anyhow::Result<()> {
             eprintln!("h2c server error: {e}");
         }
     });
-    tokio::spawn(async move {
-        if let Err(e) = run_h2_tls_server("127.0.0.1:3443".parse().unwrap(), tls_cfg.clone()).await
-        {
-            eprintln!("h2-tls server error: {e}");
-        }
-    });
+    {
+        // H2-only ALPN — the hyper server at 3443 is H2-exclusive. The
+        // generic tls_cfg (used for TCP+TLS, DTLS, etc.) advertises both
+        // `h2` and `http/1.1`, which lets an upstream client that
+        // negotiates http/1.1 through the handshake and then the H2 byte
+        // parser rejects its requests. Restricting ALPN to `h2` here gives
+        // a clean TLS failure for any non-H2 client instead of a silent
+        // protocol mismatch.
+        let h2_tls = Arc::new(
+            tls_utils::make_server_tls_config_h2_only(&cert_path, &key_path)
+                .context("building h2-tls server config")?,
+        );
+        tokio::spawn(async move {
+            if let Err(e) =
+                run_h2_tls_server("127.0.0.1:3443".parse().unwrap(), h2_tls).await
+            {
+                eprintln!("h2-tls server error: {e}");
+            }
+        });
+    }
     {
         // H1-only ALPN — critical so gateway upstream clients that offer `h2`
         // (Go net/http defaults in Kong/Tyk/KrakenD) cannot silently negotiate
@@ -665,8 +678,11 @@ async fn main() -> anyhow::Result<()> {
         }
     });
     {
+        // WSS uses HTTP/1.1 for the upgrade handshake — advertise only
+        // `http/1.1` so a gateway upstream client that also offers `h2`
+        // can't negotiate `h2` and break the WebSocket upgrade.
         let wss_tls = Arc::new(
-            tls_utils::make_server_tls_config(&cert_path, &key_path)
+            tls_utils::make_server_tls_config_h1_only(&cert_path, &key_path)
                 .context("building wss server config")?,
         );
         tokio::spawn(async move {

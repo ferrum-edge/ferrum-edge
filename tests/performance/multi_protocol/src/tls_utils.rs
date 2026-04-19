@@ -73,6 +73,24 @@ pub fn make_server_tls_config_h1_only(
     Ok(cfg)
 }
 
+/// Build a `rustls::ServerConfig` that advertises ONLY `h2` via ALPN.
+///
+/// Mirrors `make_server_tls_config_h1_only` for the H2-over-TLS listener
+/// (port 3443). The generic `make_server_tls_config` advertises `["h2",
+/// "http/1.1"]`, which lets an upstream client that negotiates `http/1.1`
+/// (or offers no ALPN at all) through the TLS handshake — then hyper's
+/// H2-only server rejects the HTTP/1.1 bytes. By advertising only `h2` we
+/// force every client to either negotiate `h2` or fail TLS cleanly, so a
+/// benchmark never silently measures a broken transport.
+pub fn make_server_tls_config_h2_only(
+    cert_path: &Path,
+    key_path: &Path,
+) -> anyhow::Result<rustls::ServerConfig> {
+    let mut cfg = make_server_tls_config_base(cert_path, key_path)?;
+    cfg.alpn_protocols = vec![b"h2".to_vec()];
+    Ok(cfg)
+}
+
 fn make_server_tls_config_base(
     cert_path: &Path,
     key_path: &Path,

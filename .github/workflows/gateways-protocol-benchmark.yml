@@ -8,15 +8,18 @@
 # artifacts are uploaded, then a final aggregate job downloads them all and posts
 # a combined markdown summary to the GitHub Actions step summary.
 #
-# Gateway × Protocol support (as of 2026-04):
+# Gateway × Protocol support (as of 2026-04) — every cell is uniform E2E.
+# A gateway only appears in a row if it can speak that protocol on BOTH
+# the client→gateway leg and the gateway→backend leg.
 #   http1-tls : ferrum, envoy, kong, tyk, krakend
-#   http2     : ferrum, envoy, kong, tyk, krakend
-#   http3     : ferrum, envoy                                  (Kong no supported HTTP/3 cfg path;
-#                                                               Tyk/KrakenD no HTTP/3 at all)
-#   grpcs     : ferrum, envoy, kong, tyk                       (KrakenD CE no gRPC)
-#   wss       : ferrum, envoy, kong, tyk                       (KrakenD CE no WS)
-#   tcp-tls   : ferrum, envoy, kong, tyk                       (KrakenD no TCP)
-#   udp       : ferrum, envoy, kong                            (Tyk/KrakenD no UDP)
+#   http2     : ferrum, envoy, tyk, krakend                    (Kong: no H2 upstream support in
+#                                                               OpenResty; would measure H2→H1)
+#   http3     : ferrum, envoy                                  (Kong: no supported HTTP/3 cfg path;
+#                                                               Tyk/KrakenD: no HTTP/3 at all)
+#   grpcs     : ferrum, envoy, kong, tyk                       (KrakenD CE: no gRPC)
+#   wss       : ferrum, envoy, kong, tyk                       (KrakenD CE: no WebSockets)
+#   tcp-tls   : ferrum, envoy, kong, tyk                       (KrakenD: no raw TCP)
+#   udp       : ferrum, envoy, kong                            (Tyk/KrakenD: no UDP)
 #   udp-dtls  : ferrum                                         (only Ferrum; direct backend baseline)
 
 name: Gateways Protocol Benchmark
@@ -166,22 +169,31 @@ jobs:
         if: steps.skip_check.outputs.skip != 'true'
         id: gateways
         run: |
-          # Matrix exclusions:
+          # Matrix exclusions — every (gateway, protocol) cell we run is
+          # uniform end-to-end: the same protocol on both the client→gateway
+          # and gateway→backend legs. Gateways that can only do half the
+          # protocol (e.g. terminate H2 but speak H1 upstream) are excluded
+          # rather than measured dishonestly.
+          #
           # - KrakenD CE does NOT support gRPC or WebSocket proxying (both are
           #   Enterprise-only — /docs/enterprise/backends/grpc/ and /websockets/).
           #   We ship CE (krakend:2.13.2), so krakend is omitted from grpcs + wss.
-          # - Kong does NOT have a documented first-class HTTP/3 config path.
-          #   KONG_PROXY_LISTEN doesn't accept http3/quic suffixes, and HTTP/3
-          #   would require experimental KONG_NGINX_HTTP_LISTEN template
-          #   injection. Omitted from http3 until Kong ships supported config.
+          # - Kong HTTP/2: Kong terminates H2 downstream but OpenResty/nginx
+          #   `proxy_pass` is HTTP/1.1 only (no H2 upstream module in the
+          #   Kong Docker image). A Kong/http2 row would be client→H2→Kong
+          #   →H1→backend, so kong is omitted from http2 until Kong ships
+          #   H2-upstream support.
+          # - Kong HTTP/3: no documented first-class HTTP/3 config path.
+          #   KONG_PROXY_LISTEN doesn't accept http3/quic suffixes.
           case "${{ matrix.protocol }}" in
-            http1-tls|http2) all="ferrum envoy kong tyk krakend" ;;
-            wss)      all="ferrum envoy kong tyk" ;;
-            grpcs)    all="ferrum envoy kong tyk" ;;
-            http3)    all="ferrum envoy" ;;
-            tcp-tls)  all="ferrum envoy kong tyk" ;;
-            udp)      all="ferrum envoy kong" ;;
-            udp-dtls) all="ferrum" ;;
+            http1-tls) all="ferrum envoy kong tyk krakend" ;;
+            http2)     all="ferrum envoy tyk krakend" ;;
+            wss)       all="ferrum envoy kong tyk" ;;
+            grpcs)     all="ferrum envoy kong tyk" ;;
+            http3)     all="ferrum envoy" ;;
+            tcp-tls)   all="ferrum envoy kong tyk" ;;
+            udp)       all="ferrum envoy kong" ;;
+            udp-dtls)  all="ferrum" ;;
           esac
           skip="${{ inputs.skip_gateways }}"
           gws=""
@@ -599,10 +611,17 @@ jobs:
           lines.append("- Gateways that do not support a protocol are omitted from that protocol's tables.")
           lines.append("- `direct` = bench against `proto_backend` directly (no gateway), as the baseline.")
           lines.append("- UDP and UDP+DTLS use a fixed 1KB payload; all other protocols sweep 10KB–5MB.")
-          lines.append("- HTTP/3 runs Ferrum vs Envoy only — Kong has no supported HTTP/3 config path "
-                       "(KONG_PROXY_LISTEN does not accept http3/quic flags); Tyk and KrakenD CE have no "
-                       "HTTP/3 support at all.")
-          lines.append("- KrakenD CE does not proxy gRPC, WebSockets, TCP, UDP, or DTLS (Enterprise-only).")
+          lines.append("- Every cell is protocol-uniform end-to-end: the same protocol on "
+                       "client→gateway and gateway→backend. Gateways that could only do half a "
+                       "protocol are excluded from that row rather than measured dishonestly.")
+          lines.append("- HTTP/2 excludes Kong — Kong can terminate H2 downstream but "
+                       "OpenResty/nginx upstream is HTTP/1.1 only, so a Kong/http2 cell would "
+                       "measure client→H2→Kong→H1→backend, not uniform H2.")
+          lines.append("- HTTP/3 runs Ferrum vs Envoy only — Kong has no supported HTTP/3 config "
+                       "path (KONG_PROXY_LISTEN does not accept http3/quic flags); Tyk and "
+                       "KrakenD CE have no HTTP/3 support at all.")
+          lines.append("- KrakenD CE does not proxy gRPC, WebSockets, TCP, UDP, or DTLS "
+                       "(Enterprise-only).")
 
           summary = "\n".join(lines) + "\n"
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
