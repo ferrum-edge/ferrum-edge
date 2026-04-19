@@ -1,0 +1,42 @@
+_format_version: "3.0"
+
+# Kong DB-less declarative configuration — TCP end-to-end TLS stream proxy.
+# Client TLS → Kong (terminate + re-originate TLS) → TCP+TLS upstream on 3444.
+# Every hop encrypted. Kong's `tls_passthrough` protocol is for passthrough,
+# not re-origination; we use `tls` + an upstream with protocol `tls` to
+# terminate and re-encrypt.
+#
+# Stream routes require KONG_STREAM_LISTEN=127.0.0.1:5001 ssl env var.
+
+services:
+  - name: tcp-service
+    host: 127.0.0.1
+    port: 3444
+    protocol: tls
+    tls_verify: false
+    connect_timeout: 5000
+    read_timeout: 300000
+    write_timeout: 300000
+    routes:
+      - name: tcp-tls-route
+        destinations:
+          - port: 5001
+        protocols:
+          - tls
+
+  # HTTP service kept so harness health-probe path still works on HTTP admin listener.
+  - name: health-service
+    host: 127.0.0.1
+    port: 3010
+    protocol: http
+    connect_timeout: 1000
+    read_timeout: 5000
+    write_timeout: 5000
+    routes:
+      - name: health-route
+        paths:
+          - /health
+        protocols:
+          - http
+          - https
+        strip_path: false

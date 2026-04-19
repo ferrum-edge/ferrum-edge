@@ -1,0 +1,21 @@
+{
+  "name": "Echo API (HTTP/1.1 E2E TLS)",
+  "slug": "echo-h1-tls",
+  "api_id": "echo-h1-tls",
+  "org_id": "default",
+  "use_keyless": true,
+  "active": true,
+  "proxy": {
+    "listen_path": "/echo",
+    "target_url": "https://127.0.0.1:3447",
+    "strip_listen_path": false,
+    "transport": {
+      "ssl_insecure_skip_verify": true
+    }
+  },
+  "version_data": {
+    "not_versioned": true,
+    "default_version": "Default",
+    "versions": { "Default": { "name": "Default" } }
+  }
+}

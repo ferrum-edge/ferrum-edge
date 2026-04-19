@@ -1,0 +1,38 @@
+_format_version: "3.0"
+
+# Kong DB-less declarative configuration — plain UDP stream proxy
+# Gateway UDP on stream port 5003 → UDP echo backend on 3005
+#
+# Stream routes require KONG_STREAM_LISTEN=127.0.0.1:5003 udp env var.
+# Kong stream subsystem supports UDP via the "udp" listener suffix.
+
+services:
+  - name: udp-service
+    host: 127.0.0.1
+    port: 3005
+    protocol: udp
+    connect_timeout: 5000
+    read_timeout: 300000
+    write_timeout: 300000
+    routes:
+      - name: udp-route
+        destinations:
+          - port: 5003
+        protocols:
+          - udp
+
+  - name: health-service
+    host: 127.0.0.1
+    port: 3010
+    protocol: http
+    connect_timeout: 1000
+    read_timeout: 5000
+    write_timeout: 5000
+    routes:
+      - name: health-route
+        paths:
+          - /health
+        protocols:
+          - http
+          - https
+        strip_path: false

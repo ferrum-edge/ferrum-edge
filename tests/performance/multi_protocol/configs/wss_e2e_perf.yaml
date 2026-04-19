@@ -1,0 +1,36 @@
+---
+# WebSocket Secure end-to-end TLS performance test config.
+# Client --WSS--> gateway --WSS--> backend. Every hop encrypted.
+# Used exclusively by gateways-protocol-benchmark.yml for the "wss" matrix job.
+proxies:
+  - id: "wss-e2e-echo"
+    name: "WSS E2E Echo"
+    listen_path: "/ws"
+    backend_protocol: wss
+    backend_host: "127.0.0.1"
+    backend_port: 3446
+    strip_listen_path: true
+    preserve_host_header: false
+    backend_connect_timeout_ms: 5000
+    backend_read_timeout_ms: 30000
+    backend_write_timeout_ms: 30000
+    backend_tls_verify_server_cert: false
+    auth_mode: single
+    plugins: []
+
+  - id: "wss-e2e-health"
+    name: "WSS E2E Health"
+    listen_path: "/health"
+    backend_protocol: http
+    backend_host: "127.0.0.1"
+    backend_port: 3010
+    strip_listen_path: false
+    preserve_host_header: false
+    backend_connect_timeout_ms: 1000
+    backend_read_timeout_ms: 5000
+    backend_write_timeout_ms: 5000
+    auth_mode: single
+    plugins: []
+
+consumers: []
+plugin_configs: []

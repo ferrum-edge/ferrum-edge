@@ -2,10 +2,11 @@
 //!
 //! Starts servers on the following ports:
 //!   HTTP/2 h2c:     3002    HTTPS/H2:  3443
-//!   WebSocket:      3003    gRPC h2c:  50052
+//!   WebSocket:      3003    WSS:       3446
 //!   TCP echo:       3004    TCP+TLS:   3444
 //!   UDP echo:       3005    DTLS echo: 3006
-//!   HTTP/3 (QUIC):  3445
+//!   HTTP/3 (QUIC):  3445    H1+TLS:    3447
+//!   gRPC h2c:      50052    gRPC+TLS: 50053
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
@@ -175,6 +176,30 @@ async fn run_h2c_server(addr: SocketAddr) -> anyhow::Result<()> {
     }
 }
 
+async fn run_h1_tls_server(
+    addr: SocketAddr,
+    tls_cfg: Arc<rustls::ServerConfig>,
+) -> anyhow::Result<()> {
+    let listener = TcpListener::bind(addr)
+        .await
+        .context("binding h1-tls listener")?;
+    let acceptor = tokio_rustls::TlsAcceptor::from(tls_cfg);
+    loop {
+        let (stream, _) = listener.accept().await?;
+        let _ = stream.set_nodelay(true);
+        let acceptor = acceptor.clone();
+        tokio::spawn(async move {
+            let Ok(tls_stream) = acceptor.accept(stream).await else {
+                return;
+            };
+            let io = TokioIo::new(tls_stream);
+            let _ = hyper::server::conn::http1::Builder::new()
+                .serve_connection(io, hyper::service::service_fn(handle_http))
+                .await;
+        });
+    }
+}
+
 async fn run_h2_tls_server(
     addr: SocketAddr,
     tls_cfg: Arc<rustls::ServerConfig>,
@@ -226,6 +251,36 @@ async fn run_ws_server(addr: SocketAddr) -> anyhow::Result<()> {
     }
 }
 
+async fn run_wss_server(
+    addr: SocketAddr,
+    tls_cfg: Arc<rustls::ServerConfig>,
+) -> anyhow::Result<()> {
+    use futures_util::{SinkExt, StreamExt};
+    let listener = TcpListener::bind(addr)
+        .await
+        .context("binding wss listener")?;
+    let acceptor = tokio_rustls::TlsAcceptor::from(tls_cfg);
+    loop {
+        let (stream, _) = listener.accept().await?;
+        let _ = stream.set_nodelay(true);
+        let acceptor = acceptor.clone();
+        tokio::spawn(async move {
+            let Ok(tls_stream) = acceptor.accept(stream).await else {
+                return;
+            };
+            let Ok(ws) = tokio_tungstenite::accept_async(tls_stream).await else {
+                return;
+            };
+            let (mut write, mut read) = ws.split();
+            while let Some(Ok(msg)) = read.next().await {
+                if (msg.is_text() || msg.is_binary()) && write.send(msg).await.is_err() {
+                    break;
+                }
+            }
+        });
+    }
+}
+
 async fn run_grpc_server(addr: SocketAddr) -> anyhow::Result<()> {
     tonic::transport::Server::builder()
         .initial_stream_window_size(8_388_608) // 8 MiB (vs 64 KB default)
@@ -235,6 +290,28 @@ async fn run_grpc_server(addr: SocketAddr) -> anyhow::Result<()> {
         .serve(addr)
         .await
         .context("gRPC server error")
+}
+
+async fn run_grpcs_server(
+    addr: SocketAddr,
+    cert_path: &std::path::Path,
+    key_path: &std::path::Path,
+) -> anyhow::Result<()> {
+    let cert_pem = std::fs::read(cert_path).context("reading grpcs cert")?;
+    let key_pem = std::fs::read(key_path).context("reading grpcs key")?;
+    let identity = tonic::transport::Identity::from_pem(cert_pem, key_pem);
+    let tls = tonic::transport::ServerTlsConfig::new().identity(identity);
+
+    tonic::transport::Server::builder()
+        .tls_config(tls)
+        .context("configuring grpcs TLS")?
+        .initial_stream_window_size(8_388_608)
+        .initial_connection_window_size(33_554_432)
+        .tcp_nodelay(true)
+        .add_service(BenchServiceServer::new(BenchServiceImpl))
+        .serve(addr)
+        .await
+        .context("grpcs server error")
 }
 
 async fn run_tcp_echo(addr: SocketAddr) -> anyhow::Result<()> {
@@ -515,10 +592,9 @@ async fn main() -> anyhow::Result<()> {
     let (cert_path, key_path) =
         tls_utils::generate_self_signed_certs(&cert_dir).context("generating certs")?;
 
-    let tls_cfg = Arc::new(
-        tls_utils::make_server_tls_config(&cert_path, &key_path)
-            .context("building server TLS config")?,
-    );
+    // Each TLS listener now builds its own ServerConfig with protocol-specific
+    // ALPN (h2-only for 3443, h1-only for 3447, wss for 3446, etc.) so silent
+    // protocol mismatches can't slip through. See make_server_tls_config_*.
     let h3_cfg = tls_utils::make_h3_server_config(&cert_path, &key_path)
         .context("building H3 server config")?;
 
@@ -528,8 +604,11 @@ async fn main() -> anyhow::Result<()> {
     println!("HTTP/1.1 Health:  127.0.0.1:3010");
     println!("HTTP/2 (h2c):    127.0.0.1:3002");
     println!("HTTPS/H2 (TLS):  127.0.0.1:3443");
+    println!("HTTP/1.1+TLS:     127.0.0.1:3447");
     println!("WebSocket:        127.0.0.1:3003");
+    println!("WSS (TLS):         127.0.0.1:3446");
     println!("gRPC (h2c):       127.0.0.1:50052");
+    println!("gRPC+TLS:         127.0.0.1:50053");
     println!("TCP Echo:          127.0.0.1:3004");
     println!("TCP+TLS Echo:      127.0.0.1:3444");
     println!("UDP Echo:          127.0.0.1:3005");
@@ -556,22 +635,82 @@ async fn main() -> anyhow::Result<()> {
             eprintln!("h2c server error: {e}");
         }
     });
-    tokio::spawn(async move {
-        if let Err(e) = run_h2_tls_server("127.0.0.1:3443".parse().unwrap(), tls_cfg.clone()).await
-        {
-            eprintln!("h2-tls server error: {e}");
-        }
-    });
+    {
+        // H2-only ALPN — the hyper server at 3443 is H2-exclusive. The
+        // generic tls_cfg (used for TCP+TLS, DTLS, etc.) advertises both
+        // `h2` and `http/1.1`, which lets an upstream client that
+        // negotiates http/1.1 through the handshake and then the H2 byte
+        // parser rejects its requests. Restricting ALPN to `h2` here gives
+        // a clean TLS failure for any non-H2 client instead of a silent
+        // protocol mismatch.
+        let h2_tls = Arc::new(
+            tls_utils::make_server_tls_config_h2_only(&cert_path, &key_path)
+                .context("building h2-tls server config")?,
+        );
+        tokio::spawn(async move {
+            if let Err(e) =
+                run_h2_tls_server("127.0.0.1:3443".parse().unwrap(), h2_tls).await
+            {
+                eprintln!("h2-tls server error: {e}");
+            }
+        });
+    }
+    {
+        // H1-only ALPN — critical so gateway upstream clients that offer `h2`
+        // (Go net/http defaults in Kong/Tyk/KrakenD) cannot silently negotiate
+        // h2 against our HTTP/1.1-only hyper server and then fail mid-parse.
+        // Using the generic make_server_tls_config here advertises both `h2`
+        // and `http/1.1`, which lets h2-preferring clients through and then
+        // the HTTP/1.1 byte parser rejects every request.
+        let h1_tls = Arc::new(
+            tls_utils::make_server_tls_config_h1_only(&cert_path, &key_path)
+                .context("building h1-tls server config")?,
+        );
+        tokio::spawn(async move {
+            if let Err(e) = run_h1_tls_server("127.0.0.1:3447".parse().unwrap(), h1_tls).await {
+                eprintln!("h1-tls server error: {e}");
+            }
+        });
+    }
     tokio::spawn(async {
         if let Err(e) = run_ws_server("127.0.0.1:3003".parse().unwrap()).await {
             eprintln!("ws server error: {e}");
         }
     });
+    {
+        // WSS uses HTTP/1.1 for the upgrade handshake — advertise only
+        // `http/1.1` so a gateway upstream client that also offers `h2`
+        // can't negotiate `h2` and break the WebSocket upgrade.
+        let wss_tls = Arc::new(
+            tls_utils::make_server_tls_config_h1_only(&cert_path, &key_path)
+                .context("building wss server config")?,
+        );
+        tokio::spawn(async move {
+            if let Err(e) = run_wss_server("127.0.0.1:3446".parse().unwrap(), wss_tls).await {
+                eprintln!("wss server error: {e}");
+            }
+        });
+    }
     tokio::spawn(async {
         if let Err(e) = run_grpc_server("127.0.0.1:50052".parse().unwrap()).await {
             eprintln!("grpc server error: {e}");
         }
     });
+    {
+        let grpcs_cert = cert_path.clone();
+        let grpcs_key = key_path.clone();
+        tokio::spawn(async move {
+            if let Err(e) = run_grpcs_server(
+                "127.0.0.1:50053".parse().unwrap(),
+                &grpcs_cert,
+                &grpcs_key,
+            )
+            .await
+            {
+                eprintln!("grpcs server error: {e}");
+            }
+        });
+    }
     tokio::spawn(async {
         if let Err(e) = run_tcp_echo("127.0.0.1:3004".parse().unwrap()).await {
             eprintln!("tcp echo error: {e}");

@@ -1,0 +1,40 @@
+_format_version: "3.0"
+
+# Kong DB-less declarative configuration — WSS end-to-end TLS.
+# Client WSS → Kong (TLS termination + WS upgrade) → WSS upstream on 3446.
+# Every hop encrypted. Kong proxies WebSocket transparently over HTTPS routes.
+
+services:
+  - name: ws-service
+    host: 127.0.0.1
+    port: 3446
+    protocol: https
+    tls_verify: false
+    connect_timeout: 5000
+    read_timeout: 3600000
+    write_timeout: 3600000
+    routes:
+      - name: ws-route
+        paths:
+          - /ws
+        protocols:
+          - http
+          - https
+        strip_path: true
+        preserve_host: false
+
+  - name: health-service
+    host: 127.0.0.1
+    port: 3010
+    protocol: http
+    connect_timeout: 1000
+    read_timeout: 5000
+    write_timeout: 5000
+    routes:
+      - name: health-route
+        paths:
+          - /health
+        protocols:
+          - http
+          - https
+        strip_path: false

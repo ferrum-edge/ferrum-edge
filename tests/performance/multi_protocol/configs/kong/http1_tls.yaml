@@ -1,0 +1,40 @@
+_format_version: "3.0"
+
+# Kong DB-less declarative configuration — HTTP/1.1 end-to-end TLS.
+# Client HTTPS → Kong → HTTPS upstream on 3443. Every hop encrypted.
+# Listener is configured via KONG_PROXY_LISTEN env var in harness script.
+
+services:
+  - name: echo-service
+    host: 127.0.0.1
+    port: 3447
+    protocol: https
+    tls_verify: false
+    connect_timeout: 5000
+    read_timeout: 30000
+    write_timeout: 30000
+    routes:
+      - name: echo-route
+        paths:
+          - /echo
+        protocols:
+          - http
+          - https
+        strip_path: false
+        preserve_host: false
+
+  - name: health-service
+    host: 127.0.0.1
+    port: 3010
+    protocol: http
+    connect_timeout: 1000
+    read_timeout: 5000
+    write_timeout: 5000
+    routes:
+      - name: health-route
+        paths:
+          - /health
+        protocols:
+          - http
+          - https
+        strip_path: false

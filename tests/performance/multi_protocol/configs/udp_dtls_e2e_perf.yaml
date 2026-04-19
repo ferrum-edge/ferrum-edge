@@ -1,0 +1,34 @@
+---
+# UDP end-to-end DTLS performance test config.
+# Client --DTLS--> gateway --DTLS--> backend. Every hop encrypted.
+# Used exclusively by gateways-protocol-benchmark.yml for the "udp-dtls" matrix job.
+proxies:
+  - id: "udp-dtls-e2e-echo"
+    name: "UDP+DTLS E2E Echo"
+    listen_path: ""
+    listen_port: 5004
+    backend_protocol: dtls
+    backend_host: "127.0.0.1"
+    backend_port: 3006
+    frontend_tls: true
+    backend_tls_verify_server_cert: false
+    udp_idle_timeout_seconds: 30
+    auth_mode: single
+    plugins: []
+
+  - id: "udp-dtls-e2e-health"
+    name: "Health"
+    listen_path: "/health"
+    backend_protocol: http
+    backend_host: "127.0.0.1"
+    backend_port: 3010
+    strip_listen_path: false
+    preserve_host_header: false
+    backend_connect_timeout_ms: 1000
+    backend_read_timeout_ms: 5000
+    backend_write_timeout_ms: 5000
+    auth_mode: single
+    plugins: []
+
+consumers: []
+plugin_configs: []

@@ -1,0 +1,637 @@
+# Gateways × Protocols head-to-head benchmark (hybrid of comparison-benchmark.yml
+# and perf-benchmark.yml). For every TLS/encrypted protocol Ferrum Edge supports,
+# runs every gateway that supports that protocol at 5 payload sizes
+# (10KB, 70KB, 500KB, 1MB, 5MB). UDP and UDP+DTLS are fixed at 1KB.
+#
+# Each protocol runs in its own ubuntu-latest runner (strategy.matrix), so the 8
+# protocols execute in parallel with isolated CPU / filesystem state. Per-protocol
+# artifacts are uploaded, then a final aggregate job downloads them all and posts
+# a combined markdown summary to the GitHub Actions step summary.
+#
+# Gateway × Protocol support (as of 2026-04) — every cell is uniform E2E.
+# A gateway only appears in a row if it can speak that protocol on BOTH
+# the client→gateway leg and the gateway→backend leg.
+#   http1-tls : ferrum, envoy, kong, tyk, krakend
+#   http2     : ferrum, envoy, tyk, krakend                    (Kong: no H2 upstream support in
+#                                                               OpenResty; would measure H2→H1)
+#   http3     : ferrum, envoy                                  (Kong: no supported HTTP/3 cfg path;
+#                                                               Tyk/KrakenD: no HTTP/3 at all)
+#   grpcs     : ferrum, envoy, kong, tyk                       (KrakenD CE: no gRPC)
+#   wss       : ferrum, envoy, kong, tyk                       (KrakenD CE: no WebSockets)
+#   tcp-tls   : ferrum, envoy, kong, tyk                       (KrakenD: no raw TCP)
+#   udp       : ferrum, envoy, kong                            (Tyk/KrakenD: no UDP)
+#   udp-dtls  : ferrum                                         (only Ferrum; direct backend baseline)
+
+name: Gateways Protocol Benchmark
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: "proto_bench duration per size (seconds)"
+        required: false
+        default: "10"
+        type: string
+      concurrency:
+        description: "Concurrent connections / streams"
+        required: false
+        default: "100"
+        type: string
+      skip_protocols:
+        description: "Space-separated protocols to skip (http1-tls http2 http3 grpcs wss tcp-tls udp udp-dtls)"
+        required: false
+        default: ""
+        type: string
+      skip_gateways:
+        description: "Space-separated gateways to skip from every matrix job (ferrum envoy kong tyk krakend)"
+        required: false
+        default: ""
+        type: string
+      skip_payload_sizes:
+        description: "Space-separated payload sizes (bytes) to skip (10240 71680 512000 1048576 5242880)"
+        required: false
+        default: ""
+        type: string
+      iterations:
+        description: "Benchmark iterations per (gateway, payload) — used for outlier detection"
+        required: false
+        default: "1"
+        type: choice
+        options: ["1", "2", "3"]
+
+jobs:
+  benchmark:
+    name: bench / ${{ matrix.protocol }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        protocol:
+          - http1-tls
+          - http2
+          - http3
+          - grpcs
+          - wss
+          - tcp-tls
+          - udp
+          - udp-dtls
+
+    steps:
+      - name: Skip protocol?
+        id: skip_check
+        run: |
+          skip_list="${{ inputs.skip_protocols }}"
+          if echo " $skip_list " | grep -qw "${{ matrix.protocol }}"; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Protocol ${{ matrix.protocol }} is in skip list — ending job."
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v6
+        if: steps.skip_check.outputs.skip != 'true'
+
+      - name: Install Rust
+        if: steps.skip_check.outputs.skip != 'true'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Install sccache
+        if: steps.skip_check.outputs.skip != 'true'
+        uses: mozilla-actions/sccache-action@v0.0.9
+        continue-on-error: true
+
+      - name: Configure sccache
+        if: steps.skip_check.outputs.skip != 'true'
+        run: |
+          if command -v sccache &>/dev/null && sccache --start-server 2>/dev/null; then
+            echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
+            echo "SCCACHE_GHA_ENABLED=true" >> $GITHUB_ENV
+          fi
+
+      - name: Cache Rust dependencies
+        if: steps.skip_check.outputs.skip != 'true'
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "ci-gateways-protocol-bench"
+
+      - name: Install system dependencies
+        if: steps.skip_check.outputs.skip != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler libcurl4-openssl-dev lsof sysstat
+
+      - name: Runner health check
+        if: steps.skip_check.outputs.skip != 'true'
+        run: |
+          echo "=== CPU ==="
+          nproc
+          lscpu | grep -E 'Model name|Socket|MHz|Hypervisor' || true
+          echo ""
+          echo "=== CPU steal (5s) ==="
+          vmstat 1 6 | tail -n 5
+          AVG_STEAL=$(vmstat 1 6 | tail -n 5 | awk '{sum += $17; n++} END {printf "%.1f", sum/n}')
+          echo "avg steal=${AVG_STEAL}%"
+          if (( $(echo "$AVG_STEAL > 5.0" | bc -l) )); then
+            echo "::warning::CPU steal is ${AVG_STEAL}% for ${{ matrix.protocol }} — results may be noisy"
+          fi
+          echo ""
+          echo "=== Memory ==="
+          free -h
+          echo ""
+          echo "=== Docker ==="
+          docker version --format '{{.Server.Version}}' || true
+
+      - name: Compute payload sizes
+        if: steps.skip_check.outputs.skip != 'true'
+        id: sizes
+        run: |
+          all_sizes="10240 71680 512000 1048576 5242880"
+          skip="${{ inputs.skip_payload_sizes }}"
+          case "${{ matrix.protocol }}" in
+            udp|udp-dtls) sizes="1024" ;;
+            *)
+              sizes=""
+              for s in $all_sizes; do
+                if ! echo " $skip " | grep -qw "$s"; then
+                  sizes="$sizes $s"
+                fi
+              done
+              ;;
+          esac
+          sizes=$(echo "$sizes" | xargs)
+          echo "payload_sizes=$sizes" >> "$GITHUB_OUTPUT"
+          echo "Payload sizes: $sizes"
+
+      - name: Compute gateway list
+        if: steps.skip_check.outputs.skip != 'true'
+        id: gateways
+        run: |
+          # Matrix exclusions — every (gateway, protocol) cell we run is
+          # uniform end-to-end: the same protocol on both the client→gateway
+          # and gateway→backend legs. Gateways that can only do half the
+          # protocol (e.g. terminate H2 but speak H1 upstream) are excluded
+          # rather than measured dishonestly.
+          #
+          # - KrakenD CE does NOT support gRPC or WebSocket proxying (both are
+          #   Enterprise-only — /docs/enterprise/backends/grpc/ and /websockets/).
+          #   We ship CE (krakend:2.13.2), so krakend is omitted from grpcs + wss.
+          # - Kong HTTP/2: Kong terminates H2 downstream but OpenResty/nginx
+          #   `proxy_pass` is HTTP/1.1 only (no H2 upstream module in the
+          #   Kong Docker image). A Kong/http2 row would be client→H2→Kong
+          #   →H1→backend, so kong is omitted from http2 until Kong ships
+          #   H2-upstream support.
+          # - Kong HTTP/3: no documented first-class HTTP/3 config path.
+          #   KONG_PROXY_LISTEN doesn't accept http3/quic suffixes.
+          case "${{ matrix.protocol }}" in
+            http1-tls) all="ferrum envoy kong tyk krakend" ;;
+            http2)     all="ferrum envoy tyk krakend" ;;
+            wss)       all="ferrum envoy kong tyk" ;;
+            grpcs)     all="ferrum envoy kong tyk" ;;
+            http3)     all="ferrum envoy" ;;
+            tcp-tls)   all="ferrum envoy kong tyk" ;;
+            udp)       all="ferrum envoy kong" ;;
+            udp-dtls)  all="ferrum" ;;
+          esac
+          skip="${{ inputs.skip_gateways }}"
+          gws=""
+          for g in $all; do
+            if ! echo " $skip " | grep -qw "$g"; then
+              gws="$gws $g"
+            fi
+          done
+          gws=$(echo "$gws" | xargs)
+          echo "list=$gws" >> "$GITHUB_OUTPUT"
+          echo "Gateways: $gws"
+
+      - name: Build Ferrum Docker image
+        if: steps.skip_check.outputs.skip != 'true'
+        run: |
+          # Build Ferrum into a Docker image so it runs under identical
+          # conditions to every other gateway (distroless Linux container on
+          # the same kernel). This ensures no gateway has a native-binary
+          # advantage — all are containerised with --network host.
+          echo "Building ferrum-edge:bench from repo Dockerfile..."
+          docker build \
+            --cache-from type=gha \
+            --cache-to type=gha,mode=max \
+            -t ferrum-edge:bench \
+            -f Dockerfile . 2>&1 | tail -20
+          docker image ls ferrum-edge:bench
+
+      - name: Pre-pull competitor Docker images
+        if: steps.skip_check.outputs.skip != 'true'
+        run: |
+          # Image tags pinned to exact patch versions for reproducibility —
+          # must match run_gateway_protocol_bench.sh. Bump deliberately.
+          gws="${{ steps.gateways.outputs.list }}"
+          images=""
+          echo " $gws " | grep -qw envoy && images="$images envoyproxy/envoy:v1.33.5"
+          echo " $gws " | grep -qw kong && images="$images kong/kong-gateway:3.10.0.0"
+          echo " $gws " | grep -qw tyk && images="$images tykio/tyk-gateway:v5.3.0 redis:7.4.1-alpine"
+          echo " $gws " | grep -qw krakend && images="$images krakend:2.13.2"
+          for img in $images; do
+            echo "pulling $img..."
+            docker pull "$img" &
+          done
+          wait
+          docker image ls
+
+      - name: Run benchmark
+        if: steps.skip_check.outputs.skip != 'true'
+        timeout-minutes: 75
+        env:
+          ITERATIONS: ${{ inputs.iterations }}
+          FERRUM_IMAGE: ferrum-edge:bench
+        run: |
+          mkdir -p results/${{ matrix.protocol }}
+          for run in $(seq 1 "$ITERATIONS"); do
+            echo ""
+            echo "============================================"
+            echo "  RUN ${run}/${ITERATIONS} — ${{ matrix.protocol }}"
+            echo "============================================"
+
+            run_dir="results/${{ matrix.protocol }}/run_${run}"
+            mkdir -p "$run_dir"
+
+            # After the first iteration: reuse already-built binaries + images
+            # (--skip-build) and skip the direct-backend baseline since it's
+            # gateway-independent and doesn't change across iterations.
+            extra_flags=""
+            if [ "$run" -gt 1 ]; then extra_flags="--skip-build --skip-direct"; fi
+
+            bash tests/performance/multi_protocol/run_gateway_protocol_bench.sh \
+              "${{ matrix.protocol }}" \
+              --gateways "${{ steps.gateways.outputs.list }}" \
+              --payload-sizes "${{ steps.sizes.outputs.payload_sizes }}" \
+              --duration "${{ inputs.duration }}" \
+              --concurrency "${{ inputs.concurrency }}" \
+              --output-dir "$run_dir" \
+              $extra_flags \
+              2>&1 | tee "$run_dir/run.log"
+          done
+
+      - name: Force-cleanup any leaked containers
+        if: steps.skip_check.outputs.skip != 'true' && always()
+        run: |
+          # Defensive cleanup in case a gateway container survived the bench
+          # step (e.g. SIGKILL from timeout prevented the harness trap from
+          # firing). Runs even on step failure to avoid polluting the runner.
+          docker ps -q | xargs -r docker rm -f 2>/dev/null || true
+          docker network prune -f 2>/dev/null || true
+
+      - name: Render per-protocol summary
+        if: steps.skip_check.outputs.skip != 'true' && always()
+        env:
+          PROTOCOL: ${{ matrix.protocol }}
+          ITERATIONS: ${{ inputs.iterations }}
+          DURATION: ${{ inputs.duration }}
+          CONCURRENCY: ${{ inputs.concurrency }}
+        run: |
+          python3 - <<'PYEOF'
+          import os, json, glob, math
+          from pathlib import Path
+
+          protocol = os.environ["PROTOCOL"]
+          iterations = int(os.environ.get("ITERATIONS", "1"))
+          proto_dir = Path(f"results/{protocol}")
+          if not proto_dir.exists():
+              print("No results — skipping summary.")
+              open(os.environ["GITHUB_STEP_SUMMARY"], "a").write(
+                  f"\n## {protocol}\n\n_No results collected._\n"
+              )
+              raise SystemExit(0)
+
+          # {(gateway, size): [rps, rps, ...]}  across runs
+          rps_agg = {}
+          # Most-recent-run details for latency/errors
+          latest = {}
+
+          for run_dir in sorted(proto_dir.glob("run_*")):
+              for f in sorted(run_dir.glob(f"*_{protocol}_*.json")):
+                  try:
+                      d = json.loads(f.read_text())
+                  except Exception:
+                      continue
+                  gw = d.get("gateway") or f.stem.split(f"_{protocol}_")[0]
+                  size = int(d.get("payload_size") or f.stem.rsplit("_", 1)[1])
+                  rps = float(d.get("rps") or 0)
+                  rps_agg.setdefault((gw, size), []).append(rps)
+                  latest[(gw, size)] = d
+
+          def fmt_rps(v): return f"{v:,.0f}" if v else "—"
+          def fmt_us(us):
+              if not us: return "—"
+              if us >= 1_000_000: return f"{us/1_000_000:.2f}s"
+              if us >= 1000: return f"{us/1000:.2f}ms"
+              return f"{int(us)}µs"
+          def fmt_bytes(b):
+              if b >= 1_048_576: return f"{b/1_048_576:.1f}MB"
+              if b >= 1024: return f"{b/1024:.0f}KB"
+              return f"{b}B"
+
+          lines = []
+          lines.append(f"\n## {protocol}\n")
+          lines.append(f"**Duration:** {os.environ['DURATION']}s  |  **Concurrency:** {os.environ['CONCURRENCY']}  |  **Iterations:** {iterations}\n")
+
+          sizes = sorted({s for (_, s) in rps_agg})
+          gateways = [g for g in ("direct", "ferrum", "envoy", "kong", "tyk", "krakend")
+                      if any((g, s) in rps_agg for s in sizes)]
+
+          # RPS table: rows=size, cols=gateway (mean over iterations)
+          lines.append("### Throughput (mean RPS)\n")
+          header = "| Payload | " + " | ".join(gateways) + " |"
+          sep = "|---------|" + "|".join("-" * max(len(g)+2, 8) for g in gateways) + "|"
+          lines.append(header)
+          lines.append(sep)
+          for s in sizes:
+              row = [fmt_bytes(s)]
+              for g in gateways:
+                  vals = rps_agg.get((g, s), [])
+                  mean = sum(vals) / len(vals) if vals else 0
+                  row.append(fmt_rps(mean))
+              lines.append("| " + " | ".join(row) + " |")
+
+          # Gateway overhead vs direct
+          if "direct" in gateways:
+              lines.append("\n### Overhead vs Direct Backend (%)\n")
+              non_direct = [g for g in gateways if g != "direct"]
+              header = "| Payload | " + " | ".join(non_direct) + " |"
+              sep = "|---------|" + "|".join("-" * max(len(g)+2, 8) for g in non_direct) + "|"
+              lines.append(header)
+              lines.append(sep)
+              for s in sizes:
+                  direct_vals = rps_agg.get(("direct", s), [])
+                  direct_mean = sum(direct_vals) / len(direct_vals) if direct_vals else 0
+                  row = [fmt_bytes(s)]
+                  for g in non_direct:
+                      vals = rps_agg.get((g, s), [])
+                      mean = sum(vals) / len(vals) if vals else 0
+                      if direct_mean > 0 and mean > 0:
+                          pct = (direct_mean - mean) / direct_mean * 100
+                          row.append(f"{pct:+.1f}%")
+                      else:
+                          row.append("—")
+                  lines.append("| " + " | ".join(row) + " |")
+
+          # Latency table (from last run)
+          lines.append("\n### Latency (last run)\n")
+          lines.append("| Gateway | Payload | Avg | P50 | P99 | Errors |")
+          lines.append("|---------|---------|-----|-----|-----|--------|")
+          for g in gateways:
+              for s in sizes:
+                  d = latest.get((g, s))
+                  if not d: continue
+                  lines.append(
+                      f"| **{g}** | {fmt_bytes(s)} "
+                      f"| {fmt_us(d.get('latency_avg_us'))} "
+                      f"| {fmt_us(d.get('p50_us'))} "
+                      f"| {fmt_us(d.get('p99_us'))} "
+                      f"| {d.get('total_errors', 0)} |"
+                  )
+
+          # Cross-iteration CV if iterations > 1
+          if iterations > 1:
+              lines.append("\n### Cross-Run Consistency (CV%)\n")
+              lines.append("| Gateway | Payload | " + " | ".join(f"Run{i+1}" for i in range(iterations)) + " | Mean | CV% |")
+              lines.append("|---------|---------|" + "|".join("-" * 8 for _ in range(iterations + 2)) + "|")
+              for g in gateways:
+                  for s in sizes:
+                      vals = rps_agg.get((g, s), [])
+                      if len(vals) < 2: continue
+                      mean = sum(vals) / len(vals)
+                      var = sum((v - mean) ** 2 for v in vals) / (len(vals) - 1)
+                      cv = math.sqrt(var) / mean * 100 if mean > 0 else 0
+                      row = [f"**{g}**", fmt_bytes(s)]
+                      row += [fmt_rps(v) for v in vals]
+                      while len(row) - 2 < iterations: row.append("—")
+                      row += [fmt_rps(mean), f"{cv:.1f}%"]
+                      lines.append("| " + " | ".join(row) + " |")
+
+          summary = "\n".join(lines) + "\n"
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+              f.write(summary)
+          print(summary)
+          PYEOF
+
+      - name: Upload per-protocol artifact
+        if: steps.skip_check.outputs.skip != 'true' && always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: gateways-protocol-bench-${{ matrix.protocol }}-${{ github.sha }}
+          path: results/${{ matrix.protocol }}
+          retention-days: 90
+
+  aggregate:
+    name: Aggregate Results
+    runs-on: ubuntu-latest
+    needs: benchmark
+    if: always()
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Download all protocol artifacts
+        uses: actions/download-artifact@v7
+        with:
+          path: all-results
+          pattern: gateways-protocol-bench-*-${{ github.sha }}
+          merge-multiple: false
+
+      - name: Render combined summary
+        env:
+          DURATION: ${{ inputs.duration }}
+          CONCURRENCY: ${{ inputs.concurrency }}
+          ITERATIONS: ${{ inputs.iterations }}
+        run: |
+          python3 - <<'PYEOF'
+          import os, json, glob, math
+          from pathlib import Path
+
+          iterations = int(os.environ.get("ITERATIONS", "1"))
+          root = Path("all-results")
+          if not root.exists():
+              with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+                  f.write("# Gateways × Protocols Benchmark\n\n_No results collected._\n")
+              raise SystemExit(0)
+
+          # {protocol: {(gateway, size): [rps...]}}
+          data = {}
+          latest = {}
+
+          for proto_artifact in sorted(root.iterdir()):
+              if not proto_artifact.is_dir(): continue
+              # Artifact name: gateways-protocol-bench-<protocol>-<sha>
+              # Protocols with hyphens (http1-tls, tcp-tls, udp-dtls) produce
+              # 6-part names; bare protocols (http2, http3, grpcs, wss, udp)
+              # produce 5-part names. Splitting on "-" and rejoining parts[3:-1]
+              # correctly reconstructs the protocol in both cases.
+              parts = proto_artifact.name.split("-")
+              if len(parts) < 5: continue
+              protocol = "-".join(parts[3:-1])
+              for run_dir in sorted(proto_artifact.glob("run_*")):
+                  for f in sorted(run_dir.glob(f"*_{protocol}_*.json")):
+                      try:
+                          d = json.loads(f.read_text())
+                      except Exception:
+                          continue
+                      gw = d.get("gateway") or f.stem.split(f"_{protocol}_")[0]
+                      size = int(d.get("payload_size") or f.stem.rsplit("_", 1)[1])
+                      rps = float(d.get("rps") or 0)
+                      data.setdefault(protocol, {}).setdefault((gw, size), []).append(rps)
+                      latest.setdefault(protocol, {})[(gw, size)] = d
+
+          def fmt_rps(v): return f"{v:,.0f}" if v else "—"
+          def fmt_bytes(b):
+              if b >= 1_048_576: return f"{b/1_048_576:.1f}MB"
+              if b >= 1024: return f"{b/1024:.0f}KB"
+              return f"{b}B"
+
+          lines = []
+          lines.append("# Gateways × Protocols Benchmark — Combined Results\n")
+          lines.append(f"**Duration:** {os.environ['DURATION']}s  |  **Concurrency:** {os.environ['CONCURRENCY']}  |  **Iterations:** {iterations}\n")
+
+          # Summary scoreboard — count wins per gateway across every scenario.
+          # Three classes of scenarios are excluded from win counting:
+          #   1. Unopposed (len(contenders) < 2): udp-dtls is Ferrum-only by
+          #      design; or --skip-gateways leaves one contender.
+          #   2. All-failed (max_rps == 0): every contender reported 0 RPS
+          #      (bench crashed, port conflict, gateway wouldn't start).
+          #      Without filtering, max() would deterministically award
+          #      Ferrum (first in tuple order) an undeserved win.
+          #   3. Only the tied winner advances — ties still favor the
+          #      earlier-listed gateway per tuple order (ferrum, envoy, kong,
+          #      tyk, krakend), which is stable and documented.
+          wins = {}
+          scenarios = 0
+          unopposed = 0
+          all_failed = 0
+          for proto, buckets in data.items():
+              sizes = sorted({s for (_, s) in buckets})
+              for s in sizes:
+                  contenders = [(g, sum(buckets[(g, s)]) / len(buckets[(g, s)]))
+                                for g in ("ferrum", "envoy", "kong", "tyk", "krakend")
+                                if (g, s) in buckets and buckets[(g, s)]]
+                  if len(contenders) < 2:
+                      if contenders:
+                          unopposed += 1
+                      continue
+                  winner_gw, winner_rps = max(contenders, key=lambda x: x[1])
+                  if winner_rps <= 0:
+                      # Every contender failed — do not credit the first-listed
+                      # gateway with a "win" for a failed scenario.
+                      all_failed += 1
+                      continue
+                  wins[winner_gw] = wins.get(winner_gw, 0) + 1
+                  scenarios += 1
+
+          if scenarios:
+              lines.append(f"## Scoreboard — gateway wins across {scenarios} head-to-head (protocol, payload) scenarios\n")
+              if unopposed:
+                  lines.append(
+                      f"_{unopposed} unopposed scenario(s) excluded from win counts "
+                      f"(e.g. udp-dtls is Ferrum-only by design — no head-to-head possible)._\n"
+                  )
+              if all_failed:
+                  lines.append(
+                      f"_{all_failed} scenario(s) excluded because every contender reported 0 RPS "
+                      f"(bench or gateway startup failure — inspect per-protocol artifacts)._\n"
+                  )
+              lines.append("| Gateway | Wins | Win rate |")
+              lines.append("|---------|------|----------|")
+              for gw in sorted(wins, key=wins.get, reverse=True):
+                  w = wins[gw]
+                  rate = w / scenarios * 100
+                  lines.append(f"| **{gw}** | {w} | {rate:.0f}% |")
+              lines.append("")
+
+          # Per-protocol tables
+          for proto in sorted(data):
+              buckets = data[proto]
+              lines.append(f"\n## {proto}\n")
+              sizes = sorted({s for (_, s) in buckets})
+              gateways = [g for g in ("direct", "ferrum", "envoy", "kong", "tyk", "krakend")
+                          if any((g, s) in buckets for s in sizes)]
+
+              # Throughput table
+              header = "| Payload | " + " | ".join(gateways) + " |"
+              sep = "|---------|" + "|".join("-" * max(len(g)+2, 8) for g in gateways) + "|"
+              lines.append("### Throughput (mean RPS)\n")
+              lines.append(header)
+              lines.append(sep)
+              for s in sizes:
+                  row = [fmt_bytes(s)]
+                  for g in gateways:
+                      vals = buckets.get((g, s), [])
+                      mean = sum(vals) / len(vals) if vals else 0
+                      row.append(fmt_rps(mean))
+                  lines.append("| " + " | ".join(row) + " |")
+
+              # Overhead vs direct
+              if "direct" in gateways:
+                  non_direct = [g for g in gateways if g != "direct"]
+                  lines.append("\n#### Overhead vs Direct Backend\n")
+                  header = "| Payload | " + " | ".join(non_direct) + " |"
+                  sep = "|---------|" + "|".join("-" * max(len(g)+2, 8) for g in non_direct) + "|"
+                  lines.append(header)
+                  lines.append(sep)
+                  for s in sizes:
+                      direct_vals = buckets.get(("direct", s), [])
+                      direct_mean = sum(direct_vals) / len(direct_vals) if direct_vals else 0
+                      row = [fmt_bytes(s)]
+                      for g in non_direct:
+                          vals = buckets.get((g, s), [])
+                          mean = sum(vals) / len(vals) if vals else 0
+                          if direct_mean > 0 and mean > 0:
+                              pct = (direct_mean - mean) / direct_mean * 100
+                              row.append(f"{pct:+.1f}%")
+                          else:
+                              row.append("—")
+                      lines.append("| " + " | ".join(row) + " |")
+
+          # UDP plaintext vs DTLS comparison callout
+          if "udp" in data and "udp-dtls" in data:
+              lines.append("\n## UDP plaintext vs UDP+DTLS (Ferrum encryption overhead)\n")
+              udp_ferrum = data["udp"].get(("ferrum", 1024), [])
+              dtls_ferrum = data["udp-dtls"].get(("ferrum", 1024), [])
+              if udp_ferrum and dtls_ferrum:
+                  udp_rps = sum(udp_ferrum) / len(udp_ferrum)
+                  dtls_rps = sum(dtls_ferrum) / len(dtls_ferrum)
+                  overhead = (udp_rps - dtls_rps) / udp_rps * 100 if udp_rps else 0
+                  lines.append(f"- UDP plaintext: **{fmt_rps(udp_rps)} RPS**")
+                  lines.append(f"- UDP+DTLS: **{fmt_rps(dtls_rps)} RPS**")
+                  lines.append(f"- DTLS overhead: **{overhead:+.1f}%**")
+
+          # Protocol coverage note
+          lines.append("\n---\n")
+          lines.append("### Notes\n")
+          lines.append("- Gateways that do not support a protocol are omitted from that protocol's tables.")
+          lines.append("- `direct` = bench against `proto_backend` directly (no gateway), as the baseline.")
+          lines.append("- UDP and UDP+DTLS use a fixed 1KB payload; all other protocols sweep 10KB–5MB.")
+          lines.append("- Every cell is protocol-uniform end-to-end: the same protocol on "
+                       "client→gateway and gateway→backend. Gateways that could only do half a "
+                       "protocol are excluded from that row rather than measured dishonestly.")
+          lines.append("- HTTP/2 excludes Kong — Kong can terminate H2 downstream but "
+                       "OpenResty/nginx upstream is HTTP/1.1 only, so a Kong/http2 cell would "
+                       "measure client→H2→Kong→H1→backend, not uniform H2.")
+          lines.append("- HTTP/3 runs Ferrum vs Envoy only — Kong has no supported HTTP/3 config "
+                       "path (KONG_PROXY_LISTEN does not accept http3/quic flags); Tyk and "
+                       "KrakenD CE have no HTTP/3 support at all.")
+          lines.append("- KrakenD CE does not proxy gRPC, WebSockets, TCP, UDP, or DTLS "
+                       "(Enterprise-only).")
+
+          summary = "\n".join(lines) + "\n"
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+              f.write(summary)
+          print(summary)
+          PYEOF
+
+      - name: Upload combined artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: gateways-protocol-bench-combined-${{ github.sha }}
+          path: all-results/
+          retention-days: 90

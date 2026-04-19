@@ -1,14 +1,13 @@
-# Envoy HTTP/1.1 end-to-end TLS reverse proxy config.
-# Listener on 8443 with TLS termination → HTTP/1.1+TLS backend on 3447.
-# (Port 3443 is H2-only; 3447 is dedicated H1-over-TLS.) All hops encrypted.
-# Matches Ferrum's http1_tls_e2e_perf.yaml.
+# Envoy gRPC end-to-end TLS reverse proxy config.
+# Listener on 8443 with TLS + ALPN h2 → gRPC+TLS backend on 50053.
+# Every hop encrypted; matches Ferrum's grpcs_e2e_perf.yaml.
 admin:
   address:
     socket_address: { address: 127.0.0.1, port_value: 15000 }
 
 static_resources:
   listeners:
-    - name: https_listener
+    - name: grpcs_listener
       address:
         socket_address: { address: 127.0.0.1, port_value: 8443 }
       filter_chains:
@@ -20,29 +19,25 @@ static_resources:
                 tls_certificates:
                   - certificate_chain: { filename: CERT_PATH }
                     private_key: { filename: KEY_PATH }
-                alpn_protocols: ["http/1.1"]
+                alpn_protocols: ["h2"]
           filters:
             - name: envoy.filters.network.http_connection_manager
               typed_config:
                 "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
-                stat_prefix: ingress_https
-                codec_type: HTTP1
+                stat_prefix: ingress_grpcs
+                codec_type: HTTP2
+                # HTTP/2 flow-control uses Envoy defaults — see http2_tls.yaml
+                # for the rationale on avoiding explicit tuning bias.
                 route_config:
                   name: local_route
                   virtual_hosts:
                     - name: backend
                       domains: ["*"]
                       routes:
-                        # Route every path to the backend. Previously this was
-                        # pinned to /api/users which meant the benchmark bench
-                        # target (/echo) received a 404 from Envoy and proto_bench
-                        # counted non-echo responses as successful — corrupting
-                        # HTTP/1.1+TLS comparison numbers for Envoy. A catch-all
-                        # prefix matches what Kong/Tyk/KrakenD/Ferrum do.
-                        - match: { prefix: "/" }
+                        - match: { prefix: "/bench.BenchService" }
                           route:
-                            cluster: backend_http1
-                            timeout: 10s
+                            cluster: backend_grpc
+                            timeout: 30s
                 http_filters:
                   - name: envoy.filters.http.router
                     typed_config:
@@ -50,20 +45,25 @@ static_resources:
                 access_log: []
 
   clusters:
-    - name: backend_http1
+    - name: backend_grpc
       connect_timeout: 5s
       type: STATIC
       lb_policy: ROUND_ROBIN
+      typed_extension_protocol_options:
+        envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+          explicit_http_config:
+            http2_protocol_options: {}
       transport_socket:
         name: envoy.transport_sockets.tls
         typed_config:
           "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
           common_tls_context:
-            alpn_protocols: ["http/1.1"]
+            alpn_protocols: ["h2"]
       load_assignment:
-        cluster_name: backend_http1
+        cluster_name: backend_grpc
         endpoints:
           - lb_endpoints:
               - endpoint:
                   address:
-                    socket_address: { address: 127.0.0.1, port_value: 3447 }
+                    socket_address: { address: 127.0.0.1, port_value: 50053 }

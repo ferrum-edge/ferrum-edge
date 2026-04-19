@@ -1,0 +1,36 @@
+---
+# HTTP/1.1 end-to-end TLS performance test config.
+# Client --HTTPS--> gateway --HTTPS--> backend. Every hop encrypted.
+# Used exclusively by gateways-protocol-benchmark.yml for the "http1-tls" matrix job.
+proxies:
+  - id: "h1-tls-e2e-echo"
+    name: "HTTP/1.1+TLS E2E Echo"
+    listen_path: "/echo"
+    backend_protocol: https
+    backend_host: "127.0.0.1"
+    backend_port: 3447
+    strip_listen_path: false
+    preserve_host_header: false
+    backend_connect_timeout_ms: 5000
+    backend_read_timeout_ms: 10000
+    backend_write_timeout_ms: 10000
+    backend_tls_verify_server_cert: false
+    auth_mode: single
+    plugins: []
+
+  - id: "h1-tls-e2e-health"
+    name: "HTTP/1.1+TLS E2E Health"
+    listen_path: "/health"
+    backend_protocol: http
+    backend_host: "127.0.0.1"
+    backend_port: 3010
+    strip_listen_path: false
+    preserve_host_header: false
+    backend_connect_timeout_ms: 1000
+    backend_read_timeout_ms: 5000
+    backend_write_timeout_ms: 5000
+    auth_mode: single
+    plugins: []
+
+consumers: []
+plugin_configs: []
